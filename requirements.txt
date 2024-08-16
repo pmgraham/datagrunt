@@ -1,3 +1,4 @@
+duckdb==0.*
 firebase-admin==6.*
 functions-framework==3.*
 google-cloud-aiplatform==1.*
@@ -7,6 +8,8 @@ google-cloud-pubsub==2.*
 google-cloud-storage==2.*
 openpyxl==3.*
 pandas==2.*
+polars==1.5.*
+pyarrow==17.*
 vertexai==1.*
 google-auth==2.*
 
