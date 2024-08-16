@@ -49,6 +49,13 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+test_data/
+*.json
+*.jsonl
+*.csv
+*.db
+*.jpg
+*.Identifier
 
 # Translations
 *.mo
