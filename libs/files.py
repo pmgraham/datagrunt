@@ -2,14 +2,11 @@
 
 # standard library
 import csv
-import json
-from io import StringIO
 import os
 from pathlib import Path
 
 # third party libraries
 import duckdb
-import polars as pl
 
 # local libraries
 
@@ -49,7 +46,8 @@ class FileEvaluator(FileBase):
 
     CSV_FILE_EXTENSIONS = ['csv', 'tsv', 'txt']
     APACHE_FILE_EXTENSIONS = ['parquet', 'avro']
-    STRUCTURED_FILE_EXTENSIONS = list(set(CSV_FILE_EXTENSIONS + EXCEL_FILE_EXTENSIONS + APACHE_FILE_EXTENSIONS))
+    STRUCTURED_FILE_EXTENSIONS = list(set(CSV_FILE_EXTENSIONS + EXCEL_FILE_EXTENSIONS +
+                                          APACHE_FILE_EXTENSIONS))
     STRUCTURED_FILE_EXTENSIONS.sort()
     SEMI_STRUCTURED_FILE_EXTENSIONS = ['json']
     UNSTRUCTURED_FILE_EXTENSIONS = ['pdf']
@@ -148,11 +146,12 @@ class CSVFile(FileEvaluator):
 
     def _duckdb_default_csv_import_table_statement(self):
         """Default CSV import table statement."""
-        return f"CREATE OR REPLACE TABLE {self.DEFAULT_DUCK_DB_CSV_IMPORT_TABLE_NAME} AS SELECT * FROM read_csv('{self.filepath}', all_varchar=True)";
+        return f"""CREATE OR REPLACE TABLE {self.DEFAULT_DUCK_DB_CSV_IMPORT_TABLE_NAME}
+                 AS SELECT * FROM read_csv('{self.filepath}', all_varchar=True)"""
 
     def _duckdb_select_from_default_csv_import_table_statement(self):
         """Select from default CSV import table statement."""
-        return f"SELECT * FROM {self.DEFAULT_DUCK_DB_CSV_IMPORT_TABLE_NAME}";
+        return f"SELECT * FROM {self.DEFAULT_DUCK_DB_CSV_IMPORT_TABLE_NAME}"
 
     def attributes(self):
         """Return the attributes of the CSV file."""
@@ -216,25 +215,25 @@ class CSVFile(FileEvaluator):
     def to_dataframe(self):
         """Return the CSV file as a DataFrame."""
         with self._establish_duckdb_database_connection() as con:
-            con.sql(self._duckdb_default_csv_import_table_statement());
+            con.sql(self._duckdb_default_csv_import_table_statement())
             return con.query(self._duckdb_select_from_default_csv_import_table_statement()).pl()
 
     def to_dicts(self):
         """Converts Dataframe to list of dictionaries."""
         with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
             csv_reader = csv.DictReader(csv_file, delimiter=self.delimiter())
-            return [row for row in csv_reader]
+            return list(csv_reader)
 
     def to_json(self, write_json_file=False):
         """Converts CSV to JSON."""
         if not write_json_file:
             return self.to_dataframe().write_json()
-        else: 
+        else:
             return self.to_dataframe().write_json(self.JSON_OUT_FILENAME)
 
     def to_json_new_line_delimited(self, write_json_file=False):
         """Converts CSV to new line delimited JSON."""
         if not write_json_file:
             return self.to_dataframe().write_ndjson()
-        else: 
+        else:
             return self.to_dataframe().write_ndjson(self.JSON_NEWLINE_OUT_FILENAME)
