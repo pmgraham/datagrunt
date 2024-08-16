@@ -226,21 +226,15 @@ class CSVFile(FileEvaluator):
             return [row for row in csv_reader]
 
     def to_json(self, write_json_file=False):
-        """Converts CSV to JSON list."""
-        data = self.to_dicts()  # Assuming to_dicts returns a list of dictionaries
+        """Converts CSV to JSON."""
         if not write_json_file:
-            return data
-        else:
-            with open(self.JSON_OUT_FILENAME, 'w', encoding=self.DEFAULT_ENCODING) as out:
-                json.dump(data, out, indent=4)  # Directly dump the list of dictionaries
+            return self.to_dataframe().write_json()
+        else: 
+            return self.to_dataframe().write_json(self.JSON_OUT_FILENAME)
 
     def to_json_new_line_delimited(self, write_json_file=False):
-        """Converts CSV to newline-delimited JSON."""
-        data = self.to_dicts()
+        """Converts CSV to new line delimited JSON."""
         if not write_json_file:
-            return [json.dumps(row) for row in data]
-        else:
-            with open(self.JSON_NEWLINE_OUT_FILENAME, 'w', encoding=self.DEFAULT_ENCODING) as out:
-                for row in data:
-                    json.dump(row, out)
-                    out.write('\n')
+            return self.to_dataframe().write_ndjson()
+        else: 
+            return self.to_dataframe().write_ndjson(self.JSON_NEWLINE_OUT_FILENAME)
