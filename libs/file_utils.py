@@ -7,7 +7,6 @@ from pathlib import Path
 # third party libraries
 
 # local libraries
-from . databases import DuckDBDatabase
 
 class FileBase:
     """Base class for file objects."""
