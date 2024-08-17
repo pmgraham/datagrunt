@@ -16,6 +16,8 @@ from . databases import DuckDBDatabase
 class FileBase:
     """Base class for file objects."""
 
+    FILE_SIZE_DIVISOR = 1024
+
     def __init__(self, filepath):
         """
         Initialize the FileBase class.
@@ -28,10 +30,10 @@ class FileBase:
         self.extension = Path(filepath).suffix
         self.extension_string = self.extension.replace('.', '')
         self.size_in_bytes = os.path.getsize(filepath)
-        self.size_in_kb = self.size_in_bytes / 1024
-        self.size_in_mb = self.size_in_kb / 1024
-        self.size_in_gb = self.size_in_mb / 1024
-        self.size_in_tb = self.size_in_gb / 1024
+        self.size_in_kb = self.size_in_bytes / self.FILE_SIZE_DIVISOR
+        self.size_in_mb = self.size_in_kb / self.FILE_SIZE_DIVISOR
+        self.size_in_gb = self.size_in_mb / self.FILE_SIZE_DIVISOR
+        self.size_in_tb = self.size_in_gb / self.FILE_SIZE_DIVISOR
 
 class FileEvaluator(FileBase):
     """Class to evaluate file types and to instantiate the right class."""
