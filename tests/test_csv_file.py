@@ -2,7 +2,7 @@ import unittest
 from pathlib import Path
 import sys
 sys.path.append('../')  # Add the parent directory to the search path
-from libs.files import CSVFile
+from libs.data_processing import CSVFile
 
 class TestCSVFile(unittest.TestCase):
 
