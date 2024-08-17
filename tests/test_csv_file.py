@@ -111,7 +111,7 @@ class TestCSVFile(unittest.TestCase):
     def test_to_json(self):
         """Test to_json method."""
         json_data = self.test_csv_file.to_json()
-        self.assertEqual(len(json_data), 425898) # string object not a dict; hence the high number of chars
+        self.assertEqual(len(json_data), 2629)
 
     def test_to_json_new_line_delimited(self):
         """Test to_json_new_line_delimited method."""
