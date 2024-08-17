@@ -221,7 +221,7 @@ class CSVFile(FileEvaluator):
          return json.loads(self.to_dataframe().write_json())
     
     def to_json_newline_delimited(self):
-        """Converts CSV to a JSON string with new line delimited."""
+        """Converts CSV to a JSON string with newline delimited."""
         return self.to_dataframe().write_ndjson()
 
     def write_json(self):
@@ -229,7 +229,7 @@ class CSVFile(FileEvaluator):
         self.duckdb_instance.to_json(self.csv_import_table_statement())
 
     def write_json_newline_delimited(self):
-        """Writes JSON to a file with new line delimited."""
+        """Writes JSON to a file with newline delimited."""
         self.duckdb_instance.to_json_new_line_delimited(self.csv_import_table_statement())
 
     def write_parquet(self):
