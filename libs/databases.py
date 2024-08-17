@@ -31,7 +31,7 @@ class DuckDBDatabase:
     def _set_database_filename(self):
         """Return name of duckdb file created at runtime."""
         return f'{Path(self.filepath).stem}.db'
-    
+
     def _set_database_table_name(self):
         """Return name of duckdb import table created during file import."""
         return f'{Path(self.filepath).stem}.db'
@@ -44,7 +44,7 @@ class DuckDBDatabase:
     def select_from_table_statement(self):
         """Select from table."""
         return f"SELECT * FROM {self.database_table_name}"
-    
+
     def export_to_json_array_statement(self):
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{self.JSON_OUT_FILENAME}' (ARRAY true) "
 
@@ -59,31 +59,31 @@ class DuckDBDatabase:
         INSTALL spatial;
         LOAD spatial;
         COPY (SELECT * FROM {self.database_table_name}) TO 'output.xlsx'(FORMAT GDAL, DRIVER 'xlsx')"""
-    
+
     def to_dataframe(self, sql_import_statement):
         """Export data as Polars a dataframe."""
         with self.database_connection as con:
             con.sql(sql_import_statement)
             return con.query(self.select_from_table_statement()).pl()
-    
+
     def to_json(self, sql_import_statement):
         """Export data as a JSON file array."""
         with self.database_connection as con:
             con.sql(sql_import_statement)
             con.sql(self.export_to_json_array_statement())
-    
+
     def to_json_new_line_delimited(self, sql_import_statement):
         """Export data as a JSON new line delimited file."""
         with self.database_connection as con:
             con.sql(sql_import_statement)
             con.sql(self.export_to_json_new_line_delimited_statement())
-    
+
     def to_parquet(self, sql_import_statement):
         """Export data as a parquet file."""
         with self.database_connection as con:
             con.sql(sql_import_statement)
             con.sql(self.export_to_parquet_statement())
-    
+
     def to_excel(self, sql_import_statement):
         """Export data as an Excel file."""
         with self.database_connection as con:

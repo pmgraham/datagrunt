@@ -139,7 +139,7 @@ class CSVFile(FileEvaluator):
         """
         super().__init__(filepath)
         self.duckdb_instance = DuckDBDatabase(self.filepath)
-    
+
     def csv_import_table_statement(self):
         """Default CSV import table statement."""
         return f"""CREATE OR REPLACE TABLE {self.duckdb_instance.database_table_name}
@@ -213,13 +213,13 @@ class CSVFile(FileEvaluator):
     def to_dataframe(self):
         """Converts CSV to a Polars dataframe."""
         return self.duckdb_instance.to_dataframe(self.csv_import_table_statement())
-    
+
     def to_json(self):
          """Converts CSV to a JSON string."""
          if self.is_large:
              print("Warning: File is large and may not load into memory properly.")
          return json.loads(self.to_dataframe().write_json())
-    
+
     def to_json_newline_delimited(self):
         """Converts CSV to a JSON string with newline delimited."""
         return self.to_dataframe().write_ndjson()
