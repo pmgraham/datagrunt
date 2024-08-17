@@ -153,8 +153,8 @@ class CSVFile(FileEvaluator):
 
     def row_count_with_header(self):
         """Return the number of lines in the CSV file including the header."""
-        with open(self.filepath, 'r', encoding=self.duckdb_instance.DEFAULT_ENCODING) as file:
-            return sum(1 for _ in file)
+        with open(self.filepath, 'r', encoding=self.duckdb_instance.DEFAULT_ENCODING) as csv_file:
+            return sum(1 for _ in csv_file)
 
     def row_count_without_header(self):
         """Return the number of lines in the CSV file excluding the header."""
@@ -167,13 +167,13 @@ class CSVFile(FileEvaluator):
 
     def columns_string(self):
         """Return the first row of the CSV file."""
-        with open(self.filepath, 'r', encoding=self.duckdb_instance.DEFAULT_ENCODING) as file:
-            return file.readline().strip()
+        with open(self.filepath, 'r', encoding=self.duckdb_instance.DEFAULT_ENCODING) as csv_file:
+            return csv_file.readline().strip()
 
     def columns_byte_string(self):
         """Return the first row of the CSV file as bytes."""
-        with open(self.filepath, 'rb') as file:
-            return file.readline().strip()
+        with open(self.filepath, 'rb') as csv_file:
+            return csv_file.readline().strip()
 
     def column_count(self):
         """Return the number of columns in the CSV file."""
