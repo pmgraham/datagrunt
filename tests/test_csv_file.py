@@ -62,11 +62,6 @@ class TestCSVFile(unittest.TestCase):
         """Test columns_schema method."""
         schema = self.test_csv_file.columns_schema()
         self.assertEqual(len(schema), 5)
-        # self.assertIn('state', schema)
-        # self.assertIn('location', schema)
-        # self.assertIn('address', schema)
-        # self.assertIn('latitude', schema)
-        # self.assertIn('longitude', schema)
 
     def test_columns_string(self):
         """Test columns_string method."""
@@ -112,27 +107,16 @@ class TestCSVFile(unittest.TestCase):
         """Test to_dicts method."""
         dicts = self.test_csv_file.to_dicts()
         self.assertEqual(len(dicts), 2629)
-        # self.assertEqual(dicts[0]['state'], 'Alabama')
-        # self.assertEqual(dicts[1]['location'], 'Auburn')
-        # self.assertEqual(dicts[2]['address'], '1000 S College St')
-        # self.assertEqual(dicts[3]['latitude'], '32.5900')
-        # self.assertEqual(dicts[4]['longitude'], '-85.4900')
 
     def test_to_json(self):
         """Test to_json method."""
         json_data = self.test_csv_file.to_json()
         self.assertEqual(len(json_data), 425898) # string object not a dict; hence the high number of chars
-        # self.assertEqual(json_data[0]['state'], 'Alabama')
-        # self.assertEqual(json_data[1]['location'], 'Auburn')
-        # self.assertEqual(json_data[2]['address'], '1000 S College St')
-        # self.assertEqual(json_data[3]['latitude'], '32.5900')
-        # self.assertEqual(json_data[4]['longitude'], '-85.4900')
 
     def test_to_json_new_line_delimited(self):
         """Test to_json_new_line_delimited method."""
         jsonl_data = self.test_csv_file.to_json_new_line_delimited()
         self.assertEqual(len(jsonl_data), 425897) # string object not a dict; hence the high number of chars
-        # self.assertIn('{"state": "Alabama", "location": "Auburn", "address": "1000 S College St", "latitude": "32.5900", "longitude": "-85.4900"}', jsonl_data)
 
 if __name__ == '__main__':
     unittest.main()
