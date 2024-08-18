@@ -78,15 +78,8 @@ class FileEvaluator(FileBase):
     @property
     def is_unstructured(self):
         """Check if the file is unstructured."""
-        match self.extension_string.lower():
-            case extension if extension in self.UNSTRUCTURED_FILE_EXTENSIONS:
-                return True
-            case extension if extension not in self.STRUCTURED_FILE_EXTENSIONS:
-                return True
-            case extension if extension not in self.SEMI_STRUCTURED_FILE_EXTENSIONS:
-                return True
-            case _:
-                return True
+        return self.extension_string.lower() not in self.STRUCTURED_FILE_EXTENSIONS and \
+               self.extension_string.lower() not in self.SEMI_STRUCTURED_FILE_EXTENSIONS
 
     @property
     def is_standard(self):
