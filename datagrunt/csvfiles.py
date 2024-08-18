@@ -5,12 +5,11 @@
 # standard library
 import csv
 import json
-
 # third party libraries
 
 # local libraries
-from . databases import DuckDBDatabase
-from . file_utils import FileEvaluator
+from core.databases import DuckDBDatabase
+from core.filehelpers import FileEvaluator
 
 class CSVFile(FileEvaluator):
 

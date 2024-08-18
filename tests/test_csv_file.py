@@ -1,8 +1,10 @@
 import unittest
+import os
 from pathlib import Path
 import sys
 sys.path.append('../')  # Add the parent directory to the search path
-from libs.data_processing import CSVFile
+sys.path.append('../datagrunt')  # Add the parent directory to the search path
+from datagrunt.csvfiles import CSVFile
 
 class TestCSVFile(unittest.TestCase):
 
