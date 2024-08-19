@@ -87,7 +87,7 @@ class TestCSVFile(unittest.TestCase):
 
     def test_delimiter(self):
         """Test delimiter method."""
-        self.assertEqual(self.test_csv_file.delimiter(), ',')
+        self.assertEqual(self.test_csv_file.delimiter, ',')
 
     def test_quotechar(self):
         """Test quotechar method."""

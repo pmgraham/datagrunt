@@ -72,16 +72,20 @@ class CSVFile(FileEvaluator):
     
         return delimiter
 
+    @property
+    def delimiter(self):
+        """Return the delimiter used in the CSV file."""
+        return self._infer_csv_delimiter()
+
     def _csv_import_table_statement(self):
         """Default CSV import table statement."""
-        delimiter = self._infer_csv_delimiter()
-        df = pd.read_csv(self.filepath, sep=delimiter, nrows=5)
+        df = pd.read_csv(self.filepath, sep=self.delimiter, nrows=5)
         columns = {c: 'VARCHAR' for c in df.columns.tolist()}
         return f"""CREATE OR REPLACE TABLE {self.duckdb_instance.database_table_name}
                  AS SELECT * 
                  FROM read_csv('{self.filepath}', 
                                 auto_detect=false,
-                                delim='{self._infer_csv_delimiter()}',
+                                delim='{self.delimiter}',
                                 header = true,
                                 columns = {columns}, 
                                 null_padding=true,
@@ -114,7 +118,7 @@ class CSVFile(FileEvaluator):
             csvfile.seek(0)  # Reset file pointer to the beginning
 
             attributes = {
-                'delimiter': self._infer_csv_delimiter(),
+                'delimiter': self.delimiter,
                 'quotechar': dialect.quotechar,
                 'escapechar': dialect.escapechar,
                 'doublequote': dialect.doublequote,
@@ -154,10 +158,6 @@ class CSVFile(FileEvaluator):
         """Return the number of columns in the CSV file."""
         return len(self.columns_string().split(','))
 
-    def delimiter(self):
-        """Return the delimiter used in the CSV file."""
-        return self._infer_csv_delimiter()
-
     def quotechar(self):
         """Return the quote character used in the CSV file."""
         return self.attributes()['quotechar']
@@ -173,7 +173,7 @@ class CSVFile(FileEvaluator):
     def to_dicts(self):
         """Converts Dataframe to list of dictionaries."""
         with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
-            csv_reader = csv.DictReader(csv_file, delimiter=self.delimiter())
+            csv_reader = csv.DictReader(csv_file, delimiter=self.delimiter)
             return list(csv_reader)
 
     def to_dataframe(self):
