@@ -73,6 +73,9 @@ class DuckDBDatabase:
         
         Args:
             sql_import_statement (str): SQL statement to import data.
+        
+        Return:
+            Polars dataframe.
         """
         with self.database_connection as con:
             con.sql(sql_import_statement)

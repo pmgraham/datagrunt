@@ -25,16 +25,33 @@ class CSVFile(FileEvaluator):
         """
         super().__init__(filepath)
         self.duckdb_instance = DuckDBDatabase(self.filepath)
+        if self.extension_string.lower() not in self.CSV_FILE_EXTENSIONS:
+            raise ValueError(f"File extension '{self.extension_string}' is not a valid CSV file extension.")
 
     def _csv_import_table_statement(self):
         """Default CSV import table statement."""
         return f"""CREATE OR REPLACE TABLE {self.duckdb_instance.database_table_name}
                  AS SELECT * FROM read_csv('{self.filepath}', all_varchar=True)""" # preserve integrity of data by importing as strings
+    
+    def select_from_table(self, sql_statement):
+        """Select from duckdb table. This method gives the user an option to
+           write a data transformation as a SQL statement. Results returned
+           as a Polars dataframe.
+        
+        Args:
+            sql_statement (str): SQL statement to import data.
+        
+        Return:
+            Polars dataframe.
+        """
+        with self.duckdb_instance.database_connection as con:
+            con.sql(self._csv_import_table_statement())
+            return con.query(sql_statement).pl()
 
     def attributes(self):
         """Return the attributes of the CSV file."""
         with self.duckdb_instance.database_connection as con:
-            df = con.sql(f"FROM sniff_csv('{self.filepath}')").pl()
+            df = con.sql(f"FROM sniff_csv('{self.filepath}', sample_size=5)").pl()
             return df.to_dicts()[0]
 
     def row_count_with_header(self):
