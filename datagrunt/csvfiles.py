@@ -25,7 +25,7 @@ class CSVFile(FileEvaluator):
         super().__init__(filepath)
         self.duckdb_instance = DuckDBDatabase(self.filepath)
 
-    def csv_import_table_statement(self):
+    def _csv_import_table_statement(self):
         """Default CSV import table statement."""
         return f"""CREATE OR REPLACE TABLE {self.duckdb_instance.database_table_name}
                  AS SELECT * FROM read_csv('{self.filepath}', all_varchar=True)""" # preserve integrity of data by importing as strings
@@ -97,7 +97,7 @@ class CSVFile(FileEvaluator):
 
     def to_dataframe(self):
         """Converts CSV to a Polars dataframe."""
-        return self.duckdb_instance.to_dataframe(self.csv_import_table_statement())
+        return self.duckdb_instance.to_dataframe(self._csv_import_table_statement())
 
     def to_json(self):
          """Converts CSV to a JSON string."""
@@ -111,16 +111,16 @@ class CSVFile(FileEvaluator):
 
     def write_json(self):
         """Writes JSON to a file."""
-        self.duckdb_instance.to_json(self.csv_import_table_statement())
+        self.duckdb_instance.to_json(self._csv_import_table_statement())
 
     def write_json_newline_delimited(self):
         """Writes JSON to a file with newline delimited."""
-        self.duckdb_instance.to_json_new_line_delimited(self.csv_import_table_statement())
+        self.duckdb_instance.to_json_new_line_delimited(self._csv_import_table_statement())
 
     def write_parquet(self):
         """Writes data to a Parquet file."""
-        self.duckdb_instance.to_parquet(self.csv_import_table_statement())
+        self.duckdb_instance.to_parquet(self._csv_import_table_statement())
 
     def write_excel(self):
         """Writes data to an Excel file."""
-        self.duckdb_instance.to_excel(self.csv_import_table_statement())
+        self.duckdb_instance.to_excel(self._csv_import_table_statement())
