@@ -72,7 +72,7 @@ class DuckDBDatabase:
             con.sql(sql_import_statement)
             con.sql(self.export_to_json_array_statement())
 
-    def to_json_new_line_delimited(self, sql_import_statement):
+    def to_json_newline_delimited(self, sql_import_statement):
         """Export data as a JSON new line delimited file."""
         with self.database_connection as con:
             con.sql(sql_import_statement)
