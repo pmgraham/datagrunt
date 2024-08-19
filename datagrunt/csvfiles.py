@@ -115,7 +115,7 @@ class CSVFile(FileEvaluator):
 
     def write_json_newline_delimited(self):
         """Writes JSON to a file with newline delimited."""
-        self.duckdb_instance.to_json_new_line_delimited(self._csv_import_table_statement())
+        self.duckdb_instance.to_json_newline_delimited(self._csv_import_table_statement())
 
     def write_parquet(self):
         """Writes data to a Parquet file."""
