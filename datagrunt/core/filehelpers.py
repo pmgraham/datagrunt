@@ -25,10 +25,10 @@ class FileBase:
         self.extension = Path(filepath).suffix
         self.extension_string = self.extension.replace('.', '')
         self.size_in_bytes = os.path.getsize(filepath)
-        self.size_in_kb = self.size_in_bytes / self.FILE_SIZE_DIVISOR
-        self.size_in_mb = self.size_in_kb / self.FILE_SIZE_DIVISOR
-        self.size_in_gb = self.size_in_mb / self.FILE_SIZE_DIVISOR
-        self.size_in_tb = self.size_in_gb / self.FILE_SIZE_DIVISOR
+        self.size_in_kb = round((self.size_in_bytes / self.FILE_SIZE_DIVISOR), 5)
+        self.size_in_mb = round((self.size_in_kb / self.FILE_SIZE_DIVISOR), 5)
+        self.size_in_gb = round((self.size_in_mb / self.FILE_SIZE_DIVISOR), 5)
+        self.size_in_tb = round((self.size_in_gb / self.FILE_SIZE_DIVISOR), 5)
 
 class FileEvaluator(FileBase):
     """Class to evaluate file types and to instantiate the right class."""
