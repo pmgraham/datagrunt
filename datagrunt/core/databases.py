@@ -34,7 +34,7 @@ class DuckDBDatabase:
 
     def _set_database_table_name(self):
         """Return name of duckdb import table created during file import."""
-        return f'{Path(self.filepath).stem}.db'
+        return f'{Path(self.filepath).stem}'
 
     @property
     def database_connection(self, threads=DEFAULT_THREAD_COUNT):
