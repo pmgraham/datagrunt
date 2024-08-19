@@ -32,6 +32,10 @@ class TestCSVFile(unittest.TestCase):
         """Test is_standard property."""
         self.assertTrue(self.test_csv_file.is_standard)
 
+    def test_is_unstructured(self):
+        """Test is_standard property."""
+        self.assertFalse(self.test_csv_file.is_unstructured)
+
     def test_is_empty(self):
         """Test is_empty property."""
         self.assertFalse(self.test_csv_file.is_empty)
