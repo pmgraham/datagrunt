@@ -3,10 +3,14 @@
 """
 
 # standard library
+from collections import Counter
 import csv
 import json
+from operator import itemgetter
+import re
 
 # third party libraries
+import pandas as pd
 
 # local libraries
 from core.databases import DuckDBDatabase
@@ -15,6 +19,15 @@ from core.filehelpers import FileEvaluator
 class CSVFile(FileEvaluator):
 
     DEFAULT_ENCODING = 'utf-8'
+    DEFAULT_DELIMITER = ','
+    DEFAULT_SAMPLE_ROWS = 5
+
+    QUOTING_MAP = {
+        0: 'no quoting',
+        1: 'quote all',
+        2: 'quote minimal',
+        3: 'quote non-numeric'
+    }
 
     def __init__(self, filepath):
         """
@@ -27,11 +40,53 @@ class CSVFile(FileEvaluator):
         self.duckdb_instance = DuckDBDatabase(self.filepath)
         if self.extension_string.lower() not in self.CSV_FILE_EXTENSIONS:
             raise ValueError(f"File extension '{self.extension_string}' is not a valid CSV file extension.")
+    
+    def _infer_csv_delimiter(self, number_of_sample_rows=5):
+        """Function to infer the delimiter of a CSV file.
+
+        Args:
+            number_of_sample_rows (int): Number of rows to be sampled from the file.
+
+        Returns:
+            str: Delimiter
+        """
+        df = pd.read_csv(self.filepath, nrows=number_of_sample_rows, sep=self.DEFAULT_DELIMITER)
+        columns = df.columns.to_list()
+
+        # The assumption is if only one column then the delimiter isn't correct
+        # The next steps will attempt to derive the delimiter even if not a commonly used one
+        if len(columns) <= 1:
+
+            # Regular expression to match non-alphanumeric characters. Excludes spaces.
+            regex = re.compile('[^0-9a-zA-Z ]')
+
+            # Count occurrences of each non-alphanumeric character
+            # Assumption is highest count non-alphanumeric will be the delimiter
+            counts = Counter(char for string in columns for char in regex.findall(string))
+
+            # Find the most common non-alphanumeric character(s) and attempt to use as a delimiter
+            most_common = counts.most_common()
+            delimiter = max(most_common, key=itemgetter(1))[0]
+        else:
+            delimiter = self.DEFAULT_DELIMITER
+    
+        return delimiter
 
     def _csv_import_table_statement(self):
         """Default CSV import table statement."""
+        delimiter = self._infer_csv_delimiter()
+        df = pd.read_csv(self.filepath, sep=delimiter, nrows=5)
+        columns = {c: 'VARCHAR' for c in df.columns.tolist()}
         return f"""CREATE OR REPLACE TABLE {self.duckdb_instance.database_table_name}
-                 AS SELECT * FROM read_csv('{self.filepath}', all_varchar=True)""" # preserve integrity of data by importing as strings
+                 AS SELECT * 
+                 FROM read_csv('{self.filepath}', 
+                                auto_detect=false,
+                                delim='{self._infer_csv_delimiter()}',
+                                header = true,
+                                columns = {columns}, 
+                                null_padding=true,
+                                all_varchar=True)
+                """ # preserve integrity of data by importing as strings
     
     def select_from_table(self, sql_statement):
         """Select from duckdb table. This method gives the user an option to
@@ -47,12 +102,29 @@ class CSVFile(FileEvaluator):
         with self.duckdb_instance.database_connection as con:
             con.sql(self._csv_import_table_statement())
             return con.query(sql_statement).pl()
-
+    
     def attributes(self):
-        """Return the attributes of the CSV file."""
-        with self.duckdb_instance.database_connection as con:
-            df = con.sql(f"FROM sniff_csv('{self.filepath}', sample_size=5)").pl()
-            return df.to_dicts()[0]
+        """Generate CSV attributes."""
+        delimiter = self._infer_csv_delimiter()
+        df = pd.read_csv(self.filepath, sep=delimiter, nrows=5)
+        columns = {c: 'VARCHAR' for c in df.columns.tolist()}
+        with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csvfile:
+            # Sniff the file to detect parameters
+            dialect = csv.Sniffer().sniff(csvfile.read(5))
+            csvfile.seek(0)  # Reset file pointer to the beginning
+
+            attributes = {
+                'delimiter': self._infer_csv_delimiter(),
+                'quotechar': dialect.quotechar,
+                'escapechar': dialect.escapechar,
+                'doublequote': dialect.doublequote,
+                'newline_delimiter': dialect.lineterminator,
+                'skipinitialspace': dialect.skipinitialspace,
+                'quoting': self.QUOTING_MAP.get(dialect.quoting),
+                'columns': columns
+            }
+
+        return attributes
 
     def row_count_with_header(self):
         """Return the number of lines in the CSV file including the header."""
@@ -63,10 +135,10 @@ class CSVFile(FileEvaluator):
         """Return the number of lines in the CSV file excluding the header."""
         return self.row_count_with_header() - 1
 
-    def columns_schema(self):
+    def columns(self):
         """Return the schema of the columns in the CSV file."""
         attributes = self.attributes()
-        return attributes['Columns']
+        return attributes['columns']
 
     def columns_string(self):
         """Return the first row of the CSV file."""
@@ -84,28 +156,19 @@ class CSVFile(FileEvaluator):
 
     def delimiter(self):
         """Return the delimiter used in the CSV file."""
-        attributes = self.attributes()
-        return attributes['Delimiter']
+        return self._infer_csv_delimiter()
 
     def quotechar(self):
         """Return the quote character used in the CSV file."""
-        attributes = self.attributes()
-        return attributes['Quote']
+        return self.attributes()['quotechar']
 
     def escapechar(self):
         """Return the escape character used in the CSV file."""
-        attributes = self.attributes()
-        return attributes['Escape']
+        return self.attributes()['escapechar']
 
     def newline_delimiter(self):
         """Return the newline delimiter used in the CSV file."""
-        attributes = self.attributes()
-        return attributes['NewLineDelimiter']
-
-    def has_header(self):
-        """Return True if the CSV file has a header, False otherwise."""
-        attributes = self.attributes()
-        return attributes['HasHeader']
+        return self.attributes()['newline_delimiter']
 
     def to_dicts(self):
         """Converts Dataframe to list of dictionaries."""
