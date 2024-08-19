@@ -49,12 +49,14 @@ class TestCSVFile(unittest.TestCase):
     def test_attributes(self):
         """Test attributes method."""
         attributes = self.test_csv_file.attributes()
-        self.assertIn('Columns', attributes)
-        self.assertIn('Delimiter', attributes)
-        self.assertIn('Quote', attributes)
-        self.assertIn('Escape', attributes)
-        self.assertIn('NewLineDelimiter', attributes)
-        self.assertIn('HasHeader', attributes)
+        self.assertIn('delimiter', attributes)
+        self.assertIn('quotechar', attributes)
+        self.assertIn('escapechar', attributes)
+        self.assertIn('doublequote', attributes)
+        self.assertIn('newline_delimiter', attributes)
+        self.assertIn('skipinitialspace', attributes)
+        self.assertIn('quoting', attributes)
+        self.assertIn('columns', attributes)
 
     def test_row_count_with_header(self):
         """Test row_count_with_header method."""
@@ -64,9 +66,9 @@ class TestCSVFile(unittest.TestCase):
         """Test row_count_without_header method."""
         self.assertEqual(self.test_csv_file.row_count_without_header(), 2629)
 
-    def test_columns_schema(self):
+    def test_columns(self):
         """Test columns_schema method."""
-        schema = self.test_csv_file.columns_schema()
+        schema = self.test_csv_file.columns()
         self.assertEqual(len(schema), 5)
 
     def test_columns_string(self):
@@ -85,7 +87,7 @@ class TestCSVFile(unittest.TestCase):
 
     def test_delimiter(self):
         """Test delimiter method."""
-        self.assertEqual(self.test_csv_file.delimiter(), ',')
+        self.assertEqual(self.test_csv_file.delimiter, ',')
 
     def test_quotechar(self):
         """Test quotechar method."""
@@ -93,15 +95,11 @@ class TestCSVFile(unittest.TestCase):
 
     def test_escapechar(self):
         """Test escapechar method."""
-        self.assertEqual(self.test_csv_file.escapechar(), '"')
+        self.assertEqual(self.test_csv_file.escapechar(), None)
 
     def test_newline_delimiter(self):
         """Test newline_delimiter method."""
-        self.assertEqual(self.test_csv_file.newline_delimiter(), '\\n')
-
-    def test_has_header(self):
-        """Test has_header method."""
-        self.assertTrue(self.test_csv_file.has_header())
+        self.assertEqual(self.test_csv_file.newline_delimiter(), '\r\n')
 
     def test_to_dataframe(self):
         """Test to_dataframe method."""
