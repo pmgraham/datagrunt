@@ -46,15 +46,19 @@ class DuckDBDatabase:
         return f"SELECT * FROM {self.database_table_name}"
 
     def export_to_json_array_statement(self):
+        """Export SQL statement to export data as a JSON file."""
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{self.JSON_OUT_FILENAME}' (ARRAY true) "
 
     def export_to_json_new_line_delimited_statement(self):
+        """Export SQL statement to export data as a JSON newline delimited file."""
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{self.JSON_NEWLINE_OUT_FILENAME}'"
 
     def export_to_parquet_statement(self):
+        """Export SQL statement to export data as a parquet file."""
         return f"COPY (SELECT * FROM {self.database_table_name}) TO 'output.parquet'(FORMAT PARQUET)"
 
     def export_to_excel_statement(self):
+        """Export SQL statement to export data as an Excel file."""
         return f"""
         INSTALL spatial;
         LOAD spatial;
