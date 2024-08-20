@@ -16,7 +16,117 @@ import pandas as pd
 from core.databases import DuckDBDatabase
 from core.filehelpers import FileEvaluator
 
-class CSVFile(FileEvaluator):
+# TODO CSVParser is a mess. Need to clean it up so that methods have a single idempotent responsibility and not be intertwined with state.
+
+class CSVParser(FileEvaluator):
+    """Class for parsing CSV files. Mostly determining the delimiter."""
+
+    COMMON_DELIMITERS = [',', ';', '|', '\t', ' ', '^']
+    COMMON_DELIMTERS_STRING = ''.join(COMMON_DELIMITERS)
+    DELIMITER_REGEX_PATTERN = r'[^0-9a-zA-Z]'
+
+    def __init__(self, filepath):
+        super().__init__(filepath)
+        self.first_row = self._get_first_line_from_file()
+        self.first_row_no_spaces = self._remove_spaces_from_string()
+
+    def _get_first_line_from_file(self):
+        """Reads and returns the first line of a file.
+
+        Args:
+            filename: The path to the file.
+
+        Returns:
+            The first line of the file, stripped of leading/trailing whitespace,
+            or None if the file is empty.
+        """
+        with open(self.filepath, 'r') as csv_file:
+            first_line = csv_file.readline().strip()
+        return first_line
+
+    def _remove_spaces_from_string(self):
+        """Remove all spaces from a given string.
+        
+        Args:
+            text (str): The string to remove spaces from.
+
+        Returns:
+            str: The string with all spaces removed.
+        """
+        return self.first_row.replace(" ", "")
+
+    def get_last_character_from_string(self):
+        """Get the last character of a given string.
+        
+        Args:
+            text (str): The string to get the last character from.
+
+        Returns:
+            str: The last character of the string.
+        """
+        return self.first_row[-1]
+
+    def return_string_without_last_non_alpha_numeric_character(self):
+        """Return the string without the last non alpha numeric character.
+        
+        Args:
+            text (str): The string to return without the last non alpha numeric character.
+
+        Returns:
+            str: The string without the last non alpha numeric character.
+        """
+        # headers = self.remove_spaces_from_string()
+        if not self.get_last_character_from_string().isalnum():
+            headers = self.first_row[0:len(self.first_row)-1]
+        else:
+            headers = self.first_row
+        return headers
+
+    def remove_trailing_non_alpha_numeric_character_from_string(self):
+        """Clean the headers of a given string.
+        
+        Args:
+            text (str): The string to clean.
+
+        Returns:
+            str: The cleaned string.
+        """
+        headers_no_spaces = self.remove_spaces_from_string()
+        return self.return_string_without_last_non_alpha_numeric_character(headers_no_spaces)
+
+    def get_most_common_non_alpha_numeric_character_from_string(self):
+        """Get the most common non-alpha-numeric character from a given string.
+        
+        Args:
+            text (str): The string to get the most common non-alpha-numeric character from.
+
+        Returns:
+            str: The most common non-alpha-numeric character from the string.
+        """
+        regex = re.compile(self.DELIMITER_REGEX_PATTERN)
+        counts = Counter(char for char in regex.findall(self.first_row))
+        most_common = counts.most_common()
+        return most_common
+
+    def infer_csv_file_delimiter(self):
+        """Infer the delimiter of a CSV file.
+        
+        Args:
+            csv_file (str): The path to the CSV file.
+
+        Returns:
+            str: The delimiter of the CSV file.
+        """
+        clean_headers = self.remove_trailing_non_alpha_numeric_character_from_string()
+        delimiter_candidates = self.get_most_common_non_alpha_numeric_character_from_string(clean_headers)
+        if len(delimiter_candidates) < 1:
+            delimiter = ' '
+        else:
+            delimiter = delimiter_candidates[0][0]
+        return delimiter
+
+
+class CSVFile(CSVParser):
 
     DEFAULT_ENCODING = 'utf-8'
     DEFAULT_DELIMITER = ','
