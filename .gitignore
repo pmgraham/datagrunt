@@ -56,7 +56,8 @@ test_data/
 *.db
 *.jpg
 *.Identifier
-dev.py
+# dev.py
+tests/*.py
 
 # Translations
 *.mo
