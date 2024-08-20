@@ -20,7 +20,7 @@ class CSVFile(FileEvaluator):
 
     DEFAULT_ENCODING = 'utf-8'
     DEFAULT_DELIMITER = ','
-    DEFAULT_SAMPLE_ROWS = 5
+    DEFAULT_SAMPLE_ROWS = 1
 
     QUOTING_MAP = {
         0: 'no quoting',
@@ -63,7 +63,6 @@ class CSVFile(FileEvaluator):
             # Count occurrences of each non-alphanumeric character
             # Assumption is highest count non-alphanumeric will be the delimiter
             counts = Counter(char for string in columns for char in regex.findall(string))
-
             # Find the most common non-alphanumeric character(s) and attempt to use as a delimiter
             most_common = counts.most_common()
             delimiter = max(most_common, key=itemgetter(1))[0]
