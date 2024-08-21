@@ -66,7 +66,7 @@ class CSVParser(FileEvaluator):
         """
         return self.first_row[-1]
 
-    def return_string_without_last_non_alpha_numeric_character(self):
+    def get_string_without_last_non_alpha_numeric_character(self):
         """Return the string without the last non alpha numeric character.
         
         Args:
@@ -92,7 +92,7 @@ class CSVParser(FileEvaluator):
             str: The cleaned string.
         """
         headers_no_spaces = self.remove_spaces_from_string()
-        return self.return_string_without_last_non_alpha_numeric_character(headers_no_spaces)
+        return self.get_string_without_last_non_alpha_numeric_character(headers_no_spaces)
 
     def get_most_common_non_alpha_numeric_character_from_string(self):
         """Get the most common non-alpha-numeric character from a given string.
@@ -157,7 +157,7 @@ class CSVFile(CSVParser):
 
     def _csv_import_table_statement(self):
         """Default CSV import table statement."""
-        columns_list = self.return_string_without_last_non_alpha_numeric_character().split(self.delimiter)
+        columns_list = self.get_string_without_last_non_alpha_numeric_character().split(self.delimiter)
         columns = {c: 'VARCHAR' for c in columns_list}
         return f"""CREATE OR REPLACE TABLE {self.duckdb_instance.database_table_name}
                  AS SELECT * 
