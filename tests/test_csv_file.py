@@ -46,9 +46,9 @@ class TestCSVFile(unittest.TestCase):
         self.assertFalse(self.test_csv_file.is_large)
         self.assertTrue(self.test_large_csv_file.is_large)
 
-    def test_attributes(self):
+    def test_get_attributes(self):
         """Test attributes method."""
-        attributes = self.test_csv_file.attributes()
+        attributes = self.test_csv_file.get_attributes()
         self.assertIn('delimiter', attributes)
         self.assertIn('quotechar', attributes)
         self.assertIn('escapechar', attributes)
@@ -58,48 +58,48 @@ class TestCSVFile(unittest.TestCase):
         self.assertIn('quoting', attributes)
         self.assertIn('columns', attributes)
 
-    def test_row_count_with_header(self):
+    def test_get_row_count_with_header(self):
         """Test row_count_with_header method."""
-        self.assertEqual(self.test_csv_file.row_count_with_header(), 2630)
+        self.assertEqual(self.test_csv_file.get_row_count_with_header(), 2630)
 
-    def test_row_count_without_header(self):
+    def test_get_row_count_without_header(self):
         """Test row_count_without_header method."""
-        self.assertEqual(self.test_csv_file.row_count_without_header(), 2629)
+        self.assertEqual(self.test_csv_file.get_row_count_without_header(), 2629)
 
-    def test_columns(self):
+    def test_get_columns(self):
         """Test columns_schema method."""
-        schema = self.test_csv_file.columns()
+        schema = self.test_csv_file.get_columns()
         self.assertEqual(len(schema), 5)
 
-    def test_columns_string(self):
+    def test_get_columns_string(self):
         """Test columns_string method."""
-        columns = self.test_csv_file.columns_string()
+        columns = self.test_csv_file.get_columns_string()
         self.assertEqual(columns, 'state,location,address,latitude,longitude')
 
-    def test_columns_byte_string(self):
+    def test_get_columns_byte_string(self):
         """Test columns_byte_string method."""
-        columns = self.test_csv_file.columns_byte_string()
+        columns = self.test_csv_file.get_columns_byte_string()
         self.assertEqual(columns, b'state,location,address,latitude,longitude')
 
-    def test_column_count(self):
+    def test_get_column_count(self):
         """Test column_count method."""
-        self.assertEqual(self.test_csv_file.column_count(), 5)
+        self.assertEqual(self.test_csv_file.get_column_count(), 5)
 
     def test_delimiter(self):
         """Test delimiter method."""
         self.assertEqual(self.test_csv_file.delimiter, ',')
 
-    def test_quotechar(self):
+    def test_get_quotechar(self):
         """Test quotechar method."""
-        self.assertEqual(self.test_csv_file.quotechar(), '"')
+        self.assertEqual(self.test_csv_file.get_quotechar(), '"')
 
-    def test_escapechar(self):
+    def test_get_escapechar(self):
         """Test escapechar method."""
-        self.assertEqual(self.test_csv_file.escapechar(), None)
+        self.assertEqual(self.test_csv_file.get_escapechar(), None)
 
-    def test_newline_delimiter(self):
+    def test_get_newline_delimiter(self):
         """Test newline_delimiter method."""
-        self.assertEqual(self.test_csv_file.newline_delimiter(), '\r\n')
+        self.assertEqual(self.test_csv_file.get_newline_delimiter(), '\r\n')
 
     def test_to_dataframe(self):
         """Test to_dataframe method."""
