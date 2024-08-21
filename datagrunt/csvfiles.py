@@ -6,12 +6,9 @@
 from collections import Counter
 import csv
 import json
-from operator import itemgetter
 import re
-import string
 
 # third party libraries
-# import pandas as pd
 
 # local libraries
 from core.databases import DuckDBDatabase
