@@ -39,7 +39,7 @@ class DuckDBDatabase:
     @property
     def set_database_connection(self, threads=DEFAULT_THREAD_COUNT):
         """Establish a connection with duckdb.
-        
+
         Args:
             threads (int): Number of threads to use for duckdb.
         """
@@ -70,10 +70,10 @@ class DuckDBDatabase:
 
     def to_dataframe(self, sql_import_statement):
         """Export data as Polars a dataframe.
-        
+
         Args:
             sql_import_statement (str): SQL statement to import data.
-        
+
         Return:
             Polars dataframe.
         """
@@ -83,7 +83,7 @@ class DuckDBDatabase:
 
     def to_json(self, sql_import_statement):
         """Export data as a JSON file array.
-        
+
         Args:
             sql_import_statement (str): SQL statement to import data.
         """
@@ -93,7 +93,7 @@ class DuckDBDatabase:
 
     def to_json_newline_delimited(self, sql_import_statement):
         """Export data as a JSON newline delimited file.
-        
+
         Args:
             sql_import_statement (str): SQL statement to import data.
         """
@@ -103,7 +103,7 @@ class DuckDBDatabase:
 
     def to_parquet(self, sql_import_statement):
         """Export data as a parquet file.
-        
+
         Args:
             sql_import_statement (str): SQL statement to import data.
         """
@@ -113,7 +113,7 @@ class DuckDBDatabase:
 
     def to_excel(self, sql_import_statement):
         """Export data as an Excel file.
-        
+
         Args:
             sql_import_statement (str): SQL statement to import data.
         """
