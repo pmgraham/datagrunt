@@ -44,56 +44,6 @@ class CSVParser(FileEvaluator):
             first_line = csv_file.readline().strip()
         return first_line
 
-    def _remove_spaces_from_string(self):
-        """Remove all spaces from a given string.
-
-        Args:
-            text (str): The string to remove spaces from.
-
-        Returns:
-            str: The string with all spaces removed.
-        """
-        return self.first_row.replace(" ", "")
-
-    def get_last_character_from_string(self):
-        """Get the last character of a given string.
-
-        Args:
-            text (str): The string to get the last character from.
-
-        Returns:
-            str: The last character of the string.
-        """
-        return self.first_row[-1]
-
-    def get_string_without_last_non_alpha_numeric_character(self):
-        """Return the string without the last non alpha numeric character.
-
-        Args:
-            text (str): The string to return without the last non alpha numeric character.
-
-        Returns:
-            str: The string without the last non alpha numeric character.
-        """
-        # headers = self.remove_spaces_from_string()
-        if not self.get_last_character_from_string().isalnum():
-            headers = self.first_row[0:len(self.first_row)-1]
-        else:
-            headers = self.first_row
-        return headers
-
-    def remove_trailing_non_alpha_numeric_character_from_string(self):
-        """Clean the headers of a given string.
-
-        Args:
-            text (str): The string to clean.
-
-        Returns:
-            str: The cleaned string.
-        """
-        headers_no_spaces = self.remove_spaces_from_string()
-        return self.get_string_without_last_non_alpha_numeric_character(headers_no_spaces)
-
     def get_most_common_non_alpha_numeric_character_from_string(self):
         """Get the most common non-alpha-numeric character from a given string.
 
