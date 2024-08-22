@@ -14,6 +14,9 @@ import re
 from core.databases import DuckDBDatabase
 from core.filehelpers import FileEvaluator
 
+# TODO need evaluate first row in CSVParser without spaces. Spaces are errenously counted as the delimiter in certain scenarios.
+# TODO reinstate the remove spaces logic from the first line of the CSV file and re-evaluate the delimiter that way.
+
 class CSVParser(FileEvaluator):
     """Class for parsing CSV files. Mostly determining the delimiter."""
 
