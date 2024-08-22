@@ -157,18 +157,16 @@ class CSVFile(CSVParser):
 
     def _csv_import_table_statement(self):
         """Default CSV import table statement."""
-        columns_list = self.get_string_without_last_non_alpha_numeric_character().split(self.delimiter)
-        columns = {c: 'VARCHAR' for c in columns_list}
+        # all_varchar=True is set to preserve integrity of data by importing as strings.
         return f"""CREATE OR REPLACE TABLE {self.duckdb_instance.database_table_name}
                  AS SELECT * 
                  FROM read_csv('{self.filepath}', 
-                                auto_detect=false,
+                                auto_detect=true,
                                 delim='{self.delimiter}',
                                 header = true,
-                                columns = {columns}, 
                                 null_padding=true,
                                 all_varchar=True)
-                """ # preserve integrity of data by importing as strings
+                """
     
     def select_from_table(self, sql_statement):
         """Select from duckdb table. This method gives the user an option to
@@ -181,7 +179,7 @@ class CSVFile(CSVParser):
         Return:
             Polars dataframe.
         """
-        with self.duckdb_instance.database_connection as con:
+        with self.duckdb_instance.set_database_connection as con:
             con.sql(self._csv_import_table_statement())
             return con.query(sql_statement).pl()
     
