@@ -127,6 +127,34 @@ class TestCSVFile(unittest.TestCase):
         """Test to_json_new_line_delimited method."""
         jsonl_data = self.test_csv_file.to_json_newline_delimited()
         self.assertEqual(len(jsonl_data), 425897) # string object not a dict; hence the high number of chars
+    
+    def test_write_json(self):
+        """Test write_json method."""
+        output_path = Path(__file__).parent / 'test_data' / 'test.json'
+        self.test_csv_file.write_json()
+        self.assertTrue(os.path.exists(output_path))
+        os.remove(output_path)  # Clean up
+
+    def test_write_json_newline_delimited(self):
+        """Test write_json_newline_delimited method."""
+        output_path = Path(__file__).parent / 'test_data' / 'test.jsonl'
+        self.test_csv_file.write_json_newline_delimited()
+        self.assertTrue(os.path.exists(output_path))
+        os.remove(output_path)  # Clean up
+
+    def test_write_parquet(self):
+        """Test write_parquet method."""
+        output_path = Path(__file__).parent / 'test_data' / 'test.parquet'
+        self.test_csv_file.write_parquet()
+        self.assertTrue(os.path.exists(output_path))
+        os.remove(output_path)  # Clean up
+
+    def test_write_excel(self):
+        """Test write_excel method."""
+        output_path = Path(__file__).parent / 'test_data' / 'test.xlsx'
+        self.test_csv_file.write_excel()
+        self.assertTrue(os.path.exists(output_path))
+        os.remove(output_path)  # Clean up
 
 if __name__ == '__main__':
     unittest.main()
