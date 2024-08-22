@@ -130,28 +130,32 @@ class TestCSVFile(unittest.TestCase):
     
     def test_write_json(self):
         """Test write_json method."""
-        output_path = Path(__file__).parent / 'test_data' / 'test.json'
+        os.chdir(Path(__file__).parent / 'test_data')
+        output_path = 'output.json'
         self.test_csv_file.write_json()
         self.assertTrue(os.path.exists(output_path))
         os.remove(output_path)  # Clean up
 
     def test_write_json_newline_delimited(self):
         """Test write_json_newline_delimited method."""
-        output_path = Path(__file__).parent / 'test_data' / 'test.jsonl'
+        os.chdir(Path(__file__).parent / 'test_data')
+        output_path = 'output.jsonl'
         self.test_csv_file.write_json_newline_delimited()
         self.assertTrue(os.path.exists(output_path))
         os.remove(output_path)  # Clean up
 
     def test_write_parquet(self):
         """Test write_parquet method."""
-        output_path = Path(__file__).parent / 'test_data' / 'test.parquet'
+        os.chdir(Path(__file__).parent / 'test_data')
+        output_path = 'output.parquet'
         self.test_csv_file.write_parquet()
         self.assertTrue(os.path.exists(output_path))
         os.remove(output_path)  # Clean up
 
     def test_write_excel(self):
         """Test write_excel method."""
-        output_path = Path(__file__).parent / 'test_data' / 'test.xlsx'
+        os.chdir(Path(__file__).parent / 'test_data')
+        output_path = 'output.xlsx'
         self.test_csv_file.write_excel()
         self.assertTrue(os.path.exists(output_path))
         os.remove(output_path)  # Clean up
