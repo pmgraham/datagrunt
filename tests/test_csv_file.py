@@ -24,6 +24,12 @@ class TestCSVFile(unittest.TestCase):
         self.assertEqual(self.test_csv_file.extension, '.csv')
         self.assertEqual(self.test_csv_file.extension_string, 'csv')
 
+    def test_select_from_table(self):
+        """Test select_from_table method."""
+        query = f"SELECT * FROM {self.test_csv_file.duckdb_instance.database_table_name} LIMIT 10"
+        df = self.test_csv_file.select_from_table(query)
+        self.assertEqual(len(df), 10)  # Check if 10 rows are returned
+
     def test_is_structured(self):
         """Test is_structured property."""
         self.assertTrue(self.test_csv_file.is_structured)
@@ -46,9 +52,9 @@ class TestCSVFile(unittest.TestCase):
         self.assertFalse(self.test_csv_file.is_large)
         self.assertTrue(self.test_large_csv_file.is_large)
 
-    def test_attributes(self):
+    def test_get_attributes(self):
         """Test attributes method."""
-        attributes = self.test_csv_file.attributes()
+        attributes = self.test_csv_file.get_attributes()
         self.assertIn('delimiter', attributes)
         self.assertIn('quotechar', attributes)
         self.assertIn('escapechar', attributes)
@@ -58,48 +64,48 @@ class TestCSVFile(unittest.TestCase):
         self.assertIn('quoting', attributes)
         self.assertIn('columns', attributes)
 
-    def test_row_count_with_header(self):
+    def test_get_row_count_with_header(self):
         """Test row_count_with_header method."""
-        self.assertEqual(self.test_csv_file.row_count_with_header(), 2630)
+        self.assertEqual(self.test_csv_file.get_row_count_with_header(), 2630)
 
-    def test_row_count_without_header(self):
+    def test_get_row_count_without_header(self):
         """Test row_count_without_header method."""
-        self.assertEqual(self.test_csv_file.row_count_without_header(), 2629)
+        self.assertEqual(self.test_csv_file.get_row_count_without_header(), 2629)
 
-    def test_columns(self):
+    def test_get_columns(self):
         """Test columns_schema method."""
-        schema = self.test_csv_file.columns()
+        schema = self.test_csv_file.get_columns()
         self.assertEqual(len(schema), 5)
 
-    def test_columns_string(self):
+    def test_get_columns_string(self):
         """Test columns_string method."""
-        columns = self.test_csv_file.columns_string()
+        columns = self.test_csv_file.get_columns_string()
         self.assertEqual(columns, 'state,location,address,latitude,longitude')
 
-    def test_columns_byte_string(self):
+    def test_get_columns_byte_string(self):
         """Test columns_byte_string method."""
-        columns = self.test_csv_file.columns_byte_string()
+        columns = self.test_csv_file.get_columns_byte_string()
         self.assertEqual(columns, b'state,location,address,latitude,longitude')
 
-    def test_column_count(self):
+    def test_get_column_count(self):
         """Test column_count method."""
-        self.assertEqual(self.test_csv_file.column_count(), 5)
+        self.assertEqual(self.test_csv_file.get_column_count(), 5)
 
     def test_delimiter(self):
         """Test delimiter method."""
         self.assertEqual(self.test_csv_file.delimiter, ',')
 
-    def test_quotechar(self):
+    def test_get_quotechar(self):
         """Test quotechar method."""
-        self.assertEqual(self.test_csv_file.quotechar(), '"')
+        self.assertEqual(self.test_csv_file.get_quotechar(), '"')
 
-    def test_escapechar(self):
+    def test_get_escapechar(self):
         """Test escapechar method."""
-        self.assertEqual(self.test_csv_file.escapechar(), None)
+        self.assertEqual(self.test_csv_file.get_escapechar(), None)
 
-    def test_newline_delimiter(self):
+    def test_get_newline_delimiter(self):
         """Test newline_delimiter method."""
-        self.assertEqual(self.test_csv_file.newline_delimiter(), '\r\n')
+        self.assertEqual(self.test_csv_file.get_newline_delimiter(), '\r\n')
 
     def test_to_dataframe(self):
         """Test to_dataframe method."""
@@ -121,6 +127,38 @@ class TestCSVFile(unittest.TestCase):
         """Test to_json_new_line_delimited method."""
         jsonl_data = self.test_csv_file.to_json_newline_delimited()
         self.assertEqual(len(jsonl_data), 425897) # string object not a dict; hence the high number of chars
+    
+    def test_write_json(self):
+        """Test write_json method."""
+        os.chdir(Path(__file__).parent / 'test_data')
+        output_path = 'output.json'
+        self.test_csv_file.write_json()
+        self.assertTrue(os.path.exists(output_path))
+        os.remove(output_path)  # Clean up
+
+    def test_write_json_newline_delimited(self):
+        """Test write_json_newline_delimited method."""
+        os.chdir(Path(__file__).parent / 'test_data')
+        output_path = 'output.jsonl'
+        self.test_csv_file.write_json_newline_delimited()
+        self.assertTrue(os.path.exists(output_path))
+        os.remove(output_path)  # Clean up
+
+    def test_write_parquet(self):
+        """Test write_parquet method."""
+        os.chdir(Path(__file__).parent / 'test_data')
+        output_path = 'output.parquet'
+        self.test_csv_file.write_parquet()
+        self.assertTrue(os.path.exists(output_path))
+        os.remove(output_path)  # Clean up
+
+    def test_write_excel(self):
+        """Test write_excel method."""
+        os.chdir(Path(__file__).parent / 'test_data')
+        output_path = 'output.xlsx'
+        self.test_csv_file.write_excel()
+        self.assertTrue(os.path.exists(output_path))
+        os.remove(output_path)  # Clean up
 
 if __name__ == '__main__':
     unittest.main()

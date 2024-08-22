@@ -37,7 +37,7 @@ class DuckDBDatabase:
         return f'{Path(self.filepath).stem}'
 
     @property
-    def database_connection(self, threads=DEFAULT_THREAD_COUNT):
+    def set_database_connection(self, threads=DEFAULT_THREAD_COUNT):
         """Establish a connection with duckdb.
         
         Args:
@@ -77,7 +77,7 @@ class DuckDBDatabase:
         Return:
             Polars dataframe.
         """
-        with self.database_connection as con:
+        with self.set_database_connection as con:
             con.sql(sql_import_statement)
             return con.query(self.select_from_table_statement()).pl()
 
@@ -87,7 +87,7 @@ class DuckDBDatabase:
         Args:
             sql_import_statement (str): SQL statement to import data.
         """
-        with self.database_connection as con:
+        with self.set_database_connection as con:
             con.sql(sql_import_statement)
             con.sql(self.export_to_json_array_statement())
 
@@ -97,7 +97,7 @@ class DuckDBDatabase:
         Args:
             sql_import_statement (str): SQL statement to import data.
         """
-        with self.database_connection as con:
+        with self.set_database_connection as con:
             con.sql(sql_import_statement)
             con.sql(self.export_to_json_new_line_delimited_statement())
 
@@ -107,7 +107,7 @@ class DuckDBDatabase:
         Args:
             sql_import_statement (str): SQL statement to import data.
         """
-        with self.database_connection as con:
+        with self.set_database_connection as con:
             con.sql(sql_import_statement)
             con.sql(self.export_to_parquet_statement())
 
@@ -117,6 +117,6 @@ class DuckDBDatabase:
         Args:
             sql_import_statement (str): SQL statement to import data.
         """
-        with self.database_connection as con:
+        with self.set_database_connection as con:
             con.sql(sql_import_statement)
             con.sql(self.export_to_excel_statement())
