@@ -24,6 +24,12 @@ class TestCSVFile(unittest.TestCase):
         self.assertEqual(self.test_csv_file.extension, '.csv')
         self.assertEqual(self.test_csv_file.extension_string, 'csv')
 
+    def test_select_from_table(self):
+        """Test select_from_table method."""
+        query = f"SELECT * FROM {self.test_csv_file.duckdb_instance.database_table_name} LIMIT 10"
+        df = self.test_csv_file.select_from_table(query)
+        self.assertEqual(len(df), 10)  # Check if 10 rows are returned
+
     def test_is_structured(self):
         """Test is_structured property."""
         self.assertTrue(self.test_csv_file.is_structured)
