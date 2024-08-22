@@ -46,7 +46,7 @@ class CSVParser(FileEvaluator):
 
     def _remove_spaces_from_string(self):
         """Remove all spaces from a given string.
-        
+
         Args:
             text (str): The string to remove spaces from.
 
@@ -54,10 +54,10 @@ class CSVParser(FileEvaluator):
             str: The string with all spaces removed.
         """
         return self.first_row.replace(" ", "")
-    
+
     def get_last_character_from_string(self):
         """Get the last character of a given string.
-        
+
         Args:
             text (str): The string to get the last character from.
 
@@ -68,7 +68,7 @@ class CSVParser(FileEvaluator):
 
     def get_string_without_last_non_alpha_numeric_character(self):
         """Return the string without the last non alpha numeric character.
-        
+
         Args:
             text (str): The string to return without the last non alpha numeric character.
 
@@ -84,7 +84,7 @@ class CSVParser(FileEvaluator):
 
     def remove_trailing_non_alpha_numeric_character_from_string(self):
         """Clean the headers of a given string.
-        
+
         Args:
             text (str): The string to clean.
 
@@ -96,7 +96,7 @@ class CSVParser(FileEvaluator):
 
     def get_most_common_non_alpha_numeric_character_from_string(self):
         """Get the most common non-alpha-numeric character from a given string.
-        
+
         Args:
             text (str): The string to get the most common non-alpha-numeric character from.
 
@@ -110,7 +110,7 @@ class CSVParser(FileEvaluator):
 
     def infer_csv_file_delimiter(self):
         """Infer the delimiter of a CSV file.
-        
+
         Args:
             csv_file (str): The path to the CSV file.
 
@@ -159,30 +159,30 @@ class CSVFile(CSVParser):
         """Default CSV import table statement."""
         # all_varchar=True is set to preserve integrity of data by importing as strings.
         return f"""CREATE OR REPLACE TABLE {self.duckdb_instance.database_table_name}
-                 AS SELECT * 
-                 FROM read_csv('{self.filepath}', 
+                 AS SELECT *
+                 FROM read_csv('{self.filepath}',
                                 auto_detect=true,
                                 delim='{self.delimiter}',
                                 header = true,
                                 null_padding=true,
                                 all_varchar=True)
                 """
-    
+
     def select_from_table(self, sql_statement):
         """Select from duckdb table. This method gives the user an option to
            write a data transformation as a SQL statement. Results returned
            as a Polars dataframe.
-        
+
         Args:
             sql_statement (str): SQL statement to import data.
-        
+
         Return:
             Polars dataframe.
         """
         with self.duckdb_instance.set_database_connection as con:
             con.sql(self._csv_import_table_statement())
             return con.query(sql_statement).pl()
-    
+
     def get_attributes(self):
         """Generate CSV attributes."""
         columns_list = self.first_row.split(self.delimiter)
