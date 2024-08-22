@@ -127,7 +127,6 @@ class CSVParser(FileEvaluator):
             delimiter = delimiter_candidates[0][0]
         return delimiter
 
-
 class CSVFile(CSVParser):
 
     DEFAULT_ENCODING = 'utf-8'
