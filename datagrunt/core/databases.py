@@ -16,6 +16,7 @@ class DuckDBDatabase:
     DEFAULT_THREAD_COUNT = 16
     JSON_OUT_FILENAME = 'output.json'
     JSON_NEWLINE_OUT_FILENAME = 'output.jsonl'
+    CSV_OUT_FILENAME = 'output.csv'
 
     def __init__(self, filepath):
         """
@@ -48,6 +49,10 @@ class DuckDBDatabase:
     def select_from_table_statement(self):
         """Select from table."""
         return f"SELECT * FROM {self.database_table_name}"
+    
+    def export_to_csv_statement(self):
+        """Export SQL statement to export data as a CSV file."""
+        return f"COPY (SELECT * FROM {self.database_table_name}) TO 'output.csv' (HEADER, DELIMITER ',');"
 
     def export_to_json_array_statement(self):
         """Export SQL statement to export data as a JSON file."""
@@ -67,6 +72,12 @@ class DuckDBDatabase:
         INSTALL spatial;
         LOAD spatial;
         COPY (SELECT * FROM {self.database_table_name}) TO 'output.xlsx'(FORMAT GDAL, DRIVER 'xlsx')"""
+    
+    def to_csv(self, sql_import_statement):
+        """Export data as a CSV file."""
+        with self.set_database_connection as con:
+            con.sql(sql_import_statement)
+            con.sql(self.export_to_csv_statement())
 
     def to_dataframe(self, sql_import_statement):
         """Export data as Polars a dataframe.

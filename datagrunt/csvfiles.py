@@ -219,6 +219,10 @@ class CSVFile(CSVParser):
     def to_json_newline_delimited(self):
         """Converts CSV to a JSON string with newline delimited."""
         return self.to_dataframe().write_ndjson()
+    
+    def write_csv(self):
+        """Writes CSV to a file."""
+        self.duckdb_instance.to_csv(self._csv_import_table_statement())
 
     def write_json(self):
         """Writes JSON to a file."""
