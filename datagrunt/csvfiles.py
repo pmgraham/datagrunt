@@ -161,7 +161,7 @@ class CSVFile(CSVParser):
 
     def get_row_count_with_header(self):
         """Return the number of lines in the CSV file including the header."""
-        with open(self.filepath, 'r', encoding=self.duckdb_instance.DEFAULT_ENCODING) as csv_file:
+        with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
             return sum(1 for _ in csv_file)
 
     def get_row_count_without_header(self):
@@ -175,7 +175,7 @@ class CSVFile(CSVParser):
 
     def get_columns_string(self):
         """Return the first row of the CSV file."""
-        with open(self.filepath, 'r', encoding=self.duckdb_instance.DEFAULT_ENCODING) as csv_file:
+        with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
             return csv_file.readline().strip()
 
     def get_columns_byte_string(self):
