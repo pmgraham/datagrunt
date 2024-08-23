@@ -77,6 +77,12 @@ class DuckDBDatabase:
         COPY (SELECT * FROM {self.database_table_name}) TO '{self.EXCEL_OUT_FILENAME}'(FORMAT GDAL, DRIVER 'xlsx')"""
 
     def write_to_file(self, sql_import_statement, sql_export_statement):
+        """Write database content to file.
+        
+        Args:
+            sql_import_statement (str): SQL statement to import data.
+            sql_export_statement (str): SQL statement to export data.
+        """
         with self.set_database_connection as con:
             con.sql(sql_import_statement)
             con.sql(sql_export_statement)
