@@ -5,6 +5,7 @@
 # standard library
 from collections import Counter
 import csv
+from functools import lru_cache
 import json
 import re
 
@@ -13,9 +14,6 @@ import re
 # local libraries
 from core.databases import DuckDBDatabase
 from core.filehelpers import FileEvaluator
-
-# TODO need evaluate first row in CSVParser without spaces. Spaces are errenously counted as the delimiter in certain scenarios.
-# TODO reinstate the remove spaces logic from the first line of the CSV file and re-evaluate the delimiter that way.
 
 class CSVParser(FileEvaluator):
     """Class for parsing CSV files. Mostly determining the delimiter."""
@@ -122,6 +120,7 @@ class CSVFile(CSVParser):
                                 all_varchar=True)
                 """
 
+    @lru_cache
     def select_from_table(self, sql_statement):
         """Select from duckdb table. This method gives the user an option to
            write a data transformation as a SQL statement. Results returned
@@ -136,6 +135,16 @@ class CSVFile(CSVParser):
         with self.duckdb_instance.set_database_connection as con:
             con.sql(self._csv_import_table_statement())
             return con.query(sql_statement).pl()
+    
+    @lru_cache
+    def get_row_count_with_header(self):
+        """Return the number of lines in the CSV file including the header."""
+        with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
+            return sum(1 for _ in csv_file)
+
+    def get_row_count_without_header(self):
+        """Return the number of lines in the CSV file excluding the header."""
+        return self.get_row_count_with_header() - 1
 
     def get_attributes(self):
         """Generate CSV attributes."""
@@ -154,19 +163,13 @@ class CSVFile(CSVParser):
                 'newline_delimiter': dialect.lineterminator,
                 'skipinitialspace': dialect.skipinitialspace,
                 'quoting': self.QUOTING_MAP.get(dialect.quoting),
-                'columns': columns
+                'row_count_with_header': self.get_row_count_with_header(),
+                'row_count_without_header': self.get_row_count_without_header(),
+                'columns': columns,
+                'column_count': len(columns_list)
             }
 
         return attributes
-
-    def get_row_count_with_header(self):
-        """Return the number of lines in the CSV file including the header."""
-        with open(self.filepath, 'r', encoding=self.duckdb_instance.DEFAULT_ENCODING) as csv_file:
-            return sum(1 for _ in csv_file)
-
-    def get_row_count_without_header(self):
-        """Return the number of lines in the CSV file excluding the header."""
-        return self.get_row_count_with_header() - 1
 
     def get_columns(self):
         """Return the schema of the columns in the CSV file."""
@@ -175,7 +178,7 @@ class CSVFile(CSVParser):
 
     def get_columns_string(self):
         """Return the first row of the CSV file."""
-        with open(self.filepath, 'r', encoding=self.duckdb_instance.DEFAULT_ENCODING) as csv_file:
+        with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
             return csv_file.readline().strip()
 
     def get_columns_byte_string(self):
@@ -219,19 +222,37 @@ class CSVFile(CSVParser):
     def to_json_newline_delimited(self):
         """Converts CSV to a JSON string with newline delimited."""
         return self.to_dataframe().write_ndjson()
+    
+    def write_avro(self):
+        """Writes data to an Avro file."""
+        self.to_dataframe().write_avro(self.duckdb_instance.AVRO_OUT_FILENAME)
+
+    def write_csv(self):
+        """Writes CSV to a file."""
+        self.duckdb_instance.write_to_file(self._csv_import_table_statement(),
+                                           self.duckdb_instance.export_to_csv_statement()
+                                           )
 
     def write_json(self):
         """Writes JSON to a file."""
-        self.duckdb_instance.to_json(self._csv_import_table_statement())
+        self.duckdb_instance.write_to_file(self._csv_import_table_statement(),
+                                           self.duckdb_instance.export_to_json_array_statement()
+                                           )
 
     def write_json_newline_delimited(self):
         """Writes JSON to a file with newline delimited."""
-        self.duckdb_instance.to_json_newline_delimited(self._csv_import_table_statement())
+        self.duckdb_instance.write_to_file(self._csv_import_table_statement(),
+                                           self.duckdb_instance.export_to_json_new_line_delimited_statement()
+                                           )
 
     def write_parquet(self):
         """Writes data to a Parquet file."""
-        self.duckdb_instance.to_parquet(self._csv_import_table_statement())
+        self.duckdb_instance.write_to_file(self._csv_import_table_statement(),
+                                           self.duckdb_instance.export_to_parquet_statement()
+                                           )
 
     def write_excel(self):
         """Writes data to an Excel file."""
-        self.duckdb_instance.to_excel(self._csv_import_table_statement())
+        self.duckdb_instance.write_to_file(self._csv_import_table_statement(),
+                                           self.duckdb_instance.export_to_excel_statement()
+                                           )
