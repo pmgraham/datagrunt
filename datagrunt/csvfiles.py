@@ -226,7 +226,6 @@ class CSVFile(CSVParser):
 
     def write_csv(self):
         """Writes CSV to a file."""
-        # self.duckdb_instance.to_csv(self._csv_import_table_statement())
         self.duckdb_instance.write_to_file(self._csv_import_table_statement(),
                                            self.duckdb_instance.export_to_csv_statement()
                                            )
