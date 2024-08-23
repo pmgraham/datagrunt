@@ -14,10 +14,14 @@ import re
 from core.databases import DuckDBDatabase
 from core.filehelpers import FileEvaluator
 
+# TODO need evaluate first row in CSVParser without spaces. Spaces are errenously counted as the delimiter in certain scenarios.
+# TODO reinstate the remove spaces logic from the first line of the CSV file and re-evaluate the delimiter that way.
+
 class CSVParser(FileEvaluator):
     """Class for parsing CSV files. Mostly determining the delimiter."""
 
     DELIMITER_REGEX_PATTERN = r'[^0-9a-zA-Z_-]'
+    DEFAULT_DELIMITER = ','
 
     def __init__(self, filepath):
         """
@@ -53,8 +57,9 @@ class CSVParser(FileEvaluator):
         Returns:
             str: The most common non-alpha-numeric character from the string.
         """
+        columns_no_spaces = self.first_row.replace(' ', '')
         regex = re.compile(self.DELIMITER_REGEX_PATTERN)
-        counts = Counter(char for char in regex.findall(self.first_row))
+        counts = Counter(char for char in regex.findall(columns_no_spaces))
         most_common = counts.most_common()
         return most_common
 
@@ -70,7 +75,7 @@ class CSVParser(FileEvaluator):
         delimiter_candidates = self.get_most_common_non_alpha_numeric_character_from_string()
 
         if self.is_empty:
-            delimiter = None
+            delimiter = self.DEFAULT_DELIMITER
         elif len(delimiter_candidates) == 0:
             delimiter = ' '
         else:
