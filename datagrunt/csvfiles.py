@@ -56,8 +56,9 @@ class CSVParser(FileEvaluator):
         Returns:
             str: The most common non-alpha-numeric character from the string.
         """
+        columns_no_spaces = self.first_row.replace(' ', '')
         regex = re.compile(self.DELIMITER_REGEX_PATTERN)
-        counts = Counter(char for char in regex.findall(self.first_row))
+        counts = Counter(char for char in regex.findall(columns_no_spaces))
         most_common = counts.most_common()
         return most_common
 
