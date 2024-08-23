@@ -1,5 +1,6 @@
 import unittest
 import os
+from glob import glob
 from pathlib import Path
 import sys
 sys.path.append('../')  # Add the parent directory to the search path
@@ -127,6 +128,22 @@ class TestCSVFile(unittest.TestCase):
         """Test to_json_new_line_delimited method."""
         jsonl_data = self.test_csv_file.to_json_newline_delimited()
         self.assertEqual(len(jsonl_data), 425897) # string object not a dict; hence the high number of chars
+
+    def test_write_avro(self):
+        """Test write_json method."""
+        os.chdir(Path(__file__).parent / 'test_data')
+        output_path = 'output.avro'
+        self.test_csv_file.write_avro()
+        self.assertTrue(os.path.exists(output_path))
+        os.remove(output_path)  # Clean up
+
+    def test_write_csv(self):
+        """Test write_json method."""
+        os.chdir(Path(__file__).parent / 'test_data')
+        output_path = 'output.csv'
+        self.test_csv_file.write_csv()
+        self.assertTrue(os.path.exists(output_path))
+        os.remove(output_path)  # Clean up
 
     def test_write_json(self):
         """Test write_json method."""
