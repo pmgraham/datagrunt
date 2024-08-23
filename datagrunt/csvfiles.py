@@ -219,6 +219,10 @@ class CSVFile(CSVParser):
     def to_json_newline_delimited(self):
         """Converts CSV to a JSON string with newline delimited."""
         return self.to_dataframe().write_ndjson()
+    
+    def write_avro(self):
+        """Writes data to an Avro file."""
+        self.to_dataframe().write_avro(self.duckdb_instance.AVRO_OUT_FILENAME)
 
     def write_csv(self):
         """Writes CSV to a file."""
