@@ -5,6 +5,7 @@
 # standard library
 from collections import Counter
 import csv
+from functools import lru_cache
 import json
 import re
 
@@ -159,6 +160,7 @@ class CSVFile(CSVParser):
 
         return attributes
 
+    @lru_cache
     def get_row_count_with_header(self):
         """Return the number of lines in the CSV file including the header."""
         with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
