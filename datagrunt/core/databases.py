@@ -49,7 +49,7 @@ class DuckDBDatabase:
     def select_from_table_statement(self):
         """Select from table."""
         return f"SELECT * FROM {self.database_table_name}"
-    
+
     def export_to_csv_statement(self):
         """Export SQL statement to export data as a CSV file."""
         return f"COPY (SELECT * FROM {self.database_table_name}) TO 'output.csv' (HEADER, DELIMITER ',');"
@@ -72,16 +72,11 @@ class DuckDBDatabase:
         INSTALL spatial;
         LOAD spatial;
         COPY (SELECT * FROM {self.database_table_name}) TO 'output.xlsx'(FORMAT GDAL, DRIVER 'xlsx')"""
-    
-    def to_csv(self, sql_import_statement):
-        """Export data as a CSV file.
-        
-        Args:
-            sql_import_statement (str): SQL statement to import data.
-        """
+
+    def write_to_file(self, sql_import_statement, sql_export_statement):
         with self.set_database_connection as con:
             con.sql(sql_import_statement)
-            con.sql(self.export_to_csv_statement())
+            con.sql(sql_export_statement)
 
     def to_dataframe(self, sql_import_statement):
         """Export data as Polars a dataframe.
@@ -95,43 +90,3 @@ class DuckDBDatabase:
         with self.set_database_connection as con:
             con.sql(sql_import_statement)
             return con.query(self.select_from_table_statement()).pl()
-
-    def to_json(self, sql_import_statement):
-        """Export data as a JSON file array.
-
-        Args:
-            sql_import_statement (str): SQL statement to import data.
-        """
-        with self.set_database_connection as con:
-            con.sql(sql_import_statement)
-            con.sql(self.export_to_json_array_statement())
-
-    def to_json_newline_delimited(self, sql_import_statement):
-        """Export data as a JSON newline delimited file.
-
-        Args:
-            sql_import_statement (str): SQL statement to import data.
-        """
-        with self.set_database_connection as con:
-            con.sql(sql_import_statement)
-            con.sql(self.export_to_json_new_line_delimited_statement())
-
-    def to_parquet(self, sql_import_statement):
-        """Export data as a parquet file.
-
-        Args:
-            sql_import_statement (str): SQL statement to import data.
-        """
-        with self.set_database_connection as con:
-            con.sql(sql_import_statement)
-            con.sql(self.export_to_parquet_statement())
-
-    def to_excel(self, sql_import_statement):
-        """Export data as an Excel file.
-
-        Args:
-            sql_import_statement (str): SQL statement to import data.
-        """
-        with self.set_database_connection as con:
-            con.sql(sql_import_statement)
-            con.sql(self.export_to_excel_statement())

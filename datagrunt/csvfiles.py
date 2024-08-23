@@ -219,23 +219,34 @@ class CSVFile(CSVParser):
     def to_json_newline_delimited(self):
         """Converts CSV to a JSON string with newline delimited."""
         return self.to_dataframe().write_ndjson()
-    
+
     def write_csv(self):
         """Writes CSV to a file."""
-        self.duckdb_instance.to_csv(self._csv_import_table_statement())
+        # self.duckdb_instance.to_csv(self._csv_import_table_statement())
+        self.duckdb_instance.write_to_file(self._csv_import_table_statement(),
+                                           self.duckdb_instance.export_to_csv_statement()
+                                           )
 
     def write_json(self):
         """Writes JSON to a file."""
-        self.duckdb_instance.to_json(self._csv_import_table_statement())
+        self.duckdb_instance.write_to_file(self._csv_import_table_statement(),
+                                           self.duckdb_instance.export_to_json_array_statement()
+                                           )
 
     def write_json_newline_delimited(self):
         """Writes JSON to a file with newline delimited."""
-        self.duckdb_instance.to_json_newline_delimited(self._csv_import_table_statement())
+        self.duckdb_instance.write_to_file(self._csv_import_table_statement(),
+                                           self.duckdb_instance.export_to_json_new_line_delimited_statement()
+                                           )
 
     def write_parquet(self):
         """Writes data to a Parquet file."""
-        self.duckdb_instance.to_parquet(self._csv_import_table_statement())
+        self.duckdb_instance.write_to_file(self._csv_import_table_statement(),
+                                           self.duckdb_instance.export_to_parquet_statement()
+                                           )
 
     def write_excel(self):
         """Writes data to an Excel file."""
-        self.duckdb_instance.to_excel(self._csv_import_table_statement())
+        self.duckdb_instance.write_to_file(self._csv_import_table_statement(),
+                                           self.duckdb_instance.export_to_excel_statement()
+                                           )
