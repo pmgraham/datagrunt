@@ -74,7 +74,11 @@ class DuckDBDatabase:
         COPY (SELECT * FROM {self.database_table_name}) TO 'output.xlsx'(FORMAT GDAL, DRIVER 'xlsx')"""
     
     def to_csv(self, sql_import_statement):
-        """Export data as a CSV file."""
+        """Export data as a CSV file.
+        
+        Args:
+            sql_import_statement (str): SQL statement to import data.
+        """
         with self.set_database_connection as con:
             con.sql(sql_import_statement)
             con.sql(self.export_to_csv_statement())
