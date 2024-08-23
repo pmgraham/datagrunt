@@ -21,6 +21,7 @@ class CSVParser(FileEvaluator):
     """Class for parsing CSV files. Mostly determining the delimiter."""
 
     DELIMITER_REGEX_PATTERN = r'[^0-9a-zA-Z_-]'
+    DEFAULT_DELIMITER = ','
 
     def __init__(self, filepath):
         """
@@ -74,7 +75,7 @@ class CSVParser(FileEvaluator):
         delimiter_candidates = self.get_most_common_non_alpha_numeric_character_from_string()
 
         if self.is_empty:
-            delimiter = None
+            delimiter = self.DEFAULT_DELIMITER
         elif len(delimiter_candidates) == 0:
             delimiter = ' '
         else:
