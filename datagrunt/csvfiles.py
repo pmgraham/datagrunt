@@ -120,6 +120,7 @@ class CSVFile(CSVParser):
                                 all_varchar=True)
                 """
 
+    @lru_cache
     def select_from_table(self, sql_statement):
         """Select from duckdb table. This method gives the user an option to
            write a data transformation as a SQL statement. Results returned
@@ -134,6 +135,16 @@ class CSVFile(CSVParser):
         with self.duckdb_instance.set_database_connection as con:
             con.sql(self._csv_import_table_statement())
             return con.query(sql_statement).pl()
+    
+    @lru_cache
+    def get_row_count_with_header(self):
+        """Return the number of lines in the CSV file including the header."""
+        with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
+            return sum(1 for _ in csv_file)
+
+    def get_row_count_without_header(self):
+        """Return the number of lines in the CSV file excluding the header."""
+        return self.get_row_count_with_header() - 1
 
     def get_attributes(self):
         """Generate CSV attributes."""
@@ -152,20 +163,13 @@ class CSVFile(CSVParser):
                 'newline_delimiter': dialect.lineterminator,
                 'skipinitialspace': dialect.skipinitialspace,
                 'quoting': self.QUOTING_MAP.get(dialect.quoting),
-                'columns': columns
+                'row_count_with_header': self.get_row_count_with_header(),
+                'row_count_without_header': self.get_row_count_without_header(),
+                'columns': columns,
+                'column_count': len(columns_list)
             }
 
         return attributes
-
-    @lru_cache
-    def get_row_count_with_header(self):
-        """Return the number of lines in the CSV file including the header."""
-        with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
-            return sum(1 for _ in csv_file)
-
-    def get_row_count_without_header(self):
-        """Return the number of lines in the CSV file excluding the header."""
-        return self.get_row_count_with_header() - 1
 
     def get_columns(self):
         """Return the schema of the columns in the CSV file."""
