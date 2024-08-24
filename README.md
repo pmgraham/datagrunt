@@ -1,65 +1,76 @@
-## datagrunt
-Welcome to datagrunt! datagrunt is a library designed to help with reading, processing, and transforming CSV files into various other formats.
+# Welcome To datagrunt
 
-## Description
-This project was born from my time at Google as a Principal Architect and data engineer. I became frustrated with having to write similar code over and over again from project to project or from customer engagemen to customer engagement. Datagrunt was born out of this frustration.
+datagrunt is a Python library designed to simplify the way you work with CSV files. It provides a streamlined approach to reading, processing, and transforming your data into various formats, making data manipulation efficient and intuitive.
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+## Why datagrunt?
+
+Born out of real-world frustration, datagrunt eliminates the need for repetitive coding when handling CSV files. Whether you're a data analyst, data engineer, or data scientist, datagrunt empowers you to focus on insights, not tedious data wrangling.
+
+## Key Features
+
+- **Intelligent Delimiter Inference:**  Datagrunt automatically detects and applies the correct delimiter for your CSV files using a custom algorithm and the power of DuckDB.
+- **Seamless Data Processing:** Leverage the robust capabilities of DuckDB to perform advanced data processing tasks directly on your CSV data.
+- **Flexible Transformation:** Easily convert your processed CSV data into various formats to suit your needs.
+- **Pythonic API:** Enjoy a clean and intuitive API that integrates seamlessly into your existing Python workflows.
 
 ## Installation
-`pip install datagrunt`
 
-## Usage
-Instantiate the `CSVFile` class and then call class attributes and methods. The delimiter and CSV properties are inferred through a combination of a custom algorithm combined with the power of duckdb.
-If the inferred delimiter is incorrect or if you want control over which delimiter to use for the CSV file(s), simply instantiate the `CSVFile` class and reset the `delimiter` property. as follows:
+Get started with datagrunt in seconds using pip:
 
-```
-csv_file = CSVFile('myfile.csv')
-csv_file.delimiter = '|'
+```bash
+pip install datagrunt
 ```
 
-An example of normal use for the `CSVFile` class is as follows:
+## Getting Started with basic usage
 
-```
-csv_file = CSVFile('myfile.csv')
-csv_file.size_in_mb # class attribute
-csv_file.attributes() # class method
-```
+```python
+from datagrunt import CSVFile
 
-Datagrunt uses duckdb to enable enhanced data processing and to provide a SQL query engine for CSV files. Here is an example of how to take advantage of this capability. SQL query results are returned as a Polars dataframe.
-
-```
+# Load your CSV file
 csv_file = CSVFile('myfile.csv')
 
+# Access file information
+print(f"File Size: {csv_file.size_in_mb} MB") 
+print(f"CSV Attributes: {csv_file.attributes()}")
+
+# Override inferred delimiter (if needed)
+csv_file.delimiter = '|' 
+
+```
+
+##  DuckDB Integration for Powerful Queries
+```python
+from datagrunt import CSVFile
+
+csv_file = CSVFile('myfile.csv')
+
+# Construct your SQL query
 query = f"""
 SELECT * 
 FROM {csv_file.duckdb_instance.database_table_name} 
 LIMIT 10
 """
 
+# Execute the query and get results as a Polars DataFrame
 df = csv_file.select_from_table(query)
 print(df.head())
 ```
 
+## Contributing
+We welcome contributions from the community! If you'd like to contribute to datagrunt, please follow these steps:
+
+    - Fork the repository.
+    - Create a new branch for your feature or bug fix.
+    - Write tests to cover your changes.
+    - Ensure your code passes all tests and follows the project's style guidelines.
+    - Submit a pull request for review.
+
 ## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
 
 ## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
 
 ## License
-For open source projects, say how it is licensed.
+This project is licensed under the [MIT License](https://opensource.org/license/mit)
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+## Acknowledgements
+A HUGE thank you to the open-source community and the creators of [DuckDB](https://duckdb.org) and [Polars](https://pola.rs) for their fantastic libraries that power datagrunt.
