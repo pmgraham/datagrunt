@@ -35,10 +35,9 @@ print(f"CSV Attributes: {csv_file.attributes()}")
 
 # Override inferred delimiter (if needed)
 csv_file.delimiter = '|' 
-
 ```
 
-##  DuckDB Integration for Powerful Queries
+##  DuckDB Integration for Performant SQL Queries
 ```python
 from datagrunt.csvfiles import CSVFile
 
