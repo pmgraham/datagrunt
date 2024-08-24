@@ -46,11 +46,10 @@ csv_file = CSVFile('myfile.csv')
 
 # Construct your SQL query
 query = f"""
-SELECT * 
-FROM {csv_file.duckdb_instance.database_table_name} 
-LIMIT 10
+    SELECT * 
+    FROM {csv_file.duckdb_instance.database_table_name} 
+    LIMIT 10
 """
-
 # Execute the query and get results as a Polars DataFrame
 df = csv_file.select_from_table(query)
 print(df.head())
