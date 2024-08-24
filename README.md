@@ -21,10 +21,10 @@ Get started with datagrunt in seconds using pip:
 pip install datagrunt
 ```
 
-## Getting Started with basic usage
+## Getting Started
 
 ```python
-from datagrunt import CSVFile
+from datagrunt.csvfiles import CSVFile
 
 # Load your CSV file
 csv_file = CSVFile('myfile.csv')
