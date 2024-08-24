@@ -40,7 +40,7 @@ csv_file.delimiter = '|'
 
 ##  DuckDB Integration for Powerful Queries
 ```python
-from datagrunt import CSVFile
+from datagrunt.csvfiles import CSVFile
 
 csv_file = CSVFile('myfile.csv')
 
