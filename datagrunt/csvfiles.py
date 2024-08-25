@@ -273,7 +273,7 @@ class CSVFile(CSVParser):
                                               self.duckdb_instance.JSON_NEWLINE_OUT_FILENAME,
                                               out_filename)
         else:
-            sql = self.duckdb_instance.export_to_json_new_line_delimited_statement()
+            sql = self.duckdb_instance.export_to_json_newline_delimited_statement()
         self.duckdb_instance.write_to_file(self._csv_import_table_statement(), sql)
 
     def write_parquet(self, out_filename=None):
