@@ -241,13 +241,21 @@ class CSVFile(CSVParser):
         return self.to_dataframe().write_ndjson()
 
     def write_avro(self, out_filename=None):
-        """Writes data to an Avro file."""
+        """Writes data to an Avro file.
+        
+        Args:
+            out_filename (str): The name of the output file.
+        """
         if not out_filename:
             filename = self.duckdb_instance.AVRO_OUT_FILENAME
         self.to_dataframe().write_avro(filename)
 
     def write_csv(self, out_filename=None):
-        """Writes CSV to a file."""
+        """Writes CSV to a file.
+        
+        Args:
+            out_filename (str): The name of the output file.
+        """
         if out_filename:
             sql = self.update_sql_output_file(self.duckdb_instance.export_to_csv_statement(),
                                               self.duckdb_instance.CSV_OUT_FILENAME,
@@ -257,7 +265,11 @@ class CSVFile(CSVParser):
         self.duckdb_instance.write_to_file(self._csv_import_table_statement(), sql)
 
     def write_json(self, out_filename=None):
-        """Writes JSON to a file."""
+        """Writes JSON to a file.
+        
+        Args:
+            out_filename (str): The name of the output file.
+        """
         if out_filename:
             sql = self.update_sql_output_file(self.duckdb_instance.export_to_json_array_statement(),
                                               self.duckdb_instance.JSON_OUT_FILENAME,
@@ -267,7 +279,11 @@ class CSVFile(CSVParser):
         self.duckdb_instance.write_to_file(self._csv_import_table_statement(), sql)
 
     def write_json_newline_delimited(self, out_filename=None):
-        """Writes JSON to a file with newline delimited."""
+        """Writes JSON to a file with newline delimited.
+        
+        Args:
+            out_filename (str): The name of the output file.
+        """
         if out_filename:
             sql = self.update_sql_output_file(self.duckdb_instance.export_to_json_newline_delimited_statement(),
                                               self.duckdb_instance.JSON_NEWLINE_OUT_FILENAME,
@@ -277,7 +293,11 @@ class CSVFile(CSVParser):
         self.duckdb_instance.write_to_file(self._csv_import_table_statement(), sql)
 
     def write_parquet(self, out_filename=None):
-        """Writes data to a Parquet file."""
+        """Writes data to a Parquet file.
+        
+        Args:
+            out_filename (str): The name of the output file.
+        """
         if out_filename:
             sql = self.update_sql_output_file(self.duckdb_instance.export_to_parquet_statement(),
                                               self.duckdb_instance.PARQUET_OUT_FILENAME,
@@ -287,7 +307,11 @@ class CSVFile(CSVParser):
         self.duckdb_instance.write_to_file(self._csv_import_table_statement(), sql)
 
     def write_excel(self, out_filename=None):
-        """Writes data to an Excel file."""
+        """Writes data to an Excel file.
+        
+        Args:
+            out_filename (str): The name of the output file.
+        """
         if self.get_row_count_without_header() > self.EXCEL_ROW_LIMIT:
             logging.basicConfig(level=logging.WARNING, format='%(levelname)s - %(message)s')
             logging.warning(f"Row count {self.get_row_count_without_header()} is greater than Excel row limit of {self.EXCEL_ROW_LIMIT}. Data will be lost.")
