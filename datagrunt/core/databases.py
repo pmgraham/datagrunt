@@ -1,6 +1,7 @@
 """Module for interfacing with databases."""
 
 # standard library
+import os
 from pathlib import Path
 
 # third party libraries
@@ -32,6 +33,12 @@ class DuckDBDatabase:
         self.database_filename = self._set_database_filename()
         self.database_table_name = self._set_database_table_name()
         self.database_connection = self._set_database_connection()
+    
+    def __del__(self):
+        """Delete .db files created locally during garbage collection."""
+        self.database_connection.close()
+        if os.path.exists(self.database_filename):
+            os.remove(self.database_filename)
 
     def _set_database_filename(self):
         """Return name of duckdb file created at runtime."""
