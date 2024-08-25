@@ -148,9 +148,8 @@ class CSVFile(CSVParser):
 
     def to_dicts(self):
         """Converts Dataframe to list of dictionaries."""
-        delimiter = self.infer_csv_file_delimiter()
         with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
-            csv_reader = csv.DictReader(csv_file, delimiter=delimiter)
+            csv_reader = csv.DictReader(csv_file, delimiter=self.delimiter)
             return list(csv_reader)
 
     def to_dataframe(self):
