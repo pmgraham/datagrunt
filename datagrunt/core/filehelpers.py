@@ -129,10 +129,10 @@ class CSVParser(FileEvaluator):
             filepath (str): Path to the file to read.
         """
         super().__init__(filepath)
-        self.first_row = self._get_first_line_from_file()
+        self.first_row = self._get_first_row_from_file()
         self.delimiter = self.infer_csv_file_delimiter()
 
-    def _get_first_line_from_file(self):
+    def _get_first_row_from_file(self):
         """Reads and returns the first line of a file.
 
         Args:

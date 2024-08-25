@@ -175,7 +175,7 @@ class CSVFile(CSVParser):
 
     def write_avro(self, out_filename=None):
         """Writes data to an Avro file.
-        
+
         Args:
             out_filename (str): The name of the output file.
         """
@@ -185,7 +185,7 @@ class CSVFile(CSVParser):
 
     def write_csv(self, out_filename=None):
         """Writes CSV to a file.
-        
+
         Args:
             out_filename (str): The name of the output file.
         """
@@ -199,7 +199,7 @@ class CSVFile(CSVParser):
 
     def write_json(self, out_filename=None):
         """Writes JSON to a file.
-        
+
         Args:
             out_filename (str): The name of the output file.
         """
@@ -213,7 +213,7 @@ class CSVFile(CSVParser):
 
     def write_json_newline_delimited(self, out_filename=None):
         """Writes JSON to a file with newline delimited.
-        
+
         Args:
             out_filename (str): The name of the output file.
         """
@@ -227,7 +227,7 @@ class CSVFile(CSVParser):
 
     def write_parquet(self, out_filename=None):
         """Writes data to a Parquet file.
-        
+
         Args:
             out_filename (str): The name of the output file.
         """
@@ -241,7 +241,7 @@ class CSVFile(CSVParser):
 
     def write_excel(self, out_filename=None):
         """Writes data to an Excel file.
-        
+
         Args:
             out_filename (str): The name of the output file.
         """
