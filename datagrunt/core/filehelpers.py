@@ -55,6 +55,7 @@ class FileEvaluator(FileBase):
     PROPRIETARY_FILE_EXTENSIONS = EXCEL_FILE_EXTENSIONS
     JSON_OUT_FILENAME = 'output.json'
     JSON_NEWLINE_OUT_FILENAME = 'output.jsonl'
+    EXCEL_ROW_LIMIT = 1_048_576
 
     def __init__(self, filepath):
         """
