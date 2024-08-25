@@ -115,7 +115,7 @@ class CSVFile(CSVParser):
                  FROM read_csv('{self.filepath}',
                                 auto_detect=true,
                                 delim='{self.delimiter}',
-                                header = true,
+                                header=true,
                                 null_padding=true,
                                 all_varchar=True)
                 """
