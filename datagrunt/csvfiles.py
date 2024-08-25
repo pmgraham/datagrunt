@@ -169,6 +169,7 @@ class CSVFile(CSVParser):
                 'columns_original_format': self.first_row,
                 'columns_list': columns_list,
                 'columns_string': ", ".join(columns_list),
+                'columns_byte_string': ", ".join(columns_list).encode(),
                 'column_count': len(columns_list)
             }
 
@@ -176,22 +177,19 @@ class CSVFile(CSVParser):
 
     def get_columns(self):
         """Return the schema of the columns in the CSV file."""
-        attributes = self.get_attributes()
-        return attributes['columns']
+        return self.get_attributes()['columns']
 
     def get_columns_string(self):
         """Return the first row of the CSV file."""
-        with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
-            return csv_file.readline().strip()
+        return self.get_attributes()['columns_string']
 
     def get_columns_byte_string(self):
         """Return the first row of the CSV file as bytes."""
-        with open(self.filepath, 'rb') as csv_file:
-            return csv_file.readline().strip()
+        return self.get_attributes()['columns_byte_string']
 
     def get_column_count(self):
         """Return the number of columns in the CSV file."""
-        return len(self.get_columns_string().split(','))
+        return self.get_attributes()['column_count']
 
     def get_quotechar(self):
         """Return the quote character used in the CSV file."""
