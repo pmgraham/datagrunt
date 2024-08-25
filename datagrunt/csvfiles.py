@@ -132,7 +132,7 @@ class CSVFile(CSVParser):
         Return:
             Polars dataframe.
         """
-        with self.duckdb_instance.set_database_connection as con:
+        with self.duckdb_instance.database_connection as con:
             con.sql(self._csv_import_table_statement())
             return con.query(sql_statement).pl()
     

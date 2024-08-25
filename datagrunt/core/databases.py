@@ -31,6 +31,7 @@ class DuckDBDatabase:
         self.filepath = filepath
         self.database_filename = self._set_database_filename()
         self.database_table_name = self._set_database_table_name()
+        self.database_connection = self._set_database_connection()
 
     def _set_database_filename(self):
         """Return name of duckdb file created at runtime."""
@@ -40,8 +41,7 @@ class DuckDBDatabase:
         """Return name of duckdb import table created during file import."""
         return f'{Path(self.filepath).stem}'
 
-    @property
-    def set_database_connection(self, threads=DEFAULT_THREAD_COUNT):
+    def _set_database_connection(self, threads=DEFAULT_THREAD_COUNT):
         """Establish a connection with duckdb.
 
         Args:
@@ -83,7 +83,7 @@ class DuckDBDatabase:
             sql_import_statement (str): SQL statement to import data.
             sql_export_statement (str): SQL statement to export data.
         """
-        with self.set_database_connection as con:
+        with self.database_connection as con:
             con.sql(sql_import_statement)
             con.sql(sql_export_statement)
 
@@ -96,6 +96,6 @@ class DuckDBDatabase:
         Return:
             Polars dataframe.
         """
-        with self.set_database_connection as con:
+        with self.database_connection as con:
             con.sql(sql_import_statement)
             return con.query(self.select_from_table_statement()).pl()
