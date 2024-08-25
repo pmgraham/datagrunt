@@ -104,7 +104,7 @@ class CSVFile(CSVParser):
         """
         super().__init__(filepath)
         self.duckdb_instance = DuckDBDatabase(self.filepath)
-        if self.extension_string.lower() not in self.CSV_FILE_EXTENSIONS:
+        if not self.is_csv:
             raise ValueError(f"File extension '{self.extension_string}' is not a valid CSV file extension.")
 
     def _csv_import_table_statement(self):
@@ -165,7 +165,10 @@ class CSVFile(CSVParser):
                 'quoting': self.QUOTING_MAP.get(dialect.quoting),
                 'row_count_with_header': self.get_row_count_with_header(),
                 'row_count_without_header': self.get_row_count_without_header(),
-                'columns': columns,
+                'columns_schema': columns,
+                'columns_original_format': self.first_row,
+                'columns_list': columns_list,
+                'columns_string': ", ".join(columns_list),
                 'column_count': len(columns_list)
             }
 
