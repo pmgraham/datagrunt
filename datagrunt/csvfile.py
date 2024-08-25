@@ -16,12 +16,6 @@ from core.databases import DuckDBDatabase
 
 class CSVFile(CSVParser):
 
-    DEFAULT_ENCODING = 'utf-8'
-    DEFAULT_DELIMITER = ','
-    DEFAULT_SAMPLE_ROWS = 1
-    CSV_SNIFF_SAMPLE_ROWS = 5
-    DATAFRAME_SAMPLE_ROWS = 5
-
     QUOTING_MAP = {
         0: 'no quoting',
         1: 'quote all',

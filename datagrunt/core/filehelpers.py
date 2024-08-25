@@ -10,6 +10,7 @@ class FileBase:
     """Base class for file objects."""
 
     FILE_SIZE_DIVISOR = 1024
+    DEFAULT_ENCODING = 'utf-8'
 
     def __init__(self, filepath):
         """
@@ -120,6 +121,9 @@ class CSVParser(FileEvaluator):
 
     DELIMITER_REGEX_PATTERN = r'[^0-9a-zA-Z_-]'
     DEFAULT_DELIMITER = ','
+    DEFAULT_SAMPLE_ROWS = 1
+    CSV_SNIFF_SAMPLE_ROWS = 5
+    DATAFRAME_SAMPLE_ROWS = 5
 
     def __init__(self, filepath):
         """
@@ -142,7 +146,7 @@ class CSVParser(FileEvaluator):
             The first line of the file, stripped of leading/trailing whitespace,
             or None if the file is empty.
         """
-        with open(self.filepath, 'r') as csv_file:
+        with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
             first_line = csv_file.readline().strip()
         return first_line
 
