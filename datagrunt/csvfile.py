@@ -243,7 +243,7 @@ class CSVFile(CSVParser):
             out_filename (str): The name of the output file.
         """
         if self.get_row_count_without_header() > self.EXCEL_ROW_LIMIT:
-            message = f"Row count {self.get_row_count_without_header()} is greater than Excel row limit of {self.EXCEL_ROW_LIMIT}. Data will be lost." 
+            message = f"Row count {self.get_row_count_without_header()} is greater than Excel row limit of {self.EXCEL_ROW_LIMIT}. Data will be lost."
             show_warning(message)
 
         if out_filename:

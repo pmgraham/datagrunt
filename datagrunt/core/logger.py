@@ -4,7 +4,7 @@ LARGE_FILE_WARNING = "Warning: File is large and may load into memory slowly or 
 
 def show_warning(message):
     """Show a warning message.
-    
+
     Args:
         message (str): The message to show.
     """
