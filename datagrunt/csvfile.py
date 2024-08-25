@@ -6,7 +6,6 @@
 import csv
 from functools import lru_cache
 import json
-import logging
 
 # third party libraries
 
