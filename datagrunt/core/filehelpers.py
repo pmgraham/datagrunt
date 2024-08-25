@@ -29,7 +29,7 @@ class FileBase:
         self.size_in_gb = round((self.size_in_mb / self.FILE_SIZE_DIVISOR), 5)
         self.size_in_tb = round((self.size_in_gb / self.FILE_SIZE_DIVISOR), 5)
 
-class FileEvaluator(FileBase):
+class FileProperties(FileBase):
     """Class to evaluate file types and to instantiate the right class."""
 
     EXCEL_FILE_EXTENSIONS = [
@@ -116,7 +116,7 @@ class FileEvaluator(FileBase):
         """Check if the file is large."""
         return self.size_in_gb >= 1
 
-class CSVParser(FileEvaluator):
+class CSVParser(FileProperties):
     """Class for parsing CSV files. Mostly determining the delimiter."""
 
     DELIMITER_REGEX_PATTERN = r'[^0-9a-zA-Z_-]'
