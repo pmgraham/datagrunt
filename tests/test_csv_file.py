@@ -1,11 +1,10 @@
 import unittest
 import os
-from glob import glob
 from pathlib import Path
 import sys
 sys.path.append('../')  # Add the parent directory to the search path
 sys.path.append('../datagrunt')  # Add the parent directory to the search path
-from datagrunt.csvfiles import CSVFile
+from datagrunt.csvfile import CSVFile
 
 class TestCSVFile(unittest.TestCase):
 
@@ -63,7 +62,8 @@ class TestCSVFile(unittest.TestCase):
         self.assertIn('newline_delimiter', attributes)
         self.assertIn('skipinitialspace', attributes)
         self.assertIn('quoting', attributes)
-        self.assertIn('columns', attributes)
+        self.assertIn('columns_schema', attributes)
+        self.assertIn('columns_byte_string', attributes)
 
     def test_get_row_count_with_header(self):
         """Test row_count_with_header method."""
@@ -81,12 +81,12 @@ class TestCSVFile(unittest.TestCase):
     def test_get_columns_string(self):
         """Test columns_string method."""
         columns = self.test_csv_file.get_columns_string()
-        self.assertEqual(columns, 'state,location,address,latitude,longitude')
+        self.assertEqual(columns, 'state, location, address, latitude, longitude')
 
     def test_get_columns_byte_string(self):
         """Test columns_byte_string method."""
         columns = self.test_csv_file.get_columns_byte_string()
-        self.assertEqual(columns, b'state,location,address,latitude,longitude')
+        self.assertEqual(columns, b'state, location, address, latitude, longitude')
 
     def test_get_column_count(self):
         """Test column_count method."""
@@ -125,7 +125,7 @@ class TestCSVFile(unittest.TestCase):
         self.assertEqual(len(json_data), 2629)
 
     def test_to_json_newline_delimited(self):
-        """Test to_json_new_line_delimited method."""
+        """Test to_json_newline_delimited method."""
         jsonl_data = self.test_csv_file.to_json_newline_delimited()
         self.assertEqual(len(jsonl_data), 425897) # string object not a dict; hence the high number of chars
 
