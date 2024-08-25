@@ -63,7 +63,8 @@ class TestCSVFile(unittest.TestCase):
         self.assertIn('newline_delimiter', attributes)
         self.assertIn('skipinitialspace', attributes)
         self.assertIn('quoting', attributes)
-        self.assertIn('columns', attributes)
+        self.assertIn('columns_schema', attributes)
+        self.assertIn('columns_byte_string', attributes)
 
     def test_get_row_count_with_header(self):
         """Test row_count_with_header method."""
@@ -81,12 +82,12 @@ class TestCSVFile(unittest.TestCase):
     def test_get_columns_string(self):
         """Test columns_string method."""
         columns = self.test_csv_file.get_columns_string()
-        self.assertEqual(columns, 'state,location,address,latitude,longitude')
+        self.assertEqual(columns, 'state, location, address, latitude, longitude')
 
     def test_get_columns_byte_string(self):
         """Test columns_byte_string method."""
         columns = self.test_csv_file.get_columns_byte_string()
-        self.assertEqual(columns, b'state,location,address,latitude,longitude')
+        self.assertEqual(columns, b'state, location, address, latitude, longitude')
 
     def test_get_column_count(self):
         """Test column_count method."""

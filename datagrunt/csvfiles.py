@@ -177,7 +177,7 @@ class CSVFile(CSVParser):
 
     def get_columns(self):
         """Return the schema of the columns in the CSV file."""
-        return self.get_attributes()['columns']
+        return self.get_attributes()['columns_list']
 
     def get_columns_string(self):
         """Return the first row of the CSV file."""
