@@ -7,8 +7,6 @@ from pathlib import Path
 # third party libraries
 import duckdb
 
-# local libraries
-
 class DuckDBDatabase:
     """Class to configure local database for file processing.
        Utilizes duckdb as the processing engine.
