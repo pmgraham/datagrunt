@@ -13,6 +13,7 @@ import logging
 # local libraries
 from core.filehelpers import CSVParser
 from core.databases import DuckDBDatabase
+from core.logger import show_warning
 
 class CSVFile(CSVParser):
 
@@ -239,8 +240,8 @@ class CSVFile(CSVParser):
             out_filename (str): The name of the output file.
         """
         if self.get_row_count_without_header() > self.EXCEL_ROW_LIMIT:
-            logging.basicConfig(level=logging.WARNING, format='%(levelname)s - %(message)s')
-            logging.warning(f"Row count {self.get_row_count_without_header()} is greater than Excel row limit of {self.EXCEL_ROW_LIMIT}. Data will be lost.")
+            message = f"Row count {self.get_row_count_without_header()} is greater than Excel row limit of {self.EXCEL_ROW_LIMIT}. Data will be lost." 
+            show_warning(message)
 
         if out_filename:
             sql = self.update_sql_output_file(self.duckdb_instance.export_to_excel_statement(),
