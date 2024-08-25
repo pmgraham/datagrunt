@@ -226,39 +226,62 @@ class CSVFile(CSVParser):
         """Converts CSV to a JSON string with newline delimited."""
         return self.to_dataframe().write_ndjson()
 
-    def write_avro(self):
+    def write_avro(self, out_filename=None):
         """Writes data to an Avro file."""
-        self.to_dataframe().write_avro(self.duckdb_instance.AVRO_OUT_FILENAME)
+        if not out_filename:
+            filename = self.duckdb_instance.AVRO_OUT_FILENAME
+        self.to_dataframe().write_avro(filename)
 
-    def write_csv(self):
+    def write_csv(self, out_filename=None):
         """Writes CSV to a file."""
-        self.duckdb_instance.write_to_file(self._csv_import_table_statement(),
-                                           self.duckdb_instance.export_to_csv_statement()
-                                           )
+        if out_filename:
+            sql = self.duckdb_instance.export_to_csv_statement().replace(self.duckdb_instance.CSV_OUT_FILENAME,
+                                                                         out_filename
+                                                                         )
+        else:
+            sql = self.duckdb_instance.export_to_csv_statement()
+        self.duckdb_instance.write_to_file(self._csv_import_table_statement(), sql)
 
-    def write_json(self):
+    def write_json(self, out_filename=None):
         """Writes JSON to a file."""
-        self.duckdb_instance.write_to_file(self._csv_import_table_statement(),
-                                           self.duckdb_instance.export_to_json_array_statement()
-                                           )
+        if out_filename:
+            sql = self.duckdb_instance.export_to_json_array_statement().replace(self.duckdb_instance.JSON_OUT_FILENAME,
+                                                                         out_filename
+                                                                         )
+        else:
+            sql = self.duckdb_instance.export_to_json_array_statement()
+        self.duckdb_instance.write_to_file(self._csv_import_table_statement(), sql)
 
-    def write_json_newline_delimited(self):
+    def write_json_newline_delimited(self, out_filename=None):
         """Writes JSON to a file with newline delimited."""
-        self.duckdb_instance.write_to_file(self._csv_import_table_statement(),
-                                           self.duckdb_instance.export_to_json_new_line_delimited_statement()
-                                           )
+        if out_filename:
+            sql = self.duckdb_instance.export_to_json_new_line_delimited_statement().replace(self.duckdb_instance.JSON_NEWLINE_OUT_FILENAME,
+                                                                         out_filename
+                                                                         )
+        else:
+            sql = self.duckdb_instance.export_to_json_new_line_delimited_statement()
+        self.duckdb_instance.write_to_file(self._csv_import_table_statement(), sql)
 
-    def write_parquet(self):
+    def write_parquet(self, out_filename=None):
         """Writes data to a Parquet file."""
-        self.duckdb_instance.write_to_file(self._csv_import_table_statement(),
-                                           self.duckdb_instance.export_to_parquet_statement()
-                                           )
+        if out_filename:
+            sql = self.duckdb_instance.export_to_parquet_statement().replace(self.duckdb_instance.PARQUET_OUT_FILENAME,
+                                                                         out_filename
+                                                                         )
+        else:
+            sql = self.duckdb_instance.export_to_parquet_statement()
+        self.duckdb_instance.write_to_file(self._csv_import_table_statement(), sql)
 
-    def write_excel(self):
+    def write_excel(self, out_filename=None):
         """Writes data to an Excel file."""
         if self.get_row_count_without_header() > self.EXCEL_ROW_LIMIT:
             logging.basicConfig(level=logging.WARNING, format='%(levelname)s - %(message)s')
             logging.warning(f"Row count {self.get_row_count_without_header()} is greater than Excel row limit of {self.EXCEL_ROW_LIMIT}. Data will be lost.")
-        self.duckdb_instance.write_to_file(self._csv_import_table_statement(),
-                                           self.duckdb_instance.export_to_excel_statement()
-                                           )
+
+        if out_filename:
+            sql = self.duckdb_instance.export_to_excel_statement().replace(self.duckdb_instance.EXCEL_OUT_FILENAME,
+                                                                         out_filename
+                                                                         )
+        else:
+            sql = self.duckdb_instance.export_to_excel_statement()
+        self.duckdb_instance.write_to_file(self._csv_import_table_statement(), sql)
