@@ -12,7 +12,7 @@ import json
 # local libraries
 from core.filehelpers import CSVParser
 from core.databases import DuckDBDatabase
-from core.logger import show_warning
+from core.logger import show_warning, show_large_file_warning
 
 class CSVFile(CSVParser):
 
@@ -148,6 +148,8 @@ class CSVFile(CSVParser):
 
     def to_dicts(self):
         """Converts Dataframe to list of dictionaries."""
+        if self.is_large:
+             show_large_file_warning()
         with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
             csv_reader = csv.DictReader(csv_file, delimiter=self.delimiter)
             return list(csv_reader)
@@ -159,11 +161,13 @@ class CSVFile(CSVParser):
     def to_json(self):
          """Converts CSV to a JSON string."""
          if self.is_large:
-             print("Warning: File is large and may not load into memory properly.")
+             show_large_file_warning()
          return json.loads(self.to_dataframe().write_json())
 
     def to_json_newline_delimited(self):
         """Converts CSV to a JSON string with newline delimited."""
+        if self.is_large:
+             show_large_file_warning()
         return self.to_dataframe().write_ndjson()
 
     def write_avro(self, out_filename=None):
