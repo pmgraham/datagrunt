@@ -122,12 +122,6 @@ class CSVFile(CSVParser):
                                 all_varchar=True)
                 """
 
-    @staticmethod
-    def log_warning(warning_message):
-        """Return warning messages."""
-        logging.basicConfig(level=logging.WARNING, format='%(levelname)s - %(message)s')
-        return logging.warning(warning_message)
-
     @lru_cache
     def select_from_table(self, sql_statement):
         """Select from duckdb table. This method gives the user an option to
@@ -263,7 +257,8 @@ class CSVFile(CSVParser):
     def write_excel(self):
         """Writes data to an Excel file."""
         if self.get_row_count_without_header() > self.EXCEL_ROW_LIMIT:
-            self.log_warning(f"Row count {self.get_row_count_without_header()} is greater than Excel row limit of {self.EXCEL_ROW_LIMIT}. Data will be lost.")
+            logging.basicConfig(level=logging.WARNING, format='%(levelname)s - %(message)s')
+            logging.warning(f"Row count {self.get_row_count_without_header()} is greater than Excel row limit of {self.EXCEL_ROW_LIMIT}. Data will be lost.")
         self.duckdb_instance.write_to_file(self._csv_import_table_statement(),
                                            self.duckdb_instance.export_to_excel_statement()
                                            )
