@@ -33,7 +33,7 @@ class DuckDBDatabase:
         self.database_filename = self._set_database_filename()
         self.database_table_name = self._set_database_table_name()
         self.database_connection = self._set_database_connection()
-    
+
     def __del__(self):
         """Delete .db files when exiting the context manager or when connection closes."""
         self.database_connection.close()
@@ -85,7 +85,7 @@ class DuckDBDatabase:
 
     def write_to_file(self, sql_import_statement, sql_export_statement):
         """Write database content to file.
-        
+
         Args:
             sql_import_statement (str): SQL statement to import data.
             sql_export_statement (str): SQL statement to export data.

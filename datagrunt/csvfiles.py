@@ -135,7 +135,7 @@ class CSVFile(CSVParser):
         with self.duckdb_instance.database_connection as con:
             con.sql(self._csv_import_table_statement())
             return con.query(sql_statement).pl()
-    
+
     @lru_cache
     def get_row_count_with_header(self):
         """Return the number of lines in the CSV file including the header."""
@@ -222,7 +222,7 @@ class CSVFile(CSVParser):
     def to_json_newline_delimited(self):
         """Converts CSV to a JSON string with newline delimited."""
         return self.to_dataframe().write_ndjson()
-    
+
     def write_avro(self):
         """Writes data to an Avro file."""
         self.to_dataframe().write_avro(self.duckdb_instance.AVRO_OUT_FILENAME)
