@@ -68,7 +68,7 @@ class DuckDBDatabase:
         """Export SQL statement to export data as a JSON file."""
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{self.JSON_OUT_FILENAME}' (ARRAY true) "
 
-    def export_to_json_new_line_delimited_statement(self):
+    def export_to_json_newline_delimited_statement(self):
         """Export SQL statement to export data as a JSON newline delimited file."""
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{self.JSON_NEWLINE_OUT_FILENAME}'"
 

@@ -269,7 +269,7 @@ class CSVFile(CSVParser):
     def write_json_newline_delimited(self, out_filename=None):
         """Writes JSON to a file with newline delimited."""
         if out_filename:
-            sql = self.update_sql_output_file(self.duckdb_instance.export_to_json_new_line_delimited_statement(),
+            sql = self.update_sql_output_file(self.duckdb_instance.export_to_json_newline_delimited_statement(),
                                               self.duckdb_instance.JSON_NEWLINE_OUT_FILENAME,
                                               out_filename)
         else:
