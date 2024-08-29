@@ -10,9 +10,9 @@ import json
 # third party libraries
 
 # local libraries
-from core.filehelpers import CSVParser
-from core.databases import DuckDBDatabase
-from core.logger import show_warning, show_large_file_warning
+from datagrunt.core.filehelpers import CSVParser
+from datagrunt.core.databases import DuckDBDatabase
+from datagrunt.core.logger import show_warning, show_large_file_warning
 
 class CSVFile(CSVParser):
 
