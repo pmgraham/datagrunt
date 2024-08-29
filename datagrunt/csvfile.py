@@ -4,8 +4,6 @@
 
 # standard library
 import csv
-from functools import lru_cache
-import json
 
 # third party libraries
 
@@ -35,7 +33,7 @@ class CSVFile(CSVParser):
         if not self.is_csv:
             raise ValueError(f"File extension '{self.extension_string}' is not a valid CSV file extension.")
 
-    @lru_cache
+    # @lru_cache
     def _csv_import_table_statement(self):
         """Default CSV import table statement."""
         # all_varchar=True is set to preserve integrity of data by importing as strings.
@@ -63,7 +61,6 @@ class CSVFile(CSVParser):
         """
         return sql.replace(original_output_file, new_output_file)
 
-    @lru_cache
     def select_from_table(self, sql_statement):
         """Select from duckdb table. This method gives the user an option to
            write a data transformation as a SQL statement. Results returned
@@ -79,7 +76,6 @@ class CSVFile(CSVParser):
             con.sql(self._csv_import_table_statement())
             return con.query(sql_statement).pl()
 
-    @lru_cache
     def get_row_count_with_header(self):
         """Return the number of lines in the CSV file including the header."""
         with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
@@ -162,7 +158,7 @@ class CSVFile(CSVParser):
          """Converts CSV to a JSON string."""
          if self.is_large:
              show_large_file_warning()
-         return json.loads(self.to_dataframe().write_json())
+         return self.to_dataframe().write_json()
 
     def to_json_newline_delimited(self):
         """Converts CSV to a JSON string with newline delimited."""

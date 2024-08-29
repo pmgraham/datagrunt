@@ -88,9 +88,9 @@ class DuckDBDatabase:
             sql_import_statement (str): SQL statement to import data.
             sql_export_statement (str): SQL statement to export data.
         """
-        with self.database_connection as con:
-            con.sql(sql_import_statement)
-            con.sql(sql_export_statement)
+        con = self.database_connection
+        con.sql(sql_import_statement)
+        con.sql(sql_export_statement)
 
     def to_dataframe(self, sql_import_statement):
         """Export data as Polars a dataframe.
@@ -101,6 +101,6 @@ class DuckDBDatabase:
         Return:
             Polars dataframe.
         """
-        with self.database_connection as con:
-            con.sql(sql_import_statement)
-            return con.query(self.select_from_table_statement()).pl()
+        con = self.database_connection
+        con.sql(sql_import_statement)
+        return con.query(self.select_from_table_statement()).pl()
