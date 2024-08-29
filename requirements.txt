@@ -1,5 +1,3 @@
 duckdb==0.*
-openpyxl==3.*
-pandas==2.*
 polars==1.5.*
 pyarrow==17.*
