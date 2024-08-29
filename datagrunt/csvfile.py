@@ -39,7 +39,7 @@ class CSVFile(CSVParser):
         """Default CSV import table statement."""
         # all_varchar=True is set to preserve integrity of data by importing as strings.
         return f"""
-            CREATE TABLE {self.duckdb_instance.database_table_name} AS
+            CREATE OR REPLACE TABLE {self.duckdb_instance.database_table_name} AS
             SELECT *
             FROM read_csv('{self.filepath}',
                             auto_detect=true,
@@ -66,10 +66,9 @@ class CSVFile(CSVParser):
     def _read_csv_to_duckdb(self):
         return read_csv(self.filepath,
                         delimiter=self.delimiter,
-                        #  auto_detect=True,
-                        #  header=True,
                         null_padding=True,
-                        all_varchar=True)
+                        all_varchar=True
+                        )
 
     def select_from_table(self, sql_statement):
         """Select from duckdb table. This method gives the user an option to
