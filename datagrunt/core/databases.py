@@ -54,33 +54,6 @@ class DuckDBDatabase:
         """
         return duckdb.connect(self.database_filename, config = {'threads': threads})
 
-    def select_from_table_statement(self):
-        """Select from table."""
-        return f"SELECT * FROM {self.database_table_name}"
-
-    def export_to_csv_statement(self):
-        """Export SQL statement to export data as a CSV file."""
-        return f"COPY (SELECT * FROM {self.database_table_name}) TO '{self.CSV_OUT_FILENAME}' (HEADER, DELIMITER ',');"
-
-    def export_to_json_array_statement(self):
-        """Export SQL statement to export data as a JSON file."""
-        return f"COPY (SELECT * FROM {self.database_table_name}) TO '{self.JSON_OUT_FILENAME}' (ARRAY true) "
-
-    def export_to_json_newline_delimited_statement(self):
-        """Export SQL statement to export data as a JSON newline delimited file."""
-        return f"COPY (SELECT * FROM {self.database_table_name}) TO '{self.JSON_NEWLINE_OUT_FILENAME}'"
-
-    def export_to_parquet_statement(self):
-        """Export SQL statement to export data as a parquet file."""
-        return f"COPY (SELECT * FROM {self.database_table_name}) TO '{self.PARQUET_OUT_FILENAME}'(FORMAT PARQUET)"
-
-    def export_to_excel_statement(self):
-        """Export SQL statement to export data as an Excel file."""
-        return f"""
-        INSTALL spatial;
-        LOAD spatial;
-        COPY (SELECT * FROM {self.database_table_name}) TO '{self.EXCEL_OUT_FILENAME}'(FORMAT GDAL, DRIVER 'xlsx')"""
-
     def write_to_file(self, sql_import_statement, sql_export_statement):
         """Write database content to file.
 
