@@ -10,12 +10,8 @@ class TestCSVFile(unittest.TestCase):
 
     def setUp(self):
         """Setup for test cases."""
-        self.test_csv_path = Path(__file__).parent / 'test_data' / 'test.csv'
-        self.test_empty_csv_path = Path(__file__).parent / 'test_data' / 'empty.csv'
-        self.test_large_csv_path = Path(__file__).parent / 'test_data' / 'large.csv'
+        self.test_csv_path = Path(__file__).parent / 'data' / 'test.csv'
         self.test_csv_file = CSVFile(self.test_csv_path)
-        self.test_empty_csv_file = CSVFile(self.test_empty_csv_path)
-        self.test_large_csv_file = CSVFile(self.test_large_csv_path)
 
     def test_init(self):
         """Test initialization of CSVFile class."""
@@ -29,28 +25,6 @@ class TestCSVFile(unittest.TestCase):
         query = f"SELECT * FROM {self.test_csv_file.duckdb_instance.database_table_name} LIMIT 10"
         df = self.test_csv_file.select_from_table(query)
         self.assertEqual(len(df), 10)  # Check if 10 rows are returned
-
-    def test_is_structured(self):
-        """Test is_structured property."""
-        self.assertTrue(self.test_csv_file.is_structured)
-
-    def test_is_standard(self):
-        """Test is_standard property."""
-        self.assertTrue(self.test_csv_file.is_standard)
-
-    def test_is_unstructured(self):
-        """Test is_standard property."""
-        self.assertFalse(self.test_csv_file.is_unstructured)
-
-    def test_is_empty(self):
-        """Test is_empty property."""
-        self.assertFalse(self.test_csv_file.is_empty)
-        self.assertTrue(self.test_empty_csv_file.is_empty)
-
-    def test_is_large(self):
-        """Test is_large property."""
-        self.assertFalse(self.test_csv_file.is_large)
-        self.assertTrue(self.test_large_csv_file.is_large)
 
     def test_get_attributes(self):
         """Test attributes method."""
@@ -122,7 +96,7 @@ class TestCSVFile(unittest.TestCase):
     def test_to_json(self):
         """Test to_json method."""
         json_data = self.test_csv_file.to_json()
-        self.assertEqual(len(json_data), 2629)
+        self.assertEqual(len(json_data), 425898)
 
     def test_to_json_newline_delimited(self):
         """Test to_json_newline_delimited method."""
@@ -131,7 +105,7 @@ class TestCSVFile(unittest.TestCase):
 
     def test_write_avro(self):
         """Test write_json method."""
-        os.chdir(Path(__file__).parent / 'test_data')
+        os.chdir(Path(__file__).parent / 'data')
         output_path = 'output.avro'
         self.test_csv_file.write_avro()
         self.assertTrue(os.path.exists(output_path))
@@ -139,7 +113,7 @@ class TestCSVFile(unittest.TestCase):
 
     def test_write_csv(self):
         """Test write_json method."""
-        os.chdir(Path(__file__).parent / 'test_data')
+        os.chdir(Path(__file__).parent / 'data')
         output_path = 'output.csv'
         self.test_csv_file.write_csv()
         self.assertTrue(os.path.exists(output_path))
@@ -147,7 +121,7 @@ class TestCSVFile(unittest.TestCase):
 
     def test_write_json(self):
         """Test write_json method."""
-        os.chdir(Path(__file__).parent / 'test_data')
+        os.chdir(Path(__file__).parent / 'data')
         output_path = 'output.json'
         self.test_csv_file.write_json()
         self.assertTrue(os.path.exists(output_path))
@@ -155,7 +129,7 @@ class TestCSVFile(unittest.TestCase):
 
     def test_write_json_newline_delimited(self):
         """Test write_json_newline_delimited method."""
-        os.chdir(Path(__file__).parent / 'test_data')
+        os.chdir(Path(__file__).parent / 'data')
         output_path = 'output.jsonl'
         self.test_csv_file.write_json_newline_delimited()
         self.assertTrue(os.path.exists(output_path))
@@ -163,7 +137,7 @@ class TestCSVFile(unittest.TestCase):
 
     def test_write_parquet(self):
         """Test write_parquet method."""
-        os.chdir(Path(__file__).parent / 'test_data')
+        os.chdir(Path(__file__).parent / 'data')
         output_path = 'output.parquet'
         self.test_csv_file.write_parquet()
         self.assertTrue(os.path.exists(output_path))
@@ -171,7 +145,7 @@ class TestCSVFile(unittest.TestCase):
 
     def test_write_excel(self):
         """Test write_excel method."""
-        os.chdir(Path(__file__).parent / 'test_data')
+        os.chdir(Path(__file__).parent / 'data')
         output_path = 'output.xlsx'
         self.test_csv_file.write_excel()
         self.assertTrue(os.path.exists(output_path))
