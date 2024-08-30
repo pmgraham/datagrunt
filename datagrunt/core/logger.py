@@ -12,4 +12,5 @@ def show_warning(message):
     return logging.warning(message)
 
 def show_large_file_warning():
+    """Show a warning message if the file is large."""
     show_warning(LARGE_FILE_WARNING)
