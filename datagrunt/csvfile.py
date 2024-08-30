@@ -49,14 +49,14 @@ class CSVFile(CSVParser):
                             null_padding=true,
                             all_varchar=True);
             """
-    
+
     def query_csv_data(self, sql_statement, show_only=False):
         """Query a CSV file using DuckDB Python API.
 
         Args:
             sql_statement (str): The SQL statement to execute.
             show_only (bool): Only show results don't return a dataframe.
-        
+
         Returns:
             Polars DataFrame or None
         """
