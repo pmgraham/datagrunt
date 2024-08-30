@@ -67,21 +67,6 @@ class CSVFile(CSVParser):
         else:
             return con.sql(sql_statement).pl()
 
-
-    @staticmethod
-    def update_sql_output_file(sql, original_output_file, new_output_file):
-        """Updates the output file path in a SQL export statement.
-
-        Args:
-            sql (str): The original SQL export statement.
-            original_output_file (str): The original output file path in the SQL statement.
-            new_output_file (str): The new output file path to replace the original.
-
-        Returns:
-            str: The updated SQL statement with the new output file path.
-        """
-        return sql.replace(original_output_file, new_output_file)
-
     def _read_csv_to_duckdb(self):
         """Read CSV file using DuckDB Python API."""
         return read_csv(self.filepath,
