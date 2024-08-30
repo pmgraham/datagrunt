@@ -11,6 +11,7 @@ def show_warning(message):
     logging.basicConfig(level=logging.WARNING, format='%(levelname)s - %(message)s')
     return logging.warning(message)
 
+
 def show_large_file_warning():
     """Show a warning message if the file is large."""
     show_warning(LARGE_FILE_WARNING)
