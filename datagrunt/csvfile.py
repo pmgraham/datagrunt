@@ -6,7 +6,7 @@
 import csv
 
 # third party libraries
-from duckdb import read_csv, sql
+from duckdb import read_csv, sql, connect
 
 # local libraries
 from datagrunt.core.filehelpers import CSVParser
@@ -31,6 +31,8 @@ class CSVFile(CSVParser):
         """
         super().__init__(filepath)
         self.attributes = self._get_attributes()
+        self.db_table = DuckDBQueries(self.filepath).database_table_name
+        self.duckdb_connection = connect(DuckDBQueries(self.filepath).database_filename)
         if not self.is_csv:
             raise ValueError(f"File extension '{self.extension_string}' is not a valid CSV file extension.")
 
@@ -38,7 +40,7 @@ class CSVFile(CSVParser):
         """Default CSV import table statement."""
         # all_varchar=True is set to preserve integrity of data by importing as strings.
         return f"""
-            CREATE OR REPLACE TABLE {DuckDBQueries(self.filepath).database_table_name} AS
+            CREATE OR REPLACE TABLE {self.db_table} AS
             SELECT *
             FROM read_csv('{self.filepath}',
                             auto_detect=true,
@@ -47,6 +49,24 @@ class CSVFile(CSVParser):
                             null_padding=true,
                             all_varchar=True);
             """
+    
+    def query_csv_data(self, sql_statement, show_only=False):
+        """Query a CSV file using DuckDB Python API.
+
+        Args:
+            sql_statement (str): The SQL statement to execute.
+            show_only (bool): Only show results don't return a dataframe.
+        
+        Returns:
+            Polars DataFrame or None
+        """
+        con = self.duckdb_connection
+        con.sql(self._csv_import_table_statement())
+        if show_only:
+            return con.sql(sql_statement).show()
+        else:
+            return con.sql(sql_statement).pl()
+
 
     @staticmethod
     def update_sql_output_file(sql, original_output_file, new_output_file):
