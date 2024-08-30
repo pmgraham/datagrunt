@@ -6,7 +6,7 @@
 import csv
 
 # third party libraries
-from duckdb import read_csv, sql, connect
+from duckdb import read_csv, sql
 
 # local libraries
 from datagrunt.core.filehelpers import CSVParser
@@ -32,7 +32,7 @@ class CSVFile(CSVParser):
         super().__init__(filepath)
         self.attributes = self._get_attributes()
         self.db_table = DuckDBQueries(self.filepath).database_table_name
-        self.duckdb_connection = connect(DuckDBQueries(self.filepath).database_filename)
+        self.duckdb_connection = DuckDBQueries(self.filepath).database_connection
         if not self.is_csv:
             raise ValueError(f"File extension '{self.extension_string}' is not a valid CSV file extension.")
 
