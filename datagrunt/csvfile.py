@@ -70,7 +70,7 @@ class CSVFile(CSVParser):
                         all_varchar=True
                         )
 
-    def select_from_table_to_dataframe(self, sql_statement):
+    def select_from_table_to_dataframe(self):
         """Select from duckdb table. This method gives the user an option to
            write a data transformation as a SQL statement. Results returned
            as a Polars dataframe.
@@ -81,9 +81,12 @@ class CSVFile(CSVParser):
         Return:
             Polars dataframe.
         """
-        con = DuckDBQueries(self.filepath).database_connection
+        db = DuckDBQueries(self.filepath)
+        table = db.database_table_name
+        con = db.database_connection
         con.sql(self._csv_import_table_statement())
-        results = con.sql(sql_statement).pl() 
+        query = f"SELECT * FROM {table}"
+        results = con.sql(query).pl() 
         return results
 
     def get_row_count_with_header(self):
