@@ -27,7 +27,7 @@ class DuckDBDatabase:
         self.database_connection = self._set_database_connection()
 
     def __del__(self):
-        """Delete .db files when exiting the context manager or when connection closes."""
+        """Delete .db files after use."""
         if os.path.exists(self.database_filename):
             os.remove(self.database_filename)
 
