@@ -31,7 +31,7 @@ csv_file = CSVFile('myfile.csv')
 
 # Access file information
 print(f"File Size: {csv_file.size_in_mb} MB") 
-print(f"CSV Attributes: {csv_file.attributes()}")
+print(f"CSV Attributes: {csv_file.attributes(")
 
 # Override inferred delimiter (if needed)
 csv_file.delimiter = '|' 
