@@ -63,7 +63,7 @@ class CSVFile(CSVParser):
         con = self.duckdb_connection
         con.sql(self._csv_import_table_statement())
         if show_only:
-            return con.sql(sql_statement).show()
+            con.sql(sql_statement).show()
         else:
             return con.sql(sql_statement).pl()
 
