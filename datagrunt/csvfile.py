@@ -10,7 +10,7 @@ from duckdb import read_csv, sql
 
 # local libraries
 from datagrunt.core.filehelpers import CSVParser
-from datagrunt.core.databases import DuckDBDatabase
+from datagrunt.core.queries import DuckDBQueries
 from datagrunt.core.logger import show_warning, show_large_file_warning
 
 class CSVFile(CSVParser):
@@ -31,7 +31,6 @@ class CSVFile(CSVParser):
         """
         super().__init__(filepath)
         self.attributes = self._get_attributes()
-        self.duckdb_instance = DuckDBDatabase(self.filepath)
         if not self.is_csv:
             raise ValueError(f"File extension '{self.extension_string}' is not a valid CSV file extension.")
 
@@ -39,7 +38,7 @@ class CSVFile(CSVParser):
         """Default CSV import table statement."""
         # all_varchar=True is set to preserve integrity of data by importing as strings.
         return f"""
-            CREATE OR REPLACE TABLE {self.duckdb_instance.database_table_name} AS
+            CREATE OR REPLACE TABLE {DuckDBQueries(self.filepath).database_table_name} AS
             SELECT *
             FROM read_csv('{self.filepath}',
                             auto_detect=true,
@@ -82,9 +81,10 @@ class CSVFile(CSVParser):
         Return:
             Polars dataframe.
         """
-        con = self.duckdb_instance.database_connection
+        con = DuckDBQueries(self.filepath).database_connection
         con.sql(self._csv_import_table_statement())
-        return con.query(sql_statement).pl()
+        results = con.sql(sql_statement).pl() 
+        return results
 
     def get_row_count_with_header(self):
         """Return the number of lines in the CSV file including the header."""
@@ -162,7 +162,6 @@ class CSVFile(CSVParser):
 
     def to_dataframe(self):
         """Converts CSV to a Polars dataframe."""
-        # return self.duckdb_instance.to_dataframe(self._csv_import_table_statement())
         return self._read_csv_to_duckdb().pl()
 
     def to_json(self):
@@ -183,8 +182,10 @@ class CSVFile(CSVParser):
         Args:
             out_filename (str): The name of the output file.
         """
-        if not out_filename:
-            filename = self.duckdb_instance.AVRO_OUT_FILENAME
+        if out_filename:
+            filename = out_filename
+        else:
+            filename = DuckDBQueries(self.filepath).AVRO_OUT_FILENAME
         self.to_dataframe().write_avro(filename)
 
     def write_csv(self, out_filename=None):
@@ -193,13 +194,8 @@ class CSVFile(CSVParser):
         Args:
             out_filename (str): The name of the output file.
         """
-        if out_filename:
-            filename = out_filename
-        else:
-            filename = self.duckdb_instance.CSV_OUT_FILENAME
-        csv_export = f"COPY {self.duckdb_instance.database_table_name} TO '{filename}' (HEADER, DELIMITER ',');"
         sql(self._csv_import_table_statement())
-        sql(csv_export)
+        sql(DuckDBQueries(self.filepath).write_csv_query(out_filename))
 
     def write_json(self, out_filename=None):
         """Writes JSON to a file.
@@ -207,13 +203,8 @@ class CSVFile(CSVParser):
         Args:
             out_filename (str): The name of the output file.
         """
-        if out_filename:
-            filename = out_filename
-        else:
-            filename = self.duckdb_instance.JSON_OUT_FILENAME
-        json_export = f"COPY (SELECT * FROM {self.duckdb_instance.database_table_name}) TO '{filename}' (ARRAY true) "
         sql(self._csv_import_table_statement())
-        sql(json_export)
+        sql(DuckDBQueries(self.filepath).write_json_query(out_filename))
 
     def write_json_newline_delimited(self, out_filename=None):
         """Writes JSON to a file with newline delimited.
@@ -221,13 +212,8 @@ class CSVFile(CSVParser):
         Args:
             out_filename (str): The name of the output file.
         """
-        if out_filename:
-            filename = out_filename
-        else:
-            filename = self.duckdb_instance.JSON_NEWLINE_OUT_FILENAME
-        json_export = f"COPY (SELECT * FROM {self.duckdb_instance.database_table_name}) TO '{filename}'"
         sql(self._csv_import_table_statement())
-        sql(json_export)
+        sql(DuckDBQueries(self.filepath).write_json_newline_delimited_query(out_filename))
 
     def write_parquet(self, out_filename=None):
         """Writes data to a Parquet file.
@@ -235,13 +221,8 @@ class CSVFile(CSVParser):
         Args:
             out_filename (str): The name of the output file.
         """
-        if out_filename:
-            filename = out_filename
-        else:
-            filename = self.duckdb_instance.PARQUET_OUT_FILENAME
-        parquet_export = f"COPY (SELECT * FROM {self.duckdb_instance.database_table_name}) TO '{filename}'(FORMAT PARQUET)"
         sql(self._csv_import_table_statement())
-        sql(parquet_export)
+        sql(DuckDBQueries(self.filepath).write_parquet_query(out_filename))
 
     def write_excel(self, out_filename=None):
         """Writes data to an Excel file.
@@ -251,13 +232,5 @@ class CSVFile(CSVParser):
         """
         if self.get_row_count_with_header() > self.EXCEL_ROW_LIMIT:
             show_warning(f"Data will be lost: file contains {self.get_row_count_with_header()} rows and Excel supports a max of {self.EXCEL_ROW_LIMIT} rows.")
-        if out_filename:
-            filename = out_filename
-        else:
-            filename = self.duckdb_instance.EXCEL_OUT_FILENAME
-        excel_export = f"""
-        INSTALL spatial;
-        LOAD spatial;
-        COPY (SELECT * FROM {self.duckdb_instance.database_table_name}) TO '{filename}'(FORMAT GDAL, DRIVER 'xlsx')"""
         sql(self._csv_import_table_statement())
-        sql(excel_export)
+        sql(DuckDBQueries(self.filepath).write_excel_query(out_filename))
