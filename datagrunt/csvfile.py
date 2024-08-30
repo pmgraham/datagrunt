@@ -55,7 +55,7 @@ class CSVFile(CSVParser):
 
         Args:
             sql_statement (str): The SQL statement to execute.
-            show_only (bool): Only show results don't return a dataframe.
+            show_only (bool): Only show results and don't return a dataframe.
 
         Returns:
             Polars DataFrame or None
