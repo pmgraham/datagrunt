@@ -199,7 +199,7 @@ class CSVFile(CSVParser):
             out_filename (str): The name of the output file.
         """
         sql(self._csv_import_table_statement())
-        sql(DuckDBQueries(self.filepath).write_csv_query(out_filename))
+        sql(DuckDBQueries(self.filepath).export_csv_query(out_filename))
 
     def write_json(self, out_filename=None):
         """Writes JSON to a file.
@@ -208,7 +208,7 @@ class CSVFile(CSVParser):
             out_filename (str): The name of the output file.
         """
         sql(self._csv_import_table_statement())
-        sql(DuckDBQueries(self.filepath).write_json_query(out_filename))
+        sql(DuckDBQueries(self.filepath).export_json_query(out_filename))
 
     def write_json_newline_delimited(self, out_filename=None):
         """Writes JSON to a file with newline delimited.
@@ -217,7 +217,7 @@ class CSVFile(CSVParser):
             out_filename (str): The name of the output file.
         """
         sql(self._csv_import_table_statement())
-        sql(DuckDBQueries(self.filepath).write_json_newline_delimited_query(out_filename))
+        sql(DuckDBQueries(self.filepath).export_json_newline_delimited_query(out_filename))
 
     def write_parquet(self, out_filename=None):
         """Writes data to a Parquet file.
@@ -226,7 +226,7 @@ class CSVFile(CSVParser):
             out_filename (str): The name of the output file.
         """
         sql(self._csv_import_table_statement())
-        sql(DuckDBQueries(self.filepath).write_parquet_query(out_filename))
+        sql(DuckDBQueries(self.filepath).export_parquet_query(out_filename))
 
     def write_excel(self, out_filename=None):
         """Writes data to an Excel file.
@@ -237,4 +237,4 @@ class CSVFile(CSVParser):
         if self.get_row_count_with_header() > self.EXCEL_ROW_LIMIT:
             show_warning(f"Data will be lost: file contains {self.get_row_count_with_header()} rows and Excel supports a max of {self.EXCEL_ROW_LIMIT} rows.")
         sql(self._csv_import_table_statement())
-        sql(DuckDBQueries(self.filepath).write_excel_query(out_filename))
+        sql(DuckDBQueries(self.filepath).export_excel_query(out_filename))
