@@ -65,6 +65,7 @@ class CSVFile(CSVParser):
         return sql.replace(original_output_file, new_output_file)
 
     def _read_csv_to_duckdb(self):
+        """Read CSV file using DuckDB Python API."""
         return read_csv(self.filepath,
                         delimiter=self.delimiter,
                         null_padding=True,
