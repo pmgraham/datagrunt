@@ -50,6 +50,18 @@ class CSVFile(CSVParser):
                             all_varchar=True);
             """
 
+    def _read_csv_to_duckdb(self):
+        """Read CSV file using DuckDB Python API."""
+        return read_csv(self.filepath,
+                        delimiter=self.delimiter,
+                        null_padding=True,
+                        all_varchar=True
+                        )
+
+    def sample_csv_data(self):
+        """Show sample 20 rows of the CSV file."""
+        self._read_csv_to_duckdb().show()
+
     def query_csv_data(self, sql_statement, show_only=False):
         """Query a CSV file using DuckDB Python API.
 
@@ -66,14 +78,6 @@ class CSVFile(CSVParser):
             con.sql(sql_statement).show()
         else:
             return con.sql(sql_statement).pl()
-
-    def _read_csv_to_duckdb(self):
-        """Read CSV file using DuckDB Python API."""
-        return read_csv(self.filepath,
-                        delimiter=self.delimiter,
-                        null_padding=True,
-                        all_varchar=True
-                        )
 
     def get_row_count_with_header(self):
         """Return the number of lines in the CSV file including the header."""
