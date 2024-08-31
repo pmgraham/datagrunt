@@ -23,7 +23,7 @@ class TestCSVFile(unittest.TestCase):
 
     def test_attributes(self):
         """Test attributes method."""
-        attributes = self.test_csv_file.attributes
+        attributes = self.test_csv_file.get_attributes()
         self.assertIn('delimiter', attributes)
         self.assertIn('quotechar', attributes)
         self.assertIn('escapechar', attributes)

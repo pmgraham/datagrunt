@@ -30,7 +30,6 @@ class CSVFile(CSVParser):
             filepath (str): Path to the file to read.
         """
         super().__init__(filepath)
-        self.attributes = self._get_attributes()
         self.db_table = DuckDBQueries(self.filepath).database_table_name
         self.duckdb_connection = DuckDBQueries(self.filepath).database_connection
         if not self.is_csv:
@@ -88,7 +87,7 @@ class CSVFile(CSVParser):
         """Return the number of lines in the CSV file excluding the header."""
         return self.get_row_count_with_header() - 1
 
-    def _get_attributes(self):
+    def get_attributes(self):
         """Generate CSV attributes."""
         columns_list = self.first_row.split(self.delimiter)
         columns = {c: 'VARCHAR' for c in columns_list}
@@ -119,31 +118,31 @@ class CSVFile(CSVParser):
 
     def get_columns(self):
         """Return the schema of the columns in the CSV file."""
-        return self.attributes['columns_list']
+        return self.get_attributes()['columns_list']
 
     def get_columns_string(self):
         """Return the first row of the CSV file."""
-        return self.attributes['columns_string']
+        return self.get_attributes()['columns_string']
 
     def get_columns_byte_string(self):
         """Return the first row of the CSV file as bytes."""
-        return self.attributes['columns_byte_string']
+        return self.get_attributes()['columns_byte_string']
 
     def get_column_count(self):
         """Return the number of columns in the CSV file."""
-        return self.attributes['column_count']
+        return self.get_attributes()['column_count']
 
     def get_quotechar(self):
         """Return the quote character used in the CSV file."""
-        return self.attributes['quotechar']
+        return self.get_attributes()['quotechar']
 
     def get_escapechar(self):
         """Return the escape character used in the CSV file."""
-        return self.attributes['escapechar']
+        return self.get_attributes()['escapechar']
 
     def get_newline_delimiter(self):
         """Return the newline delimiter used in the CSV file."""
-        return self.attributes['newline_delimiter']
+        return self.get_attributes()['newline_delimiter']
 
     def to_dicts(self):
         """Converts Dataframe to list of dictionaries."""
