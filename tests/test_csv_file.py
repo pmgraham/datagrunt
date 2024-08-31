@@ -5,6 +5,7 @@ import sys
 sys.path.append('../')  # Add the parent directory to the search path
 sys.path.append('../datagrunt')  # Add the parent directory to the search path
 from datagrunt.csvfile import CSVFile
+from datagrunt.core.queries import DuckDBQueries
 
 class TestCSVFile(unittest.TestCase):
 
@@ -20,15 +21,9 @@ class TestCSVFile(unittest.TestCase):
         self.assertEqual(self.test_csv_file.extension, '.csv')
         self.assertEqual(self.test_csv_file.extension_string, 'csv')
 
-    def test_select_from_table_to_dataframe(self):
-        """Test select_from_table method."""
-        query = f"SELECT * FROM {self.test_csv_file.duckdb_instance.database_table_name} LIMIT 10"
-        df = self.test_csv_file.select_from_table_to_dataframe(query)
-        self.assertEqual(len(df), 10)  # Check if 10 rows are returned
-
     def test_attributes(self):
         """Test attributes method."""
-        attributes = self.test_csv_file.attributes
+        attributes = self.test_csv_file.get_attributes()
         self.assertIn('delimiter', attributes)
         self.assertIn('quotechar', attributes)
         self.assertIn('escapechar', attributes)
