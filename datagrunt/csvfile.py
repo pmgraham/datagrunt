@@ -31,7 +31,7 @@ class CSVProperties(FileProperties):
         """
         super().__init__(filepath)
         self.first_row = self._get_first_row_from_file()
-        self.delimiter = self.infer_csv_file_delimiter()
+        self.delimiter = self._infer_csv_file_delimiter()
         if not self.is_csv:
             raise ValueError(f"File extension '{self.extension_string}' is not a valid CSV file extension.")
 
@@ -49,7 +49,7 @@ class CSVProperties(FileProperties):
             first_line = csv_file.readline().strip()
         return first_line
 
-    def get_most_common_non_alpha_numeric_character_from_string(self):
+    def _get_most_common_non_alpha_numeric_character_from_string(self):
         """Get the most common non-alpha-numeric character from a given string.
 
         Args:
@@ -64,7 +64,7 @@ class CSVProperties(FileProperties):
         most_common = counts.most_common()
         return most_common
 
-    def infer_csv_file_delimiter(self):
+    def _infer_csv_file_delimiter(self):
         """Infer the delimiter of a CSV file.
 
         Args:
@@ -73,7 +73,7 @@ class CSVProperties(FileProperties):
         Returns:
             str: The delimiter of the CSV file.
         """
-        delimiter_candidates = self.get_most_common_non_alpha_numeric_character_from_string()
+        delimiter_candidates = self._get_most_common_non_alpha_numeric_character_from_string()
 
         if self.is_empty:
             delimiter = self.DEFAULT_DELIMITER
