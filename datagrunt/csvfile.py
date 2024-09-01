@@ -1,6 +1,4 @@
-"""Module for data processing from files. Uses duckdb for file processing
-   and Polars for dataframe objects.
-"""
+"""Module for defining properties, reading, and writing CSV files."""
 
 # standard library
 from collections import Counter
