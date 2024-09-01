@@ -15,7 +15,7 @@ from datagrunt.core.fileproperties import FileProperties
 from datagrunt.core.queries import DuckDBQueries
 from datagrunt.core.logger import show_warning, show_large_file_warning
 
-class CSVDelimiter(FileProperties):
+class CSVProperties(FileProperties):
     """Class for parsing CSV files. Mostly determining the delimiter."""
 
     DELIMITER_REGEX_PATTERN = r'[^0-9a-zA-Z_-]'
@@ -84,70 +84,7 @@ class CSVDelimiter(FileProperties):
         else:
             delimiter = delimiter_candidates[0][0]
         return delimiter
-
-class CSVReader(CSVDelimiter):
-
-    QUOTING_MAP = {
-        0: 'no quoting',
-        1: 'quote all',
-        2: 'quote minimal',
-        3: 'quote non-numeric'
-    }
-
-    def __init__(self, filepath):
-        """
-        Initialize the CSVFile class.
-
-        Args:
-            filepath (str): Path to the file to read.
-        """
-        super().__init__(filepath)
-        self.db_table = DuckDBQueries(self.filepath).database_table_name
-        self.duckdb_connection = DuckDBQueries(self.filepath).database_connection
-
-    def _csv_import_table_statement(self):
-        """Default CSV import table statement."""
-        # all_varchar=True is set to preserve integrity of data by importing as strings.
-        return f"""
-            CREATE OR REPLACE TABLE {self.db_table} AS
-            SELECT *
-            FROM read_csv('{self.filepath}',
-                            auto_detect=true,
-                            delim='{self.delimiter}',
-                            header=true,
-                            null_padding=true,
-                            all_varchar=True);
-            """
-
-    def _read_csv_to_duckdb(self):
-        """Read CSV file using DuckDB Python API."""
-        return read_csv(self.filepath,
-                        delimiter=self.delimiter,
-                        null_padding=True,
-                        all_varchar=True
-                        )
-
-    def sample_csv_data(self):
-        """Show sample 20 rows of the CSV file."""
-        self._read_csv_to_duckdb().show()
-
-    def query_csv_data(self, sql_statement, show_only=False):
-        """Query a CSV file using DuckDB Python API.
-
-        Args:
-            sql_statement (str): The SQL statement to execute.
-            show_only (bool): Only show results and don't return a dataframe.
-
-        Returns:
-            Polars DataFrame or None
-        """
-        con = self.duckdb_connection
-        con.sql(self._csv_import_table_statement())
-        if show_only:
-            con.sql(sql_statement).show()
-        else:
-            return con.sql(sql_statement).pl()
-
+    
     def get_row_count_with_header(self):
         """Return the number of lines in the CSV file including the header."""
         with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
@@ -214,6 +151,69 @@ class CSVReader(CSVDelimiter):
         """Return the newline delimiter used in the CSV file."""
         return self.get_attributes()['newline_delimiter']
 
+class CSVReader(CSVProperties):
+
+    QUOTING_MAP = {
+        0: 'no quoting',
+        1: 'quote all',
+        2: 'quote minimal',
+        3: 'quote non-numeric'
+    }
+
+    def __init__(self, filepath):
+        """
+        Initialize the CSVReader class.
+
+        Args:
+            filepath (str): Path to the file to read.
+        """
+        super().__init__(filepath)
+        self.db_table = DuckDBQueries(self.filepath).database_table_name
+        self.duckdb_connection = DuckDBQueries(self.filepath).database_connection
+
+    def _csv_import_table_statement(self):
+        """Default CSV import table statement."""
+        # all_varchar=True is set to preserve integrity of data by importing as strings.
+        return f"""
+            CREATE OR REPLACE TABLE {self.db_table} AS
+            SELECT *
+            FROM read_csv('{self.filepath}',
+                            auto_detect=true,
+                            delim='{self.delimiter}',
+                            header=true,
+                            null_padding=true,
+                            all_varchar=True);
+            """
+
+    def _read_csv_to_duckdb(self):
+        """Read CSV file using DuckDB Python API."""
+        return read_csv(self.filepath,
+                        delimiter=self.delimiter,
+                        null_padding=True,
+                        all_varchar=True
+                        )
+
+    def sample_csv_data(self):
+        """Show sample 20 rows of the CSV file."""
+        self._read_csv_to_duckdb().show()
+
+    def query_csv_data(self, sql_statement, show_only=False):
+        """Query a CSV file using DuckDB Python API.
+
+        Args:
+            sql_statement (str): The SQL statement to execute.
+            show_only (bool): Only show results and don't return a dataframe.
+
+        Returns:
+            Polars DataFrame or None
+        """
+        con = self.duckdb_connection
+        con.sql(self._csv_import_table_statement())
+        if show_only:
+            con.sql(sql_statement).show()
+        else:
+            return con.sql(sql_statement).pl()
+
     def to_dicts(self):
         """Converts Dataframe to list of dictionaries."""
         if self.is_large:
@@ -238,6 +238,18 @@ class CSVReader(CSVDelimiter):
              show_large_file_warning()
         return self.to_dataframe().write_ndjson()
 
+class CSVWriter(CSVReader):
+    """Class to write CSV files to various file types."""
+
+    def __init__(self, filepath):
+        """
+        Initialize the CSVWriter class.
+
+        Args:
+            filepath (str): Path to the file to write.
+        """
+        super().__init__(filepath)
+    
     def write_avro(self, out_filename=None):
         """Writes data to an Avro file.
 
@@ -296,6 +308,3 @@ class CSVReader(CSVDelimiter):
             show_warning(f"Data will be lost: file contains {self.get_row_count_with_header()} rows and Excel supports a max of {self.EXCEL_ROW_LIMIT} rows.")
         sql(self._csv_import_table_statement())
         sql(DuckDBQueries(self.filepath).export_excel_query(out_filename))
-
-class CSVWriter(CSVDelimiter):
-    """Class to write CSV files to various file types."""
