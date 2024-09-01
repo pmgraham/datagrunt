@@ -15,7 +15,7 @@ from datagrunt.core.fileproperties import FileProperties
 from datagrunt.core.queries import DuckDBQueries
 from datagrunt.core.logger import show_warning, show_large_file_warning
 
-class CSVParser(FileProperties):
+class CSVDelimiter(FileProperties):
     """Class for parsing CSV files. Mostly determining the delimiter."""
 
     DELIMITER_REGEX_PATTERN = r'[^0-9a-zA-Z_-]'
@@ -83,7 +83,7 @@ class CSVParser(FileProperties):
             delimiter = delimiter_candidates[0][0]
         return delimiter
 
-class CSVFile(CSVParser):
+class CSVFile(CSVDelimiter):
 
     QUOTING_MAP = {
         0: 'no quoting',
