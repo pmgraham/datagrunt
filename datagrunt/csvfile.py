@@ -84,7 +84,7 @@ class CSVProperties(FileProperties):
         else:
             delimiter = delimiter_candidates[0][0]
         return delimiter
-    
+
     def get_row_count_with_header(self):
         """Return the number of lines in the CSV file including the header."""
         with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
@@ -249,7 +249,7 @@ class CSVWriter(CSVReader):
             filepath (str): Path to the file to write.
         """
         super().__init__(filepath)
-    
+
     def write_avro(self, out_filename=None):
         """Writes data to an Avro file.
 
