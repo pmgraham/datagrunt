@@ -11,6 +11,33 @@ class FileBase:
 
     FILE_SIZE_DIVISOR = 1024
     DEFAULT_ENCODING = 'utf-8'
+    EXCEL_FILE_EXTENSIONS = [
+        'xlsx',
+        'xlsm',
+        'xlsb',
+        'xltx',
+        'xltm',
+        'xls',
+        'xlt',
+        'xls'
+    ]
+
+    CSV_FILE_EXTENSIONS = ['csv']
+    TABULAR_FILES = ['csv', 'tsv']
+    APACHE_FILE_EXTENSIONS = ['parquet', 'avro']
+    STRUCTURED_FILE_EXTENSIONS = list(set(CSV_FILE_EXTENSIONS +
+                                          EXCEL_FILE_EXTENSIONS +
+                                          TABULAR_FILES +
+                                          APACHE_FILE_EXTENSIONS)
+                                          )
+    STRUCTURED_FILE_EXTENSIONS.sort()
+    SEMI_STRUCTURED_FILE_EXTENSIONS = ['json']
+    UNSTRUCTURED_FILE_EXTENSIONS = ['pdf']
+    STANDARD_FILE_EXTENSIONS = ['csv', 'tsv', 'txt', 'json', 'jsonl', 'parquet', 'avro']
+    PROPRIETARY_FILE_EXTENSIONS = EXCEL_FILE_EXTENSIONS
+    JSON_OUT_FILENAME = 'output.json'
+    JSON_NEWLINE_OUT_FILENAME = 'output.jsonl'
+    EXCEL_ROW_LIMIT = 1_048_576
 
     def __init__(self, filepath):
         """
@@ -28,43 +55,7 @@ class FileBase:
         self.size_in_mb = round((self.size_in_kb / self.FILE_SIZE_DIVISOR), 5)
         self.size_in_gb = round((self.size_in_mb / self.FILE_SIZE_DIVISOR), 5)
         self.size_in_tb = round((self.size_in_gb / self.FILE_SIZE_DIVISOR), 5)
-
-class FileProperties(FileBase):
-    """Class to evaluate file types and to instantiate the right class."""
-
-    EXCEL_FILE_EXTENSIONS = [
-        'xlsx',
-        'xlsm',
-        'xlsb',
-        'xltx',
-        'xltm',
-        'xls',
-        'xlt',
-        'xls'
-    ]
-
-    CSV_FILE_EXTENSIONS = ['csv', 'tsv', 'txt']
-    APACHE_FILE_EXTENSIONS = ['parquet', 'avro']
-    STRUCTURED_FILE_EXTENSIONS = list(set(CSV_FILE_EXTENSIONS + EXCEL_FILE_EXTENSIONS +
-                                          APACHE_FILE_EXTENSIONS))
-    STRUCTURED_FILE_EXTENSIONS.sort()
-    SEMI_STRUCTURED_FILE_EXTENSIONS = ['json']
-    UNSTRUCTURED_FILE_EXTENSIONS = ['pdf']
-    STANDARD_FILE_EXTENSIONS = ['csv', 'tsv', 'txt', 'json']
-    PROPRIETARY_FILE_EXTENSIONS = EXCEL_FILE_EXTENSIONS
-    JSON_OUT_FILENAME = 'output.json'
-    JSON_NEWLINE_OUT_FILENAME = 'output.jsonl'
-    EXCEL_ROW_LIMIT = 1_048_576
-
-    def __init__(self, filepath):
-        """
-        Initialize the FileEvaluator class.
-
-        Args:
-            filepath (str): Path to the file.
-        """
-        super().__init__(filepath)
-
+    
     @property
     def is_structured(self):
         """Check if the file is structured."""
@@ -116,7 +107,7 @@ class FileProperties(FileBase):
         """Check if the file is large."""
         return self.size_in_gb >= 1
 
-class CSVParser(FileProperties):
+class CSVParser(FileBase):
     """Class for parsing CSV files. Mostly determining the delimiter."""
 
     DELIMITER_REGEX_PATTERN = r'[^0-9a-zA-Z_-]'

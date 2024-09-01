@@ -9,7 +9,7 @@ import csv
 from duckdb import read_csv, sql
 
 # local libraries
-from datagrunt.core.filehelpers import CSVParser
+from datagrunt.core.fileproperties import CSVParser
 from datagrunt.core.queries import DuckDBQueries
 from datagrunt.core.logger import show_warning, show_large_file_warning
 
