@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import re
 
-class FileBase:
+class FileProperties:
     """Base class for file objects."""
 
     FILE_SIZE_DIVISOR = 1024
@@ -107,7 +107,7 @@ class FileBase:
         """Check if the file is large."""
         return self.size_in_gb >= 1
 
-class CSVParser(FileBase):
+class CSVParser(FileProperties):
     """Class for parsing CSV files. Mostly determining the delimiter."""
 
     DELIMITER_REGEX_PATTERN = r'[^0-9a-zA-Z_-]'
