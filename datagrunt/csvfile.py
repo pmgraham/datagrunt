@@ -34,6 +34,8 @@ class CSVDelimiter(FileProperties):
         super().__init__(filepath)
         self.first_row = self._get_first_row_from_file()
         self.delimiter = self.infer_csv_file_delimiter()
+        if not self.is_csv:
+            raise ValueError(f"File extension '{self.extension_string}' is not a valid CSV file extension.")
 
     def _get_first_row_from_file(self):
         """Reads and returns the first line of a file.
@@ -83,7 +85,7 @@ class CSVDelimiter(FileProperties):
             delimiter = delimiter_candidates[0][0]
         return delimiter
 
-class CSVFile(CSVDelimiter):
+class CSVReader(CSVDelimiter):
 
     QUOTING_MAP = {
         0: 'no quoting',
@@ -102,8 +104,6 @@ class CSVFile(CSVDelimiter):
         super().__init__(filepath)
         self.db_table = DuckDBQueries(self.filepath).database_table_name
         self.duckdb_connection = DuckDBQueries(self.filepath).database_connection
-        if not self.is_csv:
-            raise ValueError(f"File extension '{self.extension_string}' is not a valid CSV file extension.")
 
     def _csv_import_table_statement(self):
         """Default CSV import table statement."""
@@ -296,3 +296,6 @@ class CSVFile(CSVDelimiter):
             show_warning(f"Data will be lost: file contains {self.get_row_count_with_header()} rows and Excel supports a max of {self.EXCEL_ROW_LIMIT} rows.")
         sql(self._csv_import_table_statement())
         sql(DuckDBQueries(self.filepath).export_excel_query(out_filename))
+
+class CSVWriter(CSVDelimiter):
+    """Class to write CSV files to various file types."""
