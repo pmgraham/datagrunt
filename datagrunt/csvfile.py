@@ -6,7 +6,7 @@ import csv
 import re
 
 # third party libraries
-from duckdb import read_csv, sql, execute
+import duckdb
 import polars as pl
 
 # local libraries
@@ -170,7 +170,7 @@ class CSVReader(CSVProperties):
 
     def get_sample(self):
         """Return a sample of the CSV file."""
-        read_csv(self.filepath, delimiter=self.delimiter).show()
+        duckdb.read_csv(self.filepath, delimiter=self.delimiter).show()
 
     def to_dataframe(self):
         """Converts CSV to a Polars dataframe."""
