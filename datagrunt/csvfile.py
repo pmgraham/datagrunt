@@ -150,7 +150,7 @@ class CSVProperties(FileProperties):
         """Return the newline delimiter used in the CSV file."""
         return self.get_attributes()['newline_delimiter']
 
-class CSVDataframe(CSVProperties):
+class CSVReader(CSVProperties):
 
     QUOTING_MAP = {
         0: 'no quoting',
