@@ -1,6 +1,6 @@
 import logging
 
-LARGE_FILE_WARNING = "Warning: File is large and may load into memory slowly or exceed memory capacity."
+LARGE_FILE_WARNING = "File is large and may load into memory slowly or exceed memory capacity."
 DUCKDB_ENGINE_ERROR = "DuckDB engine failed due to the following error: {error}. Switching to Polars."
 
 def show_warning(message):
