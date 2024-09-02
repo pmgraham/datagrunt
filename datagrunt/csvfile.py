@@ -176,8 +176,8 @@ class CSVReader(CSVProperties):
         """Converts CSV to a Polars dataframe."""
         return pl.read_csv(self.filepath, separator=self.delimiter)
 
-class CSVVWriter(CSVProperties):
-    """Class to write CSV files to various file types."""
+class CSVConverter(CSVProperties):
+    """Class to convert CSV files to various other supported file types."""
 
     def __init__(self, filepath):
         """
