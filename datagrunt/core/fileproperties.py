@@ -40,6 +40,13 @@ class FileProperties:
     JSON_NEWLINE_OUT_FILENAME = 'output.jsonl'
     EXCEL_ROW_LIMIT = 1_048_576
 
+    JSON_OUT_FILENAME = 'output.json'
+    JSON_NEWLINE_OUT_FILENAME = 'output.jsonl'
+    CSV_OUT_FILENAME = 'output.csv'
+    EXCEL_OUT_FILENAME = 'output.xlsx'
+    PARQUET_OUT_FILENAME = 'output.parquet'
+    AVRO_OUT_FILENAME = 'output.avro'
+
     def __init__(self, filepath):
         """
         Initialize the FileBase class.
@@ -250,3 +257,4 @@ class CSVProperties(FileProperties):
     def get_newline_delimiter(self):
         """Return the newline delimiter used in the CSV file."""
         return self.get_attributes()['newline_delimiter']
+    
