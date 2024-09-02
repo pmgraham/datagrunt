@@ -236,7 +236,7 @@ class CSVReader(CSVProperties):
              show_large_file_warning()
         return self.to_dataframe().write_ndjson()
 
-class CSVWriter(CSVReader):
+class CSVWriter(CSVProperties):
     """Class to write CSV files to various file types."""
 
     def __init__(self, filepath):
