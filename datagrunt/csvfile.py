@@ -23,6 +23,13 @@ class CSVProperties(FileProperties):
     CSV_SNIFF_SAMPLE_ROWS = 5
     DATAFRAME_SAMPLE_ROWS = 5
 
+    QUOTING_MAP = {
+        0: 'no quoting',
+        1: 'quote all',
+        2: 'quote minimal',
+        3: 'quote non-numeric'
+    }
+
     def __init__(self, filepath):
         """
         Initialize the CSVParser class.
@@ -152,13 +159,6 @@ class CSVProperties(FileProperties):
 
 class CSVReader(CSVProperties):
 
-    QUOTING_MAP = {
-        0: 'no quoting',
-        1: 'quote all',
-        2: 'quote minimal',
-        3: 'quote non-numeric'
-    }
-
     def __init__(self, filepath):
         """
         Initialize the CSVReader class.
@@ -167,7 +167,7 @@ class CSVReader(CSVProperties):
             filepath (str): Path to the file to read.
         """
         super().__init__(filepath)
-    
+
     def get_sample(self):
         """Return a sample of the CSV file."""
         return read_csv(self.filepath, delimiter=self.delimiter).show()
