@@ -107,7 +107,6 @@ class CSVReaderPolarsEngine(CSVProperties):
         dicts = self.to_dataframe().to_dicts()
         return dicts
 
-
 class CSVWriterDuckDBEngine(DuckDBQueries):
     """Class to convert CSV files to various other supported file types."""
 
