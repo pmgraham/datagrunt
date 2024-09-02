@@ -6,13 +6,13 @@ import csv
 import re
 
 # third party libraries
-from duckdb import read_csv, sql
+from duckdb import read_csv, sql, execute
 import polars as pl
 
 # local libraries
 from datagrunt.core.fileproperties import FileProperties
 from datagrunt.core.queries import DuckDBQueries
-from datagrunt.core.logger import show_warning, show_large_file_warning
+from datagrunt.core.logger import *
 
 class CSVProperties(FileProperties):
     """Class for parsing CSV files. Mostly determining the delimiter."""
@@ -170,7 +170,7 @@ class CSVReader(CSVProperties):
 
     def get_sample(self):
         """Return a sample of the CSV file."""
-        return read_csv(self.filepath, delimiter=self.delimiter).show()
+        read_csv(self.filepath, delimiter=self.delimiter).show()
 
     def to_dataframe(self):
         """Converts CSV to a Polars dataframe."""
@@ -188,61 +188,10 @@ class CSVVWriter(CSVProperties):
         """
         super().__init__(filepath)
 
-    def write_avro(self, out_filename=None):
-        """Writes data to an Avro file.
-
+    def _attempt_duckdb_query_engine(self, query):
+        """Attempt to use duckdb query engine. On error attempt Polars.
+        
         Args:
-            out_filename (str): The name of the output file.
+            query str: DuckDB query to attempt.
         """
-        if out_filename:
-            filename = out_filename
-        else:
-            filename = DuckDBQueries(self.filepath).AVRO_OUT_FILENAME
-        CSVReader(self.filepath).to_dataframe().write_avro(filename)
-
-    def write_csv(self, out_filename=None):
-        """Writes CSV to a file.
-
-        Args:
-            out_filename (str): The name of the output file.
-        """
-        sql(self._csv_import_table_statement())
-        sql(DuckDBQueries(self.filepath).export_csv_query(out_filename))
-
-    def write_json(self, out_filename=None):
-        """Writes JSON to a file.
-
-        Args:
-            out_filename (str): The name of the output file.
-        """
-        sql(self._csv_import_table_statement())
-        sql(DuckDBQueries(self.filepath).export_json_query(out_filename))
-
-    def write_json_newline_delimited(self, out_filename=None):
-        """Writes JSON to a file with newline delimited.
-
-        Args:
-            out_filename (str): The name of the output file.
-        """
-        sql(self._csv_import_table_statement())
-        sql(DuckDBQueries(self.filepath).export_json_newline_delimited_query(out_filename))
-
-    def write_parquet(self, out_filename=None):
-        """Writes data to a Parquet file.
-
-        Args:
-            out_filename (str): The name of the output file.
-        """
-        sql(self._csv_import_table_statement())
-        sql(DuckDBQueries(self.filepath).export_parquet_query(out_filename))
-
-    def write_excel(self, out_filename=None):
-        """Writes data to an Excel file.
-
-        Args:
-            out_filename (str): The name of the output file.
-        """
-        if self.get_row_count_with_header() > self.EXCEL_ROW_LIMIT:
-            show_warning(f"Data will be lost: file contains {self.get_row_count_with_header()} rows and Excel supports a max of {self.EXCEL_ROW_LIMIT} rows.")
-        sql(self._csv_import_table_statement())
-        sql(DuckDBQueries(self.filepath).export_excel_query(out_filename))
+        pass
