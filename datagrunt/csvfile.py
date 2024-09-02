@@ -1,9 +1,7 @@
 """Module for defining properties, reading, and writing CSV files."""
 
 # standard library
-from collections import Counter
-import csv
-import re
+
 
 # third party libraries
 import duckdb
