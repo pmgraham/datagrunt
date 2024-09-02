@@ -167,33 +167,16 @@ class CSVReader(CSVProperties):
             filepath (str): Path to the file to read.
         """
         super().__init__(filepath)
-        self.dataframe = self._to_dataframe()
+    
+    def get_sample(self):
+        """Return a sample of the CSV file."""
+        return read_csv(self.filepath, delimiter=self.delimiter).show()
 
-    def _to_dataframe(self):
+    def to_dataframe(self):
         """Converts CSV to a Polars dataframe."""
         return pl.read_csv(self.filepath, separator=self.delimiter)
 
-    def to_dicts(self):
-        """Converts Dataframe to list of dictionaries."""
-        if self.is_large:
-             show_large_file_warning()
-        with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
-            csv_reader = csv.DictReader(csv_file, delimiter=self.delimiter)
-            return list(csv_reader)
-
-    def to_json(self):
-         """Converts CSV to a JSON string."""
-         if self.is_large:
-             show_large_file_warning()
-         return self.to_dataframe().write_json()
-
-    def to_json_newline_delimited(self):
-        """Converts CSV to a JSON string with newline delimited."""
-        if self.is_large:
-             show_large_file_warning()
-        return self.to_dataframe().write_ndjson()
-
-class CSVWriter(CSVProperties):
+class CSVVWriter(CSVProperties):
     """Class to write CSV files to various file types."""
 
     def __init__(self, filepath):
