@@ -7,6 +7,7 @@ import re
 
 # third party libraries
 from duckdb import read_csv, sql
+import polars as pl
 
 # local libraries
 from datagrunt.core.fileproperties import FileProperties
@@ -149,7 +150,7 @@ class CSVProperties(FileProperties):
         """Return the newline delimiter used in the CSV file."""
         return self.get_attributes()['newline_delimiter']
 
-class CSVReader(CSVProperties):
+class CSVDataframe(CSVProperties):
 
     QUOTING_MAP = {
         0: 'no quoting',
@@ -166,51 +167,11 @@ class CSVReader(CSVProperties):
             filepath (str): Path to the file to read.
         """
         super().__init__(filepath)
-        self.db_table = DuckDBQueries(self.filepath).database_table_name
-        self.duckdb_connection = DuckDBQueries(self.filepath).database_connection
+        self.dataframe = self._to_dataframe()
 
-    def _csv_import_table_statement(self):
-        """Default CSV import table statement."""
-        # all_varchar=True is set to preserve integrity of data by importing as strings.
-        return f"""
-            CREATE OR REPLACE TABLE {self.db_table} AS
-            SELECT *
-            FROM read_csv('{self.filepath}',
-                            auto_detect=true,
-                            delim='{self.delimiter}',
-                            header=true,
-                            null_padding=true,
-                            all_varchar=True);
-            """
-
-    def _read_csv_to_duckdb(self):
-        """Read CSV file using DuckDB Python API."""
-        return read_csv(self.filepath,
-                        delimiter=self.delimiter,
-                        null_padding=True,
-                        all_varchar=True
-                        )
-
-    def sample_csv_data(self):
-        """Show sample 20 rows of the CSV file."""
-        self._read_csv_to_duckdb().show()
-
-    def query_csv_data(self, sql_statement, show_only=False):
-        """Query a CSV file using DuckDB Python API.
-
-        Args:
-            sql_statement (str): The SQL statement to execute.
-            show_only (bool): Only show results and don't return a dataframe.
-
-        Returns:
-            Polars DataFrame or None
-        """
-        con = self.duckdb_connection
-        con.sql(self._csv_import_table_statement())
-        if show_only:
-            con.sql(sql_statement).show()
-        else:
-            return con.sql(sql_statement).pl()
+    def _to_dataframe(self):
+        """Converts CSV to a Polars dataframe."""
+        return pl.read_csv(self.filepath, separator=self.delimiter)
 
     def to_dicts(self):
         """Converts Dataframe to list of dictionaries."""
@@ -219,10 +180,6 @@ class CSVReader(CSVProperties):
         with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
             csv_reader = csv.DictReader(csv_file, delimiter=self.delimiter)
             return list(csv_reader)
-
-    def to_dataframe(self):
-        """Converts CSV to a Polars dataframe."""
-        return self._read_csv_to_duckdb().pl()
 
     def to_json(self):
          """Converts CSV to a JSON string."""
