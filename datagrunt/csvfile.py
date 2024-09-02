@@ -190,7 +190,7 @@ class CSVConverter(CSVProperties):
 
     def _attempt_duckdb_query_engine(self, query):
         """Attempt to use duckdb query engine. On error attempt Polars.
-        
+
         Args:
             query str: DuckDB query to attempt.
         """
