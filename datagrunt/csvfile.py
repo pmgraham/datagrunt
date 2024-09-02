@@ -198,7 +198,7 @@ class CSVVWriter(CSVProperties):
             filename = out_filename
         else:
             filename = DuckDBQueries(self.filepath).AVRO_OUT_FILENAME
-        self.to_dataframe().write_avro(filename)
+        CSVReader(self.filepath).to_dataframe().write_avro(filename)
 
     def write_csv(self, out_filename=None):
         """Writes CSV to a file.
