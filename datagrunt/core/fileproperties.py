@@ -192,16 +192,7 @@ class CSVProperties(FileProperties):
             delimiter = delimiter_candidates[0][0]
         return delimiter
 
-    def get_row_count_with_header(self):
-        """Return the number of lines in the CSV file including the header."""
-        with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
-            return sum(1 for _ in csv_file)
-
-    def get_row_count_without_header(self):
-        """Return the number of lines in the CSV file excluding the header."""
-        return self.get_row_count_with_header() - 1
-
-    def get_attributes(self):
+    def _get_attributes(self):
         """Generate CSV attributes."""
         columns_list = self.first_row.split(self.delimiter)
         columns = {c: 'VARCHAR' for c in columns_list}
@@ -230,30 +221,48 @@ class CSVProperties(FileProperties):
 
         return attributes
 
-    def get_columns(self):
+    @property
+    def row_count_with_header(self):
+        """Return the number of lines in the CSV file including the header."""
+        with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
+            return sum(1 for _ in csv_file)
+
+    @property
+    def row_count_without_header(self):
+        """Return the number of lines in the CSV file excluding the header."""
+        return self.get_row_count_with_header() - 1
+
+    @property
+    def columns(self):
         """Return the schema of the columns in the CSV file."""
-        return self.get_attributes()['columns_list']
+        return self._get_attributes()['columns_list']
 
-    def get_columns_string(self):
+    @property
+    def columns_string(self):
         """Return the first row of the CSV file."""
-        return self.get_attributes()['columns_string']
+        return self._get_attributes()['columns_string']
 
-    def get_columns_byte_string(self):
+    @property
+    def columns_byte_string(self):
         """Return the first row of the CSV file as bytes."""
-        return self.get_attributes()['columns_byte_string']
+        return self._get_attributes()['columns_byte_string']
 
-    def get_column_count(self):
+    @property
+    def column_count(self):
         """Return the number of columns in the CSV file."""
-        return self.get_attributes()['column_count']
+        return self._get_attributes()['column_count']
 
-    def get_quotechar(self):
+    @property
+    def quotechar(self):
         """Return the quote character used in the CSV file."""
-        return self.get_attributes()['quotechar']
+        return self._get_attributes()['quotechar']
 
-    def get_escapechar(self):
+    @property
+    def escapechar(self):
         """Return the escape character used in the CSV file."""
-        return self.get_attributes()['escapechar']
+        return self._get_attributes()['escapechar']
 
-    def get_newline_delimiter(self):
+    @property
+    def newline_delimiter(self):
         """Return the newline delimiter used in the CSV file."""
-        return self.get_attributes()['newline_delimiter']
+        return self._get_attributes()['newline_delimiter']
