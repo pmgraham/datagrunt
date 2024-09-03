@@ -70,7 +70,6 @@ class TestFileProperties(unittest.TestCase):
 
         # Large file
         large_file_props = FileProperties(self.large_file)
-        print(large_file_props.size_in_gb)
         self.assertGreater(large_file_props.size_in_gb, 1.0)
         self.assertFalse(large_file_props.is_empty)
         self.assertTrue(large_file_props.is_large)
@@ -112,6 +111,67 @@ class TestFileProperties(unittest.TestCase):
         self.assertFalse(json_file_props.is_csv)
         self.assertFalse(json_file_props.is_excel)
         self.assertFalse(json_file_props.is_tabular)
+
+class TestCSVProperties(unittest.TestCase):
+    """Test class for CSVProperties."""
+
+    def setUp(self):
+        """Setup method to create sample CSV files before each test."""
+        self.empty_file = 'empty.csv'
+        self.comma_file = 'comma.csv'
+        self.pipe_file = 'pipe.csv'
+        self.space_file = 'space.csv'
+        self.tab_file = 'tab.csv'
+        self.text_file = 'text.txt'
+
+        open(self.empty_file, 'w').close()
+        with open(self.comma_file, 'w') as f:
+            f.write('Name,Age,City\n')
+            f.write('Alice,25,New York\n')
+        with open(self.pipe_file, 'w') as f:
+            f.write('Name|Age|City\n')
+            f.write('Bob|30|London\n')
+        with open(self.space_file, 'w') as f:
+            f.write('Name Age City\n')
+            f.write('Charlie 28 Paris\n')
+        with open(self.tab_file, 'w') as f:
+            f.write('Name\tAge\tCity\n')
+            f.write('David\t35\tTokyo\n')
+        with open(self.text_file, 'w') as f:
+            f.write('Name\tAge\tCity\n')
+            f.write('David\t35\tTokyo\n')
+
+    def tearDown(self):
+        """Cleanup method to remove the sample files after each test."""
+        for file in [self.empty_file, self.comma_file, self.pipe_file,
+                     self.space_file, self.tab_file, self.text_file]:
+            if os.path.exists(file):
+                os.remove(file)
+
+    def test_delimiter_inference(self):
+        """Test if delimiters are correctly inferred for different CSV files."""
+        self.assertEqual(CSVProperties(self.empty_file).delimiter, ',')
+        self.assertEqual(CSVProperties(self.comma_file).delimiter, ',')
+        self.assertEqual(CSVProperties(self.pipe_file).delimiter, '|')
+        self.assertEqual(CSVProperties(self.space_file).delimiter, ' ')
+        self.assertEqual(CSVProperties(self.tab_file).delimiter, '\t')
+
+    def test_row_counting(self):
+        """Test if row counts are correctly determined."""
+        self.assertEqual(CSVProperties(self.empty_file).row_count_with_header, 0)
+        self.assertEqual(CSVProperties(self.empty_file).row_count_without_header, -1)
+        self.assertEqual(CSVProperties(self.comma_file).row_count_with_header, 2)
+        self.assertEqual(CSVProperties(self.comma_file).row_count_without_header, 1)
+
+    def test_column_extraction(self):
+        """Test if column names are correctly extracted."""
+        self.assertEqual(CSVProperties(self.comma_file).columns, ['Name', 'Age', 'City'])
+        self.assertEqual(CSVProperties(self.pipe_file).columns, ['Name', 'Age', 'City'])
+
+    def test_invalid_csv(self):
+        """Test if a ValueError is raised for a non-CSV file."""
+        with self.assertRaises(ValueError):
+            CSVProperties(self.text_file)
 
 class TestCSVReaderDuckDBEngine(unittest.TestCase):
     """Test class for CSVReaderDuckDBEngine."""
