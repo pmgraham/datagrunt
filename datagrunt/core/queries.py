@@ -24,10 +24,10 @@ class DuckDBQueries(DuckDBDatabase):
         else:
             filename = default_filename
         return filename
-    
+
     def import_csv_query(self, delimiter):
         """Query to import a CSV file into a DuckDB table.
-        
+
         Args:
             filepath str: Path to the file.
             delimiter str: The delimiter to use.
@@ -42,13 +42,13 @@ class DuckDBQueries(DuckDBDatabase):
                             null_padding=true,
                             all_varchar=True);
             """
-    
+
     def select_from_duckdb_table(self):
         return f"SELECT * FROM {self.database_table_name}"
 
     def export_csv_query(self, out_filename=None):
         """Query to export a DuckDB table to a CSV file.
-        
+
         Args:
             out_filename str: The name of the output file.
         """
@@ -57,7 +57,7 @@ class DuckDBQueries(DuckDBDatabase):
 
     def export_json_query(self, out_filename=None):
         """Query to export a DuckDB table to a JSON file.
-        
+
         Args:
             out_filename str: The name of the output file.
         """
@@ -66,7 +66,7 @@ class DuckDBQueries(DuckDBDatabase):
 
     def export_json_newline_delimited_query(self, out_filename=None):
         """Query to export a DuckDB table to a JSON file with newline delimited.
-        
+
         Args:
             out_filename str: The name of the output file.
         """
@@ -75,7 +75,7 @@ class DuckDBQueries(DuckDBDatabase):
 
     def export_parquet_query(self, out_filename=None):
         """Query to export a DuckDB table to a Parquet file.
-        
+
         Args:
             out_filename str: The name of the output file.
         """
@@ -84,7 +84,7 @@ class DuckDBQueries(DuckDBDatabase):
 
     def export_excel_query(self, out_filename=None):
         """Query to export a DuckDB table to an Excel file.
-        
+
         Args:
             out_filename str: The name of the output file.
         """
