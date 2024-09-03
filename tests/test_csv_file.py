@@ -2,7 +2,6 @@
 
 # standard library
 import os
-from pathlib import Path
 import sys
 import unittest
 from unittest.mock import patch
