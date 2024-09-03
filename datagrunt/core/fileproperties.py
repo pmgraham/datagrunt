@@ -63,7 +63,7 @@ class FileProperties:
         self.size_in_mb = round((self.size_in_kb / self.FILE_SIZE_DIVISOR), 5)
         self.size_in_gb = round((self.size_in_mb / self.FILE_SIZE_DIVISOR), 5)
         self.size_in_tb = round((self.size_in_gb / self.FILE_SIZE_DIVISOR), 5)
-    
+
     @property
     def is_structured(self):
         """Check if the file is structured."""
@@ -257,4 +257,3 @@ class CSVProperties(FileProperties):
     def get_newline_delimiter(self):
         """Return the newline delimiter used in the CSV file."""
         return self.get_attributes()['newline_delimiter']
-    
