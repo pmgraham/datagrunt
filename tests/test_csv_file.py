@@ -10,7 +10,6 @@ sys.path.append('../')  # Add the parent directory to the search path
 sys.path.append('../datagrunt')  # Add the parent directory to the search path
 
 # third party libraries
-import duckdb
 import polars as pl
 
 # local libraries
