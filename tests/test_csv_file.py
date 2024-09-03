@@ -17,6 +17,102 @@ from datagrunt.core.queries import *
 from datagrunt.core.logger import *
 from datagrunt.core.fileproperties import *
 
+class TestFileProperties(unittest.TestCase):
+    """Test class for FileProperties."""
+
+    def setUp(self):
+        """Setup method to create sample files before each test."""
+        self.empty_file = 'empty.txt'
+        self.small_file = 'small.txt'
+        self.large_file = 'large.txt'
+        self.csv_file = 'test.csv'
+        self.excel_file = 'test.xlsx'
+        self.parquet_file = 'test.parquet'
+        self.json_file = 'test.json'
+
+        open(self.empty_file, 'w').close()
+        with open(self.small_file, 'w') as f:
+            f.write('This is a small file.\n')
+        with open(self.large_file, 'wb') as f:
+            f.seek(1024 * 1024 * 1024 * 1024)  # Seek to 1GB
+            f.write(b'\0')
+        with open(self.csv_file, 'w') as f:
+            f.write('Name,Age,City\n')
+            f.write('Alice,25,New York\n')
+        with open(self.excel_file, 'w') as f:
+            f.write('This is a dummy Excel file.\n')
+        with open(self.parquet_file, 'w') as f:
+            f.write('This is a dummy Parquet file.\n')
+        with open(self.json_file, 'w') as f:
+            f.write('{"name": "John", "age": 30, "city": "New York"}\n')
+
+    def tearDown(self):
+        """Cleanup method to remove the sample files after each test."""
+        for file in [self.empty_file, self.small_file, self.large_file,
+                     self.csv_file, self.excel_file, self.parquet_file,
+                     self.json_file]:
+            if os.path.exists(file):
+                os.remove(file)
+
+    def test_file_properties(self):
+        """Test if file properties are correctly determined."""
+        # Empty file
+        empty_file_props = FileProperties(self.empty_file)
+        self.assertEqual(empty_file_props.size_in_bytes, 0)
+        self.assertTrue(empty_file_props.is_empty)
+        self.assertFalse(empty_file_props.is_large)
+
+        # Small file
+        small_file_props = FileProperties(self.small_file)
+        self.assertGreater(small_file_props.size_in_bytes, 0)
+        self.assertFalse(small_file_props.is_empty)
+        self.assertFalse(small_file_props.is_large)
+
+        # Large file
+        large_file_props = FileProperties(self.large_file)
+        print(large_file_props.size_in_gb)
+        self.assertGreater(large_file_props.size_in_gb, 1.0)
+        self.assertFalse(large_file_props.is_empty)
+        self.assertTrue(large_file_props.is_large)
+
+        # CSV file
+        csv_file_props = FileProperties(self.csv_file)
+        self.assertTrue(csv_file_props.is_structured)
+        self.assertTrue(csv_file_props.is_standard)
+        self.assertFalse(csv_file_props.is_proprietary)
+        self.assertTrue(csv_file_props.is_csv)
+        self.assertFalse(csv_file_props.is_excel)
+        self.assertTrue(csv_file_props.is_tabular)
+
+        # Excel file
+        excel_file_props = FileProperties(self.excel_file)
+        self.assertTrue(excel_file_props.is_structured)
+        self.assertFalse(excel_file_props.is_standard)
+        self.assertTrue(excel_file_props.is_proprietary)
+        self.assertFalse(excel_file_props.is_csv)
+        self.assertTrue(excel_file_props.is_excel)
+        self.assertTrue(excel_file_props.is_tabular)
+
+        # Parquet file
+        parquet_file_props = FileProperties(self.parquet_file)
+        self.assertTrue(parquet_file_props.is_structured)
+        self.assertTrue(parquet_file_props.is_standard)
+        self.assertFalse(parquet_file_props.is_proprietary)
+        self.assertFalse(parquet_file_props.is_csv)
+        self.assertFalse(parquet_file_props.is_excel)
+        self.assertFalse(parquet_file_props.is_tabular)
+        self.assertTrue(parquet_file_props.is_apache)
+
+        # JSON file
+        json_file_props = FileProperties(self.json_file)
+        self.assertTrue(json_file_props.is_semi_structured)
+        self.assertTrue(json_file_props.is_standard)
+        self.assertFalse(json_file_props.is_structured)
+        self.assertFalse(json_file_props.is_proprietary)
+        self.assertFalse(json_file_props.is_csv)
+        self.assertFalse(json_file_props.is_excel)
+        self.assertFalse(json_file_props.is_tabular)
+
 class TestCSVReaderDuckDBEngine(unittest.TestCase):
     """Test class for CSVReaderDuckDBEngine."""
 
