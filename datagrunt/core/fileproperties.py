@@ -233,8 +233,8 @@ class CSVProperties(FileProperties):
                 'newline_delimiter': dialect.lineterminator,
                 'skipinitialspace': dialect.skipinitialspace,
                 'quoting': self.QUOTING_MAP.get(dialect.quoting),
-                'row_count_with_header': self.get_row_count_with_header(),
-                'row_count_without_header': self.get_row_count_without_header(),
+                'row_count_with_header': self.row_count_with_header,
+                'row_count_without_header': self.row_count_without_header,
                 'columns_schema': columns,
                 'columns_original_format': self.first_row,
                 'columns_list': columns_list,
@@ -254,7 +254,7 @@ class CSVProperties(FileProperties):
     @property
     def row_count_without_header(self):
         """Return the number of lines in the CSV file excluding the header."""
-        return self.get_row_count_with_header() - 1
+        return self.row_count_with_header - 1
 
     @property
     def columns(self):
