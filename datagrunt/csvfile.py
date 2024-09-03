@@ -2,7 +2,6 @@
 
 # standard library
 
-
 # third party libraries
 import duckdb
 import polars as pl
