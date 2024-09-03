@@ -47,10 +47,10 @@ class FileProperties:
     SEMI_STRUCTURED_FILE_EXTENSIONS = ['json', 'jsonl']
 
     STANDARD_FILE_EXTENSIONS = list(set(CSV_FILE_EXTENSIONS +
-                                          TAB_SEPARATED_FILES +
-                                          SEMI_STRUCTURED_FILE_EXTENSIONS +
-                                          APACHE_FILE_EXTENSIONS
-                                          )
+                                        TAB_SEPARATED_FILES +
+                                        SEMI_STRUCTURED_FILE_EXTENSIONS +
+                                        APACHE_FILE_EXTENSIONS
+                                        )
                                     )
 
     STANDARD_FILE_EXTENSIONS.sort()
@@ -132,7 +132,7 @@ class FileProperties:
     @property
     def is_large(self):
         """Check if the file is large."""
-        return self.size_in_gb >= 1
+        return self.size_in_gb >= 1.0
 
     @property
     def is_tabular(self):
