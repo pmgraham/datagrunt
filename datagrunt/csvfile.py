@@ -1,4 +1,4 @@
-"""Module for defining properties, reading, and writing CSV files."""
+"""Module for reading CSV files and converting CSV files to different standard file formats."""
 
 # standard library
 
