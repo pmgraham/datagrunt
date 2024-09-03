@@ -24,20 +24,39 @@ class FileProperties:
     ]
 
     CSV_FILE_EXTENSIONS = ['csv']
-    TABULAR_FILES = ['csv', 'tsv']
+    TAB_SEPARATED_FILES = ['tsv']
+
+    TABULAR_FILES = list(set(CSV_FILE_EXTENSIONS +
+                             EXCEL_FILE_EXTENSIONS +
+                             TAB_SEPARATED_FILES
+                             )
+                        )
+    TABULAR_FILES.sort()
+
     APACHE_FILE_EXTENSIONS = ['parquet', 'avro']
+
     STRUCTURED_FILE_EXTENSIONS = list(set(CSV_FILE_EXTENSIONS +
                                           EXCEL_FILE_EXTENSIONS +
                                           TABULAR_FILES +
-                                          APACHE_FILE_EXTENSIONS)
+                                          TAB_SEPARATED_FILES +
+                                          APACHE_FILE_EXTENSIONS
                                           )
+                                    )
     STRUCTURED_FILE_EXTENSIONS.sort()
-    SEMI_STRUCTURED_FILE_EXTENSIONS = ['json']
-    UNSTRUCTURED_FILE_EXTENSIONS = ['pdf']
-    STANDARD_FILE_EXTENSIONS = ['csv', 'tsv', 'txt', 'json', 'jsonl', 'parquet', 'avro']
+
+    SEMI_STRUCTURED_FILE_EXTENSIONS = ['json', 'jsonl']
+
+    STANDARD_FILE_EXTENSIONS = list(set(CSV_FILE_EXTENSIONS +
+                                          TAB_SEPARATED_FILES +
+                                          SEMI_STRUCTURED_FILE_EXTENSIONS +
+                                          APACHE_FILE_EXTENSIONS
+                                          )
+                                    )
+
+    STANDARD_FILE_EXTENSIONS.sort()
+
     PROPRIETARY_FILE_EXTENSIONS = EXCEL_FILE_EXTENSIONS
-    JSON_OUT_FILENAME = 'output.json'
-    JSON_NEWLINE_OUT_FILENAME = 'output.jsonl'
+
     EXCEL_ROW_LIMIT = 1_048_576
 
     JSON_OUT_FILENAME = 'output.json'
@@ -114,6 +133,11 @@ class FileProperties:
     def is_large(self):
         """Check if the file is large."""
         return self.size_in_gb >= 1
+
+    @property
+    def is_tabular(self):
+        """Check if the file is tabular."""
+        return self.extension_string.lower() in self.TABULAR_FILES
 
 class CSVProperties(FileProperties):
     """Class for parsing CSV files. Mostly determining the delimiter."""
