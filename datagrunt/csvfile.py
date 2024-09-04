@@ -9,18 +9,10 @@ import polars as pl
 # local libraries
 from datagrunt.core.fileproperties import CSVProperties
 from datagrunt.core.queries import DuckDBQueries
-from datagrunt.core.logger import *
+from datagrunt.core.logger import show_large_file_warning
 
 class CSVReaderDuckDBEngine(CSVProperties):
-
-    def __init__(self, filepath):
-        """
-        Initialize the CSVReader class.
-
-        Args:
-            filepath (str): Path to the file to read.
-        """
-        super().__init__(filepath)
+    """Class to read CSV files and convert CSV files powered by DuckDB."""
 
     def get_sample(self):
         """Return a sample of the CSV file."""
@@ -61,15 +53,7 @@ class CSVReaderDuckDBEngine(CSVProperties):
         return dicts
 
 class CSVReaderPolarsEngine(CSVProperties):
-
-    def __init__(self, filepath):
-        """
-        Initialize the CSVReader class.
-
-        Args:
-            filepath (str): Path to the file to read.
-        """
-        super().__init__(filepath)
+    """Class to read CSV files and convert CSV files powered by Polars."""
 
     def get_sample(self):
         """Return a sample of the CSV file."""
@@ -107,7 +91,7 @@ class CSVReaderPolarsEngine(CSVProperties):
         return dicts
 
 class CSVWriterDuckDBEngine(CSVProperties):
-    """Class to convert CSV files to various other supported file types."""
+    """Class to convert CSV files to various other supported file types powered by DuckDB."""
 
     def __init__(self, filepath):
         """
@@ -120,13 +104,13 @@ class CSVWriterDuckDBEngine(CSVProperties):
         self.queries = DuckDBQueries(self.filepath)
 
     def write_csv(self, out_filename=None):
-            """Query to export a DuckDB table to a CSV file.
+        """Query to export a DuckDB table to a CSV file.
 
             Args:
                 out_filename str: The name of the output file.
             """
-            duckdb.sql(self.queries.import_csv_query(self.delimiter))
-            duckdb.sql(self.queries.export_csv_query(out_filename))
+        duckdb.sql(self.queries.import_csv_query(self.delimiter))
+        duckdb.sql(self.queries.export_csv_query(out_filename))
 
     def write_excel(self, out_filename=None):
         """Query to export a DuckDB table to an Excel file.
@@ -166,15 +150,6 @@ class CSVWriterDuckDBEngine(CSVProperties):
 
 class CSVWriterPolarsEngine(CSVProperties):
     """Class to write CSVs to other file formats powered by Polars."""
-
-    def __init__(self, filepath):
-        """
-        Initialize the CSVWriter class.
-
-        Args:
-            filepath (str): Path to the file to write.
-        """
-        super().__init__(filepath)
 
     def _set_out_filename(self, default_filename, out_filename=None):
         """Evaluate if a filename is passed in and if not, return default filename."""

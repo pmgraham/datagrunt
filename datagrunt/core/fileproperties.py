@@ -166,7 +166,9 @@ class CSVProperties(FileProperties):
         self.first_row = self._get_first_row_from_file()
         self.delimiter = self._infer_csv_file_delimiter()
         if not self.is_csv:
-            raise ValueError(f"File extension '{self.extension_string}' is not a valid CSV file extension.")
+            raise ValueError(
+                f"File extension '{self.extension_string}' is not a valid CSV file extension."
+                             )
 
     def _get_first_row_from_file(self):
         """Reads and returns the first line of a file.

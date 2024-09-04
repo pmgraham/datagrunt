@@ -1,8 +1,12 @@
 """Module to store database queries and query strings."""
 
+# standard library
+
+# third party libraries
+
+# local libraries
 from datagrunt.core.databases import DuckDBDatabase
 from datagrunt.core.fileproperties import FileProperties
-import duckdb
 
 class DuckDBQueries(DuckDBDatabase):
     """Class to store DuckDB database queries and query strings."""
@@ -44,6 +48,7 @@ class DuckDBQueries(DuckDBDatabase):
             """
 
     def select_from_duckdb_table(self):
+        """Query to select from a DuckDB table."""
         return f"SELECT * FROM {self.database_table_name}"
 
     def export_csv_query(self, out_filename=None):
@@ -70,7 +75,8 @@ class DuckDBQueries(DuckDBDatabase):
         Args:
             out_filename str: The name of the output file.
         """
-        filename = self._set_out_filename(self.export_properties.JSON_NEWLINE_OUT_FILENAME, out_filename)
+        filename = self._set_out_filename(self.export_properties.JSON_NEWLINE_OUT_FILENAME,
+                                          out_filename)
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}'"
 
     def export_parquet_query(self, out_filename=None):
@@ -90,6 +96,8 @@ class DuckDBQueries(DuckDBDatabase):
         """
         filename = self._set_out_filename(self.export_properties.EXCEL_OUT_FILENAME, out_filename)
         return f"""
-        INSTALL spatial;
-        LOAD spatial;
-        COPY (SELECT * FROM {self.database_table_name}) TO '{filename}'(FORMAT GDAL, DRIVER 'xlsx')"""
+            INSTALL spatial;
+            LOAD spatial;
+            COPY (SELECT * FROM {self.database_table_name})
+            TO '{filename}'(FORMAT GDAL, DRIVER 'xlsx')
+        """
