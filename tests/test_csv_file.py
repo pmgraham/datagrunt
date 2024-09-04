@@ -1,150 +1,375 @@
-import unittest
+"""Unit tests for datagrunt."""
+
+# standard library
 import os
-from pathlib import Path
 import sys
+import unittest
+from unittest.mock import patch
 sys.path.append('../')  # Add the parent directory to the search path
 sys.path.append('../datagrunt')  # Add the parent directory to the search path
-from datagrunt.csvfile import CSVFile
-from datagrunt.core.queries import DuckDBQueries
 
-class TestCSVFile(unittest.TestCase):
+# third party libraries
+import polars as pl
+
+# local libraries
+from datagrunt.csvfile import *
+from datagrunt.core.queries import *
+from datagrunt.core.logger import *
+from datagrunt.core.fileproperties import *
+
+class TestFileProperties(unittest.TestCase):
+    """Test class for FileProperties."""
 
     def setUp(self):
-        """Setup for test cases."""
-        self.test_csv_path = Path(__file__).parent / 'data' / 'test.csv'
-        self.test_csv_file = CSVFile(self.test_csv_path)
+        """Setup method to create sample files before each test."""
+        self.empty_file = 'empty.txt'
+        self.small_file = 'small.txt'
+        self.large_file = 'large.txt'
+        self.csv_file = 'test.csv'
+        self.excel_file = 'test.xlsx'
+        self.parquet_file = 'test.parquet'
+        self.json_file = 'test.json'
 
-    def test_init(self):
-        """Test initialization of CSVFile class."""
-        self.assertEqual(self.test_csv_file.filepath, self.test_csv_path)
-        self.assertEqual(self.test_csv_file.filename, 'test.csv')
-        self.assertEqual(self.test_csv_file.extension, '.csv')
-        self.assertEqual(self.test_csv_file.extension_string, 'csv')
+        open(self.empty_file, 'w').close()
+        with open(self.small_file, 'w') as f:
+            f.write('This is a small file.\n')
+        with open(self.large_file, 'wb') as f:
+            f.seek(1024 * 1024 * 1024 * 1024)  # Seek to 1GB
+            f.write(b'\0')
+        with open(self.csv_file, 'w') as f:
+            f.write('Name,Age,City\n')
+            f.write('Alice,25,New York\n')
+        with open(self.excel_file, 'w') as f:
+            f.write('This is a dummy Excel file.\n')
+        with open(self.parquet_file, 'w') as f:
+            f.write('This is a dummy Parquet file.\n')
+        with open(self.json_file, 'w') as f:
+            f.write('{"name": "John", "age": 30, "city": "New York"}\n')
 
-    def test_attributes(self):
-        """Test attributes method."""
-        attributes = self.test_csv_file.get_attributes()
-        self.assertIn('delimiter', attributes)
-        self.assertIn('quotechar', attributes)
-        self.assertIn('escapechar', attributes)
-        self.assertIn('doublequote', attributes)
-        self.assertIn('newline_delimiter', attributes)
-        self.assertIn('skipinitialspace', attributes)
-        self.assertIn('quoting', attributes)
-        self.assertIn('columns_schema', attributes)
-        self.assertIn('columns_byte_string', attributes)
+    def tearDown(self):
+        """Cleanup method to remove the sample files after each test."""
+        for file in [self.empty_file, self.small_file, self.large_file,
+                     self.csv_file, self.excel_file, self.parquet_file,
+                     self.json_file]:
+            if os.path.exists(file):
+                os.remove(file)
 
-    def test_get_row_count_with_header(self):
-        """Test row_count_with_header method."""
-        self.assertEqual(self.test_csv_file.get_row_count_with_header(), 2630)
+    def test_file_properties(self):
+        """Test if file properties are correctly determined."""
+        # Empty file
+        empty_file_props = FileProperties(self.empty_file)
+        self.assertEqual(empty_file_props.size_in_bytes, 0)
+        self.assertTrue(empty_file_props.is_empty)
+        self.assertFalse(empty_file_props.is_large)
 
-    def test_get_row_count_without_header(self):
-        """Test row_count_without_header method."""
-        self.assertEqual(self.test_csv_file.get_row_count_without_header(), 2629)
+        # Small file
+        small_file_props = FileProperties(self.small_file)
+        self.assertGreater(small_file_props.size_in_bytes, 0)
+        self.assertFalse(small_file_props.is_empty)
+        self.assertFalse(small_file_props.is_large)
 
-    def test_get_columns(self):
-        """Test columns_schema method."""
-        schema = self.test_csv_file.get_columns()
-        self.assertEqual(len(schema), 5)
+        # Large file
+        large_file_props = FileProperties(self.large_file)
+        self.assertGreater(large_file_props.size_in_gb, 1.0)
+        self.assertFalse(large_file_props.is_empty)
+        self.assertTrue(large_file_props.is_large)
 
-    def test_get_columns_string(self):
-        """Test columns_string method."""
-        columns = self.test_csv_file.get_columns_string()
-        self.assertEqual(columns, 'state, location, address, latitude, longitude')
+        # CSV file
+        csv_file_props = FileProperties(self.csv_file)
+        self.assertTrue(csv_file_props.is_structured)
+        self.assertTrue(csv_file_props.is_standard)
+        self.assertFalse(csv_file_props.is_proprietary)
+        self.assertTrue(csv_file_props.is_csv)
+        self.assertFalse(csv_file_props.is_excel)
+        self.assertTrue(csv_file_props.is_tabular)
 
-    def test_get_columns_byte_string(self):
-        """Test columns_byte_string method."""
-        columns = self.test_csv_file.get_columns_byte_string()
-        self.assertEqual(columns, b'state, location, address, latitude, longitude')
+        # Excel file
+        excel_file_props = FileProperties(self.excel_file)
+        self.assertTrue(excel_file_props.is_structured)
+        self.assertFalse(excel_file_props.is_standard)
+        self.assertTrue(excel_file_props.is_proprietary)
+        self.assertFalse(excel_file_props.is_csv)
+        self.assertTrue(excel_file_props.is_excel)
+        self.assertTrue(excel_file_props.is_tabular)
 
-    def test_get_column_count(self):
-        """Test column_count method."""
-        self.assertEqual(self.test_csv_file.get_column_count(), 5)
+        # Parquet file
+        parquet_file_props = FileProperties(self.parquet_file)
+        self.assertTrue(parquet_file_props.is_structured)
+        self.assertTrue(parquet_file_props.is_standard)
+        self.assertFalse(parquet_file_props.is_proprietary)
+        self.assertFalse(parquet_file_props.is_csv)
+        self.assertFalse(parquet_file_props.is_excel)
+        self.assertFalse(parquet_file_props.is_tabular)
+        self.assertTrue(parquet_file_props.is_apache)
 
-    def test_delimiter(self):
-        """Test delimiter method."""
-        self.assertEqual(self.test_csv_file.delimiter, ',')
+        # JSON file
+        json_file_props = FileProperties(self.json_file)
+        self.assertTrue(json_file_props.is_semi_structured)
+        self.assertTrue(json_file_props.is_standard)
+        self.assertFalse(json_file_props.is_structured)
+        self.assertFalse(json_file_props.is_proprietary)
+        self.assertFalse(json_file_props.is_csv)
+        self.assertFalse(json_file_props.is_excel)
+        self.assertFalse(json_file_props.is_tabular)
 
-    def test_get_quotechar(self):
-        """Test quotechar method."""
-        self.assertEqual(self.test_csv_file.get_quotechar(), '"')
+class TestCSVProperties(unittest.TestCase):
+    """Test class for CSVProperties."""
 
-    def test_get_escapechar(self):
-        """Test escapechar method."""
-        self.assertEqual(self.test_csv_file.get_escapechar(), None)
+    def setUp(self):
+        """Setup method to create sample CSV files before each test."""
+        self.empty_file = 'empty.csv'
+        self.comma_file = 'comma.csv'
+        self.pipe_file = 'pipe.csv'
+        self.space_file = 'space.csv'
+        self.tab_file = 'tab.csv'
+        self.text_file = 'text.txt'
 
-    def test_get_newline_delimiter(self):
-        """Test newline_delimiter method."""
-        self.assertEqual(self.test_csv_file.get_newline_delimiter(), '\r\n')
+        open(self.empty_file, 'w').close()
+        with open(self.comma_file, 'w') as f:
+            f.write('Name,Age,City\n')
+            f.write('Alice,25,New York\n')
+        with open(self.pipe_file, 'w') as f:
+            f.write('Name|Age|City\n')
+            f.write('Bob|30|London\n')
+        with open(self.space_file, 'w') as f:
+            f.write('Name Age City\n')
+            f.write('Charlie 28 Paris\n')
+        with open(self.tab_file, 'w') as f:
+            f.write('Name\tAge\tCity\n')
+            f.write('David\t35\tTokyo\n')
+        with open(self.text_file, 'w') as f:
+            f.write('Name\tAge\tCity\n')
+            f.write('David\t35\tTokyo\n')
+
+    def tearDown(self):
+        """Cleanup method to remove the sample files after each test."""
+        for file in [self.empty_file, self.comma_file, self.pipe_file,
+                     self.space_file, self.tab_file, self.text_file]:
+            if os.path.exists(file):
+                os.remove(file)
+
+    def test_delimiter_inference(self):
+        """Test if delimiters are correctly inferred for different CSV files."""
+        self.assertEqual(CSVProperties(self.empty_file).delimiter, ',')
+        self.assertEqual(CSVProperties(self.comma_file).delimiter, ',')
+        self.assertEqual(CSVProperties(self.pipe_file).delimiter, '|')
+        self.assertEqual(CSVProperties(self.space_file).delimiter, ' ')
+        self.assertEqual(CSVProperties(self.tab_file).delimiter, '\t')
+
+    def test_row_counting(self):
+        """Test if row counts are correctly determined."""
+        self.assertEqual(CSVProperties(self.empty_file).row_count_with_header, 0)
+        self.assertEqual(CSVProperties(self.empty_file).row_count_without_header, -1)
+        self.assertEqual(CSVProperties(self.comma_file).row_count_with_header, 2)
+        self.assertEqual(CSVProperties(self.comma_file).row_count_without_header, 1)
+
+    def test_column_extraction(self):
+        """Test if column names are correctly extracted."""
+        self.assertEqual(CSVProperties(self.comma_file).columns, ['Name', 'Age', 'City'])
+        self.assertEqual(CSVProperties(self.pipe_file).columns, ['Name', 'Age', 'City'])
+
+    def test_invalid_csv(self):
+        """Test if a ValueError is raised for a non-CSV file."""
+        with self.assertRaises(ValueError):
+            CSVProperties(self.text_file)
+
+class TestCSVReaderDuckDBEngine(unittest.TestCase):
+    """Test class for CSVReaderDuckDBEngine."""
+
+    def setUp(self):
+        """Setup method to create a sample CSV file before each test."""
+        self.filepath = 'test.csv'
+        self.data = {
+                        'Name': pl.Series(['Alice', 'Bob', 'Charlie'], dtype=pl.Utf8),
+                        'Age': pl.Series(['25', '30', '28'], dtype=pl.Utf8),
+                        'City': pl.Series(['New York', 'London', 'Paris'], dtype=pl.Utf8)
+                    }
+        self.df = pl.DataFrame(self.data)
+        self.df.write_csv(self.filepath)
+
+    def tearDown(self):
+        """Cleanup method to remove the sample CSV file after each test."""
+        os.remove(self.filepath)
+
+    def test_get_sample(self):
+        """Test if get_sample reads the CSV file and returns a sample."""
+        csv_reader = CSVReaderDuckDBEngine(self.filepath)
+        with patch('builtins.print') as mocked_print:
+            print(csv_reader.get_sample())
+            mocked_print.assert_called_once()
 
     def test_to_dataframe(self):
-        """Test to_dataframe method."""
-        df = self.test_csv_file.to_dataframe()
-        self.assertEqual(df.shape, (2629, 5))
-        self.assertEqual(df.columns, ['state', 'location', 'address', 'latitude', 'longitude'])
+        """Test if to_dataframe reads the CSV file and returns a Polars dataframe."""
+        csv_reader = CSVReaderDuckDBEngine(self.filepath)
+        df = csv_reader.to_dataframe()
+        # df = df.select(pl.all().cast(pl.Utf8))
+        self.assertEqual(df.shape, self.df.shape)
+
+    def test_to_arrow_table(self):
+        """Test if to_arrow_table reads the CSV file and returns a PyArrow table."""
+        csv_reader = CSVReaderDuckDBEngine(self.filepath)
+        table = csv_reader.to_arrow_table()
+        self.assertEqual(table.num_rows, len(self.df))
+        self.assertEqual(table.num_columns, len(self.df.columns))
 
     def test_to_dicts(self):
-        """Test to_dicts method."""
-        dicts = self.test_csv_file.to_dicts()
-        self.assertEqual(len(dicts), 2629)
+        """Test if to_dicts reads the CSV file and returns a list of dictionaries."""
+        csv_reader = CSVReaderDuckDBEngine(self.filepath)
+        dicts = csv_reader.to_dicts()
+        self.assertEqual(len(dicts), len(self.df))
+        for i, row in enumerate(dicts):
+            for key in self.data:
+                self.assertEqual(row[key], self.df[key][i])
 
-    def test_to_json(self):
-        """Test to_json method."""
-        json_data = self.test_csv_file.to_json()
-        self.assertEqual(len(json_data), 425898)
+class TestCSVReaderPolarsEngine(unittest.TestCase):
+    """Test class for CSVReaderPolarsEngine."""
 
-    def test_to_json_newline_delimited(self):
-        """Test to_json_newline_delimited method."""
-        jsonl_data = self.test_csv_file.to_json_newline_delimited()
-        self.assertEqual(len(jsonl_data), 425897) # string object not a dict; hence the high number of chars
+    def setUp(self):
+        """Setup method to create a sample CSV file before each test."""
+        self.filepath = 'test.csv'
+        self.data = {
+                        'Name': pl.Series(['Alice', 'Bob', 'Charlie'], dtype=pl.Utf8),
+                        'Age': pl.Series([25, 30, 28], dtype=pl.Int64),
+                        'City': pl.Series(['New York', 'London', 'Paris'], dtype=pl.Utf8)
+                    }
+        self.df = pl.DataFrame(self.data)
+        self.df.write_csv(self.filepath)
 
-    def test_write_avro(self):
-        """Test write_json method."""
-        os.chdir(Path(__file__).parent / 'data')
-        output_path = 'output.avro'
-        self.test_csv_file.write_avro()
-        self.assertTrue(os.path.exists(output_path))
-        os.remove(output_path)  # Clean up
+    def tearDown(self):
+        """Cleanup method to remove the sample CSV file after each test."""
+        os.remove(self.filepath)
+
+    def test_get_sample(self):
+        """Test if get_sample reads the CSV file and returns a sample."""
+        csv_reader = CSVReaderPolarsEngine(self.filepath)
+        with patch('builtins.print') as mocked_print:
+            print(csv_reader.get_sample())
+            mocked_print.assert_called_once()
+
+    def test_to_dataframe(self):
+        """Test if to_dataframe reads the CSV file and returns a Polars dataframe."""
+        csv_reader = CSVReaderPolarsEngine(self.filepath)
+        df = csv_reader.to_dataframe()
+        # df = df.select(pl.all().cast(pl.Utf8))
+        self.assertEqual(df.shape, self.df.shape)
+
+    def test_to_arrow_table(self):
+        """Test if to_arrow_table reads the CSV file and returns a PyArrow table."""
+        csv_reader = CSVReaderPolarsEngine(self.filepath)
+        table = csv_reader.to_arrow_table()
+        self.assertEqual(table.num_rows, len(self.df))
+        self.assertEqual(table.num_columns, len(self.df.columns))
+
+    def test_to_dicts(self):
+        """Test if to_dicts reads the CSV file and returns a list of dictionaries."""
+        csv_reader = CSVReaderPolarsEngine(self.filepath)
+        dicts = csv_reader.to_dicts()
+        self.assertEqual(len(dicts), len(self.df))
+        for i, row in enumerate(dicts):
+            for key in self.data:
+                self.assertEqual(row[key], self.df[key][i])
+
+class TestCSVWriterDuckDBEngine(unittest.TestCase):
+    """Test class for CSVWriterDuckDBEngine."""
+
+    def setUp(self):
+        """Setup method to create a sample CSV file before each test."""
+        self.filepath = 'test.csv'
+        with open(self.filepath, 'w') as f:
+            f.write('Name,Age,City\n')
+            f.write('Alice,25,New York\n')
+            f.write('Bob,30,London\n')
+            f.write('Charlie,28,Paris\n')
+
+    def tearDown(self):
+        """Cleanup method to remove the sample files after each test."""
+        os.remove(self.filepath)
+        for ext in ['csv', 'xlsx', 'json', 'ndjson', 'parquet']:
+            try:
+                os.remove(f'test.{ext}')
+            except FileNotFoundError:
+                pass
 
     def test_write_csv(self):
-        """Test write_json method."""
-        os.chdir(Path(__file__).parent / 'data')
-        output_path = 'output.csv'
-        self.test_csv_file.write_csv()
-        self.assertTrue(os.path.exists(output_path))
-        os.remove(output_path)  # Clean up
-
-    def test_write_json(self):
-        """Test write_json method."""
-        os.chdir(Path(__file__).parent / 'data')
-        output_path = 'output.json'
-        self.test_csv_file.write_json()
-        self.assertTrue(os.path.exists(output_path))
-        os.remove(output_path)  # Clean up
-
-    def test_write_json_newline_delimited(self):
-        """Test write_json_newline_delimited method."""
-        os.chdir(Path(__file__).parent / 'data')
-        output_path = 'output.jsonl'
-        self.test_csv_file.write_json_newline_delimited()
-        self.assertTrue(os.path.exists(output_path))
-        os.remove(output_path)  # Clean up
-
-    def test_write_parquet(self):
-        """Test write_parquet method."""
-        os.chdir(Path(__file__).parent / 'data')
-        output_path = 'output.parquet'
-        self.test_csv_file.write_parquet()
-        self.assertTrue(os.path.exists(output_path))
-        os.remove(output_path)  # Clean up
+        """Test if write_csv exports the correct CSV file."""
+        csv_writer = CSVWriterDuckDBEngine(self.filepath)
+        csv_writer.write_csv(out_filename='test.csv')
+        self.assertTrue(os.path.exists('test.csv'))
 
     def test_write_excel(self):
-        """Test write_excel method."""
-        os.chdir(Path(__file__).parent / 'data')
-        output_path = 'output.xlsx'
-        self.test_csv_file.write_excel()
-        self.assertTrue(os.path.exists(output_path))
-        os.remove(output_path)  # Clean up
+        """Test if write_excel exports the correct Excel file."""
+        csv_writer = CSVWriterDuckDBEngine(self.filepath)
+        csv_writer.write_excel(out_filename='test.xlsx')
+        self.assertTrue(os.path.exists('test.xlsx'))
+
+    def test_write_json(self):
+        """Test if write_json exports the correct JSON file."""
+        csv_writer = CSVWriterDuckDBEngine(self.filepath)
+        csv_writer.write_json(out_filename='test.json')
+        self.assertTrue(os.path.exists('test.json'))
+
+    def test_write_json_newline_delimited(self):
+        """Test if write_json_newline_delimited exports the correct JSON newline delimited file."""
+        csv_writer = CSVWriterDuckDBEngine(self.filepath)
+        csv_writer.write_json_newline_delimited(out_filename='test.ndjson')
+        self.assertTrue(os.path.exists('test.ndjson'))
+
+    def test_write_parquet(self):
+        """Test if write_parquet exports the correct Parquet file."""
+        csv_writer = CSVWriterDuckDBEngine(self.filepath)
+        csv_writer.write_parquet(out_filename='test.parquet')
+        self.assertTrue(os.path.exists('test.parquet'))
+
+class TestCSVWriterPolarsEngine(unittest.TestCase):
+    """Test class for CSVWriterPolarsEngine."""
+
+    def setUp(self):
+        """Setup method to create a sample CSV file before each test."""
+        self.filepath = 'test.csv'
+        with open(self.filepath, 'w') as f:
+            f.write('Name,Age,City\n')
+            f.write('Alice,25,New York\n')
+            f.write('Bob,30,London\n')
+            f.write('Charlie,28,Paris\n')
+
+    def tearDown(self):
+        """Cleanup method to remove the sample files after each test."""
+        os.remove(self.filepath)
+        for ext in ['csv', 'xlsx', 'json', 'ndjson', 'parquet']:
+            try:
+                os.remove(f'test.{ext}')
+            except FileNotFoundError:
+                pass
+
+    def test_write_csv(self):
+        """Test if write_csv exports the correct CSV file."""
+        csv_writer = CSVWriterPolarsEngine(self.filepath)
+        csv_writer.write_csv(out_filename='test.csv')
+        self.assertTrue(os.path.exists('test.csv'))
+
+    def test_write_excel(self):
+        """Test if write_excel exports the correct Excel file."""
+        csv_writer = CSVWriterPolarsEngine(self.filepath)
+        csv_writer.write_excel(out_filename='test.xlsx')
+        self.assertTrue(os.path.exists('test.xlsx'))
+
+    def test_write_json(self):
+        """Test if write_json exports the correct JSON file."""
+        csv_writer = CSVWriterPolarsEngine(self.filepath)
+        csv_writer.write_json(out_filename='test.json')
+        self.assertTrue(os.path.exists('test.json'))
+
+    def test_write_json_newline_delimited(self):
+        """Test if write_json_newline_delimited exports the correct JSON newline delimited file."""
+        csv_writer = CSVWriterPolarsEngine(self.filepath)
+        csv_writer.write_json_newline_delimited(out_filename='test.ndjson')
+        self.assertTrue(os.path.exists('test.ndjson'))
+
+    def test_write_parquet(self):
+        """Test if write_parquet exports the correct Parquet file."""
+        csv_writer = CSVWriterPolarsEngine(self.filepath)
+        csv_writer.write_parquet(out_filename='test.parquet')
+        self.assertTrue(os.path.exists('test.parquet'))
 
 if __name__ == '__main__':
     unittest.main()

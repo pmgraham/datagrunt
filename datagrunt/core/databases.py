@@ -46,4 +46,3 @@ class DuckDBDatabase:
             threads (int): Number of threads to use for duckdb.
         """
         return duckdb.connect(self.database_filename, config = {'threads': threads})
-
