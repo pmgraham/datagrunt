@@ -1,228 +1,210 @@
-"""Module for data processing from files. Uses duckdb for file processing
-   and Polars for dataframe objects.
-"""
+"""Module for reading CSV files and converting CSV files to different standard file formats."""
 
 # standard library
-import csv
 
 # third party libraries
-from duckdb import read_csv, sql
+import duckdb
+import polars as pl
 
 # local libraries
-from datagrunt.core.filehelpers import CSVParser
+from datagrunt.core.fileproperties import CSVProperties
 from datagrunt.core.queries import DuckDBQueries
-from datagrunt.core.logger import show_warning, show_large_file_warning
+from datagrunt.core.logger import show_large_file_warning
 
-class CSVFile(CSVParser):
+class CSVReaderDuckDBEngine(CSVProperties):
+    """Class to read CSV files and convert CSV files powered by DuckDB."""
 
-    QUOTING_MAP = {
-        0: 'no quoting',
-        1: 'quote all',
-        2: 'quote minimal',
-        3: 'quote non-numeric'
-    }
+    def get_sample(self):
+        """Return a sample of the CSV file."""
+        duckdb.read_csv(self.filepath, delimiter=self.delimiter).show()
+
+    def to_dataframe(self):
+        """Converts CSV to a Polars dataframe.
+
+        Returns:
+            A Polars dataframe.
+        """
+        if self.is_large:
+            show_large_file_warning()
+        return duckdb.read_csv(self.filepath,
+                               delimiter=self.delimiter,
+                               all_varchar=True
+                                ).pl()
+
+    def to_arrow_table(self):
+        """Converts CSV to a Polars dataframe.
+
+        Returns:
+            A PyArrow table.
+        """
+        arrow_table = duckdb.read_csv(self.filepath,
+                                      delimiter=self.delimiter,
+                                      all_varchar=True
+                                      ).arrow()
+        return arrow_table
+
+    def to_dicts(self):
+        """Converts CSV to a Polars dataframe.
+
+        Returns:
+            A list of dictionaries.
+        """
+        dicts = self.to_dataframe().to_dicts()
+        return dicts
+
+class CSVReaderPolarsEngine(CSVProperties):
+    """Class to read CSV files and convert CSV files powered by Polars."""
+
+    def get_sample(self):
+        """Return a sample of the CSV file."""
+        return pl.read_csv(self.filepath,
+                           separator=self.delimiter,
+                           n_rows=self.DATAFRAME_SAMPLE_ROWS
+                           )
+
+    def to_dataframe(self):
+        """Converts CSV to a Polars dataframe.
+
+        Returns:
+            A Polars dataframe.
+        """
+        if self.is_large:
+            show_large_file_warning()
+        return pl.read_csv(self.filepath, separator=self.delimiter)
+
+    def to_arrow_table(self):
+        """Converts CSV to a Polars dataframe.
+
+        Returns:
+            A PyArrow table.
+        """
+        df = self.to_dataframe().to_arrow()
+        return df
+
+    def to_dicts(self):
+        """Converts CSV to a Polars dataframe.
+
+        Returns:
+            A list of dictionaries.
+        """
+        dicts = self.to_dataframe().to_dicts()
+        return dicts
+
+class CSVWriterDuckDBEngine(CSVProperties):
+    """Class to convert CSV files to various other supported file types powered by DuckDB."""
 
     def __init__(self, filepath):
         """
-        Initialize the CSVFile class.
+        Initialize the CSVWriter class.
 
         Args:
-            filepath (str): Path to the file to read.
+            filepath (str): Path to the file to write.
         """
         super().__init__(filepath)
-        self.db_table = DuckDBQueries(self.filepath).database_table_name
-        self.duckdb_connection = DuckDBQueries(self.filepath).database_connection
-        if not self.is_csv:
-            raise ValueError(f"File extension '{self.extension_string}' is not a valid CSV file extension.")
+        self.queries = DuckDBQueries(self.filepath)
 
-    def _csv_import_table_statement(self):
-        """Default CSV import table statement."""
-        # all_varchar=True is set to preserve integrity of data by importing as strings.
-        return f"""
-            CREATE OR REPLACE TABLE {self.db_table} AS
-            SELECT *
-            FROM read_csv('{self.filepath}',
-                            auto_detect=true,
-                            delim='{self.delimiter}',
-                            header=true,
-                            null_padding=true,
-                            all_varchar=True);
+    def write_csv(self, out_filename=None):
+        """Query to export a DuckDB table to a CSV file.
+
+            Args:
+                out_filename str: The name of the output file.
             """
+        duckdb.sql(self.queries.import_csv_query(self.delimiter))
+        duckdb.sql(self.queries.export_csv_query(out_filename))
 
-    def _read_csv_to_duckdb(self):
-        """Read CSV file using DuckDB Python API."""
-        return read_csv(self.filepath,
-                        delimiter=self.delimiter,
-                        null_padding=True,
-                        all_varchar=True
-                        )
-
-    def sample_csv_data(self):
-        """Show sample 20 rows of the CSV file."""
-        self._read_csv_to_duckdb().show()
-
-    def query_csv_data(self, sql_statement, show_only=False):
-        """Query a CSV file using DuckDB Python API.
+    def write_excel(self, out_filename=None):
+        """Query to export a DuckDB table to an Excel file.
 
         Args:
-            sql_statement (str): The SQL statement to execute.
-            show_only (bool): Only show results and don't return a dataframe.
-
-        Returns:
-            Polars DataFrame or None
+            out_filename str: The name of the output file.
         """
-        con = self.duckdb_connection
-        con.sql(self._csv_import_table_statement())
-        if show_only:
-            con.sql(sql_statement).show()
-        else:
-            return con.sql(sql_statement).pl()
+        duckdb.sql(self.queries.import_csv_query(self.delimiter))
+        duckdb.sql(self.queries.export_excel_query(out_filename))
 
-    def get_row_count_with_header(self):
-        """Return the number of lines in the CSV file including the header."""
-        with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
-            return sum(1 for _ in csv_file)
-
-    def get_row_count_without_header(self):
-        """Return the number of lines in the CSV file excluding the header."""
-        return self.get_row_count_with_header() - 1
-
-    def get_attributes(self):
-        """Generate CSV attributes."""
-        columns_list = self.first_row.split(self.delimiter)
-        columns = {c: 'VARCHAR' for c in columns_list}
-        with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csvfile:
-            # Sniff the file to detect parameters
-            dialect = csv.Sniffer().sniff(csvfile.read(self.CSV_SNIFF_SAMPLE_ROWS))
-            csvfile.seek(0)  # Reset file pointer to the beginning
-
-            attributes = {
-                'delimiter': self.delimiter,
-                'quotechar': dialect.quotechar,
-                'escapechar': dialect.escapechar,
-                'doublequote': dialect.doublequote,
-                'newline_delimiter': dialect.lineterminator,
-                'skipinitialspace': dialect.skipinitialspace,
-                'quoting': self.QUOTING_MAP.get(dialect.quoting),
-                'row_count_with_header': self.get_row_count_with_header(),
-                'row_count_without_header': self.get_row_count_without_header(),
-                'columns_schema': columns,
-                'columns_original_format': self.first_row,
-                'columns_list': columns_list,
-                'columns_string': ", ".join(columns_list),
-                'columns_byte_string': ", ".join(columns_list).encode(),
-                'column_count': len(columns_list)
-            }
-
-        return attributes
-
-    def get_columns(self):
-        """Return the schema of the columns in the CSV file."""
-        return self.get_attributes()['columns_list']
-
-    def get_columns_string(self):
-        """Return the first row of the CSV file."""
-        return self.get_attributes()['columns_string']
-
-    def get_columns_byte_string(self):
-        """Return the first row of the CSV file as bytes."""
-        return self.get_attributes()['columns_byte_string']
-
-    def get_column_count(self):
-        """Return the number of columns in the CSV file."""
-        return self.get_attributes()['column_count']
-
-    def get_quotechar(self):
-        """Return the quote character used in the CSV file."""
-        return self.get_attributes()['quotechar']
-
-    def get_escapechar(self):
-        """Return the escape character used in the CSV file."""
-        return self.get_attributes()['escapechar']
-
-    def get_newline_delimiter(self):
-        """Return the newline delimiter used in the CSV file."""
-        return self.get_attributes()['newline_delimiter']
-
-    def to_dicts(self):
-        """Converts Dataframe to list of dictionaries."""
-        if self.is_large:
-             show_large_file_warning()
-        with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
-            csv_reader = csv.DictReader(csv_file, delimiter=self.delimiter)
-            return list(csv_reader)
-
-    def to_dataframe(self):
-        """Converts CSV to a Polars dataframe."""
-        return self._read_csv_to_duckdb().pl()
-
-    def to_json(self):
-         """Converts CSV to a JSON string."""
-         if self.is_large:
-             show_large_file_warning()
-         return self.to_dataframe().write_json()
-
-    def to_json_newline_delimited(self):
-        """Converts CSV to a JSON string with newline delimited."""
-        if self.is_large:
-             show_large_file_warning()
-        return self.to_dataframe().write_ndjson()
-
-    def write_avro(self, out_filename=None):
-        """Writes data to an Avro file.
+    def write_json(self, out_filename=None):
+        """Query to export a DuckDB table to a JSON file.
 
         Args:
-            out_filename (str): The name of the output file.
+            out_filename str: The name of the output file.
         """
+        duckdb.sql(self.queries.import_csv_query(self.delimiter))
+        duckdb.sql(self.queries.export_json_query(out_filename))
+
+    def write_json_newline_delimited(self, out_filename=None):
+        """Query to export a DuckDB table to a JSON newline delimited file.
+
+        Args:
+            out_filename str: The name of the output file.
+        """
+        duckdb.sql(self.queries.import_csv_query(self.delimiter))
+        duckdb.sql(self.queries.export_json_newline_delimited_query(out_filename))
+
+    def write_parquet(self, out_filename=None):
+        """Query to export a DuckDB table to a Parquet file.
+
+        Args:
+            out_filename str: The name of the output file.
+        """
+        duckdb.execute(self.queries.import_csv_query(self.delimiter))
+        duckdb.execute(self.queries.export_parquet_query(out_filename))
+
+class CSVWriterPolarsEngine(CSVProperties):
+    """Class to write CSVs to other file formats powered by Polars."""
+
+    def _set_out_filename(self, default_filename, out_filename=None):
+        """Evaluate if a filename is passed in and if not, return default filename."""
         if out_filename:
             filename = out_filename
         else:
-            filename = DuckDBQueries(self.filepath).AVRO_OUT_FILENAME
-        self.to_dataframe().write_avro(filename)
+            filename = default_filename
+        return filename
 
     def write_csv(self, out_filename=None):
-        """Writes CSV to a file.
+        """Export a Polars dataframe to a CSV file.
 
         Args:
-            out_filename (str): The name of the output file.
+            out_filename str: The name of the output file.
         """
-        sql(self._csv_import_table_statement())
-        sql(DuckDBQueries(self.filepath).export_csv_query(out_filename))
-
-    def write_json(self, out_filename=None):
-        """Writes JSON to a file.
-
-        Args:
-            out_filename (str): The name of the output file.
-        """
-        sql(self._csv_import_table_statement())
-        sql(DuckDBQueries(self.filepath).export_json_query(out_filename))
-
-    def write_json_newline_delimited(self, out_filename=None):
-        """Writes JSON to a file with newline delimited.
-
-        Args:
-            out_filename (str): The name of the output file.
-        """
-        sql(self._csv_import_table_statement())
-        sql(DuckDBQueries(self.filepath).export_json_newline_delimited_query(out_filename))
-
-    def write_parquet(self, out_filename=None):
-        """Writes data to a Parquet file.
-
-        Args:
-            out_filename (str): The name of the output file.
-        """
-        sql(self._csv_import_table_statement())
-        sql(DuckDBQueries(self.filepath).export_parquet_query(out_filename))
+        filename = self._set_out_filename(self.CSV_OUT_FILENAME, out_filename)
+        df = CSVReaderPolarsEngine(self.filepath).to_dataframe()
+        df.write_csv(filename)
 
     def write_excel(self, out_filename=None):
-        """Writes data to an Excel file.
+        """Export a Polars dataframe to an Excel file.
 
         Args:
-            out_filename (str): The name of the output file.
+            out_filename str: The name of the output file.
         """
-        if self.get_row_count_with_header() > self.EXCEL_ROW_LIMIT:
-            show_warning(f"Data will be lost: file contains {self.get_row_count_with_header()} rows and Excel supports a max of {self.EXCEL_ROW_LIMIT} rows.")
-        sql(self._csv_import_table_statement())
-        sql(DuckDBQueries(self.filepath).export_excel_query(out_filename))
+        filename = self._set_out_filename(self.EXCEL_OUT_FILENAME, out_filename)
+        df = CSVReaderPolarsEngine(self.filepath).to_dataframe()
+        df.write_excel(filename)
+
+    def write_json(self, out_filename=None):
+        """Export a Polars dataframe to a JSON file.
+
+        Args:
+            out_filename str: The name of the output file.
+        """
+        filename = self._set_out_filename(self.JSON_OUT_FILENAME, out_filename)
+        df = CSVReaderPolarsEngine(self.filepath).to_dataframe()
+        df.write_json(filename)
+
+    def write_json_newline_delimited(self, out_filename=None):
+        """Export a Polars dataframe to a JSON newline delimited file.
+
+        Args:
+            out_filename str: The name of the output file.
+        """
+        filename = self._set_out_filename(self.JSON_NEWLINE_OUT_FILENAME, out_filename)
+        df = CSVReaderPolarsEngine(self.filepath).to_dataframe()
+        df.write_ndjson(filename)
+
+    def write_parquet(self, out_filename=None):
+        """Export a Polars dataframe to a Parquet file.
+
+        Args:
+            out_filename str: The name of the output file.
+        """
+        filename = self._set_out_filename(self.PARQUET_OUT_FILENAME, out_filename)
+        df = CSVReaderPolarsEngine(self.filepath).to_dataframe()
+        df.write_parquet(filename)
