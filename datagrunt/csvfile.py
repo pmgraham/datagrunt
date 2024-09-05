@@ -75,7 +75,7 @@ class CSVReaderDuckDBEngine(CSVProperties):
 
         Returns:
             A DuckDB DuckDBPyRelation with the query results.
-        
+
         Example - Be sure to use a f string or .format to get db_table:
             dg = CSVReaderDuckDBEngine('myfile.csv')
             df = dg.to_dataframe()
@@ -134,7 +134,7 @@ class CSVReaderPolarsEngine(CSVProperties):
 
         Returns:
             A DuckDB DuckDBPyRelation with the query results.
-        
+
         Example:
             dg = CSVReaderPolarsEngine('myfile.csv')
             df = dg.to_dataframe()
