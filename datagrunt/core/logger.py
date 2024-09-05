@@ -6,6 +6,7 @@ LARGE_FILE_WARNING = "File is large and may load into memory slowly or exceed me
 DUCKDB_ENGINE_ERROR = """DuckDB engine failed due to the following error: {error}. \
     Switching to Polars."""
 
+
 def show_warning(message):
     """Show a warning message.
 
