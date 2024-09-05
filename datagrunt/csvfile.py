@@ -75,6 +75,12 @@ class CSVReaderDuckDBEngine(CSVProperties):
 
         Returns:
             A DuckDB DuckDBPyRelation with the query results.
+        
+        Example - Be sure to use a f string or .format to get db_table:
+            dg = CSVReaderDuckDBEngine('myfile.csv')
+            df = dg.to_dataframe()
+            query = "SELECT col1, col2 FROM {dg.db_table}"
+            dg.query_csv_data(query)
         """
         queries = DuckDBQueries(self.filepath)
         duckdb.sql(queries.import_csv_query(self.delimiter))
@@ -103,7 +109,7 @@ class CSVReaderPolarsEngine(CSVProperties):
                            separator=self.delimiter)
 
     def to_arrow_table(self):
-        """Converts CSV to a Polars dataframe.
+        """Converts CSV to a PyArrow table.
 
         Returns:
             A PyArrow table.
@@ -112,7 +118,7 @@ class CSVReaderPolarsEngine(CSVProperties):
         return df
 
     def to_dicts(self):
-        """Converts CSV to a Polars dataframe.
+        """Converts CSV to a Python list of dictionaies.
 
         Returns:
             A list of dictionaries.
@@ -132,7 +138,7 @@ class CSVReaderPolarsEngine(CSVProperties):
         Example:
             dg = CSVReaderPolarsEngine('myfile.csv')
             df = dg.to_dataframe()
-            query = "SELECT col1, col2 FROM df WHERE col3 = 'value'"
+            query = "SELECT col1, col2 FROM df"
             dg.query_csv_data(query)
         """
         return duckdb.sql(sql_query)
