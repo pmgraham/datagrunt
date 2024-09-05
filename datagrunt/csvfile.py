@@ -67,7 +67,7 @@ class CSVReaderDuckDBEngine(CSVProperties):
         dicts = self.to_dataframe().to_dicts()
         return dicts
 
-    def query_csv_data(self, sql_query, return_dataframe=False):
+    def query_csv_data(self, sql_query):
         """Queries as CSV file after importing into DuckDB.
 
         Args:
@@ -78,10 +78,7 @@ class CSVReaderDuckDBEngine(CSVProperties):
         """
         queries = DuckDBQueries(self.filepath)
         duckdb.sql(queries.import_csv_query(self.delimiter))
-        if return_dataframe:
-            return duckdb.sql(sql_query).pl()
-        else:
-            return duckdb.sql(sql_query)
+        return duckdb.sql(sql_query)
 
 class CSVReaderPolarsEngine(CSVProperties):
     """Class to read CSV files and convert CSV files powered by Polars."""
@@ -102,7 +99,8 @@ class CSVReaderPolarsEngine(CSVProperties):
         """
         if self.is_large:
             show_large_file_warning()
-        return pl.read_csv(self.filepath, separator=self.delimiter)
+        return pl.read_csv(self.filepath,
+                           separator=self.delimiter)
 
     def to_arrow_table(self):
         """Converts CSV to a Polars dataframe.
