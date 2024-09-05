@@ -67,7 +67,7 @@ class CSVReaderDuckDBEngine(CSVProperties):
         dicts = self.to_dataframe().to_dicts()
         return dicts
 
-    def query_csv_data(self, sql_query):
+    def query_data(self, sql_query):
         """Queries as CSV file after importing into DuckDB.
 
         Args:
@@ -120,7 +120,7 @@ class CSVReaderPolarsEngine(CSVProperties):
         dicts = self.to_dataframe().to_dicts()
         return dicts
 
-    def query_csv_data(self, sql_query):
+    def query_data(self, sql_query):
         """SQL query dataframe object and return results.
 
         Args:
