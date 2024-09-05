@@ -25,3 +25,8 @@ def duckdb_query_error(error_message):
     """Show error message if duckdb query fails."""
     message = DUCKDB_ENGINE_ERROR.format(error=error_message)
     return show_warning(message)
+
+
+def show_dataframe_sample(dataframe):
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
+    return logging.info(dataframe)
