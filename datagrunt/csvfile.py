@@ -120,6 +120,23 @@ class CSVReaderPolarsEngine(CSVProperties):
         dicts = self.to_dataframe().to_dicts()
         return dicts
 
+    def query_csv_data(self, sql_query):
+        """SQL query dataframe object and return results.
+
+        Args:
+            sql_query (str): Query referencing a dataframe to run against DuckDB.
+
+        Returns:
+            A DuckDB DuckDBPyRelation with the query results.
+        
+        Example:
+            dg = CSVReaderPolarsEngine('myfile.csv')
+            df = dg.to_dataframe()
+            query = "SELECT col1, col2 FROM df WHERE col3 = 'value'"
+            dg.query_csv_data(query)
+        """
+        return duckdb.sql(sql_query)
+
 class CSVWriterDuckDBEngine(CSVProperties):
     """Class to convert CSV files to various other supported file types powered by DuckDB."""
 
