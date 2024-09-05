@@ -230,7 +230,6 @@ class TestCSVReaderDuckDBEngine(unittest.TestCase):
         result = csv_reader.query_data(query).fetchone()[0]
         self.assertEqual(result, 1)
 
-
 class TestCSVReaderPolarsEngine(unittest.TestCase):
     """Test class for CSVReaderPolarsEngine."""
 
@@ -287,7 +286,6 @@ class TestCSVReaderPolarsEngine(unittest.TestCase):
         query = "SELECT COUNT(*) FROM df WHERE Name = 'Alice'"
         result = csv_reader.query_data(query).fetchone()[0]
         self.assertEqual(result, 1)
-
 
 class TestCSVWriterDuckDBEngine(unittest.TestCase):
     """Test class for CSVWriterDuckDBEngine."""
