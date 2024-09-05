@@ -1,7 +1,7 @@
 """Module for reading CSV files and converting CSV files to different standard file formats."""
 
 # standard library
-
+import logging
 # third party libraries
 import duckdb
 import polars as pl
@@ -9,10 +9,20 @@ import polars as pl
 # local libraries
 from datagrunt.core.fileproperties import CSVProperties
 from datagrunt.core.queries import DuckDBQueries
-from datagrunt.core.logger import show_large_file_warning
+from datagrunt.core.logger import show_large_file_warning, show_dataframe_sample
 
 class CSVReaderDuckDBEngine(CSVProperties):
     """Class to read CSV files and convert CSV files powered by DuckDB."""
+
+    def __init__(self, filepath):
+        """
+        Initialize the CSVReader class.
+
+        Args:
+            filepath (str): Path to the file to read.
+        """
+        super().__init__(filepath)
+        self.db_table = DuckDBQueries(self.filepath).database_table_name
 
     def _read_csv(self):
         """Reads a CSV using DuckDB.
@@ -57,15 +67,32 @@ class CSVReaderDuckDBEngine(CSVProperties):
         dicts = self.to_dataframe().to_dicts()
         return dicts
 
+    def query_csv_data(self, sql_query, return_dataframe=False):
+        """Queries as CSV file after importing into DuckDB.
+
+        Args:
+            sql_query (str): Query to run against DuckDB.
+
+        Returns:
+            A DuckDB DuckDBPyRelation with the query results.
+        """
+        queries = DuckDBQueries(self.filepath)
+        duckdb.sql(queries.import_csv_query(self.delimiter))
+        if return_dataframe:
+            return duckdb.sql(sql_query).pl()
+        else:
+            return duckdb.sql(sql_query)
+
 class CSVReaderPolarsEngine(CSVProperties):
     """Class to read CSV files and convert CSV files powered by Polars."""
 
     def get_sample(self):
         """Return a sample of the CSV file."""
-        return pl.read_csv(self.filepath,
+        df = pl.read_csv(self.filepath,
                            separator=self.delimiter,
                            n_rows=self.DATAFRAME_SAMPLE_ROWS
                            )
+        show_dataframe_sample(df)
 
     def to_dataframe(self):
         """Converts CSV to a Polars dataframe.
