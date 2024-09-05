@@ -14,9 +14,20 @@ from datagrunt.core.logger import show_large_file_warning
 class CSVReaderDuckDBEngine(CSVProperties):
     """Class to read CSV files and convert CSV files powered by DuckDB."""
 
+    def _read_csv(self):
+        """Reads a CSV using DuckDB.
+
+        Returns:
+            A DuckDB DuckDBPyRelation.
+        """
+        return duckdb.read_csv(self.filepath,
+                               delimiter=self.delimiter,
+                               all_varchar=True
+                            )
+
     def get_sample(self):
         """Return a sample of the CSV file."""
-        duckdb.read_csv(self.filepath, delimiter=self.delimiter).show()
+        self._read_csv().show()
 
     def to_dataframe(self):
         """Converts CSV to a Polars dataframe.
@@ -26,10 +37,7 @@ class CSVReaderDuckDBEngine(CSVProperties):
         """
         if self.is_large:
             show_large_file_warning()
-        return duckdb.read_csv(self.filepath,
-                               delimiter=self.delimiter,
-                               all_varchar=True
-                                ).pl()
+        return self._read_csv().pl()
 
     def to_arrow_table(self):
         """Converts CSV to a Polars dataframe.
@@ -37,10 +45,7 @@ class CSVReaderDuckDBEngine(CSVProperties):
         Returns:
             A PyArrow table.
         """
-        arrow_table = duckdb.read_csv(self.filepath,
-                                      delimiter=self.delimiter,
-                                      all_varchar=True
-                                      ).arrow()
+        arrow_table = self._read_csv().arrow()
         return arrow_table
 
     def to_dicts(self):
