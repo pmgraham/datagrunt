@@ -9,14 +9,35 @@ import polars as pl
 # local libraries
 from datagrunt.core.fileproperties import CSVProperties
 from datagrunt.core.queries import DuckDBQueries
-from datagrunt.core.logger import show_large_file_warning
+from datagrunt.core.logger import show_large_file_warning, show_dataframe_sample
 
 class CSVReaderDuckDBEngine(CSVProperties):
     """Class to read CSV files and convert CSV files powered by DuckDB."""
 
+    def __init__(self, filepath):
+        """
+        Initialize the CSVReader class.
+
+        Args:
+            filepath (str): Path to the file to read.
+        """
+        super().__init__(filepath)
+        self.db_table = DuckDBQueries(self.filepath).database_table_name
+
+    def _read_csv(self):
+        """Reads a CSV using DuckDB.
+
+        Returns:
+            A DuckDB DuckDBPyRelation.
+        """
+        return duckdb.read_csv(self.filepath,
+                               delimiter=self.delimiter,
+                               all_varchar=True
+                            )
+
     def get_sample(self):
         """Return a sample of the CSV file."""
-        duckdb.read_csv(self.filepath, delimiter=self.delimiter).show()
+        self._read_csv().show()
 
     def to_dataframe(self):
         """Converts CSV to a Polars dataframe.
@@ -26,10 +47,7 @@ class CSVReaderDuckDBEngine(CSVProperties):
         """
         if self.is_large:
             show_large_file_warning()
-        return duckdb.read_csv(self.filepath,
-                               delimiter=self.delimiter,
-                               all_varchar=True
-                                ).pl()
+        return self._read_csv().pl()
 
     def to_arrow_table(self):
         """Converts CSV to a Polars dataframe.
@@ -37,10 +55,7 @@ class CSVReaderDuckDBEngine(CSVProperties):
         Returns:
             A PyArrow table.
         """
-        arrow_table = duckdb.read_csv(self.filepath,
-                                      delimiter=self.delimiter,
-                                      all_varchar=True
-                                      ).arrow()
+        arrow_table = self._read_csv().arrow()
         return arrow_table
 
     def to_dicts(self):
@@ -52,15 +67,35 @@ class CSVReaderDuckDBEngine(CSVProperties):
         dicts = self.to_dataframe().to_dicts()
         return dicts
 
+    def query_data(self, sql_query):
+        """Queries as CSV file after importing into DuckDB.
+
+        Args:
+            sql_query (str): Query to run against DuckDB.
+
+        Returns:
+            A DuckDB DuckDBPyRelation with the query results.
+
+        Example - Be sure to use a f string or .format to get db_table:
+            dg = CSVReaderDuckDBEngine('myfile.csv')
+            df = dg.to_dataframe()
+            query = "SELECT col1, col2 FROM {dg.db_table}"
+            dg.query_csv_data(query)
+        """
+        queries = DuckDBQueries(self.filepath)
+        duckdb.sql(queries.import_csv_query(self.delimiter))
+        return duckdb.sql(sql_query)
+
 class CSVReaderPolarsEngine(CSVProperties):
     """Class to read CSV files and convert CSV files powered by Polars."""
 
     def get_sample(self):
         """Return a sample of the CSV file."""
-        return pl.read_csv(self.filepath,
+        df = pl.read_csv(self.filepath,
                            separator=self.delimiter,
                            n_rows=self.DATAFRAME_SAMPLE_ROWS
                            )
+        show_dataframe_sample(df)
 
     def to_dataframe(self):
         """Converts CSV to a Polars dataframe.
@@ -70,10 +105,11 @@ class CSVReaderPolarsEngine(CSVProperties):
         """
         if self.is_large:
             show_large_file_warning()
-        return pl.read_csv(self.filepath, separator=self.delimiter)
+        return pl.read_csv(self.filepath,
+                           separator=self.delimiter)
 
     def to_arrow_table(self):
-        """Converts CSV to a Polars dataframe.
+        """Converts CSV to a PyArrow table.
 
         Returns:
             A PyArrow table.
@@ -82,13 +118,30 @@ class CSVReaderPolarsEngine(CSVProperties):
         return df
 
     def to_dicts(self):
-        """Converts CSV to a Polars dataframe.
+        """Converts CSV to a Python list of dictionaies.
 
         Returns:
             A list of dictionaries.
         """
         dicts = self.to_dataframe().to_dicts()
         return dicts
+
+    def query_data(self, sql_query):
+        """SQL query dataframe object and return results.
+
+        Args:
+            sql_query (str): Query referencing a dataframe to run against DuckDB.
+
+        Returns:
+            A DuckDB DuckDBPyRelation with the query results.
+
+        Example:
+            dg = CSVReaderPolarsEngine('myfile.csv')
+            df = dg.to_dataframe()
+            query = "SELECT col1, col2 FROM df"
+            dg.query_csv_data(query)
+        """
+        return duckdb.sql(sql_query)
 
 class CSVWriterDuckDBEngine(CSVProperties):
     """Class to convert CSV files to various other supported file types powered by DuckDB."""

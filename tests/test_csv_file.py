@@ -9,6 +9,7 @@ sys.path.append('../')  # Add the parent directory to the search path
 sys.path.append('../datagrunt')  # Add the parent directory to the search path
 
 # third party libraries
+import duckdb
 import polars as pl
 
 # local libraries
@@ -221,6 +222,14 @@ class TestCSVReaderDuckDBEngine(unittest.TestCase):
             for key in self.data:
                 self.assertEqual(row[key], self.df[key][i])
 
+    def test_query_data(self):
+        """Test if query_data correctly queries the CSV data."""
+        csv_reader = CSVReaderDuckDBEngine(self.filepath)
+        # Example query
+        query = f"SELECT COUNT(*) FROM {csv_reader.db_table} WHERE Name = 'Alice'"
+        result = csv_reader.query_data(query).fetchone()[0]
+        self.assertEqual(result, 1)
+
 class TestCSVReaderPolarsEngine(unittest.TestCase):
     """Test class for CSVReaderPolarsEngine."""
 
@@ -268,6 +277,15 @@ class TestCSVReaderPolarsEngine(unittest.TestCase):
         for i, row in enumerate(dicts):
             for key in self.data:
                 self.assertEqual(row[key], self.df[key][i])
+
+    def test_query_data(self):
+        """Test if query_data correctly queries the CSV data."""
+        csv_reader = CSVReaderPolarsEngine(self.filepath)
+        df = csv_reader.to_dataframe()
+        # Example query
+        query = "SELECT COUNT(*) FROM df WHERE Name = 'Alice'"
+        result = csv_reader.query_data(query).fetchone()[0]
+        self.assertEqual(result, 1)
 
 class TestCSVWriterDuckDBEngine(unittest.TestCase):
     """Test class for CSVWriterDuckDBEngine."""
