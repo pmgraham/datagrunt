@@ -1,7 +1,7 @@
 """Module for reading CSV files and converting CSV files to different standard file formats."""
 
 # standard library
-import logging
+
 # third party libraries
 import duckdb
 import polars as pl
