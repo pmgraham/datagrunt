@@ -17,6 +17,11 @@ def show_warning(message):
 
 
 def show_info_message(message):
+    """Show an info message.
+
+    Args:
+        message (str): The message to show.
+    """
     logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
     return logging.info(message)
 
@@ -32,4 +37,9 @@ def duckdb_query_error(error_message):
 
 
 def show_dataframe_sample(dataframe):
+    """Show dataframe output.
+
+    Args:
+        dataframe (dataframe): The dataframe to show.
+    """
     return show_info_message(dataframe)
