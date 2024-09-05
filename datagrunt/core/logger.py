@@ -16,6 +16,10 @@ def show_warning(message):
     return logging.warning(message)
 
 
+def show_info_message(message):
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
+    return logging.info(message)
+
 def show_large_file_warning():
     """Show a warning message if the file is large."""
     show_warning(LARGE_FILE_WARNING)
@@ -28,5 +32,4 @@ def duckdb_query_error(error_message):
 
 
 def show_dataframe_sample(dataframe):
-    logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
-    return logging.info(dataframe)
+    return show_info_message(dataframe)
