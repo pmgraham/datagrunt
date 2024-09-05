@@ -221,7 +221,7 @@ class TestCSVReaderDuckDBEngine(unittest.TestCase):
         for i, row in enumerate(dicts):
             for key in self.data:
                 self.assertEqual(row[key], self.df[key][i])
-    
+
     def test_query_data(self):
         """Test if query_data correctly queries the CSV data."""
         csv_reader = CSVReaderDuckDBEngine(self.filepath)
@@ -278,7 +278,7 @@ class TestCSVReaderPolarsEngine(unittest.TestCase):
         for i, row in enumerate(dicts):
             for key in self.data:
                 self.assertEqual(row[key], self.df[key][i])
-    
+
     def test_query_data(self):
         """Test if query_data correctly queries the CSV data."""
         csv_reader = CSVReaderPolarsEngine(self.filepath)
