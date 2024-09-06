@@ -92,9 +92,9 @@ class CSVReaderPolarsEngine(CSVProperties):
     def get_sample(self):
         """Return a sample of the CSV file."""
         df = pl.read_csv(self.filepath,
-                           separator=self.delimiter,
-                           n_rows=self.DATAFRAME_SAMPLE_ROWS
-                           )
+                         separator=self.delimiter,
+                         n_rows=self.DATAFRAME_SAMPLE_ROWS
+                        )
         show_dataframe_sample(df)
 
     def to_dataframe(self):
