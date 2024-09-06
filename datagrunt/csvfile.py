@@ -67,25 +67,6 @@ class CSVReaderDuckDBEngine(CSVProperties):
         dicts = self.to_dataframe().to_dicts()
         return dicts
 
-    def query_data(self, sql_query):
-        """Queries as CSV file after importing into DuckDB.
-
-        Args:
-            sql_query (str): Query to run against DuckDB.
-
-        Returns:
-            A DuckDB DuckDBPyRelation with the query results.
-
-        Example - Be sure to use a f string or .format to get db_table:
-            dg = CSVReaderDuckDBEngine('myfile.csv')
-            df = dg.to_dataframe()
-            query = "SELECT col1, col2 FROM {dg.db_table}"
-            dg.query_csv_data(query)
-        """
-        queries = DuckDBQueries(self.filepath)
-        duckdb.sql(queries.import_csv_query(self.delimiter))
-        return duckdb.sql(sql_query)
-
 class CSVReaderPolarsEngine(CSVProperties):
     """Class to read CSV files and convert CSV files powered by Polars."""
 
@@ -270,7 +251,7 @@ class CSVReader(CSVProperties):
 
     def __init__(self, filepath, engine='polars'):
         """Initialize the CSV Reader class.
-        
+
         Args:
             filepath (str): Path to the file to read.
             engine (str, default 'polars'): Determines which reader engine class to instantiate.
@@ -278,6 +259,7 @@ class CSVReader(CSVProperties):
         super().__init__(filepath)
         self.engine = engine.lower().replace(' ', '')
         self.reader = self._set_reader_engine(self.engine)
+        self.db_table = DuckDBQueries(self.filepath).database_table_name
         if self.engine not in self.READER_ENGINES:
             raise ValueError(self.VALUE_ERROR_MESSAGE.format(engine=self.engine))
 
@@ -290,6 +272,33 @@ class CSVReader(CSVProperties):
         else:
             return CSVReaderPolarsEngine(self.filepath)
 
+    def query_data(self, sql_query):
+        """Queries as CSV file after importing into DuckDB.
+
+        Args:
+            sql_query (str): Query to run against DuckDB.
+
+        Returns:
+            A DuckDB DuckDBPyRelation with the query results.
+
+        Example if DuckDB Engine:
+            dg = CSVReader('myfile.csv')
+            query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
+            dg.query_csv_data(query)
+        
+        Example if Polars Engine:
+            dg = CSVReaderPolarsEngine('myfile.csv')
+            df = dg.to_dataframe()
+            query = "SELECT col1, col2 FROM df" # no f string required to query from dataframe
+            dg.query_csv_data(query)
+        """
+        if self.engine == 'duckdb':
+            queries = DuckDBQueries(self.filepath)
+            results = duckdb.sql(queries.import_csv_query(self.delimiter))
+        else:
+            results = duckdb.sql(sql_query)
+        return results
+
 class CSVWriter(CSVProperties):
     """Class to unify the interface for converting CSV files to various other supported file types."""
 
@@ -298,7 +307,7 @@ class CSVWriter(CSVProperties):
 
     def __init__(self, filepath, engine='duckdb'):
         """Initialize the CSV Writer class.
-        
+
         Args:
             filepath (str): Path to the file to write.
             engine (str, default 'duckdb'): Determines which writer engine class to instantiate.
