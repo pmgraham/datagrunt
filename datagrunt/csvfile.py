@@ -269,6 +269,12 @@ class CSVReader(CSVProperties):
     VALUE_ERROR_MESSAGE = """Reader engine '{engine}' is not 'duckdb' or 'polars'. Pass either 'duckdb' or 'polars' as valid engine params."""
 
     def __init__(self, filepath, engine='polars'):
+        """Initialize the CSV Reader class.
+        
+        Args:
+            filepath (str): Path to the file to read.
+            engine (str, default 'polars'): Determines which reader engine class to instantiate.
+        """
         super().__init__(filepath)
         self.engine = engine.lower().replace(' ', '')
         self.reader = self._set_reader_engine(self.engine)
@@ -291,6 +297,12 @@ class CSVWriter(CSVProperties):
     VALUE_ERROR_MESSAGE = """Reader engine '{engine}' is not 'duckdb' or 'polars'. Pass either 'duckdb' or 'polars' as valid engine params."""
 
     def __init__(self, filepath, engine='duckdb'):
+        """Initialize the CSV Writer class.
+        
+        Args:
+            filepath (str): Path to the file to write.
+            engine (str, default 'duckdb'): Determines which writer engine class to instantiate.
+        """
         super().__init__(filepath)
         self.engine = engine.lower().replace(' ', '')
         self.writer = self._set_writer_engine(self.engine)
