@@ -240,19 +240,47 @@ class CSVReader(CSVProperties):
             engine (str, default 'polars'): Determines which reader engine class to instantiate.
         """
         super().__init__(filepath)
+        self.db_table = DuckDBQueries(self.filepath).database_table_name
         self.engine = engine.lower().replace(' ', '')
-        self.reader = self._set_reader_engine(self.engine)
         if self.engine not in self.READER_ENGINES:
             raise ValueError(self.VALUE_ERROR_MESSAGE.format(engine=self.engine))
 
-    def _set_reader_engine(self, engine):
+    def _set_reader_engine(self):
         """Sets the CSV reader engine as either DuckDB or Polars.
            Default engine is Polars.
         """
-        if engine != 'polars':
+        if self.engine != 'polars':
             return CSVReaderDuckDBEngine(self.filepath)
         else:
             return CSVReaderPolarsEngine(self.filepath)
+
+    def get_sample(self):
+        """Return a sample of the CSV file."""
+        self._set_reader_engine().get_sample()
+
+    def to_dataframe(self):
+        """Converts CSV to a Polars dataframe.
+
+        Returns:
+            A Polars dataframe.
+        """
+        return self._set_reader_engine().to_dataframe()
+
+    def to_arrow_table(self):
+        """Converts CSV to a Polars dataframe.
+
+        Returns:
+            A PyArrow table.
+        """
+        return self._set_reader_engine().to_arrow_table()
+
+    def to_dicts(self):
+        """Converts CSV to a Polars dataframe.
+
+        Returns:
+            A list of dictionaries.
+        """
+        return self._set_reader_engine().to_dicts()
 
     def query_data(self, sql_query):
         """Queries as CSV file after importing into DuckDB.
@@ -295,9 +323,9 @@ class CSVWriter(CSVProperties):
             engine (str, default 'duckdb'): Determines which writer engine class to instantiate.
         """
         super().__init__(filepath)
+        self.db_table = DuckDBQueries(self.filepath).database_table_name
         self.engine = engine.lower().replace(' ', '')
-        self.writer = self._set_writer_engine(self.engine)
-        if self.engine not in self.WRITER_ENGINES:
+        if self.engine not in self.READER_ENGINES:
             raise ValueError(self.VALUE_ERROR_MESSAGE.format(engine=self.engine))
 
     def _set_writer_engine(self, engine):
@@ -308,3 +336,43 @@ class CSVWriter(CSVProperties):
             return CSVWriterPolarsEngine(self.filepath)
         else:
             return CSVWriterDuckDBEngine(self.filepath)
+
+    def write_csv(self, out_filename=None):
+        """Query to export a DuckDB table to a CSV file.
+
+            Args:
+                out_filename str: The name of the output file.
+            """
+        return self._set_writer_engine(self.engine).write_csv(out_filename)
+
+    def write_excel(self, out_filename=None):
+        """Query to export a DuckDB table to an Excel file.
+
+        Args:
+            out_filename str: The name of the output file.
+        """
+        return self._set_writer_engine(self.engine).write_excel(out_filename)
+
+    def write_json(self, out_filename=None):
+        """Query to export a DuckDB table to a JSON file.
+
+        Args:
+            out_filename str: The name of the output file.
+        """
+        return self._set_writer_engine(self.engine).write_json(out_filename)
+
+    def write_json_newline_delimited(self, out_filename=None):
+        """Query to export a DuckDB table to a JSON newline delimited file.
+
+        Args:
+            out_filename str: The name of the output file.
+        """
+        return self._set_writer_engine(self.engine).write_json_newline_delimited(out_filename)
+
+    def write_parquet(self, out_filename=None):
+        """Query to export a DuckDB table to a Parquet file.
+
+        Args:
+            out_filename str: The name of the output file.
+        """
+        return self._set_writer_engine(self.engine).write_parquet(out_filename)
