@@ -261,3 +261,47 @@ class CSVWriterPolarsEngine(CSVProperties):
         filename = self._set_out_filename(self.PARQUET_OUT_FILENAME, out_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe()
         df.write_parquet(filename)
+
+class CSVReader(CSVProperties):
+    """Class to unify the interface for reading CSV files."""
+
+    READER_ENGINES = ['duckdb', 'polars']
+    VALUE_ERROR_MESSAGE = """Reader engine '{engine}' is not 'duckdb' or 'polars'. Pass either 'duckdb' or 'polars' as valid engine params."""
+
+    def __init__(self, filepath, engine='polars'):
+        super().__init__(filepath)
+        self.engine = engine.lower().replace(' ', '')
+        self.reader = self._set_reader_engine(self.engine)
+        if self.engine not in self.READER_ENGINES:
+            raise ValueError(self.VALUE_ERROR_MESSAGE.format(engine=self.engine))
+
+    def _set_reader_engine(self, engine):
+        """Sets the CSV reader engine as either DuckDB or Polars.
+           Default engine is Polars.
+        """
+        if engine != 'polars':
+            return CSVReaderDuckDBEngine(self.filepath)
+        else:
+            return CSVReaderPolarsEngine(self.filepath)
+
+class CSVWriter(CSVProperties):
+    """Class to unify the interface for converting CSV files to various other supported file types."""
+
+    WRITER_ENGINES = ['duckdb', 'polars']
+    VALUE_ERROR_MESSAGE = """Reader engine '{engine}' is not 'duckdb' or 'polars'. Pass either 'duckdb' or 'polars' as valid engine params."""
+
+    def __init__(self, filepath, engine='duckdb'):
+        super().__init__(filepath)
+        self.engine = engine.lower().replace(' ', '')
+        self.writer = self._set_writer_engine(self.engine)
+        if self.engine not in self.WRITER_ENGINES:
+            raise ValueError(self.VALUE_ERROR_MESSAGE.format(engine=self.engine))
+
+    def _set_writer_engine(self, engine):
+        """Sets the CSV reader engine as either DuckDB or Polars.
+           Default engine is Polars.
+        """
+        if engine != 'duckdb':
+            return CSVWriterPolarsEngine(self.filepath)
+        else:
+            return CSVWriterDuckDBEngine(self.filepath)
