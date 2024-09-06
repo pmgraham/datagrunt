@@ -267,7 +267,7 @@ class CSVReader(CSVProperties):
             dg = CSVReader('myfile.csv')
             query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
             dg.query_csv_data(query)
-        
+
         Example if Polars Engine:
             dg = CSVReaderPolarsEngine('myfile.csv')
             df = dg.to_dataframe()
