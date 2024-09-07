@@ -31,6 +31,7 @@ class CSVReaderDuckDBEngine(CSVProperties):
             A DuckDB DuckDBPyRelation.
         """
         return duckdb.read_csv(self.filepath,
+                               null_padding=True,
                                delimiter=self.delimiter,
                                all_varchar=True
                             )
@@ -93,6 +94,7 @@ class CSVReaderPolarsEngine(CSVProperties):
         """Return a sample of the CSV file."""
         df = pl.read_csv(self.filepath,
                          separator=self.delimiter,
+                         truncate_ragged_lines=True,
                          n_rows=self.DATAFRAME_SAMPLE_ROWS
                         )
         show_dataframe_sample(df)
@@ -106,7 +108,9 @@ class CSVReaderPolarsEngine(CSVProperties):
         if self.is_large:
             show_large_file_warning()
         return pl.read_csv(self.filepath,
-                           separator=self.delimiter)
+                           separator=self.delimiter,
+                           truncate_ragged_lines=True
+                           )
 
     def to_arrow_table(self):
         """Converts CSV to a PyArrow table.
