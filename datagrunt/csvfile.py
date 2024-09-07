@@ -32,6 +32,7 @@ class CSVReaderDuckDBEngine(CSVProperties):
         """
         return duckdb.read_csv(self.filepath,
                                delimiter=self.delimiter,
+                               null_padding=True,
                                all_varchar=True
                             )
 
@@ -74,6 +75,7 @@ class CSVReaderPolarsEngine(CSVProperties):
         """Return a sample of the CSV file."""
         df = pl.read_csv(self.filepath,
                          separator=self.delimiter,
+                         truncate_ragged_lines=True,
                          n_rows=self.DATAFRAME_SAMPLE_ROWS
                         )
         show_dataframe_sample(df)
