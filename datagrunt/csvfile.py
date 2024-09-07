@@ -110,14 +110,14 @@ class CSVWriter(CSVProperties):
         if self.engine not in self.READER_ENGINES:
             raise ValueError(self.VALUE_ERROR_MESSAGE.format(engine=self.engine))
 
-    def _set_writer_engine(self, engine):
+    def _set_writer_engine(self):
         """Sets the CSV reader engine as either DuckDB or Polars.
            Default engine is Polars.
         """
-        if engine != 'duckdb':
-            return CSVWriterPolarsEngine(self.filepath)
-        else:
+        if self.engine != 'polars':
             return CSVWriterDuckDBEngine(self.filepath)
+        else:
+            return CSVWriterPolarsEngine(self.filepath)
 
     def write_csv(self, out_filename=None):
         """Query to export a DuckDB table to a CSV file.
