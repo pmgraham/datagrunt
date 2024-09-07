@@ -147,3 +147,4 @@ dmypy.json
 # Local dev
 dev.py
 benchmarks.py
+examples.ipynb
