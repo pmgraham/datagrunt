@@ -89,7 +89,9 @@ class CSVReaderPolarsEngine(CSVProperties):
         if self.is_large:
             show_large_file_warning()
         return pl.read_csv(self.filepath,
-                           separator=self.delimiter)
+                           separator=self.delimiter,
+                           truncate_ragged_lines=True
+                           )
 
     def to_arrow_table(self):
         """Converts CSV to a PyArrow table.
