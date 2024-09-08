@@ -148,3 +148,4 @@ dmypy.json
 dev.py
 benchmarks.py
 *.ipynb
+tests/data_sources
