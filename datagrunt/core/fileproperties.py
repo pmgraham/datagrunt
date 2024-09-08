@@ -252,7 +252,7 @@ class CSVProperties(FileProperties):
     @lru_cache()
     def row_count_with_header(self):
         """Return the number of lines in the CSV file including the header."""
-        with open(self.filepath, 'rb', encoding=self.DEFAULT_ENCODING) as csv_file:
+        with open(self.filepath, 'rb') as csv_file:
             return sum(1 for _ in csv_file)
 
     @property
