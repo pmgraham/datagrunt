@@ -3,6 +3,7 @@
 # standard library
 from collections import Counter
 import csv
+from functools import lru_cache
 import os
 from pathlib import Path
 import re
@@ -146,7 +147,7 @@ class CSVProperties(FileProperties):
     DEFAULT_DELIMITER = ','
     DEFAULT_SAMPLE_ROWS = 1
     CSV_SNIFF_SAMPLE_ROWS = 5
-    DATAFRAME_SAMPLE_ROWS = 5
+    DATAFRAME_SAMPLE_ROWS = 20
 
     QUOTING_MAP = {
         0: 'no quoting',
@@ -248,9 +249,10 @@ class CSVProperties(FileProperties):
         return attributes
 
     @property
+    @lru_cache()
     def row_count_with_header(self):
         """Return the number of lines in the CSV file including the header."""
-        with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csv_file:
+        with open(self.filepath, 'rb') as csv_file:
             return sum(1 for _ in csv_file)
 
     @property
