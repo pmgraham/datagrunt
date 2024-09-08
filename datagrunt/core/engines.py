@@ -1,4 +1,4 @@
-"""Module for CSV reader and writer engines to enable CSV processing."""
+"""Module engines to enable data processing."""
 
 # standard library
 
