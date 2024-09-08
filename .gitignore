@@ -52,7 +52,6 @@ coverage.xml
 test_data/
 *.json
 *.jsonl
-*.csv
 *.db
 *.jpg
 *.Identifier
@@ -123,7 +122,6 @@ dmypy.json
 .pyre/
 
 # Data files
-*.csv
 *.tsv
 *.parquet
 *.hdf5
@@ -145,6 +143,6 @@ dmypy.json
 .DS_Store
 
 # Local dev
-dev.py
+dev/
 benchmarks.py
 tests/data_sources
