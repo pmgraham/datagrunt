@@ -35,9 +35,10 @@ class CSVReader(CSVProperties):
            Default engine is Polars.
         """
         if self.engine != 'polars':
-            return CSVReaderDuckDBEngine(self.filepath)
+            engine = CSVReaderDuckDBEngine(self.filepath)
         else:
-            return CSVReaderPolarsEngine(self.filepath)
+            engine = CSVReaderPolarsEngine(self.filepath)
+        return engine
 
     def get_sample(self):
         """Return a sample of the CSV file."""
@@ -109,9 +110,10 @@ class CSVWriter(CSVProperties):
            Default engine is Polars.
         """
         if self.engine != 'polars':
-            return CSVWriterDuckDBEngine(self.filepath)
+            engine = CSVWriterDuckDBEngine(self.filepath)
         else:
-            return CSVWriterPolarsEngine(self.filepath)
+            engine = CSVWriterPolarsEngine(self.filepath)
+        return engine
 
     def write_csv(self, out_filename=None):
         """Query to export a DuckDB table to a CSV file.
