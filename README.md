@@ -18,7 +18,7 @@ Born out of real-world frustration, Datagrunt Eliminates The Need For repetitive
 Get started with Datagrunt In Seconds Using Pip:
 
 ```bash
-pip install Datagrunt
+pip install datagrunt
 ```
 
 ## Getting Started
