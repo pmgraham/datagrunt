@@ -24,44 +24,47 @@ pip install datagrunt
 ## Getting Started
 
 ```python
-from datagrunt.csvfiles import CSVFile
+from datagrunt.csvfile import CSVReader
 
 # Load your CSV file
-csv_file = CSVFile('myfile.csv')
+csv_file = 'data/electric_vehicle_population_data.csv'
+engine = 'duckdb'
 
-# Access file information
-print(f"File Size: {csv_file.size_in_mb} MB") 
-print(f"CSV Attributes: {csv_file.attributes(")
+# Set duckdb as the processing engine. Engine set to 'polars' by default
+dg = CSVReader(csv_file, engine=engine) 
 
-# Override inferred delimiter (if needed)
-csv_file.delimiter = '|' 
+# return sample of the data to get a peek at the schema
+dg.get_sample()
 ```
 
 ##  DuckDB Integration for Performant SQL Queries
 ```python
-from datagrunt.csvfiles import CSVFile
+from datagrunt.csvfile import CSVReader
 
-csv_file = CSVFile('myfile.csv')
+csv_file = 'data/electric_vehicle_population_data.csv'
+engine = 'duckdb'
 
 # Construct your SQL query
 query = f"""
-    SELECT * 
-    FROM {csv_file.duckdb_instance.database_table_name} 
-    LIMIT 10
+WITH core AS (
+    SELECT
+        City AS city,
+        "VIN (1-10)" AS vin
+    FROM {dg.db_table}
+)
+SELECT
+    city,
+    COUNT(vin) AS vehicle_count
+FROM core
+GROUP BY 1
+ORDER BY 2 DESC
 """
 # Execute the query and get results as a Polars DataFrame
-df = csv_file.select_from_table(query)
+df = dg.query_data(query).pl()
 print(df.head())
 ```
 
 ## Contributing
-We welcome contributions from the community! If you'd like to contribute to datagrunt, please follow these steps:
-
-    - Fork the repository.
-    - Create a new branch for your feature or bug fix.
-    - Write tests to cover your changes.
-    - Ensure your code passes all tests and follows the project's style guidelines.
-    - Submit a pull request for review.
 
 ## Support
 
