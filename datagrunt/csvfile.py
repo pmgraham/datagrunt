@@ -80,12 +80,6 @@ class CSVReader(CSVProperties):
             dg = CSVReader('myfile.csv')
             query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
             dg.query_csv_data(query)
-
-        Example if Polars Engine:
-            dg = CSVReaderPolarsEngine('myfile.csv')
-            df = dg.to_dataframe()
-            query = "SELECT col1, col2 FROM df" # no f string required to query from dataframe
-            dg.query_csv_data(query)
         """
         queries = DuckDBQueries(self.filepath)
         duckdb.sql(queries.import_csv_query(self.delimiter))
