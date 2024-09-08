@@ -1,30 +1,30 @@
-# Welcome To datagrunt
+# Welcome To Datagrunt
 
-datagrunt is a Python library designed to simplify the way you work with CSV files. It provides a streamlined approach to reading, processing, and transforming your data into various formats, making data manipulation efficient and intuitive.
+Datagrunt Is A Python Library Designed To Simplify The Way You Work With CSV files. It provides a streamlined approach to reading, processing, and transforming your data into various formats, making data manipulation efficient and intuitive.
 
-## Why datagrunt?
+## Why Datagrunt?
 
-Born out of real-world frustration, datagrunt eliminates the need for repetitive coding when handling CSV files. Whether you're a data analyst, data engineer, or data scientist, datagrunt empowers you to focus on insights, not tedious data wrangling.
+Born out of real-world frustration, Datagrunt Eliminates The Need For repetitive coding when handling CSV files. Whether you're a data analyst, data engineer, or data scientist, Datagrunt Empowers You To Focus On insights, not tedious data wrangling.
 
 ## Key Features
 
-- **Intelligent Delimiter Inference:**  Datagrunt automatically detects and applies the correct delimiter for your CSV files using a custom algorithm and the power of DuckDB.
+- **Intelligent Delimiter Inference:**  Datagrunt Automatically Detects and applies the correct delimiter for your CSV files using a custom algorithm and the power of DuckDB.
 - **Seamless Data Processing:** Leverage the robust capabilities of DuckDB to perform advanced data processing tasks directly on your CSV data.
 - **Flexible Transformation:** Easily convert your processed CSV data into various formats to suit your needs.
 - **Pythonic API:** Enjoy a clean and intuitive API that integrates seamlessly into your existing Python workflows.
 
 ## Installation
 
-Get started with datagrunt in seconds using pip:
+Get started with Datagrunt In Seconds Using Pip:
 
 ```bash
-pip install datagrunt
+pip install Datagrunt
 ```
 
 ## Getting Started
 
 ```python
-from datagrunt.csvfile import CSVReader
+from datagrunt.Csvfile Import Csvreader
 
 # Load your CSV file
 csv_file = 'data/electric_vehicle_population_data.csv'
@@ -39,7 +39,7 @@ dg.get_sample()
 
 ##  DuckDB Integration for Performant SQL Queries
 ```python
-from datagrunt.csvfile import CSVReader
+from datagrunt.Csvfile Import Csvreader
 
 csv_file = 'data/electric_vehicle_population_data.csv'
 engine = 'duckdb'
@@ -76,4 +76,4 @@ print(df.head())
 This project is licensed under the [MIT License](https://opensource.org/license/mit)
 
 ## Acknowledgements
-A HUGE thank you to the open-source community and the creators of [DuckDB](https://duckdb.org) and [Polars](https://pola.rs) for their fantastic libraries that power datagrunt.
+A HUGE thank you to the open-source community and the creators of [DuckDB](https://duckdb.org) and [Polars](https://pola.rs) for their fantastic libraries that power Datagrunt.
