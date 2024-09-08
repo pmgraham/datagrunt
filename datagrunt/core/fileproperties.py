@@ -122,7 +122,7 @@ class FileProperties:
 
     @property
     def is_apache(self):
-        """Check if the file is an Excel file."""
+        """Check if the file is an Apache formatted file."""
         return self.extension_string.lower() in self.APACHE_FILE_EXTENSIONS
 
     @property
@@ -132,7 +132,7 @@ class FileProperties:
 
     @property
     def is_large(self):
-        """Check if the file is large."""
+        """Check if the file is greater than or equal to 1 GB."""
         return self.size_in_gb >= 1.0
 
     @property
@@ -220,7 +220,7 @@ class CSVProperties(FileProperties):
         return delimiter
 
     def _get_attributes(self):
-        """Generate CSV attributes."""
+        """Generate a dictionary of CSV attributes."""
         columns_list = self.first_row.split(self.delimiter)
         columns = {c: 'VARCHAR' for c in columns_list}
         with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csvfile:
@@ -267,7 +267,7 @@ class CSVProperties(FileProperties):
 
     @property
     def columns_string(self):
-        """Return the first row of the CSV file."""
+        """Return the first row of a CSV file as a string."""
         return self._get_attributes()['columns_string']
 
     @property
