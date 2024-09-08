@@ -31,16 +31,17 @@ class DuckDBDatabase:
         """Delete .db files after use."""
         if os.path.exists(self.database_filename):
             os.remove(self.database_filename)
+    
+    def _format_filename_string(self):
+        return re.sub(r'[^a-zA-Z0-9]', '', Path(self.filepath).stem)
 
     def _set_database_filename(self):
         """Return name of duckdb file created at runtime."""
-        filename = re.sub(r'[^a-zA-Z0-9]', '', Path(self.filepath).stem)
-        return f'{filename}.db'
+        return f'{self._format_filename_string()}.db'
 
     def _set_database_table_name(self):
         """Return name of duckdb import table created during file import."""
-        filename = re.sub(r'[^a-zA-Z0-9]', '', Path(self.filepath).stem)
-        return f'{filename}'
+        return f'{self._format_filename_string()}'
 
     def _set_database_connection(self, threads=DEFAULT_THREAD_COUNT):
         """Establish a connection with duckdb.
