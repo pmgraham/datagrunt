@@ -33,6 +33,7 @@ class DuckDBDatabase:
             os.remove(self.database_filename)
     
     def _format_filename_string(self):
+        """Remove all non alphanumeric characters from filename."""
         return re.sub(r'[^a-zA-Z0-9]', '', Path(self.filepath).stem)
 
     def _set_database_filename(self):
