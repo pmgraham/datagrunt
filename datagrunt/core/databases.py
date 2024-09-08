@@ -3,6 +3,7 @@
 # standard library
 import os
 from pathlib import Path
+import re
 
 # third party libraries
 import duckdb
@@ -33,11 +34,13 @@ class DuckDBDatabase:
 
     def _set_database_filename(self):
         """Return name of duckdb file created at runtime."""
-        return f'{Path(self.filepath).stem}.db'
+        filename = re.sub(r'[^a-zA-Z0-9]', '', Path(self.filepath).stem)
+        return f'{filename}.db'
 
     def _set_database_table_name(self):
         """Return name of duckdb import table created during file import."""
-        return f'{Path(self.filepath).stem}'
+        filename = re.sub(r'[^a-zA-Z0-9]', '', Path(self.filepath).stem)
+        return f'{filename}'
 
     def _set_database_connection(self, threads=DEFAULT_THREAD_COUNT):
         """Establish a connection with duckdb.
