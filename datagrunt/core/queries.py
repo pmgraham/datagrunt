@@ -55,16 +55,30 @@ class DuckDBQueries(DuckDBDatabase):
         """Query to export a DuckDB table to a CSV file.
 
         Args:
-            out_filename str: The name of the output file.
+            out_filename (str, optional): The name of the output file.
         """
         filename = self._set_out_filename(self.export_properties.CSV_OUT_FILENAME, out_filename)
         return f"COPY {self.database_table_name} TO '{filename}' (HEADER, DELIMITER ',');"
+
+    def export_excel_query(self, out_filename=None):
+        """Query to export a DuckDB table to an Excel file.
+
+        Args:
+            out_filename (str, optional): The name of the output file.
+        """
+        filename = self._set_out_filename(self.export_properties.EXCEL_OUT_FILENAME, out_filename)
+        return f"""
+            INSTALL spatial;
+            LOAD spatial;
+            COPY (SELECT * FROM {self.database_table_name})
+            TO '{filename}'(FORMAT GDAL, DRIVER 'xlsx')
+        """
 
     def export_json_query(self, out_filename=None):
         """Query to export a DuckDB table to a JSON file.
 
         Args:
-            out_filename str: The name of the output file.
+            out_filename (str, optional): The name of the output file.
         """
         filename = self._set_out_filename(self.export_properties.JSON_OUT_FILENAME, out_filename)
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}' (ARRAY true) "
@@ -73,7 +87,7 @@ class DuckDBQueries(DuckDBDatabase):
         """Query to export a DuckDB table to a JSON file with newline delimited.
 
         Args:
-            out_filename str: The name of the output file.
+            out_filename (str, optional): The name of the output file.
         """
         filename = self._set_out_filename(self.export_properties.JSON_NEWLINE_OUT_FILENAME,
                                           out_filename)
@@ -83,21 +97,7 @@ class DuckDBQueries(DuckDBDatabase):
         """Query to export a DuckDB table to a Parquet file.
 
         Args:
-            out_filename str: The name of the output file.
+            out_filename (str, optional): The name of the output file.
         """
         filename = self._set_out_filename(self.export_properties.PARQUET_OUT_FILENAME, out_filename)
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}'(FORMAT PARQUET)"
-
-    def export_excel_query(self, out_filename=None):
-        """Query to export a DuckDB table to an Excel file.
-
-        Args:
-            out_filename str: The name of the output file.
-        """
-        filename = self._set_out_filename(self.export_properties.EXCEL_OUT_FILENAME, out_filename)
-        return f"""
-            INSTALL spatial;
-            LOAD spatial;
-            COPY (SELECT * FROM {self.database_table_name})
-            TO '{filename}'(FORMAT GDAL, DRIVER 'xlsx')
-        """
