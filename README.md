@@ -31,7 +31,7 @@ csv_file = 'data/electric_vehicle_population_data.csv'
 engine = 'duckdb'
 
 # Set duckdb as the processing engine. Engine set to 'polars' by default
-dg = CSVReader(csv_file, engine=engine) 
+dg = CSVReader(csv_file, engine=engine)
 
 # return sample of the data to get a peek at the schema
 dg.get_sample()
@@ -43,6 +43,8 @@ from datagrunt.csvfile import CSVReader
 
 csv_file = 'data/electric_vehicle_population_data.csv'
 engine = 'duckdb'
+
+dg = CSVReader(csv_file, engine=engine)
 
 # Construct your SQL query
 query = f"""
