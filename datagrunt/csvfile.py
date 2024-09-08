@@ -95,7 +95,7 @@ class CSVWriter(CSVProperties):
     """Class to unify the interface for converting CSV files to various other supported file types."""
 
     WRITER_ENGINES = ['duckdb', 'polars']
-    VALUE_ERROR_MESSAGE = """Reader engine '{engine}' is not 'duckdb' or 'polars'. Pass either 'duckdb' or 'polars' as valid engine params."""
+    VALUE_ERROR_MESSAGE = """Writer engine '{engine}' is not 'duckdb' or 'polars'. Pass either 'duckdb' or 'polars' as valid engine params."""
 
     def __init__(self, filepath, engine='duckdb'):
         """Initialize the CSV Writer class.
@@ -107,7 +107,7 @@ class CSVWriter(CSVProperties):
         super().__init__(filepath)
         self.db_table = DuckDBQueries(self.filepath).database_table_name
         self.engine = engine.lower().replace(' ', '')
-        if self.engine not in self.READER_ENGINES:
+        if self.engine not in self.WRITER_ENGINES:
             raise ValueError(self.VALUE_ERROR_MESSAGE.format(engine=self.engine))
 
     def _set_writer_engine(self):
@@ -125,7 +125,7 @@ class CSVWriter(CSVProperties):
             Args:
                 out_filename str: The name of the output file.
             """
-        return self._set_writer_engine(self.engine).write_csv(out_filename)
+        return self._set_writer_engine().write_csv(out_filename)
 
     def write_excel(self, out_filename=None):
         """Query to export a DuckDB table to an Excel file.
@@ -133,7 +133,7 @@ class CSVWriter(CSVProperties):
         Args:
             out_filename str: The name of the output file.
         """
-        return self._set_writer_engine(self.engine).write_excel(out_filename)
+        return self._set_writer_engine().write_excel(out_filename)
 
     def write_json(self, out_filename=None):
         """Query to export a DuckDB table to a JSON file.
@@ -141,7 +141,7 @@ class CSVWriter(CSVProperties):
         Args:
             out_filename str: The name of the output file.
         """
-        return self._set_writer_engine(self.engine).write_json(out_filename)
+        return self._set_writer_engine().write_json(out_filename)
 
     def write_json_newline_delimited(self, out_filename=None):
         """Query to export a DuckDB table to a JSON newline delimited file.
@@ -149,7 +149,7 @@ class CSVWriter(CSVProperties):
         Args:
             out_filename str: The name of the output file.
         """
-        return self._set_writer_engine(self.engine).write_json_newline_delimited(out_filename)
+        return self._set_writer_engine().write_json_newline_delimited(out_filename)
 
     def write_parquet(self, out_filename=None):
         """Query to export a DuckDB table to a Parquet file.
@@ -157,4 +157,4 @@ class CSVWriter(CSVProperties):
         Args:
             out_filename str: The name of the output file.
         """
-        return self._set_writer_engine(self.engine).write_parquet(out_filename)
+        return self._set_writer_engine().write_parquet(out_filename)
