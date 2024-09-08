@@ -51,7 +51,7 @@ class CSVReaderDuckDBEngine(CSVProperties):
         return self._read_csv().pl()
 
     def to_arrow_table(self):
-        """Converts CSV to a Polars dataframe.
+        """Converts CSV to a PyArrow table.
 
         Returns:
             A PyArrow table.
@@ -60,7 +60,7 @@ class CSVReaderDuckDBEngine(CSVProperties):
         return arrow_table
 
     def to_dicts(self):
-        """Converts CSV to a Polars dataframe.
+        """Converts CSV to a list of Python dictionaries.
 
         Returns:
             A list of dictionaries.
@@ -103,7 +103,7 @@ class CSVReaderPolarsEngine(CSVProperties):
         return df
 
     def to_dicts(self):
-        """Converts CSV to a Python list of dictionaies.
+        """Converts CSV to a list of Python dictionaries.
 
         Returns:
             A list of dictionaries.
@@ -137,7 +137,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
         """Query to export a DuckDB table to an Excel file.
 
         Args:
-            out_filename str: The name of the output file.
+            out_filename (optional, str): The name of the output file.
         """
         duckdb.sql(self.queries.import_csv_query(self.delimiter))
         duckdb.sql(self.queries.export_excel_query(out_filename))
@@ -146,7 +146,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
         """Query to export a DuckDB table to a JSON file.
 
         Args:
-            out_filename str: The name of the output file.
+            out_filename (optional, str): The name of the output file.
         """
         duckdb.sql(self.queries.import_csv_query(self.delimiter))
         duckdb.sql(self.queries.export_json_query(out_filename))
@@ -155,7 +155,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
         """Query to export a DuckDB table to a JSON newline delimited file.
 
         Args:
-            out_filename str: The name of the output file.
+            out_filename (optional, str): The name of the output file.
         """
         duckdb.sql(self.queries.import_csv_query(self.delimiter))
         duckdb.sql(self.queries.export_json_newline_delimited_query(out_filename))
@@ -164,7 +164,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
         """Query to export a DuckDB table to a Parquet file.
 
         Args:
-            out_filename str: The name of the output file.
+            out_filename (optional, str): The name of the output file.
         """
         duckdb.execute(self.queries.import_csv_query(self.delimiter))
         duckdb.execute(self.queries.export_parquet_query(out_filename))
@@ -184,7 +184,7 @@ class CSVWriterPolarsEngine(CSVProperties):
         """Export a Polars dataframe to a CSV file.
 
         Args:
-            out_filename str: The name of the output file.
+            out_filename (optional, str): The name of the output file.
         """
         filename = self._set_out_filename(self.CSV_OUT_FILENAME, out_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe()
@@ -194,7 +194,7 @@ class CSVWriterPolarsEngine(CSVProperties):
         """Export a Polars dataframe to an Excel file.
 
         Args:
-            out_filename str: The name of the output file.
+            out_filename (optional, str): The name of the output file.
         """
         filename = self._set_out_filename(self.EXCEL_OUT_FILENAME, out_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe()
@@ -204,7 +204,7 @@ class CSVWriterPolarsEngine(CSVProperties):
         """Export a Polars dataframe to a JSON file.
 
         Args:
-            out_filename str: The name of the output file.
+            out_filename (optional, str): The name of the output file.
         """
         filename = self._set_out_filename(self.JSON_OUT_FILENAME, out_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe()
@@ -214,7 +214,7 @@ class CSVWriterPolarsEngine(CSVProperties):
         """Export a Polars dataframe to a JSON newline delimited file.
 
         Args:
-            out_filename str: The name of the output file.
+            out_filename (optional, str): The name of the output file.
         """
         filename = self._set_out_filename(self.JSON_NEWLINE_OUT_FILENAME, out_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe()
@@ -224,7 +224,7 @@ class CSVWriterPolarsEngine(CSVProperties):
         """Export a Polars dataframe to a Parquet file.
 
         Args:
-            out_filename str: The name of the output file.
+            out_filename (optional, str): The name of the output file.
         """
         filename = self._set_out_filename(self.PARQUET_OUT_FILENAME, out_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe()
