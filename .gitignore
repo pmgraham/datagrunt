@@ -147,5 +147,4 @@ dmypy.json
 # Local dev
 dev.py
 benchmarks.py
-*.ipynb
 tests/data_sources
