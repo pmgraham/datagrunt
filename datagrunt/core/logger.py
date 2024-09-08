@@ -1,4 +1,4 @@
-"""Module for showing warnings."""
+"""Module for showing logging messages."""
 
 import logging
 
