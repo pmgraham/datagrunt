@@ -24,7 +24,7 @@ pip install datagrunt
 ## Getting Started
 
 ```python
-from datagrunt.Csvfile import Csvreader
+from datagrunt.csvfile import CSVReader
 
 # Load your CSV file
 csv_file = 'data/electric_vehicle_population_data.csv'
@@ -39,7 +39,7 @@ dg.get_sample()
 
 ##  DuckDB Integration for Performant SQL Queries
 ```python
-from datagrunt.Csvfile import Csvreader
+from datagrunt.csvfile import CSVReader
 
 csv_file = 'data/electric_vehicle_population_data.csv'
 engine = 'duckdb'
