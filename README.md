@@ -111,13 +111,6 @@ print(df)
 │ Redwood City   ┆ 1             │
 └────────────────┴───────────────┘
 ```
-
-## Contributing
-
-## Support
-
-## Roadmap
-
 ## License
 This project is licensed under the [MIT License](https://opensource.org/license/mit)
 
