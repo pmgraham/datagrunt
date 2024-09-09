@@ -49,14 +49,11 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
-test_data/
 *.json
 *.jsonl
 *.db
 *.jpg
 *.Identifier
-# dev.py
-tests/*.py
 
 # Translations
 *.mo
@@ -145,4 +142,3 @@ dmypy.json
 # Local dev
 dev/
 benchmarks.py
-tests/data_sources
