@@ -115,4 +115,4 @@ print(df)
 This project is licensed under the [MIT License](https://opensource.org/license/mit)
 
 ## Acknowledgements
-A HUGE thank you to the open-source community and the creators of [DuckDB](https://duckdb.org) and [Polars](https://pola.rs) for their fantastic libraries that power Datagrunt.
+A HUGE thank you to the open-source community and the creators of [DuckDB](https://duckdb.org){:target="_blank"} and [Polars](https://pola.rs){:target="_blank"} for their fantastic libraries that power Datagrunt.
