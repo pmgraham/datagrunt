@@ -112,7 +112,7 @@ print(df)
 └────────────────┴───────────────┘
 ```
 ## License
-This project is licensed under the [MIT License](https://opensource.org/license/mit){:target="_blank" rel="noopener"}
+This project is licensed under the [MIT License](https://opensource.org/license/mit)
 
 ## Acknowledgements
 A HUGE thank you to the open-source community and the creators of [DuckDB](https://duckdb.org) and [Polars](https://pola.rs) for their fantastic libraries that power Datagrunt.
