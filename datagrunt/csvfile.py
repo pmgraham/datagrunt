@@ -6,10 +6,10 @@
 import duckdb
 
 # local libraries
-from datagrunt.core.fileproperties import CSVProperties
-from datagrunt.core.engines import CSVReaderDuckDBEngine, CSVReaderPolarsEngine
-from datagrunt.core.engines import CSVWriterDuckDBEngine, CSVWriterPolarsEngine
-from datagrunt.core.queries import DuckDBQueries
+from .core.fileproperties import CSVProperties
+from .core.engines import CSVReaderDuckDBEngine, CSVReaderPolarsEngine
+from .core.engines import CSVWriterDuckDBEngine, CSVWriterPolarsEngine
+from .core.queries import DuckDBQueries
 
 class CSVReader(CSVProperties):
     """Class to unify the interface for reading CSV files."""

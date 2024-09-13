@@ -3,8 +3,8 @@ requires = ["setuptools>=45", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "datagrunt"
-version = "0.1.0"
+name = "datagrunt1"
+version = "0.1.2"
 description = "A Python library designed to simplify the way you work with CSV files"
 authors = [{name = "Martin Graham", email = "datagrunt@datagrunt.io"}]
 license = {file = "LICENSE"}
@@ -24,7 +24,7 @@ classifiers = [
 packages = ["datagrunt"]
 
 [tool.bumpversion]
-current_version = "0.1.0"
+current_version = "0.1.2"
 parse = "(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)"
 serialize = ["{major}.{minor}.{patch}"]
 commit = true
