@@ -4,27 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "datagrunt1"
-version = "0.1.2"
-description = "A Python library designed to simplify the way you work with CSV files"
-authors = [{name = "Martin Graham", email = "datagrunt@datagrunt.io"}]
-license = {file = "LICENSE"}
-readme = "README.md"
-requires-python = ">=3.10"
-classifiers = [
-    "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
-]
-
-[project.urls]
-"Homepage" = "https://github.com/pmgraham/datagrunt"
-"Bug Tracker" = "https://github.com/pmgraham/datagrunt/issues"
-
-[tool.setuptools]
-packages = ["datagrunt"]
+version = "0.1.0"
+# ... other project details ...
 
 [tool.bumpversion]
-current_version = "0.1.2"
+current_version = "0.1.0"
 parse = "(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)"
 serialize = ["{major}.{minor}.{patch}"]
 commit = true
