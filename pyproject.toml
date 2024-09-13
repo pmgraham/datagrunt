@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "datagrunt"
 version = "0.1.0"
 description = "A Python library designed to simplify the way you work with CSV files"
-authors = [{name = "Your Name", email = "datagrunt@datagrunt.io"}]
+authors = [{name = "Martin Graham", email = "datagrunt@datagrunt.io"}]
 license = {file = "LICENSE"}
 readme = "README.md"
 requires-python = ">=3.10"
