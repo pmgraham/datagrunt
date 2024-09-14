@@ -38,6 +38,6 @@ push            = false
         'current_version = "{version}"',
         'version = "{version}"',
     ]
-    "datagrunt/__init__.py" = [
+    "src/datagrunt/__init__.py" = [
         '^__version__ = "{version}"$',
 ]
