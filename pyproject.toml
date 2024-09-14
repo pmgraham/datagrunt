@@ -1,5 +1,5 @@
 [build-system]
-requires      = ["setuptools>=74.0.0", "wheel"]
+requires = ["setuptools>=74.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -13,31 +13,61 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Intended Audience :: Developers",
+    "Topic :: Data Engineering :: Automation",
+    "Topic :: Data Science :: Libraries :: Python Modules",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 keywords = ["csv", "data", "duckdb", "polars", "pyarrow", "xlsx", "delimiter"]
 dependencies = [
-    "duckdb",
-    "polars",
-    "pyarrow",
-    "XlsxWriter"
+    "duckdb>=1.1.0",
+    "polars>=1.7.1",
+    "pyarrow>=17.0.0",
+    "XlsxWriter>=3.2.0"
 ]
- 
- [project.optional-dependencies]
-    build = ["build", "twine", "bumpver"]
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov>=3.0", "black", "isort", "flake8"]
+build = ["build", "twine", "bumpver"]
+
+[project.urls]
+Homepage = "https://github.com/pmgraham/datagrunt"
+"Bug Tracker" = "https://github.com/pmgraham/datagrunt/issues"
+Documentation = "https://pmgraham.github.io/datagrunt-docs"
+"Source Code" = "https://github.com/pmgraham/datagrunt"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["datagrunt*"]
+exclude = ["tests*"]
 
 [tool.bumpver]
 current_version = "1.0.2"
 version_pattern = "MAJOR.MINOR.PATCH"
-commit_message  = "bump version {old_version} -> {new_version}"
-commit          = true
-tag             = true
-push            = false
+commit_message = "bump version {old_version} -> {new_version}"
+commit = true
+tag = true
+push = false
 
-    [tool.bumpver.file_patterns]
-    "pyproject.toml" = [
-        'current_version = "{version}"',
-        'version = "{version}"',
-    ]
-    "src/datagrunt/__init__.py" = [
-        '^__version__ = "{version}"$',
+[tool.bumpver.file_patterns]
+"pyproject.toml" = [
+    'current_version = "{version}"',
+    'version = "{version}"',
 ]
+"src/datagrunt/__init__.py" = [
+    '^__version__ = "{version}"$',
+]
+
+[tool.black]
+line-length = 88
+target-version = ['py310']
+
+[tool.isort]
+profile = "black"
+
+[tool.flake8]
+max-line-length = 88
+extend-ignore = "E203"
