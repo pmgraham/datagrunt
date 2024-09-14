@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "datagrunt"
-version = "1.0.2"
+version = "1.0.3"
 description = "Read CSV files and convert to other file formats easily"
 readme = "README.md"
 authors = [{ name = "Martin Graham", email = "datagrunt@datagrunt.io" }]
@@ -45,7 +45,7 @@ include = ["datagrunt*"]
 exclude = ["tests*"]
 
 [tool.bumpver]
-current_version = "1.0.2"
+current_version = "1.0.3"
 version_pattern = "MAJOR.MINOR.PATCH"
 commit_message = "bump version {old_version} -> {new_version}"
 commit = true
