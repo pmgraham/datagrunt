@@ -8,7 +8,7 @@ version = "1.0.5"
 description = "Read CSV files and convert to other file formats easily"
 readme = "README.md"
 authors = [{ name = "Martin Graham", email = "datagrunt@datagrunt.io" }]
-license = "MIT"
+license = {text = "MIT License"}
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python",
