@@ -3,8 +3,8 @@ requires      = ["setuptools>=61.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "datagrunt1"
-version = "0.1.11"
+name = "datagrunt"
+version = "0.1.0"
 description = "Read CSV files and convert to other file formats easily"
 readme = "README.md"
 authors = [{ name = "Martin Graham", email = "datagrunt@datagrunt.io" }]
@@ -20,7 +20,7 @@ keywords = ["csv", "data", "duckdb", "polars", "pyarrow", "xlsx", "delimiter"]
     build = ["build", "twine", "bumpver"]
 
 [tool.bumpver]
-current_version = "0.1.11"
+current_version = "0.1.0"
 version_pattern = "MAJOR.MINOR.PATCH"
 commit_message  = "bump version {old_version} -> {new_version}"
 commit          = true
