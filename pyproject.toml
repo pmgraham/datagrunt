@@ -16,8 +16,6 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Intended Audience :: Developers",
-    "Topic :: Data Engineering :: Automation",
-    "Topic :: Data Science :: Libraries :: Python Modules",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 keywords = ["csv", "data", "duckdb", "polars", "pyarrow", "xlsx", "delimiter"]
@@ -34,7 +32,7 @@ dev = ["pytest>=7.0", "pytest-cov>=3.0", "black", "isort", "flake8"]
 build = ["build", "twine", "bumpver"]
 
 [project.urls]
-Homepage = "https://github.com/pmgraham/datagrunt"
+Homepage = "https://pmgraham.github.io/datagrunt-docs"
 "Bug Tracker" = "https://github.com/pmgraham/datagrunt/issues"
 Documentation = "https://pmgraham.github.io/datagrunt-docs"
 "Source Code" = "https://github.com/pmgraham/datagrunt"
