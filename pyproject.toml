@@ -1,31 +1,35 @@
 [build-system]
-requires = ["setuptools>=45", "wheel"]
+requires      = ["setuptools>=61.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "datagrunt1"
-version = "0.1.4"
-
+version = "0.1.8"
+description = "Read CSV files and convert to other file formats easily"
+readme = "README.md"
+authors = [{ name = "Martin Graham", email = "datagrunt@datagrunt.io" }]
 dependencies = [
-    "duckdb==1.1.0",
-    "polars=>=1.7.1",
-    "pyarrow>=17.0.0",
-    "XlsxWriter>=3.2.0",
+    "duckdb",
+    "polars",
+    "pyarrow",
+    "XlsxWriter"
 ]
+keywords = ["csv", "data", "duckdb", "polars", "pyarrow", "xlsx", "delimiter"]
+ 
+ [project.optional-dependencies]
+    build = ["build", "twine"]
 
-[tool.bumpversion]
-current_version = "0.1.4"
-parse = "(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)"
-serialize = ["{major}.{minor}.{patch}"]
-commit = true
-tag = true
+[tool.bumpver]
+current_version = "0.1.8"
+version_pattern = "MAJOR.MINOR.PATCH"
+commit_message  = "bump version {old_version} -> {new_version}"
+commit          = true
+tag             = true
+push            = false
 
-[[tool.bumpversion.files]]
-filename = "pyproject.toml"
-search = 'version = "{current_version}"'
-replace = 'version = "{new_version}"'
-
-[[tool.bumpversion.files]]
-filename = "your_package/__init__.py"
-search = '__version__ = "{current_version}"'
-replace = '__version__ = "{new_version}"'
+    [tool.bumpver.file_patterns]
+    "pyproject.toml" = [
+        'current_version = "{version}"',
+        'version = "{version}"',
+    ]
+    "src/reader/__init__.py" = ["{version}"]
