@@ -27,7 +27,7 @@ pip install datagrunt
 from datagrunt import CSVReader
 
 # Load your CSV file
-csv_file = '`electric_vehicle_population_data.csv'
+csv_file = 'electric_vehicle_population_data.csv'
 engine = 'duckdb'
 
 # Set duckdb as the processing engine. Engine set to 'polars' by default
