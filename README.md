@@ -8,8 +8,8 @@ Born out of real-world frustration, Datagrunt eliminates the need For repetitive
 
 ## Key Features
 
-- **Intelligent Delimiter Inference:**  Datagrunt automatically detects and applies the correct delimiter for your csv files using a custom algorithm and the power of DuckDB.
-- **Seamless Data Processing:** Leverage the robust capabilities of DuckDB to perform advanced data processing tasks directly on your CSV data.
+- **Intelligent Delimiter Inference:**  Datagrunt automatically detects and applies the correct delimiter for your csv files using a custom algorithm.
+- **Seamless Data Processing:** Leverage the robust capabilities of [DuckDB](https://duckdb.org) and [Polars](https://pola.rs) to perform advanced data processing tasks directly on your CSV data.
 - **Flexible Transformation:** Easily convert your processed CSV data into various formats to suit your needs.
 - **Pythonic API:** Enjoy a clean and intuitive API that integrates seamlessly into your existing Python workflows.
 
@@ -24,10 +24,10 @@ pip install datagrunt
 ## Getting Started
 
 ```python
-from datagrunt.csvfile import CSVReader
+from datagrunt import CSVReader
 
 # Load your CSV file
-csv_file = 'data/electric_vehicle_population_data.csv'
+csv_file = '`electric_vehicle_population_data.csv'
 engine = 'duckdb'
 
 # Set duckdb as the processing engine. Engine set to 'polars' by default
@@ -68,9 +68,9 @@ dg.get_sample()
 
 ##  DuckDB Integration for Performant SQL Queries
 ```python
-from datagrunt.csvfile import CSVReader
+from datagrunt import CSVReader
 
-csv_file = 'data/electric_vehicle_population_data.csv'
+csv_file = 'electric_vehicle_population_data.csv'
 engine = 'duckdb'
 
 dg = CSVReader(csv_file, engine=engine)
@@ -90,6 +90,7 @@ FROM core
 GROUP BY 1
 ORDER BY 2 DESC
 """
+
 # Execute the query and get results as a Polars DataFrame
 df = dg.query_data(query).pl()
 print(df)
