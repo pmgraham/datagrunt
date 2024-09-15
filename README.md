@@ -8,7 +8,7 @@ Born out of real-world frustration, Datagrunt eliminates the need For repetitive
 
 ## Key Features
 
-- **Intelligent Delimiter Inference:**  Datagrunt automatically detects and applies the correct delimiter for your csv files using a custom algorithm.
+- **Intelligent Delimiter Inference:**  Datagrunt automatically detects and applies the correct delimiter for your csv files.
 - **Seamless Data Processing:** Leverage the robust capabilities of [DuckDB](https://duckdb.org) and [Polars](https://pola.rs) to perform advanced data processing tasks directly on your CSV data.
 - **Flexible Transformation:** Easily convert your processed CSV data into various formats to suit your needs.
 - **Pythonic API:** Enjoy a clean and intuitive API that integrates seamlessly into your existing Python workflows.
