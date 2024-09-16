@@ -154,3 +154,23 @@ class CSVWriter(CSVProperties):
             out_filename str: The name of the output file.
         """
         return self._set_writer_engine().write_parquet(out_filename)
+
+class CSVCleaner(CSVProperties):
+    """Class to unify the interface for cleaning CSV files."""
+
+    def normalize_columns():
+        pass
+
+    def change_encoding():
+        pass
+
+    def isolate_problem_rows():
+        pass
+
+    def isolate_good_rows():
+        pass
+
+    def remove_hidden_characters():
+        pass
+
+    
