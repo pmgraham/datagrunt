@@ -156,7 +156,7 @@ class CSVWriter(CSVProperties):
         """
         return self._set_writer_engine().write_parquet(out_filename)
 
-class CSVCleaner(CSVReader):
+class CSVCleaner(CSVProperties):
     """Class for cleaning CSV files."""
 
     REGEX_PATTERNS = {
