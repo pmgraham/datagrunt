@@ -315,7 +315,7 @@ class CSVCleaner(CSVProperties):
         """
         return {col: self.normalize_column_name(col) for col in self.columns}
     
-    def update_dataframe_columns(self, df):
+    def normalize_dataframe_columns(self, df):
         """
         Update the column names of a Polars DataFrame using the normalized column names.
 
