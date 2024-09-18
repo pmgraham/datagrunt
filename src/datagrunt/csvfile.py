@@ -157,105 +157,163 @@ class CSVWriter(CSVProperties):
         return self._set_writer_engine().write_parquet(out_filename)
 
 class CSVCleaner(CSVReader):
-    """Class to unify the interface for cleaning CSV files."""
-    
-    def _remove_invalid_chars(self, column_name):
-        """Leaves only alphanumeric, underscores, and whitespace characters in the string.
-        
-        Args:
-            column_name str: String to be formatted.
-        
-        Returns:
-            str: String with only alphanumeric, underscores, and whitespace characters.
-        
+    """Class for cleaning CSV files."""
+
+    REGEX_PATTERNS = {
+        'invalid_chars': r'[^a-zA-Z0-9_\s-]',
+        'valid_prefix': r'^[a-zA-Z_]',
+        'spaces': r'\s+',
+        'consecutive_duplicates': r'([a-zA-Z0-9])\1+'
+    }
+
+    def _apply_functions_in_sequence(self, value, *funcs):
         """
-        return re.sub(r'[^a-zA-Z0-9_\s]', '', column_name)
+        Apply a series of functions to a value in sequence.
+
+        This method takes an initial value and applies each function in the
+        provided sequence of functions to that value. Each function is applied
+        to the result of the previous function application.
+
+        Args:
+            value (Any): The initial value to which the functions will be applied.
+            *funcs (Callable[[Any], Any]): A variable number of functions to apply to the value.
+                Each function should take a single argument and return a value.
+
+        Returns:
+            Any: The result after applying all functions in sequence to the initial value.
+
+        Example:
+            result = self._apply("HELLO WORLD", str.lower, str.strip, lambda s: s.replace(" ", "_"))
+            # result will be "hello_world"
+        """
+        for func in funcs:
+            value = func(value)
+        return value
+
+    def _remove_invalid_chars(self, column_name):
+        """
+        Remove invalid characters from the column name.
+
+        This method leaves only alphanumeric characters, underscores, and hyphens
+        in the string. Hyphens are then replaced with underscores.
+
+        Args:
+            column_name: The original column name to be cleaned.
+
+        Returns:
+            The column name with only alphanumeric characters and underscores.
+
+        Example:
+            >>> self._remove_invalid_chars("Hello, World! 123")
+            "Hello_World_123"
+        """
+        return re.sub(self.REGEX_PATTERNS['invalid_chars'], '', column_name).replace('-', '_')
 
     def _ensure_valid_prefix(self, column_name):
-        """Ensures that the string always starts with either a letter or an underscore
-        
-        Args:
-            column_name str: String to be formatted.
-        
-        Returns:
-            str: String that always starts with either a letter or an underscore.
         """
-        return column_name if re.match(r'^[a-zA-Z_]', column_name) else f'_{column_name}'
+        Ensure the column name starts with a letter or underscore.
 
-    def _replace_spaces(self, column_name):
-        """Converts any spaces or other whitespace characters to an underscore.
-        
-        Args:
-            column_name str: String to be formatted.
-
-        Returns:
-            str: String with spaces replaced with underscores.
-        """
-        return re.sub(r'\s+', '_', column_name)
-
-    def _remove_consecutive_duplicates(self, column_name):
-        """Removes duplicate consecutive characters from the string.
+        If the column name doesn't start with a letter or underscore,
+        an underscore is prepended to it.
 
         Args:
-            column_name str: String to be formatted.
+            column_name: The column name to be checked and possibly modified.
 
         Returns:
-            str: String with duplicate consecutive characters removed.
+            The column name with a valid prefix.
 
         Examples:
-            - hello__world would become hello_world
-            - apple111orange would become apple1orange
-            - AABBCC would become ABC
+            >>> self._ensure_valid_prefix("123column")
+            "_123column"
+            >>> self._ensure_valid_prefix("column")
+            "column"
         """
-        return re.sub(r'([a-zA-Z0-9])\1+', r'\1', column_name)
+        return column_name if re.match(self.REGEX_PATTERNS['valid_prefix'], column_name) else f'_{column_name}'
 
-    def _normalize_column_name(self):
-        """Normalize a column name by applying cleaning methods.
-        
-        Returns:
-            column_name str: Cleaned and normalized version of the column name string.
+    def _replace_spaces_with_underscores(self, column_name):
         """
-        column_name = column_name.lower()
-        column_name = self._remove_invalid_chars(column_name)
-        column_name = self._ensure_valid_prefix(column_name)
-        column_name = self._replace_spaces(column_name)
-        column_name = self._remove_consecutive_duplicates(column_name)
-        return column_name
+        Replace spaces and other whitespace characters with underscores.
 
-    def normalize_columns(self):
-        """Normalize all CSV column names and return a dict of old names to new names.
-        
-        Returns:
-            dict: old column name as the key with new column name as the value.
-        """
-        return {col: self._normalize_column_name(col) for col in self.columns}
-    
-    def update_csv_column_headers(self,
-                                  csv_output_file,
-                                  new_headers_dict,
-                                  delimiter,
-                                  line_terminator):
-        """Function does the following:
-        1. Reads existing CSV
-        2. Replaces headers with values passed in via a dictionary
-        3. Writes out the values to a new file
-        Originally the function was going to handle the file management and offer a way to
-        delete the original file and replace with the output file. However, it's best to allow
-        that to be handled downstream in order to give the most flexibility during operations.
+        This method converts any sequence of whitespace characters to a single underscore.
 
         Args:
-            csv_source_file (string): CSV file with the original headers
-            csv_output_file (string): CSV file with the updated headers
-            new_headers_dict (dict): Dictionary with the new header values
-            delimiter (string): CSV file delimiter
-            line_terminator (string): Line terminator characters
+            column_name: The column name to be processed.
+
+        Returns:
+            The column name with spaces replaced by underscores.
+
+        Example:
+            >>> self._replace_spaces_with_underscores("Hello   World")
+            "Hello_World"
         """
-        with open(self.filepath, 'r') as f, open(csv_output_file, 'w') as o:
-            f.readline() # and discard
-            vals = f"{delimiter}".join(new_headers_dict.values())
-            vals += line_terminator
-            o.write(vals)
-            shutil.copyfileobj(f, o)
+        return re.sub(self.REGEX_PATTERNS['spaces'], '_', column_name)
+
+    def _remove_consecutive_duplicates(self, column_name):
+        """
+        Remove consecutive duplicate characters from the column name.
+
+        This method keeps only the first occurrence of consecutive identical characters.
+
+        Args:
+            column_name: The column name to be processed.
+
+        Returns:
+            The column name with consecutive duplicates removed.
+
+        Examples:
+            >>> self._remove_consecutive_duplicates("hello__world")
+            "hello_world"
+            >>> self._remove_consecutive_duplicates("apple111orange")
+            "apple1orange"
+            >>> self._remove_consecutive_duplicates("AABBCC")
+            "ABC"
+        """
+        return re.sub(self.REGEX_PATTERNS['consecutive_duplicates'], r'\1', column_name)
+
+    def normalize_column_name(self, column_name):
+        """
+        Normalize a column name by applying a series of cleaning methods.
+
+        This method applies the following transformations in order:
+        1. Convert to lowercase
+        2. Remove invalid characters
+        3. Ensure a valid prefix
+        4. Replace spaces with underscores
+        5. Remove consecutive duplicates
+
+        Args:
+            column_name: The original column name to be normalized.
+
+        Returns:
+            The normalized column name.
+
+        Example:
+            >>> self.normalize_column_name("  Hello, World! 123  ")
+            "hello_world_123"
+        """
+        return self._apply_functions_in_sequence(
+            column_name.lower(),
+            self._remove_invalid_chars,
+            self._ensure_valid_prefix,
+            self._replace_spaces_with_underscores,
+            self._remove_consecutive_duplicates
+        )
+
+    def normalize_columns(self):
+        """
+        Normalize all CSV column names and return a mapping of old names to new names.
+
+        This method applies the normalization process to all columns in the CSV file.
+
+        Returns:
+            A dictionary where keys are original column names and
+            values are the corresponding normalized names.
+
+        Example:
+            >>> self.normalize_columns()
+            {"Original Name": "original_name", "Another Column!": "another_column"}
+        """
+        return {col: self.normalize_column_name(col) for col in self.columns}
 
     def change_encoding():
         pass
@@ -268,5 +326,3 @@ class CSVCleaner(CSVReader):
 
     def remove_hidden_characters():
         pass
-
-    

@@ -31,7 +31,10 @@ __license__ = "MIT"
 from .csvfile import CSVReader, CSVWriter
 
 # You can define __all__ to specify what gets imported with "from package import *"
-__all__ = ['CSVReader', 'CSVWriter']
+__all__ = ['CSVReader',
+           'CSVWriter',
+           'CSVCleaner'
+           ]
 
 # Optionally, you can include a logger for your package
 import logging
