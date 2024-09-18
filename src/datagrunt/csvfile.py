@@ -314,6 +314,37 @@ class CSVCleaner(CSVProperties):
             {"Original Name": "original_name", "Another Column!": "another_column"}
         """
         return {col: self.normalize_column_name(col) for col in self.columns}
+    
+    def update_dataframe_columns(self, df):
+        """
+        Update the column names of a Polars DataFrame using the normalized column names.
+
+        This method applies the column name normalization rules defined in the CSVCleaner
+        class to rename the columns of the provided Polars DataFrame. It uses the
+        `normalize_columns` method to generate a mapping of original column names to
+        their normalized versions, and then applies this mapping to rename the DataFrame
+        columns.
+
+        Args:
+            df (polars.DataFrame): The input Polars DataFrame whose column names
+                are to be updated.
+
+        Returns:
+            polars.DataFrame: A new Polars DataFrame with updated column names.
+                The original DataFrame is not modified.
+
+        Note:
+            This method does not modify the input DataFrame in-place. Instead, it
+            returns a new DataFrame with the updated column names.
+
+        Example:
+            >>> cleaner = CSVCleaner()
+            >>> df = pl.DataFrame({"Original Name": [1, 2, 3], "Another Column!": [4, 5, 6]})
+            >>> updated_df = cleaner.update_dataframe_columns(df)
+            >>> print(updated_df.columns)
+            ['original_name', 'another_column']
+        """
+        return df.rename(self.normalize_columns())
 
     def change_encoding():
         pass
