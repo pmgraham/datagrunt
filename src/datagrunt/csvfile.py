@@ -156,7 +156,7 @@ class CSVWriter(CSVProperties):
         """
         return self._set_writer_engine().write_parquet(out_filename)
 
-class CSVCleaner(CSVProperties):
+class CSVCleaner(CSVReader):
     """Class to unify the interface for cleaning CSV files."""
     
     def _remove_invalid_chars(self, column_name):
