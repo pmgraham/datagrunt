@@ -314,7 +314,7 @@ class CSVCleaner(CSVProperties):
             {"Original Name": "original_name", "Another Column!": "another_column"}
         """
         return {col: self.normalize_column_name(col) for col in self.columns}
-    
+
     def normalize_dataframe_columns(self, df):
         """
         Update the column names of a Polars DataFrame using the normalized column names.
@@ -356,4 +356,55 @@ class CSVCleaner(CSVProperties):
         pass
 
     def remove_hidden_characters():
+        pass
+
+    def infer_column_types(self):
+        pass
+
+    def convert_column_types(self):
+        pass
+
+    def handle_missing_values(self):
+        pass
+
+    def remove_duplicate_rows(self):
+        pass
+
+    def strip_whitespace(self):
+        pass
+
+    def normalize_case(self):
+        pass
+
+    def standardize_dates(self):
+        pass
+
+    def standardize_numbers(self):
+        pass
+
+    def detect_outliers(self):
+        pass
+
+    def handle_outliers(self):
+        pass
+
+    def validate_data(self):
+        pass
+
+    def anonymize_data(self):
+        pass
+
+    def handle_multiline_fields(self):
+        pass
+
+    def check_data_consistency(self):
+        pass
+
+    def split_column(self):
+        pass
+
+    def combine_columns(self):
+        pass
+
+    def handle_special_characters(self):
         pass
