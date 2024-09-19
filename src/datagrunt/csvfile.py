@@ -160,13 +160,13 @@ class CSVCleaner(CSVProperties):
     """Class for cleaning CSV files."""
 
     REGEX_PATTERNS = {
-        'invalid_chars': r'[^a-zA-Z0-9_\s-]',
+        'invalid_chars': r'[^a-zA-Z0-9_.\s-]',
         'valid_prefix': r'^[a-zA-Z_]',
-        'spaces': r'\s+',
+        'spaces_periods': r'[\s.]+',
         'consecutive_duplicates': r'([a-zA-Z0-9])\1+'
     }
 
-    def _apply_functions_in_sequence(self, value, *funcs):
+    def _apply_string_functions_in_sequence(self, value, *funcs):
         """
         Apply a series of functions to a value in sequence.
 
@@ -175,15 +175,15 @@ class CSVCleaner(CSVProperties):
         to the result of the previous function application.
 
         Args:
-            value (Any): The initial value to which the functions will be applied.
-            *funcs (Callable[[Any], Any]): A variable number of functions to apply to the value.
+            value (str): The initial value to which the functions will be applied.
+            *funcs (Callable): A variable number of functions to apply to the value.
                 Each function should take a single argument and return a value.
 
         Returns:
             Any: The result after applying all functions in sequence to the initial value.
 
         Example:
-            result = self._apply("HELLO WORLD", str.lower, str.strip, lambda s: s.replace(" ", "_"))
+            result = self._apply_string_functions_in_sequence("HELLO WORLD", str.lower, str.strip, lambda s: s.replace(" ", "_"))
             # result will be "hello_world"
         """
         for func in funcs:
@@ -194,14 +194,14 @@ class CSVCleaner(CSVProperties):
         """
         Remove invalid characters from the column name.
 
-        This method leaves only alphanumeric characters, underscores, and hyphens
+        This method leaves only alphanumeric characters, underscores, periods, and hyphens
         in the string. Hyphens are then replaced with underscores.
 
         Args:
             column_name: The original column name to be cleaned.
 
         Returns:
-            The column name with only alphanumeric characters and underscores.
+            The column name with only alphanumeric characters, underscores, and periods.
 
         Example:
             >>> self._remove_invalid_chars("Hello, World! 123")
@@ -230,23 +230,23 @@ class CSVCleaner(CSVProperties):
         """
         return column_name if re.match(self.REGEX_PATTERNS['valid_prefix'], column_name) else f'_{column_name}'
 
-    def _replace_spaces_with_underscores(self, column_name):
+    def _replace_spaces_periods_with_underscores(self, column_name):
         """
-        Replace spaces and other whitespace characters with underscores.
+        Replace spaces, periods, and other whitespace characters with underscores.
 
-        This method converts any sequence of whitespace characters to a single underscore.
+        This method converts any sequence of whitespace characters or periods to a single underscore.
 
         Args:
             column_name: The column name to be processed.
 
         Returns:
-            The column name with spaces replaced by underscores.
+            The column name with spaces and periods replaced by underscores.
 
         Example:
-            >>> self._replace_spaces_with_underscores("Hello   World")
-            "Hello_World"
+            >>> self._replace_spaces_periods_with_underscores("Hello   World.csv")
+            "Hello_World_csv"
         """
-        return re.sub(self.REGEX_PATTERNS['spaces'], '_', column_name)
+        return re.sub(self.REGEX_PATTERNS['spaces_periods'], '_', column_name)
 
     def _remove_consecutive_duplicates(self, column_name):
         """
@@ -278,7 +278,7 @@ class CSVCleaner(CSVProperties):
         1. Convert to lowercase
         2. Remove invalid characters
         3. Ensure a valid prefix
-        4. Replace spaces with underscores
+        4. Replace spaces and periods with underscores
         5. Remove consecutive duplicates
 
         Args:
@@ -288,14 +288,14 @@ class CSVCleaner(CSVProperties):
             The normalized column name.
 
         Example:
-            >>> self.normalize_column_name("  Hello, World! 123  ")
-            "hello_world_123"
+            >>> self.normalize_column_name("  Hello, World! 123.csv  ")
+            "hello_world_123_csv"
         """
-        return self._apply_functions_in_sequence(
+        return self._apply_string_functions_in_sequence(
             column_name.lower(),
             self._remove_invalid_chars,
             self._ensure_valid_prefix,
-            self._replace_spaces_with_underscores,
+            self._replace_spaces_periods_with_underscores,
             self._remove_consecutive_duplicates
         )
 
@@ -340,7 +340,7 @@ class CSVCleaner(CSVProperties):
         Example:
             >>> cleaner = CSVCleaner()
             >>> df = pl.DataFrame({"Original Name": [1, 2, 3], "Another Column!": [4, 5, 6]})
-            >>> updated_df = cleaner.update_dataframe_columns(df)
+            >>> updated_df = cleaner.normalize_dataframe_columns(df)
             >>> print(updated_df.columns)
             ['original_name', 'another_column']
         """
