@@ -13,12 +13,12 @@ import duckdb
 import polars as pl
 
 # local libraries
-from datagrunt.core.engines import CSVReaderDuckDBEngine, CSVReaderPolarsEngine
-from datagrunt.core.engines import CSVWriterDuckDBEngine, CSVWriterPolarsEngine
-from datagrunt.csvfile import CSVReader, CSVWriter
-from datagrunt.core.databases import DuckDBDatabase
-from datagrunt.core.fileproperties import FileProperties, CSVProperties
-from datagrunt.core.logger import *
+from src.datagrunt.core.engines import CSVReaderDuckDBEngine, CSVReaderPolarsEngine
+from src.datagrunt.core.engines import CSVWriterDuckDBEngine, CSVWriterPolarsEngine
+from src.datagrunt import CSVReader, CSVWriter
+from src.datagrunt.core.databases import DuckDBDatabase
+from src.datagrunt.core.fileproperties import FileProperties, CSVProperties
+from src.datagrunt.core.logger import *
 # from datagrunt.core.queries import DuckDBQueries
 
 class TestDuckDBDatabase(unittest.TestCase):
@@ -465,63 +465,63 @@ class TestCSVReader(unittest.TestCase):
             """Reader engine 'invalid' is not 'duckdb' or 'polars'. Pass either 'duckdb' or 'polars' as valid engine params."""
         )
 
-    @patch('datagrunt.csvfile.CSVReaderPolarsEngine.get_sample')
+    @patch('src.datagrunt.csvfile.CSVReaderPolarsEngine.get_sample')
     def test_get_sample_polars(self, mock_get_sample):
         """Test that the get_sample method calls the Polars engine."""
         reader = CSVReader(self.filepath)
         reader.get_sample()
         mock_get_sample.assert_called_once()
 
-    @patch('datagrunt.csvfile.CSVReaderDuckDBEngine.get_sample')
+    @patch('src.datagrunt.csvfile.CSVReaderDuckDBEngine.get_sample')
     def test_get_sample_duckdb(self, mock_get_sample):
         """Test that the get_sample method calls the DuckDB engine."""
         reader = CSVReader(self.filepath, engine='duckdb')
         reader.get_sample()
         mock_get_sample.assert_called_once()
 
-    @patch('datagrunt.csvfile.CSVReaderPolarsEngine.to_dataframe')
+    @patch('src.datagrunt.csvfile.CSVReaderPolarsEngine.to_dataframe')
     def test_to_dataframe_polars(self, mock_to_dataframe):
         """Test that the to_dataframe method calls the Polars engine."""
         reader = CSVReader(self.filepath)
         reader.to_dataframe()
         mock_to_dataframe.assert_called_once()
 
-    @patch('datagrunt.csvfile.CSVReaderDuckDBEngine.to_dataframe')
+    @patch('src.datagrunt.csvfile.CSVReaderDuckDBEngine.to_dataframe')
     def test_to_dataframe_duckdb(self, mock_to_dataframe):
         """Test that the to_dataframe method calls the DuckDB engine."""
         reader = CSVReader(self.filepath, engine='duckdb')
         reader.to_dataframe()
         mock_to_dataframe.assert_called_once()
 
-    @patch('datagrunt.csvfile.CSVReaderPolarsEngine.to_arrow_table')
+    @patch('src.datagrunt.csvfile.CSVReaderPolarsEngine.to_arrow_table')
     def test_to_arrow_table_polars(self, mock_to_arrow_table):
         """Test that the to_arrow_table method calls the Polars engine."""
         reader = CSVReader(self.filepath)
         reader.to_arrow_table()
         mock_to_arrow_table.assert_called_once()
 
-    @patch('datagrunt.csvfile.CSVReaderDuckDBEngine.to_arrow_table')
+    @patch('src.datagrunt.csvfile.CSVReaderDuckDBEngine.to_arrow_table')
     def test_to_arrow_table_duckdb(self, mock_to_arrow_table):
         """Test that the to_arrow_table method calls the DuckDB engine."""
         reader = CSVReader(self.filepath, engine='duckdb')
         reader.to_arrow_table()
         mock_to_arrow_table.assert_called_once()
 
-    @patch('datagrunt.csvfile.CSVReaderPolarsEngine.to_dicts')
+    @patch('src.datagrunt.csvfile.CSVReaderPolarsEngine.to_dicts')
     def test_to_dicts_polars(self, mock_to_dicts):
         """Test that the to_dicts method calls the Polars engine."""
         reader = CSVReader(self.filepath)
         reader.to_dicts()
         mock_to_dicts.assert_called_once()
 
-    @patch('datagrunt.csvfile.CSVReaderDuckDBEngine.to_dicts')
+    @patch('src.datagrunt.csvfile.CSVReaderDuckDBEngine.to_dicts')
     def test_to_dicts_duckdb(self, mock_to_dicts):
         """Test that the to_dicts method calls the DuckDB engine."""
         reader = CSVReader(self.filepath, engine='duckdb')
         reader.to_dicts()
         mock_to_dicts.assert_called_once()
 
-    @patch('datagrunt.csvfile.duckdb.sql')
+    @patch('src.datagrunt.csvfile.duckdb.sql')
     def test_query_data(self, mock_sql):
         """Test that the query_data method calls DuckDB SQL with the correct query."""
         reader = CSVReader(self.filepath)
