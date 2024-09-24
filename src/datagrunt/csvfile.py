@@ -163,7 +163,7 @@ class CSVCleaner(CSVProperties):
         'invalid_chars': r'[^a-zA-Z0-9_.\s-]',
         'valid_prefix': r'^[a-zA-Z_]',
         'spaces_periods': r'[\s.]+',
-        'consecutive_duplicates': r'([a-zA-Z0-9])\1+'
+        'consecutive_duplicates': r'([^a-zA-Z0-9])\1+'
     }
 
     def _apply_string_functions_in_sequence(self, value, *funcs):
@@ -248,7 +248,7 @@ class CSVCleaner(CSVProperties):
         """
         return re.sub(self.REGEX_PATTERNS['spaces_periods'], '_', column_name)
 
-    def _remove_consecutive_duplicates(self, column_name):
+    def _remove_consecutive_non_alphanumeric_duplicates(self, column_name):
         """
         Remove consecutive duplicate characters from the column name.
 
@@ -296,7 +296,7 @@ class CSVCleaner(CSVProperties):
             self._remove_invalid_chars,
             self._ensure_valid_prefix,
             self._replace_spaces_periods_with_underscores,
-            self._remove_consecutive_duplicates
+            self._remove_consecutive_non_alphanumeric_duplicates
         )
 
     def normalize_columns(self):
