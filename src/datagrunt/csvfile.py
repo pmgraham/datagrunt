@@ -250,23 +250,26 @@ class CSVCleaner(CSVProperties):
 
     def _remove_consecutive_non_alphanumeric_duplicates(self, column_name):
         """
-        Remove consecutive duplicate characters from the column name.
-
-        This method keeps only the first occurrence of consecutive identical characters.
+        Remove consecutive duplicate non-alphanumeric characters from the column name.
+        This method keeps only the first occurrence of consecutive identical non-alphanumeric characters.
 
         Args:
             column_name: The column name to be processed.
 
         Returns:
-            The column name with consecutive duplicates removed.
+            The column name with consecutive non-alphanumeric duplicates removed.
 
         Examples:
-            >>> self._remove_consecutive_duplicates("hello__world")
+            >>> self.remove_consecutive_non_alphanumeric_duplicates("hello__world")
             "hello_world"
-            >>> self._remove_consecutive_duplicates("apple111orange")
-            "apple1orange"
-            >>> self._remove_consecutive_duplicates("AABBCC")
-            "ABC"
+            >>> self.remove_consecutive_non_alphanumeric_duplicates("apple!!!orange")
+            "apple!orange"
+            >>> self.remove_consecutive_non_alphanumeric_duplicates("data##analysis__project")
+            "data#analysis_project"
+            >>> self.remove_consecutive_non_alphanumeric_duplicates("AABBCC")
+            "AABBCC"
+            >>> self.remove_consecutive_non_alphanumeric_duplicates("user@@@email.com")
+            "user@email.com"
         """
         return re.sub(self.REGEX_PATTERNS['consecutive_duplicates'], r'\1', column_name)
 
