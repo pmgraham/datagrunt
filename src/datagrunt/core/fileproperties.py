@@ -236,8 +236,6 @@ class CSVProperties(FileProperties):
                 'newline_delimiter': dialect.lineterminator,
                 'skipinitialspace': dialect.skipinitialspace,
                 'quoting': self.QUOTING_MAP.get(dialect.quoting),
-                'row_count_with_header': self.row_count_with_header,
-                'row_count_without_header': self.row_count_without_header,
                 'columns_schema': columns,
                 'columns_original_format': self.first_row,
                 'columns_list': columns_list,
