@@ -28,10 +28,10 @@ __author__ = "Martin Graham"
 __license__ = "MIT"
 
 # Import key classes, functions, or submodules that should be available at the package level
-from .csvfile import CSVReader, CSVWriter, CSVCleaner
+from .csvfile import CSVReader, CSVWriter, CSVFormatter
 
 # You can define __all__ to specify what gets imported with "from package import *"
-__all__ = ['CSVReader', 'CSVWriter', 'CSVCleaner']
+__all__ = ['CSVReader', 'CSVWriter', 'CSVFormatter']
 
 # Optionally, you can include a logger for your package
 import logging

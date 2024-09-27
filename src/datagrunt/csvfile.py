@@ -156,8 +156,8 @@ class CSVWriter(CSVProperties):
         """
         return self._set_writer_engine().write_parquet(out_filename)
 
-class CSVCleaner(CSVProperties):
-    """Class for cleaning CSV files."""
+class CSVFormatter(CSVProperties):
+    """Class for formatting CSV files."""
 
     REGEX_PATTERNS = {
         'invalid_chars': r'[^a-zA-Z0-9_.\s-]',
