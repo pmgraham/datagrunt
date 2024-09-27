@@ -183,7 +183,11 @@ class CSVCleaner(CSVProperties):
             Any: The result after applying all functions in sequence to the initial value.
 
         Example:
-            result = self._apply_string_functions_in_sequence("HELLO WORLD", str.lower, str.strip, lambda s: s.replace(" ", "_"))
+            result = self._apply_string_functions_in_sequence("HELLO WORLD",
+                                                              str.lower,
+                                                              str.strip,
+                                                              lambda s: s.replace(" ", "_")
+                                                              )
             # result will be "hello_world"
         """
         for func in funcs:
