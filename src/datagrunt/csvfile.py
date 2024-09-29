@@ -322,7 +322,7 @@ class CSVFormatter(CSVProperties):
         """
         return {col: self.normalize_column_name(col) for col in self.columns}
 
-    def normalize_dataframe_columns(self, df):
+    def normalize_dataframe_columns(self, dataframe):
         """
         Update the column names of a Polars DataFrame using the normalized column names.
 
@@ -351,4 +351,4 @@ class CSVFormatter(CSVProperties):
             >>> print(updated_df.columns)
             ['original_name', 'another_column']
         """
-        return df.rename(self.normalize_columns())
+        return dataframe.rename(self.normalize_columns())
