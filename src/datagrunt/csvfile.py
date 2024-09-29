@@ -333,7 +333,7 @@ class CSVFormatter(CSVProperties):
         columns.
 
         Args:
-            df (polars.DataFrame): The input Polars DataFrame whose column names
+            dataframe (polars.DataFrame): The input Polars DataFrame whose column names
                 are to be updated.
 
         Returns:
@@ -346,9 +346,9 @@ class CSVFormatter(CSVProperties):
 
         Example:
             >>> cleaner = CSVCleaner()
-            >>> df = pl.DataFrame({"Original Name": [1, 2, 3], "Another Column!": [4, 5, 6]})
-            >>> updated_df = cleaner.normalize_dataframe_columns(df)
-            >>> print(updated_df.columns)
+            >>> dataframe = pl.DataFrame({"Original Name": [1, 2, 3], "Another Column!": [4, 5, 6]})
+            >>> dataframe = cleaner.normalize_dataframe_columns(dataframe)
+            >>> print(dataframe.columns)
             ['original_name', 'another_column']
         """
         return dataframe.rename(self.normalize_columns())
