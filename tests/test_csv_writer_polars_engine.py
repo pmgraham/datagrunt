@@ -31,6 +31,22 @@ def output_files(tmp_path):
         'parquet': tmp_path / "test_out.parquet"
     }
 
+def test_set_out_filename(csv_writer):
+    """Test the _set_out_filename method of CSVWriterPolarsEngine."""
+    # Test with default filename
+    default_filename = "default.csv"
+    result = csv_writer._set_out_filename(default_filename)
+    assert result == default_filename, "Should return default filename when no out_filename is provided"
+
+    # Test with custom filename
+    custom_filename = "custom.csv"
+    result = csv_writer._set_out_filename(default_filename, custom_filename)
+    assert result == custom_filename, "Should return custom filename when provided"
+
+    # Test with None as custom filename
+    result = csv_writer._set_out_filename(default_filename, None)
+    assert result == default_filename, "Should return default filename when None is provided as out_filename"
+
 def test_write_csv(csv_writer, output_files):
     """Test if write_csv exports the correct CSV file."""
     csv_writer.write_csv(out_filename=output_files['csv'])
