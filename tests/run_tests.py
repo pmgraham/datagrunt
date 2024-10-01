@@ -1,7 +1,13 @@
 import pytest
 import sys
-sys.path.append('../')  # Add the parent directory to the search path
-sys.path.append('../src/datagrunt')  # Add the parent directory to the search path
+import os
+
+# Get the absolute path of the directory containing your test file
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Add the src directory to the Python path
+src_dir = os.path.abspath(os.path.join(current_dir, '..', 'src'))
+sys.path.insert(0, src_dir)
 
 if __name__ == "__main__":
     # sys.exit(pytest.main(["-v", "--cov=src.datagrunt", "--cov-report=term-missing", "--cov-fail-under=90", "."]))

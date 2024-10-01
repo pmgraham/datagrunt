@@ -1,6 +1,17 @@
 """Unit tests for CSVProperties."""
 import pytest
-from src.datagrunt.core.fileproperties import CSVProperties
+import sys
+import os
+
+# Get the absolute path of the directory containing your test file
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Add the parent directory of 'datagrunt' to the Python path
+project_root = os.path.abspath(os.path.join(current_dir, '..'))
+sys.path.insert(0, project_root)
+
+# Now you can import your module
+from datagrunt.core.fileproperties import CSVProperties
 
 @pytest.fixture
 def sample_csv_files(tmp_path):
