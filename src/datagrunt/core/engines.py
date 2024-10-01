@@ -123,6 +123,14 @@ class CSVWriterDuckDBEngine(CSVProperties):
         """
         super().__init__(filepath)
         self.queries = DuckDBQueries(self.filepath)
+    
+    def _set_out_filename(self, default_filename, out_filename=None):
+        """Evaluate if a filename is passed in and if not, return default filename."""
+        if out_filename:
+            filename = out_filename
+        else:
+            filename = default_filename
+        return filename
 
     def write_csv(self, out_filename=None):
         """Query to export a DuckDB table to a CSV file.
@@ -130,8 +138,9 @@ class CSVWriterDuckDBEngine(CSVProperties):
             Args:
                 out_filename str: The name of the output file.
             """
+        filename = self._set_out_filename(self.CSV_OUT_FILENAME, out_filename)
         duckdb.sql(self.queries.import_csv_query(self.delimiter))
-        duckdb.sql(self.queries.export_csv_query(out_filename))
+        duckdb.sql(self.queries.export_csv_query(filename))
 
     def write_excel(self, out_filename=None):
         """Query to export a DuckDB table to an Excel file.
@@ -139,8 +148,9 @@ class CSVWriterDuckDBEngine(CSVProperties):
         Args:
             out_filename (optional, str): The name of the output file.
         """
+        filename = self._set_out_filename(self.EXCEL_OUT_FILENAME, out_filename)
         duckdb.sql(self.queries.import_csv_query(self.delimiter))
-        duckdb.sql(self.queries.export_excel_query(out_filename))
+        duckdb.sql(self.queries.export_excel_query(filename))
 
     def write_json(self, out_filename=None):
         """Query to export a DuckDB table to a JSON file.
@@ -148,8 +158,9 @@ class CSVWriterDuckDBEngine(CSVProperties):
         Args:
             out_filename (optional, str): The name of the output file.
         """
+        filename = self._set_out_filename(self.JSON_OUT_FILENAME, out_filename)
         duckdb.sql(self.queries.import_csv_query(self.delimiter))
-        duckdb.sql(self.queries.export_json_query(out_filename))
+        duckdb.sql(self.queries.export_json_query(filename))
 
     def write_json_newline_delimited(self, out_filename=None):
         """Query to export a DuckDB table to a JSON newline delimited file.
@@ -157,8 +168,9 @@ class CSVWriterDuckDBEngine(CSVProperties):
         Args:
             out_filename (optional, str): The name of the output file.
         """
+        filename = self._set_out_filename(self.JSON_NEWLINE_OUT_FILENAME, out_filename)
         duckdb.sql(self.queries.import_csv_query(self.delimiter))
-        duckdb.sql(self.queries.export_json_newline_delimited_query(out_filename))
+        duckdb.sql(self.queries.export_json_newline_delimited_query(filename))
 
     def write_parquet(self, out_filename=None):
         """Query to export a DuckDB table to a Parquet file.
@@ -166,8 +178,9 @@ class CSVWriterDuckDBEngine(CSVProperties):
         Args:
             out_filename (optional, str): The name of the output file.
         """
+        filename = self._set_out_filename(self.PARQUET_OUT_FILENAME, out_filename)
         duckdb.execute(self.queries.import_csv_query(self.delimiter))
-        duckdb.execute(self.queries.export_parquet_query(out_filename))
+        duckdb.execute(self.queries.export_parquet_query(filename))
 
 class CSVWriterPolarsEngine(CSVProperties):
     """Class to write CSVs to other file formats powered by Polars."""
