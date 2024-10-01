@@ -148,7 +148,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
         Args:
             out_filename (optional, str): The name of the output file.
         """
-        filename = self._set_out_filename(self.CSV_OUT_FILENAME, out_filename)
+        filename = self._set_out_filename(self.EXCEL_OUT_FILENAME, out_filename)
         duckdb.sql(self.queries.import_csv_query(self.delimiter))
         duckdb.sql(self.queries.export_excel_query(filename))
 
@@ -158,7 +158,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
         Args:
             out_filename (optional, str): The name of the output file.
         """
-        filename = self._set_out_filename(self.CSV_OUT_FILENAME, out_filename)
+        filename = self._set_out_filename(self.JSON_OUT_FILENAME, out_filename)
         duckdb.sql(self.queries.import_csv_query(self.delimiter))
         duckdb.sql(self.queries.export_json_query(filename))
 
@@ -168,7 +168,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
         Args:
             out_filename (optional, str): The name of the output file.
         """
-        filename = self._set_out_filename(self.CSV_OUT_FILENAME, out_filename)
+        filename = self._set_out_filename(self.JSON_NEWLINE_OUT_FILENAME, out_filename)
         duckdb.sql(self.queries.import_csv_query(self.delimiter))
         duckdb.sql(self.queries.export_json_newline_delimited_query(filename))
 
@@ -178,7 +178,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
         Args:
             out_filename (optional, str): The name of the output file.
         """
-        filename = self._set_out_filename(self.CSV_OUT_FILENAME, out_filename)
+        filename = self._set_out_filename(self.PARQUET_OUT_FILENAME, out_filename)
         duckdb.execute(self.queries.import_csv_query(self.delimiter))
         duckdb.execute(self.queries.export_parquet_query(filename))
 
