@@ -3,6 +3,16 @@
 import pytest
 import polars as pl
 from unittest.mock import patch
+import sys
+import os
+
+# Get the absolute path of the directory containing your test file
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Add the parent directory of 'datagrunt' to the Python path
+project_root = os.path.abspath(os.path.join(current_dir, '..'))
+sys.path.insert(0, project_root)
+
 from src.datagrunt.core.engines import CSVReaderDuckDBEngine
 
 @pytest.fixture

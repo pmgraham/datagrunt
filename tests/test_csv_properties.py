@@ -1,17 +1,6 @@
 """Unit tests for CSVProperties."""
 import pytest
-import sys
-import os
-
-# Get the absolute path of the directory containing your test file
-current_dir = os.path.dirname(os.path.abspath(__file__))
-
-# Add the parent directory of 'datagrunt' to the Python path
-project_root = os.path.abspath(os.path.join(current_dir, '..'))
-sys.path.insert(0, project_root)
-
-# Now you can import your module
-from datagrunt.core.fileproperties import CSVProperties
+from src.datagrunt.core.fileproperties import CSVProperties
 
 @pytest.fixture
 def sample_csv_files(tmp_path):
@@ -24,25 +13,18 @@ def sample_csv_files(tmp_path):
         'tab_file': tmp_path / 'tab.csv',
         'text_file': tmp_path / 'text.txt'
     }
-
     # Create empty file
     files['empty_file'].touch()
-
     # Create comma-separated file
     files['comma_file'].write_text('Name,Age,City\nAlice,25,New York\n')
-
     # Create pipe-separated file
     files['pipe_file'].write_text('Name|Age|City\nBob|30|London\n')
-
     # Create space-separated file
     files['space_file'].write_text('Name Age City\nCharlie 28 Paris\n')
-
     # Create tab-separated file
     files['tab_file'].write_text('Name\tAge\tCity\nDavid\t35\tTokyo\n')
-
     # Create text file (non-CSV)
     files['text_file'].write_text('Name\tAge\tCity\nDavid\t35\tTokyo\n')
-
     return files
 
 def test_delimiter_inference(sample_csv_files):
@@ -58,7 +40,6 @@ def test_row_counting(sample_csv_files):
     empty_props = CSVProperties(sample_csv_files['empty_file'])
     assert empty_props.row_count_with_header == 0
     assert empty_props.row_count_without_header == -1
-
     comma_props = CSVProperties(sample_csv_files['comma_file'])
     assert comma_props.row_count_with_header == 2
     assert comma_props.row_count_without_header == 1
