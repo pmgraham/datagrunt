@@ -1,10 +1,18 @@
 """Unit tests for CSVWriter."""
 
-import pytest
+# standard library
 import csv
 import re
-import polars as pl
 import tempfile
+import sys
+sys.path.append('../')  # Add the parent directory to the search path
+sys.path.append('../src/datagrunt')  # Add the parent directory to the search path
+
+# third party libraries
+import polars as pl
+import pytest
+
+# local libraries
 from src.datagrunt.csvfile import CSVColumnFormatter
 
 # TODO we hvae failures. Make sure all unit test scenarios pass as expected.
