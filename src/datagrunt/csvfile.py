@@ -199,8 +199,8 @@ class CSVColumnFormatter(CSVProperties):
         """
         Remove invalid characters from the column name.
 
-        This method leaves only alphanumeric characters, underscores, periods, and hyphens
-        in the string. Hyphens are then replaced with underscores.
+        This method leaves only alphanumeric characters, underscores, periods, hyphens
+        and spaces in the string. Hyphens are then replaced with underscores.
 
         Args:
             column_name: The original column name to be cleaned.
