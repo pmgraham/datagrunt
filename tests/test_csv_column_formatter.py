@@ -4,9 +4,6 @@
 import csv
 import re
 import tempfile
-import sys
-sys.path.append('../')  # Add the parent directory to the search path
-sys.path.append('../src/datagrunt')  # Add the parent directory to the search path
 
 # third party libraries
 import polars as pl
