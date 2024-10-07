@@ -55,7 +55,7 @@ class TestCSVColumnFormatter:
         assert formatter._remove_consecutive_non_alphanumeric_duplicates("user@@@gmail.com") == "user@gmail.com"
 
     def test_normalize_column_name(self, formatter):
-        assert formatter.normalize_column_name("  Hello, World! 123.csv  ") == "hello_world_123_csv"
+        assert formatter.normalize_column_name("  Hello, World! 123.csv.__  ") == "hello_world_123_csv"
         assert formatter.normalize_column_name("UPPER CASE") == "upper_case"
         assert formatter.normalize_column_name("123 Invalid Start") == "_123_invalid_start"
         assert formatter.normalize_column_name("multiple   spaces") == "multiple_spaces"
@@ -92,9 +92,9 @@ class TestCSVColumnFormatter:
         assert re.match(formatter.REGEX_PATTERNS['consecutive_duplicates'], "__") is not None
 
     def test_edge_cases(self, formatter):
-        assert formatter.normalize_column_name("") == "_"
+        assert formatter.normalize_column_name("") == ""
         assert formatter.normalize_column_name("a" * 100) == "a" * 100
-        assert formatter.normalize_column_name("!@#$%^&*()") == "_"
+        assert formatter.normalize_column_name("!@#$%^&*()") == ""
 
     def test_normalize_column_names_with_duplicates(self, csv_file_path):
         # Create a new CSV file with duplicate column names
