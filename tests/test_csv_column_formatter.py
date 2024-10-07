@@ -12,7 +12,7 @@ import pytest
 # local libraries
 from src.datagrunt.csvfile import CSVColumnFormatter
 
-# TODO we hvae failures. Make sure all unit test scenarios pass as expected.
+# TODO we have failures. Make sure all unit test scenarios pass as expected.
 
 class TestCSVColumnFormatter:
 
