@@ -163,7 +163,8 @@ class CSVColumnFormatter(CSVProperties):
         'invalid_chars': r'[^a-zA-Z0-9_.\s-]',
         'valid_prefix': r'^[a-zA-Z_]',
         'spaces_periods': r'[\s.]+',
-        'consecutive_duplicates': r'([^a-zA-Z0-9])\1+'
+        'consecutive_duplicates': r'([^a-zA-Z0-9])\1+',
+        'remove_trailing_underscores': r'[^a-zA-Z0-9]$'
     }
 
     @staticmethod
@@ -275,6 +276,25 @@ class CSVColumnFormatter(CSVProperties):
             "user@gmail.com"
         """
         return re.sub(self.REGEX_PATTERNS['consecutive_duplicates'], r'\1', column_name)
+    
+    def _remove_trailing_underscores(self, column_name):
+        """
+        Remove trailing underscores from the given column name.
+
+        This method uses a predefined regex pattern to remove any underscore 
+        characters that appear at the end of the input string.
+
+        Args:
+            column_name (str): The name of the column to process.
+
+        Returns:
+            str: The column name with trailing underscores removed.
+
+        Example:
+            >>> obj.remove_trailing_underscores("column_name___")
+            "column_name"
+        """
+        return re.sub(self.REGEX_PATTERNS['remove_trailing_underscores'], '', column_name)
 
     def normalize_column_name(self, column_name):
         """
@@ -297,14 +317,18 @@ class CSVColumnFormatter(CSVProperties):
             >>> self.normalize_column_name("  Hello, World! 123.csv  ")
             "hello_world_123_csv"
         """
-        return self._apply_string_functions_in_sequence(
+        formatted_column = self._apply_string_functions_in_sequence(
             column_name,
             str.lower,
+            str.strip,
+            str.lstrip,
             self._remove_invalid_chars,
             self._add_valid_prefix,
             self._replace_spaces_periods_with_underscores,
-            self._remove_consecutive_non_alphanumeric_duplicates
+            self._remove_consecutive_non_alphanumeric_duplicates,
+            self._remove_trailing_underscores
         )
+        return formatted_column
 
     def normalize_column_names(self):
         """
