@@ -76,7 +76,7 @@ class CSVReader(CSVProperties):
             A list of dictionaries.
         """
         if self.is_empty:
-            return self._return_empty_file_object(dict())
+            return self._return_empty_file_object(list())
         return self._set_reader_engine().to_dicts()
 
     def query_data(self, sql_query):
