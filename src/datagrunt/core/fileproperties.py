@@ -171,6 +171,24 @@ class CSVProperties(FileProperties):
                 f"File extension '{self.extension_string}' is not a valid CSV file extension."
                              )
 
+    def _return_empty_file_object(self):
+        """Return an empty file object."""
+        return {
+            'delimiter': self.DEFAULT_DELIMITER,
+            'quotechar': '"',
+            'escapechar': None,
+            'doublequote': True,
+            'newline_delimiter': '\n',
+            'skipinitialspace': False,
+            'quoting': 'quote all',
+            'columns_schema': {},
+            'columns_original_format': '',
+            'columns_list': [],
+            'columns_string': '',
+            'columns_byte_string': b'',
+            'column_count': 0
+        }
+
     def _get_first_row_from_file(self):
         """Reads and returns the first line of a file.
 
@@ -221,28 +239,30 @@ class CSVProperties(FileProperties):
 
     def _get_attributes(self):
         """Generate a dictionary of CSV attributes."""
-        columns_list = self.first_row.split(self.delimiter)
-        columns = {c: 'VARCHAR' for c in columns_list}
-        with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csvfile:
-            # Sniff the file to detect parameters
-            dialect = csv.Sniffer().sniff(csvfile.read(self.CSV_SNIFF_SAMPLE_ROWS))
-            csvfile.seek(0)  # Reset file pointer to the beginning
-
-            attributes = {
-                'delimiter': self.delimiter,
-                'quotechar': dialect.quotechar,
-                'escapechar': dialect.escapechar,
-                'doublequote': dialect.doublequote,
-                'newline_delimiter': dialect.lineterminator,
-                'skipinitialspace': dialect.skipinitialspace,
-                'quoting': self.QUOTING_MAP.get(dialect.quoting),
-                'columns_schema': columns,
-                'columns_original_format': self.first_row,
-                'columns_list': columns_list,
-                'columns_string': ", ".join(columns_list),
-                'columns_byte_string': ", ".join(columns_list).encode(),
-                'column_count': len(columns_list)
-            }
+        if self.is_empty:
+            attributes = self._return_empty_file_object()
+        else:
+            columns_list = self.first_row.split(self.delimiter)
+            columns = {c: 'VARCHAR' for c in columns_list}
+            with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csvfile:
+                # Sniff the file to detect parameters
+                dialect = csv.Sniffer().sniff(csvfile.read(self.CSV_SNIFF_SAMPLE_ROWS))
+                csvfile.seek(0)  # Reset file pointer to the beginning
+                attributes = {
+                        'delimiter': self.delimiter,
+                        'quotechar': dialect.quotechar,
+                        'escapechar': dialect.escapechar,
+                        'doublequote': dialect.doublequote,
+                        'newline_delimiter': dialect.lineterminator,
+                        'skipinitialspace': dialect.skipinitialspace,
+                        'quoting': self.QUOTING_MAP.get(dialect.quoting),
+                        'columns_schema': columns,
+                        'columns_original_format': self.first_row,
+                        'columns_list': columns_list,
+                        'columns_string': ", ".join(columns_list),
+                        'columns_byte_string': ", ".join(columns_list).encode(),
+                        'column_count': len(columns_list)
+                    }
 
         return attributes
 
