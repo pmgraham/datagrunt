@@ -171,7 +171,7 @@ class CSVProperties(FileProperties):
                 f"File extension '{self.extension_string}' is not a valid CSV file extension."
                              )
 
-    def _return_empty_file_object(self):
+    def _return_empty_file_attributes(self):
         """Return an empty file object."""
         return {
             'delimiter': self.DEFAULT_DELIMITER,
@@ -240,7 +240,7 @@ class CSVProperties(FileProperties):
     def _get_attributes(self):
         """Generate a dictionary of CSV attributes."""
         if self.is_empty:
-            attributes = self._return_empty_file_object()
+            attributes = self._return_empty_file_attributes()
         else:
             columns_list = self.first_row.split(self.delimiter)
             columns = {c: 'VARCHAR' for c in columns_list}
