@@ -4,6 +4,7 @@
 
 # third party libraries
 import duckdb
+import polars as pl
 
 # local libraries
 from .core.fileproperties import CSVProperties
@@ -40,6 +41,10 @@ class CSVReader(CSVProperties):
             engine = CSVReaderPolarsEngine(self.filepath)
         return engine
 
+    def _return_empty_file_object(self, object):
+        """Return an empty file object."""
+        return object
+
     def get_sample(self):
         """Return a sample of the CSV file."""
         self._set_reader_engine().get_sample()
@@ -50,6 +55,8 @@ class CSVReader(CSVProperties):
         Returns:
             A Polars dataframe.
         """
+        if self.is_empty:
+            return self._return_empty_file_object(pl.DataFrame())
         return self._set_reader_engine().to_dataframe()
 
     def to_arrow_table(self):
@@ -58,6 +65,8 @@ class CSVReader(CSVProperties):
         Returns:
             A PyArrow table.
         """
+        if self.is_empty:
+            return self._return_empty_file_object(pl.DataFrame().to_arrow())
         return self._set_reader_engine().to_arrow_table()
 
     def to_dicts(self):
@@ -66,6 +75,8 @@ class CSVReader(CSVProperties):
         Returns:
             A list of dictionaries.
         """
+        if self.is_empty:
+            return self._return_empty_file_object(dict())
         return self._set_reader_engine().to_dicts()
 
     def query_data(self, sql_query):
@@ -82,6 +93,8 @@ class CSVReader(CSVProperties):
             query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
             dg.query_csv_data(query)
         """
+        if self.is_empty:
+            return self._return_empty_file_object(list())
         queries = DuckDBQueries(self.filepath)
         duckdb.sql(queries.import_csv_query(self.delimiter))
         return duckdb.sql(sql_query)
