@@ -127,8 +127,19 @@ class FileProperties:
 
     @property
     def is_empty(self):
-        """Check if the file is empty."""
+        """Check if the file is empty. Empty files have a size of 0 bytes."""
         return self.size_in_bytes == 0
+
+    @property
+    def is_blank(self):
+        """Check if the file is blank. Blank files contain only whitespace."""
+        # Read the file as text first
+        with open(self.filepath, 'r') as f:
+            # Remove whitespace, newlines, and other invisible characters
+            content = f.read().strip()
+            if not content:  # If file is completely empty
+                return True
+        return False
 
     @property
     def is_large(self):
@@ -229,7 +240,7 @@ class CSVProperties(FileProperties):
         """
         delimiter_candidates = self._get_most_common_non_alpha_numeric_character_from_string()
 
-        if self.is_empty:
+        if self.is_empty or self.is_blank:
             delimiter = self.DEFAULT_DELIMITER
         elif len(delimiter_candidates) == 0:
             delimiter = ' '
@@ -239,7 +250,7 @@ class CSVProperties(FileProperties):
 
     def _get_attributes(self):
         """Generate a dictionary of CSV attributes."""
-        if self.is_empty:
+        if self.is_empty or self.is_blank:
             attributes = self._return_empty_file_attributes()
         else:
             columns_list = self.first_row.split(self.delimiter)

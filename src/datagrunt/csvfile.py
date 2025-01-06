@@ -55,7 +55,7 @@ class CSVReader(CSVProperties):
         Returns:
             A Polars dataframe.
         """
-        if self.is_empty:
+        if self.is_empty or self.is_blank:
             return self._return_empty_file_object(pl.DataFrame())
         return self._set_reader_engine().to_dataframe()
 
@@ -75,7 +75,7 @@ class CSVReader(CSVProperties):
         Returns:
             A list of dictionaries.
         """
-        if self.is_empty:
+        if self.is_empty or self.is_blank:
             return self._return_empty_file_object(list())
         return self._set_reader_engine().to_dicts()
 
@@ -93,7 +93,7 @@ class CSVReader(CSVProperties):
             query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
             dg.query_csv_data(query)
         """
-        if self.is_empty:
+        if self.is_empty or self.is_blank:
             return self._return_empty_file_object(list())
         queries = DuckDBQueries(self.filepath)
         duckdb.sql(queries.import_csv_query(self.delimiter))
