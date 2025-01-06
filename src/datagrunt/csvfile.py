@@ -65,7 +65,7 @@ class CSVReader(CSVProperties):
         Returns:
             A PyArrow table.
         """
-        if self.is_empty:
+        if self.is_empty or self.is_blank:
             return self._return_empty_file_object(pl.DataFrame().to_arrow())
         return self._set_reader_engine().to_arrow_table()
 
