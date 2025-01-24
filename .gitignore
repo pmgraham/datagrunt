@@ -149,3 +149,4 @@ dev.py
 # Pycharm
 .idea/
 .replit
+deploy.sh
