@@ -1,4 +1,4 @@
-"""Module for reading CSV files and converting CSV files to different standard file formats."""
+"""Module for reading CSV files and converting to different in memory python objects."""
 
 # standard library
 
@@ -7,10 +7,10 @@ import duckdb
 import polars as pl
 
 # local libraries
-from .core.fileproperties import CSVProperties
-from .core.engines import CSVReaderDuckDBEngine, CSVReaderPolarsEngine
-from .core.engines import CSVWriterDuckDBEngine, CSVWriterPolarsEngine
-from .core.queries import DuckDBQueries
+from ..core import CSVProperties
+from ..core import CSVReaderDuckDBEngine, CSVReaderPolarsEngine
+from ..core import DuckDBQueries
+from ..core import show_large_file_warning
 
 class CSVReader(CSVProperties):
     """Class to unify the interface for reading CSV files."""
@@ -98,72 +98,3 @@ class CSVReader(CSVProperties):
         queries = DuckDBQueries(self.filepath)
         duckdb.sql(queries.import_csv_query(self.delimiter))
         return duckdb.sql(sql_query)
-
-class CSVWriter(CSVProperties):
-    """Class to unify the interface for converting CSV files to various other supported file types."""
-
-    WRITER_ENGINES = ['duckdb', 'polars']
-    VALUE_ERROR_MESSAGE = """Writer engine '{engine}' is not 'duckdb' or 'polars'. Pass either 'duckdb' or 'polars' as valid engine params."""
-
-    def __init__(self, filepath, engine='duckdb'):
-        """Initialize the CSV Writer class.
-
-        Args:
-            filepath (str): Path to the file to write.
-            engine (str, default 'duckdb'): Determines which writer engine class to instantiate.
-        """
-        super().__init__(filepath)
-        self.db_table = DuckDBQueries(self.filepath).database_table_name
-        self.engine = engine.lower().replace(' ', '')
-        if self.engine not in self.WRITER_ENGINES:
-            raise ValueError(self.VALUE_ERROR_MESSAGE.format(engine=self.engine))
-
-    def _set_writer_engine(self):
-        """Sets the CSV reader engine as either DuckDB or Polars.
-           Default engine is Polars.
-        """
-        if self.engine != 'polars':
-            engine = CSVWriterDuckDBEngine(self.filepath)
-        else:
-            engine = CSVWriterPolarsEngine(self.filepath)
-        return engine
-
-    def write_csv(self, out_filename=None):
-        """Query to export a DuckDB table to a CSV file.
-
-            Args:
-                out_filename str: The name of the output file.
-            """
-        return self._set_writer_engine().write_csv(out_filename)
-
-    def write_excel(self, out_filename=None):
-        """Query to export a DuckDB table to an Excel file.
-
-        Args:
-            out_filename str: The name of the output file.
-        """
-        return self._set_writer_engine().write_excel(out_filename)
-
-    def write_json(self, out_filename=None):
-        """Query to export a DuckDB table to a JSON file.
-
-        Args:
-            out_filename str: The name of the output file.
-        """
-        return self._set_writer_engine().write_json(out_filename)
-
-    def write_json_newline_delimited(self, out_filename=None):
-        """Query to export a DuckDB table to a JSON newline delimited file.
-
-        Args:
-            out_filename str: The name of the output file.
-        """
-        return self._set_writer_engine().write_json_newline_delimited(out_filename)
-
-    def write_parquet(self, out_filename=None):
-        """Query to export a DuckDB table to a Parquet file.
-
-        Args:
-            out_filename str: The name of the output file.
-        """
-        return self._set_writer_engine().write_parquet(out_filename)
