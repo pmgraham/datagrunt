@@ -10,7 +10,6 @@ import polars as pl
 from ..core import CSVProperties
 from ..core import CSVReaderDuckDBEngine, CSVReaderPolarsEngine
 from ..core import DuckDBQueries
-from ..core import show_large_file_warning
 
 class CSVReader(CSVProperties):
     """Class to unify the interface for reading CSV files."""
