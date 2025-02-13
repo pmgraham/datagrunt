@@ -1,6 +1,5 @@
 import pytest
 # from pathlib import Path
-import pandas as pd
 import polars as pl
 
 import sys
@@ -11,13 +10,12 @@ sys.path.append('../src/datagrunt')  # Add the parent directory to the search pa
 def sample_csv_path(tmp_path):
     """Create a sample CSV file for testing."""
     file_path = tmp_path / "test.csv"
-    data = {
+    df = pl.DataFrame({
         'name': ['John', 'Jane'],
         'age': [30, 25],
         'city': ['New York', 'Los Angeles']
-    }
-    df = pd.DataFrame(data)
-    df.to_csv(file_path, index=False)
+    })
+    df.write_csv(file_path)
     return str(file_path)
 
 @pytest.fixture
@@ -32,12 +30,11 @@ def large_csv_path(tmp_path):
     """Create a large CSV file for testing (>1GB)."""
     file_path = tmp_path / "large.csv"
     # Create a large DataFrame
-    data = {
-        'col1': range(1000000),
-        'col2': ['test' * 100] * 1000000
-    }
-    df = pd.DataFrame(data)
-    df.to_csv(file_path, index=False)
+    df = pl.DataFrame({
+        'col1': pl.Series(range(1000000)),
+        'col2': pl.Series(['test' * 100 for _ in range(1000000)])
+    })
+    df.write_csv(file_path)
     return str(file_path)
 
 @pytest.fixture
