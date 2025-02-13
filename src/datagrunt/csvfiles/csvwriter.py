@@ -1,4 +1,4 @@
-"""Module for reading CSV files and converting to different in memory python objects."""
+"""Module for writing CSV files and converting to different file formats."""
 
 # standard library
 
