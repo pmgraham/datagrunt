@@ -1,11 +1,11 @@
-import sys
-sys.path.append('../')  # Add the parent directory to the search path
-sys.path.append('../src/datagrunt')  # Add the parent directory to the search path
-
 import pytest
 from pathlib import Path
 import pandas as pd
 import polars as pl
+
+import sys
+sys.path.append('../')  # Add the parent directory to the search path
+sys.path.append('../src/datagrunt')  # Add the parent directory to the search path
 
 @pytest.fixture
 def sample_csv_path(tmp_path):
