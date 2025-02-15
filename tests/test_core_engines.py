@@ -59,15 +59,103 @@ class TestCSVReaderPolarsEngine:
         assert all(isinstance(d, dict) for d in dicts)
 
 class TestCSVWriterDuckDBEngine:
+
     def test_write_csv(self, sample_csv_path, tmp_path):
         engine = CSVWriterDuckDBEngine(sample_csv_path)
-        output_path = tmp_path / "output.csv"
+        output_path = tmp_path / "test.csv"
         engine.write_csv(str(output_path))
         assert output_path.exists()
 
+    def test_write_default_csv(self, sample_default_csv_path, tmp_path):
+        engine = CSVWriterDuckDBEngine(sample_default_csv_path)
+        output_path = tmp_path / engine.CSV_OUT_FILENAME
+        engine.write_csv()
+        assert output_path.exists()
+
+    def test_write_parquet(self, sample_csv_path, tmp_path):
+        output_path = tmp_path / "test.parquet"
+        engine = CSVWriterDuckDBEngine(sample_csv_path)
+        engine.write_parquet(output_path)
+
+        # Verify the file was created
+        df = pl.read_parquet(output_path)
+        assert len(df.columns) == 3
+        assert output_path.exists()
+
+    def test_write_json(self, sample_csv_path, tmp_path):
+        output_path = tmp_path / "test.json"
+        engine = CSVWriterDuckDBEngine(sample_csv_path)
+        engine.write_json(str(output_path))
+
+        # Verify the file was created
+        df = pl.read_json(output_path)
+        assert len(df.columns) == 3
+        assert output_path.exists()
+
+    def test_write_newline_delimited_json(self, sample_csv_path, tmp_path):
+        output_path = tmp_path / "test.jsonl"
+        engine = CSVWriterDuckDBEngine(sample_csv_path)
+        engine.write_json_newline_delimited(str(output_path))
+
+        # Verify the file was created
+        df = pl.read_ndjson(output_path)
+        assert len(df.columns) == 3
+        assert output_path.exists()
+
+    def test_write_excel(self, sample_csv_path, tmp_path):
+        output_path = tmp_path / "test.xlsx"
+        engine = CSVWriterDuckDBEngine(sample_csv_path)
+        engine.write_excel(str(output_path))
+
+        # Verify the file was created
+        df = pl.read_excel(output_path)
+        assert len(df.columns) == 3
+        assert output_path.exists()
+
 class TestCSVWriterPolarsEngine:
+
     def test_write_csv(self, sample_csv_path, tmp_path):
         engine = CSVWriterPolarsEngine(sample_csv_path)
-        output_path = tmp_path / "output.csv"
+        output_path = tmp_path / "test.csv"
         engine.write_csv(str(output_path))
+        assert output_path.exists()
+
+    def test_write_parquet(self, sample_csv_path, tmp_path):
+        output_path = tmp_path / "test.parquet"
+        engine = CSVWriterPolarsEngine(sample_csv_path)
+        engine.write_parquet(str(output_path))
+
+        # Verify the file was created
+        df = pl.read_parquet(output_path)
+        assert len(df.columns) == 3
+        assert output_path.exists()
+
+    def test_write_json(self, sample_csv_path, tmp_path):
+        output_path = tmp_path / "test.json"
+        engine = CSVWriterPolarsEngine(sample_csv_path)
+        engine.write_json(str(output_path))
+
+        # Verify the file was created
+        df = pl.read_json(output_path)
+        assert len(df.columns) == 3
+        assert output_path.exists()
+
+    def test_write_newline_delimited_json(self, sample_csv_path, tmp_path):
+        output_path = tmp_path / "test.jsonl"
+        engine = CSVWriterPolarsEngine(sample_csv_path)
+        engine.write_json_newline_delimited(str(output_path))
+
+        # Verify the file was created
+        df = pl.read_ndjson(output_path)
+        assert len(df.columns) == 3
+        assert output_path.exists()
+
+    def test_write_excel(self, sample_csv_path, tmp_path):
+        output_path = tmp_path / "test.xlsx"
+        engine = CSVWriterPolarsEngine(sample_csv_path)
+        engine.write_excel(str(output_path))
+
+        # Verify the file was created
+        df = pl.read_excel(output_path)
+        assert len(df.columns) == 3
         assert output_path.exists()
