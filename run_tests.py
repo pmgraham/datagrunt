@@ -1,15 +1,8 @@
-import pytest
+from pathlib import Path
 import sys
-
-def main():
-    """Run all tests."""
-    args = [
-        "-v",
-        "--cov=src/datagrunt",
-        "--cov-report=term-missing",
-        "tests/"
-    ]
-    return pytest.main(args)
+import subprocess
 
 if __name__ == "__main__":
-    sys.exit(main())
+    tests_dir = Path(__file__).parent / "tests"
+    test_script = tests_dir / "run_tests.py"
+    sys.exit(subprocess.call([sys.executable, str(test_script)]))
