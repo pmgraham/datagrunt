@@ -1,4 +1,3 @@
-import pytest
 from src.datagrunt.core.fileproperties import FileProperties, CSVProperties
 
 class TestFileProperties:
