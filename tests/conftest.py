@@ -171,3 +171,60 @@ def cleanup_files():
                 os.remove(file)
         except Exception as e:
             print(f"Warning: Could not remove {file}: {e}")
+
+# Fixture to create temporary test files
+@pytest.fixture
+def temp_files(tmp_path):
+    # Create empty CSV file
+    empty_csv = tmp_path / "empty.csv"
+    empty_csv.write_text("")
+
+    # Create CSV with only whitespace
+    blank_csv = tmp_path / "blank.csv"
+    blank_csv.write_text("   \n   \n")
+
+    # Create normal CSV file
+    normal_csv = tmp_path / "test.csv"
+    normal_csv.write_text("name,age,city\nJohn,30,New York\nJane,25,London")
+
+    # Create tab-separated CSV
+    tab_csv = tmp_path / "tab.csv"
+    tab_csv.write_text("name\tage\tcity\nJohn\t30\tNew York")
+
+    # Create semicolon-separated CSV
+    semicolon_csv = tmp_path / "semicolon.csv"
+    semicolon_csv.write_text("name;age;city\nJohn;30;New York")
+
+    # Create large CSV file (>1GB) - simulated with property override
+    large_csv = tmp_path / "large.csv"
+    large_csv.write_text("header1,header2\ndata1,data2")
+
+    return {
+        'empty': empty_csv,
+        'blank': blank_csv,
+        'normal': normal_csv,
+        'tab': tab_csv,
+        'semicolon': semicolon_csv,
+        'large': large_csv
+    }
+
+@pytest.fixture
+def sample_csv():
+    """Create a sample CSV file for testing."""
+    content = "name,age,city\nJohn,30,New York\nJane,25,Los Angeles"
+    filepath = "test_sample.csv"
+    with open(filepath, "w") as f:
+        f.write(content)
+    yield filepath
+    # Cleanup after tests
+    os.remove(filepath)
+
+@pytest.fixture
+def empty_csv():
+    """Create an empty CSV file for testing."""
+    filepath = "test_empty.csv"
+    with open(filepath, "w") as f:
+        f.write("")
+    yield filepath
+    # Cleanup after tests
+    os.remove(filepath)
