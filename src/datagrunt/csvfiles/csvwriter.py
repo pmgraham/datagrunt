@@ -5,9 +5,9 @@
 # third party libraries
 
 # local libraries
-from ..core import CSVProperties
-from ..core import CSVWriterDuckDBEngine, CSVWriterPolarsEngine
-from ..core import DuckDBQueries
+from src.datagrunt.core import CSVProperties
+from src.datagrunt.core import CSVWriterDuckDBEngine, CSVWriterPolarsEngine
+from src.datagrunt.core import DuckDBQueries
 
 class CSVWriter(CSVProperties):
     """Class to unify the interface for converting CSV files to various other supported file types."""

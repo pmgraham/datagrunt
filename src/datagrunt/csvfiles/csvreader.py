@@ -7,9 +7,10 @@ import duckdb
 import polars as pl
 
 # local libraries
-from ..core import CSVProperties
-from ..core import CSVReaderDuckDBEngine, CSVReaderPolarsEngine
-from ..core import DuckDBQueries
+
+from src.datagrunt.core import CSVProperties
+from src.datagrunt.core import CSVReaderDuckDBEngine, CSVReaderPolarsEngine
+from src.datagrunt.core import DuckDBQueries
 
 class CSVReader(CSVProperties):
     """Class to unify the interface for reading CSV files."""
