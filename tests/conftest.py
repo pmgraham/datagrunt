@@ -5,6 +5,22 @@ import sys
 sys.path.append('../')  # Add the parent directory to the search path
 sys.path.append('../src/datagrunt')  # Add the parent directory to the search path
 
+# Dummy CSV data for testing
+CSV_DATA = """col1,col2,col3
+1,a,True
+2,b,False
+3,c,True"""
+
+EMPTY_CSV_DATA = ""
+
+BLANK_CSV_DATA = "   "
+
+CSV_HEADERS = ['name', 'age', 'city']
+CSV_ROWS = [
+    ['John', '30', 'New York'],
+    ['Jane', '25', 'Los Angeles']
+]
+
 @pytest.fixture
 def sample_csv_path(tmp_path):
     """Create a sample CSV file for testing."""
@@ -228,3 +244,28 @@ def empty_csv():
     yield filepath
     # Cleanup after tests
     os.remove(filepath)
+
+@pytest.fixture
+def temp_csv_file(tmp_path):
+    """Fixture to create a temporary CSV file."""
+    file_path = tmp_path / "test.csv"
+    with open(file_path, "w") as f:
+        f.write(CSV_DATA)
+    return str(file_path)
+
+
+@pytest.fixture
+def temp_empty_csv_file(tmp_path):
+    """Fixture to create a temporary empty CSV file."""
+    file_path = tmp_path / "empty.csv"
+    with open(file_path, "w") as f:
+        f.write(EMPTY_CSV_DATA)
+    return str(file_path)
+
+@pytest.fixture
+def temp_blank_csv_file(tmp_path):
+    """Fixture to create a temporary blank CSV file."""
+    file_path = tmp_path / "blank.csv"
+    with open(file_path, "w") as f:
+        f.write(BLANK_CSV_DATA)
+    return str(file_path)
