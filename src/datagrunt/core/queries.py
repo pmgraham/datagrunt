@@ -44,7 +44,8 @@ class DuckDBQueries(DuckDBDatabase):
                             delim='{delimiter}',
                             header=true,
                             null_padding=true,
-                            all_varchar=True);
+                            all_varchar=True,
+                            strict_mode=false);
             """
 
     def select_from_duckdb_table(self):
