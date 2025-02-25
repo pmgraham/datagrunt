@@ -5,8 +5,8 @@
 # third party libraries
 
 # local libraries
-from .databases import DuckDBDatabase
-from .fileproperties import FileProperties
+from src.datagrunt.core.databases import DuckDBDatabase
+from src.datagrunt.core.fileproperties import FileProperties
 
 class DuckDBQueries(DuckDBDatabase):
     """Class to store DuckDB database queries and query strings."""
