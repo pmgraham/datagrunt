@@ -1,22 +1,22 @@
 import pytest
 import sys
-sys.path.append('../')  # Add the parent directory to the search path
-sys.path.append('../src/datagrunt')  # Add the parent directory to the search path
+from pathlib import Path
+
+def main():
+    """Run all tests."""
+    # Get the root directory (parent of tests directory)
+    root_dir = Path(__file__).parent.parent
+
+    # Add the root directory to Python path
+    sys.path.insert(0, str(root_dir))
+
+    args = [
+        "-v",
+        f"--cov={root_dir}/src/datagrunt",
+        "--cov-report=term-missing",
+        str(root_dir / "tests")
+    ]
+    return pytest.main(args)
 
 if __name__ == "__main__":
-    # sys.exit(pytest.main(["-v", "--cov=src.datagrunt", "--cov-report=term-missing", "--cov-fail-under=90", "."]))
-    print("Python version:", sys.version)
-    print("Pytest version:", pytest.__version__)
-    
-    try:
-        import pytest_cov
-        print("Pytest-cov version:", pytest_cov.__version__)
-    except ImportError:
-        print("Pytest-cov not found!")
-
-    args = ["-v", "--cov=src.datagrunt", "--cov-report=term-missing", "."]
-    print("Running pytest with args:", args)
-    
-    exit_code = pytest.main(args)
-    print("Pytest exit code:", exit_code)
-    sys.exit(exit_code)
+    sys.exit(main())
