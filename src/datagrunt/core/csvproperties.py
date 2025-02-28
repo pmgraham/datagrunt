@@ -11,6 +11,69 @@ import re
 # local libraries
 from src.datagrunt.core.fileproperties import FileProperties
 
+class CSVFormatter(FileProperties):
+    """Class to format CSV files."""
+
+    def normalize_single_column_name(self, column_name):
+        """Normalize a single column name by converting to lowercase, replacing spaces and special
+        characters with underscores, and removing extra underscores.
+
+        Args:
+            column_name (str): The column name to normalize
+
+        Returns:
+            str: The normalized column name
+        """
+        name = column_name.lower()
+
+        # Replace special characters and spaces with underscore
+        name = re.sub(r'[^a-z0-9]+', '_', name)
+
+        # Remove leading and trailing underscores
+        name = name.strip('_')
+
+        # Replace multiple underscores with single underscore
+        name = re.sub(r'_+', '_', name)
+
+        return name
+
+    def make_unique_column_names(self, columns_list):
+        """
+        Make unique column names by appending a number to duplicate names.
+
+        Args:
+            columns (list): List of column names to make unique
+
+        Returns:
+            list: List of unique column names
+        """
+        name_count = {}
+        unique_names = []
+
+        for name in columns_list:
+            if name in name_count:
+                name_count[name] += 1
+                unique_names.append(f"{name}_{name_count[name]}")
+            else:
+                name_count[name] = 0
+                unique_names.append(name)
+
+        return unique_names
+
+    def normalize_column_names(self, columns):
+        """
+        Normalize column names by converting to lowercase, replacing spaces and special
+        characters with underscores, and removing extra underscores.
+
+        Args:
+            columns (list): List of column names to normalize
+
+        Returns:
+            list: List of normalized column names
+        """
+        normalized_columns = [self.normalize_single_column_name(col) for col in columns]
+        return self.make_unique_column_names(normalized_columns)
+
 class CSVProperties(FileProperties):
     """Class for parsing CSV files. Mostly determining the delimiter."""
 
@@ -37,6 +100,7 @@ class CSVProperties(FileProperties):
         super().__init__(filepath)
         self.first_row = self._get_first_row_from_file()
         self.delimiter = self._infer_csv_file_delimiter()
+        self.formatter = CSVFormatter(filepath)
         if not self.is_csv:
             raise ValueError(
                 f"File extension '{self.extension_string}' is not a valid CSV file extension."
@@ -114,7 +178,8 @@ class CSVProperties(FileProperties):
             attributes = self._return_empty_file_attributes()
         else:
             columns_list = self.first_row.split(self.delimiter)
-            columns = {c: 'VARCHAR' for c in columns_list}
+            normalized_columns_list = self.formatter.normalize_column_names(columns_list)
+            columns = {c: 'VARCHAR' for c in normalized_columns_list}
             with open(self.filepath, 'r', encoding=self.DEFAULT_ENCODING) as csvfile:
                 # Sniff the file to detect parameters
                 dialect = csv.Sniffer().sniff(csvfile.read(self.CSV_SNIFF_SAMPLE_ROWS))
@@ -130,8 +195,11 @@ class CSVProperties(FileProperties):
                         'columns_schema': columns,
                         'columns_original_format': self.first_row,
                         'columns_list': columns_list,
+                        'columns_list_normalized': normalized_columns_list,
+                        'columns_list_normalized_string': ", ".join(normalized_columns_list),
                         'columns_string': ", ".join(columns_list),
                         'columns_byte_string': ", ".join(columns_list).encode(),
+                        'columns_list_normalized_byte_string': ", ".join(normalized_columns_list).encode(),
                         'column_count': len(columns_list)
                     }
 
@@ -155,14 +223,29 @@ class CSVProperties(FileProperties):
         return self._get_attributes()['columns_list']
 
     @property
+    def columns_normalized(self):
+        """Return the normalized schema of the columns in the CSV file."""
+        return self._get_attributes()['columns_list_normalized']
+
+    @property
     def columns_string(self):
         """Return the first row of a CSV file as a string."""
         return self._get_attributes()['columns_string']
 
     @property
+    def columns_normalized_string(self):
+        """Return the normalized schema of the columns in the CSV file as a string."""
+        return self._get_attributes()['columns_list_normalized_string']
+
+    @property
     def columns_byte_string(self):
         """Return the first row of the CSV file as bytes."""
         return self._get_attributes()['columns_byte_string']
+
+    @property
+    def columns_normalized_byte_string(self):
+        """Return the normalized schema of the columns in the CSV file as bytes."""
+        return self._get_attributes()['columns_list_normalized_byte_string']
 
     @property
     def column_count(self):
