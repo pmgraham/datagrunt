@@ -1,17 +1,18 @@
-from .databases import DuckDBDatabase
-from .engines import (CSVReaderDuckDBEngine,
+from src.datagrunt.core.databases import DuckDBDatabase
+from src.datagrunt.core.engines import (CSVReaderDuckDBEngine,
                       CSVReaderPolarsEngine,
                       CSVWriterDuckDBEngine,
                       CSVWriterPolarsEngine
                     )
-from .fileproperties import FileProperties, CSVProperties
-from .logger import (show_warning,
+from src.datagrunt.core.fileproperties import FileProperties
+from src.datagrunt.core.csvproperties import CSVProperties
+from src.datagrunt.core.logger import (show_warning,
                      show_info_message,
                      show_large_file_warning,
                      duckdb_query_error,
                      show_dataframe_sample
                     )
-from .queries import DuckDBQueries
+from src.datagrunt.core.queries import DuckDBQueries
 
 __all__ = ['DuckDBDatabase',
            'DuckDBQueries',

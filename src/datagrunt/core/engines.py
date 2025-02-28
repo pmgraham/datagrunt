@@ -7,7 +7,7 @@ import duckdb
 import polars as pl
 
 # local libraries
-from src.datagrunt.core.fileproperties import CSVProperties
+from src.datagrunt.core.csvproperties import CSVProperties
 from src.datagrunt.core.queries import DuckDBQueries
 from src.datagrunt.core.logger import show_large_file_warning, show_dataframe_sample
 
@@ -123,7 +123,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
         """
         super().__init__(filepath)
         self.queries = DuckDBQueries(self.filepath)
-    
+
     def _set_out_filename(self, default_filename, out_filename=None):
         """Evaluate if a filename is passed in and if not, return default filename."""
         if out_filename:
