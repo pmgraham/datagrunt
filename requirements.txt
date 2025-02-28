@@ -1,4 +1,4 @@
 duckdb==1.*
-polars==1.5.*
+polars==1.*
 pyarrow==19.*
-XlsxWriter==3.2.*
+XlsxWriter==3.*
