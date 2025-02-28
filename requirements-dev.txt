@@ -1,7 +1,7 @@
-duckdb==1.*
-polars==1.*
-pyarrow==19.*
-XlsxWriter==3.*
-pytest==8.*
-pytest-cov==6.*
-fastexcel==0.*
+duckdb>=1.*
+polars>=1.*
+pyarrow>=19.*
+XlsxWriter>=3.*
+pytest>=8.*
+pytest-cov>=6.*
+fastexcel>=0.*
