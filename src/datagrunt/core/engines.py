@@ -119,7 +119,6 @@ class CSVReaderPolarsEngine(CSVProperties):
 
     def get_sample(self, normalize_columns=False):
         """Return a sample of the CSV file."""
-        # show_dataframe_sample(self._create_dataframe_sample(normalize_columns))
         df = self._create_dataframe_sample(normalize_columns)
         print(df)
 
