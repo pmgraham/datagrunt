@@ -16,7 +16,8 @@ class CSVWriter(CSVProperties):
     """Class to unify the interface for converting CSV files to various other supported file types."""
 
     WRITER_ENGINES = ['duckdb', 'polars']
-    VALUE_ERROR_MESSAGE = """Writer engine '{engine}' is not 'duckdb' or 'polars'. Pass either 'duckdb' or 'polars' as valid engine params."""
+    VALUE_ERROR_MESSAGE = """Writer engine '{engine}' is not 'duckdb' or 'polars'. Pass either 'duckdb'
+    or 'polars' as valid engine params."""
 
     def __init__(self, filepath, engine='duckdb'):
         """Initialize the CSV Writer class.
