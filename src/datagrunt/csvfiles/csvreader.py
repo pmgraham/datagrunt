@@ -51,7 +51,7 @@ class CSVReader(CSVProperties):
         """Return a sample of the CSV file."""
         self._set_reader_engine().get_sample()
 
-    def to_dataframe(self):
+    def to_dataframe(self, normalize_columns=False):
         """Converts CSV to a Polars dataframe.
 
         Returns:
@@ -59,7 +59,10 @@ class CSVReader(CSVProperties):
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(pl.DataFrame())
-        return self._set_reader_engine().to_dataframe()
+        df = self._set_reader_engine().to_dataframe()
+        if normalize_columns:
+            df = df.rename(self.columns_to_normalized_mapping)
+        return df
 
     def to_arrow_table(self):
         """Converts CSV to a Polars dataframe.
