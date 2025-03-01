@@ -8,9 +8,11 @@ from src.datagrunt.core.engines import (
     CSVWriterDuckDBEngine,
     CSVWriterPolarsEngine
 )
+from unittest.mock import Mock
 
 class TestCSVReaderDuckDBEngine:
     """Test suite for CSVReaderDuckDBEngine"""
+
 
     def test_init(self, sample_csv_engines):
         reader = CSVReaderDuckDBEngine(sample_csv_engines)
@@ -160,6 +162,39 @@ class TestCSVReaderPolarsEngine:
 class TestCSVWriterDuckDBEngine:
     """Test suite for CSVWriterDuckDBEngine"""
 
+    def test_db_table_property(self, sample_csv_engines):
+        # Arrange
+        mock_queries = Mock()
+        mock_queries.database_table_name = "testengines"
+
+        engine = CSVWriterDuckDBEngine(sample_csv_engines)
+        engine.queries = mock_queries  # Set the mocked queries object
+
+        # Act
+        result = engine.db_table
+
+        # Assert
+        assert result == "testengines"
+        assert result == engine.queries.database_table_name
+
+    def test_set_out_filename(self, sample_csv_engines):
+        # Arrange
+        engine = CSVWriterDuckDBEngine(sample_csv_engines)
+        default_filename = "default.csv"
+        custom_filename = "custom.csv"
+
+        # Test case 1: When out_filename is provided
+        result1 = engine._set_out_filename(default_filename, custom_filename)
+        assert result1 == custom_filename
+
+        # Test case 2: When out_filename is None
+        result2 = engine._set_out_filename(default_filename)
+        assert result2 == default_filename
+
+        # Test case 3: When out_filename is empty string
+        result3 = engine._set_out_filename(default_filename, "")
+        assert result3 == default_filename
+
     def test_write_csv(self, sample_csv_engines, tmp_path):
         writer = CSVWriterDuckDBEngine(sample_csv_engines)
         out_file = tmp_path / "output.csv"
@@ -189,6 +224,24 @@ class TestCSVWriterDuckDBEngine:
 
 class TestCSVWriterPolarsEngine:
     """Test suite for CSVWriterPolarsEngine"""
+
+    def test_set_out_filename(self, sample_csv_engines):
+        # Arrange
+        engine = CSVWriterPolarsEngine(sample_csv_engines)
+        default_filename = "default.csv"
+        custom_filename = "custom.csv"
+
+        # Test case 1: When out_filename is provided
+        result1 = engine._set_out_filename(default_filename, custom_filename)
+        assert result1 == custom_filename
+
+        # Test case 2: When out_filename is None
+        result2 = engine._set_out_filename(default_filename)
+        assert result2 == default_filename
+
+        # Test case 3: When out_filename is empty string
+        result3 = engine._set_out_filename(default_filename, "")
+        assert result3 == default_filename
 
     def test_write_csv(self, sample_csv_engines, tmp_path):
         writer = CSVWriterPolarsEngine(sample_csv_engines)
