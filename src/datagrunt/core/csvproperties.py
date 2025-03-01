@@ -32,6 +32,8 @@ class CSVFormatter(FileProperties):
         name = re.sub(r'[^a-z0-9]+', '_', name)
         name = name.strip('_')
         name = re.sub(r'_+', '_', name)
+        if name and name[0].isdigit():
+            name = f'_{name}'
         return name
 
     def make_unique_column_names(self, columns_list):
