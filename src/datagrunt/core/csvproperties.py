@@ -14,6 +14,9 @@ from src.datagrunt.core.fileproperties import FileProperties
 class CSVFormatter(FileProperties):
     """Class to format CSV files."""
 
+    SPECIAL_CHARS_PATTERN = re.compile(r'[^a-z0-9]+')
+    MULTI_UNDERSCORE_PATTERN = re.compile(r'_+')
+
     def normalize_single_column_name(self, column_name):
         """Normalize a single column name by converting to lowercase, replacing spaces and special
         characters with underscores, and removing extra underscores.
@@ -21,6 +24,7 @@ class CSVFormatter(FileProperties):
         Replace special characters and spaces with underscore
         Remove leading and trailing underscores
         Replace multiple underscores with single underscore
+        Add a leading underscore if the name starts with a digit
 
         Args:
             column_name (str): The column name to normalize
@@ -29,12 +33,10 @@ class CSVFormatter(FileProperties):
             str: The normalized column name
         """
         name = column_name.lower()
-        name = re.sub(r'[^a-z0-9]+', '_', name)
+        name = self.SPECIAL_CHARS_PATTERN.sub('_', name)
         name = name.strip('_')
-        name = re.sub(r'_+', '_', name)
-        if name and name[0].isdigit():
-            name = f'_{name}'
-        return name
+        name = self.MULTI_UNDERSCORE_PATTERN.sub('_', name)
+        return f'_{name}' if name and name[0].isdigit() else name
 
     def make_unique_column_names(self, columns_list):
         """
