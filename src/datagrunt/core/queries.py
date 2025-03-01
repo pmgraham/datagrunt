@@ -160,3 +160,11 @@ class DuckDBQueries(DuckDBDatabase):
         """
         duckdb.sql(self.import_csv_query())
         return duckdb.sql(sql_query).pl()
+
+    def create_table(self, normalize_columns=False):
+        """Create a DuckDB table from the CSV file."""
+        if normalize_columns:
+            self.update_and_normalize_column_names()
+        else:
+            duckdb.sql(self.import_csv_query())
+        return duckdb.sql(self.select_from_duckdb_table()).execute()
