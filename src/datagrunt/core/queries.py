@@ -157,13 +157,13 @@ class DuckDBQueries(DuckDBDatabase):
         return duckdb.sql(self.select_from_duckdb_table()).execute()
 
     def sql_query_to_dataframe(self, sql_query, normalize_columns=False):
-        """Query to convert a SQL query to a Pandas DataFrame.
+        """Query to convert a SQL query to a Polars DataFrame.
 
         Args:
             sql_query (str): The SQL query to execute.
 
         Returns:
-            pandas.DataFrame: The resulting DataFrame.
+            polars.DataFrame: The resulting DataFrame.
         """
         self.create_table(normalize_columns)
         return duckdb.sql(sql_query).pl()
