@@ -220,12 +220,12 @@ class CSVProperties(FileProperties):
 
     @property
     def columns(self):
-        """Return the schema of the columns in the CSV file."""
+        """Return the columns in the CSV file."""
         return self._get_attributes()['columns_list']
 
     @property
     def columns_normalized(self):
-        """Return the normalized schema of the columns in the CSV file."""
+        """Return the normalized column names in the CSV file."""
         return self._get_attributes()['columns_list_normalized']
 
     @property
@@ -235,7 +235,7 @@ class CSVProperties(FileProperties):
 
     @property
     def columns_normalized_string(self):
-        """Return the normalized schema of the columns in the CSV file as a string."""
+        """Return the normalized columns in the CSV file as a string."""
         return self._get_attributes()['columns_list_normalized_string']
 
     @property
