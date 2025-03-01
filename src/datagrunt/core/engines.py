@@ -9,7 +9,6 @@ import polars as pl
 # local libraries
 from src.datagrunt.core.csvproperties import CSVProperties
 from src.datagrunt.core.queries import DuckDBQueries
-from src.datagrunt.core.logger import show_large_file_warning, show_dataframe_sample
 
 class CSVReaderDuckDBEngine(CSVProperties):
     """Class to read CSV files and convert CSV files powered by DuckDB."""
