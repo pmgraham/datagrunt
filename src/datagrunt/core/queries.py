@@ -6,7 +6,7 @@
 
 # local libraries
 from src.datagrunt.core.databases import DuckDBDatabase
-from src.datagrunt.core.fileproperties import FileProperties
+from src.datagrunt.core.csvproperties import CSVProperties
 
 class DuckDBQueries(DuckDBDatabase):
     """Class to store DuckDB database queries and query strings."""
@@ -19,7 +19,8 @@ class DuckDBQueries(DuckDBDatabase):
             filepath (str): Path to the file.
         """
         super().__init__(filepath)
-        self.export_properties = FileProperties(self.filepath)
+        self.export_properties = CSVProperties(self.filepath)
+        self.delimiter = self.export_properties.delimiter
 
     def _set_out_filename(self, default_filename, out_filename=None):
         """Evaluate if a filename is passed in and if not, return default filename."""
@@ -29,7 +30,7 @@ class DuckDBQueries(DuckDBDatabase):
             filename = default_filename
         return filename
 
-    def import_csv_query(self, delimiter):
+    def import_csv_query(self):
         """Query to import a CSV file into a DuckDB table.
 
         Args:
@@ -41,14 +42,14 @@ class DuckDBQueries(DuckDBDatabase):
             SELECT *
             FROM read_csv('{self.filepath}',
                             auto_detect=true,
-                            delim='{delimiter}',
+                            delim='{self.delimiter}',
                             header=true,
                             null_padding=true,
                             all_varchar=True,
                             strict_mode=false);
             """
 
-    def import_csv_query_normalize_columns(self, delimiter):
+    def import_csv_query_normalize_columns(self):
         """Query to import a CSV file into a DuckDB table and normalize column names.
 
         Args:
@@ -60,7 +61,7 @@ class DuckDBQueries(DuckDBDatabase):
             SELECT *
             FROM read_csv('{self.filepath}',
                             auto_detect=true,
-                            delim='{delimiter}',
+                            delim='{self.delimiter}',
                             header=true,
                             null_padding=true,
                             all_varchar=True,

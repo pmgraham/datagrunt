@@ -47,9 +47,9 @@ class CSVReader(CSVProperties):
         """Return an empty file object."""
         return object
 
-    def get_sample(self):
+    def get_sample(self, normalize_columns=False):
         """Return a sample of the CSV file."""
-        self._set_reader_engine().get_sample()
+        self._set_reader_engine().get_sample(normalize_columns)
 
     def to_dataframe(self, normalize_columns=False):
         """Converts CSV to a Polars dataframe.
@@ -59,12 +59,9 @@ class CSVReader(CSVProperties):
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(pl.DataFrame())
-        df = self._set_reader_engine().to_dataframe()
-        if normalize_columns:
-            df = df.rename(self.columns_to_normalized_mapping)
-        return df
+        return self._set_reader_engine().to_dataframe(normalize_columns)
 
-    def to_arrow_table(self):
+    def to_arrow_table(self, normalize_columns=False):
         """Converts CSV to a Polars dataframe.
 
         Returns:
@@ -72,9 +69,9 @@ class CSVReader(CSVProperties):
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(pl.DataFrame().to_arrow())
-        return self._set_reader_engine().to_arrow_table()
+        return self._set_reader_engine().to_arrow_table(normalize_columns)
 
-    def to_dicts(self):
+    def to_dicts(self, normalize_columns=False):
         """Converts CSV to a Polars dataframe.
 
         Returns:
@@ -82,9 +79,9 @@ class CSVReader(CSVProperties):
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(list())
-        return self._set_reader_engine().to_dicts()
+        return self._set_reader_engine().to_dicts(normalize_columns)
 
-    def query_data(self, sql_query):
+    def query_data(self, sql_query, normalize_columns=False):
         """Queries as CSV file after importing into DuckDB.
 
         Args:
@@ -101,5 +98,8 @@ class CSVReader(CSVProperties):
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(list())
         queries = DuckDBQueries(self.filepath)
-        duckdb.sql(queries.import_csv_query(self.delimiter))
+        if normalize_columns:
+            duckdb.sql(queries.import_csv_query_normalize_columns())
+        else:
+            duckdb.sql(queries.import_csv_query())
         return duckdb.sql(sql_query)
