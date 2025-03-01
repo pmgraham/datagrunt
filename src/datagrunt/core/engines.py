@@ -163,11 +163,7 @@ class CSVReaderPolarsEngine(CSVProperties):
             query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
             dg.query_csv_data(query)
         """
-        if normalize_columns:
-            df = self.queries.update_column_names_dataframe_query(sql_query)
-        else:
-            df = self.queries.sql_query_to_dataframe(sql_query)
-        return df
+        return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
 
 class CSVWriterDuckDBEngine(CSVProperties):
     """Class to convert CSV files to various other supported file types powered by DuckDB."""
@@ -210,7 +206,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
                 out_filename str: The name of the output file.
             """
         filename = self._set_out_filename(self.CSV_OUT_FILENAME, out_filename)
-        CSVReaderDuckDBEngine(self.filepath).create_table(normalize_columns)
+        self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_csv_query(filename))
 
     def write_excel(self, out_filename=None, normalize_columns=False):
@@ -220,7 +216,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
             out_filename (optional, str): The name of the output file.
         """
         filename = self._set_out_filename(self.EXCEL_OUT_FILENAME, out_filename)
-        CSVReaderDuckDBEngine(self.filepath).create_table(normalize_columns)
+        self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_excel_query(filename))
 
     def write_json(self, out_filename=None, normalize_columns=False):
@@ -230,7 +226,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
             out_filename (optional, str): The name of the output file.
         """
         filename = self._set_out_filename(self.JSON_OUT_FILENAME, out_filename)
-        CSVReaderDuckDBEngine(self.filepath).create_table(normalize_columns)
+        self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_json_query(filename))
 
     def write_json_newline_delimited(self, out_filename=None, normalize_columns=False):
@@ -240,7 +236,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
             out_filename (optional, str): The name of the output file.
         """
         filename = self._set_out_filename(self.JSON_NEWLINE_OUT_FILENAME, out_filename)
-        CSVReaderDuckDBEngine(self.filepath).create_table(normalize_columns)
+        self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_json_newline_delimited_query(filename))
 
     def write_parquet(self, out_filename=None, normalize_columns=False):
@@ -250,7 +246,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
             out_filename (optional, str): The name of the output file.
         """
         filename = self._set_out_filename(self.PARQUET_OUT_FILENAME, out_filename)
-        CSVReaderDuckDBEngine(self.filepath).create_table(normalize_columns)
+        self.queries.create_table(normalize_columns)
         duckdb.execute(self.queries.export_parquet_query(filename))
 
 class CSVWriterPolarsEngine(CSVProperties):

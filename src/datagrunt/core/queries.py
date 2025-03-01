@@ -6,7 +6,6 @@
 import duckdb
 
 # local libraries
-from venv import create
 from src.datagrunt.core.databases import DuckDBDatabase
 from src.datagrunt.core.csvproperties import CSVProperties
 
@@ -149,7 +148,15 @@ class DuckDBQueries(DuckDBDatabase):
             duckdb.sql(sql_string)
         return duckdb.sql(sql_query).pl()
 
-    def sql_query_to_dataframe(self, sql_query):
+    def create_table(self, normalize_columns=False):
+        """Create a DuckDB table from the CSV file."""
+        if normalize_columns:
+            self.update_and_normalize_column_names()
+        else:
+            duckdb.sql(self.import_csv_query())
+        return duckdb.sql(self.select_from_duckdb_table()).execute()
+
+    def sql_query_to_dataframe(self, sql_query, normalize_columns=False):
         """Query to convert a SQL query to a Pandas DataFrame.
 
         Args:
@@ -158,13 +165,5 @@ class DuckDBQueries(DuckDBDatabase):
         Returns:
             pandas.DataFrame: The resulting DataFrame.
         """
-        duckdb.sql(self.import_csv_query())
+        self.create_table(normalize_columns)
         return duckdb.sql(sql_query).pl()
-
-    def create_table(self, normalize_columns=False):
-        """Create a DuckDB table from the CSV file."""
-        if normalize_columns:
-            self.update_and_normalize_column_names()
-        else:
-            duckdb.sql(self.import_csv_query())
-        return duckdb.sql(self.select_from_duckdb_table()).execute()
