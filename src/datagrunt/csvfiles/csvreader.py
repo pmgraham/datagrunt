@@ -17,7 +17,8 @@ class CSVReader(CSVProperties):
     """Class to unify the interface for reading CSV files."""
 
     READER_ENGINES = ['duckdb', 'polars']
-    VALUE_ERROR_MESSAGE = """Reader engine '{engine}' is not 'duckdb' or 'polars'. Pass either 'duckdb' or 'polars' as valid engine params."""
+    VALUE_ERROR_MESSAGE = """Reader engine '{engine}' is not 'duckdb' or 'polars'. Pass either 'duckdb'
+    or 'polars' as valid engine params."""
 
     def __init__(self, filepath, engine='polars'):
         """Initialize the CSV Reader class.
@@ -61,7 +62,7 @@ class CSVReader(CSVProperties):
         return self._set_reader_engine().to_dataframe(normalize_columns)
 
     def to_arrow_table(self, normalize_columns=False):
-        """Converts CSV to a Polars dataframe.
+        """Converts CSV to a PyArrow table.
 
         Returns:
             A PyArrow table.
@@ -71,7 +72,7 @@ class CSVReader(CSVProperties):
         return self._set_reader_engine().to_arrow_table(normalize_columns)
 
     def to_dicts(self, normalize_columns=False):
-        """Converts CSV to a Polars dataframe.
+        """Converts CSV to a list of dictionaries.
 
         Returns:
             A list of dictionaries.
@@ -93,6 +94,10 @@ class CSVReader(CSVProperties):
             dg = CSVReader('myfile.csv')
             query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
             dg.query_csv_data(query)
+
+        If you set normalize_columns=True, the column names will be normalized to lowercase
+        and spaces will be replaced with underscores, and you must reference the new column names
+        in your query.
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(list())
