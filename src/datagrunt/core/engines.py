@@ -29,17 +29,9 @@ class CSVReaderDuckDBEngine(CSVProperties):
         """Return the DuckDB table."""
         return self.queries.database_table_name
 
-    def create_table(self, normalize_columns=False):
-        """Create a DuckDB table from the CSV file."""
-        if normalize_columns:
-            duckdb.sql(self.queries.import_csv_query_normalize_columns())
-        else:
-            duckdb.sql(self.queries.import_csv_query())
-        return duckdb.sql(self.queries.select_from_duckdb_table()).execute()
-
     def get_sample(self, normalize_columns=False):
         """Return a sample of the CSV file."""
-        self.create_table(normalize_columns).show()
+        self.queries.create_table(normalize_columns).show()
 
     def to_dataframe(self, normalize_columns=False):
         """Converts CSV to a Polars dataframe.
@@ -49,7 +41,7 @@ class CSVReaderDuckDBEngine(CSVProperties):
         """
         if self.is_large:
             show_large_file_warning()
-        return self.create_table(normalize_columns).pl()
+        return self.queries.create_table(normalize_columns).pl()
 
     def to_arrow_table(self, normalize_columns=False):
         """Converts CSV to a PyArrow table.
@@ -57,7 +49,7 @@ class CSVReaderDuckDBEngine(CSVProperties):
         Returns:
             A PyArrow table.
         """
-        return self.create_table(normalize_columns).arrow()
+        return self.queries.create_table(normalize_columns).arrow()
 
     def to_dicts(self, normalize_columns=False):
         """Converts CSV to a list of Python dictionaries.
@@ -68,8 +60,40 @@ class CSVReaderDuckDBEngine(CSVProperties):
         dicts = self.to_dataframe(normalize_columns).to_dicts()
         return dicts
 
+    def query_data(self, sql_query, normalize_columns=False):
+            """Queries as CSV file after importing into DuckDB.
+
+            Args:
+                sql_query (str): Query to run against DuckDB.
+
+            Returns:
+                A DuckDB DuckDBPyRelation with the query results.
+
+            Example if DuckDB Engine:
+                dg = CSVReader('myfile.csv')
+                query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
+                dg.query_csv_data(query)
+            """
+            self.queries.create_table(normalize_columns)
+            return duckdb.sql(sql_query)
+
 class CSVReaderPolarsEngine(CSVProperties):
     """Class to read CSV files and convert CSV files powered by Polars."""
+    def __init__(self, filepath):
+        """
+        Initialize the CSVReader class.
+
+        Args:
+            filepath (str): Path to the file to read.
+        """
+        super().__init__(filepath)
+        self.queries = DuckDBQueries(self.filepath)
+        self.db_engine = CSVReaderDuckDBEngine(self.filepath)
+
+    @property
+    def db_table(self):
+        """Return the DuckDB table."""
+        return self.queries.database_table_name
 
     def _create_dataframe(self, normalize_columns=False):
         """Normalizes the column names of the dataframe."""
@@ -124,6 +148,26 @@ class CSVReaderPolarsEngine(CSVProperties):
         """
         dicts = self._create_dataframe(normalize_columns).to_dicts()
         return dicts
+
+    def query_data(self, sql_query, normalize_columns=False):
+        """Queries as CSV file after importing into DuckDB.
+
+        Args:
+            sql_query (str): Query to run against DuckDB.
+
+        Returns:
+            A DuckDB DuckDBPyRelation with the query results.
+
+        Example if DuckDB Engine:
+            dg = CSVReader('myfile.csv')
+            query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
+            dg.query_csv_data(query)
+        """
+        if normalize_columns:
+            df = self.queries.update_column_names_dataframe_query(sql_query)
+        else:
+            df = self.queries.sql_query_to_dataframe(sql_query)
+        return df
 
 class CSVWriterDuckDBEngine(CSVProperties):
     """Class to convert CSV files to various other supported file types powered by DuckDB."""

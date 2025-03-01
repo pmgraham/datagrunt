@@ -3,7 +3,6 @@
 # standard library
 
 # third party libraries
-import duckdb
 import polars as pl
 
 # local libraries
@@ -97,9 +96,4 @@ class CSVReader(CSVProperties):
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(list())
-        queries = DuckDBQueries(self.filepath)
-        if normalize_columns:
-            duckdb.sql(queries.import_csv_query_normalize_columns())
-        else:
-            duckdb.sql(queries.import_csv_query())
-        return duckdb.sql(sql_query)
+        return self._set_reader_engine().query_data(sql_query, normalize_columns)
