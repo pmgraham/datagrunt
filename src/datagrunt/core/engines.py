@@ -246,7 +246,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
         """
         filename = self._set_out_filename(self.PARQUET_OUT_FILENAME, out_filename)
         self.queries.create_table(normalize_columns)
-        duckdb.execute(self.queries.export_parquet_query(filename))
+        duckdb.sql(self.queries.export_parquet_query(filename))
 
 class CSVWriterPolarsEngine(CSVProperties):
     """Class to write CSVs to other file formats powered by Polars."""
