@@ -13,7 +13,6 @@ from unittest.mock import Mock
 class TestCSVReaderDuckDBEngine:
     """Test suite for CSVReaderDuckDBEngine"""
 
-
     def test_init(self, sample_csv_engines):
         reader = CSVReaderDuckDBEngine(sample_csv_engines)
         assert reader.filepath == sample_csv_engines
@@ -26,12 +25,12 @@ class TestCSVReaderDuckDBEngine:
 
     def test_create_table(self, sample_csv_engines):
         reader = CSVReaderDuckDBEngine(sample_csv_engines)
-        result = reader.create_table()
+        result = reader.queries.create_table()
         assert isinstance(result, duckdb.DuckDBPyRelation)
 
     def test_create_table_normalized(self, sample_csv_engines):
         reader = CSVReaderDuckDBEngine(sample_csv_engines)
-        result = reader.create_table(normalize_columns=True)
+        result = reader.queries.create_table(normalize_columns=True)
         assert isinstance(result, duckdb.DuckDBPyRelation)
         # Check if columns are normalized
         columns = result.columns
