@@ -22,23 +22,20 @@ class CSVReaderDuckDBEngine(CSVProperties):
             filepath (str): Path to the file to read.
         """
         super().__init__(filepath)
-        self.db_table = DuckDBQueries(self.filepath).database_table_name
+        self.queries = DuckDBQueries(self.filepath)
 
-    def _read_csv(self):
-        """Reads a CSV using DuckDB.
+    @property
+    def db_table(self):
+        """Return the DuckDB table."""
+        return self.queries.database_table_name
 
-        Returns:
-            A DuckDB DuckDBPyRelation.
-        """
-        return duckdb.read_csv(self.filepath,
-                               delimiter=self.delimiter,
-                               null_padding=True,
-                               all_varchar=True
-                            )
+    def _create_table(self):
+        duckdb.sql(self.queries.import_csv_query(self.delimiter))
+        return duckdb.sql(self.queries.select_from_duckdb_table()).execute()
 
     def get_sample(self):
         """Return a sample of the CSV file."""
-        self._read_csv().show()
+        self._create_table().show()
 
     def to_dataframe(self):
         """Converts CSV to a Polars dataframe.
@@ -48,7 +45,7 @@ class CSVReaderDuckDBEngine(CSVProperties):
         """
         if self.is_large:
             show_large_file_warning()
-        return self._read_csv().pl()
+        return self._create_table().pl()
 
     def to_arrow_table(self):
         """Converts CSV to a PyArrow table.
@@ -56,8 +53,7 @@ class CSVReaderDuckDBEngine(CSVProperties):
         Returns:
             A PyArrow table.
         """
-        arrow_table = self._read_csv().arrow()
-        return arrow_table
+        return self._create_table().arrow()
 
     def to_dicts(self):
         """Converts CSV to a list of Python dictionaries.
@@ -124,8 +120,26 @@ class CSVWriterDuckDBEngine(CSVProperties):
         super().__init__(filepath)
         self.queries = DuckDBQueries(self.filepath)
 
+    @property
+    def db_table(self):
+        """Return the DuckDB table."""
+        return self.queries.database_table_name
+
+    def _create_table(self):
+        """Create a DuckDB table from a CSV file."""
+        duckdb.sql(self.queries.import_csv_query(self.delimiter))
+        return duckdb.sql(self.queries.select_from_duckdb_table()).execute()
+
     def _set_out_filename(self, default_filename, out_filename=None):
-        """Evaluate if a filename is passed in and if not, return default filename."""
+        """Evaluate if a filename is passed in and if not, return default filename
+
+           Args:
+               default_filename (str): The default filename.
+               out_filename (str): The name of the output file.
+
+            Returns:
+                str: The output filename.
+        """
         if out_filename:
             filename = out_filename
         else:
@@ -139,7 +153,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
                 out_filename str: The name of the output file.
             """
         filename = self._set_out_filename(self.CSV_OUT_FILENAME, out_filename)
-        duckdb.sql(self.queries.import_csv_query(self.delimiter))
+        self._create_table()
         duckdb.sql(self.queries.export_csv_query(filename))
 
     def write_excel(self, out_filename=None):
@@ -149,7 +163,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
             out_filename (optional, str): The name of the output file.
         """
         filename = self._set_out_filename(self.EXCEL_OUT_FILENAME, out_filename)
-        duckdb.sql(self.queries.import_csv_query(self.delimiter))
+        self._create_table()
         duckdb.sql(self.queries.export_excel_query(filename))
 
     def write_json(self, out_filename=None):
@@ -159,7 +173,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
             out_filename (optional, str): The name of the output file.
         """
         filename = self._set_out_filename(self.JSON_OUT_FILENAME, out_filename)
-        duckdb.sql(self.queries.import_csv_query(self.delimiter))
+        self._create_table()
         duckdb.sql(self.queries.export_json_query(filename))
 
     def write_json_newline_delimited(self, out_filename=None):
@@ -169,7 +183,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
             out_filename (optional, str): The name of the output file.
         """
         filename = self._set_out_filename(self.JSON_NEWLINE_OUT_FILENAME, out_filename)
-        duckdb.sql(self.queries.import_csv_query(self.delimiter))
+        self._create_table()
         duckdb.sql(self.queries.export_json_newline_delimited_query(filename))
 
     def write_parquet(self, out_filename=None):
@@ -179,7 +193,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
             out_filename (optional, str): The name of the output file.
         """
         filename = self._set_out_filename(self.PARQUET_OUT_FILENAME, out_filename)
-        duckdb.execute(self.queries.import_csv_query(self.delimiter))
+        self._create_table()
         duckdb.execute(self.queries.export_parquet_query(filename))
 
 class CSVWriterPolarsEngine(CSVProperties):

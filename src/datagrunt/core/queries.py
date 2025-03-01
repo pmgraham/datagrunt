@@ -48,6 +48,26 @@ class DuckDBQueries(DuckDBDatabase):
                             strict_mode=false);
             """
 
+    def import_csv_query_normalize_columns(self, delimiter):
+        """Query to import a CSV file into a DuckDB table and normalize column names.
+
+        Args:
+            filepath str: Path to the file.
+            delimiter str: The delimiter to use.
+        """
+        return f"""
+            CREATE OR REPLACE TABLE {self.database_table_name} AS
+            SELECT *
+            FROM read_csv('{self.filepath}',
+                            auto_detect=true,
+                            delim='{delimiter}',
+                            header=true,
+                            null_padding=true,
+                            all_varchar=True,
+                            strict_mode=false,
+                            normalize_names=true);
+            """
+
     def select_from_duckdb_table(self):
         """Query to select from a DuckDB table."""
         return f"SELECT * FROM {self.database_table_name}"
