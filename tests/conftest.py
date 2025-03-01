@@ -5,6 +5,8 @@ import sys
 sys.path.append('../')  # Add the parent directory to the search path
 sys.path.append('../src/datagrunt')  # Add the parent directory to the search path
 
+from src.datagrunt.core.csvproperties import CSVFormatter
+
 # Dummy CSV data for testing
 CSV_DATA = """col1,col2,col3
 1,a,True
@@ -32,6 +34,10 @@ def sample_csv_path(tmp_path):
     })
     df.write_csv(file_path)
     return str(file_path)
+
+@pytest.fixture
+def formatter(sample_csv_path):
+    return CSVFormatter(sample_csv_path)  # Path doesn't matter for these tests
 
 @pytest.fixture
 def empty_csv_path(tmp_path):
