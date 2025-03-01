@@ -18,6 +18,10 @@ class CSVFormatter(FileProperties):
         """Normalize a single column name by converting to lowercase, replacing spaces and special
         characters with underscores, and removing extra underscores.
 
+        Replace special characters and spaces with underscore
+        Remove leading and trailing underscores
+        Replace multiple underscores with single underscore
+
         Args:
             column_name (str): The column name to normalize
 
@@ -25,16 +29,9 @@ class CSVFormatter(FileProperties):
             str: The normalized column name
         """
         name = column_name.lower()
-
-        # Replace special characters and spaces with underscore
         name = re.sub(r'[^a-z0-9]+', '_', name)
-
-        # Remove leading and trailing underscores
         name = name.strip('_')
-
-        # Replace multiple underscores with single underscore
         name = re.sub(r'_+', '_', name)
-
         return name
 
     def make_unique_column_names(self, columns_list):
