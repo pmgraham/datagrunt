@@ -2,10 +2,12 @@ import pytest
 import polars as pl
 import os
 import sys
+from unittest.mock import Mock
 sys.path.append('../')  # Add the parent directory to the search path
 sys.path.append('../src/datagrunt')  # Add the parent directory to the search path
 
 from src.datagrunt.core.csvproperties import CSVFormatter
+
 
 # Dummy CSV data for testing
 CSV_DATA = """col1,col2,col3
@@ -22,7 +24,6 @@ CSV_ROWS = [
     ['John', '30', 'New York'],
     ['Jane', '25', 'Los Angeles']
 ]
-
 @pytest.fixture
 def sample_csv_path(tmp_path):
     """Create a sample CSV file for testing."""
@@ -34,6 +35,33 @@ def sample_csv_path(tmp_path):
     })
     df.write_csv(file_path)
     return str(file_path)
+
+@pytest.fixture
+def sample_csv_engines(tmp_path):
+    """Create a sample CSV file for testing."""
+    csv_content = """Name,Age,City
+John Doe,30,New York
+Jane Smith,25,Los Angeles
+Bob Johnson,35,Chicago"""
+
+    file_path = tmp_path / "testengines.csv"
+    with open(file_path, "w") as f:
+        f.write(csv_content)
+    return str(file_path)
+
+@pytest.fixture
+def create_large_csv(tmp_path):
+    """Create a larger CSV file for sampling tests"""
+    def _create_csv(rows):
+        content = "Name,Age,City\n"
+        for i in range(rows):
+            content += f"Person{i},{20+i},City{i}\n"
+
+        file_path = tmp_path / "large_test.csv"
+        with open(file_path, "w") as f:
+            f.write(content)
+        return str(file_path)
+    return _create_csv
 
 @pytest.fixture
 def formatter(sample_csv_path):
@@ -66,6 +94,23 @@ def sample_dataframe():
         'age': [30, 25],
         'city': ['New York', 'Los Angeles']
     })
+
+@pytest.fixture
+def mock_show_dataframe(mocker, sample_dataframe):
+    """Fixture to mock the show_dataframe_sample function"""
+    mock = mocker.patch('src.datagrunt.core.logger.show_dataframe_sample')
+
+    def side_effect(df):
+        """Simulate the behavior of show_dataframe_sample"""
+        assert isinstance(df, pl.DataFrame)
+        print("\nShape:", df.shape)
+        print("Columns:", df.columns)
+        print("Sample data:")
+        print(df.head(3))
+
+    mock.side_effect = side_effect
+    return mock
+
 
 @pytest.fixture
 def sample_default_csv_path(tmp_path):
