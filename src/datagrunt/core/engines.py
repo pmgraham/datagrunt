@@ -75,7 +75,8 @@ class CSVReaderPolarsEngine(CSVProperties):
         """Normalizes the column names of the dataframe."""
         df = pl.read_csv(self.filepath,
                          separator=self.delimiter,
-                         truncate_ragged_lines=True
+                         truncate_ragged_lines=True,
+                         infer_schema=False
                         )
         if normalize_columns:
             df = df.rename(self.columns_to_normalized_mapping)
@@ -85,6 +86,7 @@ class CSVReaderPolarsEngine(CSVProperties):
         df = pl.read_csv(self.filepath,
                          separator=self.delimiter,
                          truncate_ragged_lines=True,
+                         infer_schema=False,
                          n_rows=self.DATAFRAME_SAMPLE_ROWS
                         )
         if normalize_columns:
