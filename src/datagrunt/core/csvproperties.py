@@ -1,7 +1,7 @@
 """Class to represent and define CSV properties."""
 
 # standard library
-from collections import Counter
+from collections import Counter, OrderedDict
 import csv
 from functools import lru_cache
 import re
@@ -244,8 +244,13 @@ class CSVProperties(FileProperties):
 
     @property
     def columns_normalized_byte_string(self):
-        """Return the normalized schema of the columns in the CSV file as bytes."""
+        """Return the normalized first row in the CSV file as bytes."""
         return self._get_attributes()['columns_list_normalized_byte_string']
+
+    @property
+    def columns_to_normalized_mapping(self):
+        """Return the mapping of original column names to normalized column names."""
+        return dict(OrderedDict(zip(self.columns, self.columns_normalized)))
 
     @property
     def column_count(self):
