@@ -3,8 +3,10 @@
 # standard library
 
 # third party libraries
+import duckdb
 
 # local libraries
+from venv import create
 from src.datagrunt.core.databases import DuckDBDatabase
 from src.datagrunt.core.csvproperties import CSVProperties
 
@@ -123,3 +125,38 @@ class DuckDBQueries(DuckDBDatabase):
         """
         filename = self._set_out_filename(self.export_properties.PARQUET_OUT_FILENAME, out_filename)
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}'(FORMAT PARQUET)"
+
+    def update_and_normalize_column_names(self):
+        """Query to update column names in a DuckDB table.
+
+        Args:
+            list: The new column names.
+        """
+        duckdb.sql(self.import_csv_query())
+        for old_name, new_name in zip(self.export_properties.columns, self.export_properties.columns_normalized):
+            sql_string = f"ALTER TABLE {self.database_table_name} RENAME COLUMN '{old_name}' TO '{new_name}'"
+            duckdb.sql(sql_string)
+
+    def update_column_names_dataframe_query(self, sql_query):
+        """Query to update column names in a DuckDB table.
+
+        Args:
+            list: The new column names.
+        """
+        duckdb.sql(self.import_csv_query())
+        for old_name, new_name in zip(self.export_properties.columns, self.export_properties.columns_normalized):
+            sql_string = f"ALTER TABLE {self.database_table_name} RENAME COLUMN '{old_name}' TO '{new_name}'"
+            duckdb.sql(sql_string)
+        return duckdb.sql(sql_query).pl()
+
+    def sql_query_to_dataframe(self, sql_query):
+        """Query to convert a SQL query to a Pandas DataFrame.
+
+        Args:
+            sql_query (str): The SQL query to execute.
+
+        Returns:
+            pandas.DataFrame: The resulting DataFrame.
+        """
+        duckdb.sql(self.import_csv_query())
+        return duckdb.sql(sql_query).pl()
