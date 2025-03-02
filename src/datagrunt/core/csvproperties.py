@@ -11,6 +11,52 @@ import re
 # local libraries
 from src.datagrunt.core.fileproperties import FileProperties
 
+class CSVDelimiter:
+    """Class to represent CSV delimiter."""
+
+    DELIMITER_REGEX_PATTERN = r'[^0-9a-zA-Z_ "-]'
+    DEFAULT_DELIMITER = ','
+
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self.file_properties = FileProperties(filepath)
+        self.first_row = CSVRows(filepath).first_row
+        self.delimiter = self._infer_csv_file_delimiter()
+
+    def _get_most_common_non_alpha_numeric_character_from_string(self):
+        """Get the most common non-alpha-numeric character from a given string.
+
+        Args:
+            text (str): The string to get the most common non-alpha-numeric character from.
+
+        Returns:
+            str: The most common non-alpha-numeric character from the string.
+        """
+        columns_no_spaces = self.first_row.replace(' ', '')
+        regex = re.compile(self.DELIMITER_REGEX_PATTERN)
+        counts = Counter(char for char in regex.findall(columns_no_spaces))
+        most_common = counts.most_common()
+        return most_common
+
+    def _infer_csv_file_delimiter(self):
+        """Infer the delimiter of a CSV file.
+
+        Args:
+            csv_file (str): The path to the CSV file.
+
+        Returns:
+            str: The delimiter of the CSV file.
+        """
+        delimiter_candidates = self._get_most_common_non_alpha_numeric_character_from_string()
+
+        if self.file_properties.is_empty or self.file_properties.is_blank:
+            delimiter = self.DEFAULT_DELIMITER
+        elif len(delimiter_candidates) == 0:
+            delimiter = ' '
+        else:
+            delimiter = delimiter_candidates[0][0]
+        return delimiter
+
 class CSVColumnFormatter:
     """Class to format CSV columns."""
 
@@ -77,6 +123,71 @@ class CSVColumnFormatter:
         """
         normalized_columns = [self.normalize_single_column_name(col) for col in columns]
         return self.make_unique_column_names(normalized_columns)
+
+class CSVDialect:
+    """Class for inferring the CSV dialect."""
+
+    CSV_SNIFF_SAMPLE_ROWS = 5
+
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self.csv_dialect = self._get_csv_dialect()
+
+    def _get_csv_dialect(self):
+        """Get the CSV dialect from the file.
+
+        Returns:
+            csv.Dialect: The CSV dialect inferred from the file.
+        """
+        with open(self.filepath, 'r', encoding=FileProperties(self.filepath).DEFAULT_ENCODING) as csvfile:
+            dialect = csv.Sniffer().sniff(csvfile.read(self.CSV_SNIFF_SAMPLE_ROWS))
+            csvfile.seek(0)  # Reset file pointer to the beginning
+        return dialect
+
+class CSVRows:
+    """Class for parsing CSV rows."""
+
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self.first_row = self._get_first_row_from_file()
+
+    def _get_first_row_from_file(self):
+        """Reads and returns the first line of a file.
+
+        Args:
+            filename: The path to the file.
+
+        Returns:
+            The first line of the file, stripped of leading/trailing whitespace,
+            or None if the file is empty.
+        """
+        with open(self.filepath, 'r', encoding=FileProperties(self.filepath).DEFAULT_ENCODING) as csv_file:
+            first_line = csv_file.readline().strip()
+        return first_line
+
+    @property
+    @lru_cache()
+    def row_count_with_header(self):
+        """Return the number of lines in the CSV file including the header."""
+        with open(self.filepath, 'rb') as csv_file:
+            return sum(1 for _ in csv_file)
+
+    @property
+    def row_count_without_header(self):
+        """Return the number of lines in the CSV file excluding the header."""
+        return self.row_count_with_header - 1
+
+class CSVColumns:
+    """Class for parsing CSV columns."""
+
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self.delimiter = CSVDelimiter(self.filepath)
+        self.column_formatter = CSVColumnFormatter(self.filepath)
+        self.columns_list = self.first_row.split(self.delimiter)
+
+
+
 
 class CSVProperties(FileProperties):
     """Class for parsing CSV files. Mostly determining the delimiter."""
