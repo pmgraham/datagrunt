@@ -6,7 +6,7 @@ import sys
 sys.path.append('../')  # Add the parent directory to the search path
 sys.path.append('../src/datagrunt')  # Add the parent directory to the search path
 
-from src.datagrunt.core.csvproperties import CSVColumnFormatter
+from src.datagrunt.core.csvproperties import CSVColumns
 
 
 # Dummy CSV data for testing
@@ -65,7 +65,7 @@ def create_large_csv(tmp_path):
 
 @pytest.fixture
 def formatter(sample_csv_path):
-    return CSVColumnFormatter(sample_csv_path)  # Path doesn't matter for these tests
+    return CSVColumns(sample_csv_path)  # Path doesn't matter for these tests
 
 @pytest.fixture
 def empty_csv_path(tmp_path):

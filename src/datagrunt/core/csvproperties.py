@@ -57,7 +57,7 @@ class CSVDelimiter:
             delimiter = delimiter_candidates[0][0]
         return delimiter
 
-class CSVColumnFormatter:
+class CSVColumnNameNormalizer:
     """Class to format CSV columns."""
 
     SPECIAL_CHARS_PATTERN = re.compile(r'[^a-z0-9]+')
@@ -65,8 +65,13 @@ class CSVColumnFormatter:
 
     def __init__(self, filename):
         self.filename = filename
+        self.columns_normalized = self._normalize_column_names(self._get_columns_from_file())
 
-    def normalize_single_column_name(self, column_name):
+    def _get_columns_from_file(self):
+        delimiter = CSVDelimiter(self.filename).delimiter
+        return CSVRows(self.filename).first_row.split(delimiter)
+
+    def _normalize_single_column_name(self, column_name):
         """Normalize a single column name by converting to lowercase, replacing spaces and special
         characters with underscores, and removing extra underscores.
 
@@ -87,7 +92,7 @@ class CSVColumnFormatter:
         name = self.MULTI_UNDERSCORE_PATTERN.sub('_', name)
         return f'_{name}' if name and name[0].isdigit() else name
 
-    def make_unique_column_names(self, columns_list):
+    def _make_unique_column_names(self, columns_list):
         """
         Make unique column names by appending a number to duplicate names.
 
@@ -110,7 +115,7 @@ class CSVColumnFormatter:
 
         return unique_names
 
-    def normalize_column_names(self, columns):
+    def _normalize_column_names(self, columns):
         """
         Normalize column names by converting to lowercase, replacing spaces and special
         characters with underscores, and removing extra underscores.
@@ -121,8 +126,8 @@ class CSVColumnFormatter:
         Returns:
             list: List of normalized column names
         """
-        normalized_columns = [self.normalize_single_column_name(col) for col in columns]
-        return self.make_unique_column_names(normalized_columns)
+        normalized_columns = [self._normalize_single_column_name(col) for col in columns]
+        return self._make_unique_column_names(normalized_columns)
 
 class CSVDialect:
     """Class for inferring the CSV dialect."""
@@ -182,12 +187,39 @@ class CSVColumns:
 
     def __init__(self, filepath):
         self.filepath = filepath
-        self.delimiter = CSVDelimiter(self.filepath)
-        self.column_formatter = CSVColumnFormatter(self.filepath)
-        self.columns_list = self.first_row.split(self.delimiter)
+        self.delimiter = CSVDelimiter(self.filepath).delimiter
+        self.columns_normalized = CSVColumnNameNormalizer(self.filepath).columns_normalized
+        self.columns = CSVRows(filepath).first_row.split(self.delimiter)
 
+    @property
+    def columns_string(self):
+        """Return a string representation of the columns."""
+        return ', '.join(self.columns)
 
+    @property
+    def columns_normalized_string(self):
+        """Return a list representation of the normalizedcolumns."""
+        return ', '.join(self.columns_normalized)
 
+    @property
+    def columns_byte_string(self):
+        """Return a string representation of the columns."""
+        return ', '.join(self.columns).encode()
+
+    @property
+    def columns_normalized_byte_string(self):
+        """Return a string representation of the columns."""
+        return ', '.join(self.columns_normalized).encode()
+
+    @property
+    def columns_to_normalized_mapping(self):
+        """Return the mapping of original column names to normalized column names."""
+        return dict(OrderedDict(zip(self.columns, self.columns_normalized)))
+
+    @property
+    def columns_count(self):
+        """Return the number of columns."""
+        return len(self.columns)
 
 class CSVProperties(FileProperties):
     """Class for parsing CSV files. Mostly determining the delimiter."""
@@ -215,7 +247,7 @@ class CSVProperties(FileProperties):
         super().__init__(filepath)
         self.first_row = self._get_first_row_from_file()
         self.delimiter = self._infer_csv_file_delimiter()
-        self.formatter = CSVColumnFormatter(filepath)
+        self.formatter = CSVColumnNameNormalizer(filepath)
         if not self.is_csv:
             raise ValueError(
                 f"File extension '{self.extension_string}' is not a valid CSV file extension."
