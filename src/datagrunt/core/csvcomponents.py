@@ -10,7 +10,7 @@ import re
 from src.datagrunt.core.fileproperties import FileProperties
 
 class CSVDelimiter:
-    """Class to represent CSV delimiter."""
+    """Class to infer and derive the CSV delimiter."""
 
     DELIMITER_REGEX_PATTERN = r'[^0-9a-zA-Z_ "-]'
     DEFAULT_DELIMITER = ','
