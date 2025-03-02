@@ -1,5 +1,6 @@
 import pytest
-from src.datagrunt.core.fileproperties import FileProperties, CSVProperties
+from src.datagrunt.core.fileproperties import FileProperties
+from src.datagrunt.core.csvproperties import CSVProperties
 
 class TestFileProperties:
     def test_file_size_properties(self, temp_files):

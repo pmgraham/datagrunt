@@ -36,12 +36,3 @@ def duckdb_query_error(error_message):
     """Show error message if duckdb query fails."""
     message = DUCKDB_ENGINE_ERROR.format(error=error_message)
     return show_warning(message)
-
-
-def show_dataframe_sample(dataframe):
-    """Show dataframe output.
-
-    Args:
-        dataframe (dataframe): The dataframe to show.
-    """
-    return show_info_message(dataframe)
