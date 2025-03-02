@@ -16,7 +16,6 @@ class CSVDelimiter:
     DEFAULT_DELIMITER = ','
 
     def __init__(self, filepath):
-        self.filepath = filepath
         self.file_properties = FileProperties(filepath)
         self.first_row = CSVRows(filepath).first_row
         self.delimiter = self._infer_csv_file_delimiter()
@@ -131,6 +130,12 @@ class CSVDialect:
     """Class for inferring the CSV dialect."""
 
     CSV_SNIFF_SAMPLE_ROWS = 5
+    QUOTING_MAP = {
+        0: 'no quoting',
+        1: 'quote all',
+        2: 'quote minimal',
+        3: 'quote non-numeric'
+    }
 
     def __init__(self, filepath):
         self.filepath = filepath
@@ -146,6 +151,30 @@ class CSVDialect:
             dialect = csv.Sniffer().sniff(csvfile.read(self.CSV_SNIFF_SAMPLE_ROWS))
             csvfile.seek(0)  # Reset file pointer to the beginning
         return dialect
+
+    @property
+    def quotechar(self):
+        return self.csv_dialect.quotechar
+
+    @property
+    def escapechar(self):
+        return self.csv_dialect.escapechar
+
+    @property
+    def doublequote(self):
+        return self.csv_dialect.doublequote
+
+    @property
+    def newline_delimiter(self):
+        return self.csv_dialect.lineterminator
+
+    @property
+    def skipinitialspace(self):
+        return self.csv_dialect.skipinitialspace
+
+    @property
+    def quoting(self):
+        return self.QUOTING_MAP.get(self.csv_dialect.quoting)
 
 class CSVRows:
     """Class for parsing CSV rows."""
@@ -184,37 +213,37 @@ class CSVColumns:
     """Class for parsing CSV columns."""
 
     def __init__(self, filepath):
+        """Initialize the CSVColumns class."""
         self.filepath = filepath
-        self.delimiter = CSVDelimiter(self.filepath).delimiter
-        self.columns_normalized = CSVColumnNameNormalizer(self.filepath).columns_normalized
-        self.columns = CSVRows(filepath).first_row.split(self.delimiter)
+        self.columns_list = CSVRows(filepath).first_row.split(CSVDelimiter(filepath).delimiter)
+        self.columns_normalized_list = CSVColumnNameNormalizer(filepath).columns_normalized
 
     @property
     def columns_string(self):
         """Return a string representation of the columns."""
-        return ', '.join(self.columns)
+        return ', '.join(self.columns_list)
 
     @property
     def columns_normalized_string(self):
-        """Return a list representation of the normalizedcolumns."""
-        return ', '.join(self.columns_normalized)
+        """Return a list representation of the normalized columns."""
+        return ', '.join(self.columns_normalized_list)
 
     @property
     def columns_byte_string(self):
-        """Return a string representation of the columns."""
-        return ', '.join(self.columns).encode()
+        """Return a byte string representation of the columns."""
+        return ', '.join(self.columns_list).encode()
 
     @property
     def columns_normalized_byte_string(self):
-        """Return a string representation of the columns."""
-        return ', '.join(self.columns_normalized).encode()
+        """Return a byte string representation of the normalized columns."""
+        return ', '.join(self.columns_normalized_list).encode()
 
     @property
     def columns_to_normalized_mapping(self):
         """Return the mapping of original column names to normalized column names."""
-        return dict(OrderedDict(zip(self.columns, self.columns_normalized)))
+        return dict(OrderedDict(zip(self.columns_list, self.columns_normalized_list)))
 
     @property
     def columns_count(self):
         """Return the number of columns."""
-        return len(self.columns)
+        return len(self.columns_list)
