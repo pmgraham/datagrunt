@@ -12,7 +12,7 @@ import re
 from src.datagrunt.core.fileproperties import FileProperties
 
 class CSVColumnFormatter:
-    """Class to format CSV files."""
+    """Class to format CSV columns."""
 
     SPECIAL_CHARS_PATTERN = re.compile(r'[^a-z0-9]+')
     MULTI_UNDERSCORE_PATTERN = re.compile(r'_+')
