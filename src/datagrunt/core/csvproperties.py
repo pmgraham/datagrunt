@@ -11,11 +11,14 @@ import re
 # local libraries
 from src.datagrunt.core.fileproperties import FileProperties
 
-class CSVFormatter(FileProperties):
+class CSVColumnFormatter:
     """Class to format CSV files."""
 
     SPECIAL_CHARS_PATTERN = re.compile(r'[^a-z0-9]+')
     MULTI_UNDERSCORE_PATTERN = re.compile(r'_+')
+
+    def __init__(self, filename):
+        self.filename = filename
 
     def normalize_single_column_name(self, column_name):
         """Normalize a single column name by converting to lowercase, replacing spaces and special
@@ -101,7 +104,7 @@ class CSVProperties(FileProperties):
         super().__init__(filepath)
         self.first_row = self._get_first_row_from_file()
         self.delimiter = self._infer_csv_file_delimiter()
-        self.formatter = CSVFormatter(filepath)
+        self.formatter = CSVColumnFormatter(filepath)
         if not self.is_csv:
             raise ValueError(
                 f"File extension '{self.extension_string}' is not a valid CSV file extension."
