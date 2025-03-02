@@ -3,10 +3,11 @@
 # standard library
 
 # third party libraries
+import duckdb
 
 # local libraries
 from src.datagrunt.core.databases import DuckDBDatabase
-from src.datagrunt.core.fileproperties import FileProperties
+from src.datagrunt.core.csvproperties import CSVProperties
 
 class DuckDBQueries(DuckDBDatabase):
     """Class to store DuckDB database queries and query strings."""
@@ -19,7 +20,8 @@ class DuckDBQueries(DuckDBDatabase):
             filepath (str): Path to the file.
         """
         super().__init__(filepath)
-        self.export_properties = FileProperties(self.filepath)
+        self.export_properties = CSVProperties(self.filepath)
+        self.delimiter = self.export_properties.delimiter
 
     def _set_out_filename(self, default_filename, out_filename=None):
         """Evaluate if a filename is passed in and if not, return default filename."""
@@ -29,7 +31,7 @@ class DuckDBQueries(DuckDBDatabase):
             filename = default_filename
         return filename
 
-    def import_csv_query(self, delimiter):
+    def import_csv_query(self):
         """Query to import a CSV file into a DuckDB table.
 
         Args:
@@ -41,11 +43,31 @@ class DuckDBQueries(DuckDBDatabase):
             SELECT *
             FROM read_csv('{self.filepath}',
                             auto_detect=true,
-                            delim='{delimiter}',
+                            delim='{self.delimiter}',
                             header=true,
                             null_padding=true,
                             all_varchar=True,
                             strict_mode=false);
+            """
+
+    def import_csv_query_normalize_columns(self):
+        """Query to import a CSV file into a DuckDB table and normalize column names.
+
+        Args:
+            filepath str: Path to the file.
+            delimiter str: The delimiter to use.
+        """
+        return f"""
+            CREATE OR REPLACE TABLE {self.database_table_name} AS
+            SELECT *
+            FROM read_csv('{self.filepath}',
+                            auto_detect=true,
+                            delim='{self.delimiter}',
+                            header=true,
+                            null_padding=true,
+                            all_varchar=True,
+                            strict_mode=false,
+                            normalize_names=true);
             """
 
     def select_from_duckdb_table(self):
@@ -102,3 +124,46 @@ class DuckDBQueries(DuckDBDatabase):
         """
         filename = self._set_out_filename(self.export_properties.PARQUET_OUT_FILENAME, out_filename)
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}'(FORMAT PARQUET)"
+
+    def update_and_normalize_column_names(self):
+        """Query to update column names in a DuckDB table.
+
+        Args:
+            list: The new column names.
+        """
+        duckdb.sql(self.import_csv_query())
+        for old_name, new_name in zip(self.export_properties.columns, self.export_properties.columns_normalized):
+            sql_string = f"ALTER TABLE {self.database_table_name} RENAME COLUMN '{old_name}' TO '{new_name}'"
+            duckdb.sql(sql_string)
+
+    def update_column_names_dataframe_query(self, sql_query):
+        """Query to update column names in a DuckDB table.
+
+        Args:
+            list: The new column names.
+        """
+        duckdb.sql(self.import_csv_query())
+        for old_name, new_name in zip(self.export_properties.columns, self.export_properties.columns_normalized):
+            sql_string = f"ALTER TABLE {self.database_table_name} RENAME COLUMN '{old_name}' TO '{new_name}'"
+            duckdb.sql(sql_string)
+        return duckdb.sql(sql_query).pl()
+
+    def create_table(self, normalize_columns=False):
+        """Create a DuckDB table from the CSV file."""
+        if normalize_columns:
+            self.update_and_normalize_column_names()
+        else:
+            duckdb.sql(self.import_csv_query())
+        return duckdb.sql(self.select_from_duckdb_table()).execute()
+
+    def sql_query_to_dataframe(self, sql_query, normalize_columns=False):
+        """Query to convert a SQL query to a Polars DataFrame.
+
+        Args:
+            sql_query (str): The SQL query to execute.
+
+        Returns:
+            polars.DataFrame: The resulting DataFrame.
+        """
+        self.create_table(normalize_columns)
+        return duckdb.sql(sql_query).pl()
