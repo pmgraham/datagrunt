@@ -41,42 +41,42 @@ class CSVWriter(CSVProperties):
             engine = CSVWriterPolarsEngine(self.filepath)
         return engine
 
-    def write_csv(self, out_filename=None):
+    def write_csv(self, out_filename=None, normalize_columns=False):
         """Query to export a DuckDB table to a CSV file.
 
             Args:
                 out_filename str: The name of the output file.
             """
-        return self._set_writer_engine().write_csv(out_filename)
+        return self._set_writer_engine().write_csv(out_filename, normalize_columns)
 
-    def write_excel(self, out_filename=None):
+    def write_excel(self, out_filename=None, normalize_columns=False):
         """Query to export a DuckDB table to an Excel file.
 
         Args:
             out_filename str: The name of the output file.
         """
-        return self._set_writer_engine().write_excel(out_filename)
+        return self._set_writer_engine().write_excel(out_filename, normalize_columns)
 
-    def write_json(self, out_filename=None):
+    def write_json(self, out_filename=None, normalize_columns=False):
         """Query to export a DuckDB table to a JSON file.
 
         Args:
             out_filename str: The name of the output file.
         """
-        return self._set_writer_engine().write_json(out_filename)
+        return self._set_writer_engine().write_json(out_filename, normalize_columns)
 
-    def write_json_newline_delimited(self, out_filename=None):
+    def write_json_newline_delimited(self, out_filename=None, normalize_columns=False):
         """Query to export a DuckDB table to a JSON newline delimited file.
 
         Args:
             out_filename str: The name of the output file.
         """
-        return self._set_writer_engine().write_json_newline_delimited(out_filename)
+        return self._set_writer_engine().write_json_newline_delimited(out_filename, normalize_columns)
 
-    def write_parquet(self, out_filename=None):
+    def write_parquet(self, out_filename=None, normalize_columns=False):
         """Query to export a DuckDB table to a Parquet file.
 
         Args:
             out_filename str: The name of the output file.
         """
-        return self._set_writer_engine().write_parquet(out_filename)
+        return self._set_writer_engine().write_parquet(out_filename, normalize_columns)
