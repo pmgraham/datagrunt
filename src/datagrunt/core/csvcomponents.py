@@ -140,7 +140,7 @@ class CSVDialect:
 
     def __init__(self, filepath):
         self.filepath = filepath
-        self.csv_dialect = self._get_csv_dialect()
+        self.dialect = self._get_csv_dialect()
 
     def _get_csv_dialect(self):
         """Get the CSV dialect from the file.
@@ -155,27 +155,27 @@ class CSVDialect:
 
     @property
     def quotechar(self):
-        return self.csv_dialect.quotechar
+        return self.dialect.quotechar
 
     @property
     def escapechar(self):
-        return self.csv_dialect.escapechar
+        return self.dialect.escapechar
 
     @property
     def doublequote(self):
-        return self.csv_dialect.doublequote
+        return self.dialect.doublequote
 
     @property
     def newline_delimiter(self):
-        return self.csv_dialect.lineterminator
+        return self.dialect.lineterminator
 
     @property
     def skipinitialspace(self):
-        return self.csv_dialect.skipinitialspace
+        return self.dialect.skipinitialspace
 
     @property
     def quoting(self):
-        return self.QUOTING_MAP.get(self.csv_dialect.quoting)
+        return self.QUOTING_MAP.get(self.dialect.quoting)
 
 class CSVRows:
     """Class for parsing CSV rows."""
