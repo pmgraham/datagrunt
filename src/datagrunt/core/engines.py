@@ -20,11 +20,11 @@ class EngineProperties:
     """Base properties for CSV operations."""
     filepath: str
     DATAFRAME_SAMPLE_ROWS: int = 20
-    CSV_export_filename: str = 'output.csv'
-    EXCEL_export_filename: str = 'output.xlsx'
-    JSON_export_filename: str = 'output.json'
-    JSON_NEWLINE_export_filename: str = 'output.jsonl'
-    PARQUET_export_filename: str = 'output.parquet'
+    CSV_EXPORT_FILENAME: str = 'output.csv'
+    EXCEL_EXPORT_FILENAME: str = 'output.xlsx'
+    JSON_EXPORT_FILENAME: str = 'output.json'
+    JSON_NEWLINE_EXPORT_FILENAME: str = 'output.jsonl'
+    PARQUET_EXPORT_FILENAME: str = 'output.parquet'
     VALID_ENGINES: tuple = ('duckdb', 'polars')
     VALUE_ERROR_MESSAGE: str = """Reader engine '{engine}' is not 'duckdb' or 'polars'. Pass either 'duckdb' or 'polars' as valid engine params."""
 
@@ -259,7 +259,7 @@ class CSVWriterDuckDBEngine(BaseWriterEngine):
             Args:
                 export_filename str: The name of the output file.
             """
-        filename = self.queries.set_export_filename(EngineProperties.CSV_export_filename, export_filename)
+        filename = self.queries.set_export_filename(EngineProperties.CSV_EXPORT_FILENAME, export_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_csv_query(filename))
 
@@ -269,7 +269,7 @@ class CSVWriterDuckDBEngine(BaseWriterEngine):
         Args:
             export_filename (optional, str): The name of the output file.
         """
-        filename = self.queries.set_export_filename(EngineProperties.EXCEL_export_filename, export_filename)
+        filename = self.queries.set_export_filename(EngineProperties.EXCEL_EXPORT_FILENAME, export_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_excel_query(filename))
 
@@ -279,7 +279,7 @@ class CSVWriterDuckDBEngine(BaseWriterEngine):
         Args:
             export_filename (optional, str): The name of the output file.
         """
-        filename = self.queries.set_export_filename(EngineProperties.JSON_export_filename, export_filename)
+        filename = self.queries.set_export_filename(EngineProperties.JSON_EXPORT_FILENAME, export_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_json_query(filename))
 
@@ -289,7 +289,7 @@ class CSVWriterDuckDBEngine(BaseWriterEngine):
         Args:
             export_filename (optional, str): The name of the output file.
         """
-        filename = self.queries.set_export_filename(EngineProperties.JSON_NEWLINE_export_filename, export_filename)
+        filename = self.queries.set_export_filename(EngineProperties.JSON_NEWLINE_EXPORT_FILENAME, export_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_json_newline_delimited_query(filename))
 
@@ -299,7 +299,7 @@ class CSVWriterDuckDBEngine(BaseWriterEngine):
         Args:
             export_filename (optional, str): The name of the output file.
         """
-        filename = self.queries.set_export_filename(EngineProperties.PARQUET_export_filename, export_filename)
+        filename = self.queries.set_export_filename(EngineProperties.PARQUET_EXPORT_FILENAME, export_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_parquet_query(filename))
 
@@ -316,7 +316,7 @@ class CSVWriterPolarsEngine(BaseWriterEngine):
         Args:
             export_filename (optional, str): The name of the output file.
         """
-        filename = self.queries.set_export_filename(EngineProperties.CSV_export_filename, export_filename)
+        filename = self.queries.set_export_filename(EngineProperties.CSV_EXPORT_FILENAME, export_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
         df.write_csv(filename)
 
@@ -326,7 +326,7 @@ class CSVWriterPolarsEngine(BaseWriterEngine):
         Args:
             export_filename (optional, str): The name of the output file.
         """
-        filename = self.queries.set_export_filename(EngineProperties.EXCEL_export_filename, export_filename)
+        filename = self.queries.set_export_filename(EngineProperties.EXCEL_EXPORT_FILENAME, export_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
         df.write_excel(filename)
 
@@ -336,7 +336,7 @@ class CSVWriterPolarsEngine(BaseWriterEngine):
         Args:
             export_filename (optional, str): The name of the output file.
         """
-        filename = self.queries.set_export_filename(EngineProperties.JSON_export_filename, export_filename)
+        filename = self.queries.set_export_filename(EngineProperties.JSON_EXPORT_FILENAME, export_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
         df.write_json(filename)
 
@@ -346,7 +346,7 @@ class CSVWriterPolarsEngine(BaseWriterEngine):
         Args:
             export_filename (optional, str): The name of the output file.
         """
-        filename = self.queries.set_export_filename(EngineProperties.JSON_NEWLINE_export_filename, export_filename)
+        filename = self.queries.set_export_filename(EngineProperties.JSON_NEWLINE_EXPORT_FILENAME, export_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
         df.write_ndjson(filename)
 
@@ -356,7 +356,7 @@ class CSVWriterPolarsEngine(BaseWriterEngine):
         Args:
             export_filename (optional, str): The name of the output file.
         """
-        filename = self.queries.set_export_filename(EngineProperties.PARQUET_export_filename, export_filename)
+        filename = self.queries.set_export_filename(EngineProperties.PARQUET_EXPORT_FILENAME, export_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
         df.write_parquet(filename)
 
