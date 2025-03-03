@@ -135,18 +135,6 @@ class DuckDBQueries(DuckDBDatabase):
             sql_string = f"ALTER TABLE {self.database_table_name} RENAME COLUMN '{old_name}' TO '{new_name}'"
             duckdb.sql(sql_string)
 
-    def update_column_names_query(self, sql_query):
-        """Query to update column names in a DuckDB table.
-
-        Args:
-            list: The new column names.
-        """
-        duckdb.sql(self.import_csv_query())
-        for old_name, new_name in zip(CSVColumns(self.filepath).columns, CSVColumnNameNormalizer(self.filepath).columns_normalized):
-            sql_string = f"ALTER TABLE {self.database_table_name} RENAME COLUMN '{old_name}' TO '{new_name}'"
-            duckdb.sql(sql_string)
-        return duckdb.sql(sql_query)
-
     def create_table(self, normalize_columns=False):
         """Create a DuckDB table from the CSV file."""
         if normalize_columns:
