@@ -67,7 +67,7 @@ class CSVColumnNameNormalizer:
 
     def _columns(self):
         """Return the list of columns from the CSV file."""
-        return CSVColumns(self.filename).columns_list
+        return CSVColumns(self.filename).columns
 
     def _normalize_single_column_name(self, column_name):
         """Normalize a single column name by converting to lowercase, replacing spaces and special
@@ -216,35 +216,35 @@ class CSVColumns:
     def __init__(self, filepath):
         """Initialize the CSVColumns class."""
         self.filepath = filepath
-        self.columns_list = CSVRows(filepath).first_row.split(CSVDelimiter(filepath).delimiter)
-        self.columns_normalized_list = CSVColumnNameNormalizer(filepath).columns_normalized
+        self.columns = CSVRows(filepath).first_row.split(CSVDelimiter(filepath).delimiter)
+        self.columns_normalized = CSVColumnNameNormalizer(filepath).columns_normalized
 
     @property
     def columns_string(self):
         """Return a string representation of the columns."""
-        return ', '.join(self.columns_list)
+        return ', '.join(self.columns)
 
     @property
     def columns_normalized_string(self):
         """Return a list representation of the normalized columns."""
-        return ', '.join(self.columns_normalized_list)
+        return ', '.join(self.columns_normalized)
 
     @property
     def columns_byte_string(self):
         """Return a byte string representation of the columns."""
-        return ', '.join(self.columns_list).encode()
+        return ', '.join(self.columns).encode()
 
     @property
     def columns_normalized_byte_string(self):
         """Return a byte string representation of the normalized columns."""
-        return ', '.join(self.columns_normalized_list).encode()
+        return ', '.join(self.columns_normalized).encode()
 
     @property
     def columns_to_normalized_mapping(self):
         """Return the mapping of original column names to normalized column names."""
-        return dict(OrderedDict(zip(self.columns_list, self.columns_normalized_list)))
+        return dict(OrderedDict(zip(self.columns, self.columns_normalized)))
 
     @property
     def columns_count(self):
         """Return the number of columns."""
-        return len(self.columns_list)
+        return len(self.columns)
