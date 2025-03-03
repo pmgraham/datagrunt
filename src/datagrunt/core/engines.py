@@ -275,7 +275,7 @@ class CSVWriterDuckDBEngine(BaseWriterEngine):
             Args:
                 out_filename str: The name of the output file.
             """
-        filename = self._set_out_filename(EngineProperties.CSV_OUT_FILENAME, out_filename)
+        filename = self.queries._set_out_filename(EngineProperties.CSV_OUT_FILENAME, out_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_csv_query(filename))
 
