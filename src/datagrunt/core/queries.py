@@ -9,7 +9,7 @@ import duckdb
 from src.datagrunt.core.databases import DuckDBDatabase
 from src.datagrunt.core.csvcomponents import CSVDelimiter, CSVColumns, CSVColumnNameNormalizer
 
-class DuckDBQueries(DuckDBDatabase):
+class DuckDBQueries:
     """Class to store DuckDB database queries and query strings."""
 
     def __init__(self, filepath):
@@ -19,8 +19,9 @@ class DuckDBQueries(DuckDBDatabase):
         Args:
             filepath (str): Path to the file.
         """
-        super().__init__(filepath)
+        self.filepath = filepath
         self.delimiter = CSVDelimiter(filepath).delimiter
+        self.database_table_name = DuckDBDatabase(filepath).database_table_name
 
     def set_export_filename(self, default_filename, export_filename=None):
         """Evaluate if a filename is passed in and if not, return default filename."""
