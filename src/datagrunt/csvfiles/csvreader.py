@@ -6,14 +6,20 @@
 import polars as pl
 
 # local libraries
-from src.datagrunt.core import (
-    CSVProperties,
-    CSVReaderDuckDBEngine,
-    CSVReaderPolarsEngine,
-    DuckDBQueries
+from src.datagrunt.core.csvcomponents import (
+    CSVRows,
+    CSVDialect,
+    CSVColumns,
+    CSVRows,
+    CSVDelimiter,
+    CSVColumnNameNormalizer,
 )
 
-class CSVReader(CSVProperties):
+from src.datagrunt.core.queries import DuckDBQueries
+from src.datagrunt.core.engines import CSVReaderDuckDBEngine, CSVReaderPolarsEngine
+from src.datagrunt.core.fileproperties import FileProperties
+
+class CSVReader:
     """Class to unify the interface for reading CSV files."""
 
     READER_ENGINES = ['duckdb', 'polars']
