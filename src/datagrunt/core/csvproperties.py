@@ -43,12 +43,12 @@ class CSVProperties(FileProperties):
     @property
     def columns(self):
         """Return the columns in the CSV file."""
-        return self._handle_empty_or_blank_file(CSVColumns(self.filepath).columns_list)
+        return self._handle_empty_or_blank_file(CSVColumns(self.filepath).columns)
 
     @property
     def columns_normalized(self):
         """Return the normalized column names in the CSV file."""
-        return self._handle_empty_or_blank_file(CSVColumns(self.filepath).columns_normalized_list)
+        return self._handle_empty_or_blank_file(CSVColumns(self.filepath).columns_normalized)
 
     @property
     def columns_string(self):
@@ -63,7 +63,7 @@ class CSVProperties(FileProperties):
     @property
     def columns_normalized_list(self):
         """Return the normalized columns in the CSV file as a list."""
-        return self._handle_empty_or_blank_file(CSVColumns(self.filepath).columns_normalized_list)
+        return self._handle_empty_or_blank_file(CSVColumns(self.filepath).columns_normalized)
 
     @property
     def columns_byte_string(self):
