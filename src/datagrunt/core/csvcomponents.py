@@ -62,7 +62,7 @@ class CSVColumnNameNormalizer:
 
     def __init__(self, filename):
         self.filename = filename
-        self.columns_normalized = self._normalize_column_names(self._get_columns_from_file())
+        self.columns_normalized = self.normalize_column_names(self._get_columns_from_file())
 
     def _get_columns_from_file(self):
         delimiter = CSVDelimiter(self.filename).delimiter
@@ -112,7 +112,7 @@ class CSVColumnNameNormalizer:
 
         return unique_names
 
-    def _normalize_column_names(self, columns):
+    def normalize_column_names(self, columns):
         """
         Normalize column names by converting to lowercase, replacing spaces and special
         characters with underscores, and removing extra underscores.
