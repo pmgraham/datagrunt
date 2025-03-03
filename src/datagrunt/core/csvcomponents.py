@@ -19,6 +19,7 @@ class CSVDelimiter:
         self.file_properties = FileProperties(filepath)
         self.first_row = CSVRows(filepath).first_row
         self.delimiter = self.infer_csv_file_delimiter()
+        self.delimiter_byte_string = self.delimiter.encode()
 
     def _get_most_common_non_alpha_numeric_character_from_string(self):
         """Get the most common non-alpha-numeric character from a given string.
