@@ -56,7 +56,7 @@ class CSVDelimiter:
         return delimiter
 
 class CSVColumnNameNormalizer:
-    """Class to format CSV columns."""
+    """Class to normalize CSV columns names."""
 
     SPECIAL_CHARS_PATTERN = re.compile(r'[^a-z0-9]+')
     MULTI_UNDERSCORE_PATTERN = re.compile(r'_+')
