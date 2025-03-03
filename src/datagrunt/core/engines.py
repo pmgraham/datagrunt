@@ -1,17 +1,106 @@
 """Module engines to enable data processing."""
 
 # standard library
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Dict, List, Union
 
 # third party libraries
 import duckdb
+from duckdb import DuckDBPyRelation
 import polars as pl
+import pyarrow as pa
 
 # local libraries
-from src.datagrunt.core.csvproperties import CSVProperties
+from src.datagrunt.core.csvcomponents import CSVDelimiter, CSVColumnNameNormalizer
 from src.datagrunt.core.queries import DuckDBQueries
-from src.datagrunt.core.logger import show_large_file_warning
 
-class CSVReaderDuckDBEngine(CSVProperties):
+@dataclass
+class EngineProperties:
+    """Base properties for CSV operations."""
+    filepath: str
+    DATAFRAME_SAMPLE_ROWS: int = 20
+    CSV_OUT_FILENAME: str = 'output.csv'
+    EXCEL_OUT_FILENAME: str = 'output.xlsx'
+    JSON_OUT_FILENAME: str = 'output.json'
+    JSON_NEWLINE_OUT_FILENAME: str = 'output.jsonl'
+    PARQUET_OUT_FILENAME: str = 'output.parquet'
+    VALID_ENGINES: list = ['duckdb', 'polars']
+    VALUE_ERROR_MESSAGE: str = """Reader engine '{engine}' is not 'duckdb' or 'polars'. Pass either 'duckdb' or 'polars' as valid engine params."""
+
+class BaseReaderEngine(ABC):
+    """Abstract base class defining the interface for reader engines."""
+
+    @abstractmethod
+    def get_sample(self, normalize_columns: bool = False) -> None:
+        """Return a sample of the data."""
+        pass
+
+    @abstractmethod
+    def to_dataframe(self, normalize_columns: bool = False) -> pl.DataFrame:
+        """Convert data to a dataframe."""
+        pass
+
+    @abstractmethod
+    def to_arrow_table(self, normalize_columns: bool = False) -> pa.Table:
+        """Convert data to a PyArrow table."""
+        pass
+
+    @abstractmethod
+    def to_dicts(self, normalize_columns: bool = False) -> List[Dict]:
+        """Convert data to a list of dictionaries."""
+        pass
+
+    @abstractmethod
+    def query_data(self, sql_query: str, normalize_columns: bool = False) -> Union[DuckDBPyRelation, pl.DataFrame]:
+        """Query the data using SQL."""
+        pass
+
+class BaseWriterEngine(ABC):
+    """Abstract base class defining the interface for writer engines."""
+
+    def _set_out_filename(self, default_filename, out_filename=None):
+        """Evaluate if a filename is passed in and if not, return default filename
+
+            Args:
+                default_filename (str): The default filename.
+                out_filename (str): The name of the output file.
+
+            Returns:
+                str: The output filename.
+        """
+        if out_filename:
+            filename = out_filename
+        else:
+            filename = default_filename
+        return filename
+
+    @abstractmethod
+    def write_csv(self, out_filename, normalize_columns=False):
+        """Write data to CSV format."""
+        pass
+
+    @abstractmethod
+    def write_excel(self, out_filename, normalize_columns=False):
+        """Write data to Excel format."""
+        pass
+
+    @abstractmethod
+    def write_json(self, out_filename, normalize_columns=False):
+        """Write data to JSON format."""
+        pass
+
+    @abstractmethod
+    def write_json_newline_delimited(self, out_filename, normalize_columns=False):
+        """Write data to JSON Lines format."""
+        pass
+
+    @abstractmethod
+    def write_parquet(self, out_filename, normalize_columns=False):
+        """Write data to Parquet format."""
+        pass
+
+class CSVReaderDuckDBEngine(BaseReaderEngine):
     """Class to read CSV files and convert CSV files powered by DuckDB."""
 
     def __init__(self, filepath):
@@ -21,7 +110,7 @@ class CSVReaderDuckDBEngine(CSVProperties):
         Args:
             filepath (str): Path to the file to read.
         """
-        super().__init__(filepath)
+        self.filepath = filepath
         self.queries = DuckDBQueries(self.filepath)
 
     @property
@@ -39,8 +128,6 @@ class CSVReaderDuckDBEngine(CSVProperties):
         Returns:
             A Polars dataframe.
         """
-        if self.is_large:
-            show_large_file_warning()
         return self.queries.create_table(normalize_columns).pl()
 
     def to_arrow_table(self, normalize_columns=False):
@@ -61,23 +148,23 @@ class CSVReaderDuckDBEngine(CSVProperties):
         return dicts
 
     def query_data(self, sql_query, normalize_columns=False):
-            """Queries as CSV file after importing into DuckDB.
+        """Queries as CSV file after importing into DuckDB.
 
-            Args:
-                sql_query (str): Query to run against DuckDB.
+        Args:
+            sql_query (str): Query to run against DuckDB.
 
-            Returns:
-                A DuckDB DuckDBPyRelation with the query results.
+        Returns:
+            A DuckDB DuckDBPyRelation with the query results.
 
-            Example if DuckDB Engine:
-                dg = CSVReader('myfile.csv')
-                query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
-                dg.query_csv_data(query)
-            """
-            self.queries.create_table(normalize_columns)
-            return duckdb.sql(sql_query)
+        Example if DuckDB Engine:
+            dg = CSVReader('myfile.csv')
+            query = f"SELECT col1, col2 FROM {dg.db_table}"
+            dg.query_csv_data(query)
+        """
+        self.queries.create_table(normalize_columns)
+        return duckdb.sql(sql_query)
 
-class CSVReaderPolarsEngine(CSVProperties):
+class CSVReaderPolarsEngine(BaseReaderEngine):
     """Class to read CSV files and convert CSV files powered by Polars."""
     def __init__(self, filepath):
         """
@@ -86,9 +173,9 @@ class CSVReaderPolarsEngine(CSVProperties):
         Args:
             filepath (str): Path to the file to read.
         """
-        super().__init__(filepath)
+        self.filepath = filepath
         self.queries = DuckDBQueries(self.filepath)
-        self.db_engine = CSVReaderDuckDBEngine(self.filepath)
+        self.delimiter = CSVDelimiter(self.filepath).delimiter
 
     @property
     def db_table(self):
@@ -103,7 +190,7 @@ class CSVReaderPolarsEngine(CSVProperties):
                          infer_schema=False
                         )
         if normalize_columns:
-            df = df.rename(self.columns_to_normalized_mapping)
+            df = df.rename(CSVColumnNameNormalizer(self.filepath).columns_to_normalized_mapping)
         return df
 
     def _create_dataframe_sample(self, normalize_columns=False):
@@ -111,10 +198,10 @@ class CSVReaderPolarsEngine(CSVProperties):
                          separator=self.delimiter,
                          truncate_ragged_lines=True,
                          infer_schema=False,
-                         n_rows=self.DATAFRAME_SAMPLE_ROWS
+                         n_rows=EngineProperties.DATAFRAME_SAMPLE_ROWS
                         )
         if normalize_columns:
-            df = df.rename(self.columns_to_normalized_mapping)
+            df = df.rename(CSVColumnNameNormalizer(self.filepath).columns_to_normalized_mapping)
         return df
 
     def get_sample(self, normalize_columns=False):
@@ -164,7 +251,7 @@ class CSVReaderPolarsEngine(CSVProperties):
         """
         return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
 
-class CSVWriterDuckDBEngine(CSVProperties):
+class CSVWriterDuckDBEngine(BaseWriterEngine):
     """Class to convert CSV files to various other supported file types powered by DuckDB."""
 
     def __init__(self, filepath):
@@ -174,7 +261,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
         Args:
             filepath (str): Path to the file to write.
         """
-        super().__init__(filepath)
+        self.filepath = filepath
         self.queries = DuckDBQueries(self.filepath)
 
     @property
@@ -182,29 +269,13 @@ class CSVWriterDuckDBEngine(CSVProperties):
         """Return the DuckDB table."""
         return self.queries.database_table_name
 
-    def _set_out_filename(self, default_filename, out_filename=None):
-        """Evaluate if a filename is passed in and if not, return default filename
-
-           Args:
-               default_filename (str): The default filename.
-               out_filename (str): The name of the output file.
-
-            Returns:
-                str: The output filename.
-        """
-        if out_filename:
-            filename = out_filename
-        else:
-            filename = default_filename
-        return filename
-
     def write_csv(self, out_filename=None, normalize_columns=False):
         """Query to export a DuckDB table to a CSV file.
 
             Args:
                 out_filename str: The name of the output file.
             """
-        filename = self._set_out_filename(self.CSV_OUT_FILENAME, out_filename)
+        filename = self._set_out_filename(EngineProperties.CSV_OUT_FILENAME, out_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_csv_query(filename))
 
@@ -214,7 +285,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
         Args:
             out_filename (optional, str): The name of the output file.
         """
-        filename = self._set_out_filename(self.EXCEL_OUT_FILENAME, out_filename)
+        filename = self._set_out_filename(EngineProperties.EXCEL_OUT_FILENAME, out_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_excel_query(filename))
 
@@ -224,7 +295,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
         Args:
             out_filename (optional, str): The name of the output file.
         """
-        filename = self._set_out_filename(self.JSON_OUT_FILENAME, out_filename)
+        filename = self._set_out_filename(EngineProperties.JSON_OUT_FILENAME, out_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_json_query(filename))
 
@@ -234,7 +305,7 @@ class CSVWriterDuckDBEngine(CSVProperties):
         Args:
             out_filename (optional, str): The name of the output file.
         """
-        filename = self._set_out_filename(self.JSON_NEWLINE_OUT_FILENAME, out_filename)
+        filename = self._set_out_filename(EngineProperties.JSON_NEWLINE_OUT_FILENAME, out_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_json_newline_delimited_query(filename))
 
@@ -244,20 +315,15 @@ class CSVWriterDuckDBEngine(CSVProperties):
         Args:
             out_filename (optional, str): The name of the output file.
         """
-        filename = self._set_out_filename(self.PARQUET_OUT_FILENAME, out_filename)
+        filename = self._set_out_filename(EngineProperties.PARQUET_OUT_FILENAME, out_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_parquet_query(filename))
 
-class CSVWriterPolarsEngine(CSVProperties):
+class CSVWriterPolarsEngine(BaseWriterEngine):
     """Class to write CSVs to other file formats powered by Polars."""
 
-    def _set_out_filename(self, default_filename, out_filename=None):
-        """Evaluate if a filename is passed in and if not, return default filename."""
-        if out_filename:
-            filename = out_filename
-        else:
-            filename = default_filename
-        return filename
+    def __init__(self, filepath):
+        self.filepath = filepath
 
     def write_csv(self, out_filename=None, normalize_columns=False):
         """Export a Polars dataframe to a CSV file.
@@ -265,7 +331,7 @@ class CSVWriterPolarsEngine(CSVProperties):
         Args:
             out_filename (optional, str): The name of the output file.
         """
-        filename = self._set_out_filename(self.CSV_OUT_FILENAME, out_filename)
+        filename = self._set_out_filename(EngineProperties.CSV_OUT_FILENAME, out_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
         df.write_csv(filename)
 
@@ -275,7 +341,7 @@ class CSVWriterPolarsEngine(CSVProperties):
         Args:
             out_filename (optional, str): The name of the output file.
         """
-        filename = self._set_out_filename(self.EXCEL_OUT_FILENAME, out_filename)
+        filename = self._set_out_filename(EngineProperties.EXCEL_OUT_FILENAME, out_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
         df.write_excel(filename)
 
@@ -285,7 +351,7 @@ class CSVWriterPolarsEngine(CSVProperties):
         Args:
             out_filename (optional, str): The name of the output file.
         """
-        filename = self._set_out_filename(self.JSON_OUT_FILENAME, out_filename)
+        filename = self._set_out_filename(EngineProperties.JSON_OUT_FILENAME, out_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
         df.write_json(filename)
 
@@ -295,7 +361,7 @@ class CSVWriterPolarsEngine(CSVProperties):
         Args:
             out_filename (optional, str): The name of the output file.
         """
-        filename = self._set_out_filename(self.JSON_NEWLINE_OUT_FILENAME, out_filename)
+        filename = self._set_out_filename(EngineProperties.JSON_NEWLINE_OUT_FILENAME, out_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
         df.write_ndjson(filename)
 
@@ -305,6 +371,47 @@ class CSVWriterPolarsEngine(CSVProperties):
         Args:
             out_filename (optional, str): The name of the output file.
         """
-        filename = self._set_out_filename(self.PARQUET_OUT_FILENAME, out_filename)
+        filename = self._set_out_filename(EngineProperties.PARQUET_OUT_FILENAME, out_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
         df.write_parquet(filename)
+
+class EngineFactory:
+    """Factory class for creating reader and writer engine instances."""
+
+    @staticmethod
+    def create_reader(filepath, engine='polars'):
+        """Create a reader engine instance.
+
+        Args:
+            filepath: Path to the input file
+            engine: Engine type ('duckdb' or 'polars')
+
+        Returns:
+            An instance of BaseReaderEngine
+        """
+        engine = engine.lower().strip()
+        if engine == 'duckdb':
+            return CSVReaderDuckDBEngine(filepath)
+        elif engine == 'polars':
+            return CSVReaderPolarsEngine(filepath)
+        else:
+            raise ValueError(f"Unsupported engine type: {engine}")
+
+    @staticmethod
+    def create_writer(filepath, engine='polars'):
+        """Create a writer engine instance.
+
+        Args:
+            filepath: Path to the input file
+            engine: Engine type ('duckdb' or 'polars')
+
+        Returns:
+            An instance of BaseWriterEngine
+        """
+        engine = engine.lower().strip()
+        if engine == 'duckdb':
+            return CSVWriterDuckDBEngine(filepath)
+        elif engine == 'polars':
+            return CSVWriterPolarsEngine(filepath)
+        else:
+            raise ValueError(f"Unsupported engine type: {engine}")
