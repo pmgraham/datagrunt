@@ -22,10 +22,11 @@ class DuckDBQueries(DuckDBDatabase):
         super().__init__(filepath)
         self.delimiter = CSVDelimiter(filepath).delimiter
 
-    def _set_out_filename(self, default_filename, out_filename=None):
+    def set_export_filename(self, default_filename, export_filename=None):
         """Evaluate if a filename is passed in and if not, return default filename."""
-        if out_filename:
-            filename = out_filename
+        # This method doesn't really fit the class but it's the only place it's relevant.
+        if export_filename:
+            filename = export_filename
         else:
             filename = default_filename
         return filename
@@ -73,22 +74,22 @@ class DuckDBQueries(DuckDBDatabase):
         """Query to select from a DuckDB table."""
         return f"SELECT * FROM {self.database_table_name}"
 
-    def export_csv_query(self, default_filename, out_filename=None):
+    def export_csv_query(self, default_filename, export_filename=None):
         """Query to export a DuckDB table to a CSV file.
 
         Args:
-            out_filename (str, optional): The name of the output file.
+            export_filename (str, optional): The name of the output file.
         """
-        filename = self._set_out_filename(default_filename, out_filename)
+        filename = self.set_export_filename(default_filename, export_filename)
         return f"COPY {self.database_table_name} TO '{filename}' (HEADER, DELIMITER ',');"
 
-    def export_excel_query(self, default_filename, out_filename=None):
+    def export_excel_query(self, default_filename, export_filename=None):
         """Query to export a DuckDB table to an Excel file.
 
         Args:
-            out_filename (str, optional): The name of the output file.
+            export_filename (str, optional): The name of the output file.
         """
-        filename = self._set_out_filename(default_filename, out_filename)
+        filename = self.set_export_filename(default_filename, export_filename)
         return f"""
             INSTALL spatial;
             LOAD spatial;
@@ -96,31 +97,31 @@ class DuckDBQueries(DuckDBDatabase):
             TO '{filename}'(FORMAT GDAL, DRIVER 'xlsx')
         """
 
-    def export_json_query(self, default_filename, out_filename=None):
+    def export_json_query(self, default_filename, export_filename=None):
         """Query to export a DuckDB table to a JSON file.
 
         Args:
-            out_filename (str, optional): The name of the output file.
+            export_filename (str, optional): The name of the output file.
         """
-        filename = self._set_out_filename(default_filename, out_filename)
+        filename = self.set_export_filename(default_filename, export_filename)
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}' (ARRAY true) "
 
-    def export_json_newline_delimited_query(self, default_filename, out_filename=None):
+    def export_json_newline_delimited_query(self, default_filename, export_filename=None):
         """Query to export a DuckDB table to a JSON file with newline delimited.
 
         Args:
-            out_filename (str, optional): The name of the output file.
+            export_filename (str, optional): The name of the output file.
         """
-        filename = self._set_out_filename(default_filename, out_filename)
+        filename = self.set_export_filename(default_filename, export_filename)
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}'"
 
-    def export_parquet_query(self, default_filename, out_filename=None):
+    def export_parquet_query(self, default_filename, export_filename=None):
         """Query to export a DuckDB table to a Parquet file.
 
         Args:
-            out_filename (str, optional): The name of the output file.
+            export_filename (str, optional): The name of the output file.
         """
-        filename = self._set_out_filename(default_filename, out_filename)
+        filename = self.set_export_filename(default_filename, export_filename)
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}'(FORMAT PARQUET)"
 
     def update_and_normalize_column_names(self):
@@ -134,7 +135,7 @@ class DuckDBQueries(DuckDBDatabase):
             sql_string = f"ALTER TABLE {self.database_table_name} RENAME COLUMN '{old_name}' TO '{new_name}'"
             duckdb.sql(sql_string)
 
-    def update_column_names_dataframe_query(self, sql_query):
+    def update_column_names_query(self, sql_query):
         """Query to update column names in a DuckDB table.
 
         Args:
@@ -144,7 +145,7 @@ class DuckDBQueries(DuckDBDatabase):
         for old_name, new_name in zip(CSVColumns(self.filepath).columns, CSVColumnNameNormalizer(self.filepath).columns_normalized):
             sql_string = f"ALTER TABLE {self.database_table_name} RENAME COLUMN '{old_name}' TO '{new_name}'"
             duckdb.sql(sql_string)
-        return duckdb.sql(sql_query).pl()
+        return duckdb.sql(sql_query)
 
     def create_table(self, normalize_columns=False):
         """Create a DuckDB table from the CSV file."""
