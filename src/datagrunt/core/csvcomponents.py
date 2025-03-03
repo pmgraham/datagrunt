@@ -61,12 +61,13 @@ class CSVColumnNameNormalizer:
     MULTI_UNDERSCORE_PATTERN = re.compile(r'_+')
 
     def __init__(self, filename):
+        """Initialize the CSVColumnNameNormalizer with a filename."""
         self.filename = filename
-        self.columns_normalized = self.normalize_column_names(self._get_columns_from_file())
+        self.columns_normalized = self.normalize_column_names(self._columns())
 
-    def _get_columns_from_file(self):
-        delimiter = CSVDelimiter(self.filename).delimiter
-        return CSVRows(self.filename).first_row.split(delimiter)
+    def _columns(self):
+        """Return the list of columns from the CSV file."""
+        return CSVColumns(self.filename).columns_list
 
     def _normalize_single_column_name(self, column_name):
         """Normalize a single column name by converting to lowercase, replacing spaces and special
