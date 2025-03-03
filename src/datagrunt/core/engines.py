@@ -366,8 +366,6 @@ class EngineFactory:
     def __init__(self, filepath, engine):
         self.filepath = filepath
         self.engine = engine.lower().replace(' ', '')
-        if self.engine not in EngineProperties.valid_engines:
-            raise ValueError(EngineProperties.value_error_message.format(engine=self.engine))
 
     def create_reader(self):
         """Create a reader engine instance.
