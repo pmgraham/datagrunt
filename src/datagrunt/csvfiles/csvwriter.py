@@ -22,8 +22,6 @@ class CSVWriter(CSVComponents):
         super().__init__(filepath)
         self.db_table = DuckDBQueries(self.filepath).database_table_name
         self.engine = engine.lower().replace(' ', '')
-        if self.engine not in EngineProperties.valid_engines:
-            raise ValueError(EngineProperties.value_error_message.format(engine=self.engine))
 
     def _create_writer(self):
         """Create a reader object."""
