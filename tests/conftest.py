@@ -34,3 +34,25 @@ def completely_empty_csv(tmp_path):
 def engine_factory(sample_csv):
     """Create an EngineFactory instance."""
     return EngineFactory(sample_csv, 'duckdb')
+
+@pytest.fixture
+def sample_files(tmp_path):
+    """Create sample test files."""
+    # Create various test files
+    files = {
+        'empty.csv': '',
+        'blank.csv': '   \n   \n',
+        'data.csv': 'a,b,c\n1,2,3',
+        'test.xlsx': 'dummy excel content',
+        'test.json': '{"key": "value"}',
+        'test.parquet': 'dummy parquet content',
+        'test.txt': 'plain text content'
+    }
+
+    created_files = {}
+    for filename, content in files.items():
+        file_path = tmp_path / filename
+        file_path.write_text(content)
+        created_files[filename] = file_path
+
+    return created_files
