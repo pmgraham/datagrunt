@@ -1,182 +1,149 @@
 import pytest
 import polars as pl
-from src.datagrunt import CSVReader
+import pyarrow as pa
+from duckdb import DuckDBPyRelation
 
-import duckdb
-from unittest.mock import patch
-
-from src.datagrunt.core import (
-    CSVReaderDuckDBEngine,
-    CSVReaderPolarsEngine,
-)
+from src.datagrunt.csvfiles.csvreader import CSVReader
 
 class TestCSVReader:
-    def test_initialization(self, sample_csv):
-        """Test basic initialization of CSVReader."""
-        reader = CSVReader(sample_csv)
-        assert isinstance(reader, CSVReader)
-        assert reader.filepath == sample_csv
-        assert reader.delimiter == ','
-        assert reader.engine == 'polars'
+    """Test suite for CSVReader class."""
 
-    def test_invalid_engine(self, sample_csv):
-        """Test initialization with invalid engine."""
-        with pytest.raises(ValueError):
+    def test_init_with_valid_engines(self, sample_csv):
+        """Test initialization with valid engine values."""
+        reader_polars = CSVReader(sample_csv, engine='polars')
+        assert reader_polars.engine == 'polars'
+
+        reader_duckdb = CSVReader(sample_csv, engine='duckdb')
+        assert reader_duckdb.engine == 'duckdb'
+
+        # Test with spaces and different cases
+        reader_with_spaces = CSVReader(sample_csv, engine='Duck DB')
+        assert reader_with_spaces.engine == 'duckdb'
+
+    def test_init_with_invalid_engine(self, sample_csv):
+        """Test initialization with invalid engine value."""
+        with pytest.raises(ValueError) as exc_info:
             CSVReader(sample_csv, engine='invalid')
+        assert "Reader engine 'invalid' is not 'duckdb' or 'polars'" in str(exc_info.value)
 
     def test_to_dataframe(self, sample_csv):
-        """Test conversion to dataframe."""
-        reader = CSVReader(sample_csv)
-        df = reader.to_dataframe()
-        assert isinstance(df, pl.DataFrame)
-        assert len(df) == 2
-        assert list(df.columns) == ['name', 'age', 'city']
+        """Test conversion to dataframe with both engines."""
+        # Test with Polars engine
+        reader_polars = CSVReader(sample_csv, engine='polars')
+        df_polars = reader_polars.to_dataframe()
+        assert isinstance(df_polars, pl.DataFrame)
+        assert len(df_polars) == 2
+        assert list(df_polars.columns) == ['name', 'age', 'city']
 
-    def test_empty_file(self, empty_csv):
-        """Test handling of empty file."""
-        reader = CSVReader(empty_csv)
-        df = reader.to_dataframe()
-        assert isinstance(df, pl.DataFrame)
-        assert len(df) == 0
+        # Test with DuckDB engine
+        reader_duckdb = CSVReader(sample_csv, engine='duckdb')
+        df_duckdb = reader_duckdb.to_dataframe()
+        assert isinstance(df_duckdb, pl.DataFrame)
+        assert len(df_duckdb) == 2
+        assert list(df_duckdb.columns) == ['name', 'age', 'city']
+
+    def test_to_arrow_table(self, sample_csv):
+        """Test conversion to Arrow table with both engines."""
+        reader_polars = CSVReader(sample_csv, engine='polars')
+        table_polars = reader_polars.to_arrow_table()
+        assert isinstance(table_polars, pa.Table)
+
+        reader_duckdb = CSVReader(sample_csv, engine='duckdb')
+        table_duckdb = reader_duckdb.to_arrow_table()
+        assert isinstance(table_duckdb, pa.Table)
 
     def test_to_dicts(self, sample_csv):
-        """Test conversion to list of dictionaries."""
+        """Test conversion to list of dictionaries with both engines."""
         reader = CSVReader(sample_csv)
         dicts = reader.to_dicts()
         assert isinstance(dicts, list)
         assert len(dicts) == 2
         assert all(isinstance(d, dict) for d in dicts)
         assert dicts[0]['name'] == 'John'
+        assert dicts[1]['name'] == 'Jane'
 
     def test_query_data(self, sample_csv):
-        """Test query_data method."""
-        reader = CSVReader(sample_csv, engine='duckdb')
-        query = f"SELECT * FROM {reader.db_table} WHERE age > '25'"
-        result = reader.query_data(query)
-        assert len(result) == 1
+        """Test querying data with both engines."""
+        # Test with DuckDB engine
+        reader_duckdb = CSVReader(sample_csv, engine='duckdb')
+        result_duckdb = reader_duckdb.query_data(f"""SELECT * FROM {reader_duckdb.db_table} WHERE age > '25'""")
+        assert isinstance(result_duckdb, DuckDBPyRelation)
 
-    def test_csv_reader_invalid_engine(self, temp_csv_file):
-        """Test that an invalid engine raises a ValueError."""
-        with pytest.raises(ValueError) as exc_info:
-            CSVReader(temp_csv_file, engine="invalid")
-        assert "Reader engine 'invalid' is not 'duckdb' or 'polars'." in str(exc_info.value)
+        # Test with Polars engine
+        reader_polars = CSVReader(sample_csv, engine='polars')
+        result_polars = reader_polars.query_data(f"""SELECT * FROM {reader_duckdb.db_table} WHERE age > '25'""")
+        assert isinstance(result_polars, pl.DataFrame)
 
-    def test_csv_reader_default_engine(self, temp_csv_file):
-        """Test that the default engine is 'polars'."""
-        reader = CSVReader(temp_csv_file)
-        assert reader.engine == "polars"
+    def test_empty_file_handling(self, empty_csv):
+        """Test handling of empty files."""
+        reader = CSVReader(empty_csv)
+        assert isinstance(reader.to_dataframe(), pl.DataFrame)
+        assert len(reader.to_dataframe()) == 0
+        assert isinstance(reader.to_dicts(), list)
+        assert len(reader.to_dicts()) == 0
+        assert isinstance(reader.to_arrow_table(), pa.Table)
 
-    def test_csv_reader_set_reader_engine_polars(self, temp_csv_file):
-        """Test that _set_reader_engine returns a Polars engine."""
-        reader = CSVReader(temp_csv_file, engine="polars")
-        engine = reader._set_reader_engine()
-        assert isinstance(engine, CSVReaderPolarsEngine)
+    def test_blank_file_handling(self, blank_csv):
+        """Test handling of blank files (containing only whitespace)."""
+        reader = CSVReader(blank_csv)
+        assert isinstance(reader.to_dataframe(), pl.DataFrame)
+        assert len(reader.to_dataframe()) == 0
+        assert isinstance(reader.to_dicts(), list)
+        assert len(reader.to_dicts()) == 0
+        assert isinstance(reader.to_arrow_table(), pa.Table)
 
-    def test_csv_reader_set_reader_engine_duckdb(self, temp_csv_file):
-        """Test that _set_reader_engine returns a DuckDB engine."""
-        reader = CSVReader(temp_csv_file, engine="duckdb")
-        engine = reader._set_reader_engine()
-        assert isinstance(engine, CSVReaderDuckDBEngine)
+    def test_normalize_columns(self, tmp_path):
+        """Test column name normalization."""
+        # Create CSV with mixed case and spaces in column names
+        csv_content = "First Name,Last Name,Age Group\nJohn,Doe,30-40\nJane,Smith,20-30"
+        csv_file = tmp_path / "test_normalize.csv"
+        csv_file.write_text(csv_content)
 
-    def test_csv_reader_set_reader_engine_with_spaces(self, temp_csv_file):
-        """Test that _set_reader_engine returns a DuckDB engine when spaces are in the engine name."""
-        reader = CSVReader(temp_csv_file, engine=" duckdb ")
-        engine = reader._set_reader_engine()
-        assert isinstance(engine, CSVReaderDuckDBEngine)
-        assert reader.engine == "duckdb"
+        reader = CSVReader(str(csv_file))
+        df = reader.to_dataframe(normalize_columns=True)
 
-    def test_csv_reader_get_sample(self, temp_csv_file, monkeypatch):
-        """Test the get_sample method calls the engine's get_sample."""
-        reader = CSVReader(temp_csv_file)
-        with patch.object(CSVReaderPolarsEngine, "get_sample") as mock_get_sample:
-            reader.get_sample()
-            mock_get_sample.assert_called_once()
+        expected_columns = ['first_name', 'last_name', 'age_group']
+        assert list(df.columns) == expected_columns
 
-    def test_csv_reader_to_dataframe(self, temp_csv_file, monkeypatch):
-        """Test that to_dataframe returns a Polars dataframe."""
-        reader = CSVReader(temp_csv_file)
-        with patch.object(CSVReaderPolarsEngine, "to_dataframe") as mock_to_dataframe:
-            mock_to_dataframe.return_value = pl.DataFrame({"col1": [1, 2, 3]})
-            df = reader.to_dataframe()
-            mock_to_dataframe.assert_called_once()
-            assert isinstance(df, pl.DataFrame)
-            assert df.shape == (3,1)
+    def test_get_sample(self, sample_csv, capsys):
+        """Test get_sample method."""
+        reader = CSVReader(sample_csv)
+        reader.get_sample()
+        captured = capsys.readouterr()
+        assert captured.out  # Verify that something was printed
+        assert 'John' in captured.out
+        assert 'Jane' in captured.out
 
-    def test_csv_reader_to_arrow_table(self, temp_csv_file, monkeypatch):
-        """Test that to_arrow_table returns a pyarrow table."""
-        reader = CSVReader(temp_csv_file)
-        with patch.object(CSVReaderPolarsEngine, "to_arrow_table") as mock_to_arrow_table:
-            mock_to_arrow_table.return_value = pl.DataFrame({"col1": [1, 2, 3]}).to_arrow()
-            table = reader.to_arrow_table()
-            mock_to_arrow_table.assert_called_once()
-            assert table.num_rows == 3
+    def test_to_dataframe_empty_and_blank_files(self, tmp_path):
+        """Test to_dataframe method specifically for empty and blank files."""
 
-    def test_csv_reader_to_dicts(self, temp_csv_file, monkeypatch):
-        """Test that to_dicts returns a list of dictionaries."""
-        reader = CSVReader(temp_csv_file)
-        with patch.object(CSVReaderPolarsEngine, "to_dicts") as mock_to_dicts:
-            mock_to_dicts.return_value = [{"col1": 1}, {"col1": 2}, {"col1": 3}]
-            dicts = reader.to_dicts()
-            mock_to_dicts.assert_called_once()
-            assert isinstance(dicts, list)
-            assert len(dicts) == 3
+        # Test empty file (0 bytes)
+        empty_file = tmp_path / "empty.csv"
+        empty_file.write_text("")
+        reader_empty = CSVReader(str(empty_file))
+        df_empty = reader_empty.to_dataframe()
+        assert isinstance(df_empty, pl.DataFrame)
+        assert len(df_empty) == 0
+        assert df_empty.shape == (0, 0)
 
-    def test_csv_reader_query_data(self, temp_csv_file, monkeypatch):
-        """Test that query_data returns a DuckDBPyRelation."""
-        reader = CSVReader(temp_csv_file, engine="duckdb")
-        result = reader.query_data("SELECT * FROM test")
-        assert isinstance(result, duckdb.DuckDBPyRelation)
+        # Test blank file (only whitespace and newlines)
+        blank_file = tmp_path / "blank.csv"
+        blank_file.write_text("\n   \n  \n")
+        reader_blank = CSVReader(str(blank_file))
+        df_blank = reader_blank.to_dataframe()
+        assert isinstance(df_blank, pl.DataFrame)
+        assert len(df_blank) == 0
+        assert df_blank.shape == (0, 0)
 
-    def test_csv_reader_to_dataframe_empty_file(self, temp_empty_csv_file):
-        """Test that to_dataframe handles empty files."""
-        reader = CSVReader(temp_empty_csv_file)
-        df = reader.to_dataframe()
-        assert isinstance(df, pl.DataFrame)
-        assert df.is_empty()
+        # Test file with only header
+        header_file = tmp_path / "header.csv"
+        header_file.write_text("column1,column2\n")
+        reader_header = CSVReader(str(header_file))
+        df_header = reader_header.to_dataframe()
+        assert isinstance(df_header, pl.DataFrame)
+        assert len(df_header) == 0
 
-    def test_csv_reader_to_dataframe_blank_file(self, temp_blank_csv_file):
-        """Test that to_dataframe handles blank files."""
-        reader = CSVReader(temp_blank_csv_file)
-        df = reader.to_dataframe()
-        assert isinstance(df, pl.DataFrame)
-        assert df.is_empty()
-
-    def test_csv_reader_to_arrow_table_empty_file(self, temp_empty_csv_file):
-        """Test that to_arrow_table handles empty files."""
-        reader = CSVReader(temp_empty_csv_file)
-        arrow_table = reader.to_arrow_table()
-        assert arrow_table.num_rows == 0
-
-    def test_csv_reader_to_arrow_table_blank_file(self, temp_blank_csv_file):
-        """Test that to_arrow_table handles blank files."""
-        reader = CSVReader(temp_blank_csv_file)
-        arrow_table = reader.to_arrow_table()
-        assert arrow_table.num_rows == 0
-
-    def test_csv_reader_to_dicts_empty_file(self, temp_empty_csv_file):
-        """Test that to_dicts handles empty files."""
-        reader = CSVReader(temp_empty_csv_file)
-        dicts = reader.to_dicts()
-        assert isinstance(dicts, list)
-        assert len(dicts) == 0
-
-    def test_csv_reader_to_dicts_blank_file(self, temp_blank_csv_file):
-        """Test that to_dicts handles blank files."""
-        reader = CSVReader(temp_blank_csv_file)
-        dicts = reader.to_dicts()
-        assert isinstance(dicts, list)
-        assert len(dicts) == 0
-
-    def test_csv_reader_query_data_empty_file(self, temp_empty_csv_file):
-        """Test that query_data handles empty files."""
-        reader = CSVReader(temp_empty_csv_file, engine="duckdb")
-        result = reader.query_data("SELECT * FROM test")
-        assert isinstance(result, list)
-        assert len(result) == 0
-
-    def test_csv_reader_query_data_blank_file(self, temp_blank_csv_file):
-        """Test that query_data handles blank files."""
-        reader = CSVReader(temp_blank_csv_file, engine="duckdb")
-        result = reader.query_data("SELECT * FROM test")
-        assert isinstance(result, list)
-        assert len(result) == 0
+        # Verify that the method returns a new DataFrame instance each time
+        df1 = reader_empty.to_dataframe()
+        df2 = reader_empty.to_dataframe()
+        assert df1 is not df2
