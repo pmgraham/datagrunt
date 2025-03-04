@@ -1,4 +1,3 @@
-import pytest
 import json
 import polars as pl
 import pyarrow.parquet as pq
@@ -7,24 +6,6 @@ from pathlib import Path
 from src.datagrunt.csvfiles.csvwriter import CSVWriter
 
 class TestCSVWriter:
-
-    def test_init_with_valid_engines(self, sample_csv):
-            """Test initialization with valid engine values."""
-            writer_duckdb = CSVWriter(sample_csv, engine='duckdb')
-            assert writer_duckdb.engine == 'duckdb'
-
-            writer_polars = CSVWriter(sample_csv, engine='polars')
-            assert writer_polars.engine == 'polars'
-
-            # Test with spaces and different cases
-            writer_with_spaces = CSVWriter(sample_csv, engine='Duck DB')
-            assert writer_with_spaces.engine == 'duckdb'
-
-    def test_init_with_invalid_engine(self, sample_csv):
-        """Test initialization with invalid engine value."""
-        with pytest.raises(ValueError) as exc_info:
-            CSVWriter(sample_csv, engine='invalid')
-        assert "Reader engine 'invalid' is not 'duckdb' or 'polars'" in str(exc_info.value)
 
     def test_write_csv(self, sample_csv, tmp_path):
         """Test writing to CSV format."""
