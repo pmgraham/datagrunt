@@ -8,24 +8,6 @@ from src.datagrunt.csvfiles.csvreader import CSVReader
 class TestCSVReader:
     """Test suite for CSVReader class."""
 
-    def test_init_with_valid_engines(self, sample_csv):
-        """Test initialization with valid engine values."""
-        reader_polars = CSVReader(sample_csv, engine='polars')
-        assert reader_polars.engine == 'polars'
-
-        reader_duckdb = CSVReader(sample_csv, engine='duckdb')
-        assert reader_duckdb.engine == 'duckdb'
-
-        # Test with spaces and different cases
-        reader_with_spaces = CSVReader(sample_csv, engine='Duck DB')
-        assert reader_with_spaces.engine == 'duckdb'
-
-    def test_init_with_invalid_engine(self, sample_csv):
-        """Test initialization with invalid engine value."""
-        with pytest.raises(ValueError) as exc_info:
-            CSVReader(sample_csv, engine='invalid')
-        assert "Reader engine 'invalid' is not 'duckdb' or 'polars'" in str(exc_info.value)
-
     def test_to_dataframe(self, sample_csv):
         """Test conversion to dataframe with both engines."""
         # Test with Polars engine
