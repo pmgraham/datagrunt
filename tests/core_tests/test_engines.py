@@ -22,6 +22,24 @@ class TestEngines:
         assert props.csv_export_filename == 'output.csv'
         assert props.valid_engines == ('duckdb', 'polars')
 
+    def test_init_with_valid_engines(self, sample_csv):
+        """Test initialization with valid engine values."""
+        reader_polars = EngineFactory(sample_csv, engine='polars')
+        assert reader_polars.engine == 'polars'
+
+        reader_duckdb = EngineFactory(sample_csv, engine='duckdb')
+        assert reader_duckdb.engine == 'duckdb'
+
+        # Test with spaces and different cases
+        reader_with_spaces = EngineFactory(sample_csv, engine='Duck DB')
+        assert reader_with_spaces.engine == 'duckdb'
+
+    def test_init_with_invalid_engine(self, sample_csv):
+        """Test initialization with invalid engine value."""
+        with pytest.raises(ValueError) as exc_info:
+            EngineFactory(sample_csv, engine='invalid')
+        assert "Reader engine 'invalid' is not 'duckdb' or 'polars'" in str(exc_info.value)
+
     def test_duckdb_reader_creation(self, engine_factory):
         """Test creation of DuckDB reader engine."""
         reader = engine_factory.create_reader()
