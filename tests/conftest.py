@@ -56,3 +56,24 @@ def sample_files(tmp_path):
         created_files[filename] = file_path
 
     return created_files
+
+@pytest.fixture
+def sample_csv_files(tmp_path):
+    """Create sample CSV files for testing."""
+    files = {
+        'comma.csv': 'Name,Age,City\nJohn,30,New York\nJane,25,London',
+        'semicolon.csv': 'Name;Age;City\nJohn;30;New York\nJane;25;London',
+        'tab.csv': 'Name\tAge\tCity\nJohn\t30\tNew York\nJane\t25\tLondon',
+        'empty.csv': '',
+        'blank.csv': '   \n   \n',
+        'quoted.csv': '"Name","Age","City"\n"John","30","New York"\n"Jane","25","London"',
+        'messy_headers.csv': 'First Name!,#Age@,(City)',
+    }
+
+    created_files = {}
+    for filename, content in files.items():
+        file_path = tmp_path / filename
+        file_path.write_text(content)
+        created_files[filename] = str(file_path)
+
+    return created_files
