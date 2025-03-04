@@ -7,6 +7,7 @@ import duckdb
 
 # local libraries
 from numbers import Real
+from tkinter.constants import OFF
 from src.datagrunt.core.databases import DuckDBDatabase
 from src.datagrunt.core.csvcomponents import CSVDelimiter, CSVColumns, CSVColumnNameNormalizer
 
@@ -145,7 +146,15 @@ class DuckDBQueries:
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}'(FORMAT PARQUET)"
 
     def update_and_normalize_column_names(self):
-        """Query to update column names in a DuckDB table."""
+        """Query to update column names in a DuckDB table.
+
+        DuckDB has a built-in function to normalize column names. However,
+        the format of the column names from the native DuckDB function often
+        differs from the class CSVColumnNameNormalizer. Because other types
+        of engines throughout the ecosystem may have different conventions,
+        this method uses the CSVColumnNameNormalizer class to ensure
+        consistent naming conventions across different processing engines.
+        """
         duckdb.sql(self.import_csv_query())
         for old_name, new_name in zip(CSVColumns(self.filepath).columns, CSVColumnNameNormalizer(self.filepath).columns_normalized):
             sql_string = f"ALTER TABLE {self.database_table_name} RENAME COLUMN '{old_name}' TO '{new_name}'"
