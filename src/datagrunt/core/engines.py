@@ -361,6 +361,16 @@ class CSVWriterPolarsEngine(BaseWriterEngine):
 class EngineFactory:
     """Factory class for creating reader and writer engine instances."""
 
+    READER_ENGINES = {
+                'duckdb': CSVReaderDuckDBEngine,
+                'polars': CSVReaderPolarsEngine,
+            }
+
+    WRITER_ENGINES = {
+                'duckdb': CSVWriterDuckDBEngine,
+                'polars': CSVWriterPolarsEngine,
+            }
+
     def __init__(self, filepath, engine):
         self.filepath = filepath
         self.engine = engine.lower().replace(' ', '')
@@ -378,10 +388,11 @@ class EngineFactory:
         Returns:
             An instance of BaseReaderEngine
         """
-        if self.engine == 'duckdb':
-            return CSVReaderDuckDBEngine(self.filepath)
+        engine_class = self.READER_ENGINES.get(self.engine)
+        if engine_class:
+            return engine_class(self.filepath)
         else:
-            return CSVReaderPolarsEngine(self.filepath)
+            raise ValueError(f"Unsupported reader engine: {self.engine}")
 
     def create_writer(self):
         """Create a writer engine instance.
@@ -393,7 +404,8 @@ class EngineFactory:
         Returns:
             An instance of BaseWriterEngine
         """
-        if self.engine == 'duckdb':
-            return CSVWriterDuckDBEngine(self.filepath)
+        engine_class = self.WRITER_ENGINES.get(self.engine)
+        if engine_class:
+            return engine_class(self.filepath)
         else:
-            return CSVWriterPolarsEngine(self.filepath)
+            raise ValueError(f"Unsupported reader engine: {self.engine}")
