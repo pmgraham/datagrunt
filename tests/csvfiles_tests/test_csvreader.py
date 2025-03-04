@@ -1,4 +1,3 @@
-import pytest
 import polars as pl
 import pyarrow as pa
 from duckdb import DuckDBPyRelation
