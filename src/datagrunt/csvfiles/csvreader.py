@@ -8,7 +8,7 @@ import polars as pl
 # local libraries
 from src.datagrunt.core.csvcomponents import CSVComponents
 from src.datagrunt.core.queries import DuckDBQueries
-from src.datagrunt.core.engines import EngineProperties, EngineFactory
+from src.datagrunt.core.engines import EngineFactory
 
 class CSVReader(CSVComponents):
     """Class to unify the interface for reading CSV files."""
@@ -23,8 +23,6 @@ class CSVReader(CSVComponents):
         super().__init__(filepath)
         self.db_table = DuckDBQueries(self.filepath).database_table_name
         self.engine = engine.lower().replace(' ', '')
-        if self.engine not in EngineProperties.valid_engines:
-            raise ValueError(EngineProperties.value_error_message.format(engine=self.engine))
 
     def _return_empty_file_object(self, object):
         """Return an empty file object."""
