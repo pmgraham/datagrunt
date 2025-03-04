@@ -1,3 +1,5 @@
+"""Module for CSV components."""
+
 # standard library
 from collections import Counter, OrderedDict
 import csv
@@ -17,6 +19,11 @@ class CSVDelimiter:
 
     def __init__(self, filepath):
         super().__init__()
+        """Initialize the CSVDelimiter class.
+
+        Args:
+            filepath (str): The path to the CSV file.
+        """
         self.file_properties = FileProperties(filepath)
         self.first_row = CSVRows(filepath).first_row
         self.delimiter = self.infer_csv_file_delimiter()
@@ -24,9 +31,6 @@ class CSVDelimiter:
 
     def _get_most_common_non_alpha_numeric_character_from_string(self):
         """Get the most common non-alpha-numeric character from a given string.
-
-        Args:
-            text (str): The string to get the most common non-alpha-numeric character from.
 
         Returns:
             str: The most common non-alpha-numeric character from the string.
@@ -39,9 +43,6 @@ class CSVDelimiter:
 
     def infer_csv_file_delimiter(self):
         """Infer the delimiter of a CSV file.
-
-        Args:
-            csv_file (str): The path to the CSV file.
 
         Returns:
             str: The delimiter of the CSV file.
@@ -68,6 +69,11 @@ class CSVDialect:
     }
 
     def __init__(self, filepath):
+        """Initialize the CSVDialect object.
+
+        Args:
+            filepath (str): The path to the CSV file.
+        """
         self.filepath = filepath
         self.dialect = self._get_csv_dialect()
 
@@ -84,40 +90,48 @@ class CSVDialect:
 
     @property
     def quotechar(self):
+        """The character used to quote fields in the CSV file."""
         return self.dialect.quotechar
 
     @property
     def escapechar(self):
+        """The character used to escape characters in the CSV file."""
         return self.dialect.escapechar
 
     @property
     def doublequote(self):
+        """Whether double quotes are used to escape quotes in the CSV file."""
         return self.dialect.doublequote
 
     @property
     def newline_delimiter(self):
+        """The newline delimiter used in the CSV file."""
         return self.dialect.lineterminator
 
     @property
     def skipinitialspace(self):
+        """Whether spaces are skipped at the beginning of fields in the CSV file."""
         return self.dialect.skipinitialspace
 
     @property
     def quoting(self):
+        """The quoting style used in the CSV file."""
         return self.QUOTING_MAP.get(self.dialect.quoting)
 
 class CSVRows:
     """Class for parsing CSV rows."""
 
     def __init__(self, filepath):
+        """Initialize the CSVRows object.
+
+        Args:
+            filepath: The path to the CSV file.
+        """
         self.filepath = filepath
         self.first_row = self._get_first_row_from_file()
 
     def _get_first_row_from_file(self):
         """Reads and returns the first line of a file.
-
-        Args:
-            filepath: The path to the file.
 
         Returns:
             The first line of the file, stripped of leading/trailing whitespace,
@@ -248,6 +262,11 @@ class CSVColumnNameNormalizer:
 
 class CSVComponents(FileProperties):
     def __init__(self, filepath):
+        """Initialize the CSVComponents object.
+
+        Args:
+            filepath (str): Path to the CSV file.
+        """
         super().__init__(filepath)
         self.delimiter = CSVDelimiter(filepath).delimiter
 
