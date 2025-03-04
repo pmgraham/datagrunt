@@ -16,6 +16,7 @@ class CSVDelimiter:
     DEFAULT_DELIMITER = ','
 
     def __init__(self, filepath):
+        super().__init__()
         self.file_properties = FileProperties(filepath)
         self.first_row = CSVRows(filepath).first_row
         self.delimiter = self.infer_csv_file_delimiter()
@@ -116,7 +117,7 @@ class CSVRows:
         """Reads and returns the first line of a file.
 
         Args:
-            filename: The path to the file.
+            filepath: The path to the file.
 
         Returns:
             The first line of the file, stripped of leading/trailing whitespace,
@@ -167,10 +168,10 @@ class CSVColumnNameNormalizer:
     SPECIAL_CHARS_PATTERN = re.compile(r'[^a-z0-9]+')
     MULTI_UNDERSCORE_PATTERN = re.compile(r'_+')
 
-    def __init__(self, filename):
-        """Initialize the CSVColumnNameNormalizer with a filename."""
-        self.filename = filename
-        self.columns_normalized = self._normalize_column_names(CSVColumns(filename).columns)
+    def __init__(self, filepath):
+        """Initialize the CSVColumnNameNormalizer with a filepath."""
+        self.filepath = filepath
+        self.columns_normalized = self._normalize_column_names(CSVColumns(filepath).columns)
 
     def _normalize_single_column_name(self, column_name):
         """Normalize a single column name by converting to lowercase, replacing spaces and special
@@ -243,4 +244,89 @@ class CSVColumnNameNormalizer:
     @property
     def columns_to_normalized_mapping(self):
         """Return the mapping of original column names to normalized column names."""
-        return dict(OrderedDict(zip(CSVColumns(self.filename).columns, self.columns_normalized)))
+        return dict(OrderedDict(zip(CSVColumns(self.filepath).columns, self.columns_normalized)))
+
+class CSVComponents(FileProperties):
+    def __init__(self, filepath):
+        super().__init__(filepath)
+        self.delimiter = CSVDelimiter(filepath).delimiter
+
+    @property
+    def quotechar(self):
+        """Return the quote character used in the CSV file."""
+        return CSVDialect(self.filepath).quotechar
+
+    @property
+    def escapechar(self):
+        """Return the escape character used in the CSV file."""
+        return CSVDialect(self.filepath).escapechar
+
+    @property
+    def doublequote(self):
+        """Return the double quote character used in the CSV file."""
+        return CSVDialect(self.filepath).doublequote
+
+    @property
+    def newline_delimiter(self):
+        """Return the newline delimiter used in the CSV file."""
+        return CSVDialect(self.filepath).newline_delimiter
+
+    @property
+    def skipinitialspace(self):
+        """Return the skipinitialspace flag used in the CSV file."""
+        return CSVDialect(self.filepath).skipinitialspace
+
+    @property
+    def quoting(self):
+        """Return the quoting flag used in the CSV file."""
+        return CSVDialect(self.filepath).quoting
+
+    @property
+    def row_count_with_header(self):
+        """Return the number of rows in the CSV file including the header row."""
+        return CSVRows(self.filepath).row_count_with_header
+
+    @property
+    def row_count_without_header(self):
+        """Return the number of rows in the CSV file excluding the header row."""
+        return CSVRows(self.filepath).row_count_without_header
+
+    @property
+    def columns(self):
+        """Return the columns of the CSV file."""
+        return CSVColumns(self.filepath).columns
+
+    @property
+    def columns_string(self):
+        """Return the columns of the CSV file as a string."""
+        return CSVColumns(self.filepath).columns_string
+
+    @property
+    def columns_byte_string(self):
+        """Return the columns of the CSV file as a byte string."""
+        return CSVColumns(self.filepath).columns_byte_string
+
+    @property
+    def columns_count(self):
+        """Count the columns of the CSV file."""
+        return CSVColumns(self.filepath).columns_count
+
+    @property
+    def columns_normalized(self):
+        """Normalize the columns of the CSV file."""
+        return CSVColumnNameNormalizer(self.filepath).columns_normalized
+
+    @property
+    def columns_normalized_string(self):
+        """Normalize the columns of the CSV file."""
+        return CSVColumnNameNormalizer(self.filepath).columns_normalized_string
+
+    @property
+    def columns_normalized_byte_string(self):
+        """Normalize the columns of the CSV file."""
+        return CSVColumnNameNormalizer(self.filepath).columns_normalized_byte_string
+
+    @property
+    def columns_to_normalized_mapping(self):
+        """Normalize the columns of the CSV file."""
+        return CSVColumnNameNormalizer(self.filepath).columns_to_normalized_mapping

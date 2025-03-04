@@ -8,6 +8,7 @@ from src.datagrunt.core.csvcomponents import (
     CSVDialect,
     CSVColumns,
     CSVColumnNameNormalizer,
+    CSVComponents,
     CSVRows,
 )
 
@@ -20,5 +21,6 @@ __all__ = ['DuckDBDatabase',
            'CSVDialect',
            'CSVColumns',
            'CSVColumnNameNormalizer',
+           'CSVComponents',
            'CSVRows',
 ]
