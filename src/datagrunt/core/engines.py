@@ -97,11 +97,6 @@ class CSVReaderDuckDBEngine(BaseReaderEngine):
         self.filepath = filepath
         self.queries = DuckDBQueries(self.filepath)
 
-    @property
-    def db_table(self):
-        """Return the DuckDB table."""
-        return self.queries.database_table_name
-
     def get_sample(self, normalize_columns=False):
         """Return a sample of the CSV file."""
         self.queries.create_table(normalize_columns).show()
@@ -128,8 +123,7 @@ class CSVReaderDuckDBEngine(BaseReaderEngine):
         Returns:
             A list of dictionaries.
         """
-        dicts = self.to_dataframe(normalize_columns).to_dicts()
-        return dicts
+        return self.to_dataframe(normalize_columns).to_dicts()
 
     def query_data(self, sql_query, normalize_columns=False):
         """Queries as CSV file after importing into DuckDB.
@@ -160,11 +154,6 @@ class CSVReaderPolarsEngine(BaseReaderEngine):
         self.filepath = filepath
         self.queries = DuckDBQueries(self.filepath)
         self.delimiter = CSVDelimiter(self.filepath).delimiter
-
-    @property
-    def db_table(self):
-        """Return the DuckDB table."""
-        return self.queries.database_table_name
 
     def _create_dataframe(self, normalize_columns=False):
         """Normalizes the column names of the dataframe."""
@@ -247,11 +236,6 @@ class CSVWriterDuckDBEngine(BaseWriterEngine):
         """
         self.filepath = filepath
         self.queries = DuckDBQueries(self.filepath)
-
-    @property
-    def db_table(self):
-        """Return the DuckDB table."""
-        return self.queries.database_table_name
 
     def write_csv(self, export_filename=None, normalize_columns=False):
         """Query to export a DuckDB table to a CSV file.
