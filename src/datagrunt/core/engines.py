@@ -35,27 +35,48 @@ class BaseReaderEngine(ABC):
 
     @abstractmethod
     def get_sample(self, normalize_columns: bool = False) -> None:
-        """Return a sample of the data."""
+        """Return a sample of the data.
+
+        Args:
+            normalize_columns (bool): Whether to normalize column names.
+        """
         pass
 
     @abstractmethod
     def to_dataframe(self, normalize_columns: bool = False) -> pl.DataFrame:
-        """Convert data to a dataframe."""
+        """Convert data to a dataframe.
+
+        Args:
+            normalize_columns (bool): Whether to normalize column names.
+        """
         pass
 
     @abstractmethod
     def to_arrow_table(self, normalize_columns: bool = False) -> pa.Table:
-        """Convert data to a PyArrow table."""
+        """Convert data to a PyArrow table.
+
+        Args:
+            normalize_columns (bool): Whether to normalize column names.
+        """
         pass
 
     @abstractmethod
     def to_dicts(self, normalize_columns: bool = False) -> List[Dict]:
-        """Convert data to a list of dictionaries."""
+        """Convert data to a list of dictionaries.
+
+        Args:
+            normalize_columns (bool): Whether to normalize column names.
+        """
         pass
 
     @abstractmethod
     def query_data(self, sql_query: str, normalize_columns: bool = False) -> Union[DuckDBPyRelation, pl.DataFrame]:
-        """Query the data using SQL."""
+        """Query the data using SQL.
+
+        Args:
+            sql_query (str): SQL query to execute.
+            normalize_columns (optional, bool): Whether to normalize column names.
+        """
         pass
 
 class BaseWriterEngine(ABC):
@@ -68,7 +89,12 @@ class BaseWriterEngine(ABC):
 
     @abstractmethod
     def write_excel(self, export_filename, normalize_columns=False):
-        """Write data to Excel format."""
+        """Write data to Excel format.
+
+        Args:
+            export_filename (str): Path to the file to write.
+            normalize_columns (optional, bool): Whether to normalize column names.
+        """
         pass
 
     @abstractmethod
@@ -78,12 +104,22 @@ class BaseWriterEngine(ABC):
 
     @abstractmethod
     def write_json_newline_delimited(self, export_filename, normalize_columns=False):
-        """Write data to JSON Lines format."""
+        """Write data to JSON Lines format.
+
+        Args:
+            export_filename (str): Path to the file to write.
+            normalize_columns (optional, bool): Whether to normalize column names.
+        """
         pass
 
     @abstractmethod
     def write_parquet(self, export_filename, normalize_columns=False):
-        """Write data to Parquet format."""
+        """Write data to Parquet format.
+
+        Args:
+            export_filename (str): Path to the file to write.
+            normalize_columns (optional, bool): Whether to normalize column names.
+        """
         pass
 
 class CSVReaderDuckDBEngine(BaseReaderEngine):
@@ -103,11 +139,18 @@ class CSVReaderDuckDBEngine(BaseReaderEngine):
             raise FileNotFoundError
 
     def get_sample(self, normalize_columns=False):
-        """Return a sample of the CSV file."""
+        """Return a sample of the CSV file.
+
+        Args:
+            normalize_columns (optional, bool): Whether to normalize column names.
+        """
         self.queries.create_table(normalize_columns).show()
 
     def to_dataframe(self, normalize_columns=False):
         """Converts CSV to a Polars dataframe.
+
+        Args:
+            normalize_columns (optional, bool): Whether to normalize column names.
 
         Returns:
             A Polars dataframe.
@@ -117,6 +160,9 @@ class CSVReaderDuckDBEngine(BaseReaderEngine):
     def to_arrow_table(self, normalize_columns=False):
         """Converts CSV to a PyArrow table.
 
+        Args:
+            normalize_columns (optional, bool): Whether to normalize column names.
+
         Returns:
             A PyArrow table.
         """
@@ -124,6 +170,9 @@ class CSVReaderDuckDBEngine(BaseReaderEngine):
 
     def to_dicts(self, normalize_columns=False):
         """Converts CSV to a list of Python dictionaries.
+
+        Args:
+            normalize_columns (optional, bool): Whether to normalize column names.
 
         Returns:
             A list of dictionaries.
@@ -135,6 +184,7 @@ class CSVReaderDuckDBEngine(BaseReaderEngine):
 
         Args:
             sql_query (str): Query to run against DuckDB.
+            normalize_columns (optional, bool): Whether to normalize column names.
 
         Returns:
             A DuckDB DuckDBPyRelation with the query results.
@@ -150,8 +200,7 @@ class CSVReaderDuckDBEngine(BaseReaderEngine):
 class CSVReaderPolarsEngine(BaseReaderEngine):
     """Class to read CSV files and convert CSV files powered by Polars."""
     def __init__(self, filepath):
-        """
-        Initialize the CSVReader class.
+        """Initialize the CSVReader class.
 
         Args:
             filepath (str): Path to the file to read.
@@ -164,7 +213,14 @@ class CSVReaderPolarsEngine(BaseReaderEngine):
             raise FileNotFoundError
 
     def _create_dataframe(self, normalize_columns=False):
-        """Normalizes the column names of the dataframe."""
+        """Normalizes the column names of the dataframe.
+
+        Args:
+            normalize_columns (optional, bool): Whether to normalize column names.
+
+        Returns:
+            A Polars dataframe.
+        """
         df = pl.read_csv(self.filepath,
                          separator=self.delimiter,
                          truncate_ragged_lines=True,
@@ -175,6 +231,14 @@ class CSVReaderPolarsEngine(BaseReaderEngine):
         return df
 
     def _create_dataframe_sample(self, normalize_columns=False):
+        """Create a sample of the CSV file as a Polars dataframe.
+
+        Args:
+            normalize_columns (optional, bool): Whether to normalize column names.
+
+        Returns:
+            A Polars dataframe.
+        """
         df = pl.read_csv(self.filepath,
                          separator=self.delimiter,
                          truncate_ragged_lines=True,
@@ -186,12 +250,22 @@ class CSVReaderPolarsEngine(BaseReaderEngine):
         return df
 
     def get_sample(self, normalize_columns=False):
-        """Return a sample of the CSV file."""
+        """Return a sample of the CSV file.
+
+        Args:
+            normalize_columns (optional, bool): Whether to normalize column names.
+
+        Returns:
+            A Polars dataframe.
+        """
         df = self._create_dataframe_sample(normalize_columns)
         print(df)
 
     def to_dataframe(self, normalize_columns=False):
         """Converts CSV to a Polars dataframe.
+
+        Args:
+            normalize_columns (optional, bool): Whether to normalize column names.
 
         Returns:
             A Polars dataframe.
@@ -201,6 +275,9 @@ class CSVReaderPolarsEngine(BaseReaderEngine):
     def to_arrow_table(self, normalize_columns=False):
         """Converts CSV to a PyArrow table.
 
+        Args:
+            normalize_columns (optional, bool): Whether to normalize column names.
+
         Returns:
             A PyArrow table.
         """
@@ -209,6 +286,9 @@ class CSVReaderPolarsEngine(BaseReaderEngine):
 
     def to_dicts(self, normalize_columns=False):
         """Converts CSV to a list of Python dictionaries.
+
+        Args:
+            normalize_columns (optional, bool): Whether to normalize column names.
 
         Returns:
             A list of dictionaries.
@@ -221,6 +301,7 @@ class CSVReaderPolarsEngine(BaseReaderEngine):
 
         Args:
             sql_query (str): Query to run against DuckDB.
+            normalize_columns (optional, bool): Whether to normalize column names.
 
         Returns:
             A DuckDB DuckDBPyRelation with the query results.
@@ -237,7 +318,7 @@ class CSVWriterDuckDBEngine(BaseWriterEngine):
 
     def __init__(self, filepath):
         """
-        Initialize the CSVWriter class.
+        Initialize the CSV Writer DuckDB Engine class.
 
         Args:
             filepath (str): Path to the file to write.
@@ -253,6 +334,7 @@ class CSVWriterDuckDBEngine(BaseWriterEngine):
 
             Args:
                 export_filename str: The name of the output file.
+                normalize_columns bool: Whether to normalize column names.
             """
         filename = self.queries.set_export_filename(EngineProperties.csv_export_filename, export_filename)
         self.queries.create_table(normalize_columns)
@@ -263,6 +345,7 @@ class CSVWriterDuckDBEngine(BaseWriterEngine):
 
         Args:
             export_filename (optional, str): The name of the output file.
+            normalize_columns (optional, bool): Whether to normalize column names.
         """
         filename = self.queries.set_export_filename(EngineProperties.excel_export_filename, export_filename)
         self.queries.create_table(normalize_columns)
@@ -273,6 +356,7 @@ class CSVWriterDuckDBEngine(BaseWriterEngine):
 
         Args:
             export_filename (optional, str): The name of the output file.
+            normalize_columns (optional, bool): Whether to normalize column names.
         """
         filename = self.queries.set_export_filename(EngineProperties.json_export_filename, export_filename)
         self.queries.create_table(normalize_columns)
@@ -283,6 +367,7 @@ class CSVWriterDuckDBEngine(BaseWriterEngine):
 
         Args:
             export_filename (optional, str): The name of the output file.
+            normalize_columns (optional, bool): Whether to normalize column names.
         """
         filename = self.queries.set_export_filename(EngineProperties.json_newline_export_filename, export_filename)
         self.queries.create_table(normalize_columns)
@@ -293,6 +378,7 @@ class CSVWriterDuckDBEngine(BaseWriterEngine):
 
         Args:
             export_filename (optional, str): The name of the output file.
+            normalize_columns (optional, bool): Whether to normalize column names.
         """
         filename = self.queries.set_export_filename(EngineProperties.parquet_export_filename, export_filename)
         self.queries.create_table(normalize_columns)
@@ -302,6 +388,12 @@ class CSVWriterPolarsEngine(BaseWriterEngine):
     """Class to write CSVs to other file formats powered by Polars."""
 
     def __init__(self, filepath):
+        """
+        Initialize the CSV Writer Polars Engine class.
+
+        Args:
+            filepath (str): Path to the file to write.
+        """
         self.filepath = filepath
         self.queries = DuckDBQueries(filepath)
         self.db_table = DuckDBQueries(self.filepath).database_table_name
@@ -313,6 +405,7 @@ class CSVWriterPolarsEngine(BaseWriterEngine):
 
         Args:
             export_filename (optional, str): The name of the output file.
+            normalize_columns (optional, bool): Whether to normalize column names.
         """
         filename = self.queries.set_export_filename(EngineProperties.csv_export_filename, export_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
@@ -323,6 +416,7 @@ class CSVWriterPolarsEngine(BaseWriterEngine):
 
         Args:
             export_filename (optional, str): The name of the output file.
+            normalize_columns (optional, bool): Whether to normalize column names.
         """
         filename = self.queries.set_export_filename(EngineProperties.excel_export_filename, export_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
@@ -333,6 +427,7 @@ class CSVWriterPolarsEngine(BaseWriterEngine):
 
         Args:
             export_filename (optional, str): The name of the output file.
+            normalize_columns (optional, bool): Whether to normalize column names.
         """
         filename = self.queries.set_export_filename(EngineProperties.json_export_filename, export_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
@@ -343,6 +438,7 @@ class CSVWriterPolarsEngine(BaseWriterEngine):
 
         Args:
             export_filename (optional, str): The name of the output file.
+            normalize_columns (optional, bool): Whether to normalize column names.
         """
         filename = self.queries.set_export_filename(EngineProperties.json_newline_export_filename, export_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
@@ -353,6 +449,7 @@ class CSVWriterPolarsEngine(BaseWriterEngine):
 
         Args:
             export_filename (optional, str): The name of the output file.
+            normalize_columns (optional, bool): Whether to normalize column names.
         """
         filename = self.queries.set_export_filename(EngineProperties.parquet_export_filename, export_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
@@ -372,6 +469,13 @@ class EngineFactory:
             }
 
     def __init__(self, filepath, engine):
+        """
+        Initialize the ENgine Factory class.
+
+        Args:
+            filepath (str): Path to the file to read.
+            engine (str): type of engine to create by the factory.
+        """
         self.filepath = filepath
         self.engine = engine.lower().replace(' ', '')
         self.db_table = DuckDBQueries(self.filepath).database_table_name
@@ -384,8 +488,8 @@ class EngineFactory:
         """Create a reader engine instance.
 
         Args:
-            filepath: Path to the input file
-            engine: Engine type ('duckdb' or 'polars')
+            filepath (str): Path to the input file
+            engine (str): Engine type ('duckdb' or 'polars')
 
         Returns:
             An instance of BaseReaderEngine
@@ -400,8 +504,8 @@ class EngineFactory:
         """Create a writer engine instance.
 
         Args:
-            filepath: Path to the input file
-            engine: Engine type ('duckdb' or 'polars')
+            filepath (str): Path to the input file
+            engine (str): Engine type ('duckdb' or 'polars')
 
         Returns:
             An instance of BaseWriterEngine
