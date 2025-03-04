@@ -34,6 +34,7 @@ class CSVWriter(CSVComponents):
 
             Args:
                 out_filename str: The name of the output file.
+                normalize_columns optional, bool: Whether to normalize column names.
             """
         return self._create_writer().write_csv(out_filename, normalize_columns)
 
@@ -42,6 +43,7 @@ class CSVWriter(CSVComponents):
 
         Args:
             out_filename str: The name of the output file.
+            normalize_columns optional, bool: Whether to normalize column names.
         """
         return self._create_writer().write_excel(out_filename, normalize_columns)
 
@@ -50,6 +52,7 @@ class CSVWriter(CSVComponents):
 
         Args:
             out_filename str: The name of the output file.
+            normalize_columns optional, bool: Whether to normalize column names.
         """
         return self._create_writer().write_json(out_filename, normalize_columns)
 
@@ -58,6 +61,7 @@ class CSVWriter(CSVComponents):
 
         Args:
             out_filename str: The name of the output file.
+            normalize_columns optional, bool: Whether to normalize column names.
         """
         return self._create_writer().write_json_newline_delimited(out_filename, normalize_columns)
 
@@ -66,5 +70,6 @@ class CSVWriter(CSVComponents):
 
         Args:
             out_filename str: The name of the output file.
+            normalize_columns optional, bool: Whether to normalize column names.
         """
         return self._create_writer().write_parquet(out_filename, normalize_columns)
