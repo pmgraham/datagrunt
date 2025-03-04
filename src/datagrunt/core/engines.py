@@ -3,6 +3,7 @@
 # standard library
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import os
 from typing import Dict, List, Union
 
 # third party libraries
@@ -27,6 +28,7 @@ class EngineProperties:
     parquet_export_filename: str = 'output.parquet'
     valid_engines: tuple = ('duckdb', 'polars')
     value_error_message: str = """Reader engine '{engine}' is not 'duckdb' or 'polars'. Pass either 'duckdb' or 'polars' as valid engine params."""
+    missing_file_message: str = """File '{filepath}'. No such file or directory."""
 
 class BaseReaderEngine(ABC):
     """Abstract base class defining the interface for reader engines."""
@@ -96,6 +98,9 @@ class CSVReaderDuckDBEngine(BaseReaderEngine):
         """
         self.filepath = filepath
         self.queries = DuckDBQueries(self.filepath)
+        self.db_table = DuckDBQueries(self.filepath).database_table_name
+        if not os.path.exists(self.filepath):
+            raise FileNotFoundError
 
     def get_sample(self, normalize_columns=False):
         """Return a sample of the CSV file."""
@@ -153,7 +158,10 @@ class CSVReaderPolarsEngine(BaseReaderEngine):
         """
         self.filepath = filepath
         self.queries = DuckDBQueries(self.filepath)
+        self.db_table = DuckDBQueries(self.filepath).database_table_name
         self.delimiter = CSVDelimiter(self.filepath).delimiter
+        if not os.path.exists(self.filepath):
+            raise FileNotFoundError
 
     def _create_dataframe(self, normalize_columns=False):
         """Normalizes the column names of the dataframe."""
@@ -236,6 +244,9 @@ class CSVWriterDuckDBEngine(BaseWriterEngine):
         """
         self.filepath = filepath
         self.queries = DuckDBQueries(self.filepath)
+        self.db_table = DuckDBQueries(self.filepath).database_table_name
+        if not os.path.exists(self.filepath):
+            raise FileNotFoundError
 
     def write_csv(self, export_filename=None, normalize_columns=False):
         """Query to export a DuckDB table to a CSV file.
@@ -293,6 +304,9 @@ class CSVWriterPolarsEngine(BaseWriterEngine):
     def __init__(self, filepath):
         self.filepath = filepath
         self.queries = DuckDBQueries(filepath)
+        self.db_table = DuckDBQueries(self.filepath).database_table_name
+        if not os.path.exists(self.filepath):
+            raise FileNotFoundError
 
     def write_csv(self, export_filename=None, normalize_columns=False):
         """Export a Polars dataframe to a CSV file.
@@ -350,6 +364,9 @@ class EngineFactory:
     def __init__(self, filepath, engine):
         self.filepath = filepath
         self.engine = engine.lower().replace(' ', '')
+        self.db_table = DuckDBQueries(self.filepath).database_table_name
+        if not os.path.exists(self.filepath):
+            raise FileNotFoundError
 
     def create_reader(self):
         """Create a reader engine instance.
