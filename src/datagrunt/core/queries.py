@@ -6,8 +6,6 @@
 import duckdb
 
 # local libraries
-from numbers import Real
-from tkinter.constants import OFF
 from src.datagrunt.core.databases import DuckDBDatabase
 from src.datagrunt.core.csvcomponents import CSVDelimiter, CSVColumns, CSVColumnNameNormalizer
 
