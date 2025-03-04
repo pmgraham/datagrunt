@@ -31,6 +31,7 @@ class CSVReader(CSVComponents):
         return object
 
     def _create_reader(self):
+        """Create a reader object."""
         return EngineFactory(self.filepath, self.engine).create_reader()
 
     def get_sample(self, normalize_columns=False):
