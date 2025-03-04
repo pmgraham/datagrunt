@@ -39,6 +39,9 @@ class CSVReader(CSVComponents):
     def to_dataframe(self, normalize_columns=False):
         """Converts CSV to a Polars dataframe.
 
+        Args:
+            normalize_columns (bool): Whether to normalize column names.
+
         Returns:
             A Polars dataframe.
         """
@@ -49,6 +52,9 @@ class CSVReader(CSVComponents):
     def to_arrow_table(self, normalize_columns=False):
         """Converts CSV to a PyArrow table.
 
+        Args:
+            normalize_columns (bool): Whether to normalize column names.
+
         Returns:
             A PyArrow table.
         """
@@ -58,6 +64,9 @@ class CSVReader(CSVComponents):
 
     def to_dicts(self, normalize_columns=False):
         """Converts CSV to a list of dictionaries.
+
+        Args:
+            normalize_columns (bool): Whether to normalize column names.
 
         Returns:
             A list of dictionaries.
@@ -71,6 +80,7 @@ class CSVReader(CSVComponents):
 
         Args:
             sql_query (str): Query to run against DuckDB.
+            normalize_columns (optional, bool): Whether to normalize column names.
 
         Returns:
             A DuckDB DuckDBPyRelation with the query results.
