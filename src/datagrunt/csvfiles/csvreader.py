@@ -6,16 +6,12 @@
 import polars as pl
 
 # local libraries
-
+from src.datagrunt.core.csvcomponents import CSVComponents
 from src.datagrunt.core.queries import DuckDBQueries
-from src.datagrunt.core.fileproperties import FileProperties
 from src.datagrunt.core.engines import EngineProperties, EngineFactory
 
-class CSVReader:
+class CSVReader(CSVComponents):
     """Class to unify the interface for reading CSV files."""
-
-    READER_ENGINES = ['duckdb', 'polars']
-    VALUE_ERROR_MESSAGE = """Reader engine '{engine}' is not 'duckdb' or 'polars'. Pass either 'duckdb' or 'polars' as valid engine params."""
 
     def __init__(self, filepath, engine='polars'):
         """Initialize the CSV Reader class.
@@ -24,10 +20,9 @@ class CSVReader:
             filepath (str): Path to the file to read.
             engine (str, default 'polars'): Determines which reader engine class to instantiate.
         """
-        self.filepath = filepath
+        super().__init__(filepath)
         self.db_table = DuckDBQueries(self.filepath).database_table_name
         self.engine = engine.lower().replace(' ', '')
-        self.file_properties = FileProperties(self.filepath)
         if self.engine not in EngineProperties.valid_engines:
             raise ValueError(EngineProperties.value_error_message.format(engine=self.engine))
 
@@ -48,7 +43,7 @@ class CSVReader:
         Returns:
             A Polars dataframe.
         """
-        if self.file_properties.is_empty or self.file_properties.is_blank:
+        if self.is_empty or self.is_blank:
             return self._return_empty_file_object(pl.DataFrame())
         return self._create_reader().to_dataframe(normalize_columns)
 
@@ -58,7 +53,7 @@ class CSVReader:
         Returns:
             A PyArrow table.
         """
-        if self.file_properties.is_empty or self.file_properties.is_blank:
+        if self.is_empty or self.is_blank:
             return self._return_empty_file_object(pl.DataFrame().to_arrow())
         return self._create_reader().to_arrow_table(normalize_columns)
 
@@ -68,7 +63,7 @@ class CSVReader:
         Returns:
             A list of dictionaries.
         """
-        if self.file_properties.is_empty or self.file_properties.is_blank:
+        if self.is_empty or self.is_blank:
             return self._return_empty_file_object(list())
         return self._create_reader().to_dicts(normalize_columns)
 
@@ -90,6 +85,6 @@ class CSVReader:
         and spaces will be replaced with underscores, and you must reference the new column names
         in your query.
         """
-        if self.file_properties.is_empty or self.file_properties.is_blank:
+        if self.is_empty or self.is_blank:
             return self._return_empty_file_object(list())
         return self._create_reader().query_data(sql_query, normalize_columns)
