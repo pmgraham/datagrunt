@@ -7,7 +7,7 @@ from pathlib import Path
 class FileProperties:
     """Base class for file objects."""
 
-    FILE_SIZE_DIVISOR = 1024
+    FILE_SIZE_DIVISOR = 1000
     DEFAULT_ENCODING = 'utf-8'
     EXCEL_FILE_EXTENSIONS = [
         'xlsx',
