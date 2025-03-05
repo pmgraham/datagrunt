@@ -3,7 +3,7 @@ import polars as pl
 import pyarrow.parquet as pq
 from pathlib import Path
 
-from src.datagrunt.csvfiles.csvwriter import CSVWriter
+from src.datagrunt import CSVWriter
 
 class TestCSVWriter:
 

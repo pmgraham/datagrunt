@@ -1,5 +1,5 @@
 import pytest
-from src.datagrunt.core.engines import EngineFactory
+from src.datagrunt.core import EngineFactory
 
 @pytest.fixture
 def sample_csv(tmp_path):

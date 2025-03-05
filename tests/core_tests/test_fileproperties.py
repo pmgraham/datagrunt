@@ -1,5 +1,5 @@
 import pytest
-from src.datagrunt.core.fileproperties import FileProperties
+from src.datagrunt.core import FileProperties
 
 class TestFileProperties:
     """Test suite for FileProperties"""
