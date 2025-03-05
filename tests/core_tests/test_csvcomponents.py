@@ -1,4 +1,4 @@
-from src.datagrunt.core.csvcomponents import (
+from src.datagrunt.core import (
     CSVDelimiter,
     CSVDialect,
     CSVRows,
