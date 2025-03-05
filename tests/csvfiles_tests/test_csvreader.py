@@ -2,7 +2,7 @@ import polars as pl
 import pyarrow as pa
 from duckdb import DuckDBPyRelation
 
-from src.datagrunt.csvfiles.csvreader import CSVReader
+from src.datagrunt import CSVReader
 
 class TestCSVReader:
     """Test suite for CSVReader class."""

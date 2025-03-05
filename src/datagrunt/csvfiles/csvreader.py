@@ -6,9 +6,9 @@
 import polars as pl
 
 # local libraries
-from src.datagrunt.core.csvcomponents import CSVComponents
-from src.datagrunt.core.queries import DuckDBQueries
-from src.datagrunt.core.engines import EngineFactory
+from src.datagrunt.core import CSVComponents
+from src.datagrunt.core import DuckDBQueries
+from src.datagrunt.core import EngineFactory
 
 class CSVReader(CSVComponents):
     """Class to unify the interface for reading CSV files."""
