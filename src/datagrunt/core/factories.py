@@ -1,4 +1,4 @@
-"""Factory module for creating CSV reader and writer engine instances."""
+"""Factory module for creating factory instances."""
 
 # standard library
 import os
@@ -17,7 +17,7 @@ from src.datagrunt.core.engines import (
 from src.datagrunt.core.queries import DuckDBQueries
 
 class CSVEngineFactory:
-    """Factory class for creating reader and writer engine instances."""
+    """Factory class for creating CSV reader and writer engine instances."""
 
     READER_ENGINES = {
                 'duckdb': CSVReaderDuckDBEngine,
