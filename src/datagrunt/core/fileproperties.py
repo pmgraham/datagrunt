@@ -51,7 +51,7 @@ class FileStatistics:
 
     @property
     def is_large(self):
-        """Check if the file is empty. Empty files have a size of 0 bytes."""
+        """Check if the file is at least one gigabyte or larger."""
         return self.size_in_gb >= 1.0
 
 class FileExtensions:
@@ -66,17 +66,17 @@ class FileExtensions:
 
     @property
     def csv_extensions(self):
-        """Get the file extension."""
+        """Define CSV extensions."""
         return ['csv']
 
     @property
     def tsv_extensions(self):
-        """Get the file extension."""
+        """Define TSV extensions."""
         return ['tsv']
 
     @property
     def excel_extensions(self):
-        """Get the file extension."""
+        """Define Excel extensions."""
         return [
             'xlsx',
             'xlsm',
@@ -90,22 +90,22 @@ class FileExtensions:
 
     @property
     def tabular_extensions(self):
-        """Get the file extension."""
+        """Define tabular extensions."""
         return list(set(self.csv_extensions + self.tsv_extensions + self.excel_extensions))
 
     @property
     def apache_extensions(self):
-        """Get the file extension."""
+        """Define Apache extensions."""
         return ['parquet', 'avro']
 
     @property
     def semi_structured_extensions(self):
-        """Get the file extension."""
+        """Define semi-structured extensions."""
         return list(set(['json', 'jsonl']))
 
     @property
     def standard_extensions(self):
-        """Get all file extensions."""
+        """Define standard (non proprietary) extensions."""
         return list(set(self.csv_extensions +
                         self.tsv_extensions +
                         self.apache_extensions +
@@ -113,7 +113,7 @@ class FileExtensions:
 
     @property
     def structured_extensions(self):
-        """Get the file extension."""
+        """Define structured extensions."""
         return list(set(self.csv_extensions +
                         self.tsv_extensions +
                         self.excel_extensions +
@@ -122,7 +122,7 @@ class FileExtensions:
 
     @property
     def proprietary_extensions(self):
-        """Get all file extensions."""
+        """Define proprietary extensions."""
         return list(set(self.excel_extensions))
 
 class FileProperties:
