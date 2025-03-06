@@ -33,15 +33,16 @@ class FileStatistics:
 
     FILE_SIZE_DIVISOR = 1_000
     EXCEL_ROW_LIMIT = 1_048_576
+    FILE_SIZE_ROUND_FACTOR = 5
 
     def __init__(self, filepath):
         """Initialize the FileStatistics object."""
         self.filepath = filepath
         self.size_in_bytes = os.path.getsize(self.filepath)
-        self.size_in_kb = round((self.size_in_bytes / self.FILE_SIZE_DIVISOR), 5)
-        self.size_in_mb = round((self.size_in_kb / self.FILE_SIZE_DIVISOR), 5)
-        self.size_in_gb = round((self.size_in_mb / self.FILE_SIZE_DIVISOR), 5)
-        self.size_in_tb = round((self.size_in_gb / self.FILE_SIZE_DIVISOR), 5)
+        self.size_in_kb = round((self.size_in_bytes / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
+        self.size_in_mb = round((self.size_in_kb / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
+        self.size_in_gb = round((self.size_in_mb / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
+        self.size_in_tb = round((self.size_in_gb / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
 
     @property
     def modified_time(self):
