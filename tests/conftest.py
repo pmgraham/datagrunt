@@ -1,5 +1,5 @@
 import pytest
-from src.datagrunt.core import EngineFactory
+from src.datagrunt.core import CSVEngineFactory
 
 @pytest.fixture
 def sample_csv(tmp_path):
@@ -33,7 +33,7 @@ def completely_empty_csv(tmp_path):
 @pytest.fixture
 def engine_factory(sample_csv):
     """Create an EngineFactory instance."""
-    return EngineFactory(sample_csv, 'duckdb')
+    return CSVEngineFactory(sample_csv, 'duckdb')
 
 @pytest.fixture
 def sample_files(tmp_path):

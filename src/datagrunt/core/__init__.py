@@ -1,6 +1,7 @@
 from src.datagrunt.core.databases import DuckDBDatabase
 from src.datagrunt.core.queries import DuckDBQueries
-from src.datagrunt.core.engines import EngineFactory, EngineProperties
+from src.datagrunt.core.engines import EngineProperties
+from src.datagrunt.core.factories import CSVEngineFactory
 from src.datagrunt.core.fileproperties import FileProperties
 
 from src.datagrunt.core.csvcomponents import (
@@ -14,7 +15,7 @@ from src.datagrunt.core.csvcomponents import (
 
 __all__ = ['DuckDBDatabase',
            'DuckDBQueries',
-           'EngineFactory',
+           'CSVEngineFactory',
            'EngineProperties',
            'FileProperties',
            'CSVDelimiter',
