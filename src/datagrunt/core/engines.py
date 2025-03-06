@@ -33,6 +33,19 @@ class EngineProperties:
 class BaseReaderEngine(ABC):
     """Abstract base class defining the interface for reader engines."""
 
+    def __init__(self, filepath):
+        """Initialize the CSVReader class.
+
+        Args:
+            filepath (str): Path to the file to read.
+        """
+        self.filepath = filepath
+        self.queries = DuckDBQueries(self.filepath)
+        self.db_table = DuckDBQueries(self.filepath).database_table_name
+        self.delimiter = CSVDelimiter(self.filepath).delimiter
+        if not os.path.exists(self.filepath):
+            raise FileNotFoundError
+
     @abstractmethod
     def get_sample(self, normalize_columns: bool = False) -> None:
         """Return a sample of the data.
@@ -82,6 +95,19 @@ class BaseReaderEngine(ABC):
 class BaseWriterEngine(ABC):
     """Abstract base class defining the interface for writer engines."""
 
+    def __init__(self, filepath):
+        """
+        Initialize the CSV Writer DuckDB Engine class.
+
+        Args:
+            filepath (str): Path to the file to write.
+        """
+        self.filepath = filepath
+        self.queries = DuckDBQueries(self.filepath)
+        self.db_table = DuckDBQueries(self.filepath).database_table_name
+        if not os.path.exists(self.filepath):
+            raise FileNotFoundError
+
     @abstractmethod
     def write_csv(self, export_filename, normalize_columns=False):
         """Write data to CSV format."""
@@ -122,35 +148,7 @@ class BaseWriterEngine(ABC):
         """
         pass
 
-class CSVReaderEngine(BaseReaderEngine):
-    def __init__(self, filepath):
-        """Initialize the CSVReader class.
-
-        Args:
-            filepath (str): Path to the file to read.
-        """
-        self.filepath = filepath
-        self.queries = DuckDBQueries(self.filepath)
-        self.db_table = DuckDBQueries(self.filepath).database_table_name
-        self.delimiter = CSVDelimiter(self.filepath).delimiter
-        if not os.path.exists(self.filepath):
-            raise FileNotFoundError
-
-class CSVWriterEngine(BaseWriterEngine):
-    def __init__(self, filepath):
-        """
-        Initialize the CSV Writer DuckDB Engine class.
-
-        Args:
-            filepath (str): Path to the file to write.
-        """
-        self.filepath = filepath
-        self.queries = DuckDBQueries(self.filepath)
-        self.db_table = DuckDBQueries(self.filepath).database_table_name
-        if not os.path.exists(self.filepath):
-            raise FileNotFoundError
-
-class CSVReaderDuckDBEngine(CSVReaderEngine):
+class CSVReaderDuckDBEngine(BaseReaderEngine):
     """Class to read CSV files and convert CSV files powered by DuckDB."""
 
     def get_sample(self, normalize_columns=False):
@@ -212,7 +210,7 @@ class CSVReaderDuckDBEngine(CSVReaderEngine):
         self.queries.create_table(normalize_columns)
         return duckdb.sql(sql_query)
 
-class CSVReaderPolarsEngine(CSVReaderEngine):
+class CSVReaderPolarsEngine(BaseReaderEngine):
     """Class to read CSV files and convert CSV files powered by Polars."""
 
     def _create_dataframe(self, normalize_columns=False):
@@ -316,7 +314,7 @@ class CSVReaderPolarsEngine(CSVReaderEngine):
         """
         return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
 
-class CSVWriterDuckDBEngine(CSVWriterEngine):
+class CSVWriterDuckDBEngine(BaseWriterEngine):
     """Class to convert CSV files to various other supported file types powered by DuckDB."""
 
     def write_csv(self, export_filename=None, normalize_columns=False):
@@ -374,7 +372,7 @@ class CSVWriterDuckDBEngine(CSVWriterEngine):
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_parquet_query(filename))
 
-class CSVWriterPolarsEngine(CSVWriterEngine):
+class CSVWriterPolarsEngine(BaseWriterEngine):
     """Class to write CSVs to other file formats powered by Polars."""
 
     def write_csv(self, export_filename=None, normalize_columns=False):
