@@ -30,7 +30,7 @@ class EngineProperties:
     value_error_message: str = """Reader engine '{engine}' is not 'duckdb' or 'polars'. Pass either 'duckdb' or 'polars' as valid engine params."""
     missing_file_message: str = """File '{filepath}'. No such file or directory."""
 
-class BaseReaderEngine(ABC):
+class CSVBaseReaderEngine(ABC):
     """Abstract base class defining the interface for reader engines."""
 
     def __init__(self, filepath):
@@ -92,7 +92,7 @@ class BaseReaderEngine(ABC):
         """
         pass
 
-class BaseWriterEngine(ABC):
+class CSVBaseWriterEngine(ABC):
     """Abstract base class defining the interface for writer engines."""
 
     def __init__(self, filepath):
@@ -148,7 +148,7 @@ class BaseWriterEngine(ABC):
         """
         pass
 
-class CSVReaderDuckDBEngine(BaseReaderEngine):
+class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
     """Class to read CSV files and convert CSV files powered by DuckDB."""
 
     def get_sample(self, normalize_columns=False):
@@ -210,7 +210,7 @@ class CSVReaderDuckDBEngine(BaseReaderEngine):
         self.queries.create_table(normalize_columns)
         return duckdb.sql(sql_query)
 
-class CSVReaderPolarsEngine(BaseReaderEngine):
+class CSVReaderPolarsEngine(CSVBaseReaderEngine):
     """Class to read CSV files and convert CSV files powered by Polars."""
 
     def _create_dataframe(self, normalize_columns=False):
@@ -314,7 +314,7 @@ class CSVReaderPolarsEngine(BaseReaderEngine):
         """
         return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
 
-class CSVWriterDuckDBEngine(BaseWriterEngine):
+class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
     """Class to convert CSV files to various other supported file types powered by DuckDB."""
 
     def write_csv(self, export_filename=None, normalize_columns=False):
@@ -372,7 +372,7 @@ class CSVWriterDuckDBEngine(BaseWriterEngine):
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_parquet_query(filename))
 
-class CSVWriterPolarsEngine(BaseWriterEngine):
+class CSVWriterPolarsEngine(CSVBaseWriterEngine):
     """Class to write CSVs to other file formats powered by Polars."""
 
     def write_csv(self, export_filename=None, normalize_columns=False):
