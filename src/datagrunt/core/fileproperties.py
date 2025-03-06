@@ -7,7 +7,7 @@ from pathlib import Path
 class FileProperties:
     """Base class for file objects."""
 
-    FILE_SIZE_DIVISOR = 1024
+    FILE_SIZE_DIVISOR = 1000
     DEFAULT_ENCODING = 'utf-8'
     EXCEL_FILE_EXTENSIONS = [
         'xlsx',
@@ -55,13 +55,6 @@ class FileProperties:
     PROPRIETARY_FILE_EXTENSIONS = EXCEL_FILE_EXTENSIONS
 
     EXCEL_ROW_LIMIT = 1_048_576
-
-    JSON_OUT_FILENAME = 'output.json'
-    JSON_NEWLINE_OUT_FILENAME = 'output.jsonl'
-    CSV_OUT_FILENAME = 'output.csv'
-    EXCEL_OUT_FILENAME = 'output.xlsx'
-    PARQUET_OUT_FILENAME = 'output.parquet'
-    AVRO_OUT_FILENAME = 'output.avro'
 
     def __init__(self, filepath):
         """
