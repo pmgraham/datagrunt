@@ -1,4 +1,4 @@
-"""Module engines to enable data processing."""
+"""Module to create engines for data processing."""
 
 # standard library
 from abc import ABC, abstractmethod
