@@ -10,9 +10,10 @@ from src.datagrunt.core.engines import (
     CSVReaderPolarsEngine,
     CSVWriterDuckDBEngine,
     CSVWriterPolarsEngine,
-    EngineFactory,
     EngineProperties
 )
+
+from src.datagrunt.core.factories import CSVEngineFactory
 
 class TestEngines:
     def test_engine_properties(self):
@@ -24,20 +25,20 @@ class TestEngines:
 
     def test_init_with_valid_engines(self, sample_csv):
         """Test initialization with valid engine values."""
-        reader_polars = EngineFactory(sample_csv, engine='polars')
+        reader_polars = CSVEngineFactory(sample_csv, engine='polars')
         assert reader_polars.engine == 'polars'
 
-        reader_duckdb = EngineFactory(sample_csv, engine='duckdb')
+        reader_duckdb = CSVEngineFactory(sample_csv, engine='duckdb')
         assert reader_duckdb.engine == 'duckdb'
 
         # Test with spaces and different cases
-        reader_with_spaces = EngineFactory(sample_csv, engine='Duck DB')
+        reader_with_spaces = CSVEngineFactory(sample_csv, engine='Duck DB')
         assert reader_with_spaces.engine == 'duckdb'
 
     def test_init_with_invalid_engine(self, sample_csv):
         """Test initialization with invalid engine value."""
         with pytest.raises(ValueError) as exc_info:
-            EngineFactory(sample_csv, engine='invalid')
+            CSVEngineFactory(sample_csv, engine='invalid')
         assert "Reader engine 'invalid' is not 'duckdb' or 'polars'" in str(exc_info.value)
 
     def test_duckdb_reader_creation(self, engine_factory):
@@ -47,7 +48,7 @@ class TestEngines:
 
     def test_polars_reader_creation(self, sample_csv):
         """Test creation of Polars reader engine."""
-        factory = EngineFactory(sample_csv, 'polars')
+        factory = CSVEngineFactory(sample_csv, 'polars')
         reader = factory.create_reader()
         assert isinstance(reader, CSVReaderPolarsEngine)
 
@@ -58,7 +59,7 @@ class TestEngines:
 
     def test_polars_writer_creation(self, sample_csv):
         """Test creation of Polars writer engine."""
-        factory = EngineFactory(sample_csv, 'polars')
+        factory = CSVEngineFactory(sample_csv, 'polars')
         writer = factory.create_writer()
         assert isinstance(writer, CSVWriterPolarsEngine)
 
@@ -71,7 +72,7 @@ class TestEngines:
 
     def test_polars_reader_to_dataframe(self, sample_csv):
         """Test Polars reader's to_dataframe method."""
-        factory = EngineFactory(sample_csv, 'polars')
+        factory = CSVEngineFactory(sample_csv, 'polars')
         reader = factory.create_reader()
         df = reader.to_dataframe()
         assert isinstance(df, pl.DataFrame)
@@ -110,7 +111,7 @@ class TestEngines:
 
     def test_normalized_columns(self, sample_csv):
         """Test column normalization functionality."""
-        factory = EngineFactory(sample_csv, 'polars')
+        factory = CSVEngineFactory(sample_csv, 'polars')
         reader = factory.create_reader()
         df = reader.to_dataframe(normalize_columns=True)
         assert all(col.islower() for col in df.columns)
@@ -118,7 +119,7 @@ class TestEngines:
 
     def test_polars_reader_to_dicts(self, sample_csv):
         """Test conversion to dictionary list."""
-        factory = EngineFactory(sample_csv, 'polars')
+        factory = CSVEngineFactory(sample_csv, 'polars')
         reader = factory.create_reader()
         dicts = reader.to_dicts()
         assert isinstance(dicts, list)
@@ -129,5 +130,5 @@ class TestEngines:
         """Test handling of non-existent files."""
         non_existent_file = str(tmp_path / "doesnotexist.csv")
         with pytest.raises(FileNotFoundError) as exc_info:
-            EngineFactory(non_existent_file, 'duckdb')
+            CSVEngineFactory(non_existent_file, 'duckdb')
         assert 'No such file or directory' in str(exc_info.value)
