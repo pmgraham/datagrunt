@@ -7,7 +7,7 @@
 # local libraries
 from src.datagrunt.core import CSVComponents
 from src.datagrunt.core import DuckDBQueries
-from src.datagrunt.core import EngineFactory
+from src.datagrunt.core import CSVEngineFactory
 
 class CSVWriter(CSVComponents):
     """Class to unify the interface for converting CSV files to various other supported file types."""
@@ -25,7 +25,7 @@ class CSVWriter(CSVComponents):
 
     def _create_writer(self):
         """Create a reader object."""
-        return EngineFactory(self.filepath, self.engine).create_writer()
+        return CSVEngineFactory(self.filepath, self.engine).create_writer()
 
     def write_csv(self, out_filename=None, normalize_columns=False):
         """Query to export a DuckDB table to a CSV file.

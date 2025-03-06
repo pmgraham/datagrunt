@@ -8,7 +8,7 @@ import polars as pl
 # local libraries
 from src.datagrunt.core import CSVComponents
 from src.datagrunt.core import DuckDBQueries
-from src.datagrunt.core import EngineFactory
+from src.datagrunt.core import CSVEngineFactory
 
 class CSVReader(CSVComponents):
     """Class to unify the interface for reading CSV files."""
@@ -30,7 +30,7 @@ class CSVReader(CSVComponents):
 
     def _create_reader(self):
         """Create a reader object."""
-        return EngineFactory(self.filepath, self.engine).create_reader()
+        return CSVEngineFactory(self.filepath, self.engine).create_reader()
 
     def get_sample(self, normalize_columns=False):
         """Return a sample of the CSV file."""
