@@ -31,7 +31,7 @@ class CSVEngineFactory:
 
     def __init__(self, filepath, engine):
         """
-        Initialize the ENgine Factory class.
+        Initialize the Engine Factory class.
 
         Args:
             filepath (str): Path to the file to read.
