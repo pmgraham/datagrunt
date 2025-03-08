@@ -9,7 +9,7 @@ import re
 # third party libraries
 
 # local libraries
-from src.datagrunt.core.fileproperties import FileProperties
+from datagrunt.core.fileproperties import FileProperties
 
 class CSVDelimiter:
     """Class to infer and derive the CSV delimiter."""
