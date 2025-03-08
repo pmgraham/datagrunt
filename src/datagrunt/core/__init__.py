@@ -1,8 +1,8 @@
-from src.datagrunt.core.databases import DuckDBDatabase
-from src.datagrunt.core.queries import DuckDBQueries
-from src.datagrunt.core.engines import EngineProperties
-from src.datagrunt.core.factories import CSVEngineFactory
-from src.datagrunt.core.fileproperties import FileProperties
+from datagrunt.core.databases import DuckDBDatabase
+from datagrunt.core.queries import DuckDBQueries
+from datagrunt.core.engines import EngineProperties
+from datagrunt.core.factories import CSVEngineFactory
+from datagrunt.core.fileproperties import FileProperties
 
 from src.datagrunt.core.csvcomponents import (
     CSVDelimiter,
