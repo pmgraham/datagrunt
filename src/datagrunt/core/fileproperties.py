@@ -4,59 +4,14 @@
 import os
 from pathlib import Path
 
-class BlankFile:
-    """Class for checking if a file is blank."""
-    def __init__(self, filepath):
-        self.filepath = filepath
-
-    @property
-    def is_blank(self):
-        """Check if the file is blank. Blank files contain only whitespace."""
-        with open(self.filepath, 'r') as f:
-            content = f.read().strip()
-            if not content:
-                return True
-        return False
-
-class EmptyFile:
-    """Class for checking if a file is empty."""
-    def __init__(self, filepath):
-        self.filepath = filepath
-
-    @property
-    def is_empty(self):
-        """Check if the file is empty."""
-        return FileStatistics(self.filepath).size_in_bytes == 0
-
-class FileStatistics:
-    """Class for getting file statistics."""
-
-    FILE_SIZE_DIVISOR = 1_000
-    EXCEL_ROW_LIMIT = 1_048_576
-    FILE_SIZE_ROUND_FACTOR = 5
-
-    def __init__(self, filepath):
-        """Initialize the FileStatistics object."""
-        self.filepath = filepath
-        self.size_in_bytes = os.path.getsize(self.filepath)
-        self.size_in_kb = round((self.size_in_bytes / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
-        self.size_in_mb = round((self.size_in_kb / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
-        self.size_in_gb = round((self.size_in_mb / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
-        self.size_in_tb = round((self.size_in_gb / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
-
-    @property
-    def modified_time(self):
-        """Get the file modified time."""
-        return os.path.getmtime(self.filepath)
-
-    @property
-    def is_large(self):
-        """Check if the file is at least one gigabyte or larger."""
-        return self.size_in_gb >= 1.0
-
 class FileExtensions:
     """Class for getting file extensions."""
     def __init__(self, filepath):
+        """Initialize the FileExtensions object.
+
+        Args:
+            filepath (str): Path to the file.
+        """
         self.filepath = filepath
 
     @property
@@ -125,6 +80,70 @@ class FileExtensions:
         """Define proprietary extensions."""
         return list(set(self.excel_extensions))
 
+class FileStatistics:
+    """Class for getting file statistics."""
+
+    FILE_SIZE_DIVISOR = 1_000
+    EXCEL_ROW_LIMIT = 1_048_576
+    FILE_SIZE_ROUND_FACTOR = 5
+
+    def __init__(self, filepath):
+        """Initialize the FileStatistics object.
+
+        Args:
+            filepath (str): Path to the file.
+        """
+        self.filepath = filepath
+        self.size_in_bytes = os.path.getsize(self.filepath)
+        self.size_in_kb = round((self.size_in_bytes / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
+        self.size_in_mb = round((self.size_in_kb / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
+        self.size_in_gb = round((self.size_in_mb / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
+        self.size_in_tb = round((self.size_in_gb / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
+
+    @property
+    def modified_time(self):
+        """Get the file modified time."""
+        return os.path.getmtime(self.filepath)
+
+    @property
+    def is_large(self):
+        """Check if the file is at least one gigabyte or larger."""
+        return self.size_in_gb >= 1.0
+
+class BlankFile:
+    """Class for checking if a file is blank."""
+    def __init__(self, filepath):
+        """Initialize the BlankFile object.
+
+        Args:
+            filepath (str): Path to the file.
+        """
+        self.filepath = filepath
+
+    @property
+    def is_blank(self):
+        """Check if the file is blank. Blank files contain only whitespace."""
+        with open(self.filepath, 'r') as f:
+            content = f.read().strip()
+            if not content:
+                return True
+        return False
+
+class EmptyFile:
+    """Class for checking if a file is empty."""
+    def __init__(self, filepath):
+        """Initialize the EmptyFile object.
+
+        Args:
+            filepath (str): Path to the file.
+        """
+        self.filepath = filepath
+
+    @property
+    def is_empty(self):
+        """Check if the file is empty."""
+        return FileStatistics(self.filepath).size_in_bytes == 0
+
 class FileProperties:
     """Base class for file objects."""
 
@@ -160,7 +179,6 @@ class FileProperties:
     @property
     def is_unstructured(self):
         """Check if the file is unstructured."""
-
         return self.extension_string.lower() not in FileExtensions(self.filepath).standard_extensions and \
                self.extension_string.lower() not in FileExtensions(self.filepath).semi_structured_extensions
 
