@@ -5,7 +5,7 @@ import polars as pl
 import pyarrow as pa
 import pytest
 
-from src.datagrunt.core.engines import (
+from datagrunt.core.engines import (
     CSVReaderDuckDBEngine,
     CSVReaderPolarsEngine,
     CSVWriterDuckDBEngine,
