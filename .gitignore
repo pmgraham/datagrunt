@@ -145,6 +145,7 @@ dev/
 benchmarks.py
 ibm/
 dev.py
+dev.ipynb
 
 # Pycharm
 .idea/
