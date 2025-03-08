@@ -6,8 +6,8 @@
 import duckdb
 
 # local libraries
-from src.datagrunt.core.databases import DuckDBDatabase
-from src.datagrunt.core.csvcomponents import CSVDelimiter, CSVColumns, CSVColumnNameNormalizer
+from datagrunt.core.databases import DuckDBDatabase
+from datagrunt.core.csvcomponents import CSVDelimiter, CSVColumns, CSVColumnNameNormalizer
 
 class DuckDBQueries:
     """Class to store DuckDB database queries and query strings."""
