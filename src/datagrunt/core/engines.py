@@ -13,8 +13,8 @@ import polars as pl
 import pyarrow as pa
 
 # local libraries
-from src.datagrunt.core.csvcomponents import CSVDelimiter, CSVColumnNameNormalizer
-from src.datagrunt.core.queries import DuckDBQueries
+from datagrunt.core.csvcomponents import CSVDelimiter, CSVColumnNameNormalizer
+from datagrunt.core.queries import DuckDBQueries
 
 @dataclass
 class EngineProperties:
