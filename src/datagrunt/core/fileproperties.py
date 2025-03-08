@@ -39,8 +39,7 @@ class FileExtensions:
             'xltx',
             'xltm',
             'xls',
-            'xlt',
-            'xls'
+            'xlt'
         ]
 
     @property
