@@ -86,6 +86,7 @@ class FileStatistics:
     FILE_SIZE_DIVISOR = 1_000
     EXCEL_ROW_LIMIT = 1_048_576
     FILE_SIZE_ROUND_FACTOR = 5
+    LARGE_FILE_FACTOR = 1.0 # size in GB
 
     def __init__(self, filepath):
         """Initialize the FileStatistics object.
@@ -108,7 +109,7 @@ class FileStatistics:
     @property
     def is_large(self):
         """Check if the file is at least one gigabyte or larger."""
-        return self.size_in_gb >= 1.0
+        return self.size_in_gb >= self.LARGE_FILE_FACTOR
 
 class BlankFile:
     """Class for checking if a file is blank."""
