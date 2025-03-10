@@ -32,7 +32,7 @@ dev = ["pytest>=7.0", "pytest-cov>=3.0", "black", "isort", "flake8"]
 build = ["build", "twine", "bumpver"]
 
 [project.urls]
-Homepage = "https://pmgraham.github.io/datagrunt-docs"
+Homepage = "https://pmgraham.github.io/datagrunt"
 "Bug Tracker" = "https://github.com/pmgraham/datagrunt/issues"
 Documentation = "https://pmgraham.github.io/datagrunt"
 "Source Code" = "https://github.com/pmgraham/datagrunt"
