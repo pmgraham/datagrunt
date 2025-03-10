@@ -56,10 +56,10 @@ Datagrunt provides two engines for working with CSV files: DuckDB and Polars. Wh
 The reason `polars` is the default engine for `CSVReader` is because it is a powerful and fast dataframe library that is well-suited for working with CSV files. When reading CSV files, it's a common pattern to use Dataframes to process the data.
 Once the data is in a dataframe, you can leverage the powerful data manipulation capabilities of a dataframe library such as [Pandas](https://pandas.pydata.org) or [Polars](https://pola.rs). Also, in early testing, we found that `polars` is faster than `duckdb` for certain operations when reading CSV files.
 
-Conversely, `duckdb` is the default engine for `CSVWriter` because it is a powerful and fast SQL database that is well-suited for working with CSV files. When writing CSV files to other file formats, it's a common pattern to use SQL queries to process the data first.
-Once the data is in a SQL database, you can leverage the powerful data manipulation capabilities of a SQL database such as [DuckDB](https://duckdb.org). Also, in early testing, we found that `duckdb` is faster than `polars` for certain operations when writing CSV files.
+Conversely, `duckdb` is the default engine for `CSVWriter` because it is a powerful and fast in process OLAPSQL database that is well-suited for working with CSV files. Once the data is in a SQL database, you can leverage the powerful data manipulation capabilities of [DuckDB](https://duckdb.org).
+Also, in early testing, we found that `duckdb` is faster than `polars` for certain operations when writing CSV files.
 The other reason that `duckdb` is the default engine for `CSVWriter` is because when writing data to JSON format in particular, we found that `duckdb` was not only faster than `polars`, but also wrote the data with better formatting and was less error prone with larger
-sets of data. For example, when writing JSON data to a file using `duckdb`, the file was structured correctly and had consistent formatting. Sometimes when writing JSON data to a file using `polars`, the file was not structured correctly and had inconsistent formatting, causing
+sets of data. When writing JSON data to a file using `duckdb`, the file was structured correctly and had consistent formatting. Sometimes when writing JSON data to a file using `polars`, the file was not structured correctly and had inconsistent formatting, causing
 downstream issues when reading the output.
 
 ## A Word About Pandas
@@ -87,7 +87,6 @@ df = pl.read_csv(csv_file, separator=',').to_pandas() # note you are required to
 ```
 
 ## Usage Examples
-
 ```python
 from datagrunt import CSVReader
 
@@ -130,7 +129,6 @@ reader.get_sample()
 │ ? rows (>9999 rows, 20 shown)                                                          17 columns (6 shown) │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
-
 ###  SQL Queries For CSV Data
 ```python
 from datagrunt import CSVReader
@@ -140,7 +138,7 @@ engine = 'duckdb'
 
 reader = CSVReader(csv_file, engine=engine)
 
-# Construct your SQL query
+# Construct your SQL query. The `db_table` property is provided by the CSVReader class automatically.
 query = f"""
 WITH core AS (
     SELECT
@@ -157,7 +155,7 @@ ORDER BY 2 DESC
 """
 
 # Execute the query and get results as a Polars DataFrame
-df = reader.query_data(query).pl()
+df = reader.query_data(query).pl() # the .pl() method is used to convert the results from a DuckDBPyRelation object to a Polars DataFrame
 print(df)
 ┌────────────────┬───────────────┐
 │ city           ┆ vehicle_count │
@@ -190,7 +188,7 @@ reader = CSVReader('path/to/file.csv')
 df = pd.read_csv(reader.filepath, sep=reader.delimiter) # filepath and delimiter are attributes of the CSVReader class.
 ```
 
-### Reassign the Delimiter To Make A Correction
+### Reassign the Delimiter
 
 Sometimes, the delimiter may not be correctly identified by Datagrunt. In such cases, you can reassign the delimiter attribute to correct it.
 ```python
@@ -208,15 +206,13 @@ By updating the delimiter attribute, you can ensure the `CSVReader` object will 
 Datagrunt provides two primary classes for interacting with data: `CSVReader` and `CSVWriter`. These classes are designed to simplify the process of reading and writing CSV files.
 
 ### CSVReader
-The `CSVReader` class is used to read data from a CSV file. It provides a simple interface for reading data from a CSV file and converting it into a DataFrame. You instantiate the CSVReader as follows:
-
+The `CSVReader` class is used to read data from a CSV file. It provides a simple interface for reading data from a CSV file and converting it into a DataFrame. You instantiate the `CSVReader` class as follows:
 ```python
 from datagrunt import CSVReader
-reader = CSVReader('path/to/file.csv').
+reader = CSVReader('path/to/file.csv')
 ```
 
 You may optionally specify the engine to use for reading the CSV file. The two options are `duckdb` and `polars`. The default engine is `polars`.
-
 ```python
 reader = CSVReader('path/to/file.csv', engine='duckdb') # don't pass any engine if you want to use the default engine.
 ```
@@ -224,8 +220,8 @@ reader = CSVReader('path/to/file.csv', engine='duckdb') # don't pass any engine 
 The primary methods of the `CSVReader` class are:
 - `get_sample(normalize_columns=False)`: Returns a sample of the data in the CSV file (20 rows).
 - `to_dataframe(normalize_columns=False)`: Converts the data in the CSV file into a Polars DataFrame.
-- `to_arrow_table(normalize_columns=False)`: Converts the data in the CSV file into an Arrow Table.
-- `to_dicts(normalize_columns=False)`:Converts the data in the CSV file into a list of dictionaries.
+- `to_arrow_table(normalize_columns=False)`: Converts the data in the CSV file into a PyArrow Table.
+- `to_dicts(normalize_columns=False)`: Converts the data in the CSV file into a list of dictionaries.
 - `query_data(sql_query, normalize_columns=False)`: Executes a SQL query on the data in the CSV file.
 
 ### CSVWriter
