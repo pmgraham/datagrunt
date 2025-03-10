@@ -34,7 +34,7 @@ build = ["build", "twine", "bumpver"]
 [project.urls]
 Homepage = "https://pmgraham.github.io/datagrunt-docs"
 "Bug Tracker" = "https://github.com/pmgraham/datagrunt/issues"
-Documentation = "https://pmgraham.github.io/datagrunt-docs"
+Documentation = "https://pmgraham.github.io/datagrunt"
 "Source Code" = "https://github.com/pmgraham/datagrunt"
 
 [tool.setuptools.packages.find]
