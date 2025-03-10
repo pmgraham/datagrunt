@@ -1,13 +1,10 @@
 # Welcome To Datagrunt
-
 Datagrunt is a Python library designed to simplify the way you work with CSV files. It provides a streamlined approach to reading, processing, and transforming your data into various formats, making data manipulation efficient and intuitive.
 
 ## Why Datagrunt?
-
 Born out of real-world frustration, Datagrunt eliminates the need For repetitive coding when handling CSV files. Whether you're a data analyst, data engineer, or data scientist, Datagrunt empowers you to focus on insights, not tedious data wrangling.
 
 ### What Datagrunt Is Not
-
 Datagrunt is not an extension of or a replacement for DuckDB or Polars, nor a comprehensive data processing solution. It is not designed to be a comprehensive one stop shop for all of your CSV processing needs. It's designed to simplify the way you
 work with CSV files and to help solve the pain point of inferring delimiters when a file structure is unknown. We grant an easy way to convert CSV files to dataframes and to export them to various formats. One of Datagrunt's value propositions is its relative
 simplicity and ease of use. We will extend functionaltiy where it makes sense to do so, but we will be selective and strategic in our approach to add or extend functionality.
@@ -49,6 +46,44 @@ Get started with Datagrunt in seconds using pip:
 
 ```bash
 pip install datagrunt
+```
+
+# How to Use Datagrunt
+Even though Datagrunt is a fairly simple library, it may not be obvious where to start. Here's a quick guide to help you naviate Datagrunt.
+
+## Datagrunt Engines
+Datagrunt provides two engines for working with CSV files: DuckDB and Polars. When instantiating the `CSVReader` or the `CSVWriter` class, you can specify which engine to use. The default engine for `CSVReader` is `polars`, while the default engine for `CSVWriter` is `duckdb`.
+The reason `polars` is the default engine for `CSVReader` is because it is a powerful and fast dataframe library that is well-suited for working with CSV files. When reading CSV files, it's a common pattern to use Dataframes to process the data.
+Once the data is in a dataframe, you can leverage the powerful data manipulation capabilities of a dataframe library such as [Pandas](https://pandas.pydata.org) or [Polars](https://pola.rs). Also, in early testing, we found that `polars` is faster than `duckdb` for certain operations when reading CSV files.
+
+Conversely, `duckdb` is the default engine for `CSVWriter` because it is a powerful and fast SQL database that is well-suited for working with CSV files. When writing CSV files to other file formats, it's a common pattern to use SQL queries to process the data first.
+Once the data is in a SQL database, you can leverage the powerful data manipulation capabilities of a SQL database such as [DuckDB](https://duckdb.org). Also, in early testing, we found that `duckdb` is faster than `polars` for certain operations when writing CSV files.
+The other reason that `duckdb` is the default engine for `CSVWriter` is because when writing data to JSON format in particular, we found that `duckdb` was not only faster than `polars`, but also wrote the data with better formatting and was less error prone with larger
+sets of data. For example, when writing JSON data to a file using `duckdb`, the file was structured correctly and had consistent formatting. Sometimes when writing JSON data to a file using `polars`, the file was not structured correctly and had inconsistent formatting, causing
+downstream issues when reading the output.
+
+## A Word About Pandas
+Pandas is a powerful data manipulation library that is widely used in the data science community. It provides a wide range of tools for data cleaning, transformation, and analysis.
+However, when working with large datasets, Pandas can be slow and memory-intensive. In contrast, DuckDB and Polars are designed to handle large datasets efficiently and are optimized for performance. In fact, when testing with large datasets, we found both DuckDB and Polars to be orders of magnitude faster than Pandas.
+With that said, Pandas is still a valuable tool for data manipulation and analysis and it is not our goal to replace it nor limit its usage. We encourage users to continue using Pandas for their data manipulation needs whenever it best suits their needs.
+
+Any Polars dataframe object can be easily converted to a Pandas dataframe using the `to_pandas()` method. This allows users to leverage the power of both libraries for their data manipulation needs. Likewise, if you have a Pandas dataframe object, you can convert it to a Polars dataframe
+by instantiating a new Polars dataframe object from the Pandas dataframe as follows:
+
+```python
+import polars as pl
+import pandas as pd
+
+# Convert a Pandas dataframe to a Polars dataframe
+df_pandas = pd.DataFrame({'a': [1, 2, 3], 'b': [4, 5, 6]})
+df_polars = pl.DataFrame(df_pandas)
+```
+To convert a Polars dataframe to a Pandas dataframe, use the `to_pandas()` method:
+
+```python
+import polars as pl
+
+df = pl.read_csv(csv_file, separator=',').to_pandas() # note you are required to have Pandas installed even if it's not imported
 ```
 
 ## Usage Examples
@@ -96,7 +131,7 @@ reader.get_sample()
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-##  SQL Queries For CSV Data
+###  SQL Queries For CSV Data
 ```python
 from datagrunt import CSVReader
 
@@ -143,8 +178,31 @@ print(df)
 └────────────────┴───────────────┘
 ```
 
-# How to Use Datagrunt
-Even though Datagrunt is a fairly simple library, it may not be obvious where to start. Here's a quick guide to help you naviate Datagrunt.
+### Combine Datagrunt With Other Libraries
+
+Datagrunt can be combined with other libraries. For example, you could use Datagrunt to instantiate the `CSVReader` class, and then use the provided `delimiter` attribute with other libraries.
+
+```python
+from datagrunt import CSVReader
+import pandas as pd
+
+reader = CSVReader('path/to/file.csv')
+df = pd.read_csv(reader.filepath, sep=reader.delimiter) # filepath and delimiter are attributes of the CSVReader class.
+```
+
+### Reassign the Delimiter To Make A Correction
+
+Sometimes, the delimiter may not be correctly identified by Datagrunt. In such cases, you can reassign the delimiter attribute to correct it.
+```python
+from datagrunt import CSVReader
+reader = CSVReader('path/to/file.csv')
+
+# let's assume the delimiter is wrong and was inferred incorrectly as a space. Reassign the delimiter to correct it.
+reader.delimiter = ','
+df = pd.read_csv(reader.filepath, sep=reader.delimiter)
+```
+
+By updating the delimiter attribute, you can ensure the `CSVReader` object will read the file correctly if you choose to use any of its methods down the line.
 
 ## Primary Classes
 Datagrunt provides two primary classes for interacting with data: `CSVReader` and `CSVWriter`. These classes are designed to simplify the process of reading and writing CSV files.
