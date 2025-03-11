@@ -152,3 +152,4 @@ dev.ipynb
 .replit
 deploy.sh
 virtualenv.sh
+data_local/
