@@ -7,6 +7,7 @@ from functools import lru_cache
 import re
 
 # third party libraries
+import polars as pl
 
 # local libraries
 from datagrunt.core.fileproperties import FileProperties
@@ -159,7 +160,17 @@ class CSVColumns:
     def __init__(self, filepath):
         """Initialize the CSVColumns class."""
         self.filepath = filepath
-        self.columns = CSVRows(filepath).first_row.split(CSVDelimiter(filepath).delimiter)
+        self.columns = self._get_columns()
+
+    def _get_columns(self):
+        """Return the columns."""
+        df = pl.read_csv(self.filepath,
+                         separator=CSVDelimiter(self.filepath).delimiter,
+                         truncate_ragged_lines=True,
+                         infer_schema=False,
+                         n_rows=5
+                        )
+        return df.columns
 
     @property
     def columns_string(self):
