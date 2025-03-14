@@ -114,6 +114,9 @@ class FileStatistics:
 
 class BlankFile:
     """Class for checking if a file is blank."""
+
+    FILE_SIZE_MB_FACTOR = 10
+
     def __init__(self, filepath):
         """Initialize the BlankFile object.
 
@@ -128,8 +131,8 @@ class BlankFile:
 
         filestats = FileStatistics(self.filepath)
 
-        # Very low probability of being blank if file is 1GB or larger in size
-        if filestats.size_in_gb >= filestats.LARGE_FILE_FACTOR:
+        # Very low probability of being blank if file is 10MB or larger in size
+        if filestats.size_in_mb >= self.FILE_SIZE_MB_FACTOR:
             return False
         with open(self.filepath, 'r') as f:
             content = f.read().strip()
