@@ -1,7 +1,5 @@
-from dill.tests.test_recursive import fib
 """Module for deriving and evaluating file properties."""
 
-from importlib.metadata import files
 # standard library
 import os
 from pathlib import Path
