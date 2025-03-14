@@ -113,7 +113,7 @@ class FileStatistics:
 class BlankFile:
     """Class for checking if a file is blank."""
 
-    FILE_SIZE_MB_FACTOR = 10
+    FILE_SIZE_MB_FACTOR = 10.0
 
     def __init__(self, filepath):
         """Initialize the BlankFile object.
