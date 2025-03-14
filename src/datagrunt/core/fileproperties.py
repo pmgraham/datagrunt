@@ -1,5 +1,7 @@
+from dill.tests.test_recursive import fib
 """Module for deriving and evaluating file properties."""
 
+from importlib.metadata import files
 # standard library
 import os
 from pathlib import Path
@@ -123,6 +125,11 @@ class BlankFile:
     @property
     def is_blank(self):
         """Check if the file is blank. Blank files contain only whitespace."""
+        filestats = FileStatistics(self.filepath)
+
+        # Very low probability of being blank if file is 1GB or larger in size
+        if filestats.size_in_gb >= filestats.LARGE_FILE_FACTOR:
+            return False
         with open(self.filepath, 'r') as f:
             content = f.read().strip()
             if not content:
