@@ -153,3 +153,6 @@ dev.ipynb
 deploy.sh
 virtualenv.sh
 data_local/
+
+# uv
+uv.lock
