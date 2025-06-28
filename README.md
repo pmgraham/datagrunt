@@ -14,8 +14,15 @@ Born out of real-world frustration, Datagrunt eliminates the need for repetitive
 - **Pythonic API:** Enjoy a clean and intuitive API that integrates seamlessly into your existing Python workflows.
 
 ## Installation
+We recommend using [UV](https://docs.astral.sh/uv/). However, you may get started with Datagrunt in seconds using UV or pip.
 
-Get started with Datagrunt in seconds using pip:
+Get started with UV:
+
+```bash
+uv pip install datagrunt
+```
+
+Get started with pip:
 
 ```bash
 pip install datagrunt
