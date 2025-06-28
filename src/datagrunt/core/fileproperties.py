@@ -235,3 +235,8 @@ class FileProperties:
     def is_tabular(self):
         """Check if the file is tabular."""
         return self.extension_string.lower() in FileExtensions(self.filepath).tabular_extensions
+
+    @property
+    def is_tsv(self):
+        """Check if the file is tabular."""
+        return self.extension_string.lower() in FileExtensions(self.filepath).tsv_extensions
