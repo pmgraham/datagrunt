@@ -17,6 +17,7 @@ class CSVDelimiter:
 
     DELIMITER_REGEX_PATTERN = r'[^0-9a-zA-Z_ "-]'
     DEFAULT_DELIMITER = ','
+    DEFAULT_TAB_DELIMITER = "\t"
 
     def __init__(self, filepath):
         super().__init__()
@@ -52,6 +53,8 @@ class CSVDelimiter:
 
         if self.file_properties.is_empty or self.file_properties.is_blank:
             delimiter = self.DEFAULT_DELIMITER
+        elif self.file_properties.is_tsv:
+            delimiter = self.DEFAULT_TAB_DELIMITER
         elif len(delimiter_candidates) == 0:
             delimiter = ' '
         else:
