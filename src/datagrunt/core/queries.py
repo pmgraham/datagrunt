@@ -157,7 +157,7 @@ class DuckDBQueries:
         for old_name, new_name in zip(CSVColumns(self.filepath).columns,
                                       CSVColumnNameNormalizer(self.filepath).columns_normalized
                                       ):
-            sql_string = f"ALTER TABLE {self.database_table_name} RENAME COLUMN '{old_name}' TO '{new_name}'"
+            sql_string = f"ALTER TABLE {self.database_table_name} RENAME COLUMN \"{old_name}\" TO \"{new_name}\""
             duckdb.sql(sql_string)
 
     def create_table(self, normalize_columns=False):
