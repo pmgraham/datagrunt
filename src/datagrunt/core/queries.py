@@ -7,7 +7,7 @@ import duckdb
 
 # local libraries
 from datagrunt.core.databases import DuckDBDatabase
-from datagrunt.core.csvcomponents import CSVDelimiter, CSVColumns, CSVColumnNameNormalizer
+from datagrunt.core.csvcomponents import CSVDelimiter, CSVColumnNameNormalizer
 
 class DuckDBQueries:
     """Class to store DuckDB database queries and query strings."""
@@ -154,7 +154,8 @@ class DuckDBQueries:
         consistent naming conventions across different processing engines.
         """
         duckdb.sql(self.import_csv_query())
-        for old_name, new_name in zip(CSVColumns(self.filepath).columns,
+        table_columns = duckdb.sql(f"SELECT * FROM {self.database_table_name} LIMIT 0").columns
+        for old_name, new_name in zip(table_columns,
                                       CSVColumnNameNormalizer(self.filepath).columns_normalized
                                       ):
             sql_string = f"ALTER TABLE {self.database_table_name} RENAME COLUMN \"{old_name}\" TO \"{new_name}\""
