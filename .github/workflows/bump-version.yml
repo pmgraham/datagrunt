@@ -11,15 +11,14 @@ jobs:
   bump-version:
     name: Bump version
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           # We need to fetch all history and tags for bumpver
           fetch-depth: 0
+          # This token is required to push back to the repository
+          token: ${{ secrets.PAT_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
