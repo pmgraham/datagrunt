@@ -17,7 +17,7 @@ class CSVDelimiter:
 
     DELIMITER_REGEX_PATTERN = r'[^0-9a-zA-Z_ "-]'
     DEFAULT_DELIMITER = ','
-    DEFAULT_TAB_DELIMITER = "\t"
+    DEFAULT_TAB_DELIMITER = '\t'
 
     def __init__(self, filepath):
         super().__init__()
