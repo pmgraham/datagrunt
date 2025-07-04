@@ -172,6 +172,20 @@ class DuckDBQueries:
             duckdb.sql(self.import_csv_query())
         return duckdb.sql(self.select_from_duckdb_table()).execute()
 
+    def _normalize_dataframe_columns(self, dataframe):
+        """Applies column name normalization to a Polars DataFrame.
+        Args:
+            dataframe (polars.DataFrame): The DataFrame to normalize.
+        Returns:
+            polars.DataFrame: The normalized DataFrame.
+        """
+        column_normalizer = CSVColumnNameNormalizer(self.filepath)
+        normalized_mapping = {
+            col: column_normalizer.columns_to_normalized_mapping.get(col, col)
+            for col in dataframe.columns
+        }
+        return dataframe.rename(normalized_mapping)
+
     def sql_query_to_dataframe(self, sql_query, normalize_columns=False):
         """Query to convert a SQL query to a Polars DataFrame.
 
@@ -182,5 +196,13 @@ class DuckDBQueries:
         Returns:
             polars.DataFrame: The resulting DataFrame.
         """
-        self.create_table(normalize_columns)
-        return duckdb.sql(sql_query).pl()
+        # Ensure the table is created with original column names for querying
+        duckdb.sql(self.import_csv_query())
+
+        # Execute the user's query
+        result_df = duckdb.sql(sql_query).pl()
+
+        if normalize_columns:
+            result_df = self._normalize_dataframe_columns(result_df)
+
+        return result_df
