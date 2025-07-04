@@ -2,10 +2,8 @@ name: Publish to PyPI
 
 on:
   push:
-    branches:
-      - main
-    paths:
-      - 'src/**'
+    tags:
+      - 'v*'
 
 jobs:
   build-and-publish:
