@@ -13,7 +13,7 @@ from datagrunt.core.engines import (
     EngineProperties
 )
 
-from src.datagrunt.core.factories import CSVEngineFactory
+from datagrunt.core.factories import CSVEngineFactory
 
 class TestEngines:
     def test_engine_properties(self):
