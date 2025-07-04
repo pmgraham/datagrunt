@@ -192,6 +192,21 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         """
         return self.to_dataframe(normalize_columns).to_dicts()
 
+    def _normalize_relation_columns(self, relation):
+        """Applies column name normalization to a DuckDBPyRelation.
+        Args:
+            relation (duckdb.DuckDBPyRelation): The relation to normalize.
+        Returns:
+            duckdb.DuckDBPyRelation: The normalized relation.
+        """
+        current_columns = relation.columns
+        column_normalizer = CSVColumnNameNormalizer(self.filepath)
+        projections = []
+        for col in current_columns:
+            normalized_name = column_normalizer.columns_to_normalized_mapping.get(col, col)
+            projections.append(f'"{col}" AS "{normalized_name}"')
+        return relation.project(", ".join(projections))
+
     def query_data(self, sql_query, normalize_columns=False):
         """Queries as CSV file after importing into DuckDB.
 
@@ -207,8 +222,17 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
             query = f"SELECT col1, col2 FROM {dg.db_table}"
             dg.query_csv_data(query)
         """
-        self.queries.create_table(normalize_columns)
-        return duckdb.sql(sql_query)
+        # Ensure the base table is created with original column names
+        # so the user's query can reference them.
+        self.queries.create_table(normalize_columns=False)
+
+        # Execute the user's query
+        result_relation = duckdb.sql(sql_query)
+
+        if normalize_columns:
+            result_relation = self._normalize_relation_columns(result_relation)
+
+        return result_relation
 
 class CSVReaderPolarsEngine(CSVBaseReaderEngine):
     """Class to read CSV files and convert CSV files powered by Polars."""
