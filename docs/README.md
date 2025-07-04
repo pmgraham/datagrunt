@@ -250,8 +250,6 @@ Exposed in both the 'CSVReader` and `CSVWriter` classes are a number of attribut
 # Known Issues
 These are a list of known issues that will be added to the [Github Issue Tracker](https://github.com/pmgraham/datagrunt/issues).
 
-- **When using the `polars` engine, sometimes queries fail if the `duckdb` engine cannot parse the CSV file.**
-
 # License
 This project is licensed under the [MIT License](https://opensource.org/license/mit)
 
