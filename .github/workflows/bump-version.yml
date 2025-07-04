@@ -6,18 +6,28 @@ on:
       - main
     paths:
       - 'src/**'
+  workflow_dispatch:
+    inputs:
+      part:
+        description: 'The part of the version to bump'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+        - patch
+        - minor
+        - major
 
 jobs:
   bump-version:
     name: Bump version
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          # We need to fetch all history and tags for bumpver
           fetch-depth: 0
-          # This token is required to push back to the repository
           token: ${{ secrets.PAT_TOKEN }}
 
       - name: Set up Python
@@ -36,5 +46,5 @@ jobs:
       - name: Pull latest changes
         run: git pull origin main
 
-      - name: Bump patch version
-        run: bumpver update --patch
+      - name: Bump version
+        run: bumpver update --${{ github.event.inputs.part || 'patch' }}
