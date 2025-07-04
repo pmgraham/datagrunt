@@ -29,8 +29,7 @@ class DuckDBDatabase:
 
     def __del__(self):
         """
-        Close the database connection 
-        Delete .db files after use.
+        Close the database connection and delete .db files after use.
         """
         self.database_connection.close()
         if os.path.exists(self.database_filename):
