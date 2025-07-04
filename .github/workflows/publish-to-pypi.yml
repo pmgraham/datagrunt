@@ -7,6 +7,7 @@ on:
       - completed
     branches:
       - main
+  workflow_dispatch: # Allows manual triggering
 
 jobs:
   build-and-publish:
@@ -17,18 +18,29 @@ jobs:
       id-token: write
 
     steps:
+      # Checkout the full history to find all tags
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest tag
+        id: get_tag
+        run: echo "tag=$(git describe --tags --abbrev=0)" >> $GITHUB_OUTPUT
+
+      # Checkout the specific tagged version to publish
+      - name: Checkout tagged version
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.get_tag.outputs.tag }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install build
+      - name: Install build dependencies
+        run: python -m pip install --upgrade build
 
       - name: Build package
         run: python -m build
