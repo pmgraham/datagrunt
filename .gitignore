@@ -156,3 +156,5 @@ data_local/
 
 # uv
 uv.lock
+.ruff_cache/
+lint.sh
