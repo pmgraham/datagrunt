@@ -26,6 +26,21 @@ class TestCSVStringSample:
         assert "4,5,6" in quality_sample
         assert "1,," not in quality_sample
 
+    def test_csv_string_sample(self, tmp_path):
+        # Create a temporary CSV file
+        test_file = tmp_path / "sample_test.csv"
+        test_file.write_text("a,b,c\n1,2,3\n4,5,6\n7,8,9")
+
+        # Get the sample
+        sampler = CSVStringSample(str(test_file))
+        sample = sampler.csv_string_sample
+
+        # The sample should contain the header and the first two rows
+        assert "a,b,c" in sample
+        assert "1,2,3" in sample
+        assert "4,5,6" in sample
+        assert "7,8,9" not in sample
+
 
 class TestCSVDelimiter:
     """Test suite for CSVDelimiter class."""
