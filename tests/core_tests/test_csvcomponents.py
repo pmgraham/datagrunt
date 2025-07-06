@@ -4,8 +4,28 @@ from datagrunt.core import (
     CSVRows,
     CSVColumns,
     CSVColumnNameNormalizer,
-    CSVComponents
+    CSVComponents,
+    CSVStringSample
 )
+
+
+class TestCSVStringSample:
+    """Test suite for the CSVStringSample class."""
+
+    def test_csv_string_sample_by_quality(self, tmp_path):
+        # Create a temporary CSV file with mixed quality rows
+        test_file = tmp_path / "quality_test.csv"
+        test_file.write_text("a,b,c\n1,2,3\n1,,\n4,5,6\n,,")
+        
+        # Get the quality sample
+        sampler = CSVStringSample(str(test_file))
+        quality_sample = sampler.csv_string_sample_by_quality
+        
+        # The top two rows should be the ones with no nulls
+        assert "1,2,3" in quality_sample
+        assert "4,5,6" in quality_sample
+        assert "1,," not in quality_sample
+
 
 class TestCSVDelimiter:
     """Test suite for CSVDelimiter class."""
