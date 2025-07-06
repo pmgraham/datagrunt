@@ -391,4 +391,3 @@ class CSVComponents(FileProperties):
     def csv_string_sample(self):
         """Return a sample of the CSV file as a string."""
         return CSVStringSample(self.filepath).csv_string_sample
-
