@@ -32,7 +32,10 @@ class CSVStringSample:
         Returns:
             str: The CSV string representation of the DataFrame.
         """
-        df = pl.read_csv(self.filepath, separator=CSVDelimiter(self.filepath).delimiter, n_rows=self.SAMPLE_ROWS)
+        df = pl.read_csv(self.filepath,
+                         separator=CSVDelimiter(self.filepath).delimiter,
+                         n_rows=self.SAMPLE_ROWS
+                         )
         return df.write_csv(file=None)
 
 class CSVDelimiter:
