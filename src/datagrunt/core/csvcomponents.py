@@ -26,9 +26,6 @@ class CSVStringSample:
         """
         Convert a Polars DataFrame to a CSV string.
 
-        Args:
-            df (pl.DataFrame): The DataFrame to convert.
-
         Returns:
             str: The CSV string representation of the DataFrame.
         """
