@@ -20,7 +20,6 @@ class CSVStringSample:
     def __init__(self, filepath):
         """Initialize the CSVString object."""
         self.filepath = filepath
-        self.delimiter = CSVDelimiter(filepath).delimiter
         self.csv_string_sample = self._dataframe_to_csv_string()
 
     def _dataframe_to_csv_string(self):
@@ -33,7 +32,7 @@ class CSVStringSample:
         Returns:
             str: The CSV string representation of the DataFrame.
         """
-        df = pl.read_csv(self.filepath, separator=self.delimiter, n_rows=self.SAMPLE_ROWS)
+        df = pl.read_csv(self.filepath, separator=CSVDelimiter(self.filepath).delimiter, n_rows=self.SAMPLE_ROWS)
         return df.write_csv(file=None)
 
 class CSVDelimiter:
