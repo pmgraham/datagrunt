@@ -24,9 +24,9 @@ class CSVStringSample:
             filepath (str): The path to the CSV file.
         """
         self.filepath = filepath
-        self.csv_string_sample = self._dataframe_to_csv_string()
 
-    def _dataframe_to_csv_string(self):
+    @property
+    def csv_string_sample(self):
         """
         Convert a Polars DataFrame to a CSV string.
 
@@ -38,6 +38,22 @@ class CSVStringSample:
                          n_rows=self.SAMPLE_ROWS
                          )
         return df.write_csv(file=None)
+
+    @property
+    def csv_string_sample_by_quality(self):
+        """
+        Convert a Polars DataFrame to a CSV string, prioritizing rows with the fewest null values.
+
+        Returns:
+            str: The CSV string representation of the DataFrame.
+        """
+        df = pl.read_csv(self.filepath,
+                         separator=CSVDelimiter(self.filepath).delimiter,
+                         )
+        df = df.with_columns(pl.sum_horizontal(pl.all().is_null()).alias("null_count"))
+        df = df.sort("null_count")
+        df = df.drop("null_count")
+        return df.head(self.SAMPLE_ROWS).write_csv(file=None)
 
 class CSVDelimiter:
     """Class to infer and derive the CSV delimiter."""
@@ -395,3 +411,8 @@ class CSVComponents(FileProperties):
     def csv_string_sample(self):
         """Return a sample of the CSV file as a string."""
         return CSVStringSample(self.filepath).csv_string_sample
+
+    @property
+    def csv_string_sample_by_quality(self):
+        """Return a sample of the CSV file as a string, prioritizing rows with the fewest null values."""
+        return CSVStringSample(self.filepath).csv_string_sample_by_quality
