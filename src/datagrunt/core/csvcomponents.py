@@ -18,7 +18,11 @@ class CSVStringSample:
     SAMPLE_ROWS = 2
 
     def __init__(self, filepath):
-        """Initialize the CSVString object."""
+        """Initialize the CSVString object.
+
+        Args:
+            filepath (str): The path to the CSV file.
+        """
         self.filepath = filepath
         self.csv_string_sample = self._dataframe_to_csv_string()
 
