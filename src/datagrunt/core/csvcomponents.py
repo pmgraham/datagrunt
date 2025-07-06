@@ -16,6 +16,7 @@ class CSVStringSample:
     """Base class for creating a string sample of a CSV file."""
 
     SAMPLE_ROWS = 2
+    SAMPLE_ROWS_BY_QUALITY = 50_000
 
     def __init__(self, filepath):
         """Initialize the CSVString object.
@@ -49,6 +50,7 @@ class CSVStringSample:
         """
         df = pl.read_csv(self.filepath,
                          separator=CSVDelimiter(self.filepath).delimiter,
+                         n_rows=self.SAMPLE_ROWS_BY_QUALITY,
                          )
         df = df.with_columns(pl.sum_horizontal(pl.all().is_null()).alias("null_count"))
         df = df.sort("null_count")
