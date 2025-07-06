@@ -11,6 +11,7 @@ from datagrunt.core.csvcomponents import (
     CSVColumnNameNormalizer,
     CSVComponents,
     CSVRows,
+    CSVStringSample
 )
 
 __all__ = ['DuckDBDatabase',
@@ -24,4 +25,5 @@ __all__ = ['DuckDBDatabase',
            'CSVColumnNameNormalizer',
            'CSVComponents',
            'CSVRows',
+           'CSVStringSample'
 ]
