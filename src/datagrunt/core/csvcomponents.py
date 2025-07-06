@@ -12,6 +12,51 @@ import polars as pl
 # local libraries
 from datagrunt.core.fileproperties import FileProperties
 
+class CSVStringSample:
+    """Base class for creating a string sample of a CSV file."""
+
+    SAMPLE_ROWS = 2
+    SAMPLE_ROWS_BY_QUALITY = 50_000
+
+    def __init__(self, filepath):
+        """Initialize the CSVString object.
+
+        Args:
+            filepath (str): The path to the CSV file.
+        """
+        self.filepath = filepath
+
+    @property
+    def csv_string_sample(self):
+        """
+        Convert a Polars DataFrame to a CSV string.
+
+        Returns:
+            str: The CSV string representation of the DataFrame.
+        """
+        df = pl.read_csv(self.filepath,
+                         separator=CSVDelimiter(self.filepath).delimiter,
+                         n_rows=self.SAMPLE_ROWS
+                         )
+        return df.write_csv(file=None)
+
+    @property
+    def csv_string_sample_by_quality(self):
+        """
+        Convert a Polars DataFrame to a CSV string, prioritizing rows with the fewest null values.
+
+        Returns:
+            str: The CSV string representation of the DataFrame.
+        """
+        df = pl.read_csv(self.filepath,
+                         separator=CSVDelimiter(self.filepath).delimiter,
+                         n_rows=self.SAMPLE_ROWS_BY_QUALITY,
+                         )
+        df = df.with_columns(pl.sum_horizontal(pl.all().is_null()).alias("null_count"))
+        df = df.sort("null_count")
+        df = df.drop("null_count")
+        return df.head(self.SAMPLE_ROWS).write_csv(file=None)
+
 class CSVDelimiter:
     """Class to infer and derive the CSV delimiter."""
 
@@ -363,3 +408,13 @@ class CSVComponents(FileProperties):
     def columns_to_normalized_mapping(self):
         """Normalize the columns of the CSV file."""
         return CSVColumnNameNormalizer(self.filepath).columns_to_normalized_mapping
+
+    @property
+    def csv_string_sample(self):
+        """Return a sample of the CSV file as a string."""
+        return CSVStringSample(self.filepath).csv_string_sample
+
+    @property
+    def csv_string_sample_by_quality(self):
+        """Return a sample of the CSV file as a string, prioritizing rows with the fewest null values."""
+        return CSVStringSample(self.filepath).csv_string_sample_by_quality
