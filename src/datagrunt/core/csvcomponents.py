@@ -12,6 +12,30 @@ import polars as pl
 # local libraries
 from datagrunt.core.fileproperties import FileProperties
 
+class CSVStringSample:
+    """Base class for creating a string sample of a CSV file."""
+
+    SAMPLE_ROWS = 2
+
+    def __init__(self, filepath):
+        """Initialize the CSVString object."""
+        self.filepath = filepath
+        self.delimiter = CSVDelimiter(filepath).delimiter
+        self.csv_string_sample = self._dataframe_to_csv_string()
+
+    def _dataframe_to_csv_string(self):
+        """
+        Convert a Polars DataFrame to a CSV string.
+
+        Args:
+            df (pl.DataFrame): The DataFrame to convert.
+
+        Returns:
+            str: The CSV string representation of the DataFrame.
+        """
+        df = pl.read_csv(self.filepath, separator=self.delimiter, n_rows=self.SAMPLE_ROWS)
+        return df.write_csv(file=None)
+
 class CSVDelimiter:
     """Class to infer and derive the CSV delimiter."""
 
@@ -363,3 +387,9 @@ class CSVComponents(FileProperties):
     def columns_to_normalized_mapping(self):
         """Normalize the columns of the CSV file."""
         return CSVColumnNameNormalizer(self.filepath).columns_to_normalized_mapping
+
+    @property
+    def csv_string_sample(self):
+        """Return a sample of the CSV file as a string."""
+        return CSVStringSample(self.filepath).csv_string_sample
+
