@@ -71,7 +71,7 @@ class BaseAIEngine(ABC):
         """
         pass
 
-class Google(BaseAIEngine):
+class GoogleEngine(BaseAIEngine):
     """Class to interact with the Google GenAI API."""
 
     THINKING_BUDGET = -1  # Default thinking budget for the model
