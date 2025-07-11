@@ -10,7 +10,7 @@ from datagrunt.ai import prompts
 from datagrunt.ai import AIEngineFactory
 from datagrunt.core import CSVStringSample
 
-class CSVSchemaReport:
+class CSVSchemaReportAIGenerated:
     """Class to generate a CSV schema report using AI tools."""
 
     def __init__(self, filepath, engine, api_key=None, **kwargs):
