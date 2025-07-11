@@ -6,8 +6,7 @@ import json
 # third-party imports
 
 # local imports
-from datagrunt.ai import prompts
-from datagrunt.ai import AIEngineFactory
+from datagrunt.ai import AIEngineFactory, prompts
 from datagrunt.core import CSVStringSample
 
 class CSVSchemaReportAIGenerated:
