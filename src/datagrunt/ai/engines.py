@@ -2,8 +2,8 @@
 
 # standard library imports
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 import json
-import os
 
 # third-party imports
 import anthropic
@@ -14,13 +14,25 @@ from google.genai import types
 from datagrunt.ai import prompts
 from datagrunt.core import CSVStringSample
 
+@dataclass
+class EngineProperties:
+    """Base properties for CSV operations."""
+    valid_engines: tuple = ('google')
+
 class BaseAIEngine(ABC):
     """Abstract base class for AI providers."""
 
     @abstractmethod
-    def __init__(self):
+    def __init__(self, api_key=None, **kwargs):
         """Initialize the AI provider."""
-        pass
+        self.api_key = api_key
+        self.vertexai = kwargs.pop('vertexai', False)
+        self.gcp_project = kwargs.pop('gcp_project', None)
+        self.gcp_location = kwargs.pop('gcp_location', None)
+        if not self.api_key and not self.vertexai:
+            raise ValueError("Either api_key or vertexai must be provided.")
+        if not self.api_key and self.vertexai and (not self.gcp_project or not self.gcp_location):
+            raise ValueError("You must provide gcp_project and gcp_location when using Vertex AI.")
 
     @abstractmethod
     def generate_content(
@@ -66,26 +78,6 @@ class Google(BaseAIEngine):
     THINKING_BUDGET = -1  # Default thinking budget for the model
     RESPONSE_JSON_MIME_TYPE = "application/json"  # Default response MIME type
     MAX_OUTPUT_TOKENS = 8192  # Maximum output tokens for the model
-
-    def __init__(self, file_path, api_key=None, **kwargs):
-        """Initialize the GoogleGenAI.
-
-        Args:
-            api_key (str, optional): The API key for Google GenAI.
-            gcp_project (str, optional): The GCP project ID for Vertex AI.
-            gcp_location (str, optional): The GCP location for Vertex AI.
-            vertexai (bool, optional): If True, use Vertex AI; otherwise use the API key.
-        """
-        self.file_path = file_path
-        self.api_key = api_key
-        self.vertexai = kwargs.pop('vertexai', False)
-        self.gcp_project = kwargs.pop('gcp_project', None)
-        self.gcp_location = kwargs.pop('gcp_location', None)
-
-        if not self.api_key and not self.vertexai:
-            raise ValueError("Either api_key or vertexai must be provided.")
-        if not self.api_key and self.vertexai and (not self.gcp_project or not self.gcp_location):
-            raise ValueError("You must provide gcp_project and gcp_location when using Vertex AI.")
 
     def _client(self):
         """Create and return a GenAI client."""
@@ -150,9 +142,6 @@ class Google(BaseAIEngine):
             response_mime_type = self.RESPONSE_JSON_MIME_TYPE,
         )
         return config
-
-
-        pass
 
     def generate_content(self, model, prompt, system_instruction=None):
         """Generate content using the Google GenAI API.
