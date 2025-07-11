@@ -1,3 +1,5 @@
+"""This module contains shared fixtures for pytest."""
+
 import pytest
 from datagrunt.core import CSVEngineFactory
 
