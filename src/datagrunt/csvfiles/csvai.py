@@ -28,7 +28,7 @@ class CSVSchemaReportAIGenerated:
         """Create an AI engine instance."""
         return AIEngineFactory(self.api_key, self.engine, **self.kwargs).create_engine()
 
-    def analyze_csv_schema(
+    def generate_csv_schema_report(
         self,
         model,
         prompt=None,
