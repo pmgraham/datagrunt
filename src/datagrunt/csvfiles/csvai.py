@@ -61,7 +61,8 @@ class CSVSchemaReportAIGenerated:
         try:
             csv_schema_report = json.loads(response_text)
         except json.JSONDecodeError:
-            raise ValueError("The response is not a valid JSON string.")
+            raise ValueError("The response is not a valid JSON string." \
+            "Check to make sure the `max_tokens` parameter is set high enough to capture the model's complete response.")
 
         if return_json:
             return json.dumps(csv_schema_report, indent=4)
