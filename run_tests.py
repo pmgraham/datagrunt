@@ -1,3 +1,5 @@
+"""This module runs all tests for the datagrunt package."""
+
 from pathlib import Path
 import sys
 import subprocess

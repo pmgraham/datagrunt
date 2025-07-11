@@ -152,6 +152,7 @@ class GoogleAIEngine(BaseAIEngine):
         ]
 
     def _ground_in_google_search(self):
+        """Ground the model in Google Search."""
         return [
                  types.Tool(google_search=types.GoogleSearch()),
             ]
