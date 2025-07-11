@@ -16,16 +16,9 @@ class EngineProperties:
 class BaseAIEngine(ABC):
     """Abstract base class for AI providers."""
 
-    def __init__(self, api_key=None, **kwargs):
+    def __init__(self, api_key=None):
         """Initialize the AI provider."""
         self.api_key = api_key
-        self.vertexai = kwargs.pop('vertexai', False)
-        self.gcp_project = kwargs.pop('gcp_project', None)
-        self.gcp_location = kwargs.pop('gcp_location', None)
-        if not self.api_key and not self.vertexai:
-            raise ValueError("Either api_key or vertexai must be provided.")
-        if not self.api_key and self.vertexai and (not self.gcp_project or not self.gcp_location):
-            raise ValueError("You must provide gcp_project and gcp_location when using Vertex AI.")
 
     @abstractmethod
     def generate_content(
@@ -68,9 +61,32 @@ class BaseAIEngine(ABC):
 class GoogleAIEngine(BaseAIEngine):
     """Class to interact with the Google GenAI API."""
 
-    THINKING_BUDGET = -1  # Default thinking budget for the model
-    RESPONSE_JSON_MIME_TYPE = "application/json"  # Default response MIME type
+    THINKING_BUDGET = -1  # Default thinking budget for the model. -1 means "auto".
+    DEFAULT_RESPONSE_JSON_MIME_TYPE = "application/json"  # Default response MIME type
     MAX_OUTPUT_TOKENS = 8192  # Maximum output tokens for the model
+    DEFAULT_TEMPERATURE = 0.5  # Default temperature for the model
+    DEFAULT_TOP_P = 1  # Default top_p for the model
+    DEFAULT_SEED = 0  # Default seed for the model
+    DEFAULT_SYSTEM_INSTRUCTIONS = ""  # Default system instructions for the model
+
+    def __init__(self, api_key, **kwargs):
+        """Initialize the Google AI provider."""
+        super().__init__(api_key)
+        self.vertexai = kwargs.pop('vertexai', False)
+        if not self.api_key and not self.vertexai:
+            raise ValueError("Either api_key or vertexai must be provided.")
+        self.gcp_project = kwargs.pop('gcp_project', None)
+        self.gcp_location = kwargs.pop('gcp_location', None)
+        self.prompt = kwargs.pop('prompt', None)
+        self.max_tokens = kwargs.pop('max_tokens', self.MAX_OUTPUT_TOKENS)
+        self.temperature = kwargs.pop('temperature', self.DEFAULT_TEMPERATURE)
+        self.top_p = kwargs.pop('top_p', self.DEFAULT_TOP_P)
+        self.seed = kwargs.pop('seed', self.DEFAULT_SEED)
+        self.safety_settings = kwargs.pop('safety_settings', self._safety_settings())
+        self.thinking_budget = kwargs.pop('thinking_budget', self.THINKING_BUDGET)
+        self.response_type = kwargs.pop('response_type', self.DEFAULT_RESPONSE_JSON_MIME_TYPE)
+        if not self.api_key and self.vertexai and (not self.gcp_project or not self.gcp_location):
+            raise ValueError("You must provide gcp_project and gcp_location when using Vertex AI.")
 
     def _client(self):
         """Create and return a GenAI client."""
@@ -121,18 +137,18 @@ class GoogleAIEngine(BaseAIEngine):
 
     def _content_config(self, system_instruction=None):
         if not system_instruction:
-            system_instruction = ""
+            system_instruction = self.DEFAULT_SYSTEM_INSTRUCTIONS
         config = types.GenerateContentConfig(
-            temperature = 0.5,
-            top_p = 1,
-            seed = 0,
-            max_output_tokens = self.MAX_OUTPUT_TOKENS,
-            safety_settings = self._safety_settings(),
+            temperature = self.temperature,
+            top_p = self.top_p,
+            seed = self.seed,
+            max_output_tokens = self.max_tokens,
+            safety_settings = self.safety_settings,
             system_instruction=[types.Part.from_text(text=system_instruction)],
             thinking_config=types.ThinkingConfig(
-                thinking_budget=self.THINKING_BUDGET,
+                thinking_budget=self.thinking_budget,
             ),
-            response_mime_type = self.RESPONSE_JSON_MIME_TYPE,
+            response_mime_type = self.response_type,
         )
         return config
 
