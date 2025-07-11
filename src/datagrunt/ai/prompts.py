@@ -41,7 +41,7 @@ Return a map of original column names to normalized column names.
     * Distance
 
 If `has_column_header` is false, then recommend column header names based on the the data that are nicely formatted in lowercase and underscore separated.
-After generating a list of recommend columns, add another element grouping those recommendations into dimension and measures.
+After generating a list of recommended columns, add another element grouping those recommendations into dimension and measures.
 Be sure to reserve measures only for quantifiable values and not anything that could be categorized as a `special value`.
 
 Return a response format like this:
