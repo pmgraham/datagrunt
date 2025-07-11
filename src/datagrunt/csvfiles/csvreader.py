@@ -25,7 +25,7 @@ class CSVReader(CSVComponents):
         self.engine = engine.lower().replace(' ', '')
 
     def _return_empty_file_object(self, object):
-        """Return an empty file object."""
+        """Return an empty object of the specified type."""
         return object
 
     def _create_reader(self):

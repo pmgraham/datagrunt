@@ -1,3 +1,5 @@
+"""This module runs all tests for the datagrunt package."""
+
 import pytest
 import sys
 from pathlib import Path

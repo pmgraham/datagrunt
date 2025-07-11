@@ -27,7 +27,21 @@ class CSVSchemaReportAIGenerated:
         return AIEngineFactory(self.api_key, self.engine, **self.kwargs).create_engine()
 
     def _get_ai_response(self, model, prompt, system_instructions):
-        """Get a response from the AI engine with error handling."""
+        """Send a request to the AI engine and handle potential errors.
+
+        Args:
+            model (str): The name of the model to use.
+            prompt (str): The prompt to send to the model.
+            system_instructions (str): System instructions to guide the model's response.
+
+        Returns:
+            dict: The JSON response from the AI engine.
+
+        Raises:
+            ValueError: If the response is not valid JSON.
+            TypeError: If the response is not a text string.
+            RuntimeError: For any other unexpected errors.
+        """
         try:
             response_text = self._create_engine().generate_content(
                 model=model,
