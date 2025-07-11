@@ -22,7 +22,6 @@ class EngineProperties:
 class BaseAIEngine(ABC):
     """Abstract base class for AI providers."""
 
-    @abstractmethod
     def __init__(self, api_key=None, **kwargs):
         """Initialize the AI provider."""
         self.api_key = api_key
