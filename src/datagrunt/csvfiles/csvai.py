@@ -28,6 +28,36 @@ class CSVSchemaReportAIGenerated:
         """Create an AI engine instance."""
         return AIEngineFactory(self.api_key, self.engine, **self.kwargs).create_engine()
 
+    def _get_ai_response(self, model, prompt, system_instructions):
+        """Get a response from the AI engine with error handling."""
+        try:
+            response_text = self._create_engine().generate_content(
+                model=model,
+                prompt=prompt,
+                system_instruction=system_instructions
+            )
+            return json.loads(response_text)
+        except json.JSONDecodeError as e:
+            error_message = (
+                "The model's response was not a valid JSON object. "
+                "This can happen if the `max_tokens` parameter is too low, cutting off the response. "
+                f"Details: {e}\n"
+                f"Model Response: {response_text[:500]}..."
+            )
+            raise ValueError(error_message) from e
+        except TypeError as e:
+            error_message = (
+                "The model did not return a text response that could be processed. "
+                "This can happen if the `max_tokens` parameter is too low, cutting off the response. "
+                f"Details: {e}\n"
+                f"Model Response: {response_text}"
+            )
+            raise TypeError(error_message) from e
+        except Exception as e:
+            # Catching other potential errors, such as API connection issues
+            error_message = f"An unexpected error occurred: {e}"
+            raise RuntimeError(error_message) from e
+
     def generate_csv_schema_report(
         self,
         model,
@@ -52,17 +82,7 @@ class CSVSchemaReportAIGenerated:
         if not system_instructions:
             system_instructions = prompts.CSV_SCHEMA_SYSTEM_INSTRUCTIONS
 
-        response_text = self._create_engine().generate_content(
-            model=model,
-            prompt=prompt,
-            system_instruction=system_instructions
-        )
-
-        try:
-            csv_schema_report = json.loads(response_text)
-        except json.JSONDecodeError:
-            raise ValueError("The response is not a valid JSON string." \
-            "Check to make sure the `max_tokens` parameter is set high enough to capture the model's complete response.")
+        csv_schema_report = self._get_ai_response(model, prompt, system_instructions)
 
         if return_json:
             return json.dumps(csv_schema_report, indent=4)
