@@ -24,7 +24,6 @@ class CSVSchemaReportAIGenerated:
         if self.kwargs.pop('ground_google_search', False):
             raise ValueError("Grounding in Google Search is not supported for this class.")
 
-
     def _create_engine(self):
         """Create an AI engine instance."""
         return AIEngineFactory(self.api_key, self.engine, **self.kwargs).create_engine()
