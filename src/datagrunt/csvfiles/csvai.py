@@ -20,7 +20,7 @@ class CSVSchemaReport:
         self.api_key = api_key
         self.kwargs = kwargs
 
-    def __create_engine(self):
+    def _create_engine(self):
         """Create an AI engine instance."""
         return AIEngineFactory(self.api_key, self.engine, **self.kwargs).create_engine()
 
@@ -41,12 +41,12 @@ class CSVSchemaReport:
             dict: The generated schema from the CSV string.
         """
         if not prompt:
-            csv_string = CSVStringSample(self.file_path).csv_string_sample_by_quality
+            csv_string = CSVStringSample(self.filepath).csv_string_sample_by_quality
             prompt = prompts.CSV_SCHEMA_PROMPT.format(csv_sample_string=csv_string)
         if not system_instructions:
             system_instructions = prompts.CSV_SCHEMA_SYSTEM_INSTRUCTIONS
 
-        response_text = self.generate_content(
+        response_text = self._create_engine().generate_content(
             model=model,
             prompt=prompt,
             system_instruction=system_instructions
