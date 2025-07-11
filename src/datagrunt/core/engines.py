@@ -341,6 +341,10 @@ class CSVReaderPolarsEngine(CSVBaseReaderEngine):
 class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
     """Class to convert CSV files to various other supported file types powered by DuckDB."""
 
+    def __init__(self, filepath):
+        """Initialize the CSVWriterDuckDBEngine class."""
+        super().__init__(filepath)
+
     def write_csv(self, export_filename=None, normalize_columns=False):
         """Query to export a DuckDB table to a CSV file.
 
@@ -398,6 +402,10 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
 
 class CSVWriterPolarsEngine(CSVBaseWriterEngine):
     """Class to write CSVs to other file formats powered by Polars."""
+
+    def __init__(self, filepath):
+        """Initialize the CSVWriterPolarsEngine class."""
+        super().__init__(filepath)
 
     def write_csv(self, export_filename=None, normalize_columns=False):
         """Export a Polars dataframe to a CSV file.

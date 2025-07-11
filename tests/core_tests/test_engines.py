@@ -1,3 +1,5 @@
+"""This module contains tests for the engine classes."""
+
 from pathlib import Path
 
 from duckdb import DuckDBPyRelation
