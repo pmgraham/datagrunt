@@ -37,6 +37,8 @@ class CSVSchemaReportAIGenerated:
             model (str): The name of the model to use.
             prompt (str, optional): The prompt to send to the model. If not provided, a default prompt will be used.
             system_instructions (str, optional): System instructions to guide the model's response.
+            return_json (bool, optional): Whether to return the response as a JSON string or leave as a dict.
+
         Returns:
             dict: The generated schema from the CSV string.
         """
