@@ -85,6 +85,7 @@ class GoogleAIEngine(BaseAIEngine):
         self.safety_settings = kwargs.pop('safety_settings', self._safety_settings())
         self.thinking_budget = kwargs.pop('thinking_budget', self.THINKING_BUDGET)
         self.response_type = kwargs.pop('response_type', self.DEFAULT_RESPONSE_JSON_MIME_TYPE)
+        self.ground_google_search = kwargs.pop('ground_google_search', False)
         if not self.api_key and self.vertexai and (not self.gcp_project or not self.gcp_location):
             raise ValueError("You must provide gcp_project and gcp_location when using Vertex AI.")
 
@@ -135,21 +136,43 @@ class GoogleAIEngine(BaseAIEngine):
             )
         ]
 
+    def _ground_in_google_search(self):
+        return [
+                 types.Tool(google_search=types.GoogleSearch()),
+            ]
+
     def _content_config(self, system_instruction=None):
+        """Content configuration for API calls to the LLM."""
         if not system_instruction:
             system_instruction = self.DEFAULT_SYSTEM_INSTRUCTIONS
-        config = types.GenerateContentConfig(
-            temperature = self.temperature,
-            top_p = self.top_p,
-            seed = self.seed,
-            max_output_tokens = self.max_tokens,
-            safety_settings = self.safety_settings,
-            system_instruction=[types.Part.from_text(text=system_instruction)],
-            thinking_config=types.ThinkingConfig(
-                thinking_budget=self.thinking_budget,
-            ),
-            response_mime_type = self.response_type,
-        )
+
+        if self.ground_google_search:
+            config = types.GenerateContentConfig(
+                temperature = self.temperature,
+                top_p = self.top_p,
+                seed = self.seed,
+                max_output_tokens = self.max_tokens,
+                safety_settings = self.safety_settings,
+                system_instruction=[types.Part.from_text(text=system_instruction)],
+                thinking_config=types.ThinkingConfig(
+                    thinking_budget=self.thinking_budget,
+                ),
+                response_mime_type = self.response_type,
+                tools = self._ground_in_google_search()
+            )
+        else:
+            config = types.GenerateContentConfig(
+                temperature = self.temperature,
+                top_p = self.top_p,
+                seed = self.seed,
+                max_output_tokens = self.max_tokens,
+                safety_settings = self.safety_settings,
+                system_instruction=[types.Part.from_text(text=system_instruction)],
+                thinking_config=types.ThinkingConfig(
+                    thinking_budget=self.thinking_budget,
+                ),
+                response_mime_type = self.response_type,
+            )
         return config
 
     def generate_content(self, model, prompt, system_instruction=None):
