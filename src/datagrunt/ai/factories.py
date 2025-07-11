@@ -3,12 +3,12 @@
 # local libraries
 
 from datagrunt.ai.engines import EngineProperties
-from datagrunt.ai.engines import GoogleEngine
+from datagrunt.ai.engines import GoogleAIEngine
 
 class AIEngineFactory:
     """Factory class for creating AI engine instances."""
     AI_ENGINES = {
-                'google': GoogleEngine,
+                'google': GoogleAIEngine,
             }
 
     def __init__(self, api_key, engine, **kwargs):
