@@ -7,6 +7,7 @@ import json
 
 # local imports
 from datagrunt.ai import AIEngineFactory, prompts
+from datagrunt.ai.engines import EngineProperties
 from datagrunt.core import CSVStringSample
 
 class CSVSchemaReportAIGenerated:
@@ -18,6 +19,11 @@ class CSVSchemaReportAIGenerated:
         self.engine = engine.lower().replace(' ', '')
         self.api_key = api_key
         self.kwargs = kwargs
+        if self.engine not in EngineProperties.valid_engines:
+            raise ValueError(f"Unsupported AI engine: {self.engine}")
+        if self.kwargs.pop('ground_google_search'):
+            raise ValueError(f"Grounding in Google Search is not supported for this class.")
+
 
     def _create_engine(self):
         """Create an AI engine instance."""
