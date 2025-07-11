@@ -69,23 +69,38 @@ class GoogleAIEngine(BaseAIEngine):
     DEFAULT_SEED = 0  # Default seed for the model
     DEFAULT_SYSTEM_INSTRUCTIONS = ""  # Default system instructions for the model
 
-    def __init__(self, api_key, **kwargs):
+    def __init__(
+            self,
+            api_key=None,
+            vertexai=False,
+            gcp_project=None,
+            gcp_location=None,
+            prompt=None,
+            max_tokens=MAX_OUTPUT_TOKENS,
+            temperature=DEFAULT_TEMPERATURE,
+            top_p=DEFAULT_TOP_P,
+            seed=DEFAULT_SEED,
+            safety_settings=None,
+            thinking_budget=THINKING_BUDGET,
+            response_type=DEFAULT_RESPONSE_JSON_MIME_TYPE,
+            ground_google_search=False
+            ):
         """Initialize the Google AI provider."""
         super().__init__(api_key)
-        self.vertexai = kwargs.pop('vertexai', False)
+        self.vertexai = vertexai
         if not self.api_key and not self.vertexai:
             raise ValueError("Either api_key or vertexai must be provided.")
-        self.gcp_project = kwargs.pop('gcp_project', None)
-        self.gcp_location = kwargs.pop('gcp_location', None)
-        self.prompt = kwargs.pop('prompt', None)
-        self.max_tokens = kwargs.pop('max_tokens', self.MAX_OUTPUT_TOKENS)
-        self.temperature = kwargs.pop('temperature', self.DEFAULT_TEMPERATURE)
-        self.top_p = kwargs.pop('top_p', self.DEFAULT_TOP_P)
-        self.seed = kwargs.pop('seed', self.DEFAULT_SEED)
-        self.safety_settings = kwargs.pop('safety_settings', self._safety_settings())
-        self.thinking_budget = kwargs.pop('thinking_budget', self.THINKING_BUDGET)
-        self.response_type = kwargs.pop('response_type', self.DEFAULT_RESPONSE_JSON_MIME_TYPE)
-        self.ground_google_search = kwargs.pop('ground_google_search', False)
+        self.gcp_project = gcp_project
+        self.gcp_location = gcp_location
+        self.prompt = prompt
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.top_p = top_p
+        self.seed = seed
+        self.safety_settings = safety_settings if safety_settings is not None else self._safety_settings()
+        self.thinking_budget = thinking_budget
+        self.response_type = response_type
+        self.ground_google_search = ground_google_search
         if not self.api_key and self.vertexai and (not self.gcp_project or not self.gcp_location):
             raise ValueError("You must provide gcp_project and gcp_location when using Vertex AI.")
 
