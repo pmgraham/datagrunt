@@ -7,20 +7,19 @@ import polars as pl
 import pyarrow as pa
 import pytest
 
-from datagrunt.core.engines import (
+from datagrunt.core import (
+    CSVEngineProperties,
     CSVReaderDuckDBEngine,
     CSVReaderPolarsEngine,
     CSVWriterDuckDBEngine,
-    CSVWriterPolarsEngine,
-    EngineProperties
+    CSVWriterPolarsEngine
 )
-
-from src.datagrunt.core.factories import CSVEngineFactory
+from datagrunt.core import CSVEngineFactory
 
 class TestEngines:
     def test_engine_properties(self):
-        """Test EngineProperties default values."""
-        props = EngineProperties("test.csv")
+        """Test CSVEngineProperties default values."""
+        props = CSVEngineProperties("test.csv")
         assert props.dataframe_sample_rows == 20
         assert props.csv_export_filename == 'output.csv'
         assert props.valid_engines == ('duckdb', 'polars')
