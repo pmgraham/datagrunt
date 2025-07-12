@@ -1,7 +1,7 @@
 """Factory module for creating AI factory instances."""
 
 # local libraries
-from datagrunt.ai.engines import EngineProperties, GoogleAIEngine
+from datagrunt.core.ai.engines import EngineProperties, GoogleAIEngine
 
 class AIEngineFactory:
     """Factory class for creating AI engine instances."""
