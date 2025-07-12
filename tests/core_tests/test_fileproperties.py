@@ -1,7 +1,7 @@
 """This module contains tests for the FileProperties class."""
 
 import pytest
-from src.datagrunt.core import FileProperties
+from datagrunt.core import FileProperties
 
 class TestFileProperties:
     """Test suite for FileProperties"""

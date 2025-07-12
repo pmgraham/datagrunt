@@ -13,11 +13,11 @@ import polars as pl
 import pyarrow as pa
 
 # local libraries
-from datagrunt.core.csvcomponents import CSVDelimiter, CSVColumnNameNormalizer
+from datagrunt.core.csv_io.csvcomponents import CSVDelimiter, CSVColumnNameNormalizer
 from datagrunt.core.databases import DuckDBQueries
 
 @dataclass
-class EngineProperties:
+class CSVEngineProperties:
     """Base properties for CSV operations."""
     filepath: str
     dataframe_sample_rows: int = 20
@@ -268,7 +268,7 @@ class CSVReaderPolarsEngine(CSVBaseReaderEngine):
                          separator=self.delimiter,
                          truncate_ragged_lines=True,
                          infer_schema=False,
-                         n_rows=EngineProperties.dataframe_sample_rows
+                         n_rows=CSVEngineProperties.dataframe_sample_rows
                         )
         if normalize_columns:
             df = df.rename(CSVColumnNameNormalizer(self.filepath).columns_to_normalized_mapping)
@@ -352,7 +352,7 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
                 export_filename str: The name of the output file.
                 normalize_columns bool: Whether to normalize column names.
             """
-        filename = self.queries.set_export_filename(EngineProperties.csv_export_filename, export_filename)
+        filename = self.queries.set_export_filename(CSVEngineProperties.csv_export_filename, export_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_csv_query(filename))
 
@@ -363,7 +363,7 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
             export_filename (optional, str): The name of the output file.
             normalize_columns (optional, bool): Whether to normalize column names.
         """
-        filename = self.queries.set_export_filename(EngineProperties.excel_export_filename, export_filename)
+        filename = self.queries.set_export_filename(CSVEngineProperties.excel_export_filename, export_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_excel_query(filename))
 
@@ -374,7 +374,7 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
             export_filename (optional, str): The name of the output file.
             normalize_columns (optional, bool): Whether to normalize column names.
         """
-        filename = self.queries.set_export_filename(EngineProperties.json_export_filename, export_filename)
+        filename = self.queries.set_export_filename(CSVEngineProperties.json_export_filename, export_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_json_query(filename))
 
@@ -385,7 +385,7 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
             export_filename (optional, str): The name of the output file.
             normalize_columns (optional, bool): Whether to normalize column names.
         """
-        filename = self.queries.set_export_filename(EngineProperties.json_newline_export_filename, export_filename)
+        filename = self.queries.set_export_filename(CSVEngineProperties.json_newline_export_filename, export_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_json_newline_delimited_query(filename))
 
@@ -396,7 +396,7 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
             export_filename (optional, str): The name of the output file.
             normalize_columns (optional, bool): Whether to normalize column names.
         """
-        filename = self.queries.set_export_filename(EngineProperties.parquet_export_filename, export_filename)
+        filename = self.queries.set_export_filename(CSVEngineProperties.parquet_export_filename, export_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_parquet_query(filename))
 
@@ -414,7 +414,7 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
             export_filename (optional, str): The name of the output file.
             normalize_columns (optional, bool): Whether to normalize column names.
         """
-        filename = self.queries.set_export_filename(EngineProperties.csv_export_filename, export_filename)
+        filename = self.queries.set_export_filename(CSVEngineProperties.csv_export_filename, export_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
         df.write_csv(filename)
 
@@ -425,7 +425,7 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
             export_filename (optional, str): The name of the output file.
             normalize_columns (optional, bool): Whether to normalize column names.
         """
-        filename = self.queries.set_export_filename(EngineProperties.excel_export_filename, export_filename)
+        filename = self.queries.set_export_filename(CSVEngineProperties.excel_export_filename, export_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
         df.write_excel(filename)
 
@@ -436,7 +436,7 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
             export_filename (optional, str): The name of the output file.
             normalize_columns (optional, bool): Whether to normalize column names.
         """
-        filename = self.queries.set_export_filename(EngineProperties.json_export_filename, export_filename)
+        filename = self.queries.set_export_filename(CSVEngineProperties.json_export_filename, export_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
         df.write_json(filename)
 
@@ -447,7 +447,7 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
             export_filename (optional, str): The name of the output file.
             normalize_columns (optional, bool): Whether to normalize column names.
         """
-        filename = self.queries.set_export_filename(EngineProperties.json_newline_export_filename, export_filename)
+        filename = self.queries.set_export_filename(CSVEngineProperties.json_newline_export_filename, export_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
         df.write_ndjson(filename)
 
@@ -458,6 +458,6 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
             export_filename (optional, str): The name of the output file.
             normalize_columns (optional, bool): Whether to normalize column names.
         """
-        filename = self.queries.set_export_filename(EngineProperties.parquet_export_filename, export_filename)
+        filename = self.queries.set_export_filename(CSVEngineProperties.parquet_export_filename, export_filename)
         df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
         df.write_parquet(filename)

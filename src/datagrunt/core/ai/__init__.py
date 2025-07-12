@@ -1,6 +1,6 @@
 """Initializes the ai module of the datagrunt package."""
 
-from datagrunt.core.ai.engines import GoogleAIEngine
+from datagrunt.core.ai.engines import AIEngineProperties, GoogleAIEngine
 from datagrunt.core.ai.factories import AIEngineFactory
 from datagrunt.core.ai.prompts import (
     CSV_SCHEMA_SYSTEM_INSTRUCTIONS,
@@ -10,6 +10,7 @@ from datagrunt.core.ai.prompts import (
 )
 
 __all__ = [
+    'AIEngineProperties',
     'GoogleAIEngine',
     'AIEngineFactory',
     'CSV_SCHEMA_SYSTEM_INSTRUCTIONS',
