@@ -14,7 +14,7 @@ class EngineProperties:
     valid_engines: tuple = ('google')
 
 class BaseAIEngine(ABC):
-    """Abstract base class for AI providers."""
+    """Abstract base class for AI Engines."""
 
     def __init__(self, api_key=None):
         """Initialize the AI provider."""
