@@ -1,4 +1,4 @@
-"""Factory module for creating factory instances."""
+"""Factory module for creating CSV factory instances."""
 
 # standard library
 import os
