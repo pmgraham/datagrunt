@@ -10,7 +10,7 @@ from google.genai import types
 
 @dataclass
 class EngineProperties:
-    """Base properties for CSV operations."""
+    """Base properties for AI Engines."""
     valid_engines: tuple = ('google')
 
 class BaseAIEngine(ABC):
