@@ -1,1 +1,0 @@
-"""Module to store database queries and query strings."""
