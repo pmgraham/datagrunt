@@ -10,7 +10,7 @@ import re
 import polars as pl
 
 # local libraries
-from datagrunt.core.fileproperties import FileProperties
+from datagrunt.core.file_io import FileProperties
 
 class CSVStringSample:
     """Base class for creating a string sample of a CSV file."""

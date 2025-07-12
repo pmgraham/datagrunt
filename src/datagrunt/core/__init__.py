@@ -10,7 +10,7 @@ from datagrunt.core.ai import (
 )
 from datagrunt.core.engines import EngineProperties
 from datagrunt.core.factories import CSVEngineFactory
-from datagrunt.core.fileproperties import FileProperties
+from datagrunt.core.file_io import FileProperties
 
 from datagrunt.core.csvcomponents import (
     CSVDelimiter,
