@@ -8,7 +8,8 @@ import re
 # third party libraries
 import duckdb
 
-
+# local imports
+from datagrunt.core.csv_io import CSVColumnNameNormalizer
 
 class DuckDBDatabase:
     """Class to configure local database for file processing.
@@ -67,7 +68,7 @@ class DuckDBQueries:
         Args:
             filepath (str): Path to the file.
         """
-        from datagrunt.core.csv_io.csvcomponents import CSVDelimiter, CSVColumnNameNormalizer
+        from datagrunt.core.csv_io.csvcomponents import CSVDelimiter
         self.filepath = filepath
         self.delimiter = CSVDelimiter(filepath).delimiter
         self.database_table_name = DuckDBDatabase(filepath).database_table_name
