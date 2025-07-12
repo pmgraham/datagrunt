@@ -14,7 +14,7 @@ from datagrunt.core.engines import (
     CSVWriterPolarsEngine
 )
 
-from datagrunt.core.queries import DuckDBQueries
+from datagrunt.core.databases import DuckDBQueries
 
 class CSVEngineFactory:
     """Factory class for creating CSV reader and writer engine instances."""

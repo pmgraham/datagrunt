@@ -14,7 +14,7 @@ import pyarrow as pa
 
 # local libraries
 from datagrunt.core.csvcomponents import CSVDelimiter, CSVColumnNameNormalizer
-from datagrunt.core.queries import DuckDBQueries
+from datagrunt.core.databases import DuckDBQueries
 
 @dataclass
 class EngineProperties:
