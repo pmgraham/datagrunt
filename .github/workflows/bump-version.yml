@@ -1,11 +1,6 @@
 name: Bump Version
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'src/**'
   workflow_dispatch:
     inputs:
       part:
