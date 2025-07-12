@@ -1,5 +1,13 @@
 from datagrunt.core.databases import DuckDBDatabase
 from datagrunt.core.databases import DuckDBQueries
+from datagrunt.core.ai import (
+    GoogleAIEngine,
+    AIEngineFactory,
+    CSV_SCHEMA_SYSTEM_INSTRUCTIONS,
+    CSV_SCHEMA_PROMPT,
+    SUGGEST_DATA_TRANSFORMATIONS,
+    GENERATE_SQL_QUERY
+)
 from datagrunt.core.engines import EngineProperties
 from datagrunt.core.factories import CSVEngineFactory
 from datagrunt.core.fileproperties import FileProperties
@@ -25,5 +33,11 @@ __all__ = ['DuckDBDatabase',
            'CSVColumnNameNormalizer',
            'CSVComponents',
            'CSVRows',
-           'CSVStringSample'
+           'CSVStringSample',
+           'GoogleAIEngine',
+           'AIEngineFactory',
+           'CSV_SCHEMA_SYSTEM_INSTRUCTIONS',
+           'CSV_SCHEMA_PROMPT',
+           'SUGGEST_DATA_TRANSFORMATIONS',
+           'GENERATE_SQL_QUERY'
 ]
