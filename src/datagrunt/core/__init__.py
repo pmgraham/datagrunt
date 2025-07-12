@@ -1,5 +1,5 @@
 from datagrunt.core.databases import DuckDBDatabase
-from datagrunt.core.queries import DuckDBQueries
+from datagrunt.core.databases import DuckDBQueries
 from datagrunt.core.engines import EngineProperties
 from datagrunt.core.factories import CSVEngineFactory
 from datagrunt.core.fileproperties import FileProperties
