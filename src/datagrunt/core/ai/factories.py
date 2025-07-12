@@ -1,7 +1,7 @@
 """Factory module for creating AI factory instances."""
 
 # local libraries
-from datagrunt.core.ai.engines import EngineProperties, GoogleAIEngine
+from datagrunt.core.ai.engines import AIEngineProperties, GoogleAIEngine
 
 class AIEngineFactory:
     """Factory class for creating AI engine instances."""
@@ -21,8 +21,8 @@ class AIEngineFactory:
         self.api_key = api_key
         self.engine = engine.lower().replace(' ', '')
         self.kwargs = kwargs
-        if self.engine not in EngineProperties.valid_engines:
-            raise ValueError(EngineProperties.value_error_message.format(engine=self.engine))
+        if self.engine not in AIEngineProperties.valid_engines:
+            raise ValueError(AIEngineProperties.value_error_message.format(engine=self.engine))
 
     def create_engine(self):
         """Create an AI engine instance."""

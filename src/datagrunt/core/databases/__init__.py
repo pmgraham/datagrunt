@@ -1,9 +1,8 @@
 """Initializes the databases module of the datagrunt package."""
 
-from .databases import DuckDBDatabase
-from .queries import DuckDBQueries
+from datagrunt.core.databases.databases import DuckDBDatabase, DuckDBQueries
 
 __all__ = [
     'DuckDBDatabase',
-    'DuckDBQueries',
+    'DuckDBQueries'
 ]
