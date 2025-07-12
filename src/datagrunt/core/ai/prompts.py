@@ -1,4 +1,3 @@
-
 """This module contains prompts for the AI models."""
 
 
