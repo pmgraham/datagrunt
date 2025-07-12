@@ -203,7 +203,6 @@ class DuckDBQueries:
         this method uses the CSVColumnNameNormalizer class to ensure
         consistent naming conventions across different processing engines.
         """
-        from datagrunt.core.csv_io.csvcomponents import CSVColumnNameNormalizer
         duckdb.sql(self.import_csv_query())
         table_columns = duckdb.sql(f"SELECT * FROM {self.database_table_name} LIMIT 0").columns
         for old_name, new_name in zip(table_columns,
