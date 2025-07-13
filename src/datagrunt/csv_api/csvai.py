@@ -4,9 +4,12 @@
 import json
 
 # local imports
-from datagrunt.core import AIEngineFactory, prompts
-from datagrunt.core import AIEngineProperties
-from datagrunt.core import CSVStringSample
+from datagrunt.core import (
+    AIEngineFactory,
+    AIEngineProperties,
+    CSVStringSample,
+    prompts
+)
 
 class CSVSchemaReportAIGenerated:
     """Class to generate a CSV schema report using AI tools."""
