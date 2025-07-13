@@ -107,7 +107,7 @@ class FileStatistics:
 
     @property
     def is_large(self):
-        """Check if the file is at least one gigabyte or larger."""
+        """Check if the file is at least one gigabyte or larger in size."""
         return self.size_in_gb >= self.LARGE_FILE_FACTOR
 
 class BlankFile:
