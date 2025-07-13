@@ -243,7 +243,7 @@ report_generator_vertex = CSVSchemaReportAIGenerated(
 # Generate the report using a powerful model (choose one of the generators from above)
 # Note: You must have access to the model you specify.
 schema_report = report_generator_api.generate_csv_schema_report(
-    model='models/gemini-1.5-flash',
+    model='gemini-2.5-flash',
     return_json=True
 )
 
