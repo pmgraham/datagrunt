@@ -216,7 +216,165 @@ schema_report = report_generator.generate_csv_schema_report(
 
 print(schema_report)
 ```
-This will produce a detailed JSON report analyzing the CSV's schema, data types, and column classifications.
+This will produce a detailed JSON report analyzing the CSV's schema, data types, and column classifications. Here is an output example:
+
+```json
+{
+    "has_column_header": true,
+    "is_structured": true,
+    "has_delimiter": true,
+    "delimiter": ",",
+    "is_tabular": true,
+    "encoding": "utf-8",
+    "total_column_count": 17,
+    "total_dimension_column_count": 15,
+    "total_measure_column_count": 2,
+    "schema": [
+        {
+            "name": "VIN (1-10)",
+            "normalized_name": "vin_1_10",
+            "data_type": "string",
+            "classification": "dimension"
+        },
+        {
+            "name": "County",
+            "normalized_name": "county",
+            "data_type": "string",
+            "classification": "dimension"
+        },
+        {
+            "name": "City",
+            "normalized_name": "city",
+            "data_type": "string",
+            "classification": "dimension"
+        },
+        {
+            "name": "State",
+            "normalized_name": "state",
+            "data_type": "string",
+            "classification": "dimension"
+        },
+        {
+            "name": "Postal Code",
+            "normalized_name": "postal_code",
+            "data_type": "string",
+            "classification": "dimension"
+        },
+        {
+            "name": "Model Year",
+            "normalized_name": "model_year",
+            "data_type": "integer",
+            "classification": "dimension"
+        },
+        {
+            "name": "Make",
+            "normalized_name": "make",
+            "data_type": "string",
+            "classification": "dimension"
+        },
+        {
+            "name": "Model",
+            "normalized_name": "model",
+            "data_type": "string",
+            "classification": "dimension"
+        },
+        {
+            "name": "Electric Vehicle Type",
+            "normalized_name": "electric_vehicle_type",
+            "data_type": "string",
+            "classification": "dimension"
+        },
+        {
+            "name": "Clean Alternative Fuel Vehicle (CAFV) Eligibility",
+            "normalized_name": "clean_alternative_fuel_vehicle_cafv_eligibility",
+            "data_type": "string",
+            "classification": "dimension"
+        },
+        {
+            "name": "Electric Range",
+            "normalized_name": "electric_range",
+            "data_type": "integer",
+            "classification": "measure"
+        },
+        {
+            "name": "Base MSRP",
+            "normalized_name": "base_msrp",
+            "data_type": "integer",
+            "classification": "measure"
+        },
+        {
+            "name": "Legislative District",
+            "normalized_name": "legislative_district",
+            "data_type": "integer",
+            "classification": "dimension"
+        },
+        {
+            "name": "DOL Vehicle ID",
+            "normalized_name": "dol_vehicle_id",
+            "data_type": "string",
+            "classification": "dimension"
+        },
+        {
+            "name": "Vehicle Location",
+            "normalized_name": "vehicle_location",
+            "data_type": "string",
+            "classification": "dimension"
+        },
+        {
+            "name": "Electric Utility",
+            "normalized_name": "electric_utility",
+            "data_type": "string",
+            "classification": "dimension"
+        },
+        {
+            "name": "2020 Census Tract",
+            "normalized_name": "census_tract_2020",
+            "data_type": "string",
+            "classification": "dimension"
+        }
+    ],
+    "dimensions": [
+        "vin_1_10",
+        "county",
+        "city",
+        "state",
+        "postal_code",
+        "model_year",
+        "make",
+        "model",
+        "electric_vehicle_type",
+        "clean_alternative_fuel_vehicle_cafv_eligibility",
+        "legislative_district",
+        "dol_vehicle_id",
+        "vehicle_location",
+        "electric_utility",
+        "census_tract_2020"
+    ],
+    "measures": [
+        "electric_range",
+        "base_msrp"
+    ],
+    "columns_rename_map": {
+        "VIN (1-10)": "vin_1_10",
+        "County": "county",
+        "City": "city",
+        "State": "state",
+        "Postal Code": "postal_code",
+        "Model Year": "model_year",
+        "Make": "make",
+        "Model": "model",
+        "Electric Vehicle Type": "electric_vehicle_type",
+        "Clean Alternative Fuel Vehicle (CAFV) Eligibility": "clean_alternative_fuel_vehicle_cafv_eligibility",
+        "Electric Range": "electric_range",
+        "Base MSRP": "base_msrp",
+        "Legislative District": "legislative_district",
+        "DOL Vehicle ID": "dol_vehicle_id",
+        "Vehicle Location": "vehicle_location",
+        "Electric Utility": "electric_utility",
+        "2020 Census Tract": "census_tract_2020"
+    }
+}
+```
 
 ### Combine Datagrunt With Other Libraries
 
