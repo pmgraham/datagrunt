@@ -14,6 +14,7 @@ simplicity and ease of use. We will extend functionaltiy where it makes sense to
 - **Intelligent Delimiter Inference:**  Datagrunt automatically detects and applies the correct delimiter for your CSV files.
 - **Seamless Data Processing:** Leverage the robust capabilities of [DuckDB](https://duckdb.org) and [Polars](https://pola.rs) to perform advanced data processing tasks directly on your CSV data.
 - **Flexible Transformation:** Easily convert your processed CSV data into various formats to suit your needs.
+- **AI-Powered Schema Analysis:** Use Google's Gemini models to automatically generate detailed schema reports for your CSV files, including data types, column classifications, and data quality checks.
 - **Pythonic API:** Enjoy a clean and intuitive API that integrates seamlessly into your existing Python workflows.
 
 ### Powertools Under The Hood
@@ -21,6 +22,7 @@ simplicity and ease of use. We will extend functionaltiy where it makes sense to
 |-------------------|----------------------------|
 | [DuckDB](https://duckdb.org)| Fast in-process analytical database with a simple Python API |
 | [Polars](https://pola.rs) | Multi-threaded query engine written in Rust, optimized for modern processors |
+| [Google Gemini](https://deepmind.google/technologies/gemini/) | A powerful family of generative AI models. |
 
 ### Datagrunt's Role
 
@@ -30,6 +32,7 @@ Datagrunt is not an extension of DuckDB or Polars, nor a comprehensive data proc
 2. Providing helper methods for common data tasks
 3. Facilitating CSV file loading into Polars dataframes
 4. Enabling conversion to various output formats
+5. Generating AI-powered schema reports
 
 ### Flexibility and Integration
 
@@ -96,11 +99,12 @@ df = pl.read_csv(csv_file, separator=',').to_pandas() # note you are required to
 ```
 
 ## Usage Examples
+### Reading and Querying CSV Data
 ```python
 from datagrunt import CSVReader
 
 # Load your CSV file
-csv_file = 'electric_vehicle_population_data.csv'
+csv_file = 'examples/data/electric_vehicle_population_data.csv'
 engine = 'duckdb'
 
 # Set duckdb as the processing engine. Engine set to 'polars' by default
@@ -123,7 +127,7 @@ reader.get_sample()
 │ JN1AZ0CP7B │ King      │ Kirkland     │ … │ POINT (-122.192596…  │ PUGET SOUND ENERGY…  │ 53033022603       │
 │ 1N4AZ0CP0F │ Thurston  │ Olympia      │ … │ POINT (-122.86491 …  │ PUGET SOUND ENERGY…  │ 53067010300       │
 │     ·      │   ·       │    ·         │ · │          ·           │          ·           │      ·            │
-│     ·      │   ·       │    ·         │ · │          ·           │          ·           │      ·            │
+│     ·      ���   ·       │    ·         │ · │          ·           │          ·           │      ·            │
 │     ·      │   ·       │    ·         │ · │          ·           │          ·           │      ·            │
 │ 5YJYGDEE7M │ Clark     │ Vancouver    │ … │ POINT (-122.515805…  │ BONNEVILLE POWER A…  │ 53011041310       │
 │ 7SAYGAEE0P │ Snohomish │ Monroe       │ … │ POINT (-121.968385…  │ PUGET SOUND ENERGY…  │ 53061052203       │
@@ -134,18 +138,9 @@ reader.get_sample()
 │ 7SAYGDEF2N │ King      │ Bellevue     │ … │ POINT (-122.144149…  │ PUGET SOUND ENERGY…  │ 53033024704       │
 │ 1N4BZ1DP7L │ King      │ Bellevue     │ … │ POINT (-122.144149…  │ PUGET SOUND ENERGY…  │ 53033024902       │
 ...
-├────────────┴───────────┴──────────────┴───┴──────────────────────┴──────────────────────┴───────────────────┤
+├───────────��┴───────────┴──────────────┴───┴──────────────────────┴──────────────────────┴───────────────────┤
 │ ? rows (>9999 rows, 20 shown)                                                          17 columns (6 shown) │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-```
-###  SQL Queries For CSV Data
-```python
-from datagrunt import CSVReader
-
-csv_file = 'electric_vehicle_population_data.csv'
-engine = 'duckdb'
-
-reader = CSVReader(csv_file, engine=engine)
 
 # Construct your SQL query. The `db_table` property is provided by the CSVReader class automatically.
 query = f"""
@@ -185,6 +180,44 @@ print(df)
 └────────────────┴───────────────┘
 ```
 
+### Generating an AI-Powered Schema Report
+```python
+from datagrunt import CSVSchemaReportAIGenerated
+import os
+
+# Load your CSV file
+csv_file = 'examples/data/electric_vehicle_population_data.csv'
+
+# Make sure to set your API Key as an environment variable
+api_key = os.environ.get("GEMINI_API_KEY")
+
+# Instantiate the report generator with an API key
+report_generator = CSVSchemaReportAIGenerated(
+    filepath=csv_file,
+    engine='google',
+    api_key=api_key
+)
+
+# Optionally instantiate the report generator with Vertex AI features
+report_generator = CSVSchemaReportAIGenerated(
+    filepath=csv_file,
+    engine='google',
+    vertexai=True,
+    gcp_project='my-gcp-project-id',
+    gcp_location='global'
+)
+
+# Generate the report using a powerful model
+# Note: You must have access to the model you specify.
+schema_report = report_generator.generate_csv_schema_report(
+    model='gemini-2.5-flash',
+    return_json=True
+)
+
+print(schema_report)
+```
+This will produce a detailed JSON report analyzing the CSV's schema, data types, and column classifications.
+
 ### Combine Datagrunt With Other Libraries
 
 Datagrunt can be combined with other libraries. For example, you could use Datagrunt to instantiate the `CSVReader` class, and then use the provided `delimiter` attribute with other libraries.
@@ -212,7 +245,7 @@ df = pd.read_csv(reader.filepath, sep=reader.delimiter)
 By updating the delimiter attribute, you can ensure the `CSVReader` object will read the file correctly if you choose to use any of its methods down the line.
 
 ## Primary Classes
-Datagrunt provides two primary classes for interacting with data: `CSVReader` and `CSVWriter`. These classes are designed to simplify the process of reading and writing CSV files.
+Datagrunt provides three primary classes for interacting with data: `CSVReader`, `CSVWriter`, and `CSVSchemaReportAIGenerated`. These classes are designed to simplify the process of reading, writing, and analyzing CSV files.
 
 ### CSVReader
 The `CSVReader` class is used to read data from a CSV file. It provides a simple interface for reading data from a CSV file and converting it into a DataFrame. You instantiate the `CSVReader` class as follows:
@@ -384,27 +417,45 @@ Here are the default safety settings. You may pass in your own list but these ar
 #### Grounding in Google Search
 Grounding in Google Search will be supported in the future. The implementation is already built into the AI Engines pattern, but the only class that utilizes AI right now does not allow for grounding in Google Search. Again, future implementations will utilize this feature.
 
-
 ### No AI Agents At This Time
 The current implementation leveraging a LLM to evaluate a CSV file is a simple API call to the LLM provider (currently Google Gemini). To be clear this is not an AI agent nor this is an agentic component of Datagrunt. Again, this is a simple API call to Gemini.
 
 AI Agents may be added in the future but that is currently being debated among the maintainers of Datagrunt. We will post more details on this decision in the future.
 
-## File Attributes And CSV Attributes
-Exposed in both the 'CSVReader` and `CSVWriter` classes are a number of attributes that allow you to access and manipulate file and CSV-specific information. Some examples of them are as follows (a more complete list is forthcoming soon):
-- `filepath`: The path to the CSV file being read or written.
-- `filesize`: The size of the file in bytes.
-- `delimiter`: The delimiter used in the CSV file.
-- `quotechar`: The quote character used in the CSV file.
-- `escapechar`: The escape character used in the CSV file.
-- `encoding`: The encoding used in the CSV file.
-- `size_in_bytes`: The size of the file in bytes.
-- `size_in_mb`: The size of the file in megabytes.
-- `size_in_gb`: The size of the file in gigabytes.
-- `size_in_tb`: The size of the file in terabytes.
+## File and CSV Attributes
+Exposed in both the `CSVReader` and `CSVWriter` classes are a number of attributes that allow you to access and manipulate file and CSV-specific information:
+
+**File Attributes:**
+- `filepath`: The absolute path to the file.
+- `filename`: The name of the file.
+- `extension`: The file extension (e.g., `.csv`).
+- `size_in_bytes`, `size_in_kb`, `size_in_mb`, `size_in_gb`, `size_in_tb`: File size in various units.
+- `modified_time`: The last modification time of the file.
+- `encoding`: The character encoding of the file (defaults to 'utf-8').
+
+**File Type Booleans:**
+- `is_structured`, `is_semi_structured`, `is_unstructured`: Checks for data structure type.
+- `is_standard`, `is_proprietary`: Checks for standard vs. proprietary file formats.
+- `is_csv`, `is_excel`, `is_tsv`, `is_apache`, `is_tabular`: Checks for specific file types.
+- `is_empty`, `is_blank`: Checks if the file is empty or contains only whitespace.
+- `is_large`: Checks if the file is 1GB or larger.
+
+**CSV-Specific Attributes:**
+- `delimiter`: The inferred delimiter character.
+- `quotechar`: The character used for quoting fields.
+- `escapechar`: The character used for escaping.
+- `doublequote`: Boolean indicating if the quote character is doubled to be escaped.
+- `newline_delimiter`: The line terminator sequence.
+- `skipinitialspace`: Boolean, true if whitespace immediately following a delimiter is ignored.
+- `quoting`: The quoting style used.
+- `row_count_with_header`, `row_count_without_header`: The number of rows.
+- `columns`, `columns_normalized`: Lists of original and normalized column names.
+- `columns_count`: The number of columns.
+- `columns_to_normalized_mapping`: A dictionary mapping original names to normalized names.
+- `csv_string_sample`, `csv_string_sample_by_quality`: String samples of the CSV data.
 
 # Known Issues
-These are a list of known issues that will be added to the [Github Issue Tracker](https://github.com/pmgraham/datagrunt/issues).
+Please report any bugs or issues on the [Github Issue Tracker](https://github.com/pmgraham/datagrunt/issues).
 
 # License
 This project is licensed under the [MIT License](https://opensource.org/license/mit)
