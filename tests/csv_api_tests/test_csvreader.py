@@ -1,3 +1,5 @@
+"""This module contains tests for the CSVReader class."""
+
 import polars as pl
 import pyarrow as pa
 from duckdb import DuckDBPyRelation
