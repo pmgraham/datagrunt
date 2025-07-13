@@ -1,10 +1,10 @@
 from datagrunt.core import (
     CSVDelimiter,
     CSVDialect,
-    CSVRows,
     CSVColumns,
     CSVColumnNameNormalizer,
     CSVComponents,
+    CSVRows,
     CSVStringSample
 )
 
