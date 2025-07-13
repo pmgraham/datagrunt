@@ -87,17 +87,23 @@ pip install datagrunt
 Even though Datagrunt is a fairly simple library, it may not be obvious where to start. Here's a quick guide to help you naviate Datagrunt.
 
 ## Datagrunt Engines
+
+### Polars Engine
 Datagrunt provides two engines for working with CSV files: DuckDB and Polars. When instantiating the `CSVReader` or the `CSVWriter` class, you can specify which engine to use. The default engine for `CSVReader` is `polars`, while the default engine for `CSVWriter` is `duckdb`.
 The reason `polars` is the default engine for `CSVReader` is because it is a powerful and fast dataframe library that is well-suited for working with CSV files. When reading CSV files, it's a common pattern to use Dataframes to process the data.
 Once the data is in a dataframe, you can leverage the powerful data manipulation capabilities of a dataframe library such as [Pandas](https://pandas.pydata.org) or [Polars](https://pola.rs). Also, in early testing, we found that `polars` is faster than `duckdb` for certain operations when reading CSV files.
 
+### DuckDB Engine
 Conversely, `duckdb` is the default engine for `CSVWriter` because it is a powerful and fast in process OLAPSQL database that is well-suited for working with CSV files. Once the data is in a SQL database, you can leverage the powerful data manipulation capabilities of [DuckDB](https://duckdb.org).
 Also, in early testing, we found that `duckdb` is faster than `polars` for certain operations when writing CSV files.
 The other reason that `duckdb` is the default engine for `CSVWriter` is because when writing data to JSON format in particular, we found that `duckdb` was not only faster than `polars`, but also wrote the data with better formatting and was less error prone with larger
 sets of data. When writing JSON data to a file using `duckdb`, the file was structured correctly and had consistent formatting. Sometimes when writing JSON data to a file using `polars`, the file was not structured correctly and had inconsistent formatting, causing
 downstream issues when reading the output.
 
-### Normalizing Column Names
+### Google Gemini Engine
+As of Datagrunt version 2.0.1, engines have been added for Generative AI LLM providers. Currently only Google Gemini is supported, but with the factory pattern we can easily add more providers in the future. How we approach this is being debated among the Datagrunt maintainers. We'll post more updates in the future regarding this topic.
+
+## Normalizing Column Names
 When working with data from various sources, column names can be inconsistent, contain special characters, or include spaces. This can make them difficult to work with in databases or dataframes. Datagrunt provides a convenient way to clean and standardize these names.
 
 **Why Normalize?**
