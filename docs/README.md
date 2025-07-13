@@ -43,9 +43,41 @@ While Datagrunt uses Polars dataframes by default, it doesn't limit your options
 - Leverage only specific features (e.g., delimiter inference) as needed
 - Datagrunt complements your existing data processing toolkit, offering helpful utilities without restricting your workflow choices.
 
+### A Word About Pandas
+Pandas is a powerful data manipulation library that is widely used in the data science community. It provides a wide range of tools for data cleaning, transformation, and analysis.
+However, when working with large datasets, Pandas can be slow and memory-intensive. In contrast, DuckDB and Polars are designed to handle large datasets efficiently and are optimized for performance. In fact, when testing with large datasets, we found both DuckDB and Polars to be orders of magnitude faster than Pandas.
+With that said, Pandas is still a valuable tool for data manipulation and analysis and it is not our goal to replace it nor limit its usage. We encourage users to continue using Pandas for their data manipulation needs whenever it best suits their needs.
+
+Any Polars dataframe object can be easily converted to a Pandas dataframe using the `to_pandas()` method. This allows users to leverage the power of both libraries for their data manipulation needs. Likewise, if you have a Pandas dataframe object, you can convert it to a Polars dataframe
+by instantiating a new Polars dataframe object from the Pandas dataframe as follows:
+
+```python
+import polars as pl
+import pandas as pd
+
+# Convert a Pandas dataframe to a Polars dataframe
+df_pandas = pd.DataFrame({'a': [1, 2, 3], 'b': [4, 5, 6]})
+df_polars = pl.DataFrame(df_pandas)
+```
+To convert a Polars dataframe to a Pandas dataframe, use the `to_pandas()` method:
+
+```python
+import polars as pl
+
+df = pl.read_csv(csv_file, separator=',').to_pandas() # note you are required to have Pandas installed even if it's not imported
+```
+
 # Installation
 
-Get started with Datagrunt in seconds using pip:
+We recommend using [UV](https://docs.astral.sh/uv/). However, you may get started with Datagrunt in seconds using UV or pip.
+
+Get started with UV:
+
+```bash
+uv pip install datagrunt
+```
+
+Get started with pip:
 
 ```bash
 pip install datagrunt
@@ -90,30 +122,6 @@ As of Datagrunt version 2.0.1 we introduced a factory pattern to support multipl
 
 ### Google Gemini
 Currently there is only one class that supports integration with Google Gemini: `CSVSchemaReportAIGenerated`. It is exposed as part of the facade pattern along with the `CSVReader` and `CSVWriter` classes. See below under the `Primary Classes` section for more details.
-
-## A Word About Pandas
-Pandas is a powerful data manipulation library that is widely used in the data science community. It provides a wide range of tools for data cleaning, transformation, and analysis.
-However, when working with large datasets, Pandas can be slow and memory-intensive. In contrast, DuckDB and Polars are designed to handle large datasets efficiently and are optimized for performance. In fact, when testing with large datasets, we found both DuckDB and Polars to be orders of magnitude faster than Pandas.
-With that said, Pandas is still a valuable tool for data manipulation and analysis and it is not our goal to replace it nor limit its usage. We encourage users to continue using Pandas for their data manipulation needs whenever it best suits their needs.
-
-Any Polars dataframe object can be easily converted to a Pandas dataframe using the `to_pandas()` method. This allows users to leverage the power of both libraries for their data manipulation needs. Likewise, if you have a Pandas dataframe object, you can convert it to a Polars dataframe
-by instantiating a new Polars dataframe object from the Pandas dataframe as follows:
-
-```python
-import polars as pl
-import pandas as pd
-
-# Convert a Pandas dataframe to a Polars dataframe
-df_pandas = pd.DataFrame({'a': [1, 2, 3], 'b': [4, 5, 6]})
-df_polars = pl.DataFrame(df_pandas)
-```
-To convert a Polars dataframe to a Pandas dataframe, use the `to_pandas()` method:
-
-```python
-import polars as pl
-
-df = pl.read_csv(csv_file, separator=',').to_pandas() # note you are required to have Pandas installed even if it's not imported
-```
 
 ## Usage Examples
 ### Reading and Querying CSV Data
