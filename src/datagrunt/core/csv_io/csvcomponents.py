@@ -3,7 +3,7 @@
 # standard library
 from collections import Counter, OrderedDict
 import csv
-from functools import lru_cache
+from functools import lru_cache, cached_property
 import re
 
 # third party libraries
@@ -26,7 +26,7 @@ class CSVStringSample:
         """
         self.filepath = filepath
 
-    @property
+    @cached_property
     def csv_string_sample(self):
         """
         Convert a Polars DataFrame to a CSV string.
@@ -40,7 +40,7 @@ class CSVStringSample:
                          )
         return df.write_csv(file=None)
 
-    @property
+    @cached_property
     def csv_string_sample_by_quality(self):
         """
         Convert a Polars DataFrame to a CSV string, prioritizing rows with the fewest null values.
@@ -132,40 +132,42 @@ class CSVDialect:
         Returns:
             csv.Dialect: The CSV dialect inferred from the file.
         """
+        if FileProperties(self.filepath).is_empty or FileProperties(self.filepath).is_blank:
+            return None
         with open(self.filepath, 'r', encoding=FileProperties(self.filepath).DEFAULT_ENCODING) as csvfile:
             dialect = csv.Sniffer().sniff(csvfile.read(self.CSV_SNIFF_SAMPLE_ROWS))
             csvfile.seek(0)  # Reset file pointer to the beginning
         return dialect
 
-    @property
+    @cached_property
     def quotechar(self):
         """The character used to quote fields in the CSV file."""
-        return self.dialect.quotechar
+        return self.dialect.quotechar if self.dialect else '"'
 
-    @property
+    @cached_property
     def escapechar(self):
         """The character used to escape characters in the CSV file."""
-        return self.dialect.escapechar
+        return self.dialect.escapechar if self.dialect else None
 
-    @property
+    @cached_property
     def doublequote(self):
         """Whether double quotes are used to escape quotes in the CSV file."""
-        return self.dialect.doublequote
+        return self.dialect.doublequote if self.dialect else False
 
-    @property
+    @cached_property
     def newline_delimiter(self):
         """The newline delimiter used in the CSV file."""
-        return self.dialect.lineterminator
+        return self.dialect.lineterminator if self.dialect else '\r\n'
 
-    @property
+    @cached_property
     def skipinitialspace(self):
         """Whether spaces are skipped at the beginning of fields in the CSV file."""
-        return self.dialect.skipinitialspace
+        return self.dialect.skipinitialspace if self.dialect else False
 
-    @property
+    @cached_property
     def quoting(self):
         """The quoting style used in the CSV file."""
-        return self.QUOTING_MAP.get(self.dialect.quoting)
+        return self.QUOTING_MAP.get(self.dialect.quoting) if self.dialect else 'quote minimal'
 
 class CSVRows:
     """Class for parsing CSV rows."""
@@ -190,8 +192,7 @@ class CSVRows:
             first_line = csv_file.readline().strip()
         return first_line
 
-    @property
-    @lru_cache()
+    @cached_property
     def row_count_with_header(self):
         """Return the number of lines in the CSV file including the header."""
         with open(self.filepath, 'rb') as csv_file:
@@ -212,6 +213,8 @@ class CSVColumns:
 
     def _get_columns(self):
         """Return the columns."""
+        if FileProperties(self.filepath).is_empty or FileProperties(self.filepath).is_blank:
+            return []
         df = pl.read_csv(self.filepath,
                          separator=CSVDelimiter(self.filepath).delimiter,
                          truncate_ragged_lines=True,
@@ -220,17 +223,17 @@ class CSVColumns:
                         )
         return df.columns
 
-    @property
+    @cached_property
     def columns_string(self):
         """Return a string representation of the columns."""
         return ', '.join(self.columns)
 
-    @property
+    @cached_property
     def columns_byte_string(self):
         """Return a byte string representation of the columns."""
         return ', '.join(self.columns).encode()
 
-    @property
+    @cached_property
     def columns_count(self):
         """Return the number of columns."""
         return len(self.columns)
@@ -304,17 +307,17 @@ class CSVColumnNameNormalizer:
         normalized_columns = [self._normalize_single_column_name(col) for col in columns]
         return self._make_unique_column_names(normalized_columns)
 
-    @property
+    @cached_property
     def columns_normalized_string(self):
         """Return a list representation of the normalized columns."""
         return ', '.join(self.columns_normalized)
 
-    @property
+    @cached_property
     def columns_normalized_byte_string(self):
         """Return a byte string representation of the normalized columns."""
         return ', '.join(self.columns_normalized).encode()
 
-    @property
+    @cached_property
     def columns_to_normalized_mapping(self):
         """Return the mapping of original column names to normalized column names."""
         return dict(OrderedDict(zip(CSVColumns(self.filepath).columns, self.columns_normalized)))
@@ -328,94 +331,100 @@ class CSVComponents(FileProperties):
             filepath (str): Path to the CSV file.
         """
         super().__init__(filepath)
-        self.delimiter = CSVDelimiter(filepath).delimiter
+        self._delimiter = CSVDelimiter(filepath)
+        self._dialect = CSVDialect(filepath)
+        self._rows = CSVRows(filepath)
+        self._columns = CSVColumns(filepath)
+        self._normalizer = CSVColumnNameNormalizer(filepath)
+        self._sample = CSVStringSample(filepath)
+        self.delimiter = self._delimiter.delimiter
 
-    @property
+    @cached_property
     def quotechar(self):
         """Return the quote character used in the CSV file."""
-        return CSVDialect(self.filepath).quotechar
+        return self._dialect.quotechar
 
-    @property
+    @cached_property
     def escapechar(self):
         """Return the escape character used in the CSV file."""
-        return CSVDialect(self.filepath).escapechar
+        return self._dialect.escapechar
 
-    @property
+    @cached_property
     def doublequote(self):
         """Return the double quote character used in the CSV file."""
-        return CSVDialect(self.filepath).doublequote
+        return self._dialect.doublequote
 
-    @property
+    @cached_property
     def newline_delimiter(self):
         """Return the newline delimiter used in the CSV file."""
-        return CSVDialect(self.filepath).newline_delimiter
+        return self._dialect.newline_delimiter
 
-    @property
+    @cached_property
     def skipinitialspace(self):
         """Return the skipinitialspace flag used in the CSV file."""
-        return CSVDialect(self.filepath).skipinitialspace
+        return self._dialect.skipinitialspace
 
-    @property
+    @cached_property
     def quoting(self):
         """Return the quoting flag used in the CSV file."""
-        return CSVDialect(self.filepath).quoting
+        return self._dialect.quoting
 
-    @property
+    @cached_property
     def row_count_with_header(self):
         """Return the number of rows in the CSV file including the header row."""
-        return CSVRows(self.filepath).row_count_with_header
+        return self._rows.row_count_with_header
 
-    @property
+    @cached_property
     def row_count_without_header(self):
         """Return the number of rows in the CSV file excluding the header row."""
-        return CSVRows(self.filepath).row_count_without_header
+        return self._rows.row_count_without_header
 
-    @property
+    @cached_property
     def columns(self):
         """Return the columns of the CSV file."""
-        return CSVColumns(self.filepath).columns
+        return self._columns.columns
 
-    @property
+    @cached_property
     def columns_string(self):
         """Return the columns of the CSV file as a string."""
-        return CSVColumns(self.filepath).columns_string
+        return self._columns.columns_string
 
-    @property
+    @cached_property
     def columns_byte_string(self):
         """Return the columns of the CSV file as a byte string."""
-        return CSVColumns(self.filepath).columns_byte_string
+        return self._columns.columns_byte_string
 
-    @property
+    @cached_property
     def columns_count(self):
         """Count the columns of the CSV file."""
-        return CSVColumns(self.filepath).columns_count
+        return self._columns.columns_count
 
-    @property
+    @cached_property
     def columns_normalized(self):
         """Normalize the columns of the CSV file."""
-        return CSVColumnNameNormalizer(self.filepath).columns_normalized
+        return self._normalizer.columns_normalized
 
-    @property
+    @cached_property
     def columns_normalized_string(self):
         """Normalize the columns of the CSV file."""
-        return CSVColumnNameNormalizer(self.filepath).columns_normalized_string
+        return self._normalizer.columns_normalized_string
 
-    @property
+    @cached_property
     def columns_normalized_byte_string(self):
         """Normalize the columns of the CSV file."""
-        return CSVColumnNameNormalizer(self.filepath).columns_normalized_byte_string
+        return self._normalizer.columns_normalized_byte_string
 
-    @property
+    @cached_property
     def columns_to_normalized_mapping(self):
         """Normalize the columns of the CSV file."""
-        return CSVColumnNameNormalizer(self.filepath).columns_to_normalized_mapping
+        return self._normalizer.columns_to_normalized_mapping
 
-    @property
+    @cached_property
     def csv_string_sample(self):
         """Return a sample of the CSV file as a string."""
-        return CSVStringSample(self.filepath).csv_string_sample
+        return self._sample.csv_string_sample
 
-    @property
+    @cached_property
     def csv_string_sample_by_quality(self):
         """Return a sample of the CSV file as a string, prioritizing rows with the fewest null values."""
-        return CSVStringSample(self.filepath).csv_string_sample_by_quality
+        return self._sample.csv_string_sample_by_quality
