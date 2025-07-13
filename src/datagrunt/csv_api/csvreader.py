@@ -6,9 +6,11 @@
 import polars as pl
 
 # local libraries
-from datagrunt.core import CSVComponents
-from datagrunt.core import DuckDBQueries
-from datagrunt.core import CSVEngineFactory
+from datagrunt.core import (
+    CSVComponents,
+    CSVEngineFactory,
+    DuckDBQueries
+    )
 
 class CSVReader(CSVComponents):
     """Class to unify the interface for reading CSV files."""
@@ -25,7 +27,7 @@ class CSVReader(CSVComponents):
         self.engine = engine.lower().replace(' ', '')
 
     def _return_empty_file_object(self, object):
-        """Return an empty file object."""
+        """Return an empty object of the specified type."""
         return object
 
     def _create_reader(self):

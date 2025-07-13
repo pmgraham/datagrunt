@@ -5,9 +5,11 @@
 # third party libraries
 
 # local libraries
-from datagrunt.core import CSVComponents
-from datagrunt.core import DuckDBQueries
-from datagrunt.core import CSVEngineFactory
+from datagrunt.core import (
+    CSVComponents,
+    CSVEngineFactory,
+    DuckDBQueries
+    )
 
 class CSVWriter(CSVComponents):
     """Class to unify the interface for converting CSV files to various other supported file types."""

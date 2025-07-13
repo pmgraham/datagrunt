@@ -10,7 +10,7 @@ import re
 import polars as pl
 
 # local libraries
-from datagrunt.core.fileproperties import FileProperties
+from datagrunt.core.file_io import FileProperties
 
 class CSVStringSample:
     """Base class for creating a string sample of a CSV file."""
@@ -320,6 +320,7 @@ class CSVColumnNameNormalizer:
         return dict(OrderedDict(zip(CSVColumns(self.filepath).columns, self.columns_normalized)))
 
 class CSVComponents(FileProperties):
+    """A class that combines all CSV components into a single interface."""
     def __init__(self, filepath):
         """Initialize the CSVComponents object.
 

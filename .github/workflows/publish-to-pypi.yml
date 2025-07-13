@@ -1,12 +1,6 @@
 name: Publish to PyPI
 
 on:
-  workflow_run:
-    workflows: ["Bump Version"]
-    types:
-      - completed
-    branches:
-      - main
   workflow_dispatch: # Allows manual triggering
 
 jobs:

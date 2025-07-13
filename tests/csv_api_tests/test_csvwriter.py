@@ -1,3 +1,5 @@
+"""This module contains tests for the CSVWriter class."""
+
 import json
 import polars as pl
 import pyarrow.parquet as pq
