@@ -18,7 +18,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-keywords = ["csv", "data", "duckdb", "polars", "pyarrow", "xlsx", "delimiter"]
+keywords = ["csv", "data", "duckdb", "polars", "pyarrow", "xlsx", "delimiter", "ai", "gemini"]
 dependencies = [
     "duckdb>=1.1.0",
     "polars>=1.7.1",
@@ -29,8 +29,13 @@ dependencies = [
 requires-python = ">=3.10"
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-cov>=3.0", "black", "isort", "flake8"]
-build = ["build", "twine", "bumpver"]
+dev = [
+    "pytest>=8.3.4",
+    "pytest-cov>=6.0.0",
+    "ruff>=0.5.5",
+    "bumpver>=2024.1130",
+    "fastexcel>=0.13.0",
+]
 
 [project.urls]
 Homepage = "https://pmgraham.github.io/datagrunt"
@@ -60,13 +65,23 @@ push = true
     '^__version__ = "{version}"$',
 ]
 
-[tool.black]
-line-length = 88
-target-version = ['py310']
+[tool.pytest.ini_options]
+testpaths = "tests"
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-v --cov=src/datagrunt --cov-report=term-missing"
+pythonpath = "."
 
-[tool.isort]
-profile = "black"
+[tool.ruff]
+line-length = 120
+target-version = "py310"
 
-[tool.flake8]
-max-line-length = 120
-extend-ignore = "E203"
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+]
+ignore = ["E203"]
