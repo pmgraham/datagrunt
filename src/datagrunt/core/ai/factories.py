@@ -3,6 +3,7 @@
 # local libraries
 from datagrunt.core.ai.engines import AIEngineProperties, GoogleAIEngine
 
+
 class AIEngineFactory:
     """Factory class for creating AI engine instances."""
     AI_ENGINES = {

@@ -6,6 +6,7 @@ from duckdb import DuckDBPyRelation
 
 from datagrunt import CSVReader
 
+
 class TestCSVReader:
     """Test suite for CSVReader class."""
 

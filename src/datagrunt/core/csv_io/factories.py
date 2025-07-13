@@ -4,17 +4,16 @@
 import os
 
 # third party libraries
-
 # local libraries
-from datagrunt.core.csv_io.engines import CSVEngineProperties
 from datagrunt.core.csv_io.engines import (
+    CSVEngineProperties,
     CSVReaderDuckDBEngine,
     CSVReaderPolarsEngine,
     CSVWriterDuckDBEngine,
-    CSVWriterPolarsEngine
+    CSVWriterPolarsEngine,
 )
-
 from datagrunt.core.databases import DuckDBQueries
+
 
 class CSVEngineFactory:
     """Factory class for creating CSV reader and writer engine instances."""

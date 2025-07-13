@@ -1,20 +1,21 @@
 """Module to create engines for data processing."""
 
 # standard library
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-import os
 from typing import Dict, List, Union
 
 # third party libraries
 import duckdb
-from duckdb import DuckDBPyRelation
 import polars as pl
 import pyarrow as pa
+from duckdb import DuckDBPyRelation
 
 # local libraries
-from datagrunt.core.csv_io.csvcomponents import CSVDelimiter, CSVColumnNameNormalizer
+from datagrunt.core.csv_io.csvcomponents import CSVColumnNameNormalizer, CSVDelimiter
 from datagrunt.core.databases import DuckDBQueries
+
 
 @dataclass
 class CSVEngineProperties:

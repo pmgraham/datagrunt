@@ -2,19 +2,20 @@
 
 from pathlib import Path
 
-from duckdb import DuckDBPyRelation
 import polars as pl
 import pyarrow as pa
 import pytest
+from duckdb import DuckDBPyRelation
 
 from datagrunt.core import (
+    CSVEngineFactory,
     CSVEngineProperties,
     CSVReaderDuckDBEngine,
     CSVReaderPolarsEngine,
     CSVWriterDuckDBEngine,
-    CSVWriterPolarsEngine
+    CSVWriterPolarsEngine,
 )
-from datagrunt.core import CSVEngineFactory
+
 
 class TestEngines:
     def test_engine_properties(self):

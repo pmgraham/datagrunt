@@ -1,16 +1,17 @@
 """Module for CSV components."""
 
 # standard library
-from collections import Counter, OrderedDict
 import csv
-from functools import lru_cache, cached_property
 import re
+from collections import Counter, OrderedDict
+from functools import cached_property
 
 # third party libraries
 import polars as pl
 
 # local libraries
 from datagrunt.core.file_io import FileProperties
+
 
 class CSVStringSample:
     """Base class for creating a string sample of a CSV file."""
