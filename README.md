@@ -11,6 +11,7 @@ Born out of real-world frustration, Datagrunt eliminates the need for repetitive
 - **Intelligent Delimiter Inference:**  Datagrunt automatically detects and applies the correct delimiter for your CSV files.
 - **Seamless Data Processing:** Leverage the robust capabilities of [DuckDB](https://duckdb.org) and [Polars](https://pola.rs) to perform advanced data processing tasks directly on your CSV data.
 - **Flexible Transformation:** Easily convert your processed CSV data into various formats to suit your needs.
+- **AI-Powered Schema Analysis:** Use Google's Gemini models to automatically generate detailed schema reports for your CSV files, including data types, column classifications, and data quality checks.
 - **Pythonic API:** Enjoy a clean and intuitive API that integrates seamlessly into your existing Python workflows.
 
 ## Installation
