@@ -3,6 +3,7 @@
 # standard library
 import os
 from pathlib import Path
+from functools import cached_property
 
 class FileExtensions:
     """Class for getting file extensions."""
@@ -14,22 +15,22 @@ class FileExtensions:
         """
         self.filepath = filepath
 
-    @property
+    @cached_property
     def extension(self):
         """Get the file extensions."""
         return Path(self.filepath).suffixes
 
-    @property
+    @cached_property
     def csv_extensions(self):
         """Define CSV extensions."""
         return ['csv']
 
-    @property
+    @cached_property
     def tsv_extensions(self):
         """Define TSV extensions."""
         return ['tsv']
 
-    @property
+    @cached_property
     def excel_extensions(self):
         """Define Excel extensions."""
         return [
@@ -42,22 +43,22 @@ class FileExtensions:
             'xlt'
         ]
 
-    @property
+    @cached_property
     def tabular_extensions(self):
         """Define tabular extensions."""
         return list(set(self.csv_extensions + self.tsv_extensions + self.excel_extensions))
 
-    @property
+    @cached_property
     def apache_extensions(self):
         """Define Apache extensions."""
         return ['parquet', 'avro']
 
-    @property
+    @cached_property
     def semi_structured_extensions(self):
         """Define semi-structured extensions."""
         return list(set(['json', 'jsonl']))
 
-    @property
+    @cached_property
     def standard_extensions(self):
         """Define standard (non proprietary) extensions."""
         return list(set(self.csv_extensions +
@@ -65,7 +66,7 @@ class FileExtensions:
                         self.apache_extensions +
                         self.semi_structured_extensions))
 
-    @property
+    @cached_property
     def structured_extensions(self):
         """Define structured extensions."""
         return list(set(self.csv_extensions +
@@ -74,7 +75,7 @@ class FileExtensions:
                         self.apache_extensions +
                         self.tabular_extensions))
 
-    @property
+    @cached_property
     def proprietary_extensions(self):
         """Define proprietary extensions."""
         return list(set(self.excel_extensions))
@@ -100,12 +101,12 @@ class FileStatistics:
         self.size_in_gb = round((self.size_in_mb / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
         self.size_in_tb = round((self.size_in_gb / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
 
-    @property
+    @cached_property
     def modified_time(self):
         """Get the file modified time."""
         return os.path.getmtime(self.filepath)
 
-    @property
+    @cached_property
     def is_large(self):
         """Check if the file is at least one gigabyte or larger in size."""
         return self.size_in_gb >= self.LARGE_FILE_FACTOR
@@ -123,7 +124,7 @@ class BlankFile:
         """
         self.filepath = filepath
 
-    @property
+    @cached_property
     def is_blank(self):
         """Check if the file is blank. Blank files contain only whitespace."""
 
@@ -148,7 +149,7 @@ class EmptyFile:
         """
         self.filepath = filepath
 
-    @property
+    @cached_property
     def is_empty(self):
         """Check if the file is empty."""
         return FileStatistics(self.filepath).size_in_bytes == 0
@@ -169,74 +170,81 @@ class FileProperties:
         self.filename = Path(filepath).name
         self.extension = Path(filepath).suffix
         self.extension_string = self.extension.replace('.', '')
-        self.size_in_bytes = FileStatistics(self.filepath).size_in_bytes
-        self.size_in_kb = FileStatistics(self.filepath).size_in_kb
-        self.size_in_mb = FileStatistics(self.filepath).size_in_mb
-        self.size_in_gb = FileStatistics(self.filepath).size_in_gb
-        self.size_in_tb = FileStatistics(self.filepath).size_in_tb
+        
+        # Instantiate helper classes
+        self._stats = FileStatistics(self.filepath)
+        self._ext = FileExtensions(self.filepath)
+        self._empty = EmptyFile(self.filepath)
+        self._blank = BlankFile(self.filepath)
 
-    @property
+        self.size_in_bytes = self._stats.size_in_bytes
+        self.size_in_kb = self._stats.size_in_kb
+        self.size_in_mb = self._stats.size_in_mb
+        self.size_in_gb = self._stats.size_in_gb
+        self.size_in_tb = self._stats.size_in_tb
+
+    @cached_property
     def is_structured(self):
         """Check if the file is structured."""
-        return self.extension_string.lower() in FileExtensions(self.filepath).structured_extensions
+        return self.extension_string.lower() in self._ext.structured_extensions
 
-    @property
+    @cached_property
     def is_semi_structured(self):
         """Check if the file is semi-structured."""
-        return self.extension_string.lower() in FileExtensions(self.filepath).semi_structured_extensions
+        return self.extension_string.lower() in self._ext.semi_structured_extensions
 
-    @property
+    @cached_property
     def is_unstructured(self):
         """Check if the file is unstructured."""
-        return self.extension_string.lower() not in FileExtensions(self.filepath).standard_extensions and \
-               self.extension_string.lower() not in FileExtensions(self.filepath).semi_structured_extensions
+        return self.extension_string.lower() not in self._ext.standard_extensions and \
+               self.extension_string.lower() not in self._ext.semi_structured_extensions
 
-    @property
+    @cached_property
     def is_standard(self):
         """Check if the file is standard."""
-        return self.extension_string.lower() in FileExtensions(self.filepath).standard_extensions
+        return self.extension_string.lower() in self._ext.standard_extensions
 
-    @property
+    @cached_property
     def is_proprietary(self):
         """Check if the file is proprietary."""
-        return self.extension_string.lower() in FileExtensions(self.filepath).proprietary_extensions
+        return self.extension_string.lower() in self._ext.proprietary_extensions
 
-    @property
+    @cached_property
     def is_csv(self):
         """Check if the file is a CSV file."""
-        return self.extension_string.lower() in FileExtensions(self.filepath).csv_extensions
+        return self.extension_string.lower() in self._ext.csv_extensions
 
-    @property
+    @cached_property
     def is_excel(self):
         """Check if the file is an Excel file."""
-        return self.extension_string.lower() in FileExtensions(self.filepath).excel_extensions
+        return self.extension_string.lower() in self._ext.excel_extensions
 
-    @property
+    @cached_property
     def is_apache(self):
         """Check if the file is an Apache formatted file."""
-        return self.extension_string.lower() in FileExtensions(self.filepath).apache_extensions
+        return self.extension_string.lower() in self._ext.apache_extensions
 
-    @property
+    @cached_property
     def is_empty(self):
         """Check if the file is empty. Empty files have a size of 0 bytes."""
-        return EmptyFile(self.filepath).is_empty
+        return self._empty.is_empty
 
-    @property
+    @cached_property
     def is_blank(self):
         """Check if the file is blank. Blank files contain only whitespace."""
-        return BlankFile(self.filepath).is_blank
+        return self._blank.is_blank
 
-    @property
+    @cached_property
     def is_large(self):
         """Check if the file is greater than or equal to 1 GB."""
-        return FileStatistics(self.filepath).is_large
+        return self._stats.is_large
 
-    @property
+    @cached_property
     def is_tabular(self):
         """Check if the file is tabular."""
-        return self.extension_string.lower() in FileExtensions(self.filepath).tabular_extensions
+        return self.extension_string.lower() in self._ext.tabular_extensions
 
-    @property
+    @cached_property
     def is_tsv(self):
         """Check if the file is tabular."""
-        return self.extension_string.lower() in FileExtensions(self.filepath).tsv_extensions
+        return self.extension_string.lower() in self._ext.tsv_extensions
