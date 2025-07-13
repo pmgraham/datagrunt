@@ -85,6 +85,7 @@ class GoogleAIEngine(BaseAIEngine):
             response_type=DEFAULT_RESPONSE_JSON_MIME_TYPE,
             ground_google_search=False
             ):
+
         """Initialize the Google AI provider."""
         super().__init__(api_key)
         self.vertexai = vertexai
