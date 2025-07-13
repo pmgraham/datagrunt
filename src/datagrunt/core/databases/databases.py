@@ -2,15 +2,15 @@
 
 # standard library
 import os
-from pathlib import Path
 import re
+from pathlib import Path
 
 # third party libraries
 import duckdb
 
 # local imports
-from datagrunt.core.csv_io import CSVColumnNameNormalizer
-from datagrunt.core.csv_io import CSVDelimiter
+from datagrunt.core.csv_io import CSVColumnNameNormalizer, CSVDelimiter
+
 
 class DuckDBDatabase:
     """Class to configure local database for file processing.

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from google import genai
 from google.genai import types
 
+
 @dataclass
 class AIEngineProperties:
     """Base properties for AI Engines."""

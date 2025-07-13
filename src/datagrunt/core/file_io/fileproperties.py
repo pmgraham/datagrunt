@@ -2,8 +2,9 @@
 
 # standard library
 import os
-from pathlib import Path
 from functools import cached_property
+from pathlib import Path
+
 
 class FileExtensions:
     """Class for getting file extensions."""
@@ -170,7 +171,7 @@ class FileProperties:
         self.filename = Path(filepath).name
         self.extension = Path(filepath).suffix
         self.extension_string = self.extension.replace('.', '')
-        
+
         # Instantiate helper classes
         self._stats = FileStatistics(self.filepath)
         self._ext = FileExtensions(self.filepath)
