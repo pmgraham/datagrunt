@@ -65,6 +65,23 @@ The other reason that `duckdb` is the default engine for `CSVWriter` is because 
 sets of data. When writing JSON data to a file using `duckdb`, the file was structured correctly and had consistent formatting. Sometimes when writing JSON data to a file using `polars`, the file was not structured correctly and had inconsistent formatting, causing
 downstream issues when reading the output.
 
+### Normalizing Column Names
+When working with data from various sources, column names can be inconsistent, contain special characters, or include spaces. This can make them difficult to work with in databases or dataframes. Datagrunt provides a convenient way to clean and standardize these names.
+
+**Why Normalize?**
+- **Compatibility:** Ensures column names are valid identifiers for databases (e.g., DuckDB) and can be used as attributes in dataframes (e.g., `df.my_column` instead of `df['My Column']`).
+- **Consistency:** Creates a uniform naming convention across your data, making your code cleaner and more predictable.
+
+**The Normalization Process**
+When you set `normalize_columns=True`, Datagrunt applies the following rules to each column name:
+1.  Converts the name to lowercase.
+2.  Replaces any sequence of spaces or special characters (anything not a letter or number) with a single underscore (`_`).
+3.  Removes any leading or trailing underscores.
+4.  If a name starts with a number, it prepends an underscore (e.g., `2020_census_tract` becomes `_2020_census_tract`).
+5.  If normalization results in duplicate column names, it appends a number to make them unique (e.g., `column`, `column_1`, `column_2`).
+
+You can access the original columns via the `.columns` attribute and the normalized list via the `.columns_normalized` attribute. A mapping is also available in the `.columns_to_normalized_mapping` dictionary.
+
 ## Artificial Intelligence Features
 As of Datagrunt version 2.0.1 integration with Large Language Models (LLMs) is available. Currently only Google Gemini is available. We plan to add more LLMs in the future.
 
@@ -116,7 +133,7 @@ reader.get_sample()
 │ VIN (1-10) │  County   │     City     │ … │   Vehicle Location   │   Electric Utility   │ 2020 Census Tract │
 │  varchar   │  varchar  │   varchar    │   │       varchar        │       varchar        │      varchar      │
 ├────────────┼───────────┼──────────────┼───┼──────────────────────┼──────────────────────┼───────────────────┤
-│ 5YJSA1E28K │ Snohomish │ Mukilteo     │ … │ POINT (-122.29943 …  │ PUGET SOUND ENERGY…  │ 53061042001       │
+│ 5YJSA1E28K │ Snohomish │ Mukilteo     ��� … │ POINT (-122.29943 …  │ PUGET SOUND ENERGY…  │ 53061042001       │
 │ 1C4JJXP68P │ Yakima    │ Yakima       │ … │ POINT (-120.468875…  │ PACIFICORP           │ 53077001601       │
 │ WBY8P6C05L │ Kitsap    │ Kingston     │ … │ POINT (-122.517835…  │ PUGET SOUND ENERGY…  │ 53035090102       │
 │ JTDKARFP1J │ Kitsap    │ Port Orchard │ … │ POINT (-122.653005…  │ PUGET SOUND ENERGY…  │ 53035092802       │
@@ -127,7 +144,7 @@ reader.get_sample()
 │ JN1AZ0CP7B │ King      │ Kirkland     │ … │ POINT (-122.192596…  │ PUGET SOUND ENERGY…  │ 53033022603       │
 │ 1N4AZ0CP0F │ Thurston  │ Olympia      │ … │ POINT (-122.86491 …  │ PUGET SOUND ENERGY…  │ 53067010300       │
 │     ·      │   ·       │    ·         │ · │          ·           │          ·           │      ·            │
-│     ·      ���   ·       │    ·         │ · │          ·           │          ·           │      ·            │
+│     ·      │   ·       │    ·         │ · │          ·           │          ·           │      ·            │
 │     ·      │   ·       │    ·         │ · │          ·           │          ·           │      ·            │
 │ 5YJYGDEE7M │ Clark     │ Vancouver    │ … │ POINT (-122.515805…  │ BONNEVILLE POWER A…  │ 53011041310       │
 │ 7SAYGAEE0P │ Snohomish │ Monroe       │ … │ POINT (-121.968385…  │ PUGET SOUND ENERGY…  │ 53061052203       │
@@ -138,7 +155,7 @@ reader.get_sample()
 │ 7SAYGDEF2N │ King      │ Bellevue     │ … │ POINT (-122.144149…  │ PUGET SOUND ENERGY…  │ 53033024704       │
 │ 1N4BZ1DP7L │ King      │ Bellevue     │ … │ POINT (-122.144149…  │ PUGET SOUND ENERGY…  │ 53033024902       │
 ...
-├───────────��┴───────────┴──────────────┴───┴──────────────────────┴──────────────────────┴───────────────────┤
+├────────────┴───────────┴──────────────┴───┴──────────────────────┴──────────────────────┴───────────────────┤
 │ ? rows (>9999 rows, 20 shown)                                                          17 columns (6 shown) │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
@@ -161,7 +178,7 @@ ORDER BY 2 DESC
 # Execute the query and get results as a Polars DataFrame
 df = reader.query_data(query).pl() # the .pl() method is used to convert the results from a DuckDBPyRelation object to a Polars DataFrame
 print(df)
-┌────────────────┬───────────────┐
+��────────────────┬───────────────┐
 │ city           ┆ vehicle_count │
 │ ---            ┆ ---           │
 │ str            ┆ i64           │
