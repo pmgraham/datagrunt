@@ -188,29 +188,31 @@ import os
 # Load your CSV file
 csv_file = 'examples/data/electric_vehicle_population_data.csv'
 
+# --- Option 1: Use a Google Gemini API Key ---
 # Make sure to set your API Key as an environment variable
 api_key = os.environ.get("GEMINI_API_KEY")
 
 # Instantiate the report generator with an API key
-report_generator = CSVSchemaReportAIGenerated(
+report_generator_api = CSVSchemaReportAIGenerated(
     filepath=csv_file,
     engine='google',
     api_key=api_key
 )
 
-# Optionally instantiate the report generator with Vertex AI features
-report_generator = CSVSchemaReportAIGenerated(
+# --- Option 2: Use Google Cloud Vertex AI ---
+# This assumes you have authenticated with Google Cloud CLI (gcloud auth application-default login)
+report_generator_vertex = CSVSchemaReportAIGenerated(
     filepath=csv_file,
     engine='google',
     vertexai=True,
-    gcp_project='my-gcp-project-id',
-    gcp_location='global'
+    gcp_project='my-gcp-project-id', # Change to your project ID
+    gcp_location='us-central1'      # Change to your GCP location
 )
 
-# Generate the report using a powerful model
+# Generate the report using a powerful model (choose one of the generators from above)
 # Note: You must have access to the model you specify.
-schema_report = report_generator.generate_csv_schema_report(
-    model='gemini-2.5-flash',
+schema_report = report_generator_api.generate_csv_schema_report(
+    model='models/gemini-1.5-flash',
     return_json=True
 )
 
@@ -462,7 +464,7 @@ Here is a list of optional keyword params you may pass in along with their defau
 
 There is a default prompt that is built into Datagrunt that enables this method to operate. You may optionally pass in your own prompt if you wish. If you do not pass in a prompt, Datagrunt will use the default system prompt. Otherwise, it will use the prompt you pass in.
 
-### Generative AI Default Prompt and System Instructions
+#### Generative AI Default Prompts
 Below is the default prompt and system instructions that are built into Datagrunt. Both the system instructions and the prompt are used by default to generate the report. It's very important to note that in the prompt below the JSON schema is defined so that the LLM responds with a consistent output every time. This defined schema, in conjunction with setting the MIME type output to `application/json` ensures proper JSON formatting.
 
 If you pass in your own prompt without defining a schema, or if you pass in your own prompt with a different schema, just be aware you are responsible for the output and for controlling its formatting.
@@ -575,7 +577,7 @@ Here are the default safety settings. You may pass in your own list but these ar
 #### Grounding in Google Search
 Grounding in Google Search will be supported in the future. The implementation is already built into the AI Engines pattern, but the only class that utilizes AI right now does not allow for grounding in Google Search. Again, future implementations will utilize this feature.
 
-### No AI Agents At This Time
+#### No AI Agents At This Time
 The current implementation leveraging a LLM to evaluate a CSV file is a simple API call to the LLM provider (currently Google Gemini). To be clear this is not an AI agent nor this is an agentic component of Datagrunt. Again, this is a simple API call to Gemini.
 
 AI Agents may be added in the future but that is currently being debated among the maintainers of Datagrunt. We will post more details on this decision in the future.
@@ -613,7 +615,7 @@ Exposed in both the `CSVReader` and `CSVWriter` classes are a number of attribut
 - `csv_string_sample`, `csv_string_sample_by_quality`: String samples of the CSV data.
 
 # Known Issues
-Please report any bugs or issues on the [Github Issue Tracker](https://github.com/pmgraham/datagrunt/issues).
+There are no known issues at this time. Please report any bugs or issues on the [Github Issue Tracker](https://github.com/pmgraham/datagrunt/issues).
 
 # License
 This project is licensed under the [MIT License](https://opensource.org/license/mit)
