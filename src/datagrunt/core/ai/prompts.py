@@ -30,6 +30,8 @@ Here are some examples of special values that could be numeric typeable but shou
     * Lot Numbers / Batch Numbers
     * Dates / Times (if represented as a single number without separators, e.g., MMDD)
     * Social Security Numbers (SSNs)
+    * Transaction Codes
+    * Any number with a leading zero in the original data
 
 If unsure if a data value should be categorized as a dimension or measure, for safety sake, categorize as a dimension and string type.
 Return a map of original column names to normalized column names.
