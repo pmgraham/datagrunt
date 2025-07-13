@@ -62,6 +62,15 @@ The other reason that `duckdb` is the default engine for `CSVWriter` is because 
 sets of data. When writing JSON data to a file using `duckdb`, the file was structured correctly and had consistent formatting. Sometimes when writing JSON data to a file using `polars`, the file was not structured correctly and had inconsistent formatting, causing
 downstream issues when reading the output.
 
+## Artificial Intelligence Features
+As of Datagrunt version 2.0.1 integration with Large Language Models (LLMs) is available. Currently only Google Gemini is available. We plan to add more LLMs in the future.
+
+### Artificial Intelligence (AI) Engines
+As of Datagrunt version 2.0.1 we introduced a factory pattern to support multiple LLM providers. Currently, the only engine available is Google Gemini. In order to access Gemini, you need either a Gemini API key or you need to be authenticated with a Google Cloud account so that you can use Vertex AI. Both are supported in the same interface depending on the set of paramaters you pass into the `CSVSchemaReportAIGenerated` class.
+
+### Google Gemini
+Currently there is only one class that supports integration with Google Gemini: `CSVSchemaReportAIGenerated`. It is exposed as part of the facade pattern along with the `CSVReader` and `CSVWriter` classes. See below under the `Primary Classes` section for more details.
+
 ## A Word About Pandas
 Pandas is a powerful data manipulation library that is widely used in the data science community. It provides a wide range of tools for data cleaning, transformation, and analysis.
 However, when working with large datasets, Pandas can be slow and memory-intensive. In contrast, DuckDB and Polars are designed to handle large datasets efficiently and are optimized for performance. In fact, when testing with large datasets, we found both DuckDB and Polars to be orders of magnitude faster than Pandas.
@@ -233,8 +242,155 @@ The primary methods of the `CSVWriter` class are:
 - `write_json_newline_delimited(self, out_filename=None, normalize_columns=False)`: Writes the data in the CSV file to a JSON file with newline delimiters.
 - `write_parquet(self, out_filename=None, normalize_columns=False)`: Writes the data in the CSV file to a Parquet file.
 
+### CSVSchemaReportAIGenerated
+The `CSVSchemaReportAIGenerated` class is used to generate a report on the schema of a CSV file. It provides a simple interface for generating a report on the schema of a CSV file.
+It is currently configured to run only with Google's Gemini and takes either an `api_key` or can access Vertex AI if you pass in the following paramaters:
+- `vertexai=True`
+- `gcp_project=my-gcp-project-id`
+- `gcp_location=global` or a supported Google Cloud region such as `us-central1`
 
-### File Attributes And CSV Attributes
+The primary methods of the `CSVSchemaReportAIGenerated` class are:
+- `generate_csv_schema_report(self, model, prompt=None, system_instructions=None, return_json=False)`: Generates a report on the schema of a CSV file.
+    - model: any supported Gemini model. We did not set a default model by design. Here is a link to the available Google Gemini models: [Gemini Models](https://cloud.google.com/vertex-ai/docs/generative-ai/models)
+    - prompt: optional system prompt. A default prompt is utilized if no prompt is passed in.
+    - system_instructions: optional system instructions. Default system instructions are utilized if no system instructions are passed in.
+    - return_json: set to `False` by default and returns a Python dict. Set to `True` in order to have an indented JSON response returned.
+
+Here is a list of optional keyword params you may pass in along with their default values:
+- vertexai=False,
+- gcp_project=None,
+- gcp_location=None,
+- max_tokens=8192,
+- temperature=0.5,
+- top_p=1,
+- seed=0,
+- safety_settings=None, # I'll list the default safety settings below.
+- thinking_budget=-1, # set to automatic mode
+- response_type="application/json",
+- ground_google_search=False
+
+There is a default prompt that is built into Datagrunt that enables this method to operate. You may optionally pass in your own prompt if you wish. If you do not pass in a prompt, Datagrunt will use the default system prompt. Otherwise, it will use the prompt you pass in.
+
+### Generative AI Default Prompt and System Instructions
+Below is the default prompt and system instructions that are built into Datagrunt. Both the system instructions and the prompt are used by default to generate the report. It's very important to note that in the prompt below the JSON schema is defined so that the LLM responds with a consistent output every time. This defined schema, in conjunction with setting the MIME type output to `application/json` ensures proper JSON formatting.
+
+If you pass in your own prompt without defining a schema, or if you pass in your own prompt with a different schema, just be aware you are responsible for the output and for controlling its formatting.
+
+```python
+CSV_SCHEMA_SYSTEM_INSTRUCTIONS = """
+You are a data engineering agent.
+Your job is as follows:
+    * evaluate data samples to identify columns
+    * determine data types
+    * classify dimensions from measures
+    * determine if the data has a column header or not
+    * determine if the data is structured or unstructured
+    * determine if the data has a delimiter and to identify that delimiter.
+Categorize these finding into their own section of the response format.
+"""
+
+CSV_SCHEMA_PROMPT = """
+For the given data string identify the columns, return a list of columns, the column data types, and whether or not they should be categorized as a dimension or a measure.
+Also return a normalized version of the data column name in all lower case separated by underscores. If the column name starts with a number move the number to the end of the column name.
+Anything that could be categorized as a special number could lose a leading zero if converted from text to a numeric type, be sure in those cases to classify the column as a dimension and make it a string type.
+Here are some examples of special values that could be numeric typeable but should be classified as dimensions and string types:
+
+<special values>
+    * ZIP Codes / Postal Codes
+    * Product SKUs / Item Numbers
+    * Employee IDs / Customer IDs / User IDs
+    * Phone Numbers (if stored numerically)
+    * Bank Account Numbers
+    * Serial Numbers
+    * Course Codes / Class IDs
+    * Lot Numbers / Batch Numbers
+    * Dates / Times (if represented as a single number without separators, e.g., MMDD)
+    * Social Security Numbers (SSNs)
+    * Transaction Codes
+    * Any number with a leading zero in the original data
+
+If unsure if a data value should be categorized as a dimension or measure, for safety sake, categorize as a dimension and string type.
+Return a map of original column names to normalized column names.
+
+<example measures>
+    * Sales Amount
+    * Quantity Sold
+    * Revenue
+    * Profit Margin
+    * Temperature
+    * Distance
+
+If `has_column_header` is false, then recommend column header names based on the the data that are nicely formatted in lowercase and underscore separated.
+After generating a list of recommended columns, add another element grouping those recommendations into dimension and measures.
+Be sure to reserve measures only for quantifiable values and not anything that could be categorized as a `special value`.
+
+Return a response format like this:
+
+<response format>
+
+{{
+ "has_column_header": true or false ,
+ "is_structured": true or false ,
+ "has_delimiter": true or false,
+ "delimiter": "delimiter",
+ "is_tabular": true or false,
+ "encoding": "utf-8", "latin1", "latin2", "utf-16", etc.,
+ "total_column_count": 0,
+ "total_dimension_column_count": 0,
+ "total_measure_column_count": 0,
+ "schema": [
+  {{
+   "name": "column name",
+   "normalized_name": "normalized_column_name",
+   "data_type": "data_type",
+   "classification": "dimension or measure"
+  }}
+ ],
+ "dimensions": ["colmn_name_1", "column_name_2", ...],
+ "measures": ["column_name_1", "column_name_2", ...],
+"columns_rename_map": {{
+    "column_name": "normalized_column_name"
+    }}
+}}
+
+<data string>
+```{csv_sample_string}```
+"""
+
+```
+
+Here are the default safety settings. You may pass in your own list but these are set by default in Datagrunt:
+
+```python
+[
+    types.SafetySetting(
+        category="HARM_CATEGORY_HATE_SPEECH",
+        threshold="OFF"
+    ),
+    types.SafetySetting(
+        category="HARM_CATEGORY_DANGEROUS_CONTENT",
+        threshold="OFF"
+    ),
+    types.SafetySetting(
+        category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        threshold="OFF"
+    ),
+    types.SafetySetting(
+        category="HARM_CATEGORY_HARASSMENT",
+        threshold="OFF"
+    )
+]
+```
+#### Grounding in Google Search
+Grounding in Google Search will be supported in the future. The implementation is already built into the AI Engines pattern, but the only class that utilizes AI right now does not allow for grounding in Google Search. Again, future implementations will utilize this feature.
+
+
+### No AI Agents At This Time
+The current implementation leveraging a LLM to evaluate a CSV file is a simple API call to the LLM provider (currently Google Gemini). To be clear this is not an AI agent nor this is an agentic component of Datagrunt. Again, this is a simple API call to Gemini.
+
+AI Agents may be added in the future but that is currently being debated among the maintainers of Datagrunt. We will post more details on this decision in the future.
+
+## File Attributes And CSV Attributes
 Exposed in both the 'CSVReader` and `CSVWriter` classes are a number of attributes that allow you to access and manipulate file and CSV-specific information. Some examples of them are as follows (a more complete list is forthcoming soon):
 - `filepath`: The path to the CSV file being read or written.
 - `filesize`: The size of the file in bytes.
