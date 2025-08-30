@@ -4,7 +4,8 @@
 import json
 
 # local imports
-from datagrunt.core import AIEngineFactory, AIEngineProperties, CSVStringSample, prompts
+from datagrunt.core import (
+    AIEngineFactory, AIEngineProperties, CSVStringSample, prompts)
 
 
 class CSVSchemaReportAIGenerated:
@@ -19,19 +20,23 @@ class CSVSchemaReportAIGenerated:
         if self.engine not in AIEngineProperties.valid_engines:
             raise ValueError(f"Unsupported AI engine: {self.engine}")
         if self.kwargs.pop('ground_google_search', False):
-            raise ValueError("Grounding in Google Search is not supported for this class.")
+            raise ValueError(
+                "Grounding in Google Search is not supported for this class.")
 
     def _create_engine(self):
         """Create an AI engine instance."""
-        return AIEngineFactory(self.api_key, self.engine, **self.kwargs).create_engine()
+        return AIEngineFactory(self.api_key, self.engine,
+                               **self.kwargs).create_engine()
 
     def _get_ai_response(self, model, prompt, system_instructions):
-        """Send a request to the AI engine and handle potential errors.
+        """
+        Send a request to the AI engine and handle potential errors.
 
         Args:
             model (str): The name of the model to use.
             prompt (str): The prompt to send to the model.
-            system_instructions (str): System instructions to guide the model's response.
+            system_instructions (str): System instructions to guide the model's
+            response.
 
         Returns:
             dict: The JSON response from the AI engine.
@@ -51,16 +56,16 @@ class CSVSchemaReportAIGenerated:
         except json.JSONDecodeError as e:
             error_message = (
                 "The model's response was not a valid JSON object. "
-                "This can happen if the `max_tokens` parameter is too low, cutting off the response. "
-                f"Details: {e}\n"
+                "This can happen if the `max_tokens` parameter is too low, "
+                f"cutting off the response. Details: {e}\n"
                 f"Model Response: {response_text[:500]}..."
             )
             raise ValueError(error_message) from e
         except TypeError as e:
             error_message = (
-                "The model did not return a text response that could be processed. "
-                "This can happen if the `max_tokens` parameter is too low, cutting off the response. "
-                f"Details: {e}\n"
+                "The model did not return a text response that could be "
+                "processed. This can happen if the `max_tokens` parameter is "
+                f"too low, cutting off the response. Details: {e}\n"
                 f"Model Response: {response_text}"
             )
             raise TypeError(error_message) from e
@@ -76,24 +81,31 @@ class CSVSchemaReportAIGenerated:
         system_instructions=None,
         return_json=False
     ):
-        """Generate a CSV schema from a string using the Google GenAI API.
+        """
+        Generate a CSV schema from a string using the Google GenAI API.
 
         Args:
             model (str): The name of the model to use.
-            prompt (str, optional): The prompt to send to the model. If not provided, a default prompt will be used.
-            system_instructions (str, optional): System instructions to guide the model's response.
-            return_json (bool, optional): Whether to return the response as a JSON string or leave as a dict.
+            prompt (str, optional): The prompt to send to the model. If not
+            provided, a default prompt will be used.
+            system_instructions (str, optional): System instructions to guide
+            the model's response.
+            return_json (bool, optional): Whether to return the response as a
+            JSON string or leave as a dict.
 
         Returns:
             dict: The generated schema from the CSV string.
         """
         if not prompt:
-            csv_string = CSVStringSample(self.filepath).csv_string_sample_by_quality
-            prompt = prompts.CSV_SCHEMA_PROMPT.format(csv_sample_string=csv_string)
+            csv_string = CSVStringSample(
+                self.filepath).csv_string_sample_by_quality
+            prompt = prompts.CSV_SCHEMA_PROMPT.format(
+                csv_sample_string=csv_string)
         if not system_instructions:
             system_instructions = prompts.CSV_SCHEMA_SYSTEM_INSTRUCTIONS
 
-        csv_schema_report = self._get_ai_response(model, prompt, system_instructions)
+        csv_schema_report = self._get_ai_response(
+            model, prompt, system_instructions)
 
         if return_json:
             return json.dumps(csv_schema_report, indent=4)
