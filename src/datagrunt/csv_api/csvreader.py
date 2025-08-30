@@ -1,4 +1,7 @@
-"""Module for reading CSV files and converting to different in memory python objects."""
+"""
+Module for reading CSV files and converting to different in memory python
+objects.
+"""
 
 # standard library
 
@@ -13,11 +16,13 @@ class CSVReader(CSVComponents):
     """Class to unify the interface for reading CSV files."""
 
     def __init__(self, filepath, engine='polars'):
-        """Initialize the CSV Reader class.
+        """
+        Initialize the CSV Reader class.
 
         Args:
             filepath (str): Path to the file to read.
-            engine (str, default 'polars'): Determines which reader engine class to instantiate.
+            engine (str, default 'polars'): Determines which reader engine
+            class to instantiate.
         """
         super().__init__(filepath)
         self.db_table = DuckDBQueries(self.filepath).database_table_name
@@ -75,11 +80,13 @@ class CSVReader(CSVComponents):
         return self._create_reader().to_dicts(normalize_columns)
 
     def query_data(self, sql_query, normalize_columns=False):
-        """Queries as CSV file after importing into DuckDB.
+        """
+        Queries as CSV file after importing into DuckDB.
 
         Args:
             sql_query (str): Query to run against DuckDB.
-            normalize_columns (optional, bool): Whether to normalize column names.
+            normalize_columns (optional, bool): Whether to normalize column
+            names.
 
         Returns:
             A DuckDB DuckDBPyRelation with the query results.
@@ -89,9 +96,9 @@ class CSVReader(CSVComponents):
             query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
             dg.query_csv_data(query)
 
-        If you set normalize_columns=True, the column names will be normalized to lowercase
-        and spaces will be replaced with underscores, and you must reference the new column names
-        in your query.
+        If you set normalize_columns=True, the column names will be normalized
+        to lowercase and spaces will be replaced with underscores, and you
+        must reference the new column names in your query.
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(list())
