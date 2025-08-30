@@ -1,4 +1,7 @@
-"""Module to create engines for interfacing with different large language models and providers."""
+"""
+Module to create engines for interfacing with different large language
+models and providers.
+"""
 
 # standard library imports
 from abc import ABC, abstractmethod
@@ -13,6 +16,7 @@ from google.genai import types
 class AIEngineProperties:
     """Base properties for AI Engines."""
     valid_engines: tuple = ('google')
+
 
 class BaseAIEngine(ABC):
     """Abstract base class for AI Engines."""
@@ -59,16 +63,20 @@ class BaseAIEngine(ABC):
         """
         pass
 
+
 class GoogleAIEngine(BaseAIEngine):
     """Class to interact with the Google GenAI API."""
 
-    THINKING_BUDGET = -1  # Default thinking budget for the model. -1 means "auto".
-    DEFAULT_RESPONSE_JSON_MIME_TYPE = "application/json"  # Default response MIME type
+    # Default thinking budget for the model. -1 means "auto".
+    THINKING_BUDGET = -1
+    # Default response MIME type
+    DEFAULT_RESPONSE_JSON_MIME_TYPE = "application/json"
     MAX_OUTPUT_TOKENS = 8192  # Maximum output tokens for the model
     DEFAULT_TEMPERATURE = 0.5  # Default temperature for the model
     DEFAULT_TOP_P = 1  # Default top_p for the model
     DEFAULT_SEED = 0  # Default seed for the model
-    DEFAULT_SYSTEM_INSTRUCTIONS = ""  # Default system instructions for the model
+    # Default system instructions for the model
+    DEFAULT_SYSTEM_INSTRUCTIONS = ""
 
     def __init__(
             self,
@@ -85,13 +93,13 @@ class GoogleAIEngine(BaseAIEngine):
             thinking_budget=THINKING_BUDGET,
             response_type=DEFAULT_RESPONSE_JSON_MIME_TYPE,
             ground_google_search=False
-            ):
-
+    ):
         """Initialize the Google AI provider."""
         super().__init__(api_key)
         self.vertexai = vertexai
         if not self.api_key and not self.vertexai:
-            raise ValueError("Either api_key or vertexai must be provided.")
+            raise ValueError(
+                "Either api_key or vertexai must be provided.")  # noqa: E501
         self.gcp_project = gcp_project
         self.gcp_location = gcp_location
         self.prompt = prompt
@@ -99,12 +107,18 @@ class GoogleAIEngine(BaseAIEngine):
         self.temperature = temperature
         self.top_p = top_p
         self.seed = seed
-        self.safety_settings = safety_settings if safety_settings is not None else self._safety_settings()
+        if safety_settings is not None:
+            self.safety_settings = safety_settings
+        else:
+            self.safety_settings = self._safety_settings()
         self.thinking_budget = thinking_budget
         self.response_type = response_type
         self.ground_google_search = ground_google_search
-        if not self.api_key and self.vertexai and (not self.gcp_project or not self.gcp_location):
-            raise ValueError("You must provide gcp_project and gcp_location when using Vertex AI.")
+        if not self.api_key and self.vertexai and (
+                not self.gcp_project or not self.gcp_location):
+            raise ValueError(
+                "You must provide gcp_project and gcp_location when using "
+                "Vertex AI.")
 
     def _client(self):
         """Create and return a GenAI client."""
@@ -156,8 +170,8 @@ class GoogleAIEngine(BaseAIEngine):
     def _ground_in_google_search(self):
         """Ground the model in Google Search."""
         return [
-                 types.Tool(google_search=types.GoogleSearch()),
-            ]
+            types.Tool(google_search=types.GoogleSearch()),
+        ]
 
     def _content_config(self, system_instruction=None):
         """Content configuration for API calls to the LLM."""
@@ -166,40 +180,46 @@ class GoogleAIEngine(BaseAIEngine):
 
         if self.ground_google_search:
             config = types.GenerateContentConfig(
-                temperature = self.temperature,
-                top_p = self.top_p,
-                seed = self.seed,
-                max_output_tokens = self.max_tokens,
-                safety_settings = self.safety_settings,
-                system_instruction=[types.Part.from_text(text=system_instruction)],
+                temperature=self.temperature,
+                top_p=self.top_p,
+                seed=self.seed,
+                max_output_tokens=self.max_tokens,
+                safety_settings=self.safety_settings,
+                system_instruction=[
+                    types.Part.from_text(
+                        text=system_instruction)],
                 thinking_config=types.ThinkingConfig(
                     thinking_budget=self.thinking_budget,
                 ),
-                response_mime_type = self.response_type,
-                tools = self._ground_in_google_search()
+                response_mime_type=self.response_type,
+                tools=self._ground_in_google_search()
             )
         else:
             config = types.GenerateContentConfig(
-                temperature = self.temperature,
-                top_p = self.top_p,
-                seed = self.seed,
-                max_output_tokens = self.max_tokens,
-                safety_settings = self.safety_settings,
-                system_instruction=[types.Part.from_text(text=system_instruction)],
+                temperature=self.temperature,
+                top_p=self.top_p,
+                seed=self.seed,
+                max_output_tokens=self.max_tokens,
+                safety_settings=self.safety_settings,
+                system_instruction=[
+                    types.Part.from_text(
+                        text=system_instruction)],
                 thinking_config=types.ThinkingConfig(
                     thinking_budget=self.thinking_budget,
                 ),
-                response_mime_type = self.response_type,
+                response_mime_type=self.response_type,
             )
         return config
 
     def generate_content(self, model, prompt, system_instruction=None):
-        """Generate content using the Google GenAI API.
+        """
+        Generate content using the Google GenAI API.
 
         Args:
             model (str): The name of the model to use.
             prompt (str): The prompt to send to the model.
-            system_instruction (str, optional): System instructions to guide the model's response.
+            system_instruction (str, optional): System instructions to guide the
+            model's response.
         Returns:
             str: The generated response from the model.
         """
@@ -209,10 +229,13 @@ class GoogleAIEngine(BaseAIEngine):
         response = self._client().models.generate_content(
             model=model,
             contents=contents,
-            config=generate_content_config,
+            config=generate_content_config
         )
 
         return response.text
 
     def generate_embeddings(self):
-        raise NotImplementedError("Embedding generation is not yet implemented for the Google provider.")
+        raise NotImplementedError(
+            "Embedding generation is not yet implemented for the Google "
+            "provider."
+        )

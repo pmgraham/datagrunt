@@ -48,7 +48,9 @@ class DuckDBDatabase:
         return f'{self._format_filename_string()}.db'
 
     def _set_database_table_name(self):
-        """Return name of duckdb import table created during file import."""
+        """
+        Return name of duckdb import table created during file import.
+        """
         return f'{self._format_filename_string()}'
 
     def _set_database_connection(self, threads=DEFAULT_THREAD_COUNT):
@@ -57,7 +59,9 @@ class DuckDBDatabase:
         Args:
             threads (int): Number of threads to use for duckdb.
         """
-        return duckdb.connect(self.database_filename, config = {'threads': threads})
+        return duckdb.connect(self.database_filename,
+                              config={'threads': threads})
+
 
 class DuckDBQueries:
     """Class to store DuckDB database queries and query strings."""
@@ -74,8 +78,11 @@ class DuckDBQueries:
         self.database_table_name = DuckDBDatabase(filepath).database_table_name
 
     def set_export_filename(self, default_filename, export_filename=None):
-        """Return the export filename if provided, otherwise return the default."""
-        # This method doesn't really fit the class but it's the only place it's relevant.
+        """
+        Return the export filename if provided, otherwise return the default.
+        """
+        # This method doesn't really fit the class but it's the only place it's
+        # relevant.
         if export_filename:
             filename = export_filename
         else:
@@ -101,7 +108,9 @@ class DuckDBQueries:
             """
 
     def import_csv_query_normalize_columns(self):
-        """Query to import a CSV file into a DuckDB table and normalize column names.
+        """
+        Query to import a CSV file into a DuckDB table and normalize column
+        names.
 
         Returns:
             str: The query to import the CSV file and normalize column names.
@@ -124,7 +133,8 @@ class DuckDBQueries:
         return f"SELECT * FROM {self.database_table_name}"
 
     def export_csv_query(self, default_filename, export_filename=None):
-        """Query to export a DuckDB table to a CSV file.
+        """
+        Query to export a DuckDB table to a CSV file.
 
         Args:
             default_filename (str): The default name of the output file.
@@ -134,10 +144,11 @@ class DuckDBQueries:
             str: The SQL query to export the table to a CSV file.
         """
         filename = self.set_export_filename(default_filename, export_filename)
-        return f"COPY {self.database_table_name} TO '{filename}' (HEADER, DELIMITER ',');"
+        return f"COPY {self.database_table_name} TO '{filename}' (HEADER, DELIMITER ',');"  # noqa: E501
 
     def export_excel_query(self, default_filename, export_filename=None):
-        """Query to export a DuckDB table to an Excel file.
+        """
+        Query to export a DuckDB table to an Excel file.
 
         Args:
             default_filename (str): The default name of the output file.
@@ -155,7 +166,8 @@ class DuckDBQueries:
         """
 
     def export_json_query(self, default_filename, export_filename=None):
-        """Query to export a DuckDB table to a JSON file.
+        """
+        Query to export a DuckDB table to a JSON file.
 
         Args:
             default_filename (str): The default name of the output file.
@@ -165,23 +177,27 @@ class DuckDBQueries:
             str: The SQL query to export the table to a JSON file.
         """
         filename = self.set_export_filename(default_filename, export_filename)
-        return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}' (ARRAY true) "
+        return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}' (ARRAY true)"  # noqa: E501
 
-    def export_json_newline_delimited_query(self, default_filename, export_filename=None):
-        """Query to export a DuckDB table to a JSON file with newline delimited.
+    def export_json_newline_delimited_query(
+            self, default_filename, export_filename=None):
+        """
+        Query to export a DuckDB table to a JSON file with newline delimited.
 
         Args:
             default_filename (str): The default name of the output file.
             export_filename (str, optional): The name of the output file.
 
         Returns:
-            str: The SQL query to export the table to a JSON file with newline delimited.
+            str: The SQL query to export the table to a JSON file with newline
+            delimited.
         """
         filename = self.set_export_filename(default_filename, export_filename)
-        return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}'"
+        return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}'"  # noqa: E501
 
     def export_parquet_query(self, default_filename, export_filename=None):
-        """Query to export a DuckDB table to a Parquet file.
+        """
+        Query to export a DuckDB table to a Parquet file.
 
         Args:
             default_filename (str): The default name of the output file.
@@ -191,7 +207,7 @@ class DuckDBQueries:
             str: The SQL query to export the table to a Parquet file.
         """
         filename = self.set_export_filename(default_filename, export_filename)
-        return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}'(FORMAT PARQUET)"
+        return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}'(FORMAT PARQUET)"  # noqa: E501
 
     def update_and_normalize_column_names(self):
         """Query to update column names in a DuckDB table.
@@ -204,11 +220,16 @@ class DuckDBQueries:
         consistent naming conventions across different processing engines.
         """
         duckdb.sql(self.import_csv_query())
-        table_columns = duckdb.sql(f"SELECT * FROM {self.database_table_name} LIMIT 0").columns
+        table_columns = duckdb.sql(
+            f"SELECT * FROM {self.database_table_name} LIMIT 0").columns
         for old_name, new_name in zip(table_columns,
-                                      CSVColumnNameNormalizer(self.filepath).columns_normalized
+                                      CSVColumnNameNormalizer(
+                                          self.filepath).columns_normalized
                                       ):
-            sql_string = f"ALTER TABLE {self.database_table_name} RENAME COLUMN \"{old_name}\" TO \"{new_name}\""
+            sql_string = (
+                f"ALTER TABLE {self.database_table_name} "
+                f"RENAME COLUMN \"{old_name}\" TO \"{new_name}\""
+            )
             duckdb.sql(sql_string)
 
     def create_table(self, normalize_columns=False):
@@ -238,11 +259,13 @@ class DuckDBQueries:
         return dataframe.rename(normalized_mapping)
 
     def sql_query_to_dataframe(self, sql_query, normalize_columns=False):
-        """Query to convert a SQL query to a Polars DataFrame.
+        """
+        Query to convert a SQL query to a Polars DataFrame.
 
         Args:
             sql_query (str): The SQL query to execute.
-            normalize_columns (optional, bool): Whether to normalize column names.
+            normalize_columns (optional, bool): Whether to normalize column
+            names.
 
         Returns:
             polars.DataFrame: The resulting DataFrame.
