@@ -46,19 +46,22 @@ class CSVSchemaReportAIGenerated:
             TypeError: If the response is not a text string.
             RuntimeError: For any other unexpected errors.
         """
+        response_text = None
         try:
             response_text = self._create_engine().generate_content(
                 model=model,
                 prompt=prompt,
                 system_instruction=system_instructions
             )
+            if response_text is None:
+                raise ValueError("The model returned None instead of a text response.")
             return json.loads(response_text)
         except json.JSONDecodeError as e:
             error_message = (
                 "The model's response was not a valid JSON object. "
                 "This can happen if the `max_tokens` parameter is too low, "
                 f"cutting off the response. Details: {e}\n"
-                f"Model Response: {response_text[:500]}..."
+                f"Model Response: {response_text[:500] if response_text else 'None'}..."
             )
             raise ValueError(error_message) from e
         except TypeError as e:
@@ -66,7 +69,7 @@ class CSVSchemaReportAIGenerated:
                 "The model did not return a text response that could be "
                 "processed. This can happen if the `max_tokens` parameter is "
                 f"too low, cutting off the response. Details: {e}\n"
-                f"Model Response: {response_text}"
+                f"Model Response: {response_text if response_text else 'None'}"
             )
             raise TypeError(error_message) from e
         except Exception as e:

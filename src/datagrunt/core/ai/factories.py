@@ -24,8 +24,7 @@ class AIEngineFactory:
         self.kwargs = kwargs
         if self.engine not in AIEngineProperties.valid_engines:
             raise ValueError(
-                AIEngineProperties.value_error_message.format(
-                    engine=self.engine))
+                f"Unsupported AI engine: {self.engine}")
 
     def create_engine(self):
         """Create an AI engine instance."""
