@@ -15,7 +15,7 @@ from google.genai import types
 @dataclass
 class AIEngineProperties:
     """Base properties for AI Engines."""
-    valid_engines: tuple = ('google')
+    valid_engines: tuple = ('google',)
 
 
 class BaseAIEngine(ABC):
@@ -28,40 +28,38 @@ class BaseAIEngine(ABC):
     @abstractmethod
     def generate_content(
         self,
+        model,
         prompt,
-        max_tokens,
-        temperature,
+        system_instruction=None,
         **kwargs
     ):
         """Generate text from a prompt.
 
         Args:
+            model: The model to use for generation
             prompt: The prompt to send to the model
-            max_tokens: Maximum tokens to generate
-            temperature: Sampling temperature
+            system_instruction: System instructions to guide the model's response
             **kwargs: Additional provider-specific parameters
 
         Returns:
             Generated text
         """
-        pass
+        raise NotImplementedError
 
     @abstractmethod
     def generate_embeddings(
         self,
-        text,
         **kwargs
     ):
         """Generate embeddings for text.
 
         Args:
-            text: Text to embed
             **kwargs: Additional provider-specific parameters
 
         Returns:
             Embedding vector
         """
-        pass
+        raise NotImplementedError
 
 
 class GoogleAIEngine(BaseAIEngine):
@@ -150,20 +148,20 @@ class GoogleAIEngine(BaseAIEngine):
         """Create safety settings for the model."""
         return [
             types.SafetySetting(
-                category="HARM_CATEGORY_HATE_SPEECH",
-                threshold="OFF"
+                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                threshold=types.HarmBlockThreshold.OFF
             ),
             types.SafetySetting(
-                category="HARM_CATEGORY_DANGEROUS_CONTENT",
-                threshold="OFF"
+                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                threshold=types.HarmBlockThreshold.OFF
             ),
             types.SafetySetting(
-                category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                threshold="OFF"
+                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                threshold=types.HarmBlockThreshold.OFF
             ),
             types.SafetySetting(
-                category="HARM_CATEGORY_HARASSMENT",
-                threshold="OFF"
+                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                threshold=types.HarmBlockThreshold.OFF
             )
         ]
 
@@ -211,7 +209,7 @@ class GoogleAIEngine(BaseAIEngine):
             )
         return config
 
-    def generate_content(self, model, prompt, system_instruction=None):
+    def generate_content(self, model, prompt, system_instruction=None, **kwargs):
         """
         Generate content using the Google GenAI API.
 
@@ -220,6 +218,7 @@ class GoogleAIEngine(BaseAIEngine):
             prompt (str): The prompt to send to the model.
             system_instruction (str, optional): System instructions to guide the
             model's response.
+            **kwargs: Additional provider-specific parameters
         Returns:
             str: The generated response from the model.
         """
@@ -234,7 +233,15 @@ class GoogleAIEngine(BaseAIEngine):
 
         return response.text
 
-    def generate_embeddings(self):
+    def generate_embeddings(self, **kwargs):
+        """Generate embeddings for text.
+
+        Args:
+            **kwargs: Additional provider-specific parameters
+
+        Returns:
+            Embedding vector
+        """
         raise NotImplementedError(
             "Embedding generation is not yet implemented for the Google "
             "provider."
