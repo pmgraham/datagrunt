@@ -1,16 +1,17 @@
 """Module for CSV components."""
 
 # standard library
-from collections import Counter, OrderedDict
 import csv
-from functools import lru_cache, cached_property
 import re
+from collections import Counter, OrderedDict
+from functools import cached_property
 
 # third party libraries
 import polars as pl
 
 # local libraries
 from datagrunt.core.file_io import FileProperties
+
 
 class CSVStringSample:
     """Base class for creating a string sample of a CSV file."""
@@ -43,7 +44,8 @@ class CSVStringSample:
     @cached_property
     def csv_string_sample_by_quality(self):
         """
-        Convert a Polars DataFrame to a CSV string, prioritizing rows with the fewest null values.
+        Convert a Polars DataFrame to a CSV string, prioritizing rows with
+        the fewest null values.
 
         Returns:
             str: The CSV string representation of the DataFrame.
@@ -52,10 +54,13 @@ class CSVStringSample:
                          separator=CSVDelimiter(self.filepath).delimiter,
                          n_rows=self.SAMPLE_ROWS_BY_QUALITY,
                          )
-        df = df.with_columns(pl.sum_horizontal(pl.all().is_null()).alias("null_count"))
+        df = df.with_columns(
+            pl.sum_horizontal(
+                pl.all().is_null()).alias("null_count"))
         df = df.sort("null_count")
         df = df.drop("null_count")
         return df.head(self.SAMPLE_ROWS).write_csv(file=None)
+
 
 class CSVDelimiter:
     """Class to infer and derive the CSV delimiter."""
@@ -77,14 +82,15 @@ class CSVDelimiter:
         self.delimiter_byte_string = self.delimiter.encode()
 
     def _get_most_common_non_alpha_numeric_character_from_string(self):
-        """Get the most common non-alpha-numeric character from a given string.
+        """
+        Get the most common non-alpha-numeric character from a given string.
 
         Returns:
             str: The most common non-alpha-numeric character from the string.
         """
         columns_no_spaces = self.first_row.replace(' ', '')
         regex = re.compile(self.DELIMITER_REGEX_PATTERN)
-        counts = Counter(char for char in regex.findall(columns_no_spaces))
+        counts = Counter(char for char in regex.findall(columns_no_spaces))  # noqa: E501
         most_common = counts.most_common()
         return most_common
 
@@ -94,7 +100,8 @@ class CSVDelimiter:
         Returns:
             str: The delimiter of the CSV file.
         """
-        delimiter_candidates = self._get_most_common_non_alpha_numeric_character_from_string()
+        delimiter_candidates = self._get_most_common_non_alpha_numeric_character_from_string(
+        )
 
         if self.file_properties.is_empty or self.file_properties.is_blank:
             delimiter = self.DEFAULT_DELIMITER
@@ -105,6 +112,7 @@ class CSVDelimiter:
         else:
             delimiter = delimiter_candidates[0][0]
         return delimiter
+
 
 class CSVDialect:
     """Class for inferring the CSV dialect."""
@@ -132,10 +140,12 @@ class CSVDialect:
         Returns:
             csv.Dialect: The CSV dialect inferred from the file.
         """
-        if FileProperties(self.filepath).is_empty or FileProperties(self.filepath).is_blank:
+        if FileProperties(self.filepath).is_empty or FileProperties(
+                self.filepath).is_blank:
             return None
-        with open(self.filepath, 'r', encoding=FileProperties(self.filepath).DEFAULT_ENCODING) as csvfile:
-            dialect = csv.Sniffer().sniff(csvfile.read(self.CSV_SNIFF_SAMPLE_ROWS))
+        with open(self.filepath, 'r',
+                  encoding=FileProperties(self.filepath).DEFAULT_ENCODING) as csvfile:
+            dialect = csv.Sniffer().sniff(csvfile.read(self.CSV_SNIFF_SAMPLE_ROWS))  # noqa: E501
             csvfile.seek(0)  # Reset file pointer to the beginning
         return dialect
 
@@ -151,7 +161,9 @@ class CSVDialect:
 
     @cached_property
     def doublequote(self):
-        """Whether double quotes are used to escape quotes in the CSV file."""
+        """
+        Whether double quotes are used to escape quotes in the CSV file.
+        """
         return self.dialect.doublequote if self.dialect else False
 
     @cached_property
@@ -161,13 +173,17 @@ class CSVDialect:
 
     @cached_property
     def skipinitialspace(self):
-        """Whether spaces are skipped at the beginning of fields in the CSV file."""
+        """
+        Whether spaces are skipped at the beginning of fields in the CSV file.
+        """
         return self.dialect.skipinitialspace if self.dialect else False
 
     @cached_property
     def quoting(self):
         """The quoting style used in the CSV file."""
-        return self.QUOTING_MAP.get(self.dialect.quoting) if self.dialect else 'quote minimal'
+        return self.QUOTING_MAP.get(
+            self.dialect.quoting) if self.dialect else 'quote minimal'
+
 
 class CSVRows:
     """Class for parsing CSV rows."""
@@ -185,10 +201,10 @@ class CSVRows:
         """Reads and returns the first line of a file.
 
         Returns:
-            The first line of the file, stripped of leading/trailing whitespace,
-            or None if the file is empty.
+            The first line of the file, stripped of leading/trailing
+            whitespace, or None if the file is empty.
         """
-        with open(self.filepath, 'r', encoding=FileProperties(self.filepath).DEFAULT_ENCODING) as csv_file:
+        with open(self.filepath, 'r', encoding=FileProperties(self.filepath).DEFAULT_ENCODING) as csv_file:  # noqa: E501
             first_line = csv_file.readline().strip()
         return first_line
 
@@ -203,6 +219,7 @@ class CSVRows:
         """Return the number of lines in the CSV file excluding the header."""
         return self.row_count_with_header - 1
 
+
 class CSVColumns:
     """Class for parsing CSV columns."""
 
@@ -213,14 +230,15 @@ class CSVColumns:
 
     def _get_columns(self):
         """Return the columns."""
-        if FileProperties(self.filepath).is_empty or FileProperties(self.filepath).is_blank:
+        if FileProperties(self.filepath).is_empty or FileProperties(
+                self.filepath).is_blank:
             return []
         df = pl.read_csv(self.filepath,
                          separator=CSVDelimiter(self.filepath).delimiter,
                          truncate_ragged_lines=True,
                          infer_schema=False,
                          n_rows=5
-                        )
+                         )
         return df.columns
 
     @cached_property
@@ -238,6 +256,7 @@ class CSVColumns:
         """Return the number of columns."""
         return len(self.columns)
 
+
 class CSVColumnNameNormalizer:
     """Class to normalize CSV columns names."""
 
@@ -247,11 +266,14 @@ class CSVColumnNameNormalizer:
     def __init__(self, filepath):
         """Initialize the CSVColumnNameNormalizer with a filepath."""
         self.filepath = filepath
-        self.columns_normalized = self._normalize_column_names(CSVColumns(filepath).columns)
+        self.columns_normalized = self._normalize_column_names(
+            CSVColumns(filepath).columns)
 
     def _normalize_single_column_name(self, column_name):
-        """Normalize a single column name by converting to lowercase, replacing spaces and special
-        characters with underscores, and removing extra underscores.
+        """
+        Normalize a single column name by converting to lowercase, replacing
+        spaces and special characters with underscores, and removing extra
+        underscores.
 
         Replace special characters and spaces with underscore
         Remove leading and trailing underscores
@@ -295,8 +317,9 @@ class CSVColumnNameNormalizer:
 
     def _normalize_column_names(self, columns):
         """
-        Normalize column names by converting to lowercase, replacing spaces and special
-        characters with underscores, and removing extra underscores.
+        Normalize column names by converting to lowercase, replacing spaces
+        and special characters with underscores, and removing extra
+        underscores.
 
         Args:
             columns (list): List of column names to normalize
@@ -304,7 +327,8 @@ class CSVColumnNameNormalizer:
         Returns:
             list: List of normalized column names
         """
-        normalized_columns = [self._normalize_single_column_name(col) for col in columns]
+        normalized_columns = [
+            self._normalize_single_column_name(col) for col in columns]
         return self._make_unique_column_names(normalized_columns)
 
     @cached_property
@@ -319,11 +343,16 @@ class CSVColumnNameNormalizer:
 
     @cached_property
     def columns_to_normalized_mapping(self):
-        """Return the mapping of original column names to normalized column names."""
-        return dict(OrderedDict(zip(CSVColumns(self.filepath).columns, self.columns_normalized)))
+        """
+        Return the mapping of original column names to normalized column names.
+        """
+        return dict(OrderedDict(
+            zip(CSVColumns(self.filepath).columns, self.columns_normalized)))
+
 
 class CSVComponents(FileProperties):
     """A class that combines all CSV components into a single interface."""
+
     def __init__(self, filepath):
         """Initialize the CSVComponents object.
 
@@ -371,12 +400,16 @@ class CSVComponents(FileProperties):
 
     @cached_property
     def row_count_with_header(self):
-        """Return the number of rows in the CSV file including the header row."""
+        """
+        Return the number of rows in the CSV file including the header row.
+        """
         return self._rows.row_count_with_header
 
     @cached_property
     def row_count_without_header(self):
-        """Return the number of rows in the CSV file excluding the header row."""
+        """
+        Return the number of rows in the CSV file excluding the header row.
+        """
         return self._rows.row_count_without_header
 
     @cached_property
@@ -426,5 +459,8 @@ class CSVComponents(FileProperties):
 
     @cached_property
     def csv_string_sample_by_quality(self):
-        """Return a sample of the CSV file as a string, prioritizing rows with the fewest null values."""
+        """
+        Return a sample of the CSV file as a string, prioritizing rows with
+        the fewest null values.
+        """
         return self._sample.csv_string_sample_by_quality

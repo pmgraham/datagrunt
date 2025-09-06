@@ -1,12 +1,13 @@
 from datagrunt.core import (
+    CSVColumnNameNormalizer,
+    CSVColumns,
+    CSVComponents,
     CSVDelimiter,
     CSVDialect,
-    CSVColumns,
-    CSVColumnNameNormalizer,
-    CSVComponents,
     CSVRows,
-    CSVStringSample
+    CSVStringSample,
 )
+
 
 class TestCSVStringSample:
     """Test suite for the CSVStringSample class."""
