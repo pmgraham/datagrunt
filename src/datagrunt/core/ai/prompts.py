@@ -111,5 +111,6 @@ Given a table named '{table_name}' with the following schema:
 
 Generate a SQL query for this request: {natural_language_query}
 
-Return ONLY the SQL query without any explanation or markdown formatting. The query should be compatible with DuckDB syntax.  # noqa: E501
+Return ONLY the SQL query without any explanation or markdown formatting.
+The query should be compatible with DuckDB syntax.
 """
