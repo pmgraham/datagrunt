@@ -14,10 +14,16 @@ Categorize these finding into their own section of the response format.
 """
 
 CSV_SCHEMA_PROMPT = """
-For the given data string identify the columns, return a list of columns, the column data types, and whether or not they should be categorized as a dimension or a measure.
-Also return a normalized version of the data column name in all lower case separated by underscores. If the column name starts with a number move the number to the end of the column name.
-Anything that could be categorized as a special number could lose a leading zero if converted from text to a numeric type, be sure in those cases to classify the column as a dimension and make it a string type.
-Here are some examples of special values that could be numeric typeable but should be classified as dimensions and string types:
+For the given data string identify the columns, return a list of columns,
+the column data types, and whether or not they should be categorized as a
+dimension or a measure. Also return a normalized version of the data column
+name in all lower case separated by underscores. If the column name starts
+with a number move the number to the end of the column name. Anything that
+could be categorized as a special number could lose a leading zero if
+converted from text to a numeric type, be sure in those cases to classify
+the column as a dimension and make it a string type. Here are some examples
+of special values that could be numeric typeable but should be classified as
+dimensions and string types:
 
 <special values>
     * ZIP Codes / Postal Codes
@@ -28,12 +34,14 @@ Here are some examples of special values that could be numeric typeable but shou
     * Serial Numbers
     * Course Codes / Class IDs
     * Lot Numbers / Batch Numbers
-    * Dates / Times (if represented as a single number without separators, e.g., MMDD)
+    * Dates / Times (if represented as a single number without separators,
+      e.g., MMDD)
     * Social Security Numbers (SSNs)
     * Transaction Codes
     * Any number with a leading zero in the original data
 
-If unsure if a data value should be categorized as a dimension or measure, for safety sake, categorize as a dimension and string type.
+If unsure if a data value should be categorized as a dimension or measure,
+for safety sake, categorize as a dimension and string type.
 Return a map of original column names to normalized column names.
 
 <example measures>
@@ -44,9 +52,12 @@ Return a map of original column names to normalized column names.
     * Temperature
     * Distance
 
-If `has_column_header` is false, then recommend column header names based on the the data that are nicely formatted in lowercase and underscore separated.
-After generating a list of recommended columns, add another element grouping those recommendations into dimension and measures.
-Be sure to reserve measures only for quantifiable values and not anything that could be categorized as a `special value`.
+If `has_column_header` is false, then recommend column header names based on
+the the data that are nicely formatted in lowercase and underscore separated.
+After generating a list of recommended columns, add another element grouping
+those recommendations into dimension and measures.
+Be sure to reserve measures only for quantifiable values and not anything
+that could be categorized as a `special value`.
 
 Return a response format like this:
 
@@ -74,7 +85,7 @@ Return a response format like this:
  "measures": ["column_name_1", "column_name_2", ...],
 "columns_rename_map": {{
     "column_name": "normalized_column_name"
-    }}
+}}
 }}
 
 <data string>

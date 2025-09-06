@@ -147,7 +147,7 @@ reader.get_sample()
 │ VIN (1-10) │  County   │     City     │ … │   Vehicle Location   │   Electric Utility   │ 2020 Census Tract │
 │  varchar   │  varchar  │   varchar    │   │       varchar        │       varchar        │      varchar      │
 ├────────────┼───────────┼──────────────┼───┼──────────────────────┼──────────────────────┼───────────────────┤
-│ 5YJSA1E28K │ Snohomish │ Mukilteo     ��� … │ POINT (-122.29943 …  │ PUGET SOUND ENERGY…  │ 53061042001       │
+│ 5YJSA1E28K │ Snohomish │ Mukilteo     │ … │ POINT (-122.29943 …  │ PUGET SOUND ENERGY…  │ 53061042001       │
 │ 1C4JJXP68P │ Yakima    │ Yakima       │ … │ POINT (-120.468875…  │ PACIFICORP           │ 53077001601       │
 │ WBY8P6C05L │ Kitsap    │ Kingston     │ … │ POINT (-122.517835…  │ PUGET SOUND ENERGY…  │ 53035090102       │
 │ JTDKARFP1J │ Kitsap    │ Port Orchard │ … │ POINT (-122.653005…  │ PUGET SOUND ENERGY…  │ 53035092802       │
