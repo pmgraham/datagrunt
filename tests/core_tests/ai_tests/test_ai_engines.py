@@ -32,7 +32,7 @@ class TestBaseAIEngine:
 
     def test_cannot_instantiate_directly(self):
         """Test that BaseAIEngine cannot be instantiated directly."""
-        with pytest.raises(TypeError):
+        with pytest.raises(TypeError, match="Can't instantiate abstract class BaseAIEngine"):
             BaseAIEngine()
 
     def test_abstract_methods_require_implementation(self):
@@ -44,10 +44,11 @@ class TestBaseAIEngine:
 
             # Only implement one method
             def generate_embeddings(self, **kwargs):
+
                 return "embeddings"
 
         # Should not be able to instantiate without implementing generate_content
-        with pytest.raises(TypeError):
+        with pytest.raises(TypeError, match="Can't instantiate abstract class PartialEngine"):
             PartialEngine("test_key")
 
     def test_complete_implementation_works(self):
