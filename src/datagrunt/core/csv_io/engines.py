@@ -13,8 +13,7 @@ import pyarrow as pa
 from duckdb import DuckDBPyRelation
 
 # local libraries
-from datagrunt.core.csv_io.csvcomponents import (
-    CSVColumnNameNormalizer, CSVDelimiter)
+from datagrunt.core.csv_io.csvcomponents import CSVColumnNameNormalizer, CSVDelimiter
 from datagrunt.core.databases import DuckDBQueries
 
 
