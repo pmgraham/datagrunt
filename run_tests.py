@@ -1,8 +1,8 @@
 """This module runs all tests for the datagrunt package."""
 
-from pathlib import Path
-import sys
 import subprocess
+import sys
+from pathlib import Path
 
 if __name__ == "__main__":
     tests_dir = Path(__file__).parent / "tests"
