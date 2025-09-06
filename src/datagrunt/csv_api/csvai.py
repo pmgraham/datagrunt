@@ -4,8 +4,7 @@
 import json
 
 # local imports
-from datagrunt.core import (
-    AIEngineFactory, AIEngineProperties, CSVStringSample, prompts)
+from datagrunt.core import AIEngineFactory, AIEngineProperties, CSVStringSample, prompts
 
 
 class CSVSchemaReportAIGenerated:
