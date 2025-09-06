@@ -1,10 +1,11 @@
 """This module contains tests for the AI factory classes."""
 
-import pytest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
-from datagrunt.core.ai.factories import AIEngineFactory
+import pytest
+
 from datagrunt.core.ai.engines import GoogleAIEngine
+from datagrunt.core.ai.factories import AIEngineFactory
 
 
 class TestAIEngineFactory:
