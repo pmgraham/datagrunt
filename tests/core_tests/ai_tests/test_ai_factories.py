@@ -60,7 +60,7 @@ class TestAIEngineFactory:
         factory = AIEngineFactory(api_key="test_key", engine="google")
         # Replace the engine class in the factory's AI_ENGINES dict
         original_engine = factory.AI_ENGINES['google']
-        factory.AI_ENGINES['google'] = mock_google_engine
+        factory.AI_ENGINES['google'] = mock_google_engine  # type: ignore
 
         try:
             result = factory.create_engine()
@@ -71,23 +71,23 @@ class TestAIEngineFactory:
             factory.AI_ENGINES['google'] = original_engine
 
     def test_create_engine_with_kwargs(self):
-        """Test creating an engine with additional kwargs."""
-        mock_engine_instance = Mock()
-        mock_google_engine = Mock(return_value=mock_engine_instance)
+            """Test creating an engine with additional kwargs."""
+            mock_engine_instance = Mock()
+            mock_google_engine = Mock(return_value=mock_engine_instance)
 
-        kwargs = {"temperature": 0.7, "max_tokens": 1000}
-        factory = AIEngineFactory(api_key="test_key", engine="google", **kwargs)
-        # Replace the engine class in the factory's AI_ENGINES dict
-        original_engine = factory.AI_ENGINES['google']
-        factory.AI_ENGINES['google'] = mock_google_engine
+            kwargs = {"temperature": 0.7, "max_tokens": 1000}
+            factory = AIEngineFactory(api_key="test_key", engine="google", **kwargs)
+            # Replace the engine class in the factory's AI_ENGINES dict
+            original_engine = factory.AI_ENGINES['google']
+            factory.AI_ENGINES['google'] = mock_google_engine  # type: ignore
 
-        try:
-            result = factory.create_engine()
-            mock_google_engine.assert_called_once_with("test_key", **kwargs)
-            assert result == mock_engine_instance
-        finally:
-            # Restore the original engine
-            factory.AI_ENGINES['google'] = original_engine
+            try:
+                result = factory.create_engine()
+                mock_google_engine.assert_called_once_with("test_key", **kwargs)
+                assert result == mock_engine_instance
+            finally:
+                # Restore the original engine
+                factory.AI_ENGINES['google'] = original_engine
 
     def test_create_engine_unsupported_after_init(self):
         """Test error when trying to create an unsupported engine after modifying AI_ENGINES."""
@@ -128,7 +128,7 @@ class TestAIEngineFactory:
         )
         # Replace the engine class in the factory's AI_ENGINES dict
         original_engine = factory.AI_ENGINES['google']
-        factory.AI_ENGINES['google'] = mock_google_engine
+        factory.AI_ENGINES['google'] = mock_google_engine  # type: ignore
 
         try:
             result = factory.create_engine()
