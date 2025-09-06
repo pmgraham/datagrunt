@@ -1,8 +1,9 @@
 """This module contains tests for the CSV AI functionality."""
 
 import json
+from unittest.mock import Mock, patch
+
 import pytest
-from unittest.mock import Mock, patch, MagicMock
 
 from datagrunt.csv_api.csvai import CSVSchemaReportAIGenerated
 
@@ -305,7 +306,8 @@ class TestCSVSchemaReportAIGenerated:
     @patch('datagrunt.csv_api.csvai.CSVStringSample')
     @patch('datagrunt.csv_api.csvai.prompts')
     @patch('datagrunt.csv_api.csvai.AIEngineFactory')
-    def test_generate_csv_schema_report_default_system_instructions(self, mock_factory_class, mock_prompts, mock_csv_sample_class):
+    def test_generate_csv_schema_report_default_system_instructions(self,
+            mock_factory_class, mock_prompts, mock_csv_sample_class):
         """Test generate_csv_schema_report with default system instructions."""
         # Setup mocks
         mock_csv_sample = Mock()

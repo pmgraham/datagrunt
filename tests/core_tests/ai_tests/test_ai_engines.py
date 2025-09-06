@@ -1,7 +1,8 @@
 """This module contains tests for the AI engine classes."""
 
+from unittest.mock import Mock, patch
+
 import pytest
-from unittest.mock import Mock, patch, MagicMock
 from google.genai import types
 
 from datagrunt.core.ai.engines import AIEngineProperties, BaseAIEngine, GoogleAIEngine
