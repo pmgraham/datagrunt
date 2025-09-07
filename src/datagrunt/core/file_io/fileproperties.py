@@ -25,58 +25,52 @@ class FileExtensions:
     @cached_property
     def csv_extensions(self):
         """Define CSV extensions."""
-        return ['csv']
+        return ["csv"]
 
     @cached_property
     def tsv_extensions(self):
         """Define TSV extensions."""
-        return ['tsv']
+        return ["tsv"]
 
     @cached_property
     def excel_extensions(self):
         """Define Excel extensions."""
-        return [
-            'xlsx',
-            'xlsm',
-            'xlsb',
-            'xltx',
-            'xltm',
-            'xls',
-            'xlt'
-        ]
+        return ["xlsx", "xlsm", "xlsb", "xltx", "xltm", "xls", "xlt"]
 
     @cached_property
     def tabular_extensions(self):
         """Define tabular extensions."""
-        return list(set(self.csv_extensions +
-                    self.tsv_extensions + self.excel_extensions))
+        return list(set(self.csv_extensions + self.tsv_extensions + self.excel_extensions))
 
     @cached_property
     def apache_extensions(self):
         """Define Apache extensions."""
-        return ['parquet', 'avro']
+        return ["parquet", "avro"]
 
     @cached_property
     def semi_structured_extensions(self):
         """Define semi-structured extensions."""
-        return list(set(['json', 'jsonl']))
+        return list(set(["json", "jsonl"]))
 
     @cached_property
     def standard_extensions(self):
         """Define standard (non proprietary) extensions."""
-        return list(set(self.csv_extensions +
-                        self.tsv_extensions +
-                        self.apache_extensions +
-                        self.semi_structured_extensions))
+        return list(
+            set(self.csv_extensions + self.tsv_extensions + self.apache_extensions + self.semi_structured_extensions)
+        )
 
     @cached_property
     def structured_extensions(self):
         """Define structured extensions."""
-        return list(set(self.csv_extensions +
-                        self.tsv_extensions +
-                        self.excel_extensions +
-                        self.apache_extensions +
-                        self.tabular_extensions))
+        return list(
+            set(
+                self.csv_extensions
+                + self.tsv_extensions
+                + self.excel_extensions
+                + self.apache_extensions
+                + self.tabular_extensions
+            )
+        )
 
     @cached_property
     def proprietary_extensions(self):
@@ -100,18 +94,10 @@ class FileStatistics:
         """
         self.filepath = filepath
         self.size_in_bytes = os.path.getsize(self.filepath)
-        self.size_in_kb = round(
-            (self.size_in_bytes / self.FILE_SIZE_DIVISOR),
-            self.FILE_SIZE_ROUND_FACTOR)
-        self.size_in_mb = round(
-            (self.size_in_kb / self.FILE_SIZE_DIVISOR),
-            self.FILE_SIZE_ROUND_FACTOR)
-        self.size_in_gb = round(
-            (self.size_in_mb / self.FILE_SIZE_DIVISOR),
-            self.FILE_SIZE_ROUND_FACTOR)
-        self.size_in_tb = round(
-            (self.size_in_gb / self.FILE_SIZE_DIVISOR),
-            self.FILE_SIZE_ROUND_FACTOR)
+        self.size_in_kb = round((self.size_in_bytes / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
+        self.size_in_mb = round((self.size_in_kb / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
+        self.size_in_gb = round((self.size_in_mb / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
+        self.size_in_tb = round((self.size_in_gb / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
 
     @cached_property
     def modified_time(self):
@@ -146,7 +132,7 @@ class BlankFile:
         # Very low probability of being blank if file is 10MB or larger in size
         if filestats.size_in_mb >= self.FILE_SIZE_MB_FACTOR:
             return False
-        with open(self.filepath, 'r') as f:
+        with open(self.filepath, "r") as f:
             content = f.read().strip()
             if not content:
                 return True
@@ -173,7 +159,7 @@ class EmptyFile:
 class FileProperties:
     """Base class for file objects."""
 
-    DEFAULT_ENCODING = 'utf-8'
+    DEFAULT_ENCODING = "utf-8"
 
     def __init__(self, filepath):
         """
@@ -185,7 +171,7 @@ class FileProperties:
         self.filepath = filepath
         self.filename = Path(filepath).name
         self.extension = Path(filepath).suffix
-        self.extension_string = self.extension.replace('.', '')
+        self.extension_string = self.extension.replace(".", "")
 
         # Instantiate helper classes
         self._stats = FileStatistics(self.filepath)
@@ -212,10 +198,8 @@ class FileProperties:
     @cached_property
     def is_unstructured(self):
         """Check if the file is unstructured."""
-        is_not_standard = self.extension_string.lower(
-        ) not in self._ext.standard_extensions
-        is_not_semi_structured = self.extension_string.lower(
-        ) not in self._ext.semi_structured_extensions
+        is_not_standard = self.extension_string.lower() not in self._ext.standard_extensions
+        is_not_semi_structured = self.extension_string.lower() not in self._ext.semi_structured_extensions
         return is_not_standard and is_not_semi_structured
 
     @cached_property

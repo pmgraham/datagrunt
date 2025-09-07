@@ -2,7 +2,4 @@
 
 from datagrunt.core.databases.databases import DuckDBDatabase, DuckDBQueries
 
-__all__ = [
-    'DuckDBDatabase',
-    'DuckDBQueries'
-]
+__all__ = ["DuckDBDatabase", "DuckDBQueries"]
