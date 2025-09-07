@@ -10,10 +10,9 @@ from datagrunt import CSVWriter
 
 
 class TestCSVWriter:
-
     def test_write_csv(self, sample_csv, tmp_path):
         """Test writing to CSV format."""
-        for engine in ['duckdb', 'polars']:
+        for engine in ["duckdb", "polars"]:
             writer = CSVWriter(sample_csv, engine=engine)
             out_file = str(tmp_path / f"output_{engine}.csv")
             writer.write_csv(out_file)
@@ -22,11 +21,11 @@ class TestCSVWriter:
             assert Path(out_file).exists()
             df = pl.read_csv(out_file)
             assert len(df) == 2
-            assert list(df.columns) == ['name', 'age', 'city']
+            assert list(df.columns) == ["name", "age", "city"]
 
     def test_write_excel(self, sample_csv, tmp_path):
         """Test writing to Excel format."""
-        for engine in ['duckdb', 'polars']:
+        for engine in ["duckdb", "polars"]:
             writer = CSVWriter(sample_csv, engine=engine)
             out_file = str(tmp_path / f"output_{engine}.xlsx")
             writer.write_excel(out_file)
@@ -35,18 +34,18 @@ class TestCSVWriter:
             assert Path(out_file).exists()
             df = pl.read_excel(out_file)
             assert len(df) == 2
-            assert list(df.columns) == ['name', 'age', 'city']
+            assert list(df.columns) == ["name", "age", "city"]
 
     def test_write_json(self, sample_csv, tmp_path):
         """Test writing to JSON format."""
-        for engine in ['duckdb', 'polars']:
+        for engine in ["duckdb", "polars"]:
             writer = CSVWriter(sample_csv, engine=engine)
             out_file = str(tmp_path / f"output_{engine}.json")
             writer.write_json(out_file)
 
             # Verify the output file exists and contains data
             assert Path(out_file).exists()
-            with open(out_file, 'r') as f:
+            with open(out_file, "r") as f:
                 data = json.load(f)
             assert len(data) == 2
             assert isinstance(data, list)
@@ -54,21 +53,21 @@ class TestCSVWriter:
 
     def test_write_json_newline_delimited(self, sample_csv, tmp_path):
         """Test writing to JSON Lines format."""
-        for engine in ['duckdb', 'polars']:
+        for engine in ["duckdb", "polars"]:
             writer = CSVWriter(sample_csv, engine=engine)
             out_file = str(tmp_path / f"output_{engine}.jsonl")
             writer.write_json_newline_delimited(out_file)
 
             # Verify the output file exists and contains data
             assert Path(out_file).exists()
-            with open(out_file, 'r') as f:
+            with open(out_file, "r") as f:
                 lines = f.readlines()
             assert len(lines) == 2
             assert all(json.loads(line) for line in lines)
 
     def test_write_parquet(self, sample_csv, tmp_path):
         """Test writing to Parquet format."""
-        for engine in ['duckdb', 'polars']:
+        for engine in ["duckdb", "polars"]:
             writer = CSVWriter(sample_csv, engine=engine)
             out_file = str(tmp_path / f"output_{engine}.parquet")
             writer.write_parquet(out_file)
@@ -77,7 +76,7 @@ class TestCSVWriter:
             assert Path(out_file).exists()
             table = pq.read_table(out_file)
             assert len(table) == 2
-            assert table.column_names == ['name', 'age', 'city']
+            assert table.column_names == ["name", "age", "city"]
 
     def test_write_with_normalized_columns(self, tmp_path):
         """Test writing files with normalized column names."""
@@ -86,14 +85,14 @@ class TestCSVWriter:
         input_file = tmp_path / "test_normalize.csv"
         input_file.write_text(csv_content)
 
-        for engine in ['duckdb', 'polars']:
+        for engine in ["duckdb", "polars"]:
             writer = CSVWriter(str(input_file), engine=engine)
             out_file = str(tmp_path / f"normalized_{engine}.csv")
             writer.write_csv(out_file, normalize_columns=True)
 
             # Verify the output has normalized column names
             df = pl.read_csv(out_file)
-            expected_columns = ['first_name', 'last_name', 'age_group']
+            expected_columns = ["first_name", "last_name", "age_group"]
             assert list(df.columns) == expected_columns
 
     def test_write_completely_empty_file(self, completely_empty_csv, tmp_path):
@@ -103,7 +102,7 @@ class TestCSVWriter:
         out_csv = str(tmp_path / "completely_empty_output.csv")
         writer.write_csv(out_csv)
         assert Path(out_csv).exists()
-        with open(out_csv, 'r') as f:
+        with open(out_csv, "r") as f:
             content = f.read()
         assert content.strip() == "" or "column0"  # Verify file is completely empty (ignoring whitespace)
 
@@ -113,12 +112,12 @@ class TestCSVWriter:
 
         # Test that default filenames are used when no filename is provided
         writer.write_csv()
-        assert Path('output.csv').exists()
-        Path('output.csv').unlink()  # Cleanup
+        assert Path("output.csv").exists()
+        Path("output.csv").unlink()  # Cleanup
 
         writer.write_parquet()
-        assert Path('output.parquet').exists()
-        Path('output.parquet').unlink()  # Cleanup
+        assert Path("output.parquet").exists()
+        Path("output.parquet").unlink()  # Cleanup
 
     def test_file_overwrite(self, sample_csv, tmp_path):
         """Test overwriting existing output files."""

@@ -23,21 +23,20 @@ from datagrunt.core.databases import DuckDBQueries
 @dataclass
 class CSVEngineProperties:
     """Base properties for CSV operations."""
+
     filepath: str
     dataframe_sample_rows: int = 20
-    csv_export_filename: str = 'output.csv'
-    excel_export_filename: str = 'output.xlsx'
-    json_export_filename: str = 'output.json'
-    json_newline_export_filename: str = 'output.jsonl'
-    parquet_export_filename: str = 'output.parquet'
-    valid_engines: tuple = ('duckdb', 'polars', 'pyarrow')
+    csv_export_filename: str = "output.csv"
+    excel_export_filename: str = "output.xlsx"
+    json_export_filename: str = "output.json"
+    json_newline_export_filename: str = "output.jsonl"
+    parquet_export_filename: str = "output.parquet"
+    valid_engines: tuple = ("duckdb", "polars", "pyarrow")
     value_error_message: str = (
         "Reader engine '{engine}' is not 'duckdb', 'polars', or 'pyarrow'. "
         "Pass either 'duckdb', 'polars', or 'pyarrow' as valid engine params."
     )
-    missing_file_message: str = (
-        "File '{filepath}'. No such file or directory."
-    )
+    missing_file_message: str = "File '{filepath}'. No such file or directory."
 
 
 class CSVBaseReaderEngine(ABC):
@@ -95,12 +94,7 @@ class CSVBaseReaderEngine(ABC):
         pass
 
     @abstractmethod
-    def query_data(
-            self,
-            sql_query: str,
-            normalize_columns: bool = False) -> Union[
-                DuckDBPyRelation,
-                pl.DataFrame]:
+    def query_data(self, sql_query: str, normalize_columns: bool = False) -> Union[DuckDBPyRelation, pl.DataFrame]:
         """
         Query the data using SQL.
 
@@ -151,8 +145,7 @@ class CSVBaseWriterEngine(ABC):
         pass
 
     @abstractmethod
-    def write_json_newline_delimited(
-            self, export_filename, normalize_columns=False):
+    def write_json_newline_delimited(self, export_filename, normalize_columns=False):
         """
         Write data to JSON Lines format.
 
@@ -242,8 +235,7 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         column_normalizer = CSVColumnNameNormalizer(self.filepath)
         projections = []
         for col in current_columns:
-            normalized_name = column_normalizer.columns_to_normalized_mapping.get(
-                col, col)
+            normalized_name = column_normalizer.columns_to_normalized_mapping.get(col, col)
             projections.append(f'"{col}" AS "{normalized_name}"')
         return relation.project(", ".join(projections))
 
@@ -292,15 +284,9 @@ class CSVReaderPolarsEngine(CSVBaseReaderEngine):
         Returns:
             A Polars dataframe.
         """
-        df = pl.read_csv(self.filepath,
-                         separator=self.delimiter,
-                         truncate_ragged_lines=True,
-                         infer_schema=False
-                         )
+        df = pl.read_csv(self.filepath, separator=self.delimiter, truncate_ragged_lines=True, infer_schema=False)
         if normalize_columns:
-            df = df.rename(
-                CSVColumnNameNormalizer(
-                    self.filepath).columns_to_normalized_mapping)
+            df = df.rename(CSVColumnNameNormalizer(self.filepath).columns_to_normalized_mapping)
         return df
 
     def _create_dataframe_sample(self, normalize_columns=False):
@@ -314,16 +300,15 @@ class CSVReaderPolarsEngine(CSVBaseReaderEngine):
         Returns:
             A Polars dataframe.
         """
-        df = pl.read_csv(self.filepath,
-                         separator=self.delimiter,
-                         truncate_ragged_lines=True,
-                         infer_schema=False,
-                         n_rows=CSVEngineProperties.dataframe_sample_rows
-                         )
+        df = pl.read_csv(
+            self.filepath,
+            separator=self.delimiter,
+            truncate_ragged_lines=True,
+            infer_schema=False,
+            n_rows=CSVEngineProperties.dataframe_sample_rows,
+        )
         if normalize_columns:
-            df = df.rename(
-                CSVColumnNameNormalizer(
-                    self.filepath).columns_to_normalized_mapping)
+            df = df.rename(CSVColumnNameNormalizer(self.filepath).columns_to_normalized_mapping)
         return df
 
     def get_sample(self, normalize_columns=False):
@@ -398,8 +383,7 @@ class CSVReaderPolarsEngine(CSVBaseReaderEngine):
             query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
             dg.query_csv_data(query)
         """
-        return self.queries.sql_query_to_dataframe(
-            sql_query, normalize_columns)
+        return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
 
 
 class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
@@ -419,9 +403,8 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
             Args:
                 export_filename str: The name of the output file.
                 normalize_columns bool: Whether to normalize column names.
-            """
-        filename = self.queries.set_export_filename(
-            CSVEngineProperties.csv_export_filename, export_filename)
+        """
+        filename = self.queries.set_export_filename(CSVEngineProperties.csv_export_filename, export_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_csv_query(filename))
 
@@ -434,8 +417,7 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
             normalize_columns (optional, bool): Whether to normalize column
             names.
         """
-        filename = self.queries.set_export_filename(
-            CSVEngineProperties.excel_export_filename, export_filename)
+        filename = self.queries.set_export_filename(CSVEngineProperties.excel_export_filename, export_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_excel_query(filename))
 
@@ -448,13 +430,11 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
             normalize_columns (optional, bool): Whether to normalize column
             names.
         """
-        filename = self.queries.set_export_filename(
-            CSVEngineProperties.json_export_filename, export_filename)
+        filename = self.queries.set_export_filename(CSVEngineProperties.json_export_filename, export_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_json_query(filename))
 
-    def write_json_newline_delimited(
-            self, export_filename=None, normalize_columns=False):
+    def write_json_newline_delimited(self, export_filename=None, normalize_columns=False):
         """
         Query to export a DuckDB table to a JSON newline delimited file.
 
@@ -463,8 +443,7 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
             normalize_columns (optional, bool): Whether to normalize column
             names.
         """
-        filename = self.queries.set_export_filename(
-            CSVEngineProperties.json_newline_export_filename, export_filename)
+        filename = self.queries.set_export_filename(CSVEngineProperties.json_newline_export_filename, export_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_json_newline_delimited_query(filename))
 
@@ -477,8 +456,7 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
             normalize_columns (optional, bool): Whether to normalize column
             names.
         """
-        filename = self.queries.set_export_filename(
-            CSVEngineProperties.parquet_export_filename, export_filename)
+        filename = self.queries.set_export_filename(CSVEngineProperties.parquet_export_filename, export_filename)
         self.queries.create_table(normalize_columns)
         duckdb.sql(self.queries.export_parquet_query(filename))
 
@@ -499,10 +477,8 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
             normalize_columns (optional, bool): Whether to normalize column
             names.
         """
-        filename = self.queries.set_export_filename(
-            CSVEngineProperties.csv_export_filename, export_filename)
-        df = CSVReaderPolarsEngine(
-            self.filepath).to_dataframe(normalize_columns)
+        filename = self.queries.set_export_filename(CSVEngineProperties.csv_export_filename, export_filename)
+        df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
         df.write_csv(filename)
 
     def write_excel(self, export_filename=None, normalize_columns=False):
@@ -514,10 +490,8 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
             normalize_columns (optional, bool): Whether to normalize column
             names.
         """
-        filename = self.queries.set_export_filename(
-            CSVEngineProperties.excel_export_filename, export_filename)
-        df = CSVReaderPolarsEngine(
-            self.filepath).to_dataframe(normalize_columns)
+        filename = self.queries.set_export_filename(CSVEngineProperties.excel_export_filename, export_filename)
+        df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
         df.write_excel(filename)
 
     def write_json(self, export_filename=None, normalize_columns=False):
@@ -529,14 +503,11 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
             normalize_columns (optional, bool): Whether to normalize column
             names.
         """
-        filename = self.queries.set_export_filename(
-            CSVEngineProperties.json_export_filename, export_filename)
-        df = CSVReaderPolarsEngine(
-            self.filepath).to_dataframe(normalize_columns)
+        filename = self.queries.set_export_filename(CSVEngineProperties.json_export_filename, export_filename)
+        df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
         df.write_json(filename)
 
-    def write_json_newline_delimited(
-            self, export_filename=None, normalize_columns=False):
+    def write_json_newline_delimited(self, export_filename=None, normalize_columns=False):
         """
         Export a Polars dataframe to a JSON newline delimited file.
 
@@ -545,10 +516,8 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
             normalize_columns (optional, bool): Whether to normalize column
             names.
         """
-        filename = self.queries.set_export_filename(
-            CSVEngineProperties.json_newline_export_filename, export_filename)
-        df = CSVReaderPolarsEngine(
-            self.filepath).to_dataframe(normalize_columns)
+        filename = self.queries.set_export_filename(CSVEngineProperties.json_newline_export_filename, export_filename)
+        df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
         df.write_ndjson(filename)
 
     def write_parquet(self, export_filename=None, normalize_columns=False):
@@ -560,10 +529,8 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
             normalize_columns (optional, bool): Whether to normalize column
             names.
         """
-        filename = self.queries.set_export_filename(
-            CSVEngineProperties.parquet_export_filename, export_filename)
-        df = CSVReaderPolarsEngine(
-            self.filepath).to_dataframe(normalize_columns)
+        filename = self.queries.set_export_filename(CSVEngineProperties.parquet_export_filename, export_filename)
+        df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
         df.write_parquet(filename)
 
 
@@ -588,24 +555,19 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
         columns = CSVColumns(self.filepath).columns
 
         # Create schema with all string types
-        string_schema = pa.schema([
-            (name, pa.string()) for name in columns
-        ])
+        string_schema = pa.schema([(name, pa.string()) for name in columns])
 
         # Read with explicit string types
         table = pacsv.read_csv(
             self.filepath,
             parse_options=pacsv.ParseOptions(delimiter=self.delimiter),
-            convert_options=pacsv.ConvertOptions(column_types=string_schema)
+            convert_options=pacsv.ConvertOptions(column_types=string_schema),
         )
 
         if normalize_columns:
             column_normalizer = CSVColumnNameNormalizer(self.filepath)
             old_names = table.column_names
-            new_names = [
-                column_normalizer.columns_to_normalized_mapping.get(name, name)
-                for name in old_names
-            ]
+            new_names = [column_normalizer.columns_to_normalized_mapping.get(name, name) for name in old_names]
             table = table.rename_columns(new_names)
 
         return table
@@ -626,15 +588,13 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
         columns = CSVColumns(self.filepath).columns
 
         # Create schema with all string types
-        string_schema = pa.schema([
-            (name, pa.string()) for name in columns
-        ])
+        string_schema = pa.schema([(name, pa.string()) for name in columns])
 
         # Read with explicit string types
         table = pacsv.read_csv(
             self.filepath,
             parse_options=pacsv.ParseOptions(delimiter=self.delimiter),
-            convert_options=pacsv.ConvertOptions(column_types=string_schema)
+            convert_options=pacsv.ConvertOptions(column_types=string_schema),
         )
 
         # Take sample rows
@@ -643,10 +603,7 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
         if normalize_columns:
             column_normalizer = CSVColumnNameNormalizer(self.filepath)
             old_names = sample_table.column_names
-            new_names = [
-                column_normalizer.columns_to_normalized_mapping.get(name, name)
-                for name in old_names
-            ]
+            new_names = [column_normalizer.columns_to_normalized_mapping.get(name, name) for name in old_names]
             sample_table = sample_table.rename_columns(new_names)
 
         return sample_table
@@ -732,8 +689,7 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
             query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
             dg.query_csv_data(query)
         """
-        return self.queries.sql_query_to_dataframe(
-            sql_query, normalize_columns)
+        return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
 
 
 class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
@@ -750,24 +706,19 @@ class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
         columns = CSVColumns(self.filepath).columns
 
         # Create schema with all string types
-        string_schema = pa.schema([
-            (name, pa.string()) for name in columns
-        ])
+        string_schema = pa.schema([(name, pa.string()) for name in columns])
 
         # Read with explicit string types
         table = pacsv.read_csv(
             self.filepath,
             parse_options=pacsv.ParseOptions(delimiter=CSVDelimiter(self.filepath).delimiter),
-            convert_options=pacsv.ConvertOptions(column_types=string_schema)
+            convert_options=pacsv.ConvertOptions(column_types=string_schema),
         )
 
         if normalize_columns:
             column_normalizer = CSVColumnNameNormalizer(self.filepath)
             old_names = table.column_names
-            new_names = [
-                column_normalizer.columns_to_normalized_mapping.get(name, name)
-                for name in old_names
-            ]
+            new_names = [column_normalizer.columns_to_normalized_mapping.get(name, name) for name in old_names]
             table = table.rename_columns(new_names)
 
         return table
@@ -781,8 +732,7 @@ class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
             normalize_columns (optional, bool): Whether to normalize column
             names.
         """
-        filename = self.queries.set_export_filename(
-            CSVEngineProperties.csv_export_filename, export_filename)
+        filename = self.queries.set_export_filename(CSVEngineProperties.csv_export_filename, export_filename)
         table = self._create_table(normalize_columns)
         # Use native PyArrow CSV writer - no dataframe conversion needed
         pacsv.write_csv(table, filename)
@@ -796,8 +746,7 @@ class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
             normalize_columns (optional, bool): Whether to normalize column
             names.
         """
-        filename = self.queries.set_export_filename(
-            CSVEngineProperties.excel_export_filename, export_filename)
+        filename = self.queries.set_export_filename(CSVEngineProperties.excel_export_filename, export_filename)
         table = self._create_table(normalize_columns)
         # Convert to Polars DataFrame for Excel export
         df = pl.from_arrow(table)
@@ -814,19 +763,17 @@ class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
             normalize_columns (optional, bool): Whether to normalize column
             names.
         """
-        filename = self.queries.set_export_filename(
-            CSVEngineProperties.json_export_filename, export_filename)
+        filename = self.queries.set_export_filename(CSVEngineProperties.json_export_filename, export_filename)
         table = self._create_table(normalize_columns)
         # Use native PyArrow iteration to avoid dataframe conversion
         records = []
         for i in range(table.num_rows):
             record = {col: table[col][i].as_py() for col in table.column_names}
             records.append(record)
-        with open(filename, 'w') as f:
+        with open(filename, "w") as f:
             json.dump(records, f, indent=4)
 
-    def write_json_newline_delimited(
-            self, export_filename=None, normalize_columns=False):
+    def write_json_newline_delimited(self, export_filename=None, normalize_columns=False):
         """
         Export a PyArrow table to a JSON newline delimited file.
 
@@ -835,14 +782,13 @@ class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
             normalize_columns (optional, bool): Whether to normalize column
             names.
         """
-        filename = self.queries.set_export_filename(
-            CSVEngineProperties.json_newline_export_filename, export_filename)
+        filename = self.queries.set_export_filename(CSVEngineProperties.json_newline_export_filename, export_filename)
         table = self._create_table(normalize_columns)
         # Use native PyArrow iteration to avoid dataframe conversion
-        with open(filename, 'w') as f:
+        with open(filename, "w") as f:
             for i in range(table.num_rows):
                 record = {col: table[col][i].as_py() for col in table.column_names}
-                f.write(json.dumps(record) + '\n')
+                f.write(json.dumps(record) + "\n")
 
     def write_parquet(self, export_filename=None, normalize_columns=False):
         """
@@ -853,8 +799,7 @@ class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
             normalize_columns (optional, bool): Whether to normalize column
             names.
         """
-        filename = self.queries.set_export_filename(
-            CSVEngineProperties.parquet_export_filename, export_filename)
+        filename = self.queries.set_export_filename(CSVEngineProperties.parquet_export_filename, export_filename)
         table = self._create_table(normalize_columns)
         # Use native PyArrow Parquet writer - no dataframe conversion needed
         pq.write_table(table, filename)

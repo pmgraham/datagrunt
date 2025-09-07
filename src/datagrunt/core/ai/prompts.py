@@ -1,6 +1,5 @@
 """This module contains prompts for the AI models."""
 
-
 CSV_SCHEMA_SYSTEM_INSTRUCTIONS = """
 You are a data engineering agent.
 Your job is as follows:

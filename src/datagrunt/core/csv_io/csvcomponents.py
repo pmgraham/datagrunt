@@ -35,10 +35,7 @@ class CSVStringSample:
         Returns:
             str: The CSV string representation of the DataFrame.
         """
-        df = pl.read_csv(self.filepath,
-                         separator=CSVDelimiter(self.filepath).delimiter,
-                         n_rows=self.SAMPLE_ROWS
-                         )
+        df = pl.read_csv(self.filepath, separator=CSVDelimiter(self.filepath).delimiter, n_rows=self.SAMPLE_ROWS)
         return df.write_csv(file=None)
 
     @cached_property
@@ -50,13 +47,12 @@ class CSVStringSample:
         Returns:
             str: The CSV string representation of the DataFrame.
         """
-        df = pl.read_csv(self.filepath,
-                         separator=CSVDelimiter(self.filepath).delimiter,
-                         n_rows=self.SAMPLE_ROWS_BY_QUALITY,
-                         )
-        df = df.with_columns(
-            pl.sum_horizontal(
-                pl.all().is_null()).alias("null_count"))
+        df = pl.read_csv(
+            self.filepath,
+            separator=CSVDelimiter(self.filepath).delimiter,
+            n_rows=self.SAMPLE_ROWS_BY_QUALITY,
+        )
+        df = df.with_columns(pl.sum_horizontal(pl.all().is_null()).alias("null_count"))
         df = df.sort("null_count")
         df = df.drop("null_count")
         return df.head(self.SAMPLE_ROWS).write_csv(file=None)
@@ -66,8 +62,8 @@ class CSVDelimiter:
     """Class to infer and derive the CSV delimiter."""
 
     DELIMITER_REGEX_PATTERN = r'[^0-9a-zA-Z_ "-]'
-    DEFAULT_DELIMITER = ','
-    DEFAULT_TAB_DELIMITER = '\t'
+    DEFAULT_DELIMITER = ","
+    DEFAULT_TAB_DELIMITER = "\t"
 
     def __init__(self, filepath):
         super().__init__()
@@ -88,7 +84,7 @@ class CSVDelimiter:
         Returns:
             str: The most common non-alpha-numeric character from the string.
         """
-        columns_no_spaces = self.first_row.replace(' ', '')
+        columns_no_spaces = self.first_row.replace(" ", "")
         regex = re.compile(self.DELIMITER_REGEX_PATTERN)
         counts = Counter(char for char in regex.findall(columns_no_spaces))  # noqa: E501
         most_common = counts.most_common()
@@ -100,15 +96,14 @@ class CSVDelimiter:
         Returns:
             str: The delimiter of the CSV file.
         """
-        delimiter_candidates = self._get_most_common_non_alpha_numeric_character_from_string(
-        )
+        delimiter_candidates = self._get_most_common_non_alpha_numeric_character_from_string()
 
         if self.file_properties.is_empty or self.file_properties.is_blank:
             delimiter = self.DEFAULT_DELIMITER
         elif self.file_properties.is_tsv:
             delimiter = self.DEFAULT_TAB_DELIMITER
         elif len(delimiter_candidates) == 0:
-            delimiter = ' '
+            delimiter = " "
         else:
             delimiter = delimiter_candidates[0][0]
         return delimiter
@@ -118,12 +113,7 @@ class CSVDialect:
     """Class for inferring the CSV dialect."""
 
     CSV_SNIFF_SAMPLE_ROWS = 5
-    QUOTING_MAP = {
-        0: 'no quoting',
-        1: 'quote all',
-        2: 'quote minimal',
-        3: 'quote non-numeric'
-    }
+    QUOTING_MAP = {0: "no quoting", 1: "quote all", 2: "quote minimal", 3: "quote non-numeric"}
 
     def __init__(self, filepath):
         """Initialize the CSVDialect object.
@@ -140,11 +130,9 @@ class CSVDialect:
         Returns:
             csv.Dialect: The CSV dialect inferred from the file.
         """
-        if FileProperties(self.filepath).is_empty or FileProperties(
-                self.filepath).is_blank:
+        if FileProperties(self.filepath).is_empty or FileProperties(self.filepath).is_blank:
             return None
-        with open(self.filepath, 'r',
-                  encoding=FileProperties(self.filepath).DEFAULT_ENCODING) as csvfile:
+        with open(self.filepath, "r", encoding=FileProperties(self.filepath).DEFAULT_ENCODING) as csvfile:
             dialect = csv.Sniffer().sniff(csvfile.read(self.CSV_SNIFF_SAMPLE_ROWS))  # noqa: E501
             csvfile.seek(0)  # Reset file pointer to the beginning
         return dialect
@@ -169,7 +157,7 @@ class CSVDialect:
     @cached_property
     def newline_delimiter(self):
         """The newline delimiter used in the CSV file."""
-        return self.dialect.lineterminator if self.dialect else '\r\n'
+        return self.dialect.lineterminator if self.dialect else "\r\n"
 
     @cached_property
     def skipinitialspace(self):
@@ -181,8 +169,7 @@ class CSVDialect:
     @cached_property
     def quoting(self):
         """The quoting style used in the CSV file."""
-        return self.QUOTING_MAP.get(
-            self.dialect.quoting) if self.dialect else 'quote minimal'
+        return self.QUOTING_MAP.get(self.dialect.quoting) if self.dialect else "quote minimal"
 
 
 class CSVRows:
@@ -204,14 +191,14 @@ class CSVRows:
             The first line of the file, stripped of leading/trailing
             whitespace, or None if the file is empty.
         """
-        with open(self.filepath, 'r', encoding=FileProperties(self.filepath).DEFAULT_ENCODING) as csv_file:  # noqa: E501
+        with open(self.filepath, "r", encoding=FileProperties(self.filepath).DEFAULT_ENCODING) as csv_file:  # noqa: E501
             first_line = csv_file.readline().strip()
         return first_line
 
     @cached_property
     def row_count_with_header(self):
         """Return the number of lines in the CSV file including the header."""
-        with open(self.filepath, 'rb') as csv_file:
+        with open(self.filepath, "rb") as csv_file:
             return sum(1 for _ in csv_file)
 
     @property
@@ -230,26 +217,26 @@ class CSVColumns:
 
     def _get_columns(self):
         """Return the columns."""
-        if FileProperties(self.filepath).is_empty or FileProperties(
-                self.filepath).is_blank:
+        if FileProperties(self.filepath).is_empty or FileProperties(self.filepath).is_blank:
             return []
-        df = pl.read_csv(self.filepath,
-                         separator=CSVDelimiter(self.filepath).delimiter,
-                         truncate_ragged_lines=True,
-                         infer_schema=False,
-                         n_rows=5
-                         )
+        df = pl.read_csv(
+            self.filepath,
+            separator=CSVDelimiter(self.filepath).delimiter,
+            truncate_ragged_lines=True,
+            infer_schema=False,
+            n_rows=5,
+        )
         return df.columns
 
     @cached_property
     def columns_string(self):
         """Return a string representation of the columns."""
-        return ', '.join(self.columns)
+        return ", ".join(self.columns)
 
     @cached_property
     def columns_byte_string(self):
         """Return a byte string representation of the columns."""
-        return ', '.join(self.columns).encode()
+        return ", ".join(self.columns).encode()
 
     @cached_property
     def columns_count(self):
@@ -260,14 +247,13 @@ class CSVColumns:
 class CSVColumnNameNormalizer:
     """Class to normalize CSV columns names."""
 
-    SPECIAL_CHARS_PATTERN = re.compile(r'[^a-z0-9]+')
-    MULTI_UNDERSCORE_PATTERN = re.compile(r'_+')
+    SPECIAL_CHARS_PATTERN = re.compile(r"[^a-z0-9]+")
+    MULTI_UNDERSCORE_PATTERN = re.compile(r"_+")
 
     def __init__(self, filepath):
         """Initialize the CSVColumnNameNormalizer with a filepath."""
         self.filepath = filepath
-        self.columns_normalized = self._normalize_column_names(
-            CSVColumns(filepath).columns)
+        self.columns_normalized = self._normalize_column_names(CSVColumns(filepath).columns)
 
     def _normalize_single_column_name(self, column_name):
         """
@@ -287,10 +273,10 @@ class CSVColumnNameNormalizer:
             str: The normalized column name
         """
         name = column_name.lower()
-        name = self.SPECIAL_CHARS_PATTERN.sub('_', name)
-        name = name.strip('_')
-        name = self.MULTI_UNDERSCORE_PATTERN.sub('_', name)
-        return f'_{name}' if name and name[0].isdigit() else name
+        name = self.SPECIAL_CHARS_PATTERN.sub("_", name)
+        name = name.strip("_")
+        name = self.MULTI_UNDERSCORE_PATTERN.sub("_", name)
+        return f"_{name}" if name and name[0].isdigit() else name
 
     def _make_unique_column_names(self, columns_list):
         """
@@ -327,27 +313,25 @@ class CSVColumnNameNormalizer:
         Returns:
             list: List of normalized column names
         """
-        normalized_columns = [
-            self._normalize_single_column_name(col) for col in columns]
+        normalized_columns = [self._normalize_single_column_name(col) for col in columns]
         return self._make_unique_column_names(normalized_columns)
 
     @cached_property
     def columns_normalized_string(self):
         """Return a list representation of the normalized columns."""
-        return ', '.join(self.columns_normalized)
+        return ", ".join(self.columns_normalized)
 
     @cached_property
     def columns_normalized_byte_string(self):
         """Return a byte string representation of the normalized columns."""
-        return ', '.join(self.columns_normalized).encode()
+        return ", ".join(self.columns_normalized).encode()
 
     @cached_property
     def columns_to_normalized_mapping(self):
         """
         Return the mapping of original column names to normalized column names.
         """
-        return dict(OrderedDict(
-            zip(CSVColumns(self.filepath).columns, self.columns_normalized)))
+        return dict(OrderedDict(zip(CSVColumns(self.filepath).columns, self.columns_normalized)))
 
 
 class CSVComponents(FileProperties):

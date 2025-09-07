@@ -13,19 +13,17 @@ class CSVSchemaReportAIGenerated:
     def __init__(self, filepath, engine, api_key=None, **kwargs):
         """Initialize the CSV Schema Report class."""
         self.filepath = filepath
-        self.engine = engine.lower().replace(' ', '')
+        self.engine = engine.lower().replace(" ", "")
         self.api_key = api_key
         self.kwargs = kwargs
         if self.engine not in AIEngineProperties.valid_engines:
             raise ValueError(f"Unsupported AI engine: {self.engine}")
-        if self.kwargs.pop('ground_google_search', False):
-            raise ValueError(
-                "Grounding in Google Search is not supported for this class.")
+        if self.kwargs.pop("ground_google_search", False):
+            raise ValueError("Grounding in Google Search is not supported for this class.")
 
     def _create_engine(self):
         """Create an AI engine instance."""
-        return AIEngineFactory(self.api_key, self.engine,
-                               **self.kwargs).create_engine()
+        return AIEngineFactory(self.api_key, self.engine, **self.kwargs).create_engine()
 
     def _get_ai_response(self, model, prompt, system_instructions):
         """
@@ -48,9 +46,7 @@ class CSVSchemaReportAIGenerated:
         response_text = None
         try:
             response_text = self._create_engine().generate_content(
-                model=model,
-                prompt=prompt,
-                system_instruction=system_instructions
+                model=model, prompt=prompt, system_instruction=system_instructions
             )
             if response_text is None:
                 raise ValueError("The model returned None instead of a text response.")
@@ -76,13 +72,7 @@ class CSVSchemaReportAIGenerated:
             error_message = f"An unexpected error occurred: {e}"
             raise RuntimeError(error_message) from e
 
-    def generate_csv_schema_report(
-        self,
-        model,
-        prompt=None,
-        system_instructions=None,
-        return_json=False
-    ):
+    def generate_csv_schema_report(self, model, prompt=None, system_instructions=None, return_json=False):
         """
         Generate a CSV schema from a string using the Google GenAI API.
 
@@ -99,15 +89,12 @@ class CSVSchemaReportAIGenerated:
             dict: The generated schema from the CSV string.
         """
         if not prompt:
-            csv_string = CSVStringSample(
-                self.filepath).csv_string_sample_by_quality
-            prompt = prompts.CSV_SCHEMA_PROMPT.format(
-                csv_sample_string=csv_string)
+            csv_string = CSVStringSample(self.filepath).csv_string_sample_by_quality
+            prompt = prompts.CSV_SCHEMA_PROMPT.format(csv_sample_string=csv_string)
         if not system_instructions:
             system_instructions = prompts.CSV_SCHEMA_SYSTEM_INSTRUCTIONS
 
-        csv_schema_report = self._get_ai_response(
-            model, prompt, system_instructions)
+        csv_schema_report = self._get_ai_response(model, prompt, system_instructions)
 
         if return_json:
             return json.dumps(csv_schema_report, indent=4)
