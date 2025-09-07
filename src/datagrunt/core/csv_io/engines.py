@@ -1,6 +1,7 @@
 """Module to create engines for data processing."""
 
 # standard library
+import json
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -10,10 +11,12 @@ from typing import Dict, List, Union
 import duckdb
 import polars as pl
 import pyarrow as pa
+import pyarrow.csv as pacsv
+import pyarrow.parquet as pq
 from duckdb import DuckDBPyRelation
 
 # local libraries
-from datagrunt.core.csv_io.csvcomponents import CSVColumnNameNormalizer, CSVDelimiter
+from datagrunt.core.csv_io.csvcomponents import CSVColumnNameNormalizer, CSVColumns, CSVDelimiter
 from datagrunt.core.databases import DuckDBQueries
 
 
@@ -27,10 +30,10 @@ class CSVEngineProperties:
     json_export_filename: str = 'output.json'
     json_newline_export_filename: str = 'output.jsonl'
     parquet_export_filename: str = 'output.parquet'
-    valid_engines: tuple = ('duckdb', 'polars')
+    valid_engines: tuple = ('duckdb', 'polars', 'pyarrow')
     value_error_message: str = (
-        "Reader engine '{engine}' is not 'duckdb' or 'polars'. "
-        "Pass either 'duckdb' or 'polars' as valid engine params."
+        "Reader engine '{engine}' is not 'duckdb', 'polars', or 'pyarrow'. "
+        "Pass either 'duckdb', 'polars', or 'pyarrow' as valid engine params."
     )
     missing_file_message: str = (
         "File '{filepath}'. No such file or directory."
@@ -562,3 +565,296 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
         df = CSVReaderPolarsEngine(
             self.filepath).to_dataframe(normalize_columns)
         df.write_parquet(filename)
+
+
+class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
+    """
+    Class to read CSV files and convert CSV files powered by PyArrow.
+    """
+
+    def _create_table(self, normalize_columns=False):
+        """
+        Create a PyArrow table from the CSV file.
+
+        Args:
+            normalize_columns (optional, bool): Whether to normalize column
+            names.
+
+        Returns:
+            A PyArrow table.
+        """
+        # Use PyArrow's CSV reader with all columns as string to prevent data loss
+        # Get column names efficiently using existing CSVColumns class
+        columns = CSVColumns(self.filepath).columns
+
+        # Create schema with all string types
+        string_schema = pa.schema([
+            (name, pa.string()) for name in columns
+        ])
+
+        # Read with explicit string types
+        table = pacsv.read_csv(
+            self.filepath,
+            parse_options=pacsv.ParseOptions(delimiter=self.delimiter),
+            convert_options=pacsv.ConvertOptions(column_types=string_schema)
+        )
+
+        if normalize_columns:
+            column_normalizer = CSVColumnNameNormalizer(self.filepath)
+            old_names = table.column_names
+            new_names = [
+                column_normalizer.columns_to_normalized_mapping.get(name, name)
+                for name in old_names
+            ]
+            table = table.rename_columns(new_names)
+
+        return table
+
+    def _create_table_sample(self, normalize_columns=False):
+        """
+        Create a sample of the CSV file as a PyArrow table.
+
+        Args:
+            normalize_columns (optional, bool): Whether to normalize column
+            names.
+
+        Returns:
+            A PyArrow table.
+        """
+        # Read with PyArrow with all columns as string to prevent data loss
+        # Get column names efficiently using existing CSVColumns class
+        columns = CSVColumns(self.filepath).columns
+
+        # Create schema with all string types
+        string_schema = pa.schema([
+            (name, pa.string()) for name in columns
+        ])
+
+        # Read with explicit string types
+        table = pacsv.read_csv(
+            self.filepath,
+            parse_options=pacsv.ParseOptions(delimiter=self.delimiter),
+            convert_options=pacsv.ConvertOptions(column_types=string_schema)
+        )
+
+        # Take sample rows
+        sample_table = table.slice(0, CSVEngineProperties.dataframe_sample_rows)
+
+        if normalize_columns:
+            column_normalizer = CSVColumnNameNormalizer(self.filepath)
+            old_names = sample_table.column_names
+            new_names = [
+                column_normalizer.columns_to_normalized_mapping.get(name, name)
+                for name in old_names
+            ]
+            sample_table = sample_table.rename_columns(new_names)
+
+        return sample_table
+
+    def get_sample(self, normalize_columns=False):
+        """
+        Return a sample of the CSV file.
+
+        Args:
+            normalize_columns (optional, bool): Whether to normalize column
+            names.
+        """
+        table = self._create_table_sample(normalize_columns)
+        # Convert to Polars DataFrame for display
+        df = pl.from_arrow(table)
+        if isinstance(df, pl.Series):
+            df = df.to_frame()
+        print(df)
+
+    def to_dataframe(self, normalize_columns=False) -> pl.DataFrame:
+        """
+        Converts CSV to a Polars dataframe.
+
+        Args:
+            normalize_columns (optional, bool): Whether to normalize column
+            names.
+
+        Returns:
+            A Polars dataframe.
+        """
+        table = self._create_table(normalize_columns)
+        df = pl.from_arrow(table)
+        # Ensure we always return a DataFrame, not a Series
+        if isinstance(df, pl.Series):
+            df = df.to_frame()
+        return df
+
+    def to_arrow_table(self, normalize_columns=False):
+        """
+        Converts CSV to a PyArrow table.
+
+        Args:
+            normalize_columns (optional, bool): Whether to normalize column
+            names.
+
+        Returns:
+            A PyArrow table.
+        """
+        return self._create_table(normalize_columns)
+
+    def to_dicts(self, normalize_columns=False):
+        """
+        Converts CSV to a list of Python dictionaries.
+
+        Args:
+            normalize_columns (optional, bool): Whether to normalize column
+            names.
+
+        Returns:
+            A list of dictionaries.
+        """
+        table = self._create_table(normalize_columns)
+        # Convert to Polars DataFrame and then to dicts
+        df = pl.from_arrow(table)
+        if isinstance(df, pl.Series):
+            df = df.to_frame()
+        return df.to_dicts()
+
+    def query_data(self, sql_query, normalize_columns=False):
+        """
+        Queries as CSV file after importing into DuckDB.
+
+        Args:
+            sql_query (str): Query to run against DuckDB.
+            normalize_columns (optional, bool): Whether to normalize column
+            names.
+
+        Returns:
+            A DuckDB DuckDBPyRelation with the query results.
+
+        Example if DuckDB Engine:
+            dg = CSVReader('myfile.csv')
+            query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
+            dg.query_csv_data(query)
+        """
+        return self.queries.sql_query_to_dataframe(
+            sql_query, normalize_columns)
+
+
+class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
+    """Class to write CSVs to other file formats powered by PyArrow."""
+
+    def __init__(self, filepath):
+        """Initialize the CSVWriterPyArrowEngine class."""
+        super().__init__(filepath)
+
+    def _create_table(self, normalize_columns=False):
+        """Create a PyArrow table for writing operations."""
+        # Read with PyArrow with all columns as string to prevent data loss
+        # Get column names efficiently using existing CSVColumns class
+        columns = CSVColumns(self.filepath).columns
+
+        # Create schema with all string types
+        string_schema = pa.schema([
+            (name, pa.string()) for name in columns
+        ])
+
+        # Read with explicit string types
+        table = pacsv.read_csv(
+            self.filepath,
+            parse_options=pacsv.ParseOptions(delimiter=CSVDelimiter(self.filepath).delimiter),
+            convert_options=pacsv.ConvertOptions(column_types=string_schema)
+        )
+
+        if normalize_columns:
+            column_normalizer = CSVColumnNameNormalizer(self.filepath)
+            old_names = table.column_names
+            new_names = [
+                column_normalizer.columns_to_normalized_mapping.get(name, name)
+                for name in old_names
+            ]
+            table = table.rename_columns(new_names)
+
+        return table
+
+    def write_csv(self, export_filename=None, normalize_columns=False):
+        """
+        Export a PyArrow table to a CSV file.
+
+        Args:
+            export_filename (optional, str): The name of the output file.
+            normalize_columns (optional, bool): Whether to normalize column
+            names.
+        """
+        filename = self.queries.set_export_filename(
+            CSVEngineProperties.csv_export_filename, export_filename)
+        table = self._create_table(normalize_columns)
+        # Use native PyArrow CSV writer - no dataframe conversion needed
+        pacsv.write_csv(table, filename)
+
+    def write_excel(self, export_filename=None, normalize_columns=False):
+        """
+        Export a PyArrow table to an Excel file.
+
+        Args:
+            export_filename (optional, str): The name of the output file.
+            normalize_columns (optional, bool): Whether to normalize column
+            names.
+        """
+        filename = self.queries.set_export_filename(
+            CSVEngineProperties.excel_export_filename, export_filename)
+        table = self._create_table(normalize_columns)
+        # Convert to Polars DataFrame for Excel export
+        df = pl.from_arrow(table)
+        if isinstance(df, pl.Series):
+            df = df.to_frame()
+        df.write_excel(filename)
+
+    def write_json(self, export_filename=None, normalize_columns=False):
+        """
+        Export a PyArrow table to a JSON file.
+
+        Args:
+            export_filename (optional, str): The name of the output file.
+            normalize_columns (optional, bool): Whether to normalize column
+            names.
+        """
+        filename = self.queries.set_export_filename(
+            CSVEngineProperties.json_export_filename, export_filename)
+        table = self._create_table(normalize_columns)
+        # Use native PyArrow iteration to avoid dataframe conversion
+        records = []
+        for i in range(table.num_rows):
+            record = {col: table[col][i].as_py() for col in table.column_names}
+            records.append(record)
+        with open(filename, 'w') as f:
+            json.dump(records, f, indent=4)
+
+    def write_json_newline_delimited(
+            self, export_filename=None, normalize_columns=False):
+        """
+        Export a PyArrow table to a JSON newline delimited file.
+
+        Args:
+            export_filename (optional, str): The name of the output file.
+            normalize_columns (optional, bool): Whether to normalize column
+            names.
+        """
+        filename = self.queries.set_export_filename(
+            CSVEngineProperties.json_newline_export_filename, export_filename)
+        table = self._create_table(normalize_columns)
+        # Use native PyArrow iteration to avoid dataframe conversion
+        with open(filename, 'w') as f:
+            for i in range(table.num_rows):
+                record = {col: table[col][i].as_py() for col in table.column_names}
+                f.write(json.dumps(record) + '\n')
+
+    def write_parquet(self, export_filename=None, normalize_columns=False):
+        """
+        Export a PyArrow table to a Parquet file.
+
+        Args:
+            export_filename (optional, str): The name of the output file.
+            normalize_columns (optional, bool): Whether to normalize column
+            names.
+        """
+        filename = self.queries.set_export_filename(
+            CSVEngineProperties.parquet_export_filename, export_filename)
+        table = self._create_table(normalize_columns)
+        # Use native PyArrow Parquet writer - no dataframe conversion needed
+        pq.write_table(table, filename)
