@@ -13,26 +13,26 @@ class TestCSVReader:
     def test_to_dataframe(self, sample_csv):
         """Test conversion to dataframe with both engines."""
         # Test with Polars engine
-        reader_polars = CSVReader(sample_csv, engine='polars')
+        reader_polars = CSVReader(sample_csv, engine="polars")
         df_polars = reader_polars.to_dataframe()
         assert isinstance(df_polars, pl.DataFrame)
         assert len(df_polars) == 2
-        assert list(df_polars.columns) == ['name', 'age', 'city']
+        assert list(df_polars.columns) == ["name", "age", "city"]
 
         # Test with DuckDB engine
-        reader_duckdb = CSVReader(sample_csv, engine='duckdb')
+        reader_duckdb = CSVReader(sample_csv, engine="duckdb")
         df_duckdb = reader_duckdb.to_dataframe()
         assert isinstance(df_duckdb, pl.DataFrame)
         assert len(df_duckdb) == 2
-        assert list(df_duckdb.columns) == ['name', 'age', 'city']
+        assert list(df_duckdb.columns) == ["name", "age", "city"]
 
     def test_to_arrow_table(self, sample_csv):
         """Test conversion to Arrow table with both engines."""
-        reader_polars = CSVReader(sample_csv, engine='polars')
+        reader_polars = CSVReader(sample_csv, engine="polars")
         table_polars = reader_polars.to_arrow_table()
         assert isinstance(table_polars, pa.Table)
 
-        reader_duckdb = CSVReader(sample_csv, engine='duckdb')
+        reader_duckdb = CSVReader(sample_csv, engine="duckdb")
         table_duckdb = reader_duckdb.to_arrow_table()
         assert isinstance(table_duckdb, pa.Table)
 
@@ -43,18 +43,18 @@ class TestCSVReader:
         assert isinstance(dicts, list)
         assert len(dicts) == 2
         assert all(isinstance(d, dict) for d in dicts)
-        assert dicts[0]['name'] == 'John'
-        assert dicts[1]['name'] == 'Jane'
+        assert dicts[0]["name"] == "John"
+        assert dicts[1]["name"] == "Jane"
 
     def test_query_data(self, sample_csv):
         """Test querying data with both engines."""
         # Test with DuckDB engine
-        reader_duckdb = CSVReader(sample_csv, engine='duckdb')
+        reader_duckdb = CSVReader(sample_csv, engine="duckdb")
         result_duckdb = reader_duckdb.query_data(f"""SELECT * FROM {reader_duckdb.db_table} WHERE age > '25'""")
         assert isinstance(result_duckdb, DuckDBPyRelation)
 
         # Test with Polars engine
-        reader_polars = CSVReader(sample_csv, engine='polars')
+        reader_polars = CSVReader(sample_csv, engine="polars")
         result_polars = reader_polars.query_data(f"""SELECT * FROM {reader_duckdb.db_table} WHERE age > '25'""")
         assert isinstance(result_polars, pl.DataFrame)
 
@@ -86,7 +86,7 @@ class TestCSVReader:
         reader = CSVReader(str(csv_file))
         df = reader.to_dataframe(normalize_columns=True)
 
-        expected_columns = ['first_name', 'last_name', 'age_group']
+        expected_columns = ["first_name", "last_name", "age_group"]
         assert list(df.columns) == expected_columns
 
     def test_get_sample(self, sample_csv, capsys):
@@ -95,8 +95,8 @@ class TestCSVReader:
         reader.get_sample()
         captured = capsys.readouterr()
         assert captured.out  # Verify that something was printed
-        assert 'John' in captured.out
-        assert 'Jane' in captured.out
+        assert "John" in captured.out
+        assert "Jane" in captured.out
 
     def test_to_dataframe_empty_and_blank_files(self, tmp_path):
         """Test to_dataframe method specifically for empty and blank files."""

@@ -14,13 +14,9 @@ def main():
     # Add the root directory to Python path
     sys.path.insert(0, str(root_dir))
 
-    args = [
-        "-v",
-        f"--cov={root_dir}/src/datagrunt",
-        "--cov-report=term-missing",
-        str(root_dir / "tests")
-    ]
+    args = ["-v", f"--cov={root_dir}/src/datagrunt", "--cov-report=term-missing", str(root_dir / "tests")]
     return pytest.main(args)
+
 
 if __name__ == "__main__":
     sys.exit(main())
