@@ -20,10 +20,12 @@ from datagrunt.core.csv_io import (
     CSVEngineProperties,
     CSVReaderDuckDBEngine,
     CSVReaderPolarsEngine,
+    CSVReaderPyArrowEngine,
     CSVRows,
     CSVStringSample,
     CSVWriterDuckDBEngine,
     CSVWriterPolarsEngine,
+    CSVWriterPyArrowEngine,
 )
 from datagrunt.core.databases import DuckDBDatabase, DuckDBQueries
 from datagrunt.core.file_io import FileProperties
@@ -42,8 +44,10 @@ __all__ = [
     'CSVEngineFactory',
     'CSVReaderDuckDBEngine',
     'CSVReaderPolarsEngine',
+    'CSVReaderPyArrowEngine',
     'CSVWriterDuckDBEngine',
     'CSVWriterPolarsEngine',
+    'CSVWriterPyArrowEngine',
     'CSVEngineProperties',
     'EngineProperties',
     'CSVComponents',

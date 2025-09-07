@@ -13,8 +13,10 @@ from datagrunt.core.csv_io.engines import (
     CSVEngineProperties,
     CSVReaderDuckDBEngine,
     CSVReaderPolarsEngine,
+    CSVReaderPyArrowEngine,
     CSVWriterDuckDBEngine,
     CSVWriterPolarsEngine,
+    CSVWriterPyArrowEngine,
 )
 from datagrunt.core.csv_io.factories import CSVEngineFactory
 
@@ -29,7 +31,9 @@ __all__ = [
     'CSVEngineProperties',
     'CSVReaderDuckDBEngine',
     'CSVReaderPolarsEngine',
+    'CSVReaderPyArrowEngine',
     'CSVWriterDuckDBEngine',
     'CSVWriterPolarsEngine',
+    'CSVWriterPyArrowEngine',
     'CSVEngineFactory'
 ]
