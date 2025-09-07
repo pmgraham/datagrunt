@@ -49,7 +49,7 @@ __all__ = [
     "CSVWriterPolarsEngine",
     "CSVWriterPyArrowEngine",
     "CSVEngineProperties",
-    "EngineProperties",
+    # CSV Components
     "CSVComponents",
     "CSVColumnNameNormalizer",
     "CSVColumns",
