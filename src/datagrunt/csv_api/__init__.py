@@ -6,4 +6,4 @@ from datagrunt.csv_api.csvwriter import CSVWriter
 
 # You can define __all__ to specify what gets imported with "from package
 # import *"
-__all__ = ['CSVReader', 'CSVWriter', 'CSVSchemaReportAIGenerated']
+__all__ = ["CSVReader", "CSVWriter", "CSVSchemaReportAIGenerated"]
