@@ -9,8 +9,10 @@ from datagrunt.core.csv_io.engines import (
     CSVEngineProperties,
     CSVReaderDuckDBEngine,
     CSVReaderPolarsEngine,
+    CSVReaderPyArrowEngine,
     CSVWriterDuckDBEngine,
     CSVWriterPolarsEngine,
+    CSVWriterPyArrowEngine,
 )
 from datagrunt.core.databases import DuckDBQueries
 
@@ -21,11 +23,13 @@ class CSVEngineFactory:
     READER_ENGINES = {
         'duckdb': CSVReaderDuckDBEngine,
         'polars': CSVReaderPolarsEngine,
+        'pyarrow': CSVReaderPyArrowEngine,
     }
 
     WRITER_ENGINES = {
         'duckdb': CSVWriterDuckDBEngine,
         'polars': CSVWriterPolarsEngine,
+        'pyarrow': CSVWriterPyArrowEngine,
     }
 
     def __init__(self, filepath, engine):

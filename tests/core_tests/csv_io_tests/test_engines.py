@@ -12,8 +12,10 @@ from datagrunt.core import (
     CSVEngineProperties,
     CSVReaderDuckDBEngine,
     CSVReaderPolarsEngine,
+    CSVReaderPyArrowEngine,
     CSVWriterDuckDBEngine,
     CSVWriterPolarsEngine,
+    CSVWriterPyArrowEngine,
 )
 
 
@@ -23,7 +25,7 @@ class TestEngines:
         props = CSVEngineProperties("test.csv")
         assert props.dataframe_sample_rows == 20
         assert props.csv_export_filename == 'output.csv'
-        assert props.valid_engines == ('duckdb', 'polars')
+        assert props.valid_engines == ('duckdb', 'polars', 'pyarrow')
 
     def test_init_with_valid_engines(self, sample_csv):
         """Test initialization with valid engine values."""
@@ -33,6 +35,9 @@ class TestEngines:
         reader_duckdb = CSVEngineFactory(sample_csv, engine='duckdb')
         assert reader_duckdb.engine == 'duckdb'
 
+        reader_pyarrow = CSVEngineFactory(sample_csv, engine='pyarrow')
+        assert reader_pyarrow.engine == 'pyarrow'
+
         # Test with spaces and different cases
         reader_with_spaces = CSVEngineFactory(sample_csv, engine='Duck DB')
         assert reader_with_spaces.engine == 'duckdb'
@@ -41,7 +46,7 @@ class TestEngines:
         """Test initialization with invalid engine value."""
         with pytest.raises(ValueError) as exc_info:
             CSVEngineFactory(sample_csv, engine='invalid')
-        assert "Reader engine 'invalid' is not 'duckdb' or 'polars'" in str(exc_info.value)
+        assert "Reader engine 'invalid' is not 'duckdb', 'polars', or 'pyarrow'" in str(exc_info.value)
 
     def test_duckdb_reader_creation(self, engine_factory):
         """Test creation of DuckDB reader engine."""
@@ -65,6 +70,18 @@ class TestEngines:
         writer = factory.create_writer()
         assert isinstance(writer, CSVWriterPolarsEngine)
 
+    def test_pyarrow_reader_creation(self, sample_csv):
+        """Test creation of PyArrow reader engine."""
+        factory = CSVEngineFactory(sample_csv, 'pyarrow')
+        reader = factory.create_reader()
+        assert isinstance(reader, CSVReaderPyArrowEngine)
+
+    def test_pyarrow_writer_creation(self, sample_csv):
+        """Test creation of PyArrow writer engine."""
+        factory = CSVEngineFactory(sample_csv, 'pyarrow')
+        writer = factory.create_writer()
+        assert isinstance(writer, CSVWriterPyArrowEngine)
+
     def test_duckdb_reader_to_dataframe(self, engine_factory):
         """Test DuckDB reader's to_dataframe method."""
         reader = engine_factory.create_reader()
@@ -83,6 +100,21 @@ class TestEngines:
     def test_duckdb_reader_to_arrow(self, engine_factory):
         """Test DuckDB reader's to_arrow_table method."""
         reader = engine_factory.create_reader()
+        table = reader.to_arrow_table()
+        assert isinstance(table, pa.Table)
+
+    def test_pyarrow_reader_to_dataframe(self, sample_csv):
+        """Test PyArrow reader's to_dataframe method."""
+        factory = CSVEngineFactory(sample_csv, 'pyarrow')
+        reader = factory.create_reader()
+        df = reader.to_dataframe()
+        assert isinstance(df, pl.DataFrame)
+        assert len(df) == 2
+
+    def test_pyarrow_reader_to_arrow(self, sample_csv):
+        """Test PyArrow reader's to_arrow_table method."""
+        factory = CSVEngineFactory(sample_csv, 'pyarrow')
+        reader = factory.create_reader()
         table = reader.to_arrow_table()
         assert isinstance(table, pa.Table)
 
@@ -127,6 +159,23 @@ class TestEngines:
         assert isinstance(dicts, list)
         assert all(isinstance(d, dict) for d in dicts)
         assert len(dicts) == 2
+
+    def test_pyarrow_reader_to_dicts(self, sample_csv):
+        """Test PyArrow reader's to_dicts method."""
+        factory = CSVEngineFactory(sample_csv, 'pyarrow')
+        reader = factory.create_reader()
+        dicts = reader.to_dicts()
+        assert isinstance(dicts, list)
+        assert all(isinstance(d, dict) for d in dicts)
+        assert len(dicts) == 2
+
+    def test_pyarrow_reader_query_data(self, sample_csv):
+        """Test PyArrow reader's query_data method."""
+        factory = CSVEngineFactory(sample_csv, 'pyarrow')
+        reader = factory.create_reader()
+        result = reader.query_data(f"SELECT * FROM {reader.db_table} LIMIT 1")
+        assert isinstance(result, pl.DataFrame)
+        assert len(result) == 1
 
     def test_invalid_file_handling(self, tmp_path):
         """Test handling of non-existent files."""
