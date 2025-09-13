@@ -5,18 +5,18 @@ on:
     branches:
       - main
     paths:
-      - 'src/**'
+      - "src/**"
   workflow_dispatch:
     inputs:
       part:
-        description: 'The part of the version to bump'
+        description: "The part of the version to bump"
         required: true
-        default: 'patch'
+        default: "patch"
         type: choice
         options:
-        - patch
-        - minor
-        - major
+          - patch
+          - minor
+          - major
 
 jobs:
   bump-version:
@@ -46,5 +46,19 @@ jobs:
       - name: Pull latest changes
         run: git pull origin main
 
+      - name: Determine version bump type
+        id: version_type
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          if echo "$COMMIT_MSG" | grep -qi "\[major\]"; then
+            echo "type=major" >> $GITHUB_OUTPUT
+          elif echo "$COMMIT_MSG" | grep -qi "\[minor\]"; then
+            echo "type=minor" >> $GITHUB_OUTPUT
+          elif echo "$COMMIT_MSG" | grep -qi "\[patch\]"; then
+            echo "type=patch" >> $GITHUB_OUTPUT
+          else
+            echo "type=patch" >> $GITHUB_OUTPUT
+          fi
+
       - name: Bump version
-        run: bumpver update --${{ github.event.inputs.part || 'patch' }}
+        run: bumpver update --${{ github.event.inputs.part || steps.version_type.outputs.type }}
