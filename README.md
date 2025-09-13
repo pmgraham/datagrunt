@@ -12,6 +12,7 @@ Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow
 ## Key Features
 
 - **Intelligent Delimiter Inference:** Datagrunt automatically detects and applies the correct delimiter for your CSV files.
+- **Path Object Support:** Full support for both string paths and `pathlib.Path` objects for modern, cross-platform file handling.
 - **Multiple Processing Engines:** Choose from three powerful engines - [DuckDB](https://duckdb.org), [Polars](https://pola.rs), and [PyArrow](https://arrow.apache.org/docs/python/) - to handle your data processing needs.
 - **Flexible Data Transformation:** Easily convert your processed CSV data into various formats including CSV, Excel, JSON, JSONL, and Parquet.
 - **AI-Powered Schema Analysis:** Use Google's Gemini models to automatically generate detailed schema reports for your CSV files, including data types, column classifications, and data quality checks.
@@ -47,13 +48,16 @@ pip install datagrunt
 
 ```python
 from datagrunt import CSVReader
+from pathlib import Path
 
 # Load your CSV file with different engines
+# Accepts both string paths and Path objects
 csv_file = 'electric_vehicle_population_data.csv'
+csv_path = Path('electric_vehicle_population_data.csv')
 
 # Choose your engine: 'polars' (default), 'duckdb', or 'pyarrow'
-reader_polars = CSVReader(csv_file, engine='polars')    # Default - fast DataFrame ops
-reader_duckdb = CSVReader(csv_file, engine='duckdb')    # Best for SQL queries
+reader_polars = CSVReader(csv_file, engine='polars')    # String path - fast DataFrame ops
+reader_duckdb = CSVReader(csv_path, engine='duckdb')    # Path object - best for SQL queries
 reader_pyarrow = CSVReader(csv_file, engine='pyarrow')  # Arrow ecosystem integration
 
 # Get a sample of the data
@@ -93,9 +97,11 @@ print(df)
 
 ```python
 from datagrunt import CSVWriter
+from pathlib import Path
 
-# Create writer with your preferred engine
-writer = CSVWriter('input.csv', engine='duckdb')  # Default for exports
+# Create writer with your preferred engine (accepts both strings and Path objects)
+input_file = Path('input.csv')
+writer = CSVWriter(input_file, engine='duckdb')  # Default for exports
 
 # Export to various formats
 writer.write_csv('output.csv')          # Clean CSV export
@@ -104,7 +110,7 @@ writer.write_json('output.json')        # JSON format
 writer.write_parquet('output.parquet')  # Parquet for analytics
 
 # Use PyArrow engine for optimized Parquet exports
-writer_arrow = CSVWriter('input.csv', engine='pyarrow')
+writer_arrow = CSVWriter('input.csv', engine='pyarrow')  # String path also works
 writer_arrow.write_parquet('optimized.parquet')  # Native Arrow Parquet
 ```
 
@@ -112,13 +118,15 @@ writer_arrow.write_parquet('optimized.parquet')  # Native Arrow Parquet
 
 ```python
 from datagrunt import CSVSchemaReportAIGenerated
+from pathlib import Path
 import os
 
-# Generate detailed schema reports with AI
+# Generate detailed schema reports with AI (accepts both strings and Path objects)
 api_key = os.environ.get("GEMINI_API_KEY")
+data_file = Path('your_data.csv')
 
 schema_analyzer = CSVSchemaReportAIGenerated(
-    filepath='your_data.csv',
+    filepath=data_file,  # Path object works seamlessly
     engine='google',
     api_key=api_key
 )
