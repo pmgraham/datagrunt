@@ -15,7 +15,8 @@ from google.genai import types
 @dataclass
 class AIEngineProperties:
     """Base properties for AI Engines."""
-    valid_engines: tuple = ('google',)
+
+    valid_engines: tuple = ("google",)
 
 
 class BaseAIEngine(ABC):
@@ -26,13 +27,7 @@ class BaseAIEngine(ABC):
         self.api_key = api_key
 
     @abstractmethod
-    def generate_content(
-        self,
-        model,
-        prompt,
-        system_instruction=None,
-        **kwargs
-    ):
+    def generate_content(self, model, prompt, system_instruction=None, **kwargs):
         """Generate text from a prompt.
 
         Args:
@@ -47,10 +42,7 @@ class BaseAIEngine(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def generate_embeddings(
-        self,
-        **kwargs
-    ):
+    def generate_embeddings(self, **kwargs):
         """Generate embeddings for text.
 
         Args:
@@ -77,27 +69,26 @@ class GoogleAIEngine(BaseAIEngine):
     DEFAULT_SYSTEM_INSTRUCTIONS = ""
 
     def __init__(
-            self,
-            api_key=None,
-            vertexai=False,
-            gcp_project=None,
-            gcp_location=None,
-            prompt=None,
-            max_tokens=MAX_OUTPUT_TOKENS,
-            temperature=DEFAULT_TEMPERATURE,
-            top_p=DEFAULT_TOP_P,
-            seed=DEFAULT_SEED,
-            safety_settings=None,
-            thinking_budget=THINKING_BUDGET,
-            response_type=DEFAULT_RESPONSE_JSON_MIME_TYPE,
-            ground_google_search=False
+        self,
+        api_key=None,
+        vertexai=False,
+        gcp_project=None,
+        gcp_location=None,
+        prompt=None,
+        max_tokens=MAX_OUTPUT_TOKENS,
+        temperature=DEFAULT_TEMPERATURE,
+        top_p=DEFAULT_TOP_P,
+        seed=DEFAULT_SEED,
+        safety_settings=None,
+        thinking_budget=THINKING_BUDGET,
+        response_type=DEFAULT_RESPONSE_JSON_MIME_TYPE,
+        ground_google_search=False,
     ):
         """Initialize the Google AI provider."""
         super().__init__(api_key)
         self.vertexai = vertexai
         if not self.api_key and not self.vertexai:
-            raise ValueError(
-                "Either api_key or vertexai must be provided.")  # noqa: E501
+            raise ValueError("Either api_key or vertexai must be provided.")  # noqa: E501
         self.gcp_project = gcp_project
         self.gcp_location = gcp_location
         self.prompt = prompt
@@ -112,20 +103,13 @@ class GoogleAIEngine(BaseAIEngine):
         self.thinking_budget = thinking_budget
         self.response_type = response_type
         self.ground_google_search = ground_google_search
-        if not self.api_key and self.vertexai and (
-                not self.gcp_project or not self.gcp_location):
-            raise ValueError(
-                "You must provide gcp_project and gcp_location when using "
-                "Vertex AI.")
+        if not self.api_key and self.vertexai and (not self.gcp_project or not self.gcp_location):
+            raise ValueError("You must provide gcp_project and gcp_location when using Vertex AI.")
 
     def _client(self):
         """Create and return a GenAI client."""
         if self.vertexai:
-            return genai.Client(
-                vertexai=self.vertexai,
-                project=self.gcp_project,
-                location=self.gcp_location
-            )
+            return genai.Client(vertexai=self.vertexai, project=self.gcp_project, location=self.gcp_location)
         return genai.Client(api_key=self.api_key)
 
     def _contents(self, prompt):
@@ -139,8 +123,7 @@ class GoogleAIEngine(BaseAIEngine):
         return [
             types.Content(
                 role="user",
-                parts=[
-                    types.Part.from_text(text=prompt)],
+                parts=[types.Part.from_text(text=prompt)],
             ),
         ]
 
@@ -148,21 +131,17 @@ class GoogleAIEngine(BaseAIEngine):
         """Create safety settings for the model."""
         return [
             types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                threshold=types.HarmBlockThreshold.OFF
+                category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.OFF
             ),
             types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                threshold=types.HarmBlockThreshold.OFF
+                category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.OFF
             ),
             types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                threshold=types.HarmBlockThreshold.OFF
+                category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.OFF
             ),
             types.SafetySetting(
-                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-                threshold=types.HarmBlockThreshold.OFF
-            )
+                category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.OFF
+            ),
         ]
 
     def _ground_in_google_search(self):
@@ -183,14 +162,12 @@ class GoogleAIEngine(BaseAIEngine):
                 seed=self.seed,
                 max_output_tokens=self.max_tokens,
                 safety_settings=self.safety_settings,
-                system_instruction=[
-                    types.Part.from_text(
-                        text=system_instruction)],
+                system_instruction=[types.Part.from_text(text=system_instruction)],
                 thinking_config=types.ThinkingConfig(
                     thinking_budget=self.thinking_budget,
                 ),
                 response_mime_type=self.response_type,
-                tools=self._ground_in_google_search()
+                tools=self._ground_in_google_search(),
             )
         else:
             config = types.GenerateContentConfig(
@@ -199,9 +176,7 @@ class GoogleAIEngine(BaseAIEngine):
                 seed=self.seed,
                 max_output_tokens=self.max_tokens,
                 safety_settings=self.safety_settings,
-                system_instruction=[
-                    types.Part.from_text(
-                        text=system_instruction)],
+                system_instruction=[types.Part.from_text(text=system_instruction)],
                 thinking_config=types.ThinkingConfig(
                     thinking_budget=self.thinking_budget,
                 ),
@@ -226,9 +201,7 @@ class GoogleAIEngine(BaseAIEngine):
         generate_content_config = self._content_config(system_instruction)
 
         response = self._client().models.generate_content(
-            model=model,
-            contents=contents,
-            config=generate_content_config
+            model=model, contents=contents, config=generate_content_config
         )
 
         return response.text
@@ -242,7 +215,4 @@ class GoogleAIEngine(BaseAIEngine):
         Returns:
             Embedding vector
         """
-        raise NotImplementedError(
-            "Embedding generation is not yet implemented for the Google "
-            "provider."
-        )
+        raise NotImplementedError("Embedding generation is not yet implemented for the Google provider.")

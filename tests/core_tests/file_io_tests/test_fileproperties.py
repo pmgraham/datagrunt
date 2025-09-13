@@ -10,19 +10,19 @@ class TestFileProperties:
 
     def test_initialization(self, sample_files):
         """Test basic initialization of FileProperties."""
-        file_props = FileProperties(sample_files['data.csv'])
+        file_props = FileProperties(sample_files["data.csv"])
 
         assert isinstance(file_props, FileProperties)
-        assert file_props.filename == 'data.csv'
-        assert file_props.extension == '.csv'
-        assert file_props.extension_string == 'csv'
+        assert file_props.filename == "data.csv"
+        assert file_props.extension == ".csv"
+        assert file_props.extension_string == "csv"
         assert file_props.size_in_bytes > 0
 
     def test_file_type_checks(self, sample_files):
         """Test various file type checking properties."""
-        csv_file = FileProperties(sample_files['data.csv'])
-        xlsx_file = FileProperties(sample_files['test.xlsx'])
-        json_file = FileProperties(sample_files['test.json'])
+        csv_file = FileProperties(sample_files["data.csv"])
+        xlsx_file = FileProperties(sample_files["test.xlsx"])
+        json_file = FileProperties(sample_files["test.json"])
 
         # Test CSV file
         assert csv_file.is_structured
@@ -44,8 +44,8 @@ class TestFileProperties:
 
     def test_file_size_properties(self, sample_files):
         """Test file size related properties."""
-        empty_file = FileProperties(sample_files['empty.csv'])
-        data_file = FileProperties(sample_files['data.csv'])
+        empty_file = FileProperties(sample_files["empty.csv"])
+        data_file = FileProperties(sample_files["data.csv"])
 
         assert empty_file.is_empty
         assert empty_file.size_in_bytes == 0
@@ -54,9 +54,9 @@ class TestFileProperties:
 
     def test_blank_file_detection(self, sample_files):
         """Test blank file detection."""
-        empty_file = FileProperties(sample_files['empty.csv'])
-        blank_file = FileProperties(sample_files['blank.csv'])
-        data_file = FileProperties(sample_files['data.csv'])
+        empty_file = FileProperties(sample_files["empty.csv"])
+        blank_file = FileProperties(sample_files["blank.csv"])
+        data_file = FileProperties(sample_files["data.csv"])
 
         assert empty_file.is_blank
         assert blank_file.is_blank
@@ -64,8 +64,8 @@ class TestFileProperties:
 
     def test_file_format_properties(self, sample_files):
         """Test file format related properties."""
-        csv_file = FileProperties(sample_files['data.csv'])
-        parquet_file = FileProperties(sample_files['test.parquet'])
+        csv_file = FileProperties(sample_files["data.csv"])
+        parquet_file = FileProperties(sample_files["test.parquet"])
 
         assert csv_file.is_tabular
         assert parquet_file.is_apache
