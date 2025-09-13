@@ -8,11 +8,14 @@ import pyarrow.parquet as pq
 
 from datagrunt import CSVWriter
 
+# All supported engines for CSVWriter
+ALL_ENGINES = ["duckdb", "polars", "pyarrow"]
+
 
 class TestCSVWriter:
     def test_write_csv(self, sample_csv, tmp_path):
         """Test writing to CSV format."""
-        for engine in ["duckdb", "polars"]:
+        for engine in ALL_ENGINES:
             writer = CSVWriter(sample_csv, engine=engine)
             out_file = str(tmp_path / f"output_{engine}.csv")
             writer.write_csv(out_file)
@@ -25,7 +28,7 @@ class TestCSVWriter:
 
     def test_write_excel(self, sample_csv, tmp_path):
         """Test writing to Excel format."""
-        for engine in ["duckdb", "polars"]:
+        for engine in ALL_ENGINES:
             writer = CSVWriter(sample_csv, engine=engine)
             out_file = str(tmp_path / f"output_{engine}.xlsx")
             writer.write_excel(out_file)
@@ -38,7 +41,7 @@ class TestCSVWriter:
 
     def test_write_json(self, sample_csv, tmp_path):
         """Test writing to JSON format."""
-        for engine in ["duckdb", "polars"]:
+        for engine in ALL_ENGINES:
             writer = CSVWriter(sample_csv, engine=engine)
             out_file = str(tmp_path / f"output_{engine}.json")
             writer.write_json(out_file)
@@ -53,7 +56,7 @@ class TestCSVWriter:
 
     def test_write_json_newline_delimited(self, sample_csv, tmp_path):
         """Test writing to JSON Lines format."""
-        for engine in ["duckdb", "polars"]:
+        for engine in ALL_ENGINES:
             writer = CSVWriter(sample_csv, engine=engine)
             out_file = str(tmp_path / f"output_{engine}.jsonl")
             writer.write_json_newline_delimited(out_file)
@@ -67,7 +70,7 @@ class TestCSVWriter:
 
     def test_write_parquet(self, sample_csv, tmp_path):
         """Test writing to Parquet format."""
-        for engine in ["duckdb", "polars"]:
+        for engine in ALL_ENGINES:
             writer = CSVWriter(sample_csv, engine=engine)
             out_file = str(tmp_path / f"output_{engine}.parquet")
             writer.write_parquet(out_file)
@@ -85,7 +88,7 @@ class TestCSVWriter:
         input_file = tmp_path / "test_normalize.csv"
         input_file.write_text(csv_content)
 
-        for engine in ["duckdb", "polars"]:
+        for engine in ALL_ENGINES:
             writer = CSVWriter(str(input_file), engine=engine)
             out_file = str(tmp_path / f"normalized_{engine}.csv")
             writer.write_csv(out_file, normalize_columns=True)
