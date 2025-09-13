@@ -1,7 +1,6 @@
 """Module for deriving and evaluating file properties."""
 
 # standard library
-import os
 from functools import cached_property
 from pathlib import Path
 
@@ -13,9 +12,9 @@ class FileExtensions:
         """Initialize the FileExtensions object.
 
         Args:
-            filepath (str): Path to the file.
+            filepath (str or Path): Path to the file.
         """
-        self.filepath = filepath
+        self.filepath = Path(filepath)
 
     @cached_property
     def extension(self):
@@ -90,10 +89,10 @@ class FileStatistics:
         """Initialize the FileStatistics object.
 
         Args:
-            filepath (str): Path to the file.
+            filepath (str or Path): Path to the file.
         """
-        self.filepath = filepath
-        self.size_in_bytes = os.path.getsize(self.filepath)
+        self.filepath = Path(filepath)
+        self.size_in_bytes = self.filepath.stat().st_size
         self.size_in_kb = round((self.size_in_bytes / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
         self.size_in_mb = round((self.size_in_kb / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
         self.size_in_gb = round((self.size_in_mb / self.FILE_SIZE_DIVISOR), self.FILE_SIZE_ROUND_FACTOR)
@@ -102,7 +101,7 @@ class FileStatistics:
     @cached_property
     def modified_time(self):
         """Get the file modified time."""
-        return os.path.getmtime(self.filepath)
+        return self.filepath.stat().st_mtime
 
     @cached_property
     def is_large(self):
@@ -119,9 +118,9 @@ class BlankFile:
         """Initialize the BlankFile object.
 
         Args:
-            filepath (str): Path to the file.
+            filepath (str or Path): Path to the file.
         """
-        self.filepath = filepath
+        self.filepath = Path(filepath)
 
     @cached_property
     def is_blank(self):
@@ -146,9 +145,9 @@ class EmptyFile:
         """Initialize the EmptyFile object.
 
         Args:
-            filepath (str): Path to the file.
+            filepath (str or Path): Path to the file.
         """
-        self.filepath = filepath
+        self.filepath = Path(filepath)
 
     @cached_property
     def is_empty(self):
@@ -166,11 +165,11 @@ class FileProperties:
         Initialize the FileBase class.
 
         Args:
-            filepath (str): Path to the file.
+            filepath (str or Path): Path to the file.
         """
-        self.filepath = filepath
-        self.filename = Path(filepath).name
-        self.extension = Path(filepath).suffix
+        self.filepath = Path(filepath)
+        self.filename = self.filepath.name
+        self.extension = self.filepath.suffix
         self.extension_string = self.extension.replace(".", "")
 
         # Instantiate helper classes
