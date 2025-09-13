@@ -7,22 +7,25 @@ import pytest
 
 from datagrunt.csv_api.csvai import CSVSchemaReportAIGenerated
 
+# All supported AI engines for CSVSchemaReportAIGenerated
+ALL_AI_ENGINES = ["google"]
+
 
 class TestCSVSchemaReportAIGenerated:
     """Test suite for CSVSchemaReportAIGenerated class."""
 
     def test_init_with_valid_parameters(self):
         """Test initialization with valid parameters."""
-        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine="google", api_key="test_key")
+        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine=ALL_AI_ENGINES[0], api_key="test_key")
         assert csv_ai.filepath == "test.csv"
-        assert csv_ai.engine == "google"
+        assert csv_ai.engine == ALL_AI_ENGINES[0]
         assert csv_ai.api_key == "test_key"
         assert csv_ai.kwargs == {}
 
     def test_init_with_kwargs(self):
         """Test initialization with additional kwargs."""
         kwargs = {"temperature": 0.7, "max_tokens": 1000}
-        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine="google", api_key="test_key", **kwargs)
+        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine=ALL_AI_ENGINES[0], api_key="test_key", **kwargs)
         assert csv_ai.kwargs == kwargs
 
     def test_init_with_case_insensitive_engine(self):
@@ -44,12 +47,12 @@ class TestCSVSchemaReportAIGenerated:
         """Test initialization raises error when ground_google_search is True."""
         with pytest.raises(ValueError, match="Grounding in Google Search is not supported"):
             CSVSchemaReportAIGenerated(
-                filepath="test.csv", engine="google", api_key="test_key", ground_google_search=True
+                filepath="test.csv", engine=ALL_AI_ENGINES[0], api_key="test_key", ground_google_search=True
             )
 
     def test_init_without_api_key(self):
         """Test initialization without API key."""
-        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine="google")
+        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine=ALL_AI_ENGINES[0])
         assert csv_ai.api_key is None
 
     @patch("datagrunt.csv_api.csvai.AIEngineFactory")
@@ -60,11 +63,11 @@ class TestCSVSchemaReportAIGenerated:
         mock_factory.create_engine.return_value = mock_engine
         mock_factory_class.return_value = mock_factory
 
-        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine="google", api_key="test_key", temperature=0.7)
+        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine=ALL_AI_ENGINES[0], api_key="test_key", temperature=0.7)
 
         result = csv_ai._create_engine()
 
-        mock_factory_class.assert_called_once_with("test_key", "google", temperature=0.7)
+        mock_factory_class.assert_called_once_with("test_key", ALL_AI_ENGINES[0], temperature=0.7)
         mock_factory.create_engine.assert_called_once()
         assert result == mock_engine
 
@@ -79,7 +82,7 @@ class TestCSVSchemaReportAIGenerated:
         mock_factory.create_engine.return_value = mock_engine
         mock_factory_class.return_value = mock_factory
 
-        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine="google", api_key="test_key")
+        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine=ALL_AI_ENGINES[0], api_key="test_key")
 
         result = csv_ai._get_ai_response("model", "prompt", "instructions")
 
@@ -98,7 +101,7 @@ class TestCSVSchemaReportAIGenerated:
         mock_factory.create_engine.return_value = mock_engine
         mock_factory_class.return_value = mock_factory
 
-        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine="google", api_key="test_key")
+        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine=ALL_AI_ENGINES[0], api_key="test_key")
 
         with pytest.raises(ValueError) as exc_info:
             csv_ai._get_ai_response("model", "prompt", "instructions")
@@ -117,7 +120,7 @@ class TestCSVSchemaReportAIGenerated:
         mock_factory.create_engine.return_value = mock_engine
         mock_factory_class.return_value = mock_factory
 
-        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine="google", api_key="test_key")
+        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine=ALL_AI_ENGINES[0], api_key="test_key")
 
         with pytest.raises(RuntimeError) as exc_info:
             csv_ai._get_ai_response("model", "prompt", "instructions")
@@ -134,7 +137,7 @@ class TestCSVSchemaReportAIGenerated:
         mock_factory.create_engine.return_value = mock_engine
         mock_factory_class.return_value = mock_factory
 
-        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine="google", api_key="test_key")
+        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine=ALL_AI_ENGINES[0], api_key="test_key")
 
         with pytest.raises(TypeError) as exc_info:
             csv_ai._get_ai_response("model", "prompt", "instructions")
@@ -152,7 +155,7 @@ class TestCSVSchemaReportAIGenerated:
         mock_factory.create_engine.return_value = mock_engine
         mock_factory_class.return_value = mock_factory
 
-        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine="google", api_key="test_key")
+        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine=ALL_AI_ENGINES[0], api_key="test_key")
 
         with pytest.raises(RuntimeError) as exc_info:
             csv_ai._get_ai_response("model", "prompt", "instructions")
@@ -179,7 +182,7 @@ class TestCSVSchemaReportAIGenerated:
         mock_factory.create_engine.return_value = mock_engine
         mock_factory_class.return_value = mock_factory
 
-        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine="google", api_key="test_key")
+        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine=ALL_AI_ENGINES[0], api_key="test_key")
 
         result = csv_ai.generate_csv_schema_report("model")
 
@@ -197,7 +200,7 @@ class TestCSVSchemaReportAIGenerated:
         mock_factory.create_engine.return_value = mock_engine
         mock_factory_class.return_value = mock_factory
 
-        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine="google", api_key="test_key")
+        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine=ALL_AI_ENGINES[0], api_key="test_key")
 
         result = csv_ai.generate_csv_schema_report(
             "model", prompt="custom prompt", system_instructions="custom instructions"
@@ -218,7 +221,7 @@ class TestCSVSchemaReportAIGenerated:
         mock_factory.create_engine.return_value = mock_engine
         mock_factory_class.return_value = mock_factory
 
-        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine="google", api_key="test_key")
+        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine=ALL_AI_ENGINES[0], api_key="test_key")
 
         result = csv_ai.generate_csv_schema_report("model", prompt="test prompt", return_json=True)
 
@@ -247,7 +250,7 @@ class TestCSVSchemaReportAIGenerated:
         mock_factory.create_engine.return_value = mock_engine
         mock_factory_class.return_value = mock_factory
 
-        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine="google", api_key="test_key")
+        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine=ALL_AI_ENGINES[0], api_key="test_key")
 
         csv_ai.generate_csv_schema_report("model", prompt="custom prompt")
 
@@ -257,7 +260,7 @@ class TestCSVSchemaReportAIGenerated:
 
     def test_filepath_attribute_access(self):
         """Test that filepath attribute can be accessed."""
-        csv_ai = CSVSchemaReportAIGenerated(filepath="/path/to/test.csv", engine="google", api_key="test_key")
+        csv_ai = CSVSchemaReportAIGenerated(filepath="/path/to/test.csv", engine=ALL_AI_ENGINES[0], api_key="test_key")
         assert csv_ai.filepath == "/path/to/test.csv"
 
     def test_multiple_engine_name_normalizations(self):
@@ -284,11 +287,11 @@ class TestCSVSchemaReportAIGenerated:
 
         kwargs = {"temperature": 0.8, "max_tokens": 2048, "custom_param": "value"}
 
-        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine="google", api_key="test_key", **kwargs)
+        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine=ALL_AI_ENGINES[0], api_key="test_key", **kwargs)
 
         csv_ai._create_engine()
 
-        mock_factory_class.assert_called_once_with("test_key", "google", **kwargs)
+        mock_factory_class.assert_called_once_with("test_key", ALL_AI_ENGINES[0], **kwargs)
 
     @patch("datagrunt.csv_api.csvai.AIEngineFactory")
     def test_json_loads_with_complex_response(self, mock_factory_class):
@@ -307,7 +310,7 @@ class TestCSVSchemaReportAIGenerated:
         mock_factory.create_engine.return_value = mock_engine
         mock_factory_class.return_value = mock_factory
 
-        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine="google", api_key="test_key")
+        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine=ALL_AI_ENGINES[0], api_key="test_key")
 
         result = csv_ai._get_ai_response("model", "prompt", "instructions")
 
