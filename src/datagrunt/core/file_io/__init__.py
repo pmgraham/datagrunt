@@ -3,5 +3,5 @@
 from datagrunt.core.file_io.fileproperties import FileProperties
 
 __all__ = [
-    'FileProperties',
+    "FileProperties",
 ]

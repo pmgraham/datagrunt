@@ -14,9 +14,10 @@ from datagrunt.core.csv_io import CSVColumnNameNormalizer, CSVDelimiter
 
 class DuckDBDatabase:
     """Class to configure local database for file processing.
-       Utilizes duckdb as the processing engine.
+    Utilizes duckdb as the processing engine.
     """
-    DEFAULT_ENCODING = 'utf-8'
+
+    DEFAULT_ENCODING = "utf-8"
     DEFAULT_THREAD_COUNT = 16
 
     def __init__(self, filepath):
@@ -41,17 +42,17 @@ class DuckDBDatabase:
 
     def _format_filename_string(self):
         """Remove all non alphanumeric characters from filename."""
-        return re.sub(r'[^a-zA-Z0-9]', '', Path(self.filepath).stem)
+        return re.sub(r"[^a-zA-Z0-9]", "", Path(self.filepath).stem)
 
     def _set_database_filename(self):
         """Return name of duckdb file created at runtime."""
-        return f'{self._format_filename_string()}.db'
+        return f"{self._format_filename_string()}.db"
 
     def _set_database_table_name(self):
         """
         Return name of duckdb import table created during file import.
         """
-        return f'{self._format_filename_string()}'
+        return f"{self._format_filename_string()}"
 
     def _set_database_connection(self, threads=DEFAULT_THREAD_COUNT):
         """Establish a connection with duckdb.
@@ -59,8 +60,7 @@ class DuckDBDatabase:
         Args:
             threads (int): Number of threads to use for duckdb.
         """
-        return duckdb.connect(self.database_filename,
-                              config={'threads': threads})
+        return duckdb.connect(self.database_filename, config={"threads": threads})
 
 
 class DuckDBQueries:
@@ -179,8 +179,7 @@ class DuckDBQueries:
         filename = self.set_export_filename(default_filename, export_filename)
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}' (ARRAY true)"  # noqa: E501
 
-    def export_json_newline_delimited_query(
-            self, default_filename, export_filename=None):
+    def export_json_newline_delimited_query(self, default_filename, export_filename=None):
         """
         Query to export a DuckDB table to a JSON file with newline delimited.
 
@@ -220,16 +219,9 @@ class DuckDBQueries:
         consistent naming conventions across different processing engines.
         """
         duckdb.sql(self.import_csv_query())
-        table_columns = duckdb.sql(
-            f"SELECT * FROM {self.database_table_name} LIMIT 0").columns
-        for old_name, new_name in zip(table_columns,
-                                      CSVColumnNameNormalizer(
-                                          self.filepath).columns_normalized
-                                      ):
-            sql_string = (
-                f"ALTER TABLE {self.database_table_name} "
-                f"RENAME COLUMN \"{old_name}\" TO \"{new_name}\""
-            )
+        table_columns = duckdb.sql(f"SELECT * FROM {self.database_table_name} LIMIT 0").columns
+        for old_name, new_name in zip(table_columns, CSVColumnNameNormalizer(self.filepath).columns_normalized):
+            sql_string = f'ALTER TABLE {self.database_table_name} RENAME COLUMN "{old_name}" TO "{new_name}"'
             duckdb.sql(sql_string)
 
     def create_table(self, normalize_columns=False):
@@ -253,8 +245,7 @@ class DuckDBQueries:
         """
         column_normalizer = CSVColumnNameNormalizer(self.filepath)
         normalized_mapping = {
-            col: column_normalizer.columns_to_normalized_mapping.get(col, col)
-            for col in dataframe.columns
+            col: column_normalizer.columns_to_normalized_mapping.get(col, col) for col in dataframe.columns
         }
         return dataframe.rename(normalized_mapping)
 

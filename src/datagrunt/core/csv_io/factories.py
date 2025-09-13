@@ -9,8 +9,10 @@ from datagrunt.core.csv_io.engines import (
     CSVEngineProperties,
     CSVReaderDuckDBEngine,
     CSVReaderPolarsEngine,
+    CSVReaderPyArrowEngine,
     CSVWriterDuckDBEngine,
     CSVWriterPolarsEngine,
+    CSVWriterPyArrowEngine,
 )
 from datagrunt.core.databases import DuckDBQueries
 
@@ -19,13 +21,15 @@ class CSVEngineFactory:
     """Factory class for creating CSV reader and writer engine instances."""
 
     READER_ENGINES = {
-        'duckdb': CSVReaderDuckDBEngine,
-        'polars': CSVReaderPolarsEngine,
+        "duckdb": CSVReaderDuckDBEngine,
+        "polars": CSVReaderPolarsEngine,
+        "pyarrow": CSVReaderPyArrowEngine,
     }
 
     WRITER_ENGINES = {
-        'duckdb': CSVWriterDuckDBEngine,
-        'polars': CSVWriterPolarsEngine,
+        "duckdb": CSVWriterDuckDBEngine,
+        "polars": CSVWriterPolarsEngine,
+        "pyarrow": CSVWriterPyArrowEngine,
     }
 
     def __init__(self, filepath, engine):
@@ -37,14 +41,12 @@ class CSVEngineFactory:
             engine (str): type of engine to create by the factory.
         """
         self.filepath = filepath
-        self.engine = engine.lower().replace(' ', '')
+        self.engine = engine.lower().replace(" ", "")
         self.db_table = DuckDBQueries(self.filepath).database_table_name
         if not os.path.exists(self.filepath):
             raise FileNotFoundError
         if self.engine not in CSVEngineProperties.valid_engines:
-            raise ValueError(
-                CSVEngineProperties.value_error_message.format(
-                    engine=self.engine))
+            raise ValueError(CSVEngineProperties.value_error_message.format(engine=self.engine))
 
     def create_reader(self):
         """Create a reader engine instance.

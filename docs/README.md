@@ -5,24 +5,24 @@ Datagrunt is a Python library designed to simplify the way you work with CSV fil
 Born out of real-world frustration, Datagrunt eliminates the need for repetitive coding when handling CSV files. Whether you're a data analyst, data engineer, or data scientist, Datagrunt empowers you to focus on insights, not tedious data wrangling.
 
 ### What Datagrunt Is Not
-Datagrunt is not an extension of or a replacement for DuckDB or Polars, nor a comprehensive data processing solution. It is not designed to be a comprehensive one stop shop for all of your CSV processing needs. It's designed to simplify the way you
-work with CSV files and to help solve the pain point of inferring delimiters when a file structure is unknown. We grant an easy way to convert CSV files to dataframes and to export them to various formats. One of Datagrunt's value propositions is its relative
-simplicity and ease of use. We will extend functionaltiy where it makes sense to do so, but we will be selective and strategic in our approach to add or extend functionality.
+Datagrunt is not an extension of or a replacement for DuckDB or Polars, nor is it a comprehensive data processing solution. It is not designed to be a comprehensive one-stop shop for all of your CSV processing needs. Instead, it's designed to simplify the way you work with CSV files and to help solve the pain point of inferring delimiters when a file structure is unknown. Datagrunt provides an easy way to convert CSV files to dataframes and export them to various formats. One of Datagrunt's value propositions is its relative
+simplicity and ease of use. We will extend functionality where it makes sense to do so, but we will be selective and strategic in our approach to adding or extending functionality.
 
 ### Key Features
 
-- **Intelligent Delimiter Inference:**  Datagrunt automatically detects and applies the correct delimiter for your CSV files.
-- **Seamless Data Processing:** Leverage the robust capabilities of [DuckDB](https://duckdb.org) and [Polars](https://pola.rs) to perform advanced data processing tasks directly on your CSV data.
-- **Flexible Transformation:** Easily convert your processed CSV data into various formats to suit your needs.
+- **Intelligent Delimiter Inference:** Datagrunt automatically detects and applies the correct delimiter for your CSV files.
+- **Multiple Processing Engines:** Choose from three powerful engines - [DuckDB](https://duckdb.org), [Polars](https://pola.rs), and [PyArrow](https://arrow.apache.org/docs/python/) - to handle your data processing needs.
+- **Flexible Data Transformation:** Easily convert your processed CSV data into various formats including CSV, Excel, JSON, JSONL, and Parquet.
 - **AI-Powered Schema Analysis:** Use Google's Gemini models to automatically generate detailed schema reports for your CSV files, including data types, column classifications, and data quality checks.
 - **Pythonic API:** Enjoy a clean and intuitive API that integrates seamlessly into your existing Python workflows.
 
 ### Powertools Under The Hood
 | Tool | Description |
 |-------------------|----------------------------|
-| [DuckDB](https://duckdb.org)| Fast in-process analytical database with a simple Python API |
-| [Polars](https://pola.rs) | Multi-threaded query engine written in Rust, optimized for modern processors |
-| [Google Gemini](https://deepmind.google/technologies/gemini/) | A powerful family of generative AI models. |
+| [DuckDB](https://duckdb.org)| Fast in-process analytical database with excellent SQL support |
+| [Polars](https://pola.rs) | Multi-threaded DataFrame library written in Rust, optimized for performance |
+| [PyArrow](https://arrow.apache.org/docs/python/) | Python bindings for Apache Arrow with efficient columnar data processing |
+| [Google Gemini](https://deepmind.google/technologies/gemini/) | A powerful family of generative AI models for schema analysis |
 
 ### Datagrunt's Role
 
@@ -83,22 +83,68 @@ Get started with pip:
 pip install datagrunt
 ```
 
-# How to Use Datagrunt
-Even though Datagrunt is a fairly simple library, it may not be obvious where to start. Here's a quick guide to help you naviate Datagrunt.
+# Getting Started with Datagrunt
+This section provides a comprehensive guide to using Datagrunt effectively. Here's what you'll learn:
+
+- **[Datagrunt Engines](#datagrunt-engines)** - Choose the right engine for your needs
+- **[Column Name Normalization](#normalizing-column-names)** - Clean and standardize column names
+- **[AI-Powered Analysis](#artificial-intelligence-features)** - Generate schema reports with AI
+- **[Usage Examples](#usage-examples)** - Practical code examples
+- **[Primary Classes](#primary-classes)** - Detailed API reference
 
 ## Datagrunt Engines
 
+Datagrunt provides three powerful engines for working with CSV files: Polars, DuckDB, and PyArrow. Each engine has its own strengths and is optimized for different use cases.
+
+### Engine Selection
+When instantiating the `CSVReader` or `CSVWriter` class, you can specify which engine to use:
+- **CSVReader** default engine: `polars`
+- **CSVWriter** default engine: `duckdb`
+
+```python
+# Using different engines
+reader_polars = CSVReader('file.csv', engine='polars')    # Default
+reader_duckdb = CSVReader('file.csv', engine='duckdb')
+reader_pyarrow = CSVReader('file.csv', engine='pyarrow')  # New!
+
+writer_duckdb = CSVWriter('file.csv', engine='duckdb')   # Default
+writer_polars = CSVWriter('file.csv', engine='polars')
+writer_pyarrow = CSVWriter('file.csv', engine='pyarrow') # New!
+```
+
 ### Polars Engine
-Datagrunt provides two engines for working with CSV files: DuckDB and Polars. When instantiating the `CSVReader` or the `CSVWriter` class, you can specify which engine to use. The default engine for `CSVReader` is `polars`, while the default engine for `CSVWriter` is `duckdb`.
-The reason `polars` is the default engine for `CSVReader` is because it is a powerful and fast dataframe library that is well-suited for working with CSV files. When reading CSV files, it's a common pattern to use Dataframes to process the data.
-Once the data is in a dataframe, you can leverage the powerful data manipulation capabilities of a dataframe library such as [Pandas](https://pandas.pydata.org) or [Polars](https://pola.rs). Also, in early testing, we found that `polars` is faster than `duckdb` for certain operations when reading CSV files.
+The **Polars** engine is the default for `CSVReader` because it excels at fast DataFrame operations and memory efficiency. Polars is built in Rust and optimized for modern processors, making it ideal for:
+- Fast CSV reading and initial data exploration
+- DataFrame-style data manipulation
+- Integration with existing Polars workflows
+- Memory-efficient processing of medium to large datasets
 
 ### DuckDB Engine
-Conversely, `duckdb` is the default engine for `CSVWriter` because it is a powerful and fast in process OLAPSQL database that is well-suited for working with CSV files. Once the data is in a SQL database, you can leverage the powerful data manipulation capabilities of [DuckDB](https://duckdb.org).
-Also, in early testing, we found that `duckdb` is faster than `polars` for certain operations when writing CSV files.
-The other reason that `duckdb` is the default engine for `CSVWriter` is because when writing data to JSON format in particular, we found that `duckdb` was not only faster than `polars`, but also wrote the data with better formatting and was less error prone with larger
-sets of data. When writing JSON data to a file using `duckdb`, the file was structured correctly and had consistent formatting. Sometimes when writing JSON data to a file using `polars`, the file was not structured correctly and had inconsistent formatting, causing
-downstream issues when reading the output.
+The **DuckDB** engine is the default for `CSVWriter` because it provides superior SQL capabilities and optimized file exports. DuckDB excels at:
+- Complex SQL queries and analytics
+- Efficient data export operations, especially to JSON and Parquet formats
+- Handling large datasets with minimal memory usage
+- Consistent formatting across different output formats
+
+### PyArrow Engine (New!)
+The **PyArrow** engine leverages Apache Arrow's columnar memory format for optimal performance with certain data processing patterns. PyArrow is particularly well-suited for:
+- Interoperability with other Arrow-based tools and systems
+- Efficient columnar data processing
+- Direct integration with Parquet and other Arrow-native formats
+- Zero-copy data sharing between different processing libraries
+
+PyArrow maintains string data types throughout processing to prevent data loss, making it an excellent choice when data fidelity is paramount.
+
+### Engine Comparison
+
+| Feature | Polars | DuckDB | PyArrow |
+|---------|--------|--------|---------|
+| **Best for** | DataFrame operations | SQL queries & analytics | Arrow ecosystem integration |
+| **Performance** | Fast in-memory processing | Excellent for large datasets | Optimized columnar operations |
+| **Default for** | CSVReader | CSVWriter | - |
+| **Data Types** | Type inference | All varchar import | String preservation |
+| **Export Quality** | Good | Excellent (especially JSON) | Native Parquet support |
+| **Memory Usage** | Efficient | Very efficient | Columnar efficiency |
 
 ### Google Gemini Engine
 As of Datagrunt version 2.0.1, engines have been added for Generative AI LLM providers. Currently only Google Gemini is supported, but with the factory pattern we can easily add more providers in the future. How we approach this is being debated among the Datagrunt maintainers. We'll post more updates in the future regarding this topic.
@@ -124,7 +170,7 @@ You can access the original columns via the `.columns` attribute and the normali
 As of Datagrunt version 2.0.1 integration with Large Language Models (LLMs) is available. Currently only Google Gemini is available. We plan to add more LLMs in the future.
 
 ### Artificial Intelligence (AI) Engines
-As of Datagrunt version 2.0.1 we introduced a factory pattern to support multiple LLM providers. Currently, the only engine available is Google Gemini. In order to access Gemini, you need either a Gemini API key or you need to be authenticated with a Google Cloud account so that you can use Vertex AI. Both are supported in the same interface depending on the set of paramaters you pass into the `CSVSchemaReportAIGenerated` class.
+As of Datagrunt version 2.0.1 we introduced a factory pattern to support multiple LLM providers. Currently, the only engine available is Google Gemini. In order to access Gemini, you need either a Gemini API key or you need to be authenticated with a Google Cloud account so that you can use Vertex AI. Both are supported in the same interface depending on the set of parameters you pass into the `CSVSchemaReportAIGenerated` class.
 
 ### Google Gemini
 Currently there is only one class that supports integration with Google Gemini: `CSVSchemaReportAIGenerated`. It is exposed as part of the facade pattern along with the `CSVReader` and `CSVWriter` classes. See below under the `Primary Classes` section for more details.
@@ -136,12 +182,14 @@ from datagrunt import CSVReader
 
 # Load your CSV file
 csv_file = 'examples/data/electric_vehicle_population_data.csv'
-engine = 'duckdb'
 
-# Set duckdb as the processing engine. Engine set to 'polars' by default
-reader = CSVReader(csv_file, engine=engine)
+# Choose your engine: 'polars' (default), 'duckdb', or 'pyarrow'
+reader = CSVReader(csv_file, engine='duckdb')
 
-# return sample of the data to get a peek at the schema
+# Example with PyArrow engine (new!)
+# reader_arrow = CSVReader(csv_file, engine='pyarrow')
+
+# Return a sample of the data to get a peek at the schema
 reader.get_sample()
 ┌────────────┬───────────┬──────────────┬───┬──────────────────────┬──────────────────────┬───────────────────┐
 │ VIN (1-10) │  County   │     City     │ … │   Vehicle Location   │   Electric Utility   │ 2020 Census Tract │
@@ -190,7 +238,7 @@ ORDER BY 2 DESC
 """
 
 # Execute the query and get results as a Polars DataFrame
-df = reader.query_data(query).pl() # the .pl() method is used to convert the results from a DuckDBPyRelation object to a Polars DataFrame
+df = reader.query_data(query).pl()  # The .pl() method converts DuckDBPyRelation to Polars DataFrame
 print(df)
 ��────────────────┬───────────────┐
 │ city           ┆ vehicle_count │
@@ -236,8 +284,8 @@ report_generator_vertex = CSVSchemaReportAIGenerated(
     filepath=csv_file,
     engine='google',
     vertexai=True,
-    gcp_project='my-gcp-project-id', # Change to your project ID
-    gcp_location='us-central1'      # Change to your GCP location
+    gcp_project='my-gcp-project-id',  # Change to your project ID
+    gcp_location='us-central1'       # Change to your GCP location
 )
 
 # Generate the report using a powerful model (choose one of the generators from above)
@@ -409,6 +457,29 @@ This will produce a detailed JSON report analyzing the CSV's schema, data types,
 }
 ```
 
+### Using the PyArrow Engine
+```python
+from datagrunt import CSVReader, CSVWriter
+
+# Reading with PyArrow engine
+reader = CSVReader('path/to/file.csv', engine='pyarrow')
+
+# Get data as PyArrow table (native format)
+arrow_table = reader.to_arrow_table(normalize_columns=True)
+
+# Convert to other formats
+polars_df = reader.to_dataframe()  # Returns Polars DataFrame
+dict_list = reader.to_dicts()      # Returns list of dictionaries
+
+# Writing with PyArrow engine
+writer = CSVWriter('path/to/file.csv', engine='pyarrow')
+
+# Export to various formats with PyArrow's optimized writers
+writer.write_parquet('output.parquet')  # Efficient native Parquet export
+writer.write_csv('output.csv')          # Fast CSV export
+writer.write_json('output.json')        # JSON export
+```
+
 ### Combine Datagrunt With Other Libraries
 
 Datagrunt can be combined with other libraries. For example, you could use Datagrunt to instantiate the `CSVReader` class, and then use the provided `delimiter` attribute with other libraries.
@@ -418,7 +489,7 @@ from datagrunt import CSVReader
 import pandas as pd
 
 reader = CSVReader('path/to/file.csv')
-df = pd.read_csv(reader.filepath, sep=reader.delimiter) # filepath and delimiter are attributes of the CSVReader class.
+df = pd.read_csv(reader.filepath, sep=reader.delimiter)  # filepath and delimiter are CSVReader attributes
 ```
 
 ### Reassign the Delimiter
@@ -426,28 +497,32 @@ df = pd.read_csv(reader.filepath, sep=reader.delimiter) # filepath and delimiter
 Sometimes, the delimiter may not be correctly identified by Datagrunt. In such cases, you can reassign the delimiter attribute to correct it.
 ```python
 from datagrunt import CSVReader
+import pandas as pd
+
 reader = CSVReader('path/to/file.csv')
 
-# let's assume the delimiter is wrong and was inferred incorrectly as a space. Reassign the delimiter to correct it.
+# Let's assume the delimiter was incorrectly inferred as a space. Reassign it to correct the issue.
 reader.delimiter = ','
 df = pd.read_csv(reader.filepath, sep=reader.delimiter)
 ```
 
-By updating the delimiter attribute, you can ensure the `CSVReader` object will read the file correctly if you choose to use any of its methods down the line.
+By updating the delimiter attribute, you ensure the `CSVReader` object will read the file correctly when you use any of its methods subsequently.
 
 ## Primary Classes
 Datagrunt provides three primary classes for interacting with data: `CSVReader`, `CSVWriter`, and `CSVSchemaReportAIGenerated`. These classes are designed to simplify the process of reading, writing, and analyzing CSV files.
 
 ### CSVReader
-The `CSVReader` class is used to read data from a CSV file. It provides a simple interface for reading data from a CSV file and converting it into a DataFrame. You instantiate the `CSVReader` class as follows:
+The `CSVReader` class is used to read data from a CSV file. It provides a simple interface for reading data from a CSV file and converting it into various formats. You instantiate the `CSVReader` class as follows:
 ```python
 from datagrunt import CSVReader
 reader = CSVReader('path/to/file.csv')
 ```
 
-You may optionally specify the engine to use for reading the CSV file. The two options are `duckdb` and `polars`. The default engine is `polars`.
+You may optionally specify the engine to use for reading the CSV file. The three options are `polars` (default), `duckdb`, and `pyarrow`.
 ```python
-reader = CSVReader('path/to/file.csv', engine='duckdb') # don't pass any engine if you want to use the default engine.
+reader = CSVReader('path/to/file.csv', engine='duckdb')   # DuckDB engine
+reader = CSVReader('path/to/file.csv', engine='pyarrow')  # PyArrow engine
+reader = CSVReader('path/to/file.csv')                    # Default: Polars engine
 ```
 
 The primary methods of the `CSVReader` class are:
@@ -458,7 +533,15 @@ The primary methods of the `CSVReader` class are:
 - `query_data(sql_query, normalize_columns=False)`: Executes a SQL query on the data in the CSV file.
 
 ### CSVWriter
-The `CSVWriter` class is used to write data to a CSV file. It provides a simple interface for writing data to a CSV.
+The `CSVWriter` class is used to convert and export CSV data to various file formats. It supports three engines: `duckdb` (default), `polars`, and `pyarrow`.
+
+```python
+from datagrunt import CSVWriter
+writer = CSVWriter('path/to/file.csv', engine='duckdb')   # Default: DuckDB engine
+writer = CSVWriter('path/to/file.csv', engine='polars')   # Polars engine
+writer = CSVWriter('path/to/file.csv', engine='pyarrow')  # PyArrow engine
+```
+
 The primary methods of the `CSVWriter` class are:
 - `write_csv(self, out_filename=None, normalize_columns=False)`: Writes the data in the CSV file to a CSV file.
 - `write_excel(self, out_filename=None, normalize_columns=False)`: Writes the data in the CSV file to an Excel file.
@@ -467,31 +550,31 @@ The primary methods of the `CSVWriter` class are:
 - `write_parquet(self, out_filename=None, normalize_columns=False)`: Writes the data in the CSV file to a Parquet file.
 
 ### CSVSchemaReportAIGenerated
-The `CSVSchemaReportAIGenerated` class is used to generate a report on the schema of a CSV file. It provides a simple interface for generating a report on the schema of a CSV file.
-It is currently configured to run only with Google's Gemini and takes either an `api_key` or can access Vertex AI if you pass in the following paramaters:
+The `CSVSchemaReportAIGenerated` class generates detailed schema reports for CSV files using AI. It provides a simple interface for analyzing CSV file structure and data types.
+It is currently configured to work only with Google's Gemini and accepts either an `api_key` or can access Vertex AI if you pass in the following parameters:
 - `vertexai=True`
 - `gcp_project=my-gcp-project-id`
 - `gcp_location=global` or a supported Google Cloud region such as `us-central1`
 
-The primary methods of the `CSVSchemaReportAIGenerated` class are:
-- `generate_csv_schema_report(self, model, prompt=None, system_instructions=None, return_json=False)`: Generates a report on the schema of a CSV file.
-    - model: any supported Gemini model. We did not set a default model by design. Here is a link to the available Google Gemini models: [Gemini Models](https://cloud.google.com/vertex-ai/docs/generative-ai/models)
-    - prompt: optional system prompt. A default prompt is utilized if no prompt is passed in.
-    - system_instructions: optional system instructions. Default system instructions are utilized if no system instructions are passed in.
-    - return_json: set to `False` by default and returns a Python dict. Set to `True` in order to have an indented JSON response returned.
+The primary method of the `CSVSchemaReportAIGenerated` class is:
+- `generate_csv_schema_report(self, model, prompt=None, system_instructions=None, return_json=False)`: Generates a comprehensive schema report for a CSV file.
+    - **model**: Any supported Gemini model. No default model is set by design. See [available Google Gemini models](https://cloud.google.com/vertex-ai/docs/generative-ai/models)
+    - **prompt**: Optional custom prompt. Uses a default prompt if none provided.
+    - **system_instructions**: Optional system instructions. Uses default instructions if none provided.
+    - **return_json**: Returns a Python dict by default (`False`). Set to `True` to return formatted JSON string.
 
-Here is a list of optional keyword params you may pass in along with their default values:
-- vertexai=False,
-- gcp_project=None,
-- gcp_location=None,
-- max_tokens=8192,
-- temperature=0.5,
-- top_p=1,
-- seed=0,
-- safety_settings=None, # I'll list the default safety settings below.
-- thinking_budget=-1, # set to automatic mode
-- response_type="application/json",
-- ground_google_search=False
+Here are the optional keyword parameters you may pass in along with their default values:
+- **vertexai**: `False` - Enable Vertex AI instead of direct API access
+- **gcp_project**: `None` - Google Cloud project ID (required for Vertex AI)
+- **gcp_location**: `None` - Google Cloud region (required for Vertex AI)
+- **max_tokens**: `8192` - Maximum output tokens (current limit ~65k)
+- **temperature**: `0.5` - Controls randomness in responses (0.0-1.0)
+- **top_p**: `1` - Controls diversity of token selection (0.0-1.0)
+- **seed**: `0` - Random seed for reproducible outputs
+- **safety_settings**: `None` - Custom safety settings (defaults listed below)
+- **thinking_budget**: `-1` - Thinking time budget (-1 for automatic)
+- **response_type**: `"application/json"` - Output MIME type
+- **ground_google_search**: `False` - Enable Google Search grounding (planned feature)
 
 There is a default prompt that is built into Datagrunt that enables this method to operate. You may optionally pass in your own prompt if you wish. If you do not pass in a prompt, Datagrunt will use the default system prompt. Otherwise, it will use the prompt you pass in.
 
@@ -570,7 +653,7 @@ Return a response format like this:
    "classification": "dimension or measure"
   }}
  ],
- "dimensions": ["colmn_name_1", "column_name_2", ...],
+ "dimensions": ["column_name_1", "column_name_2", ...],
  "measures": ["column_name_1", "column_name_2", ...],
 "columns_rename_map": {{
     "column_name": "normalized_column_name"
@@ -609,9 +692,9 @@ Here are the default safety settings. You may pass in your own list but these ar
 Grounding in Google Search will be supported in the future. The implementation is already built into the AI Engines pattern, but the only class that utilizes AI right now does not allow for grounding in Google Search. Again, future implementations will utilize this feature.
 
 #### No AI Agents At This Time
-The current implementation leveraging a LLM to evaluate a CSV file is a simple API call to the LLM provider (currently Google Gemini). To be clear this is not an AI agent nor this is an agentic component of Datagrunt. Again, this is a simple API call to Gemini.
+The current implementation leveraging an LLM to evaluate a CSV file is a simple API call to the LLM provider (currently Google Gemini). To be clear, this is not an AI agent nor an agentic component of Datagrunt—it is simply an API call to Gemini.
 
-AI Agents may be added in the future but that is currently being debated among the maintainers of Datagrunt. We will post more details on this decision in the future.
+AI Agents may be added in the future, but this is currently being debated among the maintainers of Datagrunt. We will post more details on this decision in the future.
 
 ## File and CSV Attributes
 Exposed in both the `CSVReader` and `CSVWriter` classes are a number of attributes that allow you to access and manipulate file and CSV-specific information:

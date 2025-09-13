@@ -6,8 +6,9 @@ from datagrunt.core.ai.engines import AIEngineProperties, GoogleAIEngine
 
 class AIEngineFactory:
     """Factory class for creating AI engine instances."""
+
     AI_ENGINES = {
-        'google': GoogleAIEngine,
+        "google": GoogleAIEngine,
     }
 
     def __init__(self, api_key, engine, **kwargs):
@@ -20,11 +21,10 @@ class AIEngineFactory:
             **kwargs: Additional parameters for the AI provider.
         """
         self.api_key = api_key
-        self.engine = engine.lower().replace(' ', '')
+        self.engine = engine.lower().replace(" ", "")
         self.kwargs = kwargs
         if self.engine not in AIEngineProperties.valid_engines:
-            raise ValueError(
-                f"Unsupported AI engine: {self.engine}")
+            raise ValueError(f"Unsupported AI engine: {self.engine}")
 
     def create_engine(self):
         """Create an AI engine instance."""

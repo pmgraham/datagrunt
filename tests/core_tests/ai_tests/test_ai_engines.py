@@ -14,7 +14,7 @@ class TestAIEngineProperties:
     def test_default_valid_engines(self):
         """Test that default valid engines tuple contains expected values."""
         properties = AIEngineProperties()
-        assert properties.valid_engines == ('google',)
+        assert properties.valid_engines == ("google",)
 
     def test_valid_engines_is_tuple(self):
         """Test that valid_engines is a tuple."""
@@ -23,8 +23,8 @@ class TestAIEngineProperties:
 
     def test_custom_valid_engines(self):
         """Test that custom valid engines can be set."""
-        properties = AIEngineProperties(valid_engines=('google', 'openai'))
-        assert properties.valid_engines == ('google', 'openai')
+        properties = AIEngineProperties(valid_engines=("google", "openai"))
+        assert properties.valid_engines == ("google", "openai")
 
 
 class TestBaseAIEngine:
@@ -39,7 +39,6 @@ class TestBaseAIEngine:
 
             # Only implement one method
             def generate_embeddings(self, **kwargs):
-
                 return "embeddings"
 
     def test_complete_implementation_works(self):
@@ -73,11 +72,7 @@ class TestGoogleAIEngine:
 
     def test_init_with_vertexai(self):
         """Test initialization with Vertex AI."""
-        engine = GoogleAIEngine(
-            vertexai=True,
-            gcp_project="test_project",
-            gcp_location="us-central1"
-        )
+        engine = GoogleAIEngine(vertexai=True, gcp_project="test_project", gcp_location="us-central1")
         assert engine.vertexai is True
         assert engine.gcp_project == "test_project"
         assert engine.gcp_location == "us-central1"
@@ -111,7 +106,7 @@ class TestGoogleAIEngine:
             safety_settings=safety_settings,
             thinking_budget=1000,
             response_type="text/plain",
-            ground_google_search=True
+            ground_google_search=True,
         )
 
         assert engine.api_key == "test_key"
@@ -133,7 +128,7 @@ class TestGoogleAIEngine:
         assert len(engine.safety_settings) == 4
         assert all(isinstance(setting, types.SafetySetting) for setting in engine.safety_settings)
 
-    @patch('datagrunt.core.ai.engines.genai.Client')
+    @patch("datagrunt.core.ai.engines.genai.Client")
     def test_client_with_api_key(self, mock_client_class):
         """Test _client method with API key."""
         mock_client = Mock()
@@ -145,24 +140,16 @@ class TestGoogleAIEngine:
         mock_client_class.assert_called_once_with(api_key="test_key")
         assert client == mock_client
 
-    @patch('datagrunt.core.ai.engines.genai.Client')
+    @patch("datagrunt.core.ai.engines.genai.Client")
     def test_client_with_vertexai(self, mock_client_class):
         """Test _client method with Vertex AI."""
         mock_client = Mock()
         mock_client_class.return_value = mock_client
 
-        engine = GoogleAIEngine(
-            vertexai=True,
-            gcp_project="test_project",
-            gcp_location="us-central1"
-        )
+        engine = GoogleAIEngine(vertexai=True, gcp_project="test_project", gcp_location="us-central1")
         client = engine._client()
 
-        mock_client_class.assert_called_once_with(
-            vertexai=True,
-            project="test_project",
-            location="us-central1"
-        )
+        mock_client_class.assert_called_once_with(vertexai=True, project="test_project", location="us-central1")
         assert client == mock_client
 
     def test_contents_creation(self):
@@ -190,7 +177,7 @@ class TestGoogleAIEngine:
             types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
             types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
             types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-            types.HarmCategory.HARM_CATEGORY_HARASSMENT
+            types.HarmCategory.HARM_CATEGORY_HARASSMENT,
         ]
 
         for expected_category in expected_categories:
@@ -215,7 +202,7 @@ class TestGoogleAIEngine:
         assert config.top_p == engine.top_p
         assert config.seed == engine.seed
         assert config.max_output_tokens == engine.max_tokens
-        assert hasattr(config, 'tools') is False or config.tools is None
+        assert hasattr(config, "tools") is False or config.tools is None
 
     def test_content_config_with_google_search(self):
         """Test _content_config method with Google Search."""
@@ -234,7 +221,7 @@ class TestGoogleAIEngine:
         assert isinstance(config, types.GenerateContentConfig)
         # Should use default empty string for system instruction
 
-    @patch('datagrunt.core.ai.engines.genai.Client')
+    @patch("datagrunt.core.ai.engines.genai.Client")
     def test_generate_content_success(self, mock_client_class):
         """Test generate_content method with successful response."""
         # Setup mocks
@@ -248,16 +235,14 @@ class TestGoogleAIEngine:
         # Test
         engine = GoogleAIEngine(api_key="test_key")
         result = engine.generate_content(
-            model="gemini-pro",
-            prompt="Test prompt",
-            system_instruction="Test instruction"
+            model="gemini-pro", prompt="Test prompt", system_instruction="Test instruction"
         )
 
         # Assertions
         assert result == "Generated content"
         mock_client.models.generate_content.assert_called_once()
 
-    @patch('datagrunt.core.ai.engines.genai.Client')
+    @patch("datagrunt.core.ai.engines.genai.Client")
     def test_generate_content_with_kwargs(self, mock_client_class):
         """Test generate_content method with additional kwargs."""
         mock_response = Mock()
@@ -268,11 +253,7 @@ class TestGoogleAIEngine:
         mock_client_class.return_value = mock_client
 
         engine = GoogleAIEngine(api_key="test_key")
-        result = engine.generate_content(
-            model="gemini-pro",
-            prompt="Test prompt",
-            extra_param="extra_value"
-        )
+        result = engine.generate_content(model="gemini-pro", prompt="Test prompt", extra_param="extra_value")
 
         assert result == "Generated content"
 
@@ -285,13 +266,13 @@ class TestGoogleAIEngine:
 
     def test_constants_are_defined(self):
         """Test that all expected constants are defined."""
-        assert hasattr(GoogleAIEngine, 'THINKING_BUDGET')
-        assert hasattr(GoogleAIEngine, 'DEFAULT_RESPONSE_JSON_MIME_TYPE')
-        assert hasattr(GoogleAIEngine, 'MAX_OUTPUT_TOKENS')
-        assert hasattr(GoogleAIEngine, 'DEFAULT_TEMPERATURE')
-        assert hasattr(GoogleAIEngine, 'DEFAULT_TOP_P')
-        assert hasattr(GoogleAIEngine, 'DEFAULT_SEED')
-        assert hasattr(GoogleAIEngine, 'DEFAULT_SYSTEM_INSTRUCTIONS')
+        assert hasattr(GoogleAIEngine, "THINKING_BUDGET")
+        assert hasattr(GoogleAIEngine, "DEFAULT_RESPONSE_JSON_MIME_TYPE")
+        assert hasattr(GoogleAIEngine, "MAX_OUTPUT_TOKENS")
+        assert hasattr(GoogleAIEngine, "DEFAULT_TEMPERATURE")
+        assert hasattr(GoogleAIEngine, "DEFAULT_TOP_P")
+        assert hasattr(GoogleAIEngine, "DEFAULT_SEED")
+        assert hasattr(GoogleAIEngine, "DEFAULT_SYSTEM_INSTRUCTIONS")
 
     def test_constants_values(self):
         """Test that constants have expected values."""
@@ -308,7 +289,7 @@ class TestGoogleAIEngine:
         engine = GoogleAIEngine(api_key="test_key")
         assert isinstance(engine, BaseAIEngine)
 
-    @patch('datagrunt.core.ai.engines.genai.Client')
+    @patch("datagrunt.core.ai.engines.genai.Client")
     def test_generate_content_api_call_structure(self, mock_client_class):
         """Test that generate_content makes the API call with correct structure."""
         mock_response = Mock()
@@ -324,7 +305,7 @@ class TestGoogleAIEngine:
         # Verify the API call was made with the right parameters
         call_args = mock_client.models.generate_content.call_args
         assert call_args is not None
-        assert 'model' in call_args.kwargs
-        assert 'contents' in call_args.kwargs
-        assert 'config' in call_args.kwargs
-        assert call_args.kwargs['model'] == "gemini-pro"
+        assert "model" in call_args.kwargs
+        assert "contents" in call_args.kwargs
+        assert "config" in call_args.kwargs
+        assert call_args.kwargs["model"] == "gemini-pro"

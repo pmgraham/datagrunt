@@ -14,7 +14,7 @@ class CSVWriter(CSVComponents):
     supported file types.
     """
 
-    def __init__(self, filepath, engine='duckdb'):
+    def __init__(self, filepath, engine="duckdb"):
         """
         Initialize the CSV Writer class.
 
@@ -25,7 +25,7 @@ class CSVWriter(CSVComponents):
         """
         super().__init__(filepath)
         self.db_table = DuckDBQueries(self.filepath).database_table_name
-        self.engine = engine.lower().replace(' ', '')
+        self.engine = engine.lower().replace(" ", "")
 
     def _create_writer(self):
         """Create a reader object."""
@@ -39,7 +39,7 @@ class CSVWriter(CSVComponents):
                 out_filename str: The name of the output file.
                 normalize_columns optional, bool: Whether to normalize column
                 names.
-            """
+        """
         return self._create_writer().write_csv(out_filename, normalize_columns)
 
     def write_excel(self, out_filename=None, normalize_columns=False):
@@ -64,8 +64,7 @@ class CSVWriter(CSVComponents):
         """
         return self._create_writer().write_json(out_filename, normalize_columns)  # noqa: E501
 
-    def write_json_newline_delimited(
-            self, out_filename=None, normalize_columns=False):
+    def write_json_newline_delimited(self, out_filename=None, normalize_columns=False):
         """
         Query to export a DuckDB table to a JSON newline delimited file.
 
@@ -74,8 +73,7 @@ class CSVWriter(CSVComponents):
             normalize_columns optional, bool: Whether to normalize column
             names.
         """
-        return self._create_writer().write_json_newline_delimited(
-            out_filename, normalize_columns)
+        return self._create_writer().write_json_newline_delimited(out_filename, normalize_columns)
 
     def write_parquet(self, out_filename=None, normalize_columns=False):
         """
