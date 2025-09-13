@@ -6,15 +6,27 @@ Datagrunt is a Python library designed to simplify the way you work with CSV fil
 
 Born out of real-world frustration, Datagrunt eliminates the need for repetitive coding when handling CSV files. Whether you're a data analyst, data engineer, or data scientist, Datagrunt empowers you to focus on insights, not tedious data wrangling.
 
+### What Datagrunt Is Not
+Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow, nor is it a comprehensive data processing solution. Instead, it's designed to simplify the way you work with CSV files and to help solve the pain point of inferring delimiters when a file structure is unknown. Datagrunt provides an easy way to convert CSV files to dataframes and export them to various formats. One of Datagrunt's value propositions is its relative simplicity and ease of use.
+
 ## Key Features
 
-- **Intelligent Delimiter Inference:**  Datagrunt automatically detects and applies the correct delimiter for your CSV files.
-- **Seamless Data Processing:** Leverage the robust capabilities of [DuckDB](https://duckdb.org) and [Polars](https://pola.rs) to perform advanced data processing tasks directly on your CSV data.
-- **Flexible Transformation:** Easily convert your processed CSV data into various formats to suit your needs.
+- **Intelligent Delimiter Inference:** Datagrunt automatically detects and applies the correct delimiter for your CSV files.
+- **Multiple Processing Engines:** Choose from three powerful engines - [DuckDB](https://duckdb.org), [Polars](https://pola.rs), and [PyArrow](https://arrow.apache.org/docs/python/) - to handle your data processing needs.
+- **Flexible Data Transformation:** Easily convert your processed CSV data into various formats including CSV, Excel, JSON, JSONL, and Parquet.
 - **AI-Powered Schema Analysis:** Use Google's Gemini models to automatically generate detailed schema reports for your CSV files, including data types, column classifications, and data quality checks.
 - **Pythonic API:** Enjoy a clean and intuitive API that integrates seamlessly into your existing Python workflows.
 
+### Powertools Under The Hood
+| Tool | Description |
+|-------------------|----------------------------|
+| [DuckDB](https://duckdb.org)| Fast in-process analytical database with excellent SQL support |
+| [Polars](https://pola.rs) | Multi-threaded DataFrame library written in Rust, optimized for performance |
+| [PyArrow](https://arrow.apache.org/docs/python/) | Python bindings for Apache Arrow with efficient columnar data processing |
+| [Google Gemini](https://deepmind.google/technologies/gemini/) | A powerful family of generative AI models for schema analysis |
+
 ## Installation
+
 We recommend using [UV](https://docs.astral.sh/uv/). However, you may get started with Datagrunt in seconds using UV or pip.
 
 Get started with UV:
@@ -29,61 +41,34 @@ Get started with pip:
 pip install datagrunt
 ```
 
-## Getting Started
+## Quick Start
+
+### Reading CSV Files with Multiple Engine Options
 
 ```python
 from datagrunt import CSVReader
 
-# Load your CSV file
+# Load your CSV file with different engines
 csv_file = 'electric_vehicle_population_data.csv'
-engine = 'duckdb'
 
-# Set duckdb as the processing engine. Engine set to 'polars' by default
-dg = CSVReader(csv_file, engine=engine)
+# Choose your engine: 'polars' (default), 'duckdb', or 'pyarrow'
+reader_polars = CSVReader(csv_file, engine='polars')    # Default - fast DataFrame ops
+reader_duckdb = CSVReader(csv_file, engine='duckdb')    # Best for SQL queries
+reader_pyarrow = CSVReader(csv_file, engine='pyarrow')  # Arrow ecosystem integration
 
-# return sample of the data to get a peek at the schema
-dg.get_sample()
-┌────────────┬───────────┬──────────────┬───┬──────────────────────┬──────────────────────┬───────────────────┐
-│ VIN (1-10) │  County   │     City     │ … │   Vehicle Location   │   Electric Utility   │ 2020 Census Tract │
-│  varchar   │  varchar  │   varchar    │   │       varchar        │       varchar        │      varchar      │
-├────────────┼───────────┼──────────────┼───┼──────────────────────┼──────────────────────┼───────────────────┤
-│ 5YJSA1E28K │ Snohomish │ Mukilteo     │ … │ POINT (-122.29943 …  │ PUGET SOUND ENERGY…  │ 53061042001       │
-│ 1C4JJXP68P │ Yakima    │ Yakima       │ … │ POINT (-120.468875…  │ PACIFICORP           │ 53077001601       │
-│ WBY8P6C05L │ Kitsap    │ Kingston     │ … │ POINT (-122.517835…  │ PUGET SOUND ENERGY…  │ 53035090102       │
-│ JTDKARFP1J │ Kitsap    │ Port Orchard │ … │ POINT (-122.653005…  │ PUGET SOUND ENERGY…  │ 53035092802       │
-│ 5UXTA6C09N │ Snohomish │ Everett      │ … │ POINT (-122.203234…  │ PUGET SOUND ENERGY…  │ 53061041605       │
-│ 5YJYGDEF8L │ King      │ Seattle      │ … │ POINT (-122.378886…  │ CITY OF SEATTLE - …  │ 53033004703       │
-│ JTMAB3FV7P │ Thurston  │ Rainier      │ … │ POINT (-122.677141…  │ PUGET SOUND ENERGY…  │ 53067012530       │
-│ JN1AZ0CPXC │ King      │ Kirkland     │ … │ POINT (-122.192596…  │ PUGET SOUND ENERGY…  │ 53033022402       │
-│ JN1AZ0CP7B │ King      │ Kirkland     │ … │ POINT (-122.192596…  │ PUGET SOUND ENERGY…  │ 53033022603       │
-│ 1N4AZ0CP0F │ Thurston  │ Olympia      │ … │ POINT (-122.86491 …  │ PUGET SOUND ENERGY…  │ 53067010300       │
-│     ·      │   ·       │    ·         │ · │          ·           │          ·           │      ·            │
-│     ·      │   ·       │    ·         │ · │          ·           │          ·           │      ·            │
-│     ·      │   ·       │    ·         │ · │          ·           │          ·           │      ·            │
-│ 5YJYGDEE7M │ Clark     │ Vancouver    │ … │ POINT (-122.515805…  │ BONNEVILLE POWER A…  │ 53011041310       │
-│ 7SAYGAEE0P │ Snohomish │ Monroe       │ … │ POINT (-121.968385…  │ PUGET SOUND ENERGY…  │ 53061052203       │
-│ 2C4RC1N75P │ King      │ Burien       │ … │ POINT (-122.347227…  │ CITY OF SEATTLE - …  │ 53033027600       │
-│ 1FTVW1EVXP │ King      │ Kirkland     │ … │ POINT (-122.202653…  │ PUGET SOUND ENERGY…  │ 53033022300       │
-│ 4JGGM1CB2P │ King      │ Seattle      │ … │ POINT (-122.2453 4…  │ CITY OF SEATTLE - …  │ 53033011700       │
-│ 1N4BZ0CP0G │ King      │ Seattle      │ … │ POINT (-122.334079…  │ CITY OF SEATTLE - …  │ 53033008300       │
-│ 7SAYGDEF2N │ King      │ Bellevue     │ … │ POINT (-122.144149…  │ PUGET SOUND ENERGY…  │ 53033024704       │
-│ 1N4BZ1DP7L │ King      │ Bellevue     │ … │ POINT (-122.144149…  │ PUGET SOUND ENERGY…  │ 53033024902       │
-...
-├────────────┴───────────┴──────────────┴───┴──────────────────────┴──────────────────────┴───────────────────┤
-│ ? rows (>9999 rows, 20 shown)                                                          17 columns (6 shown) │
-└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+# Get a sample of the data
+reader_duckdb.get_sample()
 ```
 
-##  DuckDB Integration for Performant SQL Queries
+### DuckDB Integration for Performant SQL Queries
+
 ```python
 from datagrunt import CSVReader
 
-csv_file = 'electric_vehicle_population_data.csv'
-engine = 'duckdb'
+# Set up DuckDB engine for SQL capabilities
+dg = CSVReader('electric_vehicle_population_data.csv', engine='duckdb')
 
-dg = CSVReader(csv_file, engine=engine)
-
-# Construct your SQL query
+# Construct your SQL query using the auto-generated table name
 query = f"""
 WITH core AS (
     SELECT
@@ -102,26 +87,79 @@ ORDER BY 2 DESC
 # Execute the query and get results as a Polars DataFrame
 df = dg.query_data(query).pl()
 print(df)
-┌────────────────┬───────────────┐
-│ city           ┆ vehicle_count │
-│ ---            ┆ ---           │
-│ str            ┆ i64           │
-╞════════════════╪═══════════════╡
-│ Seattle        ┆ 32602         │
-│ Bellevue       ┆ 9960          │
-│ Redmond        ┆ 7165          │
-│ Vancouver      ┆ 7081          │
-│ Bothell        ┆ 6602          │
-│ …              ┆ …             │
-│ Glenwood       ┆ 1             │
-│ Walla Walla Co ┆ 1             │
-│ Pittsburg      ┆ 1             │
-│ Decatur        ┆ 1             │
-│ Redwood City   ┆ 1             │
-└────────────────┴───────────────┘
 ```
+
+### Exporting Data to Multiple Formats
+
+```python
+from datagrunt import CSVWriter
+
+# Create writer with your preferred engine
+writer = CSVWriter('input.csv', engine='duckdb')  # Default for exports
+
+# Export to various formats
+writer.write_csv('output.csv')          # Clean CSV export
+writer.write_excel('output.xlsx')       # Excel workbook
+writer.write_json('output.json')        # JSON format
+writer.write_parquet('output.parquet')  # Parquet for analytics
+
+# Use PyArrow engine for optimized Parquet exports
+writer_arrow = CSVWriter('input.csv', engine='pyarrow')
+writer_arrow.write_parquet('optimized.parquet')  # Native Arrow Parquet
+```
+
+### AI-Powered Schema Analysis
+
+```python
+from datagrunt import CSVSchemaReportAIGenerated
+import os
+
+# Generate detailed schema reports with AI
+api_key = os.environ.get("GEMINI_API_KEY")
+
+schema_analyzer = CSVSchemaReportAIGenerated(
+    filepath='your_data.csv',
+    engine='google',
+    api_key=api_key
+)
+
+# Get comprehensive schema analysis
+report = schema_analyzer.generate_csv_schema_report(
+    model='gemini-2.5-flash',
+    return_json=True
+)
+
+print(report)  # Detailed JSON schema with data types, classifications, and more
+```
+
+## Engine Comparison
+
+| Feature | Polars | DuckDB | PyArrow |
+|---------|--------|--------|---------|
+| **Best for** | DataFrame operations | SQL queries & analytics | Arrow ecosystem integration |
+| **Performance** | Fast in-memory processing | Excellent for large datasets | Optimized columnar operations |
+| **Default for** | CSVReader | CSVWriter | - |
+| **Export Quality** | Good | Excellent (especially JSON) | Native Parquet support |
+
+## Primary Classes
+
+- **`CSVReader`**: Read and process CSV files with intelligent delimiter detection
+- **`CSVWriter`**: Export CSV data to multiple formats (CSV, Excel, JSON, Parquet)
+- **`CSVSchemaReportAIGenerated`**: Generate AI-powered schema analysis reports
+
+## Full Documentation
+
+For complete documentation, detailed examples, and advanced usage patterns, see:
+📖 **[Complete Documentation](docs/README.md)**
+
 ## License
+
 This project is licensed under the [MIT License](https://opensource.org/license/mit)
 
 ## Acknowledgements
-A HUGE thank you to the open source community and the creators of [DuckDB](https://duckdb.org) and [Polars](https://pola.rs) for their fantastic libraries that power Datagrunt.
+
+A HUGE thank you to the open source community and the creators of [DuckDB](https://duckdb.org), [Polars](https://pola.rs), and [PyArrow](https://arrow.apache.org/docs/python/) for their fantastic libraries that power Datagrunt.
+
+## Source Repository
+
+[https://github.com/pmgraham/datagrunt](https://github.com/pmgraham/datagrunt)
