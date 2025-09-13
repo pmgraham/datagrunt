@@ -15,7 +15,7 @@ from datagrunt.core import CSVComponents, CSVEngineFactory, DuckDBQueries
 class CSVReader(CSVComponents):
     """Class to unify the interface for reading CSV files."""
 
-    def __init__(self, filepath, engine='polars'):
+    def __init__(self, filepath, engine="polars"):
         """
         Initialize the CSV Reader class.
 
@@ -26,7 +26,7 @@ class CSVReader(CSVComponents):
         """
         super().__init__(filepath)
         self.db_table = DuckDBQueries(self.filepath).database_table_name
-        self.engine = engine.lower().replace(' ', '')
+        self.engine = engine.lower().replace(" ", "")
 
     def _return_empty_file_object(self, object):
         """Return an empty object of the specified type."""
