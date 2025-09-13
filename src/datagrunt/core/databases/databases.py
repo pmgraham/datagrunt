@@ -1,7 +1,6 @@
 """Module for interfacing with databases."""
 
 # standard library
-import os
 import re
 from pathlib import Path
 
@@ -25,9 +24,9 @@ class DuckDBDatabase:
         Initialize the FileDatabase class.
 
         Args:
-            filepath (str): Path to the file.
+            filepath (str or Path): Path to the file.
         """
-        self.filepath = filepath
+        self.filepath = Path(filepath)
         self.database_filename = self._set_database_filename()
         self.database_table_name = self._set_database_table_name()
         self.database_connection = self._set_database_connection()
@@ -37,12 +36,12 @@ class DuckDBDatabase:
         Close the database connection and delete .db files after use.
         """
         self.database_connection.close()
-        if os.path.exists(self.database_filename):
-            os.remove(self.database_filename)
+        if Path(self.database_filename).exists():
+            Path(self.database_filename).unlink()
 
     def _format_filename_string(self):
         """Remove all non alphanumeric characters from filename."""
-        return re.sub(r"[^a-zA-Z0-9]", "", Path(self.filepath).stem)
+        return re.sub(r"[^a-zA-Z0-9]", "", self.filepath.stem)
 
     def _set_database_filename(self):
         """Return name of duckdb file created at runtime."""
@@ -71,9 +70,9 @@ class DuckDBQueries:
         Initialize the DuckDBQueries class.
 
         Args:
-            filepath (str): Path to the file.
+            filepath (str or Path): Path to the file.
         """
-        self.filepath = filepath
+        self.filepath = Path(filepath)
         self.delimiter = CSVDelimiter(filepath).delimiter
         self.database_table_name = DuckDBDatabase(filepath).database_table_name
 
