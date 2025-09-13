@@ -138,3 +138,25 @@ class TestCSVReader:
         df1 = reader_empty.to_dataframe()
         df2 = reader_empty.to_dataframe()
         assert df1 is not df2
+
+    def test_query_data_empty_and_blank_files(self, tmp_path):
+        """Test query_data method for empty and blank files."""
+        # Test empty file (0 bytes)
+        empty_file = tmp_path / "empty.csv"
+        empty_file.write_text("")
+
+        for engine in ALL_ENGINES:
+            reader_empty = CSVReader(str(empty_file), engine=engine)
+            result_empty = reader_empty.query_data("SELECT * FROM table")
+            assert isinstance(result_empty, list)
+            assert len(result_empty) == 0
+
+        # Test blank file (only whitespace and newlines)
+        blank_file = tmp_path / "blank.csv"
+        blank_file.write_text("\n   \n  \n")
+
+        for engine in ALL_ENGINES:
+            reader_blank = CSVReader(str(blank_file), engine=engine)
+            result_blank = reader_blank.query_data("SELECT * FROM table")
+            assert isinstance(result_blank, list)
+            assert len(result_blank) == 0
