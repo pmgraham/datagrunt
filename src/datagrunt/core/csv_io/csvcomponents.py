@@ -181,9 +181,9 @@ class CSVRows:
         """Initialize the CSVRows object.
 
         Args:
-            filepath: The path to the CSV file.
+            filepath (str or Path): The path to the CSV file.
         """
-        self.filepath = filepath
+        self.filepath = Path(filepath)
         self.first_row = self._get_first_row_from_file()
 
     def _get_first_row_from_file(self):
@@ -213,8 +213,12 @@ class CSVColumns:
     """Class for parsing CSV columns."""
 
     def __init__(self, filepath):
-        """Initialize the CSVColumns class."""
-        self.filepath = filepath
+        """Initialize the CSVColumns class.
+
+        Args:
+            filepath (str or Path): The path to the CSV file.
+        """
+        self.filepath = Path(filepath)
         self.columns = self._get_columns()
 
     def _get_columns(self):
@@ -253,9 +257,13 @@ class CSVColumnNameNormalizer:
     MULTI_UNDERSCORE_PATTERN = re.compile(r"_+")
 
     def __init__(self, filepath):
-        """Initialize the CSVColumnNameNormalizer with a filepath."""
-        self.filepath = filepath
-        self.columns_normalized = self._normalize_column_names(CSVColumns(filepath).columns)
+        """Initialize the CSVColumnNameNormalizer with a filepath.
+
+        Args:
+            filepath (str or Path): The path to the CSV file.
+        """
+        self.filepath = Path(filepath)
+        self.columns_normalized = self._normalize_column_names(CSVColumns(self.filepath).columns)
 
     def _normalize_single_column_name(self, column_name):
         """
@@ -345,14 +353,14 @@ class CSVComponents(FileProperties):
         Args:
             filepath (str or Path): Path to the CSV file.
         """
-        filepath = Path(filepath)
-        super().__init__(filepath)
-        self._delimiter = CSVDelimiter(filepath)
-        self._dialect = CSVDialect(filepath)
-        self._rows = CSVRows(filepath)
-        self._columns = CSVColumns(filepath)
-        self._normalizer = CSVColumnNameNormalizer(filepath)
-        self._sample = CSVStringSample(filepath)
+        super().__init__(filepath)  # Parent class handles Path conversion
+        # Use self.filepath (now a Path object) for all component instantiation
+        self._delimiter = CSVDelimiter(self.filepath)
+        self._dialect = CSVDialect(self.filepath)
+        self._rows = CSVRows(self.filepath)
+        self._columns = CSVColumns(self.filepath)
+        self._normalizer = CSVColumnNameNormalizer(self.filepath)
+        self._sample = CSVStringSample(self.filepath)
         self.delimiter = self._delimiter.delimiter
 
     @cached_property
