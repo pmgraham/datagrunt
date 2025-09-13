@@ -1,7 +1,7 @@
 """Factory module for creating CSV factory instances."""
 
 # standard library
-import os
+from pathlib import Path
 
 # third party libraries
 # local libraries
@@ -37,13 +37,13 @@ class CSVEngineFactory:
         Initialize the Engine Factory class.
 
         Args:
-            filepath (str): Path to the file to read.
+            filepath (str or Path): Path to the file to read.
             engine (str): type of engine to create by the factory.
         """
-        self.filepath = filepath
+        self.filepath = Path(filepath)
         self.engine = engine.lower().replace(" ", "")
         self.db_table = DuckDBQueries(self.filepath).database_table_name
-        if not os.path.exists(self.filepath):
+        if not self.filepath.exists():
             raise FileNotFoundError
         if self.engine not in CSVEngineProperties.valid_engines:
             raise ValueError(CSVEngineProperties.value_error_message.format(engine=self.engine))
