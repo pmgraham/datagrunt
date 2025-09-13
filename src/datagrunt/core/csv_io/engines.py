@@ -2,9 +2,9 @@
 
 # standard library
 import json
-import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Union
 
 # third party libraries
@@ -24,7 +24,7 @@ from datagrunt.core.databases import DuckDBQueries
 class CSVEngineProperties:
     """Base properties for CSV operations."""
 
-    filepath: str
+    filepath: Path
     dataframe_sample_rows: int = 20
     csv_export_filename: str = "output.csv"
     excel_export_filename: str = "output.xlsx"
@@ -46,13 +46,13 @@ class CSVBaseReaderEngine(ABC):
         """Initialize the CSVReader class.
 
         Args:
-            filepath (str): Path to the file to read.
+            filepath (str or Path): Path to the file to read.
         """
-        self.filepath = filepath
+        self.filepath = Path(filepath)
         self.queries = DuckDBQueries(self.filepath)
         self.db_table = DuckDBQueries(self.filepath).database_table_name
         self.delimiter = CSVDelimiter(self.filepath).delimiter
-        if not os.path.exists(self.filepath):
+        if not self.filepath.exists():
             raise FileNotFoundError
 
     @abstractmethod
@@ -114,12 +114,12 @@ class CSVBaseWriterEngine(ABC):
         Initialize the CSV Writer DuckDB Engine class.
 
         Args:
-            filepath (str): Path to the file to write.
+            filepath (str or Path): Path to the file to write.
         """
-        self.filepath = filepath
+        self.filepath = Path(filepath)
         self.queries = DuckDBQueries(self.filepath)
         self.db_table = DuckDBQueries(self.filepath).database_table_name
-        if not os.path.exists(self.filepath):
+        if not self.filepath.exists():
             raise FileNotFoundError
 
     @abstractmethod

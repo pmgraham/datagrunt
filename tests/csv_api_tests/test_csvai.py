@@ -1,6 +1,7 @@
 """This module contains tests for the CSV AI functionality."""
 
 import json
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
@@ -17,7 +18,7 @@ class TestCSVSchemaReportAIGenerated:
     def test_init_with_valid_parameters(self):
         """Test initialization with valid parameters."""
         csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine=ALL_AI_ENGINES[0], api_key="test_key")
-        assert csv_ai.filepath == "test.csv"
+        assert csv_ai.filepath == Path("test.csv")
         assert csv_ai.engine == ALL_AI_ENGINES[0]
         assert csv_ai.api_key == "test_key"
         assert csv_ai.kwargs == {}
@@ -188,7 +189,7 @@ class TestCSVSchemaReportAIGenerated:
         result = csv_ai.generate_csv_schema_report("model")
 
         assert result == {"schema": "data"}
-        mock_csv_sample_class.assert_called_once_with("test.csv")
+        mock_csv_sample_class.assert_called_once_with(Path("test.csv"))
         mock_prompts.CSV_SCHEMA_PROMPT.format.assert_called_once_with(csv_sample_string="sample,csv,data\n1,2,3")
 
     @patch("datagrunt.csv_api.csvai.AIEngineFactory")
@@ -262,7 +263,7 @@ class TestCSVSchemaReportAIGenerated:
     def test_filepath_attribute_access(self):
         """Test that filepath attribute can be accessed."""
         csv_ai = CSVSchemaReportAIGenerated(filepath="/path/to/test.csv", engine=ALL_AI_ENGINES[0], api_key="test_key")
-        assert csv_ai.filepath == "/path/to/test.csv"
+        assert csv_ai.filepath == Path("/path/to/test.csv")
 
     def test_multiple_engine_name_normalizations(self):
         """Test various engine name normalizations."""

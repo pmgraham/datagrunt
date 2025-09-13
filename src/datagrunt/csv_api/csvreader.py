@@ -4,6 +4,7 @@ objects.
 """
 
 # standard library
+from pathlib import Path
 
 # third party libraries
 import polars as pl
@@ -20,10 +21,11 @@ class CSVReader(CSVComponents):
         Initialize the CSV Reader class.
 
         Args:
-            filepath (str): Path to the file to read.
+            filepath (str or Path): Path to the file to read.
             engine (str, default 'polars'): Determines which reader engine
             class to instantiate.
         """
+        filepath = Path(filepath)
         super().__init__(filepath)
         self.db_table = DuckDBQueries(self.filepath).database_table_name
         self.engine = engine.lower().replace(" ", "")
