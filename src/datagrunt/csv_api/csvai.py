@@ -2,6 +2,7 @@
 
 # standard library imports
 import json
+from pathlib import Path
 
 # local imports
 from datagrunt.core import AIEngineFactory, AIEngineProperties, CSVStringSample, prompts
@@ -12,7 +13,7 @@ class CSVSchemaReportAIGenerated:
 
     def __init__(self, filepath, engine, api_key=None, **kwargs):
         """Initialize the CSV Schema Report class."""
-        self.filepath = filepath
+        self.filepath = Path(filepath)
         self.engine = engine.lower().replace(" ", "")
         self.api_key = api_key
         self.kwargs = kwargs
