@@ -72,7 +72,6 @@ class CSVDelimiter:
         Args:
             filepath (str or Path): The path to the CSV file.
         """
-        super().__init__()
         filepath = Path(filepath)
         self.file_properties = FileProperties(filepath)
         self.first_row = CSVRows(filepath).first_row
