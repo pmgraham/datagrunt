@@ -5,6 +5,7 @@ import csv
 import re
 from collections import Counter, OrderedDict
 from functools import cached_property
+from pathlib import Path
 
 # third party libraries
 import polars as pl
@@ -23,9 +24,9 @@ class CSVStringSample:
         """Initialize the CSVString object.
 
         Args:
-            filepath (str): The path to the CSV file.
+            filepath (str or Path): The path to the CSV file.
         """
-        self.filepath = filepath
+        self.filepath = Path(filepath)
 
     @cached_property
     def csv_string_sample(self):
@@ -66,12 +67,13 @@ class CSVDelimiter:
     DEFAULT_TAB_DELIMITER = "\t"
 
     def __init__(self, filepath):
-        super().__init__()
         """Initialize the CSVDelimiter class.
 
         Args:
-            filepath (str): The path to the CSV file.
+            filepath (str or Path): The path to the CSV file.
         """
+        super().__init__()
+        filepath = Path(filepath)
         self.file_properties = FileProperties(filepath)
         self.first_row = CSVRows(filepath).first_row
         self.delimiter = self.infer_csv_file_delimiter()
@@ -119,9 +121,9 @@ class CSVDialect:
         """Initialize the CSVDialect object.
 
         Args:
-            filepath (str): The path to the CSV file.
+            filepath (str or Path): The path to the CSV file.
         """
-        self.filepath = filepath
+        self.filepath = Path(filepath)
         self.dialect = self._get_csv_dialect()
 
     def _get_csv_dialect(self):
@@ -341,8 +343,9 @@ class CSVComponents(FileProperties):
         """Initialize the CSVComponents object.
 
         Args:
-            filepath (str): Path to the CSV file.
+            filepath (str or Path): Path to the CSV file.
         """
+        filepath = Path(filepath)
         super().__init__(filepath)
         self._delimiter = CSVDelimiter(filepath)
         self._dialect = CSVDialect(filepath)

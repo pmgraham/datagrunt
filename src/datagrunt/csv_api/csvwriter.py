@@ -1,9 +1,9 @@
 """Module for writing CSV files and converting to different file formats."""
 
 # standard library
+from pathlib import Path
 
 # third party libraries
-
 # local libraries
 from datagrunt.core import CSVComponents, CSVEngineFactory, DuckDBQueries
 
@@ -19,10 +19,11 @@ class CSVWriter(CSVComponents):
         Initialize the CSV Writer class.
 
         Args:
-            filepath (str): Path to the file to write.
+            filepath (str or Path): Path to the file to write.
             engine (str, default 'duckdb'): Determines which writer engine
             class to instantiate.
         """
+        filepath = Path(filepath)
         super().__init__(filepath)
         self.db_table = DuckDBQueries(self.filepath).database_table_name
         self.engine = engine.lower().replace(" ", "")
