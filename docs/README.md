@@ -11,6 +11,7 @@ simplicity and ease of use. We will extend functionality where it makes sense to
 ### Key Features
 
 - **Intelligent Delimiter Inference:** Datagrunt automatically detects and applies the correct delimiter for your CSV files.
+- **Path Object Support:** Full support for both string paths and `pathlib.Path` objects for modern, cross-platform file handling.
 - **Multiple Processing Engines:** Choose from three powerful engines - [DuckDB](https://duckdb.org), [Polars](https://pola.rs), and [PyArrow](https://arrow.apache.org/docs/python/) - to handle your data processing needs.
 - **Flexible Data Transformation:** Easily convert your processed CSV data into various formats including CSV, Excel, JSON, JSONL, and Parquet.
 - **AI-Powered Schema Analysis:** Use Google's Gemini models to automatically generate detailed schema reports for your CSV files, including data types, column classifications, and data quality checks.
@@ -86,11 +87,58 @@ pip install datagrunt
 # Getting Started with Datagrunt
 This section provides a comprehensive guide to using Datagrunt effectively. Here's what you'll learn:
 
+- **[Path Object Support](#path-object-support)** - Modern file path handling with pathlib
 - **[Datagrunt Engines](#datagrunt-engines)** - Choose the right engine for your needs
 - **[Column Name Normalization](#normalizing-column-names)** - Clean and standardize column names
 - **[AI-Powered Analysis](#artificial-intelligence-features)** - Generate schema reports with AI
 - **[Usage Examples](#usage-examples)** - Practical code examples
 - **[Primary Classes](#primary-classes)** - Detailed API reference
+
+## Path Object Support
+
+Datagrunt fully supports both string paths and `pathlib.Path` objects, providing modern, cross-platform file handling capabilities. All classes (`CSVReader`, `CSVWriter`, `CSVSchemaReportAIGenerated`) seamlessly accept either input type.
+
+### Benefits of Path Objects
+- **Cross-platform compatibility**: Automatic handling of path separators (`/` vs `\`)
+- **Better readability**: Intuitive path operations like `path.stem`, `path.suffix`
+- **Type safety**: Clear distinction between strings and paths
+- **Modern Python standards**: Following current best practices
+
+### Usage Examples
+
+```python
+from datagrunt import CSVReader, CSVWriter
+from pathlib import Path
+
+# All of these work identically
+csv_reader_str = CSVReader('data/file.csv')                    # String path
+csv_reader_path = CSVReader(Path('data/file.csv'))             # Path object
+csv_reader_resolved = CSVReader(Path('data').resolve() / 'file.csv')  # Complex Path
+
+# Writers work the same way
+csv_writer = CSVWriter(Path('output/results.csv'))
+
+# Mixing is fine too
+input_path = Path('input.csv')
+reader = CSVReader(input_path)
+writer = CSVWriter('output.csv')  # String path
+```
+
+### Internal Conversion
+When you pass a string path to any Datagrunt class, it's automatically converted to a `Path` object internally:
+
+```python
+from datagrunt import CSVReader
+from pathlib import Path
+
+reader = CSVReader('my_file.csv')  # String input
+print(type(reader.filepath))       # <class 'pathlib.PosixPath'> (or WindowsPath)
+print(reader.filepath.name)        # 'my_file.csv'
+print(reader.filepath.suffix)      # '.csv'
+```
+
+### Backward Compatibility
+✅ **Fully backward compatible** - all existing string-based code continues to work unchanged while gaining the benefits of Path objects under the hood.
 
 ## Datagrunt Engines
 
@@ -179,9 +227,10 @@ Currently there is only one class that supports integration with Google Gemini: 
 ### Reading and Querying CSV Data
 ```python
 from datagrunt import CSVReader
+from pathlib import Path
 
-# Load your CSV file
-csv_file = 'examples/data/electric_vehicle_population_data.csv'
+# Load your CSV file (accepts both string and Path objects)
+csv_file = Path('examples/data/electric_vehicle_population_data.csv')
 
 # Choose your engine: 'polars' (default), 'duckdb', or 'pyarrow'
 reader = CSVReader(csv_file, engine='duckdb')
@@ -262,10 +311,11 @@ print(df)
 ### Generating an AI-Powered Schema Report
 ```python
 from datagrunt import CSVSchemaReportAIGenerated
+from pathlib import Path
 import os
 
-# Load your CSV file
-csv_file = 'examples/data/electric_vehicle_population_data.csv'
+# Load your CSV file (accepts both string and Path objects)
+csv_file = Path('examples/data/electric_vehicle_population_data.csv')
 
 # --- Option 1: Use a Google Gemini API Key ---
 # Make sure to set your API Key as an environment variable
@@ -460,9 +510,10 @@ This will produce a detailed JSON report analyzing the CSV's schema, data types,
 ### Using the PyArrow Engine
 ```python
 from datagrunt import CSVReader, CSVWriter
+from pathlib import Path
 
-# Reading with PyArrow engine
-reader = CSVReader('path/to/file.csv', engine='pyarrow')
+# Reading with PyArrow engine (accepts both strings and Path objects)
+reader = CSVReader(Path('path/to/file.csv'), engine='pyarrow')
 
 # Get data as PyArrow table (native format)
 arrow_table = reader.to_arrow_table(normalize_columns=True)
@@ -472,7 +523,7 @@ polars_df = reader.to_dataframe()  # Returns Polars DataFrame
 dict_list = reader.to_dicts()      # Returns list of dictionaries
 
 # Writing with PyArrow engine
-writer = CSVWriter('path/to/file.csv', engine='pyarrow')
+writer = CSVWriter(Path('path/to/file.csv'), engine='pyarrow')
 
 # Export to various formats with PyArrow's optimized writers
 writer.write_parquet('output.parquet')  # Efficient native Parquet export
@@ -486,9 +537,10 @@ Datagrunt can be combined with other libraries. For example, you could use Datag
 
 ```python
 from datagrunt import CSVReader
+from pathlib import Path
 import pandas as pd
 
-reader = CSVReader('path/to/file.csv')
+reader = CSVReader(Path('path/to/file.csv'))
 df = pd.read_csv(reader.filepath, sep=reader.delimiter)  # filepath and delimiter are CSVReader attributes
 ```
 
@@ -497,9 +549,10 @@ df = pd.read_csv(reader.filepath, sep=reader.delimiter)  # filepath and delimite
 Sometimes, the delimiter may not be correctly identified by Datagrunt. In such cases, you can reassign the delimiter attribute to correct it.
 ```python
 from datagrunt import CSVReader
+from pathlib import Path
 import pandas as pd
 
-reader = CSVReader('path/to/file.csv')
+reader = CSVReader(Path('path/to/file.csv'))
 
 # Let's assume the delimiter was incorrectly inferred as a space. Reassign it to correct the issue.
 reader.delimiter = ','
@@ -512,17 +565,20 @@ By updating the delimiter attribute, you ensure the `CSVReader` object will read
 Datagrunt provides three primary classes for interacting with data: `CSVReader`, `CSVWriter`, and `CSVSchemaReportAIGenerated`. These classes are designed to simplify the process of reading, writing, and analyzing CSV files.
 
 ### CSVReader
-The `CSVReader` class is used to read data from a CSV file. It provides a simple interface for reading data from a CSV file and converting it into various formats. You instantiate the `CSVReader` class as follows:
+The `CSVReader` class is used to read data from a CSV file. It accepts both string paths and `pathlib.Path` objects, providing a simple interface for reading data from a CSV file and converting it into various formats. You instantiate the `CSVReader` class as follows:
 ```python
 from datagrunt import CSVReader
-reader = CSVReader('path/to/file.csv')
+from pathlib import Path
+
+reader = CSVReader('path/to/file.csv')          # String path
+reader = CSVReader(Path('path/to/file.csv'))    # Path object
 ```
 
 You may optionally specify the engine to use for reading the CSV file. The three options are `polars` (default), `duckdb`, and `pyarrow`.
 ```python
-reader = CSVReader('path/to/file.csv', engine='duckdb')   # DuckDB engine
-reader = CSVReader('path/to/file.csv', engine='pyarrow')  # PyArrow engine
-reader = CSVReader('path/to/file.csv')                    # Default: Polars engine
+reader = CSVReader(Path('path/to/file.csv'), engine='duckdb')   # DuckDB engine
+reader = CSVReader('path/to/file.csv', engine='pyarrow')        # PyArrow engine
+reader = CSVReader(Path('path/to/file.csv'))                    # Default: Polars engine
 ```
 
 The primary methods of the `CSVReader` class are:
@@ -533,13 +589,15 @@ The primary methods of the `CSVReader` class are:
 - `query_data(sql_query, normalize_columns=False)`: Executes a SQL query on the data in the CSV file.
 
 ### CSVWriter
-The `CSVWriter` class is used to convert and export CSV data to various file formats. It supports three engines: `duckdb` (default), `polars`, and `pyarrow`.
+The `CSVWriter` class is used to convert and export CSV data to various file formats. It accepts both string paths and `pathlib.Path` objects and supports three engines: `duckdb` (default), `polars`, and `pyarrow`.
 
 ```python
 from datagrunt import CSVWriter
-writer = CSVWriter('path/to/file.csv', engine='duckdb')   # Default: DuckDB engine
-writer = CSVWriter('path/to/file.csv', engine='polars')   # Polars engine
-writer = CSVWriter('path/to/file.csv', engine='pyarrow')  # PyArrow engine
+from pathlib import Path
+
+writer = CSVWriter(Path('path/to/file.csv'), engine='duckdb')   # Default: DuckDB engine
+writer = CSVWriter('path/to/file.csv', engine='polars')        # Polars engine
+writer = CSVWriter(Path('path/to/file.csv'), engine='pyarrow') # PyArrow engine
 ```
 
 The primary methods of the `CSVWriter` class are:
@@ -696,11 +754,45 @@ The current implementation leveraging an LLM to evaluate a CSV file is a simple 
 
 AI Agents may be added in the future, but this is currently being debated among the maintainers of Datagrunt. We will post more details on this decision in the future.
 
+## Migration Guide
+
+### Path Object Changes (Version 2.1.1+)
+
+As of version 2.1.0, Datagrunt uses `pathlib.Path` objects internally for all file operations, providing better cross-platform compatibility and more intuitive path handling.
+
+#### What Changed
+- All filepath parameters now accept both string paths and `pathlib.Path` objects
+- Internally, string paths are automatically converted to `Path` objects
+- The `filepath` attribute on all classes now returns a `Path` object instead of a string
+
+#### Backward Compatibility
+✅ **No breaking changes** - all existing code continues to work:
+
+```python
+# This still works exactly the same
+reader = CSVReader('my_file.csv')
+writer = CSVWriter('output.csv')
+```
+
+#### What You Might Notice
+If you access the `filepath` attribute directly, it now returns a `Path` object:
+
+```python
+reader = CSVReader('my_file.csv')
+print(type(reader.filepath))  # <class 'pathlib.PosixPath'> (was <class 'str'>)
+print(reader.filepath.name)   # 'my_file.csv' - now available directly
+```
+
+#### Benefits
+- Better cross-platform path handling
+- More intuitive path operations (`path.name`, `path.suffix`, etc.)
+- No changes required to existing code
+
 ## File and CSV Attributes
 Exposed in both the `CSVReader` and `CSVWriter` classes are a number of attributes that allow you to access and manipulate file and CSV-specific information:
 
 **File Attributes:**
-- `filepath`: The absolute path to the file.
+- `filepath`: The `pathlib.Path` object representing the file path.
 - `filename`: The name of the file.
 - `extension`: The file extension (e.g., `.csv`).
 - `size_in_bytes`, `size_in_kb`, `size_in_mb`, `size_in_gb`, `size_in_tb`: File size in various units.
