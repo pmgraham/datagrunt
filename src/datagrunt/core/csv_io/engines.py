@@ -208,7 +208,8 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         Returns:
             A PyArrow table.
         """
-        return self.queries.create_table(normalize_columns).arrow()
+        reader = self.queries.create_table(normalize_columns).arrow()
+        return reader.read_all()
 
     def to_dicts(self, normalize_columns=False):
         """
