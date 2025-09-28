@@ -8,6 +8,7 @@ from pathlib import Path
 
 # third party libraries
 import polars as pl
+import pyarrow as pa
 
 # local libraries
 from datagrunt.core import CSVComponents, CSVEngineFactory, DuckDBQueries
@@ -65,7 +66,7 @@ class CSVReader(CSVComponents):
             A PyArrow table.
         """
         if self.is_empty or self.is_blank:
-            return self._return_empty_file_object(pl.DataFrame().to_arrow())
+            return self._return_empty_file_object(pa.Table.from_pydict({}))
         return self._create_reader().to_arrow_table(normalize_columns)
 
     def to_dicts(self, normalize_columns=False):
