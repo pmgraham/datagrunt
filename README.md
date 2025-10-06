@@ -158,7 +158,7 @@ print(report)  # Detailed JSON schema with data types, classifications, and more
 ## Full Documentation
 
 For complete documentation, detailed examples, and advanced usage patterns, see:
-📖 **[Complete Documentation](https://www.datagrunt.io)**
+📖 **[Complete Documentation](https://www.datagrunt.io/docs)**
 
 ## License
 
