@@ -10,11 +10,7 @@ from datagrunt import CSVReader
 ALL_ENGINES = ["polars", "duckdb", "pyarrow"]
 
 # Engine-specific expected return types for query_data method
-ENGINE_QUERY_TYPES = {
-    "duckdb": DuckDBPyRelation,
-    "polars": pl.DataFrame,
-    "pyarrow": pl.DataFrame
-}
+ENGINE_QUERY_TYPES = {"duckdb": DuckDBPyRelation, "polars": pl.DataFrame, "pyarrow": pl.DataFrame}
 
 
 class TestCSVReader:

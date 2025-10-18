@@ -44,7 +44,9 @@ class TestCrossEngineIntegration:
         """Test that normalization produces identical results across all engines."""
         # Create test file with problematic column names
         test_file = tmp_path / "normalization_test.csv"
-        test_file.write_text("First Name,2nd Column,E-mail Address,Phone #,Date/Time\nJohn,A,john@test.com,555-1234,2023-01-01")
+        test_file.write_text(
+            "First Name,2nd Column,E-mail Address,Phone #,Date/Time\nJohn,A,john@test.com,555-1234,2023-01-01"
+        )
 
         normalized_columns = {}
         normalized_data = {}
@@ -187,7 +189,7 @@ class TestCrossEngineIntegration:
 "Jané Smith","Café item with àccénts","Unicode: ñ, é, ü"
 "Comma,Field","Semicolon;Field","Pipe|Field"
 "Tab	Field","Quote""Field","Mixed: àéîôü"'''
-        special_file.write_text(special_content, encoding='utf-8')
+        special_file.write_text(special_content, encoding="utf-8")
 
         results_by_engine = {}
         successful_engines = []
@@ -197,29 +199,27 @@ class TestCrossEngineIntegration:
                 reader = CSVReader(str(special_file), engine=engine)
                 data = reader.to_dicts()
                 results_by_engine[engine] = {
-                    'success': True,
-                    'row_count': len(data),
-                    'first_row': data[0] if data else None
+                    "success": True,
+                    "row_count": len(data),
+                    "first_row": data[0] if data else None,
                 }
                 successful_engines.append(engine)
             except Exception as e:
-                results_by_engine[engine] = {
-                    'success': False,
-                    'error': str(e)
-                }
+                results_by_engine[engine] = {"success": False, "error": str(e)}
 
         # At least one engine should successfully parse the file
         assert len(successful_engines) > 0, f"No engines could parse the special characters file: {results_by_engine}"
 
         # Among successful engines, row counts should be consistent
         if len(successful_engines) > 1:
-            reference_count = results_by_engine[successful_engines[0]]['row_count']
+            reference_count = results_by_engine[successful_engines[0]]["row_count"]
             for engine in successful_engines[1:]:
-                assert results_by_engine[engine]['row_count'] == reference_count, \
+                assert results_by_engine[engine]["row_count"] == reference_count, (
                     f"Engine {engine} had different row count than reference"
+                )
 
         # Log any engine failures for debugging (but don't fail the test)
-        failed_engines = [eng for eng in ALL_ENGINES if not results_by_engine[eng]['success']]
+        failed_engines = [eng for eng in ALL_ENGINES if not results_by_engine[eng]["success"]]
         if failed_engines:
             print(f"Note: Engines {failed_engines} had limitations with this special characters test")
             for engine in failed_engines:
@@ -228,12 +228,12 @@ class TestCrossEngineIntegration:
     def test_empty_and_edge_case_consistency(self, tmp_path):
         """Test that all engines handle edge cases consistently."""
         test_cases = {
-            'completely_empty': '',
-            'only_header': 'col1,col2,col3\n',
-            'header_with_empty_row': 'col1,col2,col3\n,,\n',
-            'whitespace_only': '   \n  \n  ',
-            'single_column': 'value\ntest\n',
-            'trailing_commas': 'col1,col2,\nval1,val2,\n'
+            "completely_empty": "",
+            "only_header": "col1,col2,col3\n",
+            "header_with_empty_row": "col1,col2,col3\n,,\n",
+            "whitespace_only": "   \n  \n  ",
+            "single_column": "value\ntest\n",
+            "trailing_commas": "col1,col2,\nval1,val2,\n",
         }
 
         for case_name, content in test_cases.items():
@@ -246,26 +246,24 @@ class TestCrossEngineIntegration:
                     reader = CSVReader(str(test_file), engine=engine)
                     df = reader.to_dataframe()
                     results[engine] = {
-                        'success': True,
-                        'rows': len(df),
-                        'cols': len(df.columns) if len(df) > 0 or df.shape[1] > 0 else 0,
-                        'shape': df.shape
+                        "success": True,
+                        "rows": len(df),
+                        "cols": len(df.columns) if len(df) > 0 or df.shape[1] > 0 else 0,
+                        "shape": df.shape,
                     }
                 except Exception as e:
-                    results[engine] = {
-                        'success': False,
-                        'error': str(e)
-                    }
+                    results[engine] = {"success": False, "error": str(e)}
 
             # All engines should handle the case (success or consistent failure)
-            success_states = [r['success'] for r in results.values()]
+            success_states = [r["success"] for r in results.values()]
             if any(success_states):  # If any engine succeeds, check consistency
-                successful_engines = [eng for eng, res in results.items() if res['success']]
+                successful_engines = [eng for eng, res in results.items() if res["success"]]
                 if len(successful_engines) > 1:
                     reference = results[successful_engines[0]]
                     for engine in successful_engines[1:]:
-                        assert results[engine]['shape'] == reference['shape'], \
+                        assert results[engine]["shape"] == reference["shape"], (
                             f"Case {case_name}: Engine {engine} shape mismatch"
+                        )
 
 
 class TestAdvancedDataScenarios:
@@ -289,78 +287,73 @@ class TestAdvancedDataScenarios:
 
             # Test multiple output formats
             conversion_results[engine] = {
-                'dataframe': reader.to_dataframe(),
-                'dicts': reader.to_dicts(),
-                'arrow': reader.to_arrow_table()
+                "dataframe": reader.to_dataframe(),
+                "dicts": reader.to_dicts(),
+                "arrow": reader.to_arrow_table(),
             }
 
         # Verify consistent row counts across engines and formats
-        reference_row_count = len(conversion_results[ALL_ENGINES[0]]['dicts'])
+        reference_row_count = len(conversion_results[ALL_ENGINES[0]]["dicts"])
         for engine in ALL_ENGINES:
-            assert len(conversion_results[engine]['dicts']) == reference_row_count
-            assert len(conversion_results[engine]['dataframe']) == reference_row_count
-            assert conversion_results[engine]['arrow'].num_rows == reference_row_count
+            assert len(conversion_results[engine]["dicts"]) == reference_row_count
+            assert len(conversion_results[engine]["dataframe"]) == reference_row_count
+            assert conversion_results[engine]["arrow"].num_rows == reference_row_count
 
     def test_query_consistency_across_engines(self, tmp_path):
-            """Test that SQL queries produce consistent results across engines."""
-            # Create a dataset suitable for querying
-            query_file = tmp_path / "query_test.csv"
-            query_content = """id,category,amount,active
+        """Test that SQL queries produce consistent results across engines."""
+        # Create a dataset suitable for querying
+        query_file = tmp_path / "query_test.csv"
+        query_content = """id,category,amount,active
     1,A,100.0,true
     2,B,200.5,false
     3,A,150.0,true
     4,C,75.25,true
     5,B,300.0,false"""
-            query_file.write_text(query_content)
+        query_file.write_text(query_content)
 
-            # Test queries that should work across all engines
-            test_queries = [
-                "SELECT COUNT(*) as count FROM {table}",
-                "SELECT category, COUNT(*) as count FROM {table} GROUP BY category",
-                "SELECT * FROM {table} WHERE active = 'true'",
-                "SELECT AVG(CAST(amount AS FLOAT)) as avg_amount FROM {table}",
-            ]
+        # Test queries that should work across all engines
+        test_queries = [
+            "SELECT COUNT(*) as count FROM {table}",
+            "SELECT category, COUNT(*) as count FROM {table} GROUP BY category",
+            "SELECT * FROM {table} WHERE active = 'true'",
+            "SELECT AVG(CAST(amount AS FLOAT)) as avg_amount FROM {table}",
+        ]
 
-            query_results = {}
+        query_results = {}
 
-            for engine in ALL_ENGINES:
-                reader = CSVReader(str(query_file), engine=engine)
-                query_results[engine] = {}
+        for engine in ALL_ENGINES:
+            reader = CSVReader(str(query_file), engine=engine)
+            query_results[engine] = {}
 
-                for query_template in test_queries:
-                    query = query_template.format(table=reader.db_table)
-                    try:
-                        result = reader.query_data(query)
-                        # Convert result to a comparable format
-                        if hasattr(result, 'pl') and callable(getattr(result, 'pl', None)):  # DuckDB relation
-                            result_df = result.pl()
-                        elif hasattr(result, 'columns'):  # DataFrame-like object
-                            result_df = result
-                        else:  # Could be list or other format
-                            # Convert to polars DataFrame for consistent handling
-                            result_df = pl.DataFrame(result) if isinstance(result, list) else result
-
-                        query_results[engine][query_template] = {
-                            'success': True,
-                            'rows': len(result_df),
-                            'columns': list(result_df.columns),
-                        }
-                    except Exception as e:
-                        query_results[engine][query_template] = {
-                            'success': False,
-                            'error': str(e)
-                        }
-
-            # Verify query results are consistent where successful
             for query_template in test_queries:
-                successful_engines = [
-                    eng for eng in ALL_ENGINES
-                    if query_results[eng][query_template]['success']
-                ]
+                query = query_template.format(table=reader.db_table)
+                try:
+                    result = reader.query_data(query)
+                    # Convert result to a comparable format
+                    if hasattr(result, "pl") and callable(getattr(result, "pl", None)):  # DuckDB relation
+                        result_df = result.pl()
+                    elif hasattr(result, "columns"):  # DataFrame-like object
+                        result_df = result
+                    else:  # Could be list or other format
+                        # Convert to polars DataFrame for consistent handling
+                        result_df = pl.DataFrame(result) if isinstance(result, list) else result
 
-                if len(successful_engines) > 1:
-                    reference = query_results[successful_engines[0]][query_template]
-                    for engine in successful_engines[1:]:
-                        result = query_results[engine][query_template]
-                        assert result['rows'] == reference['rows'], \
-                            f"Query row count mismatch for {engine}: {query_template}"
+                    query_results[engine][query_template] = {
+                        "success": True,
+                        "rows": len(result_df),
+                        "columns": list(result_df.columns),
+                    }
+                except Exception as e:
+                    query_results[engine][query_template] = {"success": False, "error": str(e)}
+
+        # Verify query results are consistent where successful
+        for query_template in test_queries:
+            successful_engines = [eng for eng in ALL_ENGINES if query_results[eng][query_template]["success"]]
+
+            if len(successful_engines) > 1:
+                reference = query_results[successful_engines[0]][query_template]
+                for engine in successful_engines[1:]:
+                    result = query_results[engine][query_template]
+                    assert result["rows"] == reference["rows"], (
+                        f"Query row count mismatch for {engine}: {query_template}"
+                    )
