@@ -360,3 +360,59 @@ class TestEngines:
             if engine_class is None:
                 raise ValueError("Unsupported reader engine: nonexistent")
         assert "Unsupported reader engine: nonexistent" in str(exc_info.value)
+
+    def test_factory_create_reader_with_invalid_engine_fallback(self, sample_csv):
+        """Test create_reader error handling when engine is somehow invalid after init."""
+        factory = CSVEngineFactory(sample_csv, "duckdb")
+        # Simulate a scenario where engine is corrupted after initialization
+        factory.engine = "invalid_engine_not_in_dict"
+
+        with pytest.raises(ValueError) as exc_info:
+            factory.create_reader()
+        assert "Unsupported reader engine: invalid_engine_not_in_dict" in str(exc_info.value)
+
+    def test_factory_create_writer_with_invalid_engine_fallback(self, sample_csv):
+        """Test create_writer error handling when engine is somehow invalid after init."""
+        factory = CSVEngineFactory(sample_csv, "duckdb")
+        # Simulate a scenario where engine is corrupted after initialization
+        factory.engine = "invalid_engine_not_in_dict"
+
+        with pytest.raises(ValueError) as exc_info:
+            factory.create_writer()
+        assert "Unsupported reader engine: invalid_engine_not_in_dict" in str(exc_info.value)
+
+    def test_single_value_column_series_handling(self, tmp_path):
+        """Test that single column files with single value are properly converted from Series to DataFrame."""
+        # Create a single column, single value CSV - this is likely to return a Series
+        single_value_csv = tmp_path / "single_value.csv"
+        single_value_csv.write_text("value\n42")
+
+        # Test PyArrow engine specifically as it may return Series for single columns
+        factory = CSVEngineFactory(str(single_value_csv), "pyarrow")
+        reader = factory.create_reader()
+
+        # Get sample should handle Series to DataFrame conversion
+        reader.get_sample()
+
+        # to_dataframe should also handle Series to DataFrame conversion
+        df = reader.to_dataframe()
+        assert isinstance(df, pl.DataFrame)
+        assert df.shape == (1, 1)  # 1 row, 1 column
+
+    def test_duckdb_column_normalization_complex(self, tmp_path):
+        """Test DuckDB _normalize_relation method with complex column names."""
+        # Create CSV with special characters that need normalization
+        complex_csv = tmp_path / "complex_cols.csv"
+        complex_csv.write_text("First Name,Last Name,E-mail,Phone#\nJohn,Doe,john@test.com,555-1234")
+
+        factory = CSVEngineFactory(str(complex_csv), "duckdb")
+        reader = factory.create_reader()
+
+        # Query with normalization should use _normalize_relation
+        result = reader.query_data(f"SELECT * FROM {reader.db_table}", normalize_columns=True)
+        # Convert to DataFrame to check column names
+        df = result.pl()
+        assert "first_name" in df.columns
+        assert "last_name" in df.columns
+        assert "e_mail" in df.columns
+        assert "phone" in df.columns
