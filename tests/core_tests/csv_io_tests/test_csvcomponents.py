@@ -198,6 +198,22 @@ class TestCSVDialect:
         dialect = CSVDialect(str(csv_file))
         assert dialect.quotechar == '"'  # Default fallback
         assert dialect.escapechar is None
+        assert dialect.doublequote is False  # Default when dialect is None
+        assert dialect.skipinitialspace is False  # Default when dialect is None
+        assert dialect.quoting == "quote minimal"  # Default when dialect is None
+
+    def test_dialect_properties_with_valid_csv(self, tmp_path):
+        """Test all dialect properties with a properly formatted CSV."""
+        csv_file = tmp_path / "valid.csv"
+        csv_file.write_text('"Name","Age"\n"John",25\n"Jane",30')
+
+        dialect = CSVDialect(str(csv_file))
+        # Test all properties are accessible
+        assert dialect.quotechar == '"'
+        assert isinstance(dialect.doublequote, bool)
+        assert isinstance(dialect.skipinitialspace, bool)
+        assert dialect.quoting in ["no quoting", "quote all", "quote minimal", "quote non-numeric"]
+        assert dialect.newline_delimiter in ["\r\n", "\n", "\r"]
 
 
 class TestCSVComponents:
