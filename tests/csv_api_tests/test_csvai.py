@@ -64,8 +64,9 @@ class TestCSVSchemaReportAIGenerated:
         mock_factory.create_engine.return_value = mock_engine
         mock_factory_class.return_value = mock_factory
 
-        csv_ai = CSVSchemaReportAIGenerated(filepath="test.csv", engine=ALL_AI_ENGINES[0],
-                api_key="test_key", temperature=0.7)
+        csv_ai = CSVSchemaReportAIGenerated(
+            filepath="test.csv", engine=ALL_AI_ENGINES[0], api_key="test_key", temperature=0.7
+        )
 
         result = csv_ai._create_engine()
 
