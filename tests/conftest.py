@@ -1,5 +1,7 @@
 """This module contains shared fixtures for pytest."""
 
+import shutil
+
 import pytest
 
 from datagrunt.core import CSVEngineFactory
@@ -87,3 +89,44 @@ def sample_csv_files(tmp_path):
         created_files[filename] = str(file_path)
 
     return created_files
+
+
+@pytest.fixture
+def sample_pdf(tmp_path):
+    """Create a one-page PDF with native text and an embedded image."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)  # US Letter
+    page.insert_text((72, 72), "Quarterly Report", fontsize=24)  # header (large)
+    # Several body lines at 11pt so the median font size is small and the 24pt
+    # title is correctly classified as a header (header threshold = median*1.6).
+    page.insert_text((72, 120), "This is body text for testing.", fontsize=11)
+    page.insert_text((72, 140), "Body line two for the report.", fontsize=11)
+    page.insert_text((72, 160), "Body line three with details.", fontsize=11)
+    page.insert_text((72, 180), "Body line four wraps up the text.", fontsize=11)
+
+    # Build a 100x100 red PNG and embed it on the page.
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 100, 100))
+    pix.set_rect(pix.irect, (255, 0, 0))
+    img_bytes = pix.tobytes("png")
+    page.insert_image(pymupdf.Rect(72, 200, 172, 300), stream=img_bytes)
+
+    pdf_path = tmp_path / "report.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+    return str(pdf_path)
+
+
+@pytest.fixture
+def empty_pdf(tmp_path):
+    """Create a 0-byte PDF file."""
+    pdf_path = tmp_path / "empty.pdf"
+    pdf_path.touch()
+    return str(pdf_path)
+
+
+@pytest.fixture
+def tesseract_available():
+    """Return True if the tesseract system binary is on PATH."""
+    return shutil.which("tesseract") is not None
