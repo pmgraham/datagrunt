@@ -12,6 +12,7 @@ from datagrunt.core.pdf_io.factories import PDFEngineFactory
 from datagrunt.core.pdf_io.pdfcomponents import (
     PDFComponents,
     combine_pages,
+    dedupe_document_images,
     flatten_document_elements,
     parse_document,
     parse_page,
@@ -23,6 +24,7 @@ __all__ = [
     "parse_document",
     "combine_pages",
     "flatten_document_elements",
+    "dedupe_document_images",
     "PDFEngineProperties",
     "PDFBaseReaderEngine",
     "PDFBaseWriterEngine",
