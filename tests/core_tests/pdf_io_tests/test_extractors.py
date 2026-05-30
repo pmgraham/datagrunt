@@ -59,3 +59,29 @@ class TestExtractTables:
     def test_out_of_range_page(self, sample_pdf):
         result = extractors.extract_tables(sample_pdf, 99)
         assert result["status"] == "error"
+
+
+class TestExtractImages:
+    """Test suite for extract_images."""
+
+    def test_metadata_only_when_no_output_dir(self, sample_pdf):
+        result = extractors.extract_images(sample_pdf, 0)
+        assert result["status"] == "success"
+        assert len(result["images"]) >= 1
+        img = result["images"][0]
+        assert img["file_path"] is None
+        assert img["width_px"] >= 40 and img["height_px"] >= 40
+        assert "format" in img
+        assert set(img["bbox"]) == {"x", "y", "w", "h"}
+
+    def test_writes_files_when_output_dir_given(self, sample_pdf, tmp_path):
+        out = tmp_path / "imgs"
+        result = extractors.extract_images(
+            sample_pdf, 0, output_dir=str(out), name_prefix="report"
+        )
+        assert result["status"] == "success"
+        img = result["images"][0]
+        assert img["file_path"] is not None
+        import os
+        assert os.path.isfile(img["file_path"])
+        assert os.path.basename(img["file_path"]).startswith("report_page0_img")
