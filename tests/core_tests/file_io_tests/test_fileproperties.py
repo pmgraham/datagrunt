@@ -76,3 +76,16 @@ class TestFileProperties:
         """Test error handling for non-existent files."""
         with pytest.raises(FileNotFoundError):
             FileProperties("nonexistent_file.csv")
+
+    def test_is_pdf(self, tmp_path):
+        """Test PDF detection and classification."""
+        pdf_path = tmp_path / "doc.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4 dummy")
+
+        pdf_file = FileProperties(pdf_path)
+        assert pdf_file.is_pdf
+        assert pdf_file.extension_string == "pdf"
+        assert pdf_file.is_unstructured
+        assert not pdf_file.is_csv
+        assert not pdf_file.is_structured
+        assert not pdf_file.is_semi_structured
