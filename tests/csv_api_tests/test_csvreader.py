@@ -85,15 +85,86 @@ class TestCSVReader:
             df = reader.to_dataframe(normalize_columns=True)
             assert list(df.columns) == expected_columns
 
-    def test_get_sample(self, sample_csv, capsys):
-        """Test get_sample method."""
+    def test_get_sample(self, sample_csv):
+        """Test get_sample method returns a sample DataFrame."""
         for engine in ALL_ENGINES:
             reader = CSVReader(sample_csv, engine=engine)
-            reader.get_sample()
-            captured = capsys.readouterr()
-            assert captured.out  # Verify that something was printed
-            assert "John" in captured.out
-            assert "Jane" in captured.out
+            sample = reader.get_sample()
+            assert isinstance(sample, pl.DataFrame)
+            assert len(sample) == 2
+            names = sample["name"].to_list()
+            assert "John" in names
+            assert "Jane" in names
+
+    def test_same_stem_files_do_not_collide(self, tmp_path):
+        """Two files sharing a name stem must not overwrite each other's data.
+
+        Regression test for the DuckDB table-name collision bug: previously
+        both files mapped to a single global table named after the stem, so
+        constructing the second reader silently corrupted the first.
+        """
+        dir_a = tmp_path / "dirA"
+        dir_b = tmp_path / "dirB"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        (dir_a / "data.csv").write_text("col1,col2\n1,A\n2,B\n")
+        (dir_b / "data.csv").write_text("col1,col2\n99,Z\n100,Y\n")
+
+        for engine in ALL_ENGINES:
+            reader_a = CSVReader(str(dir_a / "data.csv"), engine=engine)
+            reader_b = CSVReader(str(dir_b / "data.csv"), engine=engine)
+
+            # Distinct, deterministic table names per file path
+            assert reader_a.db_table != reader_b.db_table
+
+            # Each reader must still return its own data after the other exists
+            a_vals = sorted(reader_a.to_dataframe()["col1"].to_list())
+            b_vals = sorted(reader_b.to_dataframe()["col1"].to_list())
+            assert a_vals == ["1", "2"]
+            assert b_vals == ["100", "99"]
+
+            # And SQL queries via DuckDB must hit the correct per-file table
+            res_a = reader_a.query_data(f"SELECT col1 FROM {reader_a.db_table} ORDER BY col1")
+            df_a = res_a.pl() if hasattr(res_a, "pl") else res_a
+            assert df_a["col1"].to_list() == ["1", "2"]
+
+    def test_duckdb_lazy_result_not_corrupted_by_later_same_stem_reader(self, tmp_path):
+        """A deferred DuckDB result must keep its own file's data even after a
+        second file sharing its name stem is loaded.
+
+        This is the test shape that actually exposes the original bug. The
+        eager paths (``to_dataframe``, or a ``query_data`` result materialized
+        immediately) re-import and read in a single step, so they always see
+        the right table and hide the collision. The bug only surfaces when a
+        *lazy* ``DuckDBPyRelation`` from the first file is materialized *after*
+        a second same-stem file is imported: on the old shared global
+        connection with a stem-only table name, the second ``CREATE OR REPLACE
+        TABLE`` overwrote the first file's table, so the deferred read returned
+        the wrong file's rows.
+
+        Lazy evaluation is DuckDB-specific here; the Polars and PyArrow engines
+        read eagerly into memory and never share a mutable table.
+        """
+        dir_a = tmp_path / "dirA"
+        dir_b = tmp_path / "dirB"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        (dir_a / "data.csv").write_text("col1,col2\n1,A\n2,B\n")
+        (dir_b / "data.csv").write_text("col1,col2\n99,Z\n100,Y\n")
+
+        reader_a = CSVReader(str(dir_a / "data.csv"), engine="duckdb")
+
+        # Build a lazy relation over file A's table but DO NOT materialize it.
+        lazy_a = reader_a.query_data(f"SELECT col1 FROM {reader_a.db_table} ORDER BY col1")
+
+        # Now import a different file that shares the "data" stem. On the buggy
+        # implementation this CREATE OR REPLACE TABLE clobbered the single
+        # shared table that ``lazy_a`` still points at.
+        reader_b = CSVReader(str(dir_b / "data.csv"), engine="duckdb")
+        reader_b.to_dataframe()
+
+        # Materialize A's deferred result only now. It must still be A's rows.
+        assert lazy_a.pl()["col1"].to_list() == ["1", "2"]
 
     def test_to_dataframe_empty_and_blank_files(self, tmp_path):
         """Test to_dataframe method specifically for empty and blank files."""
