@@ -59,17 +59,17 @@ class PDFBaseReaderEngine(ABC):
         pass
 
     @abstractmethod
-    def to_dicts(self, image_output_dir: Optional[str] = None) -> dict:
+    def to_dicts(self, image_output_dir: Optional[str] = None, drop_layout_tables: bool = False) -> dict:
         """Return the unified parsed document dict."""
         pass
 
     @abstractmethod
-    def to_dataframe(self) -> pl.DataFrame:
+    def to_dataframe(self, drop_layout_tables: bool = False) -> pl.DataFrame:
         """Return parsed elements as a Polars DataFrame."""
         pass
 
     @abstractmethod
-    def to_arrow_table(self) -> pa.Table:
+    def to_arrow_table(self, drop_layout_tables: bool = False) -> pa.Table:
         """Return parsed elements as a PyArrow table."""
         pass
 
@@ -85,7 +85,7 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
         finally:
             doc.close()
 
-    def to_dicts(self, image_output_dir: Optional[str] = None) -> dict:
+    def to_dicts(self, image_output_dir: Optional[str] = None, drop_layout_tables: bool = False) -> dict:
         """Parse all pages concurrently into the unified document dict."""
         total_pages = self._total_pages()
         page_results = {}
@@ -105,22 +105,25 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
                     errors.append(f"Page {idx + 1}: {e}")
 
         ordered = [page_results[p] for p in sorted(page_results.keys())]
-        return pdfcomponents.combine_pages(self.filepath, total_pages, ordered, errors)
+        document = pdfcomponents.combine_pages(self.filepath, total_pages, ordered, errors)
+        if drop_layout_tables:
+            pdfcomponents.drop_layout_tables(document)
+        return document
 
     def get_sample(self) -> dict:
         """Parse and return the first page only."""
         return pdfcomponents.parse_page(str(self.filepath), 0)
 
-    def to_dataframe(self) -> pl.DataFrame:
+    def to_dataframe(self, drop_layout_tables: bool = False) -> pl.DataFrame:
         """Flatten parsed elements into a Polars DataFrame (one row/element)."""
-        records = pdfcomponents.flatten_document_elements(self.to_dicts())
+        records = pdfcomponents.flatten_document_elements(self.to_dicts(drop_layout_tables=drop_layout_tables))
         if not records:
             return pl.DataFrame()
         return pl.DataFrame(records)
 
-    def to_arrow_table(self) -> pa.Table:
+    def to_arrow_table(self, drop_layout_tables: bool = False) -> pa.Table:
         """Flatten parsed elements into a PyArrow table (one row/element)."""
-        records = pdfcomponents.flatten_document_elements(self.to_dicts())
+        records = pdfcomponents.flatten_document_elements(self.to_dicts(drop_layout_tables=drop_layout_tables))
         if not records:
             return pa.Table.from_pydict({})
         return pa.Table.from_pylist(records)
@@ -143,12 +146,14 @@ class PDFBaseWriterEngine(ABC):
             raise FileNotFoundError
 
     @abstractmethod
-    def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True):
+    def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
         """Write the unified document JSON to disk."""
         pass
 
     @abstractmethod
-    def write_json_newline_delimited(self, export_filename=None, image_output_dir=None, dedupe_images=True):
+    def write_json_newline_delimited(
+        self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False
+    ):
         """Write one element per line as JSON Lines."""
         pass
 
@@ -164,7 +169,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
     def _reader(self):
         return PDFReaderPyMuPDFEngine(self.filepath, workers=self.workers)
 
-    def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True):
+    def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
         """Parse the PDF and write the unified document JSON.
 
         Args:
@@ -174,19 +179,23 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
                 ``file_path`` values are null.
             dedupe_images (bool, default True): When images are written, collapse
                 byte-identical duplicates to a single file and repoint references.
+            drop_layout_tables (bool, default False): Drop 1xN / Nx1 "tables"
+                that are layout boxes rather than real tabular data.
         """
         filename = set_export_filename(self.properties.json_export_filename, export_filename)
-        document = self._reader().to_dicts(image_output_dir=image_output_dir)
+        document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
         if image_output_dir and dedupe_images:
             pdfcomponents.dedupe_document_images(document)
         with open(filename, "w") as f:
             json.dump(document, f, indent=2)
         return filename
 
-    def write_json_newline_delimited(self, export_filename=None, image_output_dir=None, dedupe_images=True):
+    def write_json_newline_delimited(
+        self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False
+    ):
         """Parse the PDF and write one flattened element per line (JSONL)."""
         filename = set_export_filename(self.properties.json_newline_export_filename, export_filename)
-        document = self._reader().to_dicts(image_output_dir=image_output_dir)
+        document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
         if image_output_dir and dedupe_images:
             pdfcomponents.dedupe_document_images(document)
         records = pdfcomponents.flatten_document_elements(document)
