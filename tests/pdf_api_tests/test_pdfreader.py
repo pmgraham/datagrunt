@@ -45,3 +45,12 @@ class TestPDFReader:
         reader = PDFReader(sample_pdf, engine="ghostscript")
         with pytest.raises(ValueError):
             reader.to_dicts()
+
+
+class TestTopLevelExports:
+    """Verify PDF classes are importable from the package root."""
+
+    def test_top_level_imports(self):
+        from datagrunt import PDFReader, PDFWriter
+        assert PDFReader.__name__ == "PDFReader"
+        assert PDFWriter.__name__ == "PDFWriter"
