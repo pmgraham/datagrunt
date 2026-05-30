@@ -40,8 +40,15 @@ class CSVReader(CSVComponents):
         return CSVEngineFactory(self.filepath, self.engine).create_reader()
 
     def get_sample(self, normalize_columns=False):
-        """Return a sample of the CSV file."""
-        self._create_reader().get_sample(normalize_columns)
+        """Return a sample of the CSV file.
+
+        Args:
+            normalize_columns (bool): Whether to normalize column names.
+
+        Returns:
+            A Polars DataFrame containing the sample rows.
+        """
+        return self._create_reader().get_sample(normalize_columns)
 
     def to_dataframe(self, normalize_columns=False):
         """Converts CSV to a Polars dataframe.

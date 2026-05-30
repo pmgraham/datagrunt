@@ -124,23 +124,23 @@ class TestEngines:
             expected_type = QUERY_RESULT_TYPES[engine]
             assert isinstance(result, expected_type)
 
-    def test_reader_get_sample_all_engines(self, sample_csv, capsys):
-        """Test get_sample method for all reader engines."""
+    def test_reader_get_sample_all_engines(self, sample_csv):
+        """Test get_sample method returns a sample DataFrame for all engines."""
         for engine in ALL_ENGINES:
             factory = CSVEngineFactory(sample_csv, engine)
             reader = factory.create_reader()
 
             # Test get_sample without normalization
-            reader.get_sample()
-            captured = capsys.readouterr()
-            # Different engines output different formats, just verify something was printed
-            assert len(captured.out) > 0
-            assert "John" in captured.out or "Jane" in captured.out  # Should contain sample data
+            sample = reader.get_sample()
+            assert isinstance(sample, pl.DataFrame)
+            assert len(sample) > 0
+            names = sample["name"].to_list()
+            assert "John" in names or "Jane" in names  # Should contain sample data
 
             # Test get_sample with normalization
-            reader.get_sample(normalize_columns=True)
-            captured = capsys.readouterr()
-            assert len(captured.out) > 0
+            normalized_sample = reader.get_sample(normalize_columns=True)
+            assert isinstance(normalized_sample, pl.DataFrame)
+            assert len(normalized_sample) > 0
 
     def test_writer_basic_operations_all_engines(self, tmp_path, sample_csv):
         """Test basic write operations for all writer engines."""
