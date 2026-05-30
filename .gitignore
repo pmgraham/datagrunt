@@ -157,3 +157,6 @@ uv.lock
 lint.sh
 # Superpowers planning docs (local only)
 docs/superpowers/
+
+# Local test/scratch outputs
+outputs/
