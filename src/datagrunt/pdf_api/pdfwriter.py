@@ -51,9 +51,7 @@ class PDFWriter(PDFComponents):
         Returns:
             str: The path of the written JSONL file.
         """
-        return self._create_writer().write_json_newline_delimited(
-            export_filename, image_output_dir
-        )
+        return self._create_writer().write_json_newline_delimited(export_filename, image_output_dir)
 
     def extract_images(self, output_dir=None):
         """Parse the PDF and write embedded image files to disk.
