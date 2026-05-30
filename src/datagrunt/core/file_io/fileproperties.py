@@ -32,6 +32,11 @@ class FileExtensions:
         return ["tsv"]
 
     @cached_property
+    def pdf_extensions(self):
+        """Define PDF extensions."""
+        return ["pdf"]
+
+    @cached_property
     def excel_extensions(self):
         """Define Excel extensions."""
         return ["xlsx", "xlsm", "xlsb", "xltx", "xltm", "xls", "xlt"]
@@ -215,6 +220,11 @@ class FileProperties:
     def is_csv(self):
         """Check if the file is a CSV file."""
         return self.extension_string.lower() in self._ext.csv_extensions
+
+    @cached_property
+    def is_pdf(self):
+        """Check if the file is a PDF file."""
+        return self.extension_string.lower() in self._ext.pdf_extensions
 
     @cached_property
     def is_excel(self):
