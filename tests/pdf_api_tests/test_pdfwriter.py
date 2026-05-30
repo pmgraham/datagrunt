@@ -54,3 +54,47 @@ class TestPDFWriter:
     def test_engine_normalized(self, sample_pdf):
         writer = PDFWriter(sample_pdf, engine="Py Mu PDF")
         assert writer.engine == "pymupdf"
+
+    @staticmethod
+    def _two_page_dupe_pdf(tmp_path):
+        """Build a 2-page PDF with the same image embedded on each page."""
+        import pymupdf
+
+        doc = pymupdf.open()
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 120, 120))
+        pix.set_rect(pix.irect, (0, 128, 255))
+        img = pix.tobytes("png")
+        for _ in range(2):
+            page = doc.new_page(width=300, height=300)
+            page.insert_image(pymupdf.Rect(50, 50, 170, 170), stream=img)
+        path = tmp_path / "dupe.pdf"
+        doc.save(str(path))
+        doc.close()
+        return str(path)
+
+    def test_extract_images_dedupes_by_default(self, tmp_path):
+        pdf = self._two_page_dupe_pdf(tmp_path)
+        writer = PDFWriter(pdf)
+        paths = writer.extract_images(output_dir=str(tmp_path / "imgs"))
+        assert len(paths) == 1
+
+    def test_extract_images_dedupe_can_be_disabled(self, tmp_path):
+        pdf = self._two_page_dupe_pdf(tmp_path)
+        writer = PDFWriter(pdf)
+        paths = writer.extract_images(output_dir=str(tmp_path / "imgs2"), dedupe=False)
+        assert len(paths) == 2
+
+    def test_write_json_dedupes_by_default(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        pdf = self._two_page_dupe_pdf(tmp_path)
+        writer = PDFWriter(pdf)
+        jpath = writer.write_json(image_output_dir=str(tmp_path / "imgs3"))
+        with open(jpath) as f:
+            doc = json.load(f)
+        img_paths = [
+            e["metadata"]["file_path"]
+            for pg in doc["document"]["pages"]
+            for e in pg["elements"]
+            if e["type"] == "image"
+        ]
+        assert len(img_paths) == 2 and len(set(img_paths)) == 1
