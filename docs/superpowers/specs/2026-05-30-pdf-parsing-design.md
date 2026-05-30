@@ -141,9 +141,39 @@ Subclasses `PDFComponents`.
 
 | Method | Behavior |
 |--------|----------|
-| `write_json(out_filename=None)` | Write the unified JSON to disk (default `output.json`). |
-| `write_json_newline_delimited(out_filename=None)` | One page/element per line (default `output.jsonl`). |
+| `write_json(export_filename=None, ...)` | Write the unified JSON to disk. |
+| `write_json_newline_delimited(export_filename=None, ...)` | One page/element per line. |
 | `extract_images(output_dir=None)` | Write embedded image files to disk; return their paths. JSON `metadata.file_path` references the local image paths. |
+
+### Output path conventions (identical to the CSV writer)
+
+The CSV writers resolve output paths with
+`DuckDBQueries.set_export_filename(default_filename, export_filename)`, which
+returns `export_filename` when provided (truthy) and the default otherwise; the
+defaults live on the `CSVEngineProperties` dataclass
+(`json_export_filename = "output.json"`, `json_newline_export_filename =
+"output.jsonl"`, etc.). The argument is named `export_filename` and defaults to
+`None`.
+
+The PDF writer mirrors this exactly:
+
+- A `PDFEngineProperties` dataclass holds the defaults:
+  - `json_export_filename = "output.json"`
+  - `json_newline_export_filename = "output.jsonl"`
+  - `images_export_dir = "output_images"`
+- A `set_export_filename(default, export_filename=None)` helper with semantics
+  identical to the CSV one is added in `core/pdf_io` (a module-level function or
+  a method on `PDFEngineProperties`). It is **not** reused from `DuckDBQueries`,
+  so the PDF feature carries no DuckDB dependency.
+- `write_json` / `write_json_newline_delimited` take `export_filename=None`
+  and fall back to the dataclass defaults via that helper — same call shape and
+  behavior as `CSVWriter.write_json`.
+- `extract_images(output_dir=None)` falls back to `images_export_dir`, creates
+  the directory if needed (`mkdir(parents=True, exist_ok=True)`), writes each
+  embedded image as `{filepath.stem}_page{n}_img{i}.{ext}` (globally unique,
+  from the source's image-naming scheme), and returns the list of written
+  paths. The corresponding element `metadata.file_path` is set to the local
+  image path.
 
 ## Output Schema (preserved verbatim from source)
 
