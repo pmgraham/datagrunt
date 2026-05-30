@@ -347,8 +347,8 @@ def extract_images(
 def _import_ocr_deps():
     """Import OCR deps (PIL, pytesseract) lazily with a helpful error."""
     try:
-        from PIL import Image
         import pytesseract
+        from PIL import Image
         from pytesseract import Output
     except ImportError as exc:  # pragma: no cover - exercised without extra
         raise ImportError(PDF_EXTRA_HINT) from exc
