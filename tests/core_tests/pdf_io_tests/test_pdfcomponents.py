@@ -56,3 +56,82 @@ class TestPDFComponents:
         comp = pdfcomponents.PDFComponents(sample_pdf)
         assert comp.is_pdf
         assert comp.total_pages == 1
+
+
+class TestDedupeImages:
+    """Test suite for dedupe_document_images."""
+
+    @staticmethod
+    def _img_element(file_path):
+        return {
+            "id": "elem",
+            "type": "image",
+            "content": None,
+            "page": 1,
+            "position": {"x": 0, "y": 0, "w": 0, "h": 0},
+            "confidence": 1.0,
+            "metadata": {
+                "file_path": file_path,
+                "format": "png",
+                "width_px": 100,
+                "height_px": 100,
+            },
+        }
+
+    def test_dedupes_identical_images(self, tmp_path):
+        a = tmp_path / "a.png"
+        a.write_bytes(b"IMG-DATA-1")
+        b = tmp_path / "b.png"
+        b.write_bytes(b"IMG-DATA-1")  # byte-identical to a
+        c = tmp_path / "c.png"
+        c.write_bytes(b"IMG-DATA-2")  # unique
+        document = {
+            "document": {
+                "pages": [
+                    {
+                        "page_number": 1,
+                        "elements": [
+                            self._img_element(str(a)),
+                            self._img_element(str(b)),
+                            self._img_element(str(c)),
+                        ],
+                    }
+                ]
+            }
+        }
+
+        removed = pdfcomponents.dedupe_document_images(document)
+
+        assert removed == 1
+        # The redundant duplicate file is deleted; the first + unique remain.
+        assert a.exists()
+        assert not b.exists()
+        assert c.exists()
+        # The duplicate element is repointed at the first occurrence.
+        elems = document["document"]["pages"][0]["elements"]
+        assert elems[1]["metadata"]["file_path"] == str(a)
+        assert elems[0]["metadata"]["file_path"] == str(a)
+        assert elems[2]["metadata"]["file_path"] == str(c)
+
+    def test_skips_none_and_missing_paths(self, tmp_path):
+        a = tmp_path / "a.png"
+        a.write_bytes(b"ONLY")
+        document = {
+            "document": {
+                "pages": [
+                    {
+                        "page_number": 1,
+                        "elements": [
+                            self._img_element(None),
+                            self._img_element(str(tmp_path / "gone.png")),
+                            self._img_element(str(a)),
+                        ],
+                    }
+                ]
+            }
+        }
+
+        removed = pdfcomponents.dedupe_document_images(document)
+
+        assert removed == 0
+        assert a.exists()
