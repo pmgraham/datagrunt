@@ -250,3 +250,95 @@ def extract_tables(pdf_path: str, page_number: int) -> dict:
         pdf.close()
 
     return {"status": "success", "tables": tables}
+
+
+def extract_images(
+    pdf_path: str,
+    page_number: int,
+    output_dir: str = None,
+    name_prefix: str = "page",
+) -> dict:
+    """Extract embedded images from a PDF page.
+
+    Args:
+        pdf_path: Path to the PDF file.
+        page_number: Zero-indexed page number.
+        output_dir: Directory to write images to. When ``None``, no files are
+            written and each image's ``file_path`` is ``None`` (metadata only).
+        name_prefix: Filename prefix used to keep image names unique across
+            documents: ``{name_prefix}_page{page_number}_img{idx}.{ext}``.
+
+    Returns:
+        Dict with status and list of image metadata (file path, pixel
+        dimensions, format, and position on the page).
+    """
+    import os
+
+    pymupdf = _import_pymupdf()
+    try:
+        doc = pymupdf.open(pdf_path)
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to open PDF: {e}"}
+
+    if page_number < 0 or page_number >= doc.page_count:
+        doc.close()
+        return {"status": "error", "message": f"Page {page_number} out of range"}
+
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        page = doc[page_number]
+        image_list = page.get_images()
+
+        blocks = page.get_text("dict")["blocks"]
+        image_blocks = [b for b in blocks if b.get("type") == 1]
+
+        images = []
+        for idx, img_info in enumerate(image_list):
+            xref = img_info[0]
+            try:
+                base_image = doc.extract_image(xref)
+            except Exception:
+                continue
+
+            ext = base_image.get("ext", "png")
+            width = base_image.get("width", 0)
+            height = base_image.get("height", 0)
+            image_bytes = base_image.get("image", b"")
+
+            if not image_bytes:
+                continue
+
+            # Skip tiny layout artifacts, borders, and spacer pixels.
+            if width < 40 or height < 40:
+                continue
+
+            file_path = None
+            if output_dir:
+                filename = f"{name_prefix}_page{page_number}_img{idx}.{ext}"
+                file_path = os.path.join(output_dir, filename)
+                with open(file_path, "wb") as f:
+                    f.write(image_bytes)
+
+            bbox = {"x": 0, "y": 0, "w": 0, "h": 0}
+            if idx < len(image_blocks):
+                b = image_blocks[idx]["bbox"]
+                bbox = {
+                    "x": round(b[0], 2),
+                    "y": round(b[1], 2),
+                    "w": round(b[2] - b[0], 2),
+                    "h": round(b[3] - b[1], 2),
+                }
+
+            images.append({
+                "file_path": file_path,
+                "bbox": bbox,
+                "width_px": width,
+                "height_px": height,
+                "format": ext,
+            })
+    finally:
+        doc.close()
+
+    return {"status": "success", "images": images}
