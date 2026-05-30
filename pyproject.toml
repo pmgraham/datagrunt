@@ -18,7 +18,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-keywords = ["csv", "data", "duckdb", "polars", "pyarrow", "xlsx", "delimiter", "ai", "gemini"]
+keywords = ["csv", "data", "duckdb", "polars", "pyarrow", "xlsx", "delimiter", "ai", "gemini", "pdf"]
 dependencies = [
     "duckdb>=1.4.0",
     "polars>=1.7.1",
@@ -29,6 +29,12 @@ dependencies = [
 requires-python = ">=3.10"
 
 [project.optional-dependencies]
+pdf = [
+    "PyMuPDF>=1.27.0",
+    "pdfplumber>=0.11.0",
+    "pytesseract>=0.3.10",
+    "Pillow>=10.0.0",
+]
 dev = [
     "pytest>=8.3.4",
     "pytest-cov>=6.0.0",
