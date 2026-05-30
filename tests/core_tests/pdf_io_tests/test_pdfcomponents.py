@@ -1,6 +1,5 @@
 """Tests for PDF component assembly."""
 
-import pytest
 
 from datagrunt.core.pdf_io import pdfcomponents
 
