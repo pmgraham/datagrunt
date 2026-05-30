@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-05-30-pdf-parsing-design.md`
 
+**Tooling:** This project uses **`uv`** for all Python package and environment management. The env is a `uv venv` at `.venv` (Python 3.12) with `uv pip install -e ".[pdf,dev]"` already applied. Run every Python/test/lint command through uv: `uv run pytest ...`, `uv run ruff ...`, `uv run python -c "..."`. Never invoke bare `pip`/`python`/`pytest`. A harmless `VIRTUAL_ENV ... does not match` warning may print — ignore it; uv uses `.venv`.
+
 ---
 
 ## File Structure
@@ -77,7 +79,7 @@ keywords = ["csv", "data", "duckdb", "polars", "pyarrow", "xlsx", "delimiter", "
 
 - [ ] **Step 2: Install the extra and dev deps into the environment**
 
-Run: `pip install -e ".[pdf,dev]"`
+Run: `uv pip install -e ".[pdf,dev]"`
 Expected: installs `pymupdf`, `pdfplumber`, `pytesseract`, `Pillow` with no errors.
 
 - [ ] **Step 3: Verify the tesseract system binary (for OCR tests)**
@@ -87,7 +89,7 @@ Expected: a path (e.g. `/opt/homebrew/bin/tesseract`). If `TESSERACT MISSING`, O
 
 - [ ] **Step 4: Verify base import still works**
 
-Run: `python -c "import datagrunt; from datagrunt import CSVReader; print('ok')"`
+Run: `uv run python -c "import datagrunt; from datagrunt import CSVReader; print('ok')"`
 Expected: `ok`
 
 - [ ] **Step 5: Commit**
@@ -126,7 +128,7 @@ Add this test method to the `TestFileProperties` class in `tests/core_tests/file
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/core_tests/file_io_tests/test_fileproperties.py::TestFileProperties::test_is_pdf -v`
+Run: `uv run pytest tests/core_tests/file_io_tests/test_fileproperties.py::TestFileProperties::test_is_pdf -v`
 Expected: FAIL with `AttributeError: 'FileProperties' object has no attribute 'is_pdf'`
 
 - [ ] **Step 3: Add `pdf_extensions` to `FileExtensions`**
@@ -153,7 +155,7 @@ In the `FileProperties` class, add this property right after `is_csv`:
 
 - [ ] **Step 5: Run test to verify it passes**
 
-Run: `pytest tests/core_tests/file_io_tests/test_fileproperties.py -v`
+Run: `uv run pytest tests/core_tests/file_io_tests/test_fileproperties.py -v`
 Expected: PASS (all tests, including existing ones)
 
 - [ ] **Step 6: Commit**
@@ -232,10 +234,10 @@ def tesseract_available():
 
 - [ ] **Step 3: Verify the fixture builds a real PDF**
 
-Run: `pytest tests/core_tests/file_io_tests/test_fileproperties.py -v` (sanity check that conftest still imports cleanly).
+Run: `uv run pytest tests/core_tests/file_io_tests/test_fileproperties.py -v` (sanity check that conftest still imports cleanly).
 Expected: PASS. Then verify the fixture works:
 
-Run: `python -c "import pymupdf; d=pymupdf.open(); p=d.new_page(); print(d.page_count)"`
+Run: `uv run python -c "import pymupdf; d=pymupdf.open(); p=d.new_page(); print(d.page_count)"`
 Expected: `1`
 
 - [ ] **Step 4: Commit**
@@ -296,7 +298,7 @@ class TestAnalyzePage:
 
 - [ ] **Step 3: Run test to verify it fails**
 
-Run: `pytest tests/core_tests/pdf_io_tests/test_extractors.py::TestAnalyzePage -v`
+Run: `uv run pytest tests/core_tests/pdf_io_tests/test_extractors.py::TestAnalyzePage -v`
 Expected: FAIL with `ModuleNotFoundError`/`AttributeError: module ... has no attribute 'analyze_page'`
 
 - [ ] **Step 4: Create `extractors.py` with the lazy-import helper and `analyze_page`**
@@ -391,7 +393,7 @@ def analyze_page(pdf_path: str, page_number: int) -> dict:
 
 - [ ] **Step 5: Run test to verify it passes**
 
-Run: `pytest tests/core_tests/pdf_io_tests/test_extractors.py::TestAnalyzePage -v`
+Run: `uv run pytest tests/core_tests/pdf_io_tests/test_extractors.py::TestAnalyzePage -v`
 Expected: PASS
 
 - [ ] **Step 6: Commit**
@@ -438,7 +440,7 @@ class TestExtractTextBlocks:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/core_tests/pdf_io_tests/test_extractors.py::TestExtractTextBlocks -v`
+Run: `uv run pytest tests/core_tests/pdf_io_tests/test_extractors.py::TestExtractTextBlocks -v`
 Expected: FAIL with `AttributeError: ... 'extract_text_blocks'`
 
 - [ ] **Step 3: Add `_classify_block` and `extract_text_blocks` to `extractors.py`**
@@ -550,7 +552,7 @@ def extract_text_blocks(pdf_path: str, page_number: int) -> dict:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest tests/core_tests/pdf_io_tests/test_extractors.py::TestExtractTextBlocks -v`
+Run: `uv run pytest tests/core_tests/pdf_io_tests/test_extractors.py::TestExtractTextBlocks -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -589,7 +591,7 @@ class TestExtractTables:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/core_tests/pdf_io_tests/test_extractors.py::TestExtractTables -v`
+Run: `uv run pytest tests/core_tests/pdf_io_tests/test_extractors.py::TestExtractTables -v`
 Expected: FAIL with `AttributeError: ... 'extract_tables'`
 
 - [ ] **Step 3: Add `extract_tables` to `extractors.py`**
@@ -666,7 +668,7 @@ def extract_tables(pdf_path: str, page_number: int) -> dict:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest tests/core_tests/pdf_io_tests/test_extractors.py::TestExtractTables -v`
+Run: `uv run pytest tests/core_tests/pdf_io_tests/test_extractors.py::TestExtractTables -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -719,7 +721,7 @@ class TestExtractImages:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/core_tests/pdf_io_tests/test_extractors.py::TestExtractImages -v`
+Run: `uv run pytest tests/core_tests/pdf_io_tests/test_extractors.py::TestExtractImages -v`
 Expected: FAIL with `AttributeError: ... 'extract_images'`
 
 - [ ] **Step 3: Add `extract_images` to `extractors.py`**
@@ -821,7 +823,7 @@ def extract_images(
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest tests/core_tests/pdf_io_tests/test_extractors.py::TestExtractImages -v`
+Run: `uv run pytest tests/core_tests/pdf_io_tests/test_extractors.py::TestExtractImages -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -869,8 +871,8 @@ class TestOcrPage:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/core_tests/pdf_io_tests/test_extractors.py::TestOcrPage -v`
-Expected: FAIL with `AttributeError: ... 'ocr_page'` (or SKIP if tesseract missing — in that case temporarily confirm the attribute error by checking `python -c "from datagrunt.core.pdf_io import extractors; extractors.ocr_page"` raises `AttributeError`).
+Run: `uv run pytest tests/core_tests/pdf_io_tests/test_extractors.py::TestOcrPage -v`
+Expected: FAIL with `AttributeError: ... 'ocr_page'` (or SKIP if tesseract missing — in that case temporarily confirm the attribute error by checking `uv run python -c "from datagrunt.core.pdf_io import extractors; extractors.ocr_page"` raises `AttributeError`).
 
 - [ ] **Step 3: Add `ocr_page` to `extractors.py`**
 
@@ -979,7 +981,7 @@ def ocr_page(pdf_path: str, page_number: int, dpi: int = 300) -> dict:
 
 - [ ] **Step 4: Run test to verify it passes (or skips)**
 
-Run: `pytest tests/core_tests/pdf_io_tests/test_extractors.py::TestOcrPage -v`
+Run: `uv run pytest tests/core_tests/pdf_io_tests/test_extractors.py::TestOcrPage -v`
 Expected: PASS if tesseract installed, otherwise SKIP.
 
 - [ ] **Step 5: Commit**
@@ -1067,7 +1069,7 @@ class TestPDFComponents:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/core_tests/pdf_io_tests/test_pdfcomponents.py -v`
+Run: `uv run pytest tests/core_tests/pdf_io_tests/test_pdfcomponents.py -v`
 Expected: FAIL with `ModuleNotFoundError: ... pdfcomponents`
 
 - [ ] **Step 3: Create `pdfcomponents.py`**
@@ -1332,7 +1334,7 @@ class PDFComponents(FileProperties):
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest tests/core_tests/pdf_io_tests/test_pdfcomponents.py -v`
+Run: `uv run pytest tests/core_tests/pdf_io_tests/test_pdfcomponents.py -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -1423,7 +1425,7 @@ class TestPDFReaderEngine:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/core_tests/pdf_io_tests/test_engines.py -v`
+Run: `uv run pytest tests/core_tests/pdf_io_tests/test_engines.py -v`
 Expected: FAIL with `ModuleNotFoundError: ... engines`
 
 - [ ] **Step 3: Create `engines.py` with properties, resolver, base ABCs, and reader engine**
@@ -1566,7 +1568,7 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest tests/core_tests/pdf_io_tests/test_engines.py -v`
+Run: `uv run pytest tests/core_tests/pdf_io_tests/test_engines.py -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -1634,7 +1636,7 @@ class TestPDFWriterEngine:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/core_tests/pdf_io_tests/test_engines.py::TestPDFWriterEngine -v`
+Run: `uv run pytest tests/core_tests/pdf_io_tests/test_engines.py::TestPDFWriterEngine -v`
 Expected: FAIL with `ImportError: cannot import name 'PDFWriterPyMuPDFEngine'`
 
 - [ ] **Step 3: Add the writer base ABC and PyMuPDF writer engine**
@@ -1743,7 +1745,7 @@ from typing import Optional
 
 - [ ] **Step 5: Run test to verify it passes**
 
-Run: `pytest tests/core_tests/pdf_io_tests/test_engines.py -v`
+Run: `uv run pytest tests/core_tests/pdf_io_tests/test_engines.py -v`
 Expected: PASS (all engine tests)
 
 - [ ] **Step 6: Commit**
@@ -1803,7 +1805,7 @@ class TestPDFEngineFactory:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/core_tests/pdf_io_tests/test_factories.py -v`
+Run: `uv run pytest tests/core_tests/pdf_io_tests/test_factories.py -v`
 Expected: FAIL with `ModuleNotFoundError: ... factories`
 
 - [ ] **Step 3: Create `factories.py`**
@@ -1872,7 +1874,7 @@ class PDFEngineFactory:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest tests/core_tests/pdf_io_tests/test_factories.py -v`
+Run: `uv run pytest tests/core_tests/pdf_io_tests/test_factories.py -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -1967,10 +1969,10 @@ Then add these entries to the `__all__` list (append a new `# PDF IO` group befo
 
 - [ ] **Step 3: Verify imports resolve and base import is clean**
 
-Run: `python -c "from datagrunt.core import PDFEngineFactory, PDFComponents; print('ok')"`
+Run: `uv run python -c "from datagrunt.core import PDFEngineFactory, PDFComponents; print('ok')"`
 Expected: `ok`
 
-Run: `python -c "import datagrunt; print('base ok')"`
+Run: `uv run python -c "import datagrunt; print('base ok')"`
 Expected: `base ok`
 
 - [ ] **Step 4: Commit**
@@ -2044,7 +2046,7 @@ class TestPDFReader:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/pdf_api_tests/test_pdfreader.py -v`
+Run: `uv run pytest tests/pdf_api_tests/test_pdfreader.py -v`
 Expected: FAIL with `ModuleNotFoundError: ... pdf_api.pdfreader`
 
 - [ ] **Step 3: Create `pdfreader.py`**
@@ -2133,7 +2135,7 @@ class PDFReader(PDFComponents):
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest tests/pdf_api_tests/test_pdfreader.py -v`
+Run: `uv run pytest tests/pdf_api_tests/test_pdfreader.py -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -2216,7 +2218,7 @@ class TestPDFWriter:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/pdf_api_tests/test_pdfwriter.py -v`
+Run: `uv run pytest tests/pdf_api_tests/test_pdfwriter.py -v`
 Expected: FAIL with `ModuleNotFoundError: ... pdf_api.pdfwriter`
 
 - [ ] **Step 3: Create `pdfwriter.py`**
@@ -2296,7 +2298,7 @@ class PDFWriter(PDFComponents):
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `pytest tests/pdf_api_tests/test_pdfwriter.py -v`
+Run: `uv run pytest tests/pdf_api_tests/test_pdfwriter.py -v`
 Expected: PASS
 
 - [ ] **Step 5: Commit**
@@ -2330,7 +2332,7 @@ class TestTopLevelExports:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/pdf_api_tests/test_pdfreader.py::TestTopLevelExports -v`
+Run: `uv run pytest tests/pdf_api_tests/test_pdfreader.py::TestTopLevelExports -v`
 Expected: FAIL with `ImportError: cannot import name 'PDFReader' from 'datagrunt'`
 
 - [ ] **Step 3: Create `pdf_api/__init__.py`**
@@ -2376,12 +2378,12 @@ Change `A Python library designed to simplify the way you work with CSV files.` 
 
 - [ ] **Step 5: Run test to verify it passes**
 
-Run: `pytest tests/pdf_api_tests/test_pdfreader.py::TestTopLevelExports -v`
+Run: `uv run pytest tests/pdf_api_tests/test_pdfreader.py::TestTopLevelExports -v`
 Expected: PASS
 
 - [ ] **Step 6: Run the full suite**
 
-Run: `pytest`
+Run: `uv run pytest`
 Expected: PASS (CSV + PDF; OCR tests SKIP if tesseract absent). Coverage report prints.
 
 - [ ] **Step 7: Commit**
@@ -2401,10 +2403,10 @@ git commit -m "feat: export PDFReader and PDFWriter at package root"
 
 - [ ] **Step 1: Run ruff and fix any issues**
 
-Run: `ruff check src/datagrunt/pdf_api src/datagrunt/core/pdf_io tests/pdf_api_tests tests/core_tests/pdf_io_tests`
-Expected: no errors. If imports are flagged unused or import order is off, run `ruff check --fix` and re-run.
+Run: `uv run ruff check src/datagrunt/pdf_api src/datagrunt/core/pdf_io tests/pdf_api_tests tests/core_tests/pdf_io_tests`
+Expected: no errors. If imports are flagged unused or import order is off, run `uv run ruff check --fix` and re-run.
 
-Run: `ruff format src/datagrunt/pdf_api src/datagrunt/core/pdf_io`
+Run: `uv run ruff format src/datagrunt/pdf_api src/datagrunt/core/pdf_io`
 Expected: files formatted to the project's 120-char line length.
 
 - [ ] **Step 2: Add a PDF section to `README.md`**
@@ -2441,7 +2443,7 @@ writer.extract_images(output_dir="report_images")
 
 - [ ] **Step 3: Run the full suite once more**
 
-Run: `pytest`
+Run: `uv run pytest`
 Expected: PASS (OCR SKIP allowed).
 
 - [ ] **Step 4: Commit**
@@ -2457,8 +2459,8 @@ git commit -m "docs: document PDF parsing feature; apply ruff formatting"
 
 All tasks complete. Final verification:
 
-- [ ] `pytest` passes (PDF + CSV; OCR skipped only if tesseract absent)
-- [ ] `python -c "import datagrunt"` works on a base install (no `[pdf]`)
-- [ ] `ruff check src tests` is clean
+- [ ] `uv run pytest` passes (PDF + CSV; OCR skipped only if tesseract absent)
+- [ ] `uv run python -c "import datagrunt"` works on a base install (no `[pdf]`)
+- [ ] `uv run ruff check src tests` is clean
 - [ ] `PDFReader`/`PDFWriter` importable from `datagrunt` root
 - [ ] No CSV code path was modified (only `FileProperties` gained `is_pdf`)
