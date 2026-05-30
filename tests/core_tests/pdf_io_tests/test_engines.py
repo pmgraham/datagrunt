@@ -104,3 +104,59 @@ class TestPDFWriterEngine:
         paths = engine.extract_images(output_dir=str(out))
         assert len(paths) >= 1
         assert all(os.path.isfile(p) for p in paths)
+
+
+class TestPDFWriterDedupe:
+    """Test suite for image de-duplication in the writer engine."""
+
+    @staticmethod
+    def _two_page_dupe_pdf(tmp_path):
+        """Build a 2-page PDF with the same image embedded on each page."""
+        import pymupdf
+
+        doc = pymupdf.open()
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 120, 120))
+        pix.set_rect(pix.irect, (0, 128, 255))
+        img = pix.tobytes("png")
+        for _ in range(2):
+            page = doc.new_page(width=300, height=300)
+            page.insert_image(pymupdf.Rect(50, 50, 170, 170), stream=img)
+        path = tmp_path / "dupe.pdf"
+        doc.save(str(path))
+        doc.close()
+        return str(path)
+
+    def test_extract_images_dedupes_by_default(self, tmp_path):
+        pdf = self._two_page_dupe_pdf(tmp_path)
+        out = tmp_path / "imgs"
+        engine = PDFWriterPyMuPDFEngine(pdf)
+        paths = engine.extract_images(output_dir=str(out))
+        # The two byte-identical images collapse to a single file.
+        assert len(paths) == 1
+        assert os.path.isfile(paths[0])
+        assert len([f for f in os.listdir(out) if f.endswith(".png")]) == 1
+
+    def test_extract_images_dedupe_disabled(self, tmp_path):
+        pdf = self._two_page_dupe_pdf(tmp_path)
+        out = tmp_path / "imgs2"
+        engine = PDFWriterPyMuPDFEngine(pdf)
+        paths = engine.extract_images(output_dir=str(out), dedupe=False)
+        assert len(paths) == 2
+
+    def test_write_json_dedupes_image_references(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        pdf = self._two_page_dupe_pdf(tmp_path)
+        engine = PDFWriterPyMuPDFEngine(pdf)
+        jpath = engine.write_json(image_output_dir=str(tmp_path / "imgs3"))
+        with open(jpath) as f:
+            doc = json.load(f)
+        img_paths = [
+            e["metadata"]["file_path"]
+            for pg in doc["document"]["pages"]
+            for e in pg["elements"]
+            if e["type"] == "image"
+        ]
+        # Both image elements reference the same (single) on-disk file.
+        assert len(img_paths) == 2
+        assert len(set(img_paths)) == 1
+        assert all(os.path.isfile(p) for p in img_paths)
