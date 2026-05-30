@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Dict, List, Union
 
 # third party libraries
-import duckdb
 import polars as pl
 import pyarrow as pa
 import pyarrow.csv as pacsv
@@ -56,11 +55,14 @@ class CSVBaseReaderEngine(ABC):
             raise FileNotFoundError
 
     @abstractmethod
-    def get_sample(self, normalize_columns: bool = False) -> None:
-        """Return a sample of the data.
+    def get_sample(self, normalize_columns: bool = False) -> pl.DataFrame:
+        """Return a sample of the data as a Polars DataFrame.
 
         Args:
             normalize_columns (bool): Whether to normalize column names.
+
+        Returns:
+            A Polars DataFrame containing the sample rows.
         """
         pass
 
@@ -181,8 +183,12 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         Args:
             normalize_columns (optional, bool): Whether to normalize column
             names.
+
+        Returns:
+            A Polars DataFrame containing the sample rows.
         """
-        self.queries.create_table(normalize_columns).show()
+        relation = self.queries.create_table(normalize_columns)
+        return relation.limit(CSVEngineProperties.dataframe_sample_rows).pl()
 
     def to_dataframe(self, normalize_columns=False):
         """
@@ -262,8 +268,10 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         # so the user's query can reference them.
         self.queries.create_table(normalize_columns=False)
 
-        # Execute the user's query
-        result_relation = duckdb.sql(sql_query)
+        # Execute the user's query on the same per-instance connection that
+        # holds the table. The returned relation keeps this connection alive,
+        # so it remains valid after this engine instance is garbage collected.
+        result_relation = self.queries.connection.sql(sql_query)
 
         if normalize_columns:
             result_relation = self._normalize_relation_columns(result_relation)
@@ -325,8 +333,7 @@ class CSVReaderPolarsEngine(CSVBaseReaderEngine):
         Returns:
             A Polars dataframe.
         """
-        df = self._create_dataframe_sample(normalize_columns)
-        print(df)
+        return self._create_dataframe_sample(normalize_columns)
 
     def to_dataframe(self, normalize_columns=False):
         """
@@ -409,7 +416,7 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
         """
         filename = self.queries.set_export_filename(CSVEngineProperties.csv_export_filename, export_filename)
         self.queries.create_table(normalize_columns)
-        duckdb.sql(self.queries.export_csv_query(filename))
+        self.queries.connection.sql(self.queries.export_csv_query(filename))
 
     def write_excel(self, export_filename=None, normalize_columns=False):
         """
@@ -422,7 +429,7 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
         """
         filename = self.queries.set_export_filename(CSVEngineProperties.excel_export_filename, export_filename)
         self.queries.create_table(normalize_columns)
-        duckdb.sql(self.queries.export_excel_query(filename))
+        self.queries.connection.sql(self.queries.export_excel_query(filename))
 
     def write_json(self, export_filename=None, normalize_columns=False):
         """
@@ -435,7 +442,7 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
         """
         filename = self.queries.set_export_filename(CSVEngineProperties.json_export_filename, export_filename)
         self.queries.create_table(normalize_columns)
-        duckdb.sql(self.queries.export_json_query(filename))
+        self.queries.connection.sql(self.queries.export_json_query(filename))
 
     def write_json_newline_delimited(self, export_filename=None, normalize_columns=False):
         """
@@ -448,7 +455,7 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
         """
         filename = self.queries.set_export_filename(CSVEngineProperties.json_newline_export_filename, export_filename)
         self.queries.create_table(normalize_columns)
-        duckdb.sql(self.queries.export_json_newline_delimited_query(filename))
+        self.queries.connection.sql(self.queries.export_json_newline_delimited_query(filename))
 
     def write_parquet(self, export_filename=None, normalize_columns=False):
         """
@@ -461,7 +468,7 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
         """
         filename = self.queries.set_export_filename(CSVEngineProperties.parquet_export_filename, export_filename)
         self.queries.create_table(normalize_columns)
-        duckdb.sql(self.queries.export_parquet_query(filename))
+        self.queries.connection.sql(self.queries.export_parquet_query(filename))
 
 
 class CSVWriterPolarsEngine(CSVBaseWriterEngine):
@@ -618,13 +625,16 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
         Args:
             normalize_columns (optional, bool): Whether to normalize column
             names.
+
+        Returns:
+            A Polars DataFrame containing the sample rows.
         """
         table = self._create_table_sample(normalize_columns)
-        # Convert to Polars DataFrame for display
+        # Convert to a Polars DataFrame for a consistent return type
         df = pl.from_arrow(table)
         if isinstance(df, pl.Series):
             df = df.to_frame()
-        print(df)
+        return df
 
     def to_dataframe(self, normalize_columns=False) -> pl.DataFrame:
         """
