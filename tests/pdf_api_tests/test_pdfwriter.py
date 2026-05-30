@@ -98,3 +98,17 @@ class TestPDFWriter:
             if e["type"] == "image"
         ]
         assert len(img_paths) == 2 and len(set(img_paths)) == 1
+
+    def test_write_json_threads_drop_layout_tables(self, sample_pdf, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        import datagrunt.core.pdf_io.pdfcomponents as pc
+
+        calls = []
+        original = pc.drop_layout_tables
+        monkeypatch.setattr(
+            pc,
+            "drop_layout_tables",
+            lambda document, *a, **k: (calls.append(True), original(document, *a, **k))[1],
+        )
+        PDFWriter(sample_pdf).write_json(drop_layout_tables=True)
+        assert calls == [True]

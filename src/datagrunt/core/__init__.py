@@ -36,6 +36,7 @@ from datagrunt.core.pdf_io import (
     PDFReaderPyMuPDFEngine,
     PDFWriterPyMuPDFEngine,
     dedupe_document_images,
+    drop_layout_tables,
     flatten_document_elements,
     parse_document,
     parse_page,
@@ -84,5 +85,6 @@ __all__ = [
     "parse_document",
     "flatten_document_elements",
     "dedupe_document_images",
+    "drop_layout_tables",
     "set_export_filename",
 ]
