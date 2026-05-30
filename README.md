@@ -172,6 +172,10 @@ writer.write_json("report.json", image_output_dir="report_images")
 writer.extract_images(output_dir="report_images")
 ```
 
+When images are written to disk, byte-identical duplicates (common with repeated
+icons or backgrounds) are collapsed to a single file and all references are
+repointed to it. Pass `dedupe=False` / `dedupe_images=False` to keep every copy.
+
 ## Engine Comparison
 
 | Feature | Polars | DuckDB | PyArrow |

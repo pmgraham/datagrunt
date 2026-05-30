@@ -1,7 +1,9 @@
 """PDF component assembly: page parsing, document combination, flattening."""
 
 # standard library
+import hashlib
 import json
+import os
 import time
 from functools import cached_property
 from pathlib import Path
@@ -239,6 +241,51 @@ def flatten_document_elements(document: dict) -> list:
                 }
             )
     return records
+
+
+def dedupe_document_images(document: dict) -> int:
+    """Remove byte-duplicate extracted image files, repointing references.
+
+    Walks the document's image elements, hashes each on-disk file referenced by
+    ``metadata.file_path``, and for any content already seen, repoints the
+    element at the first file and deletes the redundant copy from disk.
+    Elements with no ``file_path`` (metadata-only reads) or whose file is
+    missing are skipped.
+
+    Args:
+        document: A parsed document dict (mutated in place).
+
+    Returns:
+        The number of duplicate image files removed from disk.
+    """
+    seen = {}  # md5 digest -> first file_path that produced it
+    removed = 0
+    pages = document.get("document", {}).get("pages", [])
+    for page in pages:
+        for elem in page.get("elements", []):
+            if elem.get("type") != "image":
+                continue
+            meta = elem.get("metadata") or {}
+            path = meta.get("file_path")
+            if not path or not os.path.isfile(path):
+                continue
+            with open(path, "rb") as f:
+                digest = hashlib.md5(f.read()).hexdigest()
+            first = seen.get(digest)
+            if first is None:
+                seen[digest] = path
+                continue
+            if first == path:
+                # Same file already referenced; repoint is a no-op, never delete.
+                continue
+            meta["file_path"] = first
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            else:
+                removed += 1
+    return removed
 
 
 class PDFComponents(FileProperties):
