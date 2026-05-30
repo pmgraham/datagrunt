@@ -133,3 +133,17 @@ class TestProcessPdfsFlags:
         ]
         # With the filter on, no surviving table may be 1xN or Nx1.
         assert all(t["metadata"]["rows"] >= 2 and t["metadata"]["columns"] >= 2 for t in tables)
+
+
+class TestBatchExports:
+    """process_pdfs should be importable from the package roots."""
+
+    def test_pdf_api_export(self):
+        from datagrunt.pdf_api import process_pdfs as p
+
+        assert p is process_pdfs
+
+    def test_top_level_export(self):
+        from datagrunt import process_pdfs as p
+
+        assert p is process_pdfs
