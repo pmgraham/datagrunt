@@ -160,3 +160,41 @@ class TestPDFWriterDedupe:
         assert len(img_paths) == 2
         assert len(set(img_paths)) == 1
         assert all(os.path.isfile(p) for p in img_paths)
+
+
+class TestDropLayoutTablesThreading:
+    """Verify the drop_layout_tables flag is plumbed through the engines."""
+
+    def _spy(self, monkeypatch):
+        import datagrunt.core.pdf_io.pdfcomponents as pc
+
+        calls = []
+        original = pc.drop_layout_tables
+
+        def spy(document, *args, **kwargs):
+            calls.append(True)
+            return original(document, *args, **kwargs)
+
+        monkeypatch.setattr(pc, "drop_layout_tables", spy)
+        return calls
+
+    def test_reader_to_dicts_invokes_filter_when_true(self, sample_pdf, monkeypatch):
+        calls = self._spy(monkeypatch)
+        PDFReaderPyMuPDFEngine(sample_pdf).to_dicts(drop_layout_tables=True)
+        assert calls == [True]
+
+    def test_reader_to_dicts_default_does_not_filter(self, sample_pdf, monkeypatch):
+        calls = self._spy(monkeypatch)
+        PDFReaderPyMuPDFEngine(sample_pdf).to_dicts()
+        assert calls == []
+
+    def test_reader_to_dataframe_threads_flag(self, sample_pdf, monkeypatch):
+        calls = self._spy(monkeypatch)
+        PDFReaderPyMuPDFEngine(sample_pdf).to_dataframe(drop_layout_tables=True)
+        assert calls == [True]
+
+    def test_writer_write_json_threads_flag(self, sample_pdf, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        calls = self._spy(monkeypatch)
+        PDFWriterPyMuPDFEngine(sample_pdf).write_json(drop_layout_tables=True)
+        assert calls == [True]
