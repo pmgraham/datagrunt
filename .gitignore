@@ -155,3 +155,5 @@ data_local/
 uv.lock
 .ruff_cache/
 lint.sh
+# Superpowers planning docs (local only)
+docs/superpowers/
