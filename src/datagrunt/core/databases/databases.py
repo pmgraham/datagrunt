@@ -1,6 +1,7 @@
 """Module for interfacing with databases."""
 
 # standard library
+import hashlib
 import re
 from pathlib import Path
 
@@ -69,12 +70,41 @@ class DuckDBQueries:
         """
         Initialize the DuckDBQueries class.
 
+        Each instance owns a private in-memory DuckDB connection so that
+        concurrent readers/writers - or simply multiple instances in the
+        same process - never share global state. Combined with a table name
+        that is unique per file path, this prevents one file's table from
+        silently overwriting another's.
+
         Args:
             filepath (str or Path): Path to the file.
         """
         self.filepath = Path(filepath)
         self.delimiter = CSVDelimiter(filepath).delimiter
-        self.database_table_name = DuckDBDatabase(filepath).database_table_name
+        self.database_table_name = self._set_database_table_name()
+        self.connection = duckdb.connect(":memory:")
+
+    def _format_filename_string(self):
+        """Remove all non alphanumeric characters from the file stem."""
+        return re.sub(r"[^a-zA-Z0-9]", "", self.filepath.stem)
+
+    def _set_database_table_name(self):
+        """Return a unique, deterministic table name for this file.
+
+        The name combines the sanitized file stem with a short hash of the
+        file's absolute path. The hash is deterministic, so every
+        DuckDBQueries instance created for the same file agrees on the same
+        table name (callers can therefore still reference ``db_table`` in
+        their queries). At the same time, two different files that happen to
+        share a stem (e.g. ``dirA/data.csv`` and ``dirB/data.csv``) resolve
+        to distinct tables and cannot overwrite each other.
+
+        Returns:
+            str: The unique table name.
+        """
+        stem = self._format_filename_string()
+        path_hash = hashlib.sha1(str(self.filepath.resolve()).encode()).hexdigest()[:8]  # noqa: E501
+        return f"{stem}_{path_hash}"
 
     def set_export_filename(self, default_filename, export_filename=None):
         """
@@ -217,11 +247,11 @@ class DuckDBQueries:
         this method uses the CSVColumnNameNormalizer class to ensure
         consistent naming conventions across different processing engines.
         """
-        duckdb.sql(self.import_csv_query())
-        table_columns = duckdb.sql(f"SELECT * FROM {self.database_table_name} LIMIT 0").columns
+        self.connection.sql(self.import_csv_query())
+        table_columns = self.connection.sql(f"SELECT * FROM {self.database_table_name} LIMIT 0").columns
         for old_name, new_name in zip(table_columns, CSVColumnNameNormalizer(self.filepath).columns_normalized):
             sql_string = f'ALTER TABLE {self.database_table_name} RENAME COLUMN "{old_name}" TO "{new_name}"'
-            duckdb.sql(sql_string)
+            self.connection.sql(sql_string)
 
     def create_table(self, normalize_columns=False):
         """Create a DuckDB table from the CSV file.
@@ -232,8 +262,8 @@ class DuckDBQueries:
         if normalize_columns:
             self.update_and_normalize_column_names()
         else:
-            duckdb.sql(self.import_csv_query())
-        return duckdb.sql(self.select_from_duckdb_table()).execute()
+            self.connection.sql(self.import_csv_query())
+        return self.connection.sql(self.select_from_duckdb_table()).execute()
 
     def _normalize_dataframe_columns(self, dataframe):
         """Applies column name normalization to a Polars DataFrame.
@@ -261,10 +291,10 @@ class DuckDBQueries:
             polars.DataFrame: The resulting DataFrame.
         """
         # Ensure the table is created with original column names for querying
-        duckdb.sql(self.import_csv_query())
+        self.connection.sql(self.import_csv_query())
 
         # Execute the user's query
-        result_df = duckdb.sql(sql_query).pl()
+        result_df = self.connection.sql(sql_query).pl()
 
         if normalize_columns:
             result_df = self._normalize_dataframe_columns(result_df)
