@@ -140,6 +140,38 @@ report = schema_analyzer.generate_csv_schema_report(
 print(report)  # Detailed JSON schema with data types, classifications, and more
 ```
 
+## PDF parsing
+
+PDF support is an optional extra:
+
+```bash
+pip install datagrunt[pdf]
+```
+
+OCR of scanned pages additionally requires the **Tesseract** system binary
+(e.g. `brew install tesseract` on macOS, `apt-get install tesseract-ocr` on
+Debian/Ubuntu). On Windows, Tesseract runs natively (no WSL needed) via the
+[UB-Mannheim installer](https://github.com/UB-Mannheim/tesseract/wiki) or a
+package manager (`winget install UB-Mannheim.TesseractOCR`,
+`choco install tesseract`, or `scoop install tesseract`); after installing,
+either add the Tesseract directory to your PATH or point pytesseract at it
+with `pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"`.
+Native-text PDFs, tables, and embedded images work without it.
+
+```python
+from datagrunt import PDFReader, PDFWriter
+
+# Parse a PDF into the unified document structure.
+reader = PDFReader("report.pdf")
+document = reader.to_dicts()           # {"document": {"pages": [...]}}
+df = reader.to_dataframe()             # one row per extracted element
+
+# Write JSON and extract embedded images to disk.
+writer = PDFWriter("report.pdf")
+writer.write_json("report.json", image_output_dir="report_images")
+writer.extract_images(output_dir="report_images")
+```
+
 ## Engine Comparison
 
 | Feature | Polars | DuckDB | PyArrow |
