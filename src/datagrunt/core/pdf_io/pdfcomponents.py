@@ -288,6 +288,39 @@ def dedupe_document_images(document: dict) -> int:
     return removed
 
 
+def drop_layout_tables(document: dict, min_rows: int = 2, min_cols: int = 2) -> int:
+    """Drop table elements that look like layout boxes rather than real tables.
+
+    Line-based table detection fires on decorative boxes and single rule lines
+    in graphically dense PDFs, producing 1xN or Nx1 "tables". This optional
+    post-filter removes any ``table`` element whose ``metadata.rows`` is below
+    ``min_rows`` or ``metadata.columns`` is below ``min_cols``. Non-table
+    elements are never touched.
+
+    Args:
+        document: A parsed document dict (mutated in place).
+        min_rows: Minimum rows for a table to be kept (default 2).
+        min_cols: Minimum columns for a table to be kept (default 2).
+
+    Returns:
+        The number of table elements dropped.
+    """
+    removed = 0
+    pages = document.get("document", {}).get("pages", [])
+    for page in pages:
+        elements = page.get("elements", [])
+        kept = []
+        for elem in elements:
+            if elem.get("type") == "table":
+                meta = elem.get("metadata") or {}
+                if meta.get("rows", 0) < min_rows or meta.get("columns", 0) < min_cols:
+                    removed += 1
+                    continue
+            kept.append(elem)
+        page["elements"] = kept
+    return removed
+
+
 class PDFComponents(FileProperties):
     """A class that combines PDF components into a single interface."""
 

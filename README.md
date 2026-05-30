@@ -176,6 +176,12 @@ When images are written to disk, byte-identical duplicates (common with repeated
 icons or backgrounds) are collapsed to a single file and all references are
 repointed to it. Pass `dedupe=False` / `dedupe_images=False` to keep every copy.
 
+On graphically dense PDFs, line-based table detection can pick up decorative
+boxes and rule lines as 1×N or N×1 "tables". Pass `drop_layout_tables=True` to
+the reader (`to_dicts`, `to_dataframe`, `to_arrow_table`) or writer
+(`write_json`, `write_json_newline_delimited`) to discard those and keep only
+tables with at least two rows and two columns. It is off by default.
+
 ## Engine Comparison
 
 | Feature | Polars | DuckDB | PyArrow |

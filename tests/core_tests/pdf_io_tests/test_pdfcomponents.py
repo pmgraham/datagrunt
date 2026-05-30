@@ -135,3 +135,66 @@ class TestDedupeImages:
 
         assert removed == 0
         assert a.exists()
+
+
+class TestDropLayoutTables:
+    """Test suite for drop_layout_tables."""
+
+    @staticmethod
+    def _table(rows, cols):
+        return {
+            "id": "t",
+            "type": "table",
+            "content": [[None] * cols] * rows,
+            "page": 1,
+            "position": {"x": 0, "y": 0, "w": 10, "h": 10},
+            "confidence": 1.0,
+            "metadata": {"rows": rows, "columns": cols, "has_header_row": False},
+        }
+
+    @staticmethod
+    def _header():
+        return {
+            "id": "h",
+            "type": "header",
+            "content": "Title",
+            "page": 1,
+            "position": {"x": 0, "y": 0, "w": 10, "h": 10},
+            "confidence": 1.0,
+            "metadata": {},
+        }
+
+    def test_drops_one_dimensional_tables_keeps_real_ones(self):
+        document = {
+            "document": {
+                "pages": [
+                    {
+                        "page_number": 1,
+                        "elements": [
+                            self._header(),
+                            self._table(2, 2),  # real table -> keep
+                            self._table(1, 3),  # single row -> drop
+                            self._table(3, 1),  # single column -> drop
+                            self._table(2, 1),  # single column -> drop
+                        ],
+                    }
+                ]
+            }
+        }
+
+        removed = pdfcomponents.drop_layout_tables(document)
+
+        assert removed == 3
+        kept = document["document"]["pages"][0]["elements"]
+        # header preserved, only the 2x2 table remains among tables
+        assert [e["type"] for e in kept] == ["header", "table"]
+        tbl = next(e for e in kept if e["type"] == "table")
+        assert (tbl["metadata"]["rows"], tbl["metadata"]["columns"]) == (2, 2)
+
+    def test_non_table_elements_never_dropped(self):
+        document = {
+            "document": {"pages": [{"page_number": 1, "elements": [self._header()]}]}
+        }
+        removed = pdfcomponents.drop_layout_tables(document)
+        assert removed == 0
+        assert len(document["document"]["pages"][0]["elements"]) == 1
