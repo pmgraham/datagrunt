@@ -1,6 +1,7 @@
 """Module to create engines for PDF processing."""
 
 # standard library
+import json
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -127,3 +128,84 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
         if not records:
             return pa.Table.from_pydict({})
         return pa.Table.from_pylist(records)
+
+
+class PDFBaseWriterEngine(ABC):
+    """Abstract base class defining the interface for PDF writer engines."""
+
+    def __init__(self, filepath, workers: int = 4):
+        """Initialize the PDF writer engine.
+
+        Args:
+            filepath (str or Path): Path to the PDF file.
+            workers (int): Number of concurrent per-page workers.
+        """
+        self.filepath = Path(filepath)
+        self.workers = workers
+        self.properties = PDFEngineProperties(filepath=self.filepath)
+        if not self.filepath.exists():
+            raise FileNotFoundError
+
+    @abstractmethod
+    def write_json(self, export_filename=None, image_output_dir=None):
+        """Write the unified document JSON to disk."""
+        pass
+
+    @abstractmethod
+    def write_json_newline_delimited(self, export_filename=None, image_output_dir=None):
+        """Write one element per line as JSON Lines."""
+        pass
+
+    @abstractmethod
+    def extract_images(self, output_dir=None):
+        """Write embedded images to disk; return their paths."""
+        pass
+
+
+class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
+    """Write parsed PDF output (JSON + image files) using PyMuPDF."""
+
+    def _reader(self):
+        return PDFReaderPyMuPDFEngine(self.filepath, workers=self.workers)
+
+    def write_json(self, export_filename=None, image_output_dir=None):
+        """Parse the PDF and write the unified document JSON.
+
+        Args:
+            export_filename (optional, str): Output path; defaults to output.json.
+            image_output_dir (optional, str): If provided, embedded images are
+                written here and referenced in the JSON; otherwise image
+                ``file_path`` values are null.
+        """
+        filename = set_export_filename(
+            self.properties.json_export_filename, export_filename
+        )
+        document = self._reader().to_dicts(image_output_dir=image_output_dir)
+        with open(filename, "w") as f:
+            json.dump(document, f, indent=2)
+        return filename
+
+    def write_json_newline_delimited(self, export_filename=None, image_output_dir=None):
+        """Parse the PDF and write one flattened element per line (JSONL)."""
+        filename = set_export_filename(
+            self.properties.json_newline_export_filename, export_filename
+        )
+        document = self._reader().to_dicts(image_output_dir=image_output_dir)
+        records = pdfcomponents.flatten_document_elements(document)
+        with open(filename, "w") as f:
+            for record in records:
+                f.write(json.dumps(record) + "\n")
+        return filename
+
+    def extract_images(self, output_dir=None):
+        """Parse the PDF, write embedded images to disk, return their paths."""
+        directory = output_dir if output_dir else self.properties.images_export_dir
+        document = self._reader().to_dicts(image_output_dir=directory)
+        paths = []
+        for page in document.get("document", {}).get("pages", []):
+            for elem in page.get("elements", []):
+                if elem.get("type") == "image":
+                    fp = (elem.get("metadata") or {}).get("file_path")
+                    if fp:
+                        paths.append(fp)
+        return paths
