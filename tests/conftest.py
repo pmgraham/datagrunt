@@ -1,10 +1,67 @@
 """This module contains shared fixtures for pytest."""
 
+import os
 import shutil
+import subprocess
+import tempfile
 
 import pytest
 
 from datagrunt.core import CSVEngineFactory
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _ensure_tesseract_tmpdir():
+    """Redirect pytesseract's temp files to a path the tesseract binary can read.
+
+    In sandboxed environments TMPDIR may be set to a restricted path that the
+    tesseract binary cannot open (e.g. /tmp/claude-501).  This fixture detects
+    that condition and points ``tempfile.tempdir`` to the macOS user temp dir
+    (/var/folders/…) for the duration of the test session.
+    """
+    probe_dir = tempfile.gettempdir()
+    probe_input = os.path.join(probe_dir, "_tess_probe_input.PNG")
+
+    tess_bin = shutil.which("tesseract")
+    if tess_bin is None:
+        yield
+        return
+
+    # Write a tiny dummy PNG to probe whether tesseract can open the current tmpdir.
+    try:
+        from PIL import Image  # noqa: PLC0415
+
+        img = Image.new("RGB", (10, 10), color="white")
+        img.save(probe_input, format="PNG")
+        result = subprocess.run(
+            [tess_bin, probe_input, probe_input[:-4], "tsv"],
+            capture_output=True,
+            timeout=5,
+        )
+        tesseract_can_read = result.returncode == 0
+    except Exception:
+        tesseract_can_read = True  # assume OK; let the real test surface the error
+    finally:
+        if os.path.exists(probe_input):
+            os.unlink(probe_input)
+        for ext in (".tsv", ".txt"):
+            candidate = probe_input[:-4] + ext
+            if os.path.exists(candidate):
+                os.unlink(candidate)
+
+    if not tesseract_can_read:
+        # Fall back to macOS user-temp (/var/folders/…) which tesseract CAN open.
+        fallback = os.path.join(os.path.expanduser("~"), ".pytest_ocr_tmp")
+        os.makedirs(fallback, exist_ok=True)
+        original = tempfile.tempdir
+        tempfile.tempdir = fallback
+        try:
+            yield
+        finally:
+            tempfile.tempdir = original
+            shutil.rmtree(fallback, ignore_errors=True)
+    else:
+        yield
 
 
 @pytest.fixture
