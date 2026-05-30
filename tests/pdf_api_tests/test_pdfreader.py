@@ -47,6 +47,42 @@ class TestPDFReader:
             reader.to_dicts()
 
 
+class TestDropLayoutTablesPassthrough:
+    """Verify PDFReader threads drop_layout_tables to the filter."""
+
+    def _spy(self, monkeypatch):
+        import datagrunt.core.pdf_io.pdfcomponents as pc
+
+        calls = []
+        original = pc.drop_layout_tables
+        monkeypatch.setattr(
+            pc,
+            "drop_layout_tables",
+            lambda document, *a, **k: (calls.append(True), original(document, *a, **k))[1],
+        )
+        return calls
+
+    def test_to_dicts_threads_flag(self, sample_pdf, monkeypatch):
+        calls = self._spy(monkeypatch)
+        PDFReader(sample_pdf).to_dicts(drop_layout_tables=True)
+        assert calls == [True]
+
+    def test_to_dataframe_threads_flag(self, sample_pdf, monkeypatch):
+        calls = self._spy(monkeypatch)
+        PDFReader(sample_pdf).to_dataframe(drop_layout_tables=True)
+        assert calls == [True]
+
+    def test_to_arrow_table_threads_flag(self, sample_pdf, monkeypatch):
+        calls = self._spy(monkeypatch)
+        PDFReader(sample_pdf).to_arrow_table(drop_layout_tables=True)
+        assert calls == [True]
+
+    def test_default_off(self, sample_pdf, monkeypatch):
+        calls = self._spy(monkeypatch)
+        PDFReader(sample_pdf).to_dicts()
+        assert calls == []
+
+
 class TestTopLevelExports:
     """Verify PDF classes are importable from the package root."""
 

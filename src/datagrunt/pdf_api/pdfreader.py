@@ -41,37 +41,47 @@ class PDFReader(PDFComponents):
             return self._return_empty_file_object({})
         return self._create_reader().get_sample()
 
-    def to_dicts(self, image_output_dir=None):
+    def to_dicts(self, image_output_dir=None, drop_layout_tables=False):
         """Parse the PDF into the unified document dict.
 
         Args:
             image_output_dir (optional, str): If provided, embedded images are
                 written here and referenced in the result; otherwise image
                 ``file_path`` values are null.
+            drop_layout_tables (bool, default False): Drop 1xN / Nx1 "tables"
+                that are layout boxes rather than real tabular data.
 
         Returns:
             dict: ``{"document": {... "pages": [...]}}``.
         """
         if self.is_empty:
             return self._return_empty_file_object({})
-        return self._create_reader().to_dicts(image_output_dir=image_output_dir)
+        return self._create_reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
 
-    def to_dataframe(self):
+    def to_dataframe(self, drop_layout_tables=False):
         """Parse the PDF and flatten elements into a Polars DataFrame.
+
+        Args:
+            drop_layout_tables (bool, default False): Drop 1xN / Nx1 "tables"
+                that are layout boxes rather than real tabular data.
 
         Returns:
             A Polars DataFrame with one row per extracted element.
         """
         if self.is_empty:
             return self._return_empty_file_object(pl.DataFrame())
-        return self._create_reader().to_dataframe()
+        return self._create_reader().to_dataframe(drop_layout_tables=drop_layout_tables)
 
-    def to_arrow_table(self):
+    def to_arrow_table(self, drop_layout_tables=False):
         """Parse the PDF and flatten elements into a PyArrow table.
+
+        Args:
+            drop_layout_tables (bool, default False): Drop 1xN / Nx1 "tables"
+                that are layout boxes rather than real tabular data.
 
         Returns:
             A PyArrow table with one row per extracted element.
         """
         if self.is_empty:
             return self._return_empty_file_object(pa.Table.from_pydict({}))
-        return self._create_reader().to_arrow_table()
+        return self._create_reader().to_arrow_table(drop_layout_tables=drop_layout_tables)

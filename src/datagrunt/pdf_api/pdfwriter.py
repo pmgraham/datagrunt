@@ -27,7 +27,7 @@ class PDFWriter(PDFComponents):
         """Create a writer engine instance."""
         return PDFEngineFactory(self.filepath, self.engine, self.workers).create_writer()
 
-    def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True):
+    def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
         """Parse the PDF and write the unified document JSON to disk.
 
         Args:
@@ -36,13 +36,17 @@ class PDFWriter(PDFComponents):
                 written there and referenced in the JSON.
             dedupe_images (bool, default True): When images are written, collapse
                 byte-identical duplicates to a single file and repoint references.
+            drop_layout_tables (bool, default False): Drop 1xN / Nx1 "tables"
+                that are layout boxes rather than real tabular data.
 
         Returns:
             str: The path of the written JSON file.
         """
-        return self._create_writer().write_json(export_filename, image_output_dir, dedupe_images)
+        return self._create_writer().write_json(export_filename, image_output_dir, dedupe_images, drop_layout_tables)
 
-    def write_json_newline_delimited(self, export_filename=None, image_output_dir=None, dedupe_images=True):
+    def write_json_newline_delimited(
+        self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False
+    ):
         """Parse the PDF and write one flattened element per line (JSONL).
 
         Args:
@@ -51,11 +55,15 @@ class PDFWriter(PDFComponents):
                 written there.
             dedupe_images (bool, default True): When images are written, collapse
                 byte-identical duplicates to a single file and repoint references.
+            drop_layout_tables (bool, default False): Drop 1xN / Nx1 "tables"
+                that are layout boxes rather than real tabular data.
 
         Returns:
             str: The path of the written JSONL file.
         """
-        return self._create_writer().write_json_newline_delimited(export_filename, image_output_dir, dedupe_images)
+        return self._create_writer().write_json_newline_delimited(
+            export_filename, image_output_dir, dedupe_images, drop_layout_tables
+        )
 
     def extract_images(self, output_dir=None, dedupe=True):
         """Parse the PDF and write embedded image files to disk.
