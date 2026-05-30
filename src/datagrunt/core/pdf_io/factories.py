@@ -36,9 +36,7 @@ class PDFEngineFactory:
         if not self.filepath.exists():
             raise FileNotFoundError
         if self.engine not in PDFEngineProperties.valid_engines:
-            raise ValueError(
-                PDFEngineProperties.value_error_message.format(engine=self.engine)
-            )
+            raise ValueError(PDFEngineProperties.value_error_message.format(engine=self.engine))
 
     def create_reader(self):
         """Create a PDF reader engine instance."""

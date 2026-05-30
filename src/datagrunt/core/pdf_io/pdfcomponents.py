@@ -60,73 +60,79 @@ def parse_page(pdf_path: str, page_index: int, image_output_dir: str = None) -> 
         text_result = extractors.extract_text_blocks(pdf_path, page_index)
         if text_result.get("status") == "success":
             for block in text_result.get("blocks", []):
-                elements.append({
-                    "id": gen_elem_id(),
-                    "type": block["classification"],
-                    "content": block["text"],
-                    "page": page_index + 1,
-                    "position": {
-                        "x": block["bbox"]["x"],
-                        "y": block["bbox"]["y"],
-                        "w": block["bbox"]["w"],
-                        "h": block["bbox"]["h"],
-                    },
-                    "confidence": 1.0,
-                    "metadata": {
-                        "font": block["font"],
-                        "font_size": block["font_size"],
-                        "is_bold": block["is_bold"],
-                        "is_italic": block["is_italic"],
-                        "reading_order": block["reading_order"],
-                    },
-                })
+                elements.append(
+                    {
+                        "id": gen_elem_id(),
+                        "type": block["classification"],
+                        "content": block["text"],
+                        "page": page_index + 1,
+                        "position": {
+                            "x": block["bbox"]["x"],
+                            "y": block["bbox"]["y"],
+                            "w": block["bbox"]["w"],
+                            "h": block["bbox"]["h"],
+                        },
+                        "confidence": 1.0,
+                        "metadata": {
+                            "font": block["font"],
+                            "font_size": block["font_size"],
+                            "is_bold": block["is_bold"],
+                            "is_italic": block["is_italic"],
+                            "reading_order": block["reading_order"],
+                        },
+                    }
+                )
     elif is_scanned:
         is_large_format = width > LARGE_FORMAT_DIMENSION or height > LARGE_FORMAT_DIMENSION
         page_dpi = LARGE_FORMAT_DPI if is_large_format else STANDARD_DPI
         ocr_result = extractors.ocr_page(pdf_path, page_index, dpi=page_dpi)
         if ocr_result.get("status") == "success":
             for block in ocr_result.get("blocks", []):
-                elements.append({
-                    "id": gen_elem_id(),
-                    "type": "body_text",
-                    "content": block["text"],
-                    "page": page_index + 1,
-                    "position": {
-                        "x": block["bbox"]["x"],
-                        "y": block["bbox"]["y"],
-                        "w": block["bbox"]["w"],
-                        "h": block["bbox"]["h"],
-                    },
-                    "confidence": block["confidence"] / 100.0,
-                    "metadata": {
-                        "ocr_engine": "tesseract",
-                        "word_count": block["word_count"],
-                    },
-                })
+                elements.append(
+                    {
+                        "id": gen_elem_id(),
+                        "type": "body_text",
+                        "content": block["text"],
+                        "page": page_index + 1,
+                        "position": {
+                            "x": block["bbox"]["x"],
+                            "y": block["bbox"]["y"],
+                            "w": block["bbox"]["w"],
+                            "h": block["bbox"]["h"],
+                        },
+                        "confidence": block["confidence"] / 100.0,
+                        "metadata": {
+                            "ocr_engine": "tesseract",
+                            "word_count": block["word_count"],
+                        },
+                    }
+                )
 
     # 2. Tables.
     if has_lines or not has_text_layer:
         table_result = extractors.extract_tables(pdf_path, page_index)
         if table_result.get("status") == "success":
             for table in table_result.get("tables", []):
-                elements.append({
-                    "id": gen_elem_id(),
-                    "type": "table",
-                    "content": table["data"],
-                    "page": page_index + 1,
-                    "position": {
-                        "x": table["bbox"]["x"],
-                        "y": table["bbox"]["y"],
-                        "w": table["bbox"]["w"],
-                        "h": table["bbox"]["h"],
-                    },
-                    "confidence": 1.0,
-                    "metadata": {
-                        "rows": table["rows"],
-                        "columns": table["columns"],
-                        "has_header_row": table["has_header_row"],
-                    },
-                })
+                elements.append(
+                    {
+                        "id": gen_elem_id(),
+                        "type": "table",
+                        "content": table["data"],
+                        "page": page_index + 1,
+                        "position": {
+                            "x": table["bbox"]["x"],
+                            "y": table["bbox"]["y"],
+                            "w": table["bbox"]["w"],
+                            "h": table["bbox"]["h"],
+                        },
+                        "confidence": 1.0,
+                        "metadata": {
+                            "rows": table["rows"],
+                            "columns": table["columns"],
+                            "has_header_row": table["has_header_row"],
+                        },
+                    }
+                )
 
     # 3. Images.
     if image_count > 0:
@@ -135,25 +141,27 @@ def parse_page(pdf_path: str, page_index: int, image_output_dir: str = None) -> 
         )
         if image_result.get("status") == "success":
             for img in image_result.get("images", []):
-                elements.append({
-                    "id": gen_elem_id(),
-                    "type": "image",
-                    "content": None,
-                    "page": page_index + 1,
-                    "position": {
-                        "x": img["bbox"]["x"],
-                        "y": img["bbox"]["y"],
-                        "w": img["bbox"]["w"],
-                        "h": img["bbox"]["h"],
-                    },
-                    "confidence": 1.0,
-                    "metadata": {
-                        "file_path": img["file_path"],
-                        "format": img["format"],
-                        "width_px": img["width_px"],
-                        "height_px": img["height_px"],
-                    },
-                })
+                elements.append(
+                    {
+                        "id": gen_elem_id(),
+                        "type": "image",
+                        "content": None,
+                        "page": page_index + 1,
+                        "position": {
+                            "x": img["bbox"]["x"],
+                            "y": img["bbox"]["y"],
+                            "w": img["bbox"]["w"],
+                            "h": img["bbox"]["h"],
+                        },
+                        "confidence": 1.0,
+                        "metadata": {
+                            "file_path": img["file_path"],
+                            "format": img["format"],
+                            "width_px": img["width_px"],
+                            "height_px": img["height_px"],
+                        },
+                    }
+                )
 
     classification = "mixed"
     if is_scanned:
@@ -213,21 +221,23 @@ def flatten_document_elements(document: dict) -> list:
         for elem in page.get("elements", []):
             pos = elem.get("position", {})
             content = elem.get("content")
-            content_str = content if isinstance(content, str) else (
-                json.dumps(content) if content is not None else None
+            content_str = (
+                content if isinstance(content, str) else (json.dumps(content) if content is not None else None)
             )
-            records.append({
-                "id": elem.get("id"),
-                "type": elem.get("type"),
-                "page": elem.get("page"),
-                "x": float(pos.get("x", 0.0)),
-                "y": float(pos.get("y", 0.0)),
-                "w": float(pos.get("w", 0.0)),
-                "h": float(pos.get("h", 0.0)),
-                "confidence": float(elem.get("confidence", 0.0)),
-                "content": content_str,
-                "metadata": json.dumps(elem.get("metadata") or {}),
-            })
+            records.append(
+                {
+                    "id": elem.get("id"),
+                    "type": elem.get("type"),
+                    "page": elem.get("page"),
+                    "x": float(pos.get("x", 0.0)),
+                    "y": float(pos.get("y", 0.0)),
+                    "w": float(pos.get("w", 0.0)),
+                    "h": float(pos.get("h", 0.0)),
+                    "confidence": float(elem.get("confidence", 0.0)),
+                    "content": content_str,
+                    "metadata": json.dumps(elem.get("metadata") or {}),
+                }
+            )
     return records
 
 

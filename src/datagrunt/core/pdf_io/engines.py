@@ -35,9 +35,7 @@ class PDFEngineProperties:
     json_newline_export_filename: str = "output.jsonl"
     images_export_dir: str = "output_images"
     valid_engines: tuple = ("pymupdf",)
-    value_error_message: str = (
-        "Engine '{engine}' is not 'pymupdf'. Pass 'pymupdf' as a valid engine param."
-    )
+    value_error_message: str = "Engine '{engine}' is not 'pymupdf'. Pass 'pymupdf' as a valid engine param."
 
 
 class PDFBaseReaderEngine(ABC):
@@ -95,9 +93,7 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
 
         with ThreadPoolExecutor(max_workers=self.workers) as executor:
             futures = {
-                executor.submit(
-                    pdfcomponents.parse_page, str(self.filepath), idx, image_output_dir
-                ): idx
+                executor.submit(pdfcomponents.parse_page, str(self.filepath), idx, image_output_dir): idx
                 for idx in range(total_pages)
             }
             for future in as_completed(futures):
@@ -177,9 +173,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
                 written here and referenced in the JSON; otherwise image
                 ``file_path`` values are null.
         """
-        filename = set_export_filename(
-            self.properties.json_export_filename, export_filename
-        )
+        filename = set_export_filename(self.properties.json_export_filename, export_filename)
         document = self._reader().to_dicts(image_output_dir=image_output_dir)
         with open(filename, "w") as f:
             json.dump(document, f, indent=2)
@@ -187,9 +181,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
 
     def write_json_newline_delimited(self, export_filename=None, image_output_dir=None):
         """Parse the PDF and write one flattened element per line (JSONL)."""
-        filename = set_export_filename(
-            self.properties.json_newline_export_filename, export_filename
-        )
+        filename = set_export_filename(self.properties.json_newline_export_filename, export_filename)
         document = self._reader().to_dicts(image_output_dir=image_output_dir)
         records = pdfcomponents.flatten_document_elements(document)
         with open(filename, "w") as f:

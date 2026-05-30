@@ -5,10 +5,7 @@ performed lazily inside each function so that ``import datagrunt`` works on a
 base install without the optional ``[pdf]`` extra.
 """
 
-PDF_EXTRA_HINT = (
-    "PDF parsing requires extra dependencies. "
-    "Install with: pip install datagrunt[pdf]"
-)
+PDF_EXTRA_HINT = "PDF parsing requires extra dependencies. Install with: pip install datagrunt[pdf]"
 
 
 def _import_pymupdf():
@@ -58,9 +55,7 @@ def analyze_page(pdf_path: str, page_number: int) -> dict:
         is_scanned = not has_text_layer and len(images) > 0
 
         drawings = page.get_drawings()
-        has_lines = any(
-            item[0] in ("l", "re") for d in drawings for item in d.get("items", [])
-        )
+        has_lines = any(item[0] in ("l", "re") for d in drawings for item in d.get("items", []))
 
         result = {
             "status": "success",
@@ -164,21 +159,23 @@ def extract_text_blocks(pdf_path: str, page_number: int) -> dict:
             bbox = block["bbox"]
             classification = _classify_block(dominant_size, is_bold, all_sizes)
 
-            blocks.append({
-                "text": full_text,
-                "bbox": {
-                    "x": round(bbox[0], 2),
-                    "y": round(bbox[1], 2),
-                    "w": round(bbox[2] - bbox[0], 2),
-                    "h": round(bbox[3] - bbox[1], 2),
-                },
-                "font": dominant_font,
-                "font_size": round(dominant_size, 1),
-                "is_bold": is_bold,
-                "is_italic": is_italic,
-                "classification": classification,
-                "reading_order": order,
-            })
+            blocks.append(
+                {
+                    "text": full_text,
+                    "bbox": {
+                        "x": round(bbox[0], 2),
+                        "y": round(bbox[1], 2),
+                        "w": round(bbox[2] - bbox[0], 2),
+                        "h": round(bbox[3] - bbox[1], 2),
+                    },
+                    "font": dominant_font,
+                    "font_size": round(dominant_size, 1),
+                    "is_bold": is_bold,
+                    "is_italic": is_italic,
+                    "classification": classification,
+                    "reading_order": order,
+                }
+            )
     finally:
         doc.close()
 
@@ -229,23 +226,22 @@ def extract_tables(pdf_path: str, page_number: int) -> dict:
             num_rows = len(data)
             num_cols = max(len(row) for row in data) if data else 0
 
-            has_header = (
-                num_rows > 1
-                and all(cell is not None and cell.strip() for cell in data[0])
-            )
+            has_header = num_rows > 1 and all(cell is not None and cell.strip() for cell in data[0])
 
-            tables.append({
-                "data": data,
-                "bbox": {
-                    "x": round(bbox[0], 2),
-                    "y": round(bbox[1], 2),
-                    "w": round(bbox[2] - bbox[0], 2),
-                    "h": round(bbox[3] - bbox[1], 2),
-                },
-                "rows": num_rows,
-                "columns": num_cols,
-                "has_header_row": has_header,
-            })
+            tables.append(
+                {
+                    "data": data,
+                    "bbox": {
+                        "x": round(bbox[0], 2),
+                        "y": round(bbox[1], 2),
+                        "w": round(bbox[2] - bbox[0], 2),
+                        "h": round(bbox[3] - bbox[1], 2),
+                    },
+                    "rows": num_rows,
+                    "columns": num_cols,
+                    "has_header_row": has_header,
+                }
+            )
     finally:
         pdf.close()
 
@@ -331,13 +327,15 @@ def extract_images(
                     "h": round(b[3] - b[1], 2),
                 }
 
-            images.append({
-                "file_path": file_path,
-                "bbox": bbox,
-                "width_px": width,
-                "height_px": height,
-                "format": ext,
-            })
+            images.append(
+                {
+                    "file_path": file_path,
+                    "bbox": bbox,
+                    "width_px": width,
+                    "height_px": height,
+                    "format": ext,
+                }
+            )
     finally:
         doc.close()
 
@@ -423,18 +421,20 @@ def ocr_page(pdf_path: str, page_number: int, dpi: int = 300) -> dict:
         x1 = max(w["left"] + w["width"] for w in words)
         y1 = max(w["top"] + w["height"] for w in words)
 
-        blocks.append({
-            "text": line_text,
-            "bbox": {
-                "x": round(x0 * scale, 2),
-                "y": round(y0 * scale, 2),
-                "w": round((x1 - x0) * scale, 2),
-                "h": round((y1 - y0) * scale, 2),
-            },
-            "confidence": round(avg_conf, 1),
-            "word_count": len(words),
-            "per_word_confidence": [w["confidence"] for w in words],
-        })
+        blocks.append(
+            {
+                "text": line_text,
+                "bbox": {
+                    "x": round(x0 * scale, 2),
+                    "y": round(y0 * scale, 2),
+                    "w": round((x1 - x0) * scale, 2),
+                    "h": round((y1 - y0) * scale, 2),
+                },
+                "confidence": round(avg_conf, 1),
+                "word_count": len(words),
+                "per_word_confidence": [w["confidence"] for w in words],
+            }
+        )
 
     return {
         "status": "success",
