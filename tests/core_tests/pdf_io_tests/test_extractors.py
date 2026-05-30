@@ -85,3 +85,26 @@ class TestExtractImages:
         import os
         assert os.path.isfile(img["file_path"])
         assert os.path.basename(img["file_path"]).startswith("report_page0_img")
+
+
+class TestOcrPage:
+    """Test suite for ocr_page (requires the tesseract system binary)."""
+
+    def test_ocr_returns_blocks(self, sample_pdf, tesseract_available):
+        if not tesseract_available:
+            pytest.skip("tesseract binary not installed")
+        result = extractors.ocr_page(sample_pdf, 0, dpi=150)
+        assert result["status"] == "success"
+        assert result["ocr_engine"] == "tesseract"
+        # Each block carries text, confidence (0-100), bbox, and word_count.
+        if result["blocks"]:
+            block = result["blocks"][0]
+            assert set(block["bbox"]) == {"x", "y", "w", "h"}
+            assert "confidence" in block
+            assert "word_count" in block
+
+    def test_out_of_range_page(self, sample_pdf, tesseract_available):
+        if not tesseract_available:
+            pytest.skip("tesseract binary not installed")
+        result = extractors.ocr_page(sample_pdf, 99)
+        assert result["status"] == "error"
