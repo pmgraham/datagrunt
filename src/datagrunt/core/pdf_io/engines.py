@@ -143,17 +143,17 @@ class PDFBaseWriterEngine(ABC):
             raise FileNotFoundError
 
     @abstractmethod
-    def write_json(self, export_filename=None, image_output_dir=None):
+    def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True):
         """Write the unified document JSON to disk."""
         pass
 
     @abstractmethod
-    def write_json_newline_delimited(self, export_filename=None, image_output_dir=None):
+    def write_json_newline_delimited(self, export_filename=None, image_output_dir=None, dedupe_images=True):
         """Write one element per line as JSON Lines."""
         pass
 
     @abstractmethod
-    def extract_images(self, output_dir=None):
+    def extract_images(self, output_dir=None, dedupe=True):
         """Write embedded images to disk; return their paths."""
         pass
 
@@ -164,7 +164,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
     def _reader(self):
         return PDFReaderPyMuPDFEngine(self.filepath, workers=self.workers)
 
-    def write_json(self, export_filename=None, image_output_dir=None):
+    def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True):
         """Parse the PDF and write the unified document JSON.
 
         Args:
@@ -172,32 +172,48 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
             image_output_dir (optional, str): If provided, embedded images are
                 written here and referenced in the JSON; otherwise image
                 ``file_path`` values are null.
+            dedupe_images (bool, default True): When images are written, collapse
+                byte-identical duplicates to a single file and repoint references.
         """
         filename = set_export_filename(self.properties.json_export_filename, export_filename)
         document = self._reader().to_dicts(image_output_dir=image_output_dir)
+        if image_output_dir and dedupe_images:
+            pdfcomponents.dedupe_document_images(document)
         with open(filename, "w") as f:
             json.dump(document, f, indent=2)
         return filename
 
-    def write_json_newline_delimited(self, export_filename=None, image_output_dir=None):
+    def write_json_newline_delimited(self, export_filename=None, image_output_dir=None, dedupe_images=True):
         """Parse the PDF and write one flattened element per line (JSONL)."""
         filename = set_export_filename(self.properties.json_newline_export_filename, export_filename)
         document = self._reader().to_dicts(image_output_dir=image_output_dir)
+        if image_output_dir and dedupe_images:
+            pdfcomponents.dedupe_document_images(document)
         records = pdfcomponents.flatten_document_elements(document)
         with open(filename, "w") as f:
             for record in records:
                 f.write(json.dumps(record) + "\n")
         return filename
 
-    def extract_images(self, output_dir=None):
-        """Parse the PDF, write embedded images to disk, return their paths."""
+    def extract_images(self, output_dir=None, dedupe=True):
+        """Parse the PDF, write embedded images to disk, return their paths.
+
+        Args:
+            output_dir (optional, str): Output directory; defaults to output_images.
+            dedupe (bool, default True): Collapse byte-identical duplicate images
+                to a single file before returning paths.
+        """
         directory = output_dir if output_dir else self.properties.images_export_dir
         document = self._reader().to_dicts(image_output_dir=directory)
+        if dedupe:
+            pdfcomponents.dedupe_document_images(document)
         paths = []
+        seen = set()
         for page in document.get("document", {}).get("pages", []):
             for elem in page.get("elements", []):
                 if elem.get("type") == "image":
                     fp = (elem.get("metadata") or {}).get("file_path")
-                    if fp:
+                    if fp and fp not in seen:
+                        seen.add(fp)
                         paths.append(fp)
         return paths
