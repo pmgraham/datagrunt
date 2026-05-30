@@ -45,3 +45,17 @@ class TestExtractTextBlocks:
         assert set(block["bbox"]) == {"x", "y", "w", "h"}
         assert "font" in block and "font_size" in block
         assert "reading_order" in block
+
+
+class TestExtractTables:
+    """Test suite for extract_tables."""
+
+    def test_no_tables_on_plain_page(self, sample_pdf):
+        # The sample page has no ruled table; should succeed with empty list.
+        result = extractors.extract_tables(sample_pdf, 0)
+        assert result["status"] == "success"
+        assert result["tables"] == []
+
+    def test_out_of_range_page(self, sample_pdf):
+        result = extractors.extract_tables(sample_pdf, 99)
+        assert result["status"] == "error"
