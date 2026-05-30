@@ -29,6 +29,17 @@ from datagrunt.core.csv_io import (
 )
 from datagrunt.core.databases import DuckDBDatabase, DuckDBQueries
 from datagrunt.core.file_io import FileProperties
+from datagrunt.core.pdf_io import (
+    PDFComponents,
+    PDFEngineFactory,
+    PDFEngineProperties,
+    PDFReaderPyMuPDFEngine,
+    PDFWriterPyMuPDFEngine,
+    flatten_document_elements,
+    parse_document,
+    parse_page,
+    set_export_filename,
+)
 
 __all__ = [
     # AI
@@ -62,4 +73,14 @@ __all__ = [
     "DuckDBQueries",
     # File IO
     "FileProperties",
+    # PDF IO
+    "PDFComponents",
+    "PDFEngineFactory",
+    "PDFEngineProperties",
+    "PDFReaderPyMuPDFEngine",
+    "PDFWriterPyMuPDFEngine",
+    "parse_page",
+    "parse_document",
+    "flatten_document_elements",
+    "set_export_filename",
 ]
