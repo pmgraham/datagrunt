@@ -1,7 +1,7 @@
 """
 Datagrunt
 
-A Python library designed to simplify the way you work with CSV files. This
+A Python library designed to simplify the way you work with CSV and PDF files. This
 module provides inferred CSV delimiters and helper methods for reading and
 writing CSV files.
 
@@ -30,10 +30,17 @@ __license__ = "MIT"
 # Import key classes, functions, or submodules that should be available at
 # the package level
 from datagrunt.csv_api import CSVReader, CSVSchemaReportAIGenerated, CSVWriter
+from datagrunt.pdf_api import PDFReader, PDFWriter
 
 # You can define __all__ to specify what gets imported with "from package
 # import *"
-__all__ = ["CSVReader", "CSVWriter", "CSVSchemaReportAIGenerated"]
+__all__ = [
+    "CSVReader",
+    "CSVWriter",
+    "CSVSchemaReportAIGenerated",
+    "PDFReader",
+    "PDFWriter",
+]
 
 # Optionally, you can include a logger for your package
 import logging
