@@ -27,7 +27,7 @@ from datagrunt.core.csv_io import (
     CSVWriterPolarsEngine,
     CSVWriterPyArrowEngine,
 )
-from datagrunt.core.databases import DuckDBDatabase, DuckDBQueries
+from datagrunt.core.databases import DuckDBQueries
 from datagrunt.core.file_io import FileProperties
 from datagrunt.core.pdf_io import (
     PDFComponents,
@@ -71,7 +71,6 @@ __all__ = [
     "CSVRows",
     "CSVStringSample",
     # Databases
-    "DuckDBDatabase",
     "DuckDBQueries",
     # File IO
     "FileProperties",

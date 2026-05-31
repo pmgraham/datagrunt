@@ -12,57 +12,6 @@ import duckdb
 from datagrunt.core.csv_io import CSVColumnNameNormalizer, CSVDelimiter
 
 
-class DuckDBDatabase:
-    """Class to configure local database for file processing.
-    Utilizes duckdb as the processing engine.
-    """
-
-    DEFAULT_ENCODING = "utf-8"
-    DEFAULT_THREAD_COUNT = 16
-
-    def __init__(self, filepath):
-        """
-        Initialize the FileDatabase class.
-
-        Args:
-            filepath (str or Path): Path to the file.
-        """
-        self.filepath = Path(filepath)
-        self.database_filename = self._set_database_filename()
-        self.database_table_name = self._set_database_table_name()
-        self.database_connection = self._set_database_connection()
-
-    def __del__(self):
-        """
-        Close the database connection and delete .db files after use.
-        """
-        self.database_connection.close()
-        if Path(self.database_filename).exists():
-            Path(self.database_filename).unlink()
-
-    def _format_filename_string(self):
-        """Remove all non alphanumeric characters from filename."""
-        return re.sub(r"[^a-zA-Z0-9]", "", self.filepath.stem)
-
-    def _set_database_filename(self):
-        """Return name of duckdb file created at runtime."""
-        return f"{self._format_filename_string()}.db"
-
-    def _set_database_table_name(self):
-        """
-        Return name of duckdb import table created during file import.
-        """
-        return f"{self._format_filename_string()}"
-
-    def _set_database_connection(self, threads=DEFAULT_THREAD_COUNT):
-        """Establish a connection with duckdb.
-
-        Args:
-            threads (int): Number of threads to use for duckdb.
-        """
-        return duckdb.connect(self.database_filename, config={"threads": threads})
-
-
 class DuckDBQueries:
     """Class to store DuckDB database queries and query strings."""
 
@@ -83,6 +32,21 @@ class DuckDBQueries:
         self.delimiter = CSVDelimiter(filepath).delimiter
         self.database_table_name = self._set_database_table_name()
         self.connection = duckdb.connect(":memory:")
+
+    def close(self):
+        """Close this instance's DuckDB connection.
+
+        Provides deterministic disposal of the per-instance in-memory
+        connection. Safe to call multiple times. There is intentionally no
+        ``__del__``: relying on the garbage collector to close connections is
+        unreliable - timing is non-deterministic and module globals may already
+        be torn down at interpreter shutdown.
+
+        Note: any lazy ``DuckDBPyRelation`` still referencing this connection
+        becomes invalid once it is closed, so only call ``close()`` once you are
+        done with results derived from this instance.
+        """
+        self.connection.close()
 
     def _format_filename_string(self):
         """Remove all non alphanumeric characters from the file stem."""
