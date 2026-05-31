@@ -8,7 +8,7 @@ writing CSV files.
 Example:
     A simple example of how to use the main functionality of your package:
 
-    from datagrunt.csvfile import CSVReader
+    from datagrunt import CSVReader
 
     csv_file = 'electric_vehicle_population_data.csv'
     engine = 'duckdb'

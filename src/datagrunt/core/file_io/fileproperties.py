@@ -258,5 +258,5 @@ class FileProperties:
 
     @cached_property
     def is_tsv(self):
-        """Check if the file is tabular."""
+        """Check if the file is a TSV file."""
         return self.extension_string.lower() in self._ext.tsv_extensions
