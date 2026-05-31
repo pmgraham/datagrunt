@@ -1,13 +1,13 @@
 # Welcome To Datagrunt
 
-Datagrunt is a Python library designed to simplify the way you work with CSV files. It provides a streamlined approach to reading, processing, and transforming your data into various formats, making data manipulation efficient and intuitive.
+Datagrunt is a Python library designed to simplify the way you work with CSV and PDF files. It provides a streamlined approach to reading, processing, and transforming your data into various formats, making data manipulation efficient and intuitive.
 
 ## Why Datagrunt?
 
-Born out of real-world frustration, Datagrunt eliminates the need for repetitive coding when handling CSV files. Whether you're a data analyst, data engineer, or data scientist, Datagrunt empowers you to focus on insights, not tedious data wrangling.
+Born out of real-world frustration, Datagrunt eliminates the need for repetitive coding when handling CSV and PDF files. Whether you're a data analyst, data engineer, or data scientist, Datagrunt empowers you to focus on insights, not tedious data wrangling.
 
 ### What Datagrunt Is Not
-Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow, nor is it a comprehensive data processing solution. Instead, it's designed to simplify the way you work with CSV files and to help solve the pain point of inferring delimiters when a file structure is unknown. Datagrunt provides an easy way to convert CSV files to dataframes and export them to various formats. One of Datagrunt's value propositions is its relative simplicity and ease of use.
+Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow, nor is it a comprehensive data processing solution. Instead, it's designed to simplify the way you work with CSV and PDF files — solving the pain point of inferring delimiters when a CSV structure is unknown, and turning PDFs into structured, queryable data. Datagrunt provides an easy way to convert CSV files to dataframes and export them to various formats, and to extract text, tables, and images from PDFs. One of Datagrunt's value propositions is its relative simplicity and ease of use.
 
 ## Key Features
 
@@ -15,6 +15,7 @@ Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow
 - **Path Object Support:** Full support for both string paths and `pathlib.Path` objects for modern, cross-platform file handling.
 - **Multiple Processing Engines:** Choose from three powerful engines - [DuckDB](https://duckdb.org), [Polars](https://pola.rs), and [PyArrow](https://arrow.apache.org/docs/python/) - to handle your data processing needs.
 - **Flexible Data Transformation:** Easily convert your processed CSV data into various formats including CSV, Excel, JSON, JSONL, and Parquet.
+- **PDF Parsing & OCR:** Extract text, tables, and images from PDF files as dicts, DataFrames, or JSON, with optional [Tesseract](https://github.com/tesseract-ocr/tesseract) OCR for scanned pages.
 - **AI-Powered Schema Analysis:** Use Google's Gemini models to automatically generate detailed schema reports for your CSV files, including data types, column classifications, and data quality checks.
 - **Pythonic API:** Enjoy a clean and intuitive API that integrates seamlessly into your existing Python workflows.
 
@@ -25,6 +26,7 @@ Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow
 | [Polars](https://pola.rs) | Multi-threaded DataFrame library written in Rust, optimized for performance |
 | [PyArrow](https://arrow.apache.org/docs/python/) | Python bindings for Apache Arrow with efficient columnar data processing |
 | [Google Gemini](https://deepmind.google/technologies/gemini/) | A powerful family of generative AI models for schema analysis |
+| [PyMuPDF](https://pymupdf.readthedocs.io/) | High-performance PDF engine for extracting text, tables, and images, paired with Tesseract OCR for scanned pages |
 
 ## Installation
 
@@ -41,6 +43,8 @@ Get started with pip:
 ```bash
 pip install datagrunt
 ```
+
+> **PDF parsing** is an optional extra — install it with `pip install "datagrunt[pdf]"`. See [PDF parsing](#pdf-parsing) below for details and OCR setup.
 
 ## Quick Start
 
@@ -145,7 +149,7 @@ print(report)  # Detailed JSON schema with data types, classifications, and more
 PDF support is an optional extra:
 
 ```bash
-pip install datagrunt[pdf]
+pip install "datagrunt[pdf]"
 ```
 
 OCR of scanned pages additionally requires the **Tesseract** system binary
@@ -191,11 +195,15 @@ tables with at least two rows and two columns. It is off by default.
 | **Default for** | CSVReader | CSVWriter | - |
 | **Export Quality** | Good | Excellent (especially JSON) | Native Parquet support |
 
+_The engines above apply to CSV processing. PDF parsing uses the [PyMuPDF](https://pymupdf.readthedocs.io/) engine — see [PDF parsing](#pdf-parsing)._
+
 ## Primary Classes
 
 - **`CSVReader`**: Read and process CSV files with intelligent delimiter detection
 - **`CSVWriter`**: Export CSV data to multiple formats (CSV, Excel, JSON, Parquet)
 - **`CSVSchemaReportAIGenerated`**: Generate AI-powered schema analysis reports
+- **`PDFReader`**: Parse PDF files into text, tables, and images as dicts, Polars DataFrames, or PyArrow tables
+- **`PDFWriter`**: Write parsed PDF output to JSON or JSONL and extract embedded images to disk
 
 ## Full Documentation
 
