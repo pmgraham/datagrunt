@@ -85,6 +85,27 @@ class TestCSVReader:
             df = reader.to_dataframe(normalize_columns=True)
             assert list(df.columns) == expected_columns
 
+    def test_query_data_normalize_columns_polars_and_pyarrow(self, tmp_path):
+        """query_data(normalize_columns=True) normalizes result columns on the
+        Polars and PyArrow engines.
+
+        Coverage test for review finding 7: only these two engines route
+        query_data through DuckDBQueries.sql_query_to_dataframe and its
+        _normalize_dataframe_columns helper. The DuckDB engine uses a different
+        projection path, so those lines previously had no test coverage.
+        """
+        csv_file = tmp_path / "people.csv"
+        csv_file.write_text("First Name,Last Name,Age Group\nJohn,Doe,30-40\nJane,Smith,20-30")
+        expected_columns = ["first_name", "last_name", "age_group"]
+
+        for engine in ("polars", "pyarrow"):
+            reader = CSVReader(str(csv_file), engine=engine)
+            result = reader.query_data(
+                f"SELECT * FROM {reader.db_table}", normalize_columns=True
+            )
+            assert isinstance(result, pl.DataFrame)
+            assert list(result.columns) == expected_columns
+
     def test_get_sample(self, sample_csv):
         """Test get_sample method returns a sample DataFrame."""
         for engine in ALL_ENGINES:
