@@ -130,6 +130,36 @@ def parse_pdfium_page(pdf_path: str, page_index: int, image_output_dir: str = No
                 )
                 img_index += 1
 
+        ocr_used = False
+        if not full_text.strip():
+            page_dpi = (
+                LARGE_FORMAT_DPI
+                if (width > LARGE_FORMAT_DIMENSION or height > LARGE_FORMAT_DIMENSION)
+                else STANDARD_DPI
+            )
+            ocr_result = extractors.ocr_page(pdf_path, page_index, dpi=page_dpi)
+            if ocr_result.get("status") == "success":
+                blocks = ocr_result.get("blocks", [])
+                if blocks:
+                    ocr_used = True
+                    full_text = "\n".join(b["text"] for b in blocks)
+                    for b in blocks:
+                        bb = b["bbox"]
+                        ocr_bbox = [
+                            bb["x"],
+                            bb["y"],
+                            round(bb["x"] + bb["w"], 2),
+                            round(bb["y"] + bb["h"], 2),
+                        ]
+                        text_objects.append(
+                            {
+                                "text": b["text"],
+                                "bbox": ocr_bbox,
+                                "position": {"x": bb["x"], "y": bb["y"], "w": bb["w"], "h": bb["h"]},
+                                "font_size": None,
+                            }
+                        )
+
         return {
             "page_number": page_index + 1,
             "width": round(float(width), 2),
@@ -137,7 +167,7 @@ def parse_pdfium_page(pdf_path: str, page_index: int, image_output_dir: str = No
             "text": full_text,
             "text_objects": text_objects,
             "images": images,
-            "ocr": False,
+            "ocr": ocr_used,
         }
     finally:
         pdf.close()
