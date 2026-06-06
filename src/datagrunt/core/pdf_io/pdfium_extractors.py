@@ -240,3 +240,42 @@ def flatten_pdfium_document(document: dict) -> list:
                 }
             )
     return records
+
+
+def dedupe_pdfium_images(document: dict) -> int:
+    """Remove byte-duplicate extracted image files, repointing references.
+
+    Hashes each on-disk file referenced by an image element's ``file`` and, for
+    any content already seen, repoints the element at the first file and deletes
+    the redundant copy. Elements with no ``file`` or a missing file are skipped.
+
+    Args:
+        document: A native PDFium document dict (mutated in place).
+
+    Returns:
+        The number of duplicate image files removed from disk.
+    """
+    seen = {}  # md5 digest -> first file that produced it
+    removed = 0
+    pages = document.get("document", {}).get("pages", [])
+    for page in pages:
+        for img in page.get("images", []):
+            path = img.get("file")
+            if not path or not os.path.isfile(path):
+                continue
+            with open(path, "rb") as f:
+                digest = hashlib.md5(f.read()).hexdigest()
+            first = seen.get(digest)
+            if first is None:
+                seen[digest] = path
+                continue
+            if first == path:
+                continue
+            img["file"] = first
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            else:
+                removed += 1
+    return removed
