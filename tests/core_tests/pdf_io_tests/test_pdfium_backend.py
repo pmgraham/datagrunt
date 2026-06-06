@@ -103,3 +103,17 @@ class TestBadFilePaths:
 
     def test_extract_text_blocks_bad_path(self):
         assert pdfium_backend.extract_text_blocks("/nonexistent/file.pdf", 0)["status"] == "error"
+
+
+class TestParsePageWithPdfiumBackend:
+    def test_yields_unified_schema(self, sample_pdf):
+        from datagrunt.core.pdf_io import pdfcomponents
+
+        page = pdfcomponents.parse_page(sample_pdf, 0, backend=pdfium_backend)
+        assert set(page.keys()) == {"page_number", "width", "height", "classification", "elements"}
+        assert page["page_number"] == 1
+        types = {el["type"] for el in page["elements"]}
+        assert "image" in types  # sample_pdf has an embedded image
+        assert any(el["type"] in {"header", "body_text", "subheader", "caption"} for el in page["elements"])
+        for el in page["elements"]:
+            assert set(el) >= {"id", "type", "content", "page", "position", "confidence", "metadata"}
