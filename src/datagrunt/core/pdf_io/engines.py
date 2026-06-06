@@ -13,7 +13,7 @@ import polars as pl
 import pyarrow as pa
 
 # local libraries
-from datagrunt.core.pdf_io import extractors, pdfcomponents, pdfium_extractors
+from datagrunt.core.pdf_io import extractors, pdfcomponents, pdfium_backend, pdfium_extractors
 
 
 def set_export_filename(default_filename, export_filename=None):
@@ -132,11 +132,16 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
 class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
     """Read and parse PDF files using PDFium (pypdfium2).
 
-    Emits the native PDFium schema (full page text, positioned text objects,
-    and embedded image files). Image-only pages fall back to OCR so extraction
-    stays complete. ``drop_layout_tables`` is accepted for interface parity but
-    is a no-op (PDFium has no table detection).
+    Default (``structured=False``) emits the native PDFium schema. With
+    ``structured=True`` it emits the same unified element schema as the pymupdf
+    engine, via the shared ``pdfcomponents`` pipeline driven by ``pdfium_backend``
+    (text, images, OCR) plus shared pdfplumber tables. Pages are parsed
+    sequentially because pdfium is not thread-safe.
     """
+
+    def __init__(self, filepath, workers: int = 4, structured: bool = False):
+        super().__init__(filepath, workers=workers)
+        self.structured = structured
 
     def _total_pages(self) -> int:
         pdfium, _ = pdfium_extractors._import_pdfium()
@@ -146,40 +151,63 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
         finally:
             pdf.close()
 
-    def to_dicts(self, image_output_dir: Optional[str] = None, drop_layout_tables: bool = False) -> dict:
-        """Parse all pages sequentially into the native document dict.
-
-        PDFium (pypdfium2) is not thread-safe, so pages are parsed sequentially
-        regardless of ``workers`` (which is retained only for interface parity
-        with the pymupdf engine). Per-page failures are isolated and collected
-        into the document's ``errors`` list.
-        """
+    def _to_dicts_structured(self, image_output_dir, drop_layout_tables) -> dict:
         total_pages = self._total_pages()
         pages = []
         errors = []
         for idx in range(total_pages):
             try:
                 pages.append(
-                    pdfium_extractors.parse_pdfium_page(str(self.filepath), idx, image_output_dir)
+                    pdfcomponents.parse_page(str(self.filepath), idx, image_output_dir, backend=pdfium_backend)
                 )
             except Exception as e:  # noqa: BLE001 - per-page isolation
                 errors.append(f"Page {idx + 1}: {e}")
-        return pdfium_extractors.combine_pdfium_pages(self.filepath, total_pages, pages, errors)
+        document = pdfcomponents.combine_pages(self.filepath, total_pages, pages, errors)
+        if drop_layout_tables:
+            pdfcomponents.drop_layout_tables(document)
+        return document
+
+    def _to_dicts_native(self, image_output_dir) -> dict:
+        total_pages = self._total_pages()
+        page_results = {}
+        errors = []
+        for idx in range(total_pages):
+            try:
+                page = pdfium_extractors.parse_pdfium_page(str(self.filepath), idx, image_output_dir)
+                page_results[page["page_number"]] = page
+            except Exception as e:  # noqa: BLE001 - per-page isolation
+                errors.append(f"Page {idx + 1}: {e}")
+        ordered = [page_results[p] for p in sorted(page_results.keys())]
+        return pdfium_extractors.combine_pdfium_pages(self.filepath, total_pages, ordered, errors)
+
+    def to_dicts(self, image_output_dir: Optional[str] = None, drop_layout_tables: bool = False) -> dict:
+        """Parse all pages sequentially (pdfium is not thread-safe)."""
+        if self.structured:
+            return self._to_dicts_structured(image_output_dir, drop_layout_tables)
+        return self._to_dicts_native(image_output_dir)
 
     def get_sample(self) -> dict:
         """Parse and return the first page only."""
+        if self.structured:
+            return pdfcomponents.parse_page(str(self.filepath), 0, backend=pdfium_backend)
         return pdfium_extractors.parse_pdfium_page(str(self.filepath), 0)
 
     def to_dataframe(self, drop_layout_tables: bool = False) -> pl.DataFrame:
         """Flatten parsed elements into a Polars DataFrame (one row/element)."""
-        records = pdfium_extractors.flatten_pdfium_document(self.to_dicts())
+        if self.structured:
+            records = pdfcomponents.flatten_document_elements(self.to_dicts(drop_layout_tables=drop_layout_tables))
+        else:
+            records = pdfium_extractors.flatten_pdfium_document(self.to_dicts())
         if not records:
             return pl.DataFrame()
         return pl.DataFrame(records)
 
     def to_arrow_table(self, drop_layout_tables: bool = False) -> pa.Table:
         """Flatten parsed elements into a PyArrow table (one row/element)."""
-        records = pdfium_extractors.flatten_pdfium_document(self.to_dicts())
+        if self.structured:
+            records = pdfcomponents.flatten_document_elements(self.to_dicts(drop_layout_tables=drop_layout_tables))
+        else:
+            records = pdfium_extractors.flatten_pdfium_document(self.to_dicts())
         if not records:
             return pa.Table.from_pydict({})
         return pa.Table.from_pylist(records)
