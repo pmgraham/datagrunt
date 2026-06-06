@@ -1,9 +1,7 @@
 """PDF component assembly: page parsing, document combination, flattening."""
 
 # standard library
-import hashlib
 import json
-import os
 import time
 from functools import cached_property
 from pathlib import Path
@@ -11,15 +9,12 @@ from pathlib import Path
 # local libraries
 from datagrunt.core.file_io import FileProperties
 from datagrunt.core.pdf_io.extraction import PdfPlumberTableExtractor
+from datagrunt.core.pdf_io.extraction.image_dedupe import dedupe_image_files
+from datagrunt.core.pdf_io.extraction.ocr import dpi_for_page
 from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
 from datagrunt.core.pdf_io.extraction.pymupdf_backend import PyMuPDFBackend
 
 PIPELINE_TYPE = "pure_python_local_v1"
-
-# Dynamic DPI scaling thresholds for scanned (OCR) pages.
-LARGE_FORMAT_DIMENSION = 1500
-LARGE_FORMAT_DPI = 75
-STANDARD_DPI = 150
 
 
 class DocumentAssembler:
@@ -57,9 +52,7 @@ class DocumentAssembler:
             for block in self.backend.extract_text_blocks(page_index):
                 elements.append(self._text_element(block, gen_elem_id(), page_index))
         elif analysis.is_scanned:
-            is_large = analysis.width > LARGE_FORMAT_DIMENSION or analysis.height > LARGE_FORMAT_DIMENSION
-            dpi = LARGE_FORMAT_DPI if is_large else STANDARD_DPI
-            for block in self.backend.ocr_page(page_index, dpi=dpi):
+            for block in self.backend.ocr_page(page_index, dpi=dpi_for_page(analysis.width, analysis.height)):
                 elements.append(self._ocr_element(block, gen_elem_id(), page_index))
 
         if analysis.has_line_drawings or not analysis.has_text_layer:
@@ -186,31 +179,17 @@ class ParsedDocument:
 
     def dedupe_images(self) -> int:
         """Collapse byte-identical extracted image files; return count removed."""
-        seen, removed = {}, 0
-        for page in self.document.get("document", {}).get("pages", []):
-            for elem in page.get("elements", []):
-                if elem.get("type") != "image":
-                    continue
-                meta = elem.get("metadata") or {}
-                path = meta.get("file_path")
-                if not path or not os.path.isfile(path):
-                    continue
-                with open(path, "rb") as f:
-                    digest = hashlib.md5(f.read()).hexdigest()
-                first = seen.get(digest)
-                if first is None:
-                    seen[digest] = path
-                    continue
-                if first == path:
-                    continue
-                meta["file_path"] = first
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-                else:
-                    removed += 1
-        return removed
+        images = [
+            el
+            for page in self.document.get("document", {}).get("pages", [])
+            for el in page.get("elements", [])
+            if el.get("type") == "image"
+        ]
+        return dedupe_image_files(
+            images,
+            lambda el: (el.get("metadata") or {}).get("file_path"),
+            lambda el, p: el.setdefault("metadata", {}).__setitem__("file_path", p),
+        )
 
     def drop_layout_tables(self, min_rows: int = 2, min_cols: int = 2) -> int:
         """Drop table elements below ``min_rows`` x ``min_cols`` (layout boxes)."""

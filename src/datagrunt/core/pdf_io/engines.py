@@ -192,7 +192,7 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
         if self.structured:
             records = pdfcomponents.ParsedDocument(self.to_dicts(drop_layout_tables=drop_layout_tables)).flatten()
         else:
-            records = PdfiumNativeReader(self.filepath).flatten(self.to_dicts())
+            records = PdfiumNativeReader.flatten(self.to_dicts())
         if not records:
             return pl.DataFrame()
         return pl.DataFrame(records)
@@ -202,7 +202,7 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
         if self.structured:
             records = pdfcomponents.ParsedDocument(self.to_dicts(drop_layout_tables=drop_layout_tables)).flatten()
         else:
-            records = PdfiumNativeReader(self.filepath).flatten(self.to_dicts())
+            records = PdfiumNativeReader.flatten(self.to_dicts())
         if not records:
             return pa.Table.from_pydict({})
         return pa.Table.from_pylist(records)
@@ -344,7 +344,7 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
         if self.structured:
             records = pdfcomponents.ParsedDocument(document).flatten()
         else:
-            records = PdfiumNativeReader(self.filepath).flatten(document)
+            records = PdfiumNativeReader.flatten(document)
         with open(filename, "w") as f:
             for record in records:
                 f.write(json.dumps(record) + "\n")
