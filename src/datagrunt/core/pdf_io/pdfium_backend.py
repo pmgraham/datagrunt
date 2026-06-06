@@ -7,6 +7,7 @@ from ``extractors.extract_tables`` (pdfplumber), which is engine-independent.
 """
 
 # standard library
+from math import hypot
 from pathlib import Path
 
 # local libraries
@@ -272,6 +273,12 @@ def extract_text_blocks(pdf_path: str, page_number: int) -> dict:
             except Exception:  # noqa: BLE001 - font metadata is best-effort
                 pass
             lower = font_name.lower()
+            try:
+                m = obj.get_matrix()
+                scale = hypot(m.b, m.d) or 1.0
+            except Exception:  # noqa: BLE001 - matrix is best-effort
+                scale = 1.0
+            effective_size = round(obj.get_font_size() * scale, 1)
             items.append(
                 {
                     "text": text,
@@ -279,7 +286,7 @@ def extract_text_blocks(pdf_path: str, page_number: int) -> dict:
                     "x1": round(right, 2),
                     "y_top": round(height - top, 2),
                     "y_bot": round(height - bottom, 2),
-                    "size": round(obj.get_font_size(), 1),
+                    "size": effective_size,
                     "font": font_name,
                     "bold": weight >= 600,
                     "italic": ("italic" in lower or "oblique" in lower),
