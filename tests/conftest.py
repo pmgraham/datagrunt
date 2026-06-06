@@ -212,6 +212,22 @@ def scanned_pdf(tmp_path):
 
 
 @pytest.fixture
+def multipage_pdf(tmp_path):
+    """Create a 3-page PDF with distinct, identifiable text on each page."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    for n in range(1, 4):
+        page = doc.new_page(width=612, height=792)
+        page.insert_text((72, 72), f"Page Marker {n}", fontsize=18)
+        page.insert_text((72, 110), f"Body content for page {n}.", fontsize=11)
+    pdf_path = tmp_path / "multipage.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+    return str(pdf_path)
+
+
+@pytest.fixture
 def tesseract_available():
     """Return True if the tesseract system binary is on PATH."""
     return shutil.which("tesseract") is not None
