@@ -131,8 +131,22 @@ class TestDedupePdfiumImages:
                         "text": "",
                         "text_objects": [],
                         "images": [
-                            {"file": str(a), "bbox": [], "position": {}, "px_width": 1, "px_height": 1, "extracted": True},
-                            {"file": str(b), "bbox": [], "position": {}, "px_width": 1, "px_height": 1, "extracted": True},
+                            {
+                                "file": str(a),
+                                "bbox": [],
+                                "position": {},
+                                "px_width": 1,
+                                "px_height": 1,
+                                "extracted": True,
+                            },
+                            {
+                                "file": str(b),
+                                "bbox": [],
+                                "position": {},
+                                "px_width": 1,
+                                "px_height": 1,
+                                "extracted": True,
+                            },
                         ],
                         "ocr": False,
                     }
@@ -160,8 +174,22 @@ class TestDedupePdfiumImages:
                         "text": "",
                         "text_objects": [],
                         "images": [
-                            {"file": None, "bbox": [], "position": {}, "px_width": 1, "px_height": 1, "extracted": False},
-                            {"file": str(tmp_path / "gone.png"), "bbox": [], "position": {}, "px_width": 1, "px_height": 1, "extracted": True},
+                            {
+                                "file": None,
+                                "bbox": [],
+                                "position": {},
+                                "px_width": 1,
+                                "px_height": 1,
+                                "extracted": False,
+                            },
+                            {
+                                "file": str(tmp_path / "gone.png"),
+                                "bbox": [],
+                                "position": {},
+                                "px_width": 1,
+                                "px_height": 1,
+                                "extracted": True,
+                            },
                         ],
                         "ocr": False,
                     }
