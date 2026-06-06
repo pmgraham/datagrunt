@@ -72,3 +72,38 @@ class TestOcrFallback:
         assert "HELLO" in page["text"].upper()
         assert len(page["text_objects"]) > 0
         assert page["text_objects"][0]["font_size"] is None
+
+
+class TestCombineAndFlatten:
+    """Test suite for combine_pdfium_pages and flatten_pdfium_document."""
+
+    def test_combine_wraps_pages_in_envelope(self, sample_pdf):
+        page = pdfium_extractors.parse_pdfium_page(sample_pdf, 0)
+        doc = pdfium_extractors.combine_pdfium_pages(sample_pdf, 1, [page], [])
+        assert doc["document"]["page_count"] == 1
+        assert doc["document"]["source"] == sample_pdf
+        assert doc["document"]["errors"] is None
+        assert len(doc["document"]["pages"]) == 1
+
+    def test_combine_keeps_errors(self, sample_pdf):
+        doc = pdfium_extractors.combine_pdfium_pages(sample_pdf, 1, [], ["Page 1: boom"])
+        assert doc["document"]["errors"] == ["Page 1: boom"]
+
+    def test_flatten_yields_text_and_image_records(self, sample_pdf):
+        page = pdfium_extractors.parse_pdfium_page(sample_pdf, 0)
+        doc = pdfium_extractors.combine_pdfium_pages(sample_pdf, 1, [page], [])
+        records = pdfium_extractors.flatten_pdfium_document(doc)
+        types = {r["type"] for r in records}
+        assert "text" in types
+        assert "image" in types
+        text_rec = next(r for r in records if r["type"] == "text")
+        assert set(text_rec.keys()) == {
+            "page", "type", "text", "font_size",
+            "x", "y", "w", "h", "bbox", "file",
+            "px_width", "px_height", "ocr",
+        }
+        assert text_rec["page"] == 1
+
+    def test_flatten_empty_document(self):
+        doc = {"document": {"source": "x", "page_count": 0, "errors": None, "pages": []}}
+        assert pdfium_extractors.flatten_pdfium_document(doc) == []
