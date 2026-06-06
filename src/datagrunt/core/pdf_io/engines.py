@@ -313,28 +313,27 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
 
 
 class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
-    """Write parsed PDFium output (native-schema JSON + image files)."""
+    """Write parsed PDFium output. Native schema by default; unified when structured."""
+
+    def __init__(self, filepath, workers: int = 4, structured: bool = False):
+        super().__init__(filepath, workers=workers)
+        self.structured = structured
 
     def _reader(self):
-        return PDFReaderPdfiumEngine(self.filepath, workers=self.workers)
+        return PDFReaderPdfiumEngine(self.filepath, workers=self.workers, structured=self.structured)
+
+    def _dedupe(self, document):
+        if self.structured:
+            pdfcomponents.dedupe_document_images(document)
+        else:
+            pdfium_extractors.dedupe_pdfium_images(document)
 
     def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
-        """Parse the PDF and write the native document JSON.
-
-        Args:
-            export_filename (optional, str): Output path; defaults to output.json.
-            image_output_dir (optional, str): If provided, embedded images are
-                written here and referenced in the JSON; otherwise image
-                ``file`` values are null.
-            dedupe_images (bool, default True): When images are written, collapse
-                byte-identical duplicates to a single file and repoint references.
-            drop_layout_tables (bool, default False): No-op for PDFium (no table
-                detection); accepted for interface parity.
-        """
+        """Parse the PDF and write the document JSON (native or unified schema)."""
         filename = set_export_filename(self.properties.json_export_filename, export_filename)
-        document = self._reader().to_dicts(image_output_dir=image_output_dir)
+        document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
         if image_output_dir and dedupe_images:
-            pdfium_extractors.dedupe_pdfium_images(document)
+            self._dedupe(document)
         with open(filename, "w") as f:
             json.dump(document, f, indent=2)
         return filename
@@ -344,32 +343,36 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
     ):
         """Parse the PDF and write one flattened element per line (JSONL)."""
         filename = set_export_filename(self.properties.json_newline_export_filename, export_filename)
-        document = self._reader().to_dicts(image_output_dir=image_output_dir)
+        document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
         if image_output_dir and dedupe_images:
-            pdfium_extractors.dedupe_pdfium_images(document)
-        records = pdfium_extractors.flatten_pdfium_document(document)
+            self._dedupe(document)
+        if self.structured:
+            records = pdfcomponents.flatten_document_elements(document)
+        else:
+            records = pdfium_extractors.flatten_pdfium_document(document)
         with open(filename, "w") as f:
             for record in records:
                 f.write(json.dumps(record) + "\n")
         return filename
 
     def extract_images(self, output_dir=None, dedupe=True):
-        """Parse the PDF, write embedded images to disk, return their paths.
-
-        Args:
-            output_dir (optional, str): Output directory; defaults to output_images.
-            dedupe (bool, default True): Collapse byte-identical duplicate images
-                to a single file before returning paths.
-        """
+        """Parse the PDF, write embedded images to disk, return their paths."""
         directory = output_dir if output_dir else self.properties.images_export_dir
         document = self._reader().to_dicts(image_output_dir=directory)
         if dedupe:
-            pdfium_extractors.dedupe_pdfium_images(document)
+            self._dedupe(document)
         paths = []
         seen = set()
         for page in document.get("document", {}).get("pages", []):
-            for img in page.get("images", []):
-                fp = img.get("file")
+            if self.structured:
+                candidates = [
+                    (el.get("metadata") or {}).get("file_path")
+                    for el in page.get("elements", [])
+                    if el.get("type") == "image"
+                ]
+            else:
+                candidates = [img.get("file") for img in page.get("images", [])]
+            for fp in candidates:
                 if fp and fp not in seen:
                     seen.add(fp)
                     paths.append(fp)
