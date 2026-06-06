@@ -45,3 +45,15 @@ class TestPDFEngineFactory:
         assert "ghostscript" in message
         assert "pymupdf" in message
         assert "pdfium" in message
+
+    def test_create_pdfium_reader(self, sample_pdf):
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+
+        factory = PDFEngineFactory(sample_pdf, "pdfium")
+        assert isinstance(factory.create_reader(), PDFReaderPdfiumEngine)
+
+    def test_create_pdfium_writer(self, sample_pdf):
+        from datagrunt.core.pdf_io.engines import PDFWriterPdfiumEngine
+
+        factory = PDFEngineFactory(sample_pdf, "pdfium")
+        assert isinstance(factory.create_writer(), PDFWriterPdfiumEngine)
