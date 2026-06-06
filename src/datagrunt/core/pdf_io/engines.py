@@ -13,8 +13,9 @@ import polars as pl
 import pyarrow as pa
 
 # local libraries
-from datagrunt.core.pdf_io import extractors, pdfcomponents, pdfium_extractors
-from datagrunt.core.pdf_io.extraction import PdfiumBackend
+from datagrunt.core.pdf_io import pdfcomponents
+from datagrunt.core.pdf_io.extraction import PdfiumBackend, PdfiumNativeReader
+from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
 
 
 def set_export_filename(default_filename, export_filename=None):
@@ -79,12 +80,8 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
     """Read and parse PDF files using PyMuPDF / pdfplumber / Tesseract."""
 
     def _total_pages(self) -> int:
-        pymupdf = extractors._import_pymupdf()
-        doc = pymupdf.open(self.filepath)
-        try:
-            return doc.page_count
-        finally:
-            doc.close()
+        with PdfiumDocument(self.filepath) as doc:
+            return len(doc)
 
     def to_dicts(self, image_output_dir: Optional[str] = None, drop_layout_tables: bool = False) -> dict:
         """Parse all pages concurrently into the unified document dict."""
@@ -135,7 +132,7 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
 
     Default (``structured=False``) emits the native PDFium schema. With
     ``structured=True`` it emits the same unified element schema as the pymupdf
-    engine, via the shared ``pdfcomponents`` pipeline driven by ``pdfium_backend``
+    engine, via the shared ``pdfcomponents`` pipeline driven by ``PdfiumBackend``
     (text, images, OCR) plus shared pdfplumber tables. Pages are parsed
     sequentially because pdfium is not thread-safe.
     """
@@ -145,12 +142,8 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
         self.structured = structured
 
     def _total_pages(self) -> int:
-        pdfium, _ = pdfium_extractors._import_pdfium()
-        pdf = pdfium.PdfDocument(str(self.filepath))
-        try:
-            return len(pdf)
-        finally:
-            pdf.close()
+        with PdfiumDocument(self.filepath) as doc:
+            return len(doc)
 
     def _to_dicts_structured(self, image_output_dir, drop_layout_tables) -> dict:
         total_pages = self._total_pages()
@@ -171,17 +164,18 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
         return document
 
     def _to_dicts_native(self, image_output_dir) -> dict:
+        reader = PdfiumNativeReader(self.filepath)
         total_pages = self._total_pages()
         page_results = {}
         errors = []
         for idx in range(total_pages):
             try:
-                page = pdfium_extractors.parse_pdfium_page(str(self.filepath), idx, image_output_dir)
+                page = reader.parse_page(idx, image_output_dir)
                 page_results[page["page_number"]] = page
             except Exception as e:  # noqa: BLE001 - per-page isolation
                 errors.append(f"Page {idx + 1}: {e}")
         ordered = [page_results[p] for p in sorted(page_results.keys())]
-        return pdfium_extractors.combine_pdfium_pages(self.filepath, total_pages, ordered, errors)
+        return reader.combine(total_pages, ordered, errors)
 
     def to_dicts(self, image_output_dir: Optional[str] = None, drop_layout_tables: bool = False) -> dict:
         """Parse all pages sequentially (pdfium is not thread-safe)."""
@@ -193,14 +187,14 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
         """Parse and return the first page only."""
         if self.structured:
             return pdfcomponents.parse_page(str(self.filepath), 0, backend=PdfiumBackend(self.filepath))
-        return pdfium_extractors.parse_pdfium_page(str(self.filepath), 0)
+        return PdfiumNativeReader(self.filepath).parse_page(0)
 
     def to_dataframe(self, drop_layout_tables: bool = False) -> pl.DataFrame:
         """Flatten parsed elements into a Polars DataFrame (one row/element)."""
         if self.structured:
             records = pdfcomponents.flatten_document_elements(self.to_dicts(drop_layout_tables=drop_layout_tables))
         else:
-            records = pdfium_extractors.flatten_pdfium_document(self.to_dicts())
+            records = PdfiumNativeReader(self.filepath).flatten(self.to_dicts())
         if not records:
             return pl.DataFrame()
         return pl.DataFrame(records)
@@ -210,7 +204,7 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
         if self.structured:
             records = pdfcomponents.flatten_document_elements(self.to_dicts(drop_layout_tables=drop_layout_tables))
         else:
-            records = pdfium_extractors.flatten_pdfium_document(self.to_dicts())
+            records = PdfiumNativeReader(self.filepath).flatten(self.to_dicts())
         if not records:
             return pa.Table.from_pydict({})
         return pa.Table.from_pylist(records)
@@ -329,7 +323,7 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
         if self.structured:
             pdfcomponents.dedupe_document_images(document)
         else:
-            pdfium_extractors.dedupe_pdfium_images(document)
+            PdfiumNativeReader.dedupe_images(document)
 
     def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
         """Parse the PDF and write the document JSON (native or unified schema)."""
@@ -352,7 +346,7 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
         if self.structured:
             records = pdfcomponents.flatten_document_elements(document)
         else:
-            records = pdfium_extractors.flatten_pdfium_document(document)
+            records = PdfiumNativeReader(self.filepath).flatten(document)
         with open(filename, "w") as f:
             for record in records:
                 f.write(json.dumps(record) + "\n")
