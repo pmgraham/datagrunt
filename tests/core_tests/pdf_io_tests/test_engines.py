@@ -166,16 +166,16 @@ class TestDropLayoutTablesThreading:
     """Verify the drop_layout_tables flag is plumbed through the engines."""
 
     def _spy(self, monkeypatch):
-        import datagrunt.core.pdf_io.pdfcomponents as pc
+        from datagrunt.core.pdf_io.pdfcomponents import ParsedDocument
 
         calls = []
-        original = pc.drop_layout_tables
+        original = ParsedDocument.drop_layout_tables
 
-        def spy(document, *args, **kwargs):
+        def spy(self, *args, **kwargs):
             calls.append(True)
-            return original(document, *args, **kwargs)
+            return original(self, *args, **kwargs)
 
-        monkeypatch.setattr(pc, "drop_layout_tables", spy)
+        monkeypatch.setattr(ParsedDocument, "drop_layout_tables", spy)
         return calls
 
     def test_reader_to_dicts_invokes_filter_when_true(self, sample_pdf, monkeypatch):
