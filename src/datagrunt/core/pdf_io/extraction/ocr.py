@@ -2,6 +2,17 @@
 
 from datagrunt.core.pdf_io.extraction.shapes import BBox, OcrBlock
 
+# Dynamic DPI scaling thresholds for scanned (OCR) pages.
+LARGE_FORMAT_DIMENSION = 1500
+LARGE_FORMAT_DPI = 75
+STANDARD_DPI = 150
+
+
+def dpi_for_page(width: float, height: float) -> int:
+    """Return the OCR render DPI for a page of the given size (points)."""
+    is_large = width > LARGE_FORMAT_DIMENSION or height > LARGE_FORMAT_DIMENSION
+    return LARGE_FORMAT_DPI if is_large else STANDARD_DPI
+
 
 def _import_ocr_deps():
     """Import OCR deps (pytesseract, Output) lazily with a helpful error."""

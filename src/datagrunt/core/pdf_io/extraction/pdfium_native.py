@@ -1,16 +1,11 @@
 """Native-schema pdfium reader (text + positioned text objects + images)."""
 
-import hashlib
 import json
-import os
 from pathlib import Path
 
-from datagrunt.core.pdf_io.extraction.ocr import ocr_data_to_blocks
+from datagrunt.core.pdf_io.extraction.image_dedupe import dedupe_image_files
+from datagrunt.core.pdf_io.extraction.ocr import dpi_for_page, ocr_data_to_blocks
 from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
-
-LARGE_FORMAT_DIMENSION = 1500
-LARGE_FORMAT_DPI = 75
-STANDARD_DPI = 150
 
 
 class PdfiumNativeReader:
@@ -79,9 +74,7 @@ class PdfiumNativeReader:
 
     def _ocr_fallback(self, doc, page_index, width, height):
         """Run OCR on an image-only page; return (text, extra_objects, used)."""
-        page_dpi = (
-            LARGE_FORMAT_DPI if (width > LARGE_FORMAT_DIMENSION or height > LARGE_FORMAT_DIMENSION) else STANDARD_DPI
-        )
+        page_dpi = dpi_for_page(width, height)
         img = doc.page(page_index).render_pil(dpi=page_dpi)
         blocks = ocr_data_to_blocks(img, page_dpi)
         if not blocks:
@@ -109,18 +102,20 @@ class PdfiumNativeReader:
             }
         }
 
-    def flatten(self, document: dict) -> list:
+    @staticmethod
+    def flatten(document: dict) -> list:
         """Flatten a native document into one record per text object/image."""
         records = []
         for page in document.get("document", {}).get("pages", []):
             page_no, ocr = page.get("page_number"), page.get("ocr", False)
             for obj in page.get("text_objects", []):
-                records.append(self._flat_text(obj, page_no, ocr))
+                records.append(PdfiumNativeReader._flat_text(obj, page_no, ocr))
             for img in page.get("images", []):
-                records.append(self._flat_image(img, page_no, ocr))
+                records.append(PdfiumNativeReader._flat_image(img, page_no, ocr))
         return records
 
-    def _flat_text(self, obj, page_no, ocr) -> dict:
+    @staticmethod
+    def _flat_text(obj, page_no, ocr) -> dict:
         """Flatten one native text object to a scalar record."""
         pos = obj.get("position", {})
         return {
@@ -130,7 +125,8 @@ class PdfiumNativeReader:
             "px_width": None, "px_height": None, "ocr": ocr,
         }
 
-    def _flat_image(self, img, page_no, ocr) -> dict:
+    @staticmethod
+    def _flat_image(img, page_no, ocr) -> dict:
         """Flatten one native image to a scalar record."""
         pos = img.get("position", {})
         return {
@@ -143,23 +139,13 @@ class PdfiumNativeReader:
     @staticmethod
     def dedupe_images(document: dict) -> int:
         """Collapse byte-identical extracted image files; return count removed."""
-        seen, removed = {}, 0
-        for page in document.get("document", {}).get("pages", []):
-            for img in page.get("images", []):
-                path = img.get("file")
-                if not path or not os.path.isfile(path):
-                    continue
-                with open(path, "rb") as f:
-                    digest = hashlib.md5(f.read()).hexdigest()
-                first = seen.get(digest)
-                if first is None:
-                    seen[digest] = path
-                elif first != path:
-                    img["file"] = first
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-                    else:
-                        removed += 1
-        return removed
+        images = [
+            img
+            for page in document.get("document", {}).get("pages", [])
+            for img in page.get("images", [])
+        ]
+        return dedupe_image_files(
+            images,
+            lambda img: img.get("file"),
+            lambda img, p: img.__setitem__("file", p),
+        )
