@@ -145,6 +145,9 @@ def parse_pdfium_page(pdf_path: str, page_index: int, image_output_dir: str = No
                     full_text = "\n".join(b["text"] for b in blocks)
                     for b in blocks:
                         bb = b["bbox"]
+                        # OCR bbox is [x, y, x+w, y+h] in top-left origin (PDF pts);
+                        # native text_objects use [left, bottom, right, top] (PDFium
+                        # bottom-left origin). ``position`` is top-left {x,y,w,h} in both.
                         ocr_bbox = [
                             bb["x"],
                             bb["y"],
