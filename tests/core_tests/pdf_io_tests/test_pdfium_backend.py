@@ -108,8 +108,9 @@ class TestBadFilePaths:
 class TestParsePageWithPdfiumBackend:
     def test_yields_unified_schema(self, sample_pdf):
         from datagrunt.core.pdf_io import pdfcomponents
+        from datagrunt.core.pdf_io.extraction import PdfiumBackend
 
-        page = pdfcomponents.parse_page(sample_pdf, 0, backend=pdfium_backend)
+        page = pdfcomponents.parse_page(sample_pdf, 0, backend=PdfiumBackend(sample_pdf))
         assert set(page.keys()) == {"page_number", "width", "height", "classification", "elements"}
         assert page["page_number"] == 1
         types = {el["type"] for el in page["elements"]}

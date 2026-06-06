@@ -201,38 +201,22 @@ class TestDropLayoutTables:
 
 
 class TestParsePageBackend:
-    """parse_page accepts a pluggable extraction backend (default extractors)."""
+    """parse_page consumes an ExtractionBackend + table extractor."""
 
-    def test_backend_defaults_to_extractors(self, sample_pdf):
+    def test_default_backend_pymupdf(self, sample_pdf):
         from datagrunt.core.pdf_io import pdfcomponents
 
         page = pdfcomponents.parse_page(sample_pdf, 0)
         assert page["page_number"] == 1
         assert "elements" in page
+        types = {el["type"] for el in page["elements"]}
+        assert types & {"header", "subheader", "body_text", "caption"}
 
-    def test_backend_primitives_are_called(self, sample_pdf):
-        from datagrunt.core.pdf_io import extractors, pdfcomponents
+    def test_explicit_pdfium_backend(self, sample_pdf):
+        from datagrunt.core.pdf_io import pdfcomponents
+        from datagrunt.core.pdf_io.extraction import PdfiumBackend
 
-        calls = []
-
-        class SpyBackend:
-            def analyze_page(self, p, i):
-                calls.append("analyze_page")
-                return extractors.analyze_page(p, i)
-
-            def extract_text_blocks(self, p, i):
-                calls.append("extract_text_blocks")
-                return extractors.extract_text_blocks(p, i)
-
-            def extract_images(self, p, i, output_dir=None, name_prefix="page"):
-                calls.append("extract_images")
-                return extractors.extract_images(p, i, output_dir=output_dir, name_prefix=name_prefix)
-
-            def ocr_page(self, p, i, dpi=300):
-                calls.append("ocr_page")
-                return extractors.ocr_page(p, i, dpi=dpi)
-
-        page = pdfcomponents.parse_page(sample_pdf, 0, backend=SpyBackend())
-        assert "analyze_page" in calls
-        assert "extract_text_blocks" in calls  # sample_pdf has a text layer
-        assert page["page_number"] == 1
+        page = pdfcomponents.parse_page(sample_pdf, 0, backend=PdfiumBackend(sample_pdf))
+        assert set(page.keys()) == {"page_number", "width", "height", "classification", "elements"}
+        types = {el["type"] for el in page["elements"]}
+        assert types & {"header", "subheader", "body_text", "caption"}
