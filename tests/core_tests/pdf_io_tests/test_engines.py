@@ -245,3 +245,37 @@ class TestPDFReaderPdfiumEngine:
 
         with pytest.raises(FileNotFoundError):
             PDFReaderPdfiumEngine("nope.pdf")
+
+
+class TestPDFWriterPdfiumEngine:
+    """Test suite for the PDFium writer engine."""
+
+    def test_write_json(self, sample_pdf, tmp_path):
+        import json
+
+        from datagrunt.core.pdf_io.engines import PDFWriterPdfiumEngine
+
+        out = tmp_path / "doc.json"
+        result = PDFWriterPdfiumEngine(sample_pdf).write_json(export_filename=str(out))
+        assert result == str(out)
+        data = json.loads(out.read_text())
+        assert data["document"]["page_count"] == 1
+
+    def test_write_json_newline_delimited(self, sample_pdf, tmp_path):
+        from datagrunt.core.pdf_io.engines import PDFWriterPdfiumEngine
+
+        out = tmp_path / "doc.jsonl"
+        result = PDFWriterPdfiumEngine(sample_pdf).write_json_newline_delimited(export_filename=str(out))
+        assert result == str(out)
+        lines = [ln for ln in out.read_text().splitlines() if ln.strip()]
+        assert len(lines) > 0
+
+    def test_extract_images_returns_paths(self, sample_pdf, tmp_path):
+        import os
+
+        from datagrunt.core.pdf_io.engines import PDFWriterPdfiumEngine
+
+        out = tmp_path / "imgs"
+        paths = PDFWriterPdfiumEngine(sample_pdf).extract_images(output_dir=str(out))
+        assert len(paths) > 0
+        assert all(os.path.isfile(p) for p in paths)
