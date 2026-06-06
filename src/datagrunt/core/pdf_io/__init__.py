@@ -8,6 +8,13 @@ from datagrunt.core.pdf_io.engines import (
     PDFWriterPyMuPDFEngine,
     set_export_filename,
 )
+from datagrunt.core.pdf_io.extraction import (
+    ExtractionBackend,
+    PdfiumBackend,
+    PdfiumNativeReader,
+    PdfPlumberTableExtractor,
+    PyMuPDFBackend,
+)
 from datagrunt.core.pdf_io.factories import PDFEngineFactory
 from datagrunt.core.pdf_io.pdfcomponents import (
     PDFComponents,
@@ -34,4 +41,9 @@ __all__ = [
     "PDFWriterPyMuPDFEngine",
     "set_export_filename",
     "PDFEngineFactory",
+    "ExtractionBackend",
+    "PdfiumBackend",
+    "PdfiumNativeReader",
+    "PdfPlumberTableExtractor",
+    "PyMuPDFBackend",
 ]
