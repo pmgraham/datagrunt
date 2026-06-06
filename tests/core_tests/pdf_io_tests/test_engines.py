@@ -246,6 +246,16 @@ class TestPDFReaderPdfiumEngine:
         with pytest.raises(FileNotFoundError):
             PDFReaderPdfiumEngine("nope.pdf")
 
+    def test_to_dicts_multipage_ordered(self, multipage_pdf):
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+
+        doc = PDFReaderPdfiumEngine(multipage_pdf).to_dicts()
+        pages = doc["document"]["pages"]
+        assert doc["document"]["page_count"] == 3
+        assert [p["page_number"] for p in pages] == [1, 2, 3]
+        for n, page in enumerate(pages, start=1):
+            assert f"Page Marker {n}" in page["text"]
+
 
 class TestPDFWriterPdfiumEngine:
     """Test suite for the PDFium writer engine."""
