@@ -118,9 +118,13 @@ class TestStructuredParity:
         _, mu, pdf = parsed_structured
         assert _table_cells(pdf) == _table_cells(mu)
 
-    def test_image_counts_match(self, parsed_structured):
+    def test_image_count_at_least_pymupdf(self, parsed_structured):
+        # pymupdf counts unique image XObjects per page (page.get_images, by xref);
+        # pdfium counts each placed image instance as its own positioned element.
+        # pdfium therefore captures >= pymupdf -- it never drops an image, and may
+        # surface repeated placements pymupdf collapses. Match-or-exceed, not equal.
         _, mu, pdf = parsed_structured
-        assert _elements_by_type(pdf).get("image", 0) == _elements_by_type(mu).get("image", 0)
+        assert _elements_by_type(pdf).get("image", 0) >= _elements_by_type(mu).get("image", 0)
 
     def test_text_completeness_at_least_pymupdf(self, parsed_structured):
         path, mu, pdf = parsed_structured
