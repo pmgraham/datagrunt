@@ -198,3 +198,50 @@ class TestDropLayoutTablesThreading:
         calls = self._spy(monkeypatch)
         PDFWriterPyMuPDFEngine(sample_pdf).write_json(drop_layout_tables=True)
         assert calls == [True]
+
+
+class TestPDFReaderPdfiumEngine:
+    """Test suite for the PDFium reader engine."""
+
+    def test_to_dicts_native_schema(self, sample_pdf):
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+
+        doc = PDFReaderPdfiumEngine(sample_pdf).to_dicts()
+        assert doc["document"]["page_count"] == 1
+        page = doc["document"]["pages"][0]
+        assert set(page.keys()) == {
+            "page_number", "width", "height", "text",
+            "text_objects", "images", "ocr",
+        }
+        assert "Quarterly Report" in page["text"]
+
+    def test_get_sample_returns_first_page(self, sample_pdf):
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+
+        page = PDFReaderPdfiumEngine(sample_pdf).get_sample()
+        assert page["page_number"] == 1
+
+    def test_to_dataframe_has_rows(self, sample_pdf):
+        import polars as pl
+
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+
+        df = PDFReaderPdfiumEngine(sample_pdf).to_dataframe()
+        assert isinstance(df, pl.DataFrame)
+        assert df.height > 0
+        assert "type" in df.columns
+
+    def test_to_arrow_table_has_rows(self, sample_pdf):
+        import pyarrow as pa
+
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+
+        table = PDFReaderPdfiumEngine(sample_pdf).to_arrow_table()
+        assert isinstance(table, pa.Table)
+        assert table.num_rows > 0
+
+    def test_missing_file_raises(self):
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+
+        with pytest.raises(FileNotFoundError):
+            PDFReaderPdfiumEngine("nope.pdf")
