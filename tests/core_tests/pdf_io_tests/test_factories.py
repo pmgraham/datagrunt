@@ -57,3 +57,10 @@ class TestPDFEngineFactory:
 
         factory = PDFEngineFactory(sample_pdf, "pdfium")
         assert isinstance(factory.create_writer(), PDFWriterPdfiumEngine)
+
+    def test_pdfium_structured_passthrough(self, sample_pdf):
+        factory = PDFEngineFactory(sample_pdf, "pdfium", structured=True)
+        reader = factory.create_reader()
+        writer = factory.create_writer()
+        assert reader.structured is True
+        assert writer.structured is True

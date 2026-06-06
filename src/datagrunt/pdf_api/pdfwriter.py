@@ -10,7 +10,7 @@ from datagrunt.core import PDFComponents, PDFEngineFactory
 class PDFWriter(PDFComponents):
     """Class to unify the interface for writing parsed PDF output."""
 
-    def __init__(self, filepath, engine="pymupdf", workers=4):
+    def __init__(self, filepath, engine="pymupdf", workers=4, structured=False):
         """Initialize the PDF Writer class.
 
         Args:
@@ -20,15 +20,19 @@ class PDFWriter(PDFComponents):
                 'pdfium' (native schema: text, positioned text objects, images;
                 OCR fallback for image-only pages; no table detection).
             workers (int, default 4): Number of concurrent per-page workers.
+            structured (bool, default False): pdfium engine only -- when True,
+                emit the unified element schema (parity with pymupdf) instead of
+                the native pdfium schema. Ignored by the pymupdf engine.
         """
         filepath = Path(filepath)
         super().__init__(filepath)
         self.engine = engine.lower().replace(" ", "")
         self.workers = workers
+        self.structured = structured
 
     def _create_writer(self):
         """Create a writer engine instance."""
-        return PDFEngineFactory(self.filepath, self.engine, self.workers).create_writer()
+        return PDFEngineFactory(self.filepath, self.engine, self.workers, structured=self.structured).create_writer()
 
     def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
         """Parse the PDF and write the unified document JSON to disk.
