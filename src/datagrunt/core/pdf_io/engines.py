@@ -147,26 +147,24 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
             pdf.close()
 
     def to_dicts(self, image_output_dir: Optional[str] = None, drop_layout_tables: bool = False) -> dict:
-        """Parse all pages concurrently into the native document dict."""
+        """Parse all pages sequentially into the native document dict.
+
+        PDFium (pypdfium2) is not thread-safe, so pages are parsed sequentially
+        regardless of ``workers`` (which is retained only for interface parity
+        with the pymupdf engine). Per-page failures are isolated and collected
+        into the document's ``errors`` list.
+        """
         total_pages = self._total_pages()
-        page_results = {}
+        pages = []
         errors = []
-
-        with ThreadPoolExecutor(max_workers=self.workers) as executor:
-            futures = {
-                executor.submit(pdfium_extractors.parse_pdfium_page, str(self.filepath), idx, image_output_dir): idx
-                for idx in range(total_pages)
-            }
-            for future in as_completed(futures):
-                idx = futures[future]
-                try:
-                    page = future.result()
-                    page_results[page["page_number"]] = page
-                except Exception as e:  # noqa: BLE001 - per-page isolation
-                    errors.append(f"Page {idx + 1}: {e}")
-
-        ordered = [page_results[p] for p in sorted(page_results.keys())]
-        return pdfium_extractors.combine_pdfium_pages(self.filepath, total_pages, ordered, errors)
+        for idx in range(total_pages):
+            try:
+                pages.append(
+                    pdfium_extractors.parse_pdfium_page(str(self.filepath), idx, image_output_dir)
+                )
+            except Exception as e:  # noqa: BLE001 - per-page isolation
+                errors.append(f"Page {idx + 1}: {e}")
+        return pdfium_extractors.combine_pdfium_pages(self.filepath, total_pages, pages, errors)
 
     def get_sample(self) -> dict:
         """Parse and return the first page only."""
