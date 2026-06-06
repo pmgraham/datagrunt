@@ -23,6 +23,11 @@ LARGE_FORMAT_DIMENSION = 1500
 LARGE_FORMAT_DPI = 75
 STANDARD_DPI = 150
 
+# Minimum image dimension (px) to keep; smaller images are layout artifacts,
+# borders, and spacer pixels. Mirrors the pymupdf engine's filter in
+# extractors.extract_images.
+MIN_IMAGE_DIMENSION = 40
+
 
 def _import_pdfium():
     """Import pypdfium2 lazily with a helpful error if the extra is missing."""
@@ -115,6 +120,9 @@ def parse_pdfium_page(pdf_path: str, page_index: int, image_output_dir: str = No
                     )
             elif obj.type == raw.FPDF_PAGEOBJ_IMAGE:
                 px_w, px_h = obj.get_px_size()
+                # Skip tiny layout artifacts, borders, and spacer pixels.
+                if px_w < MIN_IMAGE_DIMENSION or px_h < MIN_IMAGE_DIMENSION:
+                    continue
                 written = None
                 if image_output_dir:
                     base = Path(image_output_dir) / f"{stem}_p{page_index + 1}_img{img_index}"
