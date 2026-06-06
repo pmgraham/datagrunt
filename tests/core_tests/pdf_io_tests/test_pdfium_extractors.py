@@ -107,3 +107,65 @@ class TestCombineAndFlatten:
     def test_flatten_empty_document(self):
         doc = {"document": {"source": "x", "page_count": 0, "errors": None, "pages": []}}
         assert pdfium_extractors.flatten_pdfium_document(doc) == []
+
+
+class TestDedupePdfiumImages:
+    """Test suite for dedupe_pdfium_images."""
+
+    def test_collapses_byte_identical_images(self, tmp_path):
+        # Two files with identical bytes -> one should be removed and repointed.
+        a = tmp_path / "a.png"
+        b = tmp_path / "b.png"
+        a.write_bytes(b"PNGDATA")
+        b.write_bytes(b"PNGDATA")
+        document = {
+            "document": {
+                "source": "x",
+                "page_count": 1,
+                "errors": None,
+                "pages": [
+                    {
+                        "page_number": 1,
+                        "width": 10.0,
+                        "height": 10.0,
+                        "text": "",
+                        "text_objects": [],
+                        "images": [
+                            {"file": str(a), "bbox": [], "position": {}, "px_width": 1, "px_height": 1, "extracted": True},
+                            {"file": str(b), "bbox": [], "position": {}, "px_width": 1, "px_height": 1, "extracted": True},
+                        ],
+                        "ocr": False,
+                    }
+                ],
+            }
+        }
+        removed = pdfium_extractors.dedupe_pdfium_images(document)
+        assert removed == 1
+        assert not b.exists()
+        imgs = document["document"]["pages"][0]["images"]
+        assert imgs[0]["file"] == str(a)
+        assert imgs[1]["file"] == str(a)
+
+    def test_skips_missing_and_unwritten_files(self, tmp_path):
+        document = {
+            "document": {
+                "source": "x",
+                "page_count": 1,
+                "errors": None,
+                "pages": [
+                    {
+                        "page_number": 1,
+                        "width": 10.0,
+                        "height": 10.0,
+                        "text": "",
+                        "text_objects": [],
+                        "images": [
+                            {"file": None, "bbox": [], "position": {}, "px_width": 1, "px_height": 1, "extracted": False},
+                            {"file": str(tmp_path / "gone.png"), "bbox": [], "position": {}, "px_width": 1, "px_height": 1, "extracted": True},
+                        ],
+                        "ocr": False,
+                    }
+                ],
+            }
+        }
+        assert pdfium_extractors.dedupe_pdfium_images(document) == 0
