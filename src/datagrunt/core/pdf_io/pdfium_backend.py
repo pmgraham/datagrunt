@@ -143,3 +143,156 @@ def ocr_page(pdf_path: str, page_number: int, dpi: int = 300) -> dict:
         "ocr_engine": "tesseract",
         "dpi": dpi,
     }
+
+
+def _dominant(values, default=None):
+    """Most common value in a list (ties broken by first occurrence)."""
+    values = [v for v in values if v not in (None, "")]
+    if not values:
+        return default
+    return max(set(values), key=values.count)
+
+
+def _group_blocks(items: list) -> list:
+    """Group per-object text items (top-left coords) into line-merged blocks.
+
+    items: dicts with text, x0, x1, y_top, y_bot, size, font, bold, italic.
+    Returns extractors.extract_text_blocks-shaped block dicts (minus
+    classification, which the caller adds).
+    """
+    if not items:
+        return []
+
+    # 1. Cluster items into lines by y_top proximity.
+    lines: list[dict] = []
+    for it in sorted(items, key=lambda i: (round(i["y_top"], 0), i["x0"])):
+        placed = False
+        for ln in lines:
+            if abs(ln["y"] - it["y_top"]) <= max(2.0, it["size"] * 0.4):
+                ln["items"].append(it)
+                placed = True
+                break
+        if not placed:
+            lines.append({"y": it["y_top"], "items": [it]})
+
+    # 2. Build per-line records.
+    line_recs = []
+    for ln in lines:
+        its = sorted(ln["items"], key=lambda i: i["x0"])
+        sizes = [i["size"] for i in its]
+        line_recs.append(
+            {
+                "text": " ".join(i["text"] for i in its).strip(),
+                "x0": min(i["x0"] for i in its),
+                "x1": max(i["x1"] for i in its),
+                "y_top": min(i["y_top"] for i in its),
+                "y_bot": max(i["y_bot"] for i in its),
+                "size": _dominant(sizes, default=0.0),
+                "font": _dominant([i["font"] for i in its], default=""),
+                "bold": any(i["bold"] for i in its),
+                "italic": any(i["italic"] for i in its),
+            }
+        )
+    line_recs.sort(key=lambda r: (r["y_top"], r["x0"]))
+
+    # 3. Merge adjacent lines with similar size, small vertical gap, x-overlap.
+    merged: list[dict] = []
+    for ln in line_recs:
+        if merged:
+            prev = merged[-1]
+            gap = ln["y_top"] - prev["y_bot"]
+            same_size = abs(ln["size"] - prev["size"]) < 0.6
+            close = 0 <= gap <= max(prev["size"], 1.0) * 1.6
+            overlap = not (ln["x0"] > prev["x1"] or ln["x1"] < prev["x0"])
+            if same_size and close and overlap:
+                prev["text"] = (prev["text"] + " " + ln["text"]).strip()
+                prev["x0"] = min(prev["x0"], ln["x0"])
+                prev["x1"] = max(prev["x1"], ln["x1"])
+                prev["y_bot"] = ln["y_bot"]
+                prev["bold"] = prev["bold"] or ln["bold"]
+                prev["italic"] = prev["italic"] or ln["italic"]
+                continue
+        merged.append(dict(ln))
+
+    # 4. Finalize into extractor-shaped blocks (classification added by caller).
+    blocks = []
+    for order, b in enumerate(merged):
+        if not b["text"]:
+            continue
+        blocks.append(
+            {
+                "text": b["text"],
+                "bbox": {
+                    "x": round(b["x0"], 2),
+                    "y": round(b["y_top"], 2),
+                    "w": round(b["x1"] - b["x0"], 2),
+                    "h": round(b["y_bot"] - b["y_top"], 2),
+                },
+                "font": b["font"],
+                "font_size": round(b["size"], 1),
+                "is_bold": b["bold"],
+                "is_italic": b["italic"],
+                "reading_order": order,
+            }
+        )
+    return blocks
+
+
+def extract_text_blocks(pdf_path: str, page_number: int) -> dict:
+    """pdfium equivalent of extractors.extract_text_blocks (same return shape).
+
+    Sources text from pdfium text objects (preserving pdfium's completeness),
+    groups them into line-merged blocks, and classifies via the shared
+    extractors._classify_block using the page's font-size distribution.
+    """
+    pdfium, raw = pdfium_extractors._import_pdfium()
+    try:
+        pdf = pdfium.PdfDocument(str(pdf_path))
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "message": f"Failed to open PDF: {e}"}
+    try:
+        if page_number < 0 or page_number >= len(pdf):
+            return {"status": "error", "message": f"Page {page_number} out of range"}
+        page = pdf[page_number]
+        _, height = page.get_size()
+        textpage = page.get_textpage()
+
+        items = []
+        for obj in page.get_objects(filter=(raw.FPDF_PAGEOBJ_TEXT,), max_depth=15):
+            left, bottom, right, top = obj.get_bounds()
+            text = textpage.get_text_bounded(left=left, bottom=bottom, right=right, top=top).strip()
+            if not text:
+                continue
+            font_name = ""
+            weight = 400
+            try:
+                font = obj.get_font()
+                font_name = font.get_family_name() or ""
+                weight = font.get_weight() or 400
+            except Exception:  # noqa: BLE001 - font metadata is best-effort
+                pass
+            lower = font_name.lower()
+            items.append(
+                {
+                    "text": text,
+                    "x0": round(left, 2),
+                    "x1": round(right, 2),
+                    "y_top": round(height - top, 2),
+                    "y_bot": round(height - bottom, 2),
+                    "size": round(obj.get_font_size(), 1),
+                    "font": font_name,
+                    "bold": weight >= 600,
+                    "italic": ("italic" in lower or "oblique" in lower),
+                }
+            )
+    finally:
+        pdf.close()
+
+    blocks = _group_blocks(items)
+    # Build the font-size distribution from the per-object items (mirrors the
+    # pymupdf extractor's per-span basis). Using merged-block sizes would skew
+    # the median when many same-size lines collapse into one block.
+    all_sizes = [it["size"] for it in items if it["text"]]
+    for b in blocks:
+        b["classification"] = extractors._classify_block(b["font_size"], b["is_bold"], all_sizes)
+    return {"status": "success", "blocks": blocks}
