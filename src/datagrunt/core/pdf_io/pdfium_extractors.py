@@ -10,6 +10,7 @@ install without the optional ``[pdf]`` extra.
 # standard library
 import glob
 import hashlib
+import json
 import os
 from pathlib import Path
 
@@ -194,8 +195,6 @@ def flatten_pdfium_document(document: dict) -> list:
     Scalar columns only (position split into x/y/w/h, bbox JSON-encoded) so the
     result loads cleanly into a columnar frame regardless of element type.
     """
-    import json
-
     records = []
     pages = document.get("document", {}).get("pages", [])
     for page in pages:
