@@ -289,3 +289,31 @@ class TestPDFWriterPdfiumEngine:
         paths = PDFWriterPdfiumEngine(sample_pdf).extract_images(output_dir=str(out))
         assert len(paths) > 0
         assert all(os.path.isfile(p) for p in paths)
+
+
+class TestPDFReaderPdfiumStructured:
+    """pdfium engine in structured mode emits the unified element schema."""
+
+    def test_structured_to_dicts_unified_schema(self, sample_pdf):
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+
+        doc = PDFReaderPdfiumEngine(sample_pdf, structured=True).to_dicts()
+        assert "total_pages" in doc["document"]  # unified envelope key
+        page = doc["document"]["pages"][0]
+        assert set(page.keys()) == {"page_number", "width", "height", "classification", "elements"}
+
+    def test_default_is_native_schema(self, sample_pdf):
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+
+        page = PDFReaderPdfiumEngine(sample_pdf).to_dicts()["document"]["pages"][0]
+        assert "text_objects" in page  # native schema unchanged when structured=False
+
+    def test_structured_dataframe(self, sample_pdf):
+        import polars as pl
+
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+
+        df = PDFReaderPdfiumEngine(sample_pdf, structured=True).to_dataframe()
+        assert isinstance(df, pl.DataFrame)
+        assert df.height > 0
+        assert "type" in df.columns and "content" in df.columns  # unified flatten columns
