@@ -117,7 +117,8 @@ def run_engine(path: str, engine: str, image_dir: str | None) -> dict:
     unique_fn = _unique_images_pymupdf if unified else _UNIQUE_IMAGES[engine]
     start = time.perf_counter()
     try:
-        doc = PDFReader(path, engine=engine, structured=unified).to_dicts(image_output_dir=image_dir)
+        native = engine == "pdfium" and not unified
+        doc = PDFReader(path, engine=engine, native=native).to_dicts(image_output_dir=image_dir)
     except Exception as e:  # noqa: BLE001 - report, don't abort the sweep
         return {"error": f"{type(e).__name__}: {e}", "seconds": round(time.perf_counter() - start, 2)}
     elapsed = time.perf_counter() - start
