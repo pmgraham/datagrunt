@@ -148,3 +148,22 @@ class TestStructuredParity:
         _, _mu, pdf = parsed_structured
         text_types = set(_elements_by_type(pdf)) - {"image", "table"}
         assert text_types - {"body_text"}, f"only body_text produced: {text_types}"
+
+    def test_structured_text_not_duplicated_vs_native(self, parsed_structured):
+        # Guards against overlapping-text-object double-counting: the structured
+        # text stream must not exceed the native full-page text (which already
+        # includes table text inline). Allow a small margin for whitespace/joins.
+        from datagrunt import PDFReader
+
+        path, _mu, pdf = parsed_structured
+        native = PDFReader(path, engine="pdfium").to_dicts()
+        native_chars = sum(len(pg.get("text", "") or "") for pg in native["document"]["pages"])
+        struct_chars = 0
+        for pg in pdf["document"]["pages"]:
+            for el in pg["elements"]:
+                if isinstance(el.get("content"), str):
+                    struct_chars += len(el["content"])
+        assert struct_chars <= native_chars * 1.15, (
+            f"{Path(path).name}: structured text {struct_chars} inflated vs native {native_chars} "
+            f"(ratio {struct_chars / max(native_chars, 1):.2f}) -- overlapping-object duplication?"
+        )
