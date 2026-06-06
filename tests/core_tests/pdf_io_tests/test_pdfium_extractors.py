@@ -2,6 +2,8 @@
 
 import os
 
+import pytest
+
 from datagrunt.core.pdf_io import pdfium_extractors
 
 
@@ -57,3 +59,16 @@ class TestParsePdfiumPage:
         assert img["extracted"] is True
         assert img["file"] is not None
         assert os.path.isfile(img["file"])
+
+
+class TestOcrFallback:
+    """Test suite for the OCR fallback in parse_pdfium_page."""
+
+    def test_ocr_recovers_text_on_image_only_page(self, scanned_pdf, tesseract_available):
+        if not tesseract_available:
+            pytest.skip("tesseract binary not available")
+        page = pdfium_extractors.parse_pdfium_page(scanned_pdf, 0)
+        assert page["ocr"] is True
+        assert "HELLO" in page["text"].upper()
+        assert len(page["text_objects"]) > 0
+        assert page["text_objects"][0]["font_size"] is None
