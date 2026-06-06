@@ -174,3 +174,69 @@ def parse_pdfium_page(pdf_path: str, page_index: int, image_output_dir: str = No
         }
     finally:
         pdf.close()
+
+
+def combine_pdfium_pages(source: str, total_pages: int, pages: list, errors: list) -> dict:
+    """Wrap parsed PDFium pages in the native document envelope."""
+    return {
+        "document": {
+            "source": str(source),
+            "page_count": total_pages,
+            "errors": [e for e in errors] if errors else None,
+            "pages": pages,
+        }
+    }
+
+
+def flatten_pdfium_document(document: dict) -> list:
+    """Flatten a native PDFium document into one record per text object/image.
+
+    Scalar columns only (position split into x/y/w/h, bbox JSON-encoded) so the
+    result loads cleanly into a columnar frame regardless of element type.
+    """
+    import json
+
+    records = []
+    pages = document.get("document", {}).get("pages", [])
+    for page in pages:
+        page_no = page.get("page_number")
+        ocr = page.get("ocr", False)
+        for obj in page.get("text_objects", []):
+            pos = obj.get("position", {})
+            records.append(
+                {
+                    "page": page_no,
+                    "type": "text",
+                    "text": obj.get("text"),
+                    "font_size": obj.get("font_size"),
+                    "x": float(pos.get("x", 0.0)),
+                    "y": float(pos.get("y", 0.0)),
+                    "w": float(pos.get("w", 0.0)),
+                    "h": float(pos.get("h", 0.0)),
+                    "bbox": json.dumps(obj.get("bbox")),
+                    "file": None,
+                    "px_width": None,
+                    "px_height": None,
+                    "ocr": ocr,
+                }
+            )
+        for img in page.get("images", []):
+            pos = img.get("position", {})
+            records.append(
+                {
+                    "page": page_no,
+                    "type": "image",
+                    "text": None,
+                    "font_size": None,
+                    "x": float(pos.get("x", 0.0)),
+                    "y": float(pos.get("y", 0.0)),
+                    "w": float(pos.get("w", 0.0)),
+                    "h": float(pos.get("h", 0.0)),
+                    "bbox": json.dumps(img.get("bbox")),
+                    "file": img.get("file"),
+                    "px_width": img.get("px_width"),
+                    "px_height": img.get("px_height"),
+                    "ocr": ocr,
+                }
+            )
+    return records
