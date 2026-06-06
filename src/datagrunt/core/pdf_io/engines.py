@@ -13,7 +13,7 @@ import polars as pl
 import pyarrow as pa
 
 # local libraries
-from datagrunt.core.pdf_io import extractors, pdfcomponents
+from datagrunt.core.pdf_io import extractors, pdfcomponents, pdfium_extractors
 
 
 def set_export_filename(default_filename, export_filename=None):
@@ -124,6 +124,64 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
     def to_arrow_table(self, drop_layout_tables: bool = False) -> pa.Table:
         """Flatten parsed elements into a PyArrow table (one row/element)."""
         records = pdfcomponents.flatten_document_elements(self.to_dicts(drop_layout_tables=drop_layout_tables))
+        if not records:
+            return pa.Table.from_pydict({})
+        return pa.Table.from_pylist(records)
+
+
+class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
+    """Read and parse PDF files using PDFium (pypdfium2).
+
+    Emits the native PDFium schema (full page text, positioned text objects,
+    and embedded image files). Image-only pages fall back to OCR so extraction
+    stays complete. ``drop_layout_tables`` is accepted for interface parity but
+    is a no-op (PDFium has no table detection).
+    """
+
+    def _total_pages(self) -> int:
+        pdfium, _ = pdfium_extractors._import_pdfium()
+        pdf = pdfium.PdfDocument(str(self.filepath))
+        try:
+            return len(pdf)
+        finally:
+            pdf.close()
+
+    def to_dicts(self, image_output_dir: Optional[str] = None, drop_layout_tables: bool = False) -> dict:
+        """Parse all pages concurrently into the native document dict."""
+        total_pages = self._total_pages()
+        page_results = {}
+        errors = []
+
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            futures = {
+                executor.submit(pdfium_extractors.parse_pdfium_page, str(self.filepath), idx, image_output_dir): idx
+                for idx in range(total_pages)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    page = future.result()
+                    page_results[page["page_number"]] = page
+                except Exception as e:  # noqa: BLE001 - per-page isolation
+                    errors.append(f"Page {idx + 1}: {e}")
+
+        ordered = [page_results[p] for p in sorted(page_results.keys())]
+        return pdfium_extractors.combine_pdfium_pages(self.filepath, total_pages, ordered, errors)
+
+    def get_sample(self) -> dict:
+        """Parse and return the first page only."""
+        return pdfium_extractors.parse_pdfium_page(str(self.filepath), 0)
+
+    def to_dataframe(self, drop_layout_tables: bool = False) -> pl.DataFrame:
+        """Flatten parsed elements into a Polars DataFrame (one row/element)."""
+        records = pdfium_extractors.flatten_pdfium_document(self.to_dicts())
+        if not records:
+            return pl.DataFrame()
+        return pl.DataFrame(records)
+
+    def to_arrow_table(self, drop_layout_tables: bool = False) -> pa.Table:
+        """Flatten parsed elements into a PyArrow table (one row/element)."""
+        records = pdfium_extractors.flatten_pdfium_document(self.to_dicts())
         if not records:
             return pa.Table.from_pydict({})
         return pa.Table.from_pylist(records)
