@@ -90,3 +90,17 @@ class TestTopLevelExports:
         from datagrunt import PDFReader, PDFWriter
         assert PDFReader.__name__ == "PDFReader"
         assert PDFWriter.__name__ == "PDFWriter"
+
+
+class TestPDFReaderPdfiumEngine:
+    """End-to-end PDFReader tests using the pdfium engine."""
+
+    def test_reader_pdfium_to_dicts(self, sample_pdf):
+        doc = PDFReader(sample_pdf, engine="pdfium").to_dicts()
+        page = doc["document"]["pages"][0]
+        assert "text" in page
+        assert "text_objects" in page
+
+    def test_reader_pdfium_normalized_engine_name(self, sample_pdf):
+        reader = PDFReader(sample_pdf, engine="PDF ium")
+        assert reader.engine == "pdfium"
