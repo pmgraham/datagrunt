@@ -16,6 +16,9 @@ class PDFWriter(PDFComponents):
         Args:
             filepath (str or Path): Path to the PDF file to parse.
             engine (str, default 'pymupdf'): Parsing engine to instantiate.
+                One of 'pymupdf' (unified element schema, tables + OCR) or
+                'pdfium' (native schema: text, positioned text objects, images;
+                OCR fallback for image-only pages; no table detection).
             workers (int, default 4): Number of concurrent per-page workers.
         """
         filepath = Path(filepath)
