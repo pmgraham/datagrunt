@@ -13,7 +13,9 @@ import polars as pl
 import pyarrow as pa
 
 # local libraries
-from datagrunt.core.pdf_io import extractors, pdfcomponents
+from datagrunt.core.pdf_io import pdfcomponents
+from datagrunt.core.pdf_io.extraction import PdfiumBackend, PdfiumNativeReader
+from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
 
 
 def set_export_filename(default_filename, export_filename=None):
@@ -34,8 +36,8 @@ class PDFEngineProperties:
     json_export_filename: str = "output.json"
     json_newline_export_filename: str = "output.jsonl"
     images_export_dir: str = "output_images"
-    valid_engines: tuple = ("pymupdf",)
-    value_error_message: str = "Engine '{engine}' is not 'pymupdf'. Pass 'pymupdf' as a valid engine param."
+    valid_engines: tuple = ("pymupdf", "pdfium")
+    value_error_message: str = "Engine '{engine}' is not supported. Valid engines: {valid}."
 
 
 class PDFBaseReaderEngine(ABC):
@@ -78,22 +80,18 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
     """Read and parse PDF files using PyMuPDF / pdfplumber / Tesseract."""
 
     def _total_pages(self) -> int:
-        pymupdf = extractors._import_pymupdf()
-        doc = pymupdf.open(self.filepath)
-        try:
-            return doc.page_count
-        finally:
-            doc.close()
+        with PdfiumDocument(self.filepath) as doc:
+            return len(doc)
 
     def to_dicts(self, image_output_dir: Optional[str] = None, drop_layout_tables: bool = False) -> dict:
         """Parse all pages concurrently into the unified document dict."""
+        assembler = pdfcomponents.DocumentAssembler(self.filepath)
         total_pages = self._total_pages()
         page_results = {}
         errors = []
-
         with ThreadPoolExecutor(max_workers=self.workers) as executor:
             futures = {
-                executor.submit(pdfcomponents.parse_page, str(self.filepath), idx, image_output_dir): idx
+                executor.submit(assembler.parse_page, idx, image_output_dir): idx
                 for idx in range(total_pages)
             }
             for future in as_completed(futures):
@@ -103,27 +101,108 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
                     page_results[page["page_number"]] = page
                 except Exception as e:  # noqa: BLE001 - per-page isolation
                     errors.append(f"Page {idx + 1}: {e}")
-
         ordered = [page_results[p] for p in sorted(page_results.keys())]
-        document = pdfcomponents.combine_pages(self.filepath, total_pages, ordered, errors)
+        document = assembler.combine(total_pages, ordered, errors)
         if drop_layout_tables:
-            pdfcomponents.drop_layout_tables(document)
+            pdfcomponents.ParsedDocument(document).drop_layout_tables()
         return document
 
     def get_sample(self) -> dict:
         """Parse and return the first page only."""
-        return pdfcomponents.parse_page(str(self.filepath), 0)
+        return pdfcomponents.DocumentAssembler(self.filepath).parse_page(0)
 
     def to_dataframe(self, drop_layout_tables: bool = False) -> pl.DataFrame:
         """Flatten parsed elements into a Polars DataFrame (one row/element)."""
-        records = pdfcomponents.flatten_document_elements(self.to_dicts(drop_layout_tables=drop_layout_tables))
+        records = pdfcomponents.ParsedDocument(self.to_dicts(drop_layout_tables=drop_layout_tables)).flatten()
         if not records:
             return pl.DataFrame()
         return pl.DataFrame(records)
 
     def to_arrow_table(self, drop_layout_tables: bool = False) -> pa.Table:
         """Flatten parsed elements into a PyArrow table (one row/element)."""
-        records = pdfcomponents.flatten_document_elements(self.to_dicts(drop_layout_tables=drop_layout_tables))
+        records = pdfcomponents.ParsedDocument(self.to_dicts(drop_layout_tables=drop_layout_tables)).flatten()
+        if not records:
+            return pa.Table.from_pydict({})
+        return pa.Table.from_pylist(records)
+
+
+class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
+    """Read and parse PDF files using PDFium (pypdfium2).
+
+    Default (``structured=False``) emits the native PDFium schema. With
+    ``structured=True`` it emits the same unified element schema as the pymupdf
+    engine, via the shared ``pdfcomponents`` pipeline driven by ``PdfiumBackend``
+    (text, images, OCR) plus shared pdfplumber tables. Pages are parsed
+    sequentially because pdfium is not thread-safe.
+    """
+
+    def __init__(self, filepath, workers: int = 4, structured: bool = False):
+        super().__init__(filepath, workers=workers)
+        self.structured = structured
+
+    def _total_pages(self) -> int:
+        with PdfiumDocument(self.filepath) as doc:
+            return len(doc)
+
+    def _to_dicts_structured(self, image_output_dir, drop_layout_tables) -> dict:
+        assembler = pdfcomponents.DocumentAssembler(self.filepath, backend=PdfiumBackend(self.filepath))
+        total_pages = self._total_pages()
+        pages = []
+        errors = []
+        for idx in range(total_pages):
+            try:
+                pages.append(assembler.parse_page(idx, image_output_dir))
+            except Exception as e:  # noqa: BLE001 - per-page isolation
+                errors.append(f"Page {idx + 1}: {e}")
+        document = assembler.combine(total_pages, pages, errors)
+        if drop_layout_tables:
+            pdfcomponents.ParsedDocument(document).drop_layout_tables()
+        return document
+
+    def _to_dicts_native(self, image_output_dir) -> dict:
+        reader = PdfiumNativeReader(self.filepath)
+        total_pages = self._total_pages()
+        page_results = {}
+        errors = []
+        for idx in range(total_pages):
+            try:
+                page = reader.parse_page(idx, image_output_dir)
+                page_results[page["page_number"]] = page
+            except Exception as e:  # noqa: BLE001 - per-page isolation
+                errors.append(f"Page {idx + 1}: {e}")
+        ordered = [page_results[p] for p in sorted(page_results.keys())]
+        return reader.combine(total_pages, ordered, errors)
+
+    def to_dicts(self, image_output_dir: Optional[str] = None, drop_layout_tables: bool = False) -> dict:
+        """Parse all pages sequentially (pdfium is not thread-safe)."""
+        if self.structured:
+            return self._to_dicts_structured(image_output_dir, drop_layout_tables)
+        return self._to_dicts_native(image_output_dir)
+
+    def get_sample(self) -> dict:
+        """Parse and return the first page only."""
+        if self.structured:
+            return pdfcomponents.DocumentAssembler(
+                self.filepath, backend=PdfiumBackend(self.filepath)
+            ).parse_page(0)
+        return PdfiumNativeReader(self.filepath).parse_page(0)
+
+    def to_dataframe(self, drop_layout_tables: bool = False) -> pl.DataFrame:
+        """Flatten parsed elements into a Polars DataFrame (one row/element)."""
+        if self.structured:
+            records = pdfcomponents.ParsedDocument(self.to_dicts(drop_layout_tables=drop_layout_tables)).flatten()
+        else:
+            records = PdfiumNativeReader.flatten(self.to_dicts())
+        if not records:
+            return pl.DataFrame()
+        return pl.DataFrame(records)
+
+    def to_arrow_table(self, drop_layout_tables: bool = False) -> pa.Table:
+        """Flatten parsed elements into a PyArrow table (one row/element)."""
+        if self.structured:
+            records = pdfcomponents.ParsedDocument(self.to_dicts(drop_layout_tables=drop_layout_tables)).flatten()
+        else:
+            records = PdfiumNativeReader.flatten(self.to_dicts())
         if not records:
             return pa.Table.from_pydict({})
         return pa.Table.from_pylist(records)
@@ -185,7 +264,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
         filename = set_export_filename(self.properties.json_export_filename, export_filename)
         document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
         if image_output_dir and dedupe_images:
-            pdfcomponents.dedupe_document_images(document)
+            pdfcomponents.ParsedDocument(document).dedupe_images()
         with open(filename, "w") as f:
             json.dump(document, f, indent=2)
         return filename
@@ -197,8 +276,8 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
         filename = set_export_filename(self.properties.json_newline_export_filename, export_filename)
         document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
         if image_output_dir and dedupe_images:
-            pdfcomponents.dedupe_document_images(document)
-        records = pdfcomponents.flatten_document_elements(document)
+            pdfcomponents.ParsedDocument(document).dedupe_images()
+        records = pdfcomponents.ParsedDocument(document).flatten()
         with open(filename, "w") as f:
             for record in records:
                 f.write(json.dumps(record) + "\n")
@@ -215,7 +294,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
         directory = output_dir if output_dir else self.properties.images_export_dir
         document = self._reader().to_dicts(image_output_dir=directory)
         if dedupe:
-            pdfcomponents.dedupe_document_images(document)
+            pdfcomponents.ParsedDocument(document).dedupe_images()
         paths = []
         seen = set()
         for page in document.get("document", {}).get("pages", []):
@@ -225,4 +304,71 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
                     if fp and fp not in seen:
                         seen.add(fp)
                         paths.append(fp)
+        return paths
+
+
+class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
+    """Write parsed PDFium output. Native schema by default; unified when structured."""
+
+    def __init__(self, filepath, workers: int = 4, structured: bool = False):
+        super().__init__(filepath, workers=workers)
+        self.structured = structured
+
+    def _reader(self):
+        return PDFReaderPdfiumEngine(self.filepath, workers=self.workers, structured=self.structured)
+
+    def _dedupe(self, document):
+        if self.structured:
+            pdfcomponents.ParsedDocument(document).dedupe_images()
+        else:
+            PdfiumNativeReader.dedupe_images(document)
+
+    def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
+        """Parse the PDF and write the document JSON (native or unified schema)."""
+        filename = set_export_filename(self.properties.json_export_filename, export_filename)
+        document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
+        if image_output_dir and dedupe_images:
+            self._dedupe(document)
+        with open(filename, "w") as f:
+            json.dump(document, f, indent=2)
+        return filename
+
+    def write_json_newline_delimited(
+        self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False
+    ):
+        """Parse the PDF and write one flattened element per line (JSONL)."""
+        filename = set_export_filename(self.properties.json_newline_export_filename, export_filename)
+        document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
+        if image_output_dir and dedupe_images:
+            self._dedupe(document)
+        if self.structured:
+            records = pdfcomponents.ParsedDocument(document).flatten()
+        else:
+            records = PdfiumNativeReader.flatten(document)
+        with open(filename, "w") as f:
+            for record in records:
+                f.write(json.dumps(record) + "\n")
+        return filename
+
+    def extract_images(self, output_dir=None, dedupe=True):
+        """Parse the PDF, write embedded images to disk, return their paths."""
+        directory = output_dir if output_dir else self.properties.images_export_dir
+        document = self._reader().to_dicts(image_output_dir=directory)
+        if dedupe:
+            self._dedupe(document)
+        paths = []
+        seen = set()
+        for page in document.get("document", {}).get("pages", []):
+            if self.structured:
+                candidates = [
+                    (el.get("metadata") or {}).get("file_path")
+                    for el in page.get("elements", [])
+                    if el.get("type") == "image"
+                ]
+            else:
+                candidates = [img.get("file") for img in page.get("images", [])]
+            for fp in candidates:
+                if fp and fp not in seen:
+                    seen.add(fp)
+                    paths.append(fp)
         return paths

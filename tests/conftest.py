@@ -184,6 +184,66 @@ def empty_pdf(tmp_path):
 
 
 @pytest.fixture
+def scanned_pdf(tmp_path):
+    """Create a one-page PDF whose only content is a rendered-text image.
+
+    The text is rendered to a raster at 150 dpi and re-embedded as an image, so
+    the page has NO extractable text layer (pdfium returns empty text) and only
+    OCR can recover the words. Used to exercise the OCR fallback path.
+    """
+    import pymupdf
+
+    src = pymupdf.open()
+    src_page = src.new_page(width=612, height=792)
+    src_page.insert_text((72, 100), "HELLO WORLD", fontsize=48)
+    pix = src_page.get_pixmap(dpi=150)
+    src.close()
+
+    img_path = tmp_path / "_scan.png"
+    pix.save(str(img_path))
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_image(pymupdf.Rect(0, 0, 612, 792), filename=str(img_path))
+    pdf_path = tmp_path / "scanned.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+    return str(pdf_path)
+
+
+@pytest.fixture
+def multipage_pdf(tmp_path):
+    """Create a 3-page PDF with distinct, identifiable text on each page."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    for n in range(1, 4):
+        page = doc.new_page(width=612, height=792)
+        page.insert_text((72, 72), f"Page Marker {n}", fontsize=18)
+        page.insert_text((72, 110), f"Body content for page {n}.", fontsize=11)
+    pdf_path = tmp_path / "multipage.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+    return str(pdf_path)
+
+
+@pytest.fixture
+def small_image_pdf(tmp_path):
+    """Create a one-page PDF whose only image is below the 40px ignore threshold."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 20, 20))
+    pix.set_rect(pix.irect, (0, 0, 255))
+    page.insert_image(pymupdf.Rect(72, 72, 92, 92), stream=pix.tobytes("png"))
+    pdf_path = tmp_path / "small_image.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+    return str(pdf_path)
+
+
+@pytest.fixture
 def tesseract_available():
     """Return True if the tesseract system binary is on PATH."""
     return shutil.which("tesseract") is not None

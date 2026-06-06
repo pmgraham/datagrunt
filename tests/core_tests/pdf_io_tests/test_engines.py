@@ -166,16 +166,16 @@ class TestDropLayoutTablesThreading:
     """Verify the drop_layout_tables flag is plumbed through the engines."""
 
     def _spy(self, monkeypatch):
-        import datagrunt.core.pdf_io.pdfcomponents as pc
+        from datagrunt.core.pdf_io.pdfcomponents import ParsedDocument
 
         calls = []
-        original = pc.drop_layout_tables
+        original = ParsedDocument.drop_layout_tables
 
-        def spy(document, *args, **kwargs):
+        def spy(self, *args, **kwargs):
             calls.append(True)
-            return original(document, *args, **kwargs)
+            return original(self, *args, **kwargs)
 
-        monkeypatch.setattr(pc, "drop_layout_tables", spy)
+        monkeypatch.setattr(ParsedDocument, "drop_layout_tables", spy)
         return calls
 
     def test_reader_to_dicts_invokes_filter_when_true(self, sample_pdf, monkeypatch):
@@ -198,3 +198,144 @@ class TestDropLayoutTablesThreading:
         calls = self._spy(monkeypatch)
         PDFWriterPyMuPDFEngine(sample_pdf).write_json(drop_layout_tables=True)
         assert calls == [True]
+
+
+class TestPDFReaderPdfiumEngine:
+    """Test suite for the PDFium reader engine."""
+
+    def test_to_dicts_native_schema(self, sample_pdf):
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+
+        doc = PDFReaderPdfiumEngine(sample_pdf).to_dicts()
+        assert doc["document"]["page_count"] == 1
+        page = doc["document"]["pages"][0]
+        assert set(page.keys()) == {
+            "page_number", "width", "height", "text",
+            "text_objects", "images", "ocr",
+        }
+        assert "Quarterly Report" in page["text"]
+
+    def test_get_sample_returns_first_page(self, sample_pdf):
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+
+        page = PDFReaderPdfiumEngine(sample_pdf).get_sample()
+        assert page["page_number"] == 1
+
+    def test_to_dataframe_has_rows(self, sample_pdf):
+        import polars as pl
+
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+
+        df = PDFReaderPdfiumEngine(sample_pdf).to_dataframe()
+        assert isinstance(df, pl.DataFrame)
+        assert df.height > 0
+        assert "type" in df.columns
+
+    def test_to_arrow_table_has_rows(self, sample_pdf):
+        import pyarrow as pa
+
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+
+        table = PDFReaderPdfiumEngine(sample_pdf).to_arrow_table()
+        assert isinstance(table, pa.Table)
+        assert table.num_rows > 0
+
+    def test_missing_file_raises(self):
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+
+        with pytest.raises(FileNotFoundError):
+            PDFReaderPdfiumEngine("nope.pdf")
+
+    def test_to_dicts_multipage_ordered(self, multipage_pdf):
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+
+        doc = PDFReaderPdfiumEngine(multipage_pdf).to_dicts()
+        pages = doc["document"]["pages"]
+        assert doc["document"]["page_count"] == 3
+        assert [p["page_number"] for p in pages] == [1, 2, 3]
+        for n, page in enumerate(pages, start=1):
+            assert f"Page Marker {n}" in page["text"]
+
+
+class TestPDFWriterPdfiumEngine:
+    """Test suite for the PDFium writer engine."""
+
+    def test_write_json(self, sample_pdf, tmp_path):
+        import json
+
+        from datagrunt.core.pdf_io.engines import PDFWriterPdfiumEngine
+
+        out = tmp_path / "doc.json"
+        result = PDFWriterPdfiumEngine(sample_pdf).write_json(export_filename=str(out))
+        assert result == str(out)
+        data = json.loads(out.read_text())
+        assert data["document"]["page_count"] == 1
+
+    def test_write_json_newline_delimited(self, sample_pdf, tmp_path):
+        from datagrunt.core.pdf_io.engines import PDFWriterPdfiumEngine
+
+        out = tmp_path / "doc.jsonl"
+        result = PDFWriterPdfiumEngine(sample_pdf).write_json_newline_delimited(export_filename=str(out))
+        assert result == str(out)
+        lines = [ln for ln in out.read_text().splitlines() if ln.strip()]
+        assert len(lines) > 0
+
+    def test_extract_images_returns_paths(self, sample_pdf, tmp_path):
+        import os
+
+        from datagrunt.core.pdf_io.engines import PDFWriterPdfiumEngine
+
+        out = tmp_path / "imgs"
+        paths = PDFWriterPdfiumEngine(sample_pdf).extract_images(output_dir=str(out))
+        assert len(paths) > 0
+        assert all(os.path.isfile(p) for p in paths)
+
+
+class TestPDFReaderPdfiumStructured:
+    """pdfium engine in structured mode emits the unified element schema."""
+
+    def test_structured_to_dicts_unified_schema(self, sample_pdf):
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+
+        doc = PDFReaderPdfiumEngine(sample_pdf, structured=True).to_dicts()
+        assert "total_pages" in doc["document"]  # unified envelope key
+        page = doc["document"]["pages"][0]
+        assert set(page.keys()) == {"page_number", "width", "height", "classification", "elements"}
+
+    def test_default_is_native_schema(self, sample_pdf):
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+
+        page = PDFReaderPdfiumEngine(sample_pdf).to_dicts()["document"]["pages"][0]
+        assert "text_objects" in page  # native schema unchanged when structured=False
+
+    def test_structured_dataframe(self, sample_pdf):
+        import polars as pl
+
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+
+        df = PDFReaderPdfiumEngine(sample_pdf, structured=True).to_dataframe()
+        assert isinstance(df, pl.DataFrame)
+        assert df.height > 0
+        assert "type" in df.columns and "content" in df.columns  # unified flatten columns
+
+
+class TestPDFWriterPdfiumStructured:
+    def test_structured_write_json_unified(self, sample_pdf, tmp_path):
+        import json
+
+        from datagrunt.core.pdf_io.engines import PDFWriterPdfiumEngine
+
+        out = tmp_path / "doc.json"
+        PDFWriterPdfiumEngine(sample_pdf, structured=True).write_json(export_filename=str(out))
+        data = json.loads(out.read_text())
+        assert "total_pages" in data["document"]
+        assert "elements" in data["document"]["pages"][0]
+
+    def test_structured_extract_images(self, sample_pdf, tmp_path):
+        import os
+
+        from datagrunt.core.pdf_io.engines import PDFWriterPdfiumEngine
+
+        paths = PDFWriterPdfiumEngine(sample_pdf, structured=True).extract_images(output_dir=str(tmp_path))
+        assert len(paths) >= 1
+        assert all(os.path.isfile(p) for p in paths)
