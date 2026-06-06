@@ -5,10 +5,10 @@ from datagrunt.core.pdf_io import pdfcomponents
 
 
 class TestParsePage:
-    """Test suite for parse_page."""
+    """Test suite for DocumentAssembler.parse_page."""
 
     def test_assembles_elements(self, sample_pdf):
-        page = pdfcomponents.parse_page(sample_pdf, 0)
+        page = pdfcomponents.DocumentAssembler(sample_pdf).parse_page(0)
         assert page["page_number"] == 1
         assert page["classification"] in {"text_only", "scanned", "mixed"}
         types = {e["type"] for e in page["elements"]}
@@ -22,10 +22,10 @@ class TestParsePage:
 
 
 class TestParseDocument:
-    """Test suite for parse_document."""
+    """Test suite for DocumentAssembler.parse_document."""
 
     def test_combined_structure(self, sample_pdf):
-        doc = pdfcomponents.parse_document(sample_pdf, total_pages=1)
+        doc = pdfcomponents.DocumentAssembler(sample_pdf).parse_document(1)
         assert "document" in doc
         d = doc["document"]
         assert d["total_pages"] == 1
@@ -35,11 +35,11 @@ class TestParseDocument:
 
 
 class TestFlatten:
-    """Test suite for flatten_document_elements."""
+    """Test suite for ParsedDocument.flatten."""
 
     def test_flattens_to_records(self, sample_pdf):
-        doc = pdfcomponents.parse_document(sample_pdf, total_pages=1)
-        records = pdfcomponents.flatten_document_elements(doc)
+        doc = pdfcomponents.DocumentAssembler(sample_pdf).parse_document(1)
+        records = pdfcomponents.ParsedDocument(doc).flatten()
         assert len(records) >= 2
         rec = records[0]
         # Scalar position columns + JSON-encoded complex fields.
@@ -59,7 +59,7 @@ class TestPDFComponents:
 
 
 class TestDedupeImages:
-    """Test suite for dedupe_document_images."""
+    """Test suite for ParsedDocument.dedupe_images."""
 
     @staticmethod
     def _img_element(file_path):
@@ -100,7 +100,7 @@ class TestDedupeImages:
             }
         }
 
-        removed = pdfcomponents.dedupe_document_images(document)
+        removed = pdfcomponents.ParsedDocument(document).dedupe_images()
 
         assert removed == 1
         # The redundant duplicate file is deleted; the first + unique remain.
@@ -131,14 +131,14 @@ class TestDedupeImages:
             }
         }
 
-        removed = pdfcomponents.dedupe_document_images(document)
+        removed = pdfcomponents.ParsedDocument(document).dedupe_images()
 
         assert removed == 0
         assert a.exists()
 
 
 class TestDropLayoutTables:
-    """Test suite for drop_layout_tables."""
+    """Test suite for ParsedDocument.drop_layout_tables."""
 
     @staticmethod
     def _table(rows, cols):
@@ -182,7 +182,7 @@ class TestDropLayoutTables:
             }
         }
 
-        removed = pdfcomponents.drop_layout_tables(document)
+        removed = pdfcomponents.ParsedDocument(document).drop_layout_tables()
 
         assert removed == 3
         kept = document["document"]["pages"][0]["elements"]
@@ -195,6 +195,91 @@ class TestDropLayoutTables:
         document = {
             "document": {"pages": [{"page_number": 1, "elements": [self._header()]}]}
         }
-        removed = pdfcomponents.drop_layout_tables(document)
+        removed = pdfcomponents.ParsedDocument(document).drop_layout_tables()
         assert removed == 0
         assert len(document["document"]["pages"][0]["elements"]) == 1
+
+
+class TestParsePageBackend:
+    """DocumentAssembler.parse_page consumes an ExtractionBackend + table extractor."""
+
+    def test_default_backend_pymupdf(self, sample_pdf):
+        from datagrunt.core.pdf_io.pdfcomponents import DocumentAssembler
+
+        page = DocumentAssembler(sample_pdf).parse_page(0)
+        assert page["page_number"] == 1
+        assert "elements" in page
+        types = {el["type"] for el in page["elements"]}
+        assert types & {"header", "subheader", "body_text", "caption"}
+
+    def test_explicit_pdfium_backend(self, sample_pdf):
+        from datagrunt.core.pdf_io.extraction import PdfiumBackend
+        from datagrunt.core.pdf_io.pdfcomponents import DocumentAssembler
+
+        page = DocumentAssembler(sample_pdf, backend=PdfiumBackend(sample_pdf)).parse_page(0)
+        assert set(page.keys()) == {"page_number", "width", "height", "classification", "elements"}
+        types = {el["type"] for el in page["elements"]}
+        assert types & {"header", "subheader", "body_text", "caption"}
+
+
+class TestDocumentAssembler:
+    """DocumentAssembler builds the unified-schema document via a backend."""
+
+    def test_parse_page(self, sample_pdf):
+        from datagrunt.core.pdf_io.pdfcomponents import DocumentAssembler
+
+        page = DocumentAssembler(sample_pdf).parse_page(0)
+        assert set(page.keys()) == {"page_number", "width", "height", "classification", "elements"}
+        assert page["page_number"] == 1
+        assert {el["type"] for el in page["elements"]} & {"header", "subheader", "body_text", "caption"}
+
+    def test_parse_document_envelope(self, sample_pdf):
+        from datagrunt.core.pdf_io.pdfcomponents import DocumentAssembler
+
+        doc = DocumentAssembler(sample_pdf).parse_document(1)
+        assert doc["document"]["total_pages"] == 1
+        assert len(doc["document"]["pages"]) == 1
+
+    def test_explicit_pdfium_backend(self, sample_pdf):
+        from datagrunt.core.pdf_io.extraction import PdfiumBackend
+        from datagrunt.core.pdf_io.pdfcomponents import DocumentAssembler
+
+        page = DocumentAssembler(sample_pdf, backend=PdfiumBackend(sample_pdf)).parse_page(0)
+        assert page["page_number"] == 1
+
+
+class TestParsedDocument:
+    """ParsedDocument exposes flatten/dedupe/drop operations over a document."""
+
+    def test_flatten(self, sample_pdf):
+        from datagrunt.core.pdf_io.pdfcomponents import DocumentAssembler, ParsedDocument
+
+        doc = DocumentAssembler(sample_pdf).parse_document(1)
+        records = ParsedDocument(doc).flatten()
+        assert records and {"type", "page", "content"} <= set(records[0].keys())
+
+    def test_dedupe_images_counts(self, tmp_path):
+        from datagrunt.core.pdf_io.pdfcomponents import ParsedDocument
+
+        a, b = tmp_path / "a.png", tmp_path / "b.png"
+        a.write_bytes(b"X")
+        b.write_bytes(b"X")
+        document = {"document": {"pages": [{"elements": [
+            {"type": "image", "metadata": {"file_path": str(a)}},
+            {"type": "image", "metadata": {"file_path": str(b)}},
+        ]}]}}
+        removed = ParsedDocument(document).dedupe_images()
+        assert removed == 1 and not b.exists()
+
+    def test_drop_layout_tables(self):
+        from datagrunt.core.pdf_io.pdfcomponents import ParsedDocument
+
+        document = {"document": {"pages": [{"elements": [
+            {"type": "table", "metadata": {"rows": 1, "columns": 5}},
+            {"type": "table", "metadata": {"rows": 4, "columns": 3}},
+            {"type": "body_text"},
+        ]}]}}
+        pd = ParsedDocument(document)
+        assert pd.drop_layout_tables() == 1
+        kept = document["document"]["pages"][0]["elements"]
+        assert [e["type"] for e in kept] == ["table", "body_text"]

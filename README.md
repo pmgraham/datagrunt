@@ -15,7 +15,7 @@ Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow
 - **Path Object Support:** Full support for both string paths and `pathlib.Path` objects for modern, cross-platform file handling.
 - **Multiple Processing Engines:** Choose from three powerful engines - [DuckDB](https://duckdb.org), [Polars](https://pola.rs), and [PyArrow](https://arrow.apache.org/docs/python/) - to handle your data processing needs.
 - **Flexible Data Transformation:** Easily convert your processed CSV data into various formats including CSV, Excel, JSON, JSONL, and Parquet.
-- **PDF Parsing & OCR:** Extract text, tables, and images from PDF files as dicts, DataFrames, or JSON, with optional [Tesseract](https://github.com/tesseract-ocr/tesseract) OCR for scanned pages.
+- **PDF Parsing & OCR:** Extract text, tables, and images from PDF files as dicts, DataFrames, or JSON, with optional [Tesseract](https://github.com/tesseract-ocr/tesseract) OCR for scanned pages. Powered by the permissively-licensed **PDFium** engine by default, with **PyMuPDF** available as an alternative.
 - **AI-Powered Schema Analysis:** Use Google's Gemini models to automatically generate detailed schema reports for your CSV files, including data types, column classifications, and data quality checks.
 - **Pythonic API:** Enjoy a clean and intuitive API that integrates seamlessly into your existing Python workflows.
 
@@ -26,7 +26,10 @@ Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow
 | [Polars](https://pola.rs) | Multi-threaded DataFrame library written in Rust, optimized for performance |
 | [PyArrow](https://arrow.apache.org/docs/python/) | Python bindings for Apache Arrow with efficient columnar data processing |
 | [Google Gemini](https://deepmind.google/technologies/gemini/) | A powerful family of generative AI models for schema analysis |
-| [PyMuPDF](https://pymupdf.readthedocs.io/) | High-performance PDF engine for extracting text, tables, and images, paired with Tesseract OCR for scanned pages |
+| [PDFium](https://github.com/pypdfium2-team/pypdfium2) | Default PDF engine (via `pypdfium2`) — permissively licensed (BSD-3 / Apache-2.0); fast text + image extraction, with a structured mode at parity with PyMuPDF |
+| [pdfplumber](https://github.com/jsvine/pdfplumber) | Table detection and extraction (MIT), shared by both PDF engines |
+| [PyMuPDF](https://pymupdf.readthedocs.io/) | Alternative PDF engine for text, tables, and images (AGPL-3.0 / commercial) |
+| [Tesseract](https://github.com/tesseract-ocr/tesseract) | OCR for scanned/image-only pages (optional) |
 
 ## Installation
 
@@ -165,7 +168,7 @@ Native-text PDFs, tables, and embedded images work without it.
 ```python
 from datagrunt import PDFReader, PDFWriter
 
-# Parse a PDF into the unified document structure.
+# Parse a PDF into the unified document structure (PDFium engine by default).
 reader = PDFReader("report.pdf")
 document = reader.to_dicts()           # {"document": {"pages": [...]}}
 df = reader.to_dataframe()             # one row per extracted element
@@ -175,6 +178,33 @@ writer = PDFWriter("report.pdf")
 writer.write_json("report.json", image_output_dir="report_images")
 writer.extract_images(output_dir="report_images")
 ```
+
+### Choosing a PDF engine
+
+`PDFReader` and `PDFWriter` accept an `engine` argument:
+
+```python
+# Default: PDFium — permissively licensed (BSD-3 / Apache-2.0).
+reader = PDFReader("report.pdf")                      # engine="pdfium"
+
+# Lean, fast mode: text + positioned text objects + images, no table detection.
+reader = PDFReader("report.pdf", native=True)
+
+# Alternative engine: PyMuPDF (AGPL-3.0 / commercial).
+reader = PDFReader("report.pdf", engine="pymupdf")
+```
+
+Both engines emit the same **unified element schema** by default, so output is
+interchangeable. **PDFium** is the default because it is **permissively
+licensed** (unlike PyMuPDF, which is AGPL-3.0 / commercial) and is faster on
+text-heavy documents. Table detection (via pdfplumber) and OCR work identically
+on either engine.
+
+- `native=True` (PDFium only) switches to a lean schema — full page text,
+  positioned text objects, and images, with **no table detection** — which is
+  dramatically faster (~20–80×) when you don't need structured tables.
+- Image-only / scanned pages fall back to **Tesseract OCR** automatically on
+  both engines (requires the Tesseract binary; see above).
 
 When images are written to disk, byte-identical duplicates (common with repeated
 icons or backgrounds) are collapsed to a single file and all references are
@@ -195,7 +225,7 @@ tables with at least two rows and two columns. It is off by default.
 | **Default for** | CSVReader | CSVWriter | - |
 | **Export Quality** | Good | Excellent (especially JSON) | Native Parquet support |
 
-_The engines above apply to CSV processing. PDF parsing uses the [PyMuPDF](https://pymupdf.readthedocs.io/) engine — see [PDF parsing](#pdf-parsing)._
+_The engines above apply to CSV processing. PDF parsing uses the **PDFium** engine by default (permissively licensed), with **PyMuPDF** available via `engine="pymupdf"` — see [PDF parsing](#pdf-parsing)._
 
 ## Primary Classes
 

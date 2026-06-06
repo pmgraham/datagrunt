@@ -51,14 +51,14 @@ class TestDropLayoutTablesPassthrough:
     """Verify PDFReader threads drop_layout_tables to the filter."""
 
     def _spy(self, monkeypatch):
-        import datagrunt.core.pdf_io.pdfcomponents as pc
+        from datagrunt.core.pdf_io.pdfcomponents import ParsedDocument
 
         calls = []
-        original = pc.drop_layout_tables
+        original = ParsedDocument.drop_layout_tables
         monkeypatch.setattr(
-            pc,
+            ParsedDocument,
             "drop_layout_tables",
-            lambda document, *a, **k: (calls.append(True), original(document, *a, **k))[1],
+            lambda self, *a, **k: (calls.append(True), original(self, *a, **k))[1],
         )
         return calls
 
@@ -90,3 +90,26 @@ class TestTopLevelExports:
         from datagrunt import PDFReader, PDFWriter
         assert PDFReader.__name__ == "PDFReader"
         assert PDFWriter.__name__ == "PDFWriter"
+
+
+class TestPDFReaderPdfiumEngine:
+    """End-to-end PDFReader tests using the pdfium engine."""
+
+    def test_reader_pdfium_to_dicts(self, sample_pdf):
+        doc = PDFReader(sample_pdf, engine="pdfium", native=True).to_dicts()
+        page = doc["document"]["pages"][0]
+        assert "text" in page
+        assert "text_objects" in page
+
+    def test_reader_pdfium_normalized_engine_name(self, sample_pdf):
+        reader = PDFReader(sample_pdf, engine="PDF ium")
+        assert reader.engine == "pdfium"
+
+
+class TestPDFReaderStructured:
+    def test_reader_structured_unified_schema(self, sample_pdf):
+        from datagrunt import PDFReader
+
+        doc = PDFReader(sample_pdf, engine="pdfium").to_dicts()
+        page = doc["document"]["pages"][0]
+        assert "elements" in page and "classification" in page

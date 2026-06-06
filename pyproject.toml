@@ -34,6 +34,7 @@ pdf = [
     "pdfplumber>=0.11.0",
     "pytesseract>=0.3.10",
     "Pillow>=10.0.0",
+    "pypdfium2>=4.30.0",
 ]
 dev = [
     "pytest>=8.3.4",
@@ -76,8 +77,11 @@ testpaths = "tests"
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
-addopts = "-v --cov=src/datagrunt --cov-report=term-missing"
+addopts = "-v --cov=src/datagrunt --cov-report=term-missing -m 'not corpus'"
 pythonpath = "."
+markers = [
+    "corpus: slow, local-only cross-engine tests over the data/pdfs corpus (deselected by default; run with -m corpus)",
+]
 
 [tool.ruff]
 line-length = 120
