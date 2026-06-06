@@ -228,6 +228,22 @@ def multipage_pdf(tmp_path):
 
 
 @pytest.fixture
+def small_image_pdf(tmp_path):
+    """Create a one-page PDF whose only image is below the 40px ignore threshold."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 20, 20))
+    pix.set_rect(pix.irect, (0, 0, 255))
+    page.insert_image(pymupdf.Rect(72, 72, 92, 92), stream=pix.tobytes("png"))
+    pdf_path = tmp_path / "small_image.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+    return str(pdf_path)
+
+
+@pytest.fixture
 def tesseract_available():
     """Return True if the tesseract system binary is on PATH."""
     return shutil.which("tesseract") is not None

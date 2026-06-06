@@ -197,3 +197,16 @@ class TestDedupePdfiumImages:
             }
         }
         assert pdfium_extractors.dedupe_pdfium_images(document) == 0
+
+
+class TestImageSizeFilter:
+    """Test suite for the tiny-image filter (mirrors the pymupdf engine)."""
+
+    def test_skips_images_below_min_dimension(self, small_image_pdf):
+        page = pdfium_extractors.parse_pdfium_page(small_image_pdf, 0)
+        assert page["images"] == []
+
+    def test_keeps_images_at_or_above_min_dimension(self, sample_pdf):
+        # sample_pdf embeds a 100x100 image, which is above the threshold.
+        page = pdfium_extractors.parse_pdfium_page(sample_pdf, 0)
+        assert len(page["images"]) >= 1
