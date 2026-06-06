@@ -34,8 +34,8 @@ class PDFEngineProperties:
     json_export_filename: str = "output.json"
     json_newline_export_filename: str = "output.jsonl"
     images_export_dir: str = "output_images"
-    valid_engines: tuple = ("pymupdf",)
-    value_error_message: str = "Engine '{engine}' is not 'pymupdf'. Pass 'pymupdf' as a valid engine param."
+    valid_engines: tuple = ("pymupdf", "pdfium")
+    value_error_message: str = "Engine '{engine}' is not supported. Valid engines: {valid}."
 
 
 class PDFBaseReaderEngine(ABC):
