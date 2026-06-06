@@ -110,22 +110,26 @@ _UNIQUE_IMAGES = {"pymupdf": _unique_images_pymupdf, "pdfium": _unique_images_pd
 
 def run_engine(path: str, engine: str, image_dir: str | None) -> dict:
     """Parse one document with one engine; return metrics, per-page text, timing."""
+    unified = engine == "pdfium" and "--structured" in sys.argv[1:]
+    pages_text_fn = _pages_text_pymupdf if unified else _PAGES_TEXT[engine]
+    structure_fn = _structure_pymupdf if unified else _STRUCTURE[engine]
+    unique_fn = _unique_images_pymupdf if unified else _UNIQUE_IMAGES[engine]
     start = time.perf_counter()
     try:
-        doc = PDFReader(path, engine=engine).to_dicts(image_output_dir=image_dir)
+        doc = PDFReader(path, engine=engine, structured=unified).to_dicts(image_output_dir=image_dir)
     except Exception as e:  # noqa: BLE001 - report, don't abort the sweep
         return {"error": f"{type(e).__name__}: {e}", "seconds": round(time.perf_counter() - start, 2)}
     elapsed = time.perf_counter() - start
 
-    pages_text = _PAGES_TEXT[engine](doc)
+    pages_text = pages_text_fn(doc)
     full_text = "\n".join(pages_text)
-    metrics = _STRUCTURE[engine](doc)
+    metrics = structure_fn(doc)
     metrics.update(
         seconds=round(elapsed, 2),
         pages=len(pages_text),
         text_chars=sum(len(t) for t in pages_text),
         words=len(full_text.split()),
-        unique_images=_UNIQUE_IMAGES[engine](doc) if image_dir else None,
+        unique_images=unique_fn(doc) if image_dir else None,
         pages_text=pages_text,
         tokens=set(_TOKEN.findall(full_text.lower())),
         error=None,

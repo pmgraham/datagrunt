@@ -76,3 +76,64 @@ class TestEngineComparison:
             f"{Path(path).name}: text extraction diverges drastically "
             f"(pymupdf={mu_chars}, pdfium={pdf_chars}, ratio={lo / hi:.2f} < {TEXT_FLOOR_RATIO})"
         )
+
+
+def _elements_by_type(doc: dict) -> dict:
+    counts = {}
+    for pg in doc.get("document", {}).get("pages", []):
+        for el in pg.get("elements", []):
+            counts[el["type"]] = counts.get(el["type"], 0) + 1
+    return counts
+
+
+def _table_cells(doc: dict) -> list:
+    cells = []
+    for pg in doc.get("document", {}).get("pages", []):
+        for el in pg.get("elements", []):
+            if el.get("type") == "table":
+                cells.append(el.get("content"))
+    return cells
+
+
+@pytest.fixture(scope="module", params=CORPUS, ids=[Path(p).name for p in CORPUS])
+def parsed_structured(request):
+    """Parse one corpus doc with pymupdf and with pdfium structured mode."""
+    from datagrunt import PDFReader
+
+    path = request.param
+    pymupdf_doc = PDFReader(path, engine="pymupdf").to_dicts()
+    pdfium_doc = PDFReader(path, engine="pdfium", structured=True).to_dicts()
+    return path, pymupdf_doc, pdfium_doc
+
+
+class TestStructuredParity:
+    """pdfium structured mode must match-or-exceed the pymupdf engine."""
+
+    def test_page_count_parity(self, parsed_structured):
+        _, mu, pdf = parsed_structured
+        assert mu["document"]["total_pages"] == pdf["document"]["total_pages"]
+
+    def test_tables_identical(self, parsed_structured):
+        # Tables come from the shared pdfplumber path -> must be identical.
+        _, mu, pdf = parsed_structured
+        assert _table_cells(pdf) == _table_cells(mu)
+
+    def test_image_counts_match(self, parsed_structured):
+        _, mu, pdf = parsed_structured
+        assert _elements_by_type(pdf).get("image", 0) == _elements_by_type(mu).get("image", 0)
+
+    def test_text_completeness_at_least_pymupdf(self, parsed_structured):
+        path, mu, pdf = parsed_structured
+
+        def text_chars(doc):
+            total = 0
+            for pg in doc["document"]["pages"]:
+                for el in pg["elements"]:
+                    if isinstance(el.get("content"), str):
+                        total += len(el["content"])
+            return total
+
+        mu_chars, pdf_chars = text_chars(mu), text_chars(pdf)
+        assert pdf_chars >= TEXT_FLOOR_RATIO * mu_chars, (
+            f"{Path(path).name}: structured pdfium text {pdf_chars} far below pymupdf {mu_chars}"
+        )
