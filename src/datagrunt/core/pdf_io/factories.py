@@ -6,7 +6,9 @@ from pathlib import Path
 # local libraries
 from datagrunt.core.pdf_io.engines import (
     PDFEngineProperties,
+    PDFReaderPdfiumEngine,
     PDFReaderPyMuPDFEngine,
+    PDFWriterPdfiumEngine,
     PDFWriterPyMuPDFEngine,
 )
 
@@ -16,10 +18,12 @@ class PDFEngineFactory:
 
     READER_ENGINES = {
         "pymupdf": PDFReaderPyMuPDFEngine,
+        "pdfium": PDFReaderPdfiumEngine,
     }
 
     WRITER_ENGINES = {
         "pymupdf": PDFWriterPyMuPDFEngine,
+        "pdfium": PDFWriterPdfiumEngine,
     }
 
     def __init__(self, filepath, engine, workers: int = 4):
