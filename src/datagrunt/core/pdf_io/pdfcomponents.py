@@ -228,36 +228,6 @@ class ParsedDocument:
         return removed
 
 
-def parse_page(pdf_path, page_index, image_output_dir=None, backend=None, table_extractor=None):
-    """Deprecated shim: use DocumentAssembler. Parse one page to the unified schema."""
-    return DocumentAssembler(pdf_path, backend, table_extractor).parse_page(page_index, image_output_dir)
-
-
-def parse_document(pdf_path, total_pages, image_output_dir=None, backend=None, table_extractor=None):
-    """Deprecated shim: use DocumentAssembler.parse_document."""
-    return DocumentAssembler(pdf_path, backend, table_extractor).parse_document(total_pages, image_output_dir)
-
-
-def combine_pages(source, total_pages, pages, errors) -> dict:
-    """Deprecated shim: use DocumentAssembler.combine."""
-    return DocumentAssembler(source).combine(total_pages, pages, errors)
-
-
-def flatten_document_elements(document: dict) -> list:
-    """Deprecated shim: use ParsedDocument.flatten."""
-    return ParsedDocument(document).flatten()
-
-
-def dedupe_document_images(document: dict) -> int:
-    """Deprecated shim: use ParsedDocument.dedupe_images."""
-    return ParsedDocument(document).dedupe_images()
-
-
-def drop_layout_tables(document: dict, min_rows: int = 2, min_cols: int = 2) -> int:
-    """Deprecated shim: use ParsedDocument.drop_layout_tables."""
-    return ParsedDocument(document).drop_layout_tables(min_rows, min_cols)
-
-
 class PDFComponents(FileProperties):
     """A class that combines PDF components into a single interface."""
 

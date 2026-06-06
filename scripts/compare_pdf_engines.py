@@ -83,7 +83,7 @@ def _structure_pdfium(doc: dict) -> dict:
 
 
 def _unique_images_pymupdf(doc: dict) -> int:
-    pdfcomponents.dedupe_document_images(doc)
+    pdfcomponents.ParsedDocument(doc).dedupe_images()
     paths = set()
     for pg in doc.get("document", {}).get("pages", []):
         for el in pg.get("elements", []):
