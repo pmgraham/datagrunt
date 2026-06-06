@@ -20,16 +20,16 @@ def classify_font_size(font_size: float, is_bold: bool, all_sizes: list) -> str:
     return "body_text"
 
 
-def _dominant(values, default=None):
-    """Most common value (ties broken by first occurrence)."""
-    values = [v for v in values if v not in (None, "")]
-    if not values:
-        return default
-    return max(set(values), key=values.count)
-
-
 class TextBlockBuilder:
     """Cluster text items into lines, merge lines into blocks, then classify."""
+
+    @staticmethod
+    def _dominant(values, default=None):
+        """Most common value (ties broken by first occurrence)."""
+        values = [v for v in values if v not in (None, "")]
+        if not values:
+            return default
+        return max(set(values), key=values.count)
 
     def build(self, items: list) -> list:
         """Return a list of classified ``TextBlock`` from raw ``TextItem`` list."""
@@ -64,8 +64,8 @@ class TextBlockBuilder:
             "x1": max(i.x1 for i in its),
             "y_top": min(i.y_top for i in its),
             "y_bot": max(i.y_bot for i in its),
-            "size": _dominant(sizes, default=0.0),
-            "font": _dominant([i.font for i in its], default=""),
+            "size": self._dominant(sizes, default=0.0),
+            "font": self._dominant([i.font for i in its], default=""),
             "bold": any(i.is_bold for i in its),
             "italic": any(i.is_italic for i in its),
         }
