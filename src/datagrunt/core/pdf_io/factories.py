@@ -26,7 +26,7 @@ class PDFEngineFactory:
         "pdfium": PDFWriterPdfiumEngine,
     }
 
-    def __init__(self, filepath, engine, workers: int = 4):
+    def __init__(self, filepath, engine, workers: int = 4, structured: bool = False):
         """Initialize the PDF Engine Factory class.
 
         Args:
@@ -37,6 +37,7 @@ class PDFEngineFactory:
         self.filepath = Path(filepath)
         self.engine = engine.lower().replace(" ", "")
         self.workers = workers
+        self.structured = structured
         if not self.filepath.exists():
             raise FileNotFoundError
         if self.engine not in PDFEngineProperties.valid_engines:
@@ -51,6 +52,8 @@ class PDFEngineFactory:
         """Create a PDF reader engine instance."""
         engine_class = self.READER_ENGINES.get(self.engine)
         if engine_class:
+            if self.engine == "pdfium":
+                return engine_class(self.filepath, workers=self.workers, structured=self.structured)
             return engine_class(self.filepath, workers=self.workers)
         raise ValueError(f"Unsupported reader engine: {self.engine}")
 
@@ -58,5 +61,7 @@ class PDFEngineFactory:
         """Create a PDF writer engine instance."""
         engine_class = self.WRITER_ENGINES.get(self.engine)
         if engine_class:
+            if self.engine == "pdfium":
+                return engine_class(self.filepath, workers=self.workers, structured=self.structured)
             return engine_class(self.filepath, workers=self.workers)
         raise ValueError(f"Unsupported writer engine: {self.engine}")
