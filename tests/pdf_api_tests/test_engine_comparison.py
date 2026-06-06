@@ -141,3 +141,10 @@ class TestStructuredParity:
         assert pdf_chars >= TEXT_FLOOR_RATIO * mu_chars, (
             f"{Path(path).name}: structured pdfium text {pdf_chars} far below pymupdf {mu_chars}"
         )
+
+    def test_classification_not_degenerate(self, parsed_structured):
+        # Guards the matrix-scaled font-size fix: structured pdfium must
+        # distinguish heading-level text, not collapse everything to body_text.
+        _, _mu, pdf = parsed_structured
+        text_types = set(_elements_by_type(pdf)) - {"image", "table"}
+        assert text_types - {"body_text"}, f"only body_text produced: {text_types}"
