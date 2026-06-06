@@ -13,7 +13,8 @@ import polars as pl
 import pyarrow as pa
 
 # local libraries
-from datagrunt.core.pdf_io import extractors, pdfcomponents, pdfium_backend, pdfium_extractors
+from datagrunt.core.pdf_io import extractors, pdfcomponents, pdfium_extractors
+from datagrunt.core.pdf_io.extraction import PdfiumBackend
 
 
 def set_export_filename(default_filename, export_filename=None):
@@ -158,7 +159,9 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
         for idx in range(total_pages):
             try:
                 pages.append(
-                    pdfcomponents.parse_page(str(self.filepath), idx, image_output_dir, backend=pdfium_backend)
+                    pdfcomponents.parse_page(
+                        str(self.filepath), idx, image_output_dir, backend=PdfiumBackend(self.filepath)
+                    )
                 )
             except Exception as e:  # noqa: BLE001 - per-page isolation
                 errors.append(f"Page {idx + 1}: {e}")
@@ -189,7 +192,7 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
     def get_sample(self) -> dict:
         """Parse and return the first page only."""
         if self.structured:
-            return pdfcomponents.parse_page(str(self.filepath), 0, backend=pdfium_backend)
+            return pdfcomponents.parse_page(str(self.filepath), 0, backend=PdfiumBackend(self.filepath))
         return pdfium_extractors.parse_pdfium_page(str(self.filepath), 0)
 
     def to_dataframe(self, drop_layout_tables: bool = False) -> pl.DataFrame:
