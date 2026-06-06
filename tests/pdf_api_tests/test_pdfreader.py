@@ -104,3 +104,12 @@ class TestPDFReaderPdfiumEngine:
     def test_reader_pdfium_normalized_engine_name(self, sample_pdf):
         reader = PDFReader(sample_pdf, engine="PDF ium")
         assert reader.engine == "pdfium"
+
+
+class TestPDFReaderStructured:
+    def test_reader_structured_unified_schema(self, sample_pdf):
+        from datagrunt import PDFReader
+
+        doc = PDFReader(sample_pdf, engine="pdfium", structured=True).to_dicts()
+        page = doc["document"]["pages"][0]
+        assert "elements" in page and "classification" in page
