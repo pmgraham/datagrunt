@@ -317,3 +317,25 @@ class TestPDFReaderPdfiumStructured:
         assert isinstance(df, pl.DataFrame)
         assert df.height > 0
         assert "type" in df.columns and "content" in df.columns  # unified flatten columns
+
+
+class TestPDFWriterPdfiumStructured:
+    def test_structured_write_json_unified(self, sample_pdf, tmp_path):
+        import json
+
+        from datagrunt.core.pdf_io.engines import PDFWriterPdfiumEngine
+
+        out = tmp_path / "doc.json"
+        PDFWriterPdfiumEngine(sample_pdf, structured=True).write_json(export_filename=str(out))
+        data = json.loads(out.read_text())
+        assert "total_pages" in data["document"]
+        assert "elements" in data["document"]["pages"][0]
+
+    def test_structured_extract_images(self, sample_pdf, tmp_path):
+        import os
+
+        from datagrunt.core.pdf_io.engines import PDFWriterPdfiumEngine
+
+        paths = PDFWriterPdfiumEngine(sample_pdf, structured=True).extract_images(output_dir=str(tmp_path))
+        assert len(paths) >= 1
+        assert all(os.path.isfile(p) for p in paths)
