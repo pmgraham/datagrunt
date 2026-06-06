@@ -14,25 +14,27 @@ from datagrunt.core import PDFComponents, PDFEngineFactory
 class PDFReader(PDFComponents):
     """Class to unify the interface for reading and parsing PDF files."""
 
-    def __init__(self, filepath, engine="pymupdf", workers=4, structured=False):
+    def __init__(self, filepath, engine="pdfium", workers=4, native=False):
         """Initialize the PDF Reader class.
 
         Args:
             filepath (str or Path): Path to the PDF file to read.
-            engine (str, default 'pymupdf'): Parsing engine to instantiate.
-                One of 'pymupdf' (unified element schema, tables + OCR) or
-                'pdfium' (native schema: text, positioned text objects, images;
-                OCR fallback for image-only pages; no table detection).
+            engine (str, default 'pdfium'): Parsing engine to instantiate.
+                One of 'pdfium' (default -- permissive license; emits the unified
+                element schema by default, or the lean native schema when
+                ``native=True``) or 'pymupdf' (unified element schema, tables +
+                OCR).
             workers (int, default 4): Number of concurrent per-page workers.
-            structured (bool, default False): pdfium engine only -- when True,
-                emit the unified element schema (parity with pymupdf) instead of
-                the native pdfium schema. Ignored by the pymupdf engine.
+            native (bool, default False): pdfium only -- when True, emit the lean
+                native schema (text, positioned text objects, images; no table
+                detection) instead of the default unified element schema. Ignored
+                by the pymupdf engine.
         """
         filepath = Path(filepath)
         super().__init__(filepath)
         self.engine = engine.lower().replace(" ", "")
         self.workers = workers
-        self.structured = structured
+        self.native = native
 
     def _return_empty_file_object(self, object):
         """Return an empty object of the specified type."""
@@ -40,7 +42,7 @@ class PDFReader(PDFComponents):
 
     def _create_reader(self):
         """Create a reader engine instance."""
-        return PDFEngineFactory(self.filepath, self.engine, self.workers, structured=self.structured).create_reader()
+        return PDFEngineFactory(self.filepath, self.engine, self.workers, structured=not self.native).create_reader()
 
     def get_sample(self):
         """Parse and return the first page of the PDF."""
