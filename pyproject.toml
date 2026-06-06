@@ -34,6 +34,7 @@ pdf = [
     "pdfplumber>=0.11.0",
     "pytesseract>=0.3.10",
     "Pillow>=10.0.0",
+    "pypdfium2>=4.30.0",
 ]
 dev = [
     "pytest>=8.3.4",
