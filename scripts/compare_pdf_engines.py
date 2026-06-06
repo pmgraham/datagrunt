@@ -31,7 +31,8 @@ from glob import glob
 from pathlib import Path
 
 from datagrunt import PDFReader
-from datagrunt.core.pdf_io import pdfcomponents, pdfium_extractors
+from datagrunt.core.pdf_io import pdfcomponents
+from datagrunt.core.pdf_io.extraction import PdfiumNativeReader
 
 ENGINES = ("pymupdf", "pdfium")
 DEFAULT_GLOB = "data/pdfs/Root_Base*.pdf"
@@ -94,7 +95,7 @@ def _unique_images_pymupdf(doc: dict) -> int:
 
 
 def _unique_images_pdfium(doc: dict) -> int:
-    pdfium_extractors.dedupe_pdfium_images(doc)
+    PdfiumNativeReader.dedupe_images(doc)
     paths = set()
     for pg in doc.get("document", {}).get("pages", []):
         for img in pg.get("images", []):
