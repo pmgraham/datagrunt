@@ -1,5 +1,7 @@
 """Tests for the pdfium extraction backend (extractors-compatible shapes)."""
 
+import os
+
 from datagrunt.core.pdf_io import pdfium_backend
 
 
@@ -23,3 +25,25 @@ class TestAnalyzePage:
     def test_out_of_range_page(self, sample_pdf):
         result = pdfium_backend.analyze_page(sample_pdf, 99)
         assert result["status"] == "error"
+
+
+class TestExtractImages:
+    def test_metadata_only_without_output_dir(self, sample_pdf):
+        result = pdfium_backend.extract_images(sample_pdf, 0)
+        assert result["status"] == "success"
+        assert len(result["images"]) >= 1
+        img = result["images"][0]
+        assert set(img) == {"file_path", "bbox", "width_px", "height_px", "format"}
+        assert set(img["bbox"]) == {"x", "y", "w", "h"}
+        assert img["file_path"] is None
+        assert img["width_px"] >= 1 and img["height_px"] >= 1
+
+    def test_writes_files_with_output_dir(self, sample_pdf, tmp_path):
+        result = pdfium_backend.extract_images(sample_pdf, 0, output_dir=str(tmp_path))
+        img = result["images"][0]
+        assert img["file_path"] is not None
+        assert os.path.isfile(img["file_path"])
+
+    def test_skips_sub_threshold_images(self, small_image_pdf):
+        result = pdfium_backend.extract_images(small_image_pdf, 0)
+        assert result["images"] == []
