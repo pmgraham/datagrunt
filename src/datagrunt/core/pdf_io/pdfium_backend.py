@@ -59,3 +59,53 @@ def analyze_page(pdf_path: str, page_number: int) -> dict:
         }
     finally:
         pdf.close()
+
+
+def extract_images(pdf_path: str, page_number: int, output_dir: str = None, name_prefix: str = "page") -> dict:
+    """pdfium equivalent of extractors.extract_images (same return shape).
+
+    Applies the shared MIN_IMAGE_DIMENSION filter so counts match the pymupdf
+    engine. Writes files when output_dir is provided; otherwise metadata only.
+    """
+    pdfium, raw = pdfium_extractors._import_pdfium()
+    try:
+        pdf = pdfium.PdfDocument(str(pdf_path))
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "message": f"Failed to open PDF: {e}"}
+    try:
+        if page_number < 0 or page_number >= len(pdf):
+            return {"status": "error", "message": f"Page {page_number} out of range"}
+        page = pdf[page_number]
+        _, height = page.get_size()
+
+        images = []
+        idx = 0
+        for obj in page.get_objects(filter=(raw.FPDF_PAGEOBJ_IMAGE,), max_depth=15):
+            px_w, px_h = obj.get_px_size()
+            if px_w < MIN_IMAGE_DIMENSION or px_h < MIN_IMAGE_DIMENSION:
+                continue
+            left, bottom, right, top = obj.get_bounds()
+            bbox = pdfium_extractors._topleft_xywh(
+                [round(left, 2), round(bottom, 2), round(right, 2), round(top, 2)], height
+            )
+            file_path = None
+            fmt = "png"
+            if output_dir:
+                base = Path(output_dir) / f"{name_prefix}_page{page_number}_img{idx}"
+                written = pdfium_extractors._extract_image(obj, base)
+                if written is not None:
+                    file_path = str(written)
+                    fmt = written.suffix.lstrip(".") or "png"
+            images.append(
+                {
+                    "file_path": file_path,
+                    "bbox": bbox,
+                    "width_px": px_w,
+                    "height_px": px_h,
+                    "format": fmt,
+                }
+            )
+            idx += 1
+        return {"status": "success", "images": images}
+    finally:
+        pdf.close()
