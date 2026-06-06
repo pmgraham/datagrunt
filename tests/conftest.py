@@ -184,6 +184,34 @@ def empty_pdf(tmp_path):
 
 
 @pytest.fixture
+def scanned_pdf(tmp_path):
+    """Create a one-page PDF whose only content is a rendered-text image.
+
+    The text is rendered to a raster at 150 dpi and re-embedded as an image, so
+    the page has NO extractable text layer (pdfium returns empty text) and only
+    OCR can recover the words. Used to exercise the OCR fallback path.
+    """
+    import pymupdf
+
+    src = pymupdf.open()
+    src_page = src.new_page(width=612, height=792)
+    src_page.insert_text((72, 100), "HELLO WORLD", fontsize=48)
+    pix = src_page.get_pixmap(dpi=150)
+    src.close()
+
+    img_path = tmp_path / "_scan.png"
+    pix.save(str(img_path))
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_image(pymupdf.Rect(0, 0, 612, 792), filename=str(img_path))
+    pdf_path = tmp_path / "scanned.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+    return str(pdf_path)
+
+
+@pytest.fixture
 def tesseract_available():
     """Return True if the tesseract system binary is on PATH."""
     return shutil.which("tesseract") is not None
