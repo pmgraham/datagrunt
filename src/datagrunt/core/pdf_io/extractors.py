@@ -353,43 +353,12 @@ def _import_ocr_deps():
     return Image, pytesseract, Output
 
 
-def ocr_page(pdf_path: str, page_number: int, dpi: int = 300) -> dict:
-    """OCR a PDF page by rendering it to an image and running Tesseract.
+def _ocr_data_to_blocks(data: dict, dpi: int) -> list:
+    """Group a pytesseract image_to_data DICT into line blocks with point bboxes.
 
-    Args:
-        pdf_path: Path to the PDF file.
-        page_number: Zero-indexed page number.
-        dpi: Resolution for rendering the page. Higher = better OCR but slower.
-
-    Returns:
-        Dict with status and list of text blocks with confidence scores and
-        bounding boxes (in PDF points).
+    Shared by the pymupdf and pdfium OCR paths; only the page-rendering source
+    differs between them.
     """
-    pymupdf = _import_pymupdf()
-    Image, pytesseract, Output = _import_ocr_deps()
-
-    try:
-        doc = pymupdf.open(pdf_path)
-    except Exception as e:
-        return {"status": "error", "message": f"Failed to open PDF: {e}"}
-
-    if page_number < 0 or page_number >= doc.page_count:
-        doc.close()
-        return {"status": "error", "message": f"Page {page_number} out of range"}
-
-    try:
-        page = doc[page_number]
-        pix = page.get_pixmap(dpi=dpi)
-        mode = "RGBA" if pix.alpha else "RGB"
-        img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
-    finally:
-        doc.close()
-
-    try:
-        data = pytesseract.image_to_data(img, output_type=Output.DICT)
-    except Exception as e:
-        return {"status": "error", "message": f"Tesseract OCR failed: {e}"}
-
     scale = 72.0 / dpi
 
     lines = {}
@@ -435,6 +404,47 @@ def ocr_page(pdf_path: str, page_number: int, dpi: int = 300) -> dict:
                 "per_word_confidence": [w["confidence"] for w in words],
             }
         )
+    return blocks
+
+
+def ocr_page(pdf_path: str, page_number: int, dpi: int = 300) -> dict:
+    """OCR a PDF page by rendering it to an image and running Tesseract.
+
+    Args:
+        pdf_path: Path to the PDF file.
+        page_number: Zero-indexed page number.
+        dpi: Resolution for rendering the page. Higher = better OCR but slower.
+
+    Returns:
+        Dict with status and list of text blocks with confidence scores and
+        bounding boxes (in PDF points).
+    """
+    pymupdf = _import_pymupdf()
+    Image, pytesseract, Output = _import_ocr_deps()
+
+    try:
+        doc = pymupdf.open(pdf_path)
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to open PDF: {e}"}
+
+    if page_number < 0 or page_number >= doc.page_count:
+        doc.close()
+        return {"status": "error", "message": f"Page {page_number} out of range"}
+
+    try:
+        page = doc[page_number]
+        pix = page.get_pixmap(dpi=dpi)
+        mode = "RGBA" if pix.alpha else "RGB"
+        img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+    finally:
+        doc.close()
+
+    try:
+        data = pytesseract.image_to_data(img, output_type=Output.DICT)
+    except Exception as e:
+        return {"status": "error", "message": f"Tesseract OCR failed: {e}"}
+
+    blocks = _ocr_data_to_blocks(data, dpi)
 
     return {
         "status": "success",

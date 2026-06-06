@@ -108,3 +108,32 @@ class TestOcrPage:
             pytest.skip("tesseract binary not installed")
         result = extractors.ocr_page(sample_pdf, 99)
         assert result["status"] == "error"
+
+
+class TestOcrDataToBlocks:
+    """The OCR data->blocks helper builds line blocks with scaled bboxes."""
+
+    def test_groups_words_into_line_blocks(self):
+        from datagrunt.core.pdf_io import extractors
+
+        # One line: two words on the same (block, par, line) at 300 dpi.
+        data = {
+            "text": ["Hello", "World"],
+            "conf": [95, 90],
+            "left": [100, 200],
+            "top": [50, 50],
+            "width": [80, 80],
+            "height": [20, 20],
+            "block_num": [1, 1],
+            "par_num": [1, 1],
+            "line_num": [1, 1],
+        }
+        blocks = extractors._ocr_data_to_blocks(data, dpi=300)
+        assert len(blocks) == 1
+        b = blocks[0]
+        assert b["text"] == "Hello World"
+        assert b["word_count"] == 2
+        assert b["confidence"] == 92.5
+        # bbox scaled from px to points (scale = 72/300 = 0.24)
+        assert b["bbox"]["x"] == 24.0  # 100 * 0.24
+        assert set(b["bbox"]) == {"x", "y", "w", "h"}
