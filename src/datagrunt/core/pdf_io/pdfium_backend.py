@@ -7,6 +7,7 @@ from ``extractors.extract_tables`` (pdfplumber), which is engine-independent.
 """
 
 # standard library
+import ctypes
 from math import hypot
 from pathlib import Path
 
@@ -239,6 +240,22 @@ def _group_blocks(items: list) -> list:
     return blocks
 
 
+def _object_text(obj, textpage) -> str:
+    """Return a text object's OWN text via FPDFTextObj_GetText.
+
+    Unlike textpage.get_text_bounded(object_bounds) -- which returns ALL text
+    inside the rectangle and thus double-counts overlapping/layered objects on
+    dense pages -- this returns exactly this object's characters.
+    """
+    _, raw = pdfium_extractors._import_pdfium()
+    n = raw.FPDFTextObj_GetText(obj.raw, textpage.raw, None, 0)
+    if n <= 0:
+        return ""
+    buf = ctypes.create_string_buffer(n * 2)
+    raw.FPDFTextObj_GetText(obj.raw, textpage.raw, ctypes.cast(buf, ctypes.POINTER(ctypes.c_ushort)), n)
+    return buf.raw[: n * 2].decode("utf-16-le").rstrip("\x00").strip()
+
+
 def extract_text_blocks(pdf_path: str, page_number: int) -> dict:
     """pdfium equivalent of extractors.extract_text_blocks (same return shape).
 
@@ -261,7 +278,7 @@ def extract_text_blocks(pdf_path: str, page_number: int) -> dict:
         items = []
         for obj in page.get_objects(filter=(raw.FPDF_PAGEOBJ_TEXT,), max_depth=15):
             left, bottom, right, top = obj.get_bounds()
-            text = textpage.get_text_bounded(left=left, bottom=bottom, right=right, top=top).strip()
+            text = _object_text(obj, textpage)
             if not text:
                 continue
             font_name = ""
