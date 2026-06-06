@@ -87,3 +87,19 @@ class TestExtractTextBlocks:
         joined = " ".join(b["text"] for b in result["blocks"])
         assert "Quarterly Report" in joined
         assert "body text" in joined.lower()
+
+
+class TestBadFilePaths:
+    """Each primitive returns a status=error dict (not a raise) on a bad path."""
+
+    def test_analyze_page_bad_path(self):
+        assert pdfium_backend.analyze_page("/nonexistent/file.pdf", 0)["status"] == "error"
+
+    def test_extract_images_bad_path(self):
+        assert pdfium_backend.extract_images("/nonexistent/file.pdf", 0)["status"] == "error"
+
+    def test_ocr_page_bad_path(self):
+        assert pdfium_backend.ocr_page("/nonexistent/file.pdf", 0)["status"] == "error"
+
+    def test_extract_text_blocks_bad_path(self):
+        assert pdfium_backend.extract_text_blocks("/nonexistent/file.pdf", 0)["status"] == "error"
