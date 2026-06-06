@@ -47,7 +47,7 @@ Get started with pip:
 pip install datagrunt
 ```
 
-> **PDF parsing** is an optional extra — install it with `pip install "datagrunt[pdf]"`. See [PDF parsing](#pdf-parsing) below for details and OCR setup.
+> **PDF parsing** is an optional extra — install it with `uv pip install "datagrunt[pdf]"`. See [PDF parsing](#pdf-parsing) below for details and OCR setup.
 
 ## Quick Start
 
@@ -152,6 +152,8 @@ print(report)  # Detailed JSON schema with data types, classifications, and more
 PDF support is an optional extra:
 
 ```bash
+uv pip install "datagrunt[pdf]"
+# or
 pip install "datagrunt[pdf]"
 ```
 
