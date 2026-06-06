@@ -77,8 +77,11 @@ testpaths = "tests"
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
-addopts = "-v --cov=src/datagrunt --cov-report=term-missing"
+addopts = "-v --cov=src/datagrunt --cov-report=term-missing -m 'not corpus'"
 pythonpath = "."
+markers = [
+    "corpus: slow, local-only cross-engine tests over the data/pdfs corpus (deselected by default; run with -m corpus)",
+]
 
 [tool.ruff]
 line-length = 120

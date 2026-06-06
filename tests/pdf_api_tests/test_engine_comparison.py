@@ -26,10 +26,16 @@ CORPUS = sorted(glob(str(_REPO_ROOT / "data" / "pdfs" / "Root_Base*.pdf")))
 # normal block-vs-object extraction differences.
 TEXT_FLOOR_RATIO = 0.5
 
-pytestmark = pytest.mark.skipif(
-    not CORPUS,
-    reason="Root_Base corpus not present under data/pdfs/ (local-only).",
-)
+# Slow, local-only corpus tests: skipped when the corpus is absent (CI), and
+# deselected by default (addopts ``-m "not corpus"``). Run them explicitly with
+# ``uv run pytest -m corpus``.
+pytestmark = [
+    pytest.mark.corpus,
+    pytest.mark.skipif(
+        not CORPUS,
+        reason="Root_Base corpus not present under data/pdfs/ (local-only).",
+    ),
+]
 
 
 def _text_chars_pymupdf(doc: dict) -> int:
@@ -51,7 +57,7 @@ def parsed(request):
     """Parse one corpus document with both engines once, shared across tests."""
     path = request.param
     pymupdf_doc = PDFReader(path, engine="pymupdf").to_dicts()
-    pdfium_doc = PDFReader(path, engine="pdfium").to_dicts()
+    pdfium_doc = PDFReader(path, engine="pdfium", native=True).to_dicts()
     return path, pymupdf_doc, pdfium_doc
 
 
@@ -102,7 +108,7 @@ def parsed_structured(request):
 
     path = request.param
     pymupdf_doc = PDFReader(path, engine="pymupdf").to_dicts()
-    pdfium_doc = PDFReader(path, engine="pdfium", structured=True).to_dicts()
+    pdfium_doc = PDFReader(path, engine="pdfium").to_dicts()
     return path, pymupdf_doc, pdfium_doc
 
 
@@ -156,7 +162,7 @@ class TestStructuredParity:
         from datagrunt import PDFReader
 
         path, _mu, pdf = parsed_structured
-        native = PDFReader(path, engine="pdfium").to_dicts()
+        native = PDFReader(path, engine="pdfium", native=True).to_dicts()
         native_chars = sum(len(pg.get("text", "") or "") for pg in native["document"]["pages"])
         struct_chars = 0
         for pg in pdf["document"]["pages"]:
