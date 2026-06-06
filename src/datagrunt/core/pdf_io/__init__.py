@@ -17,23 +17,15 @@ from datagrunt.core.pdf_io.extraction import (
 )
 from datagrunt.core.pdf_io.factories import PDFEngineFactory
 from datagrunt.core.pdf_io.pdfcomponents import (
+    DocumentAssembler,
+    ParsedDocument,
     PDFComponents,
-    combine_pages,
-    dedupe_document_images,
-    drop_layout_tables,
-    flatten_document_elements,
-    parse_document,
-    parse_page,
 )
 
 __all__ = [
     "PDFComponents",
-    "parse_page",
-    "parse_document",
-    "combine_pages",
-    "flatten_document_elements",
-    "dedupe_document_images",
-    "drop_layout_tables",
+    "DocumentAssembler",
+    "ParsedDocument",
     "PDFEngineProperties",
     "PDFBaseReaderEngine",
     "PDFBaseWriterEngine",
