@@ -20,7 +20,7 @@ LARGE_FORMAT_DPI = 75
 STANDARD_DPI = 150
 
 
-def parse_page(pdf_path: str, page_index: int, image_output_dir: str = None) -> dict:
+def parse_page(pdf_path: str, page_index: int, image_output_dir: str = None, backend=extractors) -> dict:
     """Parse a single PDF page into the unified element schema.
 
     Ported from ``parse_single_page_python`` (pure Python, no LLM). Raises
@@ -36,7 +36,7 @@ def parse_page(pdf_path: str, page_index: int, image_output_dir: str = None) -> 
     Returns:
         A page dict with page_number, width, height, classification, elements.
     """
-    analysis = extractors.analyze_page(pdf_path, page_index)
+    analysis = backend.analyze_page(pdf_path, page_index)
     if analysis.get("status") != "success":
         raise ValueError(f"Page analysis failed: {analysis.get('message')}")
 
@@ -59,7 +59,7 @@ def parse_page(pdf_path: str, page_index: int, image_output_dir: str = None) -> 
 
     # 1. Text layer or OCR.
     if has_text_layer:
-        text_result = extractors.extract_text_blocks(pdf_path, page_index)
+        text_result = backend.extract_text_blocks(pdf_path, page_index)
         if text_result.get("status") == "success":
             for block in text_result.get("blocks", []):
                 elements.append(
@@ -87,7 +87,7 @@ def parse_page(pdf_path: str, page_index: int, image_output_dir: str = None) -> 
     elif is_scanned:
         is_large_format = width > LARGE_FORMAT_DIMENSION or height > LARGE_FORMAT_DIMENSION
         page_dpi = LARGE_FORMAT_DPI if is_large_format else STANDARD_DPI
-        ocr_result = extractors.ocr_page(pdf_path, page_index, dpi=page_dpi)
+        ocr_result = backend.ocr_page(pdf_path, page_index, dpi=page_dpi)
         if ocr_result.get("status") == "success":
             for block in ocr_result.get("blocks", []):
                 elements.append(
@@ -138,7 +138,7 @@ def parse_page(pdf_path: str, page_index: int, image_output_dir: str = None) -> 
 
     # 3. Images.
     if image_count > 0:
-        image_result = extractors.extract_images(
+        image_result = backend.extract_images(
             pdf_path, page_index, output_dir=image_output_dir, name_prefix=name_prefix
         )
         if image_result.get("status") == "success":
@@ -194,7 +194,7 @@ def combine_pages(source: str, total_pages: int, pages: list, errors: list) -> d
     }
 
 
-def parse_document(pdf_path: str, total_pages: int, image_output_dir: str = None) -> dict:
+def parse_document(pdf_path: str, total_pages: int, image_output_dir: str = None, backend=extractors) -> dict:
     """Parse all pages sequentially and combine into the document envelope.
 
     The reader engine (Task 10) provides a threaded variant; this sequential
@@ -204,7 +204,7 @@ def parse_document(pdf_path: str, total_pages: int, image_output_dir: str = None
     errors = []
     for idx in range(total_pages):
         try:
-            pages.append(parse_page(pdf_path, idx, image_output_dir))
+            pages.append(parse_page(pdf_path, idx, image_output_dir, backend=backend))
         except Exception as e:  # noqa: BLE001 - per-page isolation
             errors.append(str(e))
     return combine_pages(pdf_path, total_pages, pages, errors)
