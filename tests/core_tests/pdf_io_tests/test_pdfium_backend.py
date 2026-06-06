@@ -64,3 +64,26 @@ class TestOcrPage:
         b = result["blocks"][0]
         assert set(b) >= {"text", "bbox", "confidence", "word_count", "per_word_confidence"}
         assert set(b["bbox"]) == {"x", "y", "w", "h"}
+
+
+class TestExtractTextBlocks:
+    def test_blocks_have_extractor_shape_and_classification(self, sample_pdf):
+        result = pdfium_backend.extract_text_blocks(sample_pdf, 0)
+        assert result["status"] == "success"
+        assert len(result["blocks"]) >= 1
+        b = result["blocks"][0]
+        assert set(b) == {
+            "text", "bbox", "font", "font_size",
+            "is_bold", "is_italic", "classification", "reading_order",
+        }
+        assert set(b["bbox"]) == {"x", "y", "w", "h"}
+        classes = {blk["classification"] for blk in result["blocks"]}
+        # sample_pdf has a 24pt title over 11pt body -> a header is detected.
+        assert "header" in classes
+        assert "body_text" in classes
+
+    def test_text_completeness(self, sample_pdf):
+        result = pdfium_backend.extract_text_blocks(sample_pdf, 0)
+        joined = " ".join(b["text"] for b in result["blocks"])
+        assert "Quarterly Report" in joined
+        assert "body text" in joined.lower()
