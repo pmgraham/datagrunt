@@ -284,3 +284,67 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
                         seen.add(fp)
                         paths.append(fp)
         return paths
+
+
+class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
+    """Write parsed PDFium output (native-schema JSON + image files)."""
+
+    def _reader(self):
+        return PDFReaderPdfiumEngine(self.filepath, workers=self.workers)
+
+    def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
+        """Parse the PDF and write the native document JSON.
+
+        Args:
+            export_filename (optional, str): Output path; defaults to output.json.
+            image_output_dir (optional, str): If provided, embedded images are
+                written here and referenced in the JSON; otherwise image
+                ``file`` values are null.
+            dedupe_images (bool, default True): When images are written, collapse
+                byte-identical duplicates to a single file and repoint references.
+            drop_layout_tables (bool, default False): No-op for PDFium (no table
+                detection); accepted for interface parity.
+        """
+        filename = set_export_filename(self.properties.json_export_filename, export_filename)
+        document = self._reader().to_dicts(image_output_dir=image_output_dir)
+        if image_output_dir and dedupe_images:
+            pdfium_extractors.dedupe_pdfium_images(document)
+        with open(filename, "w") as f:
+            json.dump(document, f, indent=2)
+        return filename
+
+    def write_json_newline_delimited(
+        self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False
+    ):
+        """Parse the PDF and write one flattened element per line (JSONL)."""
+        filename = set_export_filename(self.properties.json_newline_export_filename, export_filename)
+        document = self._reader().to_dicts(image_output_dir=image_output_dir)
+        if image_output_dir and dedupe_images:
+            pdfium_extractors.dedupe_pdfium_images(document)
+        records = pdfium_extractors.flatten_pdfium_document(document)
+        with open(filename, "w") as f:
+            for record in records:
+                f.write(json.dumps(record) + "\n")
+        return filename
+
+    def extract_images(self, output_dir=None, dedupe=True):
+        """Parse the PDF, write embedded images to disk, return their paths.
+
+        Args:
+            output_dir (optional, str): Output directory; defaults to output_images.
+            dedupe (bool, default True): Collapse byte-identical duplicate images
+                to a single file before returning paths.
+        """
+        directory = output_dir if output_dir else self.properties.images_export_dir
+        document = self._reader().to_dicts(image_output_dir=directory)
+        if dedupe:
+            pdfium_extractors.dedupe_pdfium_images(document)
+        paths = []
+        seen = set()
+        for page in document.get("document", {}).get("pages", []):
+            for img in page.get("images", []):
+                fp = img.get("file")
+                if fp and fp not in seen:
+                    seen.add(fp)
+                    paths.append(fp)
+        return paths
