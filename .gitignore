@@ -123,6 +123,8 @@ dmypy.json
 *.h5
 *.feather
 *.json
+*.pdf
+data/
 
 # Logs
 *.log
