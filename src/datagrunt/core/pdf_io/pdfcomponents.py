@@ -1,324 +1,210 @@
 """PDF component assembly: page parsing, document combination, flattening."""
 
 # standard library
-import hashlib
 import json
-import os
 import time
 from functools import cached_property
 from pathlib import Path
 
 # local libraries
 from datagrunt.core.file_io import FileProperties
-from datagrunt.core.pdf_io import extractors
+from datagrunt.core.pdf_io.extraction import PdfPlumberTableExtractor
+from datagrunt.core.pdf_io.extraction.image_dedupe import dedupe_image_files
+from datagrunt.core.pdf_io.extraction.ocr import dpi_for_page
+from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
+from datagrunt.core.pdf_io.extraction.pymupdf_backend import PyMuPDFBackend
 
 PIPELINE_TYPE = "pure_python_local_v1"
 
-# Dynamic DPI scaling thresholds for scanned (OCR) pages.
-LARGE_FORMAT_DIMENSION = 1500
-LARGE_FORMAT_DPI = 75
-STANDARD_DPI = 150
 
+class DocumentAssembler:
+    """Assemble a unified-schema document from an extraction backend + tables.
 
-def parse_page(pdf_path: str, page_index: int, image_output_dir: str = None) -> dict:
-    """Parse a single PDF page into the unified element schema.
-
-    Ported from ``parse_single_page_python`` (pure Python, no LLM). Raises
-    ``ValueError`` if the page analysis itself fails.
-
-    Args:
-        pdf_path: Path to the PDF file.
-        page_index: Zero-indexed page number.
-        image_output_dir: If provided, embedded images are written here and
-            their ``metadata.file_path`` is set; otherwise images are metadata
-            only.
-
-    Returns:
-        A page dict with page_number, width, height, classification, elements.
+    Holds the extraction backend (defaults to ``PyMuPDFBackend``) and the shared
+    ``PdfPlumberTableExtractor``, and turns per-page extraction results into the
+    unified element dicts.
     """
-    analysis = extractors.analyze_page(pdf_path, page_index)
-    if analysis.get("status") != "success":
-        raise ValueError(f"Page analysis failed: {analysis.get('message')}")
 
-    width = analysis["width"]
-    height = analysis["height"]
-    is_scanned = analysis["is_scanned"]
-    has_text_layer = analysis["has_text_layer"]
-    image_count = analysis["image_count"]
-    has_lines = analysis["has_line_drawings"]
+    def __init__(self, filepath, backend=None, table_extractor=None):
+        """Initialize the assembler.
 
-    elements = []
-    counter = {"n": 1}
+        Args:
+            filepath (str or Path): Path to the PDF file.
+            backend (ExtractionBackend, optional): Defaults to PyMuPDFBackend.
+            table_extractor (PdfPlumberTableExtractor, optional): Shared table source.
+        """
+        self.filepath = Path(filepath)
+        self.backend = backend or PyMuPDFBackend(filepath)
+        self.table_extractor = table_extractor or PdfPlumberTableExtractor(filepath)
 
-    def gen_elem_id():
-        elem_id = f"elem_{page_index + 1:02d}_{counter['n']:03d}"
-        counter["n"] += 1
-        return elem_id
+    def parse_page(self, page_index, image_output_dir=None) -> dict:
+        """Parse a single page into the unified element schema."""
+        analysis = self.backend.analyze_page(page_index)
+        elements = []
+        counter = {"n": 1}
 
-    name_prefix = Path(pdf_path).stem
+        def gen_elem_id():
+            elem_id = f"elem_{page_index + 1:02d}_{counter['n']:03d}"
+            counter["n"] += 1
+            return elem_id
 
-    # 1. Text layer or OCR.
-    if has_text_layer:
-        text_result = extractors.extract_text_blocks(pdf_path, page_index)
-        if text_result.get("status") == "success":
-            for block in text_result.get("blocks", []):
-                elements.append(
-                    {
-                        "id": gen_elem_id(),
-                        "type": block["classification"],
-                        "content": block["text"],
-                        "page": page_index + 1,
-                        "position": {
-                            "x": block["bbox"]["x"],
-                            "y": block["bbox"]["y"],
-                            "w": block["bbox"]["w"],
-                            "h": block["bbox"]["h"],
-                        },
-                        "confidence": 1.0,
-                        "metadata": {
-                            "font": block["font"],
-                            "font_size": block["font_size"],
-                            "is_bold": block["is_bold"],
-                            "is_italic": block["is_italic"],
-                            "reading_order": block["reading_order"],
-                        },
-                    }
-                )
-    elif is_scanned:
-        is_large_format = width > LARGE_FORMAT_DIMENSION or height > LARGE_FORMAT_DIMENSION
-        page_dpi = LARGE_FORMAT_DPI if is_large_format else STANDARD_DPI
-        ocr_result = extractors.ocr_page(pdf_path, page_index, dpi=page_dpi)
-        if ocr_result.get("status") == "success":
-            for block in ocr_result.get("blocks", []):
-                elements.append(
-                    {
-                        "id": gen_elem_id(),
-                        "type": "body_text",
-                        "content": block["text"],
-                        "page": page_index + 1,
-                        "position": {
-                            "x": block["bbox"]["x"],
-                            "y": block["bbox"]["y"],
-                            "w": block["bbox"]["w"],
-                            "h": block["bbox"]["h"],
-                        },
-                        "confidence": block["confidence"] / 100.0,
-                        "metadata": {
-                            "ocr_engine": "tesseract",
-                            "word_count": block["word_count"],
-                        },
-                    }
-                )
+        if analysis.has_text_layer:
+            for block in self.backend.extract_text_blocks(page_index):
+                elements.append(self._text_element(block, gen_elem_id(), page_index))
+        elif analysis.is_scanned:
+            for block in self.backend.ocr_page(page_index, dpi=dpi_for_page(analysis.width, analysis.height)):
+                elements.append(self._ocr_element(block, gen_elem_id(), page_index))
 
-    # 2. Tables.
-    if has_lines or not has_text_layer:
-        table_result = extractors.extract_tables(pdf_path, page_index)
-        if table_result.get("status") == "success":
-            for table in table_result.get("tables", []):
-                elements.append(
-                    {
-                        "id": gen_elem_id(),
-                        "type": "table",
-                        "content": table["data"],
-                        "page": page_index + 1,
-                        "position": {
-                            "x": table["bbox"]["x"],
-                            "y": table["bbox"]["y"],
-                            "w": table["bbox"]["w"],
-                            "h": table["bbox"]["h"],
-                        },
-                        "confidence": 1.0,
-                        "metadata": {
-                            "rows": table["rows"],
-                            "columns": table["columns"],
-                            "has_header_row": table["has_header_row"],
-                        },
-                    }
-                )
+        if analysis.has_line_drawings or not analysis.has_text_layer:
+            for table in self.table_extractor.extract(page_index):
+                elements.append(self._table_element(table, gen_elem_id(), page_index))
 
-    # 3. Images.
-    if image_count > 0:
-        image_result = extractors.extract_images(
-            pdf_path, page_index, output_dir=image_output_dir, name_prefix=name_prefix
-        )
-        if image_result.get("status") == "success":
-            for img in image_result.get("images", []):
-                elements.append(
-                    {
-                        "id": gen_elem_id(),
-                        "type": "image",
-                        "content": None,
-                        "page": page_index + 1,
-                        "position": {
-                            "x": img["bbox"]["x"],
-                            "y": img["bbox"]["y"],
-                            "w": img["bbox"]["w"],
-                            "h": img["bbox"]["h"],
-                        },
-                        "confidence": 1.0,
-                        "metadata": {
-                            "file_path": img["file_path"],
-                            "format": img["format"],
-                            "width_px": img["width_px"],
-                            "height_px": img["height_px"],
-                        },
-                    }
-                )
+        if analysis.image_count > 0:
+            for img in self.backend.extract_images(
+                page_index, output_dir=image_output_dir, name_prefix=self.filepath.stem
+            ):
+                elements.append(self._image_element(img, gen_elem_id(), page_index))
 
-    classification = "mixed"
-    if is_scanned:
-        classification = "scanned"
-    elif has_text_layer and len(elements) == 0:
-        classification = "text_only"
+        classification = "mixed"
+        if analysis.is_scanned:
+            classification = "scanned"
+        elif analysis.has_text_layer and len(elements) == 0:
+            classification = "text_only"
 
-    return {
-        "page_number": page_index + 1,
-        "width": float(width),
-        "height": float(height),
-        "classification": classification,
-        "elements": elements,
-    }
-
-
-def combine_pages(source: str, total_pages: int, pages: list, errors: list) -> dict:
-    """Wrap parsed pages in the unified document envelope."""
-    return {
-        "document": {
-            "source": str(source),
-            "total_pages": total_pages,
-            "processing_id": f"proc_py_{int(time.time())}",
-            "pipeline_type": PIPELINE_TYPE,
-            "errors": [e for e in errors] if errors else None,
-            "pages": pages,
+        return {
+            "page_number": page_index + 1,
+            "width": float(analysis.width),
+            "height": float(analysis.height),
+            "classification": classification,
+            "elements": elements,
         }
-    }
 
-
-def parse_document(pdf_path: str, total_pages: int, image_output_dir: str = None) -> dict:
-    """Parse all pages sequentially and combine into the document envelope.
-
-    The reader engine (Task 10) provides a threaded variant; this sequential
-    version is used directly by tests and as a fallback.
-    """
-    pages = []
-    errors = []
-    for idx in range(total_pages):
-        try:
-            pages.append(parse_page(pdf_path, idx, image_output_dir))
-        except Exception as e:  # noqa: BLE001 - per-page isolation
-            errors.append(str(e))
-    return combine_pages(pdf_path, total_pages, pages, errors)
-
-
-def flatten_document_elements(document: dict) -> list:
-    """Flatten a parsed document into one record per element.
-
-    Scalar columns (id, type, page, x, y, w, h, confidence) plus JSON-encoded
-    ``content`` and ``metadata`` so the result is safe to load into a columnar
-    frame regardless of mixed content types (text vs. 2D table arrays).
-    """
-    records = []
-    pages = document.get("document", {}).get("pages", [])
-    for page in pages:
-        for elem in page.get("elements", []):
-            pos = elem.get("position", {})
-            content = elem.get("content")
-            content_str = (
-                content if isinstance(content, str) else (json.dumps(content) if content is not None else None)
-            )
-            records.append(
-                {
-                    "id": elem.get("id"),
-                    "type": elem.get("type"),
-                    "page": elem.get("page"),
-                    "x": float(pos.get("x", 0.0)),
-                    "y": float(pos.get("y", 0.0)),
-                    "w": float(pos.get("w", 0.0)),
-                    "h": float(pos.get("h", 0.0)),
-                    "confidence": float(elem.get("confidence", 0.0)),
-                    "content": content_str,
-                    "metadata": json.dumps(elem.get("metadata") or {}),
-                }
-            )
-    return records
-
-
-def dedupe_document_images(document: dict) -> int:
-    """Remove byte-duplicate extracted image files, repointing references.
-
-    Walks the document's image elements, hashes each on-disk file referenced by
-    ``metadata.file_path``, and for any content already seen, repoints the
-    element at the first file and deletes the redundant copy from disk.
-    Elements with no ``file_path`` (metadata-only reads) or whose file is
-    missing are skipped.
-
-    Args:
-        document: A parsed document dict (mutated in place).
-
-    Returns:
-        The number of duplicate image files removed from disk.
-    """
-    seen = {}  # md5 digest -> first file_path that produced it
-    removed = 0
-    pages = document.get("document", {}).get("pages", [])
-    for page in pages:
-        for elem in page.get("elements", []):
-            if elem.get("type") != "image":
-                continue
-            meta = elem.get("metadata") or {}
-            path = meta.get("file_path")
-            if not path or not os.path.isfile(path):
-                continue
-            with open(path, "rb") as f:
-                digest = hashlib.md5(f.read()).hexdigest()
-            first = seen.get(digest)
-            if first is None:
-                seen[digest] = path
-                continue
-            if first == path:
-                # Same file already referenced; repoint is a no-op, never delete.
-                continue
-            meta["file_path"] = first
+    def parse_document(self, total_pages, image_output_dir=None) -> dict:
+        """Parse all pages sequentially and combine into the document envelope."""
+        pages, errors = [], []
+        for idx in range(total_pages):
             try:
-                os.remove(path)
-            except OSError:
-                pass
-            else:
-                removed += 1
-    return removed
+                pages.append(self.parse_page(idx, image_output_dir))
+            except Exception as e:  # noqa: BLE001 - per-page isolation
+                errors.append(str(e))
+        return self.combine(total_pages, pages, errors)
+
+    def combine(self, total_pages, pages, errors) -> dict:
+        """Wrap parsed pages in the unified document envelope."""
+        return {
+            "document": {
+                "source": str(self.filepath),
+                "total_pages": total_pages,
+                "processing_id": f"proc_py_{int(time.time())}",
+                "pipeline_type": PIPELINE_TYPE,
+                "errors": [e for e in errors] if errors else None,
+                "pages": pages,
+            }
+        }
+
+    @staticmethod
+    def _text_element(block, elem_id, page_index) -> dict:
+        """Serialize a TextBlock to the unified text element dict."""
+        return {
+            "id": elem_id, "type": block.classification, "content": block.text, "page": page_index + 1,
+            "position": block.bbox.to_dict(), "confidence": 1.0,
+            "metadata": {"font": block.font, "font_size": block.font_size, "is_bold": block.is_bold,
+                         "is_italic": block.is_italic, "reading_order": block.reading_order},
+        }
+
+    @staticmethod
+    def _ocr_element(block, elem_id, page_index) -> dict:
+        """Serialize an OcrBlock to the unified text element dict."""
+        return {
+            "id": elem_id, "type": "body_text", "content": block.text, "page": page_index + 1,
+            "position": block.bbox.to_dict(), "confidence": block.confidence / 100.0,
+            "metadata": {"ocr_engine": "tesseract", "word_count": block.word_count},
+        }
+
+    @staticmethod
+    def _table_element(table, elem_id, page_index) -> dict:
+        """Serialize a TableBlock to the unified table element dict."""
+        return {
+            "id": elem_id, "type": "table", "content": table.data, "page": page_index + 1,
+            "position": table.bbox.to_dict(), "confidence": 1.0,
+            "metadata": {"rows": table.rows, "columns": table.columns, "has_header_row": table.has_header_row},
+        }
+
+    @staticmethod
+    def _image_element(img, elem_id, page_index) -> dict:
+        """Serialize an ImageBlock to the unified image element dict."""
+        return {
+            "id": elem_id, "type": "image", "content": None, "page": page_index + 1,
+            "position": img.bbox.to_dict(), "confidence": 1.0,
+            "metadata": {"file_path": img.file_path, "format": img.fmt,
+                         "width_px": img.width_px, "height_px": img.height_px},
+        }
 
 
-def drop_layout_tables(document: dict, min_rows: int = 2, min_cols: int = 2) -> int:
-    """Drop table elements that look like layout boxes rather than real tables.
+class ParsedDocument:
+    """A parsed unified-schema document with element-level operations."""
 
-    Line-based table detection fires on decorative boxes and single rule lines
-    in graphically dense PDFs, producing 1xN or Nx1 "tables". This optional
-    post-filter removes any ``table`` element whose ``metadata.rows`` is below
-    ``min_rows`` or ``metadata.columns`` is below ``min_cols``. Non-table
-    elements are never touched.
+    def __init__(self, document: dict):
+        """Wrap a parsed document dict (operations mutate it in place).
 
-    Args:
-        document: A parsed document dict (mutated in place).
-        min_rows: Minimum rows for a table to be kept (default 2).
-        min_cols: Minimum columns for a table to be kept (default 2).
+        Args:
+            document (dict): A ``{"document": {...}}`` parsed document.
+        """
+        self.document = document
 
-    Returns:
-        The number of table elements dropped.
-    """
-    removed = 0
-    pages = document.get("document", {}).get("pages", [])
-    for page in pages:
-        elements = page.get("elements", [])
-        kept = []
-        for elem in elements:
-            if elem.get("type") == "table":
-                meta = elem.get("metadata") or {}
-                if meta.get("rows", 0) < min_rows or meta.get("columns", 0) < min_cols:
-                    removed += 1
-                    continue
-            kept.append(elem)
-        page["elements"] = kept
-    return removed
+    def to_dict(self) -> dict:
+        """Return the underlying document dict."""
+        return self.document
+
+    def flatten(self) -> list:
+        """Flatten the document into one scalar record per element."""
+        records = []
+        for page in self.document.get("document", {}).get("pages", []):
+            for elem in page.get("elements", []):
+                pos = elem.get("position", {})
+                content = elem.get("content")
+                content_str = (
+                    content if isinstance(content, str) else (json.dumps(content) if content is not None else None)
+                )
+                records.append(
+                    {
+                        "id": elem.get("id"), "type": elem.get("type"), "page": elem.get("page"),
+                        "x": float(pos.get("x", 0.0)), "y": float(pos.get("y", 0.0)),
+                        "w": float(pos.get("w", 0.0)), "h": float(pos.get("h", 0.0)),
+                        "confidence": float(elem.get("confidence", 0.0)),
+                        "content": content_str, "metadata": json.dumps(elem.get("metadata") or {}),
+                    }
+                )
+        return records
+
+    def dedupe_images(self) -> int:
+        """Collapse byte-identical extracted image files; return count removed."""
+        images = [
+            el
+            for page in self.document.get("document", {}).get("pages", [])
+            for el in page.get("elements", [])
+            if el.get("type") == "image"
+        ]
+        return dedupe_image_files(
+            images,
+            lambda el: (el.get("metadata") or {}).get("file_path"),
+            lambda el, p: el.setdefault("metadata", {}).__setitem__("file_path", p),
+        )
+
+    def drop_layout_tables(self, min_rows: int = 2, min_cols: int = 2) -> int:
+        """Drop table elements below ``min_rows`` x ``min_cols`` (layout boxes)."""
+        removed = 0
+        for page in self.document.get("document", {}).get("pages", []):
+            kept = []
+            for elem in page.get("elements", []):
+                if elem.get("type") == "table":
+                    meta = elem.get("metadata") or {}
+                    if meta.get("rows", 0) < min_rows or meta.get("columns", 0) < min_cols:
+                        removed += 1
+                        continue
+                kept.append(elem)
+            page["elements"] = kept
+        return removed
 
 
 class PDFComponents(FileProperties):
@@ -335,9 +221,5 @@ class PDFComponents(FileProperties):
     @cached_property
     def total_pages(self):
         """Return the total number of pages in the PDF."""
-        pymupdf = extractors._import_pymupdf()
-        doc = pymupdf.open(self.filepath)
-        try:
-            return doc.page_count
-        finally:
-            doc.close()
+        with PdfiumDocument(self.filepath) as d:
+            return len(d)

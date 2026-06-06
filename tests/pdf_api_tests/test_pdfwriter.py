@@ -101,14 +101,14 @@ class TestPDFWriter:
 
     def test_write_json_threads_drop_layout_tables(self, sample_pdf, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
-        import datagrunt.core.pdf_io.pdfcomponents as pc
+        from datagrunt.core.pdf_io.pdfcomponents import ParsedDocument
 
         calls = []
-        original = pc.drop_layout_tables
+        original = ParsedDocument.drop_layout_tables
         monkeypatch.setattr(
-            pc,
+            ParsedDocument,
             "drop_layout_tables",
-            lambda document, *a, **k: (calls.append(True), original(document, *a, **k))[1],
+            lambda self, *a, **k: (calls.append(True), original(self, *a, **k))[1],
         )
         PDFWriter(sample_pdf).write_json(drop_layout_tables=True)
         assert calls == [True]

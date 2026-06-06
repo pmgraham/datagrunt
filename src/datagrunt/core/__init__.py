@@ -30,16 +30,18 @@ from datagrunt.core.csv_io import (
 from datagrunt.core.databases import DuckDBQueries
 from datagrunt.core.file_io import FileProperties
 from datagrunt.core.pdf_io import (
+    DocumentAssembler,
+    ExtractionBackend,
+    ParsedDocument,
     PDFComponents,
     PDFEngineFactory,
     PDFEngineProperties,
+    PdfiumBackend,
+    PdfiumNativeReader,
+    PdfPlumberTableExtractor,
     PDFReaderPyMuPDFEngine,
     PDFWriterPyMuPDFEngine,
-    dedupe_document_images,
-    drop_layout_tables,
-    flatten_document_elements,
-    parse_document,
-    parse_page,
+    PyMuPDFBackend,
     set_export_filename,
 )
 
@@ -76,14 +78,16 @@ __all__ = [
     "FileProperties",
     # PDF IO
     "PDFComponents",
+    "DocumentAssembler",
+    "ParsedDocument",
     "PDFEngineFactory",
     "PDFEngineProperties",
     "PDFReaderPyMuPDFEngine",
     "PDFWriterPyMuPDFEngine",
-    "parse_page",
-    "parse_document",
-    "flatten_document_elements",
-    "dedupe_document_images",
-    "drop_layout_tables",
     "set_export_filename",
+    "ExtractionBackend",
+    "PdfiumBackend",
+    "PdfiumNativeReader",
+    "PdfPlumberTableExtractor",
+    "PyMuPDFBackend",
 ]
