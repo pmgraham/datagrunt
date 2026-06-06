@@ -2,6 +2,8 @@
 
 import os
 
+import pytest
+
 from datagrunt.core.pdf_io import pdfium_backend
 
 
@@ -47,3 +49,18 @@ class TestExtractImages:
     def test_skips_sub_threshold_images(self, small_image_pdf):
         result = pdfium_backend.extract_images(small_image_pdf, 0)
         assert result["images"] == []
+
+
+class TestOcrPage:
+    def test_ocr_recovers_text(self, scanned_pdf, tesseract_available):
+        if not tesseract_available:
+            pytest.skip("tesseract binary not available")
+        result = pdfium_backend.ocr_page(scanned_pdf, 0, dpi=150)
+        assert result["status"] == "success"
+        assert result["ocr_engine"] == "tesseract"
+        joined = " ".join(b["text"] for b in result["blocks"]).upper()
+        assert "HELLO" in joined
+        # extractors.ocr_page block shape parity
+        b = result["blocks"][0]
+        assert set(b) >= {"text", "bbox", "confidence", "word_count", "per_word_confidence"}
+        assert set(b["bbox"]) == {"x", "y", "w", "h"}

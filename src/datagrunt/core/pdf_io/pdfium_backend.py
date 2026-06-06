@@ -109,3 +109,37 @@ def extract_images(pdf_path: str, page_number: int, output_dir: str = None, name
         return {"status": "success", "images": images}
     finally:
         pdf.close()
+
+
+def ocr_page(pdf_path: str, page_number: int, dpi: int = 300) -> dict:
+    """pdfium equivalent of extractors.ocr_page: render via pdfium, OCR via Tesseract.
+
+    Reuses extractors._ocr_data_to_blocks for identical block construction, so
+    only the page-rendering source differs from the pymupdf path.
+    """
+    pdfium, _ = pdfium_extractors._import_pdfium()
+    _, pytesseract, Output = extractors._import_ocr_deps()
+
+    try:
+        pdf = pdfium.PdfDocument(str(pdf_path))
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "message": f"Failed to open PDF: {e}"}
+    try:
+        if page_number < 0 or page_number >= len(pdf):
+            return {"status": "error", "message": f"Page {page_number} out of range"}
+        page = pdf[page_number]
+        img = page.render(scale=dpi / 72.0).to_pil().convert("RGB")
+    finally:
+        pdf.close()
+
+    try:
+        data = pytesseract.image_to_data(img, output_type=Output.DICT)
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "message": f"Tesseract OCR failed: {e}"}
+
+    return {
+        "status": "success",
+        "blocks": extractors._ocr_data_to_blocks(data, dpi),
+        "ocr_engine": "tesseract",
+        "dpi": dpi,
+    }
