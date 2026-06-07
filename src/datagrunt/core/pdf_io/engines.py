@@ -149,11 +149,12 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
         total_pages = self._total_pages()
         pages = []
         errors = []
-        for idx in range(total_pages):
-            try:
-                pages.append(assembler.parse_page(idx, image_output_dir))
-            except Exception as e:  # noqa: BLE001 - per-page isolation
-                errors.append(f"Page {idx + 1}: {e}")
+        with assembler.backend, assembler.table_extractor:
+            for idx in range(total_pages):
+                try:
+                    pages.append(assembler.parse_page(idx, image_output_dir))
+                except Exception as e:  # noqa: BLE001 - per-page isolation
+                    errors.append(f"Page {idx + 1}: {e}")
         document = assembler.combine(total_pages, pages, errors)
         if drop_layout_tables:
             pdfcomponents.ParsedDocument(document).drop_layout_tables()
@@ -164,12 +165,13 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
         total_pages = self._total_pages()
         page_results = {}
         errors = []
-        for idx in range(total_pages):
-            try:
-                page = reader.parse_page(idx, image_output_dir)
-                page_results[page["page_number"]] = page
-            except Exception as e:  # noqa: BLE001 - per-page isolation
-                errors.append(f"Page {idx + 1}: {e}")
+        with reader:
+            for idx in range(total_pages):
+                try:
+                    page = reader.parse_page(idx, image_output_dir)
+                    page_results[page["page_number"]] = page
+                except Exception as e:  # noqa: BLE001 - per-page isolation
+                    errors.append(f"Page {idx + 1}: {e}")
         ordered = [page_results[p] for p in sorted(page_results.keys())]
         return reader.combine(total_pages, ordered, errors)
 
