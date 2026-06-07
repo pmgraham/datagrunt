@@ -175,3 +175,17 @@ class PdfiumNativeReader:
             lambda img: img.get("file"),
             lambda img, p: img.__setitem__("file", p),
         )
+
+    @staticmethod
+    def to_markdown(document: dict) -> str:
+        """Render native schema document into Markdown paragraphs."""
+        blocks = []
+        for page in document.get("document", {}).get("pages", []):
+            text = (page.get("text") or "").strip()
+            if not text:
+                continue
+            for para in text.split("\n\n"):
+                para = para.strip()
+                if para:
+                    blocks.append(para)
+        return "\n\n".join(blocks) + "\n"
