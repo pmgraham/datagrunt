@@ -35,6 +35,7 @@ class PDFEngineProperties:
     default_workers: int = 4
     json_export_filename: str = "output.json"
     json_newline_export_filename: str = "output.jsonl"
+    markdown_export_filename: str = "output.md"
     images_export_dir: str = "output_images"
     valid_engines: tuple = ("pymupdf", "pdfium")
     value_error_message: str = "Engine '{engine}' is not supported. Valid engines: {valid}."
@@ -239,6 +240,13 @@ class PDFBaseWriterEngine(ABC):
         pass
 
     @abstractmethod
+    def write_markdown(
+        self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False
+    ):
+        """Write the document Markdown representation to disk."""
+        pass
+
+    @abstractmethod
     def extract_images(self, output_dir=None, dedupe=True):
         """Write embedded images to disk; return their paths."""
         pass
@@ -283,6 +291,27 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
         with open(filename, "w") as f:
             for record in records:
                 f.write(json.dumps(record) + "\n")
+        return filename
+
+    def write_markdown(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
+        """Parse the PDF and write the document Markdown.
+
+        Args:
+            export_filename (optional, str): Output path; defaults to output.md.
+            image_output_dir (optional, str): If provided, embedded images are
+                written there and referenced in the Markdown.
+            dedupe_images (bool, default True): When images are written, collapse
+                byte-identical duplicates to a single file and repoint references.
+            drop_layout_tables (bool, default False): Drop 1xN / Nx1 "tables"
+                that are layout boxes rather than real tabular data.
+        """
+        filename = set_export_filename(self.properties.markdown_export_filename, export_filename)
+        document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
+        if image_output_dir and dedupe_images:
+            pdfcomponents.ParsedDocument(document).dedupe_images()
+        markdown_text = pdfcomponents.ParsedDocument(document).to_markdown()
+        with open(filename, "w") as f:
+            f.write(markdown_text)
         return filename
 
     def extract_images(self, output_dir=None, dedupe=True):
@@ -350,6 +379,20 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
         with open(filename, "w") as f:
             for record in records:
                 f.write(json.dumps(record) + "\n")
+        return filename
+
+    def write_markdown(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
+        """Parse the PDF and write the document Markdown (native or structured schema)."""
+        filename = set_export_filename(self.properties.markdown_export_filename, export_filename)
+        document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
+        if image_output_dir and dedupe_images:
+            self._dedupe(document)
+        if self.structured:
+            markdown_text = pdfcomponents.ParsedDocument(document).to_markdown()
+        else:
+            markdown_text = PdfiumNativeReader.to_markdown(document)
+        with open(filename, "w") as f:
+            f.write(markdown_text)
         return filename
 
     def extract_images(self, output_dir=None, dedupe=True):

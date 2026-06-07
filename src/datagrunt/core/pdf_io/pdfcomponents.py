@@ -208,6 +208,51 @@ class ParsedDocument:
             page["elements"] = kept
         return removed
 
+    def to_markdown(self) -> str:
+        """Render the unified structured elements of the document into Markdown."""
+        blocks = []
+        heading_map = {"header": "# ", "subheader": "## "}
+        for page in self.document.get("document", {}).get("pages", []):
+            elements = sorted(
+                page.get("elements", []),
+                key=lambda el: (el.get("position", {}).get("y", 0.0), el.get("position", {}).get("x", 0.0)),
+            )
+            for el in elements:
+                etype = el.get("type")
+                content = el.get("content")
+                meta = el.get("metadata") or {}
+                if etype in heading_map:
+                    blocks.append(f"{heading_map[etype]}{content}")
+                elif etype == "caption":
+                    blocks.append(f"*{content}*")
+                elif etype == "table":
+                    blocks.append(self._render_table(content, meta.get("has_header_row", False)))
+                elif etype == "image":
+                    path = meta.get("file_path") or ""
+                    blocks.append(f"![{Path(path).name or 'image'}]({path})")
+                elif isinstance(content, str) and content.strip():
+                    blocks.append(content)
+        return "\n\n".join(blocks) + "\n"
+
+    @staticmethod
+    def _render_table(content: list, has_header: bool) -> str:
+        if not content:
+            return ""
+        def cell_str(val):
+            text = "" if val is None else str(val)
+            return text.replace("\n", " ").replace("|", "\\|").strip()
+            
+        rows = [[cell_str(c) for c in row] for row in content]
+        width = max(len(r) for r in rows)
+        rows = [r + [""] * (width - len(r)) for r in rows]
+        if has_header:
+            header, body = rows[0], rows[1:]
+        else:
+            header, body = [""] * width, rows
+        lines = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * width) + " |"]
+        lines += ["| " + " | ".join(r) + " |" for r in body]
+        return "\n".join(lines)
+
 
 class PDFComponents(FileProperties):
     """A class that combines PDF components into a single interface."""

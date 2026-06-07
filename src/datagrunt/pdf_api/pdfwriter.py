@@ -74,6 +74,27 @@ class PDFWriter(PDFComponents):
             export_filename, image_output_dir, dedupe_images, drop_layout_tables
         )
 
+    def write_markdown(
+        self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False
+    ):
+        """Parse the PDF and write a formatted Markdown file to disk.
+
+        Args:
+            export_filename (optional, str): Output path; defaults to output.md.
+            image_output_dir (optional, str): If provided, embedded images are
+                written there and referenced in the Markdown.
+            dedupe_images (bool, default True): When images are written, collapse
+                byte-identical duplicates to a single file and repoint references.
+            drop_layout_tables (bool, default False): Drop 1xN / Nx1 "tables"
+                that are layout boxes rather than real tabular data.
+
+        Returns:
+            str: The path of the written Markdown file.
+        """
+        return self._create_writer().write_markdown(
+            export_filename, image_output_dir, dedupe_images, drop_layout_tables
+        )
+
     def extract_images(self, output_dir=None, dedupe=True):
         """Parse the PDF and write embedded image files to disk.
 
