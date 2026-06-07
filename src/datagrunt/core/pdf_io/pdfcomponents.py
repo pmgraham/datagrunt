@@ -39,54 +39,56 @@ class DocumentAssembler:
 
     def parse_page(self, page_index, image_output_dir=None) -> dict:
         """Parse a single page into the unified element schema."""
-        analysis = self.backend.analyze_page(page_index)
-        elements = []
-        counter = {"n": 1}
+        with self.backend, self.table_extractor:
+            analysis = self.backend.analyze_page(page_index)
+            elements = []
+            counter = {"n": 1}
 
-        def gen_elem_id():
-            elem_id = f"elem_{page_index + 1:02d}_{counter['n']:03d}"
-            counter["n"] += 1
-            return elem_id
+            def gen_elem_id():
+                elem_id = f"elem_{page_index + 1:02d}_{counter['n']:03d}"
+                counter["n"] += 1
+                return elem_id
 
-        if analysis.has_text_layer:
-            for block in self.backend.extract_text_blocks(page_index):
-                elements.append(self._text_element(block, gen_elem_id(), page_index))
-        elif analysis.is_scanned:
-            for block in self.backend.ocr_page(page_index, dpi=dpi_for_page(analysis.width, analysis.height)):
-                elements.append(self._ocr_element(block, gen_elem_id(), page_index))
+            if analysis.has_text_layer:
+                for block in self.backend.extract_text_blocks(page_index):
+                    elements.append(self._text_element(block, gen_elem_id(), page_index))
+            elif analysis.is_scanned:
+                for block in self.backend.ocr_page(page_index, dpi=dpi_for_page(analysis.width, analysis.height)):
+                    elements.append(self._ocr_element(block, gen_elem_id(), page_index))
 
-        if analysis.has_line_drawings or not analysis.has_text_layer:
-            for table in self.table_extractor.extract(page_index):
-                elements.append(self._table_element(table, gen_elem_id(), page_index))
+            if analysis.has_line_drawings or not analysis.has_text_layer:
+                for table in self.table_extractor.extract(page_index):
+                    elements.append(self._table_element(table, gen_elem_id(), page_index))
 
-        if analysis.image_count > 0:
-            for img in self.backend.extract_images(
-                page_index, output_dir=image_output_dir, name_prefix=self.filepath.stem
-            ):
-                elements.append(self._image_element(img, gen_elem_id(), page_index))
+            if analysis.image_count > 0:
+                for img in self.backend.extract_images(
+                    page_index, output_dir=image_output_dir, name_prefix=self.filepath.stem
+                ):
+                    elements.append(self._image_element(img, gen_elem_id(), page_index))
 
-        classification = "mixed"
-        if analysis.is_scanned:
-            classification = "scanned"
-        elif analysis.has_text_layer and len(elements) == 0:
-            classification = "text_only"
+            classification = "mixed"
+            if analysis.is_scanned:
+                classification = "scanned"
+            elif analysis.has_text_layer and len(elements) == 0:
+                classification = "text_only"
 
-        return {
-            "page_number": page_index + 1,
-            "width": float(analysis.width),
-            "height": float(analysis.height),
-            "classification": classification,
-            "elements": elements,
-        }
+            return {
+                "page_number": page_index + 1,
+                "width": float(analysis.width),
+                "height": float(analysis.height),
+                "classification": classification,
+                "elements": elements,
+            }
 
     def parse_document(self, total_pages, image_output_dir=None) -> dict:
         """Parse all pages sequentially and combine into the document envelope."""
         pages, errors = [], []
-        for idx in range(total_pages):
-            try:
-                pages.append(self.parse_page(idx, image_output_dir))
-            except Exception as e:  # noqa: BLE001 - per-page isolation
-                errors.append(str(e))
+        with self.backend, self.table_extractor:
+            for idx in range(total_pages):
+                try:
+                    pages.append(self.parse_page(idx, image_output_dir))
+                except Exception as e:  # noqa: BLE001 - per-page isolation
+                    errors.append(str(e))
         return self.combine(total_pages, pages, errors)
 
     def combine(self, total_pages, pages, errors) -> dict:

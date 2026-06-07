@@ -28,6 +28,14 @@ class ExtractionBackend(ABC):
         if not self.filepath.exists():
             raise FileNotFoundError(self.filepath)
 
+    def __enter__(self):
+        """Enter a context session (reusing open resources)."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit the context session (cleaning up resources)."""
+        pass
+
     @abstractmethod
     def analyze_page(self, page_number: int) -> PageAnalysis:
         """Return summary metadata for ``page_number`` (0-indexed)."""
