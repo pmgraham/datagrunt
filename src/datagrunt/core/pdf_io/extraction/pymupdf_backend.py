@@ -18,10 +18,36 @@ def _import_pymupdf():
 class PyMuPDFBackend(ExtractionBackend):
     """Extraction via PyMuPDF (text/dict spans, images) + Tesseract OCR."""
 
+    def __init__(self, filepath):
+        super().__init__(filepath)
+        import threading
+        self._local = threading.local()
+
+    def __enter__(self):
+        if not hasattr(self._local, "depth"):
+            self._local.depth = 0
+        if self._local.depth == 0:
+            pymupdf = _import_pymupdf()
+            self._local.doc = pymupdf.open(self.filepath)
+        self._local.depth += 1
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._local.depth -= 1
+        if self._local.depth == 0:
+            if hasattr(self._local, "doc") and self._local.doc:
+                self._local.doc.close()
+                self._local.doc = None
+
+    def _get_doc(self):
+        if hasattr(self._local, "doc") and self._local.doc:
+            return self._local.doc, False
+        pymupdf = _import_pymupdf()
+        return pymupdf.open(self.filepath), True
+
     def analyze_page(self, page_number: int) -> PageAnalysis:
         """Return page metadata; raises ValueError on failure/out-of-range."""
-        pymupdf = _import_pymupdf()
-        doc = pymupdf.open(self.filepath)
+        doc, should_close = self._get_doc()
         try:
             if page_number < 0 or page_number >= doc.page_count:
                 raise ValueError(f"Page {page_number} out of range")
@@ -47,12 +73,12 @@ class PyMuPDFBackend(ExtractionBackend):
                 text_length=len(text),
             )
         finally:
-            doc.close()
+            if should_close:
+                doc.close()
 
     def extract_text_blocks(self, page_number: int) -> list:
         """Return classified text blocks (ported from extractors.extract_text_blocks)."""
-        pymupdf = _import_pymupdf()
-        doc = pymupdf.open(self.filepath)
+        doc, should_close = self._get_doc()
         try:
             if page_number < 0 or page_number >= doc.page_count:
                 return []
@@ -73,7 +99,8 @@ class PyMuPDFBackend(ExtractionBackend):
                     blocks.append(tb)
             return blocks
         finally:
-            doc.close()
+            if should_close:
+                doc.close()
 
     def _build_block(self, block: dict, all_sizes: list, order: int):
         """Reduce one pymupdf block dict to a TextBlock (or None if empty)."""
@@ -108,8 +135,7 @@ class PyMuPDFBackend(ExtractionBackend):
         """Return embedded images (ported from extractors.extract_images)."""
         import os
 
-        pymupdf = _import_pymupdf()
-        doc = pymupdf.open(self.filepath)
+        doc, should_close = self._get_doc()
         try:
             if page_number < 0 or page_number >= doc.page_count:
                 return []
@@ -125,7 +151,8 @@ class PyMuPDFBackend(ExtractionBackend):
                     results.append(block)
             return results
         finally:
-            doc.close()
+            if should_close:
+                doc.close()
 
     def _image_block(self, doc, img_info, idx, image_blocks, output_dir, name_prefix, page_number):
         """Extract one image to an ImageBlock (or None to skip), <40px filtered."""
@@ -153,10 +180,9 @@ class PyMuPDFBackend(ExtractionBackend):
 
     def ocr_page(self, page_number: int, dpi: int = 300) -> list:
         """Render the page via pymupdf and OCR it with Tesseract."""
-        pymupdf = _import_pymupdf()
         from PIL import Image
 
-        doc = pymupdf.open(self.filepath)
+        doc, should_close = self._get_doc()
         try:
             if page_number < 0 or page_number >= doc.page_count:
                 return []
@@ -165,5 +191,6 @@ class PyMuPDFBackend(ExtractionBackend):
             mode = "RGBA" if pix.alpha else "RGB"
             img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
         finally:
-            doc.close()
+            if should_close:
+                doc.close()
         return ocr_data_to_blocks(img, dpi)
