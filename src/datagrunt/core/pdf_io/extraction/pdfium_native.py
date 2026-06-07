@@ -18,10 +18,33 @@ class PdfiumNativeReader:
             filepath (str or Path): Path to the PDF file.
         """
         self.filepath = Path(filepath)
+        import threading
+        self._local = threading.local()
+
+    def __enter__(self):
+        if not hasattr(self._local, "depth"):
+            self._local.depth = 0
+        if self._local.depth == 0:
+            self._local.doc = PdfiumDocument(self.filepath)
+        self._local.depth += 1
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._local.depth -= 1
+        if self._local.depth == 0:
+            if hasattr(self._local, "doc") and self._local.doc:
+                self._local.doc.close()
+                self._local.doc = None
+
+    def _get_doc(self):
+        if hasattr(self._local, "doc") and self._local.doc:
+            return self._local.doc, False
+        return PdfiumDocument(self.filepath), True
 
     def parse_page(self, page_index: int, image_output_dir: str = None) -> dict:
         """Parse one page into the native schema dict."""
-        with PdfiumDocument(self.filepath) as doc:
+        doc, should_close = self._get_doc()
+        try:
             page = doc.page(page_index)
             width, height = page.size()
             full_text = page.full_text()
@@ -45,6 +68,9 @@ class PdfiumNativeReader:
                 "images": images,
                 "ocr": ocr_used,
             }
+        finally:
+            if should_close:
+                doc.close()
 
     def _text_object(self, item) -> dict:
         """Convert a TextItem to the native text-object dict."""
