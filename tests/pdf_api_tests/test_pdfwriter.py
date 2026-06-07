@@ -112,3 +112,34 @@ class TestPDFWriter:
         )
         PDFWriter(sample_pdf).write_json(drop_layout_tables=True)
         assert calls == [True]
+
+    def test_write_markdown_default(self, sample_pdf, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        writer = PDFWriter(sample_pdf)
+        path = writer.write_markdown()
+        assert os.path.basename(path) == "output.md"
+        with open(path) as f:
+            content = f.read()
+        assert len(content) > 0
+
+    def test_write_markdown_custom_name_and_images(self, sample_pdf, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        img_dir = tmp_path / "imgs"
+        writer = PDFWriter(sample_pdf)
+        path = writer.write_markdown(
+            export_filename="report.md", image_output_dir=str(img_dir)
+        )
+        assert os.path.basename(path) == "report.md"
+        with open(path) as f:
+            content = f.read()
+        assert len(content) > 0
+        assert "report_page" in content
+
+    def test_write_markdown_pdfium_native(self, sample_pdf, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        writer = PDFWriter(sample_pdf, engine="pdfium", native=True)
+        path = writer.write_markdown()
+        assert os.path.basename(path) == "output.md"
+        with open(path) as f:
+            content = f.read()
+        assert len(content) > 0
