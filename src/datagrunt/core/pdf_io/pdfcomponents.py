@@ -13,6 +13,7 @@ from datagrunt.core.pdf_io.extraction.image_dedupe import dedupe_image_files
 from datagrunt.core.pdf_io.extraction.ocr import dpi_for_page
 from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
 from datagrunt.core.pdf_io.extraction.pymupdf_backend import PyMuPDFBackend
+from datagrunt.core.pdf_io.extraction.layout_sorter import PageLayoutSorter, ElementAdapter
 
 PIPELINE_TYPE = "pure_python_local_v1"
 
@@ -93,7 +94,7 @@ class DocumentAssembler:
                 "width": float(analysis.width),
                 "height": float(analysis.height),
                 "classification": classification,
-                "elements": elements,
+                "elements": PageLayoutSorter(ElementAdapter()).sort(elements),
             }
 
     def parse_document(self, total_pages, image_output_dir=None) -> dict:
@@ -157,6 +158,9 @@ class DocumentAssembler:
             "metadata": {"file_path": img.file_path, "format": img.fmt,
                          "width_px": img.width_px, "height_px": img.height_px},
         }
+
+
+
 
 
 class ParsedDocument:
@@ -224,15 +228,13 @@ class ParsedDocument:
             page["elements"] = kept
         return removed
 
-    def to_markdown(self) -> str:
+    def to_markdown(self, export_filename=None) -> str:
         """Render the unified structured elements of the document into Markdown."""
+        import os
         blocks = []
         heading_map = {"header": "# ", "subheader": "## "}
         for page in self.document.get("document", {}).get("pages", []):
-            elements = sorted(
-                page.get("elements", []),
-                key=lambda el: (el.get("position", {}).get("y", 0.0), el.get("position", {}).get("x", 0.0)),
-            )
+            elements = page.get("elements", [])
             for el in elements:
                 etype = el.get("type")
                 content = el.get("content")
@@ -245,6 +247,13 @@ class ParsedDocument:
                     blocks.append(self._render_table(content, meta.get("has_header_row", False)))
                 elif etype == "image":
                     path = meta.get("file_path") or ""
+                    if export_filename and path:
+                        try:
+                            md_dir = Path(export_filename).parent.resolve()
+                            abs_img_path = Path(path).resolve()
+                            path = os.path.relpath(abs_img_path, md_dir)
+                        except Exception:
+                            pass
                     blocks.append(f"![{Path(path).name or 'image'}]({path})")
                 elif isinstance(content, str) and content.strip():
                     blocks.append(content)
