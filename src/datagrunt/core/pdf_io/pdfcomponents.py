@@ -49,16 +49,32 @@ class DocumentAssembler:
                 counter["n"] += 1
                 return elem_id
 
+            tables = []
+            if analysis.has_line_drawings or not analysis.has_text_layer:
+                tables = self.table_extractor.extract(page_index)
+
+            def is_inside_table(bbox) -> bool:
+                tol = 3.0
+                for t in tables:
+                    tb = t.bbox
+                    if (bbox.x >= tb.x - tol and
+                        bbox.y >= tb.y - tol and
+                        (bbox.x + bbox.w) <= (tb.x + tb.w) + tol and
+                        (bbox.y + bbox.h) <= (tb.y + tb.h) + tol):
+                        return True
+                return False
+
             if analysis.has_text_layer:
                 for block in self.backend.extract_text_blocks(page_index):
-                    elements.append(self._text_element(block, gen_elem_id(), page_index))
+                    if not is_inside_table(block.bbox):
+                        elements.append(self._text_element(block, gen_elem_id(), page_index))
             elif analysis.is_scanned:
                 for block in self.backend.ocr_page(page_index, dpi=dpi_for_page(analysis.width, analysis.height)):
-                    elements.append(self._ocr_element(block, gen_elem_id(), page_index))
+                    if not is_inside_table(block.bbox):
+                        elements.append(self._ocr_element(block, gen_elem_id(), page_index))
 
-            if analysis.has_line_drawings or not analysis.has_text_layer:
-                for table in self.table_extractor.extract(page_index):
-                    elements.append(self._table_element(table, gen_elem_id(), page_index))
+            for table in tables:
+                elements.append(self._table_element(table, gen_elem_id(), page_index))
 
             if analysis.image_count > 0:
                 for img in self.backend.extract_images(
