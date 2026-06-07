@@ -309,7 +309,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
         document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
         if image_output_dir and dedupe_images:
             pdfcomponents.ParsedDocument(document).dedupe_images()
-        markdown_text = pdfcomponents.ParsedDocument(document).to_markdown()
+        markdown_text = pdfcomponents.ParsedDocument(document).to_markdown(export_filename=filename)
         with open(filename, "w") as f:
             f.write(markdown_text)
         return filename
@@ -388,7 +388,7 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
         if image_output_dir and dedupe_images:
             self._dedupe(document)
         if self.structured:
-            markdown_text = pdfcomponents.ParsedDocument(document).to_markdown()
+            markdown_text = pdfcomponents.ParsedDocument(document).to_markdown(export_filename=filename)
         else:
             markdown_text = PdfiumNativeReader.to_markdown(document)
         with open(filename, "w") as f:
