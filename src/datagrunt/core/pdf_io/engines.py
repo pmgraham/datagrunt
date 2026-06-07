@@ -2,6 +2,9 @@
 
 # standard library
 import json
+import logging
+import os
+import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -16,6 +19,43 @@ import pyarrow as pa
 from datagrunt.core.pdf_io import pdfcomponents
 from datagrunt.core.pdf_io.extraction import PdfiumBackend, PdfiumNativeReader
 from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
+
+logger = logging.getLogger(__name__)
+
+
+def _is_distributed_env() -> bool:
+    """Return True if running inside a distributed execution environment like Spark or Beam."""
+    distributed_keys = {
+        "SPARK_ENV_LOADED",
+        "SPARK_HOME",
+        "BEAM_WORKER_ID",
+        "FLINK_CONF_DIR",
+        "CELERY_BROKER_URL",
+    }
+    return any(k in os.environ for k in distributed_keys)
+
+
+def _parse_page_structured_worker(filepath_str: str, page_index: int, image_output_dir: Optional[str]) -> dict:
+    """Process worker function to parse a single page using PDFium in structured mode."""
+    from pathlib import Path
+    from datagrunt.core.pdf_io import pdfcomponents
+    from datagrunt.core.pdf_io.extraction import PdfiumBackend
+
+    filepath = Path(filepath_str)
+    assembler = pdfcomponents.DocumentAssembler(filepath, backend=PdfiumBackend(filepath))
+    with assembler.backend, assembler.table_extractor:
+        return assembler.parse_page(page_index, image_output_dir)
+
+
+def _parse_page_native_worker(filepath_str: str, page_index: int, image_output_dir: Optional[str]) -> dict:
+    """Process worker function to parse a single page using PDFium in native mode."""
+    from pathlib import Path
+    from datagrunt.core.pdf_io.extraction import PdfiumNativeReader
+
+    filepath = Path(filepath_str)
+    reader = PdfiumNativeReader(filepath)
+    with reader:
+        return reader.parse_page(page_index, image_output_dir)
 
 
 def set_export_filename(default_filename, export_filename=None):
@@ -134,7 +174,9 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
     ``structured=True`` it emits the same unified element schema as the pymupdf
     engine, via the shared ``pdfcomponents`` pipeline driven by ``PdfiumBackend``
     (text, images, OCR) plus shared pdfplumber tables. Pages are parsed
-    sequentially because pdfium is not thread-safe.
+    concurrently using a process pool (or sequentially when workers=1 or in a
+    distributed environment) because pdfium is not thread-safe within the same
+    process.
     """
 
     def __init__(self, filepath, workers: int = 4, structured: bool = False):
@@ -146,38 +188,86 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
             return len(doc)
 
     def _to_dicts_structured(self, image_output_dir, drop_layout_tables) -> dict:
-        assembler = pdfcomponents.DocumentAssembler(self.filepath, backend=PdfiumBackend(self.filepath))
         total_pages = self._total_pages()
         pages = []
         errors = []
-        with assembler.backend, assembler.table_extractor:
+
+        if self.workers <= 1 or _is_distributed_env():
+            if self.workers > 1 and _is_distributed_env():
+                logger.warning(
+                    "Distributed environment detected. Defaulting to sequential PDFium execution to prevent multiprocessing overhead."
+                )
+            assembler = pdfcomponents.DocumentAssembler(self.filepath, backend=PdfiumBackend(self.filepath))
+            with assembler.backend, assembler.table_extractor:
+                for idx in range(total_pages):
+                    try:
+                        pages.append(assembler.parse_page(idx, image_output_dir))
+                    except Exception as e:  # noqa: BLE001
+                        errors.append(f"Page {idx + 1}: {e}")
+        else:
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            pages_map = {}
+            with ProcessPoolExecutor(max_workers=self.workers) as executor:
+                futures = {
+                    executor.submit(_parse_page_structured_worker, str(self.filepath), idx, image_output_dir): idx
+                    for idx in range(total_pages)
+                }
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    try:
+                        page = future.result()
+                        pages_map[idx] = page
+                    except Exception as e:  # noqa: BLE001
+                        errors.append(f"Page {idx + 1}: {e}")
             for idx in range(total_pages):
-                try:
-                    pages.append(assembler.parse_page(idx, image_output_dir))
-                except Exception as e:  # noqa: BLE001 - per-page isolation
-                    errors.append(f"Page {idx + 1}: {e}")
+                if idx in pages_map:
+                    pages.append(pages_map[idx])
+
+        assembler = pdfcomponents.DocumentAssembler(self.filepath, backend=PdfiumBackend(self.filepath))
         document = assembler.combine(total_pages, pages, errors)
         if drop_layout_tables:
             pdfcomponents.ParsedDocument(document).drop_layout_tables()
         return document
 
     def _to_dicts_native(self, image_output_dir) -> dict:
-        reader = PdfiumNativeReader(self.filepath)
         total_pages = self._total_pages()
         page_results = {}
         errors = []
-        with reader:
-            for idx in range(total_pages):
-                try:
-                    page = reader.parse_page(idx, image_output_dir)
-                    page_results[page["page_number"]] = page
-                except Exception as e:  # noqa: BLE001 - per-page isolation
-                    errors.append(f"Page {idx + 1}: {e}")
+
+        if self.workers <= 1 or _is_distributed_env():
+            if self.workers > 1 and _is_distributed_env():
+                logger.warning(
+                    "Distributed environment detected. Defaulting to sequential PDFium execution to prevent multiprocessing overhead."
+                )
+            reader = PdfiumNativeReader(self.filepath)
+            with reader:
+                for idx in range(total_pages):
+                    try:
+                        page = reader.parse_page(idx, image_output_dir)
+                        page_results[page["page_number"]] = page
+                    except Exception as e:  # noqa: BLE001
+                        errors.append(f"Page {idx + 1}: {e}")
+        else:
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            with ProcessPoolExecutor(max_workers=self.workers) as executor:
+                futures = {
+                    executor.submit(_parse_page_native_worker, str(self.filepath), idx, image_output_dir): idx
+                    for idx in range(total_pages)
+                }
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    try:
+                        page = future.result()
+                        page_results[page["page_number"]] = page
+                    except Exception as e:  # noqa: BLE001
+                        errors.append(f"Page {idx + 1}: {e}")
+
         ordered = [page_results[p] for p in sorted(page_results.keys())]
+        reader = PdfiumNativeReader(self.filepath)
         return reader.combine(total_pages, ordered, errors)
 
     def to_dicts(self, image_output_dir: Optional[str] = None, drop_layout_tables: bool = False) -> dict:
-        """Parse all pages sequentially (pdfium is not thread-safe)."""
+        """Parse all pages concurrently using a process pool (or sequentially)."""
         if self.structured:
             return self._to_dicts_structured(image_output_dir, drop_layout_tables)
         return self._to_dicts_native(image_output_dir)
