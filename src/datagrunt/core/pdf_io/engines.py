@@ -192,7 +192,7 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
         pages = []
         errors = []
 
-        if self.workers <= 1 or _is_distributed_env():
+        if self.workers <= 1 or total_pages <= 1 or _is_distributed_env():
             if self.workers > 1 and _is_distributed_env():
                 logger.warning(
                     "Distributed environment detected. Defaulting to sequential PDFium execution to prevent multiprocessing overhead."
@@ -234,7 +234,7 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
         page_results = {}
         errors = []
 
-        if self.workers <= 1 or _is_distributed_env():
+        if self.workers <= 1 or total_pages <= 1 or _is_distributed_env():
             if self.workers > 1 and _is_distributed_env():
                 logger.warning(
                     "Distributed environment detected. Defaulting to sequential PDFium execution to prevent multiprocessing overhead."
