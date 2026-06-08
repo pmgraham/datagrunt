@@ -165,6 +165,19 @@ class PyMuPDFBackend(ExtractionBackend):
         image_bytes = base_image.get("image", b"")
         if not image_bytes or width < 40 or height < 40:
             return None
+
+        # Convert non-web-friendly formats to PNG using Pixmap
+        if ext.lower() not in ("png", "jpg", "jpeg", "gif"):
+            try:
+                import pymupdf
+                pix = pymupdf.Pixmap(doc, img_info[0])
+                if pix.colorspace and (pix.colorspace.n > 3 or pix.colorspace.name == "DeviceCMYK"):
+                    pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+                image_bytes = pix.tobytes("png")
+                ext = "png"
+            except Exception:
+                pass
+
         file_path = None
         if output_dir:
             import os

@@ -135,18 +135,60 @@ class PdfiumPage:
     def _extract_image(self, obj, base: Path):
         """Write an image object to disk preserving format; return path or None."""
         import glob
+        from PIL import Image
 
         pdfium, _ = _import_pdfium()
         base.parent.mkdir(parents=True, exist_ok=True)
+
+        extracted = False
         try:
             obj.extract(str(base))
+            extracted = True
         except pdfium.PdfiumError:
             try:
                 obj.extract(str(base), fb_render=True)
+                extracted = True
             except pdfium.PdfiumError:
-                return None
-        matches = glob.glob(str(base) + ".*")
-        return Path(matches[0]) if matches else None
+                pass
+
+        if extracted:
+            matches = glob.glob(str(base) + ".*")
+            if matches:
+                path = Path(matches[0])
+                suffix = path.suffix.lower()
+                if suffix in (".png", ".jpg", ".jpeg", ".gif"):
+                    return path
+
+                # Try to convert using PIL
+                try:
+                    with Image.open(path) as img:
+                        if img.mode not in ("RGB", "RGBA", "L"):
+                            img = img.convert("RGB")
+                        png_path = path.with_suffix(".png")
+                        img.save(png_path, "PNG")
+                    path.unlink()
+                    return png_path
+                except Exception:
+                    # PIL failed (e.g. missing format plugin), clean up and fall back to bitmap
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+
+        # Fallback to direct bitmap extraction if raw extraction or conversion failed
+        try:
+            bmp = obj.get_bitmap()
+            if bmp is not None:
+                img = bmp.to_pil()
+                if img.mode not in ("RGB", "RGBA", "L"):
+                    img = img.convert("RGB")
+                png_path = base.with_suffix(".png")
+                img.save(png_path, "PNG")
+                return png_path
+        except Exception:
+            pass
+
+        return None
 
     def render_pil(self, dpi: int = 300):
         """Render the page to a PIL RGB image at the given dpi."""

@@ -113,3 +113,78 @@ class TestPDFReaderStructured:
         doc = PDFReader(sample_pdf, engine="pdfium").to_dicts()
         page = doc["document"]["pages"][0]
         assert "elements" in page and "classification" in page
+
+
+class TestPDFReaderMultiprocessing:
+    """Test multiprocessing execution and Spark/Beam environment fallback in PDFReader."""
+
+    def test_multiprocessing_structured_success(self, sample_pdf):
+        # Run structured parsing with workers=2
+        reader = PDFReader(sample_pdf, engine="pdfium", workers=2, native=False)
+        doc = reader.to_dicts()
+        assert doc["document"]["total_pages"] == 1
+        page = doc["document"]["pages"][0]
+        assert "elements" in page
+        assert page["page_number"] == 1
+
+    def test_multiprocessing_native_success(self, sample_pdf):
+        # Run native parsing with workers=2
+        reader = PDFReader(sample_pdf, engine="pdfium", workers=2, native=True)
+        doc = reader.to_dicts()
+        assert doc["document"]["page_count"] == 1
+        page = doc["document"]["pages"][0]
+        assert "text_objects" in page
+        assert page["page_number"] == 1
+
+    def test_spark_env_fallback_to_sequential_structured(self, sample_pdf, monkeypatch):
+        from concurrent.futures import ProcessPoolExecutor
+        calls = []
+        original_init = ProcessPoolExecutor.__init__
+
+        def mocked_init(self, *args, **kwargs):
+            calls.append(True)
+            original_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(ProcessPoolExecutor, "__init__", mocked_init)
+        monkeypatch.setenv("SPARK_ENV_LOADED", "1")
+
+        # Run structured parsing; should NOT invoke ProcessPoolExecutor
+        reader = PDFReader(sample_pdf, engine="pdfium", workers=2, native=False)
+        doc = reader.to_dicts()
+        assert doc["document"]["total_pages"] == 1
+        assert len(calls) == 0
+
+    def test_beam_env_fallback_to_sequential_native(self, sample_pdf, monkeypatch):
+        from concurrent.futures import ProcessPoolExecutor
+        calls = []
+        original_init = ProcessPoolExecutor.__init__
+
+        def mocked_init(self, *args, **kwargs):
+            calls.append(True)
+            original_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(ProcessPoolExecutor, "__init__", mocked_init)
+        monkeypatch.setenv("BEAM_WORKER_ID", "worker_123")
+
+        # Run native parsing; should NOT invoke ProcessPoolExecutor
+        reader = PDFReader(sample_pdf, engine="pdfium", workers=2, native=True)
+        doc = reader.to_dicts()
+        assert doc["document"]["page_count"] == 1
+        assert len(calls) == 0
+
+    def test_no_multiprocessing_when_workers_is_one(self, sample_pdf, monkeypatch):
+        from concurrent.futures import ProcessPoolExecutor
+        calls = []
+        original_init = ProcessPoolExecutor.__init__
+
+        def mocked_init(self, *args, **kwargs):
+            calls.append(True)
+            original_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(ProcessPoolExecutor, "__init__", mocked_init)
+
+        # Run structured parsing with workers=1; should NOT invoke ProcessPoolExecutor
+        reader = PDFReader(sample_pdf, engine="pdfium", workers=1, native=False)
+        doc = reader.to_dicts()
+        assert doc["document"]["total_pages"] == 1
+        assert len(calls) == 0

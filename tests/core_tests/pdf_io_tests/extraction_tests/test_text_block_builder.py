@@ -26,3 +26,30 @@ def test_builder_groups_and_classifies():
 
 def test_builder_empty():
     assert TextBlockBuilder().build([]) == []
+
+
+def test_builder_column_extraction():
+    # Spanning title
+    title = TextItem(text="Spanning Title", x0=50, x1=450, y_top=50, y_bot=74, size=24.0, font="Arial", is_bold=True, is_italic=False)
+    # Left column items (y=100 and y=120)
+    left1 = TextItem(text="left 1", x0=50, x1=150, y_top=100, y_bot=111, size=11.0, font="Arial", is_bold=False, is_italic=False)
+    left2 = TextItem(text="left 2", x0=50, x1=150, y_top=120, y_bot=131, size=11.0, font="Arial", is_bold=False, is_italic=False)
+    # Right column items (y=100 and y=120)
+    right1 = TextItem(text="right 1", x0=350, x1=450, y_top=100, y_bot=111, size=11.0, font="Arial", is_bold=False, is_italic=False)
+    right2 = TextItem(text="right 2", x0=350, x1=450, y_top=120, y_bot=131, size=11.0, font="Arial", is_bold=False, is_italic=False)
+    
+    # Pass them in non-sequential order
+    items = [left2, right1, title, left1, right2]
+    
+    blocks = TextBlockBuilder().build(items)
+    
+    # We expect 3 blocks in exact reading order: Title -> Left Column (merged) -> Right Column (merged)
+    assert len(blocks) == 3
+    assert blocks[0].text == "Spanning Title"
+    assert blocks[1].text == "left 1 left 2"
+    assert blocks[2].text == "right 1 right 2"
+    
+    # Check reading order indices
+    assert blocks[0].reading_order == 0
+    assert blocks[1].reading_order == 1
+    assert blocks[2].reading_order == 2
