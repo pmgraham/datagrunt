@@ -94,6 +94,8 @@ class PageLayoutSorter:
                     left.append(it)
                 else:
                     right.append(it)
+            if not left or not right:
+                return [items]
             return self.partition(left) + self.partition(right)
 
         intervals = self._group_spanning_intervals(spanning)
