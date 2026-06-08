@@ -14,7 +14,7 @@ class CSVWriter(CSVComponents):
     supported file types.
     """
 
-    def __init__(self, filepath, engine="duckdb"):
+    def __init__(self, filepath, engine="duckdb", lenient=False):
         """
         Initialize the CSV Writer class.
 
@@ -22,15 +22,17 @@ class CSVWriter(CSVComponents):
             filepath (str or Path): Path to the file to write.
             engine (str, default 'duckdb'): Determines which writer engine
             class to instantiate.
+            lenient (bool): Whether to run in lenient mode.
         """
         filepath = Path(filepath)
+        self.lenient = lenient
         super().__init__(filepath)
-        self.db_table = DuckDBQueries(self.filepath).database_table_name
+        self.db_table = DuckDBQueries(self.filepath, lenient=self.lenient).database_table_name
         self.engine = engine.lower().replace(" ", "")
 
     def _create_writer(self):
         """Create a reader object."""
-        return CSVEngineFactory(self.filepath, self.engine).create_writer()
+        return CSVEngineFactory(self.filepath, self.engine, lenient=self.lenient).create_writer()
 
     def write_csv(self, out_filename=None, normalize_columns=False):
         """
