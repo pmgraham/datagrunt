@@ -15,8 +15,34 @@ import pyarrow.parquet as pq
 from duckdb import DuckDBPyRelation
 
 # local libraries
-from datagrunt.core.csv_io.csvcomponents import CSVColumnNameNormalizer, CSVColumns, CSVDelimiter
+from datagrunt.core.csv_io.csvcomponents import (
+    CSVColumnNameNormalizer,
+    CSVColumns,
+    _check_csv_ragged_and_warn,
+)
 from datagrunt.core.databases import DuckDBQueries
+
+
+def _count_leading_comments(filepath):
+    count = 0
+    with open(filepath, "r", encoding="utf-8-sig") as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped.startswith("#") or not stripped:
+                count += 1
+            else:
+                break
+    return count
+
+
+def _is_legacy_mac_newlines(filepath):
+    """Check if the file uses legacy Mac OS carriage returns (\\r) as line endings."""
+    try:
+        with open(filepath, "rb") as f:
+            chunk = f.read(4096)
+        return b"\r" in chunk and b"\n" not in chunk
+    except Exception:
+        return False
 
 
 @dataclass
@@ -41,16 +67,18 @@ class CSVEngineProperties:
 class CSVBaseReaderEngine(ABC):
     """Abstract base class defining the interface for reader engines."""
 
-    def __init__(self, filepath):
+    def __init__(self, filepath, lenient=False):
         """Initialize the CSVReader class.
 
         Args:
             filepath (str or Path): Path to the file to read.
+            lenient (bool): Whether to run in lenient mode.
         """
         self.filepath = Path(filepath)
-        self.queries = DuckDBQueries(self.filepath)
-        self.db_table = DuckDBQueries(self.filepath).database_table_name
-        self.delimiter = CSVDelimiter(self.filepath).delimiter
+        self.lenient = lenient
+        self.queries = DuckDBQueries(self.filepath, lenient=self.lenient)
+        self.db_table = self.queries.database_table_name
+        self.delimiter = self.queries.delimiter
         if not self.filepath.exists():
             raise FileNotFoundError
 
@@ -111,16 +139,18 @@ class CSVBaseReaderEngine(ABC):
 class CSVBaseWriterEngine(ABC):
     """Abstract base class defining the interface for writer engines."""
 
-    def __init__(self, filepath):
+    def __init__(self, filepath, lenient=False):
         """
         Initialize the CSV Writer DuckDB Engine class.
 
         Args:
             filepath (str or Path): Path to the file to write.
+            lenient (bool): Whether to run in lenient mode.
         """
         self.filepath = Path(filepath)
-        self.queries = DuckDBQueries(self.filepath)
-        self.db_table = DuckDBQueries(self.filepath).database_table_name
+        self.lenient = lenient
+        self.queries = DuckDBQueries(self.filepath, lenient=self.lenient)
+        self.db_table = self.queries.database_table_name
         if not self.filepath.exists():
             raise FileNotFoundError
 
@@ -295,10 +325,26 @@ class CSVReaderPolarsEngine(CSVBaseReaderEngine):
         Returns:
             A Polars dataframe.
         """
-        df = pl.read_csv(self.filepath, separator=self.delimiter, truncate_ragged_lines=True, infer_schema=False)
-        if normalize_columns:
-            df = df.rename(CSVColumnNameNormalizer(self.filepath).columns_to_normalized_mapping)
-        return df
+        if _is_legacy_mac_newlines(self.filepath):
+            raise ValueError(
+                "Polars engine does not support legacy Mac OS carriage return (\\r) newlines. "
+                "Please use engine='duckdb' or convert the file to Unix/Windows newlines."
+            )
+        if self.lenient:
+            _check_csv_ragged_and_warn(self.filepath, self.delimiter)
+        try:
+            df = pl.read_csv(
+                self.filepath,
+                separator=self.delimiter,
+                truncate_ragged_lines=self.lenient,
+                infer_schema=False,
+                comment_prefix="#",
+            )
+            if normalize_columns:
+                df = df.rename(CSVColumnNameNormalizer(self.filepath, columns=df.columns).columns_to_normalized_mapping)
+            return df
+        except Exception as e:
+            raise e
 
     def _create_dataframe_sample(self, normalize_columns=False):
         """
@@ -311,16 +357,27 @@ class CSVReaderPolarsEngine(CSVBaseReaderEngine):
         Returns:
             A Polars dataframe.
         """
-        df = pl.read_csv(
-            self.filepath,
-            separator=self.delimiter,
-            truncate_ragged_lines=True,
-            infer_schema=False,
-            n_rows=CSVEngineProperties.dataframe_sample_rows,
-        )
-        if normalize_columns:
-            df = df.rename(CSVColumnNameNormalizer(self.filepath).columns_to_normalized_mapping)
-        return df
+        if _is_legacy_mac_newlines(self.filepath):
+            raise ValueError(
+                "Polars engine does not support legacy Mac OS carriage return (\\r) newlines. "
+                "Please use engine='duckdb' or convert the file to Unix/Windows newlines."
+            )
+        if self.lenient:
+            _check_csv_ragged_and_warn(self.filepath, self.delimiter)
+        try:
+            df = pl.read_csv(
+                self.filepath,
+                separator=self.delimiter,
+                truncate_ragged_lines=self.lenient,
+                infer_schema=False,
+                n_rows=CSVEngineProperties.dataframe_sample_rows,
+                comment_prefix="#",
+            )
+            if normalize_columns:
+                df = df.rename(CSVColumnNameNormalizer(self.filepath, columns=df.columns).columns_to_normalized_mapping)
+            return df
+        except Exception as e:
+            raise e
 
     def get_sample(self, normalize_columns=False):
         """
@@ -402,9 +459,9 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
     by DuckDB.
     """
 
-    def __init__(self, filepath):
+    def __init__(self, filepath, lenient=False):
         """Initialize the CSVWriterDuckDBEngine class."""
-        super().__init__(filepath)
+        super().__init__(filepath, lenient=lenient)
 
     def write_csv(self, export_filename=None, normalize_columns=False):
         """
@@ -474,9 +531,9 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
 class CSVWriterPolarsEngine(CSVBaseWriterEngine):
     """Class to write CSVs to other file formats powered by Polars."""
 
-    def __init__(self, filepath):
+    def __init__(self, filepath, lenient=False):
         """Initialize the CSVWriterPolarsEngine class."""
-        super().__init__(filepath)
+        super().__init__(filepath, lenient=lenient)
 
     def write_csv(self, export_filename=None, normalize_columns=False):
         """
@@ -488,7 +545,7 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
             names.
         """
         filename = self.queries.set_export_filename(CSVEngineProperties.csv_export_filename, export_filename)
-        df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
+        df = CSVReaderPolarsEngine(self.filepath, lenient=self.lenient).to_dataframe(normalize_columns)
         df.write_csv(filename)
 
     def write_excel(self, export_filename=None, normalize_columns=False):
@@ -501,7 +558,7 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
             names.
         """
         filename = self.queries.set_export_filename(CSVEngineProperties.excel_export_filename, export_filename)
-        df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
+        df = CSVReaderPolarsEngine(self.filepath, lenient=self.lenient).to_dataframe(normalize_columns)
         df.write_excel(filename)
 
     def write_json(self, export_filename=None, normalize_columns=False):
@@ -514,7 +571,7 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
             names.
         """
         filename = self.queries.set_export_filename(CSVEngineProperties.json_export_filename, export_filename)
-        df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
+        df = CSVReaderPolarsEngine(self.filepath, lenient=self.lenient).to_dataframe(normalize_columns)
         df.write_json(filename)
 
     def write_json_newline_delimited(self, export_filename=None, normalize_columns=False):
@@ -527,7 +584,7 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
             names.
         """
         filename = self.queries.set_export_filename(CSVEngineProperties.json_newline_export_filename, export_filename)
-        df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
+        df = CSVReaderPolarsEngine(self.filepath, lenient=self.lenient).to_dataframe(normalize_columns)
         df.write_ndjson(filename)
 
     def write_parquet(self, export_filename=None, normalize_columns=False):
@@ -562,25 +619,54 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
         """
         # Use PyArrow's CSV reader with all columns as string to prevent data loss
         # Get column names efficiently using existing CSVColumns class
-        columns = CSVColumns(self.filepath).columns
+        columns = CSVColumns(self.filepath, delimiter=self.delimiter).columns
 
         # Create schema with all string types
         string_schema = pa.schema([(name, pa.string()) for name in columns])
 
         # Read with explicit string types
-        table = pacsv.read_csv(
-            self.filepath,
-            parse_options=pacsv.ParseOptions(delimiter=self.delimiter),
-            convert_options=pacsv.ConvertOptions(column_types=string_schema),
-        )
+        if _is_legacy_mac_newlines(self.filepath):
+            raise ValueError(
+                "PyArrow engine does not support legacy Mac OS carriage return (\\r) newlines. "
+                "Please use engine='duckdb' or convert the file to Unix/Windows newlines."
+            )
+        if self.lenient:
+            _check_csv_ragged_and_warn(self.filepath, self.delimiter)
+            # Fallback to Polars to parse the ragged CSV, then convert to Arrow Table
+            df = pl.read_csv(
+                self.filepath,
+                separator=self.delimiter,
+                truncate_ragged_lines=True,
+                infer_schema=False,
+                comment_prefix="#",
+            )
+            table = df.to_arrow()
+            string_schema = pa.schema([(name, pa.string()) for name in table.column_names])
+            table = table.cast(string_schema)
+            if normalize_columns:
+                column_normalizer = CSVColumnNameNormalizer(self.filepath, columns=columns)
+                old_names = table.column_names
+                new_names = [column_normalizer.columns_to_normalized_mapping.get(name, name) for name in old_names]
+                table = table.rename_columns(new_names)
+            return table
+        try:
+            skip_count = _count_leading_comments(self.filepath) + 1
+            table = pacsv.read_csv(
+                self.filepath,
+                read_options=pacsv.ReadOptions(column_names=columns, skip_rows=skip_count),
+                parse_options=pacsv.ParseOptions(delimiter=self.delimiter),
+                convert_options=pacsv.ConvertOptions(column_types=string_schema),
+            )
 
-        if normalize_columns:
-            column_normalizer = CSVColumnNameNormalizer(self.filepath)
-            old_names = table.column_names
-            new_names = [column_normalizer.columns_to_normalized_mapping.get(name, name) for name in old_names]
-            table = table.rename_columns(new_names)
+            if normalize_columns:
+                column_normalizer = CSVColumnNameNormalizer(self.filepath, columns=columns)
+                old_names = table.column_names
+                new_names = [column_normalizer.columns_to_normalized_mapping.get(name, name) for name in old_names]
+                table = table.rename_columns(new_names)
 
-        return table
+            return table
+        except Exception as e:
+            raise e
 
     def _create_table_sample(self, normalize_columns=False):
         """
@@ -595,28 +681,58 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
         """
         # Read with PyArrow with all columns as string to prevent data loss
         # Get column names efficiently using existing CSVColumns class
-        columns = CSVColumns(self.filepath).columns
+        columns = CSVColumns(self.filepath, delimiter=self.delimiter).columns
 
         # Create schema with all string types
         string_schema = pa.schema([(name, pa.string()) for name in columns])
 
         # Read with explicit string types
-        table = pacsv.read_csv(
-            self.filepath,
-            parse_options=pacsv.ParseOptions(delimiter=self.delimiter),
-            convert_options=pacsv.ConvertOptions(column_types=string_schema),
-        )
+        if _is_legacy_mac_newlines(self.filepath):
+            raise ValueError(
+                "PyArrow engine does not support legacy Mac OS carriage return (\\r) newlines. "
+                "Please use engine='duckdb' or convert the file to Unix/Windows newlines."
+            )
+        if self.lenient:
+            _check_csv_ragged_and_warn(self.filepath, self.delimiter)
+            # Fallback to Polars to parse the ragged CSV, then convert to Arrow Table
+            df = pl.read_csv(
+                self.filepath,
+                separator=self.delimiter,
+                truncate_ragged_lines=True,
+                infer_schema=False,
+                n_rows=CSVEngineProperties.dataframe_sample_rows,
+                comment_prefix="#",
+            )
+            table = df.to_arrow()
+            string_schema = pa.schema([(name, pa.string()) for name in table.column_names])
+            table = table.cast(string_schema)
+            if normalize_columns:
+                column_normalizer = CSVColumnNameNormalizer(self.filepath, columns=columns)
+                old_names = table.column_names
+                new_names = [column_normalizer.columns_to_normalized_mapping.get(name, name) for name in old_names]
+                table = table.rename_columns(new_names)
+            return table
+        try:
+            skip_count = _count_leading_comments(self.filepath) + 1
+            table = pacsv.read_csv(
+                self.filepath,
+                read_options=pacsv.ReadOptions(column_names=columns, skip_rows=skip_count),
+                parse_options=pacsv.ParseOptions(delimiter=self.delimiter),
+                convert_options=pacsv.ConvertOptions(column_types=string_schema),
+            )
 
-        # Take sample rows
-        sample_table = table.slice(0, CSVEngineProperties.dataframe_sample_rows)
+            # Take sample rows
+            sample_table = table.slice(0, CSVEngineProperties.dataframe_sample_rows)
 
-        if normalize_columns:
-            column_normalizer = CSVColumnNameNormalizer(self.filepath)
-            old_names = sample_table.column_names
-            new_names = [column_normalizer.columns_to_normalized_mapping.get(name, name) for name in old_names]
-            sample_table = sample_table.rename_columns(new_names)
+            if normalize_columns:
+                column_normalizer = CSVColumnNameNormalizer(self.filepath, columns=columns)
+                old_names = sample_table.column_names
+                new_names = [column_normalizer.columns_to_normalized_mapping.get(name, name) for name in old_names]
+                sample_table = sample_table.rename_columns(new_names)
 
-        return sample_table
+            return sample_table
+        except Exception as e:
+            raise e
 
     def get_sample(self, normalize_columns=False):
         """
@@ -708,33 +824,62 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
 class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
     """Class to write CSVs to other file formats powered by PyArrow."""
 
-    def __init__(self, filepath):
+    def __init__(self, filepath, lenient=False):
         """Initialize the CSVWriterPyArrowEngine class."""
-        super().__init__(filepath)
+        super().__init__(filepath, lenient=lenient)
 
     def _create_table(self, normalize_columns=False):
         """Create a PyArrow table for writing operations."""
         # Read with PyArrow with all columns as string to prevent data loss
         # Get column names efficiently using existing CSVColumns class
-        columns = CSVColumns(self.filepath).columns
+        columns = CSVColumns(self.filepath, delimiter=self.queries.delimiter).columns
 
         # Create schema with all string types
         string_schema = pa.schema([(name, pa.string()) for name in columns])
 
         # Read with explicit string types
-        table = pacsv.read_csv(
-            self.filepath,
-            parse_options=pacsv.ParseOptions(delimiter=CSVDelimiter(self.filepath).delimiter),
-            convert_options=pacsv.ConvertOptions(column_types=string_schema),
-        )
+        if _is_legacy_mac_newlines(self.filepath):
+            raise ValueError(
+                "PyArrow engine does not support legacy Mac OS carriage return (\\r) newlines. "
+                "Please use engine='duckdb' or convert the file to Unix/Windows newlines."
+            )
+        if self.lenient:
+            _check_csv_ragged_and_warn(self.filepath, self.queries.delimiter)
+            # Fallback to Polars to parse the ragged CSV, then convert to Arrow Table
+            df = pl.read_csv(
+                self.filepath,
+                separator=self.queries.delimiter,
+                truncate_ragged_lines=True,
+                infer_schema=False,
+                comment_prefix="#",
+            )
+            table = df.to_arrow()
+            string_schema = pa.schema([(name, pa.string()) for name in table.column_names])
+            table = table.cast(string_schema)
+            if normalize_columns:
+                column_normalizer = CSVColumnNameNormalizer(self.filepath, columns=columns)
+                old_names = table.column_names
+                new_names = [column_normalizer.columns_to_normalized_mapping.get(name, name) for name in old_names]
+                table = table.rename_columns(new_names)
+            return table
+        try:
+            skip_count = _count_leading_comments(self.filepath) + 1
+            table = pacsv.read_csv(
+                self.filepath,
+                read_options=pacsv.ReadOptions(column_names=columns, skip_rows=skip_count),
+                parse_options=pacsv.ParseOptions(delimiter=self.queries.delimiter),
+                convert_options=pacsv.ConvertOptions(column_types=string_schema),
+            )
 
-        if normalize_columns:
-            column_normalizer = CSVColumnNameNormalizer(self.filepath)
-            old_names = table.column_names
-            new_names = [column_normalizer.columns_to_normalized_mapping.get(name, name) for name in old_names]
-            table = table.rename_columns(new_names)
+            if normalize_columns:
+                column_normalizer = CSVColumnNameNormalizer(self.filepath, columns=columns)
+                old_names = table.column_names
+                new_names = [column_normalizer.columns_to_normalized_mapping.get(name, name) for name in old_names]
+                table = table.rename_columns(new_names)
 
-        return table
+            return table
+        except Exception as e:
+            raise e
 
     def write_csv(self, export_filename=None, normalize_columns=False):
         """

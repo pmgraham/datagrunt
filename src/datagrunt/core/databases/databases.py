@@ -3,19 +3,25 @@
 # standard library
 import hashlib
 import re
+from functools import cached_property
 from pathlib import Path
 
 # third party libraries
 import duckdb
 
 # local imports
-from datagrunt.core.csv_io import CSVColumnNameNormalizer, CSVDelimiter
+from datagrunt.core.csv_io import (
+    CSVColumnNameNormalizer,
+    CSVDelimiter,
+    _check_csv_ragged_and_warn,
+    _count_leading_comments,
+)
 
 
 class DuckDBQueries:
     """Class to store DuckDB database queries and query strings."""
 
-    def __init__(self, filepath):
+    def __init__(self, filepath, lenient=False):
         """
         Initialize the DuckDBQueries class.
 
@@ -27,11 +33,18 @@ class DuckDBQueries:
 
         Args:
             filepath (str or Path): Path to the file.
+            lenient (bool): Whether to run in lenient mode.
         """
         self.filepath = Path(filepath)
-        self.delimiter = CSVDelimiter(filepath).delimiter
+        self.lenient = lenient
         self.database_table_name = self._set_database_table_name()
         self.connection = duckdb.connect(":memory:")
+        self.skip_rows = _count_leading_comments(self.filepath)
+
+    @cached_property
+    def delimiter(self):
+        """Get the delimiter."""
+        return CSVDelimiter(self.filepath).delimiter
 
     def close(self):
         """Close this instance's DuckDB connection.
@@ -88,17 +101,37 @@ class DuckDBQueries:
         Returns:
             str: The query to import the CSV file.
         """
-        return f"""
-            CREATE OR REPLACE TABLE {self.database_table_name} AS
-            SELECT *
-            FROM read_csv('{self.filepath}',
-                            auto_detect=true,
-                            delim='{self.delimiter}',
-                            header=true,
-                            null_padding=true,
-                            all_varchar=True,
-                            strict_mode=false);
-            """
+        if self.lenient:
+            from datagrunt.core.csv_io import CSVColumns
+
+            cols = CSVColumns(self.filepath, delimiter=self.delimiter).columns
+            cols_param = "{" + ", ".join(f"'{c}': 'VARCHAR'" for c in cols) + "}"
+            return f"""
+                CREATE OR REPLACE TABLE {self.database_table_name} AS
+                SELECT *
+                FROM read_csv('{self.filepath}',
+                                delim='{self.delimiter}',
+                                header=true,
+                                columns={cols_param},
+                                null_padding=true,
+                                all_varchar=True,
+                                auto_detect=false,
+                                strict_mode=false,
+                                skip={self.skip_rows});
+                """
+        else:
+            return f"""
+                CREATE OR REPLACE TABLE {self.database_table_name} AS
+                SELECT *
+                FROM read_csv('{self.filepath}',
+                                auto_detect=true,
+                                delim='{self.delimiter}',
+                                header=true,
+                                null_padding=true,
+                                all_varchar=True,
+                                strict_mode=true,
+                                skip={self.skip_rows});
+                """
 
     def import_csv_query_normalize_columns(self):
         """
@@ -108,18 +141,39 @@ class DuckDBQueries:
         Returns:
             str: The query to import the CSV file and normalize column names.
         """
-        return f"""
-            CREATE OR REPLACE TABLE {self.database_table_name} AS
-            SELECT *
-            FROM read_csv('{self.filepath}',
-                            auto_detect=true,
-                            delim='{self.delimiter}',
-                            header=true,
-                            null_padding=true,
-                            all_varchar=True,
-                            strict_mode=false,
-                            normalize_names=true);
-            """
+        if self.lenient:
+            from datagrunt.core.csv_io import CSVColumns
+
+            cols = CSVColumns(self.filepath, delimiter=self.delimiter).columns
+            cols_param = "{" + ", ".join(f"'{c}': 'VARCHAR'" for c in cols) + "}"
+            return f"""
+                CREATE OR REPLACE TABLE {self.database_table_name} AS
+                SELECT *
+                FROM read_csv('{self.filepath}',
+                                delim='{self.delimiter}',
+                                header=true,
+                                columns={cols_param},
+                                null_padding=true,
+                                all_varchar=True,
+                                auto_detect=false,
+                                strict_mode=false,
+                                normalize_names=true,
+                                skip={self.skip_rows});
+                """
+        else:
+            return f"""
+                CREATE OR REPLACE TABLE {self.database_table_name} AS
+                SELECT *
+                FROM read_csv('{self.filepath}',
+                                auto_detect=true,
+                                delim='{self.delimiter}',
+                                header=true,
+                                null_padding=true,
+                                all_varchar=True,
+                                strict_mode=true,
+                                normalize_names=true,
+                                skip={self.skip_rows});
+                """
 
     def select_from_duckdb_table(self):
         """Query to select from a DuckDB table."""
@@ -213,7 +267,8 @@ class DuckDBQueries:
         """
         self.connection.sql(self.import_csv_query())
         table_columns = self.connection.sql(f"SELECT * FROM {self.database_table_name} LIMIT 0").columns
-        for old_name, new_name in zip(table_columns, CSVColumnNameNormalizer(self.filepath).columns_normalized):
+        normalizer = CSVColumnNameNormalizer(self.filepath, columns=table_columns)
+        for old_name, new_name in zip(table_columns, normalizer.columns_normalized):
             sql_string = f'ALTER TABLE {self.database_table_name} RENAME COLUMN "{old_name}" TO "{new_name}"'
             self.connection.sql(sql_string)
 
@@ -223,6 +278,8 @@ class DuckDBQueries:
         Args:
             normalize_columns (bool): Whether to normalize column names.
         """
+        if self.lenient:
+            _check_csv_ragged_and_warn(self.filepath, self.delimiter)
         if normalize_columns:
             self.update_and_normalize_column_names()
         else:
@@ -254,6 +311,8 @@ class DuckDBQueries:
         Returns:
             polars.DataFrame: The resulting DataFrame.
         """
+        if self.lenient:
+            _check_csv_ragged_and_warn(self.filepath, self.delimiter)
         # Ensure the table is created with original column names for querying
         self.connection.sql(self.import_csv_query())
 

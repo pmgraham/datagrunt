@@ -100,9 +100,7 @@ class TestCSVReader:
 
         for engine in ("polars", "pyarrow"):
             reader = CSVReader(str(csv_file), engine=engine)
-            result = reader.query_data(
-                f"SELECT * FROM {reader.db_table}", normalize_columns=True
-            )
+            result = reader.query_data(f"SELECT * FROM {reader.db_table}", normalize_columns=True)
             assert isinstance(result, pl.DataFrame)
             assert list(result.columns) == expected_columns
 
@@ -248,3 +246,87 @@ class TestCSVReader:
             result_blank = reader_blank.query_data("SELECT * FROM table")
             assert isinstance(result_blank, list)
             assert len(result_blank) == 0
+
+    def test_legacy_mac_carriage_returns_guidance(self, tmp_path):
+        """Test that Polars and PyArrow raise helpful ValueError on legacy Mac
+        carriage returns (\\r), while DuckDB succeeds."""
+        mac_csv = tmp_path / "mac_legacy.csv"
+        mac_csv.write_text("id,name,age\r1,John,30\r2,Jane,25\r")
+
+        # Polars must raise ValueError with custom message
+        reader_polars = CSVReader(str(mac_csv), engine="polars")
+        try:
+            reader_polars.to_dataframe()
+            assert False, "Polars should have raised ValueError"
+        except ValueError as e:
+            assert "Polars engine does not support legacy Mac OS carriage return (\\r) newlines" in str(e)
+            assert "use engine='duckdb'" in str(e)
+
+        try:
+            reader_polars.get_sample()
+            assert False, "Polars should have raised ValueError on sample"
+        except ValueError as e:
+            assert "Polars engine does not support legacy Mac OS carriage return (\\r) newlines" in str(e)
+            assert "use engine='duckdb'" in str(e)
+
+        # PyArrow must raise ValueError with custom message
+        reader_pyarrow = CSVReader(str(mac_csv), engine="pyarrow")
+        try:
+            reader_pyarrow.to_dataframe()
+            assert False, "PyArrow should have raised ValueError"
+        except ValueError as e:
+            assert "PyArrow engine does not support legacy Mac OS carriage return (\\r) newlines" in str(e)
+            assert "use engine='duckdb'" in str(e)
+
+        try:
+            reader_pyarrow.get_sample()
+            assert False, "PyArrow should have raised ValueError on sample"
+        except ValueError as e:
+            assert "PyArrow engine does not support legacy Mac OS carriage return (\\r) newlines" in str(e)
+            assert "use engine='duckdb'" in str(e)
+
+        # DuckDB must succeed
+        reader_duckdb = CSVReader(mac_csv, engine="duckdb")
+        df = reader_duckdb.to_dataframe()
+        assert len(df) == 2
+        assert list(df.columns) == ["id", "name", "age"]
+
+    def test_ragged_rows_fail_loudly(self, tmp_path):
+        """Test that Polars, PyArrow, and DuckDB fail loudly on ragged rows."""
+        # Create CSV with an extra field in the second row
+        ragged_csv = tmp_path / "ragged.csv"
+        ragged_csv.write_text("id,name,age\n1,John,30\n2,Jane,25,extra_field\n")
+
+        for engine in ALL_ENGINES:
+            reader = CSVReader(str(ragged_csv), engine=engine)
+            try:
+                reader.to_dataframe()
+                assert False, f"Engine '{engine}' should have failed on ragged rows"
+            except Exception as e:
+                # Polars, PyArrow, and DuckDB must raise a parsing/execution error
+                assert isinstance(e, Exception)
+
+    def test_ragged_rows_lenient(self, tmp_path):
+        """Test that Polars, PyArrow, and DuckDB load ragged rows successfully with warnings when lenient=True."""
+        import warnings
+
+        ragged_csv = tmp_path / "ragged.csv"
+        ragged_csv.write_text("id,name,age\n1,John,30\n2,Jane,25,extra_field\n")
+
+        for engine in ALL_ENGINES:
+            reader = CSVReader(str(ragged_csv), engine=engine, lenient=True)
+
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                df = reader.to_dataframe()
+
+                # Check that a UserWarning about ragged rows was issued
+                assert len(w) >= 1
+                assert any("ragged rows" in str(warn.message) for warn in w)
+
+                # Check that it loaded successfully
+                assert isinstance(df, pl.DataFrame)
+                assert len(df) == 2
+                # The extra field should have been truncated
+                assert list(df.columns) == ["id", "name", "age"]
+                assert df.row(1) == ("2", "Jane", "25")
