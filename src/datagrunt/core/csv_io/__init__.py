@@ -8,6 +8,8 @@ from datagrunt.core.csv_io.csvcomponents import (
     CSVDialect,
     CSVRows,
     CSVStringSample,
+    _check_csv_ragged_and_warn,
+    _count_leading_comments,
 )
 from datagrunt.core.csv_io.engines import (
     CSVEngineProperties,
@@ -36,4 +38,6 @@ __all__ = [
     "CSVWriterPolarsEngine",
     "CSVWriterPyArrowEngine",
     "CSVEngineFactory",
+    "_count_leading_comments",
+    "_check_csv_ragged_and_warn",
 ]
