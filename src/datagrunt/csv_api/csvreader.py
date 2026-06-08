@@ -17,7 +17,7 @@ from datagrunt.core import CSVComponents, CSVEngineFactory, DuckDBQueries
 class CSVReader(CSVComponents):
     """Class to unify the interface for reading CSV files."""
 
-    def __init__(self, filepath, engine="polars"):
+    def __init__(self, filepath, engine="polars", lenient=False):
         """
         Initialize the CSV Reader class.
 
@@ -25,10 +25,12 @@ class CSVReader(CSVComponents):
             filepath (str or Path): Path to the file to read.
             engine (str, default 'polars'): Determines which reader engine
             class to instantiate.
+            lenient (bool): Whether to run in lenient mode.
         """
         filepath = Path(filepath)
+        self.lenient = lenient
         super().__init__(filepath)
-        self.db_table = DuckDBQueries(self.filepath).database_table_name
+        self.db_table = DuckDBQueries(self.filepath, lenient=self.lenient).database_table_name
         self.engine = engine.lower().replace(" ", "")
 
     def _return_empty_file_object(self, object):
@@ -37,7 +39,7 @@ class CSVReader(CSVComponents):
 
     def _create_reader(self):
         """Create a reader object."""
-        return CSVEngineFactory(self.filepath, self.engine).create_reader()
+        return CSVEngineFactory(self.filepath, self.engine, lenient=self.lenient).create_reader()
 
     def get_sample(self, normalize_columns=False):
         """Return a sample of the CSV file.
