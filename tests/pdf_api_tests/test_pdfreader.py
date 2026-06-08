@@ -188,3 +188,38 @@ class TestPDFReaderMultiprocessing:
         doc = reader.to_dicts()
         assert doc["document"]["total_pages"] == 1
         assert len(calls) == 0
+
+    def test_no_multiprocessing_when_single_page(self, sample_pdf, monkeypatch):
+        from concurrent.futures import ProcessPoolExecutor
+        calls = []
+        original_init = ProcessPoolExecutor.__init__
+
+        def mocked_init(self, *args, **kwargs):
+            calls.append(True)
+            original_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(ProcessPoolExecutor, "__init__", mocked_init)
+
+        # Run structured parsing with workers=2 on 1-page PDF; should NOT invoke ProcessPoolExecutor
+        reader = PDFReader(sample_pdf, engine="pdfium", workers=2, native=False)
+        doc = reader.to_dicts()
+        assert doc["document"]["total_pages"] == 1
+        assert len(calls) == 0
+
+    def test_multiprocessing_when_multi_page(self, multipage_pdf, monkeypatch):
+        from concurrent.futures import ProcessPoolExecutor
+        calls = []
+        original_init = ProcessPoolExecutor.__init__
+
+        def mocked_init(self, *args, **kwargs):
+            calls.append(True)
+            original_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(ProcessPoolExecutor, "__init__", mocked_init)
+
+        # Run structured parsing with workers=2 on 3-page PDF; should invoke ProcessPoolExecutor
+        reader = PDFReader(multipage_pdf, engine="pdfium", workers=2, native=False)
+        doc = reader.to_dicts()
+        assert doc["document"]["total_pages"] == 3
+        assert len(calls) > 0
+

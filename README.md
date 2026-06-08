@@ -214,7 +214,7 @@ on either engine.
 # Run with 8 processes to parse pages concurrently
 reader = PDFReader("report.pdf", workers=8)
 ```
-Because PDFium is not thread-safe within a single process, `datagrunt` uses a process pool (`ProcessPoolExecutor`) to bypass the Global Interpreter Lock (GIL) and run page-parsing concurrently, running **~3x faster** than PyMuPDF's thread pool.
+Because PDFium is not thread-safe within a single process, `datagrunt` uses a process pool (`ProcessPoolExecutor`) to bypass the Global Interpreter Lock (GIL) and run page-parsing concurrently for multi-page documents, running **~3x faster** than PyMuPDF's thread pool. For single-page documents, it automatically bypasses the process pool and executes sequentially to avoid process spawning overhead.
 
 #### Distributed Runtimes Fallback
 When running inside managed distributed environments (e.g. **Apache Spark**, **Apache Beam**, **Apache Flink**, or **Celery**), nested process spawning is restricted or causes container sandbox permission errors. `datagrunt` automatically detects these environments (by checking variables like `SPARK_ENV_LOADED`, `BEAM_WORKER_ID`, etc.) and falls back to sequential, parent-process execution to ensure robust, conflict-free operation.
