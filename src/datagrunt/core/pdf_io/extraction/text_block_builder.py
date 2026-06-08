@@ -1,6 +1,20 @@
 """Group raw text items into classified blocks (engine-agnostic)."""
 
+import re
 from datagrunt.core.pdf_io.extraction.shapes import BBox, TextBlock
+from datagrunt.core.pdf_io.extraction.layout_sorter import PageLayoutSorter, TextItemAdapter
+
+LIST_MARKER_REGEX = re.compile(
+    r'^('
+    r'[•\-\*]'            # Standard bullet points
+    r'|\d+(\.\d+)*\.?'    # Number hierarchies (e.g., 1., 12.5.1)
+    r'|[IVXLCDM]{2,}'     # Multi-character Roman numerals (e.g., II, III, IV)
+    r'|[IVXLCDM]\.'       # Single Roman numerals followed by dot (e.g., I.)
+    r'|[IVXLCDM]\s+[A-Z]' # Single Roman numeral list markers followed by capitalized word (e.g., I Build)
+    r'|[a-zA-Z]\.'        # Alphabetical list markers with dot (e.g., a., A.)
+    r'|[a-zA-Z]\)'        # Alphabetical list markers with parenthesis (e.g., a), A))
+    r')(\s|$)'
+)
 
 
 def classify_font_size(font_size: float, is_bold: bool, all_sizes: list) -> str:
@@ -32,13 +46,31 @@ class TextBlockBuilder:
         return max(set(values), key=values.count)
 
     def build(self, items: list) -> list:
-        """Return a list of classified ``TextBlock`` from raw ``TextItem`` list."""
+        """Return a list of classified ``TextBlock`` from raw ``TextItem`` list.
+        
+        Processes the items in reading order, identifying column layouts to prevent bleed-over.
+        """
         if not items:
             return []
-        lines = self._cluster_into_lines(items)
-        merged = self._merge_lines(lines)
+            
+        sorter = PageLayoutSorter(TextItemAdapter())
+        segments = sorter.partition(items)
+        all_blocks = []
         all_sizes = [it.size for it in items if it.text]
-        return self._finalize(merged, all_sizes)
+        
+        order = 0
+        for seg_items in segments:
+            if not seg_items:
+                continue
+            lines = self._cluster_into_lines(seg_items)
+            merged = self._merge_lines(lines)
+            blocks = self._finalize(merged, all_sizes)
+            for b in blocks:
+                b.reading_order = order
+                order += 1
+            all_blocks.extend(blocks)
+            
+        return all_blocks
 
     def _cluster_into_lines(self, items: list) -> list:
         """Group items whose ``y_top`` are within tolerance into line records."""
@@ -46,7 +78,8 @@ class TextBlockBuilder:
         for it in sorted(items, key=lambda i: (round(i.y_top, 0), i.x0)):
             placed = False
             for ln in lines:
-                if abs(ln["y"] - it.y_top) <= max(2.0, it.size * 0.4):
+                line_max_size = max(i.size for i in ln["items"])
+                if abs(ln["y"] - it.y_top) <= max(2.0, max(line_max_size, it.size) * 0.5):
                     ln["items"].append(it)
                     placed = True
                     break
@@ -83,6 +116,8 @@ class TextBlockBuilder:
 
     def _should_merge(self, prev: dict, ln: dict) -> bool:
         """Return True if ``ln`` continues the ``prev`` block."""
+        if LIST_MARKER_REGEX.match(ln["text"]):
+            return False
         gap = ln["y_top"] - prev["y_bot"]
         same_size = abs(ln["size"] - prev["size"]) < 0.6
         close = 0 <= gap <= max(prev["size"], 1.0) * 1.6
