@@ -4,6 +4,7 @@
 from functools import cached_property
 from pathlib import Path
 
+DEFAULT_ENCODING = "utf-8-sig"
 
 class FileExtensions:
     """Class for getting file extensions."""
@@ -136,11 +137,11 @@ class BlankFile:
         # Very low probability of being blank if file is 10MB or larger in size
         if filestats.size_in_mb >= self.FILE_SIZE_MB_FACTOR:
             return False
-        with open(self.filepath, "r") as f:
-            content = f.read().strip()
-            if not content:
-                return True
-        return False
+        with open(self.filepath, "r", encoding=DEFAULT_ENCODING, errors="ignore") as f:
+            for line in f:
+                if line.strip():
+                    return False
+        return True
 
 
 class EmptyFile:
@@ -163,7 +164,7 @@ class EmptyFile:
 class FileProperties:
     """Base class for file objects."""
 
-    DEFAULT_ENCODING = "utf-8"
+    DEFAULT_ENCODING = DEFAULT_ENCODING
 
     def __init__(self, filepath):
         """

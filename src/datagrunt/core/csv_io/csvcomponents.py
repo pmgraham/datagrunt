@@ -14,19 +14,89 @@ import polars as pl
 from datagrunt.core.file_io import FileProperties
 
 
+def _count_leading_comments(filepath):
+    count = 0
+    with open(filepath, "r", encoding=FileProperties(filepath).DEFAULT_ENCODING) as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped.startswith("#") or not stripped:
+                count += 1
+            else:
+                break
+    return count
+
+
+def _is_legacy_mac_newlines(filepath):
+    """Check if the file uses legacy Mac OS carriage returns (\\r) as line endings."""
+    try:
+        with open(filepath, "rb") as f:
+            chunk = f.read(4096)
+        return b"\r" in chunk and b"\n" not in chunk
+    except Exception:
+        return False
+
+
+def _check_csv_ragged_and_warn(filepath, delimiter):
+    """Check if the CSV is ragged and issue a warning if lenient loading is enabled."""
+    import csv
+    import warnings
+
+    try:
+        is_legacy_mac = _is_legacy_mac_newlines(filepath)
+        newline_param = None if is_legacy_mac else ""
+        encoding = FileProperties(filepath).DEFAULT_ENCODING
+        with open(filepath, "r", encoding=encoding, newline=newline_param, errors="ignore") as f:
+            reader = csv.reader(f, delimiter=delimiter)
+            header = None
+            for row in reader:
+                if row and not row[0].startswith("#"):
+                    header = row
+                    break
+            if not header:
+                return False
+
+            expected_cols = len(header)
+            row_count = 0
+            for row in reader:
+                if not row or row[0].startswith("#"):
+                    continue
+                row_count += 1
+                if len(row) != expected_cols:
+                    warnings.warn(
+                        f"CSV file contains ragged rows. Row {row_count} has {len(row)} columns, "
+                        f"expected {expected_cols}. Some fields will be truncated or padded with nulls.",
+                        UserWarning,
+                    )
+                    return True
+                if row_count >= 10000:
+                    break
+    except Exception:
+        pass
+    return False
+
+
 class CSVStringSample:
     """Base class for creating a string sample of a CSV file."""
 
     SAMPLE_ROWS = 2
     SAMPLE_ROWS_BY_QUALITY = 50_000
 
-    def __init__(self, filepath):
+    def __init__(self, filepath, delimiter=None):
         """Initialize the CSVString object.
 
         Args:
             filepath (str or Path): The path to the CSV file.
+            delimiter (str, optional): The delimiter of the CSV file.
         """
         self.filepath = Path(filepath)
+        self._delimiter = delimiter
+
+    @cached_property
+    def delimiter(self):
+        """Get the delimiter."""
+        if self._delimiter is not None:
+            return self._delimiter
+        return CSVDelimiter(self.filepath).delimiter
 
     @cached_property
     def csv_string_sample(self):
@@ -36,7 +106,21 @@ class CSVStringSample:
         Returns:
             str: The CSV string representation of the DataFrame.
         """
-        df = pl.read_csv(self.filepath, separator=CSVDelimiter(self.filepath).delimiter, n_rows=self.SAMPLE_ROWS)
+        if _is_legacy_mac_newlines(self.filepath):
+            try:
+                lines = []
+                encoding = FileProperties(self.filepath).DEFAULT_ENCODING
+                with open(self.filepath, "r", encoding=encoding, newline=None) as f:
+                    for line in f:
+                        stripped = line.strip()
+                        if not stripped.startswith("#") and stripped:
+                            lines.append(line)
+                            if len(lines) >= self.SAMPLE_ROWS + 1:
+                                break
+                return "".join(lines)
+            except Exception:
+                pass
+        df = pl.read_csv(self.filepath, separator=self.delimiter, n_rows=self.SAMPLE_ROWS)
         return df.write_csv(file=None)
 
     @cached_property
@@ -48,9 +132,11 @@ class CSVStringSample:
         Returns:
             str: The CSV string representation of the DataFrame.
         """
+        if _is_legacy_mac_newlines(self.filepath):
+            return self.csv_string_sample
         df = pl.read_csv(
             self.filepath,
-            separator=CSVDelimiter(self.filepath).delimiter,
+            separator=self.delimiter,
             n_rows=self.SAMPLE_ROWS_BY_QUALITY,
         )
         df = df.with_columns(pl.sum_horizontal(pl.all().is_null()).alias("null_count"))
@@ -66,15 +152,19 @@ class CSVDelimiter:
     DEFAULT_DELIMITER = ","
     DEFAULT_TAB_DELIMITER = "\t"
 
-    def __init__(self, filepath):
+    def __init__(self, filepath, first_row=None):
         """Initialize the CSVDelimiter class.
 
         Args:
             filepath (str or Path): The path to the CSV file.
+            first_row (str, optional): The first row of the CSV file.
         """
         filepath = Path(filepath)
         self.file_properties = FileProperties(filepath)
-        self.first_row = CSVRows(filepath).first_row
+        if first_row is not None:
+            self.first_row = first_row
+        else:
+            self.first_row = CSVRows(filepath).first_row
         self.delimiter = self.infer_csv_file_delimiter()
         self.delimiter_byte_string = self.delimiter.encode()
 
@@ -99,10 +189,10 @@ class CSVDelimiter:
         """
         delimiter_candidates = self._get_most_common_non_alpha_numeric_character_from_string()
 
-        if self.file_properties.is_empty or self.file_properties.is_blank:
-            delimiter = self.DEFAULT_DELIMITER
-        elif self.file_properties.is_tsv:
+        if self.file_properties.is_tsv:
             delimiter = self.DEFAULT_TAB_DELIMITER
+        elif self.file_properties.is_empty or self.file_properties.is_blank:
+            delimiter = self.DEFAULT_DELIMITER
         elif len(delimiter_candidates) == 0:
             delimiter = " "
         else:
@@ -116,13 +206,19 @@ class CSVDialect:
     CSV_SNIFF_SAMPLE_ROWS = 5
     QUOTING_MAP = {0: "no quoting", 1: "quote all", 2: "quote minimal", 3: "quote non-numeric"}
 
-    def __init__(self, filepath):
+    def __init__(self, filepath, delimiter=None, is_empty=None, is_blank=None):
         """Initialize the CSVDialect object.
 
         Args:
             filepath (str or Path): The path to the CSV file.
+            delimiter (str, optional): The delimiter of the CSV file.
+            is_empty (bool, optional): Whether the file is empty.
+            is_blank (bool, optional): Whether the file is blank.
         """
         self.filepath = Path(filepath)
+        self._delimiter = delimiter
+        self._is_empty = is_empty
+        self._is_blank = is_blank
         self.dialect = self._get_csv_dialect()
 
     def _get_csv_dialect(self):
@@ -131,11 +227,27 @@ class CSVDialect:
         Returns:
             csv.Dialect: The CSV dialect inferred from the file.
         """
-        if FileProperties(self.filepath).is_empty or FileProperties(self.filepath).is_blank:
+        is_empty = self._is_empty if self._is_empty is not None else FileProperties(self.filepath).is_empty
+        is_blank = self._is_blank if self._is_blank is not None else FileProperties(self.filepath).is_blank
+        if is_empty or is_blank:
             return None
         with open(self.filepath, "r", encoding=FileProperties(self.filepath).DEFAULT_ENCODING) as csvfile:
-            dialect = csv.Sniffer().sniff(csvfile.read(self.CSV_SNIFF_SAMPLE_ROWS))  # noqa: E501
-            csvfile.seek(0)  # Reset file pointer to the beginning
+            # Read exactly CSV_SNIFF_SAMPLE_ROWS lines to avoid diluting sniff results
+            lines = []
+            for line in csvfile:
+                if line.strip().startswith("#"):
+                    continue
+                lines.append(line)
+                if len(lines) >= self.CSV_SNIFF_SAMPLE_ROWS:
+                    break
+            sample = "".join(lines)
+        try:
+            if self._delimiter:
+                dialect = csv.Sniffer().sniff(sample, delimiters=self._delimiter)
+            else:
+                dialect = csv.Sniffer().sniff(sample)
+        except csv.Error:
+            dialect = None
         return dialect
 
     @cached_property
@@ -183,7 +295,16 @@ class CSVRows:
             filepath (str or Path): The path to the CSV file.
         """
         self.filepath = Path(filepath)
-        self.first_row = self._get_first_row_from_file()
+
+    @cached_property
+    def first_row(self):
+        """Reads and returns the first line of a file.
+
+        Returns:
+            The first line of the file, stripped of leading/trailing
+            whitespace, or None if the file is empty.
+        """
+        return self._get_first_row_from_file()
 
     def _get_first_row_from_file(self):
         """Reads and returns the first line of a file.
@@ -193,14 +314,22 @@ class CSVRows:
             whitespace, or None if the file is empty.
         """
         with open(self.filepath, "r", encoding=FileProperties(self.filepath).DEFAULT_ENCODING) as csv_file:  # noqa: E501
-            first_line = csv_file.readline().strip()
-        return first_line
+            for line in csv_file:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    return stripped
+        return ""
 
     @cached_property
     def row_count_with_header(self):
         """Return the number of lines in the CSV file including the header."""
-        with open(self.filepath, "rb") as csv_file:
-            return sum(1 for _ in csv_file)
+        count = 0
+        with open(self.filepath, "r", encoding=FileProperties(self.filepath).DEFAULT_ENCODING) as csv_file:
+            for line in csv_file:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    count += 1
+        return count
 
     @property
     def row_count_without_header(self):
@@ -211,25 +340,52 @@ class CSVRows:
 class CSVColumns:
     """Class for parsing CSV columns."""
 
-    def __init__(self, filepath):
+    def __init__(self, filepath, delimiter=None):
         """Initialize the CSVColumns class.
 
         Args:
             filepath (str or Path): The path to the CSV file.
+            delimiter (str, optional): The delimiter of the CSV file.
         """
         self.filepath = Path(filepath)
-        self.columns = self._get_columns()
+        self._delimiter = delimiter
+
+    @cached_property
+    def delimiter(self):
+        """Get the delimiter."""
+        if self._delimiter is not None:
+            return self._delimiter
+        return CSVDelimiter(self.filepath).delimiter
+
+    @cached_property
+    def columns(self):
+        """Return the columns."""
+        return self._get_columns()
 
     def _get_columns(self):
         """Return the columns."""
         if FileProperties(self.filepath).is_empty or FileProperties(self.filepath).is_blank:
             return []
+        if _is_legacy_mac_newlines(self.filepath):
+            try:
+                encoding = FileProperties(self.filepath).DEFAULT_ENCODING
+                with open(self.filepath, "r", encoding=encoding, newline=None) as f:
+                    for line in f:
+                        stripped = line.strip()
+                        if not stripped.startswith("#") and stripped:
+                            import csv
+
+                            reader = csv.reader([line], delimiter=self.delimiter)
+                            return next(reader)
+            except Exception:
+                pass
         df = pl.read_csv(
             self.filepath,
-            separator=CSVDelimiter(self.filepath).delimiter,
+            separator=self.delimiter,
             truncate_ragged_lines=True,
             infer_schema=False,
             n_rows=5,
+            skip_rows=_count_leading_comments(self.filepath),
         )
         return df.columns
 
@@ -255,14 +411,27 @@ class CSVColumnNameNormalizer:
     SPECIAL_CHARS_PATTERN = re.compile(r"[^a-z0-9]+")
     MULTI_UNDERSCORE_PATTERN = re.compile(r"_+")
 
-    def __init__(self, filepath):
+    def __init__(self, filepath, columns=None):
         """Initialize the CSVColumnNameNormalizer with a filepath.
 
         Args:
             filepath (str or Path): The path to the CSV file.
+            columns (list, optional): Pre-extracted column names.
         """
         self.filepath = Path(filepath)
-        self.columns_normalized = self._normalize_column_names(CSVColumns(self.filepath).columns)
+        self._columns = columns
+
+    @cached_property
+    def columns_list(self):
+        """Get the original columns list."""
+        if self._columns is not None:
+            return self._columns
+        return CSVColumns(self.filepath).columns
+
+    @cached_property
+    def columns_normalized(self):
+        """Get the normalized columns list."""
+        return self._normalize_column_names(self.columns_list)
 
     def _normalize_single_column_name(self, column_name):
         """
@@ -292,7 +461,7 @@ class CSVColumnNameNormalizer:
         Make unique column names by appending a number to duplicate names.
 
         Args:
-            columns (list): List of column names to make unique
+            columns_list (list): List of column names to make unique
 
         Returns:
             list: List of unique column names
@@ -340,7 +509,7 @@ class CSVColumnNameNormalizer:
         """
         Return the mapping of original column names to normalized column names.
         """
-        return dict(OrderedDict(zip(CSVColumns(self.filepath).columns, self.columns_normalized)))
+        return dict(OrderedDict(zip(self.columns_list, self.columns_normalized)))
 
 
 class CSVComponents(FileProperties):
@@ -353,14 +522,50 @@ class CSVComponents(FileProperties):
             filepath (str or Path): Path to the CSV file.
         """
         super().__init__(filepath)  # Parent class handles Path conversion
-        # Use self.filepath (now a Path object) for all component instantiation
-        self._delimiter = CSVDelimiter(self.filepath)
-        self._dialect = CSVDialect(self.filepath)
-        self._rows = CSVRows(self.filepath)
-        self._columns = CSVColumns(self.filepath)
-        self._normalizer = CSVColumnNameNormalizer(self.filepath)
-        self._sample = CSVStringSample(self.filepath)
-        self.delimiter = self._delimiter.delimiter
+
+    @cached_property
+    def _rows(self):
+        return CSVRows(self.filepath)
+
+    @cached_property
+    def first_row(self):
+        """Return the first row of the CSV file."""
+        return self._rows.first_row
+
+    @cached_property
+    def _delimiter(self):
+        return CSVDelimiter(self.filepath, first_row=self.first_row)
+
+    @property
+    def delimiter(self):
+        """Return the delimiter used in the CSV file."""
+        return self._delimiter.delimiter
+
+    @cached_property
+    def _dialect(self):
+        return CSVDialect(
+            self.filepath,
+            delimiter=self.delimiter,
+            is_empty=self.is_empty,
+            is_blank=self.is_blank,
+        )
+
+    @cached_property
+    def _columns(self):
+        return CSVColumns(self.filepath, delimiter=self.delimiter)
+
+    @cached_property
+    def columns(self):
+        """Return the columns of the CSV file."""
+        return self._columns.columns
+
+    @cached_property
+    def _normalizer(self):
+        return CSVColumnNameNormalizer(self.filepath, columns=self.columns)
+
+    @cached_property
+    def _sample(self):
+        return CSVStringSample(self.filepath, delimiter=self.delimiter)
 
     @cached_property
     def quotechar(self):
@@ -405,11 +610,6 @@ class CSVComponents(FileProperties):
         Return the number of rows in the CSV file excluding the header row.
         """
         return self._rows.row_count_without_header
-
-    @cached_property
-    def columns(self):
-        """Return the columns of the CSV file."""
-        return self._columns.columns
 
     @cached_property
     def columns_string(self):
