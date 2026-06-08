@@ -32,21 +32,27 @@ class CSVEngineFactory:
         "pyarrow": CSVWriterPyArrowEngine,
     }
 
-    def __init__(self, filepath, engine):
+    def __init__(self, filepath, engine, lenient=False):
         """
         Initialize the Engine Factory class.
 
         Args:
             filepath (str or Path): Path to the file to read.
             engine (str): type of engine to create by the factory.
+            lenient (bool): Whether to run in lenient mode.
         """
         self.filepath = Path(filepath)
         self.engine = engine.lower().replace(" ", "")
-        self.db_table = DuckDBQueries(self.filepath).database_table_name
+        self.lenient = lenient
         if not self.filepath.exists():
             raise FileNotFoundError
         if self.engine not in CSVEngineProperties.valid_engines:
             raise ValueError(CSVEngineProperties.value_error_message.format(engine=self.engine))
+
+    @property
+    def db_table(self):
+        """Return the database table name."""
+        return DuckDBQueries(self.filepath, lenient=self.lenient).database_table_name
 
     def create_reader(self):
         """Create a reader engine instance.
@@ -60,7 +66,7 @@ class CSVEngineFactory:
         """
         engine_class = self.READER_ENGINES.get(self.engine)
         if engine_class:
-            return engine_class(self.filepath)
+            return engine_class(self.filepath, lenient=self.lenient)
         else:
             raise ValueError(f"Unsupported reader engine: {self.engine}")
 
@@ -76,6 +82,6 @@ class CSVEngineFactory:
         """
         engine_class = self.WRITER_ENGINES.get(self.engine)
         if engine_class:
-            return engine_class(self.filepath)
+            return engine_class(self.filepath, lenient=self.lenient)
         else:
             raise ValueError(f"Unsupported reader engine: {self.engine}")
