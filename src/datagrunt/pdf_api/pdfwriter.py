@@ -1,10 +1,13 @@
 """Module for writing parsed PDF output (JSON + image files)."""
 
 # standard library
+import json
 from pathlib import Path
 
 # local libraries
 from datagrunt.core import PDFComponents, PDFEngineFactory
+from datagrunt.core.pdf_io import pdfcomponents
+from datagrunt.core.pdf_io.extraction import PdfiumNativeReader
 
 
 class PDFWriter(PDFComponents):
@@ -14,7 +17,7 @@ class PDFWriter(PDFComponents):
         """Initialize the PDF Writer class.
 
         Args:
-            filepath (str or Path): Path to the PDF file to parse.
+            filepath (str, Path, or dict): Path to the PDF/JSON file to parse, or parsed document dict.
             engine (str, default 'pdfium'): Parsing engine to instantiate.
                 One of 'pdfium' (default -- permissive license; emits the unified
                 element schema by default, or the lean native schema when
@@ -26,7 +29,8 @@ class PDFWriter(PDFComponents):
                 detection) instead of the default unified element schema. Ignored
                 by the pymupdf engine.
         """
-        filepath = Path(filepath)
+        if not isinstance(filepath, dict):
+            filepath = Path(filepath)
         super().__init__(filepath)
         self.engine = engine.lower().replace(" ", "")
         self.workers = workers
@@ -51,6 +55,18 @@ class PDFWriter(PDFComponents):
         Returns:
             str: The path of the written JSON file.
         """
+        if self._parsed_dict is not None:
+            filename = export_filename if export_filename else "output.json"
+            document = self._parsed_dict
+            if image_output_dir and dedupe_images:
+                is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
+                if is_structured:
+                    pdfcomponents.ParsedDocument(document).dedupe_images()
+                else:
+                    PdfiumNativeReader.dedupe_images(document)
+            with open(filename, "w") as f:
+                json.dump(document, f, indent=2)
+            return filename
         return self._create_writer().write_json(export_filename, image_output_dir, dedupe_images, drop_layout_tables)
 
     def write_json_newline_delimited(
@@ -70,6 +86,25 @@ class PDFWriter(PDFComponents):
         Returns:
             str: The path of the written JSONL file.
         """
+        if self._parsed_dict is not None:
+            filename = export_filename if export_filename else "output.jsonl"
+            document = self._parsed_dict
+            if image_output_dir and dedupe_images:
+                is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
+                if is_structured:
+                    pdfcomponents.ParsedDocument(document).dedupe_images()
+                else:
+                    PdfiumNativeReader.dedupe_images(document)
+            
+            is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
+            if is_structured:
+                records = pdfcomponents.ParsedDocument(document).flatten()
+            else:
+                records = PdfiumNativeReader.flatten(document)
+            with open(filename, "w") as f:
+                for record in records:
+                    f.write(json.dumps(record) + "\n")
+            return filename
         return self._create_writer().write_json_newline_delimited(
             export_filename, image_output_dir, dedupe_images, drop_layout_tables
         )
@@ -91,6 +126,24 @@ class PDFWriter(PDFComponents):
         Returns:
             str: The path of the written Markdown file.
         """
+        if self._parsed_dict is not None:
+            filename = export_filename if export_filename else "output.md"
+            document = self._parsed_dict
+            if image_output_dir and dedupe_images:
+                is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
+                if is_structured:
+                    pdfcomponents.ParsedDocument(document).dedupe_images()
+                else:
+                    PdfiumNativeReader.dedupe_images(document)
+            
+            is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
+            if is_structured:
+                markdown_text = pdfcomponents.ParsedDocument(document).to_markdown(export_filename=filename)
+            else:
+                markdown_text = PdfiumNativeReader.to_markdown(document)
+            with open(filename, "w") as f:
+                f.write(markdown_text)
+            return filename
         return self._create_writer().write_markdown(
             export_filename, image_output_dir, dedupe_images, drop_layout_tables
         )
@@ -107,4 +160,28 @@ class PDFWriter(PDFComponents):
         Returns:
             list: Paths of the written image files.
         """
+        if self._parsed_dict is not None:
+            document = self._parsed_dict
+            is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
+            if dedupe:
+                if is_structured:
+                    pdfcomponents.ParsedDocument(document).dedupe_images()
+                else:
+                    PdfiumNativeReader.dedupe_images(document)
+            paths = []
+            seen = set()
+            for page in document.get("document", {}).get("pages", []):
+                if is_structured:
+                    candidates = [
+                        (el.get("metadata") or {}).get("file_path")
+                        for el in page.get("elements", [])
+                        if el.get("type") == "image"
+                    ]
+                else:
+                    candidates = [img.get("file") for img in page.get("images", [])]
+                for fp in candidates:
+                    if fp and fp not in seen:
+                        seen.add(fp)
+                        paths.append(fp)
+            return paths
         return self._create_writer().extract_images(output_dir, dedupe)
