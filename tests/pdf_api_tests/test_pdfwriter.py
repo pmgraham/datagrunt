@@ -2,6 +2,7 @@
 
 import json
 import os
+import pytest
 
 from datagrunt.pdf_api.pdfwriter import PDFWriter
 
@@ -143,3 +144,81 @@ class TestPDFWriter:
         with open(path) as f:
             content = f.read()
         assert len(content) > 0
+
+
+class TestPDFWriterJsonAndDictInputs:
+    """Tests for initializing PDFWriter with JSON files or dictionaries."""
+
+    @pytest.fixture
+    def dummy_structured_dict(self):
+        return {
+            "document": {
+                "source": "dummy.pdf",
+                "total_pages": 1,
+                "pages": [
+                    {
+                        "page_number": 1,
+                        "width": 100.0,
+                        "height": 100.0,
+                        "elements": [
+                            {"id": "el1", "type": "header", "content": "Header Text", "position": {"x": 10, "y": 10, "w": 80, "h": 10}},
+                            {"id": "el2", "type": "body_text", "content": "Hello body", "position": {"x": 10, "y": 30, "w": 80, "h": 10}},
+                            {"id": "el3", "type": "image", "content": None, "position": {"x": 10, "y": 50, "w": 80, "h": 10}, "metadata": {"file_path": "/dummy/img.png"}},
+                        ]
+                    }
+                ]
+            }
+        }
+
+    def test_writer_with_dict(self, dummy_structured_dict, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        writer = PDFWriter(dummy_structured_dict)
+        assert writer._parsed_dict == dummy_structured_dict
+        assert writer.total_pages == 1
+
+        # Test write_json
+        jpath = writer.write_json("test_out.json")
+        assert os.path.exists(jpath)
+        with open(jpath) as f:
+            data = json.load(f)
+        assert data["document"]["source"] == "dummy.pdf"
+
+        # Test write_json_newline_delimited
+        jlpath = writer.write_json_newline_delimited("test_out.jsonl")
+        assert os.path.exists(jlpath)
+        with open(jlpath) as f:
+            lines = f.readlines()
+        assert len(lines) == 3
+
+        # Test write_markdown
+        mdpath = writer.write_markdown("test_out.md")
+        assert os.path.exists(mdpath)
+        with open(mdpath) as f:
+            content = f.read()
+        assert "# Header Text" in content
+        assert "Hello body" in content
+        assert "![img.png]" in content
+        assert "dummy/img.png" in content
+
+        # Test extract_images
+        img_paths = writer.extract_images()
+        assert img_paths == ["/dummy/img.png"]
+
+    def test_writer_with_json_file(self, tmp_path, dummy_structured_dict, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        json_file = tmp_path / "doc.json"
+        with open(json_file, "w") as f:
+            json.dump(dummy_structured_dict, f)
+
+        writer = PDFWriter(str(json_file))
+        assert writer._parsed_dict == dummy_structured_dict
+        assert writer.total_pages == 1
+
+        # Test write_markdown
+        mdpath = writer.write_markdown("test_out_json.md")
+        assert os.path.exists(mdpath)
+        with open(mdpath) as f:
+            content = f.read()
+        assert "# Header Text" in content
+        assert "Hello body" in content
+

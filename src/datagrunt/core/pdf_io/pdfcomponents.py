@@ -286,12 +286,71 @@ class PDFComponents(FileProperties):
         """Initialize the PDFComponents object.
 
         Args:
-            filepath (str or Path): Path to the PDF file.
+            filepath (str, Path, or dict): Path to the PDF/JSON file, or parsed document dict.
         """
-        super().__init__(filepath)  # Parent class handles Path conversion
+        self._parsed_dict = None
+        if isinstance(filepath, dict):
+            self._parsed_dict = filepath
+            # Setup dummy FileProperties attributes
+            self.filepath = Path("in_memory.json")
+            self.filename = "in_memory.json"
+            self.extension = ".json"
+            self.extension_string = "json"
+            self.size_in_bytes = 0
+            self.size_in_kb = 0.0
+            self.size_in_mb = 0.0
+            self.size_in_gb = 0.0
+            self.size_in_tb = 0.0
+            self.is_structured = True
+            self.is_semi_structured = True
+            self.is_unstructured = False
+            self.is_standard = True
+            self.is_proprietary = False
+            self.is_csv = False
+            self.is_pdf = False
+            self.is_excel = False
+            self.is_apache = False
+            self.is_empty = False
+            self.is_blank = False
+            self.is_large = False
+            self.is_tabular = False
+            self.is_tsv = False
+        else:
+            filepath_path = Path(filepath)
+            if filepath_path.suffix.lower() == ".json":
+                with open(filepath_path, "r", encoding="utf-8") as f:
+                    self._parsed_dict = json.load(f)
+                self.filepath = filepath_path
+                self.filename = filepath_path.name
+                self.extension = filepath_path.suffix
+                self.extension_string = self.extension.replace(".", "")
+                self.size_in_bytes = filepath_path.stat().st_size
+                self.size_in_kb = round(self.size_in_bytes / 1000.0, 5)
+                self.size_in_mb = round(self.size_in_kb / 1000.0, 5)
+                self.size_in_gb = round(self.size_in_mb / 1000.0, 5)
+                self.size_in_tb = round(self.size_in_gb / 1000.0, 5)
+                self.is_structured = True
+                self.is_semi_structured = True
+                self.is_unstructured = False
+                self.is_standard = True
+                self.is_proprietary = False
+                self.is_csv = False
+                self.is_pdf = False
+                self.is_excel = False
+                self.is_apache = False
+                self.is_empty = self.size_in_bytes == 0
+                self.is_blank = self.size_in_bytes <= 100
+                self.is_large = False
+                self.is_tabular = False
+                self.is_tsv = False
+            else:
+                super().__init__(filepath_path)
 
     @cached_property
     def total_pages(self):
-        """Return the total number of pages in the PDF."""
+        """Return the total number of pages in the PDF/JSON."""
+        if self._parsed_dict is not None:
+            pages = self._parsed_dict.get("document", {}).get("pages", [])
+            return len(pages)
         with PdfiumDocument(self.filepath) as d:
             return len(d)
