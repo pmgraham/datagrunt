@@ -223,3 +223,68 @@ class TestPDFReaderMultiprocessing:
         assert doc["document"]["total_pages"] == 3
         assert len(calls) > 0
 
+
+class TestPDFReaderJsonAndDictInputs:
+    """Tests for initializing PDFReader with JSON files or dictionaries."""
+
+    @pytest.fixture
+    def dummy_structured_dict(self):
+        return {
+            "document": {
+                "source": "dummy.pdf",
+                "total_pages": 1,
+                "pages": [
+                    {
+                        "page_number": 1,
+                        "width": 100.0,
+                        "height": 100.0,
+                        "elements": [
+                            {"id": "el1", "type": "header", "content": "Header Text", "position": {"x": 10, "y": 10, "w": 80, "h": 10}},
+                            {"id": "el2", "type": "body_text", "content": "Hello body", "position": {"x": 10, "y": 30, "w": 80, "h": 10}},
+                        ]
+                    }
+                ]
+            }
+        }
+
+    def test_reader_with_dict(self, dummy_structured_dict):
+        reader = PDFReader(dummy_structured_dict)
+        assert reader._parsed_dict == dummy_structured_dict
+        assert reader.total_pages == 1
+        
+        # Test to_dicts
+        assert reader.to_dicts() == dummy_structured_dict
+        
+        # Test get_sample
+        sample = reader.get_sample()
+        assert sample["page_number"] == 1
+        assert "elements" in sample
+
+        # Test to_dataframe
+        df = reader.to_dataframe()
+        assert isinstance(df, pl.DataFrame)
+        assert df.height == 2
+        assert list(df["content"]) == ["Header Text", "Hello body"]
+
+        # Test to_arrow_table
+        table = reader.to_arrow_table()
+        assert isinstance(table, pa.Table)
+        assert table.num_rows == 2
+
+    def test_reader_with_json_file(self, tmp_path, dummy_structured_dict):
+        import json
+        json_file = tmp_path / "doc.json"
+        with open(json_file, "w") as f:
+            json.dump(dummy_structured_dict, f)
+
+        reader = PDFReader(str(json_file))
+        assert reader._parsed_dict == dummy_structured_dict
+        assert reader.total_pages == 1
+        assert reader.to_dicts() == dummy_structured_dict
+
+        # Test to_dataframe
+        df = reader.to_dataframe()
+        assert df.height == 2
+        assert list(df["content"]) == ["Header Text", "Hello body"]
+
+
