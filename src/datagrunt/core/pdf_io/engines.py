@@ -72,7 +72,7 @@ class PDFEngineProperties:
     """Base properties for PDF operations."""
 
     filepath: Path
-    default_workers: int = 4
+    default_workers: int = 1
     json_export_filename: str = "output.json"
     json_newline_export_filename: str = "output.jsonl"
     markdown_export_filename: str = "output.md"
@@ -84,7 +84,7 @@ class PDFEngineProperties:
 class PDFBaseReaderEngine(ABC):
     """Abstract base class defining the interface for PDF reader engines."""
 
-    def __init__(self, filepath, workers: int = 4):
+    def __init__(self, filepath, workers: int = 1):
         """Initialize the PDF reader engine.
 
         Args:
@@ -179,7 +179,7 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
     process.
     """
 
-    def __init__(self, filepath, workers: int = 4, structured: bool = False):
+    def __init__(self, filepath, workers: int = 1, structured: bool = False):
         super().__init__(filepath, workers=workers)
         self.structured = structured
 
@@ -304,7 +304,7 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
 class PDFBaseWriterEngine(ABC):
     """Abstract base class defining the interface for PDF writer engines."""
 
-    def __init__(self, filepath, workers: int = 4):
+    def __init__(self, filepath, workers: int = 1):
         """Initialize the PDF writer engine.
 
         Args:
@@ -431,7 +431,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
 class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
     """Write parsed PDFium output. Native schema by default; unified when structured."""
 
-    def __init__(self, filepath, workers: int = 4, structured: bool = False):
+    def __init__(self, filepath, workers: int = 1, structured: bool = False):
         super().__init__(filepath, workers=workers)
         self.structured = structured
 
