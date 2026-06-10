@@ -33,18 +33,12 @@ Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow
 
 ## Installation
 
-We recommend using [UV](https://docs.astral.sh/uv/). However, you may get started with Datagrunt in seconds using UV or pip.
+We recommend using [uv](https://docs.astral.sh/uv/) as the default package manager.
 
-Get started with UV:
+To install Datagrunt using `uv`:
 
 ```bash
 uv pip install datagrunt
-```
-
-Get started with pip:
-
-```bash
-pip install datagrunt
 ```
 
 > **PDF parsing** is an optional extra — install it with `uv pip install "datagrunt[pdf]"`. See [PDF parsing](#pdf-parsing) below for details and OCR setup.
@@ -153,8 +147,6 @@ PDF support is an optional extra:
 
 ```bash
 uv pip install "datagrunt[pdf]"
-# or
-pip install "datagrunt[pdf]"
 ```
 
 OCR of scanned pages additionally requires the **Tesseract** system binary
@@ -209,12 +201,20 @@ on either engine.
   both engines (requires the Tesseract binary; see above).
 
 ### Parallel Processing & Concurrency
-`PDFReader` supports parallel processing on multi-core systems via the `workers` parameter (default: `4`):
+By default, `PDFReader` and `PDFWriter` run sequentially (`workers=1`). You can enable parallel processing on multi-core systems by passing a `workers` count greater than `1`:
 ```python
-# Run with 8 processes to parse pages concurrently
-reader = PDFReader("report.pdf", workers=8)
+if __name__ == '__main__':
+    # Run with 8 processes to parse pages concurrently
+    reader = PDFReader("report.pdf", workers=8)
+    document = reader.to_dicts()
 ```
-Because PDFium is not thread-safe within a single process, `datagrunt` uses a process pool (`ProcessPoolExecutor`) to bypass the Global Interpreter Lock (GIL) and run page-parsing concurrently for multi-page documents, running **~3x faster** than PyMuPDF's thread pool. For single-page documents, it automatically bypasses the process pool and executes sequentially to avoid process spawning overhead.
+
+#### Why `if __name__ == '__main__':` is required
+Because PDFium is not thread-safe within a single process, `datagrunt` uses a process pool (`ProcessPoolExecutor` with the `spawn` start context on macOS and Windows) to parse pages concurrently.
+
+Under Python's `spawn` start context, child processes import the main module to initialize. If you call `PDFReader` or `PDFWriter` with `workers > 1` outside of a `if __name__ == '__main__':` block, the child processes will recursively spawn their own process pools, leading to a crash or infinite recursion loop.
+
+For single-page documents, `datagrunt` automatically bypasses the process pool and executes sequentially to avoid process spawning overhead.
 
 #### Distributed Runtimes Fallback
 When running inside managed distributed environments (e.g. **Apache Spark**, **Apache Beam**, **Apache Flink**, or **Celery**), nested process spawning is restricted or causes container sandbox permission errors. `datagrunt` automatically detects these environments (by checking variables like `SPARK_ENV_LOADED`, `BEAM_WORKER_ID`, etc.) and falls back to sequential, parent-process execution to ensure robust, conflict-free operation.
