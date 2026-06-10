@@ -16,7 +16,7 @@ from datagrunt.core.pdf_io.extraction import PdfiumNativeReader
 class PDFReader(PDFComponents):
     """Class to unify the interface for reading and parsing PDF files."""
 
-    def __init__(self, filepath, engine="pdfium", workers=4, native=False):
+    def __init__(self, filepath, engine="pdfium", workers=1, native=False):
         """Initialize the PDF Reader class.
 
         Args:
@@ -26,7 +26,7 @@ class PDFReader(PDFComponents):
                 element schema by default, or the lean native schema when
                 ``native=True``) or 'pymupdf' (unified element schema, tables +
                 OCR).
-            workers (int, default 4): Number of concurrent per-page workers.
+            workers (int, default 1): Number of concurrent per-page workers.
             native (bool, default False): pdfium only -- when True, emit the lean
                 native schema (text, positioned text objects, images; no table
                 detection) instead of the default unified element schema. Ignored
