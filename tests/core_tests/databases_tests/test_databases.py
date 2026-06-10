@@ -37,3 +37,27 @@ class TestDuckDBQueriesClose:
 
         queries.close()
         queries.close()  # second call must be a safe no-op
+
+
+def test_csv_quotes_after_sniffer_sample(tmp_path):
+    csv_file = tmp_path / "delayed_quotes.csv"
+    # 5 rows without quotes, 6th row has a quoted field with a comma
+    content = (
+        "col1,col2,col3\n"
+        "1,2,3\n"
+        "4,5,6\n"
+        "7,8,9\n"
+        "10,11,12\n"
+        '13,"hello, world",15\n'
+    )
+    csv_file.write_text(content)
+
+    # This should parse successfully without raising column count/parsing errors
+    queries = DuckDBQueries(str(csv_file))
+    queries.connection.execute(queries.import_csv_query())
+    res = queries.connection.execute(queries.select_from_duckdb_table()).fetchall()
+    assert len(res) == 5
+    # The 5th row's second column should be "hello, world"
+    assert res[4][1] == "hello, world"
+    queries.close()
+
