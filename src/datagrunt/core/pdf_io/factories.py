@@ -26,7 +26,7 @@ class PDFEngineFactory:
         "pdfium": PDFWriterPdfiumEngine,
     }
 
-    def __init__(self, filepath, engine, workers: int = 4, structured: bool = False):
+    def __init__(self, filepath, engine, workers: int = 1, structured: bool = False):
         """Initialize the PDF Engine Factory class.
 
         Args:
