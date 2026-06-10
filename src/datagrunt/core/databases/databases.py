@@ -13,6 +13,7 @@ import duckdb
 from datagrunt.core.csv_io import (
     CSVColumnNameNormalizer,
     CSVDelimiter,
+    CSVDialect,
     _check_csv_ragged_and_warn,
     _count_leading_comments,
 )
@@ -45,6 +46,14 @@ class DuckDBQueries:
     def delimiter(self):
         """Get the delimiter."""
         return CSVDelimiter(self.filepath).delimiter
+
+    @cached_property
+    def quotechar(self):
+        """Get the quote character."""
+        try:
+            return CSVDialect(self.filepath).quotechar
+        except Exception:
+            return '"'
 
     def close(self):
         """Close this instance's DuckDB connection.
@@ -113,6 +122,7 @@ class DuckDBQueries:
                                 delim='{self.delimiter}',
                                 header=true,
                                 columns={cols_param},
+                                quote='{self.quotechar.replace("'", "''")}',
                                 null_padding=true,
                                 all_varchar=True,
                                 auto_detect=false,
@@ -127,6 +137,7 @@ class DuckDBQueries:
                                 auto_detect=true,
                                 delim='{self.delimiter}',
                                 header=true,
+                                quote='{self.quotechar.replace("'", "''")}',
                                 null_padding=true,
                                 all_varchar=True,
                                 strict_mode=true,
@@ -153,6 +164,7 @@ class DuckDBQueries:
                                 delim='{self.delimiter}',
                                 header=true,
                                 columns={cols_param},
+                                quote='{self.quotechar.replace("'", "''")}',
                                 null_padding=true,
                                 all_varchar=True,
                                 auto_detect=false,
@@ -168,6 +180,7 @@ class DuckDBQueries:
                                 auto_detect=true,
                                 delim='{self.delimiter}',
                                 header=true,
+                                quote='{self.quotechar.replace("'", "''")}',
                                 null_padding=true,
                                 all_varchar=True,
                                 strict_mode=true,
