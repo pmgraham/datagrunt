@@ -145,8 +145,12 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
                 self.workers,
             )
         assembler = pdfcomponents.DocumentAssembler(self.filepath)
-        total_pages = self._total_pages()
-        document = assembler.parse_document(total_pages, image_output_dir)
+        # Count pages inside the held-open backend context so the count reuses
+        # the same pymupdf document handle as the parse — one open per parse
+        # (issue #102) with no pdfium dependency for the count (issue #95).
+        with assembler.backend:
+            total_pages = assembler.backend.page_count()
+            document = assembler.parse_document(total_pages, image_output_dir)
         if drop_layout_tables:
             pdfcomponents.ParsedDocument(document).drop_layout_tables()
         return document
