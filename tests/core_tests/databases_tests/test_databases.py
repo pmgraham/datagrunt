@@ -61,3 +61,35 @@ def test_csv_quotes_after_sniffer_sample(tmp_path):
     assert res[4][1] == "hello, world"
     queries.close()
 
+
+class TestCreateTableIdempotent:
+    """create_table imports each file once per connection (issue #104)."""
+
+    def test_repeated_create_table_imports_once(self, tmp_path, monkeypatch):
+        """Repeated create_table calls must import the CSV only once.
+
+        The table name is deterministic per file path, so once the table
+        exists on this instance's connection there is no need to re-run the
+        expensive CREATE OR REPLACE TABLE import. Subsequent calls reuse the
+        already-imported table.
+        """
+        csv = tmp_path / "data.csv"
+        csv.write_text("col1,col2\n1,A\n2,B\n")
+        queries = DuckDBQueries(str(csv))
+
+        import_calls = {"count": 0}
+        original_import_query = queries.import_csv_query
+
+        def counting_import_query():
+            import_calls["count"] += 1
+            return original_import_query()
+
+        monkeypatch.setattr(queries, "import_csv_query", counting_import_query)
+
+        first = queries.create_table().fetchall()
+        second = queries.create_table().fetchall()
+
+        assert import_calls["count"] == 1
+        assert first == second == [("1", "A"), ("2", "B")]
+        queries.close()
+
