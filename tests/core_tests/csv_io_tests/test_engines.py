@@ -418,6 +418,59 @@ class TestEngines:
         assert "phone" in df.columns
 
 
+class TestNormalizeCollidingColumnsAllEngines:
+    """``normalize_columns=True`` must behave identically across engines.
+
+    When two distinct headers normalize to the same name, every engine must
+    disambiguate them rather than crash or silently drop a column.
+    """
+
+    def test_colliding_normalized_names_all_engines(self, tmp_path):
+        """``Col A,col_a`` both normalize to ``col_a`` on every engine.
+
+        The DuckDB engine historically crashed here with a CatalogException
+        because it renamed columns sequentially; polars/pyarrow returned
+        ``['col_a', 'col_a_1']``. All three must now agree.
+        """
+        csv_file = tmp_path / "collide.csv"
+        csv_file.write_text("Col A,col_a\n1,2\n3,4\n")
+
+        results = {}
+        for engine in ALL_ENGINES:
+            reader = CSVEngineFactory(str(csv_file), engine).create_reader()
+            df = reader.to_dataframe(normalize_columns=True)
+            results[engine] = (df.columns, len(df))
+
+        for engine in ALL_ENGINES:
+            assert results[engine][0] == ["col_a", "col_a_1"], engine
+            assert results[engine][1] == 2, engine
+
+    def test_three_way_collision_yields_distinct_names_all_engines(self, tmp_path):
+        """``Col A,col a,col_a_1`` must produce 3 distinct names on every engine."""
+        csv_file = tmp_path / "collide3.csv"
+        csv_file.write_text("Col A,col a,col_a_1\n1,2,3\n")
+
+        for engine in ALL_ENGINES:
+            reader = CSVEngineFactory(str(csv_file), engine).create_reader()
+            df = reader.to_dataframe(normalize_columns=True)
+            assert len(df.columns) == 3, engine
+            assert len(set(df.columns)) == 3, engine
+
+    def test_empty_normalizing_header_is_valid_all_engines(self, tmp_path):
+        """A header that normalizes to empty must become a valid column name."""
+        # Three columns so the comma is unambiguously the inferred delimiter
+        # (a two-field "%,name" header ties %/comma and the sniffer would pick
+        # %). Both "%" and "()" normalize to empty and must get valid names.
+        csv_file = tmp_path / "empty_header.csv"
+        csv_file.write_text("%,(),name\n1,2,3\n")
+
+        for engine in ALL_ENGINES:
+            reader = CSVEngineFactory(str(csv_file), engine).create_reader()
+            df = reader.to_dataframe(normalize_columns=True)
+            assert len(df.columns) == 3, engine
+            assert all(col != "" for col in df.columns), engine
+
+
 class TestDuckDBSqlEscaping:
     """The DuckDB engine must escape interpolated literals and identifiers.
 
