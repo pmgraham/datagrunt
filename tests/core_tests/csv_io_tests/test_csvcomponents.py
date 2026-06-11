@@ -214,6 +214,26 @@ class TestCSVRows:
         rows = CSVRows(str(csv_file))
         assert rows.first_row == "Name,Age,City"
 
+    def test_row_count_with_quoted_embedded_newlines(self, tmp_path):
+        # A quoted field containing an embedded newline is one CSV record,
+        # not two physical lines. Row counts must match what the engines parse.
+        csv_file = tmp_path / "embedded_newlines.csv"
+        csv_file.write_text('name,notes\nalice,"line1\nline2"\nbob,"hello"\n')
+
+        rows = CSVRows(str(csv_file))
+        # header + 2 data records, despite 4 physical lines
+        assert rows.row_count_with_header == 3
+        assert rows.row_count_without_header == 2
+
+    def test_row_count_excludes_comment_and_blank_records(self, tmp_path):
+        csv_file = tmp_path / "comments_blanks.csv"
+        csv_file.write_text("# leading comment\n\nname,notes\nalice,1\n\nbob,2\n")
+
+        rows = CSVRows(str(csv_file))
+        # header + 2 data records; comment and blank lines excluded
+        assert rows.row_count_with_header == 3
+        assert rows.row_count_without_header == 2
+
 
 class TestCSVDialect:
     """Test suite for CSVDialect class."""
