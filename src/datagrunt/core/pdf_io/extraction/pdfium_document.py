@@ -85,16 +85,47 @@ class PdfiumPage:
         self._raw.FPDFTextObj_GetText(obj.raw, self._textpage.raw, ctypes.cast(buf, ctypes.POINTER(ctypes.c_ushort)), n)
         return buf.raw[: n * 2].decode("utf-16-le").rstrip("\x00").strip()
 
+    @staticmethod
+    def _display_edges(left, bottom, right, top, rotation, disp_w, disp_h):
+        """Map pdfium's unrotated bounds to display-space ``(x0, y_top, x1, y_bot)``.
+
+        ``obj.get_bounds()`` always reports bounds in UNROTATED page space, while
+        ``get_size()`` reports ROTATION-AWARE width/height. Flipping y with the
+        rotation-aware height alone yields negative / out-of-range coordinates on
+        /Rotate 90|270 pages, so apply the page rotation to land every edge within
+        ``[0, disp_w] x [0, disp_h]`` (top-left origin). Rotation 0 reduces to the
+        original ``x0=left, x1=right, y_top=disp_h-top, y_bot=disp_h-bottom``,
+        leaving unrotated pages byte-for-byte unchanged. Returns unrounded floats
+        so callers round exactly once.
+        """
+        r = rotation % 360
+        if r == 90:
+            return bottom, left, top, right
+        if r == 180:
+            return disp_w - right, bottom, disp_w - left, top
+        if r == 270:
+            return disp_w - top, disp_h - right, disp_w - bottom, disp_h - left
+        # rotation 0 (and any unexpected value) -- original behavior
+        return left, disp_h - top, right, disp_h - bottom
+
+    @classmethod
+    def _display_box(cls, left, bottom, right, top, rotation, disp_w, disp_h) -> BBox:
+        """Display-space ``BBox`` (rounded) for an image; see ``_display_edges``."""
+        x0, y_top, x1, y_bot = cls._display_edges(left, bottom, right, top, rotation, disp_w, disp_h)
+        return BBox(x=round(x0, 2), y=round(y_top, 2), w=round(x1 - x0, 2), h=round(y_bot - y_top, 2))
+
     def text_items(self):
         """Yield a ``TextItem`` per text object (own text, matrix-scaled size)."""
         from math import hypot
 
-        _, height = self.size()
+        disp_w, disp_h = self.size()
+        rotation = self.rotation()
         for obj in self._page.get_objects(filter=(self._raw.FPDF_PAGEOBJ_TEXT,), max_depth=15):
             text = self._object_text(obj)
             if not text:
                 continue
             left, bottom, right, top = obj.get_bounds()
+            x0, y_top, x1, y_bot = self._display_edges(left, bottom, right, top, rotation, disp_w, disp_h)
             font_name, weight = "", 400
             try:
                 font = obj.get_font()
@@ -110,10 +141,10 @@ class PdfiumPage:
             lower = font_name.lower()
             yield TextItem(
                 text=text,
-                x0=round(left, 2),
-                x1=round(right, 2),
-                y_top=round(height - top, 2),
-                y_bot=round(height - bottom, 2),
+                x0=round(x0, 2),
+                x1=round(x1, 2),
+                y_top=round(y_top, 2),
+                y_bot=round(y_bot, 2),
                 size=round(obj.get_font_size() * scale, 1),
                 font=font_name,
                 is_bold=weight >= 600,
@@ -140,14 +171,15 @@ class PdfiumPage:
 
     def image_items(self, output_dir: str = None, name_prefix: str = "page", page_number: int = 0):
         """Yield an ``ImageBlock`` per embedded image >= MIN_IMAGE_DIMENSION."""
-        _, height = self.size()
+        disp_w, disp_h = self.size()
+        rotation = self.rotation()
         idx = 0
         for obj in self._page.get_objects(filter=(self._raw.FPDF_PAGEOBJ_IMAGE,), max_depth=15):
             px_w, px_h = obj.get_px_size()
             if px_w < MIN_IMAGE_DIMENSION or px_h < MIN_IMAGE_DIMENSION:
                 continue
             left, bottom, right, top = obj.get_bounds()
-            bbox = BBox.from_pdfium_bounds(left, bottom, right, top, height)
+            bbox = self._display_box(left, bottom, right, top, rotation, disp_w, disp_h)
             file_path, fmt = None, "png"
             if output_dir:
                 written = self._extract_image(obj, Path(output_dir) / f"{name_prefix}_page{page_number}_img{idx}")
