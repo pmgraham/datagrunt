@@ -224,6 +224,44 @@ class TestPDFReaderMultiprocessing:
         assert len(calls) > 0
 
 
+class TestPDFReaderPyMuPDFSequential:
+    """PyMuPDF parses sequentially because MuPDF is not thread-safe.
+
+    Regression guard (not red-green): a thread-safety race is non-deterministic,
+    so we cannot reliably reproduce a crash. We instead pin that parsing a
+    multi-page PDF with the public API and workers > 1 still returns every page
+    in the correct order with the expected content -- the ``workers`` setting is
+    accepted (API compatibility) but does not enable threading.
+    """
+
+    @staticmethod
+    def _four_page_pdf(tmp_path):
+        import pymupdf
+
+        doc = pymupdf.open()
+        for n in range(1, 5):
+            page = doc.new_page(width=612, height=792)
+            page.insert_text((72, 72), f"Sequential Marker {n}", fontsize=18)
+            page.insert_text((72, 110), f"Body content for page {n}.", fontsize=11)
+        path = tmp_path / "seq.pdf"
+        doc.save(str(path))
+        doc.close()
+        return str(path)
+
+    def test_to_dicts_all_pages_present_and_ordered(self, tmp_path):
+        pdf = self._four_page_pdf(tmp_path)
+        doc = PDFReader(pdf, engine="pymupdf", workers=4).to_dicts()
+
+        pages = doc["document"]["pages"]
+        assert doc["document"]["total_pages"] == 4
+        assert [p["page_number"] for p in pages] == [1, 2, 3, 4]
+        for n, page in enumerate(pages, start=1):
+            text = " ".join(
+                e.get("content", "") for e in page["elements"] if e.get("type") in ("header", "body_text")
+            )
+            assert f"Sequential Marker {n}" in text
+
+
 class TestPDFReaderJsonAndDictInputs:
     """Tests for initializing PDFReader with JSON files or dictionaries."""
 
