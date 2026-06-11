@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+import math
+
+# Upper bound on the density-histogram size. A corrupt PDF can carry a single
+# absurd x-coordinate (e.g. 1e9); without a cap, ``[0] * int(max_x)`` would try
+# to allocate gigabytes and effectively hang or OOM the process. 100k bins is
+# far more than any real page width in PDF points, so clamping here never
+# affects legitimate layouts.
+MAX_HISTOGRAM_BINS = 100_000
+
 
 class LayoutAdapter:
     """Interface to abstract coordinate and weight access for different item types."""
@@ -72,6 +81,13 @@ class PageLayoutSorter:
         page_width = max_x - min_x
         page_height = max_y - min_y
 
+        # Corrupt PDFs can yield non-finite coordinates (NaN/inf). A NaN slips
+        # past the ``page_width < 100`` guard below (every comparison with NaN is
+        # False) and an inf overflows ``int()`` in the histogram, so screen them
+        # out here and skip column partitioning rather than crash downstream.
+        if not (math.isfinite(min_x) and math.isfinite(max_x)):
+            return [items]
+
         if page_width < 100 or len(items) < 3:
             return [items]
 
@@ -125,13 +141,24 @@ class PageLayoutSorter:
 
     def _build_density_histogram(self, text_items: list, page_width: float, max_x: float) -> list[int]:
         """Build a horizontal density histogram from text items."""
-        bins = [0] * int(max_x + 2)
+        # Cap the allocation so a single absurd x-coordinate cannot OOM/hang the
+        # process. ``bin_limit`` is the exclusive upper index, so every write
+        # below stays within ``[0, len(bins))``.
+        bin_count = min(int(max_x) + 2, MAX_HISTOGRAM_BINS)
+        bins = [0] * bin_count
+        bin_limit = bin_count
         for it in text_items:
             x0, _, x1, _ = self.adapter.get_bounds(it)
+            # The partition-level finiteness guard only sees the aggregate
+            # min/max (NaN loses every min()/max() comparison against a finite
+            # first operand), so a non-finite coordinate on a later item can
+            # still reach int() here. Skip such items individually.
+            if not (math.isfinite(x0) and math.isfinite(x1)):
+                continue
             if (x1 - x0) > page_width * 0.7:
                 continue
             start = max(0, int(x0))
-            end = min(int(max_x), int(x1))
+            end = min(int(max_x), int(x1), bin_limit)
             weight = self.adapter.get_weight(it)
             for x in range(start, end):
                 bins[x] += weight
@@ -139,8 +166,14 @@ class PageLayoutSorter:
 
     def _find_widest_gutter(self, bins: list[int], min_x: float, page_width: float) -> float | None:
         """Search for the widest vertical gutter in the middle region (25% - 75%)."""
-        search_start = int(min_x + page_width * 0.25)
-        search_end = int(min_x + page_width * 0.75)
+        # Clamp the search window to valid bin indices. Off-page/cropped content
+        # (negative min_x) or a capped histogram can push these bounds outside
+        # ``[0, len(bins))``; an unclamped negative index would wrap around via
+        # Python negative indexing (silently picking the wrong gutter) and an
+        # out-of-range index would raise IndexError. ``range`` over an empty
+        # window simply finds no gutter and returns None.
+        search_start = max(0, min(len(bins), int(min_x + page_width * 0.25)))
+        search_end = max(search_start, min(len(bins), int(min_x + page_width * 0.75)))
         best_gutter_start = None
         best_gutter_width = 0
         current_start = None
