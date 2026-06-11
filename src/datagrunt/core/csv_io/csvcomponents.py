@@ -16,7 +16,9 @@ from datagrunt.core.file_io import FileProperties
 
 def _count_leading_comments(filepath):
     count = 0
-    with open(filepath, "r", encoding=FileProperties(filepath).DEFAULT_ENCODING) as f:
+    # errors="ignore" so a non-UTF-8 byte in the probe window can't crash this
+    # lightweight metadata scan (it runs during reader/writer construction).
+    with open(filepath, "r", encoding=FileProperties(filepath).DEFAULT_ENCODING, errors="ignore") as f:
         for line in f:
             stripped = line.strip()
             if stripped.startswith("#") or not stripped:
@@ -110,7 +112,7 @@ class CSVStringSample:
             try:
                 lines = []
                 encoding = FileProperties(self.filepath).DEFAULT_ENCODING
-                with open(self.filepath, "r", encoding=encoding, newline=None) as f:
+                with open(self.filepath, "r", encoding=encoding, newline=None, errors="ignore") as f:
                     for line in f:
                         stripped = line.strip()
                         if not stripped.startswith("#") and stripped:
@@ -231,7 +233,8 @@ class CSVDialect:
         is_blank = self._is_blank if self._is_blank is not None else FileProperties(self.filepath).is_blank
         if is_empty or is_blank:
             return None
-        with open(self.filepath, "r", encoding=FileProperties(self.filepath).DEFAULT_ENCODING) as csvfile:
+        # errors="ignore" so non-UTF-8 bytes can't crash dialect sniffing.
+        with open(self.filepath, "r", encoding=FileProperties(self.filepath).DEFAULT_ENCODING, errors="ignore") as csvfile:  # noqa: E501
             # Read exactly CSV_SNIFF_SAMPLE_ROWS lines to avoid diluting sniff results
             lines = []
             for line in csvfile:
@@ -313,7 +316,8 @@ class CSVRows:
             The first line of the file, stripped of leading/trailing
             whitespace, or None if the file is empty.
         """
-        with open(self.filepath, "r", encoding=FileProperties(self.filepath).DEFAULT_ENCODING) as csv_file:  # noqa: E501
+        # errors="ignore" so a non-UTF-8 byte can't crash this first-row probe.
+        with open(self.filepath, "r", encoding=FileProperties(self.filepath).DEFAULT_ENCODING, errors="ignore") as csv_file:  # noqa: E501
             for line in csv_file:
                 stripped = line.strip()
                 if stripped and not stripped.startswith("#"):
@@ -324,7 +328,8 @@ class CSVRows:
     def row_count_with_header(self):
         """Return the number of lines in the CSV file including the header."""
         count = 0
-        with open(self.filepath, "r", encoding=FileProperties(self.filepath).DEFAULT_ENCODING) as csv_file:
+        # errors="ignore" so a non-UTF-8 byte can't crash this row-count probe.
+        with open(self.filepath, "r", encoding=FileProperties(self.filepath).DEFAULT_ENCODING, errors="ignore") as csv_file:  # noqa: E501
             for line in csv_file:
                 stripped = line.strip()
                 if stripped and not stripped.startswith("#"):
@@ -369,7 +374,7 @@ class CSVColumns:
         if _is_legacy_mac_newlines(self.filepath):
             try:
                 encoding = FileProperties(self.filepath).DEFAULT_ENCODING
-                with open(self.filepath, "r", encoding=encoding, newline=None) as f:
+                with open(self.filepath, "r", encoding=encoding, newline=None, errors="ignore") as f:
                     for line in f:
                         stripped = line.strip()
                         if not stripped.startswith("#") and stripped:
