@@ -65,12 +65,23 @@ class DocumentAssembler:
                         return True
                 return False
 
+            warnings = []
             if analysis.has_text_layer:
                 for block in self.backend.extract_text_blocks(page_index):
                     if not is_inside_table(block.bbox):
                         elements.append(self._text_element(block, gen_elem_id(), page_index))
             elif analysis.is_scanned:
-                for block in self.backend.ocr_page(page_index, dpi=dpi_for_page(analysis.width, analysis.height)):
+                try:
+                    ocr_blocks = self.backend.ocr_page(
+                        page_index, dpi=dpi_for_page(analysis.width, analysis.height)
+                    )
+                except Exception as exc:  # noqa: BLE001 - soft per-category failure
+                    # OCR failed (e.g. missing tesseract). Keep the page with its
+                    # already-extracted images/tables rather than dropping it, and
+                    # record a page-level warning. See base.py soft-failure contract.
+                    ocr_blocks = []
+                    warnings.append(f"OCR failed: {exc}")
+                for block in ocr_blocks:
                     if not is_inside_table(block.bbox):
                         elements.append(self._ocr_element(block, gen_elem_id(), page_index))
 
@@ -89,13 +100,16 @@ class DocumentAssembler:
             elif analysis.has_text_layer and analysis.image_count == 0 and not tables:
                 classification = "text_only"
 
-            return {
+            page_dict = {
                 "page_number": page_index + 1,
                 "width": float(analysis.width),
                 "height": float(analysis.height),
                 "classification": classification,
                 "elements": PageLayoutSorter(ElementAdapter()).sort(elements),
             }
+            if warnings:
+                page_dict["warnings"] = warnings
+            return page_dict
 
     def parse_document(self, total_pages, image_output_dir=None) -> dict:
         """Parse all pages sequentially and combine into the document envelope."""
@@ -105,7 +119,7 @@ class DocumentAssembler:
                 try:
                     pages.append(self.parse_page(idx, image_output_dir))
                 except Exception as e:  # noqa: BLE001 - per-page isolation
-                    errors.append(str(e))
+                    errors.append(f"Page {idx + 1}: {e}")
         return self.combine(total_pages, pages, errors)
 
     def combine(self, total_pages, pages, errors) -> dict:
@@ -199,8 +213,14 @@ class ParsedDocument:
                 )
         return records
 
-    def dedupe_images(self) -> int:
-        """Collapse byte-identical extracted image files; return count removed."""
+    def dedupe_images(self, image_output_dir: str | None = None) -> int:
+        """Collapse byte-identical extracted image files; return count removed.
+
+        Args:
+            image_output_dir: Directory holding the images written by this run.
+                Only files resolving inside it are eligible for deletion (see
+                issue #101); when ``None`` no file is removed from disk.
+        """
         images = [
             el
             for page in self.document.get("document", {}).get("pages", [])
@@ -211,6 +231,7 @@ class ParsedDocument:
             images,
             lambda el: (el.get("metadata") or {}).get("file_path"),
             lambda el, p: el.setdefault("metadata", {}).__setitem__("file_path", p),
+            allowed_dir=image_output_dir,
         )
 
     def drop_layout_tables(self, min_rows: int = 2, min_cols: int = 2) -> int:
