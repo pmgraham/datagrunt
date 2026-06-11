@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from datagrunt.core.pdf_io.extraction.image_dedupe import dedupe_image_files
+from datagrunt.core.pdf_io.extraction.markdown_escape import escape_leading_markdown
 from datagrunt.core.pdf_io.extraction.ocr import dpi_for_page, ocr_data_to_blocks
 from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
 
@@ -187,5 +188,7 @@ class PdfiumNativeReader:
             for para in text.split("\n\n"):
                 para = para.strip()
                 if para:
-                    blocks.append(para)
+                    # Native paragraphs are all body text; escape any leading
+                    # markdown metacharacter so it is not rendered as structure.
+                    blocks.append(escape_leading_markdown(para))
         return "\n\n".join(blocks) + "\n"
