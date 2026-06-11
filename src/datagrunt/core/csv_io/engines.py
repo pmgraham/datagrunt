@@ -660,7 +660,7 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
             names.
         """
         filename = self.queries.set_export_filename(CSVEngineProperties.parquet_export_filename, export_filename)
-        df = CSVReaderPolarsEngine(self.filepath).to_dataframe(normalize_columns)
+        df = CSVReaderPolarsEngine(self.filepath, lenient=self.lenient).to_dataframe(normalize_columns)
         df.write_parquet(filename)
 
 
