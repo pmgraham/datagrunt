@@ -2,6 +2,7 @@
 
 from datagrunt.core.pdf_io.extraction.base import ExtractionBackend
 from datagrunt.core.pdf_io.extraction.ocr import ocr_data_to_blocks
+from datagrunt.core.pdf_io.extraction.pdfium_document import ENCRYPTED_PDF_MESSAGE
 from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, PageAnalysis, TextBlock
 from datagrunt.core.pdf_io.extraction.text_block_builder import classify_font_size
 
@@ -23,12 +24,25 @@ class PyMuPDFBackend(ExtractionBackend):
         import threading
         self._local = threading.local()
 
+    def _open_doc(self):
+        """Open the document, translating the encrypted case to a clear error.
+
+        pymupdf opens password-protected PDFs without raising (every page then
+        reads as empty/garbage), so encryption must be detected explicitly via
+        ``needs_pass`` to match the pdfium engines' behavior (issue #99).
+        """
+        pymupdf = _import_pymupdf()
+        doc = pymupdf.open(self.filepath)
+        if doc.needs_pass:
+            doc.close()
+            raise ValueError(ENCRYPTED_PDF_MESSAGE)
+        return doc
+
     def __enter__(self):
         if not hasattr(self._local, "depth"):
             self._local.depth = 0
         if self._local.depth == 0:
-            pymupdf = _import_pymupdf()
-            self._local.doc = pymupdf.open(self.filepath)
+            self._local.doc = self._open_doc()
         self._local.depth += 1
         return self
 
@@ -42,8 +56,16 @@ class PyMuPDFBackend(ExtractionBackend):
     def _get_doc(self):
         if hasattr(self._local, "doc") and self._local.doc:
             return self._local.doc, False
-        pymupdf = _import_pymupdf()
-        return pymupdf.open(self.filepath), True
+        return self._open_doc(), True
+
+    def page_count(self) -> int:
+        """Return the document's page count using pymupdf (no pdfium dependency)."""
+        doc, should_close = self._get_doc()
+        try:
+            return doc.page_count
+        finally:
+            if should_close:
+                doc.close()
 
     def analyze_page(self, page_number: int) -> PageAnalysis:
         """Return page metadata; raises ValueError on failure/out-of-range."""
