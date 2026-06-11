@@ -2,6 +2,7 @@
 
 from datagrunt.core.pdf_io.extraction.base import ExtractionBackend
 from datagrunt.core.pdf_io.extraction.ocr import ocr_data_to_blocks
+from datagrunt.core.pdf_io.extraction.pdfium_document import ENCRYPTED_PDF_MESSAGE
 from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, PageAnalysis, TextBlock
 from datagrunt.core.pdf_io.extraction.text_block_builder import classify_font_size
 
@@ -23,12 +24,25 @@ class PyMuPDFBackend(ExtractionBackend):
         import threading
         self._local = threading.local()
 
+    def _open_doc(self):
+        """Open the document, translating the encrypted case to a clear error.
+
+        pymupdf opens password-protected PDFs without raising (every page then
+        reads as empty/garbage), so encryption must be detected explicitly via
+        ``needs_pass`` to match the pdfium engines' behavior (issue #99).
+        """
+        pymupdf = _import_pymupdf()
+        doc = pymupdf.open(self.filepath)
+        if doc.needs_pass:
+            doc.close()
+            raise ValueError(ENCRYPTED_PDF_MESSAGE)
+        return doc
+
     def __enter__(self):
         if not hasattr(self._local, "depth"):
             self._local.depth = 0
         if self._local.depth == 0:
-            pymupdf = _import_pymupdf()
-            self._local.doc = pymupdf.open(self.filepath)
+            self._local.doc = self._open_doc()
         self._local.depth += 1
         return self
 
@@ -42,8 +56,16 @@ class PyMuPDFBackend(ExtractionBackend):
     def _get_doc(self):
         if hasattr(self._local, "doc") and self._local.doc:
             return self._local.doc, False
-        pymupdf = _import_pymupdf()
-        return pymupdf.open(self.filepath), True
+        return self._open_doc(), True
+
+    def page_count(self) -> int:
+        """Return the document's page count using pymupdf (no pdfium dependency)."""
+        doc, should_close = self._get_doc()
+        try:
+            return doc.page_count
+        finally:
+            if should_close:
+                doc.close()
 
     def analyze_page(self, page_number: int) -> PageAnalysis:
         """Return page metadata; raises ValueError on failure/out-of-range."""
@@ -143,10 +165,18 @@ class PyMuPDFBackend(ExtractionBackend):
                 os.makedirs(output_dir, exist_ok=True)
             page = doc[page_number]
             image_list = page.get_images()
-            image_blocks = [b for b in page.get_text("dict")["blocks"] if b.get("type") == 1]
             results = []
+            # ``get_images()`` lists images in resource (xref) order, which can
+            # differ from the content/display order. Resolve each image's bbox by
+            # its xref so positions never get swapped; track per-xref occurrences
+            # so an image drawn multiple times maps to the correct rect each time.
+            xref_occurrence = {}
             for idx, img_info in enumerate(image_list):
-                block = self._image_block(doc, img_info, idx, image_blocks, output_dir, name_prefix, page_number)
+                xref = img_info[0]
+                occurrence = xref_occurrence.get(xref, 0)
+                xref_occurrence[xref] = occurrence + 1
+                bbox = self._resolve_image_bbox(page, xref, occurrence)
+                block = self._image_block(doc, img_info, idx, bbox, output_dir, name_prefix, page_number)
                 if block is not None:
                     results.append(block)
             return results
@@ -154,8 +184,36 @@ class PyMuPDFBackend(ExtractionBackend):
             if should_close:
                 doc.close()
 
-    def _image_block(self, doc, img_info, idx, image_blocks, output_dir, name_prefix, page_number):
-        """Extract one image to an ImageBlock (or None to skip), <40px filtered."""
+    @staticmethod
+    def _resolve_image_bbox(page, xref, occurrence) -> BBox:
+        """Return the BBox for the ``occurrence``-th placement of image ``xref``.
+
+        Uses ``page.get_image_rects(xref)`` so the bbox always corresponds to the
+        specific image being emitted rather than a position paired by list index.
+        Falls back to a zero box when the image has no resolvable rect (e.g. it is
+        referenced but never drawn).
+        """
+        try:
+            rects = page.get_image_rects(xref)
+        except Exception:  # noqa: BLE001 - rect lookup is best-effort
+            rects = []
+        if not rects:
+            return BBox(0, 0, 0, 0)
+        # ``get_image_rects`` returns one rect per placement, in placement order,
+        # so the k-th occurrence in ``get_images()`` maps to the k-th rect.
+        rect = rects[occurrence] if occurrence < len(rects) else rects[0]
+        return BBox(
+            x=round(rect.x0, 2),
+            y=round(rect.y0, 2),
+            w=round(rect.x1 - rect.x0, 2),
+            h=round(rect.y1 - rect.y0, 2),
+        )
+
+    def _image_block(self, doc, img_info, idx, bbox, output_dir, name_prefix, page_number):
+        """Extract one image to an ImageBlock (or None to skip), <40px filtered.
+
+        ``bbox`` is the already-resolved (by xref) position for this image.
+        """
         try:
             base_image = doc.extract_image(img_info[0])
         except Exception:  # noqa: BLE001
@@ -185,10 +243,6 @@ class PyMuPDFBackend(ExtractionBackend):
             file_path = os.path.join(output_dir, f"{name_prefix}_page{page_number}_img{idx}.{ext}")
             with open(file_path, "wb") as f:
                 f.write(image_bytes)
-        bbox = BBox(0, 0, 0, 0)
-        if idx < len(image_blocks):
-            b = image_blocks[idx]["bbox"]
-            bbox = BBox(x=round(b[0], 2), y=round(b[1], 2), w=round(b[2] - b[0], 2), h=round(b[3] - b[1], 2))
         return ImageBlock(bbox=bbox, file_path=file_path, width_px=width, height_px=height, fmt=ext)
 
     def ocr_page(self, page_number: int, dpi: int = 300) -> list:

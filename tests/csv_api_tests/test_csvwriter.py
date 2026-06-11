@@ -98,16 +98,50 @@ class TestCSVWriter:
             expected_columns = ["first_name", "last_name", "age_group"]
             assert list(df.columns) == expected_columns
 
-    def test_write_completely_empty_file(self, completely_empty_csv, tmp_path):
-        """Test writing completely empty files (no headers, no content)."""
-        writer = CSVWriter(completely_empty_csv)
+    def test_write_empty_source_produces_empty_output(self, empty_csv, tmp_path):
+        """Writing a zero-byte source yields a truly empty output on every engine.
 
-        out_csv = str(tmp_path / "completely_empty_output.csv")
-        writer.write_csv(out_csv)
-        assert Path(out_csv).exists()
-        with open(out_csv, "r") as f:
-            content = f.read()
-        assert content.strip() == "" or "column0"  # Verify file is completely empty (ignoring whitespace)
+        Mirrors CSVReader's empty/blank guard: no fabricated ``column0`` header
+        (duckdb) and no engine-specific crash (polars NoDataError / pyarrow
+        ArrowInvalid). The output file must exist and be empty (0 bytes).
+        """
+        for engine in ALL_ENGINES:
+            writer = CSVWriter(empty_csv, engine=engine)
+            out_file = Path(tmp_path / f"empty_source_{engine}.csv")
+            writer.write_csv(str(out_file))
+
+            assert out_file.exists()
+            content = out_file.read_text()
+            assert content == "", f"{engine} fabricated output: {content!r}"
+            assert out_file.stat().st_size == 0
+
+    def test_write_blank_source_produces_empty_output(self, blank_csv, tmp_path):
+        """Writing a whitespace-only source yields empty output on every engine."""
+        for engine in ALL_ENGINES:
+            writer = CSVWriter(blank_csv, engine=engine)
+            out_file = Path(tmp_path / f"blank_source_{engine}.csv")
+            writer.write_csv(str(out_file))
+
+            assert out_file.exists()
+            assert out_file.read_text() == ""
+            assert out_file.stat().st_size == 0
+
+    def test_write_empty_source_all_formats(self, empty_csv, tmp_path):
+        """All write_* methods produce empty output for an empty source."""
+        methods_and_exts = [
+            ("write_csv", "csv"),
+            ("write_json", "json"),
+            ("write_json_newline_delimited", "jsonl"),
+            ("write_parquet", "parquet"),
+            ("write_excel", "xlsx"),
+        ]
+        for engine in ALL_ENGINES:
+            writer = CSVWriter(empty_csv, engine=engine)
+            for method_name, ext in methods_and_exts:
+                out_file = Path(tmp_path / f"empty_{engine}.{ext}")
+                getattr(writer, method_name)(str(out_file))
+                assert out_file.exists()
+                assert out_file.stat().st_size == 0
 
     def test_default_filenames(self, sample_csv):
         """Test writing with default filenames."""
