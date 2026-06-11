@@ -174,6 +174,7 @@ class FileProperties:
             filepath (str or Path): Path to the file.
         """
         self.filepath = Path(filepath)
+        self._validate_path()
         self.filename = self.filepath.name
         self.extension = self.filepath.suffix
         self.extension_string = self.extension.replace(".", "")
@@ -189,6 +190,18 @@ class FileProperties:
         self.size_in_mb = self._stats.size_in_mb
         self.size_in_gb = self._stats.size_in_gb
         self.size_in_tb = self._stats.size_in_tb
+
+    def _validate_path(self) -> None:
+        """Validate the path points to an existing file.
+
+        Raises:
+            FileNotFoundError: If the path does not exist.
+            ValueError: If the path is a directory rather than a file.
+        """
+        if not self.filepath.exists():
+            raise FileNotFoundError(f"No such file: '{self.filepath}'")
+        if self.filepath.is_dir():
+            raise ValueError(f"'{self.filepath}' is a directory, not a file")
 
     @cached_property
     def is_structured(self):
