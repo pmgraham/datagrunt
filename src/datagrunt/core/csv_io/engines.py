@@ -35,6 +35,28 @@ def _count_leading_comments(filepath):
     return count
 
 
+def _has_midfile_comments(filepath):
+    """Return True if a ``#`` comment line appears after the leading comment block.
+
+    PyArrow's CSV reader has no comment support and only the leading block is
+    skipped via ``skip_rows``. A comment line further down the file (which the
+    polars and duckdb engines tolerate) would otherwise crash the parser, so we
+    detect it here to route around the native PyArrow reader.
+    """
+    in_leading_block = True
+    with open(filepath, "r", encoding="utf-8-sig") as f:
+        for line in f:
+            stripped = line.strip()
+            is_comment_or_blank = stripped.startswith("#") or not stripped
+            if in_leading_block:
+                if is_comment_or_blank:
+                    continue
+                in_leading_block = False
+            elif stripped.startswith("#"):
+                return True
+    return False
+
+
 def _is_legacy_mac_newlines(filepath):
     """Check if the file uses legacy Mac OS carriage returns (\\r) as line endings."""
     try:
@@ -606,6 +628,41 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
     Class to read CSV files and convert CSV files powered by PyArrow.
     """
 
+    def _polars_fallback_table(self, columns, normalize_columns, truncate_ragged_lines, n_rows=None):
+        """Parse the CSV with Polars and convert it to an Arrow table.
+
+        Used whenever the native PyArrow reader cannot handle the input: lenient
+        (ragged) mode and files with mid-file ``#`` comment lines. Polars skips
+        comment lines via ``comment_prefix`` and yields the same rows as the
+        polars and duckdb engines, keeping engine behavior consistent.
+
+        Args:
+            columns (list): Original column names, used for normalization lookup.
+            normalize_columns (bool): Whether to normalize column names.
+            truncate_ragged_lines (bool): Whether to truncate ragged rows.
+            n_rows (int, optional): Limit the number of rows read (for samples).
+
+        Returns:
+            A PyArrow table with all columns cast to string.
+        """
+        df = pl.read_csv(
+            self.filepath,
+            separator=self.delimiter,
+            truncate_ragged_lines=truncate_ragged_lines,
+            infer_schema=False,
+            comment_prefix="#",
+            n_rows=n_rows,
+        )
+        table = df.to_arrow()
+        string_schema = pa.schema([(name, pa.string()) for name in table.column_names])
+        table = table.cast(string_schema)
+        if normalize_columns:
+            column_normalizer = CSVColumnNameNormalizer(self.filepath, columns=columns)
+            old_names = table.column_names
+            new_names = [column_normalizer.columns_to_normalized_mapping.get(name, name) for name in old_names]
+            table = table.rename_columns(new_names)
+        return table
+
     def _create_table(self, normalize_columns=False):
         """
         Create a PyArrow table from the CSV file.
@@ -633,22 +690,11 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
         if self.lenient:
             _check_csv_ragged_and_warn(self.filepath, self.delimiter)
             # Fallback to Polars to parse the ragged CSV, then convert to Arrow Table
-            df = pl.read_csv(
-                self.filepath,
-                separator=self.delimiter,
-                truncate_ragged_lines=True,
-                infer_schema=False,
-                comment_prefix="#",
-            )
-            table = df.to_arrow()
-            string_schema = pa.schema([(name, pa.string()) for name in table.column_names])
-            table = table.cast(string_schema)
-            if normalize_columns:
-                column_normalizer = CSVColumnNameNormalizer(self.filepath, columns=columns)
-                old_names = table.column_names
-                new_names = [column_normalizer.columns_to_normalized_mapping.get(name, name) for name in old_names]
-                table = table.rename_columns(new_names)
-            return table
+            return self._polars_fallback_table(columns, normalize_columns, truncate_ragged_lines=True)
+        if _has_midfile_comments(self.filepath):
+            # PyArrow cannot skip comment lines past the leading block; defer to
+            # Polars so the result matches the polars and duckdb engines (issue #90).
+            return self._polars_fallback_table(columns, normalize_columns, truncate_ragged_lines=False)
         try:
             skip_count = _count_leading_comments(self.filepath) + 1
             table = pacsv.read_csv(
@@ -695,23 +741,21 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
         if self.lenient:
             _check_csv_ragged_and_warn(self.filepath, self.delimiter)
             # Fallback to Polars to parse the ragged CSV, then convert to Arrow Table
-            df = pl.read_csv(
-                self.filepath,
-                separator=self.delimiter,
+            return self._polars_fallback_table(
+                columns,
+                normalize_columns,
                 truncate_ragged_lines=True,
-                infer_schema=False,
                 n_rows=CSVEngineProperties.dataframe_sample_rows,
-                comment_prefix="#",
             )
-            table = df.to_arrow()
-            string_schema = pa.schema([(name, pa.string()) for name in table.column_names])
-            table = table.cast(string_schema)
-            if normalize_columns:
-                column_normalizer = CSVColumnNameNormalizer(self.filepath, columns=columns)
-                old_names = table.column_names
-                new_names = [column_normalizer.columns_to_normalized_mapping.get(name, name) for name in old_names]
-                table = table.rename_columns(new_names)
-            return table
+        if _has_midfile_comments(self.filepath):
+            # PyArrow cannot skip comment lines past the leading block; defer to
+            # Polars so the result matches the polars and duckdb engines (issue #90).
+            return self._polars_fallback_table(
+                columns,
+                normalize_columns,
+                truncate_ragged_lines=False,
+                n_rows=CSVEngineProperties.dataframe_sample_rows,
+            )
         try:
             skip_count = _count_leading_comments(self.filepath) + 1
             table = pacsv.read_csv(
@@ -843,13 +887,15 @@ class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
                 "PyArrow engine does not support legacy Mac OS carriage return (\\r) newlines. "
                 "Please use engine='duckdb' or convert the file to Unix/Windows newlines."
             )
-        if self.lenient:
-            _check_csv_ragged_and_warn(self.filepath, self.queries.delimiter)
-            # Fallback to Polars to parse the ragged CSV, then convert to Arrow Table
+        if self.lenient or _has_midfile_comments(self.filepath):
+            if self.lenient:
+                _check_csv_ragged_and_warn(self.filepath, self.queries.delimiter)
+            # Fallback to Polars: it parses ragged rows and skips mid-file ``#``
+            # comment lines that the native PyArrow reader chokes on (issue #90).
             df = pl.read_csv(
                 self.filepath,
                 separator=self.queries.delimiter,
-                truncate_ragged_lines=True,
+                truncate_ragged_lines=self.lenient,
                 infer_schema=False,
                 comment_prefix="#",
             )

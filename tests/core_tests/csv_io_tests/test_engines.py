@@ -416,3 +416,27 @@ class TestEngines:
         assert "last_name" in df.columns
         assert "e_mail" in df.columns
         assert "phone" in df.columns
+
+    def test_midfile_comment_line_all_engines(self, tmp_path):
+        """A mid-file ``#`` comment line must be skipped identically by every engine.
+
+        Regression test for issue #90: polars and duckdb tolerate a comment line
+        that appears after the leading block, but the pyarrow engine raised
+        ``ArrowInvalid`` because it only skipped the *leading* comment block.
+        """
+        midfile_comment_csv = tmp_path / "midfile_comment.csv"
+        midfile_comment_csv.write_text("name,age\nalice,30\n# midfile comment\nbob,25\n")
+
+        expected_rows = [
+            {"name": "alice", "age": "30"},
+            {"name": "bob", "age": "25"},
+        ]
+
+        for engine in ALL_ENGINES:
+            factory = CSVEngineFactory(str(midfile_comment_csv), engine)
+            reader = factory.create_reader()
+            df = reader.to_dataframe()
+
+            assert isinstance(df, pl.DataFrame)
+            assert df.columns == ["name", "age"], f"engine={engine}"
+            assert df.to_dicts() == expected_rows, f"engine={engine}"
