@@ -225,6 +225,33 @@ class TestCSVReader:
         df2 = reader_empty.to_dataframe()
         assert df1 is not df2
 
+    def test_get_sample_empty_and_blank_files(self, tmp_path):
+        """get_sample must return an empty DataFrame for empty and blank files.
+
+        Regression test for issue #86: get_sample lacked the empty/blank guard
+        the other read methods have, so it crashed or fabricated phantom
+        columns divergently per engine on empty or whitespace-only files.
+        """
+        # Test empty file (0 bytes)
+        empty_file = tmp_path / "empty.csv"
+        empty_file.write_text("")
+
+        for engine in ALL_ENGINES:
+            reader_empty = CSVReader(str(empty_file), engine=engine)
+            sample_empty = reader_empty.get_sample()
+            assert isinstance(sample_empty, pl.DataFrame)
+            assert sample_empty.shape == (0, 0)
+
+        # Test blank file (only whitespace and newlines)
+        blank_file = tmp_path / "blank.csv"
+        blank_file.write_text("\n   \n  \n")
+
+        for engine in ALL_ENGINES:
+            reader_blank = CSVReader(str(blank_file), engine=engine)
+            sample_blank = reader_blank.get_sample()
+            assert isinstance(sample_blank, pl.DataFrame)
+            assert sample_blank.shape == (0, 0)
+
     def test_query_data_empty_and_blank_files(self, tmp_path):
         """Test query_data method for empty and blank files."""
         # Test empty file (0 bytes)
@@ -305,6 +332,62 @@ class TestCSVReader:
             except Exception as e:
                 # Polars, PyArrow, and DuckDB must raise a parsing/execution error
                 assert isinstance(e, Exception)
+
+    def test_query_data_imports_file_once_across_repeated_calls(self, sample_csv, monkeypatch):
+        """Repeated query_data calls on one reader must import the CSV only once.
+
+        Regression test for issue #104: previously the DuckDB engine rebuilt a
+        fresh engine (and connection) on every query_data call and unconditionally
+        re-ran CREATE OR REPLACE TABLE, paying a full file import every time. The
+        engine is now cached on the reader and create_table is idempotent per
+        connection, so the file is imported exactly once no matter how many times
+        query_data is called. Results must stay identical across calls.
+        """
+        from datagrunt.core.databases import DuckDBQueries
+
+        import_calls = {"count": 0}
+        original_import_query = DuckDBQueries.import_csv_query
+
+        def counting_import_query(self):
+            import_calls["count"] += 1
+            return original_import_query(self)
+
+        monkeypatch.setattr(DuckDBQueries, "import_csv_query", counting_import_query)
+
+        reader = CSVReader(sample_csv, engine="duckdb")
+        query = f"SELECT name FROM {reader.db_table} ORDER BY name"
+
+        first = reader.query_data(query).pl()["name"].to_list()
+        second = reader.query_data(query).pl()["name"].to_list()
+        third = reader.query_data(query).pl()["name"].to_list()
+
+        # The file is imported exactly once for the lifetime of the reader.
+        assert import_calls["count"] == 1
+        # Results are unchanged across repeated calls.
+        assert first == second == third == ["Jane", "John"]
+
+    def test_duckdb_cached_engine_reimports_when_normalize_mode_changes(self, tmp_path):
+        """Caching the engine must not freeze the table's normalization mode.
+
+        The engine (and its imported table) is now reused across calls on one
+        reader. The idempotent import is keyed on normalize_columns, so toggling
+        the flag must still produce the correct column names rather than serving
+        a stale table from a prior call (issue #104 correctness guard).
+        """
+        csv_file = tmp_path / "people.csv"
+        csv_file.write_text("First Name,Last Name\nJohn,Doe\nJane,Smith")
+
+        reader = CSVReader(str(csv_file), engine="duckdb")
+
+        raw = reader.to_dataframe(normalize_columns=False)
+        assert list(raw.columns) == ["First Name", "Last Name"]
+
+        normalized = reader.to_dataframe(normalize_columns=True)
+        assert list(normalized.columns) == ["first_name", "last_name"]
+
+        # Toggling back must restore the original column names, not stay stuck.
+        raw_again = reader.to_dataframe(normalize_columns=False)
+        assert list(raw_again.columns) == ["First Name", "Last Name"]
 
     def test_ragged_rows_lenient(self, tmp_path):
         """Test that Polars, PyArrow, and DuckDB load ragged rows successfully with warnings when lenient=True."""

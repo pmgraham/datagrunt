@@ -124,6 +124,24 @@ class TestEngines:
             expected_type = QUERY_RESULT_TYPES[engine]
             assert isinstance(result, expected_type)
 
+    def test_query_data_disposes_connection_on_materializing_engines(self, sample_csv):
+        """polars/pyarrow query_data must close the DuckDB connection.
+
+        Those engines return a fully-materialized polars DataFrame from
+        ``sql_query_to_dataframe``, so nothing references the connection after
+        the call and it must be disposed deterministically. The duckdb engine
+        returns a live relation and must keep its connection open.
+        """
+        for engine in ("polars", "pyarrow"):
+            reader = CSVEngineFactory(sample_csv, engine).create_reader()
+            reader.query_data(f"SELECT * FROM {reader.db_table} LIMIT 1")
+            assert reader.queries._connection is None, engine
+
+        duckdb_reader = CSVEngineFactory(sample_csv, "duckdb").create_reader()
+        relation = duckdb_reader.query_data(f"SELECT * FROM {duckdb_reader.db_table} LIMIT 1")
+        assert duckdb_reader.queries._connection is not None
+        assert relation.fetchall()  # the live relation is still usable
+
     def test_reader_get_sample_all_engines(self, sample_csv):
         """Test get_sample method returns a sample DataFrame for all engines."""
         for engine in ALL_ENGINES:
@@ -416,3 +434,170 @@ class TestEngines:
         assert "last_name" in df.columns
         assert "e_mail" in df.columns
         assert "phone" in df.columns
+
+    def test_midfile_comment_line_pyarrow_matches_polars(self, tmp_path):
+        """A mid-file ``#`` line must not crash pyarrow and must match polars.
+
+        Regression test for issue #90: the pyarrow engine raised
+        ``ArrowInvalid`` on a comment line after the leading block. Since #73,
+        only LEADING ``#`` lines are comments — a mid-file ``#`` line is data
+        (dropping it silently would lose ``#``-prefixed rows like hex colors) —
+        so pyarrow must yield exactly what the polars reference engine yields.
+        (duckdb's strict mode currently drops such lines; that pre-existing
+        divergence is outside this fix's scope.)
+        """
+        midfile_comment_csv = tmp_path / "midfile_comment.csv"
+        midfile_comment_csv.write_text("name,age\nalice,30\n# midfile comment\nbob,25\n")
+
+        polars_rows = CSVEngineFactory(str(midfile_comment_csv), "polars").create_reader().to_dataframe().to_dicts()
+        pyarrow_df = CSVEngineFactory(str(midfile_comment_csv), "pyarrow").create_reader().to_dataframe()
+
+        assert isinstance(pyarrow_df, pl.DataFrame)
+        assert pyarrow_df.columns == ["name", "age"]
+        assert pyarrow_df.to_dicts() == polars_rows
+        assert {"name": "alice", "age": "30"} in polars_rows
+        assert {"name": "bob", "age": "25"} in polars_rows
+
+
+class TestNormalizeCollidingColumnsAllEngines:
+    """``normalize_columns=True`` must behave identically across engines.
+
+    When two distinct headers normalize to the same name, every engine must
+    disambiguate them rather than crash or silently drop a column.
+    """
+
+    def test_colliding_normalized_names_all_engines(self, tmp_path):
+        """``Col A,col_a`` both normalize to ``col_a`` on every engine.
+
+        The DuckDB engine historically crashed here with a CatalogException
+        because it renamed columns sequentially; polars/pyarrow returned
+        ``['col_a', 'col_a_1']``. All three must now agree.
+        """
+        csv_file = tmp_path / "collide.csv"
+        csv_file.write_text("Col A,col_a\n1,2\n3,4\n")
+
+        results = {}
+        for engine in ALL_ENGINES:
+            reader = CSVEngineFactory(str(csv_file), engine).create_reader()
+            df = reader.to_dataframe(normalize_columns=True)
+            results[engine] = (df.columns, len(df))
+
+        for engine in ALL_ENGINES:
+            assert results[engine][0] == ["col_a", "col_a_1"], engine
+            assert results[engine][1] == 2, engine
+
+    def test_three_way_collision_yields_distinct_names_all_engines(self, tmp_path):
+        """``Col A,col a,col_a_1`` must produce 3 distinct names on every engine."""
+        csv_file = tmp_path / "collide3.csv"
+        csv_file.write_text("Col A,col a,col_a_1\n1,2,3\n")
+
+        for engine in ALL_ENGINES:
+            reader = CSVEngineFactory(str(csv_file), engine).create_reader()
+            df = reader.to_dataframe(normalize_columns=True)
+            assert len(df.columns) == 3, engine
+            assert len(set(df.columns)) == 3, engine
+
+    def test_empty_normalizing_header_is_valid_all_engines(self, tmp_path):
+        """A header that normalizes to empty must become a valid column name."""
+        # Three columns so the comma is unambiguously the inferred delimiter
+        # (a two-field "%,name" header ties %/comma and the sniffer would pick
+        # %). Both "%" and "()" normalize to empty and must get valid names.
+        csv_file = tmp_path / "empty_header.csv"
+        csv_file.write_text("%,(),name\n1,2,3\n")
+
+        for engine in ALL_ENGINES:
+            reader = CSVEngineFactory(str(csv_file), engine).create_reader()
+            df = reader.to_dataframe(normalize_columns=True)
+            assert len(df.columns) == 3, engine
+            assert all(col != "" for col in df.columns), engine
+
+
+class TestDuckDBSqlEscaping:
+    """The DuckDB engine must escape interpolated literals and identifiers.
+
+    A single quote in a filename or a header cell previously produced broken
+    SQL (a ParserException). The threat model is a trusted caller, so this is
+    robustness / defense-in-depth, not RCE.
+    """
+
+    def test_apostrophe_in_filename_reads_correctly_duckdb(self, tmp_path):
+        """A ``'`` in the file path must not break the read_csv SQL literal."""
+        csv_file = tmp_path / "o'hara.csv"
+        csv_file.write_text("name,age\nJohn,30\nJane,25\n")
+
+        reader = CSVEngineFactory(str(csv_file), "duckdb").create_reader()
+        df = reader.to_dataframe()
+        assert df.columns == ["name", "age"]
+        assert len(df) == 2
+
+    def test_single_quote_in_header_lenient_duckdb(self, tmp_path):
+        """A ``'`` in a header cell must not break the lenient columns dict."""
+        csv_file = tmp_path / "quoted_header.csv"
+        # Header cell contains a single quote; lenient mode builds an explicit
+        # column dict ({'col': 'VARCHAR'}) that must escape the quote. The
+        # header has more commas than quotes so delimiter inference picks ','.
+        csv_file.write_text("o'clock,value,extra\n1,2,3\n4,5,6\n")
+
+        reader = CSVEngineFactory(str(csv_file), "duckdb", lenient=True).create_reader()
+        df = reader.to_dataframe()
+        assert df.columns == ["o'clock", "value", "extra"]
+        assert len(df) == 2
+
+    def test_single_quote_inferred_delimiter_duckdb(self, tmp_path):
+        """An inferred ``'`` delimiter must not break the delim SQL literal.
+
+        Delimiter inference counts non-alphanumeric characters in the first
+        row, so a header like ``a'b'c`` infers ``'`` as the delimiter. The
+        ``delim='...'`` literal must escape it (``delim=''''``) or every
+        DuckDB read of the file raises a ParserException.
+        """
+        csv_file = tmp_path / "quote_delimited.csv"
+        csv_file.write_text("a'b'c\n1'2'3\n4'5'6\n")
+
+        reader = CSVEngineFactory(str(csv_file), "duckdb").create_reader()
+        df = reader.to_dataframe()
+        assert df.columns == ["a", "b", "c"]
+        assert len(df) == 2
+
+    def test_apostrophe_in_filename_writes_correctly_duckdb(self, tmp_path):
+        """A ``'`` in the SOURCE path must not break export COPY queries."""
+        csv_file = tmp_path / "o'hara.csv"
+        csv_file.write_text("name,age\nJohn,30\n")
+
+        writer = CSVEngineFactory(str(csv_file), "duckdb").create_writer()
+        out = tmp_path / "out.csv"
+        writer.write_csv(str(out))
+        assert out.exists()
+        assert "John" in out.read_text()
+
+
+class TestLeadingCommentHandling:
+    """Tests that engines treat only LEADING ``#`` lines as comments.
+
+    A ``#`` at the start of a DATA field (e.g. a hex color) must not cause the
+    row to be dropped, and all engines must agree on the resulting row count.
+    """
+
+    def test_hash_prefixed_data_rows_preserved_all_engines(self, tmp_path):
+        """A data field starting with ``#`` must not be treated as a comment."""
+        hex_csv = tmp_path / "hex.csv"
+        hex_csv.write_text("color,name\n#FF0000,red\n#00FF00,green\n00ABCD,teal\n")
+
+        row_counts = {}
+        for engine in ALL_ENGINES:
+            reader = CSVEngineFactory(str(hex_csv), engine).create_reader()
+            row_counts[engine] = len(reader.to_dataframe())
+
+        assert row_counts == {"duckdb": 3, "polars": 3, "pyarrow": 3}
+
+    def test_leading_comment_block_skipped_all_engines(self, tmp_path):
+        """A genuine leading comment block must still be skipped on all engines."""
+        commented_csv = tmp_path / "commented.csv"
+        commented_csv.write_text("# generated\n# v2\na,b\n1,2\n")
+
+        for engine in ALL_ENGINES:
+            reader = CSVEngineFactory(str(commented_csv), engine).create_reader()
+            df = reader.to_dataframe()
+            assert df.columns == ["a", "b"]
+            assert len(df) == 1
+
