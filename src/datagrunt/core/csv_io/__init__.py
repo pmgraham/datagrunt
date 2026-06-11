@@ -10,6 +10,7 @@ from datagrunt.core.csv_io.csvcomponents import (
     CSVStringSample,
     _check_csv_ragged_and_warn,
     _count_leading_comments,
+    _count_leading_physical_lines_before_header,
 )
 from datagrunt.core.csv_io.engines import (
     CSVEngineProperties,
@@ -39,5 +40,6 @@ __all__ = [
     "CSVWriterPyArrowEngine",
     "CSVEngineFactory",
     "_count_leading_comments",
+    "_count_leading_physical_lines_before_header",
     "_check_csv_ragged_and_warn",
 ]
