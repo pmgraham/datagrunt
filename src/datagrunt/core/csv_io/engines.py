@@ -31,10 +31,11 @@ def _has_midfile_comments(filepath):
     PyArrow's CSV reader has no comment support and only the leading block is
     skipped via ``skip_rows``. A comment line further down the file (which the
     polars and duckdb engines tolerate) would otherwise crash the parser, so we
-    detect it here to route around the native PyArrow reader.
+    detect it here to route around the native PyArrow reader. errors="ignore"
+    so a non-UTF-8 byte can't crash this lightweight probe (issue #76).
     """
     in_leading_block = True
-    with open(filepath, "r", encoding="utf-8-sig") as f:
+    with open(filepath, "r", encoding="utf-8-sig", errors="ignore") as f:
         for line in f:
             stripped = line.strip()
             is_comment_or_blank = stripped.startswith("#") or not stripped
