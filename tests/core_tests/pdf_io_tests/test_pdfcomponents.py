@@ -1,7 +1,67 @@
 """Tests for PDF component assembly."""
 
+import pytest
 
 from datagrunt.core.pdf_io import pdfcomponents
+
+
+@pytest.fixture
+def text_only_pdf(tmp_path):
+    """Create a one-page PDF with native text and no images or tables."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)  # US Letter
+    page.insert_text((72, 72), "Quarterly Report", fontsize=24)  # header (large)
+    page.insert_text((72, 120), "This is body text for testing.", fontsize=11)
+    page.insert_text((72, 140), "Body line two for the report.", fontsize=11)
+    page.insert_text((72, 160), "Body line three with details.", fontsize=11)
+    page.insert_text((72, 180), "Body line four wraps up the text.", fontsize=11)
+    pdf_path = tmp_path / "text_only.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+    return str(pdf_path)
+
+
+def _pdfium_backend(filepath):
+    from datagrunt.core.pdf_io.extraction import PdfiumBackend
+
+    return PdfiumBackend(filepath)
+
+
+def _pymupdf_backend(filepath):
+    from datagrunt.core.pdf_io.extraction import PyMuPDFBackend
+
+    return PyMuPDFBackend(filepath)
+
+
+class TestPageClassification:
+    """Page ``classification`` reflects the element makeup of the page (issue #97)."""
+
+    @pytest.mark.parametrize("make_backend", [_pymupdf_backend, _pdfium_backend])
+    def test_text_only_page_classified_text_only(self, text_only_pdf, make_backend):
+        from datagrunt.core.pdf_io.pdfcomponents import DocumentAssembler
+
+        page = DocumentAssembler(
+            text_only_pdf, backend=make_backend(text_only_pdf)
+        ).parse_page(0)
+
+        types = {el["type"] for el in page["elements"]}
+        assert "image" not in types
+        assert "table" not in types
+        assert page["classification"] == "text_only"
+
+    @pytest.mark.parametrize("make_backend", [_pymupdf_backend, _pdfium_backend])
+    def test_page_with_image_classified_mixed(self, sample_pdf, make_backend):
+        from datagrunt.core.pdf_io.pdfcomponents import DocumentAssembler
+
+        page = DocumentAssembler(
+            sample_pdf, backend=make_backend(sample_pdf)
+        ).parse_page(0)
+
+        types = {el["type"] for el in page["elements"]}
+        assert "image" in types
+        assert page["classification"] == "mixed"
 
 
 class TestParsePage:
@@ -119,7 +179,7 @@ class TestDedupeImages:
             }
         }
 
-        removed = pdfcomponents.ParsedDocument(document).dedupe_images()
+        removed = pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=str(tmp_path))
 
         assert removed == 1
         # The redundant duplicate file is deleted; the first + unique remain.
@@ -287,7 +347,7 @@ class TestParsedDocument:
             {"type": "image", "metadata": {"file_path": str(a)}},
             {"type": "image", "metadata": {"file_path": str(b)}},
         ]}]}}
-        removed = ParsedDocument(document).dedupe_images()
+        removed = ParsedDocument(document).dedupe_images(image_output_dir=str(tmp_path))
         assert removed == 1 and not b.exists()
 
     def test_drop_layout_tables(self):
