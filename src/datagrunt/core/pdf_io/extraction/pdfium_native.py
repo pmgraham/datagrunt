@@ -202,6 +202,9 @@ class PdfiumNativeReader:
             text = (page.get("text") or "").strip()
             if not text:
                 continue
+            # pdfium emits \r\n line endings; normalize before splitting so
+            # paragraph breaks match and no raw \r leaks into the Markdown.
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
             for para in text.split("\n\n"):
                 para = para.strip()
                 if para:

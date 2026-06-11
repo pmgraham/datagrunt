@@ -30,6 +30,20 @@ class TestPdfiumNativeReader:
             "page", "type", "text", "font_size", "x", "y", "w", "h", "bbox", "file", "px_width", "px_height", "ocr"
         }
 
+    def test_to_markdown_normalizes_crlf(self):
+        # pdfium emits \r\n line endings; markdown must not leak \r and must
+        # split paragraphs on blank lines (\r\n\r\n).
+        doc = {
+            "document": {
+                "pages": [
+                    {"text": "Page 1 line one\r\nstill para one\r\n\r\nPage 1 paragraph two"}
+                ]
+            }
+        }
+        markdown = PdfiumNativeReader.to_markdown(doc)
+        assert "\r" not in markdown
+        assert markdown == "Page 1 line one\nstill para one\n\nPage 1 paragraph two\n"
+
     def test_text_bbox_top_down_and_consistent_with_image(self, sample_pdf, tmp_path):
         """Native text bbox is top-down (y0 <= y1), matching image bbox and position."""
         page = PdfiumNativeReader(sample_pdf).parse_page(0, image_output_dir=str(tmp_path))
