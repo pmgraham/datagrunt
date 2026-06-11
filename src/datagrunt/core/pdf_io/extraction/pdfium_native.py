@@ -56,10 +56,18 @@ class PdfiumNativeReader:
                     )
                 ]
                 ocr_used = False
+                warnings = []
                 if not full_text.strip():
-                    full_text, extra, ocr_used = self._ocr_fallback(page, width, height)
-                    text_objects.extend(extra)
-            return {
+                    try:
+                        full_text, extra, ocr_used = self._ocr_fallback(page, width, height)
+                        text_objects.extend(extra)
+                    except Exception as exc:  # noqa: BLE001 - soft per-category failure
+                        # OCR failed (e.g. missing tesseract). Keep the page with
+                        # its already-extracted images/text rather than dropping
+                        # it, and record a page-level warning. See base.py
+                        # soft-failure contract.
+                        warnings.append(f"OCR failed: {exc}")
+            page_dict = {
                 "page_number": page_index + 1,
                 "width": round(float(width), 2),
                 "height": round(float(height), 2),
@@ -68,13 +76,16 @@ class PdfiumNativeReader:
                 "images": images,
                 "ocr": ocr_used,
             }
+            if warnings:
+                page_dict["warnings"] = warnings
+            return page_dict
         finally:
             if should_close:
                 doc.close()
 
     def _text_object(self, item) -> dict:
         """Convert a TextItem to the native text-object dict."""
-        bbox = [item.x0, round(item.y_bot, 2), item.x1, round(item.y_top, 2)]
+        bbox = [item.x0, round(item.y_top, 2), item.x1, round(item.y_bot, 2)]
         return {
             "text": item.text,
             "bbox": bbox,
@@ -166,8 +177,15 @@ class PdfiumNativeReader:
         }
 
     @staticmethod
-    def dedupe_images(document: dict) -> int:
-        """Collapse byte-identical extracted image files; return count removed."""
+    def dedupe_images(document: dict, image_output_dir: str | None = None) -> int:
+        """Collapse byte-identical extracted image files; return count removed.
+
+        Args:
+            document: Parsed native-schema document.
+            image_output_dir: Directory holding the images written by this run.
+                Only files resolving inside it are eligible for deletion (see
+                issue #101); when ``None`` no file is removed from disk.
+        """
         images = [
             img
             for page in document.get("document", {}).get("pages", [])
@@ -177,6 +195,7 @@ class PdfiumNativeReader:
             images,
             lambda img: img.get("file"),
             lambda img, p: img.__setitem__("file", p),
+            allowed_dir=image_output_dir,
         )
 
     @staticmethod
@@ -187,6 +206,9 @@ class PdfiumNativeReader:
             text = (page.get("text") or "").strip()
             if not text:
                 continue
+            # pdfium emits \r\n line endings; normalize before splitting so
+            # paragraph breaks match and no raw \r leaks into the Markdown.
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
             for para in text.split("\n\n"):
                 para = para.strip()
                 if para:
