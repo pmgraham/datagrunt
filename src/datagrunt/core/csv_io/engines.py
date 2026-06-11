@@ -19,22 +19,33 @@ from datagrunt.core.csv_io.csvcomponents import (
     CSVColumnNameNormalizer,
     CSVColumns,
     _check_csv_ragged_and_warn,
+    _count_leading_comments,
+    _count_leading_physical_lines_before_header,
 )
 from datagrunt.core.databases import DuckDBQueries
 
 
-def _count_leading_comments(filepath):
-    count = 0
-    # errors="ignore" so a non-UTF-8 byte in the probe window can't crash this
-    # lightweight leading-comment scan used by the read paths.
+def _has_midfile_comments(filepath):
+    """Return True if a ``#`` comment line appears after the leading comment block.
+
+    PyArrow's CSV reader has no comment support and only the leading block is
+    skipped via ``skip_rows``. A comment line further down the file (which the
+    polars and duckdb engines tolerate) would otherwise crash the parser, so we
+    detect it here to route around the native PyArrow reader. errors="ignore"
+    so a non-UTF-8 byte can't crash this lightweight probe (issue #76).
+    """
+    in_leading_block = True
     with open(filepath, "r", encoding="utf-8-sig", errors="ignore") as f:
         for line in f:
             stripped = line.strip()
-            if stripped.startswith("#") or not stripped:
-                count += 1
-            else:
-                break
-    return count
+            is_comment_or_blank = stripped.startswith("#") or not stripped
+            if in_leading_block:
+                if is_comment_or_blank:
+                    continue
+                in_leading_block = False
+            elif stripped.startswith("#"):
+                return True
+    return False
 
 
 def _is_legacy_mac_newlines(filepath):
@@ -219,8 +230,17 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         Returns:
             A Polars DataFrame containing the sample rows.
         """
-        relation = self.queries.create_table(normalize_columns)
-        return relation.limit(CSVEngineProperties.dataframe_sample_rows).pl()
+        # sample_dataframe streams the first rows (no full-table import) and
+        # returns a materialized Polars frame, so the per-call connection can
+        # be released deterministically rather than waiting on garbage
+        # collection.
+        try:
+            return self.queries.sample_dataframe(
+                CSVEngineProperties.dataframe_sample_rows,
+                normalize_columns,
+            )
+        finally:
+            self.queries.close()
 
     def to_dataframe(self, normalize_columns=False):
         """
@@ -233,7 +253,11 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         Returns:
             A Polars dataframe.
         """
-        return self.queries.create_table(normalize_columns).pl()
+        # Materialize fully (.pl()) before closing the per-call connection.
+        try:
+            return self.queries.create_table(normalize_columns).pl()
+        finally:
+            self.queries.close()
 
     def to_arrow_table(self, normalize_columns=False):
         """
@@ -246,10 +270,14 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         Returns:
             A PyArrow table.
         """
-        result = self.queries.create_table(normalize_columns).arrow()
-        if isinstance(result, pa.Table):
-            return result
-        return result.read_all()
+        # Materialize into an in-memory pa.Table before closing the connection.
+        try:
+            result = self.queries.create_table(normalize_columns).arrow()
+            if isinstance(result, pa.Table):
+                return result
+            return result.read_all()
+        finally:
+            self.queries.close()
 
     def to_dicts(self, normalize_columns=False):
         """
@@ -262,6 +290,7 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         Returns:
             A list of dictionaries.
         """
+        # to_dataframe already materializes and closes; this is a thin wrapper.
         return self.to_dataframe(normalize_columns).to_dicts()
 
     def _normalize_relation_columns(self, relation):
@@ -277,7 +306,11 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         projections = []
         for col in current_columns:
             normalized_name = column_normalizer.columns_to_normalized_mapping.get(col, col)
-            projections.append(f'"{col}" AS "{normalized_name}"')
+            # Double-quote-escape both identifiers; a quote in a header-derived
+            # column name would otherwise break the projection SQL.
+            safe_col = col.replace('"', '""')
+            safe_normalized = normalized_name.replace('"', '""')
+            projections.append(f'"{safe_col}" AS "{safe_normalized}"')
         return relation.project(", ".join(projections))
 
     def query_data(self, sql_query, normalize_columns=False):
@@ -335,12 +368,15 @@ class CSVReaderPolarsEngine(CSVBaseReaderEngine):
         if self.lenient:
             _check_csv_ragged_and_warn(self.filepath, self.delimiter)
         try:
+            # Skip only the LEADING comment block. Using comment_prefix here
+            # would also drop any data row whose first field begins with "#"
+            # (e.g. a hex color like "#FF0000"), silently losing rows.
             df = pl.read_csv(
                 self.filepath,
                 separator=self.delimiter,
                 truncate_ragged_lines=self.lenient,
                 infer_schema=False,
-                comment_prefix="#",
+                skip_rows=_count_leading_comments(self.filepath),
             )
             if normalize_columns:
                 df = df.rename(CSVColumnNameNormalizer(self.filepath, columns=df.columns).columns_to_normalized_mapping)
@@ -367,13 +403,15 @@ class CSVReaderPolarsEngine(CSVBaseReaderEngine):
         if self.lenient:
             _check_csv_ragged_and_warn(self.filepath, self.delimiter)
         try:
+            # Skip only the LEADING comment block so data rows whose first
+            # field starts with "#" are not mistaken for comments.
             df = pl.read_csv(
                 self.filepath,
                 separator=self.delimiter,
                 truncate_ragged_lines=self.lenient,
                 infer_schema=False,
                 n_rows=CSVEngineProperties.dataframe_sample_rows,
-                comment_prefix="#",
+                skip_rows=_count_leading_comments(self.filepath),
             )
             if normalize_columns:
                 df = df.rename(CSVColumnNameNormalizer(self.filepath, columns=df.columns).columns_to_normalized_mapping)
@@ -452,7 +490,13 @@ class CSVReaderPolarsEngine(CSVBaseReaderEngine):
             query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
             dg.query_csv_data(query)
         """
-        return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
+        # The result is a fully-materialized polars DataFrame, so the
+        # connection can be disposed deterministically (unlike the duckdb
+        # engine, whose query_data returns a live relation).
+        try:
+            return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
+        finally:
+            self.queries.close()
 
 
 class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
@@ -474,8 +518,13 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
                 normalize_columns bool: Whether to normalize column names.
         """
         filename = self.queries.set_export_filename(CSVEngineProperties.csv_export_filename, export_filename)
-        self.queries.create_table(normalize_columns)
-        self.queries.connection.sql(self.queries.export_csv_query(filename))
+        # COPY executes eagerly on .sql(), so the file is written before close()
+        # releases the per-call connection.
+        try:
+            self.queries.create_table(normalize_columns)
+            self.queries.connection.sql(self.queries.export_csv_query(filename))
+        finally:
+            self.queries.close()
 
     def write_excel(self, export_filename=None, normalize_columns=False):
         """
@@ -487,8 +536,11 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
             names.
         """
         filename = self.queries.set_export_filename(CSVEngineProperties.excel_export_filename, export_filename)
-        self.queries.create_table(normalize_columns)
-        self.queries.connection.sql(self.queries.export_excel_query(filename))
+        try:
+            self.queries.create_table(normalize_columns)
+            self.queries.connection.sql(self.queries.export_excel_query(filename))
+        finally:
+            self.queries.close()
 
     def write_json(self, export_filename=None, normalize_columns=False):
         """
@@ -500,8 +552,11 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
             names.
         """
         filename = self.queries.set_export_filename(CSVEngineProperties.json_export_filename, export_filename)
-        self.queries.create_table(normalize_columns)
-        self.queries.connection.sql(self.queries.export_json_query(filename))
+        try:
+            self.queries.create_table(normalize_columns)
+            self.queries.connection.sql(self.queries.export_json_query(filename))
+        finally:
+            self.queries.close()
 
     def write_json_newline_delimited(self, export_filename=None, normalize_columns=False):
         """
@@ -513,8 +568,11 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
             names.
         """
         filename = self.queries.set_export_filename(CSVEngineProperties.json_newline_export_filename, export_filename)
-        self.queries.create_table(normalize_columns)
-        self.queries.connection.sql(self.queries.export_json_newline_delimited_query(filename))
+        try:
+            self.queries.create_table(normalize_columns)
+            self.queries.connection.sql(self.queries.export_json_newline_delimited_query(filename))
+        finally:
+            self.queries.close()
 
     def write_parquet(self, export_filename=None, normalize_columns=False):
         """
@@ -526,8 +584,11 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
             names.
         """
         filename = self.queries.set_export_filename(CSVEngineProperties.parquet_export_filename, export_filename)
-        self.queries.create_table(normalize_columns)
-        self.queries.connection.sql(self.queries.export_parquet_query(filename))
+        try:
+            self.queries.create_table(normalize_columns)
+            self.queries.connection.sql(self.queries.export_parquet_query(filename))
+        finally:
+            self.queries.close()
 
 
 class CSVWriterPolarsEngine(CSVBaseWriterEngine):
@@ -608,6 +669,43 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
     Class to read CSV files and convert CSV files powered by PyArrow.
     """
 
+    def _polars_fallback_table(self, columns, normalize_columns, truncate_ragged_lines, n_rows=None):
+        """Parse the CSV with Polars and convert it to an Arrow table.
+
+        Used whenever the native PyArrow reader cannot handle the input: lenient
+        (ragged) mode and files with mid-file ``#`` comment lines (which crash
+        PyArrow's parser). Skips only the LEADING comment block — using
+        ``comment_prefix`` would also drop any data row whose first field
+        begins with ``#`` (e.g. a hex color), silently losing rows (issue #73)
+        — so the result matches the polars reference engine row-for-row.
+
+        Args:
+            columns (list): Original column names, used for normalization lookup.
+            normalize_columns (bool): Whether to normalize column names.
+            truncate_ragged_lines (bool): Whether to truncate ragged rows.
+            n_rows (int, optional): Limit the number of rows read (for samples).
+
+        Returns:
+            A PyArrow table with all columns cast to string.
+        """
+        df = pl.read_csv(
+            self.filepath,
+            separator=self.delimiter,
+            truncate_ragged_lines=truncate_ragged_lines,
+            infer_schema=False,
+            skip_rows=_count_leading_comments(self.filepath),
+            n_rows=n_rows,
+        )
+        table = df.to_arrow()
+        string_schema = pa.schema([(name, pa.string()) for name in table.column_names])
+        table = table.cast(string_schema)
+        if normalize_columns:
+            column_normalizer = CSVColumnNameNormalizer(self.filepath, columns=columns)
+            old_names = table.column_names
+            new_names = [column_normalizer.columns_to_normalized_mapping.get(name, name) for name in old_names]
+            table = table.rename_columns(new_names)
+        return table
+
     def _create_table(self, normalize_columns=False):
         """
         Create a PyArrow table from the CSV file.
@@ -635,24 +733,14 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
         if self.lenient:
             _check_csv_ragged_and_warn(self.filepath, self.delimiter)
             # Fallback to Polars to parse the ragged CSV, then convert to Arrow Table
-            df = pl.read_csv(
-                self.filepath,
-                separator=self.delimiter,
-                truncate_ragged_lines=True,
-                infer_schema=False,
-                comment_prefix="#",
-            )
-            table = df.to_arrow()
-            string_schema = pa.schema([(name, pa.string()) for name in table.column_names])
-            table = table.cast(string_schema)
-            if normalize_columns:
-                column_normalizer = CSVColumnNameNormalizer(self.filepath, columns=columns)
-                old_names = table.column_names
-                new_names = [column_normalizer.columns_to_normalized_mapping.get(name, name) for name in old_names]
-                table = table.rename_columns(new_names)
-            return table
+            return self._polars_fallback_table(columns, normalize_columns, truncate_ragged_lines=True)
+        if _has_midfile_comments(self.filepath):
+            # PyArrow's native reader crashes on comment lines past the leading
+            # block; defer to Polars so the rows match the polars reference
+            # engine (issue #90).
+            return self._polars_fallback_table(columns, normalize_columns, truncate_ragged_lines=False)
         try:
-            skip_count = _count_leading_comments(self.filepath) + 1
+            skip_count = _count_leading_physical_lines_before_header(self.filepath)
             table = pacsv.read_csv(
                 self.filepath,
                 read_options=pacsv.ReadOptions(column_names=columns, skip_rows=skip_count),
@@ -697,34 +785,49 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
         if self.lenient:
             _check_csv_ragged_and_warn(self.filepath, self.delimiter)
             # Fallback to Polars to parse the ragged CSV, then convert to Arrow Table
-            df = pl.read_csv(
-                self.filepath,
-                separator=self.delimiter,
+            return self._polars_fallback_table(
+                columns,
+                normalize_columns,
                 truncate_ragged_lines=True,
-                infer_schema=False,
                 n_rows=CSVEngineProperties.dataframe_sample_rows,
-                comment_prefix="#",
             )
-            table = df.to_arrow()
-            string_schema = pa.schema([(name, pa.string()) for name in table.column_names])
-            table = table.cast(string_schema)
-            if normalize_columns:
-                column_normalizer = CSVColumnNameNormalizer(self.filepath, columns=columns)
-                old_names = table.column_names
-                new_names = [column_normalizer.columns_to_normalized_mapping.get(name, name) for name in old_names]
-                table = table.rename_columns(new_names)
-            return table
+        if _has_midfile_comments(self.filepath):
+            # PyArrow's native reader crashes on comment lines past the leading
+            # block; defer to Polars so the rows match the polars reference
+            # engine (issue #90).
+            return self._polars_fallback_table(
+                columns,
+                normalize_columns,
+                truncate_ragged_lines=False,
+                n_rows=CSVEngineProperties.dataframe_sample_rows,
+            )
         try:
-            skip_count = _count_leading_comments(self.filepath) + 1
-            table = pacsv.read_csv(
+            skip_count = _count_leading_physical_lines_before_header(self.filepath)
+            sample_rows = CSVEngineProperties.dataframe_sample_rows
+            # Stream the file in batches and stop once we have enough rows,
+            # rather than materializing the whole file just to slice the head.
+            reader = pacsv.open_csv(
                 self.filepath,
                 read_options=pacsv.ReadOptions(column_names=columns, skip_rows=skip_count),
                 parse_options=pacsv.ParseOptions(delimiter=self.delimiter),
                 convert_options=pacsv.ConvertOptions(column_types=string_schema),
             )
+            batches = []
+            collected = 0
+            try:
+                while collected < sample_rows:
+                    batch = reader.read_next_batch()
+                    if batch.num_rows == 0:
+                        continue
+                    batches.append(batch)
+                    collected += batch.num_rows
+            except StopIteration:
+                # Fewer rows than the sample size; return whatever was read.
+                pass
+            finally:
+                reader.close()
 
-            # Take sample rows
-            sample_table = table.slice(0, CSVEngineProperties.dataframe_sample_rows)
+            sample_table = pa.Table.from_batches(batches, schema=string_schema).slice(0, sample_rows)
 
             if normalize_columns:
                 column_normalizer = CSVColumnNameNormalizer(self.filepath, columns=columns)
@@ -820,7 +923,13 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
             query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
             dg.query_csv_data(query)
         """
-        return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
+        # The result is a fully-materialized polars DataFrame, so the
+        # connection can be disposed deterministically (unlike the duckdb
+        # engine, whose query_data returns a live relation).
+        try:
+            return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
+        finally:
+            self.queries.close()
 
 
 class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
@@ -845,15 +954,17 @@ class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
                 "PyArrow engine does not support legacy Mac OS carriage return (\\r) newlines. "
                 "Please use engine='duckdb' or convert the file to Unix/Windows newlines."
             )
-        if self.lenient:
-            _check_csv_ragged_and_warn(self.filepath, self.queries.delimiter)
-            # Fallback to Polars to parse the ragged CSV, then convert to Arrow Table
+        if self.lenient or _has_midfile_comments(self.filepath):
+            if self.lenient:
+                _check_csv_ragged_and_warn(self.filepath, self.queries.delimiter)
+            # Fallback to Polars: it parses ragged rows and skips mid-file ``#``
+            # comment lines that the native PyArrow reader chokes on (issue #90).
             df = pl.read_csv(
                 self.filepath,
                 separator=self.queries.delimiter,
-                truncate_ragged_lines=True,
+                truncate_ragged_lines=self.lenient,
                 infer_schema=False,
-                comment_prefix="#",
+                skip_rows=_count_leading_comments(self.filepath),
             )
             table = df.to_arrow()
             string_schema = pa.schema([(name, pa.string()) for name in table.column_names])
@@ -865,7 +976,7 @@ class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
                 table = table.rename_columns(new_names)
             return table
         try:
-            skip_count = _count_leading_comments(self.filepath) + 1
+            skip_count = _count_leading_physical_lines_before_header(self.filepath)
             table = pacsv.read_csv(
                 self.filepath,
                 read_options=pacsv.ReadOptions(column_names=columns, skip_rows=skip_count),

@@ -176,6 +176,26 @@ def sample_pdf(tmp_path):
 
 
 @pytest.fixture
+def encrypted_pdf(tmp_path):
+    """Create a one-page AES-256 encrypted (password-protected) PDF."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((72, 72), "Confidential", fontsize=12)
+
+    pdf_path = tmp_path / "encrypted.pdf"
+    doc.save(
+        str(pdf_path),
+        encryption=pymupdf.PDF_ENCRYPT_AES_256,
+        owner_pw="owner-secret",
+        user_pw="user-secret",
+    )
+    doc.close()
+    return str(pdf_path)
+
+
+@pytest.fixture
 def empty_pdf(tmp_path):
     """Create a 0-byte PDF file."""
     pdf_path = tmp_path / "empty.pdf"
