@@ -275,7 +275,11 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         projections = []
         for col in current_columns:
             normalized_name = column_normalizer.columns_to_normalized_mapping.get(col, col)
-            projections.append(f'"{col}" AS "{normalized_name}"')
+            # Double-quote-escape both identifiers; a quote in a header-derived
+            # column name would otherwise break the projection SQL.
+            safe_col = col.replace('"', '""')
+            safe_normalized = normalized_name.replace('"', '""')
+            projections.append(f'"{safe_col}" AS "{safe_normalized}"')
         return relation.project(", ".join(projections))
 
     def query_data(self, sql_query, normalize_columns=False):
