@@ -56,10 +56,17 @@ class PdfiumNativeReader:
                 )
             ]
             ocr_used = False
+            warnings = []
             if not full_text.strip():
-                full_text, extra, ocr_used = self._ocr_fallback(doc, page_index, width, height)
-                text_objects.extend(extra)
-            return {
+                try:
+                    full_text, extra, ocr_used = self._ocr_fallback(doc, page_index, width, height)
+                    text_objects.extend(extra)
+                except Exception as exc:  # noqa: BLE001 - soft per-category failure
+                    # OCR failed (e.g. missing tesseract). Keep the page with its
+                    # already-extracted images/text rather than dropping it, and
+                    # record a page-level warning. See base.py soft-failure contract.
+                    warnings.append(f"OCR failed: {exc}")
+            page_dict = {
                 "page_number": page_index + 1,
                 "width": round(float(width), 2),
                 "height": round(float(height), 2),
@@ -68,6 +75,9 @@ class PdfiumNativeReader:
                 "images": images,
                 "ocr": ocr_used,
             }
+            if warnings:
+                page_dict["warnings"] = warnings
+            return page_dict
         finally:
             if should_close:
                 doc.close()

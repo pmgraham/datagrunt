@@ -65,12 +65,23 @@ class DocumentAssembler:
                         return True
                 return False
 
+            warnings = []
             if analysis.has_text_layer:
                 for block in self.backend.extract_text_blocks(page_index):
                     if not is_inside_table(block.bbox):
                         elements.append(self._text_element(block, gen_elem_id(), page_index))
             elif analysis.is_scanned:
-                for block in self.backend.ocr_page(page_index, dpi=dpi_for_page(analysis.width, analysis.height)):
+                try:
+                    ocr_blocks = self.backend.ocr_page(
+                        page_index, dpi=dpi_for_page(analysis.width, analysis.height)
+                    )
+                except Exception as exc:  # noqa: BLE001 - soft per-category failure
+                    # OCR failed (e.g. missing tesseract). Keep the page with its
+                    # already-extracted images/tables rather than dropping it, and
+                    # record a page-level warning. See base.py soft-failure contract.
+                    ocr_blocks = []
+                    warnings.append(f"OCR failed: {exc}")
+                for block in ocr_blocks:
                     if not is_inside_table(block.bbox):
                         elements.append(self._ocr_element(block, gen_elem_id(), page_index))
 
@@ -89,13 +100,16 @@ class DocumentAssembler:
             elif analysis.has_text_layer and len(elements) == 0:
                 classification = "text_only"
 
-            return {
+            page_dict = {
                 "page_number": page_index + 1,
                 "width": float(analysis.width),
                 "height": float(analysis.height),
                 "classification": classification,
                 "elements": PageLayoutSorter(ElementAdapter()).sort(elements),
             }
+            if warnings:
+                page_dict["warnings"] = warnings
+            return page_dict
 
     def parse_document(self, total_pages, image_output_dir=None) -> dict:
         """Parse all pages sequentially and combine into the document envelope."""
