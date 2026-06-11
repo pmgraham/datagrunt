@@ -40,6 +40,18 @@ class PDFWriter(PDFComponents):
         """Create a writer engine instance."""
         return PDFEngineFactory(self.filepath, self.engine, self.workers, structured=not self.native).create_writer()
 
+    @staticmethod
+    def _write_empty_file(filename, content=""):
+        """Write ``content`` (default empty) to ``filename`` and return the path.
+
+        Used to mirror the reader's empty-document handling: a 0-byte PDF yields
+        an empty/minimal output file instead of leaking a raw PdfiumError from
+        the engine.
+        """
+        with open(filename, "w") as f:
+            f.write(content)
+        return filename
+
     def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
         """Parse the PDF and write the unified document JSON to disk.
 
@@ -61,12 +73,16 @@ class PDFWriter(PDFComponents):
             if image_output_dir and dedupe_images:
                 is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
                 if is_structured:
-                    pdfcomponents.ParsedDocument(document).dedupe_images()
+                    pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
                 else:
-                    PdfiumNativeReader.dedupe_images(document)
+                    PdfiumNativeReader.dedupe_images(document, image_output_dir=image_output_dir)
             with open(filename, "w") as f:
                 json.dump(document, f, indent=2)
             return filename
+        # Mirror PDFReader's is_empty handling: a 0-byte PDF produces an empty
+        # document ({}) rather than a raw PdfiumError from loading the file.
+        if self.is_empty:
+            return self._write_empty_file(export_filename or "output.json", json.dumps({}))
         return self._create_writer().write_json(export_filename, image_output_dir, dedupe_images, drop_layout_tables)
 
     def write_json_newline_delimited(
@@ -92,9 +108,9 @@ class PDFWriter(PDFComponents):
             if image_output_dir and dedupe_images:
                 is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
                 if is_structured:
-                    pdfcomponents.ParsedDocument(document).dedupe_images()
+                    pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
                 else:
-                    PdfiumNativeReader.dedupe_images(document)
+                    PdfiumNativeReader.dedupe_images(document, image_output_dir=image_output_dir)
             
             is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
             if is_structured:
@@ -105,6 +121,10 @@ class PDFWriter(PDFComponents):
                 for record in records:
                     f.write(json.dumps(record) + "\n")
             return filename
+        # Mirror PDFReader's is_empty handling: a 0-byte PDF has no elements, so
+        # the JSONL output is an empty file rather than a raw PdfiumError.
+        if self.is_empty:
+            return self._write_empty_file(export_filename or "output.jsonl")
         return self._create_writer().write_json_newline_delimited(
             export_filename, image_output_dir, dedupe_images, drop_layout_tables
         )
@@ -132,9 +152,9 @@ class PDFWriter(PDFComponents):
             if image_output_dir and dedupe_images:
                 is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
                 if is_structured:
-                    pdfcomponents.ParsedDocument(document).dedupe_images()
+                    pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
                 else:
-                    PdfiumNativeReader.dedupe_images(document)
+                    PdfiumNativeReader.dedupe_images(document, image_output_dir=image_output_dir)
             
             is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
             if is_structured:
@@ -144,6 +164,10 @@ class PDFWriter(PDFComponents):
             with open(filename, "w") as f:
                 f.write(markdown_text)
             return filename
+        # Mirror PDFReader's is_empty handling: a 0-byte PDF has no content, so
+        # the Markdown output is an empty file rather than a raw PdfiumError.
+        if self.is_empty:
+            return self._write_empty_file(export_filename or "output.md")
         return self._create_writer().write_markdown(
             export_filename, image_output_dir, dedupe_images, drop_layout_tables
         )
@@ -162,12 +186,13 @@ class PDFWriter(PDFComponents):
         """
         if self._parsed_dict is not None:
             document = self._parsed_dict
+            image_dir = output_dir if output_dir else "output_images"
             is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
             if dedupe:
                 if is_structured:
-                    pdfcomponents.ParsedDocument(document).dedupe_images()
+                    pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_dir)
                 else:
-                    PdfiumNativeReader.dedupe_images(document)
+                    PdfiumNativeReader.dedupe_images(document, image_output_dir=image_dir)
             paths = []
             seen = set()
             for page in document.get("document", {}).get("pages", []):
@@ -184,4 +209,7 @@ class PDFWriter(PDFComponents):
                         seen.add(fp)
                         paths.append(fp)
             return paths
+        # Mirror PDFReader's is_empty handling: a 0-byte PDF has no images.
+        if self.is_empty:
+            return []
         return self._create_writer().extract_images(output_dir, dedupe)

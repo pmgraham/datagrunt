@@ -1,7 +1,67 @@
 """Tests for PDF component assembly."""
 
+import pytest
 
 from datagrunt.core.pdf_io import pdfcomponents
+
+
+@pytest.fixture
+def text_only_pdf(tmp_path):
+    """Create a one-page PDF with native text and no images or tables."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)  # US Letter
+    page.insert_text((72, 72), "Quarterly Report", fontsize=24)  # header (large)
+    page.insert_text((72, 120), "This is body text for testing.", fontsize=11)
+    page.insert_text((72, 140), "Body line two for the report.", fontsize=11)
+    page.insert_text((72, 160), "Body line three with details.", fontsize=11)
+    page.insert_text((72, 180), "Body line four wraps up the text.", fontsize=11)
+    pdf_path = tmp_path / "text_only.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+    return str(pdf_path)
+
+
+def _pdfium_backend(filepath):
+    from datagrunt.core.pdf_io.extraction import PdfiumBackend
+
+    return PdfiumBackend(filepath)
+
+
+def _pymupdf_backend(filepath):
+    from datagrunt.core.pdf_io.extraction import PyMuPDFBackend
+
+    return PyMuPDFBackend(filepath)
+
+
+class TestPageClassification:
+    """Page ``classification`` reflects the element makeup of the page (issue #97)."""
+
+    @pytest.mark.parametrize("make_backend", [_pymupdf_backend, _pdfium_backend])
+    def test_text_only_page_classified_text_only(self, text_only_pdf, make_backend):
+        from datagrunt.core.pdf_io.pdfcomponents import DocumentAssembler
+
+        page = DocumentAssembler(
+            text_only_pdf, backend=make_backend(text_only_pdf)
+        ).parse_page(0)
+
+        types = {el["type"] for el in page["elements"]}
+        assert "image" not in types
+        assert "table" not in types
+        assert page["classification"] == "text_only"
+
+    @pytest.mark.parametrize("make_backend", [_pymupdf_backend, _pdfium_backend])
+    def test_page_with_image_classified_mixed(self, sample_pdf, make_backend):
+        from datagrunt.core.pdf_io.pdfcomponents import DocumentAssembler
+
+        page = DocumentAssembler(
+            sample_pdf, backend=make_backend(sample_pdf)
+        ).parse_page(0)
+
+        types = {el["type"] for el in page["elements"]}
+        assert "image" in types
+        assert page["classification"] == "mixed"
 
 
 class TestParsePage:
@@ -57,6 +117,25 @@ class TestPDFComponents:
         assert comp.is_pdf
         assert comp.total_pages == 1
 
+    def test_total_pages_zero_page_pdf(self, tmp_path):
+        """total_pages must report 0 for a zero-page PDF, not raise PdfiumError.
+
+        Counting via the pymupdf backend keeps page counting off pdfium, which
+        cannot load zero-page PDFs at all (see issue #95).
+        """
+        import io
+
+        import pypdfium2 as pdfium
+
+        doc = pdfium.PdfDocument.new()
+        buf = io.BytesIO()
+        doc.save(buf)
+        path = tmp_path / "zero_page.pdf"
+        path.write_bytes(buf.getvalue())
+
+        comp = pdfcomponents.PDFComponents(path)
+        assert comp.total_pages == 0
+
 
 class TestDedupeImages:
     """Test suite for ParsedDocument.dedupe_images."""
@@ -100,7 +179,7 @@ class TestDedupeImages:
             }
         }
 
-        removed = pdfcomponents.ParsedDocument(document).dedupe_images()
+        removed = pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=str(tmp_path))
 
         assert removed == 1
         # The redundant duplicate file is deleted; the first + unique remain.
@@ -268,7 +347,7 @@ class TestParsedDocument:
             {"type": "image", "metadata": {"file_path": str(a)}},
             {"type": "image", "metadata": {"file_path": str(b)}},
         ]}]}}
-        removed = ParsedDocument(document).dedupe_images()
+        removed = ParsedDocument(document).dedupe_images(image_output_dir=str(tmp_path))
         assert removed == 1 and not b.exists()
 
     def test_drop_layout_tables(self):
@@ -283,3 +362,56 @@ class TestParsedDocument:
         assert pd.drop_layout_tables() == 1
         kept = document["document"]["pages"][0]["elements"]
         assert [e["type"] for e in kept] == ["table", "body_text"]
+
+
+class TestMarkdownMetacharacterEscaping:
+    """Body/caption text starting with markdown metacharacters must be escaped."""
+
+    @staticmethod
+    def _element(etype, content):
+        return {"type": etype, "content": content, "metadata": {}}
+
+    @staticmethod
+    def _markdown(elements):
+        from datagrunt.core.pdf_io.pdfcomponents import ParsedDocument
+
+        document = {"document": {"pages": [{"page_number": 1, "elements": elements}]}}
+        return ParsedDocument(document).to_markdown()
+
+    def test_body_text_leading_hash_is_escaped(self):
+        md = self._markdown([self._element("body_text", "# rm -rf is not a heading")])
+        assert "\\# rm -rf is not a heading" in md
+        # The line must not begin with a bare H1 marker.
+        assert not md.lstrip().startswith("# ")
+
+    def test_body_text_leading_dash_is_escaped(self):
+        md = self._markdown([self._element("body_text", "- not a list item")])
+        assert "\\- not a list item" in md
+
+    def test_body_text_leading_blockquote_is_escaped(self):
+        md = self._markdown([self._element("body_text", "> not a quote")])
+        assert "\\> not a quote" in md
+
+    def test_body_text_leading_ordered_list_is_escaped(self):
+        md = self._markdown([self._element("body_text", "1. not a list")])
+        assert "1\\. not a list" in md
+
+    def test_caption_leading_metacharacter_is_escaped(self):
+        md = self._markdown([self._element("caption", "# caption text")])
+        assert "*\\# caption text*" in md
+
+    def test_intentional_heading_element_still_renders(self):
+        md = self._markdown([self._element("header", "Quarterly Report")])
+        assert md.lstrip().startswith("# Quarterly Report")
+
+    def test_heading_content_with_metacharacter_does_not_inject_structure(self):
+        # A genuine heading element keeps its '# ' marker, but its own content
+        # must not introduce a second heading level.
+        md = self._markdown([self._element("header", "# extra hash")])
+        assert "# \\# extra hash" in md
+
+    def test_table_cell_escaping_unchanged(self):
+        from datagrunt.core.pdf_io.pdfcomponents import ParsedDocument
+
+        rendered = ParsedDocument._render_table([["a|b", "c"]], has_header=False)
+        assert "a\\|b" in rendered
