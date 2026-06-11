@@ -2,6 +2,7 @@
 
 import pytest
 
+from datagrunt import CSVReader, CSVWriter
 from datagrunt.core import FileProperties
 
 
@@ -89,3 +90,42 @@ class TestFileProperties:
         assert not pdf_file.is_csv
         assert not pdf_file.is_structured
         assert not pdf_file.is_semi_structured
+
+
+class TestPathValidation:
+    """Test path validation at construction for FileProperties and CSV APIs."""
+
+    def test_directory_raises_value_error(self, tmp_path):
+        """A directory path raises a clear ValueError, not a raw IsADirectoryError."""
+        with pytest.raises(ValueError, match="is a directory, not a file"):
+            FileProperties(tmp_path)
+
+    def test_missing_path_raises_file_not_found(self, tmp_path):
+        """A missing path raises FileNotFoundError."""
+        with pytest.raises(FileNotFoundError):
+            FileProperties(tmp_path / "does_not_exist.csv")
+
+    def test_csv_reader_on_directory_raises_value_error(self, tmp_path):
+        """CSVReader on a directory raises a clean ValueError at construction."""
+        with pytest.raises(ValueError, match="is a directory, not a file"):
+            CSVReader(tmp_path)
+
+    def test_csv_writer_on_directory_raises_value_error(self, tmp_path):
+        """CSVWriter on a directory raises a clean ValueError at construction."""
+        with pytest.raises(ValueError, match="is a directory, not a file"):
+            CSVWriter(tmp_path)
+
+    def test_csv_reader_on_missing_path_raises_file_not_found(self, tmp_path):
+        """CSVReader on a missing path raises FileNotFoundError."""
+        with pytest.raises(FileNotFoundError):
+            CSVReader(tmp_path / "missing.csv")
+
+    def test_csv_writer_on_missing_path_raises_file_not_found(self, tmp_path):
+        """CSVWriter on a missing path raises FileNotFoundError."""
+        with pytest.raises(FileNotFoundError):
+            CSVWriter(tmp_path / "missing.csv")
+
+    def test_valid_file_still_constructs(self, sample_files):
+        """A normal file path still constructs without error."""
+        reader = CSVReader(sample_files["data.csv"])
+        assert reader.filename == "data.csv"
