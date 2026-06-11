@@ -57,6 +57,25 @@ class TestPDFComponents:
         assert comp.is_pdf
         assert comp.total_pages == 1
 
+    def test_total_pages_zero_page_pdf(self, tmp_path):
+        """total_pages must report 0 for a zero-page PDF, not raise PdfiumError.
+
+        Counting via the pymupdf backend keeps page counting off pdfium, which
+        cannot load zero-page PDFs at all (see issue #95).
+        """
+        import io
+
+        import pypdfium2 as pdfium
+
+        doc = pdfium.PdfDocument.new()
+        buf = io.BytesIO()
+        doc.save(buf)
+        path = tmp_path / "zero_page.pdf"
+        path.write_bytes(buf.getvalue())
+
+        comp = pdfcomponents.PDFComponents(path)
+        assert comp.total_pages == 0
+
 
 class TestDedupeImages:
     """Test suite for ParsedDocument.dedupe_images."""

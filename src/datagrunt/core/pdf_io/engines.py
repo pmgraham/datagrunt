@@ -17,7 +17,7 @@ import pyarrow as pa
 
 # local libraries
 from datagrunt.core.pdf_io import pdfcomponents
-from datagrunt.core.pdf_io.extraction import PdfiumBackend, PdfiumNativeReader
+from datagrunt.core.pdf_io.extraction import PdfiumBackend, PdfiumNativeReader, PyMuPDFBackend
 from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
 
 logger = logging.getLogger(__name__)
@@ -121,8 +121,10 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
     """Read and parse PDF files using PyMuPDF / pdfplumber / Tesseract."""
 
     def _total_pages(self) -> int:
-        with PdfiumDocument(self.filepath) as doc:
-            return len(doc)
+        # Count pages with the engine's own backend so the pymupdf path has no
+        # pdfium dependency; pdfium cannot load zero-page PDFs that pymupdf
+        # handles fine (see issue #95).
+        return PyMuPDFBackend(self.filepath).page_count()
 
     def to_dicts(self, image_output_dir: Optional[str] = None, drop_layout_tables: bool = False) -> dict:
         """Parse all pages concurrently into the unified document dict."""
