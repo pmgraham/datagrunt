@@ -207,8 +207,10 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         Returns:
             A Polars DataFrame containing the sample rows.
         """
-        relation = self.queries.create_table(normalize_columns)
-        return relation.limit(CSVEngineProperties.dataframe_sample_rows).pl()
+        return self.queries.sample_dataframe(
+            CSVEngineProperties.dataframe_sample_rows,
+            normalize_columns,
+        )
 
     def to_dataframe(self, normalize_columns=False):
         """
@@ -711,15 +713,31 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
             return table
         try:
             skip_count = _count_leading_physical_lines_before_header(self.filepath)
-            table = pacsv.read_csv(
+            sample_rows = CSVEngineProperties.dataframe_sample_rows
+            # Stream the file in batches and stop once we have enough rows,
+            # rather than materializing the whole file just to slice the head.
+            reader = pacsv.open_csv(
                 self.filepath,
                 read_options=pacsv.ReadOptions(column_names=columns, skip_rows=skip_count),
                 parse_options=pacsv.ParseOptions(delimiter=self.delimiter),
                 convert_options=pacsv.ConvertOptions(column_types=string_schema),
             )
+            batches = []
+            collected = 0
+            try:
+                while collected < sample_rows:
+                    batch = reader.read_next_batch()
+                    if batch.num_rows == 0:
+                        continue
+                    batches.append(batch)
+                    collected += batch.num_rows
+            except StopIteration:
+                # Fewer rows than the sample size; return whatever was read.
+                pass
+            finally:
+                reader.close()
 
-            # Take sample rows
-            sample_table = table.slice(0, CSVEngineProperties.dataframe_sample_rows)
+            sample_table = pa.Table.from_batches(batches, schema=string_schema).slice(0, sample_rows)
 
             if normalize_columns:
                 column_normalizer = CSVColumnNameNormalizer(self.filepath, columns=columns)
