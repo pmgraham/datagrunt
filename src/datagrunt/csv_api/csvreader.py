@@ -4,6 +4,7 @@ objects.
 """
 
 # standard library
+from functools import cached_property
 from pathlib import Path
 
 # third party libraries
@@ -37,9 +38,24 @@ class CSVReader(CSVComponents):
         """Return an empty object of the specified type."""
         return object
 
-    def _create_reader(self):
-        """Create a reader object."""
+    @cached_property
+    def _reader(self):
+        """Return this reader's engine, built once and reused.
+
+        The engine owns the DuckDB connection (and, for the DuckDB engine, the
+        imported table). Caching it here means repeated calls - notably
+        ``query_data`` - reuse a single import instead of rebuilding a fresh
+        engine and re-importing the file on every call (issue #104).
+        """
         return CSVEngineFactory(self.filepath, self.engine, lenient=self.lenient).create_reader()
+
+    def _create_reader(self):
+        """Return this reader's cached engine.
+
+        Retained for backward compatibility; delegates to the cached ``_reader``
+        so callers share a single engine and a single CSV import.
+        """
+        return self._reader
 
     def get_sample(self, normalize_columns=False):
         """Return a sample of the CSV file.
