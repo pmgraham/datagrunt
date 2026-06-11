@@ -148,6 +148,47 @@ class TestCSVColumnNameNormalizer:
         assert mapping["First Name"] == "first_name"
         assert mapping["Last Name"] == "last_name"
 
+    def test_normalized_name_collides_with_existing_suffixed_name(self, tmp_path):
+        """The uniquifier must not emit a name that collides with a real column.
+
+        ``Col A`` and ``col a`` both normalize to ``col_a``; the third header
+        ``col_a_1`` already occupies the naive ``col_a_1`` suffix. The result
+        must be three DISTINCT names, so the suffix counter has to keep
+        incrementing past names already taken.
+        """
+        csv_file = tmp_path / "test.csv"
+        csv_file.write_text("Col A,col a,col_a_1\n1,2,3")
+
+        normalizer = CSVColumnNameNormalizer(str(csv_file))
+        normalized = normalizer.columns_normalized
+        assert len(normalized) == 3
+        assert len(set(normalized)) == 3  # no collisions
+
+    def test_header_that_normalizes_to_empty_gets_placeholder(self, tmp_path):
+        """A header cell of only special chars must not normalize to ``""``.
+
+        An empty identifier (e.g. from a header of ``%``) is an invalid,
+        zero-length SQL identifier. The normalizer must return a non-empty
+        placeholder so it can be uniquified into a valid column name.
+        """
+        csv_file = tmp_path / "test.csv"
+        csv_file.write_text("%,name\n1,2")
+
+        normalizer = CSVColumnNameNormalizer(str(csv_file))
+        normalized = normalizer.columns_normalized
+        assert all(name != "" for name in normalized)
+        assert len(set(normalized)) == len(normalized)
+
+    def test_multiple_empty_headers_get_unique_placeholders(self, tmp_path):
+        """Several empty-normalizing headers must yield distinct placeholders."""
+        csv_file = tmp_path / "test.csv"
+        csv_file.write_text("%,(),name\n1,2,3")
+
+        normalizer = CSVColumnNameNormalizer(str(csv_file))
+        normalized = normalizer.columns_normalized
+        assert all(name != "" for name in normalized)
+        assert len(set(normalized)) == 3
+
 
 class TestCSVRows:
     """Test suite for CSVRows class."""
