@@ -146,6 +146,56 @@ class TestPDFWriter:
         assert len(content) > 0
 
 
+class TestPDFWriterEmptyPdf:
+    """Empty (0-byte) PDFs must not surface a raw PdfiumError.
+
+    The reader (PDFReader) guards 0-byte files with ``is_empty`` and returns
+    empty objects rather than raising; the writer must behave consistently so
+    callers get an empty output file (or a clear ValueError), never a confusing
+    ``pypdfium2.PdfiumError`` leaking from deep inside the engine.
+    """
+
+    def _assert_not_pdfium_error(self, callable_):
+        """Run ``callable_``; fail if it raises a raw PdfiumError."""
+        try:
+            return callable_()
+        except Exception as exc:  # noqa: BLE001 - we are asserting the *kind* of error
+            module = type(exc).__module__
+            assert "pdfium" not in module.lower() and "PdfiumError" not in type(exc).__name__, (
+                f"empty PDF leaked a raw PdfiumError: {type(exc).__module__}.{type(exc).__name__}: {exc}"
+            )
+            raise
+
+    def test_write_json_empty_pdf(self, empty_pdf, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        writer = PDFWriter(empty_pdf)
+        path = self._assert_not_pdfium_error(lambda: writer.write_json("out.json"))
+        assert os.path.isfile(path)
+        with open(path) as f:
+            assert json.load(f) == {}
+
+    def test_write_json_newline_delimited_empty_pdf(self, empty_pdf, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        writer = PDFWriter(empty_pdf)
+        path = self._assert_not_pdfium_error(lambda: writer.write_json_newline_delimited("out.jsonl"))
+        assert os.path.isfile(path)
+        with open(path) as f:
+            assert [line for line in f if line.strip()] == []
+
+    def test_write_markdown_empty_pdf(self, empty_pdf, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        writer = PDFWriter(empty_pdf)
+        path = self._assert_not_pdfium_error(lambda: writer.write_markdown("out.md"))
+        assert os.path.isfile(path)
+
+    def test_extract_images_empty_pdf(self, empty_pdf, tmp_path):
+        writer = PDFWriter(empty_pdf)
+        paths = self._assert_not_pdfium_error(
+            lambda: writer.extract_images(output_dir=str(tmp_path / "imgs"))
+        )
+        assert paths == []
+
+
 class TestPDFWriterJsonAndDictInputs:
     """Tests for initializing PDFWriter with JSON files or dictionaries."""
 
