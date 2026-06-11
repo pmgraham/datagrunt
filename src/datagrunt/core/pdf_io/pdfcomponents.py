@@ -11,7 +11,6 @@ from datagrunt.core.file_io import FileProperties
 from datagrunt.core.pdf_io.extraction import PdfPlumberTableExtractor
 from datagrunt.core.pdf_io.extraction.image_dedupe import dedupe_image_files
 from datagrunt.core.pdf_io.extraction.ocr import dpi_for_page
-from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
 from datagrunt.core.pdf_io.extraction.pymupdf_backend import PyMuPDFBackend
 from datagrunt.core.pdf_io.extraction.layout_sorter import PageLayoutSorter, ElementAdapter
 
@@ -373,5 +372,8 @@ class PDFComponents(FileProperties):
         if self._parsed_dict is not None:
             pages = self._parsed_dict.get("document", {}).get("pages", [])
             return len(pages)
-        with PdfiumDocument(self.filepath) as d:
-            return len(d)
+        # Count pages with the pymupdf backend rather than pdfium: pdfium cannot
+        # load zero-page PDFs that pymupdf handles fine, and pymupdf reports the
+        # same count for valid PDFs, so the pdfium engine path stays correct
+        # while page counting no longer depends on pdfium (see issue #95).
+        return PyMuPDFBackend(self.filepath).page_count()

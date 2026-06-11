@@ -67,6 +67,32 @@ class TestPDFReaderEngine:
         assert isinstance(table, pa.Table)
         assert table.num_rows >= 2
 
+    @staticmethod
+    def _zero_page_pdf(tmp_path):
+        """Write a valid zero-page PDF that pymupdf opens but pdfium cannot."""
+        import io
+
+        import pypdfium2 as pdfium
+
+        doc = pdfium.PdfDocument.new()
+        buf = io.BytesIO()
+        doc.save(buf)
+        path = tmp_path / "zero_page.pdf"
+        path.write_bytes(buf.getvalue())
+        return path
+
+    def test_zero_page_pdf_parses_cleanly(self, tmp_path):
+        """A zero-page PDF must parse on the pymupdf engine, not raise PdfiumError.
+
+        pymupdf opens zero-page PDFs (page_count == 0), but pdfium refuses to
+        load them at all. Counting pages with the engine's own backend keeps the
+        pymupdf path off pdfium so it returns an empty document instead of
+        inheriting pdfium's stricter failure surface (see issue #95).
+        """
+        pdf = self._zero_page_pdf(tmp_path)
+        doc = PDFReaderPyMuPDFEngine(pdf).to_dicts()
+        assert doc["document"]["total_pages"] == 0
+        assert doc["document"]["pages"] == []
 
 
 class TestPDFWriterEngine:
