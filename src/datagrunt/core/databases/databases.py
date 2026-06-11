@@ -15,7 +15,7 @@ from datagrunt.core.csv_io import (
     CSVDelimiter,
     CSVDialect,
     _check_csv_ragged_and_warn,
-    _count_leading_comments,
+    _count_leading_physical_lines_before_header,
 )
 
 
@@ -40,7 +40,13 @@ class DuckDBQueries:
         self.lenient = lenient
         self.database_table_name = self._set_database_table_name()
         self.connection = duckdb.connect(":memory:")
-        self.skip_rows = _count_leading_comments(self.filepath)
+        # DuckDB's read_csv ``skip`` operates on physical lines and, unlike
+        # Polars/PyArrow, does not natively ignore leading blank lines. Skip
+        # every leading physical line up to (but not including) the header,
+        # which ``header=true`` then consumes. See issue #85. ``max(..., 0)``
+        # guards files with no header line (empty/blank), where the helper
+        # returns 0 and DuckDB rejects a negative ``skip``.
+        self.skip_rows = max(_count_leading_physical_lines_before_header(self.filepath) - 1, 0)
 
     @cached_property
     def delimiter(self):
