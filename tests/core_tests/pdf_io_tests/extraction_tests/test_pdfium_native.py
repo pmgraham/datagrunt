@@ -30,6 +30,26 @@ class TestPdfiumNativeReader:
             "page", "type", "text", "font_size", "x", "y", "w", "h", "bbox", "file", "px_width", "px_height", "ocr"
         }
 
+    def test_text_bbox_top_down_and_consistent_with_image(self, sample_pdf, tmp_path):
+        """Native text bbox is top-down (y0 <= y1), matching image bbox and position."""
+        page = PdfiumNativeReader(sample_pdf).parse_page(0, image_output_dir=str(tmp_path))
+
+        for obj in page["text_objects"]:
+            x0, y0, x1, y1 = obj["bbox"]
+            pos = obj["position"]
+            # Top-down ascending convention: y0 (top) <= y1 (bottom).
+            assert y0 <= y1, f"text bbox y order descending: {obj['bbox']}"
+            # bbox top must equal the position's y (top edge).
+            assert y0 == pos["y"]
+            # position height is positive (top-down) and matches bbox span.
+            assert pos["h"] > 0
+            assert round(y1 - y0, 2) == round(pos["h"], 2)
+
+        # Same page's image bbox follows the same ascending convention.
+        for img in page["images"]:
+            ix0, iy0, ix1, iy1 = img["bbox"]
+            assert iy0 <= iy1, f"image bbox y order descending: {img['bbox']}"
+
     def test_dedupe_images(self, tmp_path):
         a, b = tmp_path / "a.png", tmp_path / "b.png"
         a.write_bytes(b"X")

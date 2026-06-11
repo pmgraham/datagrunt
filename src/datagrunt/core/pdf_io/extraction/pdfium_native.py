@@ -84,7 +84,7 @@ class PdfiumNativeReader:
 
     def _text_object(self, item) -> dict:
         """Convert a TextItem to the native text-object dict."""
-        bbox = [item.x0, round(item.y_bot, 2), item.x1, round(item.y_top, 2)]
+        bbox = [item.x0, round(item.y_top, 2), item.x1, round(item.y_bot, 2)]
         return {
             "text": item.text,
             "bbox": bbox,
