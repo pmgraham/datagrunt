@@ -416,3 +416,17 @@ class TestEngines:
         assert "last_name" in df.columns
         assert "e_mail" in df.columns
         assert "phone" in df.columns
+
+
+class TestNonUtf8FileConstruction:
+    """Constructing readers/writers on non-UTF-8 files must not raise."""
+
+    def test_reader_construction_on_latin1_file(self, tmp_path):
+        """A latin-1 byte in the probe window must not crash construction."""
+        latin1_csv = tmp_path / "latin1.csv"
+        latin1_csv.write_bytes("café,price\nx,1\n".encode("latin-1"))
+
+        for engine in ALL_ENGINES:
+            # Construction alone probes delimiter/first-row/row-count.
+            reader = CSVEngineFactory(str(latin1_csv), engine).create_reader()
+            assert reader.delimiter == ","

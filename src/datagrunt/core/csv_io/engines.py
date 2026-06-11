@@ -25,7 +25,9 @@ from datagrunt.core.databases import DuckDBQueries
 
 def _count_leading_comments(filepath):
     count = 0
-    with open(filepath, "r", encoding="utf-8-sig") as f:
+    # errors="ignore" so a non-UTF-8 byte in the probe window can't crash this
+    # lightweight leading-comment scan used by the read paths.
+    with open(filepath, "r", encoding="utf-8-sig", errors="ignore") as f:
         for line in f:
             stripped = line.strip()
             if stripped.startswith("#") or not stripped:
