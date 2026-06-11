@@ -225,6 +225,33 @@ class TestCSVReader:
         df2 = reader_empty.to_dataframe()
         assert df1 is not df2
 
+    def test_get_sample_empty_and_blank_files(self, tmp_path):
+        """get_sample must return an empty DataFrame for empty and blank files.
+
+        Regression test for issue #86: get_sample lacked the empty/blank guard
+        the other read methods have, so it crashed or fabricated phantom
+        columns divergently per engine on empty or whitespace-only files.
+        """
+        # Test empty file (0 bytes)
+        empty_file = tmp_path / "empty.csv"
+        empty_file.write_text("")
+
+        for engine in ALL_ENGINES:
+            reader_empty = CSVReader(str(empty_file), engine=engine)
+            sample_empty = reader_empty.get_sample()
+            assert isinstance(sample_empty, pl.DataFrame)
+            assert sample_empty.shape == (0, 0)
+
+        # Test blank file (only whitespace and newlines)
+        blank_file = tmp_path / "blank.csv"
+        blank_file.write_text("\n   \n  \n")
+
+        for engine in ALL_ENGINES:
+            reader_blank = CSVReader(str(blank_file), engine=engine)
+            sample_blank = reader_blank.get_sample()
+            assert isinstance(sample_blank, pl.DataFrame)
+            assert sample_blank.shape == (0, 0)
+
     def test_query_data_empty_and_blank_files(self, tmp_path):
         """Test query_data method for empty and blank files."""
         # Test empty file (0 bytes)
