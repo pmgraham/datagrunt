@@ -12,6 +12,14 @@ from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, TextItem
 
 PDF_EXTRA_HINT = "PDF parsing requires extra dependencies. Install with: pip install datagrunt[pdf]"
 
+# Substring present in pdfium's load error when a PDF needs a password.
+_PDFIUM_PASSWORD_ERROR = "password"
+
+ENCRYPTED_PDF_MESSAGE = (
+    "The PDF is encrypted or password-protected and cannot be opened without "
+    "the correct password."
+)
+
 # Minimum image dimension (px) to keep; smaller images are layout artifacts.
 MIN_IMAGE_DIMENSION = 40
 
@@ -222,7 +230,15 @@ class PdfiumDocument:
         """
         pdfium, raw = _import_pdfium()
         self._raw = raw
-        self._pdf = pdfium.PdfDocument(str(filepath))
+        try:
+            self._pdf = pdfium.PdfDocument(str(filepath))
+        except pdfium.PdfiumError as exc:
+            # Translate pdfium's raw "Incorrect password error" into a clear,
+            # catchable datagrunt error. Re-raise any other load failure as-is
+            # so unrelated problems are not masked.
+            if _PDFIUM_PASSWORD_ERROR in str(exc).lower():
+                raise ValueError(ENCRYPTED_PDF_MESSAGE) from exc
+            raise
 
     def __enter__(self) -> "PdfiumDocument":
         return self
