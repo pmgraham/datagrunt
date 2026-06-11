@@ -416,3 +416,45 @@ class TestEngines:
         assert "last_name" in df.columns
         assert "e_mail" in df.columns
         assert "phone" in df.columns
+
+
+class TestDuckDBSqlEscaping:
+    """The DuckDB engine must escape interpolated literals and identifiers.
+
+    A single quote in a filename or a header cell previously produced broken
+    SQL (a ParserException). The threat model is a trusted caller, so this is
+    robustness / defense-in-depth, not RCE.
+    """
+
+    def test_apostrophe_in_filename_reads_correctly_duckdb(self, tmp_path):
+        """A ``'`` in the file path must not break the read_csv SQL literal."""
+        csv_file = tmp_path / "o'hara.csv"
+        csv_file.write_text("name,age\nJohn,30\nJane,25\n")
+
+        reader = CSVEngineFactory(str(csv_file), "duckdb").create_reader()
+        df = reader.to_dataframe()
+        assert df.columns == ["name", "age"]
+        assert len(df) == 2
+
+    def test_single_quote_in_header_lenient_duckdb(self, tmp_path):
+        """A ``'`` in a header cell must not break the lenient columns dict."""
+        csv_file = tmp_path / "quoted_header.csv"
+        # Header cell contains a single quote; lenient mode builds an explicit
+        # column dict ({'col': 'VARCHAR'}) that must escape the quote.
+        csv_file.write_text("o'clock,value\n1,2\n3,4\n")
+
+        reader = CSVEngineFactory(str(csv_file), "duckdb", lenient=True).create_reader()
+        df = reader.to_dataframe()
+        assert df.columns == ["o'clock", "value"]
+        assert len(df) == 2
+
+    def test_apostrophe_in_filename_writes_correctly_duckdb(self, tmp_path):
+        """A ``'`` in the SOURCE path must not break export COPY queries."""
+        csv_file = tmp_path / "o'hara.csv"
+        csv_file.write_text("name,age\nJohn,30\n")
+
+        writer = CSVEngineFactory(str(csv_file), "duckdb").create_writer()
+        out = tmp_path / "out.csv"
+        writer.write_csv(str(out))
+        assert out.exists()
+        assert "John" in out.read_text()
