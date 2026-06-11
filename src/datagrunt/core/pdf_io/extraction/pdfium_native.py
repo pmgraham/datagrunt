@@ -163,8 +163,15 @@ class PdfiumNativeReader:
         }
 
     @staticmethod
-    def dedupe_images(document: dict) -> int:
-        """Collapse byte-identical extracted image files; return count removed."""
+    def dedupe_images(document: dict, image_output_dir: str | None = None) -> int:
+        """Collapse byte-identical extracted image files; return count removed.
+
+        Args:
+            document: Parsed native-schema document.
+            image_output_dir: Directory holding the images written by this run.
+                Only files resolving inside it are eligible for deletion (see
+                issue #101); when ``None`` no file is removed from disk.
+        """
         images = [
             img
             for page in document.get("document", {}).get("pages", [])
@@ -174,6 +181,7 @@ class PdfiumNativeReader:
             images,
             lambda img: img.get("file"),
             lambda img, p: img.__setitem__("file", p),
+            allowed_dir=image_output_dir,
         )
 
     @staticmethod

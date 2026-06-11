@@ -199,8 +199,14 @@ class ParsedDocument:
                 )
         return records
 
-    def dedupe_images(self) -> int:
-        """Collapse byte-identical extracted image files; return count removed."""
+    def dedupe_images(self, image_output_dir: str | None = None) -> int:
+        """Collapse byte-identical extracted image files; return count removed.
+
+        Args:
+            image_output_dir: Directory holding the images written by this run.
+                Only files resolving inside it are eligible for deletion (see
+                issue #101); when ``None`` no file is removed from disk.
+        """
         images = [
             el
             for page in self.document.get("document", {}).get("pages", [])
@@ -211,6 +217,7 @@ class ParsedDocument:
             images,
             lambda el: (el.get("metadata") or {}).get("file_path"),
             lambda el, p: el.setdefault("metadata", {}).__setitem__("file_path", p),
+            allowed_dir=image_output_dir,
         )
 
     def drop_layout_tables(self, min_rows: int = 2, min_cols: int = 2) -> int:
