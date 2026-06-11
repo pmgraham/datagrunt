@@ -464,7 +464,13 @@ class CSVReaderPolarsEngine(CSVBaseReaderEngine):
             query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
             dg.query_csv_data(query)
         """
-        return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
+        # The result is a fully-materialized polars DataFrame, so the
+        # connection can be disposed deterministically (unlike the duckdb
+        # engine, whose query_data returns a live relation).
+        try:
+            return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
+        finally:
+            self.queries.close()
 
 
 class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
@@ -849,7 +855,13 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
             query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
             dg.query_csv_data(query)
         """
-        return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
+        # The result is a fully-materialized polars DataFrame, so the
+        # connection can be disposed deterministically (unlike the duckdb
+        # engine, whose query_data returns a live relation).
+        try:
+            return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
+        finally:
+            self.queries.close()
 
 
 class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
