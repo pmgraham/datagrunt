@@ -89,24 +89,23 @@ class TestPyMuPDFOpensOncePerDocument:
         )
 
 
-class TestThreadedOpensOncePerWorker:
-    """With multiple workers the document is opened once per worker, not per page."""
+class TestWorkersIgnoredStillOpensOnce:
+    """workers>1 is ignored (MuPDF is not thread-safe): parsing stays
+    sequential and the document is still opened exactly once per parse."""
 
-    def test_pymupdf_opened_once_per_worker(self, multipage_pdf, open_spy):
-        # 3-page fixture parsed with 2 workers: at most one open per worker
-        # (<= 2), never one per page (which would be 3).
+    def test_pymupdf_opened_once_even_with_workers(self, multipage_pdf, open_spy):
         engine = PDFReaderPyMuPDFEngine(multipage_pdf, workers=2)
         document = engine.to_dicts()
         assert document["document"]["total_pages"] == 3
-        assert open_spy["pymupdf"] <= 2, (
-            f"pymupdf.open called {open_spy['pymupdf']}x for 2 workers; "
-            "expected <= 2 (once per worker)"
+        assert open_spy["pymupdf"] == 1, (
+            f"pymupdf.open called {open_spy['pymupdf']}x with workers=2; "
+            "expected exactly 1 (sequential held-open parse)"
         )
 
-    def test_threaded_output_matches_sequential(self, multipage_pdf):
+    def test_workers_output_matches_sequential(self, multipage_pdf):
         sequential = PDFReaderPyMuPDFEngine(multipage_pdf, workers=1).to_dicts()
-        threaded = PDFReaderPyMuPDFEngine(multipage_pdf, workers=2).to_dicts()
-        assert _normalize(threaded) == _normalize(sequential)
+        multi = PDFReaderPyMuPDFEngine(multipage_pdf, workers=2).to_dicts()
+        assert _normalize(multi) == _normalize(sequential)
 
 
 class TestOutputUnchanged:
