@@ -6,7 +6,6 @@ import logging
 import os
 import time
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -125,57 +124,30 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
             return len(doc)
 
     def to_dicts(self, image_output_dir: Optional[str] = None, drop_layout_tables: bool = False) -> dict:
-        """Parse all pages into the unified document dict.
+        """Parse all pages sequentially into the unified document dict.
 
-        Sequentially (the default, ``workers <= 1``) the document is held open
-        once via ``DocumentAssembler.parse_document`` instead of being reopened
-        per page. With multiple workers each worker holds its thread-local
-        backend / table-extractor contexts open across the pages it owns, so the
-        document is opened once per worker rather than once per page (issue #102).
+        Pages are parsed one at a time on purpose: PyMuPDF/MuPDF shares a global
+        context and is not thread-safe, so dispatching pages across threads risks
+        garbled output or an interpreter crash. The ``workers`` argument is kept
+        for API compatibility but does not enable threading here; callers needing
+        parallel parsing should use the process-based pdfium engine.
+
+        The document and table-extractor contexts are held open once for the
+        whole parse via ``DocumentAssembler.parse_document`` instead of being
+        reopened per page (issue #102).
         """
+        if self.workers > 1:
+            logger.warning(
+                "PyMuPDF parses pages sequentially because MuPDF is not thread-safe; "
+                "the 'workers=%d' setting is ignored. Use the pdfium engine for parallel parsing.",
+                self.workers,
+            )
         assembler = pdfcomponents.DocumentAssembler(self.filepath)
         total_pages = self._total_pages()
-        if self.workers <= 1 or total_pages <= 1:
-            document = assembler.parse_document(total_pages, image_output_dir)
-        else:
-            document = self._to_dicts_threaded(assembler, total_pages, image_output_dir)
+        document = assembler.parse_document(total_pages, image_output_dir)
         if drop_layout_tables:
             pdfcomponents.ParsedDocument(document).drop_layout_tables()
         return document
-
-    def _to_dicts_threaded(self, assembler, total_pages, image_output_dir) -> dict:
-        """Parse pages across a thread pool, holding contexts open per worker.
-
-        Each worker enters the thread-local backend / table-extractor contexts
-        once and parses an interleaved slice of pages, so the document is opened
-        once per worker (not once per page) while preserving the exact per-page
-        ``"Page N: <error>"`` envelope.
-        """
-        worker_count = min(self.workers, total_pages)
-        page_results = {}
-        errors = []
-
-        def parse_slice(start: int) -> tuple:
-            slice_pages, slice_errors = {}, []
-            with assembler.backend, assembler.table_extractor:
-                for idx in range(start, total_pages, worker_count):
-                    try:
-                        page = assembler.parse_page(idx, image_output_dir)
-                        slice_pages[page["page_number"]] = page
-                    except Exception as e:  # noqa: BLE001 - per-page isolation
-                        slice_errors.append((idx, e))
-            return slice_pages, slice_errors
-
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = [executor.submit(parse_slice, start) for start in range(worker_count)]
-            for future in as_completed(futures):
-                slice_pages, slice_errors = future.result()
-                page_results.update(slice_pages)
-                errors.extend(slice_errors)
-
-        ordered = [page_results[p] for p in sorted(page_results.keys())]
-        error_messages = [f"Page {idx + 1}: {e}" for idx, e in sorted(errors, key=lambda item: item[0])]
-        return assembler.combine(total_pages, ordered, error_messages)
 
     def get_sample(self) -> dict:
         """Parse and return the first page only."""
@@ -393,7 +365,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
         filename = set_export_filename(self.properties.json_export_filename, export_filename)
         document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
         if image_output_dir and dedupe_images:
-            pdfcomponents.ParsedDocument(document).dedupe_images()
+            pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
         with open(filename, "w") as f:
             json.dump(document, f, indent=2)
         return filename
@@ -405,7 +377,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
         filename = set_export_filename(self.properties.json_newline_export_filename, export_filename)
         document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
         if image_output_dir and dedupe_images:
-            pdfcomponents.ParsedDocument(document).dedupe_images()
+            pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
         records = pdfcomponents.ParsedDocument(document).flatten()
         with open(filename, "w") as f:
             for record in records:
@@ -427,7 +399,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
         filename = set_export_filename(self.properties.markdown_export_filename, export_filename)
         document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
         if image_output_dir and dedupe_images:
-            pdfcomponents.ParsedDocument(document).dedupe_images()
+            pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
         markdown_text = pdfcomponents.ParsedDocument(document).to_markdown(export_filename=filename)
         with open(filename, "w") as f:
             f.write(markdown_text)
@@ -444,7 +416,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
         directory = output_dir if output_dir else self.properties.images_export_dir
         document = self._reader().to_dicts(image_output_dir=directory)
         if dedupe:
-            pdfcomponents.ParsedDocument(document).dedupe_images()
+            pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=directory)
         paths = []
         seen = set()
         for page in document.get("document", {}).get("pages", []):
@@ -467,18 +439,18 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
     def _reader(self):
         return PDFReaderPdfiumEngine(self.filepath, workers=self.workers, structured=self.structured)
 
-    def _dedupe(self, document):
+    def _dedupe(self, document, image_output_dir):
         if self.structured:
-            pdfcomponents.ParsedDocument(document).dedupe_images()
+            pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
         else:
-            PdfiumNativeReader.dedupe_images(document)
+            PdfiumNativeReader.dedupe_images(document, image_output_dir=image_output_dir)
 
     def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
         """Parse the PDF and write the document JSON (native or unified schema)."""
         filename = set_export_filename(self.properties.json_export_filename, export_filename)
         document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
         if image_output_dir and dedupe_images:
-            self._dedupe(document)
+            self._dedupe(document, image_output_dir)
         with open(filename, "w") as f:
             json.dump(document, f, indent=2)
         return filename
@@ -490,7 +462,7 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
         filename = set_export_filename(self.properties.json_newline_export_filename, export_filename)
         document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
         if image_output_dir and dedupe_images:
-            self._dedupe(document)
+            self._dedupe(document, image_output_dir)
         if self.structured:
             records = pdfcomponents.ParsedDocument(document).flatten()
         else:
@@ -505,7 +477,7 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
         filename = set_export_filename(self.properties.markdown_export_filename, export_filename)
         document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
         if image_output_dir and dedupe_images:
-            self._dedupe(document)
+            self._dedupe(document, image_output_dir)
         if self.structured:
             markdown_text = pdfcomponents.ParsedDocument(document).to_markdown(export_filename=filename)
         else:
@@ -519,7 +491,7 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
         directory = output_dir if output_dir else self.properties.images_export_dir
         document = self._reader().to_dicts(image_output_dir=directory)
         if dedupe:
-            self._dedupe(document)
+            self._dedupe(document, directory)
         paths = []
         seen = set()
         for page in document.get("document", {}).get("pages", []):
