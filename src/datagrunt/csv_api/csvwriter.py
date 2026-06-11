@@ -35,6 +35,7 @@ class CSVWriter(CSVComponents):
         self.queries = DuckDBQueries(self.filepath, lenient=self.lenient)
         self.db_table = self.queries.database_table_name
         self.engine = engine.lower().replace(" ", "")
+        CSVEngineFactory.validate_engine(self.engine)
 
     def _create_writer(self):
         """Create a reader object."""
