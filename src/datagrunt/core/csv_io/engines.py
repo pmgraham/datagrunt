@@ -19,20 +19,9 @@ from datagrunt.core.csv_io.csvcomponents import (
     CSVColumnNameNormalizer,
     CSVColumns,
     _check_csv_ragged_and_warn,
+    _count_leading_physical_lines_before_header,
 )
 from datagrunt.core.databases import DuckDBQueries
-
-
-def _count_leading_comments(filepath):
-    count = 0
-    with open(filepath, "r", encoding="utf-8-sig") as f:
-        for line in f:
-            stripped = line.strip()
-            if stripped.startswith("#") or not stripped:
-                count += 1
-            else:
-                break
-    return count
 
 
 def _is_legacy_mac_newlines(filepath):
@@ -650,7 +639,7 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
                 table = table.rename_columns(new_names)
             return table
         try:
-            skip_count = _count_leading_comments(self.filepath) + 1
+            skip_count = _count_leading_physical_lines_before_header(self.filepath)
             table = pacsv.read_csv(
                 self.filepath,
                 read_options=pacsv.ReadOptions(column_names=columns, skip_rows=skip_count),
@@ -713,7 +702,7 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
                 table = table.rename_columns(new_names)
             return table
         try:
-            skip_count = _count_leading_comments(self.filepath) + 1
+            skip_count = _count_leading_physical_lines_before_header(self.filepath)
             table = pacsv.read_csv(
                 self.filepath,
                 read_options=pacsv.ReadOptions(column_names=columns, skip_rows=skip_count),
@@ -863,7 +852,7 @@ class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
                 table = table.rename_columns(new_names)
             return table
         try:
-            skip_count = _count_leading_comments(self.filepath) + 1
+            skip_count = _count_leading_physical_lines_before_header(self.filepath)
             table = pacsv.read_csv(
                 self.filepath,
                 read_options=pacsv.ReadOptions(column_names=columns, skip_rows=skip_count),
