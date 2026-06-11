@@ -410,6 +410,9 @@ class CSVColumnNameNormalizer:
 
     SPECIAL_CHARS_PATTERN = re.compile(r"[^a-z0-9]+")
     MULTI_UNDERSCORE_PATTERN = re.compile(r"_+")
+    # Used when a header normalizes to the empty string so it can still be
+    # uniquified into a valid, non-empty identifier.
+    EMPTY_NAME_PLACEHOLDER = "column"
 
     def __init__(self, filepath, columns=None):
         """Initialize the CSVColumnNameNormalizer with a filepath.
@@ -454,11 +457,25 @@ class CSVColumnNameNormalizer:
         name = self.SPECIAL_CHARS_PATTERN.sub("_", name)
         name = name.strip("_")
         name = self.MULTI_UNDERSCORE_PATTERN.sub("_", name)
-        return f"_{name}" if name and name[0].isdigit() else name
+        # A header of only special characters (e.g. "%" or "()") normalizes to
+        # the empty string, which is an invalid zero-length SQL identifier and
+        # is silently dropped by some engines. Fall back to a placeholder so it
+        # can be uniquified into a valid column name.
+        if not name:
+            return self.EMPTY_NAME_PLACEHOLDER
+        return f"_{name}" if name[0].isdigit() else name
 
     def _make_unique_column_names(self, columns_list):
         """
         Make unique column names by appending a number to duplicate names.
+
+        A naive ``name_N`` suffix can itself collide with a real column (e.g.
+        ``col_a, col_a, col_a_1`` would emit two ``col_a_1``). To guarantee a
+        unique result, this tracks every name already emitted and keeps
+        incrementing the suffix until the candidate is unused across the whole
+        list. Downstream SQL projections and Arrow renames rely on this: a
+        duplicate name breaks DuckDB's ``AS`` projection and silently drops a
+        column in PyArrow.
 
         Args:
             columns_list (list): List of column names to make unique
@@ -466,16 +483,17 @@ class CSVColumnNameNormalizer:
         Returns:
             list: List of unique column names
         """
-        name_count = {}
+        emitted = set()
         unique_names = []
 
         for name in columns_list:
-            if name in name_count:
-                name_count[name] += 1
-                unique_names.append(f"{name}_{name_count[name]}")
-            else:
-                name_count[name] = 0
-                unique_names.append(name)
+            candidate = name
+            suffix = 0
+            while candidate in emitted:
+                suffix += 1
+                candidate = f"{name}_{suffix}"
+            emitted.add(candidate)
+            unique_names.append(candidate)
 
         return unique_names
 
