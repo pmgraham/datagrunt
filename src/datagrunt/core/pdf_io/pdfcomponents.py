@@ -119,7 +119,7 @@ class DocumentAssembler:
                 try:
                     pages.append(self.parse_page(idx, image_output_dir))
                 except Exception as e:  # noqa: BLE001 - per-page isolation
-                    errors.append(str(e))
+                    errors.append(f"Page {idx + 1}: {e}")
         return self.combine(total_pages, pages, errors)
 
     def combine(self, total_pages, pages, errors) -> dict:

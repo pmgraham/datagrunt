@@ -131,6 +131,10 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
         garbled output or an interpreter crash. The ``workers`` argument is kept
         for API compatibility but does not enable threading here; callers needing
         parallel parsing should use the process-based pdfium engine.
+
+        The document and table-extractor contexts are held open once for the
+        whole parse via ``DocumentAssembler.parse_document`` instead of being
+        reopened per page (issue #102).
         """
         if self.workers > 1:
             logger.warning(
@@ -140,16 +144,7 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
             )
         assembler = pdfcomponents.DocumentAssembler(self.filepath)
         total_pages = self._total_pages()
-        page_results = {}
-        errors = []
-        for idx in range(total_pages):
-            try:
-                page = assembler.parse_page(idx, image_output_dir)
-                page_results[page["page_number"]] = page
-            except Exception as e:  # noqa: BLE001 - per-page isolation
-                errors.append(f"Page {idx + 1}: {e}")
-        ordered = [page_results[p] for p in sorted(page_results.keys())]
-        document = assembler.combine(total_pages, ordered, errors)
+        document = assembler.parse_document(total_pages, image_output_dir)
         if drop_layout_tables:
             pdfcomponents.ParsedDocument(document).drop_layout_tables()
         return document
