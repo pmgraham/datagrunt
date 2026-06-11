@@ -73,9 +73,9 @@ class PDFWriter(PDFComponents):
             if image_output_dir and dedupe_images:
                 is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
                 if is_structured:
-                    pdfcomponents.ParsedDocument(document).dedupe_images()
+                    pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
                 else:
-                    PdfiumNativeReader.dedupe_images(document)
+                    PdfiumNativeReader.dedupe_images(document, image_output_dir=image_output_dir)
             with open(filename, "w") as f:
                 json.dump(document, f, indent=2)
             return filename
@@ -108,9 +108,9 @@ class PDFWriter(PDFComponents):
             if image_output_dir and dedupe_images:
                 is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
                 if is_structured:
-                    pdfcomponents.ParsedDocument(document).dedupe_images()
+                    pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
                 else:
-                    PdfiumNativeReader.dedupe_images(document)
+                    PdfiumNativeReader.dedupe_images(document, image_output_dir=image_output_dir)
             
             is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
             if is_structured:
@@ -152,9 +152,9 @@ class PDFWriter(PDFComponents):
             if image_output_dir and dedupe_images:
                 is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
                 if is_structured:
-                    pdfcomponents.ParsedDocument(document).dedupe_images()
+                    pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
                 else:
-                    PdfiumNativeReader.dedupe_images(document)
+                    PdfiumNativeReader.dedupe_images(document, image_output_dir=image_output_dir)
             
             is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
             if is_structured:
@@ -186,12 +186,13 @@ class PDFWriter(PDFComponents):
         """
         if self._parsed_dict is not None:
             document = self._parsed_dict
+            image_dir = output_dir if output_dir else "output_images"
             is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
             if dedupe:
                 if is_structured:
-                    pdfcomponents.ParsedDocument(document).dedupe_images()
+                    pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_dir)
                 else:
-                    PdfiumNativeReader.dedupe_images(document)
+                    PdfiumNativeReader.dedupe_images(document, image_output_dir=image_dir)
             paths = []
             seen = set()
             for page in document.get("document", {}).get("pages", []):
