@@ -125,28 +125,57 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
             return len(doc)
 
     def to_dicts(self, image_output_dir: Optional[str] = None, drop_layout_tables: bool = False) -> dict:
-        """Parse all pages concurrently into the unified document dict."""
+        """Parse all pages into the unified document dict.
+
+        Sequentially (the default, ``workers <= 1``) the document is held open
+        once via ``DocumentAssembler.parse_document`` instead of being reopened
+        per page. With multiple workers each worker holds its thread-local
+        backend / table-extractor contexts open across the pages it owns, so the
+        document is opened once per worker rather than once per page (issue #102).
+        """
         assembler = pdfcomponents.DocumentAssembler(self.filepath)
         total_pages = self._total_pages()
-        page_results = {}
-        errors = []
-        with ThreadPoolExecutor(max_workers=self.workers) as executor:
-            futures = {
-                executor.submit(assembler.parse_page, idx, image_output_dir): idx
-                for idx in range(total_pages)
-            }
-            for future in as_completed(futures):
-                idx = futures[future]
-                try:
-                    page = future.result()
-                    page_results[page["page_number"]] = page
-                except Exception as e:  # noqa: BLE001 - per-page isolation
-                    errors.append(f"Page {idx + 1}: {e}")
-        ordered = [page_results[p] for p in sorted(page_results.keys())]
-        document = assembler.combine(total_pages, ordered, errors)
+        if self.workers <= 1 or total_pages <= 1:
+            document = assembler.parse_document(total_pages, image_output_dir)
+        else:
+            document = self._to_dicts_threaded(assembler, total_pages, image_output_dir)
         if drop_layout_tables:
             pdfcomponents.ParsedDocument(document).drop_layout_tables()
         return document
+
+    def _to_dicts_threaded(self, assembler, total_pages, image_output_dir) -> dict:
+        """Parse pages across a thread pool, holding contexts open per worker.
+
+        Each worker enters the thread-local backend / table-extractor contexts
+        once and parses an interleaved slice of pages, so the document is opened
+        once per worker (not once per page) while preserving the exact per-page
+        ``"Page N: <error>"`` envelope.
+        """
+        worker_count = min(self.workers, total_pages)
+        page_results = {}
+        errors = []
+
+        def parse_slice(start: int) -> tuple:
+            slice_pages, slice_errors = {}, []
+            with assembler.backend, assembler.table_extractor:
+                for idx in range(start, total_pages, worker_count):
+                    try:
+                        page = assembler.parse_page(idx, image_output_dir)
+                        slice_pages[page["page_number"]] = page
+                    except Exception as e:  # noqa: BLE001 - per-page isolation
+                        slice_errors.append((idx, e))
+            return slice_pages, slice_errors
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(parse_slice, start) for start in range(worker_count)]
+            for future in as_completed(futures):
+                slice_pages, slice_errors = future.result()
+                page_results.update(slice_pages)
+                errors.extend(slice_errors)
+
+        ordered = [page_results[p] for p in sorted(page_results.keys())]
+        error_messages = [f"Page {idx + 1}: {e}" for idx, e in sorted(errors, key=lambda item: item[0])]
+        return assembler.combine(total_pages, ordered, error_messages)
 
     def get_sample(self) -> dict:
         """Parse and return the first page only."""
