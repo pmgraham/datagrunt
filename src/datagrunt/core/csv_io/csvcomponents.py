@@ -351,18 +351,29 @@ class CSVRows:
 
     @cached_property
     def row_count_with_header(self):
-        """Return the number of lines in the CSV file including the header."""
+        """Return the number of CSV records in the file including the header.
+
+        Counts parsed CSV records rather than physical lines so that quoted
+        fields containing embedded newlines are counted as a single record,
+        matching what the parsing engines report. Comment and blank records
+        are still excluded, mirroring ``_check_csv_ragged_and_warn``.
+        """
+        is_legacy_mac = _is_legacy_mac_newlines(self.filepath)
+        newline_param = None if is_legacy_mac else ""
+        encoding = FileProperties(self.filepath).DEFAULT_ENCODING
+        delimiter = CSVDelimiter(self.filepath).delimiter
         count = 0
-        with open(self.filepath, "r", encoding=FileProperties(self.filepath).DEFAULT_ENCODING) as csv_file:
-            for line in csv_file:
-                stripped = line.strip()
-                if stripped and not stripped.startswith("#"):
-                    count += 1
+        with open(self.filepath, "r", encoding=encoding, newline=newline_param) as csv_file:
+            reader = csv.reader(csv_file, delimiter=delimiter)
+            for row in reader:
+                if not row or row[0].startswith("#"):
+                    continue
+                count += 1
         return count
 
     @property
     def row_count_without_header(self):
-        """Return the number of lines in the CSV file excluding the header."""
+        """Return the number of CSV records in the file excluding the header."""
         return self.row_count_with_header - 1
 
 
