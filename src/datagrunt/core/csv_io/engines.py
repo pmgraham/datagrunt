@@ -19,20 +19,10 @@ from datagrunt.core.csv_io.csvcomponents import (
     CSVColumnNameNormalizer,
     CSVColumns,
     _check_csv_ragged_and_warn,
+    _count_leading_comments,
+    _count_leading_physical_lines_before_header,
 )
 from datagrunt.core.databases import DuckDBQueries
-
-
-def _count_leading_comments(filepath):
-    count = 0
-    with open(filepath, "r", encoding="utf-8-sig") as f:
-        for line in f:
-            stripped = line.strip()
-            if stripped.startswith("#") or not stripped:
-                count += 1
-            else:
-                break
-    return count
 
 
 def _is_legacy_mac_newlines(filepath):
@@ -217,8 +207,10 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         Returns:
             A Polars DataFrame containing the sample rows.
         """
-        relation = self.queries.create_table(normalize_columns)
-        return relation.limit(CSVEngineProperties.dataframe_sample_rows).pl()
+        return self.queries.sample_dataframe(
+            CSVEngineProperties.dataframe_sample_rows,
+            normalize_columns,
+        )
 
     def to_dataframe(self, normalize_columns=False):
         """
@@ -275,7 +267,11 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         projections = []
         for col in current_columns:
             normalized_name = column_normalizer.columns_to_normalized_mapping.get(col, col)
-            projections.append(f'"{col}" AS "{normalized_name}"')
+            # Double-quote-escape both identifiers; a quote in a header-derived
+            # column name would otherwise break the projection SQL.
+            safe_col = col.replace('"', '""')
+            safe_normalized = normalized_name.replace('"', '""')
+            projections.append(f'"{safe_col}" AS "{safe_normalized}"')
         return relation.project(", ".join(projections))
 
     def query_data(self, sql_query, normalize_columns=False):
@@ -333,12 +329,15 @@ class CSVReaderPolarsEngine(CSVBaseReaderEngine):
         if self.lenient:
             _check_csv_ragged_and_warn(self.filepath, self.delimiter)
         try:
+            # Skip only the LEADING comment block. Using comment_prefix here
+            # would also drop any data row whose first field begins with "#"
+            # (e.g. a hex color like "#FF0000"), silently losing rows.
             df = pl.read_csv(
                 self.filepath,
                 separator=self.delimiter,
                 truncate_ragged_lines=self.lenient,
                 infer_schema=False,
-                comment_prefix="#",
+                skip_rows=_count_leading_comments(self.filepath),
             )
             if normalize_columns:
                 df = df.rename(CSVColumnNameNormalizer(self.filepath, columns=df.columns).columns_to_normalized_mapping)
@@ -365,13 +364,15 @@ class CSVReaderPolarsEngine(CSVBaseReaderEngine):
         if self.lenient:
             _check_csv_ragged_and_warn(self.filepath, self.delimiter)
         try:
+            # Skip only the LEADING comment block so data rows whose first
+            # field starts with "#" are not mistaken for comments.
             df = pl.read_csv(
                 self.filepath,
                 separator=self.delimiter,
                 truncate_ragged_lines=self.lenient,
                 infer_schema=False,
                 n_rows=CSVEngineProperties.dataframe_sample_rows,
-                comment_prefix="#",
+                skip_rows=_count_leading_comments(self.filepath),
             )
             if normalize_columns:
                 df = df.rename(CSVColumnNameNormalizer(self.filepath, columns=df.columns).columns_to_normalized_mapping)
@@ -632,13 +633,14 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
             )
         if self.lenient:
             _check_csv_ragged_and_warn(self.filepath, self.delimiter)
-            # Fallback to Polars to parse the ragged CSV, then convert to Arrow Table
+            # Fallback to Polars to parse the ragged CSV, then convert to Arrow Table.
+            # Skip only the LEADING comment block so "#"-prefixed data rows survive.
             df = pl.read_csv(
                 self.filepath,
                 separator=self.delimiter,
                 truncate_ragged_lines=True,
                 infer_schema=False,
-                comment_prefix="#",
+                skip_rows=_count_leading_comments(self.filepath),
             )
             table = df.to_arrow()
             string_schema = pa.schema([(name, pa.string()) for name in table.column_names])
@@ -650,7 +652,7 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
                 table = table.rename_columns(new_names)
             return table
         try:
-            skip_count = _count_leading_comments(self.filepath) + 1
+            skip_count = _count_leading_physical_lines_before_header(self.filepath)
             table = pacsv.read_csv(
                 self.filepath,
                 read_options=pacsv.ReadOptions(column_names=columns, skip_rows=skip_count),
@@ -694,14 +696,15 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
             )
         if self.lenient:
             _check_csv_ragged_and_warn(self.filepath, self.delimiter)
-            # Fallback to Polars to parse the ragged CSV, then convert to Arrow Table
+            # Fallback to Polars to parse the ragged CSV, then convert to Arrow Table.
+            # Skip only the LEADING comment block so "#"-prefixed data rows survive.
             df = pl.read_csv(
                 self.filepath,
                 separator=self.delimiter,
                 truncate_ragged_lines=True,
                 infer_schema=False,
                 n_rows=CSVEngineProperties.dataframe_sample_rows,
-                comment_prefix="#",
+                skip_rows=_count_leading_comments(self.filepath),
             )
             table = df.to_arrow()
             string_schema = pa.schema([(name, pa.string()) for name in table.column_names])
@@ -713,16 +716,32 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
                 table = table.rename_columns(new_names)
             return table
         try:
-            skip_count = _count_leading_comments(self.filepath) + 1
-            table = pacsv.read_csv(
+            skip_count = _count_leading_physical_lines_before_header(self.filepath)
+            sample_rows = CSVEngineProperties.dataframe_sample_rows
+            # Stream the file in batches and stop once we have enough rows,
+            # rather than materializing the whole file just to slice the head.
+            reader = pacsv.open_csv(
                 self.filepath,
                 read_options=pacsv.ReadOptions(column_names=columns, skip_rows=skip_count),
                 parse_options=pacsv.ParseOptions(delimiter=self.delimiter),
                 convert_options=pacsv.ConvertOptions(column_types=string_schema),
             )
+            batches = []
+            collected = 0
+            try:
+                while collected < sample_rows:
+                    batch = reader.read_next_batch()
+                    if batch.num_rows == 0:
+                        continue
+                    batches.append(batch)
+                    collected += batch.num_rows
+            except StopIteration:
+                # Fewer rows than the sample size; return whatever was read.
+                pass
+            finally:
+                reader.close()
 
-            # Take sample rows
-            sample_table = table.slice(0, CSVEngineProperties.dataframe_sample_rows)
+            sample_table = pa.Table.from_batches(batches, schema=string_schema).slice(0, sample_rows)
 
             if normalize_columns:
                 column_normalizer = CSVColumnNameNormalizer(self.filepath, columns=columns)
@@ -845,13 +864,14 @@ class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
             )
         if self.lenient:
             _check_csv_ragged_and_warn(self.filepath, self.queries.delimiter)
-            # Fallback to Polars to parse the ragged CSV, then convert to Arrow Table
+            # Fallback to Polars to parse the ragged CSV, then convert to Arrow Table.
+            # Skip only the LEADING comment block so "#"-prefixed data rows survive.
             df = pl.read_csv(
                 self.filepath,
                 separator=self.queries.delimiter,
                 truncate_ragged_lines=True,
                 infer_schema=False,
-                comment_prefix="#",
+                skip_rows=_count_leading_comments(self.filepath),
             )
             table = df.to_arrow()
             string_schema = pa.schema([(name, pa.string()) for name in table.column_names])
@@ -863,7 +883,7 @@ class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
                 table = table.rename_columns(new_names)
             return table
         try:
-            skip_count = _count_leading_comments(self.filepath) + 1
+            skip_count = _count_leading_physical_lines_before_header(self.filepath)
             table = pacsv.read_csv(
                 self.filepath,
                 read_options=pacsv.ReadOptions(column_names=columns, skip_rows=skip_count),

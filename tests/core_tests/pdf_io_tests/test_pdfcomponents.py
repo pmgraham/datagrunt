@@ -100,7 +100,7 @@ class TestDedupeImages:
             }
         }
 
-        removed = pdfcomponents.ParsedDocument(document).dedupe_images()
+        removed = pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=str(tmp_path))
 
         assert removed == 1
         # The redundant duplicate file is deleted; the first + unique remain.
@@ -268,7 +268,7 @@ class TestParsedDocument:
             {"type": "image", "metadata": {"file_path": str(a)}},
             {"type": "image", "metadata": {"file_path": str(b)}},
         ]}]}}
-        removed = ParsedDocument(document).dedupe_images()
+        removed = ParsedDocument(document).dedupe_images(image_output_dir=str(tmp_path))
         assert removed == 1 and not b.exists()
 
     def test_drop_layout_tables(self):

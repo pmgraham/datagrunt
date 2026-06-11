@@ -469,3 +469,93 @@ class TestNormalizeCollidingColumnsAllEngines:
             df = reader.to_dataframe(normalize_columns=True)
             assert len(df.columns) == 3, engine
             assert all(col != "" for col in df.columns), engine
+
+
+class TestDuckDBSqlEscaping:
+    """The DuckDB engine must escape interpolated literals and identifiers.
+
+    A single quote in a filename or a header cell previously produced broken
+    SQL (a ParserException). The threat model is a trusted caller, so this is
+    robustness / defense-in-depth, not RCE.
+    """
+
+    def test_apostrophe_in_filename_reads_correctly_duckdb(self, tmp_path):
+        """A ``'`` in the file path must not break the read_csv SQL literal."""
+        csv_file = tmp_path / "o'hara.csv"
+        csv_file.write_text("name,age\nJohn,30\nJane,25\n")
+
+        reader = CSVEngineFactory(str(csv_file), "duckdb").create_reader()
+        df = reader.to_dataframe()
+        assert df.columns == ["name", "age"]
+        assert len(df) == 2
+
+    def test_single_quote_in_header_lenient_duckdb(self, tmp_path):
+        """A ``'`` in a header cell must not break the lenient columns dict."""
+        csv_file = tmp_path / "quoted_header.csv"
+        # Header cell contains a single quote; lenient mode builds an explicit
+        # column dict ({'col': 'VARCHAR'}) that must escape the quote. The
+        # header has more commas than quotes so delimiter inference picks ','.
+        csv_file.write_text("o'clock,value,extra\n1,2,3\n4,5,6\n")
+
+        reader = CSVEngineFactory(str(csv_file), "duckdb", lenient=True).create_reader()
+        df = reader.to_dataframe()
+        assert df.columns == ["o'clock", "value", "extra"]
+        assert len(df) == 2
+
+    def test_single_quote_inferred_delimiter_duckdb(self, tmp_path):
+        """An inferred ``'`` delimiter must not break the delim SQL literal.
+
+        Delimiter inference counts non-alphanumeric characters in the first
+        row, so a header like ``a'b'c`` infers ``'`` as the delimiter. The
+        ``delim='...'`` literal must escape it (``delim=''''``) or every
+        DuckDB read of the file raises a ParserException.
+        """
+        csv_file = tmp_path / "quote_delimited.csv"
+        csv_file.write_text("a'b'c\n1'2'3\n4'5'6\n")
+
+        reader = CSVEngineFactory(str(csv_file), "duckdb").create_reader()
+        df = reader.to_dataframe()
+        assert df.columns == ["a", "b", "c"]
+        assert len(df) == 2
+
+    def test_apostrophe_in_filename_writes_correctly_duckdb(self, tmp_path):
+        """A ``'`` in the SOURCE path must not break export COPY queries."""
+        csv_file = tmp_path / "o'hara.csv"
+        csv_file.write_text("name,age\nJohn,30\n")
+
+        writer = CSVEngineFactory(str(csv_file), "duckdb").create_writer()
+        out = tmp_path / "out.csv"
+        writer.write_csv(str(out))
+        assert out.exists()
+        assert "John" in out.read_text()
+
+
+class TestLeadingCommentHandling:
+    """Tests that engines treat only LEADING ``#`` lines as comments.
+
+    A ``#`` at the start of a DATA field (e.g. a hex color) must not cause the
+    row to be dropped, and all engines must agree on the resulting row count.
+    """
+
+    def test_hash_prefixed_data_rows_preserved_all_engines(self, tmp_path):
+        """A data field starting with ``#`` must not be treated as a comment."""
+        hex_csv = tmp_path / "hex.csv"
+        hex_csv.write_text("color,name\n#FF0000,red\n#00FF00,green\n00ABCD,teal\n")
+
+        row_counts = {}
+        for engine in ALL_ENGINES:
+            reader = CSVEngineFactory(str(hex_csv), engine).create_reader()
+            row_counts[engine] = len(reader.to_dataframe())
+
+        assert row_counts == {"duckdb": 3, "polars": 3, "pyarrow": 3}
+
+    def test_leading_comment_block_skipped_all_engines(self, tmp_path):
+        """A genuine leading comment block must still be skipped on all engines."""
+        commented_csv = tmp_path / "commented.csv"
+        commented_csv.write_text("# generated\n# v2\na,b\n1,2\n")
+
+        for engine in ALL_ENGINES:
+            reader = CSVEngineFactory(str(commented_csv), engine).create_reader()
+            df = reader.to_dataframe()
+            assert df.columns == ["a", "b"]
+            assert len(df) == 1
