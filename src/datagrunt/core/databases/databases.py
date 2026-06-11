@@ -47,6 +47,10 @@ class DuckDBQueries:
         # guards files with no header line (empty/blank), where the helper
         # returns 0 and DuckDB rejects a negative ``skip``.
         self.skip_rows = max(_count_leading_physical_lines_before_header(self.filepath) - 1, 0)
+        # Tracks how the cached table was imported (None until first import,
+        # then True/False for normalize_columns) so create_table can reuse the
+        # table for matching calls and re-import only when the mode changes.
+        self._imported_normalize_columns = None
 
     @cached_property
     def delimiter(self):
@@ -333,18 +337,44 @@ class DuckDBQueries:
             sql_string = f'ALTER TABLE {self.database_table_name} RENAME COLUMN "{old_name}" TO "{new_name}"'
             self.connection.sql(sql_string)
 
+    def _table_is_current(self, normalize_columns):
+        """Return True if the cached table already matches the requested import.
+
+        The table name is deterministic per file path, so once the import has
+        run on this instance's connection the table can be reused - but only
+        when the requested ``normalize_columns`` mode matches how the table was
+        originally imported. A mode change requires a fresh import.
+
+        Args:
+            normalize_columns (bool): The requested normalization mode.
+
+        Returns:
+            bool: Whether the existing table can be reused as-is.
+        """
+        return self._imported_normalize_columns == normalize_columns
+
     def create_table(self, normalize_columns=False):
         """Create a DuckDB table from the CSV file.
+
+        The import is skipped when the table already exists on this instance's
+        connection with the same ``normalize_columns`` mode: the table name is
+        deterministic per file path, so a single import serves every subsequent
+        matching call. This keeps repeated reads - notably ``query_data`` - from
+        paying a full file import each time (issue #104). A change in
+        ``normalize_columns`` triggers a fresh import so column names stay
+        correct.
 
         Args:
             normalize_columns (bool): Whether to normalize column names.
         """
-        if self.lenient:
-            _check_csv_ragged_and_warn(self.filepath, self.delimiter)
-        if normalize_columns:
-            self.update_and_normalize_column_names()
-        else:
-            self.connection.sql(self.import_csv_query())
+        if not self._table_is_current(normalize_columns):
+            if self.lenient:
+                _check_csv_ragged_and_warn(self.filepath, self.delimiter)
+            if normalize_columns:
+                self.update_and_normalize_column_names()
+            else:
+                self.connection.sql(self.import_csv_query())
+            self._imported_normalize_columns = normalize_columns
         return self.connection.sql(self.select_from_duckdb_table()).execute()
 
     def sample_dataframe(self, limit, normalize_columns=False):
