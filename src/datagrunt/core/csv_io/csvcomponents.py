@@ -120,7 +120,12 @@ class CSVStringSample:
                 return "".join(lines)
             except Exception:
                 pass
-        df = pl.read_csv(self.filepath, separator=self.delimiter, n_rows=self.SAMPLE_ROWS)
+        df = pl.read_csv(
+            self.filepath,
+            separator=self.delimiter,
+            n_rows=self.SAMPLE_ROWS,
+            comment_prefix="#",
+        )
         return df.write_csv(file=None)
 
     @cached_property
@@ -138,10 +143,15 @@ class CSVStringSample:
             self.filepath,
             separator=self.delimiter,
             n_rows=self.SAMPLE_ROWS_BY_QUALITY,
+            comment_prefix="#",
         )
-        df = df.with_columns(pl.sum_horizontal(pl.all().is_null()).alias("null_count"))
-        df = df.sort("null_count")
-        df = df.drop("null_count")
+        # Namespaced internal name avoids clobbering a user column named "null_count".
+        null_count_column = "__datagrunt_null_count__"
+        df = df.with_columns(
+            pl.sum_horizontal(pl.all().is_null()).alias(null_count_column)
+        )
+        df = df.sort(null_count_column)
+        df = df.drop(null_count_column)
         return df.head(self.SAMPLE_ROWS).write_csv(file=None)
 
 
