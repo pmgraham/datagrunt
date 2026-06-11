@@ -97,7 +97,7 @@ class DocumentAssembler:
             classification = "mixed"
             if analysis.is_scanned:
                 classification = "scanned"
-            elif analysis.has_text_layer and len(elements) == 0:
+            elif analysis.has_text_layer and analysis.image_count == 0 and not tables:
                 classification = "text_only"
 
             page_dict = {
