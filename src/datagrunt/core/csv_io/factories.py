@@ -46,8 +46,20 @@ class CSVEngineFactory:
         self.lenient = lenient
         if not self.filepath.exists():
             raise FileNotFoundError
-        if self.engine not in CSVEngineProperties.valid_engines:
-            raise ValueError(CSVEngineProperties.value_error_message.format(engine=self.engine))
+        self.validate_engine(self.engine)
+
+    @staticmethod
+    def validate_engine(engine):
+        """Validate a normalized engine name against the supported engines.
+
+        Args:
+            engine (str): Normalized engine name (lowercased, spaces stripped).
+
+        Raises:
+            ValueError: If the engine name is not a supported engine.
+        """
+        if engine not in CSVEngineProperties.valid_engines:
+            raise ValueError(CSVEngineProperties.value_error_message.format(engine=engine))
 
     @property
     def db_table(self):
