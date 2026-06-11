@@ -124,6 +124,24 @@ class TestEngines:
             expected_type = QUERY_RESULT_TYPES[engine]
             assert isinstance(result, expected_type)
 
+    def test_query_data_disposes_connection_on_materializing_engines(self, sample_csv):
+        """polars/pyarrow query_data must close the DuckDB connection.
+
+        Those engines return a fully-materialized polars DataFrame from
+        ``sql_query_to_dataframe``, so nothing references the connection after
+        the call and it must be disposed deterministically. The duckdb engine
+        returns a live relation and must keep its connection open.
+        """
+        for engine in ("polars", "pyarrow"):
+            reader = CSVEngineFactory(sample_csv, engine).create_reader()
+            reader.query_data(f"SELECT * FROM {reader.db_table} LIMIT 1")
+            assert reader.queries._connection is None, engine
+
+        duckdb_reader = CSVEngineFactory(sample_csv, "duckdb").create_reader()
+        relation = duckdb_reader.query_data(f"SELECT * FROM {duckdb_reader.db_table} LIMIT 1")
+        assert duckdb_reader.queries._connection is not None
+        assert relation.fetchall()  # the live relation is still usable
+
     def test_reader_get_sample_all_engines(self, sample_csv):
         """Test get_sample method returns a sample DataFrame for all engines."""
         for engine in ALL_ENGINES:
