@@ -362,3 +362,56 @@ class TestParsedDocument:
         assert pd.drop_layout_tables() == 1
         kept = document["document"]["pages"][0]["elements"]
         assert [e["type"] for e in kept] == ["table", "body_text"]
+
+
+class TestMarkdownMetacharacterEscaping:
+    """Body/caption text starting with markdown metacharacters must be escaped."""
+
+    @staticmethod
+    def _element(etype, content):
+        return {"type": etype, "content": content, "metadata": {}}
+
+    @staticmethod
+    def _markdown(elements):
+        from datagrunt.core.pdf_io.pdfcomponents import ParsedDocument
+
+        document = {"document": {"pages": [{"page_number": 1, "elements": elements}]}}
+        return ParsedDocument(document).to_markdown()
+
+    def test_body_text_leading_hash_is_escaped(self):
+        md = self._markdown([self._element("body_text", "# rm -rf is not a heading")])
+        assert "\\# rm -rf is not a heading" in md
+        # The line must not begin with a bare H1 marker.
+        assert not md.lstrip().startswith("# ")
+
+    def test_body_text_leading_dash_is_escaped(self):
+        md = self._markdown([self._element("body_text", "- not a list item")])
+        assert "\\- not a list item" in md
+
+    def test_body_text_leading_blockquote_is_escaped(self):
+        md = self._markdown([self._element("body_text", "> not a quote")])
+        assert "\\> not a quote" in md
+
+    def test_body_text_leading_ordered_list_is_escaped(self):
+        md = self._markdown([self._element("body_text", "1. not a list")])
+        assert "1\\. not a list" in md
+
+    def test_caption_leading_metacharacter_is_escaped(self):
+        md = self._markdown([self._element("caption", "# caption text")])
+        assert "*\\# caption text*" in md
+
+    def test_intentional_heading_element_still_renders(self):
+        md = self._markdown([self._element("header", "Quarterly Report")])
+        assert md.lstrip().startswith("# Quarterly Report")
+
+    def test_heading_content_with_metacharacter_does_not_inject_structure(self):
+        # A genuine heading element keeps its '# ' marker, but its own content
+        # must not introduce a second heading level.
+        md = self._markdown([self._element("header", "# extra hash")])
+        assert "# \\# extra hash" in md
+
+    def test_table_cell_escaping_unchanged(self):
+        from datagrunt.core.pdf_io.pdfcomponents import ParsedDocument
+
+        rendered = ParsedDocument._render_table([["a|b", "c"]], has_header=False)
+        assert "a\\|b" in rendered
