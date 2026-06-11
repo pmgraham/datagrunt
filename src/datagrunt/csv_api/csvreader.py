@@ -66,6 +66,8 @@ class CSVReader(CSVComponents):
         Returns:
             A Polars DataFrame containing the sample rows.
         """
+        if self.is_empty or self.is_blank:
+            return self._return_empty_file_object(pl.DataFrame())
         return self._create_reader().get_sample(normalize_columns)
 
     def to_dataframe(self, normalize_columns=False):
