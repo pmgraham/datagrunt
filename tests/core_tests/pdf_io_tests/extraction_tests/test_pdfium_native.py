@@ -30,12 +30,46 @@ class TestPdfiumNativeReader:
             "page", "type", "text", "font_size", "x", "y", "w", "h", "bbox", "file", "px_width", "px_height", "ocr"
         }
 
+    def test_to_markdown_normalizes_crlf(self):
+        # pdfium emits \r\n line endings; markdown must not leak \r and must
+        # split paragraphs on blank lines (\r\n\r\n).
+        doc = {
+            "document": {
+                "pages": [
+                    {"text": "Page 1 line one\r\nstill para one\r\n\r\nPage 1 paragraph two"}
+                ]
+            }
+        }
+        markdown = PdfiumNativeReader.to_markdown(doc)
+        assert "\r" not in markdown
+        assert markdown == "Page 1 line one\nstill para one\n\nPage 1 paragraph two\n"
+
+    def test_text_bbox_top_down_and_consistent_with_image(self, sample_pdf, tmp_path):
+        """Native text bbox is top-down (y0 <= y1), matching image bbox and position."""
+        page = PdfiumNativeReader(sample_pdf).parse_page(0, image_output_dir=str(tmp_path))
+
+        for obj in page["text_objects"]:
+            x0, y0, x1, y1 = obj["bbox"]
+            pos = obj["position"]
+            # Top-down ascending convention: y0 (top) <= y1 (bottom).
+            assert y0 <= y1, f"text bbox y order descending: {obj['bbox']}"
+            # bbox top must equal the position's y (top edge).
+            assert y0 == pos["y"]
+            # position height is positive (top-down) and matches bbox span.
+            assert pos["h"] > 0
+            assert round(y1 - y0, 2) == round(pos["h"], 2)
+
+        # Same page's image bbox follows the same ascending convention.
+        for img in page["images"]:
+            ix0, iy0, ix1, iy1 = img["bbox"]
+            assert iy0 <= iy1, f"image bbox y order descending: {img['bbox']}"
+
     def test_dedupe_images(self, tmp_path):
         a, b = tmp_path / "a.png", tmp_path / "b.png"
         a.write_bytes(b"X")
         b.write_bytes(b"X")
         doc = {"document": {"pages": [{"images": [{"file": str(a)}, {"file": str(b)}]}]}}
-        removed = PdfiumNativeReader.dedupe_images(doc)
+        removed = PdfiumNativeReader.dedupe_images(doc, image_output_dir=str(tmp_path))
         assert removed == 1 and not b.exists()
 
     def test_to_markdown_escapes_leading_metacharacters(self):
