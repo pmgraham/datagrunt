@@ -122,6 +122,32 @@ class TestCSVWriter:
         assert Path("output.parquet").exists()
         Path("output.parquet").unlink()  # Cleanup
 
+    def test_write_parquet_lenient_ragged_csv(self, tmp_path):
+        """Ragged CSV with lenient=True must round-trip to parquet, matching write_csv.
+
+        Regression test for issue #88: CSVWriterPolarsEngine.write_parquet
+        dropped the lenient flag, so a ragged file that write_csv handled fine
+        raised a polars ComputeError only for parquet output.
+        """
+        ragged_csv = tmp_path / "ragged.csv"
+        ragged_csv.write_text("a,b,c\n1,2,3\n4,5\n6,7,8,9")
+
+        writer = CSVWriter(str(ragged_csv), engine="polars", lenient=True)
+
+        # Baseline: write_csv already honors lenient and succeeds.
+        csv_out = str(tmp_path / "ragged_out.csv")
+        writer.write_csv(csv_out)
+        csv_df = pl.read_csv(csv_out)
+
+        # The fix: write_parquet must also honor lenient and round-trip.
+        parquet_out = str(tmp_path / "ragged_out.parquet")
+        writer.write_parquet(parquet_out)
+        assert Path(parquet_out).exists()
+
+        parquet_df = pl.read_parquet(parquet_out)
+        assert parquet_df.shape == csv_df.shape
+        assert list(parquet_df.columns) == list(csv_df.columns)
+
     def test_file_overwrite(self, sample_csv, tmp_path):
         """Test overwriting existing output files."""
         out_file = str(tmp_path / "test_overwrite.csv")
