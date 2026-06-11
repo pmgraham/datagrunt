@@ -15,13 +15,42 @@ from datagrunt.core.file_io import FileProperties
 
 
 def _count_leading_comments(filepath):
+    """Count leading ``#``-prefixed comment lines before the header.
+
+    Blank lines are intentionally excluded: Polars and PyArrow already ignore
+    leading blank lines natively, so counting them here would double-skip and
+    push the header onto a data row (see issue #85). Blank lines interleaved
+    with comments are tolerated and do not stop the count.
+    """
     count = 0
     with open(filepath, "r", encoding=FileProperties(filepath).DEFAULT_ENCODING) as f:
         for line in f:
             stripped = line.strip()
-            if stripped.startswith("#") or not stripped:
+            if stripped.startswith("#"):
                 count += 1
+            elif not stripped:
+                # Blank line: skip over it without counting it as a row to skip.
+                continue
             else:
+                break
+    return count
+
+
+def _count_leading_physical_lines_before_header(filepath):
+    """Count every leading physical line up to and including the header line.
+
+    Unlike :func:`_count_leading_comments`, this counts blank lines too. It is
+    used for engines (PyArrow) whose ``skip_rows`` operates on physical lines
+    and does not natively ignore leading blank lines once explicit column names
+    are supplied.
+    """
+    count = 0
+    with open(filepath, "r", encoding=FileProperties(filepath).DEFAULT_ENCODING) as f:
+        for line in f:
+            stripped = line.strip()
+            count += 1
+            if stripped and not stripped.startswith("#"):
+                # This is the header line; include it in the skip count.
                 break
     return count
 
