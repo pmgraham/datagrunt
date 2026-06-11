@@ -15,7 +15,7 @@ from datagrunt.core.csv_io import (
     CSVDelimiter,
     CSVDialect,
     _check_csv_ragged_and_warn,
-    _count_leading_comments,
+    _count_leading_physical_lines_before_header,
 )
 
 
@@ -40,7 +40,13 @@ class DuckDBQueries:
         self.lenient = lenient
         self.database_table_name = self._set_database_table_name()
         self.connection = duckdb.connect(":memory:")
-        self.skip_rows = _count_leading_comments(self.filepath)
+        # DuckDB's read_csv ``skip`` operates on physical lines and, unlike
+        # Polars/PyArrow, does not natively ignore leading blank lines. Skip
+        # every leading physical line up to (but not including) the header,
+        # which ``header=true`` then consumes. See issue #85. ``max(..., 0)``
+        # guards files with no header line (empty/blank), where the helper
+        # returns 0 and DuckDB rejects a negative ``skip``.
+        self.skip_rows = max(_count_leading_physical_lines_before_header(self.filepath) - 1, 0)
         # Tracks how the cached table was imported (None until first import,
         # then True/False for normalize_columns) so create_table can reuse the
         # table for matching calls and re-import only when the mode changes.
@@ -196,6 +202,48 @@ class DuckDBQueries:
         """Query to select from a DuckDB table."""
         return f"SELECT * FROM {self.database_table_name}"
 
+    def sample_csv_query(self, limit):
+        """Query to stream the first ``limit`` rows directly from the CSV file.
+
+        Unlike :meth:`import_csv_query`, this does not create a table; the
+        ``LIMIT`` lets DuckDB stop reading once enough rows are produced, so the
+        whole file is never materialized just to return a small sample. The
+        ``read_csv`` options mirror :meth:`import_csv_query` so the sampled rows
+        and column headers match a full import.
+
+        Args:
+            limit (int): The maximum number of rows to return.
+
+        Returns:
+            str: The SQL query to stream the sample rows.
+        """
+        if self.lenient:
+            from datagrunt.core.csv_io import CSVColumns
+
+            cols = CSVColumns(self.filepath, delimiter=self.delimiter).columns
+            cols_param = "{" + ", ".join(f"'{c}': 'VARCHAR'" for c in cols) + "}"
+            read_csv = f"""read_csv('{self.filepath}',
+                                delim='{self.delimiter}',
+                                header=true,
+                                columns={cols_param},
+                                quote='{self.quotechar.replace("'", "''")}',
+                                null_padding=true,
+                                all_varchar=True,
+                                auto_detect=false,
+                                strict_mode=false,
+                                skip={self.skip_rows})"""
+        else:
+            read_csv = f"""read_csv('{self.filepath}',
+                                auto_detect=true,
+                                delim='{self.delimiter}',
+                                header=true,
+                                quote='{self.quotechar.replace("'", "''")}',
+                                null_padding=true,
+                                all_varchar=True,
+                                strict_mode=true,
+                                skip={self.skip_rows})"""
+        return f"SELECT * FROM {read_csv} LIMIT {limit}"
+
     def export_csv_query(self, default_filename, export_filename=None):
         """
         Query to export a DuckDB table to a CSV file.
@@ -328,6 +376,28 @@ class DuckDBQueries:
                 self.connection.sql(self.import_csv_query())
             self._imported_normalize_columns = normalize_columns
         return self.connection.sql(self.select_from_duckdb_table()).execute()
+
+    def sample_dataframe(self, limit, normalize_columns=False):
+        """Return the first ``limit`` rows of the CSV as a Polars DataFrame.
+
+        Streams the rows via :meth:`sample_csv_query` rather than importing the
+        full file into a table, so memory and time stay bounded by the sample
+        size instead of the file size. Column normalization is applied to the
+        small result frame, matching the headers a full import would produce.
+
+        Args:
+            limit (int): The maximum number of rows to return.
+            normalize_columns (bool): Whether to normalize column names.
+
+        Returns:
+            polars.DataFrame: The sampled rows.
+        """
+        if self.lenient:
+            _check_csv_ragged_and_warn(self.filepath, self.delimiter)
+        dataframe = self.connection.sql(self.sample_csv_query(limit)).pl()
+        if normalize_columns:
+            dataframe = self._normalize_dataframe_columns(dataframe)
+        return dataframe
 
     def _normalize_dataframe_columns(self, dataframe):
         """Applies column name normalization to a Polars DataFrame.
