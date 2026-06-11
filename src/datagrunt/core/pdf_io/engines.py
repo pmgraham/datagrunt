@@ -6,7 +6,6 @@ import logging
 import os
 import time
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -125,23 +124,30 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
             return len(doc)
 
     def to_dicts(self, image_output_dir: Optional[str] = None, drop_layout_tables: bool = False) -> dict:
-        """Parse all pages concurrently into the unified document dict."""
+        """Parse all pages sequentially into the unified document dict.
+
+        Pages are parsed one at a time on purpose: PyMuPDF/MuPDF shares a global
+        context and is not thread-safe, so dispatching pages across threads risks
+        garbled output or an interpreter crash. The ``workers`` argument is kept
+        for API compatibility but does not enable threading here; callers needing
+        parallel parsing should use the process-based pdfium engine.
+        """
+        if self.workers > 1:
+            logger.warning(
+                "PyMuPDF parses pages sequentially because MuPDF is not thread-safe; "
+                "the 'workers=%d' setting is ignored. Use the pdfium engine for parallel parsing.",
+                self.workers,
+            )
         assembler = pdfcomponents.DocumentAssembler(self.filepath)
         total_pages = self._total_pages()
         page_results = {}
         errors = []
-        with ThreadPoolExecutor(max_workers=self.workers) as executor:
-            futures = {
-                executor.submit(assembler.parse_page, idx, image_output_dir): idx
-                for idx in range(total_pages)
-            }
-            for future in as_completed(futures):
-                idx = futures[future]
-                try:
-                    page = future.result()
-                    page_results[page["page_number"]] = page
-                except Exception as e:  # noqa: BLE001 - per-page isolation
-                    errors.append(f"Page {idx + 1}: {e}")
+        for idx in range(total_pages):
+            try:
+                page = assembler.parse_page(idx, image_output_dir)
+                page_results[page["page_number"]] = page
+            except Exception as e:  # noqa: BLE001 - per-page isolation
+                errors.append(f"Page {idx + 1}: {e}")
         ordered = [page_results[p] for p in sorted(page_results.keys())]
         document = assembler.combine(total_pages, ordered, errors)
         if drop_layout_tables:
