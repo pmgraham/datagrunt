@@ -28,29 +28,39 @@ class PdfPlumberTableExtractor:
         self._local = threading.local()
 
     def __enter__(self):
+        # Mark a held-open scope but defer the pdfplumber.open() until a page
+        # actually needs tables. Text-only documents (no line drawings, has a
+        # text layer) never call extract(), so they must never pay for opening
+        # pdfplumber. The shared handle is opened lazily on first extract() and
+        # closed when the outermost scope exits.
         if not hasattr(self._local, "depth"):
             self._local.depth = 0
-        if self._local.depth == 0:
-            pdfplumber = _import_pdfplumber()
-            self._local.pdf = pdfplumber.open(self.filepath)
+            self._local.pdf = None
         self._local.depth += 1
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._local.depth -= 1
         if self._local.depth == 0:
-            if hasattr(self._local, "pdf") and self._local.pdf:
+            if getattr(self._local, "pdf", None):
                 self._local.pdf.close()
-                self._local.pdf = None
+            self._local.pdf = None
 
     def _get_pdf(self):
-        if hasattr(self._local, "pdf") and self._local.pdf:
+        # Inside a held-open scope (depth > 0) the handle is opened once and
+        # cached for the scope; __exit__ owns closing it. Outside a scope it is
+        # opened transiently and the caller closes it.
+        if getattr(self._local, "pdf", None):
             return self._local.pdf, False
         pdfplumber = _import_pdfplumber()
         try:
-            return pdfplumber.open(self.filepath), True
+            pdf = pdfplumber.open(self.filepath)
         except Exception:
             return None, False
+        if getattr(self._local, "depth", 0) > 0:
+            self._local.pdf = pdf
+            return pdf, False
+        return pdf, True
 
     def extract(self, page_number: int) -> list:
         """Return ``TableBlock`` objects on ``page_number`` (0-indexed).
