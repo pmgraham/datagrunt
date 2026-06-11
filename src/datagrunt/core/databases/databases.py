@@ -52,6 +52,17 @@ class DuckDBQueries:
         # table for matching calls and re-import only when the mode changes.
         self._imported_normalize_columns = None
 
+    @property
+    def _escaped_filepath_literal(self):
+        """Return the file path as a single-quote-escaped SQL string literal.
+
+        DuckDB string literals are single-quoted, so a path containing an
+        apostrophe (e.g. ``o'hara.csv``) must double the quote to avoid
+        producing broken SQL. Built once and reused by every import/export
+        query that interpolates the path.
+        """
+        return Path(self.filepath).as_posix().replace("'", "''")
+
     @cached_property
     def delimiter(self):
         """Get the delimiter."""
@@ -64,6 +75,55 @@ class DuckDBQueries:
             return CSVDialect(self.filepath).quotechar
         except Exception:
             return '"'
+
+    @staticmethod
+    def _escape_sql_literal(value):
+        """Escape a value for use inside a single-quoted SQL string literal.
+
+        Doubling embedded apostrophes prevents an export path containing a
+        quote (e.g. ``my'data.csv``) from terminating the literal early and
+        producing broken ``COPY ... TO '...'`` SQL.
+
+        Args:
+            value (str): The raw string to place inside a literal.
+
+        Returns:
+            str: The escaped string (without the surrounding quotes).
+        """
+        return str(value).replace("'", "''")
+
+    @staticmethod
+    def _escape_identifier(name):
+        """Escape a column name for use inside a double-quoted SQL identifier.
+
+        DuckDB identifiers are double-quoted, so a quote in a column name (which
+        can come straight from a CSV header cell) must be doubled or it
+        terminates the identifier early and produces broken SQL.
+
+        Args:
+            name (str): The raw column name.
+
+        Returns:
+            str: The escaped name (without the surrounding double quotes).
+        """
+        return str(name).replace('"', '""')
+
+    @staticmethod
+    def _build_lenient_columns_param(columns):
+        """Build the ``columns={...}`` struct for a lenient ``read_csv`` call.
+
+        Each column name becomes a single-quoted SQL string literal, so any
+        apostrophe in a header cell must be doubled or it terminates the literal
+        early and produces broken SQL.
+
+        Args:
+            columns (list[str]): Header-derived column names.
+
+        Returns:
+            str: A DuckDB struct literal mapping each column to ``'VARCHAR'``.
+        """
+        entries = ", ".join(f"'{name.replace(chr(39), chr(39) * 2)}': 'VARCHAR'" for name in columns)
+        return "{" + entries + "}"
 
     def close(self):
         """Close this instance's DuckDB connection.
@@ -124,12 +184,12 @@ class DuckDBQueries:
             from datagrunt.core.csv_io import CSVColumns
 
             cols = CSVColumns(self.filepath, delimiter=self.delimiter).columns
-            cols_param = "{" + ", ".join(f"'{c}': 'VARCHAR'" for c in cols) + "}"
+            cols_param = self._build_lenient_columns_param(cols)
             return f"""
                 CREATE OR REPLACE TABLE {self.database_table_name} AS
                 SELECT *
-                FROM read_csv('{self.filepath}',
-                                delim='{self.delimiter}',
+                FROM read_csv('{self._escaped_filepath_literal}',
+                                delim='{self._escape_sql_literal(self.delimiter)}',
                                 header=true,
                                 columns={cols_param},
                                 quote='{self.quotechar.replace("'", "''")}',
@@ -143,9 +203,9 @@ class DuckDBQueries:
             return f"""
                 CREATE OR REPLACE TABLE {self.database_table_name} AS
                 SELECT *
-                FROM read_csv('{self.filepath}',
+                FROM read_csv('{self._escaped_filepath_literal}',
                                 auto_detect=true,
-                                delim='{self.delimiter}',
+                                delim='{self._escape_sql_literal(self.delimiter)}',
                                 header=true,
                                 quote='{self.quotechar.replace("'", "''")}',
                                 null_padding=true,
@@ -166,12 +226,12 @@ class DuckDBQueries:
             from datagrunt.core.csv_io import CSVColumns
 
             cols = CSVColumns(self.filepath, delimiter=self.delimiter).columns
-            cols_param = "{" + ", ".join(f"'{c}': 'VARCHAR'" for c in cols) + "}"
+            cols_param = self._build_lenient_columns_param(cols)
             return f"""
                 CREATE OR REPLACE TABLE {self.database_table_name} AS
                 SELECT *
-                FROM read_csv('{self.filepath}',
-                                delim='{self.delimiter}',
+                FROM read_csv('{self._escaped_filepath_literal}',
+                                delim='{self._escape_sql_literal(self.delimiter)}',
                                 header=true,
                                 columns={cols_param},
                                 quote='{self.quotechar.replace("'", "''")}',
@@ -186,9 +246,9 @@ class DuckDBQueries:
             return f"""
                 CREATE OR REPLACE TABLE {self.database_table_name} AS
                 SELECT *
-                FROM read_csv('{self.filepath}',
+                FROM read_csv('{self._escaped_filepath_literal}',
                                 auto_detect=true,
-                                delim='{self.delimiter}',
+                                delim='{self._escape_sql_literal(self.delimiter)}',
                                 header=true,
                                 quote='{self.quotechar.replace("'", "''")}',
                                 null_padding=true,
@@ -255,7 +315,7 @@ class DuckDBQueries:
         Returns:
             str: The SQL query to export the table to a CSV file.
         """
-        filename = self.set_export_filename(default_filename, export_filename)
+        filename = self._escape_sql_literal(self.set_export_filename(default_filename, export_filename))
         return f"COPY {self.database_table_name} TO '{filename}' (HEADER, DELIMITER ',');"  # noqa: E501
 
     def export_excel_query(self, default_filename, export_filename=None):
@@ -269,7 +329,7 @@ class DuckDBQueries:
         Returns:
             str: The SQL query to export the table to an Excel file.
         """
-        filename = self.set_export_filename(default_filename, export_filename)
+        filename = self._escape_sql_literal(self.set_export_filename(default_filename, export_filename))
         return f"""
             INSTALL spatial;
             LOAD spatial;
@@ -288,7 +348,7 @@ class DuckDBQueries:
         Returns:
             str: The SQL query to export the table to a JSON file.
         """
-        filename = self.set_export_filename(default_filename, export_filename)
+        filename = self._escape_sql_literal(self.set_export_filename(default_filename, export_filename))
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}' (ARRAY true)"  # noqa: E501
 
     def export_json_newline_delimited_query(self, default_filename, export_filename=None):
@@ -303,7 +363,7 @@ class DuckDBQueries:
             str: The SQL query to export the table to a JSON file with newline
             delimited.
         """
-        filename = self.set_export_filename(default_filename, export_filename)
+        filename = self._escape_sql_literal(self.set_export_filename(default_filename, export_filename))
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}'"  # noqa: E501
 
     def export_parquet_query(self, default_filename, export_filename=None):
@@ -317,7 +377,7 @@ class DuckDBQueries:
         Returns:
             str: The SQL query to export the table to a Parquet file.
         """
-        filename = self.set_export_filename(default_filename, export_filename)
+        filename = self._escape_sql_literal(self.set_export_filename(default_filename, export_filename))
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}'(FORMAT PARQUET)"  # noqa: E501
 
     def update_and_normalize_column_names(self):
@@ -334,7 +394,11 @@ class DuckDBQueries:
         table_columns = self.connection.sql(f"SELECT * FROM {self.database_table_name} LIMIT 0").columns
         normalizer = CSVColumnNameNormalizer(self.filepath, columns=table_columns)
         for old_name, new_name in zip(table_columns, normalizer.columns_normalized):
-            sql_string = f'ALTER TABLE {self.database_table_name} RENAME COLUMN "{old_name}" TO "{new_name}"'
+            # Double-quote-escape both identifiers; a quote in a header cell
+            # would otherwise break the RENAME COLUMN SQL.
+            safe_old = self._escape_identifier(old_name)
+            safe_new = self._escape_identifier(new_name)
+            sql_string = f'ALTER TABLE {self.database_table_name} RENAME COLUMN "{safe_old}" TO "{safe_new}"'
             self.connection.sql(sql_string)
 
     def _table_is_current(self, normalize_columns):
