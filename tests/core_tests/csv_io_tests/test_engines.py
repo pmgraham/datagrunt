@@ -435,6 +435,29 @@ class TestEngines:
         assert "e_mail" in df.columns
         assert "phone" in df.columns
 
+    def test_midfile_comment_line_pyarrow_matches_polars(self, tmp_path):
+        """A mid-file ``#`` line must not crash pyarrow and must match polars.
+
+        Regression test for issue #90: the pyarrow engine raised
+        ``ArrowInvalid`` on a comment line after the leading block. Since #73,
+        only LEADING ``#`` lines are comments — a mid-file ``#`` line is data
+        (dropping it silently would lose ``#``-prefixed rows like hex colors) —
+        so pyarrow must yield exactly what the polars reference engine yields.
+        (duckdb's strict mode currently drops such lines; that pre-existing
+        divergence is outside this fix's scope.)
+        """
+        midfile_comment_csv = tmp_path / "midfile_comment.csv"
+        midfile_comment_csv.write_text("name,age\nalice,30\n# midfile comment\nbob,25\n")
+
+        polars_rows = CSVEngineFactory(str(midfile_comment_csv), "polars").create_reader().to_dataframe().to_dicts()
+        pyarrow_df = CSVEngineFactory(str(midfile_comment_csv), "pyarrow").create_reader().to_dataframe()
+
+        assert isinstance(pyarrow_df, pl.DataFrame)
+        assert pyarrow_df.columns == ["name", "age"]
+        assert pyarrow_df.to_dicts() == polars_rows
+        assert {"name": "alice", "age": "30"} in polars_rows
+        assert {"name": "bob", "age": "25"} in polars_rows
+
 
 class TestNormalizeCollidingColumnsAllEngines:
     """``normalize_columns=True`` must behave identically across engines.
@@ -577,3 +600,4 @@ class TestLeadingCommentHandling:
             df = reader.to_dataframe()
             assert df.columns == ["a", "b"]
             assert len(df) == 1
+
