@@ -15,6 +15,7 @@ Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow
 - **Path Object Support:** Full support for both string paths and `pathlib.Path` objects for modern, cross-platform file handling.
 - **Multiple Processing Engines:** Choose from three powerful engines - [DuckDB](https://duckdb.org), [Polars](https://pola.rs), and [PyArrow](https://arrow.apache.org/docs/python/) - to handle your data processing needs.
 - **Flexible Data Transformation:** Easily convert your processed CSV data into various formats including CSV, Excel, JSON, JSONL, and Parquet.
+- **Robust by Default:** Fail-fast validation with clear errors (invalid engine names, missing paths, directories, encrypted PDFs), graceful handling of empty files, no `UnicodeDecodeError` when constructing a reader over a non-UTF-8 file, and sane comment semantics — only leading `#` lines are treated as comments, so `#`-prefixed data rows such as hex colors are preserved on the Polars and PyArrow engines.
 - **PDF Parsing & OCR:** Extract text, tables, and images from PDF files as dicts, DataFrames, or JSON, with optional [Tesseract](https://github.com/tesseract-ocr/tesseract) OCR for scanned pages. Powered by the permissively-licensed **PDFium** engine by default, with **PyMuPDF** available as an alternative.
 - **AI-Powered Schema Analysis:** Use Google's Gemini models to automatically generate detailed schema reports for your CSV files, including data types, column classifications, and data quality checks.
 - **Pythonic API:** Enjoy a clean and intuitive API that integrates seamlessly into your existing Python workflows.
@@ -61,7 +62,8 @@ reader_polars = CSVReader(csv_file, engine='polars')    # String path - fast Dat
 reader_duckdb = CSVReader(csv_path, engine='duckdb')    # Path object - best for SQL queries
 reader_pyarrow = CSVReader(csv_file, engine='pyarrow')  # Arrow ecosystem integration
 
-# Get a sample of the data
+# Get a sample of the data (streams the first rows — the whole file is never
+# materialized, so sampling large files stays memory-bounded on every engine)
 reader_duckdb.get_sample()
 ```
 
@@ -94,6 +96,10 @@ df = dg.query_data(query).pl()
 print(df)
 ```
 
+With the DuckDB engine, repeated `query_data()` calls on the same reader reuse
+a single import: the CSV is loaded into DuckDB once per reader instance, so
+follow-up queries skip the file import entirely and run dramatically faster.
+
 ### Exporting Data to Multiple Formats
 
 ```python
@@ -114,6 +120,9 @@ writer.write_parquet('output.parquet')  # Parquet for analytics
 writer_arrow = CSVWriter('input.csv', engine='pyarrow')  # String path also works
 writer_arrow.write_parquet('optimized.parquet')  # Native Arrow Parquet
 ```
+
+Every `write_*` method — including `write_parquet` — honors `lenient=True` for
+ragged CSVs, and empty source files produce empty output instead of an error.
 
 ### AI-Powered Schema Analysis
 
@@ -198,16 +207,27 @@ on either engine.
   positioned text objects, and images, with **no table detection** — which is
   dramatically faster (~20–80×) when you don't need structured tables.
 - Image-only / scanned pages fall back to **Tesseract OCR** automatically on
-  both engines (requires the Tesseract binary; see above).
+  both engines (requires the Tesseract binary; see above). If OCR is
+  unavailable or fails, the page is **not dropped** — it is kept with whatever
+  text and images were extracted, plus a page-level warning, so extraction is
+  always complete.
+- Encrypted / password-protected PDFs raise a clear `ValueError` on every
+  engine instead of a raw backend exception.
 
 ### Parallel Processing & Concurrency
-By default, `PDFReader` and `PDFWriter` run sequentially (`workers=1`). You can enable parallel processing on multi-core systems by passing a `workers` count greater than `1`:
+By default, `PDFReader` and `PDFWriter` run sequentially (`workers=1`). On the default **PDFium engine**, you can enable parallel processing on multi-core systems by passing a `workers` count greater than `1`:
 ```python
 if __name__ == '__main__':
     # Run with 8 processes to parse pages concurrently
     reader = PDFReader("report.pdf", workers=8)
     document = reader.to_dicts()
 ```
+
+`workers` applies to the **PDFium engine only**. The PyMuPDF engine always
+parses pages sequentially because the underlying MuPDF library is not
+thread-safe — passing `workers > 1` with `engine="pymupdf"` logs a warning and
+is ignored. Use the default PDFium engine when you need parallel
+(process-based) parsing.
 
 #### Why `if __name__ == '__main__':` is required
 Because PDFium is not thread-safe within a single process, `datagrunt` uses a process pool (`ProcessPoolExecutor` with the `spawn` start context on macOS and Windows) to parse pages concurrently.
@@ -238,7 +258,7 @@ tables with at least two rows and two columns. It is off by default.
 | **Default for** | CSVReader | CSVWriter | - |
 | **Export Quality** | Good | Excellent (especially JSON) | Native Parquet support |
 
-_The engines above apply to CSV processing. PDF parsing uses the **PDFium** engine by default (permissively licensed), with **PyMuPDF** available via `engine="pymupdf"` — see [PDF parsing](#pdf-parsing)._
+_The engines above apply to CSV processing. Whichever you pick, results are consistent: leading `#` comment lines, leading blank lines, logical record counts (quoted embedded newlines count as one record), and column-name normalization — including collision handling like `Col A,col_a` → `col_a, col_a_1` — behave identically across all three. One known divergence: mid-file lines starting with `#` are kept as data on Polars and PyArrow, but the DuckDB engine may still drop them. PDF parsing uses the **PDFium** engine by default (permissively licensed), with **PyMuPDF** available via `engine="pymupdf"` — see [PDF parsing](#pdf-parsing)._
 
 ## Primary Classes
 
