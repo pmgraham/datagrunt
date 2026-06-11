@@ -149,6 +149,12 @@ class PageLayoutSorter:
         bin_limit = bin_count
         for it in text_items:
             x0, _, x1, _ = self.adapter.get_bounds(it)
+            # The partition-level finiteness guard only sees the aggregate
+            # min/max (NaN loses every min()/max() comparison against a finite
+            # first operand), so a non-finite coordinate on a later item can
+            # still reach int() here. Skip such items individually.
+            if not (math.isfinite(x0) and math.isfinite(x1)):
+                continue
             if (x1 - x0) > page_width * 0.7:
                 continue
             start = max(0, int(x0))

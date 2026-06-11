@@ -78,6 +78,43 @@ class TestPartitionPathologicalCoordinates:
 
         assert len(_flatten(segments)) == len(items)
 
+    def test_nan_coordinate_on_non_first_item_does_not_raise(self):
+        """A NaN on a NON-first item evades the aggregate finiteness guard.
+
+        ``min(0, nan)`` returns 0 (NaN comparisons are False), so min_x/max_x
+        stay finite and partition proceeds to the histogram, where ``int(nan)``
+        raised ValueError. Non-finite items must be skipped per item.
+        """
+        nan = float("nan")
+        items = [
+            _text_item(0, 10, 10),
+            _text_item(nan, nan, 30),
+            _text_item(150, 160, 50),
+            _text_item(155, 165, 70),
+        ]
+
+        segments = PageLayoutSorter(TextItemAdapter()).partition(items)
+
+        assert len(_flatten(segments)) == len(items)
+
+    def test_infinite_coordinate_on_non_first_item_does_not_raise(self):
+        """An inf x0 with a finite x1 evades the aggregate guard.
+
+        min_x aggregates x0 (``min(0, inf)`` is 0) and max_x aggregates x1, so
+        both stay finite; ``int(inf)`` in the histogram raised OverflowError.
+        """
+        inf = float("inf")
+        items = [
+            _text_item(0, 10, 10),
+            _text_item(inf, 20, 30),
+            _text_item(150, 160, 50),
+            _text_item(155, 165, 70),
+        ]
+
+        segments = PageLayoutSorter(TextItemAdapter()).partition(items)
+
+        assert len(_flatten(segments)) == len(items)
+
     def test_infinite_coordinate_does_not_raise(self):
         """An infinite x-coordinate overflowed int() (OverflowError) before.
 
