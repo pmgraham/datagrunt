@@ -39,7 +39,11 @@ class DuckDBQueries:
         self.filepath = Path(filepath)
         self.lenient = lenient
         self.database_table_name = self._set_database_table_name()
-        self.connection = duckdb.connect(":memory:")
+        # Opened lazily on first access via the ``connection`` property. Many
+        # construction paths (reading a table name, or any polars/pyarrow read)
+        # never touch DuckDB, so eagerly opening a connection here would waste
+        # one on every such instance.
+        self._connection = None
         # DuckDB's read_csv ``skip`` operates on physical lines and, unlike
         # Polars/PyArrow, does not natively ignore leading blank lines. Skip
         # every leading physical line up to (but not including) the header,
@@ -62,6 +66,20 @@ class DuckDBQueries:
         query that interpolates the path.
         """
         return Path(self.filepath).as_posix().replace("'", "''")
+
+    @property
+    def connection(self):
+        """Return this instance's DuckDB connection, opening it on first use.
+
+        The connection is created lazily so that constructing a
+        ``DuckDBQueries`` (e.g. just to read ``database_table_name``) does not
+        open a connection. The public attribute name is unchanged, so existing
+        callers that do ``self.connection.sql(...)`` continue to work exactly
+        as they did with the previous eager attribute.
+        """
+        if self._connection is None:
+            self._connection = duckdb.connect(":memory:")
+        return self._connection
 
     @cached_property
     def delimiter(self):
@@ -138,7 +156,16 @@ class DuckDBQueries:
         becomes invalid once it is closed, so only call ``close()`` once you are
         done with results derived from this instance.
         """
-        self.connection.close()
+        # Only close if a connection was actually opened, and reset the backing
+        # attribute so a later access transparently reopens one (preserving the
+        # always-usable contract of the previous eager attribute).
+        if self._connection is not None:
+            self._connection.close()
+            self._connection = None
+            # The imported table lived in the in-memory database that was just
+            # destroyed; reset the import cache so a reopened connection
+            # re-imports instead of reusing a table that no longer exists.
+            self._imported_normalize_columns = None
 
     def _format_filename_string(self):
         """Remove all non alphanumeric characters from the file stem."""

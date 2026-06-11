@@ -207,10 +207,17 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         Returns:
             A Polars DataFrame containing the sample rows.
         """
-        return self.queries.sample_dataframe(
-            CSVEngineProperties.dataframe_sample_rows,
-            normalize_columns,
-        )
+        # sample_dataframe streams the first rows (no full-table import) and
+        # returns a materialized Polars frame, so the per-call connection can
+        # be released deterministically rather than waiting on garbage
+        # collection.
+        try:
+            return self.queries.sample_dataframe(
+                CSVEngineProperties.dataframe_sample_rows,
+                normalize_columns,
+            )
+        finally:
+            self.queries.close()
 
     def to_dataframe(self, normalize_columns=False):
         """
@@ -223,7 +230,11 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         Returns:
             A Polars dataframe.
         """
-        return self.queries.create_table(normalize_columns).pl()
+        # Materialize fully (.pl()) before closing the per-call connection.
+        try:
+            return self.queries.create_table(normalize_columns).pl()
+        finally:
+            self.queries.close()
 
     def to_arrow_table(self, normalize_columns=False):
         """
@@ -236,10 +247,14 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         Returns:
             A PyArrow table.
         """
-        result = self.queries.create_table(normalize_columns).arrow()
-        if isinstance(result, pa.Table):
-            return result
-        return result.read_all()
+        # Materialize into an in-memory pa.Table before closing the connection.
+        try:
+            result = self.queries.create_table(normalize_columns).arrow()
+            if isinstance(result, pa.Table):
+                return result
+            return result.read_all()
+        finally:
+            self.queries.close()
 
     def to_dicts(self, normalize_columns=False):
         """
@@ -252,6 +267,7 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         Returns:
             A list of dictionaries.
         """
+        # to_dataframe already materializes and closes; this is a thin wrapper.
         return self.to_dataframe(normalize_columns).to_dicts()
 
     def _normalize_relation_columns(self, relation):
@@ -451,7 +467,13 @@ class CSVReaderPolarsEngine(CSVBaseReaderEngine):
             query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
             dg.query_csv_data(query)
         """
-        return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
+        # The result is a fully-materialized polars DataFrame, so the
+        # connection can be disposed deterministically (unlike the duckdb
+        # engine, whose query_data returns a live relation).
+        try:
+            return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
+        finally:
+            self.queries.close()
 
 
 class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
@@ -473,8 +495,13 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
                 normalize_columns bool: Whether to normalize column names.
         """
         filename = self.queries.set_export_filename(CSVEngineProperties.csv_export_filename, export_filename)
-        self.queries.create_table(normalize_columns)
-        self.queries.connection.sql(self.queries.export_csv_query(filename))
+        # COPY executes eagerly on .sql(), so the file is written before close()
+        # releases the per-call connection.
+        try:
+            self.queries.create_table(normalize_columns)
+            self.queries.connection.sql(self.queries.export_csv_query(filename))
+        finally:
+            self.queries.close()
 
     def write_excel(self, export_filename=None, normalize_columns=False):
         """
@@ -486,8 +513,11 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
             names.
         """
         filename = self.queries.set_export_filename(CSVEngineProperties.excel_export_filename, export_filename)
-        self.queries.create_table(normalize_columns)
-        self.queries.connection.sql(self.queries.export_excel_query(filename))
+        try:
+            self.queries.create_table(normalize_columns)
+            self.queries.connection.sql(self.queries.export_excel_query(filename))
+        finally:
+            self.queries.close()
 
     def write_json(self, export_filename=None, normalize_columns=False):
         """
@@ -499,8 +529,11 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
             names.
         """
         filename = self.queries.set_export_filename(CSVEngineProperties.json_export_filename, export_filename)
-        self.queries.create_table(normalize_columns)
-        self.queries.connection.sql(self.queries.export_json_query(filename))
+        try:
+            self.queries.create_table(normalize_columns)
+            self.queries.connection.sql(self.queries.export_json_query(filename))
+        finally:
+            self.queries.close()
 
     def write_json_newline_delimited(self, export_filename=None, normalize_columns=False):
         """
@@ -512,8 +545,11 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
             names.
         """
         filename = self.queries.set_export_filename(CSVEngineProperties.json_newline_export_filename, export_filename)
-        self.queries.create_table(normalize_columns)
-        self.queries.connection.sql(self.queries.export_json_newline_delimited_query(filename))
+        try:
+            self.queries.create_table(normalize_columns)
+            self.queries.connection.sql(self.queries.export_json_newline_delimited_query(filename))
+        finally:
+            self.queries.close()
 
     def write_parquet(self, export_filename=None, normalize_columns=False):
         """
@@ -525,8 +561,11 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
             names.
         """
         filename = self.queries.set_export_filename(CSVEngineProperties.parquet_export_filename, export_filename)
-        self.queries.create_table(normalize_columns)
-        self.queries.connection.sql(self.queries.export_parquet_query(filename))
+        try:
+            self.queries.create_table(normalize_columns)
+            self.queries.connection.sql(self.queries.export_parquet_query(filename))
+        finally:
+            self.queries.close()
 
 
 class CSVWriterPolarsEngine(CSVBaseWriterEngine):
@@ -837,7 +876,13 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
             query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
             dg.query_csv_data(query)
         """
-        return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
+        # The result is a fully-materialized polars DataFrame, so the
+        # connection can be disposed deterministically (unlike the duckdb
+        # engine, whose query_data returns a live relation).
+        try:
+            return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
+        finally:
+            self.queries.close()
 
 
 class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
