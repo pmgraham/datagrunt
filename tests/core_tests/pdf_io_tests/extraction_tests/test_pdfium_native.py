@@ -71,3 +71,12 @@ class TestPdfiumNativeReader:
         doc = {"document": {"pages": [{"images": [{"file": str(a)}, {"file": str(b)}]}]}}
         removed = PdfiumNativeReader.dedupe_images(doc, image_output_dir=str(tmp_path))
         assert removed == 1 and not b.exists()
+
+    def test_to_markdown_escapes_leading_metacharacters(self):
+        # Native paragraph text is all body text; a paragraph that happens to
+        # start with a markdown metacharacter must not become structure.
+        doc = {"document": {"pages": [{"text": "# rm -rf is not a heading\n\n- not a list"}]}}
+        md = PdfiumNativeReader.to_markdown(doc)
+        assert "\\# rm -rf is not a heading" in md
+        assert "\\- not a list" in md
+        assert not md.lstrip().startswith("# ")
