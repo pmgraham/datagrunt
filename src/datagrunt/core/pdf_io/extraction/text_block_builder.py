@@ -1,6 +1,7 @@
 """Group raw text items into classified blocks (engine-agnostic)."""
 
 import re
+from bisect import bisect_left
 from datagrunt.core.pdf_io.extraction.shapes import BBox, TextBlock
 from datagrunt.core.pdf_io.extraction.layout_sorter import PageLayoutSorter, TextItemAdapter
 
@@ -73,18 +74,43 @@ class TextBlockBuilder:
         return all_blocks
 
     def _cluster_into_lines(self, items: list) -> list:
-        """Group items whose ``y_top`` are within tolerance into line records."""
+        """Group items whose ``y_top`` are within tolerance into line records.
+
+        Items arrive sorted by ``(round(y_top), x0)``, so each line's anchor
+        ``y`` is created in non-decreasing rounded-``y`` order. A new item can
+        therefore only match lines whose anchor lies within the tolerance band
+        ``[y_top - tol, y_top + tol]``; lines anchored further down can never
+        match again. We binary-search the band's lower edge (using the largest
+        tolerance any line could have) and scan forward to the first matching
+        line, preserving the original "first line in creation order" rule. Each
+        line's max item size is cached and updated on append rather than
+        recomputed, removing the per-candidate ``max()`` scan.
+        """
+        if not items:
+            return []
+        max_item_size = max(it.size for it in items)
+        # Widest possible half-band for any (line, item) pair on this page; used
+        # only to bound the binary search, never to decide membership.
+        max_tol = max(2.0, max_item_size * 0.5)
+
         lines = []
+        line_keys = []  # round(anchor_y, 0) per line, ascending by construction
         for it in sorted(items, key=lambda i: (round(i.y_top, 0), i.x0)):
+            lo = bisect_left(line_keys, round(it.y_top - max_tol, 0))
             placed = False
-            for ln in lines:
-                line_max_size = max(i.size for i in ln["items"])
+            for ln in lines[lo:]:
+                if ln["y"] - it.y_top > max_tol:
+                    break  # remaining anchors are even further above the band
+                line_max_size = ln["max_size"]
                 if abs(ln["y"] - it.y_top) <= max(2.0, max(line_max_size, it.size) * 0.5):
                     ln["items"].append(it)
+                    if it.size > line_max_size:
+                        ln["max_size"] = it.size
                     placed = True
                     break
             if not placed:
-                lines.append({"y": it.y_top, "items": [it]})
+                lines.append({"y": it.y_top, "items": [it], "max_size": it.size})
+                line_keys.append(round(it.y_top, 0))
         return [self._line_record(ln["items"]) for ln in lines]
 
     def _line_record(self, its: list) -> dict:
