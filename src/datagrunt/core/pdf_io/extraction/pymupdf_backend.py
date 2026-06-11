@@ -45,6 +45,15 @@ class PyMuPDFBackend(ExtractionBackend):
         pymupdf = _import_pymupdf()
         return pymupdf.open(self.filepath), True
 
+    def page_count(self) -> int:
+        """Return the document's page count using pymupdf (no pdfium dependency)."""
+        doc, should_close = self._get_doc()
+        try:
+            return doc.page_count
+        finally:
+            if should_close:
+                doc.close()
+
     def analyze_page(self, page_number: int) -> PageAnalysis:
         """Return page metadata; raises ValueError on failure/out-of-range."""
         doc, should_close = self._get_doc()
