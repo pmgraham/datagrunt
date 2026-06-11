@@ -39,23 +39,23 @@ class PdfiumBackend(ExtractionBackend):
         """Return page metadata (raises if the page/file is invalid)."""
         doc, should_close = self._get_doc()
         try:
-            page = doc.page(page_number)
-            width, height = page.size()
-            text = page.full_text().strip()
-            text_objs, image_objs = page.count_objects()
-            has_text = len(text) > 0
-            return PageAnalysis(
-                width=float(width),
-                height=float(height),
-                rotation=page.rotation(),
-                has_text_layer=has_text,
-                is_scanned=(not has_text and image_objs > 0),
-                text_block_count=text_objs,
-                image_count=image_objs,
-                image_block_count=image_objs,
-                has_line_drawings=page.has_paths(),
-                text_length=len(text),
-            )
+            with doc.page(page_number) as page:
+                width, height = page.size()
+                text = page.full_text().strip()
+                text_objs, image_objs = page.count_objects()
+                has_text = len(text) > 0
+                return PageAnalysis(
+                    width=float(width),
+                    height=float(height),
+                    rotation=page.rotation(),
+                    has_text_layer=has_text,
+                    is_scanned=(not has_text and image_objs > 0),
+                    text_block_count=text_objs,
+                    image_count=image_objs,
+                    image_block_count=image_objs,
+                    has_line_drawings=page.has_paths(),
+                    text_length=len(text),
+                )
         finally:
             if should_close:
                 doc.close()
@@ -64,7 +64,8 @@ class PdfiumBackend(ExtractionBackend):
         """Return classified text blocks built from pdfium text objects."""
         doc, should_close = self._get_doc()
         try:
-            items = list(doc.page(page_number).text_items())
+            with doc.page(page_number) as page:
+                items = list(page.text_items())
         finally:
             if should_close:
                 doc.close()
@@ -74,11 +75,12 @@ class PdfiumBackend(ExtractionBackend):
         """Return embedded images (>= MIN_IMAGE_DIMENSION); write when output_dir set."""
         doc, should_close = self._get_doc()
         try:
-            res = list(
-                doc.page(page_number).image_items(
-                    output_dir=output_dir, name_prefix=name_prefix, page_number=page_number
+            with doc.page(page_number) as page:
+                res = list(
+                    page.image_items(
+                        output_dir=output_dir, name_prefix=name_prefix, page_number=page_number
+                    )
                 )
-            )
         finally:
             if should_close:
                 doc.close()
@@ -88,7 +90,8 @@ class PdfiumBackend(ExtractionBackend):
         """Render the page via pdfium and OCR it with Tesseract."""
         doc, should_close = self._get_doc()
         try:
-            img = doc.page(page_number).render_pil(dpi=dpi)
+            with doc.page(page_number) as page:
+                img = page.render_pil(dpi=dpi)
         finally:
             if should_close:
                 doc.close()
