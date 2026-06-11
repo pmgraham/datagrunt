@@ -15,7 +15,7 @@ Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow
 - **Path Object Support:** Full support for both string paths and `pathlib.Path` objects for modern, cross-platform file handling.
 - **Multiple Processing Engines:** Choose from three powerful engines - [DuckDB](https://duckdb.org), [Polars](https://pola.rs), and [PyArrow](https://arrow.apache.org/docs/python/) - to handle your data processing needs.
 - **Flexible Data Transformation:** Easily convert your processed CSV data into various formats including CSV, Excel, JSON, JSONL, and Parquet.
-- **Robust by Default:** Fail-fast validation with clear errors (invalid engine names, missing paths, directories, encrypted PDFs), graceful handling of empty and non-UTF-8 CSV files, and consistent behavior across all engines — only leading `#` lines are treated as comments, so `#`-prefixed data such as hex colors is preserved.
+- **Robust by Default:** Fail-fast validation with clear errors (invalid engine names, missing paths, directories, encrypted PDFs), graceful handling of empty files, no `UnicodeDecodeError` when constructing a reader over a non-UTF-8 file, and sane comment semantics — only leading `#` lines are treated as comments, so `#`-prefixed data rows such as hex colors are preserved on the Polars and PyArrow engines.
 - **PDF Parsing & OCR:** Extract text, tables, and images from PDF files as dicts, DataFrames, or JSON, with optional [Tesseract](https://github.com/tesseract-ocr/tesseract) OCR for scanned pages. Powered by the permissively-licensed **PDFium** engine by default, with **PyMuPDF** available as an alternative.
 - **AI-Powered Schema Analysis:** Use Google's Gemini models to automatically generate detailed schema reports for your CSV files, including data types, column classifications, and data quality checks.
 - **Pythonic API:** Enjoy a clean and intuitive API that integrates seamlessly into your existing Python workflows.
@@ -96,9 +96,9 @@ df = dg.query_data(query).pl()
 print(df)
 ```
 
-Repeated `query_data()` calls on the same reader reuse a single import: the CSV
-is loaded into DuckDB once per reader instance, so follow-up queries skip the
-file import entirely and run dramatically faster.
+With the DuckDB engine, repeated `query_data()` calls on the same reader reuse
+a single import: the CSV is loaded into DuckDB once per reader instance, so
+follow-up queries skip the file import entirely and run dramatically faster.
 
 ### Exporting Data to Multiple Formats
 
@@ -258,7 +258,7 @@ tables with at least two rows and two columns. It is off by default.
 | **Default for** | CSVReader | CSVWriter | - |
 | **Export Quality** | Good | Excellent (especially JSON) | Native Parquet support |
 
-_The engines above apply to CSV processing. Whichever you pick, results are consistent: comment handling (only leading `#` lines), leading blank lines, logical record counts (quoted embedded newlines count as one record), and column-name normalization — including collision handling like `Col A,col_a` → `col_a, col_a_1` — behave identically across all three. PDF parsing uses the **PDFium** engine by default (permissively licensed), with **PyMuPDF** available via `engine="pymupdf"` — see [PDF parsing](#pdf-parsing)._
+_The engines above apply to CSV processing. Whichever you pick, results are consistent: leading `#` comment lines, leading blank lines, logical record counts (quoted embedded newlines count as one record), and column-name normalization — including collision handling like `Col A,col_a` → `col_a, col_a_1` — behave identically across all three. One known divergence: mid-file lines starting with `#` are kept as data on Polars and PyArrow, but the DuckDB engine may still drop them. PDF parsing uses the **PDFium** engine by default (permissively licensed), with **PyMuPDF** available via `engine="pymupdf"` — see [PDF parsing](#pdf-parsing)._
 
 ## Primary Classes
 
