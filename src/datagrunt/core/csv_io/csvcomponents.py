@@ -15,13 +15,42 @@ from datagrunt.core.file_io import FileProperties
 
 
 def _count_leading_comments(filepath):
+    """Count leading ``#``-prefixed comment lines before the header.
+
+    Blank lines are intentionally excluded: Polars and PyArrow already ignore
+    leading blank lines natively, so counting them here would double-skip and
+    push the header onto a data row (see issue #85). Blank lines interleaved
+    with comments are tolerated and do not stop the count.
+    """
     count = 0
     with open(filepath, "r", encoding=FileProperties(filepath).DEFAULT_ENCODING) as f:
         for line in f:
             stripped = line.strip()
-            if stripped.startswith("#") or not stripped:
+            if stripped.startswith("#"):
                 count += 1
+            elif not stripped:
+                # Blank line: skip over it without counting it as a row to skip.
+                continue
             else:
+                break
+    return count
+
+
+def _count_leading_physical_lines_before_header(filepath):
+    """Count every leading physical line up to and including the header line.
+
+    Unlike :func:`_count_leading_comments`, this counts blank lines too. It is
+    used for engines (PyArrow) whose ``skip_rows`` operates on physical lines
+    and does not natively ignore leading blank lines once explicit column names
+    are supplied.
+    """
+    count = 0
+    with open(filepath, "r", encoding=FileProperties(filepath).DEFAULT_ENCODING) as f:
+        for line in f:
+            stripped = line.strip()
+            count += 1
+            if stripped and not stripped.startswith("#"):
+                # This is the header line; include it in the skip count.
                 break
     return count
 
@@ -332,18 +361,29 @@ class CSVRows:
 
     @cached_property
     def row_count_with_header(self):
-        """Return the number of lines in the CSV file including the header."""
+        """Return the number of CSV records in the file including the header.
+
+        Counts parsed CSV records rather than physical lines so that quoted
+        fields containing embedded newlines are counted as a single record,
+        matching what the parsing engines report. Comment and blank records
+        are still excluded, mirroring ``_check_csv_ragged_and_warn``.
+        """
+        is_legacy_mac = _is_legacy_mac_newlines(self.filepath)
+        newline_param = None if is_legacy_mac else ""
+        encoding = FileProperties(self.filepath).DEFAULT_ENCODING
+        delimiter = CSVDelimiter(self.filepath).delimiter
         count = 0
-        with open(self.filepath, "r", encoding=FileProperties(self.filepath).DEFAULT_ENCODING) as csv_file:
-            for line in csv_file:
-                stripped = line.strip()
-                if stripped and not stripped.startswith("#"):
-                    count += 1
+        with open(self.filepath, "r", encoding=encoding, newline=newline_param) as csv_file:
+            reader = csv.reader(csv_file, delimiter=delimiter)
+            for row in reader:
+                if not row or row[0].startswith("#"):
+                    continue
+                count += 1
         return count
 
     @property
     def row_count_without_header(self):
-        """Return the number of lines in the CSV file excluding the header."""
+        """Return the number of CSV records in the file excluding the header."""
         return self.row_count_with_header - 1
 
 
@@ -420,6 +460,9 @@ class CSVColumnNameNormalizer:
 
     SPECIAL_CHARS_PATTERN = re.compile(r"[^a-z0-9]+")
     MULTI_UNDERSCORE_PATTERN = re.compile(r"_+")
+    # Used when a header normalizes to the empty string so it can still be
+    # uniquified into a valid, non-empty identifier.
+    EMPTY_NAME_PLACEHOLDER = "column"
 
     def __init__(self, filepath, columns=None):
         """Initialize the CSVColumnNameNormalizer with a filepath.
@@ -464,11 +507,25 @@ class CSVColumnNameNormalizer:
         name = self.SPECIAL_CHARS_PATTERN.sub("_", name)
         name = name.strip("_")
         name = self.MULTI_UNDERSCORE_PATTERN.sub("_", name)
-        return f"_{name}" if name and name[0].isdigit() else name
+        # A header of only special characters (e.g. "%" or "()") normalizes to
+        # the empty string, which is an invalid zero-length SQL identifier and
+        # is silently dropped by some engines. Fall back to a placeholder so it
+        # can be uniquified into a valid column name.
+        if not name:
+            return self.EMPTY_NAME_PLACEHOLDER
+        return f"_{name}" if name[0].isdigit() else name
 
     def _make_unique_column_names(self, columns_list):
         """
         Make unique column names by appending a number to duplicate names.
+
+        A naive ``name_N`` suffix can itself collide with a real column (e.g.
+        ``col_a, col_a, col_a_1`` would emit two ``col_a_1``). To guarantee a
+        unique result, this tracks every name already emitted and keeps
+        incrementing the suffix until the candidate is unused across the whole
+        list. Downstream SQL projections and Arrow renames rely on this: a
+        duplicate name breaks DuckDB's ``AS`` projection and silently drops a
+        column in PyArrow.
 
         Args:
             columns_list (list): List of column names to make unique
@@ -476,16 +533,17 @@ class CSVColumnNameNormalizer:
         Returns:
             list: List of unique column names
         """
-        name_count = {}
+        emitted = set()
         unique_names = []
 
         for name in columns_list:
-            if name in name_count:
-                name_count[name] += 1
-                unique_names.append(f"{name}_{name_count[name]}")
-            else:
-                name_count[name] = 0
-                unique_names.append(name)
+            candidate = name
+            suffix = 0
+            while candidate in emitted:
+                suffix += 1
+                candidate = f"{name}_{suffix}"
+            emitted.add(candidate)
+            unique_names.append(candidate)
 
         return unique_names
 
