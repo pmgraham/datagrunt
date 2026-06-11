@@ -440,12 +440,29 @@ class TestDuckDBSqlEscaping:
         """A ``'`` in a header cell must not break the lenient columns dict."""
         csv_file = tmp_path / "quoted_header.csv"
         # Header cell contains a single quote; lenient mode builds an explicit
-        # column dict ({'col': 'VARCHAR'}) that must escape the quote.
-        csv_file.write_text("o'clock,value\n1,2\n3,4\n")
+        # column dict ({'col': 'VARCHAR'}) that must escape the quote. The
+        # header has more commas than quotes so delimiter inference picks ','.
+        csv_file.write_text("o'clock,value,extra\n1,2,3\n4,5,6\n")
 
         reader = CSVEngineFactory(str(csv_file), "duckdb", lenient=True).create_reader()
         df = reader.to_dataframe()
-        assert df.columns == ["o'clock", "value"]
+        assert df.columns == ["o'clock", "value", "extra"]
+        assert len(df) == 2
+
+    def test_single_quote_inferred_delimiter_duckdb(self, tmp_path):
+        """An inferred ``'`` delimiter must not break the delim SQL literal.
+
+        Delimiter inference counts non-alphanumeric characters in the first
+        row, so a header like ``a'b'c`` infers ``'`` as the delimiter. The
+        ``delim='...'`` literal must escape it (``delim=''''``) or every
+        DuckDB read of the file raises a ParserException.
+        """
+        csv_file = tmp_path / "quote_delimited.csv"
+        csv_file.write_text("a'b'c\n1'2'3\n4'5'6\n")
+
+        reader = CSVEngineFactory(str(csv_file), "duckdb").create_reader()
+        df = reader.to_dataframe()
+        assert df.columns == ["a", "b", "c"]
         assert len(df) == 2
 
     def test_apostrophe_in_filename_writes_correctly_duckdb(self, tmp_path):

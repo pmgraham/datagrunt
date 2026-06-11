@@ -179,7 +179,7 @@ class DuckDBQueries:
                 CREATE OR REPLACE TABLE {self.database_table_name} AS
                 SELECT *
                 FROM read_csv('{self._escaped_filepath_literal}',
-                                delim='{self.delimiter}',
+                                delim='{self._escape_sql_literal(self.delimiter)}',
                                 header=true,
                                 columns={cols_param},
                                 quote='{self.quotechar.replace("'", "''")}',
@@ -195,7 +195,7 @@ class DuckDBQueries:
                 SELECT *
                 FROM read_csv('{self._escaped_filepath_literal}',
                                 auto_detect=true,
-                                delim='{self.delimiter}',
+                                delim='{self._escape_sql_literal(self.delimiter)}',
                                 header=true,
                                 quote='{self.quotechar.replace("'", "''")}',
                                 null_padding=true,
@@ -221,7 +221,7 @@ class DuckDBQueries:
                 CREATE OR REPLACE TABLE {self.database_table_name} AS
                 SELECT *
                 FROM read_csv('{self._escaped_filepath_literal}',
-                                delim='{self.delimiter}',
+                                delim='{self._escape_sql_literal(self.delimiter)}',
                                 header=true,
                                 columns={cols_param},
                                 quote='{self.quotechar.replace("'", "''")}',
@@ -238,7 +238,7 @@ class DuckDBQueries:
                 SELECT *
                 FROM read_csv('{self._escaped_filepath_literal}',
                                 auto_detect=true,
-                                delim='{self.delimiter}',
+                                delim='{self._escape_sql_literal(self.delimiter)}',
                                 header=true,
                                 quote='{self.quotechar.replace("'", "''")}',
                                 null_padding=true,
