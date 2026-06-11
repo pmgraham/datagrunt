@@ -226,6 +226,82 @@ class TestDropLayoutTablesThreading:
         assert calls == [True]
 
 
+class TestPDFReaderPyMuPDFSequential:
+    """PyMuPDF engine must parse pages sequentially (MuPDF is not thread-safe).
+
+    These are correctness/regression guards rather than red-green tests: a
+    thread-safety race is non-deterministic, so we cannot reliably reproduce a
+    crash. Instead we pin the contract -- no ThreadPoolExecutor is used, multi
+    page output is complete and correctly ordered, and a warning fires when a
+    caller requests workers > 1 (which is now ignored).
+    """
+
+    @staticmethod
+    def _four_page_pdf(tmp_path):
+        """Build a 4-page PDF with a distinct marker on each page."""
+        import pymupdf
+
+        doc = pymupdf.open()
+        for n in range(1, 5):
+            page = doc.new_page(width=612, height=792)
+            page.insert_text((72, 72), f"Sequential Marker {n}", fontsize=18)
+            page.insert_text((72, 110), f"Body content for page {n}.", fontsize=11)
+        path = tmp_path / "seq.pdf"
+        doc.save(str(path))
+        doc.close()
+        return str(path)
+
+    def test_multipage_parses_all_pages_in_order(self, tmp_path):
+        pdf = self._four_page_pdf(tmp_path)
+        doc = PDFReaderPyMuPDFEngine(pdf, workers=4).to_dicts()
+
+        pages = doc["document"]["pages"]
+        assert doc["document"]["total_pages"] == 4
+        assert [p["page_number"] for p in pages] == [1, 2, 3, 4]
+        for n, page in enumerate(pages, start=1):
+            text = " ".join(
+                e.get("content", "") for e in page["elements"] if e.get("type") in ("header", "body_text")
+            )
+            assert f"Sequential Marker {n}" in text
+
+    def test_does_not_use_thread_pool_executor(self, tmp_path, monkeypatch):
+        """The engine must never dispatch pages onto a ThreadPoolExecutor."""
+        import concurrent.futures
+
+        calls = []
+        original_init = concurrent.futures.ThreadPoolExecutor.__init__
+
+        def spy_init(self, *args, **kwargs):
+            calls.append(True)
+            original_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(concurrent.futures.ThreadPoolExecutor, "__init__", spy_init)
+
+        pdf = self._four_page_pdf(tmp_path)
+        PDFReaderPyMuPDFEngine(pdf, workers=4).to_dicts()
+        assert calls == []
+
+    def test_warns_once_when_workers_gt_one(self, tmp_path, caplog):
+        import logging
+
+        pdf = self._four_page_pdf(tmp_path)
+        with caplog.at_level(logging.WARNING, logger="datagrunt.core.pdf_io.engines"):
+            PDFReaderPyMuPDFEngine(pdf, workers=4).to_dicts()
+
+        warnings = [r for r in caplog.records if "not thread-safe" in r.getMessage()]
+        assert len(warnings) == 1
+
+    def test_no_warning_when_workers_is_one(self, tmp_path, caplog):
+        import logging
+
+        pdf = self._four_page_pdf(tmp_path)
+        with caplog.at_level(logging.WARNING, logger="datagrunt.core.pdf_io.engines"):
+            PDFReaderPyMuPDFEngine(pdf, workers=1).to_dicts()
+
+        warnings = [r for r in caplog.records if "not thread-safe" in r.getMessage()]
+        assert warnings == []
+
+
 class TestPDFReaderPdfiumEngine:
     """Test suite for the PDFium reader engine."""
 
