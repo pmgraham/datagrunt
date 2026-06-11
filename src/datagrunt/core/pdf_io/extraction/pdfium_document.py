@@ -40,6 +40,22 @@ class PdfiumPage:
         self._raw = raw_module
         self._textpage = page.get_textpage()
 
+    def __enter__(self) -> "PdfiumPage":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Release the page and textpage handles (textpage first, then page).
+
+        pypdfium2 leaves these handles open until the cyclic GC runs; closing
+        them explicitly reclaims them deterministically. Safe to call more than
+        once: ``close()`` on an already-closed handle is a no-op in pypdfium2.
+        """
+        self._textpage.close()
+        self._page.close()
+
     def size(self) -> tuple:
         """Return ``(width, height)`` in points."""
         return self._page.get_size()
