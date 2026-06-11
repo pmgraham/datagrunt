@@ -10,6 +10,7 @@ from pathlib import Path
 from datagrunt.core.file_io import FileProperties
 from datagrunt.core.pdf_io.extraction import PdfPlumberTableExtractor
 from datagrunt.core.pdf_io.extraction.image_dedupe import dedupe_image_files
+from datagrunt.core.pdf_io.extraction.markdown_escape import escape_leading_markdown
 from datagrunt.core.pdf_io.extraction.ocr import dpi_for_page
 from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
 from datagrunt.core.pdf_io.extraction.pymupdf_backend import PyMuPDFBackend
@@ -240,9 +241,11 @@ class ParsedDocument:
                 content = el.get("content")
                 meta = el.get("metadata") or {}
                 if etype in heading_map:
-                    blocks.append(f"{heading_map[etype]}{content}")
+                    # Keep the intentional heading marker, but escape the
+                    # element's own content so it cannot inject a second one.
+                    blocks.append(f"{heading_map[etype]}{escape_leading_markdown(content)}")
                 elif etype == "caption":
-                    blocks.append(f"*{content}*")
+                    blocks.append(f"*{escape_leading_markdown(content)}*")
                 elif etype == "table":
                     blocks.append(self._render_table(content, meta.get("has_header_row", False)))
                 elif etype == "image":
@@ -256,7 +259,7 @@ class ParsedDocument:
                             pass
                     blocks.append(f"![{Path(path).name or 'image'}]({path})")
                 elif isinstance(content, str) and content.strip():
-                    blocks.append(content)
+                    blocks.append(escape_leading_markdown(content))
         return "\n\n".join(blocks) + "\n"
 
     @staticmethod
