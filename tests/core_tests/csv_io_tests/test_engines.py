@@ -416,3 +416,34 @@ class TestEngines:
         assert "last_name" in df.columns
         assert "e_mail" in df.columns
         assert "phone" in df.columns
+
+
+class TestLeadingCommentHandling:
+    """Tests that engines treat only LEADING ``#`` lines as comments.
+
+    A ``#`` at the start of a DATA field (e.g. a hex color) must not cause the
+    row to be dropped, and all engines must agree on the resulting row count.
+    """
+
+    def test_hash_prefixed_data_rows_preserved_all_engines(self, tmp_path):
+        """A data field starting with ``#`` must not be treated as a comment."""
+        hex_csv = tmp_path / "hex.csv"
+        hex_csv.write_text("color,name\n#FF0000,red\n#00FF00,green\n00ABCD,teal\n")
+
+        row_counts = {}
+        for engine in ALL_ENGINES:
+            reader = CSVEngineFactory(str(hex_csv), engine).create_reader()
+            row_counts[engine] = len(reader.to_dataframe())
+
+        assert row_counts == {"duckdb": 3, "polars": 3, "pyarrow": 3}
+
+    def test_leading_comment_block_skipped_all_engines(self, tmp_path):
+        """A genuine leading comment block must still be skipped on all engines."""
+        commented_csv = tmp_path / "commented.csv"
+        commented_csv.write_text("# generated\n# v2\na,b\n1,2\n")
+
+        for engine in ALL_ENGINES:
+            reader = CSVEngineFactory(str(commented_csv), engine).create_reader()
+            df = reader.to_dataframe()
+            assert df.columns == ["a", "b"]
+            assert len(df) == 1
