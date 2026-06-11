@@ -35,5 +35,5 @@ class TestPdfiumNativeReader:
         a.write_bytes(b"X")
         b.write_bytes(b"X")
         doc = {"document": {"pages": [{"images": [{"file": str(a)}, {"file": str(b)}]}]}}
-        removed = PdfiumNativeReader.dedupe_images(doc)
+        removed = PdfiumNativeReader.dedupe_images(doc, image_output_dir=str(tmp_path))
         assert removed == 1 and not b.exists()
