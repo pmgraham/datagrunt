@@ -277,13 +277,29 @@ class DuckDBQueries:
         of engines throughout the ecosystem may have different conventions,
         this method uses the CSVColumnNameNormalizer class to ensure
         consistent naming conventions across different processing engines.
+
+        The rename is done as a single atomic rebuild rather than a sequence of
+        ``ALTER TABLE ... RENAME COLUMN`` statements. Sequential renames can
+        collide mid-flight: if two distinct headers normalize to the same name
+        (e.g. ``Col A`` and ``col_a`` both -> ``col_a``), an intermediate rename
+        would target a name a not-yet-renamed column still holds, raising a
+        CatalogException. Projecting every column to its new name in one
+        ``CREATE OR REPLACE TABLE ... AS SELECT`` avoids any intermediate state.
         """
         self.connection.sql(self.import_csv_query())
         table_columns = self.connection.sql(f"SELECT * FROM {self.database_table_name} LIMIT 0").columns
         normalizer = CSVColumnNameNormalizer(self.filepath, columns=table_columns)
-        for old_name, new_name in zip(table_columns, normalizer.columns_normalized):
-            sql_string = f'ALTER TABLE {self.database_table_name} RENAME COLUMN "{old_name}" TO "{new_name}"'
-            self.connection.sql(sql_string)
+        # The normalizer guarantees the new names are unique among themselves,
+        # so the projection below cannot produce a duplicate output column.
+        projections = ", ".join(
+            f'"{old_name}" AS "{new_name}"'
+            for old_name, new_name in zip(table_columns, normalizer.columns_normalized)
+        )
+        rebuild_sql = (
+            f"CREATE OR REPLACE TABLE {self.database_table_name} AS "
+            f"SELECT {projections} FROM {self.database_table_name}"
+        )
+        self.connection.sql(rebuild_sql)
 
     def create_table(self, normalize_columns=False):
         """Create a DuckDB table from the CSV file.
