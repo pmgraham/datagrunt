@@ -230,7 +230,11 @@ class PageLayoutSorter:
     def _slice_y_bands(self, columns: list, intervals: list[dict]) -> list[list]:
         """Slice Y bands based on spanning intervals."""
         segments = []
-        last_y = 0.0
+        # Start below every finite coordinate so the first "above" band captures
+        # elements with a negative y_top (off-page/cropped/rotated content);
+        # 0.0 would drop them to the leftover fallback and corrupt reading order
+        # (issue #145). With no intervals, the "below" pass then captures all.
+        last_y = -math.inf
         placed = set()
 
         for interval in intervals:
