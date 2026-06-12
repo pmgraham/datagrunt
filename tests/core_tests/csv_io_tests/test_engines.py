@@ -601,6 +601,55 @@ class TestDuckDBSqlEscaping:
         assert "John" in out.read_text()
 
 
+class TestDuckDBSampleSqlEscaping:
+    """``get_sample`` must escape interpolated literals like the import path.
+
+    ``sample_csv_query`` builds its own ``read_csv`` call separately from
+    ``import_csv_query``; an unescaped ``'`` in the file path, an inferred
+    ``'`` delimiter, or a lenient header cell previously produced broken SQL
+    (a ParserException). These mirror :class:`TestDuckDBSqlEscaping` but drive
+    the streaming-sample path via ``get_sample`` (issue #152).
+    """
+
+    def test_apostrophe_in_filename_samples_correctly_duckdb(self, tmp_path):
+        """A ``'`` in the file path must not break the sample read_csv literal."""
+        csv_file = tmp_path / "o'hara.csv"
+        csv_file.write_text("name,age\nJohn,30\nJane,25\n")
+
+        reader = CSVEngineFactory(str(csv_file), "duckdb").create_reader()
+        sample = reader.get_sample()
+        assert sample.columns == ["name", "age"]
+        assert len(sample) == 2
+
+    def test_single_quote_in_header_lenient_samples_duckdb(self, tmp_path):
+        """A ``'`` in a header cell must not break the lenient sample columns dict."""
+        csv_file = tmp_path / "quoted_header.csv"
+        # Header cell contains a single quote; lenient mode builds an explicit
+        # column dict ({'col': 'VARCHAR'}) that must escape the quote. The
+        # header has more commas than quotes so delimiter inference picks ','.
+        csv_file.write_text("o'clock,value,extra\n1,2,3\n4,5,6\n")
+
+        reader = CSVEngineFactory(str(csv_file), "duckdb", lenient=True).create_reader()
+        sample = reader.get_sample()
+        assert sample.columns == ["o'clock", "value", "extra"]
+        assert len(sample) == 2
+
+    def test_single_quote_inferred_delimiter_samples_duckdb(self, tmp_path):
+        """An inferred ``'`` delimiter must not break the sample delim literal.
+
+        A header like ``a'b'c`` infers ``'`` as the delimiter, so the
+        ``delim='...'`` literal must escape it (``delim=''''``) or every
+        DuckDB sample of the file raises a ParserException.
+        """
+        csv_file = tmp_path / "quote_delimited.csv"
+        csv_file.write_text("a'b'c\n1'2'3\n4'5'6\n")
+
+        reader = CSVEngineFactory(str(csv_file), "duckdb").create_reader()
+        sample = reader.get_sample()
+        assert sample.columns == ["a", "b", "c"]
+        assert len(sample) == 2
+
+
 class TestNonUtf8FileConstruction:
     """Constructing readers/writers on non-UTF-8 files must not raise."""
 
