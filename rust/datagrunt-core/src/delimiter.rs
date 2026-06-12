@@ -55,6 +55,12 @@ fn splits_rows_consistently(sample: &[String], c: char) -> bool {
     first >= MIN_CONSISTENT_FIELDS && sample.iter().all(|r| field_count(r, c) == first)
 }
 
+/// CSVDelimiter.infer_csv_file_delimiter parity. Precedence: `.tsv`
+/// extension wins tab; empty/blank files default to comma; an unambiguous
+/// safe delimiter (`, ; | \t`) in the header wins most-frequent-first; then a
+/// punctuation candidate that splits the sampled rows consistently; then
+/// space if consistent; else comma. Returns a 1-char String (str in Python).
+/// Errs only on file IO (e.g. missing file), like the Python original.
 pub fn infer_delimiter(path: &Path) -> std::io::Result<String> {
     if io::is_tsv(path) {
         return Ok(DEFAULT_TAB_DELIMITER.to_string());
