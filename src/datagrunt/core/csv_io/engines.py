@@ -158,14 +158,16 @@ class CSVBaseReaderEngine(ABC):
         pass
 
     @abstractmethod
-    def query_data(self, sql_query: str, normalize_columns: Optional[bool] = None) -> Union[DuckDBPyRelation, pl.DataFrame]:
+    def query_data(
+        self, sql_query: str, normalize_columns: Optional[bool] = None
+    ) -> Union[DuckDBPyRelation, pl.DataFrame]:
         """
         Query the data using SQL.
 
         Args:
             sql_query (str): SQL query to execute.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
         pass
 
