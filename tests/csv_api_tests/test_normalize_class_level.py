@@ -196,3 +196,27 @@ class TestCSVReaderClassLevelAPI:
         for engine in ALL_ENGINES:
             reader = CSVReader(mixed_headers_csv, engine=engine)
             assert list(reader.to_dataframe().columns) == ORIGINAL_HEADERS
+
+
+class TestCSVWriterClassLevelAPI:
+    """The public CSVWriter carries normalize_columns on the constructor."""
+
+    def test_constructor_flag_normalizes_written_headers(self, mixed_headers_csv, tmp_path):
+        for engine in ALL_ENGINES:
+            writer = CSVWriter(mixed_headers_csv, engine=engine, normalize_columns=True)
+            out_file = tmp_path / f"api_out_{engine}.csv"
+            writer.write_csv(str(out_file))
+            assert pl.read_csv(out_file).columns == NORMALIZED_HEADERS
+
+    def test_per_call_argument_emits_deprecation_warning(self, mixed_headers_csv, tmp_path):
+        writer = CSVWriter(mixed_headers_csv, engine="duckdb")
+        out_file = tmp_path / "api_out_warn.csv"
+        with pytest.warns(DeprecationWarning, match="normalize_columns"):
+            writer.write_csv(str(out_file), normalize_columns=True)
+        assert pl.read_csv(out_file).columns == NORMALIZED_HEADERS
+
+    def test_default_writer_behavior_unchanged(self, mixed_headers_csv, tmp_path):
+        writer = CSVWriter(mixed_headers_csv, engine="duckdb")
+        out_file = tmp_path / "api_out_raw.csv"
+        writer.write_csv(str(out_file))
+        assert pl.read_csv(out_file).columns == ORIGINAL_HEADERS
