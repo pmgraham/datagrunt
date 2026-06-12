@@ -342,34 +342,40 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
             projections.append(f'"{safe_col}" AS "{safe_normalized}"')
         return relation.project(", ".join(projections))
 
-    def query_data(self, sql_query, normalize_columns=False):
-        """Queries as CSV file after importing into DuckDB.
+    def query_data(self, sql_query, normalize_columns=None):
+        """Queries a CSV file after importing into DuckDB.
 
         Args:
             sql_query (str): Query to run against DuckDB.
-            normalize_columns (optional, bool): Whether to normalize
-                column names.
+            normalize_columns (bool or None): ``None`` (default) inherits the
+                instance-level setting: the table is created in the configured
+                vocabulary, so the query is written and returned with the same
+                column names. An explicit bool keeps the legacy behavior: the
+                query runs against the original names and only the result
+                columns are renamed.
 
         Returns:
             A DuckDB DuckDBPyRelation with the query results.
 
         Example if DuckDB Engine:
-            dg = CSVReader('myfile.csv')
-            query = f"SELECT col1, col2 FROM {dg.db_table}"
-            dg.query_csv_data(query)
+            dg = CSVReader('myfile.csv', normalize_columns=True)
+            query = f"SELECT col_one, col_two FROM {dg.db_table}"
+            dg.query_data(query)
         """  # noqa: E501
-        # Ensure the base table is created with original column names
-        # so the user's query can reference them.
+        if normalize_columns is None:
+            # Instance-level mode: the table itself carries the configured
+            # column names, so query vocabulary and result vocabulary match.
+            self.queries.create_table(normalize_columns=self.normalize_columns)
+            # The returned relation keeps this per-instance connection alive,
+            # so it remains valid after this engine instance is GC'd.
+            return self.queries.connection.sql(sql_query)
+
+        # Legacy per-call mode: the table keeps original column names so the
+        # user's query can reference them; only the result is renamed.
         self.queries.create_table(normalize_columns=False)
-
-        # Execute the user's query on the same per-instance connection that
-        # holds the table. The returned relation keeps this connection alive,
-        # so it remains valid after this engine instance is garbage collected.
         result_relation = self.queries.connection.sql(sql_query)
-
         if normalize_columns:
             result_relation = self._normalize_relation_columns(result_relation)
-
         return result_relation
 
 
@@ -500,27 +506,29 @@ class CSVReaderPolarsEngine(CSVBaseReaderEngine):
         """
         return self._create_dataframe(_resolve_normalize_columns(self.normalize_columns, normalize_columns)).to_dicts()
 
-    def query_data(self, sql_query, normalize_columns=False):
+    def query_data(self, sql_query, normalize_columns=None):
         """
-        Queries as CSV file after importing into DuckDB.
+        Queries a CSV file after importing into DuckDB.
 
         Args:
             sql_query (str): Query to run against DuckDB.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): ``None`` (default) inherits the
+                instance-level setting: the table is created in the configured
+                vocabulary, so the query is written and returned with the same
+                column names. An explicit bool keeps the legacy behavior: the
+                query runs against the original names and only the result
+                columns are renamed.
 
         Returns:
-            A DuckDB DuckDBPyRelation with the query results.
-
-        Example if DuckDB Engine:
-            dg = CSVReader('myfile.csv')
-            query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
-            dg.query_csv_data(query)
+            A Polars DataFrame with the query results.
         """
         # The result is a fully-materialized polars DataFrame, so the
         # connection can be disposed deterministically (unlike the duckdb
         # engine, whose query_data returns a live relation).
         try:
+            if normalize_columns is None:
+                self.queries.create_table(normalize_columns=self.normalize_columns)
+                return self.queries.connection.sql(sql_query).pl()
             return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
         finally:
             self.queries.close()
@@ -928,27 +936,29 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
             df = df.to_frame()
         return df.to_dicts()
 
-    def query_data(self, sql_query, normalize_columns=False):
+    def query_data(self, sql_query, normalize_columns=None):
         """
-        Queries as CSV file after importing into DuckDB.
+        Queries a CSV file after importing into DuckDB.
 
         Args:
             sql_query (str): Query to run against DuckDB.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): ``None`` (default) inherits the
+                instance-level setting: the table is created in the configured
+                vocabulary, so the query is written and returned with the same
+                column names. An explicit bool keeps the legacy behavior: the
+                query runs against the original names and only the result
+                columns are renamed.
 
         Returns:
-            A DuckDB DuckDBPyRelation with the query results.
-
-        Example if DuckDB Engine:
-            dg = CSVReader('myfile.csv')
-            query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
-            dg.query_csv_data(query)
+            A Polars DataFrame with the query results.
         """
         # The result is a fully-materialized polars DataFrame, so the
         # connection can be disposed deterministically (unlike the duckdb
         # engine, whose query_data returns a live relation).
         try:
+            if normalize_columns is None:
+                self.queries.create_table(normalize_columns=self.normalize_columns)
+                return self.queries.connection.sql(sql_query).pl()
             return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
         finally:
             self.queries.close()
