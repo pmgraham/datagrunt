@@ -167,6 +167,20 @@ class DuckDBQueries:
             # re-imports instead of reusing a table that no longer exists.
             self._imported_normalize_columns = None
 
+    def __enter__(self):
+        """Enter a ``with`` block, returning this instance."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Close the connection on leaving the ``with`` block (normal or error).
+
+        ``close()`` is idempotent and resets the lazy-connection/import-cache
+        state, so the instance stays usable after the block - a later access
+        transparently reopens. Returns ``None`` so any in-flight exception
+        propagates.
+        """
+        self.close()
+
     def _format_filename_string(self):
         """Remove all non alphanumeric characters from the file stem."""
         return re.sub(r"[^a-zA-Z0-9]", "", self.filepath.stem)

@@ -112,6 +112,15 @@ class CSVBaseReaderEngine(ABC):
         if not self.filepath.exists():
             raise FileNotFoundError
 
+    def close(self):
+        """Close the underlying DuckDB connection.
+
+        Idempotent. Only the DuckDB engine ever opens a connection (the
+        polars/pyarrow engines leave it lazily unopened), so for those engines
+        this resets already-clean state. The engine stays usable afterward.
+        """
+        self.queries.close()
+
     @abstractmethod
     def get_sample(self, normalize_columns: Optional[bool] = None) -> pl.DataFrame:
         """Return a sample of the data as a Polars DataFrame.
