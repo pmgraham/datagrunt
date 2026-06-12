@@ -1,6 +1,6 @@
 //! Port of _check_csv_ragged_and_warn (bool only; warning stays in Python).
 
-use crate::rows::{csv_reader, csv_text, skip_record};
+use crate::rows::{csv_reader_streaming, skip_record};
 use std::path::Path;
 
 const MAX_DATA_ROWS_CHECKED: usize = 10_000;
@@ -17,8 +17,7 @@ pub fn check_ragged(path: &Path, delimiter: u8) -> bool {
 
 // Inner: Err only on IO failure; the wrapper maps it to false.
 fn check_ragged_inner(path: &Path, delimiter: u8) -> std::io::Result<bool> {
-    let text = csv_text(path)?;
-    let mut reader = csv_reader(&text, delimiter);
+    let mut reader = csv_reader_streaming(path, delimiter)?;
     let mut records = reader.records();
 
     let mut expected_cols = None;
@@ -26,7 +25,8 @@ fn check_ragged_inner(path: &Path, delimiter: u8) -> std::io::Result<bool> {
         // Unlike row counting (which skips, since Python's CSVRows has no
         // try/except), a parse error here aborts to "not ragged" because the
         // Python original wraps the whole scan in `except Exception: False`.
-        // Unreachable in practice: in-memory UTF-8 source + flexible=true.
+        // With a streaming File source an `Err` could be a genuine IO error;
+        // returning false matches Python's `except Exception: return False`.
         let Ok(record) = record else { return Ok(false) };
         if !skip_record(&record) {
             expected_cols = Some(record.len());
