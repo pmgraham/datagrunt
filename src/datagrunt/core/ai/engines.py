@@ -11,6 +11,9 @@ from dataclasses import dataclass
 from google import genai
 from google.genai import types
 
+# local imports
+from datagrunt.core.ai._deprecation import warn_ai_deprecated
+
 
 @dataclass
 class AIEngineProperties:
@@ -85,6 +88,7 @@ class GoogleAIEngine(BaseAIEngine):
         ground_google_search=False,
     ):
         """Initialize the Google AI provider."""
+        warn_ai_deprecated("GoogleAIEngine")
         super().__init__(api_key)
         self.vertexai = vertexai
         if not self.api_key and not self.vertexai:

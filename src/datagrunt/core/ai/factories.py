@@ -1,6 +1,7 @@
 """Factory module for creating AI factory instances."""
 
 # local libraries
+from datagrunt.core.ai._deprecation import warn_ai_deprecated
 from datagrunt.core.ai.engines import AIEngineProperties, GoogleAIEngine
 
 
@@ -20,6 +21,7 @@ class AIEngineFactory:
             engine (str): type of engine to create by the factory.
             **kwargs: Additional parameters for the AI provider.
         """
+        warn_ai_deprecated("AIEngineFactory")
         self.api_key = api_key
         self.engine = engine.lower().replace(" ", "")
         self.kwargs = kwargs
