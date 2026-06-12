@@ -2,9 +2,10 @@
 
 # standard library
 import warnings
+from typing import Optional
 
 
-def warn_per_call_normalize(normalize_columns):
+def warn_per_call_normalize(normalize_columns: Optional[bool]) -> Optional[bool]:
     """Warn when the deprecated per-call ``normalize_columns`` argument is used.
 
     Args:
