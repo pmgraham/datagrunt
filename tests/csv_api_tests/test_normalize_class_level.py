@@ -76,3 +76,41 @@ class TestReaderEngineInstanceNormalization:
             reader_engine = CSVEngineFactory(mixed_headers_csv, engine).create_reader()
             df = reader_engine.to_dataframe(normalize_columns=True)
             assert list(df.columns) == NORMALIZED_HEADERS
+
+
+def _query_result_to_dataframe(result, engine):
+    """DuckDB's query_data returns a relation; polars/pyarrow return a DataFrame."""
+    return result.pl() if engine == "duckdb" else result
+
+
+class TestQueryDataInstanceNormalization:
+    """With the instance flag set, SQL is written AND returned in normalized names."""
+
+    def test_query_written_against_normalized_names(self, mixed_headers_csv):
+        for engine in ALL_ENGINES:
+            reader_engine = CSVEngineFactory(mixed_headers_csv, engine, normalize_columns=True).create_reader()
+            sql = f"SELECT first_name FROM {reader_engine.db_table} WHERE last_name = 'Doe'"
+            df = _query_result_to_dataframe(reader_engine.query_data(sql), engine)
+            assert df.columns == ["first_name"]
+            assert df["first_name"].to_list() == ["John"]
+
+    def test_select_star_returns_normalized_names(self, mixed_headers_csv):
+        for engine in ALL_ENGINES:
+            reader_engine = CSVEngineFactory(mixed_headers_csv, engine, normalize_columns=True).create_reader()
+            sql = f"SELECT * FROM {reader_engine.db_table}"
+            df = _query_result_to_dataframe(reader_engine.query_data(sql), engine)
+            assert df.columns == NORMALIZED_HEADERS
+
+    def test_default_instance_still_queries_original_names(self, mixed_headers_csv):
+        for engine in ALL_ENGINES:
+            reader_engine = CSVEngineFactory(mixed_headers_csv, engine).create_reader()
+            sql = f'SELECT "First Name" FROM {reader_engine.db_table}'
+            df = _query_result_to_dataframe(reader_engine.query_data(sql), engine)
+            assert df.columns == ["First Name"]
+
+    def test_legacy_per_call_true_queries_original_and_renames_result(self, mixed_headers_csv):
+        for engine in ALL_ENGINES:
+            reader_engine = CSVEngineFactory(mixed_headers_csv, engine).create_reader()
+            sql = f'SELECT "First Name" FROM {reader_engine.db_table}'
+            df = _query_result_to_dataframe(reader_engine.query_data(sql, normalize_columns=True), engine)
+            assert df.columns == ["first_name"]
