@@ -100,6 +100,27 @@ With the DuckDB engine, repeated `query_data()` calls on the same reader reuse
 a single import: the CSV is loaded into DuckDB once per reader instance, so
 follow-up queries skip the file import entirely and run dramatically faster.
 
+### Consistent Column Names with `normalize_columns`
+
+Pass `normalize_columns=True` at construction to work in normalized column names (lowercase, underscores, collision-safe) everywhere — including SQL:
+
+```python
+from datagrunt import CSVReader
+
+dg = CSVReader('electric_vehicle_population_data.csv', engine='duckdb', normalize_columns=True)
+
+# The DuckDB table is imported with normalized names, so you write your
+# query and read your results in the same vocabulary — no aliases needed.
+query = f"SELECT city, vin_1_10 FROM {dg.db_table} LIMIT 5"
+df = dg.query_data(query).pl()
+
+# Every other output honors the same setting
+dg.to_dataframe()   # columns: city, vin_1_10, ...
+dg.get_sample()     # same normalized names
+```
+
+`CSVWriter(..., normalize_columns=True)` does the same for every exported file. The older per-call form (`to_dataframe(normalize_columns=True)`) still works but is deprecated and emits a `DeprecationWarning`.
+
 ### Exporting Data to Multiple Formats
 
 ```python
