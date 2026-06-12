@@ -3,4 +3,5 @@
 pub mod delimiter;
 pub mod io;
 pub mod normalize;
+pub mod ragged;
 pub mod rows;
