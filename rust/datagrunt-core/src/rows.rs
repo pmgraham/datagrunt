@@ -1,13 +1,14 @@
 //! Ports of CSVRows probes and the leading-line counters.
 
-use crate::io::read_universal_lines;
+use crate::io::universal_lines;
 use std::path::Path;
 
 /// CSVRows.leading_rows: up to `limit` leading non-blank, non-comment rows,
-/// each stripped.
+/// each stripped. Streams the file and stops once `limit` rows are found.
 pub fn leading_rows(path: &Path, limit: usize) -> std::io::Result<Vec<String>> {
     let mut rows = Vec::new();
-    for line in read_universal_lines(path)? {
+    for line in universal_lines(path)? {
+        let line = line?;
         let stripped = line.trim();
         if !stripped.is_empty() && !stripped.starts_with('#') {
             rows.push(stripped.to_string());
@@ -27,7 +28,8 @@ pub fn first_row(path: &Path) -> std::io::Result<String> {
 /// _count_leading_comments: '#' lines before the header; blanks skipped.
 pub fn count_leading_comments(path: &Path) -> std::io::Result<usize> {
     let mut count = 0;
-    for line in read_universal_lines(path)? {
+    for line in universal_lines(path)? {
+        let line = line?;
         let stripped = line.trim();
         if stripped.starts_with('#') {
             count += 1;
@@ -44,7 +46,8 @@ pub fn count_leading_comments(path: &Path) -> std::io::Result<usize> {
 /// including the header.
 pub fn count_leading_physical_lines_before_header(path: &Path) -> std::io::Result<usize> {
     let mut count = 0;
-    for line in read_universal_lines(path)? {
+    for line in universal_lines(path)? {
+        let line = line?;
         let stripped = line.trim();
         count += 1;
         if !stripped.is_empty() && !stripped.starts_with('#') {

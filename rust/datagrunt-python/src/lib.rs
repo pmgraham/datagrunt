@@ -1,9 +1,11 @@
-use pyo3::exceptions::PyOSError;
 use pyo3::prelude::*;
 use std::path::PathBuf;
 
+/// Map an IO error to a Python exception via PyO3's `From` impl, which
+/// preserves errno (e.g. a missing file becomes `FileNotFoundError`,
+/// matching the Python implementation).
 fn oserr(e: std::io::Error) -> PyErr {
-    PyOSError::new_err(e.to_string())
+    e.into()
 }
 
 #[pyfunction]
