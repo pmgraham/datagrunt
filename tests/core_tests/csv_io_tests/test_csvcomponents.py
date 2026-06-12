@@ -108,13 +108,78 @@ class TestCSVDelimiter:
         delimiter = CSVDelimiter(str(csv_file))
         assert delimiter.delimiter == "|"
 
-    def test_space_delimiter_fallback(self, tmp_path):
-        # Create a file with no clear delimiters
+    def test_single_column_no_whitespace_uses_comma(self, tmp_path):
+        """A single-column file with no punctuation must default to comma.
+
+        Counting non-alphanumeric characters finds nothing here, so the old
+        code fell back to space; comma never splits single-column data.
+        """
         csv_file = tmp_path / "test.csv"
         csv_file.write_text("abc123\ndef456")
 
         delimiter = CSVDelimiter(str(csv_file))
+        assert delimiter.delimiter == ","
+
+    def test_dotted_header_not_treated_as_delimiter(self, tmp_path):
+        """A dotted header (user.id,user.name) must infer comma, not '.'."""
+        csv_file = tmp_path / "test.csv"
+        csv_file.write_text("user.id,user.name\n1,alice\n2,bob")
+
+        delimiter = CSVDelimiter(str(csv_file))
+        assert delimiter.delimiter == ","
+
+    def test_apostrophe_header_not_treated_as_delimiter(self, tmp_path):
+        """An apostrophe in a header (User's Name,Age) must infer comma, not '."""
+        csv_file = tmp_path / "test.csv"
+        csv_file.write_text("User's Name,Age\nJohn,30\nJane,25")
+
+        delimiter = CSVDelimiter(str(csv_file))
+        assert delimiter.delimiter == ","
+
+    def test_single_column_with_spaces_in_values_not_split(self, tmp_path):
+        """A single text column whose values contain spaces must not split.
+
+        Every row splits into two whitespace tokens, but two-token rows are
+        indistinguishable from one text column, so the file defaults to comma.
+        """
+        csv_file = tmp_path / "test.csv"
+        csv_file.write_text("full name\nJohn Smith\nJane Doe")
+
+        delimiter = CSVDelimiter(str(csv_file))
+        assert delimiter.delimiter == ","
+
+    def test_genuine_space_delimited_file_detected(self, tmp_path):
+        """A real space-delimited file (consistent 3+ fields) infers space."""
+        csv_file = tmp_path / "test.csv"
+        csv_file.write_text("a b c\n1 2 3\n4 5 6")
+
+        delimiter = CSVDelimiter(str(csv_file))
         assert delimiter.delimiter == " "
+
+    def test_consistent_ambiguous_char_detected_as_delimiter(self, tmp_path):
+        """A file that splits consistently on '.' is detected as '.'-delimited.
+
+        Multi-pass validation accepts an otherwise-ambiguous character when
+        every sampled row splits on it into the same 3+ field count.
+        """
+        csv_file = tmp_path / "test.csv"
+        csv_file.write_text("a.b.c\n1.2.3\n4.5.6")
+
+        delimiter = CSVDelimiter(str(csv_file))
+        assert delimiter.delimiter == "."
+
+    def test_dotted_header_falls_through_to_real_delimiter(self, tmp_path):
+        """A dotted header over semicolon data infers ';', not the dot or comma.
+
+        '.' is the most frequent header character but splits the data
+        inconsistently, so inference falls through to the semicolon rather than
+        defaulting to comma.
+        """
+        csv_file = tmp_path / "test.csv"
+        csv_file.write_text("user.id;user.name\n1;alice\n2;bob")
+
+        delimiter = CSVDelimiter(str(csv_file))
+        assert delimiter.delimiter == ";"
 
 
 class TestCSVColumns:
