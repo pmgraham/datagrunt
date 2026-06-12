@@ -1,6 +1,6 @@
 //! Ports of CSVRows probes and the leading-line counters.
 
-use crate::io::universal_lines;
+use crate::io::{is_legacy_mac_newlines, read_decoded, universal_lines, universal_newlines};
 use std::path::Path;
 
 /// CSVRows.leading_rows: up to `limit` leading non-blank, non-comment rows,
@@ -52,6 +52,60 @@ pub fn count_leading_physical_lines_before_header(path: &Path) -> std::io::Resul
         count += 1;
         if !stripped.is_empty() && !stripped.starts_with('#') {
             break;
+        }
+    }
+    Ok(count)
+}
+
+/// The text Python's `csv.reader` sees: universal newlines for legacy-mac
+/// files (`newline=None`), raw decoded text otherwise (`newline=""`).
+///
+/// Python's `open(..., newline=None)` translates `\r` → `\n` before the CSV
+/// parser sees anything; `newline=""` passes `\r` through raw.
+pub(crate) fn csv_text(path: &Path) -> std::io::Result<String> {
+    let raw = read_decoded(path)?;
+    Ok(if is_legacy_mac_newlines(path) {
+        universal_newlines(&raw)
+    } else {
+        raw
+    })
+}
+
+/// Build a `csv::Reader` configured to match Python's `csv.reader` behaviour:
+/// no header auto-detection, flexible field counts (Python never errors on
+/// ragged rows), and the given single-byte delimiter.
+pub(crate) fn csv_reader(text: &str, delimiter: u8) -> csv::Reader<&[u8]> {
+    csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true) // Python csv.reader never errors on ragged widths
+        .delimiter(delimiter)
+        .from_reader(text.as_bytes())
+}
+
+/// True when the record mirrors Python's skip condition:
+/// `not row or row[0].startswith("#")`.
+///
+/// The `csv` crate silently drops truly-blank lines (it never yields a
+/// zero-field record for a blank line), so `is_empty()` here is a safety
+/// guard — it will fire only if some future csv-crate version or a crafted
+/// input somehow delivers a zero-field record. The `starts_with('#')` check
+/// mirrors Python's comment-skipping logic.
+pub(crate) fn skip_record(record: &csv::StringRecord) -> bool {
+    record.is_empty() || record.get(0).is_some_and(|f| f.starts_with('#'))
+}
+
+/// Port of `CSVRows.row_count_with_header`.
+///
+/// Counts parsed CSV records (quoted fields with embedded newlines count as
+/// one record) excluding blank records and comment records (first field starts
+/// with `#`), matching the Python implementation exactly.
+pub fn row_count_with_header(path: &Path, delimiter: u8) -> std::io::Result<u64> {
+    let text = csv_text(path)?;
+    let mut count = 0u64;
+    for record in csv_reader(&text, delimiter).records() {
+        let Ok(record) = record else { continue };
+        if !skip_record(&record) {
+            count += 1;
         }
     }
     Ok(count)

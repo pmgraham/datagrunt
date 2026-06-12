@@ -184,6 +184,17 @@ pub fn is_legacy_mac_newlines(path: &Path) -> bool {
     chunk.contains(&b'\r') && !chunk.contains(&b'\n')
 }
 
+/// Convert all line endings to `\n`, matching Python's universal-newlines mode
+/// (`newline=None`): `\r\n` → `\n`, then lone `\r` → `\n`.
+///
+/// Used by the CSV row-counting path for legacy-mac files, where Python calls
+/// `open(..., newline=None)` so that `\r`-only line endings are normalised
+/// before `csv.reader` sees the text.
+pub fn universal_newlines(s: &str) -> String {
+    // Replace CRLF first so the lone-\r pass does not double-convert them.
+    s.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 /// FileProperties.is_empty parity: true iff the file is zero bytes.
 pub fn is_empty(path: &Path) -> std::io::Result<bool> {
     Ok(std::fs::metadata(path)?.len() == 0)
