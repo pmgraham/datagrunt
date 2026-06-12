@@ -486,6 +486,7 @@ class TestEngines:
             sample = reader.get_sample()
             assert sample.columns == ["color", "name"], f"{engine} sample header mismatch"
             assert len(sample) == 3, f"{engine} sample dropped rows"
+            assert sample.to_dicts() == expected_rows, f"{engine} sample rows diverge from polars"
 
 
 class TestNormalizeCollidingColumnsAllEngines:
