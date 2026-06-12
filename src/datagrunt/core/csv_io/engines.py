@@ -58,6 +58,20 @@ def _is_legacy_mac_newlines(filepath):
         return False
 
 
+def _resolve_normalize_columns(instance_default, per_call_value):
+    """Resolve a per-call normalize flag against the engine's instance default.
+
+    Args:
+        instance_default (bool): The engine's constructor-level setting.
+        per_call_value (bool or None): The per-call argument; ``None`` means
+        "inherit the instance-level setting".
+
+    Returns:
+        bool: The effective normalization mode.
+    """
+    return instance_default if per_call_value is None else per_call_value
+
+
 @dataclass
 class CSVEngineProperties:
     """Base properties for CSV operations."""
@@ -80,15 +94,18 @@ class CSVEngineProperties:
 class CSVBaseReaderEngine(ABC):
     """Abstract base class defining the interface for reader engines."""
 
-    def __init__(self, filepath, lenient=False):
+    def __init__(self, filepath, lenient=False, normalize_columns=False):
         """Initialize the CSVReader class.
 
         Args:
             filepath (str or Path): Path to the file to read.
             lenient (bool): Whether to run in lenient mode.
+            normalize_columns (bool): Whether to normalize column names for
+            every operation on this engine. A per-call argument overrides it.
         """
         self.filepath = Path(filepath)
         self.lenient = lenient
+        self.normalize_columns = normalize_columns
         self.queries = DuckDBQueries(self.filepath, lenient=self.lenient)
         self.db_table = self.queries.database_table_name
         self.delimiter = self.queries.delimiter
@@ -152,16 +169,19 @@ class CSVBaseReaderEngine(ABC):
 class CSVBaseWriterEngine(ABC):
     """Abstract base class defining the interface for writer engines."""
 
-    def __init__(self, filepath, lenient=False):
+    def __init__(self, filepath, lenient=False, normalize_columns=False):
         """
         Initialize the CSV Writer DuckDB Engine class.
 
         Args:
             filepath (str or Path): Path to the file to write.
             lenient (bool): Whether to run in lenient mode.
+            normalize_columns (bool): Whether to normalize column names for
+            every operation on this engine. A per-call argument overrides it.
         """
         self.filepath = Path(filepath)
         self.lenient = lenient
+        self.normalize_columns = normalize_columns
         self.queries = DuckDBQueries(self.filepath, lenient=self.lenient)
         self.db_table = self.queries.database_table_name
         if not self.filepath.exists():
@@ -505,10 +525,6 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
     by DuckDB.
     """
 
-    def __init__(self, filepath, lenient=False):
-        """Initialize the CSVWriterDuckDBEngine class."""
-        super().__init__(filepath, lenient=lenient)
-
     def write_csv(self, export_filename=None, normalize_columns=False):
         """
         Query to export a DuckDB table to a CSV file.
@@ -593,10 +609,6 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
 
 class CSVWriterPolarsEngine(CSVBaseWriterEngine):
     """Class to write CSVs to other file formats powered by Polars."""
-
-    def __init__(self, filepath, lenient=False):
-        """Initialize the CSVWriterPolarsEngine class."""
-        super().__init__(filepath, lenient=lenient)
 
     def write_csv(self, export_filename=None, normalize_columns=False):
         """
@@ -934,10 +946,6 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
 
 class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
     """Class to write CSVs to other file formats powered by PyArrow."""
-
-    def __init__(self, filepath, lenient=False):
-        """Initialize the CSVWriterPyArrowEngine class."""
-        super().__init__(filepath, lenient=lenient)
 
     def _create_table(self, normalize_columns=False):
         """Create a PyArrow table for writing operations."""

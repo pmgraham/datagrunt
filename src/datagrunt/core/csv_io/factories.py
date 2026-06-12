@@ -32,7 +32,7 @@ class CSVEngineFactory:
         "pyarrow": CSVWriterPyArrowEngine,
     }
 
-    def __init__(self, filepath, engine, lenient=False):
+    def __init__(self, filepath, engine, lenient=False, normalize_columns=False):
         """
         Initialize the Engine Factory class.
 
@@ -40,10 +40,13 @@ class CSVEngineFactory:
             filepath (str or Path): Path to the file to read.
             engine (str): type of engine to create by the factory.
             lenient (bool): Whether to run in lenient mode.
+            normalize_columns (bool): Instance-level column normalization
+            setting forwarded to the engines this factory creates.
         """
         self.filepath = Path(filepath)
         self.engine = engine.lower().replace(" ", "")
         self.lenient = lenient
+        self.normalize_columns = normalize_columns
         if not self.filepath.exists():
             raise FileNotFoundError
         self.validate_engine(self.engine)
@@ -78,7 +81,7 @@ class CSVEngineFactory:
         """
         engine_class = self.READER_ENGINES.get(self.engine)
         if engine_class:
-            return engine_class(self.filepath, lenient=self.lenient)
+            return engine_class(self.filepath, lenient=self.lenient, normalize_columns=self.normalize_columns)
         else:
             raise ValueError(f"Unsupported reader engine: {self.engine}")
 
@@ -94,6 +97,6 @@ class CSVEngineFactory:
         """
         engine_class = self.WRITER_ENGINES.get(self.engine)
         if engine_class:
-            return engine_class(self.filepath, lenient=self.lenient)
+            return engine_class(self.filepath, lenient=self.lenient, normalize_columns=self.normalize_columns)
         else:
             raise ValueError(f"Unsupported reader engine: {self.engine}")
