@@ -33,6 +33,11 @@ fn count_leading_physical_lines_before_header(path: PathBuf) -> PyResult<usize> 
     datagrunt_core::rows::count_leading_physical_lines_before_header(&path).map_err(oserr)
 }
 
+#[pyfunction]
+fn normalize_columns(names: Vec<String>) -> Vec<String> {
+    datagrunt_core::normalize::normalize_columns(&names)
+}
+
 #[pymodule]
 fn datagrunt_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(is_legacy_mac_newlines, m)?)?;
@@ -40,5 +45,6 @@ fn datagrunt_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(first_row, m)?)?;
     m.add_function(wrap_pyfunction!(count_leading_comments, m)?)?;
     m.add_function(wrap_pyfunction!(count_leading_physical_lines_before_header, m)?)?;
+    m.add_function(wrap_pyfunction!(normalize_columns, m)?)?;
     Ok(())
 }
