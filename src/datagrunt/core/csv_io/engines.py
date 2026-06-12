@@ -563,10 +563,10 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
         """
         Query to export a DuckDB table to a CSV file.
 
-            Args:
-                export_filename str: The name of the output file.
-                normalize_columns (bool or None): Whether to normalize column
-                names. ``None`` (default) inherits the instance-level setting.
+        Args:
+            export_filename (optional, str): The name of the output file.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.csv_export_filename, export_filename)
