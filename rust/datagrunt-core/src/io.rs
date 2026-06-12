@@ -19,8 +19,13 @@ pub fn decode_ignore(bytes: &[u8]) -> String {
             }
             Err(e) => {
                 let (valid, after) = rest.split_at(e.valid_up_to());
-                // valid_up_to guarantees this slice is valid UTF-8
+                // SAFETY: `from_utf8` just validated every byte in
+                // `0..e.valid_up_to()`, so this sub-slice is guaranteed
+                // well-formed UTF-8 per the Utf8Error contract.
                 out.push_str(unsafe { std::str::from_utf8_unchecked(valid) });
+                // error_len() is None only for an incomplete multibyte
+                // sequence truncated at EOF — the remainder is the invalid
+                // tail, so consuming all of it is correct.
                 let skip = e.error_len().unwrap_or(after.len());
                 rest = &after[skip..];
             }
@@ -57,6 +62,7 @@ pub fn read_universal_lines(path: &Path) -> std::io::Result<Vec<String>> {
 }
 
 /// First 4096 bytes contain \r and no \n. False on any IO error (best-effort).
+/// Inspects only the first 4096 bytes, matching the Python probe exactly.
 pub fn is_legacy_mac_newlines(path: &Path) -> bool {
     let mut chunk = Vec::with_capacity(4096);
     let ok = File::open(path).and_then(|f| f.take(4096).read_to_end(&mut chunk));
@@ -66,6 +72,7 @@ pub fn is_legacy_mac_newlines(path: &Path) -> bool {
     chunk.contains(&b'\r') && !chunk.contains(&b'\n')
 }
 
+/// FileProperties.is_empty parity: true iff the file is zero bytes.
 pub fn is_empty(path: &Path) -> std::io::Result<bool> {
     Ok(std::fs::metadata(path)?.len() == 0)
 }
@@ -73,6 +80,7 @@ pub fn is_empty(path: &Path) -> std::io::Result<bool> {
 /// BlankFile.is_blank: >=10MB (after Python's nested rounding: >= 9_999_995
 /// bytes) is never blank; otherwise strict decode (BOM allowed) — invalid
 /// UTF-8 counts as content; blank iff all whitespace.
+/// The stat-then-read order mirrors Python's BlankFile (the size gate is advisory; Python has the same TOCTOU characteristics, and parity is the spec).
 pub fn is_blank(path: &Path) -> bool {
     let size = match std::fs::metadata(path) {
         Ok(m) => m.len(),
@@ -92,6 +100,7 @@ pub fn is_blank(path: &Path) -> bool {
     }
 }
 
+/// FileProperties.is_tsv parity: extension is "tsv", case-insensitive.
 pub fn is_tsv(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
