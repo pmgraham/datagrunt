@@ -5,6 +5,19 @@ import os
 import stat
 from typing import Callable, Iterable, Optional
 
+# Hash in 1 MiB chunks so a single very large embedded image (e.g. a raw scanned
+# page) does not spike memory by its full size during de-duplication (issue #147).
+_HASH_CHUNK_SIZE = 1 << 20
+
+
+def _md5_file(path: str) -> str:
+    """Return the MD5 hex digest of a file, read in bounded chunks."""
+    digest = hashlib.md5()
+    with open(path, "rb") as f:
+        while chunk := f.read(_HASH_CHUNK_SIZE):
+            digest.update(chunk)
+    return digest.hexdigest()
+
 
 def _is_deletion_safe(path: str, allowed_root: Optional[str]) -> bool:
     """Return True only when ``path`` is a regular file this run may delete.
@@ -64,8 +77,7 @@ def dedupe_image_files(
         path = get_path(record)
         if not path or not os.path.isfile(path):
             continue
-        with open(path, "rb") as f:
-            digest = hashlib.md5(f.read()).hexdigest()
+        digest = _md5_file(path)
         first = seen.get(digest)
         if first is None:
             seen[digest] = path
