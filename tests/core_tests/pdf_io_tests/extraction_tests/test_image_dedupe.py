@@ -83,3 +83,49 @@ def test_symlink_inside_output_dir_is_not_followed(tmp_path):
     assert removed == 0
     assert victim.exists() is True
     assert os.path.islink(link) is True
+
+
+def test_large_identical_images_collapse_with_streamed_hash(tmp_path):
+    """Files larger than the hash chunk size must still dedupe correctly.
+
+    The MD5 is streamed in 1 MiB chunks (issue #147); a payload spanning several
+    chunks (plus a non-chunk-aligned tail) must produce the same digest as a
+    whole-file hash, so byte-identical large images still collapse.
+    """
+    import hashlib
+
+    output_dir = tmp_path / "images"
+    output_dir.mkdir()
+    # ~2.6 MiB so the hash spans multiple 1 MiB chunks with a partial final chunk.
+    payload = (b"scanned-page-bytes" * 150_000) + b"tail"
+    first = output_dir / "img_0.png"
+    second = output_dir / "img_1.png"
+    first.write_bytes(payload)
+    second.write_bytes(payload)
+
+    records = _records(str(first), str(second))
+    removed = dedupe_image_files(records, _get, _set, allowed_dir=str(output_dir))
+
+    assert removed == 1
+    assert second.exists() is False
+    assert first.exists() is True
+    assert records[1]["file_path"] == str(first)
+    # The streamed digest matches a whole-file hash (chunk boundaries are inert).
+    assert hashlib.md5(first.read_bytes()).hexdigest() == hashlib.md5(payload).hexdigest()
+
+
+def test_large_distinct_images_are_not_collapsed(tmp_path):
+    """Large but differing files must not be treated as duplicates."""
+    output_dir = tmp_path / "images"
+    output_dir.mkdir()
+    first = output_dir / "img_0.png"
+    second = output_dir / "img_1.png"
+    first.write_bytes(b"A" * (3 << 20))
+    second.write_bytes(b"B" * (3 << 20))
+
+    records = _records(str(first), str(second))
+    removed = dedupe_image_files(records, _get, _set, allowed_dir=str(output_dir))
+
+    assert removed == 0
+    assert first.exists() is True
+    assert second.exists() is True
