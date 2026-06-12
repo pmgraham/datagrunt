@@ -6,6 +6,7 @@ from pathlib import Path
 
 # local imports
 from datagrunt.core import AIEngineFactory, AIEngineProperties, CSVStringSample, prompts
+from datagrunt.core.ai._deprecation import warn_ai_deprecated
 
 
 class CSVSchemaReportAIGenerated:
@@ -13,6 +14,7 @@ class CSVSchemaReportAIGenerated:
 
     def __init__(self, filepath, engine, api_key=None, **kwargs):
         """Initialize the CSV Schema Report class."""
+        warn_ai_deprecated("CSVSchemaReportAIGenerated")
         self.filepath = Path(filepath)
         self.engine = engine.lower().replace(" ", "")
         self.api_key = api_key
