@@ -7,6 +7,11 @@ from google.genai import types
 
 from datagrunt.core.ai.engines import AIEngineProperties, BaseAIEngine, GoogleAIEngine
 
+# The AI/LLM surface is deprecated (issue #144); these tests exercise it until
+# it is removed in 4.0.0, so suppress the construction warning here. The warning
+# itself is asserted explicitly in TestAIDeprecation.
+pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
+
 
 class TestAIEngineProperties:
     """Test suite for AIEngineProperties class."""
@@ -309,3 +314,12 @@ class TestGoogleAIEngine:
         assert "contents" in call_args.kwargs
         assert "config" in call_args.kwargs
         assert call_args.kwargs["model"] == "gemini-pro"
+
+
+class TestAIDeprecation:
+    """The AI/LLM surface must warn on construction until removal (issue #144)."""
+
+    def test_google_ai_engine_construction_warns(self):
+        """Constructing GoogleAIEngine emits a DeprecationWarning."""
+        with pytest.warns(DeprecationWarning, match="deprecated"):
+            GoogleAIEngine(api_key="test_key")

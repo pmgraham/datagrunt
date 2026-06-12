@@ -11,6 +11,10 @@ from datagrunt.csv_api.csvai import CSVSchemaReportAIGenerated
 # All supported AI engines for CSVSchemaReportAIGenerated
 ALL_AI_ENGINES = ["google"]
 
+# The AI/LLM surface is deprecated (issue #144); suppress the construction
+# warning here. It is asserted explicitly in TestCSVAIDeprecation.
+pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
+
 
 class TestCSVSchemaReportAIGenerated:
     """Test suite for CSVSchemaReportAIGenerated class."""
@@ -320,3 +324,12 @@ class TestCSVSchemaReportAIGenerated:
         assert result == complex_response
         assert result["schema"]["columns"][0]["name"] == "id"
         assert result["schema"]["metadata"]["rows"] == 100
+
+
+class TestCSVAIDeprecation:
+    """CSVSchemaReportAIGenerated must warn on construction until removal (issue #144)."""
+
+    def test_csv_schema_report_construction_warns(self):
+        """Constructing CSVSchemaReportAIGenerated emits a DeprecationWarning."""
+        with pytest.warns(DeprecationWarning, match="deprecated"):
+            CSVSchemaReportAIGenerated(filepath="test.csv", engine="google", api_key="test_key")
