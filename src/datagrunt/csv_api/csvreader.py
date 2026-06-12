@@ -13,12 +13,13 @@ import pyarrow as pa
 
 # local libraries
 from datagrunt.core import CSVComponents, CSVEngineFactory, DuckDBQueries
+from datagrunt.csv_api._compat import warn_per_call_normalize
 
 
 class CSVReader(CSVComponents):
     """Class to unify the interface for reading CSV files."""
 
-    def __init__(self, filepath, engine="polars", lenient=False):
+    def __init__(self, filepath, engine="polars", lenient=False, normalize_columns=False):
         """
         Initialize the CSV Reader class.
 
@@ -27,9 +28,13 @@ class CSVReader(CSVComponents):
             engine (str, default 'polars'): Determines which reader engine
             class to instantiate.
             lenient (bool): Whether to run in lenient mode.
+            normalize_columns (bool): Whether to normalize column names for
+            every operation on this reader. With the DuckDB engine, queries
+            are then written against the normalized names.
         """
         filepath = Path(filepath)
         self.lenient = lenient
+        self.normalize_columns = normalize_columns
         super().__init__(filepath)
         self.db_table = DuckDBQueries(self.filepath, lenient=self.lenient).database_table_name
         self.engine = engine.lower().replace(" ", "")
@@ -48,7 +53,12 @@ class CSVReader(CSVComponents):
         ``query_data`` - reuse a single import instead of rebuilding a fresh
         engine and re-importing the file on every call (issue #104).
         """
-        return CSVEngineFactory(self.filepath, self.engine, lenient=self.lenient).create_reader()
+        return CSVEngineFactory(
+            self.filepath,
+            self.engine,
+            lenient=self.lenient,
+            normalize_columns=self.normalize_columns,
+        ).create_reader()
 
     def _create_reader(self):
         """Return this reader's cached engine.
@@ -58,79 +68,86 @@ class CSVReader(CSVComponents):
         """
         return self._reader
 
-    def get_sample(self, normalize_columns=False):
+    def get_sample(self, normalize_columns=None):
         """Return a sample of the CSV file.
 
         Args:
-            normalize_columns (bool): Whether to normalize column names.
+            normalize_columns (bool or None): Deprecated per-call override.
+            ``None`` (default) inherits the constructor-level setting.
 
         Returns:
             A Polars DataFrame containing the sample rows.
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(pl.DataFrame())
-        return self._create_reader().get_sample(normalize_columns)
+        return self._create_reader().get_sample(warn_per_call_normalize(normalize_columns))
 
-    def to_dataframe(self, normalize_columns=False):
+    def to_dataframe(self, normalize_columns=None):
         """Converts CSV to a Polars dataframe.
 
         Args:
-            normalize_columns (bool): Whether to normalize column names.
+            normalize_columns (bool or None): Deprecated per-call override.
+            ``None`` (default) inherits the constructor-level setting.
 
         Returns:
             A Polars dataframe.
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(pl.DataFrame())
-        return self._create_reader().to_dataframe(normalize_columns)
+        return self._create_reader().to_dataframe(warn_per_call_normalize(normalize_columns))
 
-    def to_arrow_table(self, normalize_columns=False):
+    def to_arrow_table(self, normalize_columns=None):
         """Converts CSV to a PyArrow table.
 
         Args:
-            normalize_columns (bool): Whether to normalize column names.
+            normalize_columns (bool or None): Deprecated per-call override.
+            ``None`` (default) inherits the constructor-level setting.
 
         Returns:
             A PyArrow table.
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(pa.Table.from_pydict({}))
-        return self._create_reader().to_arrow_table(normalize_columns)
+        return self._create_reader().to_arrow_table(warn_per_call_normalize(normalize_columns))
 
-    def to_dicts(self, normalize_columns=False):
+    def to_dicts(self, normalize_columns=None):
         """Converts CSV to a list of dictionaries.
 
         Args:
-            normalize_columns (bool): Whether to normalize column names.
+            normalize_columns (bool or None): Deprecated per-call override.
+            ``None`` (default) inherits the constructor-level setting.
 
         Returns:
             A list of dictionaries.
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(list())
-        return self._create_reader().to_dicts(normalize_columns)
+        return self._create_reader().to_dicts(warn_per_call_normalize(normalize_columns))
 
-    def query_data(self, sql_query, normalize_columns=False):
+    def query_data(self, sql_query, normalize_columns=None):
         """
-        Queries as CSV file after importing into DuckDB.
+        Queries a CSV file after importing into DuckDB.
 
         Args:
             sql_query (str): Query to run against DuckDB.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Deprecated per-call override.
+            ``None`` (default) inherits the constructor-level setting.
 
         Returns:
-            A DuckDB DuckDBPyRelation with the query results.
+            A DuckDB DuckDBPyRelation with the query results (DuckDB engine)
+            or a Polars DataFrame (polars/pyarrow engines).
 
         Example if DuckDB Engine:
-            dg = CSVReader('myfile.csv')
-            query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
-            dg.query_csv_data(query)
+            dg = CSVReader('myfile.csv', normalize_columns=True)
+            query = f"SELECT col_one, col_two FROM {dg.db_table}"
+            dg.query_data(query)
 
-        If you set normalize_columns=True, the column names will be normalized
-        to lowercase and spaces will be replaced with underscores, and you
-        must reference the new column names in your query.
+        If the reader was constructed with normalize_columns=True, the table
+        is imported with normalized column names, so write your SQL against
+        those names (see ``columns_normalized`` for the list). The deprecated
+        per-call argument keeps the legacy behavior instead: the query runs
+        against the original column names and only the result is renamed.
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(list())
-        return self._create_reader().query_data(sql_query, normalize_columns)
+        return self._create_reader().query_data(sql_query, warn_per_call_normalize(normalize_columns))

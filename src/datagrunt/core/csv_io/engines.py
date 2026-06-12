@@ -5,7 +5,7 @@ import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 # third party libraries
 import polars as pl
@@ -58,6 +58,20 @@ def _is_legacy_mac_newlines(filepath):
         return False
 
 
+def _resolve_normalize_columns(instance_default, per_call_value):
+    """Resolve a per-call normalize flag against the engine's instance default.
+
+    Args:
+        instance_default (bool): The engine's constructor-level setting.
+        per_call_value (bool or None): The per-call argument; ``None`` means
+        "inherit the instance-level setting".
+
+    Returns:
+        bool: The effective normalization mode.
+    """
+    return instance_default if per_call_value is None else per_call_value
+
+
 @dataclass
 class CSVEngineProperties:
     """Base properties for CSV operations."""
@@ -80,15 +94,18 @@ class CSVEngineProperties:
 class CSVBaseReaderEngine(ABC):
     """Abstract base class defining the interface for reader engines."""
 
-    def __init__(self, filepath, lenient=False):
+    def __init__(self, filepath, lenient=False, normalize_columns=False):
         """Initialize the CSVReader class.
 
         Args:
             filepath (str or Path): Path to the file to read.
             lenient (bool): Whether to run in lenient mode.
+            normalize_columns (bool): Whether to normalize column names for
+            every operation on this engine. A per-call argument overrides it.
         """
         self.filepath = Path(filepath)
         self.lenient = lenient
+        self.normalize_columns = normalize_columns
         self.queries = DuckDBQueries(self.filepath, lenient=self.lenient)
         self.db_table = self.queries.database_table_name
         self.delimiter = self.queries.delimiter
@@ -96,11 +113,12 @@ class CSVBaseReaderEngine(ABC):
             raise FileNotFoundError
 
     @abstractmethod
-    def get_sample(self, normalize_columns: bool = False) -> pl.DataFrame:
+    def get_sample(self, normalize_columns: Optional[bool] = None) -> pl.DataFrame:
         """Return a sample of the data as a Polars DataFrame.
 
         Args:
-            normalize_columns (bool): Whether to normalize column names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A Polars DataFrame containing the sample rows.
@@ -108,43 +126,48 @@ class CSVBaseReaderEngine(ABC):
         pass
 
     @abstractmethod
-    def to_dataframe(self, normalize_columns: bool = False) -> pl.DataFrame:
+    def to_dataframe(self, normalize_columns: Optional[bool] = None) -> pl.DataFrame:
         """Convert data to a dataframe.
 
         Args:
-            normalize_columns (bool): Whether to normalize column names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
         pass
 
     @abstractmethod
-    def to_arrow_table(self, normalize_columns: bool = False) -> pa.Table:
+    def to_arrow_table(self, normalize_columns: Optional[bool] = None) -> pa.Table:
         """
         Convert data to a PyArrow table.
 
         Args:
-            normalize_columns (bool): Whether to normalize column names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
         pass
 
     @abstractmethod
-    def to_dicts(self, normalize_columns: bool = False) -> List[Dict]:
+    def to_dicts(self, normalize_columns: Optional[bool] = None) -> List[Dict]:
         """
         Convert data to a list of dictionaries.
 
         Args:
-            normalize_columns (bool): Whether to normalize column names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
         pass
 
     @abstractmethod
-    def query_data(self, sql_query: str, normalize_columns: bool = False) -> Union[DuckDBPyRelation, pl.DataFrame]:
+    def query_data(
+        self, sql_query: str, normalize_columns: Optional[bool] = None
+    ) -> Union[DuckDBPyRelation, pl.DataFrame]:
         """
         Query the data using SQL.
 
         Args:
             sql_query (str): SQL query to execute.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
         pass
 
@@ -152,64 +175,79 @@ class CSVBaseReaderEngine(ABC):
 class CSVBaseWriterEngine(ABC):
     """Abstract base class defining the interface for writer engines."""
 
-    def __init__(self, filepath, lenient=False):
+    def __init__(self, filepath, lenient=False, normalize_columns=False):
         """
         Initialize the CSV Writer DuckDB Engine class.
 
         Args:
             filepath (str or Path): Path to the file to write.
             lenient (bool): Whether to run in lenient mode.
+            normalize_columns (bool): Whether to normalize column names for
+            every operation on this engine. A per-call argument overrides it.
         """
         self.filepath = Path(filepath)
         self.lenient = lenient
+        self.normalize_columns = normalize_columns
         self.queries = DuckDBQueries(self.filepath, lenient=self.lenient)
         self.db_table = self.queries.database_table_name
         if not self.filepath.exists():
             raise FileNotFoundError
 
     @abstractmethod
-    def write_csv(self, export_filename, normalize_columns=False):
-        """Write data to CSV format."""
+    def write_csv(self, export_filename, normalize_columns=None):
+        """Write data to CSV format.
+
+        Args:
+            export_filename (str): Path to the file to write.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
+        """
         pass
 
     @abstractmethod
-    def write_excel(self, export_filename, normalize_columns=False):
+    def write_excel(self, export_filename, normalize_columns=None):
         """
         Write data to Excel format.
 
         Args:
             export_filename (str): Path to the file to write.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
         pass
 
     @abstractmethod
-    def write_json(self, export_filename, normalize_columns=False):
-        """Write data to JSON format."""
+    def write_json(self, export_filename, normalize_columns=None):
+        """Write data to JSON format.
+
+        Args:
+            export_filename (str): Path to the file to write.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
+        """
         pass
 
     @abstractmethod
-    def write_json_newline_delimited(self, export_filename, normalize_columns=False):
+    def write_json_newline_delimited(self, export_filename, normalize_columns=None):
         """
         Write data to JSON Lines format.
 
         Args:
             export_filename (str): Path to the file to write.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
         pass
 
     @abstractmethod
-    def write_parquet(self, export_filename, normalize_columns=False):
+    def write_parquet(self, export_filename, normalize_columns=None):
         """
         Write data to Parquet format.
 
         Args:
             export_filename (str): Path to the file to write.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
         pass
 
@@ -219,17 +257,18 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
     Class to read CSV files and convert CSV files powered by DuckDB.
     """
 
-    def get_sample(self, normalize_columns=False):
+    def get_sample(self, normalize_columns=None):
         """
         Return a sample of the CSV file.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A Polars DataFrame containing the sample rows.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         # sample_dataframe streams the first rows (no full-table import) and
         # returns a materialized Polars frame, so the per-call connection can
         # be released deterministically rather than waiting on garbage
@@ -242,34 +281,36 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         finally:
             self.queries.close()
 
-    def to_dataframe(self, normalize_columns=False):
+    def to_dataframe(self, normalize_columns=None):
         """
         Converts CSV to a Polars dataframe.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A Polars dataframe.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         # Materialize fully (.pl()) before closing the per-call connection.
         try:
             return self.queries.create_table(normalize_columns).pl()
         finally:
             self.queries.close()
 
-    def to_arrow_table(self, normalize_columns=False):
+    def to_arrow_table(self, normalize_columns=None):
         """
         Converts CSV to a PyArrow table.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A PyArrow table.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         # Materialize into an in-memory pa.Table before closing the connection.
         try:
             result = self.queries.create_table(normalize_columns).arrow()
@@ -279,13 +320,13 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         finally:
             self.queries.close()
 
-    def to_dicts(self, normalize_columns=False):
+    def to_dicts(self, normalize_columns=None):
         """
         Converts CSV to a list of Python dictionaries.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A list of dictionaries.
@@ -313,34 +354,47 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
             projections.append(f'"{safe_col}" AS "{safe_normalized}"')
         return relation.project(", ".join(projections))
 
-    def query_data(self, sql_query, normalize_columns=False):
-        """Queries as CSV file after importing into DuckDB.
+    def query_data(self, sql_query, normalize_columns=None):
+        """Queries a CSV file after importing into DuckDB.
 
         Args:
             sql_query (str): Query to run against DuckDB.
-            normalize_columns (optional, bool): Whether to normalize
-                column names.
+            normalize_columns (bool or None): ``None`` (default) inherits the
+                instance-level setting: the table is created in the configured
+                vocabulary, so the query is written and returned with the same
+                column names. An explicit bool keeps the legacy behavior: the
+                query runs against the original names and only the result
+                columns are renamed.
 
         Returns:
             A DuckDB DuckDBPyRelation with the query results.
 
         Example if DuckDB Engine:
-            dg = CSVReader('myfile.csv')
-            query = f"SELECT col1, col2 FROM {dg.db_table}"
-            dg.query_csv_data(query)
+            dg = CSVReader('myfile.csv', normalize_columns=True)
+            query = f"SELECT col_one, col_two FROM {dg.db_table}"
+            dg.query_data(query)
+
+        Note:
+            The returned relation is lazy and bound to this reader's shared
+            DuckDB table. Mixing inherit-mode and explicit ``normalize_columns``
+            calls on the same reader re-imports that table with a different
+            column vocabulary, so evaluate (e.g. ``.pl()``) any relation you
+            need to keep before issuing a query in the other mode.
         """  # noqa: E501
-        # Ensure the base table is created with original column names
-        # so the user's query can reference them.
+        if normalize_columns is None:
+            # Instance-level mode: the table itself carries the configured
+            # column names, so query vocabulary and result vocabulary match.
+            self.queries.create_table(normalize_columns=self.normalize_columns)
+            # The relation is lazy and bound to this engine's connection; it
+            # survives engine GC but not a later mode flip or close().
+            return self.queries.connection.sql(sql_query)
+
+        # Legacy per-call mode: the table keeps original column names so the
+        # user's query can reference them; only the result is renamed.
         self.queries.create_table(normalize_columns=False)
-
-        # Execute the user's query on the same per-instance connection that
-        # holds the table. The returned relation keeps this connection alive,
-        # so it remains valid after this engine instance is garbage collected.
         result_relation = self.queries.connection.sql(sql_query)
-
         if normalize_columns:
             result_relation = self._normalize_relation_columns(result_relation)
-
         return result_relation
 
 
@@ -419,81 +473,81 @@ class CSVReaderPolarsEngine(CSVBaseReaderEngine):
         except Exception as e:
             raise e
 
-    def get_sample(self, normalize_columns=False):
+    def get_sample(self, normalize_columns=None):
         """
         Return a sample of the CSV file.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A Polars dataframe.
         """
-        return self._create_dataframe_sample(normalize_columns)
+        return self._create_dataframe_sample(_resolve_normalize_columns(self.normalize_columns, normalize_columns))
 
-    def to_dataframe(self, normalize_columns=False):
+    def to_dataframe(self, normalize_columns=None):
         """
         Converts CSV to a Polars dataframe.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A Polars dataframe.
         """
-        return self._create_dataframe(normalize_columns)
+        return self._create_dataframe(_resolve_normalize_columns(self.normalize_columns, normalize_columns))
 
-    def to_arrow_table(self, normalize_columns=False):
+    def to_arrow_table(self, normalize_columns=None):
         """
         Converts CSV to a PyArrow table.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A PyArrow table.
         """
-        df = self._create_dataframe(normalize_columns).to_arrow()
-        return df
+        return self._create_dataframe(_resolve_normalize_columns(self.normalize_columns, normalize_columns)).to_arrow()
 
-    def to_dicts(self, normalize_columns=False):
+    def to_dicts(self, normalize_columns=None):
         """
         Converts CSV to a list of Python dictionaries.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A list of dictionaries.
         """
-        dicts = self._create_dataframe(normalize_columns).to_dicts()
-        return dicts
+        return self._create_dataframe(_resolve_normalize_columns(self.normalize_columns, normalize_columns)).to_dicts()
 
-    def query_data(self, sql_query, normalize_columns=False):
+    def query_data(self, sql_query, normalize_columns=None):
         """
-        Queries as CSV file after importing into DuckDB.
+        Queries a CSV file after importing into DuckDB.
 
         Args:
             sql_query (str): Query to run against DuckDB.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): ``None`` (default) inherits the
+                instance-level setting: the table is created in the configured
+                vocabulary, so the query is written and returned with the same
+                column names. An explicit bool keeps the legacy behavior: the
+                query runs against the original names and only the result
+                columns are renamed.
 
         Returns:
-            A DuckDB DuckDBPyRelation with the query results.
-
-        Example if DuckDB Engine:
-            dg = CSVReader('myfile.csv')
-            query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
-            dg.query_csv_data(query)
+            A Polars DataFrame with the query results.
         """
         # The result is a fully-materialized polars DataFrame, so the
         # connection can be disposed deterministically (unlike the duckdb
         # engine, whose query_data returns a live relation).
         try:
+            if normalize_columns is None:
+                self.queries.create_table(normalize_columns=self.normalize_columns)
+                return self.queries.connection.sql(sql_query).pl()
             return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
         finally:
             self.queries.close()
@@ -505,18 +559,16 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
     by DuckDB.
     """
 
-    def __init__(self, filepath, lenient=False):
-        """Initialize the CSVWriterDuckDBEngine class."""
-        super().__init__(filepath, lenient=lenient)
-
-    def write_csv(self, export_filename=None, normalize_columns=False):
+    def write_csv(self, export_filename=None, normalize_columns=None):
         """
         Query to export a DuckDB table to a CSV file.
 
-            Args:
-                export_filename str: The name of the output file.
-                normalize_columns bool: Whether to normalize column names.
+        Args:
+            export_filename (optional, str): The name of the output file.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.csv_export_filename, export_filename)
         # COPY executes eagerly on .sql(), so the file is written before close()
         # releases the per-call connection.
@@ -526,15 +578,16 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
         finally:
             self.queries.close()
 
-    def write_excel(self, export_filename=None, normalize_columns=False):
+    def write_excel(self, export_filename=None, normalize_columns=None):
         """
         Query to export a DuckDB table to an Excel file.
 
         Args:
             export_filename (optional, str): The name of the output file.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.excel_export_filename, export_filename)
         try:
             self.queries.create_table(normalize_columns)
@@ -542,15 +595,16 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
         finally:
             self.queries.close()
 
-    def write_json(self, export_filename=None, normalize_columns=False):
+    def write_json(self, export_filename=None, normalize_columns=None):
         """
         Query to export a DuckDB table to a JSON file.
 
         Args:
             export_filename (optional, str): The name of the output file.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.json_export_filename, export_filename)
         try:
             self.queries.create_table(normalize_columns)
@@ -558,15 +612,16 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
         finally:
             self.queries.close()
 
-    def write_json_newline_delimited(self, export_filename=None, normalize_columns=False):
+    def write_json_newline_delimited(self, export_filename=None, normalize_columns=None):
         """
         Query to export a DuckDB table to a JSON newline delimited file.
 
         Args:
             export_filename (optional, str): The name of the output file.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.json_newline_export_filename, export_filename)
         try:
             self.queries.create_table(normalize_columns)
@@ -574,15 +629,16 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
         finally:
             self.queries.close()
 
-    def write_parquet(self, export_filename=None, normalize_columns=False):
+    def write_parquet(self, export_filename=None, normalize_columns=None):
         """
         Query to export a DuckDB table to a Parquet file.
 
         Args:
             export_filename (optional, str): The name of the output file.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.parquet_export_filename, export_filename)
         try:
             self.queries.create_table(normalize_columns)
@@ -594,71 +650,72 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
 class CSVWriterPolarsEngine(CSVBaseWriterEngine):
     """Class to write CSVs to other file formats powered by Polars."""
 
-    def __init__(self, filepath, lenient=False):
-        """Initialize the CSVWriterPolarsEngine class."""
-        super().__init__(filepath, lenient=lenient)
-
-    def write_csv(self, export_filename=None, normalize_columns=False):
+    def write_csv(self, export_filename=None, normalize_columns=None):
         """
         Export a Polars dataframe to a CSV file.
 
         Args:
             export_filename (optional, str): The name of the output file.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.csv_export_filename, export_filename)
         df = CSVReaderPolarsEngine(self.filepath, lenient=self.lenient).to_dataframe(normalize_columns)
         df.write_csv(filename)
 
-    def write_excel(self, export_filename=None, normalize_columns=False):
+    def write_excel(self, export_filename=None, normalize_columns=None):
         """
         Export a Polars dataframe to an Excel file.
 
         Args:
             export_filename (optional, str): The name of the output file.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.excel_export_filename, export_filename)
         df = CSVReaderPolarsEngine(self.filepath, lenient=self.lenient).to_dataframe(normalize_columns)
         df.write_excel(filename)
 
-    def write_json(self, export_filename=None, normalize_columns=False):
+    def write_json(self, export_filename=None, normalize_columns=None):
         """
         Export a Polars dataframe to a JSON file.
 
         Args:
             export_filename (optional, str): The name of the output file.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.json_export_filename, export_filename)
         df = CSVReaderPolarsEngine(self.filepath, lenient=self.lenient).to_dataframe(normalize_columns)
         df.write_json(filename)
 
-    def write_json_newline_delimited(self, export_filename=None, normalize_columns=False):
+    def write_json_newline_delimited(self, export_filename=None, normalize_columns=None):
         """
         Export a Polars dataframe to a JSON newline delimited file.
 
         Args:
             export_filename (optional, str): The name of the output file.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.json_newline_export_filename, export_filename)
         df = CSVReaderPolarsEngine(self.filepath, lenient=self.lenient).to_dataframe(normalize_columns)
         df.write_ndjson(filename)
 
-    def write_parquet(self, export_filename=None, normalize_columns=False):
+    def write_parquet(self, export_filename=None, normalize_columns=None):
         """
         Export a Polars dataframe to a Parquet file.
 
         Args:
             export_filename (optional, str): The name of the output file.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.parquet_export_filename, export_filename)
         df = CSVReaderPolarsEngine(self.filepath, lenient=self.lenient).to_dataframe(normalize_columns)
         df.write_parquet(filename)
@@ -839,17 +896,18 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
         except Exception as e:
             raise e
 
-    def get_sample(self, normalize_columns=False):
+    def get_sample(self, normalize_columns=None):
         """
         Return a sample of the CSV file.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A Polars DataFrame containing the sample rows.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         table = self._create_table_sample(normalize_columns)
         # Convert to a Polars DataFrame for a consistent return type
         df = pl.from_arrow(table)
@@ -857,17 +915,18 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
             df = df.to_frame()
         return df
 
-    def to_dataframe(self, normalize_columns=False) -> pl.DataFrame:
+    def to_dataframe(self, normalize_columns=None) -> pl.DataFrame:
         """
         Converts CSV to a Polars dataframe.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A Polars dataframe.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         table = self._create_table(normalize_columns)
         df = pl.from_arrow(table)
         # Ensure we always return a DataFrame, not a Series
@@ -875,30 +934,31 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
             df = df.to_frame()
         return df
 
-    def to_arrow_table(self, normalize_columns=False):
+    def to_arrow_table(self, normalize_columns=None):
         """
         Converts CSV to a PyArrow table.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A PyArrow table.
         """
-        return self._create_table(normalize_columns)
+        return self._create_table(_resolve_normalize_columns(self.normalize_columns, normalize_columns))
 
-    def to_dicts(self, normalize_columns=False):
+    def to_dicts(self, normalize_columns=None):
         """
         Converts CSV to a list of Python dictionaries.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A list of dictionaries.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         table = self._create_table(normalize_columns)
         # Convert to Polars DataFrame and then to dicts
         df = pl.from_arrow(table)
@@ -906,27 +966,29 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
             df = df.to_frame()
         return df.to_dicts()
 
-    def query_data(self, sql_query, normalize_columns=False):
+    def query_data(self, sql_query, normalize_columns=None):
         """
-        Queries as CSV file after importing into DuckDB.
+        Queries a CSV file after importing into DuckDB.
 
         Args:
             sql_query (str): Query to run against DuckDB.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): ``None`` (default) inherits the
+                instance-level setting: the table is created in the configured
+                vocabulary, so the query is written and returned with the same
+                column names. An explicit bool keeps the legacy behavior: the
+                query runs against the original names and only the result
+                columns are renamed.
 
         Returns:
-            A DuckDB DuckDBPyRelation with the query results.
-
-        Example if DuckDB Engine:
-            dg = CSVReader('myfile.csv')
-            query = "SELECT col1, col2 FROM {dg.db_table}" # f string assumed
-            dg.query_csv_data(query)
+            A Polars DataFrame with the query results.
         """
         # The result is a fully-materialized polars DataFrame, so the
         # connection can be disposed deterministically (unlike the duckdb
         # engine, whose query_data returns a live relation).
         try:
+            if normalize_columns is None:
+                self.queries.create_table(normalize_columns=self.normalize_columns)
+                return self.queries.connection.sql(sql_query).pl()
             return self.queries.sql_query_to_dataframe(sql_query, normalize_columns)
         finally:
             self.queries.close()
@@ -934,10 +996,6 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
 
 class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
     """Class to write CSVs to other file formats powered by PyArrow."""
-
-    def __init__(self, filepath, lenient=False):
-        """Initialize the CSVWriterPyArrowEngine class."""
-        super().__init__(filepath, lenient=lenient)
 
     def _create_table(self, normalize_columns=False):
         """Create a PyArrow table for writing operations."""
@@ -994,29 +1052,31 @@ class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
         except Exception as e:
             raise e
 
-    def write_csv(self, export_filename=None, normalize_columns=False):
+    def write_csv(self, export_filename=None, normalize_columns=None):
         """
         Export a PyArrow table to a CSV file.
 
         Args:
             export_filename (optional, str): The name of the output file.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.csv_export_filename, export_filename)
         table = self._create_table(normalize_columns)
         # Use native PyArrow CSV writer - no dataframe conversion needed
         pacsv.write_csv(table, filename)
 
-    def write_excel(self, export_filename=None, normalize_columns=False):
+    def write_excel(self, export_filename=None, normalize_columns=None):
         """
         Export a PyArrow table to an Excel file.
 
         Args:
             export_filename (optional, str): The name of the output file.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.excel_export_filename, export_filename)
         table = self._create_table(normalize_columns)
         # Convert to Polars DataFrame for Excel export
@@ -1025,15 +1085,16 @@ class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
             df = df.to_frame()
         df.write_excel(filename)
 
-    def write_json(self, export_filename=None, normalize_columns=False):
+    def write_json(self, export_filename=None, normalize_columns=None):
         """
         Export a PyArrow table to a JSON file.
 
         Args:
             export_filename (optional, str): The name of the output file.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.json_export_filename, export_filename)
         table = self._create_table(normalize_columns)
         # Use native PyArrow iteration to avoid dataframe conversion
@@ -1044,15 +1105,16 @@ class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
         with open(filename, "w") as f:
             json.dump(records, f, indent=4)
 
-    def write_json_newline_delimited(self, export_filename=None, normalize_columns=False):
+    def write_json_newline_delimited(self, export_filename=None, normalize_columns=None):
         """
         Export a PyArrow table to a JSON newline delimited file.
 
         Args:
             export_filename (optional, str): The name of the output file.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.json_newline_export_filename, export_filename)
         table = self._create_table(normalize_columns)
         # Use native PyArrow iteration to avoid dataframe conversion
@@ -1061,15 +1123,16 @@ class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
                 record = {col: table[col][i].as_py() for col in table.column_names}
                 f.write(json.dumps(record) + "\n")
 
-    def write_parquet(self, export_filename=None, normalize_columns=False):
+    def write_parquet(self, export_filename=None, normalize_columns=None):
         """
         Export a PyArrow table to a Parquet file.
 
         Args:
             export_filename (optional, str): The name of the output file.
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.parquet_export_filename, export_filename)
         table = self._create_table(normalize_columns)
         # Use native PyArrow Parquet writer - no dataframe conversion needed
