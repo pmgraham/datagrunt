@@ -1,8 +1,25 @@
 """Tests for PDF component assembly."""
 
+import json
+from functools import cached_property
+
 import pytest
 
+from datagrunt.core.file_io import FileProperties
 from datagrunt.core.pdf_io import pdfcomponents
+
+# The public FileProperties surface that virtual-mode (JSON/dict) PDFComponents
+# must mirror. The cached_property flags are discovered dynamically, so a NEW
+# flag added to FileProperties automatically enters the sweep and fails if a
+# virtual-mode instance does not expose it (issue #153).
+FILE_PROPERTY_FLAGS = sorted(
+    name for name, attr in vars(FileProperties).items() if isinstance(attr, cached_property)
+)
+FILE_PROPERTY_INIT_ATTRS = [
+    "filepath", "filename", "extension", "extension_string",
+    "size_in_bytes", "size_in_kb", "size_in_mb", "size_in_gb", "size_in_tb",
+]
+FILE_PROPERTY_SURFACE = FILE_PROPERTY_FLAGS + FILE_PROPERTY_INIT_ATTRS
 
 
 @pytest.fixture
@@ -135,6 +152,43 @@ class TestPDFComponents:
 
         comp = pdfcomponents.PDFComponents(path)
         assert comp.total_pages == 0
+
+
+class TestVirtualFilePropertiesSurface:
+    """JSON/dict-mode PDFComponents must expose the full FileProperties surface.
+
+    Virtual-mode instances bypass FileProperties.__init__ and so lack the helper
+    objects the cached_property flags delegate to. The single shared initializer
+    must set every public FileProperties attribute; this sweep fails (rather than
+    failing in production with AttributeError) if a new attribute is unmirrored
+    (issue #153).
+    """
+
+    PARSED_DOC = {"document": {"pages": []}}
+
+    @pytest.fixture
+    def dict_mode(self):
+        return pdfcomponents.PDFComponents(dict(self.PARSED_DOC))
+
+    @pytest.fixture
+    def json_mode(self, tmp_path):
+        path = tmp_path / "doc.json"
+        path.write_text(json.dumps(self.PARSED_DOC))
+        return pdfcomponents.PDFComponents(str(path))
+
+    def test_surface_discovery_is_not_vacuous(self):
+        """The dynamic flag sweep must actually find the known flags."""
+        assert {"is_pdf", "is_csv", "is_large", "is_blank"} <= set(FILE_PROPERTY_FLAGS)
+
+    @pytest.mark.parametrize("attr", FILE_PROPERTY_SURFACE)
+    def test_dict_mode_exposes_attribute(self, dict_mode, attr):
+        """Accessing any FileProperties attribute on a dict-mode instance must not raise."""
+        getattr(dict_mode, attr)
+
+    @pytest.mark.parametrize("attr", FILE_PROPERTY_SURFACE)
+    def test_json_mode_exposes_attribute(self, json_mode, attr):
+        """Accessing any FileProperties attribute on a json-mode instance must not raise."""
+        getattr(json_mode, attr)
 
 
 class TestDedupeImages:
