@@ -174,4 +174,6 @@ scripts/
 # Gemini rules
 .geminirules
 
-
+# Rust prototype (rust/)
+rust/target/
+rust/benchmarks/data/
