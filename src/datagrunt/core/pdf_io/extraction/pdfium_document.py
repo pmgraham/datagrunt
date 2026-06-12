@@ -6,9 +6,12 @@ imported lazily.
 """
 
 import ctypes
+import logging
 from pathlib import Path
 
 from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, TextItem
+
+logger = logging.getLogger(__name__)
 
 PDF_EXTRA_HINT = "PDF parsing requires extra dependencies. Install with: pip install datagrunt[pdf]"
 
@@ -224,8 +227,9 @@ class PdfiumPage:
                         img.save(png_path, "PNG")
                     path.unlink()
                     return png_path
-                except Exception:
+                except Exception:  # noqa: BLE001 - PIL raises many types; fall back to bitmap
                     # PIL failed (e.g. missing format plugin), clean up and fall back to bitmap
+                    logger.debug("PIL conversion of %s failed; falling back to bitmap", path, exc_info=True)
                     try:
                         path.unlink()
                     except OSError:
@@ -241,8 +245,8 @@ class PdfiumPage:
                 png_path = base.with_suffix(".png")
                 img.save(png_path, "PNG")
                 return png_path
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001 - bitmap fallback is best-effort; return no image
+            logger.debug("Bitmap image extraction failed for %s; no image emitted", base, exc_info=True)
 
         return None
 

@@ -275,7 +275,9 @@ class ParsedDocument:
                             md_dir = Path(export_filename).parent.resolve()
                             abs_img_path = Path(path).resolve()
                             path = os.path.relpath(abs_img_path, md_dir)
-                        except Exception:
+                        except (OSError, ValueError):
+                            # resolve()/relpath can fail (unresolvable path, or a
+                            # cross-drive relpath on Windows); keep the original path.
                             pass
                     blocks.append(f"![{Path(path).name or 'image'}]({path})")
                 elif isinstance(content, str) and content.strip():
