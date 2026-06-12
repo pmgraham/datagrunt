@@ -174,20 +174,27 @@ class DuckDBQueries:
     def _set_database_table_name(self):
         """Return a unique, deterministic table name for this file.
 
-        The name combines the sanitized file stem with a short hash of the
-        file's absolute path. The hash is deterministic, so every
-        DuckDBQueries instance created for the same file agrees on the same
-        table name (callers can therefore still reference ``db_table`` in
-        their queries). At the same time, two different files that happen to
-        share a stem (e.g. ``dirA/data.csv`` and ``dirB/data.csv``) resolve
-        to distinct tables and cannot overwrite each other.
+        The name combines a constant ``tbl_`` prefix with the sanitized file
+        stem and a short hash of the file's absolute path. The hash is
+        deterministic, so every DuckDBQueries instance created for the same
+        file agrees on the same table name (callers can therefore still
+        reference ``db_table`` in their queries). At the same time, two
+        different files that happen to share a stem (e.g. ``dirA/data.csv``
+        and ``dirB/data.csv``) resolve to distinct tables and cannot overwrite
+        each other.
+
+        The ``tbl_`` prefix guarantees the name starts with a letter. The table
+        name is interpolated unquoted into every query, and DuckDB rejects an
+        unquoted identifier that begins with a digit, so a numeric-leading
+        filename (e.g. ``2026_sales.csv``) would otherwise produce a
+        ParserException (issue #149).
 
         Returns:
             str: The unique table name.
         """
         stem = self._format_filename_string()
         path_hash = hashlib.sha1(str(self.filepath.resolve()).encode()).hexdigest()[:8]  # noqa: E501
-        return f"{stem}_{path_hash}"
+        return f"tbl_{stem}_{path_hash}"
 
     def set_export_filename(self, default_filename, export_filename=None):
         """
