@@ -7,6 +7,32 @@ from datagrunt.core import (
     CSVRows,
     CSVStringSample,
 )
+from datagrunt.core.csv_io.csvcomponents import _is_legacy_mac_newlines
+
+
+class TestLegacyMacNewlineProbe:
+    """_is_legacy_mac_newlines narrows to OSError (issue #151).
+
+    The probe is a best-effort binary read; an unreadable file must still fall
+    back to ``False`` (not legacy-mac), while any non-OSError is now a real bug
+    that propagates instead of being silently swallowed.
+    """
+
+    def test_missing_file_returns_false(self, tmp_path):
+        """A missing/unreadable path is caught as OSError and yields False."""
+        assert _is_legacy_mac_newlines(tmp_path / "does_not_exist.csv") is False
+
+    def test_legacy_mac_file_detected(self, tmp_path):
+        """A genuine \\r-only file is still detected as legacy-mac."""
+        mac_file = tmp_path / "legacy.csv"
+        mac_file.write_bytes(b"a,b,c\r1,2,3\r4,5,6")
+        assert _is_legacy_mac_newlines(mac_file) is True
+
+    def test_unix_file_not_detected(self, tmp_path):
+        """A normal \\n file is not legacy-mac."""
+        unix_file = tmp_path / "unix.csv"
+        unix_file.write_bytes(b"a,b,c\n1,2,3\n")
+        assert _is_legacy_mac_newlines(unix_file) is False
 
 
 class TestCSVStringSample:

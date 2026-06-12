@@ -2,6 +2,7 @@
 
 # standard library
 import csv
+import logging
 import re
 from collections import Counter, OrderedDict
 from functools import cached_property
@@ -12,6 +13,8 @@ import polars as pl
 
 # local libraries
 from datagrunt.core.file_io import FileProperties
+
+logger = logging.getLogger(__name__)
 
 
 def _count_leading_comments(filepath):
@@ -65,7 +68,9 @@ def _is_legacy_mac_newlines(filepath):
         with open(filepath, "rb") as f:
             chunk = f.read(4096)
         return b"\r" in chunk and b"\n" not in chunk
-    except Exception:
+    except OSError:
+        # Unreadable/missing file: treat as not legacy-mac and let the real
+        # read surface the error. Any other exception is a bug worth raising.
         return False
 
 
@@ -103,8 +108,8 @@ def _check_csv_ragged_and_warn(filepath, delimiter):
                     return True
                 if row_count >= 10000:
                     break
-    except Exception:
-        pass
+    except Exception:  # noqa: BLE001 - best-effort ragged-row warning; never break a read
+        logger.debug("Ragged-row check failed for %s; skipping warning", filepath, exc_info=True)
     return False
 
 
@@ -151,8 +156,8 @@ class CSVStringSample:
                             if len(lines) >= self.SAMPLE_ROWS + 1:
                                 break
                 return "".join(lines)
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001 - best-effort legacy-mac sample; fall back to polars
+                logger.debug("Legacy-mac sample read failed for %s; using polars", self.filepath, exc_info=True)
         df = pl.read_csv(
             self.filepath,
             separator=self.delimiter,
@@ -518,8 +523,8 @@ class CSVColumns:
 
                             reader = csv.reader([line], delimiter=self.delimiter)
                             return next(reader)
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001 - best-effort legacy-mac header; fall back to polars
+                logger.debug("Legacy-mac column read failed for %s; using polars", self.filepath, exc_info=True)
         df = pl.read_csv(
             self.filepath,
             separator=self.delimiter,

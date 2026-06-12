@@ -2,6 +2,7 @@
 
 # standard library
 import hashlib
+import logging
 import re
 from functools import cached_property
 from pathlib import Path
@@ -17,6 +18,8 @@ from datagrunt.core.csv_io import (
     _check_csv_ragged_and_warn,
     _count_leading_physical_lines_before_header,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class DuckDBQueries:
@@ -91,7 +94,8 @@ class DuckDBQueries:
         """Get the quote character."""
         try:
             return CSVDialect(self.filepath).quotechar
-        except Exception:
+        except Exception:  # noqa: BLE001 - dialect sniffing is best-effort; default to "
+            logger.debug("Quote-char sniffing failed for %s; defaulting to double quote", self.filepath, exc_info=True)
             return '"'
 
     @staticmethod
