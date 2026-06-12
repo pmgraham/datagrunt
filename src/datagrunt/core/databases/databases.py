@@ -315,9 +315,9 @@ class DuckDBQueries:
             from datagrunt.core.csv_io import CSVColumns
 
             cols = CSVColumns(self.filepath, delimiter=self.delimiter).columns
-            cols_param = "{" + ", ".join(f"'{c}': 'VARCHAR'" for c in cols) + "}"
-            read_csv = f"""read_csv('{self.filepath}',
-                                delim='{self.delimiter}',
+            cols_param = self._build_lenient_columns_param(cols)
+            read_csv = f"""read_csv('{self._escaped_filepath_literal}',
+                                delim='{self._escape_sql_literal(self.delimiter)}',
                                 header=true,
                                 columns={cols_param},
                                 quote='{self.quotechar.replace("'", "''")}',
@@ -327,10 +327,10 @@ class DuckDBQueries:
                                 strict_mode=false,
                                 skip={self.skip_rows})"""
         else:
-            read_csv = f"""read_csv('{self.filepath}',
+            read_csv = f"""read_csv('{self._escaped_filepath_literal}',
                                 auto_detect=true,
                                 comment='',
-                                delim='{self.delimiter}',
+                                delim='{self._escape_sql_literal(self.delimiter)}',
                                 header=true,
                                 quote='{self.quotechar.replace("'", "''")}',
                                 null_padding=true,
