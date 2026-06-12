@@ -62,6 +62,11 @@ fn row_count_with_header(path: PathBuf, delimiter: &str) -> PyResult<u64> {
     datagrunt_core::rows::row_count_with_header(&path, delimiter_byte(delimiter)?).map_err(oserr)
 }
 
+#[pyfunction]
+fn check_ragged(path: PathBuf, delimiter: &str) -> PyResult<bool> {
+    Ok(datagrunt_core::ragged::check_ragged(&path, delimiter_byte(delimiter)?))
+}
+
 #[pymodule]
 fn datagrunt_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(is_legacy_mac_newlines, m)?)?;
@@ -72,5 +77,6 @@ fn datagrunt_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(normalize_columns, m)?)?;
     m.add_function(wrap_pyfunction!(infer_delimiter, m)?)?;
     m.add_function(wrap_pyfunction!(row_count_with_header, m)?)?;
+    m.add_function(wrap_pyfunction!(check_ragged, m)?)?;
     Ok(())
 }
