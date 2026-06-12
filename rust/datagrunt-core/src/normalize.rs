@@ -4,8 +4,10 @@ use std::collections::HashSet;
 
 const EMPTY_NAME_PLACEHOLDER: &str = "column";
 
-/// Python: lower(); [^a-z0-9]+ -> "_"; strip "_"; collapse "_+"; "" ->
-/// "column"; leading digit -> "_"-prefix.
+/// Fused single-pass equivalent of Python's three-regex pipeline: lowercase,
+/// replace each run of non-[a-z0-9] chars with one "_" (which also makes the
+/// separate "_+" collapse a no-op), strip edge "_", map "" to "column", and
+/// prefix a leading digit with "_".
 fn normalize_single(name: &str) -> String {
     let lower = name.to_lowercase();
     // Replace each maximal run of non-[a-z0-9] chars with one underscore.
