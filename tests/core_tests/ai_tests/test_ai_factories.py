@@ -7,6 +7,10 @@ import pytest
 from datagrunt.core.ai.engines import GoogleAIEngine
 from datagrunt.core.ai.factories import AIEngineFactory
 
+# The AI/LLM surface is deprecated (issue #144); suppress the construction
+# warning here. It is asserted explicitly in TestAIFactoryDeprecation.
+pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
+
 
 class TestAIEngineFactory:
     """Test suite for AIEngineFactory class."""
@@ -143,3 +147,12 @@ class TestAIEngineFactory:
         for engine_name in test_cases:
             factory = AIEngineFactory(api_key="test_key", engine=engine_name)
             assert factory.engine == "google"
+
+
+class TestAIFactoryDeprecation:
+    """AIEngineFactory must warn on construction until removal (issue #144)."""
+
+    def test_ai_engine_factory_construction_warns(self):
+        """Constructing AIEngineFactory emits a DeprecationWarning."""
+        with pytest.warns(DeprecationWarning, match="deprecated"):
+            AIEngineFactory(api_key="test_key", engine="google")

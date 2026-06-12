@@ -17,7 +17,7 @@ Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow
 - **Flexible Data Transformation:** Easily convert your processed CSV data into various formats including CSV, Excel, JSON, JSONL, and Parquet.
 - **Robust by Default:** Fail-fast validation with clear errors (invalid engine names, missing paths, directories, encrypted PDFs), graceful handling of empty files, no `UnicodeDecodeError` when constructing a reader over a non-UTF-8 file, and sane comment semantics — only leading `#` lines are treated as comments, so `#`-prefixed data rows such as hex colors are preserved on all engines.
 - **PDF Parsing & OCR:** Extract text, tables, and images from PDF files as dicts, DataFrames, or JSON, with optional [Tesseract](https://github.com/tesseract-ocr/tesseract) OCR for scanned pages. Powered by the permissively-licensed **PDFium** engine by default, with **PyMuPDF** available as an alternative.
-- **AI-Powered Schema Analysis:** Use Google's Gemini models to automatically generate detailed schema reports for your CSV files, including data types, column classifications, and data quality checks.
+- **AI-Powered Schema Analysis (deprecated):** Use Google's Gemini models to automatically generate detailed schema reports for your CSV files. _Deprecated in 3.3.0, removed in 4.0.0 — see [#144](https://github.com/pmgraham/datagrunt/issues/144)._
 - **Pythonic API:** Enjoy a clean and intuitive API that integrates seamlessly into your existing Python workflows.
 
 ### Powertools Under The Hood
@@ -26,7 +26,7 @@ Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow
 | [DuckDB](https://duckdb.org)| Fast in-process analytical database with excellent SQL support |
 | [Polars](https://pola.rs) | Multi-threaded DataFrame library written in Rust, optimized for performance |
 | [PyArrow](https://arrow.apache.org/docs/python/) | Python bindings for Apache Arrow with efficient columnar data processing |
-| [Google Gemini](https://deepmind.google/technologies/gemini/) | A powerful family of generative AI models for schema analysis |
+| [Google Gemini](https://deepmind.google/technologies/gemini/) | A powerful family of generative AI models for schema analysis (deprecated — removed in 4.0.0, see [#144](https://github.com/pmgraham/datagrunt/issues/144)) |
 | [PDFium](https://github.com/pypdfium2-team/pypdfium2) | Default PDF engine (via `pypdfium2`) — permissively licensed (BSD-3 / Apache-2.0); fast text + image extraction, with a structured mode at parity with PyMuPDF |
 | [pdfplumber](https://github.com/jsvine/pdfplumber) | Table detection and extraction (MIT), shared by both PDF engines |
 | [PyMuPDF](https://pymupdf.readthedocs.io/) | Alternative PDF engine for text, tables, and images (AGPL-3.0 / commercial) |
@@ -146,6 +146,9 @@ Every `write_*` method — including `write_parquet` — honors `lenient=True` f
 ragged CSVs, and empty source files produce empty output instead of an error.
 
 ### AI-Powered Schema Analysis
+
+> [!WARNING]
+> **Deprecated.** The AI/LLM features (`CSVSchemaReportAIGenerated` and `datagrunt.core.ai`) are deprecated as of **3.3.0** and will be **removed in 4.0.0**. Constructing these classes now emits a `DeprecationWarning`. See [#144](https://github.com/pmgraham/datagrunt/issues/144).
 
 ```python
 from datagrunt import CSVSchemaReportAIGenerated
