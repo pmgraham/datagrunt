@@ -17,6 +17,7 @@
 //! binding layer applies (Task 10); they are not part of this core struct.
 
 use fancy_regex::Regex;
+use std::sync::LazyLock;
 
 /// The four data-driven facts `csv.Sniffer().sniff` derives from a sample.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,13 +87,22 @@ const QUOTE_PATTERNS: [(&str, bool); 4] = [
     ),
 ];
 
+/// Compiled forms of QUOTE_PATTERNS. Initialized once; avoids per-call `Regex::new`.
+static COMPILED_QUOTE_PATTERNS: LazyLock<[(Regex, bool); 4]> = LazyLock::new(|| {
+    QUOTE_PATTERNS.map(|(pattern, has_groups)| {
+        (
+            Regex::new(pattern).expect("static sniffer pattern is valid"),
+            has_groups,
+        )
+    })
+});
+
 fn guess_quote_and_delimiter(data: &str, delimiters: Option<&str>) -> QuoteGuess {
     // (quote, delim, space) per non-overlapping match, plus whether the winning
     // pattern even has delim/space groups. First pattern with ANY match wins.
     let mut matches: Vec<(String, Option<String>, Option<String>)> = Vec::new();
     let mut has_delim_groups = false;
-    for (pattern, has_groups) in QUOTE_PATTERNS {
-        let regexp = Regex::new(pattern).expect("static sniffer pattern is valid");
+    for (regexp, has_groups) in COMPILED_QUOTE_PATTERNS.iter() {
         let mut found = Vec::new();
         for caps in regexp.captures_iter(data) {
             let caps = caps.expect("capture iteration");
@@ -105,7 +115,7 @@ fn guess_quote_and_delimiter(data: &str, delimiters: Option<&str>) -> QuoteGuess
         }
         if !found.is_empty() {
             matches = found;
-            has_delim_groups = has_groups;
+            has_delim_groups = *has_groups;
             break;
         }
     }
@@ -167,7 +177,8 @@ fn guess_quote_and_delimiter(data: &str, delimiters: Option<&str>) -> QuoteGuess
     }
 
     // Doubled-quote detection. Built even for empty delim (re.escape("") == "").
-    // MULTILINE only, RAW quotechar, fancy_regex::escape on the delim.
+    // MULTILINE only; unescaped quotechar (only ever `"` or `'`, both regex-safe;
+    // CPython's re.escape is likewise a no-op for them), fancy_regex::escape on the delim.
     let escaped_delim = fancy_regex::escape(&delim);
     let dq_pattern = format!(
         r"(?m)(({delim})|^)\W*{quote}[^{delim}\n]*{quote}[^{delim}\n]*{quote}\W*(({delim})|$)",
@@ -235,7 +246,7 @@ fn guess_delimiter(data: &str, delimiters: Option<&str>) -> (String, bool) {
                     Some((_, meta)) => meta,
                     None => {
                         char_frequency.push((ch, Vec::new()));
-                        &mut char_frequency.last_mut().unwrap().1
+                        &mut char_frequency.last_mut().expect("just pushed, cannot be empty").1
                     }
                 };
                 match meta.iter_mut().find(|(f, _)| *f == freq) {
@@ -337,7 +348,7 @@ fn guess_delimiter(data: &str, delimiters: Option<&str>) -> (String, bool) {
             .then(a.1.cmp(&b.1))
             .then(a.2.cmp(&b.2))
     });
-    let delim = items.last().unwrap().2;
+    let delim = items.last().expect("delims non-empty after preference scan").2;
     let sis = skipinitialspace_for(lines[0], delim);
     (delim.to_string(), sis)
 }
@@ -347,7 +358,7 @@ fn guess_delimiter(data: &str, delimiters: Option<&str>) -> (String, bool) {
 pub fn sniff(sample: &str, delimiters: Option<&str>) -> Option<SniffedDialect> {
     let quote_guess = guess_quote_and_delimiter(sample, delimiters);
 
-    let (delimiter, doublequote, mut quotechar, mut skipinitialspace) = if quote_guess
+    let (delimiter, doublequote, mut quotechar, skipinitialspace) = if quote_guess
         .delimiter
         .is_empty()
     {
@@ -371,10 +382,6 @@ pub fn sniff(sample: &str, delimiters: Option<&str>) -> Option<SniffedDialect> {
     if quotechar.is_empty() {
         quotechar = "\"".to_string();
     }
-
-    // The doublequote/skipinitialspace from a successful quote guess are kept
-    // as computed above; this rebind exists only to satisfy the borrow shape.
-    let _ = &mut skipinitialspace;
 
     Some(SniffedDialect {
         delimiter,
