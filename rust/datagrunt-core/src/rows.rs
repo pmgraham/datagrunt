@@ -63,12 +63,10 @@ pub fn count_leading_physical_lines_before_header(path: &Path) -> std::io::Resul
 /// Python's `open(..., newline=None)` translates `\r` → `\n` before the CSV
 /// parser sees anything; `newline=""` passes `\r` through raw.
 pub(crate) fn csv_text(path: &Path) -> std::io::Result<String> {
+    // Probe newline style first (4 KiB read), like Python, then decode once.
+    let legacy_mac = is_legacy_mac_newlines(path);
     let raw = read_decoded(path)?;
-    Ok(if is_legacy_mac_newlines(path) {
-        universal_newlines(&raw)
-    } else {
-        raw
-    })
+    Ok(if legacy_mac { universal_newlines(&raw) } else { raw })
 }
 
 /// Build a `csv::Reader` configured to match Python's `csv.reader` behaviour:
@@ -103,6 +101,9 @@ pub fn row_count_with_header(path: &Path, delimiter: u8) -> std::io::Result<u64>
     let text = csv_text(path)?;
     let mut count = 0u64;
     for record in csv_reader(&text, delimiter).records() {
+        // Err is unreachable today: in-memory pre-decoded UTF-8 source (no IO
+        // or UTF-8 errors) and flexible=true (no UnequalLengths). Skipping
+        // mirrors Python's csv.reader, which never errors on row shape.
         let Ok(record) = record else { continue };
         if !skip_record(&record) {
             count += 1;
