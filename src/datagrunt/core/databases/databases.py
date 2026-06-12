@@ -533,6 +533,9 @@ class DuckDBQueries:
             _check_csv_ragged_and_warn(self.filepath, self.delimiter)
         # Ensure the table is created with original column names for querying
         self.connection.sql(self.import_csv_query())
+        # The raw import above replaced the table with original column names;
+        # record that so create_table cannot wrongly reuse a "normalized" table.
+        self._imported_normalize_columns = False
 
         # Execute the user's query
         result_df = self.connection.sql(sql_query).pl()
