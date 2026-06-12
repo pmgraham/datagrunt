@@ -156,3 +156,53 @@ class TestCreateTableIdempotent:
         relation = queries.create_table()
         assert relation.fetchall() == [("1", "A"), ("2", "B")]
         queries.close()
+
+
+class TestNumericLeadingFilename:
+    """Numeric-leading filenames must yield a valid unquoted table name (#149).
+
+    DuckDB rejects unquoted identifiers that start with a digit, and the table
+    name is interpolated bare into every query. A file like ``123_data.csv``
+    must therefore still import, query, and export on the duckdb engine.
+    """
+
+    def test_table_name_starts_with_letter(self, tmp_path):
+        """The generated table name must not start with a digit."""
+        csv_file = tmp_path / "123_data.csv"
+        csv_file.write_text("name,age\nalice,30\nbob,25\n")
+
+        queries = DuckDBQueries(str(csv_file))
+        assert not queries.database_table_name[0].isdigit()
+
+    def test_numeric_leading_filename_imports_and_queries(self, tmp_path):
+        """A numeric-leading filename must import and SELECT without a ParserError."""
+        csv_file = tmp_path / "2026_sales.csv"
+        csv_file.write_text("name,age\nalice,30\nbob,25\n")
+
+        queries = DuckDBQueries(str(csv_file))
+        queries.connection.execute(queries.import_csv_query())
+        res = queries.connection.execute(queries.select_from_duckdb_table()).fetchall()
+        assert res == [("alice", "30"), ("bob", "25")]
+        queries.close()
+
+    def test_numeric_leading_filename_exports(self, tmp_path):
+        """A numeric-leading filename must export via a COPY builder."""
+        csv_file = tmp_path / "01_export.csv"
+        csv_file.write_text("name,age\nalice,30\n")
+
+        queries = DuckDBQueries(str(csv_file))
+        queries.create_table()
+        out = tmp_path / "out.csv"
+        queries.connection.execute(queries.export_csv_query(str(out)))
+        assert out.exists()
+        assert "alice" in out.read_text()
+        queries.close()
+
+    def test_table_name_deterministic_across_instances(self, tmp_path):
+        """Two instances for the same numeric-leading path agree on the name."""
+        csv_file = tmp_path / "123_data.csv"
+        csv_file.write_text("name,age\nalice,30\n")
+
+        first = DuckDBQueries(str(csv_file))
+        second = DuckDBQueries(str(csv_file))
+        assert first.database_table_name == second.database_table_name
