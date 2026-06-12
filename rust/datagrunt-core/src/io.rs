@@ -43,6 +43,227 @@ pub fn read_decoded(path: &Path) -> std::io::Result<String> {
     Ok(decode_ignore(body))
 }
 
+/// Streaming equivalent of [`read_decoded`] (+ optional universal-newline
+/// translation): BOM stripped at offset 0, invalid UTF-8 bytes dropped
+/// (errors="ignore"), reading the underlying file in 64 KiB chunks so
+/// consumers that stop early never pay for the rest of the file.
+///
+/// Implements [`std::io::Read`] so the `csv` crate (or any `BufReader`) can
+/// pull decoded bytes lazily. Output is byte-for-byte identical to
+/// `read_decoded(path)` (translate_newlines = false) or
+/// `universal_newlines(&read_decoded(path))` (translate_newlines = true).
+pub struct DecodedReader {
+    inner: BufReader<File>,
+    translate_newlines: bool, // \r\n -> \n and lone \r -> \n when true
+    /// Un-emitted bytes carried to the next chunk: either an incomplete UTF-8
+    /// sequence (<=3 bytes) truncated at a chunk boundary, or a pending `\r`
+    /// awaiting its successor byte (translation needs 1-byte lookahead).
+    carry: Vec<u8>,
+    /// Decoded bytes produced but not yet handed to the caller's buffer.
+    pending: Vec<u8>,
+    pending_pos: usize,
+    bom_checked: bool,
+    eof: bool,
+}
+
+impl DecodedReader {
+    /// Open `path` for streaming decoded reads. `translate_newlines` mirrors
+    /// Python's `newline=None` (true) vs `newline=""` (false).
+    pub fn open(path: &Path, translate_newlines: bool) -> std::io::Result<Self> {
+        Ok(DecodedReader {
+            inner: BufReader::new(File::open(path)?),
+            translate_newlines,
+            carry: Vec::new(),
+            pending: Vec::new(),
+            pending_pos: 0,
+            bom_checked: false,
+            eof: false,
+        })
+    }
+
+    /// Read the next raw chunk from the file into `chunk`. Returns bytes read
+    /// (0 at EOF). Strips a leading BOM exactly once, at file offset 0.
+    fn read_chunk(&mut self, chunk: &mut Vec<u8>) -> std::io::Result<usize> {
+        chunk.clear();
+        chunk.resize(CHUNK_SIZE, 0);
+        let n = self.inner.read(&mut chunk[..])?;
+        chunk.truncate(n);
+        if n == 0 {
+            self.eof = true;
+        }
+        Ok(n)
+    }
+
+    /// Refill `pending` with the next decoded chunk. Returns false at true EOF
+    /// (nothing more will ever be produced), true if it appended output.
+    ///
+    /// On the first call enough bytes are buffered to settle the BOM question
+    /// (a file shorter than 3 bytes at offset 0 cannot be a BOM, so whatever is
+    /// there is emitted). Thereafter each call: prepends `carry`, decodes
+    /// errors="ignore" up to the last complete UTF-8 boundary, carries an
+    /// incomplete trailing sequence, then (if translating) folds newlines while
+    /// holding back a trailing `\r` for lookahead.
+    fn refill(&mut self) -> std::io::Result<bool> {
+        loop {
+            if self.eof {
+                return self.flush_carry_at_eof();
+            }
+
+            let mut chunk = Vec::new();
+            self.read_chunk(&mut chunk)?;
+
+            if !self.bom_checked {
+                // Accumulate into `carry` until we have >=3 bytes or hit EOF,
+                // so a BOM split across the first reads is still recognised.
+                self.carry.extend_from_slice(&chunk);
+                if self.carry.len() < BOM.len() && !self.eof {
+                    continue;
+                }
+                if self.carry.starts_with(BOM) {
+                    self.carry.drain(..BOM.len());
+                }
+                self.bom_checked = true;
+                chunk = std::mem::take(&mut self.carry);
+            } else if !self.carry.is_empty() {
+                // Prepend carried bytes (incomplete UTF-8 seq and/or pending \r).
+                let mut merged = std::mem::take(&mut self.carry);
+                merged.extend_from_slice(&chunk);
+                chunk = merged;
+            }
+
+            if self.eof {
+                return self.flush_carry_at_eof_with(chunk);
+            }
+            if chunk.is_empty() {
+                continue;
+            }
+
+            // Decode errors="ignore", carrying an incomplete trailing sequence.
+            let decoded = self.decode_carry_tail(&chunk);
+            let translated = self.translate_carry_tail(decoded);
+            if translated.is_empty() {
+                // Everything became carry (e.g. a lone trailing \r); read on.
+                continue;
+            }
+            self.pending = translated.into_bytes();
+            self.pending_pos = 0;
+            return Ok(true);
+        }
+    }
+
+    /// Decode `bytes` with errors="ignore". If the final bytes are an
+    /// incomplete (but not yet invalid) multibyte sequence, push them onto
+    /// `self.carry` for the next chunk instead of decoding them now.
+    fn decode_carry_tail(&mut self, bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len());
+        let mut rest = bytes;
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(s) => {
+                    out.push_str(s);
+                    break;
+                }
+                Err(e) => {
+                    let (valid, after) = rest.split_at(e.valid_up_to());
+                    // SAFETY: `from_utf8` validated `0..valid_up_to()`.
+                    out.push_str(unsafe { std::str::from_utf8_unchecked(valid) });
+                    match e.error_len() {
+                        // Truly invalid: drop the offending bytes and continue.
+                        Some(skip) => rest = &after[skip..],
+                        // Incomplete at the end of the chunk (<=3 bytes): not
+                        // invalid yet, carry it forward and stop decoding.
+                        None => {
+                            self.carry.extend_from_slice(after);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Apply universal-newline translation when enabled, holding back a single
+    /// trailing `\r` because it needs 1-byte lookahead to distinguish `\r\n`
+    /// from a lone `\r`. The `\r` is carried as a RAW byte and stripped from the
+    /// decoded text BEFORE translation, so `universal_newlines` never sees it
+    /// (it would otherwise map a chunk-final lone `\r` to `\n` prematurely).
+    fn translate_carry_tail(&mut self, mut decoded: String) -> String {
+        if !self.translate_newlines {
+            return decoded;
+        }
+        if decoded.ends_with('\r') {
+            decoded.pop();
+            // Prepend so the source byte order is preserved if an incomplete
+            // UTF-8 tail was already carried by `decode_carry_tail` (the `\r`
+            // precedes that tail in the original stream).
+            self.carry.insert(0, b'\r');
+        }
+        universal_newlines(&decoded)
+    }
+
+    /// At true EOF with no incoming chunk: emit whatever remains in `carry`.
+    /// An incomplete UTF-8 tail is dropped (matching Python's errors="ignore"
+    /// at EOF); a carried trailing `\r` becomes `\n` under translation.
+    fn flush_carry_at_eof(&mut self) -> std::io::Result<bool> {
+        if self.carry.is_empty() {
+            return Ok(false);
+        }
+        let carry = std::mem::take(&mut self.carry);
+        self.emit_eof_carry(carry)
+    }
+
+    /// EOF reached while merging a final `chunk` with `carry`.
+    fn flush_carry_at_eof_with(&mut self, chunk: Vec<u8>) -> std::io::Result<bool> {
+        if !self.bom_checked {
+            // File ended before 3 bytes; `chunk` already absorbed `carry` above.
+            self.bom_checked = true;
+        }
+        self.emit_eof_carry(chunk)
+    }
+
+    /// Decode + translate a final byte run at EOF. A pending `\r` carried from a
+    /// previous chunk that is still trailing becomes `\n`; an incomplete UTF-8
+    /// tail is dropped.
+    fn emit_eof_carry(&mut self, bytes: Vec<u8>) -> std::io::Result<bool> {
+        if bytes.is_empty() {
+            return Ok(false);
+        }
+        // Decode dropping any incomplete tail (errors="ignore" at EOF).
+        let decoded = decode_ignore(&bytes);
+        let out = if self.translate_newlines {
+            universal_newlines(&decoded)
+        } else {
+            decoded
+        };
+        if out.is_empty() {
+            return Ok(false);
+        }
+        self.pending = out.into_bytes();
+        self.pending_pos = 0;
+        Ok(true)
+    }
+}
+
+impl Read for DecodedReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // Refill `pending` until we have output or reach true exhaustion.
+        while self.pending_pos >= self.pending.len() {
+            if !self.refill()? {
+                return Ok(0);
+            }
+        }
+        let available = &self.pending[self.pending_pos..];
+        let n = available.len().min(buf.len());
+        buf[..n].copy_from_slice(&available[..n]);
+        self.pending_pos += n;
+        Ok(n)
+    }
+}
+
 /// Streaming version of Python text-mode iteration (universal newlines,
 /// utf-8-sig, errors="ignore"). Reads in 64 KiB chunks; callers that stop
 /// early never pay for the rest of the file.
@@ -331,6 +552,151 @@ mod tests {
             expected.pop();
         }
         assert_eq!(streamed, expected);
+    }
+
+    /// Drain a `DecodedReader` fully into a String, using `read_to_string` so
+    /// the caller buffering matches a realistic large-read consumer.
+    fn drain(path: &Path, translate: bool) -> String {
+        let mut s = String::new();
+        DecodedReader::open(path, translate)
+            .unwrap()
+            .read_to_string(&mut s)
+            .unwrap();
+        s
+    }
+
+    /// Drain one byte at a time to stress the Read impl under tiny buffers.
+    fn drain_byte_by_byte(path: &Path, translate: bool) -> Vec<u8> {
+        let mut reader = DecodedReader::open(path, translate).unwrap();
+        let mut out = Vec::new();
+        let mut one = [0u8; 1];
+        loop {
+            match reader.read(&mut one).unwrap() {
+                0 => break,
+                _ => out.push(one[0]),
+            }
+        }
+        out
+    }
+
+    /// Reference eager output: read_decoded (+ optional universal_newlines).
+    fn eager(path: &Path, translate: bool) -> String {
+        let raw = read_decoded(path).unwrap();
+        if translate {
+            universal_newlines(&raw)
+        } else {
+            raw
+        }
+    }
+
+    #[test]
+    fn decoded_reader_matches_read_decoded_basic() {
+        let f = tmp(b"\xef\xbb\xbfa,b\n1,2\n", ".csv");
+        assert_eq!(drain(f.path(), false), "a,b\n1,2\n");
+        assert_eq!(drain(f.path(), true), "a,b\n1,2\n");
+    }
+
+    #[test]
+    fn decoded_reader_bom_split_across_first_reads() {
+        // A file whose first chunk is shorter than 3 bytes: feed exactly the
+        // BOM in two short reads by making the file the BOM + body. (The reader
+        // accumulates until it can settle the BOM question.)
+        let f = tmp(b"\xef\xbb\xbfhello", ".csv");
+        assert_eq!(drain(f.path(), false), "hello");
+        // Partial BOM at offset 0 that is NOT a BOM must be emitted verbatim.
+        let g = tmp(b"\xef\xbb", ".csv"); // 2 bytes: incomplete BOM, also invalid UTF-8
+        // errors="ignore" drops the incomplete tail at EOF, matching read_decoded.
+        assert_eq!(drain(g.path(), false), eager(g.path(), false));
+        // A 2-byte valid-UTF8 non-BOM start must round-trip.
+        let h = tmp(b"ab", ".csv");
+        assert_eq!(drain(h.path(), false), "ab");
+    }
+
+    #[test]
+    fn decoded_reader_invalid_utf8_spanning_chunk_boundary() {
+        // Place the 2-byte prefix of a 3-byte char (\xe2\x82, prefix of € =
+        // \xe2\x82\xac) so the byte at CHUNK_SIZE-1 starts an incomplete
+        // sequence completed by the next chunk. Must decode as one '€'.
+        let mut content = vec![b'a'; CHUNK_SIZE - 1];
+        content.extend_from_slice("€".as_bytes()); // \xe2 at idx CHUNK_SIZE-1
+        content.extend_from_slice(b"tail");
+        let f = tmp(&content, ".csv");
+        let out = drain(f.path(), false);
+        assert_eq!(out, eager(f.path(), false));
+        assert!(out.contains('€'));
+        assert_eq!(out.len(), (CHUNK_SIZE - 1) + "€".len() + 4);
+    }
+
+    #[test]
+    fn decoded_reader_cr_at_chunk_boundary_with_lf_next() {
+        // \r at the last byte of chunk 1, \n as the first byte of chunk 2 under
+        // translation must collapse to exactly ONE \n.
+        let mut content = vec![b'a'; CHUNK_SIZE - 1];
+        content.extend_from_slice(b"\r\nb"); // \r at CHUNK_SIZE-1, \n at CHUNK_SIZE
+        let f = tmp(&content, ".csv");
+        let out = drain(f.path(), true);
+        assert_eq!(out, eager(f.path(), true));
+        // exactly one newline, no stray \r.
+        assert_eq!(out.matches('\n').count(), 1);
+        assert!(!out.contains('\r'));
+    }
+
+    #[test]
+    fn decoded_reader_cr_at_eof_under_translation() {
+        let f = tmp(b"a\rb\r", ".csv");
+        assert_eq!(drain(f.path(), true), "a\nb\n");
+        // Without translation, the \r passes through raw.
+        assert_eq!(drain(f.path(), false), "a\rb\r");
+    }
+
+    #[test]
+    fn decoded_reader_lone_cr_at_chunk_boundary_non_lf_next() {
+        // \r at chunk end, next chunk starts with a non-\n byte -> lone \r -> \n.
+        let mut content = vec![b'a'; CHUNK_SIZE - 1];
+        content.extend_from_slice(b"\rb"); // \r at CHUNK_SIZE-1, 'b' next chunk
+        let f = tmp(&content, ".csv");
+        assert_eq!(drain(f.path(), true), eager(f.path(), true));
+    }
+
+    #[test]
+    fn decoded_reader_tiny_buffer_matches_eager_mixed_file() {
+        let content = b"\xef\xbb\xbfa,b\r\nJos\xe9,c\rd\ne\r";
+        let f = tmp(content, ".csv");
+        for translate in [false, true] {
+            let bytes = drain_byte_by_byte(f.path(), translate);
+            assert_eq!(
+                String::from_utf8(bytes).unwrap(),
+                eager(f.path(), translate),
+                "tiny-buffer mismatch (translate={translate})"
+            );
+        }
+    }
+
+    #[test]
+    fn decoded_reader_large_file_equivalence() {
+        // ~200 KiB of mixed content spanning several 64 KiB chunks, with an
+        // invalid byte and CR/CRLF/LF endings sprinkled in.
+        let mut content = Vec::new();
+        for i in 0..20000u32 {
+            content.extend_from_slice(format!("row{i},val{i}").as_bytes());
+            match i % 3 {
+                0 => content.extend_from_slice(b"\r\n"),
+                1 => content.push(b'\r'),
+                _ => content.push(b'\n'),
+            }
+            if i % 500 == 0 {
+                content.push(0xe9); // stray invalid byte, dropped by ignore
+            }
+        }
+        assert!(content.len() > 200 * 1024);
+        let f = tmp(&content, ".csv");
+        for translate in [false, true] {
+            assert_eq!(
+                drain(f.path(), translate),
+                eager(f.path(), translate),
+                "large-file mismatch (translate={translate})"
+            );
+        }
     }
 
     #[test]

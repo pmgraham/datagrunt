@@ -1,6 +1,7 @@
 //! Ports of CSVRows probes and the leading-line counters.
 
-use crate::io::{is_legacy_mac_newlines, read_decoded, universal_lines, universal_newlines};
+use crate::io::{is_legacy_mac_newlines, universal_lines, DecodedReader};
+use std::io;
 use std::path::Path;
 
 /// CSVRows.leading_rows: up to `limit` leading non-blank, non-comment rows,
@@ -57,27 +58,34 @@ pub fn count_leading_physical_lines_before_header(path: &Path) -> std::io::Resul
     Ok(count)
 }
 
-/// The text Python's `csv.reader` sees: universal newlines for legacy-mac
-/// files (`newline=None`), raw decoded text otherwise (`newline=""`).
+/// Build a streaming `csv::Reader` over the file, matching Python's
+/// `csv.reader` behaviour: no header auto-detection, flexible field counts
+/// (Python never errors on ragged widths), and the given single-byte
+/// delimiter.
 ///
-/// Python's `open(..., newline=None)` translates `\r` → `\n` before the CSV
-/// parser sees anything; `newline=""` passes `\r` through raw.
-pub(crate) fn csv_text(path: &Path) -> std::io::Result<String> {
-    // Probe newline style first (4 KiB read), like Python, then decode once.
-    let legacy_mac = is_legacy_mac_newlines(path);
-    let raw = read_decoded(path)?;
-    Ok(if legacy_mac { universal_newlines(&raw) } else { raw })
-}
-
-/// Build a `csv::Reader` configured to match Python's `csv.reader` behaviour:
-/// no header auto-detection, flexible field counts (Python never errors on
-/// ragged rows), and the given single-byte delimiter.
-pub(crate) fn csv_reader(text: &str, delimiter: u8) -> csv::Reader<&[u8]> {
-    csv::ReaderBuilder::new()
+/// The reader streams decoded bytes via [`DecodedReader`] in 64 KiB chunks, so
+/// callers that stop early (e.g. ragged checks bailing after 10k rows) never
+/// pay to decode the rest of the file. Newline handling mirrors Python: legacy
+/// mac files get `\r` → `\n` translation (Python's `open(..., newline=None)`),
+/// every other file passes `\r` through raw (`newline=""`).
+///
+/// NOTE on error semantics: unlike the previous in-memory source, the file
+/// underneath can now surface a genuine IO error mid-parse as an `Err` record.
+/// `row_count_with_header` skips `Err` (matching Python's `csv.reader`, which
+/// never errors on row shape — a real IO error there is unreachable for regular
+/// files); `check_ragged` returns `false` on `Err`, exactly matching its Python
+/// original's `except Exception: return False`.
+pub(crate) fn csv_reader_streaming(
+    path: &Path,
+    delimiter: u8,
+) -> io::Result<csv::Reader<DecodedReader>> {
+    let translate_newlines = is_legacy_mac_newlines(path);
+    let reader = DecodedReader::open(path, translate_newlines)?;
+    Ok(csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true) // Python csv.reader never errors on ragged widths
         .delimiter(delimiter)
-        .from_reader(text.as_bytes())
+        .from_reader(reader))
 }
 
 /// True when the record mirrors Python's skip condition:
@@ -98,12 +106,14 @@ pub(crate) fn skip_record(record: &csv::StringRecord) -> bool {
 /// one record) excluding blank records and comment records (first field starts
 /// with `#`), matching the Python implementation exactly.
 pub fn row_count_with_header(path: &Path, delimiter: u8) -> std::io::Result<u64> {
-    let text = csv_text(path)?;
+    let mut reader = csv_reader_streaming(path, delimiter)?;
     let mut count = 0u64;
-    for record in csv_reader(&text, delimiter).records() {
-        // Err is unreachable today: in-memory pre-decoded UTF-8 source (no IO
-        // or UTF-8 errors) and flexible=true (no UnequalLengths). Skipping
-        // mirrors Python's csv.reader, which never errors on row shape.
+    for record in reader.records() {
+        // Skipping `Err` mirrors Python's csv.reader, which never errors on row
+        // shape (flexible=true rules out UnequalLengths). With a real File
+        // underneath an `Err` could now also be a genuine IO error mid-read;
+        // that path is unreachable for regular files and acceptable for this
+        // prototype (Python's equivalent would raise — already documented).
         let Ok(record) = record else { continue };
         if !skip_record(&record) {
             count += 1;
