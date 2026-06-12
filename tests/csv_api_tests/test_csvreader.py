@@ -2,6 +2,7 @@
 
 import polars as pl
 import pyarrow as pa
+import pytest
 from duckdb import DuckDBPyRelation
 
 from datagrunt import CSVReader
@@ -413,3 +414,58 @@ class TestCSVReader:
                 # The extra field should have been truncated
                 assert list(df.columns) == ["id", "name", "age"]
                 assert df.row(1) == ("2", "Jane", "25")
+
+
+class TestCSVReaderContextManager:
+    """CSVReader supports the with-statement, closing its engine (issue #150)."""
+
+    def _csv(self, tmp_path):
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("a,b\n1,2\n3,4\n")
+        return str(csv_file)
+
+    def test_enter_returns_self(self, tmp_path):
+        """``with CSVReader(...) as r`` binds the reader."""
+        reader = CSVReader(self._csv(tmp_path), engine="duckdb")
+        with reader as bound:
+            assert bound is reader
+
+    def test_with_block_closes_duckdb_engine_connection(self, tmp_path):
+        """Leaving the block closes the DuckDB engine's connection."""
+        reader = CSVReader(self._csv(tmp_path), engine="duckdb")
+        with reader:
+            reader.query_data(f"SELECT * FROM {reader.db_table}")
+            engine = reader.__dict__["_reader"]
+            assert engine.queries._connection is not None
+        assert engine.queries._connection is None
+
+    def test_with_block_closes_on_exception(self, tmp_path):
+        """An exception inside the block still closes the connection and propagates."""
+        reader = CSVReader(self._csv(tmp_path), engine="duckdb")
+        with pytest.raises(ValueError, match="boom"):
+            with reader:
+                reader.query_data(f"SELECT * FROM {reader.db_table}")
+                raise ValueError("boom")
+        assert reader.__dict__["_reader"].queries._connection is None
+
+    def test_close_does_not_build_engine_when_unused(self, tmp_path):
+        """close() on a reader that ran no operation must not create the engine."""
+        reader = CSVReader(self._csv(tmp_path), engine="duckdb")
+        reader.close()
+        assert "_reader" not in reader.__dict__
+
+    def test_reader_usable_after_close(self, tmp_path):
+        """The reader stays usable after the block: a later query reopens."""
+        reader = CSVReader(self._csv(tmp_path), engine="duckdb")
+        with reader:
+            reader.query_data(f"SELECT * FROM {reader.db_table}")
+        result = reader.query_data(f"SELECT a, b FROM {reader.db_table} ORDER BY a")
+        assert result.fetchall() == [("1", "2"), ("3", "4")]
+        reader.close()
+
+    def test_with_block_harmless_for_non_duckdb_engines(self, tmp_path):
+        """polars/pyarrow engines have no open connection; the block is harmless."""
+        for engine in ("polars", "pyarrow"):
+            with CSVReader(self._csv(tmp_path), engine=engine) as reader:
+                df = reader.to_dataframe()
+            assert len(df) == 2

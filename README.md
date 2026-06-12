@@ -100,6 +100,16 @@ With the DuckDB engine, repeated `query_data()` calls on the same reader reuse
 a single import: the CSV is loaded into DuckDB once per reader instance, so
 follow-up queries skip the file import entirely and run dramatically faster.
 
+Because that reuse keeps a DuckDB connection open, hold the reader in a `with`
+block (or call `reader.close()`) to release it deterministically when you are
+done. The reader stays usable afterward — a later call transparently reopens:
+
+```python
+with CSVReader('vehicles.csv', engine='duckdb') as dg:
+    df = dg.query_data(f"SELECT city, COUNT(*) FROM {dg.db_table} GROUP BY 1").pl()
+# connection is closed here, even if the block raises
+```
+
 ### Consistent Column Names with `normalize_columns`
 
 Pass `normalize_columns=True` at construction to work in normalized column names (lowercase, underscores, collision-safe) everywhere — including SQL:
