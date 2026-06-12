@@ -226,12 +226,18 @@ class DuckDBQueries:
                                 strict_mode=false,
                                 skip={self.skip_rows});
                 """
+        # comment='' pins comment handling OFF despite auto_detect=true. The
+        # sniffer otherwise infers comment='#' for files mixing a leading '#'
+        # block with '#'-prefixed data rows and swallows the data rows
+        # (issue #141). Leading comment blocks are already handled via skip,
+        # and mid-file '#' lines are data on the polars/pyarrow engines.
         else:
             return f"""
                 CREATE OR REPLACE TABLE {self.database_table_name} AS
                 SELECT *
                 FROM read_csv('{self._escaped_filepath_literal}',
                                 auto_detect=true,
+                                comment='',
                                 delim='{self._escape_sql_literal(self.delimiter)}',
                                 header=true,
                                 quote='{self.quotechar.replace("'", "''")}',
@@ -275,6 +281,7 @@ class DuckDBQueries:
                 SELECT *
                 FROM read_csv('{self._escaped_filepath_literal}',
                                 auto_detect=true,
+                                comment='',
                                 delim='{self._escape_sql_literal(self.delimiter)}',
                                 header=true,
                                 quote='{self.quotechar.replace("'", "''")}',
@@ -322,6 +329,7 @@ class DuckDBQueries:
         else:
             read_csv = f"""read_csv('{self.filepath}',
                                 auto_detect=true,
+                                comment='',
                                 delim='{self.delimiter}',
                                 header=true,
                                 quote='{self.quotechar.replace("'", "''")}',
