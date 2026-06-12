@@ -1,6 +1,7 @@
 """Module for deriving and evaluating file properties."""
 
 # standard library
+import codecs
 from functools import cached_property
 from pathlib import Path
 
@@ -119,6 +120,7 @@ class BlankFile:
     """Class for checking if a file is blank."""
 
     FILE_SIZE_MB_FACTOR = 10.0
+    READ_CHUNK_SIZE = 65_536  # 64 KiB bounded reads; never the whole file at once
 
     def __init__(self, filepath):
         """Initialize the BlankFile object.
@@ -130,18 +132,44 @@ class BlankFile:
 
     @cached_property
     def is_blank(self):
-        """Check if the file is blank. Blank files contain only whitespace."""
+        """Check if the file is blank. Blank files contain only whitespace.
 
+        The file is read in bounded binary chunks and decoded strictly. Any
+        byte sequence that is not valid text - a binary PDF/Parquet/Excel body
+        or a run of invalid-UTF-8 bytes - counts as content, instead of being
+        silently dropped by ``errors="ignore"`` and misreported as blank
+        (issue #146). Only a file that decodes cleanly and holds nothing but
+        whitespace is blank.
+        """
         filestats = FileStatistics(self.filepath)
 
         # Very low probability of being blank if file is 10MB or larger in size
         if filestats.size_in_mb >= self.FILE_SIZE_MB_FACTOR:
             return False
-        with open(self.filepath, "r", encoding=DEFAULT_ENCODING, errors="ignore") as f:
-            for line in f:
-                if line.strip():
-                    return False
-        return True
+        return not self._has_content()
+
+    def _has_content(self):
+        """Return True if the file holds binary bytes or non-whitespace text.
+
+        Decoding is strict so undecodable bytes are treated as content rather
+        than dropped; an incremental decoder keeps multibyte characters that
+        straddle a chunk boundary intact.
+        """
+        decoder = codecs.getincrementaldecoder(DEFAULT_ENCODING)(errors="strict")
+        with open(self.filepath, "rb") as f:
+            while chunk := f.read(self.READ_CHUNK_SIZE):
+                try:
+                    text = decoder.decode(chunk)
+                except UnicodeDecodeError:
+                    return True  # undecodable bytes => binary content
+                if text.strip():
+                    return True
+        # Flush any buffered partial character; a multibyte sequence truncated
+        # at EOF is not clean text, so treat it as content.
+        try:
+            return bool(decoder.decode(b"", final=True).strip())
+        except UnicodeDecodeError:
+            return True
 
 
 class EmptyFile:

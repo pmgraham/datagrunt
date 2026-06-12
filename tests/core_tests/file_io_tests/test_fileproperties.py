@@ -92,6 +92,58 @@ class TestFileProperties:
         assert not pdf_file.is_semi_structured
 
 
+class TestBlankFileBinaryDetection:
+    """is_blank must not misclassify binary/invalid-UTF-8 files as blank (#146).
+
+    The old heuristic decoded any sub-10MB file as text with ``errors="ignore"``,
+    which silently dropped undecodable bytes — so a non-empty binary file could
+    decode to whitespace and be reported blank. Strict decoding now treats any
+    non-text bytes as content.
+    """
+
+    def test_invalid_utf8_bytes_not_blank(self, tmp_path):
+        """A non-empty file of invalid-UTF-8 bytes must not be blank."""
+        garbage = tmp_path / "garbage.csv"
+        garbage.write_bytes(b"\xff" * 4096)
+
+        assert not FileProperties(garbage).is_blank
+
+    def test_pdf_bytes_not_blank(self, tmp_path):
+        """A sub-10MB PDF with a binary body must not be blank."""
+        pdf = tmp_path / "doc.pdf"
+        pdf.write_bytes(b"%PDF-1.4\n" + bytes(range(256)) * 16)
+
+        assert not FileProperties(pdf).is_blank
+
+    def test_parquet_bytes_not_blank(self, tmp_path):
+        """A sub-10MB Parquet file with a binary body must not be blank."""
+        parquet = tmp_path / "data.parquet"
+        parquet.write_bytes(b"PAR1" + bytes(range(256)) * 16 + b"PAR1")
+
+        assert not FileProperties(parquet).is_blank
+
+    def test_whitespace_only_text_still_blank(self, tmp_path):
+        """A whitespace-only text file must remain blank."""
+        blank = tmp_path / "blank.csv"
+        blank.write_text("   \n\t\n  \n")
+
+        assert FileProperties(blank).is_blank
+
+    def test_empty_file_still_blank(self, tmp_path):
+        """An empty file must remain blank."""
+        empty = tmp_path / "empty.csv"
+        empty.write_bytes(b"")
+
+        assert FileProperties(empty).is_blank
+
+    def test_normal_text_not_blank(self, tmp_path):
+        """A normal text file with content must not be blank."""
+        data = tmp_path / "data.csv"
+        data.write_text("name,age\nalice,30\n")
+
+        assert not FileProperties(data).is_blank
+
+
 class TestPathValidation:
     """Test path validation at construction for FileProperties and CSV APIs."""
 
