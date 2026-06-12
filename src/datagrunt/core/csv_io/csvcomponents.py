@@ -283,12 +283,17 @@ class CSVDelimiter:
     def infer_csv_file_delimiter(self):
         """Infer the delimiter of a CSV file.
 
-        Walks the header's candidate characters most-frequent first. A safe
-        delimiter wins immediately; any other candidate (e.g. ``.`` or ``'``)
-        must split the sampled rows into a consistent field count to win,
-        otherwise inference falls through to the next candidate. With no winner,
-        the file is space-delimited only when it splits consistently on
-        whitespace, else it defaults to comma (issue #74).
+        Precedence, by decreasing confidence:
+
+        1. An unambiguous delimiter (``, ; | tab``) present in the header wins,
+           most-frequent first. It is preferred even over a more frequent
+           punctuation character, so consistent incidental punctuation (a dot
+           in both ``a.b,c.d`` and its data) cannot outrank the real delimiter.
+        2. Otherwise a punctuation candidate (e.g. ``.`` or ``'``) wins only if
+           it splits the sampled rows into a consistent field count - a genuine
+           delimiter is present in every row with a stable count.
+        3. Otherwise the file is space-delimited only when it splits
+           consistently on whitespace, else it defaults to comma (issue #74).
 
         Returns:
             str: The delimiter of the CSV file.
@@ -298,9 +303,13 @@ class CSVDelimiter:
         if self.file_properties.is_empty or self.file_properties.is_blank:
             return self.DEFAULT_DELIMITER
 
-        for char, _count in self._get_most_common_non_alpha_numeric_character_from_string():
+        candidates = self._get_most_common_non_alpha_numeric_character_from_string()
+
+        for char, _count in candidates:
             if char in self.SAFE_DELIMITERS:
                 return char
+
+        for char, _count in candidates:
             if self._splits_rows_consistently(char):
                 return char
 

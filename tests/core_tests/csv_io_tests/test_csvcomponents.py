@@ -181,6 +181,35 @@ class TestCSVDelimiter:
         delimiter = CSVDelimiter(str(csv_file))
         assert delimiter.delimiter == ";"
 
+    def test_safe_delimiter_preferred_over_consistent_punctuation(self, tmp_path):
+        """A real comma wins over a more frequent, consistently-splitting dot.
+
+        Dotted values on both sides of a comma (a.b,c.d) make '.' the most
+        frequent character and it splits every row consistently, but the comma
+        is the actual delimiter and must win.
+        """
+        csv_file = tmp_path / "test.csv"
+        csv_file.write_text("a.b,c.d\n1.2,3.4\n5.6,7.8")
+
+        delimiter = CSVDelimiter(str(csv_file))
+        assert delimiter.delimiter == ","
+
+    def test_tab_delimited_with_csv_extension_detected(self, tmp_path):
+        """A tab-delimited file mislabeled .csv still infers tab."""
+        csv_file = tmp_path / "mislabeled.csv"
+        csv_file.write_text("a\tb\tc\n1\t2\t3\n4\t5\t6")
+
+        delimiter = CSVDelimiter(str(csv_file))
+        assert delimiter.delimiter == "\t"
+
+    def test_empty_file_uses_comma(self, tmp_path):
+        """An empty file defaults to comma without sampling rows."""
+        csv_file = tmp_path / "empty.csv"
+        csv_file.write_text("")
+
+        delimiter = CSVDelimiter(str(csv_file))
+        assert delimiter.delimiter == ","
+
 
 class TestCSVColumns:
     """Test suite for CSVColumns class."""
