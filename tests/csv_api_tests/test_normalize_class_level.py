@@ -114,3 +114,24 @@ class TestQueryDataInstanceNormalization:
             sql = f'SELECT "First Name" FROM {reader_engine.db_table}'
             df = _query_result_to_dataframe(reader_engine.query_data(sql, normalize_columns=True), engine)
             assert df.columns == ["first_name"]
+
+    def test_per_call_false_overrides_instance_true_query(self, mixed_headers_csv):
+        for engine in ALL_ENGINES:
+            reader_engine = CSVEngineFactory(mixed_headers_csv, engine, normalize_columns=True).create_reader()
+            sql = f'SELECT "First Name" FROM {reader_engine.db_table}'
+            df = _query_result_to_dataframe(reader_engine.query_data(sql, normalize_columns=False), engine)
+            assert df.columns == ["First Name"]
+
+    def test_mixed_modes_reimport_table_correctly(self, mixed_headers_csv):
+        """Alternating inherit and legacy calls re-imports the table per mode.
+
+        Each fresh query must see the vocabulary its mode implies; stale
+        relations from prior calls are documented as invalidated.
+        """
+        reader_engine = CSVEngineFactory(mixed_headers_csv, "duckdb", normalize_columns=True).create_reader()
+        inherit_sql = f"SELECT first_name FROM {reader_engine.db_table}"
+        legacy_sql = f'SELECT "First Name" FROM {reader_engine.db_table}'
+
+        assert reader_engine.query_data(inherit_sql).pl().columns == ["first_name"]
+        assert reader_engine.query_data(legacy_sql, normalize_columns=False).pl().columns == ["First Name"]
+        assert reader_engine.query_data(inherit_sql).pl().columns == ["first_name"]

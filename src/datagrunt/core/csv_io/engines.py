@@ -361,13 +361,20 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
             dg = CSVReader('myfile.csv', normalize_columns=True)
             query = f"SELECT col_one, col_two FROM {dg.db_table}"
             dg.query_data(query)
+
+        Note:
+            The returned relation is lazy and bound to this reader's shared
+            DuckDB table. Mixing inherit-mode and explicit ``normalize_columns``
+            calls on the same reader re-imports that table with a different
+            column vocabulary, so evaluate (e.g. ``.pl()``) any relation you
+            need to keep before issuing a query in the other mode.
         """  # noqa: E501
         if normalize_columns is None:
             # Instance-level mode: the table itself carries the configured
             # column names, so query vocabulary and result vocabulary match.
             self.queries.create_table(normalize_columns=self.normalize_columns)
-            # The returned relation keeps this per-instance connection alive,
-            # so it remains valid after this engine instance is GC'd.
+            # The relation is lazy and bound to this engine's connection; it
+            # survives engine GC but not a later mode flip or close().
             return self.queries.connection.sql(sql_query)
 
         # Legacy per-call mode: the table keeps original column names so the
