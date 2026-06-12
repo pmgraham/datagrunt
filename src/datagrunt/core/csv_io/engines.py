@@ -5,7 +5,7 @@ import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 # third party libraries
 import polars as pl
@@ -113,11 +113,12 @@ class CSVBaseReaderEngine(ABC):
             raise FileNotFoundError
 
     @abstractmethod
-    def get_sample(self, normalize_columns: bool = False) -> pl.DataFrame:
+    def get_sample(self, normalize_columns: Optional[bool] = None) -> pl.DataFrame:
         """Return a sample of the data as a Polars DataFrame.
 
         Args:
-            normalize_columns (bool): Whether to normalize column names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A Polars DataFrame containing the sample rows.
@@ -125,36 +126,39 @@ class CSVBaseReaderEngine(ABC):
         pass
 
     @abstractmethod
-    def to_dataframe(self, normalize_columns: bool = False) -> pl.DataFrame:
+    def to_dataframe(self, normalize_columns: Optional[bool] = None) -> pl.DataFrame:
         """Convert data to a dataframe.
 
         Args:
-            normalize_columns (bool): Whether to normalize column names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
         pass
 
     @abstractmethod
-    def to_arrow_table(self, normalize_columns: bool = False) -> pa.Table:
+    def to_arrow_table(self, normalize_columns: Optional[bool] = None) -> pa.Table:
         """
         Convert data to a PyArrow table.
 
         Args:
-            normalize_columns (bool): Whether to normalize column names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
         pass
 
     @abstractmethod
-    def to_dicts(self, normalize_columns: bool = False) -> List[Dict]:
+    def to_dicts(self, normalize_columns: Optional[bool] = None) -> List[Dict]:
         """
         Convert data to a list of dictionaries.
 
         Args:
-            normalize_columns (bool): Whether to normalize column names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
         """
         pass
 
     @abstractmethod
-    def query_data(self, sql_query: str, normalize_columns: bool = False) -> Union[DuckDBPyRelation, pl.DataFrame]:
+    def query_data(self, sql_query: str, normalize_columns: Optional[bool] = None) -> Union[DuckDBPyRelation, pl.DataFrame]:
         """
         Query the data using SQL.
 
@@ -239,17 +243,18 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
     Class to read CSV files and convert CSV files powered by DuckDB.
     """
 
-    def get_sample(self, normalize_columns=False):
+    def get_sample(self, normalize_columns=None):
         """
         Return a sample of the CSV file.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A Polars DataFrame containing the sample rows.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         # sample_dataframe streams the first rows (no full-table import) and
         # returns a materialized Polars frame, so the per-call connection can
         # be released deterministically rather than waiting on garbage
@@ -262,34 +267,36 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         finally:
             self.queries.close()
 
-    def to_dataframe(self, normalize_columns=False):
+    def to_dataframe(self, normalize_columns=None):
         """
         Converts CSV to a Polars dataframe.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A Polars dataframe.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         # Materialize fully (.pl()) before closing the per-call connection.
         try:
             return self.queries.create_table(normalize_columns).pl()
         finally:
             self.queries.close()
 
-    def to_arrow_table(self, normalize_columns=False):
+    def to_arrow_table(self, normalize_columns=None):
         """
         Converts CSV to a PyArrow table.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A PyArrow table.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         # Materialize into an in-memory pa.Table before closing the connection.
         try:
             result = self.queries.create_table(normalize_columns).arrow()
@@ -299,13 +306,13 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         finally:
             self.queries.close()
 
-    def to_dicts(self, normalize_columns=False):
+    def to_dicts(self, normalize_columns=None):
         """
         Converts CSV to a list of Python dictionaries.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A list of dictionaries.
@@ -439,59 +446,57 @@ class CSVReaderPolarsEngine(CSVBaseReaderEngine):
         except Exception as e:
             raise e
 
-    def get_sample(self, normalize_columns=False):
+    def get_sample(self, normalize_columns=None):
         """
         Return a sample of the CSV file.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A Polars dataframe.
         """
-        return self._create_dataframe_sample(normalize_columns)
+        return self._create_dataframe_sample(_resolve_normalize_columns(self.normalize_columns, normalize_columns))
 
-    def to_dataframe(self, normalize_columns=False):
+    def to_dataframe(self, normalize_columns=None):
         """
         Converts CSV to a Polars dataframe.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A Polars dataframe.
         """
-        return self._create_dataframe(normalize_columns)
+        return self._create_dataframe(_resolve_normalize_columns(self.normalize_columns, normalize_columns))
 
-    def to_arrow_table(self, normalize_columns=False):
+    def to_arrow_table(self, normalize_columns=None):
         """
         Converts CSV to a PyArrow table.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A PyArrow table.
         """
-        df = self._create_dataframe(normalize_columns).to_arrow()
-        return df
+        return self._create_dataframe(_resolve_normalize_columns(self.normalize_columns, normalize_columns)).to_arrow()
 
-    def to_dicts(self, normalize_columns=False):
+    def to_dicts(self, normalize_columns=None):
         """
         Converts CSV to a list of Python dictionaries.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A list of dictionaries.
         """
-        dicts = self._create_dataframe(normalize_columns).to_dicts()
-        return dicts
+        return self._create_dataframe(_resolve_normalize_columns(self.normalize_columns, normalize_columns)).to_dicts()
 
     def query_data(self, sql_query, normalize_columns=False):
         """
@@ -851,17 +856,18 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
         except Exception as e:
             raise e
 
-    def get_sample(self, normalize_columns=False):
+    def get_sample(self, normalize_columns=None):
         """
         Return a sample of the CSV file.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A Polars DataFrame containing the sample rows.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         table = self._create_table_sample(normalize_columns)
         # Convert to a Polars DataFrame for a consistent return type
         df = pl.from_arrow(table)
@@ -869,17 +875,18 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
             df = df.to_frame()
         return df
 
-    def to_dataframe(self, normalize_columns=False) -> pl.DataFrame:
+    def to_dataframe(self, normalize_columns=None) -> pl.DataFrame:
         """
         Converts CSV to a Polars dataframe.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A Polars dataframe.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         table = self._create_table(normalize_columns)
         df = pl.from_arrow(table)
         # Ensure we always return a DataFrame, not a Series
@@ -887,30 +894,31 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
             df = df.to_frame()
         return df
 
-    def to_arrow_table(self, normalize_columns=False):
+    def to_arrow_table(self, normalize_columns=None):
         """
         Converts CSV to a PyArrow table.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A PyArrow table.
         """
-        return self._create_table(normalize_columns)
+        return self._create_table(_resolve_normalize_columns(self.normalize_columns, normalize_columns))
 
-    def to_dicts(self, normalize_columns=False):
+    def to_dicts(self, normalize_columns=None):
         """
         Converts CSV to a list of Python dictionaries.
 
         Args:
-            normalize_columns (optional, bool): Whether to normalize column
-            names.
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
 
         Returns:
             A list of dictionaries.
         """
+        normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         table = self._create_table(normalize_columns)
         # Convert to Polars DataFrame and then to dicts
         df = pl.from_arrow(table)
