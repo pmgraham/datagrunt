@@ -190,3 +190,46 @@ class TestPartitionNormalLayout:
         segments = PageLayoutSorter(TextItemAdapter()).partition(items)
 
         assert segments == [items]
+
+
+class TestSliceYBandsNegativeY:
+    """_slice_y_bands must place negative-Y elements in reading order (#145).
+
+    last_y started at 0.0, so any element with a negative y_top failed every
+    band check (above/mid/below) and fell through to the leftover fallback,
+    which blindly appends to the end of the first segment - even though those
+    elements are the topmost content. Initializing last_y to -inf captures
+    them in the first "above"/"below" pass instead.
+    """
+
+    def test_negative_y_above_interval_sorts_before_it(self):
+        """Negative-Y items above a spanning interval precede it, not appended."""
+        sorter = PageLayoutSorter(TextItemAdapter())
+        above_negative = [_text_item(50, 90, -20), _text_item(50, 90, -10)]
+        below_interval = [_text_item(50, 90, 100), _text_item(50, 90, 110)]
+        span = _text_item(0, 500, 50)
+        interval = {"y_top": 50.0, "y_bot": 58.0, "items": [span]}
+
+        segments = sorter._slice_y_bands(
+            above_negative + below_interval, [interval]
+        )
+        flattened = _flatten(segments)
+
+        # Every column item plus the spanning item is placed exactly once.
+        assert len(flattened) == len(above_negative) + len(below_interval) + 1
+        # The topmost (negative-Y) items come before the spanning interval.
+        order = [id(it) for it in flattened]
+        for negative in above_negative:
+            assert order.index(id(negative)) < order.index(id(span))
+
+    def test_no_interval_negative_y_preserves_top_to_bottom_order(self):
+        """With no intervals, negative-Y items keep their top-to-bottom order."""
+        sorter = PageLayoutSorter(TextItemAdapter())
+        # Already in top-to-bottom order; a single narrow column so partition
+        # returns them unsplit and order is unambiguous.
+        items = [_text_item(50, 90, -30), _text_item(50, 90, -10), _text_item(50, 90, 20)]
+
+        segments = sorter._slice_y_bands(items, [])
+        flattened = _flatten(segments)
+
+        assert flattened == items
