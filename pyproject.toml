@@ -45,9 +45,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://pmgraham.github.io/datagrunt"
+Homepage = "https://www.datagrunt.io/"
 "Bug Tracker" = "https://github.com/pmgraham/datagrunt/issues"
-Documentation = "https://pmgraham.github.io/datagrunt"
+Documentation = "https://www.datagrunt.io/"
 "Source Code" = "https://github.com/pmgraham/datagrunt"
 
 [tool.setuptools.packages.find]
