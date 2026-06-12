@@ -135,3 +135,21 @@ class TestQueryDataInstanceNormalization:
         assert reader_engine.query_data(inherit_sql).pl().columns == ["first_name"]
         assert reader_engine.query_data(legacy_sql, normalize_columns=False).pl().columns == ["First Name"]
         assert reader_engine.query_data(inherit_sql).pl().columns == ["first_name"]
+
+
+class TestWriterEngineInstanceNormalization:
+    """Writer engines apply the constructor-level flag when no per-call value is given."""
+
+    def test_write_csv_uses_instance_flag(self, mixed_headers_csv, tmp_path):
+        for engine in ALL_ENGINES:
+            writer_engine = CSVEngineFactory(mixed_headers_csv, engine, normalize_columns=True).create_writer()
+            out_file = tmp_path / f"out_{engine}.csv"
+            writer_engine.write_csv(str(out_file))
+            assert pl.read_csv(out_file).columns == NORMALIZED_HEADERS
+
+    def test_write_csv_per_call_false_overrides_instance_true(self, mixed_headers_csv, tmp_path):
+        for engine in ALL_ENGINES:
+            writer_engine = CSVEngineFactory(mixed_headers_csv, engine, normalize_columns=True).create_writer()
+            out_file = tmp_path / f"out_raw_{engine}.csv"
+            writer_engine.write_csv(str(out_file), normalize_columns=False)
+            assert pl.read_csv(out_file).columns == ORIGINAL_HEADERS
