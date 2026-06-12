@@ -5,11 +5,17 @@ use std::path::Path;
 
 const MAX_DATA_ROWS_CHECKED: usize = 10_000;
 
-/// Best-effort like Python: any error means "not ragged".
+/// Returns `true` if the CSV at `path` contains ragged rows (rows whose
+/// field count differs from the header's), checking up to the first 10,000
+/// data rows.
+///
+/// Mirrors `_check_csv_ragged_and_warn` (bool only; the `UserWarning` stays
+/// in Python). Best-effort: any IO or parse error returns `false`.
 pub fn check_ragged(path: &Path, delimiter: u8) -> bool {
     check_ragged_inner(path, delimiter).unwrap_or(false)
 }
 
+// Inner: Err only on IO failure; the wrapper maps it to false.
 fn check_ragged_inner(path: &Path, delimiter: u8) -> std::io::Result<bool> {
     let text = csv_text(path)?;
     let mut reader = csv_reader(&text, delimiter);
@@ -17,6 +23,10 @@ fn check_ragged_inner(path: &Path, delimiter: u8) -> std::io::Result<bool> {
 
     let mut expected_cols = None;
     for record in records.by_ref() {
+        // Unlike row counting (which skips, since Python's CSVRows has no
+        // try/except), a parse error here aborts to "not ragged" because the
+        // Python original wraps the whole scan in `except Exception: False`.
+        // Unreachable in practice: in-memory UTF-8 source + flexible=true.
         let Ok(record) = record else { return Ok(false) };
         if !skip_record(&record) {
             expected_cols = Some(record.len());
