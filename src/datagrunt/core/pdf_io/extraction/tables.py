@@ -1,8 +1,11 @@
 """Engine-independent table extraction via pdfplumber."""
 
+import logging
 from pathlib import Path
 
 from datagrunt.core.pdf_io.extraction.shapes import BBox, TableBlock
+
+logger = logging.getLogger(__name__)
 
 
 def _import_pdfplumber():
@@ -55,7 +58,8 @@ class PdfPlumberTableExtractor:
         pdfplumber = _import_pdfplumber()
         try:
             pdf = pdfplumber.open(self.filepath)
-        except Exception:
+        except Exception:  # noqa: BLE001 - pdfplumber raises many types; tables are best-effort
+            logger.debug("pdfplumber.open failed for %s; skipping table extraction", self.filepath, exc_info=True)
             return None, False
         if getattr(self._local, "depth", 0) > 0:
             self._local.pdf = pdf

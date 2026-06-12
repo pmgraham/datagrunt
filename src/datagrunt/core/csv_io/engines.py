@@ -54,7 +54,9 @@ def _is_legacy_mac_newlines(filepath):
         with open(filepath, "rb") as f:
             chunk = f.read(4096)
         return b"\r" in chunk and b"\n" not in chunk
-    except Exception:
+    except OSError:
+        # Unreadable/missing file: treat as not legacy-mac and let the real
+        # read surface the error. Any other exception is a bug worth raising.
         return False
 
 

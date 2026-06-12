@@ -1,10 +1,14 @@
 """pymupdf-backed extraction backend (the reference engine)."""
 
+import logging
+
 from datagrunt.core.pdf_io.extraction.base import ExtractionBackend
 from datagrunt.core.pdf_io.extraction.ocr import ocr_data_to_blocks
 from datagrunt.core.pdf_io.extraction.pdfium_document import ENCRYPTED_PDF_MESSAGE
 from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, PageAnalysis, TextBlock
 from datagrunt.core.pdf_io.extraction.text_block_builder import classify_font_size
+
+logger = logging.getLogger(__name__)
 
 
 def _import_pymupdf():
@@ -233,8 +237,8 @@ class PyMuPDFBackend(ExtractionBackend):
                     pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
                 image_bytes = pix.tobytes("png")
                 ext = "png"
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001 - Pixmap conversion is best-effort; keep original bytes
+                logger.debug("Pixmap PNG conversion failed; keeping original image bytes", exc_info=True)
 
         file_path = None
         if output_dir:
