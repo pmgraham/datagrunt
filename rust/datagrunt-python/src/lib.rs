@@ -38,6 +38,11 @@ fn normalize_columns(names: Vec<String>) -> Vec<String> {
     datagrunt_core::normalize::normalize_columns(&names)
 }
 
+#[pyfunction]
+fn infer_delimiter(path: PathBuf) -> PyResult<String> {
+    datagrunt_core::delimiter::infer_delimiter(&path).map_err(oserr)
+}
+
 #[pymodule]
 fn datagrunt_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(is_legacy_mac_newlines, m)?)?;
@@ -46,5 +51,6 @@ fn datagrunt_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(count_leading_comments, m)?)?;
     m.add_function(wrap_pyfunction!(count_leading_physical_lines_before_header, m)?)?;
     m.add_function(wrap_pyfunction!(normalize_columns, m)?)?;
+    m.add_function(wrap_pyfunction!(infer_delimiter, m)?)?;
     Ok(())
 }
