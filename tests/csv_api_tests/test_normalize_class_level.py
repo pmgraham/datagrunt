@@ -40,3 +40,39 @@ class TestEngineFactoryPlumbing:
             writer_engine = CSVEngineFactory(mixed_headers_csv, engine).create_writer()
             assert reader_engine.normalize_columns is False
             assert writer_engine.normalize_columns is False
+
+
+class TestReaderEngineInstanceNormalization:
+    """Reader engines apply the constructor-level flag when no per-call value is given."""
+
+    def test_to_dataframe_uses_instance_flag(self, mixed_headers_csv):
+        for engine in ALL_ENGINES:
+            reader_engine = CSVEngineFactory(mixed_headers_csv, engine, normalize_columns=True).create_reader()
+            assert list(reader_engine.to_dataframe().columns) == NORMALIZED_HEADERS
+
+    def test_get_sample_uses_instance_flag(self, mixed_headers_csv):
+        for engine in ALL_ENGINES:
+            reader_engine = CSVEngineFactory(mixed_headers_csv, engine, normalize_columns=True).create_reader()
+            assert list(reader_engine.get_sample().columns) == NORMALIZED_HEADERS
+
+    def test_to_arrow_table_uses_instance_flag(self, mixed_headers_csv):
+        for engine in ALL_ENGINES:
+            reader_engine = CSVEngineFactory(mixed_headers_csv, engine, normalize_columns=True).create_reader()
+            assert reader_engine.to_arrow_table().column_names == NORMALIZED_HEADERS
+
+    def test_to_dicts_uses_instance_flag(self, mixed_headers_csv):
+        for engine in ALL_ENGINES:
+            reader_engine = CSVEngineFactory(mixed_headers_csv, engine, normalize_columns=True).create_reader()
+            assert list(reader_engine.to_dicts()[0].keys()) == NORMALIZED_HEADERS
+
+    def test_per_call_false_overrides_instance_true(self, mixed_headers_csv):
+        for engine in ALL_ENGINES:
+            reader_engine = CSVEngineFactory(mixed_headers_csv, engine, normalize_columns=True).create_reader()
+            df = reader_engine.to_dataframe(normalize_columns=False)
+            assert list(df.columns) == ORIGINAL_HEADERS
+
+    def test_per_call_true_overrides_instance_false(self, mixed_headers_csv):
+        for engine in ALL_ENGINES:
+            reader_engine = CSVEngineFactory(mixed_headers_csv, engine).create_reader()
+            df = reader_engine.to_dataframe(normalize_columns=True)
+            assert list(df.columns) == NORMALIZED_HEADERS
