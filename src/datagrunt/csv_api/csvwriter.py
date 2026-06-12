@@ -110,9 +110,7 @@ class CSVWriter(CSVComponents):
             ``None`` (default) inherits the constructor-level setting.
         """
         if self.is_empty or self.is_blank:
-            return self._write_empty_output(
-                CSVEngineProperties.json_newline_export_filename, out_filename
-            )
+            return self._write_empty_output(CSVEngineProperties.json_newline_export_filename, out_filename)
         return self._create_writer().write_json_newline_delimited(
             out_filename, warn_per_call_normalize(normalize_columns)
         )
