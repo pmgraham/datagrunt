@@ -16,8 +16,31 @@
 //! `quoting` (QUOTE_MINIMAL) and the absence of `escapechar` are constants the
 //! binding layer applies (Task 10); they are not part of this core struct.
 
+use crate::io;
 use fancy_regex::Regex;
+use std::path::Path;
 use std::sync::LazyLock;
+
+const SNIFF_SAMPLE_ROWS: usize = 5;
+
+/// CSVDialect sample: first 5 lines whose stripped form doesn't start with
+/// '#' (blank lines included), original line endings preserved ("".join).
+pub fn sniff_sample(path: &Path) -> std::io::Result<String> {
+    let text = io::universal_newlines(&io::read_decoded(path)?);
+    let mut sample = String::new();
+    let mut taken = 0usize;
+    for segment in text.split_inclusive('\n') {
+        if segment.trim().starts_with('#') {
+            continue;
+        }
+        sample.push_str(segment);
+        taken += 1;
+        if taken >= SNIFF_SAMPLE_ROWS {
+            break;
+        }
+    }
+    Ok(sample)
+}
 
 /// The four data-driven facts `csv.Sniffer().sniff` derives from a sample.
 #[derive(Debug, Clone, PartialEq, Eq)]

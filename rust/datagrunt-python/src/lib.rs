@@ -1,5 +1,6 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use std::path::PathBuf;
 
 /// Map an IO error to a Python exception via PyO3's `From` impl, which
@@ -67,6 +68,34 @@ fn check_ragged(path: PathBuf, delimiter: &str) -> PyResult<bool> {
     Ok(datagrunt_core::ragged::check_ragged(&path, delimiter_byte(delimiter)?))
 }
 
+/// CSVDialect equivalent: None for empty/blank files or an undeterminable
+/// sample; otherwise the raw sniffed dialect fields. lineterminator and
+/// quoting are constants in csv.Sniffer.sniff; escapechar is never set.
+#[pyfunction]
+#[pyo3(signature = (path, delimiter=None))]
+fn sniff_dialect(
+    py: Python<'_>,
+    path: PathBuf,
+    delimiter: Option<String>,
+) -> PyResult<Option<Py<PyDict>>> {
+    if datagrunt_core::io::is_empty(&path).map_err(oserr)? || datagrunt_core::io::is_blank(&path) {
+        return Ok(None);
+    }
+    let sample = datagrunt_core::dialect::sniff_sample(&path).map_err(oserr)?;
+    let Some(d) = datagrunt_core::dialect::sniff(&sample, delimiter.as_deref()) else {
+        return Ok(None);
+    };
+    let dict = PyDict::new(py);
+    dict.set_item("delimiter", d.delimiter)?;
+    dict.set_item("quotechar", d.quotechar)?;
+    dict.set_item("escapechar", py.None())?;
+    dict.set_item("doublequote", d.doublequote)?;
+    dict.set_item("lineterminator", "\r\n")?;
+    dict.set_item("skipinitialspace", d.skipinitialspace)?;
+    dict.set_item("quoting", 0)?;
+    Ok(Some(dict.into()))
+}
+
 #[pymodule]
 fn datagrunt_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(is_legacy_mac_newlines, m)?)?;
@@ -78,5 +107,6 @@ fn datagrunt_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(infer_delimiter, m)?)?;
     m.add_function(wrap_pyfunction!(row_count_with_header, m)?)?;
     m.add_function(wrap_pyfunction!(check_ragged, m)?)?;
+    m.add_function(wrap_pyfunction!(sniff_dialect, m)?)?;
     Ok(())
 }
