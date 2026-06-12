@@ -191,9 +191,35 @@ class CSVStringSample:
 class CSVDelimiter:
     """Class to infer and derive the CSV delimiter."""
 
-    DELIMITER_REGEX_PATTERN = r'[^0-9a-zA-Z_ "-]'
-    DEFAULT_DELIMITER = ","
-    DEFAULT_TAB_DELIMITER = "\t"
+    # --- Single source of truth for delimiter characters ---
+    # Every delimiter character is named exactly once here; the regex, the
+    # defaults, and the inference passes all derive from these collections so
+    # no delimiter character is repeated anywhere else in the library.
+    #
+    # Unambiguous delimiters: accepted as soon as one is the most frequent
+    # candidate in the header, with no row-consistency check.
+    COMMA, SEMICOLON, PIPE, TAB = SAFE_DELIMITERS = (",", ";", "|", "\t")
+    # The whitespace delimiter is ambiguous - incidental spaces in values look
+    # identical to a real space delimiter - so it is accepted only when the
+    # sampled rows split on it consistently.
+    SPACE_DELIMITER = " "
+    # Characters that can appear in a header/value but are never the delimiter,
+    # so they are dropped from candidate counting. The dot (``user.id``) and
+    # apostrophe (``User's Name``) are deliberately absent: they ARE counted,
+    # then validated by row consistency rather than blindly picked (issue #74).
+    NON_DELIMITER_CHARS = ('"', "-")
+
+    DEFAULT_DELIMITER = COMMA
+    DEFAULT_TAB_DELIMITER = TAB
+    # Candidates are non-word, non-space characters except those that are never
+    # delimiters; built from NON_DELIMITER_CHARS so the set lives in one place.
+    DELIMITER_REGEX_PATTERN = "[^0-9a-zA-Z_ " + "".join(re.escape(c) for c in NON_DELIMITER_CHARS) + "]"
+
+    CANDIDATE_SAMPLE_ROWS = 5
+    # A candidate must split rows into at least this many fields to win. Two
+    # fields are indistinguishable from a single text column with one separator
+    # per value (e.g. ``John Smith``), so they do not count.
+    MIN_CONSISTENT_FIELDS = 3
 
     def __init__(self, filepath, first_row=None):
         """Initialize the CSVDelimiter class.
@@ -202,21 +228,21 @@ class CSVDelimiter:
             filepath (str or Path): The path to the CSV file.
             first_row (str, optional): The first row of the CSV file.
         """
-        filepath = Path(filepath)
-        self.file_properties = FileProperties(filepath)
+        self.filepath = Path(filepath)
+        self.file_properties = FileProperties(self.filepath)
         if first_row is not None:
             self.first_row = first_row
         else:
-            self.first_row = CSVRows(filepath).first_row
+            self.first_row = CSVRows(self.filepath).first_row
         self.delimiter = self.infer_csv_file_delimiter()
         self.delimiter_byte_string = self.delimiter.encode()
 
     def _get_most_common_non_alpha_numeric_character_from_string(self):
         """
-        Get the most common non-alpha-numeric character from a given string.
+        Get the non-alpha-numeric characters of the header, most common first.
 
         Returns:
-            str: The most common non-alpha-numeric character from the string.
+            list[tuple[str, int]]: ``(character, count)`` pairs, most common first.
         """
         columns_no_spaces = self.first_row.replace(" ", "")
         regex = re.compile(self.DELIMITER_REGEX_PATTERN)
@@ -224,23 +250,72 @@ class CSVDelimiter:
         most_common = counts.most_common()
         return most_common
 
+    @cached_property
+    def _sample_rows(self):
+        """Leading non-comment rows used to validate ambiguous delimiters."""
+        return CSVRows(self.filepath).leading_rows(self.CANDIDATE_SAMPLE_ROWS)
+
+    @staticmethod
+    def _split_row(row, char):
+        """Split a row for field counting; whitespace collapses runs of spaces."""
+        return row.split() if char == " " else row.split(char)
+
+    def _splits_rows_consistently(self, char):
+        """Whether every sampled row splits on ``char`` into the same 3+ fields.
+
+        A real delimiter produces a stable field count across the header and
+        data rows; incidental punctuation (a dot only in the header, an
+        apostrophe only in some values) does not. At least two rows are required
+        so a lone header cannot self-validate.
+
+        Args:
+            char (str): The candidate delimiter to test.
+
+        Returns:
+            bool: True if the candidate splits the sample consistently.
+        """
+        rows = self._sample_rows
+        if len(rows) < 2:
+            return False
+        field_counts = {len(self._split_row(row, char)) for row in rows}
+        return len(field_counts) == 1 and field_counts.pop() >= self.MIN_CONSISTENT_FIELDS
+
     def infer_csv_file_delimiter(self):
         """Infer the delimiter of a CSV file.
+
+        Precedence, by decreasing confidence:
+
+        1. An unambiguous delimiter (``, ; | tab``) present in the header wins,
+           most-frequent first. It is preferred even over a more frequent
+           punctuation character, so consistent incidental punctuation (a dot
+           in both ``a.b,c.d`` and its data) cannot outrank the real delimiter.
+        2. Otherwise a punctuation candidate (e.g. ``.`` or ``'``) wins only if
+           it splits the sampled rows into a consistent field count - a genuine
+           delimiter is present in every row with a stable count.
+        3. Otherwise the file is space-delimited only when it splits
+           consistently on whitespace, else it defaults to comma (issue #74).
 
         Returns:
             str: The delimiter of the CSV file.
         """
-        delimiter_candidates = self._get_most_common_non_alpha_numeric_character_from_string()
-
         if self.file_properties.is_tsv:
-            delimiter = self.DEFAULT_TAB_DELIMITER
-        elif self.file_properties.is_empty or self.file_properties.is_blank:
-            delimiter = self.DEFAULT_DELIMITER
-        elif len(delimiter_candidates) == 0:
-            delimiter = " "
-        else:
-            delimiter = delimiter_candidates[0][0]
-        return delimiter
+            return self.DEFAULT_TAB_DELIMITER
+        if self.file_properties.is_empty or self.file_properties.is_blank:
+            return self.DEFAULT_DELIMITER
+
+        candidates = self._get_most_common_non_alpha_numeric_character_from_string()
+
+        for char, _count in candidates:
+            if char in self.SAFE_DELIMITERS:
+                return char
+
+        for char, _count in candidates:
+            if self._splits_rows_consistently(char):
+                return char
+
+        if self._splits_rows_consistently(self.SPACE_DELIMITER):
+            return self.SPACE_DELIMITER
+        return self.DEFAULT_DELIMITER
 
 
 class CSVDialect:
@@ -345,25 +420,34 @@ class CSVRows:
         """Reads and returns the first line of a file.
 
         Returns:
-            The first line of the file, stripped of leading/trailing
-            whitespace, or None if the file is empty.
+            The first non-comment line of the file, stripped of
+            leading/trailing whitespace, or "" if the file has no such line.
         """
-        return self._get_first_row_from_file()
+        rows = self.leading_rows(1)
+        return rows[0] if rows else ""
 
-    def _get_first_row_from_file(self):
-        """Reads and returns the first line of a file.
+    def leading_rows(self, limit):
+        """Return up to ``limit`` leading non-comment rows, each stripped.
+
+        Skips blank and ``#``-prefixed lines so the sample matches the rows the
+        parser will actually see (mirroring ``first_row``).
+
+        Args:
+            limit (int): The maximum number of rows to return.
 
         Returns:
-            The first line of the file, stripped of leading/trailing
-            whitespace, or None if the file is empty.
+            list[str]: The leading non-comment rows, in file order.
         """
-        # errors="ignore" so a non-UTF-8 byte can't crash this first-row probe.
+        rows = []
+        # errors="ignore" so a non-UTF-8 byte can't crash this leading-rows probe.
         with open(self.filepath, "r", encoding=FileProperties(self.filepath).DEFAULT_ENCODING, errors="ignore") as csv_file:  # noqa: E501
             for line in csv_file:
                 stripped = line.strip()
                 if stripped and not stripped.startswith("#"):
-                    return stripped
-        return ""
+                    rows.append(stripped)
+                    if len(rows) >= limit:
+                        break
+        return rows
 
     @cached_property
     def row_count_with_header(self):

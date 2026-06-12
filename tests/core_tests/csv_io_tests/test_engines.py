@@ -573,13 +573,13 @@ class TestDuckDBSqlEscaping:
         assert df.columns == ["o'clock", "value", "extra"]
         assert len(df) == 2
 
-    def test_single_quote_inferred_delimiter_duckdb(self, tmp_path):
-        """An inferred ``'`` delimiter must not break the delim SQL literal.
+    def test_consistent_apostrophe_delimiter_duckdb(self, tmp_path):
+        """A consistently apostrophe-delimited file infers ``'`` and escapes it.
 
-        Delimiter inference counts non-alphanumeric characters in the first
-        row, so a header like ``a'b'c`` infers ``'`` as the delimiter. The
-        ``delim='...'`` literal must escape it (``delim=''''``) or every
-        DuckDB read of the file raises a ParserException.
+        Every row of ``a'b'c`` splits into three fields on ``'``, so inference
+        validates it as a genuine delimiter (issue #74). The ``delim='...'``
+        SQL literal must then escape it (``delim=''''``) or the DuckDB read
+        raises a ParserException.
         """
         csv_file = tmp_path / "quote_delimited.csv"
         csv_file.write_text("a'b'c\n1'2'3\n4'5'6\n")
@@ -634,12 +634,12 @@ class TestDuckDBSampleSqlEscaping:
         assert sample.columns == ["o'clock", "value", "extra"]
         assert len(sample) == 2
 
-    def test_single_quote_inferred_delimiter_samples_duckdb(self, tmp_path):
-        """An inferred ``'`` delimiter must not break the sample delim literal.
+    def test_consistent_apostrophe_delimiter_samples_duckdb(self, tmp_path):
+        """A consistently apostrophe-delimited file samples with ``'`` escaped.
 
-        A header like ``a'b'c`` infers ``'`` as the delimiter, so the
-        ``delim='...'`` literal must escape it (``delim=''''``) or every
-        DuckDB sample of the file raises a ParserException.
+        Every row of ``a'b'c`` splits into three fields on ``'``, so the
+        streaming sample validates it as the delimiter (issue #74) and the
+        ``delim`` literal must be escaped or the DuckDB sample raises.
         """
         csv_file = tmp_path / "quote_delimited.csv"
         csv_file.write_text("a'b'c\n1'2'3\n4'5'6\n")
