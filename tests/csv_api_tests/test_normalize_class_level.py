@@ -153,3 +153,46 @@ class TestWriterEngineInstanceNormalization:
             out_file = tmp_path / f"out_raw_{engine}.csv"
             writer_engine.write_csv(str(out_file), normalize_columns=False)
             assert pl.read_csv(out_file).columns == ORIGINAL_HEADERS
+
+
+class TestCSVReaderClassLevelAPI:
+    """The public CSVReader carries normalize_columns on the constructor."""
+
+    def test_constructor_flag_normalizes_all_read_outputs(self, mixed_headers_csv):
+        for engine in ALL_ENGINES:
+            reader = CSVReader(mixed_headers_csv, engine=engine, normalize_columns=True)
+            assert list(reader.to_dataframe().columns) == NORMALIZED_HEADERS
+            assert list(reader.get_sample().columns) == NORMALIZED_HEADERS
+            assert reader.to_arrow_table().column_names == NORMALIZED_HEADERS
+            assert list(reader.to_dicts()[0].keys()) == NORMALIZED_HEADERS
+
+    def test_constructor_flag_enables_normalized_query_vocabulary(self, mixed_headers_csv):
+        for engine in ALL_ENGINES:
+            reader = CSVReader(mixed_headers_csv, engine=engine, normalize_columns=True)
+            sql = f"SELECT first_name FROM {reader.db_table} WHERE last_name = 'Doe'"
+            df = _query_result_to_dataframe(reader.query_data(sql), engine)
+            assert df["first_name"].to_list() == ["John"]
+
+    def test_per_call_argument_emits_deprecation_warning(self, mixed_headers_csv):
+        reader = CSVReader(mixed_headers_csv, engine="polars")
+        with pytest.warns(DeprecationWarning, match="normalize_columns"):
+            df = reader.to_dataframe(normalize_columns=True)
+        assert list(df.columns) == NORMALIZED_HEADERS
+
+    def test_per_call_query_data_emits_deprecation_warning(self, mixed_headers_csv):
+        reader = CSVReader(mixed_headers_csv, engine="duckdb")
+        sql = f'SELECT "First Name" FROM {reader.db_table}'
+        with pytest.warns(DeprecationWarning, match="normalize_columns"):
+            result = reader.query_data(sql, normalize_columns=True)
+        assert result.pl().columns == ["first_name"]
+
+    def test_no_warning_without_per_call_argument(self, mixed_headers_csv, recwarn):
+        reader = CSVReader(mixed_headers_csv, engine="polars", normalize_columns=True)
+        reader.to_dataframe()
+        deprecations = [w for w in recwarn.list if issubclass(w.category, DeprecationWarning)]
+        assert not deprecations
+
+    def test_default_reader_behavior_unchanged(self, mixed_headers_csv):
+        for engine in ALL_ENGINES:
+            reader = CSVReader(mixed_headers_csv, engine=engine)
+            assert list(reader.to_dataframe().columns) == ORIGINAL_HEADERS
