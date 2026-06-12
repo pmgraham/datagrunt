@@ -206,3 +206,48 @@ class TestNumericLeadingFilename:
         first = DuckDBQueries(str(csv_file))
         second = DuckDBQueries(str(csv_file))
         assert first.database_table_name == second.database_table_name
+
+
+class TestDuckDBQueriesContextManager:
+    """DuckDBQueries supports the with-statement, closing on exit (issue #150)."""
+
+    def test_enter_returns_self(self, tmp_path):
+        """__enter__ returns the instance so ``with ... as q`` binds it."""
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("a,b\n1,2\n")
+        queries = DuckDBQueries(str(csv_file))
+        with queries as bound:
+            assert bound is queries
+
+    def test_with_block_closes_connection_on_normal_exit(self, tmp_path):
+        """Leaving the block closes the live connection."""
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("a,b\n1,2\n")
+        queries = DuckDBQueries(str(csv_file))
+        with queries:
+            queries.create_table()
+            assert queries._connection is not None
+        assert queries._connection is None
+
+    def test_with_block_closes_connection_on_exception(self, tmp_path):
+        """An exception inside the block still closes the connection and propagates."""
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("a,b\n1,2\n")
+        queries = DuckDBQueries(str(csv_file))
+        with pytest.raises(ValueError, match="boom"):
+            with queries:
+                queries.create_table()
+                raise ValueError("boom")
+        assert queries._connection is None
+
+    def test_reuse_after_block_reopens(self, tmp_path):
+        """The instance stays usable after the block: a later use reopens."""
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("a,b\n1,2\n3,4\n")
+        queries = DuckDBQueries(str(csv_file))
+        with queries:
+            queries.create_table()
+        # Connection was closed on exit; reuse transparently reopens and re-imports.
+        relation = queries.create_table()
+        assert relation.fetchall() == [("1", "2"), ("3", "4")]
+        queries.close()

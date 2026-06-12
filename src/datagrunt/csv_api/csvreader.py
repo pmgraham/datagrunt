@@ -44,6 +44,30 @@ class CSVReader(CSVComponents):
         """Return an empty object of the specified type."""
         return object
 
+    def close(self):
+        """Close the DuckDB connection held by this reader's engine, if any.
+
+        Only the DuckDB engine holds a live connection, and only once an
+        operation has built the cached engine; if no operation has run yet there
+        is nothing to close, so this never forces the engine (and its import)
+        into existence. ``close()`` is idempotent and the reader stays usable
+        afterward - a later call transparently rebuilds/reopens (issue #150).
+        """
+        reader = self.__dict__.get("_reader")
+        if reader is not None:
+            reader.close()
+
+    def __enter__(self):
+        """Enter a ``with`` block, returning this reader."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Close the engine's connection on leaving the ``with`` block.
+
+        Returns ``None`` so any in-flight exception propagates.
+        """
+        self.close()
+
     @cached_property
     def _reader(self):
         """Return this reader's engine, built once and reused.
