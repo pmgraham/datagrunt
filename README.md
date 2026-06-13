@@ -12,6 +12,7 @@ Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow
 ## Key Features
 
 - **Intelligent Delimiter Inference:** Datagrunt automatically detects and applies the correct delimiter for your CSV files.
+- **Rust-Accelerated Core (v4.0+):** CSV delimiter and dialect inference run in a bundled Rust extension (`datagrunt._native`) for multiple-times-faster scanning of large files. A pure-Python reference implementation ships alongside it as a built-in fallback and as the differential-parity oracle, so behavior is identical with or without the native engine.
 - **Path Object Support:** Full support for both string paths and `pathlib.Path` objects for modern, cross-platform file handling.
 - **Multiple Processing Engines:** Choose from three powerful engines - [DuckDB](https://duckdb.org), [Polars](https://pola.rs), and [PyArrow](https://arrow.apache.org/docs/python/) - to handle your data processing needs.
 - **Flexible Data Transformation:** Easily convert your processed CSV data into various formats including CSV, Excel, JSON, JSONL, and Parquet.
@@ -22,6 +23,7 @@ Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow
 ### Powertools Under The Hood
 | Tool | Description |
 |-------------------|----------------------------|
+| [Rust](https://www.rust-lang.org) / [PyO3](https://pyo3.rs) | Bundled native extension (`datagrunt._native`, abi3) that accelerates CSV delimiter & dialect inference; shipped as platform wheels with a pure-Python fallback |
 | [DuckDB](https://duckdb.org)| Fast in-process analytical database with excellent SQL support |
 | [Polars](https://pola.rs) | Multi-threaded DataFrame library written in Rust, optimized for performance |
 | [PyArrow](https://arrow.apache.org/docs/python/) | Python bindings for Apache Arrow with efficient columnar data processing |
