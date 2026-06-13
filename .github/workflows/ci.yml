@@ -26,33 +26,35 @@ jobs:
       - name: Install tesseract (for PDF OCR tests)
         run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
 
-      - name: Build the extension (editable) + dev/pdf extras
-        # --with maturin: maturin lives in the dev extra, which isn't installed
-        # yet, so `uv run maturin` can't spawn it on a fresh runner. --with makes
-        # maturin available for this invocation; maturin develop then installs
-        # the project (incl. dev,pdf extras) into the uv-managed venv.
-        run: uv run --with maturin maturin develop --release --extras dev,pdf
+      - name: Create venv, build the extension (editable), install dev/pdf extras
+        # Explicit venv + editable install (uv handles maturin build isolation
+        # automatically). We then call .venv/bin/<tool> directly rather than
+        # `uv run`, which would re-sync the project env and drop the editable
+        # install + dev extras (that was the earlier "pytest: not found" failure).
+        run: |
+          uv venv
+          uv pip install -e ".[dev,pdf]"
 
       - name: cargo test
         working-directory: rust
         run: cargo test
 
       - name: pytest (Rust backend)
-        run: uv run pytest tests/ -q
+        run: .venv/bin/pytest tests/ -q
 
       - name: pytest (Python fallback backend)
         env:
           DATAGRUNT_DISABLE_RUST: "1"
-        run: uv run pytest tests/ -q
+        run: .venv/bin/pytest tests/ -q
 
       - name: differential parity (Rust vs Python reference)
-        run: uv run pytest rust/parity -q --no-cov
+        run: .venv/bin/pytest rust/parity -q --no-cov
 
       - name: ruff (owned dirs — blocking)
-        run: uv run ruff check src/datagrunt/core/csv_io rust/parity
+        run: .venv/bin/ruff check src/datagrunt/core/csv_io rust/parity
 
       - name: ruff (full src — informational)
-        run: uv run ruff check src/datagrunt || true
+        run: .venv/bin/ruff check src/datagrunt || true
 
   build:
     name: wheel matrix
