@@ -34,6 +34,10 @@ jobs:
           args: --release --out dist
           manylinux: ${{ matrix.manylinux }}
           sccache: "true"
+          # Pin maturin: the manylinux container bakes in an older maturin that
+          # emits PEP 639 license fields with Metadata-Version < 2.4, which the
+          # latest packaging/twine rejects. 1.14.x emits canonical 2.4 metadata.
+          maturin-version: v1.14.0
 
       - name: Smoke test the wheel (host)
         shell: bash
@@ -69,6 +73,7 @@ jobs:
         with:
           command: sdist
           args: --out dist
+          maturin-version: v1.14.0
       - name: Validate sdist metadata (twine check)
         run: |
           python -m pip install --upgrade twine
