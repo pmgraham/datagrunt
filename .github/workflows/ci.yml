@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: cargo + pytest (both backends)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build the extension (editable) + dev/pdf extras
+        run: uv run maturin develop --release --extras dev,pdf
+
+      - name: cargo test
+        working-directory: rust
+        run: cargo test
+
+      - name: pytest (Rust backend)
+        run: uv run pytest tests/ -q
+
+      - name: pytest (Python fallback backend)
+        env:
+          DATAGRUNT_DISABLE_RUST: "1"
+        run: uv run pytest tests/ -q
+
+      - name: differential parity (Rust vs Python reference)
+        run: uv run pytest rust/parity -q --no-cov
+
+      - name: ruff (owned dirs — blocking)
+        run: uv run ruff check src/datagrunt/core/csv_io rust/parity
+
+      - name: ruff (full src — informational)
+        run: uv run ruff check src/datagrunt || true
+
+  build:
+    name: wheel matrix
+    uses: ./.github/workflows/build.yml
