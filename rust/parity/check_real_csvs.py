@@ -3,8 +3,8 @@
 
 Points the same Rust-vs-Python comparison the test suite uses at a directory
 (or single file) of your own CSVs, instead of the synthetic fixture corpus.
-For every file it runs each exposed ``datagrunt_rs`` function and its Python
-``csvcomponents`` counterpart and asserts the outputs are identical. Any
+For every file it runs each exposed ``datagrunt._native`` function and its Python
+``_compute_python`` counterpart and asserts the outputs are identical. Any
 disagreement is reported with the file, the function, and both values.
 
 Usage (run with the project venv, after ``maturin develop``):
@@ -29,8 +29,7 @@ from typing import Callable
 
 from datagrunt import _native as datagrunt_rs
 from datagrunt.core.csv_io import _compute_python as py
-from datagrunt.core.csv_io.csvcomponents import CSVComponents
-from datagrunt.core.csv_io.csvcomponents import CSVDialect
+from datagrunt.core.csv_io.csvcomponents import CSVComponents, CSVDialect
 
 DEFAULT_EXTENSIONS = (".csv", ".tsv", ".txt")
 LEADING_ROW_LIMITS = (1, 2, 5, 100)

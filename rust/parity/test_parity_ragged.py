@@ -1,4 +1,4 @@
-"""Parity tests for ragged-row detection (_check_csv_ragged_and_warn, bool only)."""
+"""Parity tests for ragged-row detection (check_ragged, bool only)."""
 
 from datagrunt import _native as datagrunt_rs
 from datagrunt.core.csv_io import _compute_python as py
