@@ -189,3 +189,6 @@ CODE_REVIEW_VALIDATION.md
 CODE_REVIEW*.md
 FINDINGS.md
 *-rust-vs-python.md
+
+# Example notebooks/data live in docs now — never tracked here.
+examples/
