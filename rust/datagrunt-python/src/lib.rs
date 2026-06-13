@@ -97,7 +97,8 @@ fn sniff_dialect(
 }
 
 #[pymodule]
-fn datagrunt_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+#[pyo3(name = "_native")]
+fn datagrunt_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(is_legacy_mac_newlines, m)?)?;
     m.add_function(wrap_pyfunction!(leading_rows, m)?)?;
     m.add_function(wrap_pyfunction!(first_row, m)?)?;
