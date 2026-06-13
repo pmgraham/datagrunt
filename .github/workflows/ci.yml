@@ -23,8 +23,15 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install tesseract (for PDF OCR tests)
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
+
       - name: Build the extension (editable) + dev/pdf extras
-        run: uv run maturin develop --release --extras dev,pdf
+        # --with maturin: maturin lives in the dev extra, which isn't installed
+        # yet, so `uv run maturin` can't spawn it on a fresh runner. --with makes
+        # maturin available for this invocation; maturin develop then installs
+        # the project (incl. dev,pdf extras) into the uv-managed venv.
+        run: uv run --with maturin maturin develop --release --extras dev,pdf
 
       - name: cargo test
         working-directory: rust
