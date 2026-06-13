@@ -54,6 +54,11 @@ Documentation = "https://www.datagrunt.io/"
 python-source = "src"
 module-name = "datagrunt._native"
 manifest-path = "rust/datagrunt-python/Cargo.toml"
+# maturin emits `License-File: LICENSE` metadata from the detected root LICENSE,
+# but does not pack the file into the sdist when the license is declared as text
+# rather than a file. Force-include it so the sdist satisfies PyPI's metadata
+# validation (a missing License-File is a hard 400 on upload).
+include = [{ path = "LICENSE", format = "sdist" }]
 
 [tool.bumpver]
 current_version = "4.0.0"
