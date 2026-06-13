@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "datagrunt_rs"
+name = "datagrunt_native"
 crate-type = ["cdylib"]
 
 [dependencies]

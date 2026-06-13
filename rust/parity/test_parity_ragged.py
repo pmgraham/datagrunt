@@ -2,7 +2,7 @@
 
 import warnings
 
-import datagrunt_rs
+from datagrunt import _native as datagrunt_rs
 from datagrunt.core.csv_io import csvcomponents as py
 from datagrunt.core.csv_io.csvcomponents import CSVDelimiter
 

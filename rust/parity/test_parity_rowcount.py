@@ -1,6 +1,6 @@
 """Parity tests for csv-record-aware row counting (CSVRows.row_count_with_header)."""
 
-import datagrunt_rs
+from datagrunt import _native as datagrunt_rs
 from datagrunt.core.csv_io.csvcomponents import CSVDelimiter, CSVRows
 
 

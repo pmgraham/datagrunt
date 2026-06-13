@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=74.0.0", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "datagrunt"
@@ -42,6 +42,7 @@ dev = [
     "ruff>=0.15.17",
     "bumpver>=2026.1132",
     "fastexcel>=0.20.2",
+    "maturin>=1.7,<2.0",
 ]
 
 [project.urls]
@@ -50,10 +51,10 @@ Homepage = "https://www.datagrunt.io/"
 Documentation = "https://www.datagrunt.io/"
 "Source Code" = "https://github.com/pmgraham/datagrunt"
 
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["datagrunt*"]
-exclude = ["tests*"]
+[tool.maturin]
+python-source = "src"
+module-name = "datagrunt._native"
+manifest-path = "rust/datagrunt-python/Cargo.toml"
 
 [tool.bumpver]
 current_version = "3.4.0"
