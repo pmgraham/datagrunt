@@ -13,12 +13,14 @@ jobs:
     # musllinux is intentionally omitted: duckdb (a mandatory dependency) ships
     # no musllinux wheel, so `pip install datagrunt` can't resolve in slim Alpine
     # regardless of our wheel. Revisit when duckdb publishes musllinux wheels.
+    # x86_64-apple-darwin (Intel Mac) is intentionally omitted: GitHub's macos-13
+    # runner pool chronically queues these jobs for tens of minutes, and Intel
+    # Macs are effectively obsolete. Intel-Mac users install from the sdist.
     strategy:
       fail-fast: false
       matrix:
         include:
           - { os: macos-14,         target: aarch64-apple-darwin,   manylinux: auto }
-          - { os: macos-13,         target: x86_64-apple-darwin,    manylinux: auto }
           - { os: ubuntu-latest,    target: x86_64,                 manylinux: auto }
           - { os: ubuntu-24.04-arm, target: aarch64,                manylinux: auto }
           - { os: windows-latest,   target: x86_64-pc-windows-msvc, manylinux: auto }
