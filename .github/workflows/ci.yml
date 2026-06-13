@@ -47,11 +47,8 @@ jobs:
           DATAGRUNT_DISABLE_RUST: "1"
         run: .venv/bin/pytest tests/ -q
 
-      - name: differential parity (Rust vs Python reference)
-        run: .venv/bin/pytest rust/parity -q --no-cov
-
       - name: ruff (owned dirs — blocking)
-        run: .venv/bin/ruff check src/datagrunt/core/csv_io rust/parity
+        run: .venv/bin/ruff check src/datagrunt/core/csv_io
 
       - name: ruff (full src — informational)
         run: .venv/bin/ruff check src/datagrunt || true

@@ -177,9 +177,15 @@ scripts/
 
 # Rust prototype (rust/)
 rust/target/
-rust/benchmarks/data/
+# Dev-only Rust-vs-Python parity + benchmark scripts and their result/findings
+# files live under the ignored scripts/ folder, never committed under rust/.
+rust/parity/
+rust/benchmarks/
 
-# Code-review / validation scratch docs (never commit — not documentation)
+# Code-review / validation / test-result / benchmark scratch docs (never commit
+# — not documentation)
 CODE_REVIEW_VALIDATION.md
 *_VALIDATION.md
 CODE_REVIEW*.md
+FINDINGS.md
+*-rust-vs-python.md
