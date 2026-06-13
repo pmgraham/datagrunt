@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=74.0.0", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
 
 [project]
 name = "datagrunt"
@@ -18,13 +18,12 @@ classifiers = [
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-keywords = ["csv", "data", "duckdb", "polars", "pyarrow", "xlsx", "delimiter", "ai", "gemini", "pdf"]
+keywords = ["csv", "data", "duckdb", "polars", "pyarrow", "xlsx", "delimiter", "pdf"]
 dependencies = [
     "duckdb>=1.5.3",
     "polars>=1.41.2",
     "pyarrow>=24.0.0",
     "XlsxWriter>=3.2.9",
-    "google-genai>=2.8.0"
 ]
 requires-python = ">=3.10"
 
@@ -42,6 +41,7 @@ dev = [
     "ruff>=0.15.17",
     "bumpver>=2026.1132",
     "fastexcel>=0.20.2",
+    "maturin>=1.7,<2.0",
 ]
 
 [project.urls]
@@ -50,10 +50,10 @@ Homepage = "https://www.datagrunt.io/"
 Documentation = "https://www.datagrunt.io/"
 "Source Code" = "https://github.com/pmgraham/datagrunt"
 
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["datagrunt*"]
-exclude = ["tests*"]
+[tool.maturin]
+python-source = "src"
+module-name = "datagrunt._native"
+manifest-path = "rust/datagrunt-python/Cargo.toml"
 
 [tool.bumpver]
 current_version = "3.4.1"

@@ -3,47 +3,58 @@ name: Publish to PyPI
 on:
   workflow_run:
     workflows: ["Bump Version"]
-    types:
-      - completed
-    branches:
-      - main
-  workflow_dispatch: # Allows manual triggering
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Publish target"
+        required: true
+        default: "pypi"
+        type: choice
+        options: [pypi, testpypi]
+
+permissions:
+  contents: read
 
 jobs:
-  build-and-publish:
-    name: Build and publish to PyPI
+  build:
+    name: build wheels + sdist
+    uses: ./.github/workflows/build.yml
+
+  publish:
+    name: Publish to ${{ github.event.inputs.target || 'pypi' }}
+    needs: [build]
     runs-on: ubuntu-latest
-    environment: pypi
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          github.event.workflow_run.conclusion == 'success' }}
+    environment: ${{ (github.event.inputs.target == 'testpypi') && 'testpypi' || 'pypi' }}
     permissions:
       id-token: write
-
     steps:
-      # Checkout the full history to find all tags
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
         with:
-          fetch-depth: 0
+          path: dist
+          pattern: "wheel-*"
+          merge-multiple: true
 
-      - name: Get latest tag
-        id: get_tag
-        run: echo "tag=$(git describe --tags --abbrev=0)" >> $GITHUB_OUTPUT
-
-      # Checkout the specific tagged version to publish
-      - name: Checkout tagged version
-        uses: actions/checkout@v4
+      - name: Download sdist
+        uses: actions/download-artifact@v4
         with:
-          ref: ${{ steps.get_tag.outputs.tag }}
+          name: sdist
+          path: dist
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: List artifacts to publish
+        run: ls -la dist
+
+      - name: Publish to TestPyPI
+        if: ${{ github.event.inputs.target == 'testpypi' }}
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          python-version: "3.11"
+          repository-url: https://test.pypi.org/legacy/
 
-      - name: Install build dependencies
-        run: python -m pip install --upgrade build
-
-      - name: Build package
-        run: python -m build
-
-      - name: Publish package to PyPI
+      - name: Publish to PyPI
+        if: ${{ github.event.inputs.target != 'testpypi' }}
         uses: pypa/gh-action-pypi-publish@release/v1

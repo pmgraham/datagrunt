@@ -1,0 +1,6 @@
+[workspace]
+members = ["datagrunt-core", "datagrunt-python"]
+resolver = "2"
+
+[profile.release]
+lto = true

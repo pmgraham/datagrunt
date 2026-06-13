@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: cargo + pytest (both backends)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tesseract (for PDF OCR tests)
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
+
+      - name: Create venv, build the extension (editable), install dev/pdf extras
+        # Explicit venv + editable install (uv handles maturin build isolation
+        # automatically). We then call .venv/bin/<tool> directly rather than
+        # `uv run`, which would re-sync the project env and drop the editable
+        # install + dev extras (that was the earlier "pytest: not found" failure).
+        run: |
+          uv venv --clear   # setup-uv already created .venv; --clear makes this idempotent
+          uv pip install -e ".[dev,pdf]"
+
+      - name: cargo test
+        working-directory: rust
+        run: cargo test
+
+      - name: pytest (Rust backend)
+        run: .venv/bin/pytest tests/ -q
+
+      - name: pytest (Python fallback backend)
+        env:
+          DATAGRUNT_DISABLE_RUST: "1"
+        run: .venv/bin/pytest tests/ -q
+
+      - name: ruff (owned dirs — blocking)
+        run: .venv/bin/ruff check src/datagrunt/core/csv_io
+
+      - name: ruff (full src — informational)
+        run: .venv/bin/ruff check src/datagrunt || true
+
+  build:
+    name: wheel matrix
+    uses: ./.github/workflows/build.yml

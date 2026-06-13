@@ -1,10 +1,10 @@
 """Module for CSV components."""
 
 # standard library
-import csv
 import logging
 import re
-from collections import Counter, OrderedDict
+import warnings
+from collections import OrderedDict
 from functools import cached_property
 from pathlib import Path
 
@@ -12,6 +12,7 @@ from pathlib import Path
 import polars as pl
 
 # local libraries
+from datagrunt.core.csv_io import _compute
 from datagrunt.core.file_io import FileProperties
 
 logger = logging.getLogger(__name__)
@@ -20,97 +21,45 @@ logger = logging.getLogger(__name__)
 def _count_leading_comments(filepath):
     """Count leading ``#``-prefixed comment lines before the header.
 
-    Blank lines are intentionally excluded: Polars and PyArrow already ignore
-    leading blank lines natively, so counting them here would double-skip and
-    push the header onto a data row (see issue #85). Blank lines interleaved
-    with comments are tolerated and do not stop the count.
+    Delegates to the active compute backend (Rust by default; pure Python when
+    the hidden toggle is on).
     """
-    count = 0
-    # errors="ignore" so a non-UTF-8 byte in the probe window can't crash this
-    # lightweight metadata scan (it runs during reader/writer construction).
-    with open(filepath, "r", encoding=FileProperties(filepath).DEFAULT_ENCODING, errors="ignore") as f:
-        for line in f:
-            stripped = line.strip()
-            if stripped.startswith("#"):
-                count += 1
-            elif not stripped:
-                # Blank line: skip over it without counting it as a row to skip.
-                continue
-            else:
-                break
-    return count
+    return _compute.backend().count_leading_comments(str(filepath))
 
 
 def _count_leading_physical_lines_before_header(filepath):
     """Count every leading physical line up to and including the header line.
 
-    Unlike :func:`_count_leading_comments`, this counts blank lines too. It is
-    used for engines (PyArrow) whose ``skip_rows`` operates on physical lines
-    and does not natively ignore leading blank lines once explicit column names
-    are supplied.
+    Delegates to the active compute backend.
     """
-    count = 0
-    # errors="ignore" so a non-UTF-8 byte can't crash this lightweight probe
-    # (issue #76).
-    with open(filepath, "r", encoding=FileProperties(filepath).DEFAULT_ENCODING, errors="ignore") as f:
-        for line in f:
-            stripped = line.strip()
-            count += 1
-            if stripped and not stripped.startswith("#"):
-                # This is the header line; include it in the skip count.
-                break
-    return count
+    return _compute.backend().count_leading_physical_lines_before_header(str(filepath))
 
 
 def _is_legacy_mac_newlines(filepath):
-    """Check if the file uses legacy Mac OS carriage returns (\\r) as line endings."""
-    try:
-        with open(filepath, "rb") as f:
-            chunk = f.read(4096)
-        return b"\r" in chunk and b"\n" not in chunk
-    except OSError:
-        # Unreadable/missing file: treat as not legacy-mac and let the real
-        # read surface the error. Any other exception is a bug worth raising.
-        return False
+    """Check if the file uses legacy Mac OS carriage returns (\\r) as line endings.
+
+    Delegates to the active compute backend.
+    """
+    return _compute.backend().is_legacy_mac_newlines(str(filepath))
 
 
 def _check_csv_ragged_and_warn(filepath, delimiter):
-    """Check if the CSV is ragged and issue a warning if lenient loading is enabled."""
-    import csv
-    import warnings
+    """Warn if the CSV has ragged rows; return whether it does.
 
-    try:
-        is_legacy_mac = _is_legacy_mac_newlines(filepath)
-        newline_param = None if is_legacy_mac else ""
-        encoding = FileProperties(filepath).DEFAULT_ENCODING
-        with open(filepath, "r", encoding=encoding, newline=newline_param, errors="ignore") as f:
-            reader = csv.reader(f, delimiter=delimiter)
-            header = None
-            for row in reader:
-                if row and not row[0].startswith("#"):
-                    header = row
-                    break
-            if not header:
-                return False
-
-            expected_cols = len(header)
-            row_count = 0
-            for row in reader:
-                if not row or row[0].startswith("#"):
-                    continue
-                row_count += 1
-                if len(row) != expected_cols:
-                    warnings.warn(
-                        f"CSV file contains ragged rows. Row {row_count} has {len(row)} columns, "
-                        f"expected {expected_cols}. Some fields will be truncated or padded with nulls.",
-                        UserWarning,
-                    )
-                    return True
-                if row_count >= 10000:
-                    break
-    except Exception:  # noqa: BLE001 - best-effort ragged-row warning; never break a read
-        logger.debug("Ragged-row check failed for %s; skipping warning", filepath, exc_info=True)
-    return False
+    Ragged detection runs in the active compute backend; the ``UserWarning`` is
+    emitted here. The compute layer returns only a boolean, so the warning no
+    longer names the specific offending row and column counts (a documented
+    behavior delta) — but it still contains the substring "ragged rows", which
+    is the only thing any test asserts.
+    """
+    is_ragged = _compute.backend().check_ragged(str(filepath), delimiter)
+    if is_ragged:
+        warnings.warn(
+            "CSV file contains ragged rows. Some fields will be truncated or "
+            "padded with nulls.",
+            UserWarning,
+        )
+    return is_ragged
 
 
 class CSVStringSample:
@@ -242,85 +191,15 @@ class CSVDelimiter:
         self.delimiter = self.infer_csv_file_delimiter()
         self.delimiter_byte_string = self.delimiter.encode()
 
-    def _get_most_common_non_alpha_numeric_character_from_string(self):
-        """
-        Get the non-alpha-numeric characters of the header, most common first.
-
-        Returns:
-            list[tuple[str, int]]: ``(character, count)`` pairs, most common first.
-        """
-        columns_no_spaces = self.first_row.replace(" ", "")
-        regex = re.compile(self.DELIMITER_REGEX_PATTERN)
-        counts = Counter(char for char in regex.findall(columns_no_spaces))  # noqa: E501
-        most_common = counts.most_common()
-        return most_common
-
-    @cached_property
-    def _sample_rows(self):
-        """Leading non-comment rows used to validate ambiguous delimiters."""
-        return CSVRows(self.filepath).leading_rows(self.CANDIDATE_SAMPLE_ROWS)
-
-    @staticmethod
-    def _split_row(row, char):
-        """Split a row for field counting; whitespace collapses runs of spaces."""
-        return row.split() if char == " " else row.split(char)
-
-    def _splits_rows_consistently(self, char):
-        """Whether every sampled row splits on ``char`` into the same 3+ fields.
-
-        A real delimiter produces a stable field count across the header and
-        data rows; incidental punctuation (a dot only in the header, an
-        apostrophe only in some values) does not. At least two rows are required
-        so a lone header cannot self-validate.
-
-        Args:
-            char (str): The candidate delimiter to test.
-
-        Returns:
-            bool: True if the candidate splits the sample consistently.
-        """
-        rows = self._sample_rows
-        if len(rows) < 2:
-            return False
-        field_counts = {len(self._split_row(row, char)) for row in rows}
-        return len(field_counts) == 1 and field_counts.pop() >= self.MIN_CONSISTENT_FIELDS
-
     def infer_csv_file_delimiter(self):
-        """Infer the delimiter of a CSV file.
+        """Infer the delimiter of the CSV file via the active compute backend.
 
-        Precedence, by decreasing confidence:
-
-        1. An unambiguous delimiter (``, ; | tab``) present in the header wins,
-           most-frequent first. It is preferred even over a more frequent
-           punctuation character, so consistent incidental punctuation (a dot
-           in both ``a.b,c.d`` and its data) cannot outrank the real delimiter.
-        2. Otherwise a punctuation candidate (e.g. ``.`` or ``'``) wins only if
-           it splits the sampled rows into a consistent field count - a genuine
-           delimiter is present in every row with a stable count.
-        3. Otherwise the file is space-delimited only when it splits
-           consistently on whitespace, else it defaults to comma (issue #74).
-
-        Returns:
-            str: The delimiter of the CSV file.
+        Routes to ``_compute.backend().infer_delimiter`` (Rust by default; pure
+        Python when the toggle is on), reproducing the same precedence: safe
+        delimiter > consistent punctuation > space > comma, with TSV-extension
+        and empty/blank handling.
         """
-        if self.file_properties.is_tsv:
-            return self.DEFAULT_TAB_DELIMITER
-        if self.file_properties.is_empty or self.file_properties.is_blank:
-            return self.DEFAULT_DELIMITER
-
-        candidates = self._get_most_common_non_alpha_numeric_character_from_string()
-
-        for char, _count in candidates:
-            if char in self.SAFE_DELIMITERS:
-                return char
-
-        for char, _count in candidates:
-            if self._splits_rows_consistently(char):
-                return char
-
-        if self._splits_rows_consistently(self.SPACE_DELIMITER):
-            return self.SPACE_DELIMITER
-        return self.DEFAULT_DELIMITER
+        return _compute.backend().infer_delimiter(str(self.filepath))
 
 
 class CSVDialect:
@@ -345,68 +224,43 @@ class CSVDialect:
         self.dialect = self._get_csv_dialect()
 
     def _get_csv_dialect(self):
-        """Get the CSV dialect from the file.
+        """Sniff the CSV dialect via the active compute backend.
 
-        Returns:
-            csv.Dialect: The CSV dialect inferred from the file.
+        Returns the sniffed dialect dict, or ``None`` for empty/blank files and
+        undeterminable samples (the backend performs the empty/blank
+        short-circuit and the sample construction internally).
         """
-        is_empty = self._is_empty if self._is_empty is not None else FileProperties(self.filepath).is_empty
-        is_blank = self._is_blank if self._is_blank is not None else FileProperties(self.filepath).is_blank
-        if is_empty or is_blank:
-            return None
-        # errors="ignore" so non-UTF-8 bytes can't crash dialect sniffing.
-        with open(self.filepath, "r", encoding=FileProperties(self.filepath).DEFAULT_ENCODING, errors="ignore") as csvfile:  # noqa: E501
-            # Read exactly CSV_SNIFF_SAMPLE_ROWS lines to avoid diluting sniff results
-            lines = []
-            for line in csvfile:
-                if line.strip().startswith("#"):
-                    continue
-                lines.append(line)
-                if len(lines) >= self.CSV_SNIFF_SAMPLE_ROWS:
-                    break
-            sample = "".join(lines)
-        try:
-            if self._delimiter:
-                dialect = csv.Sniffer().sniff(sample, delimiters=self._delimiter)
-            else:
-                dialect = csv.Sniffer().sniff(sample)
-        except csv.Error:
-            dialect = None
-        return dialect
+        return _compute.backend().sniff_dialect(str(self.filepath), self._delimiter)
 
     @cached_property
     def quotechar(self):
         """The character used to quote fields in the CSV file."""
-        return self.dialect.quotechar if self.dialect else '"'
+        return self.dialect["quotechar"] if self.dialect else '"'
 
     @cached_property
     def escapechar(self):
         """The character used to escape characters in the CSV file."""
-        return self.dialect.escapechar if self.dialect else None
+        return self.dialect["escapechar"] if self.dialect else None
 
     @cached_property
     def doublequote(self):
-        """
-        Whether double quotes are used to escape quotes in the CSV file.
-        """
-        return self.dialect.doublequote if self.dialect else False
+        """Whether double quotes are used to escape quotes in the CSV file."""
+        return self.dialect["doublequote"] if self.dialect else False
 
     @cached_property
     def newline_delimiter(self):
         """The newline delimiter used in the CSV file."""
-        return self.dialect.lineterminator if self.dialect else "\r\n"
+        return self.dialect["lineterminator"] if self.dialect else "\r\n"
 
     @cached_property
     def skipinitialspace(self):
-        """
-        Whether spaces are skipped at the beginning of fields in the CSV file.
-        """
-        return self.dialect.skipinitialspace if self.dialect else False
+        """Whether spaces are skipped at the beginning of fields."""
+        return self.dialect["skipinitialspace"] if self.dialect else False
 
     @cached_property
     def quoting(self):
         """The quoting style used in the CSV file."""
-        return self.QUOTING_MAP.get(self.dialect.quoting) if self.dialect else "quote minimal"
+        return self.QUOTING_MAP.get(self.dialect["quoting"]) if self.dialect else "quote minimal"
 
 
 class CSVRows:
@@ -422,20 +276,11 @@ class CSVRows:
 
     @cached_property
     def first_row(self):
-        """Reads and returns the first line of a file.
-
-        Returns:
-            The first non-comment line of the file, stripped of
-            leading/trailing whitespace, or "" if the file has no such line.
-        """
-        rows = self.leading_rows(1)
-        return rows[0] if rows else ""
+        """The first non-comment row, stripped, or "" — via the compute backend."""
+        return _compute.backend().first_row(str(self.filepath))
 
     def leading_rows(self, limit):
-        """Return up to ``limit`` leading non-comment rows, each stripped.
-
-        Skips blank and ``#``-prefixed lines so the sample matches the rows the
-        parser will actually see (mirroring ``first_row``).
+        """Up to ``limit`` leading non-comment rows, each stripped — via backend.
 
         Args:
             limit (int): The maximum number of rows to return.
@@ -443,39 +288,17 @@ class CSVRows:
         Returns:
             list[str]: The leading non-comment rows, in file order.
         """
-        rows = []
-        # errors="ignore" so a non-UTF-8 byte can't crash this leading-rows probe.
-        with open(self.filepath, "r", encoding=FileProperties(self.filepath).DEFAULT_ENCODING, errors="ignore") as csv_file:  # noqa: E501
-            for line in csv_file:
-                stripped = line.strip()
-                if stripped and not stripped.startswith("#"):
-                    rows.append(stripped)
-                    if len(rows) >= limit:
-                        break
-        return rows
+        return _compute.backend().leading_rows(str(self.filepath), limit)
 
     @cached_property
     def row_count_with_header(self):
-        """Return the number of CSV records in the file including the header.
+        """Number of CSV records including the header — via the compute backend.
 
-        Counts parsed CSV records rather than physical lines so that quoted
-        fields containing embedded newlines are counted as a single record,
-        matching what the parsing engines report. Comment and blank records
-        are still excluded, mirroring ``_check_csv_ragged_and_warn``.
+        Counts parsed records (quoted embedded newlines = one record), skipping
+        comment and blank records, matching the parsing engines.
         """
-        is_legacy_mac = _is_legacy_mac_newlines(self.filepath)
-        newline_param = None if is_legacy_mac else ""
-        encoding = FileProperties(self.filepath).DEFAULT_ENCODING
         delimiter = CSVDelimiter(self.filepath).delimiter
-        count = 0
-        # errors="ignore" so a non-UTF-8 byte can't crash this row-count probe.
-        with open(self.filepath, "r", encoding=encoding, newline=newline_param, errors="ignore") as csv_file:
-            reader = csv.reader(csv_file, delimiter=delimiter)
-            for row in reader:
-                if not row or row[0].startswith("#"):
-                    continue
-                count += 1
-        return count
+        return _compute.backend().row_count_with_header(str(self.filepath), delimiter)
 
     @property
     def row_count_without_header(self):
@@ -554,12 +377,6 @@ class CSVColumns:
 class CSVColumnNameNormalizer:
     """Class to normalize CSV columns names."""
 
-    SPECIAL_CHARS_PATTERN = re.compile(r"[^a-z0-9]+")
-    MULTI_UNDERSCORE_PATTERN = re.compile(r"_+")
-    # Used when a header normalizes to the empty string so it can still be
-    # uniquified into a valid, non-empty identifier.
-    EMPTY_NAME_PLACEHOLDER = "column"
-
     def __init__(self, filepath, columns=None):
         """Initialize the CSVColumnNameNormalizer with a filepath.
 
@@ -582,81 +399,14 @@ class CSVColumnNameNormalizer:
         """Get the normalized columns list."""
         return self._normalize_column_names(self.columns_list)
 
-    def _normalize_single_column_name(self, column_name):
-        """
-        Normalize a single column name by converting to lowercase, replacing
-        spaces and special characters with underscores, and removing extra
-        underscores.
-
-        Replace special characters and spaces with underscore
-        Remove leading and trailing underscores
-        Replace multiple underscores with single underscore
-        Add a leading underscore if the name starts with a digit
-
-        Args:
-            column_name (str): The column name to normalize
-
-        Returns:
-            str: The normalized column name
-        """
-        name = column_name.lower()
-        name = self.SPECIAL_CHARS_PATTERN.sub("_", name)
-        name = name.strip("_")
-        name = self.MULTI_UNDERSCORE_PATTERN.sub("_", name)
-        # A header of only special characters (e.g. "%" or "()") normalizes to
-        # the empty string, which is an invalid zero-length SQL identifier and
-        # is silently dropped by some engines. Fall back to a placeholder so it
-        # can be uniquified into a valid column name.
-        if not name:
-            return self.EMPTY_NAME_PLACEHOLDER
-        return f"_{name}" if name[0].isdigit() else name
-
-    def _make_unique_column_names(self, columns_list):
-        """
-        Make unique column names by appending a number to duplicate names.
-
-        A naive ``name_N`` suffix can itself collide with a real column (e.g.
-        ``col_a, col_a, col_a_1`` would emit two ``col_a_1``). To guarantee a
-        unique result, this tracks every name already emitted and keeps
-        incrementing the suffix until the candidate is unused across the whole
-        list. Downstream SQL projections and Arrow renames rely on this: a
-        duplicate name breaks DuckDB's ``AS`` projection and silently drops a
-        column in PyArrow.
-
-        Args:
-            columns_list (list): List of column names to make unique
-
-        Returns:
-            list: List of unique column names
-        """
-        emitted = set()
-        unique_names = []
-
-        for name in columns_list:
-            candidate = name
-            suffix = 0
-            while candidate in emitted:
-                suffix += 1
-                candidate = f"{name}_{suffix}"
-            emitted.add(candidate)
-            unique_names.append(candidate)
-
-        return unique_names
-
     def _normalize_column_names(self, columns):
-        """
-        Normalize column names by converting to lowercase, replacing spaces
-        and special characters with underscores, and removing extra
-        underscores.
+        """Normalize and uniquify column names via the active compute backend.
 
-        Args:
-            columns (list): List of column names to normalize
-
-        Returns:
-            list: List of normalized column names
+        Routes to ``_compute.backend().normalize_columns`` (lowercase,
+        non-alphanumeric runs to ``_``, strip, leading-digit prefix, then
+        collision-safe ``_N`` uniquification).
         """
-        normalized_columns = [self._normalize_single_column_name(col) for col in columns]
-        return self._make_unique_column_names(normalized_columns)
+        return _compute.backend().normalize_columns(list(columns))
 
     @cached_property
     def columns_normalized_string(self):

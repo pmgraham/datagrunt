@@ -163,8 +163,9 @@ docs/superpowers/
 # Local test/scratch outputs
 outputs/
 
-# Local/custom scripts
+# Local/custom scripts stay local — except the CI wheel smoke test, which CI runs.
 scripts/
+!scripts/smoke_wheel.py
 
 # Antigravity session & brain directories
 .antigravity_sessions/
@@ -174,4 +175,20 @@ scripts/
 # Gemini rules
 .geminirules
 
+# Rust prototype (rust/)
+rust/target/
+# Dev-only Rust-vs-Python parity + benchmark scripts and their result/findings
+# files live under the ignored scripts/ folder, never committed under rust/.
+rust/parity/
+rust/benchmarks/
 
+# Code-review / validation / test-result / benchmark scratch docs (never commit
+# — not documentation)
+CODE_REVIEW_VALIDATION.md
+*_VALIDATION.md
+CODE_REVIEW*.md
+FINDINGS.md
+*-rust-vs-python.md
+
+# Example notebooks/data live in docs now — never tracked here.
+examples/
