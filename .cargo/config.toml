@@ -1,3 +1,10 @@
+# macOS link flags for the PyO3 cdylib. Cargo discovers config from the CURRENT
+# WORKING DIRECTORY upward — and `maturin develop`/`uv build` run from the repo
+# root (with --manifest-path rust/...), so cargo never descends into rust/ and
+# rust/.cargo/config.toml is NOT on the search path for those builds. This
+# repo-root config supplies the flags for maturin/uv builds; rust/.cargo/config.toml
+# covers bare `cd rust && cargo ...` invocations. (Required — without it the
+# macOS extension build fails with "Undefined symbols … _Py…".)
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
 [target.x86_64-apple-darwin]

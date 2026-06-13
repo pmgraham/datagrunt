@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
+# cdylib artifact name (Rust ident — can't start with "_"). The Python module
+# name is "_native", set via #[pyo3(name = "_native")] in src/lib.rs; maturin's
+# module-name = "datagrunt._native" places it inside the datagrunt package.
 name = "datagrunt_native"
 crate-type = ["cdylib"]
 
