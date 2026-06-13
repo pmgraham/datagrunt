@@ -30,6 +30,7 @@ DEFAULT_DELIMITER = COMMA
 DEFAULT_TAB_DELIMITER = TAB
 NON_DELIMITER_CHARS = ('"', "-")
 DELIMITER_REGEX_PATTERN = "[^0-9a-zA-Z_ " + "".join(re.escape(c) for c in NON_DELIMITER_CHARS) + "]"
+DELIMITER_REGEX = re.compile(DELIMITER_REGEX_PATTERN)
 CANDIDATE_SAMPLE_ROWS = 5
 MIN_CONSISTENT_FIELDS = 3
 
@@ -148,8 +149,7 @@ def row_count_with_header(filepath, delimiter):
 def _candidates_most_common(first_row_str):
     """Non-alphanumeric header characters, most common first (Counter.most_common)."""
     columns_no_spaces = first_row_str.replace(" ", "")
-    regex = re.compile(DELIMITER_REGEX_PATTERN)
-    counts = Counter(regex.findall(columns_no_spaces))
+    counts = Counter(DELIMITER_REGEX.findall(columns_no_spaces))
     return [char for char, _ in counts.most_common()]
 
 

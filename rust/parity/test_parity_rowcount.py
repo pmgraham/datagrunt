@@ -16,4 +16,5 @@ def test_row_count_with_header(corpus_file):
 def test_row_count_without_header_is_count_minus_one(corpus_file):
     delimiter = py.infer_delimiter(str(corpus_file))
     rust_count = datagrunt_rs.row_count_with_header(str(corpus_file), delimiter)
-    assert rust_count - 1 == py.row_count_with_header(str(corpus_file), delimiter) - 1
+    py_count = py.row_count_with_header(str(corpus_file), delimiter)
+    assert rust_count - 1 == py_count - 1, "row_count_without_header parity"

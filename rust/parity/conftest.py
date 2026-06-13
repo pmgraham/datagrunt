@@ -2,7 +2,6 @@
 against the Python implementation in datagrunt.core.csv_io.csvcomponents."""
 
 import pytest
-
 from corpus import CORPUS
 
 
