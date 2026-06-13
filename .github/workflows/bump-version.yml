@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - "src/**"
+      - "rust/**"
   workflow_dispatch:
     inputs:
       part:
