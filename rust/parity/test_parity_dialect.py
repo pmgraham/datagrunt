@@ -1,5 +1,6 @@
 from datagrunt import _native as datagrunt_rs
-from datagrunt.core.csv_io.csvcomponents import CSVDelimiter, CSVDialect
+from datagrunt.core.csv_io import _compute_python as py
+from datagrunt.core.csv_io.csvcomponents import CSVDialect
 
 QUOTING_MAP = CSVDialect.QUOTING_MAP
 
@@ -25,27 +26,16 @@ def dialect_properties_from_rust(rust_dict):
     }
 
 
-def dialect_properties_from_python(dialect_obj):
-    return {
-        "quotechar": dialect_obj.quotechar,
-        "escapechar": dialect_obj.escapechar,
-        "doublequote": dialect_obj.doublequote,
-        "newline_delimiter": dialect_obj.newline_delimiter,
-        "skipinitialspace": dialect_obj.skipinitialspace,
-        "quoting": dialect_obj.quoting,
-    }
-
-
 def test_sniff_dialect_unrestricted(corpus_file):
     rust = dialect_properties_from_rust(datagrunt_rs.sniff_dialect(str(corpus_file)))
-    python = dialect_properties_from_python(CSVDialect(corpus_file))
+    python = dialect_properties_from_rust(py.sniff_dialect(str(corpus_file)))
     assert rust == python, corpus_file.name
 
 
 def test_sniff_dialect_with_delimiter_restriction(corpus_file):
-    delimiter = CSVDelimiter(corpus_file).delimiter
+    delimiter = py.infer_delimiter(str(corpus_file))
     rust = dialect_properties_from_rust(
         datagrunt_rs.sniff_dialect(str(corpus_file), delimiter)
     )
-    python = dialect_properties_from_python(CSVDialect(corpus_file, delimiter=delimiter))
+    python = dialect_properties_from_rust(py.sniff_dialect(str(corpus_file), delimiter))
     assert rust == python, corpus_file.name

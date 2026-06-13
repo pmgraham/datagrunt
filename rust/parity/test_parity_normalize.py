@@ -1,5 +1,5 @@
 from datagrunt import _native as datagrunt_rs
-from datagrunt.core.csv_io.csvcomponents import CSVColumnNameNormalizer
+from datagrunt.core.csv_io import _compute_python as py
 
 CASES = [
     ["name", "age", "city"],
@@ -15,11 +15,6 @@ CASES = [
 ]
 
 
-def normalize_py(columns):
-    # filepath is never read when columns are supplied
-    return CSVColumnNameNormalizer("unused.csv", columns=columns).columns_normalized
-
-
 def test_normalize_columns_parity():
     for columns in CASES:
-        assert datagrunt_rs.normalize_columns(columns) == normalize_py(columns), columns
+        assert datagrunt_rs.normalize_columns(columns) == py.normalize_columns(columns), columns
