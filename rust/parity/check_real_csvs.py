@@ -23,20 +23,14 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 from datagrunt import _native as datagrunt_rs
-from datagrunt.core.csv_io import csvcomponents as py
-from datagrunt.core.csv_io.csvcomponents import (
-    CSVColumnNameNormalizer,
-    CSVComponents,
-    CSVDelimiter,
-    CSVDialect,
-    CSVRows,
-)
+from datagrunt.core.csv_io import _compute_python as py
+from datagrunt.core.csv_io.csvcomponents import CSVComponents
+from datagrunt.core.csv_io.csvcomponents import CSVDialect
 
 DEFAULT_EXTENSIONS = (".csv", ".tsv", ".txt")
 LEADING_ROW_LIMITS = (1, 2, 5, 100)
@@ -110,39 +104,39 @@ def build_checks(path: Path) -> list[tuple[str, Callable[[], Outcome], Callable[
     # Lightweight probes.
     add("is_legacy_mac_newlines",
         lambda: datagrunt_rs.is_legacy_mac_newlines(p),
-        lambda: py._is_legacy_mac_newlines(path))
+        lambda: py.is_legacy_mac_newlines(p))
     add("count_leading_comments",
         lambda: datagrunt_rs.count_leading_comments(p),
-        lambda: py._count_leading_comments(path))
+        lambda: py.count_leading_comments(p))
     add("count_leading_physical_lines_before_header",
         lambda: datagrunt_rs.count_leading_physical_lines_before_header(p),
-        lambda: py._count_leading_physical_lines_before_header(path))
+        lambda: py.count_leading_physical_lines_before_header(p))
     add("first_row",
         lambda: datagrunt_rs.first_row(p),
-        lambda: CSVRows(path).first_row)
+        lambda: py.first_row(p))
     for limit in LEADING_ROW_LIMITS:
         add(f"leading_rows({limit})",
             lambda limit=limit: datagrunt_rs.leading_rows(p, limit),
-            lambda limit=limit: CSVRows(path).leading_rows(limit))
+            lambda limit=limit: py.leading_rows(p, limit))
 
     # Delimiter inference.
     add("infer_delimiter",
         lambda: datagrunt_rs.infer_delimiter(p),
-        lambda: CSVDelimiter(path).delimiter)
+        lambda: py.infer_delimiter(p))
 
     # Dialect sniffing (unrestricted + delimiter-restricted), via the same
     # property-default mapping the suite uses.
     add("sniff_dialect",
         lambda: _rust_dialect(datagrunt_rs.sniff_dialect(p)),
-        lambda: _python_dialect(CSVDialect(path)))
+        lambda: _rust_dialect(py.sniff_dialect(p)))
     add("sniff_dialect(restricted)",
-        lambda: _rust_dialect(datagrunt_rs.sniff_dialect(p, CSVDelimiter(path).delimiter)),
-        lambda: _python_dialect(CSVDialect(path, delimiter=CSVDelimiter(path).delimiter)))
+        lambda: _rust_dialect(datagrunt_rs.sniff_dialect(p, py.infer_delimiter(p))),
+        lambda: _rust_dialect(py.sniff_dialect(p, py.infer_delimiter(p))))
 
     # Column-name normalization on the file's real header.
     add("normalize_columns",
         lambda: datagrunt_rs.normalize_columns(_file_columns(path)),
-        lambda: CSVColumnNameNormalizer(path, columns=_file_columns(path)).columns_normalized)
+        lambda: py.normalize_columns(_file_columns(path)))
 
     return checks
 
@@ -156,11 +150,11 @@ def build_fullscan_checks(path: Path) -> list[tuple[str, Callable, Callable]]:
         checks.append((name, lambda: Outcome.run(rust_fn), lambda: Outcome.run(py_fn)))
 
     add("row_count_with_header",
-        lambda: datagrunt_rs.row_count_with_header(p, CSVDelimiter(path).delimiter),
-        lambda: CSVRows(path).row_count_with_header)
+        lambda: datagrunt_rs.row_count_with_header(p, py.infer_delimiter(p)),
+        lambda: py.row_count_with_header(p, py.infer_delimiter(p)))
     add("check_ragged",
-        lambda: datagrunt_rs.check_ragged(p, CSVDelimiter(path).delimiter),
-        lambda: _python_ragged(path, CSVDelimiter(path).delimiter))
+        lambda: datagrunt_rs.check_ragged(p, py.infer_delimiter(p)),
+        lambda: py.check_ragged(p, py.infer_delimiter(p)))
     return checks
 
 
@@ -185,23 +179,6 @@ def _rust_dialect(rust_dict) -> dict:
         "skipinitialspace": rust_dict["skipinitialspace"],
         "quoting": QUOTING_MAP.get(rust_dict["quoting"]),
     }
-
-
-def _python_dialect(dialect_obj: CSVDialect) -> dict:
-    return {
-        "quotechar": dialect_obj.quotechar,
-        "escapechar": dialect_obj.escapechar,
-        "doublequote": dialect_obj.doublequote,
-        "newline_delimiter": dialect_obj.newline_delimiter,
-        "skipinitialspace": dialect_obj.skipinitialspace,
-        "quoting": dialect_obj.quoting,
-    }
-
-
-def _python_ragged(path: Path, delimiter: str) -> bool:
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        return py._check_csv_ragged_and_warn(path, delimiter)
 
 
 def _file_columns(path: Path) -> list[str]:
@@ -291,7 +268,7 @@ def main() -> int:
         print(f"No files matching {extensions} found under {args.target}")
         return 0
 
-    print(f"Checking {len(files)} file(s) — Rust (datagrunt_rs) vs Python (csvcomponents)"
+    print(f"Checking {len(files)} file(s) — Rust (datagrunt_rs) vs Python (_compute_python)"
           + (" [quick: header checks only]" if args.quick else ""))
     report = Report()
     started = time.perf_counter()
