@@ -133,6 +133,25 @@ def _make_two_page_dupe_image_pdf(path):
     return str(path)
 
 
+def _make_ruled_table_pdf(path):
+    """One page with a 1-row x 3-col ruled table — a 1xN "layout table" that the
+    pymupdf engine detects as rows=1, cols=3, so drop_layout_tables removes it."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=400, height=300)
+    shape = page.new_shape()
+    shape.draw_line((50, 100), (350, 100))  # top rule
+    shape.draw_line((50, 140), (350, 140))  # bottom rule
+    for x in (50, 150, 250, 350):  # 3 columns -> 4 vertical rules
+        shape.draw_line((x, 100), (x, 140))
+    shape.finish(width=1, color=(0, 0, 0))
+    shape.commit()
+    for i, x in enumerate((60, 160, 260)):
+        page.insert_text((x, 125), f"c{i}", fontsize=10)
+    doc.save(str(path))
+    doc.close()
+    return str(path)
+
+
 class TestPDFBatchWriterFlags:
     """Verify per-document option flags reach the written output."""
 
@@ -155,22 +174,33 @@ class TestPDFBatchWriterFlags:
         files = os.listdir(out / "images" / "dup")
         assert len(files) == 2
 
-    def test_drop_layout_tables_flag_reaches_output(self, tmp_path):
-        pdf = _make_pdf(tmp_path / "doc.pdf")
-        out = tmp_path / "out"
+    def test_drop_layout_tables_flag_removes_layout_tables(self, tmp_path):
+        # Non-vacuous: the fixture genuinely renders a 1x3 ruled "table", so the
+        # flag-off run MUST contain a 1xN table and the flag-on run MUST NOT —
+        # otherwise the flag is doing nothing.
+        pdf = _make_ruled_table_pdf(tmp_path / "ruled.pdf")
 
-        results = PDFBatchWriter(drop_layout_tables=True).process([pdf], str(out))
+        def table_dims(drop_layout_tables):
+            out = tmp_path / f"out_{drop_layout_tables}"
+            (result,) = PDFBatchWriter(drop_layout_tables=drop_layout_tables).process(
+                [pdf], str(out)
+            )
+            with open(result["json_path"]) as f:
+                doc = json.load(f)
+            return [
+                (e["metadata"]["rows"], e["metadata"]["columns"])
+                for pg in doc["document"]["pages"]
+                for e in pg["elements"]
+                if e["type"] == "table"
+            ]
 
-        with open(results[0]["json_path"]) as f:
-            doc = json.load(f)
-        tables = [
-            e
-            for pg in doc["document"]["pages"]
-            for e in pg["elements"]
-            if e["type"] == "table"
-        ]
-        # With the filter on, no surviving table may be 1xN or Nx1.
-        assert all(t["metadata"]["rows"] >= 2 and t["metadata"]["columns"] >= 2 for t in tables)
+        kept = table_dims(False)
+        dropped = table_dims(True)
+        # Flag off: the 1x3 layout table is present. Flag on: every 1xN/Nx1 table
+        # is gone. And the two runs must differ — guarding against a no-op flag.
+        assert any(rows < 2 or cols < 2 for rows, cols in kept), kept
+        assert all(rows >= 2 and cols >= 2 for rows, cols in dropped), dropped
+        assert kept != dropped
 
 
 class TestBatchExports:

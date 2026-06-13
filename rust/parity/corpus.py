@@ -42,4 +42,20 @@ CORPUS: dict[str, bytes] = {
     "no_trailing_newline.csv": b"a,b\n1,2",
     "single_row_only.csv": b"just one header row\n",
     "txt_extension.txt": b"a,b\n1,2\n",
+    # Invalid-UTF-8 edge cases: the Rust DecodedReader must drop these bytes
+    # exactly as CPython's errors="ignore" incremental decoder does.
+    "lone_continuation.csv": b"a\x80b,c\n1,2\n",  # stray 0x80 mid-token
+    "truncated_multibyte.csv": b"name,city\nAnn,caf\xc3",  # ends mid 2-byte char
+    "interior_nul.csv": b"a,b\n1,x\x00y\n",  # embedded NUL inside a field
+    # Data rows whose first field legitimately starts with '#': must NOT be
+    # treated as a comment by the comment-skip logic (only LEADING comments are).
+    "hex_color_values.csv": b"color,hex\nred,#ff0000\ngreen,#00ff00\n",
+    "hash_first_data.csv": b"a,b\n#x,2\n3,4\n",
+    # Ragged row that appears just PAST the 10,000-data-row scan cap
+    # (ragged.rs MAX_DATA_ROWS_CHECKED). Validates Rust and Python cap identically.
+    "ragged_beyond_10k_cap.csv": b"a,b,c\n" + b"1,2,3\n" * 10_000 + b"9,9\n",
+    # Quoted field with an embedded newline straddling the 64 KiB streaming
+    # decoder chunk boundary (io.rs CHUNK_SIZE). Exercises row counting across
+    # the chunk split for both backends.
+    "chunk_boundary_quoted_newline.csv": b"a,b\n" + b"x" * 65_528 + b',"line1\nline2"\n',
 }

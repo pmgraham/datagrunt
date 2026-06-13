@@ -82,7 +82,11 @@ fn sniff_dialect(
         return Ok(None);
     }
     let sample = datagrunt_core::dialect::sniff_sample(&path).map_err(oserr)?;
-    let Some(d) = datagrunt_core::dialect::sniff(&sample, delimiter.as_deref()) else {
+    // An empty delimiter string is Python-falsy (`if delimiter:`), meaning "no
+    // restriction" — normalize it to None so it doesn't reject every candidate
+    // (Some("") would make the substring guard `"".contains(x)` reject all).
+    let delimiter = delimiter.as_deref().filter(|s| !s.is_empty());
+    let Some(d) = datagrunt_core::dialect::sniff(&sample, delimiter) else {
         return Ok(None);
     };
     let dict = PyDict::new(py);

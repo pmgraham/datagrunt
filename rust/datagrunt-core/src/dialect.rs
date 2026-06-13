@@ -145,7 +145,14 @@ fn guess_quote_and_delimiter(data: &str, delimiters: Option<&str>) -> QuoteGuess
     for (regexp, has_groups) in COMPILED_QUOTE_PATTERNS.iter() {
         let mut found = Vec::new();
         for caps in regexp.captures_iter(data) {
-            let caps = caps.expect("capture iteration");
+            // fancy_regex returns Err when its backtrack limit is exhausted,
+            // which is reachable on adversarial input (e.g. one multi-MB line of
+            // alternating quotes and delimiters). CPython's `re` has no such
+            // limit, so to avoid a panic crossing the FFI boundary we stop
+            // scanning this pattern and use the matches gathered so far; sniffing
+            // then falls through to the frequency-based guess exactly as it would
+            // for an empty match set.
+            let Ok(caps) = caps else { break };
             let quote = caps.name("quote").map(|m| m.as_str().to_string());
             let delim = caps.name("delim").map(|m| m.as_str().to_string());
             let space = caps.name("space").map(|m| m.as_str().to_string());
@@ -225,10 +232,14 @@ fn guess_quote_and_delimiter(data: &str, delimiters: Option<&str>) -> QuoteGuess
         delim = escaped_delim,
         quote = quotechar,
     );
+    // A failed compile (defensive — the pattern is built from a single-char
+    // quotechar and an fancy_regex::escape'd delimiter) or a backtrack-limit Err
+    // on adversarial input is treated as "no doubled quotes", matching the
+    // graceful degradation above rather than panicking across the FFI boundary.
     let doublequote = Regex::new(&dq_pattern)
-        .expect("doublequote pattern is valid")
-        .is_match(data)
-        .expect("doublequote search");
+        .ok()
+        .and_then(|re| re.is_match(data).ok())
+        .unwrap_or(false);
 
     QuoteGuess {
         quotechar,
@@ -539,5 +550,20 @@ mod tests {
         // restriction to ':' even though ',' is present and more frequent.
         let d = sniff("a:b,c\n1:2,3\n", Some(":")).expect("restricted");
         assert_eq!(d.delimiter, ":");
+    }
+
+    #[test]
+    fn adversarial_long_line_does_not_panic() {
+        // One ~1.8 MB newline-free line of alternating quotes and delimiters
+        // drives fancy_regex past its backtrack limit. Before the graceful-Err
+        // fix this PANICKED (BacktrackLimitExceeded) and crossed the FFI
+        // boundary; now it must degrade to the frequency guess and recover the
+        // delimiter ',', matching CPython's csv.Sniffer on the same input.
+        let mut sample = String::from(",'a'");
+        for _ in 0..600_000 {
+            sample.push_str(",a'");
+        }
+        let d = sniff(&sample, None).expect("graceful frequency fallback yields a delimiter");
+        assert_eq!(d.delimiter, ",");
     }
 }
