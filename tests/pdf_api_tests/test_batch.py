@@ -5,7 +5,7 @@ import os
 
 import pymupdf
 
-from datagrunt.pdf_api.batch import process_pdfs
+from datagrunt.pdf_api.batch import PDFBatchWriter
 
 
 def _make_pdf(path, text="Hello batch"):
@@ -21,15 +21,15 @@ def _make_pdf(path, text="Hello batch"):
     return str(path)
 
 
-class TestProcessPdfs:
-    """Test suite for process_pdfs."""
+class TestPDFBatchWriter:
+    """Test suite for PDFBatchWriter.process."""
 
     def test_writes_one_json_per_document(self, tmp_path):
         pdf_a = _make_pdf(tmp_path / "alpha.pdf")
         pdf_b = _make_pdf(tmp_path / "beta.pdf")
         out = tmp_path / "out"
 
-        results = process_pdfs([pdf_a, pdf_b], str(out))
+        results = PDFBatchWriter().process([pdf_a, pdf_b], str(out))
 
         assert len(results) == 2
         assert all(r["status"] == "success" for r in results)
@@ -47,7 +47,7 @@ class TestProcessPdfs:
         pdf = _make_pdf(tmp_path / "doc.pdf")
         out = tmp_path / "out"
 
-        process_pdfs([pdf], str(out))
+        PDFBatchWriter().process([pdf], str(out))
 
         img_dir = out / "doc_images"
         assert img_dir.is_dir()
@@ -57,7 +57,7 @@ class TestProcessPdfs:
         pdf = _make_pdf(tmp_path / "doc.pdf")
         out = tmp_path / "out"
 
-        process_pdfs([pdf], str(out), images=False)
+        PDFBatchWriter(images=False).process([pdf], str(out))
 
         assert not (out / "doc_images").exists()
 
@@ -66,7 +66,7 @@ class TestProcessPdfs:
         bad = str(tmp_path / "nope.pdf")  # does not exist
         out = tmp_path / "out"
 
-        results = process_pdfs([bad, good], str(out))
+        results = PDFBatchWriter().process([bad, good], str(out))
 
         by_source = {r["source"]: r for r in results}
         assert by_source[bad]["status"] == "error"
@@ -77,8 +77,12 @@ class TestProcessPdfs:
     def test_results_preserve_input_order(self, tmp_path):
         pdfs = [_make_pdf(tmp_path / f"doc{i}.pdf") for i in range(3)]
         out = tmp_path / "out"
-        results = process_pdfs(pdfs, str(out))
+        results = PDFBatchWriter().process(pdfs, str(out))
         assert [r["source"] for r in results] == pdfs
+
+    def test_empty_input_returns_empty_list(self, tmp_path):
+        out = tmp_path / "out"
+        assert PDFBatchWriter().process([], str(out)) == []
 
 
 def _make_two_page_dupe_image_pdf(path):
@@ -95,14 +99,14 @@ def _make_two_page_dupe_image_pdf(path):
     return str(path)
 
 
-class TestProcessPdfsFlags:
+class TestPDFBatchWriterFlags:
     """Verify per-document option flags reach the written output."""
 
     def test_dedupe_images_default_collapses_duplicates(self, tmp_path):
         pdf = _make_two_page_dupe_image_pdf(tmp_path / "dup.pdf")
         out = tmp_path / "out"
 
-        process_pdfs([pdf], str(out))
+        PDFBatchWriter().process([pdf], str(out))
 
         # Two identical images across pages collapse to a single file on disk.
         files = [f for f in os.listdir(out / "dup_images")]
@@ -112,7 +116,7 @@ class TestProcessPdfsFlags:
         pdf = _make_two_page_dupe_image_pdf(tmp_path / "dup.pdf")
         out = tmp_path / "out"
 
-        process_pdfs([pdf], str(out), dedupe_images=False)
+        PDFBatchWriter(dedupe_images=False).process([pdf], str(out))
 
         files = [f for f in os.listdir(out / "dup_images")]
         assert len(files) == 2
@@ -121,7 +125,7 @@ class TestProcessPdfsFlags:
         pdf = _make_pdf(tmp_path / "doc.pdf")
         out = tmp_path / "out"
 
-        results = process_pdfs([pdf], str(out), drop_layout_tables=True)
+        results = PDFBatchWriter(drop_layout_tables=True).process([pdf], str(out))
 
         with open(results[0]["json_path"]) as f:
             doc = json.load(f)
@@ -136,14 +140,14 @@ class TestProcessPdfsFlags:
 
 
 class TestBatchExports:
-    """process_pdfs should be importable from the package roots."""
+    """PDFBatchWriter should be importable from the package roots."""
 
     def test_pdf_api_export(self):
-        from datagrunt.pdf_api import process_pdfs as p
+        from datagrunt.pdf_api import PDFBatchWriter as p
 
-        assert p is process_pdfs
+        assert p is PDFBatchWriter
 
     def test_top_level_export(self):
-        from datagrunt import process_pdfs as p
+        from datagrunt import PDFBatchWriter as p
 
-        assert p is process_pdfs
+        assert p is PDFBatchWriter

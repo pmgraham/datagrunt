@@ -53,46 +53,65 @@ def _process_one_pdf(path, options):
         return {"source": source, "status": "error", "error": str(e)}
 
 
-def process_pdfs(
-    paths,
-    output_dir,
-    *,
-    max_workers=None,
-    engine="pymupdf",
-    images=True,
-    dedupe_images=True,
-    drop_layout_tables=False,
-):
-    """Process many PDFs concurrently across processes, writing one set of
-    outputs per document.
+class PDFBatchWriter:
+    """Write JSON (and optionally images) for many PDFs across worker processes.
+
+    Extraction options that apply to every document in the batch are set once on
+    the instance; :meth:`process` then runs a corpus of PDFs against those
+    settings. This mirrors the per-document
+    :class:`~datagrunt.pdf_api.pdfwriter.PDFWriter` so the batch surface reads
+    the same way as the rest of the package.
+
+    Example:
+        writer = PDFBatchWriter(images=True, dedupe_images=True)
+        results = writer.process(["a.pdf", "b.pdf"], "out/")
 
     Args:
-        paths: Iterable of PDF file paths (str or Path).
-        output_dir: Directory where per-document outputs are written. Created if
-            it does not exist. Each PDF yields ``<stem>.json`` and, when
-            ``images`` is True, an ``<stem>_images/`` directory.
-        max_workers: Number of worker processes. ``None`` uses the
-            ProcessPoolExecutor default (``os.cpu_count()``).
         engine: PDF engine to use (currently ``"pymupdf"``).
         images: Whether to extract embedded images per document.
         dedupe_images: Collapse byte-identical duplicate images per document.
         drop_layout_tables: Drop 1xN / Nx1 layout-box "tables".
-
-    Returns:
-        A list of result records (input order preserved), each one of:
-        ``{"source", "status": "success", "json_path"}`` or
-        ``{"source", "status": "error", "error"}``.
     """
-    os.makedirs(output_dir, exist_ok=True)
-    options = _BatchOptions(
-        output_dir=str(output_dir),
-        engine=engine,
-        images=images,
-        dedupe_images=dedupe_images,
-        drop_layout_tables=drop_layout_tables,
-    )
-    sources = [str(p) for p in paths]
-    if not sources:
-        return []
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        return list(executor.map(_process_one_pdf, sources, [options] * len(sources)))
+
+    def __init__(
+        self,
+        *,
+        engine="pymupdf",
+        images=True,
+        dedupe_images=True,
+        drop_layout_tables=False,
+    ):
+        self.engine = engine
+        self.images = images
+        self.dedupe_images = dedupe_images
+        self.drop_layout_tables = drop_layout_tables
+
+    def process(self, paths, output_dir, *, max_workers=None):
+        """Process many PDFs concurrently, writing one set of outputs per document.
+
+        Args:
+            paths: Iterable of PDF file paths (str or Path).
+            output_dir: Directory where per-document outputs are written. Created
+                if it does not exist. Each PDF yields ``<stem>.json`` and, when
+                ``images`` is True, an ``<stem>_images/`` directory.
+            max_workers: Number of worker processes. ``None`` uses the
+                ProcessPoolExecutor default (``os.cpu_count()``).
+
+        Returns:
+            A list of result records (input order preserved), each one of:
+            ``{"source", "status": "success", "json_path"}`` or
+            ``{"source", "status": "error", "error"}``.
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        options = _BatchOptions(
+            output_dir=str(output_dir),
+            engine=self.engine,
+            images=self.images,
+            dedupe_images=self.dedupe_images,
+            drop_layout_tables=self.drop_layout_tables,
+        )
+        sources = [str(p) for p in paths]
+        if not sources:
+            return []
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            return list(executor.map(_process_one_pdf, sources, [options] * len(sources)))

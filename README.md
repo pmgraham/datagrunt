@@ -259,24 +259,26 @@ per process, each single-threaded. (Per-page threads do not speed up extraction:
 the dominant cost, table detection, is pure-Python and GIL-bound.)
 
 ```python
-from datagrunt import process_pdfs
+from datagrunt import PDFBatchWriter
 
 paths = ["a.pdf", "b.pdf", "c.pdf"]
-results = process_pdfs(paths, "out/")   # writes out/<stem>.json (+ out/<stem>_images/)
+writer = PDFBatchWriter()                 # set per-document options once
+results = writer.process(paths, "out/")   # writes out/<stem>.json (+ out/<stem>_images/)
 # results: [{"source": "a.pdf", "status": "success", "json_path": "out/a.json"}, ...]
 ```
 
 A malformed PDF is reported as a `{"status": "error", ...}` record without
-aborting the rest of the batch. Pass `images=False`, `dedupe_images=False`, or
-`drop_layout_tables=True` to control per-document output, and `max_workers=N` to
-cap processes (defaults to the CPU count).
+aborting the rest of the batch. Construct the writer with `images=False`,
+`dedupe_images=False`, or `drop_layout_tables=True` to control per-document
+output, and pass `max_workers=N` to `process` to cap processes (defaults to the
+CPU count).
 
 Because it uses a process pool (the `spawn` start method on macOS/Windows), call
-`process_pdfs` from an importable script under an `if __name__ == "__main__":`
-guard — not from a REPL, `python -c`, or piped stdin, where worker processes
-cannot re-import the entry module.
+`PDFBatchWriter().process` from an importable script under an
+`if __name__ == "__main__":` guard — not from a REPL, `python -c`, or piped
+stdin, where worker processes cannot re-import the entry module.
 
-**Apache Beam / Dataflow:** do **not** call `process_pdfs` inside a pipeline —
+**Apache Beam / Dataflow:** do **not** call `PDFBatchWriter().process` inside a pipeline —
 it would nest process pools and oversubscribe the CPU. Instead, map the
 per-document work in a `DoFn` / `beam.Map` using `PDFWriter(path, workers=1)` and
 let the runner fan documents out. Dataflow runs multiple worker processes per VM
