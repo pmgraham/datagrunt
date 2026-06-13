@@ -232,23 +232,46 @@ class Report:
     divergences: list[Divergence] = field(default_factory=list)
 
 
-def check_file(path: Path, quick: bool, verbose: bool) -> tuple[int, list[Divergence]]:
+@dataclass
+class CheckResult:
+    """One Rust-vs-Python comparison for one file — pass or fail."""
+
+    file: Path
+    check: str
+    rust: str
+    python: str
+    agree: bool
+
+
+def run_file_checks(path: Path | str, quick: bool = False) -> list[CheckResult]:
+    """Run every Rust-vs-Python check for one file and return ALL results.
+
+    This is the reusable core used by both the CLI and interactive callers
+    (e.g. a Jupyter notebook), which want the full table including the checks
+    that passed, not just the divergences.
+    """
+    path = Path(path)
     checks = build_checks(path)
     if not quick:
         checks = checks + build_fullscan_checks(path)
 
-    divergences: list[Divergence] = []
+    results: list[CheckResult] = []
     for name, rust_call, python_call in checks:
         rust = rust_call()
         python = python_call()
-        if not outcomes_agree(rust, python):
-            divergences.append(
-                Divergence(path, name, rust.describe(), python.describe())
-            )
-        if verbose:
-            status = "OK " if not divergences or divergences[-1].check != name else "XX "
-            print(f"    {status}{name}")
-    return len(checks), divergences
+        results.append(
+            CheckResult(path, name, rust.describe(), python.describe(), outcomes_agree(rust, python))
+        )
+    return results
+
+
+def check_file(path: Path, quick: bool, verbose: bool) -> tuple[int, list[Divergence]]:
+    results = run_file_checks(path, quick)
+    if verbose:
+        for r in results:
+            print(f"    {'OK ' if r.agree else 'XX '}{r.check}")
+    divergences = [Divergence(r.file, r.check, r.rust, r.python) for r in results if not r.agree]
+    return len(results), divergences
 
 
 def main() -> int:
