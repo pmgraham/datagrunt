@@ -94,10 +94,15 @@ class TestRotatedPageCoordinates:
 
 
 class TestUnrotatedCoordinatesRegressionGuard:
-    """Lock the exact rotation-0 coordinates so the rotation fix can't drift them.
+    """Lock the rotation-0 coordinates so the rotation fix can't drift them.
 
-    These literals were captured from the pre-fix code; an unrotated page MUST be
-    byte-for-byte unchanged by any rotation-handling change.
+    The literals were captured from the pre-fix code. Text coordinates are
+    compared with a 1pt tolerance, not byte-for-byte: the baseline PDF uses a
+    non-embedded font, so pdfium derives glyph boxes from platform font metrics
+    that vary sub-pixel across its per-platform binaries (≤0.34pt between macOS
+    arm64 and linux x86_64 at the same pypdfium2 5.9.0 / pdfium 150.0.7869.0). A
+    real rotation regression moves coordinates by tens of points, so the 1pt
+    window still guards the intent while staying portable across CI runners.
     """
 
     @staticmethod
@@ -121,8 +126,8 @@ class TestUnrotatedCoordinatesRegressionGuard:
         with PdfiumDocument(pdf) as doc:
             items = list(doc.page(0).text_items())
         coords = {it.text: (it.x0, it.x1, it.y_top, it.y_bot) for it in items}
-        assert coords["Quarterly Report"] == (73.03, 249.22, 54.5, 77.02)
-        assert coords["Body line one here."] == (72.8, 165.82, 112.12, 122.3)
+        assert coords["Quarterly Report"] == pytest.approx((73.03, 249.22, 54.5, 77.02), abs=1.0)
+        assert coords["Body line one here."] == pytest.approx((72.8, 165.82, 112.12, 122.3), abs=1.0)
 
     def test_unrotated_image_bbox_unchanged(self, tmp_path):
         pdf = self._baseline_pdf(tmp_path)
