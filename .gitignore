@@ -178,3 +178,8 @@ scripts/
 # Rust prototype (rust/)
 rust/target/
 rust/benchmarks/data/
+
+# Code-review / validation scratch docs (never commit — not documentation)
+CODE_REVIEW_VALIDATION.md
+*_VALIDATION.md
+CODE_REVIEW*.md
