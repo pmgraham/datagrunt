@@ -21,6 +21,7 @@ from datagrunt.core.csv_io.csvcomponents import (
     _check_csv_ragged_and_warn,
     _count_leading_comments,
     _count_leading_physical_lines_before_header,
+    _is_legacy_mac_newlines,
 )
 from datagrunt.core.databases import DuckDBQueries
 
@@ -46,18 +47,6 @@ def _has_midfile_comments(filepath):
             elif stripped.startswith("#"):
                 return True
     return False
-
-
-def _is_legacy_mac_newlines(filepath):
-    """Check if the file uses legacy Mac OS carriage returns (\\r) as line endings."""
-    try:
-        with open(filepath, "rb") as f:
-            chunk = f.read(4096)
-        return b"\r" in chunk and b"\n" not in chunk
-    except OSError:
-        # Unreadable/missing file: treat as not legacy-mac and let the real
-        # read surface the error. Any other exception is a bug worth raising.
-        return False
 
 
 def _resolve_normalize_columns(instance_default, per_call_value):

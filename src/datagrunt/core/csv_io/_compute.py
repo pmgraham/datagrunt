@@ -1,0 +1,45 @@
+"""Dispatch between the Rust extension and the pure-Python reference.
+
+The CSV-compute sites in ``csvcomponents`` call ``backend().<fn>(...)``.
+``backend()`` is read at call time, so toggling takes effect immediately.
+
+HIDDEN toggle — for testing/diagnostics only; intentionally undocumented and not
+exported in any ``__all__``:
+- env var ``DATAGRUNT_DISABLE_RUST`` (set to a non-empty, non-"0"/"false" value)
+- ``set_disable_rust(bool)``
+- ``rust_disabled()`` context manager (scoped, auto-resets)
+
+Default is Rust (``disable_rust=False``); the binary always ships and is the
+default path.
+"""
+
+import contextlib
+import os
+
+from datagrunt import _native
+from datagrunt.core.csv_io import _compute_python
+
+_DISABLE_RUST = os.environ.get("DATAGRUNT_DISABLE_RUST", "") not in ("", "0", "false", "False")
+
+
+def set_disable_rust(value):
+    """Force the pure-Python path (True) or Rust (False). Hidden test hook."""
+    global _DISABLE_RUST
+    _DISABLE_RUST = bool(value)
+
+
+@contextlib.contextmanager
+def rust_disabled():
+    """Temporarily force the pure-Python path; restore the prior state on exit."""
+    global _DISABLE_RUST
+    previous = _DISABLE_RUST
+    _DISABLE_RUST = True
+    try:
+        yield
+    finally:
+        _DISABLE_RUST = previous
+
+
+def backend():
+    """Return the active compute backend module (read at call time)."""
+    return _compute_python if _DISABLE_RUST else _native

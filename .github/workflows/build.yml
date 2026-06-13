@@ -1,0 +1,71 @@
+name: Build wheels
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: wheel ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    # musllinux is intentionally omitted: duckdb (a mandatory dependency) ships
+    # no musllinux wheel, so `pip install datagrunt` can't resolve in slim Alpine
+    # regardless of our wheel. Revisit when duckdb publishes musllinux wheels.
+    # x86_64-apple-darwin (Intel Mac) is intentionally omitted: GitHub's macos-13
+    # runner pool chronically queues these jobs for tens of minutes, and Intel
+    # Macs are effectively obsolete. Intel-Mac users install from the sdist.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14,         target: aarch64-apple-darwin,   manylinux: auto }
+          - { os: ubuntu-latest,    target: x86_64,                 manylinux: auto }
+          - { os: ubuntu-24.04-arm, target: aarch64,                manylinux: auto }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc, manylinux: auto }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: ${{ matrix.manylinux }}
+          sccache: "true"
+
+      - name: Smoke test the wheel (host)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # Install the freshly built wheel BY PATH so pip can't substitute a
+          # higher-versioned pure-Python release from PyPI (which lacks _native).
+          # Dependencies still resolve from PyPI.
+          python -m pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          python "$GITHUB_WORKSPACE/scripts/smoke_wheel.py"
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
