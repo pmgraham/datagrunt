@@ -1,0 +1,149 @@
+"""Tests for document-level batch PDF processing."""
+
+import json
+import os
+
+import pymupdf
+
+from datagrunt.pdf_api.batch import process_pdfs
+
+
+def _make_pdf(path, text="Hello batch"):
+    """Write a tiny one-page PDF with text and one embedded image."""
+    doc = pymupdf.open()
+    page = doc.new_page(width=300, height=300)
+    page.insert_text((50, 50), text, fontsize=18)
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 80, 80))
+    pix.set_rect(pix.irect, (10, 200, 100))
+    page.insert_image(pymupdf.Rect(50, 100, 130, 180), stream=pix.tobytes("png"))
+    doc.save(str(path))
+    doc.close()
+    return str(path)
+
+
+class TestProcessPdfs:
+    """Test suite for process_pdfs."""
+
+    def test_writes_one_json_per_document(self, tmp_path):
+        pdf_a = _make_pdf(tmp_path / "alpha.pdf")
+        pdf_b = _make_pdf(tmp_path / "beta.pdf")
+        out = tmp_path / "out"
+
+        results = process_pdfs([pdf_a, pdf_b], str(out))
+
+        assert len(results) == 2
+        assert all(r["status"] == "success" for r in results)
+        assert {os.path.basename(r["json_path"]) for r in results} == {
+            "alpha.json",
+            "beta.json",
+        }
+        for r in results:
+            assert os.path.isfile(r["json_path"])
+            with open(r["json_path"]) as f:
+                doc = json.load(f)
+            assert doc["document"]["total_pages"] == 1
+
+    def test_images_written_by_default(self, tmp_path):
+        pdf = _make_pdf(tmp_path / "doc.pdf")
+        out = tmp_path / "out"
+
+        process_pdfs([pdf], str(out))
+
+        img_dir = out / "doc_images"
+        assert img_dir.is_dir()
+        assert len(os.listdir(img_dir)) >= 1
+
+    def test_images_disabled(self, tmp_path):
+        pdf = _make_pdf(tmp_path / "doc.pdf")
+        out = tmp_path / "out"
+
+        process_pdfs([pdf], str(out), images=False)
+
+        assert not (out / "doc_images").exists()
+
+    def test_bad_path_isolated_from_good_ones(self, tmp_path):
+        good = _make_pdf(tmp_path / "good.pdf")
+        bad = str(tmp_path / "nope.pdf")  # does not exist
+        out = tmp_path / "out"
+
+        results = process_pdfs([bad, good], str(out))
+
+        by_source = {r["source"]: r for r in results}
+        assert by_source[bad]["status"] == "error"
+        assert "error" in by_source[bad]
+        assert by_source[good]["status"] == "success"
+        assert os.path.isfile(by_source[good]["json_path"])
+
+    def test_results_preserve_input_order(self, tmp_path):
+        pdfs = [_make_pdf(tmp_path / f"doc{i}.pdf") for i in range(3)]
+        out = tmp_path / "out"
+        results = process_pdfs(pdfs, str(out))
+        assert [r["source"] for r in results] == pdfs
+
+
+def _make_two_page_dupe_image_pdf(path):
+    """Two pages, the same image on each -> a byte-duplicate pair."""
+    doc = pymupdf.open()
+    pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 90, 90))
+    pix.set_rect(pix.irect, (200, 30, 30))
+    img = pix.tobytes("png")
+    for _ in range(2):
+        page = doc.new_page(width=300, height=300)
+        page.insert_image(pymupdf.Rect(40, 40, 130, 130), stream=img)
+    doc.save(str(path))
+    doc.close()
+    return str(path)
+
+
+class TestProcessPdfsFlags:
+    """Verify per-document option flags reach the written output."""
+
+    def test_dedupe_images_default_collapses_duplicates(self, tmp_path):
+        pdf = _make_two_page_dupe_image_pdf(tmp_path / "dup.pdf")
+        out = tmp_path / "out"
+
+        process_pdfs([pdf], str(out))
+
+        # Two identical images across pages collapse to a single file on disk.
+        files = [f for f in os.listdir(out / "dup_images")]
+        assert len(files) == 1
+
+    def test_dedupe_images_disabled_keeps_both(self, tmp_path):
+        pdf = _make_two_page_dupe_image_pdf(tmp_path / "dup.pdf")
+        out = tmp_path / "out"
+
+        process_pdfs([pdf], str(out), dedupe_images=False)
+
+        files = [f for f in os.listdir(out / "dup_images")]
+        assert len(files) == 2
+
+    def test_drop_layout_tables_flag_reaches_output(self, tmp_path):
+        pdf = _make_pdf(tmp_path / "doc.pdf")
+        out = tmp_path / "out"
+
+        results = process_pdfs([pdf], str(out), drop_layout_tables=True)
+
+        with open(results[0]["json_path"]) as f:
+            doc = json.load(f)
+        tables = [
+            e
+            for pg in doc["document"]["pages"]
+            for e in pg["elements"]
+            if e["type"] == "table"
+        ]
+        # With the filter on, no surviving table may be 1xN or Nx1.
+        assert all(t["metadata"]["rows"] >= 2 and t["metadata"]["columns"] >= 2 for t in tables)
+
+
+class TestBatchExports:
+    """process_pdfs should be importable from the package roots."""
+
+    def test_pdf_api_export(self):
+        from datagrunt.pdf_api import process_pdfs as p
+
+        assert p is process_pdfs
+
+    def test_top_level_export(self):
+        from datagrunt import process_pdfs as p
+
+        assert p is process_pdfs
