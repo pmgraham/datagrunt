@@ -18,13 +18,12 @@ classifiers = [
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-keywords = ["csv", "data", "duckdb", "polars", "pyarrow", "xlsx", "delimiter", "ai", "gemini", "pdf"]
+keywords = ["csv", "data", "duckdb", "polars", "pyarrow", "xlsx", "delimiter", "pdf"]
 dependencies = [
     "duckdb>=1.5.3",
     "polars>=1.41.2",
     "pyarrow>=24.0.0",
     "XlsxWriter>=3.2.9",
-    "google-genai>=2.8.0"
 ]
 requires-python = ">=3.10"
 
