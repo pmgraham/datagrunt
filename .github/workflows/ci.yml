@@ -32,7 +32,7 @@ jobs:
         # `uv run`, which would re-sync the project env and drop the editable
         # install + dev extras (that was the earlier "pytest: not found" failure).
         run: |
-          uv venv
+          uv venv --clear   # setup-uv already created .venv; --clear makes this idempotent
           uv pip install -e ".[dev,pdf]"
 
       - name: cargo test
