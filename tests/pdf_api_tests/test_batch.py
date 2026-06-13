@@ -4,6 +4,7 @@ import json
 import os
 
 import pymupdf
+import pytest
 
 from datagrunt.pdf_api.batch import PDFBatchWriter
 
@@ -33,33 +34,62 @@ class TestPDFBatchWriter:
 
         assert len(results) == 2
         assert all(r["status"] == "success" for r in results)
+        # JSON lands in its own json/ subdirectory, one file per document.
         assert {os.path.basename(r["json_path"]) for r in results} == {
             "alpha.json",
             "beta.json",
         }
         for r in results:
+            assert os.path.dirname(r["json_path"]) == str(out / "json")
             assert os.path.isfile(r["json_path"])
             with open(r["json_path"]) as f:
                 doc = json.load(f)
             assert doc["document"]["total_pages"] == 1
 
-    def test_images_written_by_default(self, tmp_path):
+    def test_text_and_images_go_to_separate_directories(self, tmp_path):
         pdf = _make_pdf(tmp_path / "doc.pdf")
         out = tmp_path / "out"
 
-        PDFBatchWriter().process([pdf], str(out))
+        (result,) = PDFBatchWriter(markdown=True, jsonl=True).process([pdf], str(out))
 
-        img_dir = out / "doc_images"
-        assert img_dir.is_dir()
-        assert len(os.listdir(img_dir)) >= 1
+        assert result["json_path"] == str(out / "json" / "doc.json")
+        assert result["jsonl_path"] == str(out / "jsonl" / "doc.jsonl")
+        assert result["markdown_path"] == str(out / "markdown" / "doc.md")
+        assert result["images_dir"] == str(out / "images" / "doc")
+        for path in (result["json_path"], result["jsonl_path"], result["markdown_path"]):
+            assert os.path.isfile(path)
+        # Images live under images/<stem>/, not alongside the text outputs.
+        assert os.path.isdir(result["images_dir"])
+        assert len(os.listdir(result["images_dir"])) >= 1
+
+    def test_markdown_written_only_when_enabled(self, tmp_path):
+        pdf = _make_pdf(tmp_path / "doc.pdf")
+        out = tmp_path / "out"
+
+        (result,) = PDFBatchWriter().process([pdf], str(out))
+
+        assert "markdown_path" not in result
+        assert not (out / "markdown").exists()
 
     def test_images_disabled(self, tmp_path):
         pdf = _make_pdf(tmp_path / "doc.pdf")
         out = tmp_path / "out"
 
-        PDFBatchWriter(images=False).process([pdf], str(out))
+        (result,) = PDFBatchWriter(images=False).process([pdf], str(out))
 
-        assert not (out / "doc_images").exists()
+        assert "images_dir" not in result
+        assert not (out / "images").exists()
+
+    def test_images_only_when_no_text_format(self, tmp_path):
+        pdf = _make_pdf(tmp_path / "doc.pdf")
+        out = tmp_path / "out"
+
+        (result,) = PDFBatchWriter(json=False, images=True).process([pdf], str(out))
+
+        assert "json_path" not in result
+        assert not (out / "json").exists()
+        assert os.path.isdir(result["images_dir"])
+        assert len(os.listdir(result["images_dir"])) >= 1
 
     def test_bad_path_isolated_from_good_ones(self, tmp_path):
         good = _make_pdf(tmp_path / "good.pdf")
@@ -83,6 +113,10 @@ class TestPDFBatchWriter:
     def test_empty_input_returns_empty_list(self, tmp_path):
         out = tmp_path / "out"
         assert PDFBatchWriter().process([], str(out)) == []
+
+    def test_no_output_enabled_raises(self):
+        with pytest.raises(ValueError, match="nothing to write"):
+            PDFBatchWriter(json=False, jsonl=False, markdown=False, images=False)
 
 
 def _make_two_page_dupe_image_pdf(path):
@@ -109,7 +143,7 @@ class TestPDFBatchWriterFlags:
         PDFBatchWriter().process([pdf], str(out))
 
         # Two identical images across pages collapse to a single file on disk.
-        files = [f for f in os.listdir(out / "dup_images")]
+        files = os.listdir(out / "images" / "dup")
         assert len(files) == 1
 
     def test_dedupe_images_disabled_keeps_both(self, tmp_path):
@@ -118,7 +152,7 @@ class TestPDFBatchWriterFlags:
 
         PDFBatchWriter(dedupe_images=False).process([pdf], str(out))
 
-        files = [f for f in os.listdir(out / "dup_images")]
+        files = os.listdir(out / "images" / "dup")
         assert len(files) == 2
 
     def test_drop_layout_tables_flag_reaches_output(self, tmp_path):

@@ -262,16 +262,31 @@ the dominant cost, table detection, is pure-Python and GIL-bound.)
 from datagrunt import PDFBatchWriter
 
 paths = ["a.pdf", "b.pdf", "c.pdf"]
-writer = PDFBatchWriter()                 # set per-document options once
-results = writer.process(paths, "out/")   # writes out/<stem>.json (+ out/<stem>_images/)
-# results: [{"source": "a.pdf", "status": "success", "json_path": "out/a.json"}, ...]
+writer = PDFBatchWriter(markdown=True)    # set per-document options once
+results = writer.process(paths, "out/")
+# results: [{"source": "a.pdf", "status": "success",
+#            "json_path": "out/json/a.json", "markdown_path": "out/markdown/a.md",
+#            "images_dir": "out/images/a"}, ...]
+```
+
+Each output kind is written to its own subdirectory so text and images never
+mingle:
+
+```
+out/
+├── json/      <stem>.json     (json=True, default)
+├── jsonl/     <stem>.jsonl    (jsonl=True)
+├── markdown/  <stem>.md       (markdown=True)
+└── images/    <stem>/...       (images=True, default)
 ```
 
 A malformed PDF is reported as a `{"status": "error", ...}` record without
-aborting the rest of the batch. Construct the writer with `images=False`,
-`dedupe_images=False`, or `drop_layout_tables=True` to control per-document
-output, and pass `max_workers=N` to `process` to cap processes (defaults to the
-CPU count).
+aborting the rest of the batch. Toggle outputs on the constructor with `json`,
+`jsonl`, `markdown`, and `images` (enable at least one, or it raises
+`ValueError`), use `dedupe_images=False` or `drop_layout_tables=True` to control
+per-document output, and pass `max_workers=N` to `process` to cap processes
+(defaults to the CPU count). Each success record carries a `json_path` /
+`jsonl_path` / `markdown_path` / `images_dir` key for every enabled output.
 
 Because it uses a process pool (the `spawn` start method on macOS/Windows), call
 `PDFBatchWriter().process` from an importable script under an
