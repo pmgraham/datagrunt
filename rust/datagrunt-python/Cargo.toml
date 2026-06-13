@@ -11,5 +11,5 @@ name = "datagrunt_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310"] }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
 datagrunt-core = { path = "../datagrunt-core" }
