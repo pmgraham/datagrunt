@@ -37,7 +37,10 @@ jobs:
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --find-links=dist datagrunt
+          # Install the freshly built wheel BY PATH so pip can't substitute a
+          # higher-versioned pure-Python release from PyPI (which lacks _native).
+          # Dependencies still resolve from PyPI.
+          python -m pip install dist/*.whl
           cd "$RUNNER_TEMP"
           python "$GITHUB_WORKSPACE/scripts/smoke_wheel.py"
 
