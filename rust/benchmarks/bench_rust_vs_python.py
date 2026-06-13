@@ -1,4 +1,4 @@
-"""Benchmark datagrunt_rs (Rust) vs csvcomponents (Python), per component.
+"""Benchmark datagrunt._native (Rust) vs csvcomponents (Python), per component.
 
 Usage:
     .venv/bin/python rust/benchmarks/bench_rust_vs_python.py --scales small medium
@@ -17,7 +17,7 @@ from pathlib import Path
 
 import polars as pl
 
-import datagrunt_rs
+from datagrunt import _native as datagrunt_rs
 from datagrunt.core.csv_io.csvcomponents import (
     CSVColumnNameNormalizer,
     CSVDelimiter,
