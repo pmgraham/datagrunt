@@ -33,7 +33,8 @@ fn candidates_most_common_first(first_row: &str) -> Vec<char> {
             None => counts.push((c, 1)),
         }
     }
-    counts.sort_by(|a, b| b.1.cmp(&a.1)); // stable sort keeps tie order
+    // Stable sort keeps first-seen order for ties, like Counter.most_common.
+    counts.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
     counts.into_iter().map(|(c, _)| c).collect()
 }
 
@@ -103,7 +104,7 @@ mod tests {
         assert!(!splits_rows_consistently(&rows2, '.')); // only 2 fields
         let rows3 = vec!["a.b.c".to_string(), "d.e.f".to_string()];
         assert!(splits_rows_consistently(&rows3, '.'));
-        assert!(!splits_rows_consistently(&rows3[..1].to_vec(), '.')); // 1 row
+        assert!(!splits_rows_consistently(&rows3[..1], '.')); // 1 row
     }
 
     #[test]
