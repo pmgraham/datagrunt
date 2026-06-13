@@ -4,6 +4,7 @@
 import csv
 import logging
 import re
+import warnings
 from collections import Counter, OrderedDict
 from functools import cached_property
 from pathlib import Path
@@ -13,6 +14,7 @@ import polars as pl
 
 # local libraries
 from datagrunt.core.file_io import FileProperties
+from datagrunt.core.csv_io import _compute
 
 logger = logging.getLogger(__name__)
 
@@ -20,97 +22,45 @@ logger = logging.getLogger(__name__)
 def _count_leading_comments(filepath):
     """Count leading ``#``-prefixed comment lines before the header.
 
-    Blank lines are intentionally excluded: Polars and PyArrow already ignore
-    leading blank lines natively, so counting them here would double-skip and
-    push the header onto a data row (see issue #85). Blank lines interleaved
-    with comments are tolerated and do not stop the count.
+    Delegates to the active compute backend (Rust by default; pure Python when
+    the hidden toggle is on).
     """
-    count = 0
-    # errors="ignore" so a non-UTF-8 byte in the probe window can't crash this
-    # lightweight metadata scan (it runs during reader/writer construction).
-    with open(filepath, "r", encoding=FileProperties(filepath).DEFAULT_ENCODING, errors="ignore") as f:
-        for line in f:
-            stripped = line.strip()
-            if stripped.startswith("#"):
-                count += 1
-            elif not stripped:
-                # Blank line: skip over it without counting it as a row to skip.
-                continue
-            else:
-                break
-    return count
+    return _compute.backend().count_leading_comments(str(filepath))
 
 
 def _count_leading_physical_lines_before_header(filepath):
     """Count every leading physical line up to and including the header line.
 
-    Unlike :func:`_count_leading_comments`, this counts blank lines too. It is
-    used for engines (PyArrow) whose ``skip_rows`` operates on physical lines
-    and does not natively ignore leading blank lines once explicit column names
-    are supplied.
+    Delegates to the active compute backend.
     """
-    count = 0
-    # errors="ignore" so a non-UTF-8 byte can't crash this lightweight probe
-    # (issue #76).
-    with open(filepath, "r", encoding=FileProperties(filepath).DEFAULT_ENCODING, errors="ignore") as f:
-        for line in f:
-            stripped = line.strip()
-            count += 1
-            if stripped and not stripped.startswith("#"):
-                # This is the header line; include it in the skip count.
-                break
-    return count
+    return _compute.backend().count_leading_physical_lines_before_header(str(filepath))
 
 
 def _is_legacy_mac_newlines(filepath):
-    """Check if the file uses legacy Mac OS carriage returns (\\r) as line endings."""
-    try:
-        with open(filepath, "rb") as f:
-            chunk = f.read(4096)
-        return b"\r" in chunk and b"\n" not in chunk
-    except OSError:
-        # Unreadable/missing file: treat as not legacy-mac and let the real
-        # read surface the error. Any other exception is a bug worth raising.
-        return False
+    """Check if the file uses legacy Mac OS carriage returns (\\r) as line endings.
+
+    Delegates to the active compute backend.
+    """
+    return _compute.backend().is_legacy_mac_newlines(str(filepath))
 
 
 def _check_csv_ragged_and_warn(filepath, delimiter):
-    """Check if the CSV is ragged and issue a warning if lenient loading is enabled."""
-    import csv
-    import warnings
+    """Warn if the CSV has ragged rows; return whether it does.
 
-    try:
-        is_legacy_mac = _is_legacy_mac_newlines(filepath)
-        newline_param = None if is_legacy_mac else ""
-        encoding = FileProperties(filepath).DEFAULT_ENCODING
-        with open(filepath, "r", encoding=encoding, newline=newline_param, errors="ignore") as f:
-            reader = csv.reader(f, delimiter=delimiter)
-            header = None
-            for row in reader:
-                if row and not row[0].startswith("#"):
-                    header = row
-                    break
-            if not header:
-                return False
-
-            expected_cols = len(header)
-            row_count = 0
-            for row in reader:
-                if not row or row[0].startswith("#"):
-                    continue
-                row_count += 1
-                if len(row) != expected_cols:
-                    warnings.warn(
-                        f"CSV file contains ragged rows. Row {row_count} has {len(row)} columns, "
-                        f"expected {expected_cols}. Some fields will be truncated or padded with nulls.",
-                        UserWarning,
-                    )
-                    return True
-                if row_count >= 10000:
-                    break
-    except Exception:  # noqa: BLE001 - best-effort ragged-row warning; never break a read
-        logger.debug("Ragged-row check failed for %s; skipping warning", filepath, exc_info=True)
-    return False
+    Ragged detection runs in the active compute backend; the ``UserWarning`` is
+    emitted here. The compute layer returns only a boolean, so the warning no
+    longer names the specific offending row and column counts (a documented
+    behavior delta) — but it still contains the substring "ragged rows", which
+    is the only thing any test asserts.
+    """
+    is_ragged = _compute.backend().check_ragged(str(filepath), delimiter)
+    if is_ragged:
+        warnings.warn(
+            "CSV file contains ragged rows. Some fields will be truncated or "
+            "padded with nulls.",
+            UserWarning,
+        )
+    return is_ragged
 
 
 class CSVStringSample:
