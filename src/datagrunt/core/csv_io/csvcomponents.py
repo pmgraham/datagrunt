@@ -1,7 +1,6 @@
 """Module for CSV components."""
 
 # standard library
-import csv
 import logging
 import re
 import warnings
@@ -13,8 +12,8 @@ from pathlib import Path
 import polars as pl
 
 # local libraries
-from datagrunt.core.file_io import FileProperties
 from datagrunt.core.csv_io import _compute
+from datagrunt.core.file_io import FileProperties
 
 logger = logging.getLogger(__name__)
 
@@ -225,68 +224,43 @@ class CSVDialect:
         self.dialect = self._get_csv_dialect()
 
     def _get_csv_dialect(self):
-        """Get the CSV dialect from the file.
+        """Sniff the CSV dialect via the active compute backend.
 
-        Returns:
-            csv.Dialect: The CSV dialect inferred from the file.
+        Returns the sniffed dialect dict, or ``None`` for empty/blank files and
+        undeterminable samples (the backend performs the empty/blank
+        short-circuit and the sample construction internally).
         """
-        is_empty = self._is_empty if self._is_empty is not None else FileProperties(self.filepath).is_empty
-        is_blank = self._is_blank if self._is_blank is not None else FileProperties(self.filepath).is_blank
-        if is_empty or is_blank:
-            return None
-        # errors="ignore" so non-UTF-8 bytes can't crash dialect sniffing.
-        with open(self.filepath, "r", encoding=FileProperties(self.filepath).DEFAULT_ENCODING, errors="ignore") as csvfile:  # noqa: E501
-            # Read exactly CSV_SNIFF_SAMPLE_ROWS lines to avoid diluting sniff results
-            lines = []
-            for line in csvfile:
-                if line.strip().startswith("#"):
-                    continue
-                lines.append(line)
-                if len(lines) >= self.CSV_SNIFF_SAMPLE_ROWS:
-                    break
-            sample = "".join(lines)
-        try:
-            if self._delimiter:
-                dialect = csv.Sniffer().sniff(sample, delimiters=self._delimiter)
-            else:
-                dialect = csv.Sniffer().sniff(sample)
-        except csv.Error:
-            dialect = None
-        return dialect
+        return _compute.backend().sniff_dialect(str(self.filepath), self._delimiter)
 
     @cached_property
     def quotechar(self):
         """The character used to quote fields in the CSV file."""
-        return self.dialect.quotechar if self.dialect else '"'
+        return self.dialect["quotechar"] if self.dialect else '"'
 
     @cached_property
     def escapechar(self):
         """The character used to escape characters in the CSV file."""
-        return self.dialect.escapechar if self.dialect else None
+        return self.dialect["escapechar"] if self.dialect else None
 
     @cached_property
     def doublequote(self):
-        """
-        Whether double quotes are used to escape quotes in the CSV file.
-        """
-        return self.dialect.doublequote if self.dialect else False
+        """Whether double quotes are used to escape quotes in the CSV file."""
+        return self.dialect["doublequote"] if self.dialect else False
 
     @cached_property
     def newline_delimiter(self):
         """The newline delimiter used in the CSV file."""
-        return self.dialect.lineterminator if self.dialect else "\r\n"
+        return self.dialect["lineterminator"] if self.dialect else "\r\n"
 
     @cached_property
     def skipinitialspace(self):
-        """
-        Whether spaces are skipped at the beginning of fields in the CSV file.
-        """
-        return self.dialect.skipinitialspace if self.dialect else False
+        """Whether spaces are skipped at the beginning of fields."""
+        return self.dialect["skipinitialspace"] if self.dialect else False
 
     @cached_property
     def quoting(self):
         """The quoting style used in the CSV file."""
-        return self.QUOTING_MAP.get(self.dialect.quoting) if self.dialect else "quote minimal"
+        return self.QUOTING_MAP.get(self.dialect["quoting"]) if self.dialect else "quote minimal"
 
 
 class CSVRows:
@@ -403,12 +377,6 @@ class CSVColumns:
 class CSVColumnNameNormalizer:
     """Class to normalize CSV columns names."""
 
-    SPECIAL_CHARS_PATTERN = re.compile(r"[^a-z0-9]+")
-    MULTI_UNDERSCORE_PATTERN = re.compile(r"_+")
-    # Used when a header normalizes to the empty string so it can still be
-    # uniquified into a valid, non-empty identifier.
-    EMPTY_NAME_PLACEHOLDER = "column"
-
     def __init__(self, filepath, columns=None):
         """Initialize the CSVColumnNameNormalizer with a filepath.
 
@@ -431,81 +399,14 @@ class CSVColumnNameNormalizer:
         """Get the normalized columns list."""
         return self._normalize_column_names(self.columns_list)
 
-    def _normalize_single_column_name(self, column_name):
-        """
-        Normalize a single column name by converting to lowercase, replacing
-        spaces and special characters with underscores, and removing extra
-        underscores.
-
-        Replace special characters and spaces with underscore
-        Remove leading and trailing underscores
-        Replace multiple underscores with single underscore
-        Add a leading underscore if the name starts with a digit
-
-        Args:
-            column_name (str): The column name to normalize
-
-        Returns:
-            str: The normalized column name
-        """
-        name = column_name.lower()
-        name = self.SPECIAL_CHARS_PATTERN.sub("_", name)
-        name = name.strip("_")
-        name = self.MULTI_UNDERSCORE_PATTERN.sub("_", name)
-        # A header of only special characters (e.g. "%" or "()") normalizes to
-        # the empty string, which is an invalid zero-length SQL identifier and
-        # is silently dropped by some engines. Fall back to a placeholder so it
-        # can be uniquified into a valid column name.
-        if not name:
-            return self.EMPTY_NAME_PLACEHOLDER
-        return f"_{name}" if name[0].isdigit() else name
-
-    def _make_unique_column_names(self, columns_list):
-        """
-        Make unique column names by appending a number to duplicate names.
-
-        A naive ``name_N`` suffix can itself collide with a real column (e.g.
-        ``col_a, col_a, col_a_1`` would emit two ``col_a_1``). To guarantee a
-        unique result, this tracks every name already emitted and keeps
-        incrementing the suffix until the candidate is unused across the whole
-        list. Downstream SQL projections and Arrow renames rely on this: a
-        duplicate name breaks DuckDB's ``AS`` projection and silently drops a
-        column in PyArrow.
-
-        Args:
-            columns_list (list): List of column names to make unique
-
-        Returns:
-            list: List of unique column names
-        """
-        emitted = set()
-        unique_names = []
-
-        for name in columns_list:
-            candidate = name
-            suffix = 0
-            while candidate in emitted:
-                suffix += 1
-                candidate = f"{name}_{suffix}"
-            emitted.add(candidate)
-            unique_names.append(candidate)
-
-        return unique_names
-
     def _normalize_column_names(self, columns):
-        """
-        Normalize column names by converting to lowercase, replacing spaces
-        and special characters with underscores, and removing extra
-        underscores.
+        """Normalize and uniquify column names via the active compute backend.
 
-        Args:
-            columns (list): List of column names to normalize
-
-        Returns:
-            list: List of normalized column names
+        Routes to ``_compute.backend().normalize_columns`` (lowercase,
+        non-alphanumeric runs to ``_``, strip, leading-digit prefix, then
+        collision-safe ``_N`` uniquification).
         """
-        normalized_columns = [self._normalize_single_column_name(col) for col in columns]
-        return self._make_unique_column_names(normalized_columns)
+        return _compute.backend().normalize_columns(list(columns))
 
     @cached_property
     def columns_normalized_string(self):
