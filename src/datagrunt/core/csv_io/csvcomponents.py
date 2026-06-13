@@ -5,7 +5,7 @@ import csv
 import logging
 import re
 import warnings
-from collections import Counter, OrderedDict
+from collections import OrderedDict
 from functools import cached_property
 from pathlib import Path
 
@@ -192,85 +192,15 @@ class CSVDelimiter:
         self.delimiter = self.infer_csv_file_delimiter()
         self.delimiter_byte_string = self.delimiter.encode()
 
-    def _get_most_common_non_alpha_numeric_character_from_string(self):
-        """
-        Get the non-alpha-numeric characters of the header, most common first.
-
-        Returns:
-            list[tuple[str, int]]: ``(character, count)`` pairs, most common first.
-        """
-        columns_no_spaces = self.first_row.replace(" ", "")
-        regex = re.compile(self.DELIMITER_REGEX_PATTERN)
-        counts = Counter(char for char in regex.findall(columns_no_spaces))  # noqa: E501
-        most_common = counts.most_common()
-        return most_common
-
-    @cached_property
-    def _sample_rows(self):
-        """Leading non-comment rows used to validate ambiguous delimiters."""
-        return CSVRows(self.filepath).leading_rows(self.CANDIDATE_SAMPLE_ROWS)
-
-    @staticmethod
-    def _split_row(row, char):
-        """Split a row for field counting; whitespace collapses runs of spaces."""
-        return row.split() if char == " " else row.split(char)
-
-    def _splits_rows_consistently(self, char):
-        """Whether every sampled row splits on ``char`` into the same 3+ fields.
-
-        A real delimiter produces a stable field count across the header and
-        data rows; incidental punctuation (a dot only in the header, an
-        apostrophe only in some values) does not. At least two rows are required
-        so a lone header cannot self-validate.
-
-        Args:
-            char (str): The candidate delimiter to test.
-
-        Returns:
-            bool: True if the candidate splits the sample consistently.
-        """
-        rows = self._sample_rows
-        if len(rows) < 2:
-            return False
-        field_counts = {len(self._split_row(row, char)) for row in rows}
-        return len(field_counts) == 1 and field_counts.pop() >= self.MIN_CONSISTENT_FIELDS
-
     def infer_csv_file_delimiter(self):
-        """Infer the delimiter of a CSV file.
+        """Infer the delimiter of the CSV file via the active compute backend.
 
-        Precedence, by decreasing confidence:
-
-        1. An unambiguous delimiter (``, ; | tab``) present in the header wins,
-           most-frequent first. It is preferred even over a more frequent
-           punctuation character, so consistent incidental punctuation (a dot
-           in both ``a.b,c.d`` and its data) cannot outrank the real delimiter.
-        2. Otherwise a punctuation candidate (e.g. ``.`` or ``'``) wins only if
-           it splits the sampled rows into a consistent field count - a genuine
-           delimiter is present in every row with a stable count.
-        3. Otherwise the file is space-delimited only when it splits
-           consistently on whitespace, else it defaults to comma (issue #74).
-
-        Returns:
-            str: The delimiter of the CSV file.
+        Routes to ``_compute.backend().infer_delimiter`` (Rust by default; pure
+        Python when the toggle is on), reproducing the same precedence: safe
+        delimiter > consistent punctuation > space > comma, with TSV-extension
+        and empty/blank handling.
         """
-        if self.file_properties.is_tsv:
-            return self.DEFAULT_TAB_DELIMITER
-        if self.file_properties.is_empty or self.file_properties.is_blank:
-            return self.DEFAULT_DELIMITER
-
-        candidates = self._get_most_common_non_alpha_numeric_character_from_string()
-
-        for char, _count in candidates:
-            if char in self.SAFE_DELIMITERS:
-                return char
-
-        for char, _count in candidates:
-            if self._splits_rows_consistently(char):
-                return char
-
-        if self._splits_rows_consistently(self.SPACE_DELIMITER):
-            return self.SPACE_DELIMITER
-        return self.DEFAULT_DELIMITER
+        return _compute.backend().infer_delimiter(str(self.filepath))
 
 
 class CSVDialect:
@@ -372,20 +302,11 @@ class CSVRows:
 
     @cached_property
     def first_row(self):
-        """Reads and returns the first line of a file.
-
-        Returns:
-            The first non-comment line of the file, stripped of
-            leading/trailing whitespace, or "" if the file has no such line.
-        """
-        rows = self.leading_rows(1)
-        return rows[0] if rows else ""
+        """The first non-comment row, stripped, or "" — via the compute backend."""
+        return _compute.backend().first_row(str(self.filepath))
 
     def leading_rows(self, limit):
-        """Return up to ``limit`` leading non-comment rows, each stripped.
-
-        Skips blank and ``#``-prefixed lines so the sample matches the rows the
-        parser will actually see (mirroring ``first_row``).
+        """Up to ``limit`` leading non-comment rows, each stripped — via backend.
 
         Args:
             limit (int): The maximum number of rows to return.
@@ -393,39 +314,17 @@ class CSVRows:
         Returns:
             list[str]: The leading non-comment rows, in file order.
         """
-        rows = []
-        # errors="ignore" so a non-UTF-8 byte can't crash this leading-rows probe.
-        with open(self.filepath, "r", encoding=FileProperties(self.filepath).DEFAULT_ENCODING, errors="ignore") as csv_file:  # noqa: E501
-            for line in csv_file:
-                stripped = line.strip()
-                if stripped and not stripped.startswith("#"):
-                    rows.append(stripped)
-                    if len(rows) >= limit:
-                        break
-        return rows
+        return _compute.backend().leading_rows(str(self.filepath), limit)
 
     @cached_property
     def row_count_with_header(self):
-        """Return the number of CSV records in the file including the header.
+        """Number of CSV records including the header — via the compute backend.
 
-        Counts parsed CSV records rather than physical lines so that quoted
-        fields containing embedded newlines are counted as a single record,
-        matching what the parsing engines report. Comment and blank records
-        are still excluded, mirroring ``_check_csv_ragged_and_warn``.
+        Counts parsed records (quoted embedded newlines = one record), skipping
+        comment and blank records, matching the parsing engines.
         """
-        is_legacy_mac = _is_legacy_mac_newlines(self.filepath)
-        newline_param = None if is_legacy_mac else ""
-        encoding = FileProperties(self.filepath).DEFAULT_ENCODING
         delimiter = CSVDelimiter(self.filepath).delimiter
-        count = 0
-        # errors="ignore" so a non-UTF-8 byte can't crash this row-count probe.
-        with open(self.filepath, "r", encoding=encoding, newline=newline_param, errors="ignore") as csv_file:
-            reader = csv.reader(csv_file, delimiter=delimiter)
-            for row in reader:
-                if not row or row[0].startswith("#"):
-                    continue
-                count += 1
-        return count
+        return _compute.backend().row_count_with_header(str(self.filepath), delimiter)
 
     @property
     def row_count_without_header(self):
