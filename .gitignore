@@ -163,8 +163,6 @@ docs/superpowers/
 # Local test/scratch outputs
 outputs/
 
-# Local/custom scripts
-scripts/
 
 # Antigravity session & brain directories
 .antigravity_sessions/
