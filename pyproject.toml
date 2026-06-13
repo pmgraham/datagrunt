@@ -8,9 +8,9 @@ version = "4.0.0"
 description = "Read CSV files and convert to other file formats easily"
 readme = "README.md"
 authors = [{ name = "Martin Graham", email = "datagrunt@datagrunt.io" }]
-license = {text = "MIT License"}
+license = "MIT"
+license-files = ["LICENSE"]
 classifiers = [
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -54,11 +54,6 @@ Documentation = "https://www.datagrunt.io/"
 python-source = "src"
 module-name = "datagrunt._native"
 manifest-path = "rust/datagrunt-python/Cargo.toml"
-# maturin emits `License-File: LICENSE` metadata from the detected root LICENSE,
-# but does not pack the file into the sdist when the license is declared as text
-# rather than a file. Force-include it so the sdist satisfies PyPI's metadata
-# validation (a missing License-File is a hard 400 on upload).
-include = [{ path = "LICENSE", format = "sdist" }]
 
 [tool.bumpver]
 current_version = "4.0.0"
