@@ -254,54 +254,6 @@ the reader (`to_dicts`, `to_dataframe`, `to_arrow_table`) or writer
 (`write_json`, `write_json_newline_delimited`) to discard those and keep only
 tables with at least two rows and two columns. It is off by default.
 
-### Batch processing (many PDFs)
-
-For large corpora, process documents in parallel across processes — one document
-per process, each single-threaded. (Per-page threads do not speed up extraction:
-the dominant cost, table detection, is pure-Python and GIL-bound.)
-
-```python
-from datagrunt import PDFBatchWriter
-
-paths = ["a.pdf", "b.pdf", "c.pdf"]
-writer = PDFBatchWriter(markdown=True)    # set per-document options once
-results = writer.process(paths, "out/")
-# results: [{"source": "a.pdf", "status": "success",
-#            "json_path": "out/json/a.json", "markdown_path": "out/markdown/a.md",
-#            "images_dir": "out/images/a"}, ...]
-```
-
-Each output kind is written to its own subdirectory so text and images never
-mingle:
-
-```
-out/
-├── json/      <stem>.json     (json=True, default)
-├── jsonl/     <stem>.jsonl    (jsonl=True)
-├── markdown/  <stem>.md       (markdown=True)
-└── images/    <stem>/...       (images=True, default)
-```
-
-A malformed PDF is reported as a `{"status": "error", ...}` record without
-aborting the rest of the batch. Toggle outputs on the constructor with `json`,
-`jsonl`, `markdown`, and `images` (enable at least one, or it raises
-`ValueError`), use `dedupe_images=False` or `drop_layout_tables=True` to control
-per-document output, and pass `max_workers=N` to `process` to cap processes
-(defaults to the CPU count). Each success record carries a `json_path` /
-`jsonl_path` / `markdown_path` / `images_dir` key for every enabled output.
-
-Because it uses a process pool (the `spawn` start method on macOS/Windows), call
-`PDFBatchWriter().process` from an importable script under an
-`if __name__ == "__main__":` guard — not from a REPL, `python -c`, or piped
-stdin, where worker processes cannot re-import the entry module.
-
-**Apache Beam / Dataflow:** do **not** call `PDFBatchWriter().process` inside a pipeline —
-it would nest process pools and oversubscribe the CPU. Instead, map the
-per-document work in a `DoFn` / `beam.Map` using `PDFWriter(path, workers=1)` and
-let the runner fan documents out. Dataflow runs multiple worker processes per VM
-(sidestepping the GIL) and autoscales VMs, so throughput scales with total worker
-cores.
-
 ## Engine Comparison
 
 | Feature | Polars | DuckDB | PyArrow |
