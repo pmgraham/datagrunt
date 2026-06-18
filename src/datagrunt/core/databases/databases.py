@@ -588,13 +588,12 @@ class DuckDBQueries:
         Returns:
             polars.DataFrame: The resulting DataFrame.
         """
-        if self.lenient:
-            _check_csv_ragged_and_warn(self.filepath, self.delimiter)
-        # Ensure the table is created with original column names for querying
-        self.connection.sql(self.import_csv_query())
-        # The raw import above replaced the table with original column names;
-        # record that so create_table cannot wrongly reuse a "normalized" table.
-        self._imported_normalize_columns = False
+        # Create (or reuse) the table with ORIGINAL column names so the user's
+        # SQL can reference them. create_table caches per connection, so running
+        # several queries against the same instance imports the file once
+        # instead of re-importing on every call (issue #189); it also handles
+        # the lenient ragged-row warning on actual import.
+        self.create_table(normalize_columns=False)
 
         # Execute the user's query
         result_df = self.connection.sql(sql_query).pl()

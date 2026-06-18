@@ -158,6 +158,54 @@ class TestCreateTableIdempotent:
         queries.close()
 
 
+class TestSqlQueryToDataframeReusesImport:
+    """sql_query_to_dataframe must reuse the cached table, not re-import (#189)."""
+
+    def test_repeated_queries_import_once(self, tmp_path, monkeypatch):
+        """Two SQL queries on one instance must import the CSV only once."""
+        csv = tmp_path / "data.csv"
+        csv.write_text("col1,col2\n1,A\n2,B\n")
+        queries = DuckDBQueries(str(csv))
+
+        import_calls = {"count": 0}
+        original_import_query = queries.import_csv_query
+
+        def counting_import_query():
+            import_calls["count"] += 1
+            return original_import_query()
+
+        monkeypatch.setattr(queries, "import_csv_query", counting_import_query)
+
+        sql = f"SELECT col1, col2 FROM {queries.database_table_name} ORDER BY col1"
+        first = queries.sql_query_to_dataframe(sql)
+        second = queries.sql_query_to_dataframe(sql)
+
+        assert import_calls["count"] == 1
+        assert first.rows() == second.rows() == [("1", "A"), ("2", "B")]
+        queries.close()
+
+    def test_reimports_with_original_names_after_normalized_table(self, tmp_path):
+        """A prior normalized import must be rebuilt with original column names.
+
+        sql_query_to_dataframe queries against the original headers, so if the
+        cached table was last imported normalized, it must re-import (not reuse
+        the normalized table) so the user's SQL can reference original names.
+        """
+        csv = tmp_path / "data.csv"
+        csv.write_text("First Name,Age\nJohn,30\n")
+        queries = DuckDBQueries(str(csv))
+
+        # Prime the cache with a NORMALIZED table (columns: first_name, age).
+        queries.create_table(normalize_columns=True)
+
+        # Querying original names must still work (forces a fresh import).
+        sql = f'SELECT "First Name", "Age" FROM {queries.database_table_name}'
+        result = queries.sql_query_to_dataframe(sql)
+        assert result.columns == ["First Name", "Age"]
+        assert result.rows() == [("John", "30")]
+        queries.close()
+
+
 class TestNumericLeadingFilename:
     """Numeric-leading filenames must yield a valid unquoted table name (#149).
 
