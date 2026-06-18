@@ -298,3 +298,44 @@ class TestPDFWriterJsonAndDictInputs:
         assert "# Header Text" in content
         assert "Hello body" in content
 
+    @pytest.fixture
+    def dummy_native_dict(self):
+        """A native-schema (non-"elements") document, exercising is_structured=False."""
+        return {
+            "document": {
+                "source": "dummy.pdf",
+                "total_pages": 1,
+                "pages": [
+                    {
+                        "page_number": 1,
+                        "text": "Hello native body",
+                        "text_objects": [
+                            {
+                                "text": "Hello native body",
+                                "font_size": 12,
+                                "position": {"x": 1, "y": 1, "w": 1, "h": 1},
+                                "bbox": [0, 0, 1, 1],
+                            }
+                        ],
+                        "images": [],
+                    }
+                ],
+            }
+        }
+
+    def test_writer_with_native_dict(self, dummy_native_dict, tmp_path, monkeypatch):
+        """Native-schema dict must flatten/render via the non-structured branch."""
+        monkeypatch.chdir(tmp_path)
+        writer = PDFWriter(dummy_native_dict)
+
+        jlpath = writer.write_json_newline_delimited("native_out.jsonl")
+        with open(jlpath) as f:
+            lines = [json.loads(line) for line in f]
+        assert len(lines) == 1
+        assert lines[0]["type"] == "text"
+        assert lines[0]["text"] == "Hello native body"
+
+        mdpath = writer.write_markdown("native_out.md")
+        with open(mdpath) as f:
+            assert "Hello native body" in f.read()
+
