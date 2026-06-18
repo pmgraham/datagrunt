@@ -66,6 +66,12 @@ class CSVStringSample:
     """Base class for creating a string sample of a CSV file."""
 
     SAMPLE_ROWS = 2
+    # Window scanned to pick the SAMPLE_ROWS rows with the fewest nulls. It is a
+    # deliberate quality/cost tradeoff: large enough that early sparse rows do
+    # not dominate the sample, bounded so the read+sort stays cheap. The result
+    # is a cached_property, so this scan happens at most once per instance.
+    # Lowering it would change which rows are selected (an observable change),
+    # so treat this as a tuning constant, not free headroom.
     SAMPLE_ROWS_BY_QUALITY = 50_000
 
     def __init__(self, filepath, delimiter=None):
