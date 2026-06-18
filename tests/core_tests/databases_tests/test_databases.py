@@ -251,3 +251,87 @@ class TestDuckDBQueriesContextManager:
         relation = queries.create_table()
         assert relation.fetchall() == [("1", "2"), ("3", "4")]
         queries.close()
+
+
+class TestDuckDBQueriesLazySkipRows:
+    """The leading-line scan must be deferred until ``skip_rows`` is needed."""
+
+    def test_skip_rows_not_scanned_at_construction(self, tmp_path, monkeypatch):
+        """Constructing DuckDBQueries must not scan the file for leading lines.
+
+        ``skip_rows`` is only consumed by the DuckDB import path. Polars/PyArrow
+        engines build a DuckDBQueries (for the table name) but never touch
+        DuckDB, so scanning leading physical lines in __init__ wastes a full
+        leading-block read on every such construction.
+        """
+        import datagrunt.core.databases.databases as dbmod
+
+        calls = {"count": 0}
+        original = dbmod._count_leading_physical_lines_before_header
+
+        def counting(path):
+            calls["count"] += 1
+            return original(path)
+
+        monkeypatch.setattr(dbmod, "_count_leading_physical_lines_before_header", counting)
+
+        csv = tmp_path / "data.csv"
+        csv.write_text("col1,col2\n1,A\n2,B\n")
+        queries = DuckDBQueries(str(csv))
+
+        # Construction must not have triggered the leading-line scan.
+        assert calls["count"] == 0
+
+        # First access computes it once; the result is cached thereafter.
+        first = queries.skip_rows
+        assert calls["count"] == 1
+        assert queries.skip_rows == first
+        assert calls["count"] == 1
+
+    def test_skip_rows_value_matches_leading_blank_lines(self, tmp_path):
+        """Lazy skip_rows must still yield the correct DuckDB skip count."""
+        csv = tmp_path / "leading.csv"
+        # Two leading blank lines before the header; DuckDB skips up to the header.
+        csv.write_text("\n\ncol1,col2\n1,A\n")
+        queries = DuckDBQueries(str(csv))
+        assert queries.skip_rows == 2
+
+
+class TestSpatialExtensionInstallOnce:
+    """Spatial DDL must live outside the export query and INSTALL once/process."""
+
+    def test_export_excel_query_has_no_spatial_ddl(self, tmp_path):
+        csv = tmp_path / "d.csv"
+        csv.write_text("a,b\n1,2\n")
+        queries = DuckDBQueries(str(csv))
+        sql = queries.export_excel_query("output.xlsx").upper()
+        assert "INSTALL" not in sql
+        assert "LOAD" not in sql
+        assert "COPY" in sql
+        queries.close()
+
+    def test_install_runs_once_load_runs_each_call(self, tmp_path):
+        """INSTALL spatial at most once per process; LOAD on every connection."""
+        # Reset the process-level guard so the assertion is deterministic.
+        DuckDBQueries._spatial_installed = False
+
+        executed = []
+
+        class _FakeConn:
+            def execute(self, sql, *args, **kwargs):
+                executed.append(sql.strip())
+                return self
+
+        csv = tmp_path / "d.csv"
+        csv.write_text("a,b\n1,2\n")
+        queries = DuckDBQueries(str(csv))
+        fake = _FakeConn()
+
+        # Two exports in the same process each get a fresh connection.
+        queries.load_spatial_extension(fake)
+        queries.load_spatial_extension(fake)
+
+        installs = [s for s in executed if s.upper().startswith("INSTALL SPATIAL")]
+        loads = [s for s in executed if s.upper().startswith("LOAD SPATIAL")]
+        assert len(installs) == 1
+        assert len(loads) == 2

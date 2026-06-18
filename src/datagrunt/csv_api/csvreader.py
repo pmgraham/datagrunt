@@ -152,6 +152,13 @@ class CSVReader(CSVComponents):
         """
         Queries a CSV file after importing into DuckDB.
 
+        Security:
+            ``sql_query`` is executed verbatim against the in-memory session.
+            This is intentional for analytics, but it means concatenating
+            untrusted input into ``sql_query`` is a SQL-injection vector
+            against that session. Callers that build queries from user input
+            must validate/parameterize and sandbox at the application layer.
+
         Args:
             sql_query (str): Query to run against DuckDB.
             normalize_columns (bool or None): Deprecated per-call override.

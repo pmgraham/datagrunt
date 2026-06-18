@@ -591,6 +591,7 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
         filename = self.queries.set_export_filename(CSVEngineProperties.excel_export_filename, export_filename)
         try:
             self.queries.create_table(normalize_columns)
+            self.queries.load_spatial_extension(self.queries.connection)
             self.queries.connection.sql(self.queries.export_excel_query(filename))
         finally:
             self.queries.close()
@@ -650,6 +651,25 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
 class CSVWriterPolarsEngine(CSVBaseWriterEngine):
     """Class to write CSVs to other file formats powered by Polars."""
 
+    def __init__(self, filepath, lenient=False, normalize_columns=False):
+        super().__init__(filepath, lenient=lenient, normalize_columns=normalize_columns)
+        # Cache the parsed frame per resolved normalize_columns value so that
+        # exporting one instance to several formats parses the source once.
+        self._frame_cache = {}
+
+    def _dataframe(self, normalize_columns):
+        """Return the parsed Polars frame, reading the source once per mode.
+
+        Writes never mutate the frame, so the same frame is safely shared
+        across export formats. Keyed on the resolved ``normalize_columns`` bool
+        so raw and normalized exports stay independent.
+        """
+        if normalize_columns not in self._frame_cache:
+            self._frame_cache[normalize_columns] = CSVReaderPolarsEngine(
+                self.filepath, lenient=self.lenient
+            ).to_dataframe(normalize_columns)
+        return self._frame_cache[normalize_columns]
+
     def write_csv(self, export_filename=None, normalize_columns=None):
         """
         Export a Polars dataframe to a CSV file.
@@ -661,7 +681,7 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.csv_export_filename, export_filename)
-        df = CSVReaderPolarsEngine(self.filepath, lenient=self.lenient).to_dataframe(normalize_columns)
+        df = self._dataframe(normalize_columns)
         df.write_csv(filename)
 
     def write_excel(self, export_filename=None, normalize_columns=None):
@@ -675,7 +695,7 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.excel_export_filename, export_filename)
-        df = CSVReaderPolarsEngine(self.filepath, lenient=self.lenient).to_dataframe(normalize_columns)
+        df = self._dataframe(normalize_columns)
         df.write_excel(filename)
 
     def write_json(self, export_filename=None, normalize_columns=None):
@@ -689,7 +709,7 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.json_export_filename, export_filename)
-        df = CSVReaderPolarsEngine(self.filepath, lenient=self.lenient).to_dataframe(normalize_columns)
+        df = self._dataframe(normalize_columns)
         df.write_json(filename)
 
     def write_json_newline_delimited(self, export_filename=None, normalize_columns=None):
@@ -703,7 +723,7 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.json_newline_export_filename, export_filename)
-        df = CSVReaderPolarsEngine(self.filepath, lenient=self.lenient).to_dataframe(normalize_columns)
+        df = self._dataframe(normalize_columns)
         df.write_ndjson(filename)
 
     def write_parquet(self, export_filename=None, normalize_columns=None):
@@ -717,7 +737,7 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.parquet_export_filename, export_filename)
-        df = CSVReaderPolarsEngine(self.filepath, lenient=self.lenient).to_dataframe(normalize_columns)
+        df = self._dataframe(normalize_columns)
         df.write_parquet(filename)
 
 
@@ -1097,13 +1117,10 @@ class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.json_export_filename, export_filename)
         table = self._create_table(normalize_columns)
-        # Use native PyArrow iteration to avoid dataframe conversion
-        records = []
-        for i in range(table.num_rows):
-            record = {col: table[col][i].as_py() for col in table.column_names}
-            records.append(record)
+        # to_pylist does the Arrow->Python conversion in C, producing the same
+        # list-of-dicts the per-row loop built, without the Python-level scan.
         with open(filename, "w") as f:
-            json.dump(records, f, indent=4)
+            json.dump(table.to_pylist(), f, indent=4)
 
     def write_json_newline_delimited(self, export_filename=None, normalize_columns=None):
         """
@@ -1117,11 +1134,12 @@ class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.json_newline_export_filename, export_filename)
         table = self._create_table(normalize_columns)
-        # Use native PyArrow iteration to avoid dataframe conversion
+        # Convert per record batch (C-level) instead of cell-by-cell in Python,
+        # while still streaming one line at a time to keep memory bounded.
         with open(filename, "w") as f:
-            for i in range(table.num_rows):
-                record = {col: table[col][i].as_py() for col in table.column_names}
-                f.write(json.dumps(record) + "\n")
+            for batch in table.to_batches():
+                for record in batch.to_pylist():
+                    f.write(json.dumps(record) + "\n")
 
     def write_parquet(self, export_filename=None, normalize_columns=None):
         """
