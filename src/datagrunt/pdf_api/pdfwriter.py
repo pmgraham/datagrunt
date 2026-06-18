@@ -2,6 +2,7 @@
 
 # standard library
 import json
+from functools import cached_property
 from pathlib import Path
 
 # local libraries
@@ -39,6 +40,11 @@ class PDFWriter(PDFComponents):
     def _create_writer(self):
         """Create a writer engine instance."""
         return PDFEngineFactory(self.filepath, self.engine, self.workers, structured=not self.native).create_writer()
+
+    @cached_property
+    def _writer(self):
+        """Cached writer engine; reused across write_* calls on this instance."""
+        return self._create_writer()
 
     @staticmethod
     def _write_empty_file(filename, content=""):
@@ -83,7 +89,7 @@ class PDFWriter(PDFComponents):
         # document ({}) rather than a raw PdfiumError from loading the file.
         if self.is_empty:
             return self._write_empty_file(export_filename or "output.json", json.dumps({}))
-        return self._create_writer().write_json(export_filename, image_output_dir, dedupe_images, drop_layout_tables)
+        return self._writer.write_json(export_filename, image_output_dir, dedupe_images, drop_layout_tables)
 
     def write_json_newline_delimited(
         self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False
@@ -125,7 +131,7 @@ class PDFWriter(PDFComponents):
         # the JSONL output is an empty file rather than a raw PdfiumError.
         if self.is_empty:
             return self._write_empty_file(export_filename or "output.jsonl")
-        return self._create_writer().write_json_newline_delimited(
+        return self._writer.write_json_newline_delimited(
             export_filename, image_output_dir, dedupe_images, drop_layout_tables
         )
 
@@ -168,7 +174,7 @@ class PDFWriter(PDFComponents):
         # the Markdown output is an empty file rather than a raw PdfiumError.
         if self.is_empty:
             return self._write_empty_file(export_filename or "output.md")
-        return self._create_writer().write_markdown(
+        return self._writer.write_markdown(
             export_filename, image_output_dir, dedupe_images, drop_layout_tables
         )
 
@@ -212,4 +218,4 @@ class PDFWriter(PDFComponents):
         # Mirror PDFReader's is_empty handling: a 0-byte PDF has no images.
         if self.is_empty:
             return []
-        return self._create_writer().extract_images(output_dir, dedupe)
+        return self._writer.extract_images(output_dir, dedupe)
