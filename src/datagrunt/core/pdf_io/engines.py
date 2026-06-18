@@ -323,6 +323,20 @@ class PDFBaseWriterEngine(ABC):
         self.properties = PDFEngineProperties(filepath=self.filepath)
         if not self.filepath.exists():
             raise FileNotFoundError
+        self._reader_engine = None
+        self._cached_document = None
+        self._cached_parse_key = None
+
+    def _parse_document(self, image_output_dir, drop_layout_tables):
+        """Parse once per (image_output_dir, drop_layout_tables) and reuse the dict."""
+        key = (image_output_dir, drop_layout_tables)
+        if self._cached_parse_key != key:
+            self._cached_document = self._reader().to_dicts(
+                image_output_dir=image_output_dir,
+                drop_layout_tables=drop_layout_tables,
+            )
+            self._cached_parse_key = key
+        return self._cached_document
 
     @abstractmethod
     def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
@@ -353,7 +367,9 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
     """Write parsed PDF output (JSON + image files) using PyMuPDF."""
 
     def _reader(self):
-        return PDFReaderPyMuPDFEngine(self.filepath, workers=self.workers)
+        if self._reader_engine is None:
+            self._reader_engine = PDFReaderPyMuPDFEngine(self.filepath, workers=self.workers)
+        return self._reader_engine
 
     def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
         """Parse the PDF and write the unified document JSON.
@@ -369,7 +385,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
                 that are layout boxes rather than real tabular data.
         """
         filename = set_export_filename(self.properties.json_export_filename, export_filename)
-        document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
+        document = self._parse_document(image_output_dir, drop_layout_tables)
         if image_output_dir and dedupe_images:
             pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
         with open(filename, "w") as f:
@@ -381,7 +397,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
     ):
         """Parse the PDF and write one flattened element per line (JSONL)."""
         filename = set_export_filename(self.properties.json_newline_export_filename, export_filename)
-        document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
+        document = self._parse_document(image_output_dir, drop_layout_tables)
         if image_output_dir and dedupe_images:
             pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
         records = pdfcomponents.ParsedDocument(document).flatten()
@@ -403,7 +419,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
                 that are layout boxes rather than real tabular data.
         """
         filename = set_export_filename(self.properties.markdown_export_filename, export_filename)
-        document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
+        document = self._parse_document(image_output_dir, drop_layout_tables)
         if image_output_dir and dedupe_images:
             pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
         markdown_text = pdfcomponents.ParsedDocument(document).to_markdown(export_filename=filename)
@@ -420,7 +436,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
                 to a single file before returning paths.
         """
         directory = output_dir if output_dir else self.properties.images_export_dir
-        document = self._reader().to_dicts(image_output_dir=directory)
+        document = self._parse_document(directory, False)
         if dedupe:
             pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=directory)
         paths = []
@@ -443,7 +459,11 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
         self.structured = structured
 
     def _reader(self):
-        return PDFReaderPdfiumEngine(self.filepath, workers=self.workers, structured=self.structured)
+        if self._reader_engine is None:
+            self._reader_engine = PDFReaderPdfiumEngine(
+                self.filepath, workers=self.workers, structured=self.structured
+            )
+        return self._reader_engine
 
     def _dedupe(self, document, image_output_dir):
         if self.structured:
@@ -454,7 +474,7 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
     def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
         """Parse the PDF and write the document JSON (native or unified schema)."""
         filename = set_export_filename(self.properties.json_export_filename, export_filename)
-        document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
+        document = self._parse_document(image_output_dir, drop_layout_tables)
         if image_output_dir and dedupe_images:
             self._dedupe(document, image_output_dir)
         with open(filename, "w") as f:
@@ -466,7 +486,7 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
     ):
         """Parse the PDF and write one flattened element per line (JSONL)."""
         filename = set_export_filename(self.properties.json_newline_export_filename, export_filename)
-        document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
+        document = self._parse_document(image_output_dir, drop_layout_tables)
         if image_output_dir and dedupe_images:
             self._dedupe(document, image_output_dir)
         if self.structured:
@@ -481,7 +501,7 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
     def write_markdown(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
         """Parse the PDF and write the document Markdown (native or structured schema)."""
         filename = set_export_filename(self.properties.markdown_export_filename, export_filename)
-        document = self._reader().to_dicts(image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
+        document = self._parse_document(image_output_dir, drop_layout_tables)
         if image_output_dir and dedupe_images:
             self._dedupe(document, image_output_dir)
         if self.structured:
@@ -495,7 +515,7 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
     def extract_images(self, output_dir=None, dedupe=True):
         """Parse the PDF, write embedded images to disk, return their paths."""
         directory = output_dir if output_dir else self.properties.images_export_dir
-        document = self._reader().to_dicts(image_output_dir=directory)
+        document = self._parse_document(directory, False)
         if dedupe:
             self._dedupe(document, directory)
         paths = []
