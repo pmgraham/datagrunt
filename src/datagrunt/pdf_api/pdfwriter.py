@@ -111,14 +111,12 @@ class PDFWriter(PDFComponents):
         if self._parsed_dict is not None:
             filename = export_filename if export_filename else "output.jsonl"
             document = self._parsed_dict
+            is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
             if image_output_dir and dedupe_images:
-                is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
                 if is_structured:
                     pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
                 else:
                     PdfiumNativeReader.dedupe_images(document, image_output_dir=image_output_dir)
-            
-            is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
             if is_structured:
                 records = pdfcomponents.ParsedDocument(document).flatten()
             else:
@@ -155,14 +153,12 @@ class PDFWriter(PDFComponents):
         if self._parsed_dict is not None:
             filename = export_filename if export_filename else "output.md"
             document = self._parsed_dict
+            is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
             if image_output_dir and dedupe_images:
-                is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
                 if is_structured:
                     pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
                 else:
                     PdfiumNativeReader.dedupe_images(document, image_output_dir=image_output_dir)
-            
-            is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
             if is_structured:
                 markdown_text = pdfcomponents.ParsedDocument(document).to_markdown(export_filename=filename)
             else:
