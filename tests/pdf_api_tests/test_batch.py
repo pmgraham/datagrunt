@@ -62,6 +62,46 @@ class TestPDFBatchWriter:
         assert os.path.isdir(result["images_dir"])
         assert len(os.listdir(result["images_dir"])) >= 1
 
+    def test_multi_format_batch_parses_pdf_once(self, tmp_path, monkeypatch):
+        """JSON + JSONL + Markdown must share a single parse per document."""
+        pdf = _make_pdf(tmp_path / "doc.pdf")
+        out = tmp_path / "out"
+        parse_calls = 0
+
+        from datagrunt.core.pdf_io.engines import PDFReaderPyMuPDFEngine
+
+        original_to_dicts = PDFReaderPyMuPDFEngine.to_dicts
+
+        def counting_to_dicts(self, image_output_dir=None, drop_layout_tables=False):
+            nonlocal parse_calls
+            parse_calls += 1
+            return original_to_dicts(
+                self, image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables
+            )
+
+        monkeypatch.setattr(PDFReaderPyMuPDFEngine, "to_dicts", counting_to_dicts)
+
+        class _SyncExecutor:
+            """Run batch work in-process (avoids multiprocessing in restricted CI sandboxes)."""
+
+            def __init__(self, max_workers=None):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return None
+
+            def map(self, fn, sources, options):
+                return [fn(s, o) for s, o in zip(sources, options)]
+
+        monkeypatch.setattr("datagrunt.pdf_api.batch.ProcessPoolExecutor", _SyncExecutor)
+
+        PDFBatchWriter(markdown=True, jsonl=True).process([pdf], str(out))
+
+        assert parse_calls == 1
+
     def test_markdown_written_only_when_enabled(self, tmp_path):
         pdf = _make_pdf(tmp_path / "doc.pdf")
         out = tmp_path / "out"

@@ -136,6 +136,32 @@ class TestPDFWriter:
         assert len(content) > 0
         assert "report_page" in content
 
+    def test_multi_format_writer_parses_pdf_once(self, sample_pdf, tmp_path, monkeypatch):
+        """write_json + write_jsonl + write_markdown must share one parse."""
+        monkeypatch.chdir(tmp_path)
+        parse_calls = 0
+
+        from datagrunt.core.pdf_io.engines import PDFReaderPyMuPDFEngine
+
+        original_to_dicts = PDFReaderPyMuPDFEngine.to_dicts
+
+        def counting_to_dicts(self, image_output_dir=None, drop_layout_tables=False):
+            nonlocal parse_calls
+            parse_calls += 1
+            return original_to_dicts(
+                self, image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables
+            )
+
+        monkeypatch.setattr(PDFReaderPyMuPDFEngine, "to_dicts", counting_to_dicts)
+
+        img_dir = tmp_path / "imgs"
+        writer = PDFWriter(sample_pdf, engine="pymupdf")
+        writer.write_json(image_output_dir=str(img_dir))
+        writer.write_json_newline_delimited(image_output_dir=str(img_dir))
+        writer.write_markdown(image_output_dir=str(img_dir))
+
+        assert parse_calls == 1
+
     def test_write_markdown_pdfium_native(self, sample_pdf, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         writer = PDFWriter(sample_pdf, engine="pdfium", native=True)

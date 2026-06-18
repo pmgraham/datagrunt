@@ -27,3 +27,22 @@ def escape_leading_markdown(text: str) -> str:
         return f"{indent}{digits}\\{dot}"
 
     return _LEADING_MARKDOWN_METACHAR.sub(_escape, text, count=1)
+
+
+def escape_markdown_link_text(text: str) -> str:
+    """Escape ``[`` / ``]`` / ``\\`` in markdown link *label* text (image alt)."""
+    if not isinstance(text, str):
+        return text
+    return text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+def escape_markdown_link_target(target: str) -> str:
+    """Escape ``(`` / ``)`` / ``[`` / ``\\`` in markdown link *destination* URLs/paths."""
+    if not isinstance(target, str):
+        return target
+    return (
+        target.replace("\\", "\\\\")
+        .replace(")", "\\)")
+        .replace("(", "\\(")
+        .replace("[", "\\[")
+    )

@@ -11,7 +11,11 @@ from datagrunt.core.file_io import FileProperties
 from datagrunt.core.pdf_io.extraction import PdfPlumberTableExtractor
 from datagrunt.core.pdf_io.extraction.image_dedupe import dedupe_image_files
 from datagrunt.core.pdf_io.extraction.layout_sorter import ElementAdapter, PageLayoutSorter
-from datagrunt.core.pdf_io.extraction.markdown_escape import escape_leading_markdown
+from datagrunt.core.pdf_io.extraction.markdown_escape import (
+    escape_leading_markdown,
+    escape_markdown_link_target,
+    escape_markdown_link_text,
+)
 from datagrunt.core.pdf_io.extraction.ocr import dpi_for_page
 from datagrunt.core.pdf_io.extraction.pymupdf_backend import PyMuPDFBackend
 
@@ -279,7 +283,8 @@ class ParsedDocument:
                             # resolve()/relpath can fail (unresolvable path, or a
                             # cross-drive relpath on Windows); keep the original path.
                             pass
-                    blocks.append(f"![{Path(path).name or 'image'}]({path})")
+                    alt = escape_markdown_link_text(Path(path).name or "image")
+                    blocks.append(f"![{alt}]({escape_markdown_link_target(path)})")
                 elif isinstance(content, str) and content.strip():
                     blocks.append(escape_leading_markdown(content))
         return "\n\n".join(blocks) + "\n"
@@ -307,6 +312,9 @@ class ParsedDocument:
 class PDFComponents(FileProperties):
     """A class that combines PDF components into a single interface."""
 
+    # Guardrail for untrusted ``.json`` document paths (full file is loaded into memory).
+    MAX_JSON_DOCUMENT_BYTES = 50 * 1024 * 1024
+
     def __init__(self, filepath):
         """Initialize the PDFComponents object.
 
@@ -324,9 +332,14 @@ class PDFComponents(FileProperties):
         else:
             filepath_path = Path(filepath)
             if filepath_path.suffix.lower() == ".json":
+                size_in_bytes = filepath_path.stat().st_size
+                if size_in_bytes > self.MAX_JSON_DOCUMENT_BYTES:
+                    raise ValueError(
+                        f"JSON document exceeds maximum size of "
+                        f"{self.MAX_JSON_DOCUMENT_BYTES} bytes ({size_in_bytes} bytes)"
+                    )
                 with open(filepath_path, "r", encoding="utf-8") as f:
                     self._parsed_dict = json.load(f)
-                size_in_bytes = filepath_path.stat().st_size
                 self._apply_virtual_file_properties(
                     filepath=filepath_path,
                     size_in_bytes=size_in_bytes,
