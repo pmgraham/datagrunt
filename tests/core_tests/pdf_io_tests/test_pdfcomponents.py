@@ -191,6 +191,28 @@ class TestVirtualFilePropertiesSurface:
         getattr(json_mode, attr)
 
 
+class TestPDFComponentsJsonGuardrail:
+    """Guardrail tests for ``.json`` document paths loaded into memory."""
+
+    def test_json_document_below_size_limit_loads(self, tmp_path):
+        from datagrunt.core.pdf_io.pdfcomponents import PDFComponents
+
+        doc = {"document": {"pages": [{"elements": [{"type": "body_text", "content": "ok"}]}]}}
+        path = tmp_path / "doc.json"
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        assert PDFComponents(str(path))._parsed_dict == doc
+
+    def test_json_document_above_size_limit_raises(self, tmp_path):
+        from datagrunt.core.pdf_io.pdfcomponents import PDFComponents
+
+        limit = PDFComponents.MAX_JSON_DOCUMENT_BYTES
+        path = tmp_path / "huge.json"
+        # Minimal JSON larger than the guardrail without allocating a giant string in RAM.
+        path.write_bytes(b'{"document":{"pages":[]}' + b"x" * (limit + 1) + b"}")
+        with pytest.raises(ValueError, match="exceeds maximum size"):
+            PDFComponents(str(path))
+
+
 class TestDedupeImages:
     """Test suite for ParsedDocument.dedupe_images."""
 
@@ -469,3 +491,21 @@ class TestMarkdownMetacharacterEscaping:
 
         rendered = ParsedDocument._render_table([["a|b", "c"]], has_header=False)
         assert "a\\|b" in rendered
+
+    @staticmethod
+    def _image_element(file_path):
+        return {"type": "image", "content": None, "metadata": {"file_path": file_path}}
+
+    def test_image_file_path_paren_does_not_inject_markdown(self):
+        malicious = "x) ![](https://evil.example/pwn.png"
+        md = self._markdown([self._image_element(malicious)])
+        # Must remain a single markdown image, not an injected second image link.
+        assert md.count("![") == 1
+        assert "\\)" in md
+
+    def test_image_file_path_bracket_in_alt_is_escaped(self):
+        from pathlib import Path
+
+        path = str(Path("/tmp/foo]bar.png"))
+        md = self._markdown([self._image_element(path)])
+        assert "foo\\]bar.png" in md
