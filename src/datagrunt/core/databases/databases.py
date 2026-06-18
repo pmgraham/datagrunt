@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 class DuckDBQueries:
     """Class to store DuckDB database queries and query strings."""
 
+    # Process-wide guard: the spatial extension only needs INSTALL once per
+    # process (it persists to the on-disk extension directory). Each new
+    # connection still LOADs it, but redundant INSTALLs are skipped.
+    _spatial_installed = False
+
     def __init__(self, filepath, lenient=False):
         """
         Initialize the DuckDBQueries class.
@@ -47,13 +52,6 @@ class DuckDBQueries:
         # never touch DuckDB, so eagerly opening a connection here would waste
         # one on every such instance.
         self._connection = None
-        # DuckDB's read_csv ``skip`` operates on physical lines and, unlike
-        # Polars/PyArrow, does not natively ignore leading blank lines. Skip
-        # every leading physical line up to (but not including) the header,
-        # which ``header=true`` then consumes. See issue #85. ``max(..., 0)``
-        # guards files with no header line (empty/blank), where the helper
-        # returns 0 and DuckDB rejects a negative ``skip``.
-        self.skip_rows = max(_count_leading_physical_lines_before_header(self.filepath) - 1, 0)
         # Tracks how the cached table was imported (None until first import,
         # then True/False for normalize_columns) so create_table can reuse the
         # table for matching calls and re-import only when the mode changes.
@@ -83,6 +81,34 @@ class DuckDBQueries:
         if self._connection is None:
             self._connection = duckdb.connect(":memory:")
         return self._connection
+
+    @cached_property
+    def skip_rows(self):
+        """Leading physical lines DuckDB must skip before the header.
+
+        DuckDB's read_csv ``skip`` operates on physical lines and, unlike
+        Polars/PyArrow, does not natively ignore leading blank lines. Skip
+        every leading physical line up to (but not including) the header,
+        which ``header=true`` then consumes. See issue #85. ``max(..., 0)``
+        guards files with no header line (empty/blank), where the helper
+        returns 0 and DuckDB rejects a negative ``skip``.
+
+        Computed lazily: only the DuckDB import path consumes this, so
+        Polars/PyArrow engines (which build a DuckDBQueries only for the table
+        name) never pay the leading-line scan.
+        """
+        return max(_count_leading_physical_lines_before_header(self.filepath) - 1, 0)
+
+    def load_spatial_extension(self, connection):
+        """Ensure DuckDB's spatial extension is available on ``connection``.
+
+        INSTALL runs at most once per process (the extension persists on disk);
+        LOAD runs on every call because each export opens a fresh connection.
+        """
+        if not DuckDBQueries._spatial_installed:
+            connection.execute("INSTALL spatial;")
+            DuckDBQueries._spatial_installed = True
+        connection.execute("LOAD spatial;")
 
     @cached_property
     def delimiter(self):
@@ -390,9 +416,9 @@ class DuckDBQueries:
             str: The SQL query to export the table to an Excel file.
         """
         filename = self._escape_sql_literal(self.set_export_filename(default_filename, export_filename))
+        # Spatial DDL is handled separately via load_spatial_extension() so the
+        # extension is INSTALLed at most once per process; this is a pure COPY.
         return f"""
-            INSTALL spatial;
-            LOAD spatial;
             COPY (SELECT * FROM {self.database_table_name})
             TO '{filename}'(FORMAT GDAL, DRIVER 'xlsx')
         """
