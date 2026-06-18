@@ -1,5 +1,6 @@
 """This module contains tests for the engine classes."""
 
+import json
 from pathlib import Path
 
 import polars as pl
@@ -693,3 +694,64 @@ class TestLeadingCommentHandling:
             df = reader.to_dataframe()
             assert df.columns == ["a", "b"]
             assert len(df) == 1
+
+
+class TestPolarsWriterParseOnce:
+    """CSVWriterPolarsEngine must parse the source once across export formats."""
+
+    def test_multi_format_export_reads_once(self, tmp_path, sample_csv, monkeypatch):
+        """write_csv + write_json + write_parquet on one instance read once."""
+        import datagrunt.core.csv_io.engines as engines_mod
+
+        calls = {"count": 0}
+        original = engines_mod.CSVReaderPolarsEngine.to_dataframe
+
+        def counting_to_dataframe(self, normalize_columns=None):
+            calls["count"] += 1
+            return original(self, normalize_columns)
+
+        monkeypatch.setattr(engines_mod.CSVReaderPolarsEngine, "to_dataframe", counting_to_dataframe)
+
+        writer = CSVWriterPolarsEngine(sample_csv)
+        writer.write_csv(str(tmp_path / "o.csv"))
+        writer.write_json(str(tmp_path / "o.json"))
+        writer.write_parquet(str(tmp_path / "o.parquet"))
+
+        assert calls["count"] == 1
+
+    def test_normalize_variants_are_not_cross_contaminated(self, tmp_path):
+        """Caching must key on normalize_columns; raw and normalized differ."""
+        csv = tmp_path / "c.csv"
+        csv.write_text("First Name,Age\nJohn,30\n")
+        writer = CSVWriterPolarsEngine(str(csv))
+
+        raw_path = tmp_path / "raw.csv"
+        norm_path = tmp_path / "norm.csv"
+        writer.write_csv(str(raw_path), normalize_columns=False)
+        writer.write_csv(str(norm_path), normalize_columns=True)
+
+        assert "First Name" in raw_path.read_text()
+        assert "first_name" in norm_path.read_text()
+
+
+class TestPyArrowJsonOutput:
+    """PyArrow JSON/JSONL export content must be preserved by the refactor."""
+
+    def test_write_json_content(self, tmp_path):
+        csv = tmp_path / "d.csv"
+        csv.write_text("name,age\nJohn,30\nJane,25\n")
+        out = tmp_path / "o.json"
+        CSVWriterPyArrowEngine(str(csv)).write_json(str(out))
+        # The PyArrow engine reads all columns as strings; lock that exactly.
+        assert json.loads(out.read_text()) == [
+            {"name": "John", "age": "30"},
+            {"name": "Jane", "age": "25"},
+        ]
+
+    def test_write_jsonl_content(self, tmp_path):
+        csv = tmp_path / "d.csv"
+        csv.write_text("name,age\nJohn,30\nJane,25\n")
+        out = tmp_path / "o.jsonl"
+        CSVWriterPyArrowEngine(str(csv)).write_json_newline_delimited(str(out))
+        lines = [json.loads(line) for line in out.read_text().splitlines()]
+        assert lines == [{"name": "John", "age": "30"}, {"name": "Jane", "age": "25"}]
