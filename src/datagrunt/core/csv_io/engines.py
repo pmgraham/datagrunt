@@ -4,6 +4,7 @@
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -746,6 +747,15 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
     Class to read CSV files and convert CSV files powered by PyArrow.
     """
 
+    @cached_property
+    def _midfile_comments(self):
+        """Whether the file has a mid-file ``#`` comment, scanned once per instance.
+
+        The scan is O(file) to prove absence, so caching avoids repeating it on
+        every conversion/export performed on the same engine instance.
+        """
+        return _has_midfile_comments(self.filepath)
+
     def _polars_fallback_table(self, columns, normalize_columns, truncate_ragged_lines, n_rows=None):
         """Parse the CSV with Polars and convert it to an Arrow table.
 
@@ -811,7 +821,7 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
             _check_csv_ragged_and_warn(self.filepath, self.delimiter)
             # Fallback to Polars to parse the ragged CSV, then convert to Arrow Table
             return self._polars_fallback_table(columns, normalize_columns, truncate_ragged_lines=True)
-        if _has_midfile_comments(self.filepath):
+        if self._midfile_comments:
             # PyArrow's native reader crashes on comment lines past the leading
             # block; defer to Polars so the rows match the polars reference
             # engine (issue #90).
@@ -868,7 +878,7 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
                 truncate_ragged_lines=True,
                 n_rows=CSVEngineProperties.dataframe_sample_rows,
             )
-        if _has_midfile_comments(self.filepath):
+        if self._midfile_comments:
             # PyArrow's native reader crashes on comment lines past the leading
             # block; defer to Polars so the rows match the polars reference
             # engine (issue #90).
@@ -1017,6 +1027,15 @@ class CSVReaderPyArrowEngine(CSVBaseReaderEngine):
 class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
     """Class to write CSVs to other file formats powered by PyArrow."""
 
+    @cached_property
+    def _midfile_comments(self):
+        """Whether the file has a mid-file ``#`` comment, scanned once per instance.
+
+        Cached so exporting to multiple formats on one writer instance scans
+        the file for mid-file comments only once.
+        """
+        return _has_midfile_comments(self.filepath)
+
     def _create_table(self, normalize_columns=False):
         """Create a PyArrow table for writing operations."""
         # Read with PyArrow with all columns as string to prevent data loss
@@ -1032,7 +1051,7 @@ class CSVWriterPyArrowEngine(CSVBaseWriterEngine):
                 "PyArrow engine does not support legacy Mac OS carriage return (\\r) newlines. "
                 "Please use engine='duckdb' or convert the file to Unix/Windows newlines."
             )
-        if self.lenient or _has_midfile_comments(self.filepath):
+        if self.lenient or self._midfile_comments:
             if self.lenient:
                 _check_csv_ragged_and_warn(self.filepath, self.queries.delimiter)
             # Fallback to Polars: it parses ragged rows and skips mid-file ``#``
