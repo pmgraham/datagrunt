@@ -734,6 +734,44 @@ class TestPolarsWriterParseOnce:
         assert "first_name" in norm_path.read_text()
 
 
+class TestPyArrowMidfileCommentScanCached:
+    """_has_midfile_comments must be scanned once per PyArrow engine instance."""
+
+    def test_reader_scans_once_across_conversions(self, sample_csv, monkeypatch):
+        import datagrunt.core.csv_io.engines as engines_mod
+
+        calls = {"count": 0}
+        original = engines_mod._has_midfile_comments
+
+        def counting(filepath):
+            calls["count"] += 1
+            return original(filepath)
+
+        monkeypatch.setattr(engines_mod, "_has_midfile_comments", counting)
+
+        engine = CSVReaderPyArrowEngine(sample_csv)
+        engine.to_arrow_table()
+        engine.to_arrow_table()
+        assert calls["count"] == 1
+
+    def test_writer_scans_once_across_exports(self, sample_csv, tmp_path, monkeypatch):
+        import datagrunt.core.csv_io.engines as engines_mod
+
+        calls = {"count": 0}
+        original = engines_mod._has_midfile_comments
+
+        def counting(filepath):
+            calls["count"] += 1
+            return original(filepath)
+
+        monkeypatch.setattr(engines_mod, "_has_midfile_comments", counting)
+
+        writer = CSVWriterPyArrowEngine(sample_csv)
+        writer.write_json(str(tmp_path / "o.json"))
+        writer.write_parquet(str(tmp_path / "o.parquet"))
+        assert calls["count"] == 1
+
+
 class TestPyArrowJsonOutput:
     """PyArrow JSON/JSONL export content must be preserved by the refactor."""
 

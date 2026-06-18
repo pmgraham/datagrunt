@@ -441,3 +441,36 @@ class TestPDFWriterPdfiumStructured:
         paths = PDFWriterPdfiumEngine(sample_pdf, structured=True).extract_images(output_dir=str(tmp_path))
         assert len(paths) >= 1
         assert all(os.path.isfile(p) for p in paths)
+
+
+class TestPDFReaderParseSharedAcrossConversions:
+    """to_dataframe + to_arrow_table on one reader must parse the PDF once."""
+
+    @staticmethod
+    def _spy_parse(monkeypatch):
+        import datagrunt.core.pdf_io.pdfcomponents as pdfc
+
+        calls = {"count": 0}
+        original = pdfc.DocumentAssembler.parse_document
+
+        def counting(self, *args, **kwargs):
+            calls["count"] += 1
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(pdfc.DocumentAssembler, "parse_document", counting)
+        return calls
+
+    def test_dataframe_and_arrow_share_one_parse(self, sample_pdf, monkeypatch):
+        calls = self._spy_parse(monkeypatch)
+        engine = PDFReaderPyMuPDFEngine(sample_pdf)
+        engine.to_dataframe()
+        engine.to_arrow_table()
+        assert calls["count"] == 1
+
+    def test_public_to_dicts_still_reparses(self, sample_pdf, monkeypatch):
+        """Public to_dicts must keep its uncached contract (fresh dict per call)."""
+        calls = self._spy_parse(monkeypatch)
+        engine = PDFReaderPyMuPDFEngine(sample_pdf)
+        engine.to_dicts()
+        engine.to_dicts()
+        assert calls["count"] == 2

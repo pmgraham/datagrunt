@@ -94,6 +94,19 @@ class PDFBaseReaderEngine(ABC):
         self.workers = workers
         if not self.filepath.exists():
             raise FileNotFoundError
+        self._parsed_cache = {}
+
+    def _parse_to_dicts(self, drop_layout_tables: bool = False) -> dict:
+        """Parse once per drop_layout_tables value, shared by the conversions.
+
+        ``to_dataframe`` and ``to_arrow_table`` both need the parsed document
+        and only read it (via ``flatten``), so they reuse a single parse on the
+        same instance. The public ``to_dicts`` stays uncached so its return
+        value is never an unexpectedly shared/mutable object.
+        """
+        if drop_layout_tables not in self._parsed_cache:
+            self._parsed_cache[drop_layout_tables] = self.to_dicts(drop_layout_tables=drop_layout_tables)
+        return self._parsed_cache[drop_layout_tables]
 
     @abstractmethod
     def get_sample(self) -> dict:
@@ -161,14 +174,16 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
 
     def to_dataframe(self, drop_layout_tables: bool = False) -> pl.DataFrame:
         """Flatten parsed elements into a Polars DataFrame (one row/element)."""
-        records = pdfcomponents.ParsedDocument(self.to_dicts(drop_layout_tables=drop_layout_tables)).flatten()
+        document = self._parse_to_dicts(drop_layout_tables=drop_layout_tables)
+        records = pdfcomponents.ParsedDocument(document).flatten()
         if not records:
             return pl.DataFrame()
         return pl.DataFrame(records)
 
     def to_arrow_table(self, drop_layout_tables: bool = False) -> pa.Table:
         """Flatten parsed elements into a PyArrow table (one row/element)."""
-        records = pdfcomponents.ParsedDocument(self.to_dicts(drop_layout_tables=drop_layout_tables)).flatten()
+        document = self._parse_to_dicts(drop_layout_tables=drop_layout_tables)
+        records = pdfcomponents.ParsedDocument(document).flatten()
         if not records:
             return pa.Table.from_pydict({})
         return pa.Table.from_pylist(records)
@@ -290,9 +305,10 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
     def to_dataframe(self, drop_layout_tables: bool = False) -> pl.DataFrame:
         """Flatten parsed elements into a Polars DataFrame (one row/element)."""
         if self.structured:
-            records = pdfcomponents.ParsedDocument(self.to_dicts(drop_layout_tables=drop_layout_tables)).flatten()
+            document = self._parse_to_dicts(drop_layout_tables=drop_layout_tables)
+            records = pdfcomponents.ParsedDocument(document).flatten()
         else:
-            records = PdfiumNativeReader.flatten(self.to_dicts())
+            records = PdfiumNativeReader.flatten(self._parse_to_dicts())
         if not records:
             return pl.DataFrame()
         return pl.DataFrame(records)
@@ -300,9 +316,10 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
     def to_arrow_table(self, drop_layout_tables: bool = False) -> pa.Table:
         """Flatten parsed elements into a PyArrow table (one row/element)."""
         if self.structured:
-            records = pdfcomponents.ParsedDocument(self.to_dicts(drop_layout_tables=drop_layout_tables)).flatten()
+            document = self._parse_to_dicts(drop_layout_tables=drop_layout_tables)
+            records = pdfcomponents.ParsedDocument(document).flatten()
         else:
-            records = PdfiumNativeReader.flatten(self.to_dicts())
+            records = PdfiumNativeReader.flatten(self._parse_to_dicts())
         if not records:
             return pa.Table.from_pydict({})
         return pa.Table.from_pylist(records)
