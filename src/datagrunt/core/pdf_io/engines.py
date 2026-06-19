@@ -1,7 +1,6 @@
 """Module to create engines for PDF processing."""
 
 # standard library
-import json
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -333,22 +332,52 @@ class PDFBaseWriterEngine(ABC):
             self._cached_parse_key = key
         return self._cached_document
 
-    @abstractmethod
     def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
-        """Write the unified document JSON to disk."""
-        pass
+        """Parse the PDF and write the unified document JSON to disk.
 
-    @abstractmethod
+        Args:
+            export_filename (optional, str): Output path; defaults to output.json.
+            image_output_dir (optional, str): If provided, embedded images are
+                written here and referenced in the JSON; otherwise image
+                ``file_path`` values are null.
+            dedupe_images (bool, default True): When images are written, collapse
+                byte-identical duplicates to a single file and repoint references.
+            drop_layout_tables (bool, default False): Drop 1xN / Nx1 "tables"
+                that are layout boxes rather than real tabular data.
+        """
+        filename = set_export_filename(self.properties.json_export_filename, export_filename)
+        document = self._parse_document(image_output_dir, drop_layout_tables)
+        if image_output_dir and dedupe_images:
+            pdfcomponents.dedupe_document_images(document, image_output_dir)
+        return pdfcomponents.write_document_json(document, filename)
+
     def write_json_newline_delimited(
         self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False
     ):
-        """Write one element per line as JSON Lines."""
-        pass
+        """Parse the PDF and write one flattened element per line (JSONL)."""
+        filename = set_export_filename(self.properties.json_newline_export_filename, export_filename)
+        document = self._parse_document(image_output_dir, drop_layout_tables)
+        if image_output_dir and dedupe_images:
+            pdfcomponents.dedupe_document_images(document, image_output_dir)
+        return pdfcomponents.write_document_jsonl(document, filename)
 
-    @abstractmethod
     def write_markdown(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
-        """Write the document Markdown representation to disk."""
-        pass
+        """Parse the PDF and write the document Markdown to disk.
+
+        Args:
+            export_filename (optional, str): Output path; defaults to output.md.
+            image_output_dir (optional, str): If provided, embedded images are
+                written there and referenced in the Markdown.
+            dedupe_images (bool, default True): When images are written, collapse
+                byte-identical duplicates to a single file and repoint references.
+            drop_layout_tables (bool, default False): Drop 1xN / Nx1 "tables"
+                that are layout boxes rather than real tabular data.
+        """
+        filename = set_export_filename(self.properties.markdown_export_filename, export_filename)
+        document = self._parse_document(image_output_dir, drop_layout_tables)
+        if image_output_dir and dedupe_images:
+            pdfcomponents.dedupe_document_images(document, image_output_dir)
+        return pdfcomponents.write_document_markdown(document, filename)
 
     def extract_images(self, output_dir=None, dedupe=True):
         """Parse the PDF, write embedded images to disk, return their paths.
@@ -377,62 +406,6 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
             self._reader_engine = PDFReaderPyMuPDFEngine(self.filepath, workers=self.workers)
         return self._reader_engine
 
-    def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
-        """Parse the PDF and write the unified document JSON.
-
-        Args:
-            export_filename (optional, str): Output path; defaults to output.json.
-            image_output_dir (optional, str): If provided, embedded images are
-                written here and referenced in the JSON; otherwise image
-                ``file_path`` values are null.
-            dedupe_images (bool, default True): When images are written, collapse
-                byte-identical duplicates to a single file and repoint references.
-            drop_layout_tables (bool, default False): Drop 1xN / Nx1 "tables"
-                that are layout boxes rather than real tabular data.
-        """
-        filename = set_export_filename(self.properties.json_export_filename, export_filename)
-        document = self._parse_document(image_output_dir, drop_layout_tables)
-        if image_output_dir and dedupe_images:
-            pdfcomponents.dedupe_document_images(document, image_output_dir)
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(document, f, indent=2)
-        return filename
-
-    def write_json_newline_delimited(
-        self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False
-    ):
-        """Parse the PDF and write one flattened element per line (JSONL)."""
-        filename = set_export_filename(self.properties.json_newline_export_filename, export_filename)
-        document = self._parse_document(image_output_dir, drop_layout_tables)
-        if image_output_dir and dedupe_images:
-            pdfcomponents.dedupe_document_images(document, image_output_dir)
-        records = pdfcomponents.flatten_document(document)
-        with open(filename, "w", encoding="utf-8") as f:
-            for record in records:
-                f.write(json.dumps(record) + "\n")
-        return filename
-
-    def write_markdown(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
-        """Parse the PDF and write the document Markdown.
-
-        Args:
-            export_filename (optional, str): Output path; defaults to output.md.
-            image_output_dir (optional, str): If provided, embedded images are
-                written there and referenced in the Markdown.
-            dedupe_images (bool, default True): When images are written, collapse
-                byte-identical duplicates to a single file and repoint references.
-            drop_layout_tables (bool, default False): Drop 1xN / Nx1 "tables"
-                that are layout boxes rather than real tabular data.
-        """
-        filename = set_export_filename(self.properties.markdown_export_filename, export_filename)
-        document = self._parse_document(image_output_dir, drop_layout_tables)
-        if image_output_dir and dedupe_images:
-            pdfcomponents.dedupe_document_images(document, image_output_dir)
-        markdown_text = pdfcomponents.ParsedDocument(document).to_markdown(export_filename=filename)
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(markdown_text)
-        return filename
-
 
 class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
     """Write parsed PDFium output. Native schema by default; unified when structured."""
@@ -445,41 +418,3 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
         if self._reader_engine is None:
             self._reader_engine = PDFReaderPdfiumEngine(self.filepath, workers=self.workers, structured=self.structured)
         return self._reader_engine
-
-    def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
-        """Parse the PDF and write the document JSON (native or unified schema)."""
-        filename = set_export_filename(self.properties.json_export_filename, export_filename)
-        document = self._parse_document(image_output_dir, drop_layout_tables)
-        if image_output_dir and dedupe_images:
-            pdfcomponents.dedupe_document_images(document, image_output_dir)
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(document, f, indent=2)
-        return filename
-
-    def write_json_newline_delimited(
-        self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False
-    ):
-        """Parse the PDF and write one flattened element per line (JSONL)."""
-        filename = set_export_filename(self.properties.json_newline_export_filename, export_filename)
-        document = self._parse_document(image_output_dir, drop_layout_tables)
-        if image_output_dir and dedupe_images:
-            pdfcomponents.dedupe_document_images(document, image_output_dir)
-        records = pdfcomponents.flatten_document(document)
-        with open(filename, "w", encoding="utf-8") as f:
-            for record in records:
-                f.write(json.dumps(record) + "\n")
-        return filename
-
-    def write_markdown(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
-        """Parse the PDF and write the document Markdown (native or structured schema)."""
-        filename = set_export_filename(self.properties.markdown_export_filename, export_filename)
-        document = self._parse_document(image_output_dir, drop_layout_tables)
-        if image_output_dir and dedupe_images:
-            pdfcomponents.dedupe_document_images(document, image_output_dir)
-        if self.structured:
-            markdown_text = pdfcomponents.ParsedDocument(document).to_markdown(export_filename=filename)
-        else:
-            markdown_text = PdfiumNativeReader.to_markdown(document)
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(markdown_text)
-        return filename

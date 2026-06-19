@@ -363,6 +363,78 @@ def dedupe_document_images(document: dict, image_output_dir: str) -> None:
         PdfiumNativeReader.dedupe_images(document, image_output_dir=image_output_dir)
 
 
+def write_document_json(document: dict, filename: str) -> str:
+    """Serialize *document* to a JSON file at *filename* and return *filename*.
+
+    The file is written with ``indent=2`` to match the historical engine output
+    exactly. This is the single source of truth for JSON serialization — both
+    the engine base class and the ``PDFWriter`` ``_parsed_dict`` path delegate
+    here so the byte output is identical regardless of call site.
+
+    Args:
+        document (dict): A parsed document dict (unified or native schema).
+        filename (str): Destination file path.
+
+    Returns:
+        str: The same *filename* that was written.
+    """
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(document, f, indent=2)
+    return filename
+
+
+def write_document_jsonl(document: dict, filename: str) -> str:
+    """Flatten *document* and write one JSON record per line to *filename*.
+
+    Dispatches via ``flatten_document`` so both the unified and native pdfium
+    schemas produce the correct flat records. Byte output is identical to the
+    historical per-engine implementation (``json.dumps(record) + "\\n"`` per
+    line, no trailing blank line).
+
+    Args:
+        document (dict): A parsed document dict (unified or native schema).
+        filename (str): Destination file path.
+
+    Returns:
+        str: The same *filename* that was written.
+    """
+    records = flatten_document(document)
+    with open(filename, "w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record) + "\n")
+    return filename
+
+
+def write_document_markdown(document: dict, filename: str) -> str:
+    """Render *document* to Markdown and write it to *filename*.
+
+    Dispatches on schema via ``document_is_structured``:
+
+    - **Structured** (unified element schema from pymupdf or pdfium structured
+      mode) → ``ParsedDocument.to_markdown``, which resolves image paths
+      relative to *filename*'s directory.
+    - **Native** (lean pdfium schema without ``elements`` per page) →
+      ``PdfiumNativeReader.to_markdown``, which concatenates the page-level
+      ``text`` fields.
+
+    This is the single source of truth for Markdown serialization.
+
+    Args:
+        document (dict): A parsed document dict (unified or native schema).
+        filename (str): Destination file path.
+
+    Returns:
+        str: The same *filename* that was written.
+    """
+    if document_is_structured(document):
+        text = ParsedDocument(document).to_markdown(export_filename=filename)
+    else:
+        text = PdfiumNativeReader.to_markdown(document)
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(text)
+    return filename
+
+
 def collect_image_paths(document: dict) -> list:
     """Return unique image file paths in document order, dispatching on schema."""
     structured = document_is_structured(document)
