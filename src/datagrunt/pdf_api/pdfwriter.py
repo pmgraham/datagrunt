@@ -22,7 +22,7 @@ class PDFWriter(_PDFEngineBacked):
         an empty/minimal output file instead of leaking a raw PdfiumError from
         the engine.
         """
-        with open(filename, "w") as f:
+        with open(filename, "w", encoding="utf-8") as f:
             f.write(content)
         return filename
 
@@ -46,7 +46,7 @@ class PDFWriter(_PDFEngineBacked):
             document = self._parsed_dict
             if image_output_dir and dedupe_images:
                 pdfcomponents.dedupe_document_images(document, image_output_dir)
-            with open(filename, "w") as f:
+            with open(filename, "w", encoding="utf-8") as f:
                 json.dump(document, f, indent=2)
             return filename
         # Mirror PDFReader's is_empty handling: a 0-byte PDF produces an empty
@@ -78,7 +78,7 @@ class PDFWriter(_PDFEngineBacked):
             if image_output_dir and dedupe_images:
                 pdfcomponents.dedupe_document_images(document, image_output_dir)
             records = pdfcomponents.flatten_document(document)
-            with open(filename, "w") as f:
+            with open(filename, "w", encoding="utf-8") as f:
                 for record in records:
                     f.write(json.dumps(record) + "\n")
             return filename
@@ -116,7 +116,7 @@ class PDFWriter(_PDFEngineBacked):
                 markdown_text = pdfcomponents.ParsedDocument(document).to_markdown(export_filename=filename)
             else:
                 markdown_text = PdfiumNativeReader.to_markdown(document)
-            with open(filename, "w") as f:
+            with open(filename, "w", encoding="utf-8") as f:
                 f.write(markdown_text)
             return filename
         # Mirror PDFReader's is_empty handling: a 0-byte PDF has no content, so
