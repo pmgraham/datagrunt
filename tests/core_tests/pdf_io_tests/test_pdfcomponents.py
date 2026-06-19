@@ -12,12 +12,17 @@ from datagrunt.core.pdf_io import pdfcomponents
 # must mirror. The cached_property flags are discovered dynamically, so a NEW
 # flag added to FileProperties automatically enters the sweep and fails if a
 # virtual-mode instance does not expose it (issue #153).
-FILE_PROPERTY_FLAGS = sorted(
-    name for name, attr in vars(FileProperties).items() if isinstance(attr, cached_property)
-)
+FILE_PROPERTY_FLAGS = sorted(name for name, attr in vars(FileProperties).items() if isinstance(attr, cached_property))
 FILE_PROPERTY_INIT_ATTRS = [
-    "filepath", "filename", "extension", "extension_string",
-    "size_in_bytes", "size_in_kb", "size_in_mb", "size_in_gb", "size_in_tb",
+    "filepath",
+    "filename",
+    "extension",
+    "extension_string",
+    "size_in_bytes",
+    "size_in_kb",
+    "size_in_mb",
+    "size_in_gb",
+    "size_in_tb",
 ]
 FILE_PROPERTY_SURFACE = FILE_PROPERTY_FLAGS + FILE_PROPERTY_INIT_ATTRS
 
@@ -59,9 +64,7 @@ class TestPageClassification:
     def test_text_only_page_classified_text_only(self, text_only_pdf, make_backend):
         from datagrunt.core.pdf_io.pdfcomponents import DocumentAssembler
 
-        page = DocumentAssembler(
-            text_only_pdf, backend=make_backend(text_only_pdf)
-        ).parse_page(0)
+        page = DocumentAssembler(text_only_pdf, backend=make_backend(text_only_pdf)).parse_page(0)
 
         types = {el["type"] for el in page["elements"]}
         assert "image" not in types
@@ -72,9 +75,7 @@ class TestPageClassification:
     def test_page_with_image_classified_mixed(self, sample_pdf, make_backend):
         from datagrunt.core.pdf_io.pdfcomponents import DocumentAssembler
 
-        page = DocumentAssembler(
-            sample_pdf, backend=make_backend(sample_pdf)
-        ).parse_page(0)
+        page = DocumentAssembler(sample_pdf, backend=make_backend(sample_pdf)).parse_page(0)
 
         types = {el["type"] for el in page["elements"]}
         assert "image" in types
@@ -93,8 +94,7 @@ class TestParsePage:
         assert "image" in types
         # Every element has the unified schema keys.
         for e in page["elements"]:
-            assert set(e) >= {"id", "type", "content", "page", "position",
-                              "confidence", "metadata"}
+            assert set(e) >= {"id", "type", "content", "page", "position", "confidence", "metadata"}
             assert e["id"].startswith("elem_01_")
 
 
@@ -120,8 +120,7 @@ class TestFlatten:
         assert len(records) >= 2
         rec = records[0]
         # Scalar position columns + JSON-encoded complex fields.
-        assert {"id", "type", "page", "x", "y", "w", "h", "confidence",
-                "content", "metadata"} <= set(rec)
+        assert {"id", "type", "page", "x", "y", "w", "h", "confidence", "content", "metadata"} <= set(rec)
         assert isinstance(rec["x"], float)
         assert isinstance(rec["metadata"], str)  # JSON-encoded
 
@@ -347,9 +346,7 @@ class TestDropLayoutTables:
         assert (tbl["metadata"]["rows"], tbl["metadata"]["columns"]) == (2, 2)
 
     def test_non_table_elements_never_dropped(self):
-        document = {
-            "document": {"pages": [{"page_number": 1, "elements": [self._header()]}]}
-        }
+        document = {"document": {"pages": [{"page_number": 1, "elements": [self._header()]}]}}
         removed = pdfcomponents.ParsedDocument(document).drop_layout_tables()
         assert removed == 0
         assert len(document["document"]["pages"][0]["elements"]) == 1
@@ -419,21 +416,37 @@ class TestParsedDocument:
         a, b = tmp_path / "a.png", tmp_path / "b.png"
         a.write_bytes(b"X")
         b.write_bytes(b"X")
-        document = {"document": {"pages": [{"elements": [
-            {"type": "image", "metadata": {"file_path": str(a)}},
-            {"type": "image", "metadata": {"file_path": str(b)}},
-        ]}]}}
+        document = {
+            "document": {
+                "pages": [
+                    {
+                        "elements": [
+                            {"type": "image", "metadata": {"file_path": str(a)}},
+                            {"type": "image", "metadata": {"file_path": str(b)}},
+                        ]
+                    }
+                ]
+            }
+        }
         removed = ParsedDocument(document).dedupe_images(image_output_dir=str(tmp_path))
         assert removed == 1 and not b.exists()
 
     def test_drop_layout_tables(self):
         from datagrunt.core.pdf_io.pdfcomponents import ParsedDocument
 
-        document = {"document": {"pages": [{"elements": [
-            {"type": "table", "metadata": {"rows": 1, "columns": 5}},
-            {"type": "table", "metadata": {"rows": 4, "columns": 3}},
-            {"type": "body_text"},
-        ]}]}}
+        document = {
+            "document": {
+                "pages": [
+                    {
+                        "elements": [
+                            {"type": "table", "metadata": {"rows": 1, "columns": 5}},
+                            {"type": "table", "metadata": {"rows": 4, "columns": 3}},
+                            {"type": "body_text"},
+                        ]
+                    }
+                ]
+            }
+        }
         pd = ParsedDocument(document)
         assert pd.drop_layout_tables() == 1
         kept = document["document"]["pages"][0]["elements"]

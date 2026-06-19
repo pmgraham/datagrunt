@@ -6,13 +6,10 @@
       (angle-bracket wrapping for space/tab; stripping for newlines).
 """
 
-import pytest
-
 from datagrunt.core.pdf_io.extraction.markdown_escape import (
     escape_leading_markdown,
     escape_markdown_link_target,
 )
-
 
 # ---------------------------------------------------------------------------
 # Existing behaviour that must continue to pass

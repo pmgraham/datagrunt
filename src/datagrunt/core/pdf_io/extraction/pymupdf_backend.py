@@ -26,6 +26,7 @@ class PyMuPDFBackend(ExtractionBackend):
     def __init__(self, filepath):
         super().__init__(filepath)
         import threading
+
         self._local = threading.local()
 
     def _open_doc(self):
@@ -209,9 +210,7 @@ class PyMuPDFBackend(ExtractionBackend):
                         text_blocks.append(tb)
             images = []
             if analysis.image_count > 0:
-                images = self._images_from_page(
-                    doc, page, image_list, output_dir, name_prefix, page_number
-                )
+                images = self._images_from_page(doc, page, image_list, output_dir, name_prefix, page_number)
             return analysis, text_blocks, images
         finally:
             if should_close:
@@ -224,9 +223,7 @@ class PyMuPDFBackend(ExtractionBackend):
             if page_number < 0 or page_number >= doc.page_count:
                 return []
             page = doc[page_number]
-            return self._images_from_page(
-                doc, page, page.get_images(), output_dir, name_prefix, page_number
-            )
+            return self._images_from_page(doc, page, page.get_images(), output_dir, name_prefix, page_number)
         finally:
             if should_close:
                 doc.close()
@@ -301,6 +298,7 @@ class PyMuPDFBackend(ExtractionBackend):
         if ext.lower() not in ("png", "jpg", "jpeg", "gif"):
             try:
                 import pymupdf
+
                 pix = pymupdf.Pixmap(doc, img_info[0])
                 if pix.colorspace and (pix.colorspace.n > 3 or pix.colorspace.name == "DeviceCMYK"):
                     pix = pymupdf.Pixmap(pymupdf.csRGB, pix)

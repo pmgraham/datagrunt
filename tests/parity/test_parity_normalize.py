@@ -4,14 +4,14 @@ from datagrunt.core.csv_io import _compute_python as py
 CASES = [
     ["name", "age", "city"],
     ["First Name", "LAST-NAME", "e-mail  address"],
-    ["col_a", "col_a", "col_a_1"],            # uniquify must not collide
+    ["col_a", "col_a", "col_a_1"],  # uniquify must not collide
     ["dup", "dup", "dup", "dup_1", "dup_2"],
-    ["%", "()", "!!!"],                        # all-special -> "column" placeholder
-    ["123abc", "9lives", "_x_"],               # leading digits / underscores
-    ["näme", "ÄGE", "城市"],                   # non-ASCII -> underscores
-    ["", " ", "a"],                            # empty-ish headers
+    ["%", "()", "!!!"],  # all-special -> "column" placeholder
+    ["123abc", "9lives", "_x_"],  # leading digits / underscores
+    ["näme", "ÄGE", "城市"],  # non-ASCII -> underscores
+    ["", " ", "a"],  # empty-ish headers
     ["a__b___c", "__d__"],
-    ["UPPER", "upper", "Upper"],               # case-fold collisions
+    ["UPPER", "upper", "Upper"],  # case-fold collisions
 ]
 
 

@@ -36,9 +36,7 @@ class TestNativeSchemaOcrFailure:
 
     def test_to_dicts_native_keeps_page(self, scanned_pdf, tmp_path, monkeypatch):
         monkeypatch.setattr(pdfium_native, "ocr_data_to_blocks", _tesseract_not_found)
-        document = PDFReaderPdfiumEngine(scanned_pdf, structured=False).to_dicts(
-            image_output_dir=str(tmp_path)
-        )
+        document = PDFReaderPdfiumEngine(scanned_pdf, structured=False).to_dicts(image_output_dir=str(tmp_path))
         pages = document["document"]["pages"]
         assert len(pages) == 1  # page not dropped
         assert pages[0]["ocr"] is False

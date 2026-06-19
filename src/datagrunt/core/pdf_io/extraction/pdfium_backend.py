@@ -13,6 +13,7 @@ class PdfiumBackend(ExtractionBackend):
     def __init__(self, filepath):
         super().__init__(filepath)
         import threading
+
         self._local = threading.local()
 
     def __enter__(self):
@@ -89,9 +90,7 @@ class PdfiumBackend(ExtractionBackend):
                 images = []
                 if image_objs > 0:
                     images = list(
-                        page.image_items(
-                            output_dir=output_dir, name_prefix=name_prefix, page_number=page_number
-                        )
+                        page.image_items(output_dir=output_dir, name_prefix=name_prefix, page_number=page_number)
                     )
                 return analysis, text_blocks, images
         finally:
@@ -114,11 +113,7 @@ class PdfiumBackend(ExtractionBackend):
         doc, should_close = self._get_doc()
         try:
             with doc.page(page_number) as page:
-                res = list(
-                    page.image_items(
-                        output_dir=output_dir, name_prefix=name_prefix, page_number=page_number
-                    )
-                )
+                res = list(page.image_items(output_dir=output_dir, name_prefix=name_prefix, page_number=page_number))
         finally:
             if should_close:
                 doc.close()

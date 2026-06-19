@@ -4,7 +4,6 @@
 import json
 import logging
 import os
-import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +36,7 @@ def _is_distributed_env() -> bool:
 def _parse_page_structured_worker(filepath_str: str, page_index: int, image_output_dir: Optional[str]) -> dict:
     """Process worker function to parse a single page using PDFium in structured mode."""
     from pathlib import Path
+
     from datagrunt.core.pdf_io import pdfcomponents
     from datagrunt.core.pdf_io.extraction import PdfiumBackend
 
@@ -49,6 +49,7 @@ def _parse_page_structured_worker(filepath_str: str, page_index: int, image_outp
 def _parse_page_native_worker(filepath_str: str, page_index: int, image_output_dir: Optional[str]) -> dict:
     """Process worker function to parse a single page using PDFium in native mode."""
     from pathlib import Path
+
     from datagrunt.core.pdf_io.extraction import PdfiumNativeReader
 
     filepath = Path(filepath_str)
@@ -214,7 +215,8 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
         if self.workers <= 1 or total_pages <= 1 or _is_distributed_env():
             if self.workers > 1 and _is_distributed_env():
                 logger.warning(
-                    "Distributed environment detected. Defaulting to sequential PDFium execution to prevent multiprocessing overhead."
+                    "Distributed environment detected. Defaulting to sequential "
+                    "PDFium execution to prevent multiprocessing overhead."
                 )
             assembler = pdfcomponents.DocumentAssembler(self.filepath, backend=PdfiumBackend(self.filepath))
             with assembler.backend, assembler.table_extractor:
@@ -225,6 +227,7 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
                         errors.append(f"Page {idx + 1}: {e}")
         else:
             from concurrent.futures import ProcessPoolExecutor, as_completed
+
             pages_map = {}
             with ProcessPoolExecutor(max_workers=self.workers) as executor:
                 futures = {
@@ -256,7 +259,8 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
         if self.workers <= 1 or total_pages <= 1 or _is_distributed_env():
             if self.workers > 1 and _is_distributed_env():
                 logger.warning(
-                    "Distributed environment detected. Defaulting to sequential PDFium execution to prevent multiprocessing overhead."
+                    "Distributed environment detected. Defaulting to sequential "
+                    "PDFium execution to prevent multiprocessing overhead."
                 )
             reader = PdfiumNativeReader(self.filepath)
             with reader:
@@ -268,6 +272,7 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
                         errors.append(f"Page {idx + 1}: {e}")
         else:
             from concurrent.futures import ProcessPoolExecutor, as_completed
+
             with ProcessPoolExecutor(max_workers=self.workers) as executor:
                 futures = {
                     executor.submit(_parse_page_native_worker, str(self.filepath), idx, image_output_dir): idx
@@ -294,9 +299,7 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
     def get_sample(self) -> dict:
         """Parse and return the first page only."""
         if self.structured:
-            return pdfcomponents.DocumentAssembler(
-                self.filepath, backend=PdfiumBackend(self.filepath)
-            ).parse_page(0)
+            return pdfcomponents.DocumentAssembler(self.filepath, backend=PdfiumBackend(self.filepath)).parse_page(0)
         return PdfiumNativeReader(self.filepath).parse_page(0)
 
 
@@ -343,9 +346,7 @@ class PDFBaseWriterEngine(ABC):
         pass
 
     @abstractmethod
-    def write_markdown(
-        self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False
-    ):
+    def write_markdown(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
         """Write the document Markdown representation to disk."""
         pass
 
@@ -442,9 +443,7 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
 
     def _reader(self):
         if self._reader_engine is None:
-            self._reader_engine = PDFReaderPdfiumEngine(
-                self.filepath, workers=self.workers, structured=self.structured
-            )
+            self._reader_engine = PDFReaderPdfiumEngine(self.filepath, workers=self.workers, structured=self.structured)
         return self._reader_engine
 
     def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):

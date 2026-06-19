@@ -18,11 +18,14 @@ class TestEncryptedPdf:
         # Must not leak the raw backend exception type.
         assert not isinstance(excinfo.value, pdfium.PdfiumError)
 
-    @pytest.mark.parametrize("engine,native", [
-        ("pdfium", True),
-        ("pdfium", False),
-        ("pymupdf", False),
-    ])
+    @pytest.mark.parametrize(
+        "engine,native",
+        [
+            ("pdfium", True),
+            ("pdfium", False),
+            ("pymupdf", False),
+        ],
+    )
     def test_reader_raises_clear_error(self, encrypted_pdf, engine, native):
         reader = PDFReader(encrypted_pdf, engine=engine, native=native)
         with pytest.raises(ValueError) as excinfo:

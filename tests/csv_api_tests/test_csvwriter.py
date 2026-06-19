@@ -224,7 +224,7 @@ class TestCSVWriter:
         writer = CSVWriter(sample_csv, engine="duckdb")
         writer.write_csv(str(tmp_path / "a.csv"))
         assert writer.__dict__.get("_engine") is not None
-        writer.close()                      # optional early release
+        writer.close()  # optional early release
         assert writer.__dict__["_engine"].queries._connection is None
         # Still usable afterward (engine transparently rebuilds).
         writer.write_json(str(tmp_path / "b.json"))
@@ -233,7 +233,6 @@ class TestCSVWriter:
         with CSVWriter(sample_csv, engine="duckdb") as w:
             w.write_parquet(str(tmp_path / "c.parquet"))
         assert (tmp_path / "c.parquet").exists()
-
 
     def test_csvwriter_close_does_not_build_engine_when_unused(self, sample_csv):
         """close() never forces the engine (and its import) into existence."""

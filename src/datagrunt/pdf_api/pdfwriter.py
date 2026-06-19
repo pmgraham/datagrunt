@@ -90,9 +90,7 @@ class PDFWriter(_PDFEngineBacked):
             export_filename, image_output_dir, dedupe_images, drop_layout_tables
         )
 
-    def write_markdown(
-        self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False
-    ):
+    def write_markdown(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
         """Parse the PDF and write a formatted Markdown file to disk.
 
         Args:
@@ -123,9 +121,7 @@ class PDFWriter(_PDFEngineBacked):
         # the Markdown output is an empty file rather than a raw PdfiumError.
         if self.is_empty:
             return self._write_empty_file(export_filename or "output.md")
-        return self._engine.write_markdown(
-            export_filename, image_output_dir, dedupe_images, drop_layout_tables
-        )
+        return self._engine.write_markdown(export_filename, image_output_dir, dedupe_images, drop_layout_tables)
 
     def extract_images(self, output_dir=None, dedupe=True):
         """Parse the PDF and write embedded image files to disk.

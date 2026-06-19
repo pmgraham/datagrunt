@@ -60,9 +60,7 @@ class TestPyMuPDFBackend:
         green_block = "q 60 0 0 60 280 40 cm /fzImg1 Do Q"
         # Swap the two draw blocks so green (higher xref) is drawn before blue.
         swapped = (
-            stream.replace(blue_block, "__BLUE__")
-            .replace(green_block, blue_block)
-            .replace("__BLUE__", green_block)
+            stream.replace(blue_block, "__BLUE__").replace(green_block, blue_block).replace("__BLUE__", green_block)
         )
         assert swapped != stream, "content-stream swap did not match expected draw blocks"
         doc.update_stream(content_xref, swapped.encode("latin-1"))
@@ -110,6 +108,7 @@ def test_pymupdf_extract_page_parses_page_once(sample_pdf, monkeypatch):
     """extract_page must not re-parse: at most two get_text calls (dict + text)
     and exactly one get_images call, versus three/two in the old path."""
     import pymupdf
+
     from datagrunt.core.pdf_io.extraction.pymupdf_backend import PyMuPDFBackend
 
     counts = {"get_text": 0, "get_images": 0}

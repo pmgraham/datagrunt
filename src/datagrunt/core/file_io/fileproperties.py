@@ -7,6 +7,7 @@ from pathlib import Path
 
 DEFAULT_ENCODING = "utf-8-sig"
 
+
 class FileExtensions:
     """Class for getting file extensions."""
 

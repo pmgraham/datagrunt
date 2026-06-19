@@ -62,8 +62,7 @@ class TestStructuredBackendParity:
         mu_chars = text_chars(pymupdf_doc)
         pdf_chars = text_chars(pdfium_doc)
         assert text_within_floor(mu_chars, pdf_chars), (
-            f"{name}: text extraction diverges drastically "
-            f"(pymupdf={mu_chars}, pdfium={pdf_chars})"
+            f"{name}: text extraction diverges drastically (pymupdf={mu_chars}, pdfium={pdf_chars})"
         )
 
     def test_both_engines_extract_text(self, structured_pair):
@@ -83,8 +82,6 @@ class TestMultipageMarkerParity:
             assert len(pages) == 3
             for n, page in enumerate(pages, start=1):
                 page_text = " ".join(
-                    el["content"]
-                    for el in page.get("elements", [])
-                    if isinstance(el.get("content"), str)
+                    el["content"] for el in page.get("elements", []) if isinstance(el.get("content"), str)
                 )
                 assert f"Page Marker {n}" in page_text, f"{engine} missing marker on page {n}"

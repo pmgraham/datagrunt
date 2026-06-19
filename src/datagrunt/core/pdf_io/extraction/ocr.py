@@ -35,8 +35,14 @@ def _data_to_blocks(data: dict, dpi: int) -> list:
             continue
         key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
         lines.setdefault(key, []).append(
-            {"text": text, "confidence": conf, "left": data["left"][i], "top": data["top"][i],
-             "width": data["width"][i], "height": data["height"][i]}
+            {
+                "text": text,
+                "confidence": conf,
+                "left": data["left"][i],
+                "top": data["top"][i],
+                "width": data["width"][i],
+                "height": data["height"][i],
+            }
         )
     blocks = []
     for words in lines.values():
@@ -47,8 +53,12 @@ def _data_to_blocks(data: dict, dpi: int) -> list:
         blocks.append(
             OcrBlock(
                 text=" ".join(w["text"] for w in words),
-                bbox=BBox(x=round(x0 * scale, 2), y=round(y0 * scale, 2),
-                          w=round((x1 - x0) * scale, 2), h=round((y1 - y0) * scale, 2)),
+                bbox=BBox(
+                    x=round(x0 * scale, 2),
+                    y=round(y0 * scale, 2),
+                    w=round((x1 - x0) * scale, 2),
+                    h=round((y1 - y0) * scale, 2),
+                ),
                 confidence=round(sum(w["confidence"] for w in words) / len(words), 1),
                 word_count=len(words),
                 per_word_confidence=[w["confidence"] for w in words],
