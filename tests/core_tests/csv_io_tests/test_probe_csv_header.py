@@ -49,3 +49,13 @@ def test_probe_matches_legacy_helpers(tmp_path):
     probe = py.probe_csv_header(path)
     assert probe["first_row"] == py.first_row(path)
     assert probe["sample_rows"] == py.leading_rows(path, py.CANDIDATE_SAMPLE_ROWS)
+
+
+def test_probe_caps_sample_rows_and_lines_at_five(tmp_path):
+    """Both sample windows cap at their 5-row limits regardless of file size."""
+    rows = b"".join(f"r{i},v\n".encode() for i in range(8))  # 8 non-blank, non-comment rows
+    path = _write(tmp_path, "big.csv", rows)
+    probe = py.probe_csv_header(path)
+    assert len(probe["sample_rows"]) == py.CANDIDATE_SAMPLE_ROWS == 5
+    assert len(probe["sample_lines"]) == py.CSV_SNIFF_SAMPLE_ROWS == 5
+    assert probe["sample_rows"] == py.leading_rows(path, py.CANDIDATE_SAMPLE_ROWS)
