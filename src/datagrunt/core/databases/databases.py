@@ -390,32 +390,30 @@ class DuckDBQueries:
                                 skip={self.skip_rows})"""
         return f"SELECT * FROM {read_csv} LIMIT {limit}"
 
-    def export_csv_query(self, default_filename, export_filename=None):
+    def export_csv_query(self, filename):
         """
         Query to export a DuckDB table to a CSV file.
 
         Args:
-            default_filename (str): The default name of the output file.
-            export_filename (str, optional): The name of the output file.
+            filename (str): The name of the output file.
 
         Returns:
             str: The SQL query to export the table to a CSV file.
         """
-        filename = self._escape_sql_literal(self.set_export_filename(default_filename, export_filename))
+        filename = self._escape_sql_literal(filename)
         return f"COPY {self.database_table_name} TO '{filename}' (HEADER, DELIMITER ',');"  # noqa: E501
 
-    def export_excel_query(self, default_filename, export_filename=None):
+    def export_excel_query(self, filename):
         """
         Query to export a DuckDB table to an Excel file.
 
         Args:
-            default_filename (str): The default name of the output file.
-            export_filename (str, optional): The name of the output file.
+            filename (str): The name of the output file.
 
         Returns:
             str: The SQL query to export the table to an Excel file.
         """
-        filename = self._escape_sql_literal(self.set_export_filename(default_filename, export_filename))
+        filename = self._escape_sql_literal(filename)
         # Spatial DDL is handled separately via load_spatial_extension() so the
         # extension is INSTALLed at most once per process; this is a pure COPY.
         return f"""
@@ -423,47 +421,44 @@ class DuckDBQueries:
             TO '{filename}'(FORMAT GDAL, DRIVER 'xlsx')
         """
 
-    def export_json_query(self, default_filename, export_filename=None):
+    def export_json_query(self, filename):
         """
         Query to export a DuckDB table to a JSON file.
 
         Args:
-            default_filename (str): The default name of the output file.
-            export_filename (str, optional): The name of the output file.
+            filename (str): The name of the output file.
 
         Returns:
             str: The SQL query to export the table to a JSON file.
         """
-        filename = self._escape_sql_literal(self.set_export_filename(default_filename, export_filename))
+        filename = self._escape_sql_literal(filename)
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}' (ARRAY true)"  # noqa: E501
 
-    def export_json_newline_delimited_query(self, default_filename, export_filename=None):
+    def export_json_newline_delimited_query(self, filename):
         """
         Query to export a DuckDB table to a JSON file with newline delimited.
 
         Args:
-            default_filename (str): The default name of the output file.
-            export_filename (str, optional): The name of the output file.
+            filename (str): The name of the output file.
 
         Returns:
             str: The SQL query to export the table to a JSON file with newline
             delimited.
         """
-        filename = self._escape_sql_literal(self.set_export_filename(default_filename, export_filename))
+        filename = self._escape_sql_literal(filename)
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}'"  # noqa: E501
 
-    def export_parquet_query(self, default_filename, export_filename=None):
+    def export_parquet_query(self, filename):
         """
         Query to export a DuckDB table to a Parquet file.
 
         Args:
-            default_filename (str): The default name of the output file.
-            export_filename (str, optional): The name of the output file.
+            filename (str): The name of the output file.
 
         Returns:
             str: The SQL query to export the table to a Parquet file.
         """
-        filename = self._escape_sql_literal(self.set_export_filename(default_filename, export_filename))
+        filename = self._escape_sql_literal(filename)
         return f"COPY (SELECT * FROM {self.database_table_name}) TO '{filename}'(FORMAT PARQUET)"  # noqa: E501
 
     def update_and_normalize_column_names(self):
