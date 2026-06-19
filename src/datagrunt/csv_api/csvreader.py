@@ -4,7 +4,6 @@ objects.
 """
 
 # standard library
-from functools import cached_property
 from pathlib import Path
 
 # third party libraries
@@ -12,12 +11,15 @@ import polars as pl
 import pyarrow as pa
 
 # local libraries
-from datagrunt.core import CSVComponents, CSVEngineFactory, DuckDBQueries
+from datagrunt.core import DuckDBQueries
+from datagrunt.csv_api._engine_backed import _CSVEngineBacked
 from datagrunt.csv_api._compat import warn_per_call_normalize
 
 
-class CSVReader(CSVComponents):
+class CSVReader(_CSVEngineBacked):
     """Class to unify the interface for reading CSV files."""
+
+    _engine_role = "reader"
 
     def __init__(self, filepath, engine="polars", lenient=False, normalize_columns=False):
         """
@@ -32,65 +34,12 @@ class CSVReader(CSVComponents):
             every operation on this reader. With the DuckDB engine, queries
             are then written against the normalized names.
         """
-        filepath = Path(filepath)
-        self.lenient = lenient
-        self.normalize_columns = normalize_columns
-        super().__init__(filepath)
+        super().__init__(filepath, engine, lenient=lenient, normalize_columns=normalize_columns)
         self.db_table = DuckDBQueries(self.filepath, lenient=self.lenient).database_table_name
-        self.engine = engine.lower().replace(" ", "")
-        CSVEngineFactory.validate_engine(self.engine)
 
     def _return_empty_file_object(self, object):
         """Return an empty object of the specified type."""
         return object
-
-    def close(self):
-        """Close the DuckDB connection held by this reader's engine, if any.
-
-        Only the DuckDB engine holds a live connection, and only once an
-        operation has built the cached engine; if no operation has run yet there
-        is nothing to close, so this never forces the engine (and its import)
-        into existence. ``close()`` is idempotent and the reader stays usable
-        afterward - a later call transparently rebuilds/reopens (issue #150).
-        """
-        reader = self.__dict__.get("_reader")
-        if reader is not None:
-            reader.close()
-
-    def __enter__(self):
-        """Enter a ``with`` block, returning this reader."""
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Close the engine's connection on leaving the ``with`` block.
-
-        Returns ``None`` so any in-flight exception propagates.
-        """
-        self.close()
-
-    @cached_property
-    def _reader(self):
-        """Return this reader's engine, built once and reused.
-
-        The engine owns the DuckDB connection (and, for the DuckDB engine, the
-        imported table). Caching it here means repeated calls - notably
-        ``query_data`` - reuse a single import instead of rebuilding a fresh
-        engine and re-importing the file on every call (issue #104).
-        """
-        return CSVEngineFactory(
-            self.filepath,
-            self.engine,
-            lenient=self.lenient,
-            normalize_columns=self.normalize_columns,
-        ).create_reader()
-
-    def _create_reader(self):
-        """Return this reader's cached engine.
-
-        Retained for backward compatibility; delegates to the cached ``_reader``
-        so callers share a single engine and a single CSV import.
-        """
-        return self._reader
 
     def get_sample(self, normalize_columns=None):
         """Return a sample of the CSV file.
@@ -104,7 +53,7 @@ class CSVReader(CSVComponents):
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(pl.DataFrame())
-        return self._create_reader().get_sample(warn_per_call_normalize(normalize_columns))
+        return self._engine.get_sample(warn_per_call_normalize(normalize_columns))
 
     def to_dataframe(self, normalize_columns=None):
         """Converts CSV to a Polars dataframe.
@@ -118,7 +67,7 @@ class CSVReader(CSVComponents):
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(pl.DataFrame())
-        return self._create_reader().to_dataframe(warn_per_call_normalize(normalize_columns))
+        return self._engine.to_dataframe(warn_per_call_normalize(normalize_columns))
 
     def to_arrow_table(self, normalize_columns=None):
         """Converts CSV to a PyArrow table.
@@ -132,7 +81,7 @@ class CSVReader(CSVComponents):
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(pa.Table.from_pydict({}))
-        return self._create_reader().to_arrow_table(warn_per_call_normalize(normalize_columns))
+        return self._engine.to_arrow_table(warn_per_call_normalize(normalize_columns))
 
     def to_dicts(self, normalize_columns=None):
         """Converts CSV to a list of dictionaries.
@@ -146,7 +95,7 @@ class CSVReader(CSVComponents):
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(list())
-        return self._create_reader().to_dicts(warn_per_call_normalize(normalize_columns))
+        return self._engine.to_dicts(warn_per_call_normalize(normalize_columns))
 
     def query_data(self, sql_query, normalize_columns=None):
         """
@@ -184,4 +133,4 @@ class CSVReader(CSVComponents):
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(list())
-        return self._create_reader().query_data(sql_query, warn_per_call_normalize(normalize_columns))
+        return self._engine.query_data(sql_query, warn_per_call_normalize(normalize_columns))
