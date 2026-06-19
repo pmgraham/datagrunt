@@ -13,8 +13,7 @@ def test_row_count_with_header(corpus_file):
     ) == py.row_count_with_header(str(corpus_file), delimiter)
 
 
-def test_row_count_without_header_is_count_minus_one(corpus_file):
-    delimiter = py.infer_delimiter(str(corpus_file))
-    rust_count = datagrunt_rs.row_count_with_header(str(corpus_file), delimiter)
-    py_count = py.row_count_with_header(str(corpus_file), delimiter)
-    assert rust_count - 1 == py_count - 1, "row_count_without_header parity"
+# Note: there is intentionally no separate ``row_count_without_header`` parity
+# test. Both backends expose only ``row_count_with_header``; the without-header
+# count is ``with_header - 1`` at the CSVRows layer (covered in the core tests),
+# so a backend-level ``(x-1) == (y-1)`` assertion is just the test above.

@@ -58,4 +58,9 @@ CORPUS: dict[str, bytes] = {
     # decoder chunk boundary (io.rs CHUNK_SIZE). Exercises row counting across
     # the chunk split for both backends.
     "chunk_boundary_quoted_newline.csv": b"a,b\n" + b"x" * 65_528 + b',"line1\nline2"\n',
+    # Legacy-Mac (\r) line endings WITH a quoted field that itself contains a
+    # \r. Python reads these via newline=None (universal translation), so the
+    # quoted \r must stay part of one record rather than splitting the row.
+    # Exercises the legacy-mac branch and quoting together for both backends.
+    "legacy_mac_quoted_cr.csv": b'id,note\r1,"line one\rline two"\r2,plain\r',
 }
