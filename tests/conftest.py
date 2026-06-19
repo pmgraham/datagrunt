@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import warnings
 
 import pytest
 
@@ -39,7 +40,11 @@ def _ensure_tesseract_tmpdir():
             timeout=5,
         )
         tesseract_can_read = result.returncode == 0
-    except Exception:
+    except Exception as exc:
+        warnings.warn(
+            f"tesseract tmpdir probe failed ({exc!r}); assuming OK",
+            stacklevel=2,
+        )
         tesseract_can_read = True  # assume OK; let the real test surface the error
     finally:
         if os.path.exists(probe_input):
