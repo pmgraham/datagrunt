@@ -166,7 +166,10 @@ class CSVReader(CSVComponents):
 
         Returns:
             A DuckDB DuckDBPyRelation with the query results (DuckDB engine)
-            or a Polars DataFrame (polars/pyarrow engines).
+            or a Polars DataFrame (polars/pyarrow engines). NOTE: for an empty
+            or blank file this returns an empty ``list`` regardless of engine,
+            rather than an empty relation/DataFrame — check ``is_empty`` /
+            ``is_blank`` first if you require a consistent result type.
 
         Example if DuckDB Engine:
             dg = CSVReader('myfile.csv', normalize_columns=True)
