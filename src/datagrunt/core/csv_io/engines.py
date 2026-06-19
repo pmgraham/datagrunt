@@ -78,24 +78,20 @@ class CSVEngineProperties:
     missing_file_message: str = "File '{filepath}'. No such file or directory."
 
 
-class CSVBaseReaderEngine(ABC):
-    """Abstract base class defining the interface for reader engines."""
+class _DuckDBBackedEngine(ABC):
+    """Shared DuckDB-connection ownership for the CSV reader/writer engines.
+
+    Holds the per-engine ``DuckDBQueries`` (and the derived table name) plus the
+    idempotent ``close()`` both engine families need, so neither base duplicates
+    connection setup/teardown.
+    """
 
     def __init__(self, filepath, lenient=False, normalize_columns=False):
-        """Initialize the CSVReader class.
-
-        Args:
-            filepath (str or Path): Path to the file to read.
-            lenient (bool): Whether to run in lenient mode.
-            normalize_columns (bool): Whether to normalize column names for
-            every operation on this engine. A per-call argument overrides it.
-        """
         self.filepath = Path(filepath)
         self.lenient = lenient
         self.normalize_columns = normalize_columns
         self.queries = DuckDBQueries(self.filepath, lenient=self.lenient)
         self.db_table = self.queries.database_table_name
-        self.delimiter = self.queries.delimiter
         if not self.filepath.exists():
             raise FileNotFoundError
 
@@ -107,6 +103,22 @@ class CSVBaseReaderEngine(ABC):
         this resets already-clean state. The engine stays usable afterward.
         """
         self.queries.close()
+
+
+class CSVBaseReaderEngine(_DuckDBBackedEngine):
+    """Abstract base class defining the interface for reader engines."""
+
+    def __init__(self, filepath, lenient=False, normalize_columns=False):
+        """Initialize the reader engine (adds the sniffed delimiter).
+
+        Args:
+            filepath (str or Path): Path to the file to read.
+            lenient (bool): Whether to run in lenient mode.
+            normalize_columns (bool): Whether to normalize column names for
+            every operation on this engine. A per-call argument overrides it.
+        """
+        super().__init__(filepath, lenient=lenient, normalize_columns=normalize_columns)
+        self.delimiter = self.queries.delimiter
 
     @abstractmethod
     def get_sample(self, normalize_columns: Optional[bool] = None) -> pl.DataFrame:
@@ -168,26 +180,8 @@ class CSVBaseReaderEngine(ABC):
         pass
 
 
-class CSVBaseWriterEngine(ABC):
+class CSVBaseWriterEngine(_DuckDBBackedEngine):
     """Abstract base class defining the interface for writer engines."""
-
-    def __init__(self, filepath, lenient=False, normalize_columns=False):
-        """
-        Initialize the CSV Writer DuckDB Engine class.
-
-        Args:
-            filepath (str or Path): Path to the file to write.
-            lenient (bool): Whether to run in lenient mode.
-            normalize_columns (bool): Whether to normalize column names for
-            every operation on this engine. A per-call argument overrides it.
-        """
-        self.filepath = Path(filepath)
-        self.lenient = lenient
-        self.normalize_columns = normalize_columns
-        self.queries = DuckDBQueries(self.filepath, lenient=self.lenient)
-        self.db_table = self.queries.database_table_name
-        if not self.filepath.exists():
-            raise FileNotFoundError
 
     @abstractmethod
     def write_csv(self, export_filename, normalize_columns=None):
