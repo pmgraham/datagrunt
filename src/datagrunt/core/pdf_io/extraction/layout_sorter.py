@@ -11,6 +11,15 @@ import math
 # affects legitimate layouts.
 MAX_HISTOGRAM_BINS = 100_000
 
+# Maximum recursion depth for partition() and its re-entrant helpers. A
+# crafted 'staircase' PDF layout that peels one item per recursive level drives
+# O(n) stack depth and raises RecursionError beyond ~1000 items. Real
+# multi-column pages never nest more than a handful of levels (left/right then
+# sub-columns), so 32 is well above any legitimate need. When the cap is
+# reached, the remaining items are returned as a single unsplit segment --
+# all content is preserved, only sub-column ordering is coarser.
+MAX_PARTITION_DEPTH = 32
+
 
 class LayoutAdapter:
     """Interface to abstract coordinate and weight access for different item types."""
@@ -65,10 +74,22 @@ class PageLayoutSorter:
             sorted_elements.extend(seg)
         return sorted_elements
 
-    def partition(self, items: list) -> list[list]:
-        """Recursively partition items into column-aware segments."""
+    def partition(self, items: list, depth: int = 0) -> list[list]:
+        """Recursively partition items into column-aware segments.
+
+        ``depth`` tracks how many recursive column-split levels have been
+        entered. When it reaches ``MAX_PARTITION_DEPTH``, further splitting
+        stops and the items are returned as a single segment. All content is
+        still preserved; only sub-column ordering becomes coarser. This bounds
+        worst-case stack depth on adversarial staircase layouts (O(n) recursion)
+        while never affecting real pages, which stay well below the cap.
+        """
         if not items:
             return []
+
+        # Stop splitting rather than risk a RecursionError on pathological input.
+        if depth >= MAX_PARTITION_DEPTH:
+            return [items]
 
         text_items = self._filter_text_items(items)
         if not text_items:
@@ -112,10 +133,10 @@ class PageLayoutSorter:
                     right.append(it)
             if not left or not right:
                 return [items]
-            return self.partition(left) + self.partition(right)
+            return self.partition(left, depth + 1) + self.partition(right, depth + 1)
 
         intervals = self._group_spanning_intervals(spanning)
-        return self._slice_y_bands(columns, intervals)
+        return self._slice_y_bands(columns, intervals, depth)
 
     def _filter_text_items(self, items: list) -> list:
         """Filter only text-like elements to identify page layout gutters."""
@@ -227,8 +248,12 @@ class PageLayoutSorter:
                 intervals[-1]["items"].append(it)
         return intervals
 
-    def _slice_y_bands(self, columns: list, intervals: list[dict]) -> list[list]:
-        """Slice Y bands based on spanning intervals."""
+    def _slice_y_bands(self, columns: list, intervals: list[dict], depth: int = 0) -> list[list]:
+        """Slice Y bands based on spanning intervals.
+
+        ``depth`` is forwarded to recursive ``partition`` calls so the depth
+        cap is maintained across the Y-band re-entries.
+        """
         segments = []
         # Start below every finite coordinate so the first "above" band captures
         # elements with a negative y_top (off-page/cropped/rotated content);
@@ -247,7 +272,7 @@ class PageLayoutSorter:
                     above.append(it)
                     placed.add(id(it))
             if above:
-                segments.extend(self.partition(above))
+                segments.extend(self.partition(above, depth + 1))
 
             mid = list(interval["items"])
             for it in columns:
@@ -271,7 +296,7 @@ class PageLayoutSorter:
                 below.append(it)
                 placed.add(id(it))
         if below:
-            segments.extend(self.partition(below))
+            segments.extend(self.partition(below, depth + 1))
 
         # Capture any leftover elements that were not placed in any band
         leftover = [it for it in columns if id(it) not in placed]
