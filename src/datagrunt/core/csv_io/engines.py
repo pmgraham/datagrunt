@@ -266,8 +266,9 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         # The engine is cached on the CSVReader, so the streaming-sample
-        # connection is reused by later reads and released when the reader is
-        # collected (or via the optional close()/`with`). datagrunt manages this.
+        # connection is reused by later reads and released when the reader goes
+        # out of scope (its connection is reference-counted), or earlier via the
+        # optional close()/`with`. datagrunt manages this; callers never must.
         return self.queries.sample_dataframe(
             CSVEngineProperties.dataframe_sample_rows,
             normalize_columns,
@@ -286,7 +287,8 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         # Keep the import alive on the cached engine so a follow-up read/query
-        # reuses it; released on GC (or the optional close()).
+        # reuses it; released when the reader goes out of scope (reference-counted),
+        # or earlier via the optional close().
         return self.queries.create_table(normalize_columns).pl()
 
     def to_arrow_table(self, normalize_columns=None):
@@ -302,7 +304,8 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         # Keep the import alive on the cached engine for follow-up reads/queries;
-        # released on GC (or the optional close()).
+        # released when the reader goes out of scope (reference-counted), or
+        # earlier via the optional close().
         result = self.queries.create_table(normalize_columns).arrow()
         if isinstance(result, pa.Table):
             return result
@@ -319,7 +322,8 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         Returns:
             A list of dictionaries.
         """
-        # to_dataframe already materializes and closes; this is a thin wrapper.
+        # to_dataframe materializes the frame and keeps the import alive for
+        # reuse; this is a thin wrapper.
         return self.to_dataframe(normalize_columns).to_dicts()
 
     def _normalize_relation_columns(self, relation):

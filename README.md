@@ -103,7 +103,8 @@ reuses it: repeated reads (`to_dataframe`, `to_arrow_table`, `get_sample`),
 operations run dramatically faster.
 
 You never have to manage this — the connection is released automatically when the
-reader or writer is garbage-collected. If you want to release it *early* (for
+reader or writer goes out of scope (its connection is reference-counted). If you
+want to release it *early* (for
 example, to free memory deterministically in a long-running process), use the
 reader as a context manager or call `close()`; this is optional and the object
 stays usable afterward:

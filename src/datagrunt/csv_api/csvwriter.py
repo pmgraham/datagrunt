@@ -60,7 +60,8 @@ class CSVWriter(CSVComponents):
         Caching it means exporting one ``CSVWriter`` to several formats reuses a
         single import instead of rebuilding the engine and re-importing the
         source for every format. The engine owns the DuckDB connection; it is
-        released when the writer is garbage-collected. (Parallels
+        released when the writer goes out of scope (its connection is
+        reference-counted), or earlier via an explicit teardown. (Parallels
         ``CSVReader._reader``; the two are unified in issue #209.)
         """
         return CSVEngineFactory(
