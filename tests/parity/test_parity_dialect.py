@@ -34,8 +34,6 @@ def test_sniff_dialect_unrestricted(corpus_file):
 
 def test_sniff_dialect_with_delimiter_restriction(corpus_file):
     delimiter = py.infer_delimiter(str(corpus_file))
-    rust = dialect_properties_from_rust(
-        datagrunt_rs.sniff_dialect(str(corpus_file), delimiter)
-    )
+    rust = dialect_properties_from_rust(datagrunt_rs.sniff_dialect(str(corpus_file), delimiter))
     python = dialect_properties_from_rust(py.sniff_dialect(str(corpus_file), delimiter))
     assert rust == python, corpus_file.name

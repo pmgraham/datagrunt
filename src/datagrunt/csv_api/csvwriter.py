@@ -113,9 +113,7 @@ class CSVWriter(_CSVEngineBacked):
         """
         if self.is_empty or self.is_blank:
             return self._write_empty_output(CSVEngineProperties.json_newline_export_filename, out_filename)
-        return self._engine.write_json_newline_delimited(
-            out_filename, warn_per_call_normalize(normalize_columns)
-        )
+        return self._engine.write_json_newline_delimited(out_filename, warn_per_call_normalize(normalize_columns))
 
     def write_parquet(self, out_filename: str | None = None, normalize_columns: bool | None = None) -> None:
         """

@@ -1,4 +1,5 @@
 """Per-line cap bounds pathological newline-free input (issue #222)."""
+
 from datagrunt.core.csv_io import _compute_python as py
 
 

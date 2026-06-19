@@ -18,10 +18,7 @@ PDF_EXTRA_HINT = "PDF parsing requires extra dependencies. Install with: pip ins
 # Substring present in pdfium's load error when a PDF needs a password.
 _PDFIUM_PASSWORD_ERROR = "password"
 
-ENCRYPTED_PDF_MESSAGE = (
-    "The PDF is encrypted or password-protected and cannot be opened without "
-    "the correct password."
-)
+ENCRYPTED_PDF_MESSAGE = "The PDF is encrypted or password-protected and cannot be opened without the correct password."
 
 # Minimum image dimension (px) to keep; smaller images are layout artifacts.
 MIN_IMAGE_DIMENSION = 40

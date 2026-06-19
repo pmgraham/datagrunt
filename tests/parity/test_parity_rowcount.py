@@ -8,9 +8,9 @@ def test_row_count_with_header(corpus_file):
     # Pass the Python-inferred delimiter to BOTH sides so this test isolates
     # row counting (delimiter parity is proven separately).
     delimiter = py.infer_delimiter(str(corpus_file))
-    assert datagrunt_rs.row_count_with_header(
+    assert datagrunt_rs.row_count_with_header(str(corpus_file), delimiter) == py.row_count_with_header(
         str(corpus_file), delimiter
-    ) == py.row_count_with_header(str(corpus_file), delimiter)
+    )
 
 
 # Note: there is intentionally no separate ``row_count_without_header`` parity

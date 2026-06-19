@@ -90,14 +90,7 @@ class TestDuckDBQueriesLazyConnection:
 def test_csv_quotes_after_sniffer_sample(tmp_path):
     csv_file = tmp_path / "delayed_quotes.csv"
     # 5 rows without quotes, 6th row has a quoted field with a comma
-    content = (
-        "col1,col2,col3\n"
-        "1,2,3\n"
-        "4,5,6\n"
-        "7,8,9\n"
-        "10,11,12\n"
-        '13,"hello, world",15\n'
-    )
+    content = 'col1,col2,col3\n1,2,3\n4,5,6\n7,8,9\n10,11,12\n13,"hello, world",15\n'
     csv_file.write_text(content)
 
     # This should parse successfully without raising column count/parsing errors
@@ -140,7 +133,6 @@ class TestCreateTableIdempotent:
         assert import_calls["count"] == 1
         assert first == second == [("1", "A"), ("2", "B")]
         queries.close()
-
 
     def test_create_table_reimports_after_close(self, tmp_path):
         """close() destroys the in-memory database, so the import cache must

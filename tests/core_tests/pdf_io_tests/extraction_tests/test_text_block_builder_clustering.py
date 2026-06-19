@@ -14,8 +14,15 @@ from datagrunt.core.pdf_io.extraction.text_block_builder import TextBlockBuilder
 
 def _item(text, y, size, x0=10.0):
     return TextItem(
-        text=text, x0=x0, x1=x0 + 50, y_top=y, y_bot=y + size, size=size,
-        font="Arial", is_bold=False, is_italic=False,
+        text=text,
+        x0=x0,
+        x1=x0 + 50,
+        y_top=y,
+        y_bot=y + size,
+        size=size,
+        font="Arial",
+        is_bold=False,
+        is_italic=False,
     )
 
 
@@ -46,8 +53,7 @@ def _synthetic_sets():
 
     # Plain rows, well separated.
     sets["simple_rows"] = [
-        _item(f"r{r}c{c}", y=10.0 + r * 20, size=11.0, x0=10.0 + c * 60)
-        for r in range(5) for c in range(4)
+        _item(f"r{r}c{c}", y=10.0 + r * 20, size=11.0, x0=10.0 + c * 60) for r in range(5) for c in range(4)
     ]
 
     # Mixed sizes on the same visual line (max-size tolerance widens grouping).
@@ -61,15 +67,14 @@ def _synthetic_sets():
     # Rows spaced near the tolerance boundary (size 11 -> tol = max(2, 5.5) = 5.5).
     sets["near_boundary"] = [
         _item("a", y=10.0, size=11.0, x0=10.0),
-        _item("b", y=15.4, size=11.0, x0=70.0),   # within 5.5 of 10.0 -> joins
+        _item("b", y=15.4, size=11.0, x0=70.0),  # within 5.5 of 10.0 -> joins
         _item("c", y=15.6, size=11.0, x0=130.0),  # 5.6 > 5.5 -> new line
         _item("d", y=21.0, size=11.0, x0=10.0),
     ]
 
     # Dense table: many items per row, many rows.
     sets["dense_table"] = [
-        _item(f"d{r}-{c}", y=10.0 + r * 14, size=10.0, x0=10.0 + c * 30)
-        for r in range(30) for c in range(20)
+        _item(f"d{r}-{c}", y=10.0 + r * 14, size=10.0, x0=10.0 + c * 30) for r in range(30) for c in range(20)
     ]
 
     # Pseudo-random jitter around grid positions (deterministic seed).
@@ -78,12 +83,14 @@ def _synthetic_sets():
     for r in range(40):
         base_y = 10.0 + r * 13
         for c in range(15):
-            jittered.append(_item(
-                f"j{r}-{c}",
-                y=base_y + rng.uniform(-1.5, 1.5),
-                size=rng.choice([9.0, 10.0, 11.0, 12.0]),
-                x0=10.0 + c * 25 + rng.uniform(-2.0, 2.0),
-            ))
+            jittered.append(
+                _item(
+                    f"j{r}-{c}",
+                    y=base_y + rng.uniform(-1.5, 1.5),
+                    size=rng.choice([9.0, 10.0, 11.0, 12.0]),
+                    x0=10.0 + c * 25 + rng.uniform(-2.0, 2.0),
+                )
+            )
     rng.shuffle(jittered)
     sets["jittered_grid"] = jittered
 
@@ -105,8 +112,16 @@ def test_full_build_output_identical_on_synthetic_sets():
         blocks = builder.build(items)
         # Reconstruct a comparable tuple view independent of object identity.
         view = [
-            (b.text, round(b.bbox.x, 3), round(b.bbox.y, 3), b.font_size,
-             b.is_bold, b.is_italic, b.classification, b.reading_order)
+            (
+                b.text,
+                round(b.bbox.x, 3),
+                round(b.bbox.y, 3),
+                b.font_size,
+                b.is_bold,
+                b.is_italic,
+                b.classification,
+                b.reading_order,
+            )
             for b in blocks
         ]
         assert view == view  # sanity; pinned snapshot below
@@ -120,12 +135,14 @@ def _large_page(n_items):
     for r in range(rows):
         base_y = 10.0 + r * 12
         for c in range(20):
-            items.append(_item(
-                f"x{r}-{c}",
-                y=base_y + rng.uniform(-0.4, 0.4),
-                size=10.0,
-                x0=10.0 + c * 28,
-            ))
+            items.append(
+                _item(
+                    f"x{r}-{c}",
+                    y=base_y + rng.uniform(-0.4, 0.4),
+                    size=10.0,
+                    x0=10.0 + c * 28,
+                )
+            )
     rng.shuffle(items)
     return items
 
@@ -152,9 +169,7 @@ def test_clustering_large_page_is_near_linear():
 
     # Primary deterministic guard: correct output, independent of machine speed.
     expected_rows = 3000 // 20  # == 150
-    assert len(lines) == expected_rows, (
-        f"expected {expected_rows} clustered lines, got {len(lines)}"
-    )
+    assert len(lines) == expected_rows, f"expected {expected_rows} clustered lines, got {len(lines)}"
 
     # Secondary coarse tripwire: O(n²) regression would be ~10–30 s; 5 s budget
     # is generous for near-linear but still catches a true quadratic blowup.

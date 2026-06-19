@@ -43,12 +43,8 @@ def _open_handle_counts() -> tuple:
     handle only counts as reclaimed if it was explicitly closed, never because
     the cyclic collector happened to run.
     """
-    open_pages = sum(
-        1 for obj in gc.get_objects() if isinstance(obj, PdfPage) and _is_open(obj)
-    )
-    open_textpages = sum(
-        1 for obj in gc.get_objects() if isinstance(obj, PdfTextPage) and _is_open(obj)
-    )
+    open_pages = sum(1 for obj in gc.get_objects() if isinstance(obj, PdfPage) and _is_open(obj))
+    open_textpages = sum(1 for obj in gc.get_objects() if isinstance(obj, PdfTextPage) and _is_open(obj))
     return open_pages, open_textpages
 
 

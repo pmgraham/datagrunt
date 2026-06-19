@@ -24,9 +24,7 @@ class TestPDFWriter:
         monkeypatch.chdir(tmp_path)
         img_dir = tmp_path / "imgs"
         writer = PDFWriter(sample_pdf)
-        path = writer.write_json(
-            export_filename="report.json", image_output_dir=str(img_dir)
-        )
+        path = writer.write_json(export_filename="report.json", image_output_dir=str(img_dir))
         assert os.path.basename(path) == "report.json"
         with open(path) as f:
             data = json.load(f)
@@ -128,9 +126,7 @@ class TestPDFWriter:
         monkeypatch.chdir(tmp_path)
         img_dir = tmp_path / "imgs"
         writer = PDFWriter(sample_pdf)
-        path = writer.write_markdown(
-            export_filename="report.md", image_output_dir=str(img_dir)
-        )
+        path = writer.write_markdown(export_filename="report.md", image_output_dir=str(img_dir))
         assert os.path.basename(path) == "report.md"
         with open(path) as f:
             content = f.read()
@@ -149,9 +145,7 @@ class TestPDFWriter:
         def counting_to_dicts(self, image_output_dir=None, drop_layout_tables=False):
             nonlocal parse_calls
             parse_calls += 1
-            return original_to_dicts(
-                self, image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables
-            )
+            return original_to_dicts(self, image_output_dir=image_output_dir, drop_layout_tables=drop_layout_tables)
 
         monkeypatch.setattr(PDFReaderPyMuPDFEngine, "to_dicts", counting_to_dicts)
 
@@ -271,9 +265,7 @@ class TestPDFWriterUTF8Encoding:
         self._make_writer().write_json(export_filename=out)
 
         assert recorded, "write_json did not call open() in write mode"
-        assert all(enc == "utf-8" for enc in recorded), (
-            f"expected encoding='utf-8', got {recorded}"
-        )
+        assert all(enc == "utf-8" for enc in recorded), f"expected encoding='utf-8', got {recorded}"
 
     def test_write_jsonl_uses_utf8(self, tmp_path, monkeypatch):
         """write_json_newline_delimited must pass encoding='utf-8' to open()."""
@@ -282,9 +274,7 @@ class TestPDFWriterUTF8Encoding:
         self._make_writer().write_json_newline_delimited(export_filename=out)
 
         assert recorded, "write_json_newline_delimited did not call open() in write mode"
-        assert all(enc == "utf-8" for enc in recorded), (
-            f"expected encoding='utf-8', got {recorded}"
-        )
+        assert all(enc == "utf-8" for enc in recorded), f"expected encoding='utf-8', got {recorded}"
 
     def test_write_empty_file_uses_utf8(self, tmp_path, monkeypatch):
         """_write_empty_file must pass encoding='utf-8' to open()."""
@@ -293,9 +283,7 @@ class TestPDFWriterUTF8Encoding:
         PDFWriter._write_empty_file(out)
 
         assert recorded, "_write_empty_file did not call open() in write mode"
-        assert all(enc == "utf-8" for enc in recorded), (
-            f"expected encoding='utf-8', got {recorded}"
-        )
+        assert all(enc == "utf-8" for enc in recorded), f"expected encoding='utf-8', got {recorded}"
 
 
 class TestPDFWriterEmptyPdf:
@@ -342,9 +330,7 @@ class TestPDFWriterEmptyPdf:
 
     def test_extract_images_empty_pdf(self, empty_pdf, tmp_path):
         writer = PDFWriter(empty_pdf)
-        paths = self._assert_not_pdfium_error(
-            lambda: writer.extract_images(output_dir=str(tmp_path / "imgs"))
-        )
+        paths = self._assert_not_pdfium_error(lambda: writer.extract_images(output_dir=str(tmp_path / "imgs")))
         assert paths == []
 
 
@@ -364,21 +350,27 @@ class TestPDFWriterJsonAndDictInputs:
                         "height": 100.0,
                         "elements": [
                             {
-                                "id": "el1", "type": "header", "content": "Header Text",
+                                "id": "el1",
+                                "type": "header",
+                                "content": "Header Text",
                                 "position": {"x": 10, "y": 10, "w": 80, "h": 10},
                             },
                             {
-                                "id": "el2", "type": "body_text", "content": "Hello body",
+                                "id": "el2",
+                                "type": "body_text",
+                                "content": "Hello body",
                                 "position": {"x": 10, "y": 30, "w": 80, "h": 10},
                             },
                             {
-                                "id": "el3", "type": "image", "content": None,
+                                "id": "el3",
+                                "type": "image",
+                                "content": None,
                                 "position": {"x": 10, "y": 50, "w": 80, "h": 10},
                                 "metadata": {"file_path": "/dummy/img.png"},
                             },
-                        ]
+                        ],
                     }
-                ]
+                ],
             }
         }
 
@@ -474,4 +466,3 @@ class TestPDFWriterJsonAndDictInputs:
         mdpath = writer.write_markdown("native_out.md")
         with open(mdpath) as f:
             assert "Hello native body" in f.read()
-

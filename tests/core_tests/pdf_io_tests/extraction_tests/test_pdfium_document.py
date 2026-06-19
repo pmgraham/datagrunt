@@ -92,9 +92,7 @@ class TestRotatedPageCoordinates:
             assert 0 <= box.y and box.y + box.h <= page_height, (
                 f"image y span out of [0,{page_height}] (rot {rotation})"
             )
-            assert 0 <= box.x and box.x + box.w <= page_width, (
-                f"image x span out of [0,{page_width}] (rot {rotation})"
-            )
+            assert 0 <= box.x and box.x + box.w <= page_width, f"image x span out of [0,{page_width}] (rot {rotation})"
 
 
 class TestUnrotatedCoordinatesRegressionGuard:

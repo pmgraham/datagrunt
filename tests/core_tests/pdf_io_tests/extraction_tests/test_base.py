@@ -32,12 +32,10 @@ def test_extract_page_default_delegates_and_honors_skip_logic(sample_pdf):
         # Compare against the primitives called directly.
         expected_analysis = backend.analyze_page(0)
         expected_text = backend.extract_text_blocks(0) if expected_analysis.has_text_layer else []
-        expected_images = (
-            backend.extract_images(0) if expected_analysis.image_count > 0 else []
-        )
+        expected_images = backend.extract_images(0) if expected_analysis.image_count > 0 else []
 
     assert analysis == expected_analysis
     assert text_blocks == expected_text
     assert images == expected_images
     assert text_blocks  # sample_pdf has a text layer
-    assert images       # sample_pdf has an embedded image
+    assert images  # sample_pdf has an embedded image

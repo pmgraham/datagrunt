@@ -10,8 +10,9 @@ from datagrunt.core.pdf_io.extraction.text_block_builder import (
 
 
 def _item(text, y, size, x0=10.0):
-    return TextItem(text=text, x0=x0, x1=x0 + 50, y_top=y, y_bot=y + size, size=size, font="Arial",
-                    is_bold=False, is_italic=False)
+    return TextItem(
+        text=text, x0=x0, x1=x0 + 50, y_top=y, y_bot=y + size, size=size, font="Arial", is_bold=False, is_italic=False
+    )
 
 
 def test_classify_font_size_header_vs_body():
@@ -36,26 +37,61 @@ def test_builder_empty():
 def test_builder_column_extraction():
     # Spanning title
     title = TextItem(
-        text="Spanning Title", x0=50, x1=450, y_top=50, y_bot=74, size=24.0, font="Arial",
-        is_bold=True, is_italic=False,
+        text="Spanning Title",
+        x0=50,
+        x1=450,
+        y_top=50,
+        y_bot=74,
+        size=24.0,
+        font="Arial",
+        is_bold=True,
+        is_italic=False,
     )
     # Left column items (y=100 and y=120)
     left1 = TextItem(
-        text="left 1", x0=50, x1=150, y_top=100, y_bot=111, size=11.0, font="Arial",
-        is_bold=False, is_italic=False,
+        text="left 1",
+        x0=50,
+        x1=150,
+        y_top=100,
+        y_bot=111,
+        size=11.0,
+        font="Arial",
+        is_bold=False,
+        is_italic=False,
     )
     left2 = TextItem(
-        text="left 2", x0=50, x1=150, y_top=120, y_bot=131, size=11.0, font="Arial",
-        is_bold=False, is_italic=False,
+        text="left 2",
+        x0=50,
+        x1=150,
+        y_top=120,
+        y_bot=131,
+        size=11.0,
+        font="Arial",
+        is_bold=False,
+        is_italic=False,
     )
     # Right column items (y=100 and y=120)
     right1 = TextItem(
-        text="right 1", x0=350, x1=450, y_top=100, y_bot=111, size=11.0, font="Arial",
-        is_bold=False, is_italic=False,
+        text="right 1",
+        x0=350,
+        x1=450,
+        y_top=100,
+        y_bot=111,
+        size=11.0,
+        font="Arial",
+        is_bold=False,
+        is_italic=False,
     )
     right2 = TextItem(
-        text="right 2", x0=350, x1=450, y_top=120, y_bot=131, size=11.0, font="Arial",
-        is_bold=False, is_italic=False,
+        text="right 2",
+        x0=350,
+        x1=450,
+        y_top=120,
+        y_bot=131,
+        size=11.0,
+        font="Arial",
+        is_bold=False,
+        is_italic=False,
     )
 
     # Pass them in non-sequential order

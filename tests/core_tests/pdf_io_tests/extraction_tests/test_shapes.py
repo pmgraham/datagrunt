@@ -16,7 +16,13 @@ def test_bbox_from_pdfium_bounds():
 
 def test_text_block_fields():
     tb = shapes.TextBlock(
-        text="Hi", bbox=shapes.BBox(0, 0, 1, 1), font="Arial", font_size=11.0,
-        is_bold=False, is_italic=False, classification="body_text", reading_order=0,
+        text="Hi",
+        bbox=shapes.BBox(0, 0, 1, 1),
+        font="Arial",
+        font_size=11.0,
+        is_bold=False,
+        is_italic=False,
+        classification="body_text",
+        reading_order=0,
     )
     assert tb.text == "Hi" and tb.classification == "body_text"

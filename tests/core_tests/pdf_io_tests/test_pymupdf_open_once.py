@@ -63,9 +63,7 @@ class TestPyMuPDFOpensOncePerDocument:
 
         # 3-page fixture: must be opened ONCE, not once per page.
         assert document["document"]["total_pages"] == 3
-        assert open_spy["pymupdf"] == 1, (
-            f"pymupdf.open called {open_spy['pymupdf']}x; expected 1 (once per document)"
-        )
+        assert open_spy["pymupdf"] == 1, f"pymupdf.open called {open_spy['pymupdf']}x; expected 1 (once per document)"
 
     def test_pdfplumber_opened_at_most_once_for_multipage_parse(self, multipage_pdf, open_spy):
         engine = PDFReaderPyMuPDFEngine(multipage_pdf, workers=1)

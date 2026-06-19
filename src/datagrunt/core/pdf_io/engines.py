@@ -227,6 +227,7 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
                         errors.append(f"Page {idx + 1}: {e}")
         else:
             from concurrent.futures import ProcessPoolExecutor, as_completed
+
             pages_map = {}
             with ProcessPoolExecutor(max_workers=self.workers) as executor:
                 futures = {
@@ -271,6 +272,7 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
                         errors.append(f"Page {idx + 1}: {e}")
         else:
             from concurrent.futures import ProcessPoolExecutor, as_completed
+
             with ProcessPoolExecutor(max_workers=self.workers) as executor:
                 futures = {
                     executor.submit(_parse_page_native_worker, str(self.filepath), idx, image_output_dir): idx
@@ -297,9 +299,7 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
     def get_sample(self) -> dict:
         """Parse and return the first page only."""
         if self.structured:
-            return pdfcomponents.DocumentAssembler(
-                self.filepath, backend=PdfiumBackend(self.filepath)
-            ).parse_page(0)
+            return pdfcomponents.DocumentAssembler(self.filepath, backend=PdfiumBackend(self.filepath)).parse_page(0)
         return PdfiumNativeReader(self.filepath).parse_page(0)
 
 
@@ -346,9 +346,7 @@ class PDFBaseWriterEngine(ABC):
         pass
 
     @abstractmethod
-    def write_markdown(
-        self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False
-    ):
+    def write_markdown(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
         """Write the document Markdown representation to disk."""
         pass
 
@@ -445,9 +443,7 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
 
     def _reader(self):
         if self._reader_engine is None:
-            self._reader_engine = PDFReaderPdfiumEngine(
-                self.filepath, workers=self.workers, structured=self.structured
-            )
+            self._reader_engine = PDFReaderPdfiumEngine(self.filepath, workers=self.workers, structured=self.structured)
         return self._reader_engine
 
     def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):

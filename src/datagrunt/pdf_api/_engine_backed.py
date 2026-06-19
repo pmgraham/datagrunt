@@ -48,13 +48,9 @@ class _PDFEngineBacked(PDFComponents):
         memoizes internally) instead of re-parsing the PDF on every call.
         Released when this object goes out of scope.
         """
-        factory = PDFEngineFactory(
-            self.filepath, self.engine, self.workers, structured=not self.native
-        )
+        factory = PDFEngineFactory(self.filepath, self.engine, self.workers, structured=not self.native)
         if self._engine_role == "reader":
             return factory.create_reader()
         if self._engine_role == "writer":
             return factory.create_writer()
-        raise NotImplementedError(
-            f"Subclass must set _engine_role to 'reader' or 'writer', got {self._engine_role!r}"
-        )
+        raise NotImplementedError(f"Subclass must set _engine_role to 'reader' or 'writer', got {self._engine_role!r}")

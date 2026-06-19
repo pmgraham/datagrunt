@@ -88,6 +88,7 @@ class TestTopLevelExports:
 
     def test_top_level_imports(self):
         from datagrunt import PDFReader, PDFWriter
+
         assert PDFReader.__name__ == "PDFReader"
         assert PDFWriter.__name__ == "PDFWriter"
 
@@ -138,6 +139,7 @@ class TestPDFReaderMultiprocessing:
 
     def test_spark_env_fallback_to_sequential_structured(self, sample_pdf, monkeypatch):
         from concurrent.futures import ProcessPoolExecutor
+
         calls = []
         original_init = ProcessPoolExecutor.__init__
 
@@ -156,6 +158,7 @@ class TestPDFReaderMultiprocessing:
 
     def test_beam_env_fallback_to_sequential_native(self, sample_pdf, monkeypatch):
         from concurrent.futures import ProcessPoolExecutor
+
         calls = []
         original_init = ProcessPoolExecutor.__init__
 
@@ -174,6 +177,7 @@ class TestPDFReaderMultiprocessing:
 
     def test_no_multiprocessing_when_workers_is_one(self, sample_pdf, monkeypatch):
         from concurrent.futures import ProcessPoolExecutor
+
         calls = []
         original_init = ProcessPoolExecutor.__init__
 
@@ -191,6 +195,7 @@ class TestPDFReaderMultiprocessing:
 
     def test_no_multiprocessing_when_single_page(self, sample_pdf, monkeypatch):
         from concurrent.futures import ProcessPoolExecutor
+
         calls = []
         original_init = ProcessPoolExecutor.__init__
 
@@ -208,6 +213,7 @@ class TestPDFReaderMultiprocessing:
 
     def test_multiprocessing_when_multi_page(self, multipage_pdf, monkeypatch):
         from concurrent.futures import ProcessPoolExecutor
+
         calls = []
         original_init = ProcessPoolExecutor.__init__
 
@@ -256,9 +262,7 @@ class TestPDFReaderPyMuPDFSequential:
         assert doc["document"]["total_pages"] == 4
         assert [p["page_number"] for p in pages] == [1, 2, 3, 4]
         for n, page in enumerate(pages, start=1):
-            text = " ".join(
-                e.get("content", "") for e in page["elements"] if e.get("type") in ("header", "body_text")
-            )
+            text = " ".join(e.get("content", "") for e in page["elements"] if e.get("type") in ("header", "body_text"))
             assert f"Sequential Marker {n}" in text
 
 
@@ -311,16 +315,20 @@ class TestPDFReaderJsonAndDictInputs:
                         "height": 100.0,
                         "elements": [
                             {
-                                "id": "el1", "type": "header", "content": "Header Text",
+                                "id": "el1",
+                                "type": "header",
+                                "content": "Header Text",
                                 "position": {"x": 10, "y": 10, "w": 80, "h": 10},
                             },
                             {
-                                "id": "el2", "type": "body_text", "content": "Hello body",
+                                "id": "el2",
+                                "type": "body_text",
+                                "content": "Hello body",
                                 "position": {"x": 10, "y": 30, "w": 80, "h": 10},
                             },
-                        ]
+                        ],
                     }
-                ]
+                ],
             }
         }
 
@@ -350,6 +358,7 @@ class TestPDFReaderJsonAndDictInputs:
 
     def test_reader_with_json_file(self, tmp_path, dummy_structured_dict):
         import json
+
         json_file = tmp_path / "doc.json"
         with open(json_file, "w") as f:
             json.dump(dummy_structured_dict, f)
@@ -363,5 +372,3 @@ class TestPDFReaderJsonAndDictInputs:
         df = reader.to_dataframe()
         assert df.height == 2
         assert list(df["content"]) == ["Header Text", "Hello body"]
-
-

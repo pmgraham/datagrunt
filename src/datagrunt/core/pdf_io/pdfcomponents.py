@@ -66,10 +66,12 @@ class DocumentAssembler:
                 tol = 3.0
                 for t in tables:
                     tb = t.bbox
-                    if (bbox.x >= tb.x - tol and
-                        bbox.y >= tb.y - tol and
-                        (bbox.x + bbox.w) <= (tb.x + tb.w) + tol and
-                        (bbox.y + bbox.h) <= (tb.y + tb.h) + tol):
+                    if (
+                        bbox.x >= tb.x - tol
+                        and bbox.y >= tb.y - tol
+                        and (bbox.x + bbox.w) <= (tb.x + tb.w) + tol
+                        and (bbox.y + bbox.h) <= (tb.y + tb.h) + tol
+                    ):
                         return True
                 return False
 
@@ -80,9 +82,7 @@ class DocumentAssembler:
                         elements.append(self._text_element(block, gen_elem_id(), page_index))
             elif analysis.is_scanned:
                 try:
-                    ocr_blocks = self.backend.ocr_page(
-                        page_index, dpi=dpi_for_page(analysis.width, analysis.height)
-                    )
+                    ocr_blocks = self.backend.ocr_page(page_index, dpi=dpi_for_page(analysis.width, analysis.height))
                 except Exception as exc:  # noqa: BLE001 - soft per-category failure
                     # OCR failed (e.g. missing tesseract). Keep the page with its
                     # already-extracted images/tables rather than dropping it, and
@@ -144,18 +144,31 @@ class DocumentAssembler:
     def _text_element(block, elem_id, page_index) -> dict:
         """Serialize a TextBlock to the unified text element dict."""
         return {
-            "id": elem_id, "type": block.classification, "content": block.text, "page": page_index + 1,
-            "position": block.bbox.to_dict(), "confidence": 1.0,
-            "metadata": {"font": block.font, "font_size": block.font_size, "is_bold": block.is_bold,
-                         "is_italic": block.is_italic, "reading_order": block.reading_order},
+            "id": elem_id,
+            "type": block.classification,
+            "content": block.text,
+            "page": page_index + 1,
+            "position": block.bbox.to_dict(),
+            "confidence": 1.0,
+            "metadata": {
+                "font": block.font,
+                "font_size": block.font_size,
+                "is_bold": block.is_bold,
+                "is_italic": block.is_italic,
+                "reading_order": block.reading_order,
+            },
         }
 
     @staticmethod
     def _ocr_element(block, elem_id, page_index) -> dict:
         """Serialize an OcrBlock to the unified text element dict."""
         return {
-            "id": elem_id, "type": "body_text", "content": block.text, "page": page_index + 1,
-            "position": block.bbox.to_dict(), "confidence": block.confidence / 100.0,
+            "id": elem_id,
+            "type": "body_text",
+            "content": block.text,
+            "page": page_index + 1,
+            "position": block.bbox.to_dict(),
+            "confidence": block.confidence / 100.0,
             "metadata": {"ocr_engine": "tesseract", "word_count": block.word_count},
         }
 
@@ -163,8 +176,12 @@ class DocumentAssembler:
     def _table_element(table, elem_id, page_index) -> dict:
         """Serialize a TableBlock to the unified table element dict."""
         return {
-            "id": elem_id, "type": "table", "content": table.data, "page": page_index + 1,
-            "position": table.bbox.to_dict(), "confidence": 1.0,
+            "id": elem_id,
+            "type": "table",
+            "content": table.data,
+            "page": page_index + 1,
+            "position": table.bbox.to_dict(),
+            "confidence": 1.0,
             "metadata": {"rows": table.rows, "columns": table.columns, "has_header_row": table.has_header_row},
         }
 
@@ -172,14 +189,19 @@ class DocumentAssembler:
     def _image_element(img, elem_id, page_index) -> dict:
         """Serialize an ImageBlock to the unified image element dict."""
         return {
-            "id": elem_id, "type": "image", "content": None, "page": page_index + 1,
-            "position": img.bbox.to_dict(), "confidence": 1.0,
-            "metadata": {"file_path": img.file_path, "format": img.fmt,
-                         "width_px": img.width_px, "height_px": img.height_px},
+            "id": elem_id,
+            "type": "image",
+            "content": None,
+            "page": page_index + 1,
+            "position": img.bbox.to_dict(),
+            "confidence": 1.0,
+            "metadata": {
+                "file_path": img.file_path,
+                "format": img.fmt,
+                "width_px": img.width_px,
+                "height_px": img.height_px,
+            },
         }
-
-
-
 
 
 class ParsedDocument:
@@ -209,11 +231,16 @@ class ParsedDocument:
                 )
                 records.append(
                     {
-                        "id": elem.get("id"), "type": elem.get("type"), "page": elem.get("page"),
-                        "x": float(pos.get("x", 0.0)), "y": float(pos.get("y", 0.0)),
-                        "w": float(pos.get("w", 0.0)), "h": float(pos.get("h", 0.0)),
+                        "id": elem.get("id"),
+                        "type": elem.get("type"),
+                        "page": elem.get("page"),
+                        "x": float(pos.get("x", 0.0)),
+                        "y": float(pos.get("y", 0.0)),
+                        "w": float(pos.get("w", 0.0)),
+                        "h": float(pos.get("h", 0.0)),
                         "confidence": float(elem.get("confidence", 0.0)),
-                        "content": content_str, "metadata": json.dumps(elem.get("metadata") or {}),
+                        "content": content_str,
+                        "metadata": json.dumps(elem.get("metadata") or {}),
                     }
                 )
         return records
@@ -293,6 +320,7 @@ class ParsedDocument:
     def _render_table(content: list, has_header: bool) -> str:
         if not content:
             return ""
+
         def cell_str(val):
             text = "" if val is None else str(val)
             return text.replace("\n", " ").replace("|", "\\|").strip()
@@ -392,8 +420,7 @@ class PDFComponents(FileProperties):
                 # at total_pages / flatten paths. Fail fast with a clear message.
                 if not isinstance(self._parsed_dict, dict):
                     raise ValueError(
-                        f"Expected a JSON object for the parsed document, got "
-                        f"{type(self._parsed_dict).__name__}"
+                        f"Expected a JSON object for the parsed document, got {type(self._parsed_dict).__name__}"
                     )
                 self._apply_virtual_file_properties(
                     filepath=filepath_path,

@@ -7,15 +7,15 @@ from datagrunt.core.pdf_io.extraction.layout_sorter import PageLayoutSorter, Tex
 from datagrunt.core.pdf_io.extraction.shapes import BBox, TextBlock
 
 LIST_MARKER_REGEX = re.compile(
-    r'^('
-    r'[•\-\*]'            # Standard bullet points
-    r'|\d+(\.\d+)*\.?'    # Number hierarchies (e.g., 1., 12.5.1)
-    r'|[IVXLCDM]{2,}'     # Multi-character Roman numerals (e.g., II, III, IV)
-    r'|[IVXLCDM]\.'       # Single Roman numerals followed by dot (e.g., I.)
-    r'|[IVXLCDM]\s+[A-Z]' # Single Roman numeral list markers followed by capitalized word (e.g., I Build)
-    r'|[a-zA-Z]\.'        # Alphabetical list markers with dot (e.g., a., A.)
-    r'|[a-zA-Z]\)'        # Alphabetical list markers with parenthesis (e.g., a), A))
-    r')(\s|$)'
+    r"^("
+    r"[•\-\*]"  # Standard bullet points
+    r"|\d+(\.\d+)*\.?"  # Number hierarchies (e.g., 1., 12.5.1)
+    r"|[IVXLCDM]{2,}"  # Multi-character Roman numerals (e.g., II, III, IV)
+    r"|[IVXLCDM]\."  # Single Roman numerals followed by dot (e.g., I.)
+    r"|[IVXLCDM]\s+[A-Z]"  # Single Roman numeral list markers followed by capitalized word (e.g., I Build)
+    r"|[a-zA-Z]\."  # Alphabetical list markers with dot (e.g., a., A.)
+    r"|[a-zA-Z]\)"  # Alphabetical list markers with parenthesis (e.g., a), A))
+    r")(\s|$)"
 )
 
 

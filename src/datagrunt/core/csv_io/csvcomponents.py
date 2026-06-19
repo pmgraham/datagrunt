@@ -55,8 +55,7 @@ def _check_csv_ragged_and_warn(filepath, delimiter):
     is_ragged = _compute.backend().check_ragged(str(filepath), delimiter)
     if is_ragged:
         warnings.warn(
-            "CSV file contains ragged rows. Some fields will be truncated or "
-            "padded with nulls.",
+            "CSV file contains ragged rows. Some fields will be truncated or padded with nulls.",
             UserWarning,
         )
     return is_ragged
@@ -140,9 +139,7 @@ class CSVStringSample:
         )
         # Namespaced internal name avoids clobbering a user column named "null_count".
         null_count_column = "__datagrunt_null_count__"
-        df = df.with_columns(
-            pl.sum_horizontal(pl.all().is_null()).alias(null_count_column)
-        )
+        df = df.with_columns(pl.sum_horizontal(pl.all().is_null()).alias(null_count_column))
         df = df.sort(null_count_column)
         df = df.drop(null_count_column)
         return df.head(self.SAMPLE_ROWS).write_csv(file=None)
