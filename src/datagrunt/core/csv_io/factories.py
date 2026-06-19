@@ -48,7 +48,7 @@ class CSVEngineFactory:
         self.lenient = lenient
         self.normalize_columns = normalize_columns
         if not self.filepath.exists():
-            raise FileNotFoundError
+            raise FileNotFoundError(f"CSV file not found: {self.filepath}")
         self.validate_engine(self.engine)
 
     @staticmethod
