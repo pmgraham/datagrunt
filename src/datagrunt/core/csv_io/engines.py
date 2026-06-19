@@ -24,6 +24,15 @@ from datagrunt.core.csv_io.csvcomponents import (
     _count_leading_physical_lines_before_header,
     _is_legacy_mac_newlines,
 )
+from datagrunt.core.csv_io.protocol import (
+    DataFrameDerivedReaderMixin,
+)
+from datagrunt.core.csv_io.protocol import (
+    arrow_to_polars as _arrow_to_polars,
+)
+from datagrunt.core.csv_io.protocol import (
+    resolve_normalize_columns as _resolve_normalize_columns,
+)
 from datagrunt.core.databases import DuckDBQueries
 
 
@@ -48,30 +57,6 @@ def _has_midfile_comments(filepath):
             elif stripped.startswith("#"):
                 return True
     return False
-
-
-def _resolve_normalize_columns(instance_default, per_call_value):
-    """Resolve a per-call normalize flag against the engine's instance default.
-
-    Args:
-        instance_default (bool): The engine's constructor-level setting.
-        per_call_value (bool or None): The per-call argument; ``None`` means
-        "inherit the instance-level setting".
-
-    Returns:
-        bool: The effective normalization mode.
-    """
-    return instance_default if per_call_value is None else per_call_value
-
-
-def _arrow_to_polars(table: pa.Table) -> pl.DataFrame:
-    """Convert a PyArrow table to a Polars DataFrame, never a bare Series.
-
-    ``pl.from_arrow`` yields a Series for a single-column table; the CSV engines
-    always present a DataFrame, so collapse that case here in one place.
-    """
-    df = pl.from_arrow(table)
-    return df.to_frame() if isinstance(df, pl.Series) else df
 
 
 @dataclass
@@ -409,7 +394,7 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
         return result_relation
 
 
-class CSVReaderPolarsEngine(CSVBaseReaderEngine):
+class CSVReaderPolarsEngine(DataFrameDerivedReaderMixin, CSVBaseReaderEngine):
     """
     Class to read CSV files and convert CSV files powered by Polars.
     """
@@ -472,32 +457,6 @@ class CSVReaderPolarsEngine(CSVBaseReaderEngine):
             A Polars dataframe.
         """
         return self._create_dataframe(_resolve_normalize_columns(self.normalize_columns, normalize_columns))
-
-    def to_arrow_table(self, normalize_columns=None):
-        """
-        Converts CSV to a PyArrow table.
-
-        Args:
-            normalize_columns (bool or None): Whether to normalize column
-            names. ``None`` (default) inherits the instance-level setting.
-
-        Returns:
-            A PyArrow table.
-        """
-        return self._create_dataframe(_resolve_normalize_columns(self.normalize_columns, normalize_columns)).to_arrow()
-
-    def to_dicts(self, normalize_columns=None):
-        """
-        Converts CSV to a list of Python dictionaries.
-
-        Args:
-            normalize_columns (bool or None): Whether to normalize column
-            names. ``None`` (default) inherits the instance-level setting.
-
-        Returns:
-            A list of dictionaries.
-        """
-        return self._create_dataframe(_resolve_normalize_columns(self.normalize_columns, normalize_columns)).to_dicts()
 
     def query_data(self, sql_query, normalize_columns=None):
         """
