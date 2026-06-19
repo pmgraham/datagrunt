@@ -51,3 +51,22 @@ class ExtractionBackend(ABC):
     @abstractmethod
     def ocr_page(self, page_number: int, dpi: int = 300) -> list[OcrBlock]:
         """Return OCR-recovered text lines for the page."""
+
+    def extract_page(
+        self, page_number: int, output_dir: str = None, name_prefix: str = "page"
+    ) -> tuple:
+        """Single-pass extraction: ``(PageAnalysis, list[TextBlock], list[ImageBlock])``.
+
+        Default implementation calls the three primitives separately; concrete
+        backends may override to parse the page once. The skip logic mirrors the
+        assembly pipeline: text blocks only when a text layer exists, images only
+        when the page reports embedded images. OCR is never performed here.
+        """
+        analysis = self.analyze_page(page_number)
+        text_blocks = self.extract_text_blocks(page_number) if analysis.has_text_layer else []
+        images = (
+            self.extract_images(page_number, output_dir=output_dir, name_prefix=name_prefix)
+            if analysis.image_count > 0
+            else []
+        )
+        return analysis, text_blocks, images
