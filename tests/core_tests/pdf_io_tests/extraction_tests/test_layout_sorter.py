@@ -2,14 +2,17 @@
 
 These focus on hardening ``partition`` against pathological coordinates that a
 corrupt or cropped PDF can produce: off-page (negative) positions, non-finite
-values (NaN/inf), and absurdly large finite coordinates. Each must degrade
-gracefully (return the items as segments) instead of crashing, hanging, or
-allocating gigabytes -- while still partitioning a normal multi-column page
-correctly.
+values (NaN/inf), absurdly large finite coordinates, and adversarial staircase
+layouts that drive O(n) recursion depth. Each must degrade gracefully (return
+the items as segments) instead of crashing, hanging, or allocating gigabytes --
+while still partitioning a normal multi-column page correctly.
 """
+
+import sys
 
 from datagrunt.core.pdf_io.extraction.layout_sorter import (
     MAX_HISTOGRAM_BINS,
+    MAX_PARTITION_DEPTH,
     PageLayoutSorter,
     TextItemAdapter,
 )
@@ -228,3 +231,93 @@ class TestSliceYBandsNegativeY:
         flattened = _flatten(segments)
 
         assert flattened == items
+
+
+class TestPartitionRecursionDepthCap:
+    """partition() must not raise RecursionError on adversarial staircase layouts.
+
+    A crafted 'staircase' layout peels one item per recursive level, driving
+    O(n) recursion depth. The depth cap stops further sub-partitioning at
+    MAX_PARTITION_DEPTH levels while preserving ALL items (content is never
+    dropped, only coarser sorting).
+    """
+
+    def _staircase_items(self, count: int) -> list[TextItem]:
+        """Build a staircase layout: each item shifts right by one unit.
+
+        Each item is positioned so the widest gutter is always to the left of
+        the rightmost item, causing the two-column pure split to recursively
+        peel one item per level. With enough items this exceeds Python's default
+        recursion limit.
+
+        Layout: item i occupies x=[i*4, i*4+2] and y=[i*2, i*2+8], on a wide
+        page so page_width > 100 and each recursion finds a new gutter.
+        """
+        return [_text_item(i * 4.0, i * 4.0 + 2.0, i * 2.0, text="w" * 5) for i in range(count)]
+
+    def test_staircase_layout_does_not_raise_recursion_error(self):
+        """A staircase of items that would exceed stack depth must not crash.
+
+        We temporarily lower the recursion limit to make the old code fail
+        with a small, deterministic item count, then restore it. The new code
+        must return without raising regardless of recursion limit.
+
+        Pre-fix behavior: RecursionError at depth ~item_count.
+        Post-fix behavior: returns at most MAX_PARTITION_DEPTH levels deep.
+        """
+        item_count = 120  # Deep enough to exceed a limit of 100 but not the default
+        items = self._staircase_items(item_count)
+
+        old_limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(100)
+        try:
+            segments = PageLayoutSorter(TextItemAdapter()).partition(items)
+        finally:
+            sys.setrecursionlimit(old_limit)
+
+        flattened = _flatten(segments)
+        assert len(flattened) == item_count, (
+            f"All {item_count} items must be preserved; got {len(flattened)}"
+        )
+        assert {id(it) for it in flattened} == {id(it) for it in items}, (
+            "No items must be dropped or duplicated"
+        )
+
+    def test_sort_staircase_preserves_all_items(self):
+        """sort() on a staircase layout must preserve all items end-to-end."""
+        item_count = 120
+        items = self._staircase_items(item_count)
+
+        old_limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(100)
+        try:
+            result = PageLayoutSorter(TextItemAdapter()).sort(items)
+        finally:
+            sys.setrecursionlimit(old_limit)
+
+        assert len(result) == item_count
+        assert {id(it) for it in result} == {id(it) for it in items}
+
+    def test_max_partition_depth_constant_is_sane(self):
+        """MAX_PARTITION_DEPTH must be a reasonable cap: above real column nesting but below Python stack risk."""
+        assert 8 <= MAX_PARTITION_DEPTH <= 64, (
+            f"MAX_PARTITION_DEPTH={MAX_PARTITION_DEPTH} is outside the safe range [8, 64]"
+        )
+
+    def test_normal_two_column_layout_unaffected_by_depth_cap(self):
+        """Real multi-column pages never approach the depth cap and must behave identically.
+
+        This is a regression guard: the depth cap must not alter sorting of
+        any layout a real PDF would produce (which never nests more than a
+        few column levels).
+        """
+        left_column = [_text_item(50, 240, y) for y in (50, 70, 90, 110)]
+        right_column = [_text_item(360, 550, y) for y in (50, 70, 90, 110)]
+        items = left_column + right_column
+
+        segments = PageLayoutSorter(TextItemAdapter()).partition(items)
+        flattened = _flatten(segments)
+
+        assert len(flattened) == len(items)
+        # Reading order: all left items before all right items.
+        assert [it.x0 for it in flattened] == [50, 50, 50, 50, 360, 360, 360, 360]
