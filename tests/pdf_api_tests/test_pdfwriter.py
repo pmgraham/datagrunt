@@ -171,6 +171,27 @@ class TestPDFWriter:
             content = f.read()
         assert len(content) > 0
 
+    def test_pdfwriter_caches_engine_across_calls(self, sample_pdf, tmp_path, monkeypatch):
+        """PDFWriter builds its engine once and reuses it across write_* calls."""
+        from datagrunt.core import PDFEngineFactory
+
+        calls = {"n": 0}
+        original = PDFEngineFactory.create_writer
+
+        def spy(self):
+            calls["n"] += 1
+            return original(self)
+
+        monkeypatch.setattr(PDFEngineFactory, "create_writer", spy)
+
+        writer = PDFWriter(sample_pdf, engine="pymupdf")
+        writer.write_json(str(tmp_path / "a.json"))
+        writer.write_markdown(str(tmp_path / "b.md"))
+
+        assert calls["n"] == 1  # engine cached under the standardized _engine name
+        assert "_engine" in writer.__dict__
+        assert (tmp_path / "a.json").exists() and (tmp_path / "b.md").exists()
+
 
 class TestPDFWriterEmptyPdf:
     """Empty (0-byte) PDFs must not surface a raw PdfiumError.
