@@ -22,6 +22,7 @@ from datagrunt.core.csv_io.engines import (
     CSVWriterPyArrowEngine,
 )
 from datagrunt.core.csv_io.factories import CSVEngineFactory
+from datagrunt.core.csv_io.protocol import CSVReaderEngineProtocol, CSVWriterEngineProtocol
 
 __all__ = [
     "CSVDelimiter",
@@ -39,6 +40,8 @@ __all__ = [
     "CSVWriterPolarsEngine",
     "CSVWriterPyArrowEngine",
     "CSVEngineFactory",
+    "CSVReaderEngineProtocol",
+    "CSVWriterEngineProtocol",
     "_count_leading_comments",
     "_count_leading_physical_lines_before_header",
     "_check_csv_ragged_and_warn",
