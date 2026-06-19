@@ -13,13 +13,13 @@ jobs:
     name: cargo + pytest (both backends)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           python-version: "3.12"
 
@@ -37,6 +37,8 @@ jobs:
 
       - name: cargo test
         working-directory: rust
+        env:
+          CARGO_NET_RETRY: "10" # tolerate transient crates.io HTTP/2 fetch flakes
         run: cargo test
 
       - name: pytest (Rust backend)
@@ -56,3 +58,41 @@ jobs:
   build:
     name: wheel matrix
     uses: ./.github/workflows/build.yml
+
+  audit:
+    name: dependency audit (advisory)
+    runs-on: ubuntu-latest
+    # Advisory, NOT blocking: a newly published advisory in a transitive
+    # dependency (duckdb, polars, pyarrow, pymupdf, …) must not break CI or the
+    # release path overnight. Findings surface in the step logs; promote to
+    # blocking once a clean baseline + an ignore-list of accepted advisories is
+    # curated (RUSTSEC-* / GHSA-* / PYSEC-*).
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: cargo audit
+        continue-on-error: true
+        working-directory: rust
+        env:
+          CARGO_NET_RETRY: "10"
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          python-version: "3.12"
+
+      - name: pip-audit
+        continue-on-error: true
+        # Audit the project's resolved dependency tree (installed into the venv).
+        # ``pip`` is installed alongside because pip-audit's environment source
+        # enumerates installed dists via pip (uv venvs omit pip by default).
+        run: |
+          uv venv --clear
+          uv pip install -e . pip-audit pip
+          .venv/bin/pip-audit
