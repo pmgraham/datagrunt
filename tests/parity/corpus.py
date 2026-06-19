@@ -63,4 +63,25 @@ CORPUS: dict[str, bytes] = {
     # quoted \r must stay part of one record rather than splitting the row.
     # Exercises the legacy-mac branch and quoting together for both backends.
     "legacy_mac_quoted_cr.csv": b'id,note\r1,"line one\rline two"\r2,plain\r',
+    # Giant-line entries for per-line cap parity (issue #222 / #176).
+    # These verify that both backends truncate to exactly MAX_LINE_CHARS chars
+    # and that char-based (not byte-based) counting governs the boundary.
+    #
+    # (a) Giant ASCII line: 2,252,800 chars > MAX_LINE_CHARS (2,097,152).
+    #     Both backends must yield exactly MAX_LINE_CHARS chars from this line.
+    "giant_ascii_line.csv": b"a," * 1_126_400 + b"\n",
+    # (b) Giant line with a 3-byte UTF-8 char (€) placed right at the char
+    #     boundary. The line uses a comma-delimited "a," pattern so no single
+    #     field exceeds CPython's csv field-size limit (the cap is per physical
+    #     line, not per field); the '€' lands at char index MAX_LINE_CHARS-1
+    #     (the last char kept by truncation). 2Mi-2 pattern chars + 'a' + '€'
+    #     puts '€' exactly on the boundary, then ",more" overflows the cap.
+    #     Verifies Rust counts CHARS (not bytes) and lands on the multibyte char.
+    "giant_multibyte_near_cap.csv": (
+        b"a," * (1024 * 1024 - 1) + b"a" + "€".encode("utf-8") + b",more,fields,here\n"
+    ),
+    # (c) Giant line terminated with \r\n followed by a normal data line.
+    #     After capping the giant line, the next line must still be read
+    #     correctly — validates stream-skip alignment for both backends.
+    "giant_crlf_line.csv": b"b," * 1_126_400 + b"\r\nnext_line\n",
 }

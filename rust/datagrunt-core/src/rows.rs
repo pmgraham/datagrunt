@@ -1,8 +1,13 @@
 //! Ports of CSVRows probes and the leading-line counters.
 
-use crate::io::{is_empty, is_legacy_mac_newlines, universal_lines, DecodedReader};
+use crate::io::{is_empty, is_legacy_mac_newlines, take_chars, universal_lines, DecodedReader, MAX_LINE_CHARS};
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
+
+/// Byte read bound for probe_csv_header: 4x the char cap (UTF-8 ≤4 bytes/char),
+/// matching io.rs MAX_LINE_READ_BYTES. Prevents unbounded `segment` growth on
+/// malformed newline-free files.
+const MAX_LINE_READ_BYTES: usize = MAX_LINE_CHARS * 4;
 
 // ---- probe_csv_header constants ----
 /// Python CANDIDATE_SAMPLE_ROWS = 5.
@@ -52,14 +57,59 @@ pub fn probe_csv_header(path: &Path) -> std::io::Result<HeaderProbe> {
     let mut saw_nonblank = false;
     let mut segment: Vec<u8> = Vec::new();
     loop {
+        // Bounded read: accumulate bytes up to MAX_LINE_READ_BYTES or until
+        // we find a '\n' (whichever comes first). If we hit the byte cap
+        // before finding '\n', stream-skip the rest of the physical line so
+        // a malformed newline-free file cannot grow `segment` without bound.
         segment.clear();
-        let n = reader.read_until(b'\n', &mut segment)?;
-        if n == 0 {
+        let mut total_read = 0usize;
+        let mut found_newline = false;
+        loop {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                break; // EOF
+            }
+            let newline_pos = available.iter().position(|&b| b == b'\n');
+            let take = if let Some(pos) = newline_pos {
+                pos + 1 // include the '\n'
+            } else {
+                available.len()
+            };
+            let budget = MAX_LINE_READ_BYTES.saturating_sub(total_read);
+            let capped_take = take.min(budget);
+            segment.extend_from_slice(&available[..capped_take]);
+            reader.consume(capped_take);
+            total_read += capped_take;
+            if newline_pos.map_or(false, |pos| capped_take >= pos + 1) {
+                found_newline = true;
+                break;
+            }
+            if total_read >= MAX_LINE_READ_BYTES {
+                // Byte cap hit before newline: stream-skip to end of line.
+                loop {
+                    let avail2 = reader.fill_buf()?;
+                    if avail2.is_empty() {
+                        break; // EOF
+                    }
+                    let nl = avail2.iter().position(|&b| b == b'\n');
+                    if let Some(pos) = nl {
+                        reader.consume(pos + 1);
+                        break;
+                    } else {
+                        let len = avail2.len();
+                        reader.consume(len);
+                    }
+                }
+                break;
+            }
+        }
+        if total_read == 0 && !found_newline {
             break; // EOF
         }
-        // DecodedReader yields valid UTF-8 only.
-        let text =
+        // DecodedReader yields valid UTF-8 only; apply char cap for parity.
+        let raw =
             String::from_utf8(std::mem::take(&mut segment)).expect("DecodedReader yields UTF-8");
+        let text = take_chars(&raw, MAX_LINE_CHARS);
         // `stripped` mirrors Python's `line.strip()`.
         let stripped = text.trim();
         if !stripped.is_empty() {

@@ -8,6 +8,19 @@ use std::path::Path;
 const BOM: &[u8] = b"\xef\xbb\xbf";
 const CHUNK_SIZE: usize = 64 * 1024;
 
+/// Per-physical-line cap (chars), identical to Python _compute_python.MAX_LINE_CHARS.
+pub const MAX_LINE_CHARS: usize = 2 * 1024 * 1024;
+/// Byte read bound: 4x the char cap (UTF-8 is ≤4 bytes/char), so the char cap
+/// is always the binding limit and memory stays bounded.
+const MAX_LINE_READ_BYTES: usize = MAX_LINE_CHARS * 4;
+
+/// Truncate `s` to at most `n` Unicode scalar values (chars).
+///
+/// Unlike a byte slice, this always lands on a valid char boundary.
+pub fn take_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
 /// Python `errors="ignore"`: invalid byte sequences are dropped, not replaced.
 pub fn decode_ignore(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
@@ -323,8 +336,47 @@ impl UniversalLines {
         Ok(())
     }
 
+    /// Skip bytes in the stream until (and including) the next `\r`, `\n`, or
+    /// `\r\n` terminator. Called after capping a giant line to restore
+    /// line-stream alignment.
+    fn skip_to_next_line(&mut self) -> std::io::Result<()> {
+        loop {
+            let mut i = self.pos;
+            while i < self.buf.len() {
+                match self.buf[i] {
+                    b'\n' => {
+                        self.pos = i + 1;
+                        return Ok(());
+                    }
+                    b'\r' => {
+                        // Need lookahead for \r\n.
+                        if i + 1 == self.buf.len() && !self.eof {
+                            // Keep the \r in the buffer and read more for lookahead.
+                            self.pos = i;
+                            self.fill()?;
+                            // Restart scan; self.pos still points at the \r.
+                            break;
+                        }
+                        let next_is_lf = self.buf.get(i + 1) == Some(&b'\n');
+                        self.pos = i + 1 + usize::from(next_is_lf);
+                        return Ok(());
+                    }
+                    _ => i += 1,
+                }
+            }
+            if self.eof {
+                self.pos = self.buf.len();
+                return Ok(());
+            }
+            // No terminator found yet; drain scanned bytes and read more.
+            self.pos = i;
+            self.fill()?;
+        }
+    }
+
     /// Decode one universal-newline-delimited line (without terminator), or
-    /// `None` at EOF. Errors propagate.
+    /// `None` at EOF. Lines are capped at `MAX_LINE_CHARS` characters so a
+    /// pathological newline-free file cannot force unbounded buffering.
     fn next_line(&mut self) -> std::io::Result<Option<String>> {
         if !self.bom_checked {
             self.check_bom()?;
@@ -335,7 +387,8 @@ impl UniversalLines {
             while i < self.buf.len() {
                 match self.buf[i] {
                     b'\n' => {
-                        let line = decode_ignore(&self.buf[self.pos..i]);
+                        let raw = decode_ignore(&self.buf[self.pos..i]);
+                        let line = take_chars(&raw, MAX_LINE_CHARS);
                         self.pos = i + 1;
                         return Ok(Some(line));
                     }
@@ -345,7 +398,8 @@ impl UniversalLines {
                         if i + 1 == self.buf.len() && !self.eof {
                             break;
                         }
-                        let line = decode_ignore(&self.buf[self.pos..i]);
+                        let raw = decode_ignore(&self.buf[self.pos..i]);
+                        let line = take_chars(&raw, MAX_LINE_CHARS);
                         let next_is_lf = self.buf.get(i + 1) == Some(&b'\n');
                         self.pos = i + 1 + usize::from(next_is_lf);
                         return Ok(Some(line));
@@ -356,13 +410,26 @@ impl UniversalLines {
             // No complete line in the buffer. Read more, or flush the tail.
             if self.eof {
                 if self.pos < self.buf.len() {
-                    let line = decode_ignore(&self.buf[self.pos..]);
+                    let raw = decode_ignore(&self.buf[self.pos..]);
+                    let line = take_chars(&raw, MAX_LINE_CHARS);
                     self.pos = self.buf.len();
                     return Ok(Some(line));
                 }
                 return Ok(None);
             }
             self.fill()?;
+            // Cap: if we've buffered more than MAX_LINE_READ_BYTES without
+            // finding a newline, emit the capped line and stream-skip the rest.
+            // This prevents unbounded allocation on malformed newline-free files.
+            let unread = self.buf.len() - self.pos;
+            if unread >= MAX_LINE_READ_BYTES {
+                let cap_end = self.pos + MAX_LINE_READ_BYTES;
+                let raw = decode_ignore(&self.buf[self.pos..cap_end]);
+                let line = take_chars(&raw, MAX_LINE_CHARS);
+                self.pos = cap_end;
+                self.skip_to_next_line()?;
+                return Ok(Some(line));
+            }
         }
     }
 }
@@ -718,5 +785,117 @@ mod tests {
         assert!(is_tsv(std::path::Path::new("x.tsv")));
         assert!(is_tsv(std::path::Path::new("x.TSV")));
         assert!(!is_tsv(std::path::Path::new("x.csv")));
+    }
+
+    // --- per-line cap tests (issue #222) ---
+
+    /// A line whose char count slightly exceeds MAX_LINE_CHARS (no newline until
+    /// EOF) must be truncated to exactly MAX_LINE_CHARS chars on the EOF flush
+    /// path. The file is ~2 MB — no stream-skip needed; the cap applies in the
+    /// EOF tail flush branch.
+    #[test]
+    fn cap_giant_eof_line_truncated_to_max_chars() {
+        // MAX_LINE_CHARS + 100 ASCII bytes, no newline until EOF.
+        let content: Vec<u8> = b"a".repeat(MAX_LINE_CHARS + 100);
+        let f = tmp(&content, ".csv");
+        let lines = read_universal_lines(f.path()).unwrap();
+        assert_eq!(lines.len(), 1, "should yield exactly one line");
+        assert_eq!(
+            lines[0].chars().count(),
+            MAX_LINE_CHARS,
+            "line must be capped at MAX_LINE_CHARS chars"
+        );
+    }
+
+    /// Giant ASCII line terminated by '\n' followed by a normal line.
+    /// The first line exceeds MAX_LINE_CHARS, so it must be capped; the second
+    /// line must still be read correctly (alignment after cap applies).
+    #[test]
+    fn cap_giant_lf_line_then_next_line_reads_correctly() {
+        // Build a file: (MAX_LINE_CHARS + 50) 'a' bytes + '\n' + "next_line\n".
+        // The first physical line has MAX_LINE_CHARS + 50 chars (all ASCII).
+        let mut content: Vec<u8> = b"a".repeat(MAX_LINE_CHARS + 50);
+        content.extend_from_slice(b"\nnext_line\n");
+        let f = tmp(&content, ".csv");
+        let lines = read_universal_lines(f.path()).unwrap();
+        assert_eq!(lines.len(), 2, "should yield the giant line and the next line");
+        assert_eq!(
+            lines[0].chars().count(),
+            MAX_LINE_CHARS,
+            "giant line capped at MAX_LINE_CHARS"
+        );
+        assert_eq!(lines[1], "next_line", "second line must read correctly after cap");
+    }
+
+    /// Giant line terminated by '\r\n' must be capped and the '\r\n' counted
+    /// as a single line terminator (not two). The line after it must be intact.
+    #[test]
+    fn cap_giant_crlf_line_then_next_line_reads_correctly() {
+        let mut content: Vec<u8> = b"b".repeat(MAX_LINE_CHARS + 50);
+        content.extend_from_slice(b"\r\nnext_line\n");
+        let f = tmp(&content, ".csv");
+        let lines = read_universal_lines(f.path()).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].chars().count(), MAX_LINE_CHARS);
+        assert_eq!(lines[1], "next_line");
+    }
+
+    /// Multibyte char (€, 3 bytes) placed just before the char boundary:
+    /// (MAX_LINE_CHARS - 1) ASCII 'a's + '€' + 200 more 'a's.
+    /// The line has MAX_LINE_CHARS + 200 chars total; truncation must yield
+    /// exactly MAX_LINE_CHARS chars = (MAX_LINE_CHARS - 1) 'a's + '€'.
+    #[test]
+    fn cap_multibyte_char_at_boundary() {
+        let mut content: Vec<u8> = b"a".repeat(MAX_LINE_CHARS - 1);
+        content.extend_from_slice("€".as_bytes()); // 3-byte UTF-8 char
+        content.extend_from_slice(&b"a".repeat(200));
+        content.push(b'\n');
+        let f = tmp(&content, ".csv");
+        let lines = read_universal_lines(f.path()).unwrap();
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0];
+        assert_eq!(
+            line.chars().count(),
+            MAX_LINE_CHARS,
+            "truncation must yield exactly MAX_LINE_CHARS chars"
+        );
+        // The last included char must be '€' (char index MAX_LINE_CHARS - 1).
+        assert_eq!(
+            line.chars().last().unwrap(),
+            '€',
+            "multibyte char at boundary must be the last included char"
+        );
+    }
+
+    /// A file with no newline and exactly MAX_LINE_READ_BYTES bytes triggers
+    /// the stream-skip path in next_line (not the EOF flush). The resulting
+    /// line must contain exactly MAX_LINE_CHARS chars, and no extra lines are
+    /// produced.
+    ///
+    /// NOTE: this test allocates ~8 MB + small overhead — it is intentionally
+    /// larger than the unit tests above because it targets the stream-skip branch
+    /// specifically (the EOF-flush branch fires first for smaller inputs).
+    #[test]
+    fn cap_stream_skip_path_giant_no_newline() {
+        // MAX_LINE_READ_BYTES = 4 * MAX_LINE_CHARS bytes, all ASCII.
+        // After this many bytes without a '\n', next_line must cap + skip.
+        let content: Vec<u8> = b"x".repeat(MAX_LINE_READ_BYTES + 100);
+        let f = tmp(&content, ".csv");
+        let lines = read_universal_lines(f.path()).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].chars().count(), MAX_LINE_CHARS);
+    }
+
+    /// Stream-skip path followed by a valid next line: the giant (>MAX_LINE_READ_BYTES)
+    /// line is capped and the line after the terminator is read intact.
+    #[test]
+    fn cap_stream_skip_then_next_line() {
+        let mut content: Vec<u8> = b"z".repeat(MAX_LINE_READ_BYTES + 100);
+        content.extend_from_slice(b"\nafter_giant\n");
+        let f = tmp(&content, ".csv");
+        let lines = read_universal_lines(f.path()).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].chars().count(), MAX_LINE_CHARS);
+        assert_eq!(lines[1], "after_giant");
     }
 }
