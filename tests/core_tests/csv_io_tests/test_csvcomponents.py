@@ -540,3 +540,32 @@ class TestCSVComponents:
     def test_empty_file_delimiter(self, sample_csv_files):
         delimiter = CSVDelimiter(sample_csv_files["empty.csv"])
         assert delimiter.delimiter == ","  # Should return default delimiter
+
+
+class TestLegacyMacEmbeddedNewlineInHeader:
+    """CSVColumns._get_columns handles a quoted header field with an embedded \\r.
+
+    A legacy-mac file uses \\r as its line terminator. If the HEADER itself
+    contains a quoted field that embeds another \\r (e.g.
+    ``"col\\rone",col2\\r``), the old single-line approach split the header
+    at that embedded \\r and returned a truncated column list. The fixed code
+    feeds the file handle to csv.reader so the quoted field is reassembled.
+    """
+
+    def test_embedded_cr_in_quoted_header_parsed_correctly(self, tmp_path):
+        # Build a legacy-mac CSV: \r is the line terminator.
+        # Header: `"col\rone",col2`  (first field has an embedded \r)
+        # Data row: `val1,val2`
+        # All line endings are \r (no \n).
+        content = b'"col\rone",col2\rval1,val2\r'
+        legacy_mac_file = tmp_path / "legacy_mac_embedded.csv"
+        legacy_mac_file.write_bytes(content)
+
+        columns = CSVColumns(str(legacy_mac_file)).columns
+
+        # The quoted field "col\rone" must be returned as a single column
+        # (with the embedded \r preserved or stripped, but NOT split).
+        assert len(columns) == 2
+        # The first column contains the embedded newline content
+        assert "col" in columns[0]
+        assert columns[1] == "col2"

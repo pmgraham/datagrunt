@@ -387,6 +387,14 @@ class PDFComponents(FileProperties):
                     )
                 with open(filepath_path, "r", encoding="utf-8") as f:
                     self._parsed_dict = json.load(f)
+                # Untrusted JSON: a top-level non-object (list/number/string/null)
+                # would otherwise raise a bare AttributeError deep in .get(...)
+                # at total_pages / flatten paths. Fail fast with a clear message.
+                if not isinstance(self._parsed_dict, dict):
+                    raise ValueError(
+                        f"Expected a JSON object for the parsed document, got "
+                        f"{type(self._parsed_dict).__name__}"
+                    )
                 self._apply_virtual_file_properties(
                     filepath=filepath_path,
                     size_in_bytes=size_in_bytes,

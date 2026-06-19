@@ -202,6 +202,14 @@ def probe_csv_header(filepath):
     sample_lines = []
     sample_rows = []
     saw_nonblank = False
+    # NOTE on blankness semantics: this probe derives ``blank`` from
+    # ``saw_nonblank`` over lines decoded with ``errors="ignore"``. An
+    # all-invalid-UTF-8 file therefore reads as ``blank=True`` here, whereas
+    # ``FileProperties.is_blank`` treats undecodable bytes as content and
+    # returns ``blank=False`` (issue #146). Do NOT align them: aligning would
+    # require a Rust+parity change for a negligible edge case — all-invalid
+    # input yields DEFAULT_DELIMITER/None from both paths anyway. The probe
+    # intentionally uses a lighter "errors=ignore" blankness notion.
     with open(filepath, "r", encoding=props.DEFAULT_ENCODING, errors="ignore") as f:
         for line in _capped_lines(f):
             stripped = line.strip()
