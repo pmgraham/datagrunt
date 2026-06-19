@@ -65,3 +65,16 @@ def test_pdfium_page_closes_page_when_textpage_acquisition_fails():
         PdfiumPage(FakePage(), None)
 
     assert closed["n"] == 1  # page handle closed despite textpage failure
+
+
+def test_pdf_set_export_filename_empty_raises_consistent_with_csv():
+    """Item 3+5 consistency: the PDF set_export_filename mirrors the CSV one —
+    empty/whitespace raises ValueError; None uses the default; a real name returns."""
+    from datagrunt.core.pdf_io.engines import set_export_filename
+
+    assert set_export_filename("output.json", None) == "output.json"
+    assert set_export_filename("output.json", "custom.json") == "custom.json"
+    with pytest.raises(ValueError, match="must not be empty"):
+        set_export_filename("output.json", "")
+    with pytest.raises(ValueError, match="must not be empty"):
+        set_export_filename("output.json", "   ")
