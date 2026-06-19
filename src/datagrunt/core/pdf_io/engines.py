@@ -58,12 +58,20 @@ def _parse_page_native_worker(filepath_str: str, page_index: int, image_output_d
 
 
 def set_export_filename(default_filename, export_filename=None):
-    """Return the export filename if provided, otherwise the default.
+    """Return the export filename if explicitly provided, otherwise the default.
 
-    Mirrors the CSV writer's path-resolution semantics without coupling PDF to
-    DuckDB.
+    Mirrors ``DuckDBQueries.set_export_filename``: ``None`` means "use the
+    default"; a provided-but-empty/whitespace-only string raises ``ValueError``
+    rather than silently writing to the default name (almost always a caller bug).
     """
-    return export_filename if export_filename else default_filename
+    if export_filename is not None:
+        if not export_filename.strip():
+            raise ValueError(
+                f"export_filename must not be empty or whitespace-only; "
+                f"got {export_filename!r}. Pass None to use the default."
+            )
+        return export_filename
+    return default_filename
 
 
 @dataclass

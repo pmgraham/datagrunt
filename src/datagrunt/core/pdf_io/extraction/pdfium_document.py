@@ -49,7 +49,15 @@ class PdfiumPage:
         """
         self._page = page
         self._raw = raw_module
-        self._textpage = page.get_textpage()
+        # If textpage acquisition fails (corrupt page), close the page handle
+        # before re-raising — otherwise the constructor aborts before any
+        # PdfiumPage is handed to the `with` block, so close()/__exit__ never
+        # run and the page handle leaks for the document's lifetime.
+        try:
+            self._textpage = page.get_textpage()
+        except Exception:
+            page.close()
+            raise
 
     def __enter__(self) -> "PdfiumPage":
         return self
