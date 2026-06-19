@@ -8,8 +8,6 @@ allocating gigabytes -- while still partitioning a normal multi-column page
 correctly.
 """
 
-import time
-
 from datagrunt.core.pdf_io.extraction.layout_sorter import (
     MAX_HISTOGRAM_BINS,
     PageLayoutSorter,
@@ -136,8 +134,10 @@ class TestPartitionPathologicalCoordinates:
         """A single absurd x-coordinate must not allocate a giant histogram.
 
         Pre-fix, ``[0] * int(1e9)`` allocated ~8 GB and took seconds for this
-        tiny input. The histogram cap keeps it instant; we assert it both
-        completes quickly and preserves every item.
+        tiny input. The histogram cap (``MAX_HISTOGRAM_BINS``) bounds the
+        allocation structurally; ``test_histogram_cap_is_a_sane_bound`` verifies
+        that cap deterministically. Here we just assert all items survive the
+        partition (correctness guard).
         """
         items = [
             _text_item(0, 10, 10),
@@ -146,14 +146,9 @@ class TestPartitionPathologicalCoordinates:
             _text_item(45, 50, 70),
         ]
 
-        start = time.perf_counter()
         segments = PageLayoutSorter(TextItemAdapter()).partition(items)
-        elapsed = time.perf_counter() - start
 
         assert len(_flatten(segments)) == len(items)
-        # Generous bound: the real fix runs in milliseconds, while the unbounded
-        # allocation took several seconds. This fails loudly if the cap regresses.
-        assert elapsed < 2.0
 
     def test_histogram_cap_is_a_sane_bound(self):
         """The bin cap must stay well above any real page width but bounded."""

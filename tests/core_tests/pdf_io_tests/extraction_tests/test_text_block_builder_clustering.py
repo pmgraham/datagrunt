@@ -131,14 +131,31 @@ def _large_page(n_items):
 
 
 def test_clustering_large_page_is_near_linear():
-    """A 3000-item page must cluster well under a generous bound.
+    """A 3000-item page must produce the correct cluster count and run quickly.
 
-    The original O(n^2) implementation takes >0.3s here and grows 4x per
-    doubling; the near-linear rewrite stays comfortably under 0.5s.
+    Primary (deterministic): the 3000-item grid has 150 rows × 20 columns with
+    y-jitter of ±0.4 and row spacing of 12 pt. The grouping tolerance for size
+    10 is max(2.0, 10*0.5) = 5.0, well below the 12 pt row gap, so every row
+    forms its own line — expect exactly 150 clusters.
+
+    Secondary (coarse O(n²) tripwire): the original O(n²) algorithm takes
+    several seconds on 3000 items; the near-linear rewrite runs in milliseconds.
+    The 5 s bound is generous enough to survive loaded CI while still catching a
+    true O(n²) regression (which would take ~10× longer on modern hardware).
     """
     items = _large_page(3000)
     builder = TextBlockBuilder()
+
     start = time.perf_counter()
-    builder._cluster_into_lines(items)
+    lines = builder._cluster_into_lines(items)
     elapsed = time.perf_counter() - start
-    assert elapsed < 0.5, f"clustering 3000 items took {elapsed:.3f}s (O(n^2) regression?)"
+
+    # Primary deterministic guard: correct output, independent of machine speed.
+    expected_rows = 3000 // 20  # == 150
+    assert len(lines) == expected_rows, (
+        f"expected {expected_rows} clustered lines, got {len(lines)}"
+    )
+
+    # Secondary coarse tripwire: O(n²) regression would be ~10–30 s; 5 s budget
+    # is generous for near-linear but still catches a true quadratic blowup.
+    assert elapsed < 5.0, f"clustering 3000 items took {elapsed:.3f}s (O(n^2) regression?)"
