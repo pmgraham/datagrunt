@@ -20,6 +20,10 @@ class BBox:
         """Return the box as a ``{x, y, w, h}`` dict (rounded to 2dp)."""
         return {"x": round(self.x, 2), "y": round(self.y, 2), "w": round(self.w, 2), "h": round(self.h, 2)}
 
+    def to_xyxy(self) -> list:
+        """Return ``[x, y, x+w, y+h]`` — the xyxy bbox used in native schema records."""
+        return [self.x, self.y, round(self.x + self.w, 2), round(self.y + self.h, 2)]
+
     @classmethod
     def from_pdfium_bounds(cls, left: float, bottom: float, right: float, top: float, page_height: float) -> "BBox":
         """Build from PDFium's bottom-left ``(left, bottom, right, top)`` bounds."""

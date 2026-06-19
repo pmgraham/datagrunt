@@ -48,7 +48,7 @@ class CSVEngineFactory:
         self.lenient = lenient
         self.normalize_columns = normalize_columns
         if not self.filepath.exists():
-            raise FileNotFoundError
+            raise FileNotFoundError(f"CSV file not found: {self.filepath}")
         self.validate_engine(self.engine)
 
     @staticmethod
@@ -99,4 +99,4 @@ class CSVEngineFactory:
         if engine_class:
             return engine_class(self.filepath, lenient=self.lenient, normalize_columns=self.normalize_columns)
         else:
-            raise ValueError(f"Unsupported reader engine: {self.engine}")
+            raise ValueError(f"Unsupported writer engine: {self.engine}")
