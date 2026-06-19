@@ -22,9 +22,9 @@ import pytest
 pdfium_page = pytest.importorskip("pypdfium2._helpers.page")
 pdfium_textpage = pytest.importorskip("pypdfium2._helpers.textpage")
 
-from datagrunt.core.pdf_io.extraction.pdfium_backend import PdfiumBackend
-from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
-from datagrunt.core.pdf_io.extraction.pdfium_native import PdfiumNativeReader
+from datagrunt.core.pdf_io.extraction.pdfium_backend import PdfiumBackend  # noqa: E402
+from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument  # noqa: E402
+from datagrunt.core.pdf_io.extraction.pdfium_native import PdfiumNativeReader  # noqa: E402
 
 PdfPage = pdfium_page.PdfPage
 PdfTextPage = pdfium_textpage.PdfTextPage

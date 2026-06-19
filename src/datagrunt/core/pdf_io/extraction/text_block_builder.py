@@ -2,8 +2,9 @@
 
 import re
 from bisect import bisect_left
-from datagrunt.core.pdf_io.extraction.shapes import BBox, TextBlock
+
 from datagrunt.core.pdf_io.extraction.layout_sorter import PageLayoutSorter, TextItemAdapter
+from datagrunt.core.pdf_io.extraction.shapes import BBox, TextBlock
 
 LIST_MARKER_REGEX = re.compile(
     r'^('

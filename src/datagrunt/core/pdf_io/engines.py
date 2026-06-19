@@ -4,7 +4,6 @@
 import json
 import logging
 import os
-import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +36,7 @@ def _is_distributed_env() -> bool:
 def _parse_page_structured_worker(filepath_str: str, page_index: int, image_output_dir: Optional[str]) -> dict:
     """Process worker function to parse a single page using PDFium in structured mode."""
     from pathlib import Path
+
     from datagrunt.core.pdf_io import pdfcomponents
     from datagrunt.core.pdf_io.extraction import PdfiumBackend
 
@@ -49,6 +49,7 @@ def _parse_page_structured_worker(filepath_str: str, page_index: int, image_outp
 def _parse_page_native_worker(filepath_str: str, page_index: int, image_output_dir: Optional[str]) -> dict:
     """Process worker function to parse a single page using PDFium in native mode."""
     from pathlib import Path
+
     from datagrunt.core.pdf_io.extraction import PdfiumNativeReader
 
     filepath = Path(filepath_str)
@@ -214,7 +215,8 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
         if self.workers <= 1 or total_pages <= 1 or _is_distributed_env():
             if self.workers > 1 and _is_distributed_env():
                 logger.warning(
-                    "Distributed environment detected. Defaulting to sequential PDFium execution to prevent multiprocessing overhead."
+                    "Distributed environment detected. Defaulting to sequential "
+                    "PDFium execution to prevent multiprocessing overhead."
                 )
             assembler = pdfcomponents.DocumentAssembler(self.filepath, backend=PdfiumBackend(self.filepath))
             with assembler.backend, assembler.table_extractor:
@@ -256,7 +258,8 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
         if self.workers <= 1 or total_pages <= 1 or _is_distributed_env():
             if self.workers > 1 and _is_distributed_env():
                 logger.warning(
-                    "Distributed environment detected. Defaulting to sequential PDFium execution to prevent multiprocessing overhead."
+                    "Distributed environment detected. Defaulting to sequential "
+                    "PDFium execution to prevent multiprocessing overhead."
                 )
             reader = PdfiumNativeReader(self.filepath)
             with reader:

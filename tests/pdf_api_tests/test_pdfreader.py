@@ -310,8 +310,14 @@ class TestPDFReaderJsonAndDictInputs:
                         "width": 100.0,
                         "height": 100.0,
                         "elements": [
-                            {"id": "el1", "type": "header", "content": "Header Text", "position": {"x": 10, "y": 10, "w": 80, "h": 10}},
-                            {"id": "el2", "type": "body_text", "content": "Hello body", "position": {"x": 10, "y": 30, "w": 80, "h": 10}},
+                            {
+                                "id": "el1", "type": "header", "content": "Header Text",
+                                "position": {"x": 10, "y": 10, "w": 80, "h": 10},
+                            },
+                            {
+                                "id": "el2", "type": "body_text", "content": "Hello body",
+                                "position": {"x": 10, "y": 30, "w": 80, "h": 10},
+                            },
                         ]
                     }
                 ]
@@ -322,10 +328,10 @@ class TestPDFReaderJsonAndDictInputs:
         reader = PDFReader(dummy_structured_dict)
         assert reader._parsed_dict == dummy_structured_dict
         assert reader.total_pages == 1
-        
+
         # Test to_dicts
         assert reader.to_dicts() == dummy_structured_dict
-        
+
         # Test get_sample
         sample = reader.get_sample()
         assert sample["page_number"] == 1

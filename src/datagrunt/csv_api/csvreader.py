@@ -3,14 +3,17 @@ Module for reading CSV files and converting to different in memory python
 objects.
 """
 
+# standard library
+from pathlib import Path
+
 # third party libraries
 import polars as pl
 import pyarrow as pa
 
 # local libraries
 from datagrunt.core import DuckDBQueries
-from datagrunt.csv_api._engine_backed import _CSVEngineBacked
 from datagrunt.csv_api._compat import warn_per_call_normalize
+from datagrunt.csv_api._engine_backed import _CSVEngineBacked
 
 
 class CSVReader(_CSVEngineBacked):
@@ -18,7 +21,13 @@ class CSVReader(_CSVEngineBacked):
 
     _engine_role = "reader"
 
-    def __init__(self, filepath, engine="polars", lenient=False, normalize_columns=False):
+    def __init__(
+        self,
+        filepath: str | Path,
+        engine: str = "polars",
+        lenient: bool = False,
+        normalize_columns: bool = False,
+    ) -> None:
         """
         Initialize the CSV Reader class.
 
@@ -38,7 +47,7 @@ class CSVReader(_CSVEngineBacked):
         """Return an empty object of the specified type."""
         return object
 
-    def get_sample(self, normalize_columns=None):
+    def get_sample(self, normalize_columns: bool | None = None):
         """Return a sample of the CSV file.
 
         Args:
@@ -46,27 +55,30 @@ class CSVReader(_CSVEngineBacked):
             ``None`` (default) inherits the constructor-level setting.
 
         Returns:
-            A Polars DataFrame containing the sample rows.
+            Engine-dependent result: a Polars DataFrame for the polars/pyarrow
+            engines, or a DuckDB relation for the DuckDB engine. Returns an
+            empty ``pl.DataFrame()`` for empty/blank files.
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(pl.DataFrame())
         return self._engine.get_sample(warn_per_call_normalize(normalize_columns))
 
-    def to_dataframe(self, normalize_columns=None):
-        """Converts CSV to a Polars dataframe.
+    def to_dataframe(self, normalize_columns: bool | None = None):
+        """Converts CSV to a dataframe.
 
         Args:
             normalize_columns (bool or None): Deprecated per-call override.
             ``None`` (default) inherits the constructor-level setting.
 
         Returns:
-            A Polars dataframe.
+            Engine-dependent result: a Polars DataFrame or DuckDB relation.
+            Returns an empty ``pl.DataFrame()`` for empty/blank files.
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(pl.DataFrame())
         return self._engine.to_dataframe(warn_per_call_normalize(normalize_columns))
 
-    def to_arrow_table(self, normalize_columns=None):
+    def to_arrow_table(self, normalize_columns: bool | None = None) -> pa.Table:
         """Converts CSV to a PyArrow table.
 
         Args:
@@ -80,7 +92,7 @@ class CSVReader(_CSVEngineBacked):
             return self._return_empty_file_object(pa.Table.from_pydict({}))
         return self._engine.to_arrow_table(warn_per_call_normalize(normalize_columns))
 
-    def to_dicts(self, normalize_columns=None):
+    def to_dicts(self, normalize_columns: bool | None = None) -> list:
         """Converts CSV to a list of dictionaries.
 
         Args:
@@ -94,7 +106,7 @@ class CSVReader(_CSVEngineBacked):
             return self._return_empty_file_object(list())
         return self._engine.to_dicts(warn_per_call_normalize(normalize_columns))
 
-    def query_data(self, sql_query, normalize_columns=None):
+    def query_data(self, sql_query: str, normalize_columns: bool | None = None):
         """
         Queries a CSV file after importing into DuckDB.
 

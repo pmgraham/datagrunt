@@ -110,6 +110,7 @@ def test_pymupdf_extract_page_parses_page_once(sample_pdf, monkeypatch):
     """extract_page must not re-parse: at most two get_text calls (dict + text)
     and exactly one get_images call, versus three/two in the old path."""
     import pymupdf
+
     from datagrunt.core.pdf_io.extraction.pymupdf_backend import PyMuPDFBackend
 
     counts = {"get_text": 0, "get_images": 0}

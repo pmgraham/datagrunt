@@ -2,6 +2,7 @@
 
 # standard library
 import json
+import os
 import time
 from functools import cached_property
 from pathlib import Path
@@ -255,7 +256,6 @@ class ParsedDocument:
 
     def to_markdown(self, export_filename=None) -> str:
         """Render the unified structured elements of the document into Markdown."""
-        import os
         blocks = []
         heading_map = {"header": "# ", "subheader": "## "}
         for page in self.document.get("document", {}).get("pages", []):

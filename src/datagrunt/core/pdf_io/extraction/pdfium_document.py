@@ -202,6 +202,7 @@ class PdfiumPage:
     def _extract_image(self, obj, base: Path):
         """Write an image object to disk preserving format; return path or None."""
         import glob
+
         from PIL import Image
 
         pdfium, _ = _import_pdfium()

@@ -2,6 +2,7 @@
 
 import json
 import os
+
 import pytest
 
 from datagrunt.pdf_api.pdfwriter import PDFWriter
@@ -362,9 +363,19 @@ class TestPDFWriterJsonAndDictInputs:
                         "width": 100.0,
                         "height": 100.0,
                         "elements": [
-                            {"id": "el1", "type": "header", "content": "Header Text", "position": {"x": 10, "y": 10, "w": 80, "h": 10}},
-                            {"id": "el2", "type": "body_text", "content": "Hello body", "position": {"x": 10, "y": 30, "w": 80, "h": 10}},
-                            {"id": "el3", "type": "image", "content": None, "position": {"x": 10, "y": 50, "w": 80, "h": 10}, "metadata": {"file_path": "/dummy/img.png"}},
+                            {
+                                "id": "el1", "type": "header", "content": "Header Text",
+                                "position": {"x": 10, "y": 10, "w": 80, "h": 10},
+                            },
+                            {
+                                "id": "el2", "type": "body_text", "content": "Hello body",
+                                "position": {"x": 10, "y": 30, "w": 80, "h": 10},
+                            },
+                            {
+                                "id": "el3", "type": "image", "content": None,
+                                "position": {"x": 10, "y": 50, "w": 80, "h": 10},
+                                "metadata": {"file_path": "/dummy/img.png"},
+                            },
                         ]
                     }
                 ]

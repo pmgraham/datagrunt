@@ -3,8 +3,8 @@
 from datagrunt.core.pdf_io.extraction.shapes import TextItem
 from datagrunt.core.pdf_io.extraction.text_block_builder import (
     TextBlockBuilder,
-    classify_font_size,
     classify_by_median,
+    classify_font_size,
     page_median_size,
 )
 
@@ -35,13 +35,28 @@ def test_builder_empty():
 
 def test_builder_column_extraction():
     # Spanning title
-    title = TextItem(text="Spanning Title", x0=50, x1=450, y_top=50, y_bot=74, size=24.0, font="Arial", is_bold=True, is_italic=False)
+    title = TextItem(
+        text="Spanning Title", x0=50, x1=450, y_top=50, y_bot=74, size=24.0, font="Arial",
+        is_bold=True, is_italic=False,
+    )
     # Left column items (y=100 and y=120)
-    left1 = TextItem(text="left 1", x0=50, x1=150, y_top=100, y_bot=111, size=11.0, font="Arial", is_bold=False, is_italic=False)
-    left2 = TextItem(text="left 2", x0=50, x1=150, y_top=120, y_bot=131, size=11.0, font="Arial", is_bold=False, is_italic=False)
+    left1 = TextItem(
+        text="left 1", x0=50, x1=150, y_top=100, y_bot=111, size=11.0, font="Arial",
+        is_bold=False, is_italic=False,
+    )
+    left2 = TextItem(
+        text="left 2", x0=50, x1=150, y_top=120, y_bot=131, size=11.0, font="Arial",
+        is_bold=False, is_italic=False,
+    )
     # Right column items (y=100 and y=120)
-    right1 = TextItem(text="right 1", x0=350, x1=450, y_top=100, y_bot=111, size=11.0, font="Arial", is_bold=False, is_italic=False)
-    right2 = TextItem(text="right 2", x0=350, x1=450, y_top=120, y_bot=131, size=11.0, font="Arial", is_bold=False, is_italic=False)
+    right1 = TextItem(
+        text="right 1", x0=350, x1=450, y_top=100, y_bot=111, size=11.0, font="Arial",
+        is_bold=False, is_italic=False,
+    )
+    right2 = TextItem(
+        text="right 2", x0=350, x1=450, y_top=120, y_bot=131, size=11.0, font="Arial",
+        is_bold=False, is_italic=False,
+    )
 
     # Pass them in non-sequential order
     items = [left2, right1, title, left1, right2]
