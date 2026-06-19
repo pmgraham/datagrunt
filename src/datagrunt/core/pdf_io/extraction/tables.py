@@ -28,6 +28,7 @@ class PdfPlumberTableExtractor:
         """
         self.filepath = Path(filepath)
         import threading
+
         self._local = threading.local()
 
     def __enter__(self):

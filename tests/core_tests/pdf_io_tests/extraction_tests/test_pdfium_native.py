@@ -27,19 +27,25 @@ class TestPdfiumNativeReader:
         assert {r["type"] for r in records} >= {"text", "image"}
         text_rec = next(r for r in records if r["type"] == "text")
         assert set(text_rec.keys()) == {
-            "page", "type", "text", "font_size", "x", "y", "w", "h", "bbox", "file", "px_width", "px_height", "ocr"
+            "page",
+            "type",
+            "text",
+            "font_size",
+            "x",
+            "y",
+            "w",
+            "h",
+            "bbox",
+            "file",
+            "px_width",
+            "px_height",
+            "ocr",
         }
 
     def test_to_markdown_normalizes_crlf(self):
         # pdfium emits \r\n line endings; markdown must not leak \r and must
         # split paragraphs on blank lines (\r\n\r\n).
-        doc = {
-            "document": {
-                "pages": [
-                    {"text": "Page 1 line one\r\nstill para one\r\n\r\nPage 1 paragraph two"}
-                ]
-            }
-        }
+        doc = {"document": {"pages": [{"text": "Page 1 line one\r\nstill para one\r\n\r\nPage 1 paragraph two"}]}}
         markdown = PdfiumNativeReader.to_markdown(doc)
         assert "\r" not in markdown
         assert markdown == "Page 1 line one\nstill para one\n\nPage 1 paragraph two\n"

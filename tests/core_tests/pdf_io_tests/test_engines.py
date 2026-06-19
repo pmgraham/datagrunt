@@ -259,9 +259,7 @@ class TestPDFReaderPyMuPDFSequential:
         assert doc["document"]["total_pages"] == 4
         assert [p["page_number"] for p in pages] == [1, 2, 3, 4]
         for n, page in enumerate(pages, start=1):
-            text = " ".join(
-                e.get("content", "") for e in page["elements"] if e.get("type") in ("header", "body_text")
-            )
+            text = " ".join(e.get("content", "") for e in page["elements"] if e.get("type") in ("header", "body_text"))
             assert f"Sequential Marker {n}" in text
 
     def test_does_not_use_thread_pool_executor(self, tmp_path, monkeypatch):
@@ -312,8 +310,13 @@ class TestPDFReaderPdfiumEngine:
         assert doc["document"]["page_count"] == 1
         page = doc["document"]["pages"][0]
         assert set(page.keys()) == {
-            "page_number", "width", "height", "text",
-            "text_objects", "images", "ocr",
+            "page_number",
+            "width",
+            "height",
+            "text",
+            "text_objects",
+            "images",
+            "ocr",
         }
         assert "Quarterly Report" in page["text"]
 

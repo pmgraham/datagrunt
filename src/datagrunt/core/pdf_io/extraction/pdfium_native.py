@@ -20,6 +20,7 @@ class PdfiumNativeReader:
         """
         self.filepath = Path(filepath)
         import threading
+
         self._local = threading.local()
 
     def __enter__(self):
@@ -163,30 +164,51 @@ class PdfiumNativeReader:
         supplies the type-specific fields so the key ordering stays identical.
         """
         return {
-            "page": page_no, "type": record_type, "text": text, "font_size": font_size,
-            "x": float(pos.get("x", 0.0)), "y": float(pos.get("y", 0.0)), "w": float(pos.get("w", 0.0)),
-            "h": float(pos.get("h", 0.0)), "bbox": json.dumps(bbox_raw), "file": file,
-            "px_width": px_width, "px_height": px_height, "ocr": ocr,
+            "page": page_no,
+            "type": record_type,
+            "text": text,
+            "font_size": font_size,
+            "x": float(pos.get("x", 0.0)),
+            "y": float(pos.get("y", 0.0)),
+            "w": float(pos.get("w", 0.0)),
+            "h": float(pos.get("h", 0.0)),
+            "bbox": json.dumps(bbox_raw),
+            "file": file,
+            "px_width": px_width,
+            "px_height": px_height,
+            "ocr": ocr,
         }
 
     @staticmethod
     def _flat_text(obj, page_no, ocr) -> dict:
         """Flatten one native text object to a scalar record."""
         return PdfiumNativeReader._flat_record(
-            page_no=page_no, ocr=ocr, record_type="text",
-            bbox_raw=obj.get("bbox"), pos=obj.get("position", {}),
-            text=obj.get("text"), font_size=obj.get("font_size"),
-            file=None, px_width=None, px_height=None,
+            page_no=page_no,
+            ocr=ocr,
+            record_type="text",
+            bbox_raw=obj.get("bbox"),
+            pos=obj.get("position", {}),
+            text=obj.get("text"),
+            font_size=obj.get("font_size"),
+            file=None,
+            px_width=None,
+            px_height=None,
         )
 
     @staticmethod
     def _flat_image(img, page_no, ocr) -> dict:
         """Flatten one native image to a scalar record."""
         return PdfiumNativeReader._flat_record(
-            page_no=page_no, ocr=ocr, record_type="image",
-            bbox_raw=img.get("bbox"), pos=img.get("position", {}),
-            text=None, font_size=None,
-            file=img.get("file"), px_width=img.get("px_width"), px_height=img.get("px_height"),
+            page_no=page_no,
+            ocr=ocr,
+            record_type="image",
+            bbox_raw=img.get("bbox"),
+            pos=img.get("position", {}),
+            text=None,
+            font_size=None,
+            file=img.get("file"),
+            px_width=img.get("px_width"),
+            px_height=img.get("px_height"),
         )
 
     @staticmethod
@@ -199,11 +221,7 @@ class PdfiumNativeReader:
                 Only files resolving inside it are eligible for deletion (see
                 issue #101); when ``None`` no file is removed from disk.
         """
-        images = [
-            img
-            for page in document.get("document", {}).get("pages", [])
-            for img in page.get("images", [])
-        ]
+        images = [img for page in document.get("document", {}).get("pages", []) for img in page.get("images", [])]
         return dedupe_image_files(
             images,
             lambda img: img.get("file"),

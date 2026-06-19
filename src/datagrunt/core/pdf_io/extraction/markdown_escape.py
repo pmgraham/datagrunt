@@ -16,9 +16,9 @@ import re
 # left untouched, which is the minimum intervention needed for safe rendering.
 _LEADING_MARKDOWN_METACHAR = re.compile(
     r"^(\s*)(?:"
-    r"([#>*+=|]|[-])"          # group 2 — single structural char (includes = and |)
-    r"|(\d+)(\.)"              # groups 3+4 — ordered-list marker "N."
-    r"|(```+|~~~+)"            # group 5 — code-fence opener (3+ backticks or tildes)
+    r"([#>*+=|]|[-])"  # group 2 — single structural char (includes = and |)
+    r"|(\d+)(\.)"  # groups 3+4 — ordered-list marker "N."
+    r"|(```+|~~~+)"  # group 5 — code-fence opener (3+ backticks or tildes)
     r")"
 )
 
@@ -108,20 +108,11 @@ def _contains_whitespace(text: str) -> bool:
 
 def _bare_form(target: str) -> str:
     """Escape structural chars for a bare (non-angle-bracket) link destination."""
-    return (
-        target.replace("\\", "\\\\")
-        .replace(")", "\\)")
-        .replace("(", "\\(")
-        .replace("[", "\\[")
-    )
+    return target.replace("\\", "\\\\").replace(")", "\\)").replace("(", "\\(").replace("[", "\\[")
 
 
 def _angle_bracket_form(target: str) -> str:
     """Wrap *target* in ``<...>`` and escape interior ``\\ < >``."""
     # Inside an angle-bracket destination only \, <, > are special.
-    interior = (
-        target.replace("\\", "\\\\")
-        .replace("<", "\\<")
-        .replace(">", "\\>")
-    )
+    interior = target.replace("\\", "\\\\").replace("<", "\\<").replace(">", "\\>")
     return f"<{interior}>"

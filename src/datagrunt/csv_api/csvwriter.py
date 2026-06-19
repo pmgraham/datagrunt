@@ -3,11 +3,10 @@
 # standard library
 from pathlib import Path
 
-# third party libraries
 # local libraries
 from datagrunt.core import CSVEngineProperties, DuckDBQueries
-from datagrunt.csv_api._engine_backed import _CSVEngineBacked
 from datagrunt.csv_api._compat import warn_per_call_normalize
+from datagrunt.csv_api._engine_backed import _CSVEngineBacked
 
 
 class CSVWriter(_CSVEngineBacked):
@@ -29,7 +28,13 @@ class CSVWriter(_CSVEngineBacked):
 
     _engine_role = "writer"
 
-    def __init__(self, filepath, engine="duckdb", lenient=False, normalize_columns=False):
+    def __init__(
+        self,
+        filepath: str | Path,
+        engine: str = "duckdb",
+        lenient: bool = False,
+        normalize_columns: bool = False,
+    ) -> None:
         """
         Initialize the CSV Writer class.
 
@@ -56,12 +61,12 @@ class CSVWriter(_CSVEngineBacked):
         filename = self.queries.set_export_filename(default_filename, out_filename)
         Path(filename).write_bytes(b"")
 
-    def write_csv(self, out_filename=None, normalize_columns=None):
+    def write_csv(self, out_filename: str | None = None, normalize_columns: bool | None = None) -> None:
         """
         Query to export a DuckDB table to a CSV file.
 
         Args:
-            out_filename str: The name of the output file.
+            out_filename (str | None): The name of the output file.
             normalize_columns (bool or None): Deprecated per-call override.
             ``None`` (default) inherits the constructor-level setting.
         """
@@ -69,12 +74,12 @@ class CSVWriter(_CSVEngineBacked):
             return self._write_empty_output(CSVEngineProperties.csv_export_filename, out_filename)
         return self._engine.write_csv(out_filename, warn_per_call_normalize(normalize_columns))
 
-    def write_excel(self, out_filename=None, normalize_columns=None):
+    def write_excel(self, out_filename: str | None = None, normalize_columns: bool | None = None) -> None:
         """
         Query to export a DuckDB table to an Excel file.
 
         Args:
-            out_filename str: The name of the output file.
+            out_filename (str | None): The name of the output file.
             normalize_columns (bool or None): Deprecated per-call override.
             ``None`` (default) inherits the constructor-level setting.
         """
@@ -82,12 +87,12 @@ class CSVWriter(_CSVEngineBacked):
             return self._write_empty_output(CSVEngineProperties.excel_export_filename, out_filename)
         return self._engine.write_excel(out_filename, warn_per_call_normalize(normalize_columns))
 
-    def write_json(self, out_filename=None, normalize_columns=None):
+    def write_json(self, out_filename: str | None = None, normalize_columns: bool | None = None) -> None:
         """
         Query to export a DuckDB table to a JSON file.
 
         Args:
-            out_filename str: The name of the output file.
+            out_filename (str | None): The name of the output file.
             normalize_columns (bool or None): Deprecated per-call override.
             ``None`` (default) inherits the constructor-level setting.
         """
@@ -95,27 +100,27 @@ class CSVWriter(_CSVEngineBacked):
             return self._write_empty_output(CSVEngineProperties.json_export_filename, out_filename)
         return self._engine.write_json(out_filename, warn_per_call_normalize(normalize_columns))
 
-    def write_json_newline_delimited(self, out_filename=None, normalize_columns=None):
+    def write_json_newline_delimited(
+        self, out_filename: str | None = None, normalize_columns: bool | None = None
+    ) -> None:
         """
         Query to export a DuckDB table to a JSON newline delimited file.
 
         Args:
-            out_filename str: The name of the output file.
+            out_filename (str | None): The name of the output file.
             normalize_columns (bool or None): Deprecated per-call override.
             ``None`` (default) inherits the constructor-level setting.
         """
         if self.is_empty or self.is_blank:
             return self._write_empty_output(CSVEngineProperties.json_newline_export_filename, out_filename)
-        return self._engine.write_json_newline_delimited(
-            out_filename, warn_per_call_normalize(normalize_columns)
-        )
+        return self._engine.write_json_newline_delimited(out_filename, warn_per_call_normalize(normalize_columns))
 
-    def write_parquet(self, out_filename=None, normalize_columns=None):
+    def write_parquet(self, out_filename: str | None = None, normalize_columns: bool | None = None) -> None:
         """
         Query to export a DuckDB table to a Parquet file.
 
         Args:
-            out_filename str: The name of the output file.
+            out_filename (str | None): The name of the output file.
             normalize_columns (bool or None): Deprecated per-call override.
             ``None`` (default) inherits the constructor-level setting.
         """

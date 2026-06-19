@@ -97,3 +97,8 @@ select = [
     "I",  # isort
 ]
 ignore = ["E203"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"

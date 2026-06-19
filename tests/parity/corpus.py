@@ -77,9 +77,7 @@ CORPUS: dict[str, bytes] = {
     #     (the last char kept by truncation). 2Mi-2 pattern chars + 'a' + '€'
     #     puts '€' exactly on the boundary, then ",more" overflows the cap.
     #     Verifies Rust counts CHARS (not bytes) and lands on the multibyte char.
-    "giant_multibyte_near_cap.csv": (
-        b"a," * (1024 * 1024 - 1) + b"a" + "€".encode("utf-8") + b",more,fields,here\n"
-    ),
+    "giant_multibyte_near_cap.csv": (b"a," * (1024 * 1024 - 1) + b"a" + "€".encode("utf-8") + b",more,fields,here\n"),
     # (c) Giant line terminated with \r\n followed by a normal data line.
     #     After capping the giant line, the next line must still be read
     #     correctly — validates stream-skip alignment for both backends.
@@ -96,13 +94,9 @@ CORPUS: dict[str, bytes] = {
     #     not per field). 1_800_000 reps = 9,000,000 raw bytes (> 8 MiB
     #     MAX_LINE_READ_BYTES, so the streaming cap branch fires) and 3,600,000
     #     decoded chars (> 2 Mi MAX_LINE_CHARS).
-    "giant_invalid_leading_byte.csv": (
-        b"\xff" + "😀,".encode("utf-8") * 1_800_000 + b"\n"
-    ),
+    "giant_invalid_leading_byte.csv": (b"\xff" + "😀,".encode("utf-8") * 1_800_000 + b"\n"),
     # (e) Same shape as (d) but WITHOUT the leading invalid byte: no dropped
     #     bytes. Both backends must still yield exactly MAX_LINE_CHARS chars —
     #     verifies the fix does not regress clean 4-byte-char giant lines.
-    "giant_4byte_chars_no_invalid.csv": (
-        "😀,".encode("utf-8") * 1_800_000 + b"\n"
-    ),
+    "giant_4byte_chars_no_invalid.csv": ("😀,".encode("utf-8") * 1_800_000 + b"\n"),
 }

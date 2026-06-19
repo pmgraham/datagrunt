@@ -22,9 +22,9 @@ import pytest
 pdfium_page = pytest.importorskip("pypdfium2._helpers.page")
 pdfium_textpage = pytest.importorskip("pypdfium2._helpers.textpage")
 
-from datagrunt.core.pdf_io.extraction.pdfium_backend import PdfiumBackend
-from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
-from datagrunt.core.pdf_io.extraction.pdfium_native import PdfiumNativeReader
+from datagrunt.core.pdf_io.extraction.pdfium_backend import PdfiumBackend  # noqa: E402
+from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument  # noqa: E402
+from datagrunt.core.pdf_io.extraction.pdfium_native import PdfiumNativeReader  # noqa: E402
 
 PdfPage = pdfium_page.PdfPage
 PdfTextPage = pdfium_textpage.PdfTextPage
@@ -43,12 +43,8 @@ def _open_handle_counts() -> tuple:
     handle only counts as reclaimed if it was explicitly closed, never because
     the cyclic collector happened to run.
     """
-    open_pages = sum(
-        1 for obj in gc.get_objects() if isinstance(obj, PdfPage) and _is_open(obj)
-    )
-    open_textpages = sum(
-        1 for obj in gc.get_objects() if isinstance(obj, PdfTextPage) and _is_open(obj)
-    )
+    open_pages = sum(1 for obj in gc.get_objects() if isinstance(obj, PdfPage) and _is_open(obj))
+    open_textpages = sum(1 for obj in gc.get_objects() if isinstance(obj, PdfTextPage) and _is_open(obj))
     return open_pages, open_textpages
 
 

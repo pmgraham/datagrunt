@@ -208,9 +208,7 @@ class TestSliceYBandsNegativeY:
         span = _text_item(0, 500, 50)
         interval = {"y_top": 50.0, "y_bot": 58.0, "items": [span]}
 
-        segments = sorter._slice_y_bands(
-            above_negative + below_interval, [interval]
-        )
+        segments = sorter._slice_y_bands(above_negative + below_interval, [interval])
         flattened = _flatten(segments)
 
         # Every column item plus the spanning item is placed exactly once.
@@ -276,12 +274,8 @@ class TestPartitionRecursionDepthCap:
             sys.setrecursionlimit(old_limit)
 
         flattened = _flatten(segments)
-        assert len(flattened) == item_count, (
-            f"All {item_count} items must be preserved; got {len(flattened)}"
-        )
-        assert {id(it) for it in flattened} == {id(it) for it in items}, (
-            "No items must be dropped or duplicated"
-        )
+        assert len(flattened) == item_count, f"All {item_count} items must be preserved; got {len(flattened)}"
+        assert {id(it) for it in flattened} == {id(it) for it in items}, "No items must be dropped or duplicated"
 
     def test_sort_staircase_preserves_all_items(self):
         """sort() on a staircase layout must preserve all items end-to-end."""
