@@ -141,6 +141,7 @@ data/
 
 # Local dev
 dev/
+.cursor/
 benchmarks.py
 ibm/
 dev.py
