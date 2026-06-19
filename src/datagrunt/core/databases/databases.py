@@ -107,8 +107,11 @@ class DuckDBQueries:
         """
         if not DuckDBQueries._spatial_installed:
             connection.execute("INSTALL spatial;")
-            DuckDBQueries._spatial_installed = True
         connection.execute("LOAD spatial;")
+        # Only mark installed after LOAD succeeds: if INSTALL succeeds but LOAD
+        # then fails, the flag must stay False so the next connection retries
+        # rather than LOADing an extension that never actually installed.
+        DuckDBQueries._spatial_installed = True
 
     @cached_property
     def delimiter(self):
