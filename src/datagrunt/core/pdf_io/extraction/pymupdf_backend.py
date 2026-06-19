@@ -2,6 +2,7 @@
 
 import logging
 
+from datagrunt.core.pdf_io.extraction._doc_session import _ThreadLocalDocSession
 from datagrunt.core.pdf_io.extraction.base import ExtractionBackend
 from datagrunt.core.pdf_io.extraction.ocr import ocr_data_to_blocks
 from datagrunt.core.pdf_io.extraction.pdfium_document import ENCRYPTED_PDF_MESSAGE
@@ -20,7 +21,7 @@ def _import_pymupdf():
     return pymupdf
 
 
-class PyMuPDFBackend(ExtractionBackend):
+class PyMuPDFBackend(_ThreadLocalDocSession, ExtractionBackend):
     """Extraction via PyMuPDF (text/dict spans, images) + Tesseract OCR."""
 
     def __init__(self, filepath):
@@ -43,25 +44,8 @@ class PyMuPDFBackend(ExtractionBackend):
             raise ValueError(ENCRYPTED_PDF_MESSAGE)
         return doc
 
-    def __enter__(self):
-        if not hasattr(self._local, "depth"):
-            self._local.depth = 0
-        if self._local.depth == 0:
-            self._local.doc = self._open_doc()
-        self._local.depth += 1
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self._local.depth -= 1
-        if self._local.depth == 0:
-            if hasattr(self._local, "doc") and self._local.doc:
-                self._local.doc.close()
-                self._local.doc = None
-
-    def _get_doc(self):
-        if hasattr(self._local, "doc") and self._local.doc:
-            return self._local.doc, False
-        return self._open_doc(), True
+    def _open_resource(self):
+        return self._open_doc()
 
     def page_count(self) -> int:
         """Return the document's page count using pymupdf (no pdfium dependency)."""

@@ -3,6 +3,7 @@
 import logging
 from pathlib import Path
 
+from datagrunt.core.pdf_io.extraction._doc_session import _ThreadLocalDocSession
 from datagrunt.core.pdf_io.extraction.shapes import BBox, TableBlock
 
 logger = logging.getLogger(__name__)
@@ -17,8 +18,10 @@ def _import_pdfplumber():
     return pdfplumber
 
 
-class PdfPlumberTableExtractor:
+class PdfPlumberTableExtractor(_ThreadLocalDocSession):
     """Detect and extract tables on a page using pdfplumber."""
+
+    _lazy_open = True
 
     def __init__(self, filepath):
         """Store the path.
@@ -31,48 +34,25 @@ class PdfPlumberTableExtractor:
 
         self._local = threading.local()
 
-    def __enter__(self):
+    def _open_resource(self):
         # Mark a held-open scope but defer the pdfplumber.open() until a page
         # actually needs tables. Text-only documents (no line drawings, has a
         # text layer) never call extract(), so they must never pay for opening
         # pdfplumber. The shared handle is opened lazily on first extract() and
         # closed when the outermost scope exits.
-        if not hasattr(self._local, "depth"):
-            self._local.depth = 0
-            self._local.pdf = None
-        self._local.depth += 1
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self._local.depth -= 1
-        if self._local.depth == 0:
-            if getattr(self._local, "pdf", None):
-                self._local.pdf.close()
-            self._local.pdf = None
-
-    def _get_pdf(self):
-        # Inside a held-open scope (depth > 0) the handle is opened once and
-        # cached for the scope; __exit__ owns closing it. Outside a scope it is
-        # opened transiently and the caller closes it.
-        if getattr(self._local, "pdf", None):
-            return self._local.pdf, False
         pdfplumber = _import_pdfplumber()
         try:
-            pdf = pdfplumber.open(self.filepath)
+            return pdfplumber.open(self.filepath)
         except Exception:  # noqa: BLE001 - pdfplumber raises many types; tables are best-effort
             logger.debug("pdfplumber.open failed for %s; skipping table extraction", self.filepath, exc_info=True)
-            return None, False
-        if getattr(self._local, "depth", 0) > 0:
-            self._local.pdf = pdf
-            return pdf, False
-        return pdf, True
+            return None
 
     def extract(self, page_number: int) -> list:
         """Return ``TableBlock`` objects on ``page_number`` (0-indexed).
 
         Returns an empty list on open/parse failure or out-of-range page (soft).
         """
-        pdf, should_close = self._get_pdf()
+        pdf, should_close = self._get_doc()
         if not pdf:
             return []
         try:

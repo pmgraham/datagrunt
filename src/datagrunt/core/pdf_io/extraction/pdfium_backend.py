@@ -1,5 +1,6 @@
 """pdfium-backed extraction backend (structured/unified schema)."""
 
+from datagrunt.core.pdf_io.extraction._doc_session import _ThreadLocalDocSession
 from datagrunt.core.pdf_io.extraction.base import ExtractionBackend
 from datagrunt.core.pdf_io.extraction.ocr import ocr_data_to_blocks
 from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
@@ -7,7 +8,7 @@ from datagrunt.core.pdf_io.extraction.shapes import PageAnalysis
 from datagrunt.core.pdf_io.extraction.text_block_builder import TextBlockBuilder
 
 
-class PdfiumBackend(ExtractionBackend):
+class PdfiumBackend(_ThreadLocalDocSession, ExtractionBackend):
     """Extraction via pypdfium2: text objects, images, and pdfium-rendered OCR."""
 
     def __init__(self, filepath):
@@ -16,25 +17,8 @@ class PdfiumBackend(ExtractionBackend):
 
         self._local = threading.local()
 
-    def __enter__(self):
-        if not hasattr(self._local, "depth"):
-            self._local.depth = 0
-        if self._local.depth == 0:
-            self._local.doc = PdfiumDocument(self.filepath)
-        self._local.depth += 1
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self._local.depth -= 1
-        if self._local.depth == 0:
-            if hasattr(self._local, "doc") and self._local.doc:
-                self._local.doc.close()
-                self._local.doc = None
-
-    def _get_doc(self):
-        if hasattr(self._local, "doc") and self._local.doc:
-            return self._local.doc, False
-        return PdfiumDocument(self.filepath), True
+    def _open_resource(self):
+        return PdfiumDocument(self.filepath)
 
     def analyze_page(self, page_number: int) -> PageAnalysis:
         """Return page metadata (raises if the page/file is invalid)."""
