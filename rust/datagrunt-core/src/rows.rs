@@ -340,4 +340,22 @@ mod tests {
         assert_eq!(p.first_row.chars().count(), MAX_LINE_CHARS);
         assert_eq!(p.sample_lines[0].chars().count(), MAX_LINE_CHARS);
     }
+
+    /// Parity-class lock: a giant line of a leading invalid byte + all-4-byte
+    /// chars. The probe budgets on the DECODED stream (DecodedReader drops the
+    /// invalid byte before the byte budget), so 8 MiB of decoded 4-byte chars is
+    /// exactly MAX_LINE_CHARS chars — matching Python's decode-then-slice. This
+    /// guards the probe path against the raw-vs-decoded-budget bug class that was
+    /// fixed in io.rs (the probe was already correct via DecodedReader; this keeps
+    /// it that way). A pure (undelimited) case can't live in the shared parity
+    /// corpus because Python's csv.field_size_limit would trip in row-count parity.
+    #[test]
+    fn probe_giant_4byte_with_leading_invalid_byte_yields_full_char_cap() {
+        let mut content: Vec<u8> = vec![0xff];
+        content.extend_from_slice("\u{1F600}".repeat(MAX_LINE_CHARS + 50).as_bytes());
+        let f = tmp(&content);
+        let p = probe_csv_header(f.path()).unwrap();
+        assert_eq!(p.first_row.chars().count(), MAX_LINE_CHARS);
+        assert_eq!(p.sample_lines[0].chars().count(), MAX_LINE_CHARS);
+    }
 }
