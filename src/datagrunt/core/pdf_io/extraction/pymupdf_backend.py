@@ -6,7 +6,7 @@ from datagrunt.core.pdf_io.extraction.base import ExtractionBackend
 from datagrunt.core.pdf_io.extraction.ocr import ocr_data_to_blocks
 from datagrunt.core.pdf_io.extraction.pdfium_document import ENCRYPTED_PDF_MESSAGE
 from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, PageAnalysis, TextBlock
-from datagrunt.core.pdf_io.extraction.text_block_builder import classify_font_size
+from datagrunt.core.pdf_io.extraction.text_block_builder import classify_by_median, page_median_size
 
 logger = logging.getLogger(__name__)
 
@@ -118,9 +118,10 @@ class PyMuPDFBackend(ExtractionBackend):
                 for span in line.get("spans", [])
                 if span["text"].strip()
             ]
+            median_size = page_median_size(all_sizes)
             blocks = []
             for order, block in enumerate(raw_blocks):
-                tb = self._build_block(block, all_sizes, order)
+                tb = self._build_block(block, median_size, order)
                 if tb is not None:
                     blocks.append(tb)
             return blocks
@@ -128,7 +129,7 @@ class PyMuPDFBackend(ExtractionBackend):
             if should_close:
                 doc.close()
 
-    def _build_block(self, block: dict, all_sizes: list, order: int):
+    def _build_block(self, block: dict, median_size, order: int):
         """Reduce one pymupdf block dict to a TextBlock (or None if empty)."""
         texts, fonts, sizes, bolds, italics = [], [], [], [], []
         for line in block.get("lines", []):
@@ -153,7 +154,7 @@ class PyMuPDFBackend(ExtractionBackend):
             font_size=round(dominant_size, 1),
             is_bold=is_bold,
             is_italic=any(italics),
-            classification=classify_font_size(round(dominant_size, 1), is_bold, all_sizes),
+            classification=classify_by_median(round(dominant_size, 1), median_size),
             reading_order=order,
         )
 
