@@ -47,11 +47,11 @@ jobs:
           DATAGRUNT_DISABLE_RUST: "1"
         run: .venv/bin/pytest tests/ -q
 
-      - name: ruff (owned dirs — blocking)
-        run: .venv/bin/ruff check src/datagrunt/core/csv_io
+      - name: ruff lint (src + tests — blocking)
+        run: .venv/bin/ruff check src tests
 
-      - name: ruff (full src — informational)
-        run: .venv/bin/ruff check src/datagrunt || true
+      - name: ruff format check (blocking)
+        run: .venv/bin/ruff format --check .
 
   build:
     name: wheel matrix
