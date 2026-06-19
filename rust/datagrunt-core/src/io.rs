@@ -12,7 +12,7 @@ const CHUNK_SIZE: usize = 64 * 1024;
 pub const MAX_LINE_CHARS: usize = 2 * 1024 * 1024;
 /// Byte read bound: 4x the char cap (UTF-8 is ≤4 bytes/char), so the char cap
 /// is always the binding limit and memory stays bounded.
-const MAX_LINE_READ_BYTES: usize = MAX_LINE_CHARS * 4;
+pub const MAX_LINE_READ_BYTES: usize = MAX_LINE_CHARS * 4;
 
 /// Truncate `s` to at most `n` Unicode scalar values (chars).
 ///
@@ -42,6 +42,38 @@ pub fn decode_ignore(bytes: &[u8]) -> String {
                 // tail, so consuming all of it is correct.
                 let skip = e.error_len().unwrap_or(after.len());
                 rest = &after[skip..];
+            }
+        }
+    }
+    out
+}
+
+/// Decode bytes with errors="ignore", carrying any incomplete trailing
+/// multibyte sequence into `carry` for the next call (boundary-safe).
+/// Truly-invalid bytes are dropped. Used by the cap accumulation loop in
+/// `UniversalLines::next_line` to avoid splitting multibyte chars at chunk
+/// boundaries while streaming through a giant line.
+fn decode_chunk_with_carry(bytes: &[u8], carry: &mut Vec<u8>) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                out.push_str(s);
+                break;
+            }
+            Err(e) => {
+                let (valid, after) = rest.split_at(e.valid_up_to());
+                // SAFETY: `from_utf8` validated `0..valid_up_to()`.
+                out.push_str(unsafe { std::str::from_utf8_unchecked(valid) });
+                match e.error_len() {
+                    Some(skip) => rest = &after[skip..], // truly invalid: drop
+                    None => {
+                        // Incomplete multibyte sequence at chunk boundary: carry forward.
+                        carry.extend_from_slice(after);
+                        break;
+                    }
+                }
             }
         }
     }
@@ -420,13 +452,66 @@ impl UniversalLines {
             self.fill()?;
             // Cap: if we've buffered more than MAX_LINE_READ_BYTES without
             // finding a newline, emit the capped line and stream-skip the rest.
-            // This prevents unbounded allocation on malformed newline-free files.
+            // Budget on DECODED chars (not raw bytes) for parity with Python's
+            // `decode(errors="ignore"); line[:MAX_LINE_CHARS]`. An all-invalid
+            // byte stream never accumulates MAX_LINE_CHARS chars, but raw bytes
+            // are drained as we go, keeping memory bounded.
             let unread = self.buf.len() - self.pos;
             if unread >= MAX_LINE_READ_BYTES {
-                let cap_end = self.pos + MAX_LINE_READ_BYTES;
-                let raw = decode_ignore(&self.buf[self.pos..cap_end]);
-                let line = take_chars(&raw, MAX_LINE_CHARS);
-                self.pos = cap_end;
+                let mut line = String::with_capacity(MAX_LINE_CHARS * 4);
+                let mut decoded_char_count: usize = 0;
+                let mut carry: Vec<u8> = Vec::new();
+
+                while decoded_char_count < MAX_LINE_CHARS {
+                    // Drain already-processed bytes to keep memory bounded.
+                    if self.pos > 0 {
+                        self.buf.drain(..self.pos);
+                        self.pos = 0;
+                    }
+                    if self.buf.is_empty() {
+                        if self.eof {
+                            break;
+                        }
+                        self.fill()?;
+                        if self.buf.is_empty() {
+                            break;
+                        }
+                    }
+                    // Scan for newline so we don't over-read past the line end.
+                    let scan_end = self.buf.len().min(CHUNK_SIZE);
+                    let nl_pos = self.buf[..scan_end]
+                        .iter()
+                        .position(|&b| b == b'\n' || b == b'\r');
+                    let chunk_end = nl_pos.unwrap_or(scan_end);
+
+                    // Prepend any incomplete multibyte carry from previous chunk.
+                    let to_decode: Vec<u8> = if carry.is_empty() {
+                        self.buf[..chunk_end].to_vec()
+                    } else {
+                        let mut v = std::mem::take(&mut carry);
+                        v.extend_from_slice(&self.buf[..chunk_end]);
+                        v
+                    };
+
+                    let decoded = decode_chunk_with_carry(&to_decode, &mut carry);
+                    let need = MAX_LINE_CHARS - decoded_char_count;
+                    let added: String = decoded.chars().take(need).collect();
+                    decoded_char_count += added.chars().count();
+                    line.push_str(&added);
+                    self.pos = chunk_end;
+
+                    // If we hit a newline mid-scan, stop accumulating — let
+                    // skip_to_next_line handle the terminator.
+                    if nl_pos.is_some() {
+                        break;
+                    }
+                }
+                // Drain remaining processed bytes before skip.
+                if self.pos > 0 {
+                    self.buf.drain(..self.pos);
+                    self.pos = 0;
+                }
+                // carry holds an incomplete multibyte seq — drop it (errors="ignore").
                 self.skip_to_next_line()?;
                 return Ok(Some(line));
             }
@@ -897,5 +982,59 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].chars().count(), MAX_LINE_CHARS);
         assert_eq!(lines[1], "after_giant");
+    }
+
+    /// Invalid bytes followed by 4-byte chars (😀): the cap branch must yield
+    /// exactly MAX_LINE_CHARS decoded chars, not MAX_LINE_CHARS minus the number
+    /// of dropped invalid bytes. Reproduces the raw-byte-budget parity bug.
+    #[test]
+    fn cap_invalid_bytes_then_4byte_chars_parity() {
+        let four_byte: &[u8] = "😀".as_bytes(); // 4 bytes per char
+        let n = MAX_LINE_CHARS + 50;
+        let mut content = vec![0xFF_u8]; // 1 invalid byte (dropped on decode)
+        for _ in 0..n {
+            content.extend_from_slice(four_byte);
+        }
+        // No newline: cap + EOF path fires.
+        let f = tmp(&content, ".csv");
+        let lines = read_universal_lines(f.path()).unwrap();
+        assert_eq!(lines.len(), 1, "should yield exactly one line");
+        assert_eq!(
+            lines[0].chars().count(),
+            MAX_LINE_CHARS,
+            "must yield exactly MAX_LINE_CHARS decoded chars (not MAX_LINE_CHARS - dropped_bytes)"
+        );
+    }
+
+    /// All-invalid-byte input with no newline must terminate with bounded memory
+    /// and yield an empty or very short result (all bytes dropped on decode).
+    #[test]
+    fn cap_all_invalid_bytes_no_newline_bounded_and_completes() {
+        let content: Vec<u8> = vec![0xFF; MAX_LINE_READ_BYTES + 100];
+        let f = tmp(&content, ".csv");
+        let lines = read_universal_lines(f.path()).unwrap();
+        assert!(
+            lines.is_empty() || (lines.len() == 1 && lines[0].is_empty()),
+            "all-invalid no-newline: expected 0 or 1 empty line, got {:?}",
+            lines
+        );
+    }
+
+    /// Invalid byte + 4-byte chars giant line followed by a normal line:
+    /// after capping, the next line must still read correctly.
+    #[test]
+    fn cap_invalid_bytes_4byte_chars_then_next_line() {
+        let four_byte: &[u8] = "😀".as_bytes();
+        let n = MAX_LINE_CHARS + 50;
+        let mut content = vec![0xFF_u8];
+        for _ in 0..n {
+            content.extend_from_slice(four_byte);
+        }
+        content.extend_from_slice(b"\nnext_line_ok\n");
+        let f = tmp(&content, ".csv");
+        let lines = read_universal_lines(f.path()).unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].chars().count(), MAX_LINE_CHARS);
+        assert_eq!(lines[1], "next_line_ok");
     }
 }

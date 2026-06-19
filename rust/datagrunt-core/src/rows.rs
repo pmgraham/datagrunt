@@ -2,15 +2,10 @@
 
 use crate::io::{
     decode_ignore, is_empty, is_legacy_mac_newlines, take_chars, universal_lines, DecodedReader,
-    MAX_LINE_CHARS,
+    MAX_LINE_CHARS, MAX_LINE_READ_BYTES,
 };
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
-
-/// Byte read bound for probe_csv_header: 4x the char cap (UTF-8 ≤4 bytes/char),
-/// matching io.rs MAX_LINE_READ_BYTES. Prevents unbounded `segment` growth on
-/// malformed newline-free files.
-const MAX_LINE_READ_BYTES: usize = MAX_LINE_CHARS * 4;
 
 // ---- probe_csv_header constants ----
 /// Python CANDIDATE_SAMPLE_ROWS = 5.

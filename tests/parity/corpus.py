@@ -84,4 +84,25 @@ CORPUS: dict[str, bytes] = {
     #     After capping the giant line, the next line must still be read
     #     correctly — validates stream-skip alignment for both backends.
     "giant_crlf_line.csv": b"b," * 1_126_400 + b"\r\nnext_line\n",
+    # (d) Giant line with a LEADING invalid UTF-8 byte followed by a long run
+    #     of comma-delimited 4-byte chars (😀). Repro for the raw-byte-budget
+    #     bug: the leading \xff is dropped by errors="ignore", so a byte-budgeted
+    #     decoder yields MAX_LINE_CHARS-1 chars while Python decodes the whole
+    #     line then slices [:MAX_LINE_CHARS]. Both backends must yield exactly
+    #     MAX_LINE_CHARS decoded chars (budget on DECODED chars, not raw bytes).
+    #
+    #     Uses a comma-delimited "😀," pattern (each field is a single 😀, well
+    #     under CPython's csv field-size limit — the cap is per physical line,
+    #     not per field). 1_800_000 reps = 9,000,000 raw bytes (> 8 MiB
+    #     MAX_LINE_READ_BYTES, so the streaming cap branch fires) and 3,600,000
+    #     decoded chars (> 2 Mi MAX_LINE_CHARS).
+    "giant_invalid_leading_byte.csv": (
+        b"\xff" + "😀,".encode("utf-8") * 1_800_000 + b"\n"
+    ),
+    # (e) Same shape as (d) but WITHOUT the leading invalid byte: no dropped
+    #     bytes. Both backends must still yield exactly MAX_LINE_CHARS chars —
+    #     verifies the fix does not regress clean 4-byte-char giant lines.
+    "giant_4byte_chars_no_invalid.csv": (
+        "😀,".encode("utf-8") * 1_800_000 + b"\n"
+    ),
 }
