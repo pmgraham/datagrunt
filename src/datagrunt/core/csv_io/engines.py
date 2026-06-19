@@ -254,28 +254,14 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
     """
 
     def get_sample(self, normalize_columns=None):
-        """
-        Return a sample of the CSV file.
-
-        Args:
-            normalize_columns (bool or None): Whether to normalize column
-            names. ``None`` (default) inherits the instance-level setting.
-
-        Returns:
-            A Polars DataFrame containing the sample rows.
-        """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
-        # sample_dataframe streams the first rows (no full-table import) and
-        # returns a materialized Polars frame, so the per-call connection can
-        # be released deterministically rather than waiting on garbage
-        # collection.
-        try:
-            return self.queries.sample_dataframe(
-                CSVEngineProperties.dataframe_sample_rows,
-                normalize_columns,
-            )
-        finally:
-            self.queries.close()
+        # The engine is cached on the CSVReader, so the streaming-sample
+        # connection is reused by later reads and released when the reader is
+        # collected (or via the optional close()/`with`). datagrunt manages this.
+        return self.queries.sample_dataframe(
+            CSVEngineProperties.dataframe_sample_rows,
+            normalize_columns,
+        )
 
     def to_dataframe(self, normalize_columns=None):
         """
@@ -289,11 +275,9 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
             A Polars dataframe.
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
-        # Materialize fully (.pl()) before closing the per-call connection.
-        try:
-            return self.queries.create_table(normalize_columns).pl()
-        finally:
-            self.queries.close()
+        # Keep the import alive on the cached engine so a follow-up read/query
+        # reuses it; released on GC (or the optional close()).
+        return self.queries.create_table(normalize_columns).pl()
 
     def to_arrow_table(self, normalize_columns=None):
         """
@@ -307,14 +291,12 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
             A PyArrow table.
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
-        # Materialize into an in-memory pa.Table before closing the connection.
-        try:
-            result = self.queries.create_table(normalize_columns).arrow()
-            if isinstance(result, pa.Table):
-                return result
-            return result.read_all()
-        finally:
-            self.queries.close()
+        # Keep the import alive on the cached engine for follow-up reads/queries;
+        # released on GC (or the optional close()).
+        result = self.queries.create_table(normalize_columns).arrow()
+        if isinstance(result, pa.Table):
+            return result
+        return result.read_all()
 
     def to_dicts(self, normalize_columns=None):
         """
