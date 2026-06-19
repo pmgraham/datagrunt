@@ -3,9 +3,6 @@ Module for reading CSV files and converting to different in memory python
 objects.
 """
 
-# standard library
-from pathlib import Path
-
 # third party libraries
 import polars as pl
 import pyarrow as pa
