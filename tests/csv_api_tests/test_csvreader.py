@@ -435,7 +435,7 @@ class TestCSVReaderContextManager:
         reader = CSVReader(self._csv(tmp_path), engine="duckdb")
         with reader:
             reader.query_data(f"SELECT * FROM {reader.db_table}")
-            engine = reader.__dict__["_reader"]
+            engine = reader.__dict__["_engine"]
             assert engine.queries._connection is not None
         assert engine.queries._connection is None
 
@@ -446,13 +446,13 @@ class TestCSVReaderContextManager:
             with reader:
                 reader.query_data(f"SELECT * FROM {reader.db_table}")
                 raise ValueError("boom")
-        assert reader.__dict__["_reader"].queries._connection is None
+        assert reader.__dict__["_engine"].queries._connection is None
 
     def test_close_does_not_build_engine_when_unused(self, tmp_path):
         """close() on a reader that ran no operation must not create the engine."""
         reader = CSVReader(self._csv(tmp_path), engine="duckdb")
         reader.close()
-        assert "_reader" not in reader.__dict__
+        assert "_engine" not in reader.__dict__
 
     def test_reader_usable_after_close(self, tmp_path):
         """The reader stays usable after the block: a later query reopens."""
@@ -486,7 +486,7 @@ class TestCSVReaderContextManager:
         reader = CSVReader(sample_csv, engine="duckdb")
         reader.to_dataframe()
         # Connection stays open after a materializing read (no per-call close).
-        assert reader.__dict__["_reader"].queries._connection is not None
+        assert reader.__dict__["_engine"].queries._connection is not None
         reader.to_arrow_table()
         reader.query_data(f"SELECT * FROM {reader.db_table} LIMIT 1")
 
