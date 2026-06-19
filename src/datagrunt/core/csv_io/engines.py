@@ -254,6 +254,16 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
     """
 
     def get_sample(self, normalize_columns=None):
+        """
+        Return a sample of the CSV as a Polars DataFrame.
+
+        Args:
+            normalize_columns (bool or None): Whether to normalize column
+            names. ``None`` (default) inherits the instance-level setting.
+
+        Returns:
+            A Polars DataFrame containing the sample rows.
+        """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         # The engine is cached on the CSVReader, so the streaming-sample
         # connection is reused by later reads and released when the reader is
