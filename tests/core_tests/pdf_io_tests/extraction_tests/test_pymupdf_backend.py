@@ -90,3 +90,45 @@ class TestPyMuPDFBackend:
         assert (round(blue.bbox.x, 1), round(blue.bbox.y, 1)) == blue_corner
         assert (round(green.bbox.x, 1), round(green.bbox.y, 1)) == green_corner
         assert all(im.bbox.w > 0 and im.bbox.h > 0 for im in images)
+
+
+def test_pymupdf_extract_page_matches_primitives(sample_pdf):
+    """Single-pass extract_page returns the same analysis/text/images as the
+    three primitives called separately."""
+    from datagrunt.core.pdf_io.extraction.pymupdf_backend import PyMuPDFBackend
+
+    backend = PyMuPDFBackend(sample_pdf)
+    with backend:
+        analysis, text_blocks, images = backend.extract_page(0)
+        assert analysis == backend.analyze_page(0)
+        assert text_blocks == backend.extract_text_blocks(0)
+        assert images == backend.extract_images(0)
+    assert text_blocks and images  # sanity: sample_pdf has both
+
+
+def test_pymupdf_extract_page_parses_page_once(sample_pdf, monkeypatch):
+    """extract_page must not re-parse: at most two get_text calls (dict + text)
+    and exactly one get_images call, versus three/two in the old path."""
+    import pymupdf
+    from datagrunt.core.pdf_io.extraction.pymupdf_backend import PyMuPDFBackend
+
+    counts = {"get_text": 0, "get_images": 0}
+    orig_text, orig_images = pymupdf.Page.get_text, pymupdf.Page.get_images
+
+    def spy_text(self, *a, **k):
+        counts["get_text"] += 1
+        return orig_text(self, *a, **k)
+
+    def spy_images(self, *a, **k):
+        counts["get_images"] += 1
+        return orig_images(self, *a, **k)
+
+    monkeypatch.setattr(pymupdf.Page, "get_text", spy_text)
+    monkeypatch.setattr(pymupdf.Page, "get_images", spy_images)
+
+    backend = PyMuPDFBackend(sample_pdf)
+    with backend:
+        backend.extract_page(0)
+
+    assert counts["get_text"] <= 2
+    assert counts["get_images"] == 1
