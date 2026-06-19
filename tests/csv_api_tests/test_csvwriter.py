@@ -195,3 +195,26 @@ class TestCSVWriter:
         new_timestamp = Path(out_file).stat().st_mtime
 
         assert new_timestamp > original_timestamp
+
+    def test_duckdb_writer_imports_once_across_formats(self, sample_csv, tmp_path, monkeypatch):
+        """Exporting one DuckDB CSVWriter to several formats imports the source once."""
+        from datagrunt.core import DuckDBQueries
+
+        calls = {"n": 0}
+        original = DuckDBQueries.import_csv_query
+
+        def spy(self, *args, **kwargs):
+            calls["n"] += 1
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(DuckDBQueries, "import_csv_query", spy)
+
+        writer = CSVWriter(sample_csv, engine="duckdb")
+        writer.write_csv(str(tmp_path / "out.csv"))
+        writer.write_json(str(tmp_path / "out.json"))
+        writer.write_parquet(str(tmp_path / "out.parquet"))
+
+        assert calls["n"] == 1
+        assert (tmp_path / "out.csv").exists()
+        assert (tmp_path / "out.json").exists()
+        assert (tmp_path / "out.parquet").exists()

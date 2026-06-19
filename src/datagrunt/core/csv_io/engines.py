@@ -495,13 +495,10 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.csv_export_filename, export_filename)
-        # COPY executes eagerly on .sql(), so the file is written before close()
-        # releases the per-call connection.
-        try:
-            self.queries.create_table(normalize_columns)
-            self.queries.connection.sql(self.queries.export_csv_query(filename))
-        finally:
-            self.queries.close()
+        # COPY executes eagerly on .sql(); the import stays on the cached engine
+        # so multi-format export reuses it (released on GC, not per call).
+        self.queries.create_table(normalize_columns)
+        self.queries.connection.sql(self.queries.export_csv_query(filename))
 
     def write_excel(self, export_filename=None, normalize_columns=None):
         """
@@ -514,12 +511,9 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.excel_export_filename, export_filename)
-        try:
-            self.queries.create_table(normalize_columns)
-            self.queries.load_spatial_extension(self.queries.connection)
-            self.queries.connection.sql(self.queries.export_excel_query(filename))
-        finally:
-            self.queries.close()
+        self.queries.create_table(normalize_columns)
+        self.queries.load_spatial_extension(self.queries.connection)
+        self.queries.connection.sql(self.queries.export_excel_query(filename))
 
     def write_json(self, export_filename=None, normalize_columns=None):
         """
@@ -532,11 +526,8 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.json_export_filename, export_filename)
-        try:
-            self.queries.create_table(normalize_columns)
-            self.queries.connection.sql(self.queries.export_json_query(filename))
-        finally:
-            self.queries.close()
+        self.queries.create_table(normalize_columns)
+        self.queries.connection.sql(self.queries.export_json_query(filename))
 
     def write_json_newline_delimited(self, export_filename=None, normalize_columns=None):
         """
@@ -549,11 +540,8 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.json_newline_export_filename, export_filename)
-        try:
-            self.queries.create_table(normalize_columns)
-            self.queries.connection.sql(self.queries.export_json_newline_delimited_query(filename))
-        finally:
-            self.queries.close()
+        self.queries.create_table(normalize_columns)
+        self.queries.connection.sql(self.queries.export_json_newline_delimited_query(filename))
 
     def write_parquet(self, export_filename=None, normalize_columns=None):
         """
@@ -566,11 +554,8 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.parquet_export_filename, export_filename)
-        try:
-            self.queries.create_table(normalize_columns)
-            self.queries.connection.sql(self.queries.export_parquet_query(filename))
-        finally:
-            self.queries.close()
+        self.queries.create_table(normalize_columns)
+        self.queries.connection.sql(self.queries.export_parquet_query(filename))
 
 
 class CSVWriterPolarsEngine(CSVBaseWriterEngine):

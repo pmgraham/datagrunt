@@ -1,6 +1,7 @@
 """Module for writing CSV files and converting to different file formats."""
 
 # standard library
+from functools import cached_property
 from pathlib import Path
 
 # third party libraries
@@ -52,14 +53,26 @@ class CSVWriter(CSVComponents):
         self.engine = engine.lower().replace(" ", "")
         CSVEngineFactory.validate_engine(self.engine)
 
-    def _create_writer(self):
-        """Create a writer object."""
+    @cached_property
+    def _writer(self):
+        """Return this writer's engine, built once and reused.
+
+        Caching it means exporting one ``CSVWriter`` to several formats reuses a
+        single import instead of rebuilding the engine and re-importing the
+        source for every format. The engine owns the DuckDB connection; it is
+        released when the writer is garbage-collected. (Parallels
+        ``CSVReader._reader``; the two are unified in issue #209.)
+        """
         return CSVEngineFactory(
             self.filepath,
             self.engine,
             lenient=self.lenient,
             normalize_columns=self.normalize_columns,
         ).create_writer()
+
+    def _create_writer(self):
+        """Return this writer's cached engine (back-compat delegator)."""
+        return self._writer
 
     def _write_empty_output(self, default_filename, out_filename=None):
         """Write a truly empty output file for an empty/blank source.
