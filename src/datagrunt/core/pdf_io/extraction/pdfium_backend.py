@@ -60,6 +60,44 @@ class PdfiumBackend(ExtractionBackend):
             if should_close:
                 doc.close()
 
+    def extract_page(self, page_number: int, output_dir: str = None, name_prefix: str = "page") -> tuple:
+        """Parse the page once (single pdfium page/textpage open), returning
+        analysis + text blocks + images, instead of opening the page three times.
+        """
+        doc, should_close = self._get_doc()
+        try:
+            with doc.page(page_number) as page:
+                width, height = page.size()
+                text = page.full_text().strip()
+                text_objs, image_objs = page.count_objects()
+                has_text = len(text) > 0
+                analysis = PageAnalysis(
+                    width=float(width),
+                    height=float(height),
+                    rotation=page.rotation(),
+                    has_text_layer=has_text,
+                    is_scanned=(not has_text and image_objs > 0),
+                    text_block_count=text_objs,
+                    image_count=image_objs,
+                    image_block_count=image_objs,
+                    has_line_drawings=page.has_paths(),
+                    text_length=len(text),
+                )
+                text_blocks = []
+                if has_text:
+                    text_blocks = TextBlockBuilder().build(list(page.text_items()))
+                images = []
+                if image_objs > 0:
+                    images = list(
+                        page.image_items(
+                            output_dir=output_dir, name_prefix=name_prefix, page_number=page_number
+                        )
+                    )
+                return analysis, text_blocks, images
+        finally:
+            if should_close:
+                doc.close()
+
     def extract_text_blocks(self, page_number: int) -> list:
         """Return classified text blocks built from pdfium text objects."""
         doc, should_close = self._get_doc()
