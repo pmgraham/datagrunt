@@ -16,8 +16,8 @@ def _item(text, y, size, x0=10.0):
 
 def test_classify_font_size_header_vs_body():
     sizes = [11.0, 11.0, 11.0, 24.0]
-    assert classify_font_size(24.0, False, sizes) == "header"
-    assert classify_font_size(11.0, False, sizes) == "body_text"
+    assert classify_font_size(24.0, sizes) == "header"
+    assert classify_font_size(11.0, sizes) == "body_text"
 
 
 def test_builder_groups_and_classifies():
@@ -71,7 +71,7 @@ def test_classify_by_median_equivalent_to_classify_font_size():
     sizes = [10.0, 11.0, 11.0, 12.0, 24.0]
     median = page_median_size(sizes)
     for fs in (8.0, 11.0, 14.0, 24.0):
-        assert classify_by_median(fs, median) == classify_font_size(fs, False, sizes)
+        assert classify_by_median(fs, median) == classify_font_size(fs, sizes)
 
 
 def test_classify_by_median_empty_is_body_text():

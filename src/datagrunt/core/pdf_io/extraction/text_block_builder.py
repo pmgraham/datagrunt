@@ -47,13 +47,12 @@ def classify_by_median(font_size: float, median_size) -> str:
     return "body_text"
 
 
-def classify_font_size(font_size: float, is_bold: bool, all_sizes: list) -> str:
+def classify_font_size(font_size: float, all_sizes: list) -> str:
     """Classify a block by font size relative to the page's size distribution.
 
-    Back-compat wrapper retained for callers that pass the raw size list; the
-    hot extraction paths precompute the median once via ``page_median_size``
-    and call ``classify_by_median`` directly. ``is_bold`` is accepted for
-    signature compatibility and not used in the thresholds.
+    Wrapper retained for callers that pass the raw size list; the hot
+    extraction paths precompute the median once via ``page_median_size``
+    and call ``classify_by_median`` directly.
     """
     return classify_by_median(font_size, page_median_size(all_sizes))
 
