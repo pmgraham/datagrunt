@@ -1,6 +1,9 @@
 //! Ports of CSVRows probes and the leading-line counters.
 
-use crate::io::{is_empty, is_legacy_mac_newlines, take_chars, universal_lines, DecodedReader, MAX_LINE_CHARS};
+use crate::io::{
+    decode_ignore, is_empty, is_legacy_mac_newlines, take_chars, universal_lines, DecodedReader,
+    MAX_LINE_CHARS,
+};
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 
@@ -106,9 +109,13 @@ pub fn probe_csv_header(path: &Path) -> std::io::Result<HeaderProbe> {
         if total_read == 0 && !found_newline {
             break; // EOF
         }
-        // DecodedReader yields valid UTF-8 only; apply char cap for parity.
-        let raw =
-            String::from_utf8(std::mem::take(&mut segment)).expect("DecodedReader yields UTF-8");
+        // Decode with `decode_ignore` (not `from_utf8`): the byte-cap path above
+        // can stop mid-multibyte-char at MAX_LINE_READ_BYTES, leaving an
+        // incomplete trailing sequence in `segment`. `decode_ignore` drops it
+        // (matching io.rs and Python's errors="ignore"), so a malformed
+        // newline-free file cannot panic across the PyO3 boundary. Then apply
+        // the char cap for parity with the Python reference.
+        let raw = decode_ignore(&segment);
         let text = take_chars(&raw, MAX_LINE_CHARS);
         // `stripped` mirrors Python's `line.strip()`.
         let stripped = text.trim();
@@ -319,5 +326,23 @@ mod tests {
         assert_eq!(p.sample_lines[0], "\n"); // the blank line
         assert_eq!(p.sample_lines[1], "name,age\n");
         assert_eq!(p.sample_lines[2], "Alice,30\n");
+    }
+
+    /// Regression (panic-DoS): a newline-free line whose bytes exceed
+    /// MAX_LINE_READ_BYTES with a multibyte char straddling the byte cap must
+    /// NOT panic. The byte-cap chop leaves an incomplete UTF-8 sequence in the
+    /// buffer; `decode_ignore` drops it instead of `from_utf8` panicking across
+    /// the PyO3 boundary.
+    #[test]
+    fn probe_multibyte_straddling_byte_cap_does_not_panic() {
+        // (MAX_LINE_READ_BYTES - 1) ASCII bytes + '€' (3 bytes): the byte cap at
+        // MAX_LINE_READ_BYTES slices the first byte of '€', leaving an incomplete
+        // sequence. No trailing newline (pure #222 scenario).
+        let mut content: Vec<u8> = b"a".repeat(MAX_LINE_READ_BYTES - 1);
+        content.extend_from_slice("€".as_bytes());
+        let f = tmp(&content);
+        let p = probe_csv_header(f.path()).unwrap(); // must not panic
+        assert_eq!(p.first_row.chars().count(), MAX_LINE_CHARS);
+        assert_eq!(p.sample_lines[0].chars().count(), MAX_LINE_CHARS);
     }
 }
