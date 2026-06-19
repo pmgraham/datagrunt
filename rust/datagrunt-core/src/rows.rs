@@ -1,8 +1,96 @@
 //! Ports of CSVRows probes and the leading-line counters.
 
-use crate::io::{is_legacy_mac_newlines, universal_lines, DecodedReader};
-use std::io;
+use crate::io::{is_empty, is_legacy_mac_newlines, universal_lines, DecodedReader};
+use std::io::{self, BufRead, BufReader};
 use std::path::Path;
+
+// ---- probe_csv_header constants ----
+/// Python CANDIDATE_SAMPLE_ROWS = 5.
+const CANDIDATE_SAMPLE_ROWS: usize = 5;
+/// Python CSV_SNIFF_SAMPLE_ROWS = 5.
+const SNIFF_SAMPLE_ROWS: usize = 5;
+
+/// Result of a single-pass header probe: the five values both delimiter
+/// and dialect inference need.
+pub struct HeaderProbe {
+    pub empty: bool,
+    pub blank: bool,
+    pub first_row: String,
+    pub sample_rows: Vec<String>,
+    pub sample_lines: Vec<String>,
+}
+
+/// Single-pass header probe — mirrors `_compute_python.probe_csv_header` exactly.
+///
+/// `sample_rows` = stripped non-blank non-comment rows, capped at
+/// `CANDIDATE_SAMPLE_ROWS` (== Python `leading_rows(CANDIDATE_SAMPLE_ROWS)`).
+///
+/// `sample_lines` = raw non-comment lines with their original line terminator
+/// preserved (blanks kept), capped at `SNIFF_SAMPLE_ROWS`.  Uses
+/// `BufReader::read_until(b'\n')` over a `DecodedReader` (universal-newline
+/// translation on, matching Python text mode) so the trailing `\n` is included
+/// when present and omitted on the final line of a file with no trailing
+/// newline — exactly mirroring Python's `for line in f:`.
+///
+/// `first_row` = `sample_rows[0]` or `""`.
+/// `blank`     = no non-whitespace byte seen (single-pass `saw_nonblank`).
+/// `empty`     = `io::is_empty` fast-path; returns `blank: false` to match Python.
+pub fn probe_csv_header(path: &Path) -> std::io::Result<HeaderProbe> {
+    if is_empty(path)? {
+        return Ok(HeaderProbe {
+            empty: true,
+            blank: false,
+            first_row: String::new(),
+            sample_rows: Vec::new(),
+            sample_lines: Vec::new(),
+        });
+    }
+    // Universal-newline translation on (translate=true) matches Python text mode.
+    let mut reader = BufReader::new(DecodedReader::open(path, true)?);
+    let mut sample_lines: Vec<String> = Vec::new();
+    let mut sample_rows: Vec<String> = Vec::new();
+    let mut saw_nonblank = false;
+    let mut segment: Vec<u8> = Vec::new();
+    loop {
+        segment.clear();
+        let n = reader.read_until(b'\n', &mut segment)?;
+        if n == 0 {
+            break; // EOF
+        }
+        // DecodedReader yields valid UTF-8 only.
+        let text =
+            String::from_utf8(std::mem::take(&mut segment)).expect("DecodedReader yields UTF-8");
+        // `stripped` mirrors Python's `line.strip()`.
+        let stripped = text.trim();
+        if !stripped.is_empty() {
+            saw_nonblank = true;
+        }
+        let is_comment = stripped.starts_with('#');
+        // sample_lines: raw text (including its \n if present), blanks kept,
+        // comments skipped — matches Python's `sample_lines.append(line)`.
+        if !is_comment && sample_lines.len() < SNIFF_SAMPLE_ROWS {
+            sample_lines.push(text.clone());
+        }
+        // sample_rows: stripped non-blank non-comment rows.
+        if !stripped.is_empty() && !is_comment && sample_rows.len() < CANDIDATE_SAMPLE_ROWS {
+            sample_rows.push(stripped.to_string());
+        }
+        if saw_nonblank
+            && sample_lines.len() >= SNIFF_SAMPLE_ROWS
+            && sample_rows.len() >= CANDIDATE_SAMPLE_ROWS
+        {
+            break;
+        }
+    }
+    let first_row = sample_rows.first().cloned().unwrap_or_default();
+    Ok(HeaderProbe {
+        empty: false,
+        blank: !saw_nonblank,
+        first_row,
+        sample_rows,
+        sample_lines,
+    })
+}
 
 /// CSVRows.leading_rows: up to `limit` leading non-blank, non-comment rows,
 /// each stripped. Streams the file and stops once `limit` rows are found.
@@ -120,4 +208,66 @@ pub fn row_count_with_header(path: &Path, delimiter: u8) -> std::io::Result<u64>
         }
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn tmp(content: &[u8]) -> tempfile::NamedTempFile {
+        let mut f = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+        f.write_all(content).unwrap();
+        f
+    }
+
+    #[test]
+    fn probe_empty_file() {
+        let f = tmp(b"");
+        let p = probe_csv_header(f.path()).unwrap();
+        assert!(p.empty);
+        assert!(!p.blank);
+        assert!(p.first_row.is_empty());
+        assert!(p.sample_rows.is_empty());
+        assert!(p.sample_lines.is_empty());
+    }
+
+    #[test]
+    fn probe_blank_file() {
+        let f = tmp(b"  \n\t\n  \n");
+        let p = probe_csv_header(f.path()).unwrap();
+        assert!(!p.empty);
+        assert!(p.blank);
+        assert!(p.first_row.is_empty());
+        assert!(p.sample_rows.is_empty());
+        // blank lines are not comments, so they go into sample_lines
+        assert!(!p.sample_lines.is_empty());
+    }
+
+    #[test]
+    fn probe_normal_file() {
+        let f = tmp(b"name,age\nAlice,30\nBob,25\n");
+        let p = probe_csv_header(f.path()).unwrap();
+        assert!(!p.empty);
+        assert!(!p.blank);
+        assert_eq!(p.first_row, "name,age");
+        assert_eq!(p.sample_rows[0], "name,age");
+        // sample_lines include trailing \n to match Python text-mode
+        assert_eq!(p.sample_lines[0], "name,age\n");
+    }
+
+    #[test]
+    fn probe_comment_and_blank_mix() {
+        // Comments skipped in both lists; blanks kept in sample_lines, skipped in sample_rows.
+        let f = tmp(b"# comment\n\nname,age\nAlice,30\n");
+        let p = probe_csv_header(f.path()).unwrap();
+        assert!(!p.empty);
+        assert!(!p.blank);
+        // sample_rows: skips comment AND blank
+        assert_eq!(p.sample_rows, vec!["name,age", "Alice,30"]);
+        // sample_lines: skips comment, keeps blank line
+        assert_eq!(p.sample_lines[0], "\n"); // the blank line
+        assert_eq!(p.sample_lines[1], "name,age\n");
+        assert_eq!(p.sample_lines[2], "Alice,30\n");
+    }
 }

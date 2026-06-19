@@ -196,7 +196,11 @@ def probe_csv_header(filepath):
                 sample_lines.append(line)
             if stripped and not is_comment and len(sample_rows) < CANDIDATE_SAMPLE_ROWS:
                 sample_rows.append(stripped)
-            if saw_nonblank and len(sample_lines) >= CSV_SNIFF_SAMPLE_ROWS and len(sample_rows) >= CANDIDATE_SAMPLE_ROWS:
+            if (
+                saw_nonblank
+                and len(sample_lines) >= CSV_SNIFF_SAMPLE_ROWS
+                and len(sample_rows) >= CANDIDATE_SAMPLE_ROWS
+            ):
                 break
 
     return {

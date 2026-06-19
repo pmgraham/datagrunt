@@ -29,3 +29,9 @@ def test_leading_rows(corpus_file):
         assert datagrunt_rs.leading_rows(str(corpus_file), limit) == py.leading_rows(
             str(corpus_file), limit
         )
+
+
+def test_probe_csv_header(corpus_file):
+    rust = datagrunt_rs.probe_csv_header(str(corpus_file))
+    python = py.probe_csv_header(str(corpus_file))
+    assert rust == python, corpus_file.name
