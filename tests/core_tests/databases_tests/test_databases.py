@@ -383,3 +383,35 @@ class TestSpatialExtensionInstallOnce:
         loads = [s for s in executed if s.upper().startswith("LOAD SPATIAL")]
         assert len(installs) == 1
         assert len(loads) == 2
+
+
+class TestSetExportFilename:
+    """set_export_filename distinguishes None (use default) from '' (error)."""
+
+    def test_none_uses_default(self, tmp_path):
+        csv = tmp_path / "data.csv"
+        csv.write_text("col1\n1\n")
+        queries = DuckDBQueries(str(csv))
+        result = queries.set_export_filename("default.csv", None)
+        assert result == "default.csv"
+
+    def test_provided_filename_returned(self, tmp_path):
+        csv = tmp_path / "data.csv"
+        csv.write_text("col1\n1\n")
+        queries = DuckDBQueries(str(csv))
+        result = queries.set_export_filename("default.csv", "custom.csv")
+        assert result == "custom.csv"
+
+    def test_empty_string_raises_value_error(self, tmp_path):
+        csv = tmp_path / "data.csv"
+        csv.write_text("col1\n1\n")
+        queries = DuckDBQueries(str(csv))
+        with pytest.raises(ValueError, match="export_filename"):
+            queries.set_export_filename("default.csv", "")
+
+    def test_whitespace_only_raises_value_error(self, tmp_path):
+        csv = tmp_path / "data.csv"
+        csv.write_text("col1\n1\n")
+        queries = DuckDBQueries(str(csv))
+        with pytest.raises(ValueError, match="export_filename"):
+            queries.set_export_filename("default.csv", "   ")

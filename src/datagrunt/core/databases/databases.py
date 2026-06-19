@@ -241,16 +241,33 @@ class DuckDBQueries:
         return f"tbl_{stem}_{path_hash}"
 
     def set_export_filename(self, default_filename, export_filename=None):
+        """Return the export filename if explicitly provided, else the default.
+
+        Raises ``ValueError`` when ``export_filename`` is provided but is an
+        empty or whitespace-only string — callers almost certainly passed a
+        bug rather than intending to write to a file named ``""``.
+
+        Args:
+            default_filename (str): Fallback filename used when ``export_filename``
+                is ``None``.
+            export_filename (str or None): The caller-supplied filename. ``None``
+                means "use the default"; a non-``None`` value is validated.
+
+        Returns:
+            str: The resolved export filename.
+
+        Raises:
+            ValueError: If ``export_filename`` is a non-``None`` empty or
+                whitespace-only string.
         """
-        Return the export filename if provided, otherwise return the default.
-        """
-        # This method doesn't really fit the class but it's the only place it's
-        # relevant.
-        if export_filename:
-            filename = export_filename
-        else:
-            filename = default_filename
-        return filename
+        if export_filename is not None:
+            if not export_filename.strip():
+                raise ValueError(
+                    f"export_filename must not be empty or whitespace-only; "
+                    f"got {export_filename!r}. Pass None to use the default."
+                )
+            return export_filename
+        return default_filename
 
     def import_csv_query(self):
         """Query to import a CSV file into a DuckDB table.
