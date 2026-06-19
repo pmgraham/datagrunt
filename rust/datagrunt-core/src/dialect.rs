@@ -16,48 +16,8 @@
 //! `quoting` (QUOTE_MINIMAL) and the absence of `escapechar` are constants the
 //! binding layer applies (Task 10); they are not part of this core struct.
 
-use crate::io::DecodedReader;
 use fancy_regex::Regex;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
 use std::sync::LazyLock;
-
-const SNIFF_SAMPLE_ROWS: usize = 5;
-
-/// CSVDialect sample: first 5 lines whose stripped form doesn't start with
-/// '#' (blank lines included), keeping each line's trailing `\n` so the result
-/// matches Python's `"".join(lines)` over text-mode iteration.
-///
-/// Streams the file via [`DecodedReader`] with universal-newline translation
-/// (Python text mode), reading line-by-line and STOPPING once 5 lines survive
-/// the comment filter — so an 88 MB file costs only the first few KiB. Line
-/// endings in the sample are universal-translated to `\n`, exactly as Python's
-/// text mode delivers them (not the file's original endings).
-pub fn sniff_sample(path: &Path) -> std::io::Result<String> {
-    let mut reader = BufReader::new(DecodedReader::open(path, true)?);
-    let mut sample = String::new();
-    let mut taken = 0usize;
-    let mut segment = Vec::new();
-    loop {
-        segment.clear();
-        let n = reader.read_until(b'\n', &mut segment)?;
-        if n == 0 {
-            break; // EOF
-        }
-        // DecodedReader already dropped invalid UTF-8, so this is valid UTF-8.
-        let text = String::from_utf8(std::mem::take(&mut segment))
-            .expect("DecodedReader yields valid UTF-8");
-        if text.trim().starts_with('#') {
-            continue;
-        }
-        sample.push_str(&text);
-        taken += 1;
-        if taken >= SNIFF_SAMPLE_ROWS {
-            break; // The whole point: stop after 5 surviving lines.
-        }
-    }
-    Ok(sample)
-}
 
 /// The four data-driven facts `csv.Sniffer().sniff` derives from a sample.
 #[derive(Debug, Clone, PartialEq, Eq)]
