@@ -262,6 +262,39 @@ class TestPDFReaderPyMuPDFSequential:
             assert f"Sequential Marker {n}" in text
 
 
+class TestPDFReaderEngineCache:
+    """Engine lifecycle: PDFReader builds its engine once per instance."""
+
+    def test_pdfreader_caches_engine_across_calls(self, sample_pdf, monkeypatch):
+        """PDFReader builds its engine once and reuses it across calls (one parse)."""
+        from datagrunt.core import PDFEngineFactory
+
+        calls = {"n": 0}
+        original = PDFEngineFactory.create_reader
+
+        def spy(self):
+            calls["n"] += 1
+            return original(self)
+
+        monkeypatch.setattr(PDFEngineFactory, "create_reader", spy)
+
+        reader = PDFReader(sample_pdf, engine="pymupdf")
+        reader.to_dataframe()
+        reader.to_arrow_table()
+        reader.to_dataframe()
+
+        assert calls["n"] == 1  # engine cached: one create_reader, not three
+        assert "_engine" in reader.__dict__
+
+    def test_engine_backed_requires_engine_role(self, sample_pdf):
+        """The shared base raises if a subclass omits _engine_role (no silent fallback)."""
+        from datagrunt.pdf_api._engine_backed import _PDFEngineBacked
+
+        obj = _PDFEngineBacked(sample_pdf)  # _engine_role defaults to None
+        with pytest.raises(NotImplementedError):
+            _ = obj._engine
+
+
 class TestPDFReaderJsonAndDictInputs:
     """Tests for initializing PDFReader with JSON files or dictionaries."""
 
