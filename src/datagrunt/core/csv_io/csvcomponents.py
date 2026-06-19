@@ -463,6 +463,14 @@ class CSVComponents(FileProperties):
 
     @cached_property
     def _dialect(self):
+        # NOTE: ``is_empty`` and ``is_blank`` are passed for API symmetry but
+        # ``CSVDialect._get_csv_dialect`` delegates entirely to the compute
+        # backend (``sniff_dialect``), which performs its own empty/blank
+        # short-circuit via the internal ``probe_csv_header`` call. The probe
+        # uses a lighter ``errors="ignore"`` blankness notion (see
+        # ``probe_csv_header`` in ``_compute_python.py``), not
+        # ``FileProperties.is_blank``, so these arguments are effectively
+        # unused by the dialect-sniff path.
         return CSVDialect(
             self.filepath,
             delimiter=self.delimiter,
