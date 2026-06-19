@@ -772,6 +772,24 @@ class TestPyArrowMidfileCommentScanCached:
         assert calls["count"] == 1
 
 
+class TestDuckDBBackedEngineBase:
+    """_DuckDBBackedEngine base class: shared init + close() for reader/writer."""
+
+    def test_writer_engine_has_close(self, sample_csv):
+        """All CSV writer engines expose close() (shared with reader via base)."""
+        for engine in ("duckdb", "polars", "pyarrow"):
+            writer = CSVEngineFactory(sample_csv, engine).create_writer()
+            assert hasattr(writer, "close")
+            writer.close()  # idempotent, must not raise
+            writer.close()
+
+    def test_reader_engine_attrs_preserved(self, sample_csv):
+        """The base refactor preserves the reader engine's attributes."""
+        reader = CSVEngineFactory(sample_csv, "duckdb").create_reader()
+        assert reader.filepath and reader.db_table and reader.delimiter
+        assert reader.queries is not None
+
+
 class TestPyArrowJsonOutput:
     """PyArrow JSON/JSONL export content must be preserved by the refactor."""
 

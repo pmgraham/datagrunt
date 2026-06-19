@@ -1,21 +1,16 @@
 """Module for writing CSV files and converting to different file formats."""
 
 # standard library
-from functools import cached_property
 from pathlib import Path
 
 # third party libraries
 # local libraries
-from datagrunt.core import (
-    CSVComponents,
-    CSVEngineFactory,
-    CSVEngineProperties,
-    DuckDBQueries,
-)
+from datagrunt.core import CSVEngineProperties, DuckDBQueries
+from datagrunt.csv_api._engine_backed import _CSVEngineBacked
 from datagrunt.csv_api._compat import warn_per_call_normalize
 
 
-class CSVWriter(CSVComponents):
+class CSVWriter(_CSVEngineBacked):
     """
     Class to unify the interface for converting CSV files to various other
     supported file types.
@@ -32,6 +27,8 @@ class CSVWriter(CSVComponents):
         will not silently mutate the values for you.
     """
 
+    _engine_role = "writer"
+
     def __init__(self, filepath, engine="duckdb", lenient=False, normalize_columns=False):
         """
         Initialize the CSV Writer class.
@@ -44,36 +41,9 @@ class CSVWriter(CSVComponents):
             normalize_columns (bool): Whether to normalize column names in
             every file this writer exports.
         """
-        filepath = Path(filepath)
-        self.lenient = lenient
-        self.normalize_columns = normalize_columns
-        super().__init__(filepath)
+        super().__init__(filepath, engine, lenient=lenient, normalize_columns=normalize_columns)
         self.queries = DuckDBQueries(self.filepath, lenient=self.lenient)
         self.db_table = self.queries.database_table_name
-        self.engine = engine.lower().replace(" ", "")
-        CSVEngineFactory.validate_engine(self.engine)
-
-    @cached_property
-    def _writer(self):
-        """Return this writer's engine, built once and reused.
-
-        Caching it means exporting one ``CSVWriter`` to several formats reuses a
-        single import instead of rebuilding the engine and re-importing the
-        source for every format. The engine owns the DuckDB connection; it is
-        released when the writer goes out of scope (its connection is
-        reference-counted), or earlier via an explicit teardown. (Parallels
-        ``CSVReader._reader``; the two are unified in issue #209.)
-        """
-        return CSVEngineFactory(
-            self.filepath,
-            self.engine,
-            lenient=self.lenient,
-            normalize_columns=self.normalize_columns,
-        ).create_writer()
-
-    def _create_writer(self):
-        """Return this writer's cached engine (back-compat delegator)."""
-        return self._writer
 
     def _write_empty_output(self, default_filename, out_filename=None):
         """Write a truly empty output file for an empty/blank source.
@@ -97,7 +67,7 @@ class CSVWriter(CSVComponents):
         """
         if self.is_empty or self.is_blank:
             return self._write_empty_output(CSVEngineProperties.csv_export_filename, out_filename)
-        return self._create_writer().write_csv(out_filename, warn_per_call_normalize(normalize_columns))
+        return self._engine.write_csv(out_filename, warn_per_call_normalize(normalize_columns))
 
     def write_excel(self, out_filename=None, normalize_columns=None):
         """
@@ -110,7 +80,7 @@ class CSVWriter(CSVComponents):
         """
         if self.is_empty or self.is_blank:
             return self._write_empty_output(CSVEngineProperties.excel_export_filename, out_filename)
-        return self._create_writer().write_excel(out_filename, warn_per_call_normalize(normalize_columns))
+        return self._engine.write_excel(out_filename, warn_per_call_normalize(normalize_columns))
 
     def write_json(self, out_filename=None, normalize_columns=None):
         """
@@ -123,7 +93,7 @@ class CSVWriter(CSVComponents):
         """
         if self.is_empty or self.is_blank:
             return self._write_empty_output(CSVEngineProperties.json_export_filename, out_filename)
-        return self._create_writer().write_json(out_filename, warn_per_call_normalize(normalize_columns))
+        return self._engine.write_json(out_filename, warn_per_call_normalize(normalize_columns))
 
     def write_json_newline_delimited(self, out_filename=None, normalize_columns=None):
         """
@@ -136,7 +106,7 @@ class CSVWriter(CSVComponents):
         """
         if self.is_empty or self.is_blank:
             return self._write_empty_output(CSVEngineProperties.json_newline_export_filename, out_filename)
-        return self._create_writer().write_json_newline_delimited(
+        return self._engine.write_json_newline_delimited(
             out_filename, warn_per_call_normalize(normalize_columns)
         )
 
@@ -151,4 +121,4 @@ class CSVWriter(CSVComponents):
         """
         if self.is_empty or self.is_blank:
             return self._write_empty_output(CSVEngineProperties.parquet_export_filename, out_filename)
-        return self._create_writer().write_parquet(out_filename, warn_per_call_normalize(normalize_columns))
+        return self._engine.write_parquet(out_filename, warn_per_call_normalize(normalize_columns))
