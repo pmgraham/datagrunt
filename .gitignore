@@ -193,3 +193,6 @@ FINDINGS.md
 
 # Example notebooks/data live in docs now — never tracked here.
 examples/
+
+# Local Claude Code config (settings, commands, worktrees) — keep local only
+.claude/
