@@ -666,8 +666,11 @@ class TestWriteDocumentJsonl:
         out = tmp_path / "term.jsonl"
         write_document_jsonl(_STRUCTURED_DOC, str(out))
         raw = out.read_bytes()
-        # Every line in the file ends with b'\n' (no bare CR, no missing LF).
-        assert all(ln.endswith(b"\n") or ln == b"" for ln in raw.splitlines(keepends=True))
+        # The file ends with a trailing LF and uses no CR (records are
+        # '\n'-separated, never '\r\n' or bare CR). ``json.dumps`` escapes any
+        # control bytes inside values, so a raw '\r' can only come from the
+        # separator — this assertion would catch that regression.
+        assert raw.endswith(b"\n") and b"\r" not in raw
 
 
 class TestWriteDocumentMarkdown:
