@@ -1,10 +1,11 @@
 //! Ports of CSVRows probes and the leading-line counters.
 
 use crate::io::{
-    decode_ignore, is_empty, is_legacy_mac_newlines, take_chars, universal_lines, DecodedReader,
-    MAX_LINE_CHARS, MAX_LINE_READ_BYTES,
+    decode_ignore, is_empty, take_chars, universal_lines, DecodedReader, MAX_LINE_CHARS,
+    MAX_LINE_READ_BYTES,
 };
-use std::io::{self, BufRead, BufReader};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 // ---- probe_csv_header constants ----
@@ -219,8 +220,22 @@ pub(crate) fn csv_reader_streaming(
     path: &Path,
     delimiter: u8,
 ) -> io::Result<csv::Reader<DecodedReader>> {
-    let translate_newlines = is_legacy_mac_newlines(path);
-    let reader = DecodedReader::open(path, translate_newlines)?;
+    // Open the file once: probe the first 4096 bytes for the legacy-mac
+    // newline signature (\r present, \n absent), then rewind to offset 0
+    // so DecodedReader decodes from the beginning (including BOM detection).
+    // This avoids the redundant open that `is_legacy_mac_newlines(path)`
+    // would cause; the probe semantics are byte-identical to that function.
+    let mut file = File::open(path)?;
+    let mut probe = Vec::with_capacity(4096);
+    // Mirror `is_legacy_mac_newlines`: a probe read error degrades to non-legacy
+    // (swallowed, NOT propagated), so behavior is byte-identical to the previous
+    // two-open path and to the Python oracle, both of which ignore probe IO
+    // errors. A genuine read failure surfaces later during the actual scan.
+    let legacy = file.by_ref().take(4096).read_to_end(&mut probe).is_ok()
+        && probe.contains(&b'\r')
+        && !probe.contains(&b'\n');
+    file.seek(SeekFrom::Start(0))?;
+    let reader = DecodedReader::from_file(file, legacy);
     Ok(csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true) // Python csv.reader never errors on ragged widths
@@ -357,5 +372,35 @@ mod tests {
         let p = probe_csv_header(f.path()).unwrap();
         assert_eq!(p.first_row.chars().count(), MAX_LINE_CHARS);
         assert_eq!(p.sample_lines[0].chars().count(), MAX_LINE_CHARS);
+    }
+
+    // --- single-open path tests (issue #226) ---
+    // These verify that the inline probe + seek + from_file in csv_reader_streaming
+    // produces byte-identical row counts to the previous two-open path across all
+    // newline conventions.
+
+    /// Legacy-mac (\r-only) file: the inline probe must detect the legacy flag,
+    /// translate lone \r to \n, and count rows correctly via the single-open path.
+    #[test]
+    fn single_open_legacy_mac_row_count() {
+        // 1 header + 3 data rows separated by lone \r (no \n anywhere).
+        let f = tmp(b"header,col\rrow1,a\rrow2,b\rrow3,c\r");
+        assert_eq!(row_count_with_header(f.path(), b',').unwrap(), 4);
+    }
+
+    /// CRLF file: probe must NOT set the legacy flag (\n present), and the csv
+    /// reader must count all rows without double-counting from the \r.
+    #[test]
+    fn single_open_crlf_row_count() {
+        let f = tmp(b"header,col\r\nrow1,a\r\nrow2,b\r\n");
+        assert_eq!(row_count_with_header(f.path(), b',').unwrap(), 3);
+    }
+
+    /// LF file: the standard case — probe sees no \r, no legacy translation,
+    /// rows counted correctly.
+    #[test]
+    fn single_open_lf_row_count() {
+        let f = tmp(b"header,col\nrow1,a\nrow2,b\nrow3,c\n");
+        assert_eq!(row_count_with_header(f.path(), b',').unwrap(), 4);
     }
 }
