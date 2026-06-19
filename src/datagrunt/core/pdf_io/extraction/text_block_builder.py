@@ -18,10 +18,10 @@ LIST_MARKER_REGEX = re.compile(
 )
 
 
-def page_median_size(all_sizes: list):
+def page_median_size(all_sizes: list) -> float | None:
     """Median font size for a page (legacy formula), or None if no sizes.
 
-    Uses ``sorted(all_sizes)[len // 2]`` rather than ``statistics.median`` to
+    Uses ``sorted(all_sizes)[len(all_sizes) // 2]`` rather than ``statistics.median`` to
     preserve exact parity with the original classifier (and the Rust port):
     for even-length inputs this picks the upper-middle element, it does NOT
     average the two middle values.
