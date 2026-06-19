@@ -227,8 +227,13 @@ pub(crate) fn csv_reader_streaming(
     // would cause; the probe semantics are byte-identical to that function.
     let mut file = File::open(path)?;
     let mut probe = Vec::with_capacity(4096);
-    file.by_ref().take(4096).read_to_end(&mut probe)?;
-    let legacy = probe.contains(&b'\r') && !probe.contains(&b'\n');
+    // Mirror `is_legacy_mac_newlines`: a probe read error degrades to non-legacy
+    // (swallowed, NOT propagated), so behavior is byte-identical to the previous
+    // two-open path and to the Python oracle, both of which ignore probe IO
+    // errors. A genuine read failure surfaces later during the actual scan.
+    let legacy = file.by_ref().take(4096).read_to_end(&mut probe).is_ok()
+        && probe.contains(&b'\r')
+        && !probe.contains(&b'\n');
     file.seek(SeekFrom::Start(0))?;
     let reader = DecodedReader::from_file(file, legacy);
     Ok(csv::ReaderBuilder::new()
