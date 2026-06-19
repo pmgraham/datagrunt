@@ -77,11 +77,7 @@ class PDFWriter(PDFComponents):
             filename = export_filename if export_filename else "output.json"
             document = self._parsed_dict
             if image_output_dir and dedupe_images:
-                is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
-                if is_structured:
-                    pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
-                else:
-                    PdfiumNativeReader.dedupe_images(document, image_output_dir=image_output_dir)
+                pdfcomponents.dedupe_document_images(document, image_output_dir)
             with open(filename, "w") as f:
                 json.dump(document, f, indent=2)
             return filename
@@ -111,16 +107,9 @@ class PDFWriter(PDFComponents):
         if self._parsed_dict is not None:
             filename = export_filename if export_filename else "output.jsonl"
             document = self._parsed_dict
-            is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
             if image_output_dir and dedupe_images:
-                if is_structured:
-                    pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
-                else:
-                    PdfiumNativeReader.dedupe_images(document, image_output_dir=image_output_dir)
-            if is_structured:
-                records = pdfcomponents.ParsedDocument(document).flatten()
-            else:
-                records = PdfiumNativeReader.flatten(document)
+                pdfcomponents.dedupe_document_images(document, image_output_dir)
+            records = pdfcomponents.flatten_document(document)
             with open(filename, "w") as f:
                 for record in records:
                     f.write(json.dumps(record) + "\n")
@@ -153,13 +142,9 @@ class PDFWriter(PDFComponents):
         if self._parsed_dict is not None:
             filename = export_filename if export_filename else "output.md"
             document = self._parsed_dict
-            is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
             if image_output_dir and dedupe_images:
-                if is_structured:
-                    pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
-                else:
-                    PdfiumNativeReader.dedupe_images(document, image_output_dir=image_output_dir)
-            if is_structured:
+                pdfcomponents.dedupe_document_images(document, image_output_dir)
+            if pdfcomponents.document_is_structured(document):
                 markdown_text = pdfcomponents.ParsedDocument(document).to_markdown(export_filename=filename)
             else:
                 markdown_text = PdfiumNativeReader.to_markdown(document)
@@ -189,28 +174,9 @@ class PDFWriter(PDFComponents):
         if self._parsed_dict is not None:
             document = self._parsed_dict
             image_dir = output_dir if output_dir else "output_images"
-            is_structured = any("elements" in pg for pg in document.get("document", {}).get("pages", []))
             if dedupe:
-                if is_structured:
-                    pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_dir)
-                else:
-                    PdfiumNativeReader.dedupe_images(document, image_output_dir=image_dir)
-            paths = []
-            seen = set()
-            for page in document.get("document", {}).get("pages", []):
-                if is_structured:
-                    candidates = [
-                        (el.get("metadata") or {}).get("file_path")
-                        for el in page.get("elements", [])
-                        if el.get("type") == "image"
-                    ]
-                else:
-                    candidates = [img.get("file") for img in page.get("images", [])]
-                for fp in candidates:
-                    if fp and fp not in seen:
-                        seen.add(fp)
-                        paths.append(fp)
-            return paths
+                pdfcomponents.dedupe_document_images(document, image_dir)
+            return pdfcomponents.collect_image_paths(document)
         # Mirror PDFReader's is_empty handling: a 0-byte PDF has no images.
         if self.is_empty:
             return []

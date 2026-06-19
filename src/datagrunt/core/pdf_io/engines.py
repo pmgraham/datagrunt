@@ -118,15 +118,20 @@ class PDFBaseReaderEngine(ABC):
         """Return the unified parsed document dict."""
         pass
 
-    @abstractmethod
     def to_dataframe(self, drop_layout_tables: bool = False) -> pl.DataFrame:
-        """Return parsed elements as a Polars DataFrame."""
-        pass
+        """Flatten parsed elements into a Polars DataFrame (one row/element).
 
-    @abstractmethod
+        Shared by every engine: the parse is memoized and ``flatten_document``
+        dispatches on the document's schema, so the unified and native paths
+        need no per-engine override.
+        """
+        records = pdfcomponents.flatten_document(self._parse_to_dicts(drop_layout_tables=drop_layout_tables))
+        return pl.DataFrame(records) if records else pl.DataFrame()
+
     def to_arrow_table(self, drop_layout_tables: bool = False) -> pa.Table:
-        """Return parsed elements as a PyArrow table."""
-        pass
+        """Flatten parsed elements into a PyArrow table (one row/element)."""
+        records = pdfcomponents.flatten_document(self._parse_to_dicts(drop_layout_tables=drop_layout_tables))
+        return pa.Table.from_pylist(records) if records else pa.Table.from_pydict({})
 
 
 class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
@@ -171,22 +176,6 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
     def get_sample(self) -> dict:
         """Parse and return the first page only."""
         return pdfcomponents.DocumentAssembler(self.filepath).parse_page(0)
-
-    def to_dataframe(self, drop_layout_tables: bool = False) -> pl.DataFrame:
-        """Flatten parsed elements into a Polars DataFrame (one row/element)."""
-        document = self._parse_to_dicts(drop_layout_tables=drop_layout_tables)
-        records = pdfcomponents.ParsedDocument(document).flatten()
-        if not records:
-            return pl.DataFrame()
-        return pl.DataFrame(records)
-
-    def to_arrow_table(self, drop_layout_tables: bool = False) -> pa.Table:
-        """Flatten parsed elements into a PyArrow table (one row/element)."""
-        document = self._parse_to_dicts(drop_layout_tables=drop_layout_tables)
-        records = pdfcomponents.ParsedDocument(document).flatten()
-        if not records:
-            return pa.Table.from_pydict({})
-        return pa.Table.from_pylist(records)
 
 
 class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
@@ -302,28 +291,6 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
             ).parse_page(0)
         return PdfiumNativeReader(self.filepath).parse_page(0)
 
-    def to_dataframe(self, drop_layout_tables: bool = False) -> pl.DataFrame:
-        """Flatten parsed elements into a Polars DataFrame (one row/element)."""
-        if self.structured:
-            document = self._parse_to_dicts(drop_layout_tables=drop_layout_tables)
-            records = pdfcomponents.ParsedDocument(document).flatten()
-        else:
-            records = PdfiumNativeReader.flatten(self._parse_to_dicts())
-        if not records:
-            return pl.DataFrame()
-        return pl.DataFrame(records)
-
-    def to_arrow_table(self, drop_layout_tables: bool = False) -> pa.Table:
-        """Flatten parsed elements into a PyArrow table (one row/element)."""
-        if self.structured:
-            document = self._parse_to_dicts(drop_layout_tables=drop_layout_tables)
-            records = pdfcomponents.ParsedDocument(document).flatten()
-        else:
-            records = PdfiumNativeReader.flatten(self._parse_to_dicts())
-        if not records:
-            return pa.Table.from_pydict({})
-        return pa.Table.from_pylist(records)
-
 
 class PDFBaseWriterEngine(ABC):
     """Abstract base class defining the interface for PDF writer engines."""
@@ -374,10 +341,23 @@ class PDFBaseWriterEngine(ABC):
         """Write the document Markdown representation to disk."""
         pass
 
-    @abstractmethod
     def extract_images(self, output_dir=None, dedupe=True):
-        """Write embedded images to disk; return their paths."""
-        pass
+        """Parse the PDF, write embedded images to disk, return their paths.
+
+        Shared by every engine: the parse is memoized and both the dedupe and
+        the path collection dispatch on the document's schema, so no per-engine
+        override is needed.
+
+        Args:
+            output_dir (optional, str): Output directory; defaults to output_images.
+            dedupe (bool, default True): Collapse byte-identical duplicate images
+                to a single file before returning paths.
+        """
+        directory = output_dir if output_dir else self.properties.images_export_dir
+        document = self._parse_document(directory, False)
+        if dedupe:
+            pdfcomponents.dedupe_document_images(document, directory)
+        return pdfcomponents.collect_image_paths(document)
 
 
 class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
@@ -404,7 +384,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
         filename = set_export_filename(self.properties.json_export_filename, export_filename)
         document = self._parse_document(image_output_dir, drop_layout_tables)
         if image_output_dir and dedupe_images:
-            pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
+            pdfcomponents.dedupe_document_images(document, image_output_dir)
         with open(filename, "w") as f:
             json.dump(document, f, indent=2)
         return filename
@@ -416,8 +396,8 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
         filename = set_export_filename(self.properties.json_newline_export_filename, export_filename)
         document = self._parse_document(image_output_dir, drop_layout_tables)
         if image_output_dir and dedupe_images:
-            pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
-        records = pdfcomponents.ParsedDocument(document).flatten()
+            pdfcomponents.dedupe_document_images(document, image_output_dir)
+        records = pdfcomponents.flatten_document(document)
         with open(filename, "w") as f:
             for record in records:
                 f.write(json.dumps(record) + "\n")
@@ -438,34 +418,11 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
         filename = set_export_filename(self.properties.markdown_export_filename, export_filename)
         document = self._parse_document(image_output_dir, drop_layout_tables)
         if image_output_dir and dedupe_images:
-            pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
+            pdfcomponents.dedupe_document_images(document, image_output_dir)
         markdown_text = pdfcomponents.ParsedDocument(document).to_markdown(export_filename=filename)
         with open(filename, "w") as f:
             f.write(markdown_text)
         return filename
-
-    def extract_images(self, output_dir=None, dedupe=True):
-        """Parse the PDF, write embedded images to disk, return their paths.
-
-        Args:
-            output_dir (optional, str): Output directory; defaults to output_images.
-            dedupe (bool, default True): Collapse byte-identical duplicate images
-                to a single file before returning paths.
-        """
-        directory = output_dir if output_dir else self.properties.images_export_dir
-        document = self._parse_document(directory, False)
-        if dedupe:
-            pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=directory)
-        paths = []
-        seen = set()
-        for page in document.get("document", {}).get("pages", []):
-            for elem in page.get("elements", []):
-                if elem.get("type") == "image":
-                    fp = (elem.get("metadata") or {}).get("file_path")
-                    if fp and fp not in seen:
-                        seen.add(fp)
-                        paths.append(fp)
-        return paths
 
 
 class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
@@ -482,18 +439,12 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
             )
         return self._reader_engine
 
-    def _dedupe(self, document, image_output_dir):
-        if self.structured:
-            pdfcomponents.ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
-        else:
-            PdfiumNativeReader.dedupe_images(document, image_output_dir=image_output_dir)
-
     def write_json(self, export_filename=None, image_output_dir=None, dedupe_images=True, drop_layout_tables=False):
         """Parse the PDF and write the document JSON (native or unified schema)."""
         filename = set_export_filename(self.properties.json_export_filename, export_filename)
         document = self._parse_document(image_output_dir, drop_layout_tables)
         if image_output_dir and dedupe_images:
-            self._dedupe(document, image_output_dir)
+            pdfcomponents.dedupe_document_images(document, image_output_dir)
         with open(filename, "w") as f:
             json.dump(document, f, indent=2)
         return filename
@@ -505,11 +456,8 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
         filename = set_export_filename(self.properties.json_newline_export_filename, export_filename)
         document = self._parse_document(image_output_dir, drop_layout_tables)
         if image_output_dir and dedupe_images:
-            self._dedupe(document, image_output_dir)
-        if self.structured:
-            records = pdfcomponents.ParsedDocument(document).flatten()
-        else:
-            records = PdfiumNativeReader.flatten(document)
+            pdfcomponents.dedupe_document_images(document, image_output_dir)
+        records = pdfcomponents.flatten_document(document)
         with open(filename, "w") as f:
             for record in records:
                 f.write(json.dumps(record) + "\n")
@@ -520,7 +468,7 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
         filename = set_export_filename(self.properties.markdown_export_filename, export_filename)
         document = self._parse_document(image_output_dir, drop_layout_tables)
         if image_output_dir and dedupe_images:
-            self._dedupe(document, image_output_dir)
+            pdfcomponents.dedupe_document_images(document, image_output_dir)
         if self.structured:
             markdown_text = pdfcomponents.ParsedDocument(document).to_markdown(export_filename=filename)
         else:
@@ -528,26 +476,3 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
         with open(filename, "w") as f:
             f.write(markdown_text)
         return filename
-
-    def extract_images(self, output_dir=None, dedupe=True):
-        """Parse the PDF, write embedded images to disk, return their paths."""
-        directory = output_dir if output_dir else self.properties.images_export_dir
-        document = self._parse_document(directory, False)
-        if dedupe:
-            self._dedupe(document, directory)
-        paths = []
-        seen = set()
-        for page in document.get("document", {}).get("pages", []):
-            if self.structured:
-                candidates = [
-                    (el.get("metadata") or {}).get("file_path")
-                    for el in page.get("elements", [])
-                    if el.get("type") == "image"
-                ]
-            else:
-                candidates = [img.get("file") for img in page.get("images", [])]
-            for fp in candidates:
-                if fp and fp not in seen:
-                    seen.add(fp)
-                    paths.append(fp)
-        return paths
