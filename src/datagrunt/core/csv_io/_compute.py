@@ -11,6 +11,11 @@ exported in any ``__all__``:
 
 Default is Rust (``disable_rust=False``); the binary always ships and is the
 default path.
+
+NOT thread-safe: ``set_disable_rust`` / ``rust_disabled`` flip a shared module
+global with no lock, so toggling from one thread changes the backend for all
+threads mid-flight. Use the toggle only in single-threaded test/diagnostic
+contexts, never to switch backends per-thread at runtime.
 """
 
 import contextlib
