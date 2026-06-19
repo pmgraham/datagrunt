@@ -385,7 +385,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
         document = self._parse_document(image_output_dir, drop_layout_tables)
         if image_output_dir and dedupe_images:
             pdfcomponents.dedupe_document_images(document, image_output_dir)
-        with open(filename, "w") as f:
+        with open(filename, "w", encoding="utf-8") as f:
             json.dump(document, f, indent=2)
         return filename
 
@@ -398,7 +398,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
         if image_output_dir and dedupe_images:
             pdfcomponents.dedupe_document_images(document, image_output_dir)
         records = pdfcomponents.flatten_document(document)
-        with open(filename, "w") as f:
+        with open(filename, "w", encoding="utf-8") as f:
             for record in records:
                 f.write(json.dumps(record) + "\n")
         return filename
@@ -420,7 +420,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
         if image_output_dir and dedupe_images:
             pdfcomponents.dedupe_document_images(document, image_output_dir)
         markdown_text = pdfcomponents.ParsedDocument(document).to_markdown(export_filename=filename)
-        with open(filename, "w") as f:
+        with open(filename, "w", encoding="utf-8") as f:
             f.write(markdown_text)
         return filename
 
@@ -445,7 +445,7 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
         document = self._parse_document(image_output_dir, drop_layout_tables)
         if image_output_dir and dedupe_images:
             pdfcomponents.dedupe_document_images(document, image_output_dir)
-        with open(filename, "w") as f:
+        with open(filename, "w", encoding="utf-8") as f:
             json.dump(document, f, indent=2)
         return filename
 
@@ -458,7 +458,7 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
         if image_output_dir and dedupe_images:
             pdfcomponents.dedupe_document_images(document, image_output_dir)
         records = pdfcomponents.flatten_document(document)
-        with open(filename, "w") as f:
+        with open(filename, "w", encoding="utf-8") as f:
             for record in records:
                 f.write(json.dumps(record) + "\n")
         return filename
@@ -473,6 +473,6 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
             markdown_text = pdfcomponents.ParsedDocument(document).to_markdown(export_filename=filename)
         else:
             markdown_text = PdfiumNativeReader.to_markdown(document)
-        with open(filename, "w") as f:
+        with open(filename, "w", encoding="utf-8") as f:
             f.write(markdown_text)
         return filename
