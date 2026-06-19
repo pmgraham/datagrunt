@@ -81,7 +81,7 @@ fn decode_chunk_with_carry(bytes: &[u8], carry: &mut Vec<u8>) -> String {
 }
 
 /// Read whole file as text the way Python's probes do: utf-8-sig + ignore.
-pub fn read_decoded(path: &Path) -> std::io::Result<String> {
+pub(crate) fn read_decoded(path: &Path) -> std::io::Result<String> {
     let mut bytes = Vec::new();
     File::open(path)?.read_to_end(&mut bytes)?;
     let body = if bytes.starts_with(BOM) { &bytes[BOM.len()..] } else { &bytes[..] };
@@ -551,7 +551,7 @@ impl Iterator for UniversalLines {
 ///
 /// Thin `collect()` over [`universal_lines`] so there is one line-splitting
 /// implementation. Other components rely on this for small samples.
-pub fn read_universal_lines(path: &Path) -> std::io::Result<Vec<String>> {
+pub(crate) fn read_universal_lines(path: &Path) -> std::io::Result<Vec<String>> {
     universal_lines(path)?.collect::<Result<Vec<_>, _>>()
 }
 
@@ -586,7 +586,7 @@ pub fn is_empty(path: &Path) -> std::io::Result<bool> {
 /// bytes) is never blank; otherwise strict decode (BOM allowed) — invalid
 /// UTF-8 counts as content; blank iff all whitespace.
 /// The stat-then-read order mirrors Python's BlankFile (the size gate is advisory; Python has the same TOCTOU characteristics, and parity is the spec).
-pub fn is_blank(path: &Path) -> bool {
+pub(crate) fn is_blank(path: &Path) -> bool {
     let size = match std::fs::metadata(path) {
         Ok(m) => m.len(),
         Err(_) => return false,
