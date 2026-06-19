@@ -46,7 +46,9 @@ class DocumentAssembler:
     def parse_page(self, page_index, image_output_dir=None) -> dict:
         """Parse a single page into the unified element schema."""
         with self.backend, self.table_extractor:
-            analysis = self.backend.analyze_page(page_index)
+            analysis, text_blocks, images = self.backend.extract_page(
+                page_index, output_dir=image_output_dir, name_prefix=self.filepath.stem
+            )
             elements = []
             counter = {"n": 1}
 
@@ -72,7 +74,7 @@ class DocumentAssembler:
 
             warnings = []
             if analysis.has_text_layer:
-                for block in self.backend.extract_text_blocks(page_index):
+                for block in text_blocks:
                     if not is_inside_table(block.bbox):
                         elements.append(self._text_element(block, gen_elem_id(), page_index))
             elif analysis.is_scanned:
@@ -93,11 +95,8 @@ class DocumentAssembler:
             for table in tables:
                 elements.append(self._table_element(table, gen_elem_id(), page_index))
 
-            if analysis.image_count > 0:
-                for img in self.backend.extract_images(
-                    page_index, output_dir=image_output_dir, name_prefix=self.filepath.stem
-                ):
-                    elements.append(self._image_element(img, gen_elem_id(), page_index))
+            for img in images:
+                elements.append(self._image_element(img, gen_elem_id(), page_index))
 
             classification = "mixed"
             if analysis.is_scanned:

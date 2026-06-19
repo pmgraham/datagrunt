@@ -158,36 +158,104 @@ class PyMuPDFBackend(ExtractionBackend):
             reading_order=order,
         )
 
+    def extract_page(self, page_number: int, output_dir: str = None, name_prefix: str = "page") -> tuple:
+        """Parse the page once, returning analysis + text blocks + images.
+
+        Shares a single ``get_text("dict", sort=True)`` and a single
+        ``get_images()`` between analysis and extraction. Block/image counts are
+        sort-order independent, so the sorted dict yields the same counts the
+        unsorted ``analyze_page`` produced. ``get_text("text")`` is retained for
+        ``has_text_layer``/``text_length`` to keep parity byte-identical.
+        """
+        doc, should_close = self._get_doc()
+        try:
+            if page_number < 0 or page_number >= doc.page_count:
+                raise ValueError(f"Page {page_number} out of range")
+            page = doc[page_number]
+            data = page.get_text("dict", sort=True)
+            raw_blocks = data["blocks"]
+            text_block_dicts = [b for b in raw_blocks if b.get("type") == 0]
+            image_block_dicts = [b for b in raw_blocks if b.get("type") == 1]
+            text = page.get_text("text").strip()
+            has_text = len(text) > 0
+            image_list = page.get_images()
+            drawings = page.get_drawings()
+            has_lines = any(item[0] in ("l", "re") for d in drawings for item in d.get("items", []))
+            analysis = PageAnalysis(
+                width=page.rect.width,
+                height=page.rect.height,
+                rotation=page.rotation,
+                has_text_layer=has_text,
+                is_scanned=(not has_text and len(image_list) > 0),
+                text_block_count=len(text_block_dicts),
+                image_count=len(image_list),
+                image_block_count=len(image_block_dicts),
+                has_line_drawings=has_lines,
+                text_length=len(text),
+            )
+            text_blocks = []
+            if has_text:
+                all_sizes = [
+                    span["size"]
+                    for block in text_block_dicts
+                    for line in block.get("lines", [])
+                    for span in line.get("spans", [])
+                    if span["text"].strip()
+                ]
+                median_size = page_median_size(all_sizes)
+                for order, block in enumerate(text_block_dicts):
+                    tb = self._build_block(block, median_size, order)
+                    if tb is not None:
+                        text_blocks.append(tb)
+            images = []
+            if analysis.image_count > 0:
+                images = self._images_from_page(
+                    doc, page, image_list, output_dir, name_prefix, page_number
+                )
+            return analysis, text_blocks, images
+        finally:
+            if should_close:
+                doc.close()
+
     def extract_images(self, page_number: int, output_dir: str = None, name_prefix: str = "page") -> list:
         """Return embedded images (ported from extractors.extract_images)."""
-        import os
-
         doc, should_close = self._get_doc()
         try:
             if page_number < 0 or page_number >= doc.page_count:
                 return []
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
             page = doc[page_number]
-            image_list = page.get_images()
-            results = []
-            # ``get_images()`` lists images in resource (xref) order, which can
-            # differ from the content/display order. Resolve each image's bbox by
-            # its xref so positions never get swapped; track per-xref occurrences
-            # so an image drawn multiple times maps to the correct rect each time.
-            xref_occurrence = {}
-            for idx, img_info in enumerate(image_list):
-                xref = img_info[0]
-                occurrence = xref_occurrence.get(xref, 0)
-                xref_occurrence[xref] = occurrence + 1
-                bbox = self._resolve_image_bbox(page, xref, occurrence)
-                block = self._image_block(doc, img_info, idx, bbox, output_dir, name_prefix, page_number)
-                if block is not None:
-                    results.append(block)
-            return results
+            return self._images_from_page(
+                doc, page, page.get_images(), output_dir, name_prefix, page_number
+            )
         finally:
             if should_close:
                 doc.close()
+
+    def _images_from_page(self, doc, page, image_list, output_dir, name_prefix, page_number) -> list:
+        """Build ImageBlocks from an already-fetched ``page.get_images()`` list.
+
+        Shared by ``extract_images`` and ``extract_page`` so the image list is
+        enumerated once per page.
+        """
+        import os
+
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        results = []
+        # ``get_images()`` lists images in resource (xref) order, which can
+        # differ from the content/display order. Resolve each image's bbox by
+        # its xref so positions never get swapped; track per-xref occurrences
+        # so an image drawn multiple times maps to the correct rect each time.
+        xref_occurrence = {}
+        for idx, img_info in enumerate(image_list):
+            xref = img_info[0]
+            occurrence = xref_occurrence.get(xref, 0)
+            xref_occurrence[xref] = occurrence + 1
+            bbox = self._resolve_image_bbox(page, xref, occurrence)
+            block = self._image_block(doc, img_info, idx, bbox, output_dir, name_prefix, page_number)
+            if block is not None:
+                results.append(block)
+        return results
 
     @staticmethod
     def _resolve_image_bbox(page, xref, occurrence) -> BBox:

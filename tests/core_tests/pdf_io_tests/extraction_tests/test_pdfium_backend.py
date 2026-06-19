@@ -33,3 +33,33 @@ class TestPdfiumBackend:
     def test_missing_file_raises(self):
         with pytest.raises(FileNotFoundError):
             PdfiumBackend("nope.pdf")
+
+    def test_pdfium_extract_page_matches_primitives(self, sample_pdf):
+        """Single-pass extract_page returns the same analysis/text/images as the
+        three primitives called separately."""
+        backend = PdfiumBackend(sample_pdf)
+        with backend:
+            analysis, text_blocks, images = backend.extract_page(0)
+            assert analysis == backend.analyze_page(0)
+            assert text_blocks == backend.extract_text_blocks(0)
+            assert images == backend.extract_images(0)
+        assert text_blocks  # sample_pdf has a text layer
+
+    def test_pdfium_extract_page_opens_page_once(self, sample_pdf, monkeypatch):
+        """extract_page must open the pdfium page (and textpage) once, not three times."""
+        from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
+
+        count = {"n": 0}
+        orig_page = PdfiumDocument.page
+
+        def spy_page(self, page_number):
+            count["n"] += 1
+            return orig_page(self, page_number)
+
+        monkeypatch.setattr(PdfiumDocument, "page", spy_page)
+
+        backend = PdfiumBackend(sample_pdf)
+        with backend:
+            backend.extract_page(0)
+
+        assert count["n"] == 1
