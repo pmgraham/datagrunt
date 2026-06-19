@@ -55,9 +55,8 @@ class CSVReader(_CSVEngineBacked):
             ``None`` (default) inherits the constructor-level setting.
 
         Returns:
-            Engine-dependent result: a Polars DataFrame for the polars/pyarrow
-            engines, or a DuckDB relation for the DuckDB engine. Returns an
-            empty ``pl.DataFrame()`` for empty/blank files.
+            A Polars DataFrame (all engines), or an empty ``pl.DataFrame()``
+            for empty/blank files.
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(pl.DataFrame())
@@ -71,8 +70,8 @@ class CSVReader(_CSVEngineBacked):
             ``None`` (default) inherits the constructor-level setting.
 
         Returns:
-            Engine-dependent result: a Polars DataFrame or DuckDB relation.
-            Returns an empty ``pl.DataFrame()`` for empty/blank files.
+            A Polars DataFrame, or an empty ``pl.DataFrame()`` for empty/blank
+            files.
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(pl.DataFrame())
