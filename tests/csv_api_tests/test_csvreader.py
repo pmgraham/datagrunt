@@ -469,3 +469,25 @@ class TestCSVReaderContextManager:
             with CSVReader(self._csv(tmp_path), engine=engine) as reader:
                 df = reader.to_dataframe()
             assert len(df) == 2
+
+    def test_duckdb_mixed_reads_import_file_once(self, sample_csv, monkeypatch):
+        """to_dataframe + to_arrow_table + query_data on one DuckDB reader import once."""
+        from datagrunt.core.databases import DuckDBQueries
+
+        calls = {"n": 0}
+        original = DuckDBQueries.import_csv_query
+
+        def spy(self, *args, **kwargs):
+            calls["n"] += 1
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(DuckDBQueries, "import_csv_query", spy)
+
+        reader = CSVReader(sample_csv, engine="duckdb")
+        reader.to_dataframe()
+        # Connection stays open after a materializing read (no per-call close).
+        assert reader.__dict__["_reader"].queries._connection is not None
+        reader.to_arrow_table()
+        reader.query_data(f"SELECT * FROM {reader.db_table} LIMIT 1")
+
+        assert calls["n"] == 1
