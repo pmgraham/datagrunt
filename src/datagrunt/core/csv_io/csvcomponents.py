@@ -117,7 +117,7 @@ class CSVStringSample:
             self.filepath,
             separator=self.delimiter,
             n_rows=self.SAMPLE_ROWS,
-            comment_prefix="#",
+            skip_rows=_count_leading_comments(self.filepath),
         )
         return df.write_csv(file=None)
 
@@ -136,7 +136,7 @@ class CSVStringSample:
             self.filepath,
             separator=self.delimiter,
             n_rows=self.SAMPLE_ROWS_BY_QUALITY,
-            comment_prefix="#",
+            skip_rows=_count_leading_comments(self.filepath),
         )
         # Namespaced internal name avoids clobbering a user column named "null_count".
         null_count_column = "__datagrunt_null_count__"
