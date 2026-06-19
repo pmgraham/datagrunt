@@ -499,9 +499,17 @@ class TestMarkdownMetacharacterEscaping:
     def test_image_file_path_paren_does_not_inject_markdown(self):
         malicious = "x) ![](https://evil.example/pwn.png"
         md = self._markdown([self._image_element(malicious)])
-        # Must remain a single markdown image, not an injected second image link.
-        assert md.count("![") == 1
-        assert "\\)" in md
+        # The path contains a space so it is wrapped in angle brackets
+        # (CommonMark angle-bracket destination).  The entire malicious path,
+        # including its ')' and embedded '![](', is enclosed inside the '<...>'
+        # wrapper — no injected image link is structurally valid.
+        assert "<x) ![](https://evil.example/pwn.png>" in md
+        # The output contains exactly ONE standalone image marker (the outer
+        # '![alt]' prefix).  Any second '![' that appears is inside the
+        # angle-bracket destination and is not structural markdown.
+        #
+        # Line shape: ![alt](<malicious path>)\n — a single markdown image.
+        assert md.strip().startswith("![")
 
     def test_image_file_path_bracket_in_alt_is_escaped(self):
         from pathlib import Path
