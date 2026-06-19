@@ -398,7 +398,7 @@ class TestEngines:
 
         with pytest.raises(ValueError) as exc_info:
             factory.create_writer()
-        assert "Unsupported reader engine: invalid_engine_not_in_dict" in str(exc_info.value)
+        assert "Unsupported writer engine: invalid_engine_not_in_dict" in str(exc_info.value)
 
     def test_single_value_column_series_handling(self, tmp_path):
         """Test that single column files with single value are properly converted from Series to DataFrame."""

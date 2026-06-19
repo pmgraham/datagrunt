@@ -93,7 +93,7 @@ class _DuckDBBackedEngine(ABC):
         self.queries = DuckDBQueries(self.filepath, lenient=self.lenient)
         self.db_table = self.queries.database_table_name
         if not self.filepath.exists():
-            raise FileNotFoundError
+            raise FileNotFoundError(CSVEngineProperties.missing_file_message.format(filepath=self.filepath))
 
     def close(self):
         """Close the underlying DuckDB connection.
