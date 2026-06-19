@@ -96,18 +96,22 @@ df = dg.query_data(query).pl()
 print(df)
 ```
 
-With the DuckDB engine, repeated `query_data()` calls on the same reader reuse
-a single import: the CSV is loaded into DuckDB once per reader instance, so
-follow-up queries skip the file import entirely and run dramatically faster.
+With the DuckDB engine, datagrunt imports the CSV once per reader or writer and
+reuses it: repeated reads (`to_dataframe`, `to_arrow_table`, `get_sample`),
+`query_data` calls, and multi-format exports (`write_csv` + `write_excel` +
+`write_json` + `write_parquet`) all skip re-importing the file, so follow-up
+operations run dramatically faster.
 
-Because that reuse keeps a DuckDB connection open, hold the reader in a `with`
-block (or call `reader.close()`) to release it deterministically when you are
-done. The reader stays usable afterward — a later call transparently reopens:
+You never have to manage this — the connection is released automatically when the
+reader or writer is garbage-collected. If you want to release it *early* (for
+example, to free memory deterministically in a long-running process), use the
+reader as a context manager or call `close()`; this is optional and the object
+stays usable afterward:
 
 ```python
 with CSVReader('vehicles.csv', engine='duckdb') as dg:
     df = dg.query_data(f"SELECT city, COUNT(*) FROM {dg.db_table} GROUP BY 1").pl()
-# connection is closed here, even if the block raises
+# connection released here, even if the block raises
 ```
 
 ### Consistent Column Names with `normalize_columns`
