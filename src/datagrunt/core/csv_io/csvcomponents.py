@@ -344,14 +344,21 @@ class CSVColumns:
         if _is_legacy_mac_newlines(self.filepath):
             try:
                 encoding = FileProperties(self.filepath).DEFAULT_ENCODING
+                # Open with newline=None so the OS translates \r -> \n
+                # (universal newlines). Feed the handle to csv.reader so it
+                # can reassemble a quoted field containing an embedded \r
+                # (now seen as \n after translation) — wrapping a single
+                # pre-split line string cannot do this.
                 with open(self.filepath, "r", encoding=encoding, newline=None, errors="ignore") as f:
-                    for line in f:
-                        stripped = line.strip()
-                        if not stripped.startswith("#") and stripped:
-                            import csv
+                    import csv
 
-                            reader = csv.reader([line], delimiter=self.delimiter)
-                            return next(reader)
+                    reader = csv.reader(f, delimiter=self.delimiter)
+                    for record in reader:
+                        if not record:
+                            continue
+                        if record[0].strip().startswith("#"):
+                            continue
+                        return record
             except Exception:  # noqa: BLE001 - best-effort legacy-mac header; fall back to polars
                 logger.debug("Legacy-mac column read failed for %s; using polars", self.filepath, exc_info=True)
         df = pl.read_csv(
