@@ -164,18 +164,67 @@ def _splits_rows_consistently(sample_rows, char):
     return len(field_counts) == 1 and field_counts.pop() >= MIN_CONSISTENT_FIELDS
 
 
+def probe_csv_header(filepath):
+    """Single-pass header probe shared by delimiter + dialect inference.
+
+    One read captures everything both inference paths need, replacing the
+    separate ``is_blank`` / ``first_row`` / ``leading_rows`` / sniff-sample reads.
+
+    Returns a dict:
+      - ``empty``: file has zero bytes.
+      - ``blank``: file has no non-whitespace content.
+      - ``first_row``: first stripped, non-blank, non-comment row ("" if none).
+      - ``sample_rows``: up to ``CANDIDATE_SAMPLE_ROWS`` stripped non-blank
+        non-comment rows (reproduces ``leading_rows(CANDIDATE_SAMPLE_ROWS)``).
+      - ``sample_lines``: up to ``CSV_SNIFF_SAMPLE_ROWS`` raw non-comment lines,
+        blanks kept (reproduces ``sniff_dialect``'s sample).
+    """
+    props = FileProperties(filepath)
+    if props.is_empty:
+        return {"empty": True, "blank": False, "first_row": "", "sample_rows": [], "sample_lines": []}
+
+    sample_lines = []
+    sample_rows = []
+    saw_nonblank = False
+    with open(filepath, "r", encoding=props.DEFAULT_ENCODING, errors="ignore") as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped:
+                saw_nonblank = True
+            is_comment = stripped.startswith("#")
+            if not is_comment and len(sample_lines) < CSV_SNIFF_SAMPLE_ROWS:
+                sample_lines.append(line)
+            if stripped and not is_comment and len(sample_rows) < CANDIDATE_SAMPLE_ROWS:
+                sample_rows.append(stripped)
+            if (
+                saw_nonblank
+                and len(sample_lines) >= CSV_SNIFF_SAMPLE_ROWS
+                and len(sample_rows) >= CANDIDATE_SAMPLE_ROWS
+            ):
+                break
+
+    return {
+        "empty": False,
+        "blank": not saw_nonblank,
+        "first_row": sample_rows[0] if sample_rows else "",
+        "sample_rows": sample_rows,
+        "sample_lines": sample_lines,
+    }
+
+
 def infer_delimiter(filepath):
     """Infer the delimiter (safe > consistent punctuation > space > comma)."""
     props = FileProperties(filepath)
     if props.is_tsv:
         return DEFAULT_TAB_DELIMITER
-    if props.is_empty or props.is_blank:
+    probe = probe_csv_header(filepath)
+    if probe["empty"] or probe["blank"]:
         return DEFAULT_DELIMITER
-    candidates = _candidates_most_common(first_row(filepath))
+    candidates = _candidates_most_common(probe["first_row"])
     for char in candidates:
         if char in SAFE_DELIMITERS:
             return char
-    sample = leading_rows(filepath, CANDIDATE_SAMPLE_ROWS)
+    sample = probe["sample_rows"]
     for char in candidates:
         if _splits_rows_consistently(sample, char):
             return char
@@ -191,18 +240,10 @@ def sniff_dialect(filepath, delimiter=None):
     (``escapechar`` None, ``lineterminator`` "\\r\\n", ``quoting`` 0) mirror what
     ``csv.Sniffer().sniff`` and ``datagrunt._native.sniff_dialect`` produce.
     """
-    props = FileProperties(filepath)
-    if props.is_empty or props.is_blank:
+    probe = probe_csv_header(filepath)
+    if probe["empty"] or probe["blank"]:
         return None
-    lines = []
-    with open(filepath, "r", encoding=props.DEFAULT_ENCODING, errors="ignore") as f:
-        for line in f:
-            if line.strip().startswith("#"):
-                continue
-            lines.append(line)
-            if len(lines) >= CSV_SNIFF_SAMPLE_ROWS:
-                break
-    sample = "".join(lines)
+    sample = "".join(probe["sample_lines"])
     try:
         if delimiter:
             dialect = csv.Sniffer().sniff(sample, delimiters=delimiter)

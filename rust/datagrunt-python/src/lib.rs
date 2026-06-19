@@ -71,6 +71,10 @@ fn check_ragged(path: PathBuf, delimiter: &str) -> PyResult<bool> {
 /// CSVDialect equivalent: None for empty/blank files or an undeterminable
 /// sample; otherwise the raw sniffed dialect fields. lineterminator and
 /// quoting are constants in csv.Sniffer.sniff; escapechar is never set.
+///
+/// Routes through a single `probe_csv_header` call (1 file open) — the probe's
+/// `sample_lines` joined gives the dialect sample, matching the Python refactor
+/// in `_compute_python.sniff_dialect`.
 #[pyfunction]
 #[pyo3(signature = (path, delimiter=None))]
 fn sniff_dialect(
@@ -78,10 +82,11 @@ fn sniff_dialect(
     path: PathBuf,
     delimiter: Option<String>,
 ) -> PyResult<Option<Py<PyDict>>> {
-    if datagrunt_core::io::is_empty(&path).map_err(oserr)? || datagrunt_core::io::is_blank(&path) {
+    let probe = datagrunt_core::rows::probe_csv_header(&path).map_err(oserr)?;
+    if probe.empty || probe.blank {
         return Ok(None);
     }
-    let sample = datagrunt_core::dialect::sniff_sample(&path).map_err(oserr)?;
+    let sample = probe.sample_lines.join("");
     // An empty delimiter string is Python-falsy (`if delimiter:`), meaning "no
     // restriction" — normalize it to None so it doesn't reject every candidate
     // (Some("") would make the substring guard `"".contains(x)` reject all).
@@ -100,6 +105,23 @@ fn sniff_dialect(
     Ok(Some(dict.into()))
 }
 
+/// `probe_csv_header(path) -> dict` — single-pass header probe.
+///
+/// Returns a dict with keys: `empty`, `blank`, `first_row`, `sample_rows`,
+/// `sample_lines`.  Identical values to `_compute_python.probe_csv_header`
+/// for all corpus files (enforced by the parity test suite).
+#[pyfunction]
+fn probe_csv_header(py: Python<'_>, path: PathBuf) -> PyResult<Py<PyDict>> {
+    let probe = datagrunt_core::rows::probe_csv_header(&path).map_err(oserr)?;
+    let d = PyDict::new(py);
+    d.set_item("empty", probe.empty)?;
+    d.set_item("blank", probe.blank)?;
+    d.set_item("first_row", probe.first_row)?;
+    d.set_item("sample_rows", probe.sample_rows)?;
+    d.set_item("sample_lines", probe.sample_lines)?;
+    Ok(d.into())
+}
+
 #[pymodule]
 #[pyo3(name = "_native")]
 fn datagrunt_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -113,5 +135,6 @@ fn datagrunt_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(row_count_with_header, m)?)?;
     m.add_function(wrap_pyfunction!(check_ragged, m)?)?;
     m.add_function(wrap_pyfunction!(sniff_dialect, m)?)?;
+    m.add_function(wrap_pyfunction!(probe_csv_header, m)?)?;
     Ok(())
 }

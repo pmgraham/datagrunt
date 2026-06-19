@@ -7,7 +7,6 @@ const SAFE_DELIMITERS: [char; 4] = [',', ';', '|', '\t'];
 const SPACE_DELIMITER: char = ' ';
 const DEFAULT_DELIMITER: &str = ",";
 const DEFAULT_TAB_DELIMITER: &str = "\t";
-const CANDIDATE_SAMPLE_ROWS: usize = 5;
 const MIN_CONSISTENT_FIELDS: usize = 3;
 
 /// Python DELIMITER_REGEX_PATTERN [^0-9a-zA-Z_ "-]: candidate = any char that
@@ -62,27 +61,31 @@ fn splits_rows_consistently(sample: &[String], c: char) -> bool {
 /// punctuation candidate that splits the sampled rows consistently; then
 /// space if consistent; else comma. Returns a 1-char String (str in Python).
 /// Errs only on file IO (e.g. missing file), like the Python original.
+///
+/// Uses a single `probe_csv_header` call (1 file open) instead of the
+/// previous separate `is_empty` / `is_blank` / `first_row` / `leading_rows`
+/// calls (3 opens), matching the Python refactor in `_compute_python`.
 pub fn infer_delimiter(path: &Path) -> std::io::Result<String> {
+    // .tsv extension wins immediately — no file content needed.
     if io::is_tsv(path) {
         return Ok(DEFAULT_TAB_DELIMITER.to_string());
     }
-    if io::is_empty(path)? || io::is_blank(path) {
+    let probe = rows::probe_csv_header(path)?;
+    if probe.empty || probe.blank {
         return Ok(DEFAULT_DELIMITER.to_string());
     }
-    let first = rows::first_row(path)?;
-    let candidates = candidates_most_common_first(&first);
+    let candidates = candidates_most_common_first(&probe.first_row);
     for c in &candidates {
         if SAFE_DELIMITERS.contains(c) {
             return Ok(c.to_string());
         }
     }
-    let sample = rows::leading_rows(path, CANDIDATE_SAMPLE_ROWS)?;
     for c in &candidates {
-        if splits_rows_consistently(&sample, *c) {
+        if splits_rows_consistently(&probe.sample_rows, *c) {
             return Ok(c.to_string());
         }
     }
-    if splits_rows_consistently(&sample, SPACE_DELIMITER) {
+    if splits_rows_consistently(&probe.sample_rows, SPACE_DELIMITER) {
         return Ok(SPACE_DELIMITER.to_string());
     }
     Ok(DEFAULT_DELIMITER.to_string())
