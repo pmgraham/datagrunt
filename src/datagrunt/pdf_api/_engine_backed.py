@@ -53,4 +53,8 @@ class _PDFEngineBacked(PDFComponents):
         )
         if self._engine_role == "reader":
             return factory.create_reader()
-        return factory.create_writer()
+        if self._engine_role == "writer":
+            return factory.create_writer()
+        raise NotImplementedError(
+            f"Subclass must set _engine_role to 'reader' or 'writer', got {self._engine_role!r}"
+        )
