@@ -17,6 +17,7 @@ from datagrunt.core.pdf_io.extraction.markdown_escape import (
     escape_markdown_link_text,
 )
 from datagrunt.core.pdf_io.extraction.ocr import dpi_for_page
+from datagrunt.core.pdf_io.extraction.pdfium_native import PdfiumNativeReader
 from datagrunt.core.pdf_io.extraction.pymupdf_backend import PyMuPDFBackend
 
 PIPELINE_TYPE = "pure_python_local_v1"
@@ -307,6 +308,53 @@ class ParsedDocument:
         lines = ["| " + " | ".join(header) + " |", "| " + " | ".join(["---"] * width) + " |"]
         lines += ["| " + " | ".join(r) + " |" for r in body]
         return "\n".join(lines)
+
+
+def document_is_structured(document: dict) -> bool:
+    """True if the document uses the unified ``elements`` schema (vs native).
+
+    The unified schema (pymupdf, or pdfium in structured mode) carries an
+    ``elements`` list per page; the lean native pdfium schema does not. A single
+    detector keeps every schema-dependent dispatch (flatten, dedupe, image
+    collection) consistent.
+    """
+    return any("elements" in pg for pg in document.get("document", {}).get("pages", []))
+
+
+def flatten_document(document: dict) -> list:
+    """Flatten a parsed document into one record per element, dispatching on schema."""
+    if document_is_structured(document):
+        return ParsedDocument(document).flatten()
+    return PdfiumNativeReader.flatten(document)
+
+
+def dedupe_document_images(document: dict, image_output_dir: str) -> None:
+    """Collapse byte-identical image files in a parsed document, dispatching on schema."""
+    if document_is_structured(document):
+        ParsedDocument(document).dedupe_images(image_output_dir=image_output_dir)
+    else:
+        PdfiumNativeReader.dedupe_images(document, image_output_dir=image_output_dir)
+
+
+def collect_image_paths(document: dict) -> list:
+    """Return unique image file paths in document order, dispatching on schema."""
+    structured = document_is_structured(document)
+    paths = []
+    seen = set()
+    for page in document.get("document", {}).get("pages", []):
+        if structured:
+            candidates = [
+                (el.get("metadata") or {}).get("file_path")
+                for el in page.get("elements", [])
+                if el.get("type") == "image"
+            ]
+        else:
+            candidates = [img.get("file") for img in page.get("images", [])]
+        for fp in candidates:
+            if fp and fp not in seen:
+                seen.add(fp)
+                paths.append(fp)
+    return paths
 
 
 class PDFComponents(FileProperties):

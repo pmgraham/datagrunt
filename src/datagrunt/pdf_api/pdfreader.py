@@ -10,7 +10,6 @@ import pyarrow as pa
 # local libraries
 from datagrunt.core import PDFComponents, PDFEngineFactory
 from datagrunt.core.pdf_io import pdfcomponents
-from datagrunt.core.pdf_io.extraction import PdfiumNativeReader
 
 
 class PDFReader(PDFComponents):
@@ -86,14 +85,8 @@ class PDFReader(PDFComponents):
             A Polars DataFrame with one row per extracted element.
         """
         if self._parsed_dict is not None:
-            is_structured = any("elements" in pg for pg in self._parsed_dict.get("document", {}).get("pages", []))
-            if is_structured:
-                records = pdfcomponents.ParsedDocument(self._parsed_dict).flatten()
-            else:
-                records = PdfiumNativeReader.flatten(self._parsed_dict)
-            if not records:
-                return pl.DataFrame()
-            return pl.DataFrame(records)
+            records = pdfcomponents.flatten_document(self._parsed_dict)
+            return pl.DataFrame(records) if records else pl.DataFrame()
         if self.is_empty:
             return self._return_empty_file_object(pl.DataFrame())
         return self._create_reader().to_dataframe(drop_layout_tables=drop_layout_tables)
@@ -109,14 +102,8 @@ class PDFReader(PDFComponents):
             A PyArrow table with one row per extracted element.
         """
         if self._parsed_dict is not None:
-            is_structured = any("elements" in pg for pg in self._parsed_dict.get("document", {}).get("pages", []))
-            if is_structured:
-                records = pdfcomponents.ParsedDocument(self._parsed_dict).flatten()
-            else:
-                records = PdfiumNativeReader.flatten(self._parsed_dict)
-            if not records:
-                return pa.Table.from_pydict({})
-            return pa.Table.from_pylist(records)
+            records = pdfcomponents.flatten_document(self._parsed_dict)
+            return pa.Table.from_pylist(records) if records else pa.Table.from_pydict({})
         if self.is_empty:
             return self._return_empty_file_object(pa.Table.from_pydict({}))
         return self._create_reader().to_arrow_table(drop_layout_tables=drop_layout_tables)
