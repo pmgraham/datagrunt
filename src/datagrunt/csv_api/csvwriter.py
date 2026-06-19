@@ -18,6 +18,17 @@ class CSVWriter(CSVComponents):
     """
     Class to unify the interface for converting CSV files to various other
     supported file types.
+
+    Security:
+        Cell values are written verbatim — datagrunt preserves data, it does
+        not transform or sanitize it. For the spreadsheet-interpreted formats
+        (``write_csv`` and ``write_excel``), a value beginning with ``=``,
+        ``+``, ``-``, ``@`` (or a leading tab/carriage return) is treated as a
+        FORMULA by Excel / LibreOffice / Google Sheets when the file is opened
+        — the classic CSV/formula-injection vector (CWE-1236). If your source
+        data is untrusted and the output may be opened in a spreadsheet
+        application, sanitize at the application layer before export; datagrunt
+        will not silently mutate the values for you.
     """
 
     def __init__(self, filepath, engine="duckdb", lenient=False, normalize_columns=False):
