@@ -18,14 +18,26 @@ LIST_MARKER_REGEX = re.compile(
 )
 
 
-def classify_font_size(font_size: float, is_bold: bool, all_sizes: list) -> str:
-    """Classify a block by font size relative to the page's size distribution.
+def page_median_size(all_sizes: list) -> float | None:
+    """Median font size for a page (legacy formula), or None if no sizes.
+
+    Uses ``sorted(all_sizes)[len(all_sizes) // 2]`` rather than ``statistics.median`` to
+    preserve exact parity with the original classifier (and the Rust port):
+    for even-length inputs this picks the upper-middle element, it does NOT
+    average the two middle values.
+    """
+    if not all_sizes:
+        return None
+    return sorted(all_sizes)[len(all_sizes) // 2]
+
+
+def classify_by_median(font_size: float, median_size) -> str:
+    """Classify a block by font size relative to a precomputed page median.
 
     Ported from the original ``extractors._classify_block`` (identical thresholds).
     """
-    if not all_sizes:
+    if median_size is None:
         return "body_text"
-    median_size = sorted(all_sizes)[len(all_sizes) // 2]
     if font_size >= median_size * 1.6:
         return "header"
     if font_size >= median_size * 1.2:
@@ -33,6 +45,17 @@ def classify_font_size(font_size: float, is_bold: bool, all_sizes: list) -> str:
     if font_size < median_size * 0.85:
         return "caption"
     return "body_text"
+
+
+def classify_font_size(font_size: float, is_bold: bool, all_sizes: list) -> str:
+    """Classify a block by font size relative to the page's size distribution.
+
+    Back-compat wrapper retained for callers that pass the raw size list; the
+    hot extraction paths precompute the median once via ``page_median_size``
+    and call ``classify_by_median`` directly. ``is_bold`` is accepted for
+    signature compatibility and not used in the thresholds.
+    """
+    return classify_by_median(font_size, page_median_size(all_sizes))
 
 
 class TextBlockBuilder:
@@ -48,29 +71,30 @@ class TextBlockBuilder:
 
     def build(self, items: list) -> list:
         """Return a list of classified ``TextBlock`` from raw ``TextItem`` list.
-        
+
         Processes the items in reading order, identifying column layouts to prevent bleed-over.
         """
         if not items:
             return []
-            
+
         sorter = PageLayoutSorter(TextItemAdapter())
         segments = sorter.partition(items)
         all_blocks = []
         all_sizes = [it.size for it in items if it.text]
-        
+        median_size = page_median_size(all_sizes)
+
         order = 0
         for seg_items in segments:
             if not seg_items:
                 continue
             lines = self._cluster_into_lines(seg_items)
             merged = self._merge_lines(lines)
-            blocks = self._finalize(merged, all_sizes)
+            blocks = self._finalize(merged, median_size)
             for b in blocks:
                 b.reading_order = order
                 order += 1
             all_blocks.extend(blocks)
-            
+
         return all_blocks
 
     def _cluster_into_lines(self, items: list) -> list:
@@ -159,7 +183,7 @@ class TextBlockBuilder:
         prev["bold"] = prev["bold"] or ln["bold"]
         prev["italic"] = prev["italic"] or ln["italic"]
 
-    def _finalize(self, merged: list, all_sizes: list) -> list:
+    def _finalize(self, merged: list, median_size) -> list:
         """Convert merged line records into classified ``TextBlock`` objects."""
         blocks = []
         order = 0
@@ -174,7 +198,7 @@ class TextBlockBuilder:
                     font_size=round(b["size"], 1),
                     is_bold=b["bold"],
                     is_italic=b["italic"],
-                    classification=classify_font_size(round(b["size"], 1), b["bold"], all_sizes),
+                    classification=classify_by_median(round(b["size"], 1), median_size),
                     reading_order=order,
                 )
             )

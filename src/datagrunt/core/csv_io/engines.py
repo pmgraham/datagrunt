@@ -899,6 +899,21 @@ class CSVReaderPyArrowEngine(_PyArrowEngineMixin, CSVBaseReaderEngine):
 class CSVWriterPyArrowEngine(_PyArrowEngineMixin, CSVBaseWriterEngine):
     """Class to write CSVs to other file formats powered by PyArrow."""
 
+    def __init__(self, filepath, lenient=False, normalize_columns=False):
+        super().__init__(filepath, lenient=lenient, normalize_columns=normalize_columns)
+        # Cache the parsed table per resolved normalize_columns value so that
+        # exporting one instance to several formats parses the source once.
+        # PyArrow tables are immutable and writes never mutate them, so the same
+        # table is safely shared across export formats (mirrors the Polars
+        # writer's _frame_cache).
+        self._table_cache = {}
+
+    def _table(self, normalize_columns):
+        """Return the parsed PyArrow table, reading the source once per mode."""
+        if normalize_columns not in self._table_cache:
+            self._table_cache[normalize_columns] = self._create_table(normalize_columns)
+        return self._table_cache[normalize_columns]
+
     def _create_table(self, normalize_columns=False):
         """Create a PyArrow table for writing operations (all columns as string)."""
         columns = CSVColumns(self.filepath, delimiter=self.queries.delimiter).columns
@@ -946,7 +961,7 @@ class CSVWriterPyArrowEngine(_PyArrowEngineMixin, CSVBaseWriterEngine):
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.csv_export_filename, export_filename)
-        table = self._create_table(normalize_columns)
+        table = self._table(normalize_columns)
         # Use native PyArrow CSV writer - no dataframe conversion needed
         pacsv.write_csv(table, filename)
 
@@ -961,7 +976,7 @@ class CSVWriterPyArrowEngine(_PyArrowEngineMixin, CSVBaseWriterEngine):
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.excel_export_filename, export_filename)
-        table = self._create_table(normalize_columns)
+        table = self._table(normalize_columns)
         _arrow_to_polars(table).write_excel(filename)
 
     def write_json(self, export_filename=None, normalize_columns=None):
@@ -975,7 +990,7 @@ class CSVWriterPyArrowEngine(_PyArrowEngineMixin, CSVBaseWriterEngine):
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.json_export_filename, export_filename)
-        table = self._create_table(normalize_columns)
+        table = self._table(normalize_columns)
         # to_pylist does the Arrow->Python conversion in C, producing the same
         # list-of-dicts the per-row loop built, without the Python-level scan.
         with open(filename, "w") as f:
@@ -992,7 +1007,7 @@ class CSVWriterPyArrowEngine(_PyArrowEngineMixin, CSVBaseWriterEngine):
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.json_newline_export_filename, export_filename)
-        table = self._create_table(normalize_columns)
+        table = self._table(normalize_columns)
         # Convert per record batch (C-level) instead of cell-by-cell in Python,
         # while still streaming one line at a time to keep memory bounded.
         with open(filename, "w") as f:
@@ -1011,6 +1026,6 @@ class CSVWriterPyArrowEngine(_PyArrowEngineMixin, CSVBaseWriterEngine):
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.parquet_export_filename, export_filename)
-        table = self._create_table(normalize_columns)
+        table = self._table(normalize_columns)
         # Use native PyArrow Parquet writer - no dataframe conversion needed
         pq.write_table(table, filename)
