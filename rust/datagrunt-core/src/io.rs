@@ -112,18 +112,27 @@ pub struct DecodedReader {
 }
 
 impl DecodedReader {
-    /// Open `path` for streaming decoded reads. `translate_newlines` mirrors
-    /// Python's `newline=None` (true) vs `newline=""` (false).
-    pub fn open(path: &Path, translate_newlines: bool) -> std::io::Result<Self> {
-        Ok(DecodedReader {
-            inner: BufReader::new(File::open(path)?),
+    /// Wrap an already-open `File` for streaming decoded reads.
+    ///
+    /// The file position is used as-is; callers that probe the file first
+    /// must seek back to offset 0 before calling this so decoding starts
+    /// from the file's beginning (BOM detection requires offset 0).
+    pub fn from_file(file: File, translate_newlines: bool) -> Self {
+        DecodedReader {
+            inner: BufReader::new(file),
             translate_newlines,
             carry: Vec::new(),
             pending: Vec::new(),
             pending_pos: 0,
             bom_checked: false,
             eof: false,
-        })
+        }
+    }
+
+    /// Open `path` for streaming decoded reads. `translate_newlines` mirrors
+    /// Python's `newline=None` (true) vs `newline=""` (false).
+    pub fn open(path: &Path, translate_newlines: bool) -> std::io::Result<Self> {
+        Ok(Self::from_file(File::open(path)?, translate_newlines))
     }
 
     /// Read the next raw chunk from the file into `chunk`. Returns bytes read
