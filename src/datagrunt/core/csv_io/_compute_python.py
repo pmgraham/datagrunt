@@ -42,6 +42,22 @@ SPECIAL_CHARS_PATTERN = re.compile(r"[^a-z0-9]+")
 MULTI_UNDERSCORE_PATTERN = re.compile(r"_+")
 EMPTY_NAME_PLACEHOLDER = "column"
 
+# Bound per-physical-line length so a malformed newline-free file (one giant
+# line) cannot force unbounded buffering (issue #222). 2Mi chars is far above
+# any realistic CSV line/header, so this only ever truncates pathological input.
+MAX_LINE_CHARS = 2 * 1024 * 1024
+
+
+def _capped_lines(f):
+    """Yield each line from a text file, truncated to ``MAX_LINE_CHARS`` chars.
+
+    Mirrors the Rust line readers' per-line cap so the two backends agree on
+    pathological (multi-MB single-line) input. The cap is by character count
+    (identical to Rust's), keeping parity decode-agnostic.
+    """
+    for line in f:
+        yield line if len(line) <= MAX_LINE_CHARS else line[:MAX_LINE_CHARS]
+
 
 def is_legacy_mac_newlines(filepath):
     """True if the file uses legacy Mac OS carriage returns (\\r) as line endings."""
@@ -57,7 +73,7 @@ def count_leading_comments(filepath):
     """Count leading ``#``-prefixed comment lines before the header (blanks skipped)."""
     count = 0
     with open(filepath, "r", encoding=FileProperties(filepath).DEFAULT_ENCODING, errors="ignore") as f:
-        for line in f:
+        for line in _capped_lines(f):
             stripped = line.strip()
             if stripped.startswith("#"):
                 count += 1
@@ -72,7 +88,7 @@ def count_leading_physical_lines_before_header(filepath):
     """Count every leading physical line up to and including the header line."""
     count = 0
     with open(filepath, "r", encoding=FileProperties(filepath).DEFAULT_ENCODING, errors="ignore") as f:
-        for line in f:
+        for line in _capped_lines(f):
             stripped = line.strip()
             count += 1
             if stripped and not stripped.startswith("#"):
@@ -84,7 +100,7 @@ def leading_rows(filepath, limit):
     """Up to ``limit`` leading non-blank, non-comment rows, each stripped."""
     rows = []
     with open(filepath, "r", encoding=FileProperties(filepath).DEFAULT_ENCODING, errors="ignore") as f:
-        for line in f:
+        for line in _capped_lines(f):
             stripped = line.strip()
             if stripped and not stripped.startswith("#"):
                 rows.append(stripped)
@@ -187,7 +203,7 @@ def probe_csv_header(filepath):
     sample_rows = []
     saw_nonblank = False
     with open(filepath, "r", encoding=props.DEFAULT_ENCODING, errors="ignore") as f:
-        for line in f:
+        for line in _capped_lines(f):
             stripped = line.strip()
             if stripped:
                 saw_nonblank = True

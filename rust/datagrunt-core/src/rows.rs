@@ -1,6 +1,9 @@
 //! Ports of CSVRows probes and the leading-line counters.
 
-use crate::io::{is_empty, is_legacy_mac_newlines, universal_lines, DecodedReader};
+use crate::io::{
+    decode_ignore, is_empty, is_legacy_mac_newlines, take_chars, universal_lines, DecodedReader,
+    MAX_LINE_CHARS, MAX_LINE_READ_BYTES,
+};
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 
@@ -52,14 +55,63 @@ pub fn probe_csv_header(path: &Path) -> std::io::Result<HeaderProbe> {
     let mut saw_nonblank = false;
     let mut segment: Vec<u8> = Vec::new();
     loop {
+        // Bounded read: accumulate bytes up to MAX_LINE_READ_BYTES or until
+        // we find a '\n' (whichever comes first). If we hit the byte cap
+        // before finding '\n', stream-skip the rest of the physical line so
+        // a malformed newline-free file cannot grow `segment` without bound.
         segment.clear();
-        let n = reader.read_until(b'\n', &mut segment)?;
-        if n == 0 {
+        let mut total_read = 0usize;
+        let mut found_newline = false;
+        loop {
+            let available = reader.fill_buf()?;
+            if available.is_empty() {
+                break; // EOF
+            }
+            let newline_pos = available.iter().position(|&b| b == b'\n');
+            let take = if let Some(pos) = newline_pos {
+                pos + 1 // include the '\n'
+            } else {
+                available.len()
+            };
+            let budget = MAX_LINE_READ_BYTES.saturating_sub(total_read);
+            let capped_take = take.min(budget);
+            segment.extend_from_slice(&available[..capped_take]);
+            reader.consume(capped_take);
+            total_read += capped_take;
+            if newline_pos.map_or(false, |pos| capped_take >= pos + 1) {
+                found_newline = true;
+                break;
+            }
+            if total_read >= MAX_LINE_READ_BYTES {
+                // Byte cap hit before newline: stream-skip to end of line.
+                loop {
+                    let avail2 = reader.fill_buf()?;
+                    if avail2.is_empty() {
+                        break; // EOF
+                    }
+                    let nl = avail2.iter().position(|&b| b == b'\n');
+                    if let Some(pos) = nl {
+                        reader.consume(pos + 1);
+                        break;
+                    } else {
+                        let len = avail2.len();
+                        reader.consume(len);
+                    }
+                }
+                break;
+            }
+        }
+        if total_read == 0 && !found_newline {
             break; // EOF
         }
-        // DecodedReader yields valid UTF-8 only.
-        let text =
-            String::from_utf8(std::mem::take(&mut segment)).expect("DecodedReader yields UTF-8");
+        // Decode with `decode_ignore` (not `from_utf8`): the byte-cap path above
+        // can stop mid-multibyte-char at MAX_LINE_READ_BYTES, leaving an
+        // incomplete trailing sequence in `segment`. `decode_ignore` drops it
+        // (matching io.rs and Python's errors="ignore"), so a malformed
+        // newline-free file cannot panic across the PyO3 boundary. Then apply
+        // the char cap for parity with the Python reference.
+        let raw = decode_ignore(&segment);
+        let text = take_chars(&raw, MAX_LINE_CHARS);
         // `stripped` mirrors Python's `line.strip()`.
         let stripped = text.trim();
         if !stripped.is_empty() {
@@ -269,5 +321,41 @@ mod tests {
         assert_eq!(p.sample_lines[0], "\n"); // the blank line
         assert_eq!(p.sample_lines[1], "name,age\n");
         assert_eq!(p.sample_lines[2], "Alice,30\n");
+    }
+
+    /// Regression (panic-DoS): a newline-free line whose bytes exceed
+    /// MAX_LINE_READ_BYTES with a multibyte char straddling the byte cap must
+    /// NOT panic. The byte-cap chop leaves an incomplete UTF-8 sequence in the
+    /// buffer; `decode_ignore` drops it instead of `from_utf8` panicking across
+    /// the PyO3 boundary.
+    #[test]
+    fn probe_multibyte_straddling_byte_cap_does_not_panic() {
+        // (MAX_LINE_READ_BYTES - 1) ASCII bytes + '€' (3 bytes): the byte cap at
+        // MAX_LINE_READ_BYTES slices the first byte of '€', leaving an incomplete
+        // sequence. No trailing newline (pure #222 scenario).
+        let mut content: Vec<u8> = b"a".repeat(MAX_LINE_READ_BYTES - 1);
+        content.extend_from_slice("€".as_bytes());
+        let f = tmp(&content);
+        let p = probe_csv_header(f.path()).unwrap(); // must not panic
+        assert_eq!(p.first_row.chars().count(), MAX_LINE_CHARS);
+        assert_eq!(p.sample_lines[0].chars().count(), MAX_LINE_CHARS);
+    }
+
+    /// Parity-class lock: a giant line of a leading invalid byte + all-4-byte
+    /// chars. The probe budgets on the DECODED stream (DecodedReader drops the
+    /// invalid byte before the byte budget), so 8 MiB of decoded 4-byte chars is
+    /// exactly MAX_LINE_CHARS chars — matching Python's decode-then-slice. This
+    /// guards the probe path against the raw-vs-decoded-budget bug class that was
+    /// fixed in io.rs (the probe was already correct via DecodedReader; this keeps
+    /// it that way). A pure (undelimited) case can't live in the shared parity
+    /// corpus because Python's csv.field_size_limit would trip in row-count parity.
+    #[test]
+    fn probe_giant_4byte_with_leading_invalid_byte_yields_full_char_cap() {
+        let mut content: Vec<u8> = vec![0xff];
+        content.extend_from_slice("\u{1F600}".repeat(MAX_LINE_CHARS + 50).as_bytes());
+        let f = tmp(&content);
+        let p = probe_csv_header(f.path()).unwrap();
+        assert_eq!(p.first_row.chars().count(), MAX_LINE_CHARS);
+        assert_eq!(p.sample_lines[0].chars().count(), MAX_LINE_CHARS);
     }
 }

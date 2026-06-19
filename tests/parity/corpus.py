@@ -63,4 +63,46 @@ CORPUS: dict[str, bytes] = {
     # quoted \r must stay part of one record rather than splitting the row.
     # Exercises the legacy-mac branch and quoting together for both backends.
     "legacy_mac_quoted_cr.csv": b'id,note\r1,"line one\rline two"\r2,plain\r',
+    # Giant-line entries for per-line cap parity (issue #222 / #176).
+    # These verify that both backends truncate to exactly MAX_LINE_CHARS chars
+    # and that char-based (not byte-based) counting governs the boundary.
+    #
+    # (a) Giant ASCII line: 2,252,800 chars > MAX_LINE_CHARS (2,097,152).
+    #     Both backends must yield exactly MAX_LINE_CHARS chars from this line.
+    "giant_ascii_line.csv": b"a," * 1_126_400 + b"\n",
+    # (b) Giant line with a 3-byte UTF-8 char (€) placed right at the char
+    #     boundary. The line uses a comma-delimited "a," pattern so no single
+    #     field exceeds CPython's csv field-size limit (the cap is per physical
+    #     line, not per field); the '€' lands at char index MAX_LINE_CHARS-1
+    #     (the last char kept by truncation). 2Mi-2 pattern chars + 'a' + '€'
+    #     puts '€' exactly on the boundary, then ",more" overflows the cap.
+    #     Verifies Rust counts CHARS (not bytes) and lands on the multibyte char.
+    "giant_multibyte_near_cap.csv": (
+        b"a," * (1024 * 1024 - 1) + b"a" + "€".encode("utf-8") + b",more,fields,here\n"
+    ),
+    # (c) Giant line terminated with \r\n followed by a normal data line.
+    #     After capping the giant line, the next line must still be read
+    #     correctly — validates stream-skip alignment for both backends.
+    "giant_crlf_line.csv": b"b," * 1_126_400 + b"\r\nnext_line\n",
+    # (d) Giant line with a LEADING invalid UTF-8 byte followed by a long run
+    #     of comma-delimited 4-byte chars (😀). Repro for the raw-byte-budget
+    #     bug: the leading \xff is dropped by errors="ignore", so a byte-budgeted
+    #     decoder yields MAX_LINE_CHARS-1 chars while Python decodes the whole
+    #     line then slices [:MAX_LINE_CHARS]. Both backends must yield exactly
+    #     MAX_LINE_CHARS decoded chars (budget on DECODED chars, not raw bytes).
+    #
+    #     Uses a comma-delimited "😀," pattern (each field is a single 😀, well
+    #     under CPython's csv field-size limit — the cap is per physical line,
+    #     not per field). 1_800_000 reps = 9,000,000 raw bytes (> 8 MiB
+    #     MAX_LINE_READ_BYTES, so the streaming cap branch fires) and 3,600,000
+    #     decoded chars (> 2 Mi MAX_LINE_CHARS).
+    "giant_invalid_leading_byte.csv": (
+        b"\xff" + "😀,".encode("utf-8") * 1_800_000 + b"\n"
+    ),
+    # (e) Same shape as (d) but WITHOUT the leading invalid byte: no dropped
+    #     bytes. Both backends must still yield exactly MAX_LINE_CHARS chars —
+    #     verifies the fix does not regress clean 4-byte-char giant lines.
+    "giant_4byte_chars_no_invalid.csv": (
+        "😀,".encode("utf-8") * 1_800_000 + b"\n"
+    ),
 }
