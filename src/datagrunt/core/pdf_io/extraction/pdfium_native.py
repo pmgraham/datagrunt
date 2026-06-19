@@ -3,13 +3,14 @@
 import json
 from pathlib import Path
 
+from datagrunt.core.pdf_io.extraction._doc_session import _ThreadLocalDocSession
 from datagrunt.core.pdf_io.extraction.image_dedupe import dedupe_image_files
 from datagrunt.core.pdf_io.extraction.markdown_escape import escape_leading_markdown
 from datagrunt.core.pdf_io.extraction.ocr import dpi_for_page, ocr_data_to_blocks
 from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
 
 
-class PdfiumNativeReader:
+class PdfiumNativeReader(_ThreadLocalDocSession):
     """Parse pages into the native pdfium schema and assemble documents."""
 
     def __init__(self, filepath):
@@ -23,25 +24,8 @@ class PdfiumNativeReader:
 
         self._local = threading.local()
 
-    def __enter__(self):
-        if not hasattr(self._local, "depth"):
-            self._local.depth = 0
-        if self._local.depth == 0:
-            self._local.doc = PdfiumDocument(self.filepath)
-        self._local.depth += 1
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self._local.depth -= 1
-        if self._local.depth == 0:
-            if hasattr(self._local, "doc") and self._local.doc:
-                self._local.doc.close()
-                self._local.doc = None
-
-    def _get_doc(self):
-        if hasattr(self._local, "doc") and self._local.doc:
-            return self._local.doc, False
-        return PdfiumDocument(self.filepath), True
+    def _open_resource(self):
+        return PdfiumDocument(self.filepath)
 
     def parse_page(self, page_index: int, image_output_dir: str = None) -> dict:
         """Parse one page into the native schema dict."""

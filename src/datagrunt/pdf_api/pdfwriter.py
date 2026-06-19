@@ -5,7 +5,6 @@ import json
 
 # local libraries
 from datagrunt.core.pdf_io import pdfcomponents
-from datagrunt.core.pdf_io.extraction import PdfiumNativeReader
 from datagrunt.pdf_api._engine_backed import _PDFEngineBacked
 
 
@@ -46,9 +45,7 @@ class PDFWriter(_PDFEngineBacked):
             document = self._parsed_dict
             if image_output_dir and dedupe_images:
                 pdfcomponents.dedupe_document_images(document, image_output_dir)
-            with open(filename, "w", encoding="utf-8") as f:
-                json.dump(document, f, indent=2)
-            return filename
+            return pdfcomponents.write_document_json(document, filename)
         # Mirror PDFReader's is_empty handling: a 0-byte PDF produces an empty
         # document ({}) rather than a raw PdfiumError from loading the file.
         if self.is_empty:
@@ -77,11 +74,7 @@ class PDFWriter(_PDFEngineBacked):
             document = self._parsed_dict
             if image_output_dir and dedupe_images:
                 pdfcomponents.dedupe_document_images(document, image_output_dir)
-            records = pdfcomponents.flatten_document(document)
-            with open(filename, "w", encoding="utf-8") as f:
-                for record in records:
-                    f.write(json.dumps(record) + "\n")
-            return filename
+            return pdfcomponents.write_document_jsonl(document, filename)
         # Mirror PDFReader's is_empty handling: a 0-byte PDF has no elements, so
         # the JSONL output is an empty file rather than a raw PdfiumError.
         if self.is_empty:
@@ -110,13 +103,7 @@ class PDFWriter(_PDFEngineBacked):
             document = self._parsed_dict
             if image_output_dir and dedupe_images:
                 pdfcomponents.dedupe_document_images(document, image_output_dir)
-            if pdfcomponents.document_is_structured(document):
-                markdown_text = pdfcomponents.ParsedDocument(document).to_markdown(export_filename=filename)
-            else:
-                markdown_text = PdfiumNativeReader.to_markdown(document)
-            with open(filename, "w", encoding="utf-8") as f:
-                f.write(markdown_text)
-            return filename
+            return pdfcomponents.write_document_markdown(document, filename)
         # Mirror PDFReader's is_empty handling: a 0-byte PDF has no content, so
         # the Markdown output is an empty file rather than a raw PdfiumError.
         if self.is_empty:

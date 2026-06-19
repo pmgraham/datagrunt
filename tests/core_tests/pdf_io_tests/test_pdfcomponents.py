@@ -530,3 +530,207 @@ class TestMarkdownMetacharacterEscaping:
         path = str(Path("/tmp/foo]bar.png"))
         md = self._markdown([self._image_element(path)])
         assert "foo\\]bar.png" in md
+
+
+# ---------------------------------------------------------------------------
+# Shared serialization helpers: write_document_json / jsonl / markdown
+# ---------------------------------------------------------------------------
+
+# Minimal structured document (unified element schema).
+_STRUCTURED_DOC = {
+    "document": {
+        "source": "test.pdf",
+        "total_pages": 1,
+        "processing_id": "proc_py_0",
+        "pipeline_type": "pure_python_local_v1",
+        "errors": None,
+        "pages": [
+            {
+                "page_number": 1,
+                "width": 612.0,
+                "height": 792.0,
+                "classification": "text_only",
+                "elements": [
+                    {
+                        "id": "elem_01_001",
+                        "type": "header",
+                        "content": "Test Header",
+                        "page": 1,
+                        "position": {"x": 0.0, "y": 0.0, "w": 100.0, "h": 20.0},
+                        "confidence": 1.0,
+                        "metadata": {
+                            "font": "Helvetica",
+                            "font_size": 18.0,
+                            "is_bold": True,
+                            "is_italic": False,
+                            "reading_order": 1,
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+}
+
+# Minimal native pdfium document (no 'elements' per page).
+# text_objects must be non-empty for flatten() to produce records.
+_NATIVE_DOC = {
+    "document": {
+        "source": "test.pdf",
+        "page_count": 1,
+        "pages": [
+            {
+                "page_number": 1,
+                "width": 612.0,
+                "height": 792.0,
+                "text": "Hello from native pdfium",
+                "text_objects": [{"x": 0.0, "y": 0.0, "text": "Hello from native pdfium", "size": 12.0}],
+                "images": [],
+                "ocr": [],
+            }
+        ],
+    }
+}
+
+
+class TestWriteDocumentJson:
+    """write_document_json writes valid JSON with indent=2 and returns the path."""
+
+    def test_structured_doc_roundtrips(self, tmp_path):
+        import json
+
+        from datagrunt.core.pdf_io.pdfcomponents import write_document_json
+
+        out = tmp_path / "doc.json"
+        result = write_document_json(_STRUCTURED_DOC, str(out))
+
+        assert result == str(out)
+        loaded = json.loads(out.read_text(encoding="utf-8"))
+        assert loaded == _STRUCTURED_DOC
+
+    def test_native_doc_roundtrips(self, tmp_path):
+        import json
+
+        from datagrunt.core.pdf_io.pdfcomponents import write_document_json
+
+        out = tmp_path / "native.json"
+        write_document_json(_NATIVE_DOC, str(out))
+        loaded = json.loads(out.read_text(encoding="utf-8"))
+        assert loaded == _NATIVE_DOC
+
+    def test_uses_indent_2(self, tmp_path):
+        """Output must use indent=2 to be byte-identical to the historical engine output."""
+        import json
+
+        from datagrunt.core.pdf_io.pdfcomponents import write_document_json
+
+        out = tmp_path / "indented.json"
+        write_document_json(_STRUCTURED_DOC, str(out))
+        expected = json.dumps(_STRUCTURED_DOC, indent=2)
+        assert out.read_text(encoding="utf-8") == expected
+
+
+class TestWriteDocumentJsonl:
+    """write_document_jsonl writes one flattened record per line."""
+
+    def test_structured_doc_produces_records(self, tmp_path):
+        import json
+
+        from datagrunt.core.pdf_io.pdfcomponents import write_document_jsonl
+
+        out = tmp_path / "doc.jsonl"
+        result = write_document_jsonl(_STRUCTURED_DOC, str(out))
+
+        assert result == str(out)
+        lines = [ln for ln in out.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        assert len(lines) == 1  # one element in the doc
+        record = json.loads(lines[0])
+        assert record["type"] == "header"
+        assert record["content"] == "Test Header"
+
+    def test_native_doc_produces_records(self, tmp_path):
+        import json
+
+        from datagrunt.core.pdf_io.pdfcomponents import write_document_jsonl
+
+        out = tmp_path / "native.jsonl"
+        write_document_jsonl(_NATIVE_DOC, str(out))
+        lines = [ln for ln in out.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        assert len(lines) >= 1
+        json.loads(lines[0])  # each line is valid JSON
+
+    def test_each_line_newline_terminated(self, tmp_path):
+        """Each record must end with '\\n' to match the historical byte output."""
+        from datagrunt.core.pdf_io.pdfcomponents import write_document_jsonl
+
+        out = tmp_path / "term.jsonl"
+        write_document_jsonl(_STRUCTURED_DOC, str(out))
+        raw = out.read_bytes()
+        # The file ends with a trailing LF and uses no CR (records are
+        # '\n'-separated, never '\r\n' or bare CR). ``json.dumps`` escapes any
+        # control bytes inside values, so a raw '\r' can only come from the
+        # separator — this assertion would catch that regression.
+        assert raw.endswith(b"\n") and b"\r" not in raw
+
+
+class TestWriteDocumentMarkdown:
+    """write_document_markdown dispatches on schema and writes the rendered text."""
+
+    def test_structured_doc_uses_parsed_document_renderer(self, tmp_path):
+        """Structured docs → ParsedDocument.to_markdown (unified element renderer)."""
+        from datagrunt.core.pdf_io.pdfcomponents import write_document_markdown
+
+        out = tmp_path / "doc.md"
+        result = write_document_markdown(_STRUCTURED_DOC, str(out))
+
+        assert result == str(out)
+        text = out.read_text(encoding="utf-8")
+        # The header element renders as an H1 heading.
+        assert "# Test Header" in text
+
+    def test_native_doc_uses_pdfium_native_renderer(self, tmp_path):
+        """Native pdfium docs → PdfiumNativeReader.to_markdown (text concatenation)."""
+        from datagrunt.core.pdf_io.pdfcomponents import write_document_markdown
+
+        out = tmp_path / "native.md"
+        result = write_document_markdown(_NATIVE_DOC, str(out))
+
+        assert result == str(out)
+        text = out.read_text(encoding="utf-8")
+        assert "Hello from native pdfium" in text
+
+    def test_dispatch_picks_right_renderer(self, tmp_path, monkeypatch):
+        """document_is_structured controls which renderer is called."""
+        from datagrunt.core.pdf_io import pdfcomponents
+
+        structured_calls = []
+        native_calls = []
+
+        original_is_structured = pdfcomponents.document_is_structured
+
+        def fake_is_structured(doc):
+            return original_is_structured(doc)
+
+        original_parsed_to_markdown = pdfcomponents.ParsedDocument.to_markdown
+
+        def spy_parsed(self, **kwargs):
+            structured_calls.append(True)
+            return original_parsed_to_markdown(self, **kwargs)
+
+        original_native_to_markdown = pdfcomponents.PdfiumNativeReader.to_markdown
+
+        @staticmethod
+        def spy_native(doc):
+            native_calls.append(True)
+            return original_native_to_markdown(doc)
+
+        monkeypatch.setattr(pdfcomponents.ParsedDocument, "to_markdown", spy_parsed)
+        monkeypatch.setattr(pdfcomponents.PdfiumNativeReader, "to_markdown", spy_native)
+
+        out_s = tmp_path / "s.md"
+        out_n = tmp_path / "n.md"
+        pdfcomponents.write_document_markdown(_STRUCTURED_DOC, str(out_s))
+        pdfcomponents.write_document_markdown(_NATIVE_DOC, str(out_n))
+
+        assert structured_calls == [True], "ParsedDocument.to_markdown not called for structured doc"
+        assert native_calls == [True], "PdfiumNativeReader.to_markdown not called for native doc"

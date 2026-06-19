@@ -59,6 +59,58 @@ def _has_midfile_comments(filepath):
     return False
 
 
+def _polars_read_csv(filepath, delimiter, truncate_ragged_lines, n_rows=None):
+    """Read a CSV file with Polars using the parity-critical option set.
+
+    All three Polars-backed read paths must agree on these parameters.
+    ``skip_rows`` skips only the LEADING comment block. Using
+    ``comment_prefix`` here would also drop any data row whose first field
+    begins with ``#`` (e.g. a hex color like ``#FF0000``), silently losing
+    rows (issue #73).
+
+    Args:
+        filepath: Path to the CSV file.
+        delimiter: Field separator character.
+        truncate_ragged_lines: Whether to silently truncate rows with more
+            fields than the header (lenient / ragged mode).
+        n_rows: Maximum number of data rows to read, or ``None`` for all.
+
+    Returns:
+        A Polars DataFrame with all columns kept as their raw string values
+        (``infer_schema=False``).
+    """
+    return pl.read_csv(
+        filepath,
+        separator=delimiter,
+        truncate_ragged_lines=truncate_ragged_lines,
+        infer_schema=False,
+        n_rows=n_rows,
+        skip_rows=_count_leading_comments(filepath),
+    )
+
+
+def _polars_read_to_string_arrow(filepath, delimiter, truncate_ragged_lines, n_rows=None):
+    """Read a CSV via Polars and return an all-string PyArrow table.
+
+    Calls ``_polars_read_csv`` then converts to Arrow and casts every column
+    to ``pa.string()``. Shared by the two PyArrow engine paths that fall back
+    to Polars (ragged rows and mid-file ``#`` comments that crash PyArrow's
+    native reader).
+
+    Args:
+        filepath: Path to the CSV file.
+        delimiter: Field separator character.
+        truncate_ragged_lines: Whether to silently truncate ragged rows.
+        n_rows: Maximum number of data rows to read, or ``None`` for all.
+
+    Returns:
+        A PyArrow table with every column typed as ``pa.string()``.
+    """
+    df = _polars_read_csv(filepath, delimiter, truncate_ragged_lines, n_rows=n_rows)
+    table = df.to_arrow()
+    return table.cast(pa.schema([(name, pa.string()) for name in table.column_names]))
+
+
 @dataclass
 class CSVEngineProperties:
     """Base properties for CSV operations."""
@@ -406,16 +458,11 @@ class CSVReaderPolarsEngine(DataFrameDerivedReaderMixin, CSVBaseReaderEngine):
             )
         if self.lenient:
             _check_csv_ragged_and_warn(self.filepath, self.delimiter)
-        # Skip only the LEADING comment block. Using comment_prefix here would
-        # also drop any data row whose first field begins with "#" (e.g. a hex
-        # color like "#FF0000"), silently losing rows.
-        df = pl.read_csv(
+        df = _polars_read_csv(
             self.filepath,
-            separator=self.delimiter,
-            truncate_ragged_lines=self.lenient,
-            infer_schema=False,
+            self.delimiter,
+            self.lenient,
             n_rows=CSVEngineProperties.dataframe_sample_rows if sample else None,
-            skip_rows=_count_leading_comments(self.filepath),
         )
         if normalize_columns:
             df = df.rename(CSVColumnNameNormalizer(self.filepath, columns=df.columns).columns_to_normalized_mapping)
@@ -696,17 +743,7 @@ class CSVReaderPyArrowEngine(_PyArrowEngineMixin, CSVBaseReaderEngine):
         Returns:
             A PyArrow table with all columns cast to string.
         """
-        df = pl.read_csv(
-            self.filepath,
-            separator=self.delimiter,
-            truncate_ragged_lines=truncate_ragged_lines,
-            infer_schema=False,
-            skip_rows=_count_leading_comments(self.filepath),
-            n_rows=n_rows,
-        )
-        table = df.to_arrow()
-        string_schema = pa.schema([(name, pa.string()) for name in table.column_names])
-        table = table.cast(string_schema)
+        table = _polars_read_to_string_arrow(self.filepath, self.delimiter, truncate_ragged_lines, n_rows=n_rows)
         if normalize_columns:
             table = self._normalize_arrow_columns(table, columns)
         return table
@@ -904,15 +941,7 @@ class CSVWriterPyArrowEngine(_PyArrowEngineMixin, CSVBaseWriterEngine):
                 _check_csv_ragged_and_warn(self.filepath, self.queries.delimiter)
             # Fallback to Polars: it parses ragged rows and skips mid-file ``#``
             # comment lines that the native PyArrow reader chokes on (issue #90).
-            df = pl.read_csv(
-                self.filepath,
-                separator=self.queries.delimiter,
-                truncate_ragged_lines=self.lenient,
-                infer_schema=False,
-                skip_rows=_count_leading_comments(self.filepath),
-            )
-            table = df.to_arrow()
-            table = table.cast(pa.schema([(name, pa.string()) for name in table.column_names]))
+            table = _polars_read_to_string_arrow(self.filepath, self.queries.delimiter, self.lenient)
         else:
             skip_count = _count_leading_physical_lines_before_header(self.filepath)
             table = pacsv.read_csv(
