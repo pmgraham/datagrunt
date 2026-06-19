@@ -193,6 +193,110 @@ class TestPDFWriter:
         assert (tmp_path / "a.json").exists() and (tmp_path / "b.md").exists()
 
 
+class TestPDFWriterUTF8Encoding:
+    """Issue #218: text-mode file writes must always use UTF-8, not platform default.
+
+    Each test drives the public PDFWriter API with a pre-parsed dict so no real
+    PDF or OCR is needed, and spies on ``builtins.open`` to confirm the
+    ``encoding="utf-8"`` kwarg is passed.  This deterministically fails before
+    the fix even on UTF-8 developer machines.
+    """
+
+    @staticmethod
+    def _minimal_parsed_dict_with_unicode():
+        """Return a minimal parsed-document dict whose content includes non-ASCII."""
+        return {
+            "document": {
+                "total_pages": 1,
+                "pages": [
+                    {
+                        "page_number": 1,
+                        "elements": [
+                            {
+                                "id": "e1",
+                                "type": "text",
+                                "page": 1,
+                                "x": 0,
+                                "y": 0,
+                                "content": "Héllo wörld — copyright © 2024",
+                                "metadata": {},
+                            }
+                        ],
+                    }
+                ],
+            }
+        }
+
+    def _make_writer(self):
+        return PDFWriter(self._minimal_parsed_dict_with_unicode())
+
+    @staticmethod
+    def _spy_builtins_open(monkeypatch, watch_paths):
+        """Patch ``builtins.open`` to record the ``encoding`` kwarg for watched paths.
+
+        Returns a list that is populated with one encoding value per write-mode
+        ``open()`` call whose ``file`` argument is in *watch_paths*.  Using
+        ``builtins.open`` is required because pdfwriter.py uses the builtin
+        directly (no explicit ``import open``).
+        """
+        import builtins
+
+        real_open = builtins.open
+        recorded = []
+
+        def spy_open(file, mode="r", **kwargs):
+            if "w" in str(mode) and str(file) in {str(p) for p in watch_paths}:
+                recorded.append(kwargs.get("encoding"))
+            return real_open(file, mode, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", spy_open)
+        return recorded
+
+    def test_write_markdown_uses_utf8(self, tmp_path, monkeypatch):
+        """write_markdown must pass encoding='utf-8' to open()."""
+        out = str(tmp_path / "out.md")
+        recorded = self._spy_builtins_open(monkeypatch, [out])
+        self._make_writer().write_markdown(export_filename=out)
+
+        assert recorded, "write_markdown did not call open() in write mode"
+        assert all(enc == "utf-8" for enc in recorded), (
+            f"expected all write-mode open() calls to use encoding='utf-8', got {recorded}"
+        )
+
+    def test_write_json_uses_utf8(self, tmp_path, monkeypatch):
+        """write_json must pass encoding='utf-8' to open()."""
+        out = str(tmp_path / "out.json")
+        recorded = self._spy_builtins_open(monkeypatch, [out])
+        self._make_writer().write_json(export_filename=out)
+
+        assert recorded, "write_json did not call open() in write mode"
+        assert all(enc == "utf-8" for enc in recorded), (
+            f"expected encoding='utf-8', got {recorded}"
+        )
+
+    def test_write_jsonl_uses_utf8(self, tmp_path, monkeypatch):
+        """write_json_newline_delimited must pass encoding='utf-8' to open()."""
+        out = str(tmp_path / "out.jsonl")
+        recorded = self._spy_builtins_open(monkeypatch, [out])
+        self._make_writer().write_json_newline_delimited(export_filename=out)
+
+        assert recorded, "write_json_newline_delimited did not call open() in write mode"
+        assert all(enc == "utf-8" for enc in recorded), (
+            f"expected encoding='utf-8', got {recorded}"
+        )
+
+    def test_write_empty_file_uses_utf8(self, tmp_path, monkeypatch):
+        """_write_empty_file must pass encoding='utf-8' to open()."""
+        out = str(tmp_path / "empty.md")
+        recorded = self._spy_builtins_open(monkeypatch, [out])
+        PDFWriter._write_empty_file(out)
+
+        assert recorded, "_write_empty_file did not call open() in write mode"
+        assert all(enc == "utf-8" for enc in recorded), (
+            f"expected encoding='utf-8', got {recorded}"
+        )
+
+
 class TestPDFWriterEmptyPdf:
     """Empty (0-byte) PDFs must not surface a raw PdfiumError.
 
