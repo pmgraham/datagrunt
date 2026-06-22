@@ -38,9 +38,11 @@ fn candidates_most_common_first(first_row: &str) -> Vec<char> {
 }
 
 /// Python _split_row: ' ' uses str.split() (whitespace runs), else split(char).
+/// `py_split_whitespace` matches Python's whitespace set (incl. C0 separators),
+/// unlike Rust's `str::split_whitespace` (issue #176).
 fn field_count(row: &str, c: char) -> usize {
     if c == SPACE_DELIMITER {
-        row.split_whitespace().count()
+        io::py_split_whitespace(row).count()
     } else {
         row.split(c).count()
     }
