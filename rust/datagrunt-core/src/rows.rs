@@ -1,7 +1,7 @@
 //! Ports of CSVRows probes and the leading-line counters.
 
 use crate::io::{
-    decode_ignore, is_empty, take_chars, universal_lines, DecodedReader, MAX_LINE_CHARS,
+    decode_ignore, is_empty, py_strip, take_chars, universal_lines, DecodedReader, MAX_LINE_CHARS,
     MAX_LINE_READ_BYTES,
 };
 use std::fs::File;
@@ -113,8 +113,8 @@ pub fn probe_csv_header(path: &Path) -> std::io::Result<HeaderProbe> {
         // the char cap for parity with the Python reference.
         let raw = decode_ignore(&segment);
         let text = take_chars(&raw, MAX_LINE_CHARS);
-        // `stripped` mirrors Python's `line.strip()`.
-        let stripped = text.trim();
+        // `stripped` mirrors Python's `line.strip()` (incl. C0 separators).
+        let stripped = py_strip(&text);
         if !stripped.is_empty() {
             saw_nonblank = true;
         }
@@ -151,7 +151,7 @@ pub fn leading_rows(path: &Path, limit: usize) -> std::io::Result<Vec<String>> {
     let mut rows = Vec::new();
     for line in universal_lines(path)? {
         let line = line?;
-        let stripped = line.trim();
+        let stripped = py_strip(&line);
         if !stripped.is_empty() && !stripped.starts_with('#') {
             rows.push(stripped.to_string());
             if rows.len() >= limit {
@@ -172,7 +172,7 @@ pub fn count_leading_comments(path: &Path) -> std::io::Result<usize> {
     let mut count = 0;
     for line in universal_lines(path)? {
         let line = line?;
-        let stripped = line.trim();
+        let stripped = py_strip(&line);
         if stripped.starts_with('#') {
             count += 1;
         } else if stripped.is_empty() {
@@ -190,7 +190,7 @@ pub fn count_leading_physical_lines_before_header(path: &Path) -> std::io::Resul
     let mut count = 0;
     for line in universal_lines(path)? {
         let line = line?;
-        let stripped = line.trim();
+        let stripped = py_strip(&line);
         count += 1;
         if !stripped.is_empty() && !stripped.starts_with('#') {
             break;
