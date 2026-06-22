@@ -53,19 +53,30 @@ fn delimiter_byte(delimiter: &str) -> PyResult<u8> {
     }
 }
 
+// These functions do file I/O whose cost scales with file size (most of all
+// `row_count_with_header`, a full-file scan). The work runs inside `py.detach`
+// (PyO3's GIL-release API, formerly `allow_threads`) so a long scan no longer
+// blocks every other Python thread for its full duration (issue #177). The
+// closures touch no Python objects, so releasing the GIL is sound; `delimiter`
+// is validated first because that step can raise a Python exception and must
+// hold the GIL.
 #[pyfunction]
-fn infer_delimiter(path: PathBuf) -> PyResult<String> {
-    datagrunt_core::delimiter::infer_delimiter(&path).map_err(oserr)
+fn infer_delimiter(py: Python<'_>, path: PathBuf) -> PyResult<String> {
+    py.detach(|| datagrunt_core::delimiter::infer_delimiter(&path))
+        .map_err(oserr)
 }
 
 #[pyfunction]
-fn row_count_with_header(path: PathBuf, delimiter: &str) -> PyResult<u64> {
-    datagrunt_core::rows::row_count_with_header(&path, delimiter_byte(delimiter)?).map_err(oserr)
+fn row_count_with_header(py: Python<'_>, path: PathBuf, delimiter: &str) -> PyResult<u64> {
+    let delimiter = delimiter_byte(delimiter)?;
+    py.detach(|| datagrunt_core::rows::row_count_with_header(&path, delimiter))
+        .map_err(oserr)
 }
 
 #[pyfunction]
-fn check_ragged(path: PathBuf, delimiter: &str) -> PyResult<bool> {
-    Ok(datagrunt_core::ragged::check_ragged(&path, delimiter_byte(delimiter)?))
+fn check_ragged(py: Python<'_>, path: PathBuf, delimiter: &str) -> PyResult<bool> {
+    let delimiter = delimiter_byte(delimiter)?;
+    Ok(py.detach(|| datagrunt_core::ragged::check_ragged(&path, delimiter)))
 }
 
 /// CSVDialect equivalent: None for empty/blank files or an undeterminable
@@ -82,16 +93,25 @@ fn sniff_dialect(
     path: PathBuf,
     delimiter: Option<String>,
 ) -> PyResult<Option<Py<PyDict>>> {
-    let probe = datagrunt_core::rows::probe_csv_header(&path).map_err(oserr)?;
-    if probe.empty || probe.blank {
-        return Ok(None);
-    }
-    let sample = probe.sample_lines.join("");
-    // An empty delimiter string is Python-falsy (`if delimiter:`), meaning "no
-    // restriction" — normalize it to None so it doesn't reject every candidate
-    // (Some("") would make the substring guard `"".contains(x)` reject all).
-    let delimiter = delimiter.as_deref().filter(|s| !s.is_empty());
-    let Some(d) = datagrunt_core::dialect::sniff(&sample, delimiter) else {
+    // The header probe (file I/O) and sniffing run without the GIL so other
+    // Python threads make progress during the scan (issue #177); the GIL is
+    // reacquired only to build the result dict.
+    let sniffed = py
+        .detach(|| -> std::io::Result<Option<datagrunt_core::dialect::SniffedDialect>> {
+            let probe = datagrunt_core::rows::probe_csv_header(&path)?;
+            if probe.empty || probe.blank {
+                return Ok(None);
+            }
+            let sample = probe.sample_lines.join("");
+            // An empty delimiter string is Python-falsy (`if delimiter:`), meaning
+            // "no restriction" — normalize it to None so it doesn't reject every
+            // candidate (Some("") would make the substring guard `"".contains(x)`
+            // reject all).
+            let delimiter = delimiter.as_deref().filter(|s| !s.is_empty());
+            Ok(datagrunt_core::dialect::sniff(&sample, delimiter))
+        })
+        .map_err(oserr)?;
+    let Some(d) = sniffed else {
         return Ok(None);
     };
     let dict = PyDict::new(py);
