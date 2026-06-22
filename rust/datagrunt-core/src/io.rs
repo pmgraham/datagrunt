@@ -21,6 +21,30 @@ pub fn take_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// Python `str.isspace()` for a single char.
+///
+/// Identical to Rust's `char::is_whitespace` (Unicode `White_Space`) EXCEPT
+/// that CPython also treats the C0 information separators FS/GS/RS/US
+/// (U+001C-U+001F) as whitespace. Those four are the ONLY divergence between
+/// the two definitions across the whole of Unicode (verified exhaustively), so
+/// adding them makes Rust `strip`/`split` agree with Python (issue #176).
+pub(crate) fn is_python_whitespace(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}')
+}
+
+/// Python `str.strip()` with no arguments: trim leading/trailing whitespace
+/// using Python's whitespace definition (see [`is_python_whitespace`]).
+pub(crate) fn py_strip(s: &str) -> &str {
+    s.trim_matches(is_python_whitespace)
+}
+
+/// Python `str.split()` with no arguments: split on runs of Python-whitespace,
+/// discarding empty leading/trailing fields. Mirrors `str::split_whitespace`
+/// but with Python's whitespace definition (see [`is_python_whitespace`]).
+pub(crate) fn py_split_whitespace(s: &str) -> impl Iterator<Item = &str> {
+    s.split(is_python_whitespace).filter(|field| !field.is_empty())
+}
+
 /// Python `errors="ignore"`: invalid byte sequences are dropped, not replaced.
 pub fn decode_ignore(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
@@ -600,7 +624,9 @@ pub(crate) fn is_blank(path: &Path) -> bool {
     }
     let body = if bytes.starts_with(BOM) { &bytes[BOM.len()..] } else { &bytes[..] };
     match std::str::from_utf8(body) {
-        Ok(s) => s.trim().is_empty(),
+        // `py_strip` matches Python's `str.strip()` whitespace set (incl. the
+        // C0 separators), so an all-separator file reads as blank (issue #176).
+        Ok(s) => py_strip(s).is_empty(),
         Err(_) => false,
     }
 }
@@ -627,6 +653,46 @@ mod tests {
     fn decode_ignore_drops_invalid_bytes() {
         assert_eq!(decode_ignore(b"Jos\xe9,NYC"), "Jos,NYC"); // errors="ignore" DROPS
         assert_eq!(decode_ignore("héllo".as_bytes()), "héllo");
+    }
+
+    #[test]
+    fn python_whitespace_includes_c0_separators() {
+        // The C0 information separators (U+001C-001F) are whitespace to Python
+        // but NOT to Rust's char::is_whitespace — the entire divergence set.
+        for c in ['\u{1c}', '\u{1d}', '\u{1e}', '\u{1f}'] {
+            assert!(is_python_whitespace(c), "{c:?} should be Python whitespace");
+            assert!(!c.is_whitespace(), "{c:?} is not Rust White_Space (precondition)");
+        }
+        // Ordinary whitespace (incl. \xa0 NBSP, already shared) is unchanged.
+        for c in [' ', '\t', '\n', '\r', '\u{0c}', '\u{a0}'] {
+            assert!(is_python_whitespace(c));
+        }
+        // '\u{1b}' (ESC, just below the separators) is whitespace in neither.
+        assert!(!is_python_whitespace('\u{1b}'));
+        assert!(!is_python_whitespace('a'));
+        assert!(!is_python_whitespace('#'));
+    }
+
+    #[test]
+    fn py_strip_trims_c0_separators_like_python() {
+        // "\x1c# c".strip() == "# c"  =>  recognised as a comment after strip.
+        assert_eq!(py_strip("\u{1c}# c"), "# c");
+        assert_eq!(py_strip("\u{1c}\u{1d}name,age\u{1e}\u{1f}"), "name,age");
+        // A line of only separators strips to empty (blank).
+        assert_eq!(py_strip("\u{1c}\u{1d}\u{1e}\u{1f}"), "");
+        // Mixed with ordinary whitespace.
+        assert_eq!(py_strip(" \t\u{1f}x\u{1c} \n"), "x");
+    }
+
+    #[test]
+    fn py_split_whitespace_splits_on_c0_separators_like_python() {
+        // Python: "a\x1cb\x1cc".split() == ["a", "b", "c"].
+        assert_eq!(py_split_whitespace("a\u{1c}b\u{1c}c").collect::<Vec<_>>(), ["a", "b", "c"]);
+        // Mixed separators and ordinary whitespace collapse into one split.
+        assert_eq!(py_split_whitespace("a\u{1d} \tb").collect::<Vec<_>>(), ["a", "b"]);
+        // Leading/trailing separators produce no empty fields.
+        assert_eq!(py_split_whitespace("\u{1f}a b\u{1c}").collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(py_split_whitespace("\u{1c}\u{1d}\u{1e}\u{1f}").count(), 0);
     }
 
     #[test]
@@ -876,6 +942,9 @@ mod tests {
         assert!(!is_blank(tmp(b"a", ".csv").path()));
         assert!(!is_blank(tmp(b"\xff\xfe", ".csv").path())); // invalid UTF-8 = content
         assert!(is_blank(tmp(b"\xef\xbb\xbf \n", ".csv").path())); // BOM + whitespace
+        // C0 separators are whitespace to Python's strip, so an all-separator
+        // file is blank (issue #176) — matching BlankFile.is_blank.
+        assert!(is_blank(tmp(b"\x1c\x1d\x1e\x1f\n", ".csv").path()));
         assert!(is_tsv(std::path::Path::new("x.tsv")));
         assert!(is_tsv(std::path::Path::new("x.TSV")));
         assert!(!is_tsv(std::path::Path::new("x.csv")));

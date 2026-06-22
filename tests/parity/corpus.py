@@ -99,4 +99,27 @@ CORPUS: dict[str, bytes] = {
     #     bytes. Both backends must still yield exactly MAX_LINE_CHARS chars —
     #     verifies the fix does not regress clean 4-byte-char giant lines.
     "giant_4byte_chars_no_invalid.csv": ("😀,".encode("utf-8") * 1_800_000 + b"\n"),
+    # C0 information separators FS/GS/RS/US (U+001C-001F) parity (issue #176).
+    # Python str.strip()/str.split() treat these four as whitespace; Rust's
+    # trim()/split_whitespace() (Unicode White_Space) do not. They are the ONLY
+    # such divergence across all of Unicode, so both backends must agree on
+    # comment/blank/strip/split decisions for lines containing them.
+    #
+    # (a) A leading comment whose '#' is preceded by a C0 separator: after
+    #     stripping it IS a comment (count_leading_comments / probe must skip it).
+    "c0_leading_comment.csv": b"\x1c# leading comment\nname,age\nalice,30\n",
+    # (b) A line of only C0 separators between data rows: stripped it is blank,
+    #     so it must not become a sample/data row (probe blankness, ragged).
+    "c0_blank_only_line.csv": b"name,age\n\x1c\x1d\x1e\x1f\nalice,30\n",
+    # (c) A whole file of only C0 separators: the probe must report blank=True
+    #     with no surviving rows (the equivalent BlankFile.is_blank path is
+    #     locked by a Rust unit test, as it is not exposed to _native).
+    "c0_all_whitespace.csv": b"\x1c\x1d\x1e\x1f\n",
+    # (d) Fields separated only by C0 separators: Python's bare split() treats
+    #     them as whitespace runs (3 fields per row), driving space-delimiter
+    #     inference; Rust split_whitespace() must match.
+    "c0_field_separators.csv": b"a\x1cb\x1cc\n1\x1d2\x1d3\nx\x1ey\x1ez\n",
+    # (e) Header with leading/trailing C0 separators: stripping must yield the
+    #     same first_row / sample_rows as Python for both backends.
+    "c0_leading_trailing_strip.csv": b"\x1cname,age\x1d\nalice,30\nbob,25\n",
 }
