@@ -269,6 +269,23 @@ def small_image_pdf(tmp_path):
 
 
 @pytest.fixture
+def multipage_small_image_pdf(tmp_path):
+    """Create a 2-page PDF; each page's only image is below the 40px threshold."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    for _ in range(2):
+        page = doc.new_page(width=612, height=792)
+        pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 20, 20))
+        pix.set_rect(pix.irect, (0, 0, 255))
+        page.insert_image(pymupdf.Rect(72, 72, 92, 92), stream=pix.tobytes("png"))
+    pdf_path = tmp_path / "multipage_small_image.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+    return str(pdf_path)
+
+
+@pytest.fixture
 def tesseract_available():
     """Return True if the tesseract system binary is on PATH."""
     return shutil.which("tesseract") is not None

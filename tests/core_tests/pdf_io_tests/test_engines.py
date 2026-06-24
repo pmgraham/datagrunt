@@ -489,6 +489,43 @@ class TestExtractionConfigThreaded:
         assert len(images) == 1
 
 
+def _image_count(doc):
+    """Count image elements in the unified document schema."""
+    return sum(
+        1
+        for page in doc["document"]["pages"]
+        for e in page.get("elements", [])
+        if e.get("type") == "image"
+    )
+
+
+class TestProcessPoolThreadsConfig:
+    """workers>1 uses a ProcessPoolExecutor; the frozen config must survive pickling."""
+
+    def test_pdfium_structured_process_pool_threads_config(self, multipage_small_image_pdf):
+        """workers>1 uses the process pool; the frozen config must survive pickling."""
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+        from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
+
+        eng = PDFReaderPdfiumEngine(
+            multipage_small_image_pdf, workers=2, structured=True,
+            extraction_config=_PDFExtractionConfig(min_image_dimension=10),
+        )
+        assert _image_count(eng.to_dicts()) == 2  # both pages' 20px images kept
+
+    def test_pdfium_native_process_pool_threads_config(self, multipage_small_image_pdf):
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+        from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
+
+        eng = PDFReaderPdfiumEngine(
+            multipage_small_image_pdf, workers=2, structured=False,
+            extraction_config=_PDFExtractionConfig(min_image_dimension=10),
+        )
+        doc = eng.to_dicts()
+        images = [img for p in doc["document"]["pages"] for img in p["images"]]
+        assert len(images) == 2
+
+
 class TestPDFReaderParseSharedAcrossConversions:
     """to_dataframe + to_arrow_table on one reader must parse the PDF once."""
 

@@ -33,7 +33,9 @@ def _is_distributed_env() -> bool:
     return any(k in os.environ for k in distributed_keys)
 
 
-def _parse_page_structured_worker(filepath_str: str, page_index: int, image_output_dir: Optional[str]) -> dict:
+def _parse_page_structured_worker(
+    filepath_str: str, page_index: int, image_output_dir: Optional[str], extraction_config=None
+) -> dict:
     """Process worker function to parse a single page using PDFium in structured mode."""
     from pathlib import Path
 
@@ -41,19 +43,25 @@ def _parse_page_structured_worker(filepath_str: str, page_index: int, image_outp
     from datagrunt.core.pdf_io.extraction import PdfiumBackend
 
     filepath = Path(filepath_str)
-    assembler = pdfcomponents.DocumentAssembler(filepath, backend=PdfiumBackend(filepath))
+    assembler = pdfcomponents.DocumentAssembler(
+        filepath,
+        backend=PdfiumBackend(filepath, extraction_config=extraction_config),
+        extraction_config=extraction_config,
+    )
     with assembler.backend, assembler.table_extractor:
         return assembler.parse_page(page_index, image_output_dir)
 
 
-def _parse_page_native_worker(filepath_str: str, page_index: int, image_output_dir: Optional[str]) -> dict:
+def _parse_page_native_worker(
+    filepath_str: str, page_index: int, image_output_dir: Optional[str], extraction_config=None
+) -> dict:
     """Process worker function to parse a single page using PDFium in native mode."""
     from pathlib import Path
 
     from datagrunt.core.pdf_io.extraction import PdfiumNativeReader
 
     filepath = Path(filepath_str)
-    reader = PdfiumNativeReader(filepath)
+    reader = PdfiumNativeReader(filepath, extraction_config=extraction_config)
     with reader:
         return reader.parse_page(page_index, image_output_dir)
 
@@ -237,7 +245,10 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
             pages_map = {}
             with ProcessPoolExecutor(max_workers=self.workers) as executor:
                 futures = {
-                    executor.submit(_parse_page_structured_worker, str(self.filepath), idx, image_output_dir): idx
+                    executor.submit(
+                        _parse_page_structured_worker,
+                        str(self.filepath), idx, image_output_dir, self.extraction_config,
+                    ): idx
                     for idx in range(total_pages)
                 }
                 for future in as_completed(futures):
@@ -285,7 +296,10 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
 
             with ProcessPoolExecutor(max_workers=self.workers) as executor:
                 futures = {
-                    executor.submit(_parse_page_native_worker, str(self.filepath), idx, image_output_dir): idx
+                    executor.submit(
+                        _parse_page_native_worker,
+                        str(self.filepath), idx, image_output_dir, self.extraction_config,
+                    ): idx
                     for idx in range(total_pages)
                 }
                 for future in as_completed(futures):
