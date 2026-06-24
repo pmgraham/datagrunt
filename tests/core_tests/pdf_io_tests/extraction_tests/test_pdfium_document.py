@@ -95,6 +95,24 @@ class TestRotatedPageCoordinates:
             assert 0 <= box.x and box.x + box.w <= page_width, f"image x span out of [0,{page_width}] (rot {rotation})"
 
 
+def test_image_items_threshold_keeps_small_image_when_lowered(small_image_pdf):
+    """small_image_pdf holds a 20px image: dropped at default 40, kept at 10."""
+    with PdfiumDocument(small_image_pdf) as doc:
+        with doc.page(0) as page:
+            assert len(list(page.image_items())) == 0
+        with doc.page(0) as page:
+            assert len(list(page.image_items(min_image_dimension=10))) == 1
+
+
+def test_image_items_threshold_drops_large_image_when_raised(sample_pdf):
+    """sample_pdf holds a 100px image: kept at default 40, dropped at 150."""
+    with PdfiumDocument(sample_pdf) as doc:
+        with doc.page(0) as page:
+            assert len(list(page.image_items())) == 1
+        with doc.page(0) as page:
+            assert len(list(page.image_items(min_image_dimension=150))) == 0
+
+
 class TestUnrotatedCoordinatesRegressionGuard:
     """Lock the rotation-0 coordinates so the rotation fix can't drift them.
 

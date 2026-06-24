@@ -9,7 +9,11 @@ from datagrunt.pdf_api._engine_backed import _PDFEngineBacked
 
 
 class PDFWriter(_PDFEngineBacked):
-    """Class to unify the interface for writing parsed PDF output."""
+    """Class to unify the interface for writing parsed PDF output.
+
+    Pass ``min_image_dimension`` (keyword-only) to control the minimum embedded
+    image pixel size kept during extraction (default 40; 0 keeps everything).
+    """
 
     _engine_role = "writer"
 

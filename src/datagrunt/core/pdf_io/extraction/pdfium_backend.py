@@ -2,6 +2,7 @@
 
 from datagrunt.core.pdf_io.extraction._doc_session import _ThreadLocalDocSession
 from datagrunt.core.pdf_io.extraction.base import ExtractionBackend
+from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
 from datagrunt.core.pdf_io.extraction.ocr import ocr_data_to_blocks
 from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
 from datagrunt.core.pdf_io.extraction.shapes import PageAnalysis
@@ -11,11 +12,12 @@ from datagrunt.core.pdf_io.extraction.text_block_builder import TextBlockBuilder
 class PdfiumBackend(_ThreadLocalDocSession, ExtractionBackend):
     """Extraction via pypdfium2: text objects, images, and pdfium-rendered OCR."""
 
-    def __init__(self, filepath):
+    def __init__(self, filepath, extraction_config=None):
         super().__init__(filepath)
         import threading
 
         self._local = threading.local()
+        self._config = extraction_config or _PDFExtractionConfig()
 
     def _open_resource(self):
         return PdfiumDocument(self.filepath)
@@ -74,7 +76,12 @@ class PdfiumBackend(_ThreadLocalDocSession, ExtractionBackend):
                 images = []
                 if image_objs > 0:
                     images = list(
-                        page.image_items(output_dir=output_dir, name_prefix=name_prefix, page_number=page_number)
+                        page.image_items(
+                            output_dir=output_dir,
+                            name_prefix=name_prefix,
+                            page_number=page_number,
+                            min_image_dimension=self._config.min_image_dimension,
+                        )
                     )
                 return analysis, text_blocks, images
         finally:
@@ -93,11 +100,18 @@ class PdfiumBackend(_ThreadLocalDocSession, ExtractionBackend):
         return TextBlockBuilder().build(items)
 
     def extract_images(self, page_number: int, output_dir: str = None, name_prefix: str = "page") -> list:
-        """Return embedded images (>= MIN_IMAGE_DIMENSION); write when output_dir set."""
+        """Return embedded images at or above the configured minimum dimension; write when output_dir set."""
         doc, should_close = self._get_doc()
         try:
             with doc.page(page_number) as page:
-                res = list(page.image_items(output_dir=output_dir, name_prefix=name_prefix, page_number=page_number))
+                res = list(
+                    page.image_items(
+                        output_dir=output_dir,
+                        name_prefix=name_prefix,
+                        page_number=page_number,
+                        min_image_dimension=self._config.min_image_dimension,
+                    )
+                )
         finally:
             if should_close:
                 doc.close()

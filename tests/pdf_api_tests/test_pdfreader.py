@@ -372,3 +372,25 @@ class TestPDFReaderJsonAndDictInputs:
         df = reader.to_dataframe()
         assert df.height == 2
         assert list(df["content"]) == ["Header Text", "Hello body"]
+
+
+class TestPDFReaderMinImageDimension:
+    """Tests for the keyword-only min_image_dimension parameter on PDFReader."""
+
+    def test_min_image_dimension_lowered_keeps_small_image(self, small_image_pdf):
+        doc = PDFReader(small_image_pdf, min_image_dimension=10).to_dicts()
+        images = [e for p in doc["document"]["pages"] for e in p.get("elements", []) if e.get("type") == "image"]
+        assert len(images) == 1
+
+    def test_min_image_dimension_default_drops_small_image(self, small_image_pdf):
+        doc = PDFReader(small_image_pdf).to_dicts()
+        images = [e for p in doc["document"]["pages"] for e in p.get("elements", []) if e.get("type") == "image"]
+        assert images == []
+
+    def test_min_image_dimension_invalid_raises_at_construction(self, small_image_pdf):
+        with pytest.raises(ValueError):
+            PDFReader(small_image_pdf, min_image_dimension=-1)
+
+    def test_min_image_dimension_is_keyword_only(self, small_image_pdf):
+        with pytest.raises(TypeError):
+            PDFReader(small_image_pdf, "pdfium", 1, False, 10)  # 5th positional rejected

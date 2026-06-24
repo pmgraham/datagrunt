@@ -15,6 +15,7 @@ import pyarrow as pa
 # local libraries
 from datagrunt.core.pdf_io import pdfcomponents
 from datagrunt.core.pdf_io.extraction import PdfiumBackend, PdfiumNativeReader, PyMuPDFBackend
+from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
 from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,9 @@ def _is_distributed_env() -> bool:
     return any(k in os.environ for k in distributed_keys)
 
 
-def _parse_page_structured_worker(filepath_str: str, page_index: int, image_output_dir: Optional[str]) -> dict:
+def _parse_page_structured_worker(
+    filepath_str: str, page_index: int, image_output_dir: Optional[str], extraction_config=None
+) -> dict:
     """Process worker function to parse a single page using PDFium in structured mode."""
     from pathlib import Path
 
@@ -40,19 +43,25 @@ def _parse_page_structured_worker(filepath_str: str, page_index: int, image_outp
     from datagrunt.core.pdf_io.extraction import PdfiumBackend
 
     filepath = Path(filepath_str)
-    assembler = pdfcomponents.DocumentAssembler(filepath, backend=PdfiumBackend(filepath))
+    assembler = pdfcomponents.DocumentAssembler(
+        filepath,
+        backend=PdfiumBackend(filepath, extraction_config=extraction_config),
+        extraction_config=extraction_config,
+    )
     with assembler.backend, assembler.table_extractor:
         return assembler.parse_page(page_index, image_output_dir)
 
 
-def _parse_page_native_worker(filepath_str: str, page_index: int, image_output_dir: Optional[str]) -> dict:
+def _parse_page_native_worker(
+    filepath_str: str, page_index: int, image_output_dir: Optional[str], extraction_config=None
+) -> dict:
     """Process worker function to parse a single page using PDFium in native mode."""
     from pathlib import Path
 
     from datagrunt.core.pdf_io.extraction import PdfiumNativeReader
 
     filepath = Path(filepath_str)
-    reader = PdfiumNativeReader(filepath)
+    reader = PdfiumNativeReader(filepath, extraction_config=extraction_config)
     with reader:
         return reader.parse_page(page_index, image_output_dir)
 
@@ -91,15 +100,17 @@ class PDFEngineProperties:
 class PDFBaseReaderEngine(ABC):
     """Abstract base class defining the interface for PDF reader engines."""
 
-    def __init__(self, filepath, workers: int = 1):
+    def __init__(self, filepath, workers: int = 1, extraction_config=None):
         """Initialize the PDF reader engine.
 
         Args:
             filepath (str or Path): Path to the PDF file.
             workers (int): Number of concurrent per-page workers.
+            extraction_config: Optional extraction config; defaults to _PDFExtractionConfig().
         """
         self.filepath = Path(filepath)
         self.workers = workers
+        self.extraction_config = extraction_config or _PDFExtractionConfig()
         if not self.filepath.exists():
             raise FileNotFoundError
         self._parsed_cache = {}
@@ -170,7 +181,7 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
                 "the 'workers=%d' setting is ignored. Use the pdfium engine for parallel parsing.",
                 self.workers,
             )
-        assembler = pdfcomponents.DocumentAssembler(self.filepath)
+        assembler = pdfcomponents.DocumentAssembler(self.filepath, extraction_config=self.extraction_config)
         # Count pages inside the held-open backend context so the count reuses
         # the same pymupdf document handle as the parse — one open per parse
         # (issue #102) with no pdfium dependency for the count (issue #95).
@@ -183,7 +194,7 @@ class PDFReaderPyMuPDFEngine(PDFBaseReaderEngine):
 
     def get_sample(self) -> dict:
         """Parse and return the first page only."""
-        return pdfcomponents.DocumentAssembler(self.filepath).parse_page(0)
+        return pdfcomponents.DocumentAssembler(self.filepath, extraction_config=self.extraction_config).parse_page(0)
 
 
 class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
@@ -198,8 +209,8 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
     process.
     """
 
-    def __init__(self, filepath, workers: int = 1, structured: bool = False):
-        super().__init__(filepath, workers=workers)
+    def __init__(self, filepath, workers: int = 1, structured: bool = False, extraction_config=None):
+        super().__init__(filepath, workers=workers, extraction_config=extraction_config)
         self.structured = structured
 
     def _total_pages(self) -> int:
@@ -217,7 +228,11 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
                     "Distributed environment detected. Defaulting to sequential "
                     "PDFium execution to prevent multiprocessing overhead."
                 )
-            assembler = pdfcomponents.DocumentAssembler(self.filepath, backend=PdfiumBackend(self.filepath))
+            assembler = pdfcomponents.DocumentAssembler(
+                self.filepath,
+                backend=PdfiumBackend(self.filepath, extraction_config=self.extraction_config),
+                extraction_config=self.extraction_config,
+            )
             with assembler.backend, assembler.table_extractor:
                 for idx in range(total_pages):
                     try:
@@ -230,7 +245,13 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
             pages_map = {}
             with ProcessPoolExecutor(max_workers=self.workers) as executor:
                 futures = {
-                    executor.submit(_parse_page_structured_worker, str(self.filepath), idx, image_output_dir): idx
+                    executor.submit(
+                        _parse_page_structured_worker,
+                        str(self.filepath),
+                        idx,
+                        image_output_dir,
+                        self.extraction_config,
+                    ): idx
                     for idx in range(total_pages)
                 }
                 for future in as_completed(futures):
@@ -244,7 +265,11 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
                 if idx in pages_map:
                     pages.append(pages_map[idx])
 
-        assembler = pdfcomponents.DocumentAssembler(self.filepath, backend=PdfiumBackend(self.filepath))
+        assembler = pdfcomponents.DocumentAssembler(
+            self.filepath,
+            backend=PdfiumBackend(self.filepath, extraction_config=self.extraction_config),
+            extraction_config=self.extraction_config,
+        )
         document = assembler.combine(total_pages, pages, errors)
         if drop_layout_tables:
             pdfcomponents.ParsedDocument(document).drop_layout_tables()
@@ -261,7 +286,7 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
                     "Distributed environment detected. Defaulting to sequential "
                     "PDFium execution to prevent multiprocessing overhead."
                 )
-            reader = PdfiumNativeReader(self.filepath)
+            reader = PdfiumNativeReader(self.filepath, extraction_config=self.extraction_config)
             with reader:
                 for idx in range(total_pages):
                     try:
@@ -274,7 +299,13 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
 
             with ProcessPoolExecutor(max_workers=self.workers) as executor:
                 futures = {
-                    executor.submit(_parse_page_native_worker, str(self.filepath), idx, image_output_dir): idx
+                    executor.submit(
+                        _parse_page_native_worker,
+                        str(self.filepath),
+                        idx,
+                        image_output_dir,
+                        self.extraction_config,
+                    ): idx
                     for idx in range(total_pages)
                 }
                 for future in as_completed(futures):
@@ -286,7 +317,7 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
                         errors.append(f"Page {idx + 1}: {e}")
 
         ordered = [page_results[p] for p in sorted(page_results.keys())]
-        reader = PdfiumNativeReader(self.filepath)
+        reader = PdfiumNativeReader(self.filepath, extraction_config=self.extraction_config)
         return reader.combine(total_pages, ordered, errors)
 
     def to_dicts(self, image_output_dir: Optional[str] = None, drop_layout_tables: bool = False) -> dict:
@@ -298,22 +329,28 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
     def get_sample(self) -> dict:
         """Parse and return the first page only."""
         if self.structured:
-            return pdfcomponents.DocumentAssembler(self.filepath, backend=PdfiumBackend(self.filepath)).parse_page(0)
-        return PdfiumNativeReader(self.filepath).parse_page(0)
+            return pdfcomponents.DocumentAssembler(
+                self.filepath,
+                backend=PdfiumBackend(self.filepath, extraction_config=self.extraction_config),
+                extraction_config=self.extraction_config,
+            ).parse_page(0)
+        return PdfiumNativeReader(self.filepath, extraction_config=self.extraction_config).parse_page(0)
 
 
 class PDFBaseWriterEngine(ABC):
     """Abstract base class defining the interface for PDF writer engines."""
 
-    def __init__(self, filepath, workers: int = 1):
+    def __init__(self, filepath, workers: int = 1, extraction_config=None):
         """Initialize the PDF writer engine.
 
         Args:
             filepath (str or Path): Path to the PDF file.
             workers (int): Number of concurrent per-page workers.
+            extraction_config: Optional extraction config; defaults to _PDFExtractionConfig().
         """
         self.filepath = Path(filepath)
         self.workers = workers
+        self.extraction_config = extraction_config or _PDFExtractionConfig()
         self.properties = PDFEngineProperties(filepath=self.filepath)
         if not self.filepath.exists():
             raise FileNotFoundError
@@ -403,18 +440,25 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
 
     def _reader(self):
         if self._reader_engine is None:
-            self._reader_engine = PDFReaderPyMuPDFEngine(self.filepath, workers=self.workers)
+            self._reader_engine = PDFReaderPyMuPDFEngine(
+                self.filepath, workers=self.workers, extraction_config=self.extraction_config
+            )
         return self._reader_engine
 
 
 class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
     """Write parsed PDFium output. Native schema by default; unified when structured."""
 
-    def __init__(self, filepath, workers: int = 1, structured: bool = False):
-        super().__init__(filepath, workers=workers)
+    def __init__(self, filepath, workers: int = 1, structured: bool = False, extraction_config=None):
+        super().__init__(filepath, workers=workers, extraction_config=extraction_config)
         self.structured = structured
 
     def _reader(self):
         if self._reader_engine is None:
-            self._reader_engine = PDFReaderPdfiumEngine(self.filepath, workers=self.workers, structured=self.structured)
+            self._reader_engine = PDFReaderPdfiumEngine(
+                self.filepath,
+                workers=self.workers,
+                structured=self.structured,
+                extraction_config=self.extraction_config,
+            )
         return self._reader_engine
