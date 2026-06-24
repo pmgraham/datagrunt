@@ -446,6 +446,49 @@ class TestPDFWriterPdfiumStructured:
         assert all(os.path.isfile(p) for p in paths)
 
 
+class TestExtractionConfigThreaded:
+    """extraction_config is forwarded through engines and their sequential paths."""
+
+    def _image_count(self, doc):
+        return sum(
+            1
+            for page in doc["document"]["pages"]
+            for e in page.get("elements", [])
+            if e.get("type") == "image"
+        )
+
+    def test_pymupdf_engine_threads_config(self, small_image_pdf):
+        from datagrunt.core.pdf_io.engines import PDFReaderPyMuPDFEngine
+        from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
+
+        eng = PDFReaderPyMuPDFEngine(
+            small_image_pdf, extraction_config=_PDFExtractionConfig(min_image_dimension=10)
+        )
+        assert self._image_count(eng.to_dicts()) == 1
+
+    def test_pdfium_structured_engine_threads_config(self, small_image_pdf):
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+        from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
+
+        eng = PDFReaderPdfiumEngine(
+            small_image_pdf, workers=1, structured=True,
+            extraction_config=_PDFExtractionConfig(min_image_dimension=10),
+        )
+        assert self._image_count(eng.to_dicts()) == 1
+
+    def test_pdfium_native_engine_threads_config(self, small_image_pdf):
+        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
+        from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
+
+        eng = PDFReaderPdfiumEngine(
+            small_image_pdf, workers=1, structured=False,
+            extraction_config=_PDFExtractionConfig(min_image_dimension=10),
+        )
+        doc = eng.to_dicts()
+        images = [img for p in doc["document"]["pages"] for img in p["images"]]
+        assert len(images) == 1
+
+
 class TestPDFReaderParseSharedAcrossConversions:
     """to_dataframe + to_arrow_table on one reader must parse the PDF once."""
 
