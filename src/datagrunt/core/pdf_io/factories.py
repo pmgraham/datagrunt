@@ -57,7 +57,9 @@ class PDFEngineFactory:
         if engine_class:
             if self.engine == "pdfium":
                 return engine_class(
-                    self.filepath, workers=self.workers, structured=self.structured,
+                    self.filepath,
+                    workers=self.workers,
+                    structured=self.structured,
                     extraction_config=self.extraction_config,
                 )
             return engine_class(self.filepath, workers=self.workers, extraction_config=self.extraction_config)
@@ -69,7 +71,9 @@ class PDFEngineFactory:
         if engine_class:
             if self.engine == "pdfium":
                 return engine_class(
-                    self.filepath, workers=self.workers, structured=self.structured,
+                    self.filepath,
+                    workers=self.workers,
+                    structured=self.structured,
                     extraction_config=self.extraction_config,
                 )
             return engine_class(self.filepath, workers=self.workers, extraction_config=self.extraction_config)

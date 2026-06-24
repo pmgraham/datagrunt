@@ -27,9 +27,6 @@ class _PDFExtractionConfig:
         # bool is a subclass of int; reject it explicitly so True/False cannot
         # masquerade as 1/0.
         if isinstance(value, bool) or not isinstance(value, int):
-            raise TypeError(
-                f"min_image_dimension must be an int, got {value!r} "
-                f"({type(value).__name__})"
-            )
+            raise TypeError(f"min_image_dimension must be an int, got {value!r} ({type(value).__name__})")
         if value < 0:
             raise ValueError(f"min_image_dimension must be >= 0, got {value}")

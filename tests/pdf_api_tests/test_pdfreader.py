@@ -379,22 +379,12 @@ class TestPDFReaderMinImageDimension:
 
     def test_min_image_dimension_lowered_keeps_small_image(self, small_image_pdf):
         doc = PDFReader(small_image_pdf, min_image_dimension=10).to_dicts()
-        images = [
-            e
-            for p in doc["document"]["pages"]
-            for e in p.get("elements", [])
-            if e.get("type") == "image"
-        ]
+        images = [e for p in doc["document"]["pages"] for e in p.get("elements", []) if e.get("type") == "image"]
         assert len(images) == 1
 
     def test_min_image_dimension_default_drops_small_image(self, small_image_pdf):
         doc = PDFReader(small_image_pdf).to_dicts()
-        images = [
-            e
-            for p in doc["document"]["pages"]
-            for e in p.get("elements", [])
-            if e.get("type") == "image"
-        ]
+        images = [e for p in doc["document"]["pages"] for e in p.get("elements", []) if e.get("type") == "image"]
         assert images == []
 
     def test_min_image_dimension_invalid_raises_at_construction(self, small_image_pdf):

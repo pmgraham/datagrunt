@@ -43,11 +43,7 @@ class _PDFEngineBacked(PDFComponents):
         self.engine = engine.lower().replace(" ", "")
         self.workers = workers
         self.native = native
-        overrides = {
-            k: v
-            for k, v in {"min_image_dimension": min_image_dimension}.items()
-            if v is not None
-        }
+        overrides = {k: v for k, v in {"min_image_dimension": min_image_dimension}.items() if v is not None}
         # Validates immediately (fail-fast at construction).
         self._extraction_config = _PDFExtractionConfig(**overrides)
 
@@ -60,8 +56,11 @@ class _PDFEngineBacked(PDFComponents):
         Released when this object goes out of scope.
         """
         factory = PDFEngineFactory(
-            self.filepath, self.engine, self.workers,
-            structured=not self.native, extraction_config=self._extraction_config,
+            self.filepath,
+            self.engine,
+            self.workers,
+            structured=not self.native,
+            extraction_config=self._extraction_config,
         )
         if self._engine_role == "reader":
             return factory.create_reader()

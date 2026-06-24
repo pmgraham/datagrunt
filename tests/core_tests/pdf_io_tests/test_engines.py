@@ -20,12 +20,7 @@ from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
 
 def _image_count(doc):
     """Count image elements in the unified document schema."""
-    return sum(
-        1
-        for page in doc["document"]["pages"]
-        for e in page.get("elements", [])
-        if e.get("type") == "image"
-    )
+    return sum(1 for page in doc["document"]["pages"] for e in page.get("elements", []) if e.get("type") == "image")
 
 
 class TestSetExportFilename:
@@ -435,21 +430,23 @@ class TestExtractionConfigThreaded:
     """extraction_config is forwarded through engines and their sequential paths."""
 
     def test_pymupdf_engine_threads_config(self, small_image_pdf):
-        eng = PDFReaderPyMuPDFEngine(
-            small_image_pdf, extraction_config=_PDFExtractionConfig(min_image_dimension=10)
-        )
+        eng = PDFReaderPyMuPDFEngine(small_image_pdf, extraction_config=_PDFExtractionConfig(min_image_dimension=10))
         assert _image_count(eng.to_dicts()) == 1
 
     def test_pdfium_structured_engine_threads_config(self, small_image_pdf):
         eng = PDFReaderPdfiumEngine(
-            small_image_pdf, workers=1, structured=True,
+            small_image_pdf,
+            workers=1,
+            structured=True,
             extraction_config=_PDFExtractionConfig(min_image_dimension=10),
         )
         assert _image_count(eng.to_dicts()) == 1
 
     def test_pdfium_native_engine_threads_config(self, small_image_pdf):
         eng = PDFReaderPdfiumEngine(
-            small_image_pdf, workers=1, structured=False,
+            small_image_pdf,
+            workers=1,
+            structured=False,
             extraction_config=_PDFExtractionConfig(min_image_dimension=10),
         )
         doc = eng.to_dicts()
@@ -463,7 +460,9 @@ class TestProcessPoolThreadsConfig:
     def test_pdfium_structured_process_pool_threads_config(self, multipage_small_image_pdf):
         """workers>1 uses the process pool; the frozen config must survive pickling."""
         eng = PDFReaderPdfiumEngine(
-            multipage_small_image_pdf, workers=2, structured=True,
+            multipage_small_image_pdf,
+            workers=2,
+            structured=True,
             extraction_config=_PDFExtractionConfig(min_image_dimension=10),
         )
         assert _image_count(eng.to_dicts()) == 2  # both pages' 20px images kept
@@ -471,7 +470,9 @@ class TestProcessPoolThreadsConfig:
     def test_pdfium_native_process_pool_threads_config(self, multipage_small_image_pdf):
         """workers>1 native path: the frozen config must survive pickling into the child."""
         eng = PDFReaderPdfiumEngine(
-            multipage_small_image_pdf, workers=2, structured=False,
+            multipage_small_image_pdf,
+            workers=2,
+            structured=False,
             extraction_config=_PDFExtractionConfig(min_image_dimension=10),
         )
         doc = eng.to_dicts()

@@ -247,7 +247,10 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
                 futures = {
                     executor.submit(
                         _parse_page_structured_worker,
-                        str(self.filepath), idx, image_output_dir, self.extraction_config,
+                        str(self.filepath),
+                        idx,
+                        image_output_dir,
+                        self.extraction_config,
                     ): idx
                     for idx in range(total_pages)
                 }
@@ -298,7 +301,10 @@ class PDFReaderPdfiumEngine(PDFBaseReaderEngine):
                 futures = {
                     executor.submit(
                         _parse_page_native_worker,
-                        str(self.filepath), idx, image_output_dir, self.extraction_config,
+                        str(self.filepath),
+                        idx,
+                        image_output_dir,
+                        self.extraction_config,
                     ): idx
                     for idx in range(total_pages)
                 }
@@ -450,7 +456,9 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
     def _reader(self):
         if self._reader_engine is None:
             self._reader_engine = PDFReaderPdfiumEngine(
-                self.filepath, workers=self.workers, structured=self.structured,
+                self.filepath,
+                workers=self.workers,
+                structured=self.structured,
                 extraction_config=self.extraction_config,
             )
         return self._reader_engine
