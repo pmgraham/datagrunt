@@ -1,5 +1,6 @@
 """Tests for PdfiumNativeReader (native pdfium schema)."""
 
+from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
 from datagrunt.core.pdf_io.extraction.pdfium_native import PdfiumNativeReader
 
 
@@ -86,3 +87,14 @@ class TestPdfiumNativeReader:
         assert "\\# rm -rf is not a heading" in md
         assert "\\- not a list" in md
         assert not md.lstrip().startswith("# ")
+
+
+def test_native_default_drops_small_image(small_image_pdf):
+    page = PdfiumNativeReader(small_image_pdf).parse_page(0)
+    assert page["images"] == []
+
+
+def test_native_lowered_threshold_keeps_small_image(small_image_pdf):
+    reader = PdfiumNativeReader(small_image_pdf, extraction_config=_PDFExtractionConfig(min_image_dimension=10))
+    page = reader.parse_page(0)
+    assert len(page["images"]) == 1

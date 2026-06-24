@@ -9,6 +9,7 @@ import ctypes
 import logging
 from pathlib import Path
 
+from datagrunt.core.pdf_io.extraction.config import _DEFAULT_MIN_IMAGE_DIMENSION
 from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, TextItem
 
 logger = logging.getLogger(__name__)
@@ -19,9 +20,6 @@ PDF_EXTRA_HINT = "PDF parsing requires extra dependencies. Install with: pip ins
 _PDFIUM_PASSWORD_ERROR = "password"
 
 ENCRYPTED_PDF_MESSAGE = "The PDF is encrypted or password-protected and cannot be opened without the correct password."
-
-# Minimum image dimension (px) to keep; smaller images are layout artifacts.
-MIN_IMAGE_DIMENSION = 40
 
 
 def _import_pdfium():
@@ -177,14 +175,21 @@ class PdfiumPage:
                 images += 1
         return texts, images
 
-    def image_items(self, output_dir: str = None, name_prefix: str = "page", page_number: int = 0):
-        """Yield an ``ImageBlock`` per embedded image >= MIN_IMAGE_DIMENSION."""
+    def image_items(
+        self,
+        output_dir: str = None,
+        name_prefix: str = "page",
+        page_number: int = 0,
+        min_image_dimension: int = _DEFAULT_MIN_IMAGE_DIMENSION,
+    ):
+        """Yield an ``ImageBlock`` per embedded image whose pixel sides are both
+        >= ``min_image_dimension``."""
         disp_w, disp_h = self.size()
         rotation = self.rotation()
         idx = 0
         for obj in self._page.get_objects(filter=(self._raw.FPDF_PAGEOBJ_IMAGE,), max_depth=15):
             px_w, px_h = obj.get_px_size()
-            if px_w < MIN_IMAGE_DIMENSION or px_h < MIN_IMAGE_DIMENSION:
+            if px_w < min_image_dimension or px_h < min_image_dimension:
                 continue
             left, bottom, right, top = obj.get_bounds()
             bbox = self._display_box(left, bottom, right, top, rotation, disp_w, disp_h)

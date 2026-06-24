@@ -10,6 +10,7 @@ from pathlib import Path
 # local libraries
 from datagrunt.core.file_io import FileProperties
 from datagrunt.core.pdf_io.extraction import PdfPlumberTableExtractor
+from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
 from datagrunt.core.pdf_io.extraction.image_dedupe import dedupe_image_files
 from datagrunt.core.pdf_io.extraction.layout_sorter import ElementAdapter, PageLayoutSorter
 from datagrunt.core.pdf_io.extraction.markdown_escape import (
@@ -32,16 +33,19 @@ class DocumentAssembler:
     unified element dicts.
     """
 
-    def __init__(self, filepath, backend=None, table_extractor=None):
+    def __init__(self, filepath, backend=None, table_extractor=None, extraction_config=None):
         """Initialize the assembler.
 
         Args:
             filepath (str or Path): Path to the PDF file.
             backend (ExtractionBackend, optional): Defaults to PyMuPDFBackend.
             table_extractor (PdfPlumberTableExtractor, optional): Shared table source.
+            extraction_config (_PDFExtractionConfig, optional): Tunables passed to
+                the default backend; defaults to ``_PDFExtractionConfig()``.
         """
         self.filepath = Path(filepath)
-        self.backend = backend or PyMuPDFBackend(filepath)
+        self._extraction_config = extraction_config or _PDFExtractionConfig()
+        self.backend = backend or PyMuPDFBackend(filepath, extraction_config=self._extraction_config)
         self.table_extractor = table_extractor or PdfPlumberTableExtractor(filepath)
 
     def parse_page(self, page_index, image_output_dir=None) -> dict:

@@ -4,6 +4,7 @@ from functools import cached_property
 from pathlib import Path
 
 from datagrunt.core import PDFComponents, PDFEngineFactory
+from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
 
 
 class _PDFEngineBacked(PDFComponents):
@@ -18,7 +19,7 @@ class _PDFEngineBacked(PDFComponents):
 
     _engine_role = None  # "reader" or "writer"
 
-    def __init__(self, filepath, engine="pdfium", workers=1, native=False):
+    def __init__(self, filepath, engine="pdfium", workers=1, native=False, *, min_image_dimension=None):
         """Initialize a PDF reader/writer.
 
         Args:
@@ -32,6 +33,9 @@ class _PDFEngineBacked(PDFComponents):
             native (bool, default False): pdfium only -- when True, emit the lean
                 native schema instead of the unified element schema. Ignored by
                 the pymupdf engine.
+            min_image_dimension (int, optional, keyword-only): Minimum embedded-image
+                pixel size (either side) to keep; smaller images are dropped as
+                layout artifacts. Defaults to 40. Use 0 to keep every image.
         """
         if not isinstance(filepath, dict):
             filepath = Path(filepath)
@@ -39,6 +43,9 @@ class _PDFEngineBacked(PDFComponents):
         self.engine = engine.lower().replace(" ", "")
         self.workers = workers
         self.native = native
+        overrides = {k: v for k, v in {"min_image_dimension": min_image_dimension}.items() if v is not None}
+        # Validates immediately (fail-fast at construction).
+        self._extraction_config = _PDFExtractionConfig(**overrides)
 
     @cached_property
     def _engine(self):
@@ -48,7 +55,13 @@ class _PDFEngineBacked(PDFComponents):
         memoizes internally) instead of re-parsing the PDF on every call.
         Released when this object goes out of scope.
         """
-        factory = PDFEngineFactory(self.filepath, self.engine, self.workers, structured=not self.native)
+        factory = PDFEngineFactory(
+            self.filepath,
+            self.engine,
+            self.workers,
+            structured=not self.native,
+            extraction_config=self._extraction_config,
+        )
         if self._engine_role == "reader":
             return factory.create_reader()
         if self._engine_role == "writer":

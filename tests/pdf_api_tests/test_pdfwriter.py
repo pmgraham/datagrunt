@@ -466,3 +466,18 @@ class TestPDFWriterJsonAndDictInputs:
         mdpath = writer.write_markdown("native_out.md")
         with open(mdpath) as f:
             assert "Hello native body" in f.read()
+
+
+class TestPDFWriterMinImageDimension:
+    """Tests for the keyword-only min_image_dimension parameter on PDFWriter."""
+
+    def test_writer_min_image_dimension_keeps_small_image(self, small_image_pdf, tmp_path):
+        out = tmp_path / "out.json"
+        images_dir = tmp_path / "imgs"
+        PDFWriter(small_image_pdf, min_image_dimension=10).write_json(
+            export_filename=str(out), image_output_dir=str(images_dir)
+        )
+        assert out.exists()
+        # the 20px image is written because the threshold was lowered
+        assert images_dir.exists(), "image_output_dir was not created"
+        assert any(images_dir.glob("*")), "no image files written to image_output_dir"

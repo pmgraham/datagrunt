@@ -9,10 +9,18 @@ import pytest
 
 from datagrunt.core.pdf_io.engines import (
     PDFEngineProperties,
+    PDFReaderPdfiumEngine,
     PDFReaderPyMuPDFEngine,
+    PDFWriterPdfiumEngine,
     PDFWriterPyMuPDFEngine,
     set_export_filename,
 )
+from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
+
+
+def _image_count(doc):
+    """Count image elements in the unified document schema."""
+    return sum(1 for page in doc["document"]["pages"] for e in page.get("elements", []) if e.get("type") == "image")
 
 
 class TestSetExportFilename:
@@ -304,8 +312,6 @@ class TestPDFReaderPdfiumEngine:
     """Test suite for the PDFium reader engine."""
 
     def test_to_dicts_native_schema(self, sample_pdf):
-        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
-
         doc = PDFReaderPdfiumEngine(sample_pdf).to_dicts()
         assert doc["document"]["page_count"] == 1
         page = doc["document"]["pages"][0]
@@ -321,15 +327,11 @@ class TestPDFReaderPdfiumEngine:
         assert "Quarterly Report" in page["text"]
 
     def test_get_sample_returns_first_page(self, sample_pdf):
-        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
-
         page = PDFReaderPdfiumEngine(sample_pdf).get_sample()
         assert page["page_number"] == 1
 
     def test_to_dataframe_has_rows(self, sample_pdf):
         import polars as pl
-
-        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
 
         df = PDFReaderPdfiumEngine(sample_pdf).to_dataframe()
         assert isinstance(df, pl.DataFrame)
@@ -339,21 +341,15 @@ class TestPDFReaderPdfiumEngine:
     def test_to_arrow_table_has_rows(self, sample_pdf):
         import pyarrow as pa
 
-        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
-
         table = PDFReaderPdfiumEngine(sample_pdf).to_arrow_table()
         assert isinstance(table, pa.Table)
         assert table.num_rows > 0
 
     def test_missing_file_raises(self):
-        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
-
         with pytest.raises(FileNotFoundError):
             PDFReaderPdfiumEngine("nope.pdf")
 
     def test_to_dicts_multipage_ordered(self, multipage_pdf):
-        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
-
         doc = PDFReaderPdfiumEngine(multipage_pdf).to_dicts()
         pages = doc["document"]["pages"]
         assert doc["document"]["page_count"] == 3
@@ -368,8 +364,6 @@ class TestPDFWriterPdfiumEngine:
     def test_write_json(self, sample_pdf, tmp_path):
         import json
 
-        from datagrunt.core.pdf_io.engines import PDFWriterPdfiumEngine
-
         out = tmp_path / "doc.json"
         result = PDFWriterPdfiumEngine(sample_pdf).write_json(export_filename=str(out))
         assert result == str(out)
@@ -377,8 +371,6 @@ class TestPDFWriterPdfiumEngine:
         assert data["document"]["page_count"] == 1
 
     def test_write_json_newline_delimited(self, sample_pdf, tmp_path):
-        from datagrunt.core.pdf_io.engines import PDFWriterPdfiumEngine
-
         out = tmp_path / "doc.jsonl"
         result = PDFWriterPdfiumEngine(sample_pdf).write_json_newline_delimited(export_filename=str(out))
         assert result == str(out)
@@ -387,8 +379,6 @@ class TestPDFWriterPdfiumEngine:
 
     def test_extract_images_returns_paths(self, sample_pdf, tmp_path):
         import os
-
-        from datagrunt.core.pdf_io.engines import PDFWriterPdfiumEngine
 
         out = tmp_path / "imgs"
         paths = PDFWriterPdfiumEngine(sample_pdf).extract_images(output_dir=str(out))
@@ -400,23 +390,17 @@ class TestPDFReaderPdfiumStructured:
     """pdfium engine in structured mode emits the unified element schema."""
 
     def test_structured_to_dicts_unified_schema(self, sample_pdf):
-        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
-
         doc = PDFReaderPdfiumEngine(sample_pdf, structured=True).to_dicts()
         assert "total_pages" in doc["document"]  # unified envelope key
         page = doc["document"]["pages"][0]
         assert set(page.keys()) == {"page_number", "width", "height", "classification", "elements"}
 
     def test_default_is_native_schema(self, sample_pdf):
-        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
-
         page = PDFReaderPdfiumEngine(sample_pdf).to_dicts()["document"]["pages"][0]
         assert "text_objects" in page  # native schema unchanged when structured=False
 
     def test_structured_dataframe(self, sample_pdf):
         import polars as pl
-
-        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
 
         df = PDFReaderPdfiumEngine(sample_pdf, structured=True).to_dataframe()
         assert isinstance(df, pl.DataFrame)
@@ -428,8 +412,6 @@ class TestPDFWriterPdfiumStructured:
     def test_structured_write_json_unified(self, sample_pdf, tmp_path):
         import json
 
-        from datagrunt.core.pdf_io.engines import PDFWriterPdfiumEngine
-
         out = tmp_path / "doc.json"
         PDFWriterPdfiumEngine(sample_pdf, structured=True).write_json(export_filename=str(out))
         data = json.loads(out.read_text())
@@ -439,11 +421,64 @@ class TestPDFWriterPdfiumStructured:
     def test_structured_extract_images(self, sample_pdf, tmp_path):
         import os
 
-        from datagrunt.core.pdf_io.engines import PDFWriterPdfiumEngine
-
         paths = PDFWriterPdfiumEngine(sample_pdf, structured=True).extract_images(output_dir=str(tmp_path))
         assert len(paths) >= 1
         assert all(os.path.isfile(p) for p in paths)
+
+
+class TestExtractionConfigThreaded:
+    """extraction_config is forwarded through engines and their sequential paths."""
+
+    def test_pymupdf_engine_threads_config(self, small_image_pdf):
+        eng = PDFReaderPyMuPDFEngine(small_image_pdf, extraction_config=_PDFExtractionConfig(min_image_dimension=10))
+        assert _image_count(eng.to_dicts()) == 1
+
+    def test_pdfium_structured_engine_threads_config(self, small_image_pdf):
+        eng = PDFReaderPdfiumEngine(
+            small_image_pdf,
+            workers=1,
+            structured=True,
+            extraction_config=_PDFExtractionConfig(min_image_dimension=10),
+        )
+        assert _image_count(eng.to_dicts()) == 1
+
+    def test_pdfium_native_engine_threads_config(self, small_image_pdf):
+        eng = PDFReaderPdfiumEngine(
+            small_image_pdf,
+            workers=1,
+            structured=False,
+            extraction_config=_PDFExtractionConfig(min_image_dimension=10),
+        )
+        doc = eng.to_dicts()
+        images = [img for p in doc["document"]["pages"] for img in p["images"]]
+        assert len(images) == 1
+
+
+class TestProcessPoolThreadsConfig:
+    """workers>1 uses a ProcessPoolExecutor; the frozen config must survive pickling."""
+
+    def test_pdfium_structured_process_pool_threads_config(self, multipage_small_image_pdf):
+        """workers>1 uses the process pool; the frozen config must survive pickling."""
+        eng = PDFReaderPdfiumEngine(
+            multipage_small_image_pdf,
+            workers=2,
+            structured=True,
+            extraction_config=_PDFExtractionConfig(min_image_dimension=10),
+        )
+        assert _image_count(eng.to_dicts()) == 2  # both pages' 20px images kept
+
+    def test_pdfium_native_process_pool_threads_config(self, multipage_small_image_pdf):
+        """workers>1 native path: the frozen config must survive pickling into the child."""
+        eng = PDFReaderPdfiumEngine(
+            multipage_small_image_pdf,
+            workers=2,
+            structured=False,
+            extraction_config=_PDFExtractionConfig(min_image_dimension=10),
+        )
+        doc = eng.to_dicts()
+        # native schema exposes images under p["images"], not the unified "elements" list
+        images = [img for p in doc["document"]["pages"] for img in p["images"]]
+        assert len(images) == 2
 
 
 class TestPDFReaderParseSharedAcrossConversions:

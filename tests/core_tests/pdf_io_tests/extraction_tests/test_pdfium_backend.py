@@ -2,6 +2,7 @@
 
 import pytest
 
+from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
 from datagrunt.core.pdf_io.extraction.pdfium_backend import PdfiumBackend
 from datagrunt.core.pdf_io.extraction.shapes import ImageBlock, OcrBlock, PageAnalysis, TextBlock
 
@@ -63,3 +64,22 @@ class TestPdfiumBackend:
             backend.extract_page(0)
 
         assert count["n"] == 1
+
+
+class TestPdfiumBackendImageConfig:
+    def test_default_drops_small_image(self, small_image_pdf):
+        assert PdfiumBackend(small_image_pdf).extract_images(0) == []
+
+    def test_lowered_threshold_keeps_small_image(self, small_image_pdf):
+        backend = PdfiumBackend(small_image_pdf, extraction_config=_PDFExtractionConfig(min_image_dimension=10))
+        assert len(backend.extract_images(0)) == 1
+
+    def test_raised_threshold_drops_large_image(self, sample_pdf):
+        backend = PdfiumBackend(sample_pdf, extraction_config=_PDFExtractionConfig(min_image_dimension=150))
+        assert backend.extract_images(0) == []
+
+    def test_extract_page_honors_config(self, small_image_pdf):
+        backend = PdfiumBackend(small_image_pdf, extraction_config=_PDFExtractionConfig(min_image_dimension=10))
+        with backend:
+            _analysis, _text, images = backend.extract_page(0)
+        assert len(images) == 1
