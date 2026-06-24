@@ -7,6 +7,7 @@ import pytest
 
 from datagrunt.core.file_io import FileProperties
 from datagrunt.core.pdf_io import pdfcomponents
+from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
 
 # The public FileProperties surface that virtual-mode (JSON/dict) PDFComponents
 # must mirror. The cached_property flags are discovered dynamically, so a NEW
@@ -357,8 +358,6 @@ class TestDocumentAssemblerConfig:
 
     def test_assembler_default_backend_receives_config(self, small_image_pdf):
         """The default (pymupdf) backend honors a lowered threshold via the assembler."""
-        from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
-
         assembler = pdfcomponents.DocumentAssembler(
             small_image_pdf, extraction_config=_PDFExtractionConfig(min_image_dimension=10)
         )
@@ -367,7 +366,7 @@ class TestDocumentAssemblerConfig:
         assert len(image_elems) == 1
 
     def test_assembler_default_drops_small_image(self, small_image_pdf):
-        """Default config (40px) drops the 20px test image."""
+        """Default config (40px threshold) drops the 20px test image."""
         page = pdfcomponents.DocumentAssembler(small_image_pdf).parse_page(0)
         image_elems = [e for e in page["elements"] if e.get("type") == "image"]
         assert image_elems == []
