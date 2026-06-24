@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from datagrunt.core.pdf_io.extraction._doc_session import _ThreadLocalDocSession
+from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
 from datagrunt.core.pdf_io.extraction.image_dedupe import dedupe_image_files
 from datagrunt.core.pdf_io.extraction.markdown_escape import escape_leading_markdown
 from datagrunt.core.pdf_io.extraction.ocr import dpi_for_page, ocr_data_to_blocks
@@ -13,16 +14,19 @@ from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
 class PdfiumNativeReader(_ThreadLocalDocSession):
     """Parse pages into the native pdfium schema and assemble documents."""
 
-    def __init__(self, filepath):
-        """Store the path.
+    def __init__(self, filepath, extraction_config=None):
+        """Store the path and extraction config.
 
         Args:
             filepath (str or Path): Path to the PDF file.
+            extraction_config (_PDFExtractionConfig, optional): Tunables; defaults
+                to ``_PDFExtractionConfig()``.
         """
         self.filepath = Path(filepath)
         import threading
 
         self._local = threading.local()
+        self._config = extraction_config or _PDFExtractionConfig()
 
     def _open_resource(self):
         return PdfiumDocument(self.filepath)
@@ -38,7 +42,10 @@ class PdfiumNativeReader(_ThreadLocalDocSession):
                 images = [
                     self._image(img)
                     for img in page.image_items(
-                        output_dir=image_output_dir, name_prefix=Path(self.filepath).stem, page_number=page_index
+                        output_dir=image_output_dir,
+                        name_prefix=Path(self.filepath).stem,
+                        page_number=page_index,
+                        min_image_dimension=self._config.min_image_dimension,
                     )
                 ]
                 ocr_used = False
