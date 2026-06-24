@@ -462,9 +462,6 @@ class TestProcessPoolThreadsConfig:
 
     def test_pdfium_structured_process_pool_threads_config(self, multipage_small_image_pdf):
         """workers>1 uses the process pool; the frozen config must survive pickling."""
-        from datagrunt.core.pdf_io.engines import PDFReaderPdfiumEngine
-        from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
-
         eng = PDFReaderPdfiumEngine(
             multipage_small_image_pdf, workers=2, structured=True,
             extraction_config=_PDFExtractionConfig(min_image_dimension=10),
