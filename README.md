@@ -224,6 +224,28 @@ on either engine.
 - Encrypted / password-protected PDFs raise a clear `ValueError` on every
   engine instead of a raw backend exception.
 
+### Filtering small embedded images
+
+By default, embedded images smaller than **40 px** on either side are dropped as
+layout artifacts (rule lines, separators, icon slivers). Pass the keyword-only
+`min_image_dimension` argument to `PDFReader` or `PDFWriter` to change that
+threshold:
+
+```python
+# Keep smaller images — e.g. capture logos, signatures, or small icons.
+reader = PDFReader("report.pdf", min_image_dimension=15)
+
+# Filter more aggressively — keep only large figures.
+reader = PDFReader("report.pdf", min_image_dimension=200)
+
+# Keep every image, including 1×1 px artifacts (disable the filter).
+reader = PDFReader("report.pdf", min_image_dimension=0)
+```
+
+The threshold applies to **both PDF engines** and every conversion/output method,
+and defaults to `40` (the long-standing behavior). It must be a non-negative
+integer; invalid values raise immediately when the reader/writer is constructed.
+
 ### Parallel Processing & Concurrency
 By default, `PDFReader` and `PDFWriter` run sequentially (`workers=1`). On the default **PDFium engine**, you can enable parallel processing on multi-core systems by passing a `workers` count greater than `1`:
 ```python
