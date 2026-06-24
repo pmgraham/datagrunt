@@ -2,6 +2,7 @@
 
 import pytest
 
+from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
 from datagrunt.core.pdf_io.extraction.pymupdf_backend import PyMuPDFBackend
 from datagrunt.core.pdf_io.extraction.shapes import ImageBlock, PageAnalysis, TextBlock
 
@@ -88,6 +89,25 @@ class TestPyMuPDFBackend:
         assert (round(blue.bbox.x, 1), round(blue.bbox.y, 1)) == blue_corner
         assert (round(green.bbox.x, 1), round(green.bbox.y, 1)) == green_corner
         assert all(im.bbox.w > 0 and im.bbox.h > 0 for im in images)
+
+
+class TestPyMuPDFBackendImageConfig:
+    def test_default_drops_small_image(self, small_image_pdf):
+        with PyMuPDFBackend(small_image_pdf) as backend:
+            _analysis, _text, images = backend.extract_page(0)
+        assert images == []
+
+    def test_lowered_threshold_keeps_small_image(self, small_image_pdf):
+        backend = PyMuPDFBackend(small_image_pdf, extraction_config=_PDFExtractionConfig(min_image_dimension=10))
+        with backend:
+            _analysis, _text, images = backend.extract_page(0)
+        assert len(images) == 1
+
+    def test_raised_threshold_drops_large_image(self, sample_pdf):
+        backend = PyMuPDFBackend(sample_pdf, extraction_config=_PDFExtractionConfig(min_image_dimension=150))
+        with backend:
+            _analysis, _text, images = backend.extract_page(0)
+        assert images == []
 
 
 def test_pymupdf_extract_page_matches_primitives(sample_pdf):

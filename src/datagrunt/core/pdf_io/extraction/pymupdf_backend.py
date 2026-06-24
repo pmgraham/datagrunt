@@ -4,6 +4,7 @@ import logging
 
 from datagrunt.core.pdf_io.extraction._doc_session import _ThreadLocalDocSession
 from datagrunt.core.pdf_io.extraction.base import ExtractionBackend
+from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
 from datagrunt.core.pdf_io.extraction.ocr import ocr_data_to_blocks
 from datagrunt.core.pdf_io.extraction.pdfium_document import ENCRYPTED_PDF_MESSAGE
 from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, PageAnalysis, TextBlock
@@ -24,11 +25,12 @@ def _import_pymupdf():
 class PyMuPDFBackend(_ThreadLocalDocSession, ExtractionBackend):
     """Extraction via PyMuPDF (text/dict spans, images) + Tesseract OCR."""
 
-    def __init__(self, filepath):
+    def __init__(self, filepath, extraction_config=None):
         super().__init__(filepath)
         import threading
 
         self._local = threading.local()
+        self._config = extraction_config or _PDFExtractionConfig()
 
     def _open_doc(self):
         """Open the document, translating the encrypted case to a clear error.
@@ -264,7 +266,7 @@ class PyMuPDFBackend(_ThreadLocalDocSession, ExtractionBackend):
         )
 
     def _image_block(self, doc, img_info, idx, bbox, output_dir, name_prefix, page_number):
-        """Extract one image to an ImageBlock (or None to skip), <40px filtered.
+        """Extract one image to an ImageBlock (or None to skip), images below the configured minimum are filtered.
 
         ``bbox`` is the already-resolved (by xref) position for this image.
         """
@@ -275,7 +277,8 @@ class PyMuPDFBackend(_ThreadLocalDocSession, ExtractionBackend):
         ext = base_image.get("ext", "png")
         width, height = base_image.get("width", 0), base_image.get("height", 0)
         image_bytes = base_image.get("image", b"")
-        if not image_bytes or width < 40 or height < 40:
+        minimum = self._config.min_image_dimension
+        if not image_bytes or width < minimum or height < minimum:
             return None
 
         # Convert non-web-friendly formats to PNG using Pixmap
