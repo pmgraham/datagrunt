@@ -352,6 +352,27 @@ class TestDropLayoutTables:
         assert len(document["document"]["pages"][0]["elements"]) == 1
 
 
+class TestDocumentAssemblerConfig:
+    """DocumentAssembler accepts extraction_config and threads it through."""
+
+    def test_assembler_default_backend_receives_config(self, small_image_pdf):
+        """The default (pymupdf) backend honors a lowered threshold via the assembler."""
+        from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
+
+        assembler = pdfcomponents.DocumentAssembler(
+            small_image_pdf, extraction_config=_PDFExtractionConfig(min_image_dimension=10)
+        )
+        page = assembler.parse_page(0)
+        image_elems = [e for e in page["elements"] if e.get("type") == "image"]
+        assert len(image_elems) == 1
+
+    def test_assembler_default_drops_small_image(self, small_image_pdf):
+        """Default config (40px) drops the 20px test image."""
+        page = pdfcomponents.DocumentAssembler(small_image_pdf).parse_page(0)
+        image_elems = [e for e in page["elements"] if e.get("type") == "image"]
+        assert image_elems == []
+
+
 class TestParsePageBackend:
     """DocumentAssembler.parse_page consumes an ExtractionBackend + table extractor."""
 
