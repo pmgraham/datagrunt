@@ -479,4 +479,5 @@ class TestPDFWriterMinImageDimension:
         )
         assert out.exists()
         # the 20px image is written because the threshold was lowered
-        assert any(images_dir.glob("*")) if images_dir.exists() else False
+        assert images_dir.exists(), "image_output_dir was not created"
+        assert any(images_dir.glob("*")), "no image files written to image_output_dir"
