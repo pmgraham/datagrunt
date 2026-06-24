@@ -10,7 +10,11 @@ from datagrunt.pdf_api._engine_backed import _PDFEngineBacked
 
 
 class PDFReader(_PDFEngineBacked):
-    """Class to unify the interface for reading and parsing PDF files."""
+    """Class to unify the interface for reading and parsing PDF files.
+
+    Pass ``min_image_dimension`` (keyword-only) to control the minimum embedded
+    image pixel size kept during extraction (default 40; 0 keeps everything).
+    """
 
     _engine_role = "reader"
 
