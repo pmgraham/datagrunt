@@ -1,8 +1,8 @@
 """Tests for ExcelReaderEngine."""
 
-import pytest
 import polars as pl
 import pyarrow as pa
+import pytest
 
 from datagrunt.core import ExcelEngineFactory as ExcelEngineFactoryFromCore
 from datagrunt.core.excel_io import ExcelEngineFactory, ExcelReaderEngine, ExcelWriterEngine

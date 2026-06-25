@@ -299,15 +299,11 @@ def sample_xlsx(tmp_path):
 
     path = tmp_path / "test.xlsx"
     with xlsxwriter.Workbook(str(path)) as wb:
-        pl.DataFrame(
-            {"name": ["John", "Jane"], "age": [30, 25], "city": ["New York", "Boston"]}
-        ).write_excel(workbook=wb, worksheet="People")
-        pl.DataFrame(
-            {"product": ["A", "B"], "price": [1.5, 2.5]}
-        ).write_excel(workbook=wb, worksheet="Products")
-        pl.DataFrame(
-            {"First Name!": ["x"], "#Age@": [1]}
-        ).write_excel(workbook=wb, worksheet="Messy")
+        pl.DataFrame({"name": ["John", "Jane"], "age": [30, 25], "city": ["New York", "Boston"]}).write_excel(
+            workbook=wb, worksheet="People"
+        )
+        pl.DataFrame({"product": ["A", "B"], "price": [1.5, 2.5]}).write_excel(workbook=wb, worksheet="Products")
+        pl.DataFrame({"First Name!": ["x"], "#Age@": [1]}).write_excel(workbook=wb, worksheet="Messy")
     return str(path)
 
 
