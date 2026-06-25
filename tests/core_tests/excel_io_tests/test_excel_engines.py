@@ -134,3 +134,32 @@ def test_writer_write_excel_single_sheet(sample_xlsx, tmp_path):
     out = str(tmp_path / "single.xlsx")
     ExcelWriterEngine(sample_xlsx).write_excel(out, sheet="Products")
     assert pl.read_excel(out).columns == ["product", "price"]
+
+
+# ---------------------------------------------------------------------------
+# ExcelEngineFactory tests
+# ---------------------------------------------------------------------------
+
+from datagrunt.core import ExcelEngineFactory as ExcelEngineFactoryFromCore
+from datagrunt.core.excel_io import ExcelEngineFactory
+
+
+def test_factory_creates_reader(sample_xlsx):
+    engine = ExcelEngineFactory(sample_xlsx).create_reader()
+    assert engine.to_dataframe().height == 2
+
+
+def test_factory_creates_writer(sample_xlsx, tmp_path):
+    engine = ExcelEngineFactory(sample_xlsx).create_writer()
+    out = str(tmp_path / "f.csv")
+    engine.write_csv(out)
+    assert pl.read_csv(out).height == 2
+
+
+def test_factory_missing_file_raises(nonexistent_xlsx):
+    with pytest.raises(FileNotFoundError):
+        ExcelEngineFactory(nonexistent_xlsx)
+
+
+def test_core_reexports_factory(sample_xlsx):
+    assert ExcelEngineFactoryFromCore is ExcelEngineFactory

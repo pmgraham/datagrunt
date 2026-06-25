@@ -13,9 +13,11 @@ from datagrunt.core.excel_io.excelcomponents import (
     normalize_excel_columns,
     resolve_sheet,
 )
+from datagrunt.core.excel_io.factories import ExcelEngineFactory
 
 __all__ = [
     "ExcelComponents",
+    "ExcelEngineFactory",
     "ExcelEngineProperties",
     "ExcelReaderEngine",
     "ExcelWriterEngine",
