@@ -88,3 +88,49 @@ def test_read_options_constructor_default(sample_xlsx):
 def test_reserved_read_option_raises(sample_xlsx):
     with pytest.raises(ValueError, match="controlled via"):
         ExcelReaderEngine(sample_xlsx).to_dataframe(sheet_name="People")
+
+
+# ---------------------------------------------------------------------------
+# ExcelWriterEngine tests
+# ---------------------------------------------------------------------------
+
+from datagrunt.core.excel_io import ExcelWriterEngine
+
+
+def test_writer_write_csv_first_sheet(sample_xlsx, tmp_path):
+    out = str(tmp_path / "out.csv")
+    ExcelWriterEngine(sample_xlsx).write_csv(out)
+    assert pl.read_csv(out).columns == ["name", "age", "city"]
+
+
+def test_writer_write_parquet_by_sheet(sample_xlsx, tmp_path):
+    out = str(tmp_path / "out.parquet")
+    ExcelWriterEngine(sample_xlsx).write_parquet(out, sheet="Products")
+    assert pl.read_parquet(out).columns == ["product", "price"]
+
+
+def test_writer_all_sheets_one_file_per_sheet(sample_xlsx, tmp_path):
+    out = str(tmp_path / "out.csv")
+    ExcelWriterEngine(sample_xlsx).write_csv(out, all_sheets=True)
+    assert (tmp_path / "out_People.csv").exists()
+    assert (tmp_path / "out_Products.csv").exists()
+    assert (tmp_path / "out_Messy.csv").exists()
+    assert not (tmp_path / "out.csv").exists()
+
+
+def test_writer_all_sheets_excel_is_multi_tab(sample_xlsx, tmp_path):
+    out = str(tmp_path / "out.xlsx")
+    ExcelWriterEngine(sample_xlsx).write_excel(out, all_sheets=True)
+    sheets = pl.read_excel(out, sheet_id=0)
+    assert set(sheets) == {"People", "Products", "Messy"}
+
+
+def test_writer_all_sheets_with_explicit_sheet_raises(sample_xlsx, tmp_path):
+    with pytest.raises(ValueError, match="not both"):
+        ExcelWriterEngine(sample_xlsx).write_csv(str(tmp_path / "o.csv"), sheet="People", all_sheets=True)
+
+
+def test_writer_write_excel_single_sheet(sample_xlsx, tmp_path):
+    out = str(tmp_path / "single.xlsx")
+    ExcelWriterEngine(sample_xlsx).write_excel(out, sheet="Products")
+    assert pl.read_excel(out).columns == ["product", "price"]

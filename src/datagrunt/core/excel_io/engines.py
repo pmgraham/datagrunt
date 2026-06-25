@@ -1,6 +1,7 @@
 """Polars/calamine-backed engines for the Excel subsystem."""
 
 # standard library
+import re
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import ClassVar
 # third party libraries
 import duckdb
 import polars as pl
+import xlsxwriter
 
 # local libraries
 from datagrunt.core.excel_io.excelcomponents import (
@@ -151,3 +153,109 @@ class ExcelReaderEngine:
         if self._connection is not None:
             self._connection.close()
             self._connection = None
+
+
+def set_excel_export_filename(default_filename, export_filename=None):
+    """Return ``export_filename`` if provided (non-blank), else the default.
+
+    Raises:
+        ValueError: If ``export_filename`` is a non-``None`` empty/whitespace string.
+    """
+    if export_filename is not None:
+        if not export_filename.strip():
+            raise ValueError(
+                f"out_filename must not be empty or whitespace-only; "
+                f"got {export_filename!r}. Pass None to use the default."
+            )
+        return export_filename
+    return default_filename
+
+
+def sanitize_sheet_for_filename(sheet_name):
+    """Return a filesystem-safe token for a worksheet name."""
+    return re.sub(r"[^0-9A-Za-z._-]", "_", sheet_name) or "sheet"
+
+
+class ExcelWriterEngine:
+    """Export a workbook's sheet(s) to CSV/JSON/JSONL/Parquet/Excel via Polars."""
+
+    # Map format key -> (default filename attr, Polars writer method name).
+    _SINGLE_TABLE_WRITERS = {
+        "csv": ("csv_export_filename", "write_csv"),
+        "json": ("json_export_filename", "write_json"),
+        "jsonl": ("json_newline_export_filename", "write_ndjson"),
+        "parquet": ("parquet_export_filename", "write_parquet"),
+        "excel": ("excel_export_filename", "write_excel"),
+    }
+
+    def __init__(self, filepath, normalize_columns=False, **read_options):
+        self.filepath = Path(filepath)
+        self.normalize_columns = normalize_columns
+        self._reader = ExcelReaderEngine(self.filepath, normalize_columns=normalize_columns, **read_options)
+
+    @property
+    def sheets(self):
+        """Worksheet names in workbook order."""
+        return self._reader.sheets
+
+    def close(self):
+        """Release any resources held by the backing reader engine."""
+        self._reader.close()
+
+    def _per_sheet_filename(self, base_filename, sheet_name):
+        """Return ``<stem>_<sheet><suffix>`` next to ``base_filename``."""
+        base = Path(base_filename)
+        token = sanitize_sheet_for_filename(sheet_name)
+        return str(base.with_name(f"{base.stem}_{token}{base.suffix}"))
+
+    def _write_one(self, fmt, df, filename):
+        """Write a single Polars frame in ``fmt`` to ``filename``."""
+        _, writer_method = self._SINGLE_TABLE_WRITERS[fmt]
+        getattr(df, writer_method)(filename)
+
+    def _write_all_sheets_excel(self, filename, normalize_columns, read_options):
+        """Write every sheet into one multi-tab .xlsx workbook."""
+        with xlsxwriter.Workbook(filename) as workbook:
+            for name in self.sheets:
+                df = self._reader.to_dataframe(name, normalize_columns, **read_options)
+                df.write_excel(workbook=workbook, worksheet=name)
+
+    def _write(self, fmt, out_filename, sheet, all_sheets, normalize_columns, read_options):
+        """Shared dispatch for all public write_* methods."""
+        if all_sheets and sheet is not None:
+            raise ValueError("Pass either sheet= or all_sheets=True, not both.")
+        default_attr = self._SINGLE_TABLE_WRITERS[fmt][0]
+        default_filename = getattr(ExcelEngineProperties, default_attr)
+        base = set_excel_export_filename(default_filename, out_filename)
+        if all_sheets and fmt == "excel":
+            self._write_all_sheets_excel(base, normalize_columns, read_options)
+            return
+        if all_sheets:
+            for name in self.sheets:
+                df = self._reader.to_dataframe(name, normalize_columns, **read_options)
+                self._write_one(fmt, df, self._per_sheet_filename(base, name))
+            return
+        df = self._reader.to_dataframe(sheet, normalize_columns, **read_options)
+        self._write_one(fmt, df, base)
+
+    def write_csv(self, out_filename=None, sheet=None, all_sheets=False, normalize_columns=None, **read_options):
+        """Export a sheet (or all sheets) to CSV."""
+        self._write("csv", out_filename, sheet, all_sheets, normalize_columns, read_options)
+
+    def write_json(self, out_filename=None, sheet=None, all_sheets=False, normalize_columns=None, **read_options):
+        """Export a sheet (or all sheets) to JSON."""
+        self._write("json", out_filename, sheet, all_sheets, normalize_columns, read_options)
+
+    def write_json_newline_delimited(
+        self, out_filename=None, sheet=None, all_sheets=False, normalize_columns=None, **read_options
+    ):
+        """Export a sheet (or all sheets) to newline-delimited JSON."""
+        self._write("jsonl", out_filename, sheet, all_sheets, normalize_columns, read_options)
+
+    def write_parquet(self, out_filename=None, sheet=None, all_sheets=False, normalize_columns=None, **read_options):
+        """Export a sheet (or all sheets) to Parquet."""
+        self._write("parquet", out_filename, sheet, all_sheets, normalize_columns, read_options)
+
+    def write_excel(self, out_filename=None, sheet=None, all_sheets=False, normalize_columns=None, **read_options):
+        """Export a sheet to .xlsx, or all sheets to one multi-tab workbook."""
+        self._write("excel", out_filename, sheet, all_sheets, normalize_columns, read_options)
