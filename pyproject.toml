@@ -26,6 +26,7 @@ dependencies = [
     "polars>=1.41.2",
     "pyarrow>=24.0.0",
     "XlsxWriter>=3.2.9",
+    "fastexcel>=0.20.2",
 ]
 requires-python = ">=3.10"
 
@@ -42,7 +43,6 @@ dev = [
     "pytest-cov>=7.1.0",
     "ruff>=0.15.17",
     "bumpver>=2026.1132",
-    "fastexcel>=0.20.2",
     "maturin>=1.7,<2.0",
 ]
 

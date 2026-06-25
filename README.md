@@ -160,6 +160,34 @@ writer_arrow.write_parquet('optimized.parquet')  # Native Arrow Parquet
 Every `write_*` method — including `write_parquet` — honors `lenient=True` for
 ragged CSVs, and empty source files produce empty output instead of an error.
 
+## Reading and writing Excel
+
+```python
+from datagrunt import ExcelReader, ExcelWriter
+
+xl = ExcelReader("workbook.xlsx")
+xl.sheets                      # ['Sheet1', 'Sheet2', ...]
+xl.to_dataframe()              # first sheet as a Polars DataFrame
+xl.to_dataframe(sheet="Sheet2")
+xl.to_dicts(sheet=1)           # by position
+xl.query_data(f"SELECT * FROM {xl.db_table}", sheet="Sheet2")
+
+# Full Polars read_excel passthrough (constructor default or per call):
+xl.to_dataframe(has_header=False)
+xl.to_dataframe(read_options={"skip_rows": 2, "n_rows": 100})
+
+w = ExcelWriter("workbook.xlsx")
+w.write_csv("out.csv")                    # first sheet
+w.write_parquet("out.parquet", sheet="Sheet2")
+w.write_csv("out.csv", all_sheets=True)   # one file per sheet: out_Sheet1.csv, ...
+w.write_excel("all.xlsx", all_sheets=True) # one multi-tab workbook
+```
+
+`normalize_columns=True` (constructor or per call) normalizes column names
+exactly as the CSV API does. Values beginning with `=`, `+`, `-`, `@` are
+written verbatim — sanitize at the application layer if your source is
+untrusted and the output may be opened in a spreadsheet (CWE-1236).
+
 ## PDF parsing
 
 PDF support is an optional extra:

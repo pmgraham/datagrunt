@@ -18,6 +18,13 @@ from datagrunt.core.csv_io import (
     CSVWriterPyArrowEngine,
 )
 from datagrunt.core.databases import DuckDBQueries
+from datagrunt.core.excel_io import (
+    ExcelComponents,
+    ExcelEngineFactory,
+    ExcelEngineProperties,
+    ExcelReaderEngine,
+    ExcelWriterEngine,
+)
 from datagrunt.core.file_io import FileProperties
 from datagrunt.core.pdf_io import (
     DocumentAssembler,
@@ -55,6 +62,12 @@ __all__ = [
     "CSVStringSample",
     # Databases
     "DuckDBQueries",
+    # Excel IO
+    "ExcelComponents",
+    "ExcelEngineFactory",
+    "ExcelEngineProperties",
+    "ExcelReaderEngine",
+    "ExcelWriterEngine",
     # File IO
     "FileProperties",
     # PDF IO

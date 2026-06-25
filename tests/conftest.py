@@ -289,3 +289,33 @@ def multipage_small_image_pdf(tmp_path):
 def tesseract_available():
     """Return True if the tesseract system binary is on PATH."""
     return shutil.which("tesseract") is not None
+
+
+@pytest.fixture
+def sample_xlsx(tmp_path):
+    """Create a 3-sheet workbook: People, Products, and Messy (raw headers)."""
+    import polars as pl
+    import xlsxwriter
+
+    path = tmp_path / "test.xlsx"
+    with xlsxwriter.Workbook(str(path)) as wb:
+        pl.DataFrame({"name": ["John", "Jane"], "age": [30, 25], "city": ["New York", "Boston"]}).write_excel(
+            workbook=wb, worksheet="People"
+        )
+        pl.DataFrame({"product": ["A", "B"], "price": [1.5, 2.5]}).write_excel(workbook=wb, worksheet="Products")
+        pl.DataFrame({"First Name!": ["x"], "#Age@": [1]}).write_excel(workbook=wb, worksheet="Messy")
+    return str(path)
+
+
+@pytest.fixture
+def empty_xlsx(tmp_path):
+    """Create a 0-byte .xlsx file."""
+    path = tmp_path / "empty.xlsx"
+    path.touch()
+    return str(path)
+
+
+@pytest.fixture
+def nonexistent_xlsx(tmp_path):
+    """Return a path to an .xlsx that does not exist."""
+    return str(tmp_path / "missing.xlsx")
