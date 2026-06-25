@@ -30,6 +30,7 @@ __license__ = "MIT"
 # Import key classes, functions, or submodules that should be available at
 # the package level
 from datagrunt.csv_api import CSVReader, CSVWriter
+from datagrunt.excel_api import ExcelReader
 from datagrunt.pdf_api import PDFReader, PDFWriter
 
 # You can define __all__ to specify what gets imported with "from package
@@ -37,6 +38,7 @@ from datagrunt.pdf_api import PDFReader, PDFWriter
 __all__ = [
     "CSVReader",
     "CSVWriter",
+    "ExcelReader",
     "PDFReader",
     "PDFWriter",
 ]
