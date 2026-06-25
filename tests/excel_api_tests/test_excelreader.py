@@ -70,3 +70,25 @@ def test_context_manager_closes(sample_xlsx):
         xl.query_data(f"SELECT 1 FROM {xl.db_table}")
     # No assertion needed beyond clean exit; close() must be idempotent.
     xl.close()
+
+
+def test_empty_workbook_to_arrow_table_returns_empty(empty_xlsx):
+    """to_arrow_table() on an empty workbook returns an empty pa.Table."""
+    table = ExcelReader(empty_xlsx).to_arrow_table()
+    assert isinstance(table, pa.Table)
+    assert table.num_rows == 0
+    assert table.num_columns == 0
+
+
+def test_get_sample_normal_returns_dataframe(sample_xlsx):
+    """get_sample() on a normal workbook returns a pl.DataFrame."""
+    sample = ExcelReader(sample_xlsx).get_sample()
+    assert isinstance(sample, pl.DataFrame)
+    assert sample.height > 0
+
+
+def test_get_sample_empty_workbook_returns_empty_dataframe(empty_xlsx):
+    """get_sample() on an empty workbook returns an empty pl.DataFrame."""
+    sample = ExcelReader(empty_xlsx).get_sample()
+    assert isinstance(sample, pl.DataFrame)
+    assert sample.is_empty()

@@ -18,6 +18,10 @@ def test_write_json_and_jsonl(sample_xlsx, tmp_path):
     w.write_json(j, sheet="Products")
     w.write_json_newline_delimited(jl, sheet="Products")
     assert os.path.exists(j) and os.path.exists(jl)
+    # Read back the JSONL output and assert row count and columns.
+    df_jl = pl.read_ndjson(jl)
+    assert df_jl.height == 2
+    assert set(df_jl.columns) == {"product", "price"}
 
 
 def test_write_parquet(sample_xlsx, tmp_path):

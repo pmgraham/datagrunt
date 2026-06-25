@@ -4,7 +4,9 @@ import pytest
 import polars as pl
 import pyarrow as pa
 
-from datagrunt.core.excel_io import ExcelReaderEngine
+from datagrunt.core import ExcelEngineFactory as ExcelEngineFactoryFromCore
+from datagrunt.core.excel_io import ExcelEngineFactory, ExcelReaderEngine, ExcelWriterEngine
+from datagrunt.core.excel_io.excelcomponents import resolve_sheet
 
 
 def test_to_dataframe_defaults_to_first_sheet(sample_xlsx):
@@ -90,11 +92,49 @@ def test_reserved_read_option_raises(sample_xlsx):
         ExcelReaderEngine(sample_xlsx).to_dataframe(sheet_name="People")
 
 
+def test_per_call_read_option_overrides_constructor(sample_xlsx):
+    """A per-call read_options dict wins over the constructor default."""
+    engine = ExcelReaderEngine(sample_xlsx, read_options={"n_rows": 5})
+    df = engine.to_dataframe(read_options={"n_rows": 1})
+    assert df.height == 1
+
+
+def test_close_is_idempotent(sample_xlsx):
+    """Calling close() twice after query_data must not raise."""
+    engine = ExcelReaderEngine(sample_xlsx)
+    engine.query_data(f"SELECT 1 FROM {engine.db_table}")
+    engine.close()
+    engine.close()  # second call must not raise
+
+
+def test_query_data_re_registration_replaces_prior_sheet(sample_xlsx):
+    """Querying a second sheet replaces the registered table, not stacks it."""
+    engine = ExcelReaderEngine(sample_xlsx)
+    engine.query_data(f"SELECT name FROM {engine.db_table}", sheet="People")
+    rel2 = engine.query_data(f"SELECT product FROM {engine.db_table}", sheet="Products")
+    products = [row[0] for row in rel2.fetchall()]
+    assert "product" not in products or set(products) == {"A", "B"}
+    # Confirm the second result reflects Products columns, not People's.
+    rel_check = engine.query_data(f"SELECT product FROM {engine.db_table}", sheet="Products")
+    assert rel_check.fetchone()[0] == "A"
+    engine.close()
+
+
+def test_resolve_sheet_rejects_bool_true():
+    """resolve_sheet must raise ValueError when sheet is True."""
+    with pytest.raises(ValueError):
+        resolve_sheet(["A"], True)
+
+
+def test_resolve_sheet_rejects_bool_false():
+    """resolve_sheet must raise ValueError when sheet is False."""
+    with pytest.raises(ValueError):
+        resolve_sheet(["A"], False)
+
+
 # ---------------------------------------------------------------------------
 # ExcelWriterEngine tests
 # ---------------------------------------------------------------------------
-
-from datagrunt.core.excel_io import ExcelWriterEngine
 
 
 def test_writer_write_csv_first_sheet(sample_xlsx, tmp_path):
@@ -118,6 +158,16 @@ def test_writer_all_sheets_one_file_per_sheet(sample_xlsx, tmp_path):
     assert not (tmp_path / "out.csv").exists()
 
 
+def test_writer_all_sheets_per_sheet_content(sample_xlsx, tmp_path):
+    """Read back a produced per-sheet file and assert its columns and content."""
+    out = str(tmp_path / "out.csv")
+    ExcelWriterEngine(sample_xlsx).write_csv(out, all_sheets=True)
+    df = pl.read_csv(str(tmp_path / "out_Products.csv"))
+    assert df.columns == ["product", "price"]
+    assert df.height == 2
+    assert set(df["product"].to_list()) == {"A", "B"}
+
+
 def test_writer_all_sheets_excel_is_multi_tab(sample_xlsx, tmp_path):
     out = str(tmp_path / "out.xlsx")
     ExcelWriterEngine(sample_xlsx).write_excel(out, all_sheets=True)
@@ -139,9 +189,6 @@ def test_writer_write_excel_single_sheet(sample_xlsx, tmp_path):
 # ---------------------------------------------------------------------------
 # ExcelEngineFactory tests
 # ---------------------------------------------------------------------------
-
-from datagrunt.core import ExcelEngineFactory as ExcelEngineFactoryFromCore
-from datagrunt.core.excel_io import ExcelEngineFactory
 
 
 def test_factory_creates_reader(sample_xlsx):

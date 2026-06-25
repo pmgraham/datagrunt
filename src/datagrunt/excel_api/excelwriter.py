@@ -40,7 +40,14 @@ class ExcelWriter(_ExcelEngineBacked):
         filename = set_excel_export_filename(default_filename, out_filename)
         Path(filename).write_bytes(b"")
 
-    def write_csv(self, out_filename=None, sheet=None, all_sheets=False, normalize_columns=None, **read_options):
+    def write_csv(
+        self,
+        out_filename: str | None = None,
+        sheet=None,
+        all_sheets: bool = False,
+        normalize_columns: bool | None = None,
+        **read_options,
+    ) -> None:
         """Export a sheet (or all sheets, one file each) to CSV."""
         if self.is_empty or self.is_blank:
             return self._write_empty_output(ExcelEngineProperties.csv_export_filename, out_filename)
@@ -48,7 +55,14 @@ class ExcelWriter(_ExcelEngineBacked):
             out_filename, sheet=sheet, all_sheets=all_sheets, normalize_columns=normalize_columns, **read_options
         )
 
-    def write_json(self, out_filename=None, sheet=None, all_sheets=False, normalize_columns=None, **read_options):
+    def write_json(
+        self,
+        out_filename: str | None = None,
+        sheet=None,
+        all_sheets: bool = False,
+        normalize_columns: bool | None = None,
+        **read_options,
+    ) -> None:
         """Export a sheet (or all sheets, one file each) to JSON."""
         if self.is_empty or self.is_blank:
             return self._write_empty_output(ExcelEngineProperties.json_export_filename, out_filename)
@@ -57,8 +71,13 @@ class ExcelWriter(_ExcelEngineBacked):
         )
 
     def write_json_newline_delimited(
-        self, out_filename=None, sheet=None, all_sheets=False, normalize_columns=None, **read_options
-    ):
+        self,
+        out_filename: str | None = None,
+        sheet=None,
+        all_sheets: bool = False,
+        normalize_columns: bool | None = None,
+        **read_options,
+    ) -> None:
         """Export a sheet (or all sheets, one file each) to newline-delimited JSON."""
         if self.is_empty or self.is_blank:
             return self._write_empty_output(ExcelEngineProperties.json_newline_export_filename, out_filename)
@@ -66,7 +85,14 @@ class ExcelWriter(_ExcelEngineBacked):
             out_filename, sheet=sheet, all_sheets=all_sheets, normalize_columns=normalize_columns, **read_options
         )
 
-    def write_parquet(self, out_filename=None, sheet=None, all_sheets=False, normalize_columns=None, **read_options):
+    def write_parquet(
+        self,
+        out_filename: str | None = None,
+        sheet=None,
+        all_sheets: bool = False,
+        normalize_columns: bool | None = None,
+        **read_options,
+    ) -> None:
         """Export a sheet (or all sheets, one file each) to Parquet."""
         if self.is_empty or self.is_blank:
             return self._write_empty_output(ExcelEngineProperties.parquet_export_filename, out_filename)
@@ -74,7 +100,14 @@ class ExcelWriter(_ExcelEngineBacked):
             out_filename, sheet=sheet, all_sheets=all_sheets, normalize_columns=normalize_columns, **read_options
         )
 
-    def write_excel(self, out_filename=None, sheet=None, all_sheets=False, normalize_columns=None, **read_options):
+    def write_excel(
+        self,
+        out_filename: str | None = None,
+        sheet=None,
+        all_sheets: bool = False,
+        normalize_columns: bool | None = None,
+        **read_options,
+    ) -> None:
         """Export a sheet to .xlsx, or all sheets to one multi-tab workbook."""
         if self.is_empty or self.is_blank:
             return self._write_empty_output(ExcelEngineProperties.excel_export_filename, out_filename)
