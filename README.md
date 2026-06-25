@@ -1,13 +1,13 @@
 # Welcome To Datagrunt
 
-Datagrunt is a Python library designed to simplify the way you work with CSV and PDF files. It provides a streamlined approach to reading, processing, and transforming your data into various formats, making data manipulation efficient and intuitive.
+Datagrunt is a Python library designed to simplify the way you work with CSV, Excel, and PDF files. It provides a streamlined approach to reading, processing, and transforming your data into various formats, making data manipulation efficient and intuitive.
 
 ## Why Datagrunt?
 
-Born out of real-world frustration, Datagrunt eliminates the need for repetitive coding when handling CSV and PDF files. Whether you're a data analyst, data engineer, or data scientist, Datagrunt empowers you to focus on insights, not tedious data wrangling.
+Born out of real-world frustration, Datagrunt eliminates the need for repetitive coding when handling CSV, Excel, and PDF files. Whether you're a data analyst, data engineer, or data scientist, Datagrunt empowers you to focus on insights, not tedious data wrangling.
 
 ### What Datagrunt Is Not
-Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow, nor is it a comprehensive data processing solution. Instead, it's designed to simplify the way you work with CSV and PDF files — solving the pain point of inferring delimiters when a CSV structure is unknown, and turning PDFs into structured, queryable data. Datagrunt provides an easy way to convert CSV files to dataframes and export them to various formats, and to extract text, tables, and images from PDFs. One of Datagrunt's value propositions is its relative simplicity and ease of use.
+Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow, nor is it a comprehensive data processing solution. Instead, it's designed to simplify the way you work with CSV, Excel, and PDF files — solving the pain point of inferring delimiters when a CSV structure is unknown, reading Excel workbooks sheet by sheet, and turning PDFs into structured, queryable data. Datagrunt provides an easy way to convert CSV and Excel files to dataframes and export them to various formats, and to extract text, tables, and images from PDFs. One of Datagrunt's value propositions is its relative simplicity and ease of use.
 
 ## Key Features
 
@@ -15,7 +15,8 @@ Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow
 - **Rust-Accelerated Core (v4.0+):** CSV delimiter and dialect inference run in a bundled Rust extension (`datagrunt._native`) for multiple-times-faster scanning of large files. The native engine is the default and is required on supported platforms (it ships as a prebuilt wheel). A byte-for-byte-equivalent pure-Python implementation lives alongside it as the differential-parity oracle — validated against the Rust engine in CI and selectable via a hidden diagnostics toggle — so results are identical no matter which path runs.
 - **Path Object Support:** Full support for both string paths and `pathlib.Path` objects for modern, cross-platform file handling.
 - **Multiple Processing Engines:** Choose from three powerful engines - [DuckDB](https://duckdb.org), [Polars](https://pola.rs), and [PyArrow](https://arrow.apache.org/docs/python/) - to handle your data processing needs.
-- **Flexible Data Transformation:** Easily convert your processed CSV data into various formats including CSV, Excel, JSON, JSONL, and Parquet.
+- **Flexible Data Transformation:** Easily convert your processed CSV and Excel data into various formats including CSV, Excel, JSON, JSONL, and Parquet.
+- **Excel Reading & Writing:** Read `.xlsx`/`.xls` workbooks sheet by sheet into DataFrames, dicts, Arrow, or SQL, and export any sheet (or all of them) to CSV, JSON, JSONL, Parquet, or Excel.
 - **Robust by Default:** Fail-fast validation with clear errors (invalid engine names, missing paths, directories, encrypted PDFs), graceful handling of empty files, no `UnicodeDecodeError` when constructing a reader over a non-UTF-8 file, and sane comment semantics — only leading `#` lines are treated as comments, so `#`-prefixed data rows such as hex colors are preserved on all engines.
 - **PDF Parsing & OCR:** Extract text, tables, and images from PDF files as dicts, DataFrames, or JSON, with optional [Tesseract](https://github.com/tesseract-ocr/tesseract) OCR for scanned pages. Powered by the permissively-licensed **PDFium** engine by default, with **PyMuPDF** available as an alternative.
 - **Pythonic API:** Enjoy a clean and intuitive API that integrates seamlessly into your existing Python workflows.
@@ -162,14 +163,21 @@ ragged CSVs, and empty source files produce empty output instead of an error.
 
 ## Reading and writing Excel
 
+`ExcelReader` and `ExcelWriter` read `.xlsx`/`.xls`-family workbooks **sheet by
+sheet**. Reading is backed by a single canonical engine — Polars + calamine
+(via `fastexcel`, a core dependency) — so there is no `engine` argument. A
+non-Excel or missing path is rejected at construction (`ValueError` /
+`FileNotFoundError`).
+
 ```python
 from datagrunt import ExcelReader, ExcelWriter
 
 xl = ExcelReader("workbook.xlsx")
 xl.sheets                      # ['Sheet1', 'Sheet2', ...]
 xl.to_dataframe()              # first sheet as a Polars DataFrame
-xl.to_dataframe(sheet="Sheet2")
+xl.to_dataframe(sheet="Sheet2")  # by name
 xl.to_dicts(sheet=1)           # by position
+xl.to_arrow_table()            # also: get_sample(), all accept sheet=
 xl.query_data(f"SELECT * FROM {xl.db_table}", sheet="Sheet2")
 
 # Full Polars read_excel passthrough (constructor default or per call):
@@ -182,6 +190,12 @@ w.write_parquet("out.parquet", sheet="Sheet2")
 w.write_csv("out.csv", all_sheets=True)   # one file per sheet: out_Sheet1.csv, ...
 w.write_excel("all.xlsx", all_sheets=True) # one multi-tab workbook
 ```
+
+Every reader/writer method takes an optional `sheet=` (name or zero-based
+index), defaulting to the first sheet; an invalid sheet raises a `ValueError`
+listing the available sheets, and empty/blank workbooks return empty results.
+The keys `source`, `sheet_id`, and `sheet_name` are reserved (sheet selection is
+controlled via `sheet=`).
 
 `normalize_columns=True` (constructor or per call) normalizes column names
 exactly as the CSV API does. Values beginning with `=`, `+`, `-`, `@` are
@@ -324,6 +338,8 @@ _The engines above apply to CSV processing. Whichever you pick, results are cons
 
 - **`CSVReader`**: Read and process CSV files with intelligent delimiter detection
 - **`CSVWriter`**: Export CSV data to multiple formats (CSV, Excel, JSON, Parquet)
+- **`ExcelReader`**: Read Excel workbooks sheet by sheet into Polars DataFrames, dicts, PyArrow tables, or SQL query results
+- **`ExcelWriter`**: Export a sheet (or all sheets) of an Excel workbook to CSV, Excel, JSON, JSONL, or Parquet
 - **`PDFReader`**: Parse PDF files into text, tables, and images as dicts, Polars DataFrames, or PyArrow tables
 - **`PDFWriter`**: Write parsed PDF output to JSON or JSONL and extract embedded images to disk
 
