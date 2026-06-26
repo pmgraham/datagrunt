@@ -319,3 +319,43 @@ def empty_xlsx(tmp_path):
 def nonexistent_xlsx(tmp_path):
     """Return a path to an .xlsx that does not exist."""
     return str(tmp_path / "missing.xlsx")
+
+
+@pytest.fixture
+def sample_parquet(tmp_path):
+    """Create a small Parquet file with clean and messy column names."""
+    import polars as pl
+
+    path = tmp_path / "test.parquet"
+    pl.DataFrame(
+        {
+            "name": ["John", "Jane", "Amir", "Mei"],
+            "age": [30, 25, 41, 38],
+            "city": ["New York", "Boston", "Cairo", "Taipei"],
+        }
+    ).write_parquet(str(path))
+    return str(path)
+
+
+@pytest.fixture
+def messy_parquet(tmp_path):
+    """Create a Parquet file with non-normalized column names."""
+    import polars as pl
+
+    path = tmp_path / "messy.parquet"
+    pl.DataFrame({"First Name!": ["x", "y"], "#Age@": [1, 2]}).write_parquet(str(path))
+    return str(path)
+
+
+@pytest.fixture
+def empty_parquet(tmp_path):
+    """Create a 0-byte .parquet file."""
+    path = tmp_path / "empty.parquet"
+    path.touch()
+    return str(path)
+
+
+@pytest.fixture
+def nonexistent_parquet(tmp_path):
+    """Return a path to a .parquet that does not exist."""
+    return str(tmp_path / "missing.parquet")

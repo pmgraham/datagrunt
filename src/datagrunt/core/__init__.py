@@ -26,6 +26,13 @@ from datagrunt.core.excel_io import (
     ExcelWriterEngine,
 )
 from datagrunt.core.file_io import FileProperties
+from datagrunt.core.parquet_io import (
+    ParquetComponents,
+    ParquetEngineFactory,
+    ParquetEngineProperties,
+    ParquetReaderEngine,
+    ParquetWriterEngine,
+)
 from datagrunt.core.pdf_io import (
     DocumentAssembler,
     ExtractionBackend,
@@ -70,6 +77,12 @@ __all__ = [
     "ExcelWriterEngine",
     # File IO
     "FileProperties",
+    # Parquet IO
+    "ParquetComponents",
+    "ParquetEngineFactory",
+    "ParquetEngineProperties",
+    "ParquetReaderEngine",
+    "ParquetWriterEngine",
     # PDF IO
     "PDFComponents",
     "DocumentAssembler",

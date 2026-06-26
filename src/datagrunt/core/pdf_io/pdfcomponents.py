@@ -550,6 +550,7 @@ class PDFComponents(FileProperties):
         self.is_pdf = False
         self.is_excel = False
         self.is_apache = False
+        self.is_parquet = False
         self.is_large = False
         self.is_tabular = False
         self.is_tsv = False

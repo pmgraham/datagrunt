@@ -40,6 +40,11 @@ class FileExtensions:
         return ["pdf"]
 
     @cached_property
+    def parquet_extensions(self):
+        """Define Parquet extensions."""
+        return ["parquet"]
+
+    @cached_property
     def excel_extensions(self):
         """Define Excel extensions."""
         return ["xlsx", "xlsm", "xlsb", "xltx", "xltm", "xls", "xlt"]
@@ -278,6 +283,11 @@ class FileProperties:
     def is_apache(self):
         """Check if the file is an Apache formatted file."""
         return self.extension_string.lower() in self._ext.apache_extensions
+
+    @cached_property
+    def is_parquet(self):
+        """Check if the file is a Parquet file."""
+        return self.extension_string.lower() in self._ext.parquet_extensions
 
     @cached_property
     def is_empty(self):

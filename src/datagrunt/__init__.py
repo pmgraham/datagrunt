@@ -1,7 +1,7 @@
 """
 Datagrunt
 
-A Python library designed to simplify the way you work with CSV and PDF files. This
+A Python library designed to simplify the way you work with CSV, Excel, Parquet, and PDF files. This
 module provides inferred CSV delimiters and helper methods for reading and
 writing CSV files.
 
@@ -31,6 +31,7 @@ __license__ = "MIT"
 # the package level
 from datagrunt.csv_api import CSVReader, CSVWriter
 from datagrunt.excel_api import ExcelReader, ExcelWriter
+from datagrunt.parquet_api import ParquetReader, ParquetWriter
 from datagrunt.pdf_api import PDFReader, PDFWriter
 
 # You can define __all__ to specify what gets imported with "from package
@@ -40,6 +41,8 @@ __all__ = [
     "CSVWriter",
     "ExcelReader",
     "ExcelWriter",
+    "ParquetReader",
+    "ParquetWriter",
     "PDFReader",
     "PDFWriter",
 ]
