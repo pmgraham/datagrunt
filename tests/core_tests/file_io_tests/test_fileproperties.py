@@ -91,6 +91,17 @@ class TestFileProperties:
         assert not pdf_file.is_structured
         assert not pdf_file.is_semi_structured
 
+    def test_is_parquet(self, sample_files):
+        """Parquet detection is exact and does not widen to avro."""
+        parquet_file = FileProperties(sample_files["test.parquet"])
+        csv_file = FileProperties(sample_files["data.csv"])
+        xlsx_file = FileProperties(sample_files["test.xlsx"])
+
+        assert parquet_file.is_parquet
+        assert parquet_file.is_apache  # back-compat: still apache
+        assert not csv_file.is_parquet
+        assert not xlsx_file.is_parquet
+
 
 class TestBlankFileBinaryDetection:
     """is_blank must not misclassify binary/invalid-UTF-8 files as blank (#146).

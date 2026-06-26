@@ -1,13 +1,13 @@
 # Welcome To Datagrunt
 
-Datagrunt is a Python library designed to simplify the way you work with CSV, Excel, and PDF files. It provides a streamlined approach to reading, processing, and transforming your data into various formats, making data manipulation efficient and intuitive.
+Datagrunt is a Python library designed to simplify the way you work with CSV, Excel, Parquet, and PDF files. It provides a streamlined approach to reading, processing, and transforming your data into various formats, making data manipulation efficient and intuitive.
 
 ## Why Datagrunt?
 
-Born out of real-world frustration, Datagrunt eliminates the need for repetitive coding when handling CSV, Excel, and PDF files. Whether you're a data analyst, data engineer, or data scientist, Datagrunt empowers you to focus on insights, not tedious data wrangling.
+Born out of real-world frustration, Datagrunt eliminates the need for repetitive coding when handling CSV, Excel, Parquet, and PDF files. Whether you're a data analyst, data engineer, or data scientist, Datagrunt empowers you to focus on insights, not tedious data wrangling.
 
 ### What Datagrunt Is Not
-Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow, nor is it a comprehensive data processing solution. Instead, it's designed to simplify the way you work with CSV, Excel, and PDF files — solving the pain point of inferring delimiters when a CSV structure is unknown, reading Excel workbooks sheet by sheet, and turning PDFs into structured, queryable data. Datagrunt provides an easy way to convert CSV and Excel files to dataframes and export them to various formats, and to extract text, tables, and images from PDFs. One of Datagrunt's value propositions is its relative simplicity and ease of use.
+Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow, nor is it a comprehensive data processing solution. Instead, it's designed to simplify the way you work with CSV, Excel, Parquet, and PDF files — solving the pain point of inferring delimiters when a CSV structure is unknown, reading Excel workbooks sheet by sheet, reading and converting columnar Parquet data, and turning PDFs into structured, queryable data. Datagrunt provides an easy way to convert CSV, Excel, and Parquet files to dataframes and export them to various formats, and to extract text, tables, and images from PDFs. One of Datagrunt's value propositions is its relative simplicity and ease of use.
 
 ## Key Features
 
@@ -15,8 +15,9 @@ Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow
 - **Rust-Accelerated Core (v4.0+):** CSV delimiter and dialect inference run in a bundled Rust extension (`datagrunt._native`) for multiple-times-faster scanning of large files. The native engine is the default and is required on supported platforms (it ships as a prebuilt wheel). A byte-for-byte-equivalent pure-Python implementation lives alongside it as the differential-parity oracle — validated against the Rust engine in CI and selectable via a hidden diagnostics toggle — so results are identical no matter which path runs.
 - **Path Object Support:** Full support for both string paths and `pathlib.Path` objects for modern, cross-platform file handling.
 - **Multiple Processing Engines:** Choose from three powerful engines - [DuckDB](https://duckdb.org), [Polars](https://pola.rs), and [PyArrow](https://arrow.apache.org/docs/python/) - to handle your data processing needs.
-- **Flexible Data Transformation:** Easily convert your processed CSV and Excel data into various formats including CSV, Excel, JSON, JSONL, and Parquet.
+- **Flexible Data Transformation:** Easily convert your processed CSV, Excel, and Parquet data into various formats including CSV, Excel, JSON, JSONL, and Parquet.
 - **Excel Reading & Writing:** Read `.xlsx`/`.xls` workbooks sheet by sheet into DataFrames, dicts, Arrow, or SQL, and export any sheet (or all of them) to CSV, JSON, JSONL, Parquet, or Excel.
+- **Parquet Reading & Writing:** Read `.parquet` files into DataFrames, dicts, Arrow tables, or SQL, and export to CSV, JSON, JSONL, Parquet, or Excel. Backed by a single Polars engine with full `read_options`/`write_options` passthrough.
 - **Robust by Default:** Fail-fast validation with clear errors (invalid engine names, missing paths, directories, encrypted PDFs), graceful handling of empty files, no `UnicodeDecodeError` when constructing a reader over a non-UTF-8 file, and sane comment semantics — only leading `#` lines are treated as comments, so `#`-prefixed data rows such as hex colors are preserved on all engines.
 - **PDF Parsing & OCR:** Extract text, tables, and images from PDF files as dicts, DataFrames, or JSON, with optional [Tesseract](https://github.com/tesseract-ocr/tesseract) OCR for scanned pages. Powered by the permissively-licensed **PDFium** engine by default, with **PyMuPDF** available as an alternative.
 - **Pythonic API:** Enjoy a clean and intuitive API that integrates seamlessly into your existing Python workflows.
@@ -201,6 +202,45 @@ controlled via `sheet=`).
 exactly as the CSV API does. Values beginning with `=`, `+`, `-`, `@` are
 written verbatim — sanitize at the application layer if your source is
 untrusted and the output may be opened in a spreadsheet (CWE-1236).
+
+## Reading and writing Parquet
+
+`ParquetReader` and `ParquetWriter` work with `.parquet` files as a
+**single-table columnar format** — there are no sheets and no `engine` argument.
+Reading is backed by a single canonical Polars engine. A non-Parquet or missing
+path is rejected at construction (`ValueError` / `FileNotFoundError`).
+
+```python
+from datagrunt import ParquetReader, ParquetWriter
+
+reader = ParquetReader("data.parquet")
+reader.get_sample()                          # first rows as a Polars DataFrame
+reader.to_dataframe()                        # full file as a Polars DataFrame
+reader.to_arrow_table()                      # Apache Arrow Table
+reader.to_dicts()                            # list of row dicts
+reader.query_data(f"SELECT * FROM {reader.db_table} LIMIT 5")
+
+# Pass read_options straight through to pl.read_parquet (only "source" is reserved):
+reader_subset = ParquetReader("data.parquet", columns=["id", "name"], n_rows=1000)
+```
+
+```python
+writer = ParquetWriter("data.parquet")
+writer.write_csv("out.csv")
+writer.write_json("out.json")
+writer.write_json_newline_delimited("out.jsonl")
+writer.write_parquet("out.parquet")
+writer.write_excel("out.xlsx")
+
+# write_options are forwarded to the Polars writer:
+writer.write_parquet("recompressed.parquet", compression="zstd")
+```
+
+`normalize_columns=True` normalizes column names exactly as the CSV and Excel
+APIs do. Empty or blank source files return empty results from reader methods
+and produce 0-byte output files from writer methods. Values beginning with `=`,
+`+`, `-`, `@` are written verbatim — sanitize at the application layer if your
+source is untrusted and the output may be opened in a spreadsheet (CWE-1236).
 
 ## PDF parsing
 
