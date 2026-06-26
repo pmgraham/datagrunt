@@ -1,11 +1,14 @@
 """Tests for the Parquet reader/writer engines."""
 
+from pathlib import Path
+
 import polars as pl
 import pyarrow as pa
 import pytest
 
 from datagrunt.core.parquet_io.engines import (
     ParquetReaderEngine,
+    ParquetWriterEngine,
     set_parquet_export_filename,
 )
 
@@ -65,3 +68,34 @@ def test_set_parquet_export_filename():
     assert set_parquet_export_filename("output.csv", "custom.csv") == "custom.csv"
     with pytest.raises(ValueError):
         set_parquet_export_filename("output.csv", "   ")
+
+
+def test_writer_exports_csv(sample_parquet, tmp_path):
+    out = str(tmp_path / "out.csv")
+    ParquetWriterEngine(sample_parquet).write_csv(out)
+    assert pl.read_csv(out).shape == (4, 3)
+
+
+def test_writer_exports_json_jsonl_excel(sample_parquet, tmp_path):
+    writer = ParquetWriterEngine(sample_parquet)
+    json_out = str(tmp_path / "out.json")
+    jsonl_out = str(tmp_path / "out.jsonl")
+    xlsx_out = str(tmp_path / "out.xlsx")
+    writer.write_json(json_out)
+    writer.write_json_newline_delimited(jsonl_out)
+    writer.write_excel(xlsx_out)
+    assert Path(json_out).stat().st_size > 0
+    assert Path(jsonl_out).stat().st_size > 0
+    assert pl.read_excel(xlsx_out).shape == (4, 3)
+
+
+def test_writer_parquet_round_trip_with_compression(sample_parquet, tmp_path):
+    out = str(tmp_path / "out.parquet")
+    ParquetWriterEngine(sample_parquet).write_parquet(out, compression="zstd")
+    assert pl.read_parquet(out).shape == (4, 3)
+
+
+def test_writer_normalize_columns(messy_parquet, tmp_path):
+    out = str(tmp_path / "out.csv")
+    ParquetWriterEngine(messy_parquet, normalize_columns=True).write_csv(out)
+    assert pl.read_csv(out).columns == ["first_name", "age"]

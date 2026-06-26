@@ -154,3 +154,53 @@ class ParquetReaderEngine:
         if self._connection is not None:
             self._connection.close()
             self._connection = None
+
+
+class ParquetWriterEngine:
+    """Export a Parquet file to CSV/JSON/JSONL/Parquet/Excel via Polars."""
+
+    # Map format key -> (default filename attr, Polars writer method name).
+    _SINGLE_TABLE_WRITERS = {
+        "csv": ("csv_export_filename", "write_csv"),
+        "json": ("json_export_filename", "write_json"),
+        "jsonl": ("json_newline_export_filename", "write_ndjson"),
+        "parquet": ("parquet_export_filename", "write_parquet"),
+        "excel": ("excel_export_filename", "write_excel"),
+    }
+
+    def __init__(self, filepath, normalize_columns=False, **read_options):
+        self.filepath = Path(filepath)
+        self.normalize_columns = normalize_columns
+        self._reader = ParquetReaderEngine(self.filepath, normalize_columns=normalize_columns, **read_options)
+
+    def close(self):
+        """Release any resources held by the backing reader engine."""
+        self._reader.close()
+
+    def _write(self, fmt, out_filename, normalize_columns, write_options):
+        """Shared dispatch for all public write_* methods."""
+        default_attr, writer_method = self._SINGLE_TABLE_WRITERS[fmt]
+        default_filename = getattr(ParquetEngineProperties, default_attr)
+        filename = set_parquet_export_filename(default_filename, out_filename)
+        df = self._reader.to_dataframe(normalize_columns)
+        getattr(df, writer_method)(filename, **write_options)
+
+    def write_csv(self, out_filename=None, normalize_columns=None, **write_options):
+        """Export to CSV."""
+        self._write("csv", out_filename, normalize_columns, write_options)
+
+    def write_json(self, out_filename=None, normalize_columns=None, **write_options):
+        """Export to JSON."""
+        self._write("json", out_filename, normalize_columns, write_options)
+
+    def write_json_newline_delimited(self, out_filename=None, normalize_columns=None, **write_options):
+        """Export to newline-delimited JSON."""
+        self._write("jsonl", out_filename, normalize_columns, write_options)
+
+    def write_parquet(self, out_filename=None, normalize_columns=None, **write_options):
+        """Export to Parquet (re-encode; ``compression=`` etc. pass through)."""
+        self._write("parquet", out_filename, normalize_columns, write_options)
+
+    def write_excel(self, out_filename=None, normalize_columns=None, **write_options):
+        """Export to .xlsx."""
+        self._write("excel", out_filename, normalize_columns, write_options)
