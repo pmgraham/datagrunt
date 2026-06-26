@@ -6,6 +6,15 @@ import polars as pl
 import pyarrow as pa
 import pytest
 
+from datagrunt.core import (
+    ParquetEngineFactory,
+)
+from datagrunt.core import (
+    ParquetReaderEngine as CoreReaderEngine,
+)
+from datagrunt.core import (
+    ParquetWriterEngine as CoreWriterEngine,
+)
 from datagrunt.core.parquet_io.engines import (
     ParquetReaderEngine,
     ParquetWriterEngine,
@@ -99,13 +108,6 @@ def test_writer_normalize_columns(messy_parquet, tmp_path):
     out = str(tmp_path / "out.csv")
     ParquetWriterEngine(messy_parquet, normalize_columns=True).write_csv(out)
     assert pl.read_csv(out).columns == ["first_name", "age"]
-
-
-from datagrunt.core import (
-    ParquetEngineFactory,
-    ParquetReaderEngine as CoreReaderEngine,
-    ParquetWriterEngine as CoreWriterEngine,
-)
 
 
 def test_factory_creates_engines(sample_parquet):

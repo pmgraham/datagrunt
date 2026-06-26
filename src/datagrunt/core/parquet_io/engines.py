@@ -115,9 +115,7 @@ class ParquetReaderEngine:
 
     def get_sample(self, normalize_columns=None, **read_options):
         """Return the leading sample rows as a Polars frame."""
-        return self._read_frame(normalize_columns, read_options).head(
-            ParquetEngineProperties.dataframe_sample_rows
-        )
+        return self._read_frame(normalize_columns, read_options).head(ParquetEngineProperties.dataframe_sample_rows)
 
     def to_dataframe(self, normalize_columns=None, **read_options):
         """Return the file as a Polars DataFrame."""
