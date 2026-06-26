@@ -17,10 +17,11 @@ def test_to_dataframe_round_trips(sample_parquet):
     assert df.columns == ["name", "age", "city"]
 
 
-def test_get_sample_caps_rows(sample_parquet):
-    engine = ParquetReaderEngine(sample_parquet)
-    sample = engine.get_sample()
-    assert sample.height <= 20
+def test_get_sample_caps_rows(tmp_path):
+    path = tmp_path / "big.parquet"
+    pl.DataFrame({"n": list(range(50))}).write_parquet(str(path))
+    engine = ParquetReaderEngine(str(path))
+    assert engine.get_sample().height == 20
 
 
 def test_to_arrow_and_dicts(sample_parquet):
