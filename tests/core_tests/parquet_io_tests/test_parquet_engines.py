@@ -99,3 +99,21 @@ def test_writer_normalize_columns(messy_parquet, tmp_path):
     out = str(tmp_path / "out.csv")
     ParquetWriterEngine(messy_parquet, normalize_columns=True).write_csv(out)
     assert pl.read_csv(out).columns == ["first_name", "age"]
+
+
+from datagrunt.core import (
+    ParquetEngineFactory,
+    ParquetReaderEngine as CoreReaderEngine,
+    ParquetWriterEngine as CoreWriterEngine,
+)
+
+
+def test_factory_creates_engines(sample_parquet):
+    factory = ParquetEngineFactory(sample_parquet)
+    assert isinstance(factory.create_reader(), CoreReaderEngine)
+    assert isinstance(factory.create_writer(), CoreWriterEngine)
+
+
+def test_factory_missing_file(nonexistent_parquet):
+    with pytest.raises(FileNotFoundError):
+        ParquetEngineFactory(nonexistent_parquet)
