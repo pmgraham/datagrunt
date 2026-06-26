@@ -1,5 +1,6 @@
 """Tests for Parquet components and helpers."""
 
+import polars as pl
 import pytest
 
 from datagrunt.core.parquet_io.parquetcomponents import (
@@ -27,3 +28,9 @@ def test_components_accepts_parquet(sample_parquet):
 def test_components_rejects_non_parquet(sample_files):
     with pytest.raises(ValueError, match="not a Parquet file"):
         ParquetComponents(sample_files["data.csv"])
+
+
+def test_parquet_table_name_sanitizes_special_chars(tmp_path):
+    path = tmp_path / "my data-file!.parquet"
+    pl.DataFrame({"a": [1]}).write_parquet(str(path))
+    assert parquet_table_name(str(path)) == "tbl_my_data_file_"

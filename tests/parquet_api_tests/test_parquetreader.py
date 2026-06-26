@@ -52,3 +52,8 @@ def test_missing_file(nonexistent_parquet):
 def test_context_manager(sample_parquet):
     with ParquetReader(sample_parquet) as reader:
         reader.query_data(f"SELECT 1 FROM {reader.db_table}")
+
+
+def test_rejects_reserved_source_option(sample_parquet):
+    with pytest.raises(ValueError, match="source"):
+        ParquetReader(sample_parquet, source="bad").to_dataframe()
