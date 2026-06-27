@@ -59,7 +59,7 @@ def _has_midfile_comments(filepath):
     return False
 
 
-def _polars_read_csv(filepath, delimiter, truncate_ragged_lines, n_rows=None):
+def _polars_read_csv(filepath, delimiter, truncate_ragged_lines, n_rows=None, **kwargs):
     """Read a CSV file with Polars using the parity-critical option set.
 
     All three Polars-backed read paths must agree on these parameters.
@@ -74,19 +74,21 @@ def _polars_read_csv(filepath, delimiter, truncate_ragged_lines, n_rows=None):
         truncate_ragged_lines: Whether to silently truncate rows with more
             fields than the header (lenient / ragged mode).
         n_rows: Maximum number of data rows to read, or ``None`` for all.
+        **kwargs: Direct native Polars options overrides.
 
     Returns:
         A Polars DataFrame with all columns kept as their raw string values
         (``infer_schema=False``).
     """
-    return pl.read_csv(
-        filepath,
-        separator=delimiter,
-        truncate_ragged_lines=truncate_ragged_lines,
-        infer_schema=False,
-        n_rows=n_rows,
-        skip_rows=_count_leading_comments(filepath),
-    )
+    options = {
+        "separator": delimiter,
+        "truncate_ragged_lines": truncate_ragged_lines,
+        "infer_schema": False,
+        "n_rows": n_rows,
+        "skip_rows": _count_leading_comments(filepath),
+    }
+    options.update(kwargs)
+    return pl.read_csv(filepath, **options)
 
 
 def _polars_read_to_string_arrow(filepath, delimiter, truncate_ragged_lines, n_rows=None):
@@ -320,13 +322,14 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
             normalize_columns,
         )
 
-    def to_dataframe(self, normalize_columns=None):
+    def to_dataframe(self, normalize_columns=None, **kwargs):
         """
         Converts CSV to a Polars dataframe.
 
         Args:
             normalize_columns (bool or None): Whether to normalize column
             names. ``None`` (default) inherits the instance-level setting.
+            **kwargs: Ignored keyword arguments (for consistent interface).
 
         Returns:
             A Polars dataframe.
@@ -441,12 +444,13 @@ class CSVReaderPolarsEngine(DataFrameDerivedReaderMixin, CSVBaseReaderEngine):
     Class to read CSV files and convert CSV files powered by Polars.
     """
 
-    def _create_dataframe(self, normalize_columns=False, sample=False):
+    def _create_dataframe(self, normalize_columns=False, sample=False, **kwargs):
         """Read the CSV into a Polars dataframe.
 
         Args:
             normalize_columns (bool): Whether to normalize column names.
             sample (bool): When True, read only the leading sample rows.
+            **kwargs: Overrides/options for Polars read_csv.
 
         Returns:
             A Polars dataframe.
@@ -458,11 +462,17 @@ class CSVReaderPolarsEngine(DataFrameDerivedReaderMixin, CSVBaseReaderEngine):
             )
         if self.lenient:
             _check_csv_ragged_and_warn(self.filepath, self.delimiter)
+
+        n_rows = kwargs.pop("n_rows", None)
+        if sample:
+            n_rows = CSVEngineProperties.dataframe_sample_rows
+
         df = _polars_read_csv(
             self.filepath,
             self.delimiter,
             self.lenient,
-            n_rows=CSVEngineProperties.dataframe_sample_rows if sample else None,
+            n_rows=n_rows,
+            **kwargs,
         )
         if normalize_columns:
             df = df.rename(CSVColumnNameNormalizer(self.filepath, columns=df.columns).columns_to_normalized_mapping)
@@ -482,18 +492,19 @@ class CSVReaderPolarsEngine(DataFrameDerivedReaderMixin, CSVBaseReaderEngine):
         resolved = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         return self._create_dataframe(resolved, sample=True)
 
-    def to_dataframe(self, normalize_columns=None):
+    def to_dataframe(self, normalize_columns=None, **kwargs):
         """
         Converts CSV to a Polars dataframe.
 
         Args:
             normalize_columns (bool or None): Whether to normalize column
             names. ``None`` (default) inherits the instance-level setting.
+            **kwargs: Keyword arguments passed to the Polars read_csv.
 
         Returns:
             A Polars dataframe.
         """
-        return self._create_dataframe(_resolve_normalize_columns(self.normalize_columns, normalize_columns))
+        return self._create_dataframe(_resolve_normalize_columns(self.normalize_columns, normalize_columns), **kwargs)
 
     def query_data(self, sql_query, normalize_columns=None):
         """
@@ -839,13 +850,14 @@ class CSVReaderPyArrowEngine(_PyArrowEngineMixin, CSVBaseReaderEngine):
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         return _arrow_to_polars(self._create_table(normalize_columns, sample=True))
 
-    def to_dataframe(self, normalize_columns=None) -> pl.DataFrame:
+    def to_dataframe(self, normalize_columns=None, **kwargs) -> pl.DataFrame:
         """
         Converts CSV to a Polars dataframe.
 
         Args:
             normalize_columns (bool or None): Whether to normalize column
             names. ``None`` (default) inherits the instance-level setting.
+            **kwargs: Ignored keyword arguments (for consistent interface).
 
         Returns:
             A Polars dataframe.

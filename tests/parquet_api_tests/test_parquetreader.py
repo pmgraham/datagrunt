@@ -57,3 +57,11 @@ def test_context_manager(sample_parquet):
 def test_rejects_reserved_source_option(sample_parquet):
     with pytest.raises(ValueError, match="source"):
         ParquetReader(sample_parquet, source="bad").to_dataframe()
+
+
+def test_parquetreader_to_dataframe_kwargs(sample_parquet):
+    """Verify that flat kwargs are forwarded to pl.read_parquet."""
+    reader = ParquetReader(sample_parquet)
+    df = reader.to_dataframe(n_rows=2)
+    assert df.height == 2
+    assert list(df.columns) == ["name", "age", "city"]

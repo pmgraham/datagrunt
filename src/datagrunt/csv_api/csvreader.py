@@ -62,12 +62,13 @@ class CSVReader(_CSVEngineBacked):
             return self._return_empty_file_object(pl.DataFrame())
         return self._engine.get_sample(warn_per_call_normalize(normalize_columns))
 
-    def to_dataframe(self, normalize_columns: bool | None = None):
+    def to_dataframe(self, normalize_columns: bool | None = None, **kwargs):
         """Converts CSV to a dataframe.
 
         Args:
             normalize_columns (bool or None): Deprecated per-call override.
             ``None`` (default) inherits the constructor-level setting.
+            **kwargs: Keyword arguments passed to the Polars read_csv.
 
         Returns:
             A Polars DataFrame, or an empty ``pl.DataFrame()`` for empty/blank
@@ -75,7 +76,7 @@ class CSVReader(_CSVEngineBacked):
         """
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(pl.DataFrame())
-        return self._engine.to_dataframe(warn_per_call_normalize(normalize_columns))
+        return self._engine.to_dataframe(warn_per_call_normalize(normalize_columns), **kwargs)
 
     def to_arrow_table(self, normalize_columns: bool | None = None) -> pa.Table:
         """Converts CSV to a PyArrow table.
