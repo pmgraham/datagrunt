@@ -65,13 +65,13 @@ async def run_agent(version, commit_log, file_stat, git_diff, repo_dir):
         "4. Write a release blog post under `/Users/pmgraham/projects/datagrunt-site/content/blog/2026/june/` (or current year/month folder as appropriate). Use the format `datagrunt-<version>-<short-description>.md`.\n"
         "   - The blog post must have front matter at the top: \n"
         "     ---\n"
-        "     title: \"Datagrunt <version>: <engaging headline>\"\n"
+        '     title: "Datagrunt <version>: <engaging headline>"\n'
         "     date: <YYYY-MM-DD>\n"
         "     draft: true\n"
-        "     author: \"Martin Graham\"\n"
-        "     author_email: \"datagrunt@datagrunt.io\"\n"
-        "     description: \"<engaging description of release highlights>\"\n"
-        "     tags: [\"python\", \"csv\", \"data-engineering\", \"release-notes\"]\n"
+        '     author: "Martin Graham"\n'
+        '     author_email: "datagrunt@datagrunt.io"\n'
+        '     description: "<engaging description of release highlights>"\n'
+        '     tags: ["python", "csv", "data-engineering", "release-notes"]\n'
         "     ---\n"
         "   - The post should have a structured, premium technical style with code snippets explaining how to use new features.\n"
         "5. Output a summary of the files updated and created (including their absolute paths) and a brief overview of the content generated.\n"
@@ -158,9 +158,7 @@ def main():
 
     # Gather git log, stats, and diff
     print(f"[*] Gathering git changes between {args.pre_merge_commit} and HEAD...")
-    code_log, commit_log, _ = run_command(
-        f"git log {args.pre_merge_commit}..HEAD --oneline --no-merges", cwd=repo_dir
-    )
+    code_log, commit_log, _ = run_command(f"git log {args.pre_merge_commit}..HEAD --oneline --no-merges", cwd=repo_dir)
     code_stat, file_stat, _ = run_command(f"git diff --stat {args.pre_merge_commit} HEAD", cwd=repo_dir)
     code_diff, git_diff, _ = run_command(f"git diff {args.pre_merge_commit} HEAD", cwd=repo_dir)
 
