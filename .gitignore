@@ -165,8 +165,9 @@ docs/superpowers/
 outputs/
 
 # Local/custom scripts stay local — except the CI wheel smoke test, which CI runs.
-scripts/
+scripts/*
 !scripts/smoke_wheel.py
+!scripts/antigravity_workflow.py
 
 # Antigravity session & brain directories
 .antigravity_sessions/

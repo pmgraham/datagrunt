@@ -1,0 +1,50 @@
+name: Auto Update Docs & Blog
+
+on:
+  push:
+    tags:
+      - 'v*'  # Triggers whenever a version release tag (e.g., v4.4.1) is pushed
+
+permissions:
+  contents: write
+
+jobs:
+  update-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout datagrunt
+        uses: actions/checkout@v4
+        with:
+          path: datagrunt
+          fetch-depth: 0
+
+      - name: Checkout datagrunt-site
+        uses: actions/checkout@v4
+        with:
+          repository: pmgraham/datagrunt-site
+          token: ${{ secrets.SITE_DEPLOY_TOKEN }}
+          path: datagrunt-site
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          uv pip install --system google-antigravity python-dotenv
+
+      - name: Run Antigravity Workflow
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python datagrunt/scripts/antigravity_workflow.py --pre-merge-commit HEAD~1
+
+      - name: Commit and Push Docs Update
+        working-directory: datagrunt-site
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add content/
+          git diff-index --quiet HEAD || git commit -m "docs: draft release blog post for version $(git log -n 1 --format=%s)"
+          git push origin main
