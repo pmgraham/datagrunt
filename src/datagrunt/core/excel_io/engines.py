@@ -73,6 +73,15 @@ class ExcelReaderEngine:
     def __init__(self, filepath, normalize_columns=False, **read_options):
         self.filepath = Path(filepath)
         self.normalize_columns = normalize_columns
+        if "read_options" in read_options:
+            import warnings
+
+            warnings.warn(
+                "Passing 'read_options' as a dictionary is deprecated and will be removed in a future release. "
+                "Pass the options as keyword arguments directly instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self._read_options = read_options
         self._components = ExcelComponents(self.filepath)
         self._frame_cache = {}
@@ -120,6 +129,15 @@ class ExcelReaderEngine:
 
     def to_dataframe(self, sheet=None, normalize_columns=None, **read_options):
         """Return a sheet as a Polars DataFrame."""
+        if "read_options" in read_options:
+            import warnings
+
+            warnings.warn(
+                "Passing 'read_options' as a dictionary is deprecated and will be removed in a future release. "
+                "Pass the options as keyword arguments directly instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         return self._read_sheet(sheet, normalize_columns, read_options)
 
     def to_arrow_table(self, sheet=None, normalize_columns=None, **read_options):

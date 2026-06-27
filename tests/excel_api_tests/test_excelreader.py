@@ -92,3 +92,19 @@ def test_get_sample_empty_workbook_returns_empty_dataframe(empty_xlsx):
     sample = ExcelReader(empty_xlsx).get_sample()
     assert isinstance(sample, pl.DataFrame)
     assert sample.is_empty()
+
+
+def test_excelreader_to_dataframe_flat_kwargs(sample_xlsx):
+    """Verify that flat kwargs are passed to pl.read_excel."""
+    df = ExcelReader(sample_xlsx).to_dataframe(has_header=False)
+    assert df.height == 3  # Header is treated as data row
+    assert df.row(0) == ("name", "age", "city")
+
+
+def test_excelreader_to_dataframe_read_options_deprecation(sample_xlsx):
+    """Verify that passing read_options as a dict raises a DeprecationWarning."""
+    reader = ExcelReader(sample_xlsx)
+    with pytest.warns(DeprecationWarning, match="Passing 'read_options' as a dictionary is deprecated"):
+        df = reader.to_dataframe(read_options={"n_rows": 1})
+
+    assert df.height == 1

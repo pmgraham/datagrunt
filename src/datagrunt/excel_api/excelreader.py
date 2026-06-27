@@ -29,6 +29,15 @@ class ExcelReader(_ExcelEngineBacked):
                 "n_rows": 100}``). Per-call options override these. The reserved
                 keys ``source``, ``sheet_id``, ``sheet_name`` are not allowed.
         """
+        if "read_options" in read_options:
+            import warnings
+
+            warnings.warn(
+                "Passing 'read_options' as a dictionary is deprecated and will be removed in a future release. "
+                "Pass the options as keyword arguments directly instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         super().__init__(filepath, normalize_columns=normalize_columns, **read_options)
 
     @property
@@ -46,6 +55,15 @@ class ExcelReader(_ExcelEngineBacked):
         """Convert a sheet to a Polars DataFrame (empty frame if empty/blank)."""
         if self.is_empty or self.is_blank:
             return pl.DataFrame()
+        if "read_options" in read_options:
+            import warnings
+
+            warnings.warn(
+                "Passing 'read_options' as a dictionary is deprecated and will be removed in a future release. "
+                "Pass the options as keyword arguments directly instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         return self._engine.to_dataframe(sheet, normalize_columns, **read_options)
 
     def to_arrow_table(self, sheet=None, normalize_columns: bool | None = None, **read_options) -> pa.Table:

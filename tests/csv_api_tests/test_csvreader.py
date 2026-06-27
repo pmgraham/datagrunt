@@ -491,3 +491,19 @@ class TestCSVReaderContextManager:
         reader.query_data(f"SELECT * FROM {reader.db_table} LIMIT 1")
 
         assert calls["n"] == 1
+
+
+class TestCSVReaderToDataframeKwargs:
+    """Test that CSVReader.to_dataframe() supports flat kwargs passed to Polars."""
+
+    def test_to_dataframe_kwargs_forwarding(self, sample_csv):
+        reader = CSVReader(sample_csv, engine="polars")
+        df = reader.to_dataframe(n_rows=1)
+        assert df.height == 1
+        assert list(df.columns) == ["name", "age", "city"]
+
+        # Test another Polars parameter: has_header=False
+        df_no_header = reader.to_dataframe(has_header=False)
+        # When has_header=False, the first row (the header names) becomes a data row.
+        assert df_no_header.height == 3
+        assert df_no_header.row(0) == ("name", "age", "city")
