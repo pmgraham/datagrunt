@@ -181,7 +181,8 @@ xl.to_dicts(sheet=1)           # by position
 xl.to_arrow_table()            # also: get_sample(), all accept sheet=
 xl.query_data(f"SELECT * FROM {xl.db_table}", sheet="Sheet2")
 
-# Full Polars read_excel passthrough (constructor default or per call):
+# Read options are keyword arguments forwarded verbatim to pl.read_excel
+# (constructor default or per call). Pass any pl.read_excel parameter:
 xl.to_dataframe(has_header=False)
 xl.to_dataframe(read_options={"skip_rows": 2, "n_rows": 100})
 
@@ -203,6 +204,19 @@ exactly as the CSV API does. Values beginning with `=`, `+`, `-`, `@` are
 written verbatim — sanitize at the application layer if your source is
 untrusted and the output may be opened in a spreadsheet (CWE-1236).
 
+> **How read options work (same for Excel and Parquet).** In both subsystems
+> you pass read options as **keyword arguments**, and Datagrunt forwards them
+> **verbatim** to the underlying Polars function — `pl.read_excel` for Excel,
+> `pl.read_parquet` for Parquet. The *mechanism is identical*; only the
+> available option names differ, because the two Polars functions differ.
+> `pl.read_excel` happens to expose a parameter that is itself a dict named
+> `read_options` (the calamine engine's option bag, where `skip_rows`/`n_rows`
+> live), which is why you see `read_options={...}` above. `pl.read_parquet` has
+> no such dict — its options (`columns`, `n_rows`, …) are plain top-level
+> parameters. So `xl.to_dataframe(read_options={"skip_rows": 2})` and
+> `pq.to_dataframe(columns=["id"], n_rows=100)` use the **same** Datagrunt
+> keyword-passthrough; the shape of the arguments comes straight from Polars.
+
 ## Reading and writing Parquet
 
 `ParquetReader` and `ParquetWriter` work with `.parquet` files as a
@@ -220,7 +234,9 @@ reader.to_arrow_table()                      # Apache Arrow Table
 reader.to_dicts()                            # list of row dicts
 reader.query_data(f"SELECT * FROM {reader.db_table} LIMIT 5")
 
-# Pass read_options straight through to pl.read_parquet (only "source" is reserved):
+# Read options are keyword arguments forwarded verbatim to pl.read_parquet
+# (the same passthrough as Excel; only "source" is reserved). Pass any
+# pl.read_parquet parameter — they are plain top-level kwargs, not a dict:
 reader_subset = ParquetReader("data.parquet", columns=["id", "name"], n_rows=1000)
 ```
 
@@ -241,6 +257,13 @@ APIs do. Empty or blank source files return empty results from reader methods
 and produce 0-byte output files from writer methods. Values beginning with `=`,
 `+`, `-`, `@` are written verbatim — sanitize at the application layer if your
 source is untrusted and the output may be opened in a spreadsheet (CWE-1236).
+
+> **Read options work exactly as they do for Excel** — keyword arguments
+> forwarded verbatim to Polars (here `pl.read_parquet`). There is no
+> Datagrunt-specific convention and no dict to wrap them in: `pl.read_parquet`
+> simply exposes its options as top-level parameters (`columns`, `n_rows`, …),
+> whereas `pl.read_excel` groups some of its calamine options inside a dict
+> named `read_options`. Same Datagrunt passthrough, different Polars signatures.
 
 ## PDF parsing
 
