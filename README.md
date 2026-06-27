@@ -366,7 +366,7 @@ thread-safe — passing `workers > 1` with `engine="pymupdf"` logs a warning and
 is ignored. Use the default PDFium engine when you need parallel
 (process-based) parsing.
 
-#### Why `if __name__ == '__main__':` is required
+#### Multiprocessing Guard Requirement
 Because PDFium is not thread-safe within a single process, `datagrunt` uses a process pool (`ProcessPoolExecutor` with the `spawn` start context on macOS and Windows) to parse pages concurrently.
 
 Under Python's `spawn` start context, child processes import the main module to initialize. If you call `PDFReader` or `PDFWriter` with `workers > 1` outside of a `if __name__ == '__main__':` block, the child processes will recursively spawn their own process pools, leading to a crash or infinite recursion loop.
@@ -399,11 +399,16 @@ _The engines above apply to CSV processing. Whichever you pick, results are cons
 
 ## Primary Classes
 
+### Readers
 - **`CSVReader`**: Read and process CSV files with intelligent delimiter detection
-- **`CSVWriter`**: Export CSV data to multiple formats (CSV, Excel, JSON, Parquet)
 - **`ExcelReader`**: Read Excel workbooks sheet by sheet into Polars DataFrames, dicts, PyArrow tables, or SQL query results
-- **`ExcelWriter`**: Export a sheet (or all sheets) of an Excel workbook to CSV, Excel, JSON, JSONL, or Parquet
+- **`ParquetReader`**: Read Parquet files into Polars DataFrames, dicts, PyArrow tables, or SQL query results
 - **`PDFReader`**: Parse PDF files into text, tables, and images as dicts, Polars DataFrames, or PyArrow tables
+
+### Writers
+- **`CSVWriter`**: Export CSV data to multiple formats (CSV, Excel, JSON, Parquet)
+- **`ExcelWriter`**: Export a sheet (or all sheets) of an Excel workbook to CSV, Excel, JSON, JSONL, or Parquet
+- **`ParquetWriter`**: Export Parquet files to multiple formats (CSV, Excel, JSON, JSONL, Parquet)
 - **`PDFWriter`**: Write parsed PDF output to JSON or JSONL and extract embedded images to disk
 
 ## Full Documentation
