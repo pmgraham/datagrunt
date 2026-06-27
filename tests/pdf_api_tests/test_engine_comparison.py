@@ -95,9 +95,16 @@ def _elements_by_type(doc: dict) -> dict:
 def _table_cells(doc: dict) -> list:
     cells = []
     for pg in doc.get("document", {}).get("pages", []):
+        page_tables = []
         for el in pg.get("elements", []):
             if el.get("type") == "table":
-                cells.append(el.get("content"))
+                pos = el.get("position", {})
+                x = pos.get("x", 0.0)
+                y = pos.get("y", 0.0)
+                page_tables.append((y, x, el.get("content")))
+        page_tables.sort(key=lambda t: (t[0], t[1]))
+        for _, _, content in page_tables:
+            cells.append(content)
     return cells
 
 
