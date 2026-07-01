@@ -13,20 +13,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout datagrunt
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           path: datagrunt
           fetch-depth: 0
 
+      # Mint a short-lived token for the sister datagrunt-site repo from a
+      # dedicated GitHub App (contents:write on datagrunt-site) instead of a
+      # long-lived PAT (#271). The default GITHUB_TOKEN cannot write another repo.
+      - name: Mint a GitHub App token for datagrunt-site
+        id: site-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.SITE_APP_ID }}
+          private-key: ${{ secrets.SITE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: datagrunt-site
+
       - name: Checkout datagrunt-site
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: pmgraham/datagrunt-site
-          token: ${{ secrets.SITE_DEPLOY_TOKEN }}
+          token: ${{ steps.site-token.outputs.token }}
           path: datagrunt-site
 
       - name: Setup uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
         with:
           python-version: "3.12"
 
