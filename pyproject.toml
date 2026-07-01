@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "datagrunt"
-version = "4.4.1"
+version = "4.5.0"
 description = "Read CSV files and convert to other file formats easily"
 readme = "README.md"
 authors = [{ name = "Martin Graham", email = "datagrunt@datagrunt.io" }]
@@ -60,7 +60,7 @@ module-name = "datagrunt._native"
 manifest-path = "rust/datagrunt-python/Cargo.toml"
 
 [tool.bumpver]
-current_version = "4.4.1"
+current_version = "4.5.0"
 version_pattern = "MAJOR.MINOR.PATCH"
 commit_message = "build: bump version {old_version} -> {new_version} [skip ci]"
 commit = true
