@@ -66,6 +66,60 @@ def _parse_page_native_worker(
         return reader.parse_page(page_index, image_output_dir)
 
 
+# Image formats both writer engines (pdfium via PIL, pymupdf via Pixmap) can
+# emit. Restricting to this shared set keeps the two engines byte-compatible in
+# behavior and lets an unsupported request fail fast (see _normalize_image_format).
+_SUPPORTED_IMAGE_FORMATS = ("png", "jpg", "jpeg")
+_PIL_FORMAT_BY_EXT = {"png": "PNG", "jpg": "JPEG", "jpeg": "JPEG"}
+
+
+def _normalize_image_format(image_format: str) -> tuple:
+    """Return ``(file_extension, pil_format)`` for a requested image format.
+
+    PIL registers JPEG under ``"JPEG"`` (not ``"JPG"``), so ``"jpg"`` maps to the
+    ``"JPEG"`` save handler while keeping the caller's ``.jpg`` file extension on
+    disk. Only formats both engines can write are accepted; an unsupported
+    format is a caller bug and raises ``ValueError`` up front rather than
+    silently yielding an empty result (mirrors ``set_export_filename``).
+    """
+    ext = image_format.lower().lstrip(".")
+    if ext not in _SUPPORTED_IMAGE_FORMATS:
+        raise ValueError(
+            f"Unsupported image_format {image_format!r}. Supported formats: {', '.join(_SUPPORTED_IMAGE_FORMATS)}."
+        )
+    return ext, _PIL_FORMAT_BY_EXT[ext]
+
+
+def _render_pdfium_page_to_file(
+    page, directory: Path, pdf_name: str, page_index: int, dpi: int, ext: str, pil_format: str
+) -> str:
+    """Render one already-opened PDFium page to ``directory``; return its path.
+
+    Shared by the in-process sequential loop and the process-pool worker so the
+    render-and-save step lives in exactly one place (DRY within the PDF domain).
+    """
+    img = page.render_pil(dpi=dpi)
+    out_path = directory / f"{pdf_name}_page_{page_index + 1}.{ext}"
+    img.save(out_path, format=pil_format)
+    return str(out_path)
+
+
+def _render_page_worker(filepath_str: str, page_index: int, output_dir_str: str, dpi: int, image_format: str) -> str:
+    """Process worker function to render a single page to an image using PDFium."""
+    from pathlib import Path
+
+    from datagrunt.core.pdf_io.engines import _normalize_image_format, _render_pdfium_page_to_file
+    from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
+
+    filepath = Path(filepath_str)
+    directory = Path(output_dir_str)
+    pdf_name = filepath.stem
+    ext, pil_format = _normalize_image_format(image_format)
+    with PdfiumDocument(filepath) as doc:
+        with doc.page(page_index) as page:
+            return _render_pdfium_page_to_file(page, directory, pdf_name, page_index, dpi, ext, pil_format)
+
+
 def set_export_filename(default_filename, export_filename=None):
     """Return the export filename if explicitly provided, otherwise the default.
 
@@ -434,6 +488,11 @@ class PDFBaseWriterEngine(ABC):
             pdfcomponents.dedupe_document_images(document, directory)
         return pdfcomponents.collect_image_paths(document)
 
+    @abstractmethod
+    def render_pages_as_images(self, output_dir=None, dpi=300, image_format="png") -> list:
+        """Render each page of the PDF as an image and save to disk."""
+        pass
+
 
 class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
     """Write parsed PDF output (JSON + image files) using PyMuPDF."""
@@ -444,6 +503,45 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
                 self.filepath, workers=self.workers, extraction_config=self.extraction_config
             )
         return self._reader_engine
+
+    def render_pages_as_images(self, output_dir=None, dpi=300, image_format="png") -> list:
+        from datagrunt.core.pdf_io.extraction.pymupdf_backend import _import_pymupdf
+
+        if self.workers > 1:
+            logger.warning(
+                "PyMuPDF renders pages sequentially; the 'workers=%d' setting is ignored. "
+                "Use the pdfium engine for parallel rendering.",
+                self.workers,
+            )
+
+        # Validate the format before any filesystem side effects (fail fast).
+        ext, _ = _normalize_image_format(image_format)
+        pymupdf = _import_pymupdf()
+        directory = Path(output_dir if output_dir else "page_images")
+        directory.mkdir(parents=True, exist_ok=True)
+
+        written_paths = []
+        doc = pymupdf.open(self.filepath)
+        pdf_name = self.filepath.stem
+        try:
+            for idx in range(doc.page_count):
+                # Per-page error isolation: a page that fails to render is logged
+                # and skipped, never aborting the whole batch (project invariant).
+                try:
+                    page = doc[idx]
+                    zoom = dpi / 72.0
+                    mat = pymupdf.Matrix(zoom, zoom)
+                    pix = page.get_pixmap(matrix=mat)
+                    img_data = pix.tobytes(ext)
+                    out_path = directory / f"{pdf_name}_page_{idx + 1}.{ext}"
+                    with open(out_path, "wb") as f:
+                        f.write(img_data)
+                    written_paths.append(str(out_path))
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Page %d could not be rendered and was skipped: %s", idx + 1, e)
+        finally:
+            doc.close()
+        return written_paths
 
 
 class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
@@ -462,3 +560,60 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
                 extraction_config=self.extraction_config,
             )
         return self._reader_engine
+
+    def render_pages_as_images(self, output_dir=None, dpi=300, image_format="png") -> list:
+        # Validate the format before any filesystem side effects (fail fast).
+        ext, pil_format = _normalize_image_format(image_format)
+        directory = Path(output_dir if output_dir else "page_images")
+        directory.mkdir(parents=True, exist_ok=True)
+
+        with PdfiumDocument(self.filepath) as doc:
+            total_pages = len(doc)
+
+        if self.workers <= 1 or total_pages <= 1 or _is_distributed_env():
+            if self.workers > 1 and _is_distributed_env():
+                logger.warning(
+                    "Distributed environment detected. Defaulting to sequential "
+                    "PDFium execution to prevent multiprocessing overhead."
+                )
+            written_paths = []
+            pdf_name = self.filepath.stem
+            with PdfiumDocument(self.filepath) as doc:
+                for idx in range(total_pages):
+                    # Per-page error isolation: a page that fails to render is
+                    # logged and skipped, never aborting the whole batch.
+                    try:
+                        with doc.page(idx) as page:
+                            written_paths.append(
+                                _render_pdfium_page_to_file(page, directory, pdf_name, idx, dpi, ext, pil_format)
+                            )
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("Page %d could not be rendered and was skipped: %s", idx + 1, e)
+            return written_paths
+        else:
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+
+            paths_map = {}
+            with ProcessPoolExecutor(max_workers=self.workers) as executor:
+                futures = {
+                    executor.submit(
+                        _render_page_worker,
+                        str(self.filepath),
+                        idx,
+                        str(directory),
+                        dpi,
+                        image_format,
+                    ): idx
+                    for idx in range(total_pages)
+                }
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    # Per-page error isolation applies to the parallel path too:
+                    # a worker that raises is logged and its page skipped, while
+                    # the successfully rendered pages are still returned in order.
+                    try:
+                        paths_map[idx] = future.result()
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("Page %d could not be rendered and was skipped: %s", idx + 1, e)
+
+            return [paths_map[idx] for idx in sorted(paths_map.keys())]
