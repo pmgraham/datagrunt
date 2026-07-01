@@ -295,6 +295,10 @@ df = reader.to_dataframe()             # one row per extracted element
 writer = PDFWriter("report.pdf")
 writer.write_json("report.json", image_output_dir="report_images")
 writer.extract_images(output_dir="report_images")
+
+# Render each whole page to an image file (rasterization, not embedded-image
+# extraction). Returns the written paths, in page order.
+writer.render_pages_as_images(output_dir="report_pages", dpi=300, image_format="png")
 ```
 
 ### Choosing a PDF engine
@@ -350,6 +354,29 @@ reader = PDFReader("report.pdf", min_image_dimension=0)
 The threshold applies to **both PDF engines** and every conversion/output method,
 and defaults to `40` (the long-standing behavior). It must be a non-negative
 integer; invalid values raise immediately when the reader/writer is constructed.
+
+### Rendering pages as images
+
+`extract_images` pulls the images **embedded** in a PDF. To rasterize **whole
+pages** instead — one image file per page — use `render_pages_as_images`:
+
+```python
+writer = PDFWriter("report.pdf")
+
+# One PNG per page at 300 DPI, written to ./report_pages/, returned in page order.
+paths = writer.render_pages_as_images(output_dir="report_pages", dpi=300, image_format="png")
+
+# JPEG at a lower resolution.
+writer.render_pages_as_images(output_dir="report_pages", dpi=150, image_format="jpg")
+```
+
+- `image_format` is one of `png`, `jpg`, or `jpeg` (case-insensitive); any other
+  value raises `ValueError`. Both engines produce identical output.
+- Works on **both engines**; on **PDFium** it honors the `workers` count for
+  parallel rendering (PyMuPDF renders sequentially).
+- Extraction stays **complete**: a page that fails to render is logged and
+  skipped, never aborting the batch — the returned list contains every page that
+  rendered successfully, in page order.
 
 ### Parallel Processing & Concurrency
 By default, `PDFReader` and `PDFWriter` run sequentially (`workers=1`). On the default **PDFium engine**, you can enable parallel processing on multi-core systems by passing a `workers` count greater than `1`:
@@ -409,7 +436,7 @@ _The engines above apply to CSV processing. Whichever you pick, results are cons
 - **`CSVWriter`**: Export CSV data to multiple formats (CSV, Excel, JSON, Parquet)
 - **`ExcelWriter`**: Export a sheet (or all sheets) of an Excel workbook to CSV, Excel, JSON, JSONL, or Parquet
 - **`ParquetWriter`**: Export Parquet files to multiple formats (CSV, Excel, JSON, JSONL, Parquet)
-- **`PDFWriter`**: Write parsed PDF output to JSON or JSONL and extract embedded images to disk
+- **`PDFWriter`**: Write parsed PDF output to JSON or JSONL, extract embedded images, and render whole pages to image files
 
 ## Full Documentation
 
