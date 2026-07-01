@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -481,3 +482,173 @@ class TestPDFWriterMinImageDimension:
         # the 20px image is written because the threshold was lowered
         assert images_dir.exists(), "image_output_dir was not created"
         assert any(images_dir.glob("*")), "no image files written to image_output_dir"
+
+
+class TestPDFWriterRenderPagesAsImages:
+    """Tests for rendering PDF pages as images."""
+
+    def test_render_pages_as_images(self, sample_pdf, tmp_path):
+        out = tmp_path / "page_imgs"
+        writer = PDFWriter(sample_pdf, engine="pdfium")
+        paths = writer.render_pages_as_images(output_dir=str(out), dpi=150, image_format="png")
+        assert paths
+        assert len(paths) >= 1
+        stem = Path(sample_pdf).stem
+        for idx, p in enumerate(paths):
+            assert os.path.exists(p)
+            assert os.path.basename(p) == f"{stem}_page_{idx + 1}.png"
+
+    def test_render_pages_as_images_pymupdf(self, sample_pdf, tmp_path):
+        out = tmp_path / "page_imgs_pymupdf"
+        writer = PDFWriter(sample_pdf, engine="pymupdf")
+        paths = writer.render_pages_as_images(output_dir=str(out), dpi=150, image_format="png")
+        assert paths
+        assert len(paths) >= 1
+        stem = Path(sample_pdf).stem
+        for idx, p in enumerate(paths):
+            assert os.path.exists(p)
+            assert os.path.basename(p) == f"{stem}_page_{idx + 1}.png"
+
+    def test_render_pages_as_images_parallel(self, sample_pdf, tmp_path):
+        out = tmp_path / "page_imgs_parallel"
+        writer = PDFWriter(sample_pdf, engine="pdfium", workers=2)
+        paths = writer.render_pages_as_images(output_dir=str(out), dpi=150, image_format="png")
+        assert paths
+        assert len(paths) >= 1
+        stem = Path(sample_pdf).stem
+        for idx, p in enumerate(paths):
+            assert os.path.exists(p)
+            assert os.path.basename(p) == f"{stem}_page_{idx + 1}.png"
+
+    def test_render_pages_as_images_empty_pdf(self, empty_pdf, tmp_path):
+        out = tmp_path / "page_imgs_empty"
+        writer = PDFWriter(empty_pdf)
+        paths = writer.render_pages_as_images(output_dir=str(out))
+        assert paths == []
+
+    @pytest.mark.parametrize("engine", ["pdfium", "pymupdf"])
+    def test_render_pages_as_images_jpg(self, multipage_pdf, tmp_path, engine):
+        """format='jpg' must map to PIL's 'JPEG' handler yet keep the .jpg suffix.
+
+        Regression: the pdfium path called img.save(format='JPG'), which PIL does
+        not register (it registers JPEG), raising KeyError('JPG').
+        """
+        from PIL import Image
+
+        out = tmp_path / f"jpg_imgs_{engine}"
+        writer = PDFWriter(multipage_pdf, engine=engine)
+        paths = writer.render_pages_as_images(output_dir=str(out), dpi=100, image_format="jpg")
+        assert len(paths) == 3
+        for p in paths:
+            assert p.endswith(".jpg")
+            assert os.path.exists(p)
+            with Image.open(p) as img:
+                assert img.format == "JPEG"
+
+    def test_render_pages_error_isolation_sequential_pdfium(self, multipage_pdf, tmp_path, monkeypatch):
+        """A single bad page is skipped (logged), never dropping the whole batch."""
+        from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumPage
+
+        original = PdfiumPage.render_pil
+        calls = {"n": 0}
+
+        def flaky_render(self, dpi=300):
+            calls["n"] += 1
+            if calls["n"] == 2:  # second page rendered
+                raise RuntimeError("boom on page 2")
+            return original(self, dpi=dpi)
+
+        monkeypatch.setattr(PdfiumPage, "render_pil", flaky_render)
+
+        out = tmp_path / "iso_pdfium"
+        writer = PDFWriter(multipage_pdf, engine="pdfium")  # workers=1 -> sequential
+        paths = writer.render_pages_as_images(output_dir=str(out), dpi=72)
+
+        stem = Path(multipage_pdf).stem
+        assert len(paths) == 2
+        assert not any(os.path.basename(p) == f"{stem}_page_2.png" for p in paths)
+        assert all(os.path.exists(p) for p in paths)
+
+    def test_render_pages_error_isolation_sequential_pymupdf(self, multipage_pdf, tmp_path, monkeypatch):
+        """PyMuPDF path: a single failing page is skipped, the rest are written.
+
+        Patching ``pymupdf.Matrix``/``get_pixmap`` is unsafe (pymupdf runs
+        internal ``isinstance`` checks against those types), so the failure is
+        injected at the per-page file write instead — still inside the
+        engine's per-page try/except.
+        """
+        import builtins
+
+        real_open = builtins.open
+
+        def flaky_open(file, mode="r", *args, **kwargs):
+            if "w" in str(mode) and "_page_2." in str(file):
+                raise RuntimeError("boom writing page 2")
+            return real_open(file, mode, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", flaky_open)
+
+        out = tmp_path / "iso_pymupdf"
+        writer = PDFWriter(multipage_pdf, engine="pymupdf")
+        paths = writer.render_pages_as_images(output_dir=str(out), dpi=72)
+
+        stem = Path(multipage_pdf).stem
+        assert len(paths) == 2
+        assert not any(os.path.basename(p) == f"{stem}_page_2.png" for p in paths)
+        assert all(os.path.exists(p) for p in paths)
+
+    def test_render_pages_parallel_ordering(self, multipage_pdf, tmp_path):
+        """Parallel (pdfium process pool) returns all pages in page order."""
+        out = tmp_path / "parallel_order"
+        writer = PDFWriter(multipage_pdf, engine="pdfium", workers=2)
+        paths = writer.render_pages_as_images(output_dir=str(out), dpi=72)
+
+        stem = Path(multipage_pdf).stem
+        assert len(paths) == 3
+        for idx, p in enumerate(paths):
+            assert os.path.exists(p)
+            assert os.path.basename(p) == f"{stem}_page_{idx + 1}.png"
+
+    def test_render_pages_error_isolation_parallel_pdfium(self, multipage_pdf, tmp_path):
+        """Parallel path: a worker whose page fails is skipped, others survive.
+
+        The worker runs in a subprocess (monkeypatch can't reach it), so the
+        fault is injected deterministically at the filesystem: a *directory* is
+        pre-created at page 2's output path, so only that worker's ``img.save``
+        raises. The parallel branch must catch ``future.result()`` and return
+        the other pages in order.
+        """
+        out = tmp_path / "iso_parallel"
+        out.mkdir(parents=True)
+        stem = Path(multipage_pdf).stem
+        # A directory where the file should go makes page 2's save fail only.
+        (out / f"{stem}_page_2.png").mkdir()
+
+        writer = PDFWriter(multipage_pdf, engine="pdfium", workers=2)
+        paths = writer.render_pages_as_images(output_dir=str(out), dpi=72)
+
+        assert len(paths) == 2
+        assert not any(os.path.basename(p) == f"{stem}_page_2.png" for p in paths)
+        assert all(os.path.exists(p) for p in paths)
+
+    @pytest.mark.parametrize("engine", ["pdfium", "pymupdf"])
+    def test_render_pages_unsupported_format_raises(self, sample_pdf, tmp_path, engine):
+        """An unsupported image_format is a caller bug -> fail fast, don't return []."""
+        writer = PDFWriter(sample_pdf, engine=engine)
+        with pytest.raises(ValueError, match="Unsupported image_format"):
+            writer.render_pages_as_images(output_dir=str(tmp_path / "bad"), image_format="pngg")
+
+    def test_render_pages_unsupported_format_raises_even_when_empty(self, empty_pdf, tmp_path):
+        """The format is validated before the is_empty short-circuit (documented contract)."""
+        writer = PDFWriter(empty_pdf)
+        with pytest.raises(ValueError, match="Unsupported image_format"):
+            writer.render_pages_as_images(output_dir=str(tmp_path / "bad"), image_format="pngg")
+
+    def test_render_pages_dict_constructed_writer_raises(self, sample_pdf, tmp_path):
+        """A dict/JSON-constructed writer has no source file to render pages from."""
+        from datagrunt.pdf_api.pdfreader import PDFReader
+
+        parsed = PDFReader(sample_pdf).to_dicts()
+        writer = PDFWriter(parsed)
+        with pytest.raises(ValueError):
+            writer.render_pages_as_images(output_dir=str(tmp_path / "nope"))

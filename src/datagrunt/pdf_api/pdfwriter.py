@@ -5,6 +5,7 @@ import json
 
 # local libraries
 from datagrunt.core.pdf_io import pdfcomponents
+from datagrunt.core.pdf_io.engines import _normalize_image_format
 from datagrunt.pdf_api._engine_backed import _PDFEngineBacked
 
 
@@ -136,3 +137,37 @@ class PDFWriter(_PDFEngineBacked):
         if self.is_empty:
             return []
         return self._engine.extract_images(output_dir, dedupe)
+
+    def render_pages_as_images(self, output_dir=None, dpi=300, image_format="png"):
+        """Render each page of the PDF as an image and save to disk.
+
+        Args:
+            output_dir (optional, str): Output directory; defaults to page_images.
+            dpi (int, default 300): The resolution in DPI to render the pages.
+            image_format (str, default 'png'): The image format to save. One of
+                'png', 'jpg', or 'jpeg' (case-insensitive); other values raise
+                ValueError.
+
+        Returns:
+            list: Paths of the written page images, in page order. A page that
+            fails to render is logged and skipped rather than aborting the batch.
+
+        Raises:
+            ValueError: If ``image_format`` is unsupported, or if this writer was
+                constructed from a parsed-document dict/JSON (no source PDF to
+                rasterize).
+        """
+        # Validate the format up front so an unsupported value fails fast even
+        # for an empty/dict-backed writer, honoring the documented contract.
+        _normalize_image_format(image_format)
+        # Rendering rasterizes the source PDF's pages, which a parsed-document
+        # dict (or JSON) simply does not contain — fail clearly instead of
+        # silently returning nothing.
+        if self._parsed_dict is not None:
+            raise ValueError(
+                "render_pages_as_images requires the source PDF file; "
+                "it cannot render pages from a parsed document dict."
+            )
+        if self.is_empty:
+            return []
+        return self._engine.render_pages_as_images(output_dir=output_dir, dpi=dpi, image_format=image_format)
