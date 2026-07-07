@@ -75,9 +75,12 @@ jobs:
 
       - name: Commit and Push Docs Update
         working-directory: datagrunt-site
+        # Read the version from the datagrunt checkout — this step runs inside
+        # datagrunt-site, where `git log` would return the site's own history.
         run: |
+          VERSION=$(grep -m1 '^current_version = ' "$GITHUB_WORKSPACE/datagrunt/pyproject.toml" | cut -d'"' -f2)
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add content/
-          git diff-index --quiet HEAD || git commit -m "docs: release blog post for version $(git log -n 1 --format=%s)"
+          git diff-index --quiet HEAD || git commit -m "docs: release blog post for version $VERSION"
           git push origin main
