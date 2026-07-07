@@ -21,6 +21,15 @@ class TestPyMuPDFBackend:
         imgs = PyMuPDFBackend(sample_pdf).extract_images(0, output_dir=str(tmp_path))
         assert all(isinstance(i, ImageBlock) for i in imgs)
 
+    def test_extracted_image_filenames_one_based_zero_padded(self, two_page_image_pdf, tmp_path):
+        """Extracted-image names use 1-based, zero-padded page/img numbers
+        (page02_img01), matching render_pages_as_images so listings sort."""
+        from pathlib import Path
+
+        out = tmp_path / "imgs"
+        imgs = PyMuPDFBackend(two_page_image_pdf).extract_images(1, output_dir=str(out), name_prefix="doc")
+        assert [Path(i.file_path).stem for i in imgs] == ["doc_page02_img01"]
+
     def test_missing_file_raises(self):
         with pytest.raises(FileNotFoundError):
             PyMuPDFBackend("nope.pdf")

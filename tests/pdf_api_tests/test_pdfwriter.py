@@ -496,7 +496,7 @@ class TestPDFWriterRenderPagesAsImages:
         stem = Path(sample_pdf).stem
         for idx, p in enumerate(paths):
             assert os.path.exists(p)
-            assert os.path.basename(p) == f"{stem}_page_{idx + 1}.png"
+            assert os.path.basename(p) == f"{stem}_page_{idx + 1:02d}.png"
 
     def test_render_pages_as_images_pymupdf(self, sample_pdf, tmp_path):
         out = tmp_path / "page_imgs_pymupdf"
@@ -507,7 +507,7 @@ class TestPDFWriterRenderPagesAsImages:
         stem = Path(sample_pdf).stem
         for idx, p in enumerate(paths):
             assert os.path.exists(p)
-            assert os.path.basename(p) == f"{stem}_page_{idx + 1}.png"
+            assert os.path.basename(p) == f"{stem}_page_{idx + 1:02d}.png"
 
     def test_render_pages_as_images_parallel(self, sample_pdf, tmp_path):
         out = tmp_path / "page_imgs_parallel"
@@ -518,7 +518,7 @@ class TestPDFWriterRenderPagesAsImages:
         stem = Path(sample_pdf).stem
         for idx, p in enumerate(paths):
             assert os.path.exists(p)
-            assert os.path.basename(p) == f"{stem}_page_{idx + 1}.png"
+            assert os.path.basename(p) == f"{stem}_page_{idx + 1:02d}.png"
 
     def test_render_pages_as_images_empty_pdf(self, empty_pdf, tmp_path):
         out = tmp_path / "page_imgs_empty"
@@ -566,7 +566,7 @@ class TestPDFWriterRenderPagesAsImages:
 
         stem = Path(multipage_pdf).stem
         assert len(paths) == 2
-        assert not any(os.path.basename(p) == f"{stem}_page_2.png" for p in paths)
+        assert not any(os.path.basename(p) == f"{stem}_page_02.png" for p in paths)
         assert all(os.path.exists(p) for p in paths)
 
     def test_render_pages_error_isolation_sequential_pymupdf(self, multipage_pdf, tmp_path, monkeypatch):
@@ -582,7 +582,7 @@ class TestPDFWriterRenderPagesAsImages:
         real_open = builtins.open
 
         def flaky_open(file, mode="r", *args, **kwargs):
-            if "w" in str(mode) and "_page_2." in str(file):
+            if "w" in str(mode) and "_page_02." in str(file):
                 raise RuntimeError("boom writing page 2")
             return real_open(file, mode, *args, **kwargs)
 
@@ -594,7 +594,7 @@ class TestPDFWriterRenderPagesAsImages:
 
         stem = Path(multipage_pdf).stem
         assert len(paths) == 2
-        assert not any(os.path.basename(p) == f"{stem}_page_2.png" for p in paths)
+        assert not any(os.path.basename(p) == f"{stem}_page_02.png" for p in paths)
         assert all(os.path.exists(p) for p in paths)
 
     def test_render_pages_parallel_ordering(self, multipage_pdf, tmp_path):
@@ -607,7 +607,7 @@ class TestPDFWriterRenderPagesAsImages:
         assert len(paths) == 3
         for idx, p in enumerate(paths):
             assert os.path.exists(p)
-            assert os.path.basename(p) == f"{stem}_page_{idx + 1}.png"
+            assert os.path.basename(p) == f"{stem}_page_{idx + 1:02d}.png"
 
     def test_render_pages_error_isolation_parallel_pdfium(self, multipage_pdf, tmp_path):
         """Parallel path: a worker whose page fails is skipped, others survive.
@@ -622,14 +622,39 @@ class TestPDFWriterRenderPagesAsImages:
         out.mkdir(parents=True)
         stem = Path(multipage_pdf).stem
         # A directory where the file should go makes page 2's save fail only.
-        (out / f"{stem}_page_2.png").mkdir()
+        (out / f"{stem}_page_02.png").mkdir()
 
         writer = PDFWriter(multipage_pdf, engine="pdfium", workers=2)
         paths = writer.render_pages_as_images(output_dir=str(out), dpi=72)
 
         assert len(paths) == 2
-        assert not any(os.path.basename(p) == f"{stem}_page_2.png" for p in paths)
+        assert not any(os.path.basename(p) == f"{stem}_page_02.png" for p in paths)
         assert all(os.path.exists(p) for p in paths)
+
+    @pytest.mark.parametrize("engine", ["pdfium", "pymupdf"])
+    def test_render_pages_filenames_zero_padded_and_sortable(self, tmp_path, engine):
+        """Page numbers are zero-padded so filenames sort in page order.
+
+        Regression: unpadded page numbers made a 10+ page document's files
+        sort lexicographically as page_1, page_10, page_2, ...
+        """
+        import pymupdf
+
+        pdf_path = tmp_path / "tenpage.pdf"
+        doc = pymupdf.open()
+        for n in range(1, 11):
+            page = doc.new_page(width=612, height=792)
+            page.insert_text((72, 72), f"Page Marker {n}", fontsize=18)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        out = tmp_path / f"padded_{engine}"
+        writer = PDFWriter(str(pdf_path), engine=engine)
+        paths = writer.render_pages_as_images(output_dir=str(out), dpi=72)
+
+        names = [os.path.basename(p) for p in paths]
+        assert names == [f"tenpage_page_{n:02d}.png" for n in range(1, 11)]
+        assert sorted(names) == names
 
     @pytest.mark.parametrize("engine", ["pdfium", "pymupdf"])
     def test_render_pages_unsupported_format_raises(self, sample_pdf, tmp_path, engine):

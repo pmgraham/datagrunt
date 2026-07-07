@@ -17,6 +17,7 @@ from datagrunt.core.pdf_io import pdfcomponents
 from datagrunt.core.pdf_io.extraction import PdfiumBackend, PdfiumNativeReader, PyMuPDFBackend
 from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
 from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
+from datagrunt.core.pdf_io.filenames import page_image_filename
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +100,7 @@ def _render_pdfium_page_to_file(
     render-and-save step lives in exactly one place (DRY within the PDF domain).
     """
     img = page.render_pil(dpi=dpi)
-    out_path = directory / f"{pdf_name}_page_{page_index + 1}.{ext}"
+    out_path = directory / page_image_filename(pdf_name, page_index, ext)
     img.save(out_path, format=pil_format)
     return str(out_path)
 
@@ -533,7 +534,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
                     mat = pymupdf.Matrix(zoom, zoom)
                     pix = page.get_pixmap(matrix=mat)
                     img_data = pix.tobytes(ext)
-                    out_path = directory / f"{pdf_name}_page_{idx + 1}.{ext}"
+                    out_path = directory / page_image_filename(pdf_name, idx, ext)
                     with open(out_path, "wb") as f:
                         f.write(img_data)
                     written_paths.append(str(out_path))

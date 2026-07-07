@@ -9,6 +9,7 @@ from datagrunt.core.pdf_io.extraction.ocr import ocr_data_to_blocks
 from datagrunt.core.pdf_io.extraction.pdfium_document import ENCRYPTED_PDF_MESSAGE
 from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, PageAnalysis, TextBlock
 from datagrunt.core.pdf_io.extraction.text_block_builder import classify_by_median, page_median_size
+from datagrunt.core.pdf_io.filenames import embedded_image_filename
 
 logger = logging.getLogger(__name__)
 
@@ -298,7 +299,7 @@ class PyMuPDFBackend(_ThreadLocalDocSession, ExtractionBackend):
         if output_dir:
             import os
 
-            file_path = os.path.join(output_dir, f"{name_prefix}_page{page_number}_img{idx}.{ext}")
+            file_path = os.path.join(output_dir, embedded_image_filename(name_prefix, page_number, idx, ext))
             with open(file_path, "wb") as f:
                 f.write(image_bytes)
         return ImageBlock(bbox=bbox, file_path=file_path, width_px=width, height_px=height, fmt=ext)
