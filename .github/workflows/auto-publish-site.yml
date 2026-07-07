@@ -1,9 +1,19 @@
 name: Auto Update Docs & Blog
 
 on:
+  # Chain off the version bump like Publish to PyPI does. A tag trigger cannot
+  # work for releases: bumpver's tags point at the bump commit, whose
+  # "[skip ci]" message suppresses all push-triggered workflows (#275).
+  workflow_run:
+    workflows: ["Bump Version"]
+    types: [completed]
+    branches: [main]
+  # Manual fallbacks: dispatch from the Actions tab, or push a v-prefixed tag
+  # at a commit without "[skip ci]" (how releases were published before #275).
+  workflow_dispatch:
   push:
     tags:
-      - 'v*'  # Triggers whenever a version release tag (e.g., v4.4.1) is pushed
+      - 'v*'
 
 permissions:
   contents: write
@@ -11,6 +21,9 @@ permissions:
 jobs:
   update-docs:
     runs-on: ubuntu-latest
+    if: >-
+      ${{ github.event_name != 'workflow_run' ||
+          github.event.workflow_run.conclusion == 'success' }}
     steps:
       - name: Checkout datagrunt
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -49,8 +62,16 @@ jobs:
       - name: Run Antigravity Workflow
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        # Diff against the previous release tag so the post covers the whole
+        # release, not just the commit before HEAD. Tags for the version being
+        # released are excluded so a backfill run (HEAD already tagged) still
+        # finds the prior release; with no prior tag, fall back to HEAD~1.
         run: |
-          python datagrunt/scripts/antigravity_workflow.py --pre-merge-commit HEAD~1
+          VERSION=$(grep -m1 '^current_version = ' datagrunt/pyproject.toml | cut -d'"' -f2)
+          PREV_TAG=$(git -C datagrunt describe --tags --abbrev=0 \
+            --exclude="$VERSION" --exclude="v$VERSION" HEAD 2>/dev/null || echo "HEAD~1")
+          echo "Documenting version $VERSION (diff base: $PREV_TAG)"
+          python datagrunt/scripts/antigravity_workflow.py --pre-merge-commit "$PREV_TAG"
 
       - name: Commit and Push Docs Update
         working-directory: datagrunt-site
