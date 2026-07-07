@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Antigravity workflow script to run the AI agent that updates the doc site and drafts the release blog post."""
+"""Antigravity workflow script to run the AI agent that updates the doc site and publishes the release blog post."""
 
 import argparse
 import asyncio
@@ -59,23 +59,30 @@ async def run_agent(version, commit_log, file_stat, git_diff, repo_dir):
         "You are a technical writer and release coordination agent for Datagrunt.\n"
         f"The current local date is: {datetime.now().strftime('%Y-%m-%d')}.\n\n"
         "Your goal is to:\n"
-        "1. Analyze the git diff, file statistics, and commit log of the datagrunt codebase (located at `/Users/pmgraham/projects/datagrunt`).\n"
+        "1. Analyze the git diff, file statistics, and commit log of the datagrunt codebase "
+        "(located at `/Users/pmgraham/projects/datagrunt`).\n"
         "2. Identify new features, bug fixes, performance improvements, or breaking changes.\n"
-        "3. Update the documentation in the Hugo site located at `/Users/pmgraham/projects/datagrunt-site/content/docs/_index.md` or other files. You must read the existing documentation first if you want to update it accurately. Ensure you format links and structures using Markdown.\n"
-        "4. Write a release blog post under `/Users/pmgraham/projects/datagrunt-site/content/blog/2026/june/` (or current year/month folder as appropriate). Use the format `datagrunt-<version>-<short-description>.md`.\n"
+        "3. Update the documentation in the Hugo site located at "
+        "`/Users/pmgraham/projects/datagrunt-site/content/docs/_index.md` or other files. You must read the "
+        "existing documentation first if you want to update it accurately. Ensure you format links and "
+        "structures using Markdown.\n"
+        "4. Write a release blog post under `/Users/pmgraham/projects/datagrunt-site/content/blog/2026/june/` "
+        "(or current year/month folder as appropriate). Use the format `datagrunt-<version>-<short-description>.md`.\n"
         "   - The blog post must have front matter at the top: \n"
         "     ---\n"
         '     title: "Datagrunt <version>: <engaging headline>"\n'
         "     date: <YYYY-MM-DD>\n"
-        "     draft: true\n"
+        "     draft: false\n"
         '     author: "Martin Graham"\n'
         '     author_email: "datagrunt@datagrunt.io"\n'
         '     description: "<engaging description of release highlights>"\n'
         '     tags: ["python", "csv", "data-engineering", "release-notes"]\n'
         "     ---\n"
-        "   - The post should have a structured, premium technical style with code snippets explaining how to use new features.\n"
-        "5. Output a summary of the files updated and created (including their absolute paths) and a brief overview of the content generated.\n"
-        "6. Do not mark the blog post draft: false yet. The user will review and approve it."
+        "   - The post should have a structured, premium technical style with code snippets explaining "
+        "how to use new features.\n"
+        "5. Output a summary of the files updated and created (including their absolute paths) and a brief "
+        "overview of the content generated.\n"
+        "6. Publish the post immediately (draft: false). Never future-date it; Hugo skips posts dated after the build."
     )
 
     # Check if using Vertex AI
