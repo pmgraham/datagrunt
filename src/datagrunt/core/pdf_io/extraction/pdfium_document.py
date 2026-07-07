@@ -11,6 +11,7 @@ from pathlib import Path
 
 from datagrunt.core.pdf_io.extraction.config import _DEFAULT_MIN_IMAGE_DIMENSION
 from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, TextItem
+from datagrunt.core.pdf_io.filenames import embedded_image_filename
 
 logger = logging.getLogger(__name__)
 
@@ -195,7 +196,8 @@ class PdfiumPage:
             bbox = self._display_box(left, bottom, right, top, rotation, disp_w, disp_h)
             file_path, fmt = None, "png"
             if output_dir:
-                written = self._extract_image(obj, Path(output_dir) / f"{name_prefix}_page{page_number}_img{idx}")
+                image_stem = embedded_image_filename(name_prefix, page_number, idx)
+                written = self._extract_image(obj, Path(output_dir) / image_stem)
                 if written is not None:
                     file_path, fmt = str(written), (written.suffix.lstrip(".") or "png")
             yield ImageBlock(bbox=bbox, file_path=file_path, width_px=px_w, height_px=px_h, fmt=fmt)
