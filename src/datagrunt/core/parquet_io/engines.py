@@ -4,7 +4,7 @@
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Optional
 
 # third party libraries
 import duckdb
@@ -36,7 +36,7 @@ def _resolve_normalize(instance_value, per_call_value):
     return instance_value if per_call_value is None else per_call_value
 
 
-def resolve_sample_rows(n_rows, default):
+def resolve_sample_rows(n_rows: Optional[int], default: int) -> int:
     """Resolve a per-call sample size against the engine default.
 
     ``None`` inherits ``default``. Anything else must be a positive int;

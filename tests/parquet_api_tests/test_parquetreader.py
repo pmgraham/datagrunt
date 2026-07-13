@@ -85,9 +85,7 @@ def test_get_sample_n_rows_invalid(sample_parquet):
             reader.get_sample(n_rows=bad)
 
 
-def test_get_sample_n_rows_invalid_on_empty_file(tmp_path):
+def test_get_sample_n_rows_invalid_on_empty_file(empty_parquet):
     """Invalid n_rows raises even when the file is empty."""
-    path = tmp_path / "empty.parquet"
-    path.touch()
     with pytest.raises(ValueError):
-        ParquetReader(str(path)).get_sample(n_rows=0)
+        ParquetReader(empty_parquet).get_sample(n_rows=0)
