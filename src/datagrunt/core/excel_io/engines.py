@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, Optional
 
 # third party libraries
 import duckdb
@@ -42,6 +42,19 @@ class ExcelEngineProperties:
 def _resolve_normalize(instance_value, per_call_value):
     """Return the per-call override when given, else the instance default."""
     return instance_value if per_call_value is None else per_call_value
+
+
+def resolve_sample_rows(n_rows: Optional[int], default: int) -> int:
+    """Resolve a per-call sample size against the engine default.
+
+    ``None`` inherits ``default``. Anything else must be a positive int;
+    bools are rejected because they are ints in Python but never a row count.
+    """
+    if n_rows is None:
+        return default
+    if isinstance(n_rows, bool) or not isinstance(n_rows, int) or n_rows < 1:
+        raise ValueError(f"n_rows must be a positive integer, got {n_rows!r}.")
+    return n_rows
 
 
 def _freeze(value):
@@ -121,11 +134,15 @@ class ExcelReaderEngine:
             self._frame_cache[key] = df
         return self._frame_cache[key]
 
-    def get_sample(self, sheet=None, normalize_columns=None, **read_options):
-        """Return the leading sample rows of a sheet as a Polars frame."""
-        return self._read_sheet(sheet, normalize_columns, read_options).head(
-            ExcelEngineProperties.dataframe_sample_rows
-        )
+    def get_sample(self, sheet=None, normalize_columns=None, n_rows=None, **read_options):
+        """Return the leading sample rows of a sheet as a Polars frame.
+
+        ``n_rows`` is the sample size (default 20). It is consumed here, not
+        forwarded to ``read_excel`` — pass row limits for full reads via
+        ``to_dataframe(n_rows=...)`` instead.
+        """
+        sample_rows = resolve_sample_rows(n_rows, ExcelEngineProperties.dataframe_sample_rows)
+        return self._read_sheet(sheet, normalize_columns, read_options).head(sample_rows)
 
     def to_dataframe(self, sheet=None, normalize_columns=None, **read_options):
         """Return a sheet as a Polars DataFrame."""
