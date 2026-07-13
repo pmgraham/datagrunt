@@ -8,6 +8,7 @@ import polars as pl
 import pyarrow as pa
 
 # local libraries
+from datagrunt.core.parquet_io.engines import ParquetEngineProperties, resolve_sample_rows
 from datagrunt.parquet_api._engine_backed import _ParquetEngineBacked
 
 
@@ -34,11 +35,27 @@ class ParquetReader(_ParquetEngineBacked):
         """The DuckDB table name ``query_data`` registers the file under."""
         return self._engine.db_table
 
-    def get_sample(self, normalize_columns: bool | None = None, **read_options) -> pl.DataFrame:
-        """Return the leading sample rows (empty frame if empty/blank)."""
+    def get_sample(
+        self, normalize_columns: bool | None = None, n_rows: int | None = None, **read_options
+    ) -> pl.DataFrame:
+        """Return the leading sample rows (empty frame if empty/blank).
+
+        Args:
+            normalize_columns (bool or None): Per-call override; ``None``
+                (default) inherits the constructor-level setting.
+            n_rows (int or None): Number of sample rows to return. ``None``
+                (default) uses the standard sample size (20).
+            **read_options: Polars ``read_parquet`` options for this call.
+
+        Raises:
+            ValueError: If ``n_rows`` is not ``None`` or a positive integer.
+        """
+        # Validate n_rows before the empty/blank short-circuit so a bad value
+        # raises regardless of file contents, as the Raises clause promises.
+        sample_rows = resolve_sample_rows(n_rows, ParquetEngineProperties.dataframe_sample_rows)
         if self.is_empty or self.is_blank:
             return pl.DataFrame()
-        return self._engine.get_sample(normalize_columns, **read_options)
+        return self._engine.get_sample(normalize_columns, n_rows=sample_rows, **read_options)
 
     def to_dataframe(self, normalize_columns: bool | None = None, **read_options) -> pl.DataFrame:
         """Convert to a Polars DataFrame (empty frame if empty/blank)."""

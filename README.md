@@ -228,7 +228,7 @@ path is rejected at construction (`ValueError` / `FileNotFoundError`).
 from datagrunt import ParquetReader, ParquetWriter
 
 reader = ParquetReader("data.parquet")
-reader.get_sample()                          # first rows as a Polars DataFrame
+reader.get_sample()                          # first rows as a Polars DataFrame (n_rows= adjusts the sample size)
 reader.to_dataframe()                        # full file as a Polars DataFrame
 reader.to_arrow_table()                      # Apache Arrow Table
 reader.to_dicts()                            # list of row dicts

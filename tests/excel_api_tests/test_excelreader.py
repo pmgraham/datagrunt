@@ -108,3 +108,29 @@ def test_excelreader_to_dataframe_read_options_deprecation(sample_xlsx):
         df = reader.to_dataframe(read_options={"n_rows": 1})
 
     assert df.height == 1
+
+
+def test_get_sample_n_rows(tmp_path):
+    import polars as pl
+    import xlsxwriter
+
+    path = tmp_path / "wide.xlsx"
+    with xlsxwriter.Workbook(str(path)) as wb:
+        pl.DataFrame({"n": list(range(30))}).write_excel(workbook=wb, worksheet="Wide")
+    reader = ExcelReader(str(path))
+    assert reader.get_sample().height == 20  # default unchanged
+    assert reader.get_sample(n_rows=5).height == 5
+    assert reader.get_sample(n_rows=100).height == 30  # capped at sheet size
+
+
+def test_get_sample_n_rows_invalid(sample_xlsx):
+    reader = ExcelReader(sample_xlsx)
+    for bad in (0, -3, 2.5, "ten", True):
+        with pytest.raises(ValueError):
+            reader.get_sample(n_rows=bad)
+
+
+def test_get_sample_n_rows_invalid_on_empty_file(empty_xlsx):
+    """Invalid n_rows raises even when the workbook is empty."""
+    with pytest.raises(ValueError):
+        ExcelReader(empty_xlsx).get_sample(n_rows=0)

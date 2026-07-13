@@ -11,7 +11,8 @@ import polars as pl
 import pyarrow as pa
 
 # local libraries
-from datagrunt.core import DuckDBQueries
+from datagrunt.core import CSVEngineProperties, DuckDBQueries
+from datagrunt.core.csv_io.protocol import resolve_sample_rows
 from datagrunt.csv_api._compat import warn_per_call_normalize
 from datagrunt.csv_api._engine_backed import _CSVEngineBacked
 
@@ -47,20 +48,28 @@ class CSVReader(_CSVEngineBacked):
         """Return an empty object of the specified type."""
         return object
 
-    def get_sample(self, normalize_columns: bool | None = None):
+    def get_sample(self, normalize_columns: bool | None = None, n_rows: int | None = None):
         """Return a sample of the CSV file.
 
         Args:
             normalize_columns (bool or None): Deprecated per-call override.
             ``None`` (default) inherits the constructor-level setting.
+            n_rows (int or None): Number of sample rows to return. ``None``
+            (default) uses the standard sample size (20).
 
         Returns:
             A Polars DataFrame (all engines), or an empty ``pl.DataFrame()``
             for empty/blank files.
+
+        Raises:
+            ValueError: If ``n_rows`` is not ``None`` or a positive integer.
         """
+        # Validate n_rows before the empty/blank short-circuit so a bad value
+        # raises regardless of file contents, as the Raises clause promises.
+        sample_rows = resolve_sample_rows(n_rows, CSVEngineProperties.dataframe_sample_rows)
         if self.is_empty or self.is_blank:
             return self._return_empty_file_object(pl.DataFrame())
-        return self._engine.get_sample(warn_per_call_normalize(normalize_columns))
+        return self._engine.get_sample(warn_per_call_normalize(normalize_columns), n_rows=sample_rows)
 
     def to_dataframe(self, normalize_columns: bool | None = None, **kwargs):
         """Converts CSV to a dataframe.
