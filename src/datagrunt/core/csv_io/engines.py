@@ -33,6 +33,9 @@ from datagrunt.core.csv_io.protocol import (
 from datagrunt.core.csv_io.protocol import (
     resolve_normalize_columns as _resolve_normalize_columns,
 )
+from datagrunt.core.csv_io.protocol import (
+    resolve_sample_rows as _resolve_sample_rows,
+)
 from datagrunt.core.databases import DuckDBQueries
 
 
@@ -175,12 +178,14 @@ class CSVBaseReaderEngine(_DuckDBBackedEngine):
         self.delimiter = self.queries.delimiter
 
     @abstractmethod
-    def get_sample(self, normalize_columns: Optional[bool] = None) -> pl.DataFrame:
+    def get_sample(self, normalize_columns: Optional[bool] = None, n_rows: Optional[int] = None) -> pl.DataFrame:
         """Return a sample of the data as a Polars DataFrame.
 
         Args:
             normalize_columns (bool or None): Whether to normalize column
             names. ``None`` (default) inherits the instance-level setting.
+            n_rows (int or None): Number of sample rows. ``None`` (default)
+            uses ``CSVEngineProperties.dataframe_sample_rows`` (20).
 
         Returns:
             A Polars DataFrame containing the sample rows.
@@ -301,26 +306,26 @@ class CSVReaderDuckDBEngine(CSVBaseReaderEngine):
     Class to read CSV files and convert CSV files powered by DuckDB.
     """
 
-    def get_sample(self, normalize_columns=None):
+    def get_sample(self, normalize_columns=None, n_rows=None):
         """
         Return a sample of the CSV as a Polars DataFrame.
 
         Args:
             normalize_columns (bool or None): Whether to normalize column
             names. ``None`` (default) inherits the instance-level setting.
+            n_rows (int or None): Number of sample rows. ``None`` (default)
+            uses ``CSVEngineProperties.dataframe_sample_rows`` (20).
 
         Returns:
             A Polars DataFrame containing the sample rows.
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
+        sample_rows = _resolve_sample_rows(n_rows, CSVEngineProperties.dataframe_sample_rows)
         # The engine is cached on the CSVReader, so the streaming-sample
         # connection is reused by later reads and released when the reader goes
         # out of scope (its connection is reference-counted), or earlier via the
         # optional close()/`with`. datagrunt manages this; callers never must.
-        return self.queries.sample_dataframe(
-            CSVEngineProperties.dataframe_sample_rows,
-            normalize_columns,
-        )
+        return self.queries.sample_dataframe(sample_rows, normalize_columns)
 
     def to_dataframe(self, normalize_columns=None, **kwargs):
         """
@@ -444,12 +449,15 @@ class CSVReaderPolarsEngine(DataFrameDerivedReaderMixin, CSVBaseReaderEngine):
     Class to read CSV files and convert CSV files powered by Polars.
     """
 
-    def _create_dataframe(self, normalize_columns=False, sample=False, **kwargs):
+    def _create_dataframe(self, normalize_columns=False, sample=False, sample_rows=None, **kwargs):
         """Read the CSV into a Polars dataframe.
 
         Args:
             normalize_columns (bool): Whether to normalize column names.
             sample (bool): When True, read only the leading sample rows.
+            sample_rows (int or None): Number of sample rows to read when
+            ``sample`` is True. ``None`` uses
+            ``CSVEngineProperties.dataframe_sample_rows`` (20).
             **kwargs: Overrides/options for Polars read_csv.
 
         Returns:
@@ -465,7 +473,7 @@ class CSVReaderPolarsEngine(DataFrameDerivedReaderMixin, CSVBaseReaderEngine):
 
         n_rows = kwargs.pop("n_rows", None)
         if sample:
-            n_rows = CSVEngineProperties.dataframe_sample_rows
+            n_rows = sample_rows if sample_rows is not None else CSVEngineProperties.dataframe_sample_rows
 
         df = _polars_read_csv(
             self.filepath,
@@ -478,19 +486,22 @@ class CSVReaderPolarsEngine(DataFrameDerivedReaderMixin, CSVBaseReaderEngine):
             df = df.rename(CSVColumnNameNormalizer(self.filepath, columns=df.columns).columns_to_normalized_mapping)
         return df
 
-    def get_sample(self, normalize_columns=None):
+    def get_sample(self, normalize_columns=None, n_rows=None):
         """
         Return a sample of the CSV file.
 
         Args:
             normalize_columns (bool or None): Whether to normalize column
             names. ``None`` (default) inherits the instance-level setting.
+            n_rows (int or None): Number of sample rows. ``None`` (default)
+            uses ``CSVEngineProperties.dataframe_sample_rows`` (20).
 
         Returns:
             A Polars dataframe.
         """
         resolved = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
-        return self._create_dataframe(resolved, sample=True)
+        sample_rows = _resolve_sample_rows(n_rows, CSVEngineProperties.dataframe_sample_rows)
+        return self._create_dataframe(resolved, sample=True, sample_rows=sample_rows)
 
     def to_dataframe(self, normalize_columns=None, **kwargs):
         """
@@ -759,12 +770,15 @@ class CSVReaderPyArrowEngine(_PyArrowEngineMixin, CSVBaseReaderEngine):
             table = self._normalize_arrow_columns(table, columns)
         return table
 
-    def _create_table(self, normalize_columns=False, sample=False):
+    def _create_table(self, normalize_columns=False, sample=False, sample_rows=None):
         """Create a PyArrow table from the CSV file (all columns cast to string).
 
         Args:
             normalize_columns (bool): Whether to normalize column names.
             sample (bool): When True, read only the leading sample rows.
+            sample_rows (int or None): Number of sample rows to read when
+            ``sample`` is True. ``None`` uses
+            ``CSVEngineProperties.dataframe_sample_rows`` (20).
 
         Returns:
             A PyArrow table.
@@ -777,7 +791,7 @@ class CSVReaderPyArrowEngine(_PyArrowEngineMixin, CSVBaseReaderEngine):
                 "PyArrow engine does not support legacy Mac OS carriage return (\\r) newlines. "
                 "Please use engine='duckdb' or convert the file to Unix/Windows newlines."
             )
-        sample_rows = CSVEngineProperties.dataframe_sample_rows
+        sample_rows = sample_rows if sample_rows is not None else CSVEngineProperties.dataframe_sample_rows
         fallback_rows = sample_rows if sample else None
         if self.lenient:
             _check_csv_ragged_and_warn(self.filepath, self.delimiter)
@@ -836,19 +850,22 @@ class CSVReaderPyArrowEngine(_PyArrowEngineMixin, CSVBaseReaderEngine):
             reader.close()
         return pa.Table.from_batches(batches, schema=string_schema).slice(0, sample_rows)
 
-    def get_sample(self, normalize_columns=None):
+    def get_sample(self, normalize_columns=None, n_rows=None):
         """
         Return a sample of the CSV file.
 
         Args:
             normalize_columns (bool or None): Whether to normalize column
             names. ``None`` (default) inherits the instance-level setting.
+            n_rows (int or None): Number of sample rows. ``None`` (default)
+            uses ``CSVEngineProperties.dataframe_sample_rows`` (20).
 
         Returns:
             A Polars DataFrame containing the sample rows.
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
-        return _arrow_to_polars(self._create_table(normalize_columns, sample=True))
+        sample_rows = _resolve_sample_rows(n_rows, CSVEngineProperties.dataframe_sample_rows)
+        return _arrow_to_polars(self._create_table(normalize_columns, sample=True, sample_rows=sample_rows))
 
     def to_dataframe(self, normalize_columns=None, **kwargs) -> pl.DataFrame:
         """

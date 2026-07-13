@@ -15,6 +15,19 @@ def resolve_normalize_columns(instance_default: bool, per_call_value: Optional[b
     return instance_default if per_call_value is None else per_call_value
 
 
+def resolve_sample_rows(n_rows: Optional[int], default: int) -> int:
+    """Resolve a per-call sample size against the engine default.
+
+    ``None`` inherits ``default``. Anything else must be a positive int;
+    bools are rejected because they are ints in Python but never a row count.
+    """
+    if n_rows is None:
+        return default
+    if isinstance(n_rows, bool) or not isinstance(n_rows, int) or n_rows < 1:
+        raise ValueError(f"n_rows must be a positive integer, got {n_rows!r}.")
+    return n_rows
+
+
 def arrow_to_polars(table: pa.Table) -> pl.DataFrame:
     """Convert a PyArrow table to a Polars DataFrame, never a bare Series."""
     df = pl.from_arrow(table)
@@ -40,7 +53,7 @@ class CSVReaderEngineProtocol(Protocol):
         """Release engine-held resources."""
         ...
 
-    def get_sample(self, normalize_columns: Optional[bool] = None) -> pl.DataFrame:
+    def get_sample(self, normalize_columns: Optional[bool] = None, n_rows: Optional[int] = None) -> pl.DataFrame:
         """Return a sample of the data as a Polars DataFrame."""
         ...
 

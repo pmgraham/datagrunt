@@ -116,6 +116,31 @@ class TestCSVReader:
             assert "John" in names
             assert "Jane" in names
 
+    def test_get_sample_n_rows(self, tmp_path):
+        """get_sample(n_rows=...) adjusts the sample size on every engine."""
+        csv_file = tmp_path / "wide.csv"
+        rows = "\n".join(f"row{i},{i}" for i in range(30))
+        csv_file.write_text(f"name,value\n{rows}")
+        for engine in ALL_ENGINES:
+            reader = CSVReader(str(csv_file), engine=engine)
+            assert len(reader.get_sample()) == 20  # default unchanged
+            assert len(reader.get_sample(n_rows=5)) == 5
+            assert len(reader.get_sample(n_rows=100)) == 30  # capped at file size
+
+    def test_get_sample_n_rows_invalid(self, sample_csv):
+        """Invalid n_rows raises ValueError on every engine."""
+        for engine in ALL_ENGINES:
+            reader = CSVReader(sample_csv, engine=engine)
+            for bad in (0, -3, 2.5, "ten", True):
+                with pytest.raises(ValueError):
+                    reader.get_sample(n_rows=bad)
+
+    def test_get_sample_n_rows_empty_file(self, empty_csv):
+        """n_rows on an empty file still returns an empty DataFrame."""
+        for engine in ALL_ENGINES:
+            reader = CSVReader(empty_csv, engine=engine)
+            assert reader.get_sample(n_rows=5).is_empty()
+
     def test_same_stem_files_do_not_collide(self, tmp_path):
         """Two files sharing a name stem must not overwrite each other's data.
 
