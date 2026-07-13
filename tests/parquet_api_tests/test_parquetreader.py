@@ -65,3 +65,29 @@ def test_parquetreader_to_dataframe_kwargs(sample_parquet):
     df = reader.to_dataframe(n_rows=2)
     assert df.height == 2
     assert list(df.columns) == ["name", "age", "city"]
+
+
+def test_get_sample_n_rows(tmp_path):
+    import polars as pl
+
+    path = tmp_path / "wide.parquet"
+    pl.DataFrame({"n": list(range(30))}).write_parquet(str(path))
+    reader = ParquetReader(str(path))
+    assert reader.get_sample().height == 20  # default unchanged
+    assert reader.get_sample(n_rows=5).height == 5
+    assert reader.get_sample(n_rows=100).height == 30  # capped at file size
+
+
+def test_get_sample_n_rows_invalid(sample_parquet):
+    reader = ParquetReader(sample_parquet)
+    for bad in (0, -3, 2.5, "ten", True):
+        with pytest.raises(ValueError):
+            reader.get_sample(n_rows=bad)
+
+
+def test_get_sample_n_rows_invalid_on_empty_file(tmp_path):
+    """Invalid n_rows raises even when the file is empty."""
+    path = tmp_path / "empty.parquet"
+    path.touch()
+    with pytest.raises(ValueError):
+        ParquetReader(str(path)).get_sample(n_rows=0)
