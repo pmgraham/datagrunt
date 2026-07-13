@@ -141,6 +141,13 @@ class TestCSVReader:
             reader = CSVReader(empty_csv, engine=engine)
             assert reader.get_sample(n_rows=5).is_empty()
 
+    def test_get_sample_n_rows_invalid_on_empty_file(self, empty_csv):
+        """Invalid n_rows raises even when the file is empty."""
+        for engine in ALL_ENGINES:
+            reader = CSVReader(empty_csv, engine=engine)
+            with pytest.raises(ValueError):
+                reader.get_sample(n_rows=0)
+
     def test_same_stem_files_do_not_collide(self, tmp_path):
         """Two files sharing a name stem must not overwrite each other's data.
 
