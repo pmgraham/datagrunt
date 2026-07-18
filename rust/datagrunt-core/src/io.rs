@@ -105,6 +105,11 @@ fn decode_chunk_with_carry(bytes: &[u8], carry: &mut Vec<u8>) -> String {
 }
 
 /// Read whole file as text the way Python's probes do: utf-8-sig + ignore.
+///
+/// Test-only: the eager reference oracle for [`DecodedReader`]'s differential
+/// tests. Production paths stream via [`DecodedReader`] instead of loading the
+/// whole file.
+#[cfg(test)]
 pub(crate) fn read_decoded(path: &Path) -> std::io::Result<String> {
     let mut bytes = Vec::new();
     File::open(path)?.read_to_end(&mut bytes)?;
@@ -112,7 +117,7 @@ pub(crate) fn read_decoded(path: &Path) -> std::io::Result<String> {
     Ok(decode_ignore(body))
 }
 
-/// Streaming equivalent of [`read_decoded`] (+ optional universal-newline
+/// Streaming equivalent of `read_decoded` (+ optional universal-newline
 /// translation): BOM stripped at offset 0, invalid UTF-8 bytes dropped
 /// (errors="ignore"), reading the underlying file in 64 KiB chunks so
 /// consumers that stop early never pay for the rest of the file.
@@ -574,7 +579,12 @@ impl Iterator for UniversalLines {
 /// "a\nb\n" -> ["a","b"]; "a\nb" -> ["a","b"]; "" -> [].
 ///
 /// Thin `collect()` over [`universal_lines`] so there is one line-splitting
-/// implementation. Other components rely on this for small samples.
+/// implementation.
+///
+/// Test-only: the eager reference oracle for the streaming
+/// [`universal_lines`] differential tests; production paths consume the
+/// iterator directly.
+#[cfg(test)]
 pub(crate) fn read_universal_lines(path: &Path) -> std::io::Result<Vec<String>> {
     universal_lines(path)?.collect::<Result<Vec<_>, _>>()
 }
@@ -610,6 +620,11 @@ pub fn is_empty(path: &Path) -> std::io::Result<bool> {
 /// bytes) is never blank; otherwise strict decode (BOM allowed) — invalid
 /// UTF-8 counts as content; blank iff all whitespace.
 /// The stat-then-read order mirrors Python's BlankFile (the size gate is advisory; Python has the same TOCTOU characteristics, and parity is the spec).
+///
+/// Test-only: a Python-parity mirror kept as a documented oracle with its own
+/// tests; production blank-detection consolidated into the single-open
+/// `probe_csv_header` (`probe.blank`).
+#[cfg(test)]
 pub(crate) fn is_blank(path: &Path) -> bool {
     let size = match std::fs::metadata(path) {
         Ok(m) => m.len(),
