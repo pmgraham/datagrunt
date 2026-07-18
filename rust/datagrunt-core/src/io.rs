@@ -105,6 +105,10 @@ fn decode_chunk_with_carry(bytes: &[u8], carry: &mut Vec<u8>) -> String {
 }
 
 /// Read whole file as text the way Python's probes do: utf-8-sig + ignore.
+///
+/// Test-only: the eager reference implementation the streaming-parity tests
+/// compare [`DecodedReader`] against.
+#[cfg(test)]
 pub(crate) fn read_decoded(path: &Path) -> std::io::Result<String> {
     let mut bytes = Vec::new();
     File::open(path)?.read_to_end(&mut bytes)?;
@@ -574,7 +578,11 @@ impl Iterator for UniversalLines {
 /// "a\nb\n" -> ["a","b"]; "a\nb" -> ["a","b"]; "" -> [].
 ///
 /// Thin `collect()` over [`universal_lines`] so there is one line-splitting
-/// implementation. Other components rely on this for small samples.
+/// implementation.
+///
+/// Test-only: production code streams via [`universal_lines`]; the tests use
+/// this eager collect as their reference.
+#[cfg(test)]
 pub(crate) fn read_universal_lines(path: &Path) -> std::io::Result<Vec<String>> {
     universal_lines(path)?.collect::<Result<Vec<_>, _>>()
 }
@@ -610,6 +618,9 @@ pub fn is_empty(path: &Path) -> std::io::Result<bool> {
 /// bytes) is never blank; otherwise strict decode (BOM allowed) — invalid
 /// UTF-8 counts as content; blank iff all whitespace.
 /// The stat-then-read order mirrors Python's BlankFile (the size gate is advisory; Python has the same TOCTOU characteristics, and parity is the spec).
+///
+/// Test-only: kept as the reference implementation for blank-detection tests.
+#[cfg(test)]
 pub(crate) fn is_blank(path: &Path) -> bool {
     let size = match std::fs::metadata(path) {
         Ok(m) => m.len(),
