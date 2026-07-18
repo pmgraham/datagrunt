@@ -79,7 +79,7 @@ pub fn probe_csv_header(path: &Path) -> std::io::Result<HeaderProbe> {
             segment.extend_from_slice(&available[..capped_take]);
             reader.consume(capped_take);
             total_read += capped_take;
-            if newline_pos.map_or(false, |pos| capped_take >= pos + 1) {
+            if newline_pos.is_some_and(|pos| capped_take > pos) {
                 found_newline = true;
                 break;
             }
