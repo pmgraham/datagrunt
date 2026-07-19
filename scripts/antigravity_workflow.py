@@ -54,10 +54,15 @@ async def run_agent(version, commit_log, file_stat, git_diff, repo_dir):
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(app_data_dir, exist_ok=True)
 
+    # Full ISO 8601 timestamp, not a bare date: same-day releases must carry
+    # distinct front-matter dates or Hugo breaks the listing tie by title,
+    # rendering the newer release below the older one (#288).
+    release_timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+
     # Configure the system instructions
     system_instructions = (
         "You are a technical writer and release coordination agent for Datagrunt.\n"
-        f"The current local date is: {datetime.now().strftime('%Y-%m-%d')}.\n\n"
+        f"The current local date-time is: {release_timestamp}.\n\n"
         "Your goal is to:\n"
         "1. Analyze the git diff, file statistics, and commit log of the datagrunt codebase "
         "(located at `/Users/pmgraham/projects/datagrunt`).\n"
@@ -71,7 +76,7 @@ async def run_agent(version, commit_log, file_stat, git_diff, repo_dir):
         "   - The blog post must have front matter at the top: \n"
         "     ---\n"
         '     title: "Datagrunt <version>: <engaging headline>"\n'
-        "     date: <YYYY-MM-DD>\n"
+        f"     date: {release_timestamp}\n"
         "     draft: false\n"
         '     author: "Martin Graham"\n'
         '     author_email: "datagrunt@datagrunt.io"\n'
