@@ -91,9 +91,10 @@ celerybeat-schedule
 # SageMath parsed files
 *.sage.py
 
-# dotenv
+# dotenv — but the placeholder-only example ships publicly
 .env
 .env.*
+!.env.example
 
 # virtualenv
 .venv/
@@ -197,3 +198,13 @@ examples/
 
 # Local Claude Code config (settings, commands, worktrees) — keep local only
 .claude/
+
+# Other AI assistant & editor tool artifacts — local only, never public
+.vscode/
+.gemini/
+GEMINI.md
+.aider*
+.windsurf/
+.codeium/
+.superpowers/
+.github/copilot-instructions.md

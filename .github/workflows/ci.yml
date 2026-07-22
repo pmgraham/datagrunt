@@ -41,6 +41,12 @@ jobs:
           CARGO_NET_RETRY: "10" # tolerate transient crates.io HTTP/2 fetch flakes
         run: cargo test
 
+      - name: cargo clippy (blocking)
+        working-directory: rust
+        env:
+          CARGO_NET_RETRY: "10"
+        run: cargo clippy --all-targets -- -D warnings
+
       - name: pytest (Rust backend)
         run: .venv/bin/pytest tests/ -q
 
@@ -54,6 +60,44 @@ jobs:
 
       - name: ruff format check (blocking)
         run: .venv/bin/ruff format --check .
+
+  python-compat:
+    # The main test job covers 3.12; this proves the rest of the advertised
+    # range (requires-python >= 3.10, classifiers through 3.14). The native
+    # extension is abi3-py310, so this mostly exercises the pure-Python paths
+    # (the whole PDF subsystem) and the dependency set per version.
+    name: python compat
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install tesseract (for PDF OCR tests)
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
+
+      - name: Create venv, build the extension (editable), install dev/pdf extras
+        run: |
+          uv venv --clear
+          uv pip install -e ".[dev,pdf]"
+
+      - name: pytest (Rust backend)
+        run: .venv/bin/pytest tests/ -q
+
+      - name: pytest (Python fallback backend)
+        env:
+          DATAGRUNT_DISABLE_RUST: "1"
+        run: .venv/bin/pytest tests/ -q
 
   build:
     name: wheel matrix

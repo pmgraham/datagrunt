@@ -2,6 +2,7 @@
 name = "datagrunt-python"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [lib]
 # cdylib artifact name (Rust ident — can't start with "_"). The Python module

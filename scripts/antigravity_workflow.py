@@ -50,6 +50,10 @@ async def run_agent(version, commit_log, file_stat, git_diff, repo_dir):
     save_dir = str(repo_dir / ".antigravity_sessions")
     app_data_dir = str(repo_dir / ".antigravity_brain")
 
+    # The sister Hugo site lives next to this repo by convention (both locally
+    # and in the CI checkout layout); override with DATAGRUNT_SITE_DIR.
+    site_dir = Path(os.environ.get("DATAGRUNT_SITE_DIR", repo_dir.parent / "datagrunt-site")).resolve()
+
     # Ensure directories exist
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(app_data_dir, exist_ok=True)
@@ -65,13 +69,13 @@ async def run_agent(version, commit_log, file_stat, git_diff, repo_dir):
         f"The current local date-time is: {release_timestamp}.\n\n"
         "Your goal is to:\n"
         "1. Analyze the git diff, file statistics, and commit log of the datagrunt codebase "
-        "(located at `/Users/pmgraham/projects/datagrunt`).\n"
+        f"(located at `{repo_dir}`).\n"
         "2. Identify new features, bug fixes, performance improvements, or breaking changes.\n"
         "3. Update the documentation in the Hugo site located at "
-        "`/Users/pmgraham/projects/datagrunt-site/content/docs/_index.md` or other files. You must read the "
+        f"`{site_dir / 'content' / 'docs' / '_index.md'}` or other files. You must read the "
         "existing documentation first if you want to update it accurately. Ensure you format links and "
         "structures using Markdown.\n"
-        "4. Write a release blog post under `/Users/pmgraham/projects/datagrunt-site/content/blog/2026/june/` "
+        f"4. Write a release blog post under `{site_dir / 'content' / 'blog' / '2026' / 'june'}/` "
         "(or current year/month folder as appropriate). Use the format `datagrunt-<version>-<short-description>.md`.\n"
         "   - The blog post must have front matter at the top: \n"
         "     ---\n"

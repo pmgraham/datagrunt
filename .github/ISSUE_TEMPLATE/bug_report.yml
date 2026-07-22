@@ -1,0 +1,47 @@
+name: Bug report
+description: Something in datagrunt doesn't work as documented
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+      placeholder: |
+        CSVReader("data.csv").to_dataframe() raised ... but the file parses fine with ...
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Smallest code snippet (and, if possible, a small sample file or its shape) that reproduces the problem.
+      render: python
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: datagrunt version
+      placeholder: "4.5.4"
+    validations:
+      required: true
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version and OS
+      placeholder: "3.12 on macOS 15 (arm64)"
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Compute backend
+      description: Does the problem also occur with the pure-Python oracle (`DATAGRUNT_DISABLE_RUST=1`)?
+      options:
+        - Rust backend (default) — Python oracle not tried
+        - Occurs on BOTH backends
+        - Rust backend only (Python oracle works)
+        - Python oracle only
+    validations:
+      required: false
