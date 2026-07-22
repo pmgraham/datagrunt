@@ -1,19 +1,20 @@
 name: Auto Update Docs & Blog
 
 on:
-  # Chain off the version bump like Publish to PyPI does. A tag trigger cannot
-  # work for releases: bumpver's tags point at the bump commit, whose
-  # "[skip ci]" message suppresses all push-triggered workflows (#275).
+  # Chain off the APPROVED PyPI publish, not the version bump, so the release
+  # post can never precede the maintainer's consent at the gated PyPi
+  # environment (#305). A rejected or failed publish never posts. The chain
+  # push (bump) -> Publish to PyPI -> this stays within GitHub's three-level
+  # workflow_run limit. (A tag trigger cannot work for releases: bumpver's
+  # tags point at the bump commit, whose "[skip ci]" message suppresses all
+  # push-triggered workflows — #275; the old v* fallback is gone with the
+  # v-prefixed tags.)
   workflow_run:
-    workflows: ["Bump Version"]
+    workflows: ["Publish to PyPI"]
     types: [completed]
     branches: [main]
-  # Manual fallbacks: dispatch from the Actions tab, or push a v-prefixed tag
-  # at a commit without "[skip ci]" (how releases were published before #275).
+  # Manual fallback: dispatch from the Actions tab.
   workflow_dispatch:
-  push:
-    tags:
-      - 'v*'
 
 # Read-only on THIS repo — the datagrunt-site push uses the scoped App token
 # minted below, never the workflow's GITHUB_TOKEN.
@@ -23,9 +24,15 @@ permissions:
 jobs:
   update-docs:
     runs-on: ubuntu-latest
+    # Post only for the automated release chain: the publish run must have
+    # succeeded AND itself been workflow_run-triggered (i.e. the real-PyPI
+    # path off Bump Version). Manual publish dispatches — e.g. TestPyPI
+    # smoke publishes — never generate a release post; dispatch this
+    # workflow manually if a post is wanted for one.
     if: >-
       ${{ github.event_name != 'workflow_run' ||
-          github.event.workflow_run.conclusion == 'success' }}
+          (github.event.workflow_run.conclusion == 'success' &&
+           github.event.workflow_run.event == 'workflow_run') }}
     steps:
       - name: Checkout datagrunt
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
