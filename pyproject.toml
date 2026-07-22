@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "datagrunt"
 version = "4.5.4"
-description = "Read CSV files and convert to other file formats easily"
+description = "Read, process, and convert CSV, Excel, Parquet, and PDF files easily"
 readme = "README.md"
 authors = [{ name = "Martin Graham", email = "datagrunt@datagrunt.io" }]
 license = "MIT"

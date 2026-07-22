@@ -1,0 +1,25 @@
+name: Feature request
+description: Propose an enhancement to datagrunt
+labels: ["feature request"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the workflow pain point, not just the proposed mechanism.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What would the API or behavior look like? Sketch code if helpful.
+      render: python
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false

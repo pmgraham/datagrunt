@@ -1,5 +1,10 @@
 # Welcome To Datagrunt
 
+[![CI](https://github.com/pmgraham/datagrunt/actions/workflows/ci.yml/badge.svg)](https://github.com/pmgraham/datagrunt/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/datagrunt)](https://pypi.org/project/datagrunt/)
+[![Python versions](https://img.shields.io/pypi/pyversions/datagrunt)](https://pypi.org/project/datagrunt/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/pmgraham/datagrunt/blob/main/LICENSE)
+
 Datagrunt is a Python library designed to simplify the way you work with CSV, Excel, Parquet, and PDF files. It provides a streamlined approach to reading, processing, and transforming your data into various formats, making data manipulation efficient and intuitive.
 
 ## Why Datagrunt?
@@ -31,7 +36,7 @@ Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow
 | [PyArrow](https://arrow.apache.org/docs/python/) | Python bindings for Apache Arrow with efficient columnar data processing |
 | [PDFium](https://github.com/pypdfium2-team/pypdfium2) | Default PDF engine (via `pypdfium2`) — permissively licensed (BSD-3 / Apache-2.0); fast text + image extraction, with a structured mode at parity with PyMuPDF |
 | [pdfplumber](https://github.com/jsvine/pdfplumber) | Table detection and extraction (MIT), shared by both PDF engines |
-| [PyMuPDF](https://pymupdf.readthedocs.io/) | Alternative PDF engine for text, tables, and images (AGPL-3.0 / commercial) |
+| [PyMuPDF](https://pymupdf.readthedocs.io/) | Alternative PDF engine for text, tables, and images (AGPL-3.0 / commercial). Note: selecting `engine='pymupdf'` pulls an AGPL-3.0 component into your environment — evaluate those license obligations for your use case, or stay on the default PDFium engine |
 | [Tesseract](https://github.com/tesseract-ocr/tesseract) | OCR for scanned/image-only pages (optional) |
 
 ## Installation
