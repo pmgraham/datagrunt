@@ -1,7 +1,7 @@
 # Welcome To Datagrunt
 
 [![CI](https://github.com/pmgraham/datagrunt/actions/workflows/ci.yml/badge.svg)](https://github.com/pmgraham/datagrunt/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/datagrunt)](https://pypi.org/project/datagrunt/)
+[![PyPI](https://img.shields.io/pypi/v/datagrunt?label=pypi)](https://pypi.org/project/datagrunt/)
 [![Python versions](https://img.shields.io/pypi/pyversions/datagrunt)](https://pypi.org/project/datagrunt/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/pmgraham/datagrunt/blob/main/LICENSE)
 
