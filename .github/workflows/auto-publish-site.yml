@@ -63,6 +63,11 @@ jobs:
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           python-version: "3.12"
+          # setup-uv >= 6 no longer provides an implicit environment for
+          # `uv pip install`; create and activate one so the install step and
+          # the bare `python` invocation below keep working (broke in the
+          # v5 -> v9 bump: "No virtual environment found").
+          activate-environment: true
 
       - name: Install dependencies
         # Pinned: these feed an AI agent that commits to datagrunt-site, so an
