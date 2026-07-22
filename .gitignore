@@ -91,10 +91,9 @@ celerybeat-schedule
 # SageMath parsed files
 *.sage.py
 
-# dotenv — but the placeholder-only example ships publicly
+# dotenv
 .env
 .env.*
-!.env.example
 
 # virtualenv
 .venv/
