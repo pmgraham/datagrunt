@@ -18,6 +18,7 @@ only; it must never import ``datagrunt._native`` or ``_compute``.
 # standard library
 import csv
 import re
+import sys
 from collections import Counter
 
 # local libraries
@@ -115,6 +116,19 @@ def first_row(filepath):
     return rows[0] if rows else ""
 
 
+def _nul_safe_lines(f):
+    """Line stream safe for ``csv.reader`` on every supported Python.
+
+    Python < 3.11's csv module rejects NUL characters ("line contains NUL");
+    3.11+ parses them as ordinary field content, as does the Rust backend.
+    Substituting U+FFFD (never empty-string stripping) keeps comment
+    detection, row emptiness, and column counts identical to 3.11+.
+    """
+    if sys.version_info >= (3, 11):
+        return f
+    return (line.replace("\0", "�") for line in f)
+
+
 def check_ragged(filepath, delimiter):
     """Return True if the CSV has ragged rows in the first 10,000 data rows.
 
@@ -125,7 +139,7 @@ def check_ragged(filepath, delimiter):
         newline_param = None if is_legacy_mac_newlines(filepath) else ""
         encoding = FileProperties(filepath).DEFAULT_ENCODING
         with open(filepath, "r", encoding=encoding, newline=newline_param, errors="ignore") as f:
-            reader = csv.reader(f, delimiter=delimiter)
+            reader = csv.reader(_nul_safe_lines(f), delimiter=delimiter)
             header = None
             for row in reader:
                 if row and not row[0].startswith("#"):
@@ -154,7 +168,7 @@ def row_count_with_header(filepath, delimiter):
     encoding = FileProperties(filepath).DEFAULT_ENCODING
     count = 0
     with open(filepath, "r", encoding=encoding, newline=newline_param, errors="ignore") as f:
-        reader = csv.reader(f, delimiter=delimiter)
+        reader = csv.reader(_nul_safe_lines(f), delimiter=delimiter)
         for row in reader:
             if not row or row[0].startswith("#"):
                 continue
