@@ -25,7 +25,7 @@ keywords = ["csv", "data", "duckdb", "polars", "pyarrow", "xlsx", "delimiter", "
 dependencies = [
     "duckdb>=1.5.3",
     "polars>=1.41.2",
-    "pyarrow>=24.0.0",
+    "pyarrow>=25.0.0",
     "XlsxWriter>=3.2.9",
     "fastexcel>=0.20.2",
 ]
