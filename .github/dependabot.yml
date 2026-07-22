@@ -8,6 +8,11 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # datagrunt is a LIBRARY: pyproject constraints are >= floors, and raising
+    # a floor forces every downstream user to upgrade. Only propose a bump
+    # when the existing constraint actually excludes the new version
+    # (security floor-raises still arrive via Dependabot security updates).
+    versioning-strategy: increase-if-necessary
   - package-ecosystem: "cargo"
     directory: "/rust"
     schedule:
