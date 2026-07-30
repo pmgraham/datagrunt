@@ -54,11 +54,13 @@ dev = [
     "bumpver>=2026.1132",
     "maturin>=1.7,<2.0",
     "pre-commit>=4.0.0",
-    # Bounded at the major only, unlike ruff (#312) and mypy (#314): Hypothesis
-    # is a library whose API is stable across 6.x, not a linter that adds
-    # default-on failures in minor releases. A 6.x bump cannot redden this gate
-    # on untouched code the way a formatter or type-checker release can.
-    "hypothesis>=6.164.0,<7.0",
+    # Bounded to the next minor, same as ruff (#312) and mypy (#314).
+    # Hypothesis's compatibility guarantee covers the DOCUMENTED API only;
+    # validation strictness can tighten in any 6.x minor (6.140.0 made
+    # characters(exclude_characters=...) reject multi-char strings; 6.136.2
+    # made @precondition without @rule raise). Either would redden this gate
+    # on untouched code.
+    "hypothesis>=6.164.0,<6.165",
 ]
 
 [project.urls]
