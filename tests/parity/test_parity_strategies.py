@@ -8,6 +8,7 @@ something.
 
 import os
 
+import pytest
 from hypothesis import given, settings
 from strategies import (
     SEAM_LABELS,
@@ -60,6 +61,36 @@ def test_outcome_normalizes_oserror_subclasses():
         raise FileNotFoundError(2, "No such file")
 
     assert outcome(missing) == ("raised", "OSError")
+
+
+def test_outcome_captures_baseexception_so_hypothesis_can_shrink_it():
+    """The safety-critical path: a panic must be captured, not left to escape.
+
+    PyO3 declares PanicException with PyBaseException as its base, so an
+    `except Exception` clause misses it. Hypothesis's
+    failure_exceptions_to_catch() is (Exception, SystemExit, GeneratorExit),
+    which means an escaping panic reddens the suite with no minimized repro.
+    Captured, it is an ordinary tuple mismatch that Hypothesis shrinks.
+    """
+
+    class FakePanic(BaseException):
+        """Stand-in: PanicException itself needs a real panic to construct."""
+
+    def panics():
+        raise FakePanic("boom")
+
+    assert outcome(panics) == ("raised", "FakePanic")
+
+
+@pytest.mark.parametrize("control_flow", [KeyboardInterrupt, SystemExit])
+def test_outcome_never_swallows_control_flow_exceptions(control_flow):
+    """Broadening to BaseException must not make Ctrl-C uninterruptible."""
+
+    def interrupted():
+        raise control_flow
+
+    with pytest.raises(control_flow):
+        outcome(interrupted)
 
 
 def test_csv_file_writes_bytes_and_cleans_up():

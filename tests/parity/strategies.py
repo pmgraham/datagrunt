@@ -25,6 +25,14 @@ EXTENSIONS = [".csv", ".tsv", ".TSV", ".txt"]
 # generated input must reach it.
 C0_WHITESPACE = ["\x1c", "\x1d", "\x1e", "\x1f"]
 
+# A NUL is a version-dependent seam, not just an odd byte: Python < 3.11's csv
+# module raises "line contains NUL" where the Rust csv crate reads it as
+# ordinary field content, which is why _compute_python._nul_safe_lines exists.
+# CI's compat matrix still includes 3.10, so the property layer has to be able
+# to combine a NUL with ragged/BOM/CRLF — corpus.py's static interior_nul.csv
+# covers the plain case only.
+NUL = "\x00"
+
 BOM = b"\xef\xbb\xbf"
 INVALID_UTF8 = b"\xe9\xff\xfe"
 
@@ -46,6 +54,7 @@ SEAM_LABELS = frozenset(
         "tsv-extension",
         "empty",
         "single-column",
+        "nul-byte",
     }
 )
 
@@ -85,6 +94,17 @@ def outcome(fn, *args):
     arrives as PanicException, a name the Python oracle can never produce, so
     any reachable panic becomes a parity failure with a minimized repro.
 
+    Catching BaseException is deliberate, and the clause order with it. PyO3
+    declares PanicException with PyBaseException as its base (pyo3/src/panic.rs:
+    "Like SystemExit, this exception is derived from BaseException so that it
+    will typically propagate all the way through the stack"), so an `except
+    Exception` clause would let a real panic straight through. Hypothesis's
+    failure_exceptions_to_catch() covers Exception, SystemExit and GeneratorExit
+    only, so an escaping panic reddens the suite *unshrunk* — no minimized
+    repro, which is the entire benefit above. Catching it here turns the panic
+    into an ordinary tuple mismatch, and Hypothesis shrinks that. Control-flow
+    exceptions are re-raised first so the broad clause cannot swallow them.
+
     OSError subclasses are normalized to the family name because PyO3 maps io
     errors to bare OSError while CPython raises specific subclasses; without
     this, every missing-file example would read as a false divergence.
@@ -92,9 +112,11 @@ def outcome(fn, *args):
     """
     try:
         return ("ok", fn(*args))
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except OSError:
         return ("raised", "OSError")
-    except Exception as exc:  # noqa: BLE001 - comparing behavior, not handling it
+    except BaseException as exc:  # noqa: BLE001 - comparing behavior, not handling it
         return ("raised", type(exc).__name__)
 
 
@@ -105,6 +127,18 @@ _TEXT = st.text(
     alphabet=st.characters(min_codepoint=32, max_codepoint=0x2FFF, exclude_categories=("Cs",)),
     max_size=12,
 )
+
+
+def _rare(draw) -> bool:
+    """A low-probability gate for one seam: two ANDed boolean draws, ~1 in 4.
+
+    Two rather than one so most examples stay plain and shrinking drops the
+    seam readily (Hypothesis shrinks each boolean toward False), and two rather
+    than three because ~1 in 8 is too rare at the ci profile's 100 examples —
+    `invalid-utf8` sat behind a third ANDed draw and went missing entirely on
+    seeds 4 and 8. Keep new seams at this gate unless you measure otherwise.
+    """
+    return draw(st.booleans()) and draw(st.booleans())
 
 
 @st.composite
@@ -127,15 +161,18 @@ def csv_bytes(draw) -> GeneratedCSV:
 
     def make_field() -> str:
         text = draw(_TEXT)
-        if draw(st.booleans()) and draw(st.booleans()):
+        if _rare(draw):
             text += draw(st.sampled_from(C0_WHITESPACE))
             seams.add("c0-controls")
-        if draw(st.booleans()) and draw(st.booleans()):
+        if _rare(draw):
+            text += NUL
+            seams.add("nul-byte")
+        if _rare(draw):
             text += delimiter
             seams.add("embedded-delimiter")
             text = f'"{text}"'
             seams.add("quoted")
-        elif draw(st.booleans()) and draw(st.booleans()):
+        elif _rare(draw):
             text = f'"{text}\n more"'
             seams.add("embedded-newline")
             seams.add("quoted")
@@ -154,11 +191,11 @@ def csv_bytes(draw) -> GeneratedCSV:
     lines.append(delimiter.join(header))
 
     for _ in range(n_rows):
-        if draw(st.booleans()) and draw(st.booleans()):
+        if _rare(draw):
             lines.append("")
             seams.add("blank-lines")
         width = n_fields
-        if draw(st.booleans()) and draw(st.booleans()):
+        if _rare(draw):
             width = draw(st.integers(min_value=1, max_value=n_fields + 2))
             if width != n_fields:
                 seams.add("ragged")
@@ -172,10 +209,10 @@ def csv_bytes(draw) -> GeneratedCSV:
 
     data = text.encode("utf-8")
 
-    if draw(st.booleans()) and draw(st.booleans()):
+    if _rare(draw):
         data = BOM + data
         seams.add("bom")
-    if draw(st.booleans()) and draw(st.booleans()) and draw(st.booleans()):
+    if _rare(draw):
         data += INVALID_UTF8
         seams.add("invalid-utf8")
     if not data:
