@@ -122,4 +122,29 @@ CORPUS: dict[str, bytes] = {
     # (e) Header with leading/trailing C0 separators: stripping must yield the
     #     same first_row / sample_rows as Python for both backends.
     "c0_leading_trailing_strip.csv": b"\x1cname,age\x1d\nalice,30\nbob,25\n",
+    # KNOWN DIVERGENCE (see #NNN), found by tests/parity/test_parity_property.py.
+    # A file whose bytes are non-empty but decode to the EMPTY string under
+    # errors="ignore", with no line terminator: every byte is dropped by the
+    # decoder, so there is no text left to form a line.
+    #   count_leading_physical_lines_before_header -> Rust 1, Python 0.
+    # Rust's universal_lines works on the byte stream and emits a final
+    # (now empty) line because bytes remained unterminated; CPython iterates
+    # DECODED text, which is "", so it yields no lines at all. Appending a
+    # terminator (b"\x80\n") makes both return 1, and b"\x80a" makes both
+    # return 1 — only the fully-dropped, unterminated case diverges.
+    "invalid_utf8_only_no_newline.csv": b"\x80",
+    # KNOWN DIVERGENCE (see #NNN), found by tests/parity/test_parity_property.py.
+    # sniff_dialect's own `delimiter` differs on characters where CPython's `\w`
+    # and the Rust regex crate's `\w` disagree, because the sniffer's delimiter
+    # class is `[^\w\n"']`:
+    #   - CPython `\w` is str.isalnum()-based, so it MATCHES category No
+    #     (U+00B2 '²', U+00BD '½', U+2460 '①') -> not a delimiter candidate.
+    #   - The regex crate's `\w` is [\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\p{Join_Control}],
+    #     which excludes No -> '²' IS a candidate and wins.
+    # Rust sniffs delimiter '²'; Python sniffs '"'. The reverse holds for marks
+    # (U+0301, category Mn): Python picks it, Rust does not.
+    # Every other sniffed field agrees, so the corpus dialect tests (which
+    # normalize through dialect_properties_from_rust and drop `delimiter`)
+    # cannot see this; the property suite compares the raw dicts.
+    "sniff_delimiter_word_class.csv": b'"\'"\'\n"\xc2\xb2\'"',
 }
