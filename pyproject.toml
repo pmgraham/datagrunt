@@ -42,7 +42,11 @@ pdf = [
 dev = [
     "pytest>=9.0.3",
     "pytest-cov>=7.1.0",
-    "ruff>=0.15.17",
+    # Upper-bounded deliberately: ruff's formatter output is a moving target by
+    # design (0.16 began formatting Python inside Markdown, #312), and CI gates
+    # on `ruff format --check`. Unbounded, a formatter release breaks CI on
+    # untouched code. Runtime deps stay unbounded (see #307); dev tools do not.
+    "ruff>=0.15.17,<0.17",
     "bumpver>=2026.1132",
     "maturin>=1.7,<2.0",
     "pre-commit>=4.0.0",
@@ -104,3 +108,8 @@ ignore = ["E203"]
 quote-style = "double"
 indent-style = "space"
 line-ending = "auto"
+# ruff 0.16 formats Python inside Markdown fences. Docs are hand-authored:
+# the README aligns trailing comments across example lines for readability,
+# which the formatter collapses. The gate exists to keep *source* consistent,
+# so it stops at source. See #312.
+exclude = ["*.md"]
