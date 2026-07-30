@@ -48,7 +48,7 @@ For any substantive change, follow this end-to-end. (Trivial 1–2 line fixes ma
 
 - **CSV compute:** `core/csv_io/_compute.py` dispatches `backend()` → `_native` (Rust) or `_compute_python` (oracle/toggle). Both expose the same function set (`infer_delimiter`, `sniff_dialect`, `probe_csv_header`, `leading_rows`, `first_row`, `count_leading_comments`, `row_count_with_header`, `check_ragged`, `normalize_columns`, …).
 - **CSV API:** `CSVReader`/`CSVWriter` share `csv_api/_engine_backed.py::_CSVEngineBacked` (cached `_engine` + optional `close()`/context-manager). Engines (`core/csv_io/engines.py`) share `_DuckDBBackedEngine`; DuckDB access via `core/databases/databases.py::DuckDBQueries`.
-- **PDF (pure Python):** `PDFReader`/`PDFWriter` share `pdf_api/_engine_backed.py::_PDFEngineBacked` (cached `_engine`). `core/pdf_io/pdfcomponents.py::DocumentAssembler.extract_page` does single-pass per-page extraction; backends under `core/pdf_io/extraction/` (pymupdf, pdfium, OCR, tables, layout). PDFium parallelism uses a process pool (per-page batching was investigated and declined — see issue #216).
+- **PDF (pure Python):** `PDFReader`/`PDFWriter` share `pdf_api/_engine_backed.py::_PDFEngineBacked` (cached `_engine`). `core/pdf_io/pdfcomponents.py::DocumentAssembler.parse_page` does single-pass per-page extraction; backends under `core/pdf_io/extraction/` (pymupdf, pdfium, OCR, tables, layout) expose `extract_page`, which `parse_page` calls. PDFium parallelism uses a process pool (per-page batching was investigated and declined — see issue #216).
 
 ---
 
