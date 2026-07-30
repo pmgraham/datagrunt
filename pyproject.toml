@@ -47,6 +47,9 @@ dev = [
     # on `ruff format --check`. Unbounded, a formatter release breaks CI on
     # untouched code. Runtime deps stay unbounded (see #307); dev tools do not.
     "ruff>=0.15.17,<0.17",
+    # Upper-bounded for the same reason as ruff (#312): a type checker's
+    # diagnostics are a moving target, and this gate is blocking.
+    "mypy>=1.14,<2.0",
     "bumpver>=2026.1132",
     "maturin>=1.7,<2.0",
     "pre-commit>=4.0.0",
@@ -113,3 +116,28 @@ line-ending = "auto"
 # which the formatter collapses. The gate exists to keep *source* consistent,
 # so it stops at source. See #312.
 exclude = ["*.md"]
+
+[tool.mypy]
+python_version = "3.10"
+files = [
+    "src/datagrunt/core/csv_io/_compute.py",
+    "src/datagrunt/core/csv_io/_compute_protocol.py",
+    "src/datagrunt/_native.pyi",
+]
+# Scoped deliberately. #314 tracks widening this to the public API surface;
+# checking the whole tree today would mean ~948 findings in one change.
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+# Listed explicitly rather than as `..._compute*`: mypy only accepts `*` as a
+# whole dotted component, and rejects a partial-component pattern with a
+# *warning* while still exiting 0 — a silently unenforced override. These are
+# the scoped modules above; `_compute_python` is excluded on purpose (the
+# oracle is unannotated, and annotating it is #314's job, not this gate's).
+[[tool.mypy.overrides]]
+module = [
+    "datagrunt._native",
+    "datagrunt.core.csv_io._compute",
+    "datagrunt.core.csv_io._compute_protocol",
+]
+disallow_untyped_defs = true

@@ -20,6 +20,7 @@ contexts, never to switch backends per-thread at runtime.
 
 import contextlib
 import os
+from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 from datagrunt import _native
@@ -36,14 +37,14 @@ if TYPE_CHECKING:
 _DISABLE_RUST = os.environ.get("DATAGRUNT_DISABLE_RUST", "") not in ("", "0", "false", "False")
 
 
-def set_disable_rust(value):
+def set_disable_rust(value: bool) -> None:
     """Force the pure-Python path (True) or Rust (False). Hidden test hook."""
     global _DISABLE_RUST
     _DISABLE_RUST = bool(value)
 
 
 @contextlib.contextmanager
-def rust_disabled():
+def rust_disabled() -> Iterator[None]:
     """Temporarily force the pure-Python path; restore the prior state on exit."""
     global _DISABLE_RUST
     previous = _DISABLE_RUST
