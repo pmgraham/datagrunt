@@ -42,7 +42,8 @@ pub(crate) fn py_strip(s: &str) -> &str {
 /// discarding empty leading/trailing fields. Mirrors `str::split_whitespace`
 /// but with Python's whitespace definition (see [`is_python_whitespace`]).
 pub(crate) fn py_split_whitespace(s: &str) -> impl Iterator<Item = &str> {
-    s.split(is_python_whitespace).filter(|field| !field.is_empty())
+    s.split(is_python_whitespace)
+        .filter(|field| !field.is_empty())
 }
 
 /// Python `errors="ignore"`: invalid byte sequences are dropped, not replaced.
@@ -113,7 +114,11 @@ fn decode_chunk_with_carry(bytes: &[u8], carry: &mut Vec<u8>) -> String {
 pub(crate) fn read_decoded(path: &Path) -> std::io::Result<String> {
     let mut bytes = Vec::new();
     File::open(path)?.read_to_end(&mut bytes)?;
-    let body = if bytes.starts_with(BOM) { &bytes[BOM.len()..] } else { &bytes[..] };
+    let body = if bytes.starts_with(BOM) {
+        &bytes[BOM.len()..]
+    } else {
+        &bytes[..]
+    };
     Ok(decode_ignore(body))
 }
 
@@ -634,10 +639,17 @@ pub(crate) fn is_blank(path: &Path) -> bool {
         return false;
     }
     let mut bytes = Vec::new();
-    if File::open(path).and_then(|mut f| f.read_to_end(&mut bytes)).is_err() {
+    if File::open(path)
+        .and_then(|mut f| f.read_to_end(&mut bytes))
+        .is_err()
+    {
         return false;
     }
-    let body = if bytes.starts_with(BOM) { &bytes[BOM.len()..] } else { &bytes[..] };
+    let body = if bytes.starts_with(BOM) {
+        &bytes[BOM.len()..]
+    } else {
+        &bytes[..]
+    };
     match std::str::from_utf8(body) {
         // `py_strip` matches Python's `str.strip()` whitespace set (incl. the
         // C0 separators), so an all-separator file reads as blank (issue #176).
@@ -676,7 +688,10 @@ mod tests {
         // but NOT to Rust's char::is_whitespace — the entire divergence set.
         for c in ['\u{1c}', '\u{1d}', '\u{1e}', '\u{1f}'] {
             assert!(is_python_whitespace(c), "{c:?} should be Python whitespace");
-            assert!(!c.is_whitespace(), "{c:?} is not Rust White_Space (precondition)");
+            assert!(
+                !c.is_whitespace(),
+                "{c:?} is not Rust White_Space (precondition)"
+            );
         }
         // Ordinary whitespace (incl. \xa0 NBSP, already shared) is unchanged.
         for c in [' ', '\t', '\n', '\r', '\u{0c}', '\u{a0}'] {
@@ -702,11 +717,20 @@ mod tests {
     #[test]
     fn py_split_whitespace_splits_on_c0_separators_like_python() {
         // Python: "a\x1cb\x1cc".split() == ["a", "b", "c"].
-        assert_eq!(py_split_whitespace("a\u{1c}b\u{1c}c").collect::<Vec<_>>(), ["a", "b", "c"]);
+        assert_eq!(
+            py_split_whitespace("a\u{1c}b\u{1c}c").collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
         // Mixed separators and ordinary whitespace collapse into one split.
-        assert_eq!(py_split_whitespace("a\u{1d} \tb").collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(
+            py_split_whitespace("a\u{1d} \tb").collect::<Vec<_>>(),
+            ["a", "b"]
+        );
         // Leading/trailing separators produce no empty fields.
-        assert_eq!(py_split_whitespace("\u{1f}a b\u{1c}").collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(
+            py_split_whitespace("\u{1f}a b\u{1c}").collect::<Vec<_>>(),
+            ["a", "b"]
+        );
         assert_eq!(py_split_whitespace("\u{1c}\u{1d}\u{1e}\u{1f}").count(), 0);
     }
 
@@ -777,7 +801,10 @@ mod tests {
     fn streaming_invalid_utf8_dropped() {
         // errors="ignore": the lone \xe9 is dropped per line.
         let f = tmp(b"Jos\xe9,NYC\nb\n", ".csv");
-        assert_eq!(read_universal_lines(f.path()).unwrap(), vec!["Jos,NYC", "b"]);
+        assert_eq!(
+            read_universal_lines(f.path()).unwrap(),
+            vec!["Jos,NYC", "b"]
+        );
     }
 
     #[test]
@@ -788,7 +815,9 @@ mod tests {
         let f = tmp(content, ".csv");
         let streamed = read_universal_lines(f.path()).unwrap();
         // Reference: old whole-file split implementation.
-        let text = decode_ignore(content).replace("\r\n", "\n").replace('\r', "\n");
+        let text = decode_ignore(content)
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
         let mut expected: Vec<String> = text.split('\n').map(str::to_string).collect();
         if text.ends_with('\n') {
             expected.pop();
@@ -847,7 +876,7 @@ mod tests {
         assert_eq!(drain(f.path(), false), "hello");
         // Partial BOM at offset 0 that is NOT a BOM must be emitted verbatim.
         let g = tmp(b"\xef\xbb", ".csv"); // 2 bytes: incomplete BOM, also invalid UTF-8
-        // errors="ignore" drops the incomplete tail at EOF, matching read_decoded.
+                                          // errors="ignore" drops the incomplete tail at EOF, matching read_decoded.
         assert_eq!(drain(g.path(), false), eager(g.path(), false));
         // A 2-byte valid-UTF8 non-BOM start must round-trip.
         let h = tmp(b"ab", ".csv");
@@ -944,9 +973,13 @@ mod tests {
     #[test]
     fn legacy_mac_detection() {
         assert!(is_legacy_mac_newlines(tmp(b"a,b\rc,d\r", ".csv").path()));
-        assert!(!is_legacy_mac_newlines(tmp(b"a,b\r\nc,d\r\n", ".csv").path()));
+        assert!(!is_legacy_mac_newlines(
+            tmp(b"a,b\r\nc,d\r\n", ".csv").path()
+        ));
         assert!(!is_legacy_mac_newlines(tmp(b"a,b\nc,d\n", ".csv").path()));
-        assert!(!is_legacy_mac_newlines(std::path::Path::new("/nonexistent/x.csv")));
+        assert!(!is_legacy_mac_newlines(std::path::Path::new(
+            "/nonexistent/x.csv"
+        )));
     }
 
     #[test]
@@ -957,8 +990,8 @@ mod tests {
         assert!(!is_blank(tmp(b"a", ".csv").path()));
         assert!(!is_blank(tmp(b"\xff\xfe", ".csv").path())); // invalid UTF-8 = content
         assert!(is_blank(tmp(b"\xef\xbb\xbf \n", ".csv").path())); // BOM + whitespace
-        // C0 separators are whitespace to Python's strip, so an all-separator
-        // file is blank (issue #176) — matching BlankFile.is_blank.
+                                                                   // C0 separators are whitespace to Python's strip, so an all-separator
+                                                                   // file is blank (issue #176) — matching BlankFile.is_blank.
         assert!(is_blank(tmp(b"\x1c\x1d\x1e\x1f\n", ".csv").path()));
         assert!(is_tsv(std::path::Path::new("x.tsv")));
         assert!(is_tsv(std::path::Path::new("x.TSV")));
@@ -996,13 +1029,20 @@ mod tests {
         content.extend_from_slice(b"\nnext_line\n");
         let f = tmp(&content, ".csv");
         let lines = read_universal_lines(f.path()).unwrap();
-        assert_eq!(lines.len(), 2, "should yield the giant line and the next line");
+        assert_eq!(
+            lines.len(),
+            2,
+            "should yield the giant line and the next line"
+        );
         assert_eq!(
             lines[0].chars().count(),
             MAX_LINE_CHARS,
             "giant line capped at MAX_LINE_CHARS"
         );
-        assert_eq!(lines[1], "next_line", "second line must read correctly after cap");
+        assert_eq!(
+            lines[1], "next_line",
+            "second line must read correctly after cap"
+        );
     }
 
     /// Giant line terminated by '\r\n' must be capped and the '\r\n' counted

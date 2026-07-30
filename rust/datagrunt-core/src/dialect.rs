@@ -81,10 +81,7 @@ const QUOTE_PATTERNS: [(&str, bool); 4] = [
         r#"(?sm)(?P<delim>[^\w\n"'])(?P<space> ?)(?P<quote>["']).*?\k<quote>(?:$|\n)"#,
         true,
     ),
-    (
-        r#"(?sm)(?:^|\n)(?P<quote>["']).*?\k<quote>(?:$|\n)"#,
-        false,
-    ),
+    (r#"(?sm)(?:^|\n)(?P<quote>["']).*?\k<quote>(?:$|\n)"#, false),
 ];
 
 /// Compiled forms of QUOTE_PATTERNS. Initialized once; avoids per-call `Regex::new`.
@@ -257,7 +254,10 @@ fn guess_delimiter(data: &str, delimiters: Option<&str>) -> (String, bool) {
                     Some((_, meta)) => meta,
                     None => {
                         char_frequency.push((ch, Vec::new()));
-                        &mut char_frequency.last_mut().expect("just pushed, cannot be empty").1
+                        &mut char_frequency
+                            .last_mut()
+                            .expect("just pushed, cannot be empty")
+                            .1
                     }
                 };
                 match meta.iter_mut().find(|(f, _)| *f == freq) {
@@ -352,14 +352,15 @@ fn guess_delimiter(data: &str, delimiters: Option<&str>) -> (String, bool) {
     // Otherwise pick the dominant char: Python builds `[(v, k) ...]`, sorts, and
     // takes the LAST. v is the (freq, adjusted) tuple, so the sort key is
     // ((freq, adjusted), char); the maximum such tuple wins.
-    let mut items: Vec<(usize, i64, char)> =
-        delims.iter().map(|(k, v)| (v.freq, v.adjusted, *k)).collect();
-    items.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then(a.1.cmp(&b.1))
-            .then(a.2.cmp(&b.2))
-    });
-    let delim = items.last().expect("delims non-empty after preference scan").2;
+    let mut items: Vec<(usize, i64, char)> = delims
+        .iter()
+        .map(|(k, v)| (v.freq, v.adjusted, *k))
+        .collect();
+    items.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    let delim = items
+        .last()
+        .expect("delims non-empty after preference scan")
+        .2;
     let sis = skipinitialspace_for(lines[0], delim);
     (delim.to_string(), sis)
 }
@@ -369,21 +370,19 @@ fn guess_delimiter(data: &str, delimiters: Option<&str>) -> (String, bool) {
 pub fn sniff(sample: &str, delimiters: Option<&str>) -> Option<SniffedDialect> {
     let quote_guess = guess_quote_and_delimiter(sample, delimiters);
 
-    let (delimiter, doublequote, mut quotechar, skipinitialspace) = if quote_guess
-        .delimiter
-        .is_empty()
-    {
-        // Quote guess could not determine a delimiter; fall back to frequency.
-        let (delim, sis) = guess_delimiter(sample, delimiters);
-        (delim, quote_guess.doublequote, quote_guess.quotechar, sis)
-    } else {
-        (
-            quote_guess.delimiter,
-            quote_guess.doublequote,
-            quote_guess.quotechar,
-            quote_guess.skipinitialspace,
-        )
-    };
+    let (delimiter, doublequote, mut quotechar, skipinitialspace) =
+        if quote_guess.delimiter.is_empty() {
+            // Quote guess could not determine a delimiter; fall back to frequency.
+            let (delim, sis) = guess_delimiter(sample, delimiters);
+            (delim, quote_guess.doublequote, quote_guess.quotechar, sis)
+        } else {
+            (
+                quote_guess.delimiter,
+                quote_guess.doublequote,
+                quote_guess.quotechar,
+                quote_guess.skipinitialspace,
+            )
+        };
 
     if delimiter.is_empty() {
         return None;

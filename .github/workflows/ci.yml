@@ -47,6 +47,12 @@ jobs:
           CARGO_NET_RETRY: "10"
         run: cargo clippy --all-targets -- -D warnings
 
+      # The Rust counterpart to the `ruff format --check` gate below. rustfmt
+      # needs no dependency resolution, so no CARGO_NET_RETRY here.
+      - name: cargo fmt check (blocking)
+        working-directory: rust
+        run: cargo fmt --check
+
       - name: pytest (Rust backend)
         run: .venv/bin/pytest tests/ -q
 
