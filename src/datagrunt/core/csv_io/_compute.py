@@ -20,21 +20,31 @@ contexts, never to switch backends per-thread at runtime.
 
 import contextlib
 import os
+from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 from datagrunt import _native
 from datagrunt.core.csv_io import _compute_python
+from datagrunt.core.csv_io._compute_protocol import ComputeBackendProtocol
+
+if TYPE_CHECKING:
+    # Assigning each backend module to a Protocol-typed name makes mypy verify
+    # both satisfy the contract. Drift in either is reported here, at edit time,
+    # naming the offending member — rather than as a parity-suite failure later.
+    _python_backend: ComputeBackendProtocol = _compute_python
+    _rust_backend: ComputeBackendProtocol = _native
 
 _DISABLE_RUST = os.environ.get("DATAGRUNT_DISABLE_RUST", "") not in ("", "0", "false", "False")
 
 
-def set_disable_rust(value):
+def set_disable_rust(value: bool) -> None:
     """Force the pure-Python path (True) or Rust (False). Hidden test hook."""
     global _DISABLE_RUST
     _DISABLE_RUST = bool(value)
 
 
 @contextlib.contextmanager
-def rust_disabled():
+def rust_disabled() -> Iterator[None]:
     """Temporarily force the pure-Python path; restore the prior state on exit."""
     global _DISABLE_RUST
     previous = _DISABLE_RUST
@@ -45,6 +55,6 @@ def rust_disabled():
         _DISABLE_RUST = previous
 
 
-def backend():
+def backend() -> ComputeBackendProtocol:
     """Return the active compute backend module (read at call time)."""
     return _compute_python if _DISABLE_RUST else _native

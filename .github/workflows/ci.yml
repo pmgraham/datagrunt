@@ -67,6 +67,11 @@ jobs:
       - name: ruff format check (blocking)
         run: .venv/bin/ruff format --check .
 
+      # Scoped to the compute-backend contract (files listed under [tool.mypy]),
+      # not the whole tree. #314 tracks widening it.
+      - name: "mypy (blocking — scoped, see #314)" # quoted: bare `#` starts a YAML comment
+        run: .venv/bin/mypy
+
   python-compat:
     # The main test job covers 3.12; this proves the rest of the advertised
     # range (requires-python >= 3.10, classifiers through 3.14). The native
