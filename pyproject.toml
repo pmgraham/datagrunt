@@ -54,6 +54,11 @@ dev = [
     "bumpver>=2026.1132",
     "maturin>=1.7,<2.0",
     "pre-commit>=4.0.0",
+    # Bounded at the major only, unlike ruff (#312) and mypy (#314): Hypothesis
+    # is a library whose API is stable across 6.x, not a linter that adds
+    # default-on failures in minor releases. A 6.x bump cannot redden this gate
+    # on untouched code the way a formatter or type-checker release can.
+    "hypothesis>=6.164.0,<7.0",
 ]
 
 [project.urls]
@@ -89,10 +94,11 @@ testpaths = "tests"
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
-addopts = "-v --cov=src/datagrunt --cov-report=term-missing -m 'not corpus'"
+addopts = "-v --cov=src/datagrunt --cov-report=term-missing -m 'not corpus and not deep'"
 pythonpath = "."
 markers = [
     "corpus: slow, local-only cross-engine tests over the data/pdfs corpus (deselected by default; run with -m corpus)",
+    "deep: long property searches; run by the scheduled job, deselected by default",
 ]
 
 [tool.ruff]
