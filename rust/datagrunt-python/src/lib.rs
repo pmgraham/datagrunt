@@ -97,19 +97,21 @@ fn sniff_dialect(
     // Python threads make progress during the scan (issue #177); the GIL is
     // reacquired only to build the result dict.
     let sniffed = py
-        .detach(|| -> std::io::Result<Option<datagrunt_core::dialect::SniffedDialect>> {
-            let probe = datagrunt_core::rows::probe_csv_header(&path)?;
-            if probe.empty || probe.blank {
-                return Ok(None);
-            }
-            let sample = probe.sample_lines.join("");
-            // An empty delimiter string is Python-falsy (`if delimiter:`), meaning
-            // "no restriction" — normalize it to None so it doesn't reject every
-            // candidate (Some("") would make the substring guard `"".contains(x)`
-            // reject all).
-            let delimiter = delimiter.as_deref().filter(|s| !s.is_empty());
-            Ok(datagrunt_core::dialect::sniff(&sample, delimiter))
-        })
+        .detach(
+            || -> std::io::Result<Option<datagrunt_core::dialect::SniffedDialect>> {
+                let probe = datagrunt_core::rows::probe_csv_header(&path)?;
+                if probe.empty || probe.blank {
+                    return Ok(None);
+                }
+                let sample = probe.sample_lines.join("");
+                // An empty delimiter string is Python-falsy (`if delimiter:`), meaning
+                // "no restriction" — normalize it to None so it doesn't reject every
+                // candidate (Some("") would make the substring guard `"".contains(x)`
+                // reject all).
+                let delimiter = delimiter.as_deref().filter(|s| !s.is_empty());
+                Ok(datagrunt_core::dialect::sniff(&sample, delimiter))
+            },
+        )
         .map_err(oserr)?;
     let Some(d) = sniffed else {
         return Ok(None);
@@ -149,7 +151,10 @@ fn datagrunt_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(leading_rows, m)?)?;
     m.add_function(wrap_pyfunction!(first_row, m)?)?;
     m.add_function(wrap_pyfunction!(count_leading_comments, m)?)?;
-    m.add_function(wrap_pyfunction!(count_leading_physical_lines_before_header, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        count_leading_physical_lines_before_header,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(normalize_columns, m)?)?;
     m.add_function(wrap_pyfunction!(infer_delimiter, m)?)?;
     m.add_function(wrap_pyfunction!(row_count_with_header, m)?)?;

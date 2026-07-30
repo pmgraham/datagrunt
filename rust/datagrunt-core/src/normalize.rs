@@ -61,8 +61,14 @@ mod tests {
 
     #[test]
     fn basic_and_collisions() {
-        assert_eq!(norm(&["First Name", "LAST-NAME"]), vec!["first_name", "last_name"]);
-        assert_eq!(norm(&["col_a", "col_a", "col_a_1"]), vec!["col_a", "col_a_1", "col_a_1_1"]);
+        assert_eq!(
+            norm(&["First Name", "LAST-NAME"]),
+            vec!["first_name", "last_name"]
+        );
+        assert_eq!(
+            norm(&["col_a", "col_a", "col_a_1"]),
+            vec!["col_a", "col_a_1", "col_a_1_1"]
+        );
         assert_eq!(norm(&["%", "()"]), vec!["column", "column_1"]);
         assert_eq!(norm(&["123abc"]), vec!["_123abc"]);
     }

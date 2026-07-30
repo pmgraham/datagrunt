@@ -100,7 +100,10 @@ mod tests {
     #[test]
     fn candidate_ordering_is_count_desc_then_first_seen() {
         // '.' seen first, ';' same count -> '.' first; ':' more frequent -> first overall
-        assert_eq!(candidates_most_common_first("a.b;c.d;e:f:g:h"), vec![':', '.', ';']);
+        assert_eq!(
+            candidates_most_common_first("a.b;c.d;e:f:g:h"),
+            vec![':', '.', ';']
+        );
     }
 
     #[test]

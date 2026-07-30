@@ -164,7 +164,10 @@ pub fn leading_rows(path: &Path, limit: usize) -> std::io::Result<Vec<String>> {
 
 /// CSVRows.first_row: first non-comment row stripped, or "".
 pub fn first_row(path: &Path) -> std::io::Result<String> {
-    Ok(leading_rows(path, 1)?.into_iter().next().unwrap_or_default())
+    Ok(leading_rows(path, 1)?
+        .into_iter()
+        .next()
+        .unwrap_or_default())
 }
 
 /// _count_leading_comments: '#' lines before the header; blanks skipped.
