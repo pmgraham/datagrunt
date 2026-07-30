@@ -41,6 +41,11 @@ class SniffedDialect(TypedDict):
     quoting: int
 
 
+# Deliberately not @runtime_checkable, unlike protocol.py's Protocols: that
+# decorator only enables isinstance() checks, which do not apply here since
+# a backend is a module, not an instance — and isinstance() against a
+# Protocol checks member presence, not signatures, which is what this
+# contract actually needs mypy to verify structurally.
 class ComputeBackendProtocol(Protocol):
     """Structural interface every CSV compute backend must satisfy."""
 

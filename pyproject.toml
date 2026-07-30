@@ -47,9 +47,10 @@ dev = [
     # on `ruff format --check`. Unbounded, a formatter release breaks CI on
     # untouched code. Runtime deps stay unbounded (see #307); dev tools do not.
     "ruff>=0.15.17,<0.17",
-    # Upper-bounded for the same reason as ruff (#312): a type checker's
-    # diagnostics are a moving target, and this gate is blocking.
-    "mypy>=1.14,<2.0",
+    # Upper-bounded the same way as ruff (#312): allow the current minor,
+    # exclude the next. mypy adds default-on error codes in 1.x minor
+    # releases, and this gate is blocking.
+    "mypy>=1.14,<1.21",
     "bumpver>=2026.1132",
     "maturin>=1.7,<2.0",
     "pre-commit>=4.0.0",
@@ -119,13 +120,15 @@ exclude = ["*.md"]
 
 [tool.mypy]
 python_version = "3.10"
+mypy_path = "src"
+# Scoped deliberately. #314 tracks widening this to the public API surface;
+# checking the whole tree today surfaces 42 mypy errors (13 import-untyped
+# for third-party libs without stubs, 29 substantive) in one change.
 files = [
     "src/datagrunt/core/csv_io/_compute.py",
     "src/datagrunt/core/csv_io/_compute_protocol.py",
     "src/datagrunt/_native.pyi",
 ]
-# Scoped deliberately. #314 tracks widening this to the public API surface;
-# checking the whole tree today would mean ~948 findings in one change.
 warn_unused_ignores = true
 warn_redundant_casts = true
 

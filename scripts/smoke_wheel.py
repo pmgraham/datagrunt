@@ -10,6 +10,9 @@ import datagrunt
 from datagrunt import _native  # the bundled Rust binary must import
 from datagrunt.core.csv_io import _compute, _compute_python
 
+stub_path = pathlib.Path(datagrunt.__file__).parent / "_native.pyi"
+assert stub_path.is_file(), f"_native.pyi stub missing from installed package: {stub_path}"
+
 csv_path = pathlib.Path(tempfile.mkdtemp()) / "smoke.csv"
 csv_path.write_text("a,b,c\n1,2,3\n4,5,6\n")
 
@@ -25,4 +28,4 @@ with _compute.rust_disabled():
     assert py_result == rust_result, f"python path != rust path: {py_result} vs {rust_result}"
 assert _compute.backend() is _native, "context manager did not restore Rust"
 
-print(f"smoke OK on {datagrunt.__version__}: {rust_result}; toggle verified")
+print(f"smoke OK on {datagrunt.__version__}: {rust_result}; toggle verified; stub present")
