@@ -105,6 +105,11 @@ def leading_rows(filepath: StrPath, limit: int) -> list[str]:
     """Up to ``limit`` leading non-blank, non-comment rows, each stripped."""
     rows: list[str] = []
     with open(filepath, "r", encoding=FileProperties(filepath).DEFAULT_ENCODING, errors="ignore") as f:
+        # A non-positive limit asks for nothing. The check sits inside the
+        # `with` so an unreadable path still raises here, exactly as it does
+        # for every other limit (issue #325).
+        if limit <= 0:
+            return rows
         for line in _capped_lines(f):
             stripped = line.strip()
             if stripped and not stripped.startswith("#"):

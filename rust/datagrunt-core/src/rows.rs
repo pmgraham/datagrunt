@@ -149,7 +149,14 @@ pub fn probe_csv_header(path: &Path) -> std::io::Result<HeaderProbe> {
 /// each stripped. Streams the file and stops once `limit` rows are found.
 pub fn leading_rows(path: &Path, limit: usize) -> std::io::Result<Vec<String>> {
     let mut rows = Vec::new();
-    for line in universal_lines(path)? {
+    let lines = universal_lines(path)?;
+    // A zero limit asks for nothing. The check sits after the open so an
+    // unreadable path still errors here, exactly as it does for every other
+    // limit (issue #325).
+    if limit == 0 {
+        return Ok(rows);
+    }
+    for line in lines {
         let line = line?;
         let stripped = py_strip(&line);
         if !stripped.is_empty() && !stripped.starts_with('#') {
@@ -324,6 +331,26 @@ mod tests {
         assert_eq!(p.sample_rows[0], "name,age");
         // sample_lines include trailing \n to match Python text-mode
         assert_eq!(p.sample_lines[0], "name,age\n");
+    }
+
+    /// Regression (issue #325): the cap was checked after the append, so a
+    /// zero limit yielded one row. Mirrors the Python oracle's own guard.
+    #[test]
+    fn leading_rows_limit_zero_returns_nothing() {
+        let f = tmp(b"a\nb\n");
+        assert!(leading_rows(f.path(), 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn leading_rows_honors_its_cap() {
+        let f = tmp(b"a\nb\nc\n");
+        assert_eq!(leading_rows(f.path(), 2).unwrap(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn leading_rows_limit_zero_still_reports_a_bad_path() {
+        // Asking for nothing must not turn a bad path into a silent empty result.
+        assert!(leading_rows(Path::new("/no/such/datagrunt-325.csv"), 0).is_err());
     }
 
     #[test]
