@@ -35,7 +35,7 @@ For any substantive change, follow this end-to-end. (Trivial 1–2 line fixes ma
 - When Rust changed: `cd rust && cargo test`, plus the differential parity suite `uv run pytest tests/parity/ -q` (Rust == Python over the corpus)
 - `ruff check src/datagrunt/core/csv_io` (CI gates on this; check the broader tree too)
 - `ruff format --check .` (CI gates on this, blocking)
-- `mypy` (CI gates on this, blocking; scoped to the compute-backend contract — see #314)
+- `mypy` (CI gates on this, blocking; scoped to the compute-backend contract — see #314) plus `stubtest` for `_native.pyi` signature drift (blocking)
 - After Rust changes, **rebuild the extension** so tests see it: `uv pip install -e ".[dev,pdf]"` (or `maturin develop`)
 
 ### Hygiene
