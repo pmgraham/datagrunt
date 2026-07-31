@@ -677,3 +677,61 @@ class TestPDFWriterRenderPagesAsImages:
         writer = PDFWriter(parsed)
         with pytest.raises(ValueError):
             writer.render_pages_as_images(output_dir=str(tmp_path / "nope"))
+
+
+class TestRenderDpiConfig:
+    """dpi=None resolution precedence: explicit dpi= > constructor render_dpi= > 300.
+
+    sample_pdf is a 612x792pt (US Letter) single page, so the rendered image's
+    pixel width is exactly ``round(612 * dpi / 72)`` -- used to prove which DPI
+    actually drove the render, rather than just asserting a path exists.
+    """
+
+    def test_render_default_comes_from_config(self, sample_pdf, tmp_path):
+        """No explicit dpi= falls back to the constructor's render_dpi (pdfium)."""
+        from PIL import Image
+
+        out = tmp_path / "config_default"
+        writer = PDFWriter(sample_pdf, render_dpi=72)
+        paths = writer.render_pages_as_images(output_dir=str(out))
+        with Image.open(paths[0]) as img:
+            assert img.width == round(612 * 72 / 72)
+
+    def test_explicit_dpi_beats_config(self, sample_pdf, tmp_path):
+        """An explicit dpi= argument always wins over the constructor's render_dpi (pdfium)."""
+        from PIL import Image
+
+        out = tmp_path / "explicit_wins"
+        writer = PDFWriter(sample_pdf, render_dpi=72)
+        paths = writer.render_pages_as_images(output_dir=str(out), dpi=144)
+        with Image.open(paths[0]) as img:
+            assert img.width == round(612 * 144 / 72)
+
+    def test_no_kwargs_preserves_300_default(self, sample_pdf, tmp_path):
+        """No render_dpi config and no explicit dpi= still renders at 300 (pdfium)."""
+        from PIL import Image
+
+        out = tmp_path / "no_kwargs_default"
+        paths = PDFWriter(sample_pdf).render_pages_as_images(output_dir=str(out))
+        with Image.open(paths[0]) as img:
+            assert img.width == round(612 * 300 / 72)
+
+    def test_render_default_comes_from_config_pymupdf(self, sample_pdf, tmp_path):
+        """No explicit dpi= falls back to the constructor's render_dpi (pymupdf)."""
+        from PIL import Image
+
+        out = tmp_path / "config_default_pymupdf"
+        writer = PDFWriter(sample_pdf, engine="pymupdf", render_dpi=72)
+        paths = writer.render_pages_as_images(output_dir=str(out))
+        with Image.open(paths[0]) as img:
+            assert img.width == round(612 * 72 / 72)
+
+    def test_no_kwargs_preserves_300_default_pymupdf(self, sample_pdf, tmp_path):
+        """No render_dpi config and no explicit dpi= still renders at 300 (pymupdf)."""
+        from PIL import Image
+
+        out = tmp_path / "no_kwargs_default_pymupdf"
+        writer = PDFWriter(sample_pdf, engine="pymupdf")
+        paths = writer.render_pages_as_images(output_dir=str(out))
+        with Image.open(paths[0]) as img:
+            assert img.width == round(612 * 300 / 72)

@@ -494,8 +494,18 @@ class PDFBaseWriterEngine(ABC):
             pdfcomponents.dedupe_document_images(document, directory)
         return pdfcomponents.collect_image_paths(document)
 
+    def _resolve_dpi(self, dpi: Optional[int]) -> int:
+        """Resolve the effective render DPI for a ``render_pages_as_images`` call.
+
+        An explicit ``dpi`` argument always wins; ``None`` falls back to the
+        ``render_dpi`` extraction-config default (300 unless overridden).
+        Shared here so both writer engines apply the identical precedence
+        rule from one place rather than each re-deriving it.
+        """
+        return dpi if dpi is not None else self.extraction_config.render_dpi
+
     @abstractmethod
-    def render_pages_as_images(self, output_dir=None, dpi=300, image_format="png") -> list:
+    def render_pages_as_images(self, output_dir=None, dpi=None, image_format="png") -> list:
         """Render each page of the PDF as an image and save to disk."""
         pass
 
@@ -510,8 +520,10 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
             )
         return self._reader_engine
 
-    def render_pages_as_images(self, output_dir=None, dpi=300, image_format="png") -> list:
+    def render_pages_as_images(self, output_dir=None, dpi=None, image_format="png") -> list:
         from datagrunt.core.pdf_io.extraction.pymupdf_backend import _import_pymupdf
+
+        dpi = self._resolve_dpi(dpi)
 
         if self.workers > 1:
             logger.warning(
@@ -567,7 +579,8 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
             )
         return self._reader_engine
 
-    def render_pages_as_images(self, output_dir=None, dpi=300, image_format="png") -> list:
+    def render_pages_as_images(self, output_dir=None, dpi=None, image_format="png") -> list:
+        dpi = self._resolve_dpi(dpi)
         # Validate the format before any filesystem side effects (fail fast).
         ext, pil_format = _normalize_image_format(image_format)
         directory = Path(output_dir if output_dir else "page_images")
