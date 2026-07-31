@@ -14,6 +14,9 @@ class PDFWriter(_PDFEngineBacked):
 
     Pass ``min_image_dimension`` (keyword-only) to control the minimum embedded
     image pixel size kept during extraction (default 40; 0 keeps everything).
+    Pass ``ocr_standard_dpi`` / ``ocr_large_format_dpi`` / ``ocr_large_format_dimension``
+    (keyword-only) to control the OCR render DPI policy, and ``render_dpi``
+    (keyword-only) to control the default page-rendering DPI.
     """
 
     _engine_role = "writer"
@@ -138,12 +141,14 @@ class PDFWriter(_PDFEngineBacked):
             return []
         return self._engine.extract_images(output_dir, dedupe)
 
-    def render_pages_as_images(self, output_dir=None, dpi=300, image_format="png"):
+    def render_pages_as_images(self, output_dir=None, dpi=None, image_format="png"):
         """Render each page of the PDF as an image and save to disk.
 
         Args:
             output_dir (optional, str): Output directory; defaults to page_images.
-            dpi (int, default 300): The resolution in DPI to render the pages.
+            dpi (optional, int): The resolution in DPI to render the pages.
+                None (default) uses the `render_dpi` configuration (300 unless
+                overridden).
             image_format (str, default 'png'): The image format to save. One of
                 'png', 'jpg', or 'jpeg' (case-insensitive); other values raise
                 ValueError.

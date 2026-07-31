@@ -237,6 +237,36 @@ def scanned_pdf(tmp_path):
 
 
 @pytest.fixture
+def multipage_scanned_pdf(tmp_path):
+    """Create a 2-page PDF whose pages are each a rendered-text image.
+
+    Mirrors ``scanned_pdf`` (no extractable text layer, only OCR can recover
+    the words) but with two pages, so a ``workers>1`` process pool actually
+    splits OCR work across page workers instead of falling back to the
+    single-page sequential path.
+    """
+    import pymupdf
+
+    doc = pymupdf.open()
+    for n in (1, 2):
+        src = pymupdf.open()
+        src_page = src.new_page(width=612, height=792)
+        src_page.insert_text((72, 100), f"HELLO WORLD {n}", fontsize=48)
+        pix = src_page.get_pixmap(dpi=150)
+        src.close()
+
+        img_path = tmp_path / f"_scan_{n}.png"
+        pix.save(str(img_path))
+
+        page = doc.new_page(width=612, height=792)
+        page.insert_image(pymupdf.Rect(0, 0, 612, 792), filename=str(img_path))
+    pdf_path = tmp_path / "multipage_scanned.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+    return str(pdf_path)
+
+
+@pytest.fixture
 def multipage_pdf(tmp_path):
     """Create a 3-page PDF with distinct, identifiable text on each page."""
     import pymupdf

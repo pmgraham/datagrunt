@@ -1,17 +1,17 @@
 """Shared OCR: render-agnostic Tesseract block construction."""
 
+from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
 from datagrunt.core.pdf_io.extraction.shapes import BBox, OcrBlock
 
-# Dynamic DPI scaling thresholds for scanned (OCR) pages.
-LARGE_FORMAT_DIMENSION = 1500
-LARGE_FORMAT_DPI = 75
-STANDARD_DPI = 150
 
-
-def dpi_for_page(width: float, height: float) -> int:
+def dpi_for_page(width: float, height: float, config: "_PDFExtractionConfig | None" = None) -> int:
     """Return the OCR render DPI for a page of the given size (points)."""
-    is_large = width > LARGE_FORMAT_DIMENSION or height > LARGE_FORMAT_DIMENSION
-    return LARGE_FORMAT_DPI if is_large else STANDARD_DPI
+    # No config -> module defaults, which are the historical STANDARD_DPI /
+    # LARGE_FORMAT_DPI / LARGE_FORMAT_DIMENSION constants (now defined once in
+    # config.py) — so behavior is unchanged for existing no-config callers.
+    cfg = config if config is not None else _PDFExtractionConfig()
+    is_large = width > cfg.ocr_large_format_dimension or height > cfg.ocr_large_format_dimension
+    return cfg.ocr_large_format_dpi if is_large else cfg.ocr_standard_dpi
 
 
 def _import_ocr_deps():

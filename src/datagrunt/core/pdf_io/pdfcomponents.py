@@ -87,7 +87,9 @@ class DocumentAssembler:
                         elements.append(self._text_element(block, gen_elem_id(), page_index))
             elif analysis.is_scanned:
                 try:
-                    ocr_blocks = self.backend.ocr_page(page_index, dpi=dpi_for_page(analysis.width, analysis.height))
+                    ocr_blocks = self.backend.ocr_page(
+                        page_index, dpi=dpi_for_page(analysis.width, analysis.height, self._extraction_config)
+                    )
                 except Exception as exc:  # noqa: BLE001 - soft per-category failure
                     # OCR failed (e.g. missing tesseract). Keep the page with its
                     # already-extracted images/tables rather than dropping it, and

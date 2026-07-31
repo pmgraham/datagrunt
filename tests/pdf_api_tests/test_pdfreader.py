@@ -394,3 +394,55 @@ class TestPDFReaderMinImageDimension:
     def test_min_image_dimension_is_keyword_only(self, small_image_pdf):
         with pytest.raises(TypeError):
             PDFReader(small_image_pdf, "pdfium", 1, False, 10)  # 5th positional rejected
+
+
+class TestPDFReaderOcrDpiKwargs:
+    """Tests for the keyword-only OCR/render DPI parameters on PDFReader (issue #246)."""
+
+    @pytest.mark.parametrize(
+        "kwarg,value",
+        [
+            ("ocr_standard_dpi", 300),
+            ("ocr_large_format_dpi", 400),
+            ("ocr_large_format_dimension", 2000),
+            ("render_dpi", 600),
+        ],
+    )
+    def test_kwarg_reaches_engine_config(self, sample_pdf, kwarg, value):
+        reader = PDFReader(sample_pdf, **{kwarg: value})
+        assert getattr(reader._engine.extraction_config, kwarg) == value
+
+    def test_invalid_ocr_standard_dpi_raises_at_construction(self, sample_pdf):
+        with pytest.raises(ValueError):
+            PDFReader(sample_pdf, ocr_standard_dpi=0)
+
+    def test_ocr_dpi_kwargs_are_keyword_only(self, sample_pdf):
+        with pytest.raises(TypeError):
+            PDFReader(sample_pdf, "pdfium", 1, False, 300)  # 5th positional rejected
+
+
+class TestPDFReaderOcrDpiProcessPool:
+    """workers>1 uses a ProcessPoolExecutor; the OCR DPI config must survive pickling."""
+
+    def test_default_dpi_finds_text_across_process_pool(self, multipage_scanned_pdf, tesseract_available):
+        if not tesseract_available:
+            pytest.skip("tesseract not available")
+        reader = PDFReader(multipage_scanned_pdf, engine="pdfium", native=True, workers=2)
+        doc = reader.to_dicts()
+        pages = doc["document"]["pages"]
+        assert len(pages) == 2
+        assert all(page["ocr"] is True for page in pages)
+
+    def test_low_dpi_prevents_ocr_recognition_across_process_pool(self, multipage_scanned_pdf, tesseract_available):
+        if not tesseract_available:
+            pytest.skip("tesseract not available")
+        # Rendering this low makes each page's raster far too small for
+        # tesseract to recognize any characters (see the sibling default-dpi
+        # test above for the "it normally reads fine" baseline), so both
+        # pages coming back with ocr=False only happens if the override
+        # reached the worker processes.
+        reader = PDFReader(multipage_scanned_pdf, engine="pdfium", native=True, workers=2, ocr_standard_dpi=5)
+        doc = reader.to_dicts()
+        pages = doc["document"]["pages"]
+        assert len(pages) == 2
+        assert all(page["ocr"] is False for page in pages)
