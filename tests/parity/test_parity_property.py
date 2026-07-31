@@ -54,15 +54,15 @@ def test_leading_rows_agrees(gen, limit):
     strict=True,
     reason=(
         "sniff_dialect's delimiter class is [^\\w\\n\"'], and CPython's \\w (str.isalnum()-based) "
-        "disagrees with the Rust regex crate's \\w on category No (U+00B2) and on marks (U+0301), "
-        "so the two sniff different delimiters. Corpus case sniff_delimiter_word_class.csv. See #NNN"
+        "disagrees with fancy-regex's \\w on category No (U+00B2) and on marks (U+0301), so the "
+        "two sniff different delimiters. Corpus case sniff_delimiter_word_class.csv. See #318"
     ),
 )
 @example(
     # The minimized falsifying example, pinned so this fails at every profile
     # rather than only where the search happens to reach it (it was found at the
     # deep profile, not at ci's 100 examples). Keep as a regression case once
-    # #NNN is fixed and the xfail comes off.
+    # #318 is fixed and the xfail comes off.
     gen=GeneratedCSV(
         data=b'"\'"\'\n"\xc2\xb2\'"',
         suffix=".csv",
@@ -112,13 +112,13 @@ def test_normalize_columns_agrees(names):
         "count_leading_physical_lines_before_header diverges on bytes that decode to '' under "
         "errors='ignore' with no line terminator (b'\\x80'): Rust counts a final empty line (1), "
         "CPython iterates decoded text and yields none (0). Corpus case "
-        "invalid_utf8_only_no_newline.csv. See #NNN"
+        "invalid_utf8_only_no_newline.csv. See #317"
     ),
 )
 @example(
     # The minimized falsifying example, pinned so the failure does not depend on
     # the search reaching it under a given profile or Hypothesis version. Keep as
-    # a regression case once #NNN is fixed and the xfail comes off.
+    # a regression case once #317 is fixed and the xfail comes off.
     data=b"\x80",
     fn_name="count_leading_physical_lines_before_header",
 )

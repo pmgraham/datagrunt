@@ -9,7 +9,7 @@ from datagrunt.core.csv_io import _compute_python as py
 COUNT_LEADING_PHYSICAL_LINES_DIVERGENCES = {
     "invalid_utf8_only_no_newline.csv": (
         "bytes that decode to '' under errors='ignore' with no terminator: Rust counts a final empty line "
-        "(1), CPython iterates decoded text and yields none (0), see #NNN"
+        "(1), CPython iterates decoded text and yields none (0), see #317"
     ),
 }
 
