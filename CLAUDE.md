@@ -41,7 +41,7 @@ For any substantive change, follow this end-to-end. (Trivial 1–2 line fixes ma
 ### Hygiene
 - Use **`uv`** for all Python package/env work (never plain `pip`/`python`); `maturin`/`cargo` for Rust.
 - **Keep PRs clean:** no dev/test/benchmark/scratch cruft in the repo or diff. Dev scripts go in the gitignored `scripts/`. Never commit non-documentation markdown (code-review/validation/scratch notes).
-- Commit messages end with: `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`
+- Commit messages end with a `Co-Authored-By:` trailer naming **the model that actually did the work** — e.g. `Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>`. Don't copy the version forward from an older commit: this line read `Opus 4.8` well after that stopped being true, so the trailer and the playbook disagreed.
 - PR bodies end with: `🤖 Generated with [Claude Code](https://claude.com/claude-code)`
 
 ---
