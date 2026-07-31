@@ -140,13 +140,17 @@ exclude = ["*.md"]
 [tool.mypy]
 python_version = "3.10"
 mypy_path = "src"
-# Scoped deliberately. #314 tracks widening this to the public API surface;
+# Scoped deliberately. #314 tracks widening this to cover the compute contract
+# plus the backend() call sites, and to eventually cover the whole tree;
 # checking the whole tree today surfaces 42 mypy errors (13 import-untyped
 # for third-party libs without stubs, 29 substantive) in one change.
 files = [
     "src/datagrunt/core/csv_io/_compute.py",
     "src/datagrunt/core/csv_io/_compute_protocol.py",
     "src/datagrunt/_native.pyi",
+    "src/datagrunt/core/csv_io/csvcomponents.py",
+    "src/datagrunt/core/excel_io/excelcomponents.py",
+    "src/datagrunt/core/parquet_io/parquetcomponents.py",
 ]
 warn_unused_ignores = true
 warn_redundant_casts = true
@@ -163,3 +167,11 @@ module = [
     "datagrunt.core.csv_io._compute_protocol",
 ]
 disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = [
+    "datagrunt.core.csv_io.csvcomponents",
+    "datagrunt.core.excel_io.excelcomponents",
+    "datagrunt.core.parquet_io.parquetcomponents",
+]
+check_untyped_defs = true
