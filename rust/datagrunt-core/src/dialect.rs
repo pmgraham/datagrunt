@@ -63,32 +63,67 @@ struct QuoteGuess {
     skipinitialspace: bool,
 }
 
-/// The four DOTALL|MULTILINE patterns, in the order Python tries them. The bool
-/// records whether the pattern carries `delim`/`space` groups (the 4th does
-/// not — Python hits `KeyError` and `continue`s, so it never records delims or
-/// spaces for that pattern). Python `(?P=quote)` backreferences become
-/// fancy-regex `\k<quote>`.
-const QUOTE_PATTERNS: [(&str, bool); 4] = [
-    (
-        r#"(?sm)(?P<delim>[^\w\n"'])(?P<space> ?)(?P<quote>["']).*?\k<quote>\k<delim>"#,
-        true,
-    ),
-    (
-        r#"(?sm)(?:^|\n)(?P<quote>["']).*?\k<quote>(?P<delim>[^\w\n"'])(?P<space> ?)"#,
-        true,
-    ),
-    (
-        r#"(?sm)(?P<delim>[^\w\n"'])(?P<space> ?)(?P<quote>["']).*?\k<quote>(?:$|\n)"#,
-        true,
-    ),
-    (r#"(?sm)(?:^|\n)(?P<quote>["']).*?\k<quote>(?:$|\n)"#, false),
-];
+/// CPython's `\w`, spelled out — do NOT write `\w` in a pattern here.
+///
+/// CPython defines `\w` as "alphanumeric characters (as defined by
+/// `str.isalnum()`) as well as the underscore", i.e. general categories L* and
+/// N* plus `_`. fancy-regex inherits regex-syntax's UTS#18 `perl_word`, which is
+/// `Alphabetic ∪ M ∪ Nd ∪ Pc ∪ Join_Control` — a DIFFERENT set, and different in
+/// both directions: it excludes `No`/`Nl` (so `²` U+00B2 is a word char to
+/// CPython but not to Rust) and includes marks (so U+0301 is a word char to Rust
+/// but not to CPython). That divergence made the sniffer pick different
+/// delimiters on either side (#318).
+///
+/// The equivalence below was verified exhaustively: over all 1,114,112 code
+/// points, `re.match(r"\w", ch)` agrees with `category(ch)[0] in "LN" or ch ==
+/// "_"` with zero mismatches.
+///
+/// Residual, unchanged by this: CPython's tables come from the running
+/// interpreter's Unicode version (13.0 on the 3.10 floor) while regex-syntax
+/// pins 16.0, so code points assigned in between can still disagree. That skew
+/// predates this fix and is far narrower than the definitional one it replaces —
+/// `²` and combining marks have been assigned for decades.
+const PY_WORD: &str = r"\p{L}\p{N}_";
 
-/// Compiled forms of QUOTE_PATTERNS. Initialized once; avoids per-call `Regex::new`.
+/// The four DOTALL|MULTILINE patterns, in the order Python tries them, built and
+/// compiled once to avoid a per-call `Regex::new`.
+///
+/// The bool records whether the pattern carries `delim`/`space` groups (the 4th
+/// does not — Python hits `KeyError` and `continue`s, so it never records delims
+/// or spaces for that pattern). Python `(?P=quote)` backreferences become
+/// fancy-regex `\k<quote>`.
+///
+/// The word class is interpolated from `PY_WORD` rather than written as `\w`, so
+/// there is exactly one place to look when asking what "word character" means
+/// here — see that constant for why the distinction matters.
 static COMPILED_QUOTE_PATTERNS: LazyLock<[(Regex, bool); 4]> = LazyLock::new(|| {
-    QUOTE_PATTERNS.map(|(pattern, has_groups)| {
+    let patterns: [(String, bool); 4] = [
         (
-            Regex::new(pattern).expect("static sniffer pattern is valid"),
+            format!(
+                r#"(?sm)(?P<delim>[^{PY_WORD}\n"'])(?P<space> ?)(?P<quote>["']).*?\k<quote>\k<delim>"#
+            ),
+            true,
+        ),
+        (
+            format!(
+                r#"(?sm)(?:^|\n)(?P<quote>["']).*?\k<quote>(?P<delim>[^{PY_WORD}\n"'])(?P<space> ?)"#
+            ),
+            true,
+        ),
+        (
+            format!(
+                r#"(?sm)(?P<delim>[^{PY_WORD}\n"'])(?P<space> ?)(?P<quote>["']).*?\k<quote>(?:$|\n)"#
+            ),
+            true,
+        ),
+        (
+            r#"(?sm)(?:^|\n)(?P<quote>["']).*?\k<quote>(?:$|\n)"#.to_string(),
+            false,
+        ),
+    ];
+    patterns.map(|(pattern, has_groups)| {
+        (
+            Regex::new(&pattern).expect("static sniffer pattern is valid"),
             has_groups,
         )
     })
@@ -184,10 +219,14 @@ fn guess_quote_and_delimiter(data: &str, delimiters: Option<&str>) -> QuoteGuess
     // MULTILINE only; unescaped quotechar (only ever `"` or `'`, both regex-safe;
     // CPython's re.escape is likewise a no-op for them), fancy_regex::escape on the delim.
     let escaped_delim = fancy_regex::escape(&delim);
+    // `[^{PY_WORD}]` rather than `\W`: same reason as QUOTE_PATTERNS above —
+    // fancy-regex's `\W` is the complement of a different word set than
+    // CPython's, which flipped `doublequote` as well as `delimiter` (#318).
     let dq_pattern = format!(
-        r"(?m)(({delim})|^)\W*{quote}[^{delim}\n]*{quote}[^{delim}\n]*{quote}\W*(({delim})|$)",
+        r"(?m)(({delim})|^)[^{word}]*{quote}[^{delim}\n]*{quote}[^{delim}\n]*{quote}[^{word}]*(({delim})|$)",
         delim = escaped_delim,
         quote = quotechar,
+        word = PY_WORD,
     );
     // A failed compile (defensive — the pattern is built from a single-char
     // quotechar and an fancy_regex::escape'd delimiter) or a backtrack-limit Err

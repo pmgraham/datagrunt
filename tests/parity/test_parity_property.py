@@ -14,7 +14,6 @@ xfail only when the divergence rate is too high to enumerate, and say so in the
 reason. Do not weaken a property to make it pass.
 """
 
-import pytest
 from hypothesis import event, example, given
 from hypothesis import strategies as st
 from strategies import (
@@ -71,30 +70,11 @@ def test_leading_rows_agrees(gen, limit):
         assert outcome(rs.leading_rows, path, limit) == outcome(py.leading_rows, path, limit)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "sniff_dialect's delimiter class is [^\\w\\n\"'], and CPython's \\w (str.isalnum()-based) "
-        "disagrees with fancy-regex's \\w on category No (U+00B2) and on marks (U+0301). The blast "
-        "radius is NOT delimiter-only. Two independent 20,000-call runs agree on the shape while "
-        "differing in the exact counts (they are seed-specific): delimiter alone dominates, with "
-        "delimiter+doublequote, delimiter+skipinitialspace, delimiter+quotechar, doublequote alone "
-        "and skipinitialspace alone all observed, plus dialect-vs-None flips in BOTH directions "
-        "(one run: 23 Rust-dialect/CPython-None and 15 the reverse). "
-        "doublequote, quotechar and skipinitialspace ARE fields the corpus dialect tests compare, and "
-        "a None-vs-dialect flip is a behavior change, reachable in production from "
-        "src/datagrunt/core/databases/databases.py:125 (CSVDialect(self.filepath), no delimiter). "
-        "The rate is roughly 1 in 140-170 generated examples (two runs: 1-in-137, 1-in-171) — far "
-        "too high to pin per-example — so "
-        "this stays a TEST-LEVEL xfail, which means the property explores ZERO generated examples "
-        "until #318 is fixed. Corpus case sniff_delimiter_word_class.csv. See #318"
-    ),
-)
 @example(
-    # The minimized falsifying example, pinned so this fails at every profile
-    # rather than only where the search happens to reach it (it was found at the
-    # deep profile, not at ci's 100 examples). Keep as a regression case once
-    # #318 is fixed and the xfail comes off.
+    # #318's minimized falsifying example, kept as a permanent regression case
+    # now that it is fixed. U+00B2 is a word character to CPython (category No)
+    # but was not to fancy-regex, so the sniffer's [^\w\n"'] delimiter class
+    # disagreed about whether it could be a delimiter at all.
     gen=GeneratedCSV(
         data=b'"\'"\'\n"\xc2\xb2\'"',
         suffix=".csv",
