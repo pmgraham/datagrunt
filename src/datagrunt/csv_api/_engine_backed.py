@@ -1,6 +1,7 @@
 """Shared engine lifecycle for the CSV public API (CSVReader/CSVWriter)."""
 
 from functools import cached_property
+from typing import ClassVar
 
 from datagrunt.core import CSVComponents, CSVEngineFactory
 
@@ -14,7 +15,7 @@ class _CSVEngineBacked(CSVComponents):
     factory builder and add any role-specific state in their own ``__init__``.
     """
 
-    _engine_role = None  # "reader" or "writer"
+    _engine_role: ClassVar[str | None] = None  # "reader" or "writer"
 
     def __init__(self, filepath, engine, lenient=False, normalize_columns=False):
         self.lenient = lenient

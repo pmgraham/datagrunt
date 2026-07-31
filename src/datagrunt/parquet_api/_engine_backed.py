@@ -1,6 +1,7 @@
 """Shared engine lifecycle for the Parquet public API (ParquetReader/Writer)."""
 
 from functools import cached_property
+from typing import ClassVar
 
 from datagrunt.core import ParquetComponents, ParquetEngineFactory
 
@@ -12,7 +13,7 @@ class _ParquetEngineBacked(ParquetComponents):
     semantics. Subclasses set ``_engine_role`` to choose the factory builder.
     """
 
-    _engine_role = None  # "reader" or "writer"
+    _engine_role: ClassVar[str | None] = None  # "reader" or "writer"
 
     def __init__(self, filepath, normalize_columns=False, **read_options):
         self.normalize_columns = normalize_columns

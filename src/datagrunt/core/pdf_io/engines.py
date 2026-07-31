@@ -409,9 +409,9 @@ class PDFBaseWriterEngine(ABC):
         self.properties = PDFEngineProperties(filepath=self.filepath)
         if not self.filepath.exists():
             raise FileNotFoundError
-        self._reader_engine = None
-        self._cached_document = None
-        self._cached_parse_key = None
+        self._reader_engine: Optional[PDFBaseReaderEngine] = None
+        self._cached_document: Optional[dict] = None
+        self._cached_parse_key: Optional[tuple] = None
 
     def _parse_document(self, image_output_dir, drop_layout_tables):
         """Parse once per (image_output_dir, drop_layout_tables) and reuse the dict."""
