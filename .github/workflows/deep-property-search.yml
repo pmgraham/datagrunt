@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   deep-search:
-    name: hypothesis deep search (advisory)
+    name: hypothesis deep search
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
@@ -39,20 +39,18 @@ jobs:
           key: hypothesis-${{ github.run_id }}
           restore-keys: hypothesis-
 
-      # Advisory, NOT blocking: test_path_only_functions_agree (in
-      # test_parity_property.py) is deliberately left un-xfailed — it is the
-      # highest-value property in the suite, 6 functions times the full
-      # generator — and it can reach #317's divergence at roughly 1-in-20,000
-      # examples. At this profile's 10,000 examples per property, that makes a
-      # failure here naming `count_leading_physical_lines_before_header` a
-      # recurring, already-known result, not a new one: see
-      # https://github.com/pmgraham/datagrunt/issues/317.
+      # EXPECTED GREEN, and blocking. Every known divergence is pinned in
+      # test_parity_property.py — #317 by a per-example .xfail(), #318 by a
+      # test-level one — so a red run here means the search found something NEW.
+      # Investigate it; do not paper over it with continue-on-error. A standing
+      # red that nobody can act on trains people to ignore this job, which
+      # defeats its purpose.
       #
-      # Remove this continue-on-error once #317 lands. A standing red that
-      # nobody can act on trains people to ignore this job, which defeats its
-      # purpose.
+      # Depth comes from HYPOTHESIS_PROFILE, not from a pytest marker, so no -m
+      # override is needed. --no-cov because coverage tracing across ~70,000
+      # file-I/O examples is pure overhead in a job whose only product is search
+      # depth.
       - name: Deep property search
-        continue-on-error: true
         env:
           HYPOTHESIS_PROFILE: deep
-        run: .venv/bin/pytest tests/parity/test_parity_property.py -q -p no:randomly
+        run: .venv/bin/pytest tests/parity/test_parity_property.py -q --no-cov

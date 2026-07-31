@@ -123,15 +123,25 @@ CORPUS: dict[str, bytes] = {
     #     same first_row / sample_rows as Python for both backends.
     "c0_leading_trailing_strip.csv": b"\x1cname,age\x1d\nalice,30\nbob,25\n",
     # KNOWN DIVERGENCE (see #317), found by tests/parity/test_parity_property.py.
-    # A file whose bytes are non-empty but decode to the EMPTY string under
-    # errors="ignore", with no line terminator: every byte is dropped by the
-    # decoder, so there is no text left to form a line.
-    #   count_leading_physical_lines_before_header -> Rust 1, Python 0.
-    # Rust's universal_lines works on the byte stream and emits a final
-    # (now empty) line because bytes remained unterminated; CPython iterates
-    # DECODED text, which is "", so it yields no lines at all. Appending a
-    # terminator (b"\x80\n") makes both return 1, and b"\x80a" makes both
-    # return 1 — only the fully-dropped, unterminated case diverges.
+    # b"\x80" is the MINIMAL case, not the whole shape. The general shape is:
+    # TRAILING UNTERMINATED BYTES THAT DECODE TO "" under errors="ignore", where
+    # every line before them is blank or a comment.
+    #   count_leading_physical_lines_before_header -> Rust n+1, Python n.
+    # Rust's universal_lines works on the byte stream and emits a final (now
+    # empty) line because bytes remained unterminated; CPython iterates DECODED
+    # text, where those bytes have vanished, so it yields no final line. The
+    # "blank or comment" clause is the counter's loop condition: it stops at the
+    # first non-blank non-comment line, so the phantom line is only reachable
+    # while no header has been seen yet.
+    # The FILE need not decode to "" — only its unterminated tail. Verified:
+    #   b"\x80"                     -> 1 / 0   b"# c\n\xc3"          -> 2 / 1
+    #   b"\n\xe9\xff\xfe"           -> 2 / 1   b"\n\n\xe9\xff\xfe"   -> 3 / 2
+    #   b"\xef\xbb\xbf\xe9\xff\xfe" -> 1 / 0   b"# a\n# b\n\xc3"     -> 3 / 2
+    # A truncated UTF-8 download with a comment header is the realistic form.
+    # Both agree once the phantom line cannot form or cannot be reached:
+    # b"\x80\n" and b"\x80a" (1/1), b"# c\n\xc3\n" (2/2), b"a,b\n\xc3" (1/1,
+    # header consumed first). A fix and its regression test must cover the whole
+    # shape above, not just this single-byte case.
     "invalid_utf8_only_no_newline.csv": b"\x80",
     # KNOWN DIVERGENCE (see #318), found by tests/parity/test_parity_property.py.
     # sniff_dialect's own `delimiter` differs on characters where CPython's `\w`

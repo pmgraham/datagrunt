@@ -54,12 +54,19 @@ dev = [
     "bumpver>=2026.1132",
     "maturin>=1.7,<2.0",
     "pre-commit>=4.0.0",
-    # Bounded to the next minor, same as ruff (#312) and mypy (#314).
-    # Hypothesis's compatibility guarantee covers the DOCUMENTED API only;
-    # validation strictness can tighten in any 6.x minor (6.140.0 made
-    # characters(exclude_characters=...) reject multi-char strings; 6.136.2
-    # made @precondition without @rule raise). Either would redden this gate
-    # on untouched code.
+    # Pinned to a SINGLE minor — deliberately tighter than ruff (<0.17, two
+    # minors) and mypy (<1.21, seven), so do not read those as precedent for
+    # this bound. Two reasons for the extra tightness. Hypothesis's
+    # compatibility guarantee covers the DOCUMENTED API only, and validation
+    # strictness tightens in ordinary minors (6.140.0 made
+    # characters(exclude_characters=...) reject multi-char strings; 6.136.2 made
+    # @precondition without @rule raise) — either reddens this blocking gate on
+    # untouched code. More important, tests/parity/test_parity_strategies.py's
+    # vacuity guard asserts on the GENERATION DISTRIBUTION, which is not part of
+    # any compatibility promise and shifts freely between minors. Reproducible
+    # parity search is worth the cost, and the cost is real: Hypothesis ships
+    # minors roughly weekly, so expect near-continuous Dependabot bumps here.
+    # Take them one at a time and re-run the parity suite on each.
     "hypothesis>=6.164.0,<6.165",
 ]
 
@@ -96,11 +103,15 @@ testpaths = "tests"
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
-addopts = "-v --cov=src/datagrunt --cov-report=term-missing -m 'not corpus and not deep'"
+addopts = "-v --cov=src/datagrunt --cov-report=term-missing -m 'not corpus'"
 pythonpath = "."
+# No `deep` marker on purpose. The scheduled deep search selects its work by
+# Hypothesis profile (HYPOTHESIS_PROFILE=deep) and file path, never by marker,
+# so registering one would only create a trap: a `deep`-marked test would be
+# deselected by this addopts AND unselected by the deep job, and would run
+# nowhere. Depth is a profile, not a marker.
 markers = [
     "corpus: slow, local-only cross-engine tests over the data/pdfs corpus (deselected by default; run with -m corpus)",
-    "deep: long property searches; run by the scheduled job, deselected by default",
 ]
 
 [tool.ruff]

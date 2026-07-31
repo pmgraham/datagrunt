@@ -86,6 +86,12 @@ def csv_file(data: bytes, suffix: str = ".csv"):
         os.unlink(path)
 
 
+# The name outcome() reports for a Rust panic crossing the PyO3 boundary. PyO3
+# raises pyo3_runtime.PanicException, whose __name__ is this; the Python oracle
+# can never produce it, which makes it an unambiguous crash signal.
+PANIC_EXCEPTION_NAME = "PanicException"
+
+
 def outcome(fn, *args):
     """Collapse a call into a comparable ('ok', value) or ('raised', name).
 
