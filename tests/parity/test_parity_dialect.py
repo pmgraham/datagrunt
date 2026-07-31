@@ -6,9 +6,17 @@ QUOTING_MAP = CSVDialect.QUOTING_MAP
 
 
 def dialect_properties_from_rust(rust_dict):
-    """Apply CSVDialect's property defaults to the raw Rust sniff result."""
+    """Apply CSVDialect's property defaults to the raw Rust sniff result.
+
+    ``delimiter`` is included deliberately (#319). It used to be omitted, which
+    meant sniff_dialect's own delimiter output was never compared by any corpus
+    test — infer_delimiter has its own test, but it is a different code path.
+    That gap hid #318, a real cross-backend delimiter divergence, until the
+    property suite compared the raw dicts and found it.
+    """
     if rust_dict is None:
         return {
+            "delimiter": None,
             "quotechar": '"',
             "escapechar": None,
             "doublequote": False,
@@ -17,6 +25,7 @@ def dialect_properties_from_rust(rust_dict):
             "quoting": "quote minimal",
         }
     return {
+        "delimiter": rust_dict["delimiter"],
         "quotechar": rust_dict["quotechar"],
         "escapechar": rust_dict["escapechar"],
         "doublequote": rust_dict["doublequote"],
