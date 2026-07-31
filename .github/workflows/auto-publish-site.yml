@@ -21,6 +21,16 @@ on:
 permissions:
   contents: read
 
+# Publishes approved in a batch complete seconds apart and each completion
+# triggers a run; without a group, the twins race the datagrunt-site push
+# (#328). No cancel-in-progress: a queued run must still execute so the
+# newest release is always documented. GitHub keeps at most one pending run
+# per group — a superseded middle run is auto-canceled, which is correct
+# here (every run documents the CURRENT version anyway).
+concurrency:
+  group: auto-publish-site
+  cancel-in-progress: false
+
 jobs:
   update-docs:
     runs-on: ubuntu-latest
@@ -59,7 +69,28 @@ jobs:
           token: ${{ steps.site-token.outputs.token }}
           path: datagrunt-site
 
+      # A re-trigger for an already-documented version (a late-approved stale
+      # publish, or the loser of a race) has nothing real to do — the AI
+      # generator is content-idempotent but re-stamps the post date, which is
+      # exactly the no-op diff that raced in #328. Skip the whole generation
+      # when the current version's post exists. Fails open: an unexpected
+      # post filename just means a regeneration, which the concurrency group
+      # and push retry make safe. To deliberately regenerate a post, delete
+      # its file in datagrunt-site first (or let a new version supersede it).
+      - name: Check whether this version is already posted
+        id: postcheck
+        run: |
+          VERSION=$(grep -m1 '^current_version = ' datagrunt/pyproject.toml | cut -d'"' -f2)
+          V_SLUG=$(echo "$VERSION" | tr . -)
+          if find datagrunt-site/content/blog -type f -name "datagrunt-${V_SLUG}-*.md" | grep -q .; then
+            echo "Release post for $VERSION already exists; skipping regeneration."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Setup uv
+        if: steps.postcheck.outputs.exists != 'true'
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           python-version: "3.12"
@@ -70,12 +101,14 @@ jobs:
           activate-environment: true
 
       - name: Install dependencies
+        if: steps.postcheck.outputs.exists != 'true'
         # Pinned: these feed an AI agent that commits to datagrunt-site, so an
         # unpinned install is a supply-chain soft spot. Dependabot bumps them.
         run: |
           uv pip install google-antigravity==0.1.7 python-dotenv==1.2.2
 
       - name: Run Antigravity Workflow
+        if: steps.postcheck.outputs.exists != 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         # Diff against the previous release tag so the post covers the whole
@@ -90,6 +123,7 @@ jobs:
           python datagrunt/scripts/antigravity_workflow.py --pre-merge-commit "$PREV_TAG"
 
       - name: Commit and Push Docs Update
+        if: steps.postcheck.outputs.exists != 'true'
         working-directory: datagrunt-site
         # Read the version from the datagrunt checkout — this step runs inside
         # datagrunt-site, where `git log` would return the site's own history.
@@ -99,4 +133,7 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add content/
           git diff-index --quiet HEAD || git commit -m "docs: release blog post for version $VERSION"
-          git push origin main
+          # Belt-and-braces for any writer that lands between our clone and
+          # push (#328): one rebase-retry. A conflicting rebase still fails,
+          # which is the correct outcome for a genuine content collision.
+          git push origin main || { git pull --rebase origin main && git push origin main; }
