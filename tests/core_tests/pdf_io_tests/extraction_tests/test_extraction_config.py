@@ -41,3 +41,35 @@ class TestPDFExtractionConfig:
     def test_is_picklable_and_round_trips(self):
         cfg = _PDFExtractionConfig(min_image_dimension=15)
         assert pickle.loads(pickle.dumps(cfg)) == cfg
+
+
+class TestPDFExtractionConfigDPIFields:
+    def test_defaults_match_legacy_constants(self):
+        cfg = _PDFExtractionConfig()
+        assert cfg.ocr_standard_dpi == 150
+        assert cfg.ocr_large_format_dpi == 75
+        assert cfg.ocr_large_format_dimension == 1500
+        assert cfg.render_dpi == 300
+
+    @pytest.mark.parametrize(
+        "field", ["ocr_standard_dpi", "ocr_large_format_dpi", "ocr_large_format_dimension", "render_dpi"]
+    )
+    def test_rejects_bool(self, field):
+        with pytest.raises(TypeError):
+            _PDFExtractionConfig(**{field: True})
+
+    @pytest.mark.parametrize(
+        "field", ["ocr_standard_dpi", "ocr_large_format_dpi", "ocr_large_format_dimension", "render_dpi"]
+    )
+    @pytest.mark.parametrize("bad", [0, -1])
+    def test_rejects_non_positive(self, field, bad):
+        with pytest.raises(ValueError):
+            _PDFExtractionConfig(**{field: bad})
+
+    def test_remains_picklable_with_overrides(self):
+        # Same-process round-trip of a locally-constructed, trusted instance
+        # (not deserialization of untrusted/external data) — this proves the
+        # picklability contract the config relies on to cross the pdfium
+        # process-pool worker boundary.
+        cfg = _PDFExtractionConfig(ocr_standard_dpi=300, render_dpi=600)
+        assert pickle.loads(pickle.dumps(cfg)) == cfg
