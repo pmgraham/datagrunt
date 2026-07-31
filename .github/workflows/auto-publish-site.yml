@@ -28,7 +28,10 @@ permissions:
 # per group — a superseded middle run is auto-canceled, which is correct
 # here (every run documents the CURRENT version anyway).
 concurrency:
-  group: auto-publish-site
+  # Manual dispatches get their own group (run_id is unique) so a burst of
+  # chain triggers can never silently cancel a maintainer's pending run —
+  # GitHub cancels PENDING runs in a group regardless of cancel-in-progress.
+  group: auto-publish-site-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'chain' }}
   cancel-in-progress: false
 
 jobs:
@@ -82,7 +85,7 @@ jobs:
         run: |
           VERSION=$(grep -m1 '^current_version = ' datagrunt/pyproject.toml | cut -d'"' -f2)
           V_SLUG=$(echo "$VERSION" | tr . -)
-          if find datagrunt-site/content/blog -type f -name "datagrunt-${V_SLUG}-*.md" | grep -q .; then
+          if find datagrunt-site/content/blog -type f -name "datagrunt-${V_SLUG}-*.md" -print -quit | grep -q .; then
             echo "Release post for $VERSION already exists; skipping regeneration."
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
