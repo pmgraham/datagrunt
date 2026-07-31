@@ -47,7 +47,7 @@ class PdfiumBackend(_ThreadLocalDocSession, ExtractionBackend):
             if should_close:
                 doc.close()
 
-    def extract_page(self, page_number: int, output_dir: str = None, name_prefix: str = "page") -> tuple:
+    def extract_page(self, page_number: int, output_dir: str | None = None, name_prefix: str = "page") -> tuple:
         """Parse the page once (single pdfium page/textpage open), returning
         analysis + text blocks + images, instead of opening the page three times.
         """
@@ -99,7 +99,7 @@ class PdfiumBackend(_ThreadLocalDocSession, ExtractionBackend):
                 doc.close()
         return TextBlockBuilder().build(items)
 
-    def extract_images(self, page_number: int, output_dir: str = None, name_prefix: str = "page") -> list:
+    def extract_images(self, page_number: int, output_dir: str | None = None, name_prefix: str = "page") -> list:
         """Return embedded images at or above the configured minimum dimension; write when output_dir set."""
         doc, should_close = self._get_doc()
         try:

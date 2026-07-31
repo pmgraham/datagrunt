@@ -146,7 +146,7 @@ class PyMuPDFBackend(_ThreadLocalDocSession, ExtractionBackend):
             reading_order=order,
         )
 
-    def extract_page(self, page_number: int, output_dir: str = None, name_prefix: str = "page") -> tuple:
+    def extract_page(self, page_number: int, output_dir: str | None = None, name_prefix: str = "page") -> tuple:
         """Parse the page once, returning analysis + text blocks + images.
 
         Shares a single ``get_text("dict", sort=True)`` and a single
@@ -203,7 +203,7 @@ class PyMuPDFBackend(_ThreadLocalDocSession, ExtractionBackend):
             if should_close:
                 doc.close()
 
-    def extract_images(self, page_number: int, output_dir: str = None, name_prefix: str = "page") -> list:
+    def extract_images(self, page_number: int, output_dir: str | None = None, name_prefix: str = "page") -> list:
         """Return embedded images (ported from extractors.extract_images)."""
         doc, should_close = self._get_doc()
         try:
@@ -230,7 +230,7 @@ class PyMuPDFBackend(_ThreadLocalDocSession, ExtractionBackend):
         # differ from the content/display order. Resolve each image's bbox by
         # its xref so positions never get swapped; track per-xref occurrences
         # so an image drawn multiple times maps to the correct rect each time.
-        xref_occurrence = {}
+        xref_occurrence: dict[int, int] = {}
         for idx, img_info in enumerate(image_list):
             xref = img_info[0]
             occurrence = xref_occurrence.get(xref, 0)
@@ -315,7 +315,11 @@ class PyMuPDFBackend(_ThreadLocalDocSession, ExtractionBackend):
             page = doc[page_number]
             pix = page.get_pixmap(dpi=dpi)
             mode = "RGBA" if pix.alpha else "RGB"
-            img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+            # pymupdf ships no stubs, so pix.width/height read as Any; bind the
+            # size honestly at the pymupdf boundary instead of annotating a
+            # list literal (frombytes wants tuple[int, int], not list[Any]).
+            size: tuple[int, int] = (pix.width, pix.height)
+            img = Image.frombytes(mode, size, pix.samples)
         finally:
             if should_close:
                 doc.close()

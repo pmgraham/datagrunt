@@ -2,6 +2,7 @@
 
 from functools import cached_property
 from pathlib import Path
+from typing import ClassVar
 
 from datagrunt.core import PDFComponents, PDFEngineFactory
 from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
@@ -17,7 +18,7 @@ class _PDFEngineBacked(PDFComponents):
     ``close()``/context-manager here.
     """
 
-    _engine_role = None  # "reader" or "writer"
+    _engine_role: ClassVar[str | None] = None  # "reader" or "writer"
 
     def __init__(self, filepath, engine="pdfium", workers=1, native=False, *, min_image_dimension=None):
         """Initialize a PDF reader/writer.

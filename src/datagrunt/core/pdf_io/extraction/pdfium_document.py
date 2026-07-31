@@ -178,7 +178,7 @@ class PdfiumPage:
 
     def image_items(
         self,
-        output_dir: str = None,
+        output_dir: str | None = None,
         name_prefix: str = "page",
         page_number: int = 0,
         min_image_dimension: int = _DEFAULT_MIN_IMAGE_DIMENSION,
@@ -233,6 +233,7 @@ class PdfiumPage:
 
                 # Try to convert using PIL
                 try:
+                    img: Image.Image
                     with Image.open(path) as img:
                         if img.mode not in ("RGB", "RGBA", "L"):
                             img = img.convert("RGB")

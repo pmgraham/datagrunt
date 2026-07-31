@@ -1,5 +1,7 @@
 """Shared thread-local, depth-counted document session for PDF backends."""
 
+import threading
+
 
 class _ThreadLocalDocSession:
     """Mixin providing a reused, per-thread document handle.
@@ -16,6 +18,10 @@ class _ThreadLocalDocSession:
     """
 
     _lazy_open = False
+    # Declared, not assigned: every subclass sets this in its own __init__
+    # (see docstring contract above). A bare annotation gives mypy the type
+    # without adding a class-level default that would be wrong to share.
+    _local: threading.local
 
     def _open_resource(self):
         raise NotImplementedError

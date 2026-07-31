@@ -168,7 +168,7 @@ class PDFBaseReaderEngine(ABC):
         self.extraction_config = extraction_config or _PDFExtractionConfig()
         if not self.filepath.exists():
             raise FileNotFoundError
-        self._parsed_cache = {}
+        self._parsed_cache: dict[bool, dict] = {}
 
     def _parse_to_dicts(self, drop_layout_tables: bool = False) -> dict:
         """Parse once per drop_layout_tables value, shared by the conversions.
@@ -409,9 +409,14 @@ class PDFBaseWriterEngine(ABC):
         self.properties = PDFEngineProperties(filepath=self.filepath)
         if not self.filepath.exists():
             raise FileNotFoundError
-        self._reader_engine = None
-        self._cached_document = None
-        self._cached_parse_key = None
+        self._reader_engine: Optional[PDFBaseReaderEngine] = None
+        self._cached_document: Optional[dict] = None
+        self._cached_parse_key: Optional[tuple] = None
+
+    @abstractmethod
+    def _reader(self) -> PDFBaseReaderEngine:
+        """Return (creating and caching on first call) this writer's reader engine."""
+        pass
 
     def _parse_document(self, image_output_dir, drop_layout_tables):
         """Parse once per (image_output_dir, drop_layout_tables) and reuse the dict."""

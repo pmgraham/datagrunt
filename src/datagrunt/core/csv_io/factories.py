@@ -2,10 +2,13 @@
 
 # standard library
 from pathlib import Path
+from typing import Callable, ClassVar
 
 # third party libraries
 # local libraries
 from datagrunt.core.csv_io.engines import (
+    CSVBaseReaderEngine,
+    CSVBaseWriterEngine,
     CSVEngineProperties,
     CSVReaderDuckDBEngine,
     CSVReaderPolarsEngine,
@@ -20,13 +23,20 @@ from datagrunt.core.databases import DuckDBQueries
 class CSVEngineFactory:
     """Factory class for creating CSV reader and writer engine instances."""
 
-    READER_ENGINES = {
+    # Typed as Callable rather than type[CSVBaseReaderEngine]: mypy widens a
+    # dict literal of several concrete subclasses to their common base type,
+    # and the base is abstract, so a type[...]-typed dict trips mypy's
+    # abstract-instantiation check even though every stored value is one of
+    # the three concrete subclasses below (never the abstract base itself).
+    # Callable[..., Base] describes the same runtime values without going
+    # through that check. No instance ever assigns these, so ClassVar.
+    READER_ENGINES: ClassVar[dict[str, Callable[..., CSVBaseReaderEngine]]] = {
         "duckdb": CSVReaderDuckDBEngine,
         "polars": CSVReaderPolarsEngine,
         "pyarrow": CSVReaderPyArrowEngine,
     }
 
-    WRITER_ENGINES = {
+    WRITER_ENGINES: ClassVar[dict[str, Callable[..., CSVBaseWriterEngine]]] = {
         "duckdb": CSVWriterDuckDBEngine,
         "polars": CSVWriterPolarsEngine,
         "pyarrow": CSVWriterPyArrowEngine,

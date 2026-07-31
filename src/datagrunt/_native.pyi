@@ -14,6 +14,20 @@ differ from the oracle's, so no keyword call is portable across backends.
 
 from datagrunt.core.csv_io._compute_protocol import HeaderProbe, SniffedDialect, StrPath
 
+__all__ = [
+    "is_legacy_mac_newlines",
+    "leading_rows",
+    "first_row",
+    "count_leading_comments",
+    "count_leading_physical_lines_before_header",
+    "normalize_columns",
+    "infer_delimiter",
+    "row_count_with_header",
+    "check_ragged",
+    "sniff_dialect",
+    "probe_csv_header",
+]
+
 def is_legacy_mac_newlines(path: StrPath, /) -> bool: ...
 def leading_rows(path: StrPath, limit: int, /) -> list[str]: ...
 def first_row(path: StrPath, /) -> str: ...

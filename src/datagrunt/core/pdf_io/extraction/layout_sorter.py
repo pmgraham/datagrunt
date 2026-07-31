@@ -238,7 +238,7 @@ class PageLayoutSorter:
     def _group_spanning_intervals(self, spanning: list) -> list[dict]:
         """Group overlapping spanning items into intervals."""
         spanning.sort(key=lambda it: self.adapter.get_bounds(it)[1])
-        intervals = []
+        intervals: list[dict] = []
         for it in spanning:
             x0, y_top, x1, y_bot = self.adapter.get_bounds(it)
             if not intervals or y_top > intervals[-1]["y_bot"]:

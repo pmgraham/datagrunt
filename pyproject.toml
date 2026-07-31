@@ -140,26 +140,40 @@ exclude = ["*.md"]
 [tool.mypy]
 python_version = "3.10"
 mypy_path = "src"
-# Scoped deliberately. #314 tracks widening this to the public API surface;
-# checking the whole tree today surfaces 42 mypy errors (13 import-untyped
-# for third-party libs without stubs, 29 substantive) in one change.
-files = [
-    "src/datagrunt/core/csv_io/_compute.py",
-    "src/datagrunt/core/csv_io/_compute_protocol.py",
-    "src/datagrunt/_native.pyi",
-]
+# Whole-tree, blocking (the ratchet from the original 3-file compute-contract
+# scope is now complete). check_untyped_defs keeps unannotated bodies
+# checked; the strict disallow_untyped_defs override below holds the
+# compute contract to full annotations.
+files = ["src/datagrunt"]
+check_untyped_defs = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 
 # Listed explicitly rather than as `..._compute*`: mypy only accepts `*` as a
 # whole dotted component, and rejects a partial-component pattern with a
 # *warning* while still exiting 0 — a silently unenforced override. These are
-# the scoped modules above; `_compute_python` is excluded on purpose (the
-# oracle is unannotated, and annotating it is #314's job, not this gate's).
+# the compute-backend-contract modules held to the stricter bar: the oracle is
+# annotated to the ComputeBackendProtocol, so the TYPE_CHECKING conformance
+# assignment in _compute.py enforces its signatures, not just its members.
 [[tool.mypy.overrides]]
 module = [
     "datagrunt._native",
     "datagrunt.core.csv_io._compute",
     "datagrunt.core.csv_io._compute_protocol",
+    "datagrunt.core.csv_io._compute_python",
 ]
 disallow_untyped_defs = true
+
+# Third-party libraries with no stubs/py.typed marker. Silenced here (never
+# via inline `# type: ignore`) so every suppression is visible in one place.
+# Extend this list only when the whole-tree run actually names a new one.
+# pyarrow is the odd one out: its py.typed marker is version-dependent, not
+# absent outright. The dependency floor is pyarrow>=24.0.0 (unbounded); 24.0.0
+# ships py.typed (mypy sees it locally and uses real types — this override is
+# inert there), but a fresh resolve can land on a newer release (e.g. 25.0.0)
+# whose py.typed isn't visible to mypy, which is exactly what CI hit. Safe in
+# both cases: ignore_missing_imports only silences the "missing stubs"
+# diagnostic, it never substitutes Any for a type mypy can actually resolve.
+[[tool.mypy.overrides]]
+module = ["pytesseract.*", "pypdfium2.*", "xlsxwriter.*", "pyarrow.*"]
+ignore_missing_imports = true

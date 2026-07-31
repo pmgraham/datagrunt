@@ -67,10 +67,15 @@ jobs:
       - name: ruff format check (blocking)
         run: .venv/bin/ruff format --check .
 
-      # Scoped to the compute-backend contract (files listed under [tool.mypy]),
-      # not the whole tree. #314 tracks widening it.
-      - name: "mypy (blocking — scoped, see #314)" # quoted: bare `#` starts a YAML comment
+      # Whole-tree gate: files = ["src/datagrunt"] under [tool.mypy] covers
+      # every module, with check_untyped_defs on for unannotated bodies.
+      - name: "mypy (blocking — whole tree)"
         run: .venv/bin/mypy
+
+      # The pytest stub guard compares name sets only; stubtest compares
+      # signatures, so a Rust arity/type change cannot ship a stale stub.
+      - name: "stubtest (blocking — _native.pyi vs compiled module)"
+        run: .venv/bin/python -m mypy.stubtest datagrunt._native --ignore-positional-only
 
   python-compat:
     # The main test job covers 3.12; this proves the rest of the advertised

@@ -45,14 +45,16 @@ class ExtractionBackend(ABC):
         """Return classified text blocks for the page."""
 
     @abstractmethod
-    def extract_images(self, page_number: int, output_dir: str = None, name_prefix: str = "page") -> list[ImageBlock]:
+    def extract_images(
+        self, page_number: int, output_dir: str | None = None, name_prefix: str = "page"
+    ) -> list[ImageBlock]:
         """Return embedded images; write files when ``output_dir`` is given."""
 
     @abstractmethod
     def ocr_page(self, page_number: int, dpi: int = 300) -> list[OcrBlock]:
         """Return OCR-recovered text lines for the page."""
 
-    def extract_page(self, page_number: int, output_dir: str = None, name_prefix: str = "page") -> tuple:
+    def extract_page(self, page_number: int, output_dir: str | None = None, name_prefix: str = "page") -> tuple:
         """Single-pass extraction: ``(PageAnalysis, list[TextBlock], list[ImageBlock])``.
 
         Default implementation calls the three primitives separately; concrete

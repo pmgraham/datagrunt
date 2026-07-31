@@ -27,7 +27,7 @@ def _import_ocr_deps():
 def _data_to_blocks(data: dict, dpi: int) -> list:
     """Group a pytesseract image_to_data DICT into ``OcrBlock`` lines (point bboxes)."""
     scale = 72.0 / dpi
-    lines = {}
+    lines: dict[tuple[int, int, int], list[dict]] = {}
     for i in range(len(data["text"])):
         conf = int(data["conf"][i])
         text = data["text"][i].strip()

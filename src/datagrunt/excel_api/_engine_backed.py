@@ -1,6 +1,7 @@
 """Shared engine lifecycle for the Excel public API (ExcelReader/ExcelWriter)."""
 
 from functools import cached_property
+from typing import ClassVar
 
 from datagrunt.core import ExcelComponents, ExcelEngineFactory
 
@@ -13,7 +14,7 @@ class _ExcelEngineBacked(ExcelComponents):
     ``.sheets`` is inherited from ``ExcelComponents`` and needs no engine.
     """
 
-    _engine_role = None  # "reader" or "writer"
+    _engine_role: ClassVar[str | None] = None  # "reader" or "writer"
 
     def __init__(self, filepath, normalize_columns=False, **read_options):
         self.normalize_columns = normalize_columns
