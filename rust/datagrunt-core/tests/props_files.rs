@@ -99,11 +99,7 @@ proptest! {
     fn leading_rows_respects_limit(bytes in csvish_bytes(), limit in 0usize..64) {
         let f = file_with(&bytes);
         if let Ok(rows) = datagrunt_core::rows::leading_rows(f.path(), limit) {
-            // KNOWN (issue #325): limit=0 currently returns 1 row — the cap is
-            // checked after the append in BOTH backends, so differential parity
-            // cannot see it. The fix PR for #325 must tighten this back to
-            // `rows.len() <= limit`; that flip is its red/green test.
-            prop_assert!(rows.len() <= limit.max(1));
+            prop_assert!(rows.len() <= limit);
         }
     }
 
