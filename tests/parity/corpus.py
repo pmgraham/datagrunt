@@ -122,4 +122,41 @@ CORPUS: dict[str, bytes] = {
     # (e) Header with leading/trailing C0 separators: stripping must yield the
     #     same first_row / sample_rows as Python for both backends.
     "c0_leading_trailing_strip.csv": b"\x1cname,age\x1d\nalice,30\nbob,25\n",
+    # KNOWN DIVERGENCE (see #317), found by tests/parity/test_parity_property.py.
+    # b"\x80" is the MINIMAL case, not the whole shape. The general shape is:
+    # TRAILING UNTERMINATED BYTES THAT DECODE TO "" under errors="ignore", where
+    # every line before them is blank or a comment.
+    #   count_leading_physical_lines_before_header -> Rust n+1, Python n.
+    # Rust's universal_lines works on the byte stream and emits a final (now
+    # empty) line because bytes remained unterminated; CPython iterates DECODED
+    # text, where those bytes have vanished, so it yields no final line. The
+    # "blank or comment" clause is the counter's loop condition: it stops at the
+    # first non-blank non-comment line, so the phantom line is only reachable
+    # while no header has been seen yet.
+    # The FILE need not decode to "" — only its unterminated tail. Verified:
+    #   b"\x80"                     -> 1 / 0   b"# c\n\xc3"          -> 2 / 1
+    #   b"\n\xe9\xff\xfe"           -> 2 / 1   b"\n\n\xe9\xff\xfe"   -> 3 / 2
+    #   b"\xef\xbb\xbf\xe9\xff\xfe" -> 1 / 0   b"# a\n# b\n\xc3"     -> 3 / 2
+    # A truncated UTF-8 download with a comment header is the realistic form.
+    # Both agree once the phantom line cannot form or cannot be reached:
+    # b"\x80\n" and b"\x80a" (1/1), b"# c\n\xc3\n" (2/2), b"a,b\n\xc3" (1/1,
+    # header consumed first). A fix and its regression test must cover the whole
+    # shape above, not just this single-byte case.
+    "invalid_utf8_only_no_newline.csv": b"\x80",
+    # KNOWN DIVERGENCE (see #318), found by tests/parity/test_parity_property.py.
+    # sniff_dialect's own `delimiter` differs on characters where CPython's `\w`
+    # and fancy-regex's `\w` disagree, because the sniffer's delimiter class is
+    # `[^\w\n"']`:
+    #   - CPython `\w` is str.isalnum()-based, so it MATCHES category No
+    #     (U+00B2 '²', U+00BD '½', U+2460 '①') -> not a delimiter candidate.
+    #   - fancy-regex (rust/datagrunt-core/Cargo.toml) inherits regex-syntax's
+    #     UTS#18 perl_word table, so its `\w` is
+    #     [\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\p{Join_Control}], which excludes No
+    #     -> '²' IS a candidate and wins.
+    # Rust sniffs delimiter '²'; Python sniffs '"'. The reverse holds for marks
+    # (U+0301, category Mn): Python picks it, Rust does not.
+    # Every other sniffed field agrees, so the corpus dialect tests (which
+    # normalize through dialect_properties_from_rust and drop `delimiter`)
+    # cannot see this; the property suite compares the raw dicts.
+    "sniff_delimiter_word_class.csv": b'"\'"\'\n"\xc2\xb2\'"',
 }
