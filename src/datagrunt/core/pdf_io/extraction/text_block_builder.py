@@ -117,8 +117,8 @@ class TextBlockBuilder:
         # only to bound the binary search, never to decide membership.
         max_tol = max(2.0, max_item_size * 0.5)
 
-        lines = []
-        line_keys = []  # round(anchor_y, 0) per line, ascending by construction
+        lines: list[dict] = []
+        line_keys: list[float] = []  # round(anchor_y, 0) per line, ascending by construction
         for it in sorted(items, key=lambda i: (round(i.y_top, 0), i.x0)):
             lo = bisect_left(line_keys, round(it.y_top - max_tol, 0))
             placed = False
@@ -156,7 +156,7 @@ class TextBlockBuilder:
     def _merge_lines(self, line_recs: list) -> list:
         """Merge adjacent lines of similar size, small gap, and x-overlap."""
         line_recs = sorted(line_recs, key=lambda r: (r["y_top"], r["x0"]))
-        merged = []
+        merged: list[dict] = []
         for ln in line_recs:
             if merged and self._should_merge(merged[-1], ln):
                 self._absorb(merged[-1], ln)

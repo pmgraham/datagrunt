@@ -21,6 +21,7 @@ from datagrunt.core.pdf_io.extraction.markdown_escape import (
 from datagrunt.core.pdf_io.extraction.ocr import dpi_for_page
 from datagrunt.core.pdf_io.extraction.pdfium_native import PdfiumNativeReader
 from datagrunt.core.pdf_io.extraction.pymupdf_backend import PyMuPDFBackend
+from datagrunt.core.pdf_io.extraction.shapes import TableBlock
 
 PIPELINE_TYPE = "pure_python_local_v1"
 
@@ -62,7 +63,7 @@ class DocumentAssembler:
                 counter["n"] += 1
                 return elem_id
 
-            tables = []
+            tables: list[TableBlock] = []
             if analysis.has_line_drawings or not analysis.has_text_layer:
                 tables = self.table_extractor.extract(page_index)
 

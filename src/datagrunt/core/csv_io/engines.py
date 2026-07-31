@@ -721,6 +721,10 @@ class CSVWriterPolarsEngine(CSVBaseWriterEngine):
 class _PyArrowEngineMixin:
     """Helpers shared by the PyArrow reader and writer engines."""
 
+    # Declared, not assigned: always mixed into a _DuckDBBackedEngine
+    # subclass, which sets this instance attribute in its own __init__.
+    filepath: Path
+
     @cached_property
     def _midfile_comments(self):
         """Whether the file has a mid-file ``#`` comment, scanned once per instance.

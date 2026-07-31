@@ -140,28 +140,21 @@ exclude = ["*.md"]
 [tool.mypy]
 python_version = "3.10"
 mypy_path = "src"
-# Scoped deliberately. #314 tracks widening this to cover the compute contract
-# plus the backend() call sites, and to eventually cover the whole tree;
-# checking the whole tree today surfaces 42 mypy errors (13 import-untyped
-# for third-party libs without stubs, 29 substantive) in one change.
-files = [
-    "src/datagrunt/core/csv_io/_compute.py",
-    "src/datagrunt/core/csv_io/_compute_protocol.py",
-    "src/datagrunt/core/csv_io/_compute_python.py",
-    "src/datagrunt/_native.pyi",
-    "src/datagrunt/core/csv_io/csvcomponents.py",
-    "src/datagrunt/core/excel_io/excelcomponents.py",
-    "src/datagrunt/core/parquet_io/parquetcomponents.py",
-]
+# Whole-tree, blocking (the ratchet from the original 3-file compute-contract
+# scope is now complete). check_untyped_defs keeps unannotated bodies
+# checked; the strict disallow_untyped_defs override below holds the
+# compute contract to full annotations.
+files = ["src/datagrunt"]
+check_untyped_defs = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 
 # Listed explicitly rather than as `..._compute*`: mypy only accepts `*` as a
 # whole dotted component, and rejects a partial-component pattern with a
 # *warning* while still exiting 0 — a silently unenforced override. These are
-# the scoped modules above, now including `_compute_python`: the oracle is
+# the compute-backend-contract modules held to the stricter bar: the oracle is
 # annotated to the ComputeBackendProtocol, so the TYPE_CHECKING conformance
-# assignment in _compute.py enforces its signatures, not just its members (#314).
+# assignment in _compute.py enforces its signatures, not just its members.
 [[tool.mypy.overrides]]
 module = [
     "datagrunt._native",
@@ -171,10 +164,9 @@ module = [
 ]
 disallow_untyped_defs = true
 
+# Third-party libraries with no stubs/py.typed marker. Silenced here (never
+# via inline `# type: ignore`) so every suppression is visible in one place.
+# Extend this list only when the whole-tree run actually names a new one.
 [[tool.mypy.overrides]]
-module = [
-    "datagrunt.core.csv_io.csvcomponents",
-    "datagrunt.core.excel_io.excelcomponents",
-    "datagrunt.core.parquet_io.parquetcomponents",
-]
-check_untyped_defs = true
+module = ["pytesseract.*", "pypdfium2.*", "xlsxwriter.*"]
+ignore_missing_imports = true

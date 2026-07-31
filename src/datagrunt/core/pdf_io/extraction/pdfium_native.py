@@ -31,7 +31,7 @@ class PdfiumNativeReader(_ThreadLocalDocSession):
     def _open_resource(self):
         return PdfiumDocument(self.filepath)
 
-    def parse_page(self, page_index: int, image_output_dir: str = None) -> dict:
+    def parse_page(self, page_index: int, image_output_dir: str | None = None) -> dict:
         """Parse one page into the native schema dict."""
         doc, should_close = self._get_doc()
         try:

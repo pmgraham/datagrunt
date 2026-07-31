@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional, Protocol, Union, runtime_checkable
+from typing import Callable, Dict, List, Optional, Protocol, Union, runtime_checkable
 
 import polars as pl
 import pyarrow as pa
@@ -113,6 +113,10 @@ class CSVWriterEngineProtocol(Protocol):
 
 class DataFrameDerivedReaderMixin:
     """Default Arrow/dict conversions for engines centered on Polars DataFrames."""
+
+    # Declared, not assigned: the concrete engine this is mixed into (e.g.
+    # CSVReaderPolarsEngine) provides the real to_dataframe implementation.
+    to_dataframe: Callable[..., pl.DataFrame]
 
     def to_arrow_table(self, normalize_columns=None):
         return self.to_dataframe(normalize_columns).to_arrow()

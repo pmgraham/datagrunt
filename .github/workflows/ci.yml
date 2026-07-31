@@ -67,9 +67,9 @@ jobs:
       - name: ruff format check (blocking)
         run: .venv/bin/ruff format --check .
 
-      # Scoped to the compute-backend contract (files listed under [tool.mypy]),
-      # not the whole tree. #314 tracks widening it.
-      - name: "mypy (blocking — scoped, see #314)" # quoted: bare `#` starts a YAML comment
+      # Whole-tree gate: files = ["src/datagrunt"] under [tool.mypy] covers
+      # every module, with check_untyped_defs on for unannotated bodies.
+      - name: "mypy (blocking — whole tree)"
         run: .venv/bin/mypy
 
       # The pytest stub guard compares name sets only; stubtest compares
