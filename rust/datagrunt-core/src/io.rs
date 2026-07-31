@@ -488,6 +488,17 @@ impl UniversalLines {
                     let raw = decode_ignore(&self.buf[self.pos..]);
                     let line = take_chars(&raw, MAX_LINE_CHARS);
                     self.pos = self.buf.len();
+                    // Bytes remaining is a BYTE-level condition; a line is
+                    // DECODED text. A tail whose every byte is dropped by
+                    // errors="ignore" is not a line: CPython iterates the
+                    // decoded string and yields nothing for it, so emitting
+                    // Some("") here produced a phantom final line (#317).
+                    // Only the unterminated tail is affected — an explicitly
+                    // terminated empty line (b"a\n\n") is emitted by the \n
+                    // branch above and still counts, matching CPython.
+                    if line.is_empty() {
+                        return Ok(None);
+                    }
                     return Ok(Some(line));
                 }
                 return Ok(None);
@@ -750,6 +761,32 @@ mod tests {
         assert!(read_universal_lines(h.path()).unwrap().is_empty());
         let i = tmp(b"a\n\n", ".csv"); // trailing newline dropped, interior blank kept
         assert_eq!(read_universal_lines(i.path()).unwrap(), vec!["a", ""]);
+    }
+
+    #[test]
+    fn unterminated_tail_decoding_to_nothing_is_not_a_line() {
+        // #317. "Bytes remain" is a BYTE-level condition; a line is DECODED
+        // text. A tail whose every byte is dropped by errors="ignore" must
+        // yield no line, because CPython iterates the decoded string.
+        let a = tmp(b"\x80", ".csv"); // whole file decodes to ""
+        assert!(read_universal_lines(a.path()).unwrap().is_empty());
+        let b = tmp(b"a\n\x80", ".csv"); // real line, then a vanishing tail
+        assert_eq!(read_universal_lines(b.path()).unwrap(), vec!["a"]);
+        let c = tmp(b"# c\n\xc3", ".csv"); // truncated multibyte after a comment
+        assert_eq!(read_universal_lines(c.path()).unwrap(), vec!["# c"]);
+        // BOM + invalid only. The BOM is consumed as an encoding marker (Python
+        // reads with utf-8-sig), so nothing survives decoding and there is no
+        // line — not a U+FEFF line.
+        let d = tmp(b"\xef\xbb\xbf\xe9\xff\xfe", ".csv");
+        assert!(read_universal_lines(d.path()).unwrap().is_empty());
+
+        // Guard the boundary the fix must NOT cross: a tail that decodes to
+        // real text still counts, and an explicitly terminated empty line is
+        // emitted by the \n branch, not this one.
+        let e = tmp(b"a\n\x80b", ".csv"); // invalid byte beside surviving text
+        assert_eq!(read_universal_lines(e.path()).unwrap(), vec!["a", "b"]);
+        let f = tmp(b"a\n   ", ".csv"); // whitespace-only tail is still text
+        assert_eq!(read_universal_lines(f.path()).unwrap(), vec!["a", "   "]);
     }
 
     #[test]
