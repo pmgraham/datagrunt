@@ -11,8 +11,9 @@ serves two roles as one body of code:
 
 Workflow: change CSV-compute behavior HERE first, validate against the test
 suite, then port the change to Rust and let the parity suite confirm they agree.
-This module must stand alone in pure Python — standard library + FileProperties
-only; it must never import ``datagrunt._native`` or ``_compute``.
+This module must stand alone in pure Python — standard library + FileProperties,
+plus the typing-only ``_compute_protocol`` import below (it imports nothing back,
+so this is not a cycle); it must never import ``datagrunt._native`` or ``_compute``.
 """
 
 # standard library
@@ -20,8 +21,11 @@ import csv
 import re
 import sys
 from collections import Counter
+from collections.abc import Iterator
+from typing import TextIO, cast
 
 # local libraries
+from datagrunt.core.csv_io._compute_protocol import HeaderProbe, SniffedDialect, StrPath
 from datagrunt.core.file_io import FileProperties
 
 # --- delimiter inference constants (from CSVDelimiter) ---
@@ -49,7 +53,7 @@ EMPTY_NAME_PLACEHOLDER = "column"
 MAX_LINE_CHARS = 2 * 1024 * 1024
 
 
-def _capped_lines(f):
+def _capped_lines(f: TextIO) -> Iterator[str]:
     """Yield each line from a text file, truncated to ``MAX_LINE_CHARS`` chars.
 
     Mirrors the Rust line readers' per-line cap so the two backends agree on
@@ -60,7 +64,7 @@ def _capped_lines(f):
         yield line if len(line) <= MAX_LINE_CHARS else line[:MAX_LINE_CHARS]
 
 
-def is_legacy_mac_newlines(filepath):
+def is_legacy_mac_newlines(filepath: StrPath) -> bool:
     """True if the file uses legacy Mac OS carriage returns (\\r) as line endings."""
     try:
         with open(filepath, "rb") as f:
@@ -70,7 +74,7 @@ def is_legacy_mac_newlines(filepath):
         return False
 
 
-def count_leading_comments(filepath):
+def count_leading_comments(filepath: StrPath) -> int:
     """Count leading ``#``-prefixed comment lines before the header (blanks skipped)."""
     count = 0
     with open(filepath, "r", encoding=FileProperties(filepath).DEFAULT_ENCODING, errors="ignore") as f:
@@ -85,7 +89,7 @@ def count_leading_comments(filepath):
     return count
 
 
-def count_leading_physical_lines_before_header(filepath):
+def count_leading_physical_lines_before_header(filepath: StrPath) -> int:
     """Count every leading physical line up to and including the header line."""
     count = 0
     with open(filepath, "r", encoding=FileProperties(filepath).DEFAULT_ENCODING, errors="ignore") as f:
@@ -97,9 +101,9 @@ def count_leading_physical_lines_before_header(filepath):
     return count
 
 
-def leading_rows(filepath, limit):
+def leading_rows(filepath: StrPath, limit: int) -> list[str]:
     """Up to ``limit`` leading non-blank, non-comment rows, each stripped."""
-    rows = []
+    rows: list[str] = []
     with open(filepath, "r", encoding=FileProperties(filepath).DEFAULT_ENCODING, errors="ignore") as f:
         for line in _capped_lines(f):
             stripped = line.strip()
@@ -110,13 +114,13 @@ def leading_rows(filepath, limit):
     return rows
 
 
-def first_row(filepath):
+def first_row(filepath: StrPath) -> str:
     """The first non-comment row, stripped, or "" if none."""
     rows = leading_rows(filepath, 1)
     return rows[0] if rows else ""
 
 
-def _nul_safe_lines(f):
+def _nul_safe_lines(f: TextIO) -> Iterator[str]:
     """Line stream safe for ``csv.reader`` on every supported Python.
 
     Python < 3.11's csv module rejects NUL characters ("line contains NUL");
@@ -129,7 +133,7 @@ def _nul_safe_lines(f):
     return (line.replace("\0", "�") for line in f)
 
 
-def check_ragged(filepath, delimiter):
+def check_ragged(filepath: StrPath, delimiter: str) -> bool:
     """Return True if the CSV has ragged rows in the first 10,000 data rows.
 
     Bool only (no warning — that stays in the csvcomponents wrapper). Best-effort:
@@ -162,7 +166,7 @@ def check_ragged(filepath, delimiter):
     return False
 
 
-def row_count_with_header(filepath, delimiter):
+def row_count_with_header(filepath: StrPath, delimiter: str) -> int:
     """Number of CSV records including the header (quoted newlines = one record)."""
     newline_param = None if is_legacy_mac_newlines(filepath) else ""
     encoding = FileProperties(filepath).DEFAULT_ENCODING
@@ -176,25 +180,25 @@ def row_count_with_header(filepath, delimiter):
     return count
 
 
-def _candidates_most_common(first_row_str):
+def _candidates_most_common(first_row_str: str) -> list[str]:
     """Non-alphanumeric header characters, most common first (Counter.most_common)."""
     columns_no_spaces = first_row_str.replace(" ", "")
     counts = Counter(DELIMITER_REGEX.findall(columns_no_spaces))
     return [char for char, _ in counts.most_common()]
 
 
-def _split_row(row, char):
+def _split_row(row: str, char: str) -> list[str]:
     return row.split() if char == SPACE_DELIMITER else row.split(char)
 
 
-def _splits_rows_consistently(sample_rows, char):
+def _splits_rows_consistently(sample_rows: list[str], char: str) -> bool:
     if len(sample_rows) < 2:
         return False
     field_counts = {len(_split_row(r, char)) for r in sample_rows}
     return len(field_counts) == 1 and field_counts.pop() >= MIN_CONSISTENT_FIELDS
 
 
-def probe_csv_header(filepath):
+def probe_csv_header(filepath: StrPath) -> HeaderProbe:
     """Single-pass header probe shared by delimiter + dialect inference.
 
     One read captures everything both inference paths need, replacing the
@@ -213,8 +217,8 @@ def probe_csv_header(filepath):
     if props.is_empty:
         return {"empty": True, "blank": False, "first_row": "", "sample_rows": [], "sample_lines": []}
 
-    sample_lines = []
-    sample_rows = []
+    sample_lines: list[str] = []
+    sample_rows: list[str] = []
     saw_nonblank = False
     # NOTE on blankness semantics: this probe derives ``blank`` from
     # ``saw_nonblank`` over lines decoded with ``errors="ignore"``. An
@@ -250,7 +254,7 @@ def probe_csv_header(filepath):
     }
 
 
-def infer_delimiter(filepath):
+def infer_delimiter(filepath: StrPath) -> str:
     """Infer the delimiter (safe > consistent punctuation > space > comma)."""
     props = FileProperties(filepath)
     if props.is_tsv:
@@ -271,7 +275,7 @@ def infer_delimiter(filepath):
     return DEFAULT_DELIMITER
 
 
-def sniff_dialect(filepath, delimiter=None):
+def sniff_dialect(filepath: StrPath, delimiter: str | None = None) -> SniffedDialect | None:
     """Sniff the CSV dialect, returning the native dict shape (or None).
 
     None for empty/blank files and undeterminable samples. The constant fields
@@ -289,18 +293,23 @@ def sniff_dialect(filepath, delimiter=None):
             dialect = csv.Sniffer().sniff(sample)
     except csv.Error:
         return None
-    return {
+    sniffed: SniffedDialect = {
         "delimiter": dialect.delimiter,
-        "quotechar": dialect.quotechar,
+        # typeshed types Dialect.quotechar as `str | None` for the general case
+        # (a hand-rolled dialect could set it to None), but CPython's own
+        # Sniffer.sniff() unconditionally sets `quotechar = quotechar or '"'`
+        # before returning — never None. The cast reflects that guarantee.
+        "quotechar": cast(str, dialect.quotechar),
         "escapechar": None,
         "doublequote": dialect.doublequote,
         "lineterminator": "\r\n",
         "skipinitialspace": dialect.skipinitialspace,
         "quoting": 0,
     }
+    return sniffed
 
 
-def _normalize_single(name):
+def _normalize_single(name: str) -> str:
     name = name.lower()
     name = SPECIAL_CHARS_PATTERN.sub("_", name)
     name = name.strip("_")
@@ -310,9 +319,9 @@ def _normalize_single(name):
     return f"_{name}" if name[0].isdigit() else name
 
 
-def _make_unique(columns_list):
-    emitted = set()
-    unique_names = []
+def _make_unique(columns_list: list[str]) -> list[str]:
+    emitted: set[str] = set()
+    unique_names: list[str] = []
     for name in columns_list:
         candidate = name
         suffix = 0
@@ -324,6 +333,6 @@ def _make_unique(columns_list):
     return unique_names
 
 
-def normalize_columns(names):
+def normalize_columns(names: list[str]) -> list[str]:
     """Normalize then collision-safe-uniquify a list of column names."""
     return _make_unique([_normalize_single(c) for c in names])

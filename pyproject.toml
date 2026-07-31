@@ -147,6 +147,7 @@ mypy_path = "src"
 files = [
     "src/datagrunt/core/csv_io/_compute.py",
     "src/datagrunt/core/csv_io/_compute_protocol.py",
+    "src/datagrunt/core/csv_io/_compute_python.py",
     "src/datagrunt/_native.pyi",
     "src/datagrunt/core/csv_io/csvcomponents.py",
     "src/datagrunt/core/excel_io/excelcomponents.py",
@@ -158,13 +159,15 @@ warn_redundant_casts = true
 # Listed explicitly rather than as `..._compute*`: mypy only accepts `*` as a
 # whole dotted component, and rejects a partial-component pattern with a
 # *warning* while still exiting 0 — a silently unenforced override. These are
-# the scoped modules above; `_compute_python` is excluded on purpose (the
-# oracle is unannotated, and annotating it is #314's job, not this gate's).
+# the scoped modules above, now including `_compute_python`: the oracle is
+# annotated to the ComputeBackendProtocol, so the TYPE_CHECKING conformance
+# assignment in _compute.py enforces its signatures, not just its members (#314).
 [[tool.mypy.overrides]]
 module = [
     "datagrunt._native",
     "datagrunt.core.csv_io._compute",
     "datagrunt.core.csv_io._compute_protocol",
+    "datagrunt.core.csv_io._compute_python",
 ]
 disallow_untyped_defs = true
 
