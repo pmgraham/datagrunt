@@ -20,7 +20,19 @@ class _PDFEngineBacked(PDFComponents):
 
     _engine_role: ClassVar[str | None] = None  # "reader" or "writer"
 
-    def __init__(self, filepath, engine="pdfium", workers=1, native=False, *, min_image_dimension=None):
+    def __init__(
+        self,
+        filepath,
+        engine="pdfium",
+        workers=1,
+        native=False,
+        *,
+        min_image_dimension=None,
+        ocr_standard_dpi=None,
+        ocr_large_format_dpi=None,
+        ocr_large_format_dimension=None,
+        render_dpi=None,
+    ):
         """Initialize a PDF reader/writer.
 
         Args:
@@ -37,6 +49,17 @@ class _PDFEngineBacked(PDFComponents):
             min_image_dimension (int, optional, keyword-only): Minimum embedded-image
                 pixel size (either side) to keep; smaller images are dropped as
                 layout artifacts. Defaults to 40. Use 0 to keep every image.
+            ocr_standard_dpi (int, optional, keyword-only): OCR render DPI used for
+                normal-sized pages. Defaults to 150.
+            ocr_large_format_dpi (int, optional, keyword-only): OCR render DPI used
+                for large-format pages (see ``ocr_large_format_dimension``).
+                Defaults to 75.
+            ocr_large_format_dimension (int, optional, keyword-only): Page width/height
+                threshold (points); a page with either side above this is treated as
+                large-format and rendered at ``ocr_large_format_dpi`` instead of
+                ``ocr_standard_dpi``. Defaults to 1500.
+            render_dpi (int, optional, keyword-only): Default DPI for rendering pages
+                to images. Defaults to 300.
         """
         if not isinstance(filepath, dict):
             filepath = Path(filepath)
@@ -44,7 +67,17 @@ class _PDFEngineBacked(PDFComponents):
         self.engine = engine.lower().replace(" ", "")
         self.workers = workers
         self.native = native
-        overrides = {k: v for k, v in {"min_image_dimension": min_image_dimension}.items() if v is not None}
+        overrides = {
+            k: v
+            for k, v in {
+                "min_image_dimension": min_image_dimension,
+                "ocr_standard_dpi": ocr_standard_dpi,
+                "ocr_large_format_dpi": ocr_large_format_dpi,
+                "ocr_large_format_dimension": ocr_large_format_dimension,
+                "render_dpi": render_dpi,
+            }.items()
+            if v is not None
+        }
         # Validates immediately (fail-fast at construction).
         self._extraction_config = _PDFExtractionConfig(**overrides)
 

@@ -14,6 +14,9 @@ class PDFWriter(_PDFEngineBacked):
 
     Pass ``min_image_dimension`` (keyword-only) to control the minimum embedded
     image pixel size kept during extraction (default 40; 0 keeps everything).
+    Pass ``ocr_standard_dpi`` / ``ocr_large_format_dpi`` / ``ocr_large_format_dimension``
+    (keyword-only) to control the OCR render DPI policy, and ``render_dpi``
+    (keyword-only) to control the default page-rendering DPI.
     """
 
     _engine_role = "writer"

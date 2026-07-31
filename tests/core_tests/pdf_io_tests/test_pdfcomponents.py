@@ -372,6 +372,56 @@ class TestDocumentAssemblerConfig:
         assert image_elems == []
 
 
+class TestDocumentAssemblerOcrDpiConfig:
+    """DocumentAssembler passes its held config's OCR DPI to the backend (issue #246).
+
+    ``parse_page`` calls ``self.backend.ocr_page(page_index, dpi=...)`` on
+    whichever backend it holds (pymupdf here, or pdfium via
+    ``TestParsePageBackend``'s explicit-backend style) -- the DPI policy lives
+    in the assembler, not the backend, so this one call site covers both.
+    """
+
+    def test_assembler_passes_config_dpi_to_backend_ocr_page(self, scanned_pdf, tesseract_available, monkeypatch):
+        if not tesseract_available:
+            pytest.skip("tesseract not available")
+        assembler = pdfcomponents.DocumentAssembler(
+            scanned_pdf, extraction_config=_PDFExtractionConfig(ocr_standard_dpi=300)
+        )
+        calls = []
+        original_ocr_page = assembler.backend.ocr_page
+
+        def spy_ocr_page(page_index, dpi=300):
+            calls.append(dpi)
+            return original_ocr_page(page_index, dpi=dpi)
+
+        monkeypatch.setattr(assembler.backend, "ocr_page", spy_ocr_page)
+
+        page = assembler.parse_page(0)
+
+        assert calls == [300]
+        # Sanity: OCR actually ran and found the embedded text, so this isn't
+        # a vacuous spy call on a path that produced nothing.
+        assert any(e["type"] == "body_text" for e in page["elements"])
+
+    def test_assembler_default_config_uses_module_default_dpi(self, scanned_pdf, tesseract_available, monkeypatch):
+        """No explicit extraction_config -> the historical STANDARD_DPI (150) still applies."""
+        if not tesseract_available:
+            pytest.skip("tesseract not available")
+        assembler = pdfcomponents.DocumentAssembler(scanned_pdf)
+        calls = []
+        original_ocr_page = assembler.backend.ocr_page
+
+        def spy_ocr_page(page_index, dpi=300):
+            calls.append(dpi)
+            return original_ocr_page(page_index, dpi=dpi)
+
+        monkeypatch.setattr(assembler.backend, "ocr_page", spy_ocr_page)
+
+        assembler.parse_page(0)
+
+        assert calls == [150]
+
+
 class TestParsePageBackend:
     """DocumentAssembler.parse_page consumes an ExtractionBackend + table extractor."""
 

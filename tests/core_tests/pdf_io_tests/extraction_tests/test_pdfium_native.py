@@ -1,5 +1,7 @@
 """Tests for PdfiumNativeReader (native pdfium schema)."""
 
+import pytest
+
 from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
 from datagrunt.core.pdf_io.extraction.pdfium_native import PdfiumNativeReader
 
@@ -98,3 +100,54 @@ def test_native_lowered_threshold_keeps_small_image(small_image_pdf):
     reader = PdfiumNativeReader(small_image_pdf, extraction_config=_PDFExtractionConfig(min_image_dimension=10))
     page = reader.parse_page(0)
     assert len(page["images"]) == 1
+
+
+class TestPdfiumNativeReaderOcrDpiConfig:
+    """PdfiumNativeReader passes its held config's OCR DPI to render_pil (issue #246).
+
+    ``_ocr_fallback`` is the pdfium-native OCR fallback path (the third of the
+    three OCR paths alongside the pymupdf and pdfium-structured backends that
+    ``DocumentAssembler`` drives) -- it renders the page itself via
+    ``PdfiumPage.render_pil`` rather than going through an ``ExtractionBackend``.
+    """
+
+    def test_ocr_fallback_passes_config_dpi_to_render_pil(self, scanned_pdf, tesseract_available, monkeypatch):
+        if not tesseract_available:
+            pytest.skip("tesseract not available")
+        from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumPage
+
+        recorded = []
+        original_render_pil = PdfiumPage.render_pil
+
+        def spy_render_pil(self, dpi=300):
+            recorded.append(dpi)
+            return original_render_pil(self, dpi=dpi)
+
+        monkeypatch.setattr(PdfiumPage, "render_pil", spy_render_pil)
+
+        reader = PdfiumNativeReader(scanned_pdf, extraction_config=_PDFExtractionConfig(ocr_standard_dpi=300))
+        page = reader.parse_page(0)
+
+        assert recorded == [300]
+        # Sanity: OCR actually ran and found the embedded text, so this isn't
+        # a vacuous spy call on a path that produced nothing.
+        assert page["ocr"] is True
+
+    def test_ocr_fallback_default_config_uses_module_default_dpi(self, scanned_pdf, tesseract_available, monkeypatch):
+        """No explicit extraction_config -> the historical STANDARD_DPI (150) still applies."""
+        if not tesseract_available:
+            pytest.skip("tesseract not available")
+        from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumPage
+
+        recorded = []
+        original_render_pil = PdfiumPage.render_pil
+
+        def spy_render_pil(self, dpi=300):
+            recorded.append(dpi)
+            return original_render_pil(self, dpi=dpi)
+
+        monkeypatch.setattr(PdfiumPage, "render_pil", spy_render_pil)
+
+        PdfiumNativeReader(scanned_pdf).parse_page(0)
+
+        assert recorded == [150]

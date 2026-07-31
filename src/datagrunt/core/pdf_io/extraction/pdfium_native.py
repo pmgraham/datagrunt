@@ -107,7 +107,7 @@ class PdfiumNativeReader(_ThreadLocalDocSession):
 
         Reuses the already-open ``page`` rather than opening a second handle.
         """
-        page_dpi = dpi_for_page(width, height)
+        page_dpi = dpi_for_page(width, height, self._config)
         img = page.render_pil(dpi=page_dpi)
         blocks = ocr_data_to_blocks(img, page_dpi)
         if not blocks:
