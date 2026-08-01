@@ -50,7 +50,7 @@ dev = [
     # Upper-bounded the same way as ruff (#312): allow the current minor,
     # exclude the next. mypy adds default-on error codes in 1.x minor
     # releases, and this gate is blocking.
-    "mypy>=1.14,<1.21",
+    "mypy>=1.14,<2.4",
     "bumpver>=2026.1132",
     "maturin>=1.7,<2.0",
     "pre-commit>=4.0.0",
