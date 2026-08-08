@@ -67,7 +67,7 @@ dev = [
     # parity search is worth the cost, and the cost is real: Hypothesis ships
     # minors roughly weekly, so expect near-continuous Dependabot bumps here.
     # Take them one at a time and re-run the parity suite on each.
-    "hypothesis>=6.164.0,<6.165",
+    "hypothesis>=6.164.0,<6.166",
 ]
 
 [project.urls]
