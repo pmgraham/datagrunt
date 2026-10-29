@@ -1,0 +1,764 @@
+"""Tests for the v5 PDF element types (``datagrunt.pdf.elements``)."""
+
+import dataclasses
+import hashlib
+import os
+from pathlib import Path
+from typing import get_args
+
+import polars as pl
+import pyarrow as pa
+import pytest
+
+import datagrunt.pdf.elements as elements_module
+from datagrunt.pdf import (
+    HIDDEN_REASONS,
+    BBox,
+    BulletList,
+    DatagruntPDFError,
+    DocumentElement,
+    Figure,
+    Heading,
+    HiddenReason,
+    KeyValue,
+    Paragraph,
+    Table,
+)
+from datagrunt.pdf.elements import ExtractionMethod, PageRoute, PageStatus, make_element_id
+
+
+def _bbox():
+    return BBox(x0=0, y0=0, x1=100, y1=20)
+
+
+def _base(**overrides):
+    kwargs = {"element_id": "p0001_e001", "page_number": 1, "reading_order": 0, "bbox": _bbox()}
+    kwargs.update(overrides)
+    return kwargs
+
+
+# Minimal own-field kwargs per element class; base-invariant tests run against
+# every class to prove each one inherits the shared validation.
+ELEMENT_FIELDS = {
+    Heading: {"level": 2, "text": "Overview"},
+    Paragraph: {"text": "Body text."},
+    KeyValue: {"key": "Invoice", "value": "42"},
+    BulletList: {"items": ("one", "two"), "ordered": False},
+    Table: {"headers": ("a", "b"), "rows": (("1", "2"),), "extraction_method": "lattice"},
+    Figure: {"sha256": hashlib.sha256(b"png-bytes").hexdigest(), "width_px": 64, "height_px": 32},
+}
+ELEMENT_CLASSES = list(ELEMENT_FIELDS)
+
+
+def _element(cls, **overrides):
+    return cls(**{**_base(), **ELEMENT_FIELDS[cls], **overrides})
+
+
+class TestTypeAliases:
+    def test_hidden_reasons_canonical_order(self):
+        assert HIDDEN_REASONS == ("off_page", "invisible", "tiny_font", "transparent")
+
+    def test_hidden_reason_literal_members(self):
+        assert get_args(HiddenReason) == ("off_page", "invisible", "tiny_font", "transparent")
+
+    def test_page_status_values(self):
+        assert get_args(PageStatus) == ("ok", "ocr_fallback", "error")
+
+    def test_page_route_values(self):
+        assert get_args(PageRoute) == ("digital", "hybrid", "vision")
+
+    def test_extraction_method_values(self):
+        assert get_args(ExtractionMethod) == ("lattice", "stream")
+
+    def test_document_element_is_union_of_the_six_element_types(self):
+        assert set(get_args(DocumentElement)) == {Heading, Paragraph, KeyValue, Table, BulletList, Figure}
+
+
+class TestMakeElementId:
+    @pytest.mark.parametrize(
+        ("page", "index", "expected"),
+        [(1, 3, "p0001_e003"), (1, 0, "p0001_e000"), (9999, 999, "p9999_e999"), (12345, 1000, "p12345_e1000")],
+    )
+    def test_zero_padded_format(self, page, index, expected):
+        assert make_element_id(page, index) == expected
+
+    def test_page_zero_rejected(self):
+        with pytest.raises(ValueError, match="page_number"):
+            make_element_id(0, 1)
+
+    def test_negative_index_rejected(self):
+        with pytest.raises(ValueError, match="index"):
+            make_element_id(1, -1)
+
+    @pytest.mark.parametrize(("page", "index"), [(True, 1), (1, True), (1.0, 1), (1, "1")])
+    def test_wrong_types_rejected(self, page, index):
+        with pytest.raises(TypeError):
+            make_element_id(page, index)
+
+
+@pytest.mark.parametrize("cls", ELEMENT_CLASSES)
+class TestElementBase:
+    def test_valid_minimal_element(self, cls):
+        element = _element(cls)
+        assert element.element_id == "p0001_e001"
+        assert element.scope_path == ()
+        assert element.hidden_reasons == ()
+        assert element.is_hidden is False
+
+    def test_large_page_number_id(self, cls):
+        assert _element(cls, element_id="p12345_e001", page_number=12345).page_number == 12345
+
+    def test_element_id_page_mismatch_rejected(self, cls):
+        with pytest.raises(ValueError, match="element_id"):
+            _element(cls, element_id="p0002_e001")
+
+    @pytest.mark.parametrize(
+        "bad_id",
+        [
+            "",
+            "p001_e001",
+            "p0001_e01",
+            "P0001_e001",
+            "p0001-e001",
+            "p0001_e001\n",
+            " p0001_e001",
+            "p0001_e001x",
+            "p١٢٣٤_e001",
+            "p00001_e001",
+            "p0001_e0001",
+        ],
+    )
+    def test_malformed_element_id_rejected(self, cls, bad_id):
+        with pytest.raises(ValueError, match="element_id"):
+            _element(cls, element_id=bad_id)
+
+    def test_element_id_wrong_type_rejected(self, cls):
+        with pytest.raises(TypeError, match="element_id"):
+            _element(cls, element_id=1)
+
+    @pytest.mark.parametrize(("field", "bad"), [("page_number", 0), ("reading_order", -1)])
+    def test_int_fields_below_minimum_rejected(self, cls, field, bad):
+        with pytest.raises(ValueError, match=field):
+            _element(cls, **{field: bad})
+
+    @pytest.mark.parametrize("field", ["page_number", "reading_order"])
+    @pytest.mark.parametrize("bad", [True, 1.0])
+    def test_int_fields_wrong_type_rejected(self, cls, field, bad):
+        with pytest.raises(TypeError, match=field):
+            _element(cls, **{field: bad})
+
+    def test_reading_order_zero_and_up(self, cls):
+        assert _element(cls, reading_order=0).reading_order == 0
+        assert _element(cls, reading_order=7).reading_order == 7
+
+    def test_bbox_must_be_a_bbox(self, cls):
+        with pytest.raises(TypeError, match="bbox"):
+            _element(cls, bbox=(0, 0, 100, 20))
+
+    def test_scope_path_accepts_tuple_of_headings(self, cls):
+        assert _element(cls, scope_path=("Report", "Findings")).scope_path == ("Report", "Findings")
+
+    @pytest.mark.parametrize(
+        ("bad", "exc"), [(("Report", " "), ValueError), (["Report"], TypeError), ((1,), TypeError)]
+    )
+    def test_bad_scope_path_rejected(self, cls, bad, exc):
+        with pytest.raises(exc, match="scope_path"):
+            _element(cls, scope_path=bad)
+
+    @pytest.mark.parametrize("reasons", [("off_page",), ("invisible", "transparent"), HIDDEN_REASONS])
+    def test_hidden_reasons_flag_element_as_hidden(self, cls, reasons):
+        element = _element(cls, hidden_reasons=reasons)
+        assert element.hidden_reasons == reasons
+        assert element.is_hidden is True
+
+    @pytest.mark.parametrize(
+        ("bad", "match"),
+        [
+            (("invisible", "invisible"), "duplicate"),
+            (("blurry",), "unknown"),
+            (("tiny_font", "off_page"), "canonical order"),
+            (("transparent", "invisible"), "canonical order"),
+        ],
+    )
+    def test_bad_hidden_reasons_rejected(self, cls, bad, match):
+        with pytest.raises(ValueError, match=match):
+            _element(cls, hidden_reasons=bad)
+
+    @pytest.mark.parametrize("bad", [["off_page"], (1,), "off_page"])
+    def test_hidden_reasons_wrong_type_rejected(self, cls, bad):
+        with pytest.raises(TypeError, match="hidden_reasons"):
+            _element(cls, hidden_reasons=bad)
+
+    def test_is_frozen_slotted_and_keyword_only(self, cls):
+        element = _element(cls)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            element.reading_order = 5
+        assert not hasattr(element, "__dict__")
+        # Every field supplied positionally: only kw_only can make this a TypeError.
+        positional = [getattr(element, f.name) for f in dataclasses.fields(element)]
+        with pytest.raises(TypeError, match="positional argument"):
+            cls(*positional)
+
+    def test_replace_revalidates(self, cls):
+        with pytest.raises(ValueError, match="element_id"):
+            dataclasses.replace(_element(cls), page_number=2)
+
+    def test_replace_with_valid_values_succeeds(self, cls):
+        moved = dataclasses.replace(_element(cls), element_id="p0002_e001", page_number=2)
+        assert moved.page_number == 2
+
+    def test_equal_and_hashable(self, cls):
+        assert _element(cls) == _element(cls)
+        assert hash(_element(cls)) == hash(_element(cls))
+
+
+class TestHeading:
+    @pytest.mark.parametrize("level", [1, 6])
+    def test_level_bounds(self, level):
+        assert _element(Heading, level=level).level == level
+
+    def test_replace_revalidates_own_fields(self):
+        with pytest.raises(ValueError, match="level"):
+            dataclasses.replace(_element(Heading), level=7)
+
+    @pytest.mark.parametrize("bad", [0, 7, -1])
+    def test_level_out_of_range_rejected(self, bad):
+        with pytest.raises(ValueError, match="level"):
+            _element(Heading, level=bad)
+
+    @pytest.mark.parametrize("bad", [True, 2.0, "2"])
+    def test_level_wrong_type_rejected(self, bad):
+        with pytest.raises(TypeError, match="level"):
+            _element(Heading, level=bad)
+
+    @pytest.mark.parametrize(("bad", "exc"), [("", ValueError), (" \n", ValueError), (None, TypeError)])
+    def test_bad_text_rejected(self, bad, exc):
+        with pytest.raises(exc, match="text"):
+            _element(Heading, text=bad)
+
+    @pytest.mark.parametrize(("level", "expected"), [(1, "# Overview"), (3, "### Overview"), (6, "###### Overview")])
+    def test_to_markdown(self, level, expected):
+        assert _element(Heading, level=level).to_markdown() == expected
+
+    @pytest.mark.parametrize("text", ["Line one\nLine two", "Line one\r\nLine two", "Line one\rLine two"])
+    def test_to_markdown_renders_line_breaks_as_spaces(self, text):
+        heading = _element(Heading, text=text)
+        assert heading.to_markdown() == "## Line one Line two"
+        assert heading.text == text  # data stays verbatim
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("Rank #", "## Rank \\#"),
+            ("#", "## \\#"),
+            ("Issue ##  ", "## Issue \\##  "),
+            ("Tabbed\t#", "## Tabbed\t\\#"),
+            ("Line\n#", "## Line \\#"),  # the break becomes a space, exposing the run
+            ("C#", "## C#"),  # not a closing sequence: no space before the run
+            ("C# and F#", "## C# and F#"),
+            ("# leading", "## # leading"),
+        ],
+    )
+    def test_to_markdown_trailing_hash_run_not_eaten_as_closing_sequence(self, text, expected):
+        assert _element(Heading, text=text).to_markdown() == expected
+
+
+class TestParagraph:
+    @pytest.mark.parametrize(("bad", "exc"), [("", ValueError), ("\t", ValueError), (b"x", TypeError)])
+    def test_bad_text_rejected(self, bad, exc):
+        with pytest.raises(exc, match="text"):
+            _element(Paragraph, text=bad)
+
+    def test_plain_text_unchanged(self):
+        assert _element(Paragraph, text="Plain body text.").to_markdown() == "Plain body text."
+
+    def test_leading_metachar_escaped(self):
+        assert _element(Paragraph, text="# not a heading").to_markdown() == "\\# not a heading"
+
+    def test_every_line_escaped(self):
+        paragraph = _element(Paragraph, text="intro\n- not a list\n1. not ordered\n> not a quote")
+        assert paragraph.to_markdown() == "intro\n\\- not a list\n1\\. not ordered\n\\> not a quote"
+
+    @pytest.mark.parametrize("sep", ["\r\n", "\r", "\n"])
+    def test_line_endings_preserved_while_escaping(self, sep):
+        paragraph = _element(Paragraph, text=f"a{sep}# b")
+        assert paragraph.to_markdown() == f"a{sep}\\# b"
+
+    def test_text_field_stays_verbatim(self):
+        assert _element(Paragraph, text="# raw").text == "# raw"
+
+
+class TestKeyValue:
+    def test_empty_value_allowed(self):
+        assert _element(KeyValue, value="").value == ""
+
+    @pytest.mark.parametrize(("bad", "exc"), [("", ValueError), (" ", ValueError), (3, TypeError)])
+    def test_bad_key_rejected(self, bad, exc):
+        with pytest.raises(exc, match="key"):
+            _element(KeyValue, key=bad)
+
+    @pytest.mark.parametrize("bad", [None, 42, ("v",)])
+    def test_value_wrong_type_rejected(self, bad):
+        with pytest.raises(TypeError, match="value"):
+            _element(KeyValue, value=bad)
+
+    def test_to_markdown(self):
+        assert _element(KeyValue).to_markdown() == "**Invoice:** 42"
+
+    def test_to_markdown_empty_value(self):
+        assert _element(KeyValue, value="").to_markdown() == "**Invoice:** "
+
+    def test_to_markdown_escapes_asterisks_in_key(self):
+        kv = _element(KeyValue, key="Total *net*", value="5 * 3")
+        assert kv.to_markdown() == "**Total \\*net\\*:** 5 * 3"
+        assert kv.key == "Total *net*"
+
+    @pytest.mark.parametrize(
+        ("key", "expected"),
+        [
+            ("C:\\", "**C:\\\\:** v"),  # trailing backslash would otherwise escape the colon
+            ("a\\*b", "**a\\\\\\*b:** v"),  # backslash escaped before the star
+            ("k\n# H", "**k # H:** v"),  # line break in key cannot start a heading
+            ("k\r\nl", "**k l:** v"),
+            ("  padded  ", "**padded:** v"),  # leading space would stop ** opening emphasis
+        ],
+    )
+    def test_to_markdown_key_escaping(self, key, expected):
+        kv = _element(KeyValue, key=key, value="v")
+        assert kv.to_markdown() == expected
+        assert kv.key == key
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("v\n# H", "**K:** v\n\\# H"),
+            ("v\n===", "**K:** v\n\\==="),
+            ("v\r\n- item", "**K:** v\r\n\\- item"),
+        ],
+    )
+    def test_to_markdown_value_lines_escaped(self, value, expected):
+        kv = _element(KeyValue, key="K", value=value)
+        assert kv.to_markdown() == expected
+        assert kv.value == value
+
+
+class TestBulletList:
+    def test_single_item(self):
+        assert _element(BulletList, items=("only",)).to_markdown() == "- only"
+
+    def test_unordered_markdown(self):
+        assert _element(BulletList, items=("a", "b", "c")).to_markdown() == "- a\n- b\n- c"
+
+    def test_ordered_markdown_numbers_sequentially(self):
+        bullets = _element(BulletList, items=("a", "b", "c"), ordered=True)
+        assert bullets.to_markdown() == "1. a\n2. b\n3. c"
+
+    def test_items_escaped(self):
+        bullets = _element(BulletList, items=("- nested?", "2. numbered", "# hash"), ordered=True)
+        assert bullets.to_markdown() == "1. \\- nested?\n2. 2\\. numbered\n3. \\# hash"
+        assert bullets.items == ("- nested?", "2. numbered", "# hash")
+
+    @pytest.mark.parametrize(
+        ("ordered", "expected"),
+        [
+            (False, "- first\n  \\# second\n  third"),
+            (True, "1. first\n   \\# second\n   third"),
+        ],
+    )
+    def test_multi_line_item_stays_inside_the_list(self, ordered, expected):
+        bullets = _element(BulletList, items=("first\n# second\r\nthird",), ordered=ordered)
+        assert bullets.to_markdown() == expected
+
+    def test_continuation_indent_tracks_marker_width(self):
+        items = tuple(f"item{n}" for n in range(1, 10)) + ("ten\n- not a sub-list",)
+        lines = _element(BulletList, items=items, ordered=True).to_markdown().split("\n")
+        assert lines[-2:] == ["10. ten", "    \\- not a sub-list"]
+
+    def test_empty_items_rejected(self):
+        with pytest.raises(ValueError, match="items"):
+            _element(BulletList, items=())
+
+    @pytest.mark.parametrize(("bad", "exc"), [(("a", ""), ValueError), (["a"], TypeError), (("a", None), TypeError)])
+    def test_bad_items_rejected(self, bad, exc):
+        with pytest.raises(exc, match="items"):
+            _element(BulletList, items=bad)
+
+    @pytest.mark.parametrize("bad", [1, 0, "yes", None])
+    def test_ordered_must_be_bool(self, bad):
+        with pytest.raises(TypeError, match="ordered"):
+            _element(BulletList, ordered=bad)
+
+
+def _table(**overrides):
+    return _element(Table, **overrides)
+
+
+class TestTableShape:
+    def test_headers_and_rows(self):
+        table = _table(headers=("Name", "Qty"), rows=(("bolt", "4"), ("nut", "9")))
+        assert table.headers == ("Name", "Qty")
+        assert table.rows == (("bolt", "4"), ("nut", "9"))
+        assert table.continued_from_id is None
+
+    def test_headers_with_zero_rows(self):
+        assert _table(headers=("a",), rows=()).rows == ()
+
+    def test_rows_without_headers(self):
+        assert _table(headers=(), rows=(("1", "2", "3"),)).headers == ()
+
+    def test_single_cell_table(self):
+        assert _table(headers=(), rows=(("x",),)).rows == (("x",),)
+
+    def test_blank_headers_and_cells_allowed(self):
+        table = _table(headers=("", " "), rows=(("", "\n"),))
+        assert table.headers == ("", " ")
+
+    def test_no_headers_and_no_rows_rejected(self):
+        with pytest.raises(ValueError, match="headers or at least one row"):
+            _table(headers=(), rows=())
+
+    def test_zero_width_rows_rejected(self):
+        with pytest.raises(ValueError, match="at least one column"):
+            _table(headers=(), rows=((),))
+
+    @pytest.mark.parametrize("bad_row", [("1",), ("1", "2", "3")])
+    def test_row_width_must_match_headers(self, bad_row):
+        with pytest.raises(ValueError, match=r"rows\[1\]"):
+            _table(headers=("a", "b"), rows=(("1", "2"), bad_row))
+
+    def test_ragged_headerless_rows_rejected(self):
+        with pytest.raises(ValueError, match=r"rows\[2\]"):
+            _table(headers=(), rows=(("1", "2"), ("3", "4"), ("5",)))
+
+    @pytest.mark.parametrize(
+        ("field", "bad"),
+        [
+            ("headers", ["a", "b"]),
+            ("headers", ("a", 2)),
+            ("rows", [("1", "2")]),
+            ("rows", (["1", "2"],)),
+            ("rows", (("1", 2),)),
+            ("rows", (("1", None),)),
+        ],
+    )
+    def test_wrong_types_rejected(self, field, bad):
+        with pytest.raises(TypeError, match=field):
+            _table(**{field: bad})
+
+    @pytest.mark.parametrize("method", ["lattice", "stream"])
+    def test_extraction_methods(self, method):
+        assert _table(extraction_method=method).extraction_method == method
+
+    @pytest.mark.parametrize(("bad", "exc"), [("hybrid", ValueError), ("", ValueError), (None, TypeError)])
+    def test_bad_extraction_method_rejected(self, bad, exc):
+        with pytest.raises(exc, match="extraction_method"):
+            _table(extraction_method=bad)
+
+
+class TestTableContinuation:
+    def test_valid_continuation_id(self):
+        assert _table(continued_from_id="p0001_e000").continued_from_id == "p0001_e000"
+
+    def test_continuation_from_earlier_page_id_format_allowed(self):
+        table = _table(element_id="p0002_e000", page_number=2, continued_from_id="p0001_e004")
+        assert table.continued_from_id == "p0001_e004"
+
+    @pytest.mark.parametrize("bad", ["p1_e1", "p00001_e001", "p0000_e001", "table-1", ""])
+    def test_malformed_continuation_id_rejected(self, bad):
+        with pytest.raises(ValueError, match="continued_from_id"):
+            _table(continued_from_id=bad)
+
+    def test_self_continuation_rejected(self):
+        with pytest.raises(ValueError, match="continued_from_id"):
+            _table(continued_from_id="p0001_e001")
+
+    def test_continuation_wrong_type_rejected(self):
+        with pytest.raises(TypeError, match="continued_from_id"):
+            _table(continued_from_id=1)
+
+
+class TestTableColumnNames:
+    def test_headers_used_verbatim(self):
+        assert _table(headers=("Name", "Qty"), rows=()).column_names() == ("Name", "Qty")
+
+    def test_absent_headers_numbered_from_one(self):
+        assert _table(headers=(), rows=(("1", "2", "3"),)).column_names() == ("column_1", "column_2", "column_3")
+
+    def test_blank_headers_numbered_by_position(self):
+        table = _table(headers=("", "Qty", "  "), rows=())
+        assert table.column_names() == ("column_1", "Qty", "column_3")
+        assert table.headers == ("", "Qty", "  ")
+
+    def test_duplicates_suffixed_in_order(self):
+        assert _table(headers=("a", "a", "a"), rows=()).column_names() == ("a", "a_2", "a_3")
+
+    def test_suffix_skips_names_taken_by_real_headers(self):
+        assert _table(headers=("a", "a", "a_2"), rows=()).column_names() == ("a", "a_3", "a_2")
+
+    def test_generated_name_colliding_with_header_is_suffixed(self):
+        assert _table(headers=("column_2", ""), rows=()).column_names() == ("column_2", "column_2_2")
+
+    def test_real_header_beats_earlier_generated_name(self):
+        table = _table(headers=("x", "y", "", "z", "column_3"), rows=())
+        assert table.column_names() == ("x", "y", "column_3_2", "z", "column_3")
+
+    def test_real_header_beats_earlier_duplicate_suffix(self):
+        assert _table(headers=("a", "a", "a_2"), rows=()).column_names() == ("a", "a_3", "a_2")
+
+    def test_names_always_unique(self):
+        headers = ("x", "", "x", "column_2", "x_2", "x", "")
+        names = _table(headers=headers, rows=()).column_names()
+        assert len(set(names)) == len(names) == len(headers)
+
+    def test_deterministic(self):
+        table = _table(headers=("a", "", "a"), rows=())
+        assert table.column_names() == table.column_names() == ("a", "column_2", "a_2")
+
+
+class TestTableExports:
+    def test_to_dataframe(self):
+        df = _table(headers=("Name", "Qty"), rows=(("bolt", "4"), ("nut", "9"))).to_dataframe()
+        assert df.columns == ["Name", "Qty"]
+        assert df.schema == {"Name": pl.String, "Qty": pl.String}
+        assert df.rows() == [("bolt", "4"), ("nut", "9")]
+
+    def test_zero_row_table_gives_empty_typed_dataframe(self):
+        df = _table(headers=("a", "b"), rows=()).to_dataframe()
+        assert df.shape == (0, 2)
+        assert df.schema == {"a": pl.String, "b": pl.String}
+
+    def test_dataframe_uses_deduplicated_column_names(self):
+        df = _table(headers=("a", "a", ""), rows=(("1", "2", "3"),)).to_dataframe()
+        assert df.columns == ["a", "a_2", "column_3"]
+
+    def test_numeric_looking_cells_stay_strings(self):
+        df = _table(headers=("n",), rows=(("007",), ("1e3",))).to_dataframe()
+        assert df["n"].to_list() == ["007", "1e3"]
+
+    def test_to_arrow_table(self):
+        arrow = _table(headers=("Name", "Qty"), rows=(("bolt", "4"),)).to_arrow_table()
+        assert isinstance(arrow, pa.Table)
+        assert arrow.column_names == ["Name", "Qty"]
+        assert arrow.to_pylist() == [{"Name": "bolt", "Qty": "4"}]
+        assert all(
+            pa.types.is_string(t) or pa.types.is_large_string(t) or pa.types.is_string_view(t)
+            for t in arrow.schema.types
+        )
+
+    def test_zero_row_arrow_table(self):
+        arrow = _table(headers=("a",), rows=()).to_arrow_table()
+        assert (arrow.num_rows, arrow.column_names) == (0, ["a"])
+
+    def test_to_dicts(self):
+        table = _table(headers=("a", "a"), rows=(("1", "2"), ("3", "4")))
+        assert table.to_dicts() == [{"a": "1", "a_2": "2"}, {"a": "3", "a_2": "4"}]
+
+    def test_zero_row_to_dicts(self):
+        assert _table(headers=("a",), rows=()).to_dicts() == []
+
+
+class TestTableMarkdown:
+    def test_gfm_table(self):
+        table = _table(headers=("Name", "Qty"), rows=(("bolt", "4"), ("nut", "9")))
+        assert table.to_markdown() == "| Name | Qty |\n| --- | --- |\n| bolt | 4 |\n| nut | 9 |"
+
+    def test_zero_row_table_is_header_and_separator(self):
+        assert _table(headers=("a",), rows=()).to_markdown() == "| a |\n| --- |"
+
+    def test_headerless_table_uses_generated_names(self):
+        table = _table(headers=(), rows=(("1", "2"),))
+        assert table.to_markdown() == "| column_1 | column_2 |\n| --- | --- |\n| 1 | 2 |"
+
+    def test_pipes_and_line_breaks_escaped_in_cells(self):
+        table = _table(headers=("a|b", "c\nd"), rows=(("x | y", "line1\r\nline2\rline3"),))
+        assert table.to_markdown() == "| a\\|b | c<br>d |\n| --- | --- |\n| x \\| y | line1<br>line2<br>line3 |"
+        assert table.rows == (("x | y", "line1\r\nline2\rline3"),)
+
+    @pytest.mark.parametrize(
+        ("cell", "rendered"),
+        [
+            ("a|b", "a\\|b"),
+            ("a\\|b", "a\\\\\\|b"),  # backslash run before a pipe is doubled, then the pipe escaped
+            ("a\\\\|b", "a\\\\\\\\\\|b"),
+            ("C:\\dir", "C:\\dir"),  # backslash not before a pipe is untouched
+            ("end\\\nnext", "end\\\\<br>next"),  # backslash before <br> would escape its "<"
+        ],
+    )
+    def test_backslashes_before_structural_chars_doubled(self, cell, rendered):
+        table = _table(headers=("h",), rows=((cell,),))
+        assert table.to_markdown() == f"| h |\n| --- |\n| {rendered} |"
+
+    def test_empty_cells_render(self):
+        assert _table(headers=("a", "b"), rows=(("", "1"),)).to_markdown() == "| a | b |\n| --- | --- |\n|  | 1 |"
+
+
+IMAGE = b"png-bytes"
+IMAGE_SHA = hashlib.sha256(IMAGE).hexdigest()
+
+
+def _figure(**overrides):
+    return _element(Figure, **overrides)
+
+
+class TestFigureFields:
+    def test_defaults(self):
+        figure = _figure()
+        assert (figure.image_path, figure.caption) == (None, None)
+
+    @pytest.mark.parametrize("bad_sha", [IMAGE_SHA.upper(), IMAGE_SHA[:63], IMAGE_SHA + "0", "z" * 64])
+    def test_bad_sha_rejected(self, bad_sha):
+        with pytest.raises(ValueError, match="sha256"):
+            _figure(sha256=bad_sha)
+
+    def test_sha_wrong_type_rejected(self):
+        with pytest.raises(TypeError, match="sha256"):
+            _figure(sha256=None)
+
+    @pytest.mark.parametrize("field", ["width_px", "height_px"])
+    def test_pixel_dimensions_at_least_one(self, field):
+        assert getattr(_figure(**{field: 1}), field) == 1
+        with pytest.raises(ValueError, match=field):
+            _figure(**{field: 0})
+
+    @pytest.mark.parametrize("field", ["width_px", "height_px"])
+    @pytest.mark.parametrize("bad", [True, 64.0])
+    def test_pixel_dimensions_wrong_type_rejected(self, field, bad):
+        with pytest.raises(TypeError, match=field):
+            _figure(**{field: bad})
+
+    def test_image_path_must_be_a_path(self):
+        with pytest.raises(TypeError, match="image_path"):
+            _figure(image_path="fig.png")
+
+    def test_caption_must_be_str_or_none(self):
+        with pytest.raises(TypeError, match="caption"):
+            _figure(caption=3)
+
+    def test_loader_must_be_callable(self):
+        with pytest.raises(TypeError, match="_loader"):
+            _figure(_loader=IMAGE)
+
+    def test_loader_excluded_from_equality_hash_and_repr(self):
+        with_loader = _figure(_loader=lambda: IMAGE)
+        assert with_loader == _figure()
+        assert hash(with_loader) == hash(_figure())
+        assert "_loader" not in repr(with_loader)
+
+
+class TestFigureReadBytes:
+    def test_reads_file(self, tmp_path):
+        path = tmp_path / "fig.png"
+        path.write_bytes(IMAGE)
+        assert _figure(image_path=path).read_bytes() == IMAGE
+
+    def test_file_takes_precedence_over_loader(self, tmp_path):
+        path = tmp_path / "fig.png"
+        path.write_bytes(IMAGE)
+
+        def loader():
+            raise AssertionError("loader must not be called when image_path is set")
+
+        assert _figure(image_path=path, _loader=loader).read_bytes() == IMAGE
+
+    def test_reads_loader_when_no_path(self):
+        assert _figure(_loader=lambda: IMAGE).read_bytes() == IMAGE
+
+    def test_file_sha_mismatch_raises(self, tmp_path):
+        path = tmp_path / "fig.png"
+        path.write_bytes(b"tampered")
+        with pytest.raises(DatagruntPDFError, match="sha256 mismatch"):
+            _figure(image_path=path).read_bytes()
+
+    def test_loader_sha_mismatch_raises(self):
+        with pytest.raises(DatagruntPDFError, match="sha256 mismatch"):
+            _figure(_loader=lambda: b"tampered").read_bytes()
+
+    def test_no_byte_source_raises(self):
+        with pytest.raises(DatagruntPDFError, match="no image bytes"):
+            _figure().read_bytes()
+
+    def test_missing_file_fails_loud(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            _figure(image_path=tmp_path / "gone.png").read_bytes()
+
+    @pytest.mark.parametrize("bad", [None, "png-bytes", bytearray(IMAGE)])
+    def test_loader_returning_non_bytes_raises(self, bad):
+        with pytest.raises(TypeError, match="_loader"):
+            _figure(_loader=lambda: bad).read_bytes()
+
+
+class TestFigureReadBytesBounded:
+    """Asset reads are capped at ``_MAX_ASSET_BYTES`` (patched small here, never a real 1 GiB file)."""
+
+    def test_limit_is_one_gibibyte(self):
+        assert elements_module._MAX_ASSET_BYTES == 1 << 30
+
+    def test_file_at_limit_is_read(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(elements_module, "_MAX_ASSET_BYTES", len(IMAGE))
+        path = tmp_path / "fig.png"
+        path.write_bytes(IMAGE)
+        assert _figure(image_path=path).read_bytes() == IMAGE
+
+    def test_file_over_limit_rejected_naming_size(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(elements_module, "_MAX_ASSET_BYTES", len(IMAGE) - 1)
+        path = tmp_path / "fig.png"
+        path.write_bytes(IMAGE)
+        with pytest.raises(DatagruntPDFError, match=f"{len(IMAGE)} bytes"):
+            _figure(image_path=path).read_bytes()
+
+    def test_read_stays_bounded_when_stat_understates_size(self, tmp_path, monkeypatch):
+        # A file that grows after stat() must still be rejected, not read whole.
+        class _StaleStatPath(type(tmp_path)):
+            def stat(self, *args, **kwargs):
+                return os.stat_result((0o100644, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+
+        monkeypatch.setattr(elements_module, "_MAX_ASSET_BYTES", len(IMAGE) - 1)
+        path = tmp_path / "fig.png"
+        path.write_bytes(IMAGE)
+        with pytest.raises(DatagruntPDFError, match="asset limit"):
+            _figure(image_path=_StaleStatPath(path)).read_bytes()
+
+    def test_loader_result_at_limit_is_returned(self, monkeypatch):
+        monkeypatch.setattr(elements_module, "_MAX_ASSET_BYTES", len(IMAGE))
+        assert _figure(_loader=lambda: IMAGE).read_bytes() == IMAGE
+
+    def test_loader_result_over_limit_rejected_naming_size(self, monkeypatch):
+        monkeypatch.setattr(elements_module, "_MAX_ASSET_BYTES", len(IMAGE) - 1)
+        with pytest.raises(DatagruntPDFError, match=f"{len(IMAGE)} bytes"):
+            _figure(_loader=lambda: IMAGE).read_bytes()
+
+
+class TestFigureMarkdown:
+    def test_image_link_with_escaped_caption(self):
+        figure = _figure(image_path=Path("figures/fig1.png"), caption="Revenue [2024]")
+        assert figure.to_markdown() == "![Revenue \\[2024\\]](figures/fig1.png)"
+
+    @pytest.mark.parametrize("caption", ["Rev\n# 2024", "Rev\r\n# 2024", "Rev\r# 2024"])
+    def test_image_alt_text_kept_on_one_line(self, caption):
+        figure = _figure(image_path=Path("figures/fig1.png"), caption=caption)
+        assert figure.to_markdown() == "![Rev # 2024](figures/fig1.png)"
+
+    def test_placeholder_caption_escapes_every_line(self):
+        figure = _figure(caption="Rev\n# 2024")
+        assert figure.to_markdown() == f"<!-- figure p0001_e001 sha256={IMAGE_SHA[:8]} -->\nRev\n\\# 2024"
+
+    def test_image_link_without_caption(self):
+        assert _figure(image_path=Path("figures/fig1.png")).to_markdown() == "![](figures/fig1.png)"
+
+    def test_image_target_escaped(self):
+        figure = _figure(image_path=Path("my figures/fig (1).png"))
+        assert figure.to_markdown() == "![](<my figures/fig (1).png>)"
+
+    def test_placeholder_comment_without_path(self):
+        assert _figure().to_markdown() == f"<!-- figure p0001_e001 sha256={IMAGE_SHA[:8]} -->"
+
+    def test_placeholder_comment_followed_by_caption(self):
+        figure = _figure(caption="# Figure 1: revenue")
+        assert figure.to_markdown() == f"<!-- figure p0001_e001 sha256={IMAGE_SHA[:8]} -->\n\\# Figure 1: revenue"
+        assert figure.caption == "# Figure 1: revenue"
+
+    @pytest.mark.parametrize("caption", ["", " ", "\n\t"])
+    def test_blank_caption_adds_no_line(self, caption):
+        figure = _figure(caption=caption)
+        assert figure.to_markdown() == f"<!-- figure p0001_e001 sha256={IMAGE_SHA[:8]} -->"
+        assert figure.caption == caption
