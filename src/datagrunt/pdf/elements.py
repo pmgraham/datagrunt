@@ -10,6 +10,8 @@ Coordinates are PDF points with a top-left origin.
 
 import hashlib
 import re
+import stat
+import unicodedata
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,13 +24,17 @@ from datagrunt.core.pdf_io.extraction.markdown_escape import escape_markdown_lin
 from datagrunt.pdf._validate import finite_float, int_at_least, non_blank_str, optional_str, str_tuple
 from datagrunt.pdf.exceptions import DatagruntPDFError
 
-HiddenReason: TypeAlias = Literal["off_page", "invisible", "tiny_font", "transparent"]
-"""Why a text span is hidden from a human reader (it is flagged, never dropped)."""
+HiddenReason: TypeAlias = Literal["off_page", "invisible", "tiny_font", "transparent", "matches_background"]
+"""Why a text span is hidden from a human reader (it is flagged, never dropped).
+
+``matches_background`` means the text colour is indistinguishable from the
+background it is drawn on.
+"""
 
 # Canonical order, derived from the Literal so the two can never drift apart.
 HIDDEN_REASONS: tuple[HiddenReason, ...] = get_args(HiddenReason)
 
-PageStatus: TypeAlias = Literal["ok", "ocr_fallback", "error"]
+PageStatus: TypeAlias = Literal["ok", "ocr_fallback", "ocr_unavailable", "error"]
 PageRoute: TypeAlias = Literal["digital", "hybrid", "vision"]
 ExtractionMethod: TypeAlias = Literal["lattice", "stream"]
 _EXTRACTION_METHODS: tuple[ExtractionMethod, ...] = get_args(ExtractionMethod)
@@ -64,6 +70,13 @@ _MAX_ASSET_BYTES = 1 << 30  # 1 GiB
 # Page rotations a PDF can declare (``/Rotate`` is a multiple of 90).
 _RIGHT_ANGLE_ROTATIONS = (0, 90, 180, 270)
 
+# PageQuality's optional float signals and their inclusive (lo, hi) ranges.
+_QUALITY_RANGES = (
+    ("valid_char_ratio", 0.0, 1.0),
+    ("deskew_angle_deg", -45.0, 45.0),
+    ("ocr_mean_confidence", 0.0, 100.0),
+)
+
 # A SHA-256 hex digest exactly as hashlib's hexdigest() produces it. Matched
 # with fullmatch() so a trailing newline cannot slip past a `$` anchor.
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
@@ -74,6 +87,24 @@ _PATH_SEPARATOR = re.compile(r"[\\/]")
 # Runs of characters a doc_id stem may not contain. ASCII-only on purpose: the
 # id must be safe as a file name and URL segment on every platform.
 _DOC_ID_UNSAFE_RUN = re.compile(r"[^A-Za-z0-9-]+")
+
+# Longest doc_id stem kept: bounds file-name and cache-key length.
+_DOC_ID_STEM_MAX = 64
+
+# Hex characters of the source SHA-256 in a doc_id. 8 collide ~69% across 100k
+# files sharing a stem (every non-Latin name becomes "document"); 16 do not.
+_DOC_ID_SHA_CHARS = 16
+
+
+def _ascii_folded(text: str) -> str:
+    """Return ``text`` NFKD-normalised with combining marks dropped (``"Café"`` -> ``"Cafe"``).
+
+    NFC and NFD spellings of a name normalise to the same string, so they get
+    the same doc_id; compatibility forms (ligatures, full-width letters) fold
+    to their ASCII equivalents where one exists.
+    """
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(char for char in decomposed if not unicodedata.category(char).startswith("M"))
 
 
 def _check_sha256(name: str, value: object) -> str:
@@ -92,8 +123,8 @@ def make_element_id(page_number: int, index: int) -> str:
     return f"p{page_number:04d}_e{index:03d}"
 
 
-def _parse_element_id(name: str, value: object) -> int:
-    """Validate a canonical element id and return the page number it encodes.
+def _parse_element_id(name: str, value: object) -> tuple[int, int]:
+    """Validate a canonical element id and return the ``(page_number, index)`` it encodes.
 
     Canonical means it round-trips through :func:`make_element_id`: extra zero
     padding (``p00001_e001``) is rejected so two spellings can never name the
@@ -109,7 +140,7 @@ def _parse_element_id(name: str, value: object) -> int:
         raise ValueError(f"{name} must encode a page number >= 1, got {value!r}")
     if value != make_element_id(page, index):
         raise ValueError(f"{name} must be canonical (no extra zero padding), got {value!r}")
-    return page
+    return page, index
 
 
 def _check_hidden_reasons(value: object) -> None:
@@ -134,13 +165,23 @@ def _check_choice(name: str, value: object, choices: tuple[str, ...]) -> str:
     return value
 
 
-def _free_suffix(base: str, taken: set[str]) -> str:
-    """Return the first ``base_<k>`` (k >= 2) not in ``taken``."""
+def _free_suffix(base: str, taken: set[str], next_k: dict[str, int]) -> str:
+    """Return the first ``base_<k>`` (k >= 2) whose casefold is not in ``taken``.
+
+    ``next_k`` records, per casefolded base, where the previous search for it
+    stopped; the search resumes there, because ``taken`` only grows. A
+    candidate ``<base>_<k>`` belongs to one base only (``k`` holds no ``_``),
+    so each taken name is skipped at most once over all searches: naming n
+    columns is O(n) in total, not O(n^2).
+    """
+    key = base.casefold()
+    start = next_k.get(key, 2)
     # At most len(taken) candidates can be taken, so len(taken) + 1 distinct
     # candidates always include a free one: the loop is bounded and total.
-    for k in range(2, len(taken) + 3):
+    for k in range(start, start + len(taken) + 1):
         candidate = f"{base}_{k}"
-        if candidate not in taken:
+        if candidate.casefold() not in taken:
+            next_k[key] = k + 1
             return candidate
     raise RuntimeError(f"no free column-name suffix for {base!r}")  # unreachable by the bound above
 
@@ -184,14 +225,27 @@ def _read_capped(path: Path, cap: int) -> bytes:
         return handle.read(cap + 1)
 
 
-def _read_asset_file(path: Path) -> bytes:
-    """Read an asset file, refusing anything over ``_MAX_ASSET_BYTES``.
+def _regular_file_size(path: Path, owner: str) -> int:
+    """Return the size of ``path`` after checking, before any open, that it is a regular file.
 
-    ``stat()`` rejects an oversized file before reading; the capped read keeps
-    the bound even if the file grows between the two calls.
+    Opening a named pipe blocks until a writer appears, and a device or
+    directory is not an asset, so anything but a regular file (symlinks are
+    followed) is refused without being opened.
+    """
+    status = path.stat()
+    if not stat.S_ISREG(status.st_mode):
+        raise DatagruntPDFError(f"{owner}{path} is not a regular file")
+    return status.st_size
+
+
+def _read_asset_file(path: Path) -> bytes:
+    """Read a regular asset file, refusing anything over ``_MAX_ASSET_BYTES``.
+
+    ``stat()`` rejects a non-regular or oversized file before reading; the
+    capped read keeps the bound even if the file grows between the two calls.
     """
     limit = _MAX_ASSET_BYTES
-    size = path.stat().st_size
+    size = _regular_file_size(path, "")
     if size > limit:
         raise DatagruntPDFError(f"{path} is {size} bytes, over the {limit}-byte asset limit")
     data = _read_capped(path, limit)
@@ -204,11 +258,12 @@ def _read_band_files(owner: str, paths: tuple[Path, ...]) -> tuple[bytes, ...]:
     """Read band files whose combined size stays within ``_MAX_ASSET_BYTES``.
 
     The bands together are one page image, so the limit bounds their total:
-    ``stat()`` sizes are summed before reading, and each read is capped at the
-    budget left, so the bound holds even if a file grows in between.
+    every path is checked to be a regular file and its ``stat()`` size summed
+    before any is opened, and each read is capped at the budget left, so the
+    bound holds even if a file grows in between.
     """
     limit = _MAX_ASSET_BYTES
-    total = sum(path.stat().st_size for path in paths)
+    total = sum(_regular_file_size(path, f"{owner}: band file ") for path in paths)
     if total > limit:
         raise DatagruntPDFError(f"{owner}: band files total {total} bytes, over the {limit}-byte asset limit")
     bands: list[bytes] = []
@@ -262,6 +317,14 @@ def _check_optional_callable(name: str, value: object) -> None:
     """Require ``value`` to be callable or None."""
     if value is not None and not callable(value):
         raise TypeError(f"{name} must be callable or None, got {type(value).__name__}")
+
+
+def _positive_finite(name: str, value: object) -> float:
+    """Return ``value`` as a finite float strictly greater than zero."""
+    result = finite_float(name, value)
+    if result <= 0.0:
+        raise ValueError(f"{name} must be > 0, got {result!r}")
+    return result
 
 
 def _check_bool(name: str, value: object) -> None:
@@ -323,38 +386,50 @@ class BBox:
 class PageQuality:
     """Extraction-quality signals measured for one page.
 
+    A signal that was not measured is None, never a stand-in value.
+
     Attributes:
-        valid_char_ratio: Share of extracted characters that are valid text, in [0, 1].
+        valid_char_ratio: Share of extracted characters that are valid text, in
+            [0, 1]; None exactly when ``char_count`` is 0 (no characters, no ratio).
         char_count: Extracted character count (>= 0).
         vector_line_count: Vector line segments on the page (>= 0).
         hidden_spans_flagged: Text spans flagged as hidden (>= 0).
         rotation_deg: Declared page rotation: 0, 90, 180, or 270.
-        deskew_angle_deg: Measured skew angle in degrees, in [-45, 45].
+        deskew_angle_deg: Measured skew angle in degrees, in [-45, 45], or None
+            when skew was not measured.
         ocr_mean_confidence: Mean OCR confidence in [0, 100], or None when no OCR ran.
     """
 
-    valid_char_ratio: float
+    valid_char_ratio: float | None
     char_count: int
     vector_line_count: int
     hidden_spans_flagged: int
     rotation_deg: int
-    deskew_angle_deg: float
+    deskew_angle_deg: float | None
     ocr_mean_confidence: float | None
 
     def __post_init__(self) -> None:
-        ratio = finite_float("valid_char_ratio", self.valid_char_ratio, lo=0.0, hi=1.0)
-        object.__setattr__(self, "valid_char_ratio", ratio)
         int_at_least("char_count", self.char_count, 0)
         int_at_least("vector_line_count", self.vector_line_count, 0)
         int_at_least("hidden_spans_flagged", self.hidden_spans_flagged, 0)
         int_at_least("rotation_deg", self.rotation_deg, 0)
         if self.rotation_deg not in _RIGHT_ANGLE_ROTATIONS:
             raise ValueError(f"rotation_deg must be one of {_RIGHT_ANGLE_ROTATIONS}, got {self.rotation_deg}")
-        deskew = finite_float("deskew_angle_deg", self.deskew_angle_deg, lo=-45.0, hi=45.0)
-        object.__setattr__(self, "deskew_angle_deg", deskew)
-        if self.ocr_mean_confidence is not None:
-            confidence = finite_float("ocr_mean_confidence", self.ocr_mean_confidence, lo=0.0, hi=100.0)
-            object.__setattr__(self, "ocr_mean_confidence", confidence)
+        for name, lo, hi in _QUALITY_RANGES:
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, finite_float(name, value, lo=lo, hi=hi))
+        self._check_ratio_presence()
+
+    def _check_ratio_presence(self) -> None:
+        """Require ``valid_char_ratio`` to be None exactly when ``char_count`` is 0."""
+        if self.char_count == 0 and self.valid_char_ratio is not None:
+            raise ValueError(
+                f"valid_char_ratio must be None when char_count is 0 (no characters, no ratio), "
+                f"got {self.valid_char_ratio!r}"
+            )
+        if self.char_count > 0 and self.valid_char_ratio is None:
+            raise ValueError(f"valid_char_ratio is required when char_count is {self.char_count}, got None")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -396,22 +471,25 @@ class DocumentMetadata:
 
     @staticmethod
     def make_doc_id(source_name: str, sha256: str) -> str:
-        """Build the deterministic doc id ``<stem>__<first 8 hex of sha256>``.
+        """Build the deterministic doc id ``<stem>__<first 16 hex of sha256>``.
 
         The stem is the text after the last ``/`` or ``\\`` (either separator,
-        on every OS), minus its last extension (a leading dot is not one), with
-        every run of characters outside ``[A-Za-z0-9-]`` collapsed to one ``_``
-        and outer ``_`` stripped; an empty result becomes ``"document"``. Case
-        is preserved. The stem can never contain ``__``, so the separator is
-        unambiguous. No pathlib: its ``stem`` differs across OSes and versions.
+        on every OS), minus its last extension (a leading dot is not one),
+        NFKD-normalised with combining marks dropped (so NFC and NFD names
+        match), with every run of characters outside ``[A-Za-z0-9-]`` collapsed
+        to one ``_``, outer ``_`` stripped, and capped at 64 characters (a
+        ``_`` left at the cut is stripped too); an empty result becomes
+        ``"document"``. Case is preserved. The stem can never contain ``__``
+        or end in ``_``, so the separator is unambiguous. No pathlib: its
+        ``stem`` differs across OSes and versions.
         """
         non_blank_str("source_name", source_name)
         _check_sha256("sha256", sha256)
         name = _PATH_SEPARATOR.split(source_name)[-1]
         dot = name.rfind(".")
-        raw_stem = name[:dot] if dot > 0 else name
-        stem = _DOC_ID_UNSAFE_RUN.sub("_", raw_stem).strip("_")
-        return f"{stem or 'document'}__{sha256[:8]}"
+        raw_stem = _ascii_folded(name[:dot] if dot > 0 else name)
+        stem = _DOC_ID_UNSAFE_RUN.sub("_", raw_stem).strip("_")[:_DOC_ID_STEM_MAX].rstrip("_")
+        return f"{stem or 'document'}__{sha256[:_DOC_ID_SHA_CHARS]}"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -419,10 +497,12 @@ class _Element:
     """Fields and invariants shared by every document element.
 
     Attributes:
-        element_id: Canonical id ``p<page:04d>_e<index:03d>``; its page part
-            must equal ``page_number``.
+        element_id: Canonical id ``p<page:04d>_e<index:03d>``; it must equal
+            ``make_element_id(page_number, reading_order)``, so the id names
+            exactly one (page, reading-order) position.
         page_number: 1-based page the element was extracted from.
-        reading_order: Position in the page's reading order (>= 0).
+        reading_order: Position in the page's reading order (>= 0); the
+            element id's index.
         bbox: Location on the page, in points.
         scope_path: Enclosing heading texts, outermost first (non-blank entries).
         hidden_reasons: Why the element is hidden from a human reader, in
@@ -439,10 +519,14 @@ class _Element:
     def __post_init__(self) -> None:
         int_at_least("page_number", self.page_number, 1)
         int_at_least("reading_order", self.reading_order, 0)
-        id_page = _parse_element_id("element_id", self.element_id)
+        id_page, id_index = _parse_element_id("element_id", self.element_id)
         if id_page != self.page_number:
             raise ValueError(
                 f"element_id {self.element_id!r} encodes page {id_page}, not page_number {self.page_number}"
+            )
+        if id_index != self.reading_order:
+            raise ValueError(
+                f"element_id {self.element_id!r} encodes index {id_index}, not reading_order {self.reading_order}"
             )
         if not isinstance(self.bbox, BBox):
             raise TypeError(f"bbox must be a BBox, got {type(self.bbox).__name__}")
@@ -481,7 +565,12 @@ class _Element:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Heading(_Element):
-    """A section heading of ``level`` 1-6 with non-blank ``text``."""
+    """A section heading of ``level`` 1-6 with non-blank ``text``.
+
+    A heading opens its own scope, so its ``scope_path`` includes its text:
+    it is non-empty and ends with ``text`` (verbatim), after the texts of the
+    headings enclosing it.
+    """
 
     level: int
     text: str
@@ -491,6 +580,8 @@ class Heading(_Element):
         if self.level > 6:
             raise ValueError(f"level must be <= 6, got {self.level}")
         non_blank_str("text", self.text)
+        if not self.scope_path or self.scope_path[-1] != self.text:
+            raise ValueError(f"scope_path must end with the heading's own text {self.text!r}, got {self.scope_path!r}")
 
     def _render_markdown(self) -> str:
         """Render as an ATX heading on one line: the text's lines joined with spaces.
@@ -571,7 +662,8 @@ class Table(_Element):
 
     The width is ``len(headers)`` when headers exist, else ``len(rows[0])``;
     it must be >= 1 and every row must match it. Blank or duplicate headers
-    stay untouched in ``headers``; :meth:`column_names` derives unique names.
+    stay untouched in ``headers`` and render verbatim in Markdown;
+    :meth:`column_names` derives unique names for the DataFrame exports.
 
     Attributes:
         headers: Header cells; may be empty when the table has no header row.
@@ -613,27 +705,30 @@ class Table(_Element):
         return len(self.headers) if self.headers else len(self.rows[0])
 
     def column_names(self) -> tuple[str, ...]:
-        """Return unique, non-blank column names derived from ``headers``.
+        """Return unique, non-blank column names derived from ``headers``, for DataFrames.
 
-        The first occurrence of each non-blank header keeps its text; real
-        headers are reserved up front, so a generated name never takes one. A
-        blank or absent header becomes ``column_<i>`` (1-based); a repeat, or a
-        generated name already in use, gets ``_2``, ``_3``, ... in column order.
-        The result is deterministic and unique.
+        Names are compared case-insensitively (``str.casefold``), as DuckDB
+        compares column names. The first occurrence of each non-blank header
+        keeps its text; real headers are reserved up front, so a generated
+        name never takes one. A blank or absent header becomes ``column_<i>``
+        (1-based); a repeat, or a generated name already in use, gets ``_2``,
+        ``_3``, ... in column order. The result is deterministic, unique even
+        ignoring case, and computed in O(n) for n columns.
         """
         cells = self.headers if self.headers else ("",) * self._width()
         real = [cell if cell.strip() else None for cell in cells]
-        taken = {cell for cell in real if cell is not None}
+        taken = {cell.casefold() for cell in real if cell is not None}
         claimed: set[str] = set()
+        next_k: dict[str, int] = {}
         names = []
         for position, cell in enumerate(real, start=1):
-            if cell is not None and cell not in claimed:
-                claimed.add(cell)
+            if cell is not None and cell.casefold() not in claimed:
+                claimed.add(cell.casefold())
                 names.append(cell)
                 continue
             base = f"column_{position}" if cell is None else cell
-            name = _free_suffix(base, taken) if base in taken else base
-            taken.add(name)
+            name = _free_suffix(base, taken, next_k) if base.casefold() in taken else base
+            taken.add(name.casefold())
             names.append(name)
         return tuple(names)
 
@@ -645,8 +740,15 @@ class Table(_Element):
         return pl.DataFrame(columns, schema={name: pl.String for name in names})
 
     def to_arrow_table(self) -> pa.Table:
-        """Return the rows as a ``pyarrow.Table`` (converted via :meth:`to_dataframe`)."""
-        return self.to_dataframe().to_arrow()
+        """Return the rows as a ``pyarrow.Table`` of ``pa.large_string()`` columns.
+
+        Converted via :meth:`to_dataframe`, then cast to an explicit schema:
+        polars' default Arrow string type varies by version (``large_string``,
+        ``string_view``), and callers need one stable type.
+        """
+        frame = self.to_dataframe()
+        schema = pa.schema([(name, pa.large_string()) for name in frame.columns])
+        return frame.to_arrow().cast(schema)
 
     def to_dicts(self) -> list[dict[str, str]]:
         """Return one ``{column_name: cell}`` dict per row."""
@@ -654,9 +756,15 @@ class Table(_Element):
         return [dict(zip(names, row, strict=True)) for row in self.rows]
 
     def _render_markdown(self) -> str:
-        """Render as a GFM table headed by :meth:`column_names`."""
-        names = self.column_names()
-        lines = [_gfm_row(names), "| " + " | ".join("---" for _ in names) + " |"]
+        """Render as a GFM table headed by the raw ``headers``, escaped.
+
+        A blank header is an empty cell and a table without headers gets an
+        empty header row (GFM requires one): Markdown shows the table as
+        extracted, while :meth:`column_names` exists for DataFrame column names.
+        """
+        width = self._width()
+        header = self.headers if self.headers else ("",) * width
+        lines = [_gfm_row(header), "| " + " | ".join("---" for _ in range(width)) + " |"]
         lines.extend(_gfm_row(row) for row in self.rows)
         return "\n".join(lines)
 
@@ -673,14 +781,16 @@ class Figure(_Element):
         sha256: SHA-256 of the image bytes, 64 lowercase hex characters.
         width_px: Image width in pixels (>= 1).
         height_px: Image height in pixels (>= 1).
-        image_path: Where the image was written, if it was.
+        image_path: Where the image was written, if it was. Not part of
+            equality: the same image stored elsewhere is the same figure.
         caption: Caption text, if one was found.
     """
 
     sha256: str
     width_px: int
     height_px: int
-    image_path: Path | None = None
+    # Storage location, not identity: excluded from equality and hashing.
+    image_path: Path | None = field(default=None, compare=False)
     caption: str | None = None
     _loader: Callable[[], bytes] | None = field(default=None, compare=False, repr=False)
 
@@ -696,8 +806,12 @@ class Figure(_Element):
         """Return the image bytes after verifying them against ``sha256``.
 
         Raises:
-            DatagruntPDFError: If there is no byte source or the bytes' SHA-256
-                does not match ``sha256``.
+            DatagruntPDFError: If there is no byte source, ``image_path`` is not
+                a regular file, the bytes exceed the asset limit, or their
+                SHA-256 does not match ``sha256``.
+            OSError: If ``image_path`` cannot be stat'ed or read (e.g.
+                ``FileNotFoundError``, ``PermissionError``).
+            TypeError: If the loader returns something other than ``bytes``.
         """
         data = self._load_bytes()
         actual = hashlib.sha256(data).hexdigest()
@@ -742,27 +856,31 @@ class PageImage:
 
     Attributes:
         page_number: 1-based page this image renders.
-        dpi: Render resolution in dots per inch (>= 36).
+        dpi: Render resolution in dots per inch (finite, > 0). A float: a
+            render bounded by pixel size has a fractional dpi, below 36 for a
+            very large page.
         width_px: Image width in pixels (>= 1).
         height_px: Image height in pixels (>= 1).
         image_path: Where the full-page image was written, if it was.
         band_paths: Where the bands were written, top to bottom; empty if none.
+            Neither path is part of equality: storage location is not identity.
         contrast_normalized: True if autocontrast was applied before saving.
     """
 
     page_number: int
-    dpi: int
+    dpi: float
     width_px: int
     height_px: int
-    image_path: Path | None = None
-    band_paths: tuple[Path, ...] = ()
+    # Storage locations, not identity: excluded from equality and hashing.
+    image_path: Path | None = field(default=None, compare=False)
+    band_paths: tuple[Path, ...] = field(default=(), compare=False)
     contrast_normalized: bool = False
     _loader: Callable[[], bytes] | None = field(default=None, compare=False, repr=False)
     _band_loader: Callable[[], tuple[bytes, ...]] | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         int_at_least("page_number", self.page_number, 1)
-        int_at_least("dpi", self.dpi, 36)
+        object.__setattr__(self, "dpi", _positive_finite("dpi", self.dpi))
         int_at_least("width_px", self.width_px, 1)
         int_at_least("height_px", self.height_px, 1)
         _check_optional_path("image_path", self.image_path)
@@ -779,7 +897,11 @@ class PageImage:
         """Return the full-page image bytes: ``image_path`` first, then the loader.
 
         Raises:
-            DatagruntPDFError: If there is no byte source or it exceeds the asset limit.
+            DatagruntPDFError: If there is no byte source, ``image_path`` is not
+                a regular file, or the bytes exceed the asset limit.
+            OSError: If ``image_path`` cannot be stat'ed or read (e.g.
+                ``FileNotFoundError``, ``PermissionError``).
+            TypeError: If the loader returns something other than ``bytes``.
         """
         if self.image_path is not None:
             return _read_asset_file(self.image_path)
@@ -795,7 +917,12 @@ class PageImage:
 
         Raises:
             DatagruntPDFError: If there is no band source (a loader returning no
-                bands counts as none) or the bands exceed the asset limit in total.
+                bands counts as none), a band path is not a regular file, or the
+                bands exceed the asset limit in total.
+            OSError: If a band path cannot be stat'ed or read (e.g.
+                ``FileNotFoundError``, ``PermissionError``).
+            TypeError: If the band loader returns something other than a tuple
+                of ``bytes``.
         """
         owner = f"page image {self.page_number}"
         if self.band_paths:
@@ -806,16 +933,10 @@ class PageImage:
 
 
 _PAGE_STATUSES: tuple[PageStatus, ...] = get_args(PageStatus)
+# Statuses that only a vision-route page can have.
+_VISION_ONLY_STATUSES: tuple[PageStatus, ...] = ("ocr_fallback", "ocr_unavailable")
 _PAGE_ROUTES: tuple[PageRoute, ...] = get_args(PageRoute)
 _ELEMENT_TYPES: tuple[type, ...] = get_args(DocumentElement)
-
-
-def _positive_finite(name: str, value: object) -> float:
-    """Return ``value`` as a finite float strictly greater than zero."""
-    result = finite_float(name, value)
-    if result <= 0.0:
-        raise ValueError(f"{name} must be > 0, got {result!r}")
-    return result
 
 
 def _check_instances(name: str, value: object, types: tuple[type, ...], label: str) -> None:
@@ -855,12 +976,15 @@ class Page:
 
     ``status`` says how extraction went:
 
-    - ``"ok"``: extracted on its ``route``. A vision page whose OCR is
-      unavailable stays ``"ok"`` and records why in ``warnings``.
+    - ``"ok"``: extracted on its ``route``.
     - ``"ocr_fallback"``: digital extraction raised and the page was recovered
       by render + OCR, so its route is ``"vision"``.
+    - ``"ocr_unavailable"``: a ``"vision"`` page whose OCR could not run; the
+      digital spans it had are kept as its elements.
     - ``"error"``: nothing was recovered; ``error`` says why and the page has
-      no elements.
+      no elements and no quality signals.
+
+    Every status but ``"ok"`` marks a degraded page (``PDFDocument.degraded_pages``).
 
     ``integrity_verified`` is True when the reconstructed elements were checked
     against the page's text layer; a vision page has no text layer to check
@@ -870,9 +994,10 @@ class Page:
         page_number: 1-based page number.
         width_pt: Page width in points (finite, > 0).
         height_pt: Page height in points (finite, > 0).
-        status: ``"ok"``, ``"ocr_fallback"``, or ``"error"`` (see above).
+        status: ``"ok"``, ``"ocr_fallback"``, ``"ocr_unavailable"``, or ``"error"`` (see above).
         route: ``"digital"``, ``"hybrid"``, or ``"vision"``.
-        quality: Extraction-quality signals for the page.
+        quality: Extraction-quality signals for the page; None exactly when
+            ``status == "error"`` (nothing was measured).
         elements: The page's elements; ``reading_order`` strictly increases in
             tuple order and ``element_id`` is unique. An element is flagged
             ``"off_page"`` exactly when its bbox lies outside the page.
@@ -887,7 +1012,7 @@ class Page:
     height_pt: float
     status: PageStatus
     route: PageRoute
-    quality: PageQuality
+    quality: PageQuality | None
     elements: tuple[DocumentElement, ...] = ()
     page_image: PageImage | None = None
     integrity_verified: bool = False
@@ -910,8 +1035,8 @@ class Page:
         object.__setattr__(self, "height_pt", _positive_finite("height_pt", self.height_pt))
         _check_choice("status", self.status, _PAGE_STATUSES)
         _check_choice("route", self.route, _PAGE_ROUTES)
-        if not isinstance(self.quality, PageQuality):
-            raise TypeError(f"quality must be a PageQuality, got {type(self.quality).__name__}")
+        if self.quality is not None and not isinstance(self.quality, PageQuality):
+            raise TypeError(f"quality must be a PageQuality or None, got {type(self.quality).__name__}")
         _check_document_elements("elements", self.elements)
         if self.page_image is not None and not isinstance(self.page_image, PageImage):
             raise TypeError(f"page_image must be a PageImage or None, got {type(self.page_image).__name__}")
@@ -920,22 +1045,30 @@ class Page:
         str_tuple("warnings", self.warnings)
 
     def _check_status(self) -> None:
-        """Enforce the status / route / error / integrity_verified invariants."""
+        """Enforce the status / route / error / quality / integrity_verified invariants."""
         if self.status == "error":
-            if self.error is None or not self.error.strip():
-                raise ValueError(f"status 'error' requires a non-blank error message, got error={self.error!r}")
-            if self.elements:
-                raise ValueError(f"an error page must have no elements, got {len(self.elements)}")
-            if self.integrity_verified:
-                raise ValueError("an error page cannot be integrity_verified")
+            self._check_error_page()
         elif self.error is not None:
             raise ValueError(
                 f"error must be None unless status is 'error', got status={self.status!r}, error={self.error!r}"
             )
-        if self.status == "ocr_fallback" and self.route != "vision":
-            raise ValueError(f"status 'ocr_fallback' requires route 'vision', got route={self.route!r}")
+        elif self.quality is None:
+            raise ValueError(f"status {self.status!r} requires a PageQuality, got quality=None")
+        if self.status in _VISION_ONLY_STATUSES and self.route != "vision":
+            raise ValueError(f"status {self.status!r} requires route 'vision', got route={self.route!r}")
         if self.route == "vision" and self.integrity_verified:
             raise ValueError("a vision page cannot be integrity_verified: it has no text layer to verify against")
+
+    def _check_error_page(self) -> None:
+        """An error page explains itself and holds nothing: no elements, no quality, no verification."""
+        if self.error is None or not self.error.strip():
+            raise ValueError(f"status 'error' requires a non-blank error message, got error={self.error!r}")
+        if self.elements:
+            raise ValueError(f"an error page must have no elements, got {len(self.elements)}")
+        if self.quality is not None:
+            raise ValueError(f"an error page must have quality None, got a {type(self.quality).__name__}")
+        if self.integrity_verified:
+            raise ValueError("an error page cannot be integrity_verified")
 
     def _check_elements(self) -> None:
         """Enforce page membership, unique ids, strictly increasing reading order, and page bounds."""
@@ -992,23 +1125,32 @@ def _check_page_span(value: object) -> tuple[int, int]:
     return start, end
 
 
+def _position(element: DocumentElement) -> tuple[int, int]:
+    """Return the element's place in document order: ``(page_number, reading_order)``."""
+    return element.page_number, element.reading_order
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Section:
-    """A run of elements under one heading (or before the first heading).
+    """A flat run of elements under one heading (or before the first heading).
 
-    ``tables`` and ``figures`` are derived from ``elements`` on each access
-    (O(len(elements))), in document order.
+    Sections do not nest: a subsection is its own ``Section`` whose
+    ``scope_path`` extends its parent's, so nesting is read from
+    ``scope_path`` prefixes. ``tables`` and ``figures`` are derived from
+    ``elements`` on each access (O(len(elements))), in document order.
 
     Attributes:
         heading: The heading that opens the section, or None for content
-            before the first heading. It lies on a page in ``page_span`` and may
-            also appear in ``elements`` (an element with its id must equal it).
+            before the first heading. It lies on a page in ``page_span``, its
+            ``scope_path`` equals the section's, and it may also appear in
+            ``elements``, as ``elements[0]`` (an element with its id must equal it).
         scope_path: Enclosing heading texts, outermost first; when ``heading``
             is set it is non-empty and ends with ``heading.text`` (verbatim).
         page_span: Inclusive ``(start, end)`` pages, ``1 <= start <= end``;
             every element lies on a page in this span.
         elements: The section's elements in document order: ``(page_number,
-            reading_order)`` strictly increases, so no element repeats.
+            reading_order)`` strictly increases, so no element repeats. Every
+            element's ``scope_path`` equals the section's.
     """
 
     heading: Heading | None
@@ -1020,38 +1162,37 @@ class Section:
         if self.heading is not None and not isinstance(self.heading, Heading):
             raise TypeError(f"heading must be a Heading or None, got {type(self.heading).__name__}")
         str_tuple("scope_path", self.scope_path)
-        if self.heading is not None:
-            if not self.scope_path:
-                raise ValueError("scope_path must be non-empty when heading is set")
-            if self.scope_path[-1] != self.heading.text:
-                raise ValueError(
-                    f"scope_path[-1] {self.scope_path[-1]!r} must equal heading.text {self.heading.text!r}"
-                )
         start, end = _check_page_span(self.page_span)
-        if self.heading is not None and not start <= self.heading.page_number <= end:
-            raise ValueError(
-                f"heading ({self.heading.element_id}) is on page {self.heading.page_number}, "
-                f"outside page_span {(start, end)}"
-            )
+        if self.heading is not None:
+            self._check_heading(self.heading, start, end)
         _check_document_elements("elements", self.elements)
         self._check_elements(start, end)
 
-    def _check_elements(self, start: int, end: int) -> None:
-        """Require every element in ``[start, end]``, in strictly increasing document order, ids unique.
+    def _check_heading(self, heading: Heading, start: int, end: int) -> None:
+        """Require the heading to open this scope and lie within ``[start, end]``."""
+        if not self.scope_path:
+            raise ValueError("scope_path must be non-empty when heading is set")
+        if self.scope_path[-1] != heading.text:
+            raise ValueError(f"scope_path[-1] {self.scope_path[-1]!r} must equal heading.text {heading.text!r}")
+        if heading.scope_path != self.scope_path:
+            raise ValueError(
+                f"heading ({heading.element_id}) has scope_path {heading.scope_path!r}, "
+                f"but the section's scope_path is {self.scope_path!r}"
+            )
+        if not start <= heading.page_number <= end:
+            raise ValueError(
+                f"heading ({heading.element_id}) is on page {heading.page_number}, outside page_span {(start, end)}"
+            )
 
-        An element with the heading's id must be the heading itself, or
-        :meth:`to_markdown` would render it in the heading's place.
-        """
+    def _check_elements(self, start: int, end: int) -> None:
+        """Require every element in ``[start, end]``, in strictly increasing document order, ids unique."""
         seen: set[str] = set()
         previous: DocumentElement | None = None
         for index, element in enumerate(self.elements):
             label = f"elements[{index}] ({element.element_id})"
             if not start <= element.page_number <= end:
                 raise ValueError(f"{label} is on page {element.page_number}, outside page_span {(start, end)}")
-            if previous is not None and (element.page_number, element.reading_order) <= (
-                previous.page_number,
-                previous.reading_order,
-            ):
+            if previous is not None and _position(element) <= _position(previous):
                 raise ValueError(
                     f"{label} is not after elements[{index - 1}] ({previous.element_id}) "
                     "in document order (page_number, reading_order)"
@@ -1059,9 +1200,25 @@ class Section:
             if element.element_id in seen:
                 raise ValueError(f"elements has duplicate element_id {element.element_id!r}")
             seen.add(element.element_id)
-            if self.heading is not None and element.element_id == self.heading.element_id and element != self.heading:
-                raise ValueError(f"{label} has the heading's element_id but differs from heading")
+            self._check_member(index, label, element)
             previous = element
+
+    def _check_member(self, index: int, label: str, element: DocumentElement) -> None:
+        """Require the heading, if listed, to be itself and first, and every element to share the scope.
+
+        An element with the heading's id must equal the heading, or
+        :meth:`to_markdown` would render it in the heading's place.
+        """
+        heading = self.heading
+        if heading is not None and element.element_id == heading.element_id:
+            if element != heading:
+                raise ValueError(f"{label} has the heading's element_id but differs from heading")
+            if index != 0:
+                raise ValueError(f"{label} is the section heading, so it must be elements[0]")
+        if element.scope_path != self.scope_path:
+            raise ValueError(
+                f"{label} has scope_path {element.scope_path!r}, but the section's scope_path is {self.scope_path!r}"
+            )
 
     @property
     def tables(self) -> tuple[Table, ...]:
@@ -1107,16 +1264,69 @@ def _describe(element: DocumentElement | None) -> str:
 
 
 def _check_continuations(elements: tuple[DocumentElement, ...], by_id: dict[str, DocumentElement]) -> None:
-    """Require every ``Table.continued_from_id`` to name a table on an earlier page."""
+    """Require every ``Table.continued_from_id`` to name a table on an earlier page, at most once.
+
+    A split table has a single next part, so two tables continuing the same
+    table would fork it; the first in document order keeps the link.
+    """
+    continued_by: dict[str, str] = {}
     for element in elements:
         if not isinstance(element, Table) or element.continued_from_id is None:
             continue
-        target = by_id.get(element.continued_from_id)
+        source = element.continued_from_id
+        target = by_id.get(source)
         if not isinstance(target, Table) or target.page_number >= element.page_number:
             raise ValueError(
-                f"table {element.element_id}: continued_from_id {element.continued_from_id!r} "
+                f"table {element.element_id}: continued_from_id {source!r} "
                 f"must name a table on an earlier page, got {_describe(target)}"
             )
+        if source in continued_by:
+            raise ValueError(
+                f"table {element.element_id}: table {source!r} is already continued by {continued_by[source]}"
+            )
+        continued_by[source] = element.element_id
+
+
+def _section_members(section: Section) -> tuple[DocumentElement, ...]:
+    """Return what belongs to ``section``: its elements, plus its heading when it is not among them."""
+    heading = section.heading
+    if heading is None or any(element.element_id == heading.element_id for element in section.elements):
+        return section.elements
+    return (heading, *section.elements)
+
+
+def _where(position: tuple[int, int]) -> str:
+    """Describe a ``(page_number, reading_order)`` position for error messages."""
+    return f"page {position[0]} reading_order {position[1]}"
+
+
+def _check_section_layout(sections: tuple[Section, ...]) -> None:
+    """Require flat sections in document order: none shares an element (heading included) or interleaves.
+
+    A section spans from its first to its last member in document order;
+    each must start after the previous non-empty section ends. O(N) overall.
+    """
+    owner: dict[str, int] = {}
+    previous: tuple[int, tuple[int, int]] | None = None  # (index, end position) of the last non-empty section
+    for index, section in enumerate(sections):
+        members = _section_members(section)
+        for element in members:
+            first = owner.setdefault(element.element_id, index)
+            if first != index:
+                raise ValueError(
+                    f"{element.element_id!r} is in sections[{first}] and sections[{index}]: "
+                    "an element belongs to at most one section"
+                )
+        if not members:
+            continue
+        positions = [_position(element) for element in members]
+        start = min(positions)
+        if previous is not None and start <= previous[1]:
+            raise ValueError(
+                f"sections[{index}] starts at {_where(start)}, not after sections[{previous[0]}] ends at "
+                f"{_where(previous[1])}: sections must be in document order and must not interleave"
+            )
+        previous = (index, max(positions))
 
 
 def _check_member(where: str, element: DocumentElement, by_id: dict[str, DocumentElement]) -> None:
@@ -1129,46 +1339,67 @@ def _check_member(where: str, element: DocumentElement, by_id: dict[str, Documen
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class _DocumentIndex:
+    """The values ``PDFDocument`` derives from its pages, computed once (see its properties)."""
+
+    elements: tuple[DocumentElement, ...]
+    headings: tuple[Heading, ...]
+    paragraphs: tuple[Paragraph, ...]
+    key_values: tuple[KeyValue, ...]
+    tables: tuple[Table, ...]
+    lists: tuple[BulletList, ...]
+    figures: tuple[Figure, ...]
+    page_images: tuple[PageImage, ...]
+    degraded_pages: tuple[int, ...]
+    integrity_verified: bool
+
+
+def _build_index(pages: tuple[Page, ...], elements: tuple[DocumentElement, ...]) -> _DocumentIndex:
+    """Derive the document's collections and page facts (one pass per collection)."""
+    # An error page yielded nothing, so nothing on it was verified: the document is not.
+    has_error_page = any(page.status == "error" for page in pages)
+    verifiable = [page for page in pages if page.route != "vision"]
+    return _DocumentIndex(
+        elements=elements,
+        headings=tuple(element for element in elements if isinstance(element, Heading)),
+        paragraphs=tuple(element for element in elements if isinstance(element, Paragraph)),
+        key_values=tuple(element for element in elements if isinstance(element, KeyValue)),
+        tables=tuple(element for element in elements if isinstance(element, Table)),
+        lists=tuple(element for element in elements if isinstance(element, BulletList)),
+        figures=tuple(element for element in elements if isinstance(element, Figure)),
+        page_images=tuple(page.page_image for page in pages if page.page_image is not None),
+        degraded_pages=tuple(page.page_number for page in pages if page.status != "ok"),
+        integrity_verified=(
+            not has_error_page and bool(verifiable) and all(page.integrity_verified for page in verifiable)
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class PDFDocument:
     """A whole extracted PDF: metadata, pages in order, and optional sections.
 
-    The collections below are derived once at construction (never passed in)
-    and excluded from equality and repr; ``dataclasses.replace`` re-derives
-    them. Validation and derivation are O(N) in time and memory, N being the
-    total number of elements (plus the size of each section element compared
+    ``elements``, ``tables``, ``degraded_pages`` and the other derived values
+    are read-only properties, not fields: they are computed once at
+    construction into a private index (excluded from equality and repr;
+    ``dataclasses.replace`` re-derives it), so each access is O(1).
+    ``dataclasses.asdict`` is not a serialization format for this class.
+    Validation and derivation are O(N) in time and memory, N being the total
+    number of elements (plus the size of each section element compared
     against the document's element with its id).
 
     Attributes:
         metadata: Identity of the source PDF; ``page_count == len(pages)``.
         pages: The pages, numbered 1..N in order.
-        sections: Heading-scoped runs of the document's own elements (heading
-            included), each ending by the last page.
-        elements: Every page's elements, in document order.
-        headings: The ``Heading`` elements, in document order.
-        paragraphs: The ``Paragraph`` elements, in document order.
-        key_values: The ``KeyValue`` elements, in document order.
-        tables: The ``Table`` elements, in document order.
-        lists: The ``BulletList`` elements, in document order.
-        figures: The ``Figure`` elements, in document order.
-        page_images: Every page's ``page_image`` that is not None, in page order.
-        degraded_pages: 1-based numbers of pages with status ``"error"`` or ``"ocr_fallback"``.
-        integrity_verified: True iff at least one page is neither an error page
-            nor on the vision route, and every such page is integrity_verified.
+        sections: Flat, heading-scoped runs of the document's own elements, in
+            document order, no element in two sections, each ending by the
+            last page (nesting is expressed by ``scope_path`` prefixes).
     """
 
     metadata: DocumentMetadata
     pages: tuple[Page, ...]
     sections: tuple[Section, ...] = ()
-    elements: tuple[DocumentElement, ...] = field(init=False, repr=False, compare=False)
-    headings: tuple[Heading, ...] = field(init=False, repr=False, compare=False)
-    paragraphs: tuple[Paragraph, ...] = field(init=False, repr=False, compare=False)
-    key_values: tuple[KeyValue, ...] = field(init=False, repr=False, compare=False)
-    tables: tuple[Table, ...] = field(init=False, repr=False, compare=False)
-    lists: tuple[BulletList, ...] = field(init=False, repr=False, compare=False)
-    figures: tuple[Figure, ...] = field(init=False, repr=False, compare=False)
-    page_images: tuple[PageImage, ...] = field(init=False, repr=False, compare=False)
-    degraded_pages: tuple[int, ...] = field(init=False, repr=False, compare=False)
-    integrity_verified: bool = field(init=False, repr=False, compare=False)
+    _index: _DocumentIndex = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.metadata, DocumentMetadata):
@@ -1180,7 +1411,7 @@ class PDFDocument:
         by_id = _index_by_id(elements)
         _check_continuations(elements, by_id)
         self._check_sections(by_id)
-        self._derive(elements)
+        object.__setattr__(self, "_index", _build_index(self.pages, elements))
 
     def _check_page_numbers(self) -> None:
         """Require ``len(pages) == metadata.page_count`` and pages numbered 1..N in order."""
@@ -1193,7 +1424,7 @@ class PDFDocument:
                 raise ValueError(f"pages[{index}] has page_number {page.page_number}, expected {index + 1}")
 
     def _check_sections(self, by_id: dict[str, DocumentElement]) -> None:
-        """Require each section to end by the last page and hold only (equals of) the document's elements."""
+        """Require each section to end by the last page, hold only (equals of) the document's elements, and lie flat."""
         last_page = self.metadata.page_count
         for index, section in enumerate(self.sections):
             if section.page_span[1] > last_page:
@@ -1204,26 +1435,57 @@ class PDFDocument:
                 _check_member(f"sections[{index}] heading", section.heading, by_id)
             for element in section.elements:
                 _check_member(f"sections[{index}] element", element, by_id)
+        _check_section_layout(self.sections)
 
-    def _derive(self, elements: tuple[DocumentElement, ...]) -> None:
-        """Store the derived collections (one pass over ``elements`` per collection)."""
-        derived: dict[str, object] = {
-            "elements": elements,
-            "headings": tuple(element for element in elements if isinstance(element, Heading)),
-            "paragraphs": tuple(element for element in elements if isinstance(element, Paragraph)),
-            "key_values": tuple(element for element in elements if isinstance(element, KeyValue)),
-            "tables": tuple(element for element in elements if isinstance(element, Table)),
-            "lists": tuple(element for element in elements if isinstance(element, BulletList)),
-            "figures": tuple(element for element in elements if isinstance(element, Figure)),
-            "page_images": tuple(page.page_image for page in self.pages if page.page_image is not None),
-            "degraded_pages": tuple(
-                page.page_number for page in self.pages if page.status in ("error", "ocr_fallback")
-            ),
-        }
-        verifiable = [page for page in self.pages if page.status != "error" and page.route != "vision"]
-        derived["integrity_verified"] = bool(verifiable) and all(page.integrity_verified for page in verifiable)
-        for name, value in derived.items():
-            object.__setattr__(self, name, value)
+    @property
+    def elements(self) -> tuple[DocumentElement, ...]:
+        """Every page's elements, in document order."""
+        return self._index.elements
+
+    @property
+    def headings(self) -> tuple[Heading, ...]:
+        """The ``Heading`` elements, in document order."""
+        return self._index.headings
+
+    @property
+    def paragraphs(self) -> tuple[Paragraph, ...]:
+        """The ``Paragraph`` elements, in document order."""
+        return self._index.paragraphs
+
+    @property
+    def key_values(self) -> tuple[KeyValue, ...]:
+        """The ``KeyValue`` elements, in document order."""
+        return self._index.key_values
+
+    @property
+    def tables(self) -> tuple[Table, ...]:
+        """The ``Table`` elements, in document order."""
+        return self._index.tables
+
+    @property
+    def lists(self) -> tuple[BulletList, ...]:
+        """The ``BulletList`` elements, in document order."""
+        return self._index.lists
+
+    @property
+    def figures(self) -> tuple[Figure, ...]:
+        """The ``Figure`` elements, in document order."""
+        return self._index.figures
+
+    @property
+    def page_images(self) -> tuple[PageImage, ...]:
+        """Every page's ``page_image`` that is not None, in page order."""
+        return self._index.page_images
+
+    @property
+    def degraded_pages(self) -> tuple[int, ...]:
+        """1-based numbers of pages whose status is not ``"ok"`` (error, ocr_fallback, ocr_unavailable)."""
+        return self._index.degraded_pages
+
+    @property
+    def integrity_verified(self) -> bool:
+        """False if any page is an error page; else True iff >= 1 non-vision page exists and all are verified."""
+        return self._index.integrity_verified
 
     def to_markdown(self) -> str:
         """Render every page's Markdown, blank-line separated (empty for a zero-page document)."""

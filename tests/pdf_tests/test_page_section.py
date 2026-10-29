@@ -49,15 +49,21 @@ def _bbox(**overrides):
     return BBox(**kwargs)
 
 
-def _ids(index, *, page=1):
-    return {"element_id": make_element_id(page, index), "page_number": page, "reading_order": index, "bbox": _bbox()}
+def _ids(index, *, page=1, scope_path=()):
+    return {
+        "element_id": make_element_id(page, index),
+        "page_number": page,
+        "reading_order": index,
+        "bbox": _bbox(),
+        "scope_path": scope_path,
+    }
 
 
-def _paragraph(index, *, page=1, order=None, **overrides):
+def _paragraph(index, *, page=1, **overrides):
     kwargs = {
         "element_id": make_element_id(page, index),
         "page_number": page,
-        "reading_order": index if order is None else order,
+        "reading_order": index,
         "bbox": _bbox(),
         "text": f"Paragraph {index}.",
     }
@@ -72,7 +78,8 @@ def _page(**overrides):
         "height_pt": 792,
         "status": "ok",
         "route": "digital",
-        "quality": _quality(),
+        # An error page measured nothing, so it has no quality signals.
+        "quality": None if overrides.get("status") == "error" else _quality(),
     }
     kwargs.update(overrides)
     return Page(**kwargs)
@@ -108,20 +115,45 @@ class TestPageImageFields:
         assert image.band_paths == (Path("b1.png"), Path("b2.png"))
         assert image.contrast_normalized is True
 
-    @pytest.mark.parametrize(("field", "minimum"), [("page_number", 1), ("dpi", 36), ("width_px", 1), ("height_px", 1)])
+    @pytest.mark.parametrize(("field", "minimum"), [("page_number", 1), ("width_px", 1), ("height_px", 1)])
     def test_int_fields_accept_minimum(self, field, minimum):
         assert getattr(_page_image(**{field: minimum}), field) == minimum
 
-    @pytest.mark.parametrize(("field", "minimum"), [("page_number", 1), ("dpi", 36), ("width_px", 1), ("height_px", 1)])
+    @pytest.mark.parametrize(("field", "minimum"), [("page_number", 1), ("width_px", 1), ("height_px", 1)])
     def test_int_fields_reject_minimum_minus_one(self, field, minimum):
         with pytest.raises(ValueError, match=f"{field} must be >= {minimum}"):
             _page_image(**{field: minimum - 1})
 
-    @pytest.mark.parametrize("field", ["page_number", "dpi", "width_px", "height_px"])
+    @pytest.mark.parametrize("field", ["page_number", "width_px", "height_px"])
     @pytest.mark.parametrize("bad", [True, 300.0, "300"])
     def test_int_fields_wrong_type_rejected(self, field, bad):
         with pytest.raises(TypeError, match=f"{field} must be an int"):
             _page_image(**{field: bad})
+
+    @pytest.mark.parametrize("dpi", [300, 72.5, 35, 0.25, 1e-9])
+    def test_dpi_is_any_positive_finite_number_coerced_to_float(self, dpi):
+        # Pixel-bounded renders give fractional dpi, and a huge page can render below 36 dpi.
+        image = _page_image(dpi=dpi)
+        assert image.dpi == float(dpi)
+        assert type(image.dpi) is float
+
+    @pytest.mark.parametrize(
+        ("bad", "match"),
+        [
+            (0, "dpi must be > 0"),
+            (-72, "dpi must be > 0"),
+            (math.nan, "dpi must be finite"),
+            (math.inf, "dpi must be finite"),
+        ],
+    )
+    def test_dpi_must_be_positive_and_finite(self, bad, match):
+        with pytest.raises(ValueError, match=match):
+            _page_image(dpi=bad)
+
+    @pytest.mark.parametrize("bad", [True, "300", None])
+    def test_dpi_wrong_type_rejected(self, bad):
+        with pytest.raises(TypeError, match="dpi must be an int or float"):
+            _page_image(dpi=bad)
 
     def test_image_path_must_be_a_path(self):
         with pytest.raises(TypeError, match="image_path must be a pathlib.Path or None"):
@@ -149,6 +181,14 @@ class TestPageImageFields:
         with pytest.raises(TypeError, match=f"{field} must be callable or None"):
             _page_image(**{field: PNG})
 
+    def test_storage_paths_excluded_from_equality_and_hash(self):
+        # Where the image and bands were written is storage, not identity.
+        stored = _page_image(image_path=Path("a/p.png"), band_paths=(Path("a/b1.png"),))
+        moved = _page_image(image_path=Path("b/p.png"), band_paths=(Path("b/b1.png"), Path("b/b2.png")))
+        assert stored == moved == _page_image()
+        assert hash(stored) == hash(moved) == hash(_page_image())
+        assert "band_paths=(" in repr(stored)
+
     def test_loaders_excluded_from_equality_hash_and_repr(self):
         with_loaders = _page_image(_loader=lambda: PNG, _band_loader=lambda: BANDS)
         assert with_loaders == _page_image()
@@ -167,8 +207,8 @@ class TestPageImageFields:
             PageImage(*positional)
 
     def test_replace_revalidates(self):
-        with pytest.raises(ValueError, match="dpi must be >= 36"):
-            dataclasses.replace(_page_image(), dpi=35)
+        with pytest.raises(ValueError, match="dpi must be > 0"):
+            dataclasses.replace(_page_image(), dpi=0)
 
 
 class TestPageImageReadBytes:
@@ -202,6 +242,17 @@ class TestPageImageReadBytes:
     def test_loader_returning_non_bytes_raises(self, bad):
         with pytest.raises(TypeError, match="_loader result must be bytes"):
             _page_image(_loader=lambda: bad).read_bytes()
+
+    def test_directory_path_rejected_before_opening(self, tmp_path):
+        with pytest.raises(DatagruntPDFError, match="is not a regular file"):
+            _page_image(image_path=tmp_path).read_bytes()
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX named pipes")
+    def test_named_pipe_rejected_without_blocking(self, tmp_path):
+        fifo = tmp_path / "p.png"
+        os.mkfifo(fifo)
+        with pytest.raises(DatagruntPDFError, match="is not a regular file"):
+            _page_image(image_path=fifo).read_bytes()
 
 
 class TestPageImageReadBands:
@@ -238,9 +289,31 @@ class TestPageImageReadBands:
         with pytest.raises(TypeError, match="_band_loader must return a tuple of bytes"):
             _page_image(_band_loader=lambda: bad).read_bands()
 
+    def test_directory_band_path_rejected_before_opening(self, tmp_path):
+        paths = (_write(tmp_path, "b1.png", BANDS[0]), tmp_path)
+        with pytest.raises(DatagruntPDFError, match="is not a regular file"):
+            _page_image(band_paths=paths).read_bands()
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX named pipes")
+    def test_named_pipe_band_rejected_without_blocking(self, tmp_path):
+        fifo = tmp_path / "b2.png"
+        os.mkfifo(fifo)
+        paths = (_write(tmp_path, "b1.png", BANDS[0]), fifo)
+        with pytest.raises(DatagruntPDFError, match="is not a regular file"):
+            _page_image(band_paths=paths).read_bands()
+
     def test_band_loader_returning_non_bytes_band_raises(self):
         with pytest.raises(TypeError, match=r"_band_loader result\[1\] must be bytes"):
             _page_image(_band_loader=lambda: (BANDS[0], "band-two")).read_bands()
+
+
+@pytest.mark.parametrize(
+    "method", [Figure.read_bytes, PageImage.read_bytes, PageImage.read_bands], ids=lambda m: m.__qualname__
+)
+def test_asset_read_docstrings_list_every_raised_error(method):
+    raises = method.__doc__.split("Raises:", 1)[1]
+    for error in ("DatagruntPDFError", "OSError", "TypeError"):
+        assert f"{error}:" in raises, f"{method.__qualname__} docstring does not list {error}"
 
 
 class TestPageImageReadsBounded:
@@ -313,7 +386,9 @@ def _one_of_each(page=1):
     """One element of every DocumentElement type, in reading order on ``page``."""
     base = {"page_number": page, "bbox": _bbox()}
     return (
-        Heading(element_id=make_element_id(page, 0), reading_order=0, level=1, text="Report", **base),
+        Heading(
+            element_id=make_element_id(page, 0), reading_order=0, level=1, text="Report", scope_path=("Report",), **base
+        ),
         Paragraph(element_id=make_element_id(page, 1), reading_order=1, text="# Body.", **base),
         KeyValue(element_id=make_element_id(page, 2), reading_order=2, key="Invoice", value="42", **base),
         Table(
@@ -467,7 +542,9 @@ class TestPageStatusInvariants:
         with pytest.raises(ValueError, match="status 'error' requires a non-blank error message"):
             _page(status="error", error=error)
 
-    @pytest.mark.parametrize(("status", "route"), [("ok", "digital"), ("ocr_fallback", "vision")])
+    @pytest.mark.parametrize(
+        ("status", "route"), [("ok", "digital"), ("ocr_fallback", "vision"), ("ocr_unavailable", "vision")]
+    )
     @pytest.mark.parametrize("error", ["boom", ""])
     def test_error_message_only_on_error_status(self, status, route, error):
         with pytest.raises(ValueError, match="error must be None unless status is 'error'"):
@@ -480,6 +557,19 @@ class TestPageStatusInvariants:
     def test_error_page_cannot_be_integrity_verified(self):
         with pytest.raises(ValueError, match="an error page cannot be integrity_verified"):
             _page(status="error", error="boom", integrity_verified=True)
+
+    def test_error_page_has_no_quality(self):
+        assert _page(status="error", error="boom").quality is None
+
+    def test_error_page_with_quality_rejected(self):
+        # Nothing was extracted, so any quality signals would be invented.
+        with pytest.raises(ValueError, match="an error page must have quality None, got a PageQuality"):
+            _page(status="error", error="boom", quality=_quality())
+
+    @pytest.mark.parametrize(("status", "route"), [("ok", "digital"), ("ok", "vision"), ("ocr_fallback", "vision")])
+    def test_non_error_page_requires_quality(self, status, route):
+        with pytest.raises(ValueError, match=f"status {status!r} requires a PageQuality, got quality=None"):
+            _page(status=status, route=route, quality=None)
 
     def test_ocr_fallback_on_vision_route(self):
         page = _page(status="ocr_fallback", route="vision", elements=(_paragraph(0),))
@@ -494,14 +584,25 @@ class TestPageStatusInvariants:
     def test_non_vision_page_can_be_integrity_verified(self, route):
         assert _page(route=route, integrity_verified=True).integrity_verified is True
 
-    @pytest.mark.parametrize("status", ["ok", "ocr_fallback"])
+    @pytest.mark.parametrize("status", ["ok", "ocr_fallback", "ocr_unavailable"])
     def test_vision_page_cannot_be_integrity_verified(self, status):
         with pytest.raises(ValueError, match="a vision page cannot be integrity_verified"):
             _page(status=status, route="vision", integrity_verified=True)
 
-    def test_vision_page_without_ocr_stays_ok_with_a_warning(self):
-        page = _page(route="vision", warnings=("OCR unavailable: tesseract not found",))
-        assert (page.status, page.warnings) == ("ok", ("OCR unavailable: tesseract not found",))
+    def test_vision_page_without_ocr_is_ocr_unavailable_and_keeps_digital_spans(self):
+        page = _page(
+            status="ocr_unavailable",
+            route="vision",
+            elements=(_paragraph(0),),
+            warnings=("OCR unavailable: tesseract not found",),
+        )
+        assert (page.status, page.route, page.elements) == ("ocr_unavailable", "vision", (_paragraph(0),))
+        assert page.warnings == ("OCR unavailable: tesseract not found",)
+
+    @pytest.mark.parametrize("route", ["digital", "hybrid"])
+    def test_ocr_unavailable_on_non_vision_route_rejected(self, route):
+        with pytest.raises(ValueError, match=f"status 'ocr_unavailable' requires route 'vision', got route='{route}'"):
+            _page(status="ocr_unavailable", route=route)
 
 
 class TestPageElements:
@@ -510,7 +611,7 @@ class TestPageElements:
         assert _page(elements=elements).elements == elements
 
     def test_reading_order_may_skip_values(self):
-        elements = (_paragraph(0, order=2), _paragraph(1, order=5), _paragraph(2, order=9))
+        elements = (_paragraph(2), _paragraph(5), _paragraph(9))
         assert _page(elements=elements).elements == elements
 
     def test_element_page_number_mismatch_rejected(self):
@@ -518,14 +619,17 @@ class TestPageElements:
             _page(elements=(_paragraph(0, page=2),))
 
     def test_duplicate_element_ids_rejected(self):
-        twins = (_paragraph(0, order=0), _paragraph(0, order=1))
+        # An id encodes (page, reading_order), so equal ids mean an equal reading order too.
+        twins = (_paragraph(0), _paragraph(0))
         with pytest.raises(ValueError, match="duplicate element_id 'p0001_e000'"):
             _page(elements=twins)
 
-    @pytest.mark.parametrize("second_order", [3, 2])
+    @pytest.mark.parametrize("second_order", [2, 0])
     def test_non_increasing_reading_order_rejected(self, second_order):
-        elements = (_paragraph(0, order=3), _paragraph(1, order=second_order))
-        with pytest.raises(ValueError, match=rf"elements\[1\] \(p0001_e001\) reading_order {second_order} must be"):
+        elements = (_paragraph(3), _paragraph(second_order))
+        with pytest.raises(
+            ValueError, match=rf"elements\[1\] \(p0001_e00{second_order}\) reading_order {second_order} must be"
+        ):
             _page(elements=elements)
 
     def test_off_page_element_rejected_unless_flagged(self):
@@ -588,6 +692,10 @@ class TestPageMarkdown:
         page = _page(page_number=3, status="error", error="pdfium: bad xref -->")
         assert page.to_markdown() == "<!-- page 3 route=digital status=error -->"
 
+    def test_ocr_unavailable_header(self):
+        page = _page(status="ocr_unavailable", route="vision", elements=(_paragraph(0),))
+        assert page.to_markdown() == "<!-- page 1 route=vision status=ocr_unavailable -->\n\nParagraph 0."
+
     def test_ocr_fallback_header(self):
         page = _page(status="ocr_fallback", route="vision", elements=(_paragraph(0),))
         assert page.to_markdown() == "<!-- page 1 route=vision status=ocr_fallback -->\n\nParagraph 0."
@@ -625,6 +733,10 @@ class TestPageMarkdown:
         )
 
 
+# The scope of the sections built here: a heading's own scope_path ends with its text.
+SCOPE = ("Report", "Findings")
+
+
 def _heading(index=0, *, page=1, text="Findings", **overrides):
     kwargs = {
         "element_id": make_element_id(page, index),
@@ -633,6 +745,7 @@ def _heading(index=0, *, page=1, text="Findings", **overrides):
         "bbox": _bbox(),
         "level": 2,
         "text": text,
+        "scope_path": ("Report", text),
     }
     kwargs.update(overrides)
     return Heading(**kwargs)
@@ -666,9 +779,9 @@ def _section(**overrides):
     heading = _heading()
     kwargs = {
         "heading": heading,
-        "scope_path": ("Report", "Findings"),
+        "scope_path": SCOPE,
         "page_span": (1, 2),
-        "elements": (heading, _paragraph(1), _paragraph(0, page=2)),
+        "elements": (heading, _paragraph(1, scope_path=SCOPE), _paragraph(0, page=2, scope_path=SCOPE)),
     }
     kwargs.update(overrides)
     return Section(**kwargs)
@@ -686,9 +799,47 @@ class TestSectionFields:
         section = _section(heading=None, scope_path=(), page_span=(1, 1), elements=(_paragraph(0),))
         assert section.heading is None
 
-    def test_scope_path_unconstrained_without_heading(self):
-        section = _section(heading=None, scope_path=("Report",), elements=(_paragraph(1),))
+    def test_scope_path_without_heading_need_not_end_with_a_heading_text(self):
+        section = _section(heading=None, scope_path=("Report",), elements=(_paragraph(1, scope_path=("Report",)),))
         assert section.scope_path == ("Report",)
+
+    @pytest.mark.parametrize("scope_path", [(), ("Report",), ("Report", "Findings", "Detail"), ("Other", "Findings")])
+    def test_element_scope_must_equal_section_scope(self, scope_path):
+        # Sections are flat: a nested scope is its own section, linked by the scope_path prefix.
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                f"elements[1] (p0001_e001) has scope_path {scope_path!r}, but the section's scope_path is {SCOPE!r}"
+            ),
+        ):
+            _section(elements=(_heading(), _paragraph(1, scope_path=scope_path)))
+
+    def test_element_scope_checked_without_heading_too(self):
+        with pytest.raises(ValueError, match=r"elements\[0\] \(p0001_e000\) has scope_path \('Report',\)"):
+            _section(heading=None, scope_path=(), page_span=(1, 1), elements=(_paragraph(0, scope_path=("Report",)),))
+
+    def test_heading_scope_must_equal_section_scope(self):
+        heading = _heading(scope_path=("Other", "Findings"))
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "heading (p0001_e000) has scope_path ('Other', 'Findings'), "
+                "but the section's scope_path is ('Report', 'Findings')"
+            ),
+        ):
+            _section(heading=heading, elements=())
+
+    def test_heading_in_elements_must_be_first(self):
+        heading = _heading(1)
+        with pytest.raises(
+            ValueError, match=r"elements\[1\] \(p0001_e001\) is the section heading, so it must be elements\[0\]"
+        ):
+            _section(heading=heading, elements=(_paragraph(0, scope_path=SCOPE), heading))
+
+    def test_heading_first_in_elements_accepted(self):
+        heading = _heading(1)
+        elements = (heading, _paragraph(2, scope_path=SCOPE))
+        assert _section(heading=heading, elements=elements).elements == elements
 
     def test_empty_elements_allowed(self):
         assert _section(elements=()).elements == ()
@@ -764,9 +915,13 @@ class TestSectionFields:
             _section(heading=None, scope_path=(), elements=elements)
 
     def test_duplicate_element_ids_rejected(self):
-        twins = (_paragraph(0, order=0), _paragraph(0, order=1))
+        # Unreachable through validated elements (an id encodes its page and
+        # reading order, which strictly increase here), so a forged element
+        # stands in for corrupted input: the defensive check must still fire.
+        forged = _paragraph(1)
+        object.__setattr__(forged, "element_id", "p0001_e000")
         with pytest.raises(ValueError, match="elements has duplicate element_id 'p0001_e000'"):
-            _section(heading=None, scope_path=(), elements=twins)
+            _section(heading=None, scope_path=(), elements=(_paragraph(0), forged))
 
     @pytest.mark.parametrize(
         "impostor",
@@ -828,7 +983,7 @@ class TestSectionMarkdown:
         assert _section().to_markdown() == "## Findings\n\nParagraph 1.\n\nParagraph 0."
 
     def test_heading_not_among_elements_rendered_first(self):
-        section = _section(elements=(_paragraph(1),))
+        section = _section(elements=(_paragraph(1, scope_path=SCOPE),))
         assert section.to_markdown() == "## Findings\n\nParagraph 1."
 
     def test_heading_only_section(self):
@@ -839,13 +994,15 @@ class TestSectionMarkdown:
         assert section.to_markdown() == "Paragraph 0.\n\n| k | v |\n| --- | --- |\n| t1.1 | 1 |"
 
     def test_comment_in_text_cannot_swallow_following_elements(self):
-        section = _section(elements=(_heading(), _paragraph(1, text="<!-- draft"), _paragraph(2)))
+        section = _section(
+            elements=(_heading(), _paragraph(1, text="<!-- draft", scope_path=SCOPE), _paragraph(2, scope_path=SCOPE))
+        )
         assert section.to_markdown() == "## Findings\n\n\\<!-- draft\n\nParagraph 2."
 
     def test_consecutive_lists_separated_by_empty_comment(self):
         lists = (
-            BulletList(**_ids(1), items=("a",), ordered=True),
-            BulletList(**_ids(2), items=("b",), ordered=True),
+            BulletList(**_ids(1, scope_path=SCOPE), items=("a",), ordered=True),
+            BulletList(**_ids(2, scope_path=SCOPE), items=("b",), ordered=True),
         )
         assert _section(elements=lists).to_markdown() == "## Findings\n\n1. a\n\n<!-- -->\n\n1. b"
 

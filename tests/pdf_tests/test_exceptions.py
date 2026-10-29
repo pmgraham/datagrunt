@@ -23,6 +23,12 @@ class TestHierarchy:
         assert issubclass(PDFCorruptError, DatagruntPDFError)
         assert not issubclass(PDFCorruptError, ValueError)
 
+    def test_corrupt_is_a_runtime_error_for_v4_callers(self):
+        # v4's corrupt-PDF errors were PdfiumError(RuntimeError); `except RuntimeError` must keep working.
+        assert issubclass(PDFCorruptError, RuntimeError)
+        with pytest.raises(RuntimeError, match="bad xref"):
+            raise PDFCorruptError("bad xref")
+
     def test_base_catches_both_subclasses(self):
         for exc in (PDFEncryptedError("locked"), PDFCorruptError("broken")):
             with pytest.raises(DatagruntPDFError):
@@ -48,12 +54,12 @@ class TestPDFCorruptError:
 
     @pytest.mark.parametrize("bad", [True, False])
     def test_rejects_bool_page_number(self, bad):
-        with pytest.raises(ValueError, match="page_number"):
+        with pytest.raises(TypeError, match="page_number must be an int"):
             PDFCorruptError("bad page", page_number=bad)
 
     @pytest.mark.parametrize("bad", [1.0, "1", [1]])
     def test_rejects_non_int_page_number(self, bad):
-        with pytest.raises(ValueError, match="page_number"):
+        with pytest.raises(TypeError, match="page_number must be an int"):
             PDFCorruptError("bad page", page_number=bad)
 
     def test_page_number_is_keyword_only(self):

@@ -4,6 +4,7 @@ import dataclasses
 import hashlib
 import os
 import re
+import time
 from pathlib import Path
 from typing import get_args
 
@@ -33,7 +34,8 @@ def _bbox():
 
 
 def _base(**overrides):
-    kwargs = {"element_id": "p0001_e001", "page_number": 1, "reading_order": 0, "bbox": _bbox()}
+    # element_id must equal make_element_id(page_number, reading_order).
+    kwargs = {"element_id": "p0001_e001", "page_number": 1, "reading_order": 1, "bbox": _bbox()}
     kwargs.update(overrides)
     return kwargs
 
@@ -41,7 +43,8 @@ def _base(**overrides):
 # Minimal own-field kwargs per element class; base-invariant tests run against
 # every class to prove each one inherits the shared validation.
 ELEMENT_FIELDS = {
-    Heading: {"level": 2, "text": "Overview"},
+    # A heading's own scope_path ends with its text.
+    Heading: {"level": 2, "text": "Overview", "scope_path": ("Overview",)},
     Paragraph: {"text": "Body text."},
     KeyValue: {"key": "Invoice", "value": "42"},
     BulletList: {"items": ("one", "two"), "ordered": False},
@@ -52,18 +55,22 @@ ELEMENT_CLASSES = list(ELEMENT_FIELDS)
 
 
 def _element(cls, **overrides):
-    return cls(**{**_base(), **ELEMENT_FIELDS[cls], **overrides})
+    kwargs = {**_base(), **ELEMENT_FIELDS[cls], **overrides}
+    text = overrides.get("text")
+    if cls is Heading and "scope_path" not in overrides and isinstance(text, str) and text.strip():
+        kwargs["scope_path"] = (text,)  # keep the heading's scope ending with its (overridden) text
+    return cls(**kwargs)
 
 
 class TestTypeAliases:
     def test_hidden_reasons_canonical_order(self):
-        assert HIDDEN_REASONS == ("off_page", "invisible", "tiny_font", "transparent")
+        assert HIDDEN_REASONS == ("off_page", "invisible", "tiny_font", "transparent", "matches_background")
 
     def test_hidden_reason_literal_members(self):
-        assert get_args(HiddenReason) == ("off_page", "invisible", "tiny_font", "transparent")
+        assert get_args(HiddenReason) == ("off_page", "invisible", "tiny_font", "transparent", "matches_background")
 
     def test_page_status_values(self):
-        assert get_args(PageStatus) == ("ok", "ocr_fallback", "error")
+        assert get_args(PageStatus) == ("ok", "ocr_fallback", "ocr_unavailable", "error")
 
     def test_page_route_values(self):
         assert get_args(PageRoute) == ("digital", "hybrid", "vision")
@@ -102,7 +109,7 @@ class TestElementBase:
     def test_valid_minimal_element(self, cls):
         element = _element(cls)
         assert element.element_id == "p0001_e001"
-        assert element.scope_path == ()
+        assert element.scope_path == ELEMENT_FIELDS[cls].get("scope_path", ())
         assert element.hidden_reasons == ()
         assert element.is_hidden is False
 
@@ -112,6 +119,16 @@ class TestElementBase:
     def test_element_id_page_mismatch_rejected(self, cls):
         with pytest.raises(ValueError, match="element_id"):
             _element(cls, element_id="p0002_e001")
+
+    @pytest.mark.parametrize("order", [0, 2, 10])
+    def test_element_id_index_must_equal_reading_order(self, cls, order):
+        with pytest.raises(ValueError, match=rf"element_id 'p0001_e001' encodes index 1, not reading_order {order}"):
+            _element(cls, reading_order=order)
+
+    @pytest.mark.parametrize("order", [0, 1, 999, 1000])
+    def test_element_id_is_derived_from_page_and_reading_order(self, cls, order):
+        element = _element(cls, element_id=make_element_id(1, order), reading_order=order)
+        assert element.element_id == make_element_id(element.page_number, element.reading_order)
 
     @pytest.mark.parametrize(
         "bad_id",
@@ -149,15 +166,16 @@ class TestElementBase:
             _element(cls, **{field: bad})
 
     def test_reading_order_zero_and_up(self, cls):
-        assert _element(cls, reading_order=0).reading_order == 0
-        assert _element(cls, reading_order=7).reading_order == 7
+        assert _element(cls, element_id="p0001_e000", reading_order=0).reading_order == 0
+        assert _element(cls, element_id="p0001_e007", reading_order=7).reading_order == 7
 
     def test_bbox_must_be_a_bbox(self, cls):
         with pytest.raises(TypeError, match="bbox"):
             _element(cls, bbox=(0, 0, 100, 20))
 
     def test_scope_path_accepts_tuple_of_headings(self, cls):
-        assert _element(cls, scope_path=("Report", "Findings")).scope_path == ("Report", "Findings")
+        # Ends with "Overview", so it is also a valid scope for the Heading fixture.
+        assert _element(cls, scope_path=("Report", "Overview")).scope_path == ("Report", "Overview")
 
     @pytest.mark.parametrize(
         ("bad", "exc"), [(("Report", " "), ValueError), (["Report"], TypeError), ((1,), TypeError)]
@@ -166,7 +184,9 @@ class TestElementBase:
         with pytest.raises(exc, match="scope_path"):
             _element(cls, scope_path=bad)
 
-    @pytest.mark.parametrize("reasons", [("off_page",), ("invisible", "transparent"), HIDDEN_REASONS])
+    @pytest.mark.parametrize(
+        "reasons", [("off_page",), ("invisible", "transparent"), ("matches_background",), HIDDEN_REASONS]
+    )
     def test_hidden_reasons_flag_element_as_hidden(self, cls, reasons):
         element = _element(cls, hidden_reasons=reasons)
         assert element.hidden_reasons == reasons
@@ -179,6 +199,7 @@ class TestElementBase:
             (("blurry",), "unknown"),
             (("tiny_font", "off_page"), "canonical order"),
             (("transparent", "invisible"), "canonical order"),
+            (("matches_background", "transparent"), "canonical order"),
         ],
     )
     def test_bad_hidden_reasons_rejected(self, cls, bad, match):
@@ -236,6 +257,16 @@ class TestHeading:
     def test_bad_text_rejected(self, bad, exc):
         with pytest.raises(exc, match="text"):
             _element(Heading, text=bad)
+
+    @pytest.mark.parametrize("scope_path", [("Overview",), ("Report", "Overview"), ("A", "B", "Overview")])
+    def test_scope_path_ends_with_own_text(self, scope_path):
+        assert _element(Heading, scope_path=scope_path).scope_path == scope_path
+
+    @pytest.mark.parametrize("scope_path", [(), ("Report",), ("Overview", "Report"), ("Overview ",), ("overview",)])
+    def test_scope_path_not_ending_with_own_text_rejected(self, scope_path):
+        # A heading opens its own scope, so its scope_path includes its text (verbatim, last).
+        with pytest.raises(ValueError, match=r"scope_path must end with the heading's own text 'Overview'"):
+            _element(Heading, scope_path=scope_path)
 
     @pytest.mark.parametrize(("level", "expected"), [(1, "# Overview"), (3, "### Overview"), (6, "###### Overview")])
     def test_to_markdown(self, level, expected):
@@ -462,7 +493,7 @@ class TestTableContinuation:
         assert _table(continued_from_id="p0001_e000").continued_from_id == "p0001_e000"
 
     def test_continuation_from_earlier_page_id_format_allowed(self):
-        table = _table(element_id="p0002_e000", page_number=2, continued_from_id="p0001_e004")
+        table = _table(element_id="p0002_e001", page_number=2, continued_from_id="p0001_e004")
         assert table.continued_from_id == "p0001_e004"
 
     @pytest.mark.parametrize("bad", ["p1_e1", "p00001_e001", "p0000_e001", "table-1", ""])
@@ -516,6 +547,39 @@ class TestTableColumnNames:
         table = _table(headers=("a", "", "a"), rows=())
         assert table.column_names() == table.column_names() == ("a", "column_2", "a_2")
 
+    @pytest.mark.parametrize(
+        ("headers", "names"),
+        [
+            (("a", "A"), ("a", "A_2")),  # DuckDB treats column names case-insensitively
+            (("Name", "NAME", "name_2"), ("Name", "NAME_3", "name_2")),
+            (("", "COLUMN_1"), ("column_1_2", "COLUMN_1")),
+            (("Straße", "STRASSE"), ("Straße", "STRASSE_2")),  # casefold, not lower: ß folds to ss
+            (("x", "X_2", "x"), ("x", "X_2", "x_3")),
+        ],
+    )
+    def test_duplicates_detected_case_insensitively(self, headers, names):
+        assert _table(headers=headers, rows=()).column_names() == names
+
+    def test_names_unique_case_insensitively(self):
+        headers = ("a", "A", "", "COLUMN_3", "a_2", "A_2", "column_3_2", "")
+        names = _table(headers=headers, rows=()).column_names()
+        folded = [name.casefold() for name in names]
+        assert len(set(folded)) == len(folded) == len(headers)
+
+    def test_dataframe_accepts_case_variant_headers(self):
+        df = _table(headers=("id", "ID"), rows=(("1", "2"),)).to_dataframe()
+        assert df.columns == ["id", "ID_2"]
+
+    def test_many_duplicates_named_in_linear_time(self):
+        # A quadratic suffix search takes seconds here; a linear one takes milliseconds.
+        count = 10_000
+        table = _table(headers=("a",) * count, rows=())
+        started = time.perf_counter()
+        names = table.column_names()
+        elapsed = time.perf_counter() - started
+        assert names[:3] == ("a", "a_2", "a_3") and names[-1] == f"a_{count}"
+        assert elapsed < 1.0, f"column_names took {elapsed:.2f}s for {count} duplicate headers"
+
 
 class TestTableExports:
     def test_to_dataframe(self):
@@ -542,14 +606,24 @@ class TestTableExports:
         assert isinstance(arrow, pa.Table)
         assert arrow.column_names == ["Name", "Qty"]
         assert arrow.to_pylist() == [{"Name": "bolt", "Qty": "4"}]
-        assert all(
-            pa.types.is_string(t) or pa.types.is_large_string(t) or pa.types.is_string_view(t)
-            for t in arrow.schema.types
-        )
+        assert arrow.schema == pa.schema([("Name", pa.large_string()), ("Qty", pa.large_string())])
 
     def test_zero_row_arrow_table(self):
         arrow = _table(headers=("a",), rows=()).to_arrow_table()
         assert (arrow.num_rows, arrow.column_names) == (0, ["a"])
+        assert arrow.schema == pa.schema([("a", pa.large_string())])
+
+    def test_arrow_schema_pinned_whatever_string_type_polars_exports(self, monkeypatch):
+        # Newer polars exports string_view by default; the schema must not follow it.
+        export = pl.DataFrame.to_arrow
+
+        def newest(self, *args, **kwargs):
+            return export(self, compat_level=pl.CompatLevel.newest())
+
+        monkeypatch.setattr(pl.DataFrame, "to_arrow", newest)
+        arrow = _table(headers=("a", "b"), rows=(("1", "2"),)).to_arrow_table()
+        assert arrow.schema.types == [pa.large_string(), pa.large_string()]
+        assert arrow.to_pylist() == [{"a": "1", "b": "2"}]
 
     def test_to_dicts(self):
         table = _table(headers=("a", "a"), rows=(("1", "2"), ("3", "4")))
@@ -567,9 +641,18 @@ class TestTableMarkdown:
     def test_zero_row_table_is_header_and_separator(self):
         assert _table(headers=("a",), rows=()).to_markdown() == "| a |\n| --- |"
 
-    def test_headerless_table_uses_generated_names(self):
+    def test_headerless_table_has_an_empty_header_row(self):
+        # GFM needs a header row; generated column names would invent header text.
         table = _table(headers=(), rows=(("1", "2"),))
-        assert table.to_markdown() == "| column\\_1 | column\\_2 |\n| --- | --- |\n| 1 | 2 |"
+        assert table.to_markdown() == "|  |  |\n| --- | --- |\n| 1 | 2 |"
+
+    def test_blank_headers_render_as_empty_cells(self):
+        table = _table(headers=("", "Qty", " \n "), rows=(("a", "1", "b"),))
+        assert table.to_markdown() == "|  | Qty |  |\n| --- | --- | --- |\n| a | 1 | b |"
+
+    def test_duplicate_headers_render_verbatim(self):
+        table = _table(headers=("a", "A", "a"), rows=())
+        assert table.to_markdown() == "| a | A | a |\n| --- | --- | --- |"
 
     def test_pipes_and_line_breaks_escaped_in_cells(self):
         table = _table(headers=("a|b", "c\nd"), rows=(("x | y", "line1\r\nline2\rline3"),))
@@ -640,6 +723,14 @@ class TestFigureFields:
         with pytest.raises(TypeError, match="_loader"):
             _figure(_loader=IMAGE)
 
+    def test_image_path_excluded_from_equality_and_hash(self):
+        # Where the image was written is storage, not identity.
+        stored = _figure(image_path=Path("out/a/fig.png"))
+        moved = _figure(image_path=Path("out/b/fig.png"))
+        assert stored == moved == _figure()
+        assert hash(stored) == hash(moved) == hash(_figure())
+        assert "image_path=PosixPath" in repr(stored) or "image_path=WindowsPath" in repr(stored)
+
     def test_loader_excluded_from_equality_hash_and_repr(self):
         with_loader = _figure(_loader=lambda: IMAGE)
         assert with_loader == _figure()
@@ -687,6 +778,18 @@ class TestFigureReadBytes:
     def test_loader_returning_non_bytes_raises(self, bad):
         with pytest.raises(TypeError, match="_loader"):
             _figure(_loader=lambda: bad).read_bytes()
+
+    def test_directory_path_rejected_before_opening(self, tmp_path):
+        with pytest.raises(DatagruntPDFError, match="is not a regular file"):
+            _figure(image_path=tmp_path).read_bytes()
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX named pipes")
+    def test_named_pipe_rejected_without_blocking(self, tmp_path):
+        # Opening a FIFO for reading blocks until a writer appears: never open one.
+        fifo = tmp_path / "fig.png"
+        os.mkfifo(fifo)
+        with pytest.raises(DatagruntPDFError, match="is not a regular file"):
+            _figure(image_path=fifo).read_bytes()
 
 
 class TestFigureReadBytesBounded:

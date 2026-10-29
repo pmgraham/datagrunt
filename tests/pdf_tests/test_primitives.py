@@ -3,6 +3,7 @@
 import dataclasses
 import hashlib
 import math
+import unicodedata
 
 import pytest
 
@@ -275,7 +276,27 @@ class TestPageQuality:
     @pytest.mark.parametrize("field", COUNT_FIELDS)
     @pytest.mark.parametrize("value", [0, 1, 50_000])
     def test_counts_accept_zero_and_up(self, field, value):
-        assert getattr(_quality(**{field: value}), field) == value
+        # A page with no characters has no valid-character ratio to report.
+        ratio = None if (field, value) == ("char_count", 0) else 0.98
+        assert getattr(_quality(**{field: value, "valid_char_ratio": ratio}), field) == value
+
+    def test_ratio_is_none_for_a_page_without_characters(self):
+        quality = _quality(char_count=0, valid_char_ratio=None)
+        assert (quality.char_count, quality.valid_char_ratio) == (0, None)
+
+    @pytest.mark.parametrize("ratio", [0, 0.0, 1.0])
+    def test_ratio_without_characters_rejected(self, ratio):
+        # 0 of 0 characters is not a ratio: reporting one would invent a value.
+        with pytest.raises(ValueError, match="valid_char_ratio must be None when char_count is 0"):
+            _quality(char_count=0, valid_char_ratio=ratio)
+
+    @pytest.mark.parametrize("count", [1, 1200])
+    def test_ratio_required_when_characters_exist(self, count):
+        with pytest.raises(ValueError, match=f"valid_char_ratio is required when char_count is {count}"):
+            _quality(char_count=count, valid_char_ratio=None)
+
+    def test_deskew_none_when_not_measured(self):
+        assert _quality(deskew_angle_deg=None).deskew_angle_deg is None
 
     @pytest.mark.parametrize("field", COUNT_FIELDS)
     def test_negative_count_rejected(self, field):
@@ -347,7 +368,7 @@ SHA = hashlib.sha256(b"datagrunt").hexdigest()
 
 def _metadata(**overrides):
     kwargs = {
-        "doc_id": f"report__{SHA[:8]}",
+        "doc_id": f"report__{SHA[:16]}",
         "source_name": "report.pdf",
         "sha256": SHA,
         "page_count": 3,
@@ -369,23 +390,54 @@ class TestMakeDocId:
             ("README", "README"),
             ("a__b___c.pdf", "a_b_c"),
             ("--x--.pdf", "--x--"),
-            ("café.pdf", "caf"),
+            ("café.pdf", "cafe"),  # NFKD: the accent is a combining mark, dropped
             (".", "document"),
         ],
     )
     def test_sanitized_stem_plus_sha_prefix(self, source_name, stem):
-        assert DocumentMetadata.make_doc_id(source_name, SHA) == f"{stem}__{SHA[:8]}"
+        assert DocumentMetadata.make_doc_id(source_name, SHA) == f"{stem}__{SHA[:16]}"
 
     @pytest.mark.parametrize("source_name", ["My Report (v2).final.pdf", "__.pdf", "a__b.pdf", "日本語.pdf"])
     def test_separator_is_unambiguous(self, source_name):
         doc_id = DocumentMetadata.make_doc_id(source_name, SHA)
         stem, sha_prefix = doc_id.split("__")
         assert stem and "_" not in (stem[0], stem[-1])
-        assert sha_prefix == SHA[:8]
+        assert sha_prefix == SHA[:16]
 
     def test_concrete_doc_id(self):
         # Pinned literal: a change to the derivation must show up here, not just stay self-consistent.
-        assert DocumentMetadata.make_doc_id("x.pdf", SHA) == "x__34a61eb5"
+        assert DocumentMetadata.make_doc_id("x.pdf", SHA) == "x__34a61eb5cc80969e"
+
+    def test_suffix_is_sixteen_hex_characters(self):
+        # 8 hex characters collide ~69% across 100k files sharing a stem (e.g. every
+        # non-Latin name becomes "document"); 16 makes that negligible.
+        assert DocumentMetadata.make_doc_id("日本語.pdf", SHA).split("__")[1] == SHA[:16]
+
+    def test_nfc_and_nfd_names_give_the_same_id(self):
+        nfc = unicodedata.normalize("NFC", "Résumé Café.pdf")
+        nfd = unicodedata.normalize("NFD", "Résumé Café.pdf")
+        assert nfc != nfd
+        assert DocumentMetadata.make_doc_id(nfc, SHA) == DocumentMetadata.make_doc_id(nfd, SHA)
+        assert DocumentMetadata.make_doc_id(nfd, SHA) == f"Resume_Cafe__{SHA[:16]}"
+
+    @pytest.mark.parametrize(
+        ("source_name", "stem"),
+        [
+            ("ﬁnal ＲＥＰＯＲＴ.pdf", "final_REPORT"),  # NFKD folds the ligature and full-width letters
+            ("naïve-Ångström.pdf", "naive-Angstrom"),
+        ],
+    )
+    def test_compatibility_forms_folded_to_ascii(self, source_name, stem):
+        assert DocumentMetadata.make_doc_id(source_name, SHA) == f"{stem}__{SHA[:16]}"
+
+    @pytest.mark.parametrize(("length", "kept"), [(63, 63), (64, 64), (65, 64), (500, 64)])
+    def test_stem_capped_at_sixty_four_characters(self, length, kept):
+        assert DocumentMetadata.make_doc_id("a" * length + ".pdf", SHA) == f"{'a' * kept}__{SHA[:16]}"
+
+    def test_cap_never_leaves_a_trailing_underscore(self):
+        # The cut lands right after a "_": stripping it keeps the "__" separator unambiguous.
+        doc_id = DocumentMetadata.make_doc_id("a" * 63 + " b" * 10 + ".pdf", SHA)
+        assert doc_id == f"{'a' * 63}__{SHA[:16]}"
 
     @pytest.mark.parametrize(
         "source_name",
@@ -400,7 +452,7 @@ class TestMakeDocId:
     )
     def test_same_doc_id_for_posix_and_windows_paths(self, source_name):
         # OS-independent: the doc_id feeds cache keys and bundle names.
-        assert DocumentMetadata.make_doc_id(source_name, SHA) == f"report__{SHA[:8]}"
+        assert DocumentMetadata.make_doc_id(source_name, SHA) == f"report__{SHA[:16]}"
 
     @pytest.mark.parametrize(
         ("source_name", "stem"),
@@ -412,7 +464,7 @@ class TestMakeDocId:
         ],
     )
     def test_dot_and_separator_edge_names(self, source_name, stem):
-        assert DocumentMetadata.make_doc_id(source_name, SHA) == f"{stem}__{SHA[:8]}"
+        assert DocumentMetadata.make_doc_id(source_name, SHA) == f"{stem}__{SHA[:16]}"
 
     @pytest.mark.parametrize("bad_sha", [SHA.upper(), SHA[:63], SHA + "0", "g" * 64])
     def test_rejects_bad_sha(self, bad_sha):
@@ -428,7 +480,7 @@ class TestMakeDocId:
 class TestDocumentMetadata:
     def test_valid_construction_with_defaults(self):
         meta = _metadata()
-        assert meta.doc_id == f"report__{SHA[:8]}"
+        assert meta.doc_id == f"report__{SHA[:16]}"
         assert meta.title is None
         assert meta.author is None
 
@@ -458,7 +510,7 @@ class TestDocumentMetadata:
         with pytest.raises(TypeError, match="sha256"):
             _metadata(sha256=SHA.encode())
 
-    @pytest.mark.parametrize("bad_id", [f"other__{SHA[:8]}", f"Report__{SHA[:8]}", "report__00000000", ""])
+    @pytest.mark.parametrize("bad_id", [f"other__{SHA[:16]}", f"Report__{SHA[:16]}", "report__0000000000000000", ""])
     def test_doc_id_mismatch_rejected(self, bad_id):
         with pytest.raises(ValueError, match="doc_id"):
             _metadata(doc_id=bad_id)
@@ -483,7 +535,7 @@ class TestDocumentMetadata:
             meta.page_count = 9
         assert not hasattr(meta, "__dict__")
         with pytest.raises(TypeError, match="positional argument"):
-            DocumentMetadata(f"report__{SHA[:8]}", "report.pdf", SHA, 3, None, None)
+            DocumentMetadata(f"report__{SHA[:16]}", "report.pdf", SHA, 3, None, None)
 
     def test_replace_revalidates(self):
         # Renaming the source without re-deriving doc_id must be caught.

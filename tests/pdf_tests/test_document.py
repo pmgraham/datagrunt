@@ -3,7 +3,9 @@
 import copy
 import dataclasses
 import hashlib
+import inspect
 import pickle
+import re
 
 import pytest
 
@@ -43,12 +45,23 @@ def _metadata(page_count):
     return DocumentMetadata(doc_id=doc_id, source_name="report.pdf", sha256=SOURCE_SHA, page_count=page_count)
 
 
-def _ids(page, index):
-    return {"element_id": make_element_id(page, index), "page_number": page, "reading_order": index, "bbox": BOX}
+def _ids(page, index, scope_path=()):
+    return {
+        "element_id": make_element_id(page, index),
+        "page_number": page,
+        "reading_order": index,
+        "bbox": BOX,
+        "scope_path": scope_path,
+    }
 
 
-def _paragraph(page, index, text=None):
-    return Paragraph(**_ids(page, index), text=text or f"Paragraph {page}.{index}.")
+def _paragraph(page, index, text=None, scope_path=()):
+    return Paragraph(**_ids(page, index, scope_path), text=text or f"Paragraph {page}.{index}.")
+
+
+def _heading(page, index, text, level=1):
+    # A heading's own scope_path ends with its text.
+    return Heading(**_ids(page, index, (text,)), level=level, text=text)
 
 
 def _table(page, index, continued_from_id=None):
@@ -64,7 +77,7 @@ def _table(page, index, continued_from_id=None):
 def _one_of_each(page):
     """One element of every DocumentElement type, in reading order on ``page``."""
     return (
-        Heading(**_ids(page, 0), level=1, text=f"Heading {page}"),
+        _heading(page, 0, f"Heading {page}"),
         Paragraph(**_ids(page, 1), text=f"Body {page}."),
         KeyValue(**_ids(page, 2), key="Invoice", value=str(page)),
         _table(page, 3),
@@ -82,11 +95,26 @@ def _page(page_number, *, elements=(), status="ok", route="digital", integrity_v
         height_pt=792,
         status=status,
         route=route,
-        quality=QUALITY,
+        quality=None if status == "error" else QUALITY,  # an error page measured nothing
         elements=elements,
         integrity_verified=integrity_verified,
         **overrides,
     )
+
+
+# Values derived from the pages: read-only properties, never dataclass fields.
+DERIVED = (
+    "elements",
+    "headings",
+    "paragraphs",
+    "key_values",
+    "tables",
+    "lists",
+    "figures",
+    "page_images",
+    "degraded_pages",
+    "integrity_verified",
+)
 
 
 def _document(*pages, sections=()):
@@ -136,10 +164,26 @@ class TestDocumentFields:
         with pytest.raises(TypeError, match="positional argument"):
             PDFDocument(*positional)
 
-    @pytest.mark.parametrize("derived", ["elements", "tables", "degraded_pages", "integrity_verified"])
+    @pytest.mark.parametrize("derived", [*DERIVED, "_index"])
     def test_derived_fields_are_not_constructor_arguments(self, derived):
         with pytest.raises(TypeError, match=f"unexpected keyword argument '{derived}'"):
             PDFDocument(metadata=_metadata(0), pages=(), **{derived: ()})
+
+    @pytest.mark.parametrize("derived", DERIVED)
+    def test_derived_values_are_read_only_properties_not_fields(self, derived):
+        assert isinstance(inspect.getattr_static(PDFDocument, derived), property)
+        assert derived not in {f.name for f in dataclasses.fields(PDFDocument)}
+        # Frozen + slotted dataclasses reject assigning a non-field name with
+        # TypeError (a CPython quirk; BBox.width behaves the same), a field with
+        # FrozenInstanceError (an AttributeError): either way it never sticks.
+        with pytest.raises((AttributeError, TypeError)):
+            setattr(_two_page_document(), derived, ())
+
+    def test_one_private_index_field_holds_the_derived_values(self):
+        hidden = [f for f in dataclasses.fields(PDFDocument) if not f.init]
+        assert [f.name for f in hidden] == ["_index"]
+        assert (hidden[0].repr, hidden[0].compare) == (False, False)
+        assert [f.name for f in dataclasses.fields(PDFDocument) if f.init] == ["metadata", "pages", "sections"]
 
     def test_replace_revalidates(self):
         with pytest.raises(ValueError, match="metadata.page_count is 5"):
@@ -177,9 +221,10 @@ class TestDocumentFields:
 
         restored, fresh = clone(build()), build()
         assert restored == fresh
-        for derived in (f.name for f in dataclasses.fields(PDFDocument) if not f.init):
+        for derived in DERIVED:
             assert getattr(restored, derived) == getattr(fresh, derived), derived
-        assert (restored.degraded_pages, restored.integrity_verified) == ((2, 3), True)
+        # An error page (page 3) makes the document unverified.
+        assert (restored.degraded_pages, restored.integrity_verified) == ((2, 3), False)
 
 
 class TestDocumentPageInvariants:
@@ -236,6 +281,44 @@ class TestDocumentContinuations:
         )
         assert doc.tables[1].continued_from_id == "p0001_e000"
 
+    def test_chain_of_continuations_accepted(self):
+        doc = _document(
+            _page(1, elements=(_table(1, 0),)),
+            _page(2, elements=(_table(2, 0, continued_from_id="p0001_e000"),)),
+            _page(3, elements=(_table(3, 0, continued_from_id="p0002_e000"),)),
+        )
+        assert len(doc.tables) == 3
+
+    @pytest.mark.parametrize(
+        ("pages", "second"),
+        [
+            # both continuations on the same later page
+            (
+                (
+                    _page(1, elements=(_table(1, 0),)),
+                    _page(2, elements=(_table(2, 0, "p0001_e000"), _table(2, 1, "p0001_e000"))),
+                ),
+                "p0002_e001",
+            ),
+            # the second continuation on a page after the first
+            (
+                (
+                    _page(1, elements=(_table(1, 0),)),
+                    _page(2, elements=(_table(2, 0, "p0001_e000"),)),
+                    _page(3, elements=(_paragraph(3, 0), _table(3, 1, "p0001_e000"))),
+                ),
+                "p0003_e001",
+            ),
+        ],
+        ids=["same-page", "later-page"],
+    )
+    def test_a_table_continued_twice_rejected(self, pages, second):
+        # A split table has one next part: a second continuation would fork it.
+        with pytest.raises(
+            ValueError, match=rf"^table {second}: table 'p0001_e000' is already continued by p0002_e000$"
+        ):
+            _document(*pages)
+
     @pytest.mark.parametrize(
         ("pages", "described"),
         [
@@ -259,8 +342,11 @@ class TestDocumentContinuations:
 
 class TestDocumentSections:
     def test_sections_made_of_document_elements(self):
-        heading = Heading(**_ids(1, 0), level=1, text="Intro")
-        pages = (_page(1, elements=(heading, _paragraph(1, 1))), _page(2, elements=(_paragraph(2, 0),)))
+        heading = _heading(1, 0, "Intro")
+        pages = (
+            _page(1, elements=(heading, _paragraph(1, 1, scope_path=("Intro",)))),
+            _page(2, elements=(_paragraph(2, 0),)),
+        )
         section = Section(heading=heading, scope_path=("Intro",), page_span=(1, 2), elements=pages[0].elements)
         doc = _document(*pages, sections=(section,))
         assert doc.sections == (section,)
@@ -278,14 +364,14 @@ class TestDocumentSections:
             _two_page_document(sections=(section,))
 
     def test_section_heading_not_in_document_rejected(self):
-        stray = Heading(**_ids(1, 9), level=1, text="Intro")
+        stray = _heading(1, 9, "Intro")
         section = Section(heading=stray, scope_path=("Intro",), page_span=(1, 1), elements=())
         with pytest.raises(ValueError, match=r"sections\[0\] heading 'p0001_e009' is not in the document"):
             _two_page_document(sections=(section,))
 
     def test_section_heading_differing_from_document_element_rejected(self):
-        heading = Heading(**_ids(1, 0), level=1, text="Intro")
-        altered = Heading(**_ids(1, 0), level=2, text="Intro")
+        heading = _heading(1, 0, "Intro")
+        altered = _heading(1, 0, "Intro", level=2)
         section = Section(heading=altered, scope_path=("Intro",), page_span=(1, 1), elements=())
         with pytest.raises(ValueError, match=r"sections\[0\] heading 'p0001_e000' differs from the document's element"):
             _document(_page(1, elements=(heading,)), sections=(section,))
@@ -310,6 +396,61 @@ class TestDocumentSections:
         assert _two_page_document(sections=(section,)).sections[0].elements == (copy,)
 
 
+# Two pages, two flat sections: "Intro" runs from p1 e000 to p2 e000, "Next" from p2 e001.
+INTRO = ("Intro",)
+NEXT = ("Next",)
+H_INTRO, P11, P20 = _heading(1, 0, "Intro"), _paragraph(1, 1, scope_path=INTRO), _paragraph(2, 0, scope_path=INTRO)
+H_NEXT, P22 = _heading(2, 1, "Next"), _paragraph(2, 2, scope_path=NEXT)
+S_INTRO = Section(heading=H_INTRO, scope_path=INTRO, page_span=(1, 2), elements=(H_INTRO, P11, P20))
+S_NEXT = Section(heading=H_NEXT, scope_path=NEXT, page_span=(2, 2), elements=(H_NEXT, P22))
+
+
+def _sectioned(*sections):
+    return _document(_page(1, elements=(H_INTRO, P11)), _page(2, elements=(P20, H_NEXT, P22)), sections=sections)
+
+
+class TestDocumentSectionLayout:
+    def test_flat_sections_in_document_order(self):
+        assert _sectioned(S_INTRO, S_NEXT).sections == (S_INTRO, S_NEXT)
+
+    def test_sections_out_of_document_order_rejected(self):
+        with pytest.raises(
+            ValueError,
+            match=re.escape(
+                "sections[1] starts at page 1 reading_order 0, not after sections[0] ends at page 2 reading_order 2"
+            ),
+        ):
+            _sectioned(S_NEXT, S_INTRO)
+
+    def test_interleaved_sections_rejected(self):
+        # Starts are in order ((1, 0) then (1, 1)), but the first section runs past the second's start.
+        first = Section(heading=H_INTRO, scope_path=INTRO, page_span=(1, 2), elements=(H_INTRO, P20))
+        second = Section(heading=None, scope_path=INTRO, page_span=(1, 1), elements=(P11,))
+        with pytest.raises(
+            ValueError, match=r"sections\[1\] starts at page 1 reading_order 1, not after sections\[0\] ends"
+        ):
+            _sectioned(first, second)
+
+    def test_empty_sections_take_no_place_in_the_order(self):
+        empty = Section(heading=None, scope_path=(), page_span=(2, 2), elements=())
+        assert _sectioned(empty, S_INTRO, empty, S_NEXT, empty).sections == (empty, S_INTRO, empty, S_NEXT, empty)
+
+    def test_element_in_two_sections_rejected(self):
+        again = Section(heading=None, scope_path=INTRO, page_span=(2, 2), elements=(P20,))
+        with pytest.raises(ValueError, match=r"^'p0002_e000' is in sections\[0\] and sections\[1\]"):
+            _sectioned(S_INTRO, again)
+
+    def test_heading_of_one_section_among_another_sections_elements_rejected(self):
+        # The heading belongs to its section even when it is not in that section's elements.
+        holder = Section(heading=None, scope_path=NEXT, page_span=(2, 2), elements=(H_NEXT,))
+        headed = Section(heading=H_NEXT, scope_path=NEXT, page_span=(2, 2), elements=(P22,))
+        with pytest.raises(ValueError, match=r"^'p0002_e001' is in sections\[1\] and sections\[2\]"):
+            _sectioned(S_INTRO, holder, headed)
+
+    def test_heading_listed_in_its_own_elements_counts_once(self):
+        assert _sectioned(S_INTRO).sections == (S_INTRO,)
+
+
 class TestDocumentDerived:
     def test_collections_in_document_order(self):
         first, second = _one_of_each(1), _one_of_each(2)
@@ -331,15 +472,16 @@ class TestDocumentDerived:
         doc = _document(_page(1, page_image=images[1]), _page(2), _page(3, page_image=images[3]))
         assert doc.page_images == (images[1], images[3])
 
-    def test_degraded_pages_are_error_and_ocr_fallback_pages(self):
+    def test_degraded_pages_are_error_ocr_fallback_and_ocr_unavailable_pages(self):
         doc = _document(
             _page(1),
             _page(2, status="error"),
             _page(3, status="ocr_fallback", route="vision"),
             _page(4, route="vision"),
             _page(5, route="hybrid"),
+            _page(6, status="ocr_unavailable", route="vision"),
         )
-        assert doc.degraded_pages == (2, 3)
+        assert doc.degraded_pages == (2, 3, 6)
 
     def test_no_degraded_pages(self):
         assert _two_page_document().degraded_pages == ()
@@ -358,11 +500,26 @@ class TestDocumentIntegrity:
             ((_page(1, integrity_verified=True), _page(2, integrity_verified=False)), False),
             ((_page(1, integrity_verified=True), _page(2, route="vision")), True),  # vision pages not counted
             ((_page(1, integrity_verified=True), _page(2, status="ocr_fallback", route="vision")), True),
-            ((_page(1, integrity_verified=True), _page(2, status="error")), True),  # error pages not counted
+            ((_page(1, integrity_verified=True), _page(2, status="ocr_unavailable", route="vision")), True),
         ],
     )
     def test_verified_iff_every_verifiable_page_is_verified(self, pages, expected):
         assert _document(*pages).integrity_verified is expected
+
+    @pytest.mark.parametrize("error_page", [1, 2, 3])
+    def test_false_whenever_any_page_is_an_error_page(self, error_page):
+        # A page that yielded nothing cannot have been verified, so neither can the document.
+        pages = tuple(
+            _page(n, status="error") if n == error_page else _page(n, integrity_verified=True) for n in (1, 2, 3)
+        )
+        assert _document(*pages).integrity_verified is False
+
+    def test_false_when_an_error_page_was_on_the_vision_route(self):
+        # A vision-route page is excluded from the verifiable set, so only the
+        # explicit error-page rule keeps a failed scan from leaving the document
+        # verified by its remaining digital pages.
+        pages = (_page(1, status="error", route="vision"), _page(2, integrity_verified=True))
+        assert _document(*pages).integrity_verified is False
 
     @pytest.mark.parametrize(
         "pages",

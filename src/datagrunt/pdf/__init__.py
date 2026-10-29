@@ -11,6 +11,7 @@ from datagrunt.pdf.elements import (
     BulletList,
     DocumentElement,
     DocumentMetadata,
+    ExtractionMethod,
     Figure,
     Heading,
     HiddenReason,
@@ -18,10 +19,13 @@ from datagrunt.pdf.elements import (
     Page,
     PageImage,
     PageQuality,
+    PageRoute,
+    PageStatus,
     Paragraph,
     PDFDocument,
     Section,
     Table,
+    make_element_id,
 )
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFEncryptedError
 
@@ -42,6 +46,10 @@ __all__ = [
     "DocumentElement",
     "HiddenReason",
     "HIDDEN_REASONS",
+    "PageStatus",
+    "PageRoute",
+    "ExtractionMethod",
+    "make_element_id",
     "DatagruntPDFError",
     "PDFEncryptedError",
     "PDFCorruptError",
