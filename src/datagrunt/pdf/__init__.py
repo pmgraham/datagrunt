@@ -15,8 +15,12 @@ from datagrunt.pdf.elements import (
     Heading,
     HiddenReason,
     KeyValue,
+    Page,
+    PageImage,
     PageQuality,
     Paragraph,
+    PDFDocument,
+    Section,
     Table,
 )
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFEncryptedError
@@ -31,6 +35,10 @@ __all__ = [
     "Table",
     "BulletList",
     "Figure",
+    "PageImage",
+    "Page",
+    "Section",
+    "PDFDocument",
     "DocumentElement",
     "HiddenReason",
     "HIDDEN_REASONS",

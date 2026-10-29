@@ -3,6 +3,7 @@
 import dataclasses
 import hashlib
 import os
+import re
 from pathlib import Path
 from typing import get_args
 
@@ -251,12 +252,12 @@ class TestHeading:
         [
             ("Rank #", "## Rank \\#"),
             ("#", "## \\#"),
-            ("Issue ##  ", "## Issue \\##  "),
+            ("Issue ##  ", "## Issue \\#\\#"),  # every # escaped; trailing spaces stripped
             ("Tabbed\t#", "## Tabbed\t\\#"),
             ("Line\n#", "## Line \\#"),  # the break becomes a space, exposing the run
-            ("C#", "## C#"),  # not a closing sequence: no space before the run
-            ("C# and F#", "## C# and F#"),
-            ("# leading", "## # leading"),
+            ("C#", "## C\\#"),  # every # is escaped, closing sequence or not
+            ("C# and F#", "## C\\# and F\\#"),
+            ("# leading", "## \\# leading"),
         ],
     )
     def test_to_markdown_trailing_hash_run_not_eaten_as_closing_sequence(self, text, expected):
@@ -280,9 +281,10 @@ class TestParagraph:
         assert paragraph.to_markdown() == "intro\n\\- not a list\n1\\. not ordered\n\\> not a quote"
 
     @pytest.mark.parametrize("sep", ["\r\n", "\r", "\n"])
-    def test_line_endings_preserved_while_escaping(self, sep):
+    def test_line_endings_rendered_as_newline_while_escaping(self, sep):
         paragraph = _element(Paragraph, text=f"a{sep}# b")
-        assert paragraph.to_markdown() == f"a{sep}\\# b"
+        assert paragraph.to_markdown() == "a\n\\# b"
+        assert paragraph.text == f"a{sep}# b"
 
     def test_text_field_stays_verbatim(self):
         assert _element(Paragraph, text="# raw").text == "# raw"
@@ -310,7 +312,7 @@ class TestKeyValue:
 
     def test_to_markdown_escapes_asterisks_in_key(self):
         kv = _element(KeyValue, key="Total *net*", value="5 * 3")
-        assert kv.to_markdown() == "**Total \\*net\\*:** 5 * 3"
+        assert kv.to_markdown() == "**Total \\*net\\*:** 5 \\* 3"
         assert kv.key == "Total *net*"
 
     @pytest.mark.parametrize(
@@ -318,8 +320,8 @@ class TestKeyValue:
         [
             ("C:\\", "**C:\\\\:** v"),  # trailing backslash would otherwise escape the colon
             ("a\\*b", "**a\\\\\\*b:** v"),  # backslash escaped before the star
-            ("k\n# H", "**k # H:** v"),  # line break in key cannot start a heading
-            ("k\r\nl", "**k l:** v"),
+            ("k\n# H", "**k\n\\# H:** v"),  # line break in key cannot start a heading
+            ("k\r\nl", "**k\nl:** v"),
             ("  padded  ", "**padded:** v"),  # leading space would stop ** opening emphasis
         ],
     )
@@ -333,7 +335,7 @@ class TestKeyValue:
         [
             ("v\n# H", "**K:** v\n\\# H"),
             ("v\n===", "**K:** v\n\\==="),
-            ("v\r\n- item", "**K:** v\r\n\\- item"),
+            ("v\r\n- item", "**K:** v\n\\- item"),
         ],
     )
     def test_to_markdown_value_lines_escaped(self, value, expected):
@@ -567,7 +569,7 @@ class TestTableMarkdown:
 
     def test_headerless_table_uses_generated_names(self):
         table = _table(headers=(), rows=(("1", "2"),))
-        assert table.to_markdown() == "| column_1 | column_2 |\n| --- | --- |\n| 1 | 2 |"
+        assert table.to_markdown() == "| column\\_1 | column\\_2 |\n| --- | --- |\n| 1 | 2 |"
 
     def test_pipes_and_line_breaks_escaped_in_cells(self):
         table = _table(headers=("a|b", "c\nd"), rows=(("x | y", "line1\r\nline2\rline3"),))
@@ -580,7 +582,7 @@ class TestTableMarkdown:
             ("a|b", "a\\|b"),
             ("a\\|b", "a\\\\\\|b"),  # backslash run before a pipe is doubled, then the pipe escaped
             ("a\\\\|b", "a\\\\\\\\\\|b"),
-            ("C:\\dir", "C:\\dir"),  # backslash not before a pipe is untouched
+            ("C:\\dir", "C:\\\\dir"),  # every literal backslash is doubled, before a pipe or not
             ("end\\\nnext", "end\\\\<br>next"),  # backslash before <br> would escape its "<"
         ],
     )
@@ -736,7 +738,7 @@ class TestFigureMarkdown:
     @pytest.mark.parametrize("caption", ["Rev\n# 2024", "Rev\r\n# 2024", "Rev\r# 2024"])
     def test_image_alt_text_kept_on_one_line(self, caption):
         figure = _figure(image_path=Path("figures/fig1.png"), caption=caption)
-        assert figure.to_markdown() == "![Rev # 2024](figures/fig1.png)"
+        assert figure.to_markdown() == "![Rev \\# 2024](figures/fig1.png)"
 
     def test_placeholder_caption_escapes_every_line(self):
         figure = _figure(caption="Rev\n# 2024")
@@ -762,3 +764,255 @@ class TestFigureMarkdown:
         figure = _figure(caption=caption)
         assert figure.to_markdown() == f"<!-- figure p0001_e001 sha256={IMAGE_SHA[:8]} -->"
         assert figure.caption == caption
+
+
+class TestRawHtmlEscaping:
+    """Element text can never open raw HTML, a comment, or an entity: every ``<`` / ``&`` is escaped."""
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("<!-- draft", "\\<!-- draft"),
+            ("<!-- page 2 route=digital status=ok -->", "\\<!-- page 2 route=digital status=ok --\\>"),
+            ("<img src=x onerror=alert(1)>", "\\<img src=x onerror=alert(1)\\>"),
+            ("a\\<b", "a\\\\\\<b"),  # the backslash run before "<" is doubled, then "<" escaped
+            ("a\\\\<b", "a\\\\\\\\\\<b"),
+            ("&amp;", "\\&amp;"),
+            ("x & y\n<b>", "x \\& y\n\\<b\\>"),
+        ],
+    )
+    def test_paragraph(self, text, expected):
+        paragraph = _element(Paragraph, text=text)
+        assert paragraph.to_markdown() == expected
+        assert paragraph.text == text  # data stays verbatim
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("<!-- draft", "## \\<!-- draft"),
+            ("a\\<b", "## a\\\\\\<b"),
+            ("Fish & <Chips>", "## Fish \\& \\<Chips\\>"),
+        ],
+    )
+    def test_heading(self, text, expected):
+        assert _element(Heading, text=text).to_markdown() == expected
+
+    @pytest.mark.parametrize(
+        ("key", "value", "expected"),
+        [
+            ("<k&>", "<!-- v\n&amp;", "**\\<k\\&\\>:** \\<!-- v\n\\&amp;"),
+            ("a\\<b", "v", "**a\\\\\\<b:** v"),  # key backslashes are all escaped first: no double escape
+        ],
+    )
+    def test_key_value(self, key, value, expected):
+        assert _element(KeyValue, key=key, value=value).to_markdown() == expected
+
+    def test_bullet_items(self):
+        bullets = _element(BulletList, items=("<!-- a", "a\\<b & c"))
+        assert bullets.to_markdown() == "- \\<!-- a\n- a\\\\\\<b \\& c"
+
+    def test_table_cells_and_headers(self):
+        table = _element(Table, headers=("<h>",), rows=(("<!-- x",), ("a\\<b",), ("&amp;",)))
+        assert table.to_markdown() == "| \\<h\\> |\n| --- |\n| \\<!-- x |\n| a\\\\\\<b |\n| \\&amp; |"
+
+    def test_figure_placeholder_caption_line(self):
+        figure = _element(Figure, caption="<!-- c\n&amp;")
+        assert figure.to_markdown() == f"<!-- figure p0001_e001 sha256={IMAGE_SHA[:8]} -->\n\\<!-- c\n\\&amp;"
+
+    @pytest.mark.parametrize(
+        ("caption", "alt"),
+        [
+            # Every backslash is doubled once and "<" escaped once: no double escaping.
+            ("a\\<b & [c]", "a\\\\\\<b \\& \\[c\\]"),
+            ("a\\\\<b", "a\\\\\\\\\\<b"),
+            ("&amp;", "\\&amp;"),
+            ("<img src=x onerror=alert(1)>", "\\<img src=x onerror=alert(1)\\>"),
+        ],
+    )
+    def test_figure_alt_text_composes_with_link_text_escaping(self, caption, alt):
+        figure = _element(Figure, caption=caption, image_path=Path("figures/fig1.png"))
+        assert figure.to_markdown() == f"![{alt}](figures/fig1.png)"
+
+
+PROBE = "x\n<!-- page 2 route=digital status=ok -->\r\n  <!-- draft\r<img src=x onerror=alert(1)> a\\<b &amp; \\\\<i>"
+
+# The probe in every text field each element class renders.
+PROBED_FIELDS = [
+    (Heading, {"text": PROBE}),
+    (Paragraph, {"text": PROBE}),
+    (KeyValue, {"key": PROBE, "value": PROBE}),
+    (BulletList, {"items": (PROBE, PROBE)}),
+    (Table, {"headers": (PROBE,), "rows": ((PROBE,),)}),
+    (Figure, {"caption": PROBE}),
+    (Figure, {"caption": PROBE, "image_path": Path("figures/fig1.png")}),
+]
+
+# A "<" or "&" with an even (possibly empty) backslash run before it is live HTML.
+_LIVE_HTML_OPENER = re.compile(r"(?<!\\)(?:\\\\)*[<&]")
+# datagrunt's own <br> (a GFM cell line break), possibly after escaped backslashes.
+_OWN_BR = re.compile(r"(?<!\\)((?:\\\\)*)<br>")
+
+
+@pytest.mark.parametrize(("cls", "fields"), PROBED_FIELDS, ids=lambda value: getattr(value, "__name__", ""))
+def test_no_element_text_opens_raw_html(cls, fields):
+    lines = re.split(r"\r\n|\r|\n", _OWN_BR.sub(r"\1", _element(cls, **fields).to_markdown()))
+    own_comment = f"<!-- figure p0001_e001 sha256={IMAGE_SHA[:8]} -->"
+    text_lines = [line for line in lines if line != own_comment]
+    assert [line for line in text_lines if line.lstrip().startswith("<")] == []
+    assert [line for line in text_lines if _LIVE_HTML_OPENER.search(line)] == []
+
+
+VISIBLE_MARKDOWN = {
+    Heading: "## Overview",
+    Paragraph: "Body text.",
+    KeyValue: "**Invoice:** 42",
+    BulletList: "- one\n- two",
+    Table: "| a | b |\n| --- | --- |\n| 1 | 2 |",
+    Figure: f"<!-- figure p0001_e001 sha256={hashlib.sha256(b'png-bytes').hexdigest()[:8]} -->",
+}
+
+
+@pytest.mark.parametrize("cls", ELEMENT_CLASSES)
+class TestHiddenMarker:
+    def test_visible_element_has_no_marker(self, cls):
+        assert _element(cls).to_markdown() == VISIBLE_MARKDOWN[cls]
+
+    def test_hidden_element_starts_with_hidden_marker(self, cls):
+        hidden = _element(cls, hidden_reasons=("invisible", "tiny_font"))
+        assert hidden.to_markdown() == "<!-- hidden: invisible,tiny_font -->\n" + VISIBLE_MARKDOWN[cls]
+
+    def test_single_reason_marker(self, cls):
+        hidden = _element(cls, hidden_reasons=("transparent",))
+        assert hidden.to_markdown().split("\n", 1)[0] == "<!-- hidden: transparent -->"
+
+
+def test_base_element_without_renderer_fails_loud():
+    with pytest.raises(NotImplementedError, match="_Element must implement _render_markdown"):
+        elements_module._Element(**_base()).to_markdown()
+
+
+ALT_PATH = Path("figures/fig1.png")
+FIGURE_COMMENT = f"<!-- figure p0001_e001 sha256={hashlib.sha256(b'png-bytes').hexdigest()[:8]} -->"
+
+
+class TestMarkdownLeadingWhitespace:
+    """Class A: Markdown cannot display line-edge whitespace; leading spaces would indent into code or a list."""
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("  leading two spaces", "leading two spaces"),
+            ("    four spaces code", "four spaces code"),
+            ("\tTab start", "Tab start"),
+            ("line1\n    line2 indented", "line1\nline2 indented"),
+            ("hard  \nbreak", "hard\nbreak"),  # two trailing spaces would be a hard line break
+            ("a\n\n  \nb", "a\nb"),  # a blank line would split the paragraph
+        ],
+    )
+    def test_paragraph(self, text, expected):
+        paragraph = _element(Paragraph, text=text)
+        assert paragraph.to_markdown() == expected
+        assert paragraph.text == text  # stored data is unchanged
+
+    def test_list_item_continuation_not_indented_into_code(self):
+        bullets = _element(BulletList, items=("    code\n      more",), ordered=False)
+        assert bullets.to_markdown() == "- code\n  more"
+
+    def test_figure_caption(self):
+        assert _element(Figure, caption="\tTab start").to_markdown() == f"{FIGURE_COMMENT}\nTab start"
+
+    def test_key_value_value_lines(self):
+        assert _element(KeyValue, key="  K ", value="  v\n    w").to_markdown() == "**K:** v\nw"
+
+    def test_heading_and_table_cell(self):
+        assert _element(Heading, text="  a\n   b  ").to_markdown() == "## a b"
+        table = _element(Table, headers=("h",), rows=(("  a\n\n   b  ",),))
+        assert table.to_markdown() == "| h |\n| --- |\n| a<br>b |"
+
+
+class TestMarkdownLineStartMarkers:
+    """Class B: list, thematic-break, and setext markers at a line start are escaped."""
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("2) paren", "2\\) paren"),
+            ("10. ten", "10\\. ten"),
+            ("___", "\\_\\_\\_"),
+            ("***", "\\*\\*\\*"),
+            ("+ plus", "\\+ plus"),
+            ("= =", "\\= ="),
+            ("line1\n---", "line1\n\\---"),
+            ("line1\n===", "line1\n\\==="),
+            ("1999 was a year", "1999 was a year"),  # digits alone are not a list marker
+        ],
+    )
+    def test_paragraph(self, text, expected):
+        assert _element(Paragraph, text=text).to_markdown() == expected
+
+    def test_list_item_and_figure_caption(self):
+        assert _element(BulletList, items=("2) x", "___"), ordered=False).to_markdown() == "- 2\\) x\n- \\_\\_\\_"
+        assert _element(Figure, caption="2) x\n___").to_markdown() == f"{FIGURE_COMMENT}\n2\\) x\n\\_\\_\\_"
+
+
+class TestMarkdownInlineSyntax:
+    """Class C: emphasis, links, code spans, strikethrough, and fences are shown as literal text."""
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("*emph* _u_", "\\*emph\\* \\_u\\_"),
+            ("[link](http://x)", "\\[link\\](http://x)"),
+            ("`code`", "\\`code\\`"),
+            ("~~gone~~", "\\~\\~gone\\~\\~"),
+            ("a > b", "a \\> b"),
+            ("C# and F#", "C\\# and F\\#"),
+        ],
+    )
+    def test_paragraph(self, text, expected):
+        assert _element(Paragraph, text=text).to_markdown() == expected
+
+    def test_heading(self):
+        assert _element(Heading, text="*emph* [l](u) `c`").to_markdown() == "## \\*emph\\* \\[l\\](u) \\`c\\`"
+
+    def test_key_value_fence_key(self):
+        kv = _element(KeyValue, key="```fence", value="_v_")
+        assert kv.to_markdown() == "**\\`\\`\\`fence:** \\_v\\_"
+
+    def test_list_item(self):
+        assert _element(BulletList, items=("`code` *x*",), ordered=False).to_markdown() == "- \\`code\\` \\*x\\*"
+
+    def test_table_cell(self):
+        table = _element(Table, headers=("h",), rows=(("*emph* [l](u) `c`",),))
+        assert table.to_markdown() == "| h |\n| --- |\n| \\*emph\\* \\[l\\](u) \\`c\\` |"
+
+    def test_figure_alt_text(self):
+        figure = _element(Figure, caption="*emph* `code`", image_path=ALT_PATH)
+        assert figure.to_markdown() == "![\\*emph\\* \\`code\\`](figures/fig1.png)"
+
+
+class TestMarkdownBackslashes:
+    """Class D: every literal backslash is doubled, so none escapes the next character or makes a hard break."""
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("a\\|b", "a\\\\\\|b"),
+            ("end\\\nnext", "end\\\\\nnext"),
+            ("trailing backslash\\", "trailing backslash\\\\"),
+            ("\\", "\\\\"),
+            ("C:\\dir\\file", "C:\\\\dir\\\\file"),
+        ],
+    )
+    def test_paragraph(self, text, expected):
+        assert _element(Paragraph, text=text).to_markdown() == expected
+
+    def test_heading_list_value_and_caption(self):
+        assert _element(Heading, text="a\\|b").to_markdown() == "## a\\\\\\|b"
+        assert _element(BulletList, items=("end\\\nnext",), ordered=False).to_markdown() == "- end\\\\\n  next"
+        assert _element(KeyValue, key="k", value="C:\\dir").to_markdown() == "**k:** C:\\\\dir"
+        assert _element(Figure, caption="end\\").to_markdown() == f"{FIGURE_COMMENT}\nend\\\\"
+
+    def test_table_cell_backslash_not_before_a_pipe(self):
+        table = _element(Table, headers=("h",), rows=(("C:\\dir",),))
+        assert table.to_markdown() == "| h |\n| --- |\n| C:\\\\dir |"

@@ -1,0 +1,402 @@
+"""Tests for the v5 ``PDFDocument`` contract: invariants, derived collections, Markdown."""
+
+import copy
+import dataclasses
+import hashlib
+import pickle
+
+import pytest
+
+from datagrunt.pdf import (
+    BBox,
+    BulletList,
+    DocumentMetadata,
+    Figure,
+    Heading,
+    KeyValue,
+    Page,
+    PageImage,
+    PageQuality,
+    Paragraph,
+    PDFDocument,
+    Section,
+    Table,
+)
+from datagrunt.pdf.elements import make_element_id
+
+SOURCE_SHA = hashlib.sha256(b"source-pdf").hexdigest()
+FIGURE_SHA = hashlib.sha256(b"figure-bytes").hexdigest()
+BOX = BBox(x0=72, y0=72, x1=540, y1=90)
+QUALITY = PageQuality(
+    valid_char_ratio=0.98,
+    char_count=1200,
+    vector_line_count=14,
+    hidden_spans_flagged=0,
+    rotation_deg=0,
+    deskew_angle_deg=0.0,
+    ocr_mean_confidence=None,
+)
+
+
+def _metadata(page_count):
+    doc_id = DocumentMetadata.make_doc_id("report.pdf", SOURCE_SHA)
+    return DocumentMetadata(doc_id=doc_id, source_name="report.pdf", sha256=SOURCE_SHA, page_count=page_count)
+
+
+def _ids(page, index):
+    return {"element_id": make_element_id(page, index), "page_number": page, "reading_order": index, "bbox": BOX}
+
+
+def _paragraph(page, index, text=None):
+    return Paragraph(**_ids(page, index), text=text or f"Paragraph {page}.{index}.")
+
+
+def _table(page, index, continued_from_id=None):
+    return Table(
+        **_ids(page, index),
+        headers=("k",),
+        rows=((f"{page}.{index}",),),
+        extraction_method="lattice",
+        continued_from_id=continued_from_id,
+    )
+
+
+def _one_of_each(page):
+    """One element of every DocumentElement type, in reading order on ``page``."""
+    return (
+        Heading(**_ids(page, 0), level=1, text=f"Heading {page}"),
+        Paragraph(**_ids(page, 1), text=f"Body {page}."),
+        KeyValue(**_ids(page, 2), key="Invoice", value=str(page)),
+        _table(page, 3),
+        BulletList(**_ids(page, 4), items=("x",), ordered=True),
+        Figure(**_ids(page, 5), sha256=FIGURE_SHA, width_px=8, height_px=8),
+    )
+
+
+def _page(page_number, *, elements=(), status="ok", route="digital", integrity_verified=False, **overrides):
+    if status == "error":
+        overrides.setdefault("error", "pdfium: bad xref")
+    return Page(
+        page_number=page_number,
+        width_pt=612,
+        height_pt=792,
+        status=status,
+        route=route,
+        quality=QUALITY,
+        elements=elements,
+        integrity_verified=integrity_verified,
+        **overrides,
+    )
+
+
+def _document(*pages, sections=()):
+    return PDFDocument(metadata=_metadata(len(pages)), pages=pages, sections=sections)
+
+
+def _two_page_document(**kwargs):
+    return _document(_page(1, elements=(_paragraph(1, 0),)), _page(2, elements=(_paragraph(2, 0),)), **kwargs)
+
+
+class TestDocumentFields:
+    def test_valid_document(self):
+        doc = _two_page_document()
+        assert [page.page_number for page in doc.pages] == [1, 2]
+        assert doc.metadata.page_count == 2
+        assert doc.sections == ()
+
+    def test_zero_page_document(self):
+        doc = PDFDocument(metadata=_metadata(0), pages=())
+        assert (doc.pages, doc.elements, doc.degraded_pages) == ((), (), ())
+
+    def test_metadata_must_be_document_metadata(self):
+        with pytest.raises(TypeError, match="metadata must be a DocumentMetadata, got dict"):
+            PDFDocument(metadata={"page_count": 0}, pages=())
+
+    @pytest.mark.parametrize(
+        ("bad", "match"), [([], "pages must be a tuple"), ((_paragraph(1, 0),), r"pages\[0\] must be a Page")]
+    )
+    def test_pages_must_be_tuple_of_pages(self, bad, match):
+        with pytest.raises(TypeError, match=match):
+            PDFDocument(metadata=_metadata(len(bad)), pages=bad)
+
+    @pytest.mark.parametrize(
+        ("bad", "match"), [([], "sections must be a tuple"), ((_page(1),), r"sections\[0\] must be a Section")]
+    )
+    def test_sections_must_be_tuple_of_sections(self, bad, match):
+        with pytest.raises(TypeError, match=match):
+            PDFDocument(metadata=_metadata(0), pages=(), sections=bad)
+
+    def test_is_frozen_slotted_and_keyword_only(self):
+        doc = _two_page_document()
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            doc.pages = ()
+        assert not hasattr(doc, "__dict__")
+        # Every init field supplied positionally: only kw_only can make this a TypeError.
+        positional = [getattr(doc, f.name) for f in dataclasses.fields(doc) if f.init]
+        with pytest.raises(TypeError, match="positional argument"):
+            PDFDocument(*positional)
+
+    @pytest.mark.parametrize("derived", ["elements", "tables", "degraded_pages", "integrity_verified"])
+    def test_derived_fields_are_not_constructor_arguments(self, derived):
+        with pytest.raises(TypeError, match=f"unexpected keyword argument '{derived}'"):
+            PDFDocument(metadata=_metadata(0), pages=(), **{derived: ()})
+
+    def test_replace_revalidates(self):
+        with pytest.raises(ValueError, match="metadata.page_count is 5"):
+            dataclasses.replace(_two_page_document(), metadata=_metadata(5))
+
+    def test_replace_recomputes_derived_fields(self):
+        doc = _two_page_document()
+        error_page = _page(2, status="error")
+        replaced = dataclasses.replace(doc, pages=(doc.pages[0], error_page))
+        assert replaced.degraded_pages == (2,)
+        assert replaced.elements == (_paragraph(1, 0),)
+
+    def test_equal_and_hashable(self):
+        assert _two_page_document() == _two_page_document()
+        assert hash(_two_page_document()) == hash(_two_page_document())
+
+    def test_derived_fields_not_in_repr(self):
+        # Page reprs nest their own elements= / integrity_verified=, so check the outer shape.
+        text = repr(_two_page_document())
+        assert text.startswith("PDFDocument(metadata=DocumentMetadata(")
+        assert text.endswith(", sections=())")
+        assert "headings=" not in text
+        assert "degraded_pages=" not in text
+
+    @pytest.mark.parametrize(
+        "clone", [lambda doc: pickle.loads(pickle.dumps(doc)), copy.deepcopy], ids=["pickle", "deepcopy"]
+    )
+    def test_round_trip_keeps_derived_fields(self, clone):
+        def build():
+            return _document(
+                _page(1, elements=_one_of_each(1), integrity_verified=True),
+                _page(2, status="ocr_fallback", route="vision", elements=(_paragraph(2, 0),)),
+                _page(3, status="error"),
+            )
+
+        restored, fresh = clone(build()), build()
+        assert restored == fresh
+        for derived in (f.name for f in dataclasses.fields(PDFDocument) if not f.init):
+            assert getattr(restored, derived) == getattr(fresh, derived), derived
+        assert (restored.degraded_pages, restored.integrity_verified) == ((2, 3), True)
+
+
+class TestDocumentPageInvariants:
+    @pytest.mark.parametrize(("page_count", "pages"), [(3, 2), (1, 2), (0, 1)])
+    def test_page_count_mismatch_rejected(self, page_count, pages):
+        page_tuple = tuple(_page(n) for n in range(1, pages + 1))
+        with pytest.raises(ValueError, match=rf"pages has {pages} page\(s\), but metadata.page_count is {page_count}"):
+            PDFDocument(metadata=_metadata(page_count), pages=page_tuple)
+
+    @pytest.mark.parametrize(
+        ("numbers", "match"),
+        [
+            ((1, 3), r"pages\[1\] has page_number 3, expected 2"),  # gap
+            ((2, 1), r"pages\[0\] has page_number 2, expected 1"),  # out of order
+            ((1, 1), r"pages\[1\] has page_number 1, expected 2"),  # repeated
+            ((2,), r"pages\[0\] has page_number 2, expected 1"),  # does not start at 1
+        ],
+    )
+    def test_pages_must_be_numbered_one_to_n_in_order(self, numbers, match):
+        with pytest.raises(ValueError, match=match):
+            _document(*(_page(n) for n in numbers))
+
+
+class TestDocumentElementIds:
+    def test_same_index_on_different_pages_is_distinct(self):
+        doc = _two_page_document()
+        assert [e.element_id for e in doc.elements] == ["p0001_e000", "p0002_e000"]
+
+    def test_duplicate_element_ids_across_pages_rejected(self):
+        # Unreachable through validated Pages (an id encodes its page, and pages
+        # are numbered 1..N), so a page whose own validation was bypassed stands
+        # in for corrupted input: the document-wide check must still catch it.
+        first = _page(1, elements=(_paragraph(1, 0),))
+        second = _page(2)
+        object.__setattr__(second, "elements", first.elements)
+        with pytest.raises(ValueError, match="duplicate element_id 'p0001_e000' across pages"):
+            _document(first, second)
+
+
+class TestDocumentContinuations:
+    def test_continuation_from_earlier_page(self):
+        doc = _document(
+            _page(1, elements=(_table(1, 0),)),
+            _page(2, elements=(_table(2, 0, continued_from_id="p0001_e000"),)),
+            _page(3, elements=(_paragraph(3, 0), _table(3, 1, continued_from_id="p0002_e000"))),
+        )
+        assert [t.continued_from_id for t in doc.tables] == [None, "p0001_e000", "p0002_e000"]
+
+    def test_continuation_may_skip_a_page(self):
+        doc = _document(
+            _page(1, elements=(_table(1, 0),)),
+            _page(2),
+            _page(3, elements=(_table(3, 0, continued_from_id="p0001_e000"),)),
+        )
+        assert doc.tables[1].continued_from_id == "p0001_e000"
+
+    @pytest.mark.parametrize(
+        ("pages", "described"),
+        [
+            # dangling: no element has that id
+            ((_page(1, elements=(_table(1, 0),)), _page(2, elements=(_table(2, 0, "p0001_e009"),))), "no such element"),
+            # forward: names a table on a later page
+            (
+                (_page(1, elements=(_table(1, 0, "p0002_e000"),)), _page(2, elements=(_table(2, 0),))),
+                "a Table on page 2",
+            ),
+            # same page: not an earlier page
+            ((_page(1, elements=(_table(1, 0), _table(1, 1, "p0001_e000"))), _page(2)), "a Table on page 1"),
+            # names an element that is not a table
+            ((_page(1, elements=(_paragraph(1, 0),)), _page(2, elements=(_table(2, 0, "p0001_e000"),))), "a Paragraph"),
+        ],
+    )
+    def test_bad_continuation_rejected(self, pages, described):
+        with pytest.raises(ValueError, match=f"must name a table on an earlier page, got {described}"):
+            _document(*pages)
+
+
+class TestDocumentSections:
+    def test_sections_made_of_document_elements(self):
+        heading = Heading(**_ids(1, 0), level=1, text="Intro")
+        pages = (_page(1, elements=(heading, _paragraph(1, 1))), _page(2, elements=(_paragraph(2, 0),)))
+        section = Section(heading=heading, scope_path=("Intro",), page_span=(1, 2), elements=pages[0].elements)
+        doc = _document(*pages, sections=(section,))
+        assert doc.sections == (section,)
+
+    def test_section_element_not_in_document_rejected(self):
+        stray = _paragraph(1, 7)
+        section = Section(heading=None, scope_path=(), page_span=(1, 1), elements=(stray,))
+        with pytest.raises(ValueError, match=r"sections\[1\] element 'p0001_e007' is not in the document"):
+            _two_page_document(sections=(Section(heading=None, scope_path=(), page_span=(1, 1), elements=()), section))
+
+    def test_section_element_differing_from_document_element_rejected(self):
+        altered = _paragraph(2, 0, text="Not what page 2 says.")
+        section = Section(heading=None, scope_path=(), page_span=(2, 2), elements=(altered,))
+        with pytest.raises(ValueError, match=r"sections\[0\] element 'p0002_e000' differs from the document's element"):
+            _two_page_document(sections=(section,))
+
+    def test_section_heading_not_in_document_rejected(self):
+        stray = Heading(**_ids(1, 9), level=1, text="Intro")
+        section = Section(heading=stray, scope_path=("Intro",), page_span=(1, 1), elements=())
+        with pytest.raises(ValueError, match=r"sections\[0\] heading 'p0001_e009' is not in the document"):
+            _two_page_document(sections=(section,))
+
+    def test_section_heading_differing_from_document_element_rejected(self):
+        heading = Heading(**_ids(1, 0), level=1, text="Intro")
+        altered = Heading(**_ids(1, 0), level=2, text="Intro")
+        section = Section(heading=altered, scope_path=("Intro",), page_span=(1, 1), elements=())
+        with pytest.raises(ValueError, match=r"sections\[0\] heading 'p0001_e000' differs from the document's element"):
+            _document(_page(1, elements=(heading,)), sections=(section,))
+
+    def test_section_page_span_past_last_page_rejected(self):
+        section = Section(heading=None, scope_path=(), page_span=(1, 3), elements=())
+        with pytest.raises(ValueError, match=r"sections\[0\] page_span \(1, 3\) ends after the document's last page 2"):
+            _two_page_document(sections=(section,))
+
+    def test_section_page_span_ending_on_last_page_accepted(self):
+        section = Section(heading=None, scope_path=(), page_span=(2, 2), elements=())
+        assert _two_page_document(sections=(section,)).sections == (section,)
+
+    def test_section_in_zero_page_document_rejected(self):
+        section = Section(heading=None, scope_path=(), page_span=(1, 1), elements=())
+        with pytest.raises(ValueError, match="ends after the document's last page 0"):
+            PDFDocument(metadata=_metadata(0), pages=(), sections=(section,))
+
+    def test_equal_copy_of_a_document_element_accepted(self):
+        copy = _paragraph(2, 0)  # equal to, but not the same object as, the page's element
+        section = Section(heading=None, scope_path=(), page_span=(2, 2), elements=(copy,))
+        assert _two_page_document(sections=(section,)).sections[0].elements == (copy,)
+
+
+class TestDocumentDerived:
+    def test_collections_in_document_order(self):
+        first, second = _one_of_each(1), _one_of_each(2)
+        doc = _document(_page(1, elements=first), _page(2, elements=second))
+        assert doc.elements == first + second
+        assert doc.headings == (first[0], second[0])
+        assert doc.paragraphs == (first[1], second[1])
+        assert doc.key_values == (first[2], second[2])
+        assert doc.tables == (first[3], second[3])
+        assert doc.lists == (first[4], second[4])
+        assert doc.figures == (first[5], second[5])
+
+    def test_empty_pages_yield_empty_collections(self):
+        doc = _document(_page(1), _page(2, status="error"))
+        assert (doc.elements, doc.headings, doc.tables, doc.figures, doc.page_images) == ((), (), (), (), ())
+
+    def test_page_images_skip_pages_without_one(self):
+        images = {n: PageImage(page_number=n, dpi=200, width_px=1700, height_px=2200) for n in (1, 3)}
+        doc = _document(_page(1, page_image=images[1]), _page(2), _page(3, page_image=images[3]))
+        assert doc.page_images == (images[1], images[3])
+
+    def test_degraded_pages_are_error_and_ocr_fallback_pages(self):
+        doc = _document(
+            _page(1),
+            _page(2, status="error"),
+            _page(3, status="ocr_fallback", route="vision"),
+            _page(4, route="vision"),
+            _page(5, route="hybrid"),
+        )
+        assert doc.degraded_pages == (2, 3)
+
+    def test_no_degraded_pages(self):
+        assert _two_page_document().degraded_pages == ()
+
+    def test_derived_once_not_per_access(self):
+        doc = _document(_page(1, elements=_one_of_each(1)))
+        assert doc.elements is doc.elements
+        assert doc.tables is doc.tables
+
+
+class TestDocumentIntegrity:
+    @pytest.mark.parametrize(
+        ("pages", "expected"),
+        [
+            ((_page(1, integrity_verified=True), _page(2, route="hybrid", integrity_verified=True)), True),
+            ((_page(1, integrity_verified=True), _page(2, integrity_verified=False)), False),
+            ((_page(1, integrity_verified=True), _page(2, route="vision")), True),  # vision pages not counted
+            ((_page(1, integrity_verified=True), _page(2, status="ocr_fallback", route="vision")), True),
+            ((_page(1, integrity_verified=True), _page(2, status="error")), True),  # error pages not counted
+        ],
+    )
+    def test_verified_iff_every_verifiable_page_is_verified(self, pages, expected):
+        assert _document(*pages).integrity_verified is expected
+
+    @pytest.mark.parametrize(
+        "pages",
+        [
+            (_page(1, route="vision"), _page(2, status="ocr_fallback", route="vision")),  # all vision
+            (_page(1, status="error"), _page(2, status="error")),  # all error
+            (_page(1, status="error"), _page(2, route="vision")),  # error + vision
+            (),  # no pages at all
+        ],
+    )
+    def test_false_when_no_page_is_verifiable(self, pages):
+        assert _document(*pages).integrity_verified is False
+
+
+class TestDocumentMarkdown:
+    def test_pages_joined_by_blank_lines(self):
+        doc = _document(_page(1, elements=(_paragraph(1, 0),)), _page(2, status="error"))
+        assert doc.to_markdown() == (
+            "<!-- page 1 route=digital status=ok -->\n\nParagraph 1.0.\n\n<!-- page 2 route=digital status=error -->"
+        )
+
+    def test_text_cannot_forge_a_page_marker(self):
+        forged = _paragraph(1, 0, text="<!-- page 2 route=digital status=ok -->\n<!-- draft")
+        doc = _document(_page(1, elements=(forged, _paragraph(1, 1))), _page(2, route="hybrid"))
+        markers = [line for line in doc.to_markdown().split("\n") if line.lstrip().startswith("<")]
+        assert markers == ["<!-- page 1 route=digital status=ok -->", "<!-- page 2 route=hybrid status=ok -->"]
+
+    def test_lists_on_consecutive_pages_are_separated_by_the_page_header(self):
+        lists = [BulletList(**_ids(page, 0), items=(f"item {page}",), ordered=True) for page in (1, 2)]
+        doc = _document(_page(1, elements=(lists[0],)), _page(2, elements=(lists[1],)))
+        assert doc.to_markdown() == (
+            "<!-- page 1 route=digital status=ok -->\n\n1. item 1\n\n"
+            "<!-- page 2 route=digital status=ok -->\n\n1. item 2"
+        )
+
+    def test_zero_page_document_renders_empty_string(self):
+        assert PDFDocument(metadata=_metadata(0), pages=()).to_markdown() == ""
