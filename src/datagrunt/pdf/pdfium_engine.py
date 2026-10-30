@@ -36,17 +36,27 @@ and pinned by ``tests/pdf_tests/test_pdfium_engine.py``:
 Text (#365 T2), pinned by ``tests/pdf_tests/test_pdfium_spans.py``:
 
 - pdfium makes one text object per text-showing operator (``Tj``, ``TJ``,
-  ``'``, ``"``), so one object's chars share one baseline; every
-  non-generated textpage char names its owner (``FPDFText_GetTextObject``).
+  ``'``, ``"``), so one object's chars share one baseline. Non-generated
+  textpage chars name their owner (``FPDFText_GetTextObject``), except the
+  space pdfium inserts between two right-to-left words drawn by separate
+  operators: it is not flagged generated and has no owner. A generated
+  space inside one object (a wide ``TJ`` gap) names that object.
+- Right-to-left text is in logical order: a Hebrew word drawn left to right
+  in visual order reads from its rightmost glyph.
 - Textpage char boxes and ``FPDFText_GetMatrix`` are page space with every
   enclosing form's matrix applied; ``get_bounds()`` and
   ``FPDFPageObj_GetMatrix`` of an object inside a form are in the form's
   space. pdfium parses forms at most 40 levels deep.
 - A non-BMP char is two textpage chars, a UTF-16 surrogate pair with equal
   boxes. An unmapped char code reads as itself, flagged by
-  ``FPDFText_HasUnicodeMapError``.
-- Text drawn at ``Tf 0`` yields no textpage chars, and a char drawn on an
-  identical char at the same place is dropped (pdfium's fake-bold removal).
+  ``FPDFText_HasUnicodeMapError``; without a ToUnicode map a 3- or 4-byte
+  CMap code can read beyond U+10FFFF (0x110000, 0xFFFFFFFF).
+- The textpage is not every drawn char: pdfium drops text at ``Tf 0``, at
+  ``Tz 0`` or under ~0.001 pt, objects of a single space, and a char drawn
+  on an identical char at the same place (fake-bold removal); it collapses
+  runs of spaces to one, decomposes ligatures (U+FB01 reads "fi") and
+  mirrors "(" in right-to-left text (it reads ")"). The engine keeps every
+  char the textpage reports.
 - Standard-14 fonts have no descriptor: their flags lack ForceBold and their
   weight reads 0, so only the base name says bold. A non-embedded alias
   reads as the standard-14 font pdfium substitutes (``Arial,BoldItalic``
@@ -238,9 +248,12 @@ class RawSpan:
     top-left ``(x0, y0, x1, y1)`` points, as :func:`to_display_box` returns.
 
     Attributes:
-        text: The chars as pdfium reports them, each kept: control chars,
-            U+FFFD and lone surrogates included (A3 classifies them). A
-            surrogate pair pdfium reports as two chars is one char here.
+        text: The chars pdfium's textpage reports for the object, each
+            kept: control chars, U+FFFD and lone surrogates included (A3
+            classifies them). A surrogate pair pdfium reports as two chars
+            is one char here; a raw code beyond U+10FFFF is U+FFFD. The
+            textpage itself drops or rewrites some drawn chars (see the
+            module notes: ``Tf 0`` text, space runs, ligatures).
         bbox: The union of ``char_boxes``.
         char_boxes: One box per char of ``text``: pdfium's loose char box
             (advance width by the font's ascent-to-descent height).
@@ -248,9 +261,16 @@ class RawSpan:
             page-space matrix (form matrices included); negative for a
             negative ``Tf`` (mirrored glyphs).
         base_font_name: The font's /BaseFont without a subset tag
-            (``ABCDEF+``); empty for a font without one (Type3).
-        is_bold: From the font name, the ForceBold flag, or weight >= 600.
-        is_italic: From the font name or the Italic flag.
+            (``ABCDEF+``); empty for a font without one (Type3). For a
+            non-embedded Type1 font pdfium aliases to a standard-14 font,
+            this is pdfium's alias, not the PDF's name: ``Arial-BoldMT``
+            reads ``Helvetica-Bold`` and ``TimesNewRomanPS-BoldItalicMT``
+            reads ``Times-BoldItalic``.
+        is_bold: From a whole style word of the font name (Bold, Black,
+            Heavy, Semibold, Bd, Blk, Hv, ...), the ForceBold flag, or
+            weight >= 600.
+        is_italic: From a whole style word of the font name (Italic,
+            Oblique, It, Obl, Slanted) or the Italic flag.
         render_mode: The text render mode, 0 (fill) to 7 (clip).
         fill_rgba: Fill colour and alpha as 0-255 ints, as pdfium reports
             them (a pattern fill reads as a colour pdfium picks).
@@ -258,6 +278,12 @@ class RawSpan:
         object_index: The owning text object's position in the page's
             depth-first, paint-order object walk (forms count, then their
             contents), so it also gives the span's z-order.
+        generated_breaks: Offsets into ``text``, strictly increasing and
+            each in ``1..len(text) - 1``, before which pdfium generated a
+            char (a space or line break) inside this span, as at a wide
+            ``TJ`` gap: ``[(Name) -12000 (Value)] TJ`` is text "NameValue"
+            with a break at 4. The generated chars are not inserted into
+            ``text``.
     """
 
     text: str
@@ -271,9 +297,11 @@ class RawSpan:
     fill_rgba: tuple[int, int, int, int]
     stroke_rgba: tuple[int, int, int, int]
     object_index: int
+    generated_breaks: tuple[int, ...]
 
     def __post_init__(self) -> None:
         self._check_text_and_boxes()
+        self._check_generated_breaks()
         object.__setattr__(self, "font_size_pt", finite_float("font_size_pt", self.font_size_pt))
         if not isinstance(self.base_font_name, str):
             raise TypeError(f"base_font_name must be a str, got {self.base_font_name!r}")
@@ -304,28 +332,51 @@ class RawSpan:
         object.__setattr__(self, "char_boxes", boxes)
         object.__setattr__(self, "bbox", bbox)
 
+    def _check_generated_breaks(self) -> None:
+        breaks = self.generated_breaks
+        if not isinstance(breaks, tuple):
+            raise TypeError(f"generated_breaks must be a tuple, got {type(breaks).__name__}")
+        last = len(self.text) - 1
+        for index, offset in enumerate(breaks):
+            int_at_least(f"generated_breaks[{index}]", offset, 0)
+            if not 1 <= offset <= last:
+                raise ValueError(f"generated_breaks[{index}] must be inside text, in 1..{last}, got {offset}")
+        if any(later <= earlier for earlier, later in zip(breaks, breaks[1:])):
+            raise ValueError(f"generated_breaks must be strictly increasing, got {breaks!r}")
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class TextStats:
     """Counts of one page's textpage chars, for A3's text-quality checks.
 
+    The three char counts are disjoint and sum to the textpage's char count.
+
     Attributes:
-        char_count: Non-generated textpage chars: the chars the content
-            stream draws (a non-BMP char counts twice, as a surrogate pair).
-        generated_count: Chars pdfium inserted (spaces and line breaks
-            between objects); they are in no span.
-        unicode_map_error_count: Non-generated chars pdfium could not map
-            to Unicode (``FPDFText_HasUnicodeMapError``); each reads as its
-            raw char code.
+        char_count: Non-generated textpage chars a text object owns: the
+            chars of the page's spans (a non-BMP char counts twice, as a
+            surrogate pair).
+        generated_count: Chars pdfium flags as generated (spaces and line
+            breaks it inserts); they are in no span.
+        ownerless_count: Non-generated chars no text object owns
+            (``FPDFText_GetTextObject`` is NULL): pdfium inserts them, as
+            the space between two right-to-left words drawn by separate
+            operators; they are in no span.
+        unicode_map_error_count: Owned chars pdfium could not map to
+            Unicode (``FPDFText_HasUnicodeMapError``); each reads as its raw
+            char code. A raw code beyond U+10FFFF (a 3- or 4-byte CMap code
+            with no ToUnicode entry) reads as U+FFFD and counts here once,
+            whether pdfium flags it or not.
     """
 
     char_count: int
     generated_count: int
+    ownerless_count: int
     unicode_map_error_count: int
 
     def __post_init__(self) -> None:
         int_at_least("char_count", self.char_count, 0)
         int_at_least("generated_count", self.generated_count, 0)
+        int_at_least("ownerless_count", self.ownerless_count, 0)
         int_at_least("unicode_map_error_count", self.unicode_map_error_count, 0)
         if self.unicode_map_error_count > self.char_count:
             counts = f"unicode_map_error_count ({self.unicode_map_error_count}) cannot exceed"
@@ -336,8 +387,8 @@ class TextStats:
 class PageText:
     """One page's spans in textpage order, with its textpage counts.
 
-    Every non-generated textpage char is in exactly one span: one span char
-    per textpage char, or one per surrogate pair.
+    Every owned, non-generated textpage char is in exactly one span: one
+    span char per textpage char, or one per surrogate pair.
     """
 
     spans: tuple[RawSpan, ...]
@@ -655,9 +706,14 @@ def _rgba(getter: Callable[..., int], text_object: pdfium_c.FPDF_PAGEOBJECT, wha
 _FLAG_ITALIC = 0x40
 _FLAG_FORCE_BOLD = 0x40000
 _BOLD_WEIGHT = 600
-# Case-insensitive; "bold" also matches Semibold, Demibold and ExtraBold.
-_BOLD_NAME_TOKENS = ("bold", "black", "heavy")
-_ITALIC_NAME_TOKENS = ("italic", "oblique")
+# Whole style words, lowercased: SemiBold is "semi" + "bold", BdIt "bd" + "it".
+_BOLD_NAME_TOKENS = frozenset(
+    {"bold", "black", "heavy", "semibold", "demibold", "extrabold", "ultrabold", "bd", "blk", "hv"}
+)
+_ITALIC_NAME_TOKENS = frozenset({"italic", "oblique", "it", "obl", "slanted"})
+# A font name's words: capitals before a capitalised word (LT in LTStd), a
+# capitalised or lowercase word, the rest of a run of capitals, a digit run.
+_NAME_WORD = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
 # A font subset's /BaseFont starts with exactly six capitals and "+" (PDF 32000-1, 9.9.2).
 _SUBSET_TAG = re.compile(r"[A-Z]{6}\+")
 _STYLE_SEPARATOR = re.compile(r"[-,]")
@@ -686,31 +742,42 @@ def _base_font_name(font: pdfium_c.FPDF_FONT, label: str) -> str:
     return name[7:] if _SUBSET_TAG.match(name) else name
 
 
-def _style_part(name: str) -> str:
-    """The style part of a font name, after its first "-" or "," (Arial-BoldMT, Arial,Bold).
+def _style_words(name: str) -> frozenset[str]:
+    """The lowercased words of a font name's style part, split on case and digit boundaries.
 
-    A name without one is all style part (ArialBlack). Matching only this
-    part keeps a family name such as BlackadderITC-Regular from reading bold.
+    The style part follows the first "-" or "," (Arial-BoldMT: "bold",
+    "mt"; Arial,Bold: "bold"). A name without one starts with its family
+    word, which is skipped (ArialBlack: "black"; BlackadderITC: "itc").
+    Matching whole style words keeps family names such as BlackChancery and
+    BlackadderITC-Regular from reading bold.
     """
     separator = _STYLE_SEPARATOR.search(name)
-    return (name[separator.end() :] if separator else name).lower()
+    if separator:
+        return frozenset(word.lower() for word in _NAME_WORD.findall(name[separator.end() :]))
+    return frozenset(word.lower() for word in _NAME_WORD.findall(name)[1:])
 
 
-def _bold_and_italic(font: pdfium_c.FPDF_FONT, name: str) -> tuple[bool, bool]:
+def _bold_and_italic(font: pdfium_c.FPDF_FONT, name: str, label: str) -> tuple[bool, bool]:
     """Read bold and italic from the font name, its descriptor flags and its weight.
 
     Each source alone suffices: standard-14 fonts have no descriptor (flags
-    and weight read 0), so their name is the only one that says bold. With a
-    valid font, pdfium's flags and weight cannot fail (-1 means a NULL font).
+    and weight read 0), so their name is the only one that says bold.
+    pdfium keeps the low 19 bits of /Flags, so only a NULL font reads
+    negative (-1, every bit set): that is a failure, not bold italic. The
+    weight is not a failure signal: pdfium derives it from /StemV (114
+    reads 570, so CMBX10 is not bold unless its name says so), and a
+    negative /StemV reads negative (-5 reads -25).
     """
-    style = _style_part(name)
+    style = _style_words(name)
     flags = pdfium_c.FPDFFont_GetFlags(font)
+    if flags < 0:
+        raise _PdfiumFailure(f"read the font flags of {label}")
     is_bold = (
-        any(token in style for token in _BOLD_NAME_TOKENS)
+        not style.isdisjoint(_BOLD_NAME_TOKENS)
         or bool(flags & _FLAG_FORCE_BOLD)
         or pdfium_c.FPDFFont_GetWeight(font) >= _BOLD_WEIGHT
     )
-    is_italic = any(token in style for token in _ITALIC_NAME_TOKENS) or bool(flags & _FLAG_ITALIC)
+    is_italic = not style.isdisjoint(_ITALIC_NAME_TOKENS) or bool(flags & _FLAG_ITALIC)
     return is_bold, is_italic
 
 
@@ -743,7 +810,7 @@ def _read_style(
     if not font:
         raise _PdfiumFailure(f"read the font of {label}")
     name = _base_font_name(font, label)
-    is_bold, is_italic = _bold_and_italic(font, name)
+    is_bold, is_italic = _bold_and_italic(font, name, label)
     render_mode = pdfium_c.FPDFTextObj_GetTextRenderMode(text_object)
     if render_mode not in range(8):  # FPDF_TEXTRENDERMODE_UNKNOWN (-1) on failure
         raise _PdfiumFailure(f"read the render mode of {label}")
@@ -773,10 +840,11 @@ def _loose_box(textpage: pdfium_c.FPDF_TEXTPAGE, char_index: int) -> Box:
 _HIGH_SURROGATES = range(0xD800, 0xDC00)
 _LOW_SURROGATES = range(0xDC00, 0xE000)
 _MAX_CODE_POINT = 0x10FFFF
+_REPLACEMENT_CHAR = "\ufffd"
 
 
 class _SpanBuilder:
-    """Groups a page's non-generated textpage chars into RawSpans, in order."""
+    """Groups a page's owned, non-generated textpage chars into RawSpans, in order."""
 
     def __init__(
         self, textpage: pdfium_c.FPDF_TEXTPAGE, geometry: PageGeometry, object_indices: dict[int, int]
@@ -790,21 +858,32 @@ class _SpanBuilder:
         self._owner = 0
         self._chars: list[str] = []
         self._boxes: list[Box] = []
+        self._breaks: list[int] = []
+        self._break_pending = False
 
-    def add(self, char_index: int) -> None:
-        """Append non-generated textpage char ``char_index`` to the current span or a new one."""
-        self._switch_owner(char_index)
-        code = pdfium_c.FPDFText_GetUnicode(self._textpage, char_index)
-        if code > _MAX_CODE_POINT:
-            raise _PdfiumFailure(f"read char {char_index}: code {code:#x} is beyond Unicode")
+    def mark_inserted(self) -> None:
+        """Note that pdfium inserted a char (generated or ownerless) after the last one added."""
+        self._break_pending = True
+
+    def add(self, char_index: int, text_object: pdfium_c.FPDF_PAGEOBJECT, code: int) -> None:
+        """Append textpage char ``char_index`` (``code``), owned by ``text_object``, to the current or a new span."""
+        self._switch_owner(char_index, text_object)
         box = _loose_box(self._textpage, char_index)
-        if code in _LOW_SURROGATES and self._chars and ord(self._chars[-1]) in _HIGH_SURROGATES:
+        # A char pdfium inserted inside this span becomes a break before this
+        # char; one inserted between spans is only counted.
+        breaking = self._break_pending and bool(self._chars)
+        self._break_pending = False
+        if breaking:
+            self._breaks.append(len(self._chars))
+        elif code in _LOW_SURROGATES and self._chars and ord(self._chars[-1]) in _HIGH_SURROGATES:
             # pdfium reports a non-BMP char as a UTF-16 pair of textpage chars.
             high = ord(self._chars[-1])
             self._chars[-1] = chr(0x10000 + ((high - _HIGH_SURROGATES.start) << 10) + (code - _LOW_SURROGATES.start))
             self._boxes[-1] = _union((self._boxes[-1], box))
             return
-        self._chars.append(chr(code))
+        # A code beyond Unicode is a raw char code pdfium could not map; U+FFFD
+        # keeps its place (and is no surrogate, so it never pairs).
+        self._chars.append(chr(code) if code <= _MAX_CODE_POINT else _REPLACEMENT_CHAR)
         self._boxes.append(box)
 
     def finish(self) -> tuple[RawSpan, ...]:
@@ -812,11 +891,8 @@ class _SpanBuilder:
         self._flush()
         return tuple(self._spans)
 
-    def _switch_owner(self, char_index: int) -> None:
+    def _switch_owner(self, char_index: int, text_object: pdfium_c.FPDF_PAGEOBJECT) -> None:
         """Start a new span when char ``char_index`` belongs to another text object."""
-        text_object = pdfium_c.FPDFText_GetTextObject(self._textpage, char_index)
-        if not text_object:
-            raise _PdfiumFailure(f"read the text object of char {char_index}")
         owner = _address(text_object)
         if owner == self._owner:
             return
@@ -837,10 +913,11 @@ class _SpanBuilder:
                 bbox=_union(boxes),
                 char_boxes=boxes,
                 object_index=self._object_indices[self._owner],
+                generated_breaks=tuple(self._breaks),
                 **self._styles[self._owner]._asdict(),
             )
         )
-        self._chars, self._boxes = [], []
+        self._chars, self._boxes, self._breaks = [], [], []
 
 
 def _textpage_flag(result: int, char_index: int, question: str) -> bool:
@@ -851,20 +928,37 @@ def _textpage_flag(result: int, char_index: int, question: str) -> bool:
 
 
 def _collect_text(textpage: pdfium_c.FPDF_TEXTPAGE, geometry: PageGeometry, object_indices: dict[int, int]) -> PageText:
-    """Walk every textpage char once: count them and group the non-generated ones."""
+    """Walk every textpage char once: count them and group the owned, non-generated ones."""
     count = pdfium_c.FPDFText_CountChars(textpage)
     if count < 0:
         raise _PdfiumFailure("count the text page's chars")
     builder = _SpanBuilder(textpage, geometry, object_indices)
-    generated = map_errors = 0
+    generated = ownerless = map_errors = 0
     for char_index in range(count):
         if _textpage_flag(pdfium_c.FPDFText_IsGenerated(textpage, char_index), char_index, "is generated"):
             generated += 1
+            builder.mark_inserted()
             continue
-        map_error = pdfium_c.FPDFText_HasUnicodeMapError(textpage, char_index)
-        map_errors += _textpage_flag(map_error, char_index, "maps to Unicode")
-        builder.add(char_index)
-    stats = TextStats(char_count=count - generated, generated_count=generated, unicode_map_error_count=map_errors)
+        text_object = pdfium_c.FPDFText_GetTextObject(textpage, char_index)
+        if not text_object:
+            # pdfium inserted it, though not flagged generated: the space
+            # between two right-to-left words drawn by separate operators.
+            ownerless += 1
+            builder.mark_inserted()
+            continue
+        map_error = _textpage_flag(
+            pdfium_c.FPDFText_HasUnicodeMapError(textpage, char_index), char_index, "maps to Unicode"
+        )
+        code = pdfium_c.FPDFText_GetUnicode(textpage, char_index)
+        # A code beyond U+10FFFF reads as U+FFFD: a map error, counted once.
+        map_errors += map_error or code > _MAX_CODE_POINT
+        builder.add(char_index, text_object, code)
+    stats = TextStats(
+        char_count=count - generated - ownerless,
+        generated_count=generated,
+        ownerless_count=ownerless,
+        unicode_map_error_count=map_errors,
+    )
     return PageText(spans=builder.finish(), stats=stats)
 
 
@@ -887,11 +981,13 @@ def _read_page_text(page: pdfium.PdfPage, geometry: PageGeometry) -> PageText:
 def page_text(handle: DocumentHandle, index: int) -> PageText:
     """Return the text spans and textpage counts of the page at 0-based ``index``.
 
-    One pass over the textpage: generated chars (pdfium's inserted spaces
-    and line breaks) are counted and skipped; every other char joins the
-    span of its owning text object (see :class:`RawSpan`). Boxes are mapped
-    to the displayed page with :func:`to_display_box`. The page and textpage
-    handles are closed before returning.
+    One pass over the textpage: chars pdfium inserted (generated spaces and
+    line breaks, and ownerless spaces between right-to-left words) are
+    counted and skipped, and become a ``generated_breaks`` offset when they
+    fall inside a span; every other char joins the span of its owning text
+    object (see :class:`RawSpan`). Boxes are mapped to the displayed page
+    with :func:`to_display_box`. The page and textpage handles are closed
+    before returning.
 
     Raises:
         TypeError: If ``handle`` is not a DocumentHandle, or ``index`` is not

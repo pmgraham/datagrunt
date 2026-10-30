@@ -8,7 +8,8 @@ hand (``hand_written_pdf``) for what ReportLab cannot write.
 import dataclasses
 import pickle
 import re
-from collections import Counter
+import subprocess
+import sys
 from pathlib import Path
 
 import pypdfium2 as pdfium
@@ -25,6 +26,8 @@ TOL = 1.0
 
 BOX_A = (10.0, 20.0, 16.0, 32.0)
 BOX_B = (16.0, 21.0, 22.0, 33.0)
+# RawSpan overrides for a valid four-char span.
+FOUR_CHARS = {"text": "Abcd", "bbox": BOX_A, "char_boxes": (BOX_A,) * 4}
 
 ROTATIONS = [0, 90, 180, 270]
 # Top-left (50, 20)-(350, 260) on the 400 x 300 page: PDF CropBox (50, 40)-(350, 280).
@@ -88,13 +91,16 @@ def span(**overrides) -> RawSpan:
         "fill_rgba": (0, 0, 0, 255),
         "stroke_rgba": (255, 0, 0, 128),
         "object_index": 3,
+        "generated_breaks": (),
     }
     return RawSpan(**(fields | overrides))
 
 
 def stats(**overrides) -> TextStats:
     """A valid TextStats with ``overrides`` applied."""
-    return TextStats(**({"char_count": 2, "generated_count": 1, "unicode_map_error_count": 0} | overrides))
+    return TextStats(
+        **({"char_count": 2, "generated_count": 1, "ownerless_count": 0, "unicode_map_error_count": 0} | overrides)
+    )
 
 
 class TestRawSpan:
@@ -174,11 +180,49 @@ class TestRawSpan:
             ),
             pytest.param({"stroke_rgba": [0, 0, 0, 0]}, TypeError, "stroke_rgba must be a tuple", id="stroke-list"),
             pytest.param({"object_index": -1}, ValueError, "object_index must be >= 0, got -1", id="index-neg"),
+            pytest.param(
+                {"generated_breaks": [1]}, TypeError, "generated_breaks must be a tuple, got list", id="breaks"
+            ),
+            pytest.param(
+                {"generated_breaks": (True,)},
+                TypeError,
+                "generated_breaks[0] must be an int, got True (bool)",
+                id="break-bool",
+            ),
+            pytest.param(
+                {"generated_breaks": (0,)},
+                ValueError,
+                "generated_breaks[0] must be inside text, in 1..1, got 0",
+                id="break-at-start",
+            ),
+            pytest.param(
+                {"generated_breaks": (2,)},
+                ValueError,
+                "generated_breaks[0] must be inside text, in 1..1, got 2",
+                id="break-at-end",
+            ),
+            pytest.param(
+                {**FOUR_CHARS, "generated_breaks": (2, 1)},
+                ValueError,
+                "generated_breaks must be strictly increasing, got (2, 1)",
+                id="breaks-unsorted",
+            ),
+            pytest.param(
+                {**FOUR_CHARS, "generated_breaks": (2, 2)},
+                ValueError,
+                "generated_breaks must be strictly increasing, got (2, 2)",
+                id="breaks-repeated",
+            ),
         ],
     )
     def test_invalid_field_raises(self, overrides, error, message):
         with pytest.raises(error, match=re.escape(message)):
             span(**overrides)
+
+    def test_generated_breaks_inside_text_are_kept(self):
+        value = span(**FOUR_CHARS, generated_breaks=(1, 3))
+
+        assert value.generated_breaks == (1, 3)
 
 
 class TestTextStats:
@@ -196,6 +240,7 @@ class TestTextStats:
         [
             pytest.param({"char_count": -1}, ValueError, "char_count must be >= 0, got -1", id="chars"),
             pytest.param({"generated_count": 1.0}, TypeError, "generated_count must be an int", id="generated"),
+            pytest.param({"ownerless_count": -1}, ValueError, "ownerless_count must be >= 0, got -1", id="ownerless"),
             pytest.param(
                 {"unicode_map_error_count": 3},
                 ValueError,
@@ -217,12 +262,18 @@ class TestPageText:
 
         assert pickle.loads(pickle.dumps(original)) == original
 
-    @pytest.mark.parametrize("char_count", [2, 3, 4], ids=["one-each", "one-pair", "all-pairs"])
-    def test_span_chars_take_one_or_two_textpage_chars(self, char_count):
-        # A non-BMP char is two textpage chars (a UTF-16 surrogate pair).
-        value = PageText(spans=(span(),), stats=stats(char_count=char_count))
+    @pytest.mark.parametrize(
+        "codes,char_count",
+        [(b"00020002", 2), (b"00020001", 3), (b"00010003", 4)],
+        ids=["one-each", "one-pair", "all-pairs"],
+    )
+    def test_span_chars_take_one_or_two_textpage_chars(self, tmp_path, codes, char_count):
+        # A non-BMP char is two textpage chars (a UTF-16 surrogate pair), so
+        # the engine's PageText holds two span chars for 2, 3 or 4 of them.
+        result = page_text(open_document(cid_page(tmp_path, codes)), 0)
 
-        assert value.stats.char_count == char_count
+        (got,) = result.spans
+        assert (len(got.text), result.stats.char_count) == (2, char_count)
 
     @pytest.mark.parametrize(
         "spans,page_stats,error,message",
@@ -293,17 +344,47 @@ class TestSpanGrouping:
 
         result = page_text(open_document(path), 0)
 
-        assert [item.text for item in result.spans] == ["AB"]
-        assert result.stats == TextStats(char_count=2, generated_count=1, unicode_map_error_count=0)
+        assert [(item.text, item.generated_breaks) for item in result.spans] == [("AB", (1,))]
+        assert result.stats == TextStats(char_count=2, generated_count=1, ownerless_count=0, unicode_map_error_count=0)
         assert result.spans[0].char_boxes[1][0] - result.spans[0].char_boxes[0][2] > 20.0
+
+    @pytest.mark.parametrize(
+        "content,text,breaks",
+        [
+            pytest.param(
+                b"BT /F1 10 Tf 72 250 Td [(Hello)-333(W)83(orld)-333(again)]TJ ET",
+                "HelloWorldagain",
+                (5, 10),
+                id="pdftex-word-spacing",
+            ),
+            pytest.param(
+                b"BT /F1 10 Tf 20 250 Td [(Name) -12000 (Value) -12000 (Total)] TJ ET",
+                "NameValueTotal",
+                (4, 9),
+                id="table-columns",
+            ),
+        ],
+    )
+    def test_word_breaks_inside_one_tj_are_generated_breaks(self, tmp_path, content, text, breaks):
+        # The text stays exactly the drawn chars; the breaks say where pdfium put a space.
+        (got,) = spans_of(content_page(tmp_path, content))
+
+        assert (got.text, got.generated_breaks) == (text, breaks)
+
+    def test_a_generated_break_keeps_lone_surrogates_apart(self, tmp_path):
+        # A lone high and a lone low surrogate, drawn apart: not one non-BMP char.
+        (got,) = spans_of(cid_font_page(tmp_path, b"BT /F1 20 Tf 72 150 Td [<0005> -3000 <0006>] TJ ET"))
+
+        assert (got.text, got.generated_breaks) == ("\ud835\udc00", (1,))
 
     def test_generated_line_breaks_are_counted_not_kept(self, tmp_path):
         runs = (TextRun("Up", x=72.0, y=100.0), TextRun("Down", x=72.0, y=200.0))
 
         result = page_text(open_document(one_page(tmp_path, *runs)), 0)
 
-        assert [item.text for item in result.spans] == ["Up", "Down"]
-        assert result.stats == TextStats(char_count=6, generated_count=2, unicode_map_error_count=0)
+        # The generated line break falls between spans, so neither span has a break.
+        assert [(item.text, item.generated_breaks) for item in result.spans] == [("Up", ()), ("Down", ())]
+        assert result.stats == TextStats(char_count=6, generated_count=2, ownerless_count=0, unicode_map_error_count=0)
 
     def test_a_run_drawn_twice_in_place_reads_once(self, tmp_path):
         # Observed pdfium behaviour (fake-bold removal): a char drawn on an
@@ -488,6 +569,8 @@ class TestBoldItalic:
             pytest.param(b"Plain", b"/Flags 32 /FontWeight 600", "Plain", True, False, id="weight-600"),
             pytest.param(b"Plain", b"/Flags 32 /FontWeight 500", "Plain", False, False, id="weight-500"),
             pytest.param(b"Plain", b"/Flags 32 /StemV 140", "Plain", True, False, id="weight-from-stem-v"),
+            # pdfium reads /StemV -5 as weight -25: a negative weight is PDF data, not a failure.
+            pytest.param(b"Plain", b"/Flags 32 /StemV -5", "Plain", False, False, id="negative-weight"),
             pytest.param(b"ABCDEF+Arial-BoldMT", None, "Arial-BoldMT", True, False, id="subset-tag-stripped"),
             pytest.param(b"Abcdef+Plain", None, "Abcdef+Plain", False, False, id="lowercase-tag-kept"),
             pytest.param(b"ABCDE+Plain", None, "ABCDE+Plain", False, False, id="five-letter-tag-kept"),
@@ -497,10 +580,35 @@ class TestBoldItalic:
             pytest.param(b"Roboto-Heavy", None, "Roboto-Heavy", True, False, id="heavy"),
             pytest.param(b"Font-Oblique", None, "Font-Oblique", False, True, id="oblique"),
             pytest.param(b"Font,BoldItalic", None, "Font,BoldItalic", True, True, id="comma-style"),
-            pytest.param(b"ArialBlack", None, "ArialBlack", True, False, id="no-separator-whole-name"),
+            pytest.param(b"ArialBlack", None, "ArialBlack", True, False, id="no-separator-words-after-family"),
             pytest.param(b"BlackadderITC-Regular", None, "BlackadderITC-Regular", False, False, id="family-ignored"),
+            # Style words are whole words, split on case and digit boundaries;
+            # without a separator the first word is the family.
+            pytest.param(b"BlackadderITC", None, "BlackadderITC", False, False, id="no-separator-family-word"),
+            pytest.param(b"BlackChancery", None, "BlackChancery", False, False, id="no-separator-black-family"),
+            pytest.param(b"Bold-Regular", None, "Bold-Regular", False, False, id="bold-family"),
+            pytest.param(b"Font-Lite", None, "Font-Lite", False, False, id="it-inside-a-word"),
+            pytest.param(b"MinionPro-It", None, "MinionPro-It", False, True, id="it"),
+            pytest.param(b"MinionPro-BoldIt", None, "MinionPro-BoldIt", True, True, id="bold-it"),
+            pytest.param(b"MinionPro-SemiboldIt", None, "MinionPro-SemiboldIt", True, True, id="semibold-it"),
+            pytest.param(b"HelveticaNeueLTStd-It", None, "HelveticaNeueLTStd-It", False, True, id="neue-it"),
+            pytest.param(b"HelveticaNeueLTStd-Bd", None, "HelveticaNeueLTStd-Bd", True, False, id="bd"),
+            pytest.param(b"HelveticaNeueLTStd-BdIt", None, "HelveticaNeueLTStd-BdIt", True, True, id="bd-it"),
+            pytest.param(b"HelveticaNeueLTStd-Blk", None, "HelveticaNeueLTStd-Blk", True, False, id="blk"),
+            pytest.param(b"HelveticaNeueLTStd-Hv", None, "HelveticaNeueLTStd-Hv", True, False, id="hv"),
+            pytest.param(b"Font-Obl", None, "Font-Obl", False, True, id="obl"),
+            pytest.param(b"Font-Slanted", None, "Font-Slanted", False, True, id="slanted"),
+            pytest.param(b"Font-ExtraBold", None, "Font-ExtraBold", True, False, id="extrabold"),
+            pytest.param(b"Font-Ultrabold", None, "Font-Ultrabold", True, False, id="ultrabold"),
+            pytest.param(b"Helvetica-Narrow-Bold", None, "Helvetica-Narrow-Bold", True, False, id="two-separators"),
+            pytest.param(b"NotoSans-SemiBold", None, "NotoSans-SemiBold", True, False, id="semi-bold"),
+            pytest.param(b"KozGoPr6N-Heavy", None, "KozGoPr6N-Heavy", True, False, id="digit-in-family"),
+            # pdfium reads CMBX10's /StemV 114 as weight 570: not bold, as its name says nothing.
+            pytest.param(b"CMBX10", b"/Flags 32 /StemV 114", "CMBX10", False, False, id="cmbx10-weight-570"),
             # pdfium reports the standard-14 font it substitutes for an alias.
             pytest.param(b"Arial,BoldItalic", None, "Helvetica-BoldOblique", True, True, id="pdfium-alias"),
+            pytest.param(b"Arial-BoldMT", None, "Helvetica-Bold", True, False, id="alias-arial-boldmt"),
+            pytest.param(b"TimesNewRomanPS-BoldItalicMT", None, "Times-BoldItalic", True, True, id="alias-times"),
             pytest.param(b"Caf#c3#a9-Bold", None, "Café-Bold", True, False, id="utf-8-name"),
             pytest.param(b"Bad#ff#feName", None, "Bad\\xff\\xfeName", False, False, id="invalid-utf-8-escaped"),
         ],
@@ -536,20 +644,32 @@ end
 end"""
 
 
+# The descendant font (object 6) and its descriptor (object 8) of the Type0 test fonts.
+CID_DESCENDANT = (
+    b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /TestCID /FontDescriptor 8 0 R /DW 600"
+    b" /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> >>"
+)
+CID_DESCRIPTOR = (
+    b"<< /Type /FontDescriptor /FontName /TestCID /Flags 32 /FontBBox [0 -200 1000 900]"
+    b" /ItalicAngle 0 /Ascent 900 /Descent -200 /CapHeight 700 /StemV 80 >>"
+)
+
+
+def cid_font_page(tmp_path: Path, content: bytes, to_unicode: bytes = TO_UNICODE) -> Path:
+    """A page drawing ``content`` with /F1, a non-embedded Identity-H CID font mapped by ``to_unicode``.
+
+    Every 2-byte code is 600 units wide: 12 pt apart at 20 pt.
+    """
+    font = b"<< /Type /Font /Subtype /Type0 /BaseFont /TestCID /Encoding /Identity-H /DescendantFonts [6 0 R]"
+    cmap = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(to_unicode), to_unicode)
+    return content_page(
+        tmp_path, content, font=font + b" /ToUnicode 7 0 R >>", extra=(CID_DESCENDANT, cmap, CID_DESCRIPTOR)
+    )
+
+
 def cid_page(tmp_path: Path, codes: bytes) -> Path:
     """A page drawing 2-byte ``codes`` (hex) at 20 pt, 12 pt apart, in a non-embedded CID font."""
-    font = b"<< /Type /Font /Subtype /Type0 /BaseFont /TestCID /Encoding /Identity-H /DescendantFonts [6 0 R]"
-    descendant = (
-        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /TestCID /FontDescriptor 8 0 R /DW 600"
-        b" /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> >>"
-    )
-    descriptor = (
-        b"<< /Type /FontDescriptor /FontName /TestCID /Flags 32 /FontBBox [0 -200 1000 900]"
-        b" /ItalicAngle 0 /Ascent 900 /Descent -200 /CapHeight 700 /StemV 80 >>"
-    )
-    cmap = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(TO_UNICODE), TO_UNICODE)
-    content = b"BT /F1 20 Tf 72 150 Td <%s> Tj ET" % codes
-    return content_page(tmp_path, content, font=font + b" /ToUnicode 7 0 R >>", extra=(descendant, cmap, descriptor))
+    return cid_font_page(tmp_path, b"BT /F1 20 Tf 72 150 Td <%s> Tj ET" % codes)
 
 
 class TestUnicode:
@@ -563,20 +683,210 @@ class TestUnicode:
         assert got.text == "A\U0001d400\U0001f600A"
         assert [box[0] for box in got.char_boxes] == pytest.approx([72.0, 84.0, 96.0, 108.0], abs=TOL)
         assert got.char_boxes[1][2] == pytest.approx(96.0, abs=TOL)
-        assert result.stats == TextStats(char_count=6, generated_count=0, unicode_map_error_count=0)
+        assert result.stats == TextStats(char_count=6, generated_count=0, ownerless_count=0, unicode_map_error_count=0)
 
     def test_lone_surrogates_and_unmapped_codes_are_kept(self, tmp_path):
         # Preserve, not transform: A3 classifies these chars.
         result = page_text(open_document(cid_page(tmp_path, b"00020005000400050002")), 0)
 
         assert [item.text for item in result.spans] == ["A\ud835\x04\ud835A"]
-        assert result.stats == TextStats(char_count=5, generated_count=0, unicode_map_error_count=1)
+        assert result.stats == TextStats(char_count=5, generated_count=0, ownerless_count=0, unicode_map_error_count=1)
 
     def test_a_lone_low_surrogate_is_kept(self, tmp_path):
         result = page_text(open_document(cid_page(tmp_path, b"000200060002")), 0)
 
         assert [item.text for item in result.spans] == ["A\udc00A"]
         assert result.stats.char_count == 3
+
+    def test_a_code_beyond_unicode_is_kept_as_u_fffd_and_counted_once(self, tmp_path):
+        # Without a ToUnicode map pdfium reads each char as its raw code: the
+        # 3-byte code 110000 and the 4-byte FFFFFFFF are beyond U+10FFFF.
+        result = page_text(open_document(wide_code_page(tmp_path, b"01 10FFFF 110000 02 FFFFFFFF 03")), 0)
+
+        (got,) = result.spans
+        assert got.text == "\x01\U0010ffff\ufffd\x02\ufffd\x03"
+        assert [box[0] for box in got.char_boxes] == pytest.approx([72.0, 84.0, 96.0, 108.0, 120.0, 132.0], abs=TOL)
+        assert result.stats == TextStats(char_count=6, generated_count=0, ownerless_count=0, unicode_map_error_count=6)
+
+    def test_a_code_beyond_unicode_never_pairs_with_a_surrogate(self, tmp_path):
+        result = page_text(open_document(wide_code_page(tmp_path, b"D835 110000 DC00")), 0)
+
+        assert [item.text for item in result.spans] == ["\ud835\ufffd\udc00"]
+        assert result.stats.unicode_map_error_count == 3
+
+
+# An embedded CMap with 1-, 2-, 3- and 4-byte codes (the first byte picks the
+# length), each its own CID.
+WIDE_CODES_CMAP = b"""/CIDInit /ProcSet findresource begin
+12 dict begin
+begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> def
+/CMapName /Test-Wide def
+/CMapType 1 def
+4 begincodespacerange
+<00> <0F>
+<D000> <DFFF>
+<100000> <CFFFFF>
+<E0000000> <FFFFFFFF>
+endcodespacerange
+3 begincidrange
+<D000> <DFFF> 1
+<100000> <CFFFFF> 1
+<E0000000> <FFFFFFFF> 1
+endcidrange
+endcmap
+CMapName currentdict /CMap defineresource pop
+end
+end"""
+
+
+def wide_code_page(tmp_path: Path, codes: bytes) -> Path:
+    """A page drawing hex ``codes`` at 20 pt, 12 pt apart, in a CID font encoded by WIDE_CODES_CMAP, no ToUnicode."""
+    font = b"<< /Type /Font /Subtype /Type0 /BaseFont /TestCID /Encoding 7 0 R /DescendantFonts [6 0 R] >>"
+    cmap = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(WIDE_CODES_CMAP), WIDE_CODES_CMAP)
+    content = b"BT /F1 20 Tf 72 150 Td <%s> Tj ET" % codes.replace(b" ", b"")
+    return content_page(tmp_path, content, font=font, extra=(CID_DESCENDANT, cmap, CID_DESCRIPTOR))
+
+
+def bfchar_cmap(pairs: dict[bytes, bytes]) -> bytes:
+    """A ToUnicode CMap mapping each 2-byte hex code of ``pairs`` to its UTF-16BE hex."""
+    chars = b"\n".join(b"<%s> <%s>" % pair for pair in pairs.items())
+    return (
+        b"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CMapName /Test-UCS def\n/CMapType 2 def\n"
+        b"1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n%d beginbfchar\n%s\nendbfchar\nendcmap\n"
+        b"CMapName currentdict /CMap defineresource pop\nend\nend" % (len(pairs), chars)
+    )
+
+
+# 0001-0003: Hebrew alef, bet, gimel; 0004-0005: Arabic alef, lam; 0006-0009: "A" to "D".
+RTL_TO_UNICODE = bfchar_cmap(
+    {
+        b"0001": b"05D0",
+        b"0002": b"05D1",
+        b"0003": b"05D2",
+        b"0004": b"0627",
+        b"0005": b"0644",
+        b"0006": b"0041",
+        b"0007": b"0042",
+        b"0008": b"0043",
+        b"0009": b"0044",
+    }
+)
+
+# Glyphs are drawn left to right in visual order, as a PDF producer writes
+# right-to-left text: "gimel bet alef" at x 72 reads alef-bet-gimel.
+HEBREW_TWO_WORDS = b"BT /F1 20 Tf 72 150 Td <000300020001> Tj 80 0 Td <00020001> Tj ET"
+ARABIC_TWO_WORDS = b"BT /F1 20 Tf 72 150 Td <00040005> Tj ET BT /F1 20 Tf 130 150 Td <00050004> Tj ET"
+ENGLISH_HEBREW_ENGLISH = (
+    b"BT /F1 20 Tf 72 150 Td <00060007> Tj ET BT /F1 20 Tf 130 150 Td <00020001> Tj ET"
+    b" BT /F1 20 Tf 190 150 Td <00080009> Tj ET"
+)
+
+
+def rtl_page(tmp_path: Path, content: bytes) -> Path:
+    """A page drawing ``content`` in the CID font mapped by RTL_TO_UNICODE."""
+    return cid_font_page(tmp_path, content, RTL_TO_UNICODE)
+
+
+# A CID font map for pdfium's textpage normalisations: alef, "(", "A" and the fi ligature.
+NORMALISED_TO_UNICODE = bfchar_cmap({b"0001": b"05D0", b"0002": b"0028", b"0003": b"0041", b"0004": b"FB01"})
+
+
+class TestTextpageNormalisation:
+    """pdfium's textpage drops or rewrites some drawn chars; the engine keeps every char it reports."""
+
+    @pytest.mark.parametrize(
+        "content,texts",
+        [
+            pytest.param(
+                b"BT /F1 12 Tf 0 Tz 72 100 Td (Gone) Tj ET BT /F1 12 Tf 100 Tz 72 150 Td (Seen) Tj ET",
+                ["Seen"],
+                id="tz-0-dropped",
+            ),
+            pytest.param(
+                b"BT /F1 0.001 Tf 72 100 Td (Tiny) Tj ET BT /F1 12 Tf 72 150 Td (Seen) Tj ET",
+                ["Seen"],
+                id="under-0.001-pt-dropped",
+            ),
+            pytest.param(
+                b"BT /F1 20 Tf 72 150 Td (AB) Tj ET BT /F1 20 Tf 94.2 150 Td ( ) Tj ET"
+                b" BT /F1 20 Tf 99.8 150 Td (CD) Tj ET",
+                ["AB", "CD"],
+                id="single-space-object-dropped",
+            ),
+            pytest.param(b"BT /F1 20 Tf 72 150 Td (Hello world  two) Tj ET", ["Hello world two"], id="space-run"),
+        ],
+    )
+    def test_latin_text(self, tmp_path, content, texts):
+        assert [item.text for item in spans_of(content_page(tmp_path, content))] == texts
+
+    @pytest.mark.parametrize(
+        "codes,text",
+        [
+            pytest.param(b"00030004", "Afi", id="fi-ligature-decomposed"),
+            pytest.param(b"000100020001", "\u05d0)\u05d0", id="rtl-paren-mirrored"),
+        ],
+    )
+    def test_mapped_text(self, tmp_path, codes, text):
+        content = b"BT /F1 20 Tf 72 150 Td <%s> Tj ET" % codes
+
+        assert [item.text for item in spans_of(cid_font_page(tmp_path, content, NORMALISED_TO_UNICODE))] == [text]
+
+
+class TestRightToLeft:
+    """pdfium reads right-to-left text in logical order; the space it inserts between RTL words has no owner."""
+
+    def test_the_space_between_rtl_words_is_not_generated_and_has_no_owner(self, tmp_path):
+        # Observed pdfium behaviour: page_text once failed the whole page on this char.
+        textpage = pdfium.PdfDocument(rtl_page(tmp_path, HEBREW_TWO_WORDS))[0].get_textpage()
+
+        assert chr(pdfium_c.FPDFText_GetUnicode(textpage, 2)) == " "
+        assert pdfium_c.FPDFText_IsGenerated(textpage, 2) == 0
+        assert not pdfium_c.FPDFText_GetTextObject(textpage, 2)
+
+    def test_hebrew_words_in_separate_tj_are_two_spans(self, tmp_path):
+        result = page_text(open_document(rtl_page(tmp_path, HEBREW_TWO_WORDS)), 0)
+
+        # Logical order: the right-hand word (drawn second) reads first, its chars right to left.
+        assert [(item.text, item.object_index) for item in result.spans] == [("אב", 1), ("אבג", 0)]
+        assert [box[0] for box in result.spans[0].char_boxes] == pytest.approx([164.0, 152.0], abs=TOL)
+        assert result.stats == TextStats(char_count=5, generated_count=0, ownerless_count=1, unicode_map_error_count=0)
+
+    def test_arabic_words_in_separate_tj_are_two_spans(self, tmp_path):
+        result = page_text(open_document(rtl_page(tmp_path, ARABIC_TWO_WORDS)), 0)
+
+        assert [(item.text, item.object_index) for item in result.spans] == [("ال", 1), ("لا", 0)]
+        assert result.stats == TextStats(char_count=4, generated_count=0, ownerless_count=1, unicode_map_error_count=0)
+
+    def test_english_hebrew_english_keeps_every_word(self, tmp_path):
+        result = page_text(open_document(rtl_page(tmp_path, ENGLISH_HEBREW_ENGLISH)), 0)
+
+        # pdfium generates the space before the Hebrew word and inserts an ownerless one after it.
+        assert [(item.text, item.object_index) for item in result.spans] == [("AB", 0), ("אב", 1), ("CD", 2)]
+        assert result.stats == TextStats(char_count=6, generated_count=1, ownerless_count=1, unicode_map_error_count=0)
+
+    def test_a_char_without_an_owner_is_counted_and_never_fails_the_page(self, tmp_path, monkeypatch):
+        handle = open_document(one_page(tmp_path, TextRun("Hi", x=72.0, y=100.0)))
+        monkeypatch.setattr(pdfium_c, "FPDFText_GetTextObject", failing(None))
+
+        result = page_text(handle, 0)
+
+        empty = TextStats(char_count=0, generated_count=0, ownerless_count=2, unicode_map_error_count=0)
+        assert result == PageText(spans=(), stats=empty)
+
+    def test_an_ownerless_char_inside_a_span_is_a_generated_break(self, tmp_path, monkeypatch):
+        # Not seen in a real PDF (pdfium's ownerless spaces fall between
+        # objects), so injected: an ownerless char is one pdfium inserted.
+        handle = open_document(one_page(tmp_path, TextRun("ABC", x=72.0, y=100.0)))
+        real = pdfium_c.FPDFText_GetTextObject
+        monkeypatch.setattr(
+            pdfium_c, "FPDFText_GetTextObject", lambda page, index: None if index == 1 else real(page, index)
+        )
+
+        result = page_text(handle, 0)
+
+        assert [(item.text, item.generated_breaks) for item in result.spans] == [("AC", (1,))]
+        assert result.stats.ownerless_count == 1
 
 
 def nested_forms_page(tmp_path: Path, depth: int) -> Path:
@@ -644,22 +954,24 @@ class TestNestedText:
         assert [item.object_index for item in got] == [2 * level + 1 for level in range(40)]
 
 
-def textpage_chars(path: Path) -> tuple[str, int, int]:
-    """Page 1's non-generated textpage chars, read straight from pdfium.
+def textpage_chars(path: Path) -> tuple[str, int, int, int]:
+    """Page 1's owned, non-generated textpage chars, read straight from pdfium.
 
     Returns the chars (surrogate pairs joined by Python's UTF-16 codec, an
-    oracle independent of the engine's pairing), their textpage count, and
-    the generated count.
+    oracle independent of the engine's pairing), their textpage count, the
+    generated count, and the count of non-generated chars with no owner.
     """
     textpage = pdfium.PdfDocument(path)[0].get_textpage()
-    units, generated = [], 0
+    units, generated, ownerless = [], 0, 0
     for index in range(textpage.count_chars()):
         if pdfium_c.FPDFText_IsGenerated(textpage, index):
             generated += 1
-            continue
-        units.append(chr(pdfium_c.FPDFText_GetUnicode(textpage, index)))
+        elif not pdfium_c.FPDFText_GetTextObject(textpage, index):
+            ownerless += 1
+        else:
+            units.append(chr(pdfium_c.FPDFText_GetUnicode(textpage, index)))
     chars = "".join(units).encode("utf-16-le", "surrogatepass").decode("utf-16-le", "surrogatepass")
-    return chars, len(units), generated
+    return chars, len(units), generated, ownerless
 
 
 def busy_page(tmp_path: Path) -> Path:
@@ -683,28 +995,100 @@ CONSERVATION_PAGES = [
     pytest.param(lambda tmp_path: cid_page(tmp_path, b"000200010003000500040002"), id="cid"),
     pytest.param(lambda tmp_path: nested_forms_page(tmp_path, 45), id="nested-forms"),
     pytest.param(lambda tmp_path: content_page(tmp_path, b"BT /F1 12 Tf 72 250 Td [(A) -2000 (B)] TJ ET"), id="kerned"),
+    pytest.param(lambda tmp_path: rtl_page(tmp_path, HEBREW_TWO_WORDS), id="hebrew"),
+    pytest.param(lambda tmp_path: rtl_page(tmp_path, ARABIC_TWO_WORDS), id="arabic"),
+    pytest.param(lambda tmp_path: rtl_page(tmp_path, ENGLISH_HEBREW_ENGLISH), id="english-hebrew-english"),
 ]
 
 
 class TestConservation:
-    """Spans hold exactly the textpage's non-generated chars, in textpage order."""
+    """Spans hold exactly the textpage's owned, non-generated chars, in textpage order."""
 
     @pytest.mark.parametrize("make_page", CONSERVATION_PAGES)
     def test_span_chars_are_the_textpage_chars(self, tmp_path, make_page):
         path = make_page(tmp_path)
-        chars, char_count, generated = textpage_chars(path)
+        chars, char_count, generated, ownerless = textpage_chars(path)
 
         result = page_text(open_document(path), 0)
 
-        span_chars = "".join(item.text for item in result.spans)
-        assert Counter(c for c in span_chars if not c.isspace()) == Counter(c for c in chars if not c.isspace())
-        assert span_chars == chars
-        assert (result.stats.char_count, result.stats.generated_count) == (char_count, generated)
+        assert "".join(item.text for item in result.spans) == chars
+        counts = (result.stats.char_count, result.stats.generated_count, result.stats.ownerless_count)
+        assert counts == (char_count, generated, ownerless)
 
     def test_an_empty_page_has_no_spans(self, tmp_path):
         result = page_text(open_document(one_page(tmp_path)), 0)
 
-        assert result == PageText(spans=(), stats=TextStats(char_count=0, generated_count=0, unicode_map_error_count=0))
+        assert result == PageText(
+            spans=(), stats=TextStats(char_count=0, generated_count=0, ownerless_count=0, unicode_map_error_count=0)
+        )
+
+
+def mixed_pages_pdf(tmp_path: Path) -> Path:
+    """A hand-written 3-page PDF: Hebrew in a CID font, a substituted alias font with TJ gaps, English-Hebrew-English.
+
+    Every page shares one resource dict: /F1 the RTL CID font, /F2 the
+    non-embedded alias Arial,BoldItalic, /F3 Helvetica. Page 2 is /Rotate 90.
+    """
+    contents = (
+        HEBREW_TWO_WORDS,
+        b"BT /F2 14 Tf 20 250 Td [(Name) -12000 (Value)] TJ ET BT /F3 9 Tf 20 200 Td (Plain) Tj ET",
+        ENGLISH_HEBREW_ENGLISH,
+    )
+    page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Contents %d 0 R /Resources 9 0 R%s >>"
+    descendant = (
+        b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /TestCID /FontDescriptor 15 0 R /DW 600"
+        b" /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> >>"
+    )
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>",
+        *(page % (6 + index, b" /Rotate 90" if index == 1 else b"") for index in range(3)),
+        *(b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content) for content in contents),
+        b"<< /Font << /F1 10 0 R /F2 13 0 R /F3 14 0 R >> >>",
+        b"<< /Type /Font /Subtype /Type0 /BaseFont /TestCID /Encoding /Identity-H /DescendantFonts [11 0 R]"
+        b" /ToUnicode 12 0 R >>",
+        descendant,
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(RTL_TO_UNICODE), RTL_TO_UNICODE),
+        b"<< /Type /Font /Subtype /TrueType /BaseFont /Arial,BoldItalic >>",
+        HELVETICA,
+        CID_DESCRIPTOR,
+    ]
+    return hand_written_pdf(tmp_path / "mixed.pdf", objects)
+
+
+# Pickles page_text of every page of argv[1], read in argv[2] order
+# ("forward" or "reversed"), as one list in page order.
+PAGE_TEXTS_SCRIPT = """
+import pickle, sys
+from datagrunt.pdf.pdfium_engine import open_document, page_text
+handle = open_document(sys.argv[1])
+order = range(handle.page_count)
+results = {index: page_text(handle, index) for index in (reversed(order) if sys.argv[2] == "reversed" else order)}
+sys.stdout.buffer.write(pickle.dumps([results[index] for index in order]))
+"""
+
+
+def page_texts_in_a_fresh_process(path: Path, order: str) -> bytes:
+    """The pickled page_text of every page of ``path``, computed in a new interpreter."""
+    done = subprocess.run(
+        [sys.executable, "-c", PAGE_TEXTS_SCRIPT, str(path), order], capture_output=True, check=True, timeout=120
+    )
+    return done.stdout
+
+
+class TestDeterminism:
+    """page_text is a pure function of the PDF: no run, process or page order changes it (#389)."""
+
+    def test_fresh_processes_and_page_order_give_identical_pickles(self, tmp_path):
+        path = mixed_pages_pdf(tmp_path)
+
+        first, second = (page_texts_in_a_fresh_process(path, "forward") for _ in range(2))
+        backwards = page_texts_in_a_fresh_process(path, "reversed")
+
+        assert first == second == backwards
+        texts = [[item.text for item in page.spans] for page in pickle.loads(first)]
+        # pdfium reads the /Rotate 90 page in displayed order: "Plain" is left of "NameValue".
+        assert texts == [["אב", "אבג"], ["Plain", "NameValue"], ["AB", "אב", "CD"]]
 
 
 @pytest.fixture
@@ -752,12 +1136,11 @@ PDFIUM_FAILURES = [
     ("FPDFText_CountChars", failing(-1), "page 1: pdfium cannot count the text page's chars"),
     ("FPDFText_IsGenerated", failing(-1), "page 1: pdfium cannot read whether char 0 is generated"),
     ("FPDFText_HasUnicodeMapError", failing(-1), "page 1: pdfium cannot read whether char 0 maps to Unicode"),
-    ("FPDFText_GetTextObject", failing(None), "page 1: pdfium cannot read the text object of char 0"),
-    ("FPDFText_GetUnicode", failing(0x110000), "page 1: pdfium cannot read char 0: code 0x110000 is beyond Unicode"),
     ("FPDFText_GetLooseCharBox", failing(0), "page 1: pdfium cannot read the box of char 0"),
     ("FPDFText_GetLooseCharBox", writes_inf_box, "page 1: pdfium cannot read the box of char 0: it is not finite"),
     ("FPDFText_GetMatrix", failing(0), "page 1: pdfium cannot read the matrix of char 0"),
     ("FPDFTextObj_GetFont", failing(None), "page 1: pdfium cannot read the font of object 0"),
+    ("FPDFFont_GetFlags", failing(-1), "page 1: pdfium cannot read the font flags of object 0"),
     ("FPDFFont_GetBaseFontName", failing(0), "page 1: pdfium cannot read the font name of object 0"),
     (
         "FPDFFont_GetBaseFontName",
