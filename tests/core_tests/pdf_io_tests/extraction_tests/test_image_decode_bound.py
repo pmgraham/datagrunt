@@ -135,6 +135,177 @@ def smask_bomb_pdf(path: Path) -> Path:
     return hand_written_pdf(path, objects)
 
 
+def _bomb_image_obj() -> bytes:
+    return b"<< /Type /XObject /Subtype /Image %s /Length %d >>\nstream\n%s\nendstream" % (
+        BOMB_ENTRIES,
+        len(JPX_RSS_BOMB),
+        JPX_RSS_BOMB,
+    )
+
+
+def annotation_ap_bomb_pdf(path: Path) -> Path:
+    """A page with an empty content stream whose annotation appearance draws a JPX bomb."""
+    appearance = b"q 100 0 0 100 0 0 cm /Im0 Do Q"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Contents 4 0 R /Annots [5 0 R] >>",
+        b"<< /Length 0 >>\nstream\n\nendstream",
+        b"<< /Type /Annot /Subtype /Stamp /Rect [50 50 150 150] /AP << /N 6 0 R >> >>",
+        b"<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] "
+        b"/Resources << /XObject << /Im0 7 0 R >> >> /Length %d >>\nstream\n%s\nendstream"
+        % (len(appearance), appearance),
+        _bomb_image_obj(),
+    ]
+    return hand_written_pdf(path, objects)
+
+
+def tiling_pattern_bomb_pdf(path: Path) -> Path:
+    """A page filled with a tiling pattern whose cell draws a JPX bomb."""
+    content = b"q /Pattern cs /P0 scn 0 0 612 792 re f Q"
+    cell = b"q 100 0 0 100 0 0 cm /Im0 Do Q"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Pattern << /P0 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        b"<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 100 100] "
+        b"/XStep 100 /YStep 100 /Resources << /XObject << /Im0 6 0 R >> >> /Length %d >>\nstream\n%s\nendstream"
+        % (len(cell), cell),
+        _bomb_image_obj(),
+    ]
+    return hand_written_pdf(path, objects)
+
+
+def deep_form_bomb_pdf(path: Path, depth: int = 70) -> Path:
+    """A page whose image is nested ``depth`` Form XObjects deep."""
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /XObject << /Fm0 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length 8 >>\nstream\n/Fm0 Do\nendstream",
+    ]
+    for i in range(depth):
+        n = len(objects) + 1
+        last = i == depth - 1
+        body = b"q 200 0 0 200 50 50 cm /Im0 Do Q" if last else b"/Fm0 Do"
+        member = n + 1
+        res = (b"/XObject << /Im0 %d 0 R >>" % member) if last else (b"/XObject << /Fm0 %d 0 R >>" % member)
+        objects.append(
+            b"<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << %s >> /Length %d >>"
+            b"\nstream\n%s\nendstream" % (res, len(body), body)
+        )
+    objects.append(_bomb_image_obj())
+    return hand_written_pdf(path, objects)
+
+
+def _type3_pdf(path: Path, glyph: bytes) -> Path:
+    """A one-page PDF drawing a Type3 font character whose glyph procedure is ``glyph``."""
+    content = b"BT /F0 100 Tf 100 100 Td (A) Tj ET"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 100 100] /FontMatrix [0.01 0 0 0.01 0 0] "
+        b"/CharProcs << /ch 6 0 R >> /Encoding << /Differences [65 /ch] >> "
+        b"/FirstChar 65 /LastChar 65 /Widths [100] >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(glyph), glyph),
+    ]
+    return hand_written_pdf(path, objects)
+
+
+def type3_inline_bomb_pdf(path: Path) -> Path:
+    """A Type3 glyph procedure carrying an inline (BI/ID/EI) JPEG 2000 bomb."""
+    assert b"EI" not in JPX_RSS_BOMB
+    glyph = b"d0 100 0 q 100 0 0 100 0 0 cm BI /W 16 /H 16 /CS /G /BPC 8 /F /JPXDecode ID " + JPX_RSS_BOMB + b"\nEI Q"
+    return _type3_pdf(path, glyph)
+
+
+def inline_in_pattern_bomb_pdf(path: Path) -> Path:
+    """A page whose tiling pattern's cell content carries an inline JPEG 2000 bomb."""
+    assert b"EI" not in JPX_RSS_BOMB
+    page_content = b"q /Pattern cs /P0 scn 0 0 612 792 re f Q"
+    cell = b"q 100 0 0 100 0 0 cm BI /W 16 /H 16 /CS /G /BPC 8 /F /JPXDecode ID " + JPX_RSS_BOMB + b"\nEI Q"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Pattern << /P0 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(page_content), page_content),
+        b"<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 100 100] "
+        b"/XStep 100 /YStep 100 /Resources << >> /Length %d >>\nstream\n%s\nendstream" % (len(cell), cell),
+    ]
+    return hand_written_pdf(path, objects)
+
+
+def inline_bomb_pdf(path: Path) -> Path:
+    """A page whose content stream carries an inline (BI/ID/EI) JPEG 2000 bomb."""
+    assert b"EI" not in JPX_RSS_BOMB
+    content = b"q 100 0 0 100 50 50 cm BI /W 16 /H 16 /CS /G /BPC 8 /F /JPXDecode ID " + JPX_RSS_BOMB + b"\nEI Q"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+    ]
+    return hand_written_pdf(path, objects)
+
+
+# Builders for a JPX-bomb reachable only through a given container; each must
+# make every render of the document skip (document-wide guard).
+BOMB_CONTAINERS = {
+    "smask": smask_bomb_pdf,
+    "annotation": annotation_ap_bomb_pdf,
+    "pattern": tiling_pattern_bomb_pdf,
+    "deep70": deep_form_bomb_pdf,
+    "inline": inline_bomb_pdf,
+    "inline_pattern": inline_in_pattern_bomb_pdf,
+    "type3_inline": type3_inline_bomb_pdf,
+}
+
+
+def normal_rich_pdf(path: Path) -> Path:
+    """A page with a legitimate image + small /SMask, an annotation image, and a tiling pattern image.
+
+    Every image is small and valid, so the document renders normally (no false
+    positive from the document-wide guard).
+    """
+    import zlib
+
+    base = zlib.compress(b"\x80" * 64 * 64)
+    mask = zlib.compress(b"\xff" * 64 * 64)
+    small_jpx = NORMAL_JPX
+    appearance = b"q 40 0 0 40 0 0 cm /Ia Do Q"
+    cell = b"q 40 0 0 40 0 0 cm /Ip Do Q"
+    content = b"q 200 0 0 200 50 50 cm /Im0 Do Q /Pattern cs /P0 scn 0 400 200 200 re f"
+    gray = b"/Width 64 /Height 64 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /XObject << /Im0 5 0 R >> /Pattern << /P0 8 0 R >> >> "
+        b"/Contents 4 0 R /Annots [10 0 R] >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        b"<< /Type /XObject /Subtype /Image %s /SMask 6 0 R /Length %d >>\nstream\n%s\nendstream"
+        % (gray, len(base), base),
+        b"<< /Type /XObject /Subtype /Image %s /Length %d >>\nstream\n%s\nendstream" % (gray, len(mask), mask),
+        b"<< /Type /XObject /Subtype /Image %s /Length %d >>\nstream\n%s\nendstream"
+        % (gray_entries(48, 48, b"/JPXDecode"), len(small_jpx), small_jpx),  # obj 7: small JPX in the pattern
+        b"<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 40 40] "
+        b"/XStep 40 /YStep 40 /Resources << /XObject << /Ip 7 0 R >> >> /Length %d >>\nstream\n%s\nendstream"
+        % (len(cell), cell),
+        b"<< /Type /XObject /Subtype /Form /BBox [0 0 40 40] "
+        b"/Resources << /XObject << /Ia 7 0 R >> >> /Length %d >>\nstream\n%s\nendstream"
+        % (len(appearance), appearance),
+        b"<< /Type /Annot /Subtype /Stamp /Rect [400 50 440 90] /AP << /N 9 0 R >> >>",
+    ]
+    return hand_written_pdf(path, objects)
+
+
 # ---------------------------------------------------------------------------
 # Skip-with-warning, no decode: caps patched small, a spy on decode entry points.
 # ---------------------------------------------------------------------------
@@ -248,19 +419,55 @@ def test_a_jbig2_page_size_bomb_is_skipped(tmp_path, engine, tiny_cap, no_decode
     )
     document = PDFReader(path, engine=engine).to_dicts()
 
-    assert any("JBIG2 page" in w for w in _warnings_of(document))
+    assert any("JBIG2" in w for w in _warnings_of(document))
     assert no_decode == []
 
 
-def test_pymupdf_render_skips_a_jpx_soft_mask_bomb(tmp_path, no_decode):
-    # A good base image with a JPEG 2000 bomb /SMask: a pymupdf page render
-    # decodes the mask at its codestream size. The render gate must skip it.
-    path = smask_bomb_pdf(tmp_path / "smask.pdf")
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("container", sorted(BOMB_CONTAINERS))
+def test_render_skips_a_bomb_reachable_through_any_container(tmp_path, engine, container, no_decode):
+    # The bomb is reachable only via a soft mask, an annotation appearance, a
+    # tiling pattern, 70 nested forms, or an inline image. A render decodes it
+    # however it is drawn, so the document-wide gate must skip every render.
+    path = BOMB_CONTAINERS[container](tmp_path / f"{container}.pdf")
     out = tmp_path / "pages"
-    paths = PDFWriter(path, engine="pymupdf").render_pages_as_images(str(out), dpi=72)
+    paths = PDFWriter(path, engine=engine).render_pages_as_images(str(out), dpi=72)
 
-    assert paths == []
+    assert paths == [], f"{engine}/{container}: a page drawing a bomb must not be rendered"
     assert no_decode == []
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_ocr_path_skips_a_bomb_on_a_scanned_page(tmp_path, engine, no_decode):
+    # A scanned page (no text, its own image) whose image is a JPX bomb: the
+    # OCR route would render it. The document-wide gate stops the render.
+    path = image_page_pdf(tmp_path / "scan.pdf", JPX_RSS_BOMB, BOMB_ENTRIES)
+    document = PDFReader(path, engine=engine).to_dicts()
+
+    assert any("OCR skipped" in w or "JPEG 2000" in w for w in _warnings_of(document))
+    assert no_decode == []
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_normal_rich_document_still_renders(tmp_path, engine):
+    # Legitimate base image + small /SMask + annotation image + tiling-pattern
+    # image: no false positive, the document renders.
+    path = normal_rich_pdf(tmp_path / "rich.pdf")
+    out = tmp_path / "pages"
+    paths = PDFWriter(path, engine=engine).render_pages_as_images(str(out), dpi=72)
+
+    assert len(paths) == 1, f"{engine}: a normal rich document must still render"
+    assert Path(paths[0]).exists()
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_normal_type3_document_still_renders(tmp_path, engine):
+    # A Type3 glyph that draws vector art (no bomb) must not block the render.
+    path = _type3_pdf(tmp_path / "t3.pdf", b"d0 100 0 10 10 80 80 re f")
+    out = tmp_path / "pages"
+    paths = PDFWriter(path, engine=engine).render_pages_as_images(str(out), dpi=72)
+
+    assert len(paths) == 1, f"{engine}: a normal Type3 document must still render"
 
 
 def test_a_jpx_behind_asciihex_is_still_guarded(tmp_path, tiny_cap, no_decode):
@@ -353,3 +560,13 @@ def test_peak_rss_stays_bounded(tmp_path, engine, op):
     path = image_page_pdf(tmp_path / "rss.pdf", JPX_RSS_BOMB, BOMB_ENTRIES)
     peak = _run_peak(path, engine, op)
     assert peak < _RSS_BOUND_MIB, f"{engine}/{op} peaked at {peak} MiB (bound {_RSS_BOUND_MIB})"
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("container", sorted(BOMB_CONTAINERS))
+def test_peak_rss_bounded_rendering_any_container(tmp_path, engine, container):
+    # Rendering a document whose bomb is reachable only through a soft mask,
+    # annotation, pattern, deep nesting or inline image stays bounded.
+    path = BOMB_CONTAINERS[container](tmp_path / f"{container}.pdf")
+    peak = _run_peak(path, engine, "render")
+    assert peak < _RSS_BOUND_MIB, f"{engine}/{container} render peaked at {peak} MiB (bound {_RSS_BOUND_MIB})"

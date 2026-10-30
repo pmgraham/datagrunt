@@ -14,6 +14,7 @@ import pytest
 from PIL import Image
 
 from datagrunt.core.pdf_io.extraction.image_guard import (
+    _JBIG2_REGION_TYPES,
     _MAX_DECODED_PIXELS,
     _MAX_JPX_COMPONENTS,
     _MAX_JPX_TILES,
@@ -21,6 +22,12 @@ from datagrunt.core.pdf_io.extraction.image_guard import (
     jbig2_page_size,
     normalize_filter,
 )
+
+
+def jbig2_region(number: int, segment_type: int, width: int, height: int, page: int = 1) -> bytes:
+    """A JBIG2 region segment whose 17-byte region-information field declares ``width`` x ``height``."""
+    region_info = struct.pack(">IIIIB", width, height, 0, 0, 0)
+    return jbig2_segment(number, segment_type, region_info, page=page)
 
 
 def j2k(size=(16, 16), *, siz=None, tile=None, jp2=False, mode="L") -> bytes:
@@ -167,7 +174,7 @@ class TestJbig2:
     def test_a_page_info_size_bomb_is_skipped(self):
         decision = inspect_image(jbig2_stream(40000, 40000), ["JBIG2Decode"])
         assert decision.skip is True
-        assert "JBIG2 page" in decision.reason
+        assert "JBIG2" in decision.reason
 
     def test_an_unknown_height_is_skipped(self):
         decision = inspect_image(jbig2_stream(16, 0xFFFFFFFF), ["JBIG2Decode"])
@@ -177,3 +184,42 @@ class TestJbig2:
         only_end = jbig2_segment(0, 49, b"")
         assert jbig2_page_size(only_end) is None
         assert inspect_image(only_end, ["JBIG2Decode"]).skip is True
+
+
+class TestJbig2Segments:
+    """Every region segment (and page-info) is bounded, not only the page-information segment."""
+
+    SMALL_PAGE = jbig2_segment(0, 48, struct.pack(">IIIIBH", 16, 16, 0, 0, 0, 0))
+
+    def test_the_region_types_bounded(self):
+        assert _JBIG2_REGION_TYPES == frozenset({4, 6, 7, 20, 22, 23, 36, 38, 39, 40, 42, 43})
+
+    @pytest.mark.parametrize("region_type", sorted({4, 6, 7, 20, 22, 23, 36, 38, 39, 40, 42, 43}))
+    def test_a_region_segment_bomb_is_skipped(self, region_type):
+        stream = self.SMALL_PAGE + jbig2_region(1, region_type, 40000, 40000) + jbig2_segment(2, 49, b"")
+        decision = inspect_image(stream, ["JBIG2Decode"])
+        assert decision.skip is True
+        assert "JBIG2" in decision.reason
+
+    def test_a_small_region_with_a_small_page_is_safe(self):
+        stream = self.SMALL_PAGE + jbig2_region(1, 38, 32, 32) + jbig2_segment(2, 49, b"")
+        assert inspect_image(stream, ["JBIG2Decode"]).skip is False
+
+    def test_a_region_in_the_globals_stream_is_bounded(self):
+        globals_stream = jbig2_region(0, 38, 40000, 40000)
+        decision = inspect_image(self.SMALL_PAGE, ["JBIG2Decode"], jbig2_globals=globals_stream)
+        assert decision.skip is True
+
+    def test_missing_globals_fails_closed(self):
+        decision = inspect_image(self.SMALL_PAGE, ["JBIG2Decode"], jbig2_globals_missing=True)
+        assert decision.skip is True
+        assert "globals" in decision.reason.lower()
+
+    def test_a_truncated_segment_header_fails_closed(self):
+        decision = inspect_image(self.SMALL_PAGE + b"\x00\x00\x00\x09", ["JBIG2Decode"])
+        assert decision.skip is True
+
+    def test_a_page_info_for_another_page_fails_closed(self):
+        page2 = jbig2_segment(0, 48, struct.pack(">IIIIBH", 16, 16, 0, 0, 0, 0), page=2)
+        decision = inspect_image(page2, ["JBIG2Decode"])
+        assert decision.skip is True

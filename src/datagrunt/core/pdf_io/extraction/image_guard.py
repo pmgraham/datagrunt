@@ -49,11 +49,19 @@ _MAX_JPX_TILES = 4096
 # is skipped (unsized). Bounds a hostile length from forcing a huge copy.
 _MAX_RAW_HEADER_BYTES = _MAX_ASSET_BYTES
 
-# JBIG2 segment walk: a page's embedded stream holds a handful of segments
-# before its page-information segment; past this the data is refused.
+# JBIG2 segment walk: an embedded stream holds a bounded run of segments; past
+# this the data is refused (fail closed).
 _MAX_JBIG2_SEGMENTS = 4096
 _JBIG2_PAGE_INFO = 48  # the page-information segment type (ISO/IEC 14492 7.4.8)
-# A JBIG2 page height of 0xFFFFFFFF means "unknown" (striped); it is unsized.
+# Region segments carry a 17-byte region-information field (width x height x
+# location x flags) at the start of their data: immediate generic/text/halftone/
+# refinement regions and their "intermediate" forms (ISO/IEC 14492 7.4.1).
+_JBIG2_REGION_TYPES = frozenset({4, 6, 7, 20, 22, 23, 36, 38, 39, 40, 42, 43})
+# Segments that start with a bitmap width x height (region info / page info).
+_JBIG2_SIZED_TYPES = _JBIG2_REGION_TYPES | {_JBIG2_PAGE_INFO}
+# In a PDF-embedded JBIG2 stream the (single) page is page 1.
+_JBIG2_EMBEDDED_PAGE = 1
+# A JBIG2 dimension of 0xFFFFFFFF means "unknown" (striped); it is unsized.
 _JBIG2_UNKNOWN = 0xFFFFFFFF
 
 # Filter names, normalised, that do not decode an image to a raster bigger than
@@ -115,6 +123,8 @@ def inspect_image(
     raw_stream: bytes | None,
     filters,
     label: str = "an image",
+    jbig2_globals: bytes | None = None,
+    jbig2_globals_missing: bool = False,
 ) -> GuardDecision:
     """Decide whether an image is safe for an engine to decode, from its raw bytes and filters.
 
@@ -124,11 +134,17 @@ def inspect_image(
             is skipped (unsized).
         filters: The image's filter names in decoding order (each a str).
         label: A human-readable name for the image, used in the warning.
+        jbig2_globals: For a JBIG2 image, the ``/DecodeParms /JBIG2Globals``
+            stream bytes (segments shared across images), or None when there is
+            no globals stream.
+        jbig2_globals_missing: True when a JBIG2 image references a globals
+            stream that could not be read; the image is then skipped (fail
+            closed), since its segments cannot be bounded.
 
     Fails closed: safe only when the last filter is a recognised non-image
-    filter or a bounded header-read codec (JPX via SIZ, JBIG2 via its
-    page-information segment), every earlier filter is a recognised non-image
-    filter, and no readable header puts the decode over a bound.
+    filter or a bounded header-read codec (JPX via SIZ, JBIG2 via its region
+    and page-information segments), every earlier filter is a recognised
+    non-image filter, and no readable header puts the decode over a bound.
     """
     names = [normalize_filter(str(f)) for f in filters]
     codec = names[-1] if names else ""
@@ -150,7 +166,7 @@ def inspect_image(
     if codec == "JPXDecode":
         return _inspect_jpx(raw_stream, wrappers, label)
     if codec == "JBIG2Decode":
-        return _inspect_jbig2(raw_stream, wrappers, label)
+        return _inspect_jbig2(raw_stream, wrappers, label, jbig2_globals, jbig2_globals_missing)
     if codec in _NON_IMAGE_FILTERS:
         # Simple filter or DCT as the image codec: bounded by the declared
         # size; v4 behaviour is unchanged (no decode beyond the declared size).
@@ -211,13 +227,21 @@ def _inspect_jpx(raw_stream: bytes | None, wrappers, label: str) -> GuardDecisio
     return _SAFE
 
 
-def _inspect_jbig2(raw_stream: bytes | None, wrappers, label: str) -> GuardDecision:
-    """Guard a JBIG2 image by the width x height of its page-information segment.
+def _inspect_jbig2(
+    raw_stream: bytes | None,
+    wrappers,
+    label: str,
+    globals_data: bytes | None,
+    globals_missing: bool,
+) -> GuardDecision:
+    """Guard a JBIG2 image by the width x height of EVERY region and page-info segment.
 
-    MuPDF decodes a JBIG2 image at the size its page-information segment gives,
-    ignoring the declared /Width /Height. A bounded reader of that segment
-    (1 bit per pixel) lets small, legitimate JBIG2 scans through while bounding
-    a bomb; an unreadable or unknown size is skipped (fail closed).
+    MuPDF decodes a JBIG2 image at the sizes its segments give, ignoring the
+    declared /Width /Height. A bounded walk of the globals stream (shared
+    segments) and the image stream reads each region/page bitmap size; the
+    largest, at 1 bit per pixel, is checked against the pixel cap. A referenced
+    but unreadable globals stream, a malformed/truncated header, a page-info
+    segment for another page, or an unknown size, is skipped (fail closed).
     """
     data = _usable_stream(raw_stream, label)
     if isinstance(data, GuardDecision):
@@ -226,35 +250,84 @@ def _inspect_jbig2(raw_stream: bytes | None, wrappers, label: str) -> GuardDecis
         # A JBIG2 stream behind any other filter: its segments cannot be read
         # here without a decode. Skip it.
         return GuardDecision(True, f"{label}: JBIG2 behind {', '.join(wrappers)}; size unreadable, skipped")
-    size = jbig2_page_size(data)
-    if size is None:
-        return GuardDecision(True, f"{label}: JBIG2 page size cannot be read; skipped (not decoded)")
-    width, height = size
-    pixels = width * height
-    if pixels > _MAX_DECODED_PIXELS:
+    if globals_missing:
+        return GuardDecision(True, f"{label}: JBIG2 globals stream cannot be read; skipped (not decoded)")
+
+    saw_page = False
+    max_pixels = 0
+    for source in (globals_data, data):
+        if source is None:
+            continue
+        result = _jbig2_segment_pixels(source)
+        if result is None:
+            return GuardDecision(True, f"{label}: JBIG2 segments cannot be read; skipped (not decoded)")
+        pixels, had_page = result
+        max_pixels = max(max_pixels, pixels)
+        saw_page = saw_page or had_page
+
+    if not saw_page:
+        # Every embedded JBIG2 image has a page-information segment; its absence
+        # means the stream could not be parsed as expected.
+        return GuardDecision(True, f"{label}: JBIG2 has no readable page-information segment; skipped")
+    if max_pixels > _MAX_DECODED_PIXELS:
         return GuardDecision(
             True,
-            f"{label}: JBIG2 page is {width} x {height} = {pixels} pixels, "
-            f"over the {_MAX_DECODED_PIXELS}-pixel bound; skipped",
+            f"{label}: JBIG2 decodes to {max_pixels} pixels, over the {_MAX_DECODED_PIXELS}-pixel bound; skipped",
         )
     return _SAFE
+
+
+def _jbig2_segment_pixels(data: bytes) -> tuple[int, bool] | None:
+    """Walk a JBIG2 segment sequence; return ``(max_region_or_page_pixels, saw_page_info)``.
+
+    Returns None (fail closed) on a malformed/truncated header, a page-info
+    segment for a page other than the single embedded page, or an unknown
+    (0xFFFFFFFF) or zero dimension in a sized segment.
+    """
+    position = 0
+    max_pixels = 0
+    saw_page = False
+    for _ in range(_MAX_JBIG2_SEGMENTS):
+        if position >= len(data):
+            return max_pixels, saw_page
+        header = _jbig2_segment_header(data, position)
+        if header is None:
+            return None
+        segment_type, page_assoc, data_start, data_length, next_position = header
+        if segment_type in _JBIG2_SIZED_TYPES:
+            if data_start + 8 > len(data):
+                return None
+            width = int.from_bytes(data[data_start : data_start + 4], "big")
+            height = int.from_bytes(data[data_start + 4 : data_start + 8], "big")
+            if width == 0 or height == 0 or _JBIG2_UNKNOWN in (width, height):
+                return None
+            if segment_type == _JBIG2_PAGE_INFO:
+                if page_assoc != _JBIG2_EMBEDDED_PAGE:
+                    return None
+                saw_page = True
+            max_pixels = max(max_pixels, width * height)
+        if data_length == _JBIG2_UNKNOWN:
+            # An unknown-length segment can only be the last one; we cannot
+            # skip past it to reach any later segment.
+            return (max_pixels, saw_page) if saw_page else None
+        position = next_position
+    return None
 
 
 def jbig2_page_size(data: bytes) -> tuple[int, int] | None:
     """The width x height of a JBIG2 embedded stream's first page-information segment.
 
-    Walks the segment headers (ISO/IEC 14492 7.2, embedded/PDF organisation:
-    no file header, sequential segments) to the first page-information segment
-    (type 48) and reads its width and height. Returns None if the stream cannot
-    be read, has no such segment within the segment bound, or declares an
-    unknown height.
+    A thin reader kept for inspection/tests; the guard uses
+    :func:`_jbig2_segment_pixels` to bound every region as well. Returns None
+    if the stream cannot be read, has no page-information segment within the
+    segment bound, or declares an unknown dimension.
     """
     position = 0
     for _ in range(_MAX_JBIG2_SEGMENTS):
         header = _jbig2_segment_header(data, position)
         if header is None:
             return None
-        segment_type, data_start, data_length, next_position = header
+        segment_type, _page_assoc, data_start, data_length, next_position = header
         if segment_type == _JBIG2_PAGE_INFO:
             if data_start + 8 > len(data):
                 return None
@@ -264,19 +337,17 @@ def jbig2_page_size(data: bytes) -> tuple[int, int] | None:
                 return None
             return width, height
         if data_length == _JBIG2_UNKNOWN:
-            # An unknown-length segment can only be the last one; we cannot
-            # skip past it to find a later page-information segment.
             return None
         position = next_position
     return None
 
 
-def _jbig2_segment_header(data: bytes, position: int) -> tuple[int, int, int, int] | None:
+def _jbig2_segment_header(data: bytes, position: int) -> tuple[int, int, int, int, int] | None:
     """Parse one JBIG2 segment header at ``position``.
 
-    Returns ``(segment_type, data_start, data_length, next_position)`` or None
-    if the header runs past the data or is malformed. Every field is bounded by
-    the data length.
+    Returns ``(segment_type, page_association, data_start, data_length,
+    next_position)`` or None if the header runs past the data or is malformed.
+    Every field is bounded by the data length.
     """
     # Segment number (4) + header flags (1).
     if position + 5 > len(data):
@@ -312,7 +383,16 @@ def _jbig2_segment_header(data: bytes, position: int) -> tuple[int, int, int, in
     cursor += count * ref_size
 
     # Segment page association (1 or 4 bytes) + segment data length (4 bytes).
-    cursor += 4 if page_assoc_is_4 else 1
+    if page_assoc_is_4:
+        if cursor + 4 > len(data):
+            return None
+        page_assoc = int.from_bytes(data[cursor : cursor + 4], "big")
+        cursor += 4
+    else:
+        if cursor + 1 > len(data):
+            return None
+        page_assoc = data[cursor]
+        cursor += 1
     if cursor + 4 > len(data):
         return None
     data_length = int.from_bytes(data[cursor : cursor + 4], "big")
@@ -320,4 +400,4 @@ def _jbig2_segment_header(data: bytes, position: int) -> tuple[int, int, int, in
     if data_length != _JBIG2_UNKNOWN and data_start + data_length > len(data):
         return None
     next_position = data_start + data_length if data_length != _JBIG2_UNKNOWN else len(data)
-    return segment_type, data_start, data_length, next_position
+    return segment_type, page_assoc, data_start, data_length, next_position

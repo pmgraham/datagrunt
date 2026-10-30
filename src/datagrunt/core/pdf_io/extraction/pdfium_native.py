@@ -27,6 +27,17 @@ class PdfiumNativeReader(_ThreadLocalDocSession):
 
         self._local = threading.local()
         self._config = extraction_config or _PDFExtractionConfig()
+        self._render_block_cached: str | None = None
+        self._render_block_done = False
+
+    def _render_block_reason(self) -> str | None:
+        """Document-wide reason this PDF must not be rendered (None if safe), computed once."""
+        if not self._render_block_done:
+            from datagrunt.core.pdf_io.extraction.render_guard import document_block_reason_for_path
+
+            self._render_block_cached = document_block_reason_for_path(self.filepath)
+            self._render_block_done = True
+        return self._render_block_cached
 
     def _open_resource(self):
         return PdfiumDocument(self.filepath)
@@ -52,11 +63,12 @@ class PdfiumNativeReader(_ThreadLocalDocSession):
                 ]
                 ocr_used = False
                 if not full_text.strip():
-                    if warnings:
-                        # A guarded image on this page; rendering it for OCR would
-                        # decode it at its codestream size. Skip OCR; the per-image
-                        # warnings already explain why.
-                        warnings.append(f"OCR skipped on page {page_index + 1}: an image was not decoded")
+                    block = self._render_block_reason()
+                    if block:
+                        # OCR renders the page, decoding every image it draws. If
+                        # any image anywhere in the document is a decode bomb
+                        # (render_guard, document-wide), do not render; record why.
+                        warnings.append(f"OCR skipped on page {page_index + 1}: {block}")
                     else:
                         try:
                             full_text, extra, ocr_used = self._ocr_fallback(page, width, height)
