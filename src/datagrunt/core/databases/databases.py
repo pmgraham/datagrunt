@@ -545,6 +545,12 @@ class DuckDBQueries:
 
         Args:
             normalize_columns (bool): Whether to normalize column names.
+
+        Returns:
+            duckdb.DuckDBPyRelation: A lazy ``SELECT *`` over the table. It runs
+            when consumed (``.pl()``, ``.arrow()``, ``.fetchall()``), so callers
+            that only need the table to exist pay no query. Not ``.execute()``d
+            here: DuckDB 2.0 removed ``DuckDBPyRelation.execute()`` (#377).
         """
         if not self._table_is_current(normalize_columns):
             if self.lenient:
@@ -554,7 +560,7 @@ class DuckDBQueries:
             else:
                 self.connection.sql(self.import_csv_query())
             self._imported_normalize_columns = normalize_columns
-        return self.connection.sql(self.select_from_duckdb_table()).execute()
+        return self.connection.sql(self.select_from_duckdb_table())
 
     def sample_dataframe(self, limit, normalize_columns=False):
         """Return the first ``limit`` rows of the CSV as a Polars DataFrame.

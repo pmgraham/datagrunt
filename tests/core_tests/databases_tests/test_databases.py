@@ -27,7 +27,7 @@ class TestDuckDBQueriesClose:
 
         # Usable before close; capture the live handle to verify disposal.
         live_handle = queries.connection
-        assert live_handle.sql("SELECT 1").fetchone() == (1,)
+        assert live_handle.sql("SELECT 1").fetchall() == [(1,)]
 
         queries.close()
 
@@ -64,7 +64,7 @@ class TestDuckDBQueriesLazyConnection:
         assert queries._connection is None
 
         # Accessing the public attribute opens it (backward-compatible usage).
-        assert queries.connection.sql("SELECT 1").fetchone() == (1,)
+        assert queries.connection.sql("SELECT 1").fetchall() == [(1,)]
         assert queries._connection is not None
 
     def test_close_allows_reopen(self, tmp_path):
@@ -78,12 +78,12 @@ class TestDuckDBQueriesLazyConnection:
         csv.write_text("col1,col2\n1,A\n")
         queries = DuckDBQueries(str(csv))
 
-        assert queries.connection.sql("SELECT 1").fetchone() == (1,)
+        assert queries.connection.sql("SELECT 1").fetchall() == [(1,)]
         queries.close()
         assert queries._connection is None
 
         # A fresh access reopens a working connection.
-        assert queries.connection.sql("SELECT 2").fetchone() == (2,)
+        assert queries.connection.sql("SELECT 2").fetchall() == [(2,)]
         queries.close()
 
 
@@ -147,6 +147,51 @@ class TestCreateTableIdempotent:
 
         relation = queries.create_table()
         assert relation.fetchall() == [("1", "A"), ("2", "B")]
+        queries.close()
+
+
+class _DuckDB2Relation:
+    """Relation proxy refusing the methods DuckDB 2.0 removed (#377).
+
+    Lets the suite catch reliance on them under any installed DuckDB, not only
+    when CI happens to resolve 2.0.
+    """
+
+    _REMOVED = frozenset({"execute", "fetchone", "fetchmany", "fetch_df_chunk"})
+
+    def __init__(self, relation):
+        self._relation = relation
+
+    def __getattr__(self, name):
+        if name in self._REMOVED:
+            raise AttributeError(f"DuckDB 2.0 removed DuckDBPyRelation.{name}()")
+        return getattr(self._relation, name)
+
+
+class _DuckDB2Connection:
+    """Connection proxy whose ``sql()`` relations behave like DuckDB 2.0's."""
+
+    def __init__(self, connection):
+        self._connection = connection
+
+    def sql(self, *args, **kwargs):
+        relation = self._connection.sql(*args, **kwargs)
+        return relation if relation is None else _DuckDB2Relation(relation)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
+class TestDuckDB2RelationAPI:
+    """create_table must not depend on relation methods DuckDB 2.0 removed (#377)."""
+
+    def test_create_table_avoids_removed_relation_methods(self, tmp_path):
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("id,name\n1,A\n2,B\n")
+        queries = DuckDBQueries(csv_file)
+        queries._connection = _DuckDB2Connection(duckdb.connect(":memory:"))
+
+        assert queries.create_table().fetchall() == [("1", "A"), ("2", "B")]
         queries.close()
 
 

@@ -177,3 +177,15 @@ disallow_untyped_defs = true
 [[tool.mypy.overrides]]
 module = ["pytesseract.*", "pypdfium2.*", "xlsxwriter.*", "pyarrow.*"]
 ignore_missing_imports = true
+
+# numpy is never imported by datagrunt; mypy only reaches it because polars
+# (py.typed) references numpy.typing. numpy >= 2.5 stubs use the PEP 695
+# `type` statement, which mypy rejects as a *syntax* error under
+# python_version = "3.10" — a blocking error that stops the whole-tree run
+# before any datagrunt module is checked (#374). Skipping numpy keeps the 3.10
+# target for our own code. follow_imports_for_stubs is required: without it
+# mypy ignores follow_imports = "skip" for .pyi files, and numpy ships .pyi.
+[[tool.mypy.overrides]]
+module = ["numpy", "numpy.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true
