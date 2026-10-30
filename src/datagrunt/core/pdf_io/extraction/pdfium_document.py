@@ -72,8 +72,19 @@ class PdfiumPage:
         self._page.close()
 
     def size(self) -> tuple:
-        """Return ``(width, height)`` in points."""
+        """Return the visible box's rotation-aware ``(width, height)`` in points."""
         return self._page.get_size()
+
+    def _visible_box(self) -> tuple:
+        """Return the visible box ``(left, bottom, right, top)`` in PDF user space.
+
+        This is pdfium's page bounding box: the CropBox intersected with the
+        MediaBox, both inherited from the page tree. It is the region the page
+        renders and the frame ``size()`` measures. pypdfium2's
+        ``get_mediabox()`` / ``get_cropbox()`` read only the page's own
+        dictionary, so they miss inherited boxes.
+        """
+        return self._page.get_bbox()
 
     def rotation(self) -> int:
         """Return the page rotation in degrees."""
@@ -93,46 +104,47 @@ class PdfiumPage:
         return buf.raw[: n * 2].decode("utf-16-le").rstrip("\x00").strip()
 
     @staticmethod
-    def _display_edges(left, bottom, right, top, rotation, disp_w, disp_h):
+    def _display_edges(left, bottom, right, top, rotation, visible_box):
         """Map pdfium's unrotated bounds to display-space ``(x0, y_top, x1, y_bot)``.
 
-        ``obj.get_bounds()`` always reports bounds in UNROTATED page space, while
-        ``get_size()`` reports ROTATION-AWARE width/height. Flipping y with the
-        rotation-aware height alone yields negative / out-of-range coordinates on
-        /Rotate 90|270 pages, so apply the page rotation to land every edge within
-        ``[0, disp_w] x [0, disp_h]`` (top-left origin). Rotation 0 reduces to the
-        original ``x0=left, x1=right, y_top=disp_h-top, y_bot=disp_h-bottom``,
-        leaving unrotated pages byte-for-byte unchanged. Returns unrounded floats
-        so callers round exactly once.
+        ``obj.get_bounds()`` reports bottom-left bounds in UNROTATED PDF user
+        space, while the page displays its visible box ``(L, B, R, T)`` (see
+        ``_visible_box``) turned by the page rotation. Measure every edge from
+        that box's displayed top-left corner, so coordinates share the frame of
+        the rotation-aware ``size()`` and land within it. On an uncropped page
+        with a zero origin this reduces to the earlier size-only formulas,
+        leaving those pages unchanged. Returns unrounded floats so callers
+        round exactly once.
         """
+        vis_left, vis_bottom, vis_right, vis_top = visible_box
         r = rotation % 360
         if r == 90:
-            return bottom, left, top, right
+            return bottom - vis_bottom, left - vis_left, top - vis_bottom, right - vis_left
         if r == 180:
-            return disp_w - right, bottom, disp_w - left, top
+            return vis_right - right, bottom - vis_bottom, vis_right - left, top - vis_bottom
         if r == 270:
-            return disp_w - top, disp_h - right, disp_w - bottom, disp_h - left
-        # rotation 0 (and any unexpected value) -- original behavior
-        return left, disp_h - top, right, disp_h - bottom
+            return vis_top - top, vis_right - right, vis_top - bottom, vis_right - left
+        # rotation 0 (and any unexpected value)
+        return left - vis_left, vis_top - top, right - vis_left, vis_top - bottom
 
     @classmethod
-    def _display_box(cls, left, bottom, right, top, rotation, disp_w, disp_h) -> BBox:
+    def _display_box(cls, left, bottom, right, top, rotation, visible_box) -> BBox:
         """Display-space ``BBox`` (rounded) for an image; see ``_display_edges``."""
-        x0, y_top, x1, y_bot = cls._display_edges(left, bottom, right, top, rotation, disp_w, disp_h)
+        x0, y_top, x1, y_bot = cls._display_edges(left, bottom, right, top, rotation, visible_box)
         return BBox(x=round(x0, 2), y=round(y_top, 2), w=round(x1 - x0, 2), h=round(y_bot - y_top, 2))
 
     def text_items(self):
         """Yield a ``TextItem`` per text object (own text, matrix-scaled size)."""
         from math import hypot
 
-        disp_w, disp_h = self.size()
+        visible_box = self._visible_box()
         rotation = self.rotation()
         for obj in self._page.get_objects(filter=(self._raw.FPDF_PAGEOBJ_TEXT,), max_depth=15):
             text = self._object_text(obj)
             if not text:
                 continue
             left, bottom, right, top = obj.get_bounds()
-            x0, y_top, x1, y_bot = self._display_edges(left, bottom, right, top, rotation, disp_w, disp_h)
+            x0, y_top, x1, y_bot = self._display_edges(left, bottom, right, top, rotation, visible_box)
             font_name, weight = "", 400
             try:
                 font = obj.get_font()
@@ -185,7 +197,7 @@ class PdfiumPage:
     ):
         """Yield an ``ImageBlock`` per embedded image whose pixel sides are both
         >= ``min_image_dimension``."""
-        disp_w, disp_h = self.size()
+        visible_box = self._visible_box()
         rotation = self.rotation()
         idx = 0
         for obj in self._page.get_objects(filter=(self._raw.FPDF_PAGEOBJ_IMAGE,), max_depth=15):
@@ -193,7 +205,7 @@ class PdfiumPage:
             if px_w < min_image_dimension or px_h < min_image_dimension:
                 continue
             left, bottom, right, top = obj.get_bounds()
-            bbox = self._display_box(left, bottom, right, top, rotation, disp_w, disp_h)
+            bbox = self._display_box(left, bottom, right, top, rotation, visible_box)
             file_path, fmt = None, "png"
             if output_dir:
                 image_stem = embedded_image_filename(name_prefix, page_number, idx)
