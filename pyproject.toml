@@ -54,6 +54,13 @@ dev = [
     "bumpver>=2026.1132",
     "maturin>=1.7,<2.0",
     "pre-commit>=4.0.0",
+    # Dev-only (BSD) PDF writer for v5 test fixtures: tests/pdf_tests/builders.py
+    # builds every v5 test PDF with it, replacing PyMuPDF as the test-PDF
+    # builder (#363). Never imported by src/. Bounded to one major, like
+    # markdown-it-py: a release that changes how text, encodings or
+    # encryption are written would otherwise redden a blocking gate on
+    # untouched code.
+    "reportlab>=5.1.0,<6",
     # Pinned to a SINGLE minor — deliberately tighter than ruff (<0.17, two
     # minors) and mypy (<1.21, seven), so do not read those as precedent for
     # this bound. Two reasons for the extra tightness. Hypothesis's
