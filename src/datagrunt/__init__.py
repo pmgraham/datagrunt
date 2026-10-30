@@ -23,7 +23,7 @@ Attributes:
     __license__: The license under which the package is released.
 """
 
-__version__ = "4.6.4"
+__version__ = "4.6.5"
 __author__ = "Martin Graham"
 __license__ = "MIT"
 
