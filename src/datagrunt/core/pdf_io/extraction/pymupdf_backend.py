@@ -23,6 +23,39 @@ def _import_pymupdf():
     return pymupdf
 
 
+def _transform_bbox(bbox: BBox, matrix: tuple) -> BBox:
+    """Apply the affine ``matrix`` ``(a, b, c, d, e, f)`` to ``bbox`` (rounded).
+
+    A point ``(x, y)`` maps to ``(a*x + c*y + e, b*x + d*y + f)``, PyMuPDF's
+    convention. Computed in double precision: PyMuPDF's own ``Rect * Matrix``
+    goes through single-precision floats, while the right-angle matrices used
+    here are exact in double precision.
+    """
+    a, b, c, d, e, f = matrix
+    corners = [(x, y) for x in (bbox.x, bbox.x + bbox.w) for y in (bbox.y, bbox.y + bbox.h)]
+    xs = [a * x + c * y + e for x, y in corners]
+    ys = [b * x + d * y + f for x, y in corners]
+    x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+    return BBox(x=round(x0, 2), y=round(y0, 2), w=round(x1 - x0, 2), h=round(y1 - y0, 2))
+
+
+def _derotation(rotation: int, width: float, height: float) -> tuple:
+    """Display-to-unrotated matrix ``(a, b, c, d, e, f)`` for a /Rotate 90|180|270 page.
+
+    ``width`` and ``height`` are the displayed visible box's (``page.rect``).
+    The unrotated frame starts at the same box's unrotated top-left corner.
+    PyMuPDF's own ``page.derotation_matrix`` is not used: it is sized from the
+    raw CropBox, which is not intersected with the MediaBox, so a CropBox that
+    overhangs the MediaBox would shift every box by the overhang.
+    """
+    r = rotation % 360
+    if r == 90:
+        return (0.0, -1.0, 1.0, 0.0, 0.0, width)
+    if r == 180:
+        return (-1.0, 0.0, 0.0, -1.0, width, height)
+    return (0.0, 1.0, -1.0, 0.0, height, 0.0)
+
+
 class PyMuPDFBackend(_ThreadLocalDocSession, ExtractionBackend):
     """Extraction via PyMuPDF (text/dict spans, images) + Tesseract OCR."""
 
@@ -202,6 +235,24 @@ class PyMuPDFBackend(_ThreadLocalDocSession, ExtractionBackend):
         finally:
             if should_close:
                 doc.close()
+
+    def display_to_text_frame(self, analysis: PageAnalysis, bboxes: list[BBox]) -> list[BBox]:
+        """Map display-frame boxes into the frame PyMuPDF reports text in.
+
+        PyMuPDF reports text and images on the visible box UNROTATED (top-left
+        origin, /Rotate ignored), while the display frame has /Rotate applied.
+        ``analysis`` is this backend's own for the page: its size is
+        ``page.rect`` (the displayed visible box) and its rotation is
+        ``page.rotation``, so the document is never reopened. An unrotated
+        page's frames coincide, so its boxes come back unchanged. Raises
+        ``ValueError`` if the rotation is not a right angle.
+        """
+        if analysis.rotation % 90 != 0:
+            raise ValueError(f"Page rotation must be a right angle, got {analysis.rotation!r}")
+        if not bboxes or analysis.rotation % 360 == 0:
+            return list(bboxes)
+        matrix = _derotation(analysis.rotation, analysis.width, analysis.height)
+        return [_transform_bbox(bbox, matrix) for bbox in bboxes]
 
     def extract_images(self, page_number: int, output_dir: str | None = None, name_prefix: str = "page") -> list:
         """Return embedded images (ported from extractors.extract_images)."""

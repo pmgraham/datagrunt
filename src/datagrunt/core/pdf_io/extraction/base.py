@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from datagrunt.core.pdf_io.extraction.shapes import ImageBlock, OcrBlock, PageAnalysis, TextBlock
+from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, OcrBlock, PageAnalysis, TextBlock
 
 
 class ExtractionBackend(ABC):
@@ -53,6 +53,18 @@ class ExtractionBackend(ABC):
     @abstractmethod
     def ocr_page(self, page_number: int, dpi: int = 300) -> list[OcrBlock]:
         """Return OCR-recovered text lines for the page."""
+
+    def display_to_text_frame(self, analysis: PageAnalysis, bboxes: list[BBox]) -> list[BBox]:
+        """Map boxes from the page's display frame into the frame this backend reports text in.
+
+        ``analysis`` is this backend's own ``PageAnalysis`` for the page. The
+        display frame is where content renders (see ``display_frame``); table
+        boxes arrive in it (#385). This default returns the boxes
+        unchanged, which is right for a backend whose text is already in the
+        display frame, such as pdfium (#384). A backend that reports text in
+        another frame must override it.
+        """
+        return list(bboxes)
 
     def extract_page(self, page_number: int, output_dir: str | None = None, name_prefix: str = "page") -> tuple:
         """Single-pass extraction: ``(PageAnalysis, list[TextBlock], list[ImageBlock])``.
