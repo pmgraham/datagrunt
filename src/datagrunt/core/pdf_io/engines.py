@@ -91,6 +91,10 @@ def _normalize_image_format(image_format: str) -> tuple:
     return ext, _PIL_FORMAT_BY_EXT[ext]
 
 
+class _GuardedPageSkip(Exception):
+    """A page carries an image a decode bound would skip, so it must not be rendered."""
+
+
 def _render_pdfium_page_to_file(
     page, directory: Path, pdf_name: str, page_index: int, dpi: int, ext: str, pil_format: str
 ) -> str:
@@ -98,7 +102,13 @@ def _render_pdfium_page_to_file(
 
     Shared by the in-process sequential loop and the process-pool worker so the
     render-and-save step lives in exactly one place (DRY within the PDF domain).
+    Raises ``_GuardedPageSkip`` (before any decode) when the page draws an image
+    a decode bound would skip: a render decodes every image at its codestream
+    size, so such a page is skipped rather than rendered.
     """
+    reasons = page.guarded_image_reasons(page_index)
+    if reasons:
+        raise _GuardedPageSkip("; ".join(reasons))
     img = page.render_pil(dpi=dpi)
     out_path = directory / page_image_filename(pdf_name, page_index, ext)
     img.save(out_path, format=pil_format)
@@ -521,7 +531,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
         return self._reader_engine
 
     def render_pages_as_images(self, output_dir=None, dpi=None, image_format="png") -> list:
-        from datagrunt.core.pdf_io.extraction.pymupdf_backend import _import_pymupdf
+        from datagrunt.core.pdf_io.extraction.pymupdf_backend import _guarded_page_image_reasons, _import_pymupdf
 
         dpi = self._resolve_dpi(dpi)
 
@@ -547,6 +557,13 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
                 # and skipped, never aborting the whole batch (project invariant).
                 try:
                     page = doc[idx]
+                    reasons = _guarded_page_image_reasons(doc, page)
+                    if reasons:
+                        # Rendering would decode a guarded image at its codestream
+                        # size; skip the page instead (project per-page isolation).
+                        for reason in reasons:
+                            logger.warning("Page %d image not rendered: %s", idx + 1, reason)
+                        continue
                     zoom = dpi / 72.0
                     mat = pymupdf.Matrix(zoom, zoom)
                     pix = page.get_pixmap(matrix=mat)

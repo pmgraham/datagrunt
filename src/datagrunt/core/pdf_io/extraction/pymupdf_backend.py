@@ -1,10 +1,12 @@
 """pymupdf-backed extraction backend (the reference engine)."""
 
 import logging
+import re
 
 from datagrunt.core.pdf_io.extraction._doc_session import _ThreadLocalDocSession
 from datagrunt.core.pdf_io.extraction.base import ExtractionBackend
 from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
+from datagrunt.core.pdf_io.extraction.image_guard import _MAX_RAW_HEADER_BYTES, inspect_image
 from datagrunt.core.pdf_io.extraction.ocr import ocr_data_to_blocks
 from datagrunt.core.pdf_io.extraction.pdfium_document import ENCRYPTED_PDF_MESSAGE
 from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, PageAnalysis, TextBlock
@@ -12,6 +14,63 @@ from datagrunt.core.pdf_io.extraction.text_block_builder import classify_by_medi
 from datagrunt.core.pdf_io.filenames import embedded_image_filename
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_filter_value(value) -> list:
+    """Parse a PDF ``/Filter`` entry (as pymupdf's ``xref_get_key`` returns it) into filter names.
+
+    The value is ``"/JPXDecode"`` for one filter or an array for a chain, which
+    pymupdf serialises without spaces between the names
+    (``"[/FlateDecode/DCTDecode]"``). A PDF name cannot contain ``/``, whitespace
+    or array/dict delimiters, so each ``/Name`` token is taken whole; the guard
+    normalises abbreviations.
+    """
+    if not value:
+        return []
+    return re.findall(r"/([^\s/\[\]<>(){}]+)", str(value))
+
+
+def _guard_image(doc, xref: int, label: str):
+    """Guard decision for the image at ``xref`` from its raw stream + /Filter (no decode).
+
+    The raw stream is copied (not decoded) and bounded; an unreadable stream or
+    filter means the guard fails closed (skip).
+    """
+    try:
+        _, filter_value = doc.xref_get_key(xref, "Filter")
+    except Exception:  # noqa: BLE001 - a missing/odd filter must not fail the page
+        filter_value = None
+    filters = _parse_filter_value(filter_value)
+    try:
+        raw = doc.xref_stream_raw(xref)
+    except Exception:  # noqa: BLE001 - unreadable raw stream -> fail closed
+        raw = None
+    if raw is not None and len(raw) > _MAX_RAW_HEADER_BYTES:
+        raw = None
+    return inspect_image(raw, filters, label=label)
+
+
+def _guarded_page_image_reasons(doc, page) -> list:
+    """Warning reasons for every image on ``page`` a decode bound would skip.
+
+    Used to decide whether a page may be rendered (a render decodes every image
+    it draws, at the image's codestream size for JPEG 2000 / JBIG2). Each
+    image's soft mask (``/SMask``, ``get_images(full=True)[1]``) is a separate
+    stream the render also decodes, so it is guarded too — a good base image
+    may carry a JPEG 2000 bomb as its mask.
+    """
+    reasons = []
+    seen: set[int] = set()
+    for info in page.get_images(full=True):
+        xref, smask_xref = info[0], info[1]
+        for target in (xref, smask_xref):
+            if not target or target in seen:
+                continue
+            seen.add(target)
+            decision = _guard_image(doc, target, f"xref {target}")
+            if decision.skip:
+                reasons.append(decision.reason)
+    return reasons
 
 
 def _import_pymupdf():
@@ -229,9 +288,10 @@ class PyMuPDFBackend(_ThreadLocalDocSession, ExtractionBackend):
                     if tb is not None:
                         text_blocks.append(tb)
             images = []
+            warnings: list[str] = []
             if analysis.image_count > 0:
-                images = self._images_from_page(doc, page, image_list, output_dir, name_prefix, page_number)
-            return analysis, text_blocks, images
+                images = self._images_from_page(doc, page, image_list, output_dir, name_prefix, page_number, warnings)
+            return analysis, text_blocks, images, warnings
         finally:
             if should_close:
                 doc.close()
@@ -255,22 +315,35 @@ class PyMuPDFBackend(_ThreadLocalDocSession, ExtractionBackend):
         return [_transform_bbox(bbox, matrix) for bbox in bboxes]
 
     def extract_images(self, page_number: int, output_dir: str | None = None, name_prefix: str = "page") -> list:
-        """Return embedded images (ported from extractors.extract_images)."""
+        """Return embedded images (ported from extractors.extract_images).
+
+        An image a decode bound would skip is left untouched and logged, never
+        decoded (see ``image_guard``).
+        """
         doc, should_close = self._get_doc()
+        warnings: list[str] = []
         try:
             if page_number < 0 or page_number >= doc.page_count:
                 return []
             page = doc[page_number]
-            return self._images_from_page(doc, page, page.get_images(), output_dir, name_prefix, page_number)
+            res = self._images_from_page(doc, page, page.get_images(), output_dir, name_prefix, page_number, warnings)
         finally:
             if should_close:
                 doc.close()
+        for reason in warnings:
+            logger.warning("%s", reason)
+        return res
 
-    def _images_from_page(self, doc, page, image_list, output_dir, name_prefix, page_number) -> list:
+    def _images_from_page(self, doc, page, image_list, output_dir, name_prefix, page_number, warnings=None) -> list:
         """Build ImageBlocks from an already-fetched ``page.get_images()`` list.
 
         Shared by ``extract_images`` and ``extract_page`` so the image list is
-        enumerated once per page.
+        enumerated once per page. An image a decode bound would skip (a JPEG
+        2000 / JBIG2 whose codestream describes far more than its declared size,
+        or one behind an unrecognised filter) is NOT touched: its xref is never
+        passed to ``get_image_rects``, ``extract_image`` or ``Pixmap`` (each of
+        which decodes). Its reason is appended to ``warnings`` and it is not
+        emitted.
         """
         import os
 
@@ -286,6 +359,11 @@ class PyMuPDFBackend(_ThreadLocalDocSession, ExtractionBackend):
             xref = img_info[0]
             occurrence = xref_occurrence.get(xref, 0)
             xref_occurrence[xref] = occurrence + 1
+            decision = _guard_image(doc, xref, f"page {page_number + 1} image {idx} (xref {xref})")
+            if decision.skip:
+                if warnings is not None:
+                    warnings.append(decision.reason)
+                continue
             bbox = self._resolve_image_bbox(page, xref, occurrence)
             block = self._image_block(doc, img_info, idx, bbox, output_dir, name_prefix, page_number)
             if block is not None:
@@ -364,6 +442,10 @@ class PyMuPDFBackend(_ThreadLocalDocSession, ExtractionBackend):
             if page_number < 0 or page_number >= doc.page_count:
                 return []
             page = doc[page_number]
+            if _guarded_page_image_reasons(doc, page):
+                # Rendering would decode a guarded image at its codestream size.
+                # parse_page records the per-image warnings; yield no OCR here.
+                return []
             pix = page.get_pixmap(dpi=dpi)
             mode = "RGBA" if pix.alpha else "RGB"
             # pymupdf ships no stubs, so pix.width/height read as Any; bind the

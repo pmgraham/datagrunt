@@ -103,19 +103,19 @@ class TestPyMuPDFBackend:
 class TestPyMuPDFBackendImageConfig:
     def test_default_drops_small_image(self, small_image_pdf):
         with PyMuPDFBackend(small_image_pdf) as backend:
-            _analysis, _text, images = backend.extract_page(0)
+            _analysis, _text, images, _warnings = backend.extract_page(0)
         assert images == []
 
     def test_lowered_threshold_keeps_small_image(self, small_image_pdf):
         backend = PyMuPDFBackend(small_image_pdf, extraction_config=_PDFExtractionConfig(min_image_dimension=10))
         with backend:
-            _analysis, _text, images = backend.extract_page(0)
+            _analysis, _text, images, _warnings = backend.extract_page(0)
         assert len(images) == 1
 
     def test_raised_threshold_drops_large_image(self, sample_pdf):
         backend = PyMuPDFBackend(sample_pdf, extraction_config=_PDFExtractionConfig(min_image_dimension=150))
         with backend:
-            _analysis, _text, images = backend.extract_page(0)
+            _analysis, _text, images, _warnings = backend.extract_page(0)
         assert images == []
 
 
@@ -126,7 +126,7 @@ def test_pymupdf_extract_page_matches_primitives(sample_pdf):
 
     backend = PyMuPDFBackend(sample_pdf)
     with backend:
-        analysis, text_blocks, images = backend.extract_page(0)
+        analysis, text_blocks, images, warnings = backend.extract_page(0)
         assert analysis == backend.analyze_page(0)
         assert text_blocks == backend.extract_text_blocks(0)
         assert images == backend.extract_images(0)

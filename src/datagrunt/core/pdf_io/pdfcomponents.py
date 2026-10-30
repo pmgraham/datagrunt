@@ -53,7 +53,7 @@ class DocumentAssembler:
     def parse_page(self, page_index, image_output_dir=None) -> dict:
         """Parse a single page into the unified element schema."""
         with self.backend, self.table_extractor:
-            analysis, text_blocks, images = self.backend.extract_page(
+            analysis, text_blocks, images, image_warnings = self.backend.extract_page(
                 page_index, output_dir=image_output_dir, name_prefix=self.filepath.stem
             )
             elements = []
@@ -81,11 +81,16 @@ class DocumentAssembler:
                         return True
                 return False
 
-            warnings = []
+            warnings = list(image_warnings)
             if analysis.has_text_layer:
                 for block in text_blocks:
                     if not is_inside_table(block.bbox):
                         elements.append(self._text_element(block, gen_elem_id(), page_index))
+            elif analysis.is_scanned and image_warnings:
+                # A scanned page whose image(s) a decode bound skipped must not be
+                # rendered for OCR: the render would decode them at their
+                # codestream size. The per-image warnings already explain why.
+                warnings.append(f"OCR skipped on page {page_index + 1}: an image was not decoded (see warnings)")
             elif analysis.is_scanned:
                 try:
                     ocr_blocks = self.backend.ocr_page(
