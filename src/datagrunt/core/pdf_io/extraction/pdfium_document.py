@@ -10,6 +10,7 @@ import logging
 from pathlib import Path
 
 from datagrunt.core.pdf_io.extraction.config import _DEFAULT_MIN_IMAGE_DIMENSION
+from datagrunt.core.pdf_io.extraction.display_frame import display_edges
 from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, TextItem
 from datagrunt.core.pdf_io.filenames import embedded_image_filename
 
@@ -104,33 +105,9 @@ class PdfiumPage:
         return buf.raw[: n * 2].decode("utf-16-le").rstrip("\x00").strip()
 
     @staticmethod
-    def _display_edges(left, bottom, right, top, rotation, visible_box):
-        """Map pdfium's unrotated bounds to display-space ``(x0, y_top, x1, y_bot)``.
-
-        ``obj.get_bounds()`` reports bottom-left bounds in UNROTATED PDF user
-        space, while the page displays its visible box ``(L, B, R, T)`` (see
-        ``_visible_box``) turned by the page rotation. Measure every edge from
-        that box's displayed top-left corner, so coordinates share the frame of
-        the rotation-aware ``size()`` and land within it. On an uncropped page
-        with a zero origin this reduces to the earlier size-only formulas,
-        leaving those pages unchanged. Returns unrounded floats so callers
-        round exactly once.
-        """
-        vis_left, vis_bottom, vis_right, vis_top = visible_box
-        r = rotation % 360
-        if r == 90:
-            return bottom - vis_bottom, left - vis_left, top - vis_bottom, right - vis_left
-        if r == 180:
-            return vis_right - right, bottom - vis_bottom, vis_right - left, top - vis_bottom
-        if r == 270:
-            return vis_top - top, vis_right - right, vis_top - bottom, vis_right - left
-        # rotation 0 (and any unexpected value)
-        return left - vis_left, vis_top - top, right - vis_left, vis_top - bottom
-
-    @classmethod
-    def _display_box(cls, left, bottom, right, top, rotation, visible_box) -> BBox:
-        """Display-space ``BBox`` (rounded) for an image; see ``_display_edges``."""
-        x0, y_top, x1, y_bot = cls._display_edges(left, bottom, right, top, rotation, visible_box)
+    def _display_box(left, bottom, right, top, rotation, visible_box) -> BBox:
+        """Display-space ``BBox`` (rounded) for an image; see ``display_edges``."""
+        x0, y_top, x1, y_bot = display_edges(left, bottom, right, top, rotation, visible_box)
         return BBox(x=round(x0, 2), y=round(y_top, 2), w=round(x1 - x0, 2), h=round(y_bot - y_top, 2))
 
     def text_items(self):
@@ -143,8 +120,9 @@ class PdfiumPage:
             text = self._object_text(obj)
             if not text:
                 continue
+            # pdfium reports bottom-left bounds in UNROTATED PDF user space.
             left, bottom, right, top = obj.get_bounds()
-            x0, y_top, x1, y_bot = self._display_edges(left, bottom, right, top, rotation, visible_box)
+            x0, y_top, x1, y_bot = display_edges(left, bottom, right, top, rotation, visible_box)
             font_name, weight = "", 400
             try:
                 font = obj.get_font()
