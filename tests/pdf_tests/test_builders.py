@@ -16,6 +16,7 @@ import pytest
 from PIL import Image
 
 from pdf_tests.builders import (
+    FormXObject,
     Line,
     PageSpec,
     RasterImage,
@@ -24,6 +25,7 @@ from pdf_tests.builders import (
     break_page,
     build_pdf,
     first_unencodable,
+    hand_written_pdf,
     solid_png,
 )
 
@@ -537,6 +539,69 @@ class TestBreakPage:
         assert path.read_bytes() == original
 
 
+class TestFormXObject:
+    """A FormXObject draws its items inside a Form XObject placed on the page."""
+
+    def test_text_is_nested_in_a_form_at_its_scaled_page_position(self, tmp_path):
+        run = TextRun("Tx", x=10.0, y=40.0, size=10.0)
+        form = FormXObject(x=100.0, y=50.0, w=150.0, h=60.0, items=(run,), scale=2.0)
+        page = pdfium.PdfDocument(build_pdf(tmp_path / "form.pdf", on_page(form)))[0]
+
+        objects = list(page.get_objects())
+        assert [(obj.type, obj.level) for obj in objects] == [
+            (pdfium_c.FPDF_PAGEOBJ_FORM, 0),
+            (pdfium_c.FPDF_PAGEOBJ_TEXT, 1),
+        ]
+        # Form (10, 40) at scale 2 from the form's top-left corner (100, 50).
+        assert first_char_top_left(page) == pytest.approx((120.0, 130.0), abs=TOL)
+        matrix = pdfium_c.FS_MATRIX()
+        assert pdfium_c.FPDFText_GetMatrix(page.get_textpage(), 0, matrix)
+        assert (matrix.a, matrix.b, matrix.c, matrix.d) == pytest.approx((2.0, 0.0, 0.0, 2.0))
+
+    def test_rect_in_a_form_renders_at_its_scaled_page_box(self, tmp_path):
+        rect = Rect(20.0, 10.0, 30.0, 15.0, fill_rgb=(0.0, 0.0, 0.0), stroke=False)
+        form = FormXObject(x=100.0, y=50.0, w=150.0, h=60.0, items=(rect,), scale=2.0)
+        page = pdfium.PdfDocument(build_pdf(tmp_path / "form.pdf", on_page(form)))[0]
+
+        image = page.render(scale=1).to_pil().convert("L")
+
+        ink = image.point(lambda p: 255 if p < 128 else 0).getbbox()
+        assert ink == pytest.approx((140.0, 70.0, 200.0, 100.0), abs=TOL)
+
+    def test_several_forms_on_several_pages_each_draw_their_own_items(self, tmp_path):
+        def form(text: str, y: float) -> FormXObject:
+            return FormXObject(x=72.0, y=y, w=200.0, h=40.0, items=(TextRun(text, x=0.0, y=20.0),))
+
+        # Apart: pdfium drops a char drawn over the same char (A1 on A2 reads "A12").
+        pages = [PageSpec(items=(form("A1", 72.0), form("A2", 172.0))), PageSpec(items=(form("B1", 72.0),))]
+        pdf = pdfium.PdfDocument(build_pdf(tmp_path / "forms.pdf", pages))
+
+        texts = [page.get_textpage().get_text_range() for page in pdf]
+        # pdfium places its generated line breaks by form-space position, and
+        # both lines sit at form (0, 20): it inserts no break between them.
+        assert texts == ["A1A2", "B1"]
+
+
+class TestHandWrittenPdf:
+    """hand_written_pdf writes raw objects behind an xref that points at each one."""
+
+    def test_xref_offsets_point_at_each_object_and_pdfium_reads_it(self, tmp_path):
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] >>",
+        ]
+
+        path = hand_written_pdf(tmp_path / "hand.pdf", objects)
+
+        data = path.read_bytes()
+        xref = int(data.rsplit(b"startxref\n", 1)[1].split(b"\n", 1)[0])
+        entries = data[xref:].split(b"\n")[3 : 3 + len(objects)]
+        offsets = [int(entry[:10]) for entry in entries]
+        assert [data[offset:].split(b"\n", 1)[0] for offset in offsets] == [b"1 0 obj", b"2 0 obj", b"3 0 obj"]
+        assert pdfium.PdfDocument(path)[0].get_size() == (200.0, 100.0)
+
+
 class TestValidation:
     """build_pdf rejects a bad spec before it writes anything."""
 
@@ -685,6 +750,30 @@ class TestValidation:
                 "PageSpec.crop_box must lie within the 612.0 x 792.0 page, got (0.0, 0.0, 10.0, 800.0)",
                 id="crop-off-page-bottom",
             ),
+            pytest.param(
+                on_page(FormXObject(0.0, 0.0, 0.0, 10.0)), {}, "FormXObject.w must be > 0, got 0.0", id="form-w"
+            ),
+            pytest.param(
+                on_page(FormXObject(0.0, 0.0, 10.0, -1.0)), {}, "FormXObject.h must be > 0, got -1.0", id="form-h"
+            ),
+            pytest.param(
+                on_page(FormXObject(0.0, 0.0, 10.0, 10.0, scale=0.0)),
+                {},
+                "FormXObject.scale must be > 0, got 0.0",
+                id="form-scale",
+            ),
+            pytest.param(
+                on_page(FormXObject(float("nan"), 0.0, 10.0, 10.0)),
+                {},
+                "FormXObject.x must be finite, got nan",
+                id="form-x",
+            ),
+            pytest.param(
+                on_page(FormXObject(0.0, 0.0, 10.0, 10.0, items=(TextRun("", 1.0, 1.0),))),
+                {},
+                "TextRun.text must not be empty",
+                id="form-item-checked",
+            ),
             pytest.param([PageSpec()], {"strength": 64}, "strength must be one of (40, 128), got 64", id="strength"),
             pytest.param(
                 [PageSpec()],
@@ -726,6 +815,18 @@ class TestValidation:
                 {},
                 "PageSpec.crop_box must be a tuple or None, got list",
                 id="crop-list",
+            ),
+            pytest.param(
+                on_page(FormXObject(0.0, 0.0, 10.0, 10.0, items=(FormXObject(0.0, 0.0, 5.0, 5.0),))),
+                {},
+                "FormXObject.items cannot hold a FormXObject: forms do not nest",
+                id="form-nested",
+            ),
+            pytest.param(
+                on_page(FormXObject(0.0, 0.0, 10.0, 10.0, items=("item",))),
+                {},
+                "unsupported page item: str",
+                id="form-item",
             ),
             pytest.param([PageSpec()], {"strength": 128.0}, "strength must be an int, got 128.0", id="strength-float"),
             pytest.param([PageSpec()], {"strength": True}, "strength must be an int, got True", id="strength-bool"),

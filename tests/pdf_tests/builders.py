@@ -3,6 +3,9 @@
 Coordinates are top-left page points: x grows rightward from the left edge,
 y grows downward from the top edge (the v5 convention). ReportLab draws in
 bottom-left space; ``_flip_y`` is the only place that converts between them.
+Items inside a ``FormXObject`` use the form's own top-left space.
+
+``hand_written_pdf`` writes raw objects, for structures ReportLab cannot write.
 """
 
 from __future__ import annotations
@@ -85,7 +88,29 @@ class RasterImage:
     png: bytes
 
 
-PageItem = TextRun | Line | Rect | RasterImage
+FormItem = TextRun | Line | Rect | RasterImage
+
+
+@dataclass(frozen=True)
+class FormXObject:
+    """A Form XObject whose top-left corner sits at (x, y) on the page.
+
+    ``items`` are drawn inside the form, in its own top-left space: (0, 0) is
+    the form's top-left corner and its /BBox is ``w`` x ``h`` form units. The
+    page draws the form scaled by ``scale``, so an item at form (u, v) lands
+    at page (x + u * scale, y + v * scale). Forms do not nest, and renderers
+    clip a form's content to its box.
+    """
+
+    x: float
+    y: float
+    w: float
+    h: float
+    items: tuple[FormItem, ...] = ()
+    scale: float = 1.0
+
+
+PageItem = FormItem | FormXObject
 
 
 @dataclass(frozen=True)
@@ -196,6 +221,26 @@ def break_page(path: str | os.PathLike[str], page_number: int) -> Path:
     return out
 
 
+def hand_written_pdf(path: str | os.PathLike[str], objects: Sequence[bytes]) -> Path:
+    """Write ``objects`` (object 1 is the catalog) as a PDF with a correct xref.
+
+    For structures ReportLab cannot write. The offsets are computed, so
+    pdfium reads the file as written instead of repairing it.
+    """
+    data = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objects, 1):
+        offsets.append(len(data))
+        data += b"%d 0 obj\n%s\nendobj\n" % (number, body)
+    xref = len(data)
+    data += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    data += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+    data += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref)
+    out = Path(path)
+    out.write_bytes(bytes(data))
+    return out
+
+
 def _require(ok: bool, message: str) -> None:
     if not ok:
         raise ValueError(message)
@@ -274,8 +319,21 @@ def _check_item(item: PageItem) -> None:
             _check_rect(item)
         case RasterImage():
             _check_image(item)
+        case FormXObject():
+            _check_form(item)
         case _:
             raise TypeError(f"unsupported page item: {type(item).__name__}")
+
+
+def _check_form(form: FormXObject) -> None:
+    _require_finite_fields(form, ("x", "y"))
+    _require_positive("FormXObject.w", form.w)
+    _require_positive("FormXObject.h", form.h)
+    _require_positive("FormXObject.scale", form.scale)
+    for item in form.items:
+        if isinstance(item, FormXObject):
+            raise TypeError("FormXObject.items cannot hold a FormXObject: forms do not nest")
+        _check_item(item)
 
 
 def _check_text(run: TextRun) -> None:
@@ -342,11 +400,28 @@ def _draw_page(canvas: Canvas, page: PageSpec) -> None:
     canvas.setPageRotation(page.rotate)
     # ReportLab keeps a crop box for every later page; set (or clear) it per page.
     canvas.setCropBox(_pdf_box(page.height, page.crop_box) if page.crop_box is not None else None)
-    for item in page.items:
+    for index, item in enumerate(page.items):
         canvas.saveState()
-        _draw_item(canvas, item, page.height)
+        if isinstance(item, FormXObject):
+            # Form names are document-wide: page number + item index is unique.
+            _draw_form(canvas, item, page.height, f"Form{canvas.getPageNumber()}_{index}")
+        else:
+            _draw_item(canvas, item, page.height)
         canvas.restoreState()
     canvas.showPage()
+
+
+def _draw_form(canvas: Canvas, form: FormXObject, page_height: float, name: str) -> None:
+    canvas.beginForm(name, 0, 0, form.w, form.h)
+    for item in form.items:
+        canvas.saveState()
+        _draw_item(canvas, item, form.h)
+        canvas.restoreState()
+    canvas.endForm()
+    # Put the form's bottom-left corner where its scaled top-left lands at (x, y).
+    canvas.translate(form.x, _flip_y(page_height, form.y + form.h * form.scale))
+    canvas.scale(form.scale, form.scale)
+    canvas.doForm(name)
 
 
 def _draw_item(canvas: Canvas, item: PageItem, page_height: float) -> None:

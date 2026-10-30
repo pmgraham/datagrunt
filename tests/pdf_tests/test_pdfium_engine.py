@@ -19,7 +19,7 @@ import pytest
 
 from datagrunt.pdf import PDFCorruptError, PDFEncryptedError, pdfium_engine
 from datagrunt.pdf.pdfium_engine import DocumentHandle, PageGeometry, open_document, page_geometry, to_display_box
-from pdf_tests.builders import PageSpec, Rect, TextRun, break_page, build_pdf
+from pdf_tests.builders import PageSpec, Rect, TextRun, break_page, build_pdf, hand_written_pdf
 
 # Position tolerance in page points.
 TOL = 1.0
@@ -44,25 +44,6 @@ def encrypted(tmp_path: Path) -> Path:
     """A one-page RC4-128 PDF that needs USER_PW (or OWNER_PW) to open."""
     page = PageSpec(items=(TextRun("Secret", x=72.0, y=100.0),))
     return build_pdf(tmp_path / "enc.pdf", [page], user_password=USER_PW, owner_password=OWNER_PW, strength=128)
-
-
-def hand_written_pdf(path: Path, objects: list[bytes]) -> Path:
-    """Write ``objects`` (object 1 is the catalog) as a PDF with a correct xref.
-
-    For structures ReportLab cannot write. The offsets are computed, so
-    pdfium reads the file as written instead of repairing it.
-    """
-    data = bytearray(b"%PDF-1.4\n")
-    offsets = []
-    for number, body in enumerate(objects, 1):
-        offsets.append(len(data))
-        data += b"%d 0 obj\n%s\nendobj\n" % (number, body)
-    xref = len(data)
-    data += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
-    data += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
-    data += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref)
-    path.write_bytes(bytes(data))
-    return path
 
 
 def zero_pages(tmp_path: Path) -> Path:

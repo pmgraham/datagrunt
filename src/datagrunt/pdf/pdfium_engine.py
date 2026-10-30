@@ -6,7 +6,7 @@ pdfium behaviour this module relies on, observed with pypdfium2 5.14.0 /
 pdfium 156.0.8076.0 on ReportLab-, PyMuPDF- and hand-built PDFs (#365 T1),
 and pinned by ``tests/pdf_tests/test_pdfium_engine.py``:
 
-- Char boxes (``PdfTextPage.get_charbox``) and object bounds
+- Char boxes (``PdfTextPage.get_charbox``) and top-level object bounds
   (``PdfObject.get_bounds``) are ``(left, bottom, right, top)`` in PDF user
   space: bottom-left origin, unrotated, absolute (not relative to the
   CropBox). They are identical on every /Rotate and with or without a CropBox.
@@ -32,14 +32,39 @@ and pinned by ``tests/pdf_tests/test_pdfium_engine.py``:
   the document (``_open_pdf`` never calls ``FPDF_CloseDocument``). So this
   module loads with ``FPDF_LoadDocument`` itself, closes a zero-page
   document, and hands the handle to ``PdfDocument`` (a documented input).
+
+Text (#365 T2), pinned by ``tests/pdf_tests/test_pdfium_spans.py``:
+
+- pdfium makes one text object per text-showing operator (``Tj``, ``TJ``,
+  ``'``, ``"``), so one object's chars share one baseline; every
+  non-generated textpage char names its owner (``FPDFText_GetTextObject``).
+- Textpage char boxes and ``FPDFText_GetMatrix`` are page space with every
+  enclosing form's matrix applied; ``get_bounds()`` and
+  ``FPDFPageObj_GetMatrix`` of an object inside a form are in the form's
+  space. pdfium parses forms at most 40 levels deep.
+- A non-BMP char is two textpage chars, a UTF-16 surrogate pair with equal
+  boxes. An unmapped char code reads as itself, flagged by
+  ``FPDFText_HasUnicodeMapError``.
+- Text drawn at ``Tf 0`` yields no textpage chars, and a char drawn on an
+  identical char at the same place is dropped (pdfium's fake-bold removal).
+- Standard-14 fonts have no descriptor: their flags lack ForceBold and their
+  weight reads 0, so only the base name says bold. A non-embedded alias
+  reads as the standard-14 font pdfium substitutes (``Arial,BoldItalic``
+  reads ``Helvetica-BoldOblique``). A pattern fill reads as a colour pdfium
+  picks (opaque 75% grey for a tiling pattern).
 """
 
+import ctypes
 import errno
+import math
 import os
+import re
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import NoReturn
+from typing import NamedTuple, NoReturn
 
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
@@ -162,6 +187,174 @@ class PageGeometry:
         across, up = (self.height_pt, self.width_pt) if quarter_turn else (self.width_pt, self.height_pt)
         left, bottom = self.crop_offset
         return left, bottom, left + across, bottom + up
+
+
+def _checked_display_box(name: str, box: object) -> Box:
+    """Return ``box`` as 4 finite floats ``(x0, y0, x1, y1)`` with ``x0 <= x1`` and ``y0 <= y1``."""
+    x0, y0, x1, y1 = _finite_tuple(name, box, 4)
+    if x0 > x1 or y0 > y1:
+        raise ValueError(f"{name} must have x0 <= x1 and y0 <= y1, got {box!r}")
+    return x0, y0, x1, y1
+
+
+def _union(boxes: tuple[Box, ...]) -> Box:
+    """The smallest box holding every one of ``boxes`` (at least one)."""
+    return (
+        min(box[0] for box in boxes),
+        min(box[1] for box in boxes),
+        max(box[2] for box in boxes),
+        max(box[3] for box in boxes),
+    )
+
+
+def _checked_bool(name: str, value: object) -> bool:
+    """Return ``value`` if it is exactly a bool (not an int standing in for one)."""
+    if not isinstance(value, bool):
+        raise TypeError(f"{name} must be a bool, got {value!r} ({type(value).__name__})")
+    return value
+
+
+def _checked_rgba(name: str, value: object) -> tuple[int, int, int, int]:
+    """Return ``value`` if it is a tuple of 4 ints in 0..255 (bool rejected)."""
+    if not isinstance(value, tuple):
+        raise TypeError(f"{name} must be a tuple, got {type(value).__name__}")
+    if len(value) != 4:
+        raise ValueError(f"{name} must have 4 channels, got {len(value)}")
+    for index, channel in enumerate(value):
+        if isinstance(channel, bool) or not isinstance(channel, int):
+            raise TypeError(f"{name}[{index}] must be an int, got {channel!r} ({type(channel).__name__})")
+        if not 0 <= channel <= 255:
+            raise ValueError(f"{name}[{index}] must be in 0..255, got {channel}")
+    red, green, blue, alpha = value
+    return red, green, blue, alpha
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RawSpan:
+    """A maximal run of consecutive textpage chars owned by one text object.
+
+    pdfium makes one text object per text-showing operator (``Tj``, ``TJ``,
+    ``'``, ``"``), so a span never crosses a line. Boxes are displayed,
+    top-left ``(x0, y0, x1, y1)`` points, as :func:`to_display_box` returns.
+
+    Attributes:
+        text: The chars as pdfium reports them, each kept: control chars,
+            U+FFFD and lone surrogates included (A3 classifies them). A
+            surrogate pair pdfium reports as two chars is one char here.
+        bbox: The union of ``char_boxes``.
+        char_boxes: One box per char of ``text``: pdfium's loose char box
+            (advance width by the font's ascent-to-descent height).
+        font_size_pt: The ``Tf`` size times the vertical scale of the text's
+            page-space matrix (form matrices included); negative for a
+            negative ``Tf`` (mirrored glyphs).
+        base_font_name: The font's /BaseFont without a subset tag
+            (``ABCDEF+``); empty for a font without one (Type3).
+        is_bold: From the font name, the ForceBold flag, or weight >= 600.
+        is_italic: From the font name or the Italic flag.
+        render_mode: The text render mode, 0 (fill) to 7 (clip).
+        fill_rgba: Fill colour and alpha as 0-255 ints, as pdfium reports
+            them (a pattern fill reads as a colour pdfium picks).
+        stroke_rgba: Stroke colour and alpha as 0-255 ints.
+        object_index: The owning text object's position in the page's
+            depth-first, paint-order object walk (forms count, then their
+            contents), so it also gives the span's z-order.
+    """
+
+    text: str
+    bbox: Box
+    char_boxes: tuple[Box, ...]
+    font_size_pt: float
+    base_font_name: str
+    is_bold: bool
+    is_italic: bool
+    render_mode: int
+    fill_rgba: tuple[int, int, int, int]
+    stroke_rgba: tuple[int, int, int, int]
+    object_index: int
+
+    def __post_init__(self) -> None:
+        self._check_text_and_boxes()
+        object.__setattr__(self, "font_size_pt", finite_float("font_size_pt", self.font_size_pt))
+        if not isinstance(self.base_font_name, str):
+            raise TypeError(f"base_font_name must be a str, got {self.base_font_name!r}")
+        _checked_bool("is_bold", self.is_bold)
+        _checked_bool("is_italic", self.is_italic)
+        if isinstance(self.render_mode, bool) or not isinstance(self.render_mode, int):
+            raise TypeError(f"render_mode must be an int, got {self.render_mode!r}")
+        if self.render_mode not in range(8):
+            raise ValueError(f"render_mode must be in 0..7, got {self.render_mode}")
+        _checked_rgba("fill_rgba", self.fill_rgba)
+        _checked_rgba("stroke_rgba", self.stroke_rgba)
+        int_at_least("object_index", self.object_index, 0)
+
+    def _check_text_and_boxes(self) -> None:
+        if not isinstance(self.text, str):
+            raise TypeError(f"text must be a str, got {type(self.text).__name__}")
+        if not self.text:
+            raise ValueError("text must not be empty")
+        if not isinstance(self.char_boxes, tuple):
+            raise TypeError(f"char_boxes must be a tuple, got {type(self.char_boxes).__name__}")
+        if len(self.char_boxes) != len(self.text):
+            counts = f"{len(self.char_boxes)} boxes for {len(self.text)} chars"
+            raise ValueError(f"char_boxes must hold one box per char of text: {counts}")
+        boxes = tuple(_checked_display_box(f"char_boxes[{i}]", box) for i, box in enumerate(self.char_boxes))
+        bbox = _checked_display_box("bbox", self.bbox)
+        if bbox != _union(boxes):
+            raise ValueError(f"bbox must be the union of char_boxes, {_union(boxes)!r}, got {self.bbox!r}")
+        object.__setattr__(self, "char_boxes", boxes)
+        object.__setattr__(self, "bbox", bbox)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TextStats:
+    """Counts of one page's textpage chars, for A3's text-quality checks.
+
+    Attributes:
+        char_count: Non-generated textpage chars: the chars the content
+            stream draws (a non-BMP char counts twice, as a surrogate pair).
+        generated_count: Chars pdfium inserted (spaces and line breaks
+            between objects); they are in no span.
+        unicode_map_error_count: Non-generated chars pdfium could not map
+            to Unicode (``FPDFText_HasUnicodeMapError``); each reads as its
+            raw char code.
+    """
+
+    char_count: int
+    generated_count: int
+    unicode_map_error_count: int
+
+    def __post_init__(self) -> None:
+        int_at_least("char_count", self.char_count, 0)
+        int_at_least("generated_count", self.generated_count, 0)
+        int_at_least("unicode_map_error_count", self.unicode_map_error_count, 0)
+        if self.unicode_map_error_count > self.char_count:
+            counts = f"unicode_map_error_count ({self.unicode_map_error_count}) cannot exceed"
+            raise ValueError(f"{counts} char_count ({self.char_count})")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PageText:
+    """One page's spans in textpage order, with its textpage counts.
+
+    Every non-generated textpage char is in exactly one span: one span char
+    per textpage char, or one per surrogate pair.
+    """
+
+    spans: tuple[RawSpan, ...]
+    stats: TextStats
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.spans, tuple):
+            raise TypeError(f"spans must be a tuple, got {type(self.spans).__name__}")
+        for index, item in enumerate(self.spans):
+            if not isinstance(item, RawSpan):
+                raise TypeError(f"spans[{index}] must be a RawSpan, got {type(item).__name__}")
+        if not isinstance(self.stats, TextStats):
+            raise TypeError(f"stats must be a TextStats, got {type(self.stats).__name__}")
+        span_chars = sum(len(item.text) for item in self.spans)
+        if not span_chars <= self.stats.char_count <= 2 * span_chars:
+            message = f"spans hold {span_chars} chars, which {self.stats.char_count} textpage chars cannot make"
+            raise ValueError(f"{message} (each is 1 textpage char, or 2 for a surrogate pair)")
 
 
 class DocumentHandle:
@@ -327,13 +520,34 @@ def _checked_index(index: object, page_count: int) -> int:
     return index
 
 
-def _rotation_and_visible_box(pdf: pdfium.PdfDocument, index: int) -> tuple[int, Box]:
-    """Read one page's /Rotate and visible box, closing the page handle."""
-    page = pdf[index]
+def _load_page(handle: object, index: object) -> tuple[pdfium.PdfPage, int]:
+    """Validate ``handle`` and ``index``; load the page and return it with its 1-based number."""
+    if not isinstance(handle, DocumentHandle):
+        raise TypeError(f"handle must be a DocumentHandle, got {type(handle).__name__}")
+    pdf = handle._require_open()
+    page_number = _checked_index(index, handle.page_count) + 1
     try:
-        return page.get_rotation(), page.get_bbox()
-    finally:
-        page.close()
+        return pdf[page_number - 1], page_number
+    except pdfium.PdfiumError as exc:
+        raise PDFCorruptError(f"page {page_number} is unreadable: {exc}", page_number=page_number) from exc
+
+
+def _read_geometry(page: pdfium.PdfPage, page_number: int) -> PageGeometry:
+    """Read a loaded page's displayed geometry."""
+    try:
+        rotation, visible_box = page.get_rotation(), page.get_bbox()
+    except pdfium.PdfiumError as exc:
+        raise PDFCorruptError(f"page {page_number} is unreadable: {exc}", page_number=page_number) from exc
+    try:
+        left, bottom, right, top = _checked_box("visible box", visible_box, allow_empty=False)
+    except ValueError as exc:
+        message = f"page {page_number} has no visible area (CropBox within MediaBox): {exc}"
+        raise PDFCorruptError(message, page_number=page_number) from exc
+    across, up = right - left, top - bottom
+    width, height = (up, across) if rotation in (90, 270) else (across, up)
+    return PageGeometry(
+        page_number=page_number, width_pt=width, height_pt=height, rotation_deg=rotation, crop_offset=(left, bottom)
+    )
 
 
 def page_geometry(handle: DocumentHandle, index: int) -> PageGeometry:
@@ -351,21 +565,344 @@ def page_geometry(handle: DocumentHandle, index: int) -> PageGeometry:
         PDFCorruptError: If pdfium cannot load the page, or its CropBox and
             MediaBox leave no visible area (``page_number`` is set).
     """
-    if not isinstance(handle, DocumentHandle):
-        raise TypeError(f"handle must be a DocumentHandle, got {type(handle).__name__}")
-    pdf = handle._require_open()
-    page_number = _checked_index(index, handle.page_count) + 1
+    page, page_number = _load_page(handle, index)
     try:
-        rotation, visible_box = _rotation_and_visible_box(pdf, page_number - 1)
-    except pdfium.PdfiumError as exc:
-        raise PDFCorruptError(f"page {page_number} is unreadable: {exc}", page_number=page_number) from exc
-    try:
-        left, bottom, right, top = _checked_box("visible box", visible_box, allow_empty=False)
-    except ValueError as exc:
-        message = f"page {page_number} has no visible area (CropBox within MediaBox): {exc}"
-        raise PDFCorruptError(message, page_number=page_number) from exc
-    across, up = right - left, top - bottom
-    width, height = (up, across) if rotation in (90, 270) else (across, up)
-    return PageGeometry(
-        page_number=page_number, width_pt=width, height_pt=height, rotation_deg=rotation, crop_offset=(left, bottom)
+        return _read_geometry(page, page_number)
+    finally:
+        page.close()
+
+
+class _PdfiumFailure(Exception):
+    """A pdfium call failed; page_text reports it as PDFCorruptError for the page.
+
+    The message completes "pdfium cannot ...".
+    """
+
+
+def _address(pointer: pdfium_c.FPDF_PAGEOBJECT) -> int:
+    """The address a pdfium object pointer holds (0 for NULL), to compare objects."""
+    return ctypes.cast(pointer, ctypes.c_void_p).value or 0
+
+
+# pdfium parses Form XObjects at most 40 levels deep (observed: 80 nested
+# forms yield the text of 40), so this bound reaches every object it parsed.
+_MAX_FORM_DEPTH = 64
+
+
+def _children(
+    count: int, get_child: Callable[[int], pdfium_c.FPDF_PAGEOBJECT], owner: str
+) -> list[pdfium_c.FPDF_PAGEOBJECT]:
+    """The ``count`` objects of the page or a form, in paint order; ``owner`` names it."""
+    if count < 0:
+        raise _PdfiumFailure(f"count the objects of {owner}")
+    children = []
+    for index in range(count):
+        child = get_child(index)
+        if not child:
+            raise _PdfiumFailure(f"read object {index} of {owner}")
+        children.append(child)
+    return children
+
+
+def _page_objects(page_raw: pdfium_c.FPDF_PAGE) -> list[pdfium_c.FPDF_PAGEOBJECT]:
+    """Every page object in depth-first paint order: a form, then its contents."""
+    top = _children(
+        pdfium_c.FPDFPage_CountObjects(page_raw), partial(pdfium_c.FPDFPage_GetObject, page_raw), "the page"
     )
+    ordered: list[pdfium_c.FPDF_PAGEOBJECT] = []
+    stack = [iter(top)]
+    # Bounded: one pass per object and one per form, each from a pdfium count,
+    # and the stack never holds more than _MAX_FORM_DEPTH + 1 levels.
+    while stack:
+        child = next(stack[-1], None)
+        if child is None:
+            stack.pop()
+            continue
+        ordered.append(child)
+        if len(stack) <= _MAX_FORM_DEPTH and pdfium_c.FPDFPageObj_GetType(child) == pdfium_c.FPDF_PAGEOBJ_FORM:
+            count = pdfium_c.FPDFFormObj_CountObjects(child)
+            owner = f"form object {len(ordered) - 1}"
+            stack.append(iter(_children(count, partial(pdfium_c.FPDFFormObj_GetObject, child), owner)))
+    return ordered
+
+
+def _object_indices(page_raw: pdfium_c.FPDF_PAGE) -> dict[int, int]:
+    """Map each page object's address to its depth-first paint-order index."""
+    return {_address(obj): index for index, obj in enumerate(_page_objects(page_raw))}
+
+
+class _Style(NamedTuple):
+    """The RawSpan fields read from a span's text object."""
+
+    font_size_pt: float
+    base_font_name: str
+    is_bold: bool
+    is_italic: bool
+    render_mode: int
+    fill_rgba: tuple[int, int, int, int]
+    stroke_rgba: tuple[int, int, int, int]
+
+
+def _rgba(getter: Callable[..., int], text_object: pdfium_c.FPDF_PAGEOBJECT, what: str) -> tuple[int, int, int, int]:
+    """Read a page object's fill or stroke colour (``what``) as 0-255 (R, G, B, A)."""
+    red, green, blue, alpha = (ctypes.c_uint() for _ in range(4))
+    if not getter(text_object, red, green, blue, alpha):
+        raise _PdfiumFailure(f"read the {what}")
+    return red.value, green.value, blue.value, alpha.value
+
+
+# PDF 32000-1 font descriptor flags (Table 121) and weights (Table 122).
+_FLAG_ITALIC = 0x40
+_FLAG_FORCE_BOLD = 0x40000
+_BOLD_WEIGHT = 600
+# Case-insensitive; "bold" also matches Semibold, Demibold and ExtraBold.
+_BOLD_NAME_TOKENS = ("bold", "black", "heavy")
+_ITALIC_NAME_TOKENS = ("italic", "oblique")
+# A font subset's /BaseFont starts with exactly six capitals and "+" (PDF 32000-1, 9.9.2).
+_SUBSET_TAG = re.compile(r"[A-Z]{6}\+")
+_STYLE_SEPARATOR = re.compile(r"[-,]")
+# PDF names are at most 127 bytes in practice (PDF 32000-1, Annex C); this
+# bound, NUL included, only stops a hostile length from sizing the buffer.
+_MAX_FONT_NAME_BYTES = 4096
+
+
+def _base_font_name(font: pdfium_c.FPDF_FONT, label: str) -> str:
+    """Read a font's /BaseFont without its subset tag.
+
+    pdfium returns the name as UTF-8; bytes that are not UTF-8 are kept as
+    visible ``\\xNN`` escapes rather than replaced.
+    """
+    size = pdfium_c.FPDFFont_GetBaseFontName(font, None, 0)
+    if size < 1:
+        raise _PdfiumFailure(f"read the font name of {label}")
+    if size > _MAX_FONT_NAME_BYTES:
+        raise _PdfiumFailure(
+            f"read the font name of {label}: {size} bytes is over the {_MAX_FONT_NAME_BYTES}-byte bound"
+        )
+    buffer = ctypes.create_string_buffer(size)
+    if pdfium_c.FPDFFont_GetBaseFontName(font, buffer, size) != size:
+        raise _PdfiumFailure(f"read the font name of {label}")
+    name = buffer.raw[: size - 1].decode("utf-8", errors="backslashreplace")
+    return name[7:] if _SUBSET_TAG.match(name) else name
+
+
+def _style_part(name: str) -> str:
+    """The style part of a font name, after its first "-" or "," (Arial-BoldMT, Arial,Bold).
+
+    A name without one is all style part (ArialBlack). Matching only this
+    part keeps a family name such as BlackadderITC-Regular from reading bold.
+    """
+    separator = _STYLE_SEPARATOR.search(name)
+    return (name[separator.end() :] if separator else name).lower()
+
+
+def _bold_and_italic(font: pdfium_c.FPDF_FONT, name: str) -> tuple[bool, bool]:
+    """Read bold and italic from the font name, its descriptor flags and its weight.
+
+    Each source alone suffices: standard-14 fonts have no descriptor (flags
+    and weight read 0), so their name is the only one that says bold. With a
+    valid font, pdfium's flags and weight cannot fail (-1 means a NULL font).
+    """
+    style = _style_part(name)
+    flags = pdfium_c.FPDFFont_GetFlags(font)
+    is_bold = (
+        any(token in style for token in _BOLD_NAME_TOKENS)
+        or bool(flags & _FLAG_FORCE_BOLD)
+        or pdfium_c.FPDFFont_GetWeight(font) >= _BOLD_WEIGHT
+    )
+    is_italic = any(token in style for token in _ITALIC_NAME_TOKENS) or bool(flags & _FLAG_ITALIC)
+    return is_bold, is_italic
+
+
+def _font_size(
+    textpage: pdfium_c.FPDF_TEXTPAGE, text_object: pdfium_c.FPDF_PAGEOBJECT, char_index: int, label: str
+) -> float:
+    """``Tf`` size times the vertical scale of the char's page-space matrix.
+
+    The textpage matrix includes every enclosing form's matrix; the object's
+    own matrix (``FPDFPageObj_GetMatrix``) is in its form's space.
+    """
+    nominal = ctypes.c_float()
+    if not pdfium_c.FPDFTextObj_GetFontSize(text_object, nominal):
+        raise _PdfiumFailure(f"read the font size of {label}")
+    matrix = pdfium_c.FS_MATRIX()
+    if not pdfium_c.FPDFText_GetMatrix(textpage, char_index, matrix):
+        raise _PdfiumFailure(f"read the matrix of char {char_index}")
+    size = nominal.value * math.hypot(matrix.c, matrix.d)
+    if not math.isfinite(size):
+        raise _PdfiumFailure(f"read the font size of {label}: it is not finite ({size})")
+    return size
+
+
+def _read_style(
+    textpage: pdfium_c.FPDF_TEXTPAGE, text_object: pdfium_c.FPDF_PAGEOBJECT, char_index: int, object_index: int
+) -> _Style:
+    """Read the style of text object ``object_index``, which owns textpage char ``char_index``."""
+    label = f"object {object_index}"
+    font = pdfium_c.FPDFTextObj_GetFont(text_object)
+    if not font:
+        raise _PdfiumFailure(f"read the font of {label}")
+    name = _base_font_name(font, label)
+    is_bold, is_italic = _bold_and_italic(font, name)
+    render_mode = pdfium_c.FPDFTextObj_GetTextRenderMode(text_object)
+    if render_mode not in range(8):  # FPDF_TEXTRENDERMODE_UNKNOWN (-1) on failure
+        raise _PdfiumFailure(f"read the render mode of {label}")
+    return _Style(
+        font_size_pt=_font_size(textpage, text_object, char_index, label),
+        base_font_name=name,
+        is_bold=is_bold,
+        is_italic=is_italic,
+        render_mode=render_mode,
+        fill_rgba=_rgba(pdfium_c.FPDFPageObj_GetFillColor, text_object, f"fill colour of {label}"),
+        stroke_rgba=_rgba(pdfium_c.FPDFPageObj_GetStrokeColor, text_object, f"stroke colour of {label}"),
+    )
+
+
+def _loose_box(textpage: pdfium_c.FPDF_TEXTPAGE, char_index: int) -> Box:
+    """Read a char's loose box as ``(left, bottom, right, top)`` in PDF user space."""
+    rect = pdfium_c.FS_RECTF()
+    if not pdfium_c.FPDFText_GetLooseCharBox(textpage, char_index, rect):
+        raise _PdfiumFailure(f"read the box of char {char_index}")
+    left, bottom, right, top = rect.left, rect.bottom, rect.right, rect.top
+    if not all(math.isfinite(edge) for edge in (left, bottom, right, top)):
+        raise _PdfiumFailure(f"read the box of char {char_index}: it is not finite {(left, bottom, right, top)}")
+    # Edges in order, so a mirrored (negative-size) char still reads as a box.
+    return min(left, right), min(bottom, top), max(left, right), max(bottom, top)
+
+
+_HIGH_SURROGATES = range(0xD800, 0xDC00)
+_LOW_SURROGATES = range(0xDC00, 0xE000)
+_MAX_CODE_POINT = 0x10FFFF
+
+
+class _SpanBuilder:
+    """Groups a page's non-generated textpage chars into RawSpans, in order."""
+
+    def __init__(
+        self, textpage: pdfium_c.FPDF_TEXTPAGE, geometry: PageGeometry, object_indices: dict[int, int]
+    ) -> None:
+        self._textpage = textpage
+        self._rotation = geometry.rotation_deg
+        self._page_box = geometry.page_box
+        self._object_indices = object_indices
+        self._styles: dict[int, _Style] = {}
+        self._spans: list[RawSpan] = []
+        self._owner = 0
+        self._chars: list[str] = []
+        self._boxes: list[Box] = []
+
+    def add(self, char_index: int) -> None:
+        """Append non-generated textpage char ``char_index`` to the current span or a new one."""
+        self._switch_owner(char_index)
+        code = pdfium_c.FPDFText_GetUnicode(self._textpage, char_index)
+        if code > _MAX_CODE_POINT:
+            raise _PdfiumFailure(f"read char {char_index}: code {code:#x} is beyond Unicode")
+        box = _loose_box(self._textpage, char_index)
+        if code in _LOW_SURROGATES and self._chars and ord(self._chars[-1]) in _HIGH_SURROGATES:
+            # pdfium reports a non-BMP char as a UTF-16 pair of textpage chars.
+            high = ord(self._chars[-1])
+            self._chars[-1] = chr(0x10000 + ((high - _HIGH_SURROGATES.start) << 10) + (code - _LOW_SURROGATES.start))
+            self._boxes[-1] = _union((self._boxes[-1], box))
+            return
+        self._chars.append(chr(code))
+        self._boxes.append(box)
+
+    def finish(self) -> tuple[RawSpan, ...]:
+        """Close the current span and return every span."""
+        self._flush()
+        return tuple(self._spans)
+
+    def _switch_owner(self, char_index: int) -> None:
+        """Start a new span when char ``char_index`` belongs to another text object."""
+        text_object = pdfium_c.FPDFText_GetTextObject(self._textpage, char_index)
+        if not text_object:
+            raise _PdfiumFailure(f"read the text object of char {char_index}")
+        owner = _address(text_object)
+        if owner == self._owner:
+            return
+        if owner not in self._object_indices:
+            raise _PdfiumFailure(f"read the text object of char {char_index}: it is not in the page's object tree")
+        self._flush()
+        self._owner = owner
+        if owner not in self._styles:
+            self._styles[owner] = _read_style(self._textpage, text_object, char_index, self._object_indices[owner])
+
+    def _flush(self) -> None:
+        if not self._chars:
+            return
+        boxes = tuple(to_display_box(box, rotation_deg=self._rotation, page_box=self._page_box) for box in self._boxes)
+        self._spans.append(
+            RawSpan(
+                text="".join(self._chars),
+                bbox=_union(boxes),
+                char_boxes=boxes,
+                object_index=self._object_indices[self._owner],
+                **self._styles[self._owner]._asdict(),
+            )
+        )
+        self._chars, self._boxes = [], []
+
+
+def _textpage_flag(result: int, char_index: int, question: str) -> bool:
+    """Return a 0/1 FPDFText_* answer about a char as a bool; anything else is a pdfium failure."""
+    if result not in (0, 1):
+        raise _PdfiumFailure(f"read whether char {char_index} {question}")
+    return result == 1
+
+
+def _collect_text(textpage: pdfium_c.FPDF_TEXTPAGE, geometry: PageGeometry, object_indices: dict[int, int]) -> PageText:
+    """Walk every textpage char once: count them and group the non-generated ones."""
+    count = pdfium_c.FPDFText_CountChars(textpage)
+    if count < 0:
+        raise _PdfiumFailure("count the text page's chars")
+    builder = _SpanBuilder(textpage, geometry, object_indices)
+    generated = map_errors = 0
+    for char_index in range(count):
+        if _textpage_flag(pdfium_c.FPDFText_IsGenerated(textpage, char_index), char_index, "is generated"):
+            generated += 1
+            continue
+        map_error = pdfium_c.FPDFText_HasUnicodeMapError(textpage, char_index)
+        map_errors += _textpage_flag(map_error, char_index, "maps to Unicode")
+        builder.add(char_index)
+    stats = TextStats(char_count=count - generated, generated_count=generated, unicode_map_error_count=map_errors)
+    return PageText(spans=builder.finish(), stats=stats)
+
+
+def _read_page_text(page: pdfium.PdfPage, geometry: PageGeometry) -> PageText:
+    """Read a loaded page's spans, closing its textpage."""
+    page_number = geometry.page_number
+    try:
+        textpage = page.get_textpage()
+    except pdfium.PdfiumError as exc:
+        message = f"page {page_number}: pdfium cannot load the text page: {exc}"
+        raise PDFCorruptError(message, page_number=page_number) from exc
+    try:
+        return _collect_text(textpage.raw, geometry, _object_indices(page.raw))
+    except _PdfiumFailure as exc:
+        raise PDFCorruptError(f"page {page_number}: pdfium cannot {exc}", page_number=page_number) from exc
+    finally:
+        textpage.close()
+
+
+def page_text(handle: DocumentHandle, index: int) -> PageText:
+    """Return the text spans and textpage counts of the page at 0-based ``index``.
+
+    One pass over the textpage: generated chars (pdfium's inserted spaces
+    and line breaks) are counted and skipped; every other char joins the
+    span of its owning text object (see :class:`RawSpan`). Boxes are mapped
+    to the displayed page with :func:`to_display_box`. The page and textpage
+    handles are closed before returning.
+
+    Raises:
+        TypeError: If ``handle`` is not a DocumentHandle, or ``index`` is not
+            an int (bool rejected).
+        ValueError: If ``handle`` is closed.
+        IndexError: If ``index`` is outside ``0..page_count - 1``.
+        PDFCorruptError: If pdfium cannot load the page or its textpage, or a
+            pdfium call on them fails (``page_number`` is set).
+    """
+    page, page_number = _load_page(handle, index)
+    try:
+        return _read_page_text(page, _read_geometry(page, page_number))
+    finally:
+        page.close()
