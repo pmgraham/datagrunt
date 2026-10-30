@@ -10,6 +10,7 @@ from __future__ import annotations
 import io
 import math
 import os
+import re
 import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -90,12 +91,18 @@ PageItem = TextRun | Line | Rect | RasterImage
 @dataclass(frozen=True)
 class PageSpec:
     """One page: its size in points, the items drawn on it in order, and its
-    /Rotate. Item coordinates are in the unrotated page space."""
+    /Rotate. ``width`` x ``height`` is the unrotated MediaBox; item
+    coordinates are in that unrotated page space. /Rotate turns the displayed
+    page clockwise, so a 90 or 270 page displays ``height`` wide.
+
+    ``crop_box`` is the visible area as top-left ``(x0, y0, x1, y1)`` points
+    inside the page, or None for no /CropBox (the whole MediaBox shows)."""
 
     width: float = 612.0
     height: float = 792.0
     items: tuple[PageItem, ...] = ()
     rotate: int = 0
+    crop_box: tuple[float, float, float, float] | None = None
 
 
 def first_unencodable(font: str, text: str) -> str | None:
@@ -160,6 +167,35 @@ def build_pdf(
     return out
 
 
+# ReportLab writes one flat, uncompressed /Kids array and "\nN 0 obj" headers.
+_KIDS = re.compile(rb"/Kids \[([^\]]*)\]")
+_KID_REF = re.compile(rb"(\d+) 0 R")
+
+
+def break_page(path: str | os.PathLike[str], page_number: int) -> Path:
+    """Make page ``page_number`` (1-based) of a ``build_pdf`` file unloadable, in place.
+
+    Renames that page object's ``/Type /Page`` to ``/Type /Pagx``: the same
+    length, so every xref offset stays valid. pdfium still counts the page,
+    but ``FPDF_LoadPage`` fails on it; the other pages load normally (zeroing
+    a content stream would not do this: pdfium loads an empty page). Page
+    dictionaries are never encrypted, so this works on encrypted files too.
+    """
+    out = Path(path)
+    data = out.read_bytes()
+    _require_int("page_number", page_number)
+    kids = _KIDS.findall(data)
+    _require(len(kids) == 1, f"expected one /Kids array (a build_pdf file), found {len(kids)}")
+    refs = _KID_REF.findall(kids[0])
+    _require(1 <= page_number <= len(refs), f"page_number must be in 1..{len(refs)}, got {page_number}")
+    start = data.index(b"\n" + refs[page_number - 1] + b" 0 obj")
+    end = data.index(b"endobj", start)
+    page_object = data[start:end]
+    _require(page_object.count(b"/Type /Page") == 1, f"page {page_number} has no single /Type /Page entry")
+    out.write_bytes(data[:start] + page_object.replace(b"/Type /Page", b"/Type /Pagx") + data[end:])
+    return out
+
+
 def _require(ok: bool, message: str) -> None:
     if not ok:
         raise ValueError(message)
@@ -206,8 +242,25 @@ def _check_page(page: PageSpec) -> None:
     _require_positive("PageSpec.height", page.height)
     _require_int("PageSpec.rotate", page.rotate)
     _require(page.rotate in _ROTATIONS, f"PageSpec.rotate must be one of {_ROTATIONS}, got {page.rotate!r}")
+    if page.crop_box is not None:
+        _check_crop_box(page)
     for item in page.items:
         _check_item(item)
+
+
+def _check_crop_box(page: PageSpec) -> None:
+    box = page.crop_box
+    if not isinstance(box, tuple):
+        raise TypeError(f"PageSpec.crop_box must be a tuple or None, got {type(box).__name__}")
+    _require(len(box) == 4, f"PageSpec.crop_box must have 4 values (x0, y0, x1, y1), got {len(box)}")
+    for index, value in enumerate(box):
+        _require_finite(f"PageSpec.crop_box[{index}]", value)
+    x0, y0, x1, y1 = box
+    _require(x0 < x1 and y0 < y1, f"PageSpec.crop_box must have x0 < x1 and y0 < y1, got {box!r}")
+    # pdfium silently intersects a CropBox with the MediaBox; refuse one that
+    # would be clipped, so a test's crop box is always the box pdfium shows.
+    inside = x0 >= 0 and y0 >= 0 and x1 <= page.width and y1 <= page.height
+    _require(inside, f"PageSpec.crop_box must lie within the {page.width} x {page.height} page, got {box!r}")
 
 
 def _check_item(item: PageItem) -> None:
@@ -274,9 +327,21 @@ def _flip_y(page_height: float, y: float) -> float:
     return page_height - y
 
 
+def _pdf_box(page_height: float, box: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    """Convert a top-left (x0, y0, x1, y1) box to PDF bottom-left (left, bottom, right, top)."""
+    x0, y0, x1, y1 = box
+    return x0, _flip_y(page_height, y1), x1, _flip_y(page_height, y0)
+
+
 def _draw_page(canvas: Canvas, page: PageSpec) -> None:
-    canvas.setPageSize((page.width, page.height))
+    # ReportLab 5.1 treats the page size as the displayed size: on /Rotate 90
+    # and 270 it writes MediaBox [0 0 height width]. Swap first so the
+    # MediaBox is always [0 0 width height], the space items are drawn in.
+    quarter_turn = page.rotate in (90, 270)
+    canvas.setPageSize((page.height, page.width) if quarter_turn else (page.width, page.height))
     canvas.setPageRotation(page.rotate)
+    # ReportLab keeps a crop box for every later page; set (or clear) it per page.
+    canvas.setCropBox(_pdf_box(page.height, page.crop_box) if page.crop_box is not None else None)
     for item in page.items:
         canvas.saveState()
         _draw_item(canvas, item, page.height)

@@ -21,6 +21,7 @@ from pdf_tests.builders import (
     RasterImage,
     Rect,
     TextRun,
+    break_page,
     build_pdf,
     first_unencodable,
     solid_png,
@@ -449,13 +450,49 @@ class TestPages:
 
         assert pdfium.PdfDocument(path)[0].get_rotation() == rotate
 
-    def test_rotated_page_size_is_unrotated(self, tmp_path):
-        # pdfium behaviour later phases rely on: get_size() ignores /Rotate.
-        path = build_pdf(tmp_path / "rot.pdf", [PageSpec(width=400.0, height=300.0, rotate=90)])
+    @pytest.mark.parametrize(
+        "rotate,displayed",
+        [(0, (400.0, 300.0)), (90, (300.0, 400.0)), (180, (400.0, 300.0)), (270, (300.0, 400.0))],
+    )
+    def test_spec_size_is_the_unrotated_media_box(self, tmp_path, rotate, displayed):
+        # pdfium behaviour later phases rely on: get_bbox() is the unrotated
+        # box, get_size() the displayed one (swapped by /Rotate 90 and 270).
+        path = build_pdf(tmp_path / "rot.pdf", [PageSpec(width=400.0, height=300.0, rotate=rotate)])
 
         page = pdfium.PdfDocument(path)[0]
-        assert page.get_rotation() == 90
-        assert page.get_size() == pytest.approx((400.0, 300.0))
+        assert page.get_rotation() == rotate
+        assert page.get_bbox() == pytest.approx((0.0, 0.0, 400.0, 300.0))
+        assert page.get_size() == pytest.approx(displayed)
+
+    @pytest.mark.parametrize("rotate", [0, 90, 180, 270])
+    def test_rotated_page_items_stay_in_unrotated_space(self, tmp_path, rotate):
+        spec = PageSpec(width=400.0, height=300.0, items=(TextRun("Total", x=72.0, y=100.0),), rotate=rotate)
+        path = build_pdf(tmp_path / "rot.pdf", [spec])
+
+        page = pdfium.PdfDocument(path)[0]
+        left, bottom, _right, _top = page.get_textpage().get_charbox(0)
+        unrotated_height = page.get_bbox()[3]
+        assert (left, unrotated_height - bottom) == pytest.approx((72.0, 100.0), abs=TOL)
+
+    @pytest.mark.parametrize("rotate,displayed", [(0, (300.0, 240.0)), (90, (240.0, 300.0))])
+    def test_crop_box_is_the_visible_box(self, tmp_path, rotate, displayed):
+        # Top-left (50, 20)-(350, 260) on a 400 x 300 page is PDF (50, 40)-(350, 280).
+        spec = PageSpec(width=400.0, height=300.0, rotate=rotate, crop_box=(50.0, 20.0, 350.0, 260.0))
+        path = build_pdf(tmp_path / "crop.pdf", [spec])
+
+        page = pdfium.PdfDocument(path)[0]
+        assert page.get_mediabox() == pytest.approx((0.0, 0.0, 400.0, 300.0))
+        assert page.get_cropbox() == pytest.approx((50.0, 40.0, 350.0, 280.0))
+        assert page.get_bbox() == pytest.approx((50.0, 40.0, 350.0, 280.0))
+        assert page.get_size() == pytest.approx(displayed)
+
+    def test_crop_box_applies_to_its_own_page_only(self, tmp_path):
+        pages = [PageSpec(crop_box=(10.0, 10.0, 100.0, 100.0)), PageSpec()]
+        path = build_pdf(tmp_path / "crop.pdf", pages)
+
+        second = pdfium.PdfDocument(path)[1]
+        assert second.get_cropbox(fallback_ok=False) is None
+        assert second.get_bbox() == pytest.approx((0.0, 0.0, 612.0, 792.0))
 
     def test_multi_page_count_sizes_and_content(self, tmp_path):
         sizes = [(612.0, 792.0), (400.0, 300.0), (842.0, 595.0)]
@@ -471,6 +508,33 @@ class TestPages:
             assert page.get_size() == pytest.approx(size)
             assert page.get_textpage().get_text_range() == f"Page {n}"
             assert first_char_top_left(page)[1] == pytest.approx(100.0, abs=TOL)
+
+
+class TestBreakPage:
+    """break_page leaves one page that pdfium counts but cannot load."""
+
+    @pytest.mark.parametrize("kwargs", [pytest.param({}, id="plain"), pytest.param({"user_password": "pw"}, id="enc")])
+    def test_only_the_broken_page_fails_to_load(self, tmp_path, kwargs):
+        pages = [PageSpec(items=(TextRun(f"Page {n}", x=72.0, y=100.0),)) for n in (1, 2, 3)]
+        path = build_pdf(tmp_path / "three.pdf", pages, **kwargs)
+        size = path.stat().st_size
+
+        assert break_page(path, 2) == path
+        assert path.stat().st_size == size
+        pdf = pdfium.PdfDocument(path, password=kwargs.get("user_password"))
+        assert len(pdf) == 3
+        with pytest.raises(pdfium.PdfiumError, match="Failed to load page"):
+            pdf[1]
+        assert [pdf[i].get_textpage().get_text_range() for i in (0, 2)] == ["Page 1", "Page 3"]
+
+    @pytest.mark.parametrize("page_number,error", [(0, ValueError), (4, ValueError), (True, TypeError)])
+    def test_page_number_outside_the_file_raises(self, tmp_path, page_number, error):
+        path = build_pdf(tmp_path / "three.pdf", [PageSpec(), PageSpec(), PageSpec()])
+        original = path.read_bytes()
+
+        with pytest.raises(error, match="page_number"):
+            break_page(path, page_number)
+        assert path.read_bytes() == original
 
 
 class TestValidation:
@@ -585,6 +649,42 @@ class TestValidation:
                 "RasterImage.png must be PNG data (it lacks the PNG signature)",
                 id="img-not-png",
             ),
+            pytest.param(
+                [PageSpec(crop_box=(0.0, 0.0, 10.0))],
+                {},
+                "PageSpec.crop_box must have 4 values (x0, y0, x1, y1), got 3",
+                id="crop-length",
+            ),
+            pytest.param(
+                [PageSpec(crop_box=(0.0, 0.0, math.inf, 10.0))],
+                {},
+                "PageSpec.crop_box[2] must be finite, got inf",
+                id="crop-inf",
+            ),
+            pytest.param(
+                [PageSpec(crop_box=(50.0, 0.0, 50.0, 10.0))],
+                {},
+                "PageSpec.crop_box must have x0 < x1 and y0 < y1, got (50.0, 0.0, 50.0, 10.0)",
+                id="crop-empty-x",
+            ),
+            pytest.param(
+                [PageSpec(crop_box=(0.0, 20.0, 10.0, 10.0))],
+                {},
+                "PageSpec.crop_box must have x0 < x1 and y0 < y1, got (0.0, 20.0, 10.0, 10.0)",
+                id="crop-reversed-y",
+            ),
+            pytest.param(
+                [PageSpec(crop_box=(-1.0, 0.0, 10.0, 10.0))],
+                {},
+                "PageSpec.crop_box must lie within the 612.0 x 792.0 page, got (-1.0, 0.0, 10.0, 10.0)",
+                id="crop-off-page-left",
+            ),
+            pytest.param(
+                [PageSpec(crop_box=(0.0, 0.0, 10.0, 800.0))],
+                {},
+                "PageSpec.crop_box must lie within the 612.0 x 792.0 page, got (0.0, 0.0, 10.0, 800.0)",
+                id="crop-off-page-bottom",
+            ),
             pytest.param([PageSpec()], {"strength": 64}, "strength must be one of (40, 128), got 64", id="strength"),
             pytest.param(
                 [PageSpec()],
@@ -621,6 +721,12 @@ class TestValidation:
             ),
             pytest.param([PageSpec(rotate=90.0)], {}, "PageSpec.rotate must be an int, got 90.0", id="rotate-float"),
             pytest.param([PageSpec(rotate=False)], {}, "PageSpec.rotate must be an int, got False", id="rotate-bool"),
+            pytest.param(
+                [PageSpec(crop_box=[0.0, 0.0, 10.0, 10.0])],
+                {},
+                "PageSpec.crop_box must be a tuple or None, got list",
+                id="crop-list",
+            ),
             pytest.param([PageSpec()], {"strength": 128.0}, "strength must be an int, got 128.0", id="strength-float"),
             pytest.param([PageSpec()], {"strength": True}, "strength must be an int, got True", id="strength-bool"),
         ],
