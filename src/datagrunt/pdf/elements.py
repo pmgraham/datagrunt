@@ -776,6 +776,13 @@ class Figure(_Element):
       ``image_path`` when set, else from ``_loader``. It is not checked
       against ``sha256``, which hashes the raw stream, not the PNG.
 
+    The engine sets both loaders to an ``ImageLoader``'s bound methods,
+    which reopen the PDF on demand. For an encrypted PDF that loader holds
+    the password, so a pickled Figure (one sent across a process pool)
+    carries the password inside its loaders' pickle: never store or send
+    such a pickle anywhere the PDF's readers could not already go. The
+    password stays out of the Figure's repr and equality.
+
     Attributes:
         sha256: SHA-256 of the image's raw embedded stream, 64 lowercase hex
             characters. Unlike a hash of exported bytes, it survives encoder

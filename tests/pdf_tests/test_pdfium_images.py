@@ -8,12 +8,15 @@ forms with a /Matrix. Hand-written content is in PDF user space (bottom-left
 origin) on a 400 x 300 pt page, so a display y is ``300 - y``.
 """
 
+import base64
+import ctypes
 import dataclasses
 import gc
 import hashlib
 import io
 import pickle
 import re
+import struct
 import subprocess
 import sys
 import traceback
@@ -46,6 +49,7 @@ VALID = {
     "bbox": (10.0, 20.0, 110.0, 70.0),
     "px_width": 64,
     "px_height": 32,
+    "declared_px": (64, 32),
     "object_index": 0,
     "raw_sha256": SHA,
     "filters": ("FlateDecode",),
@@ -59,8 +63,16 @@ def raw_image(**overrides) -> RawImage:
     return RawImage(**{**VALID, **overrides})
 
 
-def stats(nonfinite: int = 0, oversized: int = 0, cover: float = 0.0) -> ImageStats:
-    return ImageStats(skipped_nonfinite_images=nonfinite, skipped_oversized_images=oversized, max_cover_fraction=cover)
+def stats(
+    nonfinite: int = 0, oversized: int = 0, cover: float = 0.0, unsized: int = 0, over_budget: int = 0
+) -> ImageStats:
+    return ImageStats(
+        skipped_nonfinite_images=nonfinite,
+        skipped_oversized_images=oversized,
+        skipped_unsized_images=unsized,
+        skipped_over_budget_images=over_budget,
+        max_cover_fraction=cover,
+    )
 
 
 class TestRawImage:
@@ -77,6 +89,9 @@ class TestRawImage:
         with pytest.raises(dataclasses.FrozenInstanceError):
             item.px_width = 1  # type: ignore[misc]
         assert not hasattr(item, "__dict__")
+
+    def test_a_stream_not_read_has_no_hash(self):
+        assert raw_image(raw_sha256=None, bits_per_pixel=None, colorspace=None).raw_sha256 is None
 
     def test_int_box_values_are_stored_as_floats_and_zero_pixels_are_kept(self):
         # pdfium reads a missing or zero /Width as 0 px: a raw fact, kept here.
@@ -104,7 +119,21 @@ class TestRawImage:
             pytest.param(
                 {"raw_sha256": SHA.upper()}, ValueError, "raw_sha256 must be 64 lowercase hex characters", id="sha"
             ),
-            pytest.param({"raw_sha256": None}, TypeError, "raw_sha256 must be a str, got None", id="sha-type"),
+            pytest.param({"raw_sha256": 7}, TypeError, "raw_sha256 must be a str, got 7", id="sha-type"),
+            pytest.param({"declared_px": [64, 32]}, TypeError, "declared_px must be a tuple, got list", id="declared"),
+            pytest.param(
+                {"declared_px": (64,)}, ValueError, "declared_px must have 2 values, got 1", id="declared-size"
+            ),
+            pytest.param(
+                {"declared_px": (131072, 1)},
+                ValueError,
+                "declared_px[0] must be <= 131071, got 131072",
+                id="declared-max",
+            ),
+            pytest.param(
+                {"declared_px": (-1, 1)}, ValueError, "declared_px[0] must be >= 0, got -1", id="declared-min"
+            ),
+            pytest.param({"px_width": 131072}, ValueError, "px_width must be <= 131071, got 131072", id="width-max"),
             pytest.param(
                 {"filters": ["FlateDecode"]}, TypeError, "filters must be a tuple of str, got list", id="filters"
             ),
@@ -130,7 +159,7 @@ class TestPageImagesAndStats:
     """PageImages and ImageStats are frozen, slotted, picklable, validated records."""
 
     def test_pickle_round_trip(self):
-        original = PageImages(images=(raw_image(),), stats=stats(1, 2, 0.5))
+        original = PageImages(images=(raw_image(),), stats=stats(1, 2, 0.5, unsized=3, over_budget=4))
 
         assert pickle.loads(pickle.dumps(original)) == original
         with pytest.raises(dataclasses.FrozenInstanceError):
@@ -148,6 +177,15 @@ class TestPageImagesAndStats:
             ),
             pytest.param(
                 lambda: stats(oversized=True), TypeError, "skipped_oversized_images must be an int, got True", id="big"
+            ),
+            pytest.param(
+                lambda: stats(unsized=-1), ValueError, "skipped_unsized_images must be >= 0, got -1", id="unsized"
+            ),
+            pytest.param(
+                lambda: stats(over_budget=1.0),
+                TypeError,
+                "skipped_over_budget_images must be an int, got 1.0",
+                id="budget",
             ),
             pytest.param(lambda: stats(cover=1.5), ValueError, "max_cover_fraction must be <= 1.0, got 1.5", id="over"),
             pytest.param(
@@ -448,6 +486,12 @@ class TestPixelMetadata:
         assert (image.bits_per_pixel, image.colorspace, image.raw_sha256) == (None, None, sha(data))
 
 
+def unread_image(bbox, object_index: int, **facts) -> RawImage:
+    """The RawImage of an image whose stream was not read: no hash, no pixel size, no pixel metadata."""
+    fields = {"px_width": 0, "px_height": 0, "raw_sha256": None, "bits_per_pixel": None, "colorspace": None}
+    return RawImage(bbox=bbox, object_index=object_index, **{**fields, **facts})
+
+
 def cover_of(path: Path) -> float:
     return images_of(path).stats.max_cover_fraction
 
@@ -538,11 +582,12 @@ class TestSkippedImages:
 
         assert page_images(handle, 0) == PageImages(images=(), stats=stats(nonfinite=1))
 
-    def test_a_raw_stream_over_the_asset_limit_is_skipped_but_still_covers(self, tmp_path, monkeypatch):
+    def test_a_raw_stream_over_the_asset_limit_is_recorded_without_its_hash(self, tmp_path, monkeypatch):
         path = xobject_page(tmp_path, FLATE, RGB_4X2 + b" /Filter /FlateDecode")
         monkeypatch.setattr(_pdfium_images, "_MAX_ASSET_BYTES", len(FLATE) - 1)
 
-        assert images_of(path) == PageImages(images=(), stats=stats(oversized=1, cover=80 * 40 / 120000))
+        unread = unread_image((10.0, 240.0, 90.0, 280.0), 0, declared_px=(4, 2), filters=("FlateDecode",))
+        assert images_of(path) == PageImages(images=(unread,), stats=stats(oversized=1, cover=80 * 40 / 120000))
 
     def test_a_raw_stream_at_the_asset_limit_is_read(self, tmp_path, monkeypatch):
         path = xobject_page(tmp_path, FLATE, RGB_4X2 + b" /Filter /FlateDecode")
@@ -626,6 +671,7 @@ PDFIUM_FAILURES = [
         "cannot read the raw stream of object 0",
     ),
     ("FPDFImageObj_GetImageMetadata", failing(0), "page 1: pdfium cannot read the metadata of object 0"),
+    ("FPDFImageObj_GetImagePixelSize", failing(0), "page 1: pdfium cannot read the pixel size of object 0"),
     (
         "FPDFImageObj_GetImageMetadata",
         writes_colorspace(12),
@@ -696,7 +742,7 @@ PASSWORD = "s3cret-pw"
 
 
 def loader(**overrides) -> ImageLoader:
-    fields = {"source": Path("/docs/doc.pdf"), "page_index": 0, "object_index": 0, "raw_sha256": SHA}
+    fields = {"source": Path("/docs/doc.pdf"), "page_index": 0, "image": raw_image()}
     return ImageLoader(**{**fields, **overrides})
 
 
@@ -704,7 +750,7 @@ class TestImageLoaderRecord:
     """ImageLoader is a frozen, slotted, picklable record that never shows its password."""
 
     def test_pickle_round_trip_keeps_the_password(self):
-        original = loader(page_index=2, object_index=5, password=PASSWORD)
+        original = loader(page_index=2, image=raw_image(object_index=5), password=PASSWORD)
 
         # Our own object, pickled and unpickled in this test: no untrusted data.
         restored = pickle.loads(pickle.dumps(original))
@@ -727,6 +773,11 @@ class TestImageLoaderRecord:
         assert locked == loader(password="other") == loader()
         assert hash(locked) == hash(loader())
 
+    def test_names_the_image_it_verifies(self):
+        image_loader = loader(image=raw_image(object_index=5))
+
+        assert (image_loader.object_index, image_loader.raw_sha256) == (5, SHA)
+
     def test_a_str_source_becomes_an_absolute_path(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
 
@@ -738,8 +789,13 @@ class TestImageLoaderRecord:
             pytest.param({"source": b"doc.pdf"}, TypeError, "source must be a str or os.PathLike, got bytes", id="src"),
             pytest.param({"page_index": -1}, ValueError, "page_index must be >= 0, got -1", id="page"),
             pytest.param({"page_index": True}, TypeError, "page_index must be an int, got True", id="page-bool"),
-            pytest.param({"object_index": -1}, ValueError, "object_index must be >= 0, got -1", id="object"),
-            pytest.param({"raw_sha256": "abc"}, ValueError, "raw_sha256 must be 64 lowercase hex characters", id="sha"),
+            pytest.param({"image": object()}, TypeError, "image must be a RawImage, got object", id="image"),
+            pytest.param(
+                {"image": raw_image(raw_sha256=None)},
+                ValueError,
+                "image has no raw_sha256 (its stream was not read): there is nothing to verify a read against",
+                id="no-hash",
+            ),
         ],
     )
     def test_invalid_field_raises(self, overrides, error, message):
@@ -765,13 +821,7 @@ JPEG_ENTRIES = b"/Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 
 
 def loader_for(path: Path, image: RawImage, page_index: int = 0, password: str | None = None) -> ImageLoader:
     """The loader of ``image`` (from page ``page_index`` of ``path``)."""
-    return ImageLoader(
-        source=path,
-        page_index=page_index,
-        object_index=image.object_index,
-        raw_sha256=image.raw_sha256,
-        password=password,
-    )
+    return ImageLoader(source=path, page_index=page_index, image=image, password=password)
 
 
 def only_loader(path: Path, password: str | None = None) -> ImageLoader:
@@ -1041,15 +1091,15 @@ class TestPngBytes:
 
         assert decoded(image_loader.png_bytes()).size == (4, 2)
 
-    def test_a_bitmap_bigger_than_declared_is_refused_and_freed(self, tmp_path, monkeypatch):
+    def test_a_bitmap_bigger_than_its_header_is_refused_and_freed(self, tmp_path, monkeypatch):
         image_loader = only_loader(xobject_page(tmp_path, FLATE, RGB_4X2 + b" /Filter /FlateDecode"))
         destroyed = []
         destroy = pdfium_c.FPDFBitmap_Destroy
-        monkeypatch.setattr(_pdfium_images, "_MAX_DECODED_PIXELS", 7)
-        monkeypatch.setattr(pdfium_c, "FPDFImageObj_GetImagePixelSize", writes_size(1, 1))
+        monkeypatch.setattr(_pdfium_images, "_MAX_DECODED_PIXELS", 8)
+        monkeypatch.setattr(pdfium_c, "FPDFBitmap_GetWidth", failing(5))
         monkeypatch.setattr(pdfium_c, "FPDFBitmap_Destroy", lambda bitmap: destroyed.append(destroy(bitmap)))
 
-        with pytest.raises(DatagruntPDFError, match=re.escape("object 0 decodes to 4 x 2 = 8 pixels")):
+        with pytest.raises(DatagruntPDFError, match=re.escape("object 0 decodes to 5 x 2 = 10 pixels")):
             image_loader.png_bytes()
         assert len(destroyed) == 1
 
@@ -1083,24 +1133,15 @@ class TestPngBytes:
         assert page_closes == ["PdfPage"]
         assert len(destroyed) == len([bitmap for bitmap in created if bitmap])
 
-    def test_an_image_pdfium_cannot_decode_raises_for_the_page(self, tmp_path):
-        # A zero /Width: pdfium reads the image but has no pixels to decode.
+    def test_an_image_without_a_pixel_size_is_refused_before_decoding(self, tmp_path, monkeypatch):
         image_loader = only_loader(
             xobject_page(tmp_path, bytes(24), b"/Width 0 /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8")
         )
+        monkeypatch.setattr(pdfium_c, "FPDFImageObj_GetBitmap", lambda image: pytest.fail("decoded anyway"))
 
-        with pytest.raises(PDFCorruptError, match=re.escape("page 1: pdfium cannot decode object 0")) as caught:
+        message = "page 1: object 0 has no pixel size pdfium can decode (0 x 2)"
+        with pytest.raises(DatagruntPDFError, match=re.escape(message)):
             image_loader.png_bytes()
-
-        assert caught.value.page_number == 1
-
-
-def writes_size(width, height):
-    def stand_in(image, out_width, out_height):
-        out_width.value, out_height.value = width, height
-        return 1
-
-    return stand_in
 
 
 class TestFigureThroughALoader:
@@ -1150,7 +1191,7 @@ class TestPlacementGeometry:
 
 
 class TestBitmapFormats:
-    """Every bitmap format pdfium decodes to becomes the Pillow image it holds."""
+    """Every bitmap format pdfium decodes to becomes a PNG of the pixels it holds."""
 
     @pytest.mark.parametrize(
         "bitmap_format,mode,pixel",
@@ -1166,8 +1207,428 @@ class TestBitmapFormats:
         try:
             # FillRect takes 0xAARRGGBB; a gray bitmap keeps the colour's luminance.
             assert pdfium_c.FPDFBitmap_FillRect(bitmap, 0, 0, 3, 2, 0x44112233 if mode != "L" else 0xFF808080)
-            got = _pdfium_images._bitmap_image(bitmap, "object 0")
+            got = decoded(_pdfium_images._bitmap_png(bitmap, "object 0"))
         finally:
             pdfium_c.FPDFBitmap_Destroy(bitmap)
 
         assert (got.mode, got.size, got.getpixel((2, 1))) == (mode, (3, 2), pixel)
+
+
+def j2k(size=(16, 8), *, siz=None, tile=None) -> bytes:
+    """A Pillow raw J2K codestream of a gray image; ``siz`` and ``tile`` overwrite its SIZ size and tile size."""
+    buffer = io.BytesIO()
+    Image.new("L", size, 128).save(buffer, "JPEG2000", no_jp2=True)
+    data = bytearray(buffer.getvalue())
+    at = data.find(b"\xff\x4f\xff\x51")
+    if siz is not None:
+        data[at + 8 : at + 16] = struct.pack(">II", *siz)
+    if tile is not None:
+        data[at + 24 : at + 32] = struct.pack(">II", *tile)
+    return bytes(data)
+
+
+def jpeg_with_frame(width: int, height: int) -> bytes:
+    """A 16 x 16 gray JPEG whose frame header (SOF0) claims ``width`` x ``height``."""
+    buffer = io.BytesIO()
+    Image.new("L", (16, 16), 128).save(buffer, "JPEG")
+    data = bytearray(buffer.getvalue())
+    sof = data.find(b"\xff\xc0")
+    data[sof + 5 : sof + 9] = struct.pack(">HH", height, width)
+    return bytes(data)
+
+
+def gray(width: int, height: int, codec: bytes) -> bytes:
+    return b"/Width %d /Height %d /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter %s" % (width, height, codec)
+
+
+JPX_16 = gray(16, 16, b"/JPXDecode")
+DCT_16 = gray(16, 16, b"/DCTDecode")
+DRAWN = 80 * 40 / 120000  # the cover of an image drawn by xobject_page
+
+
+@pytest.fixture
+def decode_calls(monkeypatch):
+    """Record every pdfium call that can decode an image's pixels; none of them reaches pdfium."""
+    calls = []
+    for name in ("FPDFImageObj_GetImageMetadata", "FPDFImageObj_GetBitmap", "FPDFImageObj_GetRenderedBitmap"):
+        monkeypatch.setattr(pdfium_c, name, lambda *args, _name=name: calls.append(_name))
+    return calls
+
+
+BOMB_SCRIPT = r"""
+import os, resource, sys, threading, time
+
+LIMIT = 1536 << 20  # bytes of peak RSS; past it the process ends at once
+
+
+def peak() -> int:
+    used = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return used if sys.platform == "darwin" else used * 1024  # macOS reports bytes, Linux KiB
+
+
+def watch() -> None:
+    # ctypes releases the GIL during pdfium calls, so this runs while pdfium allocates.
+    while True:
+        if peak() > LIMIT:
+            sys.stdout.write(f"killed: peak RSS over {LIMIT >> 20} MiB\n")
+            sys.stdout.flush()
+            os._exit(99)
+        time.sleep(0.005)
+
+
+threading.Thread(target=watch, daemon=True).start()
+from datagrunt.pdf import DatagruntPDFError
+from datagrunt.pdf.pdfium_engine import ImageLoader, open_document, page_images
+
+(image,) = page_images(open_document(sys.argv[1]), 0).images
+print(f"page_images: px {image.px_width} x {image.px_height}", flush=True)
+try:
+    ImageLoader(source=sys.argv[1], page_index=0, image=image).png_bytes()
+except DatagruntPDFError as exc:
+    print(f"refused: {exc}")
+print(f"peak {peak() >> 20} MiB")
+"""
+
+
+def run_memory_limited(path: Path) -> subprocess.CompletedProcess:
+    """BOMB_SCRIPT on ``path`` in a fresh interpreter that exits (99) once its peak RSS passes 1.5 GiB."""
+    return subprocess.run(
+        [sys.executable, "-c", BOMB_SCRIPT, str(path)], capture_output=True, check=False, timeout=120, text=True
+    )
+
+
+class TestDecodeBounds:
+    """pdfium decodes DCT at the JPEG frame's size and JPX at the codestream's: those sizes are bounded, not /Width."""
+
+    def test_a_jpx_bomb_is_recorded_at_its_codestream_size_without_decoding(self, tmp_path, decode_calls):
+        bomb = j2k((16, 16), siz=(16000, 16000), tile=(16000, 16000))
+
+        got = images_of(xobject_page(tmp_path, bomb, JPX_16))
+
+        (image,) = got.images
+        assert (image.px_width, image.px_height, image.declared_px) == (16000, 16000, (16, 16))
+        assert (image.bits_per_pixel, image.colorspace, image.raw_sha256) == (None, None, sha(bomb))
+        assert got.stats == stats(oversized=1, cover=DRAWN)
+        assert decode_calls == []
+
+    def test_a_jpx_bomb_is_refused_before_decoding(self, tmp_path, decode_calls):
+        bomb = j2k((16, 16), siz=(16000, 16000), tile=(16000, 16000))
+        image_loader = only_loader(xobject_page(tmp_path, bomb, JPX_16))
+
+        message = "page 1: object 0 decodes to 16000 x 16000 = 256000000 pixels, over the 89478485-pixel bound"
+        with pytest.raises(DatagruntPDFError, match=re.escape(message)):
+            image_loader.png_bytes()
+        assert image_loader.raw_bytes() == bomb
+        assert decode_calls == []
+
+    def test_a_jpx_tiled_past_the_tile_bound_is_refused(self, tmp_path, decode_calls):
+        # Pillow's one 16 x 8 tile, repeated over 2000 x 2000: 125 x 250 tiles. OpenJPEG
+        # allocates ~12 KB per tile as it reads the header (observed: 15625 tiles took 234 MB).
+        bomb = j2k((16, 8), siz=(2000, 2000))
+        path = xobject_page(tmp_path, bomb, gray(2000, 2000, b"/JPXDecode"))
+
+        got = images_of(path)
+
+        assert got.stats == stats(oversized=1, cover=DRAWN)
+        with pytest.raises(DatagruntPDFError, match=re.escape("object 0 decodes in 31250 tiles, over the 4096-tile")):
+            only_loader(path).png_bytes()
+        assert decode_calls == []
+
+    def test_the_jpx_tile_bound(self):
+        assert _pdfium_images._MAX_JPX_TILES == 4096
+
+    def test_jpx_pixel_metadata_is_never_read(self, tmp_path, monkeypatch):
+        # pdfium decodes a JPX image in full to report its bits per pixel and colour space.
+        calls = []
+        monkeypatch.setattr(pdfium_c, "FPDFImageObj_GetImageMetadata", lambda *args: calls.append(args))
+        path = xobject_page(tmp_path, j2k((16, 8)), gray(16, 8, b"/JPXDecode"))
+
+        got = images_of(path)
+
+        (image,) = got.images
+        assert (image.px_width, image.px_height, image.bits_per_pixel, image.colorspace) == (16, 8, None, None)
+        assert got.stats == stats(cover=DRAWN)
+        assert decoded(only_loader(path).png_bytes()).size == (16, 8)
+        assert calls == []
+
+    @pytest.mark.parametrize(
+        "data,entries",
+        [
+            pytest.param(j2k((16, 16), siz=(20000, 20000), tile=(20000, 20000)), JPX_16, id="jpx"),
+            pytest.param(jpeg_with_frame(30000, 30000), DCT_16, id="dct"),
+        ],
+    )
+    def test_a_bomb_stays_small_in_a_memory_limited_process(self, tmp_path, data, entries):
+        done = run_memory_limited(xobject_page(tmp_path, data, entries))
+
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert "refused: " in done.stdout and "over the 89478485-pixel bound" in done.stdout
+        assert int(re.search(r"peak (\d+) MiB", done.stdout).group(1)) < 400, done.stdout
+
+    def test_a_jpeg_bomb_is_sized_by_its_frame_and_refused_before_decoding(self, tmp_path, decode_calls):
+        bomb = jpeg_with_frame(26000, 26000)
+        path = xobject_page(tmp_path, bomb, DCT_16)
+
+        got = images_of(path)
+
+        (image,) = got.images
+        assert (image.px_width, image.px_height, image.declared_px) == (26000, 26000, (16, 16))
+        assert got.stats == stats(oversized=1, cover=DRAWN)
+        message = "page 1: object 0 decodes to 26000 x 26000 = 676000000 pixels, over the 89478485-pixel bound"
+        with pytest.raises(DatagruntPDFError, match=re.escape(message)):
+            loader_for(path, image).png_bytes()
+        assert decode_calls == []
+
+    @pytest.mark.parametrize(
+        "frame,declared",
+        [
+            pytest.param((16, 16), (12000, 12000), id="declared-larger"),
+            pytest.param((300, 200), (16, 16), id="frame-larger"),
+        ],
+    )
+    def test_a_jpeg_decodes_at_its_frame_size_whatever_its_dictionary_says(self, tmp_path, frame, declared):
+        path = xobject_page(tmp_path, jpeg_with_frame(*frame), gray(*declared, b"/DCTDecode"))
+
+        (image,) = images_of(path).images
+
+        assert (image.px_width, image.px_height, image.declared_px) == (*frame, declared)
+        assert (image.bits_per_pixel, image.colorspace) == (8, "DeviceGray")
+        assert decoded(loader_for(path, image).png_bytes()).size == frame
+
+    @pytest.mark.parametrize(
+        "name,wrap",
+        [
+            pytest.param(b"ASCII85Decode", lambda data: base64.a85encode(data) + b"~>", id="ascii85"),
+            pytest.param(b"ASCIIHexDecode", lambda data: data.hex().encode() + b">", id="asciihex"),
+        ],
+    )
+    def test_an_ascii_wrapped_jpeg_is_sized_by_its_frame(self, tmp_path, name, wrap):
+        # ReportLab writes every JPEG as [/ASCII85Decode /DCTDecode].
+        wrapped = wrap(jpeg_bytes((16, 8)))
+        entries = b"/Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter [/%s /DCTDecode]" % name
+        path = xobject_page(tmp_path, wrapped, entries)
+
+        (image,) = images_of(path).images
+
+        assert (image.px_width, image.px_height, image.raw_sha256) == (16, 8, sha(wrapped))
+        assert (image.filters, image.bits_per_pixel, image.colorspace) == (
+            (name.decode(), "DCTDecode"),
+            24,
+            "DeviceRGB",
+        )
+        assert decoded(loader_for(path, image).png_bytes()).size == (16, 8)
+
+    def test_an_ascii_wrapped_jpeg_bomb_is_refused(self, tmp_path, decode_calls):
+        wrapped = base64.a85encode(jpeg_with_frame(26000, 26000)) + b"~>"
+        entries = (
+            b"/Width 16 /Height 16 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter [/ASCII85Decode /DCTDecode]"
+        )
+
+        got = images_of(xobject_page(tmp_path, wrapped, entries))
+
+        assert [(item.px_width, item.px_height) for item in got.images] == [(26000, 26000)]
+        assert got.stats == stats(oversized=1, cover=DRAWN)
+        assert decode_calls == []
+
+    def test_a_jpeg_behind_flate_is_never_decoded(self, tmp_path, monkeypatch, decode_calls):
+        decoded_reads = []
+        monkeypatch.setattr(pdfium_c, "FPDFImageObj_GetImageDataDecoded", lambda *args: decoded_reads.append(args))
+        flated = zlib.compress(jpeg_bytes((16, 8)))
+        entries = b"/Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter [/FlateDecode /DCTDecode]"
+        path = xobject_page(tmp_path, flated, entries)
+
+        got = images_of(path)
+
+        (image,) = got.images
+        assert (image.px_width, image.px_height, image.declared_px, image.raw_sha256) == (0, 0, (16, 8), sha(flated))
+        assert got.stats == stats(unsized=1, cover=DRAWN)
+        message = "page 1: object 0 is a DCTDecode stream behind FlateDecode: its size cannot be read without decoding"
+        with pytest.raises(DatagruntPDFError, match=re.escape(message)):
+            loader_for(path, image).png_bytes()
+        assert (decode_calls, decoded_reads) == ([], [])
+
+    @pytest.mark.parametrize("codec", [b"DCTDecode", b"JPXDecode"])
+    def test_an_unreadable_header_is_never_decoded(self, tmp_path, decode_calls, codec):
+        path = xobject_page(tmp_path, b"not a codestream", gray(16, 16, b"/" + codec))
+
+        got = images_of(path)
+
+        assert [(item.px_width, item.px_height, item.declared_px) for item in got.images] == [(0, 0, (16, 16))]
+        assert got.stats == stats(unsized=1, cover=DRAWN)
+        message = f"page 1: object 0 has a {codec.decode()} header that cannot be read"
+        with pytest.raises(DatagruntPDFError, match=re.escape(message)):
+            loader_for(path, got.images[0]).png_bytes()
+        assert decode_calls == []
+
+    def test_an_ascii_wrapped_stream_over_its_bound_is_never_decoded(self, tmp_path, monkeypatch):
+        # ASCII85's "z" makes 4 bytes of 1, so the wrapped stream is bounded before pdfium decodes it.
+        wrapped = base64.a85encode(jpeg_bytes((16, 8))) + b"~>"
+        entries = b"/Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter [/ASCII85Decode /DCTDecode]"
+        monkeypatch.setattr(_pdfium_images, "_MAX_ASCII_WRAPPED_BYTES", len(wrapped) - 1)
+        monkeypatch.setattr(pdfium_c, "FPDFImageObj_GetImageDataDecoded", lambda *args: pytest.fail("decoded"))
+
+        got = images_of(xobject_page(tmp_path, wrapped, entries))
+
+        assert [(item.px_width, item.px_height) for item in got.images] == [(0, 0)]
+        assert got.stats == stats(unsized=1, cover=DRAWN)
+
+    def test_the_ascii_wrapped_bound_keeps_the_decoded_stream_within_a_quarter_of_the_asset_limit(self):
+        assert _pdfium_images._MAX_ASCII_WRAPPED_BYTES == elements._MAX_ASSET_BYTES // 16
+
+    @pytest.mark.parametrize("width", [-5, 0, 131072])
+    def test_an_impossible_width_is_unknown_and_never_decoded(self, tmp_path, decode_calls, width):
+        # pdfium reads /Width -5 as 4294967291 and decodes nothing wider than 131071.
+        path = xobject_page(
+            tmp_path, bytes(24), b"/Width %d /Height 2 /ColorSpace /DeviceRGB /BitsPerComponent 8" % width
+        )
+
+        got = images_of(path)
+
+        assert [(item.px_width, item.px_height, item.declared_px) for item in got.images] == [(0, 2, (0, 2))]
+        assert got.stats == stats(unsized=1, cover=DRAWN)
+        assert decode_calls == []
+
+    def test_the_widest_image_pdfium_decodes_is_kept(self, tmp_path):
+        path = xobject_page(tmp_path, zlib.compress(bytes(100)), gray(131071, 1, b"/FlateDecode"))
+
+        (image,) = images_of(path).images
+
+        assert (image.px_width, image.declared_px, image.bits_per_pixel) == (131071, (131071, 1), 8)
+
+
+def drawn_times(tmp_path: Path, count: int, data: bytes = FLATE, entries: bytes = RGB_4X2 + b" /Filter /FlateDecode"):
+    """A page drawing one image XObject ``count`` times, in a row."""
+    content = b"".join(b"q 20 0 0 10 %d 20 cm /Im Do Q " % (10 + 25 * index) for index in range(count))
+    return xobject_page(tmp_path, data, entries, content)
+
+
+@pytest.fixture
+def raw_reads(monkeypatch):
+    """Record each FPDFImageObj_GetImageDataRaw call as "size" (a length query) or "copy"; pdfium still runs."""
+    calls = []
+    original = pdfium_c.FPDFImageObj_GetImageDataRaw
+
+    def recording(image, buffer, length):
+        calls.append("size" if buffer is None else "copy")
+        return original(image, buffer, length)
+
+    monkeypatch.setattr(pdfium_c, "FPDFImageObj_GetImageDataRaw", recording)
+    return calls
+
+
+class TestPageBudget:
+    """A page's stream reads are budgeted: past the budget images are recorded unread and counted."""
+
+    def test_the_page_budget_is_twice_the_asset_limit(self):
+        assert _pdfium_images._MAX_PAGE_STREAM_BYTES == 2 * elements._MAX_ASSET_BYTES
+
+    def test_streams_past_the_budget_are_recorded_without_reading_them(self, tmp_path, monkeypatch, raw_reads):
+        monkeypatch.setattr(_pdfium_images, "_MAX_PAGE_STREAM_BYTES", 2 * len(FLATE))
+
+        got = images_of(drawn_times(tmp_path, 5))
+
+        assert [item.raw_sha256 for item in got.images] == [sha(FLATE)] * 2 + [None] * 3
+        assert got.images[4] == unread_image(
+            (110.0, 270.0, 130.0, 280.0), 4, declared_px=(4, 2), filters=("FlateDecode",)
+        )
+        assert (got.stats.skipped_over_budget_images, got.stats.skipped_oversized_images) == (3, 0)
+        # Once spent, the budget stops even the length queries, which copy the stream too.
+        assert raw_reads == ["size", "copy", "size", "copy"]
+
+    def test_a_stream_that_does_not_fit_spends_the_budget(self, tmp_path, monkeypatch, raw_reads):
+        monkeypatch.setattr(_pdfium_images, "_MAX_PAGE_STREAM_BYTES", 3 * len(FLATE) // 2)
+
+        got = images_of(drawn_times(tmp_path, 4))
+
+        assert [item.raw_sha256 for item in got.images] == [sha(FLATE), None, None, None]
+        assert got.stats.skipped_over_budget_images == 3
+        assert raw_reads == ["size", "copy", "size"]
+
+    def test_an_oversized_stream_is_charged_to_the_budget(self, tmp_path, monkeypatch, raw_reads):
+        monkeypatch.setattr(_pdfium_images, "_MAX_ASSET_BYTES", len(FLATE) - 1)
+        monkeypatch.setattr(_pdfium_images, "_MAX_PAGE_STREAM_BYTES", 2 * len(FLATE))
+
+        got = images_of(drawn_times(tmp_path, 3))
+
+        assert [item.raw_sha256 for item in got.images] == [None, None, None]
+        assert (got.stats.skipped_oversized_images, got.stats.skipped_over_budget_images) == (2, 1)
+        assert raw_reads == ["size", "size"]
+
+    def test_an_ascii_wrapped_codestream_is_charged_its_decoded_size_too(self, tmp_path, monkeypatch):
+        wrapped = base64.a85encode(jpeg_bytes((16, 8))) + b"~>"
+        entries = b"/Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter [/ASCII85Decode /DCTDecode]"
+        # Room for two raw streams, not for two raw streams and their decoded JPEGs.
+        monkeypatch.setattr(_pdfium_images, "_MAX_PAGE_STREAM_BYTES", 2 * len(wrapped))
+
+        got = images_of(drawn_times(tmp_path, 2, wrapped, entries))
+
+        assert [item.raw_sha256 for item in got.images] == [sha(wrapped), None]
+        assert got.stats.skipped_over_budget_images == 1
+
+
+class TestChangedDictionary:
+    """The same stream bytes under a new image dictionary are a changed file, not a different PNG."""
+
+    @pytest.mark.parametrize(
+        "entries,found",
+        [
+            pytest.param(
+                gray(24, 1, b"/FlateDecode"),
+                "FlateDecode, 24 x 1 px (declared 24 x 1), 8 bits per pixel, colour space DeviceGray",
+                id="size",
+            ),
+            pytest.param(
+                b"/Width 4 /Height 2 /ColorSpace [/CalRGB << /WhitePoint [0.9505 1 1.089] >>] /BitsPerComponent 8 "
+                b"/Filter /FlateDecode",
+                "FlateDecode, 4 x 2 px (declared 4 x 2), 24 bits per pixel, colour space CalRGB",
+                id="colour-space",
+            ),
+        ],
+    )
+    def test_a_new_dictionary_is_a_changed_file(self, tmp_path, entries, found):
+        path = xobject_page(tmp_path, FLATE, RGB_4X2 + b" /Filter /FlateDecode")
+        image_loader = only_loader(path)
+        rewrite(path, b"q 80 0 0 40 10 20 cm /Im Do Q", image_xobject(FLATE, entries))
+
+        expected = "FlateDecode, 4 x 2 px (declared 4 x 2), 24 bits per pixel, colour space DeviceRGB"
+        message = f"the file changed (the image now reads {found}; the loader expects {expected})"
+        for read in (image_loader.raw_bytes, image_loader.png_bytes):
+            with pytest.raises(DatagruntPDFError, match=re.escape(message)):
+                read()
+
+
+class TestPngMemory:
+    """png_bytes encodes from pdfium's bitmap in place: no copy of the decoded pixels."""
+
+    def test_the_decoded_bitmap_is_never_copied(self, tmp_path, monkeypatch):
+        image_loader = only_loader(xobject_page(tmp_path, FLATE, RGB_4X2 + b" /Filter /FlateDecode"))
+        monkeypatch.setattr(ctypes, "string_at", lambda *args: pytest.fail("copied the decoded bitmap"))
+
+        assert decoded(image_loader.png_bytes()).tobytes() == SAMPLES
+
+
+class TestBoundaryMutants:
+    """Edges the first round's tests left open (review M6)."""
+
+    def test_rounding_never_takes_the_cover_over_1(self):
+        # A turned full-bleed image whose clipped area computes as a hair over the page.
+        matrix = Matrix(
+            2601.9954700100498,
+            -597.5013533044593,
+            597.5013533044593,
+            2601.9954700100498,
+            -1293.7484116572546,
+            -606.2470583527952,
+        )
+        page_box = (0.0, 0.0, 612.0, 792.0)
+        corners = [matrix.apply(x, y) for x, y in ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))]
+        to_display = partial(to_display_box, rotation_deg=0, page_box=page_box)
+
+        assert _pdfium_images._area(_pdfium_images._clipped(corners, page_box)) / (612 * 792) > 1.0
+        assert _pdfium_images.image_placement(matrix, page_box, to_display).cover_fraction == 1.0
+
+    def test_the_last_colour_space_pdfium_names_is_read(self, tmp_path, monkeypatch):
+        handle = open_document(xobject_page(tmp_path, FLATE, RGB_4X2 + b" /Filter /FlateDecode"))
+        monkeypatch.setattr(pdfium_c, "FPDFImageObj_GetImageMetadata", writes_colorspace(11))
+
+        assert [item.colorspace for item in page_images(handle, 0).images] == ["Pattern"]

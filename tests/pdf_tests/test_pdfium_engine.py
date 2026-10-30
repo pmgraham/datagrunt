@@ -20,6 +20,7 @@ import pytest
 from datagrunt.pdf import (
     PDFCorruptError,
     PDFEncryptedError,
+    _image_headers,
     _path_segments,
     _pdfium_common,
     _pdfium_images,
@@ -94,7 +95,7 @@ def imported_modules(module) -> set[str]:
     return imported | {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
 
 
-ENGINE_MODULES = [pdfium_engine, _pdfium_text, _pdfium_common, _path_segments, _pdfium_images]
+ENGINE_MODULES = [pdfium_engine, _pdfium_text, _pdfium_common, _path_segments, _pdfium_images, _image_headers]
 
 
 class TestModuleImports:

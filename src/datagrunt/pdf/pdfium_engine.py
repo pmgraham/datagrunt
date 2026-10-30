@@ -80,6 +80,20 @@ Images (#365 T4), pinned by ``tests/pdf_tests/test_pdfium_images.py``:
   CCITT and 1-bit images arrive as 8-bit gray, CMYK and Indexed as BGR.
   It returns NULL for an image it cannot load (a zero /Width, an empty
   stream).
+- pdfium decodes a DCT image at its JPEG frame's (SOF) size whatever /Width
+  says (declared 16 x 16 with a 2000 x 2000 frame decodes 2000 x 2000;
+  declared 12000 x 12000 with a 16 x 16 frame, 16 x 16), and a JPX image at
+  its codestream's SIZ size. ``FPDFImageObj_GetImageMetadata`` decodes a JPX
+  image in full (0.14 s, 78 MB at 9000 x 9000) and OpenJPEG allocates ~12
+  KB per tile as it reads the header (761 MB for a 2000 x 2000 codestream
+  in 16 x 16 tiles); for DCT, Flate and CCITT the call reads no pixels
+  (unchanged RSS at a 9000 x 9000 frame and a 9400 x 9400 Flate bomb).
+- pdfium decodes no side over 131071 (``/Width 131072`` reads bits per
+  pixel 0 and a NULL bitmap) and reads ``/Width -5`` as 4294967291.
+- ``FPDFImageObj_GetImageDataRaw``'s length query copies the stream too
+  (4 ms against 8 ms for the read of a 200 MB stream).
+  ``FPDFImageObj_GetImageDataDecoded`` of ``[/ASCII85Decode /DCTDecode]``
+  (what ReportLab writes for every JPEG) is the JPEG as written.
 """
 
 import ctypes
@@ -110,17 +124,22 @@ from datagrunt.pdf._path_segments import (
 )
 from datagrunt.pdf._pdfium_common import Box, PdfiumFailure, object_address, read_rgba
 from datagrunt.pdf._pdfium_images import (
+    DecodeRefused,
     ImageStats,
     OversizedStream,
     PageImages,
+    PixelFacts,
     RawImage,
-    TooManyPixels,
+    ascii_decoded_stream,
     collect_images,
+    declared_size,
     decoded_png,
+    pixel_facts,
+    read_filters,
     read_raw_stream,
 )
 from datagrunt.pdf._pdfium_text import PageText, RawSpan, TextStats, collect_text
-from datagrunt.pdf._validate import finite_float, finite_tuple, int_at_least, sha256_hex
+from datagrunt.pdf._validate import finite_float, finite_tuple, int_at_least
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFEncryptedError
 
 __all__ = [
@@ -734,11 +753,15 @@ def page_images(handle: DocumentHandle, index: int) -> PageImages:
     Every image object is read: XObjects and inline images (``BI`` ... ``EI``),
     those inside Form XObjects included (as deep as pdfium parses them), with
     the full transform to page space composed here. No size filter applies:
-    these are raw facts (A4 applies ``min_image_dimension``). Each image's
-    raw stream is read once, to hash it (see :class:`RawImage`); pixels are
-    decoded only on demand, by :class:`ImageLoader`. An image whose
-    page-space geometry is not finite, or whose raw stream is over the asset
-    limit, is skipped and counted in :class:`ImageStats`. The page handle is
+    these are raw facts (A4 applies ``min_image_dimension``). No pixel is
+    decoded here: each image's raw stream is copied out once to hash it
+    (within a per-page stream budget), JPEG and JPEG 2000 sizes are read
+    from their own headers, and pdfium is asked for bits per pixel and
+    colour space only for images it may decode and reads them for without
+    decoding (not JPX or JBIG2). Pixels are decoded by :class:`ImageLoader`.
+    An image whose page-space geometry is not finite is skipped; images too
+    big, of unknown size or past the budget are recorded with those facts
+    left out; each is counted in :class:`ImageStats`. The page handle is
     closed before returning.
 
     Raises:
@@ -766,17 +789,16 @@ class ImageLoader:
 
     A picklable stand-in for the image (it crosses the process pool): each
     read reopens ``source`` (with ``password``), finds the object by the same
-    object walk that numbered it, and checks it is still that image before
-    returning anything.
+    object walk that numbered it, and checks it is still ``image`` (its raw
+    stream's hash and its pixel facts) before returning anything.
 
     Attributes:
         source: The PDF's path, made absolute at construction (a worker's
             later ``chdir`` cannot redirect it).
         page_index: The 0-based page holding the image.
-        object_index: The image object's index in that page's object walk
-            (:attr:`RawImage.object_index`).
-        raw_sha256: The SHA-256 of the image's raw stream
-            (:attr:`RawImage.raw_sha256`), which every read verifies.
+        image: The image as :func:`page_images` recorded it; it must have a
+            ``raw_sha256`` (its stream was read). ``object_index`` and
+            ``raw_sha256`` read from it.
         password: The encrypted PDF's password, or None. Excluded from repr,
             equality and hashing, and never put in an error message; a
             pickle of the loader carries it (the worker needs it).
@@ -784,16 +806,32 @@ class ImageLoader:
 
     source: Path
     page_index: int
-    object_index: int
-    raw_sha256: str
+    image: RawImage
     password: str | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source", _checked_path(self.source, "source").absolute())
         int_at_least("page_index", self.page_index, 0)
-        int_at_least("object_index", self.object_index, 0)
-        sha256_hex("raw_sha256", self.raw_sha256)
+        if not isinstance(self.image, RawImage):
+            raise TypeError(f"image must be a RawImage, got {type(self.image).__name__}")
+        if self.image.raw_sha256 is None:
+            raise ValueError(
+                "image has no raw_sha256 (its stream was not read): there is nothing to verify a read against"
+            )
         _checked_password(self.password)
+
+    @property
+    def object_index(self) -> int:
+        """The image object's index in its page's object walk."""
+        return self.image.object_index
+
+    @property
+    def raw_sha256(self) -> str:
+        """The SHA-256 every read verifies the image's raw stream against."""
+        digest = self.image.raw_sha256
+        if digest is None:  # refused at construction; this narrows the type
+            raise ValueError("image has no raw_sha256")
+        return digest
 
     def raw_bytes(self) -> bytes:
         """Return the image's raw stream, as :attr:`RawImage.raw_sha256` hashed it.
@@ -801,14 +839,14 @@ class ImageLoader:
         Raises:
             DatagruntPDFError: If the object at ``page_index`` /
                 ``object_index`` is not an image whose raw stream hashes to
-                ``raw_sha256`` (the file changed), or the stream is over the
-                asset limit.
+                ``raw_sha256`` and whose pixel facts are ``image``'s (the file
+                changed), or the stream is over the asset limit.
             PDFCorruptError: If pdfium cannot load the page or a pdfium call
                 on it fails (``page_number`` is set).
             FileNotFoundError, PermissionError, PDFEncryptedError: As
                 :func:`open_document` raises them.
         """
-        return self._read(lambda image, raw, label: raw)
+        return self._read(lambda image, raw, facts, label: raw)
 
     def png_bytes(self) -> bytes:
         """Return the image decoded by pdfium at its own pixel size, as PNG bytes.
@@ -821,20 +859,22 @@ class ImageLoader:
         bytes on every run with a given Pillow and zlib build.
 
         Raises:
-            DatagruntPDFError: As :meth:`raw_bytes` raises it, or if the image
-                decodes to more than 89,478,485 pixels (Pillow's default
-                decompression-bomb bound: 1 GiB / 4 / 3), checked before
-                decoding.
-            PDFCorruptError: If pdfium cannot load the page, decode the image
-                (a zero /Width, say), or a pdfium call fails
-                (``page_number`` is set).
+            DatagruntPDFError: As :meth:`raw_bytes` raises it, or, before
+                pdfium decodes anything, if the image would decode to more
+                than 89,478,485 pixels (Pillow's default decompression-bomb
+                bound: 1 GiB / 4 / 3) or in more than 4096 JPEG 2000 tiles,
+                or its decode size cannot be known first (see
+                :class:`ImageStats`); or if the bitmap pdfium decodes is over
+                the pixel bound after all.
+            PDFCorruptError: If pdfium cannot load the page, decode the image,
+                or a pdfium call fails (``page_number`` is set).
             FileNotFoundError, PermissionError, PDFEncryptedError: As
                 :func:`open_document` raises them.
         """
-        return self._read(lambda image, raw, label: decoded_png(image, label))
+        return self._read(lambda image, raw, facts, label: decoded_png(image, facts, label))
 
-    def _read(self, finish: Callable[[pdfium_c.FPDF_PAGEOBJECT, bytes, str], bytes]) -> bytes:
-        """Reopen the PDF, verify the image and return ``finish(image, raw stream, label)``.
+    def _read(self, finish: Callable[[pdfium_c.FPDF_PAGEOBJECT, bytes, PixelFacts, str], bytes]) -> bytes:
+        """Reopen the PDF, verify the image and return ``finish(image, raw stream, pixel facts, label)``.
 
         The page and the document are closed before returning.
         """
@@ -843,18 +883,26 @@ class ImageLoader:
                 raise self._changed(f"it has {handle.page_count} page(s)")
             page, page_number = _load_page(handle, self.page_index)
             try:
-                image, raw = self._verified_image(page.raw)
-                return finish(image, raw, f"object {self.object_index}")
+                image, raw, facts = self._verified_image(page.raw)
+                return finish(image, raw, facts, f"object {self.object_index}")
             except PdfiumFailure as exc:
                 message = f"{self.source}: page {page_number}: pdfium cannot {exc}"
                 raise PDFCorruptError(message, page_number=page_number) from exc
-            except (OversizedStream, TooManyPixels) as exc:
+            except (OversizedStream, DecodeRefused) as exc:
                 raise DatagruntPDFError(f"{self.source}: page {page_number}: {exc}") from exc
             finally:
                 page.close()
 
-    def _verified_image(self, page_raw: pdfium_c.FPDF_PAGE) -> tuple[pdfium_c.FPDF_PAGEOBJECT, bytes]:
-        """The image object this loader names on the loaded page, and its verified raw stream."""
+    def _verified_image(self, page_raw: pdfium_c.FPDF_PAGE) -> tuple[pdfium_c.FPDF_PAGEOBJECT, bytes, PixelFacts]:
+        """The image object this loader names on the loaded page, its verified raw stream and pixel facts.
+
+        The stream must hash to ``raw_sha256``, and the facts read from the
+        image dictionary and codestream (filters, decode size, declared size,
+        and the bits per pixel and colour space when pdfium reads them) must
+        be the image's: the same stream under another dictionary would decode
+        to another picture. Dictionary changes that keep all of these (a
+        /Decode array, a palette's colours) are not detected.
+        """
         objects = _page_objects(page_raw)
         if self.object_index >= len(objects):
             raise self._changed(f"the page has {len(objects)} object(s)")
@@ -863,16 +911,46 @@ class ImageLoader:
         if kind != pdfium_c.FPDF_PAGEOBJ_IMAGE:
             name = _OBJECT_KIND_NAMES.get(kind, f"type {kind}")
             raise self._changed(f"object {self.object_index} is a {name} object, not an image")
-        raw = read_raw_stream(image, f"object {self.object_index}")
+        label = f"object {self.object_index}"
+        raw = read_raw_stream(image, label)
         actual = hashlib.sha256(raw).hexdigest()
         if actual != self.raw_sha256:
             raise self._changed(f"its raw stream hashes to {actual}, not {self.raw_sha256}")
-        return image, raw
+        filters = read_filters(image, label)
+        decoded = partial(ascii_decoded_stream, image, len(raw), label)
+        facts = pixel_facts(image, page_raw, label, filters, declared_size(image, label), raw, decoded)
+        found = _described(filters, facts.px_width, facts.px_height, facts.declared_px, facts, facts.read_metadata)
+        expected = _described(
+            self.image.filters,
+            self.image.px_width,
+            self.image.px_height,
+            self.image.declared_px,
+            self.image,
+            facts.read_metadata,
+        )
+        if found != expected:
+            raise self._changed(f"the image now reads {found}; the loader expects {expected}")
+        return image, raw, facts
 
     def _changed(self, detail: str) -> DatagruntPDFError:
         """The error for a source that no longer holds this image (never naming the password)."""
         where = f"{self.source}: page {self.page_index + 1}, object {self.object_index}"
         return DatagruntPDFError(f"{where} is not the image this loader was made for: the file changed ({detail})")
+
+
+def _described(
+    filters: tuple[str, ...],
+    width: int,
+    height: int,
+    declared: tuple[int, int],
+    metadata: RawImage | PixelFacts,
+    with_metadata: bool,
+) -> str:
+    """An image's pixel facts in words, its bits per pixel and colour space only ``with_metadata``."""
+    words = f"{'/'.join(filters) or 'no filter'}, {width} x {height} px (declared {declared[0]} x {declared[1]})"
+    if not with_metadata:
+        return words
+    return f"{words}, {metadata.bits_per_pixel} bits per pixel, colour space {metadata.colorspace}"
 
 
 # pdfium's page object types, named for error messages.
