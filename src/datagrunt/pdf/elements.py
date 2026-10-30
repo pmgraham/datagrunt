@@ -21,7 +21,14 @@ import polars as pl
 import pyarrow as pa
 
 from datagrunt.core.pdf_io.extraction.markdown_escape import escape_markdown_link_target
-from datagrunt.pdf._validate import finite_float, int_at_least, non_blank_str, optional_str, str_tuple
+from datagrunt.pdf._validate import (
+    finite_float,
+    int_at_least,
+    non_blank_str,
+    optional_str,
+    sha256_hex,
+    str_tuple,
+)
 from datagrunt.pdf.exceptions import DatagruntPDFError
 
 HiddenReason: TypeAlias = Literal["off_page", "invisible", "tiny_font", "transparent", "matches_background"]
@@ -77,10 +84,6 @@ _QUALITY_RANGES = (
     ("ocr_mean_confidence", 0.0, 100.0),
 )
 
-# A SHA-256 hex digest exactly as hashlib's hexdigest() produces it. Matched
-# with fullmatch() so a trailing newline cannot slip past a `$` anchor.
-_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
-
 # Either path separator, so a doc_id never depends on the OS that built it.
 _PATH_SEPARATOR = re.compile(r"[\\/]")
 
@@ -105,15 +108,6 @@ def _ascii_folded(text: str) -> str:
     """
     decomposed = unicodedata.normalize("NFKD", text)
     return "".join(char for char in decomposed if not unicodedata.category(char).startswith("M"))
-
-
-def _check_sha256(name: str, value: object) -> str:
-    """Return ``value`` if it is a 64-char lowercase hex SHA-256 digest."""
-    if not isinstance(value, str):
-        raise TypeError(f"{name} must be a str, got {value!r} ({type(value).__name__})")
-    if _SHA256_HEX.fullmatch(value) is None:
-        raise ValueError(f"{name} must be 64 lowercase hex characters, got {value!r}")
-    return value
 
 
 def make_element_id(page_number: int, index: int) -> str:
@@ -459,7 +453,7 @@ class DocumentMetadata:
 
     def __post_init__(self) -> None:
         non_blank_str("source_name", self.source_name)
-        _check_sha256("sha256", self.sha256)
+        sha256_hex("sha256", self.sha256)
         int_at_least("page_count", self.page_count, 0)
         optional_str("title", self.title)
         optional_str("author", self.author)
@@ -484,7 +478,7 @@ class DocumentMetadata:
         ``stem`` differs across OSes and versions.
         """
         non_blank_str("source_name", source_name)
-        _check_sha256("sha256", sha256)
+        sha256_hex("sha256", sha256)
         name = _PATH_SEPARATOR.split(source_name)[-1]
         dot = name.rfind(".")
         raw_stem = _ascii_folded(name[:dot] if dot > 0 else name)
@@ -771,17 +765,24 @@ class Table(_Element):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Figure(_Element):
-    """An embedded image, identified by the SHA-256 of its bytes.
+    """An embedded image, identified by the SHA-256 of its raw embedded stream.
 
-    Bytes come from ``image_path`` when set, else from ``_loader`` (an internal
-    lazy source, excluded from equality and repr). :meth:`read_bytes` verifies
-    them against ``sha256`` and fails loud on a mismatch.
+    Two byte sources, each excluded from equality and repr:
+
+    - :meth:`read_raw_bytes` returns the raw stream (as stored in the PDF,
+      still encoded by its filters) from ``_raw_loader``, verified against
+      ``sha256``: a mismatch fails loud.
+    - :meth:`read_bytes` returns the image as PNG, a derived artifact: from
+      ``image_path`` when set, else from ``_loader``. It is not checked
+      against ``sha256``, which hashes the raw stream, not the PNG.
 
     Attributes:
-        sha256: SHA-256 of the image bytes, 64 lowercase hex characters.
+        sha256: SHA-256 of the image's raw embedded stream, 64 lowercase hex
+            characters. Unlike a hash of exported bytes, it survives encoder
+            upgrades, so image dedupe and cache keys stay stable.
         width_px: Image width in pixels (>= 1).
         height_px: Image height in pixels (>= 1).
-        image_path: Where the image was written, if it was. Not part of
+        image_path: Where the PNG was written, if it was. Not part of
             equality: the same image stored elsewhere is the same figure.
         caption: Caption text, if one was found.
     """
@@ -792,39 +793,55 @@ class Figure(_Element):
     # Storage location, not identity: excluded from equality and hashing.
     image_path: Path | None = field(default=None, compare=False)
     caption: str | None = None
+    # Internal lazy sources: PNG bytes, and the raw stream sha256 hashes.
     _loader: Callable[[], bytes] | None = field(default=None, compare=False, repr=False)
+    _raw_loader: Callable[[], bytes] | None = field(default=None, compare=False, repr=False)
 
     def _validate_fields(self) -> None:
-        _check_sha256("sha256", self.sha256)
+        sha256_hex("sha256", self.sha256)
         int_at_least("width_px", self.width_px, 1)
         int_at_least("height_px", self.height_px, 1)
         _check_optional_path("image_path", self.image_path)
         optional_str("caption", self.caption)
         _check_optional_callable("_loader", self._loader)
+        _check_optional_callable("_raw_loader", self._raw_loader)
 
     def read_bytes(self) -> bytes:
-        """Return the image bytes after verifying them against ``sha256``.
+        """Return the image as PNG bytes: ``image_path`` first, then the loader.
+
+        Derived bytes, so they are not checked against ``sha256`` (use
+        :meth:`read_raw_bytes` for verified bytes); every read is bounded by
+        the asset limit.
 
         Raises:
             DatagruntPDFError: If there is no byte source, ``image_path`` is not
-                a regular file, the bytes exceed the asset limit, or their
-                SHA-256 does not match ``sha256``.
+                a regular file, or the bytes exceed the asset limit.
             OSError: If ``image_path`` cannot be stat'ed or read (e.g.
                 ``FileNotFoundError``, ``PermissionError``).
             TypeError: If the loader returns something other than ``bytes``.
         """
-        data = self._load_bytes()
-        actual = hashlib.sha256(data).hexdigest()
-        if actual != self.sha256:
-            raise DatagruntPDFError(f"figure {self.element_id}: sha256 mismatch (expected {self.sha256}, got {actual})")
-        return data
-
-    def _load_bytes(self) -> bytes:
         if self.image_path is not None:
             return _read_asset_file(self.image_path)
         if self._loader is None:
             raise DatagruntPDFError(f"figure {self.element_id} has no image bytes: no image_path and no loader")
         return _check_loaded_asset(f"figure {self.element_id}", "_loader result", self._loader())
+
+    def read_raw_bytes(self) -> bytes:
+        """Return the raw embedded stream after verifying it against ``sha256``.
+
+        Raises:
+            DatagruntPDFError: If there is no raw loader, its bytes exceed the
+                asset limit, or their SHA-256 does not match ``sha256``.
+            TypeError: If the raw loader returns something other than ``bytes``.
+        """
+        owner = f"figure {self.element_id}"
+        if self._raw_loader is None:
+            raise DatagruntPDFError(f"{owner} has no raw image bytes: no raw loader")
+        data = _check_loaded_asset(owner, "_raw_loader result", self._raw_loader())
+        actual = hashlib.sha256(data).hexdigest()
+        if actual != self.sha256:
+            raise DatagruntPDFError(f"{owner}: sha256 mismatch (expected {self.sha256}, got {actual})")
+        return data
 
     def _render_markdown(self) -> str:
         """Render an image link when ``image_path`` is set, else a placeholder comment.

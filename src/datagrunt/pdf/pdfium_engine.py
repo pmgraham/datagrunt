@@ -57,14 +57,38 @@ Paths (#365 T3), pinned by ``tests/pdf_tests/test_pdfium_segments.py``:
   0 0 cm`` overflow it, and objects drawn under it read a matrix of
   ``(inf, nan, nan, inf, 0, 0)`` and NaN textpage boxes; pdfium renders the
   rest of the page. The engine skips and counts such objects.
+
+Images (#365 T4), pinned by ``tests/pdf_tests/test_pdfium_images.py``:
+
+- An image object's matrix maps its unit square into the enclosing form's
+  space (that form's /Matrix included, an enclosing form's not), as a
+  path's does, and so do its bounds; the engine composes form matrices.
+  Inline images (``BI`` ... ``EI``) are image objects too, and an object
+  under an overflowed CTM reads the same non-finite matrix as a path.
+- ``FPDFImageObj_GetImageDataRaw`` is the stream as written, still
+  filter-encoded but decrypted (an encrypted PDF's image hashes as the
+  unencrypted one's), and an inline image's data between ``ID`` and ``EI``;
+  an empty stream reads 0 bytes. Filter names are pdfium's full names (an
+  inline ``/AHx`` reads ``ASCIIHexDecode``).
+- ``FPDFImageObj_GetImageMetadata`` reads 0 bits per pixel and colour
+  space 0 (unknown) for an image it cannot load (a missing or zero /Width,
+  which reads as 0 px wide, or an empty stream); an image mask reads 1 bit
+  and colour space 0; CMYK reads 24 bits (pdfium decodes it to RGB).
+- ``FPDFImageObj_GetBitmap`` decodes at the image's own size (16 x 8
+  samples drawn 80 x 40 pt decode 16 x 8; ``GetRenderedBitmap`` would
+  resample to 80 x 40) as Gray or BGR, ignoring the matrix and any mask:
+  CCITT and 1-bit images arrive as 8-bit gray, CMYK and Indexed as BGR.
+  It returns NULL for an image it cannot load (a zero /Width, an empty
+  stream).
 """
 
 import ctypes
 import errno
+import hashlib
 import os
 import sys
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType
@@ -85,21 +109,36 @@ from datagrunt.pdf._path_segments import (
     path_segments,
 )
 from datagrunt.pdf._pdfium_common import Box, PdfiumFailure, object_address, read_rgba
+from datagrunt.pdf._pdfium_images import (
+    ImageStats,
+    OversizedStream,
+    PageImages,
+    RawImage,
+    TooManyPixels,
+    collect_images,
+    decoded_png,
+    read_raw_stream,
+)
 from datagrunt.pdf._pdfium_text import PageText, RawSpan, TextStats, collect_text
-from datagrunt.pdf._validate import finite_float, finite_tuple, int_at_least
-from datagrunt.pdf.exceptions import PDFCorruptError, PDFEncryptedError
+from datagrunt.pdf._validate import finite_float, finite_tuple, int_at_least, sha256_hex
+from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFEncryptedError
 
 __all__ = [
     "DocumentHandle",
+    "ImageLoader",
+    "ImageStats",
     "PageGeometry",
+    "PageImages",
     "PageSegments",
     "PageText",
+    "RawImage",
     "RawSegment",
     "RawSpan",
     "SegmentStats",
     "TextStats",
     "open_document",
     "page_geometry",
+    "page_images",
     "page_segments",
     "page_text",
     "to_display_box",
@@ -267,13 +306,13 @@ class DocumentHandle:
         return self._pdf
 
 
-def _checked_path(path: object) -> Path:
+def _checked_path(path: object, name: str = "path") -> Path:
     """Return ``path`` as a Path; bytes are refused (pypdfium2 reads them as PDF data)."""
     if not isinstance(path, (str, os.PathLike)):
-        raise TypeError(f"path must be a str or os.PathLike, got {type(path).__name__}")
+        raise TypeError(f"{name} must be a str or os.PathLike, got {type(path).__name__}")
     text = os.fspath(path)
     if not isinstance(text, str):
-        raise TypeError(f"path must be a str or os.PathLike, got a {type(text).__name__} path")
+        raise TypeError(f"{name} must be a str or os.PathLike, got a {type(text).__name__} path")
     return Path(text)
 
 
@@ -488,8 +527,7 @@ def _read_page_text(page: pdfium.PdfPage, geometry: PageGeometry) -> PageText:
         message = f"page {page_number}: pdfium cannot load the text page: {exc}"
         raise PDFCorruptError(message, page_number=page_number) from exc
     try:
-        to_display = partial(to_display_box, rotation_deg=geometry.rotation_deg, page_box=geometry.page_box)
-        return collect_text(textpage.raw, to_display, _object_indices(page.raw))
+        return collect_text(textpage.raw, _display_mapping(geometry), _object_indices(page.raw))
     except PdfiumFailure as exc:
         raise PDFCorruptError(f"page {page_number}: pdfium cannot {exc}", page_number=page_number) from exc
     finally:
@@ -618,24 +656,38 @@ def _path_object_segments(
         return None
 
 
+def _placed_objects(page_raw: pdfium_c.FPDF_PAGE, kind: int) -> Iterator[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix]]:
+    """Each page object of type ``kind`` (not a form) with its walk index and its matrix to page space.
+
+    pdfium's object matrix maps into the enclosing form's space only, so
+    each form's matrix to page space is composed here, in walk order (a form
+    precedes its contents).
+    """
+    form_matrices: dict[int, Matrix] = {}
+    for index, (obj, form) in enumerate(_page_objects(page_raw)):
+        obj_kind = pdfium_c.FPDFPageObj_GetType(obj)
+        if obj_kind not in (kind, pdfium_c.FPDF_PAGEOBJ_FORM):
+            continue
+        matrix = _read_matrix(obj, f"object {index}").then(form_matrices[form] if form >= 0 else IDENTITY)
+        if obj_kind == pdfium_c.FPDF_PAGEOBJ_FORM:
+            # A non-finite form matrix is kept: everything inside it is then skipped.
+            form_matrices[index] = matrix
+        else:
+            yield index, obj, matrix
+
+
+def _display_mapping(geometry: PageGeometry) -> Callable[[Box], Box]:
+    """:func:`to_display_box` for the page ``geometry`` describes."""
+    return partial(to_display_box, rotation_deg=geometry.rotation_deg, page_box=geometry.page_box)
+
+
 def _collect_segments(page_raw: pdfium_c.FPDF_PAGE, geometry: PageGeometry) -> PageSegments:
     """The segments of every path object on the page, forms' included, in object-walk order."""
-    to_display = partial(to_display_box, rotation_deg=geometry.rotation_deg, page_box=geometry.page_box)
-    # Each form's matrix to page space, by walk index; a form precedes its contents.
-    form_matrices: dict[int, Matrix] = {}
+    to_display = _display_mapping(geometry)
     segments: list[RawSegment] = []
     skipped = 0
-    for index, (obj, form) in enumerate(_page_objects(page_raw)):
-        kind = pdfium_c.FPDFPageObj_GetType(obj)
-        if kind not in (pdfium_c.FPDF_PAGEOBJ_PATH, pdfium_c.FPDF_PAGEOBJ_FORM):
-            continue
-        # pdfium's object matrix maps into the enclosing form's space only.
-        matrix = _read_matrix(obj, f"object {index}").then(form_matrices[form] if form >= 0 else IDENTITY)
-        if kind == pdfium_c.FPDF_PAGEOBJ_FORM:
-            # A non-finite form matrix is kept: every path inside it is then skipped.
-            form_matrices[index] = matrix
-            continue
-        found = _path_object_segments(obj, index, matrix, to_display)
+    for index, path, matrix in _placed_objects(page_raw, pdfium_c.FPDF_PAGEOBJ_PATH):
+        found = _path_object_segments(path, index, matrix, to_display)
         if found is None:
             skipped += 1
         else:
@@ -674,3 +726,162 @@ def page_segments(handle: DocumentHandle, index: int) -> PageSegments:
         raise PDFCorruptError(f"page {page_number}: pdfium cannot {exc}", page_number=page_number) from exc
     finally:
         page.close()
+
+
+def page_images(handle: DocumentHandle, index: int) -> PageImages:
+    """Return the image objects of the page at 0-based ``index``, with their stats.
+
+    Every image object is read: XObjects and inline images (``BI`` ... ``EI``),
+    those inside Form XObjects included (as deep as pdfium parses them), with
+    the full transform to page space composed here. No size filter applies:
+    these are raw facts (A4 applies ``min_image_dimension``). Each image's
+    raw stream is read once, to hash it (see :class:`RawImage`); pixels are
+    decoded only on demand, by :class:`ImageLoader`. An image whose
+    page-space geometry is not finite, or whose raw stream is over the asset
+    limit, is skipped and counted in :class:`ImageStats`. The page handle is
+    closed before returning.
+
+    Raises:
+        TypeError: If ``handle`` is not a DocumentHandle, or ``index`` is not
+            an int (bool rejected).
+        ValueError: If ``handle`` is closed.
+        IndexError: If ``index`` is outside ``0..page_count - 1``.
+        PDFCorruptError: If pdfium cannot load the page or a pdfium call on
+            it fails (``page_number`` is set).
+    """
+    page, page_number = _load_page(handle, index)
+    try:
+        geometry = _read_geometry(page, page_number)
+        placed = _placed_objects(page.raw, pdfium_c.FPDF_PAGEOBJ_IMAGE)
+        return collect_images(placed, page.raw, geometry.page_box, _display_mapping(geometry))
+    except PdfiumFailure as exc:
+        raise PDFCorruptError(f"page {page_number}: pdfium cannot {exc}", page_number=page_number) from exc
+    finally:
+        page.close()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ImageLoader:
+    """Reads one image object's bytes on demand, from the PDF on disk.
+
+    A picklable stand-in for the image (it crosses the process pool): each
+    read reopens ``source`` (with ``password``), finds the object by the same
+    object walk that numbered it, and checks it is still that image before
+    returning anything.
+
+    Attributes:
+        source: The PDF's path, made absolute at construction (a worker's
+            later ``chdir`` cannot redirect it).
+        page_index: The 0-based page holding the image.
+        object_index: The image object's index in that page's object walk
+            (:attr:`RawImage.object_index`).
+        raw_sha256: The SHA-256 of the image's raw stream
+            (:attr:`RawImage.raw_sha256`), which every read verifies.
+        password: The encrypted PDF's password, or None. Excluded from repr,
+            equality and hashing, and never put in an error message; a
+            pickle of the loader carries it (the worker needs it).
+    """
+
+    source: Path
+    page_index: int
+    object_index: int
+    raw_sha256: str
+    password: str | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source", _checked_path(self.source, "source").absolute())
+        int_at_least("page_index", self.page_index, 0)
+        int_at_least("object_index", self.object_index, 0)
+        sha256_hex("raw_sha256", self.raw_sha256)
+        _checked_password(self.password)
+
+    def raw_bytes(self) -> bytes:
+        """Return the image's raw stream, as :attr:`RawImage.raw_sha256` hashed it.
+
+        Raises:
+            DatagruntPDFError: If the object at ``page_index`` /
+                ``object_index`` is not an image whose raw stream hashes to
+                ``raw_sha256`` (the file changed), or the stream is over the
+                asset limit.
+            PDFCorruptError: If pdfium cannot load the page or a pdfium call
+                on it fails (``page_number`` is set).
+            FileNotFoundError, PermissionError, PDFEncryptedError: As
+                :func:`open_document` raises them.
+        """
+        return self._read(lambda image, raw, label: raw)
+
+    def png_bytes(self) -> bytes:
+        """Return the image decoded by pdfium at its own pixel size, as PNG bytes.
+
+        A derived artifact, not what ``raw_sha256`` hashes: the image is
+        verified as :meth:`raw_bytes` verifies it, then decoded with
+        ``FPDFImageObj_GetBitmap`` (its samples through its filters and
+        colour space; its matrix, soft mask and image mask not applied) and
+        encoded with fixed Pillow settings, so the same image gives the same
+        bytes on every run with a given Pillow and zlib build.
+
+        Raises:
+            DatagruntPDFError: As :meth:`raw_bytes` raises it, or if the image
+                decodes to more than 89,478,485 pixels (Pillow's default
+                decompression-bomb bound: 1 GiB / 4 / 3), checked before
+                decoding.
+            PDFCorruptError: If pdfium cannot load the page, decode the image
+                (a zero /Width, say), or a pdfium call fails
+                (``page_number`` is set).
+            FileNotFoundError, PermissionError, PDFEncryptedError: As
+                :func:`open_document` raises them.
+        """
+        return self._read(lambda image, raw, label: decoded_png(image, label))
+
+    def _read(self, finish: Callable[[pdfium_c.FPDF_PAGEOBJECT, bytes, str], bytes]) -> bytes:
+        """Reopen the PDF, verify the image and return ``finish(image, raw stream, label)``.
+
+        The page and the document are closed before returning.
+        """
+        with open_document(self.source, password=self.password) as handle:
+            if self.page_index >= handle.page_count:
+                raise self._changed(f"it has {handle.page_count} page(s)")
+            page, page_number = _load_page(handle, self.page_index)
+            try:
+                image, raw = self._verified_image(page.raw)
+                return finish(image, raw, f"object {self.object_index}")
+            except PdfiumFailure as exc:
+                message = f"{self.source}: page {page_number}: pdfium cannot {exc}"
+                raise PDFCorruptError(message, page_number=page_number) from exc
+            except (OversizedStream, TooManyPixels) as exc:
+                raise DatagruntPDFError(f"{self.source}: page {page_number}: {exc}") from exc
+            finally:
+                page.close()
+
+    def _verified_image(self, page_raw: pdfium_c.FPDF_PAGE) -> tuple[pdfium_c.FPDF_PAGEOBJECT, bytes]:
+        """The image object this loader names on the loaded page, and its verified raw stream."""
+        objects = _page_objects(page_raw)
+        if self.object_index >= len(objects):
+            raise self._changed(f"the page has {len(objects)} object(s)")
+        image, _form = objects[self.object_index]
+        kind = pdfium_c.FPDFPageObj_GetType(image)
+        if kind != pdfium_c.FPDF_PAGEOBJ_IMAGE:
+            name = _OBJECT_KIND_NAMES.get(kind, f"type {kind}")
+            raise self._changed(f"object {self.object_index} is a {name} object, not an image")
+        raw = read_raw_stream(image, f"object {self.object_index}")
+        actual = hashlib.sha256(raw).hexdigest()
+        if actual != self.raw_sha256:
+            raise self._changed(f"its raw stream hashes to {actual}, not {self.raw_sha256}")
+        return image, raw
+
+    def _changed(self, detail: str) -> DatagruntPDFError:
+        """The error for a source that no longer holds this image (never naming the password)."""
+        where = f"{self.source}: page {self.page_index + 1}, object {self.object_index}"
+        return DatagruntPDFError(f"{where} is not the image this loader was made for: the file changed ({detail})")
+
+
+# pdfium's page object types, named for error messages.
+_OBJECT_KIND_NAMES = MappingProxyType(
+    {
+        pdfium_c.FPDF_PAGEOBJ_TEXT: "text",
+        pdfium_c.FPDF_PAGEOBJ_PATH: "path",
+        pdfium_c.FPDF_PAGEOBJ_IMAGE: "image",
+        pdfium_c.FPDF_PAGEOBJ_SHADING: "shading",
+        pdfium_c.FPDF_PAGEOBJ_FORM: "form",
+    }
+)

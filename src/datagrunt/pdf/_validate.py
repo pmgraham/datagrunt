@@ -6,6 +6,11 @@ Every message names the offending field so construction errors are actionable.
 """
 
 import math
+import re
+
+# A SHA-256 hex digest exactly as hashlib's hexdigest() produces it. Matched
+# with fullmatch() so a trailing newline cannot slip past a `$` anchor.
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 
 def int_at_least(name: str, value: object, minimum: int) -> int:
@@ -98,3 +103,20 @@ def rgba_tuple(name: str, value: object) -> tuple[int, int, int, int]:
             raise ValueError(f"{name}[{index}] must be in 0..255, got {channel}")
     red, green, blue, alpha = value
     return red, green, blue, alpha
+
+
+def sha256_hex(name: str, value: object) -> str:
+    """Return ``value`` if it is a 64-char lowercase hex SHA-256 digest."""
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a str, got {value!r} ({type(value).__name__})")
+    if _SHA256_HEX.fullmatch(value) is None:
+        raise ValueError(f"{name} must be 64 lowercase hex characters, got {value!r}")
+    return value
+
+
+def ordered_box(name: str, value: object) -> tuple[float, float, float, float]:
+    """Return ``value`` as 4 finite floats ``(x0, y0, x1, y1)`` with ``x0 <= x1`` and ``y0 <= y1``."""
+    x0, y0, x1, y1 = finite_tuple(name, value, 4)
+    if x0 > x1 or y0 > y1:
+        raise ValueError(f"{name} must have x0 <= x1 and y0 <= y1, got {value!r}")
+    return x0, y0, x1, y1

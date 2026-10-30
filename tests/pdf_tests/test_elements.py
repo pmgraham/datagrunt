@@ -737,6 +737,16 @@ class TestFigureFields:
         assert hash(with_loader) == hash(_figure())
         assert "_loader" not in repr(with_loader)
 
+    def test_raw_loader_must_be_callable(self):
+        with pytest.raises(TypeError, match="_raw_loader must be callable or None, got bytes"):
+            _figure(_raw_loader=IMAGE)
+
+    def test_raw_loader_excluded_from_equality_hash_and_repr(self):
+        with_loader = _figure(_raw_loader=lambda: IMAGE)
+        assert with_loader == _figure()
+        assert hash(with_loader) == hash(_figure())
+        assert "_raw_loader" not in repr(with_loader)
+
 
 class TestFigureReadBytes:
     def test_reads_file(self, tmp_path):
@@ -756,15 +766,20 @@ class TestFigureReadBytes:
     def test_reads_loader_when_no_path(self):
         assert _figure(_loader=lambda: IMAGE).read_bytes() == IMAGE
 
-    def test_file_sha_mismatch_raises(self, tmp_path):
+    def test_file_bytes_are_derived_and_not_checked_against_sha256(self, tmp_path):
+        # sha256 hashes the raw embedded stream (D1); an exported PNG is derived from it.
         path = tmp_path / "fig.png"
-        path.write_bytes(b"tampered")
-        with pytest.raises(DatagruntPDFError, match="sha256 mismatch"):
-            _figure(image_path=path).read_bytes()
+        path.write_bytes(b"exported png")
+        assert _figure(image_path=path).read_bytes() == b"exported png"
 
-    def test_loader_sha_mismatch_raises(self):
-        with pytest.raises(DatagruntPDFError, match="sha256 mismatch"):
-            _figure(_loader=lambda: b"tampered").read_bytes()
+    def test_loader_bytes_are_derived_and_not_checked_against_sha256(self):
+        assert _figure(_loader=lambda: b"decoded png").read_bytes() == b"decoded png"
+
+    def test_never_reads_the_raw_loader(self):
+        def raw_loader():
+            raise AssertionError("read_bytes must not read the raw stream")
+
+        assert _figure(_loader=lambda: IMAGE, _raw_loader=raw_loader).read_bytes() == IMAGE
 
     def test_no_byte_source_raises(self):
         with pytest.raises(DatagruntPDFError, match="no image bytes"):
@@ -831,6 +846,38 @@ class TestFigureReadBytesBounded:
         monkeypatch.setattr(elements_module, "_MAX_ASSET_BYTES", len(IMAGE) - 1)
         with pytest.raises(DatagruntPDFError, match=f"{len(IMAGE)} bytes"):
             _figure(_loader=lambda: IMAGE).read_bytes()
+
+
+class TestFigureReadRawBytes:
+    """read_raw_bytes() returns the raw embedded stream, verified against sha256 (D1)."""
+
+    def test_reads_the_raw_loader_verified(self):
+        assert _figure(_raw_loader=lambda: IMAGE).read_raw_bytes() == IMAGE
+
+    def test_sha_mismatch_raises(self):
+        with pytest.raises(DatagruntPDFError, match=f"sha256 mismatch \\(expected {IMAGE_SHA}, got "):
+            _figure(_raw_loader=lambda: b"tampered").read_raw_bytes()
+
+    def test_no_raw_source_raises_even_with_png_sources(self, tmp_path):
+        # image_path and _loader hold derived PNG bytes, never the raw stream.
+        path = tmp_path / "fig.png"
+        path.write_bytes(IMAGE)
+        with pytest.raises(DatagruntPDFError, match="figure p0001_e001 has no raw image bytes: no raw loader"):
+            _figure(image_path=path, _loader=lambda: IMAGE).read_raw_bytes()
+
+    @pytest.mark.parametrize("bad", [None, "png-bytes", bytearray(IMAGE)])
+    def test_raw_loader_returning_non_bytes_raises(self, bad):
+        with pytest.raises(TypeError, match="_raw_loader result must be bytes"):
+            _figure(_raw_loader=lambda: bad).read_raw_bytes()
+
+    def test_raw_loader_result_at_limit_is_returned(self, monkeypatch):
+        monkeypatch.setattr(elements_module, "_MAX_ASSET_BYTES", len(IMAGE))
+        assert _figure(_raw_loader=lambda: IMAGE).read_raw_bytes() == IMAGE
+
+    def test_raw_loader_result_over_limit_rejected_naming_size(self, monkeypatch):
+        monkeypatch.setattr(elements_module, "_MAX_ASSET_BYTES", len(IMAGE) - 1)
+        with pytest.raises(DatagruntPDFError, match=f"_raw_loader result is {len(IMAGE)} bytes, over the"):
+            _figure(_raw_loader=lambda: IMAGE).read_raw_bytes()
 
 
 class TestFigureMarkdown:

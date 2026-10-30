@@ -46,15 +46,7 @@ from typing import NamedTuple
 import pypdfium2.raw as pdfium_c
 
 from datagrunt.pdf._pdfium_common import Box, PdfiumFailure, object_address, read_rgba
-from datagrunt.pdf._validate import finite_float, finite_tuple, int_at_least, rgba_tuple, strict_bool
-
-
-def _display_box(name: str, box: object) -> Box:
-    """Return ``box`` as 4 finite floats ``(x0, y0, x1, y1)`` with ``x0 <= x1`` and ``y0 <= y1``."""
-    x0, y0, x1, y1 = finite_tuple(name, box, 4)
-    if x0 > x1 or y0 > y1:
-        raise ValueError(f"{name} must have x0 <= x1 and y0 <= y1, got {box!r}")
-    return x0, y0, x1, y1
+from datagrunt.pdf._validate import finite_float, int_at_least, ordered_box, rgba_tuple, strict_bool
 
 
 def _union(boxes: tuple[Box, ...]) -> Box:
@@ -153,8 +145,8 @@ class RawSpan:
         if len(self.char_boxes) != len(self.text):
             counts = f"{len(self.char_boxes)} boxes for {len(self.text)} chars"
             raise ValueError(f"char_boxes must hold one box per char of text: {counts}")
-        boxes = tuple(_display_box(f"char_boxes[{i}]", box) for i, box in enumerate(self.char_boxes))
-        bbox = _display_box("bbox", self.bbox)
+        boxes = tuple(ordered_box(f"char_boxes[{i}]", box) for i, box in enumerate(self.char_boxes))
+        bbox = ordered_box("bbox", self.bbox)
         if bbox != _union(boxes):
             raise ValueError(f"bbox must be the union of char_boxes, {_union(boxes)!r}, got {self.bbox!r}")
         object.__setattr__(self, "char_boxes", boxes)

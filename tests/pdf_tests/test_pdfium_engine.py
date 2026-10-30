@@ -22,6 +22,7 @@ from datagrunt.pdf import (
     PDFEncryptedError,
     _path_segments,
     _pdfium_common,
+    _pdfium_images,
     _pdfium_text,
     pdfium_engine,
 )
@@ -93,7 +94,7 @@ def imported_modules(module) -> set[str]:
     return imported | {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
 
 
-ENGINE_MODULES = [pdfium_engine, _pdfium_text, _pdfium_common, _path_segments]
+ENGINE_MODULES = [pdfium_engine, _pdfium_text, _pdfium_common, _path_segments, _pdfium_images]
 
 
 class TestModuleImports:
