@@ -99,7 +99,16 @@ def span(**overrides) -> RawSpan:
 def stats(**overrides) -> TextStats:
     """A valid TextStats with ``overrides`` applied."""
     return TextStats(
-        **({"char_count": 2, "generated_count": 1, "ownerless_count": 0, "unicode_map_error_count": 0} | overrides)
+        **(
+            {
+                "char_count": 2,
+                "generated_count": 1,
+                "ownerless_count": 0,
+                "unicode_map_error_count": 0,
+                "skipped_nonfinite_objects": 0,
+            }
+            | overrides
+        )
     )
 
 
@@ -229,7 +238,7 @@ class TestTextStats:
     """TextStats counts a page's textpage chars; the counts must be consistent."""
 
     def test_pickle_round_trip_and_frozen(self):
-        original = stats(unicode_map_error_count=1)
+        original = stats(unicode_map_error_count=1, skipped_nonfinite_objects=0)
 
         assert pickle.loads(pickle.dumps(original)) == original
         with pytest.raises(dataclasses.FrozenInstanceError):
@@ -246,6 +255,18 @@ class TestTextStats:
                 ValueError,
                 "unicode_map_error_count (3) cannot exceed char_count (2)",
                 id="errors-over-chars",
+            ),
+            pytest.param(
+                {"skipped_nonfinite_objects": -1},
+                ValueError,
+                "skipped_nonfinite_objects must be >= 0, got -1",
+                id="skipped",
+            ),
+            pytest.param(
+                {"skipped_nonfinite_objects": True},
+                TypeError,
+                "skipped_nonfinite_objects must be an int, got True",
+                id="skipped-bool",
             ),
         ],
     )
@@ -345,7 +366,9 @@ class TestSpanGrouping:
         result = page_text(open_document(path), 0)
 
         assert [(item.text, item.generated_breaks) for item in result.spans] == [("AB", (1,))]
-        assert result.stats == TextStats(char_count=2, generated_count=1, ownerless_count=0, unicode_map_error_count=0)
+        assert result.stats == TextStats(
+            char_count=2, generated_count=1, ownerless_count=0, unicode_map_error_count=0, skipped_nonfinite_objects=0
+        )
         assert result.spans[0].char_boxes[1][0] - result.spans[0].char_boxes[0][2] > 20.0
 
     @pytest.mark.parametrize(
@@ -384,7 +407,9 @@ class TestSpanGrouping:
 
         # The generated line break falls between spans, so neither span has a break.
         assert [(item.text, item.generated_breaks) for item in result.spans] == [("Up", ()), ("Down", ())]
-        assert result.stats == TextStats(char_count=6, generated_count=2, ownerless_count=0, unicode_map_error_count=0)
+        assert result.stats == TextStats(
+            char_count=6, generated_count=2, ownerless_count=0, unicode_map_error_count=0, skipped_nonfinite_objects=0
+        )
 
     def test_a_run_drawn_twice_in_place_reads_once(self, tmp_path):
         # Observed pdfium behaviour (fake-bold removal): a char drawn on an
@@ -683,14 +708,18 @@ class TestUnicode:
         assert got.text == "A\U0001d400\U0001f600A"
         assert [box[0] for box in got.char_boxes] == pytest.approx([72.0, 84.0, 96.0, 108.0], abs=TOL)
         assert got.char_boxes[1][2] == pytest.approx(96.0, abs=TOL)
-        assert result.stats == TextStats(char_count=6, generated_count=0, ownerless_count=0, unicode_map_error_count=0)
+        assert result.stats == TextStats(
+            char_count=6, generated_count=0, ownerless_count=0, unicode_map_error_count=0, skipped_nonfinite_objects=0
+        )
 
     def test_lone_surrogates_and_unmapped_codes_are_kept(self, tmp_path):
         # Preserve, not transform: A3 classifies these chars.
         result = page_text(open_document(cid_page(tmp_path, b"00020005000400050002")), 0)
 
         assert [item.text for item in result.spans] == ["A\ud835\x04\ud835A"]
-        assert result.stats == TextStats(char_count=5, generated_count=0, ownerless_count=0, unicode_map_error_count=1)
+        assert result.stats == TextStats(
+            char_count=5, generated_count=0, ownerless_count=0, unicode_map_error_count=1, skipped_nonfinite_objects=0
+        )
 
     def test_a_lone_low_surrogate_is_kept(self, tmp_path):
         result = page_text(open_document(cid_page(tmp_path, b"000200060002")), 0)
@@ -706,7 +735,9 @@ class TestUnicode:
         (got,) = result.spans
         assert got.text == "\x01\U0010ffff\ufffd\x02\ufffd\x03"
         assert [box[0] for box in got.char_boxes] == pytest.approx([72.0, 84.0, 96.0, 108.0, 120.0, 132.0], abs=TOL)
-        assert result.stats == TextStats(char_count=6, generated_count=0, ownerless_count=0, unicode_map_error_count=6)
+        assert result.stats == TextStats(
+            char_count=6, generated_count=0, ownerless_count=0, unicode_map_error_count=6, skipped_nonfinite_objects=0
+        )
 
     def test_a_code_beyond_unicode_never_pairs_with_a_surrogate(self, tmp_path):
         result = page_text(open_document(wide_code_page(tmp_path, b"D835 110000 DC00")), 0)
@@ -850,20 +881,26 @@ class TestRightToLeft:
         # Logical order: the right-hand word (drawn second) reads first, its chars right to left.
         assert [(item.text, item.object_index) for item in result.spans] == [("אב", 1), ("אבג", 0)]
         assert [box[0] for box in result.spans[0].char_boxes] == pytest.approx([164.0, 152.0], abs=TOL)
-        assert result.stats == TextStats(char_count=5, generated_count=0, ownerless_count=1, unicode_map_error_count=0)
+        assert result.stats == TextStats(
+            char_count=5, generated_count=0, ownerless_count=1, unicode_map_error_count=0, skipped_nonfinite_objects=0
+        )
 
     def test_arabic_words_in_separate_tj_are_two_spans(self, tmp_path):
         result = page_text(open_document(rtl_page(tmp_path, ARABIC_TWO_WORDS)), 0)
 
         assert [(item.text, item.object_index) for item in result.spans] == [("ال", 1), ("لا", 0)]
-        assert result.stats == TextStats(char_count=4, generated_count=0, ownerless_count=1, unicode_map_error_count=0)
+        assert result.stats == TextStats(
+            char_count=4, generated_count=0, ownerless_count=1, unicode_map_error_count=0, skipped_nonfinite_objects=0
+        )
 
     def test_english_hebrew_english_keeps_every_word(self, tmp_path):
         result = page_text(open_document(rtl_page(tmp_path, ENGLISH_HEBREW_ENGLISH)), 0)
 
         # pdfium generates the space before the Hebrew word and inserts an ownerless one after it.
         assert [(item.text, item.object_index) for item in result.spans] == [("AB", 0), ("אב", 1), ("CD", 2)]
-        assert result.stats == TextStats(char_count=6, generated_count=1, ownerless_count=1, unicode_map_error_count=0)
+        assert result.stats == TextStats(
+            char_count=6, generated_count=1, ownerless_count=1, unicode_map_error_count=0, skipped_nonfinite_objects=0
+        )
 
     def test_a_char_without_an_owner_is_counted_and_never_fails_the_page(self, tmp_path, monkeypatch):
         handle = open_document(one_page(tmp_path, TextRun("Hi", x=72.0, y=100.0)))
@@ -871,7 +908,9 @@ class TestRightToLeft:
 
         result = page_text(handle, 0)
 
-        empty = TextStats(char_count=0, generated_count=0, ownerless_count=2, unicode_map_error_count=0)
+        empty = TextStats(
+            char_count=0, generated_count=0, ownerless_count=2, unicode_map_error_count=0, skipped_nonfinite_objects=0
+        )
         assert result == PageText(spans=(), stats=empty)
 
     def test_an_ownerless_char_inside_a_span_is_a_generated_break(self, tmp_path, monkeypatch):
@@ -1019,7 +1058,14 @@ class TestConservation:
         result = page_text(open_document(one_page(tmp_path)), 0)
 
         assert result == PageText(
-            spans=(), stats=TextStats(char_count=0, generated_count=0, ownerless_count=0, unicode_map_error_count=0)
+            spans=(),
+            stats=TextStats(
+                char_count=0,
+                generated_count=0,
+                ownerless_count=0,
+                unicode_map_error_count=0,
+                skipped_nonfinite_objects=0,
+            ),
         )
 
 
@@ -1120,6 +1166,19 @@ def writes_inf_box(textpage, index, rect):
     return 1
 
 
+def writes_inf_box_at(char_index):
+    """FPDFText_GetLooseCharBox, writing an infinite left edge for char ``char_index`` only."""
+    real = pdfium_c.FPDFText_GetLooseCharBox
+
+    def stand_in(textpage, index, rect):
+        ok = real(textpage, index, rect)
+        if index == char_index:
+            rect.left = float("inf")
+        return ok
+
+    return stand_in
+
+
 def writes_inf_size(text_object, size):
     size.value = float("inf")
     return 1
@@ -1137,7 +1196,6 @@ PDFIUM_FAILURES = [
     ("FPDFText_IsGenerated", failing(-1), "page 1: pdfium cannot read whether char 0 is generated"),
     ("FPDFText_HasUnicodeMapError", failing(-1), "page 1: pdfium cannot read whether char 0 maps to Unicode"),
     ("FPDFText_GetLooseCharBox", failing(0), "page 1: pdfium cannot read the box of char 0"),
-    ("FPDFText_GetLooseCharBox", writes_inf_box, "page 1: pdfium cannot read the box of char 0: it is not finite"),
     ("FPDFText_GetMatrix", failing(0), "page 1: pdfium cannot read the matrix of char 0"),
     ("FPDFTextObj_GetFont", failing(None), "page 1: pdfium cannot read the font of object 0"),
     ("FPDFFont_GetFlags", failing(-1), "page 1: pdfium cannot read the font flags of object 0"),
@@ -1149,7 +1207,6 @@ PDFIUM_FAILURES = [
     ),
     ("FPDFFont_GetBaseFontName", name_size_then(0), "page 1: pdfium cannot read the font name of object 0"),
     ("FPDFTextObj_GetFontSize", failing(0), "page 1: pdfium cannot read the font size of object 0"),
-    ("FPDFTextObj_GetFontSize", writes_inf_size, "page 1: pdfium cannot read the font size of object 0: it is not"),
     ("FPDFTextObj_GetTextRenderMode", failing(-1), "page 1: pdfium cannot read the render mode of object 0"),
     ("FPDFPageObj_GetFillColor", failing(0), "page 1: pdfium cannot read the fill colour of object 0"),
     ("FPDFPageObj_GetStrokeColor", failing(0), "page 1: pdfium cannot read the stroke colour of object 0"),
@@ -1166,6 +1223,79 @@ FORM_FAILURES = [
     ("FPDFFormObj_CountObjects", failing(-1), "page 1: pdfium cannot count the objects of form object 0"),
     ("FPDFFormObj_GetObject", failing(None), "page 1: pdfium cannot read object 0 of form object 0"),
 ]
+
+
+# pdfium keeps the CTM in 32-bit floats: five of these overflow it to (inf, nan, nan, inf, 0, 0).
+OVERFLOW = b"1000000000 0 0 1000000000 0 0 cm " * 5
+
+
+class TestNonFiniteText:
+    """A text object pdfium cannot place finitely is skipped and counted; the page's other text survives."""
+
+    def test_text_in_a_form_drawn_under_an_overflowing_cm_is_skipped(self, tmp_path):
+        inner = b"BT /F1 12 Tf 0 0 Td (Lost) Tj ET"
+        form = b"<< /Type /XObject /Subtype /Form /BBox [0 0 400 300] /Resources << /Font << /F1 5 0 R >> >>"
+        form += b" /Length %d >>\nstream\n%s\nendstream" % (len(inner), inner)
+        content = b"BT /F1 12 Tf 20 270 Td (Visible) Tj ET q " + OVERFLOW + b"/X Do Q"
+        path = content_page(tmp_path, content, extra=(form,), resources=b"/XObject << /X 6 0 R >>")
+
+        # Observed: pdfium's textpage keeps the lost chars, with NaN boxes.
+        textpage = pdfium.PdfDocument(path)[0].get_textpage()
+        assert [repr(edge) for edge in textpage.get_charbox(0, loose=True)] == ["nan"] * 4
+        got = page_text(open_document(path), 0)
+
+        assert [item.text for item in got.spans] == ["Visible"]
+        assert got.stats.skipped_nonfinite_objects == 1
+        assert got.stats.char_count == len("Visible")
+
+    @pytest.mark.parametrize(
+        "function,stand_in",
+        [
+            pytest.param("FPDFText_GetLooseCharBox", writes_inf_box, id="box"),
+            pytest.param("FPDFTextObj_GetFontSize", writes_inf_size, id="font-size"),
+        ],
+    )
+    def test_non_finite_geometry_from_pdfium_skips_the_object(self, tmp_path, monkeypatch, function, stand_in):
+        handle = open_document(one_page(tmp_path, TextRun("Hi", x=72.0, y=100.0)))
+        monkeypatch.setattr(pdfium_c, function, stand_in)
+
+        empty = TextStats(
+            char_count=0, generated_count=0, ownerless_count=0, unicode_map_error_count=0, skipped_nonfinite_objects=1
+        )
+        assert page_text(handle, 0) == PageText(spans=(), stats=empty)
+
+    def test_one_non_finite_char_skips_its_whole_object_only(self, tmp_path, monkeypatch):
+        # Chars 0-1 are "Ab" (object 0), char 2 the generated space, 3-4 "Cd" (object 1).
+        runs = (TextRun("Ab", x=72.0, y=100.0), TextRun("Cd", x=72.0, y=200.0), TextRun("Ef", x=72.0, y=250.0))
+        handle = open_document(one_page(tmp_path, *runs))
+        monkeypatch.setattr(pdfium_c, "FPDFText_GetLooseCharBox", writes_inf_box_at(4))
+
+        got = page_text(handle, 0)
+
+        assert [(item.text, item.object_index) for item in got.spans] == [("Ab", 0), ("Ef", 2)]
+        assert (got.stats.char_count, got.stats.skipped_nonfinite_objects) == (4, 1)
+
+    def test_a_skipped_object_ends_the_span_it_interrupts(self, tmp_path, monkeypatch):
+        # pdfium never interleaves objects' chars; make "C" report A's object so
+        # that A's run is interrupted by the skipped "B": "A" and "C" stay apart.
+        path = one_page(
+            tmp_path, *(TextRun(text, x=72.0, y=y) for text, y in (("A", 100.0), ("B", 150.0), ("C", 200.0)))
+        )
+        chars = pdfium.PdfDocument(path)[0].get_textpage().get_text_range()
+        a_index, b_index, c_index = (chars.index(text) for text in "ABC")
+        real_owner = pdfium_c.FPDFText_GetTextObject
+        monkeypatch.setattr(
+            pdfium_c, "FPDFText_GetTextObject", lambda tp, index: real_owner(tp, a_index if index == c_index else index)
+        )
+        monkeypatch.setattr(pdfium_c, "FPDFText_GetLooseCharBox", writes_inf_box_at(b_index))
+
+        got = page_text(open_document(path), 0)
+
+        assert [(item.text, item.object_index, item.generated_breaks) for item in got.spans] == [
+            ("A", 0, ()),
+            ("C", 0, ()),
+        ]
+        assert got.stats.skipped_nonfinite_objects == 1
 
 
 class TestPageTextErrors:

@@ -15,12 +15,12 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, NamedTuple
 
-from datagrunt.pdf._validate import finite_float, int_at_least
+from datagrunt.pdf._validate import finite_float, int_at_least, rgba_tuple, strict_bool
 
 Box = tuple[float, float, float, float]
 Point = tuple[float, float]
 Orientation = Literal["h", "v"]
-SegmentKind = Literal["stroke", "thin_fill"]
+SegmentKind = Literal["stroke", "thin_fill", "fill_edge"]
 
 # A segment is at least this long (A4's lattice pass, #367).
 MIN_LENGTH_PT = 12.0
@@ -30,7 +30,7 @@ AXIS_TOLERANCE_PT = 0.5
 MAX_THIN_FILL_PT = 3.0
 
 _ORIENTATIONS = ("h", "v")
-_KINDS = ("stroke", "thin_fill")
+_KINDS = ("stroke", "thin_fill", "fill_edge")
 
 
 def _checked_choice(name: str, value: object, choices: tuple[str, ...]) -> str:
@@ -59,12 +59,22 @@ class RawSegment:
         end: Where the line ends along its axis.
         width: The stroke's thickness in page points (the ``w`` line width
             scaled across the line by every enclosing transform), or a thin
-            fill's short side. 0 for a hairline.
+            fill's short side; 0 for a hairline and for every fill edge.
         kind: ``"stroke"`` for a stroked straight path edge, ``"thin_fill"``
-            for a filled rectangle at most 3 pt thick.
+            for a filled rectangle at most 3 pt thick (one segment along its
+            length), ``"fill_edge"`` for a side of a thicker filled rectangle
+            (a shaded cell's border, which v4's pdfplumber read as a rule;
+            whether it rules a table is #367's call).
         object_index: The path object's position in the page's depth-first,
             paint-order object walk (forms count, then their contents): the
             same index a :class:`~datagrunt.pdf.pdfium_engine.RawSpan` uses.
+        dashed: Whether a stroke's dash pattern leaves gaps (a dash array
+            with a gap > 0, not all zero): dashed rules and dotted leaders.
+            Always False for the fill kinds.
+        paint_rgba: The colour and alpha, 0-255, the segment is painted in:
+            the stroke colour for ``"stroke"``, the fill colour otherwise (a
+            pattern reads as a colour pdfium picks). White or transparent
+            rules are kept; #367/#368 judge them.
     """
 
     orientation: Orientation
@@ -74,6 +84,8 @@ class RawSegment:
     width: float
     kind: SegmentKind
     object_index: int
+    dashed: bool
+    paint_rgba: tuple[int, int, int, int]
 
     def __post_init__(self) -> None:
         _checked_choice("orientation", self.orientation, _ORIENTATIONS)
@@ -86,6 +98,44 @@ class RawSegment:
         object.__setattr__(self, "width", finite_float("width", self.width, lo=0.0))
         _checked_choice("kind", self.kind, _KINDS)
         int_at_least("object_index", self.object_index, 0)
+        if strict_bool("dashed", self.dashed) and self.kind != "stroke":
+            raise ValueError(f"dashed must be False for a {self.kind}: only a stroke has a dash pattern")
+        rgba_tuple("paint_rgba", self.paint_rgba)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SegmentStats:
+    """Counts of one page's path objects that gave no segments for a reason A3 records.
+
+    Attributes:
+        skipped_nonfinite_paths: Path objects skipped because their
+            page-space geometry is not finite: their matrix to page space
+            (pdfium keeps the CTM in 32-bit floats, so five ``1e9`` scales
+            overflow it), a point, or the stroke width. A path inside a form
+            whose matrix overflowed counts here.
+    """
+
+    skipped_nonfinite_paths: int
+
+    def __post_init__(self) -> None:
+        int_at_least("skipped_nonfinite_paths", self.skipped_nonfinite_paths, 0)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PageSegments:
+    """One page's segments in object-walk order, with its skip counts."""
+
+    segments: tuple[RawSegment, ...]
+    stats: SegmentStats
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.segments, tuple):
+            raise TypeError(f"segments must be a tuple, got {type(self.segments).__name__}")
+        for index, item in enumerate(self.segments):
+            if not isinstance(item, RawSegment):
+                raise TypeError(f"segments[{index}] must be a RawSegment, got {type(item).__name__}")
+        if not isinstance(self.stats, SegmentStats):
+            raise TypeError(f"stats must be a SegmentStats, got {type(self.stats).__name__}")
 
 
 class Matrix(NamedTuple):
@@ -119,7 +169,7 @@ IDENTITY = Matrix(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 
 
 class NonFiniteGeometry(ValueError):
-    """A path's page-space point or stroke width is not finite (a transform overflowed)."""
+    """A path's matrix to page space, a page-space point or its stroke width is not finite."""
 
 
 class PathPoint(NamedTuple):
@@ -137,11 +187,14 @@ class PathPoint(NamedTuple):
 
 
 class PathPaint(NamedTuple):
-    """How a path object is painted: stroked, filled, and its ``w`` line width."""
+    """How a path object is painted: stroked or filled, its ``w`` line width, dashes and colours."""
 
     stroked: bool
     filled: bool
     stroke_width: float
+    dashed: bool
+    stroke_rgba: tuple[int, int, int, int]
+    fill_rgba: tuple[int, int, int, int]
 
 
 def path_segments(
@@ -158,30 +211,38 @@ def path_segments(
         points: The path's points in its own space, as pdfium reads them.
         matrix: Maps the path's space to PDF user space (bottom-left,
             unrotated): its object matrix followed by every enclosing form's.
-        paint: How the path is painted: a filled path has thin-fill segments,
-            a stroked one stroke segments.
+        paint: How the path is painted: a filled path has thin-fill and
+            fill-edge segments, a stroked one stroke segments.
         object_index: The path object's index in the page's object walk.
         to_display: Maps a user-space ``(left, bottom, right, top)`` box to a
             displayed, top-left ``(x0, y0, x1, y1)`` box.
 
+    Raises:
+        NonFiniteGeometry: If ``matrix`` or the stroke width is not finite,
+            or a point or an edge's stroke thickness overflows in page space.
+
     Returns:
-        The thin filled rectangles (:func:`_thin_fills`), then the stroked
+        The filled rectangles' segments (:func:`_fill_segments`), then the stroked
         straight edges at least :data:`MIN_LENGTH_PT` long and axis-aligned
         within :data:`AXIS_TOLERANCE_PT` in user space, each in path order:
         PDF paints a path's fill before its stroke.
     """
+    if not all(math.isfinite(value) for value in matrix):
+        raise NonFiniteGeometry(f"its matrix to page space is not finite {tuple(matrix)}")
+    if not math.isfinite(paint.stroke_width):
+        raise NonFiniteGeometry(f"its stroke width is not finite ({paint.stroke_width})")
     closed = _explicit_closes(points)
     placed = [_placed(point, matrix) for point in closed]
     segments = []
     if paint.filled:
-        segments.extend(_thin_fills(placed, object_index, to_display))
+        segments.extend(_fill_segments(placed, object_index, paint, to_display))
     if not paint.stroked:
         return segments
     for local, page in zip(_straight_edges(closed), _straight_edges(placed)):
         line = _axis_line(*page)
         if line is not None:
             width = _stroke_thickness(paint.stroke_width, matrix, local, page)
-            segments.append(_segment(line, width, "stroke", object_index, to_display))
+            segments.append(_segment(line, width, "stroke", object_index, paint, to_display))
     return segments
 
 
@@ -254,8 +315,16 @@ def _stroke_thickness(width: float, matrix: Matrix, local: tuple[Point, Point], 
     return thickness
 
 
-def _thin_fills(points: Sequence[PathPoint], object_index: int, to_display: Callable[[Box], Box]) -> list[RawSegment]:
-    """One segment per filled rectangle at most :data:`MAX_THIN_FILL_PT` thick and :data:`MIN_LENGTH_PT` long."""
+def _fill_segments(
+    points: Sequence[PathPoint], object_index: int, paint: PathPaint, to_display: Callable[[Box], Box]
+) -> list[RawSegment]:
+    """The segments of each filled axis-aligned rectangle among a path's subpaths.
+
+    A rectangle at most :data:`MAX_THIN_FILL_PT` thick and at least
+    :data:`MIN_LENGTH_PT` long is one ``thin_fill`` along its length; a
+    thicker one gives each side at least :data:`MIN_LENGTH_PT` long as a
+    zero-width ``fill_edge``: bottom, right, top, left in user space.
+    """
     segments = []
     for subpath in _subpaths(points):
         box = _filled_rectangle(subpath)
@@ -263,14 +332,26 @@ def _thin_fills(points: Sequence[PathPoint], object_index: int, to_display: Call
             continue
         left, bottom, right, top = box
         width, height = right - left, top - bottom
-        if max(width, height) < MIN_LENGTH_PT or min(width, height) > MAX_THIN_FILL_PT:
+        if min(width, height) > MAX_THIN_FILL_PT:
+            sides = (
+                (left, bottom, right, bottom),
+                (right, bottom, right, top),
+                (left, top, right, top),
+                (left, bottom, left, top),
+            )
+            segments += [
+                _segment(side, 0.0, "fill_edge", object_index, paint, to_display)
+                for side in sides
+                if max(side[2] - side[0], side[3] - side[1]) >= MIN_LENGTH_PT
+            ]
+        elif max(width, height) < MIN_LENGTH_PT:
             continue
-        if width >= height:
+        elif width >= height:
             y = (bottom + top) / 2
-            segments.append(_segment((left, y, right, y), height, "thin_fill", object_index, to_display))
+            segments.append(_segment((left, y, right, y), height, "thin_fill", object_index, paint, to_display))
         else:
             x = (left + right) / 2
-            segments.append(_segment((x, bottom, x, top), width, "thin_fill", object_index, to_display))
+            segments.append(_segment((x, bottom, x, top), width, "thin_fill", object_index, paint, to_display))
     return segments
 
 
@@ -309,13 +390,20 @@ def _filled_rectangle(subpath: Sequence[PathPoint]) -> Box | None:
 
 
 def _segment(
-    line: Box, width: float, kind: SegmentKind, object_index: int, to_display: Callable[[Box], Box]
+    line: Box,
+    width: float,
+    kind: SegmentKind,
+    object_index: int,
+    paint: PathPaint,
+    to_display: Callable[[Box], Box],
 ) -> RawSegment:
     """The RawSegment of a user-space line, given as a zero-thickness box at least 12 pt long.
 
     The displayed box says the orientation: a quarter-turned page shows a
-    horizontal user-space line vertically.
+    horizontal user-space line vertically. A stroke takes the stroke's dash
+    flag and colour, a fill segment the fill colour.
     """
+    stroke = kind == "stroke"
     x0, y0, x1, y1 = to_display(line)
     orientation: Orientation
     if x1 - x0 > y1 - y0:
@@ -330,4 +418,6 @@ def _segment(
         width=width,
         kind=kind,
         object_index=object_index,
+        dashed=paint.dashed and stroke,
+        paint_rgba=paint.stroke_rgba if stroke else paint.fill_rgba,
     )

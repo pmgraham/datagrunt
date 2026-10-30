@@ -67,3 +67,34 @@ def optional_str(name: str, value: object) -> str | None:
     if value is not None and not isinstance(value, str):
         raise TypeError(f"{name} must be a str or None, got {value!r} ({type(value).__name__})")
     return value
+
+
+def finite_tuple(name: str, value: object, size: int) -> tuple[float, ...]:
+    """Return ``value`` as a tuple of ``size`` finite floats."""
+    if not isinstance(value, tuple):
+        raise TypeError(f"{name} must be a tuple, got {type(value).__name__}")
+    if len(value) != size:
+        raise ValueError(f"{name} must have {size} values, got {len(value)}")
+    return tuple(finite_float(f"{name}[{index}]", item) for index, item in enumerate(value))
+
+
+def strict_bool(name: str, value: object) -> bool:
+    """Return ``value`` if it is exactly a bool (not an int standing in for one)."""
+    if not isinstance(value, bool):
+        raise TypeError(f"{name} must be a bool, got {value!r} ({type(value).__name__})")
+    return value
+
+
+def rgba_tuple(name: str, value: object) -> tuple[int, int, int, int]:
+    """Return ``value`` if it is a tuple of 4 ints in 0..255 (bool rejected)."""
+    if not isinstance(value, tuple):
+        raise TypeError(f"{name} must be a tuple, got {type(value).__name__}")
+    if len(value) != 4:
+        raise ValueError(f"{name} must have 4 channels, got {len(value)}")
+    for index, channel in enumerate(value):
+        if isinstance(channel, bool) or not isinstance(channel, int):
+            raise TypeError(f"{name}[{index}] must be an int, got {channel!r} ({type(channel).__name__})")
+        if not 0 <= channel <= 255:
+            raise ValueError(f"{name}[{index}] must be in 0..255, got {channel}")
+    red, green, blue, alpha = value
+    return red, green, blue, alpha

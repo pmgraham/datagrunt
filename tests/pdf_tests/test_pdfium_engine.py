@@ -17,7 +17,14 @@ import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 import pytest
 
-from datagrunt.pdf import PDFCorruptError, PDFEncryptedError, pdfium_engine
+from datagrunt.pdf import (
+    PDFCorruptError,
+    PDFEncryptedError,
+    _path_segments,
+    _pdfium_common,
+    _pdfium_text,
+    pdfium_engine,
+)
 from datagrunt.pdf.pdfium_engine import DocumentHandle, PageGeometry, open_document, page_geometry, to_display_box
 from pdf_tests.builders import PageSpec, Rect, TextRun, break_page, build_pdf, hand_written_pdf
 
@@ -79,15 +86,45 @@ def gc_disabled():
         gc.collect()
 
 
+def imported_modules(module) -> set[str]:
+    """The modules ``module``'s source imports."""
+    tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+    imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+    return imported | {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
+
+
+ENGINE_MODULES = [pdfium_engine, _pdfium_text, _pdfium_common, _path_segments]
+
+
 class TestModuleImports:
     """The engine stands alone: no v4 PDF stack, no PyMuPDF or pdfplumber."""
 
-    def test_imports_only_allowed_modules(self):
-        tree = ast.parse(Path(pdfium_engine.__file__).read_text(encoding="utf-8"))
-        imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
-        imported |= {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
+    @pytest.mark.parametrize("module", ENGINE_MODULES, ids=lambda module: module.__name__)
+    def test_imports_only_allowed_modules(self, module):
         banned = ("fitz", "pymupdf", "pdfplumber", "datagrunt.core.pdf_io", "datagrunt.pdf_api")
-        assert not [name for name in imported if name.lower().startswith(banned)]
+
+        assert not [name for name in imported_modules(module) if name.lower().startswith(banned)]
+
+    @pytest.mark.parametrize("module", ENGINE_MODULES, ids=lambda module: module.__name__)
+    def test_module_level_tables_are_immutable(self, module):
+        # No mutable module state: lookup tables are MappingProxyType, tuples or frozensets.
+        mutable = (dict, list, set, bytearray)
+        names = {name: value for name, value in vars(module).items() if not name.startswith("__")}
+        found = {name for name, value in names.items() if isinstance(value, mutable)}
+
+        assert found == set()
+
+    @pytest.mark.parametrize(
+        "module,allowed",
+        [
+            pytest.param(_pdfium_common, set(), id="common"),
+            pytest.param(_pdfium_text, {"datagrunt.pdf._pdfium_common", "datagrunt.pdf._validate"}, id="text"),
+            pytest.param(_path_segments, {"datagrunt.pdf._validate"}, id="segments"),
+        ],
+    )
+    def test_engine_parts_import_only_downward(self, module, allowed):
+        # The engine imports its parts; a part never imports the engine (or a sibling above it).
+        assert {name for name in imported_modules(module) if name.startswith("datagrunt")} == allowed
 
 
 class TestToDisplayBox:

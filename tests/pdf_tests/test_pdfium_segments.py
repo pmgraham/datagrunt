@@ -20,10 +20,20 @@ import pytest
 
 from datagrunt.pdf import PDFCorruptError, _path_segments
 from datagrunt.pdf._path_segments import IDENTITY, Matrix, NonFiniteGeometry, PathPaint, PathPoint, path_segments
-from datagrunt.pdf.pdfium_engine import RawSegment, open_document, page_segments
+from datagrunt.pdf.pdfium_engine import (
+    PageSegments,
+    RawSegment,
+    SegmentStats,
+    open_document,
+    page_segments,
+    page_text,
+)
 from pdf_tests.builders import FormXObject, Line, PageSpec, Rect, break_page, build_pdf, hand_written_pdf
 
 BLACK = (0.0, 0.0, 0.0)
+HELVETICA = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+# pdfium keeps the CTM in 32-bit floats: five of these overflow it to (inf, nan, nan, inf, 0, 0).
+OVERFLOW = b"1000000000 0 0 1000000000 0 0 cm " * 5
 
 # RawSegment fields for a valid horizontal stroke.
 VALID = {
@@ -34,6 +44,8 @@ VALID = {
     "width": 0.5,
     "kind": "stroke",
     "object_index": 0,
+    "dashed": False,
+    "paint_rgba": (0, 0, 0, 255),
 }
 
 
@@ -62,7 +74,7 @@ def content_page(tmp_path: Path, content: bytes, *, extra: tuple[bytes, ...] = (
 
 def segments_of(path: Path) -> tuple[RawSegment, ...]:
     """The segments of page 1 of ``path``."""
-    return page_segments(open_document(path), 0)
+    return page_segments(open_document(path), 0).segments
 
 
 def rows(segments: tuple[RawSegment, ...]) -> list[tuple]:
@@ -95,8 +107,9 @@ class TestModuleImports:
 class TestRawSegment:
     """RawSegment is a frozen, slotted, picklable, validated record."""
 
-    def test_pickle_round_trip(self):
-        original = segment(orientation="v", kind="thin_fill", object_index=7)
+    @pytest.mark.parametrize("kind", ["stroke", "thin_fill", "fill_edge"])
+    def test_pickle_round_trip(self, kind):
+        original = segment(orientation="v", kind=kind, object_index=7)
 
         assert pickle.loads(pickle.dumps(original)) == original
 
@@ -129,10 +142,28 @@ class TestRawSegment:
             ),
             pytest.param({"width": -0.5}, ValueError, "width must be >= 0.0, got -0.5", id="width-negative"),
             pytest.param({"width": True}, TypeError, "width must be an int or float, got True", id="width-bool"),
-            pytest.param({"kind": "fill"}, ValueError, "kind must be 'stroke' or 'thin_fill', got 'fill'", id="kind"),
+            pytest.param(
+                {"kind": "fill"},
+                ValueError,
+                "kind must be 'stroke' or 'thin_fill' or 'fill_edge', got 'fill'",
+                id="kind",
+            ),
             pytest.param({"kind": 1}, TypeError, "kind must be a str, got 1", id="kind-type"),
             pytest.param({"object_index": -1}, ValueError, "object_index must be >= 0, got -1", id="index-negative"),
             pytest.param({"object_index": True}, TypeError, "object_index must be an int, got True", id="index-bool"),
+            pytest.param({"dashed": 1}, TypeError, "dashed must be a bool, got 1", id="dashed-type"),
+            pytest.param(
+                {"kind": "thin_fill", "dashed": True},
+                ValueError,
+                "dashed must be False for a thin_fill: only a stroke has a dash pattern",
+                id="dashed-fill",
+            ),
+            pytest.param(
+                {"paint_rgba": (0, 0, 0)}, ValueError, "paint_rgba must have 4 channels, got 3", id="rgba-size"
+            ),
+            pytest.param(
+                {"paint_rgba": (0, 0, 256, 0)}, ValueError, "paint_rgba[2] must be in 0..255", id="rgba-range"
+            ),
         ],
     )
     def test_invalid_field_raises(self, overrides, error, message):
@@ -183,12 +214,13 @@ class TestStrokedLines:
         assert rows(got) == [("h", 50.0, 10.0, 100.0, 1.0, "stroke", 2), ("v", 250.0, 50.0, 150.0, 1.0, "stroke", 2)]
 
     def test_unstroked_paths_give_no_stroke_segments(self, tmp_path):
-        # A large filled rectangle, a fill-only straight path, a clip-only path and an unpainted one.
-        content = b"10 10 200 100 re f 10 150 m 200 150 l 200 160 l f 10 200 m 300 200 l W n 10 250 m 300 250 l n"
+        # A fill-only straight path, a clip-only path and an unpainted one.
+        content = b"10 150 m 200 150 l 200 160 l f 10 200 m 300 200 l W n 10 250 m 300 250 l n"
         filled = Rect(50.0, 50.0, 200.0, 100.0, fill_rgb=BLACK, stroke=False)
 
         assert segments_of(content_page(tmp_path, content)) == ()
-        assert segments_of(one_page(tmp_path, filled)) == ()
+        # A large filled rectangle gives only its fill's edges (TestFillEdges).
+        assert {item.kind for item in segments_of(one_page(tmp_path, filled))} == {"fill_edge"}
 
     def test_a_stroked_rectangle_gives_its_four_sides(self, tmp_path):
         got = segments_of(one_page(tmp_path, Rect(50.0, 100.0, 100.0, 40.0)))
@@ -204,9 +236,10 @@ class TestStrokedLines:
     @pytest.mark.parametrize("operators", [b"s", b"h S", b"b", b"h B"])
     def test_closing_a_subpath_strokes_its_closing_side(self, tmp_path, operators):
         got = segments_of(content_page(tmp_path, b"10 10 m 100 10 l 100 50 l 10 50 l " + operators))
+        strokes = [row for row in rows(got) if row[5] == "stroke"]
 
-        assert rows(got)[-1] == ("v", 10.0, 250.0, 290.0, 1.0, "stroke", 0)
-        assert len(got) == 4
+        assert strokes[-1] == ("v", 10.0, 250.0, 290.0, 1.0, "stroke", 0)
+        assert len(strokes) == 4
 
     def test_each_subpath_of_one_path_gives_its_segments(self, tmp_path):
         got = segments_of(content_page(tmp_path, b"10 10 m 100 10 l 10 30 m 100 30 l S"))
@@ -246,7 +279,8 @@ class TestThinFills:
 
         got = segments_of(content_page(tmp_path, content))
 
-        assert rows(got) == [
+        # The 3.25 pt rectangle gives fill edges instead (TestFillEdges).
+        assert [row for row in rows(got) if row[5] == "thin_fill"] == [
             ("h", 288.5, 10.0, 110.0, 3.0, "thin_fill", 0),
             ("h", 249.0, 10.0, 22.0, 2.0, "thin_fill", 2),
             ("v", 201.5, 190.0, 290.0, 3.0, "thin_fill", 4),
@@ -289,6 +323,81 @@ class TestThinFills:
             ("h", 150.0, 50.0, 150.0, 1.0, "stroke", 0),
             ("h", 148.0, 50.0, 150.0, 1.0, "stroke", 0),
         ]
+
+
+class TestFillEdges:
+    """Each side (>= 12 pt) of a filled rectangle thicker than 3 pt is a zero-width fill_edge."""
+
+    def test_a_table_of_shaded_cells_gives_every_cell_edge(self, tmp_path):
+        # A 3 x 3 table drawn only as shaded cells, 1 pt apart (as v4's pdfplumber still finds).
+        lefts, bottoms = (50, 150, 250), (100, 120, 140)
+        cells = b" ".join(b"%d %d 99 19 re f" % (x, y) for y in bottoms for x in lefts)
+
+        got = segments_of(content_page(tmp_path, b"0.9 g " + cells))
+
+        expected = []
+        for index, (y, x) in enumerate((y, x) for y in bottoms for x in lefts):
+            top, bottom = 300.0 - (y + 19), 300.0 - y
+            expected += [
+                ("h", bottom, float(x), x + 99.0, 0.0, "fill_edge", index),
+                ("v", x + 99.0, top, bottom, 0.0, "fill_edge", index),
+                ("h", top, float(x), x + 99.0, 0.0, "fill_edge", index),
+                ("v", float(x), top, bottom, 0.0, "fill_edge", index),
+            ]
+        assert rows(got) == expected
+
+    def test_thin_fills_stay_thin_fill(self, tmp_path):
+        got = segments_of(content_page(tmp_path, b"10 10 100 3 re f 10 50 100 3.25 re f"))
+
+        # 3 pt thick is a thin fill; 3.25 pt is a rectangle with two long edges.
+        assert rows(got) == [
+            ("h", 288.5, 10.0, 110.0, 3.0, "thin_fill", 0),
+            ("h", 250.0, 10.0, 110.0, 0.0, "fill_edge", 1),
+            ("h", 246.75, 10.0, 110.0, 0.0, "fill_edge", 1),
+        ]
+
+    def test_a_filled_and_stroked_rectangle_gives_its_fill_edges_then_its_strokes(self, tmp_path):
+        got = segments_of(content_page(tmp_path, b"10 10 100 50 re B"))
+
+        assert [item.kind for item in got] == ["fill_edge"] * 4 + ["stroke"] * 4
+        assert rows(got)[:4] == [(row[0], row[1], row[2], row[3], 0.0, "fill_edge", 0) for row in rows(got)[4:]]
+
+
+def paints(segments: tuple[RawSegment, ...]) -> list[tuple]:
+    """Each segment's kind, dash flag and paint colour."""
+    return [(item.kind, item.dashed, item.paint_rgba) for item in segments]
+
+
+class TestPaint:
+    """Each segment carries its dash flag and the colour it is painted in, for #367/#368 to judge."""
+
+    @pytest.mark.parametrize(
+        "pattern,dashed",
+        [
+            pytest.param(b"[]", False, id="solid"),
+            pytest.param(b"[3 2]", True, id="dashes"),
+            pytest.param(b"[3]", True, id="odd-length"),
+            pytest.param(b"[0 4]", True, id="dots"),
+            pytest.param(b"[4 0]", False, id="no-gaps"),
+            pytest.param(b"[0 0]", False, id="all-zero"),
+        ],
+    )
+    def test_dashed_means_the_dash_pattern_leaves_gaps(self, tmp_path, pattern, dashed):
+        # Observed: pdfium strokes [4 0] and [0 0] solid; [0 4] draws only round-cap dots.
+        got = segments_of(content_page(tmp_path, pattern + b" 0 d 10 10 m 100 10 l S"))
+
+        assert paints(got) == [("stroke", dashed, (0, 0, 0, 255))]
+
+    def test_strokes_carry_the_stroke_colour_and_fills_the_fill_colour(self, tmp_path):
+        alpha = b"<< /Type /ExtGState /CA 0.5 /ca 0.25 >>"
+        content = b"1 0 0 RG 0 0 1 rg [3 2] 0 d 10 10 100 2 re 10 50 100 40 re B /G gs 0.9 g 10 200 100 20 re f"
+        path = content_page(tmp_path, content, resources=b"/ExtGState << /G 5 0 R >>", extra=(alpha,))
+
+        got = paints(segments_of(path))
+
+        blue, red, grey = (0, 0, 255, 255), (255, 0, 0, 255), (230, 230, 230, 64)
+        expected = [("thin_fill", False, blue)] + [("fill_edge", False, blue)] * 4 + [("stroke", True, red)] * 6
+        assert got == expected + [("fill_edge", False, grey)] * 4
 
 
 def form_xobject(content: bytes, *, matrix: bytes = b"[1 0 0 1 0 0]", resources: bytes = b"") -> bytes:
@@ -445,7 +554,9 @@ def user_space(box):
     return box
 
 
-STROKE = PathPaint(stroked=True, filled=False, stroke_width=1.0)
+STROKE = PathPaint(
+    stroked=True, filled=False, stroke_width=1.0, dashed=False, stroke_rgba=(0, 0, 0, 255), fill_rgba=(0, 0, 0, 255)
+)
 
 
 class TestPathGeometry:
@@ -482,9 +593,18 @@ class TestPathGeometry:
         points = [PathPoint("move", 1.0, 0.0), PathPoint("line", 100.0, 0.0)]
         huge = Matrix(1e308, 0.0, 0.0, 1.0, 0.0, 0.0)
 
-        for matrix in (IDENTITY._replace(a=float("inf")), huge):
-            with pytest.raises(NonFiniteGeometry, match=re.escape("its page-space point (inf, 0.0) is not finite")):
-                path_segments(points, matrix=matrix, paint=STROKE, object_index=0, to_display=user_space)
+        with pytest.raises(NonFiniteGeometry, match=re.escape("its page-space point (inf, 0.0) is not finite")):
+            path_segments(points, matrix=huge, paint=STROKE, object_index=0, to_display=user_space)
+
+    def test_a_non_finite_matrix_or_stroke_width_raises(self):
+        points = [PathPoint("move", 1.0, 0.0), PathPoint("line", 100.0, 0.0)]
+        message = "its matrix to page space is not finite (inf, 0.0, 0.0, 1.0, 0.0, 0.0)"
+
+        with pytest.raises(NonFiniteGeometry, match=re.escape(message)):
+            path_segments(points, matrix=IDENTITY._replace(a=INF), paint=STROKE, object_index=0, to_display=user_space)
+        with pytest.raises(NonFiniteGeometry, match=re.escape("its stroke width is not finite (nan)")):
+            nan_width = STROKE._replace(stroke_width=float("nan"))
+            path_segments(points, matrix=IDENTITY, paint=nan_width, object_index=0, to_display=user_space)
 
     def test_a_stroke_width_scaled_beyond_float_range_raises(self):
         # Each point stays finite; the matrix's determinant (1e400) does not.
@@ -549,29 +669,18 @@ INF = float("inf")
 
 # (pdfium function, stand-in, message): each makes page_segments raise PDFCorruptError for page 1.
 PDFIUM_FAILURES = [
+    ("FPDFPageObj_GetDashCount", failing(-1), "page 1: pdfium cannot read the dash pattern of object 0"),
+    ("FPDFPageObj_GetDashArray", failing(0), "page 1: pdfium cannot read the dash pattern of object 0"),
+    ("FPDFPageObj_GetStrokeColor", failing(0), "page 1: pdfium cannot read the stroke colour of object 0"),
+    ("FPDFPageObj_GetFillColor", failing(0), "page 1: pdfium cannot read the fill colour of object 0"),
     ("FPDFPath_GetDrawMode", failing(0), "page 1: pdfium cannot read the draw mode of object 0"),
     ("FPDFPath_GetDrawMode", writes_fill_mode(3), "page 1: pdfium cannot read the draw mode of object 0"),
     ("FPDFPageObj_GetStrokeWidth", failing(0), "page 1: pdfium cannot read the stroke width of object 0"),
-    (
-        "FPDFPageObj_GetStrokeWidth",
-        writes_width(float("nan")),
-        "page 1: pdfium cannot read the stroke width of object 0: it is not finite (nan)",
-    ),
     ("FPDFPageObj_GetMatrix", failing(0), "page 1: pdfium cannot read the matrix of object 0"),
     ("FPDFPath_CountSegments", failing(-1), "page 1: pdfium cannot count the path segments of object 0"),
     ("FPDFPath_GetPathSegment", failing(None), "page 1: pdfium cannot read path segment 0 of object 0"),
     ("FPDFPathSegment_GetType", failing(-1), "page 1: pdfium cannot read path segment 0 of object 0"),
     ("FPDFPathSegment_GetPoint", failing(0), "page 1: pdfium cannot read path segment 0 of object 0"),
-    (
-        "FPDFPathSegment_GetPoint",
-        writes_nan_point,
-        "page 1: pdfium cannot read the geometry of object 0: its page-space point (nan, nan) is not finite",
-    ),
-    (
-        "FPDFPageObj_GetMatrix",
-        writes_matrix(INF, 0.0, 0.0, 1.0, 0.0, 0.0),
-        "page 1: pdfium cannot read the matrix of object 0: it is not finite (inf, 0.0, 0.0, 1.0, 0.0, 0.0)",
-    ),
     ("FPDFPage_CountObjects", failing(-1), "page 1: pdfium cannot count the objects of the page"),
     ("FPDFPage_GetObject", failing(None), "page 1: pdfium cannot read object 0 of the page"),
 ]
@@ -581,6 +690,101 @@ FORM_FAILURES = [
     ("FPDFFormObj_CountObjects", failing(-1), "page 1: pdfium cannot count the objects of form object 0"),
     ("FPDFFormObj_GetObject", failing(None), "page 1: pdfium cannot read object 0 of form object 0"),
 ]
+
+
+# (pdfium function, stand-in): each gives the one path non-finite geometry, so it is skipped.
+NON_FINITE = [
+    pytest.param("FPDFPageObj_GetStrokeWidth", writes_width(float("nan")), id="width"),
+    pytest.param("FPDFPathSegment_GetPoint", writes_nan_point, id="point"),
+    pytest.param("FPDFPageObj_GetMatrix", writes_matrix(INF, 0.0, 0.0, 1.0, 0.0, 0.0), id="matrix"),
+]
+
+
+def stats(skipped: int) -> SegmentStats:
+    return SegmentStats(skipped_nonfinite_paths=skipped)
+
+
+class TestPageSegmentsAndStats:
+    """PageSegments and SegmentStats are frozen, slotted, picklable, validated records."""
+
+    def test_pickle_round_trip(self):
+        original = PageSegments(segments=(segment(),), stats=stats(2))
+
+        assert pickle.loads(pickle.dumps(original)) == original
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            original.stats = stats(0)  # type: ignore[misc]
+        assert not hasattr(original, "__dict__") and not hasattr(original.stats, "__dict__")
+
+    @pytest.mark.parametrize(
+        "make,error,message",
+        [
+            pytest.param(lambda: stats(-1), ValueError, "skipped_nonfinite_paths must be >= 0, got -1", id="negative"),
+            pytest.param(lambda: stats(True), TypeError, "skipped_nonfinite_paths must be an int, got True", id="bool"),
+            pytest.param(
+                lambda: PageSegments(segments=[segment()], stats=stats(0)),
+                TypeError,
+                "segments must be a tuple, got list",
+                id="segments-list",
+            ),
+            pytest.param(
+                lambda: PageSegments(segments=(segment(), "x"), stats=stats(0)),
+                TypeError,
+                "segments[1] must be a RawSegment, got str",
+                id="segments-item",
+            ),
+            pytest.param(
+                lambda: PageSegments(segments=(), stats=0),
+                TypeError,
+                "stats must be a SegmentStats, got int",
+                id="stats-type",
+            ),
+        ],
+    )
+    def test_invalid_field_raises(self, make, error, message):
+        with pytest.raises(error, match=re.escape(message)):
+            make()
+
+
+class TestNonFiniteGeometry:
+    """A path whose page-space geometry is not finite is skipped and counted; the page survives."""
+
+    def test_a_path_drawn_under_an_overflowing_cm_is_skipped(self, tmp_path):
+        content = b"BT /F1 12 Tf 20 270 Td (Visible) Tj ET 10 250 m 200 250 l S q " + OVERFLOW + b"0 0 m 1 0 l S Q"
+        path = content_page(tmp_path, content, resources=b"/Font << /F1 5 0 R >>", extra=(HELVETICA,))
+
+        # Observed: pdfium reads the overflowed matrix and still renders the page.
+        page = pdfium.PdfDocument(path)[0]
+        assert [repr(value) for value in list(page.get_objects())[2].get_matrix().get()] == [
+            "inf",
+            "nan",
+            "nan",
+            "inf",
+            "0.0",
+            "0.0",
+        ]
+        assert renders_dark(path, 100, (50,)) == [True]
+        got = page_segments(open_document(path), 0)
+
+        assert rows(got.segments) == [("h", 50.0, 10.0, 200.0, 1.0, "stroke", 1)]
+        assert got.stats == stats(1)
+        assert [item.text for item in page_text(open_document(path), 0).spans] == ["Visible"]
+
+    def test_every_path_in_a_form_drawn_under_an_overflowing_cm_is_skipped(self, tmp_path):
+        form = form_xobject(b"10 10 m 100 10 l S 10 50 4 100 re f")
+        content = b"q " + OVERFLOW + b"/X Do Q 10 250 m 200 250 l S"
+        path = content_page(tmp_path, content, resources=b"/XObject << /X 5 0 R >>", extra=(form,))
+
+        got = page_segments(open_document(path), 0)
+
+        assert rows(got.segments) == [("h", 50.0, 10.0, 200.0, 1.0, "stroke", 3)]
+        assert got.stats == stats(2)
+
+    @pytest.mark.parametrize("function,stand_in", NON_FINITE)
+    def test_non_finite_geometry_from_pdfium_skips_the_path(self, tmp_path, monkeypatch, function, stand_in):
+        handle = open_document(content_page(tmp_path, b"10 10 m 110 10 l S"))
+        monkeypatch.setattr(pdfium_c, function, stand_in)
+
+        assert page_segments(handle, 0) == PageSegments(segments=(), stats=stats(1))
 
 
 class TestPageSegmentsErrors:
@@ -595,7 +799,8 @@ class TestPageSegmentsErrors:
     def test_pdfium_failure_raises_for_the_page_and_closes_it(
         self, tmp_path, monkeypatch, page_closes, function, stand_in, message
     ):
-        handle = open_document(content_page(tmp_path, b"10 10 m 110 10 l S"))
+        # Dashed, so the dash array is read too.
+        handle = open_document(content_page(tmp_path, b"[3 2] 0 d 10 10 m 110 10 l S"))
         monkeypatch.setattr(pdfium_c, function, stand_in)
 
         with pytest.raises(PDFCorruptError, match=re.escape(message)) as caught:
@@ -623,7 +828,7 @@ class TestPageSegmentsErrors:
             page_segments(handle, 1)
 
         assert caught.value.page_number == 2
-        assert [page_segments(handle, index)[0].end for index in (0, 2)] == [111.0, 113.0]
+        assert [page_segments(handle, index).segments[0].end for index in (0, 2)] == [111.0, 113.0]
 
     @pytest.mark.parametrize(
         "index,error,message",
