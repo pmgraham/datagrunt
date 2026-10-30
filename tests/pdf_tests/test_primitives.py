@@ -8,7 +8,7 @@ import unicodedata
 import pytest
 
 from datagrunt.pdf import BBox, DocumentMetadata, PageQuality
-from datagrunt.pdf._validate import finite_float, int_at_least, non_blank_str, optional_str, str_tuple
+from datagrunt.pdf._validate import choice_str, finite_float, int_at_least, non_blank_str, optional_str, str_tuple
 
 NON_FINITE = [math.nan, math.inf, -math.inf]
 BBOX_FIELDS = ["x0", "y0", "x1", "y1"]
@@ -88,6 +88,21 @@ class TestNonBlankStr:
     def test_rejects_non_str(self, bad):
         with pytest.raises(TypeError, match="text"):
             non_blank_str("text", bad)
+
+
+class TestChoiceStr:
+    @pytest.mark.parametrize("value", ["h", "v"])
+    def test_returns_a_listed_choice(self, value):
+        assert choice_str("orientation", value, ("h", "v")) == value
+
+    def test_rejects_an_unlisted_str_naming_every_choice(self):
+        with pytest.raises(ValueError, match="orientation must be 'h' or 'v', got 'x'"):
+            choice_str("orientation", "x", ("h", "v"))
+
+    @pytest.mark.parametrize("bad", [None, 1, b"h"])
+    def test_rejects_non_str(self, bad):
+        with pytest.raises(TypeError, match="orientation must be a str"):
+            choice_str("orientation", bad, ("h", "v"))
 
 
 class TestStrTuple:

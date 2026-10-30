@@ -15,7 +15,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, NamedTuple
 
-from datagrunt.pdf._validate import finite_float, int_at_least, rgba_tuple, strict_bool
+from datagrunt.pdf._validate import choice_str, finite_float, int_at_least, rgba_tuple, strict_bool
 
 Box = tuple[float, float, float, float]
 Point = tuple[float, float]
@@ -31,16 +31,6 @@ MAX_THIN_FILL_PT = 3.0
 
 _ORIENTATIONS = ("h", "v")
 _KINDS = ("stroke", "thin_fill", "fill_edge")
-
-
-def _checked_choice(name: str, value: object, choices: tuple[str, ...]) -> str:
-    """Return ``value`` if it is one of the str ``choices``."""
-    if not isinstance(value, str):
-        raise TypeError(f"{name} must be a str, got {value!r} ({type(value).__name__})")
-    if value not in choices:
-        allowed = " or ".join(repr(choice) for choice in choices)
-        raise ValueError(f"{name} must be {allowed}, got {value!r}")
-    return value
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -88,7 +78,7 @@ class RawSegment:
     paint_rgba: tuple[int, int, int, int]
 
     def __post_init__(self) -> None:
-        _checked_choice("orientation", self.orientation, _ORIENTATIONS)
+        choice_str("orientation", self.orientation, _ORIENTATIONS)
         object.__setattr__(self, "position", finite_float("position", self.position))
         start, end = finite_float("start", self.start), finite_float("end", self.end)
         if not start < end:
@@ -96,7 +86,7 @@ class RawSegment:
         object.__setattr__(self, "start", start)
         object.__setattr__(self, "end", end)
         object.__setattr__(self, "width", finite_float("width", self.width, lo=0.0))
-        _checked_choice("kind", self.kind, _KINDS)
+        choice_str("kind", self.kind, _KINDS)
         int_at_least("object_index", self.object_index, 0)
         if strict_bool("dashed", self.dashed) and self.kind != "stroke":
             raise ValueError(f"dashed must be False for a {self.kind}: only a stroke has a dash pattern")

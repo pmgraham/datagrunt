@@ -129,7 +129,6 @@ from datagrunt.pdf._path_segments import (
     PathPoint,
     RawSegment,
     SegmentStats,
-    _checked_choice,
     path_segments,
 )
 from datagrunt.pdf._pdfium_common import Box, PdfiumFailure, object_address, read_rgba
@@ -149,7 +148,7 @@ from datagrunt.pdf._pdfium_images import (
     read_raw_stream,
 )
 from datagrunt.pdf._pdfium_text import PageText, RawSpan, TextStats, collect_text
-from datagrunt.pdf._validate import finite_float, finite_tuple, int_at_least, non_blank_str
+from datagrunt.pdf._validate import choice_str, finite_float, finite_tuple, int_at_least, non_blank_str
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFEncryptedError
 
 __all__ = [
@@ -880,7 +879,7 @@ class PageFailure:
 
     def __post_init__(self) -> None:
         int_at_least("page_number", self.page_number, 1)
-        _checked_choice("stage", self.stage, _STAGES)
+        choice_str("stage", self.stage, _STAGES)
         non_blank_str("message", self.message)
 
 

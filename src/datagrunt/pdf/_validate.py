@@ -54,6 +54,16 @@ def non_blank_str(name: str, value: object) -> str:
     return value
 
 
+def choice_str(name: str, value: object, choices: tuple[str, ...]) -> str:
+    """Return ``value`` if it is one of the str ``choices``."""
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a str, got {value!r} ({type(value).__name__})")
+    if value not in choices:
+        allowed = " or ".join(repr(choice) for choice in choices)
+        raise ValueError(f"{name} must be {allowed}, got {value!r}")
+    return value
+
+
 def str_tuple(name: str, value: object, *, allow_blank: bool = False) -> tuple[str, ...]:
     """Return ``value`` if it is a tuple of str (entries non-blank unless ``allow_blank``)."""
     # A tuple, never a list: element fields must stay immutable and hashable.
