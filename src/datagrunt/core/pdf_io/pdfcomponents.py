@@ -66,7 +66,7 @@ class DocumentAssembler:
 
             tables: list[TableBlock] = []
             if analysis.has_line_drawings or not analysis.has_text_layer:
-                tables = self._tables_in_text_frame(page_index, analysis.has_text_layer)
+                tables = self._tables_in_text_frame(page_index, analysis)
 
             def is_inside_table(bbox) -> bool:
                 tol = 3.0
@@ -124,7 +124,7 @@ class DocumentAssembler:
                 page_dict["warnings"] = warnings
             return page_dict
 
-    def _tables_in_text_frame(self, page_index, has_text_layer) -> list[TableBlock]:
+    def _tables_in_text_frame(self, page_index, analysis) -> list[TableBlock]:
         """Detect tables, boxed in the frame of the text they de-duplicate (#385).
 
         The extractor reports the display frame, where the page renders. A text
@@ -133,9 +133,9 @@ class DocumentAssembler:
         display frame, so on a page without a text layer they stay as they are.
         """
         tables = self.table_extractor.extract(page_index)
-        if not has_text_layer or not tables:
+        if not analysis.has_text_layer or not tables:
             return tables
-        boxes = self.backend.display_to_text_frame(page_index, [t.bbox for t in tables])
+        boxes = self.backend.display_to_text_frame(analysis, [t.bbox for t in tables])
         return [replace(t, bbox=box) for t, box in zip(tables, boxes, strict=True)]
 
     def parse_document(self, total_pages, image_output_dir=None) -> dict:

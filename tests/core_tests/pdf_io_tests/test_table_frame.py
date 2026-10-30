@@ -14,8 +14,11 @@ the frames disagreed, so table cell text was emitted a second time as body
 text. Ground truth is rendered pixels at 72 dpi, one pixel per point.
 """
 
+import json
+import logging
 import re
 from collections import Counter
+from dataclasses import replace
 
 import pytest
 
@@ -23,16 +26,19 @@ from datagrunt.core.pdf_io.extraction.pdfium_backend import PdfiumBackend
 from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
 from datagrunt.core.pdf_io.extraction.pymupdf_backend import PyMuPDFBackend
 from datagrunt.core.pdf_io.extraction.shapes import BBox, OcrBlock
-from datagrunt.core.pdf_io.extraction.tables import PdfPlumberTableExtractor
+from datagrunt.core.pdf_io.extraction.tables import PdfPlumberTableExtractor, _visible_box
 from datagrunt.core.pdf_io.pdfcomponents import DocumentAssembler
 
-# "none" is a plain 612x792 page. The other three all expose the visible box
+# "none" is a plain 612x792 page. The next three all expose the visible box
 # (50, 40, 530, 720), like #384's fixtures: an offset CropBox, a MediaBox with
 # a non-zero origin, and that MediaBox inherited from the /Pages node.
-_KINDS = ("none", "cropbox", "mediabox", "inherited_mediabox")
+# "overhanging_cropbox" has a CropBox that runs past the MediaBox's top and
+# right, so only their intersection (40, 30, 612, 792) is visible.
+_KINDS = ("none", "cropbox", "mediabox", "inherited_mediabox", "overhanging_cropbox")
 _ROTATIONS = (0, 90, 180, 270)
 _BACKENDS = {"pdfium": PdfiumBackend, "pymupdf": PyMuPDFBackend}
 _OFFSET_BOX_PDF = "[50 40 530 720]"
+_OVERHANGING_CROPBOX_PDF = "[40 30 700 850]"
 
 _CELLS = (("Part", "Qty"), ("Bolt", "12"), ("Nut", "40"), ("Washer", "7"))
 _CELL_TEXTS = {text for row in _CELLS for text in row}
@@ -70,6 +76,9 @@ def _apply_box_layout(doc, page, kind):
         doc.xref_set_key(parent_xref, "MediaBox", _OFFSET_BOX_PDF)
         page_obj = doc.xref_object(page.xref, compressed=True)
         doc.update_object(page.xref, re.sub(r"/MediaBox\s*\[[^\]]*\]", "", page_obj))
+    elif kind == "overhanging_cropbox":
+        # Written raw: PyMuPDF's set_cropbox() refuses a box outside the MediaBox.
+        doc.xref_set_key(page.xref, "CropBox", _OVERHANGING_CROPBOX_PDF)
 
 
 def _ruled_table_pdf(tmp_path, kind, rotation, *, with_text=True, with_image=False):
@@ -189,13 +198,61 @@ class TestOcrPageTablesStayInTheDisplayFrame:
 
 
 class TestPyMuPDFDisplayToTextFrame:
-    """Defensive edges of PyMuPDF's display-to-text-frame mapping."""
+    """Edges of PyMuPDF's display-to-text-frame mapping.
+
+    It works from the backend's own ``PageAnalysis`` (PyMuPDF's ``page.rect``
+    size and ``page.rotation``), so it never reopens the page.
+    """
+
+    @staticmethod
+    def _analysis(tmp_path, rotation):
+        pdf = _ruled_table_pdf(tmp_path, "cropbox", rotation)
+        backend = PyMuPDFBackend(pdf)
+        return backend, backend.analyze_page(0)
 
     def test_empty_input_maps_to_empty_list(self, tmp_path):
-        backend = PyMuPDFBackend(_ruled_table_pdf(tmp_path, "cropbox", 90))
-        assert backend.display_to_text_frame(0, []) == []
+        backend, analysis = self._analysis(tmp_path, 90)
+        assert backend.display_to_text_frame(analysis, []) == []
 
-    def test_out_of_range_page_raises(self, tmp_path):
-        backend = PyMuPDFBackend(_ruled_table_pdf(tmp_path, "cropbox", 90))
-        with pytest.raises(ValueError, match="out of range"):
-            backend.display_to_text_frame(1, [BBox(x=0, y=0, w=1, h=1)])
+    def test_unrotated_page_returns_boxes_unchanged_without_a_page_load(self, tmp_path, monkeypatch):
+        backend, analysis = self._analysis(tmp_path, 0)
+
+        def no_document_access():
+            raise AssertionError("an unrotated page must not reopen the document")
+
+        monkeypatch.setattr(backend, "_get_doc", no_document_access)
+        box = BBox(x=-0.0, y=-0.0, w=10.0, h=10.0)
+        (mapped,) = backend.display_to_text_frame(analysis, [box])
+        # -0.0 == 0.0 in Python, so compare the serialized text the output carries.
+        assert json.dumps(mapped.to_dict()) == json.dumps(box.to_dict())
+
+    def test_rotated_page_does_not_reopen_the_document(self, tmp_path, monkeypatch):
+        backend, analysis = self._analysis(tmp_path, 90)
+
+        def no_document_access():
+            raise AssertionError("the mapping must come from the PageAnalysis")
+
+        monkeypatch.setattr(backend, "_get_doc", no_document_access)
+        (mapped,) = backend.display_to_text_frame(analysis, [BBox(x=506.0, y=50.0, w=96.0, h=240.0)])
+        assert mapped == BBox(x=50.0, y=78.0, w=240.0, h=96.0)
+
+    def test_non_right_angle_rotation_raises(self, tmp_path):
+        backend, analysis = self._analysis(tmp_path, 0)
+        with pytest.raises(ValueError, match="right angle"):
+            backend.display_to_text_frame(replace(analysis, rotation=45), [BBox(x=0, y=0, w=1, h=1)])
+
+
+class TestVisibleBoxFallback:
+    """A CropBox that misses the MediaBox falls back to the MediaBox, visibly."""
+
+    def test_disjoint_cropbox_falls_back_to_mediabox_and_logs(self, caplog):
+        mediabox, cropbox = (0.0, 0.0, 612.0, 792.0), (700.0, 800.0, 900.0, 900.0)
+        with caplog.at_level(logging.DEBUG, logger="datagrunt.core.pdf_io.extraction.tables"):
+            assert _visible_box(mediabox, cropbox) == mediabox
+        assert "does not intersect" in caplog.text
+
+    def test_overlapping_cropbox_is_intersected_without_logging(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger="datagrunt.core.pdf_io.extraction.tables"):
+            visible = _visible_box((0.0, 0.0, 612.0, 792.0), (40.0, 30.0, 700.0, 850.0))
+        assert visible == (40.0, 30.0, 612.0, 792.0)
+        assert caplog.text == ""

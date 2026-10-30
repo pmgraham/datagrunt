@@ -54,11 +54,12 @@ class ExtractionBackend(ABC):
     def ocr_page(self, page_number: int, dpi: int = 300) -> list[OcrBlock]:
         """Return OCR-recovered text lines for the page."""
 
-    def display_to_text_frame(self, page_number: int, bboxes: list[BBox]) -> list[BBox]:
+    def display_to_text_frame(self, analysis: PageAnalysis, bboxes: list[BBox]) -> list[BBox]:
         """Map boxes from the page's display frame into the frame this backend reports text in.
 
-        The display frame is where content renders (see ``display_frame``);
-        table boxes arrive in it (#385). This default returns the boxes
+        ``analysis`` is this backend's own ``PageAnalysis`` for the page. The
+        display frame is where content renders (see ``display_frame``); table
+        boxes arrive in it (#385). This default returns the boxes
         unchanged, which is right for a backend whose text is already in the
         display frame, such as pdfium (#384). A backend that reports text in
         another frame must override it.

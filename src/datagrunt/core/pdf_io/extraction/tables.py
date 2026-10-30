@@ -33,6 +33,7 @@ def _visible_box(mediabox: _Box, cropbox: _Box) -> _Box:
     left, bottom = max(mediabox[0], cropbox[0]), max(mediabox[1], cropbox[1])
     right, top = min(mediabox[2], cropbox[2]), min(mediabox[3], cropbox[3])
     if left >= right or bottom >= top:
+        logger.debug("CropBox %s does not intersect MediaBox %s; measuring tables from the MediaBox", cropbox, mediabox)
         return mediabox
     return left, bottom, right, top
 
