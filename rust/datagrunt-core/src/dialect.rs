@@ -22,7 +22,8 @@
 //!
 //! Only the four data-driven fields live here. `lineterminator` ("\r\n"),
 //! `quoting` (QUOTE_MINIMAL) and the absence of `escapechar` are constants the
-//! binding layer applies (Task 10); they are not part of this core struct.
+//! binding layer applies (`rust/datagrunt-python`); they are not part of this
+//! core struct.
 
 use fancy_regex::Regex;
 use std::borrow::Cow;
