@@ -62,6 +62,24 @@ Text (#365 T2), pinned by ``tests/pdf_tests/test_pdfium_spans.py``:
   reads as the standard-14 font pdfium substitutes (``Arial,BoldItalic``
   reads ``Helvetica-BoldOblique``). A pattern fill reads as a colour pdfium
   picks (opaque 75% grey for a tiling pattern).
+
+Paths (#365 T3), pinned by ``tests/pdf_tests/test_pdfium_segments.py``:
+
+- Path points (``FPDFPathSegment_GetPoint``) are in the path's own space.
+  ``FPDFPageObj_GetMatrix`` of a path is the CTM at its painting operator
+  inside its form, that form's /Matrix included; of a form object, the CTM
+  at its ``Do`` in the parent's space. Neither includes an enclosing form's
+  matrix, so page space is point x path matrix x each enclosing form's
+  matrix, innermost first (``get_bounds()`` is no help: it is form space).
+- pdfium writes every close as an edge: ``h``, ``s``, ``b`` and ``re``
+  append a LINETO back to the subpath's start, flagged close (``re`` reads
+  MOVETO + 4 LINETO). ``n`` and clip-only (``W n``) paths make no object.
+- ``FPDFPageObj_GetStrokeWidth`` is ``w`` as written, in the path's space;
+  a negative width strokes as a hairline, like 0. A zero-area fill (a
+  zero-height ``re f``) paints as a hairline. A dash pattern does not
+  change the path's points.
+- A number pdfium cannot read as a PDF number (``1e5``, or 39 digits)
+  reads as 0, so such a ``cm`` collapses a path rather than overflowing.
 """
 
 import ctypes
@@ -74,11 +92,20 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import NamedTuple, NoReturn
+from typing import Literal, NamedTuple, NoReturn
 
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 
+from datagrunt.pdf._path_segments import (
+    IDENTITY,
+    Matrix,
+    NonFiniteGeometry,
+    PathPaint,
+    PathPoint,
+    RawSegment,
+    path_segments,
+)
 from datagrunt.pdf._validate import finite_float, int_at_least
 from datagrunt.pdf.exceptions import PDFCorruptError, PDFEncryptedError
 
@@ -655,31 +682,35 @@ def _children(
     return children
 
 
-def _page_objects(page_raw: pdfium_c.FPDF_PAGE) -> list[pdfium_c.FPDF_PAGEOBJECT]:
-    """Every page object in depth-first paint order: a form, then its contents."""
+def _page_objects(page_raw: pdfium_c.FPDF_PAGE) -> list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]:
+    """Every page object in depth-first paint order (a form, then its contents).
+
+    Each comes with the walk index of the form that holds it, -1 for none.
+    """
     top = _children(
         pdfium_c.FPDFPage_CountObjects(page_raw), partial(pdfium_c.FPDFPage_GetObject, page_raw), "the page"
     )
-    ordered: list[pdfium_c.FPDF_PAGEOBJECT] = []
-    stack = [iter(top)]
+    ordered: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] = []
+    stack = [(iter(top), -1)]
     # Bounded: one pass per object and one per form, each from a pdfium count,
     # and the stack never holds more than _MAX_FORM_DEPTH + 1 levels.
     while stack:
-        child = next(stack[-1], None)
+        siblings, parent = stack[-1]
+        child = next(siblings, None)
         if child is None:
             stack.pop()
             continue
-        ordered.append(child)
+        ordered.append((child, parent))
         if len(stack) <= _MAX_FORM_DEPTH and pdfium_c.FPDFPageObj_GetType(child) == pdfium_c.FPDF_PAGEOBJ_FORM:
-            count = pdfium_c.FPDFFormObj_CountObjects(child)
-            owner = f"form object {len(ordered) - 1}"
-            stack.append(iter(_children(count, partial(pdfium_c.FPDFFormObj_GetObject, child), owner)))
+            count, form_index = pdfium_c.FPDFFormObj_CountObjects(child), len(ordered) - 1
+            owner = f"form object {form_index}"
+            stack.append((iter(_children(count, partial(pdfium_c.FPDFFormObj_GetObject, child), owner)), form_index))
     return ordered
 
 
 def _object_indices(page_raw: pdfium_c.FPDF_PAGE) -> dict[int, int]:
     """Map each page object's address to its depth-first paint-order index."""
-    return {_address(obj): index for index, obj in enumerate(_page_objects(page_raw))}
+    return {_address(obj): index for index, (obj, _form) in enumerate(_page_objects(page_raw))}
 
 
 class _Style(NamedTuple):
@@ -1000,5 +1031,119 @@ def page_text(handle: DocumentHandle, index: int) -> PageText:
     page, page_number = _load_page(handle, index)
     try:
         return _read_page_text(page, _read_geometry(page, page_number))
+    finally:
+        page.close()
+
+
+# pdfium's path segment types, as PathPoint kinds (FPDF_SEGMENT_UNKNOWN, -1, is a failure).
+_POINT_KINDS: dict[int, Literal["move", "line", "curve"]] = {
+    pdfium_c.FPDF_SEGMENT_MOVETO: "move",
+    pdfium_c.FPDF_SEGMENT_LINETO: "line",
+    pdfium_c.FPDF_SEGMENT_BEZIERTO: "curve",
+}
+_FILL_MODES = (pdfium_c.FPDF_FILLMODE_NONE, pdfium_c.FPDF_FILLMODE_ALTERNATE, pdfium_c.FPDF_FILLMODE_WINDING)
+
+
+def _read_paint(path: pdfium_c.FPDF_PAGEOBJECT, label: str) -> PathPaint:
+    """Read whether a path object is stroked or filled, and (if stroked) its ``w`` line width."""
+    fill_mode, stroke = ctypes.c_int(), ctypes.c_int()
+    if not pdfium_c.FPDFPath_GetDrawMode(path, fill_mode, stroke) or fill_mode.value not in _FILL_MODES:
+        raise _PdfiumFailure(f"read the draw mode of {label}")
+    width = ctypes.c_float()
+    if stroke.value:
+        if not pdfium_c.FPDFPageObj_GetStrokeWidth(path, width):
+            raise _PdfiumFailure(f"read the stroke width of {label}")
+        if not math.isfinite(width.value):
+            raise _PdfiumFailure(f"read the stroke width of {label}: it is not finite ({width.value})")
+    filled = fill_mode.value != pdfium_c.FPDF_FILLMODE_NONE
+    return PathPaint(stroked=bool(stroke.value), filled=filled, stroke_width=width.value)
+
+
+def _read_points(path: pdfium_c.FPDF_PAGEOBJECT, label: str) -> list[PathPoint]:
+    """Read a path object's points, in its own space."""
+    count = pdfium_c.FPDFPath_CountSegments(path)
+    if count < 0:
+        raise _PdfiumFailure(f"count the path segments of {label}")
+    points = []
+    x, y = ctypes.c_float(), ctypes.c_float()
+    for index in range(count):
+        segment = pdfium_c.FPDFPath_GetPathSegment(path, index)
+        kind = _POINT_KINDS.get(pdfium_c.FPDFPathSegment_GetType(segment)) if segment else None
+        if kind is None or not pdfium_c.FPDFPathSegment_GetPoint(segment, x, y):
+            raise _PdfiumFailure(f"read path segment {index} of {label}")
+        points.append(PathPoint(kind, x.value, y.value, bool(pdfium_c.FPDFPathSegment_GetClose(segment))))
+    return points
+
+
+def _read_matrix(obj: pdfium_c.FPDF_PAGEOBJECT, label: str) -> Matrix:
+    """Read a page object's matrix: six finite floats."""
+    raw = pdfium_c.FS_MATRIX()
+    if not pdfium_c.FPDFPageObj_GetMatrix(obj, raw):
+        raise _PdfiumFailure(f"read the matrix of {label}")
+    matrix = Matrix(raw.a, raw.b, raw.c, raw.d, raw.e, raw.f)
+    if not all(math.isfinite(value) for value in matrix):
+        raise _PdfiumFailure(f"read the matrix of {label}: it is not finite {tuple(matrix)}")
+    return matrix
+
+
+def _path_object_segments(
+    path: pdfium_c.FPDF_PAGEOBJECT, index: int, matrix: Matrix, to_display: Callable[[Box], Box]
+) -> list[RawSegment]:
+    """The segments of path object ``index``, whose matrix to page space is ``matrix``."""
+    label = f"object {index}"
+    paint = _read_paint(path, label)
+    points = _read_points(path, label)
+    try:
+        return path_segments(points, matrix=matrix, paint=paint, object_index=index, to_display=to_display)
+    except NonFiniteGeometry as exc:
+        raise _PdfiumFailure(f"read the geometry of {label}: {exc}") from exc
+
+
+def _collect_segments(page_raw: pdfium_c.FPDF_PAGE, geometry: PageGeometry) -> tuple[RawSegment, ...]:
+    """The segments of every path object on the page, forms' included, in object-walk order."""
+    to_display = partial(to_display_box, rotation_deg=geometry.rotation_deg, page_box=geometry.page_box)
+    # Each form's matrix to page space, by walk index; a form precedes its contents.
+    form_matrices: dict[int, Matrix] = {}
+    segments: list[RawSegment] = []
+    for index, (obj, form) in enumerate(_page_objects(page_raw)):
+        kind = pdfium_c.FPDFPageObj_GetType(obj)
+        if kind not in (pdfium_c.FPDF_PAGEOBJ_PATH, pdfium_c.FPDF_PAGEOBJ_FORM):
+            continue
+        # pdfium's object matrix maps into the enclosing form's space only.
+        matrix = _read_matrix(obj, f"object {index}").then(form_matrices[form] if form >= 0 else IDENTITY)
+        if kind == pdfium_c.FPDF_PAGEOBJ_FORM:
+            form_matrices[index] = matrix
+        else:
+            segments.extend(_path_object_segments(obj, index, matrix, to_display))
+    return tuple(segments)
+
+
+def page_segments(handle: DocumentHandle, index: int) -> tuple[RawSegment, ...]:
+    """Return the axis-aligned segments of the page at 0-based ``index``.
+
+    Every path object is read, those inside Form XObjects included (as deep
+    as pdfium parses them), with its full transform to page space composed
+    here. A stroked path gives each straight edge at least 12 pt long and
+    axis-aligned within 0.5 pt (closing edges included; Bézier curves and
+    diagonals are ignored); a filled one gives each rectangle at most 3 pt
+    thick and at least 12 pt long as one segment along its length (see
+    :class:`RawSegment`). Segments follow the object walk, and within one
+    path its fill's before its stroke's, as PDF paints them. The page handle
+    is closed before returning.
+
+    Raises:
+        TypeError: If ``handle`` is not a DocumentHandle, or ``index`` is not
+            an int (bool rejected).
+        ValueError: If ``handle`` is closed.
+        IndexError: If ``index`` is outside ``0..page_count - 1``.
+        PDFCorruptError: If pdfium cannot load the page, a pdfium call on it
+            fails, or a path's page-space geometry is not finite
+            (``page_number`` is set).
+    """
+    page, page_number = _load_page(handle, index)
+    try:
+        return _collect_segments(page.raw, _read_geometry(page, page_number))
+    except _PdfiumFailure as exc:
+        raise PDFCorruptError(f"page {page_number}: pdfium cannot {exc}", page_number=page_number) from exc
     finally:
         page.close()
