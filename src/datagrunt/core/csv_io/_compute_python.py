@@ -22,7 +22,7 @@ import re
 import sys
 from collections import Counter
 from collections.abc import Iterator
-from typing import TextIO, cast
+from typing import TextIO
 
 # local libraries
 from datagrunt.core.csv_io._compute_protocol import HeaderProbe, SniffedDialect, StrPath
@@ -41,6 +41,33 @@ MIN_CONSISTENT_FIELDS = 3
 
 # --- dialect constants (from CSVDialect) ---
 CSV_SNIFF_SAMPLE_ROWS = 5
+
+# --- dialect sniffing: a mirror of CPython's csv.Sniffer (issue #378) ---
+# Ported from Lib/csv.py at CPython v3.10.22, which behaves identically to
+# v3.11.18 / v3.13.18 / v3.14.10: the releases carrying the 2026 Sniffer fixes
+# gh-103925 (line endings normalised before sniffing), gh-98820 (a quoted-field
+# body stops at the first undoubled quote) and gh-109638 (doubled quotes are
+# sought in whole fields). Mirrored rather than delegated so the oracle no
+# longer changes with the interpreter's patch level. 3.11+ spells both bodies
+# with possessive quantifiers, which 3.10's `re` lacks; the 3.10.22 unrolled
+# spellings used here are unambiguous, so they match the same text.
+# rust/datagrunt-core/src/dialect.rs is the Rust port of this algorithm.
+SNIFF_PREFERRED_DELIMITERS = (",", "\t", ";", " ", ":")
+SNIFF_ASCII = tuple(chr(c) for c in range(127))  # code points 0..126, as CPython scans
+SNIFF_CHUNK_LINES = 10
+SNIFF_CONSISTENCY_THRESHOLD = 0.9
+_QUOTE_OTHER = r"(?:(?!(?P=quote)).)*"
+_QUOTE_BODY = r"%s(?:(?P=quote){2}%s)*" % (_QUOTE_OTHER, _QUOTE_OTHER)
+# Tried in this order; the first pattern with any match wins.
+SNIFF_QUOTE_PATTERNS = tuple(
+    re.compile(restr % _QUOTE_BODY, re.DOTALL | re.MULTILINE)
+    for restr in (
+        r'(?P<delim>[^\w\n"\'])(?P<space> ?)(?P<quote>["\'])%s(?P=quote)(?P=delim)',  # ,"...",
+        r'(?:^|\n)(?P<quote>["\'])%s(?P=quote)(?P<delim>[^\w\n"\'])(?P<space> ?)',  #  "...",
+        r'(?P<delim>[^\w\n"\'])(?P<space> ?)(?P<quote>["\'])%s(?P=quote)(?:$|\n)',  # ,"..."
+        r'(?:^|\n)(?P<quote>["\'])%s(?P=quote)(?:$|\n)',  #  "..." (no delim, no space)
+    )
+)
 
 # --- normalization constants (from CSVColumnNameNormalizer) ---
 SPECIAL_CHARS_PATTERN = re.compile(r"[^a-z0-9]+")
@@ -280,38 +307,207 @@ def infer_delimiter(filepath: StrPath) -> str:
     return DEFAULT_DELIMITER
 
 
+def _first_quote_matches(data: str) -> tuple[re.Pattern[str], list[re.Match[str]]]:
+    """Every match of the first quote pattern that matches at all (CPython's order)."""
+    for regexp in SNIFF_QUOTE_PATTERNS:
+        matches = list(regexp.finditer(data))
+        if matches:
+            return regexp, matches
+    return SNIFF_QUOTE_PATTERNS[-1], []
+
+
+def _tally_quote_matches(
+    regexp: re.Pattern[str], matches: list[re.Match[str]], delimiters: str | None
+) -> tuple[dict[str, int], dict[str, int], int]:
+    """Count quote chars, allowed delimiters, and matches with a space after the delimiter.
+
+    The quote and delimiter groups each match exactly one character, so
+    CPython's emptiness checks on them can never fire. The last pattern has no
+    ``delim``/``space`` groups: CPython's ``KeyError`` ``continue`` skips both
+    tallies for it, as ``has_delim`` does here. ``delim in delimiters`` is a
+    substring test on purpose, exactly as CPython's is on a str restriction.
+    """
+    quotes: dict[str, int] = {}
+    delims: dict[str, int] = {}
+    spaces = 0
+    has_delim = "delim" in regexp.groupindex
+    for match in matches:
+        quote = match["quote"]
+        quotes[quote] = quotes.get(quote, 0) + 1
+        if not has_delim:
+            continue
+        delim = match["delim"]
+        if delimiters is None or delim in delimiters:
+            delims[delim] = delims.get(delim, 0) + 1
+        if match["space"]:
+            spaces += 1
+    return quotes, delims, spaces
+
+
+def _has_doubled_quote(data: str, quotechar: str, delim: str) -> bool:
+    """gh-109638: a doubled quote inside a whole quoted field means ``doublequote``.
+
+    The field body is CPython 3.10.22's unrolled loop; the quotechar is only
+    ever ``"`` or ``'``, which need no escaping (CPython does not escape it).
+    """
+    dq_regexp = re.compile(
+        r"(?:(?<=%(delim)s)|^)%(space)s%(quote)s"  # ,"
+        r"([^%(quote)s]*(?:%(quote)s%(quote)s[^%(quote)s]*)*)"  # the body
+        r"%(quote)s(?:%(delim)s|$)"  # ",
+        % {
+            "delim": re.escape(delim),
+            "quote": quotechar,
+            # Skipping spaces after a space rescans them.
+            "space": " *" if delim != " " else "",
+        },
+        re.MULTILINE,
+    )
+    doubled = quotechar * 2
+    return any(doubled in match[1] for match in dq_regexp.finditer(data))
+
+
+def _guess_quote_and_delimiter(data: str, delimiters: str | None) -> tuple[str, bool, str, bool]:
+    """Mirror of ``Sniffer._guess_quote_and_delimiter``.
+
+    Returns ``(quotechar, doublequote, delimiter, skipinitialspace)``; an empty
+    delimiter means "not determinable from quoting". CPython's ``delim == '\\n'``
+    reset is omitted: both delimiter groups exclude ``\\n``, so it is unreachable.
+    """
+    regexp, matches = _first_quote_matches(data)
+    if not matches:
+        return "", False, "", False
+    quotes, delims, spaces = _tally_quote_matches(regexp, matches, delimiters)
+    # max() keeps the first key reaching the maximum, as max(d, key=d.get) does.
+    quotechar = max(quotes, key=quotes.__getitem__)
+    if not delims:
+        # A single column of quoted data. Doubled quotes are only sought once a
+        # delimiter is known (gh-109638).
+        return quotechar, False, "", False
+    delim = max(delims, key=delims.__getitem__)
+    skipinitialspace = delims[delim] == spaces
+    return quotechar, _has_doubled_quote(data, quotechar, delim), delim, skipinitialspace
+
+
+def _count_char_frequencies(lines: list[str], char_frequency: dict[str, dict[int, int]]) -> None:
+    """Add each line's per-character count to ``char_frequency[char][count]`` (zeros included)."""
+    for line in lines:
+        for char in SNIFF_ASCII:
+            meta_frequency = char_frequency.setdefault(char, {})
+            freq = line.count(char)
+            meta_frequency[freq] = meta_frequency.get(freq, 0) + 1
+
+
+def _char_modes(char_frequency: dict[str, dict[int, int]]) -> dict[str, tuple[int, int]]:
+    """Each seen character's modal frequency, its row count reduced by every other frequency's."""
+    modes: dict[str, tuple[int, int]] = {}
+    for char, meta_frequency in char_frequency.items():
+        items = list(meta_frequency.items())
+        if len(items) == 1 and items[0][0] == 0:
+            continue
+        if len(items) == 1:
+            modes[char] = items[0]
+            continue
+        mode_freq, mode_count = max(items, key=lambda item: item[1])
+        others = sum(count for freq, count in items if freq != mode_freq)
+        modes[char] = (mode_freq, mode_count - others)
+    return modes
+
+
+def _consistent_delimiters(
+    modes: dict[str, tuple[int, int]], total: float, delimiters: str | None
+) -> dict[str, tuple[int, int]]:
+    """Characters meeting their mode on the most rows, relaxing 1.0 down to the 0.9 threshold.
+
+    At most 11 passes. The repeated float subtraction is CPython's, kept so the
+    boundary values compare identically.
+    """
+    consistency = 1.0
+    while consistency >= SNIFF_CONSISTENCY_THRESHOLD:
+        found = {
+            char: mode
+            for char, mode in modes.items()
+            if mode[0] > 0
+            and mode[1] > 0
+            and mode[1] / total >= consistency
+            and (delimiters is None or char in delimiters)
+        }
+        if found:
+            return found
+        consistency -= 0.01
+    return {}
+
+
+def _skips_initial_space(first_line: str, delim: str) -> bool:
+    return first_line.count(delim) == first_line.count(delim + " ")
+
+
+def _pick_delimiter(delims: dict[str, tuple[int, int]], first_line: str) -> tuple[str, bool]:
+    """The first preferred delimiter present, else the dominant one (CPython sorts ``(mode, char)``)."""
+    preferred = [d for d in SNIFF_PREFERRED_DELIMITERS if d in delims]
+    delim = preferred[0] if preferred else max((mode, char) for char, mode in delims.items())[1]
+    return delim, _skips_initial_space(first_line, delim)
+
+
+def _guess_delimiter(data: str, delimiters: str | None) -> tuple[str, bool]:
+    """Mirror of ``Sniffer._guess_delimiter``: ``(delimiter, skipinitialspace)``, "" if undetermined.
+
+    CPython never revisits a non-empty ``delims``, so later chunks cannot change
+    the outcome once one is found; stopping there returns what CPython returns.
+    A lone candidate needs no tie-break, so ``_pick_delimiter`` returns it as is.
+    """
+    lines = [line for line in data.split("\n") if line]
+    chunk_length = min(SNIFF_CHUNK_LINES, len(lines))
+    char_frequency: dict[str, dict[int, int]] = {}
+    delims: dict[str, tuple[int, int]] = {}
+    iteration = 0
+    # Bounded: each pass advances `start` by chunk_length (>= 1 when lines exist).
+    for start in range(0, len(lines), max(chunk_length, 1)):
+        iteration += 1
+        _count_char_frequencies(lines[start : start + chunk_length], char_frequency)
+        total = float(min(chunk_length * iteration, len(lines)))
+        delims = _consistent_delimiters(_char_modes(char_frequency), total, delimiters)
+        if delims:
+            break
+    if not delims:
+        return "", False
+    return _pick_delimiter(delims, lines[0])
+
+
+def _sniff_sample(sample: str, delimiters: str | None) -> SniffedDialect | None:
+    """Mirror of ``csv.Sniffer().sniff(sample, delimiters)``; None where CPython raises ``csv.Error``.
+
+    The constant fields (``escapechar`` None, ``lineterminator`` "\\r\\n",
+    ``quoting`` 0 = QUOTE_MINIMAL) are the ones CPython's sniffed dialect carries.
+    """
+    sample = sample.replace("\r\n", "\n").replace("\r", "\n")  # gh-103925
+    quotechar, doublequote, delimiter, skipinitialspace = _guess_quote_and_delimiter(sample, delimiters)
+    if not delimiter:
+        delimiter, skipinitialspace = _guess_delimiter(sample, delimiters)
+    if not delimiter:
+        return None
+    return {
+        "delimiter": delimiter,
+        "quotechar": quotechar or '"',  # _csv.reader won't accept a quotechar of ''
+        "escapechar": None,
+        "doublequote": doublequote,
+        "lineterminator": "\r\n",
+        "skipinitialspace": skipinitialspace,
+        "quoting": 0,
+    }
+
+
 def sniff_dialect(filepath: StrPath, delimiter: str | None = None) -> SniffedDialect | None:
     """Sniff the CSV dialect, returning the native dict shape (or None).
 
-    None for empty/blank files and undeterminable samples. The constant fields
-    (``escapechar`` None, ``lineterminator`` "\\r\\n", ``quoting`` 0) mirror what
-    ``csv.Sniffer().sniff`` and ``datagrunt._native.sniff_dialect`` produce.
+    None for empty/blank files and undeterminable samples. Sniffing is this
+    module's mirror of the fixed CPython ``csv.Sniffer`` (see ``_sniff_sample``),
+    never the running interpreter's, so the result does not depend on it.
+    An empty ``delimiter`` means no restriction, like ``None``.
     """
     probe = probe_csv_header(filepath)
     if probe["empty"] or probe["blank"]:
         return None
-    sample = "".join(probe["sample_lines"])
-    try:
-        if delimiter:
-            dialect = csv.Sniffer().sniff(sample, delimiters=delimiter)
-        else:
-            dialect = csv.Sniffer().sniff(sample)
-    except csv.Error:
-        return None
-    sniffed: SniffedDialect = {
-        "delimiter": dialect.delimiter,
-        # typeshed types Dialect.quotechar as `str | None` for the general case
-        # (a hand-rolled dialect could set it to None), but CPython's own
-        # Sniffer.sniff() unconditionally sets `quotechar = quotechar or '"'`
-        # before returning — never None. The cast reflects that guarantee.
-        "quotechar": cast(str, dialect.quotechar),
-        "escapechar": None,
-        "doublequote": dialect.doublequote,
-        "lineterminator": "\r\n",
-        "skipinitialspace": dialect.skipinitialspace,
-        "quoting": 0,
-    }
-    return sniffed
+    return _sniff_sample("".join(probe["sample_lines"]), delimiter or None)
 
 
 def _normalize_single(name: str) -> str:
