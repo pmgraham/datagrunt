@@ -15,7 +15,16 @@ import pypdfium2.raw as pdfium_c
 import pytest
 from PIL import Image
 
-from pdf_tests.builders import Line, PageSpec, RasterImage, Rect, TextRun, build_pdf, solid_png
+from pdf_tests.builders import (
+    Line,
+    PageSpec,
+    RasterImage,
+    Rect,
+    TextRun,
+    build_pdf,
+    first_unencodable,
+    solid_png,
+)
 
 # Position tolerance in page points.
 TOL = 1.0
@@ -24,10 +33,23 @@ TOL = 1.0
 def stroke_tol(width: float) -> float:
     """Tolerance for a stroked path's bounds.
 
-    pdfium pads stroked bounds by the stroke: measured 1x the width on
-    axis-aligned edges and width x sqrt(2) on a diagonal.
+    pdfium pads an axis-aligned stroke's bounds by exactly 1x the width
+    (measured 0.5/2.0/5.0 at widths 0.5/2/5); a diagonal pads by width x
+    sqrt(2) (1.06 at 0.75), still inside TOL + width.
     """
-    return TOL + width * math.sqrt(2)
+    return TOL + width
+
+
+def rect_corners(obj: pdfium.PdfObject, page_height: float) -> list[tuple[float, float]]:
+    """Return a path's distinct points, sorted, in top-left page points."""
+    return sorted(set(path_points(obj, page_height)))
+
+
+def assert_points(actual: list[tuple[float, float]], expected: list[tuple[float, float]]) -> None:
+    """Assert two point lists match pairwise within TOL."""
+    assert len(actual) == len(expected)
+    for got, want in zip(actual, expected, strict=True):
+        assert got == pytest.approx(want, abs=TOL)
 
 
 def page_objects(page: pdfium.PdfPage, kind: int) -> list[pdfium.PdfObject]:
@@ -35,12 +57,21 @@ def page_objects(page: pdfium.PdfPage, kind: int) -> list[pdfium.PdfObject]:
     return list(page.get_objects(filter=(kind,)))
 
 
-def fill_rgba(obj: pdfium.PdfObject) -> tuple[int, int, int, int]:
-    """Return the object's fill colour as 0-255 (R, G, B, A)."""
+def _rgba(getter, obj: pdfium.PdfObject) -> tuple[int, int, int, int]:
     channels = [ctypes.c_uint() for _ in range(4)]
-    assert pdfium_c.FPDFPageObj_GetFillColor(obj, *channels)
+    assert getter(obj, *channels)
     red, green, blue, alpha = (channel.value for channel in channels)
     return red, green, blue, alpha
+
+
+def fill_rgba(obj: pdfium.PdfObject) -> tuple[int, int, int, int]:
+    """Return the object's fill colour as 0-255 (R, G, B, A)."""
+    return _rgba(pdfium_c.FPDFPageObj_GetFillColor, obj)
+
+
+def stroke_rgba(obj: pdfium.PdfObject) -> tuple[int, int, int, int]:
+    """Return the object's stroke colour as 0-255 (R, G, B, A)."""
+    return _rgba(pdfium_c.FPDFPageObj_GetStrokeColor, obj)
 
 
 def top_left_bounds(obj: pdfium.PdfObject, page_height: float) -> tuple[float, float, float, float]:
@@ -83,6 +114,11 @@ def first_char_top_left(page: pdfium.PdfPage) -> tuple[float, float]:
     """
     left, bottom, _right, _top = page.get_textpage().get_charbox(0)
     return left, page.get_height() - bottom
+
+
+def on_page(*items):
+    """Return a one-page spec list holding ``items``."""
+    return [PageSpec(items=items)]
 
 
 class TestTextRunPosition:
@@ -155,6 +191,15 @@ class TestTextRunStyle:
         (obj,) = page_objects(pdfium.PdfDocument(path)[0], pdfium_c.FPDF_PAGEOBJ_TEXT)
         assert fill_rgba(obj) == rgba
 
+    @pytest.mark.parametrize("mode", [1, 2])
+    def test_stroke_render_modes_use_rgb_and_alpha(self, tmp_path, mode):
+        run = TextRun("Total", x=72.0, y=100.0, rgb=(1.0, 0.0, 0.0), alpha=0.0, render_mode=mode)
+        path = build_pdf(tmp_path / "stroke.pdf", on_page(run))
+
+        (obj,) = page_objects(pdfium.PdfDocument(path)[0], pdfium_c.FPDF_PAGEOBJ_TEXT)
+        assert stroke_rgba(obj) == (255, 0, 0, 0)
+        assert fill_rgba(obj) == (255, 0, 0, 0)
+
     @pytest.mark.parametrize(
         "kwargs,mode",
         [pytest.param({}, 0, id="default")] + [pytest.param({"render_mode": m}, m, id=f"mode{m}") for m in range(8)],
@@ -165,6 +210,81 @@ class TestTextRunStyle:
 
         (obj,) = page_objects(pdfium.PdfDocument(path)[0], pdfium_c.FPDF_PAGEOBJ_TEXT)
         assert pdfium_c.FPDFTextObj_GetTextRenderMode(obj) == mode
+
+
+class TestItemIsolation:
+    """One item's graphics state never leaks into the next."""
+
+    def test_rect_after_transparent_red_text_keeps_its_own_colour_and_alpha(self, tmp_path):
+        run = TextRun("Total", x=72.0, y=100.0, rgb=(1.0, 0.0, 0.0), alpha=0.0)
+        rect = Rect(100.0, 400.0, 200.0, 50.0, fill_rgb=(0.0, 0.0, 1.0))
+        path = build_pdf(tmp_path / "two.pdf", on_page(run, rect))
+
+        (obj,) = page_objects(pdfium.PdfDocument(path)[0], pdfium_c.FPDF_PAGEOBJ_PATH)
+        assert fill_rgba(obj) == (0, 0, 255, 255)
+        assert stroke_rgba(obj) == (0, 0, 0, 255)
+
+
+STANDARD_14_FONTS = [
+    "Courier",
+    "Courier-Bold",
+    "Courier-Oblique",
+    "Courier-BoldOblique",
+    "Helvetica",
+    "Helvetica-Bold",
+    "Helvetica-Oblique",
+    "Helvetica-BoldOblique",
+    "Times-Roman",
+    "Times-Bold",
+    "Times-Italic",
+    "Times-BoldItalic",
+    "Symbol",
+    "ZapfDingbats",
+]
+
+
+class TestTextRunEncoding:
+    """A run draws every character as itself: no glyph substitution."""
+
+    @pytest.mark.parametrize("font", STANDARD_14_FONTS)
+    def test_every_accepted_bmp_character_round_trips(self, tmp_path, font):
+        accepted = "".join(char for char in map(chr, range(0x10000)) if first_unencodable(font, char) is None)
+        run = TextRun(accepted, x=10.0, y=100.0, font=font, size=6.0)
+        path = build_pdf(tmp_path / "chars.pdf", on_page(run))
+
+        assert len(accepted) > 150
+        assert pdfium.PdfDocument(path)[0].get_textpage().get_text_range() == accepted
+
+    @pytest.mark.parametrize(
+        "text,font,code",
+        [
+            pytest.param("\ufb01x", "Helvetica", "U+FB01", id="ligature"),
+            pytest.param("日本語", "Helvetica", "U+65E5", id="cjk"),
+            pytest.param("a\u200db\u200ec", "Helvetica", "U+200D", id="zwj"),
+            pytest.param("αβγ", "Helvetica", "U+03B1", id="greek-needs-symbol"),
+            pytest.param("1\u00a02", "Helvetica", "U+00A0", id="nbsp-reads-as-space"),
+            pytest.param("co\u00adop", "Times-Roman", "U+00AD", id="soft-hyphen-reads-as-hyphen"),
+            pytest.param("Δ", "Symbol", "U+0394", id="delta-reads-as-increment"),
+            pytest.param("A", "ZapfDingbats", "U+0041", id="latin-in-dingbats"),
+        ],
+    )
+    def test_unencodable_character_raises(self, tmp_path, text, font, code):
+        target = tmp_path / "bad.pdf"
+        message = f"TextRun.text has {code}, which {font} cannot draw without glyph substitution"
+
+        with pytest.raises(ValueError, match=re.escape(message)):
+            build_pdf(target, on_page(TextRun(text, x=72.0, y=100.0, font=font)))
+        assert not target.exists()
+        assert first_unencodable(font, text) == chr(int(code[2:], 16))
+
+    @pytest.mark.parametrize("text,code", [("A\nB", "U+000A"), ("A\rB", "U+000D")])
+    def test_line_break_raises(self, tmp_path, text, code):
+        target = tmp_path / "bad.pdf"
+        message = f"TextRun.text must be one line (one run = one line), got {code}"
+
+        with pytest.raises(ValueError, match=re.escape(message)):
+            build_pdf(target, on_page(TextRun(text, x=72.0, y=100.0)))
+        assert not target.exists()
 
 
 class TestLine:
@@ -198,6 +318,8 @@ class TestRect:
         assert top_left_bounds(obj, page.get_height()) == pytest.approx(
             (100.0, 400.0, 300.0, 450.0), abs=stroke_tol(2.0)
         )
+        corners = [(100.0, 400.0), (100.0, 450.0), (300.0, 400.0), (300.0, 450.0)]
+        assert_points(rect_corners(obj, page.get_height()), corners)
         assert draw_mode(obj) == (pdfium_c.FPDF_FILLMODE_NONE, True)
         assert stroke_width(obj) == pytest.approx(2.0)
 
@@ -209,6 +331,8 @@ class TestRect:
         (obj,) = page_objects(page, pdfium_c.FPDF_PAGEOBJ_PATH)
         fill_mode, stroked = draw_mode(obj)
         assert top_left_bounds(obj, page.get_height()) == pytest.approx((100.0, 600.0, 300.0, 650.0), abs=TOL)
+        corners = [(100.0, 600.0), (100.0, 650.0), (300.0, 600.0), (300.0, 650.0)]
+        assert_points(rect_corners(obj, page.get_height()), corners)
         assert fill_mode != pdfium_c.FPDF_FILLMODE_NONE
         assert not stroked
         assert fill_rgba(obj) == (0, 0, 255, 255)
@@ -232,6 +356,24 @@ class TestRasterImage:
         (obj,) = page_objects(page, pdfium_c.FPDF_PAGEOBJ_IMAGE)
         assert top_left_bounds(obj, page.get_height()) == pytest.approx((300.0, 500.0, 420.0, 580.0), abs=TOL)
         assert obj.get_px_size() == (30, 20)
+
+    @pytest.mark.parametrize(
+        "alpha,rendered",
+        [
+            pytest.param(0, (255, 255, 255), id="transparent"),
+            pytest.param(128, (255, 127, 127), id="half"),
+            pytest.param(255, (255, 0, 0), id="opaque"),
+        ],
+    )
+    def test_png_alpha_is_kept(self, tmp_path, alpha, rendered):
+        buffer = io.BytesIO()
+        Image.new("RGBA", (20, 20), (255, 0, 0, alpha)).save(buffer, format="PNG")
+        image = RasterImage(0.0, 0.0, 100.0, 100.0, png=buffer.getvalue())
+        path = build_pdf(tmp_path / "rgba.pdf", [PageSpec(width=100.0, height=100.0, items=(image,))])
+
+        # Red over pdfium's white page background: alpha shows as lightness.
+        pixel = pdfium.PdfDocument(path)[0].render(scale=1).to_pil().getpixel((50, 50))
+        assert pixel[:3] == pytest.approx(rendered, abs=3)
 
 
 SECRET_PAGE = PageSpec(items=(TextRun("Secret", x=72.0, y=100.0),))
@@ -263,6 +405,8 @@ class TestEncryption:
             tmp_path / "enc.pdf", [SECRET_PAGE], user_password="user-pw", owner_password="owner-pw", strength=128
         )
 
+        with pytest.raises(pdfium.PdfiumError, match="password"):
+            pdfium.PdfDocument(path)
         pdf = pdfium.PdfDocument(path, password="owner-pw")
         assert pdf[0].get_textpage().get_text_range() == "Secret"
 
@@ -277,6 +421,23 @@ class TestEncryption:
         path = build_pdf(tmp_path / "plain.pdf", [SECRET_PAGE])
 
         assert pdfium_c.FPDF_GetSecurityHandlerRevision(pdfium.PdfDocument(path)) == -1
+
+
+class TestDeterminism:
+    """The same spec always builds the same bytes."""
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            pytest.param({}, id="plain"),
+            pytest.param({"user_password": "user-pw", "owner_password": "owner-pw"}, id="encrypted"),
+        ],
+    )
+    def test_same_spec_builds_identical_bytes(self, tmp_path, kwargs):
+        first = build_pdf(tmp_path / "first.pdf", [SECRET_PAGE], **kwargs).read_bytes()
+        second = build_pdf(tmp_path / "second.pdf", [SECRET_PAGE], **kwargs).read_bytes()
+
+        assert first == second
 
 
 class TestPages:
@@ -312,11 +473,6 @@ class TestPages:
             assert first_char_top_left(page)[1] == pytest.approx(100.0, abs=TOL)
 
 
-def on_page(*items):
-    """Return a one-page spec list holding ``items``."""
-    return [PageSpec(items=items)]
-
-
 class TestValidation:
     """build_pdf rejects a bad spec before it writes anything."""
 
@@ -332,6 +488,12 @@ class TestValidation:
             pytest.param(on_page(TextRun("", 72.0, 100.0)), {}, "TextRun.text must not be empty", id="text-empty"),
             pytest.param(
                 on_page(TextRun("a", 72.0, 100.0, size=0.0)), {}, "TextRun.size must be > 0, got 0.0", id="text-size"
+            ),
+            pytest.param(
+                on_page(TextRun("a", 72.0, 100.0, font="Comic-Sans")),
+                {},
+                "TextRun.font must be one of the standard 14 PDF fonts, got 'Comic-Sans'",
+                id="font-unknown",
             ),
             pytest.param(
                 on_page(TextRun("a", 72.0, 100.0, alpha=-0.1)),
@@ -392,6 +554,37 @@ class TestValidation:
             pytest.param(
                 on_page(RasterImage(0.0, 0.0, 10.0, 0.0, png=b"")), {}, "RasterImage.h must be > 0, got 0.0", id="img-h"
             ),
+            pytest.param([PageSpec(width=math.inf)], {}, "PageSpec.width must be finite, got inf", id="page-width-inf"),
+            pytest.param(
+                on_page(TextRun("a", math.nan, 100.0)), {}, "TextRun.x must be finite, got nan", id="text-x-nan"
+            ),
+            pytest.param(
+                on_page(TextRun("a", 72.0, 100.0, size=math.inf)),
+                {},
+                "TextRun.size must be finite, got inf",
+                id="text-size-inf",
+            ),
+            pytest.param(
+                on_page(Line(0.0, 0.0, 10.0, math.inf)), {}, "Line.y1 must be finite, got inf", id="line-y1-inf"
+            ),
+            pytest.param(
+                on_page(Rect(0.0, math.nan, 10.0, 10.0)), {}, "Rect.y must be finite, got nan", id="rect-y-nan"
+            ),
+            pytest.param(
+                on_page(Rect(0.0, 0.0, 10.0, math.inf)), {}, "Rect.h must be finite, got inf", id="rect-h-inf"
+            ),
+            pytest.param(
+                on_page(RasterImage(-math.inf, 0.0, 10.0, 10.0, png=b"")),
+                {},
+                "RasterImage.x must be finite, got -inf",
+                id="img-x-ninf",
+            ),
+            pytest.param(
+                on_page(RasterImage(0.0, 0.0, 10.0, 10.0, png=b"GIF89a")),
+                {},
+                "RasterImage.png must be PNG data (it lacks the PNG signature)",
+                id="img-not-png",
+            ),
             pytest.param([PageSpec()], {"strength": 64}, "strength must be one of (40, 128), got 64", id="strength"),
             pytest.param(
                 [PageSpec()],
@@ -410,17 +603,33 @@ class TestValidation:
         assert not target.exists()
 
     @pytest.mark.parametrize(
-        "pages,message",
+        "pages,kwargs,message",
         [
-            pytest.param(["page"], "pages must hold PageSpec, got str", id="page"),
-            pytest.param(on_page("item"), "unsupported page item: str", id="item"),
+            pytest.param(["page"], {}, "pages must hold PageSpec, got str", id="page"),
+            pytest.param(on_page("item"), {}, "unsupported page item: str", id="item"),
+            pytest.param(
+                on_page(TextRun("a", 72.0, 100.0, render_mode=3.0)),
+                {},
+                "TextRun.render_mode must be an int, got 3.0",
+                id="mode-float",
+            ),
+            pytest.param(
+                on_page(TextRun("a", 72.0, 100.0, render_mode=True)),
+                {},
+                "TextRun.render_mode must be an int, got True",
+                id="mode-bool",
+            ),
+            pytest.param([PageSpec(rotate=90.0)], {}, "PageSpec.rotate must be an int, got 90.0", id="rotate-float"),
+            pytest.param([PageSpec(rotate=False)], {}, "PageSpec.rotate must be an int, got False", id="rotate-bool"),
+            pytest.param([PageSpec()], {"strength": 128.0}, "strength must be an int, got 128.0", id="strength-float"),
+            pytest.param([PageSpec()], {"strength": True}, "strength must be an int, got True", id="strength-bool"),
         ],
     )
-    def test_wrong_type_raises_type_error(self, tmp_path, pages, message):
+    def test_wrong_type_raises_type_error(self, tmp_path, pages, kwargs, message):
         target = tmp_path / "bad.pdf"
 
         with pytest.raises(TypeError, match=re.escape(message)):
-            build_pdf(target, pages)
+            build_pdf(target, pages, **kwargs)
         assert not target.exists()
 
     @pytest.mark.parametrize(

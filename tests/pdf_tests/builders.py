@@ -8,7 +8,9 @@ bottom-left space; ``_flip_y`` is the only place that converts between them.
 from __future__ import annotations
 
 import io
+import math
 import os
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,12 +18,14 @@ from pathlib import Path
 from PIL import Image
 from reportlab.lib.pdfencrypt import StandardEncryption
 from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfgen.canvas import Canvas
 
 # An RGB colour, each channel in [0, 1] (the PDF convention).
 RGB = tuple[float, float, float]
 
 _ROTATIONS = (0, 90, 180, 270)
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # RC4 strengths only. ReportLab's AES-256 needs pyaes (unmaintained since
 # 2017), which this toolkit deliberately does not depend on (#363).
 _STRENGTHS = (40, 128)
@@ -94,6 +98,31 @@ class PageSpec:
     rotate: int = 0
 
 
+def first_unencodable(font: str, text: str) -> str | None:
+    """Return the first character of ``text`` that ``font`` cannot draw as
+    itself, or None. ``font`` is one of the standard 14 PDF fonts.
+
+    ReportLab silently substitutes such characters (another font, or a
+    missing-glyph box); pdfium would then read back different text. Control
+    and format characters are refused too: pdfium rewrites them (U+00AD
+    reads back as "-").
+    """
+    encoding = pdfmetrics.getFont(font).encName
+    for char in text:
+        if unicodedata.category(char) in ("Cc", "Cf") or not _encodes_as_itself(char, encoding):
+            return char
+    return None
+
+
+def _encodes_as_itself(char: str, encoding: str) -> bool:
+    # An alias decodes to its canonical character (U+00A0 -> U+0020 in
+    # WinAnsi, U+0394 -> U+2206 in Symbol), which is what pdfium reads back.
+    try:
+        return char.encode(encoding).decode(encoding) == char
+    except UnicodeEncodeError:
+        return False
+
+
 def solid_png(width_px: int, height_px: int, rgb: RGB) -> bytes:
     """Return PNG bytes for a ``width_px`` x ``height_px`` image of one colour."""
     _require_positive("solid_png width_px", width_px)
@@ -122,7 +151,9 @@ def build_pdf(
     """
     _check_spec(pages, strength)
     out = Path(path)
-    canvas = Canvas(str(out), encrypt=_encryption(user_password, owner_password, strength))
+    # invariant=1 fixes CreationDate, ModDate and /ID, so a spec always
+    # builds the same bytes (and RC4 keys, which derive from /ID).
+    canvas = Canvas(str(out), invariant=1, encrypt=_encryption(user_password, owner_password, strength))
     for page in pages:
         _draw_page(canvas, page)
     canvas.save()
@@ -134,7 +165,23 @@ def _require(ok: bool, message: str) -> None:
         raise ValueError(message)
 
 
+def _require_int(name: str, value: int) -> None:
+    # bool is an int subclass and 3.0 == 3; neither is a real int here.
+    if type(value) is not int:
+        raise TypeError(f"{name} must be an int, got {value!r}")
+
+
+def _require_finite(name: str, value: float) -> None:
+    _require(math.isfinite(value), f"{name} must be finite, got {value!r}")
+
+
+def _require_finite_fields(item: PageItem, fields: tuple[str, ...]) -> None:
+    for field in fields:
+        _require_finite(f"{type(item).__name__}.{field}", getattr(item, field))
+
+
 def _require_positive(name: str, value: float) -> None:
+    _require_finite(name, value)
     _require(value > 0, f"{name} must be > 0, got {value!r}")
 
 
@@ -144,6 +191,7 @@ def _require_rgb(name: str, rgb: Sequence[float]) -> None:
 
 
 def _check_spec(pages: Sequence[PageSpec], strength: int) -> None:
+    _require_int("strength", strength)
     _require(strength != 256, _AES_256_UNSUPPORTED)
     _require(strength in _STRENGTHS, f"strength must be one of {_STRENGTHS}, got {strength!r}")
     _require(len(pages) > 0, "pages must not be empty")
@@ -156,6 +204,7 @@ def _check_page(page: PageSpec) -> None:
         raise TypeError(f"pages must hold PageSpec, got {type(page).__name__}")
     _require_positive("PageSpec.width", page.width)
     _require_positive("PageSpec.height", page.height)
+    _require_int("PageSpec.rotate", page.rotate)
     _require(page.rotate in _ROTATIONS, f"PageSpec.rotate must be one of {_ROTATIONS}, got {page.rotate!r}")
     for item in page.items:
         _check_item(item)
@@ -166,25 +215,46 @@ def _check_item(item: PageItem) -> None:
         case TextRun():
             _check_text(item)
         case Line():
+            _require_finite_fields(item, ("x0", "y0", "x1", "y1"))
             _require_positive("Line.width", item.width)
         case Rect():
             _check_rect(item)
         case RasterImage():
-            _require_positive("RasterImage.w", item.w)
-            _require_positive("RasterImage.h", item.h)
+            _check_image(item)
         case _:
             raise TypeError(f"unsupported page item: {type(item).__name__}")
 
 
 def _check_text(run: TextRun) -> None:
     _require(run.text != "", "TextRun.text must not be empty")
+    _require_finite_fields(run, ("x", "y"))
+    fonts = pdfmetrics.standardFonts
+    _require(run.font in fonts, f"TextRun.font must be one of the standard 14 PDF fonts, got {run.font!r}")
+    _check_text_chars(run)
     _require_positive("TextRun.size", run.size)
     _require_rgb("TextRun.rgb", run.rgb)
     _require(0 <= run.alpha <= 1, f"TextRun.alpha must be in [0, 1], got {run.alpha!r}")
+    _require_int("TextRun.render_mode", run.render_mode)
     _require(run.render_mode in range(8), f"TextRun.render_mode must be in 0..7, got {run.render_mode!r}")
 
 
+def _check_text_chars(run: TextRun) -> None:
+    for char in run.text:
+        _require(char not in "\n\r", f"TextRun.text must be one line (one run = one line), got U+{ord(char):04X}")
+    char = first_unencodable(run.font, run.text)
+    if char is not None:
+        raise ValueError(f"TextRun.text has U+{ord(char):04X}, which {run.font} cannot draw without glyph substitution")
+
+
+def _check_image(image: RasterImage) -> None:
+    _require_finite_fields(image, ("x", "y"))
+    _require_positive("RasterImage.w", image.w)
+    _require_positive("RasterImage.h", image.h)
+    _require(image.png[:8] == _PNG_SIGNATURE, "RasterImage.png must be PNG data (it lacks the PNG signature)")
+
+
 def _check_rect(rect: Rect) -> None:
+    _require_finite_fields(rect, ("x", "y"))
     _require_positive("Rect.w", rect.w)
     _require_positive("Rect.h", rect.h)
     _require_positive("Rect.line_width", rect.line_width)
@@ -230,10 +300,15 @@ def _draw_item(canvas: Canvas, item: PageItem, page_height: float) -> None:
 
 
 def _draw_text(canvas: Canvas, run: TextRun, page_height: float) -> None:
+    # rgb/alpha apply to whatever the render mode paints: fill, stroke, or both.
+    # Alpha goes on the canvas: ReportLab 5.1's PDFTextObject.setStrokeAlpha
+    # is a silent no-op (it has no _setStrokeAlpha to call).
+    canvas.setFillAlpha(run.alpha)
+    canvas.setStrokeAlpha(run.alpha)
     text = canvas.beginText(run.x, _flip_y(page_height, run.y))
     text.setFont(run.font, run.size)
     text.setFillColorRGB(*run.rgb)
-    text.setFillAlpha(run.alpha)
+    text.setStrokeColorRGB(*run.rgb)
     text.setTextRenderMode(run.render_mode)
     text.textOut(run.text)
     canvas.drawText(text)
@@ -254,4 +329,7 @@ def _draw_rect(canvas: Canvas, rect: Rect, page_height: float) -> None:
 
 def _draw_image(canvas: Canvas, image: RasterImage, page_height: float) -> None:
     bottom = _flip_y(page_height, image.y + image.h)
-    canvas.drawImage(ImageReader(io.BytesIO(image.png)), image.x, bottom, width=image.w, height=image.h)
+    # mask="auto" keeps a PNG's alpha channel as an /SMask; ReportLab's
+    # default (mask=None) silently drops it and paints the pixels opaque.
+    reader = ImageReader(io.BytesIO(image.png))
+    canvas.drawImage(reader, image.x, bottom, width=image.w, height=image.h, mask="auto")
