@@ -68,6 +68,12 @@ dev = [
     # minors roughly weekly, so expect near-continuous Dependabot bumps here.
     # Take them one at a time and re-run the parity suite on each.
     "hypothesis>=6.164.0,<6.165",
+    # Test-only CommonMark + GFM parser (MIT, pure Python). The v5 PDF
+    # Markdown fidelity tests render element Markdown with it and assert the
+    # visible text and block structure come back unchanged (#364). Bounded to
+    # one major: a parser release that changes how edge cases tokenize would
+    # otherwise redden a blocking gate on untouched code.
+    "markdown-it-py>=4.2,<5",
 ]
 
 [project.urls]
