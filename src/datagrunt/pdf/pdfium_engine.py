@@ -16,21 +16,35 @@ and pinned by ``tests/pdf_tests/test_pdfium_engine.py``:
   MediaBox reads as the 612 x 792 fallback), so geometry uses ``get_bbox()``.
 - Rendering shows the visible box turned clockwise by ``get_rotation()``;
   ``get_size()`` is that displayed size (width and height swap on 90 / 270).
-- A failed open raises ``PdfiumError`` whose ``err_code`` names the cause:
-  ``FPDF_ERR_PASSWORD`` for a missing or wrong password, ``FPDF_ERR_SECURITY``
-  for an unknown security handler, ``FPDF_ERR_FILE`` when the OS refuses the
-  read, ``FPDF_ERR_FORMAT`` for non-PDF, empty and truncated files.
-  pypdfium2 raises ``FileNotFoundError`` itself for a path that is not a file.
+- An empty MediaBox (``[0 0 0 0]``) reads as (0, 0, 612, 792) in
+  ``get_bbox()``, as the renderer draws it.
+- ``/UserUnit`` is not supported: pdfium ignores it, so sizes are in user
+  units (``/UserUnit 2`` on a 400 x 300 MediaBox reads, and renders, 400 x
+  300), and so are this module's points.
+- ``FPDF_LoadDocument`` returns NULL on failure and sets
+  ``FPDF_GetLastError()``: ``FPDF_ERR_PASSWORD`` for a missing or wrong
+  password, ``FPDF_ERR_SECURITY`` for an unknown security handler,
+  ``FPDF_ERR_FILE`` when the OS refuses the read, ``FPDF_ERR_FORMAT`` for
+  non-PDF, empty and truncated files. A successful load never resets that
+  code, so it is read only after a NULL return. A well-formed file with no
+  pages loads successfully; pypdfium2 5.14's path open then raises with the
+  stale code (an unencrypted file can read as "Incorrect password") and leaks
+  the document (``_open_pdf`` never calls ``FPDF_CloseDocument``). So this
+  module loads with ``FPDF_LoadDocument`` itself, closes a zero-page
+  document, and hands the handle to ``PdfDocument`` (a documented input).
 """
 
+import errno
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NoReturn
 
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 
-from datagrunt.pdf._validate import finite_float, int_at_least, optional_str
+from datagrunt.pdf._validate import finite_float, int_at_least
 from datagrunt.pdf.exceptions import PDFCorruptError, PDFEncryptedError
 
 Box = tuple[float, float, float, float]
@@ -158,11 +172,17 @@ class DocumentHandle:
     no reference cycle, so dropping the last reference to the handle closes
     the document at once, by refcounting alone. ``close()`` and ``with``
     release it early.
+
+    Not thread-safe: pdfium is not, so a handle belongs to one thread of one
+    process. It cannot be pickled; a worker process reopens the PDF from its
+    path (and password) with :func:`open_document`.
     """
 
     __slots__ = ("_pdf", "_page_count")
 
     def __init__(self, pdf: pdfium.PdfDocument) -> None:
+        if not isinstance(pdf, pdfium.PdfDocument):
+            raise TypeError(f"pdf must be a pypdfium2 PdfDocument, got {type(pdf).__name__}")
         self._pdf = pdf
         self._page_count: int = len(pdf)
 
@@ -187,6 +207,13 @@ class DocumentHandle:
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
+    def __reduce__(self) -> NoReturn:
+        raise TypeError(
+            "DocumentHandle cannot be pickled: a pdfium document belongs to one process and is not "
+            "thread-safe; send the PDF's path (and password) instead and reopen it from its path "
+            "with open_document() in the worker"
+        )
+
     def _require_open(self) -> pdfium.PdfDocument:
         if self.closed:
             raise ValueError("document handle is closed")
@@ -205,25 +232,61 @@ def _checked_path(path: object) -> Path:
 
 def _checked_password(password: object) -> str | None:
     """Return ``password`` if it is None or a str pdfium can read whole."""
-    checked = optional_str("password", password)
+    if password is None:
+        return None
+    # Name the type only: a password must never reach an error message.
+    if not isinstance(password, str):
+        raise TypeError(f"password must be a str or None, got {type(password).__name__}")
     # pypdfium2 hands the password to pdfium as a NUL-terminated C string: an
     # embedded NUL would silently truncate it to a different password.
-    if checked is not None and "\x00" in checked:
+    if "\x00" in password:
         raise ValueError("password must not contain NUL: pdfium would read only the part before it")
-    return checked
+    return password
 
 
-def _load_error(path: Path, password: str | None, exc: pdfium.PdfiumError) -> Exception:
-    """Translate a pdfium open failure into the datagrunt error for its cause."""
-    if exc.err_code == pdfium_c.FPDF_ERR_PASSWORD:
+# FPDF_GetLastError() codes after a failed FPDF_LoadDocument, named as pdfium's docs name them.
+_LOAD_ERROR_NAMES = {
+    pdfium_c.FPDF_ERR_UNKNOWN: "Unknown error",
+    pdfium_c.FPDF_ERR_FILE: "File access error",
+    pdfium_c.FPDF_ERR_FORMAT: "Data format error",
+    pdfium_c.FPDF_ERR_PASSWORD: "Incorrect password error",
+    pdfium_c.FPDF_ERR_SECURITY: "Unsupported security scheme error",
+    pdfium_c.FPDF_ERR_PAGE: "Page not found or content error",
+}
+
+# pypdfium2's path encoding for FPDF_LoadDocument, so both open the same files.
+_PATH_ERRORS = "strict" if sys.platform.startswith("win32") else "surrogateescape"
+
+
+def _load_error(path: Path, password: str | None, code: int) -> Exception:
+    """Translate a failed FPDF_LoadDocument's last-error code into a datagrunt error."""
+    if code == pdfium_c.FPDF_ERR_PASSWORD:
         if password is None:
             return PDFEncryptedError(f"{path} is encrypted; pass its password to open it")
         return PDFEncryptedError(f"{path} is encrypted and the password is incorrect")
-    if exc.err_code == pdfium_c.FPDF_ERR_SECURITY:
+    if code == pdfium_c.FPDF_ERR_SECURITY:
         return PDFEncryptedError(f"{path} is encrypted with a security handler pdfium does not support")
-    if exc.err_code == pdfium_c.FPDF_ERR_FILE:
-        return OSError(f"cannot read {path}: {exc}")
-    return PDFCorruptError(f"{path} is not a readable PDF: {exc}")
+    reason = _LOAD_ERROR_NAMES.get(code, f"error code {code}")
+    if code == pdfium_c.FPDF_ERR_FILE:
+        # The path is a file (checked first), so the OS refused the read.
+        return PermissionError(errno.EACCES, f"pdfium cannot read the file (pdfium: {reason})", str(path))
+    return PDFCorruptError(f"{path} is not a readable PDF (pdfium: {reason})")
+
+
+def _load_raw_document(path: Path, password: str | None) -> pdfium_c.FPDF_DOCUMENT:
+    """Load ``path`` with FPDF_LoadDocument; return a handle to a document with pages."""
+    resolved = path.expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(errno.ENOENT, "not an existing file", str(path))
+    encoded_path = (str(resolved) + "\x00").encode("utf-8", errors=_PATH_ERRORS)
+    encoded_password = None if password is None else (password + "\x00").encode("utf-8")
+    raw = pdfium_c.FPDF_LoadDocument(encoded_path, encoded_password)
+    if not raw:
+        raise _load_error(path, password, pdfium_c.FPDF_GetLastError())
+    if pdfium_c.FPDF_GetPageCount(raw) < 1:
+        pdfium_c.FPDF_CloseDocument(raw)
+        raise PDFCorruptError(f"{path} has no pages")
+    return raw
 
 
 def open_document(path: str | os.PathLike[str], *, password: str | None = None) -> DocumentHandle:
@@ -245,17 +308,14 @@ def open_document(path: str | os.PathLike[str], *, password: str | None = None) 
         FileNotFoundError: If ``path`` is not an existing file.
         PDFEncryptedError: If the password is missing or wrong, or the file
             uses a security handler pdfium does not support.
-        OSError: If the OS refuses to let pdfium read the file.
-        PDFCorruptError: If the file is not a readable PDF (``page_number``
-            is None: the container itself is unreadable).
+        PermissionError: If the OS refuses to let pdfium read the file
+            (``errno`` is ``EACCES``).
+        PDFCorruptError: If the file is not a readable PDF or has no pages
+            (``page_number`` is None: the container itself is unreadable).
     """
     source = _checked_path(path)
-    checked_password = _checked_password(password)
-    try:
-        pdf = pdfium.PdfDocument(source, password=checked_password)
-    except pdfium.PdfiumError as exc:
-        raise _load_error(source, checked_password, exc) from exc
-    return DocumentHandle(pdf)
+    raw = _load_raw_document(source, _checked_password(password))
+    return DocumentHandle(pdfium.PdfDocument(raw))
 
 
 def _checked_index(index: object, page_count: int) -> int:

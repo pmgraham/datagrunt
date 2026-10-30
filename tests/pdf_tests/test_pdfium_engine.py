@@ -6,6 +6,7 @@ coordinates are top-left points in the unrotated page space.
 
 import ast
 import dataclasses
+import errno
 import gc
 import os
 import pickle
@@ -43,6 +44,31 @@ def encrypted(tmp_path: Path) -> Path:
     """A one-page RC4-128 PDF that needs USER_PW (or OWNER_PW) to open."""
     page = PageSpec(items=(TextRun("Secret", x=72.0, y=100.0),))
     return build_pdf(tmp_path / "enc.pdf", [page], user_password=USER_PW, owner_password=OWNER_PW, strength=128)
+
+
+def hand_written_pdf(path: Path, objects: list[bytes]) -> Path:
+    """Write ``objects`` (object 1 is the catalog) as a PDF with a correct xref.
+
+    For structures ReportLab cannot write. The offsets are computed, so
+    pdfium reads the file as written instead of repairing it.
+    """
+    data = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objects, 1):
+        offsets.append(len(data))
+        data += b"%d 0 obj\n%s\nendobj\n" % (number, body)
+    xref = len(data)
+    data += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    data += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+    data += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref)
+    path.write_bytes(bytes(data))
+    return path
+
+
+def zero_pages(tmp_path: Path) -> Path:
+    """A well-formed PDF whose page tree is empty."""
+    objects = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [] /Count 0 >>"]
+    return hand_written_pdf(tmp_path / "zero.pdf", objects)
 
 
 def open_pdfium_documents() -> int:
@@ -157,11 +183,22 @@ class TestOpenDocument:
         with pytest.raises(PDFEncryptedError, match="is encrypted; pass its password"):
             open_document(encrypted(tmp_path))
 
-    @pytest.mark.parametrize("password", ["hunter2", ""], ids=["wrong", "empty"])
-    def test_wrong_password_raises_encrypted_error_without_echoing_it(self, tmp_path, password):
+    def test_wrong_password_raises_encrypted_error_without_echoing_it(self, tmp_path):
         with pytest.raises(PDFEncryptedError, match="the password is incorrect") as caught:
-            open_document(encrypted(tmp_path), password=password)
+            open_document(encrypted(tmp_path), password="hunter2")
         assert "hunter2" not in str(caught.value)
+
+    def test_empty_password_is_an_incorrect_password(self, tmp_path):
+        with pytest.raises(PDFEncryptedError, match="the password is incorrect"):
+            open_document(encrypted(tmp_path), password="")
+
+    @pytest.mark.parametrize("password", [b"s3cret", bytearray(b"s3cret")], ids=["bytes", "bytearray"])
+    def test_non_str_password_raises_type_error_without_echoing_it(self, tmp_path, password):
+        with pytest.raises(
+            TypeError, match=re.escape(f"password must be a str or None, got {type(password).__name__}") + "$"
+        ) as caught:
+            open_document(three_pages(tmp_path), password=password)
+        assert "s3cret" not in str(caught.value)
 
     def test_unsupported_security_handler_raises_encrypted_error(self, tmp_path):
         path = encrypted(tmp_path)
@@ -198,19 +235,47 @@ class TestOpenDocument:
             open_document(path)
         assert caught.value.page_number is None
 
+    @pytest.mark.parametrize("earlier_failure", [None, "password", "format"])
+    def test_zero_page_pdf_raises_corrupt_error_whatever_failed_before(self, tmp_path, earlier_failure):
+        # pdfium's last-error code is never reset by a successful parse, so a
+        # zero-page file must not be classified by it (it would read as the
+        # previous failure: an unencrypted file reported as encrypted).
+        if earlier_failure == "password":
+            with pytest.raises(PDFEncryptedError):
+                open_document(encrypted(tmp_path))
+        if earlier_failure == "format":
+            (tmp_path / "bad.pdf").write_bytes(b"not a pdf")
+            with pytest.raises(PDFCorruptError):
+                open_document(tmp_path / "bad.pdf")
+
+        with pytest.raises(PDFCorruptError, match="has no pages") as caught:
+            open_document(zero_pages(tmp_path))
+        assert caught.value.page_number is None
+
+    def test_zero_page_pdf_is_closed_not_leaked(self, tmp_path, monkeypatch):
+        closed = []
+        original = pdfium_c.FPDF_CloseDocument
+        monkeypatch.setattr(pdfium_c, "FPDF_CloseDocument", lambda raw: closed.append(raw) or original(raw))
+
+        with pytest.raises(PDFCorruptError, match="has no pages"):
+            open_document(zero_pages(tmp_path))
+        assert len(closed) == 1
+
     def test_missing_file_raises_file_not_found(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             open_document(tmp_path / "absent.pdf")
 
     @pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="needs a non-root POSIX user")
-    def test_unreadable_file_raises_os_error_not_corrupt_error(self, tmp_path):
+    def test_unreadable_file_raises_permission_error_not_corrupt_error(self, tmp_path):
         path = three_pages(tmp_path)
         path.chmod(0)
         try:
-            with pytest.raises(OSError, match="File access error"):
+            with pytest.raises(PermissionError, match="File access error") as caught:
                 open_document(path)
         finally:
             path.chmod(0o600)
+        assert caught.value.errno == errno.EACCES
+        assert caught.value.filename == str(path)
 
     @pytest.mark.parametrize(
         "path,password,error,message",
@@ -224,7 +289,7 @@ class TestOpenDocument:
                 "path must be a str or os.PathLike, got a bytes path",
                 id="bytes-fspath",
             ),
-            pytest.param("doc.pdf", 123, TypeError, "password must be a str or None, got 123 (int)", id="int-pw"),
+            pytest.param("doc.pdf", 123, TypeError, "password must be a str or None, got int", id="int-pw"),
             pytest.param("doc.pdf", "a\x00b", ValueError, "password must not contain NUL", id="nul-pw"),
         ],
     )
@@ -256,6 +321,17 @@ class TestDocumentHandle:
 
         with pytest.raises(ValueError, match="document handle is closed"):
             _ = handle.page_count
+
+    def test_refuses_to_pickle_and_says_to_reopen(self, tmp_path):
+        handle = open_document(three_pages(tmp_path))
+
+        with pytest.raises(TypeError, match="cannot be pickled.*reopen it from its path"):
+            pickle.dumps(handle)
+        assert not handle.closed
+
+    def test_wraps_only_a_pdfium_document(self):
+        with pytest.raises(TypeError, match=re.escape("pdf must be a pypdfium2 PdfDocument, got str")):
+            DocumentHandle("doc.pdf")
 
     def test_dropping_the_last_reference_closes_without_gc(self, tmp_path, gc_disabled):
         path = three_pages(tmp_path)
@@ -329,13 +405,23 @@ class TestPageGeometry:
             geometry(**overrides)
 
 
-def open_pdfium_pages() -> int:
-    """Count pypdfium2 pages whose handle is still open, without collecting."""
-    return sum(
-        1
-        for obj in gc.get_objects()
-        if isinstance(obj, pdfium.PdfPage) and obj._finalizer is not None and obj._finalizer.alive
-    )
+@pytest.fixture
+def page_closes(monkeypatch):
+    """Record every explicit PdfPage.close() call (not the parent's cascade).
+
+    Refcounting alone would also free a dropped page, so counting open pages
+    cannot show that the engine closes them; counting close() calls can.
+    """
+    calls = []
+    original = pdfium.PdfPage.close
+
+    def counting_close(self, *args, **kwargs):
+        if not kwargs.get("_by_parent", False):
+            calls.append(self)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(pdfium.PdfPage, "close", counting_close)
+    return calls
 
 
 ROTATIONS = [0, 90, 180, 270]
@@ -349,32 +435,21 @@ def one_page(tmp_path: Path, *items, rotate: int = 0, crop_box=None) -> Path:
     return build_pdf(tmp_path / "page.pdf", [spec])
 
 
-def inherited_boxes_pdf(tmp_path: Path, pages_entries: bytes) -> Path:
-    """A hand-written one-page PDF whose page inherits ``pages_entries`` from /Pages.
+def one_page_pdf(tmp_path: Path, pages_entries: bytes = b"", page_entries: bytes = b"") -> Path:
+    """A hand-written one-page PDF with extra /Pages and /Page dictionary entries.
 
-    ReportLab writes every box on the page itself, so the toolkit cannot
-    build this. The xref offsets are computed, so pdfium never repairs it.
+    For what ReportLab cannot write: boxes inherited from /Pages, an empty
+    MediaBox, /UserUnit.
     """
     content = b"BT /F1 20 Tf 100 100 Td (T) Tj ET"
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 " + pages_entries + b" >>",
-        b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+        b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> " + page_entries + b" >>",
         b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
     ]
-    data = bytearray(b"%PDF-1.4\n")
-    offsets = []
-    for number, body in enumerate(objects, 1):
-        offsets.append(len(data))
-        data += b"%d 0 obj\n%s\nendobj\n" % (number, body)
-    xref = len(data)
-    data += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
-    data += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
-    data += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref)
-    path = tmp_path / "inherited.pdf"
-    path.write_bytes(bytes(data))
-    return path
+    return hand_written_pdf(tmp_path / "hand.pdf", objects)
 
 
 class TestPageGeometryOfAPage:
@@ -395,7 +470,7 @@ class TestPageGeometryOfAPage:
         assert (got.width_pt, got.height_pt) == pytest.approx(pdfium.PdfDocument(path)[0].get_size())
 
     def test_boxes_and_rotation_inherited_from_the_page_tree_are_honoured(self, tmp_path):
-        path = inherited_boxes_pdf(tmp_path, b"/MediaBox [0 0 400 300] /CropBox [50 40 350 280] /Rotate 90")
+        path = one_page_pdf(tmp_path, pages_entries=b"/MediaBox [0 0 400 300] /CropBox [50 40 350 280] /Rotate 90")
         # Why geometry reads get_bbox(): pypdfium2's get_mediabox() does not
         # inherit, and falls back to US Letter for this page.
         assert pdfium.PdfDocument(path)[0].get_mediabox() == (0, 0, 612, 792)
@@ -406,19 +481,49 @@ class TestPageGeometryOfAPage:
             page_number=1, width_pt=240.0, height_pt=300.0, rotation_deg=90, crop_offset=(50.0, 40.0)
         )
 
+    @pytest.mark.parametrize(
+        "page_entries,size",
+        [
+            pytest.param(b"/MediaBox [0 0 0 0]", (612.0, 792.0), id="empty-media-box-is-letter"),
+            pytest.param(b"/MediaBox [0 0 400 300] /UserUnit 2", (400.0, 300.0), id="user-unit-ignored"),
+        ],
+    )
+    def test_documented_pdfium_size_rules(self, tmp_path, page_entries, size):
+        path = one_page_pdf(tmp_path, page_entries=page_entries)
+
+        got = page_geometry(open_document(path), 0)
+
+        assert (got.width_pt, got.height_pt) == size
+        assert pdfium.PdfDocument(path)[0].render(scale=1).to_pil().size == tuple(map(round, size))
+
     def test_page_number_is_one_based(self, tmp_path):
         handle = open_document(three_pages(tmp_path))
 
         assert [page_geometry(handle, index).page_number for index in range(3)] == [1, 2, 3]
 
-    def test_closes_every_page_handle_without_gc(self, tmp_path, gc_disabled):
+    def test_closes_every_page_handle(self, tmp_path, page_closes):
         handle = open_document(three_pages(tmp_path))
 
         for index in range(3):
             page_geometry(handle, index)
 
-        assert open_pdfium_pages() == 0
+        assert len(page_closes) == 3
+        assert all(page.raw is None for page in page_closes)
         assert not handle.closed
+
+    def test_closes_the_page_when_reading_it_fails(self, tmp_path, page_closes, monkeypatch):
+        def failing_bbox(self):
+            raise pdfium.PdfiumError("Failed to get page bounding box.")
+
+        monkeypatch.setattr(pdfium.PdfPage, "get_bbox", failing_bbox)
+        handle = open_document(three_pages(tmp_path))
+
+        # pytest keeps the traceback, and with it the page: only close() frees it.
+        with pytest.raises(PDFCorruptError, match="page 1 is unreadable") as caught:
+            page_geometry(handle, 0)
+
+        assert caught.value.page_number == 1
+        assert len(page_closes) == 1
 
     @pytest.mark.parametrize(
         "index,error,message",
@@ -446,7 +551,7 @@ class TestPageGeometryOfAPage:
         with pytest.raises(ValueError, match="document handle is closed"):
             page_geometry(handle, 0)
 
-    def test_unloadable_page_raises_corrupt_error_for_that_page_only(self, tmp_path, gc_disabled):
+    def test_unloadable_page_raises_corrupt_error_for_that_page_only(self, tmp_path, page_closes):
         path = break_page(three_pages(tmp_path), 2)
         handle = open_document(path)
 
@@ -455,7 +560,7 @@ class TestPageGeometryOfAPage:
 
         assert caught.value.page_number == 2
         assert [page_geometry(handle, index).page_number for index in (0, 2)] == [1, 3]
-        assert open_pdfium_pages() == 0
+        assert len(page_closes) == 2  # pages 1 and 3; page 2 never loaded
 
     def test_empty_visible_box_raises_corrupt_error(self, tmp_path):
         # A CropBox outside the MediaBox: pdfium intersects them to nothing.
