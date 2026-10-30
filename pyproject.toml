@@ -9,7 +9,7 @@ description = "Read, process, and convert CSV, Excel, Parquet, and PDF files eas
 readme = "README.md"
 authors = [{ name = "Martin Graham", email = "datagrunt@datagrunt.io" }]
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.txt"]
 classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
