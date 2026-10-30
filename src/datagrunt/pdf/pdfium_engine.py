@@ -94,6 +94,15 @@ Images (#365 T4), pinned by ``tests/pdf_tests/test_pdfium_images.py``:
   (4 ms against 8 ms for the read of a 200 MB stream).
   ``FPDFImageObj_GetImageDataDecoded`` of ``[/ASCII85Decode /DCTDecode]``
   (what ReportLab writes for every JPEG) is the JPEG as written.
+
+Pages (#365 T5), pinned by ``tests/pdf_tests/test_pdfium_extract_page.py``:
+
+- :func:`extract_page` loads a page once and reads its geometry, text,
+  segments and images from that load, in that order. A PDFCorruptError in a
+  stage becomes a :class:`PageFailure` naming the stage, with the message
+  that stage's own function raises, so one bad page never fails a batch;
+  any other error is a bug and propagates. :class:`RawPage` and
+  :class:`PageFailure` are picklable: they cross the process pool.
 """
 
 import ctypes
@@ -120,6 +129,7 @@ from datagrunt.pdf._path_segments import (
     PathPoint,
     RawSegment,
     SegmentStats,
+    _checked_choice,
     path_segments,
 )
 from datagrunt.pdf._pdfium_common import Box, PdfiumFailure, object_address, read_rgba
@@ -139,22 +149,25 @@ from datagrunt.pdf._pdfium_images import (
     read_raw_stream,
 )
 from datagrunt.pdf._pdfium_text import PageText, RawSpan, TextStats, collect_text
-from datagrunt.pdf._validate import finite_float, finite_tuple, int_at_least
+from datagrunt.pdf._validate import finite_float, finite_tuple, int_at_least, non_blank_str
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFEncryptedError
 
 __all__ = [
     "DocumentHandle",
     "ImageLoader",
     "ImageStats",
+    "PageFailure",
     "PageGeometry",
     "PageImages",
     "PageSegments",
     "PageText",
     "RawImage",
+    "RawPage",
     "RawSegment",
     "RawSpan",
     "SegmentStats",
     "TextStats",
+    "extract_page",
     "open_document",
     "page_geometry",
     "page_images",
@@ -537,6 +550,11 @@ def _object_indices(page_raw: pdfium_c.FPDF_PAGE) -> dict[int, int]:
     return {object_address(obj): index for index, (obj, _form) in enumerate(_page_objects(page_raw))}
 
 
+def _pdfium_error(page_number: int, failure: PdfiumFailure) -> PDFCorruptError:
+    """The PDFCorruptError for a pdfium call that failed on page ``page_number``."""
+    return PDFCorruptError(f"page {page_number}: pdfium cannot {failure}", page_number=page_number)
+
+
 def _read_page_text(page: pdfium.PdfPage, geometry: PageGeometry) -> PageText:
     """Read a loaded page's spans, closing its textpage."""
     page_number = geometry.page_number
@@ -548,7 +566,7 @@ def _read_page_text(page: pdfium.PdfPage, geometry: PageGeometry) -> PageText:
     try:
         return collect_text(textpage.raw, _display_mapping(geometry), _object_indices(page.raw))
     except PdfiumFailure as exc:
-        raise PDFCorruptError(f"page {page_number}: pdfium cannot {exc}", page_number=page_number) from exc
+        raise _pdfium_error(page_number, exc) from exc
     finally:
         textpage.close()
 
@@ -714,6 +732,14 @@ def _collect_segments(page_raw: pdfium_c.FPDF_PAGE, geometry: PageGeometry) -> P
     return PageSegments(segments=tuple(segments), stats=SegmentStats(skipped_nonfinite_paths=skipped))
 
 
+def _read_segments(page: pdfium.PdfPage, geometry: PageGeometry) -> PageSegments:
+    """Read a loaded page's segments."""
+    try:
+        return _collect_segments(page.raw, geometry)
+    except PdfiumFailure as exc:
+        raise _pdfium_error(geometry.page_number, exc) from exc
+
+
 def page_segments(handle: DocumentHandle, index: int) -> PageSegments:
     """Return the axis-aligned segments of the page at 0-based ``index``.
 
@@ -740,11 +766,18 @@ def page_segments(handle: DocumentHandle, index: int) -> PageSegments:
     """
     page, page_number = _load_page(handle, index)
     try:
-        return _collect_segments(page.raw, _read_geometry(page, page_number))
-    except PdfiumFailure as exc:
-        raise PDFCorruptError(f"page {page_number}: pdfium cannot {exc}", page_number=page_number) from exc
+        return _read_segments(page, _read_geometry(page, page_number))
     finally:
         page.close()
+
+
+def _read_images(page: pdfium.PdfPage, geometry: PageGeometry) -> PageImages:
+    """Read a loaded page's image objects (no pixel is decoded)."""
+    try:
+        placed = _placed_objects(page.raw, pdfium_c.FPDF_PAGEOBJ_IMAGE)
+        return collect_images(placed, page.raw, geometry.page_box, _display_mapping(geometry))
+    except PdfiumFailure as exc:
+        raise _pdfium_error(geometry.page_number, exc) from exc
 
 
 def page_images(handle: DocumentHandle, index: int) -> PageImages:
@@ -774,13 +807,127 @@ def page_images(handle: DocumentHandle, index: int) -> PageImages:
     """
     page, page_number = _load_page(handle, index)
     try:
-        geometry = _read_geometry(page, page_number)
-        placed = _placed_objects(page.raw, pdfium_c.FPDF_PAGEOBJ_IMAGE)
-        return collect_images(placed, page.raw, geometry.page_box, _display_mapping(geometry))
-    except PdfiumFailure as exc:
-        raise PDFCorruptError(f"page {page_number}: pdfium cannot {exc}", page_number=page_number) from exc
+        return _read_images(page, _read_geometry(page, page_number))
     finally:
         page.close()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RawPage:
+    """One page's raw facts, read by :func:`extract_page` from one load of the page.
+
+    Picklable, so it crosses the process pool: its images carry no pixels
+    (an :class:`ImageLoader` reads them on demand).
+
+    Attributes:
+        geometry: The displayed size, rotation and crop offset, as
+            :func:`page_geometry` returns them.
+        text: The spans and textpage counts, as :func:`page_text` returns them.
+        segments: The axis-aligned segments, as :func:`page_segments` returns
+            them.
+        images: The image objects and their stats, as :func:`page_images`
+            returns them.
+    """
+
+    geometry: PageGeometry
+    text: PageText
+    segments: PageSegments
+    images: PageImages
+
+    def __post_init__(self) -> None:
+        checks = (
+            ("geometry", self.geometry, PageGeometry),
+            ("text", self.text, PageText),
+            ("segments", self.segments, PageSegments),
+            ("images", self.images, PageImages),
+        )
+        for name, value, expected in checks:
+            if not isinstance(value, expected):
+                raise TypeError(f"{name} must be a {expected.__name__}, got {type(value).__name__}")
+
+    @property
+    def page_number(self) -> int:
+        """The 1-based page number, read from ``geometry``."""
+        return self.geometry.page_number
+
+
+PageStage = Literal["page", "text", "objects"]
+_STAGES: tuple[PageStage, ...] = ("page", "text", "objects")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PageFailure:
+    """A page :func:`extract_page` could not read, and the stage that failed.
+
+    A raw fact, not an error: the caller decides what it means (A3/A5:
+    ``strict`` raises ``PDFCorruptError(message, page_number=page_number)``;
+    otherwise the page falls back to vision or becomes an error page).
+    Picklable, so it crosses the process pool.
+
+    Attributes:
+        page_number: 1-based page number.
+        stage: ``"page"`` (loading the page or reading its geometry),
+            ``"text"`` (its textpage) or ``"objects"`` (its segments, then its
+            images).
+        message: The message of the PDFCorruptError that the stage's own
+            function (:func:`page_geometry`, :func:`page_text`,
+            :func:`page_segments` or :func:`page_images`) raises for the page.
+    """
+
+    page_number: int
+    stage: PageStage
+    message: str
+
+    def __post_init__(self) -> None:
+        int_at_least("page_number", self.page_number, 1)
+        _checked_choice("stage", self.stage, _STAGES)
+        non_blank_str("message", self.message)
+
+
+def extract_page(handle: DocumentHandle, index: int) -> RawPage | PageFailure:
+    """Return every raw fact of the page at 0-based ``index``, read from one load of it.
+
+    The page is loaded once and read in stages: geometry, text, then
+    segments and images; the page and its textpage are closed before
+    returning. A good page equals the :class:`RawPage` of
+    :func:`page_geometry`, :func:`page_text`, :func:`page_segments` and
+    :func:`page_images` (each of which loads the page again). A page pdfium
+    cannot read is no error here: the PDFCorruptError a stage raises becomes
+    a :class:`PageFailure` of that stage with the same message, so one bad
+    page never fails a batch. Any other error (a PDFCorruptError naming no
+    page included) propagates unchanged: it is a bug, not a page fault.
+
+    Raises:
+        TypeError: If ``handle`` is not a DocumentHandle, or ``index`` is not
+            an int (bool rejected).
+        ValueError: If ``handle`` is closed.
+        IndexError: If ``index`` is outside ``0..page_count - 1``.
+    """
+    try:
+        page, page_number = _load_page(handle, index)
+    except PDFCorruptError as exc:
+        if exc.page_number is None:
+            raise
+        return PageFailure(page_number=exc.page_number, stage="page", message=str(exc))
+    try:
+        return _read_stages(page, page_number)
+    finally:
+        page.close()
+
+
+def _read_stages(page: pdfium.PdfPage, page_number: int) -> RawPage | PageFailure:
+    """Read a loaded page stage by stage; a stage's PDFCorruptError becomes its PageFailure."""
+    stage: PageStage = "page"
+    try:
+        geometry = _read_geometry(page, page_number)
+        stage = "text"
+        text = _read_page_text(page, geometry)
+        stage = "objects"
+        segments = _read_segments(page, geometry)
+        images = _read_images(page, geometry)
+    except PDFCorruptError as exc:
+        return PageFailure(page_number=page_number, stage=stage, message=str(exc))
+    return RawPage(geometry=geometry, text=text, segments=segments, images=images)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
