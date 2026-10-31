@@ -960,7 +960,8 @@ class PageImage:
 _PAGE_STATUSES: tuple[PageStatus, ...] = get_args(PageStatus)
 # Statuses that only a vision-route page can have.
 _VISION_ONLY_STATUSES: tuple[PageStatus, ...] = ("ocr_fallback", "ocr_unavailable")
-_PAGE_ROUTES: tuple[PageRoute, ...] = get_args(PageRoute)
+# Public, like HIDDEN_REASONS: the v5 quality stage (datagrunt.pdf.quality) checks routes with it.
+PAGE_ROUTES: tuple[PageRoute, ...] = get_args(PageRoute)
 _ELEMENT_TYPES: tuple[type, ...] = get_args(DocumentElement)
 
 
@@ -1059,7 +1060,7 @@ class Page:
         object.__setattr__(self, "width_pt", positive_float("width_pt", self.width_pt))
         object.__setattr__(self, "height_pt", positive_float("height_pt", self.height_pt))
         _check_choice("status", self.status, _PAGE_STATUSES)
-        _check_choice("route", self.route, _PAGE_ROUTES)
+        _check_choice("route", self.route, PAGE_ROUTES)
         if self.quality is not None and not isinstance(self.quality, PageQuality):
             raise TypeError(f"quality must be a PageQuality or None, got {type(self.quality).__name__}")
         _check_document_elements("elements", self.elements)

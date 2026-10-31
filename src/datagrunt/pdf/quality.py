@@ -1,9 +1,11 @@
-"""Hidden-span flags and raster cover for the v5 PDF quality stage (#366, A3 part 1).
+"""Hidden-span flags, raster cover, page quality and routing for the v5 PDF quality stage (#366, A3 parts 1, 4).
 
 Internal: not exported from ``datagrunt`` or ``datagrunt.pdf``. Pure: it
-reads the engine's raw facts (:class:`~datagrunt.pdf.pdfium_engine.RawSpan`,
-:class:`~datagrunt.pdf.pdfium_engine.RawImage`) and never imports pdfium.
-Boxes are displayed, top-left ``(x0, y0, x1, y1)`` points.
+reads the engine's raw facts (:class:`~datagrunt.pdf.pdfium_engine.RawPage`,
+:class:`~datagrunt.pdf.pdfium_engine.RawSpan`,
+:class:`~datagrunt.pdf.pdfium_engine.RawImage`) and calls no pdfium function;
+it imports the engine for the ``RawPage`` type only (the engine never imports
+it). Boxes are displayed, top-left ``(x0, y0, x1, y1)`` points.
 
 Hidden text is flagged, never dropped: :func:`classify_spans` returns every
 char of every span, in order, cut into pieces that carry the A1
@@ -25,18 +27,54 @@ char of every span, in order, cut into pieces that carry the A1
 
 A white fill alone is no signal: ``matches_background`` needs the rendered
 background under the span (#366 task 2).
+
+:func:`assess_page` measures a page and routes it (#366 task 4):
+
+- A char is valid text unless it is U+FFFD (a code with no Unicode
+  mapping), private use (``Co``), unassigned (``Cn``, by the running
+  Python's Unicode database) or a lone surrogate (``Cs``). Marks, format
+  chars (ZWJ, LRM) and control chars are valid: nothing is stripped.
+- ``valid_char_ratio`` is the valid share of every span char, hidden ones
+  included. It is recorded, never routed on: a contents page whose dot
+  leaders read as U+FFFD keeps its digital text.
+- Routing counts the valid, visible (no hidden reason), non-whitespace
+  chars. ``ocr="always"`` routes vision. Under 20 routes vision, or digital
+  with a warning under ``ocr="never"``. 20 or more on a page whose raster
+  cover is over 50 % routes hybrid (OCR fills the unmapped regions); else
+  digital.
+- Unmapped regions: the box of each maximal run of invalid chars in a
+  visible piece, where OCR (A5) reads what the text layer cannot say.
 """
 
+import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass
+from itertools import groupby
+from typing import Literal, TypeAlias, get_args
 
 from datagrunt.pdf._pdfium_common import Box, union_box
 from datagrunt.pdf._pdfium_images import RawImage
 from datagrunt.pdf._pdfium_text import RawSpan
-from datagrunt.pdf._validate import int_at_least, positive_float, typed_tuple
-from datagrunt.pdf.elements import HIDDEN_REASONS, BBox, HiddenReason, check_hidden_reasons
+from datagrunt.pdf._validate import choice_str, int_at_least, ordered_box, positive_float, str_tuple, typed_tuple
+from datagrunt.pdf.elements import (
+    HIDDEN_REASONS,
+    PAGE_ROUTES,
+    BBox,
+    HiddenReason,
+    PageQuality,
+    PageRoute,
+    check_hidden_reasons,
+)
+from datagrunt.pdf.pdfium_engine import RawPage
 
-__all__ = ["SpanPiece", "classify_spans", "raster_cover_fraction"]
+__all__ = ["OcrMode", "PageAssessment", "SpanPiece", "assess_page", "classify_spans", "raster_cover_fraction"]
+
+OcrMode: TypeAlias = Literal["auto", "always", "never"]
+"""The reader's OCR option: ``"auto"`` routes by the page's text,
+``"always"`` sends every page to vision, ``"never"`` keeps a page without
+enough text digital (with a warning) instead of sending it to vision."""
+
+_OCR_MODES: tuple[OcrMode, ...] = get_args(OcrMode)
 
 # Text render modes (PDF 32000-1, Table 106): 0 fill, 1 stroke, 2 both, 3
 # neither; 4 to 7 do the same and add the glyphs to the clipping path.
@@ -44,8 +82,15 @@ _FILL_MODES = frozenset({0, 2, 4, 6})
 _STROKE_MODES = frozenset({1, 2, 5, 6})
 _NO_PAINT_MODES = frozenset({3, 7})
 _TINY_FONT_PT = 1.0
-# Raster cover over this fraction of the page makes no-paint text over it an OCR layer.
+# Raster cover over this fraction of the page makes no-paint text over it an
+# OCR layer, and a page with enough text over it hybrid.
 _OCR_LAYER_COVER = 0.5
+# Valid, visible, non-whitespace chars a page needs to stay out of vision.
+_MIN_TEXT_CHARS = 20
+# What a char code with no Unicode mapping reads as.
+_REPLACEMENT_CHAR = "\ufffd"
+# Private use, unassigned and lone-surrogate chars carry no text.
+_INVALID_CATEGORIES = frozenset({"Co", "Cn", "Cs"})
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -114,11 +159,15 @@ def classify_spans(
     typed_tuple("images", images, RawImage)
     width, height = positive_float("width_pt", width_pt), positive_float("height_pt", height_pt)
     boxes = tuple(image.bbox for image in images)
-    raster = boxes if _cover_fraction(boxes, width, height) > _OCR_LAYER_COVER else ()
-    pieces: list[SpanPiece] = []
-    for span in spans:
-        pieces.extend(_span_pieces(span, width, height, raster))
-    return tuple(pieces)
+    return _classify(spans, width, height, boxes, _cover_fraction(boxes, width, height))
+
+
+def _classify(
+    spans: tuple[RawSpan, ...], width: float, height: float, boxes: tuple[Box, ...], cover: float
+) -> tuple[SpanPiece, ...]:
+    """:func:`classify_spans` of checked input, given the raster ``cover`` of the image ``boxes``."""
+    raster = boxes if cover > _OCR_LAYER_COVER else ()
+    return tuple(piece for span in spans for piece in _span_pieces(span, width, height, raster))
 
 
 def _transparent(span: RawSpan) -> bool:
@@ -273,3 +322,121 @@ class _CoverTree:
             self._covered[node] = 0.0
         else:
             self._covered[node] = self._covered[2 * node] + self._covered[2 * node + 1]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PageAssessment:
+    """One page's pieces, quality signals and route, as :func:`assess_page` measures them.
+
+    Picklable, so it crosses the process pool.
+
+    Attributes:
+        pieces: Every char of every span, cut by :func:`classify_spans`.
+        quality: The page's quality signals; ``deskew_angle_deg`` and
+            ``ocr_mean_confidence`` are None (A5 measures them).
+        route: ``"digital"``, ``"hybrid"`` or ``"vision"``.
+        unmapped_regions: One box per maximal run of invalid chars in a
+            visible piece, in piece order: where OCR (A5) reads what the
+            text layer cannot say. Empty when there is none.
+        warnings: Non-fatal notes for the page (``Page.warnings``).
+    """
+
+    pieces: tuple[SpanPiece, ...]
+    quality: PageQuality
+    route: PageRoute
+    unmapped_regions: tuple[Box, ...]
+    warnings: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        typed_tuple("pieces", self.pieces, SpanPiece)
+        if not isinstance(self.quality, PageQuality):
+            raise TypeError(f"quality must be a PageQuality, got {type(self.quality).__name__}")
+        choice_str("route", self.route, PAGE_ROUTES)
+        regions = typed_tuple("unmapped_regions", self.unmapped_regions, tuple)
+        boxes = tuple(ordered_box(f"unmapped_regions[{index}]", box) for index, box in enumerate(regions))
+        object.__setattr__(self, "unmapped_regions", boxes)
+        str_tuple("warnings", self.warnings)
+
+
+def assess_page(page: RawPage, *, ocr: OcrMode = "auto") -> PageAssessment:
+    """Classify a page's spans, measure its quality and route it (see the module notes).
+
+    Cost: :func:`classify_spans`, one raster cover and O(chars).
+
+    Args:
+        page: The page's raw facts, as
+            :func:`~datagrunt.pdf.pdfium_engine.extract_page` returns them.
+        ocr: The reader's OCR option.
+
+    Raises:
+        TypeError: If ``page`` is not a RawPage, or ``ocr`` is not a str.
+        ValueError: If ``ocr`` is not ``"auto"``, ``"always"`` or ``"never"``.
+    """
+    if not isinstance(page, RawPage):
+        raise TypeError(f"page must be a RawPage, got {type(page).__name__}")
+    choice_str("ocr", ocr, _OCR_MODES)
+    width, height = page.geometry.width_pt, page.geometry.height_pt
+    boxes = tuple(image.bbox for image in page.images.images)
+    cover = _cover_fraction(boxes, width, height)
+    pieces = _classify(page.text.spans, width, height, boxes, cover)
+    route, warnings = _route(_text_char_count(pieces), cover, ocr)
+    return PageAssessment(
+        pieces=pieces,
+        quality=_quality(page, pieces),
+        route=route,
+        unmapped_regions=_unmapped_regions(pieces),
+        warnings=warnings,
+    )
+
+
+def _valid(char: str) -> bool:
+    """True unless ``char`` is U+FFFD, private use, unassigned or a lone surrogate."""
+    return char != _REPLACEMENT_CHAR and unicodedata.category(char) not in _INVALID_CATEGORIES
+
+
+def _quality(page: RawPage, pieces: tuple[SpanPiece, ...]) -> PageQuality:
+    """The page's quality signals; every span char, hidden or not, counts toward the ratio."""
+    texts = tuple(span.text for span in page.text.spans)
+    count = sum(len(text) for text in texts)
+    valid = sum(1 for text in texts for char in text if _valid(char))
+    return PageQuality(
+        valid_char_ratio=valid / count if count else None,
+        char_count=count,
+        vector_line_count=len(page.segments.segments),
+        hidden_spans_flagged=sum(1 for piece in pieces if piece.hidden_reasons),
+        rotation_deg=page.geometry.rotation_deg,
+        deskew_angle_deg=None,
+        ocr_mean_confidence=None,
+    )
+
+
+def _text_char_count(pieces: tuple[SpanPiece, ...]) -> int:
+    """The chars routing counts: valid, visible (in a piece with no reason) and not whitespace."""
+    visible = (piece.text for piece in pieces if not piece.hidden_reasons)
+    return sum(1 for text in visible for char in text if _valid(char) and not char.isspace())
+
+
+def _route(text_chars: int, cover: float, ocr: OcrMode) -> tuple[PageRoute, tuple[str, ...]]:
+    """The page's route and warnings, from its routing char count and raster cover (see the module notes)."""
+    if ocr == "always":
+        return "vision", ()
+    if text_chars < _MIN_TEXT_CHARS:
+        if ocr == "never":
+            count = f"{text_chars} valid, visible, non-whitespace chars (under {_MIN_TEXT_CHARS})"
+            return "digital", (f"ocr='never': the page has {count}; it stays digital instead of going to OCR",)
+        return "vision", ()
+    return ("hybrid" if cover > _OCR_LAYER_COVER else "digital"), ()
+
+
+def _unmapped_regions(pieces: tuple[SpanPiece, ...]) -> tuple[Box, ...]:
+    """The box of each invalid-char run in a visible piece, in piece order (hidden text is not OCR'd)."""
+    return tuple(region for piece in pieces if not piece.hidden_reasons for region in _invalid_runs(piece))
+
+
+def _invalid_runs(piece: SpanPiece) -> Iterator[Box]:
+    """Yield the union box of each maximal run of invalid chars in ``piece``."""
+    text, boxes = piece.span.text, piece.span.char_boxes
+    for invalid, run in groupby(range(piece.start, piece.end), key=lambda offset: not _valid(text[offset])):
+        if invalid:
+            offsets = tuple(run)
+            yield union_box(boxes[offsets[0] : offsets[-1] + 1])

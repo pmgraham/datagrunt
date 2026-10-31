@@ -24,7 +24,7 @@ from datagrunt.pdf.elements import BBox
 from datagrunt.pdf.pdfium_engine import RawImage, RawPage, RawSpan, extract_page, open_document
 from datagrunt.pdf.quality import SpanPiece, classify_spans, raster_cover_fraction
 from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf, solid_png
-from pdf_tests.test_pdfium_engine import imported_modules
+from pdf_tests.test_pdfium_engine import ENGINE_MODULES, imported_modules
 
 W, H = 400.0, 300.0
 SHA = "0" * 64
@@ -657,9 +657,14 @@ class TestModuleImports:
             "datagrunt.pdf._pdfium_text",
             "datagrunt.pdf._validate",
             "datagrunt.pdf.elements",
+            "datagrunt.pdf.pdfium_engine",  # for RawPage only
         }
 
         assert {name for name in imported_modules(quality) if name.startswith("datagrunt")} == allowed
+
+    @pytest.mark.parametrize("module", ENGINE_MODULES, ids=lambda module: module.__name__)
+    def test_the_engine_never_imports_quality(self, module):
+        assert "datagrunt.pdf.quality" not in imported_modules(module)
 
     def test_imports_no_private_name(self):
         tree = ast.parse(Path(quality.__file__).read_text(encoding="utf-8"))
@@ -671,13 +676,20 @@ class TestModuleImports:
         assert quality.check_hidden_reasons is elements.check_hidden_reasons
         assert not hasattr(elements, "_check_hidden_reasons")
 
+    def test_validates_routes_with_a1s_public_table(self):
+        assert quality.PAGE_ROUTES is elements.PAGE_ROUTES
+        assert elements.PAGE_ROUTES == ("digital", "hybrid", "vision")
+        assert not hasattr(elements, "_PAGE_ROUTES")
+
     def test_module_level_tables_are_immutable(self):
         mutable = (dict, list, set, bytearray)
         names = {name: value for name, value in vars(quality).items() if not name.startswith("__")}
 
         assert {name for name, value in names.items() if isinstance(value, mutable)} == set()
 
-    @pytest.mark.parametrize("name", ["SpanPiece", "classify_spans", "raster_cover_fraction"])
+    @pytest.mark.parametrize(
+        "name", ["SpanPiece", "classify_spans", "raster_cover_fraction", "OcrMode", "PageAssessment", "assess_page"]
+    )
     def test_not_exported(self, name):
         assert name not in datagrunt.pdf.__all__
         assert not hasattr(datagrunt.pdf, name)
