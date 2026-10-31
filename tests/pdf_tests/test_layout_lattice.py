@@ -1,7 +1,10 @@
 """Tests for the v5 vector-lattice table pass (#367, A4a).
 
 Unit tests build RawSegment and SpanPiece values directly: boxes are
-displayed, top-left ``(x0, y0, x1, y1)`` points.
+displayed, top-left ``(x0, y0, x1, y1)`` points. End-to-end tests build PDFs
+with the ReportLab toolkit (``pdf_tests.builders``), whose coordinates are
+top-left points in the unrotated page space, and read them through
+``extract_page``, ``assess_page`` and ``find_lattice_tables``.
 """
 
 import dataclasses
@@ -14,8 +17,10 @@ import pytest
 from datagrunt.pdf import layout, quality
 from datagrunt.pdf._path_segments import RawSegment
 from datagrunt.pdf.elements import BBox
-from datagrunt.pdf.layout import LatticeCell, LatticeResult, LatticeTable
-from datagrunt.pdf.quality import SpanPiece
+from datagrunt.pdf.layout import LatticeCell, LatticeResult, LatticeTable, find_lattice_tables
+from datagrunt.pdf.pdfium_engine import extract_page, open_document
+from datagrunt.pdf.quality import SpanPiece, assess_page
+from pdf_tests.builders import FormXObject, Line, PageSpec, Rect, TextRun, build_pdf
 from pdf_tests.test_pdfium_engine import ENGINE_MODULES, imported_modules
 from pdf_tests.test_quality import raw_span
 
@@ -754,3 +759,237 @@ class TestCellText:
 
         # Components come in order of their first horizontal rule: the outer grid's (y 0) first.
         assert got == [["", "", "out", ""], ["in", "", "", ""]]
+
+
+def read_tables(tmp_path, *items, rotate: int = 0) -> LatticeResult:
+    """find_lattice_tables over page 1 of a 400 x 300 pt PDF of ``items``, through extract_page and assess_page."""
+    path = build_pdf(tmp_path / "page.pdf", [PageSpec(width=400.0, height=300.0, items=items, rotate=rotate)])
+    page = extract_page(open_document(path), 0)
+    return find_lattice_tables(page.segments.segments, assess_page(page).pieces)
+
+
+def rules(xs, ys, *, width: float = 0.5) -> tuple[Line, ...]:
+    """Stroked rules at ``xs`` (vertical) and ``ys`` (horizontal), each across the whole grid."""
+    across = tuple(Line(xs[0], y, xs[-1], y, width=width) for y in ys)
+    return across + tuple(Line(x, ys[0], x, ys[-1], width=width) for x in xs)
+
+
+def filled_rules(xs, ys) -> tuple[Rect, ...]:
+    """The same rules drawn as 1 pt thin filled rectangles, centred on the grid lines."""
+    across = tuple(Rect(xs[0], y - 0.5, xs[-1] - xs[0], 1.0, fill_rgb=(0.0, 0.0, 0.0), stroke=False) for y in ys)
+    return across + tuple(Rect(x - 0.5, ys[0], 1.0, ys[-1] - ys[0], fill_rgb=(0.0, 0.0, 0.0), stroke=False) for x in xs)
+
+
+def written(texts, xs, ys, **overrides) -> tuple[TextRun, ...]:
+    """Each non-empty text in its grid cell, 5 pt in from its left rule and 14 pt down from its top rule."""
+    return tuple(
+        TextRun(text, xs[col] + 5.0, ys[row] + 14.0, **overrides)
+        for row, line in enumerate(texts)
+        for col, text in enumerate(line)
+        if text
+    )
+
+
+def shape(result: LatticeResult):
+    """Each table as ``(rounded bbox, grid, has_header)``: pdfium points are 32-bit floats."""
+    return [
+        (tuple(round(value, 2) for value in (t.bbox.x0, t.bbox.y0, t.bbox.x1, t.bbox.y1)), t.grid(), t.has_header)
+        for t in result.tables
+    ]
+
+
+def spans_of(table: LatticeTable):
+    """Each cell as ``(row, col, row_span, col_span, text)``."""
+    return [(item.row, item.col, item.row_span, item.col_span, item.text) for item in table.cells]
+
+
+XS, YS = (50.0, 150.0, 250.0, 350.0), (40.0, 60.0, 80.0, 100.0)
+SPEC = (("Part", "Qty", "Price"), ("Bolt", "4", "0.10"), ("Nut", "12", "0.05"))
+SPEC_GRID = (("Part", "Qty", "Price"), ("Bolt", "4", "0.10"), ("Nut", "12", "0.05"))
+
+
+class TestFindLatticeTables:
+    """Ruled tables found end to end: extract_page's segments and assess_page's pieces."""
+
+    def test_a_ruled_3_x_3_grid_is_one_table(self, tmp_path):
+        result = read_tables(tmp_path, *rules(XS, YS), *written(SPEC, XS, YS))
+
+        assert shape(result) == [((50.0, 40.0, 350.0, 100.0), SPEC_GRID, True)]
+        assert (result.tables[0].n_rows, result.tables[0].n_cols) == (3, 3)
+        first = result.tables[0].cells[0].bbox
+        assert tuple(round(value, 2) for value in (first.x0, first.y0, first.x1, first.y1)) == (50.0, 40.0, 150.0, 60.0)
+
+    def test_thin_filled_rectangles_rule_a_table(self, tmp_path):
+        result = read_tables(tmp_path, *filled_rules(XS, YS), *written(SPEC, XS, YS))
+
+        assert shape(result) == [((50.0, 40.0, 350.0, 100.0), SPEC_GRID, True)]
+
+    def test_a_header_across_the_columns_is_one_cell_spanning_them(self, tmp_path):
+        items = [Line(XS[0], y, XS[-1], y) for y in YS] + [Line(x, YS[0], x, YS[-1]) for x in (XS[0], XS[-1])]
+        items += [Line(x, YS[1], x, YS[-1]) for x in XS[1:-1]]
+        texts_ = (("Fasteners", "", ""), ("Bolt", "4", "0.10"), ("Nut", "12", "0.05"))
+
+        result = read_tables(tmp_path, *items, *written(texts_, XS, YS))
+
+        table = result.tables[0]
+        assert spans_of(table)[0] == (0, 0, 1, 3, "Fasteners")
+        assert table.grid() == (("Fasteners", "", ""), ("Bolt", "4", "0.10"), ("Nut", "12", "0.05"))
+        assert table.has_header is False
+
+    def test_a_cell_down_two_rows_spans_them(self, tmp_path):
+        items = [Line(XS[0], y, XS[-1], y) for y in (YS[0], YS[1], YS[-1])] + [Line(XS[1], YS[2], XS[-1], YS[2])]
+        items += [Line(x, YS[0], x, YS[-1]) for x in XS]
+        texts_ = (("Part", "Qty", "Price"), ("Bolt", "4", "0.10"), ("", "12", "0.05"))
+
+        result = read_tables(tmp_path, *items, *written(texts_, XS, YS))
+
+        assert spans_of(result.tables[0])[3] == (1, 0, 2, 1, "Bolt")
+        assert result.tables[0].grid() == (("Part", "Qty", "Price"), ("Bolt", "4", "0.10"), ("", "12", "0.05"))
+
+    def test_a_cell_of_two_lines_reads_them_joined_by_a_space(self, tmp_path):
+        ys = (40.0, 60.0, 100.0)
+        items = rules(XS[:3], ys) + written((("Part", "Note"),), XS, ys)
+        items += (TextRun("Hex bolt,", 55.0, 74.0), TextRun("zinc plated", 55.0, 88.0), TextRun("M8", 155.0, 74.0))
+
+        result = read_tables(tmp_path, *items)
+
+        assert result.tables[0].grid() == (("Part", "Note"), ("Hex bolt, zinc plated", "M8"))
+
+    def test_text_crossing_a_cell_border_splits_and_is_used_once(self, tmp_path):
+        # One text object across the column rule at x 150: each char goes to the cell holding its centre.
+        items = rules(XS[:3], YS) + written((("Left", "Right"), ("a", "b")), XS, YS)
+        items += (TextRun("ABCDEFGHIJKL", 100.0, 94.0),)
+
+        result = read_tables(tmp_path, *items)
+
+        left, right = result.tables[0].grid()[2]
+        assert left + right == "ABCDEFGHIJKL"
+        assert left and right
+        crossing = [piece for piece in result.used_pieces if piece.span.text == "ABCDEFGHIJKL"]
+        assert [(piece.start, piece.end) for piece in crossing] == [(0, 12)]
+
+    def test_a_table_in_a_scaled_form_xobject_is_found_at_its_page_position(self, tmp_path):
+        xs, ys = (0.0, 60.0, 120.0), (0.0, 20.0, 40.0)
+        form = FormXObject(
+            40.0, 30.0, 120.0, 40.0, items=rules(xs, ys) + written((("A1", "B1"), ("A2", "B2")), xs, ys), scale=1.5
+        )
+
+        result = read_tables(tmp_path, form)
+
+        assert shape(result) == [((40.0, 30.0, 220.0, 90.0), (("A1", "B1"), ("A2", "B2")), True)]
+
+    @pytest.mark.parametrize("rotate", [90, 270])
+    def test_a_table_turned_by_rotate_reads_in_the_order_it_was_written(self, tmp_path, rotate):
+        # v4 parity (#391): /Rotate turns the table on the displayed page; its cells still read as written.
+        result = read_tables(tmp_path, *rules(XS, YS), *written(SPEC, XS, YS), rotate=rotate)
+
+        assert [table.grid() for table in result.tables] == [SPEC_GRID]
+        assert result.tables[0].has_header is True
+
+    def test_a_table_upside_down_reads_in_display_order(self, tmp_path):
+        # Known limitation: pdfium's boxes cannot tell upside-down text from right-to-left text (both
+        # advance leftward), so /Rotate 180 reads the displayed grid; each cell's text stays as written.
+        result = read_tables(tmp_path, *rules(XS, YS), *written(SPEC, XS, YS), rotate=180)
+
+        assert result.tables[0].grid() == tuple(tuple(reversed(row)) for row in reversed(SPEC_GRID))
+
+    def test_a_page_border_frame_is_no_table_and_uses_no_text(self, tmp_path):
+        items = (Rect(10.0, 10.0, 380.0, 280.0), TextRun("Inside the frame", 50.0, 50.0))
+
+        assert read_tables(tmp_path, *items) == LatticeResult(tables=(), used_pieces=())
+
+    def test_an_empty_ruled_grid_is_decoration(self, tmp_path):
+        assert read_tables(tmp_path, *rules(XS[:3], YS[:3])) == LatticeResult(tables=(), used_pieces=())
+
+    def test_two_tables_come_top_to_bottom(self, tmp_path):
+        lower_ys = (200.0, 220.0, 240.0)
+        items = rules(XS[:3], lower_ys) + written((("Low", "er"), ("x", "y")), XS, lower_ys)
+        items += rules(XS[:3], YS[:3]) + written((("Up", "per"), ("p", "q")), XS, YS)
+
+        result = read_tables(tmp_path, *items)
+
+        assert [table.grid()[0] for table in result.tables] == [("Up", "per"), ("Low", "er")]
+
+    def test_hidden_text_in_a_cell_stays_out_of_the_table(self, tmp_path):
+        items = rules(XS[:3], YS[:3]) + written((("Name", "Value"), ("a", "1")), XS, YS)
+        items += (TextRun("secret", 160.0, 74.0, render_mode=3),)
+
+        result = read_tables(tmp_path, *items)
+
+        assert result.tables[0].grid() == (("Name", "Value"), ("a", "1"))
+        assert "secret" not in [piece.text for piece in result.used_pieces]
+
+    def test_used_pieces_are_the_cells_text_and_nothing_outside(self, tmp_path):
+        items = (TextRun("Parts list", 50.0, 30.0),) + rules(XS[:3], YS[:3])
+        items += written((("Name", "Value"), ("a", "1")), XS, YS)
+
+        result = read_tables(tmp_path, *items)
+
+        assert [piece.text for piece in result.used_pieces] == ["Name", "Value", "a", "1"]
+        assert all(piece.hidden_reasons == () for piece in result.used_pieces)
+
+    def test_a_blank_header_cell_means_no_header(self, tmp_path):
+        result = read_tables(tmp_path, *rules(XS[:3], YS[:3]), *written((("Name", ""), ("a", "1")), XS, YS))
+
+        assert result.tables[0].has_header is False
+
+
+def cell_rectangles(count: int, size: float) -> tuple[RawSegment, ...]:
+    """A ``count`` x ``count`` table drawn as one stroked rectangle per cell: four sides each."""
+    segments = []
+    for row in range(count):
+        for col in range(count):
+            x0, y0 = 10.0 + col * size, 10.0 + row * size
+            segments += [
+                h(y0, x0, x0 + size),
+                h(y0 + size, x0, x0 + size),
+                v(x0, y0, y0 + size),
+                v(x0 + size, y0, y0 + size),
+            ]
+    return tuple(segments)
+
+
+class TestFindLatticeTablesBounds:
+    """A page of ~15 000 segments takes under 1 s; the arguments are checked."""
+
+    def test_a_60_x_60_table_drawn_cell_by_cell_with_text_in_every_cell(self):
+        segments = cell_rectangles(60, 12.0)
+        pieces = tuple(
+            chars("x", 13.0 + col * 12.0, 11.0 + row * 12.0, height=10.0) for row in range(60) for col in range(60)
+        )
+
+        started = time.perf_counter()
+        result = find_lattice_tables(segments, pieces)
+        elapsed = time.perf_counter() - started
+
+        assert len(segments) == 14_400
+        assert [(table.n_rows, table.n_cols) for table in result.tables] == [(60, 60)]
+        assert len(result.used_pieces) == 3_600
+        assert elapsed < 1.0, f"{elapsed:.2f} s"
+
+    def test_a_dashed_mesh_of_15_000_segments(self):
+        segments = tuple(dashed_mesh())
+
+        started = time.perf_counter()
+        result = find_lattice_tables(segments, ())
+        elapsed = time.perf_counter() - started
+
+        assert result == LatticeResult(tables=(), used_pieces=())
+        assert elapsed < 1.0, f"{elapsed:.2f} s"
+
+    @pytest.mark.parametrize(
+        "segments,pieces,error,message",
+        [
+            pytest.param([h(1.0, 0.0, 20.0)], (), TypeError, "segments must be a tuple, got list", id="segments-list"),
+            pytest.param((), ("text",), TypeError, "pieces[0] must be a SpanPiece, got str", id="pieces-str"),
+        ],
+    )
+    def test_invalid_argument_raises(self, segments, pieces, error, message):
+        with pytest.raises(error, match=f"^{re.escape(message)}$"):
+            find_lattice_tables(segments, pieces)
+
+    def test_a_piece_passed_twice_raises(self):
+        piece = chars("x", 10.0, 10.0)
+
+        with pytest.raises(ValueError, match=r"^pieces\[1\] is pieces\[0\] again: each piece is the page's text once$"):
+            find_lattice_tables((), (piece, piece))

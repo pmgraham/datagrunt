@@ -4,6 +4,24 @@ Internal: not exported from ``datagrunt`` or ``datagrunt.pdf``. Pure: it
 reads the engine's segments (:class:`~datagrunt.pdf._path_segments.RawSegment`)
 and A3's span pieces (:class:`~datagrunt.pdf.quality.SpanPiece`) and calls
 no pdfium function. Boxes are displayed, top-left ``(x0, y0, x1, y1)`` points.
+
+The lattice pass (:func:`find_lattice_tables`, spec §3.3 step 3, Pass A)
+builds ruled tables from a page's segments and puts each visible char in
+the cell holding its box centre. Its :class:`LatticeResult` names the text
+the tables used, so the stream pass (A4b, #368) lays out only the rest;
+element ids and reading order come there too, so the tables are
+intermediate :class:`LatticeTable` values.
+
+Known limitations (each a fact this pure pass cannot see):
+
+- Clip paths are not applied to segments (A2): a rule clipped away rules.
+- Every segment rules, whatever its colour, alpha or dash (v4's
+  pdfplumber and the A0 prototype read every edge): a white, transparent
+  or dotted rule rules a table as a black one does.
+- A table drawn upside down reads in display order: pdfium's boxes cannot
+  tell upside-down text from right-to-left text.
+- A cell that is not a rectangle (an L, or the U around a box touching a
+  cell border) leaves its whole grid to the stream pass.
 """
 
 import math
@@ -19,7 +37,7 @@ from datagrunt.pdf._validate import int_at_least, typed_tuple
 from datagrunt.pdf.elements import BBox
 from datagrunt.pdf.quality import SpanPiece
 
-__all__ = ["LatticeCell", "LatticeResult", "LatticeTable"]
+__all__ = ["LatticeCell", "LatticeResult", "LatticeTable", "find_lattice_tables"]
 
 # Lines this close snap to one position, join end to end, and meet (spec §3.3 Pass A).
 SNAP_PT = 2.0
@@ -195,6 +213,71 @@ class LatticeResult:
                 )
 
 
+def find_lattice_tables(segments: tuple[RawSegment, ...], pieces: tuple[SpanPiece, ...]) -> LatticeResult:
+    """The page's ruled tables and the visible text they hold (spec §3.3 step 3, Pass A).
+
+    1. Rules: every segment, snapped (positions within :data:`SNAP_PT`
+       chain to their mean) and merged along each position across gaps of
+       at most :data:`SNAP_PT` (:func:`_snapped_lines`).
+    2. Components: rules crossing within :data:`SNAP_PT`, grouped by a
+       sweep line and union-find (:func:`_components`).
+    3. Grids: a component's positions cut it into units; units joined
+       across absent edges are one cell, which spans rows or columns. No
+       table when a cell is not a rectangle or the grid has fewer than 2
+       rows or 2 columns (:func:`_grid`).
+    4. Text: each visible char goes to the cell holding its box centre
+       (in the smallest grid holding it), so a piece crossing a cell
+       border splits at its chars; a cell's text reads line by line
+       (:func:`_cell_text`). A grid whose every cell is blank is
+       decoration, not a table.
+
+    A table whose text all advances one way down or up the page (one
+    turned by /Rotate 90 or 270, or drawn turned) reads as it was written:
+    its rows run along that text's lines (v4 parity, #391). Text advancing
+    leftward reads as displayed: pdfium's boxes cannot tell upside-down
+    text from right-to-left text.
+
+    Tables come in the order of their top rules: top to bottom, then left
+    to right.
+
+    Cost: O(n log n + I) for n segments and I crossings, plus O(X Y) per
+    component of X by Y positions, plus O(chars x G + chars log(X + Y))
+    for G grids near each piece.
+
+    Args:
+        segments: The page's segments (``PageSegments.segments``).
+        pieces: The page's pieces (``PageAssessment.pieces``); hidden ones
+            never enter a table.
+
+    Raises:
+        TypeError: If ``segments`` is not a tuple of RawSegment or
+            ``pieces`` is not a tuple of SpanPiece.
+        ValueError: If a piece is passed twice.
+    """
+    typed_tuple("segments", segments, RawSegment)
+    typed_tuple("pieces", pieces, SpanPiece)
+    _check_distinct(pieces)
+    found = (_grid(*group) for group in _components(*_snapped_lines(segments)))
+    grids = [grid for grid in found if grid is not None]
+    tables: list[LatticeTable] = []
+    used: list[_Run] = []
+    for grid, cell_runs in zip(grids, _cell_runs(grids, pieces)):
+        table = _table(grid, cell_runs)
+        if table is not None:
+            tables.append(table)
+            used.extend(run for runs in cell_runs for run in runs)
+    return LatticeResult(tables=tuple(tables), used_pieces=_used_pieces(used, pieces))
+
+
+def _check_distinct(pieces: tuple[SpanPiece, ...]) -> None:
+    """Require each piece object once: a piece is a run of the page's text, which is read once."""
+    seen: dict[int, int] = {}
+    for index, item in enumerate(pieces):
+        first = seen.setdefault(id(item), index)
+        if first != index:
+            raise ValueError(f"pieces[{index}] is pieces[{first}] again: each piece is the page's text once")
+
+
 class _Line(NamedTuple):
     """A snapped, merged rule: its position across its axis, and where it starts and ends along it."""
 
@@ -254,10 +337,10 @@ def _merged(position: float, extents: list[tuple[float, float]]) -> list[_Line]:
     return lines
 
 
-Component = tuple[list[_Line], list[_Line]]
+_Component = tuple[list[_Line], list[_Line]]
 
 
-def _components(horizontal: list[_Line], vertical: list[_Line]) -> list[Component]:
+def _components(horizontal: list[_Line], vertical: list[_Line]) -> list[_Component]:
     """The groups of rules connected by crossings, each as its horizontal and vertical rules.
 
     Two rules cross when each reaches the other's position within
@@ -271,7 +354,7 @@ def _components(horizontal: list[_Line], vertical: list[_Line]) -> list[Componen
     groups = _UnionFind(len(horizontal) + len(vertical))
     for h_index, v_index in _crossings(horizontal, vertical):
         groups.union(h_index, len(horizontal) + v_index)
-    members: dict[int, Component] = {}
+    members: dict[int, _Component] = {}
     for index, line in enumerate(horizontal):
         members.setdefault(groups.find(index), ([], []))[0].append(line)
     for index, line in enumerate(vertical):
@@ -634,3 +717,51 @@ def _run_text(run: _Run) -> str:
     inside = breaks[bisect_right(breaks, run.start) : bisect_left(breaks, run.end)]
     bounds = (run.start, *inside, run.end)
     return " ".join(span.text[start:end] for start, end in zip(bounds, bounds[1:]))
+
+
+def _table(grid: _Grid, cell_runs: list[list[_Run]]) -> LatticeTable | None:
+    """A grid's table, read in its text's turn, or None if every cell is blank (decoration)."""
+    turn = _reading_turn([run for runs in cell_runs for run in runs], _ACROSS)
+    texts = [_cell_text(runs, turn) for runs in cell_runs]
+    if not any(text.strip() for text in texts):
+        return None
+    n_rows, n_cols, positions = _grid_positions(tuple(_turned(box, turn) for box in grid.boxes))
+    cells = sorted(zip(positions, grid.boxes, texts))
+    x0, y0, x1, y1 = _extent(grid)
+    return LatticeTable(
+        bbox=BBox(x0=x0, y0=y0, x1=x1, y1=y1),
+        n_rows=n_rows,
+        n_cols=n_cols,
+        cells=tuple(
+            LatticeCell(row=row, col=col, row_span=rows, col_span=cols, bbox=_bbox(box), text=text)
+            for (row, col, rows, cols), box, text in cells
+        ),
+    )
+
+
+def _bbox(box: Box) -> BBox:
+    """A1's BBox of a box."""
+    return BBox(x0=box[0], y0=box[1], x1=box[2], y1=box[3])
+
+
+def _used_pieces(runs: list[_Run], pieces: tuple[SpanPiece, ...]) -> tuple[SpanPiece, ...]:
+    """The char ranges ``runs`` cover, as visible pieces: per piece in order, maximal and in char order."""
+    ranges: dict[int, list[tuple[int, int]]] = {}
+    for run in runs:
+        ranges.setdefault(id(run.piece), []).append((run.start, run.end))
+    used = []
+    for piece in pieces:
+        for start, end in _joined(sorted(ranges.get(id(piece), []))):
+            used.append(SpanPiece(span=piece.span, start=start, end=end, hidden_reasons=()))
+    return tuple(used)
+
+
+def _joined(extents: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Sorted, disjoint ``(start, end)`` char ranges with touching ones joined."""
+    joined: list[tuple[int, int]] = []
+    for start, end in extents:
+        if joined and joined[-1][1] == start:
+            joined[-1] = (joined[-1][0], end)
+        else:
+            joined.append((start, end))
+    return joined
