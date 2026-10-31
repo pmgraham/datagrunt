@@ -211,6 +211,20 @@ def test_legacy_dominant_size_empty_returns_default():
     assert text_block_builder.legacy_dominant_size([], 0) == 0
 
 
+class _NoCountList(list):
+    """A list whose ``count`` fails: one ``count`` per distinct value is quadratic."""
+
+    def count(self, value):
+        raise AssertionError("legacy_dominant_size must count in one pass, not call list.count")
+
+
+def test_legacy_dominant_size_counts_in_one_pass_with_the_same_pick():
+    # Many distinct sizes in one line/block made the old key=sizes.count
+    # O(n * distinct); counting once keeps the same set-order pick in O(n).
+    for sizes in [*_TIED_SIZES, [9.0, 11.0, 9.0, 11.0, 11.0], [float(n) for n in range(5000)]]:
+        assert text_block_builder.legacy_dominant_size(_NoCountList(sizes), 0.0) == _legacy_size_pick(sizes)
+
+
 def test_dominant_font_breaks_ties_by_first_occurrence():
     for values in _rotations(_TIED_FONTS):
         assert TextBlockBuilder._dominant_font(values) == values[0]

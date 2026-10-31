@@ -39,11 +39,14 @@ def legacy_dominant_size(sizes: list, default):
     Deliberately NOT first occurrence. Float hashes are not seeded, so this
     pick was always the same in every process; it is kept so 4.x output (block
     merging, classification, ``font_size``) stays unchanged. Only font-name
-    ties moved to first occurrence (#389). v5 replaces this code.
+    ties moved to first occurrence (#389). v5 replaces this code. The counts
+    come from one pass (``key=sizes.count`` was O(n x distinct sizes)); ``max``
+    still walks the same set in the same order, so the pick is the same.
     """
     if not sizes:
         return default
-    return max(set(sizes), key=sizes.count)
+    counts = Counter(sizes)
+    return max(set(sizes), key=counts.__getitem__)
 
 
 def page_median_size(all_sizes: list) -> float | None:
