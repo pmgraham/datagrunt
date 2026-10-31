@@ -598,6 +598,19 @@ class TestXYCut:
         assert cut([]) == []
 
 
+def inked(text: str, x: float, y: float, *, height: float = 12.0, bearing: float = 1.0, rise: float = 2.0) -> SpanPiece:
+    """A visible piece of ``text`` in 6 pt advances from ``(x, y)``, ``height`` tall; its tight boxes are each glyph's
+    ink, ``bearing`` in from both sides of its advance and ``rise`` in from its top and bottom."""
+    loose = chars(text, x, y, height=height).span.char_boxes
+    tight = tuple((x0 + bearing, y0 + rise, x1 - bearing, y1 - rise) for x0, y0, x1, y1 in loose)
+    return chars(text, x, y, height=height, tight_boxes=tight)
+
+
+def block_lines(blocks) -> list[list[str]]:
+    """Each block's line texts."""
+    return [[found.text for found in item.lines] for item in blocks]
+
+
 class TestTextBlocks:
     """Blocks in reading order, end to end: columns read in turn, lines merged into paragraphs as v4 merged them."""
 
@@ -691,6 +704,50 @@ class TestTextBlocks:
             [piece.text for piece in left],
             [piece.text for piece in right],
         ]
+
+    def test_a_gutter_is_measured_between_glyphs_not_their_advances(self):
+        # The left lines' advances end at 144 and the right column's start at 155: 11 pt, no gutter. Their glyphs
+        # (tight boxes) sit 1 pt in from each side of their advances: 13 pt of ink-free gutter, as v4 measured it.
+        left = tuple(inked("abcdefghijklmnopqrstuvwx", 0.0, 14.0 * row) for row in range(3))
+        right = tuple(inked("ABCDEFGHIJKLMNOPQRSTUVWX", 155.0, 14.0 * row) for row in range(3))
+
+        blocks = text_blocks(left + right, NO_TABLES)
+
+        assert block_lines(blocks) == [[piece.text for piece in left], [piece.text for piece in right]]
+
+    def test_lines_set_solid_under_a_spanning_heading_join_its_band_only_if_their_ink_does(self):
+        # Boxes 13.4 pt tall (an 11 pt font's ascent to descent) at a 12 pt pitch overlap, so each column's first
+        # line would start inside the heading's band and read across the columns with it; their ink (2 pt in
+        # from top and bottom) does not overlap.
+        heading = inked("A HEADING OVER BOTH COLUMNS OF THE PAGE AND MORE", 0.0, 0.0, height=13.4)
+        left = tuple(inked(f"left column line {row}", 0.0, 12.0 * (row + 1), height=13.4) for row in range(4))
+        right = tuple(inked(f"right column line {row}", 180.0, 12.0 * (row + 1), height=13.4) for row in range(4))
+
+        blocks = text_blocks((heading, *left, *right), NO_TABLES)
+
+        assert block_lines(blocks) == [[heading.text], [piece.text for piece in left], [piece.text for piece in right]]
+
+    def test_columns_closer_than_12_pt_between_advances_read_in_turn_when_their_ink_is_not(self, tmp_path):
+        # The left lines end in "1" and the right ones start with it: a tabular figure, narrower than its
+        # advance by a side bearing at each edge. Their advances leave 10 pt; their ink over 12 pt.
+        size, pitch, left_x = 20.0, 24.0, 72.0
+        left = ("Rule 1.1", "Rule 2.1", "Rule 3.1")
+        right_x = after(left[0], left_x, size=size) + 10.0
+        right = ("1st apple", "1st pear", "1st plum")
+        page, pieces = page_of(
+            tmp_path,
+            *column(left, left_x, 100.0, pitch=pitch, size=size),
+            *column(right, right_x, 100.0, pitch=pitch, size=size),
+        )
+
+        # The glyphs come from the font pdfium substitutes for Helvetica, which differs by platform: the
+        # fixture holds only while the ink gutter is at least 13 pt wide.
+        ends = [piece.span.tight_boxes[piece.end - 1][2] for piece in pieces if piece.span.text in left]
+        starts = [piece.span.tight_boxes[piece.start][0] for piece in pieces if piece.span.text in right]
+        assert min(starts) - max(ends) >= 13.0
+        blocks = text_blocks(pieces, find_lattice_tables(page.segments.segments, pieces))
+
+        assert block_texts(blocks) == [" ".join(left), " ".join(right)]
 
     def test_invalid_arguments_raise_as_for_text_lines(self):
         with pytest.raises(TypeError, match=r"^lattice must be a LatticeResult, got NoneType$"):

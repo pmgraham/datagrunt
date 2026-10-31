@@ -1216,9 +1216,10 @@ def text_blocks(pieces: tuple[SpanPiece, ...], lattice: LatticeResult) -> tuple[
     The runs of :func:`text_lines` (its step 1) are cut into reading-order
     segments by v4's XY-cut (:func:`_xy_cut`) in the frame of the page's
     turn, so columns read in turn and a heading spanning them reads first.
-    The cut reads each run's ink: the boxes of its non-whitespace chars, as
-    v4's glyph bounds did, so a run's trailing space does not narrow the
-    gutter after it.
+    The cut reads each run's ink (:func:`_ink_box`) on both axes, as v4's
+    glyph bounds did: gutters, spanning, column sides and bands. Lines,
+    joins, cells and the paragraph merge keep the loose boxes, as the
+    lattice pass does.
 
     Each segment's runs make lines as :func:`text_lines` makes them, and
     its lines merge into paragraphs by v4's rule (:func:`_paragraphs`).
@@ -1248,9 +1249,18 @@ def text_blocks(pieces: tuple[SpanPiece, ...], lattice: LatticeResult) -> tuple[
 
 
 def _ink_box(run: _Run) -> Box:
-    """The union of the boxes of a run's non-whitespace chars (a stream run has one: none is whitespace only)."""
+    """Where a run's ink is: the union of its non-whitespace chars' tight boxes (a stream run has one).
+
+    Tight boxes are pdfium's glyph bounds (``RawSpan.tight_boxes``), whose
+    union for a text object is the object bounds v4's XY-cut measured.
+    Loose boxes run each glyph's full advance, a side bearing past its ink
+    at each edge, and the font's ascent to descent, so they narrow a
+    gutter (by 1 to 2 pt on the corpus) and make lines set solid overlap.
+    A whitespace char draws no ink: pdfium stands in its advance along the
+    baseline, and a trailing space would narrow the gutter after it.
+    """
     span = run.piece.span
-    return union_box(tuple(span.char_boxes[at] for at in range(run.start, run.end) if not span.text[at].isspace()))
+    return union_box(tuple(span.tight_boxes[at] for at in range(run.start, run.end) if not span.text[at].isspace()))
 
 
 # An XY-cut region: its items (indices into the boxes) and its depth; None for a segment already read.
@@ -1280,9 +1290,6 @@ def _xy_cut(boxes: list[Box], weights: list[int]) -> list[list[int]]:
     - v4's: each line spanning the gutter is a band of its own, so a
       full-width paragraph above or between columns reads in order but
       as one block per line.
-    - v5's boxes are pdfium's advance boxes, up to a side bearing wider at
-      each edge than the glyph bounds v4 measured: a gutter v4 found at
-      12 or 13 pt can measure 11 here, and its region stays one segment.
     """
     segments: list[list[int]] = []
     stack: list[_Region] = [(list(range(len(boxes))), 0)] if boxes else []
