@@ -13,6 +13,7 @@ import pickle
 import random
 import re
 import time
+import zlib
 from pathlib import Path
 
 import pytest
@@ -75,12 +76,12 @@ def raw_span(text: str = "Abcd", boxes=None, **overrides) -> RawSpan:
 
 
 def image(bbox, **overrides) -> RawImage:
-    """A valid RawImage drawn into ``bbox``."""
+    """A valid RawImage drawn into ``bbox``: 1000 x 750 px, a scan's resolution (180 ppi over the page)."""
     fields = {
         "bbox": bbox,
-        "px_width": 8,
-        "px_height": 8,
-        "declared_px": (8, 8),
+        "px_width": 1000,
+        "px_height": 750,
+        "declared_px": (1000, 750),
         "object_index": 1,
         "raw_sha256": SHA,
         "filters": ("FlateDecode",),
@@ -352,6 +353,49 @@ class TestInvisible:
         tiny_ocr = raw_span(render_mode=3, font_size_pt=0.5)
 
         assert reasons_of(transparent, tiny_ocr, images=(FULL_BLEED,)) == [("transparent",), ("tiny_font",)]
+
+
+class TestScanLikeCover:
+    """Only images drawn at 50 ppi or more on each side are raster cover: the scan an OCR layer lies on."""
+
+    @pytest.mark.parametrize(
+        "px,counts",
+        [
+            pytest.param((1, 1), False, id="1x1-stretched"),
+            pytest.param((8, 8), False, id="8x8"),
+            pytest.param((0, 0), False, id="unknown-size"),
+            pytest.param((250, 0), False, id="unknown-height"),
+            # A gradient drawn as one row of pixels stretched over the page.
+            pytest.param((1000, 1), False, id="gradient-row"),
+            pytest.param((250, 200), True, id="exactly-50-ppi"),
+            pytest.param((249, 200), False, id="just-under-across"),
+            pytest.param((250, 199), False, id="just-under-down"),
+            pytest.param((2500, 2000), True, id="500-ppi"),
+        ],
+    )
+    def test_the_ocr_layer_exemption_needs_a_scan_like_image(self, px, counts):
+        # 360 x 288 pt is 5 x 4 in, 86 % of the page: 250 x 200 px is 50 ppi each way.
+        drawn = image((0.0, 0.0, 360.0, 288.0), px_width=px[0], px_height=px[1], declared_px=px)
+
+        assert reasons_of(raw_span(render_mode=3), images=(drawn,)) == [() if counts else ("invisible",)]
+
+    def test_a_quarter_turned_scan_pairs_its_pixel_sides_with_the_other_box_sides(self):
+        # 200 x 250 px shown 5 x 4 in, as a quarter-turned page or image shows a 4 x 5 in scan: 50 ppi.
+        turned = image((0.0, 0.0, 360.0, 288.0), px_width=200, px_height=250, declared_px=(200, 250))
+
+        assert reasons_of(raw_span(render_mode=3), images=(turned,)) == [()]
+
+    def test_low_resolution_images_add_no_cover_to_a_scan(self):
+        # A scan of the left 40 % of the page and a 1 x 1 px image over the rest: 40 % scan cover.
+        scan = image((0.0, 0.0, 160.0, H))
+        stretched = image((160.0, 0.0, W, H), px_width=1, px_height=1, declared_px=(1, 1))
+
+        assert reasons_of(raw_span(render_mode=3, boxes=row(4, 20.0)), images=(scan, stretched)) == [("invisible",)]
+
+    def test_raster_cover_fraction_still_counts_every_image(self):
+        stretched = image((0.0, 0.0, W, H), px_width=1, px_height=1, declared_px=(1, 1))
+
+        assert raster_cover_fraction((stretched,), W, H) == 1.0
 
 
 class TestTinyFont:
@@ -649,7 +693,8 @@ class TestRasterCoverFraction:
             raster_cover_fraction(*args)
 
 
-PNG = solid_png(8, 8, (1.0, 1.0, 1.0))
+# A blank scan: 400 x 300 px is 72 ppi over the 400 x 300 pt page (scan-like: 50 ppi or more each way).
+PNG = solid_png(400, 300, (1.0, 1.0, 1.0))
 
 
 def classified(tmp_path: Path, *items, rotate: int = 0) -> tuple[tuple[SpanPiece, ...], RawPage]:
@@ -691,6 +736,40 @@ class TestThroughExtractPage:
         pieces, _ = classified(tmp_path, TextRun("Scan", x=72.0, y=100.0, render_mode=3))
 
         assert texts(pieces) == [("Scan", ("invisible",))]
+
+    def test_render_mode_3_over_a_stretched_1_px_image_is_invisible(self, tmp_path):
+        pieces, raw = classified(
+            tmp_path,
+            RasterImage(0.0, 0.0, W, H, solid_png(1, 1, (1.0, 1.0, 1.0))),
+            TextRun("Scan", x=72.0, y=100.0, render_mode=3),
+        )
+
+        assert (raw.images.images[0].px_width, raw.images.stats.max_cover_fraction) == (1, 1.0)
+        assert texts(pieces) == [("Scan", ("invisible",))]
+
+    def test_ocr_layer_over_a_scan_on_a_quarter_turned_page_is_visible(self, tmp_path):
+        # The page shows a 300 x 225 px scan of 400 x 300 pt (54 ppi) as 300 x 400 pt: unpaired with the turned
+        # box, its 225 px would be 40 ppi over 400 pt.
+        scan = RasterImage(0.0, 0.0, W, H, solid_png(300, 225, (1.0, 1.0, 1.0)))
+
+        pieces, raw = classified(tmp_path, scan, TextRun("Scan", x=72.0, y=100.0, render_mode=3), rotate=90)
+
+        assert raw.images.images[0].bbox == pytest.approx((0.0, 0.0, H, W))
+        assert texts(pieces) == [("Scan", ())]
+
+    def test_a_clip_path_is_not_applied_to_a_scan(self, tmp_path):
+        # Known limitation: a scan clipped away entirely still lies under the OCR layer.
+        pixels = zlib.compress(bytes(400 * 300))
+        scan = b"<< /Type /XObject /Subtype /Image /Width 400 /Height 300 /ColorSpace /DeviceGray"
+        scan += b" /BitsPerComponent 8 /Filter /FlateDecode /Length %d >>\nstream\n%s\nendstream" % (
+            len(pixels),
+            pixels,
+        )
+        content = b"q 0 0 0 0 re W n 400 0 0 300 0 0 cm /Im Do Q BT /F1 12 Tf 3 Tr 72 100 Td (Scan) Tj ET"
+
+        pieces = classified_page(content_page(tmp_path, content, extra=(scan,), resources=b"/XObject << /Im 6 0 R >>"))
+
+        assert texts(pieces) == [("Scan", ())]
 
     def test_render_mode_3_over_a_small_image_is_invisible(self, tmp_path):
         pieces, _ = classified(

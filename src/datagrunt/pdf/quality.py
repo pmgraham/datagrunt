@@ -16,9 +16,16 @@ char of every span, in order, cut into pieces that carry the A1
   a char partly past an edge is off the page, and every piece not flagged
   ``off_page`` lies within the page as A1's ``Page`` requires.
 - ``invisible``: render mode 3 or 7 (no paint), unless the char lies over
-  raster cover: the page's union image cover (:func:`raster_cover_fraction`)
-  is over 50 % and the char's centre is inside some image's box. That is a
-  searchable scan's OCR layer, which a reader sees as the scan.
+  raster cover: the union cover (:func:`raster_cover_fraction`) of the
+  page's scan-like images is over 50 % and the char's centre is inside one
+  of their boxes. That is a searchable scan's OCR layer, which a reader sees
+  as the scan. An image is scan-like when it is drawn at 50 ppi or more on
+  each side: its pixel width and height over its displayed box's sides in
+  inches, each pixel side paired with either box side (a quarter-turned page
+  or image swaps them; the better pairing counts). An image of unknown pixel
+  size is not scan-like, nor is a 1 x 1 px image stretched over the page.
+  Clip paths, soft masks and image masks are not applied: a scan clipped
+  away still counts.
 - ``tiny_font``: a font size under 1 pt in magnitude (a negative ``Tf``
   draws mirrored glyphs at its magnitude).
 - ``transparent``: an alpha of at most 12 of 255 (under 5 %; pdfium rounds
@@ -52,8 +59,9 @@ task 2).
 - Routing counts the valid, visible (no hidden reason), non-whitespace
   chars. ``ocr="always"`` routes vision. Under 20 routes vision, or digital
   with a warning under ``ocr="never"``. 20 or more on a page whose raster
-  cover is over 50 % routes hybrid (OCR fills the unmapped regions), or
-  digital under ``ocr="never"``; else digital.
+  cover (of scan-like images, as for ``invisible``) is over 50 % routes
+  hybrid (OCR fills the unmapped regions), or digital under
+  ``ocr="never"``; else digital.
 - Unmapped regions: the box of each maximal run of invalid chars in a
   visible piece, where OCR (A5) reads what the text layer cannot say.
 
@@ -104,6 +112,9 @@ _OCR_MODES: tuple[OcrMode, ...] = get_args(OcrMode)
 _FILL_MODES = frozenset({0, 2, 4, 6})
 _STROKE_MODES = frozenset({1, 2, 5, 6})
 _NO_PAINT_MODES = frozenset({3, 7})
+# An image drawn at this many pixels per inch or more on each side can be a scan; points per inch.
+_MIN_SCAN_PPI = 50.0
+_POINTS_PER_INCH = 72.0
 # A channel painted at this alpha (of 255) or less is too faint to read: under 5 %. Fill and stroke alike.
 _FAINT_ALPHA = 12
 # Raster cover over this fraction of the page makes no-paint text over it an
@@ -182,7 +193,7 @@ def classify_spans(
     typed_tuple("spans", spans, RawSpan)
     typed_tuple("images", images, RawImage)
     width, height = positive_float("width_pt", width_pt), positive_float("height_pt", height_pt)
-    boxes = tuple(image.bbox for image in images)
+    boxes = _scan_boxes(images)
     return _classify(spans, width, height, boxes, _cover_fraction(boxes, width, height))
 
 
@@ -192,6 +203,22 @@ def _classify(
     """:func:`classify_spans` of checked input, given the raster ``cover`` of the image ``boxes``."""
     raster = boxes if cover > _OCR_LAYER_COVER else ()
     return tuple(piece for span in spans for piece in _span_pieces(span, width, height, raster))
+
+
+def _scan_boxes(images: tuple[RawImage, ...]) -> tuple[Box, ...]:
+    """The boxes of the scan-like images among ``images``: raster cover (see the module notes)."""
+    return tuple(image.bbox for image in images if _scan_like(image))
+
+
+def _scan_like(image: RawImage) -> bool:
+    """True if ``image`` is drawn at 50 ppi or more on each side, its pixel sides paired with either box side."""
+    width, height = image.px_width, image.px_height
+    if width <= 0 or height <= 0:
+        return False
+    x0, y0, x1, y1 = image.bbox
+    # Pixels per inch at least 50: px >= 50 x (points / 72), kept in multiplication (a side may be 0 pt).
+    across, down = _MIN_SCAN_PPI * (x1 - x0) / _POINTS_PER_INCH, _MIN_SCAN_PPI * (y1 - y0) / _POINTS_PER_INCH
+    return (width >= across and height >= down) or (width >= down and height >= across)
 
 
 def _transparent(span: RawSpan) -> bool:
@@ -241,7 +268,8 @@ def raster_cover_fraction(images: tuple[RawImage, ...], width_pt: float, height_
     ``(0, 0, width_pt, height_pt)`` and overlaps count once (a scan drawn
     in strips covers the page though no strip covers half of it). Every
     image counts, an oversized or unsized one included: it is still
-    raster. A rotated image counts as its axis-aligned box, an
+    raster (the OCR-layer exemption and the hybrid route count only the
+    scan-like ones; see the module notes). A rotated image counts as its axis-aligned box, an
     over-estimate of its painted area. O(n log n) in the image count n: a
     sweep over x with a segment tree over the compressed y edges.
 
@@ -409,7 +437,7 @@ def assess_page(page: RawPage, *, ocr: OcrMode = "auto", recovered: RecoveredTex
     choice_str("ocr", ocr, _OCR_MODES)
     _check_recovered(recovered, page.text.stats.dropped_text_objects)
     width, height = page.geometry.width_pt, page.geometry.height_pt
-    boxes = tuple(image.bbox for image in page.images.images)
+    boxes = _scan_boxes(page.images.images)
     cover = _cover_fraction(boxes, width, height)
     pieces = _classify(page.text.spans, width, height, boxes, cover)
     flagged = _recovered_pieces(recovered, width, height, boxes, cover)

@@ -452,6 +452,13 @@ class TestHybrid:
 
         assert assess(letters(24), images=(mostly_off,)).route == "digital"
 
+    @pytest.mark.parametrize("px", [(1, 1), (8, 8), (0, 0)], ids=["1x1", "8x8", "unknown"])
+    def test_a_low_resolution_image_is_not_a_scan(self, px):
+        # A 1 x 1 px image stretched over the page is no scan: the page is digital, not hybrid.
+        stretched = image((0.0, 0.0, W, H), px_width=px[0], px_height=px[1], declared_px=px)
+
+        assert assess(letters(24), images=(stretched,)).route == "digital"
+
     def test_too_little_text_over_a_scan_is_vision(self):
         assert assess(letters(19), images=(FULL_BLEED,)).route == "vision"
 
