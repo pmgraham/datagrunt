@@ -353,6 +353,16 @@ class TestDocumentHandle:
         with pytest.raises(TypeError, match=re.escape("pdf must be a pypdfium2 PdfDocument, got str")):
             DocumentHandle("doc.pdf")
 
+    def test_refuses_a_document_with_no_pages(self):
+        # pypdfium2 itself makes a zero-page document (PdfDocument.new()); the
+        # handle refuses it, so page_count is always at least 1.
+        pdf = pdfium.PdfDocument.new()
+        try:
+            with pytest.raises(ValueError, match=re.escape("pdf has no pages: a DocumentHandle needs at least one")):
+                DocumentHandle(pdf)
+        finally:
+            pdf.close()
+
     def test_dropping_the_last_reference_closes_without_gc(self, tmp_path, gc_disabled):
         path = three_pages(tmp_path)
         before = open_pdfium_documents()

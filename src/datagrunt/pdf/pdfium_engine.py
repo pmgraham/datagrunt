@@ -300,8 +300,11 @@ class DocumentHandle:
     def __init__(self, pdf: pdfium.PdfDocument) -> None:
         if not isinstance(pdf, pdfium.PdfDocument):
             raise TypeError(f"pdf must be a pypdfium2 PdfDocument, got {type(pdf).__name__}")
+        page_count = len(pdf)
+        if page_count < 1:
+            raise ValueError("pdf has no pages: a DocumentHandle needs at least one")
         self._pdf = pdf
-        self._page_count: int = len(pdf)
+        self._page_count: int = page_count
 
     @property
     def closed(self) -> bool:
@@ -310,7 +313,7 @@ class DocumentHandle:
 
     @property
     def page_count(self) -> int:
-        """Number of pages; pypdfium2 refuses to open a document with none."""
+        """Number of pages, at least 1: the handle refuses a document with none."""
         self._require_open()
         return self._page_count
 
