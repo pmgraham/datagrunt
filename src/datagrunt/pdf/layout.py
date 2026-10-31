@@ -10,7 +10,9 @@ builds ruled tables from a page's segments and puts each visible char in
 the cell holding its box centre. Its :class:`LatticeResult` names the text
 the tables used, so the stream pass (A4b, #368) lays out only the rest;
 element ids and reading order come there too, so the tables are
-intermediate :class:`LatticeTable` values.
+intermediate :class:`LatticeTable` values. Its work per page is bounded
+(:data:`MAX_CROSSINGS`, :data:`MAX_GRID_UNITS`, :data:`MAX_GRIDS`): what a
+bound leaves out keeps its text for the stream pass, and the result says so.
 
 Known limitations (each a fact this pure pass cannot see):
 
@@ -33,7 +35,7 @@ from typing import NamedTuple
 
 from datagrunt.pdf._path_segments import Box, RawSegment
 from datagrunt.pdf._pdfium_common import union_box
-from datagrunt.pdf._validate import int_at_least, typed_tuple
+from datagrunt.pdf._validate import int_at_least, strict_bool, typed_tuple
 from datagrunt.pdf.elements import BBox
 from datagrunt.pdf.quality import SpanPiece
 
@@ -44,6 +46,17 @@ SNAP_PT = 2.0
 
 # A table has at least this many rows and columns of cells (v4's drop_layout_tables minimum).
 _MIN_GRID = 2
+
+# Page bounds: a hostile page cannot make the pass quadratic. Nothing is dropped: a component left
+# out keeps its text for the stream pass, and LatticeResult counts it so the caller can warn. The
+# corpus (data/pdfs, 95 pages) peaks at 674 crossings, a 201-unit component (422 units on the page)
+# and 3 grids on a page; its largest table is 34 grid positions.
+# Grid units a page may build, all components together: a 500 x 500 grid.
+MAX_GRID_UNITS = 250_000
+# Crossings the sweep may report on a page: twice the 251 001 of a full 500 x 500 grid.
+MAX_CROSSINGS = 500_000
+# Grids a page may build: every visible piece is checked against each.
+MAX_GRIDS = 100
 
 # A run joins a line when they overlap across it by this share of the smaller height (spec §3.3 Pass B).
 _LINE_OVERLAP = 0.45
@@ -198,10 +211,18 @@ class LatticeResult:
         used_pieces: The char ranges of visible pieces whose chars lie in a
             table's cells, as pieces of the same spans: A4b lays out only
             the rest of the page's text.
+        skipped_grids: Components left out, their text to the stream pass,
+            because they would pass the page's :data:`MAX_GRID_UNITS` or
+            :data:`MAX_GRIDS`: a warning for the page.
+        crossing_cap_reached: True when the page's rules cross more than
+            :data:`MAX_CROSSINGS` times: the sweep stopped, so the page has
+            no lattice tables and all its text goes to the stream pass.
     """
 
     tables: tuple[LatticeTable, ...]
     used_pieces: tuple[SpanPiece, ...]
+    skipped_grids: int = 0
+    crossing_cap_reached: bool = False
 
     def __post_init__(self) -> None:
         typed_tuple("tables", self.tables, LatticeTable)
@@ -211,6 +232,9 @@ class LatticeResult:
                 raise ValueError(
                     f"used_pieces[{index}] is hidden ({item.hidden_reasons!r}): hidden text never enters a table"
                 )
+        int_at_least("skipped_grids", self.skipped_grids, 0)
+        if strict_bool("crossing_cap_reached", self.crossing_cap_reached) and (self.tables or self.used_pieces):
+            raise ValueError("a page past the crossing cap has no lattice tables and uses no text")
 
 
 def find_lattice_tables(segments: tuple[RawSegment, ...], pieces: tuple[SpanPiece, ...]) -> LatticeResult:
@@ -240,9 +264,14 @@ def find_lattice_tables(segments: tuple[RawSegment, ...], pieces: tuple[SpanPiec
     Tables come in the order of their top rules: top to bottom, then left
     to right.
 
-    Cost: O(n log n + I) for n segments and I crossings, plus O(X Y) per
-    component of X by Y positions, plus O(chars x G + chars log(X + Y))
-    for G grids near each piece.
+    Bounds, per page: the sweep stops past :data:`MAX_CROSSINGS`
+    crossings (the page then has no lattice tables); components build
+    grids in order while their units (X - 1) x (Y - 1), for X vertical and
+    Y horizontal positions, fit the :data:`MAX_GRID_UNITS` left and fewer
+    than :data:`MAX_GRIDS` grids are built; any other is left out, its
+    text kept for the stream pass, and counted. So the cost is
+    O(n log n + MAX_CROSSINGS + MAX_GRID_UNITS + pieces x MAX_GRIDS +
+    chars x (G + log(X + Y))) for n segments and the G grids near a piece.
 
     Args:
         segments: The page's segments (``PageSegments.segments``).
@@ -257,8 +286,10 @@ def find_lattice_tables(segments: tuple[RawSegment, ...], pieces: tuple[SpanPiec
     typed_tuple("segments", segments, RawSegment)
     typed_tuple("pieces", pieces, SpanPiece)
     _check_distinct(pieces)
-    found = (_grid(*group) for group in _components(*_snapped_lines(segments)))
-    grids = [grid for grid in found if grid is not None]
+    groups = _components(*_snapped_lines(segments))
+    if groups is None:
+        return LatticeResult(tables=(), used_pieces=(), crossing_cap_reached=True)
+    grids, skipped = _bounded_grids(groups)
     tables: list[LatticeTable] = []
     used: list[_Run] = []
     for grid, cell_runs in zip(grids, _cell_runs(grids, pieces)):
@@ -266,7 +297,7 @@ def find_lattice_tables(segments: tuple[RawSegment, ...], pieces: tuple[SpanPiec
         if table is not None:
             tables.append(table)
             used.extend(run for runs in cell_runs for run in runs)
-    return LatticeResult(tables=tuple(tables), used_pieces=_used_pieces(used, pieces))
+    return LatticeResult(tables=tuple(tables), used_pieces=_used_pieces(used, pieces), skipped_grids=skipped)
 
 
 def _check_distinct(pieces: tuple[SpanPiece, ...]) -> None:
@@ -340,7 +371,7 @@ def _merged(position: float, extents: list[tuple[float, float]]) -> list[_Line]:
 _Component = tuple[list[_Line], list[_Line]]
 
 
-def _components(horizontal: list[_Line], vertical: list[_Line]) -> list[_Component]:
+def _components(horizontal: list[_Line], vertical: list[_Line]) -> list[_Component] | None:
     """The groups of rules connected by crossings, each as its horizontal and vertical rules.
 
     Two rules cross when each reaches the other's position within
@@ -348,11 +379,15 @@ def _components(horizontal: list[_Line], vertical: list[_Line]) -> list[_Compone
     components of that relation (union-find). A group without both
     orientations rules no cell and is left out. Groups come in order of
     their first horizontal rule, each with its rules in input order.
-    O((H + V) log(H + V) + I) for H horizontal and V vertical rules with
-    I crossings (union-find is near-constant per crossing).
+    None when the rules cross more than :data:`MAX_CROSSINGS` times: the
+    sweep stops at the first crossing past it. O((H + V) log(H + V) + I)
+    for H horizontal and V vertical rules with I <= MAX_CROSSINGS + 1
+    crossings read (union-find is near-constant per crossing).
     """
     groups = _UnionFind(len(horizontal) + len(vertical))
-    for h_index, v_index in _crossings(horizontal, vertical):
+    for count, (h_index, v_index) in enumerate(_crossings(horizontal, vertical), 1):
+        if count > MAX_CROSSINGS:
+            return None
         groups.union(h_index, len(horizontal) + v_index)
     members: dict[int, _Component] = {}
     for index, line in enumerate(horizontal):
@@ -412,6 +447,34 @@ class _Grid(NamedTuple):
     boxes: tuple[Box, ...]
 
 
+def _bounded_grids(groups: list[_Component]) -> tuple[list[_Grid], int]:
+    """The components' grids, in order, within the page's bounds, and how many components were left out.
+
+    A component is left out when its units would pass the
+    :data:`MAX_GRID_UNITS` the page has left, or :data:`MAX_GRIDS` grids
+    are built; one built (or rejected by :func:`_grid`) spends its units.
+    """
+    grids: list[_Grid] = []
+    skipped, budget = 0, MAX_GRID_UNITS
+    for horizontal, vertical in groups:
+        units = _unit_count(horizontal, vertical)
+        if units > budget or len(grids) >= MAX_GRIDS:
+            skipped += 1
+            continue
+        budget -= units
+        grid = _grid(horizontal, vertical)
+        if grid is not None:
+            grids.append(grid)
+    return grids, skipped
+
+
+def _unit_count(horizontal: list[_Line], vertical: list[_Line]) -> int:
+    """The units a component's grid would have: (X - 1) x (Y - 1) for its X vertical and Y horizontal positions."""
+    across = len({line.position for line in vertical}) - 1
+    down = len({line.position for line in horizontal}) - 1
+    return max(across, 0) * max(down, 0)
+
+
 def _grid(horizontal: list[_Line], vertical: list[_Line]) -> _Grid | None:
     """The cells one component's rules close, or None if they rule no table.
 
@@ -425,7 +488,7 @@ def _grid(horizontal: list[_Line], vertical: list[_Line]) -> _Grid | None:
     columns (a frame, or one row or column of boxes: v4's
     ``drop_layout_tables`` minimum); a position that bounds no cell is no
     grid line. O(X Y + R log X Y) for X vertical and Y horizontal
-    positions and R rules.
+    positions and R rules: :func:`_bounded_grids` bounds X Y per page.
     """
     xs = tuple(sorted({line.position for line in vertical}))
     ys = tuple(sorted({line.position for line in horizontal}))

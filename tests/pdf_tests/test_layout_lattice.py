@@ -304,6 +304,21 @@ class TestLatticeResult:
                 "used_pieces[1] is hidden (('invisible',)): hidden text never enters a table",
                 id="hidden",
             ),
+            pytest.param(
+                {"skipped_grids": -1}, ValueError, "skipped_grids must be >= 0, got -1", id="skipped-negative"
+            ),
+            pytest.param(
+                {"skipped_grids": True}, TypeError, "skipped_grids must be an int, got True (bool)", id="s-bool"
+            ),
+            pytest.param(
+                {"crossing_cap_reached": 1}, TypeError, "crossing_cap_reached must be a bool, got 1 (int)", id="cap-int"
+            ),
+            pytest.param(
+                {"crossing_cap_reached": True, "used_pieces": (used(),)},
+                ValueError,
+                "a page past the crossing cap has no lattice tables and uses no text",
+                id="cap-with-text",
+            ),
         ],
     )
     def test_invalid_field_raises(self, overrides, error, message):
@@ -993,3 +1008,91 @@ class TestFindLatticeTablesBounds:
 
         with pytest.raises(ValueError, match=r"^pieces\[1\] is pieces\[0\] again: each piece is the page's text once$"):
             find_lattice_tables((), (piece, piece))
+
+
+def comb_pair(teeth: int, *, x: float = 0.0, y: float = 0.0) -> list[RawSegment]:
+    """Two combs joined at ``(x, y)``: one component of ``teeth`` x ``teeth`` grid units from 2 x teeth + 2 rules.
+
+    A rule along the top crossed by ``teeth`` short vertical teeth 3 pt apart, and a rule down the left
+    crossed by ``teeth`` short horizontal teeth: few crossings, but every tooth is a grid position.
+    """
+    span = 3.0 * teeth
+    segments = [h(y, x, x + span), v(x, y, y + span)]
+    segments += [v(x + 3.0 * (i + 1), y - 6.0, y + 6.0) for i in range(teeth)]
+    segments += [h(y + 3.0 * (i + 1), x - 6.0, x + 6.0) for i in range(teeth)]
+    return segments
+
+
+def small_table(x: float, y: float, label: str) -> tuple[list[RawSegment], tuple[SpanPiece, ...]]:
+    """A ruled 2 x 2 table of 40 x 20 pt cells at ``(x, y)`` with ``label`` in its first cell."""
+    return ruled_grid((x, x + 40.0, x + 80.0), (y, y + 20.0, y + 40.0)), (chars(label, x + 2.0, y + 4.0),)
+
+
+class TestPageBounds:
+    """A hostile page cannot make the pass quadratic: what passes a page bound is left to the stream pass."""
+
+    def test_the_bounds(self):
+        # The corpus (data/pdfs, 95 pages) peaks at 674 crossings, a 201-unit component and 3 grids on a page.
+        assert (layout.MAX_GRID_UNITS, layout.MAX_CROSSINGS, layout.MAX_GRIDS) == (250_000, 500_000, 100)
+
+    def test_a_component_over_the_grid_unit_budget_is_no_table_and_keeps_its_text(self):
+        # 601 x 601 positions from 1 202 rules: 360 000 units, over the 250 000 a page may build.
+        table_segments, table_pieces = small_table(3000.0, 3000.0, "kept")
+        inside = chars("comb text", 100.0, 100.0)
+
+        result = find_lattice_tables((*comb_pair(600), *table_segments), (inside, *table_pieces))
+
+        assert [table.grid() for table in result.tables] == [(("kept", ""), ("", ""))]
+        assert result.skipped_grids == 1
+        assert [piece.text for piece in result.used_pieces] == ["kept"]
+        assert result.crossing_cap_reached is False
+
+    def test_the_grid_unit_budget_is_per_page(self, monkeypatch):
+        # Two 30 x 30 = 900-unit components against a 1 000-unit page: the second is left out, and the
+        # small table after it (4 units) still fits.
+        monkeypatch.setattr(layout, "MAX_GRID_UNITS", 1_000)
+        # Far apart: positions within 2 pt chain-snap across components, which would merge the combs' teeth.
+        table_segments, table_pieces = small_table(1000.0, 1000.0, "fits")
+        segments = (*comb_pair(30), *comb_pair(30, x=500.0, y=500.0), *table_segments)
+
+        result = find_lattice_tables(segments, table_pieces)
+
+        assert [table.grid() for table in result.tables] == [(("fits", ""), ("", ""))]
+        assert result.skipped_grids == 1
+
+    def test_a_page_builds_at_most_max_grids_grids(self, monkeypatch):
+        monkeypatch.setattr(layout, "MAX_GRIDS", 2)
+        built = [small_table(10.0, 10.0 + 100.0 * index, f"t{index}") for index in range(3)]
+
+        result = find_lattice_tables(
+            tuple(item for segments, _ in built for item in segments),
+            tuple(item for _, pieces in built for item in pieces),
+        )
+
+        assert [table.grid()[0][0] for table in result.tables] == ["t0", "t1"]
+        assert result.skipped_grids == 1
+        assert [piece.text for piece in result.used_pieces] == ["t0", "t1"]
+
+    @pytest.mark.parametrize(
+        "cap,found", [pytest.param(16, True, id="at-the-cap"), pytest.param(15, False, id="past-it")]
+    )
+    def test_past_max_crossings_the_page_has_no_lattice_tables(self, monkeypatch, cap, found):
+        # A 3 x 3 grid's 4 + 4 rules cross 16 times.
+        monkeypatch.setattr(layout, "MAX_CROSSINGS", cap)
+        segments = ruled_grid((0.0, 40.0, 80.0, 120.0), (0.0, 20.0, 40.0, 60.0))
+
+        result = find_lattice_tables(tuple(segments), (chars("x", 2.0, 2.0),))
+
+        assert (len(result.tables), result.crossing_cap_reached) == ((1, False) if found else (0, True))
+        assert len(result.used_pieces) == (1 if found else 0)
+
+    def test_a_page_past_max_crossings_stops_the_sweep_at_the_cap(self):
+        # 710 x 710 full-length rules cross 504 100 times; the sweep stops at 500 001.
+        segments = ruled_grid(tuple(3.0 * index for index in range(710)), tuple(3.0 * index for index in range(710)))
+
+        started = time.perf_counter()
+        result = find_lattice_tables(tuple(segments), ())
+        elapsed = time.perf_counter() - started
+
+        assert result == LatticeResult(tables=(), used_pieces=(), skipped_grids=0, crossing_cap_reached=True)
+        assert elapsed < 1.0, f"{elapsed:.2f} s"
