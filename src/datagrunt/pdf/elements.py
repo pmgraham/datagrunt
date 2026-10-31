@@ -137,8 +137,16 @@ def _parse_element_id(name: str, value: object) -> tuple[int, int]:
     return page, index
 
 
-def _check_hidden_reasons(value: object) -> None:
-    """Require unique, known hidden reasons in ``HIDDEN_REASONS`` order."""
+def check_hidden_reasons(value: object) -> None:
+    """Require unique, known hidden reasons in ``HIDDEN_REASONS`` order.
+
+    The one rule for every ``hidden_reasons`` field: elements here, and the
+    v5 quality stage's span pieces (:mod:`datagrunt.pdf.quality`).
+
+    Raises:
+        TypeError: If ``value`` is not a tuple of str.
+        ValueError: If a reason is unknown, repeated, or out of canonical order.
+    """
     reasons = str_tuple("hidden_reasons", value)
     unknown = [reason for reason in reasons if reason not in HIDDEN_REASONS]
     if unknown:
@@ -525,7 +533,7 @@ class _Element:
         if not isinstance(self.bbox, BBox):
             raise TypeError(f"bbox must be a BBox, got {type(self.bbox).__name__}")
         str_tuple("scope_path", self.scope_path)
-        _check_hidden_reasons(self.hidden_reasons)
+        check_hidden_reasons(self.hidden_reasons)
         self._validate_fields()
 
     def _validate_fields(self) -> None:
