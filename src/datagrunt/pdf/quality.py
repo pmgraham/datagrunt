@@ -15,8 +15,11 @@ char of every span, in order, cut into pieces that carry the A1
   :meth:`~datagrunt.pdf.elements.BBox.within` rule and default tolerance, so
   a char partly past an edge is off the page, and every piece not flagged
   ``off_page`` lies within the page as A1's ``Page`` requires.
-- ``invisible``: render mode 3 or 7 (no paint), unless the char lies over
-  raster cover: the union cover (:func:`raster_cover_fraction`) of the
+- ``invisible``: render mode 3 (no paint), or 7 (no paint, glyphs added to
+  the clip) unless a later path, image or shading overlaps it
+  (``RawSpan.painted_over``: its paint shows through the glyphs, as
+  gradient-filled text is drawn), and unless the char lies over raster
+  cover: the union cover (:func:`raster_cover_fraction`) of the
   page's scan-like images is over 50 % and the char's centre is inside one
   of their boxes. That is a searchable scan's OCR layer, which a reader sees
   as the scan. An image is scan-like when it is drawn at 50 ppi or more on
@@ -245,7 +248,8 @@ def _over_raster(box: Box, raster: tuple[Box, ...]) -> bool:
 
 def _span_pieces(span: RawSpan, width: float, height: float, raster: tuple[Box, ...]) -> Iterator[SpanPiece]:
     """Yield ``span``'s pieces: maximal runs of chars with equal hidden reasons."""
-    no_paint = span.render_mode in _NO_PAINT_MODES
+    # Clip-only text a later object paints through shows its glyphs (gradient text).
+    no_paint = span.render_mode in _NO_PAINT_MODES and not span.painted_over
     under = _overlapping(span.bbox, raster) if no_paint else ()
     flagged = dict.fromkeys(em_reasons(span.em_width_pt, abs(span.font_size_pt)), True)
     flagged["transparent"] = _transparent(span)

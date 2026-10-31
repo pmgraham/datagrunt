@@ -71,6 +71,7 @@ def raw_span(text: str = "Abcd", boxes=None, **overrides) -> RawSpan:
         "object_index": 0,
         "generated_breaks": (),
         "map_errors": (),
+        "painted_over": False,
     }
     return RawSpan(**(fields | overrides))
 
@@ -310,6 +311,13 @@ class TestInvisible:
     @pytest.mark.parametrize("mode", [3, 7])
     def test_no_paint_modes_are_invisible(self, mode):
         assert reasons_of(raw_span(render_mode=mode)) == [("invisible",)]
+
+    def test_clip_only_text_painted_over_is_visible(self):
+        # Gradient text: a later fill paints through the glyphs' clip.
+        assert reasons_of(raw_span(render_mode=7, painted_over=True)) == [()]
+
+    def test_clip_only_text_painted_over_keeps_its_other_reasons(self):
+        assert reasons_of(raw_span(render_mode=7, painted_over=True, font_size_pt=0.5)) == [("tiny_font",)]
 
     @pytest.mark.parametrize("mode", [0, 1, 2, 4, 5, 6])
     def test_painting_modes_are_visible(self, mode):
@@ -770,6 +778,20 @@ class TestThroughExtractPage:
         pieces = classified_page(content_page(tmp_path, content, extra=(scan,), resources=b"/XObject << /Im 6 0 R >>"))
 
         assert texts(pieces) == [("Scan", ())]
+
+    @pytest.mark.parametrize(
+        "after,expected",
+        [
+            pytest.param(b"0 0.3 0.8 rg 0 0 400 300 re f", (), id="gradient-text"),
+            pytest.param(b"", ("invisible",), id="nothing-painted"),
+        ],
+    )
+    def test_clip_only_text_is_visible_where_a_later_fill_paints_through_it(self, tmp_path, after, expected):
+        content = b"q BT /F1 24 Tf 7 Tr 30 150 Td (Quarterly revenue up 12 percent) Tj ET %s Q" % after
+
+        pieces = classified_page(content_page(tmp_path, content))
+
+        assert texts(pieces) == [("Quarterly revenue up 12 percent", expected)]
 
     def test_render_mode_3_over_a_small_image_is_invisible(self, tmp_path):
         pieces, _ = classified(

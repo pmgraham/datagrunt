@@ -57,7 +57,8 @@ text does and lies on it, so no text a reader sees is counted away and no
 hidden copy hides behind a visible one:
 
 - It looks the same: the same render mode, fill and stroke colours and
-  alphas, em reasons and placement reasons (``off_page``: both within the
+  alphas, em reasons, painted-over fact (``RawSpan.painted_over``, for
+  clip-only text) and placement reasons (``off_page``: both within the
   page, or both not; :func:`off_page`).
 - Its origin lies within that text's duplicate window on each displayed
   axis: 0.9 of the size of its last char's box (the glyph's advance by the
@@ -83,7 +84,7 @@ import pypdfium2.raw as pdfium_c
 
 from datagrunt.pdf._path_segments import Matrix
 from datagrunt.pdf._pdfium_common import Box, PdfiumFailure, object_address, union_box
-from datagrunt.pdf._pdfium_text import PageText, RawSpan, em_size
+from datagrunt.pdf._pdfium_text import CLIP_ONLY_MODE, PageText, RawSpan, em_size, render_mode
 from datagrunt.pdf._validate import int_at_least, typed_tuple
 from datagrunt.pdf.elements import BBox, HiddenReason, check_hidden_reasons
 
@@ -140,8 +141,8 @@ class RecoveryStats:
     Attributes:
         overprint_duplicates: Objects whose recovered text equals an earlier
             text object's (owned or recovered) that looks the same (render
-            mode, fill and stroke colours and alphas, em and placement
-            reasons), at an origin within its duplicate window (0.9 of its
+            mode, fill and stroke colours and alphas, em reasons, painted
+            over, placement reasons), at an origin within its duplicate window (0.9 of its
             last char box's size on each displayed axis, 0.5 to 12 pt; see
             the module notes): a copy drawn on it (a drop shadow, fake
             bold), counted and not emitted. Any other copy is emitted.
@@ -204,7 +205,8 @@ class Target(NamedTuple):
     ``box`` (displayed) and ``origin`` (page space) are None when pdfium
     placed it at a non-finite position or size (its size and em width then
     read 0). ``empty`` is True when its box is still a point once moved and
-    laid out again.
+    laid out again. ``painted_over`` is ``RawSpan.painted_over`` where the
+    object was drawn (False unless it is clip-only text).
     """
 
     object_index: int
@@ -214,6 +216,7 @@ class Target(NamedTuple):
     em_width_pt: float
     hidden_reasons: tuple[HiddenReason, ...]
     empty: bool = False
+    painted_over: bool = False
 
 
 def is_glyphless(handle: pdfium_c.FPDF_PAGEOBJECT, matrix: Matrix, label: str) -> bool:
@@ -246,6 +249,24 @@ def _bounds(handle: pdfium_c.FPDF_PAGEOBJECT, label: str) -> Box:
     return left.value, bottom.value, right.value, top.value
 
 
+def page_bounds(handle: pdfium_c.FPDF_PAGEOBJECT, outer: Matrix, label: str) -> Box | None:
+    """The object's bounds in page space ``(left, bottom, right, top)``, or None if they are not finite.
+
+    pdfium's bounds are in the object's form's space; ``outer`` maps that
+    space to page space (IDENTITY off a form), and the box holds the four
+    corners it maps them to.
+
+    Raises:
+        PdfiumFailure: If a pdfium call fails.
+    """
+    left, bottom, right, top = _bounds(handle, label)
+    corners = [outer.apply(x, y) for x in (left, right) for y in (bottom, top)]
+    xs, ys = [corner[0] for corner in corners], [corner[1] for corner in corners]
+    if not all(math.isfinite(value) for value in (*xs, *ys)):
+        return None
+    return min(xs), min(ys), max(xs), max(ys)
+
+
 def _is_point(box: Box) -> bool:
     """True if ``box`` has no width and no height (pdfium's box of an object with no glyph extent)."""
     left, bottom, right, top = box
@@ -253,21 +274,29 @@ def _is_point(box: Box) -> bool:
 
 
 def isolate_dropped(
-    texts: Iterable[TextObject], dropped: frozenset[int], to_display: Callable[[Box], Box]
+    texts: Iterable[TextObject],
+    dropped: frozenset[int],
+    to_display: Callable[[Box], Box],
+    painted_over: Callable[[int], bool],
 ) -> tuple[Target, ...]:
     """Read each dropped object's original place and size, then move it where a textpage reads it.
 
     Bounded by the page's text objects; each dropped one gets the next place
     on the diagonal ``(100 k, -100 (k + 1))`` of its form's space.
+    ``painted_over`` (the walk's) is asked of clip-only objects before they
+    move.
 
     Raises:
         PdfiumFailure: If a pdfium call fails.
     """
     targets: list[Target] = []
     for text in texts:
-        if object_address(text.handle) not in dropped:
+        address = object_address(text.handle)
+        if address not in dropped:
             continue
         target = _original(text, to_display)
+        if render_mode(text.handle, f"object {text.object_index}") == CLIP_ONLY_MODE:
+            target = target._replace(painted_over=painted_over(address))
         if target.box is not None:
             _move(text, len(targets))
             target = target._replace(empty=_is_point(_bounds(text.handle, f"object {text.object_index}")))
@@ -279,21 +308,17 @@ def _original(text: TextObject, to_display: Callable[[Box], Box]) -> Target:
     """The dropped object ``text`` as pdfium placed it: its displayed box, origin, size, em width and reasons."""
     label = f"object {text.object_index}"
     size = _font_size(text.handle, label)
-    left, bottom, right, top = _bounds(text.handle, label)
+    box = page_bounds(text.handle, text.outer, label)
     matrix = text.own.then(text.outer)
-    # Bounds are in the form's space, as the object matrix is.
-    corners = [text.outer.apply(x, y) for x in (left, right) for y in (bottom, top)]
     width, height = em_size(size, matrix.a, matrix.b, matrix.c, matrix.d)
-    edges = (edge for corner in corners for edge in corner)
-    if not all(math.isfinite(value) for value in (*matrix, width, height, *edges)):
+    if box is None or not all(math.isfinite(value) for value in (*matrix, width, height)):
         return Target(
             object_index=text.object_index, origin=None, box=None, font_size_pt=0.0, em_width_pt=0.0, hidden_reasons=()
         )
-    xs, ys = [corner[0] for corner in corners], [corner[1] for corner in corners]
     return Target(
         object_index=text.object_index,
         origin=(matrix.e, matrix.f),
-        box=to_display((min(xs), min(ys), max(xs), max(ys))),
+        box=to_display(box),
         font_size_pt=math.copysign(height, size),
         em_width_pt=width,
         hidden_reasons=em_reasons(width, height),
@@ -364,7 +389,7 @@ def recovered_text(
             unrecovered += 1
             continue
         text = "".join(piece.text for piece in pieces)
-        look = _look(pieces[0], target.hidden_reasons, target.box, display)
+        look = _look(pieces[0], target.hidden_reasons, target.painted_over, target.box, display)
         copy = _Copy(_displayed(target.origin, display), _reach(target.box), look)
         if text.isspace():
             whitespace += 1
@@ -382,9 +407,10 @@ def recovered_text(
     return RecoveredText(spans=tuple(spans), stats=counts)
 
 
-# How a copy shows: render mode, fill and stroke colours with their alphas, em reasons, placement reasons.
+# How a copy shows: render mode, fill and stroke colours with their alphas, em reasons, painted over (clip-only
+# text), placement reasons.
 _Look = tuple[
-    int, tuple[int, int, int, int], tuple[int, int, int, int], tuple[HiddenReason, ...], tuple[HiddenReason, ...]
+    int, tuple[int, int, int, int], tuple[int, int, int, int], tuple[HiddenReason, ...], bool, tuple[HiddenReason, ...]
 ]
 
 
@@ -400,14 +426,15 @@ class _Copy(NamedTuple):
     look: _Look
 
 
-def _look(span: RawSpan, reasons: tuple[HiddenReason, ...], box: Box, display: Display) -> _Look:
-    """How ``span``'s object shows: its paint, the em ``reasons`` and the place reasons of its displayed ``box``.
+def _look(span: RawSpan, reasons: tuple[HiddenReason, ...], painted_over: bool, box: Box, display: Display) -> _Look:
+    """How ``span``'s object shows: its paint, its em ``reasons``, whether it is ``painted_over``, its place reasons.
 
-    The place reasons are ``off_page`` when ``box`` is not within the page
-    (A1's rule), so a copy past an edge never absorbs one on the page.
+    The place reasons are ``off_page`` when its displayed ``box`` is not
+    within the page (A1's rule), so a copy past an edge never absorbs one on
+    the page.
     """
     placement: tuple[HiddenReason, ...] = ("off_page",) if off_page(box, display.width_pt, display.height_pt) else ()
-    return span.render_mode, span.fill_rgba, span.stroke_rgba, reasons, placement
+    return span.render_mode, span.fill_rgba, span.stroke_rgba, reasons, painted_over, placement
 
 
 def _reach(box: Box) -> tuple[float, float]:
@@ -439,7 +466,7 @@ def _owned_copies(
     for index, own in _spans_by_object(spans, set(origins)).items():
         first = own[0]
         em = em_reasons(first.em_width_pt, abs(first.font_size_pt))
-        look = _look(first, em, union_box(tuple(span.bbox for span in own)), display)
+        look = _look(first, em, first.painted_over, union_box(tuple(span.bbox for span in own)), display)
         copy = _Copy(_displayed(origins[index], display), _reach(own[-1].char_boxes[-1]), look)
         printed.setdefault("".join(span.text for span in own), []).append(copy)
     return printed
@@ -478,5 +505,6 @@ def _placed(span: RawSpan, box: Box, target: Target) -> RecoveredSpan:
         char_boxes=(box,) * len(span.text),
         font_size_pt=target.font_size_pt,
         em_width_pt=target.em_width_pt,
+        painted_over=target.painted_over,
     )
     return RecoveredSpan(span=original, hidden_reasons=target.hidden_reasons)
