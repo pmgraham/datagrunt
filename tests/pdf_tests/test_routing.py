@@ -40,7 +40,7 @@ from datagrunt.pdf.pdfium_engine import (
 )
 from datagrunt.pdf.quality import OcrMode, PageAssessment, assess_page, classify_spans, raster_cover_fraction
 from pdf_tests.builders import Line, PageSpec, RasterImage, TextRun, build_pdf
-from pdf_tests.test_pdfium_spans import bfchar_cmap, cid_font_page, content_page
+from pdf_tests.test_pdfium_spans import OVERFLOW, bfchar_cmap, cid_font_page, content_page
 from pdf_tests.test_quality import FULL_BLEED, PNG, STRIPS, H, W, image, raw_span, row
 
 NEVER_WARNING = (
@@ -90,6 +90,7 @@ def raw_page(*spans, images=(), segments: int = 0, rotation: int = 0, dropped: i
         unicode_map_error_count=0,
         skipped_nonfinite_objects=0,
         dropped_text_objects=dropped,
+        empty_text_objects=0,
     )
     largest = max((raster_cover_fraction((item,), W, H) for item in images), default=0.0)
     image_stats = ImageStats(
@@ -755,9 +756,14 @@ def recovered_span(text: str, *, reasons=("tiny_font",), y: float = 200.0, **ove
     return RecoveredSpan(span=span, hidden_reasons=reasons)
 
 
-def recovery(*spans: RecoveredSpan, overprint: int = 0, whitespace: int = 0, unrecovered: int = 0) -> RecoveredText:
+def recovery(
+    *spans: RecoveredSpan, overprint: int = 0, whitespace: int = 0, empty: int = 0, unrecovered: int = 0
+) -> RecoveredText:
     counts = RecoveryStats(
-        overprint_duplicates=overprint, whitespace_objects=whitespace, unrecovered_text_objects=unrecovered
+        overprint_duplicates=overprint,
+        whitespace_objects=whitespace,
+        empty_text_objects=empty,
+        unrecovered_text_objects=unrecovered,
     )
     return RecoveredText(spans=spans, stats=counts)
 
@@ -841,7 +847,7 @@ class TestRecoveredPieces:
         assert result.warnings == (UNRECOVERED_WARNING.format(count=count),)
 
     def test_counted_objects_alone_are_no_warning(self):
-        result = assess_recovered(letters(24), recovered=recovery(overprint=2, whitespace=1))
+        result = assess_recovered(letters(24), recovered=recovery(overprint=2, whitespace=1, empty=3))
 
         assert (result.pieces[1:], result.warnings) == ((), ())
 
@@ -903,11 +909,24 @@ class TestRecoveryIntegration:
         assert result.pieces[: len(alone.pieces)] == alone.pieces
         assert result.quality == dataclasses.replace(alone.quality, hidden_spans_flagged=1)
 
-    def test_a_single_space_object_is_a_warning(self, tmp_path):
+    def test_a_single_space_object_is_empty_and_needs_no_recovery(self, tmp_path):
         content = (
             b"BT /F1 12 Tf 20 270 Td (A digital page with enough visible text) Tj ET BT /F1 12 Tf 72 100 Td ( ) Tj ET"
         )
-        handle = open_document(content_page(tmp_path, content))
+        raw = extract_page(open_document(content_page(tmp_path, content)), 0)
+
+        result = assess_page(raw)
+
+        assert (raw.text.stats.dropped_text_objects, raw.text.stats.empty_text_objects) == (0, 1)
+        assert (result.route, result.warnings) == ("digital", ())
+
+    def test_text_recovery_cannot_place_is_a_warning(self, tmp_path):
+        # Tf 0 text in a form drawn under a cm that overflows pdfium's 32-bit CTM.
+        hidden = b"BT /F1 0 Tf 0 0 Td (Lost) Tj ET"
+        form = b"<< /Type /XObject /Subtype /Form /BBox [0 0 400 300] /Resources << /Font << /F1 5 0 R >> >>"
+        form += b" /Length %d >>\nstream\n%s\nendstream" % (len(hidden), hidden)
+        content = b"BT /F1 12 Tf 20 270 Td (A digital page with enough visible text) Tj ET q " + OVERFLOW + b"/X Do Q"
+        handle = open_document(content_page(tmp_path, content, extra=(form,), resources=b"/XObject << /X 6 0 R >>"))
         raw = extract_page(handle, 0)
 
         result = assess_page(raw, recovered=recover_dropped_text(handle, 0))

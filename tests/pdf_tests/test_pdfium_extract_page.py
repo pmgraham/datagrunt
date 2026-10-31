@@ -350,6 +350,7 @@ EMPTY_TEXT = PageText(
         unicode_map_error_count=0,
         skipped_nonfinite_objects=0,
         dropped_text_objects=0,
+        empty_text_objects=0,
     ),
 )
 EMPTY_SEGMENTS = PageSegments(segments=(), stats=SegmentStats(skipped_nonfinite_paths=0))

@@ -4,14 +4,25 @@ Internal: not exported from ``datagrunt`` or ``datagrunt.pdf``;
 :mod:`datagrunt.pdf.pdfium_engine` re-exports :class:`RecoveredSpan`,
 :class:`RecoveryStats` and :class:`RecoveredText`, and runs a recovery on a
 page load of its own: it walks the page, reads a textpage
-(:func:`~datagrunt.pdf._pdfium_text.collect_text`), hands the dropped text
-objects to :func:`isolate_dropped`, reads a fresh textpage and hands both
-reads to :func:`recovered_text`. This module never imports the engine.
+(:func:`~datagrunt.pdf._pdfium_text.collect_text`, which asks
+:func:`is_glyphless` of each text object that owns no char), hands the
+dropped text objects to :func:`isolate_dropped`, reads a fresh textpage and
+hands both reads to :func:`recovered_text`. This module never imports the
+engine.
 
 pdfium drops a text object whose box is under 0.01 pt wide (``Tf 0``, ``Tz
 0``, a tiny size, a single space) and a copy drawn on identical text. The
 object still exists and keeps its chars, but owns no textpage char, and
 ``FPDFTextObj_GetText`` (served from the textpage) reads it as empty.
+
+An object whose box is the point at its origin though its em is 1 unit or
+more each way (in its form's space, where pdfium measures its box) draws no
+ink: none of its glyphs has an outline. It is an object of a single space,
+or of spaces that char spacing draws on one spot (a new size would spread
+them apart, still drawing nothing). It is empty, not dropped, and never
+recovered. A point box from a tiny or flat em (``Tf 0``, a zero matrix) is
+dropped: laid out again, it may draw; if its box is still a point then, it
+is empty too.
 :func:`isolate_dropped` gives each such object a 12 pt size and an unscaled
 matrix (size first: pdfium lays an object out again on a new matrix, not on
 a new size) at a place of its own, on a diagonal below the page, so no copy
@@ -97,19 +108,23 @@ class RecoveryStats:
             text object's (owned or recovered) at an origin within 0.5 pt on
             each axis: a copy drawn on it, counted and not emitted.
         whitespace_objects: Objects whose recovered text is whitespace only.
-        unrecovered_text_objects: Objects that still own no textpage char
-            (pdfium drops an object of a single space at any size), or that
-            pdfium places at a non-finite position: their text is lost, and
-            the caller warns.
+        empty_text_objects: Objects whose box is still a point once laid out
+            again at 12 pt: they draw no glyph with extent (a single space
+            at ``Tf 0``). Counted, never a warning.
+        unrecovered_text_objects: Objects with extent that still own no
+            textpage char, or that pdfium places at a non-finite position:
+            their text is lost, and the caller warns.
     """
 
     overprint_duplicates: int
     whitespace_objects: int
+    empty_text_objects: int
     unrecovered_text_objects: int
 
     def __post_init__(self) -> None:
         int_at_least("overprint_duplicates", self.overprint_duplicates, 0)
         int_at_least("whitespace_objects", self.whitespace_objects, 0)
+        int_at_least("empty_text_objects", self.empty_text_objects, 0)
         int_at_least("unrecovered_text_objects", self.unrecovered_text_objects, 0)
 
 
@@ -149,7 +164,8 @@ class Target(NamedTuple):
     """A dropped text object as it was before :func:`isolate_dropped` moved it.
 
     ``box`` (displayed) and ``origin`` (page space) are None when pdfium
-    placed it at a non-finite position or size.
+    placed it at a non-finite position or size. ``empty`` is True when its
+    box is still a point once moved and laid out again.
     """
 
     object_index: int
@@ -157,6 +173,48 @@ class Target(NamedTuple):
     box: Box | None
     font_size_pt: float
     hidden_reasons: tuple[HiddenReason, ...]
+    empty: bool = False
+
+
+def is_glyphless(handle: pdfium_c.FPDF_PAGEOBJECT, matrix: Matrix, label: str) -> bool:
+    """Whether the text object ``handle`` draws no ink: no glyph with an outline (see the module notes).
+
+    ``matrix`` is its object matrix (into its form's space, where its bounds
+    are); its box must be the point at its origin while its em is at least
+    :data:`TINY_FONT_PT` each way.
+
+    Raises:
+        PdfiumFailure: If a pdfium call fails.
+    """
+    width, height = _em(_font_size(handle, label), matrix)
+    return width >= TINY_FONT_PT and height >= TINY_FONT_PT and _is_point(_bounds(handle, label))
+
+
+def _font_size(handle: pdfium_c.FPDF_PAGEOBJECT, label: str) -> float:
+    """The text object's ``Tf`` size."""
+    size = ctypes.c_float()
+    if not pdfium_c.FPDFTextObj_GetFontSize(handle, size):
+        raise PdfiumFailure(f"read the font size of {label}")
+    return size.value
+
+
+def _bounds(handle: pdfium_c.FPDF_PAGEOBJECT, label: str) -> Box:
+    """The object's box ``(left, bottom, right, top)`` in its form's space."""
+    left, bottom, right, top = (ctypes.c_float() for _ in range(4))
+    if not pdfium_c.FPDFPageObj_GetBounds(handle, left, bottom, right, top):
+        raise PdfiumFailure(f"read the bounds of {label}")
+    return left.value, bottom.value, right.value, top.value
+
+
+def _is_point(box: Box) -> bool:
+    """True if ``box`` has no width and no height (pdfium's box of an object with no glyph extent)."""
+    left, bottom, right, top = box
+    return left == right and bottom == top
+
+
+def _em(size: float, matrix: Matrix) -> tuple[float, float]:
+    """The width and height of an em of ``Tf`` ``size`` under ``matrix``."""
+    return abs(size) * math.hypot(matrix.a, matrix.b), abs(size) * math.hypot(matrix.c, matrix.d)
 
 
 def isolate_dropped(
@@ -177,6 +235,7 @@ def isolate_dropped(
         target = _original(text, to_display)
         if target.box is not None:
             _move(text, len(targets))
+            target = target._replace(empty=_is_point(_bounds(text.handle, f"object {text.object_index}")))
         targets.append(target)
     return tuple(targets)
 
@@ -184,16 +243,12 @@ def isolate_dropped(
 def _original(text: TextObject, to_display: Callable[[Box], Box]) -> Target:
     """The dropped object ``text`` as pdfium placed it: its displayed box, origin, size and reasons."""
     label = f"object {text.object_index}"
-    size = ctypes.c_float()
-    if not pdfium_c.FPDFTextObj_GetFontSize(text.handle, size):
-        raise PdfiumFailure(f"read the font size of {label}")
-    left, bottom, right, top = (ctypes.c_float() for _ in range(4))
-    if not pdfium_c.FPDFPageObj_GetBounds(text.handle, left, bottom, right, top):
-        raise PdfiumFailure(f"read the bounds of {label}")
+    size = _font_size(text.handle, label)
+    left, bottom, right, top = _bounds(text.handle, label)
     matrix = text.own.then(text.outer)
     # Bounds are in the form's space, as the object matrix is.
-    corners = [text.outer.apply(x, y) for x in (left.value, right.value) for y in (bottom.value, top.value)]
-    em = size.value * math.hypot(matrix.c, matrix.d)
+    corners = [text.outer.apply(x, y) for x in (left, right) for y in (bottom, top)]
+    em = size * math.hypot(matrix.c, matrix.d)
     if not all(math.isfinite(value) for value in (*matrix, em, *(edge for corner in corners for edge in corner))):
         return Target(object_index=text.object_index, origin=None, box=None, font_size_pt=0.0, hidden_reasons=())
     xs, ys = [corner[0] for corner in corners], [corner[1] for corner in corners]
@@ -202,15 +257,16 @@ def _original(text: TextObject, to_display: Callable[[Box], Box]) -> Target:
         origin=(matrix.e, matrix.f),
         box=to_display((min(xs), min(ys), max(xs), max(ys))),
         font_size_pt=em,
-        hidden_reasons=_reasons(size.value, matrix),
+        hidden_reasons=_reasons(size, matrix),
     )
 
 
 def _reasons(size: float, matrix: Matrix) -> tuple[HiddenReason, ...]:
     """``tiny_font`` and / or ``zero_scale`` for text of ``Tf`` ``size`` under ``matrix`` (see the module notes)."""
-    across, up = math.hypot(matrix.a, matrix.b), math.hypot(matrix.c, matrix.d)
-    tiny = abs(size) * up < TINY_FONT_PT
-    squeezed = across < up and abs(size) * across < TINY_FONT_PT
+    width, height = _em(size, matrix)
+    tiny = height < TINY_FONT_PT
+    # A narrower em than a taller one: the matrix (Tz) squeezes it, not the size.
+    squeezed = width < height and width < TINY_FONT_PT
     return tuple(reason for reason, flagged in zip(RECOVERY_REASONS, (tiny, squeezed)) if flagged)
 
 
@@ -239,9 +295,12 @@ def recovered_text(
         printed.setdefault(text, []).append(origins[index])
     found = _spans_by_object(after.spans, {target.object_index for target in targets})
     spans: list[RecoveredSpan] = []
-    overprints = whitespace = unrecovered = 0
+    overprints = whitespace = empty = unrecovered = 0
     for target in targets:
         pieces = found.get(target.object_index, [])
+        if target.empty:
+            empty += 1
+            continue
         if target.box is None or target.origin is None or not pieces:
             unrecovered += 1
             continue
@@ -254,7 +313,10 @@ def recovered_text(
             printed.setdefault(text, []).append(target.origin)
             spans.extend(_placed(piece, target.box, target) for piece in pieces)
     counts = RecoveryStats(
-        overprint_duplicates=overprints, whitespace_objects=whitespace, unrecovered_text_objects=unrecovered
+        overprint_duplicates=overprints,
+        whitespace_objects=whitespace,
+        empty_text_objects=empty,
+        unrecovered_text_objects=unrecovered,
     )
     return RecoveredText(spans=tuple(spans), stats=counts)
 

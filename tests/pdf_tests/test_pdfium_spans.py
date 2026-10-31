@@ -107,6 +107,7 @@ def stats(**overrides) -> TextStats:
                 "unicode_map_error_count": 0,
                 "skipped_nonfinite_objects": 0,
                 "dropped_text_objects": 0,
+                "empty_text_objects": 0,
             }
             | overrides
         )
@@ -278,6 +279,7 @@ class TestTextStats:
                 "dropped_text_objects must be an int, got 1.0",
                 id="dropped-float",
             ),
+            pytest.param({"empty_text_objects": -1}, ValueError, "empty_text_objects must be >= 0, got -1", id="empty"),
         ],
     )
     def test_invalid_field_raises(self, overrides, error, message):
@@ -383,6 +385,7 @@ class TestSpanGrouping:
             unicode_map_error_count=0,
             skipped_nonfinite_objects=0,
             dropped_text_objects=0,
+            empty_text_objects=0,
         )
         assert result.spans[0].char_boxes[1][0] - result.spans[0].char_boxes[0][2] > 20.0
 
@@ -429,6 +432,7 @@ class TestSpanGrouping:
             unicode_map_error_count=0,
             skipped_nonfinite_objects=0,
             dropped_text_objects=0,
+            empty_text_objects=0,
         )
 
     def test_a_run_drawn_twice_in_place_reads_once(self, tmp_path):
@@ -735,6 +739,7 @@ class TestUnicode:
             unicode_map_error_count=0,
             skipped_nonfinite_objects=0,
             dropped_text_objects=0,
+            empty_text_objects=0,
         )
 
     def test_lone_surrogates_and_unmapped_codes_are_kept(self, tmp_path):
@@ -749,6 +754,7 @@ class TestUnicode:
             unicode_map_error_count=1,
             skipped_nonfinite_objects=0,
             dropped_text_objects=0,
+            empty_text_objects=0,
         )
 
     def test_a_lone_low_surrogate_is_kept(self, tmp_path):
@@ -772,6 +778,7 @@ class TestUnicode:
             unicode_map_error_count=6,
             skipped_nonfinite_objects=0,
             dropped_text_objects=0,
+            empty_text_objects=0,
         )
 
     def test_a_code_beyond_unicode_never_pairs_with_a_surrogate(self, tmp_path):
@@ -923,6 +930,7 @@ class TestRightToLeft:
             unicode_map_error_count=0,
             skipped_nonfinite_objects=0,
             dropped_text_objects=0,
+            empty_text_objects=0,
         )
 
     def test_arabic_words_in_separate_tj_are_two_spans(self, tmp_path):
@@ -936,6 +944,7 @@ class TestRightToLeft:
             unicode_map_error_count=0,
             skipped_nonfinite_objects=0,
             dropped_text_objects=0,
+            empty_text_objects=0,
         )
 
     def test_english_hebrew_english_keeps_every_word(self, tmp_path):
@@ -950,6 +959,7 @@ class TestRightToLeft:
             unicode_map_error_count=0,
             skipped_nonfinite_objects=0,
             dropped_text_objects=0,
+            empty_text_objects=0,
         )
 
     def test_a_char_without_an_owner_is_counted_and_never_fails_the_page(self, tmp_path, monkeypatch):
@@ -966,6 +976,7 @@ class TestRightToLeft:
             unicode_map_error_count=0,
             skipped_nonfinite_objects=0,
             dropped_text_objects=1,
+            empty_text_objects=0,
         )
         assert result == PageText(spans=(), stats=empty)
 
@@ -1122,6 +1133,7 @@ class TestConservation:
                 unicode_map_error_count=0,
                 skipped_nonfinite_objects=0,
                 dropped_text_objects=0,
+                empty_text_objects=0,
             ),
         )
 
@@ -1323,6 +1335,7 @@ class TestNonFiniteText:
             unicode_map_error_count=0,
             skipped_nonfinite_objects=1,
             dropped_text_objects=0,
+            empty_text_objects=0,
         )
         assert page_text(handle, 0) == PageText(spans=(), stats=empty)
 

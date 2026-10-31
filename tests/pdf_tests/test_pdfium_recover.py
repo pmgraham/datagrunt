@@ -7,9 +7,11 @@ draws a visible control line (object 0), then the hidden text.
 
 import ctypes
 import dataclasses
+import itertools
 import pickle
 import re
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 import pypdfium2 as pdfium
@@ -19,6 +21,7 @@ import pytest
 from datagrunt.pdf import PDFCorruptError, pdfium_engine
 from datagrunt.pdf._pdfium_common import object_address
 from datagrunt.pdf.pdfium_engine import (
+    PageFailure,
     RawSpan,
     RecoveredSpan,
     RecoveredText,
@@ -41,8 +44,9 @@ from pdf_tests.test_pdfium_spans import (
 
 HELVETICA = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
 CONTROL = b"BT /F1 12 Tf 20 270 Td (Visible) Tj ET "
-NO_LOSS = RecoveryStats(overprint_duplicates=0, whitespace_objects=0, unrecovered_text_objects=0)
-TECHNIQUES = ["tf-0", "tiny", "tz-0", "overprint", "single-space"]
+NO_LOSS = RecoveryStats(overprint_duplicates=0, whitespace_objects=0, empty_text_objects=0, unrecovered_text_objects=0)
+# The techniques whose text object pdfium drops though it draws glyphs ("single-space" draws none).
+DROPPING = ["tf-0", "tiny", "tz-0", "overprint"]
 
 
 def show(technique: str, x: float, y: float) -> bytes:
@@ -142,9 +146,22 @@ def recovered(path: Path) -> RecoveredText:
     return recover_dropped_text(open_document(path), 0)
 
 
+def fails_on_call(name: str, call: int, value: int = 0):
+    """A stand-in for pdfium function ``name`` that reports failure (``value``) on its ``call``-th call only."""
+    real = getattr(pdfium_c, name)
+    calls = itertools.count(1)
+    return lambda *args: value if next(calls) == call else real(*args)
+
+
 def dropped_count(path: Path) -> int:
     """TextStats.dropped_text_objects of page 1 of ``path``."""
     return page_text(open_document(path), 0).stats.dropped_text_objects
+
+
+def ownerless_counts(path: Path) -> tuple[int, int]:
+    """TextStats ``(dropped_text_objects, empty_text_objects)`` of page 1 of ``path``."""
+    got = page_text(open_document(path), 0).stats
+    return got.dropped_text_objects, got.empty_text_objects
 
 
 def text_objects(page: pdfium.PdfPage) -> list:
@@ -223,7 +240,10 @@ def recovered_span(**overrides) -> RecoveredSpan:
 
 def stats(**overrides) -> RecoveryStats:
     return RecoveryStats(
-        **({"overprint_duplicates": 1, "whitespace_objects": 2, "unrecovered_text_objects": 3} | overrides)
+        **(
+            {"overprint_duplicates": 1, "whitespace_objects": 2, "empty_text_objects": 4, "unrecovered_text_objects": 3}
+            | overrides
+        )
     )
 
 
@@ -301,7 +321,7 @@ class TestRecoveryStats:
     def test_fields(self):
         names = [item.name for item in dataclasses.fields(RecoveryStats)]
 
-        assert names == ["overprint_duplicates", "whitespace_objects", "unrecovered_text_objects"]
+        assert names == ["overprint_duplicates", "whitespace_objects", "empty_text_objects", "unrecovered_text_objects"]
 
     @pytest.mark.parametrize(
         "overrides,error,message",
@@ -312,6 +332,7 @@ class TestRecoveryStats:
             pytest.param(
                 {"whitespace_objects": True}, TypeError, "whitespace_objects must be an int, got True", id="whitespace"
             ),
+            pytest.param({"empty_text_objects": -1}, ValueError, "empty_text_objects must be >= 0, got -1", id="empty"),
             pytest.param(
                 {"unrecovered_text_objects": 1.0},
                 TypeError,
@@ -350,15 +371,15 @@ class TestRecoveredText:
 
 
 class TestDroppedTextObjects:
-    """TextStats counts the text objects that own no textpage char: the pages worth a recovery."""
+    """TextStats counts the text objects that own no textpage char but draw glyphs: the pages worth a recovery."""
 
-    @pytest.mark.parametrize("technique", TECHNIQUES)
+    @pytest.mark.parametrize("technique", DROPPING)
     def test_each_technique_drops_one_object(self, tmp_path, technique):
-        assert dropped_count(plain(tmp_path, technique)) == 1
+        assert ownerless_counts(plain(tmp_path, technique)) == (1, 0)
 
-    @pytest.mark.parametrize("technique", TECHNIQUES)
+    @pytest.mark.parametrize("technique", DROPPING)
     def test_dropped_objects_inside_forms_count(self, tmp_path, technique):
-        assert dropped_count(nested(tmp_path, technique)) == 1
+        assert ownerless_counts(nested(tmp_path, technique)) == (1, 0)
 
     @pytest.mark.parametrize(
         "make_page",
@@ -388,7 +409,7 @@ class TestDroppedTextObjects:
     )
     def test_a_page_whose_text_objects_all_own_chars_has_none(self, tmp_path, make_page):
         # Callers recover only when the count is over 0: these pages never pay the second load.
-        assert dropped_count(make_page(tmp_path)) == 0
+        assert ownerless_counts(make_page(tmp_path)) == (0, 0)
 
     def test_an_object_pdfium_places_nowhere_is_skipped_not_dropped(self, tmp_path):
         inner = b"BT /F1 12 Tf 0 0 Td (Lost) Tj ET"
@@ -402,9 +423,103 @@ class TestDroppedTextObjects:
         assert (got.skipped_nonfinite_objects, got.dropped_text_objects) == (1, 0)
 
     def test_extract_page_counts_the_same(self, tmp_path):
-        handle = open_document(plain(tmp_path, "tf-0"))
+        content = CONTROL + show("tf-0", 72, 100) + b" " + show("single-space", 72, 150)
+        got = extract_page(open_document(pdf(tmp_path, content)), 0).text.stats
 
-        assert extract_page(handle, 0).text.stats.dropped_text_objects == 1
+        assert (got.dropped_text_objects, got.empty_text_objects) == (1, 1)
+
+    @pytest.mark.parametrize(
+        "function,message",
+        [
+            pytest.param("FPDFPageObj_GetMatrix", "page 1: pdfium cannot read the matrix of object 1", id="matrix"),
+            pytest.param("FPDFTextObj_GetFontSize", "page 1: pdfium cannot read the font size of object 1", id="size"),
+            pytest.param("FPDFPageObj_GetBounds", "page 1: pdfium cannot read the bounds of object 1", id="bounds"),
+        ],
+    )
+    def test_a_failure_classifying_an_ownerless_object_fails_the_text_stage(
+        self, tmp_path, monkeypatch, handle_closes, function, message
+    ):
+        # Only objects that own no char are read: the control line's size is read before the stand-in fails.
+        # A single space: its em is 12 pt, so its bounds are read too (a Tf 0 object's are not).
+        handle = open_document(plain(tmp_path, "single-space"))
+        call = 2 if function == "FPDFTextObj_GetFontSize" else 1
+        first, second = fails_on_call(function, call), fails_on_call(function, call)
+        monkeypatch.setattr(pdfium_c, function, first)
+
+        with pytest.raises(PDFCorruptError, match=re.escape(message) + "$"):
+            page_text(handle, 0)
+        assert handle_closes == ["PdfTextPage", "PdfPage"]
+        monkeypatch.setattr(pdfium_c, function, second)
+        assert extract_page(handle, 0) == PageFailure(page_number=1, stage="text", message=message)
+
+
+class TestEmptyTextObjects:
+    """A text object that owns no char and draws no glyph with extent is empty: counted, never recovered."""
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param(b"BT /F1 12 Tf 72 100 Td () Tj ET", id="empty-string"),
+            pytest.param(b"BT /F1 12 Tf 72 100 Td [] TJ ET", id="empty-array"),
+            pytest.param(b"BT /F1 12 Tf 72 100 Td [-500] TJ ET", id="kerning-only"),
+            pytest.param(b"BT /F1 12 Tf 72 100 Td ET", id="no-show"),
+        ],
+    )
+    def test_a_show_of_nothing_makes_no_text_object(self, tmp_path, content):
+        # Observed pdfium behaviour: there is no object to count at all.
+        path = pdf(tmp_path, CONTROL + content)
+        page = pdfium.PdfDocument(path)[0]
+
+        assert len(text_objects(page)) == 1
+        assert ownerless_counts(path) == (0, 0)
+
+    @pytest.mark.parametrize("where", PLACEMENTS)
+    def test_a_single_space_object_is_empty_not_dropped(self, tmp_path, where):
+        path = where.build(tmp_path, "single-space")
+
+        assert ownerless_counts(path) == (0, 1)
+        # Nothing to recover: a caller never loads the page again for it.
+        assert recovered(path) == RecoveredText(spans=(), stats=NO_LOSS)
+
+    @pytest.mark.parametrize(
+        "content,counts",
+        [
+            pytest.param(b"BT /F1 12 Tf 72 100 Td (\240) Tj ET", (0, 1), id="no-break-space"),
+            # Tj then ' (next line, show): two objects of a single space.
+            pytest.param(b"BT /F1 12 Tf 14 TL 72 100 Td ( ) Tj ( ) ' ET", (0, 2), id="two-shows"),
+            # Two spaces drawn on one spot by char spacing (see TestPdfiumBehaviour).
+            pytest.param(b"BT /F1 1 Tf -0.278 Tc 10 0 0 10 72 100 Tm (  ) Tj ET", (0, 1), id="spaces-on-one-spot"),
+        ],
+    )
+    def test_other_glyph_less_objects_are_empty(self, tmp_path, content, counts):
+        assert ownerless_counts(pdf(tmp_path, CONTROL + content)) == counts
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param(show("tf-0", 72, 100), id="tf-0"),
+            pytest.param(b"q 0 0 0 0 0 0 cm BT /F1 12 Tf 72 100 Td (FLAT) Tj ET Q", id="zero-matrix"),
+            pytest.param(b"BT /F1 0.5 Tf 72 100 Td ( ) Tj ET", id="tiny-space"),
+        ],
+    )
+    def test_a_point_box_from_a_tiny_or_flat_em_is_dropped_not_empty(self, tmp_path, content):
+        # Each box is a point, as a space's is, but its em is under 1 pt: re-laid out, it may draw.
+        assert ownerless_counts(pdf(tmp_path, CONTROL + content)) == (1, 0)
+
+    def test_a_dropped_object_still_a_point_after_re_layout_is_empty(self, tmp_path):
+        got = recovered(pdf(tmp_path, CONTROL + b"BT /F1 0 Tf 72 100 Td ( ) Tj ET"))
+
+        assert got == RecoveredText(spans=(), stats=dataclasses.replace(NO_LOSS, empty_text_objects=1))
+
+    def test_empty_objects_beside_dropped_ones_are_not_recovered(self, tmp_path):
+        content = CONTROL + show("single-space", 72, 150) + b" " + show("tf-0", 72, 100)
+        path = pdf(tmp_path, content)
+
+        got = recovered(path)
+
+        assert ownerless_counts(path) == (1, 1)
+        assert [(item.span.text, item.span.object_index) for item in got.spans] == [("HIDDEN", 2)]
+        assert got.stats == NO_LOSS
 
 
 class TestPdfiumBehaviour:
@@ -425,6 +540,35 @@ class TestPdfiumBehaviour:
 
         assert matrix_of(tf_0) == (1.0, 0.0, 0.0, 1.0, 72.0, 100.0)
         assert bounds_of(tf_0) == (72.0, 100.0, 72.0, 100.0)
+
+    @pytest.mark.parametrize("text", [b"( )", b"(\240)"], ids=["space", "no-break-space"])
+    def test_a_single_glyph_less_char_object_is_the_point_at_its_origin(self, tmp_path, text):
+        page = pdfium.PdfDocument(pdf(tmp_path, CONTROL + b"BT /F1 12 Tf 72 100 Td %s Tj ET" % text))[0]
+        hidden = text_objects(page)[1]
+        size = ctypes.c_float()
+        assert pdfium_c.FPDFTextObj_GetFontSize(hidden, size)
+
+        assert (size.value, matrix_of(hidden), bounds_of(hidden)) == (
+            12.0,
+            (1.0, 0.0, 0.0, 1.0, 72.0, 100.0),
+            (72.0, 100.0, 72.0, 100.0),
+        )
+        assert object_address(hidden) not in owners(page)
+
+    def test_spaces_char_spacing_draws_on_one_spot_spread_apart_when_laid_out_again(self, tmp_path):
+        # As on page 12 of the corpus's Learn to Play: Tf 1 under a 10x Tm, char spacing -0.278 (one
+        # space's advance), so both spaces sit at the origin. Tc is not scaled by Tf: at 12 pt they part.
+        content = CONTROL + b"BT /F1 1 Tf -0.278 Tc 10 0 0 10 72 100 Tm (  ) Tj ET"
+        page = pdfium.PdfDocument(pdf(tmp_path, content))[0]
+        hidden = text_objects(page)[1]
+        assert bounds_of(hidden) == (72.0, 100.0, 72.0, 100.0)
+
+        set_size(hidden, 12.0)
+        set_matrix(hidden, 1, 0, 0, 1, 0, -100)
+
+        left, bottom, right, top = bounds_of(hidden)
+        assert (left, bottom, top) == (0.0, -100.0, -100.0) and right == pytest.approx(12 * 0.278 - 0.278, abs=1e-4)
+        assert object_text(hidden, page) == " "
 
     def test_tz_0_is_in_the_matrix_and_leaves_no_width(self, tmp_path):
         page = pdfium.PdfDocument(plain(tmp_path, "tz-0"))[0]
@@ -593,13 +737,6 @@ class TestRecovery:
 
         assert got == RecoveredText(spans=(), stats=dataclasses.replace(NO_LOSS, overprint_duplicates=1))
 
-    @pytest.mark.parametrize("where", PLACEMENTS)
-    def test_single_space(self, tmp_path, where):
-        # No size or matrix gets pdfium to read a single-space object back.
-        got = recovered(where.build(tmp_path, "single-space"))
-
-        assert got == RecoveredText(spans=(), stats=dataclasses.replace(NO_LOSS, unrecovered_text_objects=1))
-
     def test_type3_font(self, tmp_path):
         font = (
             b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 750 750] /FontMatrix [0.001 0 0 0.001 0 0]"
@@ -707,13 +844,22 @@ class TestRecovery:
 
     def test_every_dropped_object_is_accounted_for(self, tmp_path):
         # Operators need whitespace between them: "ETBT" would be one unknown operator.
-        shows = (show("tf-0", 72, 100), show("overprint", 72, 150), show("single-space", 72, 200))
-        path = pdf(tmp_path, CONTROL + b" ".join(shows) + b" BT /F1 0 Tf 72 50 Td (  ) Tj ET")
+        shows = (
+            show("tf-0", 72, 100),
+            show("overprint", 72, 150),
+            show("single-space", 72, 200),  # empty: never dropped
+            b"BT /F1 0 Tf 72 50 Td (  ) Tj ET",  # whitespace once read
+            b"BT /F1 0 Tf 300 50 Td ( ) Tj ET",  # still a point once laid out again
+        )
+        path = pdf(tmp_path, CONTROL + b" ".join(shows))
 
         got = recovered(path)
 
-        assert got.stats == RecoveryStats(overprint_duplicates=1, whitespace_objects=1, unrecovered_text_objects=1)
-        assert len(got.spans) + sum(dataclasses.astuple(got.stats)) == dropped_count(path) == 4
+        assert got.stats == RecoveryStats(
+            overprint_duplicates=1, whitespace_objects=1, empty_text_objects=1, unrecovered_text_objects=0
+        )
+        assert ownerless_counts(path) == (4, 1)
+        assert len(got.spans) + sum(dataclasses.astuple(got.stats)) == 4
 
     def test_the_document_keeps_no_edit(self, tmp_path):
         handle = open_document(plain(tmp_path, "tf-0"))
@@ -752,37 +898,33 @@ def failing(value):
 
 TEXTPAGES_THEN_PAGE = ["PdfTextPage", "PdfTextPage", "PdfPage"]
 
-# (pdfium function, stand-in, message, closes): each makes recovery of a page holding
-# only a Tf 0 object (object 0) raise PDFCorruptError for page 1.
+# (pdfium function, stand-in maker, message, closes): each stand-in makes recovery of a page
+# holding only a Tf 0 object (object 0) raise PDFCorruptError for page 1. The text stage reads
+# the object's matrix and size (is it empty? Its em is 0, so its bounds are not read), then
+# recovery reads its size and bounds (its original place), and its bounds again once it is
+# moved (is it still a point?).
 RECOVERY_FAILURES = [
-    ("FPDFPageObj_GetMatrix", failing(0), "page 1: pdfium cannot read the matrix of object 0", ["PdfPage"]),
+    ("FPDFPageObj_GetMatrix", lambda: failing(0), "page 1: pdfium cannot read the matrix of object 0", ["PdfPage"]),
     (
         "FPDFText_CountChars",
-        failing(-1),
+        lambda: failing(-1),
         "page 1: pdfium cannot count the text page's chars",
         ["PdfTextPage", "PdfPage"],
     ),
-    (
-        "FPDFTextObj_GetFontSize",
-        failing(0),
-        "page 1: pdfium cannot read the font size of object 0",
-        ["PdfTextPage", "PdfPage"],
-    ),
-    (
-        "FPDFPageObj_GetBounds",
-        failing(0),
-        "page 1: pdfium cannot read the bounds of object 0",
-        ["PdfTextPage", "PdfPage"],
+    *(
+        (function, maker, f"page 1: pdfium cannot read the {what} of object 0", ["PdfTextPage", "PdfPage"])
+        for function, what in (("FPDFTextObj_GetFontSize", "font size"), ("FPDFPageObj_GetBounds", "bounds"))
+        for maker in (lambda: failing(0), partial(fails_on_call, function, 2))
     ),
     (
         "FPDFTextObj_SetFontSize",
-        failing(0),
+        lambda: failing(0),
         "page 1: pdfium cannot set the font size of object 0",
         ["PdfTextPage", "PdfPage"],
     ),
     (
         "FPDFPageObj_SetMatrix",
-        failing(0),
+        lambda: failing(0),
         "page 1: pdfium cannot set the matrix of object 0",
         ["PdfTextPage", "PdfPage"],
     ),
@@ -801,12 +943,12 @@ class TestRecoveryErrors:
 
         assert handle_closes == TEXTPAGES_THEN_PAGE
 
-    @pytest.mark.parametrize("function,stand_in,message,closes", RECOVERY_FAILURES)
+    @pytest.mark.parametrize("function,make_stand_in,message,closes", RECOVERY_FAILURES)
     def test_pdfium_failure_raises_for_the_page_and_closes_handles(
-        self, tmp_path, monkeypatch, handle_closes, function, stand_in, message, closes
+        self, tmp_path, monkeypatch, handle_closes, function, make_stand_in, message, closes
     ):
         handle = open_document(pdf(tmp_path, show("tf-0", 72, 100)))
-        monkeypatch.setattr(pdfium_c, function, stand_in)
+        monkeypatch.setattr(pdfium_c, function, make_stand_in())
 
         with pytest.raises(PDFCorruptError, match=re.escape(message) + "$") as caught:
             recover_dropped_text(handle, 0)

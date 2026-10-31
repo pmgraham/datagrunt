@@ -113,12 +113,19 @@ Recovery (#366 task 3), pinned by ``tests/pdf_tests/test_pdfium_recover.py``
   ~2 pt from it. The object keeps its chars but owns no textpage char, and
   ``FPDFTextObj_GetText`` reads it as empty. ``Tz`` is in the object's
   matrix (``Tz 0`` reads ``a = b = 0``); a ``Tf 0`` object's bounds are the
-  point at its origin, a ``Tz 0`` one's a line with no width.
+  point at its origin, a ``Tz 0`` one's a line with no width. So are a 12
+  pt single space's and no-break space's (their glyph has no outline), and
+  two spaces' that char spacing draws on one spot (a 12 pt re-layout spreads
+  them apart; they read as a space): the text stage counts such objects as
+  empty, not dropped.
+- ``() Tj``, ``[] TJ``, ``[-500] TJ`` and a ``BT`` ... ``ET`` that shows
+  nothing make no text object at all.
 - ``FPDFTextObj_SetFontSize`` alone changes nothing the textpage reads;
   ``FPDFPageObj_SetMatrix`` after it lays the object out again, and a fresh
   textpage reads its text (a new size after the matrix: nothing). A copy
   moved off the text it copies reads too; left in place, it stays dropped.
-  An object of a single space stays dropped at any size and matrix.
+  An object of a single space stays dropped, its box a point, at any size
+  and matrix.
 - These edits live in their page load only: a fresh load of the page drops
   the same objects. :func:`recover_dropped_text` loads the page itself and
   saves nothing.
@@ -135,7 +142,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, NamedTuple, NoReturn
+from typing import Literal, NoReturn
 
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
@@ -172,10 +179,11 @@ from datagrunt.pdf._pdfium_recover import (
     RecoveredText,
     RecoveryStats,
     TextObject,
+    is_glyphless,
     isolate_dropped,
     recovered_text,
 )
-from datagrunt.pdf._pdfium_text import PageText, RawSpan, TextStats, collect_text
+from datagrunt.pdf._pdfium_text import ObjectWalk, PageText, RawSpan, TextStats, collect_text
 from datagrunt.pdf._validate import choice_str, finite_tuple, int_at_least, non_blank_str, positive_float
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFEncryptedError
 
@@ -571,18 +579,19 @@ def _page_objects(page_raw: pdfium_c.FPDF_PAGE) -> list[tuple[pdfium_c.FPDF_PAGE
     return ordered
 
 
-class _TextWalk(NamedTuple):
-    """What the text stage needs of the object walk: every object's index and the text objects."""
-
-    indices: dict[int, int]
-    text_objects: frozenset[int]
-
-
-def _text_walk(objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]) -> _TextWalk:
-    """Map each walked object's address to its depth-first paint-order index; name the text objects."""
+def _text_walk(objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]) -> ObjectWalk:
+    """The walk as the text stage reads it: each object's index, the text objects, and which draw no glyph."""
     indices = {object_address(obj): index for index, (obj, _form) in enumerate(objects)}
     texts = (obj for obj, _form in objects if pdfium_c.FPDFPageObj_GetType(obj) == pdfium_c.FPDF_PAGEOBJ_TEXT)
-    return _TextWalk(indices, frozenset(object_address(obj) for obj in texts))
+    return ObjectWalk(indices, frozenset(object_address(obj) for obj in texts), partial(_glyphless, objects, indices))
+
+
+def _glyphless(objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]], indices: dict[int, int], address: int) -> bool:
+    """Whether the walked text object at ``address`` draws no glyph with extent (its own matrix: its box's space)."""
+    index = indices[address]
+    text_object, _form = objects[index]
+    label = f"object {index}"
+    return is_glyphless(text_object, _read_matrix(text_object, label), label)
 
 
 def _pdfium_error(page_number: int, failure: PdfiumFailure) -> PDFCorruptError:
@@ -617,8 +626,7 @@ def _read_page_text(page: pdfium.PdfPage, geometry: PageGeometry) -> PageText:
     """Read a loaded page's spans, closing its textpage."""
     page_number = geometry.page_number
     with _opened_textpage(page, page_number) as textpage, _pdfium_errors(page_number):
-        walk = _text_walk(_page_objects(page.raw))
-        return collect_text(textpage.raw, _display_mapping(geometry), walk.indices, walk.text_objects).page_text
+        return collect_text(textpage.raw, _display_mapping(geometry), _text_walk(_page_objects(page.raw))).page_text
 
 
 def page_text(handle: DocumentHandle, index: int) -> PageText:
@@ -996,16 +1004,18 @@ def recover_dropped_text(handle: DocumentHandle, index: int) -> RecoveredText:
 
     Worth calling only when the page's ``TextStats.dropped_text_objects`` is
     over 0 (a page with none recovers nothing, at the cost of a load and two
-    textpages). On a load of its own, the page's text objects that own no
-    textpage char (forms' included, as deep as pdfium parses them) are each
+    textpages; empty objects never need it). On a load of its own, the
+    page's dropped text objects (forms' included, as deep as pdfium parses
+    them: those that own no textpage char and are not empty) are each
     drawn at 12 pt with an unscaled matrix at a place of their own, and a
     fresh textpage reads them (see :mod:`datagrunt.pdf._pdfium_recover`).
     Each recovered span sits at its object's original displayed box, with
     its original size and its hidden reasons; overprint copies and
-    whitespace-only objects are counted, not emitted, and objects pdfium
-    still drops (a single space) are counted as unrecovered. Nothing is
-    saved: the edits die with that page load, which is closed (with both
-    textpages) before returning.
+    whitespace-only objects are counted, not emitted, and so are objects
+    whose box is still a point once laid out again (empty, as a ``Tf 0``
+    space); objects with extent that pdfium still drops, or places nowhere,
+    are counted as unrecovered. Nothing is saved: the edits die with that
+    page load, which is closed (with both textpages) before returning.
 
     Raises:
         TypeError: If ``handle`` is not a DocumentHandle, or ``index`` is not
@@ -1030,10 +1040,10 @@ def _recover(page: pdfium.PdfPage, geometry: PageGeometry) -> RecoveredText:
         walk = _text_walk(objects)
         texts = tuple(TextObject(*placed) for placed in _objects_in_forms(objects, pdfium_c.FPDF_PAGEOBJ_TEXT))
         with _opened_textpage(page, page_number) as textpage:
-            before = collect_text(textpage.raw, to_display, walk.indices, walk.text_objects)
+            before = collect_text(textpage.raw, to_display, walk)
         targets = isolate_dropped(texts, before.dropped, to_display)
         with _opened_textpage(page, page_number) as textpage:
-            after = collect_text(textpage.raw, to_display, walk.indices, walk.text_objects)
+            after = collect_text(textpage.raw, to_display, walk)
     return recovered_text(targets, texts, before.page_text, after.page_text)
 
 

@@ -415,7 +415,12 @@ def _check_recovered(recovered: object, dropped: int) -> None:
     if not isinstance(recovered, RecoveredText):
         raise TypeError(f"recovered must be a RecoveredText or None, got {type(recovered).__name__}")
     stats = recovered.stats
-    counted = stats.overprint_duplicates + stats.whitespace_objects + stats.unrecovered_text_objects
+    counted = (
+        stats.overprint_duplicates
+        + stats.whitespace_objects
+        + stats.empty_text_objects
+        + stats.unrecovered_text_objects
+    )
     accounted = len({item.span.object_index for item in recovered.spans}) + counted
     if accounted != dropped:
         found = f"recovered accounts for {accounted} dropped text object(s), but the page has {dropped}"
