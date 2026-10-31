@@ -2053,8 +2053,8 @@ def _without_page_columns(structures: list[_Rows], runs: list[_TurnedRun], turn:
     boxes = [_turned(_ink_box(run), turn) for _, run in runs]
     segment_of: dict[tuple[int, int, int], int] = {}
     for number, segment in enumerate(_xy_cut(boxes, [run.end - run.start for _, run in runs])):
-        segment_of.update((_key(runs[index][1]), number) for index in segment)
-    taken = {_key(piece) for found in structures for piece in _lines_pieces(found.rows)}
+        segment_of.update((_identity(runs[index][1]), number) for index in segment)
+    taken = {_identity(piece) for found in structures for piece in _lines_pieces(found.rows)}
     free = {number for key, number in segment_of.items() if key not in taken}
     return [
         found
@@ -2068,7 +2068,7 @@ def _page_columns(table: StreamTable, segment_of: dict[tuple[int, int, int], int
     by_column: list[set[int]] = [set() for _ in range(table.n_cols)]
     for row, placed in zip(table.rows, table.columns):
         for found, column in zip(row.cells, placed):
-            by_column[column].update(segment_of[_key(piece)] for piece in found.pieces)
+            by_column[column].update(segment_of[_identity(piece)] for piece in found.pieces)
     return len(set().union(*by_column)) >= _MIN_GRID and all(segments & free for segments in by_column)
 
 
@@ -2195,11 +2195,11 @@ def _reading_slots(runs: list[_TurnedRun], turn: int, structures: list[_Rows]) -
     ink, weighing their chars. The other runs are items as in
     :func:`text_blocks`.
     """
-    owner = {_key(piece): index for index, found in enumerate(structures) for piece in _lines_pieces(found.rows)}
+    owner = {_identity(piece): index for index, found in enumerate(structures) for piece in _lines_pieces(found.rows)}
     free: list[_TurnedRun] = []
     members: list[list[_Run]] = [[] for _ in structures]
     for item in runs:
-        at = owner.get(_key(item[1]))
+        at = owner.get(_identity(item[1]))
         if at is None:
             free.append(item)
         else:
@@ -2214,7 +2214,7 @@ def _reading_slots(runs: list[_TurnedRun], turn: int, structures: list[_Rows]) -
     return slots
 
 
-def _key(item: _Run | SpanPiece) -> tuple[int, int, int]:
+def _identity(item: _Run | SpanPiece) -> tuple[int, int, int]:
     """A run's identity on the page: its span's, and its char range there."""
     span = item.piece.span if isinstance(item, _Run) else item.span
     return id(span), item.start, item.end
