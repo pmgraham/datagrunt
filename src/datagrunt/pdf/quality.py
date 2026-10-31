@@ -21,9 +21,11 @@ char of every span, in order, cut into pieces that carry the A1
   searchable scan's OCR layer, which a reader sees as the scan.
 - ``tiny_font``: a font size under 1 pt in magnitude (a negative ``Tf``
   draws mirrored glyphs at its magnitude).
-- ``transparent``: alpha 0 on every channel the render mode paints: fill
-  for modes 0 and 4, stroke for 1 and 5, both for 2 and 6. Modes 3 and 7
-  paint nothing (``invisible``), so they are never ``transparent``.
+- ``transparent``: an alpha of at most 12 of 255 (under 5 %; pdfium rounds
+  an ExtGState ``ca`` / ``CA``, so ``0.048`` reads 12 and ``0.05`` reads 13)
+  on every channel the render mode paints: fill for modes 0 and 4, stroke
+  for 1 and 5, both for 2 and 6. Modes 3 and 7 paint nothing
+  (``invisible``), so they are never ``transparent``.
 - ``zero_scale``: an em (``RawSpan.em_width_pt``) under 1 pt wide and
   narrower than it is tall: text squeezed flat by its matrix (``Tz 0.05``),
   which pdfium's textpage keeps. Tiny text no narrower than tall is
@@ -102,6 +104,8 @@ _OCR_MODES: tuple[OcrMode, ...] = get_args(OcrMode)
 _FILL_MODES = frozenset({0, 2, 4, 6})
 _STROKE_MODES = frozenset({1, 2, 5, 6})
 _NO_PAINT_MODES = frozenset({3, 7})
+# A channel painted at this alpha (of 255) or less is too faint to read: under 5 %. Fill and stroke alike.
+_FAINT_ALPHA = 12
 # Raster cover over this fraction of the page makes no-paint text over it an
 # OCR layer, and a page with enough text over it hybrid.
 _OCR_LAYER_COVER = 0.5
@@ -191,12 +195,12 @@ def _classify(
 
 
 def _transparent(span: RawSpan) -> bool:
-    """True if every channel the span's render mode paints has alpha 0 (a mode that paints nothing: False)."""
+    """True if every channel the span's render mode paints is faint (a mode that paints nothing: False)."""
     mode = span.render_mode
     if mode in _NO_PAINT_MODES:
         return False
-    fill_clear = mode not in _FILL_MODES or span.fill_rgba[3] == 0
-    stroke_clear = mode not in _STROKE_MODES or span.stroke_rgba[3] == 0
+    fill_clear = mode not in _FILL_MODES or span.fill_rgba[3] <= _FAINT_ALPHA
+    stroke_clear = mode not in _STROKE_MODES or span.stroke_rgba[3] <= _FAINT_ALPHA
     return fill_clear and stroke_clear
 
 

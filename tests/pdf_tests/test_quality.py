@@ -447,7 +447,7 @@ class TestTransparent:
         [
             pytest.param(0, 0, 255, ("transparent",), id="fill-clear"),
             pytest.param(0, 255, 0, (), id="fill-opaque-stroke-clear"),
-            pytest.param(0, 1, 255, (), id="fill-alpha-1"),
+            pytest.param(0, 1, 255, ("transparent",), id="fill-alpha-1"),
             pytest.param(4, 0, 255, ("transparent",), id="fill-clip-clear"),
             pytest.param(1, 255, 0, ("transparent",), id="stroke-clear"),
             pytest.param(1, 0, 255, (), id="stroke-opaque-fill-clear"),
@@ -466,6 +466,28 @@ class TestTransparent:
         source = raw_span(render_mode=mode, fill_rgba=(255, 255, 255, fill_alpha), stroke_rgba=(0, 0, 0, stroke_alpha))
 
         assert reasons_of(source) == [expected]
+
+    @pytest.mark.parametrize(
+        "alpha,expected",
+        [
+            pytest.param(0, ("transparent",), id="0"),
+            pytest.param(12, ("transparent",), id="12"),
+            pytest.param(13, (), id="13"),
+            pytest.param(255, (), id="255"),
+        ],
+    )
+    @pytest.mark.parametrize("mode", [0, 1, 2, 4, 5, 6])
+    def test_an_alpha_of_at_most_12_is_transparent_on_each_channel(self, mode, alpha, expected):
+        # 12 of 255 is under 5 %: one threshold for fill and stroke alike.
+        source = raw_span(render_mode=mode, fill_rgba=(0, 0, 0, alpha), stroke_rgba=(0, 0, 0, alpha))
+
+        assert reasons_of(source) == [expected]
+
+    @pytest.mark.parametrize("fill_alpha,stroke_alpha", [(12, 13), (13, 12)])
+    def test_both_painted_channels_must_be_faint(self, fill_alpha, stroke_alpha):
+        source = raw_span(render_mode=2, fill_rgba=(0, 0, 0, fill_alpha), stroke_rgba=(0, 0, 0, stroke_alpha))
+
+        assert reasons_of(source) == [()]
 
 
 class TestCombinedReasons:
@@ -713,6 +735,33 @@ class TestThroughExtractPage:
 
 # A visible control line above the text under test, on hand-written pages (ReportLab cannot write Tz).
 CONTROL = b"BT /F1 12 Tf 20 270 Td (Visible) Tj ET "
+
+
+class TestTransparentThroughExtractPage:
+    """pdfium rounds an ExtGState alpha to 0-255; at most 12 (under 5 %) is transparent."""
+
+    @pytest.mark.parametrize(
+        "alpha,read,expected",
+        [
+            pytest.param(b"0", 0, ("transparent",), id="ca-0"),
+            pytest.param(b"0.002", 1, ("transparent",), id="ca-0.002"),
+            pytest.param(b"0.01", 3, ("transparent",), id="ca-0.01"),
+            pytest.param(b"0.048", 12, ("transparent",), id="ca-0.048"),
+            # pdfium rounds 0.05 x 255 = 12.75 up: 13, over the threshold.
+            pytest.param(b"0.05", 13, (), id="ca-0.05"),
+            pytest.param(b"0.06", 15, (), id="ca-0.06"),
+        ],
+    )
+    @pytest.mark.parametrize("mode", [b"0", b"1"], ids=["fill", "stroke"])
+    def test_a_faint_alpha_is_transparent(self, tmp_path, alpha, read, expected, mode):
+        state = b"<< /Type /ExtGState /ca %s /CA %s >>" % (alpha, alpha)
+        content = CONTROL + b"q /Faint gs BT /F1 12 Tf %s Tr 72 100 Td (HIDDEN) Tj ET Q" % mode
+        path = content_page(tmp_path, content, resources=b"/ExtGState << /Faint 6 0 R >>", extra=(state,))
+
+        pieces = classified_page(path)
+
+        assert (pieces[1].span.fill_rgba[3], pieces[1].span.stroke_rgba[3]) == (read, read)
+        assert texts(pieces) == [("Visible", ()), ("HIDDEN", expected)]
 
 
 def classified_page(path: Path) -> tuple[SpanPiece, ...]:
