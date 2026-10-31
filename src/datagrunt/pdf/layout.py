@@ -22,8 +22,10 @@ paragraphs (:class:`TextBlock`), by v4's XY-cut and line merge, ported
 (v5 imports no v4 code); :func:`classify_blocks` reads the blocks as
 headings, key-value pairs, lists and paragraphs (:class:`StreamHeading`,
 :class:`StreamKeyValue`, :class:`StreamList`, :class:`StreamParagraph`),
-each keeping the char ranges it reads. Hidden text is laid out apart
-(A4b group 3).
+each keeping the char ranges it reads. :func:`stream_layout` puts it
+together: borderless tables (:class:`StreamTable`), mastheads and
+key-value lists found on the lines and read whole, the rest classified,
+all in reading order. Hidden text is laid out apart (A4b group 3).
 
 Known limitations (each a fact this pure pass cannot see):
 
@@ -48,7 +50,14 @@ from typing import NamedTuple
 
 from datagrunt.pdf._path_segments import Box, RawSegment
 from datagrunt.pdf._pdfium_common import union_box
-from datagrunt.pdf._validate import int_at_least, non_blank_str, positive_float, strict_bool, typed_tuple
+from datagrunt.pdf._validate import (
+    finite_float,
+    int_at_least,
+    non_blank_str,
+    positive_float,
+    strict_bool,
+    typed_tuple,
+)
 from datagrunt.pdf.elements import BBox
 from datagrunt.pdf.quality import SpanPiece
 
@@ -61,11 +70,13 @@ __all__ = [
     "StreamList",
     "StreamListItem",
     "StreamParagraph",
+    "StreamTable",
     "TextBlock",
     "TextCell",
     "TextLine",
     "classify_blocks",
     "find_lattice_tables",
+    "stream_layout",
     "text_blocks",
     "text_lines",
 ]
@@ -274,8 +285,13 @@ class LatticeTable:
 
     @property
     def has_header(self) -> bool:
-        """v4's rule: more than one row, and every row-0 grid cell non-blank."""
-        return self.n_rows > 1 and all(text.strip() for text in self.grid()[0])
+        """v4's rule (:func:`_has_header`)."""
+        return _has_header(self.grid())
+
+
+def _has_header(grid: tuple[tuple[str, ...], ...]) -> bool:
+    """v4's rule: more than one row, and every row-0 grid cell non-blank."""
+    return len(grid) > 1 and all(text.strip() for text in grid[0])
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1675,9 +1691,29 @@ def classify_blocks(blocks: tuple[TextBlock, ...]) -> tuple[StreamItem, ...]:
         TypeError: If ``blocks`` is not a tuple of TextBlock.
     """
     typed_tuple("blocks", blocks, TextBlock)
-    body = _body_size(blocks)
-    headings = [_is_heading(found, body) for found in blocks]
-    levels = _heading_levels(_tenths(found.lines[0].font_size_pt) for found, is_one in zip(blocks, headings) if is_one)
+    return tuple(_classified_runs([list(blocks)])[0])
+
+
+def _classified_runs(runs: list[list[TextBlock]]) -> list[list[StreamItem]]:
+    """Each run of neighbouring blocks classified apart, with the body size and heading levels of them all.
+
+    A list never runs from one run into the next: :func:`stream_layout`
+    passes the page's paragraphs between its tables as runs.
+    """
+    every = [found for run in runs for found in run]
+    body = _body_size(every)
+    flags = [_is_heading(found, body) for found in every]
+    levels = _heading_levels(_tenths(found.lines[0].font_size_pt) for found, flag in zip(every, flags) if flag)
+    classified: list[list[StreamItem]] = []
+    start = 0
+    for run in runs:
+        classified.append(_classified(run, flags[start : start + len(run)], levels))
+        start += len(run)
+    return classified
+
+
+def _classified(blocks: list[TextBlock], headings: list[bool], levels: dict[int, int]) -> list[StreamItem]:
+    """Neighbouring blocks classified (:func:`classify_blocks`), given which are headings and each size's level."""
     items: list[StreamItem] = []
     pending: list[tuple[StreamListItem, bool]] = []
     for found, is_heading in zip(blocks, headings):
@@ -1696,7 +1732,7 @@ def classify_blocks(blocks: tuple[TextBlock, ...]) -> tuple[StreamItem, ...]:
             items.extend(_pairs_and_paragraphs(found))
     if pending:
         items.append(_stream_list(pending))
-    return tuple(items)
+    return items
 
 
 def _tenths(size: float) -> int:
@@ -1704,7 +1740,7 @@ def _tenths(size: float) -> int:
     return round(size * 10)
 
 
-def _body_size(blocks: tuple[TextBlock, ...]) -> int:
+def _body_size(blocks: list[TextBlock]) -> int:
     """The page's body size in tenths: the upper median of its lines' sizes, each weighed by its non-blank chars.
 
     v4's median (``page_median_size``: the upper middle, not a mean),
@@ -1830,3 +1866,379 @@ def _pair_or_paragraph(parsed: tuple[str, str] | None, lines: list[TextLine]) ->
         return StreamParagraph(text=" ".join(item.text for item in lines), bbox=bbox, pieces=_lines_pieces(lines))
     value = " ".join(part for part in (parsed[1], *(item.text.strip() for item in lines[1:])) if part)
     return StreamKeyValue(key=parsed[0], value=value, bbox=bbox, pieces=_lines_pieces(lines))
+
+
+# Stream tables and the page's reading order (spec §3.3 step 3, Pass B).
+
+# Rows fewer than this whose widest gap between columns passes this share of the page along them are a masthead
+# (spec): pairs and paragraphs, not a table. On the corpus datasheets, 2-row mastheads gap 0.41 to 0.44 of the page.
+_MASTHEAD_ROWS = 3
+_MASTHEAD_GAP = 0.40
+# Rows are prose, not a table, when at least this share of their cells hold at least this many words: on the
+# corpus, every run of two-column prose lines has a share of 0.5 to 1.0; the fixture tables have none.
+_PROSE_WORDS = 4
+_PROSE_SHARE = Fraction(1, 2)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class StreamTable:
+    """A borderless table of the stream text: lines whose cells keep to consistent X-bands (spec §3.3 Pass B).
+
+    Attributes:
+        rows: Its lines, at least 2, top to bottom in their own frame.
+        columns: Per row, the column of each of its cells, rising; every
+            column holds a cell.
+        column_centres: Each column's centre on the displayed page, along
+            the rows: the middle of the band its cells span (display x for
+            upright text, display y for text turned a quarter turn, so
+            falling for text read up the page). At least 2.
+        bbox: The union of its rows' boxes on the displayed page.
+    """
+
+    rows: tuple[TextLine, ...]
+    columns: tuple[tuple[int, ...], ...]
+    column_centres: tuple[float, ...]
+    bbox: BBox
+
+    def __post_init__(self) -> None:
+        typed_tuple("rows", self.rows, TextLine)
+        if len(self.rows) < _MIN_GRID:
+            raise ValueError(f"rows must hold at least {_MIN_GRID} rows, got {len(self.rows)}")
+        if not isinstance(self.column_centres, tuple):
+            raise TypeError(f"column_centres must be a tuple, got {type(self.column_centres).__name__}")
+        if len(self.column_centres) < _MIN_GRID:
+            raise ValueError(f"column_centres must hold at least {_MIN_GRID} columns, got {len(self.column_centres)}")
+        for index, centre in enumerate(self.column_centres):
+            finite_float(f"column_centres[{index}]", centre)
+        self._check_columns()
+        _check_bbox("bbox", self.bbox)
+        for index, item in enumerate(self.rows):
+            if _outside(_plain(item.bbox), self.bbox):
+                raise ValueError(f"rows[{index}].bbox must lie within the bbox, got {item.bbox} in {self.bbox}")
+
+    def _check_columns(self) -> None:
+        """One entry per row, placing each of its cells in a column, rising, with no column left empty."""
+        if not isinstance(self.columns, tuple):
+            raise TypeError(f"columns must be a tuple, got {type(self.columns).__name__}")
+        if len(self.columns) != len(self.rows):
+            raise ValueError(f"columns must hold one entry per row ({len(self.rows)}), got {len(self.columns)}")
+        last = self.n_cols - 1
+        held: set[int] = set()
+        for index, (row, placed) in enumerate(zip(self.rows, self.columns)):
+            if not isinstance(placed, tuple) or len(placed) != len(row.cells):
+                raise ValueError(
+                    f"columns[{index}] must place each of the row's {len(row.cells)} cells, got {placed!r}"
+                )
+            for at, column in enumerate(placed):
+                int_at_least(f"columns[{index}][{at}]", column, 0)
+            if any(after <= before for before, after in zip(placed, placed[1:])) or placed[-1] > last:
+                raise ValueError(f"columns[{index}] must rise strictly within 0..{last}, got {placed!r}")
+            held.update(placed)
+        if len(held) <= last:
+            missing = min(set(range(last + 1)) - held)
+            raise ValueError(f"every column must hold a cell: column {missing} holds none")
+
+    @property
+    def n_cols(self) -> int:
+        """Its column count."""
+        return len(self.column_centres)
+
+    def grid(self) -> tuple[tuple[str, ...], ...]:
+        """The cell texts by row and column, ``""`` where a row has no cell."""
+        grid = []
+        for row, placed in zip(self.rows, self.columns):
+            texts = [""] * self.n_cols
+            for found, column in zip(row.cells, placed):
+                texts[column] = found.text
+            grid.append(tuple(texts))
+        return tuple(grid)
+
+    @property
+    def has_header(self) -> bool:
+        """A4a's rule (:func:`_has_header`): every cell of the first row non-blank."""
+        return _has_header(self.grid())
+
+    @property
+    def pieces(self) -> tuple[SpanPiece, ...]:
+        """The char ranges its rows read, row by row."""
+        return _lines_pieces(self.rows)
+
+
+StreamElement = StreamItem | StreamTable
+
+
+def stream_layout(
+    pieces: tuple[SpanPiece, ...], lattice: LatticeResult, *, width_pt: float, height_pt: float
+) -> tuple[StreamElement, ...]:
+    """The page's visible text outside its lattice tables, in reading order, as tables and classified text.
+
+    Spec §3.3 step 3, Pass B:
+
+    1. Lines: the page's stream lines (:func:`text_lines`).
+    2. Rows (:func:`_row_structures`): each run of 2 or more neighbouring
+       lines of 2 or more cells whose cells keep to consistent X-bands
+       (:func:`_aligned_runs`) is, by the first rule it meets, a list of
+       key-value pairs (every line a key cell ending in a colon and a
+       value cell), a masthead (fewer than :data:`_MASTHEAD_ROWS` lines and
+       its widest gap between columns over :data:`_MASTHEAD_GAP` of the
+       page along them: a pair or paragraph per cell), prose (left to step
+       3), or a :class:`StreamTable`, unless its columns are page columns
+       (:func:`_without_page_columns`; left to step 3).
+    3. Reading order: v4's XY-cut (:func:`text_blocks`) of the other
+       text, each table, list or masthead in it as one item, so no gutter
+       cuts it into columns; each segment's lines merge into paragraphs
+       between the items, top to bottom.
+    4. The paragraphs are classified (:func:`classify_blocks`), the body
+       size and heading levels read over all of them, so text in rows
+       never moves the body size; a list never runs across a table.
+
+    Ids and positions among the lattice tables and figures come in A4b
+    group 3. Every visible char outside the lattice tables is read once,
+    in the items' ``pieces``.
+
+    Cost: O(c log c) for c chars, plus two XY-cuts' O(D r log r) for r
+    runs (one to find page columns, one to read the page).
+
+    Known limitations:
+
+    - Lines run across the page, so a borderless table beside other text
+      on the same lines (in one column of two) is not found: its text
+      reads as paragraphs.
+    - A cell wrapped onto a line of its own ends its table (spec: runs of
+      lines of 2 or more cells), as does a cell reaching across two
+      columns.
+    - A table whose cells are half or more running text (4 words or
+      more, as a two-column glossary's) reads as prose.
+
+    Args:
+        pieces: The page's pieces (``PageAssessment.pieces``).
+        lattice: Their lattice tables (``find_lattice_tables(segments,
+            pieces)``).
+        width_pt: The displayed page's width in points.
+        height_pt: Its height in points.
+
+    Raises:
+        TypeError: If an argument is of the wrong type.
+        ValueError: As :func:`text_lines`, or if a page side is not
+            finite and greater than zero.
+    """
+    width, height = positive_float("width_pt", width_pt), positive_float("height_pt", height_pt)
+    runs = _stream_runs(pieces, lattice)
+    turn = _page_turn(runs)
+    structures = _row_structures(_ordered_lines(runs, turn), width=width, height=height)
+    structures = _without_page_columns(structures, runs, turn)
+    slots = _reading_slots(runs, turn, structures)
+    classified = iter(_classified_runs([slot for slot in slots if isinstance(slot, list)]))
+    return tuple(item for slot in slots for item in (next(classified) if isinstance(slot, list) else slot.items))
+
+
+class _Rows(NamedTuple):
+    """Lines read whole: a stream table, or a masthead or key-value list as pairs and paragraphs."""
+
+    rows: tuple[TextLine, ...]
+    items: tuple[StreamElement, ...]
+
+
+def _without_page_columns(structures: list[_Rows], runs: list[_TurnedRun], turn: int) -> list[_Rows]:
+    """The structures but the tables whose columns are page columns: text on one baseline grid, not a table.
+
+    v4's XY-cut of all the page's runs (as :func:`text_blocks` reads them)
+    puts the table's cells in 2 or more segments, and every column of it
+    shares a segment with text in no structure: each column runs on past
+    the table, as two columns of an index do whose lines share baselines
+    (Root's Law p. 31, a 19-row false table). A table with a column that
+    shares segments only with structures (a title over its first column
+    leaves the others alone) stays. O(D r log r) for r runs.
+    """
+    boxes = [_turned(_ink_box(run), turn) for _, run in runs]
+    segment_of: dict[tuple[int, int, int], int] = {}
+    for number, segment in enumerate(_xy_cut(boxes, [run.end - run.start for _, run in runs])):
+        segment_of.update((_key(runs[index][1]), number) for index in segment)
+    taken = {_key(piece) for found in structures for piece in _lines_pieces(found.rows)}
+    free = {number for key, number in segment_of.items() if key not in taken}
+    return [
+        found
+        for found in structures
+        if not (isinstance(found.items[0], StreamTable) and _page_columns(found.items[0], segment_of, free))
+    ]
+
+
+def _page_columns(table: StreamTable, segment_of: dict[tuple[int, int, int], int], free: set[int]) -> bool:
+    """True if the table's cells lie in 2 or more segments and each of its columns shares one with free text."""
+    by_column: list[set[int]] = [set() for _ in range(table.n_cols)]
+    for row, placed in zip(table.rows, table.columns):
+        for found, column in zip(row.cells, placed):
+            by_column[column].update(segment_of[_key(piece)] for piece in found.pieces)
+    return len(set().union(*by_column)) >= _MIN_GRID and all(segments & free for segments in by_column)
+
+
+def _row_structures(lines: list[TextLine], *, width: float, height: float) -> list[_Rows]:
+    """The tables, mastheads and key-value lists among the lines (:func:`stream_layout`, step 2), in order.
+
+    The page's extent along a run's lines (``width`` for upright text,
+    ``height`` for text turned a quarter turn) weighs a masthead's gap.
+    """
+    found = []
+    for rows, starts, ends in _aligned_runs(lines):
+        extent = width if rows[0].turn == _ACROSS else height
+        structure = _row_structure(rows, starts, ends, extent)
+        if structure is not None:
+            found.append(structure)
+    return found
+
+
+def _aligned_runs(lines: list[TextLine]) -> Iterator[tuple[list[TextLine], list[float], list[float]]]:
+    """Yield each run of 2 or more neighbouring lines of one turn whose cells fit X-bands, with its bands.
+
+    Bands come as their starts and ends along the lines, sorted. A line
+    that does not fit (:func:`_fit`), has one cell or another turn ends
+    the run; one of 2 or more cells starts the next. O(c log c) for c
+    cells: each cell is placed by bisection, and a band is inserted once.
+    """
+    rows: list[TextLine] = []
+    starts: list[float] = []
+    ends: list[float] = []
+    for item in lines:
+        spans = [_along(found.bbox, item.turn) for found in item.cells]
+        several = len(spans) >= _MIN_GRID
+        if several and rows and item.turn == rows[0].turn and _fit(starts, ends, spans):
+            rows.append(item)
+            continue
+        if len(rows) >= _MIN_GRID:
+            yield rows, starts, ends
+        rows, starts, ends = [], [], []
+        if several and _fit(starts, ends, spans):
+            rows.append(item)
+    if len(rows) >= _MIN_GRID:
+        yield rows, starts, ends
+
+
+def _along(bbox: BBox, turn: int) -> tuple[float, float]:
+    """Where a box starts and ends along a line of ``turn``, in its frame."""
+    x0, _, x1, _ = _turned(_plain(bbox), turn)
+    return x0, x1
+
+
+def _fit(starts: list[float], ends: list[float], spans: list[tuple[float, float]]) -> bool:
+    """Add a line's cells (``spans`` along it, in order) to the bands, or leave the bands and return False.
+
+    Interval projection with no slack: a cell joins the one band it
+    overlaps or touches, widening it, or makes a band of its own. The line
+    does not fit when its cells overlap, a cell meets two bands, or two
+    cells meet one: its cells would not be one per column.
+    """
+    plan: list[tuple[int, bool, float, float]] = []
+    reach, joined = -math.inf, -1
+    for start, end in spans:
+        low, high = bisect_left(ends, start), bisect_right(starts, end)
+        if start <= reach or high - low > 1 or (high - low == 1 and low == joined):
+            return False
+        plan.append((low, high > low, start, end))
+        reach, joined = end, (low if high > low else -1)
+    for at, joins, start, end in reversed(plan):
+        if joins:
+            starts[at], ends[at] = min(starts[at], start), max(ends[at], end)
+        else:
+            starts.insert(at, start)
+            ends.insert(at, end)
+    return True
+
+
+def _row_structure(rows: list[TextLine], starts: list[float], ends: list[float], extent: float) -> _Rows | None:
+    """A run's lines as a key-value list, a masthead, or a table; None for prose (:func:`stream_layout`, step 2)."""
+    if all(len(item.cells) == _MIN_GRID and _is_key(item.cells[0].text) for item in rows):
+        return _Rows(tuple(rows), tuple(_pair_or_paragraph(_key_value(item.text), [item]) for item in rows))
+    gap = max(start - end for end, start in zip(ends, starts[1:]))
+    if len(rows) < _MASTHEAD_ROWS and gap > _MASTHEAD_GAP * extent:
+        return _Rows(tuple(rows), tuple(_cell_item(found) for item in rows for found in item.cells))
+    cells = [found for item in rows for found in item.cells]
+    if sum(len(found.text.split()) >= _PROSE_WORDS for found in cells) >= _PROSE_SHARE * len(cells):
+        return None
+    return _Rows(tuple(rows), (_stream_table(rows, starts, ends),))
+
+
+def _is_key(text: str) -> bool:
+    """True if ``text`` is a key and its colon, nothing after: ``Weight:``."""
+    parsed = _key_value(text)
+    return parsed is not None and not parsed[1]
+
+
+def _cell_item(found: TextCell) -> StreamKeyValue | StreamParagraph:
+    """A masthead cell as a pair, if it reads ``Key: Value``, else a paragraph."""
+    parsed = _key_value(found.text)
+    if parsed is None:
+        return StreamParagraph(text=found.text, bbox=found.bbox, pieces=found.pieces)
+    return StreamKeyValue(key=parsed[0], value=parsed[1], bbox=found.bbox, pieces=found.pieces)
+
+
+def _stream_table(rows: list[TextLine], starts: list[float], ends: list[float]) -> StreamTable:
+    """A run's lines as a table: each cell in the band holding its start, each column centred on its band."""
+    turn = rows[0].turn
+    columns = tuple(
+        tuple(bisect_right(starts, _along(found.bbox, turn)[0]) - 1 for found in item.cells) for item in rows
+    )
+    # Back to the displayed page: along a line read up it (turn 270), the frame's x is the page's y negated.
+    sign = -1.0 if turn == _UP else 1.0
+    centres = tuple(sign * (start + end) / 2 for start, end in zip(starts, ends))
+    bbox = _bbox(union_box(tuple(_plain(item.bbox) for item in rows)))
+    return StreamTable(rows=tuple(rows), columns=columns, column_centres=centres, bbox=bbox)
+
+
+# A slot of the page's reading order: neighbouring paragraphs, or lines read whole.
+_Slot = list[TextBlock] | _Rows
+
+
+def _reading_slots(runs: list[_TurnedRun], turn: int, structures: list[_Rows]) -> list[_Slot]:
+    """The page's paragraphs and row structures in reading order (:func:`stream_layout`, step 3).
+
+    The XY-cut reads each structure as one item: the union of its runs'
+    ink, weighing their chars. The other runs are items as in
+    :func:`text_blocks`.
+    """
+    owner = {_key(piece): index for index, found in enumerate(structures) for piece in _lines_pieces(found.rows)}
+    free: list[_TurnedRun] = []
+    members: list[list[_Run]] = [[] for _ in structures]
+    for item in runs:
+        at = owner.get(_key(item[1]))
+        if at is None:
+            free.append(item)
+        else:
+            members[at].append(item[1])
+    boxes = [_turned(_ink_box(run), turn) for _, run in free]
+    boxes += [_turned(union_box(tuple(_ink_box(run) for run in found)), turn) for found in members]
+    weights = [run.end - run.start for _, run in free]
+    weights += [sum(run.end - run.start for run in found) for found in members]
+    slots: list[_Slot] = []
+    for segment in _xy_cut(boxes, weights):
+        slots.extend(_segment_slots(segment, free, structures, boxes, turn))
+    return slots
+
+
+def _key(item: _Run | SpanPiece) -> tuple[int, int, int]:
+    """A run's identity on the page: its span's, and its char range there."""
+    span = item.piece.span if isinstance(item, _Run) else item.span
+    return id(span), item.start, item.end
+
+
+def _segment_slots(
+    segment: list[int], free: list[_TurnedRun], structures: list[_Rows], boxes: list[Box], turn: int
+) -> list[_Slot]:
+    """One XY-cut segment's slots: its runs' lines in paragraphs between its structures, top to bottom."""
+    count = len(free)
+    placed = sorted((boxes[index][1], index - count) for index in segment if index >= count)
+    slots: list[_Slot] = []
+    group: list[TextLine] = []
+    at = 0
+    for item in _ordered_lines([free[index] for index in segment if index < count], turn):
+        top = _turned(_plain(item.bbox), turn)[1]
+        while at < len(placed) and placed[at][0] <= top:
+            if group:
+                slots.append(_paragraphs(group))
+                group = []
+            slots.append(structures[placed[at][1]])
+            at += 1
+        group.append(item)
+    if group:
+        slots.append(_paragraphs(group))
+    slots.extend(structures[index] for _, index in placed[at:])
+    return slots

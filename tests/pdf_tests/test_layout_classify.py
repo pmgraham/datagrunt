@@ -283,6 +283,12 @@ class TestKeyValues:
 
         assert described(classify_blocks((block(pair, after),))) == expected
 
+    def test_a_line_of_one_word_too_long_for_the_room_continues_the_value(self):
+        # The pair's line ends at x 46, the block at 82: 36 pt of room for a 72 pt word.
+        pair, after = line(cell("Ab: cd", 10.0, 10.0)), line(cell("efghijklmnop", 10.0, 24.0))
+
+        assert described(classify_blocks((block(pair, after),))) == [("key_value", "Ab", "cd efghijklmnop")]
+
     def test_a_key_with_nothing_after_it_has_an_empty_value(self, tmp_path):
         items = read_items(tmp_path, *lines_of(("Signature:", "Date:")))
 
