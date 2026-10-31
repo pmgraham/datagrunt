@@ -250,6 +250,8 @@ _MAX_DECODED_PIXELS = _MAX_ASSET_BYTES // 4 // 3
 # 62500 tiles 761 MB), before any pixel is decoded. 4096 tiles cost ~50 MB
 # and admit tiles of 148 x 148 or larger over a full-bound image.
 _MAX_JPX_TILES = 4096
+_MAX_JPX_COMPONENTS = 4
+_MAX_DECODED_SAMPLES = _MAX_DECODED_PIXELS * 4
 
 # An ASCII-wrapped (ASCII85 / ASCIIHex) DCT or JPX stream at most this long
 # is decoded by pdfium to read its header: ASCII85's "z" turns 1 byte into 4,
@@ -286,6 +288,7 @@ _HEADER_READERS: MappingProxyType[str, Callable[[bytes], CodestreamSize | None]]
 # Filters in front of such a codec that pdfium may decode to reach its header:
 # ASCII85 and ASCIIHex grow data at most fourfold (Flate or LZW could be a bomb).
 _ASCII_FILTERS = frozenset({"ASCII85Decode", "ASCIIHexDecode"})
+_SIMPLE_FILTERS = frozenset({*_ASCII_FILTERS, "LZWDecode", "FlateDecode", "RunLengthDecode", "CCITTFaxDecode"})
 # Codecs pdfium decodes in full to report an image's metadata (observed for
 # JPX: 0.14 s and 78 MB at 9000 x 9000); JBIG2 is treated alike, unobserved
 # (no encoder here). Their bits per pixel and colour space are never read.
@@ -518,8 +521,8 @@ def ascii_decoded_stream(image: pdfium_c.FPDF_PAGEOBJECT, raw_size: int, label: 
     if raw_size > _MAX_ASCII_WRAPPED_BYTES:
         return None
     size = pdfium_c.FPDFImageObj_GetImageDataDecoded(image, None, 0)
-    if size == 0:
-        return b""
+    if size == 0 or size > _MAX_ASSET_BYTES:
+        return None
     buffer = ctypes.create_string_buffer(size)
     if pdfium_c.FPDFImageObj_GetImageDataDecoded(image, buffer, size) != size:
         raise PdfiumFailure(f"read the decoded stream of {label}")
@@ -597,8 +600,10 @@ def _decode_size(
     """The (width, height) pdfium decodes an image at, and why it must not (None: it may)."""
     codec = filters[-1] if filters else ""
     reader = _HEADER_READERS.get(codec)
-    tiles = 1
+    tiles, components = 1, 1
     if reader is None:
+        if not _SIMPLE_FILTERS.issuperset(filters):
+            return 0, 0, ("unsized", f"{label} uses filter {codec!r}: its decode size cannot be read without decoding")
         width, height = declared
     else:
         wrappers = filters[:-1]
@@ -610,11 +615,22 @@ def _decode_size(
         header = None if data is None else reader(data)
         if header is None:
             return 0, 0, ("unsized", f"{label} has a {codec} header that cannot be read")
-        width, height, tiles = _dimension(header.width), _dimension(header.height), header.tiles
+        if header.components > _MAX_JPX_COMPONENTS:
+            message = f"{label} has {header.components} components, over the {_MAX_JPX_COMPONENTS}-component bound"
+            return 0, 0, ("oversized", message)
+        width, height = _dimension(header.width), _dimension(header.height)
+        tiles, components = header.tiles, header.components
     if not (width and height):
         return width, height, ("unsized", f"{label} has no pixel size pdfium can decode ({width} x {height})")
     if width * height > _MAX_DECODED_PIXELS:
         return width, height, ("oversized", _too_many_pixels(width, height, label))
+    if width * height * components > _MAX_DECODED_SAMPLES:
+        samples = width * height * components
+        message = (
+            f"{label} is {width} x {height} x {components} "
+            f"({samples} decoded samples, over the {_MAX_DECODED_SAMPLES}-sample bound)"
+        )
+        return 0, 0, ("oversized", message)
     if tiles > _MAX_JPX_TILES:
         return width, height, ("oversized", f"{label} decodes in {tiles} tiles, over the {_MAX_JPX_TILES}-tile bound")
     return width, height, None

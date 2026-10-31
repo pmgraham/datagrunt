@@ -281,11 +281,15 @@ def _straight_edges(points: Sequence[PathPoint]) -> list[tuple[Point, Point]]:
 def _axis_line(start: Point, end: Point) -> Box | None:
     """A user-space edge as a zero-thickness line box, or None if it is short or not axis-aligned."""
     (x0, y0), (x1, y1) = start, end
-    if abs(y1 - y0) < AXIS_TOLERANCE_PT and abs(x1 - x0) >= MIN_LENGTH_PT:
-        y = (y0 + y1) / 2
+    dx = abs(x1 - x0)
+    dy = abs(y1 - y0)
+    if not (math.isfinite(dx) and math.isfinite(dy)):
+        raise NonFiniteGeometry(f"path span is not finite: ({x0!r}, {y0!r}) -> ({x1!r}, {y1!r})")
+    if dy < AXIS_TOLERANCE_PT and dx >= MIN_LENGTH_PT:
+        y = y0 + (y1 - y0) / 2
         return min(x0, x1), y, max(x0, x1), y
-    if abs(x1 - x0) < AXIS_TOLERANCE_PT and abs(y1 - y0) >= MIN_LENGTH_PT:
-        x = (x0 + x1) / 2
+    if dx < AXIS_TOLERANCE_PT and dy >= MIN_LENGTH_PT:
+        x = x0 + (x1 - x0) / 2
         return x, min(y0, y1), x, max(y0, y1)
     return None
 
@@ -394,12 +398,19 @@ def _segment(
     flag and colour, a fill segment the fill colour.
     """
     stroke = kind == "stroke"
-    x0, y0, x1, y1 = to_display(line)
+    try:
+        x0, y0, x1, y1 = to_display(line)
+    except ValueError as exc:
+        raise NonFiniteGeometry("path segment is not finite in display space") from exc
+    if not (math.isfinite(x0) and math.isfinite(y0) and math.isfinite(x1) and math.isfinite(y1)):
+        raise NonFiniteGeometry("path segment is not finite in display space")
     orientation: Orientation
     if x1 - x0 > y1 - y0:
         orientation, position, start, end = "h", y0, x0, x1
     else:
         orientation, position, start, end = "v", x0, y0, y1
+    if not start < end:
+        raise NonFiniteGeometry("path segment collapsed in display space")
     return RawSegment(
         orientation=orientation,
         position=position,

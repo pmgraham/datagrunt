@@ -12,6 +12,7 @@ import ast
 import dataclasses
 import pickle
 import re
+from functools import partial
 from pathlib import Path
 
 import pypdfium2 as pdfium
@@ -24,9 +25,11 @@ from datagrunt.pdf.pdfium_engine import (
     PageSegments,
     RawSegment,
     SegmentStats,
+    extract_page,
     open_document,
     page_segments,
     page_text,
+    to_display_box,
 )
 from pdf_tests.builders import FormXObject, Line, PageSpec, Rect, break_page, build_pdf, hand_written_pdf
 
@@ -614,6 +617,27 @@ class TestPathGeometry:
         with pytest.raises(NonFiniteGeometry, match="its stroke is not finitely wide across an edge"):
             path_segments(points, matrix=huge, paint=STROKE, object_index=0, to_display=user_space)
 
+    def test_axis_line_midpoint_and_span_overflow(self):
+        assert _path_segments._axis_line((10.0, 1e308), (50.0, 1e308)) == (10.0, 1e308, 50.0, 1e308)
+        assert _path_segments._axis_line((1e308, 10.0), (1e308, 50.0)) == (1e308, 10.0, 1e308, 50.0)
+
+        with pytest.raises(NonFiniteGeometry):
+            _path_segments._axis_line((-1e308, 10.0), (1e308, 10.0))
+        with pytest.raises(NonFiniteGeometry):
+            _path_segments._axis_line((10.0, -1e308), (10.0, 1e308))
+
+    def test_a_segment_collapsed_in_display_space_raises(self):
+        bound = float(2**57)
+        h_points = [PathPoint("move", -(bound - 16.0), 100.0), PathPoint("line", -(bound - 32.0), 100.0)]
+        v_points = [PathPoint("move", 50.0, -(bound - 32.0)), PathPoint("line", 50.0, -(bound - 48.0))]
+        cropped = partial(to_display_box, rotation_deg=0, page_box=(50.0, 20.0, 350.0, 260.0))
+        unrotated = partial(to_display_box, rotation_deg=0, page_box=(0.0, 0.0, 400.0, 300.0))
+
+        with pytest.raises(NonFiniteGeometry):
+            path_segments(h_points, matrix=IDENTITY, paint=STROKE, object_index=0, to_display=cropped)
+        with pytest.raises(NonFiniteGeometry):
+            path_segments(v_points, matrix=IDENTITY, paint=STROKE, object_index=0, to_display=unrotated)
+
 
 @pytest.fixture
 def page_closes(monkeypatch):
@@ -785,6 +809,49 @@ class TestNonFiniteGeometry:
         monkeypatch.setattr(pdfium_c, function, stand_in)
 
         assert page_segments(handle, 0) == PageSegments(segments=(), stats=stats(1))
+
+    def test_a_path_whose_display_endpoints_collapse_is_skipped(self, tmp_path):
+        # 2^-29 * 2^29 = 1 in y, with f = -268435456 * 536870912 = -2^57:
+        # y0 = -2^57 + 32 and y1 = -2^57 + 48 are 16 pt apart in user space,
+        # but 300.0 - y1 == 300.0 - y0 in IEEE-754 float64 when mapped to display space.
+        v_form = form_xobject(
+            b"50 32 m 50 48 l S",
+            matrix=b"[1 0 0 0.00000000186264514923095703125 0 -268435456]",
+        )
+        v_content = b"10 250 m 200 250 l S q 1 0 0 536870912 0 0 cm /X Do Q"
+        v_path = content_page(tmp_path, v_content, resources=b"/XObject << /X 5 0 R >>", extra=(v_form,))
+        v_handle = open_document(v_path)
+
+        v_got = page_segments(v_handle, 0)
+        v_page = extract_page(v_handle, 0)
+
+        assert rows(v_got.segments) == [("h", 50.0, 10.0, 200.0, 1.0, "stroke", 0)]
+        assert v_got.stats == stats(1)
+        assert v_page.segments == v_got
+
+        # Likewise for a horizontal stroke whose x0 and x1 collapse in to_display_box (x - 50.0 at -2^57).
+        h_form = form_xobject(
+            b"16 50 m 32 50 l S",
+            matrix=b"[0.00000000186264514923095703125 0 0 1 -268435456 0]",
+        )
+        h_content = b"60 250 m 200 250 l S q 536870912 0 0 1 0 0 cm /X Do Q"
+        h_objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /CropBox [50 20 350 260]"
+            b" /Contents 4 0 R /Resources << /XObject << /X 5 0 R >> >> >>",
+            b"<< /Length %d >>\nstream\n%s\nendstream" % (len(h_content), h_content),
+            h_form,
+        ]
+        h_path = hand_written_pdf(tmp_path / "collapse_h.pdf", h_objects)
+        h_handle = open_document(h_path)
+
+        h_got = page_segments(h_handle, 0)
+        h_page = extract_page(h_handle, 0)
+
+        assert rows(h_got.segments) == [("h", 10.0, 10.0, 150.0, 1.0, "stroke", 0)]
+        assert h_got.stats == stats(1)
+        assert h_page.segments == h_got
 
 
 class TestPageSegmentsErrors:

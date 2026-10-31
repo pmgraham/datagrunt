@@ -37,11 +37,15 @@ _CODESTREAM_START = b"\xff\x4f\xff\x51"
 
 
 class CodestreamSize(NamedTuple):
-    """The size a codec decodes an image at, and its JPEG 2000 tile count (1 for JPEG)."""
+    """The size a codec decodes an image at, and its JPEG 2000 tile and component counts (1 for JPEG).
+
+    ``components`` defaults to 1, so a three-field CodestreamSize is unchanged.
+    """
 
     width: int
     height: int
     tiles: int
+    components: int = 1
 
 
 def jpeg_size(data: bytes) -> CodestreamSize | None:
@@ -90,7 +94,7 @@ def jpx_size(data: bytes) -> CodestreamSize | None:
 
     A JP2 file's first top-level ``jp2c`` box holds the codestream; anything
     else must be a raw codestream. The size is the SIZ marker's
-    ``Xsiz - XOsiz`` by ``Ysiz - YOsiz``, with its tile count.
+    ``Xsiz - XOsiz`` by ``Ysiz - YOsiz``, with its tile and component (Csiz) counts.
     """
     if data.startswith(_JP2_SIGNATURE):
         start = _jp2_codestream(data)
@@ -134,4 +138,4 @@ def _siz_size(data: bytes, start: int) -> CodestreamSize | None:
     if xtosiz >= xsiz or ytosiz >= ysiz:
         return None
     tiles = -(-(xsiz - xtosiz) // xtsiz) * -(-(ysiz - ytosiz) // ytsiz)
-    return CodestreamSize(xsiz - xosiz, ysiz - yosiz, tiles)
+    return CodestreamSize(xsiz - xosiz, ysiz - yosiz, tiles, csiz)

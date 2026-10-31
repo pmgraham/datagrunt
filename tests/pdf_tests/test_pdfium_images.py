@@ -1214,16 +1214,21 @@ class TestBitmapFormats:
         assert (got.mode, got.size, got.getpixel((2, 1))) == (mode, (3, 2), pixel)
 
 
-def j2k(size=(16, 8), *, siz=None, tile=None) -> bytes:
-    """A Pillow raw J2K codestream of a gray image; ``siz`` and ``tile`` overwrite its SIZ size and tile size."""
+def j2k(size=(16, 8), *, mode: str = "L", siz=None, tile=None, components: int | None = None) -> bytes:
+    """A Pillow raw J2K codestream; ``siz``, ``tile`` and ``components`` overwrite its SIZ header."""
     buffer = io.BytesIO()
-    Image.new("L", size, 128).save(buffer, "JPEG2000", no_jp2=True)
+    Image.new(mode, size).save(buffer, "JPEG2000", no_jp2=True)
     data = bytearray(buffer.getvalue())
     at = data.find(b"\xff\x4f\xff\x51")
     if siz is not None:
         data[at + 8 : at + 16] = struct.pack(">II", *siz)
     if tile is not None:
         data[at + 24 : at + 32] = struct.pack(">II", *tile)
+    if components is not None:
+        (csiz,) = struct.unpack_from(">H", data, at + 40)
+        entry = bytes(data[at + 42 : at + 45])
+        data[at + 4 : at + 6] = struct.pack(">H", 38 + 3 * components)
+        data[at + 40 : at + 42 + 3 * csiz] = struct.pack(">H", components) + entry * components
     return bytes(data)
 
 
@@ -1494,6 +1499,67 @@ class TestDecodeBounds:
         (image,) = images_of(path).images
 
         assert (image.px_width, image.declared_px, image.bits_per_pixel) == (131071, (131071, 1), 8)
+
+    def test_a_jpx_past_the_component_bound_is_refused_before_decoding(self, tmp_path, decode_calls):
+        bomb = j2k((16, 8), components=5)
+        path = xobject_page(tmp_path, bomb, gray(16, 8, b"/JPXDecode"))
+
+        got = images_of(path)
+
+        (image,) = got.images
+        assert (image.px_width, image.px_height) == (0, 0)
+        assert got.stats == stats(oversized=1, cover=DRAWN)
+        with pytest.raises(DatagruntPDFError, match=re.escape("5 components, over the 4-component bound")):
+            only_loader(path).png_bytes()
+        assert decode_calls == []
+        assert _pdfium_images._MAX_JPX_COMPONENTS == 4
+
+    def test_a_jpx_past_the_decoded_samples_bound_is_refused_before_decoding(self, tmp_path, monkeypatch, decode_calls):
+        monkeypatch.setattr(_pdfium_images, "_MAX_DECODED_SAMPLES", 16 * 8 * 2, raising=False)
+        rgba_jpx = j2k((16, 8), mode="RGBA")
+        path = xobject_page(tmp_path, rgba_jpx, gray(16, 8, b"/JPXDecode"))
+
+        got = images_of(path)
+
+        assert got.stats == stats(oversized=1, cover=DRAWN)
+        with pytest.raises(DatagruntPDFError, match="decoded samples"):
+            only_loader(path).png_bytes()
+        assert decode_calls == []
+
+    @pytest.mark.parametrize("codec", [b"JBIG2Decode", b"Crypt"], ids=["jbig2", "crypt"])
+    def test_an_unsized_filter_is_recorded_without_size_and_never_decoded(self, tmp_path, decode_calls, codec):
+        path = xobject_page(tmp_path, bytes(16), gray(16, 8, b"/" + codec))
+
+        got = images_of(path)
+
+        (image,) = got.images
+        assert (image.px_width, image.px_height) == (0, 0)
+        assert got.stats == stats(unsized=1, cover=DRAWN)
+        with pytest.raises(DatagruntPDFError, match="cannot be read"):
+            only_loader(path).png_bytes()
+        assert decode_calls == []
+
+    def test_an_ascii_decoded_stream_over_the_asset_limit_is_not_allocated(self, tmp_path, monkeypatch):
+        wrapped = jpeg_bytes((16, 8)).hex().encode() + b">"
+        entries = b"/Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter [/ASCIIHexDecode /DCTDecode]"
+        real_create = ctypes.create_string_buffer
+
+        def guarded_create(init, size=None):
+            if isinstance(init, int) and init > _pdfium_images._MAX_ASSET_BYTES:
+                pytest.fail(f"allocated {init}-byte buffer over the asset limit")
+            return real_create(init, size)
+
+        monkeypatch.setattr(ctypes, "create_string_buffer", guarded_create)
+        monkeypatch.setattr(
+            _pdfium_images.pdfium_c,
+            "FPDFImageObj_GetImageDataDecoded",
+            lambda image, buf, length: _pdfium_images._MAX_ASSET_BYTES + 1,
+        )
+
+        got = images_of(xobject_page(tmp_path, wrapped, entries))
+
+        assert [(item.px_width, item.px_height) for item in got.images] == [(0, 0)]
+        assert got.stats.skipped_unsized_images + got.stats.skipped_oversized_images == 1
 
 
 def drawn_times(tmp_path: Path, count: int, data: bytes = FLATE, entries: bytes = RGB_4X2 + b" /Filter /FlateDecode"):
