@@ -46,7 +46,7 @@ dev = [
     # design (0.16 began formatting Python inside Markdown, #312), and CI gates
     # on `ruff format --check`. Unbounded, a formatter release breaks CI on
     # untouched code. Runtime deps stay unbounded (see #307); dev tools do not.
-    "ruff>=0.15.17,<0.17",
+    "ruff>=0.15.17,<0.18",
     # Upper-bounded the same way as ruff (#312): allow the current minor,
     # exclude the next. mypy adds default-on error codes in 1.x minor
     # releases, and this gate is blocking.
