@@ -6,13 +6,20 @@ and A3's span pieces (:class:`~datagrunt.pdf.quality.SpanPiece`) and calls
 no pdfium function. Boxes are displayed, top-left ``(x0, y0, x1, y1)`` points.
 """
 
+import math
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from typing import NamedTuple
 
+from datagrunt.pdf._path_segments import RawSegment
 from datagrunt.pdf._validate import int_at_least, typed_tuple
 from datagrunt.pdf.elements import BBox
 from datagrunt.pdf.quality import SpanPiece
 
 __all__ = ["LatticeCell", "LatticeResult", "LatticeTable"]
+
+# Lines this close snap to one position, join end to end, and meet (spec §3.3 Pass A).
+SNAP_PT = 2.0
 
 
 def _check_bbox(name: str, value: object) -> BBox:
@@ -169,3 +176,62 @@ class LatticeResult:
                 raise ValueError(
                     f"used_pieces[{index}] is hidden ({item.hidden_reasons!r}): hidden text never enters a table"
                 )
+
+
+class _Line(NamedTuple):
+    """A snapped, merged rule: its position across its axis, and where it starts and ends along it."""
+
+    position: float
+    start: float
+    end: float
+
+
+def _snapped_lines(segments: Iterable[RawSegment]) -> tuple[list[_Line], list[_Line]]:
+    """The horizontal and vertical rules of ``segments``, snapped and merged.
+
+    Per orientation, positions chain into clusters (sorted, each within
+    :data:`SNAP_PT` of the one before, as pdfplumber snaps) and each
+    cluster's segments move to its mean; then the segments at each
+    position merge where they overlap, touch or leave a gap of at most
+    :data:`SNAP_PT`. Every segment rules, whatever its kind, dash or
+    colour (v4's pdfplumber reads every edge). Lines come sorted by
+    position, then start. O(n log n) for n segments.
+    """
+    horizontal = [item for item in segments if item.orientation == "h"]
+    vertical = [item for item in segments if item.orientation == "v"]
+    return _snap_and_merge(horizontal), _snap_and_merge(vertical)
+
+
+def _snap_and_merge(segments: list[RawSegment]) -> list[_Line]:
+    """One orientation's segments, snapped to their clusters' mean positions and merged along them."""
+    lines: list[_Line] = []
+    for cluster in _position_clusters(sorted(segments, key=lambda item: item.position)):
+        position = math.fsum(item.position for item in cluster) / len(cluster)
+        lines.extend(_merged(position, sorted((item.start, item.end) for item in cluster)))
+    return lines
+
+
+def _position_clusters(ordered: list[RawSegment]) -> Iterator[list[RawSegment]]:
+    """Yield runs of position-sorted segments, each within :data:`SNAP_PT` of the one before."""
+    cluster: list[RawSegment] = []
+    for item in ordered:
+        if cluster and item.position - cluster[-1].position > SNAP_PT:
+            yield cluster
+            cluster = []
+        cluster.append(item)
+    if cluster:
+        yield cluster
+
+
+def _merged(position: float, extents: list[tuple[float, float]]) -> list[_Line]:
+    """Start-sorted ``(start, end)`` extents at ``position``, joined across gaps of at most :data:`SNAP_PT`."""
+    lines = []
+    start, end = extents[0]
+    for next_start, next_end in extents[1:]:
+        if next_start - end <= SNAP_PT:
+            end = max(end, next_end)
+            continue
+        lines.append(_Line(position, start, end))
+        start, end = next_start, next_end
+    lines.append(_Line(position, start, end))
+    return lines

@@ -11,6 +11,7 @@ import re
 import pytest
 
 from datagrunt.pdf import layout, quality
+from datagrunt.pdf._path_segments import RawSegment
 from datagrunt.pdf.elements import BBox
 from datagrunt.pdf.layout import LatticeCell, LatticeResult, LatticeTable
 from datagrunt.pdf.quality import SpanPiece
@@ -70,7 +71,12 @@ class TestModuleImports:
         assert not [name for name in imported_modules(layout) if name.lower().startswith(banned)]
 
     def test_imports_only_the_raw_fact_types_quality_and_a1(self):
-        allowed = {"datagrunt.pdf._validate", "datagrunt.pdf.elements", "datagrunt.pdf.quality"}
+        allowed = {
+            "datagrunt.pdf._path_segments",
+            "datagrunt.pdf._validate",
+            "datagrunt.pdf.elements",
+            "datagrunt.pdf.quality",
+        }
 
         assert {name for name in imported_modules(layout) if name.startswith("datagrunt")} == allowed
 
@@ -298,3 +304,105 @@ class TestLatticeResult:
 
         with pytest.raises(error, match=f"^{re.escape(message)}$"):
             LatticeResult(**(fields | overrides))
+
+
+def seg(orientation: str, position: float, start: float, end: float, **overrides) -> RawSegment:
+    """A RawSegment: a 0.5 pt black stroke unless ``overrides`` say otherwise."""
+    fields = {
+        "orientation": orientation,
+        "position": position,
+        "start": start,
+        "end": end,
+        "width": 0.5,
+        "kind": "stroke",
+        "object_index": 0,
+        "dashed": False,
+        "paint_rgba": (0, 0, 0, 255),
+    }
+    return RawSegment(**(fields | overrides))
+
+
+def h(y: float, x0: float, x1: float, **overrides) -> RawSegment:
+    """A horizontal segment at ``y`` from ``x0`` to ``x1``."""
+    return seg("h", y, x0, x1, **overrides)
+
+
+def v(x: float, y0: float, y1: float, **overrides) -> RawSegment:
+    """A vertical segment at ``x`` from ``y0`` to ``y1``."""
+    return seg("v", x, y0, y1, **overrides)
+
+
+def snapped(*segments: RawSegment):
+    """The snapped, merged lines as ``(horizontal, vertical)`` lists of ``(position, start, end)``."""
+    horizontal, vertical = layout._snapped_lines(segments)
+    return [tuple(line) for line in horizontal], [tuple(line) for line in vertical]
+
+
+class TestSnapping:
+    """Positions within 2 pt of each other snap to their mean, per orientation (chained, as pdfplumber's)."""
+
+    def test_positions_within_2_pt_snap_to_their_mean(self):
+        assert snapped(h(100.0, 10.0, 90.0), h(101.0, 10.0, 90.0), h(102.0, 10.0, 90.0)) == ([(101.0, 10.0, 90.0)], [])
+
+    def test_exactly_2_pt_apart_snap(self):
+        assert snapped(v(100.0, 10.0, 90.0), v(102.0, 10.0, 90.0)) == ([], [(101.0, 10.0, 90.0)])
+
+    def test_more_than_2_pt_apart_stay_apart(self):
+        assert snapped(v(100.0, 10.0, 90.0), v(102.25, 10.0, 90.0)) == ([], [(100.0, 10.0, 90.0), (102.25, 10.0, 90.0)])
+
+    def test_snapping_chains_through_close_neighbours(self):
+        # 100 and 103 are 3 pt apart, but each is within 2 pt of 101.5: one position, their mean.
+        got = snapped(h(103.0, 10.0, 90.0), h(100.0, 10.0, 90.0), h(101.5, 10.0, 90.0))
+
+        assert got == ([(101.5, 10.0, 90.0)], [])
+
+    def test_snapping_is_per_page_so_lines_far_apart_along_the_axis_share_a_position(self):
+        got = snapped(h(100.0, 0.0, 50.0), h(101.0, 200.0, 250.0))
+
+        assert got == ([(100.5, 0.0, 50.0), (100.5, 200.0, 250.0)], [])
+
+    def test_orientations_never_snap_together(self):
+        assert snapped(h(100.0, 10.0, 90.0), v(101.0, 10.0, 90.0)) == ([(100.0, 10.0, 90.0)], [(101.0, 10.0, 90.0)])
+
+
+class TestCollinearMerge:
+    """Snapped lines at one position merge where they overlap, touch or leave a gap of at most 2 pt."""
+
+    @pytest.mark.parametrize(
+        "second,expected",
+        [
+            pytest.param((40.0, 120.0), [(10.0, 120.0)], id="overlapping"),
+            pytest.param((20.0, 30.0), [(10.0, 50.0)], id="contained"),
+            pytest.param((50.0, 120.0), [(10.0, 120.0)], id="touching"),
+            pytest.param((52.0, 120.0), [(10.0, 120.0)], id="gap-of-2-pt"),
+            pytest.param((52.25, 120.0), [(10.0, 50.0), (52.25, 120.0)], id="gap-over-2-pt"),
+        ],
+    )
+    def test_merge(self, second, expected):
+        horizontal, _ = snapped(h(100.0, *second), h(100.0, 10.0, 50.0))
+
+        assert horizontal == [(100.0, start, end) for start, end in expected]
+
+    def test_a_chain_of_short_pieces_is_one_line(self):
+        pieces = [v(40.0, 10.0 + 12.0 * index, 22.0 + 12.0 * index) for index in range(10)]
+
+        assert snapped(*reversed(pieces)) == ([], [(40.0, 10.0, 130.0)])
+
+    def test_snapped_pieces_merge(self):
+        # A rule drawn in two pieces 1 pt apart in y: one line at the mean.
+        assert snapped(h(100.0, 10.0, 60.0), h(101.0, 55.0, 120.0)) == ([(100.5, 10.0, 120.0)], [])
+
+    def test_every_kind_dash_and_colour_rules(self):
+        # v4's pdfplumber (and the A0 prototype) rule a table with every edge: fill edges, thin fills,
+        # dashed and white strokes alike.
+        got = snapped(
+            h(100.0, 10.0, 40.0, kind="fill_edge", width=0.0),
+            h(100.0, 40.0, 70.0, kind="thin_fill", width=2.0),
+            h(100.0, 70.0, 100.0, dashed=True),
+            h(100.0, 100.0, 130.0, paint_rgba=(255, 255, 255, 255)),
+        )
+
+        assert got == ([(100.0, 10.0, 130.0)], [])
+
+    def test_no_segments_no_lines(self):
+        assert snapped() == ([], [])
