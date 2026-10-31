@@ -21,9 +21,9 @@ def jpeg(size=(16, 8), mode="L", **options) -> bytes:
     return buffer.getvalue()
 
 
-def jpeg_2000(size=(16, 8), *, jp2: bool = True, **options) -> bytes:
+def jpeg_2000(size=(16, 8), mode: str = "L", *, jp2: bool = True, **options) -> bytes:
     buffer = io.BytesIO()
-    Image.new("L", size, 128).save(buffer, "JPEG2000", no_jp2=not jp2, **options)
+    Image.new(mode, size).save(buffer, "JPEG2000", no_jp2=not jp2, **options)
     return buffer.getvalue()
 
 
@@ -145,28 +145,30 @@ class TestJpxSize:
 
 
 class TestJpxComponents:
-    """jpx_size reports the SIZ component count (Csiz): decoded memory scales with it."""
+    """jpx_size reads the SIZ marker's Csiz component count; CodestreamSize defaults components to 1."""
 
     @pytest.mark.parametrize("jp2", [True, False], ids=["jp2", "j2k"])
-    @pytest.mark.parametrize("mode,components", [("L", 1), ("RGB", 3), ("RGBA", 4)])
-    def test_reads_the_component_count(self, jp2, mode, components):
-        buffer = io.BytesIO()
-        Image.new(mode, (16, 8)).save(buffer, "JPEG2000", no_jp2=not jp2)
+    @pytest.mark.parametrize("mode,expected", [("L", 1), ("RGB", 3), ("RGBA", 4)])
+    def test_reads_component_count_by_mode(self, jp2, mode, expected):
+        size = jpx_size(jpeg_2000((16, 8), mode, jp2=jp2))
 
-        assert jpx_size(buffer.getvalue()).components == components
+        assert size is not None
+        assert size.components == expected
 
-    def test_a_count_written_into_siz_is_read_as_written(self):
-        # Csiz 40: Lsiz grows by three bytes (Ssiz, XRsiz, YRsiz) per component.
-        data = jpeg_2000(jp2=False)
+    def test_a_patched_siz_marker_with_40_components_is_read(self):
+        data = bytearray(jpeg_2000(jp2=False))
         at = siz_offset(data)
-        (csiz,) = struct.unpack_from(">H", data, at + 40)
-        component = data[at + 42 : at + 45]
-        siz = data[at + 2 : at + 40] + struct.pack(">H", 40) + component * 40
-        patched = data[: at + 2] + b"\xff\x51" + struct.pack(">H", 38 + 3 * 40) + siz[4:] + data[at + 42 + 3 * csiz :]
+        entry = bytes(data[at + 42 : at + 45])
+        data[at + 4 : at + 6] = struct.pack(">H", 38 + 3 * 40)
+        data[at + 40 : at + 45] = struct.pack(">H", 40) + entry * 40
 
-        assert jpx_size(patched).components == 40
+        size = jpx_size(bytes(data))
 
-    def test_jpeg_and_existing_callers_read_one_component(self):
-        # The field defaults to 1, so a three-field CodestreamSize still compares equal.
+        assert size is not None
+        assert size.components == 40
+
+    def test_codestream_size_defaults_components_to_one_and_jpeg_is_one(self):
         assert CodestreamSize(16, 8, 1) == CodestreamSize(16, 8, 1, 1)
-        assert jpeg_size(jpeg((9, 5), "RGB")).components == 1
+        size = jpeg_size(jpeg((9, 5), "RGB"))
+        assert size is not None
+        assert size.components == 1

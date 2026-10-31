@@ -3,6 +3,9 @@
 Coordinates are top-left page points: x grows rightward from the left edge,
 y grows downward from the top edge (the v5 convention). ReportLab draws in
 bottom-left space; ``_flip_y`` is the only place that converts between them.
+Items inside a ``FormXObject`` use the form's own top-left space.
+
+``hand_written_pdf`` writes raw objects, for structures ReportLab cannot write.
 """
 
 from __future__ import annotations
@@ -10,6 +13,7 @@ from __future__ import annotations
 import io
 import math
 import os
+import re
 import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -84,18 +88,46 @@ class RasterImage:
     png: bytes
 
 
-PageItem = TextRun | Line | Rect | RasterImage
+FormItem = TextRun | Line | Rect | RasterImage
+
+
+@dataclass(frozen=True)
+class FormXObject:
+    """A Form XObject whose top-left corner sits at (x, y) on the page.
+
+    ``items`` are drawn inside the form, in its own top-left space: (0, 0) is
+    the form's top-left corner and its /BBox is ``w`` x ``h`` form units. The
+    page draws the form scaled by ``scale``, so an item at form (u, v) lands
+    at page (x + u * scale, y + v * scale). Forms do not nest, and renderers
+    clip a form's content to its box.
+    """
+
+    x: float
+    y: float
+    w: float
+    h: float
+    items: tuple[FormItem, ...] = ()
+    scale: float = 1.0
+
+
+PageItem = FormItem | FormXObject
 
 
 @dataclass(frozen=True)
 class PageSpec:
     """One page: its size in points, the items drawn on it in order, and its
-    /Rotate. Item coordinates are in the unrotated page space."""
+    /Rotate. ``width`` x ``height`` is the unrotated MediaBox; item
+    coordinates are in that unrotated page space. /Rotate turns the displayed
+    page clockwise, so a 90 or 270 page displays ``height`` wide.
+
+    ``crop_box`` is the visible area as top-left ``(x0, y0, x1, y1)`` points
+    inside the page, or None for no /CropBox (the whole MediaBox shows)."""
 
     width: float = 612.0
     height: float = 792.0
     items: tuple[PageItem, ...] = ()
     rotate: int = 0
+    crop_box: tuple[float, float, float, float] | None = None
 
 
 def first_unencodable(font: str, text: str) -> str | None:
@@ -160,6 +192,55 @@ def build_pdf(
     return out
 
 
+# ReportLab writes one flat, uncompressed /Kids array and "\nN 0 obj" headers.
+_KIDS = re.compile(rb"/Kids \[([^\]]*)\]")
+_KID_REF = re.compile(rb"(\d+) 0 R")
+
+
+def break_page(path: str | os.PathLike[str], page_number: int) -> Path:
+    """Make page ``page_number`` (1-based) of a ``build_pdf`` file unloadable, in place.
+
+    Renames that page object's ``/Type /Page`` to ``/Type /Pagx``: the same
+    length, so every xref offset stays valid. pdfium still counts the page,
+    but ``FPDF_LoadPage`` fails on it; the other pages load normally (zeroing
+    a content stream would not do this: pdfium loads an empty page). Page
+    dictionaries are never encrypted, so this works on encrypted files too.
+    """
+    out = Path(path)
+    data = out.read_bytes()
+    _require_int("page_number", page_number)
+    kids = _KIDS.findall(data)
+    _require(len(kids) == 1, f"expected one /Kids array (a build_pdf file), found {len(kids)}")
+    refs = _KID_REF.findall(kids[0])
+    _require(1 <= page_number <= len(refs), f"page_number must be in 1..{len(refs)}, got {page_number}")
+    start = data.index(b"\n" + refs[page_number - 1] + b" 0 obj")
+    end = data.index(b"endobj", start)
+    page_object = data[start:end]
+    _require(page_object.count(b"/Type /Page") == 1, f"page {page_number} has no single /Type /Page entry")
+    out.write_bytes(data[:start] + page_object.replace(b"/Type /Page", b"/Type /Pagx") + data[end:])
+    return out
+
+
+def hand_written_pdf(path: str | os.PathLike[str], objects: Sequence[bytes]) -> Path:
+    """Write ``objects`` (object 1 is the catalog) as a PDF with a correct xref.
+
+    For structures ReportLab cannot write. The offsets are computed, so
+    pdfium reads the file as written instead of repairing it.
+    """
+    data = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objects, 1):
+        offsets.append(len(data))
+        data += b"%d 0 obj\n%s\nendobj\n" % (number, body)
+    xref = len(data)
+    data += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    data += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+    data += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref)
+    out = Path(path)
+    out.write_bytes(bytes(data))
+    return out
+
+
 def _require(ok: bool, message: str) -> None:
     if not ok:
         raise ValueError(message)
@@ -206,8 +287,25 @@ def _check_page(page: PageSpec) -> None:
     _require_positive("PageSpec.height", page.height)
     _require_int("PageSpec.rotate", page.rotate)
     _require(page.rotate in _ROTATIONS, f"PageSpec.rotate must be one of {_ROTATIONS}, got {page.rotate!r}")
+    if page.crop_box is not None:
+        _check_crop_box(page)
     for item in page.items:
         _check_item(item)
+
+
+def _check_crop_box(page: PageSpec) -> None:
+    box = page.crop_box
+    if not isinstance(box, tuple):
+        raise TypeError(f"PageSpec.crop_box must be a tuple or None, got {type(box).__name__}")
+    _require(len(box) == 4, f"PageSpec.crop_box must have 4 values (x0, y0, x1, y1), got {len(box)}")
+    for index, value in enumerate(box):
+        _require_finite(f"PageSpec.crop_box[{index}]", value)
+    x0, y0, x1, y1 = box
+    _require(x0 < x1 and y0 < y1, f"PageSpec.crop_box must have x0 < x1 and y0 < y1, got {box!r}")
+    # pdfium silently intersects a CropBox with the MediaBox; refuse one that
+    # would be clipped, so a test's crop box is always the box pdfium shows.
+    inside = x0 >= 0 and y0 >= 0 and x1 <= page.width and y1 <= page.height
+    _require(inside, f"PageSpec.crop_box must lie within the {page.width} x {page.height} page, got {box!r}")
 
 
 def _check_item(item: PageItem) -> None:
@@ -221,8 +319,21 @@ def _check_item(item: PageItem) -> None:
             _check_rect(item)
         case RasterImage():
             _check_image(item)
+        case FormXObject():
+            _check_form(item)
         case _:
             raise TypeError(f"unsupported page item: {type(item).__name__}")
+
+
+def _check_form(form: FormXObject) -> None:
+    _require_finite_fields(form, ("x", "y"))
+    _require_positive("FormXObject.w", form.w)
+    _require_positive("FormXObject.h", form.h)
+    _require_positive("FormXObject.scale", form.scale)
+    for item in form.items:
+        if isinstance(item, FormXObject):
+            raise TypeError("FormXObject.items cannot hold a FormXObject: forms do not nest")
+        _check_item(item)
 
 
 def _check_text(run: TextRun) -> None:
@@ -274,14 +385,43 @@ def _flip_y(page_height: float, y: float) -> float:
     return page_height - y
 
 
+def _pdf_box(page_height: float, box: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    """Convert a top-left (x0, y0, x1, y1) box to PDF bottom-left (left, bottom, right, top)."""
+    x0, y0, x1, y1 = box
+    return x0, _flip_y(page_height, y1), x1, _flip_y(page_height, y0)
+
+
 def _draw_page(canvas: Canvas, page: PageSpec) -> None:
-    canvas.setPageSize((page.width, page.height))
+    # ReportLab 5.1 treats the page size as the displayed size: on /Rotate 90
+    # and 270 it writes MediaBox [0 0 height width]. Swap first so the
+    # MediaBox is always [0 0 width height], the space items are drawn in.
+    quarter_turn = page.rotate in (90, 270)
+    canvas.setPageSize((page.height, page.width) if quarter_turn else (page.width, page.height))
     canvas.setPageRotation(page.rotate)
-    for item in page.items:
+    # ReportLab keeps a crop box for every later page; set (or clear) it per page.
+    canvas.setCropBox(_pdf_box(page.height, page.crop_box) if page.crop_box is not None else None)
+    for index, item in enumerate(page.items):
         canvas.saveState()
-        _draw_item(canvas, item, page.height)
+        if isinstance(item, FormXObject):
+            # Form names are document-wide: page number + item index is unique.
+            _draw_form(canvas, item, page.height, f"Form{canvas.getPageNumber()}_{index}")
+        else:
+            _draw_item(canvas, item, page.height)
         canvas.restoreState()
     canvas.showPage()
+
+
+def _draw_form(canvas: Canvas, form: FormXObject, page_height: float, name: str) -> None:
+    canvas.beginForm(name, 0, 0, form.w, form.h)
+    for item in form.items:
+        canvas.saveState()
+        _draw_item(canvas, item, form.h)
+        canvas.restoreState()
+    canvas.endForm()
+    # Put the form's bottom-left corner where its scaled top-left lands at (x, y).
+    canvas.translate(form.x, _flip_y(page_height, form.y + form.h * form.scale))
+    canvas.scale(form.scale, form.scale)
+    canvas.doForm(name)
 
 
 def _draw_item(canvas: Canvas, item: PageItem, page_height: float) -> None:

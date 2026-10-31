@@ -6,6 +6,11 @@ Every message names the offending field so construction errors are actionable.
 """
 
 import math
+import re
+
+# A SHA-256 hex digest exactly as hashlib's hexdigest() produces it. Matched
+# with fullmatch() so a trailing newline cannot slip past a `$` anchor.
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 
 def int_at_least(name: str, value: object, minimum: int) -> int:
@@ -49,6 +54,16 @@ def non_blank_str(name: str, value: object) -> str:
     return value
 
 
+def choice_str(name: str, value: object, choices: tuple[str, ...]) -> str:
+    """Return ``value`` if it is one of the str ``choices``."""
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a str, got {value!r} ({type(value).__name__})")
+    if value not in choices:
+        allowed = " or ".join(repr(choice) for choice in choices)
+        raise ValueError(f"{name} must be {allowed}, got {value!r}")
+    return value
+
+
 def str_tuple(name: str, value: object, *, allow_blank: bool = False) -> tuple[str, ...]:
     """Return ``value`` if it is a tuple of str (entries non-blank unless ``allow_blank``)."""
     # A tuple, never a list: element fields must stay immutable and hashable.
@@ -67,3 +82,51 @@ def optional_str(name: str, value: object) -> str | None:
     if value is not None and not isinstance(value, str):
         raise TypeError(f"{name} must be a str or None, got {value!r} ({type(value).__name__})")
     return value
+
+
+def finite_tuple(name: str, value: object, size: int) -> tuple[float, ...]:
+    """Return ``value`` as a tuple of ``size`` finite floats."""
+    if not isinstance(value, tuple):
+        raise TypeError(f"{name} must be a tuple, got {type(value).__name__}")
+    if len(value) != size:
+        raise ValueError(f"{name} must have {size} values, got {len(value)}")
+    return tuple(finite_float(f"{name}[{index}]", item) for index, item in enumerate(value))
+
+
+def strict_bool(name: str, value: object) -> bool:
+    """Return ``value`` if it is exactly a bool (not an int standing in for one)."""
+    if not isinstance(value, bool):
+        raise TypeError(f"{name} must be a bool, got {value!r} ({type(value).__name__})")
+    return value
+
+
+def rgba_tuple(name: str, value: object) -> tuple[int, int, int, int]:
+    """Return ``value`` if it is a tuple of 4 ints in 0..255 (bool rejected)."""
+    if not isinstance(value, tuple):
+        raise TypeError(f"{name} must be a tuple, got {type(value).__name__}")
+    if len(value) != 4:
+        raise ValueError(f"{name} must have 4 channels, got {len(value)}")
+    for index, channel in enumerate(value):
+        if isinstance(channel, bool) or not isinstance(channel, int):
+            raise TypeError(f"{name}[{index}] must be an int, got {channel!r} ({type(channel).__name__})")
+        if not 0 <= channel <= 255:
+            raise ValueError(f"{name}[{index}] must be in 0..255, got {channel}")
+    red, green, blue, alpha = value
+    return red, green, blue, alpha
+
+
+def sha256_hex(name: str, value: object) -> str:
+    """Return ``value`` if it is a 64-char lowercase hex SHA-256 digest."""
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a str, got {value!r} ({type(value).__name__})")
+    if _SHA256_HEX.fullmatch(value) is None:
+        raise ValueError(f"{name} must be 64 lowercase hex characters, got {value!r}")
+    return value
+
+
+def ordered_box(name: str, value: object) -> tuple[float, float, float, float]:
+    """Return ``value`` as 4 finite floats ``(x0, y0, x1, y1)`` with ``x0 <= x1`` and ``y0 <= y1``."""
+    x0, y0, x1, y1 = finite_tuple(name, value, 4)
+    if x0 > x1 or y0 > y1:
+        raise ValueError(f"{name} must have x0 <= x1 and y0 <= y1, got {value!r}")
+    return x0, y0, x1, y1
