@@ -64,10 +64,24 @@ def _element(cls, **overrides):
 
 class TestTypeAliases:
     def test_hidden_reasons_canonical_order(self):
-        assert HIDDEN_REASONS == ("off_page", "invisible", "tiny_font", "transparent", "matches_background")
+        assert HIDDEN_REASONS == (
+            "off_page",
+            "invisible",
+            "tiny_font",
+            "transparent",
+            "matches_background",
+            "zero_scale",
+        )
 
     def test_hidden_reason_literal_members(self):
-        assert get_args(HiddenReason) == ("off_page", "invisible", "tiny_font", "transparent", "matches_background")
+        assert get_args(HiddenReason) == (
+            "off_page",
+            "invisible",
+            "tiny_font",
+            "transparent",
+            "matches_background",
+            "zero_scale",
+        )
 
     def test_page_status_values(self):
         assert get_args(PageStatus) == ("ok", "ocr_fallback", "ocr_unavailable", "error")

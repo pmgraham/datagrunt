@@ -26,16 +26,23 @@ from datagrunt.pdf._validate import (
     int_at_least,
     non_blank_str,
     optional_str,
+    positive_float,
     sha256_hex,
     str_tuple,
 )
 from datagrunt.pdf.exceptions import DatagruntPDFError
 
-HiddenReason: TypeAlias = Literal["off_page", "invisible", "tiny_font", "transparent", "matches_background"]
+HiddenReason: TypeAlias = Literal[
+    "off_page", "invisible", "tiny_font", "transparent", "matches_background", "zero_scale"
+]
 """Why a text span is hidden from a human reader (it is flagged, never dropped).
 
 ``matches_background`` means the text colour is indistinguishable from the
-background it is drawn on.
+background it is drawn on. ``zero_scale`` means the text is squeezed flat:
+drawn under 1 pt per em wide and narrower than tall, as text pdfium's
+textpage drops (``Tz 0``: the v5 engine recovers it) or keeps (``Tz 0.05``)
+(#366). New reasons are appended, so the canonical order of the older ones
+never changes.
 """
 
 # Canonical order, derived from the Literal so the two can never drift apart.
@@ -137,8 +144,16 @@ def _parse_element_id(name: str, value: object) -> tuple[int, int]:
     return page, index
 
 
-def _check_hidden_reasons(value: object) -> None:
-    """Require unique, known hidden reasons in ``HIDDEN_REASONS`` order."""
+def check_hidden_reasons(value: object) -> None:
+    """Require unique, known hidden reasons in ``HIDDEN_REASONS`` order.
+
+    The one rule for every ``hidden_reasons`` field: elements here, and the
+    v5 quality stage's span pieces (:mod:`datagrunt.pdf.quality`).
+
+    Raises:
+        TypeError: If ``value`` is not a tuple of str.
+        ValueError: If a reason is unknown, repeated, or out of canonical order.
+    """
     reasons = str_tuple("hidden_reasons", value)
     unknown = [reason for reason in reasons if reason not in HIDDEN_REASONS]
     if unknown:
@@ -311,14 +326,6 @@ def _check_optional_callable(name: str, value: object) -> None:
     """Require ``value`` to be callable or None."""
     if value is not None and not callable(value):
         raise TypeError(f"{name} must be callable or None, got {type(value).__name__}")
-
-
-def _positive_finite(name: str, value: object) -> float:
-    """Return ``value`` as a finite float strictly greater than zero."""
-    result = finite_float(name, value)
-    if result <= 0.0:
-        raise ValueError(f"{name} must be > 0, got {result!r}")
-    return result
 
 
 def _check_bool(name: str, value: object) -> None:
@@ -525,7 +532,7 @@ class _Element:
         if not isinstance(self.bbox, BBox):
             raise TypeError(f"bbox must be a BBox, got {type(self.bbox).__name__}")
         str_tuple("scope_path", self.scope_path)
-        _check_hidden_reasons(self.hidden_reasons)
+        check_hidden_reasons(self.hidden_reasons)
         self._validate_fields()
 
     def _validate_fields(self) -> None:
@@ -904,7 +911,7 @@ class PageImage:
 
     def __post_init__(self) -> None:
         int_at_least("page_number", self.page_number, 1)
-        object.__setattr__(self, "dpi", _positive_finite("dpi", self.dpi))
+        object.__setattr__(self, "dpi", positive_float("dpi", self.dpi))
         int_at_least("width_px", self.width_px, 1)
         int_at_least("height_px", self.height_px, 1)
         _check_optional_path("image_path", self.image_path)
@@ -959,7 +966,8 @@ class PageImage:
 _PAGE_STATUSES: tuple[PageStatus, ...] = get_args(PageStatus)
 # Statuses that only a vision-route page can have.
 _VISION_ONLY_STATUSES: tuple[PageStatus, ...] = ("ocr_fallback", "ocr_unavailable")
-_PAGE_ROUTES: tuple[PageRoute, ...] = get_args(PageRoute)
+# Public, like HIDDEN_REASONS: the v5 quality stage (datagrunt.pdf.quality) checks routes with it.
+PAGE_ROUTES: tuple[PageRoute, ...] = get_args(PageRoute)
 _ELEMENT_TYPES: tuple[type, ...] = get_args(DocumentElement)
 
 
@@ -1055,10 +1063,10 @@ class Page:
     def _validate_fields(self) -> None:
         """Check each field's own type and range (coercing the dimensions to float)."""
         int_at_least("page_number", self.page_number, 1)
-        object.__setattr__(self, "width_pt", _positive_finite("width_pt", self.width_pt))
-        object.__setattr__(self, "height_pt", _positive_finite("height_pt", self.height_pt))
+        object.__setattr__(self, "width_pt", positive_float("width_pt", self.width_pt))
+        object.__setattr__(self, "height_pt", positive_float("height_pt", self.height_pt))
         _check_choice("status", self.status, _PAGE_STATUSES)
-        _check_choice("route", self.route, _PAGE_ROUTES)
+        _check_choice("route", self.route, PAGE_ROUTES)
         if self.quality is not None and not isinstance(self.quality, PageQuality):
             raise TypeError(f"quality must be a PageQuality or None, got {type(self.quality).__name__}")
         _check_document_elements("elements", self.elements)

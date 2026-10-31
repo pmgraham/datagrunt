@@ -21,14 +21,25 @@ Text (#365 T2), pinned by ``tests/pdf_tests/test_pdfium_spans.py``:
   space. pdfium parses forms at most 40 levels deep.
 - A non-BMP char is two textpage chars, a UTF-16 surrogate pair with equal
   boxes. An unmapped char code reads as itself, flagged by
-  ``FPDFText_HasUnicodeMapError``; without a ToUnicode map a 3- or 4-byte
-  CMap code can read beyond U+10FFFF (0x110000, 0xFFFFFFFF).
-- The textpage is not every drawn char: pdfium drops text at ``Tf 0``, at
-  ``Tz 0`` or under ~0.001 pt, objects of a single space, and a char drawn
-  on an identical char at the same place (fake-bold removal); it collapses
-  runs of spaces to one, decomposes ligatures (U+FB01 reads "fi") and
-  mirrors "(" in right-to-left text (it reads ")"). The engine keeps every
-  char the textpage reports.
+  ``FPDFText_HasUnicodeMapError`` (its offset is in ``RawSpan.map_errors``);
+  without a ToUnicode map a 3- or 4-byte CMap code can read beyond U+10FFFF
+  (0x110000, 0xFFFFFFFF).
+- The textpage is not every drawn char: pdfium drops a text object whose
+  box is under 0.01 pt wide (``Tf 0``, ``Tz 0``, a tiny size, an object of a
+  single space) and a copy of identical text (the same codes at the same
+  ``Tf``) drawn on one of the five text objects before it (fake-bold and
+  drop-shadow removal): along x within 0.9 of its last glyph's advance at
+  that ``Tf``, whatever matrix scales the text (2.4 pt for 12 pt "Total",
+  10.2 pt for "TOTAL DUE MW"), and across within about an eighth of its
+  width while the two boxes overlap. It collapses runs of spaces to one,
+  decomposes ligatures (U+FB01 reads "fi") and mirrors "(" in right-to-left
+  text (it reads ")"). The engine keeps every char the textpage reports and counts
+  the text objects that own none: ``TextStats.empty_text_objects`` when the
+  object draws no glyph with extent (its box is a point, anywhere, though
+  its em is 1 unit or more each way in its form's space: a single space,
+  whose box pdfium puts at its origin), else
+  ``TextStats.dropped_text_objects``, which
+  :mod:`datagrunt.pdf._pdfium_recover` reads back.
 - Standard-14 fonts have no descriptor: their flags lack ForceBold and their
   weight reads 0, so only the base name says bold. A non-embedded alias
   reads as the standard-14 font pdfium substitutes (``Arial,BoldItalic``
@@ -45,18 +56,9 @@ from typing import NamedTuple
 
 import pypdfium2.raw as pdfium_c
 
-from datagrunt.pdf._pdfium_common import Box, PdfiumFailure, object_address, read_rgba
-from datagrunt.pdf._validate import finite_float, int_at_least, ordered_box, rgba_tuple, strict_bool
-
-
-def _union(boxes: tuple[Box, ...]) -> Box:
-    """The smallest box holding every one of ``boxes`` (at least one)."""
-    return (
-        min(box[0] for box in boxes),
-        min(box[1] for box in boxes),
-        max(box[2] for box in boxes),
-        max(box[3] for box in boxes),
-    )
+from datagrunt.pdf._hidden_rules import em_size
+from datagrunt.pdf._pdfium_common import Box, PdfiumFailure, object_address, read_rgba, union_box
+from datagrunt.pdf._validate import finite_float, int_at_least, ordered_box, rgba_tuple, strict_bool, typed_tuple
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -77,9 +79,18 @@ class RawSpan:
         bbox: The union of ``char_boxes``.
         char_boxes: One box per char of ``text``: pdfium's loose char box
             (advance width by the font's ascent-to-descent height).
-        font_size_pt: The ``Tf`` size times the vertical scale of the text's
-            page-space matrix (form matrices included); negative for a
+        font_size_pt: The height of the text's em under its page-space
+            matrix (form matrices included), measured across its baseline
+            (:func:`em_size`): the ``Tf`` size for upright, turned or
+            oblique text, near 0 for text sheared flat; negative for a
             negative ``Tf`` (mirrored glyphs).
+        em_width_pt: The width of the text's em under the same matrix
+            (form matrices and ``Tz`` included), measured across its height
+            side (:func:`em_size`), so a mirrored scale counts at its
+            magnitude, turned text in full and sheared-flat text as flat;
+            never negative. An em under 1 pt wide and narrower than it is
+            tall is text squeezed flat: ``Tz 0.05`` leaves 12 pt "HIDDEN"
+            in the textpage at 0.006 pt per em.
         base_font_name: The font's /BaseFont without a subset tag
             (``ABCDEF+``); empty for a font without one (Type3). For a
             non-embedded Type1 font pdfium aliases to a standard-14 font,
@@ -104,12 +115,21 @@ class RawSpan:
             ``TJ`` gap: ``[(Name) -12000 (Value)] TJ`` is text "NameValue"
             with a break at 4. The generated chars are not inserted into
             ``text``.
+        map_errors: Offsets into ``text``, strictly increasing and each in
+            ``0..len(text) - 1``, of the chars pdfium could not map to
+            Unicode (``FPDFText_HasUnicodeMapError``, or a raw code beyond
+            U+10FFFF, which reads as U+FFFD): each reads as its raw char
+            code, so its text says nothing (A3 counts it invalid). A
+            surrogate pair is one offset if either half is unmapped.
+            ``TextStats.unicode_map_error_count`` counts the same chars in
+            textpage chars.
     """
 
     text: str
     bbox: Box
     char_boxes: tuple[Box, ...]
     font_size_pt: float
+    em_width_pt: float
     base_font_name: str
     is_bold: bool
     is_italic: bool
@@ -118,11 +138,15 @@ class RawSpan:
     stroke_rgba: tuple[int, int, int, int]
     object_index: int
     generated_breaks: tuple[int, ...]
+    map_errors: tuple[int, ...]
 
     def __post_init__(self) -> None:
         self._check_text_and_boxes()
-        self._check_generated_breaks()
+        last = len(self.text) - 1
+        _check_offsets("generated_breaks", self.generated_breaks, 1, last)
+        _check_offsets("map_errors", self.map_errors, 0, last)
         object.__setattr__(self, "font_size_pt", finite_float("font_size_pt", self.font_size_pt))
+        object.__setattr__(self, "em_width_pt", finite_float("em_width_pt", self.em_width_pt, lo=0.0))
         if not isinstance(self.base_font_name, str):
             raise TypeError(f"base_font_name must be a str, got {self.base_font_name!r}")
         strict_bool("is_bold", self.is_bold)
@@ -147,22 +171,22 @@ class RawSpan:
             raise ValueError(f"char_boxes must hold one box per char of text: {counts}")
         boxes = tuple(ordered_box(f"char_boxes[{i}]", box) for i, box in enumerate(self.char_boxes))
         bbox = ordered_box("bbox", self.bbox)
-        if bbox != _union(boxes):
-            raise ValueError(f"bbox must be the union of char_boxes, {_union(boxes)!r}, got {self.bbox!r}")
+        if bbox != union_box(boxes):
+            raise ValueError(f"bbox must be the union of char_boxes, {union_box(boxes)!r}, got {self.bbox!r}")
         object.__setattr__(self, "char_boxes", boxes)
         object.__setattr__(self, "bbox", bbox)
 
-    def _check_generated_breaks(self) -> None:
-        breaks = self.generated_breaks
-        if not isinstance(breaks, tuple):
-            raise TypeError(f"generated_breaks must be a tuple, got {type(breaks).__name__}")
-        last = len(self.text) - 1
-        for index, offset in enumerate(breaks):
-            int_at_least(f"generated_breaks[{index}]", offset, 0)
-            if not 1 <= offset <= last:
-                raise ValueError(f"generated_breaks[{index}] must be inside text, in 1..{last}, got {offset}")
-        if any(later <= earlier for earlier, later in zip(breaks, breaks[1:])):
-            raise ValueError(f"generated_breaks must be strictly increasing, got {breaks!r}")
+
+def _check_offsets(name: str, offsets: object, low: int, high: int) -> None:
+    """Require ``offsets`` to be a tuple of strictly increasing ints in ``low..high`` (offsets into a span's text)."""
+    if not isinstance(offsets, tuple):
+        raise TypeError(f"{name} must be a tuple, got {type(offsets).__name__}")
+    for index, offset in enumerate(offsets):
+        int_at_least(f"{name}[{index}]", offset, 0)
+        if not low <= offset <= high:
+            raise ValueError(f"{name}[{index}] must be inside text, in {low}..{high}, got {offset}")
+    if any(later <= earlier for earlier, later in zip(offsets, offsets[1:])):
+        raise ValueError(f"{name} must be strictly increasing, got {offsets!r}")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -186,12 +210,27 @@ class TextStats:
             Unicode (``FPDFText_HasUnicodeMapError``); each reads as its raw
             char code. A raw code beyond U+10FFFF (a 3- or 4-byte CMap code
             with no ToUnicode entry) reads as U+FFFD and counts here once,
-            whether pdfium flags it or not.
+            whether pdfium flags it or not. The span chars they make are
+            each span's ``map_errors`` (one per surrogate pair).
         skipped_nonfinite_objects: Text objects whose chars are in no span
             (and no other count) because pdfium places them at a non-finite
-            position or size: a char box or the font size is NaN or
-            infinite, as under a ``cm`` that overflows pdfium's 32-bit CTM.
+            position or size: a char box, the font size or the em width is
+            NaN or infinite, as under a ``cm`` that overflows pdfium's
+            32-bit CTM.
             pdfium renders the rest of such a page.
+        dropped_text_objects: Text objects of the page (forms' included)
+            that own no textpage char but draw glyphs: pdfium dropped them
+            (see the module notes), so their text is in no span. Over 0, the
+            page is worth
+            :func:`~datagrunt.pdf.pdfium_engine.recover_dropped_text`; at 0
+            there is nothing to recover. Disjoint from
+            ``skipped_nonfinite_objects``, whose objects own chars.
+        empty_text_objects: Text objects that own no textpage char and draw
+            no glyph with extent: their box is a point (anywhere; pdfium
+            puts it at the origin) though their em is 1 unit or more each way
+            in their form's space (an object of a single space or no-break
+            space). Nothing to recover; disjoint from
+            ``dropped_text_objects``.
     """
 
     char_count: int
@@ -199,6 +238,8 @@ class TextStats:
     ownerless_count: int
     unicode_map_error_count: int
     skipped_nonfinite_objects: int
+    dropped_text_objects: int
+    empty_text_objects: int
 
     def __post_init__(self) -> None:
         int_at_least("char_count", self.char_count, 0)
@@ -206,6 +247,8 @@ class TextStats:
         int_at_least("ownerless_count", self.ownerless_count, 0)
         int_at_least("unicode_map_error_count", self.unicode_map_error_count, 0)
         int_at_least("skipped_nonfinite_objects", self.skipped_nonfinite_objects, 0)
+        int_at_least("dropped_text_objects", self.dropped_text_objects, 0)
+        int_at_least("empty_text_objects", self.empty_text_objects, 0)
         if self.unicode_map_error_count > self.char_count:
             counts = f"unicode_map_error_count ({self.unicode_map_error_count}) cannot exceed"
             raise ValueError(f"{counts} char_count ({self.char_count})")
@@ -224,23 +267,57 @@ class PageText:
     stats: TextStats
 
     def __post_init__(self) -> None:
-        if not isinstance(self.spans, tuple):
-            raise TypeError(f"spans must be a tuple, got {type(self.spans).__name__}")
-        for index, item in enumerate(self.spans):
-            if not isinstance(item, RawSpan):
-                raise TypeError(f"spans[{index}] must be a RawSpan, got {type(item).__name__}")
+        typed_tuple("spans", self.spans, RawSpan)
         if not isinstance(self.stats, TextStats):
             raise TypeError(f"stats must be a TextStats, got {type(self.stats).__name__}")
-        span_chars = sum(len(item.text) for item in self.spans)
-        if not span_chars <= self.stats.char_count <= 2 * span_chars:
-            message = f"spans hold {span_chars} chars, which {self.stats.char_count} textpage chars cannot make"
-            raise ValueError(f"{message} (each is 1 textpage char, or 2 for a surrogate pair)")
+        _check_made_of("chars", sum(len(item.text) for item in self.spans), self.stats.char_count, "chars")
+        unmapped = sum(len(item.map_errors) for item in self.spans)
+        _check_made_of("map errors (map_errors)", unmapped, self.stats.unicode_map_error_count, "map errors")
+
+
+def _check_made_of(what: str, span_count: int, textpage_count: int, unit: str) -> None:
+    """Require ``textpage_count`` textpage items to make ``span_count`` span items (1 each, or 2 for a pair)."""
+    if not span_count <= textpage_count <= 2 * span_count:
+        message = f"spans hold {span_count} {what}, which {textpage_count} textpage {unit} cannot make"
+        raise ValueError(f"{message} (each is 1 textpage char, or 2 for a surrogate pair)")
+
+
+class ObjectWalk(NamedTuple):
+    """What :func:`collect_text` needs of the page's object walk.
+
+    Attributes:
+        indices: Each walked object's address (``object_address``) to its
+            index in the page's depth-first, paint-order object walk.
+        text_objects: The addresses of the walk's text objects.
+        glyphless: Whether the text object at an address draws no glyph
+            with extent; asked only of text objects that own no textpage
+            char, in walk order. It may raise PdfiumFailure.
+    """
+
+    indices: dict[int, int]
+    text_objects: frozenset[int]
+    glyphless: Callable[[int], bool]
+
+
+class CollectedText(NamedTuple):
+    """What :func:`collect_text` reads from a textpage.
+
+    Attributes:
+        page_text: The spans and counts.
+        dropped: The addresses (``object_address``) of the text objects that
+            own no textpage char but draw glyphs;
+            ``page_text.stats.dropped_text_objects`` counts them.
+    """
+
+    page_text: PageText
+    dropped: frozenset[int]
 
 
 class _Style(NamedTuple):
     """The RawSpan fields read from a span's text object."""
 
     font_size_pt: float
+    em_width_pt: float
     base_font_name: str
     is_bold: bool
     is_italic: bool
@@ -328,23 +405,31 @@ def _bold_and_italic(font: pdfium_c.FPDF_FONT, name: str, label: str) -> tuple[b
     return is_bold, is_italic
 
 
-def _font_size(
-    textpage: pdfium_c.FPDF_TEXTPAGE, text_object: pdfium_c.FPDF_PAGEOBJECT, char_index: int, label: str
-) -> float:
-    """``Tf`` size times the vertical scale of the char's page-space matrix.
+def font_size(text_object: pdfium_c.FPDF_PAGEOBJECT, label: str) -> float:
+    """The text object's ``Tf`` size: the one read of it, for spans and recovery alike."""
+    size = ctypes.c_float()
+    if not pdfium_c.FPDFTextObj_GetFontSize(text_object, size):
+        raise PdfiumFailure(f"read the font size of {label}")
+    return size.value
 
-    The textpage matrix includes every enclosing form's matrix; the object's
-    own matrix (``FPDFPageObj_GetMatrix``) is in its form's space. It may not
+
+def _em(
+    textpage: pdfium_c.FPDF_TEXTPAGE, text_object: pdfium_c.FPDF_PAGEOBJECT, char_index: int, label: str
+) -> tuple[float, float]:
+    """The char's ``(font_size_pt, em_width_pt)``: its em's height, signed by ``Tf``, and its width (:func:`em_size`).
+
+    Measured on the char's page-space matrix: the textpage matrix holds
+    ``Tz`` and every enclosing form's matrix (not ``Tf``); the object's own
+    matrix (``FPDFPageObj_GetMatrix``) is in its form's space. It may not
     be finite (a ``cm`` that overflows pdfium's 32-bit CTM): the
     caller then skips the object.
     """
-    nominal = ctypes.c_float()
-    if not pdfium_c.FPDFTextObj_GetFontSize(text_object, nominal):
-        raise PdfiumFailure(f"read the font size of {label}")
+    nominal = font_size(text_object, label)
     matrix = pdfium_c.FS_MATRIX()
     if not pdfium_c.FPDFText_GetMatrix(textpage, char_index, matrix):
         raise PdfiumFailure(f"read the matrix of char {char_index}")
-    return nominal.value * math.hypot(matrix.c, matrix.d)
+    width, height = em_size(nominal, matrix.a, matrix.b, matrix.c, matrix.d)
+    return math.copysign(height, nominal), width
 
 
 def _read_style(
@@ -360,8 +445,10 @@ def _read_style(
     render_mode = pdfium_c.FPDFTextObj_GetTextRenderMode(text_object)
     if render_mode not in range(8):  # FPDF_TEXTRENDERMODE_UNKNOWN (-1) on failure
         raise PdfiumFailure(f"read the render mode of {label}")
+    font_size_pt, em_width_pt = _em(textpage, text_object, char_index, label)
     return _Style(
-        font_size_pt=_font_size(textpage, text_object, char_index, label),
+        font_size_pt=font_size_pt,
+        em_width_pt=em_width_pt,
         base_font_name=name,
         is_bold=is_bold,
         is_italic=is_italic,
@@ -403,7 +490,7 @@ class _Textpage(NamedTuple):
     generated_count: int
     ownerless_count: int
     styles: dict[int, _Style]
-    # Owners with a char box or font size that is not finite: no span takes their chars.
+    # Owners with a char box, font size or em width that is not finite: no span takes their chars.
     skipped: frozenset[int]
 
 
@@ -427,6 +514,7 @@ class _SpanBuilder:
         self._chars: list[str] = []
         self._boxes: list[Box] = []
         self._breaks: list[int] = []
+        self._errors: list[int] = []
         self._break_pending = False
 
     def mark_inserted(self) -> None:
@@ -454,12 +542,19 @@ class _SpanBuilder:
             # pdfium reports a non-BMP char as a UTF-16 pair of textpage chars.
             high = ord(self._chars[-1])
             self._chars[-1] = chr(0x10000 + ((high - _HIGH_SURROGATES.start) << 10) + (code - _LOW_SURROGATES.start))
-            self._boxes[-1] = _union((self._boxes[-1], char.box))
+            self._boxes[-1] = union_box((self._boxes[-1], char.box))
+            self._mark_unmapped(char, len(self._chars) - 1)
             return
+        self._mark_unmapped(char, len(self._chars))
         # A code beyond Unicode is a raw char code pdfium could not map; U+FFFD
         # keeps its place (and is no surrogate, so it never pairs).
         self._chars.append(chr(code) if code <= _MAX_CODE_POINT else _REPLACEMENT_CHAR)
         self._boxes.append(char.box)
+
+    def _mark_unmapped(self, char: _OwnedChar, offset: int) -> None:
+        """Record span char ``offset`` as a map error if ``char`` (one of its textpage chars) is one; once each."""
+        if _unmapped(char) and (not self._errors or self._errors[-1] != offset):
+            self._errors.append(offset)
 
     def finish(self) -> tuple[RawSpan, ...]:
         """Close the current span and return every span."""
@@ -473,14 +568,20 @@ class _SpanBuilder:
         self._spans.append(
             RawSpan(
                 text="".join(self._chars),
-                bbox=_union(boxes),
+                bbox=union_box(boxes),
                 char_boxes=boxes,
                 object_index=self._object_indices[self._owner],
                 generated_breaks=tuple(self._breaks),
+                map_errors=tuple(self._errors),
                 **self._styles[self._owner]._asdict(),
             )
         )
-        self._chars, self._boxes, self._breaks = [], [], []
+        self._chars, self._boxes, self._breaks, self._errors = [], [], [], []
+
+
+def _unmapped(char: _OwnedChar) -> bool:
+    """True if pdfium could not map ``char`` to Unicode: flagged, or a code beyond U+10FFFF (it reads as U+FFFD)."""
+    return char.map_error or char.code > _MAX_CODE_POINT
 
 
 def _textpage_flag(result: int, char_index: int, question: str) -> bool:
@@ -521,33 +622,36 @@ def _read_textpage(textpage: pdfium_c.FPDF_TEXTPAGE, object_indices: dict[int, i
                 raise PdfiumFailure(f"read the text object of char {char_index}: it is not in the page's object tree")
             styles[owner] = _read_style(textpage, text_object, char_index, object_indices[owner])
         box = _loose_box(textpage, char_index)
-        if not all(math.isfinite(value) for value in (*box, styles[owner].font_size_pt)):
+        style = styles[owner]
+        if not all(math.isfinite(value) for value in (*box, style.font_size_pt, style.em_width_pt)):
             skipped.add(owner)
         chars.append(_OwnedChar(owner, code, map_error, box))
     return _Textpage(chars, generated, ownerless, styles, frozenset(skipped))
 
 
-def collect_text(
-    textpage: pdfium_c.FPDF_TEXTPAGE, to_display: Callable[[Box], Box], object_indices: dict[int, int]
-) -> PageText:
+def collect_text(textpage: pdfium_c.FPDF_TEXTPAGE, to_display: Callable[[Box], Box], walk: ObjectWalk) -> CollectedText:
     """Read every textpage char once: count them and group the owned, non-generated ones.
 
-    A text object with a char box or font size that is not finite (pdfium
-    places it nowhere) is skipped whole and counted; a skipped char ends the
-    span it interrupts.
+    A text object with a char box, font size or em width that is not finite
+    (pdfium places it nowhere) is skipped whole and counted; a skipped char
+    ends the span it interrupts. A text object that owns no char is empty if
+    it draws no glyph with extent (``walk.glyphless``), else dropped.
 
     Args:
         textpage: The page's loaded textpage.
         to_display: Maps a user-space ``(left, bottom, right, top)`` box to a
             displayed, top-left ``(x0, y0, x1, y1)`` box.
-        object_indices: Each page object's address (``object_address``) to
-            its index in the page's depth-first, paint-order object walk.
+        walk: The page's object walk.
 
     Raises:
         PdfiumFailure: If a pdfium call fails.
     """
-    read = _read_textpage(textpage, object_indices)
-    builder = _SpanBuilder(to_display, object_indices, read.styles)
+    read = _read_textpage(textpage, walk.indices)
+    ownerless = walk.text_objects - {char.owner for char in read.chars if char is not None}
+    # In walk order, so a pdfium failure always names the same object.
+    empty = frozenset(address for address in sorted(ownerless, key=walk.indices.__getitem__) if walk.glyphless(address))
+    dropped = ownerless - empty
+    builder = _SpanBuilder(to_display, walk.indices, read.styles)
     kept = map_errors = 0
     for char in read.chars:
         if char is None:
@@ -556,8 +660,7 @@ def collect_text(
             builder.mark_skipped()
         else:
             kept += 1
-            # A code beyond U+10FFFF reads as U+FFFD: a map error, counted once.
-            map_errors += char.map_error or char.code > _MAX_CODE_POINT
+            map_errors += _unmapped(char)
             builder.add(char)
     stats = TextStats(
         char_count=kept,
@@ -565,5 +668,7 @@ def collect_text(
         ownerless_count=read.ownerless_count,
         unicode_map_error_count=map_errors,
         skipped_nonfinite_objects=len(read.skipped),
+        dropped_text_objects=len(dropped),
+        empty_text_objects=len(empty),
     )
-    return PageText(spans=builder.finish(), stats=stats)
+    return CollectedText(page_text=PageText(spans=builder.finish(), stats=stats), dropped=dropped)

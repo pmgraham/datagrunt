@@ -7,6 +7,9 @@ Every message names the offending field so construction errors are actionable.
 
 import math
 import re
+from typing import TypeVar
+
+_T = TypeVar("_T")
 
 # A SHA-256 hex digest exactly as hashlib's hexdigest() produces it. Matched
 # with fullmatch() so a trailing newline cannot slip past a `$` anchor.
@@ -45,6 +48,14 @@ def finite_float(name: str, value: object, *, lo: float | None = None, hi: float
     return result
 
 
+def positive_float(name: str, value: object) -> float:
+    """Return ``value`` as a finite float strictly greater than zero."""
+    result = finite_float(name, value)
+    if result <= 0.0:
+        raise ValueError(f"{name} must be > 0, got {result!r}")
+    return result
+
+
 def non_blank_str(name: str, value: object) -> str:
     """Return ``value`` verbatim if it is a str with at least one non-whitespace char."""
     if not isinstance(value, str):
@@ -61,6 +72,16 @@ def choice_str(name: str, value: object, choices: tuple[str, ...]) -> str:
     if value not in choices:
         allowed = " or ".join(repr(choice) for choice in choices)
         raise ValueError(f"{name} must be {allowed}, got {value!r}")
+    return value
+
+
+def typed_tuple(name: str, value: object, kind: type[_T]) -> tuple[_T, ...]:
+    """Return ``value`` if it is a tuple whose every item is a ``kind``."""
+    if not isinstance(value, tuple):
+        raise TypeError(f"{name} must be a tuple, got {type(value).__name__}")
+    for index, item in enumerate(value):
+        if not isinstance(item, kind):
+            raise TypeError(f"{name}[{index}] must be a {kind.__name__}, got {type(item).__name__}")
     return value
 
 

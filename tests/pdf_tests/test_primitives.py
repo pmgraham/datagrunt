@@ -3,6 +3,7 @@
 import dataclasses
 import hashlib
 import math
+import re
 import unicodedata
 
 import pytest
@@ -16,10 +17,12 @@ from datagrunt.pdf._validate import (
     non_blank_str,
     optional_str,
     ordered_box,
+    positive_float,
     rgba_tuple,
     sha256_hex,
     str_tuple,
     strict_bool,
+    typed_tuple,
 )
 
 NON_FINITE = [math.nan, math.inf, -math.inf]
@@ -209,6 +212,42 @@ class TestOrderedBox:
     def test_rejects_non_finite(self):
         with pytest.raises(ValueError, match=r"bbox\[0\] must be finite"):
             ordered_box("bbox", (math.nan, 0.0, 1.0, 1.0))
+
+
+class TestPositiveFloat:
+    @pytest.mark.parametrize("value", [1, 0.001, 1e300])
+    def test_returns_a_float_above_zero(self, value):
+        assert positive_float("width_pt", value) == float(value)
+
+    @pytest.mark.parametrize("bad", [0, 0.0, -1.0])
+    def test_rejects_zero_and_negative(self, bad):
+        with pytest.raises(ValueError, match="width_pt must be > 0"):
+            positive_float("width_pt", bad)
+
+    @pytest.mark.parametrize("bad", NON_FINITE)
+    def test_rejects_non_finite(self, bad):
+        with pytest.raises(ValueError, match="width_pt must be finite"):
+            positive_float("width_pt", bad)
+
+    @pytest.mark.parametrize("bad", [True, "1", None])
+    def test_rejects_non_number(self, bad):
+        with pytest.raises(TypeError, match="width_pt"):
+            positive_float("width_pt", bad)
+
+
+class TestTypedTuple:
+    def test_returns_the_tuple(self):
+        value = (1, 2)
+
+        assert typed_tuple("items", value, int) is value
+
+    def test_rejects_non_tuple(self):
+        with pytest.raises(TypeError, match="items must be a tuple, got list"):
+            typed_tuple("items", [1], int)
+
+    def test_rejects_wrong_item_type_naming_index(self):
+        with pytest.raises(TypeError, match=re.escape("items[1] must be a int, got str")):
+            typed_tuple("items", (1, "2"), int)
 
 
 class TestStrTuple:

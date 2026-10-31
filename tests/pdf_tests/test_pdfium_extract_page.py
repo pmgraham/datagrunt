@@ -344,7 +344,13 @@ GEOMETRY = PageGeometry(page_number=3, width_pt=400.0, height_pt=300.0, rotation
 EMPTY_TEXT = PageText(
     spans=(),
     stats=TextStats(
-        char_count=0, generated_count=0, ownerless_count=0, unicode_map_error_count=0, skipped_nonfinite_objects=0
+        char_count=0,
+        generated_count=0,
+        ownerless_count=0,
+        unicode_map_error_count=0,
+        skipped_nonfinite_objects=0,
+        dropped_text_objects=0,
+        empty_text_objects=0,
     ),
 )
 EMPTY_SEGMENTS = PageSegments(segments=(), stats=SegmentStats(skipped_nonfinite_paths=0))

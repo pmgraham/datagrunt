@@ -6,6 +6,7 @@ hand (``hand_written_pdf``) for what ReportLab cannot write.
 """
 
 import dataclasses
+import math
 import pickle
 import re
 import subprocess
@@ -17,7 +18,8 @@ import pypdfium2.raw as pdfium_c
 import pytest
 from reportlab.pdfbase.pdfmetrics import stringWidth
 
-from datagrunt.pdf import PDFCorruptError
+from datagrunt.pdf import PDFCorruptError, _pdfium_common
+from datagrunt.pdf._hidden_rules import em_size
 from datagrunt.pdf.pdfium_engine import PageText, RawSpan, TextStats, open_document, page_text
 from pdf_tests.builders import FormXObject, PageSpec, TextRun, break_page, build_pdf, hand_written_pdf
 
@@ -84,6 +86,7 @@ def span(**overrides) -> RawSpan:
         "bbox": (10.0, 20.0, 22.0, 33.0),
         "char_boxes": (BOX_A, BOX_B),
         "font_size_pt": 12.0,
+        "em_width_pt": 12.0,
         "base_font_name": "Helvetica-Bold",
         "is_bold": True,
         "is_italic": False,
@@ -92,6 +95,7 @@ def span(**overrides) -> RawSpan:
         "stroke_rgba": (255, 0, 0, 128),
         "object_index": 3,
         "generated_breaks": (),
+        "map_errors": (),
     }
     return RawSpan(**(fields | overrides))
 
@@ -106,6 +110,8 @@ def stats(**overrides) -> TextStats:
                 "ownerless_count": 0,
                 "unicode_map_error_count": 0,
                 "skipped_nonfinite_objects": 0,
+                "dropped_text_objects": 0,
+                "empty_text_objects": 0,
             }
             | overrides
         )
@@ -222,16 +228,67 @@ class TestRawSpan:
                 "generated_breaks must be strictly increasing, got (2, 2)",
                 id="breaks-repeated",
             ),
+            pytest.param({"map_errors": [0]}, TypeError, "map_errors must be a tuple, got list", id="errors-list"),
+            pytest.param(
+                {"map_errors": (True,)}, TypeError, "map_errors[0] must be an int, got True (bool)", id="error-bool"
+            ),
+            pytest.param({"map_errors": (-1,)}, ValueError, "map_errors[0] must be >= 0, got -1", id="error-negative"),
+            pytest.param(
+                {"map_errors": (2,)},
+                ValueError,
+                "map_errors[0] must be inside text, in 0..1, got 2",
+                id="error-past-the-end",
+            ),
+            pytest.param(
+                {**FOUR_CHARS, "map_errors": (2, 1)},
+                ValueError,
+                "map_errors must be strictly increasing, got (2, 1)",
+                id="errors-unsorted",
+            ),
+            pytest.param(
+                {**FOUR_CHARS, "map_errors": (1, 1)},
+                ValueError,
+                "map_errors must be strictly increasing, got (1, 1)",
+                id="errors-repeated",
+            ),
         ],
     )
     def test_invalid_field_raises(self, overrides, error, message):
         with pytest.raises(error, match=re.escape(message)):
             span(**overrides)
 
+    def test_map_errors_anywhere_in_the_text_are_kept(self):
+        value = span(**FOUR_CHARS, map_errors=(0, 3))
+
+        assert value.map_errors == (0, 3)
+
     def test_generated_breaks_inside_text_are_kept(self):
         value = span(**FOUR_CHARS, generated_breaks=(1, 3))
 
         assert value.generated_breaks == (1, 3)
+
+    def test_int_em_width_is_stored_as_a_float(self):
+        value = span(em_width_pt=12)
+
+        assert (value.em_width_pt, type(value.em_width_pt)) == (12.0, float)
+
+    def test_a_zero_em_width_is_kept(self):
+        # Text squeezed flat (Tz 0, a zero matrix) has an em with no width.
+        assert span(em_width_pt=0.0).em_width_pt == 0.0
+
+    @pytest.mark.parametrize(
+        "width,error,message",
+        [
+            pytest.param(float("inf"), ValueError, "em_width_pt must be finite", id="inf"),
+            pytest.param(float("nan"), ValueError, "em_width_pt must be finite", id="nan"),
+            pytest.param(-0.5, ValueError, "em_width_pt must be >= 0.0, got -0.5", id="negative"),
+            pytest.param(True, TypeError, "em_width_pt must be an int or float, got True (bool)", id="bool"),
+            pytest.param("12", TypeError, "em_width_pt must be an int or float, got '12' (str)", id="str"),
+        ],
+    )
+    def test_invalid_em_width_raises(self, width, error, message):
+        with pytest.raises(error, match=re.escape(message)):
+            span(em_width_pt=width)
 
 
 class TestTextStats:
@@ -268,6 +325,16 @@ class TestTextStats:
                 "skipped_nonfinite_objects must be an int, got True",
                 id="skipped-bool",
             ),
+            pytest.param(
+                {"dropped_text_objects": -1}, ValueError, "dropped_text_objects must be >= 0, got -1", id="dropped"
+            ),
+            pytest.param(
+                {"dropped_text_objects": 1.0},
+                TypeError,
+                "dropped_text_objects must be an int, got 1.0",
+                id="dropped-float",
+            ),
+            pytest.param({"empty_text_objects": -1}, ValueError, "empty_text_objects must be >= 0, got -1", id="empty"),
         ],
     )
     def test_invalid_field_raises(self, overrides, error, message):
@@ -316,11 +383,39 @@ class TestPageText:
                 "spans hold 2 chars, which 5 textpage chars cannot make",
                 id="too-many",
             ),
+            pytest.param(
+                (span(map_errors=(0, 1)),),
+                stats(unicode_map_error_count=1),
+                ValueError,
+                "spans hold 2 map errors (map_errors), which 1 textpage map errors cannot make",
+                id="too-few-map-errors",
+            ),
+            pytest.param(
+                (span(map_errors=(1,)),),
+                stats(unicode_map_error_count=0),
+                ValueError,
+                "spans hold 1 map errors (map_errors), which 0 textpage map errors cannot make",
+                id="map-errors-uncounted",
+            ),
+            pytest.param(
+                (span(),),
+                stats(unicode_map_error_count=2),
+                ValueError,
+                "spans hold 0 map errors (map_errors), which 2 textpage map errors cannot make",
+                id="too-many-map-errors",
+            ),
         ],
     )
     def test_invalid_field_raises(self, spans, page_stats, error, message):
         with pytest.raises(error, match=re.escape(message)):
             PageText(spans=spans, stats=page_stats)
+
+    def test_a_map_error_may_be_a_pair_of_textpage_chars(self):
+        pair = span(text="\U0001d400", bbox=BOX_A, char_boxes=(BOX_A,), map_errors=(0,))
+
+        page = PageText(spans=(pair,), stats=stats(char_count=2, unicode_map_error_count=2))
+
+        assert page.spans == (pair,)
 
 
 class TestSpanGrouping:
@@ -367,7 +462,13 @@ class TestSpanGrouping:
 
         assert [(item.text, item.generated_breaks) for item in result.spans] == [("AB", (1,))]
         assert result.stats == TextStats(
-            char_count=2, generated_count=1, ownerless_count=0, unicode_map_error_count=0, skipped_nonfinite_objects=0
+            char_count=2,
+            generated_count=1,
+            ownerless_count=0,
+            unicode_map_error_count=0,
+            skipped_nonfinite_objects=0,
+            dropped_text_objects=0,
+            empty_text_objects=0,
         )
         assert result.spans[0].char_boxes[1][0] - result.spans[0].char_boxes[0][2] > 20.0
 
@@ -408,7 +509,13 @@ class TestSpanGrouping:
         # The generated line break falls between spans, so neither span has a break.
         assert [(item.text, item.generated_breaks) for item in result.spans] == [("Up", ()), ("Down", ())]
         assert result.stats == TextStats(
-            char_count=6, generated_count=2, ownerless_count=0, unicode_map_error_count=0, skipped_nonfinite_objects=0
+            char_count=6,
+            generated_count=2,
+            ownerless_count=0,
+            unicode_map_error_count=0,
+            skipped_nonfinite_objects=0,
+            dropped_text_objects=0,
+            empty_text_objects=0,
         )
 
     def test_a_run_drawn_twice_in_place_reads_once(self, tmp_path):
@@ -709,7 +816,13 @@ class TestUnicode:
         assert [box[0] for box in got.char_boxes] == pytest.approx([72.0, 84.0, 96.0, 108.0], abs=TOL)
         assert got.char_boxes[1][2] == pytest.approx(96.0, abs=TOL)
         assert result.stats == TextStats(
-            char_count=6, generated_count=0, ownerless_count=0, unicode_map_error_count=0, skipped_nonfinite_objects=0
+            char_count=6,
+            generated_count=0,
+            ownerless_count=0,
+            unicode_map_error_count=0,
+            skipped_nonfinite_objects=0,
+            dropped_text_objects=0,
+            empty_text_objects=0,
         )
 
     def test_lone_surrogates_and_unmapped_codes_are_kept(self, tmp_path):
@@ -718,8 +831,63 @@ class TestUnicode:
 
         assert [item.text for item in result.spans] == ["A\ud835\x04\ud835A"]
         assert result.stats == TextStats(
-            char_count=5, generated_count=0, ownerless_count=0, unicode_map_error_count=1, skipped_nonfinite_objects=0
+            char_count=5,
+            generated_count=0,
+            ownerless_count=0,
+            unicode_map_error_count=1,
+            skipped_nonfinite_objects=0,
+            dropped_text_objects=0,
+            empty_text_objects=0,
         )
+
+    def test_each_map_error_is_kept_at_its_offset(self, tmp_path):
+        # 0004 is the one code the ToUnicode map leaves out: pdfium reads it as its raw code, U+0004.
+        result = page_text(open_document(cid_page(tmp_path, b"00020005000400050002")), 0)
+
+        assert [(item.text, item.map_errors) for item in result.spans] == [("A\ud835\x04\ud835A", (2,))]
+
+    def test_mapped_text_has_no_map_errors(self, tmp_path):
+        (got,) = page_text(open_document(cid_page(tmp_path, b"0002000100030002")), 0).spans
+
+        assert got.map_errors == ()
+
+    def test_codes_with_no_unicode_mapping_are_map_errors(self, tmp_path):
+        # No ToUnicode map: each code reads as itself, beyond U+10FFFF as U+FFFD.
+        (got,) = page_text(open_document(wide_code_page(tmp_path, b"01 10FFFF 110000 02 FFFFFFFF 03")), 0).spans
+
+        assert got.map_errors == (0, 1, 2, 3, 4, 5)
+
+    def test_a_pair_of_unmapped_surrogate_codes_is_one_map_error(self, tmp_path):
+        # Read as a UTF-16 pair: one char from two textpage chars, both map errors.
+        result = page_text(open_document(wide_code_page(tmp_path, b"D835 DC00 01")), 0)
+
+        assert [(item.text, item.map_errors) for item in result.spans] == [("\U0001d400\x01", (0, 1))]
+        assert result.stats.unicode_map_error_count == 3
+
+    def test_a_pair_whose_low_half_is_unmapped_is_a_map_error(self, tmp_path):
+        # 0005 maps to a lone high surrogate; DC00 is in no map, so it reads as its raw code, a low one.
+        result = page_text(open_document(cid_page(tmp_path, b"00020005DC00")), 0)
+
+        assert [(item.text, item.map_errors) for item in result.spans] == [("A\U0001d400", (1,))]
+        assert result.stats.unicode_map_error_count == 1
+
+    @pytest.mark.parametrize("first_code,text", [(97, "abab"), (1, "\x01\x02\x01\x02")], ids=["ascii", "low"])
+    def test_a_type3_font_without_to_unicode_reads_its_raw_codes_as_map_errors(self, tmp_path, first_code, text):
+        # Glyph names (/a /b) give no Unicode here: pdfium reads each code as itself, so codes 97 and 98
+        # read "ab" only because they are ASCII's; codes 1 and 2 read U+0001 and U+0002.
+        font = (
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 750 750] /FontMatrix [0.001 0 0 0.001 0 0]"
+            b" /CharProcs << /a 6 0 R /b 6 0 R >> /Encoding << /Type /Encoding /Differences [%d /a /b] >>"
+            b" /FirstChar %d /LastChar %d /Widths [1000 1000] /Resources << >> >>"
+            % ((first_code,) * 2 + (first_code + 1,))
+        )
+        glyph = b"<< /Length 38 >>\nstream\n1000 0 0 0 750 750 d1 0 0 750 750 re f\nendstream"
+        codes = bytes([first_code, first_code + 1]) * 2
+        content = b"BT /F1 12 Tf 20 270 Td <%s> Tj ET" % codes.hex().encode()
+
+        result = page_text(open_document(content_page(tmp_path, content, font=font, extra=(glyph,))), 0)
+
+        assert [(item.text, item.map_errors) for item in result.spans] == [(text, (0, 1, 2, 3))]
 
     def test_a_lone_low_surrogate_is_kept(self, tmp_path):
         result = page_text(open_document(cid_page(tmp_path, b"000200060002")), 0)
@@ -736,7 +904,13 @@ class TestUnicode:
         assert got.text == "\x01\U0010ffff\ufffd\x02\ufffd\x03"
         assert [box[0] for box in got.char_boxes] == pytest.approx([72.0, 84.0, 96.0, 108.0, 120.0, 132.0], abs=TOL)
         assert result.stats == TextStats(
-            char_count=6, generated_count=0, ownerless_count=0, unicode_map_error_count=6, skipped_nonfinite_objects=0
+            char_count=6,
+            generated_count=0,
+            ownerless_count=0,
+            unicode_map_error_count=6,
+            skipped_nonfinite_objects=0,
+            dropped_text_objects=0,
+            empty_text_objects=0,
         )
 
     def test_a_code_beyond_unicode_never_pairs_with_a_surrogate(self, tmp_path):
@@ -882,7 +1056,13 @@ class TestRightToLeft:
         assert [(item.text, item.object_index) for item in result.spans] == [("אב", 1), ("אבג", 0)]
         assert [box[0] for box in result.spans[0].char_boxes] == pytest.approx([164.0, 152.0], abs=TOL)
         assert result.stats == TextStats(
-            char_count=5, generated_count=0, ownerless_count=1, unicode_map_error_count=0, skipped_nonfinite_objects=0
+            char_count=5,
+            generated_count=0,
+            ownerless_count=1,
+            unicode_map_error_count=0,
+            skipped_nonfinite_objects=0,
+            dropped_text_objects=0,
+            empty_text_objects=0,
         )
 
     def test_arabic_words_in_separate_tj_are_two_spans(self, tmp_path):
@@ -890,7 +1070,13 @@ class TestRightToLeft:
 
         assert [(item.text, item.object_index) for item in result.spans] == [("ال", 1), ("لا", 0)]
         assert result.stats == TextStats(
-            char_count=4, generated_count=0, ownerless_count=1, unicode_map_error_count=0, skipped_nonfinite_objects=0
+            char_count=4,
+            generated_count=0,
+            ownerless_count=1,
+            unicode_map_error_count=0,
+            skipped_nonfinite_objects=0,
+            dropped_text_objects=0,
+            empty_text_objects=0,
         )
 
     def test_english_hebrew_english_keeps_every_word(self, tmp_path):
@@ -899,17 +1085,30 @@ class TestRightToLeft:
         # pdfium generates the space before the Hebrew word and inserts an ownerless one after it.
         assert [(item.text, item.object_index) for item in result.spans] == [("AB", 0), ("אב", 1), ("CD", 2)]
         assert result.stats == TextStats(
-            char_count=6, generated_count=1, ownerless_count=1, unicode_map_error_count=0, skipped_nonfinite_objects=0
+            char_count=6,
+            generated_count=1,
+            ownerless_count=1,
+            unicode_map_error_count=0,
+            skipped_nonfinite_objects=0,
+            dropped_text_objects=0,
+            empty_text_objects=0,
         )
 
     def test_a_char_without_an_owner_is_counted_and_never_fails_the_page(self, tmp_path, monkeypatch):
+        # With no char owned, the run's text object counts as dropped too.
         handle = open_document(one_page(tmp_path, TextRun("Hi", x=72.0, y=100.0)))
         monkeypatch.setattr(pdfium_c, "FPDFText_GetTextObject", failing(None))
 
         result = page_text(handle, 0)
 
         empty = TextStats(
-            char_count=0, generated_count=0, ownerless_count=2, unicode_map_error_count=0, skipped_nonfinite_objects=0
+            char_count=0,
+            generated_count=0,
+            ownerless_count=2,
+            unicode_map_error_count=0,
+            skipped_nonfinite_objects=0,
+            dropped_text_objects=1,
+            empty_text_objects=0,
         )
         assert result == PageText(spans=(), stats=empty)
 
@@ -993,6 +1192,156 @@ class TestNestedText:
         assert [item.object_index for item in got] == [2 * level + 1 for level in range(40)]
 
 
+# Each squeeze below keeps "HIDDEN" over 0.01 pt wide, so the textpage keeps it.
+SQUEEZED = b"q BT /F1 12 Tf %s Tz 72 100 Td (HIDDEN) Tj ET Q"
+TURNED = b"q BT /F1 12 Tf %s Tz %s 200 100 Tm (HIDDEN) Tj ET Q"
+# The defaults of nested_text_page: the text's page-space matrix is its own times 3.
+NESTED_SCALE = 3.0
+
+
+def two_forms_page(tmp_path: Path, body: bytes, *, outer: bytes, inner: bytes) -> Path:
+    """``body`` in form Y (/Matrix ``inner``), drawn at (3, 4) in form X (``outer``), drawn at (40, 0) on the page.
+
+    pdfium's object matrix of a text object in Y holds Y's /Matrix but not
+    X's, nor the ``cm`` before either ``Do``; its textpage matrix holds all.
+    """
+    entries = b"/Type /XObject /Subtype /Form /BBox [-1000 -1000 1000 1000] /Matrix %s /Resources << %s >>"
+
+    def form(content: bytes, matrix: bytes, resources: bytes) -> bytes:
+        return b"<< %s /Length %d >>\nstream\n%s\nendstream" % (entries % (matrix, resources), len(content), content)
+
+    x = form(b"q 1 0 0 1 3 4 cm /Y Do Q", outer, b"/Font << /F1 5 0 R >> /XObject << /Y 7 0 R >>")
+    y = form(body, inner, b"/Font << /F1 5 0 R >>")
+    return content_page(tmp_path, b"q 1 0 0 1 40 0 cm /X Do Q", extra=(x, y), resources=b"/XObject << /X 6 0 R >>")
+
+
+def nested_text_page(tmp_path: Path, body: bytes) -> Path:
+    """``body`` two forms deep, under form matrices [1.5 0 0 1.5 20 30] and [2 0 0 2 10 10]: scale 3."""
+    return two_forms_page(tmp_path, body, outer=b"[1.5 0 0 1.5 20 30]", inner=b"[2 0 0 2 10 10]")
+
+
+class TestEmWidth:
+    """em_width_pt is |Tf| times the horizontal scale, hypot(a, b), of the text's page-space matrix."""
+
+    @pytest.mark.parametrize(
+        "content,size,width",
+        [
+            # Tz is a percentage of the em's width: 0.05 % of 12 pt is 0.006 pt.
+            pytest.param(SQUEEZED % b"0.05", 12.0, 0.006, id="tz-0.05"),
+            pytest.param(SQUEEZED % b"0.5", 12.0, 0.06, id="tz-0.5"),
+            pytest.param(SQUEEZED % b"1", 12.0, 0.12, id="tz-1"),
+            pytest.param(SQUEEZED % b"100", 12.0, 12.0, id="tz-100"),
+            # A mirrored scale (negative Tz, Tm or Tf) counts at its magnitude.
+            pytest.param(SQUEEZED % b"-1", 12.0, 0.12, id="tz-minus-1"),
+            pytest.param(SQUEEZED % b"-100", 12.0, 12.0, id="tz-minus-100"),
+            pytest.param(b"BT /F1 12 Tf -1 0 0 1 200 100 Tm (HIDDEN) Tj ET", 12.0, 12.0, id="mirrored-tm"),
+            pytest.param(b"q BT /F1 -12 Tf 1 Tz 200 100 Td (HIDDEN) Tj ET Q", -12.0, 0.12, id="negative-tf-tz-1"),
+            # Turned text: the em's width lies along (a, b), with b not 0.
+            pytest.param(TURNED % (b"1", b"0 1 -1 0"), 12.0, 0.12, id="quarter-turn-tz-1"),
+            pytest.param(TURNED % (b"100", b"0 1 -1 0"), 12.0, 12.0, id="quarter-turn-tz-100"),
+            pytest.param(TURNED % (b"1", b"0.866025 0.5 -0.5 0.866025"), 12.0, 0.12, id="30-degrees-tz-1"),
+            pytest.param(TURNED % (b"100", b"0.866025 0.5 -0.5 0.866025"), 12.0, 12.0, id="30-degrees-tz-100"),
+            pytest.param(b"BT /F1 10 Tf 3 0 0 2 72 100 Tm (Wide) Tj ET", 20.0, 30.0, id="anisotropic-tm"),
+            pytest.param(b"q 0.05 0 0 1 0 0 cm BT /F1 12 Tf 72 100 Td (HIDDEN) Tj ET Q", 12.0, 0.6, id="cm-squeeze"),
+        ],
+    )
+    def test_em_width_is_tf_times_the_horizontal_scale(self, tmp_path, content, size, width):
+        (got,) = spans_of(content_page(tmp_path, content))
+
+        assert (got.font_size_pt, got.em_width_pt) == pytest.approx((size, width), rel=1e-5)
+
+    def test_an_em_of_exactly_one_point_reads_exactly(self, tmp_path):
+        # 25 % of 4 pt: 0.25 and 4 are exact in pdfium's 32-bit floats.
+        (got,) = spans_of(content_page(tmp_path, b"BT /F1 4 Tf 25 Tz 72 100 Td (HIDDEN) Tj ET"))
+
+        assert got.em_width_pt == 1.0
+
+    @pytest.mark.parametrize(
+        "body,width",
+        [
+            pytest.param(b"q BT /F1 12 Tf 0.05 Tz 10 10 Td (HIDDEN) Tj ET Q", 0.006, id="tz-0.05"),
+            pytest.param(b"q BT /F1 12 Tf 0.5 Tz 10 10 Td (HIDDEN) Tj ET Q", 0.06, id="tz-0.5"),
+            pytest.param(b"q BT /F1 12 Tf 1 Tz 10 10 Td (HIDDEN) Tj ET Q", 0.12, id="tz-1"),
+            pytest.param(b"BT /F1 12 Tf 10 10 Td (HIDDEN) Tj ET", 12.0, id="tz-100"),
+            pytest.param(b"q BT /F1 12 Tf -1 Tz 10 10 Td (HIDDEN) Tj ET Q", 0.12, id="tz-minus-1"),
+            pytest.param(b"q BT /F1 12 Tf 1 Tz 0 1 -1 0 10 10 Tm (HIDDEN) Tj ET Q", 0.12, id="quarter-turn-tz-1"),
+        ],
+    )
+    def test_text_inside_nested_forms_takes_every_form_matrix(self, tmp_path, body, width):
+        (got,) = spans_of(nested_text_page(tmp_path, body))
+
+        assert (got.font_size_pt, got.em_width_pt) == pytest.approx((12.0 * NESTED_SCALE, width * NESTED_SCALE))
+
+    @pytest.mark.parametrize(
+        "body,outer,width",
+        [
+            # The object's own matrix reads 12 pt wide; the outer form squeezes it to 0.6.
+            pytest.param(b"BT /F1 12 Tf 10 10 Td (HIDDEN) Tj ET", b"[0.05 0 0 1 20 30]", 0.6, id="outer-squeezes"),
+            # The object's own matrix reads 0.12 pt wide; the outer form widens it to 1.2.
+            pytest.param(b"q BT /F1 12 Tf 1 Tz 10 10 Td (HIDDEN) Tj ET Q", b"[10 0 0 1 0 30]", 1.2, id="outer-widens"),
+            # The outer form turns the text a quarter: b is not 0, and the em keeps its width.
+            pytest.param(
+                b"q BT /F1 12 Tf 1 Tz 10 10 Td (HIDDEN) Tj ET Q", b"[0 1 -1 0 300 30]", 0.12, id="outer-turns"
+            ),
+            pytest.param(b"BT /F1 12 Tf 10 10 Td (HIDDEN) Tj ET", b"[0 1 -1 0 300 30]", 12.0, id="outer-turns-tz-100"),
+        ],
+    )
+    def test_an_enclosing_forms_matrix_scales_the_em_width(self, tmp_path, body, outer, width):
+        (got,) = spans_of(two_forms_page(tmp_path, body, outer=outer, inner=b"[1 0 0 1 0 0]"))
+
+        assert (got.font_size_pt, got.em_width_pt) == pytest.approx((12.0, width), rel=1e-5)
+
+    @pytest.mark.parametrize(
+        "matrix,size,width",
+        [
+            # Both sides of the em are 12 pt long, but sheared onto almost one line: 0.0012 pt of area per pt.
+            pytest.param(b"1 0 1 0.0001", 0.0012, 0.0012, id="sheared-flat"),
+            # Both sides on one line: no area at all.
+            pytest.param(b"1 0 1 0", 0.0, 0.0, id="rank-1"),
+            # An oblique em is as tall as its size; its slant narrows it.
+            pytest.param(b"1 0 0.2 1", 12.0, 12.0 / math.hypot(0.2, 1.0), id="oblique"),
+        ],
+    )
+    def test_a_slanted_em_is_measured_across_its_other_side(self, tmp_path, matrix, size, width):
+        (got,) = spans_of(content_page(tmp_path, b"BT /F1 12 Tf %s 200 100 Tm (HIDDEN) Tj ET" % matrix))
+
+        # pdfium keeps the matrix in 32-bit floats: 0.0001 reads 0.000099999997.
+        assert (got.font_size_pt, got.em_width_pt) == pytest.approx((size, width), rel=1e-5)
+
+
+class TestEmSize:
+    """em_size measures each side of the em perpendicular to the other: a sheared or singular em reads small."""
+
+    @pytest.mark.parametrize(
+        "matrix,size,expected",
+        [
+            pytest.param((1.0, 0.0, 0.0, 1.0), 12.0, (12.0, 12.0), id="identity"),
+            pytest.param((3.0, 0.0, 0.0, 2.0), 10.0, (30.0, 20.0), id="anisotropic"),
+            pytest.param((0.0, 1.0, -1.0, 0.0), 12.0, (12.0, 12.0), id="quarter-turn"),
+            pytest.param((0.6, 0.8, -0.8, 0.6), 12.0, (12.0, 12.0), id="turned"),
+            # A mirrored (negative) size or scale counts at its magnitude.
+            pytest.param((1.0, 0.0, 0.0, 1.0), -12.0, (12.0, 12.0), id="negative-size"),
+            pytest.param((-1.0, 0.0, 0.0, 1.0), 12.0, (12.0, 12.0), id="mirrored"),
+            # Perpendicular sides: each is its own length, as before.
+            pytest.param((0.01, 0.0, 0.0, 1.0), 12.0, (0.12, 12.0), id="tz-1"),
+            # An oblique em is as tall as its size; its slant narrows it.
+            pytest.param((1.0, 0.0, 0.2, 1.0), 12.0, (12.0 / math.hypot(0.2, 1.0), 12.0), id="oblique"),
+            # Tz 0: the width side has no length, so the height is the other side's length.
+            pytest.param((0.0, 0.0, 0.0, 1.0), 12.0, (0.0, 12.0), id="tz-0"),
+            pytest.param((1.0, 0.0, 0.0, 0.0), 12.0, (12.0, 0.0), id="no-height"),
+            pytest.param((0.0, 0.0, 0.0, 0.0), 12.0, (0.0, 0.0), id="zero"),
+            # Sheared flat: both sides about a unit long, spanning 0.0001 square units.
+            pytest.param((1.0, 0.0, 1.0, 0.0001), 12.0, (0.0012 / math.hypot(1.0, 0.0001), 0.0012), id="sheared"),
+            # Rank 1: both sides on one line.
+            pytest.param((1.0, 0.0, 1.0, 0.0), 12.0, (0.0, 0.0), id="rank-1"),
+            pytest.param((0.0, 1.0, 0.0, 1.0), 12.0, (0.0, 0.0), id="rank-1-vertical"),
+            pytest.param((1.0, 1.0, 2.0, 2.0), 12.0, (0.0, 0.0), id="rank-1-diagonal"),
+        ],
+    )
+    def test_each_side_is_measured_across_the_other(self, matrix, size, expected):
+        assert em_size(size, *matrix) == pytest.approx(expected, rel=1e-12, abs=1e-12)
+
+
 def textpage_chars(path: Path) -> tuple[str, int, int, int]:
     """Page 1's owned, non-generated textpage chars, read straight from pdfium.
 
@@ -1065,6 +1414,8 @@ class TestConservation:
                 ownerless_count=0,
                 unicode_map_error_count=0,
                 skipped_nonfinite_objects=0,
+                dropped_text_objects=0,
+                empty_text_objects=0,
             ),
         )
 
@@ -1260,9 +1611,31 @@ class TestNonFiniteText:
         monkeypatch.setattr(pdfium_c, function, stand_in)
 
         empty = TextStats(
-            char_count=0, generated_count=0, ownerless_count=0, unicode_map_error_count=0, skipped_nonfinite_objects=1
+            char_count=0,
+            generated_count=0,
+            ownerless_count=0,
+            unicode_map_error_count=0,
+            skipped_nonfinite_objects=1,
+            dropped_text_objects=0,
+            empty_text_objects=0,
         )
         assert page_text(handle, 0) == PageText(spans=(), stats=empty)
+
+    def test_a_non_finite_em_width_alone_skips_the_object(self, tmp_path, monkeypatch):
+        # Only the horizontal scale overflows: the char boxes and the font size stay finite.
+        real = pdfium_c.FPDFText_GetMatrix
+
+        def writes_inf_a(textpage, index, matrix):
+            ok = real(textpage, index, matrix)
+            matrix.a = float("inf")
+            return ok
+
+        handle = open_document(one_page(tmp_path, TextRun("Hi", x=72.0, y=100.0)))
+        monkeypatch.setattr(pdfium_c, "FPDFText_GetMatrix", writes_inf_a)
+
+        got = page_text(handle, 0)
+
+        assert (got.spans, got.stats.skipped_nonfinite_objects, got.stats.char_count) == ((), 1, 0)
 
     def test_one_non_finite_char_skips_its_whole_object_only(self, tmp_path, monkeypatch):
         # Chars 0-1 are "Ab" (object 0), char 2 the generated space, 3-4 "Cd" (object 1).
@@ -1373,3 +1746,15 @@ class TestPageTextErrors:
             page_text("doc.pdf", 0)
         with pytest.raises(ValueError, match="document handle is closed"):
             page_text(handle, 0)
+
+
+class TestUnionBox:
+    """union_box is the smallest box holding every given box."""
+
+    def test_one_box_is_itself(self):
+        assert _pdfium_common.union_box(((1.0, 2.0, 3.0, 4.0),)) == (1.0, 2.0, 3.0, 4.0)
+
+    def test_spans_every_box(self):
+        boxes = ((5.0, 1.0, 6.0, 2.0), (0.0, 3.0, 1.0, 9.0), (2.0, -1.0, 8.0, 0.0))
+
+        assert _pdfium_common.union_box(boxes) == (0.0, -1.0, 8.0, 9.0)

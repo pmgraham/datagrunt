@@ -103,6 +103,36 @@ Pages (#365 T5), pinned by ``tests/pdf_tests/test_pdfium_extract_page.py``:
   that stage's own function raises, so one bad page never fails a batch;
   any other error is a bug and propagates. :class:`RawPage` and
   :class:`PageFailure` are picklable: they cross the process pool.
+
+Recovery (#366 task 3), pinned by ``tests/pdf_tests/test_pdfium_recover.py``
+(see :mod:`datagrunt.pdf._pdfium_recover`):
+
+- pdfium's textpage drops a text object whose box is under 0.01 pt wide
+  (``Tf 0``; a tiny size: "HIDDEN" goes at 0.002 pt, stays at 0.004; ``Tz
+  0.01`` goes, ``Tz 0.05`` stays) and a copy of identical text drawn within
+  its duplicate window of one of the five text objects before it: 0.9 of
+  its last glyph's advance at its ``Tf`` along x ("Total" at 12 pt goes 2.39
+  pt away, stays 2.41; "TOTAL DUE MW" goes 10.18), whatever matrix scales
+  the text, and about an eighth of its width across while the boxes
+  overlap. The object keeps its chars but owns no textpage char, and
+  ``FPDFTextObj_GetText`` reads it as empty. ``Tz`` is in the object's
+  matrix (``Tz 0`` reads ``a = b = 0``); a ``Tf 0`` object's bounds are the
+  point at its origin, a ``Tz 0`` one's a line with no width. So are a 12
+  pt single space's and no-break space's (their glyph has no outline), and
+  two spaces' that char spacing draws on one spot (a 12 pt re-layout spreads
+  them apart; they read as a space): the text stage counts such objects as
+  empty, not dropped.
+- ``() Tj``, ``[] TJ``, ``[-500] TJ`` and a ``BT`` ... ``ET`` that shows
+  nothing make no text object at all.
+- ``FPDFTextObj_SetFontSize`` alone changes nothing the textpage reads;
+  ``FPDFPageObj_SetMatrix`` after it lays the object out again, and a fresh
+  textpage reads its text (a new size after the matrix: nothing). A copy
+  moved off the text it copies reads too; left in place, it stays dropped.
+  An object of a single space stays dropped, its box a point, at any size
+  and matrix.
+- These edits live in their page load only: a fresh load of the page drops
+  the same objects. :func:`recover_dropped_text` loads the page itself and
+  saves nothing.
 """
 
 import ctypes
@@ -111,6 +141,7 @@ import hashlib
 import os
 import sys
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -147,8 +178,18 @@ from datagrunt.pdf._pdfium_images import (
     read_filters,
     read_raw_stream,
 )
-from datagrunt.pdf._pdfium_text import PageText, RawSpan, TextStats, collect_text
-from datagrunt.pdf._validate import choice_str, finite_float, finite_tuple, int_at_least, non_blank_str
+from datagrunt.pdf._pdfium_recover import (
+    Display,
+    RecoveredSpan,
+    RecoveredText,
+    RecoveryStats,
+    TextObject,
+    is_glyphless,
+    isolate_dropped,
+    recovered_text,
+)
+from datagrunt.pdf._pdfium_text import ObjectWalk, PageText, RawSpan, TextStats, collect_text
+from datagrunt.pdf._validate import choice_str, finite_tuple, int_at_least, non_blank_str, positive_float
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFEncryptedError
 
 __all__ = [
@@ -164,6 +205,9 @@ __all__ = [
     "RawPage",
     "RawSegment",
     "RawSpan",
+    "RecoveredSpan",
+    "RecoveredText",
+    "RecoveryStats",
     "SegmentStats",
     "TextStats",
     "extract_page",
@@ -172,6 +216,7 @@ __all__ = [
     "page_images",
     "page_segments",
     "page_text",
+    "recover_dropped_text",
     "to_display_box",
 ]
 
@@ -233,14 +278,6 @@ def to_display_box(box: Box, *, rotation_deg: int, page_box: Box) -> Box:
             return page_top - top, page_right - right, page_top - bottom, page_right - left
 
 
-def _positive_finite(name: str, value: object) -> float:
-    """Return ``value`` as a finite float strictly greater than zero."""
-    result = finite_float(name, value)
-    if result <= 0.0:
-        raise ValueError(f"{name} must be > 0, got {result!r}")
-    return result
-
-
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PageGeometry:
     """One page's displayed size, rotation and visible-box offset.
@@ -263,8 +300,8 @@ class PageGeometry:
 
     def __post_init__(self) -> None:
         int_at_least("page_number", self.page_number, 1)
-        object.__setattr__(self, "width_pt", _positive_finite("width_pt", self.width_pt))
-        object.__setattr__(self, "height_pt", _positive_finite("height_pt", self.height_pt))
+        object.__setattr__(self, "width_pt", positive_float("width_pt", self.width_pt))
+        object.__setattr__(self, "height_pt", positive_float("height_pt", self.height_pt))
         _checked_rotation(self.rotation_deg)
         object.__setattr__(self, "crop_offset", finite_tuple("crop_offset", self.crop_offset, 2))
 
@@ -547,9 +584,19 @@ def _page_objects(page_raw: pdfium_c.FPDF_PAGE) -> list[tuple[pdfium_c.FPDF_PAGE
     return ordered
 
 
-def _object_indices(page_raw: pdfium_c.FPDF_PAGE) -> dict[int, int]:
-    """Map each page object's address to its depth-first paint-order index."""
-    return {object_address(obj): index for index, (obj, _form) in enumerate(_page_objects(page_raw))}
+def _text_walk(objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]) -> ObjectWalk:
+    """The walk as the text stage reads it: each object's index, the text objects, and which draw no glyph."""
+    indices = {object_address(obj): index for index, (obj, _form) in enumerate(objects)}
+    texts = (obj for obj, _form in objects if pdfium_c.FPDFPageObj_GetType(obj) == pdfium_c.FPDF_PAGEOBJ_TEXT)
+    return ObjectWalk(indices, frozenset(object_address(obj) for obj in texts), partial(_glyphless, objects, indices))
+
+
+def _glyphless(objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]], indices: dict[int, int], address: int) -> bool:
+    """Whether the walked text object at ``address`` draws no glyph with extent (its own matrix: its box's space)."""
+    index = indices[address]
+    text_object, _form = objects[index]
+    label = f"object {index}"
+    return is_glyphless(text_object, _read_matrix(text_object, label), label)
 
 
 def _pdfium_error(page_number: int, failure: PdfiumFailure) -> PDFCorruptError:
@@ -557,20 +604,34 @@ def _pdfium_error(page_number: int, failure: PdfiumFailure) -> PDFCorruptError:
     return PDFCorruptError(f"page {page_number}: pdfium cannot {failure}", page_number=page_number)
 
 
-def _read_page_text(page: pdfium.PdfPage, geometry: PageGeometry) -> PageText:
-    """Read a loaded page's spans, closing its textpage."""
-    page_number = geometry.page_number
+@contextmanager
+def _pdfium_errors(page_number: int) -> Iterator[None]:
+    """Raise a PdfiumFailure from inside as page ``page_number``'s PDFCorruptError."""
+    try:
+        yield
+    except PdfiumFailure as exc:
+        raise _pdfium_error(page_number, exc) from exc
+
+
+@contextmanager
+def _opened_textpage(page: pdfium.PdfPage, page_number: int) -> Iterator[pdfium.PdfTextPage]:
+    """A textpage of the loaded ``page``, closed on leaving; a failed load is the page's PDFCorruptError."""
     try:
         textpage = page.get_textpage()
     except pdfium.PdfiumError as exc:
         message = f"page {page_number}: pdfium cannot load the text page: {exc}"
         raise PDFCorruptError(message, page_number=page_number) from exc
     try:
-        return collect_text(textpage.raw, _display_mapping(geometry), _object_indices(page.raw))
-    except PdfiumFailure as exc:
-        raise _pdfium_error(page_number, exc) from exc
+        yield textpage
     finally:
         textpage.close()
+
+
+def _read_page_text(page: pdfium.PdfPage, geometry: PageGeometry) -> PageText:
+    """Read a loaded page's spans, closing its textpage."""
+    page_number = geometry.page_number
+    with _opened_textpage(page, page_number) as textpage, _pdfium_errors(page_number):
+        return collect_text(textpage.raw, _display_mapping(geometry), _text_walk(_page_objects(page.raw))).page_text
 
 
 def page_text(handle: DocumentHandle, index: int) -> PageText:
@@ -583,7 +644,9 @@ def page_text(handle: DocumentHandle, index: int) -> PageText:
     object (see :class:`RawSpan`), unless pdfium places that object at a
     non-finite position or size: it is skipped whole and counted
     (``TextStats.skipped_nonfinite_objects``), and the page's other text is
-    kept. Boxes are mapped to the displayed page with :func:`to_display_box`.
+    kept. Text objects that own no char are counted
+    (``TextStats.dropped_text_objects``: see :func:`recover_dropped_text`).
+    Boxes are mapped to the displayed page with :func:`to_display_box`.
     The page and textpage handles are closed before returning.
 
     Raises:
@@ -695,24 +758,33 @@ def _path_object_segments(
         return None
 
 
-def _placed_objects(page_raw: pdfium_c.FPDF_PAGE, kind: int) -> Iterator[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix]]:
-    """Each page object of type ``kind`` (not a form) with its walk index and its matrix to page space.
+def _objects_in_forms(
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]], kind: int
+) -> Iterator[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix, Matrix]]:
+    """Each walked object of type ``kind`` (not a form): its walk index, its matrix and its forms' matrix.
 
     pdfium's object matrix maps into the enclosing form's space only, so
     each form's matrix to page space is composed here, in walk order (a form
-    precedes its contents).
+    precedes its contents); the last item maps the object's form space to
+    page space (IDENTITY off a form).
     """
     form_matrices: dict[int, Matrix] = {}
-    for index, (obj, form) in enumerate(_page_objects(page_raw)):
+    for index, (obj, form) in enumerate(objects):
         obj_kind = pdfium_c.FPDFPageObj_GetType(obj)
         if obj_kind not in (kind, pdfium_c.FPDF_PAGEOBJ_FORM):
             continue
-        matrix = _read_matrix(obj, f"object {index}").then(form_matrices[form] if form >= 0 else IDENTITY)
+        own, outer = _read_matrix(obj, f"object {index}"), form_matrices[form] if form >= 0 else IDENTITY
         if obj_kind == pdfium_c.FPDF_PAGEOBJ_FORM:
             # A non-finite form matrix is kept: everything inside it is then skipped.
-            form_matrices[index] = matrix
+            form_matrices[index] = own.then(outer)
         else:
-            yield index, obj, matrix
+            yield index, obj, own, outer
+
+
+def _placed_objects(page_raw: pdfium_c.FPDF_PAGE, kind: int) -> Iterator[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix]]:
+    """Each page object of type ``kind`` (not a form) with its walk index and its matrix to page space."""
+    for index, obj, own, outer in _objects_in_forms(_page_objects(page_raw), kind):
+        yield index, obj, own.then(outer)
 
 
 def _display_mapping(geometry: PageGeometry) -> Callable[[Box], Box]:
@@ -930,6 +1002,56 @@ def _read_stages(page: pdfium.PdfPage, page_number: int) -> RawPage | PageFailur
     except PDFCorruptError as exc:
         return PageFailure(page_number=page_number, stage=stage, message=str(exc))
     return RawPage(geometry=geometry, text=text, segments=segments, images=images)
+
+
+def recover_dropped_text(handle: DocumentHandle, index: int) -> RecoveredText:
+    """Read back the text of the page's text objects that its textpage drops.
+
+    Worth calling only when the page's ``TextStats.dropped_text_objects`` is
+    over 0 (a page with none recovers nothing, at the cost of a load and two
+    textpages; empty objects never need it). On a load of its own, the
+    page's dropped text objects (forms' included, as deep as pdfium parses
+    them: those that own no textpage char and are not empty) are each
+    drawn at 12 pt with an unscaled matrix at a place of their own, and a
+    fresh textpage reads them (see :mod:`datagrunt.pdf._pdfium_recover`).
+    Each recovered span sits at its object's original displayed box, with
+    its original size and its hidden reasons; overprint copies and
+    whitespace-only objects are counted, not emitted, and so are objects
+    whose box is still a point once laid out again (empty, as a ``Tf 0``
+    space); objects with extent that pdfium still drops, or places nowhere,
+    are counted as unrecovered. Nothing is saved: the edits die with that
+    page load, which is closed (with both textpages) before returning.
+
+    Raises:
+        TypeError: If ``handle`` is not a DocumentHandle, or ``index`` is not
+            an int (bool rejected).
+        ValueError: If ``handle`` is closed.
+        IndexError: If ``index`` is outside ``0..page_count - 1``.
+        PDFCorruptError: If pdfium cannot load the page or a textpage, or a
+            pdfium call on them fails (``page_number`` is set).
+    """
+    page, page_number = _load_page(handle, index)
+    try:
+        return _recover(page, _read_geometry(page, page_number))
+    finally:
+        page.close()
+
+
+def _recover(page: pdfium.PdfPage, geometry: PageGeometry) -> RecoveredText:
+    """Recover a loaded page's dropped text: read a textpage, move the dropped objects, read another."""
+    page_number, to_display = geometry.page_number, _display_mapping(geometry)
+    with _pdfium_errors(page_number):
+        objects = _page_objects(page.raw)
+        walk = _text_walk(objects)
+        texts = tuple(TextObject(*placed) for placed in _objects_in_forms(objects, pdfium_c.FPDF_PAGEOBJ_TEXT))
+        with _opened_textpage(page, page_number) as textpage:
+            before = collect_text(textpage.raw, to_display, walk)
+        targets = isolate_dropped(texts, before.dropped, to_display)
+        with _opened_textpage(page, page_number) as textpage:
+            after = collect_text(textpage.raw, to_display, walk)
+    display = Display(to_display, geometry.width_pt, geometry.height_pt)
+    spans, stats = recovered_text(targets, texts, before.page_text, after.page_text, display)
+    return RecoveredText(page_number=page_number, spans=spans, stats=stats)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

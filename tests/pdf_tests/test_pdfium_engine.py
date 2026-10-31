@@ -20,10 +20,12 @@ import pytest
 from datagrunt.pdf import (
     PDFCorruptError,
     PDFEncryptedError,
+    _hidden_rules,
     _image_headers,
     _path_segments,
     _pdfium_common,
     _pdfium_images,
+    _pdfium_recover,
     _pdfium_text,
     pdfium_engine,
 )
@@ -95,7 +97,16 @@ def imported_modules(module) -> set[str]:
     return imported | {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
 
 
-ENGINE_MODULES = [pdfium_engine, _pdfium_text, _pdfium_common, _path_segments, _pdfium_images, _image_headers]
+ENGINE_MODULES = [
+    pdfium_engine,
+    _hidden_rules,
+    _pdfium_text,
+    _pdfium_recover,
+    _pdfium_common,
+    _path_segments,
+    _pdfium_images,
+    _image_headers,
+]
 
 
 class TestModuleImports:
@@ -120,13 +131,40 @@ class TestModuleImports:
         "module,allowed",
         [
             pytest.param(_pdfium_common, set(), id="common"),
-            pytest.param(_pdfium_text, {"datagrunt.pdf._pdfium_common", "datagrunt.pdf._validate"}, id="text"),
+            pytest.param(_hidden_rules, {"datagrunt.pdf.elements"}, id="hidden-rules"),
+            pytest.param(
+                _pdfium_text,
+                {"datagrunt.pdf._hidden_rules", "datagrunt.pdf._pdfium_common", "datagrunt.pdf._validate"},
+                id="text",
+            ),
             pytest.param(_path_segments, {"datagrunt.pdf._validate"}, id="segments"),
+            pytest.param(
+                _pdfium_recover,
+                {
+                    "datagrunt.pdf._hidden_rules",
+                    "datagrunt.pdf._path_segments",
+                    "datagrunt.pdf._pdfium_common",
+                    "datagrunt.pdf._pdfium_text",
+                    "datagrunt.pdf._validate",
+                    "datagrunt.pdf.elements",  # HiddenReason and its one validation rule
+                },
+                id="recover",
+            ),
         ],
     )
     def test_engine_parts_import_only_downward(self, module, allowed):
         # The engine imports its parts; a part never imports the engine (or a sibling above it).
         assert {name for name in imported_modules(module) if name.startswith("datagrunt")} == allowed
+
+    def test_the_hidden_text_rules_are_pure(self):
+        # The em measure, the em reasons and the placement rule call no pdfium: quality shares them.
+        assert not [name for name in imported_modules(_hidden_rules) if name.startswith("pypdfium2")]
+
+    def test_the_font_size_is_read_in_one_place(self):
+        sources = sorted(Path(pdfium_engine.__file__).parent.glob("*.py"))
+        calls = {path.name: path.read_text(encoding="utf-8").count("FPDFTextObj_GetFontSize(") for path in sources}
+
+        assert {name: count for name, count in calls.items() if count} == {"_pdfium_text.py": 1}
 
 
 class TestToDisplayBox:
