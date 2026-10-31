@@ -179,6 +179,7 @@ from datagrunt.pdf._pdfium_images import (
     read_raw_stream,
 )
 from datagrunt.pdf._pdfium_recover import (
+    Display,
     RecoveredSpan,
     RecoveredText,
     RecoveryStats,
@@ -1048,7 +1049,8 @@ def _recover(page: pdfium.PdfPage, geometry: PageGeometry) -> RecoveredText:
         targets = isolate_dropped(texts, before.dropped, to_display)
         with _opened_textpage(page, page_number) as textpage:
             after = collect_text(textpage.raw, to_display, walk)
-    return recovered_text(targets, texts, before.page_text, after.page_text, to_display)
+    display = Display(to_display, geometry.width_pt, geometry.height_pt)
+    return recovered_text(targets, texts, before.page_text, after.page_text, display)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

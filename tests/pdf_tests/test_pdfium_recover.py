@@ -43,6 +43,10 @@ from pdf_tests.test_pdfium_spans import (
 )
 
 HELVETICA = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+# Helvetica whose /Widths say every glyph is 5 em wide: 60 pt per char at 12 pt.
+WIDE_GLYPHS = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 32 /LastChar 126 /Widths [%s] >>" % (
+    b" ".join([b"5000"] * 95)
+)
 CONTROL = b"BT /F1 12 Tf 20 270 Td (Visible) Tj ET "
 NO_LOSS = RecoveryStats(overprint_duplicates=0, whitespace_objects=0, empty_text_objects=0, unrecovered_text_objects=0)
 # The techniques whose text object pdfium drops though it draws glyphs ("single-space" draws none).
@@ -684,6 +688,13 @@ class TestPdfiumBehaviour:
 
         assert object_address(text_objects(page)[1]) not in owners(page)
 
+    def test_pdfium_drops_a_copy_as_far_as_the_fonts_glyph_widths_say(self, tmp_path):
+        # Glyphs 5 em wide: the window is 0.9 of a 60 pt advance, so a copy 30 pt away goes.
+        copy = b"BT /F1 12 Tf 72 100 Td (To) Tj ET BT /F1 12 Tf 102 100 Td (To) Tj ET"
+        page = pdfium.PdfDocument(pdf(tmp_path, copy, font=WIDE_GLYPHS))[0]
+
+        assert object_address(text_objects(page)[1]) not in owners(page)
+
     @pytest.mark.parametrize("between,dropped", [(4, True), (5, False)])
     def test_pdfium_looks_for_the_text_a_copy_copies_among_the_five_text_objects_before_it(
         self, tmp_path, between, dropped
@@ -838,6 +849,10 @@ class TestRecovery:
             pytest.param((b"", b""), (b"", b"1 Tr"), 1, (), id="filled-then-stroked"),
             pytest.param((b"/Clear gs", b""), (b"", b""), 0, (), id="transparent-then-opaque"),
             pytest.param((b"", b""), (b"/Faint gs", b""), 0, (), id="opaque-then-faint"),
+            # Alike but for colour: a white copy on the white page, then the black one a reader sees.
+            pytest.param((b"1 1 1 rg", b""), (b"", b""), 0, (), id="white-then-black"),
+            pytest.param((b"", b""), (b"1 0 0 rg", b""), 0, (), id="black-then-red"),
+            pytest.param((b"1 1 1 RG", b"1 Tr"), (b"", b"1 Tr"), 1, (), id="white-stroke-then-black"),
             # The copy pdfium drops for its width (Tz 0) is hidden though the text it copies is not.
             pytest.param((b"", b""), (b"", b"0 Tz"), 0, ("zero_scale",), id="drawn-then-squeezed"),
         ],
@@ -872,6 +887,36 @@ class TestRecovery:
         got = recovered(pdf(tmp_path, CONTROL + copy))
 
         assert got == RecoveredText(spans=(), stats=dataclasses.replace(NO_LOSS, overprint_duplicates=1))
+
+    @pytest.mark.parametrize(
+        "first_x,second_x",
+        [
+            # The first copy runs past the right edge; the copy 2.3 pt left of it lies on the page.
+            pytest.param(375.0, 372.7, id="off-page-then-on"),
+            pytest.param(372.7, 375.0, id="on-page-then-off"),
+        ],
+    )
+    def test_a_copy_placed_unlike_the_text_it_copies_is_emitted(self, tmp_path, first_x, second_x):
+        # pdfium drops the second copy (within 2.4 pt of a 12 pt "l"); one shows a char the other does not.
+        copies = b"BT /F1 12 Tf %g 100 Td (Total) Tj ET BT /F1 12 Tf %g 100 Td (Total) Tj ET" % (first_x, second_x)
+
+        got = recovered(pdf(tmp_path, CONTROL + copies))
+
+        (item,) = got.spans
+        assert (item.span.text, item.span.object_index, item.hidden_reasons, got.stats) == ("Total", 2, (), NO_LOSS)
+
+    @pytest.mark.parametrize("dx,counted", [(30.0, False), (12.5, False), (11.5, True)])
+    def test_the_duplicate_window_is_capped_at_12_pt_whatever_the_font_says(self, tmp_path, dx, counted):
+        # A font whose glyphs claim 5 em each: pdfium drops a copy up to 54 pt away (TestPdfiumBehaviour),
+        # which a reader sees beside the first. Recovery's window stops at 12 pt: further, the copy is emitted.
+        copy = b"BT /F1 12 Tf 72 100 Td (To) Tj ET BT /F1 12 Tf %g 100 Td (To) Tj ET" % (72 + dx)
+
+        got = recovered(pdf(tmp_path, CONTROL + copy, font=WIDE_GLYPHS))
+
+        assert got.stats == dataclasses.replace(NO_LOSS, overprint_duplicates=int(counted))
+        assert [(item.span.text, item.span.object_index, item.hidden_reasons) for item in got.spans] == (
+            [] if counted else [("To", 2, ())]
+        )
 
     @pytest.mark.parametrize("where", PLACEMENTS)
     def test_a_drop_shadow_is_an_overprint(self, tmp_path, where):

@@ -70,13 +70,12 @@ from typing import Literal, TypeAlias, get_args
 
 from datagrunt.pdf._pdfium_common import Box, union_box
 from datagrunt.pdf._pdfium_images import RawImage
-from datagrunt.pdf._pdfium_recover import RecoveredText, em_reasons
+from datagrunt.pdf._pdfium_recover import RecoveredText, em_reasons, off_page
 from datagrunt.pdf._pdfium_text import RawSpan
 from datagrunt.pdf._validate import choice_str, int_at_least, ordered_box, positive_float, str_tuple, typed_tuple
 from datagrunt.pdf.elements import (
     HIDDEN_REASONS,
     PAGE_ROUTES,
-    BBox,
     HiddenReason,
     PageQuality,
     PageRoute,
@@ -209,12 +208,6 @@ def _over_raster(box: Box, raster: tuple[Box, ...]) -> bool:
     return any(image[0] <= x <= image[2] and image[1] <= y <= image[3] for image in raster)
 
 
-def _off_page(box: Box, width: float, height: float) -> bool:
-    """True if ``box`` is not within the page by A1's ``BBox.within`` rule and its default tolerance."""
-    x0, y0, x1, y1 = box
-    return not BBox(x0=x0, y0=y0, x1=x1, y1=y1).within(width, height)
-
-
 def _span_pieces(span: RawSpan, width: float, height: float, raster: tuple[Box, ...]) -> Iterator[SpanPiece]:
     """Yield ``span``'s pieces: maximal runs of chars with equal hidden reasons."""
     no_paint = span.render_mode in _NO_PAINT_MODES
@@ -223,7 +216,7 @@ def _span_pieces(span: RawSpan, width: float, height: float, raster: tuple[Box, 
     flagged["transparent"] = _transparent(span)
     reasons: list[tuple[HiddenReason, ...]] = []
     for box in span.char_boxes:
-        flagged["off_page"] = _off_page(box, width, height)
+        flagged["off_page"] = off_page(box, width, height)
         flagged["invisible"] = no_paint and not _over_raster(box, under)
         reasons.append(tuple(reason for reason in HIDDEN_REASONS if flagged.get(reason, False)))
     start = 0
