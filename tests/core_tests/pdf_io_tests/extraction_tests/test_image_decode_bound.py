@@ -570,3 +570,217 @@ def test_peak_rss_bounded_rendering_any_container(tmp_path, engine, container):
     path = BOMB_CONTAINERS[container](tmp_path / f"{container}.pdf")
     peak = _run_peak(path, engine, "render")
     assert peak < _RSS_BOUND_MIB, f"{engine}/{container} render peaked at {peak} MiB (bound {_RSS_BOUND_MIB})"
+
+
+# ---------------------------------------------------------------------------
+# Guard bypass regressions: indirect /Filter, #xx hex escapes, inline BI/ID/EI
+# token boundaries, and fail-closed on unreadable content streams.
+# ---------------------------------------------------------------------------
+
+
+def _jpx_tile_bomb() -> bytes:
+    """A J2K codestream whose SIZ/tile headers exceed the 4,096-tile guard cap."""
+    return j2k((16, 16), siz=(2000, 2000), tile=(8, 8))
+
+
+def _pdf_with_indirect_filter_image(data: bytes, filter_obj: bytes = b"/JPXDecode") -> bytes:
+    """Build a 1-page PDF bytes buffer where Image XObject 5 has ``/Filter 6 0 R``."""
+    content = b"q 200 0 0 200 50 50 cm /Im0 Do Q"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        b"<< /Type /XObject /Subtype /Image /Width 16 /Height 16 /ColorSpace /DeviceGray "
+        b"/BitsPerComponent 8 /Filter 6 0 R /Length %d >>\nstream\n%s\nendstream" % (len(data), data),
+        filter_obj,
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, body in enumerate(objects, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n%s\nendobj\n" % (number, body)
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    out += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref)
+    return bytes(out)
+
+
+@pytest.fixture
+def no_pymupdf_image_decode(monkeypatch):
+    """Fail if PyMuPDF image decode/rect/render entry points are called."""
+    import pymupdf
+
+    calls: list[str] = []
+
+    def forbid(name):
+        def spy(*args, **kwargs):
+            calls.append(name)
+            pytest.fail(f"PyMuPDF image decode entry point {name} was called on a guarded image")
+
+        return spy
+
+    monkeypatch.setattr(pymupdf.Document, "extract_image", forbid("Document.extract_image"))
+    monkeypatch.setattr(pymupdf, "Pixmap", forbid("pymupdf.Pixmap"))
+    monkeypatch.setattr(pymupdf.Page, "get_image_rects", forbid("Page.get_image_rects"))
+    monkeypatch.setattr(pymupdf.Page, "get_pixmap", forbid("Page.get_pixmap"))
+    return calls
+
+
+@pytest.fixture
+def no_pymupdf_page_render(monkeypatch):
+    """Fail if PyMuPDF page rendering (Page.get_pixmap) is called."""
+    import pymupdf
+
+    calls: list[str] = []
+
+    def forbid(name):
+        def spy(*args, **kwargs):
+            calls.append(name)
+            pytest.fail(f"PyMuPDF page render entry point {name} was called on a guarded page")
+
+        return spy
+
+    monkeypatch.setattr(pymupdf.Page, "get_pixmap", forbid("Page.get_pixmap"))
+    return calls
+
+
+def test_indirect_filter_reference_is_guarded_in_to_dicts(tmp_path, no_pymupdf_image_decode):
+    path = tmp_path / "indirect_filter.pdf"
+    path.write_bytes(_pdf_with_indirect_filter_image(_jpx_tile_bomb(), b"/JPXDecode"))
+    document = PDFReader(path, engine="pymupdf").to_dicts()
+
+    assert any("JPEG 2000" in w for w in _warnings_of(document))
+    assert _image_elements(document) == []
+    assert no_pymupdf_image_decode == []
+
+
+def test_indirect_filter_array_reference_is_guarded_in_to_dicts(tmp_path, no_pymupdf_image_decode):
+    import binascii
+
+    wrapped = binascii.hexlify(_jpx_tile_bomb()) + b">"
+    path = tmp_path / "indirect_filter_array.pdf"
+    path.write_bytes(_pdf_with_indirect_filter_image(wrapped, b"[/ASCIIHexDecode /JPXDecode]"))
+    document = PDFReader(path, engine="pymupdf").to_dicts()
+
+    assert any("JPEG 2000" in w for w in _warnings_of(document))
+    assert _image_elements(document) == []
+    assert no_pymupdf_image_decode == []
+
+
+def test_indirect_filter_reference_is_guarded_in_render_pages(tmp_path, no_pymupdf_page_render):
+    path = tmp_path / "indirect_filter_render.pdf"
+    path.write_bytes(_pdf_with_indirect_filter_image(_jpx_tile_bomb(), b"/JPXDecode"))
+    paths = PDFWriter(path, engine="pymupdf").render_pages_as_images(str(tmp_path / "pages"), dpi=72)
+
+    assert paths == []
+    assert no_pymupdf_page_render == []
+
+
+def test_hex_escaped_subtype_and_filter_xobject_is_guarded(tmp_path, no_pymupdf_image_decode, no_pymupdf_page_render):
+    bomb = _jpx_tile_bomb()
+    content = b"q 200 0 0 200 50 50 cm /Im0 Do Q"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        b"<< /Type /XObject /Subtype /#49mage /Width 16 /Height 16 /ColorSpace /DeviceGray "
+        b"/BitsPerComponent 8 /Filter /#4aPXDecode /Length %d >>\nstream\n%s\nendstream" % (len(bomb), bomb),
+    ]
+    path = hand_written_pdf(tmp_path / "hex_xobj.pdf", objects)
+
+    document = PDFReader(path, engine="pymupdf").to_dicts()
+    assert any("JPEG 2000" in w for w in _warnings_of(document))
+    assert _image_elements(document) == []
+    assert no_pymupdf_image_decode == []
+
+    paths = PDFWriter(path, engine="pymupdf").render_pages_as_images(str(tmp_path / "pages"), dpi=72)
+    assert paths == []
+    assert no_pymupdf_page_render == []
+
+    indirect_hex_path = tmp_path / "indirect_hex_xobj.pdf"
+    indirect_hex_path.write_bytes(_pdf_with_indirect_filter_image(bomb, b"/#4aPXDecode"))
+    indirect_doc = PDFReader(indirect_hex_path, engine="pymupdf").to_dicts()
+    assert any("JPEG 2000" in w for w in _warnings_of(indirect_doc))
+    assert _image_elements(indirect_doc) == []
+    assert no_pymupdf_image_decode == []
+
+    indirect_paths = PDFWriter(indirect_hex_path, engine="pymupdf").render_pages_as_images(
+        str(tmp_path / "indirect_pages"), dpi=72
+    )
+    assert indirect_paths == []
+    assert no_pymupdf_page_render == []
+
+
+def test_hex_escaped_inline_image_filter_is_guarded_in_render_pages(tmp_path, no_pymupdf_page_render):
+    bomb = _jpx_tile_bomb()
+    assert b"EI" not in bomb
+    content = b"q 100 0 0 100 50 50 cm BI /W 16 /H 16 /CS /G /BPC 8 /#46 /#4aPXDecode ID " + bomb + b"\nEI Q"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+    ]
+    path = hand_written_pdf(tmp_path / "hex_inline.pdf", objects)
+    paths = PDFWriter(path, engine="pymupdf").render_pages_as_images(str(tmp_path / "pages"), dpi=72)
+
+    assert paths == []
+    assert no_pymupdf_page_render == []
+
+
+def test_inline_image_with_slash_id_key_before_filter_is_guarded(tmp_path, no_pymupdf_page_render):
+    bomb = _jpx_tile_bomb()
+    assert b"EI" not in bomb
+    content = b"q 100 0 0 100 50 50 cm BI /W 16 /H 16 /CS /G /BPC 8 /X /ID /F /JPXDecode ID " + bomb + b"\nEI Q"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+    ]
+    path = hand_written_pdf(tmp_path / "slash_id_inline.pdf", objects)
+    paths = PDFWriter(path, engine="pymupdf").render_pages_as_images(str(tmp_path / "pages"), dpi=72)
+
+    assert paths == []
+    assert no_pymupdf_page_render == []
+
+
+def test_inline_image_without_matching_id_operator_fails_closed(tmp_path, no_pymupdf_page_render):
+    content = b"q 100 0 0 100 50 50 cm BI /W 16 /H 16 /CS /G /BPC 8 /F /JPXDecode"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+    ]
+    path = hand_written_pdf(tmp_path / "unterminated_bi.pdf", objects)
+    paths = PDFWriter(path, engine="pymupdf").render_pages_as_images(str(tmp_path / "pages"), dpi=72)
+
+    assert paths == []
+    assert no_pymupdf_page_render == []
+
+
+def test_document_block_reason_fails_closed_when_read_contents_raises(tmp_path, monkeypatch):
+    import pymupdf
+
+    from datagrunt.core.pdf_io.extraction.render_guard import document_block_reason
+
+    path = normal_rich_pdf(tmp_path / "normal.pdf")
+    doc = pymupdf.open(path)
+    try:
+
+        def _boom(self):
+            raise RuntimeError("corrupt content stream")
+
+        monkeypatch.setattr(pymupdf.Page, "read_contents", _boom)
+        reason = document_block_reason(doc)
+    finally:
+        doc.close()
+
+    assert reason is not None
+    assert "unreadable" in reason.lower()

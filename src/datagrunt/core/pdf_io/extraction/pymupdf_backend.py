@@ -1,12 +1,16 @@
 """pymupdf-backed extraction backend (the reference engine)."""
 
 import logging
-import re
 
 from datagrunt.core.pdf_io.extraction._doc_session import _ThreadLocalDocSession
 from datagrunt.core.pdf_io.extraction.base import ExtractionBackend
 from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
-from datagrunt.core.pdf_io.extraction.image_guard import _MAX_RAW_HEADER_BYTES, inspect_image
+from datagrunt.core.pdf_io.extraction.image_guard import (
+    _MAX_RAW_HEADER_BYTES,
+    extract_xref_filters,
+    inspect_image,
+    parse_filter_names,
+)
 from datagrunt.core.pdf_io.extraction.ocr import ocr_data_to_blocks
 from datagrunt.core.pdf_io.extraction.pdfium_document import ENCRYPTED_PDF_MESSAGE
 from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, PageAnalysis, TextBlock
@@ -25,9 +29,7 @@ def _parse_filter_value(value) -> list:
     or array/dict delimiters, so each ``/Name`` token is taken whole; the guard
     normalises abbreviations.
     """
-    if not value:
-        return []
-    return re.findall(r"/([^\s/\[\]<>(){}]+)", str(value))
+    return parse_filter_names(value)
 
 
 def _guard_image(doc, xref: int, label: str):
@@ -36,11 +38,7 @@ def _guard_image(doc, xref: int, label: str):
     The raw stream is copied (not decoded) and bounded; an unreadable stream or
     filter means the guard fails closed (skip).
     """
-    try:
-        _, filter_value = doc.xref_get_key(xref, "Filter")
-    except Exception:  # noqa: BLE001 - a missing/odd filter must not fail the page
-        filter_value = None
-    filters = _parse_filter_value(filter_value)
+    filters = extract_xref_filters(doc, xref)
     try:
         raw = doc.xref_stream_raw(xref)
     except Exception:  # noqa: BLE001 - unreadable raw stream -> fail closed

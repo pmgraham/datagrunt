@@ -19,7 +19,15 @@ reuses the reason.
 import logging
 import re
 
-from datagrunt.core.pdf_io.extraction.image_guard import _NON_IMAGE_FILTERS, inspect_image, normalize_filter
+from datagrunt.core.pdf_io.extraction.image_guard import (
+    _NON_IMAGE_FILTERS,
+    _UNREADABLE_FILTER,
+    extract_xref_filters,
+    inspect_image,
+    normalize_filter,
+    parse_filter_names,
+    unescape_pdf_names,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,15 +46,16 @@ _MAX_INLINE_DICT_BYTES = 4096
 # span a whole bomb.
 _MAX_INLINE_DATA_BYTES = 1 << 20
 
-_NAME_TOKEN = r"/([^\s/\[\]<>(){}]+)"
+_FILTER_KEY_RE = re.compile(r"/(?:Filter|F)\b")
 _FILTER_VALUE = re.compile(r"/(?:Filter|F)\b\s*(\[[^\]]*\]|/[^\s/\[\]<>(){}]+)")
+_BI_TOKEN = re.compile(rb"(?<![^\s\]>)}])BI(?=[\s/])")
+_ID_TOKEN = re.compile(rb"(?<![^\s\]>)}])ID[\s]")
+_EI_TOKEN = re.compile(rb"[\s]EI(?=$|[\s/>])")
 
 
 def _parse_filter_value(value) -> list:
     """Parse a PDF ``/Filter`` entry into filter names (abbreviations kept; guard normalises)."""
-    if not value:
-        return []
-    return re.findall(_NAME_TOKEN, str(value))
+    return parse_filter_names(value)
 
 
 def _jbig2_globals(doc, xref: int) -> tuple[bytes | None, bool]:
@@ -73,11 +82,7 @@ def _jbig2_globals(doc, xref: int) -> tuple[bytes | None, bool]:
 
 def _image_block_reason(doc, xref: int) -> tuple[str | None, int]:
     """Guard decision for the image at ``xref`` and the raw bytes it read (for the budget)."""
-    try:
-        _, filter_value = doc.xref_get_key(xref, "Filter")
-    except Exception:  # noqa: BLE001
-        filter_value = None
-    filters = _parse_filter_value(filter_value)
+    filters = extract_xref_filters(doc, xref)
     globals_data, globals_missing = _jbig2_globals(doc, xref)
     try:
         raw = doc.xref_stream_raw(xref)
@@ -90,6 +95,17 @@ def _image_block_reason(doc, xref: int) -> tuple[str | None, int]:
     return (decision.reason if decision.skip else None), read
 
 
+def _inline_dict_filters(raw_dict: str) -> list[str]:
+    """Extract inline image filter names from an unescaped dictionary text."""
+    match = _FILTER_VALUE.search(raw_dict)
+    if match is not None:
+        names = _parse_filter_value(match.group(1))
+        return names if names else [_UNREADABLE_FILTER]
+    if _FILTER_KEY_RE.search(raw_dict) is not None:
+        return [_UNREADABLE_FILTER]
+    return []
+
+
 def _inline_block_reason(content: bytes) -> str | None:
     """Scan one decoded content stream for an inline image a render must not decode.
 
@@ -100,30 +116,52 @@ def _inline_block_reason(content: bytes) -> str | None:
     cannot be delimited within the bound, the render is blocked (fail closed).
     """
     start = 0
-    while True:
-        bi = content.find(b"BI", start)
-        if bi < 0:
+    max_steps = len(content) // 2 + 1
+    for _ in range(max_steps):
+        if start >= len(content):
             return None
-        id_at = content.find(b"ID", bi, bi + _MAX_INLINE_DICT_BYTES)
-        if id_at < 0:
-            start = bi + 2
+        bi_match = _BI_TOKEN.search(content, start)
+        if bi_match is None:
+            return None
+        bi_end = bi_match.end()
+        dict_window = content[bi_end : bi_end + _MAX_INLINE_DICT_BYTES]
+        id_match = _ID_TOKEN.search(dict_window)
+        if id_match is None:
+            if _FILTER_KEY_RE.search(unescape_pdf_names(dict_window.decode("latin-1"))):
+                return "inline image: stream truncated before ID; render skipped"
+            start = bi_end
             continue
-        dict_text = content[bi + 2 : id_at]
-        match = _FILTER_VALUE.search(dict_text.decode("latin-1"))
-        filters = _parse_filter_value(match.group(1)) if match else []
+        raw_dict = unescape_pdf_names(dict_window[: id_match.start()].decode("latin-1"))
+        filters = _inline_dict_filters(raw_dict)
         codec = normalize_filter(filters[-1]) if filters else ""
         if not filters or codec in _NON_IMAGE_FILTERS:
-            start = id_at + 2  # a safe or filter-less inline image: bounded by /W /H
+            start = bi_end + id_match.end()  # a safe or filter-less inline image: bounded by /W /H
             continue
-        data_start = id_at + 3  # one whitespace byte follows ID
-        ei = content.find(b"EI", data_start, data_start + _MAX_INLINE_DATA_BYTES)
-        data = content[data_start:ei] if ei >= 0 else content[data_start : data_start + _MAX_INLINE_DATA_BYTES]
+        data_start = bi_end + id_match.end()  # one whitespace byte follows ID
+        data_window = content[data_start : data_start + _MAX_INLINE_DATA_BYTES]
+        ei_match = _EI_TOKEN.search(data_window)
+        data = data_window[: ei_match.start()] if ei_match is not None else data_window
         decision = inspect_image(data if data else None, filters, label="an inline image")
         if decision.skip:
             return decision.reason
-        if ei < 0:
+        if ei_match is None:
             return "an inline image could not be delimited within the scan bound; render skipped"
-        start = ei + 2
+        start = data_start + ei_match.end()
+    return None
+
+
+def _is_subtype(subtype: tuple[str, str], expected: str) -> bool:
+    """Return True if ``xref_get_key(xref, 'Subtype')`` matches ``expected`` after ``#xx`` unescaping."""
+    kind, value = subtype
+    return kind == "name" and unescape_pdf_names(str(value)) == expected
+
+
+def _is_pattern_object(doc, xref: int) -> bool:
+    """Return True if ``xref`` declares a ``/PatternType`` entry."""
+    try:
+        return doc.xref_get_key(xref, "PatternType") != ("null", "null")
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def document_block_reason(doc) -> str | None:
@@ -142,34 +180,31 @@ def document_block_reason(doc) -> str | None:
         return f"document has {count} objects, over the {_MAX_SCAN_OBJECTS}-object scan bound; render skipped"
 
     budget = _MAX_SCAN_BYTES
-    content_xrefs = []  # Form XObjects and tiling patterns: streams that may hold inline images
+    content_xrefs: list[int] = []  # Form XObjects and tiling patterns: streams that may hold inline images
     for xref in range(1, count):
         try:
             subtype = doc.xref_get_key(xref, "Subtype")
         except Exception:  # noqa: BLE001 - not a dictionary object
             continue
-        if subtype == ("name", "/Image"):
+        if _is_subtype(subtype, "/Image"):
             reason, read = _image_block_reason(doc, xref)
             if reason is not None:
                 return reason
             budget -= read
             if budget < 0:
                 return "image stream scan exceeded the per-document byte budget; render skipped"
-        elif subtype == ("name", "/Form"):
+        elif _is_subtype(subtype, "/Form"):
             content_xrefs.append(xref)  # annotation appearance /N streams are Form XObjects too
-        elif subtype == ("name", "/Type3"):
+        elif _is_subtype(subtype, "/Type3"):
             content_xrefs.extend(_charproc_xrefs(doc, xref))  # glyph procedures may hold inline images
-        else:
-            try:
-                is_pattern = doc.xref_get_key(xref, "PatternType") != ("null", "null")
-            except Exception:  # noqa: BLE001
-                is_pattern = False
-            if is_pattern:
-                content_xrefs.append(xref)
+        elif _is_pattern_object(doc, xref):
+            content_xrefs.append(xref)
 
     # Inline images live in content streams, not in xref /Subtype: scan every
     # page's content and every Form XObject / tiling-pattern stream.
-    for source in _content_streams(doc, content_xrefs):
+    for source, error_reason in _content_streams(doc, content_xrefs):
+        if error_reason is not None or source is None:
+            return error_reason or "content stream unreadable; render skipped"
         budget -= len(source)
         if budget < 0:
             return "content stream scan exceeded the per-document byte budget; render skipped"
@@ -211,19 +246,21 @@ def _charproc_xrefs(doc, font_xref: int) -> list:
 
 
 def _content_streams(doc, content_xrefs):
-    """Yield the decoded bytes of every page content stream and Form/pattern stream."""
-    for page in doc:
+    """Yield ``(stream_bytes, error_reason)`` for every page and Form/pattern content stream."""
+    for page_index, page in enumerate(doc):
         try:
-            yield page.read_contents()
-        except Exception:  # noqa: BLE001 - a page whose content cannot be read has nothing to scan
-            continue
+            yield page.read_contents(), None
+        except Exception:  # noqa: BLE001 - unreadable page content stream -> fail closed
+            page_num = getattr(page, "number", page_index) + 1
+            yield None, f"page {page_num}: content stream unreadable; render skipped"
     for xref in content_xrefs:
         try:
             stream = doc.xref_stream(xref)
-        except Exception:  # noqa: BLE001
-            stream = None
+        except Exception:  # noqa: BLE001 - unreadable form/pattern content stream -> fail closed
+            yield None, f"xref {xref}: form content stream unreadable; render skipped"
+            continue
         if stream:
-            yield stream
+            yield stream, None
 
 
 def document_block_reason_for_path(filepath) -> str | None:

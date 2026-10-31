@@ -22,6 +22,7 @@ Pure: no pdfium / pymupdf import. Every scan is bounded by the data's length
 and a marker, box or segment count.
 """
 
+import re
 from typing import NamedTuple
 
 from datagrunt.pdf._image_headers import jpx_size
@@ -113,10 +114,63 @@ class GuardDecision(NamedTuple):
 
 _SAFE = GuardDecision(skip=False, reason=None)
 
+_HEX_ESCAPE_RE = re.compile(r"#([0-9A-Fa-f]{2})")
+_NAME_TOKEN_RE = re.compile(r"/([^\s/\[\]<>(){}]+)")
+_INDIRECT_REF_RE = re.compile(r"(\d+)\s+\d+\s+R")
+_MAX_FILTER_REF_DEPTH = 2
+_UNREADABLE_FILTER = "__unreadable_filter__"
+
+
+def unescape_pdf_names(text: str) -> str:
+    """Decode PDF ``#xx`` hex escapes in name tokens (ISO 32000-1 7.3.5)."""
+    return _HEX_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), text)
+
+
+def parse_filter_names(value: object) -> list[str]:
+    """Parse a PDF ``/Filter`` entry into ``#xx``-unescaped filter names."""
+    if not value:
+        return []
+    return _NAME_TOKEN_RE.findall(unescape_pdf_names(str(value)))
+
+
+def _resolve_indirect_filter(doc: object, value: str) -> list[str]:
+    """Resolve an indirect ``/Filter`` reference (up to 2 hops) into filter names."""
+    current = str(value).strip()
+    for _ in range(_MAX_FILTER_REF_DEPTH):
+        match = _INDIRECT_REF_RE.fullmatch(current)
+        if match is None:
+            break
+        ref_xref = int(match.group(1))
+        current = str(doc.xref_object(ref_xref) or "").strip()  # type: ignore[attr-defined]
+    if _INDIRECT_REF_RE.fullmatch(current) is not None:
+        return [_UNREADABLE_FILTER]
+    names = parse_filter_names(current)
+    return names if names else [_UNREADABLE_FILTER]
+
+
+def extract_xref_filters(doc: object, xref: int) -> list[str]:
+    """Return filter names for ``xref``, resolving indirect ``/Filter`` refs and failing closed."""
+    try:
+        kind, value = doc.xref_get_key(xref, "Filter")  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - unreadable filter key -> fail closed
+        return [_UNREADABLE_FILTER]
+    if kind == "null":
+        return []
+    if kind in ("name", "array"):
+        names = parse_filter_names(value)
+        return names if names else [_UNREADABLE_FILTER]
+    if kind == "xref":
+        try:
+            return _resolve_indirect_filter(doc, str(value))
+        except Exception:  # noqa: BLE001 - broken indirect filter -> fail closed
+            return [_UNREADABLE_FILTER]
+    return [_UNREADABLE_FILTER]
+
 
 def normalize_filter(name: str) -> str:
-    """Return a PDF filter name with its abbreviation expanded, else unchanged."""
-    return _FILTER_ABBREVIATIONS.get(name, name)
+    """Return a PDF filter name with ``#xx`` escapes decoded and its abbreviation expanded."""
+    unescaped = unescape_pdf_names(name)
+    return _FILTER_ABBREVIATIONS.get(unescaped, unescaped)
 
 
 def inspect_image(
