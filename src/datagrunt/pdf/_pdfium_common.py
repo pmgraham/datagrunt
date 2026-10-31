@@ -20,6 +20,16 @@ class PdfiumFailure(Exception):
     """
 
 
+def union_box(boxes: tuple[Box, ...]) -> Box:
+    """The smallest box holding every one of ``boxes`` (at least one)."""
+    return (
+        min(box[0] for box in boxes),
+        min(box[1] for box in boxes),
+        max(box[2] for box in boxes),
+        max(box[3] for box in boxes),
+    )
+
+
 def object_address(pointer: pdfium_c.FPDF_PAGEOBJECT) -> int:
     """The address a pdfium object pointer holds (0 for NULL), to compare objects."""
     return ctypes.cast(pointer, ctypes.c_void_p).value or 0

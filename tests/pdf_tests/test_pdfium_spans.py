@@ -17,7 +17,7 @@ import pypdfium2.raw as pdfium_c
 import pytest
 from reportlab.pdfbase.pdfmetrics import stringWidth
 
-from datagrunt.pdf import PDFCorruptError
+from datagrunt.pdf import PDFCorruptError, _pdfium_common
 from datagrunt.pdf.pdfium_engine import PageText, RawSpan, TextStats, open_document, page_text
 from pdf_tests.builders import FormXObject, PageSpec, TextRun, break_page, build_pdf, hand_written_pdf
 
@@ -1373,3 +1373,15 @@ class TestPageTextErrors:
             page_text("doc.pdf", 0)
         with pytest.raises(ValueError, match="document handle is closed"):
             page_text(handle, 0)
+
+
+class TestUnionBox:
+    """union_box is the smallest box holding every given box."""
+
+    def test_one_box_is_itself(self):
+        assert _pdfium_common.union_box(((1.0, 2.0, 3.0, 4.0),)) == (1.0, 2.0, 3.0, 4.0)
+
+    def test_spans_every_box(self):
+        boxes = ((5.0, 1.0, 6.0, 2.0), (0.0, 3.0, 1.0, 9.0), (2.0, -1.0, 8.0, 0.0))
+
+        assert _pdfium_common.union_box(boxes) == (0.0, -1.0, 8.0, 9.0)

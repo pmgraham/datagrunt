@@ -26,6 +26,7 @@ from datagrunt.pdf._validate import (
     int_at_least,
     non_blank_str,
     optional_str,
+    positive_float,
     sha256_hex,
     str_tuple,
 )
@@ -319,14 +320,6 @@ def _check_optional_callable(name: str, value: object) -> None:
     """Require ``value`` to be callable or None."""
     if value is not None and not callable(value):
         raise TypeError(f"{name} must be callable or None, got {type(value).__name__}")
-
-
-def _positive_finite(name: str, value: object) -> float:
-    """Return ``value`` as a finite float strictly greater than zero."""
-    result = finite_float(name, value)
-    if result <= 0.0:
-        raise ValueError(f"{name} must be > 0, got {result!r}")
-    return result
 
 
 def _check_bool(name: str, value: object) -> None:
@@ -912,7 +905,7 @@ class PageImage:
 
     def __post_init__(self) -> None:
         int_at_least("page_number", self.page_number, 1)
-        object.__setattr__(self, "dpi", _positive_finite("dpi", self.dpi))
+        object.__setattr__(self, "dpi", positive_float("dpi", self.dpi))
         int_at_least("width_px", self.width_px, 1)
         int_at_least("height_px", self.height_px, 1)
         _check_optional_path("image_path", self.image_path)
@@ -1063,8 +1056,8 @@ class Page:
     def _validate_fields(self) -> None:
         """Check each field's own type and range (coercing the dimensions to float)."""
         int_at_least("page_number", self.page_number, 1)
-        object.__setattr__(self, "width_pt", _positive_finite("width_pt", self.width_pt))
-        object.__setattr__(self, "height_pt", _positive_finite("height_pt", self.height_pt))
+        object.__setattr__(self, "width_pt", positive_float("width_pt", self.width_pt))
+        object.__setattr__(self, "height_pt", positive_float("height_pt", self.height_pt))
         _check_choice("status", self.status, _PAGE_STATUSES)
         _check_choice("route", self.route, _PAGE_ROUTES)
         if self.quality is not None and not isinstance(self.quality, PageQuality):

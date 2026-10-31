@@ -148,7 +148,7 @@ from datagrunt.pdf._pdfium_images import (
     read_raw_stream,
 )
 from datagrunt.pdf._pdfium_text import PageText, RawSpan, TextStats, collect_text
-from datagrunt.pdf._validate import choice_str, finite_float, finite_tuple, int_at_least, non_blank_str
+from datagrunt.pdf._validate import choice_str, finite_tuple, int_at_least, non_blank_str, positive_float
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFEncryptedError
 
 __all__ = [
@@ -233,14 +233,6 @@ def to_display_box(box: Box, *, rotation_deg: int, page_box: Box) -> Box:
             return page_top - top, page_right - right, page_top - bottom, page_right - left
 
 
-def _positive_finite(name: str, value: object) -> float:
-    """Return ``value`` as a finite float strictly greater than zero."""
-    result = finite_float(name, value)
-    if result <= 0.0:
-        raise ValueError(f"{name} must be > 0, got {result!r}")
-    return result
-
-
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PageGeometry:
     """One page's displayed size, rotation and visible-box offset.
@@ -263,8 +255,8 @@ class PageGeometry:
 
     def __post_init__(self) -> None:
         int_at_least("page_number", self.page_number, 1)
-        object.__setattr__(self, "width_pt", _positive_finite("width_pt", self.width_pt))
-        object.__setattr__(self, "height_pt", _positive_finite("height_pt", self.height_pt))
+        object.__setattr__(self, "width_pt", positive_float("width_pt", self.width_pt))
+        object.__setattr__(self, "height_pt", positive_float("height_pt", self.height_pt))
         _checked_rotation(self.rotation_deg)
         object.__setattr__(self, "crop_offset", finite_tuple("crop_offset", self.crop_offset, 2))
 

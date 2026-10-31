@@ -30,10 +30,10 @@ background under the span (#366 task 2).
 from collections.abc import Iterator
 from dataclasses import dataclass
 
-from datagrunt.pdf._pdfium_common import Box
+from datagrunt.pdf._pdfium_common import Box, union_box
 from datagrunt.pdf._pdfium_images import RawImage
 from datagrunt.pdf._pdfium_text import RawSpan
-from datagrunt.pdf._validate import finite_float, int_at_least
+from datagrunt.pdf._validate import int_at_least, positive_float, typed_tuple
 from datagrunt.pdf.elements import HIDDEN_REASONS, BBox, HiddenReason, check_hidden_reasons
 
 __all__ = ["SpanPiece", "classify_spans", "raster_cover_fraction"]
@@ -46,16 +46,6 @@ _NO_PAINT_MODES = frozenset({3, 7})
 _TINY_FONT_PT = 1.0
 # Raster cover over this fraction of the page makes no-paint text over it an OCR layer.
 _OCR_LAYER_COVER = 0.5
-
-
-def _union(boxes: tuple[Box, ...]) -> Box:
-    """The smallest box holding every one of ``boxes`` (at least one)."""
-    return (
-        min(box[0] for box in boxes),
-        min(box[1] for box in boxes),
-        max(box[2] for box in boxes),
-        max(box[3] for box in boxes),
-    )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -94,24 +84,7 @@ class SpanPiece:
     @property
     def bbox(self) -> Box:
         """The union of the piece's char boxes."""
-        return _union(self.span.char_boxes[self.start : self.end])
-
-
-def _check_items(name: str, value: object, kind: type) -> None:
-    """Require ``value`` to be a tuple of ``kind`` instances."""
-    if not isinstance(value, tuple):
-        raise TypeError(f"{name} must be a tuple, got {type(value).__name__}")
-    for index, item in enumerate(value):
-        if not isinstance(item, kind):
-            raise TypeError(f"{name}[{index}] must be a {kind.__name__}, got {type(item).__name__}")
-
-
-def _page_side(name: str, value: object) -> float:
-    """Return a page side as a finite float strictly greater than zero."""
-    side = finite_float(name, value)
-    if side <= 0.0:
-        raise ValueError(f"{name} must be > 0, got {side!r}")
-    return side
+        return union_box(self.span.char_boxes[self.start : self.end])
 
 
 def classify_spans(
@@ -137,9 +110,9 @@ def classify_spans(
             RawImage, or a page side is not a number (bool rejected).
         ValueError: If a page side is not finite and greater than zero.
     """
-    _check_items("spans", spans, RawSpan)
-    _check_items("images", images, RawImage)
-    width, height = _page_side("width_pt", width_pt), _page_side("height_pt", height_pt)
+    typed_tuple("spans", spans, RawSpan)
+    typed_tuple("images", images, RawImage)
+    width, height = positive_float("width_pt", width_pt), positive_float("height_pt", height_pt)
     boxes = tuple(image.bbox for image in images)
     raster = boxes if _cover_fraction(boxes, width, height) > _OCR_LAYER_COVER else ()
     pieces: list[SpanPiece] = []
@@ -209,8 +182,8 @@ def raster_cover_fraction(images: tuple[RawImage, ...], width_pt: float, height_
             is not a number (bool rejected).
         ValueError: If a page side is not finite and greater than zero.
     """
-    _check_items("images", images, RawImage)
-    width, height = _page_side("width_pt", width_pt), _page_side("height_pt", height_pt)
+    typed_tuple("images", images, RawImage)
+    width, height = positive_float("width_pt", width_pt), positive_float("height_pt", height_pt)
     return _cover_fraction(tuple(image.bbox for image in images), width, height)
 
 

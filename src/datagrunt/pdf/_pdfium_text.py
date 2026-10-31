@@ -45,18 +45,8 @@ from typing import NamedTuple
 
 import pypdfium2.raw as pdfium_c
 
-from datagrunt.pdf._pdfium_common import Box, PdfiumFailure, object_address, read_rgba
-from datagrunt.pdf._validate import finite_float, int_at_least, ordered_box, rgba_tuple, strict_bool
-
-
-def _union(boxes: tuple[Box, ...]) -> Box:
-    """The smallest box holding every one of ``boxes`` (at least one)."""
-    return (
-        min(box[0] for box in boxes),
-        min(box[1] for box in boxes),
-        max(box[2] for box in boxes),
-        max(box[3] for box in boxes),
-    )
+from datagrunt.pdf._pdfium_common import Box, PdfiumFailure, object_address, read_rgba, union_box
+from datagrunt.pdf._validate import finite_float, int_at_least, ordered_box, rgba_tuple, strict_bool, typed_tuple
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -147,8 +137,8 @@ class RawSpan:
             raise ValueError(f"char_boxes must hold one box per char of text: {counts}")
         boxes = tuple(ordered_box(f"char_boxes[{i}]", box) for i, box in enumerate(self.char_boxes))
         bbox = ordered_box("bbox", self.bbox)
-        if bbox != _union(boxes):
-            raise ValueError(f"bbox must be the union of char_boxes, {_union(boxes)!r}, got {self.bbox!r}")
+        if bbox != union_box(boxes):
+            raise ValueError(f"bbox must be the union of char_boxes, {union_box(boxes)!r}, got {self.bbox!r}")
         object.__setattr__(self, "char_boxes", boxes)
         object.__setattr__(self, "bbox", bbox)
 
@@ -224,11 +214,7 @@ class PageText:
     stats: TextStats
 
     def __post_init__(self) -> None:
-        if not isinstance(self.spans, tuple):
-            raise TypeError(f"spans must be a tuple, got {type(self.spans).__name__}")
-        for index, item in enumerate(self.spans):
-            if not isinstance(item, RawSpan):
-                raise TypeError(f"spans[{index}] must be a RawSpan, got {type(item).__name__}")
+        typed_tuple("spans", self.spans, RawSpan)
         if not isinstance(self.stats, TextStats):
             raise TypeError(f"stats must be a TextStats, got {type(self.stats).__name__}")
         span_chars = sum(len(item.text) for item in self.spans)
@@ -454,7 +440,7 @@ class _SpanBuilder:
             # pdfium reports a non-BMP char as a UTF-16 pair of textpage chars.
             high = ord(self._chars[-1])
             self._chars[-1] = chr(0x10000 + ((high - _HIGH_SURROGATES.start) << 10) + (code - _LOW_SURROGATES.start))
-            self._boxes[-1] = _union((self._boxes[-1], char.box))
+            self._boxes[-1] = union_box((self._boxes[-1], char.box))
             return
         # A code beyond Unicode is a raw char code pdfium could not map; U+FFFD
         # keeps its place (and is no surrogate, so it never pairs).
@@ -473,7 +459,7 @@ class _SpanBuilder:
         self._spans.append(
             RawSpan(
                 text="".join(self._chars),
-                bbox=_union(boxes),
+                bbox=union_box(boxes),
                 char_boxes=boxes,
                 object_index=self._object_indices[self._owner],
                 generated_breaks=tuple(self._breaks),
