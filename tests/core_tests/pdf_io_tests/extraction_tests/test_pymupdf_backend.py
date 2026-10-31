@@ -163,7 +163,7 @@ def test_pymupdf_extract_page_parses_page_once(sample_pdf, monkeypatch):
 
 
 class TestBuildBlockDominant:
-    """#389: a block's font and size ties go to the first span, not hash order."""
+    """#389: a block's font ties go to the first span; size ties keep the 4.x pick."""
 
     @staticmethod
     def _block(spans):
@@ -181,12 +181,16 @@ class TestBuildBlockDominant:
             block = self._block([(f"word{n}", font, 11.0) for n, font in enumerate(rotated)])
             assert backend._build_block(block, None, 0).font == rotated[0]
 
-    def test_tied_sizes_take_the_first_span(self, sample_pdf):
+    def test_tied_sizes_keep_the_4x_pick(self, sample_pdf):
+        # Sizes keep max(set(sizes), key=sizes.count), which never varied by
+        # process (float hashes are unseeded); set({12.0, 8.0}) meets 8.0 first.
         backend = PyMuPDFBackend(sample_pdf)
-        first_big = backend._build_block(self._block([("Alpha", "Arial", 12.0), ("Beta", "Arial", 8.0)]), None, 0)
-        first_small = backend._build_block(self._block([("Alpha", "Arial", 8.0), ("Beta", "Arial", 12.0)]), None, 0)
-        assert first_big.font_size == 12.0
-        assert first_small.font_size == 8.0
+        for sizes in ([12.0, 8.0], [8.0, 12.0], [16.0, 8.0], [10.5, 9.96, 11.04]):
+            block = self._block([(f"w{n}", "Arial", size) for n, size in enumerate(sizes)])
+            expected = round(max(set(sizes), key=sizes.count), 1)
+            assert backend._build_block(block, None, 0).font_size == expected
+        pinned = backend._build_block(self._block([("Alpha", "Arial", 12.0), ("Beta", "Arial", 8.0)]), None, 0)
+        assert pinned.font_size == 8.0
 
     def test_non_tied_block_keeps_the_majority(self, sample_pdf):
         backend = PyMuPDFBackend(sample_pdf)

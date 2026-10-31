@@ -23,13 +23,27 @@ LIST_MARKER_REGEX = re.compile(
 def most_common(values: list, default=None):
     """Most frequent value, ties broken by first occurrence; ``default`` if empty.
 
-    ``Counter`` keeps first-seen order and ``most_common(1)`` returns the first
-    of the tied maxima, so the winner never depends on set/hash iteration order
-    (which, for strings, varies with the per-process ``PYTHONHASHSEED``; #389).
+    The rule for font names. ``Counter`` keeps first-seen order and
+    ``most_common(1)`` returns the first of the tied maxima, so the winner never
+    depends on set iteration order, which for strings follows the per-process
+    ``PYTHONHASHSEED`` (#389).
     """
     if not values:
         return default
     return Counter(values).most_common(1)[0][0]
+
+
+def legacy_dominant_size(sizes: list, default):
+    """Most frequent font size, ties broken by set iteration order (the 4.x pick).
+
+    Deliberately NOT first occurrence. Float hashes are not seeded, so this
+    pick was always the same in every process; it is kept so 4.x output (block
+    merging, classification, ``font_size``) stays unchanged. Only font-name
+    ties moved to first occurrence (#389). v5 replaces this code.
+    """
+    if not sizes:
+        return default
+    return max(set(sizes), key=sizes.count)
 
 
 def page_median_size(all_sizes: list) -> float | None:
@@ -75,9 +89,19 @@ class TextBlockBuilder:
     """Cluster text items into lines, merge lines into blocks, then classify."""
 
     @staticmethod
-    def _dominant(values, default=None):
-        """Most common value (ties broken by first occurrence)."""
-        return most_common([v for v in values if v not in (None, "")], default)
+    def _present(values) -> list:
+        """``values`` without missing entries (``None`` or ``""``)."""
+        return [v for v in values if v not in (None, "")]
+
+    @classmethod
+    def _dominant_font(cls, fonts) -> str:
+        """Most common font name, ties broken by first occurrence; ``""`` if none."""
+        return most_common(cls._present(fonts), "")
+
+    @classmethod
+    def _dominant_size(cls, sizes) -> float:
+        """Most common font size, ties kept on the 4.x pick (``legacy_dominant_size``); 0.0 if none."""
+        return legacy_dominant_size(cls._present(sizes), 0.0)
 
     def build(self, items: list) -> list:
         """Return a list of classified ``TextBlock`` from raw ``TextItem`` list.
@@ -157,8 +181,8 @@ class TextBlockBuilder:
             "x1": max(i.x1 for i in its),
             "y_top": min(i.y_top for i in its),
             "y_bot": max(i.y_bot for i in its),
-            "size": self._dominant(sizes, default=0.0),
-            "font": self._dominant([i.font for i in its], default=""),
+            "size": self._dominant_size(sizes),
+            "font": self._dominant_font([i.font for i in its]),
             "bold": any(i.is_bold for i in its),
             "italic": any(i.is_italic for i in its),
         }

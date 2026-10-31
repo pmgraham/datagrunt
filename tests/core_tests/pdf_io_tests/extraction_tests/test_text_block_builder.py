@@ -130,16 +130,50 @@ def test_classify_by_median_empty_is_body_text():
     assert classify_by_median(24.0, None) == "body_text"
 
 
-# --- #389: the dominant value breaks ties by first occurrence, never hash order ---
+# --- #389: font ties go to the first occurrence; sizes keep the 4.x pick ---
 
 # Five distinct names, each seen once (a five-way tie). Every rotation puts a
 # different name first, so a winner picked by set/hash order cannot match the
 # first occurrence in all of them, whatever the process's string-hash seed.
 _TIED_FONTS = ["Gamma", "Alpha", "Delta", "Beta", "Epsilon"]
 
+# Tied size lists. Sizes keep the 4.x pick, max(set(sizes), key=sizes.count):
+# float hashes are not seeded, so it never varied between processes, but it is
+# not the first occurrence (set({12.0, 8.0}) meets 8.0 first in either order).
+_TIED_SIZES = [[12.0, 8.0], [8.0, 12.0], [16.0, 8.0], [10.5, 9.96, 11.04], [11.04, 9.96, 10.5, 11.04, 9.96, 10.5]]
+
 
 def _rotations(values):
     return [values[i:] + values[:i] for i in range(len(values))]
+
+
+def _legacy_size_pick(sizes):
+    """The 4.x expression, verbatim: the oracle for the size rule."""
+    return max(set(sizes), key=sizes.count)
+
+
+def _line_items(fonts, sizes):
+    """One line of items, left to right, with the given fonts and sizes."""
+    return [
+        TextItem(
+            text=f"w{n}",
+            x0=10.0 + 40 * n,
+            x1=40.0 + 40 * n,
+            y_top=50,
+            y_bot=61,
+            size=size,
+            font=font,
+            is_bold=False,
+            is_italic=False,
+        )
+        for n, (font, size) in enumerate(zip(fonts, sizes))
+    ]
+
+
+def test_tied_size_cases_include_a_non_first_pick():
+    # Guard: the size tests below would be vacuous if the 4.x pick always
+    # matched the first occurrence.
+    assert any(_legacy_size_pick(sizes) != sizes[0] for sizes in _TIED_SIZES)
 
 
 def test_most_common_breaks_str_ties_by_first_occurrence():
@@ -148,8 +182,7 @@ def test_most_common_breaks_str_ties_by_first_occurrence():
 
 
 def test_most_common_breaks_float_ties_by_first_occurrence():
-    # set({12.0, 8.0}) iterates 8.0 first (float hashes are not seeded), so
-    # the hash-order pick is 8.0 for both orders.
+    # The helper itself is type-agnostic; sizes just do not use it.
     assert text_block_builder.most_common([12.0, 8.0]) == 12.0
     assert text_block_builder.most_common([8.0, 12.0]) == 8.0
 
@@ -164,48 +197,69 @@ def test_most_common_empty_returns_default():
     assert text_block_builder.most_common([], default="unknown") == "unknown"
 
 
-def test_dominant_breaks_str_ties_by_first_occurrence():
+def test_legacy_dominant_size_keeps_the_4x_pick():
+    for sizes in _TIED_SIZES:
+        assert text_block_builder.legacy_dominant_size(sizes, 0.0) == _legacy_size_pick(sizes)
+    assert text_block_builder.legacy_dominant_size([12.0, 8.0], 0.0) == 8.0
+
+
+def test_legacy_dominant_size_non_tie_returns_most_frequent():
+    assert text_block_builder.legacy_dominant_size([9.0, 11.0, 9.0, 11.0, 11.0], 0.0) == 11.0
+
+
+def test_legacy_dominant_size_empty_returns_default():
+    assert text_block_builder.legacy_dominant_size([], 0) == 0
+
+
+def test_dominant_font_breaks_ties_by_first_occurrence():
     for values in _rotations(_TIED_FONTS):
-        assert TextBlockBuilder._dominant(values, default="") == values[0]
+        assert TextBlockBuilder._dominant_font(values) == values[0]
 
 
-def test_dominant_breaks_float_ties_by_first_occurrence():
-    assert TextBlockBuilder._dominant([12.0, 8.0], default=0.0) == 12.0
-    assert TextBlockBuilder._dominant([8.0, 12.0], default=0.0) == 8.0
+def test_dominant_font_non_tie_returns_most_frequent():
+    assert TextBlockBuilder._dominant_font(["Arial", "Times", "Times"]) == "Times"
 
 
-def test_dominant_non_tie_returns_most_frequent():
-    assert TextBlockBuilder._dominant(["Arial", "Times", "Times"], default="") == "Times"
-    assert TextBlockBuilder._dominant([9.0, 11.0, 11.0], default=0.0) == 11.0
+def test_dominant_font_ignores_missing_names():
+    # Missing names outnumber the real one but never win.
+    assert TextBlockBuilder._dominant_font(["", "", None, "Arial"]) == "Arial"
 
 
-def test_dominant_ignores_missing_values():
-    # Missing fonts/sizes outnumber the real one but never win.
-    assert TextBlockBuilder._dominant(["", "", "Arial"], default="") == "Arial"
-    assert TextBlockBuilder._dominant([None, None, 10.0], default=0.0) == 10.0
+def test_dominant_font_all_missing_is_empty():
+    assert TextBlockBuilder._dominant_font([]) == ""
+    assert TextBlockBuilder._dominant_font(["", None]) == ""
 
 
-def test_dominant_all_missing_returns_default():
-    assert TextBlockBuilder._dominant([], default="") == ""
-    assert TextBlockBuilder._dominant(["", None], default=0.0) == 0.0
+def test_dominant_size_keeps_the_4x_pick():
+    for sizes in _TIED_SIZES:
+        assert TextBlockBuilder._dominant_size(sizes) == _legacy_size_pick(sizes)
+
+
+def test_dominant_size_non_tie_returns_most_frequent():
+    assert TextBlockBuilder._dominant_size([9.0, 11.0, 11.0]) == 11.0
+
+
+def test_dominant_size_ignores_missing_sizes():
+    assert TextBlockBuilder._dominant_size([None, None, 10.0]) == 10.0
+
+
+def test_dominant_size_all_missing_is_zero():
+    assert TextBlockBuilder._dominant_size([]) == 0.0
+    assert TextBlockBuilder._dominant_size([None]) == 0.0
 
 
 def test_line_record_tied_fonts_take_the_leftmost_item():
     # _line_record orders a line's items by x0, so the leftmost run wins a tie,
     # whatever order the items arrive in.
     for fonts in _rotations(_TIED_FONTS):
-        items = [
-            TextItem(
-                text=f"w{n}",
-                x0=10.0 + 40 * n,
-                x1=40.0 + 40 * n,
-                y_top=50,
-                y_bot=61,
-                size=11.0,
-                font=font,
-                is_bold=False,
-                is_italic=False,
-            )
-            for n, font in enumerate(fonts)
-        ]
+        items = _line_items(fonts, [11.0] * len(fonts))
         assert TextBlockBuilder()._line_record(items[::-1])["font"] == fonts[0]
+
+
+def test_line_record_tied_sizes_keep_the_4x_pick():
+    # Sizes are read left to right (x0 order) and keep the 4.x set-order pick.
+    for sizes in _TIED_SIZES:
+        items = _line_items(["Arial"] * len(sizes), sizes)
+        assert TextBlockBuilder()._line_record(items[::-1])["size"] == _legacy_size_pick(sizes)
+    pinned = TextBlockBuilder()._line_record(_line_items(["Arial", "Arial"], [12.0, 8.0]))
+    assert pinned["size"] == 8.0
