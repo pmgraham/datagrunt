@@ -8,17 +8,35 @@ so a large-format sheet lowers its DPI rather than its pixel bound. Each
 displayed side renders to ``floor(side_pt * dpi / 72)`` pixels
 (:func:`render_size`); rounding down keeps the product within the bound,
 which the spec's continuous formula alone guarantees only before rounding.
+
+Before a page renders, the image guard
+(:func:`~datagrunt.pdf.pdfium_engine.image_refusal`) checks every image
+object pdfium exposes on it, forms' included, against A2's decode bounds,
+on the same load of the page the render then draws; a refusal, or the
+guard's walk reaching its bound, is a :class:`RenderRefused` naming the
+object, and nothing is drawn.
 """
 
 import math
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
+
+import pypdfium2 as pdfium
 
 from datagrunt.pdf._validate import int_at_least, positive_float
 from datagrunt.pdf.exceptions import DatagruntPDFError
+from datagrunt.pdf.pdfium_engine import PageGeometry, image_refusal, loaded_page, open_document
 
 # The spec's construction checks (PDFReader / PDFWriter): dpi >= 36, max_render_pixels >= 512 x 512.
 _MIN_TARGET_DPI = 36
 _MIN_RENDER_PIXELS = 262_144
 _POINTS_PER_INCH = 72.0
+
+# The objects (forms' contents included) the guard walks before it refuses a
+# page: ~250 times the corpus's busiest page (3,977). The walk costs ~0.4 us
+# an object here, so the bound is about half a second of guard.
+_MAX_GUARD_OBJECTS = 1_000_000
 
 
 class RenderRefused(DatagruntPDFError):
@@ -77,3 +95,26 @@ def effective_dpi(target_dpi: int, max_render_pixels: int, width_pt: float, heig
     if height_px < 1:
         raise RenderRefused(f"{page} renders 0 px tall at {dpi} DPI")
     return dpi
+
+
+@contextmanager
+def _guarded_page(
+    source: str | os.PathLike[str], page_index: int, password: str | None
+) -> Iterator[tuple[pdfium.PdfPage, PageGeometry]]:
+    """The loaded page at ``page_index`` with its geometry, once the image guard passes it.
+
+    The guard and the render that follows share this one load of the page.
+    The document and page are closed on leaving.
+
+    Raises:
+        RenderRefused: If :func:`~datagrunt.pdf.pdfium_engine.image_refusal`
+            refuses the page; nothing is yielded.
+        FileNotFoundError, PermissionError, PDFEncryptedError, PDFCorruptError,
+        IndexError: As :func:`~datagrunt.pdf.pdfium_engine.open_document` and
+            :func:`~datagrunt.pdf.pdfium_engine.loaded_page` raise them.
+    """
+    with open_document(source, password=password) as handle, loaded_page(handle, page_index) as (page, geometry):
+        refusal = image_refusal(page, geometry, max_objects=_MAX_GUARD_OBJECTS)
+        if refusal is not None:
+            raise RenderRefused(f"page {geometry.page_number}: {refusal}; the page is not rendered")
+        yield page, geometry

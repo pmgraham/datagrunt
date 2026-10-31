@@ -29,7 +29,7 @@ import ctypes
 import hashlib
 import io
 import math
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Literal, NamedTuple
@@ -303,6 +303,22 @@ class Placement(NamedTuple):
 
 
 Skip = Literal["oversized", "unsized", "over_budget"]
+# The ImageStats count an image falls under, with why it must not be decoded (its message names the object).
+Refusal = tuple[Literal["nonfinite", "oversized", "unsized", "over_budget"], str]
+
+
+class ImageOutcome(NamedTuple):
+    """One image object as :func:`collect_images` reads it, in object-walk order.
+
+    ``image`` is None for an image skipped because its matrix to page space
+    is not finite (its decode size is then never read, and its
+    ``cover_fraction`` is 0.0). ``refusal`` is None when pdfium may decode
+    the image; else the ImageStats count it adds to and why, naming it.
+    """
+
+    image: RawImage | None
+    cover_fraction: float
+    refusal: Refusal | None
 
 
 class PixelFacts(NamedTuple):
@@ -360,18 +376,12 @@ def collect_images(
     images: list[RawImage] = []
     counts = dict.fromkeys(("nonfinite", "oversized", "unsized", "over_budget"), 0)
     cover = 0.0
-    budget = _PageBudget()
-    for index, image, matrix in placed:
-        try:
-            placement = image_placement(matrix, page_box, to_display)
-        except NonFiniteGeometry:
-            counts["nonfinite"] += 1
-            continue
-        cover = max(cover, placement.cover_fraction)
-        recorded, skip = _page_image(image, page_raw, index, placement.bbox, budget)
-        images.append(recorded)
-        if skip is not None:
-            counts[skip] += 1
+    for outcome in image_outcomes(placed, page_raw, page_box, to_display):
+        if outcome.refusal is not None:
+            counts[outcome.refusal[0]] += 1
+        if outcome.image is not None:
+            images.append(outcome.image)
+            cover = max(cover, outcome.cover_fraction)
     stats = ImageStats(
         skipped_nonfinite_images=counts["nonfinite"],
         skipped_oversized_images=counts["oversized"],
@@ -382,10 +392,33 @@ def collect_images(
     return PageImages(images=tuple(images), stats=stats)
 
 
+def image_outcomes(
+    placed: Iterable[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix]],
+    page_raw: pdfium_c.FPDF_PAGE,
+    page_box: Box,
+    to_display: Callable[[Box], Box],
+) -> Iterator[ImageOutcome]:
+    """Each image object in ``placed`` (see :func:`collect_images`) as an :class:`ImageOutcome`, lazily.
+
+    One page stream budget serves the whole iteration, so a caller that
+    stops early (the render guard, at its first refusal) reads no further
+    stream. pdfium call failures raise PdfiumFailure. No pixel is decoded.
+    """
+    budget = _PageBudget()
+    for index, image, matrix in placed:
+        try:
+            placement = image_placement(matrix, page_box, to_display)
+        except NonFiniteGeometry as exc:
+            yield ImageOutcome(None, 0.0, ("nonfinite", f"object {index}: {exc}"))
+            continue
+        recorded, refusal = _page_image(image, page_raw, index, placement.bbox, budget)
+        yield ImageOutcome(recorded, placement.cover_fraction, refusal)
+
+
 def _page_image(
     image: pdfium_c.FPDF_PAGEOBJECT, page_raw: pdfium_c.FPDF_PAGE, index: int, bbox: Box, budget: _PageBudget
-) -> tuple[RawImage, Skip | None]:
-    """Image object ``index`` as a RawImage, and the ImageStats count it adds to (None for none)."""
+) -> tuple[RawImage, Refusal | None]:
+    """Image object ``index`` as a RawImage, and the ImageStats count it adds to with why (None for none)."""
     label = f"object {index}"
     filters = read_filters(image, label)
     declared = declared_size(image, label)
@@ -401,13 +434,13 @@ def _page_image(
         colorspace=None,
     )
     if budget.remaining == 0:
-        return unread, "over_budget"
+        return unread, _over_budget(label)
     size = pdfium_c.FPDFImageObj_GetImageDataRaw(image, None, 0)  # copies the stream, so it is charged
     fits = budget.charge(size)
     if size > _MAX_ASSET_BYTES:
-        return unread, "oversized"
+        return unread, ("oversized", _oversized_stream(size, label))
     if not fits:
-        return unread, "over_budget"
+        return unread, _over_budget(label)
     raw = _copied_raw_stream(image, size, label)
 
     def charged_ascii_decoded() -> bytes | None:
@@ -427,7 +460,12 @@ def _page_image(
         bits_per_pixel=facts.bits_per_pixel,
         colorspace=facts.colorspace,
     )
-    return recorded, None if facts.refusal is None else facts.refusal[0]
+    return recorded, facts.refusal
+
+
+def _over_budget(label: str) -> Refusal:
+    """The refusal of an image whose stream the page's budget leaves unread."""
+    return "over_budget", f"{label} was not read: the page's {_MAX_PAGE_STREAM_BYTES}-byte image stream budget is spent"
 
 
 def image_placement(matrix: Matrix, page_box: Box, to_display: Callable[[Box], Box]) -> Placement:
@@ -496,10 +534,13 @@ def read_raw_stream(image: pdfium_c.FPDF_PAGEOBJECT, label: str) -> bytes:
     """
     size = pdfium_c.FPDFImageObj_GetImageDataRaw(image, None, 0)
     if size > _MAX_ASSET_BYTES:
-        raise OversizedStream(
-            f"the raw stream of {label} is {size} bytes, over the {_MAX_ASSET_BYTES}-byte asset limit"
-        )
+        raise OversizedStream(_oversized_stream(size, label))
     return _copied_raw_stream(image, size, label)
+
+
+def _oversized_stream(size: int, label: str) -> str:
+    """Why a ``size``-byte raw stream is neither read nor hashed."""
+    return f"the raw stream of {label} is {size} bytes, over the {_MAX_ASSET_BYTES}-byte asset limit"
 
 
 def _copied_raw_stream(image: pdfium_c.FPDF_PAGEOBJECT, size: int, label: str) -> bytes:
