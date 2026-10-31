@@ -708,6 +708,7 @@ def stepped_pieces(steps: int, rows_per_step: int) -> tuple[SpanPiece, ...]:
 class TestTextBlocksBounds:
     """Adversarial pages of 10 000 or more tiny pieces lay out in under 2 s: the work is O(depth x n log n)."""
 
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_a_staircase_driving_the_xy_cut_to_its_depth_cap(self):
         pieces = stepped_pieces(40, 250)
 
@@ -720,6 +721,7 @@ class TestTextBlocksBounds:
         assert sum(found.text.count("x") for found in blocks) == 10_000
         assert elapsed < 2.0, f"{elapsed:.2f} s"
 
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_a_grid_of_20_000_one_char_pieces(self):
         # Every char 24 pt clear of the next: a gutter for the XY-cut, and over 1.8 em of 11 pt, so a cell of its own.
         pieces = tuple(chars("x", 30.0 * col, 14.0 * row) for row in range(100) for col in range(200))
