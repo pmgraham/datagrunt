@@ -524,6 +524,59 @@ class TestTableContinuation:
             _table(continued_from_id=1)
 
 
+class TestTableColumnCentres:
+    """``column_centres``: each column's display-space x centre, which the scope pass links split tables by."""
+
+    def test_defaults_to_empty(self):
+        assert _table().column_centres == ()
+
+    def test_one_centre_per_column(self):
+        assert _table(column_centres=(10.5, 80.0)).column_centres == (10.5, 80.0)
+
+    def test_ints_are_stored_as_floats(self):
+        centres = _table(column_centres=(10, 80)).column_centres
+
+        assert centres == (10.0, 80.0)
+        assert [type(centre) for centre in centres] == [float, float]
+
+    def test_a_table_without_headers_counts_its_columns_in_the_first_row(self):
+        table = _table(headers=(), rows=(("1", "2", "3"),), column_centres=(1.0, 2.0, 3.0))
+
+        assert table.column_centres == (1.0, 2.0, 3.0)
+
+    def test_off_page_centres_keep_their_raw_coordinates(self):
+        assert _table(column_centres=(-40.0, -10.0)).column_centres == (-40.0, -10.0)
+
+    @pytest.mark.parametrize("bad", [(10.0,), (10.0, 20.0, 30.0)], ids=["one", "three"])
+    def test_count_must_match_the_width(self, bad):
+        message = f"column_centres must have 2 values (one per column), got {len(bad)}"
+        with pytest.raises(ValueError, match=re.escape(message)):
+            _table(column_centres=bad)
+
+    @pytest.mark.parametrize("bad", [(20.0, 10.0), (10.0, 10.0)], ids=["decreasing", "equal"])
+    def test_must_strictly_increase(self, bad):
+        with pytest.raises(ValueError, match=re.escape(f"column_centres must strictly increase, got {bad!r}")):
+            _table(column_centres=bad)
+
+    @pytest.mark.parametrize(
+        ("bad", "exc", "match"),
+        [
+            ([10.0, 20.0], TypeError, "column_centres must be a tuple, got list"),
+            ((10.0, "20"), TypeError, "column_centres[1] must be an int or float"),
+            ((True, 20.0), TypeError, "column_centres[0] must be an int or float"),
+            ((10.0, float("nan")), ValueError, "column_centres[1] must be finite"),
+            ((10.0, float("inf")), ValueError, "column_centres[1] must be finite"),
+        ],
+        ids=["list", "str", "bool", "nan", "inf"],
+    )
+    def test_bad_values_rejected(self, bad, exc, match):
+        with pytest.raises(exc, match=re.escape(match)):
+            _table(column_centres=bad)
+
+    def test_part_of_equality(self):
+        assert _table(column_centres=(1.0, 2.0)) != _table()
+
+
 class TestTableColumnNames:
     def test_headers_used_verbatim(self):
         assert _table(headers=("Name", "Qty"), rows=()).column_names() == ("Name", "Qty")
@@ -584,6 +637,7 @@ class TestTableColumnNames:
         df = _table(headers=("id", "ID"), rows=(("1", "2"),)).to_dataframe()
         assert df.columns == ["id", "ID_2"]
 
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_many_duplicates_named_in_linear_time(self):
         # A quadratic suffix search takes seconds here; a linear one takes milliseconds.
         count = 10_000
