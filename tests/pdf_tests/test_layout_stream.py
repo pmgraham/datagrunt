@@ -1,4 +1,4 @@
-"""Tests for the v5 stream layout pass (#368, A4b): lines.
+"""Tests for the v5 stream layout pass (#368, A4b): lines, blocks and reading order.
 
 Unit tests build SpanPiece values directly: boxes are displayed, top-left
 ``(x0, y0, x1, y1)`` points. End-to-end tests build PDFs with the ReportLab
@@ -10,15 +10,25 @@ unrotated page space, and read them through ``extract_page``, ``assess_page``,
 import dataclasses
 import pickle
 import re
+import time
 
 import pytest
 from reportlab.pdfbase.pdfmetrics import stringWidth
 
-from datagrunt.pdf.layout import LatticeResult, TextCell, TextLine, find_lattice_tables, text_lines
+from datagrunt.pdf import layout
+from datagrunt.pdf.layout import (
+    LatticeResult,
+    TextBlock,
+    TextCell,
+    TextLine,
+    find_lattice_tables,
+    text_blocks,
+    text_lines,
+)
 from datagrunt.pdf.pdfium_engine import extract_page, open_document
 from datagrunt.pdf.quality import SpanPiece, assess_page
 from pdf_tests.builders import PageSpec, TextRun, build_pdf
-from pdf_tests.test_layout_lattice import box, chars, rising, rules, written
+from pdf_tests.test_layout_lattice import box, chars, falling, rising, rules, written
 from pdf_tests.test_quality import raw_span
 
 NO_TABLES = LatticeResult(tables=(), used_pieces=())
@@ -383,3 +393,340 @@ class TestTextLinesArguments:
 
         with pytest.raises(ValueError, match=r"^lattice\.used_pieces\[0\] is not visible text of these pieces"):
             text_lines((shorter,), lattice)
+
+
+def read_blocks(tmp_path, *items, rotate: int = 0) -> tuple[TextBlock, ...]:
+    """text_blocks of page 1, through extract_page, assess_page and find_lattice_tables."""
+    page, pieces = page_of(tmp_path, *items, rotate=rotate)
+    return text_blocks(pieces, find_lattice_tables(page.segments.segments, pieces))
+
+
+def block_texts(blocks) -> list[str]:
+    """Each block's text."""
+    return [found.text for found in blocks]
+
+
+def column(texts, x: float, top: float, *, pitch: float = 14.0, **overrides) -> tuple[TextRun, ...]:
+    """One TextRun per text from ``x``, their baselines ``pitch`` apart from ``top``."""
+    return tuple(TextRun(text, x, top + index * pitch, **overrides) for index, text in enumerate(texts))
+
+
+def block(*lines: TextLine, **overrides) -> TextBlock:
+    """A TextBlock of ``lines`` (one default line if none), boxed by their union."""
+    lines = lines or (line(),)
+    union = box(
+        min(item.bbox.x0 for item in lines),
+        min(item.bbox.y0 for item in lines),
+        max(item.bbox.x1 for item in lines),
+        max(item.bbox.y1 for item in lines),
+    )
+    return TextBlock(**({"lines": lines, "bbox": union} | overrides))
+
+
+class TestTextBlock:
+    """TextBlock is a frozen, slotted, picklable, validated record; its text joins its lines with a space."""
+
+    def test_pickle_round_trip(self):
+        original = block(line(cell("first")), line(cell("second", 10.0, 30.0)))
+
+        assert pickle.loads(pickle.dumps(original)) == original
+
+    def test_frozen_and_slotted(self):
+        value = block()
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            value.lines = ()
+        assert not hasattr(value, "__dict__")
+
+    def test_text_joins_the_lines_with_one_space(self):
+        assert block(line(cell("first")), line(cell("second", 10.0, 30.0))).text == "first second"
+
+    @pytest.mark.parametrize(
+        "overrides,error,message",
+        [
+            pytest.param({"lines": [line()]}, TypeError, "lines must be a tuple, got list", id="lines-list"),
+            pytest.param({"lines": ("Name",)}, TypeError, "lines[0] must be a TextLine, got str", id="lines-str"),
+            pytest.param({"lines": ()}, ValueError, "lines must hold at least one line", id="lines-empty"),
+            pytest.param({"bbox": None}, TypeError, "bbox must be a BBox, got NoneType", id="bbox-none"),
+            pytest.param(
+                {"bbox": box(10.0, 10.0, 20.0, 22.0)},
+                ValueError,
+                "lines[0].bbox must lie within the bbox, got BBox(x0=10.0, y0=10.0, x1=34.0, y1=22.0) in "
+                "BBox(x0=10.0, y0=10.0, x1=20.0, y1=22.0)",
+                id="line-outside",
+            ),
+        ],
+    )
+    def test_invalid_field_raises(self, overrides, error, message):
+        with pytest.raises(error, match=f"^{re.escape(message)}$"):
+            block(**overrides)
+
+
+def rows(x0: float, x1: float, count: int = 3, *, top: float = 0.0) -> list[tuple[float, float, float, float]]:
+    """``count`` boxes from ``x0`` to ``x1``, 12 pt tall, 20 pt apart from ``top``: a column of lines."""
+    return [(x0, top + 20.0 * index, x1, top + 20.0 * index + 12.0) for index in range(count)]
+
+
+def cut(boxes, weights=None) -> list[list[int]]:
+    """The XY-cut's segments of ``boxes`` (each weighing 10 unless given)."""
+    return layout._xy_cut(list(boxes), list(weights or [10] * len(boxes)))
+
+
+def staircase(count: int, *, width: float = 2e9):
+    """``count`` boxes, each step's box peeling off the left 0.3 of what is left, a 0.1 gutter after it.
+
+    The widest gutter of every step is its own, so each XY-cut level peels one box.
+    """
+    boxes, left, span = [], 0.0, width
+    for _ in range(count - 1):
+        boxes.append((left, 0.0, left + 0.3 * span, 12.0))
+        left, span = left + 0.4 * span, 0.6 * span
+    boxes.append((left, 0.0, width, 12.0))
+    return boxes
+
+
+LEFT, RIGHT = rows(0.0, 140.0), rows(160.0, 300.0)
+
+
+class TestXYCut:
+    """v4's XY-cut (layout_sorter.PageLayoutSorter), ported: gutters, spanning bands and the depth cap."""
+
+    def test_one_column_is_one_segment(self):
+        assert cut(LEFT) == [[0, 1, 2]]
+
+    def test_lines_spanning_a_gutter_with_text_on_one_side_only_are_one_segment(self):
+        # v5 fix: v4 read each full-width line as a band of its own (no column text on the right of the gutter).
+        short = (0.0, 60.0, 90.0, 72.0)
+
+        assert cut(LEFT + [short]) == [[0, 1, 2, 3]]
+
+    def test_two_columns_read_left_then_right(self):
+        assert cut(RIGHT + LEFT) == [[3, 4, 5], [0, 1, 2]]
+
+    @pytest.mark.parametrize(
+        "gap,segments",
+        [
+            pytest.param(11.0, [[0, 1, 2, 3, 4, 5]], id="11-pt"),
+            pytest.param(12.0, [[0, 1, 2], [3, 4, 5]], id="12-pt"),
+        ],
+    )
+    def test_a_gutter_is_at_least_12_pt_wide(self, gap, segments):
+        assert cut(LEFT + rows(140.0 + gap, 280.0 + gap)) == segments
+
+    def test_a_gutter_outside_the_middle_half_does_not_split(self):
+        assert cut(rows(0.0, 40.0) + rows(60.0, 300.0)) == [[0, 1, 2, 3, 4, 5]]
+
+    @pytest.mark.parametrize(
+        "weight,segments",
+        [
+            pytest.param(1, [[0, 1, 2, 6], [3, 4, 5]], id="weight-1-leaves-the-gutter"),
+            pytest.param(2, [[0, 1, 2, 3, 4, 5, 6]], id="weight-2-blocks-it"),
+        ],
+    )
+    def test_the_gutter_holds_a_weight_of_at_most_1(self, weight, segments):
+        assert cut(LEFT + RIGHT + [(145.0, 0.0, 150.0, 12.0)], [10] * 6 + [weight]) == segments
+
+    def test_the_widest_gutter_splits_first(self):
+        # A heading (weight 1, so it blocks nothing) crosses only the wider gutter, between columns 2 and 3:
+        # cut there first, it spans and reads first; cut at the narrower gutter first, column 1 would.
+        heading = (110.0, -30.0, 290.0, -18.0)
+        columns = rows(0.0, 80.0) + rows(100.0, 180.0) + rows(220.0, 300.0)
+
+        assert cut(columns + [heading], [10] * 9 + [1]) == [[9], [0, 1, 2], [3, 4, 5], [6, 7, 8]]
+
+    @pytest.mark.parametrize(
+        "width,segments",
+        [
+            pytest.param(211.0, [[6], [0, 1, 2], [3, 4, 5]], id="over-70-percent-spans"),
+            pytest.param(209.0, [[0, 1, 2, 3, 4, 5, 6]], id="under-70-percent-blocks-the-gutter"),
+        ],
+    )
+    def test_only_items_over_70_percent_of_the_width_leave_the_density(self, width, segments):
+        # Known limitation (v4): a spanning heading narrower than that blocks the gutter, so its page is one segment.
+        assert cut(LEFT + RIGHT + [(45.0, -30.0, 45.0 + width, -18.0)]) == segments
+
+    @pytest.mark.parametrize(
+        "right,segments",
+        [
+            pytest.param(155.0, [[0, 1, 2, 6], [3, 4, 5]], id="5-pt-past-the-gutter-is-a-column-item"),
+            pytest.param(156.0, [[6], [0, 1, 2], [3, 4, 5]], id="over-5-pt-past-it-spans"),
+        ],
+    )
+    def test_an_item_spans_when_it_reaches_over_5_pt_past_the_gutter_centre(self, right, segments):
+        assert cut(LEFT + RIGHT + [(100.0, -30.0, right, -18.0)], [10] * 6 + [1]) == segments
+
+    def test_an_item_as_tall_as_80_percent_of_the_text_never_spans(self):
+        assert cut(LEFT + RIGHT + [(100.0, 0.0, 200.0, 52.0)], [10] * 6 + [1]) == [[0, 1, 2], [3, 4, 5, 6]]
+
+    def test_spanning_items_cut_the_columns_into_bands_read_in_order(self):
+        # Both spanning items are over 70 % of the width, so neither adds weight to the gutter.
+        heading, rule = (10.0, -30.0, 290.0, -18.0), (10.0, 60.0, 290.0, 72.0)
+        boxes = LEFT + RIGHT + rows(0.0, 140.0, top=80.0) + rows(160.0, 300.0, top=80.0) + [rule, heading]
+
+        assert cut(boxes) == [[13], [0, 1, 2], [3, 4, 5], [12], [6, 7, 8], [9, 10, 11]]
+
+    def test_overlapping_spanning_items_are_one_band_read_top_then_left(self):
+        # The column item whose top falls inside the band joins it, read between the two by its top.
+        lower, upper, inside = (10.0, -24.0, 290.0, -12.0), (20.0, -30.0, 280.0, -18.0), (0.0, -27.0, 60.0, -15.0)
+
+        assert cut(LEFT + RIGHT + [lower, upper, inside]) == [[7, 8, 6], [0, 1, 2], [3, 4, 5]]
+
+    @pytest.mark.parametrize(
+        "boxes,count",
+        [
+            pytest.param([LEFT[0], RIGHT[0]], 1, id="2-items"),
+            pytest.param(rows(0.0, 40.0) + rows(55.0, 99.0), 1, id="99-pt-wide"),
+            pytest.param(rows(0.0, 42.0) + rows(58.0, 100.0), 2, id="100-pt-wide"),
+        ],
+    )
+    def test_fewer_than_3_items_or_under_100_pt_wide_is_one_segment(self, boxes, count):
+        assert len(cut(boxes)) == count
+
+    def test_past_max_partition_depth_the_rest_is_one_segment(self):
+        segments = cut(staircase(40))
+
+        assert layout.MAX_PARTITION_DEPTH == 32
+        assert segments == [[index] for index in range(32)] + [list(range(32, 40))]
+
+    def test_a_lower_depth_cap_stops_cutting_sooner(self, monkeypatch):
+        monkeypatch.setattr(layout, "MAX_PARTITION_DEPTH", 1)
+        columns = rows(0.0, 80.0) + rows(100.0, 180.0) + rows(200.0, 300.0)
+
+        assert cut(columns) == [[0, 1, 2], [3, 4, 5, 6, 7, 8]]
+
+    def test_no_items_no_segments(self):
+        assert cut([]) == []
+
+
+class TestTextBlocks:
+    """Blocks in reading order, end to end: columns read in turn, lines merged into paragraphs as v4 merged them."""
+
+    def test_two_column_prose_reads_column_by_column_under_a_spanning_heading(self, tmp_path):
+        heading = TextRun("Chapter One: How the Woodland Alliance Came to Be", 72.0, 90.0, size=18.0)
+        left = ("The woodland creatures gathered at", "dawn to plan the long campaign", "against the marquise.")
+        right = ("Their sympathy spread from glade", "to glade, each clearing taking up", "the cause in turn.")
+        items = (heading, *column(left, 72.0, 130.0), *column(right, 316.0, 130.0))
+
+        assert block_texts(read_blocks(tmp_path, *items)) == [heading.text, " ".join(left), " ".join(right)]
+
+    def test_three_columns_read_in_turn(self, tmp_path):
+        first, second, third = ("one a", "one b", "one c"), ("two a", "two b", "two c"), ("three a", "three b")
+        items = (*column(third, 396.0, 100.0), *column(second, 234.0, 100.0), *column(first, 72.0, 100.0))
+
+        assert block_texts(read_blocks(tmp_path, *items)) == [" ".join(first), " ".join(second), " ".join(third)]
+
+    def test_close_lines_of_one_size_are_one_paragraph_even_when_their_boxes_overlap(self, tmp_path):
+        # 11 pt Helvetica boxes are 12.28 pt tall: at a 12 pt pitch neighbouring lines overlap by 0.28 pt.
+        items = column(("Lines set", "solid read as", "one paragraph."), 72.0, 100.0, pitch=12.0)
+
+        assert block_texts(read_blocks(tmp_path, *items)) == ["Lines set solid read as one paragraph."]
+
+    @pytest.mark.parametrize(
+        "pitch,texts",
+        [
+            # 11 pt lines 12.28 pt tall: a pitch of 29.7 pt leaves a 17.42 pt gap, 30 pt a 17.72 pt gap (1.6 em: 17.6).
+            pytest.param(29.7, ["above below"], id="gap-under-1.6-em"),
+            pytest.param(30.0, ["above", "below"], id="gap-over-1.6-em"),
+        ],
+    )
+    def test_a_gap_over_1_6_em_starts_a_paragraph(self, tmp_path, pitch, texts):
+        assert block_texts(read_blocks(tmp_path, *column(("above", "below"), 72.0, 100.0, pitch=pitch))) == texts
+
+    @pytest.mark.parametrize(
+        "size,texts",
+        [
+            pytest.param(11.5, ["body more"], id="0.5-pt-larger"),
+            pytest.param(11.6, ["body", "more"], id="0.6-pt-larger"),
+        ],
+    )
+    def test_a_font_size_0_6_pt_away_starts_a_paragraph(self, tmp_path, size, texts):
+        items = (TextRun("body", 72.0, 100.0), TextRun("more", 72.0, 114.0, size=size))
+
+        assert block_texts(read_blocks(tmp_path, *items)) == texts
+
+    @pytest.mark.parametrize(
+        "marked",
+        [
+            pytest.param(("• first", "• second"), id="bullets"),
+            pytest.param(("1. first", "2. second"), id="numbers"),
+            pytest.param(("a) first", "b) second"), id="letters"),
+        ],
+    )
+    def test_a_line_starting_with_a_list_marker_starts_a_paragraph(self, tmp_path, marked):
+        items = column(("Intro text", *marked), 72.0, 100.0)
+
+        assert block_texts(read_blocks(tmp_path, *items)) == ["Intro text", *marked]
+
+    def test_lines_without_horizontal_overlap_stay_apart(self, tmp_path):
+        items = (TextRun("left", 72.0, 100.0), TextRun("right", 300.0, 114.0))
+
+        assert block_texts(read_blocks(tmp_path, *items)) == ["left", "right"]
+
+    def test_a_page_turned_by_rotate_90_reads_its_paragraph_as_written(self, tmp_path):
+        items = column(("first line", "second line", "third line"), 72.0, 100.0)
+
+        assert block_texts(read_blocks(tmp_path, *items, rotate=90)) == ["first line second line third line"]
+
+    def test_the_lattice_tables_text_is_not_reused(self, tmp_path):
+        xs, ys = (50.0, 150.0, 250.0), (40.0, 60.0, 80.0)
+        items = rules(xs, ys) + written((("Part", "Qty"), ("Bolt", "4")), xs, ys) + (TextRun("After", 50.0, 120.0),)
+
+        assert block_texts(read_blocks(tmp_path, *items)) == ["After"]
+
+    def test_a_turned_line_never_joins_a_paragraph_of_another_turn(self):
+        # Read in mixed frames, the falling label would pass every other test of the merge: its turn keeps it apart.
+        pieces = (chars("alpha", 50.0, 10.0), falling("dn", 40.0, 40.0))
+
+        assert [[found.text for found in item.lines] for item in text_blocks(pieces, NO_TABLES)] == [["alpha"], ["dn"]]
+
+    def test_a_trailing_space_does_not_narrow_a_gutter(self):
+        # 6 pt chars: the left lines' ink ends at 138, their trailing spaces at 144; the right column starts at 152.
+        # The XY-cut reads ink, as v4's glyph bounds did: a 14 pt gutter, though the boxes leave only 8 pt.
+        left = tuple(chars("abcdefghijklmnopqrstuvw ", 0.0, 14.0 * row) for row in range(3))
+        right = tuple(chars("ABCDEFGHIJKLMNOPQRSTUVWX", 152.0, 14.0 * row) for row in range(3))
+
+        blocks = text_blocks(left + right, NO_TABLES)
+
+        assert [[found.text for found in item.lines] for item in blocks] == [
+            [piece.text for piece in left],
+            [piece.text for piece in right],
+        ]
+
+    def test_invalid_arguments_raise_as_for_text_lines(self):
+        with pytest.raises(TypeError, match=r"^lattice must be a LatticeResult, got NoneType$"):
+            text_blocks((), None)
+
+
+def stepped_pieces(steps: int, rows_per_step: int) -> tuple[SpanPiece, ...]:
+    """One-char pieces filling each box of a ``steps``-box staircase, ``rows_per_step`` lines of them deep."""
+    pieces = []
+    for x0, _, x1, _ in staircase(steps):
+        pieces += [chars("x", x0, 14.0 * row, advance=x1 - x0) for row in range(rows_per_step)]
+    return tuple(pieces)
+
+
+class TestTextBlocksBounds:
+    """Adversarial pages of 10 000 or more tiny pieces lay out in under 2 s: the work is O(depth x n log n)."""
+
+    def test_a_staircase_driving_the_xy_cut_to_its_depth_cap(self):
+        pieces = stepped_pieces(40, 250)
+
+        started = time.perf_counter()
+        blocks = text_blocks(pieces, NO_TABLES)
+        elapsed = time.perf_counter() - started
+
+        assert len(pieces) == 10_000
+        assert len(blocks) == layout.MAX_PARTITION_DEPTH + 1
+        assert sum(found.text.count("x") for found in blocks) == 10_000
+        assert elapsed < 2.0, f"{elapsed:.2f} s"
+
+    def test_a_grid_of_20_000_one_char_pieces(self):
+        # Every char 24 pt clear of the next: a gutter for the XY-cut, and over 1.8 em of 11 pt, so a cell of its own.
+        pieces = tuple(chars("x", 30.0 * col, 14.0 * row) for row in range(100) for col in range(200))
+
+        started = time.perf_counter()
+        blocks = text_blocks(pieces, NO_TABLES)
+        elapsed = time.perf_counter() - started
+
+        assert sum(len(found.cells) for item in blocks for found in item.lines) == 20_000
+        assert elapsed < 2.0, f"{elapsed:.2f} s"

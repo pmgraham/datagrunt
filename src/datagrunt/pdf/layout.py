@@ -17,7 +17,9 @@ bound leaves out keeps its text for the stream pass, and the result says so.
 The stream pass (spec §3.3 step 3, Pass B) lays out the visible text the
 lattice tables did not use: :func:`text_lines` reads it as lines
 (:class:`TextLine`) of cells (:class:`TextCell`), each keeping the char
-ranges it reads. Hidden text is laid out apart (A4b group 3).
+ranges it reads; :func:`text_blocks` reads it in reading order, as
+paragraphs (:class:`TextBlock`), by v4's XY-cut and line merge, ported
+(v5 imports no v4 code). Hidden text is laid out apart (A4b group 3).
 
 Known limitations (each a fact this pure pass cannot see):
 
@@ -32,6 +34,7 @@ Known limitations (each a fact this pure pass cannot see):
 """
 
 import math
+import re
 from bisect import bisect_left, bisect_right, insort
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -44,7 +47,17 @@ from datagrunt.pdf._validate import int_at_least, non_blank_str, positive_float,
 from datagrunt.pdf.elements import BBox
 from datagrunt.pdf.quality import SpanPiece
 
-__all__ = ["LatticeCell", "LatticeResult", "LatticeTable", "TextCell", "TextLine", "find_lattice_tables", "text_lines"]
+__all__ = [
+    "LatticeCell",
+    "LatticeResult",
+    "LatticeTable",
+    "TextBlock",
+    "TextCell",
+    "TextLine",
+    "find_lattice_tables",
+    "text_blocks",
+    "text_lines",
+]
 
 # Lines this close snap to one position, join end to end, and meet (spec §3.3 Pass A).
 SNAP_PT = 2.0
@@ -78,6 +91,35 @@ _CELL_GAP_EM = 1.8
 _ACROSS, _DOWN, _UP = 0, 90, 270
 # The turns, in the order a tie between them is broken.
 _TURNS = (_ACROSS, _DOWN, _UP)
+
+# v4's XY-cut (layout_sorter.PageLayoutSorter), ported in _xy_cut. Regions nest at most this deep: past
+# it, a region's items are one segment (v4's MAX_PARTITION_DEPTH).
+MAX_PARTITION_DEPTH = 32
+# A gutter is a run of at least this many 1 pt bins (v4's gutter_tolerance) ...
+_GUTTER_PT = 12
+# ... each holding a weight (chars) of at most this ...
+_FREE_WEIGHT = 1
+# ... in this middle share of the region's width.
+_GUTTER_WINDOW = (0.25, 0.75)
+# Items wider than this share of the region add no weight: a full-width line spans the gutter.
+_WIDE_SHARE = 0.7
+# A region narrower than this, or of fewer items, is not cut.
+_MIN_CUT_WIDTH_PT = 100.0
+_MIN_CUT_ITEMS = 3
+# An item spans the gutter when it reaches more than this past its centre on both sides ...
+_SPAN_REACH_PT = 5.0
+# ... and is shorter than this share of the region's height.
+_SPAN_HEIGHT_SHARE = 0.8
+
+# v4's paragraph merge (text_block_builder.TextBlockBuilder._merge_lines), ported in _paragraphs. A line
+# starting with one of v4's list markers (text_block_builder.LIST_MARKER_REGEX) starts a paragraph.
+_LIST_MARKER = re.compile(
+    r"^([•\-\*]|\d+(\.\d+)*\.?|[IVXLCDM]{2,}|[IVXLCDM]\.|[IVXLCDM]\s+[A-Z]|[a-zA-Z]\.|[a-zA-Z]\))(\s|$)"
+)
+# A paragraph's lines differ from its first line's font size by less than this ...
+_SAME_SIZE_PT = 0.6
+# ... and each starts at most this many ems (of that size, at least 1 pt) below the one before.
+_PARAGRAPH_GAP_EM = 1.6
 
 # Sweep events at one x: horizontal rules open, then vertical rules query, then horizontal rules close.
 _OPEN, _QUERY, _CLOSE = 0, 1, 2
@@ -866,6 +908,11 @@ def _outside(inner: Box, outer: BBox) -> bool:
     return inner[0] < outer.x0 or inner[1] < outer.y0 or inner[2] > outer.x1 or inner[3] > outer.y1
 
 
+def _plain(bbox: BBox) -> Box:
+    """A BBox as a box tuple."""
+    return bbox.x0, bbox.y0, bbox.x1, bbox.y1
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class TextCell:
     """A stretch of a stream line between gaps wider than 1.8 em: one column's text on the line.
@@ -920,9 +967,8 @@ class TextLine:
             raise ValueError("cells must hold at least one cell")
         _check_bbox("bbox", self.bbox)
         for index, item in enumerate(self.cells):
-            inner = item.bbox
-            if _outside((inner.x0, inner.y0, inner.x1, inner.y1), self.bbox):
-                raise ValueError(f"cells[{index}].bbox must lie within the bbox, got {inner} in {self.bbox}")
+            if _outside(_plain(item.bbox), self.bbox):
+                raise ValueError(f"cells[{index}].bbox must lie within the bbox, got {item.bbox} in {self.bbox}")
         if int_at_least("turn", self.turn, 0) not in _TURNS:
             raise ValueError(f"turn must be 0, 90 or 270, got {self.turn}")
         object.__setattr__(self, "font_size_pt", positive_float("font_size_pt", self.font_size_pt))
@@ -971,8 +1017,7 @@ def text_lines(pieces: tuple[SpanPiece, ...], lattice: LatticeResult) -> tuple[T
             ``lattice`` is not a char range inside one visible piece.
     """
     runs = _stream_runs(pieces, lattice)
-    turn = _page_turn(runs)
-    return tuple(sorted(_stream_lines(runs, turn), key=lambda found: _frame_key(found.bbox, turn)))
+    return tuple(_ordered_lines(runs, _page_turn(runs)))
 
 
 # A run with the turn its text advances at; None for one char.
@@ -1066,10 +1111,14 @@ def _page_turn(runs: list[_TurnedRun]) -> int:
     return max(_TURNS, key=chars.__getitem__)
 
 
-def _frame_key(bbox: BBox, turn: int) -> tuple[float, float]:
-    """``(top, left)`` of a box in the frame where text advancing at ``turn`` reads left to right."""
-    x0, y0, _, _ = _turned((bbox.x0, bbox.y0, bbox.x1, bbox.y1), turn)
-    return y0, x0
+def _ordered_lines(runs: list[_TurnedRun], page_turn: int) -> list[TextLine]:
+    """The runs' lines in order of their tops, then left edges, in the frame of ``page_turn``."""
+
+    def key(found: TextLine) -> tuple[float, float]:
+        x0, y0, _, _ = _turned(_plain(found.bbox), page_turn)
+        return y0, x0
+
+    return sorted(_stream_lines(runs, page_turn), key=key)
 
 
 def _stream_lines(runs: list[_TurnedRun], page_turn: int) -> list[TextLine]:
@@ -1132,3 +1181,286 @@ def _text_cell(group: list[tuple[Box, _Run]]) -> TextCell:
             for run in runs
         ),
     )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TextBlock:
+    """A paragraph of the page's stream text: lines v4's merge joins (see :func:`text_blocks`).
+
+    Attributes:
+        lines: Its lines, top to bottom in their own frame.
+        bbox: The union of its lines' boxes on the displayed page.
+    """
+
+    lines: tuple[TextLine, ...]
+    bbox: BBox
+
+    def __post_init__(self) -> None:
+        typed_tuple("lines", self.lines, TextLine)
+        if not self.lines:
+            raise ValueError("lines must hold at least one line")
+        _check_bbox("bbox", self.bbox)
+        for index, item in enumerate(self.lines):
+            if _outside(_plain(item.bbox), self.bbox):
+                raise ValueError(f"lines[{index}].bbox must lie within the bbox, got {item.bbox} in {self.bbox}")
+
+    @property
+    def text(self) -> str:
+        """Its lines' texts joined with one space."""
+        return " ".join(item.text for item in self.lines)
+
+
+def text_blocks(pieces: tuple[SpanPiece, ...], lattice: LatticeResult) -> tuple[TextBlock, ...]:
+    """The page's visible text outside its lattice tables, as paragraphs in reading order (spec §3.3 Pass B).
+
+    The runs of :func:`text_lines` (its step 1) are cut into reading-order
+    segments by v4's XY-cut (:func:`_xy_cut`) in the frame of the page's
+    turn, so columns read in turn and a heading spanning them reads first.
+    The cut reads each run's ink: the boxes of its non-whitespace chars, as
+    v4's glyph bounds did, so a run's trailing space does not narrow the
+    gutter after it.
+
+    Each segment's runs make lines as :func:`text_lines` makes them, and
+    its lines merge into paragraphs by v4's rule (:func:`_paragraphs`).
+    Blocks come segment by segment, each segment's top to bottom.
+
+    Cost: O(c log c) for the runs and lines of c chars, and the XY-cut's
+    O(D r log r) for r runs and D = :data:`MAX_PARTITION_DEPTH` + 1.
+
+    Args:
+        pieces: The page's pieces (``PageAssessment.pieces``).
+        lattice: Their lattice tables (``find_lattice_tables(segments,
+            pieces)``): its used pieces share the pieces' spans.
+
+    Raises:
+        TypeError: If ``pieces`` is not a tuple of SpanPiece or ``lattice``
+            is not a LatticeResult.
+        ValueError: If a piece is passed twice, or a used piece of
+            ``lattice`` is not a char range inside one visible piece.
+    """
+    runs = _stream_runs(pieces, lattice)
+    turn = _page_turn(runs)
+    boxes = [_turned(_ink_box(run), turn) for _, run in runs]
+    blocks: list[TextBlock] = []
+    for segment in _xy_cut(boxes, [run.end - run.start for _, run in runs]):
+        blocks.extend(_paragraphs(_ordered_lines([runs[index] for index in segment], turn)))
+    return tuple(blocks)
+
+
+def _ink_box(run: _Run) -> Box:
+    """The union of the boxes of a run's non-whitespace chars (a stream run has one: none is whitespace only)."""
+    span = run.piece.span
+    return union_box(tuple(span.char_boxes[at] for at in range(run.start, run.end) if not span.text[at].isspace()))
+
+
+# An XY-cut region: its items (indices into the boxes) and its depth; None for a segment already read.
+_Region = tuple[list[int], int | None]
+
+
+def _xy_cut(boxes: list[Box], weights: list[int]) -> list[list[int]]:
+    """The items' reading-order segments: lists of indices into ``boxes``, in reading order.
+
+    v4's recursive XY-cut (``layout_sorter.PageLayoutSorter.partition``),
+    ported to a stack of regions: each region is cut into parts read in
+    order (:func:`_cut_region`), or is a segment. ``weights`` (chars per
+    item) make the density histogram. Boxes are in the frame the page
+    reads in: left to right, lines top to bottom.
+
+    Bound: a region at depth :data:`MAX_PARTITION_DEPTH` is not cut, and
+    the regions at one depth hold disjoint items (each cut deals its
+    region's items out once), so at most D = MAX_PARTITION_DEPTH + 1
+    levels each cut at most n items: O(D n log n) for n items, with no
+    recursion.
+
+    Known limitations:
+
+    - v4's: a heading over the gutter narrower than :data:`_WIDE_SHARE` of
+      its region adds weight to it, so the region is not cut and its
+      columns read as one segment.
+    - v4's: each line spanning the gutter is a band of its own, so a
+      full-width paragraph above or between columns reads in order but
+      as one block per line.
+    - v5's boxes are pdfium's advance boxes, up to a side bearing wider at
+      each edge than the glyph bounds v4 measured: a gutter v4 found at
+      12 or 13 pt can measure 11 here, and its region stays one segment.
+    """
+    segments: list[list[int]] = []
+    stack: list[_Region] = [(list(range(len(boxes))), 0)] if boxes else []
+    while stack:
+        items, depth = stack.pop()
+        parts = None if depth is None else _cut_region(boxes, weights, items, depth)
+        if parts is None:
+            segments.append(items)
+        else:
+            stack.extend(reversed(parts))
+    return segments
+
+
+def _cut_region(boxes: list[Box], weights: list[int], items: list[int], depth: int) -> list[_Region] | None:
+    """A region's parts in reading order (v4's ``partition`` step), or None to read it as one segment.
+
+    No cut at :data:`MAX_PARTITION_DEPTH`, for fewer than
+    :data:`_MIN_CUT_ITEMS` items, a region under :data:`_MIN_CUT_WIDTH_PT`
+    wide or one with no gutter (:func:`_widest_gutter`). The items not
+    spanning the gutter (:func:`_spans`) are its columns' text: unless
+    they lie on both sides of it (by box centre), there are no columns to
+    cut. Else the spanning items cut the columns into bands
+    (:func:`_bands`), or with none the columns split into the two sides.
+
+    v4 asked for text on both sides only before that split. Asked before
+    the bands too (a v5 fix): a region of lines each wider than
+    :data:`_WIDE_SHARE` of it (justified prose drawn a line per run) has
+    weight nowhere, so v4 found a gutter that every line spans and read
+    each line as a band of its own, which no paragraph merge could join.
+    """
+    if depth >= MAX_PARTITION_DEPTH or len(items) < _MIN_CUT_ITEMS:
+        return None
+    x0, y0, x1, y1 = union_box(tuple(boxes[index] for index in items))
+    if x1 - x0 < _MIN_CUT_WIDTH_PT:
+        return None
+    gutter = _widest_gutter(boxes, weights, items, x0, x1 - x0)
+    if gutter is None:
+        return None
+    spanning = [index for index in items if _spans(boxes[index], gutter, y1 - y0)]
+    across = set(spanning)
+    columns = [index for index in items if index not in across]
+    left = [index for index in columns if (boxes[index][0] + boxes[index][2]) / 2 < gutter]
+    if not left or len(left) == len(columns):
+        return None
+    if not spanning:
+        chosen = set(left)
+        return [(left, depth + 1), ([index for index in columns if index not in chosen], depth + 1)]
+    return _bands(boxes, spanning, columns, depth)
+
+
+def _widest_gutter(boxes: list[Box], weights: list[int], items: list[int], left: float, width: float) -> float | None:
+    """The centre of the region's widest gutter, or None (v4's density histogram and ``_find_widest_gutter``).
+
+    v4's histogram has a 1 pt bin per whole point of x: an item adds its
+    weight to the bins from ``floor(x0)`` up to ``floor(x1)`` (items wider
+    than :data:`_WIDE_SHARE` of the region add none). A gutter is a run of
+    at least :data:`_GUTTER_PT` bins of weight at most :data:`_FREE_WEIGHT`
+    inside :data:`_GUTTER_WINDOW` of the region; the widest wins, the
+    leftmost of equals. The bins are read run-length encoded
+    (:func:`_free_runs`): O(k log k) for k items, whatever their width.
+    """
+    covers = []
+    for index in items:
+        x0, _, x1, _ = boxes[index]
+        start, end = math.floor(x0), math.floor(x1)
+        if x1 - x0 <= _WIDE_SHARE * width and end > start:
+            covers.append((start, end, weights[index]))
+    low = math.floor(left + _GUTTER_WINDOW[0] * width)
+    high = max(low, math.floor(left + _GUTTER_WINDOW[1] * width))
+    widest = max(_free_runs(covers, low, high), key=lambda run: run[1] - run[0], default=None)
+    if widest is None or widest[1] - widest[0] < _GUTTER_PT:
+        return None
+    return widest[0] + (widest[1] - widest[0]) / 2
+
+
+def _free_runs(covers: list[tuple[int, int, int]], low: int, high: int) -> Iterator[tuple[int, int]]:
+    """Yield, left to right, each maximal run ``[start, end)`` of bins in ``[low, high)`` of weight at most 1.
+
+    ``covers`` are ``(first bin, end bin, weight)``; the weight changes
+    only where one starts or ends.
+    """
+    deltas: dict[int, int] = {}
+    for start, end, weight in covers:
+        deltas[start] = deltas.get(start, 0) + weight
+        deltas[end] = deltas.get(end, 0) - weight
+    weight = sum(delta for point, delta in deltas.items() if point <= low)
+    run_start = low if weight <= _FREE_WEIGHT else None
+    for point in sorted(point for point in deltas if low < point < high):
+        weight += deltas[point]
+        if weight <= _FREE_WEIGHT and run_start is None:
+            run_start = point
+        elif weight > _FREE_WEIGHT and run_start is not None:
+            yield run_start, point
+            run_start = None
+    if run_start is not None and run_start < high:
+        yield run_start, high
+
+
+def _spans(box: Box, gutter: float, height: float) -> bool:
+    """True if ``box`` spans the gutter (v4's ``_split_columns_and_spanning``)."""
+    reaches = box[0] < gutter - _SPAN_REACH_PT and box[2] > gutter + _SPAN_REACH_PT
+    return reaches and box[3] - box[1] < _SPAN_HEIGHT_SHARE * height
+
+
+def _bands(boxes: list[Box], spanning: list[int], columns: list[int], depth: int) -> list[_Region]:
+    """v4's ``_slice_y_bands``: the spanning items' intervals cut the column items into bands by their tops.
+
+    In order, for each interval: the column items above it (a region),
+    then the interval's items with the column items whose tops fall inside
+    it (a segment, by top then left); then the column items below the last
+    interval (a region). The bands tile every top, so no item is left over.
+    """
+    intervals = _spanning_intervals(boxes, spanning)
+    edges = [edge for top, bottom, _ in intervals for edge in (top, bottom)]
+    bands: list[list[int]] = [[] for _ in range(len(edges) + 1)]
+    for index in columns:
+        bands[bisect_right(edges, boxes[index][1])].append(index)
+    parts: list[_Region] = []
+    for at, (_, _, members) in enumerate(intervals):
+        if bands[2 * at]:
+            parts.append((bands[2 * at], depth + 1))
+        band = sorted(members + bands[2 * at + 1], key=lambda index: (boxes[index][1], boxes[index][0]))
+        parts.append((band, None))
+    if bands[-1]:
+        parts.append((bands[-1], depth + 1))
+    return parts
+
+
+def _spanning_intervals(boxes: list[Box], spanning: list[int]) -> list[tuple[float, float, list[int]]]:
+    """The spanning items, by top, grouped while they overlap down the page: ``(top, bottom, items)`` each."""
+    intervals: list[tuple[float, float, list[int]]] = []
+    for index in sorted(spanning, key=lambda item: boxes[item][1]):
+        _, top, _, bottom = boxes[index]
+        if intervals and top <= intervals[-1][1]:
+            first, last, members = intervals[-1]
+            members.append(index)
+            intervals[-1] = (first, max(last, bottom), members)
+        else:
+            intervals.append((top, bottom, [index]))
+    return intervals
+
+
+def _paragraphs(lines: list[TextLine]) -> list[TextBlock]:
+    """Lines (in reading order) merged into paragraphs: v4's ``_merge_lines``, ported (see :func:`_continues`)."""
+    groups: list[list[TextLine]] = []
+    extents: list[tuple[float, float]] = []
+    for line in lines:
+        box = _turned(_plain(line.bbox), line.turn)
+        if groups and _continues(groups[-1], extents[-1], line, box):
+            groups[-1].append(line)
+            extents[-1] = (min(extents[-1][0], box[0]), max(extents[-1][1], box[2]))
+        else:
+            groups.append([line])
+            extents.append((box[0], box[2]))
+    return [
+        TextBlock(lines=tuple(group), bbox=_bbox(union_box(tuple(_plain(item.bbox) for item in group))))
+        for group in groups
+    ]
+
+
+def _continues(group: list[TextLine], extent: tuple[float, float], line: TextLine, box: Box) -> bool:
+    """True if ``line`` (``box`` in its own frame) continues the paragraph ``group`` (v4's ``_should_merge``).
+
+    v4's rule: the line does not start with a list marker; its font size
+    is within :data:`_SAME_SIZE_PT` of the paragraph's first line; it
+    starts at most :data:`_PARAGRAPH_GAP_EM` ems below the last line; it
+    overlaps the paragraph's extent across. v5 adds: the same turn, the
+    geometry read in its frame. v4 asked a gap of at least 0: its object
+    boxes were tight, but pdfium's char boxes run ascent to descent, so
+    lines set solid overlap; v5 asks the line to start below the last
+    line's top instead. Sizes are to 0.1 pt and their difference is
+    rounded so, so float error cannot move it across the threshold.
+    """
+    first, last = group[0], group[-1]
+    if line.turn != first.turn or _LIST_MARKER.match(line.text.lstrip()):
+        return False
+    if round(abs(line.font_size_pt - first.font_size_pt), 1) >= _SAME_SIZE_PT:
+        return False
+    _, last_top, _, last_bottom = _turned(_plain(last.bbox), line.turn)
+    below = last_top < box[1] and box[1] - last_bottom <= _PARAGRAPH_GAP_EM * max(first.font_size_pt, 1.0)
+    return below and box[0] <= extent[1] and box[2] >= extent[0]

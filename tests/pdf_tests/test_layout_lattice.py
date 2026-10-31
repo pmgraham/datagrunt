@@ -96,13 +96,13 @@ class TestModuleImports:
         import datagrunt.pdf
 
         names = {"LatticeCell", "LatticeTable", "LatticeResult", "find_lattice_tables"}
-        names |= {"TextCell", "TextLine", "text_lines"}
+        names |= {"TextBlock", "TextCell", "TextLine", "text_blocks", "text_lines"}
         for package in (datagrunt, datagrunt.pdf):
             assert not names & set(dir(package))
 
     def test_names_its_public_api(self):
-        expected = ["LatticeCell", "LatticeResult", "LatticeTable", "TextCell", "TextLine"]
-        expected += ["find_lattice_tables", "text_lines"]
+        expected = ["LatticeCell", "LatticeResult", "LatticeTable", "TextBlock", "TextCell", "TextLine"]
+        expected += ["find_lattice_tables", "text_blocks", "text_lines"]
 
         assert layout.__all__ == expected
 
