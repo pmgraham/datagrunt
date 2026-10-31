@@ -7,6 +7,7 @@ no pdfium function. Boxes are displayed, top-left ``(x0, y0, x1, y1)`` points.
 """
 
 import math
+from bisect import bisect_left, bisect_right, insort
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -20,6 +21,9 @@ __all__ = ["LatticeCell", "LatticeResult", "LatticeTable"]
 
 # Lines this close snap to one position, join end to end, and meet (spec §3.3 Pass A).
 SNAP_PT = 2.0
+
+# Sweep events at one x: horizontal rules open, then vertical rules query, then horizontal rules close.
+_OPEN, _QUERY, _CLOSE = 0, 1, 2
 
 
 def _check_bbox(name: str, value: object) -> BBox:
@@ -235,3 +239,87 @@ def _merged(position: float, extents: list[tuple[float, float]]) -> list[_Line]:
         start, end = next_start, next_end
     lines.append(_Line(position, start, end))
     return lines
+
+
+Component = tuple[list[_Line], list[_Line]]
+
+
+def _components(horizontal: list[_Line], vertical: list[_Line]) -> list[Component]:
+    """The groups of rules connected by crossings, each as its horizontal and vertical rules.
+
+    Two rules cross when each reaches the other's position within
+    :data:`SNAP_PT` (:func:`_crossings`); groups are the connected
+    components of that relation (union-find). A group without both
+    orientations rules no cell and is left out. Groups come in order of
+    their first horizontal rule, each with its rules in input order.
+    O((H + V) log(H + V) + I) for H horizontal and V vertical rules with
+    I crossings (union-find is near-constant per crossing).
+    """
+    groups = _UnionFind(len(horizontal) + len(vertical))
+    for h_index, v_index in _crossings(horizontal, vertical):
+        groups.union(h_index, len(horizontal) + v_index)
+    members: dict[int, Component] = {}
+    for index, line in enumerate(horizontal):
+        members.setdefault(groups.find(index), ([], []))[0].append(line)
+    for index, line in enumerate(vertical):
+        root = groups.find(len(horizontal) + index)
+        if root in members:
+            members[root][1].append(line)
+    return [group for group in members.values() if group[1]]
+
+
+def _crossings(horizontal: list[_Line], vertical: list[_Line]) -> Iterator[tuple[int, int]]:
+    """Yield ``(horizontal index, vertical index)`` for each pair of rules that cross within :data:`SNAP_PT`.
+
+    A sweep over x: a horizontal rule is active from ``start - SNAP_PT`` to
+    ``end + SNAP_PT`` in a list sorted by y, and each vertical rule
+    reports, by bisection, the active rules whose y lies within its own
+    extent widened by ``SNAP_PT`` at both ends. O((H + V) log(H + V) + I):
+    one sort of 2H + V events, one bisection per open, close and query,
+    and each crossing reported once (opening and closing also shift the
+    list, a C memmove of at most H references).
+    """
+    events = [(line.start - SNAP_PT, _OPEN, index) for index, line in enumerate(horizontal)]
+    events += [(line.end + SNAP_PT, _CLOSE, index) for index, line in enumerate(horizontal)]
+    events += [(line.position, _QUERY, index) for index, line in enumerate(vertical)]
+    events.sort()
+    active: list[tuple[float, int]] = []
+    for _, kind, index in events:
+        if kind == _OPEN:
+            insort(active, (horizontal[index].position, index))
+        elif kind == _CLOSE:
+            del active[bisect_left(active, (horizontal[index].position, index))]
+        else:
+            line = vertical[index]
+            low = bisect_left(active, (line.start - SNAP_PT, -1))
+            high = bisect_right(active, (line.end + SNAP_PT, len(horizontal)))
+            for _, h_index in active[low:high]:
+                yield h_index, index
+
+
+class _UnionFind:
+    """Disjoint sets of ``0..size - 1``: union by size, path halving (each find walks O(log n) parents)."""
+
+    __slots__ = ("_parent", "_size")
+
+    def __init__(self, size: int) -> None:
+        self._parent = list(range(size))
+        self._size = [1] * size
+
+    def find(self, item: int) -> int:
+        """The representative of ``item``'s set."""
+        parent = self._parent
+        while parent[item] != item:
+            parent[item] = parent[parent[item]]
+            item = parent[item]
+        return item
+
+    def union(self, first: int, second: int) -> None:
+        """Join the sets of ``first`` and ``second``."""
+        first, second = self.find(first), self.find(second)
+        if first == second:
+            return
+        if self._size[first] < self._size[second]:
+            first, second = second, first
+        self._parent[second] = first
+        self._size[first] += self._size[second]

@@ -7,6 +7,7 @@ displayed, top-left ``(x0, y0, x1, y1)`` points.
 import dataclasses
 import pickle
 import re
+import time
 
 import pytest
 
@@ -406,3 +407,99 @@ class TestCollinearMerge:
 
     def test_no_segments_no_lines(self):
         assert snapped() == ([], [])
+
+
+def components(*segments: RawSegment):
+    """Each connected group of rules as ``(horizontal, vertical)`` lists of ``(position, start, end)``."""
+    groups = layout._components(*layout._snapped_lines(segments))
+    return [([tuple(line) for line in hs], [tuple(line) for line in vs]) for hs, vs in groups]
+
+
+def ruled_grid(xs, ys) -> list[RawSegment]:
+    """Full-length rules at ``xs`` (vertical) and ``ys`` (horizontal): every cell closed."""
+    return [h(y, xs[0], xs[-1]) for y in ys] + [v(x, ys[0], ys[-1]) for x in xs]
+
+
+def dashed_mesh() -> list[RawSegment]:
+    """14 920 dashes (12 pt on, 3 pt off: too far apart to merge) crossing in one mesh.
+
+    100 rows of 75 horizontal dashes 8 pt apart and 140 columns of 53
+    vertical dashes 8 pt apart, every other row and column shifted half a
+    dash so that the crossings link them all: 55.6 million
+    horizontal-vertical pairs, but each vertical dash crosses only the
+    dashes of the two or three rows it spans.
+    """
+    rows = [
+        h(6.0 + 8.0 * row, 10.0 + 15.0 * dash + 7.5 * (row % 2), 22.0 + 15.0 * dash + 7.5 * (row % 2))
+        for row in range(100)
+        for dash in range(75)
+    ]
+    columns = [
+        v(14.0 + 8.0 * col, 10.0 + 15.0 * dash + 7.5 * (col % 2), 22.0 + 15.0 * dash + 7.5 * (col % 2))
+        for col in range(140)
+        for dash in range(53)
+    ]
+    return rows + columns
+
+
+class TestComponents:
+    """Rules that cross (within 2 pt) group by a sweep line and union-find; a group needs both orientations."""
+
+    def test_a_ruled_grid_is_one_component(self):
+        segments = ruled_grid((10.0, 50.0, 90.0), (20.0, 40.0, 60.0))
+
+        assert components(*segments) == [
+            (
+                [(20.0, 10.0, 90.0), (40.0, 10.0, 90.0), (60.0, 10.0, 90.0)],
+                [(10.0, 20.0, 60.0), (50.0, 20.0, 60.0), (90.0, 20.0, 60.0)],
+            )
+        ]
+
+    @pytest.mark.parametrize(
+        "vertical,meets",
+        [
+            pytest.param(v(50.0, 102.0, 150.0), True, id="starts-2-pt-below"),
+            pytest.param(v(50.0, 102.25, 150.0), False, id="starts-over-2-pt-below"),
+            pytest.param(v(50.0, 40.0, 98.0), True, id="ends-2-pt-above"),
+            pytest.param(v(50.0, 40.0, 97.75), False, id="ends-over-2-pt-above"),
+            pytest.param(v(12.0, 40.0, 150.0), True, id="2-pt-past-the-start"),
+            pytest.param(v(11.75, 40.0, 150.0), False, id="over-2-pt-past-the-start"),
+            pytest.param(v(92.0, 40.0, 150.0), True, id="2-pt-past-the-end"),
+            pytest.param(v(92.25, 40.0, 150.0), False, id="over-2-pt-past-the-end"),
+        ],
+    )
+    def test_rules_meet_within_2_pt_of_each_others_ends(self, vertical, meets):
+        got = components(h(100.0, 14.0, 90.0), vertical)
+
+        assert len(got) == (1 if meets else 0)
+
+    def test_parallel_rules_never_connect_on_their_own(self):
+        assert components(h(100.0, 10.0, 90.0), h(101.5, 10.0, 90.0), h(130.0, 10.0, 90.0)) == []
+
+    def test_rules_connect_through_a_chain_of_crossings(self):
+        # h1 - v1 - h2 - v2: no rule crosses every other, yet all are one group.
+        got = components(h(10.0, 0.0, 50.0), v(40.0, 0.0, 100.0), h(90.0, 30.0, 200.0), v(180.0, 80.0, 300.0))
+
+        assert got == [([(10.0, 0.0, 50.0), (90.0, 30.0, 200.0)], [(40.0, 0.0, 100.0), (180.0, 80.0, 300.0)])]
+
+    def test_separate_grids_are_separate_components_in_order_of_their_first_horizontal_rule(self):
+        lower = ruled_grid((10.0, 50.0), (300.0, 340.0))
+        upper = ruled_grid((200.0, 260.0), (20.0, 60.0))
+
+        got = components(*lower, *upper)
+
+        assert [hs[0][0] for hs, _ in got] == [20.0, 300.0]
+        assert [len(hs) + len(vs) for hs, vs in got] == [4, 4]
+
+    def test_a_dashed_mesh_of_15_000_segments_groups_within_1_second(self):
+        # The bound under test: O((H + V) log(H + V) + I), not the pairwise O(H x V).
+        segments = dashed_mesh()
+
+        started = time.perf_counter()
+        got = layout._components(*layout._snapped_lines(segments))
+        elapsed = time.perf_counter() - started
+
+        assert len(segments) == 14_920
+        # One group: every vertical dash, and every horizontal dash but the 76 that cross none.
+        assert [(len(hs), len(vs)) for hs, vs in got] == [(7_424, 7_420)]
+        assert elapsed < 1.0, f"{elapsed:.2f} s"
