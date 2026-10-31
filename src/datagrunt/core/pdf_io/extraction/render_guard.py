@@ -20,12 +20,17 @@ import logging
 import re
 
 from datagrunt.core.pdf_io.extraction.image_guard import (
+    _ARRAY_OUTER_RE,
+    _MAX_FILTER_ARRAY_ITEMS,
+    _MAX_RAW_HEADER_BYTES,
     _NON_IMAGE_FILTERS,
+    _SINGLE_NAME_RE,
     _UNREADABLE_FILTER,
     extract_xref_filters,
     inspect_image,
     normalize_filter,
     parse_filter_names,
+    resolve_indirect_text,
     unescape_pdf_names,
 )
 
@@ -51,6 +56,11 @@ _FILTER_VALUE = re.compile(r"/(?:Filter|F)\b\s*(\[[^\]]*\]|/[^\s/\[\]<>(){}]+)")
 _BI_TOKEN = re.compile(rb"(?<![^\s\]>)}])BI(?=[\s/])")
 _ID_TOKEN = re.compile(rb"(?<![^\s\]>)}])ID[\s]")
 _EI_TOKEN = re.compile(rb"[\s]EI(?=$|[\s/>])")
+_JBIG2_GLOBALS_KEY_RE = re.compile(r"/JBIG2Globals\b")
+_JBIG2_GLOBALS_NULL_RE = re.compile(r"/JBIG2Globals\s+null\b")
+_JBIG2_GLOBALS_REF_RE = re.compile(r"/JBIG2Globals\s+(\d+)\s+\d+\s+R")
+_DICT_OUTER_RE = re.compile(r"^\s*<<.*>>\s*$", re.DOTALL)
+_DECODE_PARMS_ARRAY_TOKEN_RE = re.compile(r"<<.*?>>|(\d+)\s+\d+\s+R|null\b", re.DOTALL)
 
 
 def _parse_filter_value(value) -> list:
@@ -58,26 +68,98 @@ def _parse_filter_value(value) -> list:
     return parse_filter_names(value)
 
 
-def _jbig2_globals(doc, xref: int) -> tuple[bytes | None, bool]:
-    """Return ``(/JBIG2Globals stream bytes, missing)`` for image ``xref``.
-
-    ``missing`` is True when a globals stream is referenced but cannot be read,
-    so the guard fails closed; ``(None, False)`` means no globals are referenced.
-    """
-    try:
-        kind, value = doc.xref_get_key(xref, "DecodeParms/JBIG2Globals")
-    except Exception:  # noqa: BLE001 - absent or array-valued DecodeParms
+def _jbig2_globals_from_dict(doc, dict_text: str) -> tuple[bytes | None, bool]:
+    """Read ``/JBIG2Globals`` from a single ``/DecodeParms`` dictionary text."""
+    text = unescape_pdf_names(dict_text)
+    if _JBIG2_GLOBALS_KEY_RE.search(text) is None:
         return None, False
-    if kind != "xref":
+    if _JBIG2_GLOBALS_NULL_RE.search(text) is not None:
         return None, False
+    match = _JBIG2_GLOBALS_REF_RE.search(text)
+    if match is None:
+        return None, True
     try:
-        globals_xref = int(str(value).split()[0])
+        globals_xref = int(match.group(1))
         raw = doc.xref_stream_raw(globals_xref)
     except Exception:  # noqa: BLE001 - referenced but unreadable -> fail closed
         return None, True
-    if raw is None:
+    if raw is None or len(raw) > _MAX_RAW_HEADER_BYTES:
         return None, True
     return raw, False
+
+
+def _jbig2_globals_from_array(doc, array_text: str) -> tuple[bytes | None, bool]:
+    """Read ``/JBIG2Globals`` from a ``/DecodeParms [...]`` array text."""
+    outer = _ARRAY_OUTER_RE.match(array_text)
+    if outer is None:
+        return None, True
+    interior = outer.group(1)
+    pos = 0
+    found_raw: bytes | None = None
+    for _ in range(_MAX_FILTER_ARRAY_ITEMS):
+        while pos < len(interior) and interior[pos].isspace():
+            pos += 1
+        if pos >= len(interior):
+            break
+        match = _DECODE_PARMS_ARRAY_TOKEN_RE.match(interior, pos)
+        if match is None:
+            return None, True
+        pos = match.end()
+        token = match.group(0)
+        ref_num = match.group(1)
+        if token == "null":
+            continue
+        if ref_num is not None:
+            resolved = resolve_indirect_text(doc, f"{ref_num} 0 R")
+            if resolved is None:
+                return None, True
+            if resolved == "null":
+                continue
+            if _DICT_OUTER_RE.match(resolved) is None:
+                return None, True
+            token = resolved
+        raw, missing = _jbig2_globals_from_dict(doc, token)
+        if missing:
+            return None, True
+        if raw is not None:
+            found_raw = raw
+    else:
+        return None, True
+    return found_raw, False
+
+
+def _jbig2_globals(doc, xref: int) -> tuple[bytes | None, bool]:
+    """Return ``(/JBIG2Globals stream bytes, missing)`` for image ``xref``.
+
+    ``missing`` is True when a globals stream is referenced (or ``/DecodeParms``
+    is malformed/unresolvable) and cannot be read, so the guard fails closed;
+    ``(None, False)`` means no globals are referenced.
+    """
+    try:
+        kind, value = doc.xref_get_key(xref, "DecodeParms")
+        if kind == "null":
+            kind, value = doc.xref_get_key(xref, "DP")
+    except Exception:  # noqa: BLE001
+        return None, True
+    if kind == "null":
+        return None, False
+    text = str(value)
+    if kind == "xref":
+        resolved = resolve_indirect_text(doc, text)
+        if resolved is None:
+            return None, True
+        if resolved == "null":
+            return None, False
+        if _DICT_OUTER_RE.match(resolved) is not None:
+            return _jbig2_globals_from_dict(doc, resolved)
+        if _ARRAY_OUTER_RE.match(resolved) is not None:
+            return _jbig2_globals_from_array(doc, resolved)
+        return None, True
+    if kind == "dict":
+        return _jbig2_globals_from_dict(doc, text)
+    if kind == "array":
+        return _jbig2_globals_from_array(doc, text)
+    return None, True
 
 
 def _image_block_reason(doc, xref: int) -> tuple[str | None, int]:
@@ -150,10 +232,24 @@ def _inline_block_reason(content: bytes) -> str | None:
     return None
 
 
-def _is_subtype(subtype: tuple[str, str], expected: str) -> bool:
-    """Return True if ``xref_get_key(xref, 'Subtype')`` matches ``expected`` after ``#xx`` unescaping."""
-    kind, value = subtype
-    return kind == "name" and unescape_pdf_names(str(value)) == expected
+def _resolve_subtype(doc, xref: int) -> tuple[str | None, bool]:
+    """Return ``(unescaped_subtype_name, unreadable)`` for ``xref``."""
+    try:
+        kind, value = doc.xref_get_key(xref, "Subtype")
+    except Exception:  # noqa: BLE001 - not a dictionary object
+        return None, False
+    if kind == "null":
+        return None, False
+    if kind == "name":
+        unescaped = unescape_pdf_names(str(value).strip())
+        return (unescaped, False) if _SINGLE_NAME_RE.match(unescaped) else (None, True)
+    if kind == "xref":
+        resolved = resolve_indirect_text(doc, str(value))
+        if resolved is None:
+            return None, True
+        unescaped = unescape_pdf_names(resolved.strip())
+        return (unescaped, False) if _SINGLE_NAME_RE.match(unescaped) else (None, True)
+    return None, True
 
 
 def _is_pattern_object(doc, xref: int) -> bool:
@@ -182,20 +278,19 @@ def document_block_reason(doc) -> str | None:
     budget = _MAX_SCAN_BYTES
     content_xrefs: list[int] = []  # Form XObjects and tiling patterns: streams that may hold inline images
     for xref in range(1, count):
-        try:
-            subtype = doc.xref_get_key(xref, "Subtype")
-        except Exception:  # noqa: BLE001 - not a dictionary object
-            continue
-        if _is_subtype(subtype, "/Image"):
+        subtype_name, subtype_unreadable = _resolve_subtype(doc, xref)
+        if subtype_unreadable:
+            return f"xref {xref}: unreadable /Subtype; render skipped"
+        if subtype_name == "/Image":
             reason, read = _image_block_reason(doc, xref)
             if reason is not None:
                 return reason
             budget -= read
             if budget < 0:
                 return "image stream scan exceeded the per-document byte budget; render skipped"
-        elif _is_subtype(subtype, "/Form"):
+        elif subtype_name == "/Form":
             content_xrefs.append(xref)  # annotation appearance /N streams are Form XObjects too
-        elif _is_subtype(subtype, "/Type3"):
+        elif subtype_name == "/Type3":
             content_xrefs.extend(_charproc_xrefs(doc, xref))  # glyph procedures may hold inline images
         elif _is_pattern_object(doc, xref):
             content_xrefs.append(xref)

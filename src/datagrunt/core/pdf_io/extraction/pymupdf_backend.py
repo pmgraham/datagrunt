@@ -13,6 +13,7 @@ from datagrunt.core.pdf_io.extraction.image_guard import (
 )
 from datagrunt.core.pdf_io.extraction.ocr import ocr_data_to_blocks
 from datagrunt.core.pdf_io.extraction.pdfium_document import ENCRYPTED_PDF_MESSAGE
+from datagrunt.core.pdf_io.extraction.render_guard import _jbig2_globals
 from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, PageAnalysis, TextBlock
 from datagrunt.core.pdf_io.extraction.text_block_builder import classify_by_median, page_median_size
 from datagrunt.core.pdf_io.filenames import embedded_image_filename
@@ -39,13 +40,20 @@ def _guard_image(doc, xref: int, label: str):
     filter means the guard fails closed (skip).
     """
     filters = extract_xref_filters(doc, xref)
+    globals_data, globals_missing = _jbig2_globals(doc, xref)
     try:
         raw = doc.xref_stream_raw(xref)
     except Exception:  # noqa: BLE001 - unreadable raw stream -> fail closed
         raw = None
     if raw is not None and len(raw) > _MAX_RAW_HEADER_BYTES:
         raw = None
-    return inspect_image(raw, filters, label=label)
+    return inspect_image(
+        raw,
+        filters,
+        label=label,
+        jbig2_globals=globals_data,
+        jbig2_globals_missing=globals_missing,
+    )
 
 
 def _guarded_page_image_reasons(doc, page) -> list:
@@ -250,13 +258,31 @@ class PyMuPDFBackend(_ThreadLocalDocSession, ExtractionBackend):
             if page_number < 0 or page_number >= doc.page_count:
                 raise ValueError(f"Page {page_number} out of range")
             page = doc[page_number]
+            image_list = page.get_images()
+            images = []
+            warnings: list[str] = []
+            if image_list:
+                images = self._images_from_page(doc, page, image_list, output_dir, name_prefix, page_number, warnings)
+            if warnings:
+                analysis = PageAnalysis(
+                    width=page.rect.width,
+                    height=page.rect.height,
+                    rotation=page.rotation,
+                    has_text_layer=False,
+                    is_scanned=len(image_list) > 0,
+                    text_block_count=0,
+                    image_count=len(image_list),
+                    image_block_count=0,
+                    has_line_drawings=False,
+                    text_length=0,
+                )
+                return analysis, [], images, warnings
             data = page.get_text("dict", sort=True)
             raw_blocks = data["blocks"]
             text_block_dicts = [b for b in raw_blocks if b.get("type") == 0]
             image_block_dicts = [b for b in raw_blocks if b.get("type") == 1]
             text = page.get_text("text").strip()
             has_text = len(text) > 0
-            image_list = page.get_images()
             drawings = page.get_drawings()
             has_lines = any(item[0] in ("l", "re") for d in drawings for item in d.get("items", []))
             analysis = PageAnalysis(
@@ -285,10 +311,6 @@ class PyMuPDFBackend(_ThreadLocalDocSession, ExtractionBackend):
                     tb = self._build_block(block, median_size, order)
                     if tb is not None:
                         text_blocks.append(tb)
-            images = []
-            warnings: list[str] = []
-            if analysis.image_count > 0:
-                images = self._images_from_page(doc, page, image_list, output_dir, name_prefix, page_number, warnings)
             return analysis, text_blocks, images, warnings
         finally:
             if should_close:

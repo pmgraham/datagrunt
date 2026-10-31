@@ -784,3 +784,153 @@ def test_document_block_reason_fails_closed_when_read_contents_raises(tmp_path, 
 
     assert reason is not None
     assert "unreadable" in reason.lower()
+
+
+def test_indirect_subtype_image_xobject_is_guarded_in_render_pages(tmp_path, no_pymupdf_page_render):
+    bomb = _jpx_tile_bomb()
+    content = b"q 200 0 0 200 50 50 cm /Im0 Do Q"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        b"<< /Type /XObject /Subtype 6 0 R /Width 16 /Height 16 /ColorSpace /DeviceGray "
+        b"/BitsPerComponent 8 /Filter /JPXDecode /Length %d >>\nstream\n%s\nendstream" % (len(bomb), bomb),
+        b"/Image",
+    ]
+    path = hand_written_pdf(tmp_path / "indirect_subtype.pdf", objects)
+    paths = PDFWriter(path, engine="pymupdf").render_pages_as_images(str(tmp_path / "pages"), dpi=72)
+
+    assert paths == []
+    assert no_pymupdf_page_render == []
+
+
+@pytest.mark.parametrize(
+    "extra_objects",
+    [
+        [b"7 0 R", b"8 0 R", b"9 0 R", b"/Image"],
+        [b"123"],
+    ],
+    ids=["hop_limit_exceeded", "non_name_target"],
+)
+def test_unresolvable_indirect_subtype_fails_closed_in_render_pages(tmp_path, extra_objects, no_pymupdf_page_render):
+    bomb = _jpx_tile_bomb()
+    content = b"q 200 0 0 200 50 50 cm /Im0 Do Q"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        b"<< /Type /XObject /Subtype 6 0 R /Width 16 /Height 16 /ColorSpace /DeviceGray "
+        b"/BitsPerComponent 8 /Filter /JPXDecode /Length %d >>\nstream\n%s\nendstream" % (len(bomb), bomb),
+        *extra_objects,
+    ]
+    path = hand_written_pdf(tmp_path / "unresolvable_subtype.pdf", objects)
+    paths = PDFWriter(path, engine="pymupdf").render_pages_as_images(str(tmp_path / "pages"), dpi=72)
+
+    assert paths == []
+    assert no_pymupdf_page_render == []
+
+
+def _jbig2_globals_bomb_pdf(path: Path, decode_parms_entry: bytes, extra_objects: list[bytes]) -> Path:
+    """Build a 1-page PDF with a 16x16 JBIG2 image whose object 6 globals stream holds a 40000x40000 region bomb."""
+    content = b"q 200 0 0 200 50 50 cm /Im0 Do Q"
+    local_stream = jbig2_stream(16, 16)
+    region_bomb = jbig2_segment(0, 4, struct.pack(">IIIIB", 40000, 40000, 0, 0, 0), page=0)
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        b"<< /Type /XObject /Subtype /Image /Width 16 /Height 16 /ColorSpace /DeviceGray "
+        b"/BitsPerComponent 1 /Filter [/JBIG2Decode] %s /Length %d >>\nstream\n%s\nendstream"
+        % (decode_parms_entry, len(local_stream), local_stream),
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(region_bomb), region_bomb),
+        *extra_objects,
+    ]
+    return hand_written_pdf(path, objects)
+
+
+@pytest.mark.parametrize(
+    ("decode_parms_entry", "extra_objects"),
+    [
+        (b"/DecodeParms [<< /JBIG2Globals 6 0 R >>]", []),
+        (b"/DecodeParms 7 0 R", [b"<< /JBIG2Globals 6 0 R >>"]),
+        (b"/DecodeParms 7 0 R", [b"[<< /JBIG2Globals 6 0 R >>]"]),
+        (b"/DecodeParms [7 0 R]", [b"<< /JBIG2Globals 6 0 R >>"]),
+    ],
+    ids=["array_of_dict", "indirect_dict", "indirect_array", "array_of_indirect_dict"],
+)
+def test_jbig2_globals_in_array_or_indirect_decode_parms_is_guarded(
+    tmp_path, decode_parms_entry, extra_objects, no_pymupdf_image_decode, no_pymupdf_page_render
+):
+    path = _jbig2_globals_bomb_pdf(tmp_path / "jbig2_globals.pdf", decode_parms_entry, extra_objects)
+
+    paths = PDFWriter(path, engine="pymupdf").render_pages_as_images(str(tmp_path / "pages"), dpi=72)
+    assert paths == []
+    assert no_pymupdf_page_render == []
+
+    document = PDFReader(path, engine="pymupdf").to_dicts()
+    assert any("JBIG2" in w for w in _warnings_of(document))
+    assert _image_elements(document) == []
+    assert no_pymupdf_image_decode == []
+
+
+def test_filter_array_with_indirect_element_is_guarded(tmp_path, no_pymupdf_image_decode, no_pymupdf_page_render):
+    import binascii
+
+    wrapped = binascii.hexlify(_jpx_tile_bomb()) + b">"
+    content = b"q 200 0 0 200 50 50 cm /Im0 Do Q"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        b"<< /Type /XObject /Subtype /Image /Width 16 /Height 16 /ColorSpace /DeviceGray "
+        b"/BitsPerComponent 8 /Filter [/ASCIIHexDecode 6 0 R] /Length %d >>\nstream\n%s\nendstream"
+        % (len(wrapped), wrapped),
+        b"/JPXDecode",
+    ]
+    path = hand_written_pdf(tmp_path / "filter_array_indirect_elem.pdf", objects)
+
+    document = PDFReader(path, engine="pymupdf").to_dicts()
+    assert any("JPEG 2000" in w for w in _warnings_of(document))
+    assert _image_elements(document) == []
+    assert no_pymupdf_image_decode == []
+
+    paths = PDFWriter(path, engine="pymupdf").render_pages_as_images(str(tmp_path / "pages"), dpi=72)
+    assert paths == []
+    assert no_pymupdf_page_render == []
+
+
+def test_filter_array_with_unresolvable_indirect_element_fails_closed(
+    tmp_path, no_pymupdf_image_decode, no_pymupdf_page_render
+):
+    import binascii
+
+    wrapped = binascii.hexlify(b"\x80" * 256) + b">"
+    content = b"q 200 0 0 200 50 50 cm /Im0 Do Q"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        b"<< /Type /XObject /Subtype /Image /Width 16 /Height 16 /ColorSpace /DeviceGray "
+        b"/BitsPerComponent 8 /Filter [/ASCIIHexDecode 99 0 R] /Length %d >>\nstream\n%s\nendstream"
+        % (len(wrapped), wrapped),
+    ]
+    path = hand_written_pdf(tmp_path / "filter_array_bad_ref.pdf", objects)
+
+    document = PDFReader(path, engine="pymupdf").to_dicts()
+    assert _warnings_of(document)
+    assert _image_elements(document) == []
+    assert no_pymupdf_image_decode == []
+
+    paths = PDFWriter(path, engine="pymupdf").render_pages_as_images(str(tmp_path / "pages"), dpi=72)
+    assert paths == []
+    assert no_pymupdf_page_render == []

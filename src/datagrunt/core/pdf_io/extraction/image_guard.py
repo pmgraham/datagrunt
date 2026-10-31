@@ -116,8 +116,12 @@ _SAFE = GuardDecision(skip=False, reason=None)
 
 _HEX_ESCAPE_RE = re.compile(r"#([0-9A-Fa-f]{2})")
 _NAME_TOKEN_RE = re.compile(r"/([^\s/\[\]<>(){}]+)")
+_SINGLE_NAME_RE = re.compile(r"^\s*/([^\s/\[\]<>(){}]+)\s*$")
+_ARRAY_OUTER_RE = re.compile(r"^\s*\[(.*)\]\s*$", re.DOTALL)
+_FILTER_ARRAY_TOKEN_RE = re.compile(r"/([^\s/\[\]<>(){}]+)|(\d+)\s+\d+\s+R")
 _INDIRECT_REF_RE = re.compile(r"(\d+)\s+\d+\s+R")
 _MAX_FILTER_REF_DEPTH = 2
+_MAX_FILTER_ARRAY_ITEMS = 64
 _UNREADABLE_FILTER = "__unreadable_filter__"
 
 
@@ -133,19 +137,67 @@ def parse_filter_names(value: object) -> list[str]:
     return _NAME_TOKEN_RE.findall(unescape_pdf_names(str(value)))
 
 
-def _resolve_indirect_filter(doc: object, value: str) -> list[str]:
-    """Resolve an indirect ``/Filter`` reference (up to 2 hops) into filter names."""
+def resolve_indirect_text(doc: object, value: str) -> str | None:
+    """Resolve an indirect reference ``'N 0 R'`` up to 2 hops; return target text or None."""
     current = str(value).strip()
     for _ in range(_MAX_FILTER_REF_DEPTH):
         match = _INDIRECT_REF_RE.fullmatch(current)
         if match is None:
-            break
+            return current
         ref_xref = int(match.group(1))
-        current = str(doc.xref_object(ref_xref) or "").strip()  # type: ignore[attr-defined]
+        try:
+            if ref_xref <= 0 or ref_xref >= doc.xref_length():  # type: ignore[attr-defined]
+                return None
+            obj_text = doc.xref_object(ref_xref)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            return None
+        current = str(obj_text or "").strip()
+        if not current:
+            return None
     if _INDIRECT_REF_RE.fullmatch(current) is not None:
+        return None
+    return current
+
+
+def _parse_filter_array(doc: object, interior: str) -> list[str]:
+    """Parse the interior of a ``/Filter [...]`` array, resolving any indirect element refs."""
+    names: list[str] = []
+    pos = 0
+    for _ in range(_MAX_FILTER_ARRAY_ITEMS):
+        while pos < len(interior) and interior[pos].isspace():
+            pos += 1
+        if pos >= len(interior):
+            break
+        match = _FILTER_ARRAY_TOKEN_RE.match(interior, pos)
+        if match is None:
+            return [_UNREADABLE_FILTER]
+        pos = match.end()
+        direct_name, ref_num = match.group(1), match.group(2)
+        if direct_name is not None:
+            names.append(direct_name)
+            continue
+        resolved = resolve_indirect_text(doc, f"{ref_num} 0 R")
+        if resolved is None:
+            return [_UNREADABLE_FILTER]
+        name_match = _SINGLE_NAME_RE.match(unescape_pdf_names(resolved))
+        if name_match is None:
+            return [_UNREADABLE_FILTER]
+        names.append(name_match.group(1))
+    else:
         return [_UNREADABLE_FILTER]
-    names = parse_filter_names(current)
     return names if names else [_UNREADABLE_FILTER]
+
+
+def _parse_resolved_filter_text(doc: object, raw_text: str) -> list[str]:
+    """Parse a direct or resolved ``/Filter`` text (single ``/Name`` or ``[...]`` array)."""
+    unescaped = unescape_pdf_names(raw_text)
+    single = _SINGLE_NAME_RE.match(unescaped)
+    if single is not None:
+        return [single.group(1)]
+    array_match = _ARRAY_OUTER_RE.match(unescaped)
+    if array_match is not None:
+        return _parse_filter_array(doc, array_match.group(1))
+    return [_UNREADABLE_FILTER]
 
 
 def extract_xref_filters(doc: object, xref: int) -> list[str]:
@@ -157,13 +209,12 @@ def extract_xref_filters(doc: object, xref: int) -> list[str]:
     if kind == "null":
         return []
     if kind in ("name", "array"):
-        names = parse_filter_names(value)
-        return names if names else [_UNREADABLE_FILTER]
+        return _parse_resolved_filter_text(doc, str(value))
     if kind == "xref":
-        try:
-            return _resolve_indirect_filter(doc, str(value))
-        except Exception:  # noqa: BLE001 - broken indirect filter -> fail closed
+        resolved = resolve_indirect_text(doc, str(value))
+        if resolved is None:
             return [_UNREADABLE_FILTER]
+        return _parse_resolved_filter_text(doc, resolved)
     return [_UNREADABLE_FILTER]
 
 
