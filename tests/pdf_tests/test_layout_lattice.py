@@ -95,8 +95,16 @@ class TestModuleImports:
         import datagrunt
         import datagrunt.pdf
 
+        names = {"LatticeCell", "LatticeTable", "LatticeResult", "find_lattice_tables"}
+        names |= {"TextCell", "TextLine", "text_lines"}
         for package in (datagrunt, datagrunt.pdf):
-            assert not {"LatticeCell", "LatticeTable", "LatticeResult", "find_lattice_tables"} & set(dir(package))
+            assert not names & set(dir(package))
+
+    def test_names_its_public_api(self):
+        expected = ["LatticeCell", "LatticeResult", "LatticeTable", "TextCell", "TextLine"]
+        expected += ["find_lattice_tables", "text_lines"]
+
+        assert layout.__all__ == expected
 
 
 class TestLatticeCell:
@@ -723,6 +731,20 @@ class TestCellText:
         right = chars("right", 10.0 + 4 * 6.0 + gap, 10.0)
 
         assert texts(TWO_BY_TWO, right, chars("left", 10.0, 10.0)) == [[joined, "", "", ""]]
+
+    @pytest.mark.parametrize(
+        "left,right,joined",
+        [
+            pytest.param("20", "°C", "20°C", id="degree"),
+            pytest.param("Price", ",", "Price,", id="punctuation"),
+            pytest.param("(", "net", "(net", id="opening-bracket"),
+        ],
+    )
+    def test_runs_next_to_degree_or_punctuation_join_with_nothing(self, left, right, joined):
+        # The stream pass's join (A4b): 3 pt apart, past 0.22 em, yet joined with nothing.
+        pieces = (chars(left, 10.0, 10.0), chars(right, 10.0 + 6.0 * len(left) + 3.0, 10.0))
+
+        assert texts(TWO_BY_TWO, *pieces) == [[joined, "", "", ""]]
 
     def test_a_raised_run_overlapping_the_line_by_45_percent_or_more_stays_on_it(self):
         # '2' is 6 pt tall and overlaps the 12 pt line by 2.76 pt: 0.46 of the smaller height.

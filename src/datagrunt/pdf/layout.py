@@ -1,4 +1,4 @@
-"""Page layout for the v5 PDF document model (#367, A4a: the vector-lattice table pass).
+"""Page layout for the v5 PDF document model (#367, A4a: the vector-lattice table pass; #368, A4b: the stream pass).
 
 Internal: not exported from ``datagrunt`` or ``datagrunt.pdf``. Pure: it
 reads the engine's segments (:class:`~datagrunt.pdf._path_segments.RawSegment`)
@@ -13,6 +13,11 @@ element ids and reading order come there too, so the tables are
 intermediate :class:`LatticeTable` values. Its work per page is bounded
 (:data:`MAX_CROSSINGS`, :data:`MAX_GRID_UNITS`, :data:`MAX_GRIDS`): what a
 bound leaves out keeps its text for the stream pass, and the result says so.
+
+The stream pass (spec §3.3 step 3, Pass B) lays out the visible text the
+lattice tables did not use: :func:`text_lines` reads it as lines
+(:class:`TextLine`) of cells (:class:`TextCell`), each keeping the char
+ranges it reads. Hidden text is laid out apart (A4b group 3).
 
 Known limitations (each a fact this pure pass cannot see):
 
@@ -35,11 +40,11 @@ from typing import NamedTuple
 
 from datagrunt.pdf._path_segments import Box, RawSegment
 from datagrunt.pdf._pdfium_common import union_box
-from datagrunt.pdf._validate import int_at_least, strict_bool, typed_tuple
+from datagrunt.pdf._validate import int_at_least, non_blank_str, positive_float, strict_bool, typed_tuple
 from datagrunt.pdf.elements import BBox
 from datagrunt.pdf.quality import SpanPiece
 
-__all__ = ["LatticeCell", "LatticeResult", "LatticeTable", "find_lattice_tables"]
+__all__ = ["LatticeCell", "LatticeResult", "LatticeTable", "TextCell", "TextLine", "find_lattice_tables", "text_lines"]
 
 # Lines this close snap to one position, join end to end, and meet (spec §3.3 Pass A).
 SNAP_PT = 2.0
@@ -62,9 +67,17 @@ MAX_GRIDS = 100
 _LINE_OVERLAP = 0.45
 # Runs on a line join with nothing across a gap of at most this many ems, else with a space (spec §3.3 Pass B).
 _JOIN_GAP_EM = 0.22
+# ... and with nothing next to degree and punctuation glyphs, whatever the gap (spec §3.3 Pass B): after
+# an opening bracket, quote or degree sign ("(see", "°C"), before a closing one or punctuation ("20°", "Hi,").
+_TIGHT_AFTER = frozenset("([{\u2018\u201c\u00b0")
+_TIGHT_BEFORE = frozenset(")]},.;:!?%\u2019\u201d\u00b0")
+# The stream pass splits a line into cells across a gap of more than this many ems (spec §3.3 Pass B).
+_CELL_GAP_EM = 1.8
 # Reading turns: the clockwise angle a run's text advances at on the displayed page. Text advancing
 # leftward reads across too: right-to-left text comes in logical order, as upside-down text would.
 _ACROSS, _DOWN, _UP = 0, 90, 270
+# The turns, in the order a tie between them is broken.
+_TURNS = (_ACROSS, _DOWN, _UP)
 
 # Sweep events at one x: horizontal rules open, then vertical rules query, then horizontal rules close.
 _OPEN, _QUERY, _CLOSE = 0, 1, 2
@@ -686,8 +699,9 @@ def _cell_text(runs: list[_Run], default_turn: int) -> str:
     else ``default_turn``. In that frame, runs overlapping a line by at
     least :data:`_LINE_OVERLAP` of the smaller height are on it; lines read
     top to bottom and join with one space; runs on a line read left to
-    right and join with nothing across a gap of at most
-    :data:`_JOIN_GAP_EM` ems of the larger font, else with one space; a
+    right and join as the stream pass joins them (:func:`_separator`:
+    nothing across a gap of at most :data:`_JOIN_GAP_EM` ems of the larger
+    font or next to a degree or punctuation glyph, else one space); a
     run keeps its span's char order, with one space at each break pdfium
     generated inside it. Text is otherwise verbatim. O(r log r) for r runs.
     """
@@ -763,14 +777,28 @@ def _overlap_share(top: float, bottom: float, y0: float, y1: float) -> float:
 
 
 def _line_text(line: list[tuple[Box, _Run]]) -> str:
-    """A line's runs left to right, joined by the gap between them (see :func:`_cell_text`)."""
+    """A line's runs left to right, each joined to the one before by :func:`_separator`."""
     ordered = sorted(line, key=lambda item: item[0][0])
     parts = [_run_text(ordered[0][1])]
-    for (before, previous), (box, run) in zip(ordered, ordered[1:]):
-        em = max(abs(previous.piece.span.font_size_pt), abs(run.piece.span.font_size_pt))
-        parts.append("" if box[0] - before[2] <= _JOIN_GAP_EM * em else " ")
-        parts.append(_run_text(run))
+    for before, item in zip(ordered, ordered[1:]):
+        parts.append(_separator(before, item))
+        parts.append(_run_text(item[1]))
     return "".join(parts)
+
+
+def _separator(before: tuple[Box, _Run], after: tuple[Box, _Run]) -> str:
+    """What joins two neighbouring runs on a line, each with its turned box (spec §3.3 Pass B).
+
+    Nothing across a gap of at most :data:`_JOIN_GAP_EM` ems of the larger
+    font, after a glyph in :data:`_TIGHT_AFTER` or before one in
+    :data:`_TIGHT_BEFORE` (degree and punctuation glyphs); else one space.
+    """
+    (left_box, left), (right_box, right) = before, after
+    em = max(abs(left.piece.span.font_size_pt), abs(right.piece.span.font_size_pt))
+    if right_box[0] - left_box[2] <= _JOIN_GAP_EM * em:
+        return ""
+    last, first = left.piece.span.text[left.end - 1], right.piece.span.text[right.start]
+    return "" if last in _TIGHT_AFTER or first in _TIGHT_BEFORE else " "
 
 
 def _run_text(run: _Run) -> str:
@@ -828,3 +856,279 @@ def _joined(extents: list[tuple[int, int]]) -> list[tuple[int, int]]:
         else:
             joined.append((start, end))
     return joined
+
+
+# The stream pass (spec §3.3 step 3, Pass B; #368, A4b).
+
+
+def _outside(inner: Box, outer: BBox) -> bool:
+    """True if ``inner`` reaches past ``outer`` on any side."""
+    return inner[0] < outer.x0 or inner[1] < outer.y0 or inner[2] > outer.x1 or inner[3] > outer.y1
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TextCell:
+    """A stretch of a stream line between gaps wider than 1.8 em: one column's text on the line.
+
+    Attributes:
+        text: Its runs in order along the line, joined as :func:`text_lines`
+            joins them; never blank.
+        bbox: The union of its pieces' boxes on the displayed page.
+        pieces: The char ranges it reads, in their order along the line.
+    """
+
+    text: str
+    bbox: BBox
+    pieces: tuple[SpanPiece, ...]
+
+    def __post_init__(self) -> None:
+        non_blank_str("text", self.text)
+        _check_bbox("bbox", self.bbox)
+        typed_tuple("pieces", self.pieces, SpanPiece)
+        if not self.pieces:
+            raise ValueError("pieces must hold at least one piece")
+        for index, item in enumerate(self.pieces):
+            if _outside(item.bbox, self.bbox):
+                raise ValueError(f"pieces[{index}] must lie within the bbox, got {item.bbox} in {self.bbox}")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class TextLine:
+    """A line of the page's stream text: its cells, read along the line.
+
+    Attributes:
+        cells: Its cells in order along the line (left to right in the
+            line's own frame).
+        bbox: The union of its cells' boxes on the displayed page.
+        turn: The clockwise angle, in degrees, its text advances at on the
+            displayed page: 0 (across; right-to-left text too), 90 (down)
+            or 270 (up).
+        font_size_pt: The font size (magnitude, to 0.1 pt) most of its chars
+            are drawn at; a tie goes to the size met first along the line.
+        is_bold: True if every run on it is from a bold span.
+    """
+
+    cells: tuple[TextCell, ...]
+    bbox: BBox
+    turn: int
+    font_size_pt: float
+    is_bold: bool
+
+    def __post_init__(self) -> None:
+        typed_tuple("cells", self.cells, TextCell)
+        if not self.cells:
+            raise ValueError("cells must hold at least one cell")
+        _check_bbox("bbox", self.bbox)
+        for index, item in enumerate(self.cells):
+            inner = item.bbox
+            if _outside((inner.x0, inner.y0, inner.x1, inner.y1), self.bbox):
+                raise ValueError(f"cells[{index}].bbox must lie within the bbox, got {inner} in {self.bbox}")
+        if int_at_least("turn", self.turn, 0) not in _TURNS:
+            raise ValueError(f"turn must be 0, 90 or 270, got {self.turn}")
+        object.__setattr__(self, "font_size_pt", positive_float("font_size_pt", self.font_size_pt))
+        strict_bool("is_bold", self.is_bold)
+
+    @property
+    def text(self) -> str:
+        """Its cells' texts joined with one space."""
+        return " ".join(item.text for item in self.cells)
+
+
+def text_lines(pieces: tuple[SpanPiece, ...], lattice: LatticeResult) -> tuple[TextLine, ...]:
+    """The page's visible text outside its lattice tables, as lines (spec §3.3 step 3, Pass B).
+
+    1. Runs: each visible piece's chars that no lattice table used, cut
+       where two neighbouring chars leave a gap over :data:`_CELL_GAP_EM`
+       ems of the span's font (where pdfium generates a break across a
+       ``TJ`` gap between columns). Whitespace-only runs hold no text and
+       are left out; hidden pieces are not laid out here.
+    2. Turns: a run reads in the direction its text advances (see
+       :func:`find_lattice_tables`); a one-char run takes the page's turn,
+       the one most chars advance at (ties: across, down, up). Each turn's
+       runs make lines in their own frame, so a label up the margin is a
+       line of its own, not glue between the page's lines.
+    3. Lines: runs overlapping a line across it by at least
+       :data:`_LINE_OVERLAP` of the smaller height are on it (A4a's rule).
+    4. Cells: along a line, runs read in order of their boxes (a run keeps
+       its span's char order, so right-to-left text reads as pdfium gives
+       it); a gap over :data:`_CELL_GAP_EM` ems of the larger font starts a
+       cell; inside a cell, runs join as A4a's cells do
+       (:func:`_separator`), with one space at each break pdfium generated
+       inside a run.
+
+    Lines come in order of their tops, then their left edges, in the frame
+    of the page's turn. O(c log c) for c chars.
+
+    Args:
+        pieces: The page's pieces (``PageAssessment.pieces``).
+        lattice: Their lattice tables (``find_lattice_tables(segments,
+            pieces)``): its used pieces share the pieces' spans.
+
+    Raises:
+        TypeError: If ``pieces`` is not a tuple of SpanPiece or ``lattice``
+            is not a LatticeResult.
+        ValueError: If a piece is passed twice, or a used piece of
+            ``lattice`` is not a char range inside one visible piece.
+    """
+    runs = _stream_runs(pieces, lattice)
+    turn = _page_turn(runs)
+    return tuple(sorted(_stream_lines(runs, turn), key=lambda found: _frame_key(found.bbox, turn)))
+
+
+# A run with the turn its text advances at; None for one char.
+_TurnedRun = tuple[int | None, _Run]
+
+
+def _stream_runs(pieces: tuple[SpanPiece, ...], lattice: LatticeResult) -> list[_TurnedRun]:
+    """The runs the stream pass lays out (:func:`text_lines`, step 1), in piece order, each with its turn."""
+    typed_tuple("pieces", pieces, SpanPiece)
+    if not isinstance(lattice, LatticeResult):
+        raise TypeError(f"lattice must be a LatticeResult, got {type(lattice).__name__}")
+    _check_distinct(pieces)
+    used = _used_ranges(lattice.used_pieces)
+    runs: list[_TurnedRun] = []
+    matched: set[int] = set()
+    for piece in pieces:
+        if piece.hidden_reasons:
+            continue
+        for start, end in _free_ranges(piece, used.get(id(piece.span), []), matched):
+            runs.extend(_cut_at_gaps(_Run(piece, start, end)))
+    if len(matched) != len(lattice.used_pieces):
+        missing = min(set(range(len(lattice.used_pieces))) - matched)
+        where = "is not visible text of these pieces: the lattice result is of another page"
+        raise ValueError(f"lattice.used_pieces[{missing}] {where}")
+    return [item for item in runs if not _run_chars(item[1]).isspace()]
+
+
+def _used_ranges(used: tuple[SpanPiece, ...]) -> dict[int, list[tuple[int, int, int]]]:
+    """Each span's used char ranges as ``(start, end, index into used)``, sorted, keyed by the span's identity."""
+    ranges: dict[int, list[tuple[int, int, int]]] = {}
+    for index, item in enumerate(used):
+        ranges.setdefault(id(item.span), []).append((item.start, item.end, index))
+    for found in ranges.values():
+        found.sort()
+    return ranges
+
+
+def _free_ranges(piece: SpanPiece, ranges: list[tuple[int, int, int]], matched: set[int]) -> list[tuple[int, int]]:
+    """The piece's char ranges outside its span's used ``ranges``; adds the indices of those inside to ``matched``.
+
+    A used range counts only inside the piece and after the one before it:
+    any other matches nothing, so :func:`_stream_runs` rejects it.
+    O(log u + the ranges inside) for u used ranges of the span.
+    """
+    free: list[tuple[int, int]] = []
+    cursor = piece.start
+    at = bisect_left(ranges, (piece.start,))
+    while at < len(ranges) and ranges[at][0] < piece.end:
+        start, end, index = ranges[at]
+        at += 1
+        if end > piece.end or start < cursor:
+            continue
+        if start > cursor:
+            free.append((cursor, start))
+        cursor = end
+        matched.add(index)
+    if cursor < piece.end:
+        free.append((cursor, piece.end))
+    return free
+
+
+def _cut_at_gaps(run: _Run) -> list[_TurnedRun]:
+    """``run`` cut where two neighbouring chars leave a gap over :data:`_CELL_GAP_EM` ems, each part with its turn."""
+    turn = _run_turn(run)
+    if turn is None:
+        return [(None, run)]
+    span = run.piece.span
+    boxes = [_turned(box, turn) for box in span.char_boxes[run.start : run.end]]
+    limit = _CELL_GAP_EM * abs(span.font_size_pt)
+    cuts = [run.start + at for at in range(1, len(boxes)) if _separation(boxes[at - 1], boxes[at]) > limit]
+    bounds = (run.start, *cuts, run.end)
+    return [(turn, _Run(run.piece, start, end)) for start, end in zip(bounds, bounds[1:])]
+
+
+def _separation(first: Box, second: Box) -> float:
+    """The gap between two boxes along a line, whichever comes first (right-to-left chars run leftward)."""
+    return max(second[0] - first[2], first[0] - second[2])
+
+
+def _run_chars(run: _Run) -> str:
+    """A run's chars, as its span holds them."""
+    return run.piece.span.text[run.start : run.end]
+
+
+def _page_turn(runs: list[_TurnedRun]) -> int:
+    """The turn most of the runs' chars advance at (ties: across, down, up); across for none."""
+    chars = dict.fromkeys(_TURNS, 0)
+    for turn, run in runs:
+        if turn is not None:
+            chars[turn] += run.end - run.start
+    return max(_TURNS, key=chars.__getitem__)
+
+
+def _frame_key(bbox: BBox, turn: int) -> tuple[float, float]:
+    """``(top, left)`` of a box in the frame where text advancing at ``turn`` reads left to right."""
+    x0, y0, _, _ = _turned((bbox.x0, bbox.y0, bbox.x1, bbox.y1), turn)
+    return y0, x0
+
+
+def _stream_lines(runs: list[_TurnedRun], page_turn: int) -> list[TextLine]:
+    """The runs' lines, each turn's in its own frame (:func:`text_lines`, steps 2 to 4), unordered."""
+    by_turn: dict[int, list[tuple[Box, _Run]]] = {}
+    for turn, run in runs:
+        own = page_turn if turn is None else turn
+        by_turn.setdefault(own, []).append((_turned(_run_box(run), own), run))
+    lines: list[TextLine] = []
+    for own, placed in by_turn.items():
+        placed.sort(key=lambda item: (item[0][1], item[0][0]))
+        lines.extend(_text_line(found, own) for found in _lines(placed))
+    return lines
+
+
+def _text_line(line: list[tuple[Box, _Run]], turn: int) -> TextLine:
+    """One line's TextLine: its runs (with their boxes turned by ``turn``) in cells along it."""
+    ordered = sorted(line, key=lambda item: item[0][0])
+    cells = tuple(_text_cell(group) for group in _cell_groups(ordered))
+    runs = [run for _, run in ordered]
+    sizes: dict[float, int] = {}
+    for run in runs:
+        size = round(abs(run.piece.span.font_size_pt), 1)
+        sizes[size] = sizes.get(size, 0) + run.end - run.start
+    return TextLine(
+        cells=cells,
+        bbox=_bbox(union_box(tuple(_run_box(run) for run in runs))),
+        turn=turn,
+        font_size_pt=max(sizes, key=sizes.__getitem__),
+        is_bold=all(run.piece.span.is_bold for run in runs),
+    )
+
+
+def _cell_groups(ordered: list[tuple[Box, _Run]]) -> list[list[tuple[Box, _Run]]]:
+    """A line's runs, sorted along it, split where one starts over :data:`_CELL_GAP_EM` ems past all before it.
+
+    The em is the larger font of the run and the one before it.
+    """
+    groups = [[ordered[0]]]
+    reach = ordered[0][0][2]
+    for (_, previous), item in zip(ordered, ordered[1:]):
+        box, run = item
+        em = max(abs(previous.piece.span.font_size_pt), abs(run.piece.span.font_size_pt))
+        if box[0] - reach > _CELL_GAP_EM * em:
+            groups.append([item])
+        else:
+            groups[-1].append(item)
+        reach = max(reach, box[2])
+    return groups
+
+
+def _text_cell(group: list[tuple[Box, _Run]]) -> TextCell:
+    """One cell's TextCell: its runs (sorted along the line) joined, boxed and kept as char ranges."""
+    runs = [run for _, run in group]
+    return TextCell(
+        text=_line_text(group),
+        bbox=_bbox(union_box(tuple(_run_box(run) for run in runs))),
+        pieces=tuple(
+            SpanPiece(span=run.piece.span, start=run.start, end=run.end, hidden_reasons=run.piece.hidden_reasons)
+            for run in runs
+        ),
+    )
