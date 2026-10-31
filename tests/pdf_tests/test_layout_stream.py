@@ -661,14 +661,66 @@ class TestTextBlocks:
         "marked",
         [
             pytest.param(("• first", "• second"), id="bullets"),
+            pytest.param(("» first", "» second"), id="guillemets"),
             pytest.param(("1. first", "2. second"), id="numbers"),
             pytest.param(("a) first", "b) second"), id="letters"),
+            pytest.param(("(a) first", "(b) second"), id="bracketed-letters"),
+            pytest.param(("I Battle. first", "II Ambush. second"), id="bare-roman-before-a-capital"),
         ],
     )
     def test_a_line_starting_with_a_list_marker_starts_a_paragraph(self, tmp_path, marked):
         items = column(("Intro text", *marked), 72.0, 100.0)
 
         assert block_texts(read_blocks(tmp_path, *items)) == ["Intro text", *marked]
+
+    @pytest.mark.parametrize(
+        "numbered",
+        [
+            pytest.param(("1.1.1 Precedence. first", "1.1.2 Cannot. second"), id="rule-numbers"),
+            pytest.param(("A.5.1 Choose. first", "G.24 Remove. second"), id="appendix-numbers"),
+        ],
+    )
+    def test_a_line_starting_with_a_section_number_starts_a_paragraph(self, tmp_path, numbered):
+        items = column(("Intro text", *numbered), 72.0, 100.0)
+
+        assert block_texts(read_blocks(tmp_path, *items)) == ["Intro text", *numbered]
+
+    @pytest.mark.parametrize(
+        "second",
+        [
+            # v4's marker took a bare number for one: Root's Law wraps "... take" / "3 quest cards ..." (p. 10).
+            pytest.param("3 quest cards, and place them face up near you.", id="bare-number"),
+            pytest.param("2024. The rules were revised for every game.", id="year"),
+            pytest.param("-5 °C is the lowest rated temperature.", id="minus-sign"),
+            pytest.param("I think the rule is clear.", id="pronoun"),
+            pytest.param("CIVIL ENGINEERING TEXTS ARE PROSE TOO.", id="roman-letters-of-a-word"),
+        ],
+    )
+    def test_a_line_starting_with_no_marker_continues_its_paragraph(self, tmp_path, second):
+        items = column(("Each player draws a hand and takes", second), 72.0, 100.0)
+
+        assert block_texts(read_blocks(tmp_path, *items)) == [f"Each player draws a hand and takes {second}"]
+
+    @pytest.mark.parametrize(
+        "fonts",
+        [
+            pytest.param(("Helvetica-Bold", "Helvetica"), id="bold-then-regular"),
+            pytest.param(("Helvetica", "Helvetica-Bold"), id="regular-then-bold"),
+        ],
+    )
+    def test_a_line_whose_boldness_differs_from_the_last_starts_a_paragraph(self, tmp_path, fonts):
+        # v5 adds this to v4's merge: a bold heading set at the body's size, directly over it, stays its own block.
+        items = (
+            TextRun("Overview", 72.0, 100.0, font=fonts[0]),
+            TextRun("The woodland is vast.", 72.0, 114.0, font=fonts[1]),
+        )
+
+        assert block_texts(read_blocks(tmp_path, *items)) == ["Overview", "The woodland is vast."]
+
+    def test_lines_that_are_all_bold_merge_as_any_others(self, tmp_path):
+        items = column(("A bold paragraph", "set over two lines"), 72.0, 100.0, font="Helvetica-Bold")
+
+        assert block_texts(read_blocks(tmp_path, *items)) == ["A bold paragraph set over two lines"]
 
     def test_lines_without_horizontal_overlap_stay_apart(self, tmp_path):
         items = (TextRun("left", 72.0, 100.0), TextRun("right", 300.0, 114.0))

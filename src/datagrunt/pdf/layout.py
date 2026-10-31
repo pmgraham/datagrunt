@@ -19,7 +19,11 @@ lattice tables did not use: :func:`text_lines` reads it as lines
 (:class:`TextLine`) of cells (:class:`TextCell`), each keeping the char
 ranges it reads; :func:`text_blocks` reads it in reading order, as
 paragraphs (:class:`TextBlock`), by v4's XY-cut and line merge, ported
-(v5 imports no v4 code). Hidden text is laid out apart (A4b group 3).
+(v5 imports no v4 code); :func:`classify_blocks` reads the blocks as
+headings, key-value pairs, lists and paragraphs (:class:`StreamHeading`,
+:class:`StreamKeyValue`, :class:`StreamList`, :class:`StreamParagraph`),
+each keeping the char ranges it reads. Hidden text is laid out apart
+(A4b group 3).
 
 Known limitations (each a fact this pure pass cannot see):
 
@@ -38,6 +42,7 @@ import re
 from bisect import bisect_left, bisect_right, insort
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from fractions import Fraction
 from itertools import groupby
 from typing import NamedTuple
 
@@ -51,9 +56,15 @@ __all__ = [
     "LatticeCell",
     "LatticeResult",
     "LatticeTable",
+    "StreamHeading",
+    "StreamKeyValue",
+    "StreamList",
+    "StreamListItem",
+    "StreamParagraph",
     "TextBlock",
     "TextCell",
     "TextLine",
+    "classify_blocks",
     "find_lattice_tables",
     "text_blocks",
     "text_lines",
@@ -112,10 +123,20 @@ _SPAN_REACH_PT = 5.0
 _SPAN_HEIGHT_SHARE = 0.8
 
 # v4's paragraph merge (text_block_builder.TextBlockBuilder._merge_lines), ported in _paragraphs. A line
-# starting with one of v4's list markers (text_block_builder.LIST_MARKER_REGEX) starts a paragraph.
+# starting with a list marker or a section number starts a paragraph (v4's LIST_MARKER_REGEX, revised: see
+# _starts_paragraph). Unordered markers: the spec's bullet, hyphen and asterisk, the » Root's Learn to Play
+# bullets with, and Unicode's bullet glyphs; a hyphen or asterisk only before whitespace.
+_BULLETS = "•‣⁃◦∙▪●»"
+# An ordinal: a number of up to 3 digits, a letter, or a Roman numeral of 2 to 5 of i, v and x.
+_ORDINAL = r"(?:\d{1,3}|[A-Za-z]|[ivx]{2,5}|[IVX]{2,5})"
+# Ordered markers: an ordinal before "." or ")", or in brackets; or a bare upper-case Roman numeral before a
+# capital (Root's Law: "I  Battle."). Each before whitespace or the end of the text.
 _LIST_MARKER = re.compile(
-    r"^([•\-\*]|\d+(\.\d+)*\.?|[IVXLCDM]{2,}|[IVXLCDM]\.|[IVXLCDM]\s+[A-Z]|[a-zA-Z]\.|[a-zA-Z]\))(\s|$)"
+    rf"(?P<bullet>[{_BULLETS}]|[-*](?=\s))"
+    rf"|(?P<ordinal>\({_ORDINAL}\)|{_ORDINAL}[.)]|[IVX]{{1,5}}(?=\s+[A-Z]))(?=\s|$)"
 )
+# A section number: numbers joined by dots, or a letter and numbers ("1.1.1", "A.5.1", "G.24").
+_SECTION_NUMBER = re.compile(r"(?:\d+|[A-Z])(?:\.\d+)+\.?(?=\s|$)")
 # A paragraph's lines differ from its first line's font size by less than this ...
 _SAME_SIZE_PT = 0.6
 # ... and each starts at most this many ems (of that size, at least 1 pt) below the one before.
@@ -930,13 +951,17 @@ class TextCell:
 
     def __post_init__(self) -> None:
         non_blank_str("text", self.text)
-        _check_bbox("bbox", self.bbox)
-        typed_tuple("pieces", self.pieces, SpanPiece)
-        if not self.pieces:
-            raise ValueError("pieces must hold at least one piece")
-        for index, item in enumerate(self.pieces):
-            if _outside(item.bbox, self.bbox):
-                raise ValueError(f"pieces[{index}] must lie within the bbox, got {item.bbox} in {self.bbox}")
+        _check_sources(_check_bbox("bbox", self.bbox), self.pieces)
+
+
+def _check_sources(bbox: BBox, pieces: object) -> None:
+    """Require ``pieces`` to be a non-empty tuple of SpanPiece, each within ``bbox``."""
+    checked = typed_tuple("pieces", pieces, SpanPiece)
+    if not checked:
+        raise ValueError("pieces must hold at least one piece")
+    for index, item in enumerate(checked):
+        if _outside(item.bbox, bbox):
+            raise ValueError(f"pieces[{index}] must lie within the bbox, got {item.bbox} in {bbox}")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1453,21 +1478,355 @@ def _paragraphs(lines: list[TextLine]) -> list[TextBlock]:
 def _continues(group: list[TextLine], extent: tuple[float, float], line: TextLine, box: Box) -> bool:
     """True if ``line`` (``box`` in its own frame) continues the paragraph ``group`` (v4's ``_should_merge``).
 
-    v4's rule: the line does not start with a list marker; its font size
-    is within :data:`_SAME_SIZE_PT` of the paragraph's first line; it
-    starts at most :data:`_PARAGRAPH_GAP_EM` ems below the last line; it
-    overlaps the paragraph's extent across. v5 adds: the same turn, the
-    geometry read in its frame. v4 asked a gap of at least 0: its object
-    boxes were tight, but pdfium's char boxes run ascent to descent, so
-    lines set solid overlap; v5 asks the line to start below the last
-    line's top instead. Sizes are to 0.1 pt and their difference is
-    rounded so, so float error cannot move it across the threshold.
+    v4's rule: the line does not start a paragraph by its text
+    (:func:`_starts_paragraph`); its font size is within
+    :data:`_SAME_SIZE_PT` of the paragraph's first line; it starts at most
+    :data:`_PARAGRAPH_GAP_EM` ems below the last line; it overlaps the
+    paragraph's extent across. v5 adds: the same turn, the geometry read in
+    its frame; the same boldness as the last line (:attr:`TextLine.is_bold`),
+    so a bold heading set at the body's size, directly over it, stays a
+    block of its own (on the corpus this splits 18 blocks, each a bold
+    question, heading or label from the text under it). v4 asked a gap of
+    at least 0: its object boxes were tight, but pdfium's char boxes run
+    ascent to descent, so lines set solid overlap; v5 asks the line to
+    start below the last line's top instead. Sizes are to 0.1 pt and their
+    difference is rounded so, so float error cannot move it across the
+    threshold.
     """
     first, last = group[0], group[-1]
-    if line.turn != first.turn or _LIST_MARKER.match(line.text.lstrip()):
+    if line.turn != first.turn or line.is_bold != last.is_bold or _starts_paragraph(line.text.lstrip()):
         return False
     if round(abs(line.font_size_pt - first.font_size_pt), 1) >= _SAME_SIZE_PT:
         return False
     _, last_top, _, last_bottom = _turned(_plain(last.bbox), line.turn)
     below = last_top < box[1] and box[1] - last_bottom <= _PARAGRAPH_GAP_EM * max(first.font_size_pt, 1.0)
     return below and box[0] <= extent[1] and box[2] >= extent[0]
+
+
+def _starts_paragraph(text: str) -> bool:
+    """True if ``text`` starts with a list marker or a section number, so its line starts a paragraph.
+
+    v4's markers (``text_block_builder.LIST_MARKER_REGEX``), revised:
+
+    - A bare number is no marker (v4's was): Root's Law wraps lines
+      before "3 quest cards", "20 warriors" and "1 card"; only "1." or
+      "1)" mark items. A number of 4 digits or more is none either.
+    - Roman numerals are i, v and x only, and a bare upper-case one must
+      precede a capital ("I  Battle." in Root's Law), so words such as
+      "CIVIL" or "MIX" are none (v4 took any run of I, V, X, L, C, D, M).
+    - Added: bracketed ordinals ("(a)", "(iv)"; the spec's), Unicode's
+      bullet glyphs, and » (Root's Learn to Play bullets with it), the
+      bullets also before no space; letter-led section numbers
+      ("A.5.1", Root's Law's appendices).
+    """
+    return _LIST_MARKER.match(text) is not None or _SECTION_NUMBER.match(text) is not None
+
+
+# Classification (spec §3.3 step 3, Pass B).
+
+# A heading's size is at least this share of the page's body size (spec) ...
+_HEADING_RATIO = Fraction(115, 100)
+# ... and its text is at most this many chars: corpus headings run to 49; text set as large but longer was always
+# prose (68 to 581 chars).
+_HEADING_MAX_CHARS = 60
+# Levels run from 1 (the page's largest heading size) to this.
+_MAX_LEVEL = 6
+# A key is at most this many chars (spec) and holds none of these (sentence-ending punctuation).
+_MAX_KEY_CHARS = 40
+_SENTENCE_END = frozenset(".!?")
+# A key ends at the first colon before whitespace or the end of the line: "10:30" or "https://" holds none.
+_KEY_END = re.compile(r":(?=\s|$)")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _StreamText:
+    """Fields shared by the classified text items: their box and the char ranges they read.
+
+    Attributes:
+        bbox: The union of the item's lines' boxes on the displayed page.
+        pieces: The char ranges it reads, in reading order: every char of
+            its lines once, markers and separators included (Pass C).
+    """
+
+    bbox: BBox
+    pieces: tuple[SpanPiece, ...]
+
+    def __post_init__(self) -> None:
+        _check_sources(_check_bbox("bbox", self.bbox), self.pieces)
+        self._validate_fields()
+
+    def _validate_fields(self) -> None:
+        """Validate the subclass's own fields (A1's ``_Element`` hook)."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class StreamHeading(_StreamText):
+    """A heading of the stream text, ``level`` 1-6: A1's ``Heading`` before its id and scope."""
+
+    text: str
+    level: int
+
+    def _validate_fields(self) -> None:
+        non_blank_str("text", self.text)
+        if int_at_least("level", self.level, 1) > _MAX_LEVEL:
+            raise ValueError(f"level must be <= {_MAX_LEVEL}, got {self.level}")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class StreamParagraph(_StreamText):
+    """A paragraph of the stream text: A1's ``Paragraph`` before its id."""
+
+    text: str
+
+    def _validate_fields(self) -> None:
+        non_blank_str("text", self.text)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class StreamKeyValue(_StreamText):
+    """A ``Key: Value`` pair of the stream text: A1's ``KeyValue`` before its id.
+
+    The colon after the key is in neither field (it is in ``pieces``);
+    ``value`` may be empty.
+    """
+
+    key: str
+    value: str
+
+    def _validate_fields(self) -> None:
+        non_blank_str("key", self.key)
+        if not isinstance(self.value, str):
+            raise TypeError(f"value must be a str, got {self.value!r} ({type(self.value).__name__})")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class StreamListItem(_StreamText):
+    """One item of a stream list: its marker as written ("•", "1.", "(a)") and its text after it."""
+
+    marker: str
+    text: str
+
+    def _validate_fields(self) -> None:
+        non_blank_str("marker", self.marker)
+        non_blank_str("text", self.text)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class StreamList:
+    """A list of the stream text: A1's ``BulletList`` before its id.
+
+    Attributes:
+        items: Its items in reading order, one per marker.
+        ordered: True if its markers are ordinals ("1.", "(a)", "IV."),
+            False if bullets.
+        bbox: The union of its items' boxes on the displayed page.
+    """
+
+    items: tuple[StreamListItem, ...]
+    ordered: bool
+    bbox: BBox
+
+    def __post_init__(self) -> None:
+        typed_tuple("items", self.items, StreamListItem)
+        if not self.items:
+            raise ValueError("items must hold at least one item")
+        strict_bool("ordered", self.ordered)
+        _check_bbox("bbox", self.bbox)
+        for index, item in enumerate(self.items):
+            if _outside(_plain(item.bbox), self.bbox):
+                raise ValueError(f"items[{index}].bbox must lie within the bbox, got {item.bbox} in {self.bbox}")
+
+    @property
+    def pieces(self) -> tuple[SpanPiece, ...]:
+        """Its items' pieces, in order."""
+        return tuple(piece for item in self.items for piece in item.pieces)
+
+
+StreamItem = StreamHeading | StreamParagraph | StreamKeyValue | StreamList
+
+
+def classify_blocks(blocks: tuple[TextBlock, ...]) -> tuple[StreamItem, ...]:
+    """The page's stream blocks (:func:`text_blocks`, in reading order) as headings, pairs, lists and paragraphs.
+
+    Spec §3.3 step 3, Pass B; each block is, by the first rule it meets:
+
+    1. A heading (:func:`_is_heading`): its first line's size is at least
+       :data:`_HEADING_RATIO` times the page's body size
+       (:func:`_body_size`), or it is one bold line; either way its text
+       is at most :data:`_HEADING_MAX_CHARS` chars, does not end with a
+       full stop and does not start with a bullet. Levels rank the page's
+       heading sizes, largest first, from 1 to :data:`_MAX_LEVEL`.
+    2. A list item: its text starts with a list marker
+       (:data:`_LIST_MARKER`) and holds text after it; its continuation
+       lines are the block's other lines (the merge starts a block at each
+       marker). Neighbouring items, all bulleted or all numbered, are one
+       list.
+    3. Key-value pairs (:func:`_pairs_and_paragraphs`): its first line is
+       ``Key: Value``, the key at most :data:`_MAX_KEY_CHARS` chars with no
+       sentence-ending punctuation; each such line starts a pair, the
+       lines after it continue its value while they wrap, and a paragraph
+       then runs to the block's end.
+    4. Else a paragraph.
+
+    Items keep their blocks' order and every char of them once, in their
+    ``pieces``. O(c + s log s) for c chars of s distinct sizes.
+
+    Raises:
+        TypeError: If ``blocks`` is not a tuple of TextBlock.
+    """
+    typed_tuple("blocks", blocks, TextBlock)
+    body = _body_size(blocks)
+    headings = [_is_heading(found, body) for found in blocks]
+    levels = _heading_levels(_tenths(found.lines[0].font_size_pt) for found, is_one in zip(blocks, headings) if is_one)
+    items: list[StreamItem] = []
+    pending: list[tuple[StreamListItem, bool]] = []
+    for found, is_heading in zip(blocks, headings):
+        entry = None if is_heading else _list_item(found)
+        if pending and (entry is None or entry[1] != pending[0][1]):
+            items.append(_stream_list(pending))
+            pending = []
+        if entry is not None:
+            pending.append(entry)
+        elif is_heading:
+            level = levels[_tenths(found.lines[0].font_size_pt)]
+            items.append(
+                StreamHeading(text=found.text, level=level, bbox=found.bbox, pieces=_lines_pieces(found.lines))
+            )
+        else:
+            items.extend(_pairs_and_paragraphs(found))
+    if pending:
+        items.append(_stream_list(pending))
+    return tuple(items)
+
+
+def _tenths(size: float) -> int:
+    """A font size (to 0.1 pt, as lines hold it) in tenths of a point: exact for comparing."""
+    return round(size * 10)
+
+
+def _body_size(blocks: tuple[TextBlock, ...]) -> int:
+    """The page's body size in tenths: the upper median of its lines' sizes, each weighed by its non-blank chars.
+
+    v4's median (``page_median_size``: the upper middle, not a mean),
+    weighed by chars so a page's many short headings or labels do not move
+    it. 0 for no blocks.
+    """
+    weights: dict[int, int] = {}
+    for found in blocks:
+        for item in found.lines:
+            size = _tenths(item.font_size_pt)
+            weights[size] = weights.get(size, 0) + sum(1 for char in item.text if not char.isspace())
+    middle, seen = sum(weights.values()) // 2, 0
+    for size in sorted(weights):
+        seen += weights[size]
+        if seen > middle:
+            return size
+    return 0
+
+
+def _is_heading(found: TextBlock, body: int) -> bool:
+    """True if the block is a heading (:func:`classify_blocks`, rule 1) on a page of ``body`` size (tenths)."""
+    text = found.text.strip()
+    marker = _LIST_MARKER.match(text)
+    if len(text) > _HEADING_MAX_CHARS or text.endswith(".") or (marker is not None and marker["bullet"]):
+        return False
+    first = found.lines[0]
+    if Fraction(_tenths(first.font_size_pt), body) >= _HEADING_RATIO:
+        return True
+    return len(found.lines) == 1 and first.is_bold
+
+
+def _heading_levels(sizes: Iterable[int]) -> dict[int, int]:
+    """Each heading size's level: its rank among the distinct sizes, largest first, at most :data:`_MAX_LEVEL`."""
+    return {size: min(rank, _MAX_LEVEL) for rank, size in enumerate(sorted(set(sizes), reverse=True), 1)}
+
+
+def _lines_pieces(lines: Iterable[TextLine]) -> tuple[SpanPiece, ...]:
+    """The char ranges of ``lines``, in order."""
+    return tuple(piece for item in lines for found in item.cells for piece in found.pieces)
+
+
+def _list_item(found: TextBlock) -> tuple[StreamListItem, bool] | None:
+    """The block as a list item and whether it is ordered, or None if it starts with no marker or holds nothing more."""
+    text = found.text.lstrip()
+    marker = _LIST_MARKER.match(text)
+    if marker is None or not text[marker.end() :].strip():
+        return None
+    item = StreamListItem(
+        marker=marker[0], text=text[marker.end() :].strip(), bbox=found.bbox, pieces=_lines_pieces(found.lines)
+    )
+    return item, marker["ordinal"] is not None
+
+
+def _stream_list(entries: list[tuple[StreamListItem, bool]]) -> StreamList:
+    """One list of neighbouring items, all bulleted or all numbered."""
+    items = tuple(item for item, _ in entries)
+    bbox = _bbox(union_box(tuple(_plain(item.bbox) for item in items)))
+    return StreamList(items=items, ordered=entries[0][1], bbox=bbox)
+
+
+def _key_value(text: str) -> tuple[str, str] | None:
+    """``(key, value)`` of a ``Key: Value`` line, or None (:func:`classify_blocks`, rule 3)."""
+    end = _KEY_END.search(text)
+    if end is None:
+        return None
+    key = text[: end.start()].strip()
+    if not key or len(key) > _MAX_KEY_CHARS or not _SENTENCE_END.isdisjoint(key):
+        return None
+    return key, text[end.end() :].strip()
+
+
+def _pairs_and_paragraphs(found: TextBlock) -> list[StreamKeyValue | StreamParagraph]:
+    """The block as key-value pairs and paragraphs (:func:`classify_blocks`, rules 3 and 4).
+
+    A ``Key: Value`` line starts a pair; a line after it continues its
+    value only if that line wrapped (:func:`_wrapped`), else it starts a
+    paragraph. A paragraph runs to the block's end, so a colon later in a
+    paragraph makes no pair, and a block whose first line is no pair is
+    one paragraph. On the corpus datasheets, a paragraph set close under
+    "Category: Fastener" merges into its block, though that line ends
+    405 pt short of the column.
+    """
+    right = max(_turned(_plain(item.bbox), item.turn)[2] for item in found.lines)
+    groups: list[tuple[tuple[str, str] | None, list[TextLine]]] = []
+    for item in found.lines:
+        parsed = _key_value(item.text)
+        if groups and (groups[-1][0] is None or (parsed is None and _wrapped(groups[-1][1][-1], item, right))):
+            groups[-1][1].append(item)
+        else:
+            groups.append((parsed, [item]))
+    return [_pair_or_paragraph(parsed, lines) for parsed, lines in groups]
+
+
+def _wrapped(before: TextLine, after: TextLine, right: float) -> bool:
+    """True if ``before`` wrapped onto ``after``: ``after``'s first word would not fit between its end and ``right``.
+
+    Read along the lines (their own frame), ``right`` the block's end.
+    """
+    return right - _turned(_plain(before.bbox), before.turn)[2] < _first_word_length(after)
+
+
+def _first_word_length(found: TextLine) -> float:
+    """How far the line's first word runs along it: its chars before the first whitespace after it starts."""
+    boxes: list[Box] = []
+    for piece in found.cells[0].pieces:
+        for at in range(piece.start, piece.end):
+            if not piece.span.text[at].isspace():
+                boxes.append(_turned(piece.span.char_boxes[at], found.turn))
+            elif boxes:
+                return _length(boxes)
+    return _length(boxes)
+
+
+def _length(boxes: list[Box]) -> float:
+    """How far ``boxes`` run across: from the first one's start to the furthest end."""
+    return max(item[2] for item in boxes) - min(item[0] for item in boxes)
+
+
+def _pair_or_paragraph(parsed: tuple[str, str] | None, lines: list[TextLine]) -> StreamKeyValue | StreamParagraph:
+    """A pair over ``lines`` (``parsed`` from the first: key, then value and the other lines), or a paragraph."""
+    bbox = _bbox(union_box(tuple(_plain(item.bbox) for item in lines)))
+    if parsed is None:
+        return StreamParagraph(text=" ".join(item.text for item in lines), bbox=bbox, pieces=_lines_pieces(lines))
+    value = " ".join(part for part in (parsed[1], *(item.text.strip() for item in lines[1:])) if part)
+    return StreamKeyValue(key=parsed[0], value=value, bbox=bbox, pieces=_lines_pieces(lines))

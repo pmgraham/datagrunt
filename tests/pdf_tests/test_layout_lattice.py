@@ -97,12 +97,16 @@ class TestModuleImports:
 
         names = {"LatticeCell", "LatticeTable", "LatticeResult", "find_lattice_tables"}
         names |= {"TextBlock", "TextCell", "TextLine", "text_blocks", "text_lines"}
+        names |= {"StreamHeading", "StreamKeyValue", "StreamList", "StreamListItem", "StreamParagraph"}
+        names |= {"classify_blocks"}
         for package in (datagrunt, datagrunt.pdf):
             assert not names & set(dir(package))
 
     def test_names_its_public_api(self):
-        expected = ["LatticeCell", "LatticeResult", "LatticeTable", "TextBlock", "TextCell", "TextLine"]
-        expected += ["find_lattice_tables", "text_blocks", "text_lines"]
+        expected = ["LatticeCell", "LatticeResult", "LatticeTable"]
+        expected += ["StreamHeading", "StreamKeyValue", "StreamList", "StreamListItem", "StreamParagraph"]
+        expected += ["TextBlock", "TextCell", "TextLine"]
+        expected += ["classify_blocks", "find_lattice_tables", "text_blocks", "text_lines"]
 
         assert layout.__all__ == expected
 
