@@ -87,7 +87,7 @@ def raw_page(*spans, images=(), segments: int = 0, rotation: int = 0, dropped: i
         char_count=sum(textpage_chars(span.text) for span in spans),
         generated_count=0,
         ownerless_count=0,
-        unicode_map_error_count=0,
+        unicode_map_error_count=sum(len(span.map_errors) for span in spans),
         skipped_nonfinite_objects=0,
         dropped_text_objects=dropped,
         empty_text_objects=0,
@@ -313,6 +313,12 @@ class TestCharValidity:
 
         assert quality.valid_char_ratio == pytest.approx(4 / 8)
 
+    def test_a_map_error_is_invalid_whatever_it_reads_as(self):
+        # pdfium reads a code it cannot map as the raw code: here "\x03" and "B" (U+0042).
+        quality = assess(text_span("A\x03Bc", map_errors=(1, 2))).quality
+
+        assert quality.valid_char_ratio == pytest.approx(2 / 4)
+
 
 class TestPageQuality:
     """The PageQuality assembled from the page's raw facts and its pieces."""
@@ -396,6 +402,12 @@ class TestRoutingCount:
     @pytest.mark.parametrize("invalid", ["\ufffd", "\ue000", "\u0378", "\ud835", "\udc00"])
     def test_invalid_chars_do_not_count(self, invalid):
         assert assess(letters(19), text_span(invalid * 30, y=120.0)).route == "vision"
+
+    def test_map_errors_do_not_count(self):
+        unmapped = letters(30, y=120.0, map_errors=tuple(range(30)))
+
+        assert assess(letters(19), unmapped).route == "vision"
+        assert assess(letters(19), letters(30, y=120.0, map_errors=tuple(range(29)))).route == "digital"
 
     def test_the_ratio_is_recorded_but_never_routed_on(self):
         got = assess(letters(20), text_span("\ufffd" * 60, y=120.0), text_span("\ufffd" * 60, y=150.0))
@@ -517,6 +529,16 @@ class TestUnmappedRegions:
             union_box(boxes[3:6]),
             union_box(boxes[8:9]),
         )
+
+    def test_a_run_of_map_errors_is_a_region(self):
+        source = text_span("Ab\x03\x04cd", map_errors=(2, 3))
+
+        assert assess(source).unmapped_regions == (union_box(source.char_boxes[2:4]),)
+
+    def test_map_errors_and_invalid_chars_make_one_run(self):
+        source = text_span("A\x03\ufffd\x05B", map_errors=(1, 3))
+
+        assert assess(source).unmapped_regions == (union_box(source.char_boxes[1:4]),)
 
     def test_regions_follow_piece_order_across_spans(self):
         first, second = text_span("A\ufffdB"), text_span("\ufffdC", y=150.0)
@@ -651,6 +673,19 @@ class TestRegressions:
         )
 
         assert result.unmapped_regions == expected
+
+    def test_a_page_of_codes_with_no_unicode_mapping_is_vision(self, tmp_path):
+        # A subset CID font whose ToUnicode maps none of its codes: pdfium reads each as itself (U+0003 ...).
+        codes = b"".join(b"%04X" % code for code in range(0x03, 0x1C))
+        path = cid_font_page(tmp_path, b"BT /F1 10 Tf 20 150 Td <%s> Tj ET" % codes, bfchar_cmap({b"FFF0": b"0041"}))
+
+        result, raw = assessed(path)
+
+        (span,) = raw.text.spans
+        assert span.text == "".join(chr(code) for code in range(0x03, 0x1C))
+        assert span.map_errors == tuple(range(25))
+        assert (result.route, result.quality.valid_char_ratio) == ("vision", 0.0)
+        assert result.unmapped_regions == (span.bbox,)
 
     def test_searchable_scan_is_hybrid(self, tmp_path):
         text = "Scanned page with its OCR layer"

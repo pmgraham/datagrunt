@@ -69,6 +69,7 @@ def raw_span(text: str = "Abcd", boxes=None, **overrides) -> RawSpan:
         "stroke_rgba": (0, 0, 0, 255),
         "object_index": 0,
         "generated_breaks": (),
+        "map_errors": (),
     }
     return RawSpan(**(fields | overrides))
 

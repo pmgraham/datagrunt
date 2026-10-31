@@ -244,6 +244,7 @@ def raw_span(text: str = "Ab", box=(72.0, 200.0, 72.0, 200.0), **overrides) -> R
         "stroke_rgba": (0, 0, 0, 255),
         "object_index": 1,
         "generated_breaks": (),
+        "map_errors": (),
     }
     return RawSpan(**(fields | overrides))
 

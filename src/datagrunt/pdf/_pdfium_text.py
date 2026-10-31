@@ -21,8 +21,9 @@ Text (#365 T2), pinned by ``tests/pdf_tests/test_pdfium_spans.py``:
   space. pdfium parses forms at most 40 levels deep.
 - A non-BMP char is two textpage chars, a UTF-16 surrogate pair with equal
   boxes. An unmapped char code reads as itself, flagged by
-  ``FPDFText_HasUnicodeMapError``; without a ToUnicode map a 3- or 4-byte
-  CMap code can read beyond U+10FFFF (0x110000, 0xFFFFFFFF).
+  ``FPDFText_HasUnicodeMapError`` (its offset is in ``RawSpan.map_errors``);
+  without a ToUnicode map a 3- or 4-byte CMap code can read beyond U+10FFFF
+  (0x110000, 0xFFFFFFFF).
 - The textpage is not every drawn char: pdfium drops a text object whose
   box is under 0.01 pt wide (``Tf 0``, ``Tz 0``, a tiny size, an object of a
   single space) and a copy of identical text (the same codes at the same
@@ -113,6 +114,14 @@ class RawSpan:
             ``TJ`` gap: ``[(Name) -12000 (Value)] TJ`` is text "NameValue"
             with a break at 4. The generated chars are not inserted into
             ``text``.
+        map_errors: Offsets into ``text``, strictly increasing and each in
+            ``0..len(text) - 1``, of the chars pdfium could not map to
+            Unicode (``FPDFText_HasUnicodeMapError``, or a raw code beyond
+            U+10FFFF, which reads as U+FFFD): each reads as its raw char
+            code, so its text says nothing (A3 counts it invalid). A
+            surrogate pair is one offset if either half is unmapped.
+            ``TextStats.unicode_map_error_count`` counts the same chars in
+            textpage chars.
     """
 
     text: str
@@ -128,10 +137,13 @@ class RawSpan:
     stroke_rgba: tuple[int, int, int, int]
     object_index: int
     generated_breaks: tuple[int, ...]
+    map_errors: tuple[int, ...]
 
     def __post_init__(self) -> None:
         self._check_text_and_boxes()
-        self._check_generated_breaks()
+        last = len(self.text) - 1
+        _check_offsets("generated_breaks", self.generated_breaks, 1, last)
+        _check_offsets("map_errors", self.map_errors, 0, last)
         object.__setattr__(self, "font_size_pt", finite_float("font_size_pt", self.font_size_pt))
         object.__setattr__(self, "em_width_pt", finite_float("em_width_pt", self.em_width_pt, lo=0.0))
         if not isinstance(self.base_font_name, str):
@@ -163,17 +175,17 @@ class RawSpan:
         object.__setattr__(self, "char_boxes", boxes)
         object.__setattr__(self, "bbox", bbox)
 
-    def _check_generated_breaks(self) -> None:
-        breaks = self.generated_breaks
-        if not isinstance(breaks, tuple):
-            raise TypeError(f"generated_breaks must be a tuple, got {type(breaks).__name__}")
-        last = len(self.text) - 1
-        for index, offset in enumerate(breaks):
-            int_at_least(f"generated_breaks[{index}]", offset, 0)
-            if not 1 <= offset <= last:
-                raise ValueError(f"generated_breaks[{index}] must be inside text, in 1..{last}, got {offset}")
-        if any(later <= earlier for earlier, later in zip(breaks, breaks[1:])):
-            raise ValueError(f"generated_breaks must be strictly increasing, got {breaks!r}")
+
+def _check_offsets(name: str, offsets: object, low: int, high: int) -> None:
+    """Require ``offsets`` to be a tuple of strictly increasing ints in ``low..high`` (offsets into a span's text)."""
+    if not isinstance(offsets, tuple):
+        raise TypeError(f"{name} must be a tuple, got {type(offsets).__name__}")
+    for index, offset in enumerate(offsets):
+        int_at_least(f"{name}[{index}]", offset, 0)
+        if not low <= offset <= high:
+            raise ValueError(f"{name}[{index}] must be inside text, in {low}..{high}, got {offset}")
+    if any(later <= earlier for earlier, later in zip(offsets, offsets[1:])):
+        raise ValueError(f"{name} must be strictly increasing, got {offsets!r}")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -197,7 +209,8 @@ class TextStats:
             Unicode (``FPDFText_HasUnicodeMapError``); each reads as its raw
             char code. A raw code beyond U+10FFFF (a 3- or 4-byte CMap code
             with no ToUnicode entry) reads as U+FFFD and counts here once,
-            whether pdfium flags it or not.
+            whether pdfium flags it or not. The span chars they make are
+            each span's ``map_errors`` (one per surrogate pair).
         skipped_nonfinite_objects: Text objects whose chars are in no span
             (and no other count) because pdfium places them at a non-finite
             position or size: a char box, the font size or the em width is
@@ -255,10 +268,16 @@ class PageText:
         typed_tuple("spans", self.spans, RawSpan)
         if not isinstance(self.stats, TextStats):
             raise TypeError(f"stats must be a TextStats, got {type(self.stats).__name__}")
-        span_chars = sum(len(item.text) for item in self.spans)
-        if not span_chars <= self.stats.char_count <= 2 * span_chars:
-            message = f"spans hold {span_chars} chars, which {self.stats.char_count} textpage chars cannot make"
-            raise ValueError(f"{message} (each is 1 textpage char, or 2 for a surrogate pair)")
+        _check_made_of("chars", sum(len(item.text) for item in self.spans), self.stats.char_count, "chars")
+        unmapped = sum(len(item.map_errors) for item in self.spans)
+        _check_made_of("map errors (map_errors)", unmapped, self.stats.unicode_map_error_count, "map errors")
+
+
+def _check_made_of(what: str, span_count: int, textpage_count: int, unit: str) -> None:
+    """Require ``textpage_count`` textpage items to make ``span_count`` span items (1 each, or 2 for a pair)."""
+    if not span_count <= textpage_count <= 2 * span_count:
+        message = f"spans hold {span_count} {what}, which {textpage_count} textpage {unit} cannot make"
+        raise ValueError(f"{message} (each is 1 textpage char, or 2 for a surrogate pair)")
 
 
 class ObjectWalk(NamedTuple):
@@ -510,6 +529,7 @@ class _SpanBuilder:
         self._chars: list[str] = []
         self._boxes: list[Box] = []
         self._breaks: list[int] = []
+        self._errors: list[int] = []
         self._break_pending = False
 
     def mark_inserted(self) -> None:
@@ -538,11 +558,18 @@ class _SpanBuilder:
             high = ord(self._chars[-1])
             self._chars[-1] = chr(0x10000 + ((high - _HIGH_SURROGATES.start) << 10) + (code - _LOW_SURROGATES.start))
             self._boxes[-1] = union_box((self._boxes[-1], char.box))
+            self._mark_unmapped(char, len(self._chars) - 1)
             return
+        self._mark_unmapped(char, len(self._chars))
         # A code beyond Unicode is a raw char code pdfium could not map; U+FFFD
         # keeps its place (and is no surrogate, so it never pairs).
         self._chars.append(chr(code) if code <= _MAX_CODE_POINT else _REPLACEMENT_CHAR)
         self._boxes.append(char.box)
+
+    def _mark_unmapped(self, char: _OwnedChar, offset: int) -> None:
+        """Record span char ``offset`` as a map error if ``char`` (one of its textpage chars) is one; once each."""
+        if _unmapped(char) and (not self._errors or self._errors[-1] != offset):
+            self._errors.append(offset)
 
     def finish(self) -> tuple[RawSpan, ...]:
         """Close the current span and return every span."""
@@ -560,10 +587,16 @@ class _SpanBuilder:
                 char_boxes=boxes,
                 object_index=self._object_indices[self._owner],
                 generated_breaks=tuple(self._breaks),
+                map_errors=tuple(self._errors),
                 **self._styles[self._owner]._asdict(),
             )
         )
-        self._chars, self._boxes, self._breaks = [], [], []
+        self._chars, self._boxes, self._breaks, self._errors = [], [], [], []
+
+
+def _unmapped(char: _OwnedChar) -> bool:
+    """True if pdfium could not map ``char`` to Unicode: flagged, or a code beyond U+10FFFF (it reads as U+FFFD)."""
+    return char.map_error or char.code > _MAX_CODE_POINT
 
 
 def _textpage_flag(result: int, char_index: int, question: str) -> bool:
@@ -642,8 +675,7 @@ def collect_text(textpage: pdfium_c.FPDF_TEXTPAGE, to_display: Callable[[Box], B
             builder.mark_skipped()
         else:
             kept += 1
-            # A code beyond U+10FFFF reads as U+FFFD: a map error, counted once.
-            map_errors += char.map_error or char.code > _MAX_CODE_POINT
+            map_errors += _unmapped(char)
             builder.add(char)
     stats = TextStats(
         char_count=kept,

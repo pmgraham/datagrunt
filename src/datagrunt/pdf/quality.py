@@ -37,10 +37,13 @@ task 2).
 
 :func:`assess_page` measures a page and routes it (#366 task 4):
 
-- A char is valid text unless it is U+FFFD (a code with no Unicode
+- A char is valid text unless pdfium could not map its code to Unicode
+  (``RawSpan.map_errors``: it reads as the raw code, ``\x03`` or ``B``
+  alike, so it says nothing), or it is U+FFFD (a code with no Unicode
   mapping), private use (``Co``), unassigned (``Cn``, by the running
   Python's Unicode database) or a lone surrogate (``Cs``). Marks, format
-  chars (ZWJ, LRM) and control chars are valid: nothing is stripped.
+  chars (ZWJ, LRM) and control chars are otherwise valid: nothing is
+  stripped.
 - ``valid_char_ratio`` is the valid share of every span char, hidden ones
   included. It is recorded, never routed on: a contents page whose dot
   leaders read as U+FFFD keeps its digital text.
@@ -63,6 +66,7 @@ warning.
 """
 
 import unicodedata
+from bisect import bisect_left
 from collections.abc import Iterator
 from dataclasses import dataclass
 from itertools import groupby
@@ -459,16 +463,24 @@ def _recovery_warnings(recovered: RecoveredText | None) -> tuple[str, ...]:
     return (f"{lost} text object(s) that pdfium's textpage drops {missing}",)
 
 
-def _valid(char: str) -> bool:
-    """True unless ``char`` is U+FFFD, private use, unassigned or a lone surrogate."""
+def _valid(span: RawSpan, offset: int) -> bool:
+    """True unless ``span``'s char at ``offset`` is a map error, U+FFFD, private use, unassigned or a lone surrogate.
+
+    O(log map errors): ``map_errors`` is sorted.
+    """
+    errors = span.map_errors
+    at = bisect_left(errors, offset)
+    if at < len(errors) and errors[at] == offset:
+        return False
+    char = span.text[offset]
     return char != _REPLACEMENT_CHAR and unicodedata.category(char) not in _INVALID_CATEGORIES
 
 
 def _quality(page: RawPage, pieces: tuple[SpanPiece, ...]) -> PageQuality:
     """The page's quality signals; every span char, hidden or not, counts toward the ratio."""
-    texts = tuple(span.text for span in page.text.spans)
-    count = sum(len(text) for text in texts)
-    valid = sum(1 for text in texts for char in text if _valid(char))
+    spans = page.text.spans
+    count = sum(len(span.text) for span in spans)
+    valid = sum(1 for span in spans for offset in range(len(span.text)) if _valid(span, offset))
     return PageQuality(
         valid_char_ratio=valid / count if count else None,
         char_count=count,
@@ -482,8 +494,13 @@ def _quality(page: RawPage, pieces: tuple[SpanPiece, ...]) -> PageQuality:
 
 def _text_char_count(pieces: tuple[SpanPiece, ...]) -> int:
     """The chars routing counts: valid, visible (in a piece with no reason) and not whitespace."""
-    visible = (piece.text for piece in pieces if not piece.hidden_reasons)
-    return sum(1 for text in visible for char in text if _valid(char) and not char.isspace())
+    visible = (piece for piece in pieces if not piece.hidden_reasons)
+    return sum(
+        1
+        for piece in visible
+        for offset in range(piece.start, piece.end)
+        if _valid(piece.span, offset) and not piece.span.text[offset].isspace()
+    )
 
 
 def _route(text_chars: int, cover: float, ocr: OcrMode) -> tuple[PageRoute, tuple[str, ...]]:
@@ -506,8 +523,8 @@ def _unmapped_regions(pieces: tuple[SpanPiece, ...]) -> tuple[Box, ...]:
 
 def _invalid_runs(piece: SpanPiece) -> Iterator[Box]:
     """Yield the union box of each maximal run of invalid chars in ``piece``."""
-    text, boxes = piece.span.text, piece.span.char_boxes
-    for invalid, run in groupby(range(piece.start, piece.end), key=lambda offset: not _valid(text[offset])):
+    span, boxes = piece.span, piece.span.char_boxes
+    for invalid, run in groupby(range(piece.start, piece.end), key=lambda offset: not _valid(span, offset)):
         if invalid:
             offsets = tuple(run)
             yield union_box(boxes[offsets[0] : offsets[-1] + 1])

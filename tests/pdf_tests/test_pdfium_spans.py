@@ -95,6 +95,7 @@ def span(**overrides) -> RawSpan:
         "stroke_rgba": (255, 0, 0, 128),
         "object_index": 3,
         "generated_breaks": (),
+        "map_errors": (),
     }
     return RawSpan(**(fields | overrides))
 
@@ -227,11 +228,39 @@ class TestRawSpan:
                 "generated_breaks must be strictly increasing, got (2, 2)",
                 id="breaks-repeated",
             ),
+            pytest.param({"map_errors": [0]}, TypeError, "map_errors must be a tuple, got list", id="errors-list"),
+            pytest.param(
+                {"map_errors": (True,)}, TypeError, "map_errors[0] must be an int, got True (bool)", id="error-bool"
+            ),
+            pytest.param({"map_errors": (-1,)}, ValueError, "map_errors[0] must be >= 0, got -1", id="error-negative"),
+            pytest.param(
+                {"map_errors": (2,)},
+                ValueError,
+                "map_errors[0] must be inside text, in 0..1, got 2",
+                id="error-past-the-end",
+            ),
+            pytest.param(
+                {**FOUR_CHARS, "map_errors": (2, 1)},
+                ValueError,
+                "map_errors must be strictly increasing, got (2, 1)",
+                id="errors-unsorted",
+            ),
+            pytest.param(
+                {**FOUR_CHARS, "map_errors": (1, 1)},
+                ValueError,
+                "map_errors must be strictly increasing, got (1, 1)",
+                id="errors-repeated",
+            ),
         ],
     )
     def test_invalid_field_raises(self, overrides, error, message):
         with pytest.raises(error, match=re.escape(message)):
             span(**overrides)
+
+    def test_map_errors_anywhere_in_the_text_are_kept(self):
+        value = span(**FOUR_CHARS, map_errors=(0, 3))
+
+        assert value.map_errors == (0, 3)
 
     def test_generated_breaks_inside_text_are_kept(self):
         value = span(**FOUR_CHARS, generated_breaks=(1, 3))
@@ -354,11 +383,39 @@ class TestPageText:
                 "spans hold 2 chars, which 5 textpage chars cannot make",
                 id="too-many",
             ),
+            pytest.param(
+                (span(map_errors=(0, 1)),),
+                stats(unicode_map_error_count=1),
+                ValueError,
+                "spans hold 2 map errors (map_errors), which 1 textpage map errors cannot make",
+                id="too-few-map-errors",
+            ),
+            pytest.param(
+                (span(map_errors=(1,)),),
+                stats(unicode_map_error_count=0),
+                ValueError,
+                "spans hold 1 map errors (map_errors), which 0 textpage map errors cannot make",
+                id="map-errors-uncounted",
+            ),
+            pytest.param(
+                (span(),),
+                stats(unicode_map_error_count=2),
+                ValueError,
+                "spans hold 0 map errors (map_errors), which 2 textpage map errors cannot make",
+                id="too-many-map-errors",
+            ),
         ],
     )
     def test_invalid_field_raises(self, spans, page_stats, error, message):
         with pytest.raises(error, match=re.escape(message)):
             PageText(spans=spans, stats=page_stats)
+
+    def test_a_map_error_may_be_a_pair_of_textpage_chars(self):
+        pair = span(text="\U0001d400", bbox=BOX_A, char_boxes=(BOX_A,), map_errors=(0,))
+
+        page = PageText(spans=(pair,), stats=stats(char_count=2, unicode_map_error_count=2))
+
+        assert page.spans == (pair,)
 
 
 class TestSpanGrouping:
@@ -782,6 +839,55 @@ class TestUnicode:
             dropped_text_objects=0,
             empty_text_objects=0,
         )
+
+    def test_each_map_error_is_kept_at_its_offset(self, tmp_path):
+        # 0004 is the one code the ToUnicode map leaves out: pdfium reads it as its raw code, U+0004.
+        result = page_text(open_document(cid_page(tmp_path, b"00020005000400050002")), 0)
+
+        assert [(item.text, item.map_errors) for item in result.spans] == [("A\ud835\x04\ud835A", (2,))]
+
+    def test_mapped_text_has_no_map_errors(self, tmp_path):
+        (got,) = page_text(open_document(cid_page(tmp_path, b"0002000100030002")), 0).spans
+
+        assert got.map_errors == ()
+
+    def test_codes_with_no_unicode_mapping_are_map_errors(self, tmp_path):
+        # No ToUnicode map: each code reads as itself, beyond U+10FFFF as U+FFFD.
+        (got,) = page_text(open_document(wide_code_page(tmp_path, b"01 10FFFF 110000 02 FFFFFFFF 03")), 0).spans
+
+        assert got.map_errors == (0, 1, 2, 3, 4, 5)
+
+    def test_a_pair_of_unmapped_surrogate_codes_is_one_map_error(self, tmp_path):
+        # Read as a UTF-16 pair: one char from two textpage chars, both map errors.
+        result = page_text(open_document(wide_code_page(tmp_path, b"D835 DC00 01")), 0)
+
+        assert [(item.text, item.map_errors) for item in result.spans] == [("\U0001d400\x01", (0, 1))]
+        assert result.stats.unicode_map_error_count == 3
+
+    def test_a_pair_whose_low_half_is_unmapped_is_a_map_error(self, tmp_path):
+        # 0005 maps to a lone high surrogate; DC00 is in no map, so it reads as its raw code, a low one.
+        result = page_text(open_document(cid_page(tmp_path, b"00020005DC00")), 0)
+
+        assert [(item.text, item.map_errors) for item in result.spans] == [("A\U0001d400", (1,))]
+        assert result.stats.unicode_map_error_count == 1
+
+    @pytest.mark.parametrize("first_code,text", [(97, "abab"), (1, "\x01\x02\x01\x02")], ids=["ascii", "low"])
+    def test_a_type3_font_without_to_unicode_reads_its_raw_codes_as_map_errors(self, tmp_path, first_code, text):
+        # Glyph names (/a /b) give no Unicode here: pdfium reads each code as itself, so codes 97 and 98
+        # read "ab" only because they are ASCII's; codes 1 and 2 read U+0001 and U+0002.
+        font = (
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 750 750] /FontMatrix [0.001 0 0 0.001 0 0]"
+            b" /CharProcs << /a 6 0 R /b 6 0 R >> /Encoding << /Type /Encoding /Differences [%d /a /b] >>"
+            b" /FirstChar %d /LastChar %d /Widths [1000 1000] /Resources << >> >>"
+            % ((first_code,) * 2 + (first_code + 1,))
+        )
+        glyph = b"<< /Length 38 >>\nstream\n1000 0 0 0 750 750 d1 0 0 750 750 re f\nendstream"
+        codes = bytes([first_code, first_code + 1]) * 2
+        content = b"BT /F1 12 Tf 20 270 Td <%s> Tj ET" % codes.hex().encode()
+
+        result = page_text(open_document(content_page(tmp_path, content, font=font, extra=(glyph,))), 0)
+
+        assert [(item.text, item.map_errors) for item in result.spans] == [(text, (0, 1, 2, 3))]
 
     def test_a_lone_low_surrogate_is_kept(self, tmp_path):
         result = page_text(open_document(cid_page(tmp_path, b"000200060002")), 0)
