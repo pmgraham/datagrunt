@@ -464,9 +464,15 @@ class TestOcrModes:
 
         assert (got.route, got.warnings) == ("digital", ())
 
-    def test_never_with_enough_text_over_a_scan_is_hybrid(self):
-        # The route rule for 20+ chars does not depend on the mode (#366 task 4 detail).
+    def test_never_with_enough_text_over_a_scan_is_digital(self):
+        # hybrid OCRs the unmapped regions, which "never" rules out: the page
+        # keeps its digital text and is not OCR'd.
         got = assess(letters(20), images=(FULL_BLEED,), ocr="never")
+
+        assert (got.route, got.warnings) == ("digital", ())
+
+    def test_auto_with_enough_text_over_a_scan_is_hybrid(self):
+        got = assess(letters(20), images=(FULL_BLEED,))
 
         assert (got.route, got.warnings) == ("hybrid", ())
 

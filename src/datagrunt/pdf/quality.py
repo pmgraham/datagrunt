@@ -40,8 +40,8 @@ background under the span (#366 task 2).
 - Routing counts the valid, visible (no hidden reason), non-whitespace
   chars. ``ocr="always"`` routes vision. Under 20 routes vision, or digital
   with a warning under ``ocr="never"``. 20 or more on a page whose raster
-  cover is over 50 % routes hybrid (OCR fills the unmapped regions); else
-  digital.
+  cover is over 50 % routes hybrid (OCR fills the unmapped regions), or
+  digital under ``ocr="never"``; else digital.
 - Unmapped regions: the box of each maximal run of invalid chars in a
   visible piece, where OCR (A5) reads what the text layer cannot say.
 """
@@ -71,8 +71,9 @@ __all__ = ["OcrMode", "PageAssessment", "SpanPiece", "assess_page", "classify_sp
 
 OcrMode: TypeAlias = Literal["auto", "always", "never"]
 """The reader's OCR option: ``"auto"`` routes by the page's text,
-``"always"`` sends every page to vision, ``"never"`` keeps a page without
-enough text digital (with a warning) instead of sending it to vision."""
+``"always"`` sends every page to vision, ``"never"`` routes no page to OCR:
+a page without enough text stays digital (with a warning) instead of going
+to vision, and one that would be hybrid stays digital."""
 
 _OCR_MODES: tuple[OcrMode, ...] = get_args(OcrMode)
 
@@ -425,7 +426,8 @@ def _route(text_chars: int, cover: float, ocr: OcrMode) -> tuple[PageRoute, tupl
             count = f"{text_chars} valid, visible, non-whitespace chars (under {_MIN_TEXT_CHARS})"
             return "digital", (f"ocr='never': the page has {count}; it stays digital instead of going to OCR",)
         return "vision", ()
-    return ("hybrid" if cover > _OCR_LAYER_COVER else "digital"), ()
+    # hybrid OCRs the unmapped regions, so "never" keeps such a page digital.
+    return ("hybrid" if cover > _OCR_LAYER_COVER and ocr != "never" else "digital"), ()
 
 
 def _unmapped_regions(pieces: tuple[SpanPiece, ...]) -> tuple[Box, ...]:
