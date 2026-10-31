@@ -12,7 +12,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from datagrunt.pdf._path_segments import RawSegment
+from datagrunt.pdf._path_segments import Box, RawSegment
 from datagrunt.pdf._validate import int_at_least, typed_tuple
 from datagrunt.pdf.elements import BBox
 from datagrunt.pdf.quality import SpanPiece
@@ -21,6 +21,9 @@ __all__ = ["LatticeCell", "LatticeResult", "LatticeTable"]
 
 # Lines this close snap to one position, join end to end, and meet (spec §3.3 Pass A).
 SNAP_PT = 2.0
+
+# A table has at least this many rows and columns of cells (v4's drop_layout_tables minimum).
+_MIN_GRID = 2
 
 # Sweep events at one x: horizontal rules open, then vertical rules query, then horizontal rules close.
 _OPEN, _QUERY, _CLOSE = 0, 1, 2
@@ -295,6 +298,129 @@ def _crossings(horizontal: list[_Line], vertical: list[_Line]) -> Iterator[tuple
             high = bisect_right(active, (line.end + SNAP_PT, len(horizontal)))
             for _, h_index in active[low:high]:
                 yield h_index, index
+
+
+class _Grid(NamedTuple):
+    """The cells a component's rules close.
+
+    Attributes:
+        xs: The component's distinct vertical-rule positions, sorted: the
+            unit columns' boundaries.
+        ys: Its distinct horizontal-rule positions, sorted: the unit rows'
+            boundaries.
+        unit_cells: Each unit's cell (an index into ``boxes``), row-major
+            over ``len(ys) - 1`` rows of ``len(xs) - 1`` units.
+        boxes: Each cell's box, in row-major order of its top-left unit.
+    """
+
+    xs: tuple[float, ...]
+    ys: tuple[float, ...]
+    unit_cells: tuple[int, ...]
+    boxes: tuple[Box, ...]
+
+
+def _grid(horizontal: list[_Line], vertical: list[_Line]) -> _Grid | None:
+    """The cells one component's rules close, or None if they rule no table.
+
+    The component's distinct positions cut its extent into units; a unit
+    edge is present when a rule at its position reaches both its ends
+    within :data:`SNAP_PT`. Units joined across absent internal edges are
+    one cell, so a cell spans rows or columns where rules are missing. An
+    edge on the grid's border may be absent: the border closes the cell.
+    None when a cell is not a rectangle (no row, column and span can hold
+    it), or when the cells' distinct edges leave fewer than two rows or
+    columns (a frame, or one row or column of boxes: v4's
+    ``drop_layout_tables`` minimum); a position that bounds no cell is no
+    grid line. O(X Y + R log X Y) for X vertical and Y horizontal
+    positions and R rules.
+    """
+    xs = tuple(sorted({line.position for line in vertical}))
+    ys = tuple(sorted({line.position for line in horizontal}))
+    if len(xs) <= _MIN_GRID or len(ys) <= _MIN_GRID:
+        return None
+    rows, cols = len(ys) - 1, len(xs) - 1
+    across = _covered_edges(horizontal, ys, xs)
+    down = _covered_edges(vertical, xs, ys)
+    found = _rectangles(_unit_regions(across, down, rows, cols), cols)
+    if found is None:
+        return None
+    spans, unit_cells = found
+    boxes = tuple((xs[left], ys[top], xs[right + 1], ys[bottom + 1]) for top, left, bottom, right in spans)
+    n_rows, n_cols, _ = _grid_positions(boxes)
+    if n_rows < _MIN_GRID or n_cols < _MIN_GRID:
+        return None
+    return _Grid(xs=xs, ys=ys, unit_cells=unit_cells, boxes=boxes)
+
+
+def _covered_edges(lines: list[_Line], positions: tuple[float, ...], along: tuple[float, ...]) -> bytearray:
+    """Which unit edges ``lines`` cover: 1 at ``k * (len(along) - 1) + j`` for edge ``along[j]..along[j + 1]``.
+
+    ``positions`` are the lines' own distinct positions, sorted (``k``
+    indexes them). A line covers an edge when it reaches both ends of it
+    within :data:`SNAP_PT`.
+    """
+    count = len(along) - 1
+    covered = bytearray(len(positions) * count)
+    rank = {position: index for index, position in enumerate(positions)}
+    for line in lines:
+        first = bisect_left(along, line.start - SNAP_PT)
+        last = bisect_right(along, line.end + SNAP_PT) - 1
+        if last > first:
+            offset = rank[line.position] * count
+            covered[offset + first : offset + last] = b"\x01" * (last - first)
+    return covered
+
+
+def _unit_regions(across: bytearray, down: bytearray, rows: int, cols: int) -> list[int]:
+    """Each unit's region (a union-find root), row-major: units join across absent internal edges.
+
+    ``across`` holds the horizontal edges (``rows + 1`` lines of ``cols``),
+    ``down`` the vertical ones (``cols + 1`` lines of ``rows``).
+    """
+    regions = _UnionFind(rows * cols)
+    for row in range(rows):
+        for col in range(cols):
+            unit = row * cols + col
+            if col + 1 < cols and not down[(col + 1) * rows + row]:
+                regions.union(unit, unit + 1)
+            if row + 1 < rows and not across[(row + 1) * cols + col]:
+                regions.union(unit, unit + cols)
+    return [regions.find(unit) for unit in range(rows * cols)]
+
+
+def _rectangles(roots: list[int], cols: int) -> tuple[list[tuple[int, int, int, int]], tuple[int, ...]] | None:
+    """Each region's unit bounds ``(top, left, bottom, right)`` and each unit's region, or None if one is no rectangle.
+
+    Regions are numbered in row-major order of first appearance, which is
+    the order of their top-left units when every region is a rectangle.
+    """
+    order: dict[int, int] = {}
+    bounds: list[list[int]] = []
+    unit_cells = []
+    for unit, root in enumerate(roots):
+        row, col = divmod(unit, cols)
+        index = order.setdefault(root, len(order))
+        if index == len(bounds):
+            bounds.append([row, col, row, col, 0])
+        found = bounds[index]
+        found[1], found[2], found[3] = min(found[1], col), max(found[2], row), max(found[3], col)
+        found[4] += 1
+        unit_cells.append(index)
+    if any(units != (bottom - top + 1) * (right - left + 1) for top, left, bottom, right, units in bounds):
+        return None
+    return [(top, left, bottom, right) for top, left, bottom, right, _ in bounds], tuple(unit_cells)
+
+
+def _grid_positions(boxes: tuple[Box, ...]) -> tuple[int, int, list[tuple[int, int, int, int]]]:
+    """The grid the cell ``boxes`` make: ``(n_rows, n_cols, [(row, col, row_span, col_span), ...])``.
+
+    Every distinct box edge is a grid line (so none bounds no cell); each
+    box's position and spans are the ranks of its edges among them.
+    """
+    columns = {x: index for index, x in enumerate(sorted({x for box in boxes for x in (box[0], box[2])}))}
+    rows = {y: index for index, y in enumerate(sorted({y for box in boxes for y in (box[1], box[3])}))}
+    positions = [(rows[y0], columns[x0], rows[y1] - rows[y0], columns[x1] - columns[x0]) for x0, y0, x1, y1 in boxes]
+    return len(rows) - 1, len(columns) - 1, positions
 
 
 class _UnionFind:

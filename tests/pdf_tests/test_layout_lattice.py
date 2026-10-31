@@ -503,3 +503,123 @@ class TestComponents:
         # One group: every vertical dash, and every horizontal dash but the 76 that cross none.
         assert [(len(hs), len(vs)) for hs, vs in got] == [(7_424, 7_420)]
         assert elapsed < 1.0, f"{elapsed:.2f} s"
+
+
+def grid_of(*segments: RawSegment):
+    """The one component's grid as ``(n_rows, n_cols, [(row, col, row_span, col_span, box), ...])``, or None."""
+    groups = layout._components(*layout._snapped_lines(segments))
+    assert len(groups) == 1, f"expected one component, got {len(groups)}"
+    grid = layout._grid(*groups[0])
+    if grid is None:
+        return None
+    n_rows, n_cols, positions = layout._grid_positions(grid.boxes)
+    return n_rows, n_cols, [(*position, cell_box) for position, cell_box in zip(positions, grid.boxes)]
+
+
+def frame(x0: float, y0: float, x1: float, y1: float) -> list[RawSegment]:
+    """The four sides of a box."""
+    return [h(y0, x0, x1), h(y1, x0, x1), v(x0, y0, y1), v(x1, y0, y1)]
+
+
+class TestGrid:
+    """Grid lines are the component's positions; cells are the units joined across absent internal edges."""
+
+    def test_a_ruled_3_x_3_grid_has_nine_unit_cells(self):
+        got = grid_of(*ruled_grid((10.0, 50.0, 90.0, 130.0), (20.0, 40.0, 60.0, 80.0)))
+
+        expected = [
+            (row, col, 1, 1, (10.0 + 40.0 * col, 20.0 + 20.0 * row, 50.0 + 40.0 * col, 40.0 + 20.0 * row))
+            for row in range(3)
+            for col in range(3)
+        ]
+        assert got == (3, 3, expected)
+
+    def test_a_header_cell_across_the_columns_spans_them(self):
+        # The column rules start below the header row.
+        segments = frame(0.0, 0.0, 90.0, 60.0) + [h(20.0, 0.0, 90.0), h(40.0, 0.0, 90.0)]
+        segments += [v(30.0, 20.0, 60.0), v(60.0, 20.0, 60.0)]
+
+        n_rows, n_cols, cells = grid_of(*segments)
+
+        assert (n_rows, n_cols) == (3, 3)
+        assert cells[0] == (0, 0, 1, 3, (0.0, 0.0, 90.0, 20.0))
+        assert [cell[:4] for cell in cells[1:]] == [(row, col, 1, 1) for row in (1, 2) for col in range(3)]
+
+    def test_a_cell_down_two_rows_spans_them(self):
+        # The second row rule starts right of the first column.
+        segments = frame(0.0, 0.0, 90.0, 60.0) + [h(20.0, 0.0, 90.0), h(40.0, 30.0, 90.0)]
+        segments += [v(30.0, 0.0, 60.0), v(60.0, 0.0, 60.0)]
+
+        n_rows, n_cols, cells = grid_of(*segments)
+
+        assert (n_rows, n_cols) == (3, 3)
+        assert [cell[:4] for cell in cells] == [
+            (0, 0, 1, 1),
+            (0, 1, 1, 1),
+            (0, 2, 1, 1),
+            (1, 0, 2, 1),
+            (1, 1, 1, 1),
+            (1, 2, 1, 1),
+            (2, 1, 1, 1),
+            (2, 2, 1, 1),
+        ]
+        assert cells[3][4] == (0.0, 20.0, 30.0, 60.0)
+
+    @pytest.mark.parametrize(
+        "bottom,split",
+        [pytest.param(58.0, True, id="ends-2-pt-short"), pytest.param(57.75, False, id="ends-over-2-pt-short")],
+    )
+    def test_a_rule_covers_an_edge_to_within_2_pt_of_its_end(self, bottom, split):
+        segments = frame(0.0, 0.0, 90.0, 60.0) + [h(20.0, 0.0, 90.0), h(40.0, 0.0, 90.0)]
+        segments += [v(30.0, 0.0, 60.0), v(60.0, 0.0, bottom)]
+
+        n_rows, n_cols, cells = grid_of(*segments)
+
+        last_row = [cell[:4] for cell in cells if cell[0] == 2]
+        assert last_row == ([(2, 0, 1, 1), (2, 1, 1, 1), (2, 2, 1, 1)] if split else [(2, 0, 1, 1), (2, 1, 1, 2)])
+
+    def test_a_rule_that_bounds_no_cell_adds_no_column(self):
+        # A 12 pt stub hangs from the top rule inside the first cell: it is in the component (it meets the
+        # top rule) but closes no cell, so the grid is the plain 2 x 2 one.
+        plain_grid = frame(0.0, 0.0, 90.0, 60.0) + [h(30.0, 0.0, 90.0), v(45.0, 0.0, 60.0)]
+
+        assert grid_of(*plain_grid, v(20.0, 0.0, 12.0)) == grid_of(*plain_grid)
+
+    @pytest.mark.parametrize(
+        "segments",
+        [
+            pytest.param(frame(0.0, 0.0, 600.0, 780.0), id="page-border-frame"),
+            pytest.param(frame(0.0, 0.0, 90.0, 60.0) + [h(30.0, 0.0, 90.0)], id="two-rows-one-column"),
+            pytest.param(frame(0.0, 0.0, 90.0, 60.0) + [v(30.0, 0.0, 60.0), v(60.0, 0.0, 60.0)], id="one-row"),
+            pytest.param(
+                # The stub makes two columns of units, but it bounds no cell: still one column.
+                frame(0.0, 0.0, 90.0, 60.0) + [h(30.0, 0.0, 90.0), v(45.0, 0.0, 12.0)],
+                id="one-column-and-a-stub",
+            ),
+        ],
+    )
+    def test_fewer_than_2_rows_or_2_columns_is_no_grid(self, segments):
+        # v4's drop_layout_tables minimum, now geometric: a frame or a single row or column of boxes.
+        assert grid_of(*segments) is None
+
+    def test_a_merged_region_that_is_not_a_rectangle_is_no_grid(self):
+        # The inner rules stop at the centre: the three other units join in an L, which no
+        # (row, col, row_span, col_span) cell can hold; the text is left to the stream pass.
+        segments = frame(0.0, 0.0, 100.0, 100.0) + [h(50.0, 0.0, 50.0), v(50.0, 0.0, 50.0)]
+
+        assert grid_of(*segments) is None
+
+    def test_a_box_inside_a_cell_touching_its_border_is_no_grid(self):
+        # The cell around the box is a U, not a rectangle.
+        segments = ruled_grid((0.0, 100.0, 200.0), (0.0, 100.0, 200.0)) + frame(20.0, 0.0, 60.0, 40.0)
+
+        assert grid_of(*segments) is None
+
+
+class TestGridPositions:
+    """Cell boxes rank into grid positions: every distinct box edge is a grid line."""
+
+    def test_positions_rank_the_box_edges(self):
+        boxes = ((0.0, 0.0, 90.0, 20.0), (0.0, 20.0, 30.0, 60.0), (30.0, 20.0, 90.0, 40.0), (30.0, 40.0, 90.0, 60.0))
+
+        assert layout._grid_positions(boxes) == (3, 2, [(0, 0, 1, 2), (1, 0, 2, 1), (1, 1, 1, 1), (2, 1, 1, 1)])
