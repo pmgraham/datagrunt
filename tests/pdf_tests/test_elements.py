@@ -637,6 +637,7 @@ class TestTableColumnNames:
         df = _table(headers=("id", "ID"), rows=(("1", "2"),)).to_dataframe()
         assert df.columns == ["id", "ID_2"]
 
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_many_duplicates_named_in_linear_time(self):
         # A quadratic suffix search takes seconds here; a linear one takes milliseconds.
         count = 10_000

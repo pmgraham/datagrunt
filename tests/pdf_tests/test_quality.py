@@ -660,6 +660,7 @@ class TestRasterCoverFraction:
 
         assert raster_cover_fraction(images, W, H) == pytest.approx(brute_force_cover(boxes, W, H), abs=1e-9)
 
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_twenty_thousand_images_in_under_two_seconds(self):
         rng = random.Random(20_000)
         images = tuple(image(random_box(rng), object_index=index) for index in range(20_000))
