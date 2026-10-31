@@ -28,6 +28,7 @@ from datagrunt.pdf import (
     _pdfium_recover,
     _pdfium_text,
     pdfium_engine,
+    render,
 )
 from datagrunt.pdf.pdfium_engine import DocumentHandle, PageGeometry, open_document, page_geometry, to_display_box
 from pdf_tests.builders import PageSpec, Rect, TextRun, break_page, build_pdf, hand_written_pdf
@@ -106,6 +107,7 @@ ENGINE_MODULES = [
     _path_segments,
     _pdfium_images,
     _image_headers,
+    render,
 ]
 
 
