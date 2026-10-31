@@ -327,6 +327,141 @@ class TestHeaderContext:
         assert document(result).header_context == (kv(1, 0), kv(1, 2, "Due"))
 
 
+def tables(result):
+    """``(element_id, continued_from_id, headers)`` of every table, in document order."""
+    found = [element for item in result.pages for element in item.elements if isinstance(element, Table)]
+    return [(element.element_id, element.continued_from_id, element.headers) for element in found]
+
+
+HEADERS = ("Item", "Qty")
+
+
+class TestSplitTables:
+    """Rule 3: page p's last visible table continues as page p+1's first when their columns line up."""
+
+    def test_a_continuation_without_headers_links_and_takes_the_previous_headers(self):
+        pages = (
+            page(1, heading(1, 0, 1, "Parts"), table(1, 1)),
+            page(2, table(2, 0, headers=(), rows=(("nut", "9"),), centres=(102.0, 297.0)), para(2, 1)),
+        )
+
+        result = apply_scope(pages)
+        continuation = result.pages[1].elements[0]
+
+        assert tables(result) == [("p0001_e001", None, HEADERS), ("p0002_e000", "p0001_e001", HEADERS)]
+        assert continuation.rows == (("nut", "9"),)
+        assert continuation.scope_path == ("Parts",)
+
+    def test_a_repeated_header_row_is_kept(self):
+        pages = (page(1, table(1, 0)), page(2, table(2, 0, headers=HEADERS)))
+
+        assert tables(apply_scope(pages))[1] == ("p0002_e000", "p0001_e000", HEADERS)
+
+    def test_a_continuations_own_headers_are_kept(self):
+        pages = (page(1, table(1, 0)), page(2, table(2, 0, headers=("Part", "Count"))))
+
+        assert tables(apply_scope(pages))[1] == ("p0002_e000", "p0001_e000", ("Part", "Count"))
+
+    def test_two_headerless_parts_link_and_stay_headerless(self):
+        pages = (page(1, table(1, 0, headers=())), page(2, table(2, 0, headers=())))
+
+        assert tables(apply_scope(pages))[1] == ("p0002_e000", "p0001_e000", ())
+
+    @pytest.mark.parametrize(
+        ("centres", "linked"),
+        [
+            ((108.0, 300.0), True),
+            ((92.0, 300.0), True),
+            ((100.0, 308.0), True),
+            ((108.5, 300.0), False),
+            ((91.5, 300.0), False),
+            ((100.0, 308.5), False),
+        ],
+        ids=["+8", "-8", "last+8", "+8.5", "-8.5", "last+8.5"],
+    )
+    def test_every_centre_must_lie_within_8_pt(self, centres, linked):
+        pages = (page(1, table(1, 0)), page(2, table(2, 0, centres=centres)))
+
+        assert tables(apply_scope(pages))[1][1] == ("p0001_e000" if linked else None)
+
+    def test_the_tolerance_is_8_pt(self):
+        assert scope.SPLIT_TABLE_TOLERANCE_PT == 8.0
+
+    def test_a_different_column_count_does_not_link(self):
+        wider = table(2, 0, headers=("Item", "Qty", "Price"), rows=(("nut", "9", "1"),), centres=(100.0, 300.0, 450.0))
+        pages = (page(1, table(1, 0)), page(2, wider))
+
+        assert tables(apply_scope(pages))[1] == ("p0002_e000", None, ("Item", "Qty", "Price"))
+
+    @pytest.mark.parametrize(("first", "second"), [((), (100.0, 300.0)), ((100.0, 300.0), ()), ((), ())])
+    def test_tables_without_centres_never_link(self, first, second):
+        pages = (page(1, table(1, 0, centres=first)), page(2, table(2, 0, headers=(), centres=second)))
+
+        assert tables(apply_scope(pages))[1] == ("p0002_e000", None, ())
+
+    def test_a_running_header_above_the_continuation_blocks_the_link(self):
+        # Known limitation: the continuation must be page p+1's first visible element.
+        pages = (page(1, table(1, 0)), page(2, para(2, 0, "ACME Corp - page 2"), table(2, 1, headers=())))
+
+        assert tables(apply_scope(pages))[1] == ("p0002_e001", None, ())
+
+    def test_a_table_followed_by_text_does_not_continue(self):
+        pages = (page(1, table(1, 0), para(1, 1)), page(2, table(2, 0, headers=())))
+
+        assert tables(apply_scope(pages))[1] == ("p0002_e000", None, ())
+
+    def test_hidden_elements_do_not_block_the_link(self):
+        pages = (
+            page(1, table(1, 0), para(1, 1, hidden=True)),
+            page(2, para(2, 0, hidden=True), table(2, 1, headers=())),
+        )
+
+        assert tables(apply_scope(pages))[1] == ("p0002_e001", "p0001_e000", HEADERS)
+
+    @pytest.mark.parametrize(
+        "pages",
+        [
+            (page(1, para(1, 0), table(1, 1, hidden=True)), page(2, table(2, 0, headers=()))),
+            (page(1, table(1, 0)), page(2, table(2, 0, headers=(), hidden=True), para(2, 1))),
+        ],
+        ids=["hidden-tail", "hidden-head"],
+    )
+    def test_a_hidden_table_never_links(self, pages):
+        assert [link for _, link, _ in tables(apply_scope(pages))] == [None, None]
+
+    def test_a_three_page_chain_links_pairwise(self):
+        pages = (
+            page(1, para(1, 0), table(1, 1)),
+            page(2, table(2, 0, headers=(), rows=(("nut", "9"),))),
+            page(3, table(3, 0, headers=(), rows=(("washer", "2"),), centres=(96.0, 304.0)), para(3, 1)),
+        )
+
+        assert tables(apply_scope(pages)) == [
+            ("p0001_e001", None, HEADERS),
+            ("p0002_e000", "p0001_e001", HEADERS),
+            ("p0003_e000", "p0002_e000", HEADERS),
+        ]
+
+    def test_an_error_page_breaks_the_chain(self):
+        pages = (page(1, table(1, 0)), error_page(2), page(3, table(3, 0, headers=())))
+
+        assert tables(apply_scope(pages))[1] == ("p0003_e000", None, ())
+
+    def test_an_existing_link_is_left_alone(self):
+        source = table(1, 0)
+        later = dataclasses.replace(table(3, 0), continued_from_id=source.element_id)
+        pages = (page(1, source), page(2, para(2, 0)), page(3, later))
+
+        assert tables(apply_scope(pages))[1] == ("p0003_e000", "p0001_e000", HEADERS)
+
+    def test_a_document_accepts_the_links(self):
+        pages = (page(1, table(1, 0)), page(2, table(2, 0, headers=())), page(3, table(3, 0, headers=())))
+
+        links = [item.continued_from_id for item in document(apply_scope(pages)).tables]
+
+        assert links == [None, "p0001_e000", "p0002_e000"]
+
+
 def _mixed_document():
     """Three pages holding every element type, a hidden element, a figure loader, and an error page."""
     figure = Figure(**_ids(2, 1, False), sha256="0" * 64, width_px=8, height_px=8, _loader=lambda: b"png")

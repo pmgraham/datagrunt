@@ -19,17 +19,34 @@ change.
 2. **Header context.** Page 1's visible ``KeyValue`` elements that come, in
    reading order, before its first visible ``Table`` or ``Heading`` (an
    invoice's number and date above its line items, say).
+3. **Split tables.** When page p's last visible element is a ``Table`` and
+   page p+1's first visible element is a ``Table`` with as many columns,
+   each column centre within :data:`SPLIT_TABLE_TOLERANCE_PT` of the
+   other's, the second continues the first: its ``continued_from_id`` names
+   the first, and when it has no headers it takes the first's (headers it
+   has, repeated or its own, are kept). Both tables need
+   ``column_centres``; without them there is no link. Chains link pairwise
+   (p -> p+1 -> p+2). A link already on a table is left alone.
 
 The stack holds at most six entries (levels 1-6 strictly increase down it),
-so the walk is O(total elements).
+so the walk is O(total elements), plus O(columns) per page boundary.
+
+Known limitations:
+
+- A visible element above a continuation (a running page header, say)
+  makes it not page p+1's first visible element, so it does not link.
 """
 
 import dataclasses
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TypeAlias
 
 from datagrunt.pdf._validate import typed_tuple
 from datagrunt.pdf.elements import DocumentElement, Heading, KeyValue, Page, Table
+
+# How far apart, in points, the same column's centres may lie on the two parts of a split table (spec §3.3).
+SPLIT_TABLE_TOLERANCE_PT = 8.0
 
 # The open headings as (level, text), outermost first; levels strictly increase.
 _Stack: TypeAlias = tuple[tuple[int, str], ...]
@@ -54,7 +71,7 @@ class ScopeResult:
 
 
 def apply_scope(pages: tuple[Page, ...]) -> ScopeResult:
-    """Return ``pages`` with every element's ``scope_path`` set, plus the document's header context.
+    """Return ``pages`` scoped (``scope_path``, split-table links), plus the document's header context.
 
     Args:
         pages: The document's pages, numbered 1..N in order.
@@ -64,7 +81,7 @@ def apply_scope(pages: tuple[Page, ...]) -> ScopeResult:
         ValueError: If the pages are not numbered 1..N in order.
     """
     _check_pages(pages)
-    scoped = _scope_pages(pages)
+    scoped = _link_split_tables(_scope_pages(pages))
     return ScopeResult(pages=scoped, header_context=_header_context(scoped))
 
 
@@ -98,6 +115,43 @@ def _step(stack: _Stack, element: DocumentElement) -> tuple[_Stack, tuple[str, .
         return stack, (*path, element.text)
     pushed = (*(entry for entry in stack if entry[0] < element.level), (element.level, element.text))
     return pushed, tuple(text for _, text in pushed)
+
+
+def _link_split_tables(pages: tuple[Page, ...]) -> tuple[Page, ...]:
+    """Return the pages with each split table's continuation linked to its previous part (rule 3).
+
+    Each page is linked against the already-linked previous page, so headers
+    a continuation took pass on down a chain.
+    """
+    linked: list[Page] = []
+    for item in pages:
+        linked.append(_continue_from(linked[-1], item) if linked else item)
+    return tuple(linked)
+
+
+def _continue_from(previous: Page, item: Page) -> Page:
+    """Return ``item`` with its leading table linked to ``previous``'s trailing table if they are one table."""
+    tail = _first_visible(reversed(previous.elements))
+    head = _first_visible(item.elements)
+    if not isinstance(tail, Table) or not isinstance(head, Table) or not _same_columns(tail, head):
+        return item
+    joined = dataclasses.replace(head, continued_from_id=tail.element_id, headers=head.headers or tail.headers)
+    return dataclasses.replace(
+        item, elements=tuple(joined if element is head else element for element in item.elements)
+    )
+
+
+def _first_visible(elements: Iterable[DocumentElement]) -> DocumentElement | None:
+    """Return the first element that is not hidden, or None."""
+    return next((element for element in elements if not element.is_hidden), None)
+
+
+def _same_columns(first: Table, second: Table) -> bool:
+    """True if both tables have column centres, as many columns, and each centre within the tolerance."""
+    if not first.column_centres or len(first.column_centres) != len(second.column_centres):
+        return False
+    pairs = zip(first.column_centres, second.column_centres, strict=True)
+    return all(abs(left - right) <= SPLIT_TABLE_TOLERANCE_PT for left, right in pairs)
 
 
 def _header_context(pages: tuple[Page, ...]) -> tuple[KeyValue, ...]:
