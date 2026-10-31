@@ -635,14 +635,20 @@ class TestTextBlocks:
         assert block_texts(read_blocks(tmp_path, *items)) == ["Lines set solid read as one paragraph."]
 
     @pytest.mark.parametrize(
-        "pitch,texts",
+        "slack,texts",
         [
-            # 11 pt lines 12.28 pt tall: a pitch of 29.7 pt leaves a 17.42 pt gap, 30 pt a 17.72 pt gap (1.6 em: 17.6).
-            pytest.param(29.7, ["above below"], id="gap-under-1.6-em"),
-            pytest.param(30.0, ["above", "below"], id="gap-over-1.6-em"),
+            pytest.param(-0.15, ["above below"], id="gap-under-1.6-em"),
+            pytest.param(0.15, ["above", "below"], id="gap-over-1.6-em"),
         ],
     )
-    def test_a_gap_over_1_6_em_starts_a_paragraph(self, tmp_path, pitch, texts):
+    def test_a_gap_over_1_6_em_starts_a_paragraph(self, tmp_path, slack, texts):
+        # The gap runs from a line's box to the next one's, and pdfium sizes the boxes by the platform's stand-in for
+        # Helvetica (11 pt lines are 12.28 pt tall on macOS), so the line height is read from pdfium in this run.
+        measured = tmp_path / "measured"
+        measured.mkdir()
+        (alone,) = read_lines(measured, *column(("above",), 72.0, 100.0))
+        pitch = alone.bbox.y1 - alone.bbox.y0 + 1.6 * 11.0 + slack
+
         assert block_texts(read_blocks(tmp_path, *column(("above", "below"), 72.0, 100.0, pitch=pitch))) == texts
 
     @pytest.mark.parametrize(
