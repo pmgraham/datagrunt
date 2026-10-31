@@ -54,12 +54,13 @@ def column(count: int, y: float, x: float = 100.0, *, width: float = 12.0, heigh
 
 
 def raw_span(text: str = "Abcd", boxes=None, **overrides) -> RawSpan:
-    """A valid RawSpan of ``text``, one box per char (a row at x=72 by default)."""
+    """A valid RawSpan of ``text``, one box per char (a row at x=72 by default), its tight boxes the same."""
     boxes = row(len(text), 72.0) if boxes is None else boxes
     fields = {
         "text": text,
         "bbox": union(boxes),
         "char_boxes": boxes,
+        "tight_boxes": boxes,
         "font_size_pt": 11.0,
         "em_width_pt": 11.0,
         "base_font_name": "Helvetica",

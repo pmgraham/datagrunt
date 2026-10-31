@@ -32,18 +32,18 @@ a new size) at a place of its own, on a diagonal below the page, so no copy
 lies on another text; a fresh textpage then reads its text. The edits live
 only in that page load: nothing is saved.
 
-Recovered text keeps where the object was: every char box of its span is the
-object's original box (a point for ``Tf 0`` text, a line with no width for
-``Tz 0`` text) and its font size and em width are the original ones. Known
-(A3 review M2): that box is pdfium's object bounds, near the glyphs' ink,
-while a textpage span's char boxes are loose (advance by the font's height),
-so a recovered box and a textpage box of the same text differ in size; and
-(M3) a recovery reads the page's textpage again before moving the dropped
+Recovered text keeps where the object was: every char box of its span, loose
+and tight, is the object's original box (a point for ``Tf 0`` text, a line
+with no width for ``Tz 0`` text) and its font size and em width are the
+original ones. Known (A3 review M2): that box is pdfium's object bounds, the
+glyphs' ink (a textpage span's tight boxes make up the same bounds), while a
+textpage span's loose char boxes are advance by the font's height, so a
+recovered loose box and a textpage loose box of the same text differ in size;
+and (M3) a recovery reads the page's textpage again before moving the dropped
 objects, though the text stage has read it once: a second load and two
-textpages per page that drops text. Its
-hidden reasons (:func:`em_reasons`) are measured on the original object's
-text matrix to page space (``[a b c d]``) and ``Tf`` size
-(:func:`~datagrunt.pdf._hidden_rules.em_size`), the rule
+textpages per page that drops text. Its hidden reasons (:func:`em_reasons`)
+are measured on the original object's text matrix to page space (``[a b c
+d]``) and ``Tf`` size (:func:`~datagrunt.pdf._hidden_rules.em_size`), the rule
 :mod:`datagrunt.pdf.quality` flags a textpage span with:
 
 - ``tiny_font``: the em's height, measured across its baseline, is under
@@ -113,10 +113,10 @@ class RecoveredSpan:
 
     Attributes:
         span: The recovered chars, in textpage order (generated breaks
-            kept), with the object's style. Every char box is the object's
-            original displayed box (a degenerate one for ``Tf 0`` or ``Tz 0``
-            text), and ``font_size_pt`` and ``em_width_pt`` are its
-            original size and em width.
+            kept), with the object's style. Every char box, loose and
+            tight, is the object's original displayed box (a degenerate one
+            for ``Tf 0`` or ``Tz 0`` text), and ``font_size_pt`` and
+            ``em_width_pt`` are its original size and em width.
         hidden_reasons: ``tiny_font`` and / or ``zero_scale`` (see the module
             notes), in A1's canonical order; empty for a drawn copy.
     """
@@ -132,10 +132,11 @@ class RecoveredSpan:
             drawn = f"must be drawn from {RECOVERY_REASONS}, got {self.hidden_reasons}"
             raise ValueError(f"hidden_reasons of a recovered span {drawn}")
         bbox = self.span.bbox
-        for index, box in enumerate(self.span.char_boxes):
-            if box != bbox:
-                where = f"char_boxes[{index}] of a recovered span must be its bbox {bbox!r}"
-                raise ValueError(f"{where} (the text object's box), got {box!r}")
+        for name, boxes in (("char_boxes", self.span.char_boxes), ("tight_boxes", self.span.tight_boxes)):
+            for index, box in enumerate(boxes):
+                if box != bbox:
+                    where = f"{name}[{index}] of a recovered span must be its bbox {bbox!r}"
+                    raise ValueError(f"{where} (the text object's box), got {box!r}")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -453,6 +454,7 @@ def _placed(span: RawSpan, box: Box, target: Target) -> RecoveredSpan:
         span,
         bbox=box,
         char_boxes=(box,) * len(span.text),
+        tight_boxes=(box,) * len(span.text),
         font_size_pt=target.font_size_pt,
         em_width_pt=target.em_width_pt,
     )
