@@ -365,24 +365,28 @@ class TestRecoveredText:
     """RecoveredText pairs the recovered spans with the counts."""
 
     def test_pickle_round_trip(self):
-        original = RecoveredText(spans=(recovered_span(),), stats=stats())
+        original = RecoveredText(page_number=2, spans=(recovered_span(),), stats=stats())
 
         assert pickle.loads(pickle.dumps(original)) == original
 
     def test_fields(self):
-        assert [item.name for item in dataclasses.fields(RecoveredText)] == ["spans", "stats"]
+        assert [item.name for item in dataclasses.fields(RecoveredText)] == ["page_number", "spans", "stats"]
 
     @pytest.mark.parametrize(
-        "spans,counts,error,message",
+        "page_number,spans,counts,error,message",
         [
-            pytest.param([recovered_span()], stats(), TypeError, "spans must be a tuple, got list", id="list"),
-            pytest.param((raw_span(),), stats(), TypeError, "spans[0] must be a RecoveredSpan, got RawSpan", id="item"),
-            pytest.param((), None, TypeError, "stats must be a RecoveryStats, got NoneType", id="stats"),
+            pytest.param(1, [recovered_span()], stats(), TypeError, "spans must be a tuple, got list", id="list"),
+            pytest.param(
+                1, (raw_span(),), stats(), TypeError, "spans[0] must be a RecoveredSpan, got RawSpan", id="item"
+            ),
+            pytest.param(1, (), None, TypeError, "stats must be a RecoveryStats, got NoneType", id="stats"),
+            pytest.param(0, (), stats(), ValueError, "page_number must be >= 1, got 0", id="page-0"),
+            pytest.param(True, (), stats(), TypeError, "page_number must be an int, got True (bool)", id="page-bool"),
         ],
     )
-    def test_invalid_field_raises(self, spans, counts, error, message):
+    def test_invalid_field_raises(self, page_number, spans, counts, error, message):
         with pytest.raises(error, match=re.escape(message)):
-            RecoveredText(spans=spans, stats=counts)
+            RecoveredText(page_number=page_number, spans=spans, stats=counts)
 
 
 class TestDroppedTextObjects:
@@ -494,7 +498,7 @@ class TestEmptyTextObjects:
 
         assert ownerless_counts(path) == (0, 1)
         # Nothing to recover: a caller never loads the page again for it.
-        assert recovered(path) == RecoveredText(spans=(), stats=NO_LOSS)
+        assert recovered(path) == RecoveredText(page_number=1, spans=(), stats=NO_LOSS)
 
     @pytest.mark.parametrize(
         "content,counts",
@@ -524,7 +528,7 @@ class TestEmptyTextObjects:
     def test_a_dropped_object_still_a_point_after_re_layout_is_empty(self, tmp_path):
         got = recovered(pdf(tmp_path, CONTROL + b"BT /F1 0 Tf 72 100 Td ( ) Tj ET"))
 
-        assert got == RecoveredText(spans=(), stats=dataclasses.replace(NO_LOSS, empty_text_objects=1))
+        assert got == RecoveredText(page_number=1, spans=(), stats=dataclasses.replace(NO_LOSS, empty_text_objects=1))
 
     def test_empty_objects_beside_dropped_ones_are_not_recovered(self, tmp_path):
         content = CONTROL + show("single-space", 72, 150) + b" " + show("tf-0", 72, 100)
@@ -743,7 +747,7 @@ class TestRecovery:
         box = (72.0, 200.0, 72.0, 200.0)
         expected = RecoveredSpan(span=raw_span("HIDDEN", box), hidden_reasons=("tiny_font",))
 
-        assert recovered(plain(tmp_path, "tf-0")) == RecoveredText(spans=(expected,), stats=NO_LOSS)
+        assert recovered(plain(tmp_path, "tf-0")) == RecoveredText(page_number=1, spans=(expected,), stats=NO_LOSS)
 
     @pytest.mark.parametrize("where", PLACEMENTS)
     def test_tf_0(self, tmp_path, where):
@@ -797,7 +801,7 @@ class TestRecovery:
     def test_overprint(self, tmp_path, where):
         got = recovered(where.build(tmp_path, "overprint"))
 
-        assert got == RecoveredText(spans=(), stats=dataclasses.replace(NO_LOSS, overprint_duplicates=1))
+        assert got == RecoveredText(page_number=1, spans=(), stats=dataclasses.replace(NO_LOSS, overprint_duplicates=1))
 
     def test_type3_font(self, tmp_path):
         font = (
@@ -825,7 +829,7 @@ class TestRecovery:
     def test_whitespace_only_text_is_counted_not_emitted(self, tmp_path):
         got = recovered(pdf(tmp_path, CONTROL + b"BT /F1 0 Tf 72 100 Td (   ) Tj ET"))
 
-        assert got == RecoveredText(spans=(), stats=dataclasses.replace(NO_LOSS, whitespace_objects=1))
+        assert got == RecoveredText(page_number=1, spans=(), stats=dataclasses.replace(NO_LOSS, whitespace_objects=1))
 
     def test_a_hidden_copy_of_hidden_text_reads_once(self, tmp_path):
         content = CONTROL + b"BT /F1 0 Tf 72 100 Td (Dup) Tj ET BT /F1 0 Tf 72 100 Td (Dup) Tj ET"
@@ -840,7 +844,7 @@ class TestRecovery:
 
         got = recovered(pdf(tmp_path, content))
 
-        assert got == RecoveredText(spans=(), stats=dataclasses.replace(NO_LOSS, overprint_duplicates=1))
+        assert got == RecoveredText(page_number=1, spans=(), stats=dataclasses.replace(NO_LOSS, overprint_duplicates=1))
 
     @pytest.mark.parametrize(
         "first,second,mode,reasons",
@@ -887,7 +891,7 @@ class TestRecovery:
 
         got = recovered(pdf(tmp_path, CONTROL + copy))
 
-        assert got == RecoveredText(spans=(), stats=dataclasses.replace(NO_LOSS, overprint_duplicates=1))
+        assert got == RecoveredText(page_number=1, spans=(), stats=dataclasses.replace(NO_LOSS, overprint_duplicates=1))
 
     @pytest.mark.parametrize(
         "first_x,second_x",
@@ -923,7 +927,7 @@ class TestRecovery:
     def test_a_drop_shadow_is_an_overprint(self, tmp_path, where):
         got = recovered(where.build(tmp_path, "drop-shadow"))
 
-        assert got == RecoveredText(spans=(), stats=dataclasses.replace(NO_LOSS, overprint_duplicates=1))
+        assert got == RecoveredText(page_number=1, spans=(), stats=dataclasses.replace(NO_LOSS, overprint_duplicates=1))
 
     def test_a_shrunk_copy_beyond_its_last_glyph_is_emitted_without_a_reason(self, tmp_path):
         # pdfium's window does not shrink with the text (TestPdfiumBehaviour); recovery's is the last
@@ -1022,11 +1026,11 @@ class TestRecovery:
         path = pdf(tmp_path, content, resources=b"/XObject << /X 6 0 R >>", extra=(hidden,))
 
         assert recovered(path) == RecoveredText(
-            spans=(), stats=dataclasses.replace(NO_LOSS, unrecovered_text_objects=1)
+            page_number=1, spans=(), stats=dataclasses.replace(NO_LOSS, unrecovered_text_objects=1)
         )
 
     def test_a_page_with_nothing_dropped_recovers_nothing(self, tmp_path):
-        assert recovered(pdf(tmp_path, CONTROL)) == RecoveredText(spans=(), stats=NO_LOSS)
+        assert recovered(pdf(tmp_path, CONTROL)) == RecoveredText(page_number=1, spans=(), stats=NO_LOSS)
 
     def test_every_dropped_object_is_accounted_for(self, tmp_path):
         # Operators need whitespace between them: "ETBT" would be one unknown operator.
@@ -1055,6 +1059,12 @@ class TestRecovery:
 
         assert extract_page(handle, 0) == before
         assert page_text(handle, 0).spans == before.text.spans
+
+    def test_the_recovery_names_its_page(self, tmp_path):
+        pages = [PageSpec(items=(TextRun(f"Page {n}", x=72.0, y=100.0),)) for n in (1, 2, 3)]
+        handle = open_document(build_pdf(tmp_path / "three.pdf", pages))
+
+        assert [recover_dropped_text(handle, index).page_number for index in range(3)] == [1, 2, 3]
 
     def test_pickle_round_trip_of_a_recovery(self, tmp_path):
         original = recovered(plain(tmp_path, "tz-0"))
@@ -1172,7 +1182,7 @@ class TestRecoveryErrors:
             recover_dropped_text(handle, 1)
 
         assert caught.value.page_number == 2
-        assert recover_dropped_text(handle, 2) == RecoveredText(spans=(), stats=NO_LOSS)
+        assert recover_dropped_text(handle, 2) == RecoveredText(page_number=3, spans=(), stats=NO_LOSS)
 
     @pytest.mark.parametrize(
         "index,error,message",

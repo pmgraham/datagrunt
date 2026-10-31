@@ -606,7 +606,8 @@ def built(tmp_path: Path, *items, rotate: int = 0) -> Path:
 
 def assessed(path: Path, *, ocr: OcrMode = "auto") -> tuple[PageAssessment, RawPage]:
     """assess_page of page 1 of ``path``, with the RawPage it read."""
-    raw = extract_page(open_document(path), 0)
+    with open_document(path) as handle:
+        raw = extract_page(handle, 0)
     assert isinstance(raw, RawPage)
     return assess_page(raw, ocr=ocr), raw
 
@@ -812,7 +813,12 @@ def recovered_span(text: str, *, reasons=("tiny_font",), y: float = 200.0, **ove
 
 
 def recovery(
-    *spans: RecoveredSpan, overprint: int = 0, whitespace: int = 0, empty: int = 0, unrecovered: int = 0
+    *spans: RecoveredSpan,
+    overprint: int = 0,
+    whitespace: int = 0,
+    empty: int = 0,
+    unrecovered: int = 0,
+    page_number: int = 1,
 ) -> RecoveredText:
     counts = RecoveryStats(
         overprint_duplicates=overprint,
@@ -820,7 +826,7 @@ def recovery(
         empty_text_objects=empty,
         unrecovered_text_objects=unrecovered,
     )
-    return RecoveredText(spans=spans, stats=counts)
+    return RecoveredText(page_number=page_number, spans=spans, stats=counts)
 
 
 def accounted(recovered: RecoveredText) -> int:
@@ -951,6 +957,10 @@ class TestRecoveredPieces:
     def test_invalid_recovery_raises(self, recovered, dropped, error, message):
         with pytest.raises(error, match=re.escape(message)):
             assess_page(raw_page(letters(24), dropped=dropped), recovered=recovered)
+
+    def test_another_pages_recovery_raises(self):
+        with pytest.raises(ValueError, match=re.escape("recovered is the recovery of page 2, not of page 1")):
+            assess_page(raw_page(letters(24), dropped=1), recovered=recovery(unrecovered=1, page_number=2))
 
     def test_two_spans_of_one_object_account_for_it_once(self):
         recovered = recovery(recovered_span("A"), recovered_span("B"))

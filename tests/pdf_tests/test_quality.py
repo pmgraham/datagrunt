@@ -20,8 +20,8 @@ import pytest
 
 import datagrunt
 import datagrunt.pdf
-from datagrunt.pdf import _pdfium_recover, elements, quality
-from datagrunt.pdf._pdfium_recover import em_reasons
+from datagrunt.pdf import _hidden_rules, _pdfium_recover, elements, quality
+from datagrunt.pdf._hidden_rules import em_reasons
 from datagrunt.pdf.elements import BBox
 from datagrunt.pdf.pdfium_engine import RawImage, RawPage, RawSpan, extract_page, open_document
 from datagrunt.pdf.quality import SpanPiece, assess_page, classify_spans, raster_cover_fraction
@@ -958,6 +958,7 @@ class TestModuleImports:
 
     def test_imports_only_the_raw_fact_types_and_a1(self):
         allowed = {
+            "datagrunt.pdf._hidden_rules",
             "datagrunt.pdf._pdfium_common",
             "datagrunt.pdf._pdfium_images",
             "datagrunt.pdf._pdfium_recover",
@@ -984,9 +985,15 @@ class TestModuleImports:
         assert not hasattr(elements, "_check_hidden_reasons")
 
     def test_flags_tiny_and_squeezed_text_with_recoverys_one_rule(self):
-        # One em rule and one threshold for textpage spans and recovered text alike.
-        assert quality.em_reasons is _pdfium_recover.em_reasons
+        # One em rule and one threshold for textpage spans and recovered text alike, in a pure module.
+        assert quality.em_reasons is _pdfium_recover.em_reasons is _hidden_rules.em_reasons
         assert not hasattr(quality, "TINY_FONT_PT")
+        # Recovery reads the threshold from the pure module; it defines none of its own.
+        assert "TINY_FONT_PT = " not in Path(_pdfium_recover.__file__).read_text(encoding="utf-8")
+        assert _pdfium_recover.TINY_FONT_PT == _hidden_rules.TINY_FONT_PT == 1.0
+
+    def test_flags_off_page_text_with_recoverys_one_rule(self):
+        assert quality.off_page is _pdfium_recover.off_page is _hidden_rules.off_page
 
     def test_validates_routes_with_a1s_public_table(self):
         assert quality.PAGE_ROUTES is elements.PAGE_ROUTES

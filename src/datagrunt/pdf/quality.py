@@ -43,7 +43,7 @@ char of every span, in order, cut into pieces that carry the A1
   ``tiny_font`` only.
 
 ``tiny_font`` and ``zero_scale`` are recovery's rule and threshold
-(:func:`~datagrunt.pdf._pdfium_recover.em_reasons`), so a textpage span and
+(:func:`~datagrunt.pdf._hidden_rules.em_reasons`), so a textpage span and
 recovered text are flagged alike. A white fill alone is no signal:
 ``matches_background`` needs the rendered background under the span (#366
 task 2).
@@ -69,6 +69,16 @@ task 2).
 - Unmapped regions: the box of each maximal run of invalid chars in a
   visible piece, where OCR (A5) reads what the text layer cannot say.
 
+Known limitations (A3 review M7; each needs what this pure stage cannot
+see, and an occlusion follow-up is proposed for the last two):
+
+- A glyph with no outline whose ToUnicode map says it is text (a space
+  that reads "IGNORE ALL") draws nothing but reads as visible text; alone
+  in its object it is an empty object, counted and never read.
+- Text a clip path excludes is not flagged: clip paths are not applied.
+- Text under a later opaque image or fill is not flagged: occlusion is
+  not checked.
+
 Recovered text (#366 task 3,
 :func:`~datagrunt.pdf.pdfium_engine.recover_dropped_text`) is kept apart from
 the page's pieces, in ``PageAssessment.recovered_pieces``, each flagged with
@@ -87,9 +97,10 @@ from dataclasses import dataclass
 from itertools import groupby
 from typing import Literal, TypeAlias, get_args
 
+from datagrunt.pdf._hidden_rules import em_reasons, off_page
 from datagrunt.pdf._pdfium_common import Box, union_box
 from datagrunt.pdf._pdfium_images import RawImage
-from datagrunt.pdf._pdfium_recover import RecoveredText, em_reasons, off_page
+from datagrunt.pdf._pdfium_recover import RecoveredText
 from datagrunt.pdf._pdfium_text import RawSpan
 from datagrunt.pdf._validate import choice_str, int_at_least, ordered_box, positive_float, str_tuple, typed_tuple
 from datagrunt.pdf.elements import (
@@ -434,13 +445,13 @@ def assess_page(page: RawPage, *, ocr: OcrMode = "auto", recovered: RecoveredTex
         TypeError: If ``page`` is not a RawPage, ``ocr`` is not a str, or
             ``recovered`` is not a RecoveredText or None.
         ValueError: If ``ocr`` is not ``"auto"``, ``"always"`` or ``"never"``,
-            or ``recovered`` does not account for exactly the page's
-            ``dropped_text_objects`` (it is another page's).
+            or ``recovered`` names another page, or does not account for
+            exactly the page's ``dropped_text_objects``.
     """
     if not isinstance(page, RawPage):
         raise TypeError(f"page must be a RawPage, got {type(page).__name__}")
     choice_str("ocr", ocr, _OCR_MODES)
-    _check_recovered(recovered, page.text.stats.dropped_text_objects)
+    _check_recovered(recovered, page.page_number, page.text.stats.dropped_text_objects)
     width, height = page.geometry.width_pt, page.geometry.height_pt
     boxes = _scan_boxes(page.images.images)
     cover = _cover_fraction(boxes, width, height)
@@ -457,12 +468,14 @@ def assess_page(page: RawPage, *, ocr: OcrMode = "auto", recovered: RecoveredTex
     )
 
 
-def _check_recovered(recovered: object, dropped: int) -> None:
-    """Require None, or a RecoveredText that accounts for each of the page's ``dropped`` text objects once."""
+def _check_recovered(recovered: object, page_number: int, dropped: int) -> None:
+    """Require None, or page ``page_number``'s RecoveredText, accounting for each of its ``dropped`` objects once."""
     if recovered is None:
         return
     if not isinstance(recovered, RecoveredText):
         raise TypeError(f"recovered must be a RecoveredText or None, got {type(recovered).__name__}")
+    if recovered.page_number != page_number:
+        raise ValueError(f"recovered is the recovery of page {recovered.page_number}, not of page {page_number}")
     stats = recovered.stats
     counted = (
         stats.overprint_duplicates

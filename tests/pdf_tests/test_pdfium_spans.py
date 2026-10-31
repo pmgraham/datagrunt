@@ -19,7 +19,7 @@ import pytest
 from reportlab.pdfbase.pdfmetrics import stringWidth
 
 from datagrunt.pdf import PDFCorruptError, _pdfium_common
-from datagrunt.pdf._pdfium_text import em_size
+from datagrunt.pdf._hidden_rules import em_size
 from datagrunt.pdf.pdfium_engine import PageText, RawSpan, TextStats, open_document, page_text
 from pdf_tests.builders import FormXObject, PageSpec, TextRun, break_page, build_pdf, hand_written_pdf
 

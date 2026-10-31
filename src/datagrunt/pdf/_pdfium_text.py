@@ -35,9 +35,9 @@ Text (#365 T2), pinned by ``tests/pdf_tests/test_pdfium_spans.py``:
   decomposes ligatures (U+FB01 reads "fi") and mirrors "(" in right-to-left
   text (it reads ")"). The engine keeps every char the textpage reports and counts
   the text objects that own none: ``TextStats.empty_text_objects`` when the
-  object draws no glyph with extent (its box is the point at its origin
-  though its em is 1 unit or more each way in its form's space: a single
-  space), else
+  object draws no glyph with extent (its box is a point, anywhere, though
+  its em is 1 unit or more each way in its form's space: a single space,
+  whose box pdfium puts at its origin), else
   ``TextStats.dropped_text_objects``, which
   :mod:`datagrunt.pdf._pdfium_recover` reads back.
 - Standard-14 fonts have no descriptor: their flags lack ForceBold and their
@@ -56,6 +56,7 @@ from typing import NamedTuple
 
 import pypdfium2.raw as pdfium_c
 
+from datagrunt.pdf._hidden_rules import em_size
 from datagrunt.pdf._pdfium_common import Box, PdfiumFailure, object_address, read_rgba, union_box
 from datagrunt.pdf._validate import finite_float, int_at_least, ordered_box, rgba_tuple, strict_bool, typed_tuple
 
@@ -225,10 +226,11 @@ class TextStats:
             there is nothing to recover. Disjoint from
             ``skipped_nonfinite_objects``, whose objects own chars.
         empty_text_objects: Text objects that own no textpage char and draw
-            no glyph with extent: their box is the point at their origin
-            though their em is 1 unit or more each way in their form's
-            space (an object of a single space or no-break space). Nothing
-            to recover; disjoint from ``dropped_text_objects``.
+            no glyph with extent: their box is a point (anywhere; pdfium
+            puts it at the origin) though their em is 1 unit or more each way
+            in their form's space (an object of a single space or no-break
+            space). Nothing to recover; disjoint from
+            ``dropped_text_objects``.
     """
 
     char_count: int
@@ -403,27 +405,12 @@ def _bold_and_italic(font: pdfium_c.FPDF_FONT, name: str, label: str) -> tuple[b
     return is_bold, is_italic
 
 
-def em_size(size: float, a: float, b: float, c: float, d: float) -> tuple[float, float]:
-    """The width and height in points of an em of ``Tf`` ``size`` under a text matrix ``[a b c d]`` to page space.
-
-    The em's sides map to ``(a, b)`` (along the baseline) and ``(c, d)``
-    (up the glyphs), and each is measured perpendicular to the other: the
-    em is ``|size| x |ad - bc| / hypot(c, d)`` wide and ``|size| x |ad - bc|
-    / hypot(a, b)`` tall, the two heights of the parallelogram it maps to.
-    Perpendicular sides (any turn, scale or mirror) read their own lengths;
-    a shear that lays both sides along almost one line (``1 0 1 0.0001``)
-    or a singular matrix (``1 0 1 0``) leaves the em little or no extent
-    either way, however long its sides. A side of no length leaves the
-    other its own length (``Tz 0``: no width, full height). A mirrored
-    (negative) size or scale counts at its magnitude. The one measure for
-    textpage spans (:class:`RawSpan`) and for the text objects recovery
-    reads back.
-    """
-    area = abs(a * d - b * c)
-    along, up = math.hypot(a, b), math.hypot(c, d)
-    width = area / up if up else along
-    height = area / along if along else up
-    return abs(size) * width, abs(size) * height
+def font_size(text_object: pdfium_c.FPDF_PAGEOBJECT, label: str) -> float:
+    """The text object's ``Tf`` size: the one read of it, for spans and recovery alike."""
+    size = ctypes.c_float()
+    if not pdfium_c.FPDFTextObj_GetFontSize(text_object, size):
+        raise PdfiumFailure(f"read the font size of {label}")
+    return size.value
 
 
 def _em(
@@ -437,14 +424,12 @@ def _em(
     be finite (a ``cm`` that overflows pdfium's 32-bit CTM): the
     caller then skips the object.
     """
-    nominal = ctypes.c_float()
-    if not pdfium_c.FPDFTextObj_GetFontSize(text_object, nominal):
-        raise PdfiumFailure(f"read the font size of {label}")
+    nominal = font_size(text_object, label)
     matrix = pdfium_c.FS_MATRIX()
     if not pdfium_c.FPDFText_GetMatrix(textpage, char_index, matrix):
         raise PdfiumFailure(f"read the matrix of char {char_index}")
-    width, height = em_size(nominal.value, matrix.a, matrix.b, matrix.c, matrix.d)
-    return math.copysign(height, nominal.value), width
+    width, height = em_size(nominal, matrix.a, matrix.b, matrix.c, matrix.d)
+    return math.copysign(height, nominal), width
 
 
 def _read_style(

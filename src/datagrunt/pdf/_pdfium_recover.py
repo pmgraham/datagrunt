@@ -17,9 +17,10 @@ its duplicate window of one of the five text objects before it (see
 chars, but owns no textpage char, and ``FPDFTextObj_GetText`` (served from
 the textpage) reads it as empty.
 
-An object whose box is the point at its origin though its em is 1 unit or
-more each way (in its form's space, where pdfium measures its box) draws no
-ink: none of its glyphs has an outline. It is an object of a single space,
+An object whose box is a point though its em is 1 unit or more each way (in
+its form's space, where pdfium measures its box) draws no ink: none of its
+glyphs has an outline. The rule asks for a point anywhere; pdfium puts such
+a box at the object's origin (pinned), but the origin is not checked. It is an object of a single space,
 or of spaces that char spacing draws on one spot (a new size would spread
 them apart, still drawing nothing). It is empty, not dropped, and never
 recovered. A point box from a tiny or flat em (``Tf 0``, a zero matrix) is
@@ -33,10 +34,16 @@ only in that page load: nothing is saved.
 
 Recovered text keeps where the object was: every char box of its span is the
 object's original box (a point for ``Tf 0`` text, a line with no width for
-``Tz 0`` text) and its font size and em width are the original ones. Its
+``Tz 0`` text) and its font size and em width are the original ones. Known
+(A3 review M2): that box is pdfium's object bounds, near the glyphs' ink,
+while a textpage span's char boxes are loose (advance by the font's height),
+so a recovered box and a textpage box of the same text differ in size; and
+(M3) a recovery reads the page's textpage again before moving the dropped
+objects, though the text stage has read it once: a second load and two
+textpages per page that drops text. Its
 hidden reasons (:func:`em_reasons`) are measured on the original object's
 text matrix to page space (``[a b c d]``) and ``Tf`` size
-(:func:`~datagrunt.pdf._pdfium_text.em_size`), the rule
+(:func:`~datagrunt.pdf._hidden_rules.em_size`), the rule
 :mod:`datagrunt.pdf.quality` flags a textpage span with:
 
 - ``tiny_font``: the em's height, measured across its baseline, is under
@@ -81,15 +88,13 @@ from typing import NamedTuple
 
 import pypdfium2.raw as pdfium_c
 
+from datagrunt.pdf._hidden_rules import RECOVERY_REASONS, TINY_FONT_PT, em_reasons, em_size, off_page
 from datagrunt.pdf._path_segments import Matrix
 from datagrunt.pdf._pdfium_common import Box, PdfiumFailure, object_address, union_box
-from datagrunt.pdf._pdfium_text import PageText, RawSpan, em_size
+from datagrunt.pdf._pdfium_text import PageText, RawSpan, font_size
 from datagrunt.pdf._validate import int_at_least, typed_tuple
-from datagrunt.pdf.elements import BBox, HiddenReason, check_hidden_reasons
+from datagrunt.pdf.elements import HiddenReason, check_hidden_reasons
 
-RECOVERY_REASONS: tuple[HiddenReason, ...] = ("tiny_font", "zero_scale")
-# A font size (or an em's width) under this many points is too small to read.
-TINY_FONT_PT = 1.0
 # The least duplicate window (each axis) of text whose last char's box is a point or a line (Tf 0, Tz 0).
 OVERPRINT_TOLERANCE_PT = 0.5
 # The most: pdfium's window for 12 pt text ending in Helvetica's widest glyph (W) is 10.2 pt. A copy
@@ -171,14 +176,17 @@ class RecoveredText:
     """One page's recovered spans, in object-walk order, with the objects that gave none.
 
     Every dropped text object (``TextStats.dropped_text_objects``) is either
-    behind one or more spans or counted once in ``stats``. Picklable, so it
-    crosses the process pool.
+    behind one or more spans or counted once in ``stats``. ``page_number``
+    (1-based) names the page it was read from, so a caller cannot pair it
+    with another page's facts. Picklable, so it crosses the process pool.
     """
 
+    page_number: int
     spans: tuple[RecoveredSpan, ...]
     stats: RecoveryStats
 
     def __post_init__(self) -> None:
+        int_at_least("page_number", self.page_number, 1)
         typed_tuple("spans", self.spans, RecoveredSpan)
         if not isinstance(self.stats, RecoveryStats):
             raise TypeError(f"stats must be a RecoveryStats, got {type(self.stats).__name__}")
@@ -220,22 +228,15 @@ def is_glyphless(handle: pdfium_c.FPDF_PAGEOBJECT, matrix: Matrix, label: str) -
     """Whether the text object ``handle`` draws no ink: no glyph with an outline (see the module notes).
 
     ``matrix`` is its object matrix (into its form's space, where its bounds
-    are); its box must be the point at its origin while its em is at least
-    :data:`TINY_FONT_PT` each way.
+    are); its box must be a point, anywhere (pdfium puts it at the origin;
+    that is not checked), while its em is at least :data:`TINY_FONT_PT` each
+    way.
 
     Raises:
         PdfiumFailure: If a pdfium call fails.
     """
-    width, height = em_size(_font_size(handle, label), matrix.a, matrix.b, matrix.c, matrix.d)
+    width, height = em_size(font_size(handle, label), matrix.a, matrix.b, matrix.c, matrix.d)
     return width >= TINY_FONT_PT and height >= TINY_FONT_PT and _is_point(_bounds(handle, label))
-
-
-def _font_size(handle: pdfium_c.FPDF_PAGEOBJECT, label: str) -> float:
-    """The text object's ``Tf`` size."""
-    size = ctypes.c_float()
-    if not pdfium_c.FPDFTextObj_GetFontSize(handle, size):
-        raise PdfiumFailure(f"read the font size of {label}")
-    return size.value
 
 
 def _bounds(handle: pdfium_c.FPDF_PAGEOBJECT, label: str) -> Box:
@@ -278,7 +279,7 @@ def isolate_dropped(
 def _original(text: TextObject, to_display: Callable[[Box], Box]) -> Target:
     """The dropped object ``text`` as pdfium placed it: its displayed box, origin, size, em width and reasons."""
     label = f"object {text.object_index}"
-    size = _font_size(text.handle, label)
+    size = font_size(text.handle, label)
     left, bottom, right, top = _bounds(text.handle, label)
     matrix = text.own.then(text.outer)
     # Bounds are in the form's space, as the object matrix is.
@@ -298,30 +299,6 @@ def _original(text: TextObject, to_display: Callable[[Box], Box]) -> Target:
         em_width_pt=width,
         hidden_reasons=em_reasons(width, height),
     )
-
-
-def em_reasons(width_pt: float, height_pt: float) -> tuple[HiddenReason, ...]:
-    """``tiny_font`` and / or ``zero_scale`` for text whose em is ``width_pt`` by ``height_pt`` (see the module notes).
-
-    The one rule, and :data:`TINY_FONT_PT` the one threshold, for text pdfium
-    drops (recovery) and text its textpage keeps (:mod:`datagrunt.pdf.quality`
-    flags a span by its ``em_width_pt`` and ``|font_size_pt|``). Both sides
-    are magnitudes (:func:`~datagrunt.pdf._pdfium_text.em_size`).
-    """
-    tiny = height_pt < TINY_FONT_PT
-    # A narrower em than a taller one: the matrix (Tz) squeezes it, not the size.
-    squeezed = width_pt < height_pt and width_pt < TINY_FONT_PT
-    return tuple(reason for reason, flagged in zip(RECOVERY_REASONS, (tiny, squeezed)) if flagged)
-
-
-def off_page(box: Box, width: float, height: float) -> bool:
-    """True if the displayed ``box`` is not within the ``width`` x ``height`` page by A1's ``BBox.within`` rule.
-
-    The one placement rule for recovered copies (the overprint rule) and
-    textpage chars (:mod:`datagrunt.pdf.quality` flags ``off_page`` by it).
-    """
-    x0, y0, x1, y1 = box
-    return not BBox(x0=x0, y0=y0, x1=x1, y1=y1).within(width, height)
 
 
 def _move(text: TextObject, place: int) -> None:
@@ -345,8 +322,8 @@ class Display(NamedTuple):
 
 def recovered_text(
     targets: tuple[Target, ...], texts: Iterable[TextObject], before: PageText, after: PageText, display: Display
-) -> RecoveredText:
-    """The recovered spans and counts, from the textpages read ``before`` and ``after`` the targets moved.
+) -> tuple[tuple[RecoveredSpan, ...], RecoveryStats]:
+    """The recovered spans and their counts, from the textpages read ``before`` and ``after`` the targets moved.
 
     ``texts`` (every text object of the walk) gives the owned objects'
     origins, and ``display`` places them, for the overprint rule.
@@ -379,7 +356,7 @@ def recovered_text(
         empty_text_objects=empty,
         unrecovered_text_objects=unrecovered,
     )
-    return RecoveredText(spans=tuple(spans), stats=counts)
+    return tuple(spans), counts
 
 
 # How a copy shows: render mode, fill and stroke colours with their alphas, em reasons, placement reasons.

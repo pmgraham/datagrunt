@@ -1050,7 +1050,8 @@ def _recover(page: pdfium.PdfPage, geometry: PageGeometry) -> RecoveredText:
         with _opened_textpage(page, page_number) as textpage:
             after = collect_text(textpage.raw, to_display, walk)
     display = Display(to_display, geometry.width_pt, geometry.height_pt)
-    return recovered_text(targets, texts, before.page_text, after.page_text, display)
+    spans, stats = recovered_text(targets, texts, before.page_text, after.page_text, display)
+    return RecoveredText(page_number=page_number, spans=spans, stats=stats)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
