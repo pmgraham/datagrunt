@@ -75,7 +75,8 @@ its recovered reasons and those :func:`classify_spans` computes for it: a
 recovered copy (even a drawn one, with no reason) is never laid out as page
 text. It counts toward ``hidden_spans_flagged`` only: never toward routing,
 the char counts or the unmapped regions. Objects it could not recover are a
-warning.
+warning, and so are dropped objects when no recovery is passed (the page's
+``TextStats.dropped_text_objects`` is over 0 and ``recovered`` is None).
 """
 
 import unicodedata
@@ -452,7 +453,7 @@ def assess_page(page: RawPage, *, ocr: OcrMode = "auto", recovered: RecoveredTex
         quality=_quality(page, pieces + flagged),
         route=route,
         unmapped_regions=_unmapped_regions(pieces),
-        warnings=warnings + _recovery_warnings(recovered),
+        warnings=warnings + _recovery_warnings(recovered, page.text.stats.dropped_text_objects),
     )
 
 
@@ -490,13 +491,13 @@ def _recovered_pieces(
     return tuple(pieces)
 
 
-def _recovery_warnings(recovered: RecoveredText | None) -> tuple[str, ...]:
-    """A warning for the dropped text objects recovery could not read back, if any."""
-    lost = 0 if recovered is None else recovered.stats.unrecovered_text_objects
-    if not lost:
-        return ()
-    missing = "could not be recovered; their text is missing from this page"
-    return (f"{lost} text object(s) that pdfium's textpage drops {missing}",)
+def _recovery_warnings(recovered: RecoveredText | None, dropped: int) -> tuple[str, ...]:
+    """A warning for the page's ``dropped`` text objects that no recovery read back, if any."""
+    objects, missing = "text object(s) that pdfium's textpage drops", "their text is missing from this page"
+    if recovered is None:
+        return (f"{dropped} {objects} were not recovered (no recovery was passed); {missing}",) if dropped else ()
+    lost = recovered.stats.unrecovered_text_objects
+    return (f"{lost} {objects} could not be recovered; {missing}",) if lost else ()
 
 
 def _valid(span: RawSpan, offset: int) -> bool:

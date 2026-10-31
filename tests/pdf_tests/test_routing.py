@@ -809,6 +809,10 @@ class TestRegressions:
 UNRECOVERED_WARNING = (
     "{count} text object(s) that pdfium's textpage drops could not be recovered; their text is missing from this page"
 )
+NOT_RECOVERED_WARNING = (
+    "{count} text object(s) that pdfium's textpage drops were not recovered (no recovery was passed); "
+    "their text is missing from this page"
+)
 
 
 def recovered_span(text: str, *, reasons=("tiny_font",), y: float = 200.0, **overrides) -> RecoveredSpan:
@@ -849,6 +853,20 @@ class TestRecoveredPieces:
         page = raw_page(letters(24), dropped=1)
 
         assert assess_page(page) == assess_page(page, recovered=None)
+
+    @pytest.mark.parametrize("count", [1, 3])
+    def test_dropped_objects_with_no_recovery_are_a_warning(self, count):
+        result = assess_page(raw_page(letters(24), dropped=count))
+
+        assert result.warnings == (NOT_RECOVERED_WARNING.format(count=count),)
+
+    def test_a_page_with_nothing_dropped_needs_no_recovery(self):
+        assert assess_page(raw_page(letters(24))).warnings == ()
+
+    def test_the_not_recovered_warning_follows_the_routing_warning(self):
+        result = assess_page(raw_page(letters(5), dropped=2), ocr="never")
+
+        assert result.warnings == (NEVER_WARNING.format(count=5), NOT_RECOVERED_WARNING.format(count=2))
 
     def test_recovered_is_keyword_only(self):
         with pytest.raises(TypeError):
