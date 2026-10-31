@@ -520,6 +520,7 @@ class TestComponents:
         assert [hs[0][0] for hs, _ in got] == [20.0, 300.0]
         assert [len(hs) + len(vs) for hs, vs in got] == [4, 4]
 
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_a_dashed_mesh_of_15_000_segments_groups_within_1_second(self):
         # The bound under test: O((H + V) log(H + V) + I), not the pairwise O(H x V).
         segments = dashed_mesh()
@@ -989,6 +990,7 @@ def cell_rectangles(count: int, size: float) -> tuple[RawSegment, ...]:
 class TestFindLatticeTablesBounds:
     """A page of ~15 000 segments takes under 1 s; the arguments are checked."""
 
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_a_60_x_60_table_drawn_cell_by_cell_with_text_in_every_cell(self):
         segments = cell_rectangles(60, 12.0)
         pieces = tuple(
@@ -1004,6 +1006,7 @@ class TestFindLatticeTablesBounds:
         assert len(result.used_pieces) == 3_600
         assert elapsed < 1.0, f"{elapsed:.2f} s"
 
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_a_dashed_mesh_of_15_000_segments(self):
         segments = tuple(dashed_mesh())
 
@@ -1108,6 +1111,7 @@ class TestPageBounds:
         assert (len(result.tables), result.crossing_cap_reached) == ((1, False) if found else (0, True))
         assert len(result.used_pieces) == (1 if found else 0)
 
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_a_page_past_max_crossings_stops_the_sweep_at_the_cap(self):
         # 710 x 710 full-length rules cross 504 100 times; the sweep stops at 500 001.
         segments = ruled_grid(tuple(3.0 * index for index in range(710)), tuple(3.0 * index for index in range(710)))
