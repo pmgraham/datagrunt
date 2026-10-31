@@ -160,3 +160,42 @@ def test_pymupdf_extract_page_parses_page_once(sample_pdf, monkeypatch):
 
     assert counts["get_text"] <= 2
     assert counts["get_images"] == 1
+
+
+class TestBuildBlockDominant:
+    """#389: a block's font and size ties go to the first span, not hash order."""
+
+    @staticmethod
+    def _block(spans):
+        """A pymupdf ``get_text("dict")`` text block with one line of ``(text, font, size)`` spans."""
+        return {
+            "bbox": (72.0, 60.0, 200.0, 75.0),
+            "lines": [{"spans": [{"text": t, "font": f, "size": s, "flags": 0} for t, f, s in spans]}],
+        }
+
+    def test_tied_fonts_take_the_first_span(self, sample_pdf):
+        backend = PyMuPDFBackend(sample_pdf)
+        fonts = ["Gamma", "Alpha", "Delta", "Beta", "Epsilon"]
+        for i in range(len(fonts)):
+            rotated = fonts[i:] + fonts[:i]
+            block = self._block([(f"word{n}", font, 11.0) for n, font in enumerate(rotated)])
+            assert backend._build_block(block, None, 0).font == rotated[0]
+
+    def test_tied_sizes_take_the_first_span(self, sample_pdf):
+        backend = PyMuPDFBackend(sample_pdf)
+        first_big = backend._build_block(self._block([("Alpha", "Arial", 12.0), ("Beta", "Arial", 8.0)]), None, 0)
+        first_small = backend._build_block(self._block([("Alpha", "Arial", 8.0), ("Beta", "Arial", 12.0)]), None, 0)
+        assert first_big.font_size == 12.0
+        assert first_small.font_size == 8.0
+
+    def test_non_tied_block_keeps_the_majority(self, sample_pdf):
+        backend = PyMuPDFBackend(sample_pdf)
+        block = self._block([("a", "Arial", 9.0), ("b", "Times", 11.0), ("c", "Times", 11.0)])
+        tb = backend._build_block(block, None, 0)
+        assert (tb.font, tb.font_size) == ("Times", 11.0)
+
+    def test_whitespace_spans_do_not_vote(self, sample_pdf):
+        backend = PyMuPDFBackend(sample_pdf)
+        block = self._block([("Alpha", "Courier", 11.0), (" ", "Helvetica", 9.0), (" ", "Helvetica", 9.0)])
+        tb = backend._build_block(block, None, 0)
+        assert (tb.font, tb.font_size) == ("Courier", 11.0)

@@ -8,7 +8,7 @@ from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
 from datagrunt.core.pdf_io.extraction.ocr import ocr_data_to_blocks
 from datagrunt.core.pdf_io.extraction.pdfium_document import ENCRYPTED_PDF_MESSAGE
 from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, PageAnalysis, TextBlock
-from datagrunt.core.pdf_io.extraction.text_block_builder import classify_by_median, page_median_size
+from datagrunt.core.pdf_io.extraction.text_block_builder import classify_by_median, most_common, page_median_size
 from datagrunt.core.pdf_io.filenames import embedded_image_filename
 
 logger = logging.getLogger(__name__)
@@ -164,8 +164,8 @@ class PyMuPDFBackend(_ThreadLocalDocSession, ExtractionBackend):
         full_text = " ".join(texts).strip()
         if not full_text:
             return None
-        dominant_font = max(set(fonts), key=fonts.count) if fonts else "unknown"
-        dominant_size = max(set(sizes), key=sizes.count) if sizes else 0
+        dominant_font = most_common(fonts, "unknown")
+        dominant_size = most_common(sizes, 0)
         is_bold = any(bolds)
         x0, y0, x1, y1 = block["bbox"]
         return TextBlock(

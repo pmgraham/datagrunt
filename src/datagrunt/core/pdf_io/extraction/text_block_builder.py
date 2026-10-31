@@ -2,6 +2,7 @@
 
 import re
 from bisect import bisect_left
+from collections import Counter
 
 from datagrunt.core.pdf_io.extraction.layout_sorter import PageLayoutSorter, TextItemAdapter
 from datagrunt.core.pdf_io.extraction.shapes import BBox, TextBlock
@@ -17,6 +18,18 @@ LIST_MARKER_REGEX = re.compile(
     r"|[a-zA-Z]\)"  # Alphabetical list markers with parenthesis (e.g., a), A))
     r")(\s|$)"
 )
+
+
+def most_common(values: list, default=None):
+    """Most frequent value, ties broken by first occurrence; ``default`` if empty.
+
+    ``Counter`` keeps first-seen order and ``most_common(1)`` returns the first
+    of the tied maxima, so the winner never depends on set/hash iteration order
+    (which, for strings, varies with the per-process ``PYTHONHASHSEED``; #389).
+    """
+    if not values:
+        return default
+    return Counter(values).most_common(1)[0][0]
 
 
 def page_median_size(all_sizes: list) -> float | None:
@@ -64,10 +77,7 @@ class TextBlockBuilder:
     @staticmethod
     def _dominant(values, default=None):
         """Most common value (ties broken by first occurrence)."""
-        values = [v for v in values if v not in (None, "")]
-        if not values:
-            return default
-        return max(set(values), key=values.count)
+        return most_common([v for v in values if v not in (None, "")], default)
 
     def build(self, items: list) -> list:
         """Return a list of classified ``TextBlock`` from raw ``TextItem`` list.
