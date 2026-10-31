@@ -781,6 +781,30 @@ class TestRecovery:
 
         assert got == RecoveredText(spans=(), stats=dataclasses.replace(NO_LOSS, overprint_duplicates=1))
 
+    @pytest.mark.parametrize(
+        "first,second,mode,reasons",
+        [
+            # pdfium keeps the first copy, which paints nothing, and drops the one a reader sees.
+            pytest.param((b"", b"3 Tr"), (b"", b""), 0, (), id="invisible-then-filled"),
+            pytest.param((b"", b""), (b"", b"1 Tr"), 1, (), id="filled-then-stroked"),
+            pytest.param((b"/Clear gs", b""), (b"", b""), 0, (), id="transparent-then-opaque"),
+            pytest.param((b"", b""), (b"/Faint gs", b""), 0, (), id="opaque-then-faint"),
+            # The copy pdfium drops for its width (Tz 0) is hidden though the text it copies is not.
+            pytest.param((b"", b""), (b"", b"0 Tz"), 0, ("zero_scale",), id="drawn-then-squeezed"),
+        ],
+    )
+    def test_a_copy_painted_unlike_the_text_it_copies_is_emitted(self, tmp_path, first, second, mode, reasons):
+        show_copy = b"q %s BT /F1 12 Tf %s 72 100 Td (Total) Tj ET Q "
+        content = CONTROL + show_copy % first + show_copy % second
+        states = b"<< /Type /ExtGState /ca 0 /CA 0 >>", b"<< /Type /ExtGState /ca 0.5 /CA 0.5 >>"
+        path = pdf(tmp_path, content, resources=b"/ExtGState << /Clear 6 0 R /Faint 7 0 R >>", extra=states)
+
+        got = recovered(path)
+
+        (item,) = got.spans
+        assert (item.span.text, item.span.object_index, item.span.render_mode) == ("Total", 2, mode)
+        assert (item.hidden_reasons, got.stats) == (reasons, NO_LOSS)
+
     def test_a_copy_further_than_half_a_point_is_recovered_without_a_reason(self, tmp_path):
         # pdfium drops it as a duplicate (TestPdfiumBehaviour); it is drawn, so nothing hides it.
         content = CONTROL + b"BT /F1 12 Tf 72 100 Td (Total) Tj ET BT /F1 12 Tf 74 100 Td (Total) Tj ET"

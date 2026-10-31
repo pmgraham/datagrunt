@@ -48,6 +48,12 @@ text matrix to page space (``[a b c d]``) and ``Tf`` size
 Text drawn under 1 pt per em wide is always one or the other. A recovered
 object whose em is wider (a copy pdfium dropped as a duplicate though it lies
 over 0.5 pt from the text it copies) has neither reason: it is drawn.
+
+A copy is an overprint (counted, not emitted) only when it is painted as the
+text it copies is: the same render mode, fill and stroke alphas and em
+reasons. pdfium keeps the first of two copies whatever their paint, so a
+copy that paints when the first does not (``3 Tr`` then ``0 Tr``, alpha 0
+then opaque) is what a reader sees, and is emitted.
 """
 
 import ctypes
@@ -112,7 +118,9 @@ class RecoveryStats:
     Attributes:
         overprint_duplicates: Objects whose recovered text equals an earlier
             text object's (owned or recovered) at an origin within 0.5 pt on
-            each axis: a copy drawn on it, counted and not emitted.
+            each axis, painted alike (render mode, fill and stroke alphas,
+            em reasons): a copy drawn on it, counted and not emitted. A copy
+            painted otherwise is emitted.
         whitespace_objects: Objects whose recovered text is whitespace only.
         empty_text_objects: Objects whose box is still a point once laid out
             again at 12 pt: they draw no glyph with extent (a single space
@@ -301,10 +309,7 @@ def recovered_text(
     ``texts`` (every text object of the walk) gives the owned objects'
     origins, for the overprint rule.
     """
-    origins = {text.object_index: _origin(text) for text in texts}
-    printed: dict[str, list[tuple[float, float]]] = {}
-    for index, text in _texts_by_object(before.spans).items():
-        printed.setdefault(text, []).append(origins[index])
+    printed = _owned_copies(before.spans, {text.object_index: _origin(text) for text in texts})
     found = _spans_by_object(after.spans, {target.object_index for target in targets})
     spans: list[RecoveredSpan] = []
     overprints = whitespace = empty = unrecovered = 0
@@ -317,12 +322,13 @@ def recovered_text(
             unrecovered += 1
             continue
         text = "".join(piece.text for piece in pieces)
+        copy = _Copy(target.origin, _paint(pieces[0], target.hidden_reasons))
         if text.isspace():
             whitespace += 1
-        elif _overprints(target.origin, printed.get(text, ())):
+        elif _overprints(copy, printed.get(text, ())):
             overprints += 1
         else:
-            printed.setdefault(text, []).append(target.origin)
+            printed.setdefault(text, []).append(copy)
             spans.extend(_placed(piece, target.box, target) for piece in pieces)
     counts = RecoveryStats(
         overprint_duplicates=overprints,
@@ -333,17 +339,35 @@ def recovered_text(
     return RecoveredText(spans=tuple(spans), stats=counts)
 
 
+# What decides whether a copy shows as the text it copies: render mode, fill alpha, stroke alpha, em reasons.
+_Paint = tuple[int, int, int, tuple[HiddenReason, ...]]
+
+
+class _Copy(NamedTuple):
+    """A text object already on the page, for the overprint rule: its page-space origin and its paint."""
+
+    origin: tuple[float, float]
+    paint: _Paint
+
+
+def _paint(span: RawSpan, reasons: tuple[HiddenReason, ...]) -> _Paint:
+    """The paint of ``span``'s object, whose em gives it ``reasons``."""
+    return span.render_mode, span.fill_rgba[3], span.stroke_rgba[3], reasons
+
+
+def _owned_copies(spans: tuple[RawSpan, ...], origins: dict[int, tuple[float, float]]) -> dict[str, list[_Copy]]:
+    """Each owned object's text (its spans' text joined) to the copies drawing it, in walk order."""
+    printed: dict[str, list[_Copy]] = {}
+    for index, own in _spans_by_object(spans, set(origins)).items():
+        first = own[0]
+        paint = _paint(first, em_reasons(first.em_width_pt, abs(first.font_size_pt)))
+        printed.setdefault("".join(span.text for span in own), []).append(_Copy(origins[index], paint))
+    return printed
+
+
 def _origin(text: TextObject) -> tuple[float, float]:
     """The page-space origin of ``text`` (its matrix's translation, every form's applied)."""
     return text.outer.apply(text.own.e, text.own.f)
-
-
-def _texts_by_object(spans: tuple[RawSpan, ...]) -> dict[int, str]:
-    """Each object's text: the joined text of its spans, in order."""
-    texts: dict[int, str] = {}
-    for span in spans:
-        texts[span.object_index] = texts.get(span.object_index, "") + span.text
-    return texts
 
 
 def _spans_by_object(spans: tuple[RawSpan, ...], wanted: set[int]) -> dict[int, list[RawSpan]]:
@@ -355,12 +379,14 @@ def _spans_by_object(spans: tuple[RawSpan, ...], wanted: set[int]) -> dict[int, 
     return found
 
 
-def _overprints(origin: tuple[float, float], others: Iterable[tuple[float, float]]) -> bool:
-    """True if ``origin`` is within the overprint tolerance of one of ``others`` on both axes."""
-    x, y = origin
+def _overprints(copy: _Copy, others: Iterable[_Copy]) -> bool:
+    """True if one of ``others`` is painted as ``copy`` is, its origin within the overprint tolerance on both axes."""
+    x, y = copy.origin
     return any(
-        abs(x - other_x) <= OVERPRINT_TOLERANCE_PT and abs(y - other_y) <= OVERPRINT_TOLERANCE_PT
-        for other_x, other_y in others
+        other.paint == copy.paint
+        and abs(x - other.origin[0]) <= OVERPRINT_TOLERANCE_PT
+        and abs(y - other.origin[1]) <= OVERPRINT_TOLERANCE_PT
+        for other in others
     )
 
 
