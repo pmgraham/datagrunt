@@ -465,7 +465,10 @@ class TestStreamLayout:
 
 
 class TestStreamLayoutBounds:
-    """Adversarial pages of 20 000 pieces lay out in under 2 s: banding is O(c log c), the XY-cut O(D n log n)."""
+    """Adversarial pages of 20 000 pieces lay out within bounds: banding is O(c log c), the XY-cut O(D n log n).
+
+    Each bound is generous: it catches a pass gone quadratic (20 000 squared steps take minutes), not a slow runner.
+    """
 
     @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_a_grid_of_20_000_one_char_pieces_is_one_table(self):
@@ -496,7 +499,9 @@ class TestStreamLayoutBounds:
 
         assert not [item for item in found if isinstance(item, StreamTable)]
         assert sum(len(item.pieces) for item in found) == 20_000
-        assert elapsed < 2.0, f"{elapsed:.2f} s"
+        # Linear: 10 000, 20 000 and 40 000 pieces take 0.24, 0.49 and 0.99 s on a laptop; CI runners took 2.2-2.3 s
+        # for these 20 000 against a 2 s bound.
+        assert elapsed < 6.0, f"{elapsed:.2f} s"
 
 
 def two_rows():
