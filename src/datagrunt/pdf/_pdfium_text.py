@@ -122,15 +122,6 @@ class RawSpan:
             surrogate pair is one offset if either half is unmapped.
             ``TextStats.unicode_map_error_count`` counts the same chars in
             textpage chars.
-        painted_over: For clip-only text (render mode 7, which paints
-            nothing and adds its glyphs to the clip): whether a later object
-            in paint order (a path, image or shading, forms' contents
-            included; not text) overlaps the text object's box, so its
-            paint shows through the glyphs (gradient-filled text). Boxes are
-            page-space bounds, compared with positive overlap; the clip's
-            scope (``q`` ... ``Q``) is not checked, so a later paint after
-            the clip is restored counts too. False for every other render
-            mode (not read).
     """
 
     text: str
@@ -147,7 +138,6 @@ class RawSpan:
     object_index: int
     generated_breaks: tuple[int, ...]
     map_errors: tuple[int, ...]
-    painted_over: bool
 
     def __post_init__(self) -> None:
         self._check_text_and_boxes()
@@ -167,9 +157,6 @@ class RawSpan:
         rgba_tuple("fill_rgba", self.fill_rgba)
         rgba_tuple("stroke_rgba", self.stroke_rgba)
         int_at_least("object_index", self.object_index, 0)
-        if strict_bool("painted_over", self.painted_over) and self.render_mode != CLIP_ONLY_MODE:
-            only = f"read for render mode {CLIP_ONLY_MODE} (clip only) text only"
-            raise ValueError(f"painted_over is {only}, got render mode {self.render_mode}")
 
     def _check_text_and_boxes(self) -> None:
         if not isinstance(self.text, str):
@@ -303,15 +290,11 @@ class ObjectWalk(NamedTuple):
         glyphless: Whether the text object at an address draws no glyph
             with extent; asked only of text objects that own no textpage
             char, in walk order. It may raise PdfiumFailure.
-        painted_over: Whether a later path, image or shading overlaps the
-            text object at an address (``RawSpan.painted_over``); asked only
-            of clip-only (render mode 7) owners. It may raise PdfiumFailure.
     """
 
     indices: dict[int, int]
     text_objects: frozenset[int]
     glyphless: Callable[[int], bool]
-    painted_over: Callable[[int], bool]
 
 
 class CollectedText(NamedTuple):
@@ -339,11 +322,8 @@ class _Style(NamedTuple):
     render_mode: int
     fill_rgba: tuple[int, int, int, int]
     stroke_rgba: tuple[int, int, int, int]
-    painted_over: bool
 
 
-# The text render mode (PDF 32000-1, Table 106) that paints nothing and adds the glyphs to the clip.
-CLIP_ONLY_MODE = 7
 # PDF 32000-1 font descriptor flags (Table 121) and weights (Table 122).
 _FLAG_ITALIC = 0x40
 _FLAG_FORCE_BOLD = 0x40000
@@ -467,26 +447,19 @@ def _em(
     return math.copysign(height, nominal.value), width
 
 
-def render_mode(text_object: pdfium_c.FPDF_PAGEOBJECT, label: str) -> int:
-    """The text object's render mode, 0 to 7."""
-    mode = pdfium_c.FPDFTextObj_GetTextRenderMode(text_object)
-    if mode not in range(8):  # FPDF_TEXTRENDERMODE_UNKNOWN (-1) on failure
-        raise PdfiumFailure(f"read the render mode of {label}")
-    return mode
-
-
 def _read_style(
-    textpage: pdfium_c.FPDF_TEXTPAGE, text_object: pdfium_c.FPDF_PAGEOBJECT, char_index: int, walk: ObjectWalk
+    textpage: pdfium_c.FPDF_TEXTPAGE, text_object: pdfium_c.FPDF_PAGEOBJECT, char_index: int, object_index: int
 ) -> _Style:
-    """Read the style of the walked text object ``text_object``, which owns textpage char ``char_index``."""
-    address = object_address(text_object)
-    label = f"object {walk.indices[address]}"
+    """Read the style of text object ``object_index``, which owns textpage char ``char_index``."""
+    label = f"object {object_index}"
     font = pdfium_c.FPDFTextObj_GetFont(text_object)
     if not font:
         raise PdfiumFailure(f"read the font of {label}")
     name = _base_font_name(font, label)
     is_bold, is_italic = _bold_and_italic(font, name, label)
-    mode = render_mode(text_object, label)
+    render_mode = pdfium_c.FPDFTextObj_GetTextRenderMode(text_object)
+    if render_mode not in range(8):  # FPDF_TEXTRENDERMODE_UNKNOWN (-1) on failure
+        raise PdfiumFailure(f"read the render mode of {label}")
     font_size_pt, em_width_pt = _em(textpage, text_object, char_index, label)
     return _Style(
         font_size_pt=font_size_pt,
@@ -494,10 +467,9 @@ def _read_style(
         base_font_name=name,
         is_bold=is_bold,
         is_italic=is_italic,
-        render_mode=mode,
+        render_mode=render_mode,
         fill_rgba=read_rgba(pdfium_c.FPDFPageObj_GetFillColor, text_object, f"fill colour of {label}"),
         stroke_rgba=read_rgba(pdfium_c.FPDFPageObj_GetStrokeColor, text_object, f"stroke colour of {label}"),
-        painted_over=mode == CLIP_ONLY_MODE and walk.painted_over(address),
     )
 
 
@@ -634,7 +606,7 @@ def _textpage_flag(result: int, char_index: int, question: str) -> bool:
     return result == 1
 
 
-def _read_textpage(textpage: pdfium_c.FPDF_TEXTPAGE, walk: ObjectWalk) -> _Textpage:
+def _read_textpage(textpage: pdfium_c.FPDF_TEXTPAGE, object_indices: dict[int, int]) -> _Textpage:
     """Read every textpage char once, each owner's style once, and which owners pdfium cannot place."""
     count = pdfium_c.FPDFText_CountChars(textpage)
     if count < 0:
@@ -661,9 +633,9 @@ def _read_textpage(textpage: pdfium_c.FPDF_TEXTPAGE, walk: ObjectWalk) -> _Textp
         code = pdfium_c.FPDFText_GetUnicode(textpage, char_index)
         owner = object_address(text_object)
         if owner not in styles:
-            if owner not in walk.indices:
+            if owner not in object_indices:
                 raise PdfiumFailure(f"read the text object of char {char_index}: it is not in the page's object tree")
-            styles[owner] = _read_style(textpage, text_object, char_index, walk)
+            styles[owner] = _read_style(textpage, text_object, char_index, object_indices[owner])
         box = _loose_box(textpage, char_index)
         style = styles[owner]
         if not all(math.isfinite(value) for value in (*box, style.font_size_pt, style.em_width_pt)):
@@ -689,7 +661,7 @@ def collect_text(textpage: pdfium_c.FPDF_TEXTPAGE, to_display: Callable[[Box], B
     Raises:
         PdfiumFailure: If a pdfium call fails.
     """
-    read = _read_textpage(textpage, walk)
+    read = _read_textpage(textpage, walk.indices)
     ownerless = walk.text_objects - {char.owner for char in read.chars if char is not None}
     # In walk order, so a pdfium failure always names the same object.
     empty = frozenset(address for address in sorted(ownerless, key=walk.indices.__getitem__) if walk.glyphless(address))

@@ -133,14 +133,6 @@ Recovery (#366 task 3), pinned by ``tests/pdf_tests/test_pdfium_recover.py``
 - These edits live in their page load only: a fresh load of the page drops
   the same objects. :func:`recover_dropped_text` loads the page itself and
   saves nothing.
-
-Paint order (#366 A3 review I6), pinned by ``TestPaintedOver`` in
-``tests/pdf_tests/test_pdfium_spans.py``: clip-only text (render mode 7) is
-painted over when a later path, image or shading object's page-space bounds
-overlap its own. ``FPDFPageObj_GetMatrix`` fails for a shading object (an
-``sh``), whose bounds are its clip's, rounded out to whole points; so the
-rule reads bounds only, and only on a page whose text has a clip-only
-object.
 """
 
 import ctypes
@@ -151,10 +143,10 @@ import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from functools import cache, partial
+from functools import partial
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, NamedTuple, NoReturn
+from typing import Literal, NoReturn
 
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
@@ -194,7 +186,6 @@ from datagrunt.pdf._pdfium_recover import (
     TextObject,
     is_glyphless,
     isolate_dropped,
-    page_bounds,
     recovered_text,
 )
 from datagrunt.pdf._pdfium_text import ObjectWalk, PageText, RawSpan, TextStats, collect_text
@@ -594,17 +585,10 @@ def _page_objects(page_raw: pdfium_c.FPDF_PAGE) -> list[tuple[pdfium_c.FPDF_PAGE
 
 
 def _text_walk(objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]) -> ObjectWalk:
-    """The walk as the text stage reads it: each object's index, its text objects and two questions about them."""
+    """The walk as the text stage reads it: each object's index, the text objects, and which draw no glyph."""
     indices = {object_address(obj): index for index, (obj, _form) in enumerate(objects)}
     texts = (obj for obj, _form in objects if pdfium_c.FPDFPageObj_GetType(obj) == pdfium_c.FPDF_PAGEOBJ_TEXT)
-    # Read once, on the first question: only pages with clip-only text pay for the boxes.
-    order = cache(partial(_paint_order, objects))
-    return ObjectWalk(
-        indices,
-        frozenset(object_address(obj) for obj in texts),
-        partial(_glyphless, objects, indices),
-        partial(_painted_over, indices, order),
-    )
+    return ObjectWalk(indices, frozenset(object_address(obj) for obj in texts), partial(_glyphless, objects, indices))
 
 
 def _glyphless(objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]], indices: dict[int, int], address: int) -> bool:
@@ -613,53 +597,6 @@ def _glyphless(objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]], indices: dic
     text_object, _form = objects[index]
     label = f"object {index}"
     return is_glyphless(text_object, _read_matrix(text_object, label), label)
-
-
-# The objects whose paint shows through clip-only text drawn before them.
-_PAINTING_KINDS = (pdfium_c.FPDF_PAGEOBJ_PATH, pdfium_c.FPDF_PAGEOBJ_IMAGE, pdfium_c.FPDF_PAGEOBJ_SHADING)
-
-
-class _PaintOrder(NamedTuple):
-    """The page-space boxes the painted-over rule compares, by walk index.
-
-    ``texts``: each text object's box (None where not finite); ``paints``:
-    each path, image and shading object's (walk index, box), in walk order,
-    those that are not finite left out.
-    """
-
-    texts: dict[int, Box | None]
-    paints: tuple[tuple[int, Box], ...]
-
-
-def _paint_order(objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]) -> _PaintOrder:
-    """Read the boxes of the walk's text and painting objects (forms' included, their matrices composed).
-
-    Bounds only: pdfium reads no matrix of a shading object.
-    """
-    texts: dict[int, Box | None] = {}
-    paints: list[tuple[int, Box]] = []
-    for index, obj, kind, outer in _form_spaces(objects):
-        if kind == pdfium_c.FPDF_PAGEOBJ_TEXT:
-            texts[index] = page_bounds(obj, outer, f"object {index}")
-        elif kind in _PAINTING_KINDS:
-            box = page_bounds(obj, outer, f"object {index}")
-            if box is not None:
-                paints.append((index, box))
-    return _PaintOrder(texts, tuple(paints))
-
-
-def _painted_over(indices: dict[int, int], order: Callable[[], _PaintOrder], address: int) -> bool:
-    """Whether a path, image or shading after the text object at ``address`` overlaps its box (positive area)."""
-    index = indices[address]
-    found = order()
-    box = found.texts.get(index)
-    if box is None:
-        return False
-    left, bottom, right, top = box
-    return any(
-        later > index and paint[0] < right and left < paint[2] and paint[1] < top and bottom < paint[3]
-        for later, paint in found.paints
-    )
 
 
 def _pdfium_error(page_number: int, failure: PdfiumFailure) -> PDFCorruptError:
@@ -821,34 +758,27 @@ def _path_object_segments(
         return None
 
 
-def _form_spaces(
-    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]],
-) -> Iterator[tuple[int, pdfium_c.FPDF_PAGEOBJECT, int, Matrix]]:
-    """Each walked object that is not a form: its walk index, its type and its forms' matrix.
+def _objects_in_forms(
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]], kind: int
+) -> Iterator[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix, Matrix]]:
+    """Each walked object of type ``kind`` (not a form): its walk index, its matrix and its forms' matrix.
 
     pdfium's object matrix maps into the enclosing form's space only, so
     each form's matrix to page space is composed here, in walk order (a form
     precedes its contents); the last item maps the object's form space to
-    page space (IDENTITY off a form). Only forms' own matrices are read.
+    page space (IDENTITY off a form).
     """
     form_matrices: dict[int, Matrix] = {}
     for index, (obj, form) in enumerate(objects):
         obj_kind = pdfium_c.FPDFPageObj_GetType(obj)
-        outer = form_matrices[form] if form >= 0 else IDENTITY
+        if obj_kind not in (kind, pdfium_c.FPDF_PAGEOBJ_FORM):
+            continue
+        own, outer = _read_matrix(obj, f"object {index}"), form_matrices[form] if form >= 0 else IDENTITY
         if obj_kind == pdfium_c.FPDF_PAGEOBJ_FORM:
             # A non-finite form matrix is kept: everything inside it is then skipped.
-            form_matrices[index] = _read_matrix(obj, f"object {index}").then(outer)
+            form_matrices[index] = own.then(outer)
         else:
-            yield index, obj, obj_kind, outer
-
-
-def _objects_in_forms(
-    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]], kind: int
-) -> Iterator[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix, Matrix]]:
-    """Each walked object of type ``kind`` (not a form): its walk index, its matrix and its forms' matrix."""
-    for index, obj, obj_kind, outer in _form_spaces(objects):
-        if obj_kind == kind:
-            yield index, obj, _read_matrix(obj, f"object {index}"), outer
+            yield index, obj, own, outer
 
 
 def _placed_objects(page_raw: pdfium_c.FPDF_PAGE, kind: int) -> Iterator[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix]]:
@@ -1116,10 +1046,9 @@ def _recover(page: pdfium.PdfPage, geometry: PageGeometry) -> RecoveredText:
         texts = tuple(TextObject(*placed) for placed in _objects_in_forms(objects, pdfium_c.FPDF_PAGEOBJ_TEXT))
         with _opened_textpage(page, page_number) as textpage:
             before = collect_text(textpage.raw, to_display, walk)
-        targets = isolate_dropped(texts, before.dropped, to_display, walk.painted_over)
-        # A fresh walk: its boxes are read once the targets have moved (each target keeps its own fact).
+        targets = isolate_dropped(texts, before.dropped, to_display)
         with _opened_textpage(page, page_number) as textpage:
-            after = collect_text(textpage.raw, to_display, _text_walk(objects))
+            after = collect_text(textpage.raw, to_display, walk)
     display = Display(to_display, geometry.width_pt, geometry.height_pt)
     return recovered_text(targets, texts, before.page_text, after.page_text, display)
 

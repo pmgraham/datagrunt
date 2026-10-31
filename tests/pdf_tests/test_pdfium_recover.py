@@ -245,7 +245,6 @@ def raw_span(text: str = "Ab", box=(72.0, 200.0, 72.0, 200.0), **overrides) -> R
         "object_index": 1,
         "generated_breaks": (),
         "map_errors": (),
-        "painted_over": False,
     }
     return RawSpan(**(fields | overrides))
 
@@ -1011,30 +1010,6 @@ class TestRecovery:
 
         assert (item.span.text, item.hidden_reasons) == ("HIDDEN", ("tiny_font",))
         assert (item.span.font_size_pt, item.span.em_width_pt) == pytest.approx((0.0, 0.0), abs=1e-3)
-
-    @pytest.mark.parametrize("after,painted", [(b"0 0 400 300 re f", True), (b"", False)], ids=["fill", "none"])
-    def test_clip_only_text_is_painted_over_where_it_was(self, tmp_path, after, painted):
-        # Read where the object was drawn, not where recovery moved it.
-        content = CONTROL + b"q BT /F1 0 Tf 7 Tr 72 100 Td (HIDDEN) Tj ET %s Q" % after
-
-        (item,) = recovered(pdf(tmp_path, content)).spans
-
-        assert (item.span.text, item.span.render_mode, item.span.painted_over) == ("HIDDEN", 7, painted)
-
-    def test_a_clip_only_copy_nothing_paints_through_is_emitted(self, tmp_path):
-        # The first copy is painted over (gradient text a reader sees); the copy after the fill shows nothing.
-        clip = b"BT /F1 12 Tf 7 Tr 72 100 Td (Total) Tj ET "
-        content = CONTROL + b"q " + clip + b"0 0 400 300 re f " + clip + b"Q"
-
-        got = recovered(pdf(tmp_path, content))
-
-        (item,) = got.spans
-        assert (item.span.text, item.span.object_index, item.span.painted_over, got.stats) == (
-            "Total",
-            3,
-            False,
-            NO_LOSS,
-        )
 
     def test_generated_breaks_are_kept(self, tmp_path):
         got = recovered(pdf(tmp_path, CONTROL + b"BT /F1 0 Tf 72 100 Td [(Name) -12000 (Value)] TJ ET"))

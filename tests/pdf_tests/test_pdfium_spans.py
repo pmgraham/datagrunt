@@ -5,7 +5,6 @@ coordinates are top-left points in the unrotated page space, or written by
 hand (``hand_written_pdf``) for what ReportLab cannot write.
 """
 
-import ctypes
 import dataclasses
 import math
 import pickle
@@ -97,7 +96,6 @@ def span(**overrides) -> RawSpan:
         "object_index": 3,
         "generated_breaks": (),
         "map_errors": (),
-        "painted_over": False,
     }
     return RawSpan(**(fields | overrides))
 
@@ -258,25 +256,6 @@ class TestRawSpan:
     def test_invalid_field_raises(self, overrides, error, message):
         with pytest.raises(error, match=re.escape(message)):
             span(**overrides)
-
-    @pytest.mark.parametrize(
-        "overrides,error,message",
-        [
-            pytest.param({"painted_over": 1}, TypeError, "painted_over must be a bool, got 1 (int)", id="int"),
-            pytest.param(
-                {"painted_over": True, "render_mode": 3},
-                ValueError,
-                "painted_over is read for render mode 7 (clip only) text only, got render mode 3",
-                id="not-clip-only",
-            ),
-        ],
-    )
-    def test_invalid_painted_over_raises(self, overrides, error, message):
-        with pytest.raises(error, match=re.escape(message)):
-            span(**overrides)
-
-    def test_clip_only_text_may_be_painted_over(self):
-        assert span(render_mode=7, painted_over=True).painted_over is True
 
     def test_map_errors_anywhere_in_the_text_are_kept(self):
         value = span(**FOUR_CHARS, map_errors=(0, 3))
@@ -1328,95 +1307,6 @@ class TestEmWidth:
 
         # pdfium keeps the matrix in 32-bit floats: 0.0001 reads 0.000099999997.
         assert (got.font_size_pt, got.em_width_pt) == pytest.approx((size, width), rel=1e-5)
-
-
-# A shading over the whole page, for clip-only text that a later sh paints through.
-SHADING = (
-    b"<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 400 0]"
-    b" /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >>"
-)
-# A 1 x 1 px image (its pixels are never decoded here).
-ONE_PIXEL = b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8"
-ONE_PIXEL += b" /Length 1 >>\nstream\n\x80\nendstream"
-CLIP_TEXT = b"q BT /F1 24 Tf 7 Tr 30 150 Td (Gradient text) Tj ET "
-
-
-def painted_page(tmp_path: Path, content: bytes) -> Path:
-    """A page drawing ``content``, with /Sh (SHADING), /Im (ONE_PIXEL) and a form /X filling (0, 0)-(400, 300)."""
-    fill = b"0 0 400 300 re f"
-    form = b"<< /Type /XObject /Subtype /Form /BBox [0 0 400 300] /Length %d >>\nstream\n%s\nendstream" % (
-        len(fill),
-        fill,
-    )
-    resources = b"/Shading << /Sh 6 0 R >> /XObject << /Im 7 0 R /X 8 0 R >>"
-    return content_page(tmp_path, content, extra=(SHADING, ONE_PIXEL, form), resources=resources)
-
-
-class TestPaintedOver:
-    """Clip-only (render mode 7) text is painted over when a later path, image or shading overlaps its box."""
-
-    @pytest.mark.parametrize(
-        "content,painted",
-        [
-            # Gradient text: the glyphs clip, then a fill paints through them.
-            pytest.param(CLIP_TEXT + b"0 0.3 0.8 rg 0 0 400 300 re f Q", True, id="later-fill"),
-            pytest.param(CLIP_TEXT + b"Q", False, id="nothing-after"),
-            pytest.param(CLIP_TEXT + b"0 0 400 20 re f Q", False, id="later-fill-elsewhere"),
-            pytest.param(b"q 0 0 400 300 re f Q " + CLIP_TEXT + b"Q", False, id="earlier-fill"),
-            pytest.param(CLIP_TEXT + b"2 w 20 158 m 200 158 l S Q", True, id="later-stroke"),
-            pytest.param(CLIP_TEXT + b"/Sh sh Q", True, id="later-shading"),
-            pytest.param(CLIP_TEXT + b"q 400 0 0 300 0 0 cm /Im Do Q Q", True, id="later-image"),
-            pytest.param(CLIP_TEXT + b"/X Do Q", True, id="later-form-content"),
-            # Text drawn later does not show the clipped glyphs as text.
-            pytest.param(CLIP_TEXT + b"BT /F1 24 Tf 30 150 Td (Gradient text) Tj ET Q", False, id="later-text"),
-        ],
-    )
-    def test_a_later_painting_object_over_the_box(self, tmp_path, content, painted):
-        spans = spans_of(painted_page(tmp_path, content))
-
-        assert (spans[0].text, spans[0].render_mode, spans[0].painted_over) == ("Gradient text", 7, painted)
-
-    @pytest.mark.parametrize("mode", [0, 3, 4, 6])
-    def test_only_clip_only_text_is_read(self, tmp_path, mode):
-        content = b"q BT /F1 24 Tf %d Tr 30 150 Td (Gradient text) Tj ET 0 0 400 300 re f Q" % mode
-
-        (got,) = spans_of(painted_page(tmp_path, content))
-
-        assert (got.render_mode, got.painted_over) == (mode, False)
-
-    def test_clip_only_text_in_a_form_painted_over_on_the_page(self, tmp_path):
-        # The text's box is the form's under its matrix (2 0 0 2 100 100): (110, 110) on, past (0, 200).
-        inner = b"BT /F1 12 Tf 7 Tr 5 5 Td (In a form) Tj ET"
-        form = b"<< /Type /XObject /Subtype /Form /BBox [-500 -500 500 500] /Matrix [2 0 0 2 100 100]"
-        form += b" /Resources << /Font << /F1 5 0 R >> >> /Length %d >>\nstream\n%s\nendstream" % (len(inner), inner)
-        over = b"/F Do 100 100 50 20 re f"
-        beside = b"/F Do 0 0 50 20 re f"
-
-        painted = spans_of(content_page(tmp_path, over, extra=(form,), resources=b"/XObject << /F 6 0 R >>"))
-        unpainted = spans_of(content_page(tmp_path, beside, extra=(form,), resources=b"/XObject << /F 6 0 R >>"))
-
-        assert [(item.text, item.painted_over) for item in painted + unpainted] == [
-            ("In a form", True),
-            ("In a form", False),
-        ]
-
-    def test_pdfium_reads_the_bounds_but_no_matrix_of_a_shading_object(self, tmp_path):
-        # So the painted-over rule reads boxes only: a shading's are its clip's (here the glyphs', rounded out).
-        page = pdfium.PdfDocument(painted_page(tmp_path, CLIP_TEXT + b"/Sh sh Q"))[0]
-        shading = pdfium_c.FPDFPage_GetObject(page.raw, 1)
-        edges = [ctypes.c_float() for _ in range(4)]
-
-        assert pdfium_c.FPDFPageObj_GetType(shading) == pdfium_c.FPDF_PAGEOBJ_SHADING
-        assert not pdfium_c.FPDFPageObj_GetMatrix(shading, pdfium_c.FS_MATRIX())
-        assert pdfium_c.FPDFPageObj_GetBounds(shading, *edges)
-        assert [edge.value for edge in edges] == [31.0, 149.0, 168.0, 168.0]
-
-    def test_a_failure_reading_a_box_fails_the_text_stage(self, tmp_path, monkeypatch):
-        handle = open_document(painted_page(tmp_path, CLIP_TEXT + b"0 0 400 300 re f Q"))
-        monkeypatch.setattr(pdfium_c, "FPDFPageObj_GetBounds", failing(0))
-
-        with pytest.raises(PDFCorruptError, match=re.escape("page 1: pdfium cannot read the bounds of object 0")):
-            page_text(handle, 0)
 
 
 class TestEmSize:

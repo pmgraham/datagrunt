@@ -734,17 +734,6 @@ class TestRegressions:
         assert [item.hidden_reasons for item in result.pieces] == [("invisible",)]
         assert result.route == "vision"
 
-    def test_gradient_filled_text_is_digital(self, tmp_path):
-        # Clip-only text (7 Tr) that a later fill paints through is what a reader sees (A3 review I6).
-        content = (
-            b"q BT /F1 24 Tf 7 Tr 30 150 Td (Quarterly revenue up 12 percent) Tj ET 0 0.3 0.8 rg 0 0 400 300 re f Q"
-        )
-
-        result, raw = assessed(content_page(tmp_path, content))
-
-        assert raw.text.spans[0].painted_over
-        assert ([item.hidden_reasons for item in result.pieces], result.route) == ([()], "digital")
-
     def test_blank_page_is_vision(self, tmp_path):
         result, _ = assessed(built(tmp_path))
 
