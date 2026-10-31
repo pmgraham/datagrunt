@@ -599,18 +599,18 @@ def _decode_size(
 ) -> tuple[int, int, tuple[Skip, str] | None]:
     """The (width, height) pdfium decodes an image at, and why it must not (None: it may)."""
     codec = filters[-1] if filters else ""
+    wrappers = filters[:-1]
     reader = _HEADER_READERS.get(codec)
+    if reader is None and filters and codec not in _SIMPLE_FILTERS:
+        return 0, 0, ("unsized", f"{label} uses filter {codec!r}: its decode size cannot be read without decoding")
+    if not _ASCII_FILTERS.issuperset(wrappers):
+        behind = ", ".join(wrappers)
+        message = f"{label} is a {codec} stream behind {behind}: its size cannot be read without decoding"
+        return 0, 0, ("unsized", message)
     tiles, components = 1, 1
     if reader is None:
-        if not _SIMPLE_FILTERS.issuperset(filters):
-            return 0, 0, ("unsized", f"{label} uses filter {codec!r}: its decode size cannot be read without decoding")
         width, height = declared
     else:
-        wrappers = filters[:-1]
-        if not _ASCII_FILTERS.issuperset(wrappers):
-            behind = ", ".join(wrappers)
-            message = f"{label} is a {codec} stream behind {behind}: its size cannot be read without decoding"
-            return 0, 0, ("unsized", message)
         data = ascii_decoded() if wrappers else raw
         header = None if data is None else reader(data)
         if header is None:

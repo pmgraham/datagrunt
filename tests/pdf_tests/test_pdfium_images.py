@@ -1561,6 +1561,45 @@ class TestDecodeBounds:
         assert [(item.px_width, item.px_height) for item in got.images] == [(0, 0)]
         assert got.stats.skipped_unsized_images + got.stats.skipped_oversized_images == 1
 
+    @pytest.mark.parametrize(
+        "filter_spec,behind",
+        [
+            pytest.param(b"[/FlateDecode /FlateDecode]", "FlateDecode", id="flate-flate"),
+            pytest.param(b"[/LZWDecode /FlateDecode]", "LZWDecode", id="lzw-flate"),
+            pytest.param(b"[/FlateDecode /ASCII85Decode]", "FlateDecode", id="flate-ascii85"),
+        ],
+    )
+    def test_a_simple_filter_behind_a_non_ascii_filter_is_never_decoded(
+        self, tmp_path, decode_calls, filter_spec, behind
+    ):
+        path = xobject_page(tmp_path, zlib.compress(FLATE), RGB_4X2 + b" /Filter " + filter_spec)
+
+        got = images_of(path)
+
+        (image,) = got.images
+        assert (image.px_width, image.px_height) == (0, 0)
+        assert got.stats == stats(unsized=1, cover=DRAWN)
+        with pytest.raises(
+            DatagruntPDFError, match=re.escape(f"behind {behind}: its size cannot be read without decoding")
+        ):
+            only_loader(path).png_bytes()
+        assert decode_calls == []
+
+    @pytest.mark.parametrize(
+        "name,wrap",
+        [
+            pytest.param(b"ASCII85Decode", lambda data: base64.a85encode(data) + b"~>", id="ascii85-flate"),
+            pytest.param(b"ASCIIHexDecode", lambda data: data.hex().encode() + b">", id="asciihex-flate"),
+        ],
+    )
+    def test_a_simple_filter_behind_an_ascii_filter_is_decoded(self, tmp_path, name, wrap):
+        path = xobject_page(tmp_path, wrap(FLATE), RGB_4X2 + b" /Filter [/%s /FlateDecode]" % name)
+
+        (image,) = images_of(path).images
+
+        assert (image.px_width, image.px_height) == (4, 2)
+        assert decoded(only_loader(path).png_bytes()).size == (4, 2)
+
 
 def drawn_times(tmp_path: Path, count: int, data: bytes = FLATE, entries: bytes = RGB_4X2 + b" /Filter /FlateDecode"):
     """A page drawing one image XObject ``count`` times, in a row."""
