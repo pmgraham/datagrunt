@@ -189,11 +189,11 @@ class TestSpanPiece:
                 {"hidden_reasons": ("hidden",)}, ValueError, "hidden_reasons has unknown reason(s)", id="unknown"
             ),
             pytest.param(
-                # task 3 adds zero_scale with the recovery that produces it.
-                {"hidden_reasons": ("zero_scale",)},
+                # zero_scale (recovered Tz 0 text) is last in the canonical order.
+                {"hidden_reasons": ("zero_scale", "tiny_font")},
                 ValueError,
-                "hidden_reasons has unknown reason(s)",
-                id="zero-scale-not-yet",
+                "hidden_reasons must be in canonical order ('tiny_font', 'zero_scale')",
+                id="zero-scale-order",
             ),
             pytest.param(
                 {"hidden_reasons": ("invisible", "invisible")},
@@ -654,6 +654,7 @@ class TestModuleImports:
         allowed = {
             "datagrunt.pdf._pdfium_common",
             "datagrunt.pdf._pdfium_images",
+            "datagrunt.pdf._pdfium_recover",
             "datagrunt.pdf._pdfium_text",
             "datagrunt.pdf._validate",
             "datagrunt.pdf.elements",

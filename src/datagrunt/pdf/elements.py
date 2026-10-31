@@ -32,11 +32,16 @@ from datagrunt.pdf._validate import (
 )
 from datagrunt.pdf.exceptions import DatagruntPDFError
 
-HiddenReason: TypeAlias = Literal["off_page", "invisible", "tiny_font", "transparent", "matches_background"]
+HiddenReason: TypeAlias = Literal[
+    "off_page", "invisible", "tiny_font", "transparent", "matches_background", "zero_scale"
+]
 """Why a text span is hidden from a human reader (it is flagged, never dropped).
 
 ``matches_background`` means the text colour is indistinguishable from the
-background it is drawn on.
+background it is drawn on. ``zero_scale`` means the text is squeezed flat:
+drawn under 1 pt per em wide and narrower than tall (``Tz 0``), text pdfium's
+textpage drops and the v5 engine recovers (#366). New reasons are appended,
+so the canonical order of the older ones never changes.
 """
 
 # Canonical order, derived from the Literal so the two can never drift apart.

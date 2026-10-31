@@ -1,4 +1,4 @@
-"""Hidden-span flags, raster cover, page quality and routing for the v5 PDF quality stage (#366, A3 parts 1, 4).
+"""Hidden-span flags, raster cover, page quality and routing for the v5 PDF quality stage (#366, A3 parts 1, 3, 4).
 
 Internal: not exported from ``datagrunt`` or ``datagrunt.pdf``. Pure: it
 reads the engine's raw facts (:class:`~datagrunt.pdf.pdfium_engine.RawPage`,
@@ -26,7 +26,8 @@ char of every span, in order, cut into pieces that carry the A1
   paint nothing (``invisible``), so they are never ``transparent``.
 
 A white fill alone is no signal: ``matches_background`` needs the rendered
-background under the span (#366 task 2).
+background under the span (#366 task 2). ``zero_scale`` comes only from
+recovery (#366 task 3): textpage spans are never flagged with it.
 
 :func:`assess_page` measures a page and routes it (#366 task 4):
 
@@ -44,6 +45,13 @@ background under the span (#366 task 2).
   digital under ``ocr="never"``; else digital.
 - Unmapped regions: the box of each maximal run of invalid chars in a
   visible piece, where OCR (A5) reads what the text layer cannot say.
+
+Recovered text (#366 task 3,
+:func:`~datagrunt.pdf.pdfium_engine.recover_dropped_text`) joins the page as
+pieces after its own, each flagged with its recovered reasons and those
+:func:`classify_spans` computes for it. It counts toward
+``hidden_spans_flagged`` only: never toward routing, the char counts or the
+unmapped regions. Objects it could not recover are a warning.
 """
 
 import unicodedata
@@ -54,6 +62,7 @@ from typing import Literal, TypeAlias, get_args
 
 from datagrunt.pdf._pdfium_common import Box, union_box
 from datagrunt.pdf._pdfium_images import RawImage
+from datagrunt.pdf._pdfium_recover import TINY_FONT_PT, RecoveredText
 from datagrunt.pdf._pdfium_text import RawSpan
 from datagrunt.pdf._validate import choice_str, int_at_least, ordered_box, positive_float, str_tuple, typed_tuple
 from datagrunt.pdf.elements import (
@@ -82,7 +91,6 @@ _OCR_MODES: tuple[OcrMode, ...] = get_args(OcrMode)
 _FILL_MODES = frozenset({0, 2, 4, 6})
 _STROKE_MODES = frozenset({1, 2, 5, 6})
 _NO_PAINT_MODES = frozenset({3, 7})
-_TINY_FONT_PT = 1.0
 # Raster cover over this fraction of the page makes no-paint text over it an
 # OCR layer, and a page with enough text over it hybrid.
 _OCR_LAYER_COVER = 0.5
@@ -203,7 +211,7 @@ def _span_pieces(span: RawSpan, width: float, height: float, raster: tuple[Box, 
     """Yield ``span``'s pieces: maximal runs of chars with equal hidden reasons."""
     no_paint = span.render_mode in _NO_PAINT_MODES
     under = _overlapping(span.bbox, raster) if no_paint else ()
-    flagged = {"tiny_font": abs(span.font_size_pt) < _TINY_FONT_PT, "transparent": _transparent(span)}
+    flagged = {"tiny_font": abs(span.font_size_pt) < TINY_FONT_PT, "transparent": _transparent(span)}
     reasons: list[tuple[HiddenReason, ...]] = []
     for box in span.char_boxes:
         flagged["off_page"] = _off_page(box, width, height)
@@ -332,7 +340,8 @@ class PageAssessment:
     Picklable, so it crosses the process pool.
 
     Attributes:
-        pieces: Every char of every span, cut by :func:`classify_spans`.
+        pieces: Every char of every span, cut by :func:`classify_spans`,
+            then the recovered spans' pieces (see the module notes).
         quality: The page's quality signals; ``deskew_angle_deg`` and
             ``ocr_mean_confidence`` are None (A5 measures them).
         route: ``"digital"``, ``"hybrid"`` or ``"vision"``.
@@ -359,35 +368,82 @@ class PageAssessment:
         str_tuple("warnings", self.warnings)
 
 
-def assess_page(page: RawPage, *, ocr: OcrMode = "auto") -> PageAssessment:
+def assess_page(page: RawPage, *, ocr: OcrMode = "auto", recovered: RecoveredText | None = None) -> PageAssessment:
     """Classify a page's spans, measure its quality and route it (see the module notes).
 
-    Cost: :func:`classify_spans`, one raster cover and O(chars).
+    Cost: :func:`classify_spans` of the page's and the recovered spans, one
+    raster cover and O(chars).
 
     Args:
         page: The page's raw facts, as
             :func:`~datagrunt.pdf.pdfium_engine.extract_page` returns them.
         ocr: The reader's OCR option.
+        recovered: The page's recovered text, as
+            :func:`~datagrunt.pdf.pdfium_engine.recover_dropped_text` returns
+            it, or None for none.
 
     Raises:
-        TypeError: If ``page`` is not a RawPage, or ``ocr`` is not a str.
-        ValueError: If ``ocr`` is not ``"auto"``, ``"always"`` or ``"never"``.
+        TypeError: If ``page`` is not a RawPage, ``ocr`` is not a str, or
+            ``recovered`` is not a RecoveredText or None.
+        ValueError: If ``ocr`` is not ``"auto"``, ``"always"`` or ``"never"``,
+            or ``recovered`` does not account for exactly the page's
+            ``dropped_text_objects`` (it is another page's).
     """
     if not isinstance(page, RawPage):
         raise TypeError(f"page must be a RawPage, got {type(page).__name__}")
     choice_str("ocr", ocr, _OCR_MODES)
+    _check_recovered(recovered, page.text.stats.dropped_text_objects)
     width, height = page.geometry.width_pt, page.geometry.height_pt
     boxes = tuple(image.bbox for image in page.images.images)
     cover = _cover_fraction(boxes, width, height)
     pieces = _classify(page.text.spans, width, height, boxes, cover)
+    flagged = _recovered_pieces(recovered, width, height, boxes, cover)
     route, warnings = _route(_text_char_count(pieces), cover, ocr)
     return PageAssessment(
-        pieces=pieces,
-        quality=_quality(page, pieces),
+        pieces=pieces + flagged,
+        quality=_quality(page, pieces + flagged),
         route=route,
         unmapped_regions=_unmapped_regions(pieces),
-        warnings=warnings,
+        warnings=warnings + _recovery_warnings(recovered),
     )
+
+
+def _check_recovered(recovered: object, dropped: int) -> None:
+    """Require None, or a RecoveredText that accounts for each of the page's ``dropped`` text objects once."""
+    if recovered is None:
+        return
+    if not isinstance(recovered, RecoveredText):
+        raise TypeError(f"recovered must be a RecoveredText or None, got {type(recovered).__name__}")
+    stats = recovered.stats
+    counted = stats.overprint_duplicates + stats.whitespace_objects + stats.unrecovered_text_objects
+    accounted = len({item.span.object_index for item in recovered.spans}) + counted
+    if accounted != dropped:
+        found = f"recovered accounts for {accounted} dropped text object(s), but the page has {dropped}"
+        raise ValueError(f"{found}: it is not this page's recovery")
+
+
+def _recovered_pieces(
+    recovered: RecoveredText | None, width: float, height: float, boxes: tuple[Box, ...], cover: float
+) -> tuple[SpanPiece, ...]:
+    """The recovered spans' pieces, each with its recovered reasons and the computed ones, in canonical order."""
+    if recovered is None:
+        return ()
+    pieces = []
+    for item in recovered.spans:
+        for piece in _classify((item.span,), width, height, boxes, cover):
+            found = set(piece.hidden_reasons) | set(item.hidden_reasons)
+            reasons = tuple(reason for reason in HIDDEN_REASONS if reason in found)
+            pieces.append(SpanPiece(span=piece.span, start=piece.start, end=piece.end, hidden_reasons=reasons))
+    return tuple(pieces)
+
+
+def _recovery_warnings(recovered: RecoveredText | None) -> tuple[str, ...]:
+    """A warning for the dropped text objects recovery could not read back, if any."""
+    lost = 0 if recovered is None else recovered.stats.unrecovered_text_objects
+    if not lost:
+        return ()
+    missing = "could not be recovered; their text is missing from this page"
+    return (f"{lost} text object(s) that pdfium's textpage drops {missing}",)
 
 
 def _valid(char: str) -> bool:

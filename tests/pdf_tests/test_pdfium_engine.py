@@ -24,6 +24,7 @@ from datagrunt.pdf import (
     _path_segments,
     _pdfium_common,
     _pdfium_images,
+    _pdfium_recover,
     _pdfium_text,
     pdfium_engine,
 )
@@ -95,7 +96,15 @@ def imported_modules(module) -> set[str]:
     return imported | {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
 
 
-ENGINE_MODULES = [pdfium_engine, _pdfium_text, _pdfium_common, _path_segments, _pdfium_images, _image_headers]
+ENGINE_MODULES = [
+    pdfium_engine,
+    _pdfium_text,
+    _pdfium_recover,
+    _pdfium_common,
+    _path_segments,
+    _pdfium_images,
+    _image_headers,
+]
 
 
 class TestModuleImports:
@@ -122,6 +131,17 @@ class TestModuleImports:
             pytest.param(_pdfium_common, set(), id="common"),
             pytest.param(_pdfium_text, {"datagrunt.pdf._pdfium_common", "datagrunt.pdf._validate"}, id="text"),
             pytest.param(_path_segments, {"datagrunt.pdf._validate"}, id="segments"),
+            pytest.param(
+                _pdfium_recover,
+                {
+                    "datagrunt.pdf._path_segments",
+                    "datagrunt.pdf._pdfium_common",
+                    "datagrunt.pdf._pdfium_text",
+                    "datagrunt.pdf._validate",
+                    "datagrunt.pdf.elements",  # HiddenReason and its one validation rule
+                },
+                id="recover",
+            ),
         ],
     )
     def test_engine_parts_import_only_downward(self, module, allowed):

@@ -106,6 +106,7 @@ def stats(**overrides) -> TextStats:
                 "ownerless_count": 0,
                 "unicode_map_error_count": 0,
                 "skipped_nonfinite_objects": 0,
+                "dropped_text_objects": 0,
             }
             | overrides
         )
@@ -268,6 +269,15 @@ class TestTextStats:
                 "skipped_nonfinite_objects must be an int, got True",
                 id="skipped-bool",
             ),
+            pytest.param(
+                {"dropped_text_objects": -1}, ValueError, "dropped_text_objects must be >= 0, got -1", id="dropped"
+            ),
+            pytest.param(
+                {"dropped_text_objects": 1.0},
+                TypeError,
+                "dropped_text_objects must be an int, got 1.0",
+                id="dropped-float",
+            ),
         ],
     )
     def test_invalid_field_raises(self, overrides, error, message):
@@ -367,7 +377,12 @@ class TestSpanGrouping:
 
         assert [(item.text, item.generated_breaks) for item in result.spans] == [("AB", (1,))]
         assert result.stats == TextStats(
-            char_count=2, generated_count=1, ownerless_count=0, unicode_map_error_count=0, skipped_nonfinite_objects=0
+            char_count=2,
+            generated_count=1,
+            ownerless_count=0,
+            unicode_map_error_count=0,
+            skipped_nonfinite_objects=0,
+            dropped_text_objects=0,
         )
         assert result.spans[0].char_boxes[1][0] - result.spans[0].char_boxes[0][2] > 20.0
 
@@ -408,7 +423,12 @@ class TestSpanGrouping:
         # The generated line break falls between spans, so neither span has a break.
         assert [(item.text, item.generated_breaks) for item in result.spans] == [("Up", ()), ("Down", ())]
         assert result.stats == TextStats(
-            char_count=6, generated_count=2, ownerless_count=0, unicode_map_error_count=0, skipped_nonfinite_objects=0
+            char_count=6,
+            generated_count=2,
+            ownerless_count=0,
+            unicode_map_error_count=0,
+            skipped_nonfinite_objects=0,
+            dropped_text_objects=0,
         )
 
     def test_a_run_drawn_twice_in_place_reads_once(self, tmp_path):
@@ -709,7 +729,12 @@ class TestUnicode:
         assert [box[0] for box in got.char_boxes] == pytest.approx([72.0, 84.0, 96.0, 108.0], abs=TOL)
         assert got.char_boxes[1][2] == pytest.approx(96.0, abs=TOL)
         assert result.stats == TextStats(
-            char_count=6, generated_count=0, ownerless_count=0, unicode_map_error_count=0, skipped_nonfinite_objects=0
+            char_count=6,
+            generated_count=0,
+            ownerless_count=0,
+            unicode_map_error_count=0,
+            skipped_nonfinite_objects=0,
+            dropped_text_objects=0,
         )
 
     def test_lone_surrogates_and_unmapped_codes_are_kept(self, tmp_path):
@@ -718,7 +743,12 @@ class TestUnicode:
 
         assert [item.text for item in result.spans] == ["A\ud835\x04\ud835A"]
         assert result.stats == TextStats(
-            char_count=5, generated_count=0, ownerless_count=0, unicode_map_error_count=1, skipped_nonfinite_objects=0
+            char_count=5,
+            generated_count=0,
+            ownerless_count=0,
+            unicode_map_error_count=1,
+            skipped_nonfinite_objects=0,
+            dropped_text_objects=0,
         )
 
     def test_a_lone_low_surrogate_is_kept(self, tmp_path):
@@ -736,7 +766,12 @@ class TestUnicode:
         assert got.text == "\x01\U0010ffff\ufffd\x02\ufffd\x03"
         assert [box[0] for box in got.char_boxes] == pytest.approx([72.0, 84.0, 96.0, 108.0, 120.0, 132.0], abs=TOL)
         assert result.stats == TextStats(
-            char_count=6, generated_count=0, ownerless_count=0, unicode_map_error_count=6, skipped_nonfinite_objects=0
+            char_count=6,
+            generated_count=0,
+            ownerless_count=0,
+            unicode_map_error_count=6,
+            skipped_nonfinite_objects=0,
+            dropped_text_objects=0,
         )
 
     def test_a_code_beyond_unicode_never_pairs_with_a_surrogate(self, tmp_path):
@@ -882,7 +917,12 @@ class TestRightToLeft:
         assert [(item.text, item.object_index) for item in result.spans] == [("אב", 1), ("אבג", 0)]
         assert [box[0] for box in result.spans[0].char_boxes] == pytest.approx([164.0, 152.0], abs=TOL)
         assert result.stats == TextStats(
-            char_count=5, generated_count=0, ownerless_count=1, unicode_map_error_count=0, skipped_nonfinite_objects=0
+            char_count=5,
+            generated_count=0,
+            ownerless_count=1,
+            unicode_map_error_count=0,
+            skipped_nonfinite_objects=0,
+            dropped_text_objects=0,
         )
 
     def test_arabic_words_in_separate_tj_are_two_spans(self, tmp_path):
@@ -890,7 +930,12 @@ class TestRightToLeft:
 
         assert [(item.text, item.object_index) for item in result.spans] == [("ال", 1), ("لا", 0)]
         assert result.stats == TextStats(
-            char_count=4, generated_count=0, ownerless_count=1, unicode_map_error_count=0, skipped_nonfinite_objects=0
+            char_count=4,
+            generated_count=0,
+            ownerless_count=1,
+            unicode_map_error_count=0,
+            skipped_nonfinite_objects=0,
+            dropped_text_objects=0,
         )
 
     def test_english_hebrew_english_keeps_every_word(self, tmp_path):
@@ -899,17 +944,28 @@ class TestRightToLeft:
         # pdfium generates the space before the Hebrew word and inserts an ownerless one after it.
         assert [(item.text, item.object_index) for item in result.spans] == [("AB", 0), ("אב", 1), ("CD", 2)]
         assert result.stats == TextStats(
-            char_count=6, generated_count=1, ownerless_count=1, unicode_map_error_count=0, skipped_nonfinite_objects=0
+            char_count=6,
+            generated_count=1,
+            ownerless_count=1,
+            unicode_map_error_count=0,
+            skipped_nonfinite_objects=0,
+            dropped_text_objects=0,
         )
 
     def test_a_char_without_an_owner_is_counted_and_never_fails_the_page(self, tmp_path, monkeypatch):
+        # With no char owned, the run's text object counts as dropped too.
         handle = open_document(one_page(tmp_path, TextRun("Hi", x=72.0, y=100.0)))
         monkeypatch.setattr(pdfium_c, "FPDFText_GetTextObject", failing(None))
 
         result = page_text(handle, 0)
 
         empty = TextStats(
-            char_count=0, generated_count=0, ownerless_count=2, unicode_map_error_count=0, skipped_nonfinite_objects=0
+            char_count=0,
+            generated_count=0,
+            ownerless_count=2,
+            unicode_map_error_count=0,
+            skipped_nonfinite_objects=0,
+            dropped_text_objects=1,
         )
         assert result == PageText(spans=(), stats=empty)
 
@@ -1065,6 +1121,7 @@ class TestConservation:
                 ownerless_count=0,
                 unicode_map_error_count=0,
                 skipped_nonfinite_objects=0,
+                dropped_text_objects=0,
             ),
         )
 
@@ -1260,7 +1317,12 @@ class TestNonFiniteText:
         monkeypatch.setattr(pdfium_c, function, stand_in)
 
         empty = TextStats(
-            char_count=0, generated_count=0, ownerless_count=0, unicode_map_error_count=0, skipped_nonfinite_objects=1
+            char_count=0,
+            generated_count=0,
+            ownerless_count=0,
+            unicode_map_error_count=0,
+            skipped_nonfinite_objects=1,
+            dropped_text_objects=0,
         )
         assert page_text(handle, 0) == PageText(spans=(), stats=empty)
 

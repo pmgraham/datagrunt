@@ -23,12 +23,14 @@ Text (#365 T2), pinned by ``tests/pdf_tests/test_pdfium_spans.py``:
   boxes. An unmapped char code reads as itself, flagged by
   ``FPDFText_HasUnicodeMapError``; without a ToUnicode map a 3- or 4-byte
   CMap code can read beyond U+10FFFF (0x110000, 0xFFFFFFFF).
-- The textpage is not every drawn char: pdfium drops text at ``Tf 0``, at
-  ``Tz 0`` or under ~0.001 pt, objects of a single space, and a char drawn
-  on an identical char at the same place (fake-bold removal); it collapses
-  runs of spaces to one, decomposes ligatures (U+FB01 reads "fi") and
-  mirrors "(" in right-to-left text (it reads ")"). The engine keeps every
-  char the textpage reports.
+- The textpage is not every drawn char: pdfium drops a text object whose
+  box is under 0.01 pt wide (``Tf 0``, ``Tz 0``, a tiny size, an object of a
+  single space) and a copy drawn on identical text up to ~2 pt away
+  (fake-bold removal); it collapses runs of spaces to one, decomposes
+  ligatures (U+FB01 reads "fi") and mirrors "(" in right-to-left text (it
+  reads ")"). The engine keeps every char the textpage reports and counts
+  the text objects that own none (``TextStats.dropped_text_objects``):
+  :mod:`datagrunt.pdf._pdfium_recover` reads them back.
 - Standard-14 fonts have no descriptor: their flags lack ForceBold and their
   weight reads 0, so only the base name says bold. A non-embedded alias
   reads as the standard-14 font pdfium substitutes (``Arial,BoldItalic``
@@ -182,6 +184,12 @@ class TextStats:
             position or size: a char box or the font size is NaN or
             infinite, as under a ``cm`` that overflows pdfium's 32-bit CTM.
             pdfium renders the rest of such a page.
+        dropped_text_objects: Text objects of the page (forms' included)
+            that own no textpage char: pdfium dropped them (see the module
+            notes), so their text is in no span. Over 0, the page is worth
+            :func:`~datagrunt.pdf.pdfium_engine.recover_dropped_text`; at 0
+            there is nothing to recover. Disjoint from
+            ``skipped_nonfinite_objects``, whose objects own chars.
     """
 
     char_count: int
@@ -189,6 +197,7 @@ class TextStats:
     ownerless_count: int
     unicode_map_error_count: int
     skipped_nonfinite_objects: int
+    dropped_text_objects: int
 
     def __post_init__(self) -> None:
         int_at_least("char_count", self.char_count, 0)
@@ -196,6 +205,7 @@ class TextStats:
         int_at_least("ownerless_count", self.ownerless_count, 0)
         int_at_least("unicode_map_error_count", self.unicode_map_error_count, 0)
         int_at_least("skipped_nonfinite_objects", self.skipped_nonfinite_objects, 0)
+        int_at_least("dropped_text_objects", self.dropped_text_objects, 0)
         if self.unicode_map_error_count > self.char_count:
             counts = f"unicode_map_error_count ({self.unicode_map_error_count}) cannot exceed"
             raise ValueError(f"{counts} char_count ({self.char_count})")
@@ -221,6 +231,20 @@ class PageText:
         if not span_chars <= self.stats.char_count <= 2 * span_chars:
             message = f"spans hold {span_chars} chars, which {self.stats.char_count} textpage chars cannot make"
             raise ValueError(f"{message} (each is 1 textpage char, or 2 for a surrogate pair)")
+
+
+class CollectedText(NamedTuple):
+    """What :func:`collect_text` reads from a textpage.
+
+    Attributes:
+        page_text: The spans and counts.
+        dropped: The addresses (``object_address``) of the text objects that
+            own no textpage char; ``page_text.stats.dropped_text_objects``
+            counts them.
+    """
+
+    page_text: PageText
+    dropped: frozenset[int]
 
 
 class _Style(NamedTuple):
@@ -514,13 +538,16 @@ def _read_textpage(textpage: pdfium_c.FPDF_TEXTPAGE, object_indices: dict[int, i
 
 
 def collect_text(
-    textpage: pdfium_c.FPDF_TEXTPAGE, to_display: Callable[[Box], Box], object_indices: dict[int, int]
-) -> PageText:
+    textpage: pdfium_c.FPDF_TEXTPAGE,
+    to_display: Callable[[Box], Box],
+    object_indices: dict[int, int],
+    text_objects: frozenset[int],
+) -> CollectedText:
     """Read every textpage char once: count them and group the owned, non-generated ones.
 
     A text object with a char box or font size that is not finite (pdfium
     places it nowhere) is skipped whole and counted; a skipped char ends the
-    span it interrupts.
+    span it interrupts. A text object that owns no char is dropped.
 
     Args:
         textpage: The page's loaded textpage.
@@ -528,11 +555,13 @@ def collect_text(
             displayed, top-left ``(x0, y0, x1, y1)`` box.
         object_indices: Each page object's address (``object_address``) to
             its index in the page's depth-first, paint-order object walk.
+        text_objects: The addresses of the walk's text objects.
 
     Raises:
         PdfiumFailure: If a pdfium call fails.
     """
     read = _read_textpage(textpage, object_indices)
+    dropped = text_objects - {char.owner for char in read.chars if char is not None}
     builder = _SpanBuilder(to_display, object_indices, read.styles)
     kept = map_errors = 0
     for char in read.chars:
@@ -551,5 +580,6 @@ def collect_text(
         ownerless_count=read.ownerless_count,
         unicode_map_error_count=map_errors,
         skipped_nonfinite_objects=len(read.skipped),
+        dropped_text_objects=len(dropped),
     )
-    return PageText(spans=builder.finish(), stats=stats)
+    return CollectedText(page_text=PageText(spans=builder.finish(), stats=stats), dropped=dropped)
