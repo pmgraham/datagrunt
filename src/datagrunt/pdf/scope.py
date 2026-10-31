@@ -6,7 +6,7 @@ pdfium function. A1 types are frozen, so changed elements and pages are
 rebuilt with :func:`dataclasses.replace`; element ids and reading order never
 change.
 
-:func:`apply_scope` walks pages 1..N once, in document order:
+:func:`apply_scope` applies four rules to pages 1..N in document order, each in one walk:
 
 1. **Heading stack.** A visible level-L ``Heading`` pops every heading of
    level >= L and pushes itself. Every element's ``scope_path`` becomes the
@@ -27,14 +27,25 @@ change.
    has, repeated or its own, are kept). Both tables need
    ``column_centres``; without them there is no link. Chains link pairwise
    (p -> p+1 -> p+2). A link already on a table is left alone.
+4. **Sections.** One flat A1 ``Section`` per visible heading, holding that
+   heading (as ``elements[0]``) and everything after it up to the next
+   visible heading of any level, plus a leading heading-less section for
+   what comes before the first visible heading (only if there is any).
+   A1 sections do not nest (every element shares its section's
+   ``scope_path``), so a subsection is its own section and nesting is read
+   from ``scope_path`` prefixes. ``page_span`` runs from the section's first
+   element's page to its last's.
 
 The stack holds at most six entries (levels 1-6 strictly increase down it),
-so the walk is O(total elements), plus O(columns) per page boundary.
+so each walk is O(total elements); rule 3 adds O(columns) per page boundary.
 
 Known limitations:
 
 - A visible element above a continuation (a running page header, say)
   makes it not page p+1's first visible element, so it does not link.
+- A hidden heading is in no section: A1 makes a heading's ``scope_path``
+  end with its own text and a section's elements share its path, so a
+  heading that opens no scope fits none. It stays in its page's elements.
 """
 
 import dataclasses
@@ -43,7 +54,7 @@ from dataclasses import dataclass
 from typing import TypeAlias
 
 from datagrunt.pdf._validate import typed_tuple
-from datagrunt.pdf.elements import DocumentElement, Heading, KeyValue, Page, Table
+from datagrunt.pdf.elements import DocumentElement, Heading, KeyValue, Page, Section, Table
 
 # How far apart, in points, the same column's centres may lie on the two parts of a split table (spec §3.3).
 SPLIT_TABLE_TOLERANCE_PT = 8.0
@@ -58,20 +69,24 @@ class ScopeResult:
 
     Attributes:
         pages: The pages, each element carrying its ``scope_path``.
+        sections: Flat, heading-scoped runs of the pages' own elements, in
+            document order (see rule 4).
         header_context: Page 1's visible key-values that head the document,
             in reading order: the elements of ``pages[0]`` themselves.
     """
 
     pages: tuple[Page, ...]
+    sections: tuple[Section, ...]
     header_context: tuple[KeyValue, ...]
 
     def __post_init__(self) -> None:
         typed_tuple("pages", self.pages, Page)
+        typed_tuple("sections", self.sections, Section)
         typed_tuple("header_context", self.header_context, KeyValue)
 
 
 def apply_scope(pages: tuple[Page, ...]) -> ScopeResult:
-    """Return ``pages`` scoped (``scope_path``, split-table links), plus the document's header context.
+    """Return ``pages`` scoped (``scope_path``, split-table links), plus their sections and header context.
 
     Args:
         pages: The document's pages, numbered 1..N in order.
@@ -82,7 +97,7 @@ def apply_scope(pages: tuple[Page, ...]) -> ScopeResult:
     """
     _check_pages(pages)
     scoped = _link_split_tables(_scope_pages(pages))
-    return ScopeResult(pages=scoped, header_context=_header_context(scoped))
+    return ScopeResult(pages=scoped, sections=_sections(scoped), header_context=_header_context(scoped))
 
 
 def _check_pages(pages: object) -> None:
@@ -152,6 +167,35 @@ def _same_columns(first: Table, second: Table) -> bool:
         return False
     pairs = zip(first.column_centres, second.column_centres, strict=True)
     return all(abs(left - right) <= SPLIT_TABLE_TOLERANCE_PT for left, right in pairs)
+
+
+def _sections(pages: tuple[Page, ...]) -> tuple[Section, ...]:
+    """Return a flat section per visible heading, after a leading heading-less one if needed (rule 4)."""
+    found: list[Section] = []
+    heading: Heading | None = None
+    members: list[DocumentElement] = []
+    for element in (element for item in pages for element in item.elements):
+        if not isinstance(element, Heading):
+            members.append(element)
+        elif not element.is_hidden:
+            found.extend(_section(heading, members))
+            heading, members = element, [element]
+    found.extend(_section(heading, members))
+    return tuple(found)
+
+
+def _section(heading: Heading | None, members: list[DocumentElement]) -> tuple[Section, ...]:
+    """Return the section of ``members`` under ``heading``, or nothing when there are no members."""
+    if not members:
+        return ()
+    return (
+        Section(
+            heading=heading,
+            scope_path=() if heading is None else heading.scope_path,
+            page_span=(members[0].page_number, members[-1].page_number),
+            elements=tuple(members),
+        ),
+    )
 
 
 def _header_context(pages: tuple[Page, ...]) -> tuple[KeyValue, ...]:
