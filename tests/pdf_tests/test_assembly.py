@@ -12,9 +12,18 @@ import pickle
 
 import pytest
 
-from datagrunt.pdf import assembly
-from datagrunt.pdf.assembly import FigureDraft, PageFigures, page_figures
-from datagrunt.pdf.elements import BBox, Figure
+from datagrunt.pdf import assembly, layout
+from datagrunt.pdf.assembly import FigureDraft, PageFigures, assemble_page, page_figures, pass_c
+from datagrunt.pdf.elements import BBox, Figure, Page, Paragraph, Table
+from datagrunt.pdf.layout import (
+    MAX_CROSSINGS,
+    LatticeCell,
+    LatticeResult,
+    LatticeTable,
+    StreamTable,
+    find_lattice_tables,
+    stream_layout,
+)
 from datagrunt.pdf.pdfium_engine import (
     ImageLoader,
     ImageStats,
@@ -23,8 +32,15 @@ from datagrunt.pdf.pdfium_engine import (
     RawPage,
     extract_page,
     open_document,
+    recover_dropped_text,
 )
-from pdf_tests.builders import PageSpec, RasterImage, build_pdf, solid_png
+from datagrunt.pdf.quality import assess_page
+from datagrunt.pdf.scope import apply_scope
+from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf, solid_png
+from pdf_tests.test_layout_apart import tiny_text_page
+from pdf_tests.test_layout_lattice import rules as lattice_rules
+from pdf_tests.test_layout_lattice import written
+from pdf_tests.test_layout_stream_tables import body_text, table_runs
 from pdf_tests.test_pdfium_engine import imported_modules
 from pdf_tests.test_quality import SHA, image
 
@@ -375,3 +391,449 @@ class TestPageFiguresEndToEnd:
         page = read_page(path)
 
         assert page_figures(page.images, page.geometry, source=path) == PageFigures(drafts=(), warnings=())
+
+
+# Page assembly (task 7): assemble_page and Pass C.
+
+LETTER_W, LETTER_H = 612.0, 792.0
+LATTICE_XS = (50.0, 150.0, 250.0, 350.0)
+SPEC = (("Part", "Qty", "Price"), ("Bolt", "4", "0.10"), ("Nut", "12", "0.05"))
+PARTS = (("Part", "Qty", "Price"), ("Bolt", "4", "0.10"), ("Nut", "12", "0.05"), ("Washer", "100", "0.01"))
+
+
+def letter(tmp_path, *items, rotate: int = 0, name: str = "doc.pdf"):
+    """A one-page letter-size PDF of ``items``."""
+    return build_pdf(tmp_path / name, [PageSpec(items=items, rotate=rotate)])
+
+
+def inputs(path, index: int = 0):
+    """Page ``index``'s raw facts, its assessment (with its recovery) and its lattice tables."""
+    handle = open_document(path)
+    page = extract_page(handle, index)
+    recovered = recover_dropped_text(handle, index) if page.text.stats.dropped_text_objects else None
+    assessment = assess_page(page, recovered=recovered)
+    return page, assessment, find_lattice_tables(page.segments.segments, assessment.pieces)
+
+
+def assembled(path, index: int = 0, **options) -> Page:
+    """assemble_page of page ``index`` of ``path``."""
+    return assemble_page(*inputs(path, index), source=path, **options)
+
+
+def kinds(page: Page) -> list[str]:
+    """Each element's class name."""
+    return [type(element).__name__ for element in page.elements]
+
+
+def mixed_items() -> tuple:
+    """A heading, a paragraph, a key-value, a list, an image, a ruled table and a borderless one, top to bottom."""
+    return (
+        TextRun("Results", 72.0, 60.0, size=18.0),
+        *body_text(90.0),
+        TextRun("Invoice: 10442", 72.0, 150.0, size=10.0),
+        TextRun("• first item", 72.0, 180.0, size=10.0),
+        TextRun("• second item", 72.0, 194.0, size=10.0),
+        RasterImage(72.0, 220.0, 120.0, 80.0, solid_png(120, 80, (0.2, 0.4, 0.6))),
+        *lattice_rules(LATTICE_XS, (340.0, 360.0, 380.0, 400.0)),
+        *written(SPEC, LATTICE_XS, (340.0, 360.0, 380.0, 400.0)),
+        *table_runs(PARTS, top=460.0),
+    )
+
+
+class TestAssemblePage:
+    """assemble_page: the page's elements in reading order, with canonical ids, its facts and Pass C."""
+
+    def test_elements_come_in_reading_order_with_canonical_ids(self, tmp_path):
+        page = assembled(letter(tmp_path, *mixed_items()))
+
+        assert kinds(page) == ["Heading", "Paragraph", "KeyValue", "BulletList", "Figure", "Table", "Table"]
+        assert [element.element_id for element in page.elements] == [f"p0001_e{index:03d}" for index in range(7)]
+        assert [element.reading_order for element in page.elements] == list(range(7))
+
+    def test_the_page_carries_its_facts_and_passes_pass_c(self, tmp_path):
+        path = letter(tmp_path, *mixed_items())
+        raw, assessment, lattice = inputs(path)
+
+        page = assemble_page(raw, assessment, lattice, source=path)
+
+        assert (page.page_number, page.width_pt, page.height_pt) == (1, LETTER_W, LETTER_H)
+        assert (page.status, page.route, page.quality, page.page_image, page.error) == (
+            "ok",
+            "digital",
+            assessment.quality,
+            None,
+            None,
+        )
+        assert (page.integrity_verified, page.warnings) == (True, ())
+
+    def test_text_elements_convert_their_fields(self, tmp_path):
+        heading, paragraph, pair, bullets, *_ = assembled(letter(tmp_path, *mixed_items())).elements
+
+        assert (heading.text, heading.level, heading.scope_path) == ("Results", 1, ("Results",))
+        assert paragraph.text.startswith("The woodland is vast") and paragraph.scope_path == ()
+        assert (pair.key, pair.value) == ("Invoice", "10442")
+        assert (bullets.items, bullets.markers, bullets.ordered) == (("first item", "second item"), ("•", "•"), False)
+
+    def test_an_ordered_list_keeps_its_markers(self, tmp_path):
+        items = (TextRun("1. one", 72.0, 100.0, size=10.0), TextRun("2. two", 72.0, 114.0, size=10.0))
+
+        (bullets,) = assembled(letter(tmp_path, *body_text(300.0), *items)).elements[:1]
+
+        assert (bullets.items, bullets.markers, bullets.ordered) == (("one", "two"), ("1.", "2."), True)
+
+    def test_a_ruled_table_is_a_lattice_table_with_its_grid_column_centres(self, tmp_path):
+        tables = [
+            element for element in assembled(letter(tmp_path, *mixed_items())).elements if isinstance(element, Table)
+        ]
+
+        ruled = tables[0]
+        assert (ruled.extraction_method, ruled.headers, ruled.rows) == ("lattice", SPEC[0], SPEC[1:])
+        assert ruled.column_centres == pytest.approx((100.0, 200.0, 300.0))
+
+    def test_a_borderless_table_is_a_stream_table_with_its_band_centres(self, tmp_path):
+        path = letter(tmp_path, *mixed_items())
+        raw, assessment, lattice = inputs(path)
+        geometry = raw.geometry
+        (stream,) = [
+            item
+            for item in stream_layout(
+                assessment.pieces, lattice, width_pt=geometry.width_pt, height_pt=geometry.height_pt
+            )
+            if isinstance(item, StreamTable)
+        ]
+
+        table = [
+            element
+            for element in assemble_page(raw, assessment, lattice, source=path).elements
+            if isinstance(element, Table)
+        ][1]
+
+        assert (table.extraction_method, table.headers, table.rows) == ("stream", PARTS[0], PARTS[1:])
+        assert table.column_centres == stream.column_centres
+
+    @pytest.mark.parametrize("rotate", [90, 270])
+    def test_a_turned_table_has_no_column_centres(self, tmp_path, rotate):
+        ys = (340.0, 360.0, 380.0, 400.0)
+        items = (*lattice_rules(LATTICE_XS, ys), *written(SPEC, LATTICE_XS, ys), *table_runs(PARTS, top=460.0))
+
+        tables = [
+            element
+            for element in assembled(letter(tmp_path, *items, rotate=rotate)).elements
+            if isinstance(element, Table)
+        ]
+
+        assert sorted(table.extraction_method for table in tables) == ["lattice", "stream"]
+        assert [table.column_centres for table in tables] == [(), ()]
+
+    def test_a_figure_is_bound_and_never_loaded(self, tmp_path, monkeypatch):
+        def refuse(self):
+            raise AssertionError("a loader was called")
+
+        monkeypatch.setattr(ImageLoader, "png_bytes", refuse)
+        monkeypatch.setattr(ImageLoader, "raw_bytes", refuse)
+
+        page = assembled(letter(tmp_path, *mixed_items()))
+
+        (figure,) = [element for element in page.elements if isinstance(element, Figure)]
+        assert (figure.width_px, figure.height_px) == (120, 80)
+        assert figure.bbox == pytest.approx(BBox(x0=72.0, y0=220.0, x1=192.0, y1=300.0))
+        with pytest.raises(AssertionError, match="a loader was called"):
+            figure.read_bytes()
+
+    def test_figures_follow_the_options(self, tmp_path):
+        path = letter(tmp_path, *mixed_items())
+
+        assert "Figure" not in kinds(assembled(path, min_image_dimension=121))
+        (figure,) = [element for element in assembled(path, password="secret").elements if isinstance(element, Figure)]
+        assert figure._loader.__self__.password == "secret"
+
+    def test_hidden_and_recovered_text_become_hidden_paragraphs(self, tmp_path):
+        page = assembled(tiny_text_page(tmp_path))
+
+        hidden = [(element.text, element.hidden_reasons) for element in page.elements if element.is_hidden]
+        assert hidden == [("ZERO", ("tiny_font",)), ("CENTI", ("tiny_font",)), ("FOUR", ("tiny_font",))]
+        assert all(isinstance(element, Paragraph) for element in page.elements)
+        assert page.integrity_verified is True
+
+    def test_a_vision_page_keeps_its_digital_text_and_says_ocr_has_not_run(self, tmp_path):
+        page = assembled(letter(tmp_path, TextRun("Too short", 72.0, 100.0)))
+
+        assert (page.route, page.status, page.integrity_verified) == ("vision", "ocr_unavailable", False)
+        assert [element.text for element in page.elements] == ["Too short"]
+        assert page.warnings == (
+            "route 'vision': OCR (A5) has not run on this page; its digital text is kept as its elements",
+        )
+
+
+class TestAssemblePageWarnings:
+    """Warnings are carried from A2, A3 and A4a, then the page's own."""
+
+    def test_a2s_counts_are_carried(self, tmp_path):
+        path = letter(tmp_path, *body_text(100.0))
+        raw, assessment, lattice = inputs(path)
+        text = dataclasses.replace(raw.text, stats=dataclasses.replace(raw.text.stats, skipped_nonfinite_objects=2))
+        segments = dataclasses.replace(
+            raw.segments, stats=dataclasses.replace(raw.segments.stats, skipped_nonfinite_paths=3)
+        )
+        images = dataclasses.replace(
+            raw.images, stats=dataclasses.replace(raw.images.stats, skipped_nonfinite_images=1)
+        )
+        raw = dataclasses.replace(raw, text=text, segments=segments, images=images)
+
+        page = assemble_page(raw, assessment, lattice, source=path)
+
+        assert page.warnings == (
+            "2 text object(s) skipped: pdfium places them at a non-finite position or size; "
+            "their text is missing from this page",
+            "3 path object(s) skipped: their geometry is not finite; their rules are missing from this page",
+            "1 image object(s) skipped: their placement on the page is not finite",
+        )
+
+    def test_a3s_warnings_are_carried(self, tmp_path):
+        path = tiny_text_page(tmp_path)
+        handle = open_document(path)
+        raw = extract_page(handle, 0)
+        assessment = assess_page(raw)  # no recovery: A3 warns of the dropped object
+
+        page = assemble_page(
+            raw, assessment, find_lattice_tables(raw.segments.segments, assessment.pieces), source=path
+        )
+
+        assert page.warnings == assessment.warnings != ()
+
+    @pytest.mark.parametrize(
+        "lattice,expected",
+        [
+            pytest.param(
+                LatticeResult(tables=(), used_pieces=(), skipped_grids=2),
+                "2 ruled grid(s) left out of the lattice pass (over its per-page bounds): "
+                "their text reads as stream text",
+                id="skipped-grids",
+            ),
+            pytest.param(
+                LatticeResult(tables=(), used_pieces=(), crossing_cap_reached=True),
+                f"the page's rules cross more than {MAX_CROSSINGS} times: no lattice tables were read; "
+                "its text reads as stream text",
+                id="crossing-cap",
+            ),
+        ],
+    )
+    def test_a4as_bounds_are_carried(self, tmp_path, lattice, expected):
+        path = letter(tmp_path, *body_text(100.0))
+        raw, assessment, _ = inputs(path)
+
+        assert assemble_page(raw, assessment, lattice, source=path).warnings == (expected,)
+
+    def test_figure_and_layout_warnings_are_carried(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(layout, "MAX_APART_PAIRS", 0)
+        path = tiny_text_page(tmp_path)
+
+        page = assembled(path)
+
+        assert page.warnings == (
+            "3 hidden or recovered line(s) read after the page's visible text: placing them by position "
+            "would compare 3 pairs, over the bound of 0",
+        )
+
+
+class TestPassC:
+    """Pass C: the multiset of the page's non-whitespace chars equals its elements'; a mismatch warns, never raises."""
+
+    def test_every_element_kind_counts_its_chars(self, tmp_path):
+        path = letter(tmp_path, *mixed_items())
+        raw, assessment, lattice = inputs(path)
+        page = assemble_page(raw, assessment, lattice, source=path)
+
+        assert pass_c(assessment, page.elements) == (True, ())
+
+    def test_dropping_an_element_fails_with_the_counts(self, tmp_path):
+        path = letter(tmp_path, *mixed_items())
+        raw, assessment, lattice = inputs(path)
+        elements = assemble_page(raw, assessment, lattice, source=path).elements
+        total = sum(1 for piece in assessment.pieces for char in piece.text if not char.isspace())
+
+        verified, warnings = pass_c(assessment, elements[1:])
+
+        assert verified is False
+        assert warnings == (
+            f"Pass C: the page's text holds {total} non-whitespace chars and its elements {total - 7}: "
+            "7 missing, 0 extra",
+        )
+
+    def test_an_extra_char_fails(self, tmp_path):
+        path = letter(tmp_path, *body_text(100.0))
+        raw, assessment, lattice = inputs(path)
+        (paragraph,) = assemble_page(raw, assessment, lattice, source=path).elements
+        total = sum(1 for piece in assessment.pieces for char in piece.text if not char.isspace())
+
+        verified, warnings = pass_c(assessment, (dataclasses.replace(paragraph, text=paragraph.text + "!"),))
+
+        assert (verified, warnings) == (
+            False,
+            (
+                f"Pass C: the page's text holds {total} non-whitespace chars and its elements {total + 1}: "
+                "0 missing, 1 extra",
+            ),
+        )
+
+    def test_whitespace_never_counts(self, tmp_path):
+        path = letter(tmp_path, *body_text(100.0))
+        raw, assessment, lattice = inputs(path)
+        (paragraph,) = assemble_page(raw, assessment, lattice, source=path).elements
+
+        spaced = dataclasses.replace(paragraph, text=" \t".join(paragraph.text) + "\n")
+
+        assert pass_c(assessment, (spaced,)) == (True, ())
+
+    def test_recovered_chars_count(self, tmp_path):
+        path = tiny_text_page(tmp_path)
+        raw, assessment, lattice = inputs(path)
+        elements = assemble_page(raw, assessment, lattice, source=path).elements
+
+        assert pass_c(assessment, elements) == (True, ())
+        assert pass_c(dataclasses.replace(assessment, recovered_pieces=()), elements)[0] is False
+
+    def test_a_page_dropping_an_element_is_not_verified(self, tmp_path, monkeypatch):
+        real = assembly.page_layout
+
+        def lose_the_first(*args, **kwargs):
+            found = real(*args, **kwargs)
+            return dataclasses.replace(found, items=found.items[1:])
+
+        monkeypatch.setattr(assembly, "page_layout", lose_the_first)
+
+        page = assembled(letter(tmp_path, *mixed_items()))
+
+        assert page.integrity_verified is False
+        assert page.warnings[-1].startswith("Pass C: the page's text holds ")
+        assert page.warnings[-1].endswith(": 7 missing, 0 extra")
+
+    def test_a_vision_page_is_never_verified_but_still_checked(self, tmp_path, monkeypatch):
+        real = assembly.page_layout
+
+        def lose_the_first(*args, **kwargs):
+            found = real(*args, **kwargs)
+            return dataclasses.replace(found, items=found.items[1:])
+
+        monkeypatch.setattr(assembly, "page_layout", lose_the_first)
+
+        page = assembled(letter(tmp_path, TextRun("Too short", 72.0, 100.0)))
+
+        assert page.integrity_verified is False
+        assert page.warnings[-1].endswith(": 8 missing, 0 extra")
+
+
+class TestAssemblePageArguments:
+    """assemble_page checks its arguments at its boundary."""
+
+    def test_rejects_wrong_types(self, tmp_path):
+        path = letter(tmp_path, *body_text(100.0))
+        raw, assessment, lattice = inputs(path)
+
+        with pytest.raises(TypeError, match="raw_page"):
+            assemble_page(None, assessment, lattice, source=path)
+        with pytest.raises(TypeError, match="assessment"):
+            assemble_page(raw, None, lattice, source=path)
+        with pytest.raises(TypeError, match="lattice"):
+            assemble_page(raw, assessment, None, source=path)
+
+    def test_rejects_another_pages_assessment(self, tmp_path):
+        first = letter(tmp_path, *body_text(100.0), name="first.pdf")
+        second = letter(tmp_path, TextRun("A different page of other text", 72.0, 100.0), name="second.pdf")
+        raw, _, lattice = inputs(first)
+        _, other, _ = inputs(second)
+
+        with pytest.raises(ValueError, match="assessment"):
+            assemble_page(raw, other, lattice, source=first)
+
+    def test_rejects_an_assessment_of_another_rotation(self, tmp_path):
+        path = letter(tmp_path, *body_text(100.0))
+        raw, assessment, lattice = inputs(path)
+        turned = dataclasses.replace(assessment, quality=dataclasses.replace(assessment.quality, rotation_deg=90))
+
+        with pytest.raises(ValueError, match="turned 90, not 0"):
+            assemble_page(raw, turned, lattice, source=path)
+
+    def test_pass_c_checks_its_arguments(self, tmp_path):
+        raw, assessment, _ = inputs(letter(tmp_path, *body_text(100.0)))
+
+        with pytest.raises(TypeError, match="assessment"):
+            pass_c(raw, ())
+        with pytest.raises(TypeError, match=r"elements\[0\]"):
+            pass_c(assessment, ("text",))
+        with pytest.raises(TypeError, match="elements"):
+            pass_c(assessment, [])
+
+    def test_a_ruled_table_reaching_past_the_page_is_clipped_to_it(self, tmp_path):
+        path = letter(tmp_path, *body_text(100.0))
+        raw, assessment, _ = inputs(path)
+        reaching = LatticeTable(
+            bbox=BBox(x0=-20.0, y0=700.0, x1=300.0, y1=800.0),
+            n_rows=1,
+            n_cols=2,
+            cells=(
+                LatticeCell(
+                    row=0, col=0, row_span=1, col_span=1, bbox=BBox(x0=-20.0, y0=700.0, x1=100.0, y1=800.0), text=""
+                ),
+                LatticeCell(
+                    row=0, col=1, row_span=1, col_span=1, bbox=BBox(x0=100.0, y0=700.0, x1=300.0, y1=800.0), text="x"
+                ),
+            ),
+        )
+
+        page = assemble_page(raw, assessment, LatticeResult(tables=(reaching,), used_pieces=()), source=path)
+
+        (table,) = [element for element in page.elements if isinstance(element, Table)]
+        assert table.bbox == BBox(x0=0.0, y0=700.0, x1=300.0, y1=LETTER_H)
+        assert table.column_centres == (40.0, 200.0)
+
+
+class TestSplitTablesLinkAcrossPages:
+    """A6's apply_scope links a table split across two pages from real assemble_page output."""
+
+    @pytest.mark.parametrize("kind", ["lattice", "stream"])
+    def test_a_table_split_across_pages_is_linked(self, tmp_path, kind):
+        if kind == "lattice":
+            tail = (
+                *lattice_rules(LATTICE_XS, (600.0, 620.0, 640.0, 660.0)),
+                *written(SPEC, LATTICE_XS, (600.0, 620.0, 640.0, 660.0)),
+            )
+            head = (
+                *lattice_rules(LATTICE_XS, (60.0, 80.0, 100.0)),
+                *written(PARTS[3:] + (("Pin", "8", "0.02"),), LATTICE_XS, (60.0, 80.0, 100.0)),
+            )
+        else:
+            tail = table_runs(PARTS, top=650.0)
+            head = table_runs((("Washer", "100", "0.01"), ("Pin", "8", "0.02")), top=60.0)
+        pages = [
+            PageSpec(items=(TextRun("Parts list", 72.0, 60.0, size=18.0), *body_text(100.0), *tail)),
+            PageSpec(items=(*head, *body_text(300.0))),
+        ]
+        path = build_pdf(tmp_path / "split.pdf", pages)
+
+        first, second = assembled(path, 0), assembled(path, 1)
+        scoped = apply_scope((first, second))
+
+        (tail_table,) = [element for element in scoped.pages[0].elements if isinstance(element, Table)]
+        (head_table,) = [element for element in scoped.pages[1].elements if isinstance(element, Table)]
+        assert tail_table.extraction_method == head_table.extraction_method == kind
+        assert head_table.continued_from_id == tail_table.element_id
+
+    def test_a_turned_split_table_is_not_linked(self, tmp_path):
+        pages = [
+            PageSpec(items=(*body_text(100.0), *table_runs(PARTS, top=650.0)), rotate=90),
+            PageSpec(
+                items=(*table_runs((("Washer", "100", "0.01"), ("Pin", "8", "0.02")), top=60.0), *body_text(300.0)),
+                rotate=90,
+            ),
+        ]
+        path = build_pdf(tmp_path / "split.pdf", pages)
+
+        scoped = apply_scope((assembled(path, 0), assembled(path, 1)))
+
+        assert [
+            element.continued_from_id
+            for page in scoped.pages
+            for element in page.elements
+            if isinstance(element, Table)
+        ] == [None, None]

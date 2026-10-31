@@ -25,9 +25,11 @@ headings, key-value pairs, lists and paragraphs (:class:`StreamHeading`,
 each keeping the char ranges it reads. :func:`stream_layout` puts it
 together: borderless tables (:class:`StreamTable`), mastheads and
 key-value lists found on the lines and read whole, the rest classified,
-all in reading order. :func:`page_layout` adds the page's hidden and
-recovered text, laid out apart as lines (:class:`ApartLine`) and placed
-among the visible items by position, so it never changes their order.
+all in reading order. :func:`page_layout` reads the whole page: its
+lattice tables and figures (:class:`FigureSlot`) join the XY-cut as
+units that hold no text, and its hidden and recovered text is laid out
+apart as lines (:class:`ApartLine`), placed among the visible items by
+position, so it never changes their order.
 
 Known limitations (each a fact this pure pass cannot see):
 
@@ -66,6 +68,7 @@ from datagrunt.pdf.quality import SpanPiece
 
 __all__ = [
     "ApartLine",
+    "FigureSlot",
     "LatticeCell",
     "LatticeResult",
     "LatticeTable",
@@ -216,18 +219,24 @@ class LatticeTable:
         n_rows: Grid rows, at least 1.
         n_cols: Grid columns, at least 1.
         cells: The cells in row-major order of their top-left positions.
+        turn: The clockwise angle its text advances at on the displayed
+            page, which its rows run along: 0 (across), 90 (down) or 270
+            (up). An upright table's columns run left to right on the page.
     """
 
     bbox: BBox
     n_rows: int
     n_cols: int
     cells: tuple[LatticeCell, ...]
+    turn: int = _ACROSS
 
     def __post_init__(self) -> None:
         _check_bbox("bbox", self.bbox)
         int_at_least("n_rows", self.n_rows, 1)
         int_at_least("n_cols", self.n_cols, 1)
         typed_tuple("cells", self.cells, LatticeCell)
+        if int_at_least("turn", self.turn, 0) not in _TURNS:
+            raise ValueError(f"turn must be 0, 90 or 270, got {self.turn}")
         self._check_placement()
         self._check_every_line_starts_a_cell()
         self._check_tiling()
@@ -912,6 +921,7 @@ def _table(grid: _Grid, cell_runs: list[list[_Run]]) -> LatticeTable | None:
             LatticeCell(row=row, col=col, row_span=rows, col_span=cols, bbox=_bbox(box), text=text)
             for (row, col, rows, cols), box, text in cells
         ),
+        turn=turn,
     )
 
 
@@ -1329,14 +1339,17 @@ def _ink_box(run: _Run) -> Box:
 _Region = tuple[list[int], int | None]
 
 
-def _xy_cut(boxes: list[Box], weights: list[int]) -> list[list[int]]:
+def _xy_cut(boxes: list[Box], weights: list[int], text: list[bool] | None = None) -> list[list[int]]:
     """The items' reading-order segments: lists of indices into ``boxes``, in reading order.
 
     v4's recursive XY-cut (``layout_sorter.PageLayoutSorter.partition``),
     ported to a stack of regions: each region is cut into parts read in
     order (:func:`_cut_region`), or is a segment. ``weights`` (chars per
     item) make the density histogram. Boxes are in the frame the page
-    reads in: left to right, lines top to bottom.
+    reads in: left to right, lines top to bottom. ``text`` says which
+    items are text (all, when None): as v4's ``_filter_text_items``, only
+    text sets a region's extent and histogram; every item is dealt into
+    the parts (a table or an image, say).
 
     Bound: a region at depth :data:`MAX_PARTITION_DEPTH` is not cut, and
     the regions at one depth hold disjoint items (each cut deals its
@@ -1357,7 +1370,7 @@ def _xy_cut(boxes: list[Box], weights: list[int]) -> list[list[int]]:
     stack: list[_Region] = [(list(range(len(boxes))), 0)] if boxes else []
     while stack:
         items, depth = stack.pop()
-        parts = None if depth is None else _cut_region(boxes, weights, items, depth)
+        parts = None if depth is None else _cut_region(boxes, weights, items, depth, text)
         if parts is None:
             segments.append(items)
         else:
@@ -1365,16 +1378,21 @@ def _xy_cut(boxes: list[Box], weights: list[int]) -> list[list[int]]:
     return segments
 
 
-def _cut_region(boxes: list[Box], weights: list[int], items: list[int], depth: int) -> list[_Region] | None:
+def _cut_region(
+    boxes: list[Box], weights: list[int], items: list[int], depth: int, text: list[bool] | None = None
+) -> list[_Region] | None:
     """A region's parts in reading order (v4's ``partition`` step), or None to read it as one segment.
 
     No cut at :data:`MAX_PARTITION_DEPTH`, for fewer than
-    :data:`_MIN_CUT_ITEMS` items, a region under :data:`_MIN_CUT_WIDTH_PT`
-    wide or one with no gutter (:func:`_widest_gutter`). The items not
-    spanning the gutter (:func:`_spans`) are its columns' text: unless
-    they lie on both sides of it (by box centre), there are no columns to
-    cut. Else the spanning items cut the columns into bands
-    (:func:`_bands`), or with none the columns split into the two sides.
+    :data:`_MIN_CUT_ITEMS` items, a region of no text (v4), a region
+    whose text is under :data:`_MIN_CUT_WIDTH_PT` wide, or one with no
+    gutter (:func:`_widest_gutter`, over its text). The items not
+    spanning the gutter (:func:`_spans`) are its columns: unless text of
+    them lies on both sides of it (by box centre), there are no columns
+    to cut (a unit is dealt to a side, but makes no column). Else the
+    spanning items cut the columns into bands (:func:`_bands`), or with
+    none the columns split into the two sides. A unit spans only where no
+    column text starts beside it (:func:`_unflanked`).
 
     v4 asked for text on both sides only before that split. Asked before
     the bands too (a v5 fix): a region of lines each wider than
@@ -1384,22 +1402,50 @@ def _cut_region(boxes: list[Box], weights: list[int], items: list[int], depth: i
     """
     if depth >= MAX_PARTITION_DEPTH or len(items) < _MIN_CUT_ITEMS:
         return None
-    x0, y0, x1, y1 = union_box(tuple(boxes[index] for index in items))
+    texts = items if text is None else [index for index in items if text[index]]
+    if not texts:
+        return None
+    x0, y0, x1, y1 = union_box(tuple(boxes[index] for index in texts))
     if x1 - x0 < _MIN_CUT_WIDTH_PT:
         return None
-    gutter = _widest_gutter(boxes, weights, items, x0, x1 - x0)
+    gutter = _widest_gutter(boxes, weights, texts, x0, x1 - x0)
     if gutter is None:
         return None
     spanning = [index for index in items if _spans(boxes[index], gutter, y1 - y0)]
+    if text is not None:
+        spanning = _unflanked(boxes, spanning, items, text)
     across = set(spanning)
     columns = [index for index in items if index not in across]
     left = [index for index in columns if (boxes[index][0] + boxes[index][2]) / 2 < gutter]
-    if not left or len(left) == len(columns):
+    texts_left = sum(1 for index in left if text is None or text[index])
+    if not texts_left or texts_left == sum(1 for index in columns if text is None or text[index]):
         return None
     if not spanning:
         chosen = set(left)
         return [(left, depth + 1), ([index for index in columns if index not in chosen], depth + 1)]
     return _bands(boxes, spanning, columns, depth)
+
+
+def _unflanked(boxes: list[Box], spanning: list[int], items: list[int], text: list[bool]) -> list[int]:
+    """The spanning items less each unit that column text flanks: a text item not spanning starts beside it.
+
+    A v5 rule (v4 let any item span): a unit spanning the gutter cuts the
+    columns into a band from its top to its bottom, and the column text
+    starting in that band would read across the gutter, a line of each
+    column as one. Flanked, it is a column item, dealt by its centre.
+    "Beside" is the band's span, top included, bottom not (as
+    :func:`_bands` deals tops). O(k log k) for k items.
+    """
+    across = set(spanning)
+    tops = sorted(boxes[index][1] for index in items if text[index] and index not in across)
+    kept = []
+    for index in spanning:
+        if not text[index]:
+            at = bisect_left(tops, boxes[index][1])
+            if at < len(tops) and tops[at] < boxes[index][3]:
+                continue
+        kept.append(index)
+    return kept
 
 
 def _widest_gutter(boxes: list[Box], weights: list[int], items: list[int], left: float, width: float) -> float | None:
@@ -1998,6 +2044,28 @@ class StreamTable:
 
 
 StreamElement = StreamItem | StreamTable
+_STREAM = (StreamHeading, StreamParagraph, StreamKeyValue, StreamList, StreamTable)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FigureSlot:
+    """Where a figure reads in the page's order: its index among the boxes :func:`page_layout` was given.
+
+    Attributes:
+        index: The figure's index (>= 0) in ``page_layout``'s ``figures``.
+        bbox: Its box, as given.
+    """
+
+    index: int
+    bbox: BBox
+
+    def __post_init__(self) -> None:
+        int_at_least("index", self.index, 0)
+        _check_bbox("bbox", self.bbox)
+
+
+# A unit of the page's reading order that holds no stream text: a lattice table or a figure.
+_Unit = LatticeTable | FigureSlot
 
 
 def stream_layout(
@@ -2025,9 +2093,9 @@ def stream_layout(
        size and heading levels read over all of them, so text in rows
        never moves the body size; a list never runs across a table.
 
-    Ids and positions among the lattice tables and figures come in A4b
-    group 3. Every visible char outside the lattice tables is read once,
-    in the items' ``pieces``.
+    :func:`page_layout` reads the page with its lattice tables, figures,
+    hidden and recovered text too. Every visible char outside the lattice
+    tables is read once, in the items' ``pieces``.
 
     Cost: O(c log c) for c chars, plus two XY-cuts' O(D r log r) for r
     runs (one to find page columns, one to read the page).
@@ -2057,16 +2125,26 @@ def stream_layout(
     """
     width, height = positive_float("width_pt", width_pt), positive_float("height_pt", height_pt)
     runs = _stream_runs(pieces, lattice)
-    return tuple(_visible_items(runs, _page_turn(runs), width, height))
+    return tuple(item for item in _visible_items(runs, _page_turn(runs), width, height) if isinstance(item, _STREAM))
 
 
-def _visible_items(runs: list[_TurnedRun], turn: int, width: float, height: float) -> list[StreamElement]:
-    """The runs' tables and classified text in reading order (:func:`stream_layout`, steps 2 to 4)."""
+def _visible_items(
+    runs: list[_TurnedRun], turn: int, width: float, height: float, units: tuple[_Unit, ...] = ()
+) -> list[StreamElement | _Unit]:
+    """The runs' tables and classified text, and the units, in reading order (:func:`stream_layout`, steps 2 to 4)."""
     structures = _row_structures(_ordered_lines(runs, turn), width=width, height=height)
     structures = _without_page_columns(structures, runs, turn)
-    slots = _reading_slots(runs, turn, structures)
+    slots = _reading_slots(runs, turn, structures, units)
     classified = iter(_classified_runs([slot for slot in slots if isinstance(slot, list)]))
-    return [item for slot in slots for item in (next(classified) if isinstance(slot, list) else slot.items)]
+    items: list[StreamElement | _Unit] = []
+    for slot in slots:
+        if isinstance(slot, list):
+            items.extend(next(classified))
+        elif isinstance(slot, _Rows):
+            items.extend(slot.items)
+        else:
+            items.append(slot)
+    return items
 
 
 class _Rows(NamedTuple):
@@ -2221,16 +2299,19 @@ def _stream_table(rows: list[TextLine], starts: list[float], ends: list[float]) 
     return StreamTable(rows=tuple(rows), columns=columns, column_centres=centres, bbox=bbox)
 
 
-# A slot of the page's reading order: neighbouring paragraphs, or lines read whole.
-_Slot = list[TextBlock] | _Rows
+# A slot of the page's reading order: neighbouring paragraphs, lines read whole, or a unit.
+_Slot = list[TextBlock] | _Rows | _Unit
 
 
-def _reading_slots(runs: list[_TurnedRun], turn: int, structures: list[_Rows]) -> list[_Slot]:
-    """The page's paragraphs and row structures in reading order (:func:`stream_layout`, step 3).
+def _reading_slots(
+    runs: list[_TurnedRun], turn: int, structures: list[_Rows], units: tuple[_Unit, ...] = ()
+) -> list[_Slot]:
+    """The page's paragraphs, row structures and units in reading order (:func:`stream_layout`, step 3).
 
     The XY-cut reads each structure as one item: the union of its runs'
     ink, weighing their chars. The other runs are items as in
-    :func:`text_blocks`.
+    :func:`text_blocks`. Each unit is one item, its box, and no text
+    (:func:`_xy_cut`): it adds no weight and sets no region's extent.
     """
     owner = {_identity(piece): index for index, found in enumerate(structures) for piece in _lines_pieces(found.rows)}
     free: list[_TurnedRun] = []
@@ -2243,11 +2324,15 @@ def _reading_slots(runs: list[_TurnedRun], turn: int, structures: list[_Rows]) -
             members[at].append(item[1])
     boxes = [_turned(_ink_box(run), turn) for _, run in free]
     boxes += [_turned(union_box(tuple(_ink_box(run) for run in found)), turn) for found in members]
+    boxes += [_turned(_plain(unit.bbox), turn) for unit in units]
     weights = [run.end - run.start for _, run in free]
     weights += [sum(run.end - run.start for run in found) for found in members]
+    weights += [0] * len(units)
+    text = [True] * (len(free) + len(structures)) + [False] * len(units)
+    placed: list[_Rows | _Unit] = [*structures, *units]
     slots: list[_Slot] = []
-    for segment in _xy_cut(boxes, weights):
-        slots.extend(_segment_slots(segment, free, structures, boxes, turn))
+    for segment in _xy_cut(boxes, weights, text):
+        slots.extend(_segment_slots(segment, free, placed, boxes, turn))
     return slots
 
 
@@ -2258,27 +2343,70 @@ def _identity(item: _Run | SpanPiece) -> tuple[int, int, int]:
 
 
 def _segment_slots(
-    segment: list[int], free: list[_TurnedRun], structures: list[_Rows], boxes: list[Box], turn: int
+    segment: list[int], free: list[_TurnedRun], placed_items: list[_Rows | _Unit], boxes: list[Box], turn: int
 ) -> list[_Slot]:
-    """One XY-cut segment's slots: its runs' lines in paragraphs between its structures, top to bottom."""
+    """One XY-cut segment's slots, top to bottom: its runs' lines in paragraphs between its structures, then its units.
+
+    A structure ends the paragraphs before it, as its lines are the
+    page's own. A unit holds no text, so it splits no paragraph (v4 sorted
+    images apart from the text blocks): it reads before the first
+    paragraph or structure that starts below it (:func:`_with_units`).
+    """
     count = len(free)
     placed = sorted((boxes[index][1], index - count) for index in segment if index >= count)
-    slots: list[_Slot] = []
+    structures: list[tuple[float, _Rows]] = []
+    units: list[tuple[float, _Unit]] = []
+    for top, index in placed:
+        found = placed_items[index]
+        if isinstance(found, _Rows):
+            structures.append((top, found))
+        else:
+            units.append((top, found))
+    slots: list[list[TextBlock] | _Rows] = []
     group: list[TextLine] = []
     at = 0
     for item in _ordered_lines([free[index] for index in segment if index < count], turn):
         top = _turned(_plain(item.bbox), turn)[1]
-        while at < len(placed) and placed[at][0] <= top:
+        while at < len(structures) and structures[at][0] <= top:
             if group:
                 slots.append(_paragraphs(group))
                 group = []
-            slots.append(structures[placed[at][1]])
+            slots.append(structures[at][1])
             at += 1
         group.append(item)
     if group:
         slots.append(_paragraphs(group))
-    slots.extend(structures[index] for _, index in placed[at:])
-    return slots
+    slots.extend(found for _, found in structures[at:])
+    return _with_units(slots, units, turn)
+
+
+def _with_units(slots: list[list[TextBlock] | _Rows], units: list[tuple[float, _Unit]], turn: int) -> list[_Slot]:
+    """``slots`` (paragraph runs and structures, top to bottom) with each unit before the first that starts below it.
+
+    ``units`` come as ``(top, unit)``, sorted by top; a run of paragraphs
+    is split where a unit falls between two of them.
+    """
+    out: list[_Slot] = []
+    queue = units[::-1]
+    for slot in slots:
+        blocks: list[TextBlock | _Rows] = list(slot) if isinstance(slot, list) else [slot]
+        run: list[TextBlock] = []
+        for block in blocks:
+            first = block.lines[0] if isinstance(block, TextBlock) else block.rows[0]
+            top = _turned(_plain(first.bbox), turn)[1]
+            while queue and queue[-1][0] < top:
+                if run:
+                    out.append(run)
+                    run = []
+                out.append(queue.pop()[1])
+            if isinstance(block, TextBlock):
+                run.append(block)
+            else:
+                out.append(block)
+        if run:
+            out.append(run)
+    out.extend(unit for _, unit in reversed(queue))
+    return out
 
 
 # Hidden and recovered text, and the page's reading order (A4b group 3).
@@ -2324,8 +2452,8 @@ class ApartLine:
         return " ".join(item.text for item in self.cells)
 
 
-PageItem = StreamElement | ApartLine
-_PAGE_ITEMS = (StreamHeading, StreamParagraph, StreamKeyValue, StreamList, StreamTable, ApartLine)
+PageItem = StreamElement | LatticeTable | FigureSlot | ApartLine
+_PAGE_ITEMS = (*_STREAM, LatticeTable, FigureSlot, ApartLine)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -2357,25 +2485,35 @@ def page_layout(
     *,
     width_pt: float,
     height_pt: float,
+    figures: tuple[BBox, ...] = (),
 ) -> PageLayout:
-    """The page's text in reading order: its visible items, with its hidden and recovered text placed among them.
+    """The page in reading order: its visible items, with its hidden and recovered text placed among them.
 
-    1. Visible text: as :func:`stream_layout` reads it. Hidden and recovered
-       text takes no part in it, so it cannot change the visible order.
-    2. Apart lines (:func:`_apart_lines`): the page's hidden pieces and
-       its recovered pieces, grouped by their hidden reasons, each group
-       read as lines (:func:`text_lines`, steps 1 to 4), so a line holds
-       pieces of one set of reasons and no visible text.
-    3. Placement (:func:`_with_apart`): each apart line reads next to the
-       visible item nearest it (the gap between their boxes, then between
-       their centres, then reading order), before it when the line starts
-       higher (in the frame of the page's turn), else after it; lines by
-       one item, or on a page with none, read top to bottom, then left to
-       right. Past :data:`MAX_APART_PAIRS` comparisons, they read after
-       the visible items instead, with a warning.
+    1. Visible items: the visible text as :func:`stream_layout` reads it,
+       with each lattice table and each figure within the page (A1's
+       :meth:`~datagrunt.pdf.elements.BBox.within`) one unit of the XY-cut:
+       dealt into its parts by its box, but no text, so it neither weighs
+       in the histogram nor sets a region's extent (v4's
+       ``_filter_text_items``), and read in its segment by its top.
+       Hidden and recovered text takes no part, so it cannot change the
+       visible order.
+    2. Apart items: the page's hidden pieces and its recovered pieces,
+       grouped by their hidden reasons, each group read as lines
+       (:func:`_apart_lines`; :func:`text_lines`, steps 1 to 4), so a line
+       holds pieces of one set of reasons and no visible text; and each
+       figure off the page.
+    3. Placement (:func:`_with_apart`): each apart item reads next to the
+       visible item nearest it (the gap between their boxes; then an item
+       of text before a figure, so text lying on a page-sized background
+       reads with the text it touches; then the gap between their centres;
+       then reading order), before it when it starts higher
+       (in the frame of the page's turn), else after it; apart items by
+       one visible item, or on a page with none, read top to bottom, then
+       left to right. Past :data:`MAX_APART_PAIRS` comparisons, they read
+       after the visible items instead, with a warning.
 
     Cost: :func:`stream_layout`'s, the apart lines' O(c log c) for c chars,
-    and O(a v) for a apart lines and v visible items (bounded above).
+    and O(a v) for a apart items and v visible items (bounded above).
 
     Args:
         pieces: The page's pieces (``PageAssessment.pieces``).
@@ -2383,6 +2521,8 @@ def page_layout(
         lattice: The pieces' lattice tables (``find_lattice_tables``).
         width_pt: The displayed page's width in points.
         height_pt: Its height in points.
+        figures: The page's figure boxes; each reads as a
+            :class:`FigureSlot` naming its index here.
 
     Raises:
         TypeError: If an argument is of the wrong type.
@@ -2397,9 +2537,13 @@ def page_layout(
     for index, item in enumerate(recovered):
         if id(item) in taken:
             raise ValueError(f"recovered[{index}] is also among pieces: recovered text is never page text")
+    slots = [FigureSlot(index=at, bbox=found) for at, found in enumerate(typed_tuple("figures", figures, BBox))]
+    on_page = tuple(slot for slot in slots if slot.bbox.within(width, height))
     turn = _page_turn(runs)
-    visible: list[PageItem] = list(_visible_items(runs, turn, width, height))
-    items, warnings = _with_apart(visible, _apart_lines(pieces, recovered, turn), turn)
+    visible: list[PageItem] = list(_visible_items(runs, turn, width, height, (*lattice.tables, *on_page)))
+    apart: list[ApartLine | FigureSlot] = [*_apart_lines(pieces, recovered, turn)]
+    apart += [slot for slot in slots if slot not in on_page]
+    items, warnings = _with_apart(visible, apart, turn)
     return PageLayout(items=tuple(items), warnings=warnings)
 
 
@@ -2418,24 +2562,31 @@ def _apart_lines(pieces: tuple[SpanPiece, ...], recovered: tuple[SpanPiece, ...]
     return lines
 
 
-def _with_apart(visible: list[PageItem], apart: list[ApartLine], turn: int) -> tuple[list[PageItem], tuple[str, ...]]:
-    """The visible items with the apart lines placed among them (:func:`page_layout`, step 3), and any warning."""
+def _with_apart(
+    visible: list[PageItem], apart: list[ApartLine | FigureSlot], turn: int
+) -> tuple[list[PageItem], tuple[str, ...]]:
+    """The visible items with the apart items placed among them (:func:`page_layout`, step 3), and any warning."""
     if not apart:
         return visible, ()
     ordered = [item for _, _, item in sorted((_frame(item, turn)[1::-1], at, item) for at, item in enumerate(apart))]
     pairs = len(apart) * len(visible)
     if pairs > MAX_APART_PAIRS:
-        where = f"{len(apart)} hidden or recovered line(s) read after the page's visible text"
+        lines = sum(1 for item in apart if isinstance(item, ApartLine))
+        figures = f" and {len(apart) - lines} off-page figure(s)" if lines < len(apart) else ""
+        where = f"{lines} hidden or recovered line(s){figures} read after the page's visible text"
         why = f"placing them by position would compare {pairs} pairs, over the bound of {MAX_APART_PAIRS}"
         return [*visible, *ordered], (f"{where}: {why}",)
     if not visible:
         return list(ordered), ()
     frames = [_frame(item, turn) for item in visible]
+    pictures = [isinstance(item, FigureSlot) for item in visible]
     before: list[list[PageItem]] = [[] for _ in visible]
     after: list[list[PageItem]] = [[] for _ in visible]
     for line in ordered:
         box = _frame(line, turn)
-        anchor = min(range(len(frames)), key=lambda at: (_gap(box, frames[at]), _centre_gap(box, frames[at]), at))
+        anchor = min(
+            range(len(frames)), key=lambda at: (_gap(box, frames[at]), pictures[at], _centre_gap(box, frames[at]), at)
+        )
         (before if box[1] < frames[anchor][1] else after)[anchor].append(line)
     placed: list[PageItem] = []
     for at, item in enumerate(visible):
