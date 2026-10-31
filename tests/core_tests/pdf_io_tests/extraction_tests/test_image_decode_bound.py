@@ -514,8 +514,15 @@ _SUBPROCESS = textwrap.dedent(
     LIMIT = {limit} << 20
 
     def peak():
-        used = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return used if sys.platform == "darwin" else used * 1024
+        # Linux keeps ru_maxrss across fork + exec, so a child of a large process
+        # (pytest) reports the parent's peak; VmHWM is this process's own, reset at exec.
+        if sys.platform.startswith("linux"):
+            with open("/proc/self/status") as status:
+                for line in status:
+                    if line.startswith("VmHWM:"):
+                        return int(line.split()[1]) * 1024
+            raise RuntimeError("no VmHWM line in /proc/self/status")
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # macOS reports bytes
 
     def watch():
         while True:
