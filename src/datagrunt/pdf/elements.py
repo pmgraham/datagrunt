@@ -672,12 +672,16 @@ class Table(_Element):
         extraction_method: ``"lattice"`` (ruled lines) or ``"stream"`` (whitespace).
         continued_from_id: Element id of the table this one continues (a table
             split across pages), or None.
+        column_centres: Display-space x centre of each column, left to right
+            (finite, strictly increasing, one per column), or empty when not
+            measured. The scope pass links a split table's parts by them.
     """
 
     headers: tuple[str, ...]
     rows: tuple[tuple[str, ...], ...]
     extraction_method: ExtractionMethod
     continued_from_id: str | None = None
+    column_centres: tuple[float, ...] = ()
 
     def _validate_fields(self) -> None:
         str_tuple("headers", self.headers, allow_blank=True)
@@ -691,6 +695,23 @@ class Table(_Element):
             _parse_element_id("continued_from_id", self.continued_from_id)
             if self.continued_from_id == self.element_id:
                 raise ValueError(f"continued_from_id must differ from element_id, got {self.continued_from_id!r}")
+        self._validate_centres()
+
+    def _validate_centres(self) -> None:
+        """Require no centres, or one finite centre per column in strictly increasing order (stored as floats)."""
+        if not isinstance(self.column_centres, tuple):
+            raise TypeError(f"column_centres must be a tuple, got {type(self.column_centres).__name__}")
+        if not self.column_centres:
+            return
+        width = self._width()
+        if len(self.column_centres) != width:
+            raise ValueError(
+                f"column_centres must have {width} values (one per column), got {len(self.column_centres)}"
+            )
+        centres = tuple(finite_float(f"column_centres[{i}]", centre) for i, centre in enumerate(self.column_centres))
+        if any(left >= right for left, right in zip(centres, centres[1:])):
+            raise ValueError(f"column_centres must strictly increase, got {self.column_centres!r}")
+        object.__setattr__(self, "column_centres", centres)
 
     def _validate_width(self) -> None:
         if not self.headers and not self.rows:
@@ -1426,11 +1447,15 @@ class PDFDocument:
         sections: Flat, heading-scoped runs of the document's own elements, in
             document order, no element in two sections, each ending by the
             last page (nesting is expressed by ``scope_path`` prefixes).
+        header_context: The visible ``KeyValue`` elements that head page 1
+            (an invoice's number and date, say), in reading order; each is
+            the document's own element. The scope pass fills it.
     """
 
     metadata: DocumentMetadata
     pages: tuple[Page, ...]
     sections: tuple[Section, ...] = ()
+    header_context: tuple[KeyValue, ...] = ()
     _index: _DocumentIndex = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -1438,11 +1463,13 @@ class PDFDocument:
             raise TypeError(f"metadata must be a DocumentMetadata, got {type(self.metadata).__name__}")
         _check_instances("pages", self.pages, (Page,), "Page")
         _check_instances("sections", self.sections, (Section,), "Section")
+        _check_instances("header_context", self.header_context, (KeyValue,), "KeyValue")
         self._check_page_numbers()
         elements = tuple(element for page in self.pages for element in page.elements)
         by_id = _index_by_id(elements)
         _check_continuations(elements, by_id)
         self._check_sections(by_id)
+        self._check_header_context(by_id)
         object.__setattr__(self, "_index", _build_index(self.pages, elements))
 
     def _check_page_numbers(self) -> None:
@@ -1468,6 +1495,21 @@ class PDFDocument:
             for element in section.elements:
                 _check_member(f"sections[{index}] element", element, by_id)
         _check_section_layout(self.sections)
+
+    def _check_header_context(self, by_id: dict[str, DocumentElement]) -> None:
+        """Require visible page-1 key-values of the document's own, in strictly increasing reading order."""
+        previous = -1
+        for index, item in enumerate(self.header_context):
+            label = f"header_context[{index}] ({item.element_id})"
+            if item.page_number != 1:
+                raise ValueError(f"{label} is on page {item.page_number}, not page 1")
+            if item.is_hidden:
+                reasons = ", ".join(item.hidden_reasons)
+                raise ValueError(f"{label} is hidden ({reasons}): header context holds visible text only")
+            _check_member(f"header_context[{index}]", item, by_id)
+            if item.reading_order <= previous:
+                raise ValueError(f"{label} is not after header_context[{index - 1}] in reading order")
+            previous = item.reading_order
 
     @property
     def elements(self) -> tuple[DocumentElement, ...]:
