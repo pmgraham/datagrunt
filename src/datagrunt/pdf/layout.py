@@ -25,7 +25,9 @@ headings, key-value pairs, lists and paragraphs (:class:`StreamHeading`,
 each keeping the char ranges it reads. :func:`stream_layout` puts it
 together: borderless tables (:class:`StreamTable`), mastheads and
 key-value lists found on the lines and read whole, the rest classified,
-all in reading order. Hidden text is laid out apart (A4b group 3).
+all in reading order. :func:`page_layout` adds the page's hidden and
+recovered text, laid out apart as lines (:class:`ApartLine`) and placed
+among the visible items by position, so it never changes their order.
 
 Known limitations (each a fact this pure pass cannot see):
 
@@ -55,16 +57,19 @@ from datagrunt.pdf._validate import (
     int_at_least,
     non_blank_str,
     positive_float,
+    str_tuple,
     strict_bool,
     typed_tuple,
 )
-from datagrunt.pdf.elements import BBox
+from datagrunt.pdf.elements import BBox, HiddenReason, check_hidden_reasons
 from datagrunt.pdf.quality import SpanPiece
 
 __all__ = [
+    "ApartLine",
     "LatticeCell",
     "LatticeResult",
     "LatticeTable",
+    "PageLayout",
     "StreamHeading",
     "StreamKeyValue",
     "StreamList",
@@ -76,6 +81,7 @@ __all__ = [
     "TextLine",
     "classify_blocks",
     "find_lattice_tables",
+    "page_layout",
     "stream_layout",
     "text_blocks",
     "text_lines",
@@ -392,13 +398,13 @@ def find_lattice_tables(segments: tuple[RawSegment, ...], pieces: tuple[SpanPiec
     return LatticeResult(tables=tuple(tables), used_pieces=_used_pieces(used, pieces), skipped_grids=skipped)
 
 
-def _check_distinct(pieces: tuple[SpanPiece, ...]) -> None:
+def _check_distinct(pieces: tuple[SpanPiece, ...], name: str = "pieces") -> None:
     """Require each piece object once: a piece is a run of the page's text, which is read once."""
     seen: dict[int, int] = {}
     for index, item in enumerate(pieces):
         first = seen.setdefault(id(item), index)
         if first != index:
-            raise ValueError(f"pieces[{index}] is pieces[{first}] again: each piece is the page's text once")
+            raise ValueError(f"{name}[{index}] is {name}[{first}] again: each piece is the page's text once")
 
 
 class _Line(NamedTuple):
@@ -1003,15 +1009,7 @@ class TextLine:
     is_bold: bool
 
     def __post_init__(self) -> None:
-        typed_tuple("cells", self.cells, TextCell)
-        if not self.cells:
-            raise ValueError("cells must hold at least one cell")
-        _check_bbox("bbox", self.bbox)
-        for index, item in enumerate(self.cells):
-            if _outside(_plain(item.bbox), self.bbox):
-                raise ValueError(f"cells[{index}].bbox must lie within the bbox, got {item.bbox} in {self.bbox}")
-        if int_at_least("turn", self.turn, 0) not in _TURNS:
-            raise ValueError(f"turn must be 0, 90 or 270, got {self.turn}")
+        _check_line_shape(self.cells, self.bbox, self.turn)
         object.__setattr__(self, "font_size_pt", positive_float("font_size_pt", self.font_size_pt))
         strict_bool("is_bold", self.is_bold)
 
@@ -1019,6 +1017,19 @@ class TextLine:
     def text(self) -> str:
         """Its cells' texts joined with one space."""
         return " ".join(item.text for item in self.cells)
+
+
+def _check_line_shape(cells: object, bbox: object, turn: object) -> None:
+    """Require a line's cells (a non-empty tuple of TextCell, each within ``bbox``), its BBox and its turn."""
+    checked = typed_tuple("cells", cells, TextCell)
+    if not checked:
+        raise ValueError("cells must hold at least one cell")
+    outer = _check_bbox("bbox", bbox)
+    for index, item in enumerate(checked):
+        if _outside(_plain(item.bbox), outer):
+            raise ValueError(f"cells[{index}].bbox must lie within the bbox, got {item.bbox} in {outer}")
+    if int_at_least("turn", turn, 0) not in _TURNS:
+        raise ValueError(f"turn must be 0, 90 or 270, got {turn}")
 
 
 def text_lines(pieces: tuple[SpanPiece, ...], lattice: LatticeResult) -> tuple[TextLine, ...]:
@@ -1164,29 +1175,39 @@ def _ordered_lines(runs: list[_TurnedRun], page_turn: int) -> list[TextLine]:
 
 def _stream_lines(runs: list[_TurnedRun], page_turn: int) -> list[TextLine]:
     """The runs' lines, each turn's in its own frame (:func:`text_lines`, steps 2 to 4), unordered."""
+    return [_text_line(found, own) for found, own in _grouped_lines(runs, page_turn)]
+
+
+def _grouped_lines(runs: list[_TurnedRun], page_turn: int) -> Iterator[tuple[list[tuple[Box, _Run]], int]]:
+    """Yield each line of the runs (its runs with their boxes turned) and its turn: each turn's in its own frame."""
     by_turn: dict[int, list[tuple[Box, _Run]]] = {}
     for turn, run in runs:
         own = page_turn if turn is None else turn
         by_turn.setdefault(own, []).append((_turned(_run_box(run), own), run))
-    lines: list[TextLine] = []
     for own, placed in by_turn.items():
         placed.sort(key=lambda item: (item[0][1], item[0][0]))
-        lines.extend(_text_line(found, own) for found in _lines(placed))
-    return lines
+        for found in _lines(placed):
+            yield found, own
+
+
+def _line_cells(line: list[tuple[Box, _Run]]) -> tuple[tuple[TextCell, ...], BBox, list[_Run]]:
+    """One line's cells along it, its box on the displayed page, and its runs in order along it."""
+    ordered = sorted(line, key=lambda item: item[0][0])
+    runs = [run for _, run in ordered]
+    cells = tuple(_text_cell(group) for group in _cell_groups(ordered))
+    return cells, _bbox(union_box(tuple(_run_box(run) for run in runs))), runs
 
 
 def _text_line(line: list[tuple[Box, _Run]], turn: int) -> TextLine:
     """One line's TextLine: its runs (with their boxes turned by ``turn``) in cells along it."""
-    ordered = sorted(line, key=lambda item: item[0][0])
-    cells = tuple(_text_cell(group) for group in _cell_groups(ordered))
-    runs = [run for _, run in ordered]
+    cells, bbox, runs = _line_cells(line)
     sizes: dict[float, int] = {}
     for run in runs:
         size = round(abs(run.piece.span.font_size_pt), 1)
         sizes[size] = sizes.get(size, 0) + run.end - run.start
     return TextLine(
         cells=cells,
-        bbox=_bbox(union_box(tuple(_run_box(run) for run in runs))),
+        bbox=bbox,
         turn=turn,
         font_size_pt=max(sizes, key=sizes.__getitem__),
         is_bold=all(run.piece.span.is_bold for run in runs),
@@ -1668,7 +1689,8 @@ def classify_blocks(blocks: tuple[TextBlock, ...]) -> tuple[StreamItem, ...]:
 
     1. A heading (:func:`_is_heading`): its first line's size is at least
        :data:`_HEADING_RATIO` times the page's body size
-       (:func:`_body_size`), or it is one bold line; either way its text
+       (:func:`_body_size`; a ratio, never a division: :func:`_larger`),
+       or it is one bold line; either way its text
        is at most :data:`_HEADING_MAX_CHARS` chars, does not end with a
        full stop and does not start with a bullet. Levels rank the page's
        heading sizes, largest first, from 1 to :data:`_MAX_LEVEL`.
@@ -1745,7 +1767,7 @@ def _body_size(blocks: list[TextBlock]) -> int:
 
     v4's median (``page_median_size``: the upper middle, not a mean),
     weighed by chars so a page's many short headings or labels do not move
-    it. 0 for no blocks.
+    it. 0 for no blocks, and for a page whose text is mostly under 0.05 pt.
     """
     weights: dict[int, int] = {}
     for found in blocks:
@@ -1767,9 +1789,20 @@ def _is_heading(found: TextBlock, body: int) -> bool:
     if len(text) > _HEADING_MAX_CHARS or text.endswith(".") or (marker is not None and marker["bullet"]):
         return False
     first = found.lines[0]
-    if Fraction(_tenths(first.font_size_pt), body) >= _HEADING_RATIO:
+    if _larger(_tenths(first.font_size_pt), body):
         return True
     return len(found.lines) == 1 and first.is_bold
+
+
+def _larger(size: int, body: int) -> bool:
+    """True if ``size / body`` (both in tenths) is at least :data:`_HEADING_RATIO`, compared without dividing.
+
+    Read as the ratio it is, also on a body of 0 tenths (text under
+    0.05 pt): every size over 0 is infinitely larger, and 0 / 0 is no
+    ratio at all, so equal sizes never make a heading. On a body over 0,
+    ``size > body`` follows from the ratio.
+    """
+    return size > body and size >= _HEADING_RATIO * body
 
 
 def _heading_levels(sizes: Iterable[int]) -> dict[int, int]:
@@ -2024,12 +2057,16 @@ def stream_layout(
     """
     width, height = positive_float("width_pt", width_pt), positive_float("height_pt", height_pt)
     runs = _stream_runs(pieces, lattice)
-    turn = _page_turn(runs)
+    return tuple(_visible_items(runs, _page_turn(runs), width, height))
+
+
+def _visible_items(runs: list[_TurnedRun], turn: int, width: float, height: float) -> list[StreamElement]:
+    """The runs' tables and classified text in reading order (:func:`stream_layout`, steps 2 to 4)."""
     structures = _row_structures(_ordered_lines(runs, turn), width=width, height=height)
     structures = _without_page_columns(structures, runs, turn)
     slots = _reading_slots(runs, turn, structures)
     classified = iter(_classified_runs([slot for slot in slots if isinstance(slot, list)]))
-    return tuple(item for slot in slots for item in (next(classified) if isinstance(slot, list) else slot.items))
+    return [item for slot in slots for item in (next(classified) if isinstance(slot, list) else slot.items)]
 
 
 class _Rows(NamedTuple):
@@ -2242,3 +2279,184 @@ def _segment_slots(
         slots.append(_paragraphs(group))
     slots.extend(structures[index] for _, index in placed[at:])
     return slots
+
+
+# Hidden and recovered text, and the page's reading order (A4b group 3).
+
+# Each apart line is placed by comparing it with every visible item: past this many pairs, a page's apart lines read
+# after its visible text instead, with a warning. The corpus (data/pdfs, 95 pages) needs at most 25 000.
+MAX_APART_PAIRS = 1_000_000
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ApartLine:
+    """A line of hidden or recovered text, laid out apart from the page's visible text and never mixed with it.
+
+    Its pieces all carry its ``hidden_reasons``: hidden pieces of the page's
+    text that share them, or recovered pieces (a copy pdfium dropped though
+    it is drawn has none). It holds no font size: apart text is never
+    classified, and text drawn at ``Tf 0`` has no size to read.
+
+    Attributes:
+        cells: Its cells along the line, as :class:`TextLine`'s.
+        bbox: The union of its cells' boxes on the displayed page.
+        turn: The clockwise angle its text advances at: 0, 90 or 270.
+        hidden_reasons: Its pieces' reasons, in A1's canonical order.
+    """
+
+    cells: tuple[TextCell, ...]
+    bbox: BBox
+    turn: int
+    hidden_reasons: tuple[HiddenReason, ...]
+
+    def __post_init__(self) -> None:
+        _check_line_shape(self.cells, self.bbox, self.turn)
+        check_hidden_reasons(self.hidden_reasons)
+        for index, item in enumerate(self.cells):
+            for at, piece in enumerate(item.pieces):
+                if piece.hidden_reasons != self.hidden_reasons:
+                    found = f"cells[{index}].pieces[{at}] has hidden_reasons {piece.hidden_reasons}"
+                    raise ValueError(f"{found}, not the line's {self.hidden_reasons}")
+
+    @property
+    def text(self) -> str:
+        """Its cells' texts joined with one space."""
+        return " ".join(item.text for item in self.cells)
+
+
+PageItem = StreamElement | ApartLine
+_PAGE_ITEMS = (StreamHeading, StreamParagraph, StreamKeyValue, StreamList, StreamTable, ApartLine)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PageLayout:
+    """A page's items in reading order (:func:`page_layout`), and the warnings laying them out raised.
+
+    Attributes:
+        items: Its visible items, as :func:`stream_layout` reads them, with
+            its apart lines placed among them.
+        warnings: Non-fatal notes for the page (``Page.warnings``).
+    """
+
+    items: tuple[PageItem, ...]
+    warnings: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.items, tuple):
+            raise TypeError(f"items must be a tuple, got {type(self.items).__name__}")
+        for index, item in enumerate(self.items):
+            if not isinstance(item, _PAGE_ITEMS):
+                raise TypeError(f"items[{index}] must be a page item, got {type(item).__name__}")
+        str_tuple("warnings", self.warnings)
+
+
+def page_layout(
+    pieces: tuple[SpanPiece, ...],
+    recovered: tuple[SpanPiece, ...],
+    lattice: LatticeResult,
+    *,
+    width_pt: float,
+    height_pt: float,
+) -> PageLayout:
+    """The page's text in reading order: its visible items, with its hidden and recovered text placed among them.
+
+    1. Visible text: as :func:`stream_layout` reads it. Hidden and recovered
+       text takes no part in it, so it cannot change the visible order.
+    2. Apart lines (:func:`_apart_lines`): the page's hidden pieces and
+       its recovered pieces, grouped by their hidden reasons, each group
+       read as lines (:func:`text_lines`, steps 1 to 4), so a line holds
+       pieces of one set of reasons and no visible text.
+    3. Placement (:func:`_with_apart`): each apart line reads next to the
+       visible item nearest it (the gap between their boxes, then between
+       their centres, then reading order), before it when the line starts
+       higher (in the frame of the page's turn), else after it; lines by
+       one item, or on a page with none, read top to bottom, then left to
+       right. Past :data:`MAX_APART_PAIRS` comparisons, they read after
+       the visible items instead, with a warning.
+
+    Cost: :func:`stream_layout`'s, the apart lines' O(c log c) for c chars,
+    and O(a v) for a apart lines and v visible items (bounded above).
+
+    Args:
+        pieces: The page's pieces (``PageAssessment.pieces``).
+        recovered: Its recovered pieces (``PageAssessment.recovered_pieces``).
+        lattice: The pieces' lattice tables (``find_lattice_tables``).
+        width_pt: The displayed page's width in points.
+        height_pt: Its height in points.
+
+    Raises:
+        TypeError: If an argument is of the wrong type.
+        ValueError: As :func:`stream_layout`, or if a recovered piece is
+            passed twice or also among ``pieces``.
+    """
+    width, height = positive_float("width_pt", width_pt), positive_float("height_pt", height_pt)
+    runs = _stream_runs(pieces, lattice)
+    typed_tuple("recovered", recovered, SpanPiece)
+    _check_distinct(recovered, "recovered")
+    taken = {id(item) for item in pieces}
+    for index, item in enumerate(recovered):
+        if id(item) in taken:
+            raise ValueError(f"recovered[{index}] is also among pieces: recovered text is never page text")
+    turn = _page_turn(runs)
+    visible: list[PageItem] = list(_visible_items(runs, turn, width, height))
+    items, warnings = _with_apart(visible, _apart_lines(pieces, recovered, turn), turn)
+    return PageLayout(items=tuple(items), warnings=warnings)
+
+
+def _apart_lines(pieces: tuple[SpanPiece, ...], recovered: tuple[SpanPiece, ...], turn: int) -> list[ApartLine]:
+    """The hidden pieces' and the recovered pieces' lines, each of one set of hidden reasons (:func:`page_layout`)."""
+    groups: dict[tuple[HiddenReason, ...], list[_TurnedRun]] = {}
+    for piece in (*(item for item in pieces if item.hidden_reasons), *recovered):
+        for found in _cut_at_gaps(_Run(piece, piece.start, piece.end)):
+            if not _run_chars(found[1]).isspace():
+                groups.setdefault(piece.hidden_reasons, []).append(found)
+    lines = []
+    for reasons, runs in groups.items():
+        for line, own in _grouped_lines(runs, turn):
+            cells, bbox, _ = _line_cells(line)
+            lines.append(ApartLine(cells=cells, bbox=bbox, turn=own, hidden_reasons=reasons))
+    return lines
+
+
+def _with_apart(visible: list[PageItem], apart: list[ApartLine], turn: int) -> tuple[list[PageItem], tuple[str, ...]]:
+    """The visible items with the apart lines placed among them (:func:`page_layout`, step 3), and any warning."""
+    if not apart:
+        return visible, ()
+    ordered = [item for _, _, item in sorted((_frame(item, turn)[1::-1], at, item) for at, item in enumerate(apart))]
+    pairs = len(apart) * len(visible)
+    if pairs > MAX_APART_PAIRS:
+        where = f"{len(apart)} hidden or recovered line(s) read after the page's visible text"
+        why = f"placing them by position would compare {pairs} pairs, over the bound of {MAX_APART_PAIRS}"
+        return [*visible, *ordered], (f"{where}: {why}",)
+    if not visible:
+        return list(ordered), ()
+    frames = [_frame(item, turn) for item in visible]
+    before: list[list[PageItem]] = [[] for _ in visible]
+    after: list[list[PageItem]] = [[] for _ in visible]
+    for line in ordered:
+        box = _frame(line, turn)
+        anchor = min(range(len(frames)), key=lambda at: (_gap(box, frames[at]), _centre_gap(box, frames[at]), at))
+        (before if box[1] < frames[anchor][1] else after)[anchor].append(line)
+    placed: list[PageItem] = []
+    for at, item in enumerate(visible):
+        placed.extend((*before[at], item, *after[at]))
+    return placed, ()
+
+
+def _frame(item: PageItem, turn: int) -> Box:
+    """An item's box in the frame of the page's ``turn``."""
+    return _turned(_plain(item.bbox), turn)
+
+
+def _gap(first: Box, second: Box) -> float:
+    """The distance between two boxes: 0 when they meet."""
+    across = max(second[0] - first[2], first[0] - second[2], 0.0)
+    down = max(second[1] - first[3], first[1] - second[3], 0.0)
+    return math.hypot(across, down)
+
+
+def _centre_gap(first: Box, second: Box) -> float:
+    """The distance between two boxes' centres."""
+    return math.hypot(
+        (first[0] + first[2] - second[0] - second[2]) / 2, (first[1] + first[3] - second[1] - second[3]) / 2
+    )

@@ -103,10 +103,17 @@ class TestModuleImports:
             assert not names & set(dir(package))
 
     def test_names_its_public_api(self):
-        expected = ["LatticeCell", "LatticeResult", "LatticeTable"]
+        expected = ["ApartLine", "LatticeCell", "LatticeResult", "LatticeTable", "PageLayout"]
         expected += ["StreamHeading", "StreamKeyValue", "StreamList", "StreamListItem", "StreamParagraph"]
         expected += ["StreamTable", "TextBlock", "TextCell", "TextLine"]
-        expected += ["classify_blocks", "find_lattice_tables", "stream_layout", "text_blocks", "text_lines"]
+        expected += [
+            "classify_blocks",
+            "find_lattice_tables",
+            "page_layout",
+            "stream_layout",
+            "text_blocks",
+            "text_lines",
+        ]
 
         assert layout.__all__ == expected
 
