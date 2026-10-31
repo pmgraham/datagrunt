@@ -74,6 +74,7 @@ class TestModuleImports:
     def test_imports_only_the_raw_fact_types_quality_and_a1(self):
         allowed = {
             "datagrunt.pdf._path_segments",
+            "datagrunt.pdf._pdfium_common",
             "datagrunt.pdf._validate",
             "datagrunt.pdf.elements",
             "datagrunt.pdf.quality",
@@ -623,3 +624,133 @@ class TestGridPositions:
         boxes = ((0.0, 0.0, 90.0, 20.0), (0.0, 20.0, 30.0, 60.0), (30.0, 20.0, 90.0, 40.0), (30.0, 40.0, 90.0, 60.0))
 
         assert layout._grid_positions(boxes) == (3, 2, [(0, 0, 1, 2), (1, 0, 2, 1), (1, 1, 1, 1), (2, 1, 1, 1)])
+
+
+def chars(text: str, x: float, y: float, *, advance: float = 6.0, height: float = 12.0, **overrides) -> SpanPiece:
+    """A visible piece of ``text`` in a row of ``advance``-wide chars from ``(x, y)`` (a whole span)."""
+    boxes = tuple((x + i * advance, y, x + (i + 1) * advance, y + height) for i in range(len(text)))
+    return SpanPiece(span=raw_span(text, boxes, **overrides), start=0, end=len(text), hidden_reasons=())
+
+
+def falling(text: str, x: float, y: float, *, advance: float = 6.0, width: float = 12.0) -> SpanPiece:
+    """A visible piece of ``text`` running down from ``(x, y)``: text a quarter turn clockwise."""
+    boxes = tuple((x, y + i * advance, x + width, y + (i + 1) * advance) for i in range(len(text)))
+    return SpanPiece(span=raw_span(text, boxes), start=0, end=len(text), hidden_reasons=())
+
+
+def rising(text: str, x: float, y: float, *, advance: float = 6.0, width: float = 12.0) -> SpanPiece:
+    """A visible piece of ``text`` running up from ``(x, y)``: text a quarter turn anticlockwise."""
+    boxes = tuple((x, y - (i + 1) * advance, x + width, y - i * advance) for i in range(len(text)))
+    return SpanPiece(span=raw_span(text, boxes), start=0, end=len(text), hidden_reasons=())
+
+
+def texts(segments, *pieces: SpanPiece):
+    """Each component grid's cell texts, in cell order, read in each cell's own direction."""
+    grids = [layout._grid(*group) for group in layout._components(*layout._snapped_lines(segments))]
+    assert all(grid is not None for grid in grids)
+    runs = layout._cell_runs(grids, pieces)
+    return [[layout._cell_text(cell_runs, 0) for cell_runs in grid_runs] for grid_runs in runs]
+
+
+# A 2 x 2 grid of 100 x 50 pt cells from (0, 0).
+TWO_BY_TWO = ruled_grid((0.0, 100.0, 200.0), (0.0, 50.0, 100.0))
+
+
+class TestCellText:
+    """A visible char belongs to the cell holding its box centre; a cell's text reads line by line."""
+
+    def test_each_cell_holds_the_chars_centred_in_it(self):
+        got = texts(TWO_BY_TWO, chars("a", 10.0, 10.0), chars("b", 110.0, 10.0), chars("c", 10.0, 60.0))
+
+        assert got == [["a", "b", "c", ""]]
+
+    @pytest.mark.parametrize(
+        "x,left,right",
+        [
+            # From x 70, 'E' spans 94..100: it ends on the border, its centre (97) is left of it.
+            pytest.param(70.0, "ABCDE", "FGH", id="ends-on-the-border"),
+            # From x 74, 'E' spans 98..104: it starts left of the border, its centre (101) is right of it.
+            pytest.param(74.0, "ABCD", "EFGH", id="centred-past-the-border"),
+        ],
+    )
+    def test_a_piece_crossing_a_border_splits_at_its_chars_by_their_centres(self, x, left, right):
+        assert texts(TWO_BY_TWO, chars("ABCDEFGH", x, 10.0)) == [[left, right, "", ""]]
+
+    def test_a_char_centred_outside_every_grid_is_in_no_cell(self):
+        got = texts(TWO_BY_TWO, chars("xy", 200.0, 10.0), chars("z", -4.0, 120.0))
+
+        assert got == [["", "", "", ""]]
+
+    def test_hidden_pieces_never_enter_a_cell(self):
+        hidden = dataclasses.replace(chars("secret", 10.0, 10.0), hidden_reasons=("invisible",))
+
+        assert texts(TWO_BY_TWO, hidden, chars("shown", 110.0, 10.0)) == [["", "shown", "", ""]]
+
+    def test_lines_read_top_to_bottom_and_join_with_one_space(self):
+        got = texts(TWO_BY_TWO, chars("second", 10.0, 24.0), chars("first", 10.0, 6.0))
+
+        assert got == [["first second", "", "", ""]]
+
+    @pytest.mark.parametrize(
+        "gap,joined",
+        [
+            pytest.param(2.4, "leftright", id="gap-under-0.22-em"),
+            pytest.param(2.5, "left right", id="gap-over-0.22-em"),
+        ],
+    )
+    def test_runs_on_a_line_read_left_to_right_joined_by_the_gap(self, gap, joined):
+        # 11 pt text: a gap of at most 0.22 em (2.42 pt) joins with nothing, a wider one with a space.
+        right = chars("right", 10.0 + 4 * 6.0 + gap, 10.0)
+
+        assert texts(TWO_BY_TWO, right, chars("left", 10.0, 10.0)) == [[joined, "", "", ""]]
+
+    def test_a_raised_run_overlapping_the_line_by_45_percent_or_more_stays_on_it(self):
+        # '2' is 6 pt tall and overlaps the 12 pt line by 2.76 pt: 0.46 of the smaller height.
+        got = texts(TWO_BY_TWO, chars("m", 10.0, 10.0), chars("2", 16.0, 6.76, height=6.0))
+
+        assert got == [["m2", "", "", ""]]
+
+    def test_a_run_overlapping_the_line_by_less_than_45_percent_starts_a_line(self):
+        # 2.64 pt: 0.44 of the smaller height.
+        got = texts(TWO_BY_TWO, chars("m", 10.0, 10.0), chars("2", 16.0, 6.64, height=6.0))
+
+        assert got == [["2 m", "", "", ""]]
+
+    def test_generated_breaks_become_one_space(self):
+        piece = chars("NameValue", 10.0, 10.0, generated_breaks=(4,))
+
+        assert texts(TWO_BY_TWO, piece) == [["Name Value", "", "", ""]]
+
+    def test_a_generated_break_where_the_cell_splits_the_piece_adds_nothing(self):
+        piece = chars("abcdefghij", 70.0, 10.0, generated_breaks=(5,))
+
+        assert texts(TWO_BY_TWO, piece) == [["abcde", "fghij", "", ""]]
+
+    def test_text_is_otherwise_verbatim(self):
+        assert texts(TWO_BY_TWO, chars(" a  b\t", 10.0, 10.0)) == [[" a  b\t", "", "", ""]]
+
+    def test_a_run_keeps_its_span_order(self):
+        # pdfium gives right-to-left text in logical order: its chars run leftward; kept as given.
+        boxes = tuple((60.0 - 6.0 * (i + 1), 10.0, 60.0 - 6.0 * i, 22.0) for i in range(4))
+        piece = SpanPiece(span=raw_span("שלום", boxes), start=0, end=4, hidden_reasons=())
+
+        assert texts(TWO_BY_TWO, piece) == [["שלום", "", "", ""]]
+
+    @pytest.mark.parametrize(
+        "pieces",
+        [
+            pytest.param((falling("second", 10.0, 5.0), falling("first", 30.0, 5.0)), id="falling"),
+            pytest.param((rising("first", 10.0, 45.0), rising("second", 30.0, 45.0)), id="rising"),
+        ],
+    )
+    def test_turned_text_reads_along_its_own_lines(self, pieces):
+        # Text a quarter turn clockwise reads its lines right to left; anticlockwise, left to right.
+        assert texts(TWO_BY_TWO, *pieces) == [["first second", "", "", ""]]
+
+    def test_the_smallest_grid_holding_a_char_takes_it(self):
+        inner = ruled_grid((20.0, 50.0, 80.0), (10.0, 25.0, 40.0))
+
+        got = texts(TWO_BY_TWO + inner, chars("in", 22.0, 12.0), chars("out", 10.0, 60.0))
+
+        # Components come in order of their first horizontal rule: the outer grid's (y 0) first.
+        assert got == [["", "", "out", ""], ["in", "", "", ""]]

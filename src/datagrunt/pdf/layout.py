@@ -10,9 +10,11 @@ import math
 from bisect import bisect_left, bisect_right, insort
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from itertools import groupby
 from typing import NamedTuple
 
 from datagrunt.pdf._path_segments import Box, RawSegment
+from datagrunt.pdf._pdfium_common import union_box
 from datagrunt.pdf._validate import int_at_least, typed_tuple
 from datagrunt.pdf.elements import BBox
 from datagrunt.pdf.quality import SpanPiece
@@ -24,6 +26,14 @@ SNAP_PT = 2.0
 
 # A table has at least this many rows and columns of cells (v4's drop_layout_tables minimum).
 _MIN_GRID = 2
+
+# A run joins a line when they overlap across it by this share of the smaller height (spec §3.3 Pass B).
+_LINE_OVERLAP = 0.45
+# Runs on a line join with nothing across a gap of at most this many ems, else with a space (spec §3.3 Pass B).
+_JOIN_GAP_EM = 0.22
+# Reading turns: the clockwise angle a run's text advances at on the displayed page. Text advancing
+# leftward reads across too: right-to-left text comes in logical order, as upside-down text would.
+_ACROSS, _DOWN, _UP = 0, 90, 270
 
 # Sweep events at one x: horizontal rules open, then vertical rules query, then horizontal rules close.
 _OPEN, _QUERY, _CLOSE = 0, 1, 2
@@ -449,3 +459,178 @@ class _UnionFind:
             first, second = second, first
         self._parent[second] = first
         self._size[first] += self._size[second]
+
+
+class _Run(NamedTuple):
+    """Consecutive chars ``piece.span.text[start:end]`` of one visible piece, all centred in one cell."""
+
+    piece: SpanPiece
+    start: int
+    end: int
+
+
+def _cell_runs(grids: list[_Grid], pieces: Iterable[SpanPiece]) -> list[list[list[_Run]]]:
+    """The runs of visible chars in each cell of each grid, in piece order.
+
+    A char belongs to the smallest grid (by extent) whose extent holds the
+    centre of its box, edges included, and to the cell of the unit
+    holding it there, so a piece crossing a cell border splits at its
+    chars. Hidden pieces are in no cell. O(chars x G + chars log(X + Y))
+    for G grids near each piece.
+    """
+    runs: list[list[list[_Run]]] = [[[] for _ in grid.boxes] for grid in grids]
+    by_area = sorted(range(len(grids)), key=lambda index: _extent_area(grids[index]))
+    for piece in pieces:
+        if piece.hidden_reasons:
+            continue
+        nearby = [index for index in by_area if _meets(_extent(grids[index]), piece.bbox)]
+        for (grid_index, cell_index), start, end in _located_runs(piece, grids, nearby):
+            runs[grid_index][cell_index].append(_Run(piece, start, end))
+    return runs
+
+
+def _extent(grid: _Grid) -> Box:
+    """The box a grid's units cover."""
+    return grid.xs[0], grid.ys[0], grid.xs[-1], grid.ys[-1]
+
+
+def _extent_area(grid: _Grid) -> float:
+    """The area a grid's units cover."""
+    x0, y0, x1, y1 = _extent(grid)
+    return (x1 - x0) * (y1 - y0)
+
+
+def _meets(first: Box, second: Box) -> bool:
+    """True if two boxes meet, edges included."""
+    return first[0] <= second[2] and second[0] <= first[2] and first[1] <= second[3] and second[1] <= first[3]
+
+
+def _located_runs(
+    piece: SpanPiece, grids: list[_Grid], nearby: list[int]
+) -> Iterator[tuple[tuple[int, int], int, int]]:
+    """Yield ``((grid, cell), start, end)`` for each maximal run of the piece's chars centred in one cell."""
+    if not nearby:
+        return
+    boxes = piece.span.char_boxes
+    places = [_place(grids, nearby, boxes[offset]) for offset in range(piece.start, piece.end)]
+    offset = piece.start
+    for place, group in groupby(places):
+        count = sum(1 for _ in group)
+        if place is not None:
+            yield place, offset, offset + count
+        offset += count
+
+
+def _place(grids: list[_Grid], nearby: list[int], box: Box) -> tuple[int, int] | None:
+    """``(grid, cell)`` of the first of the ``nearby`` grids whose extent holds the centre of ``box``, if any."""
+    x, y = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    for index in nearby:
+        xs, ys = grids[index].xs, grids[index].ys
+        if xs[0] <= x <= xs[-1] and ys[0] <= y <= ys[-1]:
+            col = min(bisect_right(xs, x), len(xs) - 1) - 1
+            row = min(bisect_right(ys, y), len(ys) - 1) - 1
+            return index, grids[index].unit_cells[row * (len(xs) - 1) + col]
+    return None
+
+
+def _cell_text(runs: list[_Run], default_turn: int) -> str:
+    """A cell's text: its runs in lines, read in the direction its text advances.
+
+    The direction is the one the cell's runs of two or more chars share,
+    else ``default_turn``. In that frame, runs overlapping a line by at
+    least :data:`_LINE_OVERLAP` of the smaller height are on it; lines read
+    top to bottom and join with one space; runs on a line read left to
+    right and join with nothing across a gap of at most
+    :data:`_JOIN_GAP_EM` ems of the larger font, else with one space; a
+    run keeps its span's char order, with one space at each break pdfium
+    generated inside it. Text is otherwise verbatim. O(r log r) for r runs.
+    """
+    if not runs:
+        return ""
+    turn = _reading_turn(runs, default_turn)
+    placed = sorted(((_turned(_run_box(run), turn), run) for run in runs), key=lambda item: (item[0][1], item[0][0]))
+    return " ".join(_line_text(line) for line in _lines(placed))
+
+
+def _reading_turn(runs: list[_Run], default: int) -> int:
+    """The one reading turn the runs with a direction share, else ``default``."""
+    turns = {turn for run in runs if (turn := _run_turn(run)) is not None}
+    return turns.pop() if len(turns) == 1 else default
+
+
+def _run_turn(run: _Run) -> int | None:
+    """The turn a run's text advances at, from its first char's centre to its last; None for one char."""
+    if run.end - run.start < 2:
+        return None
+    boxes = run.piece.span.char_boxes
+    first, last = boxes[run.start], boxes[run.end - 1]
+    dx = (last[0] + last[2] - first[0] - first[2]) / 2
+    dy = (last[1] + last[3] - first[1] - first[3]) / 2
+    if dx == 0 and dy == 0:
+        return None
+    if abs(dx) >= abs(dy):
+        return _ACROSS
+    return _DOWN if dy > 0 else _UP
+
+
+def _turned(box: Box, turn: int) -> Box:
+    """``box`` in the frame where text advancing at ``turn`` reads left to right, its lines top to bottom.
+
+    Text advancing down (a quarter turn clockwise) has its top toward +x:
+    ``(u, v) = (y, -x)``. Text advancing up: ``(u, v) = (-y, x)``.
+    """
+    x0, y0, x1, y1 = box
+    if turn == _DOWN:
+        return y0, -x1, y1, -x0
+    if turn == _UP:
+        return -y1, x0, -y0, x1
+    return box
+
+
+def _run_box(run: _Run) -> Box:
+    """The union of a run's char boxes."""
+    return union_box(run.piece.span.char_boxes[run.start : run.end])
+
+
+def _lines(placed: list[tuple[Box, _Run]]) -> list[list[tuple[Box, _Run]]]:
+    """Runs (with their turned boxes, sorted by top) grouped into lines by their overlap across them."""
+    lines: list[list[tuple[Box, _Run]]] = []
+    top = bottom = 0.0
+    for item in placed:
+        _, y0, _, y1 = item[0]
+        if lines and _overlap_share(top, bottom, y0, y1) >= _LINE_OVERLAP:
+            lines[-1].append(item)
+            bottom = max(bottom, y1)
+            continue
+        lines.append([item])
+        top, bottom = y0, y1
+    return lines
+
+
+def _overlap_share(top: float, bottom: float, y0: float, y1: float) -> float:
+    """How much ``top..bottom`` and ``y0..y1`` overlap, as a share of the smaller (touching counts for a point)."""
+    overlap = min(bottom, y1) - max(top, y0)
+    smaller = min(bottom - top, y1 - y0)
+    if smaller <= 0.0:
+        return 1.0 if overlap >= 0.0 else 0.0
+    return overlap / smaller
+
+
+def _line_text(line: list[tuple[Box, _Run]]) -> str:
+    """A line's runs left to right, joined by the gap between them (see :func:`_cell_text`)."""
+    ordered = sorted(line, key=lambda item: item[0][0])
+    parts = [_run_text(ordered[0][1])]
+    for (before, previous), (box, run) in zip(ordered, ordered[1:]):
+        em = max(abs(previous.piece.span.font_size_pt), abs(run.piece.span.font_size_pt))
+        parts.append("" if box[0] - before[2] <= _JOIN_GAP_EM * em else " ")
+        parts.append(_run_text(run))
+    return "".join(parts)
+
+
+def _run_text(run: _Run) -> str:
+    """A run's chars in span order, with one space at each generated break inside it."""
+    span = run.piece.span
+    breaks = span.generated_breaks
+    inside = breaks[bisect_right(breaks, run.start) : bisect_left(breaks, run.end)]
+    bounds = (run.start, *inside, run.end)
+    return " ".join(span.text[start:end] for start, end in zip(bounds, bounds[1:]))
