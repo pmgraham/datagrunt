@@ -6,7 +6,8 @@ later paint in the same ``q`` ... ``Q`` scope shows through the glyphs
 paint runs inside its clip, is visibly painted, and covers the glyphs. The
 pins below record what pdfium 156.0.8076.0 (pypdfium2 5.14.0) exposes, and
 why that proof cannot be made from it: mode-7 text stays ``invisible`` in
-every case (the maintainer decides again with this evidence).
+every case (maintainer decision, 2026-10-31, given this evidence: flagged
+text is still extracted, while unflagged invisible text would not be).
 """
 
 import ctypes
