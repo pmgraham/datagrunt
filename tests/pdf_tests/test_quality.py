@@ -791,6 +791,24 @@ class TestZeroScaleThroughExtractPage:
     def test_inside_forms(self, tmp_path, make_page, expected):
         assert texts(classified_page(make_page(tmp_path))) == [("HIDDEN", expected)]
 
+    @pytest.mark.parametrize(
+        "matrix,expected",
+        [
+            # Both em sides about a unit long, sheared onto almost one line: 0.0012 pt tall, and a hair
+            # narrower than tall (its slanted side is 1.000000005 units long), so squeezed too.
+            pytest.param(b"1 0 1 0.0001", ("tiny_font", "zero_scale"), id="sheared-flat"),
+            # Both sides on one line: the glyphs collapse onto it.
+            pytest.param(b"1 0 1 0", ("tiny_font",), id="rank-1"),
+            # Controls: an oblique (italic) em and a turned one stay unflagged.
+            pytest.param(b"1 0 0.2 1", (), id="oblique"),
+            pytest.param(b"0 1 -1 0", (), id="quarter-turn"),
+        ],
+    )
+    def test_a_collapsed_em_is_flagged(self, tmp_path, matrix, expected):
+        content = CONTROL + b"BT /F1 12 Tf %s 200 100 Tm (HIDDEN) Tj ET" % matrix
+
+        assert texts(classified_page(content_page(tmp_path, content))) == [("Visible", ()), ("HIDDEN", expected)]
+
     @pytest.mark.parametrize("scale,route", [(b"1", "vision"), (b"100", "digital")], ids=["tz-1", "tz-100"])
     def test_squeezed_text_is_kept_but_never_routes_the_page(self, tmp_path, scale, route):
         content = b"q BT /F1 12 Tf %s Tz 20 150 Td (Thirty characters of body text.) Tj ET Q" % scale

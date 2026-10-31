@@ -73,14 +73,16 @@ class RawSpan:
         bbox: The union of ``char_boxes``.
         char_boxes: One box per char of ``text``: pdfium's loose char box
             (advance width by the font's ascent-to-descent height).
-        font_size_pt: The ``Tf`` size times the vertical scale of the text's
-            page-space matrix (form matrices included); negative for a
+        font_size_pt: The height of the text's em under its page-space
+            matrix (form matrices included), measured across its baseline
+            (:func:`em_size`): the ``Tf`` size for upright, turned or
+            oblique text, near 0 for text sheared flat; negative for a
             negative ``Tf`` (mirrored glyphs).
-        em_width_pt: The width of the text's em: ``|Tf|`` times the
-            horizontal scale, ``hypot(a, b)``, of the same matrix (form
-            matrices and ``Tz`` included), so a mirrored scale counts at its
-            magnitude and turned text in full; never negative (see
-            :func:`em_size`). An em under 1 pt wide and narrower than it is
+        em_width_pt: The width of the text's em under the same matrix
+            (form matrices and ``Tz`` included), measured across its height
+            side (:func:`em_size`), so a mirrored scale counts at its
+            magnitude, turned text in full and sheared-flat text as flat;
+            never negative. An em under 1 pt wide and narrower than it is
             tall is text squeezed flat: ``Tz 0.05`` leaves 12 pt "HIDDEN"
             in the textpage at 0.006 pt per em.
         base_font_name: The font's /BaseFont without a subset tag
@@ -381,13 +383,24 @@ def _bold_and_italic(font: pdfium_c.FPDF_FONT, name: str, label: str) -> tuple[b
 def em_size(size: float, a: float, b: float, c: float, d: float) -> tuple[float, float]:
     """The width and height in points of an em of ``Tf`` ``size`` under a text matrix ``[a b c d]`` to page space.
 
-    The em's sides map to ``(a, b)`` and ``(c, d)``: it is ``|size| x
-    hypot(a, b)`` wide and ``|size| x hypot(c, d)`` tall, so a mirrored
-    (negative) size or scale counts at its magnitude and turned text in
-    full. The one measure for textpage spans (:class:`RawSpan`) and for the
-    text objects recovery reads back.
+    The em's sides map to ``(a, b)`` (along the baseline) and ``(c, d)``
+    (up the glyphs), and each is measured perpendicular to the other: the
+    em is ``|size| x |ad - bc| / hypot(c, d)`` wide and ``|size| x |ad - bc|
+    / hypot(a, b)`` tall, the two heights of the parallelogram it maps to.
+    Perpendicular sides (any turn, scale or mirror) read their own lengths;
+    a shear that lays both sides along almost one line (``1 0 1 0.0001``)
+    or a singular matrix (``1 0 1 0``) leaves the em little or no extent
+    either way, however long its sides. A side of no length leaves the
+    other its own length (``Tz 0``: no width, full height). A mirrored
+    (negative) size or scale counts at its magnitude. The one measure for
+    textpage spans (:class:`RawSpan`) and for the text objects recovery
+    reads back.
     """
-    return abs(size) * math.hypot(a, b), abs(size) * math.hypot(c, d)
+    area = abs(a * d - b * c)
+    along, up = math.hypot(a, b), math.hypot(c, d)
+    width = area / up if up else along
+    height = area / along if along else up
+    return abs(size) * width, abs(size) * height
 
 
 def _em(

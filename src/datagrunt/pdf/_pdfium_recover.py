@@ -37,11 +37,13 @@ text matrix to page space (``[a b c d]``) and ``Tf`` size
 (:func:`~datagrunt.pdf._pdfium_text.em_size`), the rule
 :mod:`datagrunt.pdf.quality` flags a textpage span with:
 
-- ``tiny_font``: the em's height, ``|Tf| x hypot(c, d)``, is under 1 pt
-  (0 included).
-- ``zero_scale``: the em's width, ``|Tf| x hypot(a, b)``, is under 1 pt and
-  the matrix squeezes it, ``hypot(a, b) < hypot(c, d)`` (``Tz 0``; the
-  textpage keeps ``Tz 0.05`` text, which this rule flags all the same).
+- ``tiny_font``: the em's height, measured across its baseline, is under
+  1 pt (0 included): a tiny size, or a matrix that lays the em's sides
+  along (almost) one line (``0 1 0 1 Tm``), however long they are.
+- ``zero_scale``: the em's width, measured across its height side, is under
+  1 pt and under its height: the matrix squeezes it, ``hypot(a, b) <
+  hypot(c, d)`` (``Tz 0``; the textpage keeps ``Tz 0.05`` text, which this
+  rule flags all the same).
 
 Text drawn under 1 pt per em wide is always one or the other. A recovered
 object whose em is wider (a copy pdfium dropped as a duplicate though it lies

@@ -6,6 +6,7 @@ hand (``hand_written_pdf``) for what ReportLab cannot write.
 """
 
 import dataclasses
+import math
 import pickle
 import re
 import subprocess
@@ -18,6 +19,7 @@ import pytest
 from reportlab.pdfbase.pdfmetrics import stringWidth
 
 from datagrunt.pdf import PDFCorruptError, _pdfium_common
+from datagrunt.pdf._pdfium_text import em_size
 from datagrunt.pdf.pdfium_engine import PageText, RawSpan, TextStats, open_document, page_text
 from pdf_tests.builders import FormXObject, PageSpec, TextRun, break_page, build_pdf, hand_written_pdf
 
@@ -1182,6 +1184,56 @@ class TestEmWidth:
         (got,) = spans_of(two_forms_page(tmp_path, body, outer=outer, inner=b"[1 0 0 1 0 0]"))
 
         assert (got.font_size_pt, got.em_width_pt) == pytest.approx((12.0, width), rel=1e-5)
+
+    @pytest.mark.parametrize(
+        "matrix,size,width",
+        [
+            # Both sides of the em are 12 pt long, but sheared onto almost one line: 0.0012 pt of area per pt.
+            pytest.param(b"1 0 1 0.0001", 0.0012, 0.0012, id="sheared-flat"),
+            # Both sides on one line: no area at all.
+            pytest.param(b"1 0 1 0", 0.0, 0.0, id="rank-1"),
+            # An oblique em is as tall as its size; its slant narrows it.
+            pytest.param(b"1 0 0.2 1", 12.0, 12.0 / math.hypot(0.2, 1.0), id="oblique"),
+        ],
+    )
+    def test_a_slanted_em_is_measured_across_its_other_side(self, tmp_path, matrix, size, width):
+        (got,) = spans_of(content_page(tmp_path, b"BT /F1 12 Tf %s 200 100 Tm (HIDDEN) Tj ET" % matrix))
+
+        # pdfium keeps the matrix in 32-bit floats: 0.0001 reads 0.000099999997.
+        assert (got.font_size_pt, got.em_width_pt) == pytest.approx((size, width), rel=1e-5)
+
+
+class TestEmSize:
+    """em_size measures each side of the em perpendicular to the other: a sheared or singular em reads small."""
+
+    @pytest.mark.parametrize(
+        "matrix,size,expected",
+        [
+            pytest.param((1.0, 0.0, 0.0, 1.0), 12.0, (12.0, 12.0), id="identity"),
+            pytest.param((3.0, 0.0, 0.0, 2.0), 10.0, (30.0, 20.0), id="anisotropic"),
+            pytest.param((0.0, 1.0, -1.0, 0.0), 12.0, (12.0, 12.0), id="quarter-turn"),
+            pytest.param((0.6, 0.8, -0.8, 0.6), 12.0, (12.0, 12.0), id="turned"),
+            # A mirrored (negative) size or scale counts at its magnitude.
+            pytest.param((1.0, 0.0, 0.0, 1.0), -12.0, (12.0, 12.0), id="negative-size"),
+            pytest.param((-1.0, 0.0, 0.0, 1.0), 12.0, (12.0, 12.0), id="mirrored"),
+            # Perpendicular sides: each is its own length, as before.
+            pytest.param((0.01, 0.0, 0.0, 1.0), 12.0, (0.12, 12.0), id="tz-1"),
+            # An oblique em is as tall as its size; its slant narrows it.
+            pytest.param((1.0, 0.0, 0.2, 1.0), 12.0, (12.0 / math.hypot(0.2, 1.0), 12.0), id="oblique"),
+            # Tz 0: the width side has no length, so the height is the other side's length.
+            pytest.param((0.0, 0.0, 0.0, 1.0), 12.0, (0.0, 12.0), id="tz-0"),
+            pytest.param((1.0, 0.0, 0.0, 0.0), 12.0, (12.0, 0.0), id="no-height"),
+            pytest.param((0.0, 0.0, 0.0, 0.0), 12.0, (0.0, 0.0), id="zero"),
+            # Sheared flat: both sides about a unit long, spanning 0.0001 square units.
+            pytest.param((1.0, 0.0, 1.0, 0.0001), 12.0, (0.0012 / math.hypot(1.0, 0.0001), 0.0012), id="sheared"),
+            # Rank 1: both sides on one line.
+            pytest.param((1.0, 0.0, 1.0, 0.0), 12.0, (0.0, 0.0), id="rank-1"),
+            pytest.param((0.0, 1.0, 0.0, 1.0), 12.0, (0.0, 0.0), id="rank-1-vertical"),
+            pytest.param((1.0, 1.0, 2.0, 2.0), 12.0, (0.0, 0.0), id="rank-1-diagonal"),
+        ],
+    )
+    def test_each_side_is_measured_across_the_other(self, matrix, size, expected):
+        assert em_size(size, *matrix) == pytest.approx(expected, rel=1e-12, abs=1e-12)
 
 
 def textpage_chars(path: Path) -> tuple[str, int, int, int]:

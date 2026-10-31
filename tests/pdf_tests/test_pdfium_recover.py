@@ -852,6 +852,16 @@ class TestRecovery:
 
         assert (item.span.text, item.hidden_reasons, item.span.font_size_pt) == ("FLAT", ("tiny_font",), 0.0)
 
+    @pytest.mark.parametrize("matrix", [b"0 1 0 1", b"0.00001 1 0 1"], ids=["rank-1", "sheared-flat"])
+    def test_a_collapsed_matrix_is_tiny(self, tmp_path, matrix):
+        # Both em sides are 12 pt long but (almost) on one line: pdfium drops the text, which draws a line.
+        content = CONTROL + b"BT /F1 12 Tf %s 72 100 Tm (HIDDEN) Tj ET" % matrix
+
+        (item,) = recovered(pdf(tmp_path, content)).spans
+
+        assert (item.span.text, item.hidden_reasons) == ("HIDDEN", ("tiny_font",))
+        assert (item.span.font_size_pt, item.span.em_width_pt) == pytest.approx((0.0, 0.0), abs=1e-3)
+
     def test_generated_breaks_are_kept(self, tmp_path):
         got = recovered(pdf(tmp_path, CONTROL + b"BT /F1 0 Tf 72 100 Td [(Name) -12000 (Value)] TJ ET"))
 
