@@ -39,9 +39,10 @@ HiddenReason: TypeAlias = Literal[
 
 ``matches_background`` means the text colour is indistinguishable from the
 background it is drawn on. ``zero_scale`` means the text is squeezed flat:
-drawn under 1 pt per em wide and narrower than tall (``Tz 0``), text pdfium's
-textpage drops and the v5 engine recovers (#366). New reasons are appended,
-so the canonical order of the older ones never changes.
+drawn under 1 pt per em wide and narrower than tall, as text pdfium's
+textpage drops (``Tz 0``: the v5 engine recovers it) or keeps (``Tz 0.05``)
+(#366). New reasons are appended, so the canonical order of the older ones
+never changes.
 """
 
 # Canonical order, derived from the Literal so the two can never drift apart.

@@ -31,14 +31,17 @@ only in that page load: nothing is saved.
 
 Recovered text keeps where the object was: every char box of its span is the
 object's original box (a point for ``Tf 0`` text, a line with no width for
-``Tz 0`` text) and its font size is the original one. Its hidden reasons are
-measured on the original object's text matrix to page space (``[a b c d]``)
-and ``Tf`` size:
+``Tz 0`` text) and its font size and em width are the original ones. Its
+hidden reasons (:func:`em_reasons`) are measured on the original object's
+text matrix to page space (``[a b c d]``) and ``Tf`` size
+(:func:`~datagrunt.pdf._pdfium_text.em_size`), the rule
+:mod:`datagrunt.pdf.quality` flags a textpage span with:
 
 - ``tiny_font``: the em's height, ``|Tf| x hypot(c, d)``, is under 1 pt
-  (0 included), as :mod:`datagrunt.pdf.quality` flags a textpage span.
+  (0 included).
 - ``zero_scale``: the em's width, ``|Tf| x hypot(a, b)``, is under 1 pt and
-  the matrix squeezes it, ``hypot(a, b) < hypot(c, d)`` (``Tz 0``).
+  the matrix squeezes it, ``hypot(a, b) < hypot(c, d)`` (``Tz 0``; the
+  textpage keeps ``Tz 0.05`` text, which this rule flags all the same).
 
 Text drawn under 1 pt per em wide is always one or the other. A recovered
 object whose em is wider (a copy pdfium dropped as a duplicate though it lies
@@ -55,7 +58,7 @@ import pypdfium2.raw as pdfium_c
 
 from datagrunt.pdf._path_segments import Matrix
 from datagrunt.pdf._pdfium_common import Box, PdfiumFailure, object_address
-from datagrunt.pdf._pdfium_text import PageText, RawSpan
+from datagrunt.pdf._pdfium_text import PageText, RawSpan, em_size
 from datagrunt.pdf._validate import int_at_least, typed_tuple
 from datagrunt.pdf.elements import HiddenReason, check_hidden_reasons
 
@@ -77,7 +80,8 @@ class RecoveredSpan:
         span: The recovered chars, in textpage order (generated breaks
             kept), with the object's style. Every char box is the object's
             original displayed box (a degenerate one for ``Tf 0`` or ``Tz 0``
-            text), and ``font_size_pt`` is its original size.
+            text), and ``font_size_pt`` and ``em_width_pt`` are its
+            original size and em width.
         hidden_reasons: ``tiny_font`` and / or ``zero_scale`` (see the module
             notes), in A1's canonical order; empty for a drawn copy.
     """
@@ -164,14 +168,16 @@ class Target(NamedTuple):
     """A dropped text object as it was before :func:`isolate_dropped` moved it.
 
     ``box`` (displayed) and ``origin`` (page space) are None when pdfium
-    placed it at a non-finite position or size. ``empty`` is True when its
-    box is still a point once moved and laid out again.
+    placed it at a non-finite position or size (its size and em width then
+    read 0). ``empty`` is True when its box is still a point once moved and
+    laid out again.
     """
 
     object_index: int
     origin: tuple[float, float] | None
     box: Box | None
     font_size_pt: float
+    em_width_pt: float
     hidden_reasons: tuple[HiddenReason, ...]
     empty: bool = False
 
@@ -186,7 +192,7 @@ def is_glyphless(handle: pdfium_c.FPDF_PAGEOBJECT, matrix: Matrix, label: str) -
     Raises:
         PdfiumFailure: If a pdfium call fails.
     """
-    width, height = _em(_font_size(handle, label), matrix)
+    width, height = em_size(_font_size(handle, label), matrix.a, matrix.b, matrix.c, matrix.d)
     return width >= TINY_FONT_PT and height >= TINY_FONT_PT and _is_point(_bounds(handle, label))
 
 
@@ -210,11 +216,6 @@ def _is_point(box: Box) -> bool:
     """True if ``box`` has no width and no height (pdfium's box of an object with no glyph extent)."""
     left, bottom, right, top = box
     return left == right and bottom == top
-
-
-def _em(size: float, matrix: Matrix) -> tuple[float, float]:
-    """The width and height of an em of ``Tf`` ``size`` under ``matrix``."""
-    return abs(size) * math.hypot(matrix.a, matrix.b), abs(size) * math.hypot(matrix.c, matrix.d)
 
 
 def isolate_dropped(
@@ -241,32 +242,41 @@ def isolate_dropped(
 
 
 def _original(text: TextObject, to_display: Callable[[Box], Box]) -> Target:
-    """The dropped object ``text`` as pdfium placed it: its displayed box, origin, size and reasons."""
+    """The dropped object ``text`` as pdfium placed it: its displayed box, origin, size, em width and reasons."""
     label = f"object {text.object_index}"
     size = _font_size(text.handle, label)
     left, bottom, right, top = _bounds(text.handle, label)
     matrix = text.own.then(text.outer)
     # Bounds are in the form's space, as the object matrix is.
     corners = [text.outer.apply(x, y) for x in (left, right) for y in (bottom, top)]
-    em = size * math.hypot(matrix.c, matrix.d)
-    if not all(math.isfinite(value) for value in (*matrix, em, *(edge for corner in corners for edge in corner))):
-        return Target(object_index=text.object_index, origin=None, box=None, font_size_pt=0.0, hidden_reasons=())
+    width, height = em_size(size, matrix.a, matrix.b, matrix.c, matrix.d)
+    edges = (edge for corner in corners for edge in corner)
+    if not all(math.isfinite(value) for value in (*matrix, width, height, *edges)):
+        return Target(
+            object_index=text.object_index, origin=None, box=None, font_size_pt=0.0, em_width_pt=0.0, hidden_reasons=()
+        )
     xs, ys = [corner[0] for corner in corners], [corner[1] for corner in corners]
     return Target(
         object_index=text.object_index,
         origin=(matrix.e, matrix.f),
         box=to_display((min(xs), min(ys), max(xs), max(ys))),
-        font_size_pt=em,
-        hidden_reasons=_reasons(size, matrix),
+        font_size_pt=math.copysign(height, size),
+        em_width_pt=width,
+        hidden_reasons=em_reasons(width, height),
     )
 
 
-def _reasons(size: float, matrix: Matrix) -> tuple[HiddenReason, ...]:
-    """``tiny_font`` and / or ``zero_scale`` for text of ``Tf`` ``size`` under ``matrix`` (see the module notes)."""
-    width, height = _em(size, matrix)
-    tiny = height < TINY_FONT_PT
+def em_reasons(width_pt: float, height_pt: float) -> tuple[HiddenReason, ...]:
+    """``tiny_font`` and / or ``zero_scale`` for text whose em is ``width_pt`` by ``height_pt`` (see the module notes).
+
+    The one rule, and :data:`TINY_FONT_PT` the one threshold, for text pdfium
+    drops (recovery) and text its textpage keeps (:mod:`datagrunt.pdf.quality`
+    flags a span by its ``em_width_pt`` and ``|font_size_pt|``). Both sides
+    are magnitudes (:func:`~datagrunt.pdf._pdfium_text.em_size`).
+    """
+    tiny = height_pt < TINY_FONT_PT
     # A narrower em than a taller one: the matrix (Tz) squeezes it, not the size.
-    squeezed = width < height and width < TINY_FONT_PT
+    squeezed = width_pt < height_pt and width_pt < TINY_FONT_PT
     return tuple(reason for reason, flagged in zip(RECOVERY_REASONS, (tiny, squeezed)) if flagged)
 
 
@@ -353,6 +363,12 @@ def _overprints(origin: tuple[float, float], others: Iterable[tuple[float, float
 
 
 def _placed(span: RawSpan, box: Box, target: Target) -> RecoveredSpan:
-    """``span`` read from the moved object, put back at the target's original ``box`` and size."""
-    original = replace(span, bbox=box, char_boxes=(box,) * len(span.text), font_size_pt=target.font_size_pt)
+    """``span`` read from the moved object, put back at the target's original ``box``, size and em width."""
+    original = replace(
+        span,
+        bbox=box,
+        char_boxes=(box,) * len(span.text),
+        font_size_pt=target.font_size_pt,
+        em_width_pt=target.em_width_pt,
+    )
     return RecoveredSpan(span=original, hidden_reasons=target.hidden_reasons)

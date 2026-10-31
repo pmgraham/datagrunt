@@ -24,10 +24,16 @@ char of every span, in order, cut into pieces that carry the A1
 - ``transparent``: alpha 0 on every channel the render mode paints: fill
   for modes 0 and 4, stroke for 1 and 5, both for 2 and 6. Modes 3 and 7
   paint nothing (``invisible``), so they are never ``transparent``.
+- ``zero_scale``: an em (``RawSpan.em_width_pt``) under 1 pt wide and
+  narrower than it is tall: text squeezed flat by its matrix (``Tz 0.05``),
+  which pdfium's textpage keeps. Tiny text no narrower than tall is
+  ``tiny_font`` only.
 
-A white fill alone is no signal: ``matches_background`` needs the rendered
-background under the span (#366 task 2). ``zero_scale`` comes only from
-recovery (#366 task 3): textpage spans are never flagged with it.
+``tiny_font`` and ``zero_scale`` are recovery's rule and threshold
+(:func:`~datagrunt.pdf._pdfium_recover.em_reasons`), so a textpage span and
+recovered text are flagged alike. A white fill alone is no signal:
+``matches_background`` needs the rendered background under the span (#366
+task 2).
 
 :func:`assess_page` measures a page and routes it (#366 task 4):
 
@@ -62,7 +68,7 @@ from typing import Literal, TypeAlias, get_args
 
 from datagrunt.pdf._pdfium_common import Box, union_box
 from datagrunt.pdf._pdfium_images import RawImage
-from datagrunt.pdf._pdfium_recover import TINY_FONT_PT, RecoveredText
+from datagrunt.pdf._pdfium_recover import RecoveredText, em_reasons
 from datagrunt.pdf._pdfium_text import RawSpan
 from datagrunt.pdf._validate import choice_str, int_at_least, ordered_box, positive_float, str_tuple, typed_tuple
 from datagrunt.pdf.elements import (
@@ -211,7 +217,8 @@ def _span_pieces(span: RawSpan, width: float, height: float, raster: tuple[Box, 
     """Yield ``span``'s pieces: maximal runs of chars with equal hidden reasons."""
     no_paint = span.render_mode in _NO_PAINT_MODES
     under = _overlapping(span.bbox, raster) if no_paint else ()
-    flagged = {"tiny_font": abs(span.font_size_pt) < TINY_FONT_PT, "transparent": _transparent(span)}
+    flagged = dict.fromkeys(em_reasons(span.em_width_pt, abs(span.font_size_pt)), True)
+    flagged["transparent"] = _transparent(span)
     reasons: list[tuple[HiddenReason, ...]] = []
     for box in span.char_boxes:
         flagged["off_page"] = _off_page(box, width, height)

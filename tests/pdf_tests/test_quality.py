@@ -19,12 +19,14 @@ import pytest
 
 import datagrunt
 import datagrunt.pdf
-from datagrunt.pdf import elements, quality
+from datagrunt.pdf import _pdfium_recover, elements, quality
+from datagrunt.pdf._pdfium_recover import em_reasons
 from datagrunt.pdf.elements import BBox
 from datagrunt.pdf.pdfium_engine import RawImage, RawPage, RawSpan, extract_page, open_document
-from datagrunt.pdf.quality import SpanPiece, classify_spans, raster_cover_fraction
+from datagrunt.pdf.quality import SpanPiece, assess_page, classify_spans, raster_cover_fraction
 from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf, solid_png
 from pdf_tests.test_pdfium_engine import ENGINE_MODULES, imported_modules
+from pdf_tests.test_pdfium_spans import SQUEEZED, TURNED, content_page, nested_text_page, two_forms_page
 
 W, H = 400.0, 300.0
 SHA = "0" * 64
@@ -58,6 +60,7 @@ def raw_span(text: str = "Abcd", boxes=None, **overrides) -> RawSpan:
         "bbox": union(boxes),
         "char_boxes": boxes,
         "font_size_pt": 11.0,
+        "em_width_pt": 11.0,
         "base_font_name": "Helvetica",
         "is_bold": False,
         "is_italic": False,
@@ -370,6 +373,71 @@ class TestTinyFont:
         assert reasons_of(raw_span(font_size_pt=size)) == [expected]
 
 
+class TestZeroScale:
+    """An em under 1 pt wide and narrower than tall is zero_scale: text squeezed flat (Tz), recovery's rule."""
+
+    @pytest.mark.parametrize(
+        "width,expected",
+        [
+            pytest.param(0.0, ("zero_scale",), id="flat"),
+            pytest.param(0.006, ("zero_scale",), id="tz-0.05"),
+            pytest.param(0.5, ("zero_scale",), id="half-point"),
+            pytest.param(0.999, ("zero_scale",), id="just-under"),
+            pytest.param(1.0, (), id="one-point"),
+            pytest.param(11.0, (), id="body"),
+            pytest.param(30.0, (), id="wide"),
+        ],
+    )
+    def test_threshold(self, width, expected):
+        assert reasons_of(raw_span(font_size_pt=11.0, em_width_pt=width)) == [expected]
+
+    @pytest.mark.parametrize(
+        "size,width,expected",
+        [
+            # A negative Tf draws mirrored glyphs at its magnitude: 12 pt tall.
+            pytest.param(-12.0, 0.12, ("zero_scale",), id="mirrored-squeezed"),
+            pytest.param(-12.0, 12.0, (), id="mirrored-body"),
+            # Tiny but not squeezed (no narrower than tall): the size hides it, not the scale.
+            pytest.param(0.5, 0.5, ("tiny_font",), id="tiny-square"),
+            pytest.param(0.0, 0.0, ("tiny_font",), id="zero-matrix"),
+            pytest.param(0.5, 0.1, ("tiny_font", "zero_scale"), id="tiny-and-squeezed"),
+        ],
+    )
+    def test_the_em_must_be_narrower_than_tall(self, size, width, expected):
+        assert reasons_of(raw_span(font_size_pt=size, em_width_pt=width)) == [expected]
+
+    def test_the_rule_is_recoverys(self):
+        cases = [(width, height) for width in (0.0, 0.006, 0.5, 0.999, 1.0, 12.0) for height in (0.0, 0.5, 1.0, 12.0)]
+
+        for width, height in cases:
+            (got,) = reasons_of(raw_span(font_size_pt=height, em_width_pt=width))
+            assert got == em_reasons(width, height), (width, height)
+
+    def test_off_page_invisible_tiny_and_zero_scale(self):
+        source = raw_span("A", ((-40.0, 90.0, -39.5, 90.5),), render_mode=3, font_size_pt=0.5, em_width_pt=0.1)
+
+        assert reasons_of(source) == [("off_page", "invisible", "tiny_font", "zero_scale")]
+
+    def test_off_page_tiny_transparent_and_zero_scale(self):
+        source = raw_span("A", ((-40.0, 90.0, -39.5, 90.5),), font_size_pt=0.5, em_width_pt=0.1, fill_rgba=(0, 0, 0, 0))
+
+        assert reasons_of(source) == [("off_page", "tiny_font", "transparent", "zero_scale")]
+
+    def test_transparent_and_zero_scale(self):
+        assert reasons_of(raw_span(em_width_pt=0.12, fill_rgba=(0, 0, 0, 0))) == [("transparent", "zero_scale")]
+
+    def test_zero_scale_stays_on_both_sides_of_an_edge_split(self):
+        source = raw_span("Abcd", row(4, 388.0), em_width_pt=0.12)
+
+        assert layout(classify(source)) == [(0, 2, "Ab", ("zero_scale",)), (2, 4, "cd", ("off_page", "zero_scale"))]
+
+    def test_an_ocr_layer_squeezed_flat_is_still_zero_scale(self):
+        # Raster cover lifts invisible only: the squeeze still hides the text.
+        source = raw_span(render_mode=3, em_width_pt=0.12)
+
+        assert reasons_of(source, images=(FULL_BLEED,)) == [("zero_scale",)]
+
+
 class TestTransparent:
     """Transparent: alpha 0 on every channel the render mode paints."""
 
@@ -642,6 +710,97 @@ class TestThroughExtractPage:
         assert all(meets_page_rule(item, geometry.width_pt, geometry.height_pt) for item in pieces)
 
 
+# A visible control line above the text under test, on hand-written pages (ReportLab cannot write Tz).
+CONTROL = b"BT /F1 12 Tf 20 270 Td (Visible) Tj ET "
+
+
+def classified_page(path: Path) -> tuple[SpanPiece, ...]:
+    """extract_page of page 1 of ``path``, its spans classified."""
+    raw = extract_page(open_document(path), 0)
+    assert isinstance(raw, RawPage)
+    geometry = raw.geometry
+    return classify_spans(
+        raw.text.spans, width_pt=geometry.width_pt, height_pt=geometry.height_pt, images=raw.images.images
+    )
+
+
+class TestZeroScaleThroughExtractPage:
+    """Text pdfium's textpage keeps though it is squeezed under 1 pt per em is flagged zero_scale, never dropped."""
+
+    @pytest.mark.parametrize(
+        "content,expected",
+        [
+            pytest.param(SQUEEZED % b"0.05", ("zero_scale",), id="tz-0.05"),
+            pytest.param(SQUEEZED % b"0.5", ("zero_scale",), id="tz-0.5"),
+            pytest.param(SQUEEZED % b"1", ("zero_scale",), id="tz-1"),
+            pytest.param(SQUEEZED % b"100", (), id="tz-100"),
+            # 25 % of 4 pt is an em exactly 1 pt wide: not under the threshold.
+            pytest.param(b"BT /F1 4 Tf 25 Tz 72 100 Td (HIDDEN) Tj ET", (), id="exactly-1-pt"),
+            pytest.param(SQUEEZED % b"-1", ("zero_scale",), id="mirrored-tz-1"),
+            pytest.param(SQUEEZED % b"-100", (), id="mirrored-tz-100"),
+            pytest.param(TURNED % (b"1", b"0 1 -1 0"), ("zero_scale",), id="turned-tz-1"),
+            pytest.param(TURNED % (b"100", b"0 1 -1 0"), (), id="turned-tz-100"),
+            # Tiny and squeezed: 0.5 pt tall, 0.005 pt wide.
+            pytest.param(b"q BT /F1 0.5 Tf 1 Tz 72 100 Td (HIDDEN) Tj ET Q", ("tiny_font", "zero_scale"), id="tiny"),
+        ],
+    )
+    def test_on_a_plain_page(self, tmp_path, content, expected):
+        pieces = classified_page(content_page(tmp_path, CONTROL + content))
+
+        assert texts(pieces) == [("Visible", ()), ("HIDDEN", expected)]
+
+    @pytest.mark.parametrize(
+        "make_page,expected",
+        [
+            pytest.param(
+                lambda tmp_path: nested_text_page(tmp_path, b"q BT /F1 12 Tf 1 Tz 10 10 Td (HIDDEN) Tj ET Q"),
+                ("zero_scale",),
+                id="nested-tz-1",
+            ),
+            # 5 % of 12 pt is 0.6 pt, but the forms scale it 3 times: 1.8 pt.
+            pytest.param(
+                lambda tmp_path: nested_text_page(tmp_path, b"q BT /F1 12 Tf 5 Tz 10 10 Td (HIDDEN) Tj ET Q"),
+                (),
+                id="nested-tz-5",
+            ),
+            pytest.param(
+                lambda tmp_path: nested_text_page(tmp_path, b"BT /F1 12 Tf 10 10 Td (HIDDEN) Tj ET"), (), id="nested"
+            ),
+            pytest.param(
+                lambda tmp_path: two_forms_page(
+                    tmp_path,
+                    b"BT /F1 12 Tf 10 10 Td (HIDDEN) Tj ET",
+                    outer=b"[0.05 0 0 1 20 30]",
+                    inner=b"[1 0 0 1 0 0]",
+                ),
+                ("zero_scale",),
+                id="outer-form-squeezes",
+            ),
+            pytest.param(
+                lambda tmp_path: two_forms_page(
+                    tmp_path,
+                    b"q BT /F1 12 Tf 1 Tz 10 10 Td (HIDDEN) Tj ET Q",
+                    outer=b"[10 0 0 1 0 30]",
+                    inner=b"[1 0 0 1 0 0]",
+                ),
+                (),
+                id="outer-form-widens",
+            ),
+        ],
+    )
+    def test_inside_forms(self, tmp_path, make_page, expected):
+        assert texts(classified_page(make_page(tmp_path))) == [("HIDDEN", expected)]
+
+    @pytest.mark.parametrize("scale,route", [(b"1", "vision"), (b"100", "digital")], ids=["tz-1", "tz-100"])
+    def test_squeezed_text_is_kept_but_never_routes_the_page(self, tmp_path, scale, route):
+        content = b"q BT /F1 12 Tf %s Tz 20 150 Td (Thirty characters of body text.) Tj ET Q" % scale
+
+        result = assess_page(extract_page(open_document(content_page(tmp_path, content)), 0))
+
+        assert [item.text for item in result.pieces] == ["Thirty characters of body text."]
+        assert result.route == route
+
+
 class TestModuleImports:
     """quality is pure and internal: no pdfium, no v4 stack, nothing exported."""
 
@@ -676,6 +835,11 @@ class TestModuleImports:
     def test_validates_reasons_with_a1s_public_rule(self):
         assert quality.check_hidden_reasons is elements.check_hidden_reasons
         assert not hasattr(elements, "_check_hidden_reasons")
+
+    def test_flags_tiny_and_squeezed_text_with_recoverys_one_rule(self):
+        # One em rule and one threshold for textpage spans and recovered text alike.
+        assert quality.em_reasons is _pdfium_recover.em_reasons
+        assert not hasattr(quality, "TINY_FONT_PT")
 
     def test_validates_routes_with_a1s_public_table(self):
         assert quality.PAGE_ROUTES is elements.PAGE_ROUTES

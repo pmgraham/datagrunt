@@ -76,6 +76,13 @@ class RawSpan:
         font_size_pt: The ``Tf`` size times the vertical scale of the text's
             page-space matrix (form matrices included); negative for a
             negative ``Tf`` (mirrored glyphs).
+        em_width_pt: The width of the text's em: ``|Tf|`` times the
+            horizontal scale, ``hypot(a, b)``, of the same matrix (form
+            matrices and ``Tz`` included), so a mirrored scale counts at its
+            magnitude and turned text in full; never negative (see
+            :func:`em_size`). An em under 1 pt wide and narrower than it is
+            tall is text squeezed flat: ``Tz 0.05`` leaves 12 pt "HIDDEN"
+            in the textpage at 0.006 pt per em.
         base_font_name: The font's /BaseFont without a subset tag
             (``ABCDEF+``); empty for a font without one (Type3). For a
             non-embedded Type1 font pdfium aliases to a standard-14 font,
@@ -106,6 +113,7 @@ class RawSpan:
     bbox: Box
     char_boxes: tuple[Box, ...]
     font_size_pt: float
+    em_width_pt: float
     base_font_name: str
     is_bold: bool
     is_italic: bool
@@ -119,6 +127,7 @@ class RawSpan:
         self._check_text_and_boxes()
         self._check_generated_breaks()
         object.__setattr__(self, "font_size_pt", finite_float("font_size_pt", self.font_size_pt))
+        object.__setattr__(self, "em_width_pt", finite_float("em_width_pt", self.em_width_pt, lo=0.0))
         if not isinstance(self.base_font_name, str):
             raise TypeError(f"base_font_name must be a str, got {self.base_font_name!r}")
         strict_bool("is_bold", self.is_bold)
@@ -185,8 +194,9 @@ class TextStats:
             whether pdfium flags it or not.
         skipped_nonfinite_objects: Text objects whose chars are in no span
             (and no other count) because pdfium places them at a non-finite
-            position or size: a char box or the font size is NaN or
-            infinite, as under a ``cm`` that overflows pdfium's 32-bit CTM.
+            position or size: a char box, the font size or the em width is
+            NaN or infinite, as under a ``cm`` that overflows pdfium's
+            32-bit CTM.
             pdfium renders the rest of such a page.
         dropped_text_objects: Text objects of the page (forms' included)
             that own no textpage char but draw glyphs: pdfium dropped them
@@ -280,6 +290,7 @@ class _Style(NamedTuple):
     """The RawSpan fields read from a span's text object."""
 
     font_size_pt: float
+    em_width_pt: float
     base_font_name: str
     is_bold: bool
     is_italic: bool
@@ -367,13 +378,26 @@ def _bold_and_italic(font: pdfium_c.FPDF_FONT, name: str, label: str) -> tuple[b
     return is_bold, is_italic
 
 
-def _font_size(
-    textpage: pdfium_c.FPDF_TEXTPAGE, text_object: pdfium_c.FPDF_PAGEOBJECT, char_index: int, label: str
-) -> float:
-    """``Tf`` size times the vertical scale of the char's page-space matrix.
+def em_size(size: float, a: float, b: float, c: float, d: float) -> tuple[float, float]:
+    """The width and height in points of an em of ``Tf`` ``size`` under a text matrix ``[a b c d]`` to page space.
 
-    The textpage matrix includes every enclosing form's matrix; the object's
-    own matrix (``FPDFPageObj_GetMatrix``) is in its form's space. It may not
+    The em's sides map to ``(a, b)`` and ``(c, d)``: it is ``|size| x
+    hypot(a, b)`` wide and ``|size| x hypot(c, d)`` tall, so a mirrored
+    (negative) size or scale counts at its magnitude and turned text in
+    full. The one measure for textpage spans (:class:`RawSpan`) and for the
+    text objects recovery reads back.
+    """
+    return abs(size) * math.hypot(a, b), abs(size) * math.hypot(c, d)
+
+
+def _em(
+    textpage: pdfium_c.FPDF_TEXTPAGE, text_object: pdfium_c.FPDF_PAGEOBJECT, char_index: int, label: str
+) -> tuple[float, float]:
+    """The char's ``(font_size_pt, em_width_pt)``: its em's height, signed by ``Tf``, and its width (:func:`em_size`).
+
+    Measured on the char's page-space matrix: the textpage matrix holds
+    ``Tz`` and every enclosing form's matrix (not ``Tf``); the object's own
+    matrix (``FPDFPageObj_GetMatrix``) is in its form's space. It may not
     be finite (a ``cm`` that overflows pdfium's 32-bit CTM): the
     caller then skips the object.
     """
@@ -383,7 +407,8 @@ def _font_size(
     matrix = pdfium_c.FS_MATRIX()
     if not pdfium_c.FPDFText_GetMatrix(textpage, char_index, matrix):
         raise PdfiumFailure(f"read the matrix of char {char_index}")
-    return nominal.value * math.hypot(matrix.c, matrix.d)
+    width, height = em_size(nominal.value, matrix.a, matrix.b, matrix.c, matrix.d)
+    return math.copysign(height, nominal.value), width
 
 
 def _read_style(
@@ -399,8 +424,10 @@ def _read_style(
     render_mode = pdfium_c.FPDFTextObj_GetTextRenderMode(text_object)
     if render_mode not in range(8):  # FPDF_TEXTRENDERMODE_UNKNOWN (-1) on failure
         raise PdfiumFailure(f"read the render mode of {label}")
+    font_size_pt, em_width_pt = _em(textpage, text_object, char_index, label)
     return _Style(
-        font_size_pt=_font_size(textpage, text_object, char_index, label),
+        font_size_pt=font_size_pt,
+        em_width_pt=em_width_pt,
         base_font_name=name,
         is_bold=is_bold,
         is_italic=is_italic,
@@ -442,7 +469,7 @@ class _Textpage(NamedTuple):
     generated_count: int
     ownerless_count: int
     styles: dict[int, _Style]
-    # Owners with a char box or font size that is not finite: no span takes their chars.
+    # Owners with a char box, font size or em width that is not finite: no span takes their chars.
     skipped: frozenset[int]
 
 
@@ -560,7 +587,8 @@ def _read_textpage(textpage: pdfium_c.FPDF_TEXTPAGE, object_indices: dict[int, i
                 raise PdfiumFailure(f"read the text object of char {char_index}: it is not in the page's object tree")
             styles[owner] = _read_style(textpage, text_object, char_index, object_indices[owner])
         box = _loose_box(textpage, char_index)
-        if not all(math.isfinite(value) for value in (*box, styles[owner].font_size_pt)):
+        style = styles[owner]
+        if not all(math.isfinite(value) for value in (*box, style.font_size_pt, style.em_width_pt)):
             skipped.add(owner)
         chars.append(_OwnedChar(owner, code, map_error, box))
     return _Textpage(chars, generated, ownerless, styles, frozenset(skipped))
@@ -569,10 +597,10 @@ def _read_textpage(textpage: pdfium_c.FPDF_TEXTPAGE, object_indices: dict[int, i
 def collect_text(textpage: pdfium_c.FPDF_TEXTPAGE, to_display: Callable[[Box], Box], walk: ObjectWalk) -> CollectedText:
     """Read every textpage char once: count them and group the owned, non-generated ones.
 
-    A text object with a char box or font size that is not finite (pdfium
-    places it nowhere) is skipped whole and counted; a skipped char ends the
-    span it interrupts. A text object that owns no char is empty if it draws
-    no glyph with extent (``walk.glyphless``), else dropped.
+    A text object with a char box, font size or em width that is not finite
+    (pdfium places it nowhere) is skipped whole and counted; a skipped char
+    ends the span it interrupts. A text object that owns no char is empty if
+    it draws no glyph with extent (``walk.glyphless``), else dropped.
 
     Args:
         textpage: The page's loaded textpage.

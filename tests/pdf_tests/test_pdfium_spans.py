@@ -84,6 +84,7 @@ def span(**overrides) -> RawSpan:
         "bbox": (10.0, 20.0, 22.0, 33.0),
         "char_boxes": (BOX_A, BOX_B),
         "font_size_pt": 12.0,
+        "em_width_pt": 12.0,
         "base_font_name": "Helvetica-Bold",
         "is_bold": True,
         "is_italic": False,
@@ -234,6 +235,29 @@ class TestRawSpan:
         value = span(**FOUR_CHARS, generated_breaks=(1, 3))
 
         assert value.generated_breaks == (1, 3)
+
+    def test_int_em_width_is_stored_as_a_float(self):
+        value = span(em_width_pt=12)
+
+        assert (value.em_width_pt, type(value.em_width_pt)) == (12.0, float)
+
+    def test_a_zero_em_width_is_kept(self):
+        # Text squeezed flat (Tz 0, a zero matrix) has an em with no width.
+        assert span(em_width_pt=0.0).em_width_pt == 0.0
+
+    @pytest.mark.parametrize(
+        "width,error,message",
+        [
+            pytest.param(float("inf"), ValueError, "em_width_pt must be finite", id="inf"),
+            pytest.param(float("nan"), ValueError, "em_width_pt must be finite", id="nan"),
+            pytest.param(-0.5, ValueError, "em_width_pt must be >= 0.0, got -0.5", id="negative"),
+            pytest.param(True, TypeError, "em_width_pt must be an int or float, got True (bool)", id="bool"),
+            pytest.param("12", TypeError, "em_width_pt must be an int or float, got '12' (str)", id="str"),
+        ],
+    )
+    def test_invalid_em_width_raises(self, width, error, message):
+        with pytest.raises(error, match=re.escape(message)):
+            span(em_width_pt=width)
 
 
 class TestTextStats:
@@ -1060,6 +1084,106 @@ class TestNestedText:
         assert [item.object_index for item in got] == [2 * level + 1 for level in range(40)]
 
 
+# Each squeeze below keeps "HIDDEN" over 0.01 pt wide, so the textpage keeps it.
+SQUEEZED = b"q BT /F1 12 Tf %s Tz 72 100 Td (HIDDEN) Tj ET Q"
+TURNED = b"q BT /F1 12 Tf %s Tz %s 200 100 Tm (HIDDEN) Tj ET Q"
+# The defaults of nested_text_page: the text's page-space matrix is its own times 3.
+NESTED_SCALE = 3.0
+
+
+def two_forms_page(tmp_path: Path, body: bytes, *, outer: bytes, inner: bytes) -> Path:
+    """``body`` in form Y (/Matrix ``inner``), drawn at (3, 4) in form X (``outer``), drawn at (40, 0) on the page.
+
+    pdfium's object matrix of a text object in Y holds Y's /Matrix but not
+    X's, nor the ``cm`` before either ``Do``; its textpage matrix holds all.
+    """
+    entries = b"/Type /XObject /Subtype /Form /BBox [-1000 -1000 1000 1000] /Matrix %s /Resources << %s >>"
+
+    def form(content: bytes, matrix: bytes, resources: bytes) -> bytes:
+        return b"<< %s /Length %d >>\nstream\n%s\nendstream" % (entries % (matrix, resources), len(content), content)
+
+    x = form(b"q 1 0 0 1 3 4 cm /Y Do Q", outer, b"/Font << /F1 5 0 R >> /XObject << /Y 7 0 R >>")
+    y = form(body, inner, b"/Font << /F1 5 0 R >>")
+    return content_page(tmp_path, b"q 1 0 0 1 40 0 cm /X Do Q", extra=(x, y), resources=b"/XObject << /X 6 0 R >>")
+
+
+def nested_text_page(tmp_path: Path, body: bytes) -> Path:
+    """``body`` two forms deep, under form matrices [1.5 0 0 1.5 20 30] and [2 0 0 2 10 10]: scale 3."""
+    return two_forms_page(tmp_path, body, outer=b"[1.5 0 0 1.5 20 30]", inner=b"[2 0 0 2 10 10]")
+
+
+class TestEmWidth:
+    """em_width_pt is |Tf| times the horizontal scale, hypot(a, b), of the text's page-space matrix."""
+
+    @pytest.mark.parametrize(
+        "content,size,width",
+        [
+            # Tz is a percentage of the em's width: 0.05 % of 12 pt is 0.006 pt.
+            pytest.param(SQUEEZED % b"0.05", 12.0, 0.006, id="tz-0.05"),
+            pytest.param(SQUEEZED % b"0.5", 12.0, 0.06, id="tz-0.5"),
+            pytest.param(SQUEEZED % b"1", 12.0, 0.12, id="tz-1"),
+            pytest.param(SQUEEZED % b"100", 12.0, 12.0, id="tz-100"),
+            # A mirrored scale (negative Tz, Tm or Tf) counts at its magnitude.
+            pytest.param(SQUEEZED % b"-1", 12.0, 0.12, id="tz-minus-1"),
+            pytest.param(SQUEEZED % b"-100", 12.0, 12.0, id="tz-minus-100"),
+            pytest.param(b"BT /F1 12 Tf -1 0 0 1 200 100 Tm (HIDDEN) Tj ET", 12.0, 12.0, id="mirrored-tm"),
+            pytest.param(b"q BT /F1 -12 Tf 1 Tz 200 100 Td (HIDDEN) Tj ET Q", -12.0, 0.12, id="negative-tf-tz-1"),
+            # Turned text: the em's width lies along (a, b), with b not 0.
+            pytest.param(TURNED % (b"1", b"0 1 -1 0"), 12.0, 0.12, id="quarter-turn-tz-1"),
+            pytest.param(TURNED % (b"100", b"0 1 -1 0"), 12.0, 12.0, id="quarter-turn-tz-100"),
+            pytest.param(TURNED % (b"1", b"0.866025 0.5 -0.5 0.866025"), 12.0, 0.12, id="30-degrees-tz-1"),
+            pytest.param(TURNED % (b"100", b"0.866025 0.5 -0.5 0.866025"), 12.0, 12.0, id="30-degrees-tz-100"),
+            pytest.param(b"BT /F1 10 Tf 3 0 0 2 72 100 Tm (Wide) Tj ET", 20.0, 30.0, id="anisotropic-tm"),
+            pytest.param(b"q 0.05 0 0 1 0 0 cm BT /F1 12 Tf 72 100 Td (HIDDEN) Tj ET Q", 12.0, 0.6, id="cm-squeeze"),
+        ],
+    )
+    def test_em_width_is_tf_times_the_horizontal_scale(self, tmp_path, content, size, width):
+        (got,) = spans_of(content_page(tmp_path, content))
+
+        assert (got.font_size_pt, got.em_width_pt) == pytest.approx((size, width), rel=1e-5)
+
+    def test_an_em_of_exactly_one_point_reads_exactly(self, tmp_path):
+        # 25 % of 4 pt: 0.25 and 4 are exact in pdfium's 32-bit floats.
+        (got,) = spans_of(content_page(tmp_path, b"BT /F1 4 Tf 25 Tz 72 100 Td (HIDDEN) Tj ET"))
+
+        assert got.em_width_pt == 1.0
+
+    @pytest.mark.parametrize(
+        "body,width",
+        [
+            pytest.param(b"q BT /F1 12 Tf 0.05 Tz 10 10 Td (HIDDEN) Tj ET Q", 0.006, id="tz-0.05"),
+            pytest.param(b"q BT /F1 12 Tf 0.5 Tz 10 10 Td (HIDDEN) Tj ET Q", 0.06, id="tz-0.5"),
+            pytest.param(b"q BT /F1 12 Tf 1 Tz 10 10 Td (HIDDEN) Tj ET Q", 0.12, id="tz-1"),
+            pytest.param(b"BT /F1 12 Tf 10 10 Td (HIDDEN) Tj ET", 12.0, id="tz-100"),
+            pytest.param(b"q BT /F1 12 Tf -1 Tz 10 10 Td (HIDDEN) Tj ET Q", 0.12, id="tz-minus-1"),
+            pytest.param(b"q BT /F1 12 Tf 1 Tz 0 1 -1 0 10 10 Tm (HIDDEN) Tj ET Q", 0.12, id="quarter-turn-tz-1"),
+        ],
+    )
+    def test_text_inside_nested_forms_takes_every_form_matrix(self, tmp_path, body, width):
+        (got,) = spans_of(nested_text_page(tmp_path, body))
+
+        assert (got.font_size_pt, got.em_width_pt) == pytest.approx((12.0 * NESTED_SCALE, width * NESTED_SCALE))
+
+    @pytest.mark.parametrize(
+        "body,outer,width",
+        [
+            # The object's own matrix reads 12 pt wide; the outer form squeezes it to 0.6.
+            pytest.param(b"BT /F1 12 Tf 10 10 Td (HIDDEN) Tj ET", b"[0.05 0 0 1 20 30]", 0.6, id="outer-squeezes"),
+            # The object's own matrix reads 0.12 pt wide; the outer form widens it to 1.2.
+            pytest.param(b"q BT /F1 12 Tf 1 Tz 10 10 Td (HIDDEN) Tj ET Q", b"[10 0 0 1 0 30]", 1.2, id="outer-widens"),
+            # The outer form turns the text a quarter: b is not 0, and the em keeps its width.
+            pytest.param(
+                b"q BT /F1 12 Tf 1 Tz 10 10 Td (HIDDEN) Tj ET Q", b"[0 1 -1 0 300 30]", 0.12, id="outer-turns"
+            ),
+            pytest.param(b"BT /F1 12 Tf 10 10 Td (HIDDEN) Tj ET", b"[0 1 -1 0 300 30]", 12.0, id="outer-turns-tz-100"),
+        ],
+    )
+    def test_an_enclosing_forms_matrix_scales_the_em_width(self, tmp_path, body, outer, width):
+        (got,) = spans_of(two_forms_page(tmp_path, body, outer=outer, inner=b"[1 0 0 1 0 0]"))
+
+        assert (got.font_size_pt, got.em_width_pt) == pytest.approx((12.0, width), rel=1e-5)
+
+
 def textpage_chars(path: Path) -> tuple[str, int, int, int]:
     """Page 1's owned, non-generated textpage chars, read straight from pdfium.
 
@@ -1338,6 +1462,22 @@ class TestNonFiniteText:
             empty_text_objects=0,
         )
         assert page_text(handle, 0) == PageText(spans=(), stats=empty)
+
+    def test_a_non_finite_em_width_alone_skips_the_object(self, tmp_path, monkeypatch):
+        # Only the horizontal scale overflows: the char boxes and the font size stay finite.
+        real = pdfium_c.FPDFText_GetMatrix
+
+        def writes_inf_a(textpage, index, matrix):
+            ok = real(textpage, index, matrix)
+            matrix.a = float("inf")
+            return ok
+
+        handle = open_document(one_page(tmp_path, TextRun("Hi", x=72.0, y=100.0)))
+        monkeypatch.setattr(pdfium_c, "FPDFText_GetMatrix", writes_inf_a)
+
+        got = page_text(handle, 0)
+
+        assert (got.spans, got.stats.skipped_nonfinite_objects, got.stats.char_count) == ((), 1, 0)
 
     def test_one_non_finite_char_skips_its_whole_object_only(self, tmp_path, monkeypatch):
         # Chars 0-1 are "Ab" (object 0), char 2 the generated space, 3-4 "Cd" (object 1).

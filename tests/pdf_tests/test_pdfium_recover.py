@@ -222,6 +222,7 @@ def raw_span(text: str = "Ab", box=(72.0, 200.0, 72.0, 200.0), **overrides) -> R
         "bbox": box,
         "char_boxes": (box,) * len(text),
         "font_size_pt": 0.0,
+        "em_width_pt": 0.0,
         "base_font_name": "Helvetica",
         "is_bold": False,
         "is_italic": False,
@@ -813,6 +814,32 @@ class TestRecovery:
 
         assert (item.span.text, item.hidden_reasons) == ("HIDDEN", reasons)
         assert item.span.font_size_pt == pytest.approx(size, rel=1e-4)
+
+    @pytest.mark.parametrize(
+        "content,width",
+        [
+            pytest.param(show("tf-0", 72, 100), 0.0, id="tf-0"),
+            pytest.param(show("tz-0", 72, 100), 0.0, id="tz-0"),
+            pytest.param(show("tiny", 72, 100), 0.0005, id="tiny"),
+            # 0.001 % of 12 pt.
+            pytest.param(b"q BT /F1 12 Tf 0.001 Tz 72 100 Td (HIDDEN) Tj ET Q", 0.00012, id="tz-0.001"),
+            pytest.param(b"BT /F1 0 Tf 0 1 -1 0 200 50 Tm (HIDDEN) Tj ET", 0.0, id="turned-tf-0"),
+            # A drawn copy pdfium drops as a duplicate keeps its full 12 pt em.
+            pytest.param(
+                b"BT /F1 12 Tf 72 100 Td (Total) Tj ET BT /F1 12 Tf 74 100 Td (Total) Tj ET", 12.0, id="drawn-copy"
+            ),
+        ],
+    )
+    def test_em_width_comes_from_the_original_object(self, tmp_path, content, width):
+        (item,) = recovered(pdf(tmp_path, CONTROL + content)).spans
+
+        assert item.span.em_width_pt == pytest.approx(width, rel=1e-4)
+
+    @pytest.mark.parametrize("where", PLACEMENTS)
+    def test_em_width_takes_the_forms_scale(self, tmp_path, where):
+        (item,) = recovered(where.build(tmp_path, "tiny")).spans
+
+        assert item.span.em_width_pt == pytest.approx(0.0005 * where.scale, rel=1e-4)
 
     def test_both_reasons_when_the_text_is_tiny_and_squeezed(self, tmp_path):
         got = recovered(pdf(tmp_path, CONTROL + b"q BT /F1 0.5 Tf 0 Tz 72 100 Td (BOTH) Tj ET Q"))
