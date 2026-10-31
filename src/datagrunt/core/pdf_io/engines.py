@@ -98,6 +98,8 @@ def _render_pdfium_page_to_file(
 
     Shared by the in-process sequential loop and the process-pool worker so the
     render-and-save step lives in exactly one place (DRY within the PDF domain).
+    The caller decides, document-wide, whether the PDF may be rendered at all
+    (see ``render_guard``); this only renders.
     """
     img = page.render_pil(dpi=dpi)
     out_path = directory / page_image_filename(pdf_name, page_index, ext)
@@ -522,6 +524,7 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
 
     def render_pages_as_images(self, output_dir=None, dpi=None, image_format="png") -> list:
         from datagrunt.core.pdf_io.extraction.pymupdf_backend import _import_pymupdf
+        from datagrunt.core.pdf_io.extraction.render_guard import document_block_reason
 
         dpi = self._resolve_dpi(dpi)
 
@@ -542,6 +545,12 @@ class PDFWriterPyMuPDFEngine(PDFBaseWriterEngine):
         doc = pymupdf.open(self.filepath)
         pdf_name = self.filepath.stem
         try:
+            # A render decodes every image a page draws; if any image anywhere in
+            # the document is a decode bomb, no page is rendered (render_guard).
+            block = document_block_reason(doc)
+            if block:
+                logger.warning("No pages rendered: %s", block)
+                return []
             for idx in range(doc.page_count):
                 # Per-page error isolation: a page that fails to render is logged
                 # and skipped, never aborting the whole batch (project invariant).
@@ -580,11 +589,21 @@ class PDFWriterPdfiumEngine(PDFBaseWriterEngine):
         return self._reader_engine
 
     def render_pages_as_images(self, output_dir=None, dpi=None, image_format="png") -> list:
+        from datagrunt.core.pdf_io.extraction.render_guard import document_block_reason_for_path
+
         dpi = self._resolve_dpi(dpi)
         # Validate the format before any filesystem side effects (fail fast).
         ext, pil_format = _normalize_image_format(image_format)
         directory = Path(output_dir if output_dir else "page_images")
         directory.mkdir(parents=True, exist_ok=True)
+
+        # A render decodes every image a page draws (pdfium decodes JPEG 2000 /
+        # JBIG2 at their codestream size); if any image anywhere in the document
+        # is a decode bomb, no page is rendered (render_guard, document-wide).
+        block = document_block_reason_for_path(self.filepath)
+        if block:
+            logger.warning("No pages rendered: %s", block)
+            return []
 
         with PdfiumDocument(self.filepath) as doc:
             total_pages = len(doc)

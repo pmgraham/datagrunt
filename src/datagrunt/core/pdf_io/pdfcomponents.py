@@ -49,11 +49,22 @@ class DocumentAssembler:
         self._extraction_config = extraction_config or _PDFExtractionConfig()
         self.backend = backend or PyMuPDFBackend(filepath, extraction_config=self._extraction_config)
         self.table_extractor = table_extractor or PdfPlumberTableExtractor(filepath)
+        self._render_block_cached: str | None = None
+        self._render_block_done = False
+
+    def _render_block_reason(self) -> str | None:
+        """Document-wide reason this PDF must not be rendered (None if safe), computed once."""
+        if not self._render_block_done:
+            from datagrunt.core.pdf_io.extraction.render_guard import document_block_reason_for_path
+
+            self._render_block_cached = document_block_reason_for_path(self.filepath)
+            self._render_block_done = True
+        return self._render_block_cached
 
     def parse_page(self, page_index, image_output_dir=None) -> dict:
         """Parse a single page into the unified element schema."""
         with self.backend, self.table_extractor:
-            analysis, text_blocks, images = self.backend.extract_page(
+            analysis, text_blocks, images, image_warnings = self.backend.extract_page(
                 page_index, output_dir=image_output_dir, name_prefix=self.filepath.stem
             )
             elements = []
@@ -81,11 +92,17 @@ class DocumentAssembler:
                         return True
                 return False
 
-            warnings = []
+            warnings = list(image_warnings)
             if analysis.has_text_layer:
                 for block in text_blocks:
                     if not is_inside_table(block.bbox):
                         elements.append(self._text_element(block, gen_elem_id(), page_index))
+            elif analysis.is_scanned and self._render_block_reason():
+                # A scanned page is OCR'd by rendering it, which decodes every
+                # image it draws. If any image anywhere in the document is a
+                # decode bomb (see render_guard, document-wide), the page is not
+                # rendered; record why instead.
+                warnings.append(f"OCR skipped on page {page_index + 1}: {self._render_block_reason()}")
             elif analysis.is_scanned:
                 try:
                     ocr_blocks = self.backend.ocr_page(

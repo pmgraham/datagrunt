@@ -103,19 +103,19 @@ class TestPyMuPDFBackend:
 class TestPyMuPDFBackendImageConfig:
     def test_default_drops_small_image(self, small_image_pdf):
         with PyMuPDFBackend(small_image_pdf) as backend:
-            _analysis, _text, images = backend.extract_page(0)
+            _analysis, _text, images, _warnings = backend.extract_page(0)
         assert images == []
 
     def test_lowered_threshold_keeps_small_image(self, small_image_pdf):
         backend = PyMuPDFBackend(small_image_pdf, extraction_config=_PDFExtractionConfig(min_image_dimension=10))
         with backend:
-            _analysis, _text, images = backend.extract_page(0)
+            _analysis, _text, images, _warnings = backend.extract_page(0)
         assert len(images) == 1
 
     def test_raised_threshold_drops_large_image(self, sample_pdf):
         backend = PyMuPDFBackend(sample_pdf, extraction_config=_PDFExtractionConfig(min_image_dimension=150))
         with backend:
-            _analysis, _text, images = backend.extract_page(0)
+            _analysis, _text, images, _warnings = backend.extract_page(0)
         assert images == []
 
 
@@ -126,7 +126,7 @@ def test_pymupdf_extract_page_matches_primitives(sample_pdf):
 
     backend = PyMuPDFBackend(sample_pdf)
     with backend:
-        analysis, text_blocks, images = backend.extract_page(0)
+        analysis, text_blocks, images, warnings = backend.extract_page(0)
         assert analysis == backend.analyze_page(0)
         assert text_blocks == backend.extract_text_blocks(0)
         assert images == backend.extract_images(0)
@@ -160,3 +160,46 @@ def test_pymupdf_extract_page_parses_page_once(sample_pdf, monkeypatch):
 
     assert counts["get_text"] <= 2
     assert counts["get_images"] == 1
+
+
+class TestBuildBlockDominant:
+    """#389: a block's font ties go to the first span; size ties keep the 4.x pick."""
+
+    @staticmethod
+    def _block(spans):
+        """A pymupdf ``get_text("dict")`` text block with one line of ``(text, font, size)`` spans."""
+        return {
+            "bbox": (72.0, 60.0, 200.0, 75.0),
+            "lines": [{"spans": [{"text": t, "font": f, "size": s, "flags": 0} for t, f, s in spans]}],
+        }
+
+    def test_tied_fonts_take_the_first_span(self, sample_pdf):
+        backend = PyMuPDFBackend(sample_pdf)
+        fonts = ["Gamma", "Alpha", "Delta", "Beta", "Epsilon"]
+        for i in range(len(fonts)):
+            rotated = fonts[i:] + fonts[:i]
+            block = self._block([(f"word{n}", font, 11.0) for n, font in enumerate(rotated)])
+            assert backend._build_block(block, None, 0).font == rotated[0]
+
+    def test_tied_sizes_keep_the_4x_pick(self, sample_pdf):
+        # Sizes keep max(set(sizes), key=sizes.count), which never varied by
+        # process (float hashes are unseeded); set({12.0, 8.0}) meets 8.0 first.
+        backend = PyMuPDFBackend(sample_pdf)
+        for sizes in ([12.0, 8.0], [8.0, 12.0], [16.0, 8.0], [10.5, 9.96, 11.04]):
+            block = self._block([(f"w{n}", "Arial", size) for n, size in enumerate(sizes)])
+            expected = round(max(set(sizes), key=sizes.count), 1)
+            assert backend._build_block(block, None, 0).font_size == expected
+        pinned = backend._build_block(self._block([("Alpha", "Arial", 12.0), ("Beta", "Arial", 8.0)]), None, 0)
+        assert pinned.font_size == 8.0
+
+    def test_non_tied_block_keeps_the_majority(self, sample_pdf):
+        backend = PyMuPDFBackend(sample_pdf)
+        block = self._block([("a", "Arial", 9.0), ("b", "Times", 11.0), ("c", "Times", 11.0)])
+        tb = backend._build_block(block, None, 0)
+        assert (tb.font, tb.font_size) == ("Times", 11.0)
+
+    def test_whitespace_spans_do_not_vote(self, sample_pdf):
+        backend = PyMuPDFBackend(sample_pdf)
+        block = self._block([("Alpha", "Courier", 11.0), (" ", "Helvetica", 9.0), (" ", "Helvetica", 9.0)])
+        tb = backend._build_block(block, None, 0)
+        assert (tb.font, tb.font_size) == ("Courier", 11.0)

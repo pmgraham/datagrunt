@@ -49,7 +49,7 @@ class TestPdfiumBackend:
         three primitives called separately."""
         backend = PdfiumBackend(sample_pdf)
         with backend:
-            analysis, text_blocks, images = backend.extract_page(0)
+            analysis, text_blocks, images, warnings = backend.extract_page(0)
             assert analysis == backend.analyze_page(0)
             assert text_blocks == backend.extract_text_blocks(0)
             assert images == backend.extract_images(0)
@@ -90,5 +90,5 @@ class TestPdfiumBackendImageConfig:
     def test_extract_page_honors_config(self, small_image_pdf):
         backend = PdfiumBackend(small_image_pdf, extraction_config=_PDFExtractionConfig(min_image_dimension=10))
         with backend:
-            _analysis, _text, images = backend.extract_page(0)
+            _analysis, _text, images, _warnings = backend.extract_page(0)
         assert len(images) == 1

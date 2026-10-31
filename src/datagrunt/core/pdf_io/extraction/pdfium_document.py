@@ -11,10 +11,15 @@ from pathlib import Path
 
 from datagrunt.core.pdf_io.extraction.config import _DEFAULT_MIN_IMAGE_DIMENSION
 from datagrunt.core.pdf_io.extraction.display_frame import display_edges
+from datagrunt.core.pdf_io.extraction.image_guard import _MAX_RAW_HEADER_BYTES, inspect_image
 from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, TextItem
 from datagrunt.core.pdf_io.filenames import embedded_image_filename
 
 logger = logging.getLogger(__name__)
+
+# Image objects can be nested inside form XObjects; walk deep enough to reach a
+# bomb hidden behind a few layers of forms before a render would decode it.
+_IMAGE_WALK_DEPTH = 200
 
 PDF_EXTRA_HINT = "PDF parsing requires extra dependencies. Install with: pip install datagrunt[pdf]"
 
@@ -166,19 +171,78 @@ class PdfiumPage:
                 images += 1
         return texts, images
 
+    def _image_filters(self, obj) -> list:
+        """Return an image object's filter names (decoding order); ``[]`` on failure."""
+        try:
+            return list(obj.get_filters())
+        except Exception:  # noqa: BLE001 - a missing/odd filter list must not fail the page
+            return []
+
+    def _raw_image_stream(self, obj) -> bytes | None:
+        """Return an image object's raw (still-encoded) stream, or None if unreadable/too large.
+
+        The raw stream is COPIED, not decoded; the size is checked first so a
+        hostile ``/Length`` cannot force a copy beyond the header-read bound.
+        """
+        size = self._raw.FPDFImageObj_GetImageDataRaw(obj.raw, None, 0)
+        if size <= 0 or size > _MAX_RAW_HEADER_BYTES:
+            return None
+        import ctypes as _ctypes
+
+        buffer = _ctypes.create_string_buffer(size)
+        if self._raw.FPDFImageObj_GetImageDataRaw(obj.raw, buffer, size) != size:
+            return None
+        return buffer.raw
+
+    def _guard(self, obj, page_number: int, idx: int):
+        """Return the guard decision for an image object (raw stream + filters, no decode)."""
+        filters = self._image_filters(obj)
+        raw = self._raw_image_stream(obj)
+        return inspect_image(raw, filters, label=f"page {page_number + 1} image {idx}")
+
+    def guarded_image_reasons(self, page_number: int = 0) -> list:
+        """Warning reasons for every image on the page a decode bound would skip.
+
+        Walks the page's image objects (forms included) and runs the guard on
+        each WITHOUT decoding, so a render can be skipped when any image would
+        make a decoder allocate at its codestream size rather than its declared
+        size.
+        """
+        reasons = []
+        for i, obj in enumerate(
+            self._page.get_objects(filter=(self._raw.FPDF_PAGEOBJ_IMAGE,), max_depth=_IMAGE_WALK_DEPTH)
+        ):
+            decision = self._guard(obj, page_number, i)
+            if decision.skip:
+                reasons.append(decision.reason)
+        return reasons
+
     def image_items(
         self,
         output_dir: str | None = None,
         name_prefix: str = "page",
         page_number: int = 0,
         min_image_dimension: int = _DEFAULT_MIN_IMAGE_DIMENSION,
+        warnings: list | None = None,
     ):
         """Yield an ``ImageBlock`` per embedded image whose pixel sides are both
-        >= ``min_image_dimension``."""
+        >= ``min_image_dimension``.
+
+        An image a decode bound would skip (a JPEG 2000 / JBIG2 whose codestream
+        describes far more than its declared size, or one behind an unrecognised
+        filter) is NOT touched: no ``get_px_size``, extract or bitmap call is
+        made for it. Its reason is appended to ``warnings`` (when given) so the
+        page records it, and it is never emitted as an image.
+        """
         visible_box = self._visible_box()
         rotation = self.rotation()
         idx = 0
         for obj in self._page.get_objects(filter=(self._raw.FPDF_PAGEOBJ_IMAGE,), max_depth=15):
+            decision = self._guard(obj, page_number, idx)
+            if decision.skip:
+                if warnings is not None:
+                    warnings.append(decision.reason)
+                continue
             px_w, px_h = obj.get_px_size()
             if px_w < min_image_dimension or px_h < min_image_dimension:
                 continue

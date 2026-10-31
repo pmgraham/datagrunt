@@ -67,12 +67,14 @@ class ExtractionBackend(ABC):
         return list(bboxes)
 
     def extract_page(self, page_number: int, output_dir: str | None = None, name_prefix: str = "page") -> tuple:
-        """Single-pass extraction: ``(PageAnalysis, list[TextBlock], list[ImageBlock])``.
+        """Single-pass extraction: ``(PageAnalysis, list[TextBlock], list[ImageBlock], list[str])``.
 
         Default implementation calls the three primitives separately; concrete
         backends may override to parse the page once. The skip logic mirrors the
         assembly pipeline: text blocks only when a text layer exists, images only
-        when the page reports embedded images. OCR is never performed here.
+        when the page reports embedded images. OCR is never performed here. The
+        fourth element carries image-guard warnings (empty here; concrete
+        backends populate it when they skip an image a decode bound would skip).
         """
         analysis = self.analyze_page(page_number)
         text_blocks = self.extract_text_blocks(page_number) if analysis.has_text_layer else []
@@ -81,4 +83,4 @@ class ExtractionBackend(ABC):
             if analysis.image_count > 0
             else []
         )
-        return analysis, text_blocks, images
+        return analysis, text_blocks, images, []

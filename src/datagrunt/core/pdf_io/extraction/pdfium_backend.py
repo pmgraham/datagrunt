@@ -1,5 +1,7 @@
 """pdfium-backed extraction backend (structured/unified schema)."""
 
+import logging
+
 from datagrunt.core.pdf_io.extraction._doc_session import _ThreadLocalDocSession
 from datagrunt.core.pdf_io.extraction.base import ExtractionBackend
 from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
@@ -7,6 +9,8 @@ from datagrunt.core.pdf_io.extraction.ocr import ocr_data_to_blocks
 from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumDocument
 from datagrunt.core.pdf_io.extraction.shapes import PageAnalysis
 from datagrunt.core.pdf_io.extraction.text_block_builder import TextBlockBuilder
+
+logger = logging.getLogger(__name__)
 
 
 class PdfiumBackend(_ThreadLocalDocSession, ExtractionBackend):
@@ -49,7 +53,8 @@ class PdfiumBackend(_ThreadLocalDocSession, ExtractionBackend):
 
     def extract_page(self, page_number: int, output_dir: str | None = None, name_prefix: str = "page") -> tuple:
         """Parse the page once (single pdfium page/textpage open), returning
-        analysis + text blocks + images, instead of opening the page three times.
+        analysis + text blocks + images + image-guard warnings, instead of
+        opening the page three times.
         """
         doc, should_close = self._get_doc()
         try:
@@ -74,6 +79,7 @@ class PdfiumBackend(_ThreadLocalDocSession, ExtractionBackend):
                 if has_text:
                     text_blocks = TextBlockBuilder().build(list(page.text_items()))
                 images = []
+                warnings: list[str] = []
                 if image_objs > 0:
                     images = list(
                         page.image_items(
@@ -81,9 +87,10 @@ class PdfiumBackend(_ThreadLocalDocSession, ExtractionBackend):
                             name_prefix=name_prefix,
                             page_number=page_number,
                             min_image_dimension=self._config.min_image_dimension,
+                            warnings=warnings,
                         )
                     )
-                return analysis, text_blocks, images
+                return analysis, text_blocks, images, warnings
         finally:
             if should_close:
                 doc.close()
@@ -100,8 +107,13 @@ class PdfiumBackend(_ThreadLocalDocSession, ExtractionBackend):
         return TextBlockBuilder().build(items)
 
     def extract_images(self, page_number: int, output_dir: str | None = None, name_prefix: str = "page") -> list:
-        """Return embedded images at or above the configured minimum dimension; write when output_dir set."""
+        """Return embedded images at or above the configured minimum dimension; write when output_dir set.
+
+        An image a decode bound would skip is left untouched and logged, never
+        decoded (see ``image_guard``).
+        """
         doc, should_close = self._get_doc()
+        warnings: list[str] = []
         try:
             with doc.page(page_number) as page:
                 res = list(
@@ -110,18 +122,28 @@ class PdfiumBackend(_ThreadLocalDocSession, ExtractionBackend):
                         name_prefix=name_prefix,
                         page_number=page_number,
                         min_image_dimension=self._config.min_image_dimension,
+                        warnings=warnings,
                     )
                 )
         finally:
             if should_close:
                 doc.close()
+        for reason in warnings:
+            logger.warning("%s", reason)
         return res
 
     def ocr_page(self, page_number: int, dpi: int = 300) -> list:
-        """Render the page via pdfium and OCR it with Tesseract."""
+        """Render the page via pdfium and OCR it with Tesseract.
+
+        A page carrying an image a decode bound would skip is NOT rendered: the
+        render would decode that image at its codestream size. ``parse_page``
+        records the per-image warnings, so here the page simply yields no OCR.
+        """
         doc, should_close = self._get_doc()
         try:
             with doc.page(page_number) as page:
+                if page.guarded_image_reasons(page_number):
+                    return []
                 img = page.render_pil(dpi=dpi)
         finally:
             if should_close:

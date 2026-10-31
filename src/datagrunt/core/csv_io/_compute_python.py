@@ -418,8 +418,8 @@ def _consistent_delimiters(
 ) -> dict[str, tuple[int, int]]:
     """Characters meeting their mode on the most rows, relaxing 1.0 down to the 0.9 threshold.
 
-    At most 11 passes. The repeated float subtraction is CPython's, kept so the
-    boundary values compare identically.
+    At most 10 passes (1.0 down to 0.9099999999999999). The repeated float
+    subtraction is CPython's, kept so the boundary values compare identically.
     """
     consistency = 1.0
     while consistency >= SNIFF_CONSISTENCY_THRESHOLD:
