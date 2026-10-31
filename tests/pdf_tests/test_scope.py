@@ -6,6 +6,7 @@ A1 pages are built directly: the pass reads A1 types only, so no PDF is needed.
 import ast
 import copy
 import dataclasses
+import hashlib
 import pickle
 import re
 from pathlib import Path
@@ -15,12 +16,14 @@ import pytest
 from datagrunt.pdf import scope
 from datagrunt.pdf.elements import (
     BBox,
+    DocumentMetadata,
     Figure,
     Heading,
     KeyValue,
     Page,
     PageQuality,
     Paragraph,
+    PDFDocument,
     Table,
     make_element_id,
 )
@@ -60,6 +63,20 @@ def para(page, index, text=None, *, hidden=False, scope_path=()):
     return Paragraph(**_ids(page, index, hidden), text=text, scope_path=scope_path)
 
 
+def kv(page, index, key="Invoice", value="42", *, hidden=False):
+    return KeyValue(**_ids(page, index, hidden), key=key, value=value)
+
+
+def table(page, index, *, headers=("Item", "Qty"), rows=(("bolt", "4"),), centres=(100.0, 300.0), hidden=False):
+    return Table(
+        **_ids(page, index, hidden),
+        headers=headers,
+        rows=rows,
+        extraction_method="lattice",
+        column_centres=centres,
+    )
+
+
 def page(number, *elements, **overrides):
     fields = {"width_pt": 612, "height_pt": 792, "status": "ok", "route": "digital", "quality": QUALITY}
     fields.update(overrides)
@@ -68,6 +85,16 @@ def page(number, *elements, **overrides):
 
 def error_page(number):
     return page(number, status="error", quality=None, error="pdfium: bad xref")
+
+
+def document(result):
+    """A ``PDFDocument`` of everything ``result`` holds: A1 validates it all."""
+    sha = hashlib.sha256(b"scoped.pdf").hexdigest()
+    count = len(result.pages)
+    metadata = DocumentMetadata(
+        doc_id=DocumentMetadata.make_doc_id("scoped.pdf", sha), source_name="scoped.pdf", sha256=sha, page_count=count
+    )
+    return PDFDocument(metadata=metadata, pages=result.pages, header_context=result.header_context)
 
 
 def paths(result):
@@ -116,14 +143,22 @@ class TestScopeResult:
             ScopeResult(result.pages)
 
     def test_fields(self):
-        assert [item.name for item in dataclasses.fields(ScopeResult)] == ["pages"]
+        assert [item.name for item in dataclasses.fields(ScopeResult)] == ["pages", "header_context"]
 
     @pytest.mark.parametrize(
-        ("bad", "match"), [([], "pages must be a tuple, got list"), ((para(1, 0),), r"pages\[0\] must be a Page")]
+        ("field", "bad", "match"),
+        [
+            ("pages", [], "pages must be a tuple, got list"),
+            ("pages", (para(1, 0),), r"pages\[0\] must be a Page"),
+            ("header_context", [], "header_context must be a tuple, got list"),
+            ("header_context", (para(1, 0),), r"header_context\[0\] must be a KeyValue"),
+        ],
     )
-    def test_pages_must_be_a_tuple_of_pages(self, bad, match):
+    def test_fields_must_be_tuples_of_their_types(self, field, bad, match):
+        fields = {"pages": (), "header_context": ()}
+        fields[field] = bad
         with pytest.raises(TypeError, match=match):
-            ScopeResult(pages=bad)
+            ScopeResult(**fields)
 
     @pytest.mark.parametrize(
         "clone", [lambda value: pickle.loads(pickle.dumps(value)), copy.deepcopy], ids=["pickle", "deepcopy"]
@@ -138,7 +173,7 @@ class TestArguments:
     """``pages`` must be the document's pages, numbered 1..N in order."""
 
     def test_no_pages_scope_to_nothing(self):
-        assert apply_scope(()) == ScopeResult(pages=())
+        assert apply_scope(()) == ScopeResult(pages=(), header_context=())
 
     @pytest.mark.parametrize(
         ("bad", "match"), [([], "pages must be a tuple, got list"), ((para(1, 0),), r"pages\[0\] must be a Page")]
@@ -236,6 +271,60 @@ class TestHiddenHeadings:
         pages = (page(1, heading(1, 0, 1, "Report"), para(1, 1, hidden=True)),)
 
         assert paths(apply_scope(pages))[1] == ("p0001_e001", ("Report",))
+
+
+class TestHeaderContext:
+    """Rule 2: page 1's visible key-values that come before its first visible table or heading."""
+
+    def test_key_values_before_the_first_table(self):
+        pages = (page(1, kv(1, 0), kv(1, 1, "Date"), table(1, 2), kv(1, 3, "Total")),)
+
+        assert apply_scope(pages).header_context == (kv(1, 0), kv(1, 1, "Date"))
+
+    def test_key_values_before_the_first_heading(self):
+        pages = (page(1, kv(1, 0), heading(1, 1, 1, "Report"), kv(1, 2, "Date")),)
+
+        assert apply_scope(pages).header_context == (kv(1, 0),)
+
+    @pytest.mark.parametrize("first", [table(1, 0), heading(1, 0, 1, "Report")], ids=["table", "heading"])
+    def test_absent_when_a_table_or_heading_comes_first(self, first):
+        pages = (page(1, first, kv(1, 1)),)
+
+        assert apply_scope(pages).header_context == ()
+
+    def test_every_page_one_key_value_when_no_table_or_heading_follows(self):
+        pages = (page(1, kv(1, 0), para(1, 1), kv(1, 2, "Date")),)
+
+        assert apply_scope(pages).header_context == (kv(1, 0), kv(1, 2, "Date"))
+
+    def test_hidden_key_values_are_left_out(self):
+        pages = (page(1, kv(1, 0, "Secret", hidden=True), kv(1, 1)),)
+
+        assert apply_scope(pages).header_context == (kv(1, 1),)
+
+    def test_a_hidden_table_or_heading_does_not_end_it(self):
+        hidden_heading = heading(1, 2, 1, "Secret", hidden=True)
+        pages = (page(1, kv(1, 0), table(1, 1, hidden=True), hidden_heading, kv(1, 3, "Date")),)
+
+        assert apply_scope(pages).header_context == (kv(1, 0), kv(1, 3, "Date"))
+
+    def test_only_page_one_counts(self):
+        pages = (page(1, para(1, 0)), page(2, kv(2, 0)))
+
+        assert apply_scope(pages).header_context == ()
+
+    def test_absent_when_page_one_is_an_error_page(self):
+        assert apply_scope((error_page(1), page(2, kv(2, 0)))).header_context == ()
+
+    def test_entries_are_the_scoped_pages_own_elements(self):
+        result = apply_scope((page(1, kv(1, 0), table(1, 1), kv(1, 2)),))
+
+        assert result.header_context[0] is result.pages[0].elements[0]
+
+    def test_a_document_accepts_it(self):
+        result = apply_scope((page(1, kv(1, 0), kv(1, 1, "Date", hidden=True), kv(1, 2, "Due")), page(2, kv(2, 0))))
+
+        assert document(result).header_context == (kv(1, 0), kv(1, 2, "Due"))
 
 
 def _mixed_document():

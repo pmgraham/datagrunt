@@ -16,6 +16,9 @@ change.
    ``scope_path`` is the current path plus its text (A1 requires a heading's
    path to end with its text), and every other hidden element gets the
    current path.
+2. **Header context.** Page 1's visible ``KeyValue`` elements that come, in
+   reading order, before its first visible ``Table`` or ``Heading`` (an
+   invoice's number and date above its line items, say).
 
 The stack holds at most six entries (levels 1-6 strictly increase down it),
 so the walk is O(total elements).
@@ -26,7 +29,7 @@ from dataclasses import dataclass
 from typing import TypeAlias
 
 from datagrunt.pdf._validate import typed_tuple
-from datagrunt.pdf.elements import DocumentElement, Heading, Page
+from datagrunt.pdf.elements import DocumentElement, Heading, KeyValue, Page, Table
 
 # The open headings as (level, text), outermost first; levels strictly increase.
 _Stack: TypeAlias = tuple[tuple[int, str], ...]
@@ -38,16 +41,20 @@ class ScopeResult:
 
     Attributes:
         pages: The pages, each element carrying its ``scope_path``.
+        header_context: Page 1's visible key-values that head the document,
+            in reading order: the elements of ``pages[0]`` themselves.
     """
 
     pages: tuple[Page, ...]
+    header_context: tuple[KeyValue, ...]
 
     def __post_init__(self) -> None:
         typed_tuple("pages", self.pages, Page)
+        typed_tuple("header_context", self.header_context, KeyValue)
 
 
 def apply_scope(pages: tuple[Page, ...]) -> ScopeResult:
-    """Return ``pages`` with every element's ``scope_path`` set by the heading stack.
+    """Return ``pages`` with every element's ``scope_path`` set, plus the document's header context.
 
     Args:
         pages: The document's pages, numbered 1..N in order.
@@ -57,7 +64,8 @@ def apply_scope(pages: tuple[Page, ...]) -> ScopeResult:
         ValueError: If the pages are not numbered 1..N in order.
     """
     _check_pages(pages)
-    return ScopeResult(pages=_scope_pages(pages))
+    scoped = _scope_pages(pages)
+    return ScopeResult(pages=scoped, header_context=_header_context(scoped))
 
 
 def _check_pages(pages: object) -> None:
@@ -90,3 +98,18 @@ def _step(stack: _Stack, element: DocumentElement) -> tuple[_Stack, tuple[str, .
         return stack, (*path, element.text)
     pushed = (*(entry for entry in stack if entry[0] < element.level), (element.level, element.text))
     return pushed, tuple(text for _, text in pushed)
+
+
+def _header_context(pages: tuple[Page, ...]) -> tuple[KeyValue, ...]:
+    """Return page 1's visible key-values before its first visible table or heading (rule 2)."""
+    if not pages:
+        return ()
+    context: list[KeyValue] = []
+    for element in pages[0].elements:
+        if element.is_hidden:
+            continue
+        if isinstance(element, (Table, Heading)):
+            break
+        if isinstance(element, KeyValue):
+            context.append(element)
+    return tuple(context)
