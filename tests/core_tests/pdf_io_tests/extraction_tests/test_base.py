@@ -28,7 +28,7 @@ def test_extract_page_default_delegates_and_honors_skip_logic(sample_pdf):
 
     backend = PyMuPDFBackend(sample_pdf)
     with backend:
-        analysis, text_blocks, images = ExtractionBackend.extract_page(backend, 0)
+        analysis, text_blocks, images, warnings = ExtractionBackend.extract_page(backend, 0)
         # Compare against the primitives called directly.
         expected_analysis = backend.analyze_page(0)
         expected_text = backend.extract_text_blocks(0) if expected_analysis.has_text_layer else []

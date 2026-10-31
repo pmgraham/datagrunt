@@ -27,6 +27,17 @@ class PdfiumNativeReader(_ThreadLocalDocSession):
 
         self._local = threading.local()
         self._config = extraction_config or _PDFExtractionConfig()
+        self._render_block_cached: str | None = None
+        self._render_block_done = False
+
+    def _render_block_reason(self) -> str | None:
+        """Document-wide reason this PDF must not be rendered (None if safe), computed once."""
+        if not self._render_block_done:
+            from datagrunt.core.pdf_io.extraction.render_guard import document_block_reason_for_path
+
+            self._render_block_cached = document_block_reason_for_path(self.filepath)
+            self._render_block_done = True
+        return self._render_block_cached
 
     def _open_resource(self):
         return PdfiumDocument(self.filepath)
@@ -39,6 +50,7 @@ class PdfiumNativeReader(_ThreadLocalDocSession):
                 width, height = page.size()
                 full_text = page.full_text()
                 text_objects = [self._text_object(it) for it in page.text_items()]
+                warnings: list[str] = []
                 images = [
                     self._image(img)
                     for img in page.image_items(
@@ -46,20 +58,27 @@ class PdfiumNativeReader(_ThreadLocalDocSession):
                         name_prefix=Path(self.filepath).stem,
                         page_number=page_index,
                         min_image_dimension=self._config.min_image_dimension,
+                        warnings=warnings,
                     )
                 ]
                 ocr_used = False
-                warnings = []
                 if not full_text.strip():
-                    try:
-                        full_text, extra, ocr_used = self._ocr_fallback(page, width, height)
-                        text_objects.extend(extra)
-                    except Exception as exc:  # noqa: BLE001 - soft per-category failure
-                        # OCR failed (e.g. missing tesseract). Keep the page with
-                        # its already-extracted images/text rather than dropping
-                        # it, and record a page-level warning. See base.py
-                        # soft-failure contract.
-                        warnings.append(f"OCR failed: {exc}")
+                    block = self._render_block_reason()
+                    if block:
+                        # OCR renders the page, decoding every image it draws. If
+                        # any image anywhere in the document is a decode bomb
+                        # (render_guard, document-wide), do not render; record why.
+                        warnings.append(f"OCR skipped on page {page_index + 1}: {block}")
+                    else:
+                        try:
+                            full_text, extra, ocr_used = self._ocr_fallback(page, width, height)
+                            text_objects.extend(extra)
+                        except Exception as exc:  # noqa: BLE001 - soft per-category failure
+                            # OCR failed (e.g. missing tesseract). Keep the page with
+                            # its already-extracted images/text rather than dropping
+                            # it, and record a page-level warning. See base.py
+                            # soft-failure contract.
+                            warnings.append(f"OCR failed: {exc}")
             page_dict = {
                 "page_number": page_index + 1,
                 "width": round(float(width), 2),
