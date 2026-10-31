@@ -670,18 +670,25 @@ class TestPdfiumBehaviour:
         assert copy_dropped(tmp_path, text, sign * (reach - 0.01), 0.0)
         assert not copy_dropped(tmp_path, text, sign * (reach + 0.01), 0.0)
 
-    @pytest.mark.parametrize(
-        "text,dropped_at,kept_at",
-        [
-            # Up to about an eighth of the copy's width (26 pt of "Total")...
-            pytest.param(b"Total", 3.0, 3.3, id="an-eighth-of-the-width"),
-            # ... and only while the two boxes overlap (these capitals are 8.6 pt tall).
-            pytest.param(b"TOTAL DUE MW", 8.0, 9.0, id="while-the-boxes-overlap"),
-        ],
-    )
-    def test_pdfium_drops_a_copy_shifted_across_its_baseline_within_a_window(self, tmp_path, text, dropped_at, kept_at):
-        assert copy_dropped(tmp_path, text, 0.0, dropped_at) and copy_dropped(tmp_path, text, 0.0, -dropped_at)
-        assert not copy_dropped(tmp_path, text, 0.0, kept_at) and not copy_dropped(tmp_path, text, 0.0, -kept_at)
+    def test_pdfium_drops_a_copy_shifted_across_its_baseline_within_an_eighth_of_its_width(self, tmp_path):
+        # Up to about an eighth of the copy's width (26 pt of "Total").
+        assert copy_dropped(tmp_path, b"Total", 0.0, 3.0) and copy_dropped(tmp_path, b"Total", 0.0, -3.0)
+        assert not copy_dropped(tmp_path, b"Total", 0.0, 3.3) and not copy_dropped(tmp_path, b"Total", 0.0, -3.3)
+
+    def test_pdfium_drops_a_copy_shifted_across_its_baseline_only_while_the_boxes_overlap(self, tmp_path):
+        # The window across the baseline is the glyph box's height, and that box comes from
+        # the outlines of the font pdfium substitutes for Helvetica, which differ by platform
+        # (these capitals are 8.6 pt tall on macOS, less on Linux): measure it here.
+        text = b"TOTAL DUE MW"
+        page = pdfium.PdfDocument(pdf(tmp_path, b"BT /F1 12 Tf 72 100 Td (%s) Tj ET" % text))[0]
+        left, bottom, right, top = (ctypes.c_float() for _ in range(4))
+        assert pdfium_c.FPDFPageObj_GetBounds(text_objects(page)[0], left, bottom, right, top)
+        height = top.value - bottom.value
+
+        for shift in (0.93 * height, -0.93 * height):
+            assert copy_dropped(tmp_path, text, 0.0, shift)
+        for shift in (1.05 * height, -1.05 * height):
+            assert not copy_dropped(tmp_path, text, 0.0, shift)
 
     def test_pdfium_drops_a_shrunk_copy_within_its_unscaled_window(self, tmp_path):
         # Tf 100 under a 0.1 cm: "Total" is 2.7 pt per em, but the window is still 0.9 of a 100 pt "l".

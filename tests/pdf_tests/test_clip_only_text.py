@@ -11,6 +11,7 @@ text is still extracted, while unflagged invisible text would not be).
 """
 
 import ctypes
+import math
 from pathlib import Path
 
 import pypdfium2 as pdfium
@@ -131,13 +132,18 @@ class TestWhatPdfiumExposesOfATextClip:
 
     def test_a_shading_has_its_clips_bounds_and_no_matrix(self, tmp_path):
         page = pdfium.PdfDocument(clip_page(tmp_path, b"q " + GRADIENT + b"/Sh sh Q"))[0]
-        shading = pdfium_c.FPDFPage_GetObject(page.raw, 1)
-        edges = [ctypes.c_float() for _ in range(4)]
+        text, shading = (pdfium_c.FPDFPage_GetObject(page.raw, index) for index in (0, 1))
+        glyphs, edges = ([ctypes.c_float() for _ in range(4)] for _ in range(2))
 
         assert not pdfium_c.FPDFPageObj_GetMatrix(shading, pdfium_c.FS_MATRIX())
+        assert pdfium_c.FPDFPageObj_GetBounds(text, *glyphs)
         assert pdfium_c.FPDFPageObj_GetBounds(shading, *edges)
-        # The glyphs' box, rounded out to whole points: not where the shading paints.
-        assert [edge.value for edge in edges] == [31.0, 144.0, 376.0, 168.0]
+        # The glyphs' box, rounded out to whole points: not where the shading paints. The
+        # glyph box comes from the outlines of the font pdfium substitutes for Helvetica,
+        # which differ by platform ([31, 144, 376, 168] on macOS, [30, 144, 375, 168] on Linux).
+        left, bottom, right, top = (edge.value for edge in glyphs)
+        rounded_out = [math.floor(left), math.floor(bottom), math.ceil(right), math.ceil(top)]
+        assert [edge.value for edge in edges] == rounded_out
 
 
 class TestClipOnlyTextIsInvisible:
