@@ -53,11 +53,13 @@ task 2).
   visible piece, where OCR (A5) reads what the text layer cannot say.
 
 Recovered text (#366 task 3,
-:func:`~datagrunt.pdf.pdfium_engine.recover_dropped_text`) joins the page as
-pieces after its own, each flagged with its recovered reasons and those
-:func:`classify_spans` computes for it. It counts toward
-``hidden_spans_flagged`` only: never toward routing, the char counts or the
-unmapped regions. Objects it could not recover are a warning.
+:func:`~datagrunt.pdf.pdfium_engine.recover_dropped_text`) is kept apart from
+the page's pieces, in ``PageAssessment.recovered_pieces``, each flagged with
+its recovered reasons and those :func:`classify_spans` computes for it: a
+recovered copy (even a drawn one, with no reason) is never laid out as page
+text. It counts toward ``hidden_spans_flagged`` only: never toward routing,
+the char counts or the unmapped regions. Objects it could not recover are a
+warning.
 """
 
 import unicodedata
@@ -347,8 +349,11 @@ class PageAssessment:
     Picklable, so it crosses the process pool.
 
     Attributes:
-        pieces: Every char of every span, cut by :func:`classify_spans`,
-            then the recovered spans' pieces (see the module notes).
+        pieces: Every char of every span of the page's textpage, cut by
+            :func:`classify_spans`: the page's text.
+        recovered_pieces: The recovered spans' pieces, in recovery order
+            (see the module notes): never page text. Empty without a
+            recovery.
         quality: The page's quality signals; ``deskew_angle_deg`` and
             ``ocr_mean_confidence`` are None (A5 measures them).
         route: ``"digital"``, ``"hybrid"`` or ``"vision"``.
@@ -359,6 +364,7 @@ class PageAssessment:
     """
 
     pieces: tuple[SpanPiece, ...]
+    recovered_pieces: tuple[SpanPiece, ...]
     quality: PageQuality
     route: PageRoute
     unmapped_regions: tuple[Box, ...]
@@ -366,6 +372,7 @@ class PageAssessment:
 
     def __post_init__(self) -> None:
         typed_tuple("pieces", self.pieces, SpanPiece)
+        typed_tuple("recovered_pieces", self.recovered_pieces, SpanPiece)
         if not isinstance(self.quality, PageQuality):
             raise TypeError(f"quality must be a PageQuality, got {type(self.quality).__name__}")
         choice_str("route", self.route, PAGE_ROUTES)
@@ -407,7 +414,8 @@ def assess_page(page: RawPage, *, ocr: OcrMode = "auto", recovered: RecoveredTex
     flagged = _recovered_pieces(recovered, width, height, boxes, cover)
     route, warnings = _route(_text_char_count(pieces), cover, ocr)
     return PageAssessment(
-        pieces=pieces + flagged,
+        pieces=pieces,
+        recovered_pieces=flagged,
         quality=_quality(page, pieces + flagged),
         route=route,
         unmapped_regions=_unmapped_regions(pieces),

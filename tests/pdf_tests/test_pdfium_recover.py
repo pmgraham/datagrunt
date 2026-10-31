@@ -58,6 +58,8 @@ def show(technique: str, x: float, y: float) -> bytes:
         # Tz is graphics state: q / Q keeps it from squeezing later text.
         "tz-0": b"q BT /F1 12 Tf 0 Tz %s (HIDDEN) Tj ET Q" % at,
         "overprint": b"BT /F1 12 Tf %s (Total) Tj ET BT /F1 12 Tf %s (Total) Tj ET" % (at, at),
+        # A copy 1 unit right and 1 down: a drop shadow, inside pdfium's duplicate window.
+        "drop-shadow": b"BT /F1 12 Tf %s (Total) Tj ET BT /F1 12 Tf %g %g Td (Total) Tj ET" % (at, x + 1, y - 1),
         "single-space": b"BT /F1 12 Tf %s ( ) Tj ET" % at,
     }[technique]
 
@@ -179,6 +181,13 @@ def owners(page: pdfium.PdfPage) -> set[int]:
         return {object_address(pdfium_c.FPDFText_GetTextObject(textpage.raw, i)) for i in range(textpage.count_chars())}
     finally:
         textpage.close()
+
+
+def copy_dropped(tmp_path: Path, text: bytes, dx: float, dy: float) -> bool:
+    """Whether pdfium drops a 12 pt copy of ``text`` drawn ``(dx, dy)`` from the text at (72, 100)."""
+    content = b"BT /F1 12 Tf 72 100 Td (%s) Tj ET BT /F1 12 Tf %g %g Td (%s) Tj ET" % (text, 72 + dx, 100 + dy, text)
+    page = pdfium.PdfDocument(pdf(tmp_path, content))[0]
+    return object_address(text_objects(page)[1]) not in owners(page)
 
 
 def object_text(text_object, page: pdfium.PdfPage) -> str:
@@ -637,13 +646,53 @@ class TestPdfiumBehaviour:
         set_matrix(copy, 1, 0, 0, 1, 0, -100)
         assert object_text(copy, page) == "Total"
 
-    @pytest.mark.parametrize("dx,dy", [(2, 0), (0, 2)], ids=["x", "y"])
-    def test_pdfium_drops_a_copy_up_to_2_pt_away(self, tmp_path, dx, dy):
-        # Wider than recovery's 0.5 pt overprint rule: recovery emits such a copy (see TestRecovery).
-        content = b"BT /F1 12 Tf 72 100 Td (Total) Tj ET BT /F1 12 Tf %g %g Td (Total) Tj ET" % (72 + dx, 100 + dy)
-        page = pdfium.PdfDocument(pdf(tmp_path, content))[0]
+    @pytest.mark.parametrize(
+        "text,reach",
+        [
+            # 0.9 of the last glyph's advance at 12 pt: Helvetica's l is 222 units wide, a 556, W 944.
+            pytest.param(b"Total", 0.9 * 0.222 * 12, id="ends-in-l"),
+            pytest.param(b"Tota", 0.9 * 0.556 * 12, id="ends-in-a"),
+            pytest.param(b"TOTAL DUE MW", 0.9 * 0.944 * 12, id="ends-in-W"),
+        ],
+    )
+    @pytest.mark.parametrize("sign", [1, -1], ids=["right", "left"])
+    def test_pdfium_drops_a_copy_within_nine_tenths_of_its_last_glyphs_advance(self, tmp_path, text, reach, sign):
+        # Not 2 pt: "TOTAL DUE MW" goes 10.18 pt away, "Total" stays 2.41 pt away.
+        assert copy_dropped(tmp_path, text, sign * (reach - 0.01), 0.0)
+        assert not copy_dropped(tmp_path, text, sign * (reach + 0.01), 0.0)
+
+    @pytest.mark.parametrize(
+        "text,dropped_at,kept_at",
+        [
+            # Up to about an eighth of the copy's width (26 pt of "Total")...
+            pytest.param(b"Total", 3.0, 3.3, id="an-eighth-of-the-width"),
+            # ... and only while the two boxes overlap (these capitals are 8.6 pt tall).
+            pytest.param(b"TOTAL DUE MW", 8.0, 9.0, id="while-the-boxes-overlap"),
+        ],
+    )
+    def test_pdfium_drops_a_copy_shifted_across_its_baseline_within_a_window(self, tmp_path, text, dropped_at, kept_at):
+        assert copy_dropped(tmp_path, text, 0.0, dropped_at) and copy_dropped(tmp_path, text, 0.0, -dropped_at)
+        assert not copy_dropped(tmp_path, text, 0.0, kept_at) and not copy_dropped(tmp_path, text, 0.0, -kept_at)
+
+    def test_pdfium_drops_a_shrunk_copy_within_its_unscaled_window(self, tmp_path):
+        # Tf 100 under a 0.1 cm: "Total" is 2.7 pt per em, but the window is still 0.9 of a 100 pt "l".
+        shrunk = (
+            b"q 0.1 0 0 0.1 0 0 cm BT /F1 100 Tf 720 1000 Td (Total) Tj ET BT /F1 100 Tf %g 1000 Td (Total) Tj ET Q"
+        )
+
+        page = pdfium.PdfDocument(pdf(tmp_path, shrunk % (720 + 100)))[0]
 
         assert object_address(text_objects(page)[1]) not in owners(page)
+
+    @pytest.mark.parametrize("between,dropped", [(4, True), (5, False)])
+    def test_pdfium_looks_for_the_text_a_copy_copies_among_the_five_text_objects_before_it(
+        self, tmp_path, between, dropped
+    ):
+        others = b"".join(b"BT /F1 12 Tf 72 %d Td (x%d) Tj ET " % (200 + 10 * i, i) for i in range(between))
+        content = b"BT /F1 12 Tf 72 100 Td (Total) Tj ET " + others + b"BT /F1 12 Tf 72 100 Td (Total) Tj ET"
+        page = pdfium.PdfDocument(pdf(tmp_path, content))[0]
+
+        assert (object_address(text_objects(page)[-1]) not in owners(page)) == dropped
 
     @pytest.mark.parametrize("matrix", [(1, 0, 0, 1, 72, 100), (1, 0, 0, 1, 0, -100), (5, 0, 0, 5, 0, -100)])
     def test_a_single_space_object_stays_dropped_whatever_its_size_and_matrix(self, tmp_path, matrix):
@@ -805,14 +854,42 @@ class TestRecovery:
         assert (item.span.text, item.span.object_index, item.span.render_mode) == ("Total", 2, mode)
         assert (item.hidden_reasons, got.stats) == (reasons, NO_LOSS)
 
-    def test_a_copy_further_than_half_a_point_is_recovered_without_a_reason(self, tmp_path):
-        # pdfium drops it as a duplicate (TestPdfiumBehaviour); it is drawn, so nothing hides it.
-        content = CONTROL + b"BT /F1 12 Tf 72 100 Td (Total) Tj ET BT /F1 12 Tf 74 100 Td (Total) Tj ET"
+    @pytest.mark.parametrize(
+        "text,dx,dy",
+        [
+            pytest.param(b"Total", 1.0, -1.0, id="drop-shadow"),
+            pytest.param(b"Total", 2.0, 0.0, id="fake-bold"),
+            pytest.param(b"Total", -2.3, 0.0, id="left"),
+            pytest.param(b"Total", 0.0, 3.0, id="across"),
+            pytest.param(b"TOTAL DUE MW", 10.1, 0.0, id="nine-tenths-of-a-W"),
+            pytest.param(b"TOTAL DUE MW", 0.0, -8.0, id="across-while-overlapping"),
+        ],
+    )
+    def test_a_copy_within_pdfiums_duplicate_window_is_an_overprint(self, tmp_path, text, dx, dy):
+        # Drawn on the text it copies as pdfium's window allows (TestPdfiumBehaviour): counted, not emitted.
+        copy = b"BT /F1 12 Tf 72 100 Td (%s) Tj ET BT /F1 12 Tf %g %g Td (%s) Tj ET" % (text, 72 + dx, 100 + dy, text)
 
-        (item,) = recovered(pdf(tmp_path, content)).spans
+        got = recovered(pdf(tmp_path, CONTROL + copy))
+
+        assert got == RecoveredText(spans=(), stats=dataclasses.replace(NO_LOSS, overprint_duplicates=1))
+
+    @pytest.mark.parametrize("where", PLACEMENTS)
+    def test_a_drop_shadow_is_an_overprint(self, tmp_path, where):
+        got = recovered(where.build(tmp_path, "drop-shadow"))
+
+        assert got == RecoveredText(spans=(), stats=dataclasses.replace(NO_LOSS, overprint_duplicates=1))
+
+    def test_a_shrunk_copy_beyond_its_last_glyph_is_emitted_without_a_reason(self, tmp_path):
+        # pdfium's window does not shrink with the text (TestPdfiumBehaviour); recovery's is the last
+        # glyph's box (2.2 pt here), so a copy 10 pt away is emitted: it is drawn, so nothing hides it.
+        shrunk = (
+            b"q 0.1 0 0 0.1 0 0 cm BT /F1 100 Tf 720 1000 Td (Total) Tj ET BT /F1 100 Tf 820 1000 Td (Total) Tj ET Q"
+        )
+
+        (item,) = recovered(pdf(tmp_path, CONTROL + shrunk)).spans
 
         assert (item.span.text, item.span.object_index, item.hidden_reasons) == ("Total", 2, ())
-        assert item.span.font_size_pt == 12.0
+        assert item.span.font_size_pt == pytest.approx(10.0)
 
     def test_several_dropped_objects_come_back_in_walk_order(self, tmp_path):
         content = CONTROL + b"BT /F1 0 Tf 72 100 Td (ONE) Tj ET q BT /F1 12 Tf 0 Tz 72 150 Td (TWO) Tj ET Q"
@@ -848,9 +925,11 @@ class TestRecovery:
             # 0.001 % of 12 pt.
             pytest.param(b"q BT /F1 12 Tf 0.001 Tz 72 100 Td (HIDDEN) Tj ET Q", 0.00012, id="tz-0.001"),
             pytest.param(b"BT /F1 0 Tf 0 1 -1 0 200 50 Tm (HIDDEN) Tj ET", 0.0, id="turned-tf-0"),
-            # A drawn copy pdfium drops as a duplicate keeps its full 12 pt em.
+            # A drawn copy of invisible text (pdfium drops it as a duplicate) keeps its full 12 pt em.
             pytest.param(
-                b"BT /F1 12 Tf 72 100 Td (Total) Tj ET BT /F1 12 Tf 74 100 Td (Total) Tj ET", 12.0, id="drawn-copy"
+                b"q BT /F1 12 Tf 3 Tr 72 100 Td (Total) Tj ET Q BT /F1 12 Tf 72 100 Td (Total) Tj ET",
+                12.0,
+                id="drawn-copy",
             ),
         ],
     )

@@ -11,9 +11,11 @@ hands both reads to :func:`recovered_text`. This module never imports the
 engine.
 
 pdfium drops a text object whose box is under 0.01 pt wide (``Tf 0``, ``Tz
-0``, a tiny size, a single space) and a copy drawn on identical text. The
-object still exists and keeps its chars, but owns no textpage char, and
-``FPDFTextObj_GetText`` (served from the textpage) reads it as empty.
+0``, a tiny size, a single space) and a copy of identical text drawn within
+its duplicate window of one of the five text objects before it (see
+:mod:`datagrunt.pdf._pdfium_text`). The object still exists and keeps its
+chars, but owns no textpage char, and ``FPDFTextObj_GetText`` (served from
+the textpage) reads it as empty.
 
 An object whose box is the point at its origin though its em is 1 unit or
 more each way (in its form's space, where pdfium measures its box) draws no
@@ -46,14 +48,21 @@ text matrix to page space (``[a b c d]``) and ``Tf`` size
   rule flags all the same).
 
 Text drawn under 1 pt per em wide is always one or the other. A recovered
-object whose em is wider (a copy pdfium dropped as a duplicate though it lies
-over 0.5 pt from the text it copies) has neither reason: it is drawn.
+object whose em is wider (a copy pdfium dropped as a duplicate, emitted as
+below) has neither reason: it is drawn.
 
-A copy is an overprint (counted, not emitted) only when it is painted as the
-text it copies is: the same render mode, fill and stroke alphas and em
-reasons. pdfium keeps the first of two copies whatever their paint, so a
+A recovered copy of text already on the page (owned, or recovered before it)
+is an overprint, counted and not emitted, when it is painted as that text is
+(the same render mode, fill and stroke alphas and em reasons) and its origin
+lies within that text's duplicate window: the size of its last char's
+displayed box on each axis (the glyph's advance by the font's height, at
+least 0.5 pt). That window holds pdfium's for text no matrix shrinks, so
+drop shadows and fake-bold copies are counted. Otherwise the copy is
+emitted: pdfium keeps the first of two copies whatever their paint, so a
 copy that paints when the first does not (``3 Tr`` then ``0 Tr``, alpha 0
-then opaque) is what a reader sees, and is emitted.
+then opaque) is what a reader sees; and pdfium's window does not shrink
+with the text (Tf 100 under ``0.1 0 0 0.1 0 0 cm`` drops a copy 10 pt from
+a 2.2 pt "l"), so such a copy is emitted unflagged.
 """
 
 import ctypes
@@ -73,7 +82,7 @@ from datagrunt.pdf.elements import HiddenReason, check_hidden_reasons
 RECOVERY_REASONS: tuple[HiddenReason, ...] = ("tiny_font", "zero_scale")
 # A font size (or an em's width) under this many points is too small to read.
 TINY_FONT_PT = 1.0
-# Recovered text equal to another text object's at an origin this close (each axis) is an overprint.
+# The least duplicate window (each axis) of text whose last char's box is a point or a line (Tf 0, Tz 0).
 OVERPRINT_TOLERANCE_PT = 0.5
 # The size each dropped object is drawn at to be read, and the spacing of the places it is moved to.
 _READ_SIZE_PT = 12.0
@@ -117,10 +126,12 @@ class RecoveryStats:
 
     Attributes:
         overprint_duplicates: Objects whose recovered text equals an earlier
-            text object's (owned or recovered) at an origin within 0.5 pt on
-            each axis, painted alike (render mode, fill and stroke alphas,
-            em reasons): a copy drawn on it, counted and not emitted. A copy
-            painted otherwise is emitted.
+            text object's (owned or recovered), painted alike (render mode,
+            fill and stroke alphas, em reasons), at an origin within its
+            duplicate window (its last char box's size on each displayed
+            axis, at least 0.5 pt; see the module notes): a copy drawn on it
+            (a drop shadow, fake bold), counted and not emitted. A copy
+            painted otherwise, or further away, is emitted.
         whitespace_objects: Objects whose recovered text is whitespace only.
         empty_text_objects: Objects whose box is still a point once laid out
             again at 12 pt: they draw no glyph with extent (a single space
@@ -302,14 +313,19 @@ def _move(text: TextObject, place: int) -> None:
 
 
 def recovered_text(
-    targets: tuple[Target, ...], texts: Iterable[TextObject], before: PageText, after: PageText
+    targets: tuple[Target, ...],
+    texts: Iterable[TextObject],
+    before: PageText,
+    after: PageText,
+    to_display: Callable[[Box], Box],
 ) -> RecoveredText:
     """The recovered spans and counts, from the textpages read ``before`` and ``after`` the targets moved.
 
     ``texts`` (every text object of the walk) gives the owned objects'
-    origins, for the overprint rule.
+    origins, and ``to_display`` maps them to the displayed page, for the
+    overprint rule.
     """
-    printed = _owned_copies(before.spans, {text.object_index: _origin(text) for text in texts})
+    printed = _owned_copies(before.spans, {text.object_index: _origin(text) for text in texts}, to_display)
     found = _spans_by_object(after.spans, {target.object_index for target in targets})
     spans: list[RecoveredSpan] = []
     overprints = whitespace = empty = unrecovered = 0
@@ -322,7 +338,8 @@ def recovered_text(
             unrecovered += 1
             continue
         text = "".join(piece.text for piece in pieces)
-        copy = _Copy(target.origin, _paint(pieces[0], target.hidden_reasons))
+        origin = _displayed(target.origin, to_display)
+        copy = _Copy(origin, _reach(target.box), _paint(pieces[0], target.hidden_reasons))
         if text.isspace():
             whitespace += 1
         elif _overprints(copy, printed.get(text, ())):
@@ -344,9 +361,14 @@ _Paint = tuple[int, int, int, tuple[HiddenReason, ...]]
 
 
 class _Copy(NamedTuple):
-    """A text object already on the page, for the overprint rule: its page-space origin and its paint."""
+    """A text object already on the page, for the overprint rule.
+
+    ``origin`` is displayed; ``reach`` is its duplicate window on each
+    displayed axis (:func:`_reach`); ``paint`` is :func:`_paint`'s.
+    """
 
     origin: tuple[float, float]
+    reach: tuple[float, float]
     paint: _Paint
 
 
@@ -355,13 +377,31 @@ def _paint(span: RawSpan, reasons: tuple[HiddenReason, ...]) -> _Paint:
     return span.render_mode, span.fill_rgba[3], span.stroke_rgba[3], reasons
 
 
-def _owned_copies(spans: tuple[RawSpan, ...], origins: dict[int, tuple[float, float]]) -> dict[str, list[_Copy]]:
-    """Each owned object's text (its spans' text joined) to the copies drawing it, in walk order."""
+def _reach(box: Box) -> tuple[float, float]:
+    """The duplicate window of text whose last char's displayed box is ``box``: its size, at least the tolerance."""
+    return max(box[2] - box[0], OVERPRINT_TOLERANCE_PT), max(box[3] - box[1], OVERPRINT_TOLERANCE_PT)
+
+
+def _displayed(point: tuple[float, float], to_display: Callable[[Box], Box]) -> tuple[float, float]:
+    """The page-space ``point`` on the displayed page."""
+    x0, y0, _x1, _y1 = to_display((*point, *point))
+    return x0, y0
+
+
+def _owned_copies(
+    spans: tuple[RawSpan, ...], origins: dict[int, tuple[float, float]], to_display: Callable[[Box], Box]
+) -> dict[str, list[_Copy]]:
+    """Each owned object's text (its spans' text joined) to the copies drawing it, in walk order.
+
+    ``origins`` are page space; an object with spans has a finite one (the
+    text stage skips an object pdfium places nowhere).
+    """
     printed: dict[str, list[_Copy]] = {}
     for index, own in _spans_by_object(spans, set(origins)).items():
-        first = own[0]
+        first, last = own[0], own[-1]
         paint = _paint(first, em_reasons(first.em_width_pt, abs(first.font_size_pt)))
-        printed.setdefault("".join(span.text for span in own), []).append(_Copy(origins[index], paint))
+        copy = _Copy(_displayed(origins[index], to_display), _reach(last.char_boxes[-1]), paint)
+        printed.setdefault("".join(span.text for span in own), []).append(copy)
     return printed
 
 
@@ -380,12 +420,12 @@ def _spans_by_object(spans: tuple[RawSpan, ...], wanted: set[int]) -> dict[int, 
 
 
 def _overprints(copy: _Copy, others: Iterable[_Copy]) -> bool:
-    """True if one of ``others`` is painted as ``copy`` is, its origin within the overprint tolerance on both axes."""
+    """True if ``copy`` is painted as one of ``others`` is and lies within its duplicate window on both axes."""
     x, y = copy.origin
     return any(
         other.paint == copy.paint
-        and abs(x - other.origin[0]) <= OVERPRINT_TOLERANCE_PT
-        and abs(y - other.origin[1]) <= OVERPRINT_TOLERANCE_PT
+        and abs(x - other.origin[0]) <= other.reach[0]
+        and abs(y - other.origin[1]) <= other.reach[1]
         for other in others
     )
 

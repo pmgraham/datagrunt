@@ -25,10 +25,14 @@ Text (#365 T2), pinned by ``tests/pdf_tests/test_pdfium_spans.py``:
   CMap code can read beyond U+10FFFF (0x110000, 0xFFFFFFFF).
 - The textpage is not every drawn char: pdfium drops a text object whose
   box is under 0.01 pt wide (``Tf 0``, ``Tz 0``, a tiny size, an object of a
-  single space) and a copy drawn on identical text up to ~2 pt away
-  (fake-bold removal); it collapses runs of spaces to one, decomposes
-  ligatures (U+FB01 reads "fi") and mirrors "(" in right-to-left text (it
-  reads ")"). The engine keeps every char the textpage reports and counts
+  single space) and a copy of identical text (the same codes at the same
+  ``Tf``) drawn on one of the five text objects before it (fake-bold and
+  drop-shadow removal): along x within 0.9 of its last glyph's advance at
+  that ``Tf``, whatever matrix scales the text (2.4 pt for 12 pt "Total",
+  10.2 pt for "TOTAL DUE MW"), and across within about an eighth of its
+  width while the two boxes overlap. It collapses runs of spaces to one,
+  decomposes ligatures (U+FB01 reads "fi") and mirrors "(" in right-to-left
+  text (it reads ")"). The engine keeps every char the textpage reports and counts
   the text objects that own none: ``TextStats.empty_text_objects`` when the
   object draws no glyph with extent (its box is the point at its origin
   though its em is 1 unit or more each way in its form's space: a single

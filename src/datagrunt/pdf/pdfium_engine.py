@@ -109,8 +109,12 @@ Recovery (#366 task 3), pinned by ``tests/pdf_tests/test_pdfium_recover.py``
 
 - pdfium's textpage drops a text object whose box is under 0.01 pt wide
   (``Tf 0``; a tiny size: "HIDDEN" goes at 0.002 pt, stays at 0.004; ``Tz
-  0.01`` goes, ``Tz 0.05`` stays) and a copy of identical text drawn up to
-  ~2 pt from it. The object keeps its chars but owns no textpage char, and
+  0.01`` goes, ``Tz 0.05`` stays) and a copy of identical text drawn within
+  its duplicate window of one of the five text objects before it: 0.9 of
+  its last glyph's advance at its ``Tf`` along x ("Total" at 12 pt goes 2.39
+  pt away, stays 2.41; "TOTAL DUE MW" goes 10.18), whatever matrix scales
+  the text, and about an eighth of its width across while the boxes
+  overlap. The object keeps its chars but owns no textpage char, and
   ``FPDFTextObj_GetText`` reads it as empty. ``Tz`` is in the object's
   matrix (``Tz 0`` reads ``a = b = 0``); a ``Tf 0`` object's bounds are the
   point at its origin, a ``Tz 0`` one's a line with no width. So are a 12
@@ -1044,7 +1048,7 @@ def _recover(page: pdfium.PdfPage, geometry: PageGeometry) -> RecoveredText:
         targets = isolate_dropped(texts, before.dropped, to_display)
         with _opened_textpage(page, page_number) as textpage:
             after = collect_text(textpage.raw, to_display, walk)
-    return recovered_text(targets, texts, before.page_text, after.page_text)
+    return recovered_text(targets, texts, before.page_text, after.page_text, to_display)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
