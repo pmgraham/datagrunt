@@ -810,6 +810,29 @@ class TestTextBlocks:
 
         assert self.bold_lines(*lines) == [" ".join(text for text, _ in lines)]
 
+    def test_lower_case_bold_words_after_a_line_that_did_not_wrap_start_a_paragraph(self):
+        # "Each player draws" ends 294 pt short of the column's measure (the longest line, the last): it did not
+        # wrap, so the bold words under it start a paragraph, though they start lower case.
+        lines = (
+            ("Each player draws", False),
+            ("a hand of cards", True),
+            ("and the woodland is vast and its creatures many, each with its own", False),
+        )
+
+        assert self.bold_lines(*lines) == [text for text, _ in lines]
+
+    def test_lower_case_bold_words_after_a_wrapped_line_ending_in_a_colon_start_a_paragraph(self):
+        # The last line sets the measure, one char (6 pt) past the first: room for no word of the bold line's
+        # (its first, "and", is 18 pt), so the first line wrapped, but it ends a clause.
+        lines = (
+            ("Before play, each player takes the following items:", False),
+            ("and a faction board with its pieces", True),
+            ("and a hand of three cards drawn from the shared deck", False),
+        )
+        assert len(lines[2][0]) == len(lines[0][0]) + 1
+
+        assert self.bold_lines(*lines) == [text for text, _ in lines]
+
     def test_a_long_bold_line_opening_a_block_stays_its_own(self):
         # A heading at a block's start ends at the first regular line, however long it runs.
         lines = (
