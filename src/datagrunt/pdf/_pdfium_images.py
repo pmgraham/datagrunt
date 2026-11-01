@@ -10,7 +10,10 @@ No pixel is decoded while a page's images are collected: each stream is
 copied out once (within a per-page budget) to hash it, JPEG and JPEG 2000
 sizes are read from their own headers (:mod:`datagrunt.pdf._image_headers`),
 and pdfium's metadata call, which decodes JPX in full, is made only for
-codecs it reads without decoding. Pixels are decoded by
+codecs it reads without decoding. A JPEG or JPEG 2000 codestream behind
+exactly one FlateDecode is read only when zlib inflates the stream whole
+within 1 MiB and pdfium then decodes it to the very same bytes (see
+``_MAX_INFLATED_BYTES``); both inflations count against the page budget. Pixels are decoded by
 :class:`~datagrunt.pdf.pdfium_engine.ImageLoader`, one image at a time, after
 the decode bounds (``_MAX_DECODED_PIXELS``, ``_MAX_JPX_TILES``) pass.
 
@@ -29,8 +32,10 @@ import ctypes
 import hashlib
 import io
 import math
+import zlib
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from functools import partial
 from types import MappingProxyType
 from typing import Literal, NamedTuple
 
@@ -71,7 +76,9 @@ class RawImage:
             to page space (form matrices included): its painted area, before
             any clipping path, soft mask or image mask.
         px_width: The width pdfium decodes the image at: for a DCT or JPX
-            stream (alone or behind ASCII85 / ASCIIHex) its own header's
+            stream (alone, behind ASCII85 / ASCIIHex, or behind one
+            FlateDecode that inflates whole within 1 MiB to exactly the
+            stream pdfium decodes) its own header's
             (JPEG frame, JPEG 2000 SIZ), which pdfium uses whatever
             ``/Width`` says; else ``declared_px``'s. 0 when unknown: a side
             outside 1..131071 (pdfium decodes no larger side), a header that
@@ -177,8 +184,10 @@ class ImageStats:
         skipped_unsized_images: Images whose decode size cannot be known
             without decoding, recorded without pixel metadata (size 0 where
             unknown): a dimension outside 1..131071, an unreadable JPEG or
-            JPEG 2000 header, such a codestream behind a filter other than
-            ASCII85 / ASCIIHex (a Flate one could be a bomb), or a codec whose
+            JPEG 2000 header, such a codestream behind other filters than
+            ASCII85 / ASCIIHex or exactly one FlateDecode, or behind a
+            FlateDecode that zlib cannot inflate whole within 1 MiB (a bomb)
+            or that pdfium decodes to other bytes (a predictor), or a codec whose
             size is not read from its header (JBIG2: sizing it is #407; until
             then the render guard refuses a page holding one). Never decoded.
         skipped_over_budget_images: Images recorded without hash, size or
@@ -259,6 +268,15 @@ _MAX_DECODED_SAMPLES = _MAX_DECODED_PIXELS * 4
 # is decoded by pdfium to read its header: ASCII85's "z" turns 1 byte into 4,
 # so the decoded stream stays within a quarter of the asset limit.
 _MAX_ASCII_WRAPPED_BYTES = _MAX_ASSET_BYTES // 16
+
+# A DCT or JPX codestream behind exactly one FlateDecode is read only when
+# zlib inflates the stream whole within this many bytes, and pdfium then
+# decodes it to the same bytes. The cap bounds the work before pdfium is
+# asked for anything (a Flate bomb stops here); the comparison catches a
+# /DecodeParms predictor, which pdfium applies and no pdfium API reports, and
+# which can hide another frame from a reader of the inflated bytes.
+_MAX_INFLATED_BYTES = 1 << 20
+_FLATE_ONLY = ("FlateDecode",)
 
 # The stream bytes one page may copy out of pdfium. A length query copies a
 # stream as a read does (observed: 4 ms against 8 ms for a 200 MB stream),
@@ -444,13 +462,8 @@ def _page_image(
     if not fits:
         return unread, _over_budget(label)
     raw = _copied_raw_stream(image, size, label)
-
-    def charged_ascii_decoded() -> bytes | None:
-        data = ascii_decoded_stream(image, size, label)
-        budget.charge(len(data or b""))
-        return data
-
-    facts = pixel_facts(image, page_raw, label, filters, declared, raw, charged_ascii_decoded)
+    wrapped = partial(wrapped_codestream, image, filters, raw, label, budget.charge)
+    facts = pixel_facts(image, page_raw, label, filters, declared, raw, wrapped)
     recorded = RawImage(
         bbox=bbox,
         px_width=facts.px_width,
@@ -572,6 +585,62 @@ def ascii_decoded_stream(image: pdfium_c.FPDF_PAGEOBJECT, raw_size: int, label: 
     return buffer.raw
 
 
+def wrapped_codestream(
+    image: pdfium_c.FPDF_PAGEOBJECT, filters: tuple[str, ...], raw: bytes, label: str, charge: Callable[[int], object]
+) -> bytes | str:
+    """The codestream a DCT or JPX image's filters wrap, as pdfium's decoder reads it; or why it is not read.
+
+    Behind exactly one FlateDecode: :func:`flate_decoded_stream`. Else (behind
+    ASCII85 / ASCIIHex only): pdfium's decoded stream, empty when it is not
+    read (:func:`ascii_decoded_stream`). Each stream decoded is passed to
+    ``charge``, which the page's stream budget counts.
+    """
+    if filters[:-1] == _FLATE_ONLY:
+        return flate_decoded_stream(image, raw, label, charge)
+    data = ascii_decoded_stream(image, len(raw), label) or b""
+    charge(len(data))
+    return data
+
+
+def flate_decoded_stream(
+    image: pdfium_c.FPDF_PAGEOBJECT, raw: bytes, label: str, charge: Callable[[int], object]
+) -> bytes | str:
+    """The stream one FlateDecode wraps, as pdfium decodes it, once verified; or why it is not read.
+
+    zlib inflates ``raw`` first, its output capped at ``_MAX_INFLATED_BYTES``:
+    pdfium is asked only for a stream zlib saw end within the cap. pdfium's
+    decoded stream (its size queried first) must then be exactly what zlib
+    inflated. Both inflations are charged. The reason completes "a DCT
+    stream behind FlateDecode ...".
+    """
+    inflated = _inflated(raw, charge)
+    if isinstance(inflated, str):
+        return inflated
+    size = pdfium_c.FPDFImageObj_GetImageDataDecoded(image, None, 0)
+    charge(size)
+    if size != len(inflated):
+        return f"that pdfium decodes to {size} bytes, not the {len(inflated)} zlib inflates"
+    buffer = ctypes.create_string_buffer(size)
+    if pdfium_c.FPDFImageObj_GetImageDataDecoded(image, buffer, size) != size:
+        return "whose decoded stream pdfium cannot copy"
+    if buffer.raw != inflated:
+        return "that pdfium decodes to other bytes than zlib inflates (a /DecodeParms predictor)"
+    return inflated
+
+
+def _inflated(raw: bytes, charge: Callable[[int], object]) -> bytes | str:
+    """``raw`` inflated by zlib if it ends within ``_MAX_INFLATED_BYTES``; else why not. What it inflates is charged."""
+    inflater = zlib.decompressobj()
+    try:
+        inflated = inflater.decompress(raw, _MAX_INFLATED_BYTES + 1)
+    except zlib.error as exc:
+        return f"that does not inflate ({exc})"
+    charge(len(inflated))
+    if not inflater.eof or len(inflated) > _MAX_INFLATED_BYTES:
+        return f"that does not inflate, whole, within {_MAX_INFLATED_BYTES} bytes"
+    return inflated
+
+
 def read_filters(image: pdfium_c.FPDF_PAGEOBJECT, label: str) -> tuple[str, ...]:
     """An image object's filter names in decoding order.
 
@@ -618,16 +687,17 @@ def pixel_facts(
     filters: tuple[str, ...],
     declared: tuple[int, int],
     raw: bytes,
-    ascii_decoded: Callable[[], bytes | None],
+    wrapped: Callable[[], bytes | str],
 ) -> PixelFacts:
     """What image object ``image`` decodes to, without decoding it.
 
-    The size is the codestream header's for a DCT or JPX stream (alone or
-    behind ASCII filters, decoded by ``ascii_decoded``), else ``declared``.
-    pdfium's metadata (bits per pixel, colour space) is read only when the
-    image may be decoded and the codec reads it without decoding.
+    The size is the codestream header's for a DCT or JPX stream (alone, or
+    behind ASCII filters or one FlateDecode: read by ``wrapped``, see
+    :func:`wrapped_codestream`), else ``declared``. pdfium's metadata (bits
+    per pixel, colour space) is read only when the image may be decoded and
+    the codec reads it without decoding.
     """
-    width, height, refusal = _decode_size(filters, declared, raw, ascii_decoded, label)
+    width, height, refusal = _decode_size(filters, declared, raw, wrapped, label)
     read_metadata = refusal is None and not _DECODED_FOR_METADATA.intersection(filters)
     bits_per_pixel, colorspace = _metadata(image, page_raw, label) if read_metadata else (None, None)
     return PixelFacts(width, height, declared, bits_per_pixel, colorspace, refusal, read_metadata)
@@ -637,7 +707,7 @@ def _decode_size(
     filters: tuple[str, ...],
     declared: tuple[int, int],
     raw: bytes,
-    ascii_decoded: Callable[[], bytes | None],
+    wrapped: Callable[[], bytes | str],
     label: str,
 ) -> tuple[int, int, tuple[Skip, str] | None]:
     """The (width, height) pdfium decodes an image at, and why it must not (None: it may)."""
@@ -646,7 +716,7 @@ def _decode_size(
     reader = _HEADER_READERS.get(codec)
     if reader is None and filters and codec not in _SIMPLE_FILTERS:
         return 0, 0, ("unsized", f"{label} uses filter {codec!r}: its decode size cannot be read without decoding")
-    if not _ASCII_FILTERS.issuperset(wrappers):
+    if not (_ASCII_FILTERS.issuperset(wrappers) or (reader is not None and wrappers == _FLATE_ONLY)):
         behind = ", ".join(wrappers)
         message = f"{label} is a {codec} stream behind {behind}: its size cannot be read without decoding"
         return 0, 0, ("unsized", message)
@@ -654,8 +724,11 @@ def _decode_size(
     if reader is None:
         width, height = declared
     else:
-        data = ascii_decoded() if wrappers else raw
-        header = None if data is None else reader(data)
+        data = wrapped() if wrappers else raw
+        if isinstance(data, str):
+            message = f"{label} is a {codec} stream behind FlateDecode {data}: its size cannot be read without decoding"
+            return 0, 0, ("unsized", message)
+        header = reader(data)
         if header is None:
             return 0, 0, ("unsized", f"{label} has a {codec} header that cannot be read")
         if header.components > _MAX_JPX_COMPONENTS:

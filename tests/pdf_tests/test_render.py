@@ -27,12 +27,14 @@ from pdf_tests.test_pdfium_images import (
     RGB_4X2,
     SAMPLES,
     content_page,
+    flate_bomb,
     gray,
     image_xobject,
     j2k,
     jpeg_bytes,
     jpeg_with_frame,
     one_page,
+    predictor_bomb,
     xobject_page,
 )
 
@@ -211,6 +213,11 @@ class TestImageGuard:
         assert len(page_images(open_document(path), 0).images) == 2
         assert refusal_of(path) is None
 
+    def test_a_flate_wrapped_jpeg_passes(self, tmp_path):
+        entries = b"/Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter [/FlateDecode /DCTDecode]"
+
+        assert refusal_of(xobject_page(tmp_path, zlib.compress(jpeg_bytes((16, 8))), entries)) is None
+
     def test_a_page_without_images_passes(self, tmp_path):
         assert refusal_of(content_page(tmp_path, b"10 10 m 100 100 l S")) is None
 
@@ -251,10 +258,17 @@ class TestImageGuard:
                 id="flate-declared",
             ),
             pytest.param(
-                zlib.compress(jpeg_bytes((16, 8))),
+                *predictor_bomb(),
+                "object 0 is a DCTDecode stream behind FlateDecode that pdfium decodes to other bytes than zlib "
+                "inflates (a /DecodeParms predictor): its size cannot be read without decoding",
+                id="dct-behind-flate-with-a-predictor",
+            ),
+            pytest.param(
+                flate_bomb(2048),
                 b"/Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter [/FlateDecode /DCTDecode]",
-                "object 0 is a DCTDecode stream behind FlateDecode: its size cannot be read without decoding",
-                id="dct-behind-flate",
+                "object 0 is a DCTDecode stream behind FlateDecode that does not inflate, whole, within 1048576 "
+                "bytes: its size cannot be read without decoding",
+                id="flate-bomb-before-dct",
             ),
             pytest.param(
                 b"not a codestream",

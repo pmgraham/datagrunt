@@ -93,7 +93,10 @@ Images (#365 T4), pinned by ``tests/pdf_tests/test_pdfium_images.py``:
 - ``FPDFImageObj_GetImageDataRaw``'s length query copies the stream too
   (4 ms against 8 ms for the read of a 200 MB stream).
   ``FPDFImageObj_GetImageDataDecoded`` of ``[/ASCII85Decode /DCTDecode]``
-  (what ReportLab writes for every JPEG) is the JPEG as written.
+  (what ReportLab writes for every JPEG) is the JPEG as written; of
+  ``[/FlateDecode /DCTDecode]`` it is the inflated JPEG with its
+  ``/DecodeParms`` predictor undone (no pdfium API reads /DecodeParms), so a
+  predictor can hide one frame behind another (#369 A5a).
 
 Pages (#365 T5), pinned by ``tests/pdf_tests/test_pdfium_extract_page.py``:
 
@@ -176,7 +179,6 @@ from datagrunt.pdf._pdfium_images import (
     PageImages,
     PixelFacts,
     RawImage,
-    ascii_decoded_stream,
     collect_images,
     declared_size,
     decoded_png,
@@ -184,6 +186,7 @@ from datagrunt.pdf._pdfium_images import (
     pixel_facts,
     read_filters,
     read_raw_stream,
+    wrapped_codestream,
 )
 from datagrunt.pdf._pdfium_recover import (
     Display,
@@ -1307,8 +1310,8 @@ class ImageLoader:
         if actual != self.raw_sha256:
             raise self._changed(f"its raw stream hashes to {actual}, not {self.raw_sha256}")
         filters = read_filters(image, label)
-        decoded = partial(ascii_decoded_stream, image, len(raw), label)
-        facts = pixel_facts(image, page_raw, label, filters, declared_size(image, label), raw, decoded)
+        wrapped = partial(wrapped_codestream, image, filters, raw, label, _uncharged)
+        facts = pixel_facts(image, page_raw, label, filters, declared_size(image, label), raw, wrapped)
         found = _described(filters, facts.px_width, facts.px_height, facts.declared_px, facts, facts.read_metadata)
         expected = _described(
             self.image.filters,
@@ -1326,6 +1329,10 @@ class ImageLoader:
         """The error for a source that no longer holds this image (never naming the password)."""
         where = f"{self.source}: page {self.page_index + 1}, object {self.object_index}"
         return DatagruntPDFError(f"{where} is not the image this loader was made for: the file changed ({detail})")
+
+
+def _uncharged(size: int) -> None:
+    """A loader reads one image: there is no page stream budget to charge ``size`` to."""
 
 
 def _described(
