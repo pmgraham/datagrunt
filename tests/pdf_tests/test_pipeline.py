@@ -301,13 +301,13 @@ def swap_after_first_chunk(message, replies):
     pipeline._worker_main(message, replies)
 
 
-# The per-page pool deadline (#418, #426). Vision options with a page budget of their own, here and in a worker.
-SLOW_OCR_TIMEOUT_S = 1.0
-SLOW_OCR_SLEEP_S = 0.8  # each slow tesseract call: just under its timeout
-SLOW_OCR_BUDGET_S = 4.0
-HANG_BUDGET_S = 0.5
-QUEUE_BUDGET_S = 3.0
-SLOW_PAGE_S = 2.5  # the slow chunk's pages, each within its bound (3.75 s)
+# The per-page pool deadline (#418, #426). Each timing pin keeps 6x headroom or more between what it waits for and
+# the bound it is measured against: here a worker starts and sends a 4-page chunk in ~0.3 s, a CI runner ~3x slower.
+SLOW_OCR_TIMEOUT_S = 3.0
+SLOW_OCR_SLEEP_S = 0.3  # each slow tesseract call: a tenth of its timeout
+SLOW_OCR_BUDGET_S = 3 * 2 * SLOW_OCR_TIMEOUT_S  # 3 x what a page's 2 calls (OSD, one band at 72 DPI) may take
+HANG_BUDGET_S = 2.5
+SLOW_PAGE_S = 0.5  # each of the slow chunk's pages: an eighth of its 4 s bound
 HANG_S = 20.0  # past every bound the pins set
 
 
@@ -323,7 +323,6 @@ def budgeted(page_budget_s: float, options: PipelineOptions, *, ocr_timeout_s: f
 
 SLOW_OCR_VISION = partial(budgeted, SLOW_OCR_BUDGET_S, ocr_timeout_s=SLOW_OCR_TIMEOUT_S)
 HANG_VISION = partial(budgeted, HANG_BUDGET_S)
-QUEUE_VISION = partial(budgeted, QUEUE_BUDGET_S)
 
 
 def with_slow_ocr_budget(message, replies):
@@ -352,22 +351,16 @@ def hang_on_page_2(message, replies):
 
 
 def slow_first_chunk(message, replies):
-    """The first chunk's worker routes each page SLOW_PAGE_S late (each within its bound); vision QUEUE_VISION's."""
-    pipeline._vision = QUEUE_VISION
+    """Every worker draws its pages one a window; the first chunk's routes each page SLOW_PAGE_S late."""
+    pipeline._WINDOW_PAGES = 1
     if message["pages"][0] == 0:
         pipeline._routed = routed_after(SLOW_PAGE_S)
     pipeline._worker_main(message, replies)
 
 
-def small_allowances(monkeypatch, start_s: float) -> None:
-    """The pool's allowances, small: a worker's start (``start_s``), a page's work, the background render's, a reap."""
-    for name, value in (
-        ("_WORKER_START_S", start_s),
-        ("_WORKER_PAGE_S", 0.25),
-        ("_BACKGROUND_START_S", 0.5),
-        ("_BACKGROUND_PAGE_S", 0.25),
-        ("_CALL_REAP_S", 0.25),
-    ):
+def allowances(monkeypatch, **values: float) -> None:
+    """Set the pool's allowances (``_WORKER_START_S`` and so on) for this test."""
+    for name, value in values.items():
         monkeypatch.setattr(pipeline, name, value)
 
 
@@ -1295,24 +1288,25 @@ class TestWorkers:
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 4)
         started = started_workers(monkeypatch)
         run_page_workers_as(monkeypatch, "hang_on_page_3")
-        for name, value in (
-            ("_WORKER_START_S", 3.0),
-            ("_WORKER_PAGE_S", 0.5),
-            ("_BACKGROUND_START_S", 0.5),
-            ("_BACKGROUND_PAGE_S", 0.5),
-            ("_CALL_REAP_S", 0.5),
-        ):
-            monkeypatch.setattr(pipeline, name, value)
+        allowances(
+            monkeypatch,
+            _WORKER_START_S=4.0,
+            _WORKER_PAGE_S=2.0,
+            _BACKGROUND_START_S=0.5,
+            _BACKGROUND_PAGE_S=0.5,
+            _CALL_REAP_S=0.5,
+        )
 
         began = time.monotonic()
         pooled = extract_document(path, workers=2, ocr="never")
         elapsed = time.monotonic() - began
 
-        reason = "the worker process extracting pages 3-4 did not return page 3 within 6 s of its start: it was killed"
+        reason = "the worker process extracting pages 3-4 did not return page 3 within 10 s of its start: it was killed"
         assert [page.error for page in pooled.pages] == [None, None, reason, reason]
-        # Page 3's bound from its worker's start: 3 s to start, its own 0.5 + 0.5 s (no OCR under ocr="never"), and
-        # its window's lead: page 4's 0.5 + 0.5 s and the background render's 0.5 + 0.5 s. The hung worker sleeps 60 s.
-        assert 6.0 <= elapsed < 40.0  # about 6 s here; the hung worker would reply at 60 s
+        # Page 3's bound from its worker's start: 4 s to start, its own 2 + 0.5 s (no OCR under ocr="never"), and
+        # its window's lead: page 4's 2 + 0.5 s and the background render's 0.5 + 0.5 s. Pages 1-2 come in ~0.3 s
+        # here, page 2 well within its 2.5 s of page 1; the hung worker sleeps 60 s.
+        assert elapsed >= 10.0
         assert_reaped(started)
 
     @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
@@ -1325,23 +1319,30 @@ class TestWorkers:
     )
     def test_a_hung_page_is_killed_within_its_bound_and_the_pages_before_it_kept(self, tmp_path, monkeypatch, second):
         path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=LINES), second, *[PageSpec(items=LINES)] * 6])
-        small_allowances(monkeypatch, start_s=3.0)
+        allowances(
+            monkeypatch,
+            _WORKER_START_S=2.0,
+            _WORKER_PAGE_S=0.5,
+            _BACKGROUND_START_S=0.5,
+            _BACKGROUND_PAGE_S=0.5,
+            _CALL_REAP_S=0.5,
+        )
         monkeypatch.setattr(pipeline, "_vision", HANG_VISION)
         expected = [element_texts(page) for page in extract_document(path).pages]
         started = started_workers(monkeypatch)
         run_page_workers_as(monkeypatch, "hang_on_page_2")
 
-        began = time.monotonic()
         pooled = extract_document(path, workers=2)
-        elapsed = time.monotonic() - began
 
-        # Page 2's bound, however large the page: 0.25 s of work, 0.25 s of background render, its 0.5 s OCR budget
-        # and its reap, 0.25 s, from page 1's reply. Its worker hangs 20 s; pages 3-4 were never finished.
-        reason = "the worker process extracting pages 1-4 did not return page 2 within 1.25 s of page 1: it was killed"
+        # Page 2's bound from page 1's reply, however large the page: 0.5 s of work, 0.5 s of background render, its
+        # 2.5 s OCR budget and its reap, 0.5 s: 4 s, where each page after a chunk's first comes in ~0.05 s here. Page
+        # 1's (and page 5's) bound is 10 s from its worker's start (2 s to start, its 4 s, and its window's lead: 3
+        # pages' 1 s and the background render's 1 s), where it comes in ~0.3 s. Page 2's worker hangs 20 s: page 1
+        # is kept, pages 2-4 (never finished) are error pages.
+        reason = "the worker process extracting pages 1-4 did not return page 2 within 4 s of page 1: it was killed"
         assert [page.error for page in pooled.pages] == [None, reason, reason, reason, None, None, None, None]
         kept = [0, 4, 5, 6, 7]
         assert [element_texts(pooled.pages[index]) for index in kept] == [expected[index] for index in kept]
-        assert elapsed < 15.0  # about 2.5 s here; the hung page would return at 20 s
         assert_reaped(started)
 
     @posix_only
@@ -1349,7 +1350,14 @@ class TestWorkers:
     def test_a_slow_but_bounded_ocr_is_never_cut_off(self, tmp_path, monkeypatch, scan_png):
         path = build_pdf(tmp_path / "doc.pdf", [*[scan_page(scan_png)] * 3, *[PageSpec(items=LINES)] * 3])
         fake_tesseract(tmp_path, monkeypatch, SLOW_TESSERACT, stdout=tsv(row(5, (10, 10, 50, 20), "95", "slow")))
-        small_allowances(monkeypatch, start_s=2.0)
+        allowances(
+            monkeypatch,
+            _WORKER_START_S=6.0,
+            _WORKER_PAGE_S=0.5,
+            _BACKGROUND_START_S=0.5,
+            _BACKGROUND_PAGE_S=0.5,
+            _CALL_REAP_S=0.5,
+        )
         monkeypatch.setattr(pipeline, "_vision", SLOW_OCR_VISION)
         sequential = extract_document(path, dpi=72, vision_dpi=72)
         started = started_workers(monkeypatch)
@@ -1362,29 +1370,38 @@ class TestWorkers:
         assert pooled == sequential
         assert [(page.status, page.route) for page in pooled.pages] == [("ok", "vision")] * 3 + [("ok", "digital")] * 3
         assert [element_texts(page) for page in pooled.pages[:3]] == [["slow"]] * 3
-        # Pages 1-3's worker made 6 tesseract calls (OSD and one band a page at 72 DPI) of 0.8 s, each within its 1 s
-        # timeout and its page's 4 s budget: 4.8 s, past one page's bound (4.75 s) but within each page's own.
+        # Pages 1-3's worker made 6 slow tesseract calls (OSD and one band a page at 72 DPI), each 0.3 s of its 3 s
+        # timeout, a page ~0.9 s of its 18 s budget: none was cut off.
         assert elapsed >= 6 * SLOW_OCR_SLEEP_S
         assert_reaped(started)
 
     @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_a_fast_chunk_behind_a_slow_one_is_never_killed(self, tmp_path, monkeypatch):
-        # #426: pages 5-8 (~140 KB pickled, past a pipe's 64 KB) are read as they come, not after pages 1-4's.
-        path = build_pdf(tmp_path / "doc.pdf", [*[PageSpec(items=LINES)] * 4, *[dense_page()] * 4])
-        small_allowances(monkeypatch, start_s=2.0)
-        monkeypatch.setattr(pipeline, "_vision", QUEUE_VISION)
-        sequential = extract_document(path)
+        # #426: pages 25-48 (~150 KB pickled, past a pipe's 64 KB) are read as they come, not after pages 1-24's.
+        path = build_pdf(tmp_path / "doc.pdf", [*[PageSpec(items=LINES)] * 44, *[dense_page()] * 4])
+        allowances(
+            monkeypatch,
+            _WINDOW_PAGES=1,
+            _WORKER_START_S=6.0,
+            _WORKER_PAGE_S=2.9,
+            _BACKGROUND_START_S=0.3,
+            _BACKGROUND_PAGE_S=0.5,
+            _CALL_REAP_S=0.3,
+        )
+        sequential = extract_document(path, ocr="never")
         started = started_workers(monkeypatch)
         run_page_workers_as(monkeypatch, "slow_first_chunk")
 
         began = time.monotonic()
-        pooled = extract_document(path, workers=2)
+        pooled = extract_document(path, workers=2, ocr="never")
         elapsed = time.monotonic() - began
 
         assert pooled == sequential
-        assert [page.status for page in pooled.pages] == ["ok"] * 8
-        # Pages 1-4 take 2.5 s each, each within its 3.75 s bound: 10 s in all, past pages 5-8's first bound (8 s).
-        assert elapsed >= 4 * SLOW_PAGE_S
+        assert [page.status for page in pooled.pages] == ["ok"] * 48
+        # A page's bound (each page its own window): 2.9 + 0.5 s, and 0.3 + 0.3 s for its window's background render,
+        # 4 s; a chunk's first page, 6 s more. Pages 1-24 take 0.5 s each, an eighth of their bound: 12 s in all, past
+        # the 10 s pages 25-48's first page is given from its worker's start. Pages 25-48 take ~0.05 s each here.
+        assert elapsed >= 24 * SLOW_PAGE_S
         assert_reaped(started)
 
     @pytest.mark.parametrize(

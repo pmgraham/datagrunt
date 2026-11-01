@@ -1127,17 +1127,17 @@ class TestDeadline:
 
     @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_a_call_is_cut_at_the_deadline_and_the_reading_is_spent(self, tmp_path, monkeypatch):
-        # Each call takes 0.5 s: band 1 ends ~0.5 s in; band 2 is given the ~0.3 s left, not its 30 s timeout.
-        body = "cat > /dev/null\nsleep 0.5\n" + 'cat "{d}/stdout"'
+        # Band 1 answers at once (~0.01 s here); band 2's call would take 60 s: it is given the ~1 s left, not 30 s.
+        body = 'cat > /dev/null\nif [ -e "{d}/called" ]; then exec sleep 60; fi\n: > "{d}/called"\ncat "{d}/stdout"'
         fake_tesseract(tmp_path, monkeypatch, body, stdout=tsv(row(5, (10, 20, 30, 15), "90", "fox")))
 
         began = time.monotonic()
-        result = words_of(PAGE_50_BY_1000, deadline=began + 0.8)
+        result = words_of(PAGE_50_BY_1000, deadline=began + 1.0)
         elapsed = time.monotonic() - began
 
         assert (result.status, result.reason) == ("spent", "OCR stopped after 1 of 2 bands")
         assert [word.text for word in result.words] == ["fox"]  # band 1's, for the caller not to use
-        assert elapsed < 5.0  # ~0.8 s here; band 2's own timeout would allow 30 s
+        assert elapsed < 8.0  # ~1 s here; band 2's own timeout would allow 30 s
 
     def test_a_call_cut_at_the_deadline_is_spent_not_timed_out(self, tmp_path, monkeypatch):
         fake_tesseract(tmp_path, monkeypatch, "exec sleep 60")

@@ -12,7 +12,6 @@ absent (CI installs ``tesseract-ocr``).
 import dataclasses
 import io
 import pickle
-import re
 import time
 from pathlib import Path
 
@@ -952,21 +951,21 @@ class TestPageBudget:
     @posix_only
     @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_a_page_whose_bands_outrun_its_budget_stops_with_the_warning(self, scans, tmp_path, monkeypatch):
-        # Each tesseract call takes 0.5 s, within its 30 s timeout; the page's 4 bands and OSD would take 2.5 s.
+        # Each tesseract call takes 2 s, within its 30 s timeout; the page's 3 s budget is 12 times its render (~0.25 s
+        # here). OSD alone leaves under 1 s, so no band is read, however slow the runner: 0 of the page's 4 bands.
         body = (
-            "cat > /dev/null\nsleep 0.5\n"
+            "cat > /dev/null\nsleep 2\n"
             'if [ "$4" = "0" ]; then printf "Rotate: 0\\nOrientation confidence: 9.00\\n"; else cat "{d}/stdout"; fi'
         )
         fake_tesseract(tmp_path, monkeypatch, body, stdout=tsv(tsv_row(5, (10, 20, 30, 15), "90", "fox")))
 
         began = time.monotonic()
-        page = visioned(scans["scan"], options=VisionOptions(ocr_timeout_s=30.0, page_budget_s=1.6))
+        page = visioned(scans["scan"], options=VisionOptions(ocr_timeout_s=30.0, page_budget_s=3.0))
         elapsed = time.monotonic() - began
 
         assert (page.status, texts(page)) == ("ocr_unavailable", [])
-        stopped = r"OCR stopped after [01] of 4 bands: the page's 1\.6 s budget is spent"
-        assert re.fullmatch(rf"OCR could not read the page: {stopped}(; the \d+ word\(s\) .*)?", page.warnings[-1])
-        assert elapsed < 6.0  # ~1.6 s here: the budget, then one call's reap at most
+        assert page.warnings[-1] == budget_warning("OCR stopped after 0 of 4 bands", "3")
+        assert elapsed < 20.0  # ~3 s here: the budget, then one call's reap at most; unbounded, its 5 calls take 10 s
 
 
 class TestPageRender:
