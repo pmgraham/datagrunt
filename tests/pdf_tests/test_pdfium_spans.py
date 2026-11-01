@@ -5,6 +5,7 @@ coordinates are top-left points in the unrotated page space, or written by
 hand (``hand_written_pdf``) for what ReportLab cannot write.
 """
 
+import ctypes
 import dataclasses
 import math
 import pickle
@@ -28,8 +29,11 @@ TOL = 1.0
 
 BOX_A = (10.0, 20.0, 16.0, 32.0)
 BOX_B = (16.0, 21.0, 22.0, 33.0)
+# Their glyphs' bounds: inside each advance, from the baseline (31, 32) up.
+TIGHT_A = (11.0, 22.0, 15.0, 31.0)
+TIGHT_B = (17.0, 23.0, 21.0, 32.0)
 # RawSpan overrides for a valid four-char span.
-FOUR_CHARS = {"text": "Abcd", "bbox": BOX_A, "char_boxes": (BOX_A,) * 4}
+FOUR_CHARS = {"text": "Abcd", "bbox": BOX_A, "char_boxes": (BOX_A,) * 4, "tight_boxes": (TIGHT_A,) * 4}
 
 ROTATIONS = [0, 90, 180, 270]
 # Top-left (50, 20)-(350, 260) on the 400 x 300 page: PDF CropBox (50, 40)-(350, 280).
@@ -85,6 +89,7 @@ def span(**overrides) -> RawSpan:
         "text": "Ab",
         "bbox": (10.0, 20.0, 22.0, 33.0),
         "char_boxes": (BOX_A, BOX_B),
+        "tight_boxes": (TIGHT_A, TIGHT_B),
         "font_size_pt": 12.0,
         "em_width_pt": 12.0,
         "base_font_name": "Helvetica-Bold",
@@ -134,10 +139,18 @@ class TestRawSpan:
         assert not hasattr(value, "__dict__")
 
     def test_int_coordinates_and_size_are_stored_as_floats(self):
-        value = span(text="A", bbox=(10, 20, 16, 32), char_boxes=((10, 20, 16, 32),), font_size_pt=12, object_index=0)
+        value = span(
+            text="A",
+            bbox=(10, 20, 16, 32),
+            char_boxes=((10, 20, 16, 32),),
+            tight_boxes=((11, 22, 15, 31),),
+            font_size_pt=12,
+            object_index=0,
+        )
 
         assert [type(part) for part in value.bbox] == [float] * 4
         assert [type(part) for part in value.char_boxes[0]] == [float] * 4
+        assert [type(part) for part in value.tight_boxes[0]] == [float] * 4
         assert type(value.font_size_pt) is float
 
     def test_negative_font_size_and_empty_font_name_are_preserved(self):
@@ -177,6 +190,27 @@ class TestRawSpan:
                 id="bbox-not-union",
             ),
             pytest.param({"bbox": (10.0, 20.0, 22.0)}, ValueError, "bbox must have 4 values, got 3", id="bbox-len"),
+            pytest.param(
+                {"tight_boxes": [TIGHT_A, TIGHT_B]}, TypeError, "tight_boxes must be a tuple, got list", id="tight-list"
+            ),
+            pytest.param(
+                {"tight_boxes": (TIGHT_A,)},
+                ValueError,
+                "tight_boxes must hold one box per char of text: 1 boxes for 2 chars",
+                id="tight-count",
+            ),
+            pytest.param(
+                {"tight_boxes": (TIGHT_A, (21.0, 23.0, 17.0, 32.0))},
+                ValueError,
+                "tight_boxes[1] must have x0 <= x1 and y0 <= y1",
+                id="tight-reversed",
+            ),
+            pytest.param(
+                {"tight_boxes": (TIGHT_A, (17.0, float("inf"), 21.0, 32.0))},
+                ValueError,
+                "tight_boxes[1][1] must be finite",
+                id="tight-inf",
+            ),
             pytest.param({"font_size_pt": float("inf")}, ValueError, "font_size_pt must be finite", id="size-inf"),
             pytest.param({"base_font_name": None}, TypeError, "base_font_name must be a str, got None", id="font"),
             pytest.param({"is_bold": 1}, TypeError, "is_bold must be a bool, got 1 (int)", id="bold-int"),
@@ -256,6 +290,13 @@ class TestRawSpan:
     def test_invalid_field_raises(self, overrides, error, message):
         with pytest.raises(error, match=re.escape(message)):
             span(**overrides)
+
+    def test_tight_boxes_may_reach_past_the_loose_boxes_and_never_make_the_bbox(self):
+        # A glyph may be wider than its advance (an italic f) or taller than the font's ascent.
+        value = span(tight_boxes=(TIGHT_A, (15.0, 18.0, 25.0, 32.0)))
+
+        assert value.tight_boxes[1] == (15.0, 18.0, 25.0, 32.0)
+        assert value.bbox == (10.0, 20.0, 22.0, 33.0)
 
     def test_map_errors_anywhere_in_the_text_are_kept(self):
         value = span(**FOUR_CHARS, map_errors=(0, 3))
@@ -411,7 +452,7 @@ class TestPageText:
             PageText(spans=spans, stats=page_stats)
 
     def test_a_map_error_may_be_a_pair_of_textpage_chars(self):
-        pair = span(text="\U0001d400", bbox=BOX_A, char_boxes=(BOX_A,), map_errors=(0,))
+        pair = span(text="\U0001d400", bbox=BOX_A, char_boxes=(BOX_A,), tight_boxes=(TIGHT_A,), map_errors=(0,))
 
         page = PageText(spans=(pair,), stats=stats(char_count=2, unicode_map_error_count=2))
 
@@ -563,6 +604,105 @@ class TestSpanPositions:
 
         assert got.bbox[0] == pytest.approx(-60.0, abs=TOL)
         assert got.bbox[3] < 0.0
+
+
+def object_bounds(path: Path, index: int = 0) -> tuple[float, float, float, float]:
+    """Page 1's object ``index`` bounds, ``(left, bottom, right, top)`` in PDF space, as pdfium reports them."""
+    page = pdfium.PdfDocument(path)[0]
+    edges = [ctypes.c_float() for _ in range(4)]
+    assert pdfium_c.FPDFPageObj_GetBounds(pdfium_c.FPDFPage_GetObject(page.raw, index), *edges)
+    left, bottom, right, top = (edge.value for edge in edges)
+    return left, bottom, right, top
+
+
+def displayed(box, rotate: int, crop_box) -> tuple[float, float, float, float]:
+    """PDF-space ``box`` (left, bottom, right, top) of the 400 x 300 page, displayed under ``rotate``, ``crop_box``."""
+    crop_x0, crop_y0, crop_x1, crop_y1 = crop_box or (0.0, 0.0, 400.0, 300.0)
+    left, bottom, right, top = box
+    corners = [
+        display_point(x - crop_x0, 300.0 - y - crop_y0, rotate, crop_x1 - crop_x0, crop_y1 - crop_y0)
+        for x in (left, right)
+        for y in (bottom, top)
+    ]
+    xs, ys = [corner[0] for corner in corners], [corner[1] for corner in corners]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+class TestTightBoxes:
+    """Tight boxes are pdfium's glyph bounds (FPDFText_GetCharBox), displayed as the loose ones are.
+
+    Glyph outlines come from the font pdfium substitutes for Helvetica, which
+    differs by platform, so glyph edges are read from pdfium in the same run
+    (the object's bounds) or pinned against the loose box, never as numbers.
+    """
+
+    @pytest.mark.parametrize("crop_box", CROPS)
+    @pytest.mark.parametrize("rotate", ROTATIONS)
+    def test_they_make_up_the_text_objects_bounds_each_inside_its_loose_box(self, tmp_path, rotate, crop_box):
+        path = one_page(tmp_path, TextRun("Hix", x=120.0, y=150.0, size=20.0), rotate=rotate, crop_box=crop_box)
+        (got,) = spans_of(path)
+
+        # The object's bounds, which v4 measured, are the union of its glyphs.
+        bounds = displayed(object_bounds(path), rotate, crop_box)
+        assert _pdfium_common.union_box(got.tight_boxes) == pytest.approx(bounds, abs=0.01)
+        for loose, tight in zip(got.char_boxes, got.tight_boxes, strict=True):
+            # H, i and x lie inside their advance, between the font's descent and ascent.
+            assert loose[0] <= tight[0] < tight[2] <= loose[2] and loose[1] <= tight[1] < tight[3] <= loose[3]
+
+    def test_a_hanging_numerals_is_its_ink_inside_its_advance(self, tmp_path):
+        # A list numeral hung in the margin: "1." from x 60, its text from 72 (baseline y 100, displayed 200).
+        numeral, text = spans_of(content_page(tmp_path, b"BT /F1 12 Tf 60 100 Td (1.) Tj 12 0 Td (Text) Tj ET"))
+        loose, tight = numeral.char_boxes[0], numeral.tight_boxes[0]
+
+        # The loose box is the advance from the origin, ascent to descent ...
+        assert (loose[0], loose[2]) == pytest.approx((60.0, 60.0 + stringWidth("1", "Helvetica", 12.0)), abs=1e-3)
+        assert loose[1] < 200.0 - 8.0 and loose[3] > 200.0
+        # ... the tight box is the glyph: in from both ends of the advance, standing on the baseline.
+        assert loose[0] + 0.5 < tight[0] < tight[2] < loose[2] - 0.5
+        assert loose[1] < tight[1] and tight[3] == pytest.approx(200.0, abs=0.01)
+        # So between ink the numeral stands further from its text than between advances.
+        ink_gap = text.tight_boxes[0][0] - numeral.tight_boxes[-1][2]
+        assert ink_gap > text.char_boxes[0][0] - numeral.char_boxes[-1][2] + 1.0
+
+    @pytest.mark.parametrize("size", [12.0, 24.0])
+    def test_a_spaces_is_its_advance_on_the_baseline_a_thousandth_of_an_em_high(self, tmp_path, size):
+        # A space has no outline: pdfium stands in its advance, 1/1000 em across, on the baseline. That
+        # is no ink, so the XY-cut leaves whitespace out when it measures ink.
+        (got,) = spans_of(content_page(tmp_path, b"BT /F1 %g Tf 72 100 Td (a b) Tj ET" % size))
+        loose, tight = got.char_boxes[1], got.tight_boxes[1]
+
+        assert loose[2] - loose[0] == pytest.approx(stringWidth(" ", "Helvetica", size), abs=1e-3)
+        assert tight == pytest.approx((loose[0], 200.0 - size / 1000.0, loose[2], 200.0), abs=1e-4)
+
+    def test_a_box_pdfium_reports_reversed_is_put_in_order(self, tmp_path, monkeypatch):
+        path = one_page(tmp_path, TextRun("Hix", x=120.0, y=150.0, size=20.0))
+        (expected,) = spans_of(path)
+        real = pdfium_c.FPDFText_GetCharBox
+
+        def reversed_edges(textpage, index, left, right, bottom, top):
+            ok = real(textpage, index, left, right, bottom, top)
+            left.value, right.value, bottom.value, top.value = right.value, left.value, top.value, bottom.value
+            return ok
+
+        monkeypatch.setattr(pdfium_c, "FPDFText_GetCharBox", reversed_edges)
+        (got,) = spans_of(path)
+
+        assert got.tight_boxes == expected.tight_boxes
+
+    def test_a_turned_runs_are_its_glyphs_turned_from_its_baseline(self, tmp_path):
+        # "1 Hi" a quarter turn anticlockwise, its baseline on x 200: it reads up the page, glyph tops toward -x.
+        (got,) = spans_of(content_page(tmp_path, b"BT /F1 12 Tf 0 1 -1 0 200 100 Tm (1 Hi) Tj ET"))
+
+        assert got.text == "1 Hi"
+        for char, loose, tight in zip(got.text, got.char_boxes, got.tight_boxes, strict=True):
+            if char == " ":
+                # The space's stand-in: its advance along the run, 1/1000 em across, on the baseline.
+                assert tight == pytest.approx((200.0 - 0.012, loose[1], 200.0, loose[3]), abs=1e-4)
+                continue
+            # A glyph lies inside its loose box along the run, and across it from its baseline (the loose
+            # box reaches past it by the font's descent) to its top.
+            assert loose[1] < tight[1] < tight[3] < loose[3]
+            assert loose[0] < tight[0] and tight[2] == pytest.approx(200.0, abs=0.01) and 200.0 < loose[2]
 
 
 class TestSpanStyle:
@@ -824,6 +964,31 @@ class TestUnicode:
             dropped_text_objects=0,
             empty_text_objects=0,
         )
+
+    def test_a_pairs_boxes_cover_both_halves(self, tmp_path, monkeypatch):
+        # pdfium gives both halves of a pair (textpage chars 1 and 2 here) one box, loose and tight alike;
+        # were the low half's to reach further, the pair's char would cover it.
+        path = cid_page(tmp_path, b"00020001")
+        (before,) = page_text(open_document(path), 0).spans
+        real_loose, real_tight = pdfium_c.FPDFText_GetLooseCharBox, pdfium_c.FPDFText_GetCharBox
+
+        def wider_loose(textpage, index, rect):
+            ok = real_loose(textpage, index, rect)
+            rect.right += 5.0 if index == 2 else 0.0
+            return ok
+
+        def wider_tight(textpage, index, left, right, bottom, top):
+            ok = real_tight(textpage, index, left, right, bottom, top)
+            right.value += 5.0 if index == 2 else 0.0
+            return ok
+
+        monkeypatch.setattr(pdfium_c, "FPDFText_GetLooseCharBox", wider_loose)
+        monkeypatch.setattr(pdfium_c, "FPDFText_GetCharBox", wider_tight)
+        (got,) = page_text(open_document(path), 0).spans
+
+        for boxes, wider in ((before.char_boxes, got.char_boxes), (before.tight_boxes, got.tight_boxes)):
+            x0, y0, x1, y1 = boxes[1]
+            assert wider == (boxes[0], pytest.approx((x0, y0, x1 + 5.0, y1), abs=1e-4))
 
     def test_lone_surrogates_and_unmapped_codes_are_kept(self, tmp_path):
         # Preserve, not transform: A3 classifies these chars.
@@ -1530,6 +1695,11 @@ def writes_inf_box_at(char_index):
     return stand_in
 
 
+def writes_inf_tight_box(textpage, index, left, right, bottom, top):
+    right.value = float("inf")
+    return 1
+
+
 def writes_inf_size(text_object, size):
     size.value = float("inf")
     return 1
@@ -1547,6 +1717,7 @@ PDFIUM_FAILURES = [
     ("FPDFText_IsGenerated", failing(-1), "page 1: pdfium cannot read whether char 0 is generated"),
     ("FPDFText_HasUnicodeMapError", failing(-1), "page 1: pdfium cannot read whether char 0 maps to Unicode"),
     ("FPDFText_GetLooseCharBox", failing(0), "page 1: pdfium cannot read the box of char 0"),
+    ("FPDFText_GetCharBox", failing(0), "page 1: pdfium cannot read the tight box of char 0"),
     ("FPDFText_GetMatrix", failing(0), "page 1: pdfium cannot read the matrix of char 0"),
     ("FPDFTextObj_GetFont", failing(None), "page 1: pdfium cannot read the font of object 0"),
     ("FPDFFont_GetFlags", failing(-1), "page 1: pdfium cannot read the font flags of object 0"),
@@ -1603,6 +1774,7 @@ class TestNonFiniteText:
         "function,stand_in",
         [
             pytest.param("FPDFText_GetLooseCharBox", writes_inf_box, id="box"),
+            pytest.param("FPDFText_GetCharBox", writes_inf_tight_box, id="tight-box"),
             pytest.param("FPDFTextObj_GetFontSize", writes_inf_size, id="font-size"),
         ],
     )

@@ -95,8 +95,27 @@ class TestModuleImports:
         import datagrunt
         import datagrunt.pdf
 
+        names = {"LatticeCell", "LatticeTable", "LatticeResult", "find_lattice_tables"}
+        names |= {"TextBlock", "TextCell", "TextLine", "text_blocks", "text_lines"}
+        names |= {"StreamHeading", "StreamKeyValue", "StreamList", "StreamListItem", "StreamParagraph"}
+        names |= {"StreamTable", "classify_blocks", "stream_layout"}
         for package in (datagrunt, datagrunt.pdf):
-            assert not {"LatticeCell", "LatticeTable", "LatticeResult", "find_lattice_tables"} & set(dir(package))
+            assert not names & set(dir(package))
+
+    def test_names_its_public_api(self):
+        expected = ["ApartLine", "FigureSlot", "LatticeCell", "LatticeResult", "LatticeTable", "PageLayout"]
+        expected += ["StreamHeading", "StreamKeyValue", "StreamList", "StreamListItem", "StreamParagraph"]
+        expected += ["StreamTable", "TextBlock", "TextCell", "TextLine"]
+        expected += [
+            "classify_blocks",
+            "find_lattice_tables",
+            "page_layout",
+            "stream_layout",
+            "text_blocks",
+            "text_lines",
+        ]
+
+        assert layout.__all__ == expected
 
 
 class TestLatticeCell:
@@ -149,6 +168,25 @@ class TestLatticeTable:
         with pytest.raises(dataclasses.FrozenInstanceError):
             value.n_rows = 4
         assert not hasattr(value, "__dict__")
+
+    def test_turn_defaults_to_upright(self):
+        assert table(MERGED, 3, 3).turn == 0
+
+    @pytest.mark.parametrize("turn", [0, 90, 270])
+    def test_turn_is_a_reading_turn(self, turn):
+        assert dataclasses.replace(table(MERGED, 3, 3), turn=turn).turn == turn
+
+    @pytest.mark.parametrize(
+        "turn,error,message",
+        [
+            pytest.param(180, ValueError, "turn must be 0, 90 or 270, got 180", id="180"),
+            pytest.param(True, TypeError, "turn must be an int, got True (bool)", id="bool"),
+            pytest.param(-90, ValueError, "turn must be >= 0, got -90", id="negative"),
+        ],
+    )
+    def test_turn_must_be_a_reading_turn(self, turn, error, message):
+        with pytest.raises(error, match=f"^{re.escape(message)}$"):
+            dataclasses.replace(table(MERGED, 3, 3), turn=turn)
 
     def test_grid_puts_a_merged_cells_text_top_left_and_blanks_what_it_spans(self):
         # v4 / pdfplumber's convention: no text is duplicated into the positions a merged cell covers.
@@ -725,6 +763,20 @@ class TestCellText:
 
         assert texts(TWO_BY_TWO, right, chars("left", 10.0, 10.0)) == [[joined, "", "", ""]]
 
+    @pytest.mark.parametrize(
+        "left,right,joined",
+        [
+            pytest.param("20", "°C", "20°C", id="degree"),
+            pytest.param("Price", ",", "Price,", id="punctuation"),
+            pytest.param("(", "net", "(net", id="opening-bracket"),
+        ],
+    )
+    def test_runs_next_to_degree_or_punctuation_join_with_nothing(self, left, right, joined):
+        # The stream pass's join (A4b): 3 pt apart, past 0.22 em, yet joined with nothing.
+        pieces = (chars(left, 10.0, 10.0), chars(right, 10.0 + 6.0 * len(left) + 3.0, 10.0))
+
+        assert texts(TWO_BY_TWO, *pieces) == [[joined, "", "", ""]]
+
     def test_a_raised_run_overlapping_the_line_by_45_percent_or_more_stays_on_it(self):
         # '2' is 6 pt tall and overlaps the 12 pt line by 2.76 pt: 0.46 of the smaller height.
         got = texts(TWO_BY_TWO, chars("m", 10.0, 10.0), chars("2", 16.0, 6.76, height=6.0))
@@ -901,6 +953,13 @@ class TestFindLatticeTables:
 
         assert [table.grid() for table in result.tables] == [SPEC_GRID]
         assert result.tables[0].has_header is True
+
+    @pytest.mark.parametrize("rotate,turn", [(0, 0), (90, 90), (270, 270), (180, 0)])
+    def test_a_table_records_the_turn_its_text_reads_at(self, tmp_path, rotate, turn):
+        # /Rotate 90 shows text running down the page (turn 90), 270 up it; 180 reads across (right to left).
+        result = read_tables(tmp_path, *rules(XS, YS), *written(SPEC, XS, YS), rotate=rotate)
+
+        assert [table.turn for table in result.tables] == [turn]
 
     def test_a_table_upside_down_reads_in_display_order(self, tmp_path):
         # Known limitation: pdfium's boxes cannot tell upside-down text from right-to-left text (both

@@ -631,16 +631,30 @@ class KeyValue(_Element):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class BulletList(_Element):
-    """A non-empty list of non-blank items, numbered when ``ordered``."""
+    """A non-empty list of non-blank items, numbered when ``ordered``.
+
+    Attributes:
+        items: Each item's text, its marker not included.
+        ordered: True if its markers number the items.
+        markers: Each item's marker as written ("•", "1.", "(a)"), one per
+            item and non-blank, or empty when not recorded. Kept, not
+            rendered: Markdown numbers or bullets the items itself.
+    """
 
     items: tuple[str, ...]
     ordered: bool
+    markers: tuple[str, ...] = ()
 
     def _validate_fields(self) -> None:
         str_tuple("items", self.items)
         if not self.items:
             raise ValueError("items must contain at least one item")
         _check_bool("ordered", self.ordered)
+        str_tuple("markers", self.markers)
+        if self.markers and len(self.markers) != len(self.items):
+            raise ValueError(
+                f"markers must be empty or hold one marker per item ({len(self.items)}), got {len(self.markers)}"
+            )
 
     def _render_markdown(self) -> str:
         """Render one ``- item`` (or ``N. item``) entry per item.

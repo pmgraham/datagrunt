@@ -19,6 +19,12 @@ Text (#365 T2), pinned by ``tests/pdf_tests/test_pdfium_spans.py``:
   enclosing form's matrix applied; ``get_bounds()`` and
   ``FPDFPageObj_GetMatrix`` of an object inside a form are in the form's
   space. pdfium parses forms at most 40 levels deep.
+- A char's tight box (``FPDFText_GetCharBox``) is its glyph's bounds, page
+  space as its loose box is; a text object's bounds (``FPDFPageObj_GetBounds``,
+  what v4 measured) are the union of its chars' tight boxes. A char with no
+  outline (a space) gets pdfium's stand-in: its advance along the baseline,
+  1/1000 em across it. Glyph outlines come from the font pdfium uses, which
+  for a non-embedded font differs by platform.
 - A non-BMP char is two textpage chars, a UTF-16 surrogate pair with equal
   boxes. An unmapped char code reads as itself, flagged by
   ``FPDFText_HasUnicodeMapError`` (its offset is in ``RawSpan.map_errors``);
@@ -79,6 +85,13 @@ class RawSpan:
         bbox: The union of ``char_boxes``.
         char_boxes: One box per char of ``text``: pdfium's loose char box
             (advance width by the font's ascent-to-descent height).
+        tight_boxes: One box per char of ``text``: pdfium's tight char box
+            (``FPDFText_GetCharBox``), the glyph's own bounds, where its ink
+            is: the union of an object's is its bounds, which v4 measured. A
+            char with no outline (a space) has pdfium's stand-in, its
+            advance along the baseline by 1/1000 em, which is no ink. A glyph
+            may reach past its loose box (an italic overhang, an accent over
+            the ascent), so ``bbox`` is not their union.
         font_size_pt: The height of the text's em under its page-space
             matrix (form matrices included), measured across its baseline
             (:func:`em_size`): the ``Tf`` size for upright, turned or
@@ -128,6 +141,7 @@ class RawSpan:
     text: str
     bbox: Box
     char_boxes: tuple[Box, ...]
+    tight_boxes: tuple[Box, ...]
     font_size_pt: float
     em_width_pt: float
     base_font_name: str
@@ -164,17 +178,22 @@ class RawSpan:
             raise TypeError(f"text must be a str, got {type(self.text).__name__}")
         if not self.text:
             raise ValueError("text must not be empty")
-        if not isinstance(self.char_boxes, tuple):
-            raise TypeError(f"char_boxes must be a tuple, got {type(self.char_boxes).__name__}")
-        if len(self.char_boxes) != len(self.text):
-            counts = f"{len(self.char_boxes)} boxes for {len(self.text)} chars"
-            raise ValueError(f"char_boxes must hold one box per char of text: {counts}")
-        boxes = tuple(ordered_box(f"char_boxes[{i}]", box) for i, box in enumerate(self.char_boxes))
+        boxes = _per_char_boxes("char_boxes", self.char_boxes, len(self.text))
         bbox = ordered_box("bbox", self.bbox)
         if bbox != union_box(boxes):
             raise ValueError(f"bbox must be the union of char_boxes, {union_box(boxes)!r}, got {self.bbox!r}")
         object.__setattr__(self, "char_boxes", boxes)
+        object.__setattr__(self, "tight_boxes", _per_char_boxes("tight_boxes", self.tight_boxes, len(self.text)))
         object.__setattr__(self, "bbox", bbox)
+
+
+def _per_char_boxes(name: str, boxes: object, count: int) -> tuple[Box, ...]:
+    """Require ``boxes`` to be a tuple of ``count`` ordered, finite boxes (one per char); return them as floats."""
+    if not isinstance(boxes, tuple):
+        raise TypeError(f"{name} must be a tuple, got {type(boxes).__name__}")
+    if len(boxes) != count:
+        raise ValueError(f"{name} must hold one box per char of text: {len(boxes)} boxes for {count} chars")
+    return tuple(ordered_box(f"{name}[{index}]", box) for index, box in enumerate(boxes))
 
 
 def _check_offsets(name: str, offsets: object, low: int, high: int) -> None:
@@ -459,16 +478,31 @@ def _read_style(
 
 
 def _loose_box(textpage: pdfium_c.FPDF_TEXTPAGE, char_index: int) -> Box:
-    """Read a char's loose box as ``(left, bottom, right, top)`` in PDF user space.
+    """Read a char's loose box as ``(left, bottom, right, top)`` in PDF user space (:func:`_in_order`)."""
+    rect = pdfium_c.FS_RECTF()
+    if not pdfium_c.FPDFText_GetLooseCharBox(textpage, char_index, rect):
+        raise PdfiumFailure(f"read the box of char {char_index}")
+    return _in_order(rect.left, rect.bottom, rect.right, rect.top)
+
+
+def _tight_box(textpage: pdfium_c.FPDF_TEXTPAGE, char_index: int) -> Box:
+    """Read a char's tight box (its glyph's bounds) as ``(left, bottom, right, top)`` in PDF user space.
+
+    Edges as :func:`_in_order` gives them.
+    """
+    left, right, bottom, top = (ctypes.c_double() for _ in range(4))
+    if not pdfium_c.FPDFText_GetCharBox(textpage, char_index, left, right, bottom, top):
+        raise PdfiumFailure(f"read the tight box of char {char_index}")
+    return _in_order(left.value, bottom.value, right.value, top.value)
+
+
+def _in_order(left: float, bottom: float, right: float, top: float) -> Box:
+    """A box pdfium reports, with its edges in order if they are finite.
 
     A box that is not finite is returned as pdfium reports it (the caller
     then skips the char's object); a finite one has its edges in order, so a
     mirrored (negative-size) char still reads as a box.
     """
-    rect = pdfium_c.FS_RECTF()
-    if not pdfium_c.FPDFText_GetLooseCharBox(textpage, char_index, rect):
-        raise PdfiumFailure(f"read the box of char {char_index}")
-    left, bottom, right, top = rect.left, rect.bottom, rect.right, rect.top
     if not all(math.isfinite(edge) for edge in (left, bottom, right, top)):
         return left, bottom, right, top
     return min(left, right), min(bottom, top), max(left, right), max(bottom, top)
@@ -481,6 +515,7 @@ class _OwnedChar(NamedTuple):
     code: int
     map_error: bool
     box: Box
+    tight: Box
 
 
 class _Textpage(NamedTuple):
@@ -490,7 +525,7 @@ class _Textpage(NamedTuple):
     generated_count: int
     ownerless_count: int
     styles: dict[int, _Style]
-    # Owners with a char box, font size or em width that is not finite: no span takes their chars.
+    # Owners with a char box (loose or tight), font size or em width that is not finite: no span takes their chars.
     skipped: frozenset[int]
 
 
@@ -513,6 +548,7 @@ class _SpanBuilder:
         self._owner = 0
         self._chars: list[str] = []
         self._boxes: list[Box] = []
+        self._tight: list[Box] = []
         self._breaks: list[int] = []
         self._errors: list[int] = []
         self._break_pending = False
@@ -543,6 +579,7 @@ class _SpanBuilder:
             high = ord(self._chars[-1])
             self._chars[-1] = chr(0x10000 + ((high - _HIGH_SURROGATES.start) << 10) + (code - _LOW_SURROGATES.start))
             self._boxes[-1] = union_box((self._boxes[-1], char.box))
+            self._tight[-1] = union_box((self._tight[-1], char.tight))
             self._mark_unmapped(char, len(self._chars) - 1)
             return
         self._mark_unmapped(char, len(self._chars))
@@ -550,6 +587,7 @@ class _SpanBuilder:
         # keeps its place (and is no surrogate, so it never pairs).
         self._chars.append(chr(code) if code <= _MAX_CODE_POINT else _REPLACEMENT_CHAR)
         self._boxes.append(char.box)
+        self._tight.append(char.tight)
 
     def _mark_unmapped(self, char: _OwnedChar, offset: int) -> None:
         """Record span char ``offset`` as a map error if ``char`` (one of its textpage chars) is one; once each."""
@@ -570,13 +608,14 @@ class _SpanBuilder:
                 text="".join(self._chars),
                 bbox=union_box(boxes),
                 char_boxes=boxes,
+                tight_boxes=tuple(self._to_display(box) for box in self._tight),
                 object_index=self._object_indices[self._owner],
                 generated_breaks=tuple(self._breaks),
                 map_errors=tuple(self._errors),
                 **self._styles[self._owner]._asdict(),
             )
         )
-        self._chars, self._boxes, self._breaks, self._errors = [], [], [], []
+        self._chars, self._boxes, self._tight, self._breaks, self._errors = [], [], [], [], []
 
 
 def _unmapped(char: _OwnedChar) -> bool:
@@ -621,21 +660,22 @@ def _read_textpage(textpage: pdfium_c.FPDF_TEXTPAGE, object_indices: dict[int, i
             if owner not in object_indices:
                 raise PdfiumFailure(f"read the text object of char {char_index}: it is not in the page's object tree")
             styles[owner] = _read_style(textpage, text_object, char_index, object_indices[owner])
-        box = _loose_box(textpage, char_index)
+        box, tight = _loose_box(textpage, char_index), _tight_box(textpage, char_index)
         style = styles[owner]
-        if not all(math.isfinite(value) for value in (*box, style.font_size_pt, style.em_width_pt)):
+        if not all(math.isfinite(value) for value in (*box, *tight, style.font_size_pt, style.em_width_pt)):
             skipped.add(owner)
-        chars.append(_OwnedChar(owner, code, map_error, box))
+        chars.append(_OwnedChar(owner, code, map_error, box, tight))
     return _Textpage(chars, generated, ownerless, styles, frozenset(skipped))
 
 
 def collect_text(textpage: pdfium_c.FPDF_TEXTPAGE, to_display: Callable[[Box], Box], walk: ObjectWalk) -> CollectedText:
     """Read every textpage char once: count them and group the owned, non-generated ones.
 
-    A text object with a char box, font size or em width that is not finite
-    (pdfium places it nowhere) is skipped whole and counted; a skipped char
-    ends the span it interrupts. A text object that owns no char is empty if
-    it draws no glyph with extent (``walk.glyphless``), else dropped.
+    A text object with a char box (loose or tight), font size or em width
+    that is not finite (pdfium places it nowhere) is skipped whole and
+    counted; a skipped char ends the span it interrupts. A text object that
+    owns no char is empty if it draws no glyph with extent
+    (``walk.glyphless``), else dropped.
 
     Args:
         textpage: The page's loaded textpage.
