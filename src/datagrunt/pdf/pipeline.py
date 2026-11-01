@@ -7,6 +7,38 @@ Internal: not exported from ``datagrunt`` or ``datagrunt.pdf``. A7's
 and runs the spec's construction checks (invariant 2) when it is built, so
 a bad option fails before any work. :class:`PDFSource` is where a document
 is opened from (its path and password), in this process or in a worker.
+
+:func:`extract_page_at` is one page's steps, in order; no stage is skipped:
+
+1. A2 :func:`~datagrunt.pdf.pdfium_engine.extract_page`. A
+   :class:`~datagrunt.pdf.pdfium_engine.PageFailure` raises
+   :class:`~datagrunt.pdf.exceptions.PDFCorruptError` naming the page under
+   ``strict``; else it is :func:`_fallback_page`'s.
+2. A2 :func:`~datagrunt.pdf.pdfium_engine.recover_dropped_text`, when the
+   page's textpage drops text objects (``TextStats.dropped_text_objects``
+   over 0).
+3. A3 :func:`~datagrunt.pdf.quality.assess_page`, with the ``ocr`` option
+   and the recovery.
+4. The route: a digital or hybrid page is A4a's lattice tables, then A4b's
+   :func:`~datagrunt.pdf.assembly.assemble_page`; a vision page is
+   :func:`_vision_page`'s.
+5. Isolation: any other exception (an ``Exception``; an interrupt is never
+   caught) is an error page whose ``error`` is ``"<type>: <message>"``,
+   recorded, never dropped. Under ``strict`` it raises a PDFCorruptError
+   naming the page, chained from it (a PDFCorruptError that already names
+   the page is raised as it is).
+
+Two stand-ins hold A5b's place, each one small function A5b replaces:
+:func:`_vision_page` (a vision page is ``assemble_page``'s
+``"ocr_unavailable"`` page) and :func:`_fallback_page` (a page A2 cannot
+read is an error page).
+
+An error page (A1: no elements, no quality, never verified) is routed
+``"vision"``, the spec's route for a page whose extraction fails (render
+and OCR, A5b). Its size is the page's, read with
+:func:`~datagrunt.pdf.pdfium_engine.page_geometry`; when that cannot be
+read either, it is pdfium's default page size (612 x 792 pt, what pdfium
+reads for an empty MediaBox), and a warning says so and why.
 """
 
 from dataclasses import dataclass, field
@@ -14,14 +46,32 @@ from pathlib import Path
 from typing import get_args
 
 from datagrunt.pdf._validate import choice_str, int_at_least, strict_bool
-from datagrunt.pdf.assembly import MIN_IMAGE_DIMENSION
-from datagrunt.pdf.pdfium_engine import _checked_password, _checked_path
-from datagrunt.pdf.quality import OcrMode
+from datagrunt.pdf.assembly import MIN_IMAGE_DIMENSION, assemble_page
+from datagrunt.pdf.elements import Page
+from datagrunt.pdf.exceptions import PDFCorruptError
+from datagrunt.pdf.layout import find_lattice_tables
+from datagrunt.pdf.pdfium_engine import (
+    DocumentHandle,
+    PageFailure,
+    RawPage,
+    _checked_index,
+    _checked_password,
+    _checked_path,
+    extract_page,
+    open_document,
+    page_geometry,
+    recover_dropped_text,
+)
+from datagrunt.pdf.quality import OcrMode, PageAssessment, assess_page
 from datagrunt.pdf.render import _MIN_RENDER_PIXELS, _MIN_TARGET_DPI
 
-__all__ = ["PDFSource", "PipelineOptions"]
+__all__ = ["PDFSource", "PipelineOptions", "extract_page_at"]
 
 _OCR_MODES: tuple[OcrMode, ...] = get_args(OcrMode)
+
+# pdfium's own default page size (US Letter), as it reads an empty MediaBox: an error page's size when its own
+# cannot be read.
+_DEFAULT_PAGE_SIZE = (612.0, 792.0)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -94,3 +144,126 @@ class PDFSource:
     def __post_init__(self) -> None:
         object.__setattr__(self, "path", _checked_path(self.path, "source").absolute())
         _checked_password(self.password)
+
+
+def extract_page_at(handle_source: PDFSource, index: int, options: PipelineOptions) -> Page:
+    """Extract the page at 0-based ``index``: steps 1-5 (see the module notes), on a load of its own.
+
+    Picklable in and out (a worker's step): the document is opened from
+    ``handle_source`` and closed before returning, on every path.
+
+    Raises:
+        TypeError: If ``handle_source`` is not a PDFSource, ``options`` not
+            a PipelineOptions, or ``index`` not an int (bool rejected).
+        IndexError: If ``index`` is outside ``0..page_count - 1``.
+        FileNotFoundError, PermissionError, PDFEncryptedError: As
+            :func:`~datagrunt.pdf.pdfium_engine.open_document` raises them;
+            and PDFCorruptError for an unreadable file.
+        PDFCorruptError: Under ``options.strict``, for a page that fails,
+            naming it (``page_number`` is set).
+    """
+    _check_arguments(handle_source, options)
+    with open_document(handle_source.path, password=handle_source.password) as handle:
+        _checked_index(index, handle.page_count)
+        return _isolated_page(handle, handle_source, index, options)
+
+
+def _check_arguments(handle_source: object, options: object) -> None:
+    """Require a PDFSource and a PipelineOptions."""
+    if not isinstance(handle_source, PDFSource):
+        raise TypeError(f"handle_source must be a PDFSource, got {type(handle_source).__name__}")
+    if not isinstance(options, PipelineOptions):
+        raise TypeError(f"options must be a PipelineOptions, got {type(options).__name__}")
+
+
+def _isolated_page(handle: DocumentHandle, source: PDFSource, index: int, options: PipelineOptions) -> Page:
+    """Steps 1-4 for the page, isolated (step 5): a failure is an error page, or under ``strict`` raises."""
+    page_number = index + 1
+    try:
+        return _routed_page(handle, source, index, options)
+    except Exception as exc:  # step 5: per-page isolation; an interrupt (BaseException) is never caught
+        if not options.strict:
+            return _error_page(handle, index, f"{type(exc).__name__}: {exc}")
+        if isinstance(exc, PDFCorruptError) and exc.page_number == page_number:
+            raise
+        message = f"page {page_number}: {type(exc).__name__}: {exc}"
+        raise PDFCorruptError(message, page_number=page_number) from exc
+
+
+def _routed_page(handle: DocumentHandle, source: PDFSource, index: int, options: PipelineOptions) -> Page:
+    """Steps 1-4: A2, recovery when the page drops text, A3, then the page's route."""
+    raw = extract_page(handle, index)
+    if isinstance(raw, PageFailure):
+        if options.strict:
+            raise PDFCorruptError(raw.message, page_number=raw.page_number)
+        return _fallback_page(handle, index, raw)
+    dropped = raw.text.stats.dropped_text_objects
+    recovered = recover_dropped_text(handle, index) if dropped > 0 else None
+    assessment = assess_page(raw, ocr=options.ocr, recovered=recovered)
+    if assessment.route == "vision":
+        return _vision_page(raw, assessment, source, options)
+    return _assembled_page(raw, assessment, source, options)
+
+
+def _assembled_page(raw: RawPage, assessment: PageAssessment, source: PDFSource, options: PipelineOptions) -> Page:
+    """A digital or hybrid page: A4a's lattice tables, then A4b's assembly."""
+    lattice = find_lattice_tables(raw.segments.segments, assessment.pieces)
+    return assemble_page(
+        raw,
+        assessment,
+        lattice,
+        source=source.path,
+        password=source.password,
+        min_image_dimension=options.min_image_dimension,
+    )
+
+
+def _vision_page(raw: RawPage, assessment: PageAssessment, source: PDFSource, options: PipelineOptions) -> Page:
+    """A vision page. A stand-in for A5b's ``vision_page``, which replaces this function.
+
+    Until A5b lands, a vision page is :func:`_assembled_page`'s: A4b's
+    :func:`~datagrunt.pdf.assembly.assemble_page` makes it an
+    ``"ocr_unavailable"`` page (A1: its digital text kept as its elements,
+    never ``integrity_verified``), with a warning that OCR has not run.
+    """
+    return _assembled_page(raw, assessment, source, options)
+
+
+def _fallback_page(handle: DocumentHandle, index: int, failure: PageFailure) -> Page:
+    """A page A2 could not read. A stand-in for A5b's ``fallback_page``, which replaces this function.
+
+    Until A5b lands (render and OCR, an ``"ocr_fallback"`` page), it is an
+    error page whose ``error`` is the stage's PDFCorruptError and the stage.
+    """
+    return _error_page(handle, index, f"PDFCorruptError: {failure.message} (stage {failure.stage!r})")
+
+
+def _error_page(handle: DocumentHandle, index: int, error: str) -> Page:
+    """The A1 error page of the page at ``index``: no elements, no quality, routed vision (see the module notes)."""
+    (width, height), warnings = _error_page_size(handle, index)
+    return Page(
+        page_number=index + 1,
+        width_pt=width,
+        height_pt=height,
+        status="error",
+        route="vision",
+        quality=None,
+        error=error,
+        warnings=warnings,
+    )
+
+
+def _error_page_size(handle: DocumentHandle, index: int) -> tuple[tuple[float, float], tuple[str, ...]]:
+    """The page's displayed size, or pdfium's default page size and a warning saying why."""
+    try:
+        geometry = page_geometry(handle, index)
+    except Exception as exc:  # an error page is never dropped: its size is read when it can be
+        return _DEFAULT_PAGE_SIZE, (_default_size_warning(f"{type(exc).__name__}: {exc}"),)
+    return (geometry.width_pt, geometry.height_pt), ()
+
+
+def _default_size_warning(reason: str) -> str:
+    """The warning of an error page whose size is pdfium's default page size, not its own."""
+    width, height = _DEFAULT_PAGE_SIZE
+    default = f"{width:g} x {height:g} pt is pdfium's default page size, not this page's"
+    return f"the page's size could not be read ({reason}); {default}"
