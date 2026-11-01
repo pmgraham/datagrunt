@@ -11,6 +11,7 @@ control what it does; tests that need the real one skip when it is absent
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -561,6 +562,107 @@ def words_of(page: RenderedPage, **options) -> OCRResult:
     return ocr_words(bands(page), **{**arguments, "timeout_s": 30.0, **options})
 
 
+NO_TESSERACT = "no tesseract in an absolute PATH directory"
+
+
+def planted(directory: Path, version: str, marker: Path) -> Path:
+    """An executable ``tesseract`` in ``directory`` that leaves ``marker`` and answers ``--version`` as ``version``."""
+    directory.mkdir(parents=True, exist_ok=True)
+    script = directory / "tesseract"
+    script.write_text(f'#!/bin/sh\n: > "{marker}"\necho "tesseract {version}"\n')
+    script.chmod(0o755)
+    return script
+
+
+@posix_only
+class TestSearchPath:
+    """tesseract is looked up in absolute PATH directories only, and run by the absolute path found.
+
+    A relative PATH entry ("", ".", "bin") names a directory under whatever
+    the working directory is, such as the folder of untrusted PDFs: a
+    ``tesseract`` planted there must never run.
+    """
+
+    @pytest.mark.parametrize("relative", [".", "", "bin"], ids=["dot", "empty", "bin"])
+    def test_a_tesseract_planted_under_a_relative_entry_is_never_run(self, tmp_path, monkeypatch, relative):
+        work = tmp_path / "work"
+        work.mkdir()
+        monkeypatch.chdir(work)
+        planted(work / relative, "9.9.9", tmp_path / "planted-ran")
+        trusted = planted(tmp_path / "trusted", "5.3.4", tmp_path / "trusted-ran")
+        monkeypatch.setenv("PATH", os.pathsep.join([relative, str(tmp_path / "trusted")]))
+
+        assert ocr._binary() == str(trusted)
+        assert tesseract_available() is True
+        assert (tmp_path / "trusted-ran").exists()
+        assert not (tmp_path / "planted-ran").exists()
+
+    @pytest.mark.parametrize("relative", [".", "", "bin"], ids=["dot", "empty", "bin"])
+    def test_relative_entries_alone_find_no_tesseract(self, tmp_path, monkeypatch, relative):
+        monkeypatch.chdir(tmp_path)
+        planted(tmp_path / relative, "9.9.9", tmp_path / "planted-ran")
+        monkeypatch.setenv("PATH", relative)
+
+        assert ocr._binary() is None
+        assert tesseract_available() is False
+        assert orientation(PAGE_3_BY_2, timeout_s=5.0).reason == NO_TESSERACT
+        assert words_of(PAGE_3_BY_2) == OCRResult(words=(), status="unavailable", reason=NO_TESSERACT)
+        assert not (tmp_path / "planted-ran").exists()
+
+    @pytest.mark.parametrize("found", ["absolute", "relative"])
+    def test_a_match_outside_the_absolute_entries_is_refused(self, tmp_path, monkeypatch, found):
+        # Windows' shutil.which looks in the working directory first, whatever PATH says.
+        work = tmp_path / "work"
+        script = planted(work, "9.9.9", tmp_path / "planted-ran")
+        monkeypatch.chdir(work)
+        planted(tmp_path / "trusted", "5.3.4", tmp_path / "trusted-ran")
+        monkeypatch.setenv("PATH", str(tmp_path / "trusted"))
+        answer = str(script) if found == "absolute" else os.path.join(os.curdir, "tesseract")
+        monkeypatch.setattr(ocr.shutil, "which", lambda name, mode=os.F_OK | os.X_OK, path=None: answer)
+
+        assert ocr._binary() is None
+        assert tesseract_available() is False
+        assert not (tmp_path / "planted-ran").exists()
+
+    def test_a_tesseract_in_an_absolute_entry_is_used(self, tmp_path, monkeypatch):
+        trusted = planted(tmp_path / "trusted", "5.3.4", tmp_path / "trusted-ran")
+        monkeypatch.setenv("PATH", str(tmp_path / "trusted"))
+
+        assert ocr._binary() == str(trusted)
+        assert tesseract_available() is True
+        assert (tmp_path / "trusted-ran").exists()
+
+    def test_symlinks_in_the_entry_or_the_binary_are_followed_to_the_entry(self, tmp_path, monkeypatch):
+        # A symlinked PATH directory, and a symlinked binary (as Homebrew links /opt/homebrew/bin/tesseract).
+        cellar = planted(tmp_path / "cellar", "5.5.3", tmp_path / "cellar-ran")
+        (tmp_path / "bin").mkdir()
+        (tmp_path / "bin" / "tesseract").symlink_to(cellar)
+        (tmp_path / "linked").symlink_to(tmp_path / "bin", target_is_directory=True)
+        monkeypatch.setenv("PATH", str(tmp_path / "linked"))
+
+        assert ocr._binary() == str(tmp_path / "linked" / "tesseract")
+        assert tesseract_available() is True
+
+    def test_tesseract_runs_by_the_absolute_path_found(self, tmp_path, monkeypatch):
+        trusted = planted(tmp_path / "trusted", "5.3.4", tmp_path / "trusted-ran")
+        monkeypatch.setenv("PATH", str(tmp_path / "trusted"))
+        commands = []
+        popen = subprocess.Popen
+
+        def recorded(argv, *args, **kwargs):
+            commands.append(argv)
+            return popen(argv, *args, **kwargs)
+
+        monkeypatch.setattr(ocr.subprocess, "Popen", recorded)
+
+        tesseract_available()
+        orientation(PAGE_3_BY_2, timeout_s=10.0)
+        words_of(PAGE_3_BY_2)
+
+        assert [argv[0] for argv in commands] == [str(trusted)] * 3
+        assert os.path.isabs(commands[0][0])
+
+
 class TestMissingTesseract:
     """No tesseract is a recorded status, 'unavailable', never an empty success or an exception."""
 
@@ -569,9 +671,9 @@ class TestMissingTesseract:
 
         assert tesseract_available() is False
         assert orientation(PAGE_3_BY_2, timeout_s=5.0) == Orientation(
-            degrees=0, confidence=None, status="unavailable", reason="tesseract is not on PATH"
+            degrees=0, confidence=None, status="unavailable", reason=NO_TESSERACT
         )
-        assert words_of(PAGE_3_BY_2) == OCRResult(words=(), status="unavailable", reason="tesseract is not on PATH")
+        assert words_of(PAGE_3_BY_2) == OCRResult(words=(), status="unavailable", reason=NO_TESSERACT)
 
     def test_a_tesseract_that_cannot_start_is_unavailable(self, tmp_path, monkeypatch):
         missing = str(tmp_path / "gone" / "tesseract")
@@ -715,7 +817,7 @@ class TestBounds:
         monkeypatch.setattr(ocr, "_MAX_STDOUT_BYTES", 1000)
         fake_tesseract(tmp_path, monkeypatch, "head -c 1000 /dev/zero")
 
-        call = ocr._call(["tesseract"], (), 10.0)
+        call = ocr._call([ocr._binary()], (), 10.0)
 
         assert (call.status, call.reason, len(call.stdout)) == ("ok", "", 1000)
 
@@ -723,7 +825,7 @@ class TestBounds:
         monkeypatch.setattr(ocr, "_MAX_STDOUT_BYTES", 1000)
         fake_tesseract(tmp_path, monkeypatch, "head -c 1001 /dev/zero")
 
-        call = ocr._call(["tesseract"], (), 10.0)
+        call = ocr._call([ocr._binary()], (), 10.0)
 
         assert (call.status, call.reason, call.stdout) == (
             "failed",
@@ -737,7 +839,7 @@ class TestBounds:
         fake_tesseract(tmp_path, monkeypatch, "head -c 1001 /dev/zero\nexec sleep 60")
 
         began = time.monotonic()
-        call = ocr._call(["tesseract"], (), 30.0)
+        call = ocr._call([ocr._binary()], (), 30.0)
         elapsed = time.monotonic() - began
 
         assert call.status == "failed"
@@ -746,7 +848,7 @@ class TestBounds:
     def test_a_timeout_is_a_status_not_an_exception(self, tmp_path, monkeypatch):
         fake_tesseract(tmp_path, monkeypatch, "exec sleep 60")
 
-        call = ocr._call(["tesseract"], (b"P5\n1 1\n255\n", b"\x00"), 0.2)
+        call = ocr._call([ocr._binary()], (b"P5\n1 1\n255\n", b"\x00"), 0.2)
 
         assert (call.status, call.reason) == ("timeout", "tesseract did not finish within 0.2 s and was killed")
 
@@ -757,7 +859,7 @@ class TestBounds:
         monkeypatch.setattr(ocr.os, "killpg", refused)
         fake_tesseract(tmp_path, monkeypatch, "exec sleep 60")
 
-        assert ocr._call(["tesseract"], (), 0.2).status == "timeout"
+        assert ocr._call([ocr._binary()], (), 0.2).status == "timeout"
 
     def test_without_sessions_the_process_itself_is_killed(self, tmp_path, monkeypatch):
         # Windows' path: no session to kill, so the process alone.
@@ -765,7 +867,7 @@ class TestBounds:
         monkeypatch.setattr(ocr.os, "killpg", lambda pid, signal_number: pytest.fail("no session to kill"))
         fake_tesseract(tmp_path, monkeypatch, "exec sleep 60")
 
-        assert ocr._call(["tesseract"], (), 0.2).status == "timeout"
+        assert ocr._call([ocr._binary()], (), 0.2).status == "timeout"
 
 
 class FailingStdin:

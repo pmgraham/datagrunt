@@ -27,8 +27,10 @@ The tesseract CLI (never ``pytesseract``) reads the page:
   both bands of a shared strip (the same text, boxes overlapping by an IoU
   of 0.5 or more) is kept once, with its higher confidence.
 
-Each call starts ``tesseract`` from an argv list (never a shell) in its own
-session, with ``OMP_THREAD_LIMIT=1`` in its environment, and writes the
+Each call starts ``tesseract`` from an argv list (never a shell), by the
+absolute path found in an absolute PATH directory (a relative entry, which
+names a directory under the working directory, is never searched), in its
+own session, with ``OMP_THREAD_LIMIT=1`` in its environment, and writes the
 image to its stdin as a binary PGM (no temporary image file). Its stdout is
 read within :data:`_MAX_STDOUT_BYTES`; its stderr goes to an anonymous
 temporary file, of which the last 4 KiB is read. At its timeout a timer
@@ -97,7 +99,7 @@ _LANGUAGE = re.compile(r"[A-Za-z0-9_]+(?:\+[A-Za-z0-9_]+)*")
 _MAX_STDOUT_BYTES = 16 << 20
 _READ_CHUNK = 1 << 16
 _VERSION_TIMEOUT_S = 10.0
-_NOT_ON_PATH = "tesseract is not on PATH"
+_NOT_ON_PATH = "no tesseract in an absolute PATH directory"
 # POSIX: each call is its own session, so a timeout ends a wrapper script's children too.
 _OWN_SESSION = sys.platform != "win32"
 
@@ -303,7 +305,7 @@ def _checked_turn(name: str, value: object) -> int:
 
 
 def tesseract_available() -> bool:
-    """Whether ``tesseract`` is on PATH and its ``--version`` answers as tesseract within a timeout."""
+    """Whether a ``tesseract`` in an absolute PATH directory answers ``--version`` as tesseract within a timeout."""
     binary = _binary()
     if binary is None:
         return False
@@ -593,8 +595,24 @@ def _displayed_box(word: _Placed, rotation: int, displayed: tuple[int, int], dpi
 
 
 def _binary() -> str | None:
-    """The ``tesseract`` on PATH, if any."""
-    return shutil.which("tesseract")
+    """The absolute path of the ``tesseract`` in an absolute PATH directory; None if there is none.
+
+    Relative entries ("", ".", "bin") name directories under the working
+    directory, which may be a folder of untrusted files: they are never
+    searched. A match whose directory (symlinks resolved) is not one of the
+    absolute entries is refused too: Windows' ``shutil.which`` looks in the
+    working directory first, whatever PATH says. Resolved on every call.
+    """
+    directories = [entry for entry in os.environ.get("PATH", "").split(os.pathsep) if os.path.isabs(entry)]
+    if not directories:
+        return None
+    found = shutil.which("tesseract", path=os.pathsep.join(directories))
+    if found is None:
+        return None
+    trusted = {os.path.realpath(directory) for directory in directories}
+    if os.path.realpath(os.path.dirname(os.path.abspath(found))) not in trusted:
+        return None
+    return os.path.abspath(found)
 
 
 def _pgm(image: RenderedPage | Band) -> tuple[bytes, bytes]:
