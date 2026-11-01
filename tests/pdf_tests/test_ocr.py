@@ -1106,6 +1106,77 @@ class TestTesseractAvailable:
         assert time.monotonic() - began < 4.0
 
 
+@posix_only
+class TestDeadline:
+    """A deadline (#418) ends the reading: each band's call is given at most the time left; no band starts past it."""
+
+    def test_a_band_past_the_deadline_is_not_started(self, tmp_path, monkeypatch):
+        fake = fake_tesseract(tmp_path, monkeypatch, ': > "{d}/called"\n' + READS_STDIN, stdout=tsv())
+
+        result = words_of(PAGE_50_BY_1000, deadline=time.monotonic() - 1.0)
+
+        assert result == OCRResult(words=(), status="spent", reason="OCR stopped after 0 of 2 bands")
+        assert not (fake / "called").exists()
+
+    def test_a_deadline_far_off_changes_nothing(self, tmp_path, monkeypatch):
+        fake_tesseract(tmp_path, monkeypatch, READS_STDIN, stdout=tsv(row(5, (10, 20, 30, 15), "90", "fox")))
+
+        result = words_of(PAGE_50_BY_1000, deadline=time.monotonic() + 600.0)
+
+        assert (result.status, [word.text for word in result.words]) == ("ok", ["fox", "fox"])
+
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_a_call_is_cut_at_the_deadline_and_the_reading_is_spent(self, tmp_path, monkeypatch):
+        # Band 1 answers at once (~0.01 s here); band 2's call would take 60 s: it is given the ~1 s left, not 30 s.
+        body = 'cat > /dev/null\nif [ -e "{d}/called" ]; then exec sleep 60; fi\n: > "{d}/called"\ncat "{d}/stdout"'
+        fake_tesseract(tmp_path, monkeypatch, body, stdout=tsv(row(5, (10, 20, 30, 15), "90", "fox")))
+
+        began = time.monotonic()
+        result = words_of(PAGE_50_BY_1000, deadline=began + 1.0)
+        elapsed = time.monotonic() - began
+
+        assert (result.status, result.reason) == ("spent", "OCR stopped after 1 of 2 bands")
+        assert [word.text for word in result.words] == ["fox"]  # band 1's, for the caller not to use
+        assert elapsed < 8.0  # ~1 s here; band 2's own timeout would allow 30 s
+
+    def test_a_call_cut_at_the_deadline_is_spent_not_timed_out(self, tmp_path, monkeypatch):
+        fake_tesseract(tmp_path, monkeypatch, "exec sleep 60")
+
+        result = words_of(PAGE_3_BY_2, deadline=time.monotonic() + 0.3)
+
+        assert result == OCRResult(words=(), status="spent", reason="OCR stopped after 0 of 1 bands")
+
+    def test_a_timeout_within_the_deadline_is_a_timeout(self, tmp_path, monkeypatch):
+        fake_tesseract(tmp_path, monkeypatch, "exec sleep 60")
+
+        result = words_of(PAGE_3_BY_2, timeout_s=0.2, deadline=time.monotonic() + 600.0)
+
+        assert (result.status, result.reason) == (
+            "timeout",
+            "band 1 of 1 (rows 0 to 1): tesseract did not finish within 0.2 s and was killed",
+        )
+
+    @pytest.mark.parametrize(
+        "deadline,error,message",
+        [
+            pytest.param(float("nan"), ValueError, "deadline must be finite", id="nan"),
+            pytest.param(float("inf"), ValueError, "deadline must be finite", id="inf"),
+            pytest.param("soon", TypeError, "deadline must be an int or float", id="str"),
+            pytest.param(True, TypeError, "deadline must be an int or float", id="bool"),
+        ],
+    )
+    def test_a_bad_deadline_raises_before_anything_runs(self, deadline, error, message, monkeypatch):
+        monkeypatch.setattr(ocr, "trusted_executable", lambda name: pytest.fail("tesseract must not be looked up"))
+
+        with pytest.raises(error, match=re.escape(message)):
+            words_of(PAGE_3_BY_2, deadline=deadline)
+
+    def test_spent_is_a_status_with_a_reason(self):
+        assert OCRResult(words=(), status="spent", reason="OCR stopped after 1 of 2 bands").status == "spent"
+        with pytest.raises(ValueError, match="reason"):
+            OCRResult(words=(), status="spent", reason="")
+
+
 class TestArguments:
     """orientation() and ocr_words() validate their arguments before anything runs."""
 
