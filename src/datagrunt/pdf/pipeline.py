@@ -47,25 +47,41 @@ document's:
 Workers: with ``workers > 1`` the pages run in worker processes, one per
 contiguous chunk (:func:`_chunks`: ``min(workers, page_count)`` chunks whose
 sizes differ by at most one), all at once; each worker opens the document
-itself (a pdfium handle never crosses processes) and returns its pages,
-pickled, and the pages come back in page order. Pages extract in this
-process instead when ``workers`` is 1, the document has one page, or a
-distributed runner is detected (:func:`_is_distributed_env`, ported from v4:
-its executors are the parallelism). The pool is bounded and always ends:
+itself (a pdfium handle never crosses processes) and the pages come back in
+page order. Pages extract in this process instead when ``workers`` is 1, the
+document has one page, or a distributed runner is detected
+(:func:`_is_distributed_env`, ported from v4: its executors are the
+parallelism). The pool is bounded and always ends:
 
-- Workers are started with the ``spawn`` method on every platform, so a
-  worker never inherits a forked copy of pdfium's state. As with any
-  ``multiprocessing`` pool, a script that extracts with ``workers > 1``
-  needs the ``if __name__ == "__main__":`` guard: a spawned worker imports
-  the caller's main module.
+- A worker is a plain ``python -I`` subprocess started by the launcher the
+  render worker shares (:mod:`datagrunt.pdf._process`, worker key
+  ``"pages"``): it never imports the caller's main module, so a caller's
+  script runs once, however it is written, with or without a ``__main__``
+  guard. Its request (the source, the password, the file's identity, the
+  chunk and the options) is JSON on its stdin; with no Python interpreter
+  to start (a frozen application), ``workers > 1`` raises before any
+  worker starts.
+- A worker extracts its whole chunk, re-checks the file (see below), then
+  sends each page as one length-prefixed pickled message, in page order,
+  and a done message; or, instead, the pickled exception that stopped the
+  chunk. Each message is read within :data:`_MAX_PAGE_MESSAGE_BYTES` (the
+  1 GiB asset limit); a longer one is refused unread. The parent checks
+  each reply is a page, the count and the order.
+- Unpickling a worker's pages is acceptable where it would not be for
+  bytes from elsewhere: the worker is the caller's own process image, run
+  with the caller's privileges and exact ``sys.path``. A worker compromised
+  through pdfium could already do anything the caller can, and in this
+  process pdfium runs in the caller anyway (``workers=1``). The render
+  worker, whose replies are pixels, pickles nothing.
 - Every worker must return by one deadline,
   :data:`_WORKER_START_S` + :data:`_WORKER_PAGE_S` x the longest chunk,
   counted from the pool's start. One that has not leaves error pages for
   its chunk, and is killed when the pool ends.
-- A worker that dies without returning (killed, crashed, ``os._exit``)
-  leaves error pages for exactly its chunk's pages, never a lost page; the
-  other chunks extract. Under ``strict`` either case raises a
-  DatagruntPDFError naming the pages instead.
+- A worker that dies without returning (killed, crashed, ``os._exit``), or
+  sends a message over its bound, leaves error pages for exactly its
+  chunk's pages, never a lost page, their error ending with its stderr's
+  last 4 KiB; the other chunks extract. Under ``strict`` any of these
+  raises a DatagruntPDFError naming the pages instead.
 - An exception a worker raises outside the per-page isolation (``strict``'s
   PDFCorruptError, an open error) is raised here.
 - Every worker is reaped (killed first if still running) before the pool
@@ -107,21 +123,35 @@ pages were never read in this process.
 import dataclasses
 import errno
 import hashlib
-import multiprocessing
 import os
+import pickle
+import subprocess
+import tempfile
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from multiprocessing.connection import Connection
-from multiprocessing.context import SpawnContext, SpawnProcess
 from pathlib import Path
-from typing import BinaryIO, get_args
+from typing import IO, BinaryIO, get_args
 
-from datagrunt.pdf._process import REAP_TIMEOUT_S
+from datagrunt.pdf._process import (
+    MAX_REQUEST_BYTES,
+    REAP_TIMEOUT_S,
+    MessageTooLong,
+    NoInterpreter,
+    close_pipes,
+    read_message,
+    reaped,
+    request_payload,
+    send_message,
+    start_worker,
+    stderr_tail,
+    worker_command,
+)
 from datagrunt.pdf._validate import choice_str, int_at_least, strict_bool
 from datagrunt.pdf.assembly import MIN_IMAGE_DIMENSION, assemble_page
-from datagrunt.pdf.elements import DocumentMetadata, Page, PDFDocument
+from datagrunt.pdf.elements import _MAX_ASSET_BYTES, DocumentMetadata, Page, PDFDocument
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFSourceChangedError
 from datagrunt.pdf.layout import find_lattice_tables
 from datagrunt.pdf.pdfium_engine import (
@@ -158,10 +188,17 @@ _HASH_CHUNK_BYTES = 1 << 20
 _DISTRIBUTED_KEYS = ("SPARK_ENV_LOADED", "SPARK_HOME", "BEAM_WORKER_ID", "FLINK_CONF_DIR", "CELERY_BROKER_URL")
 
 # A worker's deadline: this, plus _WORKER_PAGE_S for each page of the longest chunk, from the pool's start.
-# Measured here: a spawned worker imports datagrunt in ~0.6 s, and the corpus's slowest page (95 pages)
+# Measured here: a worker imports datagrunt in ~0.6 s, and the corpus's slowest page (95 pages)
 # extracts in ~0.5 s, so each bound is over 100 times what it covers.
 _WORKER_START_S = 60.0
 _WORKER_PAGE_S = 60.0
+_EXIT_GRACE_S = 1.0  # a worker whose replies ended without its pages is given this to exit
+
+# A page worker's replies, each one length-prefixed message: a page (pickled), the chunk done, or the
+# exception that stopped it (pickled). Each is read within the asset limit.
+_PAGE, _DONE, _ERROR = b"P", b"D", b"E"
+_MAX_PAGE_MESSAGE_BYTES = _MAX_ASSET_BYTES
+_CHUNK_REQUEST_KEYS = ("source", "password", "identity", "pages", "options")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -577,26 +614,62 @@ def _extract_chunk(source: PDFSource, pages: range, options: PipelineOptions) ->
     return extracted
 
 
-def _chunk_worker(sender: Connection, source: PDFSource, pages: range, options: PipelineOptions) -> None:
-    """A worker process's body: send its pages, or the exception that stopped them (the parent raises it).
+def _worker_main(message: object, replies: IO[bytes]) -> None:
+    """The page worker, run by the launcher's bootstrap (key ``"pages"``): a chunk's request in; replies out.
 
-    Module level, so a spawned worker imports it by name.
+    It extracts the whole chunk (its file re-checked at open and after its
+    last page), then sends each page, pickled, in page order, then done.
+    An exception that stops the chunk (``strict``'s PDFCorruptError,
+    PDFSourceChangedError, an open error, a request it cannot read) is sent
+    pickled instead, for the parent to raise.
     """
-    with sender:
-        try:
-            outcome: tuple[Page, ...] | Exception = _extract_chunk(source, pages, options)
-        except Exception as exc:  # strict's PDFCorruptError, an open error: sent, and raised by the parent
-            outcome = exc
-        sender.send(outcome)
+    try:
+        pages = _extract_chunk(*_chunk_request(message))
+    except Exception as exc:  # sent, and raised by the parent: never swallowed here
+        send_message(replies, _ERROR + pickle.dumps(exc))
+        return
+    for page in pages:
+        send_message(replies, _PAGE + pickle.dumps(page))
+    send_message(replies, _DONE)
+
+
+def _chunk_payload(source: PDFSource, pages: range, options: PipelineOptions) -> dict[str, object]:
+    """A chunk's request, as JSON-ready values (the password on the worker's stdin only)."""
+    identity = None if source.identity is None else dataclasses.asdict(source.identity)
+    return {
+        "source": str(source.path),
+        "password": source.password,
+        "identity": identity,
+        "pages": [pages.start, pages.stop],
+        "options": dataclasses.asdict(options),
+    }
+
+
+def _chunk_request(message: object) -> tuple[PDFSource, range, PipelineOptions]:
+    """The source, pages and options a worker reads (JSON from its parent), each checked as at construction."""
+    if not isinstance(message, dict) or set(message) != set(_CHUNK_REQUEST_KEYS):
+        found = sorted(message) if isinstance(message, dict) else type(message).__name__
+        raise ValueError(f"the page worker's request must hold exactly {_CHUNK_REQUEST_KEYS}, got {found}")
+    bounds = message["pages"]
+    ints = isinstance(bounds, list) and len(bounds) == 2 and all(type(bound) is int for bound in bounds)
+    if not ints or not 0 <= bounds[0] < bounds[1]:
+        raise ValueError(f"pages must be [start, stop] with 0 <= start < stop, got {bounds!r}")
+    identity = message["identity"]
+    source = PDFSource(
+        path=message["source"],
+        password=message["password"],
+        identity=None if identity is None else SourceIdentity(**identity),
+    )
+    return source, range(*bounds), PipelineOptions(**message["options"])
 
 
 @dataclass(frozen=True, slots=True)
 class _Worker:
-    """One running worker: its chunk, its process, and the parent's end of its pipe."""
+    """One running page worker: its chunk, its process, and the file its stderr goes to."""
 
     pages: range
-    process: SpawnProcess
-    receiver: Connection
+    child: "subprocess.Popen[bytes]"
+    errors: IO[bytes]
 
 
 def _pooled_pages(source: PDFSource, chunks: tuple[range, ...], options: PipelineOptions) -> tuple[Page, ...]:
@@ -604,49 +677,117 @@ def _pooled_pages(source: PDFSource, chunks: tuple[range, ...], options: Pipelin
 
     Every worker is reaped before this returns or raises (see the module notes).
     """
-    context = multiprocessing.get_context("spawn")
+    command = _pool_command()
     budget_s = _WORKER_START_S + _WORKER_PAGE_S * max(len(chunk) for chunk in chunks)
     deadline = time.monotonic() + budget_s
     workers: list[_Worker] = []
+    killer = _deadline_killer(workers, deadline)
     try:
         for chunk in chunks:
-            workers.append(_started(context, source, chunk, options))
+            workers.append(_started(command, chunk))
+            _send_request(
+                workers[-1], request_payload("pages", _chunk_payload(source, chunk, options), MAX_REQUEST_BYTES)
+            )
         return tuple(page for worker in workers for page in _collected(worker, deadline, budget_s, options))
     finally:
-        _shut_down(workers)
+        _shut_down(workers, killer)
 
 
-def _started(context: SpawnContext, source: PDFSource, pages: range, options: PipelineOptions) -> _Worker:
-    """Start the worker for ``pages``; the parent keeps only its pipe's receiving end."""
-    receiver, sender = context.Pipe(duplex=False)
-    process = context.Process(
-        target=_chunk_worker, args=(sender, source, pages, options), name=f"datagrunt-pdf-{_span(pages)}", daemon=True
-    )
+def _pool_command() -> list[str]:
+    """The page worker's command line; DatagruntPDFError, before anything starts, if there is no interpreter."""
     try:
-        process.start()
+        return worker_command("a page worker")
+    except NoInterpreter as exc:
+        raise DatagruntPDFError(f"{exc}: pass workers=1 to extract in this process") from exc
+
+
+def _deadline_killer(workers: list[_Worker], deadline: float) -> threading.Timer:
+    """A timer that kills, at ``deadline``, every worker then in ``workers`` (one still running ends its replies)."""
+    killer = threading.Timer(max(0.0, deadline - time.monotonic()), _kill_all, args=(workers,))
+    killer.daemon = True
+    killer.start()
+    return killer
+
+
+def _kill_all(workers: list[_Worker]) -> None:
+    """Kill each worker in ``workers`` that is still running (a reaped one is never signalled)."""
+    for worker in tuple(workers):
+        worker.child.kill()
+
+
+def _started(command: list[str], pages: range) -> _Worker:
+    """Start the worker for ``pages``, its stderr to a temporary file."""
+    errors = tempfile.TemporaryFile()
+    try:
+        return _Worker(pages=pages, child=start_worker(command, errors), errors=errors)
     except BaseException:
-        receiver.close()
+        errors.close()
         raise
-    finally:
-        sender.close()  # the worker holds its own copy: once it ends, the receiver reads end of file
-    return _Worker(pages=pages, process=process, receiver=receiver)
+
+
+def _send_request(worker: _Worker, payload: bytes) -> None:
+    """Write the worker's request to its stdin and close it.
+
+    A worker that has already died stops reading: its replies then end
+    without its pages, and its exit code and stderr say why.
+    """
+    stdin = worker.child.stdin
+    if stdin is None:
+        raise ValueError("the worker's stdin must be a pipe")
+    try:
+        stdin.write(payload)
+        stdin.close()
+    except OSError:  # it died at once: _collected reports it from its exit code and stderr
+        pass
 
 
 def _collected(worker: _Worker, deadline: float, budget_s: float, options: PipelineOptions) -> tuple[Page, ...]:
-    """The worker's pages; its chunk's error pages if it ran out of time or died first (see the module notes)."""
+    """The worker's pages; its chunk's error pages if it ran out of time, died first or overran a bound."""
     lost = f"the worker process extracting pages {_span(worker.pages)}"
-    if not worker.receiver.poll(max(0.0, deadline - time.monotonic())):  # _shut_down kills it
-        return _lost_chunk(worker.pages, f"{lost} did not return them within {budget_s:g} s: it was killed", options)
     try:
-        outcome = worker.receiver.recv()
-    except (EOFError, OSError):
-        worker.process.join(REAP_TIMEOUT_S)
-        ended = f"ended (exit code {worker.process.exitcode}) before returning them"
-        return _lost_chunk(worker.pages, f"{lost} {ended}", options)
-    worker.process.join(REAP_TIMEOUT_S)
-    if isinstance(outcome, Exception):
-        raise outcome
-    return _checked_chunk(outcome, worker.pages, lost)
+        pages = _received_pages(worker, lost)
+    except MessageTooLong as exc:
+        return _lost_chunk(worker.pages, f"{lost} sent {exc}: it was killed", options)
+    if pages is not None:
+        reaped(worker.child, REAP_TIMEOUT_S)
+        return pages
+    if time.monotonic() >= deadline:
+        return _lost_chunk(worker.pages, f"{lost} did not return them within {budget_s:g} s: it was killed", options)
+    ended = f"{lost} ended (exit code {reaped(worker.child, _EXIT_GRACE_S)}) before returning them"
+    tail = stderr_tail(worker.errors)
+    return _lost_chunk(worker.pages, f"{ended}; its stderr ends: {tail}" if tail else ended, options)
+
+
+def _received_pages(worker: _Worker, lost: str) -> tuple[Page, ...] | None:
+    """The worker's pages, checked, once it says done; None if its replies end first (it died or was killed)."""
+    stdout = worker.child.stdout
+    if stdout is None:
+        raise ValueError("the worker's stdout must be a pipe")
+    pages: list[Page] = []
+    for _ in range(len(worker.pages) + 1):  # each page, then done
+        message = read_message(stdout, _MAX_PAGE_MESSAGE_BYTES)
+        if message is None:
+            return None
+        if message[:1] == _DONE:
+            return _checked_chunk(tuple(pages), worker.pages, lost)
+        pages.append(_reply_page(message, lost))
+    raise DatagruntPDFError(f"{lost} sent more than its {len(worker.pages)} page(s)")
+
+
+def _reply_page(message: bytes, lost: str) -> Page:
+    """The page in one of the worker's replies; its error raised; anything else fails loud."""
+    kind, body = message[:1], message[1:]
+    if kind == _ERROR:
+        error = pickle.loads(body)  # the caller's own process image: see the module notes
+        if not isinstance(error, Exception):
+            raise DatagruntPDFError(f"{lost} sent a {type(error).__name__} as its error")
+        raise error
+    if kind != _PAGE:
+        raise DatagruntPDFError(f"{lost} sent a reply of unknown kind {kind!r}")
+    page = pickle.loads(body)  # the caller's own process image: see the module notes
+    if not isinstance(page, Page):
+        raise DatagruntPDFError(f"{lost} sent a {type(page).__name__}, not a page")
+    return page
 
 
 def _lost_chunk(pages: range, reason: str, options: PipelineOptions) -> tuple[Page, ...]:
@@ -656,26 +797,26 @@ def _lost_chunk(pages: range, reason: str, options: PipelineOptions) -> tuple[Pa
     return tuple(_error_page(None, index, reason) for index in pages)
 
 
-def _checked_chunk(outcome: object, pages: range, lost: str) -> tuple[Page, ...]:
-    """``outcome`` if it is the chunk's pages, in order: a worker's reply is checked, never trusted."""
-    expected = [index + 1 for index in pages]
-    if not isinstance(outcome, tuple) or not all(isinstance(page, Page) for page in outcome):
-        raise DatagruntPDFError(f"{lost} returned a {type(outcome).__name__}, not its {len(pages)} page(s)")
-    if [page.page_number for page in outcome] != expected:
-        numbers = [page.page_number for page in outcome]
+def _checked_chunk(pages: tuple[Page, ...], chunk: range, lost: str) -> tuple[Page, ...]:
+    """``pages`` if they are the chunk's, in order: a worker's reply is checked, never trusted."""
+    expected = [index + 1 for index in chunk]
+    numbers = [page.page_number for page in pages]
+    if numbers != expected:
         raise DatagruntPDFError(f"{lost} returned pages {numbers}, not pages {expected}")
-    return outcome
+    return pages
 
 
-def _shut_down(workers: list[_Worker]) -> None:
-    """End the pool: kill each worker still running, reap it and close its pipe and process."""
+def _shut_down(workers: list[_Worker], killer: threading.Timer) -> None:
+    """End the pool: stop the deadline's timer, then close, kill (if still running) and reap each worker.
+
+    The timer is stopped before any worker is reaped, so a kill never reaches a reaped (reusable) pid.
+    """
+    killer.cancel()
+    killer.join(REAP_TIMEOUT_S)
     for worker in workers:
-        worker.receiver.close()
-        if worker.process.is_alive():
-            worker.process.kill()
-        worker.process.join(REAP_TIMEOUT_S)
-        if worker.process.exitcode is not None:
-            worker.process.close()
+        close_pipes(worker.child)
+        reaped(worker.child, 0.0)
+        worker.errors.close()
 
 
 def _span(pages: range) -> str:
