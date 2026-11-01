@@ -28,9 +28,9 @@ The tesseract CLI (never ``pytesseract``) reads the page:
   of 0.5 or more) is kept once, with its higher confidence.
 
 Each call starts ``tesseract`` from an argv list (never a shell), by the
-absolute path found in an absolute PATH directory (a relative entry, which
-names a directory under the working directory, is never searched), in its
-own session, with ``OMP_THREAD_LIMIT=1`` in its environment, and writes the
+absolute path :func:`~datagrunt.pdf._executables.trusted_executable` finds
+in an absolute PATH directory (never the working directory), in its own
+session, with ``OMP_THREAD_LIMIT=1`` in its environment, and writes the
 image to its stdin as a binary PGM (no temporary image file). Its stdout is
 read within :data:`_MAX_STDOUT_BYTES`; its stderr goes to an anonymous
 temporary file, of which the last 4 KiB is read. At its timeout a timer
@@ -44,7 +44,6 @@ bound is a status with its reason (:class:`Orientation`,
 import math
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -55,6 +54,7 @@ from typing import IO, Literal, NamedTuple
 
 from PIL import Image, ImageOps
 
+from datagrunt.pdf._executables import trusted_executable
 from datagrunt.pdf._validate import (
     choice_str,
     finite_float,
@@ -306,7 +306,7 @@ def _checked_turn(name: str, value: object) -> int:
 
 def tesseract_available() -> bool:
     """Whether a ``tesseract`` in an absolute PATH directory answers ``--version`` as tesseract within a timeout."""
-    binary = _binary()
+    binary = trusted_executable("tesseract")
     if binary is None:
         return False
     call = _call([binary, "--version"], (), _VERSION_TIMEOUT_S)
@@ -326,7 +326,7 @@ def orientation(page: RenderedPage, *, timeout_s: float) -> Orientation:
     """
     _checked_page(page)
     positive_float("timeout_s", timeout_s)
-    binary = _binary()
+    binary = trusted_executable("tesseract")
     if binary is None:
         return _unoriented("unavailable", _NOT_ON_PATH)
     call = _call([binary, "stdin", "stdout", "--psm", "0"], _pgm(page), timeout_s)
@@ -407,7 +407,7 @@ def ocr_words(
     positive_float("timeout_s", timeout_s)
     if not isinstance(language, str) or _LANGUAGE.fullmatch(language) is None:
         raise ValueError(f"language must be tesseract language names (like eng or deu+eng), got {language!r}")
-    binary = _binary()
+    binary = trusted_executable("tesseract")
     if binary is None:
         return OCRResult(words=(), status="unavailable", reason=_NOT_ON_PATH)
     argv = [binary, "stdin", "stdout", "--psm", "6", "-l", language, "tsv"]
@@ -592,27 +592,6 @@ def _displayed_box(word: _Placed, rotation: int, displayed: tuple[int, int], dpi
         box = (x0, y0, x1, y1)
     scale = 72.0 / dpi
     return BBox(x0=box[0] * scale, y0=box[1] * scale, x1=box[2] * scale, y1=box[3] * scale)
-
-
-def _binary() -> str | None:
-    """The absolute path of the ``tesseract`` in an absolute PATH directory; None if there is none.
-
-    Relative entries ("", ".", "bin") name directories under the working
-    directory, which may be a folder of untrusted files: they are never
-    searched. A match whose directory (symlinks resolved) is not one of the
-    absolute entries is refused too: Windows' ``shutil.which`` looks in the
-    working directory first, whatever PATH says. Resolved on every call.
-    """
-    directories = [entry for entry in os.environ.get("PATH", "").split(os.pathsep) if os.path.isabs(entry)]
-    if not directories:
-        return None
-    found = shutil.which("tesseract", path=os.pathsep.join(directories))
-    if found is None:
-        return None
-    trusted = {os.path.realpath(directory) for directory in directories}
-    if os.path.realpath(os.path.dirname(os.path.abspath(found))) not in trusted:
-        return None
-    return os.path.abspath(found)
 
 
 def _pgm(image: RenderedPage | Band) -> tuple[bytes, bytes]:
