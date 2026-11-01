@@ -2593,18 +2593,26 @@ def page_layout(
     for index, item in enumerate(recovered):
         if id(item) in taken:
             raise ValueError(f"recovered[{index}] is also among pieces: recovered text is never page text")
-    slots = [FigureSlot(index=at, bbox=found) for at, found in enumerate(typed_tuple("figures", figures, BBox))]
-    on_page = tuple(slot for slot in slots if slot.bbox.within(width, height))
+    on_page, off_page = _figure_slots(figures, width, height)
     turn = _page_turn(runs)
     found, over = _visible_items(runs, turn, width, height, (*lattice.tables, *on_page))
     visible: list[PageItem] = list(found)
     apart: list[ApartLine | FigureSlot] = [*_apart_lines(pieces, recovered, turn)]
-    apart += [slot for slot in slots if slot not in on_page]
+    apart += off_page
     items, warnings = _with_apart(visible, apart, turn)
     if over:
         bound = f"{over} borderless table(s) over the {MAX_STREAM_GRID_UNITS}-cell page bound"
         warnings = (f"{bound}: their text reads as paragraphs", *warnings)
     return PageLayout(items=tuple(items), warnings=warnings)
+
+
+def _figure_slots(figures: object, width: float, height: float) -> tuple[list[FigureSlot], list[FigureSlot]]:
+    """Each figure box's slot, those within the page (A1's rule) apart from those off it: one pass, O(figures)."""
+    on_page: list[FigureSlot] = []
+    off_page: list[FigureSlot] = []
+    for at, figure in enumerate(typed_tuple("figures", figures, BBox)):
+        (on_page if figure.within(width, height) else off_page).append(FigureSlot(index=at, bbox=figure))
+    return on_page, off_page
 
 
 def _apart_lines(pieces: tuple[SpanPiece, ...], recovered: tuple[SpanPiece, ...], turn: int) -> list[ApartLine]:
@@ -2632,8 +2640,9 @@ def _with_apart(
     pairs = len(apart) * len(visible)
     if pairs > MAX_APART_PAIRS:
         lines = sum(1 for item in apart if isinstance(item, ApartLine))
-        figures = f" and {len(apart) - lines} off-page figure(s)" if lines < len(apart) else ""
-        where = f"{lines} hidden or recovered line(s){figures} read after the page's visible text"
+        named = (f"{lines} hidden or recovered line(s)", f"{len(apart) - lines} off-page figure(s)")
+        where = " and ".join(name for name, count in zip(named, (lines, len(apart) - lines)) if count)
+        where += " read after the page's visible text"
         why = f"placing them by position would compare {pairs} pairs, over the bound of {MAX_APART_PAIRS}"
         return [*visible, *ordered], (f"{where}: {why}",)
     if not visible:

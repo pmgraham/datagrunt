@@ -6,9 +6,11 @@ displayed, top-left ``(x0, y0, x1, y1)`` points.
 
 import dataclasses
 import pickle
+import time
 
 import pytest
 
+from datagrunt.pdf import layout
 from datagrunt.pdf.layout import FigureSlot, LatticeResult, LatticeTable, PageLayout, StreamParagraph, page_layout
 from pdf_tests.test_layout_apart import LEFT, RIGHT, column_of, hidden
 from pdf_tests.test_layout_lattice import box, cell, chars
@@ -227,6 +229,41 @@ class TestUnits:
         )
 
         assert named(items) == ["Text", "figure0", "ApartLine"]
+
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_20_000_figure_boxes_lay_out_in_linear_time(self):
+        # A quarter reach past the page's left edge: one pass splits them from the rest. Comparing each with every
+        # on-page slot (a tuple's "in") took 5.3 s on a laptop.
+        boxes = tuple(
+            box(
+                5.0 * (at % 200) - 500.0 * (at % 2),
+                20.0 + 5.0 * (at // 200),
+                5.0 * (at % 200) + 4.0,
+                24.0 + 5.0 * (at // 200),
+            )
+            for at in range(20_000)
+        )
+
+        started = time.perf_counter()
+        found = page_layout(
+            (chars("Visible body text", 10.0, 2.0),), (), NO_TABLES, width_pt=1000.0, height_pt=600.0, figures=boxes
+        )
+        elapsed = time.perf_counter() - started
+
+        slots = [item for item in found.items if isinstance(item, FigureSlot)]
+        assert sorted(slot.index for slot in slots) == list(range(20_000))
+        assert elapsed < 2.0, f"{elapsed:.2f} s"
+
+    def test_off_page_figures_past_the_placement_bound_are_named_alone(self, monkeypatch):
+        monkeypatch.setattr(layout, "MAX_APART_PAIRS", 1)
+        figures = (box(-300.0, 10.0, -100.0, 60.0), box(-300.0, 100.0, -100.0, 160.0))
+
+        found = page_layout((chars("Body", 10.0, 10.0),), (), NO_TABLES, width_pt=W, height_pt=H, figures=figures)
+
+        assert found.warnings == (
+            "2 off-page figure(s) read after the page's visible text: placing them by position would compare "
+            "2 pairs, over the bound of 1",
+        )
 
     def test_figures_must_be_a_tuple_of_boxes(self):
         with pytest.raises(TypeError, match="figures"):
