@@ -144,6 +144,16 @@ encrypted file); a missing entry, or a file with no /Info, reads as the
 terminator alone (2 bytes). Its length query copies nothing, so
 :func:`document_metadata` checks the length against its bound first.
 
+Object boxes (#400), pinned by ``tests/pdf_tests/test_pdfium_object_boxes.py``:
+:func:`page_object_boxes` gives the displayed box of every non-text object
+the walk visits (paths, images, shadings, forms and their contents, any
+object of an unknown type): pdfium's bounds in the object's form space
+(``FPDFPageObj_GetBounds``: a stroke's box includes its width, a shading's
+is its clip's, or the page's when it is unclipped, a form's holds its
+contents), through every enclosing form's matrix to page space. An object
+whose bounds pdfium cannot read, or whose box is not finite, is counted in
+``ObjectBoxes.unboxed``: the background check counts it as under all text.
+
 Render guard (#369 A5a), pinned by ``tests/pdf_tests/test_render.py``:
 :func:`image_refusal` walks a loaded page as :func:`page_images` does, its
 walk bounded by an object count and the form depth, and refuses the render
@@ -154,6 +164,7 @@ a pixel. :func:`loaded_page` keeps that load open for the render.
 import ctypes
 import errno
 import hashlib
+import math
 import os
 import sys
 from collections.abc import Callable, Iterator
@@ -212,6 +223,7 @@ from datagrunt.pdf._validate import (
     int_at_least,
     non_blank_str,
     optional_str,
+    ordered_box,
     positive_float,
 )
 from datagrunt.pdf.elements import _MAX_ASSET_BYTES
@@ -222,6 +234,7 @@ __all__ = [
     "DocumentInfo",
     "ImageLoader",
     "ImageStats",
+    "ObjectBoxes",
     "PageFailure",
     "PageGeometry",
     "PageImages",
@@ -243,6 +256,7 @@ __all__ = [
     "open_document",
     "page_geometry",
     "page_images",
+    "page_object_boxes",
     "page_segments",
     "page_text",
     "recover_dropped_text",
@@ -1083,6 +1097,93 @@ def image_refusal(page: pdfium.PdfPage, geometry: PageGeometry, *, max_objects: 
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class ObjectBoxes:
+    """The displayed box of each of the page's non-text objects: what may paint under its text (#400).
+
+    Attributes:
+        boxes: One displayed, top-left box per path, image, shading, form
+            and unknown-type object, in object-walk order (a form, then its
+            contents): pdfium's bounds through every enclosing form's matrix.
+        unboxed: How many such objects have no box the walk can give
+            (pdfium cannot read their bounds, or the box is not finite). The
+            background check counts each as under every piece of text.
+    """
+
+    boxes: tuple[Box, ...]
+    unboxed: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.boxes, tuple):
+            raise TypeError(f"boxes must be a tuple, got {type(self.boxes).__name__}")
+        checked = tuple(ordered_box(f"boxes[{index}]", box) for index, box in enumerate(self.boxes))
+        object.__setattr__(self, "boxes", checked)
+        int_at_least("unboxed", self.unboxed, 0)
+
+
+def _collect_object_boxes(page_raw: pdfium_c.FPDF_PAGE, geometry: PageGeometry) -> ObjectBoxes:
+    """The displayed box of every non-text object on the page, forms' contents included, in object-walk order."""
+    to_display = _display_mapping(geometry)
+    objects = _page_objects(page_raw)
+    form_matrices: dict[int, Matrix] = {}
+    boxes: list[Box] = []
+    unboxed = 0
+    for index, (obj, form) in enumerate(objects):  # bounded: the walk's objects
+        kind = pdfium_c.FPDFPageObj_GetType(obj)
+        outer = form_matrices[form] if form >= 0 else IDENTITY
+        if kind == pdfium_c.FPDF_PAGEOBJ_FORM:
+            form_matrices[index] = _read_matrix(obj, f"object {index}").then(outer)
+        if kind == pdfium_c.FPDF_PAGEOBJ_TEXT:
+            continue
+        box = _object_box(obj, outer, to_display)
+        if box is None:
+            unboxed += 1
+        else:
+            boxes.append(box)
+    return ObjectBoxes(boxes=tuple(boxes), unboxed=unboxed)
+
+
+def _object_box(obj: pdfium_c.FPDF_PAGEOBJECT, outer: Matrix, to_display: Callable[[Box], Box]) -> Box | None:
+    """The object's displayed box: its bounds (in its form's space) through ``outer`` to page space; None if none."""
+    left, bottom, right, top = (ctypes.c_float() for _ in range(4))
+    if not pdfium_c.FPDFPageObj_GetBounds(obj, left, bottom, right, top):
+        return None
+    corners = [outer.apply(x, y) for x in (left.value, right.value) for y in (bottom.value, top.value)]
+    xs, ys = [corner[0] for corner in corners], [corner[1] for corner in corners]
+    if not all(math.isfinite(value) for value in (*xs, *ys)):
+        return None
+    return to_display((min(xs), min(ys), max(xs), max(ys)))
+
+
+def _read_object_boxes(page: pdfium.PdfPage, geometry: PageGeometry) -> ObjectBoxes:
+    """Read a loaded page's object boxes."""
+    try:
+        return _collect_object_boxes(page.raw, geometry)
+    except PdfiumFailure as exc:
+        raise _pdfium_error(geometry.page_number, exc) from exc
+
+
+def page_object_boxes(handle: DocumentHandle, index: int) -> ObjectBoxes:
+    """Return the displayed box of every non-text object of the page at 0-based ``index`` (see the module notes).
+
+    Every object of the walk is read, forms' contents included (as deep as
+    pdfium parses them). The page handle is closed before returning.
+
+    Raises:
+        TypeError: If ``handle`` is not a DocumentHandle, or ``index`` is not
+            an int (bool rejected).
+        ValueError: If ``handle`` is closed.
+        IndexError: If ``index`` is outside ``0..page_count - 1``.
+        PDFCorruptError: If pdfium cannot load the page or read a form's
+            matrix (``page_number`` is set).
+    """
+    page, page_number = _load_page(handle, index)
+    try:
+        return _read_object_boxes(page, _read_geometry(page, page_number))
+    finally:
+        page.close()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class RawPage:
     """One page's raw facts, read by :func:`extract_page` from one load of the page.
 
@@ -1097,12 +1198,15 @@ class RawPage:
             them.
         images: The image objects and their stats, as :func:`page_images`
             returns them.
+        object_boxes: The non-text objects' boxes, as
+            :func:`page_object_boxes` returns them.
     """
 
     geometry: PageGeometry
     text: PageText
     segments: PageSegments
     images: PageImages
+    object_boxes: ObjectBoxes
 
     def __post_init__(self) -> None:
         checks = (
@@ -1110,6 +1214,7 @@ class RawPage:
             ("text", self.text, PageText),
             ("segments", self.segments, PageSegments),
             ("images", self.images, PageImages),
+            ("object_boxes", self.object_boxes, ObjectBoxes),
         )
         for name, value, expected in checks:
             if not isinstance(value, expected):
@@ -1158,10 +1263,11 @@ def extract_page(handle: DocumentHandle, index: int) -> RawPage | PageFailure:
     """Return every raw fact of the page at 0-based ``index``, read from one load of it.
 
     The page is loaded once and read in stages: geometry, text, then
-    segments and images; the page and its textpage are closed before
-    returning. A good page equals the :class:`RawPage` of
-    :func:`page_geometry`, :func:`page_text`, :func:`page_segments` and
-    :func:`page_images` (each of which loads the page again). A page pdfium
+    segments, images and object boxes; the page and its textpage are closed
+    before returning. A good page equals the :class:`RawPage` of
+    :func:`page_geometry`, :func:`page_text`, :func:`page_segments`,
+    :func:`page_images` and :func:`page_object_boxes` (each of which loads
+    the page again). A page pdfium
     cannot read is no error here: the PDFCorruptError a stage raises becomes
     a :class:`PageFailure` of that stage with the same message, so one bad
     page never fails a batch. Any other error (a PDFCorruptError naming no
@@ -1195,9 +1301,10 @@ def _read_stages(page: pdfium.PdfPage, page_number: int) -> RawPage | PageFailur
         stage = "objects"
         segments = _read_segments(page, geometry)
         images = _read_images(page, geometry)
+        object_boxes = _read_object_boxes(page, geometry)
     except PDFCorruptError as exc:
         return PageFailure(page_number=page_number, stage=stage, message=str(exc))
-    return RawPage(geometry=geometry, text=text, segments=segments, images=images)
+    return RawPage(geometry=geometry, text=text, segments=segments, images=images, object_boxes=object_boxes)
 
 
 def recover_dropped_text(handle: DocumentHandle, index: int) -> RecoveredText:

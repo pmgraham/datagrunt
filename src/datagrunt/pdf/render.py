@@ -61,6 +61,28 @@ render is a :class:`RenderFailed`, raised before anything starts.
 Annotations are not drawn (no ``FPDF_ANNOT``): their appearance streams
 are content the guard's object walk cannot see, so a vision page's form
 field values, stamps and markup are not rendered, and not read by OCR.
+
+Analysis modes (#400), for the background check of
+:mod:`datagrunt.pdf.quality`; the defaults (8-bit gray, with the text) are
+A5a's:
+
+- ``colour``: 24-bit BGR (pdfium's ``FPDFBitmap_BGR``: blue, green, red
+  bytes a pixel), unpadded rows, drawn with no flag.
+- ``without_text``: once the guard passes the page, the worker removes every
+  text object of its load, page level and inside forms
+  (``FPDFPage_RemoveObject`` / ``FPDFFormObj_RemoveObject``, on the guard's
+  bounded object walk), then draws it. The edit lives in that load only:
+  nothing is saved, and pdfium regenerates no content.
+
+:func:`render_pages` draws several pages of one document in one worker
+(the same key, ``"render"``: a request holding ``pages`` is a batch). The
+worker caps its memory once, opens the document once, then guards and
+draws each page in turn, from a load of its own, and replies for each in
+order. The cap is per worker and one timeout covers the whole batch. A page
+refused or failed is that page's outcome and the batch goes on; a worker
+that ends (its cap, the timeout, a crash) fails every page it had not
+answered, each with why. Every page's pixels are held at once: the caller
+bounds the batch (at most :data:`MAX_BATCH_PAGES` pages).
 """
 
 import ctypes
@@ -73,9 +95,10 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields
+from functools import partial
 from typing import IO, NamedTuple
 
 import pypdfium2 as pdfium
@@ -95,12 +118,14 @@ from datagrunt.pdf._process import (
 )
 from datagrunt.pdf._process import read_message as _read_message
 from datagrunt.pdf._process import send_message as _send
-from datagrunt.pdf._validate import int_at_least, positive_float
+from datagrunt.pdf._validate import int_at_least, positive_float, strict_bool
 from datagrunt.pdf.exceptions import DatagruntPDFError
 from datagrunt.pdf.pdfium_engine import (
+    DocumentHandle,
     PageGeometry,
     _checked_password,
     _checked_path,
+    _page_objects,
     image_refusal,
     loaded_page,
     open_document,
@@ -139,6 +164,24 @@ _WHITE = 0xFFFFFFFF
 # Gray output and nothing else: no FPDF_ANNOT (annotations are not drawn), no LCD text, no printing mode.
 _RENDER_FLAGS = pdfium_c.FPDF_GRAYSCALE
 
+# The pages one render_pages call draws, at most: each page's pixels are held at once.
+MAX_BATCH_PAGES = 64
+
+
+class _Format(NamedTuple):
+    """How a page is drawn: bytes a pixel, pdfium's bitmap format and render flags, and the format's name."""
+
+    channels: int
+    bitmap: int
+    flags: int
+    name: str
+
+
+_GRAY = _Format(1, pdfium_c.FPDFBitmap_Gray, _RENDER_FLAGS, "gray")
+# Colour, and nothing else: no flag (no annotations, no LCD text, no printing mode).
+_BGR = _Format(3, pdfium_c.FPDFBitmap_BGR, 0, "BGR")
+_CHANNELS = (_GRAY.channels, _BGR.channels)
+
 
 class RenderRefused(DatagruntPDFError):
     """A page is not rendered: rendering it is refused before pdfium draws anything."""
@@ -150,29 +193,34 @@ class RenderFailed(DatagruntPDFError):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RenderedPage:
-    """A page :func:`render_page` drew in 8-bit gray.
+    """A page :func:`render_page` drew: in 8-bit gray, or in 24-bit BGR (``colour``).
 
     Attributes:
-        pixels: ``px_width * px_height`` bytes, row by row from the displayed
-            page's top-left corner, 0 black to 255 white, unpadded. Not in
-            repr.
+        pixels: ``px_width * px_height * channels`` bytes, row by row from
+            the displayed page's top-left corner, unpadded: a byte a pixel,
+            0 black to 255 white, in gray; blue, green and red bytes a
+            pixel in BGR. Not in repr.
         px_width: Pixels across the displayed page (:func:`render_size`).
         px_height: Pixels down it.
+        channels: 1 (gray) or 3 (BGR).
     """
 
     pixels: bytes = field(repr=False)
     px_width: int
     px_height: int
+    channels: int = 1
 
     def __post_init__(self) -> None:
         int_at_least("px_width", self.px_width, 1)
         int_at_least("px_height", self.px_height, 1)
+        if int_at_least("channels", self.channels, 1) not in _CHANNELS:
+            raise ValueError(f"channels must be 1 (gray) or 3 (BGR), got {self.channels}")
         if not isinstance(self.pixels, bytes):
             raise TypeError(f"pixels must be bytes, got {type(self.pixels).__name__}")
-        expected = self.px_width * self.px_height
+        expected = self.px_width * self.px_height * self.channels
         if len(self.pixels) != expected:
-            message = f"pixels must hold {self.px_width} x {self.px_height} = {expected} bytes, got {len(self.pixels)}"
-            raise ValueError(message)
+            size = f"{self.px_width} x {self.px_height}" + (f" x {self.channels}" if self.channels > 1 else "")
+            raise ValueError(f"pixels must hold {size} = {expected} bytes, got {len(self.pixels)}")
 
 
 def render_size(width_pt: float, height_pt: float, dpi: int) -> tuple[int, int]:
@@ -245,7 +293,20 @@ def _guarded_page(
         IndexError: As :func:`~datagrunt.pdf.pdfium_engine.open_document` and
             :func:`~datagrunt.pdf.pdfium_engine.loaded_page` raise them.
     """
-    with open_document(source, password=password) as handle, loaded_page(handle, page_index) as (page, geometry):
+    with open_document(source, password=password) as handle, _guarded(handle, page_index) as loaded:
+        yield loaded
+
+
+@contextmanager
+def _guarded(handle: DocumentHandle, page_index: int) -> Iterator[tuple[pdfium.PdfPage, PageGeometry]]:
+    """The page at ``page_index`` of the open document, loaded, once the image guard passes it; closed on leaving.
+
+    Raises:
+        RenderRefused: If the guard refuses the page; nothing is yielded.
+        IndexError, PDFCorruptError: As
+            :func:`~datagrunt.pdf.pdfium_engine.loaded_page` raises them.
+    """
+    with loaded_page(handle, page_index) as (page, geometry):
         refusal = image_refusal(page, geometry, max_objects=_MAX_GUARD_OBJECTS)
         if refusal is not None:
             raise RenderRefused(f"page {geometry.page_number}: {refusal}; the page is not rendered")
@@ -253,11 +314,12 @@ def _guarded_page(
 
 
 class _Bitmap(NamedTuple):
-    """A page drawn in this process: its size and its pixels (unpadded rows) in anonymous memory."""
+    """A page drawn in this process: its size, its pixels (unpadded rows) in anonymous memory, and bytes a pixel."""
 
     width: int
     height: int
     pixels: mmap.mmap
+    channels: int = 1
 
 
 def _render_guarded(source: str | os.PathLike[str], page_index: int, dpi: int, password: str | None) -> _Bitmap:
@@ -275,26 +337,72 @@ def _render_guarded(source: str | os.PathLike[str], page_index: int, dpi: int, p
         return _draw(page, geometry, dpi)
 
 
-def _draw(page: pdfium.PdfPage, geometry: PageGeometry, dpi: int) -> _Bitmap:
-    """Draw the loaded page at ``dpi`` on white, in 8-bit gray, without its annotations."""
+def _draw(page: pdfium.PdfPage, geometry: PageGeometry, dpi: int, *, colour: bool = False) -> _Bitmap:
+    """Draw the loaded page at ``dpi`` on white, in 8-bit gray (24-bit BGR if ``colour``), without its annotations."""
+    drawn = _BGR if colour else _GRAY
     width, height = render_size(geometry.width_pt, geometry.height_pt, dpi)
     if width < 1 or height < 1:
         message = f"page {geometry.page_number} renders {width} x {height} px at {dpi} DPI; the page is not rendered"
         raise RenderRefused(message)
-    pixels = _blank(width * height)
-    buffer = (ctypes.c_ubyte * (width * height)).from_buffer(pixels)
-    bitmap = pdfium_c.FPDFBitmap_CreateEx(width, height, pdfium_c.FPDFBitmap_Gray, buffer, width)
+    stride = width * drawn.channels  # unpadded rows
+    pixels = _blank(stride * height)
+    buffer = (ctypes.c_ubyte * (stride * height)).from_buffer(pixels)
+    bitmap = pdfium_c.FPDFBitmap_CreateEx(width, height, drawn.bitmap, buffer, stride)
     if not bitmap:
-        raise RenderFailed(f"page {geometry.page_number}: pdfium cannot make a {width} x {height} gray bitmap")
+        raise RenderFailed(f"page {geometry.page_number}: pdfium cannot make a {width} x {height} {drawn.name} bitmap")
     try:
         if not pdfium_c.FPDFBitmap_FillRect(bitmap, 0, 0, width, height, _WHITE):
             raise RenderFailed(f"page {geometry.page_number}: pdfium cannot fill a {width} x {height} bitmap")
         # Rotation 0 draws the page as displayed (its /Rotate applied), filling the bitmap.
-        pdfium_c.FPDF_RenderPageBitmap(bitmap, page.raw, 0, 0, width, height, 0, _RENDER_FLAGS)
+        pdfium_c.FPDF_RenderPageBitmap(bitmap, page.raw, 0, 0, width, height, 0, drawn.flags)
     finally:
         pdfium_c.FPDFBitmap_Destroy(bitmap)
     del buffer  # releases the mapping's export, so it can be sent and closed
-    return _Bitmap(width, height, pixels)
+    return _Bitmap(width, height, pixels, drawn.channels)
+
+
+def _render_loaded(handle: DocumentHandle, page_index: int, dpi: int, *, colour: bool, without_text: bool) -> _Bitmap:
+    """Guard the page of the open document, remove its text if asked, then draw it from the same load.
+
+    The batch worker calls this under its memory cap; never call it outside one.
+
+    Raises:
+        RenderRefused: If the guard refuses the page, or it draws under one pixel across at ``dpi``.
+        RenderFailed: If pdfium cannot remove a text object, or make or fill the bitmap.
+        MemoryError: If the bitmap cannot be mapped (a memory cap).
+    """
+    with _guarded(handle, page_index) as (page, geometry):
+        if without_text:
+            _remove_text(page, geometry.page_number)
+        return _draw(page, geometry, dpi, colour=colour)
+
+
+def _remove_text(page: pdfium.PdfPage, page_number: int) -> int:
+    """Remove every text object from the loaded page, forms' included; how many. In this load only: nothing is saved.
+
+    Walks the guard's walk (:func:`~datagrunt.pdf.pdfium_engine._page_objects`
+    within :data:`_MAX_GUARD_OBJECTS`), so it is bounded by the page the guard
+    passed. Each removed object is destroyed (pdfium hands it to the caller).
+
+    Raises:
+        RenderFailed: If pdfium cannot remove a text object (named by its walk index).
+    """
+    objects = _page_objects(page.raw, max_objects=_MAX_GUARD_OBJECTS)
+    removed = 0
+    for index, (item, form) in enumerate(objects):  # bounded: the walk's objects
+        if pdfium_c.FPDFPageObj_GetType(item) != pdfium_c.FPDF_PAGEOBJ_TEXT:
+            continue
+        if form < 0:
+            done = pdfium_c.FPDFPage_RemoveObject(page.raw, item)
+        else:
+            done = pdfium_c.FPDFFormObj_RemoveObject(objects[form][0], item)
+        if not done:
+            raise RenderFailed(
+                f"page {page_number}: pdfium cannot remove text object {index}; the page is not rendered"
+            )
+        pdfium_c.FPDFPageObj_Destroy(item)
+        removed += 1
+    return removed
 
 
 def _blank(size: int) -> mmap.mmap:
@@ -328,12 +436,36 @@ class _Request:
 _REQUEST_FIELDS = tuple(item.name for item in fields(_Request))
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _BatchRequest:
+    """A batch the parent asks its worker for (:func:`render_pages`), in the JSON on the worker's stdin.
+
+    ``pages`` are ``(0-based page index, dpi)`` pairs, drawn in order. The
+    password is never in repr: it reaches the worker in that JSON only.
+    """
+
+    source: str
+    pages: tuple[tuple[int, int], ...]
+    password: str | None = field(repr=False)
+    memory_cap_bytes: int
+    timeout_s: float
+    colour: bool
+    without_text: bool
+
+
+_BATCH_FIELDS = tuple(item.name for item in fields(_BatchRequest))
+
+
 class _Reply(NamedTuple):
     """A worker's whole reply: its kind, its message (refused, failed), and the page it drew (pixels)."""
 
     kind: bytes
     detail: str
     page: RenderedPage | None
+
+
+class _Malformed(Exception):
+    """A worker's reply the parent refuses (a bad header, a claim past the cap, short pixels): a failure, unread on."""
 
 
 def render_page(
@@ -344,8 +476,10 @@ def render_page(
     password: str | None = None,
     memory_cap_bytes: int,
     timeout_s: float,
+    colour: bool = False,
+    without_text: bool = False,
 ) -> RenderedPage:
-    """Render the page at 0-based ``page_index`` in 8-bit gray at ``dpi``, in a capped worker process.
+    """Render the page at 0-based ``page_index`` at ``dpi``, in a capped worker process: in 8-bit gray by default.
 
     The worker (``python -I``, see the module notes) caps its own memory at
     ``memory_cap_bytes`` over what it holds once started, runs the image
@@ -362,6 +496,11 @@ def render_page(
         memory_cap_bytes: The worker's memory past its start, at least 1.
         timeout_s: Seconds the whole render may take, the worker's start
             included (a worker imports datagrunt: ~0.5 s here).
+        colour: Draw in 24-bit BGR (``channels`` 3) instead of 8-bit gray.
+        without_text: Remove the page's text objects from the worker's load
+            before drawing it (see the module notes).
+
+    Either mode draws the page as a one-page :func:`render_pages` batch does.
 
     Raises:
         TypeError, ValueError: If an argument is invalid (before any worker starts).
@@ -381,6 +520,9 @@ def render_page(
         memory_cap_bytes=int_at_least("memory_cap_bytes", memory_cap_bytes, 1),
         timeout_s=positive_float("timeout_s", timeout_s),
     )
+    modes = (strict_bool("colour", colour), strict_bool("without_text", without_text))
+    if any(modes):
+        return _one_page_batch(request, colour=colour, without_text=without_text)
     where = f"{request.source}: page {request.page_index + 1}"
     command = _worker_command(where)
     payload = _request_payload(request)
@@ -393,6 +535,160 @@ def render_page(
             close_pipes(worker)
         tail = "" if reply is not None else stderr_tail(errors)
     return _outcome(reply, timed_out, exitcode, request, tail)
+
+
+def _one_page_batch(request: _Request, *, colour: bool, without_text: bool) -> RenderedPage:
+    """The page of ``request`` drawn as a one-page batch in the modes asked for; its refusal or failure raised."""
+    (result,) = render_pages(
+        request.source,
+        ((request.page_index, request.dpi),),
+        password=request.password,
+        memory_cap_bytes=request.memory_cap_bytes,
+        timeout_s=request.timeout_s,
+        colour=colour,
+        without_text=without_text,
+    )
+    if isinstance(result, RenderedPage):
+        return result
+    raise result
+
+
+def render_pages(
+    source: str | os.PathLike[str],
+    pages: tuple[tuple[int, int], ...],
+    *,
+    password: str | None = None,
+    memory_cap_bytes: int,
+    timeout_s: float,
+    colour: bool = False,
+    without_text: bool = False,
+) -> tuple[RenderedPage | RenderRefused | RenderFailed, ...]:
+    """Render several pages of one PDF in one capped worker process: each page's outcome, in order.
+
+    Each page is drawn as :func:`render_page` draws it, in the modes asked
+    for, from a load of its own (see the module notes). The cap is the
+    worker's and ``timeout_s`` covers the whole batch, the worker's start
+    included. A page the guard refuses is its :class:`RenderRefused`, a page
+    that fails (unloadable, past the last) its :class:`RenderFailed`, and the
+    batch goes on. When the worker ends (its cap, the timeout, a crash), no
+    worker can start, or the PDF cannot be opened, every page not yet
+    answered is a :class:`RenderFailed` saying why. Nothing else is raised.
+
+    Args:
+        source: The PDF's path (made absolute here).
+        pages: ``(0-based page index, dpi)`` pairs, 1 to
+            :data:`MAX_BATCH_PAGES` of them; a page may repeat. Pass each
+            page's :func:`effective_dpi`.
+        password, memory_cap_bytes: As :func:`render_page`'s.
+        timeout_s: Seconds the whole batch may take.
+        colour, without_text: As :func:`render_page`'s, for every page.
+
+    Raises:
+        TypeError, ValueError: If an argument is invalid (before any worker starts).
+    """
+    request = _BatchRequest(
+        source=str(_checked_path(source, "source").absolute()),
+        pages=_checked_pages(pages, tuple),
+        password=_checked_password(password),
+        memory_cap_bytes=int_at_least("memory_cap_bytes", memory_cap_bytes, 1),
+        timeout_s=positive_float("timeout_s", timeout_s),
+        colour=strict_bool("colour", colour),
+        without_text=strict_bool("without_text", without_text),
+    )
+    try:
+        replies, timed_out, exitcode, tail = _run_batch(request)
+    except RenderFailed as exc:  # no worker ran: every page fails alike
+        return tuple(RenderFailed(f"{request.source}: page {index + 1}: {exc}") for index, _dpi in request.pages)
+    return _batch_outcomes(replies, timed_out, exitcode, request, tail)
+
+
+def _checked_pages(value: object, kind: type) -> tuple[tuple[int, int], ...]:
+    """``value`` as ``(page index, dpi)`` pairs, 1 to MAX_BATCH_PAGES of them: a ``kind`` of ``kind`` pairs.
+
+    The parent passes tuples; JSON brings a worker lists.
+    """
+    if not isinstance(value, (tuple, list)) or not isinstance(value, kind):
+        raise TypeError(f"pages must be a {kind.__name__}, got {type(value).__name__}")
+    if not 1 <= len(value) <= MAX_BATCH_PAGES:
+        raise ValueError(f"pages must hold 1 to {MAX_BATCH_PAGES} (page index, dpi) pairs, got {len(value)}")
+    checked = []
+    for position, pair in enumerate(value):
+        if not isinstance(pair, (tuple, list)) or not isinstance(pair, kind) or len(pair) != 2:
+            raise ValueError(f"pages[{position}] must be a (page index, dpi) pair, got {pair!r}")
+        index = int_at_least(f"pages[{position}] page index", pair[0], 0)
+        checked.append((index, int_at_least(f"pages[{position}] dpi", pair[1], 1)))
+    return tuple(checked)
+
+
+def _run_batch(request: _BatchRequest) -> tuple[list[_Reply], bool, int | None, str]:
+    """Run the batch's worker to its replies: them, whether its deadline passed, its exit code and stderr's tail.
+
+    Raises:
+        RenderFailed: If no worker can start (no interpreter, no file for
+            its stderr, the OS refuses), or the request is over its bound.
+    """
+    try:
+        command = worker_command("a render worker")
+    except NoInterpreter as exc:
+        raise RenderFailed(str(exc)) from exc
+    payload = _batch_payload(request)
+    count, channels = len(request.pages), (_BGR if request.colour else _GRAY).channels
+    with _stderr_file() as errors:
+        deadline = time.monotonic() + request.timeout_s
+        try:
+            worker = start_worker(command, errors)
+        except OSError as exc:
+            raise RenderFailed(f"cannot start a render worker: {exc}") from exc
+        exchange = partial(
+            _exchange_batch, worker.stdin, worker.stdout, payload, request.memory_cap_bytes, channels, count
+        )
+        try:
+            replies, timed_out, exitcode = _watched(worker, deadline, count, exchange)
+        finally:
+            close_pipes(worker)
+        tail = "" if len(replies) == count else stderr_tail(errors)
+    return replies, timed_out, exitcode, tail
+
+
+def _stderr_file() -> IO[bytes]:
+    """A temporary file for a worker's stderr; RenderFailed if none can be made."""
+    try:
+        return tempfile.TemporaryFile()
+    except OSError as exc:
+        raise RenderFailed(f"cannot make a file for the render worker's stderr: {exc}") from exc
+
+
+def _batch_payload(request: _BatchRequest) -> bytes:
+    """The JSON a batch worker reads from its stdin: the caller's exact sys.path, the worker's key and the batch."""
+    try:
+        return request_payload("render", asdict(request), _MAX_REQUEST_BYTES)
+    except ValueError as exc:
+        raise RenderFailed(str(exc)) from exc
+
+
+def _batch_outcomes(
+    replies: list[_Reply], timed_out: bool, exitcode: int | None, request: _BatchRequest, tail: str
+) -> tuple[RenderedPage | RenderRefused | RenderFailed, ...]:
+    """Each page's outcome: its reply, in order, and past the replies, why the worker ended."""
+    ending = _ending(exitcode, timed_out, request)
+    unanswered = f"{ending}; its stderr ends: {tail}" if tail else ending
+    outcomes: list[RenderedPage | RenderRefused | RenderFailed] = []
+    for position, (index, _dpi) in enumerate(request.pages):
+        where = f"{request.source}: page {index + 1}"
+        if position < len(replies):
+            outcomes.append(_page_outcome(replies[position], request.source, where))
+        else:
+            outcomes.append(RenderFailed(f"{where}: {unanswered}"))
+    return tuple(outcomes)
+
+
+def _page_outcome(reply: _Reply, source: str, where: str) -> RenderedPage | RenderRefused | RenderFailed:
+    """The page one reply holds, or the RenderRefused / RenderFailed it says."""
+    if reply.page is not None:
+        return reply.page
+    if reply.kind == _REFUSED:
+        return RenderRefused(f"{source}: {reply.detail}")
+    return RenderFailed(f"{where}: the render worker failed: {reply.detail}")
 
 
 def _worker_command(where: str) -> list[str]:
@@ -422,26 +718,44 @@ def _started(command: list[str], errors: IO[bytes], where: str) -> "subprocess.P
 def _supervised(
     worker: "subprocess.Popen[bytes]", payload: bytes, memory_cap_bytes: int, deadline: float
 ) -> tuple[_Reply | None, bool, int | None]:
-    """Exchange with the started worker until its reply or ``deadline``, then reap it.
+    """Exchange with the started worker until its reply or ``deadline``, then reap it (see :func:`_watched`).
+
+    Returns the reply (None: none came whole), whether the deadline passed
+    without one, and the exit code.
+    """
+
+    def exchange() -> list[_Reply]:
+        reply = _exchange(worker.stdin, worker.stdout, payload, memory_cap_bytes)
+        return [] if reply is None else [reply]
+
+    replies, timed_out, exitcode = _watched(worker, deadline, 1, exchange)
+    return (replies[0] if replies else None), timed_out, exitcode
+
+
+def _watched(
+    worker: "subprocess.Popen[bytes]", deadline: float, count: int, exchange: Callable[[], list[_Reply]]
+) -> tuple[list[_Reply], bool, int | None]:
+    """Run ``exchange`` with the started worker until it returns or ``deadline``, then reap the worker.
 
     A timer kills the worker at the deadline, which closes its stdout: so
     no read or write outlives the deadline (a worker that stalls mid-reply
-    included). Returns the reply (None: none came whole), whether the
-    deadline passed without one, and the exit code.
+    included). Returns the replies, whether the deadline passed before all
+    ``count`` came, and the exit code.
     """
     killer = threading.Timer(max(0.0, deadline - time.monotonic()), worker.kill)
     killer.daemon = True
     killer.start()
-    reply: _Reply | None = None
+    replies: list[_Reply] = []
     try:
-        reply = _exchange(worker.stdin, worker.stdout, payload, memory_cap_bytes)
+        replies = exchange()
     finally:
         # Cancelled and joined before the worker is reaped: a kill never reaches a reaped (reusable) pid.
         killer.cancel()
         killer.join(REAP_TIMEOUT_S)
-        timed_out = reply is None and time.monotonic() >= deadline
-        exitcode = reaped(worker, REAP_TIMEOUT_S if reply is not None else 0.0 if timed_out else _EXIT_GRACE_S)
-    return reply, timed_out, exitcode
+        complete = len(replies) == count
+        timed_out = not complete and time.monotonic() >= deadline
+        exitcode = reaped(worker, REAP_TIMEOUT_S if complete else 0.0 if timed_out else _EXIT_GRACE_S)
+    return replies, timed_out, exitcode
 
 
 def _exchange(
@@ -459,24 +773,68 @@ def _exchange(
     try:
         stdin.write(payload)
         stdin.close()
-        status = _read_message(stdout, _MAX_STATUS_BYTES)
-        if status is None:
-            return None
-        kind = status[:1]
-        if kind != _PIXELS:
-            return _message_reply(kind, status[1:])
-        size = _pixel_size(status[1:], memory_cap_bytes)
-        if isinstance(size, str):
-            return _Reply(_FAILED, size, None)
-        width, height = size
-        pixels = _read_message(stdout, width * height)
+        return _read_reply(stdout, memory_cap_bytes, _GRAY.channels)
+    except _Malformed as exc:
+        return _Reply(_FAILED, str(exc), None)
     except (OSError, MessageTooLong):  # the worker stopped reading (it died, or was killed), or overran a bound
         return None
+
+
+def _exchange_batch(
+    stdin: IO[bytes] | None,
+    stdout: IO[bytes] | None,
+    payload: bytes,
+    memory_cap_bytes: int,
+    channels: int,
+    count: int,
+) -> list[_Reply]:
+    """Write ``payload`` to the worker; return its replies, one a page, in order, up to ``count``.
+
+    Each is read as :func:`_exchange` reads one. Reading ends early when the
+    worker's replies end (it died, or was killed at the deadline): the pages
+    left are unanswered. A reply the parent refuses (malformed, or over a
+    bound) is that page's failure, and nothing after it is read: the stream
+    can no longer be trusted.
+    """
+    if stdin is None or stdout is None:
+        raise ValueError("the worker's stdin and stdout must be pipes")
+    replies: list[_Reply] = []
+    try:
+        stdin.write(payload)
+        stdin.close()
+        for _ in range(count):  # bounded: one reply a page
+            reply = _read_reply(stdout, memory_cap_bytes, channels)
+            if reply is None:
+                return replies
+            replies.append(reply)
+    except (_Malformed, MessageTooLong) as exc:
+        replies.append(_Reply(_FAILED, str(exc), None))
+    except OSError:  # it stopped reading (it died, or was killed): each page left fails with why it ended
+        return replies
+    return replies
+
+
+def _read_reply(stdout: IO[bytes], memory_cap_bytes: int, channels: int) -> _Reply | None:
+    """One page's whole reply from the worker's ``stdout``, or None if its replies end first.
+
+    Raises:
+        _Malformed: If the reply cannot be trusted (see :func:`_pixel_size`), or its pixels are short.
+        MessageTooLong: If a message is over its bound (unread).
+        OSError: If the pipe fails.
+    """
+    status = _read_message(stdout, _MAX_STATUS_BYTES)
+    if status is None:
+        return None
+    kind = status[:1]
+    if kind != _PIXELS:
+        return _message_reply(kind, status[1:])
+    width, height = _pixel_size(status[1:], memory_cap_bytes, channels)
+    pixels = _read_message(stdout, width * height * channels)
     if pixels is None:
         return None
-    if len(pixels) != width * height:
-        return _Reply(_FAILED, f"it sent {len(pixels)} pixel bytes for a {width} x {height} px render", None)
-    return _Reply(_PIXELS, "", RenderedPage(pixels=pixels, px_width=width, px_height=height))
+    if len(pixels) != width * height * channels:
+        raise _Malformed(f"it sent {len(pixels)} pixel bytes for a {_px(width, height, channels)} render")
+    return _Reply(_PIXELS, "", RenderedPage(pixels=pixels, px_width=width, px_height=height, channels=channels))
 
 
 def _message_reply(kind: bytes, message: bytes) -> _Reply:
@@ -486,20 +844,30 @@ def _message_reply(kind: bytes, message: bytes) -> _Reply:
     return _Reply(kind, message.decode("utf-8", errors="backslashreplace"), None)
 
 
-def _pixel_size(header: bytes, memory_cap_bytes: int) -> tuple[int, int] | str:
-    """The ``(width, height)`` a pixel reply claims, or why the claim is refused.
+def _pixel_size(header: bytes, memory_cap_bytes: int, channels: int) -> tuple[int, int]:
+    """The ``(width, height)`` a pixel reply claims.
 
     The worker's pixels live within its memory cap, so a claim past it is
     refused before the parent receives (or allocates) a byte of them.
+
+    Raises:
+        _Malformed: Naming why the claim is refused.
     """
     if len(header) != _PIXEL_SIZE.size:
-        return f"it sent a {len(header)}-byte pixel header, not {_PIXEL_SIZE.size}"
+        raise _Malformed(f"it sent a {len(header)}-byte pixel header, not {_PIXEL_SIZE.size}")
     width, height = _PIXEL_SIZE.unpack(header)
     if width < 1 or height < 1:
-        return f"it claimed a {width} x {height} px render"
-    if width * height > memory_cap_bytes:
-        return f"it claimed a {width} x {height} px render, over its {memory_cap_bytes}-byte memory cap"
+        raise _Malformed(f"it claimed a {_px(width, height, channels)} render")
+    if width * height * channels > memory_cap_bytes:
+        raise _Malformed(
+            f"it claimed a {_px(width, height, channels)} render, over its {memory_cap_bytes}-byte memory cap"
+        )
     return width, height
+
+
+def _px(width: int, height: int, channels: int) -> str:
+    """A render's size in words: ``"3 x 2 px"``, and ``"3 x 2 px BGR"`` in colour."""
+    return f"{width} x {height} px" + (f" {_BGR.name}" if channels == _BGR.channels else "")
 
 
 def _outcome(reply: _Reply | None, timed_out: bool, exitcode: int | None, request: _Request, tail: str) -> RenderedPage:
@@ -508,14 +876,13 @@ def _outcome(reply: _Reply | None, timed_out: bool, exitcode: int | None, reques
     if reply is None:
         ending = _ending(exitcode, timed_out, request)
         raise RenderFailed(f"{where}: {ending}; its stderr ends: {tail}" if tail else f"{where}: {ending}")
-    if reply.page is not None:
-        return reply.page
-    if reply.kind == _REFUSED:
-        raise RenderRefused(f"{request.source}: {reply.detail}")
-    raise RenderFailed(f"{where}: the render worker failed: {reply.detail}")
+    result = _page_outcome(reply, request.source, where)
+    if isinstance(result, RenderedPage):
+        return result
+    raise result
 
 
-def _ending(exitcode: int | None, timed_out: bool, request: _Request) -> str:
+def _ending(exitcode: int | None, timed_out: bool, request: _Request | _BatchRequest) -> str:
     """Why a worker ended without a whole reply."""
     if timed_out:
         return f"the render timed out after {request.timeout_s} s; its worker was killed"
@@ -531,10 +898,14 @@ def _ending(exitcode: int | None, timed_out: bool, request: _Request) -> str:
 def _worker_main(message: object, replies: IO[bytes]) -> None:
     """The render worker, run by _BOOTSTRAP: one request in, one reply out on ``replies``, as raw bytes.
 
-    It caps its own memory before it opens the PDF. Reaching the cap (a
-    MemoryError) ends it with ``_CAP_EXIT`` and no reply; a refusal and any
-    other error are sent back as messages, never swallowed.
+    A request holding ``pages`` is a batch (:func:`_batch_main`). It caps its
+    own memory before it opens the PDF. Reaching the cap (a MemoryError)
+    ends it with ``_CAP_EXIT`` and no reply; a refusal and any other error
+    are sent back as messages, never swallowed.
     """
+    if isinstance(message, dict) and "pages" in message:
+        _batch_main(message, replies)
+        return
     try:
         request = _request_from(message)
         _apply_memory_cap(request.memory_cap_bytes, request.timeout_s)
@@ -551,6 +922,58 @@ def _worker_main(message: object, replies: IO[bytes]) -> None:
     _send(replies, bitmap.pixels)
 
 
+def _batch_main(message: dict[str, object], replies: IO[bytes]) -> None:
+    """The batch worker: a batch in; each page's reply (its pixels after it) out on ``replies``, in order.
+
+    It caps its own memory once, before it opens the PDF, then opens it once.
+    Reaching the cap ends it with ``_CAP_EXIT``: the parent fails the pages
+    not yet answered. A batch it cannot read is one failure; a PDF it cannot
+    open fails each page with the reason. Nothing is swallowed.
+    """
+    try:
+        request = _batch_request_from(message)
+    except Exception as exc:  # sent, never swallowed: the parent fails the batch's pages
+        _send(replies, _failure(exc))
+        return
+    sent = 0
+    try:
+        _apply_memory_cap(request.memory_cap_bytes, request.timeout_s)
+        with open_document(request.source, password=request.password) as handle:
+            for index, dpi in request.pages:  # bounded: at most MAX_BATCH_PAGES
+                _send_page(replies, handle, index, dpi, request)
+                sent += 1
+    except MemoryError:
+        os._exit(_CAP_EXIT)
+    except Exception as exc:  # no page left can be drawn (the PDF cannot be opened): each fails with it
+        for _ in request.pages[sent:]:
+            _send(replies, _failure(exc))
+
+
+def _send_page(replies: IO[bytes], handle: DocumentHandle, index: int, dpi: int, request: _BatchRequest) -> None:
+    """Draw one page of the batch and send its reply; a refusal or failure is its reply, and the batch goes on.
+
+    A MemoryError (the cap) is raised: it ends the worker.
+    """
+    try:
+        bitmap = _render_loaded(handle, index, dpi, colour=request.colour, without_text=request.without_text)
+    except MemoryError:
+        raise
+    except RenderRefused as exc:
+        _send(replies, _REFUSED + str(exc).encode("utf-8", errors="backslashreplace"))
+        return
+    except Exception as exc:  # this page's failure, sent to the parent
+        _send(replies, _failure(exc))
+        return
+    with bitmap.pixels:  # unmapped once sent: a batch holds one page's pixels at a time
+        _send(replies, _PIXELS + _PIXEL_SIZE.pack(bitmap.width, bitmap.height))
+        _send(replies, bitmap.pixels)
+
+
+def _failure(exc: Exception) -> bytes:
+    """A failed reply naming ``exc``: its type and message."""
+    return _FAILED + f"{type(exc).__name__}: {exc}".encode("utf-8", errors="backslashreplace")
+
+
 def _request_from(message: object) -> _Request:
     """The request a worker reads (JSON from its parent), its fields checked as render_page checks them."""
     if not isinstance(message, dict):
@@ -564,6 +987,21 @@ def _request_from(message: object) -> _Request:
         password=_checked_password(message["password"]),
         memory_cap_bytes=int_at_least("memory_cap_bytes", message["memory_cap_bytes"], 1),
         timeout_s=positive_float("timeout_s", message["timeout_s"]),
+    )
+
+
+def _batch_request_from(message: dict[str, object]) -> _BatchRequest:
+    """The batch a worker reads (JSON from its parent), its fields checked as render_pages checks them."""
+    if set(message) != set(_BATCH_FIELDS):
+        raise ValueError(f"the batch request must hold exactly {_BATCH_FIELDS}, got {sorted(message)}")
+    return _BatchRequest(
+        source=str(_checked_path(message["source"], "source")),
+        pages=_checked_pages(message["pages"], list),
+        password=_checked_password(message["password"]),
+        memory_cap_bytes=int_at_least("memory_cap_bytes", message["memory_cap_bytes"], 1),
+        timeout_s=positive_float("timeout_s", message["timeout_s"]),
+        colour=strict_bool("colour", message["colour"]),
+        without_text=strict_bool("without_text", message["without_text"]),
     )
 
 

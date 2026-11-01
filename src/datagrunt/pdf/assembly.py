@@ -315,10 +315,12 @@ def assemble_page(
        A3's notes); a table
        is a :class:`~datagrunt.pdf.elements.Table` of its grid, headed by
        its first row when every cell of it is non-blank (A4a's rule), with
-       ``column_centres`` when upright (a lattice table's grid column
-       spans, a stream table's X-bands), else ``()``: a turned table's run
-       along display y, and A6 links only increasing display x. A lattice
-       table's box is clamped to the page (its rules may run past it).
+       ``column_centres`` when upright (the middle of each of a lattice
+       table's grid columns; each of a stream table's columns' alignment
+       edge, the start, end or middle its cells share), else ``()``: a
+       turned table's run along display y, and A6 links only increasing
+       display x. A lattice table's box is clamped to the page (its rules
+       may run past it).
     4. Pass C (:func:`pass_c`) sets ``integrity_verified``.
 
     The page's ``quality`` and ``route`` are A3's. Its warnings are A2's

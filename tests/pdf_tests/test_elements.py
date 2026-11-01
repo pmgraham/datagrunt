@@ -73,6 +73,7 @@ class TestTypeAliases:
             "zero_scale",
             "duplicate",
             "superseded",
+            "unchecked_background",
         )
 
     def test_hidden_reason_literal_members(self):
@@ -85,6 +86,7 @@ class TestTypeAliases:
             "zero_scale",
             "duplicate",
             "superseded",
+            "unchecked_background",
         )
 
     def test_page_status_values(self):

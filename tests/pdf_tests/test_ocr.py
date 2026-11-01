@@ -91,6 +91,14 @@ class TestNormalized:
         with pytest.raises(TypeError, match=re.escape("page must be a RenderedPage, got bytes")):
             normalized(b"\x00")
 
+    def test_a_bgr_page_is_refused(self):
+        # OCR reads 8-bit gray: a 24-bit BGR render (#400's background check) is never read as gray.
+        page = RenderedPage(pixels=bytes(18), px_width=3, px_height=2, channels=3)
+
+        for call in (normalized, bands, lambda bgr: rotated(bgr, 90), lambda bgr: orientation(bgr, timeout_s=1.0)):
+            with pytest.raises(ValueError, match=re.escape("page must be 8-bit gray (1 channel), got 3 channels")):
+                call(page)
+
 
 def striped(width: int, height: int) -> RenderedPage:
     """A ``width`` x ``height`` page whose every row has its own grey level (row index mod 256)."""
@@ -290,9 +298,9 @@ class TestRecords:
             Orientation(**{"degrees": 90, "confidence": 9.0, "status": "ok", "reason": "", **fields})
 
     def test_a_valid_word(self):
-        word = OCRWord(text="fox", bbox=bbox(1.0, 2.0, 3.0, 4.0), confidence=96.05)
+        word = OCRWord(text="fox", bbox=bbox(1.0, 2.0, 3.0, 4.0), confidence=96.05, line=3)
 
-        assert (word.text, word.bbox.x1, word.confidence) == ("fox", 3.0, 96.05)
+        assert (word.text, word.bbox.x1, word.confidence, word.line) == ("fox", 3.0, 96.05, 3)
 
     @pytest.mark.parametrize(
         "fields,error,message",
@@ -301,14 +309,17 @@ class TestRecords:
             pytest.param({"bbox": (1.0, 2.0, 3.0, 4.0)}, TypeError, "bbox must be a BBox, got tuple", id="bbox"),
             pytest.param({"confidence": 100.5}, ValueError, "confidence must be <= 100.0, got 100.5", id="high"),
             pytest.param({"confidence": -1.0}, ValueError, "confidence must be >= 0.0, got -1.0", id="low"),
+            pytest.param({"line": -1}, ValueError, "line must be >= 0, got -1", id="line-negative"),
+            pytest.param({"line": 1.0}, TypeError, "line must be an int", id="line-float"),
+            pytest.param({"line": True}, TypeError, "line must be an int", id="line-bool"),
         ],
     )
     def test_invalid_words_raise(self, fields, error, message):
         with pytest.raises(error, match=re.escape(message)):
-            OCRWord(**{"text": "fox", "bbox": bbox(1.0, 2.0, 3.0, 4.0), "confidence": 50.0, **fields})
+            OCRWord(**{"text": "fox", "bbox": bbox(1.0, 2.0, 3.0, 4.0), "confidence": 50.0, "line": 0, **fields})
 
     def test_valid_results(self):
-        word = OCRWord(text="fox", bbox=bbox(1.0, 2.0, 3.0, 4.0), confidence=96.0)
+        word = OCRWord(text="fox", bbox=bbox(1.0, 2.0, 3.0, 4.0), confidence=96.0, line=0)
 
         assert OCRResult(words=(word,), status="ok", reason="").words == (word,)
         assert OCRResult(words=(word,), status="timeout", reason="band 2 of 2").status == "timeout"
@@ -383,9 +394,13 @@ def tsv(*rows: str, newline: str = "\n") -> bytes:
     return (newline.join((TSV_HEADER, *rows)) + newline).encode()
 
 
-def row(level: int, box: tuple[int, int, int, int], conf: str, text: str) -> str:
+def row(
+    level: int, box: tuple[int, int, int, int], conf: str, text: str, line: tuple[int, int, int] = (1, 1, 1)
+) -> str:
+    """A TSV row: ``line`` is its block, paragraph and line numbers."""
     left, top, width, height = box
-    return f"{level}\t1\t1\t1\t1\t1\t{left}\t{top}\t{width}\t{height}\t{conf}\t{text}"
+    block, paragraph, number = line
+    return f"{level}\t1\t{block}\t{paragraph}\t{number}\t1\t{left}\t{top}\t{width}\t{height}\t{conf}\t{text}"
 
 
 BAND_AT_840 = Band(top_px=840, pixels=bytes(100 * 900), px_width=100, px_height=900)
@@ -404,25 +419,38 @@ class TestTsv:
         )
 
         assert ocr._tsv_words(stdout, BAND_AT_840) == [
-            ocr._Placed("Hello", 10, 860, 40, 875, 96.050018),
-            ocr._Placed("world,", 45, 861, 80, 875, 91.0),
+            ocr._Placed("Hello", 10, 860, 40, 875, 96.050018, (840, 1, 1, 1)),
+            ocr._Placed("world,", 45, 861, 80, 875, 91.0, (840, 1, 1, 1)),
         ]
 
     def test_words_without_text_or_confidence_are_skipped(self):
         stdout = tsv(row(5, (1, 1, 5, 5), "-1", "x"), row(5, (1, 1, 5, 5), "40", " "), row(5, (1, 1, 5, 5), "0", "y"))
 
-        assert ocr._tsv_words(stdout, BAND_AT_840) == [ocr._Placed("y", 1, 841, 6, 846, 0.0)]
+        assert ocr._tsv_words(stdout, BAND_AT_840) == [ocr._Placed("y", 1, 841, 6, 846, 0.0, (840, 1, 1, 1))]
 
     def test_only_word_rows_are_words(self):
         # Only level 5 is a word, whatever text or confidence another level's row carries.
         stdout = tsv(*(row(level, (1, 1, 5, 5), "50", "x") for level in (1, 2, 3, 4)), row(5, (1, 1, 5, 5), "50", "y"))
 
-        assert ocr._tsv_words(stdout, BAND_AT_840) == [ocr._Placed("y", 1, 841, 6, 846, 50.0)]
+        assert ocr._tsv_words(stdout, BAND_AT_840) == [ocr._Placed("y", 1, 841, 6, 846, 50.0, (840, 1, 1, 1))]
+
+    def test_each_word_keeps_its_bands_top_and_its_block_paragraph_and_line(self):
+        stdout = tsv(
+            row(5, (10, 20, 30, 15), "90", "The", line=(1, 1, 1)),
+            row(5, (45, 20, 30, 15), "90", "fox", line=(1, 1, 1)),
+            row(5, (10, 40, 30, 15), "90", "ran", line=(1, 1, 2)),
+            row(5, (10, 60, 30, 15), "90", "far", line=(1, 2, 1)),
+            row(5, (10, 80, 30, 15), "90", "off", line=(2, 1, 1)),
+        )
+
+        lines = [word.line for word in ocr._tsv_words(stdout, BAND_AT_840)]
+
+        assert lines == [(840, 1, 1, 1), (840, 1, 1, 1), (840, 1, 1, 2), (840, 1, 2, 1), (840, 2, 1, 1)]
 
     def test_crlf_line_ends_are_read(self):
         stdout = tsv(row(5, (1, 2, 3, 4), "50", "fox"), newline="\r\n")
 
-        assert ocr._tsv_words(stdout, BAND_AT_840) == [ocr._Placed("fox", 1, 842, 4, 846, 50.0)]
+        assert ocr._tsv_words(stdout, BAND_AT_840) == [ocr._Placed("fox", 1, 842, 4, 846, 50.0, (840, 1, 1, 1))]
 
     @pytest.mark.parametrize(
         "stdout,message",
@@ -435,6 +463,13 @@ class TestTsv:
                 tsv(row(5, (1, 2, 3, 4), "50", "x").replace("\t1\t2\t", "\tone\t2\t")), "line 2: left", id="int"
             ),
             pytest.param(tsv(row(5, (1, -2, 3, 4), "50", "x")), "line 2: top must be >= 0, got -2", id="negative"),
+            pytest.param(
+                tsv(row(5, (1, 2, 3, 4), "50", "x").replace("5\t1\t1\t", "5\t1\tone\t")),
+                "line 2: block_num",
+                id="block",
+            ),
+            pytest.param(tsv(row(5, (1, 2, 3, 4), "50", "x", line=(1, -1, 1))), "line 2: par_num", id="paragraph"),
+            pytest.param(tsv(row(5, (1, 2, 3, 4), "50", "x", line=(1, 1, 2.5))), "line 2: line_num", id="line"),
             pytest.param(tsv(row(5, (1, 2, 3, 4), "100.5", "x")), "line 2: conf must be <= 100.0", id="conf-high"),
             pytest.param(tsv(row(5, (1, 2, 3, 4), "nan", "x")), "line 2: conf must be finite", id="conf-nan"),
             pytest.param(tsv(row(5, (1, 2, 3, 4), "most", "x")), "line 2: conf", id="conf-text"),
@@ -454,7 +489,8 @@ LAST = Band(top_px=1680, pixels=bytes(900), px_width=1, px_height=900)
 
 
 def placed(text: str, box: tuple[int, int, int, int], confidence: float) -> "ocr._Placed":
-    return ocr._Placed(text, *box, confidence)
+    """A word placed on the righted page: its line is keyed by its top row (its band's, block, paragraph and line)."""
+    return ocr._Placed(text, *box, confidence, (0, 1, 1, box[1]))
 
 
 class TestMerged:
@@ -514,6 +550,81 @@ class TestMerged:
         words = [placed("a", (0, 0, 5, 5), 1.0), placed("a", (0, 0, 5, 5), 2.0)]
 
         assert ocr._merged([(UPPER, words)]) == words
+
+
+class TestSeamFragments:
+    """A word cut by its band's cut edge, wholly in the strip it shares, is dropped when the other band reads it whole.
+
+    UPPER is rows 0..899 and LOWER rows 840..1739: they share rows 840..899.
+    UPPER's cut edge is its bottom (a box ending at row 899 has a y1 of 900);
+    LOWER's is its top (a box starting at row 840 has a y0 of 840). A box
+    within 1 px of the edge touches it (#416).
+    """
+
+    def test_a_fragment_at_the_lower_bands_top_is_dropped_for_the_upper_bands_whole_word(self):
+        whole = placed("quick", (10, 830, 60, 870), 96.0)  # rows 830..869: whole in UPPER, 30 rows above its edge
+        fragment = placed("qnick", (10, 840, 60, 870), 99.0)  # LOWER's read of the rows below its top edge
+
+        assert ocr._merged([(UPPER, [whole]), (LOWER, [fragment])]) == [whole]
+
+    def test_a_fragment_at_the_upper_bands_bottom_is_dropped_for_the_lower_bands_whole_word(self):
+        fragment = placed("qnick", (10, 880, 60, 900), 99.0)  # UPPER's read of the rows above its bottom edge
+        whole = placed("quick", (10, 880, 60, 920), 96.0)  # rows 880..919: whole in LOWER, 40 rows below its edge
+
+        assert ocr._merged([(UPPER, [fragment]), (LOWER, [whole])]) == [whole]
+
+    @pytest.mark.parametrize("gap,cut", [(0, True), (1, True), (2, False)])
+    def test_a_word_within_1_px_of_its_bands_cut_edge_is_cut(self, gap, cut):
+        upper_whole, lower_whole = placed("over", (10, 820, 60, 860), 90.0), placed("lazy", (100, 870, 150, 910), 90.0)
+        lower_part = placed("ovcr", (10, 840 + gap, 60, 860), 90.0)  # its top `gap` rows below LOWER's top
+        upper_part = placed("lazv", (100, 870, 150, 900 - gap), 90.0)  # its bottom `gap` rows above UPPER's bottom
+
+        merged = ocr._merged([(UPPER, [upper_whole, upper_part]), (LOWER, [lower_part, lower_whole])])
+
+        assert merged == ([upper_whole, lower_whole] if cut else [upper_whole, upper_part, lower_part, lower_whole])
+
+    def test_a_cut_word_reaching_past_the_shared_strip_is_kept(self):
+        # Each touches its band's cut edge but reaches a row the other band does not hold: only it read that row.
+        upper_whole, lower_whole = placed("over", (10, 820, 60, 860), 90.0), placed("lazy", (100, 870, 150, 910), 90.0)
+        lower_part = placed("ovcr", (10, 840, 60, 901), 90.0)  # to row 900, below the strip
+        upper_part = placed("lazv", (100, 839, 150, 900), 90.0)  # from row 839, above the strip
+
+        merged = ocr._merged([(UPPER, [upper_whole, upper_part]), (LOWER, [lower_part, lower_whole])])
+
+        assert merged == [upper_whole, upper_part, lower_part, lower_whole]
+
+    @pytest.mark.parametrize(
+        "neighbour",
+        [
+            pytest.param((61, 830, 90, 870), id="sharing-its-right-edge"),
+            pytest.param((10, 800, 61, 841), id="sharing-its-top-row-edge"),
+        ],
+    )
+    def test_a_cut_word_the_other_band_does_not_read_is_kept(self, neighbour):
+        # Words read once are never dropped: nothing in UPPER overlaps the cut word (a shared edge is no overlap).
+        # Its top is 1 row below LOWER's top edge, so it is cut; UPPER's word ends on that row's top edge.
+        beside = placed("fox", neighbour, 90.0)
+        cut = placed("qnick", (10, 841, 61, 870), 90.0)
+
+        assert ocr._merged([(UPPER, [beside]), (LOWER, [cut])]) == [beside, cut]
+
+    def test_a_line_both_bands_cut_is_kept_in_both(self):
+        # Rows 840..899 exactly: UPPER's copy touches its bottom, LOWER's its top; neither band read the line whole.
+        upper, lower = placed("SORT", (10, 840, 60, 900), 0.0), placed("Company", (10, 840, 60, 899), 96.0)
+
+        assert ocr._merged([(UPPER, [upper]), (LOWER, [lower])]) == [upper, lower]
+
+    def test_the_whole_copy_is_kept_over_a_cut_copy_of_higher_confidence(self):
+        # The same text, IoU 0.75: the copy cut by LOWER's top is a fragment, whatever its confidence.
+        whole, cut = placed("fox", (10, 830, 40, 870), 80.0), placed("fox", (10, 840, 40, 870), 95.0)
+
+        assert ocr._merged([(UPPER, [whole]), (LOWER, [cut])]) == [whole]
+
+    def test_each_seam_drops_its_own_fragments(self):
+        first, last = placed("ab", (0, 830, 10, 870), 90.0), placed("cd", (0, 1720, 10, 1760), 90.0)
+        second = [placed("xb", (0, 840, 10, 870), 90.0), placed("cx", (0, 1720, 10, 1740), 90.0)]
+
+        assert ocr._merged([(UPPER, [first]), (LOWER, second), (LAST, [last])]) == [first, last]
 
 
 class TestDisplayedBox:
@@ -704,6 +815,26 @@ class TestCli:
 
         assert result.status == "ok"
         assert [word.bbox for word in result.words] == [bbox(10.0, 20.0, 40.0, 35.0), bbox(10.0, 860.0, 40.0, 875.0)]
+
+    def test_lines_are_numbered_across_the_page_in_the_order_read(self, tmp_path, monkeypatch):
+        # The same report for each band, its lines numbered alike: a band's line 1 is not another band's.
+        report = tsv(
+            row(5, (1, 20, 9, 15), "90", "The", line=(1, 1, 1)),
+            row(5, (12, 20, 9, 15), "90", "fox", line=(1, 1, 1)),
+            row(5, (1, 400, 9, 15), "90", "ran", line=(2, 1, 1)),
+        )
+        fake_tesseract(tmp_path, monkeypatch, READS_STDIN, stdout=report)
+
+        result = words_of(PAGE_50_BY_1000)
+
+        assert [(word.text, word.line) for word in result.words] == [
+            ("The", 0),
+            ("fox", 0),
+            ("ran", 1),
+            ("The", 2),
+            ("fox", 2),
+            ("ran", 3),
+        ]
 
     def test_a_band_that_fails_ends_the_page_with_the_words_read_before_it(self, tmp_path, monkeypatch):
         body = (
@@ -1079,3 +1210,25 @@ class TestRealTesseract:
         expected = {word for sentence in SENTENCES for word in sentence.split()}
         assert result.status == "ok"
         assert len(expected & {word.text for word in result.words}) >= 0.9 * len(expected)
+
+    @pytest.mark.parametrize(
+        "top",
+        [pytest.param(825, id="across-the-lower-bands-top"), pytest.param(870, id="across-the-upper-bands-bottom")],
+    )
+    def test_a_line_crossing_a_band_edge_is_read_once(self, top):
+        # The bands are rows 0..899 and 840..1649. The line's ink (36 px tall, from ~7 rows below `top`) crosses row
+        # 840 or row 899: one band reads it whole, the other reads its cut part as other words (#416).
+        font = ImageFont.load_default(size=36)
+        image = Image.new("L", (2550, 1650), 255)
+        draw = ImageDraw.Draw(image)
+        draw.text((150, 700), SENTENCES[1], fill=0, font=font)
+        draw.text((150, top), SENTENCES[0], fill=0, font=font)
+        page = RenderedPage(pixels=image.tobytes(), px_width=image.width, px_height=image.height)
+
+        result = ocr_words(bands(page), dpi=300, rotation=0, page_size_pt=(612.0, 396.0), timeout_s=60.0)
+
+        expected = SENTENCES[0].split()
+        line = [word.text for word in result.words if word.bbox.y0 > 790 * 72 / 300]  # below the first line
+        assert result.status == "ok"
+        assert len(line) == len(expected)
+        assert sum(text in expected for text in line) >= 0.9 * len(expected)

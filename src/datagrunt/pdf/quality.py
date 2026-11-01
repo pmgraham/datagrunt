@@ -44,9 +44,57 @@ char of every span, in order, cut into pieces that carry the A1
 
 ``tiny_font`` and ``zero_scale`` are recovery's rule and threshold
 (:func:`~datagrunt.pdf._hidden_rules.em_reasons`), so a textpage span and
-recovered text are flagged alike. A white fill alone is no signal:
-``matches_background`` needs the rendered background under the span (#366
-task 2).
+recovered text are flagged alike.
+
+``matches_background`` (#400) needs the page drawn: a :class:`Backdrop` is
+the page drawn without its text, in 24-bit BGR (the render worker's
+``colour`` and ``without_text`` modes). :func:`flag_background` checks each
+visible piece (no other reason) against it; colour alone never flags (white
+text on a dark box is legitimate):
+
+- Each char's background is the median of each channel over the backdrop's
+  pixels whose centres its loose box holds, clipped to the page; a box
+  holding no pixel centre (under one pixel) samples the pixel under its
+  centre. At most :data:`MAX_SAMPLES_PER_AXIS` pixels a side are sampled,
+  evenly spaced: a bound on each char's cost. A piece's background is the
+  median of each channel over its chars' (the lower median, both times).
+- Its paint is the fill for render modes 0, 2, 4 and 6 and the stroke for 1
+  and 5. Modes 3 and 7 paint nothing: never matched (a visible one is a
+  scan's OCR layer, which a reader sees as the scan). Alpha does not enter
+  the colour (a faint paint is ``transparent``).
+- The piece is flagged when the Euclidean RGB distance between its paint and
+  its background is under :data:`MATCH_DISTANCE` (4).
+
+The backdrop's pixels map onto the displayed page at its own scale on each
+axis (it is the page drawn at one DPI, each side rounded down).
+
+The gate (:func:`needs_background`) selects each visible piece that paints
+(page text or recovered; render mode not 3 or 7) whose paint is under
+:data:`MATCH_DISTANCE` of white (a page's default background), or whose box
+shares area with the box of any non-text object of the page (A2's
+:class:`~datagrunt.pdf.pdfium_engine.ObjectBoxes`: paths of any shape and
+strokes, images, shadings, forms and their contents), and every such piece
+when the page holds an object A2 could give no box (fail closed). A page is
+drawn when it selects a piece: only pages of text alone, none near white,
+are skipped. The boxes are indexed by :data:`_GATE_BANDS` bands down the
+page, and a page spends at most :data:`MAX_GATE_CHECKS` box checks: a piece
+whose checks the budget cannot pay for is selected (fail closed). Known
+limit: a background drawn with text glyphs (a ``█`` under the text) is
+removed with the text from the backdrop, so the text is checked against
+what lies under those glyphs, not against them.
+
+Order (#400): A3 assesses a page with no background; the pipeline gates it,
+draws it, and assesses it again with its :class:`Backdrop`
+(``assess_page(..., background=...)``). That assessment flags the page's
+pieces, then the recovered pieces (their own reasons first), before the
+duplicate check, then routes, measures and warns: flagged text leaves the
+routing count and ratio, the unmapped regions and the duplicate check's
+visible twins, as text with any other reason does. A page that could not
+be drawn (its render refused or failed) is assessed with why (a str) and
+fails closed: each visible piece the gate selects (see
+:func:`needs_background`) is flagged ``unchecked_background``, in the same
+place in that order, and the page warns ``background not checked: ...``.
+Pieces the gate does not select stay visible.
 
 :func:`assess_page` measures a page and routes it (#366 task 4):
 
@@ -57,15 +105,30 @@ task 2).
   Python's Unicode database) or a lone surrogate (``Cs``). Marks, format
   chars (ZWJ, LRM) and control chars are otherwise valid: nothing is
   stripped.
-- ``valid_char_ratio`` is the valid share of every span char, hidden ones
-  included. It is recorded, never routed on: a contents page whose dot
-  leaders read as U+FFFD keeps its digital text.
-- Routing counts the valid, visible (no hidden reason), non-whitespace
-  chars. ``ocr="always"`` routes vision. Under 20 routes vision, or digital
-  with a warning under ``ocr="never"``. 20 or more on a page whose raster
-  cover (of scan-like images, as for ``invisible``) is over 50 % routes
-  hybrid (OCR fills the unmapped regions), or digital under
-  ``ocr="never"``; else digital.
+- ``valid_char_ratio`` (recorded) is the valid share of every span char,
+  hidden ones and leader runs included, as ``char_count`` counts them.
+- Routing (spec §3.3 step 2, #417) reads the visible chars (in a piece with
+  no hidden reason) alone, so hidden text can neither send a page to
+  vision nor keep it out. The count is of the valid, non-whitespace ones.
+  The ratio is the valid share of the rest of them, whitespace included
+  (the spec counts spaces valid), with leader runs left out of both its
+  numerator and its denominator: a leader run is a maximal run of 3 or
+  more identical invalid chars within a piece (dot leaders that read as
+  U+FFFD, a private-use rule glyph repeated), which is layout, not text.
+  This amends the spec's rule (maintainer, 2026-11-01): a contents page
+  whose leaders are most of its chars keeps its route. Garbled text, whose
+  invalid chars vary, counts in full; a run of identical valid chars
+  (``-----``) is valid and counts. A run is found within one piece: A3
+  does not group spans into lines (A4b does), so a run a piece break cuts
+  is two runs, each judged on its own length. The routing ratio differs
+  from the recorded one on a page with hidden text or a leader run.
+- ``ocr="always"`` routes vision. A count under 20, or a ratio under 0.70,
+  routes vision, or digital under ``ocr="never"`` with a warning naming
+  each that held; a page with no visible char outside leader runs has no
+  ratio (its count, 0, routes it). Otherwise, a page whose raster cover (of
+  scan-like images, as for ``invisible``) is over 50 % routes hybrid (OCR
+  fills the unmapped regions), or digital under ``ocr="never"``; else
+  digital.
 - Unmapped regions: the box of each maximal run of invalid chars in a
   visible piece, where OCR (A5) reads what the text layer cannot say.
 
@@ -111,19 +174,28 @@ a warning, and so are dropped objects when no recovery is passed (the page's
 ``TextStats.dropped_text_objects`` is over 0 and ``recovered`` is None).
 """
 
+import math
 import unicodedata
 from bisect import bisect_left
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass, field
 from itertools import groupby
-from typing import Literal, TypeAlias, get_args
+from typing import Literal, NamedTuple, TypeAlias, get_args
 
 from datagrunt.pdf._hidden_rules import em_reasons, off_page
 from datagrunt.pdf._pdfium_common import Box, union_box
 from datagrunt.pdf._pdfium_images import RawImage
 from datagrunt.pdf._pdfium_recover import RecoveredText, duplicate_window
 from datagrunt.pdf._pdfium_text import RawSpan
-from datagrunt.pdf._validate import choice_str, int_at_least, ordered_box, positive_float, str_tuple, typed_tuple
+from datagrunt.pdf._validate import (
+    choice_str,
+    int_at_least,
+    non_blank_str,
+    ordered_box,
+    positive_float,
+    str_tuple,
+    typed_tuple,
+)
 from datagrunt.pdf.elements import (
     HIDDEN_REASONS,
     PAGE_ROUTES,
@@ -135,11 +207,15 @@ from datagrunt.pdf.elements import (
 from datagrunt.pdf.pdfium_engine import RawPage
 
 __all__ = [
+    "MATCH_DISTANCE",
+    "Backdrop",
     "OcrMode",
     "PageAssessment",
     "SpanPiece",
     "assess_page",
     "classify_spans",
+    "flag_background",
+    "needs_background",
     "raster_cover_fraction",
     "valid_char",
 ]
@@ -147,8 +223,9 @@ __all__ = [
 OcrMode: TypeAlias = Literal["auto", "always", "never"]
 """The reader's OCR option: ``"auto"`` routes by the page's text,
 ``"always"`` sends every page to vision, ``"never"`` routes no page to OCR:
-a page without enough text stays digital (with a warning) instead of going
-to vision, and one that would be hybrid stays digital."""
+a page without enough valid text, or whose text is mostly invalid, stays
+digital (with a warning) instead of going to vision, and one that would be
+hybrid stays digital."""
 
 _OCR_MODES: tuple[OcrMode, ...] = get_args(OcrMode)
 
@@ -167,6 +244,10 @@ _FAINT_ALPHA = 12
 _OCR_LAYER_COVER = 0.5
 # Valid, visible, non-whitespace chars a page needs to stay out of vision.
 _MIN_TEXT_CHARS = 20
+# The valid share of its visible chars a page needs to stay out of vision (spec §3.3 step 2, #417).
+_MIN_VALID_RATIO = 0.70
+# A run of this many identical invalid chars or more is a leader or a rule, not text: the routing ratio leaves it out.
+_MIN_LEADER_RUN = 3
 # What a char code with no Unicode mapping reads as.
 _REPLACEMENT_CHAR = "\ufffd"
 # Private use, unassigned and lone-surrogate chars carry no text.
@@ -175,6 +256,18 @@ _INVALID_CATEGORIES = frozenset({"Co", "Cn", "Cs"})
 # not checked (it stays visible) and the page warns. The corpus (data/pdfs, 95 pages) needs at most 5.
 MAX_DUPLICATE_CANDIDATES = 64
 _DUPLICATE: tuple[HiddenReason, ...] = ("duplicate",)
+# Paint under this Euclidean RGB distance of the background drawn under it matches it (#400): matches_background.
+MATCH_DISTANCE = 4.0
+# A char's box is sampled at most this many pixels along each axis, evenly spaced: a bound on each char's cost.
+MAX_SAMPLES_PER_AXIS = 32
+_MATCHES_BACKGROUND: tuple[HiddenReason, ...] = ("matches_background",)
+_UNCHECKED_BACKGROUND: tuple[HiddenReason, ...] = ("unchecked_background",)
+_BGR_BYTES = 3  # blue, green and red bytes a backdrop pixel
+_WHITE_RGB = (255, 255, 255)  # a page's default background
+# The box checks the gate may spend on a page: a piece whose checks it cannot pay for is selected (fail closed).
+MAX_GATE_CHECKS = 1_000_000
+# The gate indexes a page's object boxes by this many horizontal bands of it.
+_GATE_BANDS = 32
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -308,6 +401,161 @@ def _span_pieces(span: RawSpan, width: float, height: float, raster: tuple[Box, 
         if end == len(reasons) or reasons[end] != reasons[start]:
             yield SpanPiece(span=span, start=start, end=end, hidden_reasons=reasons[start])
             start = end
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Backdrop:
+    """A page drawn without its text, in 24-bit BGR: the background its text is drawn on (#400).
+
+    The render worker draws it (``render_page(..., colour=True,
+    without_text=True)``); its pixels are its ``RenderedPage``'s.
+
+    Attributes:
+        pixels: ``px_width * px_height * 3`` bytes, row by row from the
+            displayed page's top-left corner, unpadded, a pixel's blue, green
+            and red bytes in turn. Not in repr.
+        px_width: Pixels across the displayed page.
+        px_height: Pixels down it.
+    """
+
+    pixels: bytes = field(repr=False)
+    px_width: int
+    px_height: int
+
+    def __post_init__(self) -> None:
+        int_at_least("px_width", self.px_width, 1)
+        int_at_least("px_height", self.px_height, 1)
+        if not isinstance(self.pixels, bytes):
+            raise TypeError(f"pixels must be bytes, got {type(self.pixels).__name__}")
+        expected = self.px_width * self.px_height * _BGR_BYTES
+        if len(self.pixels) != expected:
+            size = f"{self.px_width} x {self.px_height} x {_BGR_BYTES}"
+            raise ValueError(f"pixels must hold {size} = {expected} bytes, got {len(self.pixels)}")
+
+
+def flag_background(
+    pieces: tuple[SpanPiece, ...], backdrop: Backdrop, *, width_pt: float, height_pt: float
+) -> tuple[SpanPiece, ...]:
+    """``pieces``, each visible one whose paint matches the background under it flagged ``matches_background``.
+
+    See the module notes. A piece with a reason is returned as it is; so is
+    one that paints nothing (render mode 3 or 7). Pieces keep their order.
+    Cost: O(chars x MAX_SAMPLES_PER_AXIS) slices of the backdrop, each at
+    most MAX_SAMPLES_PER_AXIS pixels.
+
+    Args:
+        pieces: The pieces to check, as :func:`classify_spans` cuts them.
+        backdrop: The page drawn without its text.
+        width_pt: The displayed page width in points (``PageGeometry.width_pt``).
+        height_pt: The displayed page height in points.
+
+    Raises:
+        TypeError: If ``pieces`` is not a tuple of SpanPiece, ``backdrop`` not
+            a Backdrop, or a page side not a number (bool rejected).
+        ValueError: If a page side is not finite and greater than zero, or
+            the backdrop is not a page of that size drawn at one scale.
+    """
+    typed_tuple("pieces", pieces, SpanPiece)
+    if not isinstance(backdrop, Backdrop):
+        raise TypeError(f"backdrop must be a Backdrop, got {type(backdrop).__name__}")
+    width, height = positive_float("width_pt", width_pt), positive_float("height_pt", height_pt)
+    return _flag_background(pieces, backdrop, _scale(backdrop, width, height))
+
+
+def _scale(backdrop: Backdrop, width: float, height: float) -> tuple[float, float]:
+    """The backdrop's pixels a point across and down, once it is shown to be the page drawn at one scale.
+
+    A page drawn at ``k`` pixels a point is ``floor(width k)`` x
+    ``floor(height k)`` px, so some ``k`` lies in both sides' intervals
+    ``[px / side, (px + 1) / side)``.
+
+    Raises:
+        ValueError: If no single scale draws the page at the backdrop's size.
+    """
+    across, down = backdrop.px_width / width, backdrop.px_height / height
+    ceiling = min((backdrop.px_width + 1) / width, (backdrop.px_height + 1) / height)
+    if max(across, down) > ceiling:
+        size = f"{backdrop.px_width} x {backdrop.px_height} px"
+        raise ValueError(f"backdrop is {size}: not a {width} x {height} pt page drawn at one scale")
+    return across, down
+
+
+def _flag_background(
+    pieces: tuple[SpanPiece, ...], backdrop: Backdrop, scale: tuple[float, float]
+) -> tuple[SpanPiece, ...]:
+    """:func:`flag_background` of checked input, at the backdrop's ``scale``."""
+    return tuple(_background_flagged(piece, backdrop, scale) for piece in pieces)
+
+
+def _background_flagged(piece: SpanPiece, backdrop: Backdrop, scale: tuple[float, float]) -> SpanPiece:
+    """``piece``, flagged ``matches_background`` if it is visible and its paint matches its background."""
+    if piece.hidden_reasons or not _matches_background(piece, backdrop, scale):
+        return piece
+    return SpanPiece(span=piece.span, start=piece.start, end=piece.end, hidden_reasons=_MATCHES_BACKGROUND)
+
+
+def _matches_background(piece: SpanPiece, backdrop: Backdrop, scale: tuple[float, float]) -> bool:
+    """True if the piece paints and its paint is under MATCH_DISTANCE of its background."""
+    if piece.span.render_mode in _NO_PAINT_MODES:
+        return False
+    return _near(_paint_rgb(piece.span), _background_rgb(piece, backdrop, scale))
+
+
+def _near(paint: tuple[int, int, int], background: tuple[int, int, int]) -> bool:
+    """True if the Euclidean RGB distance between the two colours is under MATCH_DISTANCE."""
+    return math.dist(paint, background) < MATCH_DISTANCE
+
+
+def _paint_rgb(span: RawSpan) -> tuple[int, int, int]:
+    """The colour the span's render mode paints: the fill for modes 0, 2, 4 and 6, else the stroke."""
+    red, green, blue, _alpha = span.fill_rgba if span.render_mode in _FILL_MODES else span.stroke_rgba
+    return red, green, blue
+
+
+def _background_rgb(piece: SpanPiece, backdrop: Backdrop, scale: tuple[float, float]) -> tuple[int, int, int]:
+    """The piece's background: each channel's median over its chars' backgrounds, as red, green, blue."""
+    samples = [_char_bgr(box, backdrop, scale) for box in piece.span.char_boxes[piece.start : piece.end]]
+    blue, green, red = (_median([sample[channel] for sample in samples]) for channel in range(_BGR_BYTES))
+    return red, green, blue
+
+
+def _char_bgr(box: Box, backdrop: Backdrop, scale: tuple[float, float]) -> tuple[int, int, int]:
+    """A char's background: each channel's median over the backdrop's pixels under its box, as blue, green, red.
+
+    Each row is three strided slices of the backdrop (one a channel): at
+    most MAX_SAMPLES_PER_AXIS rows of at most MAX_SAMPLES_PER_AXIS pixels.
+    """
+    x0, y0, x1, y1 = box
+    columns = _pixel_run(x0 * scale[0], x1 * scale[0], backdrop.px_width)
+    rows = _pixel_run(y0 * scale[1], y1 * scale[1], backdrop.px_height)
+    row_bytes, step = backdrop.px_width * _BGR_BYTES, columns.step * _BGR_BYTES
+    first, last = columns.start * _BGR_BYTES, columns[-1] * _BGR_BYTES
+    channels: tuple[list[int], list[int], list[int]] = ([], [], [])
+    for row in rows:  # at most MAX_SAMPLES_PER_AXIS
+        base = row * row_bytes
+        for channel, values in enumerate(channels):
+            values.extend(backdrop.pixels[base + first + channel : base + last + channel + 1 : step])
+    blue, green, red = (_median(values) for values in channels)
+    return blue, green, red
+
+
+def _pixel_run(low: float, high: float, size: int) -> range:
+    """The pixels ``0..size - 1`` whose centres lie in ``[low, high]``, at most MAX_SAMPLES_PER_AXIS, evenly spaced.
+
+    When none does (the span is under one pixel, or past an edge), the pixel
+    under its centre, clamped to the edge.
+    """
+    first, last = max(0, math.ceil(low - 0.5)), min(size - 1, math.floor(high - 0.5))
+    if first > last:
+        nearest = min(size - 1, max(0, math.floor((low + high) / 2)))
+        return range(nearest, nearest + 1)
+    step = -(-(last - first + 1) // MAX_SAMPLES_PER_AXIS)
+    return range(first, last + 1, step)
+
+
+def _median(values: Sequence[int]) -> int:
+    """The lower median of ``values`` (not empty)."""
+    return sorted(values)[(len(values) - 1) // 2]
 
 
 def raster_cover_fraction(images: tuple[RawImage, ...], width_pt: float, height_pt: float) -> float:
@@ -460,13 +708,23 @@ class PageAssessment:
         str_tuple("warnings", self.warnings)
 
 
-def assess_page(page: RawPage, *, ocr: OcrMode = "auto", recovered: RecoveredText | None = None) -> PageAssessment:
-    """Classify a page's spans, measure its quality and route it (see the module notes).
+def assess_page(
+    page: RawPage,
+    *,
+    ocr: OcrMode = "auto",
+    recovered: RecoveredText | None = None,
+    background: Backdrop | str | None = None,
+) -> PageAssessment:
+    """Classify a page's spans, check them against its background, measure its quality and route it.
+
+    See the module notes, and their order: the background is checked before
+    the duplicate check and the route, so flagged text counts as hidden.
 
     Cost: :func:`classify_spans` of the page's and the recovered spans, one
-    raster cover and O(chars); the duplicate check indexes the page's pieces
-    by text and makes at most :data:`MAX_DUPLICATE_CANDIDATES` box checks
-    per recovered piece.
+    raster cover and O(chars); with a backdrop, :func:`flag_background` of
+    those pieces; the duplicate check indexes the page's pieces by text and
+    makes at most :data:`MAX_DUPLICATE_CANDIDATES` box checks per recovered
+    piece.
 
     Args:
         page: The page's raw facts, as
@@ -475,24 +733,37 @@ def assess_page(page: RawPage, *, ocr: OcrMode = "auto", recovered: RecoveredTex
         recovered: The page's recovered text, as
             :func:`~datagrunt.pdf.pdfium_engine.recover_dropped_text` returns
             it, or None for none.
+        background: The page drawn without its text (a :class:`Backdrop`),
+            why it could not be drawn (a str: a warning, and each piece the
+            gate selects flagged ``unchecked_background``), or None: not
+            checked (the gate did not pass it), no warning.
 
     Raises:
-        TypeError: If ``page`` is not a RawPage, ``ocr`` is not a str, or
-            ``recovered`` is not a RecoveredText or None.
+        TypeError: If ``page`` is not a RawPage, ``ocr`` is not a str,
+            ``recovered`` is not a RecoveredText or None, or ``background``
+            not a Backdrop, a str or None.
         ValueError: If ``ocr`` is not ``"auto"``, ``"always"`` or ``"never"``,
             or ``recovered`` names another page, or does not account for
-            exactly the page's ``dropped_text_objects``.
+            exactly the page's ``dropped_text_objects``, or ``background`` is
+            a blank str, or a backdrop not of this page's size.
     """
     if not isinstance(page, RawPage):
         raise TypeError(f"page must be a RawPage, got {type(page).__name__}")
     choice_str("ocr", ocr, _OCR_MODES)
     _check_recovered(recovered, page.page_number, page.text.stats.dropped_text_objects)
+    _check_background(background)
     width, height = page.geometry.width_pt, page.geometry.height_pt
     boxes = _scan_boxes(page.images.images)
     cover = _cover_fraction(boxes, width, height)
     pieces = _classify(page.text.spans, width, height, boxes, cover)
-    flagged, unchecked = _recovered_pieces(recovered, pieces, width, height, boxes, cover)
-    route, warnings = _route(_text_char_count(pieces), cover, ocr)
+    own = _recovered_own(recovered, width, height, boxes, cover)
+    if isinstance(background, Backdrop):
+        scale = _scale(background, width, height)
+        pieces, own = _flag_background(pieces, background, scale), _flag_background(own, background, scale)
+    elif background is not None:
+        pieces, own = _flag_unchecked(pieces, page), _flag_unchecked(own, page)
+    flagged, unchecked = _duplicates_flagged(own, pieces)
+    route, warnings = _route(_visible_text(pieces), cover, ocr)
     warnings += _recovery_warnings(recovered, page.text.stats.dropped_text_objects)
     return PageAssessment(
         pieces=pieces,
@@ -500,7 +771,95 @@ def assess_page(page: RawPage, *, ocr: OcrMode = "auto", recovered: RecoveredTex
         quality=_quality(page, pieces + flagged),
         route=route,
         unmapped_regions=_unmapped_regions(pieces),
-        warnings=warnings + _duplicate_warnings(unchecked),
+        warnings=warnings + _duplicate_warnings(unchecked) + _background_warnings(background),
+    )
+
+
+def _check_background(background: object) -> None:
+    """Require a Backdrop, a non-blank str (why the page was not drawn) or None."""
+    if background is None or isinstance(background, Backdrop):
+        return
+    if not isinstance(background, str):
+        raise TypeError(f"background must be a Backdrop, a str or None, got {type(background).__name__}")
+    non_blank_str("background", background)
+
+
+def _background_warnings(background: Backdrop | str | None) -> tuple[str, ...]:
+    """The warning of a page whose background could not be checked (``background`` says why), if so."""
+    return (f"background not checked: {background}",) if isinstance(background, str) else ()
+
+
+def needs_background(page: RawPage, assessment: PageAssessment) -> bool:
+    """Whether the page must be drawn to check its text's background: the gate (see the module notes).
+
+    True when a visible piece of ``assessment`` (page or recovered) that
+    paints (render mode not 3 or 7) has a paint under MATCH_DISTANCE of
+    white, or overlaps (with area) any non-text page object of ``page``
+    (A2's ``object_boxes``: paths, images, shadings, forms), or when an
+    object's box cannot be read (fail closed). Cost: O(objects) to band the
+    boxes, then O(pieces x boxes in their bands), within MAX_GATE_CHECKS.
+
+    Raises:
+        TypeError: If ``page`` is not a RawPage or ``assessment`` not a PageAssessment.
+    """
+    if not isinstance(page, RawPage):
+        raise TypeError(f"page must be a RawPage, got {type(page).__name__}")
+    if not isinstance(assessment, PageAssessment):
+        raise TypeError(f"assessment must be a PageAssessment, got {type(assessment).__name__}")
+    return any(_gate_selection((*assessment.pieces, *assessment.recovered_pieces), page))
+
+
+def _gate_selection(pieces: tuple[SpanPiece, ...], page: RawPage) -> tuple[bool, ...]:
+    """For each piece, whether the gate selects it: visible, painting, and near white or over paint (module notes)."""
+    found, height = page.object_boxes, page.geometry.height_pt
+    bands = _banded(found.boxes, height)
+    budget = MAX_GATE_CHECKS
+    selected: list[bool] = []
+    for piece in pieces:  # bounded: the pieces; their box checks, by the budget
+        if piece.hidden_reasons or piece.span.render_mode in _NO_PAINT_MODES:
+            selected.append(False)
+        elif found.unboxed or _near(_paint_rgb(piece.span), _WHITE_RGB):
+            selected.append(True)
+        else:
+            over, budget = _over_paint(piece.bbox, bands, height, budget)
+            selected.append(over)
+    return tuple(selected)
+
+
+def _banded(boxes: tuple[Box, ...], height: float) -> tuple[tuple[Box, ...], ...]:
+    """``boxes`` by the bands of the page each one meets; a box past an edge is in the edge's band."""
+    bands: list[list[Box]] = [[] for _ in range(_GATE_BANDS)]
+    for box in boxes:  # bounded: the boxes, each in at most _GATE_BANDS bands
+        for band in _bands_of(box[1], box[3], height):
+            bands[band].append(box)
+    return tuple(tuple(band) for band in bands)
+
+
+def _bands_of(top: float, bottom: float, height: float) -> range:
+    """The bands a span from ``top`` to ``bottom`` down a page ``height`` tall meets, clamped to the page's."""
+    first = min(_GATE_BANDS - 1, max(0, int(top / height * _GATE_BANDS)))
+    last = min(_GATE_BANDS - 1, max(0, int(bottom / height * _GATE_BANDS)))
+    return range(first, last + 1)
+
+
+def _over_paint(box: Box, bands: tuple[tuple[Box, ...], ...], height: float, budget: int) -> tuple[bool, int]:
+    """Whether ``box`` shares area with a box in the bands it meets, and the budget left; past the budget, True."""
+    x0, y0, x1, y1 = box
+    for band in _bands_of(y0, y1, height):
+        for cover in bands[band]:
+            budget -= 1
+            if budget < 0 or (cover[0] < x1 and x0 < cover[2] and cover[1] < y1 and y0 < cover[3]):
+                return True, budget
+    return False, budget
+
+
+def _flag_unchecked(pieces: tuple[SpanPiece, ...], page: RawPage) -> tuple[SpanPiece, ...]:
+    """``pieces``, each one the gate selects flagged ``unchecked_background``: its background could not be checked."""
+    return tuple(
+        SpanPiece(span=piece.span, start=piece.start, end=piece.end, hidden_reasons=_UNCHECKED_BACKGROUND)
+        if selected
+        else piece
+        for piece, selected in zip(pieces, _gate_selection(pieces, page), strict=True)
     )
 
 
@@ -525,36 +884,43 @@ def _check_recovered(recovered: object, page_number: int, dropped: int) -> None:
         raise ValueError(f"{found}: it is not this page's recovery")
 
 
-def _recovered_pieces(
-    recovered: RecoveredText | None,
-    pieces: tuple[SpanPiece, ...],
-    width: float,
-    height: float,
-    boxes: tuple[Box, ...],
-    cover: float,
-) -> tuple[tuple[SpanPiece, ...], int]:
-    """The recovered spans' pieces, and how many were past the duplicate check's cap (see the module notes).
+def _recovered_own(
+    recovered: RecoveredText | None, width: float, height: float, boxes: tuple[Box, ...], cover: float
+) -> tuple[SpanPiece, ...]:
+    """The recovered spans' pieces, in recovery order, each with its recovered reasons and the computed ones.
 
-    Each piece has its recovered reasons and the computed ones, in canonical
-    order; one with none that is a drawn copy of a visible piece of the
-    page's ``pieces`` is ``duplicate``. Cost: O(pieces) to index them by
-    text, then O(MAX_DUPLICATE_CANDIDATES) box checks per recovered piece.
+    Reasons are in canonical order. Empty without a recovery.
     """
     if recovered is None:
-        return (), 0
-    twins = _visible_by_text(pieces)
+        return ()
     found: list[SpanPiece] = []
-    unchecked = 0
     for item in recovered.spans:
         for piece in _classify((item.span,), width, height, boxes, cover):
             given = set(piece.hidden_reasons) | set(item.hidden_reasons)
             reasons = tuple(reason for reason in HIDDEN_REASONS if reason in given)
-            candidates = () if reasons else twins.get(piece.text, ())
-            if len(candidates) > MAX_DUPLICATE_CANDIDATES:
-                unchecked += 1
-            elif any(_drawn_on(piece, twin) for twin in candidates):
-                reasons = _DUPLICATE
             found.append(SpanPiece(span=piece.span, start=piece.start, end=piece.end, hidden_reasons=reasons))
+    return tuple(found)
+
+
+def _duplicates_flagged(own: tuple[SpanPiece, ...], pieces: tuple[SpanPiece, ...]) -> tuple[tuple[SpanPiece, ...], int]:
+    """The recovered pieces ``own``, each with no reason that is a drawn copy of a visible piece ``duplicate``.
+
+    Also how many were past the duplicate check's cap (see the module notes).
+    Cost: O(pieces) to index them by text, then O(MAX_DUPLICATE_CANDIDATES)
+    box checks per recovered piece.
+    """
+    twins = _visible_by_text(pieces)
+    found: list[SpanPiece] = []
+    unchecked = 0
+    for piece in own:
+        candidates = () if piece.hidden_reasons else twins.get(piece.text, ())
+        if len(candidates) > MAX_DUPLICATE_CANDIDATES:
+            unchecked += 1
+            found.append(piece)
+        elif any(_drawn_on(piece, twin) for twin in candidates):
+            found.append(SpanPiece(span=piece.span, start=piece.start, end=piece.end, hidden_reasons=_DUPLICATE))
+        else:
+            found.append(piece)
     return tuple(found), unchecked
 
 
@@ -651,28 +1017,71 @@ def _quality(page: RawPage, pieces: tuple[SpanPiece, ...]) -> PageQuality:
     )
 
 
-def _text_char_count(pieces: tuple[SpanPiece, ...]) -> int:
-    """The chars routing counts: valid, visible (in a piece with no reason) and not whitespace."""
-    visible = (piece for piece in pieces if not piece.hidden_reasons)
-    return sum(
-        1
-        for piece in visible
-        for offset in range(piece.start, piece.end)
-        if _valid(piece.span, offset) and not piece.span.text[offset].isspace()
-    )
+class _VisibleText(NamedTuple):
+    """What routing reads of a page's visible chars (those in a piece with no reason).
+
+    Attributes:
+        chars: The visible chars outside leader runs: the ratio's denominator.
+        valid: The valid ones, whitespace included (the spec counts spaces valid): the ratio's numerator.
+        counted: The valid ones that are not whitespace: the routing count.
+    """
+
+    chars: int
+    valid: int
+    counted: int
 
 
-def _route(text_chars: int, cover: float, ocr: OcrMode) -> tuple[PageRoute, tuple[str, ...]]:
-    """The page's route and warnings, from its routing char count and raster cover (see the module notes)."""
+def _visible_text(pieces: tuple[SpanPiece, ...]) -> _VisibleText:
+    """The visible chars of ``pieces`` outside leader runs, the valid ones, and the valid non-whitespace ones.
+
+    A leader run is a maximal run, within a piece, of :data:`_MIN_LEADER_RUN`
+    or more identical invalid chars (see the module notes). O(chars).
+    """
+    chars = valid = counted = 0
+    for piece in pieces:  # bounded: the pieces, then each one's runs of equal chars
+        if piece.hidden_reasons:
+            continue
+        span = piece.span
+        runs = groupby(range(piece.start, piece.end), key=lambda offset: (span.text[offset], _valid(span, offset)))
+        for (char, is_valid), run in runs:
+            length = sum(1 for _ in run)
+            if is_valid:
+                chars, valid = chars + length, valid + length
+                counted += 0 if char.isspace() else length
+            elif length < _MIN_LEADER_RUN:
+                chars += length
+    return _VisibleText(chars=chars, valid=valid, counted=counted)
+
+
+def _route(text: _VisibleText, cover: float, ocr: OcrMode) -> tuple[PageRoute, tuple[str, ...]]:
+    """The page's route and warnings, from its visible text and raster cover (see the module notes)."""
     if ocr == "always":
         return "vision", ()
-    if text_chars < _MIN_TEXT_CHARS:
+    shortfalls = _shortfalls(text)
+    if shortfalls:
         if ocr == "never":
-            count = f"{text_chars} valid, visible, non-whitespace chars (under {_MIN_TEXT_CHARS})"
-            return "digital", (f"ocr='never': the page has {count}; it stays digital instead of going to OCR",)
+            short = " and ".join(shortfalls)
+            return "digital", (f"ocr='never': the page has {short}; it stays digital instead of going to OCR",)
         return "vision", ()
     # hybrid OCRs the unmapped regions, so "never" keeps such a page digital.
     return ("hybrid" if cover > _OCR_LAYER_COVER and ocr != "never" else "digital"), ()
+
+
+def _shortfalls(text: _VisibleText) -> tuple[str, ...]:
+    """Why the page's visible text cannot stand: too few valid chars, too small a valid share, or both; else empty.
+
+    A page with no visible char outside leader runs has no ratio: its count
+    (0) is short. The ratio is shown cut to 3 places (exact, in integers),
+    so one under 0.70 never reads as 0.700.
+    """
+    found: list[str] = []
+    if text.counted < _MIN_TEXT_CHARS:
+        found.append(f"{text.counted} valid, visible, non-whitespace chars (under {_MIN_TEXT_CHARS})")
+    if text.chars and text.valid / text.chars < _MIN_VALID_RATIO:
+        ratio = f"0.{text.valid * 1000 // text.chars:03d}"
+        share = f"{text.valid} valid chars of its {text.chars} visible ones (leader runs aside)"
+        found.append(f"{share}, a ratio of {ratio} (under {_MIN_VALID_RATIO:.2f})")
+    return tuple(found)
 
 
 def _unmapped_regions(pieces: tuple[SpanPiece, ...]) -> tuple[Box, ...]:
