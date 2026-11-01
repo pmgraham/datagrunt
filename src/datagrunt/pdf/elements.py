@@ -700,9 +700,13 @@ class Table(_Element):
         extraction_method: ``"lattice"`` (ruled lines) or ``"stream"`` (whitespace).
         continued_from_id: Element id of the table this one continues (a table
             split across pages), or None.
-        column_centres: Display-space x centre of each column, left to right
-            (finite, strictly increasing, one per column), or empty when not
-            measured. The scope pass links a split table's parts by them.
+        column_centres: One display-x position per column, left to right
+            (finite, strictly increasing), or empty when not measured. A
+            stream table's is the column's alignment edge: the start, end
+            or middle, whichever its cells share, so it does not move with
+            the column's widest cell; a lattice table's is the middle of
+            its ruled column. The scope pass (A6) links a split table's
+            parts on them.
     """
 
     headers: tuple[str, ...]

@@ -9,11 +9,14 @@ import dataclasses
 import inspect
 import pickle
 import time
+from pathlib import Path
 
 import pytest
 
 from datagrunt.pdf import assembly, layout
 from datagrunt.pdf.layout import FigureSlot, LatticeResult, LatticeTable, PageLayout, StreamParagraph, page_layout
+from datagrunt.pdf.pdfium_engine import extract_page, open_document, recover_dropped_text
+from datagrunt.pdf.quality import assess_page
 from pdf_tests.test_layout_apart import LEFT, RIGHT, column_of, hidden
 from pdf_tests.test_layout_lattice import box, cell, chars
 from pdf_tests.test_layout_stream import block, line
@@ -32,8 +35,8 @@ def laid_out(*pieces, lattice=NO_TABLES, figures=(), width: float = W, height: f
 
 def named(items) -> list[str]:
     """Each item as a name: a paragraph's text (a column paragraph's as "left" / "right"), else its kind."""
-    columns = {" ".join([LEFT] * count): f"left{count}" for count in (3, 4, 6)}
-    columns |= {" ".join([RIGHT] * count): f"right{count}" for count in (3, 4, 6)}
+    columns = {" ".join([LEFT] * count): f"left{count}" for count in (3, 4, 5, 6)}
+    columns |= {" ".join([RIGHT] * count): f"right{count}" for count in (3, 4, 5, 6)}
     found = []
     for item in items:
         if isinstance(item, StreamParagraph):
@@ -220,12 +223,13 @@ class TestUnits:
 
     def test_hidden_text_on_a_background_figure_reads_with_the_text_it_touches(self):
         # The page-sized figure touches the line as the right column does, and its centre is the nearer (57 pt
-        # against 64): the paragraph still anchors it, as hidden text reads with the visible text it lies in.
+        # against 64): the paragraph still anchors it, as hidden text reads with the visible text it lies in. The
+        # figure is the columns' background, so it reads before them (#409), not between them.
         columns = (*column_of(LEFT, 10.0, 6), *column_of(RIGHT, 200.0, 6))
 
         items = laid_out(*columns, hidden("SECRET", 200.0, 90.0), figures=(box(0.0, 0.0, W, H),))
 
-        assert named(items) == ["left6", "figure0", "right6", "ApartLine"]
+        assert named(items) == ["figure0", "left6", "right6", "ApartLine"]
 
     def test_hidden_text_on_a_figure_alone_reads_with_it(self):
         items = laid_out(
@@ -287,6 +291,112 @@ class TestUnits:
         slot, ruling = FigureSlot(index=0, bbox=box(0.0, 0.0, 1.0, 1.0)), ruled(0.0, 0.0, 20.0, 20.0)
 
         assert PageLayout(items=(slot, ruling), warnings=()).items == (slot, ruling)
+
+
+def five_lines(text: str, x: float) -> tuple:
+    """Five visible lines of ``text`` from ``x``, 17 pt apart from y 10: one paragraph whose ink ends at y 90."""
+    return tuple(chars(text, x, 10.0 + 17.0 * at) for at in range(5))
+
+
+class TestBackgrounds:
+    """A figure covering 90% of a region the XY-cut cuts is its background: read first, never dealt to a column (#409).
+
+    A4b dealt every unit to a column by its centre, so a page-sized background read between the columns.
+    """
+
+    def test_a_page_sized_figure_reads_before_the_columns(self):
+        items = laid_out(*column_of(LEFT, 10.0, 6), *column_of(RIGHT, 200.0, 6), figures=(box(0.0, 0.0, W, H),))
+
+        assert named(items) == ["figure0", "left6", "right6"]
+
+    @pytest.mark.parametrize(
+        "bottom,expected",
+        [
+            # The columns' ink spans x 10-326 and y 10-90. The figure runs from y 0 across x 10-326 to ``bottom``:
+            # 72 of the 80 pt is 90% (the float product is exact), 71.2 pt 89%, dealt by its centre (x 168) to the
+            # right column, where it reads by its top, as before #409.
+            pytest.param(82.0, ["figure0", "left5", "right5"], id="90-percent"),
+            pytest.param(81.2, ["left5", "figure0", "right5"], id="89-percent"),
+        ],
+    )
+    def test_a_figure_covering_90_percent_of_the_region_is_its_background(self, bottom, expected):
+        items = laid_out(*five_lines(LEFT, 10.0), *five_lines(RIGHT, 200.0), figures=(box(10.0, 0.0, 326.0, bottom),))
+
+        assert named(items) == expected
+
+    def test_a_figure_under_one_column_is_that_columns_background(self):
+        # The right half (x 200-400) splits into two columns of its own, of 4-word lines (prose, not a table). The
+        # figure covers 53% of the page's text, so the first cut deals it to the right half by its centre; it covers
+        # all of the right half's, so it reads first there, not in the half's right column by its centre (x 302.5).
+        inner = (*column_of("one two six ten", 200.0, 6), *column_of("red tan sky sea", 310.0, 6))
+
+        items = laid_out(*column_of(LEFT, 10.0, 6), *inner, figures=(box(195.0, 0.0, 410.0, 100.0),), width=500.0)
+
+        assert named(items) == [
+            "left6",
+            "figure0",
+            " ".join(["one two six ten"] * 6),
+            " ".join(["red tan sky sea"] * 6),
+        ]
+
+    def test_a_lattice_table_over_the_columns_is_dealt_as_before(self):
+        # Only a figure is a background: a ruled table covering the columns is dealt by its centre.
+        lattice = LatticeResult(tables=(ruled(0.0, 0.0, W, H),), used_pieces=())
+
+        items = laid_out(*column_of(LEFT, 10.0, 6), *column_of(RIGHT, 200.0, 6), lattice=lattice)
+
+        assert named(items) == ["left6", "lattice", "right6"]
+
+    def test_a_figure_clear_of_the_text_covers_none_of_it(self):
+        # Below and right of the columns' ink (x 10-326, y 10-92): no overlap either way, which is none (the product
+        # of the two shortfalls, 674 x 908 pt, would pass 90% of the text's 316 x 82 pt).
+        columns = (*column_of(LEFT, 10.0, 6), *column_of(RIGHT, 200.0, 6))
+
+        items = laid_out(*columns, figures=(box(1000.0, 1000.0, 1100.0, 1100.0),), width=2000.0, height=2000.0)
+
+        assert named(items) == ["left6", "right6", "figure0"]
+
+    def test_a_region_whose_text_has_no_area_has_no_background(self):
+        # Two runs of no height cut at x 165: of no area, nothing is 90% covered (0 >= 0.9 x 0 would make the far
+        # figure a background), so the figure is dealt by its centre (x 200) to the right, as any unit.
+        boxes = [(10.0, 10.0, 130.0, 10.0), (200.0, 10.0, 326.0, 10.0), (0.0, 0.0, 400.0, 300.0)]
+
+        assert layout._xy_cut(boxes, [20, 21, 0], [True, True, False], [False, False, True]) == [[0], [1, 2]]
+
+    def test_a_figure_under_a_region_not_cut_reads_by_its_top(self):
+        # One column is no cut, so the figure reads where it starts, as any unit, though it covers 94% of the text
+        # (y 15-92 of 10-92): no column is dealt there, and a figure between a title and its caption covers most of
+        # theirs too.
+        items = laid_out(*column_of(LEFT, 10.0, 6), figures=(box(0.0, 15.0, W, H),))
+
+        assert named(items) == ["left6", "figure0"]
+
+
+LAW = Path(__file__).resolve().parents[2] / "data" / "pdfs" / "Root_Base_Law_Oct_2025.pdf"
+
+
+@pytest.mark.corpus
+@pytest.mark.skipif(not LAW.exists(), reason="Root_Base corpus not present under data/pdfs/ (local-only).")
+def test_root_law_page_4_reads_its_background_first_then_column_by_column():
+    # A4b's page-sized background (figure 0) read between the columns: it reads first now, then the left column's
+    # text, then the right's.
+    handle = open_document(LAW)
+    raw = extract_page(handle, 3)
+    recovered = recover_dropped_text(handle, 3) if raw.text.stats.dropped_text_objects else None
+    assessment = assess_page(raw, recovered=recovered)
+    lattice = layout.find_lattice_tables(raw.segments.segments, assessment.pieces)
+    figures = tuple(draft.bbox for draft in assembly.page_figures(raw.images, raw.geometry, source=LAW).drafts)
+    width, height = raw.geometry.width_pt, raw.geometry.height_pt
+
+    found = page_layout(
+        assessment.pieces, assessment.recovered_pieces, lattice, width_pt=width, height_pt=height, figures=figures
+    )
+
+    first = found.items[0]
+    assert isinstance(first, FigureSlot) and first.index == 0
+    assert (first.bbox.x1 - first.bbox.x0) * (first.bbox.y1 - first.bbox.y0) > 0.99 * width * height
+    sides = [item.bbox.x0 > width / 2 for item in found.items if isinstance(item, layout._STREAM)]
+    assert sides == sorted(sides) and False in sides and True in sides
 
 
 # Statements that open a block of control flow: each one inside another nests a level deeper.
