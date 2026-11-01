@@ -15,7 +15,9 @@ import pickle
 import re
 import subprocess
 import sys
+import threading
 import time
+from functools import partial
 from pathlib import Path
 
 import pypdfium2.raw as pdfium_c
@@ -35,7 +37,7 @@ from pdf_tests.builders import PageSpec, RasterImage, TextRun, break_page, build
 from pdf_tests.test_layout_lattice import rules as lattice_rules
 from pdf_tests.test_layout_lattice import written
 from pdf_tests.test_layout_stream_tables import body_text, table_runs
-from pdf_tests.test_ocr import needs_tesseract
+from pdf_tests.test_ocr import fake_tesseract, needs_tesseract, posix_only, row, tsv
 from pdf_tests.test_ocr_scans import LINES, TOKENS, png_of, rendered
 from pdf_tests.test_pdfium_extract_page import failing
 from pdf_tests.test_routing import BROKEN_LINE, MAPPED_LINE, garbled, garbled_page
@@ -242,7 +244,7 @@ def hang_on_page_3(message, replies):
 
 def extracted(message):
     """The pages the pipeline's worker would send for ``message``."""
-    return pipeline._extract_chunk(*pipeline._chunk_request(message))
+    return tuple(pipeline._extract_chunk(*pipeline._chunk_request(message)))
 
 
 def send_pages_reversed(message, replies):
@@ -269,6 +271,18 @@ def send_an_unknown_kind(message, replies):
     _process.send_message(replies, b"Z what")
 
 
+def send_done_early(message, replies):
+    """A worker that says done before it sends its pages."""
+    _process.send_message(replies, b"D")
+
+
+def send_pages_then_die(message, replies):
+    """A worker that sends its pages, then dies before its last check of the file (no done)."""
+    for page in extracted(message):
+        _process.send_message(replies, b"P" + pickle.dumps(page))
+    os._exit(5)
+
+
 def send_a_str_as_an_error(message, replies):
     """A worker whose error reply holds no exception."""
     _process.send_message(replies, b"E" + pickle.dumps("not an exception"))
@@ -277,15 +291,96 @@ def send_a_str_as_an_error(message, replies):
 def swap_after_first_chunk(message, replies):
     """The first chunk's worker replaces the source with ``other.pdf`` beside it once its pages are extracted."""
     if message["pages"][0] == 0:
-        real, source = pipeline._pages_in, Path(message["source"])
+        real, source = pipeline._iter_pages, Path(message["source"])
 
         def then_swap(*args):
-            pages = real(*args)
+            yield from real(*args)
             os.replace(source.with_name("other.pdf"), source)
-            return pages
 
-        pipeline._pages_in = then_swap  # this worker process only: it ends with the chunk
+        pipeline._iter_pages = then_swap  # this worker process only: it ends with the chunk
     pipeline._worker_main(message, replies)
+
+
+# The per-page pool deadline (#418, #426). Vision options with a page budget of their own, here and in a worker.
+SLOW_OCR_TIMEOUT_S = 1.0
+SLOW_OCR_SLEEP_S = 0.8  # each slow tesseract call: just under its timeout
+SLOW_OCR_BUDGET_S = 4.0
+HANG_BUDGET_S = 0.5
+QUEUE_BUDGET_S = 3.0
+SLOW_PAGE_S = 2.5  # the slow chunk's pages, each within its bound (3.75 s)
+HANG_S = 20.0  # past every bound the pins set
+
+
+def budgeted(page_budget_s: float, options: PipelineOptions, *, ocr_timeout_s: float = 120.0) -> VisionOptions:
+    """pipeline._vision's options, with a page budget of ``page_budget_s`` and tesseract's timeout ``ocr_timeout_s``."""
+    return VisionOptions(
+        vision_dpi=options.vision_dpi,
+        max_render_pixels=options.max_render_pixels,
+        ocr_timeout_s=ocr_timeout_s,
+        page_budget_s=page_budget_s,
+    )
+
+
+SLOW_OCR_VISION = partial(budgeted, SLOW_OCR_BUDGET_S, ocr_timeout_s=SLOW_OCR_TIMEOUT_S)
+HANG_VISION = partial(budgeted, HANG_BUDGET_S)
+QUEUE_VISION = partial(budgeted, QUEUE_BUDGET_S)
+
+
+def with_slow_ocr_budget(message, replies):
+    """The pipeline's worker, its vision options SLOW_OCR_VISION's (in this worker only)."""
+    pipeline._vision = SLOW_OCR_VISION
+    pipeline._worker_main(message, replies)
+
+
+def routed_after(seconds: float, *, page: int | None = None):
+    """pipeline._routed, after a sleep of ``seconds`` (on page ``page`` only, if given)."""
+    real = pipeline._routed
+
+    def route(raw, *args, **kwargs):
+        if page is None or raw.geometry.page_number == page:
+            time.sleep(seconds)
+        return real(raw, *args, **kwargs)
+
+    return route
+
+
+def hang_on_page_2(message, replies):
+    """The worker holding page 2 hangs as it routes it, past every bound; vision options HANG_VISION's."""
+    pipeline._vision = HANG_VISION
+    pipeline._routed = routed_after(HANG_S, page=2)
+    pipeline._worker_main(message, replies)
+
+
+def slow_first_chunk(message, replies):
+    """The first chunk's worker routes each page SLOW_PAGE_S late (each within its bound); vision QUEUE_VISION's."""
+    pipeline._vision = QUEUE_VISION
+    if message["pages"][0] == 0:
+        pipeline._routed = routed_after(SLOW_PAGE_S)
+    pipeline._worker_main(message, replies)
+
+
+def small_allowances(monkeypatch, start_s: float) -> None:
+    """The pool's allowances, small: a worker's start (``start_s``), a page's work, the background render's, a reap."""
+    for name, value in (
+        ("_WORKER_START_S", start_s),
+        ("_WORKER_PAGE_S", 0.25),
+        ("_BACKGROUND_START_S", 0.5),
+        ("_BACKGROUND_PAGE_S", 0.25),
+        ("_CALL_REAP_S", 0.25),
+    ):
+        monkeypatch.setattr(pipeline, name, value)
+
+
+SLOW_TESSERACT = (
+    f"cat > /dev/null\nsleep {SLOW_OCR_SLEEP_S}\n"
+    'if [ "$4" = "0" ]; then printf "Rotate: 0\\nOrientation confidence: 9.00\\n"; else cat "{d}/stdout"; fi'
+)
+
+
+def dense_page() -> PageSpec:
+    """A page of 170 lines of 4 pt text: ~35 KB pickled, so 4 of them overrun a pipe's 64 KB buffer."""
+    words = "lorem ipsum dolor sit amet consectetur " * 5
+    return PageSpec(items=tuple(TextRun(f"Row {i} {words}", 20.0, 12.0 + i * 4.5, size=4.0) for i in range(170)))
 
 
 def run_page_workers_as(monkeypatch, function: str) -> None:
@@ -1200,17 +1295,96 @@ class TestWorkers:
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 4)
         started = started_workers(monkeypatch)
         run_page_workers_as(monkeypatch, "hang_on_page_3")
-        monkeypatch.setattr(pipeline, "_WORKER_START_S", 4.0)
-        monkeypatch.setattr(pipeline, "_WORKER_PAGE_S", 1.0)
+        for name, value in (
+            ("_WORKER_START_S", 3.0),
+            ("_WORKER_PAGE_S", 0.5),
+            ("_BACKGROUND_START_S", 0.5),
+            ("_BACKGROUND_PAGE_S", 0.5),
+            ("_CALL_REAP_S", 0.5),
+        ):
+            monkeypatch.setattr(pipeline, name, value)
+
+        began = time.monotonic()
+        pooled = extract_document(path, workers=2, ocr="never")
+        elapsed = time.monotonic() - began
+
+        reason = "the worker process extracting pages 3-4 did not return page 3 within 6 s of its start: it was killed"
+        assert [page.error for page in pooled.pages] == [None, None, reason, reason]
+        # Page 3's bound from its worker's start: 3 s to start, its own 0.5 + 0.5 s (no OCR under ocr="never"), and
+        # its window's lead: page 4's 0.5 + 0.5 s and the background render's 0.5 + 0.5 s. The hung worker sleeps 60 s.
+        assert 6.0 <= elapsed < 40.0  # about 6 s here; the hung worker would reply at 60 s
+        assert_reaped(started)
+
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    @pytest.mark.parametrize(
+        "second",
+        [
+            pytest.param(PageSpec(items=LINES), id="letter"),
+            pytest.param(PageSpec(width=10.0, height=1_000_000.0), id="giant"),
+        ],
+    )
+    def test_a_hung_page_is_killed_within_its_bound_and_the_pages_before_it_kept(self, tmp_path, monkeypatch, second):
+        path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=LINES), second, *[PageSpec(items=LINES)] * 6])
+        small_allowances(monkeypatch, start_s=3.0)
+        monkeypatch.setattr(pipeline, "_vision", HANG_VISION)
+        expected = [element_texts(page) for page in extract_document(path).pages]
+        started = started_workers(monkeypatch)
+        run_page_workers_as(monkeypatch, "hang_on_page_2")
 
         began = time.monotonic()
         pooled = extract_document(path, workers=2)
         elapsed = time.monotonic() - began
 
-        reason = "the worker process extracting pages 3-4 did not return them within 6 s: it was killed"
-        assert [page.error for page in pooled.pages] == [None, None, reason, reason]
-        # The budget is 4 + 1 x 2 = 6 s from the pool's start; the hung worker sleeps 60 s.
-        assert 6.0 <= elapsed < 40.0  # about 6 s here; the hung worker would reply at 60 s
+        # Page 2's bound, however large the page: 0.25 s of work, 0.25 s of background render, its 0.5 s OCR budget
+        # and its reap, 0.25 s, from page 1's reply. Its worker hangs 20 s; pages 3-4 were never finished.
+        reason = "the worker process extracting pages 1-4 did not return page 2 within 1.25 s of page 1: it was killed"
+        assert [page.error for page in pooled.pages] == [None, reason, reason, reason, None, None, None, None]
+        kept = [0, 4, 5, 6, 7]
+        assert [element_texts(pooled.pages[index]) for index in kept] == [expected[index] for index in kept]
+        assert elapsed < 15.0  # about 2.5 s here; the hung page would return at 20 s
+        assert_reaped(started)
+
+    @posix_only
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_a_slow_but_bounded_ocr_is_never_cut_off(self, tmp_path, monkeypatch, scan_png):
+        path = build_pdf(tmp_path / "doc.pdf", [*[scan_page(scan_png)] * 3, *[PageSpec(items=LINES)] * 3])
+        fake_tesseract(tmp_path, monkeypatch, SLOW_TESSERACT, stdout=tsv(row(5, (10, 10, 50, 20), "95", "slow")))
+        small_allowances(monkeypatch, start_s=2.0)
+        monkeypatch.setattr(pipeline, "_vision", SLOW_OCR_VISION)
+        sequential = extract_document(path, dpi=72, vision_dpi=72)
+        started = started_workers(monkeypatch)
+        run_page_workers_as(monkeypatch, "with_slow_ocr_budget")
+
+        began = time.monotonic()
+        pooled = extract_document(path, workers=2, dpi=72, vision_dpi=72)
+        elapsed = time.monotonic() - began
+
+        assert pooled == sequential
+        assert [(page.status, page.route) for page in pooled.pages] == [("ok", "vision")] * 3 + [("ok", "digital")] * 3
+        assert [element_texts(page) for page in pooled.pages[:3]] == [["slow"]] * 3
+        # Pages 1-3's worker made 6 tesseract calls (OSD and one band a page at 72 DPI) of 0.8 s, each within its 1 s
+        # timeout and its page's 4 s budget: 4.8 s, past one page's bound (4.75 s) but within each page's own.
+        assert elapsed >= 6 * SLOW_OCR_SLEEP_S
+        assert_reaped(started)
+
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_a_fast_chunk_behind_a_slow_one_is_never_killed(self, tmp_path, monkeypatch):
+        # #426: pages 5-8 (~140 KB pickled, past a pipe's 64 KB) are read as they come, not after pages 1-4's.
+        path = build_pdf(tmp_path / "doc.pdf", [*[PageSpec(items=LINES)] * 4, *[dense_page()] * 4])
+        small_allowances(monkeypatch, start_s=2.0)
+        monkeypatch.setattr(pipeline, "_vision", QUEUE_VISION)
+        sequential = extract_document(path)
+        started = started_workers(monkeypatch)
+        run_page_workers_as(monkeypatch, "slow_first_chunk")
+
+        began = time.monotonic()
+        pooled = extract_document(path, workers=2)
+        elapsed = time.monotonic() - began
+
+        assert pooled == sequential
+        assert [page.status for page in pooled.pages] == ["ok"] * 8
+        # Pages 1-4 take 2.5 s each, each within its 3.75 s bound: 10 s in all, past pages 5-8's first bound (8 s).
+        assert elapsed >= 4 * SLOW_PAGE_S
         assert_reaped(started)
 
     @pytest.mark.parametrize(
@@ -1220,6 +1394,7 @@ class TestWorkers:
             pytest.param("send_more_pages", "pages 1-1 sent more than its 1 page(s)", id="more-pages"),
             pytest.param("send_an_unknown_kind", "pages 1-1 sent a reply of unknown kind b'Z'", id="unknown-kind"),
             pytest.param("send_a_str_as_an_error", "pages 1-1 sent a str as its error", id="error-not-exception"),
+            pytest.param("send_done_early", "pages 1-1 said done after 0 of its 1 page(s)", id="done-early"),
         ],
     )
     def test_a_worker_whose_reply_is_not_its_pages_fails_loud(self, tmp_path, monkeypatch, worker, message):
@@ -1244,6 +1419,13 @@ class TestWorkers:
         )
         assert all(re.fullmatch(pattern, page.error) for page in pooled.pages), [page.error for page in pooled.pages]
         assert_reaped(started)
+
+    def test_a_worker_that_dies_after_its_last_page_keeps_its_pages(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 4)
+        sequential = extract_document(path)
+        run_page_workers_as(monkeypatch, "send_pages_then_die")
+
+        assert extract_document(path, workers=2) == sequential
 
     def test_a_crashed_workers_stderr_ends_its_pages_error(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 4)
@@ -1344,7 +1526,7 @@ class TestWorkers:
         started = started_workers(monkeypatch)
         run_page_workers_as(monkeypatch, "send_pages_reversed")
 
-        message = "the worker process extracting pages 1-2 returned pages [2, 1], not pages [1, 2]"
+        message = "the worker process extracting pages 1-2 returned page 2 where page 1 was due"
         with pytest.raises(DatagruntPDFError, match=re.escape(message)):
             extract_document(path, workers=2)
 
@@ -1397,6 +1579,104 @@ class TestWorkers:
         monkeypatch.setattr(pipeline, "_pooled_pages", raising(AssertionError("the pool ran")))
 
         assert len(extract_document(path, workers=workers).pages) == pages
+
+
+# A page's bound at the defaults: 60 s of work, 30 s of background render, and, unless ocr="never", its 600 s OCR
+# budget and the reap of its last call, 15 s.
+PAGE_BOUND_S = 60.0 + 30.0 + 600.0 + 15.0
+NEVER_PAGE_BOUND_S = 60.0 + 30.0
+
+
+class TestPageDeadline:
+    """A worker is given each page's bound from its last reply (#418): its own work and budget, never its size."""
+
+    def test_a_pages_bound_is_its_work_its_background_share_and_its_ocr_budget(self):
+        assert pipeline._page_bound_s(PipelineOptions()) == PAGE_BOUND_S == 705.0  # about 12 minutes
+        assert pipeline._page_bound_s(PipelineOptions(ocr="always")) == PAGE_BOUND_S
+
+    def test_ocr_never_gives_a_smaller_page_bound(self):
+        assert pipeline._page_bound_s(PipelineOptions(ocr="never")) == NEVER_PAGE_BOUND_S == 90.0
+        assert NEVER_PAGE_BOUND_S < pipeline._page_bound_s(PipelineOptions())
+
+    def test_the_budget_is_the_one_the_worker_reads_with(self, monkeypatch):
+        monkeypatch.setattr(pipeline, "_vision", partial(budgeted, 30.0))
+
+        assert pipeline._page_bound_s(PipelineOptions()) == 60.0 + 30.0 + 30.0 + 15.0
+
+    @pytest.mark.parametrize(
+        "chunk,received,bound",
+        [
+            # Page 1: the worker's start (60 s), its own bound, and its window's lead: the 3 other pages' work and
+            # background shares (3 x 90 s), the background render's start (60 s) and reap (15 s).
+            pytest.param(range(0, 4), 0, 60.0 + PAGE_BOUND_S + 3 * 90.0 + 75.0, id="first"),
+            pytest.param(range(0, 4), 1, PAGE_BOUND_S, id="second"),
+            pytest.param(range(0, 4), 3, PAGE_BOUND_S, id="last"),
+            # Page 9 of 10 leads the second window of 8: its own bound, page 10's 90 s, the render's 75 s.
+            pytest.param(range(0, 10), 8, PAGE_BOUND_S + 90.0 + 75.0, id="second-window"),
+            pytest.param(range(20, 30), 8, PAGE_BOUND_S + 90.0 + 75.0, id="second-window-later-chunk"),
+            # After its last page: its close and last check of the file, then done.
+            pytest.param(range(0, 4), 4, 60.0, id="done"),
+        ],
+    )
+    def test_each_replys_bound(self, chunk, received, bound):
+        assert pipeline._reply_bound_s(chunk, received, PipelineOptions()) == bound
+
+
+def sleeping_worker(pages: range) -> pipeline._Worker:
+    """A worker process that sends nothing for a minute."""
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdout=subprocess.PIPE)
+    return pipeline._Worker(pages=pages, child=child, errors=io.BytesIO(), started=time.monotonic())
+
+
+class TestReplies:
+    """Each reply is read within its bound, its worker killed past it; why a chunk's pages were lost, in words."""
+
+    def test_a_reply_past_its_bound_kills_the_worker(self):
+        worker = sleeping_worker(range(0, 2))
+        try:
+            message, expired = pipeline._next_reply(worker, worker.child.stdout, 0.2)
+
+            assert (message, expired) == (None, True)
+            assert worker.child.wait(5.0) < 0  # killed by a signal
+        finally:
+            pipeline._shut_down([worker], [])
+
+    @pytest.mark.parametrize(
+        "ending,received,detail,why",
+        [
+            pytest.param("expired", 0, "", "did not return page 3 within 9 s of its start: it was killed", id="start"),
+            pytest.param("expired", 1, "", "did not return page 4 within 9 s of page 3: it was killed", id="page"),
+            pytest.param(
+                "too long",
+                1,
+                "a 9-byte message, over the 1-byte bound",
+                "sent a 9-byte message, over the 1-byte bound: it was killed",
+                id="too-long",
+            ),
+        ],
+    )
+    def test_why_a_chunks_pages_were_lost(self, ending, received, detail, why):
+        worker = pipeline._Worker(pages=range(2, 5), child=None, errors=io.BytesIO(), started=0.0)
+        replies = pipeline._Replies()
+        replies.pages, replies.ending, replies.detail, replies.bound_s = [None] * received, ending, detail, 9.0
+
+        reason = pipeline._why_lost(worker, replies, range(2 + received, 5))
+
+        assert reason == f"the worker process extracting pages 3-5 {why}"
+
+    def test_a_reader_that_does_not_end_fails_loud(self, monkeypatch):
+        monkeypatch.setattr(pipeline, "_reply_bound_s", lambda chunk, received, options: 0.01)
+        monkeypatch.setattr(pipeline, "REAP_TIMEOUT_S", 0.05)
+        worker = sleeping_worker(range(0, 1))
+        stuck = threading.Thread(target=time.sleep, args=(2.0,), daemon=True)
+        stuck.start()
+        try:
+            with pytest.raises(DatagruntPDFError, match="the replies of the worker for pages 1-1 could not be read"):
+                pipeline._joined(stuck, worker, PipelineOptions())
+
+            assert worker.child.wait(5.0) < 0  # killed first, so a reader blocked on it would end
+        finally:
+            pipeline._shut_down([worker], [])
 
 
 class TestSourceIdentity:
@@ -1582,6 +1862,25 @@ class TestPageWorker:
 
         assert [reply[:1] for reply in replies] == [b"P", b"P", b"D"]
         assert [pickle.loads(reply[1:]) for reply in replies[:2]] == [chain_page(path, 1), chain_page(path, 2)]
+
+    def test_each_page_is_sent_as_soon_as_it_is_extracted(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page(), mixed_page(), mixed_page()])
+        events: list[str] = []
+        real = pipeline._routed
+
+        def routed(raw, *args, **kwargs):
+            events.append(f"route {raw.geometry.page_number}")
+            return real(raw, *args, **kwargs)
+
+        class Sent(io.BytesIO):
+            def flush(self):  # send_message flushes each message once it is written
+                events.append("sent")
+
+        monkeypatch.setattr(pipeline, "_routed", routed)
+
+        pipeline._worker_main(self.request(path, (0, 3)), Sent())
+
+        assert events == ["route 1", "sent", "route 2", "sent", "route 3", "sent", "sent"]
 
     def test_an_error_that_stops_the_chunk_is_sent_pickled_instead(self, tmp_path):
         path = break_page(build_pdf(tmp_path / "doc.pdf", [mixed_page(), mixed_page()]), 2)
