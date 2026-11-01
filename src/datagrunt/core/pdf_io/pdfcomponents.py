@@ -14,15 +14,15 @@ from datagrunt.core.pdf_io.extraction import PdfPlumberTableExtractor
 from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
 from datagrunt.core.pdf_io.extraction.image_dedupe import dedupe_image_files
 from datagrunt.core.pdf_io.extraction.layout_sorter import ElementAdapter, PageLayoutSorter
-from datagrunt.core.pdf_io.extraction.markdown_escape import (
-    escape_leading_markdown,
-    escape_markdown_link_target,
-    escape_markdown_link_text,
-)
 from datagrunt.core.pdf_io.extraction.ocr import dpi_for_page
 from datagrunt.core.pdf_io.extraction.pdfium_native import PdfiumNativeReader
 from datagrunt.core.pdf_io.extraction.pymupdf_backend import PyMuPDFBackend
 from datagrunt.core.pdf_io.extraction.shapes import TableBlock
+from datagrunt.pdf._markdown_escape import (
+    escape_leading_markdown,
+    escape_markdown_link_target,
+    escape_markdown_link_text,
+)
 
 PIPELINE_TYPE = "pure_python_local_v1"
 

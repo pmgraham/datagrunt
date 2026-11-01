@@ -20,7 +20,7 @@ from typing import Literal, TypeAlias, Union, get_args
 import polars as pl
 import pyarrow as pa
 
-from datagrunt.core.pdf_io.extraction.markdown_escape import escape_markdown_link_target
+from datagrunt.pdf._markdown_escape import escape_markdown_link_target
 from datagrunt.pdf._validate import (
     finite_float,
     int_at_least,
