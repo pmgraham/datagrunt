@@ -13,11 +13,21 @@ from pathlib import Path
 
 from datagrunt.core.pdf_io.extraction.config import _DEFAULT_MIN_IMAGE_DIMENSION
 from datagrunt.core.pdf_io.extraction.display_frame import display_edges
-from datagrunt.core.pdf_io.extraction.image_guard import _MAX_RAW_HEADER_BYTES, inspect_image, normalize_filter
+from datagrunt.core.pdf_io.extraction.image_guard import (
+    _MAX_FILTER_ARRAY_ITEMS,
+    _MAX_RAW_HEADER_BYTES,
+    GuardDecision,
+    inspect_image,
+    normalize_filter,
+)
 from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, TextItem
 from datagrunt.core.pdf_io.filenames import embedded_image_filename
 
 logger = logging.getLogger(__name__)
+
+# PDF names are at most 127 bytes in practice; this bound, NUL included, only
+# stops a length pdfium reports from sizing the buffer.
+_MAX_FILTER_NAME_BYTES = 4096
 
 # Image objects can be nested inside form XObjects; walk deep enough to reach a
 # bomb hidden behind a few layers of forms before a render would decode it.
@@ -179,12 +189,35 @@ class PdfiumPage:
                 images += 1
         return texts, images
 
-    def _image_filters(self, obj) -> list:
-        """Return an image object's filter names (decoding order); ``[]`` on failure."""
+    def _image_filters(self, obj) -> list[str] | None:
+        """Return an image object's filter names (decoding order); None when pdfium cannot read them.
+
+        The count, each name's size and each copy are checked; a name that is
+        not UTF-8, or more than ``_MAX_FILTER_ARRAY_ITEMS`` filters, is unreadable too.
+        """
+        count = self._raw.FPDFImageObj_GetImageFilterCount(obj.raw)
+        if not 0 <= count <= _MAX_FILTER_ARRAY_ITEMS:
+            return None
+        names = []
+        for index in range(count):
+            name = self._image_filter(obj, index)
+            if name is None:
+                return None
+            names.append(name)
+        return names
+
+    def _image_filter(self, obj, index: int) -> str | None:
+        """Return filter ``index`` of an image object, or None when pdfium cannot read it."""
+        size = self._raw.FPDFImageObj_GetImageFilter(obj.raw, index, None, 0)
+        if not 1 <= size <= _MAX_FILTER_NAME_BYTES:
+            return None
+        buffer = ctypes.create_string_buffer(size)
+        if self._raw.FPDFImageObj_GetImageFilter(obj.raw, index, buffer, size) != size:
+            return None
         try:
-            return list(obj.get_filters())
-        except Exception:  # noqa: BLE001 - a missing/odd filter list must not fail the page
-            return []
+            return buffer.raw[: size - 1].decode("utf-8")
+        except UnicodeDecodeError:
+            return None
 
     def _raw_image_stream(self, obj) -> bytes | None:
         """Return an image object's raw (still-encoded) stream, or None if unreadable/too large.
@@ -208,11 +241,14 @@ class PdfiumPage:
         A JBIG2 image's decode parameters are checked by its raw stream: it is
         decoded only when the document draws that stream with no ``/JBIG2Globals``.
         """
+        label = f"page {page_number + 1} image {idx}"
         filters = self._image_filters(obj)
+        if filters is None:
+            return GuardDecision(True, f"{label}: image filters could not be read; skipped (not decoded)")
         raw = self._raw_image_stream(obj)
-        is_jbig2 = bool(filters) and normalize_filter(str(filters[-1])) == "JBIG2Decode"
+        is_jbig2 = bool(filters) and normalize_filter(filters[-1]) == "JBIG2Decode"
         unchecked = is_jbig2 and not self._drawn_without_jbig2_globals(raw)
-        return inspect_image(raw, filters, label=f"page {page_number + 1} image {idx}", jbig2_globals_missing=unchecked)
+        return inspect_image(raw, filters, label=label, jbig2_globals_missing=unchecked)
 
     def _drawn_without_jbig2_globals(self, raw: bytes | None) -> bool:
         """True when ``raw`` is a JBIG2 stream the document draws with no ``/JBIG2Globals``."""

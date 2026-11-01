@@ -1222,3 +1222,132 @@ def test_a_pdfium_page_without_the_documents_jbig2_list_decodes_no_jbig2_image(t
         "page 1 image 0: JBIG2 decode parameters could not be checked for /JBIG2Globals; skipped (not decoded)"
     ]
     assert no_decode == []
+
+
+# ---------------------------------------------------------------------------
+# Reads the guard depends on: a read that fails skips the image or the render.
+# ---------------------------------------------------------------------------
+
+FLATE_GRAY_64 = __import__("zlib").compress(b"\x80" * 64 * 64)
+FLATE_GRAY_ENTRIES = b"/Width 64 /Height 64 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode"
+
+
+def _failing_filter_count(original):
+    return lambda image: -1
+
+
+def _failing_filter_size(original):
+    return lambda image, index, buffer, length: 0
+
+
+def _short_filter_copy(original):
+    def stand_in(image, index, buffer, length):
+        size = original(image, index, None, 0)
+        return size if buffer is None else size - 1
+
+    return stand_in
+
+
+FILTER_READ_FAILURES = {
+    "count": ("FPDFImageObj_GetImageFilterCount", _failing_filter_count),
+    "name-size": ("FPDFImageObj_GetImageFilter", _failing_filter_size),
+    "name-copy": ("FPDFImageObj_GetImageFilter", _short_filter_copy),
+}
+
+
+def _assert_pdfium_skips_and_renders_nothing(path: Path, tmp_path: Path, calls: list, warning: str) -> None:
+    """Both pdfium schemas skip the page's image with ``warning`` and OCR nothing; its render is skipped."""
+    for native in (False, True):
+        document = PDFReader(path, engine="pdfium", native=native).to_dicts(image_output_dir=str(tmp_path / "out"))
+        assert _image_elements(document) == []
+        assert any(warning in w for w in _warnings_of(document)), (native, _warnings_of(document))
+    assert PDFWriter(path, engine="pdfium").render_pages_as_images(str(tmp_path / "pages"), dpi=72) == []
+    assert calls == []
+
+
+@pytest.mark.parametrize("failure", sorted(FILTER_READ_FAILURES))
+def test_an_image_whose_filters_cannot_be_read_is_not_decoded_by_pdfium(tmp_path, monkeypatch, failure, no_decode):
+    import pypdfium2.raw as pdfium_raw
+
+    path = image_page_pdf(tmp_path / "flate.pdf", FLATE_GRAY_64, FLATE_GRAY_ENTRIES)
+    name, stand_in = FILTER_READ_FAILURES[failure]
+    monkeypatch.setattr(pdfium_raw, name, stand_in(getattr(pdfium_raw, name)))
+
+    _assert_pdfium_skips_and_renders_nothing(
+        path, tmp_path, no_decode, "page 1 image 0: image filters could not be read"
+    )
+
+
+def test_an_image_whose_filter_name_is_not_utf8_is_not_decoded_by_pdfium(tmp_path, no_decode):
+    entries = b"/Width 64 /Height 64 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter [/FlateDecode /X#E9]"
+    path = image_page_pdf(tmp_path / "name.pdf", FLATE_GRAY_64, entries)
+
+    document = PDFReader(path, engine="pdfium").to_dicts(image_output_dir=str(tmp_path / "out"))
+
+    assert _image_elements(document) == []
+    assert "page 1 image 0: image filters could not be read; skipped (not decoded)" in _warnings_of(document)
+    assert no_decode == []
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_flate_image_is_still_decoded_and_rendered(tmp_path, engine):
+    path = image_page_pdf(tmp_path / "flate.pdf", FLATE_GRAY_64, FLATE_GRAY_ENTRIES)
+
+    natives = (False, True) if engine == "pdfium" else (False,)
+    for native in natives:
+        document = PDFReader(path, engine=engine, native=native).to_dicts(image_output_dir=str(tmp_path / "out"))
+        assert len(_image_elements(document)) == 1, (engine, native)
+        assert not _warnings_of(document)
+    assert len(PDFWriter(path, engine=engine).render_pages_as_images(str(tmp_path / "pages"), dpi=72)) == 1
+
+
+def _type3_indirect_charprocs_pdf(path: Path) -> Path:
+    """A Type3 font whose /CharProcs is an indirect dictionary (object 7)."""
+    glyph = b"d0 100 0 10 10 80 80 re f"
+    content = b"BT /F0 100 Tf 100 100 Td (A) Tj ET"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 100 100] /FontMatrix [0.01 0 0 0.01 0 0] "
+        b"/CharProcs 7 0 R /Encoding << /Differences [65 /ch] >> /FirstChar 65 /LastChar 65 /Widths [100] >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(glyph), glyph),
+        b"<< /ch 6 0 R >>",
+    ]
+    return hand_written_pdf(path, objects)
+
+
+KEY_READ_FAILURES = {
+    "subtype": ("xref_get_key", "Subtype", lambda path: image_page_pdf(path, FLATE_GRAY_64, FLATE_GRAY_ENTRIES)),
+    "pattern-type": (
+        "xref_get_key",
+        "PatternType",
+        lambda path: image_page_pdf(path, FLATE_GRAY_64, FLATE_GRAY_ENTRIES),
+    ),
+    "char-procs": ("xref_get_key", "CharProcs", lambda path: _type3_pdf(path, b"d0 100 0 10 10 80 80 re f")),
+    "char-procs-keys": ("xref_get_keys", None, _type3_indirect_charprocs_pdf),
+}
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("failure", sorted(KEY_READ_FAILURES))
+def test_a_render_is_skipped_when_a_key_the_scan_reads_cannot_be_read(
+    tmp_path, monkeypatch, engine, failure, no_decode
+):
+    import pymupdf
+
+    method, key, make = KEY_READ_FAILURES[failure]
+    original = getattr(pymupdf.Document, method)
+
+    def failing(document, xref, *args):
+        if key is None or args[0] == key:
+            raise RuntimeError("unreadable")
+        return original(document, xref, *args)
+
+    path = make(tmp_path / "doc.pdf")
+    monkeypatch.setattr(pymupdf.Document, method, failing)
+
+    assert PDFWriter(path, engine=engine).render_pages_as_images(str(tmp_path / "pages"), dpi=72) == []
+    assert no_decode == []

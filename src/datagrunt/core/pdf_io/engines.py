@@ -99,8 +99,12 @@ def _render_pdfium_page_to_file(
     Shared by the in-process sequential loop and the process-pool worker so the
     render-and-save step lives in exactly one place (DRY within the PDF domain).
     The caller decides, document-wide, whether the PDF may be rendered at all
-    (see ``render_guard``); this only renders.
+    (see ``render_guard``); this also refuses (``ValueError``) a page drawing an
+    image pdfium's own guard skips, such as one whose filters it cannot read.
     """
+    reasons = page.guarded_image_reasons(page_index)
+    if reasons:
+        raise ValueError(reasons[0])
     img = page.render_pil(dpi=dpi)
     out_path = directory / page_image_filename(pdf_name, page_index, ext)
     img.save(out_path, format=pil_format)

@@ -241,8 +241,8 @@ def _resolve_subtype(doc, xref: int) -> tuple[str | None, bool]:
     """Return ``(unescaped_subtype_name, unreadable)`` for ``xref``."""
     try:
         kind, value = doc.xref_get_key(xref, "Subtype")
-    except Exception:  # noqa: BLE001 - not a dictionary object
-        return None, False
+    except Exception:  # noqa: BLE001 - a non-dictionary reads as null; a failure is unreadable
+        return None, True
     if kind == "null":
         return None, False
     if kind == "name":
@@ -257,12 +257,25 @@ def _resolve_subtype(doc, xref: int) -> tuple[str | None, bool]:
     return None, True
 
 
-def _is_pattern_object(doc, xref: int) -> bool:
-    """Return True if ``xref`` declares a ``/PatternType`` entry."""
+def _is_pattern_object(doc, xref: int) -> bool | None:
+    """Return True if ``xref`` declares a ``/PatternType`` entry; None if it cannot be read."""
     try:
         return doc.xref_get_key(xref, "PatternType") != ("null", "null")
-    except Exception:  # noqa: BLE001
-        return False
+    except Exception:  # noqa: BLE001 - unreadable -> the caller blocks the render
+        return None
+
+
+def _object_content_xrefs(doc, xref: int, subtype_name: str | None) -> list[int] | str:
+    """The content streams of non-image object ``xref`` that may hold inline images, or why they cannot be read."""
+    if subtype_name == "/Form":
+        return [xref]  # annotation appearance /N streams are Form XObjects too
+    if subtype_name == "/Type3":
+        glyphs = _charproc_xrefs(doc, xref)  # glyph procedures may hold inline images
+        return glyphs if glyphs is not None else f"xref {xref}: unreadable /CharProcs; render skipped"
+    is_pattern = _is_pattern_object(doc, xref)
+    if is_pattern is None:
+        return f"xref {xref}: unreadable /PatternType; render skipped"
+    return [xref] if is_pattern else []
 
 
 def document_block_reason(doc) -> str | None:
@@ -293,12 +306,11 @@ def document_block_reason(doc) -> str | None:
             budget -= read
             if budget < 0:
                 return "image stream scan exceeded the per-document byte budget; render skipped"
-        elif subtype_name == "/Form":
-            content_xrefs.append(xref)  # annotation appearance /N streams are Form XObjects too
-        elif subtype_name == "/Type3":
-            content_xrefs.extend(_charproc_xrefs(doc, xref))  # glyph procedures may hold inline images
-        elif _is_pattern_object(doc, xref):
-            content_xrefs.append(xref)
+        else:
+            found = _object_content_xrefs(doc, xref, subtype_name)
+            if isinstance(found, str):
+                return found
+            content_xrefs.extend(found)
 
     # Inline images live in content streams, not in xref /Subtype: scan every
     # page's content and every Form XObject / tiling-pattern stream.
@@ -386,8 +398,8 @@ def jbig2_streams_without_globals_for_path(filepath) -> frozenset[str]:
         doc.close()
 
 
-def _charproc_xrefs(doc, font_xref: int) -> list:
-    """The stream xrefs of a Type3 font's ``/CharProcs`` glyph procedures.
+def _charproc_xrefs(doc, font_xref: int) -> list[int] | None:
+    """The stream xrefs of a Type3 font's ``/CharProcs`` glyph procedures; None if they cannot be read.
 
     ``/CharProcs`` is a dictionary of glyph name -> content stream; its content
     streams can draw inline images, so each is scanned. Handles both an inline
@@ -395,26 +407,19 @@ def _charproc_xrefs(doc, font_xref: int) -> list:
     """
     try:
         kind, value = doc.xref_get_key(font_xref, "CharProcs")
-    except Exception:  # noqa: BLE001
-        return []
-    if kind == "dict":
-        return [int(ref) for ref in re.findall(r"(\d+)\s+\d+\s+R", str(value))]
-    if kind == "xref":
-        try:
-            obj = int(str(value).split()[0])
-            keys = doc.xref_get_keys(obj)
-        except Exception:  # noqa: BLE001
+        if kind == "dict":
+            return [int(ref) for ref in re.findall(r"(\d+)\s+\d+\s+R", str(value))]
+        if kind != "xref":
             return []
+        obj = int(str(value).split()[0])
         xrefs = []
-        for key in keys:
-            try:
-                k, v = doc.xref_get_key(obj, key)
-            except Exception:  # noqa: BLE001
-                continue
+        for key in doc.xref_get_keys(obj):
+            k, v = doc.xref_get_key(obj, key)
             if k == "xref":
                 xrefs.append(int(str(v).split()[0]))
         return xrefs
-    return []
+    except Exception:  # noqa: BLE001 - unreadable glyph procedures -> the caller blocks the render
+        return None
 
 
 def _content_streams(doc, content_xrefs):

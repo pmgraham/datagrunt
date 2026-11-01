@@ -63,11 +63,13 @@ class PdfiumNativeReader(_ThreadLocalDocSession):
                 ]
                 ocr_used = False
                 if not full_text.strip():
-                    block = self._render_block_reason()
+                    # OCR renders the page, decoding every image it draws. If any
+                    # image anywhere in the document is guarded (render_guard,
+                    # document-wide), or pdfium's own guard skips an image on this
+                    # page, do not render; record why.
+                    page_reasons = page.guarded_image_reasons(page_index)
+                    block = self._render_block_reason() or (page_reasons[0] if page_reasons else None)
                     if block:
-                        # OCR renders the page, decoding every image it draws. If
-                        # any image anywhere in the document is a decode bomb
-                        # (render_guard, document-wide), do not render; record why.
                         warnings.append(f"OCR skipped on page {page_index + 1}: {block}")
                     else:
                         try:
