@@ -237,6 +237,16 @@ class TestChecksums:
         finally:
             (copy / A_PNG).chmod(0o644)
 
+    def test_a_read_stops_one_byte_past_its_limit(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(bundle, "_READ_CHUNK_BYTES", 4)
+        (tmp_path / "f").write_bytes(b"0123456789abcdef")
+        descriptor = os.open(tmp_path / "f", os.O_RDONLY)
+        try:
+            total, digest, data = bundle._read_fd(descriptor, 6, keep=True)
+        finally:
+            os.close(descriptor)
+        assert (total, data, digest) == (7, b"0123456", hashlib.sha256(b"0123456").hexdigest())
+
     def test_a_file_that_shrinks_while_it_is_read_is_refused(self, copy, monkeypatch):
         real = bundle._read_fd
 

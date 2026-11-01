@@ -32,7 +32,7 @@ from datagrunt.pdf.exceptions import DatagruntPDFError
 from datagrunt.pdf.ocr import bands, normalized
 from datagrunt.pdf.pipeline import extract_document
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page, render_size
-from pdf_tests.builders import PageSpec, TextRun, build_pdf, solid_png
+from pdf_tests.builders import PageSpec, Rect, TextRun, build_pdf, solid_png
 from pdf_tests.documents import FIGURE_A_SHA, FIGURE_B_SHA, PAGE_SIZES, metadata, rich_document, surrogate_document
 
 PNG_A = solid_png(64, 32, (0.2, 0.4, 0.6))
@@ -43,9 +43,21 @@ CAP, TIMEOUT = 2 << 30, 120.0
 
 
 def source_pdf(directory: Path, *, user_password=None, name="report.pdf") -> Path:
-    """A PDF of rich_document's page sizes, one line of text a page."""
+    """A PDF of rich_document's page sizes, one line of text a page.
+
+    Pages 3 and 4 (the vision pages) also hold two grey fills, so their
+    1 % autocontrast changes their pixels.
+    """
+    greys = (
+        Rect(0.0, 0.0, 612.0, 300.0, fill_rgb=(0.6, 0.6, 0.6), stroke=False),
+        Rect(0.0, 300.0, 612.0, 300.0, fill_rgb=(0.3, 0.3, 0.3), stroke=False),
+    )
     pages = [
-        PageSpec(width=width, height=height, items=(TextRun(f"Page {number}", 72.0, 100.0),))
+        PageSpec(
+            width=width,
+            height=height,
+            items=(TextRun(f"Page {number}", 72.0, 100.0), *(greys if number > 2 else ())),
+        )
         for number, (width, height) in enumerate(PAGE_SIZES, 1)
     ]
     return build_pdf(directory / name, pages, user_password=user_password)
@@ -230,6 +242,7 @@ class TestDocument:
             dpi = effective_dpi(VISION_DPI, 16_000_000, page.width_pt, page.height_pt)
             drawn = render_page(written.source, n - 1, dpi=dpi, memory_cap_bytes=CAP, timeout_s=TIMEOUT)
             expected = bands(normalized(drawn))
+            assert normalized(drawn).pixels != drawn.pixels  # the fixture tells normalized from not
             paths = page.page_image.band_paths
             assert paths == tuple(written.out / "page_images" / "bands" / f"page_{n:04d}_band_0{k}.png" for k in (1, 2))
             assert len(expected) == 2
@@ -382,12 +395,15 @@ class TestFailuresAreRecorded:
 
 
 class TestAtomicWrite:
-    def test_an_existing_non_empty_output_dir_is_refused_untouched(self, tmp_path, source, fast_render):
+    def test_an_existing_non_empty_output_dir_is_refused_untouched(self, tmp_path, source, monkeypatch):
         out = tmp_path / "out"
         out.mkdir()
         (out / "keep.txt").write_text("mine")
+        work = []
+        monkeypatch.setattr(bundle, "render_page", lambda *args, **kwargs: work.append("render"))
         with pytest.raises(FileExistsError, match="not empty"):
-            write(bound_document(source), out, source)
+            write(bound_document(source, lambda: work.append("figure") or PNG_A), out, source)
+        assert work == []  # refused before any work
         assert files_in(out) == {"keep.txt"} and (out / "keep.txt").read_text() == "mine"
         assert stagings(tmp_path) == []
 
@@ -601,7 +617,7 @@ class TestChunks:
                 running["now"] += 1
                 running["most"] = max(running["most"], running["now"])
                 events.append(("start", page_index))
-            time.sleep(0.1)
+            time.sleep(0.05 if page_index == 0 else 0.3)
             with lock:
                 running["now"] -= 1
                 events.append(("end", page_index))
