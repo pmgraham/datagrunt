@@ -23,6 +23,7 @@ from datagrunt.pdf._pdfium_common import union_box
 from datagrunt.pdf.elements import PageQuality
 from datagrunt.pdf.pdfium_engine import (
     ImageStats,
+    ObjectBoxes,
     PageFailure,
     PageGeometry,
     PageImages,
@@ -117,6 +118,7 @@ def raw_page(*spans, images=(), segments: int = 0, rotation: int = 0, dropped: i
             stats=SegmentStats(skipped_nonfinite_paths=0),
         ),
         images=PageImages(images=images, stats=image_stats),
+        object_boxes=ObjectBoxes(boxes=(), unboxed=0),
     )
 
 

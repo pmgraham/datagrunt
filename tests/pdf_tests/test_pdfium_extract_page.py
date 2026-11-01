@@ -18,6 +18,7 @@ import pytest
 from datagrunt.pdf import PDFCorruptError, pdfium_engine
 from datagrunt.pdf.pdfium_engine import (
     ImageStats,
+    ObjectBoxes,
     PageFailure,
     PageGeometry,
     PageImages,
@@ -30,6 +31,7 @@ from datagrunt.pdf.pdfium_engine import (
     open_document,
     page_geometry,
     page_images,
+    page_object_boxes,
     page_segments,
     page_text,
 )
@@ -99,11 +101,13 @@ class TestGoodPage:
             text=page_text(handle, 0),
             segments=page_segments(handle, 0),
             images=page_images(handle, 0),
+            object_boxes=page_object_boxes(handle, 0),
         )
         # Not vacuous: every stage found its item on the page.
         assert [item.text for item in got.text.spans] == ["Hello"]
         assert [item.object_index for item in got.segments.segments] == [1]
         assert [item.object_index for item in got.images.images] == [2]
+        assert len(got.object_boxes.boxes) == 2  # the line and the image
         assert (got.page_number, got.geometry.rotation_deg) == (1, rotate)
 
     def test_page_number_is_one_based(self, tmp_path):
@@ -365,10 +369,18 @@ EMPTY_IMAGES = PageImages(
     ),
 )
 
+NO_BOXES = ObjectBoxes(boxes=(), unboxed=0)
+
 
 def raw_page(**overrides) -> RawPage:
     """A valid (empty) RawPage of page 3 with ``overrides`` applied."""
-    fields = {"geometry": GEOMETRY, "text": EMPTY_TEXT, "segments": EMPTY_SEGMENTS, "images": EMPTY_IMAGES}
+    fields = {
+        "geometry": GEOMETRY,
+        "text": EMPTY_TEXT,
+        "segments": EMPTY_SEGMENTS,
+        "images": EMPTY_IMAGES,
+        "object_boxes": NO_BOXES,
+    }
     return RawPage(**(fields | overrides))
 
 

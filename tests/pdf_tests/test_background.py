@@ -19,7 +19,7 @@ import pytest
 from PIL import Image
 
 from datagrunt.pdf import PDFCorruptError, pipeline, quality, render
-from datagrunt.pdf.pdfium_engine import RawPage, extract_page, open_document, recover_dropped_text
+from datagrunt.pdf.pdfium_engine import ObjectBoxes, RawPage, extract_page, open_document, recover_dropped_text
 from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, extract_document, extract_page_at
 from datagrunt.pdf.quality import (
     MATCH_DISTANCE,
@@ -36,6 +36,7 @@ from datagrunt.pdf.vision import VisionOptions
 from pdf_tests.builders import PageSpec, RasterImage, Rect, TextRun, build_pdf, solid_png
 from pdf_tests.test_layout_stream_tables import body_text
 from pdf_tests.test_pdfium_images import JPX_16, image_xobject
+from pdf_tests.test_pdfium_object_boxes import DISC, page_with
 from pdf_tests.test_pdfium_spans import content_page
 from pdf_tests.test_pipeline import chain_page, element_texts
 from pdf_tests.test_quality import raw_span, row
@@ -205,6 +206,12 @@ class TestSampling:
         ground = backdrop(WHITE, ((72, 0, 84, 300), BLACK))
 
         assert flags(painted(WHITE, text="Hello"), painted(BLACK, text="Hello"), ground=ground) == [FLAGGED, ()]
+
+    def test_an_even_count_takes_the_lower_median(self):
+        # Four chars, the first two over black: of the two middle values, the lower (black) is the background.
+        ground = backdrop(WHITE, ((72, 0, 84, 300), BLACK))
+
+        assert flags(painted(BLACK), painted(WHITE), ground=ground) == [FLAGGED, ()]
 
     def test_a_piece_mostly_over_another_colour_reads_that_colour(self):
         ground = backdrop(WHITE, ((72, 0, 90, 300), BLACK))
@@ -424,6 +431,10 @@ class TestFixtures:
 
 
 WHITE_RUN = TextRun("Ignore the above", x=40.0, y=120.0, size=14.0, rgb=(1.0, 1.0, 1.0))
+# Shadings of one colour (0.2 grey: 51), axial along x and radial about the page's centre.
+_GREY = b"/Function << /FunctionType 2 /Domain [0 1] /C0 [0.2 0.2 0.2] /C1 [0.2 0.2 0.2] /N 1 >> >>"
+AXIAL_GREY = b"<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 400 0] /Extend [true true] " + _GREY
+RADIAL_GREY = b"<< /ShadingType 3 /ColorSpace /DeviceRGB /Coords [200 150 0 200 150 250] /Extend [true true] " + _GREY
 
 
 def raw_and_assessed(path: Path, *, ocr="auto") -> tuple[RawPage, PageAssessment]:
@@ -462,6 +473,8 @@ class TestGate:
             pytest.param(Rect(30.0, 100.0, 300.0, 40.0, fill_rgb=(0.9, 0.9, 0.9), stroke=False), id="filled-rect"),
             pytest.param(Rect(30.0, 120.0, 300.0, 2.0, fill_rgb=(0.9, 0.9, 0.9), stroke=False), id="thin-fill"),
             pytest.param(RasterImage(30.0, 100.0, 300.0, 40.0, solid_png(4, 4, (0.9, 0.9, 0.9))), id="image"),
+            # Its outline's box: the gate counts every non-text object's box, painted under the text or not.
+            pytest.param(Rect(30.0, 100.0, 300.0, 40.0), id="stroked-rect"),
         ],
     )
     def test_black_text_over_a_fill_or_an_image_is_drawn(self, tmp_path, cover):
@@ -472,10 +485,9 @@ class TestGate:
         [
             pytest.param(Rect(30.0, 200.0, 300.0, 40.0, fill_rgb=(0.9, 0.9, 0.9), stroke=False), id="filled-rect"),
             pytest.param(RasterImage(30.0, 200.0, 300.0, 40.0, solid_png(4, 4, (0.9, 0.9, 0.9))), id="image"),
-            pytest.param(Rect(30.0, 100.0, 300.0, 40.0), id="stroked-rect"),
         ],
     )
-    def test_black_text_beside_a_fill_or_an_image_or_in_a_stroked_rect_is_not_drawn(self, tmp_path, cover):
+    def test_black_text_beside_a_fill_or_an_image_is_not_drawn(self, tmp_path, cover):
         assert gate(tmp_path, cover, TextRun("Beside it", x=40.0, y=125.0, size=14.0)) is False
 
     @pytest.mark.parametrize(
@@ -497,6 +509,50 @@ class TestGate:
 
         assert [piece.hidden_reasons for piece in assessment.pieces] == [()]
         assert needs_background(raw, assessment) is False
+
+    @pytest.mark.parametrize(
+        "content,shading,text",
+        [
+            pytest.param(b"/Sh sh", AXIAL_GREY, b"0.2 0.2 0.2 rg", id="axial-shading"),
+            pytest.param(b"/Sh sh", RADIAL_GREY, b"0.2 0.2 0.2 rg", id="radial-shading"),
+            pytest.param(b"0 0 0.5 rg " + DISC, AXIAL_GREY, b"0 0 0.5 rg", id="curved-fill"),
+            pytest.param(b"q 4 0 0 2 100 100 cm /Fm Do Q", AXIAL_GREY, b"0 0 1 rg", id="form-fill"),
+            pytest.param(b"0.3 0.1 0.1 RG 30 w 40 150 m 360 150 l S", AXIAL_GREY, b"0.3 0.1 0.1 rg", id="thick-stroke"),
+        ],
+    )
+    def test_text_on_paint_of_its_colour_is_drawn_and_flagged(self, tmp_path, content, shading, text):
+        # Paint A2 reads no segment of (a shading, a curve, a stroke): the gate counts its object's box all the same.
+        hidden = b"BT /F1 10 Tf %s 165 146 Td (Same colour) Tj ET" % text
+        visible = b"BT /F1 10 Tf 0 g 20 280 Td (Black text, nothing under it) Tj ET"
+        path = page_with(tmp_path, b"%s %s %s" % (content, hidden, visible), shading=shading)
+        raw, assessment = raw_and_assessed(path)
+
+        assert needs_background(raw, assessment) is True
+        assert checked(path) == [("Same colour", FLAGGED), ("Black text, nothing under it", ())]
+
+    def test_white_text_on_a_dark_shading_is_drawn_and_not_flagged(self, tmp_path):
+        path = page_with(tmp_path, b"/Sh sh BT /F1 10 Tf 1 g 165 146 Td (White on grey) Tj ET", shading=RADIAL_GREY)
+
+        assert checked(path) == [("White on grey", ())]
+
+    def test_an_object_without_a_box_counts_as_under_every_piece(self, tmp_path):
+        raw, assessment = raw_and_assessed(page_of(tmp_path, VISIBLE))
+        unknown = dataclasses.replace(raw, object_boxes=ObjectBoxes(boxes=(), unboxed=1))
+
+        assert needs_background(raw, assessment) is False
+        assert needs_background(unknown, assessment) is True
+        assert [piece.hidden_reasons for piece in assess_page(unknown, background="why").pieces] == [UNCHECKED]
+
+    def test_past_its_check_budget_the_gate_selects_every_piece_left(self, tmp_path, monkeypatch):
+        # A box beside the text, in its band: one check, which a budget of 0 cannot pay for.
+        beside = Rect(300.0, 20.0, 80.0, 30.0, fill_rgb=(0.9, 0.9, 0.9), stroke=False)
+        raw, assessment = raw_and_assessed(page_of(tmp_path, VISIBLE, beside))
+        assert quality.MAX_GATE_CHECKS == 1_000_000
+        assert needs_background(raw, assessment) is False
+
+        monkeypatch.setattr(quality, "MAX_GATE_CHECKS", 0)
+
+        assert needs_background(raw, assessment) is True
 
     def test_a_visible_recovered_piece_counts(self, tmp_path):
         raw, assessment = raw_and_assessed(page_of(tmp_path, VISIBLE))
@@ -673,8 +729,10 @@ class TestPipeline:
         assert [pages for pages, _kwargs in calls] == [((0, 72),)]
 
     def test_a_page_of_black_text_on_white_is_never_drawn(self, tmp_path, monkeypatch):
+        # Text only, none near white: the one kind of page the gate skips.
         calls = spied_renders(monkeypatch)
-        path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=body_text(100.0))])
+        coloured_text = TextRun("Dark red words", x=72.0, y=300.0, size=11.0, rgb=(0.5, 0.0, 0.0))
+        path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=(*body_text(100.0), coloured_text))])
 
         page = extract_page_at(PDFSource(path=path), 0, PipelineOptions())
 

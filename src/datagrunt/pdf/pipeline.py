@@ -32,9 +32,10 @@ steps 1-3 for each page of a window before step 4 for any):
    ``matches_background`` counts as hidden. A window's gated pages are drawn
    in one worker, with the vision route's memory cap and a deadline of
    :data:`_BACKGROUND_START_S` + :data:`_BACKGROUND_PAGE_S` a page. A page
-   whose render is refused or fails is assessed with why: a warning
-   (``background not checked: ...``), nothing flagged, never dropped. A
-   render call that raises instead is each of its pages' step-5 failure.
+   whose render is refused or fails is assessed with why, and fails closed:
+   each piece the gate selects is flagged ``unchecked_background`` (hidden,
+   never dropped), and it warns ``background not checked: ...``. A render
+   call that raises instead is each of its pages' step-5 failure.
 4. The route: a digital or hybrid page is A4a's lattice tables, then A4b's
    :func:`~datagrunt.pdf.assembly.assemble_page`; a vision page is A5b's
    :func:`~datagrunt.pdf.vision.vision_page`'s (render and OCR: ``"ok"``,

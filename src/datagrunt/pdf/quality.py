@@ -68,15 +68,20 @@ text on a dark box is legitimate):
 The backdrop's pixels map onto the displayed page at its own scale on each
 axis (it is the page drawn at one DPI, each side rounded down).
 
-The gate (:func:`needs_background`): a page is drawn only when it holds a
-visible piece that paints (page text or recovered) whose paint is under
-:data:`MATCH_DISTANCE` of white (a page's default background), or whose
-box overlaps a fill or an image A2 reads: a thin fill's box, the box of a
-filled rectangle's fill edges (the union of each path object's), an image's
-box. A fill A2 reads no segment of (a curve, a shape that is no rectangle,
-a rectangle under 12 pt each way) does not pass the gate: text the same
-colour as such a fill, on a page with no other reason to be drawn, is not
-checked.
+The gate (:func:`needs_background`) selects each visible piece that paints
+(page text or recovered; render mode not 3 or 7) whose paint is under
+:data:`MATCH_DISTANCE` of white (a page's default background), or whose box
+shares area with the box of any non-text object of the page (A2's
+:class:`~datagrunt.pdf.pdfium_engine.ObjectBoxes`: paths of any shape and
+strokes, images, shadings, forms and their contents), and every such piece
+when the page holds an object A2 could give no box (fail closed). A page is
+drawn when it selects a piece: only pages of text alone, none near white,
+are skipped. The boxes are indexed by :data:`_GATE_BANDS` bands down the
+page, and a page spends at most :data:`MAX_GATE_CHECKS` box checks: a piece
+whose checks the budget cannot pay for is selected (fail closed). Known
+limit: a background drawn with text glyphs (a ``█`` under the text) is
+removed with the text from the backdrop, so the text is checked against
+what lies under those glyphs, not against them.
 
 Order (#400): A3 assesses a page with no background; the pipeline gates it,
 draws it, and assesses it again with its :class:`Backdrop`
@@ -184,7 +189,7 @@ from datagrunt.pdf.elements import (
     PageRoute,
     check_hidden_reasons,
 )
-from datagrunt.pdf.pdfium_engine import RawPage, RawSegment
+from datagrunt.pdf.pdfium_engine import RawPage
 
 __all__ = [
     "MATCH_DISTANCE",
@@ -239,6 +244,10 @@ _MATCHES_BACKGROUND: tuple[HiddenReason, ...] = ("matches_background",)
 _UNCHECKED_BACKGROUND: tuple[HiddenReason, ...] = ("unchecked_background",)
 _BGR_BYTES = 3  # blue, green and red bytes a backdrop pixel
 _WHITE_RGB = (255, 255, 255)  # a page's default background
+# The box checks the gate may spend on a page: a piece whose checks it cannot pay for is selected (fail closed).
+MAX_GATE_CHECKS = 1_000_000
+# The gate indexes a page's object boxes by this many horizontal bands of it.
+_GATE_BANDS = 32
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -779,16 +788,47 @@ def needs_background(page: RawPage, assessment: PageAssessment) -> bool:
 
 
 def _gate_selection(pieces: tuple[SpanPiece, ...], page: RawPage) -> tuple[bool, ...]:
-    """For each piece, whether the gate selects it: visible, painting, and near white or over paint."""
-    covers = (*_fill_boxes(page.segments.segments), *(image.bbox for image in page.images.images))
-    return tuple(_gate_selects(piece, covers) for piece in pieces)
+    """For each piece, whether the gate selects it: visible, painting, and near white or over paint (module notes)."""
+    found, height = page.object_boxes, page.geometry.height_pt
+    bands = _banded(found.boxes, height)
+    budget = MAX_GATE_CHECKS
+    selected: list[bool] = []
+    for piece in pieces:  # bounded: the pieces; their box checks, by the budget
+        if piece.hidden_reasons or piece.span.render_mode in _NO_PAINT_MODES:
+            selected.append(False)
+        elif found.unboxed or _near(_paint_rgb(piece.span), _WHITE_RGB):
+            selected.append(True)
+        else:
+            over, budget = _over_paint(piece.bbox, bands, height, budget)
+            selected.append(over)
+    return tuple(selected)
 
 
-def _gate_selects(piece: SpanPiece, covers: tuple[Box, ...]) -> bool:
-    """True if the piece is visible, paints (render mode not 3 or 7), and is near white or over a cover."""
-    if piece.hidden_reasons or piece.span.render_mode in _NO_PAINT_MODES:
-        return False
-    return _near(_paint_rgb(piece.span), _WHITE_RGB) or _overlaps_any(piece.bbox, covers)
+def _banded(boxes: tuple[Box, ...], height: float) -> tuple[tuple[Box, ...], ...]:
+    """``boxes`` by the bands of the page each one meets; a box past an edge is in the edge's band."""
+    bands: list[list[Box]] = [[] for _ in range(_GATE_BANDS)]
+    for box in boxes:  # bounded: the boxes, each in at most _GATE_BANDS bands
+        for band in _bands_of(box[1], box[3], height):
+            bands[band].append(box)
+    return tuple(tuple(band) for band in bands)
+
+
+def _bands_of(top: float, bottom: float, height: float) -> range:
+    """The bands a span from ``top`` to ``bottom`` down a page ``height`` tall meets, clamped to the page's."""
+    first = min(_GATE_BANDS - 1, max(0, int(top / height * _GATE_BANDS)))
+    last = min(_GATE_BANDS - 1, max(0, int(bottom / height * _GATE_BANDS)))
+    return range(first, last + 1)
+
+
+def _over_paint(box: Box, bands: tuple[tuple[Box, ...], ...], height: float, budget: int) -> tuple[bool, int]:
+    """Whether ``box`` shares area with a box in the bands it meets, and the budget left; past the budget, True."""
+    x0, y0, x1, y1 = box
+    for band in _bands_of(y0, y1, height):
+        for cover in bands[band]:
+            budget -= 1
+            if budget < 0 or (cover[0] < x1 and x0 < cover[2] and cover[1] < y1 and y0 < cover[3]):
+                return True, budget
+    return False, budget
 
 
 def _flag_unchecked(pieces: tuple[SpanPiece, ...], page: RawPage) -> tuple[SpanPiece, ...]:
@@ -799,36 +839,6 @@ def _flag_unchecked(pieces: tuple[SpanPiece, ...], page: RawPage) -> tuple[SpanP
         else piece
         for piece, selected in zip(pieces, _gate_selection(pieces, page), strict=True)
     )
-
-
-def _fill_boxes(segments: tuple[RawSegment, ...]) -> tuple[Box, ...]:
-    """The boxes A2's fill segments say are painted: each thin fill's, and each path object's fill edges' union."""
-    thin: list[Box] = []
-    edges: dict[int, Box] = {}
-    for segment in segments:  # bounded: the page's segments
-        if segment.kind == "stroke":
-            continue
-        box = _segment_box(segment)
-        if segment.kind == "thin_fill":
-            thin.append(box)
-            continue
-        known = edges.get(segment.object_index)
-        edges[segment.object_index] = box if known is None else union_box((known, box))
-    return (*thin, *edges.values())
-
-
-def _segment_box(segment: RawSegment) -> Box:
-    """The displayed box a segment covers: its length along its axis, its width across it (0 for a fill edge)."""
-    half = segment.width / 2
-    if segment.orientation == "h":
-        return segment.start, segment.position - half, segment.end, segment.position + half
-    return segment.position - half, segment.start, segment.position + half, segment.end
-
-
-def _overlaps_any(box: Box, covers: tuple[Box, ...]) -> bool:
-    """True if ``box`` and some box of ``covers`` share area (touching edges do not)."""
-    x0, y0, x1, y1 = box
-    return any(cover[0] < x1 and x0 < cover[2] and cover[1] < y1 and y0 < cover[3] for cover in covers)
 
 
 def _check_recovered(recovered: object, page_number: int, dropped: int) -> None:
