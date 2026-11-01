@@ -19,9 +19,18 @@ reuses the reason.
 import hashlib
 import logging
 import re
+import zlib
 from collections import Counter
 from typing import NamedTuple
 
+from datagrunt.core.pdf_io.extraction.content_lexer import (
+    GLOBALS_TOKEN,
+    JBIG2_DECODE_TOKEN,
+    JPX_DECODE_TOKEN,
+    InlineImage,
+    count_tokens,
+    inline_images,
+)
 from datagrunt.core.pdf_io.extraction.image_guard import (
     _ARRAY_OUTER_RE,
     _MAX_FILTER_ARRAY_ITEMS,
@@ -32,7 +41,6 @@ from datagrunt.core.pdf_io.extraction.image_guard import (
     extract_xref_filters,
     inspect_image,
     normalize_filter,
-    parse_filter_names,
     resolve_indirect_text,
     unescape_pdf_names,
 )
@@ -46,29 +54,16 @@ _MAX_SCAN_BYTES = 2 << 30  # 2 GiB
 # Most objects (xref entries) a document may have for this scan to run; past it
 # the document is refused rather than scanned.
 _MAX_SCAN_OBJECTS = 500_000
-# An inline image's dictionary (between ``BI`` and ``ID``) is tiny; its filter
-# is read within this many bytes of the ``BI``.
-_MAX_INLINE_DICT_BYTES = 4096
-# The most content-stream bytes scanned past an inline image's ``ID`` for its
-# ``EI``; a JPEG 2000 / JBIG2 header sits right after ``ID``, so this need not
-# span a whole bomb.
-_MAX_INLINE_DATA_BYTES = 1 << 20
+# The file is read in chunks of this many bytes to count name tokens; each
+# chunk keeps this many bytes of the one before (a #-escaped /JBIG2Globals is 37).
+_TOKEN_CHUNK_BYTES = 1 << 20
+_TOKEN_OVERLAP_BYTES = 64
 
-_FILTER_KEY_RE = re.compile(r"/(?:Filter|F)\b")
-_FILTER_VALUE = re.compile(r"/(?:Filter|F)\b\s*(\[[^\]]*\]|/[^\s/\[\]<>(){}]+)")
-_BI_TOKEN = re.compile(rb"(?<![^\s\]>)}])BI(?=[\s/])")
-_ID_TOKEN = re.compile(rb"(?<![^\s\]>)}])ID[\s]")
-_EI_TOKEN = re.compile(rb"[\s]EI(?=$|[\s/>])")
 _JBIG2_GLOBALS_KEY_RE = re.compile(r"/JBIG2Globals\b")
 _JBIG2_GLOBALS_NULL_RE = re.compile(r"/JBIG2Globals\s+null\b")
 _JBIG2_GLOBALS_REF_RE = re.compile(r"/JBIG2Globals\s+(\d+)\s+\d+\s+R")
 _DICT_OUTER_RE = re.compile(r"^\s*<<.*>>\s*$", re.DOTALL)
 _DECODE_PARMS_ARRAY_TOKEN_RE = re.compile(r"<<.*?>>|(\d+)\s+\d+\s+R|null\b", re.DOTALL)
-
-
-def _parse_filter_value(value) -> list:
-    """Parse a PDF ``/Filter`` entry into filter names (abbreviations kept; guard normalises)."""
-    return parse_filter_names(value)
 
 
 def _jbig2_globals_from_dict(doc, dict_text: str) -> tuple[bytes | None, bool]:
@@ -165,8 +160,17 @@ def _jbig2_globals(doc, xref: int) -> tuple[bytes | None, bool]:
     return None, True
 
 
-def _image_block_reason(doc, xref: int) -> tuple[str | None, int]:
-    """Guard decision for the image at ``xref`` and the raw bytes it read (for the budget)."""
+class _ImageScan(NamedTuple):
+    """One image object as the render scan reads it: why it blocks the render (or None), and what it counted."""
+
+    reason: str | None
+    read: int
+    is_jbig2: bool
+    resolved_globals: bool
+
+
+def _image_block_reason(doc, xref: int) -> _ImageScan:
+    """Guard decision for the image at ``xref``, the raw bytes it read (for the budget), and its JBIG2 facts."""
     filters = extract_xref_filters(doc, xref)
     globals_data, globals_missing = _jbig2_globals(doc, xref)
     try:
@@ -177,66 +181,48 @@ def _image_block_reason(doc, xref: int) -> tuple[str | None, int]:
     decision = inspect_image(
         raw, filters, label=f"xref {xref}", jbig2_globals=globals_data, jbig2_globals_missing=globals_missing
     )
-    return (decision.reason if decision.skip else None), read
+    is_jbig2 = _may_be_jbig2(filters)
+    return _ImageScan(decision.reason if decision.skip else None, read, is_jbig2, globals_data is not None)
 
 
-def _inline_dict_filters(raw_dict: str) -> list[str]:
-    """Extract inline image filter names from an unescaped dictionary text."""
-    match = _FILTER_VALUE.search(raw_dict)
-    if match is not None:
-        names = _parse_filter_value(match.group(1))
-        return names if names else [_UNREADABLE_FILTER]
-    if _FILTER_KEY_RE.search(raw_dict) is not None:
-        return [_UNREADABLE_FILTER]
-    return []
+def _may_be_jbig2(filters: list[str]) -> bool:
+    """True when ``filters`` name JBIG2Decode, or cannot be read."""
+    return any(name == _UNREADABLE_FILTER or normalize_filter(name) == "JBIG2Decode" for name in filters)
 
 
-def _inline_block_reason(content: bytes) -> str | None:
-    """Scan one decoded content stream for an inline image a render must not decode.
+def _inline_block_reason(content: bytes) -> tuple[str | None, int]:
+    """Why a render must not decode one of ``content``'s inline images (None: it may), and how many name globals.
 
-    Only an inline image whose filter is an image codec the guard does not
-    positively accept (JPEG 2000 / JBIG2 / unknown) is examined; its data
-    (between ``ID`` and the next ``EI``) is run through the guard. A simple
-    filter (or none) is bounded by ``/W`` ``/H`` and left alone. If the data
-    cannot be delimited within the bound, the render is blocked (fail closed).
+    Every inline image is read by :func:`~content_lexer.inline_images`; one it
+    cannot read for certain blocks the render. Each is run through the guard
+    (a simple filter, or none, is bounded by ``/W`` ``/H``); an image codec
+    whose data no ``EI`` ends blocks it too. A JPXDecode or JBIG2Decode name
+    anywhere in the stream (strings and comments included) that is not in an
+    image the lexer read blocks it: the lexer may have misplaced where some
+    image's data ends.
     """
-    start = 0
-    max_steps = len(content) // 2 + 1
-    for _ in range(max_steps):
-        if start >= len(content):
-            return None
-        bi_match = _BI_TOKEN.search(content, start)
-        if bi_match is None:
-            return None
-        bi_end = bi_match.end()
-        dict_window = content[bi_end : bi_end + _MAX_INLINE_DICT_BYTES]
-        id_match = _ID_TOKEN.search(dict_window)
-        if id_match is None:
-            if _FILTER_KEY_RE.search(unescape_pdf_names(dict_window.decode("latin-1"))):
-                return "inline image: stream truncated before ID; render skipped"
-            start = bi_end
-            continue
-        raw_dict = unescape_pdf_names(dict_window[: id_match.start()].decode("latin-1"))
-        filters = _inline_dict_filters(raw_dict)
-        codec = normalize_filter(filters[-1]) if filters else ""
-        if not filters or codec in _NON_IMAGE_FILTERS:
-            start = bi_end + id_match.end()  # a safe or filter-less inline image: bounded by /W /H
-            continue
-        data_start = bi_end + id_match.end()  # one whitespace byte follows ID
-        data_window = content[data_start : data_start + _MAX_INLINE_DATA_BYTES]
-        ei_match = _EI_TOKEN.search(data_window)
-        data = data_window[: ei_match.start()] if ei_match is not None else data_window
-        # An inline image's /DP is not resolved here: any /JBIG2Globals in it is not checked.
-        globals_unchecked = _JBIG2_GLOBALS_KEY_RE.search(raw_dict) is not None
+    found = inline_images(content)
+    if isinstance(found, str):
+        return f"an inline image {found}; render skipped", 0
+    for image in found:
+        # The lexer has unescaped each name once, as a reader does: escape "#" so the guard's unescape keeps it.
+        filters = [name.replace("#", "#23") for name in image.filters]
         decision = inspect_image(
-            data if data else None, filters, label="an inline image", jbig2_globals_missing=globals_unchecked
+            image.data or None, filters, label="an inline image", jbig2_globals_missing=image.has_globals
         )
         if decision.skip:
-            return decision.reason
-        if ei_match is None:
-            return "an inline image could not be delimited within the scan bound; render skipped"
-        start = data_start + ei_match.end()
-    return None
+            return decision.reason, 0
+        if filters and normalize_filter(filters[-1]) not in _NON_IMAGE_FILTERS and not image.delimited:
+            return "an inline image could not be delimited; render skipped", 0
+    named = sum(_codec_names(image) for image in found)
+    if count_tokens(JPX_DECODE_TOKEN, content) + count_tokens(JBIG2_DECODE_TOKEN, content) > named:
+        return "a JPXDecode or JBIG2Decode name lies outside the inline images read; render skipped", 0
+    return None, sum(image.has_globals for image in found)
+
+
+def _codec_names(image: InlineImage) -> int:
+    """The JPXDecode and JBIG2Decode names in an inline image's dictionary bytes, counted as the stream is."""
+    return count_tokens(JPX_DECODE_TOKEN, image.dictionary) + count_tokens(JBIG2_DECODE_TOKEN, image.dictionary)
 
 
 def _resolve_subtype(doc, xref: int) -> tuple[str | None, bool]:
@@ -286,7 +272,11 @@ def document_block_reason(doc) -> str | None:
     Scans every ``/Subtype /Image`` stream object and every page/Form content
     stream for inline images, within the byte and object budget. The first
     guarded image returns its reason; exceeding the budget returns a
-    fail-closed reason.
+    fail-closed reason. Then, for a document holding a JBIG2 image, or whose
+    bytes (the file's, its decoded object streams' or its content streams')
+    name JBIG2Decode at all, both readers must find one sound revision
+    (:func:`_one_sound_revision`); and the file may hold no more
+    ``/JBIG2Globals`` names than the scan resolved.
     """
     try:
         count = doc.xref_length()
@@ -294,38 +284,218 @@ def document_block_reason(doc) -> str | None:
         return f"document object table unreadable ({exc}); render skipped"
     if count > _MAX_SCAN_OBJECTS:
         return f"document has {count} objects, over the {_MAX_SCAN_OBJECTS}-object scan bound; render skipped"
-
-    budget = _MAX_SCAN_BYTES
-    content_xrefs: list[int] = []  # Form XObjects and tiling patterns: streams that may hold inline images
-    for xref in range(1, count):
-        subtype_name, subtype_unreadable = _resolve_subtype(doc, xref)
-        if subtype_unreadable:
-            return f"xref {xref}: unreadable /Subtype; render skipped"
-        if subtype_name == "/Image":
-            reason, read = _image_block_reason(doc, xref)
-            if reason is not None:
-                return reason
-            budget -= read
-            if budget < 0:
-                return "image stream scan exceeded the per-document byte budget; render skipped"
-        else:
-            found = _object_content_xrefs(doc, xref, subtype_name)
-            if isinstance(found, str):
-                return found
-            content_xrefs.extend(found)
-
+    scanned = _scan_objects(doc, count)
+    if isinstance(scanned, str):
+        return scanned
+    budget = _MAX_SCAN_BYTES - scanned.read
+    content_tokens, inline_resolved, inline_jbig2 = 0, 0, 0
     # Inline images live in content streams, not in xref /Subtype: scan every
     # page's content and every Form XObject / tiling-pattern stream.
-    for source, error_reason in _content_streams(doc, content_xrefs):
+    for source, error_reason in _content_streams(doc, scanned.content_xrefs):
         if error_reason is not None or source is None:
             return error_reason or "content stream unreadable; render skipped"
         budget -= len(source)
         if budget < 0:
             return "content stream scan exceeded the per-document byte budget; render skipped"
-        reason = _inline_block_reason(source)
+        reason, resolved = _inline_block_reason(source)
         if reason is not None:
             return reason
+        inline_resolved += resolved
+        content_tokens += count_tokens(GLOBALS_TOKEN, source)
+        inline_jbig2 += count_tokens(JBIG2_DECODE_TOKEN, source)
+    outside = _tokens_outside_content(doc)
+    if outside is None:
+        return "the file's JBIG2 names could not be counted; render skipped"
+    globals_outside, jbig2_outside = outside
+    if (scanned.jbig2_images or inline_jbig2 or jbig2_outside) and not _one_sound_revision(doc):
+        return "a JBIG2 image is in a file both readers do not read as one sound revision; render skipped"
+    if globals_outside + content_tokens > scanned.resolved_globals + inline_resolved:
+        return "a /JBIG2Globals name in the file is not one the scan resolved; render skipped"
     return None
+
+
+class _ObjectScan(NamedTuple):
+    """The render scan's pass over every object: content streams to read next, and its counts."""
+
+    content_xrefs: list[int]
+    read: int
+    jbig2_images: int
+    resolved_globals: int
+
+
+def _scan_objects(doc, count: int) -> _ObjectScan | str:
+    """Every image object guarded and every content stream found, or the first reason to block the render."""
+    content_xrefs: list[int] = []  # Form XObjects and tiling patterns: streams that may hold inline images
+    read, jbig2_images, resolved_globals = 0, 0, 0
+    for xref in range(1, count):
+        subtype_name, subtype_unreadable = _resolve_subtype(doc, xref)
+        if subtype_unreadable:
+            return f"xref {xref}: unreadable /Subtype; render skipped"
+        if subtype_name != "/Image":
+            found = _object_content_xrefs(doc, xref, subtype_name)
+            if isinstance(found, str):
+                return found
+            content_xrefs.extend(found)
+            continue
+        image = _image_block_reason(doc, xref)
+        if image.reason is not None:
+            return image.reason
+        read += image.read
+        jbig2_images += image.is_jbig2
+        resolved_globals += image.resolved_globals
+        if read > _MAX_SCAN_BYTES:
+            return "image stream scan exceeded the per-document byte budget; render skipped"
+    return _ObjectScan(content_xrefs, read, jbig2_images, resolved_globals)
+
+
+def _one_sound_revision(doc) -> bool:
+    """True when PyMuPDF and pdfium each read the file as one revision with a sound cross-reference table.
+
+    Asked after the scan has read every object (PyMuPDF repairs a file when it
+    first reads an object it cannot find).
+    """
+    from datagrunt.core.pdf_io.extraction.pdfium_document import pdfium_reads_one_sound_revision_for_path
+
+    path = getattr(doc, "name", "") or ""
+    return _single_unrepaired_revision(doc) and bool(path) and pdfium_reads_one_sound_revision_for_path(path)
+
+
+def _tokens_outside_content(doc) -> tuple[int, int] | None:
+    """``(/JBIG2Globals names, JBIG2Decode names)`` in the file's bytes and decoded object streams, any context.
+
+    None when they cannot be counted (no file name, an unreadable file or
+    object stream, or the byte budget): an over-count fails closed.
+    """
+    patterns = (GLOBALS_TOKEN, JBIG2_DECODE_TOKEN)
+    path = getattr(doc, "name", "") or ""
+    in_file = _file_token_counts(path, patterns) if path else None
+    in_object_streams = _object_stream_token_counts(doc, patterns)
+    if in_file is None or in_object_streams is None:
+        return None
+    return in_file[0] + in_object_streams[0], in_file[1] + in_object_streams[1]
+
+
+def _file_token_counts(path, patterns) -> tuple[int, ...] | None:
+    """How many of each of ``patterns`` the file at ``path`` holds, read in chunks; None if unreadable or too long."""
+    counts, tail, read = [0] * len(patterns), b"", 0
+    try:
+        with open(path, "rb") as source:
+            for _ in range(_MAX_SCAN_BYTES // _TOKEN_CHUNK_BYTES + 2):
+                chunk = source.read(_TOKEN_CHUNK_BYTES)
+                if not chunk:
+                    return tuple(counts)
+                read += len(chunk)
+                if read > _MAX_SCAN_BYTES:
+                    return None
+                window = tail + chunk
+                for index, pattern in enumerate(patterns):
+                    # A match ending within the kept tail was counted with the chunk before.
+                    counts[index] += sum(1 for match in pattern.finditer(window) if match.end() > len(tail))
+                tail = window[-_TOKEN_OVERLAP_BYTES:]
+    except OSError:
+        return None
+    return None
+
+
+def _object_stream_token_counts(doc, patterns) -> tuple[int, ...] | None:
+    """How many of each of ``patterns`` the document's object streams hold, decoded; None if one cannot be decoded.
+
+    The object streams are :func:`_object_stream_xrefs`'. Only an unfiltered
+    or FlateDecode one without decode parameters is decoded (zlib, its output
+    capped by the scan's byte budget); any other is doubt.
+    """
+    try:
+        count = doc.xref_length()
+    except Exception:  # noqa: BLE001 - unreadable object table
+        return None
+    streams = _object_stream_xrefs(doc, count)
+    if streams is None:
+        return None
+    counts, budget = [0] * len(patterns), _MAX_SCAN_BYTES
+    for xref in sorted(streams):
+        decoded = _decoded_object_stream(doc, xref, budget)
+        if decoded is None:
+            return None
+        budget -= len(decoded)
+        for index, pattern in enumerate(patterns):
+            counts[index] += count_tokens(pattern, decoded)
+    return tuple(counts)
+
+
+def _object_stream_xrefs(doc, count: int) -> set[int] | None:
+    """The document's object streams; None when a stream's ``/Type`` cannot be read or resolved.
+
+    Those PyMuPDF's xref entries hold compressed objects in, and every stream
+    whose ``/Type``, direct or indirect (pdfium resolves it), is ``/ObjStm``.
+    When PyMuPDF cannot list its xref entries, every stream that is not an
+    image and has no ``/Type`` is taken for one too.
+    """
+    compressed = _compressed_object_streams(doc, count)
+    found = set(compressed or ())
+    for xref in range(1, count):
+        try:
+            is_stream = doc.xref_is_stream(xref)
+        except Exception:  # noqa: BLE001 - unreadable object -> doubt
+            return None
+        if not is_stream:
+            continue
+        kind = _resolved_type(doc, xref)
+        if kind is None:
+            return None
+        untyped = compressed is None and kind == "" and _resolve_subtype(doc, xref)[0] != "/Image"
+        if kind == "/ObjStm" or untyped:
+            found.add(xref)
+    return found
+
+
+def _compressed_object_streams(doc, count: int) -> set[int] | None:
+    """The object streams PyMuPDF's xref entries (type 2) hold objects in; None when PyMuPDF cannot list them."""
+    try:
+        import pymupdf
+
+        pdf = pymupdf._as_pdf_document(doc).m_internal
+        entries = [pymupdf.mupdf.ll_pdf_get_xref_entry_no_null(pdf, xref) for xref in range(1, count)]
+        return {int(entry.ofs) for entry in entries if entry.type == "o"}
+    except Exception:  # noqa: BLE001 - this PyMuPDF does not expose them
+        return None
+
+
+def _resolved_type(doc, xref: int) -> str | None:
+    """Object ``xref``'s ``/Type`` name, unescaped and resolved if indirect; "" when it has none; None if unreadable."""
+    try:
+        kind, value = doc.xref_get_key(xref, "Type")
+    except Exception:  # noqa: BLE001 - unreadable /Type -> doubt
+        return None
+    if kind == "xref":
+        resolved = resolve_indirect_text(doc, str(value))
+        if resolved is None:
+            return None
+        kind, value = ("name", resolved) if _SINGLE_NAME_RE.match(unescape_pdf_names(resolved)) else ("other", "")
+    if kind != "name":
+        return ""
+    return unescape_pdf_names(str(value).strip())
+
+
+def _decoded_object_stream(doc, xref: int, budget: int) -> bytes | None:
+    """Object stream ``xref`` decoded within ``budget`` bytes, or None when it cannot be."""
+    filters = [normalize_filter(name) for name in extract_xref_filters(doc, xref)]
+    try:
+        raw = doc.xref_stream_raw(xref)
+        parms = doc.xref_get_key(xref, "DecodeParms")
+    except Exception:  # noqa: BLE001 - unreadable stream -> doubt
+        return None
+    if raw is None or parms != ("null", "null"):
+        return None
+    if not filters:
+        return raw
+    if filters != ["FlateDecode"]:
+        return None
+    inflater = zlib.decompressobj()
+    try:
+        decoded = inflater.decompress(raw, budget + 1)
+    except zlib.error:
+        return None
+    return decoded if inflater.eof and len(decoded) <= budget else None
 
 
 class Jbig2Agreement(NamedTuple):
@@ -360,11 +530,14 @@ def jbig2_agreement(doc) -> Jbig2Agreement:
 
     None is decoded (``_NO_AGREEMENT``) unless: PyMuPDF opened the file
     without repairing it and finds a single revision (no incremental
-    update); no content stream (pages, forms, patterns, Type3 glyphs) holds
-    an inline JBIG2 image; and every JBIG2 ``/Image`` object's raw stream is
-    the stream of exactly one ``/Image`` object, with no stream object of
-    those bytes carrying ``/JBIG2Globals`` (or decode parameters that cannot
-    be read). Any read failure, or the scan's object or byte bound, is doubt.
+    update; pdfium's own reading is checked by the pdfium engine); no
+    content stream (pages, forms, patterns, Type3 glyphs) names JBIG2Decode
+    or holds an inline image the lexer cannot read; no ``/JBIG2Globals``
+    name is in the file's bytes, its decoded object streams or its content
+    streams; and every JBIG2 ``/Image`` object's raw stream is the stream of
+    exactly one ``/Image`` object, with no stream object of those bytes
+    carrying ``/JBIG2Globals`` (or decode parameters that cannot be read).
+    Any read failure, or the scan's object or byte bound, is doubt.
     """
     if not _single_unrepaired_revision(doc):
         return _NO_AGREEMENT
@@ -372,7 +545,8 @@ def jbig2_agreement(doc) -> Jbig2Agreement:
     if scanned is None:
         return _NO_AGREEMENT
     facts, content_xrefs, budget = scanned
-    if _holds_inline_jbig2(doc, content_xrefs, budget):
+    outside = _tokens_outside_content(doc)
+    if _holds_inline_jbig2(doc, content_xrefs, budget) or outside is None or outside[0]:
         return _NO_AGREEMENT
     jbig2 = {fact.xref: fact.digest for fact in facts if fact.is_jbig2}
     images = Counter(fact.digest for fact in facts if fact.is_image)
@@ -380,7 +554,8 @@ def jbig2_agreement(doc) -> Jbig2Agreement:
     if any(images[digest] != 1 or digest in with_globals for digest in jbig2.values()):
         return _NO_AGREEMENT
     page_streams = _page_jbig2_streams(doc, jbig2)
-    if page_streams is None:
+    # PyMuPDF repairs a file when it first reads an object it cannot find: ask again after every read.
+    if page_streams is None or not _single_unrepaired_revision(doc):
         return _NO_AGREEMENT
     return Jbig2Agreement(frozenset(jbig2.values()), page_streams)
 
@@ -446,31 +621,20 @@ def _stream_fact(doc, xref: int, is_image: bool) -> _StreamFact | bool | None:
 
 
 def _holds_inline_jbig2(doc, content_xrefs: list[int], budget: int) -> bool:
-    """True when a page's or listed content stream holds an inline JBIG2 image, or cannot be read within ``budget``."""
+    """True when a page's or listed content stream may hold an inline JBIG2 image or a /JBIG2Globals name.
+
+    Also True when one cannot be read within ``budget``, or the lexer cannot
+    read its inline images for certain.
+    """
     for source, error_reason in _content_streams(doc, content_xrefs):
         if error_reason is not None or source is None:
             return True
         budget -= len(source)
-        if budget < 0 or _has_inline_jbig2(source):
+        if budget < 0 or isinstance(inline_images(source), str):
+            return True
+        if count_tokens(JBIG2_DECODE_TOKEN, source) or count_tokens(GLOBALS_TOKEN, source):
             return True
     return False
-
-
-def _has_inline_jbig2(content: bytes) -> bool:
-    """True when an inline image (``BI``) in ``content`` names JBIG2Decode, or a filter that cannot be read."""
-    start = 0
-    for _ in range(len(content) // 2 + 1):
-        bi_match = _BI_TOKEN.search(content, start)
-        if bi_match is None:
-            return False
-        window = content[bi_match.end() : bi_match.end() + _MAX_INLINE_DICT_BYTES]
-        id_match = _ID_TOKEN.search(window)
-        raw_dict = unescape_pdf_names((window[: id_match.start()] if id_match else window).decode("latin-1"))
-        filters = _inline_dict_filters(raw_dict)
-        if any(name == _UNREADABLE_FILTER or normalize_filter(name) == "JBIG2Decode" for name in filters):
-            return True
-        start = bi_match.end()
-    return True  # unreachable (each step passes a 2-byte token); at the bound, doubt
 
 
 def _page_jbig2_streams(doc, jbig2: dict[int, str]) -> tuple[frozenset[str], ...] | None:

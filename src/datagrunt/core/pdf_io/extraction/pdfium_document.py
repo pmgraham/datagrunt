@@ -56,6 +56,31 @@ def _import_pdfium():
     return pdfium, raw
 
 
+def pdfium_reads_one_sound_revision(pdf_handle, raw_module) -> bool:
+    """True when pdfium read the document's cross-reference table as valid and finds one trailer end.
+
+    One trailer end is one revision: an incremental update adds one, whether
+    its cross-reference is a table or a stream (observed: 1 and 2 for
+    either). A table pdfium had to rebuild reads as not valid.
+    """
+    if not raw_module.FPDF_DocumentHasValidCrossReferenceTable(pdf_handle):
+        return False
+    return raw_module.FPDF_GetTrailerEnds(pdf_handle, None, 0) == 1
+
+
+def pdfium_reads_one_sound_revision_for_path(filepath) -> bool:
+    """:func:`pdfium_reads_one_sound_revision` of the file at ``filepath``; False when pdfium cannot open it."""
+    try:
+        pdfium, raw = _import_pdfium()
+        pdf = pdfium.PdfDocument(str(filepath))
+    except Exception:  # noqa: BLE001 - unreadable here -> not one sound revision
+        return False
+    try:
+        return pdfium_reads_one_sound_revision(pdf.raw, raw)
+    finally:
+        pdf.close()
+
+
 class PdfiumPage:
     """A single page; exposes text/image/render primitives in datagrunt shapes."""
 
@@ -439,7 +464,10 @@ class PdfiumDocument:
         return PdfiumPage(self._pdf[page_number], self._raw, partial(self._jbig2_decodable, page_number))
 
     def _jbig2_decodable(self, page_number: int, digest: str, on_page: frozenset[str]) -> bool:
-        """True when PyMuPDF agrees: ``digest`` may be decoded and page ``page_number`` holds exactly ``on_page``."""
+        """True when pdfium reads one sound revision and PyMuPDF agrees: ``digest`` may be decoded and page
+        ``page_number`` holds exactly ``on_page``."""
+        if not pdfium_reads_one_sound_revision(self._pdf.raw, self._raw):
+            return False
         agreement = self._jbig2_agreement_with_pymupdf()
         if digest not in agreement.streams or page_number >= len(agreement.page_streams):
             return False
