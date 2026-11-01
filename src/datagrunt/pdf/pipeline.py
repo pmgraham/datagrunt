@@ -8,7 +8,9 @@ and runs the spec's construction checks (invariant 2) when it is built, so
 a bad option fails before any work. :class:`PDFSource` is where a document
 is opened from (its path and password), in this process or in a worker.
 
-:func:`extract_page_at` is one page's steps, in order; no stage is skipped:
+:func:`extract_page_at` is one page's steps, in order; no stage is skipped
+(:func:`extract_document` runs them :data:`_WINDOW_PAGES` pages at a time,
+steps 1-3 for each page of a window before step 4 for any):
 
 1. A2 :func:`~datagrunt.pdf.pdfium_engine.extract_page`. A
    :class:`~datagrunt.pdf.pdfium_engine.PageFailure` raises
@@ -20,7 +22,19 @@ is opened from (its path and password), in this process or in a worker.
    page's textpage drops text objects (``TextStats.dropped_text_objects``
    over 0).
 3. A3 :func:`~datagrunt.pdf.quality.assess_page`, with the ``ocr`` option
-   and the recovery.
+   and the recovery; then the background check (#400): a page A3's gate
+   (:func:`~datagrunt.pdf.quality.needs_background`) passes is drawn in
+   24-bit BGR without its text (:func:`~datagrunt.pdf.render.render_pages`:
+   the guarded, capped worker) at :data:`_BACKGROUND_DPI`, lowered to fit
+   :data:`_BACKGROUND_MAX_PIXELS` or the reader's ``max_render_pixels`` if
+   lower (:func:`~datagrunt.pdf.render.effective_dpi`), and assessed again
+   with that backdrop: assess, then flag, then route, so text flagged
+   ``matches_background`` counts as hidden. A window's gated pages are drawn
+   in one worker, with the vision route's memory cap and a deadline of
+   :data:`_BACKGROUND_START_S` + :data:`_BACKGROUND_PAGE_S` a page. A page
+   whose render is refused or fails is assessed with why: a warning
+   (``background not checked: ...``), nothing flagged, never dropped. A
+   render call that raises instead is each of its pages' step-5 failure.
 4. The route: a digital or hybrid page is A4a's lattice tables, then A4b's
    :func:`~datagrunt.pdf.assembly.assemble_page`; a vision page is A5b's
    :func:`~datagrunt.pdf.vision.vision_page`'s (render and OCR: ``"ok"``,
@@ -132,11 +146,12 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
-from typing import IO, BinaryIO, get_args
+from typing import IO, BinaryIO, NamedTuple, TypeVar, get_args
 
 from datagrunt.pdf._process import (
     MAX_REQUEST_BYTES,
@@ -162,6 +177,7 @@ from datagrunt.pdf.pdfium_engine import (
     DocumentInfo,
     PageFailure,
     RawPage,
+    RecoveredText,
     _checked_index,
     _checked_password,
     _checked_path,
@@ -171,8 +187,16 @@ from datagrunt.pdf.pdfium_engine import (
     page_geometry,
     recover_dropped_text,
 )
-from datagrunt.pdf.quality import OcrMode, PageAssessment, assess_page
-from datagrunt.pdf.render import _MIN_RENDER_PIXELS, _MIN_TARGET_DPI
+from datagrunt.pdf.quality import Backdrop, OcrMode, PageAssessment, assess_page, needs_background
+from datagrunt.pdf.render import (
+    _MIN_RENDER_PIXELS,
+    _MIN_TARGET_DPI,
+    RenderedPage,
+    RenderFailed,
+    RenderRefused,
+    effective_dpi,
+    render_pages,
+)
 from datagrunt.pdf.scope import apply_scope
 from datagrunt.pdf.vision import VisionOptions, fallback_page, vision_page
 
@@ -203,6 +227,21 @@ _EXIT_GRACE_S = 1.0  # a worker whose replies ended without its pages is given t
 _PAGE, _DONE, _ERROR = b"P", b"D", b"E"
 _MAX_PAGE_MESSAGE_BYTES = _MAX_ASSET_BYTES
 _CHUNK_REQUEST_KEYS = ("source", "password", "identity", "pages", "options")
+
+# The background check (#400). Pages go through steps 1-3 this many at a time; the window's gated pages are then
+# drawn in one render worker: a bound on the raw pages and backdrops held at once (at most 8 x 6 MB of pixels).
+_WINDOW_PAGES = 8
+# Its render: 72 DPI (a letter page is 612 x 792 px), lowered to fit 2,000,000 px (6 MB of BGR), or the reader's
+# max_render_pixels if lower.
+_BACKGROUND_DPI = 72
+_BACKGROUND_MAX_PIXELS = 2_000_000
+# Its worker's deadline: this, plus _BACKGROUND_PAGE_S for each page it draws. Measured here on the corpus (95 pages,
+# every one gated): a worker starts in ~0.2 s and draws a page in ~0.06 s or less, so each bound is over 100 times what
+# it covers. One worker a page would cost ~0.26 s a page; a window of 8 costs ~0.1 s a page.
+_BACKGROUND_START_S = 60.0
+_BACKGROUND_PAGE_S = 30.0
+
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -485,10 +524,48 @@ def _check_arguments(handle_source: object, options: object) -> None:
 
 
 def _isolated_page(handle: DocumentHandle, source: PDFSource, index: int, options: PipelineOptions) -> Page:
-    """Steps 1-4 for the page, isolated (step 5): a failure is an error page, or under ``strict`` raises."""
+    """Steps 1-4 for the page, each isolated (step 5): a window of one page."""
+    return _window_pages(handle, source, range(index, index + 1), options)[0]
+
+
+class _Assessed(NamedTuple):
+    """A page through steps 1-3 but its background check.
+
+    ``background_dpi`` is the DPI its background is drawn at (the gate
+    passed it), why it cannot be drawn (a str), or None (the gate did not
+    pass it).
+    """
+
+    page_index: int
+    raw: RawPage
+    recovered: RecoveredText | None
+    assessment: PageAssessment
+    background_dpi: int | str | None
+
+
+# A page's background render: the page drawn, why not, or the exception its batch raised (each page's step 5).
+_Drawn = RenderedPage | RenderRefused | RenderFailed | Exception
+
+
+def _window_pages(handle: DocumentHandle, source: PDFSource, window: range, options: PipelineOptions) -> list[Page]:
+    """The window's pages: steps 1-3 for each, its gated pages drawn in one worker, then step 4; each step isolated."""
+    staged = [_isolated(handle, index, options, partial(_assessed, handle, source, index, options)) for index in window]
+    drawn = _backgrounds(source, staged, options)
+    return [
+        item
+        if isinstance(item, Page)
+        else _isolated(
+            handle, item.page_index, options, partial(_finished, item, drawn.get(item.page_index), source, options)
+        )
+        for item in staged
+    ]
+
+
+def _isolated(handle: DocumentHandle, index: int, options: PipelineOptions, step: Callable[[], _T]) -> _T | Page:
+    """``step()`` of the page at ``index`` (step 5): a failure is an error page; under ``strict`` it raises."""
     page_number = index + 1
     try:
-        return _routed_page(handle, source, index, options)
+        return step()
     except Exception as exc:  # step 5: per-page isolation; an interrupt (BaseException) is never caught
         if not options.strict:
             return _error_page(handle, index, f"{type(exc).__name__}: {exc}")
@@ -498,8 +575,8 @@ def _isolated_page(handle: DocumentHandle, source: PDFSource, index: int, option
         raise PDFCorruptError(message, page_number=page_number) from exc
 
 
-def _routed_page(handle: DocumentHandle, source: PDFSource, index: int, options: PipelineOptions) -> Page:
-    """Steps 1-4: A2, recovery when the page drops text, A3, then the page's route."""
+def _assessed(handle: DocumentHandle, source: PDFSource, index: int, options: PipelineOptions) -> Page | _Assessed:
+    """Steps 1-3 (A2, recovery when the page drops text, A3, the gate); a page A2 could not read is fallback_page's."""
     raw = extract_page(handle, index)
     if isinstance(raw, PageFailure):
         if options.strict:
@@ -510,6 +587,72 @@ def _routed_page(handle: DocumentHandle, source: PDFSource, index: int, options:
     dropped = raw.text.stats.dropped_text_objects
     recovered = recover_dropped_text(handle, index) if dropped > 0 else None
     assessment = assess_page(raw, ocr=options.ocr, recovered=recovered)
+    return _Assessed(index, raw, recovered, assessment, _background_dpi(raw, assessment, options))
+
+
+def _background_dpi(raw: RawPage, assessment: PageAssessment, options: PipelineOptions) -> int | str | None:
+    """The DPI the page's background is drawn at, why it cannot be drawn, or None when the gate does not pass it."""
+    if not needs_background(raw, assessment):
+        return None
+    bound = min(options.max_render_pixels, _BACKGROUND_MAX_PIXELS)
+    try:
+        return effective_dpi(_BACKGROUND_DPI, bound, raw.geometry.width_pt, raw.geometry.height_pt)
+    except RenderRefused as exc:
+        return str(exc)
+
+
+def _backgrounds(source: PDFSource, staged: list[Page | _Assessed], options: PipelineOptions) -> dict[int, _Drawn]:
+    """Each gated page's background render, by page index: the window's, drawn in one worker (see the module notes).
+
+    A render call that raises is each of its pages' outcome: each raises it
+    in its own step 4, so the window's other pages are untouched.
+    """
+    pages = tuple(
+        (item.page_index, item.background_dpi)
+        for item in staged
+        if isinstance(item, _Assessed) and isinstance(item.background_dpi, int)
+    )
+    if not pages:
+        return {}
+    try:
+        drawn = render_pages(
+            source.path,
+            pages,
+            password=source.password,
+            memory_cap_bytes=_vision(options).memory_cap_bytes,
+            timeout_s=_BACKGROUND_START_S + _BACKGROUND_PAGE_S * len(pages),
+            colour=True,
+            without_text=True,
+        )
+    except Exception as exc:  # step 5, page by page: see the docstring
+        return dict.fromkeys((index for index, _dpi in pages), exc)
+    return {index: result for (index, _dpi), result in zip(pages, drawn, strict=True)}
+
+
+def _finished(item: _Assessed, drawn: _Drawn | None, source: PDFSource, options: PipelineOptions) -> Page:
+    """Step 3's background check, then step 4: the page assessed again with its backdrop (or why not), then routed."""
+    background = _background(item, drawn)
+    assessment = item.assessment
+    if background is not None:
+        assessment = assess_page(item.raw, ocr=options.ocr, recovered=item.recovered, background=background)
+    return _routed(item.raw, assessment, source, options)
+
+
+def _background(item: _Assessed, drawn: _Drawn | None) -> Backdrop | str | None:
+    """The page's backdrop, why it could not be drawn, or None (the gate did not pass it); its batch's error raised."""
+    if isinstance(item.background_dpi, str):
+        return item.background_dpi
+    if drawn is None:
+        return None
+    if isinstance(drawn, RenderedPage):
+        return Backdrop(pixels=drawn.pixels, px_width=drawn.px_width, px_height=drawn.px_height)
+    if isinstance(drawn, (RenderRefused, RenderFailed)):
+        return str(drawn)
+    raise drawn
+
+
+def _routed(raw: RawPage, assessment: PageAssessment, source: PDFSource, options: PipelineOptions) -> Page:
+    """Step 4: a vision page is A5b's vision_page; a digital or hybrid one is assembled."""
     if assessment.route == "vision":
         return vision_page(
             raw,
@@ -577,8 +720,12 @@ def _default_size_warning(reason: str) -> str:
 
 
 def _pages_in(handle: DocumentHandle, source: PDFSource, indices: range, options: PipelineOptions) -> tuple[Page, ...]:
-    """The pages at ``indices`` of the open document, in order, each one's steps isolated."""
-    return tuple(_isolated_page(handle, source, index, options) for index in indices)
+    """The pages at ``indices`` of the open document, in order, :data:`_WINDOW_PAGES` at a time; each step isolated."""
+    pages: list[Page] = []
+    for start in range(indices.start, indices.stop, _WINDOW_PAGES):  # bounded: one window per _WINDOW_PAGES pages
+        window = range(start, min(start + _WINDOW_PAGES, indices.stop))
+        pages.extend(_window_pages(handle, source, window, options))
+    return tuple(pages)
 
 
 def _is_distributed_env() -> bool:

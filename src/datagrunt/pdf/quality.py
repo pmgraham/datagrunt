@@ -68,6 +68,26 @@ text on a dark box is legitimate):
 The backdrop's pixels map onto the displayed page at its own scale on each
 axis (it is the page drawn at one DPI, each side rounded down).
 
+The gate (:func:`needs_background`): a page is drawn only when it holds a
+visible piece that paints (page text or recovered) whose paint is under
+:data:`MATCH_DISTANCE` of white (a page's default background), or whose
+box overlaps a fill or an image A2 reads: a thin fill's box, the box of a
+filled rectangle's fill edges (the union of each path object's), an image's
+box. A fill A2 reads no segment of (a curve, a shape that is no rectangle,
+a rectangle under 12 pt each way) does not pass the gate: text the same
+colour as such a fill, on a page with no other reason to be drawn, is not
+checked.
+
+Order (#400): A3 assesses a page with no background; the pipeline gates it,
+draws it, and assesses it again with its :class:`Backdrop`
+(``assess_page(..., background=...)``). That assessment flags the page's
+pieces, then the recovered pieces (their own reasons first), before the
+duplicate check, then routes, measures and warns: flagged text leaves the
+routing count, the unmapped regions and the duplicate check's visible
+twins, as text with any other reason does. A page that could not be drawn
+is assessed with why (a str): nothing is flagged, and it warns
+``background not checked: ...``.
+
 :func:`assess_page` measures a page and routes it (#366 task 4):
 
 - A char is valid text unless pdfium could not map its code to Unicode
@@ -144,7 +164,15 @@ from datagrunt.pdf._pdfium_common import Box, union_box
 from datagrunt.pdf._pdfium_images import RawImage
 from datagrunt.pdf._pdfium_recover import RecoveredText, duplicate_window
 from datagrunt.pdf._pdfium_text import RawSpan
-from datagrunt.pdf._validate import choice_str, int_at_least, ordered_box, positive_float, str_tuple, typed_tuple
+from datagrunt.pdf._validate import (
+    choice_str,
+    int_at_least,
+    non_blank_str,
+    ordered_box,
+    positive_float,
+    str_tuple,
+    typed_tuple,
+)
 from datagrunt.pdf.elements import (
     HIDDEN_REASONS,
     PAGE_ROUTES,
@@ -153,7 +181,7 @@ from datagrunt.pdf.elements import (
     PageRoute,
     check_hidden_reasons,
 )
-from datagrunt.pdf.pdfium_engine import RawPage
+from datagrunt.pdf.pdfium_engine import RawPage, RawSegment
 
 __all__ = [
     "MATCH_DISTANCE",
@@ -164,6 +192,7 @@ __all__ = [
     "assess_page",
     "classify_spans",
     "flag_background",
+    "needs_background",
     "raster_cover_fraction",
     "valid_char",
 ]
@@ -205,6 +234,7 @@ MATCH_DISTANCE = 4.0
 MAX_SAMPLES_PER_AXIS = 32
 _MATCHES_BACKGROUND: tuple[HiddenReason, ...] = ("matches_background",)
 _BGR_BYTES = 3  # blue, green and red bytes a backdrop pixel
+_WHITE_RGB = (255, 255, 255)  # a page's default background
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -645,13 +675,23 @@ class PageAssessment:
         str_tuple("warnings", self.warnings)
 
 
-def assess_page(page: RawPage, *, ocr: OcrMode = "auto", recovered: RecoveredText | None = None) -> PageAssessment:
-    """Classify a page's spans, measure its quality and route it (see the module notes).
+def assess_page(
+    page: RawPage,
+    *,
+    ocr: OcrMode = "auto",
+    recovered: RecoveredText | None = None,
+    background: Backdrop | str | None = None,
+) -> PageAssessment:
+    """Classify a page's spans, check them against its background, measure its quality and route it.
+
+    See the module notes, and their order: the background is checked before
+    the duplicate check and the route, so flagged text counts as hidden.
 
     Cost: :func:`classify_spans` of the page's and the recovered spans, one
-    raster cover and O(chars); the duplicate check indexes the page's pieces
-    by text and makes at most :data:`MAX_DUPLICATE_CANDIDATES` box checks
-    per recovered piece.
+    raster cover and O(chars); with a backdrop, :func:`flag_background` of
+    those pieces; the duplicate check indexes the page's pieces by text and
+    makes at most :data:`MAX_DUPLICATE_CANDIDATES` box checks per recovered
+    piece.
 
     Args:
         page: The page's raw facts, as
@@ -660,23 +700,33 @@ def assess_page(page: RawPage, *, ocr: OcrMode = "auto", recovered: RecoveredTex
         recovered: The page's recovered text, as
             :func:`~datagrunt.pdf.pdfium_engine.recover_dropped_text` returns
             it, or None for none.
+        background: The page drawn without its text (a :class:`Backdrop`),
+            why it could not be drawn (a str: a warning, nothing flagged), or
+            None: not checked (the gate did not pass it), no warning.
 
     Raises:
-        TypeError: If ``page`` is not a RawPage, ``ocr`` is not a str, or
-            ``recovered`` is not a RecoveredText or None.
+        TypeError: If ``page`` is not a RawPage, ``ocr`` is not a str,
+            ``recovered`` is not a RecoveredText or None, or ``background``
+            not a Backdrop, a str or None.
         ValueError: If ``ocr`` is not ``"auto"``, ``"always"`` or ``"never"``,
             or ``recovered`` names another page, or does not account for
-            exactly the page's ``dropped_text_objects``.
+            exactly the page's ``dropped_text_objects``, or ``background`` is
+            a blank str, or a backdrop not of this page's size.
     """
     if not isinstance(page, RawPage):
         raise TypeError(f"page must be a RawPage, got {type(page).__name__}")
     choice_str("ocr", ocr, _OCR_MODES)
     _check_recovered(recovered, page.page_number, page.text.stats.dropped_text_objects)
+    _check_background(background)
     width, height = page.geometry.width_pt, page.geometry.height_pt
     boxes = _scan_boxes(page.images.images)
     cover = _cover_fraction(boxes, width, height)
     pieces = _classify(page.text.spans, width, height, boxes, cover)
-    flagged, unchecked = _recovered_pieces(recovered, pieces, width, height, boxes, cover)
+    own = _recovered_own(recovered, width, height, boxes, cover)
+    if isinstance(background, Backdrop):
+        scale = _scale(background, width, height)
+        pieces, own = _flag_background(pieces, background, scale), _flag_background(own, background, scale)
+    flagged, unchecked = _duplicates_flagged(own, pieces)
     route, warnings = _route(_text_char_count(pieces), cover, ocr)
     warnings += _recovery_warnings(recovered, page.text.stats.dropped_text_objects)
     return PageAssessment(
@@ -685,8 +735,78 @@ def assess_page(page: RawPage, *, ocr: OcrMode = "auto", recovered: RecoveredTex
         quality=_quality(page, pieces + flagged),
         route=route,
         unmapped_regions=_unmapped_regions(pieces),
-        warnings=warnings + _duplicate_warnings(unchecked),
+        warnings=warnings + _duplicate_warnings(unchecked) + _background_warnings(background),
     )
+
+
+def _check_background(background: object) -> None:
+    """Require a Backdrop, a non-blank str (why the page was not drawn) or None."""
+    if background is None or isinstance(background, Backdrop):
+        return
+    if not isinstance(background, str):
+        raise TypeError(f"background must be a Backdrop, a str or None, got {type(background).__name__}")
+    non_blank_str("background", background)
+
+
+def _background_warnings(background: Backdrop | str | None) -> tuple[str, ...]:
+    """The warning of a page whose background could not be checked (``background`` says why), if so."""
+    return (f"background not checked: {background}",) if isinstance(background, str) else ()
+
+
+def needs_background(page: RawPage, assessment: PageAssessment) -> bool:
+    """Whether the page must be drawn to check its text's background: the gate (see the module notes).
+
+    True when a visible piece of ``assessment`` (page or recovered) that
+    paints (render mode not 3 or 7) has a paint under MATCH_DISTANCE of
+    white, or overlaps (with area) a fill A2 reads or an image of ``page``.
+    Cost: O(segments) for the fills, then O(pieces x (fills + images)).
+
+    Raises:
+        TypeError: If ``page`` is not a RawPage or ``assessment`` not a PageAssessment.
+    """
+    if not isinstance(page, RawPage):
+        raise TypeError(f"page must be a RawPage, got {type(page).__name__}")
+    if not isinstance(assessment, PageAssessment):
+        raise TypeError(f"assessment must be a PageAssessment, got {type(assessment).__name__}")
+    painted = tuple(
+        piece
+        for piece in (*assessment.pieces, *assessment.recovered_pieces)
+        if not piece.hidden_reasons and piece.span.render_mode not in _NO_PAINT_MODES
+    )
+    if any(_near(_paint_rgb(piece.span), _WHITE_RGB) for piece in painted):
+        return True
+    covers = (*_fill_boxes(page.segments.segments), *(image.bbox for image in page.images.images))
+    return any(_overlaps_any(piece.bbox, covers) for piece in painted)
+
+
+def _fill_boxes(segments: tuple[RawSegment, ...]) -> tuple[Box, ...]:
+    """The boxes A2's fill segments say are painted: each thin fill's, and each path object's fill edges' union."""
+    thin: list[Box] = []
+    edges: dict[int, Box] = {}
+    for segment in segments:  # bounded: the page's segments
+        if segment.kind == "stroke":
+            continue
+        box = _segment_box(segment)
+        if segment.kind == "thin_fill":
+            thin.append(box)
+            continue
+        known = edges.get(segment.object_index)
+        edges[segment.object_index] = box if known is None else union_box((known, box))
+    return (*thin, *edges.values())
+
+
+def _segment_box(segment: RawSegment) -> Box:
+    """The displayed box a segment covers: its length along its axis, its width across it (0 for a fill edge)."""
+    half = segment.width / 2
+    if segment.orientation == "h":
+        return segment.start, segment.position - half, segment.end, segment.position + half
+    return segment.position - half, segment.start, segment.position + half, segment.end
+
+
+def _overlaps_any(box: Box, covers: tuple[Box, ...]) -> bool:
+    """True if ``box`` and some box of ``covers`` share area (touching edges do not)."""
+    x0, y0, x1, y1 = box
+    return any(cover[0] < x1 and x0 < cover[2] and cover[1] < y1 and y0 < cover[3] for cover in covers)
 
 
 def _check_recovered(recovered: object, page_number: int, dropped: int) -> None:
@@ -710,36 +830,43 @@ def _check_recovered(recovered: object, page_number: int, dropped: int) -> None:
         raise ValueError(f"{found}: it is not this page's recovery")
 
 
-def _recovered_pieces(
-    recovered: RecoveredText | None,
-    pieces: tuple[SpanPiece, ...],
-    width: float,
-    height: float,
-    boxes: tuple[Box, ...],
-    cover: float,
-) -> tuple[tuple[SpanPiece, ...], int]:
-    """The recovered spans' pieces, and how many were past the duplicate check's cap (see the module notes).
+def _recovered_own(
+    recovered: RecoveredText | None, width: float, height: float, boxes: tuple[Box, ...], cover: float
+) -> tuple[SpanPiece, ...]:
+    """The recovered spans' pieces, in recovery order, each with its recovered reasons and the computed ones.
 
-    Each piece has its recovered reasons and the computed ones, in canonical
-    order; one with none that is a drawn copy of a visible piece of the
-    page's ``pieces`` is ``duplicate``. Cost: O(pieces) to index them by
-    text, then O(MAX_DUPLICATE_CANDIDATES) box checks per recovered piece.
+    Reasons are in canonical order. Empty without a recovery.
     """
     if recovered is None:
-        return (), 0
-    twins = _visible_by_text(pieces)
+        return ()
     found: list[SpanPiece] = []
-    unchecked = 0
     for item in recovered.spans:
         for piece in _classify((item.span,), width, height, boxes, cover):
             given = set(piece.hidden_reasons) | set(item.hidden_reasons)
             reasons = tuple(reason for reason in HIDDEN_REASONS if reason in given)
-            candidates = () if reasons else twins.get(piece.text, ())
-            if len(candidates) > MAX_DUPLICATE_CANDIDATES:
-                unchecked += 1
-            elif any(_drawn_on(piece, twin) for twin in candidates):
-                reasons = _DUPLICATE
             found.append(SpanPiece(span=piece.span, start=piece.start, end=piece.end, hidden_reasons=reasons))
+    return tuple(found)
+
+
+def _duplicates_flagged(own: tuple[SpanPiece, ...], pieces: tuple[SpanPiece, ...]) -> tuple[tuple[SpanPiece, ...], int]:
+    """The recovered pieces ``own``, each with no reason that is a drawn copy of a visible piece ``duplicate``.
+
+    Also how many were past the duplicate check's cap (see the module notes).
+    Cost: O(pieces) to index them by text, then O(MAX_DUPLICATE_CANDIDATES)
+    box checks per recovered piece.
+    """
+    twins = _visible_by_text(pieces)
+    found: list[SpanPiece] = []
+    unchecked = 0
+    for piece in own:
+        candidates = () if piece.hidden_reasons else twins.get(piece.text, ())
+        if len(candidates) > MAX_DUPLICATE_CANDIDATES:
+            unchecked += 1
+            found.append(piece)
+        elif any(_drawn_on(piece, twin) for twin in candidates):
+            found.append(SpanPiece(span=piece.span, start=piece.start, end=piece.end, hidden_reasons=_DUPLICATE))
+        else:
+            found.append(piece)
     return tuple(found), unchecked
 
 
