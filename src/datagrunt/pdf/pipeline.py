@@ -118,6 +118,7 @@ from multiprocessing.context import SpawnContext, SpawnProcess
 from pathlib import Path
 from typing import BinaryIO, get_args
 
+from datagrunt.pdf._process import REAP_TIMEOUT_S
 from datagrunt.pdf._validate import choice_str, int_at_least, strict_bool
 from datagrunt.pdf.assembly import MIN_IMAGE_DIMENSION, assemble_page
 from datagrunt.pdf.elements import DocumentMetadata, Page, PDFDocument
@@ -138,7 +139,7 @@ from datagrunt.pdf.pdfium_engine import (
     recover_dropped_text,
 )
 from datagrunt.pdf.quality import OcrMode, PageAssessment, assess_page
-from datagrunt.pdf.render import _MIN_RENDER_PIXELS, _MIN_TARGET_DPI, _REAP_TIMEOUT_S
+from datagrunt.pdf.render import _MIN_RENDER_PIXELS, _MIN_TARGET_DPI
 from datagrunt.pdf.scope import apply_scope
 
 __all__ = ["PDFSource", "PipelineOptions", "SourceIdentity", "extract_document", "extract_page_at"]
@@ -639,10 +640,10 @@ def _collected(worker: _Worker, deadline: float, budget_s: float, options: Pipel
     try:
         outcome = worker.receiver.recv()
     except (EOFError, OSError):
-        worker.process.join(_REAP_TIMEOUT_S)
+        worker.process.join(REAP_TIMEOUT_S)
         ended = f"ended (exit code {worker.process.exitcode}) before returning them"
         return _lost_chunk(worker.pages, f"{lost} {ended}", options)
-    worker.process.join(_REAP_TIMEOUT_S)
+    worker.process.join(REAP_TIMEOUT_S)
     if isinstance(outcome, Exception):
         raise outcome
     return _checked_chunk(outcome, worker.pages, lost)
@@ -672,7 +673,7 @@ def _shut_down(workers: list[_Worker]) -> None:
         worker.receiver.close()
         if worker.process.is_alive():
             worker.process.kill()
-        worker.process.join(_REAP_TIMEOUT_S)
+        worker.process.join(REAP_TIMEOUT_S)
         if worker.process.exitcode is not None:
             worker.process.close()
 
