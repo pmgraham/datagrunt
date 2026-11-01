@@ -40,12 +40,13 @@ from datagrunt.pdf.pdfium_engine import (
 )
 from datagrunt.pdf.quality import PageAssessment, assess_page
 from datagrunt.pdf.scope import apply_scope
-from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf, solid_png
+from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf, hand_written_pdf, solid_png
 from pdf_tests.test_layout_apart import tiny_text_page
 from pdf_tests.test_layout_lattice import rules as lattice_rules
 from pdf_tests.test_layout_lattice import written
 from pdf_tests.test_layout_stream_tables import body_text, staircase, table_runs
 from pdf_tests.test_pdfium_engine import imported_modules
+from pdf_tests.test_pdfium_spans import content_page
 from pdf_tests.test_quality import SHA, image
 
 W, H = 400.0, 300.0
@@ -955,3 +956,109 @@ class TestStreamTableBoundsEndToEnd:
         assert done.returncode == 0, done.stdout + done.stderr
         imported = int(re.search(r"imported: peak (\d+) MiB", done.stdout).group(1))
         assert int(re.search(r"^peak (\d+) MiB", done.stdout, re.MULTILINE).group(1)) - imported < 200, done.stdout
+
+
+# Recovered drawn copies (#406): hand-written 400 x 300 pt pages in Helvetica (/F1), a line of body text first so
+# the page routes digital and Pass C runs (a vision page is never verified).
+BODY = b"BT /F1 12 Tf 20 270 Td (A digital page with enough visible text) Tj ET "
+# "Total"'s codes read "Words" through this ToUnicode map (a simple font's one-byte codes).
+RELABEL_CMAP = (
+    b"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CMapName /Test-UCS def\n/CMapType 2 def\n"
+    b"1 begincodespacerange\n<00> <FF>\nendcodespacerange\n5 beginbfchar\n"
+    b"<54> <0057>\n<6F> <006F>\n<74> <0072>\n<61> <0064>\n<6C> <0073>\nendbfchar\nendcmap\n"
+    b"CMapName currentdict /CMap defineresource pop\nend\nend"
+)
+
+
+def hand_written(tmp_path, content: bytes) -> Path:
+    """A hand-written page drawing the body line, then ``content``."""
+    return content_page(tmp_path, BODY + content)
+
+
+def relabelled_copy_page(tmp_path) -> Path:
+    """ "Total" in Helvetica, then its codes in a Helvetica whose ToUnicode map reads them "Words", on it.
+
+    pdfium drops the second object as a copy of the first (the same codes at the same size, on it), so
+    recovery reads back "Words": text the page shows nowhere else.
+    """
+    content = BODY + b"BT /F1 12 Tf 72 100 Td (Total) Tj ET BT /F2 12 Tf 72 100 Td (Total) Tj ET"
+    relabelled = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 7 0 R >>"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Contents 4 0 R"
+        b" /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        relabelled,
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(RELABEL_CMAP), RELABEL_CMAP),
+    ]
+    return hand_written_pdf(tmp_path / "relabelled.pdf", objects)
+
+
+def recovered_read(path) -> tuple[list, Page]:
+    """Page 1's recovered pieces as ``(text, hidden_reasons)``, and its assembled page."""
+    page, assessment, lattice = inputs(path)
+    pieces = [(item.text, item.hidden_reasons) for item in assessment.recovered_pieces]
+    return pieces, assemble_page(page, assessment, lattice, source=path)
+
+
+def texts_shown(page: Page, *, hidden: bool) -> list:
+    """The text of each hidden (with its reasons) or visible element."""
+    return [(element.text, element.hidden_reasons) for element in page.elements if element.is_hidden == hidden]
+
+
+class TestRecoveredDuplicatesEndToEnd:
+    """A shadow or outline copy pdfium drops reads once: its recovered piece is a hidden ``duplicate`` (#406)."""
+
+    @pytest.mark.parametrize("offset", [0.25, 2.0, 7.0])
+    def test_a_shadow_title_reads_once(self, tmp_path, offset):
+        # The grey shadow first, offset right and down (pdfium keeps it), then the black title it drops.
+        shadow = b"q 0.6 g BT /F1 24 Tf %g %g Td (Walking) Tj ET Q " % (60 + offset, 150 - offset)
+        path = hand_written(tmp_path, shadow + b"BT /F1 24 Tf 60 150 Td (Walking) Tj ET")
+
+        pieces, page = recovered_read(path)
+
+        assert pieces == [("Walking", ("duplicate",))]
+        assert [text for text, _ in texts_shown(page, hidden=False)].count("Walking") == 1
+        assert texts_shown(page, hidden=True) == [("Walking", ("duplicate",))]
+        assert page.integrity_verified is True
+
+    def test_a_copy_20_pt_away_stays_visible(self, tmp_path):
+        # pdfium drops a copy within 0.9 of its last glyph's advance (a 30 pt "W": 25 pt); the window stops at 12 pt.
+        path = hand_written(
+            tmp_path, b"BT /F1 30 Tf 60 150 Td (SHOW) Tj ET q 0.6 g BT /F1 30 Tf 80 150 Td (SHOW) Tj ET Q"
+        )
+
+        pieces, page = recovered_read(path)
+
+        assert pieces == [("SHOW", ())]
+        assert [text for text, _ in texts_shown(page, hidden=False)].count("SHOW") == 2
+        assert page.integrity_verified is True
+
+    @pytest.mark.parametrize(
+        "hidden,reasons",
+        [
+            # Squeezed under 1 pt tall by its matrix: pdfium keeps it and drops the drawn copy on it.
+            pytest.param(b"BT /F1 12 Tf 1 0 0 0.05 72 100 Tm (Total) Tj ET", ("tiny_font",), id="tiny_font"),
+            # Tr is graphics state: q / Q keeps it from the copy.
+            pytest.param(b"q BT /F1 12 Tf 3 Tr 72 100 Td (Total) Tj ET Q", ("invisible",), id="invisible"),
+        ],
+    )
+    def test_a_copy_of_hidden_text_stays_visible(self, tmp_path, hidden, reasons):
+        path = hand_written(tmp_path, hidden + b" BT /F1 12 Tf 72 100 Td (Total) Tj ET")
+
+        pieces, page = recovered_read(path)
+
+        assert pieces == [("Total", ())]
+        assert [text for text, _ in texts_shown(page, hidden=False)].count("Total") == 1
+        assert texts_shown(page, hidden=True) == [("Total", reasons)]
+        assert page.integrity_verified is True
+
+    def test_recovered_unique_text_stays_visible(self, tmp_path):
+        pieces, page = recovered_read(relabelled_copy_page(tmp_path))
+
+        assert pieces == [("Words", ())]
+        assert {"Total", "Words"} <= {text for text, _ in texts_shown(page, hidden=False)}
+        assert texts_shown(page, hidden=True) == []
+        assert page.integrity_verified is True

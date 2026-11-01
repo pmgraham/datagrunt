@@ -100,7 +100,7 @@ from typing import Literal, TypeAlias, get_args
 from datagrunt.pdf._hidden_rules import em_reasons, off_page
 from datagrunt.pdf._pdfium_common import Box, union_box
 from datagrunt.pdf._pdfium_images import RawImage
-from datagrunt.pdf._pdfium_recover import RecoveredText
+from datagrunt.pdf._pdfium_recover import RecoveredText, duplicate_window
 from datagrunt.pdf._pdfium_text import RawSpan
 from datagrunt.pdf._validate import choice_str, int_at_least, ordered_box, positive_float, str_tuple, typed_tuple
 from datagrunt.pdf.elements import (
@@ -142,6 +142,10 @@ _MIN_TEXT_CHARS = 20
 _REPLACEMENT_CHAR = "\ufffd"
 # Private use, unassigned and lone-surrogate chars carry no text.
 _INVALID_CATEGORIES = frozenset({"Co", "Cn", "Cs"})
+# The visible pieces of a recovered piece's text it is checked against for a drawn duplicate: past this many, it is
+# not checked (it stays visible) and the page warns. The corpus (data/pdfs, 95 pages) needs at most 5.
+MAX_DUPLICATE_CANDIDATES = 64
+_DUPLICATE: tuple[HiddenReason, ...] = ("duplicate",)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -431,7 +435,9 @@ def assess_page(page: RawPage, *, ocr: OcrMode = "auto", recovered: RecoveredTex
     """Classify a page's spans, measure its quality and route it (see the module notes).
 
     Cost: :func:`classify_spans` of the page's and the recovered spans, one
-    raster cover and O(chars).
+    raster cover and O(chars); the duplicate check indexes the page's pieces
+    by text and makes at most :data:`MAX_DUPLICATE_CANDIDATES` box checks
+    per recovered piece.
 
     Args:
         page: The page's raw facts, as
@@ -456,15 +462,16 @@ def assess_page(page: RawPage, *, ocr: OcrMode = "auto", recovered: RecoveredTex
     boxes = _scan_boxes(page.images.images)
     cover = _cover_fraction(boxes, width, height)
     pieces = _classify(page.text.spans, width, height, boxes, cover)
-    flagged = _recovered_pieces(recovered, width, height, boxes, cover)
+    flagged, unchecked = _recovered_pieces(recovered, pieces, width, height, boxes, cover)
     route, warnings = _route(_text_char_count(pieces), cover, ocr)
+    warnings += _recovery_warnings(recovered, page.text.stats.dropped_text_objects)
     return PageAssessment(
         pieces=pieces,
         recovered_pieces=flagged,
         quality=_quality(page, pieces + flagged),
         route=route,
         unmapped_regions=_unmapped_regions(pieces),
-        warnings=warnings + _recovery_warnings(recovered, page.text.stats.dropped_text_objects),
+        warnings=warnings + _duplicate_warnings(unchecked),
     )
 
 
@@ -490,18 +497,69 @@ def _check_recovered(recovered: object, page_number: int, dropped: int) -> None:
 
 
 def _recovered_pieces(
-    recovered: RecoveredText | None, width: float, height: float, boxes: tuple[Box, ...], cover: float
-) -> tuple[SpanPiece, ...]:
-    """The recovered spans' pieces, each with its recovered reasons and the computed ones, in canonical order."""
+    recovered: RecoveredText | None,
+    pieces: tuple[SpanPiece, ...],
+    width: float,
+    height: float,
+    boxes: tuple[Box, ...],
+    cover: float,
+) -> tuple[tuple[SpanPiece, ...], int]:
+    """The recovered spans' pieces, and how many were past the duplicate check's cap (see the module notes).
+
+    Each piece has its recovered reasons and the computed ones, in canonical
+    order; one with none that is a drawn copy of a visible piece of the
+    page's ``pieces`` is ``duplicate``. Cost: O(pieces) to index them by
+    text, then O(MAX_DUPLICATE_CANDIDATES) box checks per recovered piece.
+    """
     if recovered is None:
-        return ()
-    pieces = []
+        return (), 0
+    twins = _visible_by_text(pieces)
+    found: list[SpanPiece] = []
+    unchecked = 0
     for item in recovered.spans:
         for piece in _classify((item.span,), width, height, boxes, cover):
-            found = set(piece.hidden_reasons) | set(item.hidden_reasons)
-            reasons = tuple(reason for reason in HIDDEN_REASONS if reason in found)
-            pieces.append(SpanPiece(span=piece.span, start=piece.start, end=piece.end, hidden_reasons=reasons))
-    return tuple(pieces)
+            given = set(piece.hidden_reasons) | set(item.hidden_reasons)
+            reasons = tuple(reason for reason in HIDDEN_REASONS if reason in given)
+            candidates = () if reasons else twins.get(piece.text, ())
+            if len(candidates) > MAX_DUPLICATE_CANDIDATES:
+                unchecked += 1
+            elif any(_drawn_on(piece, twin) for twin in candidates):
+                reasons = _DUPLICATE
+            found.append(SpanPiece(span=piece.span, start=piece.start, end=piece.end, hidden_reasons=reasons))
+    return tuple(found), unchecked
+
+
+def _visible_by_text(pieces: tuple[SpanPiece, ...]) -> dict[str, list[SpanPiece]]:
+    """The visible pieces (no hidden reason) of ``pieces``, by their text, in piece order."""
+    found: dict[str, list[SpanPiece]] = {}
+    for piece in pieces:
+        if not piece.hidden_reasons:
+            found.setdefault(piece.text, []).append(piece)
+    return found
+
+
+def _drawn_on(copy: SpanPiece, twin: SpanPiece) -> bool:
+    """True if each edge of ``twin``'s ink box lies within ``copy``'s duplicate window of the same edge of ``copy``'s.
+
+    The window is recovery's (:func:`duplicate_window`) of the copy's last
+    char's box, on each displayed axis.
+    """
+    across, down = duplicate_window(copy.span.char_boxes[copy.end - 1])
+    window = (across, down, across, down)
+    return all(abs(mine - theirs) <= reach for mine, theirs, reach in zip(_ink(copy), _ink(twin), window))
+
+
+def _ink(piece: SpanPiece) -> Box:
+    """The union of the piece's tight boxes: where its glyphs' ink is (a recovered char box is its object's ink)."""
+    return union_box(piece.span.tight_boxes[piece.start : piece.end])
+
+
+def _duplicate_warnings(unchecked: int) -> tuple[str, ...]:
+    """A warning for the ``unchecked`` recovered pieces past the duplicate check's cap, if any."""
+    if not unchecked:
+        return ()
+    each = f"each has over {MAX_DUPLICATE_CANDIDATES} visible pieces of the same text on the page"
+    return (f"{unchecked} recovered piece(s) were not checked for a drawn duplicate: {each}; they stay visible",)
 
 
 def _recovery_warnings(recovered: RecoveredText | None, dropped: int) -> tuple[str, ...]:

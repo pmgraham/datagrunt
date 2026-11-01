@@ -997,6 +997,13 @@ class TestModuleImports:
     def test_flags_off_page_text_with_recoverys_one_rule(self):
         assert quality.off_page is _pdfium_recover.off_page is _hidden_rules.off_page
 
+    def test_flags_drawn_duplicates_with_recoverys_one_window(self):
+        # A3's duplicate window is recovery's overprint window: its share, floor and cap are defined once (#406).
+        assert quality.duplicate_window is _pdfium_recover.duplicate_window
+        assert not {"OVERPRINT_TOLERANCE_PT", "DUPLICATE_REACH_CAP_PT", "_PDFIUM_SHARE"} & set(vars(quality))
+        assert _pdfium_recover.duplicate_window((0.0, 0.0, 10.0, 0.25)) == (9.0, 0.5)
+        assert _pdfium_recover.duplicate_window((0.0, 0.0, 30.0, 20.0)) == (12.0, 12.0)
+
     def test_validates_routes_with_a1s_public_table(self):
         assert quality.PAGE_ROUTES is elements.PAGE_ROUTES
         assert elements.PAGE_ROUTES == ("digital", "hybrid", "vision")

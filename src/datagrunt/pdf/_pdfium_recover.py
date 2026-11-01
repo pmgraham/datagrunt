@@ -343,7 +343,7 @@ def recovered_text(
             continue
         text = "".join(piece.text for piece in pieces)
         look = _look(pieces[0], target.hidden_reasons, target.box, display)
-        copy = _Copy(_displayed(target.origin, display), _reach(target.box), look)
+        copy = _Copy(_displayed(target.origin, display), duplicate_window(target.box), look)
         if text.isspace():
             whitespace += 1
         elif _overprints(copy, printed.get(text, ())):
@@ -370,7 +370,7 @@ class _Copy(NamedTuple):
     """A text object already on the page, for the overprint rule.
 
     ``origin`` is displayed; ``reach`` is its duplicate window on each
-    displayed axis (:func:`_reach`); ``look`` is :func:`_look`'s.
+    displayed axis (:func:`duplicate_window`); ``look`` is :func:`_look`'s.
     """
 
     origin: tuple[float, float]
@@ -388,11 +388,12 @@ def _look(span: RawSpan, reasons: tuple[HiddenReason, ...], box: Box, display: D
     return span.render_mode, span.fill_rgba, span.stroke_rgba, reasons, placement
 
 
-def _reach(box: Box) -> tuple[float, float]:
+def duplicate_window(box: Box) -> tuple[float, float]:
     """The duplicate window of text whose last char's displayed box is ``box`` (see the module notes).
 
     pdfium's share of the box's size on each axis, at least the tolerance
-    and at most the cap, so no font's glyph box widens it.
+    and at most the cap, so no font's glyph box widens it. The quality stage
+    flags a recovered drawn copy with the same window (#406).
     """
     sides = (box[2] - box[0], box[3] - box[1])
     width, height = (min(DUPLICATE_REACH_CAP_PT, max(OVERPRINT_TOLERANCE_PT, _PDFIUM_SHARE * side)) for side in sides)
@@ -418,7 +419,7 @@ def _owned_copies(
         first = own[0]
         em = em_reasons(first.em_width_pt, abs(first.font_size_pt))
         look = _look(first, em, union_box(tuple(span.bbox for span in own)), display)
-        copy = _Copy(_displayed(origins[index], display), _reach(own[-1].char_boxes[-1]), look)
+        copy = _Copy(_displayed(origins[index], display), duplicate_window(own[-1].char_boxes[-1]), look)
         printed.setdefault("".join(span.text for span in own), []).append(copy)
     return printed
 
