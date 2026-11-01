@@ -426,6 +426,23 @@ class TestEncryption:
         assert pdfium_c.FPDF_GetSecurityHandlerRevision(pdfium.PdfDocument(path)) == -1
 
 
+class TestDocumentInfo:
+    """``title`` and ``author`` set the document's /Info entries; None keeps ReportLab's own."""
+
+    def test_title_and_author_are_written(self, tmp_path):
+        path = build_pdf(
+            tmp_path / "info.pdf", [SECRET_PAGE], title="Quarterly \u2014 R\u00e9sum\u00e9 \U0001f600", author="Ada"
+        )
+
+        info = pdfium.PdfDocument(path).get_metadata_dict()
+        assert (info["Title"], info["Author"]) == ("Quarterly \u2014 R\u00e9sum\u00e9 \U0001f600", "Ada")
+
+    def test_none_keeps_reportlabs_defaults(self, tmp_path):
+        info = pdfium.PdfDocument(build_pdf(tmp_path / "info.pdf", [SECRET_PAGE])).get_metadata_dict()
+
+        assert (info["Title"], info["Author"]) == ("untitled", "anonymous")
+
+
 class TestDeterminism:
     """The same spec always builds the same bytes."""
 
@@ -830,6 +847,8 @@ class TestValidation:
             ),
             pytest.param([PageSpec()], {"strength": 128.0}, "strength must be an int, got 128.0", id="strength-float"),
             pytest.param([PageSpec()], {"strength": True}, "strength must be an int, got True", id="strength-bool"),
+            pytest.param([PageSpec()], {"title": 1}, "title must be a str or None, got 1", id="title"),
+            pytest.param([PageSpec()], {"author": b"Ada"}, "author must be a str or None, got b'Ada'", id="author"),
         ],
     )
     def test_wrong_type_raises_type_error(self, tmp_path, pages, kwargs, message):

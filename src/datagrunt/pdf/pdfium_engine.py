@@ -137,6 +137,13 @@ Recovery (#366 task 3), pinned by ``tests/pdf_tests/test_pdfium_recover.py``
   the same objects. :func:`recover_dropped_text` loads the page itself and
   saves nothing.
 
+Metadata (#372 A8a), pinned by ``tests/pdf_tests/test_pdfium_metadata.py``:
+``FPDF_GetMetaText`` reads an /Info entry as UTF-16LE with a 2-byte NUL
+terminator (a PDFDocEncoding or UTF-16BE string alike, decrypted in an
+encrypted file); a missing entry, or a file with no /Info, reads as the
+terminator alone (2 bytes). Its length query copies nothing, so
+:func:`document_metadata` checks the length against its bound first.
+
 Render guard (#369 A5a), pinned by ``tests/pdf_tests/test_render.py``:
 :func:`image_refusal` walks a loaded page as :func:`page_images` does, its
 walk bounded by an object count and the form depth, and refuses the render
@@ -199,11 +206,20 @@ from datagrunt.pdf._pdfium_recover import (
     recovered_text,
 )
 from datagrunt.pdf._pdfium_text import ObjectWalk, PageText, RawSpan, TextStats, collect_text
-from datagrunt.pdf._validate import choice_str, finite_tuple, int_at_least, non_blank_str, positive_float
+from datagrunt.pdf._validate import (
+    choice_str,
+    finite_tuple,
+    int_at_least,
+    non_blank_str,
+    optional_str,
+    positive_float,
+)
+from datagrunt.pdf.elements import _MAX_ASSET_BYTES
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFEncryptedError
 
 __all__ = [
     "DocumentHandle",
+    "DocumentInfo",
     "ImageLoader",
     "ImageStats",
     "PageFailure",
@@ -220,6 +236,7 @@ __all__ = [
     "RecoveryStats",
     "SegmentStats",
     "TextStats",
+    "document_metadata",
     "extract_page",
     "image_refusal",
     "loaded_page",
@@ -487,6 +504,63 @@ def open_document(path: str | os.PathLike[str], *, password: str | None = None) 
     source = _checked_path(path)
     raw = _load_raw_document(source, _checked_password(password))
     return DocumentHandle(pdfium.PdfDocument(raw))
+
+
+# An /Info entry is read whole or not at all: the asset limit (1 GiB) bounds the copy.
+_MAX_META_TEXT_BYTES = _MAX_ASSET_BYTES
+# FPDF_GetMetaText ends every value with a UTF-16 NUL.
+_META_TERMINATOR_BYTES = 2
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DocumentInfo:
+    """A document's /Info entries, as :func:`document_metadata` reads them.
+
+    Attributes:
+        title: /Title verbatim, or None when it is missing or blank.
+        author: /Author verbatim, or None when it is missing or blank.
+    """
+
+    title: str | None
+    author: str | None
+
+    def __post_init__(self) -> None:
+        optional_str("title", self.title)
+        optional_str("author", self.author)
+
+
+def document_metadata(handle: DocumentHandle) -> DocumentInfo:
+    """Return the document's /Title and /Author, read with pdfium's ``FPDF_GetMetaText``.
+
+    Each value is decoded from UTF-16LE as written: nothing is stripped or
+    replaced (a lone surrogate is kept, as page text keeps it). A missing
+    or blank (whitespace-only) value is None.
+
+    Raises:
+        TypeError: If ``handle`` is not a DocumentHandle.
+        ValueError: If ``handle`` is closed.
+        DatagruntPDFError: If a value is over :data:`_MAX_META_TEXT_BYTES`
+            (the asset limit): it is refused unread, never cut short.
+    """
+    if not isinstance(handle, DocumentHandle):
+        raise TypeError(f"handle must be a DocumentHandle, got {type(handle).__name__}")
+    raw = handle._require_open().raw
+    return DocumentInfo(title=_meta_text(raw, "Title"), author=_meta_text(raw, "Author"))
+
+
+def _meta_text(raw: pdfium_c.FPDF_DOCUMENT, tag: str) -> str | None:
+    """The /Info entry ``tag``, decoded; None when it is missing or blank."""
+    key = tag.encode("ascii")
+    size = pdfium_c.FPDF_GetMetaText(raw, key, None, 0)
+    if size > _MAX_META_TEXT_BYTES:
+        bound = f"over the {_MAX_META_TEXT_BYTES}-byte bound: it is not read"
+        raise DatagruntPDFError(f"the document's /{tag} is {size} bytes (UTF-16LE), {bound}")
+    if size <= _META_TERMINATOR_BYTES:
+        return None
+    buffer = ctypes.create_string_buffer(size)
+    pdfium_c.FPDF_GetMetaText(raw, key, buffer, size)
+    text = buffer.raw[: size - _META_TERMINATOR_BYTES].decode("utf-16-le", errors="surrogatepass")
+    return text if text.strip() else None
 
 
 def _checked_index(index: object, page_count: int) -> int:
