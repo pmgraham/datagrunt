@@ -19,6 +19,7 @@ from collections import Counter
 import pytest
 
 from datagrunt.pdf import layout
+from datagrunt.pdf.elements import Table
 from datagrunt.pdf.layout import (
     LatticeResult,
     StreamParagraph,
@@ -116,14 +117,15 @@ class TestStreamTables:
 
         (table,) = stream_layout(pieces, lattice, width_pt=612.0, height_pt=792.0)
 
-        # Each column's band runs from its cells' first start to their last end, as pdfium boxes them in this run
-        # (the substitute font sets some advances: "Washer" ends 0.15 pt past its Helvetica width on macOS).
+        # Every cell starts where its column was drawn, so each column is at that start (#409), whatever its widest
+        # cell. The table ends where pdfium ends its last column's widest cell, as it boxes it in this run (the
+        # substitute font sets some advances: "Washer" ends 0.15 pt past its Helvetica width on macOS).
         cells = [found.cells for found in text_lines(pieces, lattice)]
-        bands = [(min(row[col].bbox.x0 for row in cells), max(row[col].bbox.x1 for row in cells)) for col in range(3)]
-        assert table.column_centres == tuple((start + end) / 2 for start, end in bands)
+        assert [{row[col].bbox.x0 for row in cells} for col in range(3)] == [{x} for x in XS]
+        assert table.column_centres == XS
         assert (table.n_cols, table.columns) == (3, ((0, 1, 2),) * 4)
         assert [row.text for row in table.rows] == [" ".join(row) for row in PARTS]
-        assert (table.bbox.x0, table.bbox.x1) == (72.0, bands[2][1])
+        assert (table.bbox.x0, table.bbox.x1) == (72.0, max(row[2].bbox.x1 for row in cells))
         assert table.pieces == tuple(piece for row in table.rows for found in row.cells for piece in found.pieces)
 
     @pytest.mark.parametrize(
@@ -174,7 +176,8 @@ class TestStreamTables:
     def test_a_table_on_a_page_turned_by_rotate_90_reads_as_written(self, tmp_path):
         (table,) = laid_out(tmp_path, *table_runs(PARTS), rotate=90)
 
-        # Along its rows the turned table runs down the displayed page: its column centres are display y.
+        # Along its rows the turned table runs down the displayed page: its columns are where their cells start, in
+        # display y (#409).
         bands = [
             [
                 found.bbox
@@ -186,16 +189,19 @@ class TestStreamTables:
         ]
         assert table.grid() == PARTS
         assert {row.turn for row in table.rows} == {90}
-        assert table.column_centres == tuple((min(b.y0 for b in band) + max(b.y1 for b in band)) / 2 for band in bands)
+        starts = [{found.y0 for found in band} for band in bands]
+        assert all(len(found) == 1 for found in starts)
+        assert table.column_centres == tuple(found.pop() for found in starts)
 
     def test_a_table_read_up_the_page_has_its_column_centres_in_reading_order(self):
-        # Text rising up the page reads bottom to top: its first column is the lower one (display y 376-400).
+        # Text rising up the page reads bottom to top: its first column is the lower one (display y 376-400), each
+        # column where its text starts (#409): at its bottom.
         rows = [line(up_cell("Name", x, 400.0), up_cell("Value", x, 200.0), turn=270) for x in (10.0, 30.0)]
 
         (found,) = layout._row_structures(rows, width=612.0, height=792.0)
 
         assert found.items[0].grid() == (("Name", "Value"), ("Name", "Value"))
-        assert found.items[0].column_centres == (388.0, 185.0)
+        assert found.items[0].column_centres == (400.0, 200.0)
 
 
 class TestBands:
@@ -245,6 +251,108 @@ class TestBands:
         turned = line(down_cell("Name", 10.0, 100.0), down_cell("Value", 10.0, 300.0), turn=90)
 
         assert layout._row_structures([upright[0], turned, upright[1]], width=612.0, height=792.0) == []
+
+
+def ending(text: str, end: float, y: float) -> TextCell:
+    """A cell of ``text`` in 6 pt chars ending at ``end``: set flush right."""
+    return cell(text, end - 6.0 * len(text), y)
+
+
+def centred(text: str, middle: float, y: float) -> TextCell:
+    """A cell of ``text`` in 6 pt chars centred on ``middle``."""
+    return cell(text, middle - 3.0 * len(text), y)
+
+
+def positions(*rows) -> tuple[float, ...]:
+    """The column positions (``column_centres``) of the one table ``rows`` make."""
+    (found,) = layout._row_structures(list(rows), width=612.0, height=792.0)
+    (table,) = found.items
+    assert isinstance(table, StreamTable)
+    return table.column_centres
+
+
+class TestColumnPositions:
+    """A column is where its cells align, the edge that varies least down it: not its band's middle (#409).
+
+    The middle of a band moves with the column's widest cell, so the two parts of one split table could
+    differ there; the edge the cells align on does not.
+    """
+
+    def test_text_aligns_on_its_start_and_numbers_on_their_end(self):
+        rows = (
+            line(cell("Washer", 72.0, 10.0), ending("100", 250.0, 10.0)),
+            line(cell("Pin", 72.0, 30.0), ending("8", 250.0, 30.0)),
+        )
+
+        assert positions(*rows) == (72.0, 250.0)
+
+    def test_centred_cells_align_on_their_middle(self):
+        rows = (
+            line(cell("Grade", 72.0, 10.0), centred("AB", 200.0, 10.0)),
+            line(cell("Code", 72.0, 30.0), centred("ABCD", 200.0, 30.0)),
+        )
+
+        assert positions(*rows) == (72.0, 200.0)
+
+    def test_a_column_of_one_width_is_where_its_text_starts(self):
+        # Every edge aligns, so none tells the alignment: the column is at its start, as left-set text is.
+        rows = (
+            line(cell("Pin", 72.0, 10.0), cell("0.01", 200.0, 10.0)),
+            line(cell("Nut", 72.0, 30.0), cell("0.02", 200.0, 30.0)),
+        )
+
+        assert positions(*rows) == (72.0, 200.0)
+
+    def test_a_header_off_the_alignment_moves_no_column(self):
+        # A centred header over flush-right amounts: the column is the amounts' end, the median (their mean is 297.75).
+        rows = (
+            line(cell("Item", 72.0, 10.0), centred("Total", 276.0, 10.0)),
+            line(cell("Bolt", 72.0, 30.0), ending("1,250.00", 300.0, 30.0)),
+            line(cell("Nut", 72.0, 50.0), ending("8.00", 300.0, 50.0)),
+            line(cell("Pin", 72.0, 70.0), ending("16.50", 300.0, 70.0)),
+        )
+
+        assert positions(*rows) == (72.0, 300.0)
+
+    @pytest.mark.parametrize(
+        "starts,position",
+        [
+            # Two cells ending together 36 pt past the first's start: their starts spread 0.09 pt (within the 0.1 pt
+            # slack: a tie, read at the start), exactly 0.1 pt (the float 0.1: a tie too) or 0.11 pt (past it: the
+            # ends, which do not vary, are the alignment).
+            pytest.param((72.0, 72.18), 72.09, id="within-the-slack"),
+            pytest.param((0.0, 0.2), 0.1, id="at-the-slack"),
+            pytest.param((72.0, 72.22), 108.0, id="past-the-slack"),
+        ],
+    )
+    def test_edges_within_the_slack_of_the_least_spread_tie(self, starts, position):
+        end = starts[0] + 36.0
+        rows = tuple(
+            line(
+                TextCell(
+                    text="Washer", bbox=box(start, y, end, y + 12.0), pieces=(chars("Washer", start, y, advance=5.9),)
+                ),
+                cell("100", 200.0, y),
+            )
+            for start, y in zip(starts, (10.0, 30.0))
+        )
+
+        assert positions(*rows)[0] == pytest.approx(position, abs=1e-9)
+
+    def test_each_column_is_inside_its_band_so_they_rise_strictly(self):
+        # Column 0 ends flush at 100, column 1 starts at 100.5: the two edges the bands share are the positions.
+        rows = (
+            line(ending("10", 100.0, 10.0), cell("Bolt", 100.5, 10.0)),
+            line(ending("200", 100.0, 30.0), cell("Nut", 100.5, 30.0)),
+        )
+
+        centres = positions(*rows)
+
+        assert centres == (100.0, 100.5)
+        ids = {"element_id": "p0001_e000", "page_number": 1, "reading_order": 0, "bbox": box(88.0, 10.0, 124.5, 42.0)}
+        grid = (("10", "Bolt"), ("200", "Nut"))
+        # A1's contract: one strictly increasing centre per column.
+        assert Table(**ids, headers=(), rows=grid, extraction_method="stream", column_centres=centres).column_centres
 
 
 class TestRejections:

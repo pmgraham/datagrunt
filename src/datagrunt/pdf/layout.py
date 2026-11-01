@@ -45,6 +45,7 @@ Known limitations (each a fact this pure pass cannot see):
 
 import math
 import re
+import statistics
 from bisect import bisect_left, bisect_right, insort
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -148,6 +149,12 @@ _MIN_CUT_ITEMS = 3
 _SPAN_REACH_PT = 5.0
 # ... and is shorter than this share of the region's height.
 _SPAN_HEIGHT_SHARE = 0.8
+# A figure covering at least this share of the area of a cut region's text is its background: read before the
+# region's parts, never dealt to one (#409). In the regions the corpus cuts, units cover all of it (32 page-sized
+# backgrounds) or at most 0.64 of it. Only a cut region: in the regions it does not cut, figure covers fill every
+# twentieth from 0.5 to 1.0 (a figure between a heading and its caption covers most of their extent too), and a
+# figure there reads by its top, as any unit.
+_BACKGROUND_SHARE = 0.9
 
 # v4's paragraph merge (text_block_builder.TextBlockBuilder._merge_lines), ported in _paragraphs. A line
 # starting with a list marker or a section number starts a paragraph (v4's LIST_MARKER_REGEX, revised: see
@@ -1348,7 +1355,9 @@ def _ink_box(run: _Run) -> Box:
 _Region = tuple[list[int], int | None]
 
 
-def _xy_cut(boxes: list[Box], weights: list[int], text: list[bool] | None = None) -> list[list[int]]:
+def _xy_cut(
+    boxes: list[Box], weights: list[int], text: list[bool] | None = None, figure: list[bool] | None = None
+) -> list[list[int]]:
     """The items' reading-order segments: lists of indices into ``boxes``, in reading order.
 
     v4's recursive XY-cut (``layout_sorter.PageLayoutSorter.partition``),
@@ -1358,13 +1367,16 @@ def _xy_cut(boxes: list[Box], weights: list[int], text: list[bool] | None = None
     reads in: left to right, lines top to bottom. ``text`` says which
     items are text (all, when None): as v4's ``_filter_text_items``, only
     text sets a region's extent and histogram; every item is dealt into
-    the parts (a table or an image, say).
+    the parts (a table or an image, say), but a background. ``figure``
+    says which items are figures (none, when None): a figure covering
+    most of a cut region's text is its background, a segment of its own
+    read before the region's parts (#409).
 
     Bound: a region at depth :data:`MAX_PARTITION_DEPTH` is not cut, and
     the regions at one depth hold disjoint items (each cut deals its
-    region's items out once), so at most D = MAX_PARTITION_DEPTH + 1
-    levels each cut at most n items: O(D n log n) for n items, with no
-    recursion.
+    region's items out once, its backgrounds into a segment), so at most
+    D = MAX_PARTITION_DEPTH + 1 levels each cut at most n items:
+    O(D n log n) for n items, with no recursion.
 
     Known limitations:
 
@@ -1379,7 +1391,7 @@ def _xy_cut(boxes: list[Box], weights: list[int], text: list[bool] | None = None
     stack: list[_Region] = [(list(range(len(boxes))), 0)] if boxes else []
     while stack:
         items, depth = stack.pop()
-        parts = None if depth is None else _cut_region(boxes, weights, items, depth, text)
+        parts = None if depth is None else _cut_region(boxes, weights, items, depth, text, figure)
         if parts is None:
             segments.append(items)
         else:
@@ -1388,20 +1400,69 @@ def _xy_cut(boxes: list[Box], weights: list[int], text: list[bool] | None = None
 
 
 def _cut_region(
-    boxes: list[Box], weights: list[int], items: list[int], depth: int, text: list[bool] | None = None
+    boxes: list[Box],
+    weights: list[int],
+    items: list[int],
+    depth: int,
+    text: list[bool] | None = None,
+    figure: list[bool] | None = None,
 ) -> list[_Region] | None:
     """A region's parts in reading order (v4's ``partition`` step), or None to read it as one segment.
 
     No cut at :data:`MAX_PARTITION_DEPTH`, for fewer than
     :data:`_MIN_CUT_ITEMS` items, a region of no text (v4), a region
     whose text is under :data:`_MIN_CUT_WIDTH_PT` wide, or one with no
-    gutter (:func:`_widest_gutter`, over its text). The items not
-    spanning the gutter (:func:`_spans`) are its columns: unless text of
-    them lies on both sides of it (by box centre), there are no columns
-    to cut (a unit is dealt to a side, but makes no column). Else the
-    spanning items cut the columns into bands (:func:`_bands`), or with
-    none the columns split into the two sides. A unit spans only where no
-    column text starts beside it (:func:`_unflanked`).
+    gutter (:func:`_widest_gutter`, over its text). Else the region's
+    backgrounds, each a figure covering at least :data:`_BACKGROUND_SHARE`
+    of its text's extent (:func:`_covers`), are set apart, and the other
+    items are cut (:func:`_parts`). If they are, the backgrounds read
+    first, a segment of their own, dealt to no part (#409: A4b dealt a
+    page-sized background to a column by its centre, between the
+    columns); if not, the region is one segment, where they read by
+    their tops as any unit does.
+    """
+    if depth >= MAX_PARTITION_DEPTH or len(items) < _MIN_CUT_ITEMS:
+        return None
+    texts = items if text is None else [index for index in items if text[index]]
+    if not texts:
+        return None
+    extent = union_box(tuple(boxes[index] for index in texts))
+    x0, y0, x1, y1 = extent
+    if x1 - x0 < _MIN_CUT_WIDTH_PT:
+        return None
+    gutter = _widest_gutter(boxes, weights, texts, x0, x1 - x0)
+    if gutter is None:
+        return None
+    backgrounds = (
+        [] if figure is None else [index for index in items if figure[index] and _covers(boxes[index], extent)]
+    )
+    apart = set(backgrounds)
+    parts = _parts(boxes, [index for index in items if index not in apart], depth, text, gutter, y1 - y0)
+    if parts is None or not backgrounds:
+        return parts
+    return [(backgrounds, None), *parts]
+
+
+def _covers(box: Box, extent: Box) -> bool:
+    """True if ``box`` covers at least :data:`_BACKGROUND_SHARE` of the area of ``extent``, an area over 0."""
+    x0, y0, x1, y1 = extent
+    area = (x1 - x0) * (y1 - y0)
+    covered = max(min(box[2], x1) - max(box[0], x0), 0.0) * max(min(box[3], y1) - max(box[1], y0), 0.0)
+    return area > 0.0 and covered >= _BACKGROUND_SHARE * area
+
+
+def _parts(
+    boxes: list[Box], items: list[int], depth: int, text: list[bool] | None, gutter: float, height: float
+) -> list[_Region] | None:
+    """A region's items cut at its ``gutter`` (``height`` its text's), in reading order; None if there are no columns.
+
+    The items not spanning the gutter (:func:`_spans`) are its columns:
+    unless text of them lies on both sides of it (by box centre), there
+    are no columns to cut (a unit is dealt to a side, but makes no
+    column). Else the spanning items cut the columns into bands
+    (:func:`_bands`), or with none the columns split into the two sides.
+    A unit spans only where no column text starts beside it
+    (:func:`_unflanked`).
 
     v4 asked for text on both sides only before that split. Asked before
     the bands too (a v5 fix): a region of lines each wider than
@@ -1409,18 +1470,7 @@ def _cut_region(
     weight nowhere, so v4 found a gutter that every line spans and read
     each line as a band of its own, which no paragraph merge could join.
     """
-    if depth >= MAX_PARTITION_DEPTH or len(items) < _MIN_CUT_ITEMS:
-        return None
-    texts = items if text is None else [index for index in items if text[index]]
-    if not texts:
-        return None
-    x0, y0, x1, y1 = union_box(tuple(boxes[index] for index in texts))
-    if x1 - x0 < _MIN_CUT_WIDTH_PT:
-        return None
-    gutter = _widest_gutter(boxes, weights, texts, x0, x1 - x0)
-    if gutter is None:
-        return None
-    spanning = [index for index in items if _spans(boxes[index], gutter, y1 - y0)]
+    spanning = [index for index in items if _spans(boxes[index], gutter, height)]
     if text is not None:
         spanning = _unflanked(boxes, spanning, items, text)
     across = set(spanning)
@@ -1998,6 +2048,10 @@ _MASTHEAD_GAP = 0.40
 # corpus, every run of two-column prose lines has a share of 0.5 to 1.0; the fixture tables have none.
 _PROSE_WORDS = 4
 _PROSE_SHARE = Fraction(1, 2)
+# A column's cells align on the edge (start, end or middle) that varies least down it; edges whose spread (standard
+# deviation) is within this of the least tie (#409). pdfium boxes the edge a column was set on exactly (spread 0.000
+# on the probe's fixtures); two one-letter widths differ by 0.15 pt, which must still tell a centred column.
+_ALIGN_SLACK_PT = 0.1
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -2008,10 +2062,14 @@ class StreamTable:
         rows: Its lines, at least 2, top to bottom in their own frame.
         columns: Per row, the column of each of its cells, rising; every
             column holds a cell.
-        column_centres: Each column's centre on the displayed page, along
-            the rows: the middle of the band its cells span (display x for
-            upright text, display y for text turned a quarter turn, so
-            falling for text read up the page). At least 2.
+        column_centres: Each column's position on the displayed page, along
+            the rows: where its cells align (:func:`_column_position`; the
+            start for text set flush left, the end for flush-right numbers,
+            the middle for centred cells), so it does not move with the
+            column's widest cell (#409). Display x for upright text, display
+            y for text turned a quarter turn, so falling for text read up
+            the page. Each lies in its column's band, so they rise strictly
+            (A1's contract). At least 2.
         bbox: The union of its rows' boxes on the displayed page.
     """
 
@@ -2341,7 +2399,7 @@ def _row_structure(rows: list[TextLine], starts: list[float], ends: list[float],
     cells = [found for item in rows for found in item.cells]
     if sum(len(found.text.split()) >= _PROSE_WORDS for found in cells) >= _PROSE_SHARE * len(cells):
         return None
-    return _Rows(tuple(rows), (_stream_table(rows, starts, ends),))
+    return _Rows(tuple(rows), (_stream_table(rows, starts),))
 
 
 def _is_key(text: str) -> bool:
@@ -2364,17 +2422,57 @@ def _cell_item(found: TextCell) -> StreamKeyValue | StreamParagraph:
     return StreamKeyValue(key=parsed[0], value=parsed[1], bbox=found.bbox, pieces=found.pieces)
 
 
-def _stream_table(rows: list[TextLine], starts: list[float], ends: list[float]) -> StreamTable:
-    """A run's lines as a table: each cell in the band holding its start, each column centred on its band."""
+def _stream_table(rows: list[TextLine], starts: list[float]) -> StreamTable:
+    """A run's lines as a table: each cell in the band holding its start, each column where its cells align."""
     turn = rows[0].turn
     columns = tuple(
         tuple(bisect_right(starts, _along(found.bbox, turn)[0]) - 1 for found in item.cells) for item in rows
     )
+    spans: list[list[tuple[float, float]]] = [[] for _ in starts]
+    for item, placed in zip(rows, columns):
+        for found, column in zip(item.cells, placed):
+            spans[column].append(_along(found.bbox, turn))
     # Back to the displayed page: along a line read up it (turn 270), the frame's x is the page's y negated.
     sign = -1.0 if turn == _UP else 1.0
-    centres = tuple(sign * (start + end) / 2 for start, end in zip(starts, ends))
+    centres = tuple(sign * _column_position(found) for found in spans)
     bbox = _bbox(union_box(tuple(_plain(item.bbox) for item in rows)))
     return StreamTable(rows=tuple(rows), columns=columns, column_centres=centres, bbox=bbox)
+
+
+def _column_position(spans: list[tuple[float, float]]) -> float:
+    """Where a column's cells align along its rows, given each cell's ``(start, end)`` there (#409).
+
+    The cells align on the edge (their starts, ends or middles) whose
+    spread down the column is least: its values' standard deviation, the
+    root of their variance. The column is that edge's median, so a header
+    set another way does not move it. Edges within
+    :data:`_ALIGN_SLACK_PT` of the least spread tie, read in the order
+    start, end, middle: in a column whose cells are all one width every
+    edge aligns, and the column is where its text starts.
+
+    The median lies between the column's cells, so in its band: the
+    positions of neighbouring bands, which never meet, rise strictly.
+
+    Known limit: a column of one width tells no alignment. A part of a
+    split table whose flush-right numbers are all one width ("0.02",
+    "0.03") is placed at their start, which does not meet the other
+    part's end. O(k log k) for k cells.
+    """
+    edges = (
+        [start for start, _ in spans],
+        [end for _, end in spans],
+        [(start + end) / 2 for start, end in spans],
+    )
+    spreads = [_spread(values) for values in edges]
+    least = min(spreads)
+    aligned = next(values for values, spread in zip(edges, spreads) if spread <= least + _ALIGN_SLACK_PT)
+    return statistics.median(aligned)
+
+
+def _spread(values: list[float]) -> float:
+    """The population standard deviation of ``values`` (at least one): how far they vary from their mean."""
+    mean = math.fsum(values) / len(values)
+    return math.sqrt(math.fsum((value - mean) ** 2 for value in values) / len(values))
 
 
 # A slot of the page's reading order: neighbouring paragraphs, lines read whole, or a unit.
@@ -2389,7 +2487,9 @@ def _reading_slots(
     The XY-cut reads each structure as one item: the union of its runs'
     ink, weighing their chars. The other runs are items as in
     :func:`text_blocks`. Each unit is one item, its box, and no text
-    (:func:`_xy_cut`): it adds no weight and sets no region's extent.
+    (:func:`_xy_cut`): it adds no weight and sets no region's extent. A
+    figure covering most of a cut region's text is that region's
+    background, read before its parts (:func:`_cut_region`, #409).
     """
     owner = {_identity(piece): index for index, found in enumerate(structures) for piece in _lines_pieces(found.rows)}
     free: list[_TurnedRun] = []
@@ -2407,9 +2507,10 @@ def _reading_slots(
     weights += [sum(run.end - run.start for run in found) for found in members]
     weights += [0] * len(units)
     text = [True] * (len(free) + len(structures)) + [False] * len(units)
+    figure = [False] * (len(free) + len(structures)) + [isinstance(unit, FigureSlot) for unit in units]
     placed: list[_Rows | _Unit] = [*structures, *units]
     slots: list[_Slot] = []
-    for segment in _xy_cut(boxes, weights, text):
+    for segment in _xy_cut(boxes, weights, text, figure):
         slots.extend(_segment_slots(segment, free, placed, boxes, turn))
     return slots
 
@@ -2580,7 +2681,10 @@ def page_layout(
        :meth:`~datagrunt.pdf.elements.BBox.within`) one unit of the XY-cut:
        dealt into its parts by its box, but no text, so it neither weighs
        in the histogram nor sets a region's extent (v4's
-       ``_filter_text_items``), and read in its segment by its top.
+       ``_filter_text_items``), and read in its segment by its top. A
+       figure covering at least :data:`_BACKGROUND_SHARE` of a cut
+       region's text is that region's background: read before its parts,
+       never dealt to one (#409).
        Hidden and recovered text takes no part, so it cannot change the
        visible order.
     2. Apart items: the page's hidden pieces and its recovered pieces,
