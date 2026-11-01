@@ -14,27 +14,36 @@ import io
 import pickle
 from pathlib import Path
 
+import pypdfium2 as pdfium
 import pytest
 from PIL import Image
 
 from datagrunt.pdf import vision
 from datagrunt.pdf.assembly import FigureDraft, assemble_page, conservation
-from datagrunt.pdf.elements import BBox, Figure, Page, Paragraph
+from datagrunt.pdf.elements import BBox, Figure, Page, PageQuality, Paragraph
 from datagrunt.pdf.layout import find_lattice_tables
 from datagrunt.pdf.ocr import OCRResult, OCRWord, Orientation, bands, normalized, rotated
-from datagrunt.pdf.pdfium_engine import ImageLoader, PageGeometry, extract_page, open_document, recover_dropped_text
+from datagrunt.pdf.pdfium_engine import (
+    ImageLoader,
+    PageFailure,
+    PageGeometry,
+    extract_page,
+    open_document,
+    recover_dropped_text,
+)
 from datagrunt.pdf.quality import SpanPiece, assess_page
 from datagrunt.pdf.render import RenderFailed, RenderRefused
 from datagrunt.pdf.vision import (
     PageRender,
     VisionElements,
     VisionOptions,
+    fallback_page,
     ocr_pieces,
     superseded,
     vision_elements,
     vision_page,
 )
-from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf
+from pdf_tests.builders import PageSpec, RasterImage, TextRun, break_page, build_pdf
 from pdf_tests.test_ocr import needs_tesseract
 from pdf_tests.test_ocr_scans import LINES, TOKENS, png_of, rendered
 from pdf_tests.test_pdfium_engine import imported_modules
@@ -694,3 +703,197 @@ class TestPageRender:
         assert first == second
         assert decoded(first) == (normalized(rendered(scans["scan"], dpi=72)).pixels, 612, 792)
         assert calls == [72, 72]
+
+
+# The page whose extraction failed (task 4): its geometry, then render + OCR; else an error page.
+
+
+def failing_text(monkeypatch) -> None:
+    """Make every textpage load in this process fail, as a corrupt page's does; the render worker is unaffected."""
+
+    def broken(self):
+        raise pdfium.PdfiumError("Failed to load text page.")
+
+    monkeypatch.setattr(pdfium.PdfPage, "get_textpage", broken)
+
+
+def failed_at_text(path: Path, monkeypatch) -> PageFailure:
+    """Page 1's PageFailure, its text stage failing (A2's extract_page)."""
+    failing_text(monkeypatch)
+    with open_document(path) as handle:
+        failure = extract_page(handle, 0)
+    monkeypatch.undo()
+    assert isinstance(failure, PageFailure) and failure.stage == "text"
+    return failure
+
+
+def fell_back(path: Path, failure: PageFailure, **options) -> Page:
+    """fallback_page of ``failure`` on its own load of ``path``."""
+    with open_document(path) as handle:
+        return fallback_page(handle, failure, source=path, **options)
+
+
+FAILED = "extraction failed at stage 'text': "
+READ_BY_OCR = "; the page was read by OCR of its render: its text layer, vector rules and images were not read"
+
+
+@needs_tesseract
+class TestFallbackPage:
+    """A page whose extraction raised is read by OCR of its render: 'ocr_fallback', route vision, never verified."""
+
+    def test_a_page_whose_extraction_raises_is_ocr_fallback(self, scans, monkeypatch):
+        failure = failed_at_text(scans["captioned"], monkeypatch)
+
+        page = fell_back(scans["captioned"], failure)
+
+        assert (page.status, page.route, page.integrity_verified, page.error) == ("ocr_fallback", "vision", False, None)
+        read_tokens = " ".join(texts(page)).split()
+        assert len(set(TOKENS) & set(read_tokens)) >= 0.9 * len(set(TOKENS))
+        assert "Page" in read_tokens
+        assert texts(page, hidden=True) == []
+        assert page.warnings[0] == f"{FAILED}{failure.message}{READ_BY_OCR}"
+        assert (page.page_image.width_px, page.page_image.height_px) == (2550, 3300)
+
+    def test_its_quality_is_the_ocrs(self, scans, monkeypatch):
+        failure = failed_at_text(scans["scan"], monkeypatch)
+
+        page = fell_back(scans["scan"], failure)
+
+        words = " ".join(texts(page)).replace(" ", "")
+        assert page.quality.char_count == len(words)
+        assert page.quality.valid_char_ratio == 1.0
+        assert 0.0 < page.quality.ocr_mean_confidence <= 100.0
+        assert (page.quality.vector_line_count, page.quality.hidden_spans_flagged) == (0, 0)
+        assert (page.quality.rotation_deg, page.quality.deskew_angle_deg) == (0, None)
+
+
+def ok_reading(monkeypatch, words) -> None:
+    """OCR stands in: the page upright, ``words`` read."""
+    monkeypatch.setattr(vision, "orientation", lambda *args, **kwargs: UPRIGHT)
+    spy_ocr(monkeypatch, words)
+
+
+class TestFallbackQuality:
+    """An OCR'd fallback page's quality counts the words' chars by A3's rule."""
+
+    def test_the_counts_and_the_mean_confidence(self, scans, monkeypatch):
+        failure = failed_at_text(scans["scan"], monkeypatch)
+        words = (word("Bolt", 72.0, 100.0, 92.0, 110.0, 80.0), word("4�", 100.0, 100.0, 115.0, 110.0, 50.0))
+        ok_reading(monkeypatch, words)
+
+        page = fell_back(scans["scan"], failure)
+
+        assert page.quality == PageQuality(
+            valid_char_ratio=5 / 7,
+            char_count=7,
+            vector_line_count=0,
+            hidden_spans_flagged=0,
+            rotation_deg=0,
+            deskew_angle_deg=None,
+            ocr_mean_confidence=65.0,
+        )
+        assert page.status == "ocr_fallback"
+
+    def test_no_words_no_ratio_and_no_mean(self, scans, monkeypatch):
+        failure = failed_at_text(scans["scan"], monkeypatch)
+        ok_reading(monkeypatch, ())
+
+        page = fell_back(scans["scan"], failure)
+
+        assert (page.quality.char_count, page.quality.valid_char_ratio, page.quality.ocr_mean_confidence) == (
+            0,
+            None,
+            None,
+        )
+        assert (page.status, page.elements) == ("ocr_fallback", ())
+
+
+class TestFallbackErrors:
+    """A failed page whose geometry, render or OCR fails too is an error page: why, and no elements (A1)."""
+
+    def test_a_page_that_cannot_load_is_an_error_without_rendering(self, tmp_path, monkeypatch):
+        path = break_page(build_pdf(tmp_path / "broken.pdf", [PageSpec(items=LINES)]), 1)
+        with open_document(path) as handle:
+            failure = extract_page(handle, 0)
+        assert isinstance(failure, PageFailure) and failure.stage == "page"
+        monkeypatch.setattr(vision, "render_page", lambda *args, **kwargs: pytest.fail("rendered"))
+
+        page = fell_back(path, failure)
+
+        assert (page.status, page.route, page.quality, page.elements, page.page_image) == (
+            "error",
+            "vision",
+            None,
+            (),
+            None,
+        )
+        assert page.error.startswith(f"extraction failed at stage 'page': {failure.message}; ")
+        assert "its geometry cannot be read either: " in page.error
+        assert (page.width_pt, page.height_pt) == (612.0, 792.0)
+        geometry_error = page.error.split("its geometry cannot be read either: ", 1)[1]
+        default = "612 x 792 pt is pdfium's default page size, not this page's"
+        assert page.warnings == (f"the page's size could not be read (PDFCorruptError: {geometry_error}); {default}",)
+
+    @pytest.mark.parametrize("error", [RenderFailed, RenderRefused])
+    def test_a_page_not_rendered_either_is_an_error(self, scans, monkeypatch, error):
+        failure = failed_at_text(scans["scan"], monkeypatch)
+
+        def fail(*args, **kwargs):
+            raise error("page 1: it cannot be drawn")
+
+        monkeypatch.setattr(vision, "render_page", fail)
+
+        page = fell_back(scans["scan"], failure)
+
+        assert (page.status, page.elements, page.quality, page.page_image) == ("error", (), None, None)
+        assert page.error == f"{FAILED}{failure.message}; the page was not rendered: page 1: it cannot be drawn"
+        assert (page.width_pt, page.height_pt) == LETTER
+
+    def test_no_tesseract_is_an_error_with_the_render_kept(self, scans, monkeypatch, tmp_path):
+        failure = failed_at_text(scans["scan"], monkeypatch)
+        no_tesseract(monkeypatch, tmp_path)
+
+        page = fell_back(scans["scan"], failure)
+
+        assert (page.status, page.elements, page.quality) == ("error", (), None)
+        reason = "tesseract is unavailable: no tesseract in an absolute PATH directory"
+        assert page.error == f"{FAILED}{failure.message}; OCR could not read the page: {reason}"
+        assert page.page_image is not None
+
+    def test_an_ocr_timeout_is_an_error_and_its_partial_words_unused(self, scans, monkeypatch):
+        failure = failed_at_text(scans["scan"], monkeypatch)
+        partial = OCRResult(words=tuple(line_words("The", 72.0, 100.0)), status="timeout", reason="band 3 of 4: killed")
+        monkeypatch.setattr(vision, "orientation", lambda *args, **kwargs: UPRIGHT)
+        monkeypatch.setattr(vision, "ocr_words", lambda *args, **kwargs: partial)
+
+        page = fell_back(scans["scan"], failure)
+
+        assert (page.status, page.elements) == ("error", ())
+        unused = "the 1 word(s) it read before that are not used"
+        assert page.error.endswith(f"OCR could not read the page: tesseract timeout: band 3 of 4: killed; {unused}")
+
+    def test_ocr_never_reads_nothing_by_ocr(self, scans, monkeypatch):
+        failure = failed_at_text(scans["scan"], monkeypatch)
+        monkeypatch.setattr(vision, "render_page", lambda *args, **kwargs: pytest.fail("rendered"))
+
+        page = fell_back(scans["scan"], failure, ocr="never")
+
+        assert (page.status, page.elements, page.page_image) == ("error", (), None)
+        assert page.error == f"{FAILED}{failure.message}; ocr='never', so the page is not read by OCR"
+        assert (page.width_pt, page.height_pt) == LETTER
+
+
+class TestFallbackArguments:
+    """fallback_page checks its arguments at its boundary."""
+
+    def test_rejects_wrong_arguments(self, scans, monkeypatch):
+        failure = failed_at_text(scans["scan"], monkeypatch)
+        with open_document(scans["scan"]) as handle:
+            with pytest.raises(TypeError, match="handle"):
+                fallback_page(None, failure, source=scans["scan"])
+            with pytest.raises(TypeError, match="failure"):
+                fallback_page(handle, None, source=scans["scan"])
+            with pytest.raises(ValueError, match="ocr"):
+                fallback_page(handle, failure, source=scans["scan"], ocr="sometimes")
+            with pytest.raises(TypeError, match="options"):
+                fallback_page(handle, failure, source=scans["scan"], options=None)

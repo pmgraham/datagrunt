@@ -56,6 +56,19 @@ page of its digital text, the page image when it was rendered, and a
 warning naming why. Words read before a band failed are not used: the page
 is the digital text's, never half of each.
 
+:func:`fallback_page` makes the A1 page of a page A2 could not read (its
+``PageFailure``; spec §3.3 step 2, per-page fault isolation): only its
+geometry is read (``page_geometry``), then it is rendered and read as a
+vision page is, with no digital text and no figures (none was read). Read,
+it is ``"ocr_fallback"`` (route ``"vision"``, never verified): its quality
+is the OCR's (the words' chars by A3's rule, their mean confidence; no
+vector line, hidden span or skew was measured: 0, 0 and None), and its first
+warning says extraction failed and what was not read. When its geometry,
+render or OCR fails too, or ``ocr="never"``, it is an ``"error"`` page (A1:
+no elements, no quality) whose ``error`` names the extraction failure and
+then why it was not read; a page whose geometry cannot be read is pdfium's
+default 612 x 792 pt, with a warning.
+
 Known limitation: a word's box runs from its highest to its lowest ink, so
 its height is the font's x-height for a word such as "over", and its
 ascent to descent for "jumps". Lines whose words mostly reach both read
@@ -76,7 +89,7 @@ from typing import NamedTuple
 
 from PIL import Image
 
-from datagrunt.pdf._validate import int_at_least, non_blank_str, positive_float, typed_tuple
+from datagrunt.pdf._validate import choice_str, int_at_least, non_blank_str, positive_float, typed_tuple
 from datagrunt.pdf.assembly import (
     MIN_IMAGE_DIMENSION,
     FigureDraft,
@@ -87,11 +100,21 @@ from datagrunt.pdf.assembly import (
     page_figures,
     raw_page_warnings,
 )
-from datagrunt.pdf.elements import DocumentElement, HiddenReason, Page, PageImage
+from datagrunt.pdf.elements import DocumentElement, HiddenReason, Page, PageImage, PageQuality
+from datagrunt.pdf.exceptions import PDFCorruptError
 from datagrunt.pdf.layout import LatticeResult, find_lattice_tables, page_layout
 from datagrunt.pdf.ocr import Band, OCRWord, Orientation, bands, normalized, ocr_words, orientation, rotated
-from datagrunt.pdf.pdfium_engine import PageGeometry, RawPage, RawSpan, _checked_password, _checked_path
-from datagrunt.pdf.quality import PageAssessment, SpanPiece
+from datagrunt.pdf.pdfium_engine import (
+    DocumentHandle,
+    PageFailure,
+    PageGeometry,
+    RawPage,
+    RawSpan,
+    _checked_password,
+    _checked_path,
+    page_geometry,
+)
+from datagrunt.pdf.quality import OcrMode, PageAssessment, SpanPiece, valid_char
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page
 
 __all__ = [
@@ -100,6 +123,7 @@ __all__ = [
     "PageRender",
     "VisionElements",
     "VisionOptions",
+    "fallback_page",
     "ocr_pieces",
     "superseded",
     "vision_elements",
@@ -121,6 +145,10 @@ ROTATION_CONFIDENCE = 2.0
 
 _SUPERSEDED: tuple[HiddenReason, ...] = ("superseded",)
 _TURNS = (0, 90, 180, 270)
+_OCR_MODES: tuple[OcrMode, ...] = ("auto", "always", "never")
+# What pdfium reads for a page with no MediaBox: an error page whose own size cannot be read has this one.
+_DEFAULT_PAGE_SIZE = (612.0, 792.0)
+_NOT_READ = "the page was read by OCR of its render: its text layer, vector rules and images were not read"
 
 # The spec's construction checks (PDFReader / PDFWriter) and defaults: vision_dpi >= 36, 300; max_render_pixels >=
 # 512 x 512, 16,000,000.
@@ -530,4 +558,116 @@ def _unread(
     )
     return dataclasses.replace(
         page, page_image=image, warnings=(*page.warnings, f"OCR could not read the page: {reason}")
+    )
+
+
+def fallback_page(
+    handle: DocumentHandle,
+    failure: PageFailure,
+    *,
+    source: str | os.PathLike[str],
+    password: str | None = None,
+    ocr: OcrMode = "auto",
+    options: VisionOptions = VisionOptions(),
+) -> Page:
+    """The A1 page of a page whose extraction failed: read by OCR of its render, or an error page (module notes).
+
+    Args:
+        handle: The open document the page failed in; its geometry is read again from it.
+        failure: A2's ``PageFailure`` of the page.
+        source: The PDF's path: the page is rendered from it.
+        password: The PDF's password, or None.
+        ocr: The reader's OCR option: ``"never"`` reads nothing by OCR.
+        options: How the page is rendered and read.
+
+    Raises:
+        TypeError, ValueError: If an argument is of the wrong type or value.
+        IndexError: If ``failure`` names a page the document does not have.
+    """
+    _check_fallback(handle, failure, ocr, options)
+    failed = f"extraction failed at stage {failure.stage!r}: {failure.message}"
+    try:
+        geometry = page_geometry(handle, failure.page_number - 1)
+    except PDFCorruptError as exc:
+        return _error_page(failure.page_number, None, _unsized(failed, exc))
+    if ocr == "never":
+        never = f"{failed}; ocr='never', so the page is not read by OCR"
+        return _error_page(failure.page_number, geometry, _Unread(never))
+    drawn = _drawn(source, geometry, password, options)
+    if drawn.page is None:
+        return _error_page(failure.page_number, geometry, _Unread(f"{failed}; {drawn.failure}"))
+    reading = _read(drawn.page, drawn.dpi, geometry, options)
+    image = _page_image(drawn, reading.rotation, geometry, source, password, options)
+    if reading.failure:
+        why = f"{failed}; OCR could not read the page: {reading.failure}"
+        return _error_page(failure.page_number, geometry, _Unread(why, reading.notes, image))
+    laid = vision_elements(reading.words, geometry=geometry)
+    return Page(
+        page_number=geometry.page_number,
+        width_pt=geometry.width_pt,
+        height_pt=geometry.height_pt,
+        status="ocr_fallback",
+        route="vision",
+        quality=_ocr_quality(reading.words, geometry),
+        elements=laid.elements,
+        page_image=image,
+        warnings=(f"{failed}; {_NOT_READ}", *reading.notes, *laid.warnings),
+    )
+
+
+def _check_fallback(handle: object, failure: object, ocr: object, options: object) -> None:
+    """Require an open document's handle, a PageFailure, an OCR mode and VisionOptions."""
+    if not isinstance(handle, DocumentHandle):
+        raise TypeError(f"handle must be a DocumentHandle, got {type(handle).__name__}")
+    if not isinstance(failure, PageFailure):
+        raise TypeError(f"failure must be a PageFailure, got {type(failure).__name__}")
+    choice_str("ocr", ocr, _OCR_MODES)
+    if not isinstance(options, VisionOptions):
+        raise TypeError(f"options must be a VisionOptions, got {type(options).__name__}")
+
+
+class _Unread(NamedTuple):
+    """Why a failed page was not read, its warnings, and its image if it was rendered."""
+
+    error: str
+    warnings: tuple[str, ...] = ()
+    image: PageImage | None = None
+
+
+def _unsized(failed: str, exc: PDFCorruptError) -> _Unread:
+    """Why a failed page whose geometry cannot be read either is not read, and a warning that its size is a default."""
+    size = f"the page's size could not be read ({type(exc).__name__}: {exc})"
+    width, height = _DEFAULT_PAGE_SIZE
+    default = f"{width:g} x {height:g} pt is pdfium's default page size, not this page's"
+    return _Unread(f"{failed}; its geometry cannot be read either: {exc}", (f"{size}; {default}",))
+
+
+def _error_page(page_number: int, geometry: PageGeometry | None, unread: _Unread) -> Page:
+    """The A1 error page: no elements, no quality, routed vision; its size the page's, or pdfium's default."""
+    width, height = (geometry.width_pt, geometry.height_pt) if geometry is not None else _DEFAULT_PAGE_SIZE
+    return Page(
+        page_number=page_number,
+        width_pt=width,
+        height_pt=height,
+        status="error",
+        route="vision",
+        quality=None,
+        page_image=unread.image,
+        error=unread.error,
+        warnings=unread.warnings,
+    )
+
+
+def _ocr_quality(words: tuple[OCRWord, ...], geometry: PageGeometry) -> PageQuality:
+    """A fallback page's quality: its words' chars by A3's rule and their mean confidence; nothing else was read."""
+    chars = [char for item in words for char in item.text]
+    valid = sum(1 for char in chars if valid_char(char))
+    return PageQuality(
+        valid_char_ratio=valid / len(chars) if chars else None,
+        char_count=len(chars),
+        vector_line_count=0,
+        hidden_spans_flagged=0,
+        rotation_deg=geometry.rotation_deg,
+        deskew_angle_deg=None,
+        ocr_mean_confidence=_mean_confidence(words),
     )

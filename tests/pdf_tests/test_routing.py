@@ -40,7 +40,14 @@ from datagrunt.pdf.pdfium_engine import (
     open_document,
     recover_dropped_text,
 )
-from datagrunt.pdf.quality import OcrMode, PageAssessment, assess_page, classify_spans, raster_cover_fraction
+from datagrunt.pdf.quality import (
+    OcrMode,
+    PageAssessment,
+    assess_page,
+    classify_spans,
+    raster_cover_fraction,
+    valid_char,
+)
 from pdf_tests.builders import Line, PageSpec, RasterImage, TextRun, build_pdf
 from pdf_tests.test_pdfium_spans import OVERFLOW, bfchar_cmap, cid_font_page, content_page
 from pdf_tests.test_quality import FULL_BLEED, PNG, STRIPS, H, W, image, raw_span, row
@@ -309,6 +316,13 @@ class TestCharValidity:
         quality = assess(text_span(char)).quality
 
         assert quality.valid_char_ratio == (1.0 if valid else 0.0)
+        # The public rule A5b's vision route measures OCR text with: the same verdict.
+        assert valid_char(char) is valid
+
+    @pytest.mark.parametrize(("bad", "error"), [("ab", ValueError), ("", ValueError), (65, TypeError)])
+    def test_the_public_rule_takes_one_char(self, bad, error):
+        with pytest.raises(error, match="char"):
+            valid_char(bad)
 
     def test_ratio_is_valid_over_every_char(self):
         quality = assess(text_span("Ab\ufffd\ue000c\u0378d\ud835")).quality
