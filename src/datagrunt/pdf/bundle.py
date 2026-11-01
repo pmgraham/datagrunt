@@ -53,6 +53,31 @@ page render's, ``contrast_normalized`` is False, and ``band_paths`` are the
 vision bands (A1's PageImage has one DPI: the bands' is the effective
 ``vision_dpi``, from the manifest's parameters).
 
+:func:`load_bundle` takes a bundle directory or its ``manifest.json``
+and returns the document, its figures' and page images' paths in the
+bundle (their bytes are read from those files, by A1). Nothing is trusted
+before it is checked:
+
+1. The manifest (read within the asset limit, strict JSON): its version
+   (:data:`BUNDLE_FORMAT_VERSION`), its keys (exactly, at every level) and
+   values; every artifact path through
+   :func:`~datagrunt.pdf.codec.contained_path` (plain relative parts,
+   resolved inside the bundle: no ``..``, absolute path or symlink out),
+   listed once, ``json/document.json`` and ``markdown/document.md`` among
+   them, each no larger than the asset limit.
+2. Every artifact: a regular file (checked before it is opened) of the
+   manifest's size, read in chunks of at most that size plus one byte, of
+   the manifest's sha256. ``json/document.json`` is decoded from the bytes
+   verified, not read again.
+3. The document (the codec, its paths joined to the bundle by the same
+   helper): the manifest's source sha256, ``integrity_verified`` and
+   ``degraded_pages`` must be its; every path it names must be a verified
+   artifact; and its missing page images, bands and figures must be
+   exactly the manifest's ``missing`` entries.
+
+A failure is a :class:`~datagrunt.pdf.exceptions.BundleCorruptError` naming
+the artifact. Nothing is held open: there is nothing to close.
+
 Failures are recorded, never silent: a page whose render is refused or
 fails (``RenderRefused``, ``RenderFailed``) has no page image (nor bands);
 a vision page whose band render is refused or fails has no bands; a figure
@@ -69,8 +94,9 @@ import importlib.metadata
 import json
 import os
 import shutil
+import stat
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -78,16 +104,24 @@ from typing import IO, BinaryIO, NamedTuple, cast
 
 from PIL import Image
 
-from datagrunt.pdf.codec import document_to_json_bytes
-from datagrunt.pdf.elements import Figure, Page, PageImage, PDFDocument
-from datagrunt.pdf.exceptions import DatagruntPDFError
+from datagrunt.pdf._validate import choice_str, int_at_least, non_blank_str, optional_str, sha256_hex, strict_bool
+from datagrunt.pdf.codec import (
+    _array,
+    _object,
+    contained_path,
+    document_from_json_bytes,
+    document_to_json_bytes,
+    parse_json,
+)
+from datagrunt.pdf.elements import _MAX_ASSET_BYTES, Figure, Page, PageImage, PDFDocument
+from datagrunt.pdf.exceptions import BundleCorruptError, DatagruntPDFError
 from datagrunt.pdf.frame import utf8_text
 from datagrunt.pdf.ocr import Band, bands, normalized
 from datagrunt.pdf.pdfium_engine import _checked_path
 from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, _opened_source, _stream_sha256
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page
 
-__all__ = ["BUNDLE_FORMAT_VERSION", "write_bundle"]
+__all__ = ["BUNDLE_FORMAT_VERSION", "load_bundle", "write_bundle"]
 
 BUNDLE_FORMAT_VERSION = "5.0"
 MANIFEST = "manifest.json"
@@ -99,6 +133,22 @@ _STAGING_PREFIX = ".tmp_"
 _MEMORY_CAP_BYTES = 2 << 30
 _RENDER_TIMEOUT_S = 120.0
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+# The most bytes of any one file a load reads (the manifest, an artifact): A1's asset limit.
+_MAX_ARTIFACT_BYTES = _MAX_ASSET_BYTES
+_READ_CHUNK_BYTES = 1 << 20
+_MANIFEST_KEYS = (
+    "bundle_format_version",
+    "datagrunt_version",
+    "source_sha256",
+    "extraction_params",
+    "integrity_verified",
+    "degraded_pages",
+    "artifacts",
+    "missing",
+)
+_PARAM_KEYS = ("dpi", "vision_dpi", "max_render_pixels", "workers")
+_MISSING_ARTIFACTS = ("bands", "figure", "page_image")
 
 
 class _Artifact(NamedTuple):
@@ -478,3 +528,249 @@ def _manifest(document: PDFDocument, options: PipelineOptions, ledger: _Ledger) 
         "missing": [entry._asdict() for entry in sorted(ledger.missing, key=_missing_order)],
     }
     return json.dumps(data, ensure_ascii=True, allow_nan=False, indent=2).encode("ascii")
+
+
+class _Listed(NamedTuple):
+    """An artifact the manifest lists, and its file in the bundle."""
+
+    entry: _Artifact
+    file: Path
+
+
+class _Manifest(NamedTuple):
+    """A manifest's values, checked (see the module notes)."""
+
+    source_sha256: str
+    integrity_verified: bool
+    degraded_pages: tuple[int, ...]
+    artifacts: tuple[_Listed, ...]
+    missing: tuple[_Missing, ...]
+
+
+def load_bundle(path: str | os.PathLike[str]) -> PDFDocument:
+    """The document of the bundle at ``path`` (its directory or its ``manifest.json``), verified.
+
+    See the module notes for every check.
+
+    Raises:
+        TypeError: If ``path`` is not a str or os.PathLike.
+        FileNotFoundError: If ``path`` does not exist, or the directory has
+            no ``manifest.json``.
+        ValueError: If ``path`` is a file other than a ``manifest.json``.
+        BundleCorruptError: If the bundle is not what its manifest says
+            (naming the artifact).
+    """
+    root = _bundle_root(path)
+    manifest = _read_manifest(root)
+    raw = b""
+    for listed in manifest.artifacts:
+        data = _verified(listed, keep=listed.entry.path == DOCUMENT_JSON)
+        raw = data or raw
+    try:
+        document = document_from_json_bytes(raw, base_dir=root)
+    except (TypeError, ValueError) as exc:
+        raise BundleCorruptError(f"{DOCUMENT_JSON}: {exc}") from exc
+    _check_facts(document, manifest)
+    _check_paths(document, {listed.entry.path for listed in manifest.artifacts}, root)
+    _check_missing(document, manifest.missing)
+    return document
+
+
+def _bundle_root(path: object) -> Path:
+    """The bundle directory ``path`` names (itself, or a ``manifest.json``'s), made absolute."""
+    if not isinstance(path, (str, os.PathLike)):
+        raise TypeError(f"path must be a str or os.PathLike, got {type(path).__name__}")
+    given = Path(path).absolute()
+    if given.is_dir():
+        root = given
+    elif given.name == MANIFEST and given.is_file():
+        root = given.parent
+    elif not given.exists():
+        raise FileNotFoundError(errno.ENOENT, "no bundle here", str(given))
+    else:
+        raise ValueError(f"{given} is not a bundle directory or its {MANIFEST}")
+    if not (root / MANIFEST).exists():
+        raise FileNotFoundError(errno.ENOENT, f"no {MANIFEST}: not a bundle directory", str(root))
+    return root
+
+
+def _read_manifest(root: Path) -> _Manifest:
+    """The manifest, read within the asset limit and checked; any fault is a BundleCorruptError naming it."""
+    try:
+        file = contained_path(MANIFEST, MANIFEST, root)
+    except ValueError as exc:
+        raise BundleCorruptError(f"{MANIFEST}: {exc}") from exc
+    _regular_size(file, MANIFEST)
+    total, _digest, raw = _hashed(file, _MAX_ARTIFACT_BYTES, keep=True)
+    if total > _MAX_ARTIFACT_BYTES:
+        raise BundleCorruptError(f"{MANIFEST}: it is over the {_MAX_ARTIFACT_BYTES}-byte asset limit")
+    try:
+        return _manifest_of(parse_json(raw, MANIFEST), root)
+    except (TypeError, ValueError) as exc:
+        raise BundleCorruptError(f"{MANIFEST}: {exc}") from exc
+
+
+def _manifest_of(data: object, root: Path) -> _Manifest:
+    """The manifest's values, each checked: TypeError or ValueError naming the first that is wrong."""
+    top = _object("manifest", data, _MANIFEST_KEYS)
+    version = top["bundle_format_version"]
+    if not isinstance(version, str) or version != BUNDLE_FORMAT_VERSION:
+        message = f"bundle_format_version {version!r} is not supported: this datagrunt reads {BUNDLE_FORMAT_VERSION!r}"
+        raise ValueError(message)
+    non_blank_str("datagrunt_version", top["datagrunt_version"])
+    PipelineOptions(**_object("extraction_params", top["extraction_params"], _PARAM_KEYS))
+    pages = enumerate(_array("degraded_pages", top["degraded_pages"]))
+    missing = enumerate(_array("missing", top["missing"]))
+    return _Manifest(
+        source_sha256=sha256_hex("source_sha256", top["source_sha256"]),
+        integrity_verified=strict_bool("integrity_verified", top["integrity_verified"]),
+        degraded_pages=tuple(int_at_least(f"degraded_pages[{i}]", page, 1) for i, page in pages),
+        artifacts=_listed_artifacts(top["artifacts"], root),
+        missing=tuple(_missing_entry(f"missing[{i}]", item) for i, item in missing),
+    )
+
+
+def _listed_artifacts(value: object, root: Path) -> tuple[_Listed, ...]:
+    """The manifest's artifacts: each checked, each path once, the document's JSON and Markdown among them."""
+    listed: list[_Listed] = []
+    seen: set[str] = set()
+    for index, item in enumerate(_array("artifacts", value)):
+        artifact = _artifact_entry(f"artifacts[{index}]", item, root)
+        if artifact.entry.path in seen:
+            raise ValueError(f"artifacts lists {artifact.entry.path!r} twice")
+        seen.add(artifact.entry.path)
+        listed.append(artifact)
+    for required in (DOCUMENT_JSON, DOCUMENT_MARKDOWN):
+        if required not in seen:
+            raise ValueError(f"artifacts lists no {required}")
+    return tuple(listed)
+
+
+def _artifact_entry(name: str, value: object, root: Path) -> _Listed:
+    data = _object(name, value, _Artifact._fields)
+    file = contained_path(f"{name}.path", data["path"], root)
+    size = int_at_least(f"{name}.size", data["size"], 0)
+    if size > _MAX_ARTIFACT_BYTES:
+        raise ValueError(f"{name} ({data['path']!r}): size {size} is over the {_MAX_ARTIFACT_BYTES}-byte asset limit")
+    entry = _Artifact(path=data["path"], size=size, sha256=sha256_hex(f"{name}.sha256", data["sha256"]))
+    return _Listed(entry, file)
+
+
+def _missing_entry(name: str, value: object) -> _Missing:
+    data = _object(name, value, _Missing._fields)
+    return _Missing(
+        artifact=choice_str(f"{name}.artifact", data["artifact"], _MISSING_ARTIFACTS),
+        page_number=int_at_least(f"{name}.page_number", data["page_number"], 1),
+        element_id=optional_str(f"{name}.element_id", data["element_id"]),
+        reason=non_blank_str(f"{name}.reason", data["reason"]),
+    )
+
+
+def _regular_size(file: Path, name: str) -> int:
+    """The size of ``file``, a regular file, checked before it is opened (a named pipe would block an open)."""
+    try:
+        status = file.stat()
+    except FileNotFoundError as exc:
+        raise BundleCorruptError(f"{name}: it is missing") from exc
+    if not stat.S_ISREG(status.st_mode):
+        raise BundleCorruptError(f"{name}: it is not a regular file")
+    return status.st_size
+
+
+def _hashed(file: Path, limit: int, *, keep: bool) -> tuple[int, str, bytes]:
+    """Read at most ``limit + 1`` bytes of ``file`` in chunks: the bytes read, their sha256, and them if ``keep``."""
+    digest = hashlib.sha256()
+    parts: list[bytes] = []
+    total = 0
+    with file.open("rb") as handle:
+        for _ in range(limit // _READ_CHUNK_BYTES + 2):
+            block = handle.read(min(_READ_CHUNK_BYTES, limit + 1 - total))
+            if not block:
+                break
+            digest.update(block)
+            total += len(block)
+            if keep:
+                parts.append(block)
+    return total, digest.hexdigest(), b"".join(parts)
+
+
+def _verified(listed: _Listed, *, keep: bool) -> bytes:
+    """Check the artifact's file is the manifest's (its size, then its sha256); its bytes if ``keep``, else b""."""
+    entry = listed.entry
+    size = _regular_size(listed.file, entry.path)
+    if size != entry.size:
+        raise BundleCorruptError(f"{entry.path}: it is {size} bytes, the manifest says {entry.size}")
+    total, digest, data = _hashed(listed.file, entry.size, keep=keep)
+    if total != entry.size:
+        raise BundleCorruptError(f"{entry.path}: it is {total} bytes, the manifest says {entry.size}")
+    if digest != entry.sha256:
+        raise BundleCorruptError(f"{entry.path}: its sha256 is {digest}, the manifest's is {entry.sha256}")
+    return data
+
+
+def _check_facts(document: PDFDocument, manifest: _Manifest) -> None:
+    """The manifest's source sha256, integrity and degraded pages must be the document's."""
+    if manifest.source_sha256 != document.metadata.sha256:
+        sha = document.metadata.sha256
+        raise BundleCorruptError(f"{MANIFEST}: source_sha256 {manifest.source_sha256} is not the document's {sha}")
+    if manifest.integrity_verified != document.integrity_verified:
+        verified = document.integrity_verified
+        message = f"integrity_verified {manifest.integrity_verified} is not the document's {verified}"
+        raise BundleCorruptError(f"{MANIFEST}: {message}")
+    if manifest.degraded_pages != document.degraded_pages:
+        mine, theirs = list(manifest.degraded_pages), list(document.degraded_pages)
+        raise BundleCorruptError(f"{MANIFEST}: degraded_pages {mine} are not the document's {theirs}")
+
+
+def _document_paths(document: PDFDocument) -> Iterator[Path]:
+    """Every path the document names: its figures', its page images' and their bands'."""
+    for figure in document.figures:
+        if figure.image_path is not None:
+            yield figure.image_path
+    for image in document.page_images:
+        if image.image_path is not None:
+            yield image.image_path
+        yield from image.band_paths
+
+
+def _check_paths(document: PDFDocument, listed: set[str], root: Path) -> None:
+    """Every path the document names must be an artifact the manifest lists (so it was verified)."""
+    for path in _document_paths(document):
+        relative = path.relative_to(root).as_posix()
+        if relative not in listed:
+            raise BundleCorruptError(f"{DOCUMENT_JSON}: {relative!r} is not an artifact the manifest lists")
+
+
+def _unwritten(document: PDFDocument) -> set[tuple[str, int, str | None]]:
+    """What the document lacks, as missing entries' keys: page images, vision bands, figures (by first figure)."""
+    keys: set[tuple[str, int, str | None]] = set()
+    for page in document.pages:
+        image = page.page_image
+        if image is None:
+            keys.add(("page_image", page.page_number, None))
+        elif page.route == "vision" and not image.band_paths:
+            keys.add(("bands", page.page_number, None))
+    first: dict[str, Figure] = {}
+    for figure in document.figures:
+        owner = first.setdefault(figure.sha256, figure)
+        if figure.image_path is None:
+            keys.add(("figure", owner.page_number, owner.element_id))
+    return keys
+
+
+def _key_order(key: tuple[str, int, str | None]) -> tuple[str, int, str]:
+    return key[0], key[1], key[2] or ""
+
+
+def _check_missing(document: PDFDocument, missing: tuple[_Missing, ...]) -> None:
+    """The manifest's missing entries must be exactly what the document lacks, each once."""
+    recorded = {(entry.artifact, entry.page_number, entry.element_id) for entry in missing}
+    if len(recorded) != len(missing):
+        raise BundleCorruptError(f"{MANIFEST}: missing lists an artifact twice")
+    expected = _unwritten(document)
+    unrecorded, stale = expected - recorded, recorded - expected
+    if unrecorded or stale:
+        raise BundleCorruptError(
+            f"{MANIFEST}: its missing artifacts are not the document's; "
+            f"unrecorded: {sorted(unrecorded, key=_key_order)}; recorded but present: {sorted(stale, key=_key_order)}"
+        )
