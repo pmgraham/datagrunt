@@ -17,7 +17,7 @@ guard's walk reaching its bound, is a :class:`RenderRefused` naming the
 object, and nothing is drawn.
 
 :func:`render_page` runs the guard and the render in a worker process
-(``spawn``) whose memory is capped, because pdfium decodes what the object
+whose memory is capped, because pdfium decodes what the object
 walk cannot see (soft masks, patterns, Type3 glyph procedures) and an image
 within A2's bounds can still cost ~1.7 GiB to decode. The cap is the
 worker's memory over what it holds once started (the interpreter and
@@ -37,14 +37,29 @@ datagrunt's imports):
   test runs on Windows: this path is untested.
 - Anywhere else the worker refuses to render (a :class:`RenderFailed`).
 
+The worker is a plain subprocess, ``python -I -c _BOOTSTRAP``: it never
+imports the caller's main module, so a caller's script runs once, however
+it is written. ``-I`` (isolated mode) keeps the caller's working directory
+and the ``PYTHON*`` environment (``PYTHONPATH``, ``PYTHONSTARTUP``, ...)
+out of the worker, so nothing from either runs before the request is
+read. The bootstrap then installs the caller's exact ``sys.path``, sent
+with the request, so the worker imports the same datagrunt and pdfium the
+caller has, wherever they were found.
+
+The request (with ``sys.path`` and the password) is one JSON message on
+the worker's stdin, never in its argv or environment. The worker replies
+on its stdout in length-prefixed raw bytes; it moves file descriptor 1 to
+its stderr first, so a stray print cannot corrupt the reply. Nothing is
+pickled either way: the parent decodes nothing but bytes from a worker
+(which parses hostile PDFs), each message within a bound. The worker's
+stderr goes to a temporary file; a failure without a reply ends with its
+last 4 KiB.
+
 Every wait is bounded by ``timeout_s``: at the deadline the worker is
 killed and reaped. A worker killed, timed out or failed is a
-:class:`RenderFailed`; the caller continues. The password goes to the
-worker over its pipe, never in its argv or environment. A worker replies
-in raw bytes, never a pickle: the parent unpickles nothing a worker (which
-parses hostile PDFs) sends. A spawned worker imports the caller's main
-module as ``__mp_main__``, as every ``spawn`` child does, so a script that
-renders must keep its own work under ``if __name__ == "__main__":``.
+:class:`RenderFailed`; the caller continues. A frozen application, or one
+whose ``sys.executable`` is empty, has no interpreter to start: every
+render is a :class:`RenderFailed`, raised before anything starts.
 
 Annotations are not drawn (no ``FPDF_ANNOT``): their appearance streams
 are content the guard's object walk cannot see, so a vision page's form
@@ -52,20 +67,20 @@ field values, stamps and markup are not rendered, and not read by OCR.
 """
 
 import ctypes
+import json
 import math
 import mmap
-import multiprocessing
 import os
 import struct
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from multiprocessing.connection import Connection
-from multiprocessing.process import BaseProcess
-from typing import NamedTuple
+from dataclasses import asdict, dataclass, field, fields
+from typing import IO, NamedTuple
 
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
@@ -94,11 +109,15 @@ _POINTS_PER_INCH = 72.0
 # an object here, so the bound is about half a second of guard.
 _MAX_GUARD_OBJECTS = 1_000_000
 
-# A worker's replies, raw bytes: a kind byte, then a UTF-8 message (refused,
-# failed) or the pixel size, followed by the pixels as a second message.
+# A worker's replies, raw bytes, each message after its 8-byte length: a kind
+# byte, then a UTF-8 message (refused, failed) or the pixel size, followed by
+# the pixels as a second message.
 _PIXELS, _REFUSED, _FAILED = b"P", b"R", b"F"
+_LENGTH = struct.Struct("<Q")
 _PIXEL_SIZE = struct.Struct("<QQ")
 _MAX_STATUS_BYTES = 1 << 20
+_MAX_REQUEST_BYTES = 1 << 20  # the JSON request on the worker's stdin
+_MAX_STDERR_TAIL = 4096
 
 # A worker's exit codes: it reached its memory cap; its watchdog outlived its
 # own deadline (the parent's timeout, which starts first, kills it before).
@@ -287,9 +306,9 @@ def _blank(size: int) -> mmap.mmap:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _Request:
-    """What the parent sends its worker over their pipe (pickled: the worker trusts its parent).
+    """What the parent asks its worker for, in the JSON on the worker's stdin.
 
-    The password is never in repr: it reaches the worker in this pickle only.
+    The password is never in repr: it reaches the worker in that JSON only.
     """
 
     source: str
@@ -300,12 +319,36 @@ class _Request:
     timeout_s: float
 
 
+_REQUEST_FIELDS = tuple(item.name for item in fields(_Request))
+
+
 class _Reply(NamedTuple):
     """A worker's whole reply: its kind, its message (refused, failed), and the page it drew (pixels)."""
 
     kind: bytes
     detail: str
     page: RenderedPage | None
+
+
+# The worker's program: ``python -I -c _BOOTSTRAP``. It keeps the real stdout
+# for replies and points file descriptor 1 at stderr, reads one bounded JSON
+# message from stdin, installs the caller's sys.path, and hands the request to
+# _worker_main. Fixed text: nothing from the caller or the PDF is in it.
+_BOOTSTRAP = f"""
+import json, os, sys
+replies = os.fdopen(os.dup(1), "wb")
+os.dup2(2, 1)
+data = sys.stdin.buffer.read({_MAX_REQUEST_BYTES} + 1)
+if len(data) > {_MAX_REQUEST_BYTES}:
+    raise SystemExit("the render request is over {_MAX_REQUEST_BYTES} bytes")
+message = json.loads(data)
+path = message["sys_path"]
+if not isinstance(path, list) or not all(isinstance(entry, str) for entry in path):
+    raise SystemExit("the render request's sys_path is not a list of str")
+sys.path[:] = path
+from datagrunt.pdf.render import _worker_main
+_worker_main(message.get("request"), replies)
+"""
 
 
 def render_page(
@@ -319,30 +362,31 @@ def render_page(
 ) -> RenderedPage:
     """Render the page at 0-based ``page_index`` in 8-bit gray at ``dpi``, in a capped worker process.
 
-    The worker (``spawn``) caps its own memory at ``memory_cap_bytes`` over
-    what it holds once started, runs the image guard, then draws the page
-    from the same load: as displayed (its /Rotate applied), on white,
-    without annotations. Pass :func:`effective_dpi`'s result as ``dpi``; the
-    page is then at most ``max_render_pixels``.
+    The worker (``python -I``, see the module notes) caps its own memory at
+    ``memory_cap_bytes`` over what it holds once started, runs the image
+    guard, then draws the page from the same load: as displayed (its /Rotate
+    applied), on white, without annotations. Pass :func:`effective_dpi`'s
+    result as ``dpi``; the page is then at most ``max_render_pixels``.
 
     Args:
         source: The PDF's path (made absolute here).
         page_index: The 0-based page.
         dpi: Dots per inch, at least 1.
-        password: The encrypted PDF's password, or None. Sent to the worker
-            over its pipe only; never in an error message.
+        password: The encrypted PDF's password, or None. Sent on the
+            worker's stdin only; never in an error message.
         memory_cap_bytes: The worker's memory past its start, at least 1.
         timeout_s: Seconds the whole render may take, the worker's start
-            included (a spawned worker imports datagrunt: ~0.5 s here).
+            included (a worker imports datagrunt: ~0.5 s here).
 
     Raises:
         TypeError, ValueError: If an argument is invalid (before any worker starts).
         RenderRefused: If the guard refuses the page (naming the object), or
             it draws under one pixel across at ``dpi``. Nothing is drawn.
-        RenderFailed: If the worker reaches its memory cap, outlives
-            ``timeout_s`` (it is killed and reaped), dies, or fails (the
-            PDF missing, encrypted without its password, its page
-            unloadable): the page is not rendered.
+        RenderFailed: If no worker can start (no interpreter, or the OS
+            refuses), or the worker reaches its memory cap, outlives
+            ``timeout_s`` (it is killed and reaped), dies, or fails (the PDF
+            missing, encrypted without its password, its page unloadable):
+            the page is not rendered.
     """
     request = _Request(
         source=str(_checked_path(source, "source").absolute()),
@@ -352,32 +396,68 @@ def render_page(
         memory_cap_bytes=int_at_least("memory_cap_bytes", memory_cap_bytes, 1),
         timeout_s=positive_float("timeout_s", timeout_s),
     )
-    context = multiprocessing.get_context("spawn")
-    ours, theirs = context.Pipe(duplex=True)
-    with ours:
-        with theirs:  # the worker holds its own copy once started; the parent's closes here
-            worker = context.Process(target=_worker_main, args=(theirs,), name="datagrunt-pdf-render", daemon=True)
-            deadline = time.monotonic() + request.timeout_s
-            worker.start()
-        reply, timed_out, exitcode = _supervised(ours, worker, request, deadline)
-    return _outcome(reply, timed_out, exitcode, request)
+    where = f"{request.source}: page {request.page_index + 1}"
+    command = _worker_command(where)
+    payload = _request_payload(request)
+    with tempfile.TemporaryFile() as errors:
+        deadline = time.monotonic() + request.timeout_s
+        worker = _started(command, errors, where)
+        try:
+            reply, timed_out, exitcode = _supervised(worker, payload, request.memory_cap_bytes, deadline)
+        finally:
+            _close_pipes(worker)
+        tail = "" if reply is not None else _stderr_tail(errors)
+    return _outcome(reply, timed_out, exitcode, request, tail)
+
+
+def _worker_command(where: str) -> list[str]:
+    """The worker's command line, which holds nothing of the request; RenderFailed if there is no interpreter."""
+    if getattr(sys, "frozen", False):
+        raise RenderFailed(f"{where}: a frozen application has no Python interpreter to start a render worker with")
+    if not sys.executable:
+        raise RenderFailed(f"{where}: sys.executable is empty: there is no Python interpreter for a render worker")
+    return [sys.executable, "-I", "-c", _BOOTSTRAP]
+
+
+def _request_payload(request: _Request) -> bytes:
+    """The JSON the worker reads from its stdin: the caller's exact sys.path and the request."""
+    payload = json.dumps({"sys_path": list(sys.path), "request": asdict(request)}).encode("ascii")
+    if len(payload) > _MAX_REQUEST_BYTES:
+        raise RenderFailed(f"the render request is {len(payload)} bytes, over the {_MAX_REQUEST_BYTES}-byte bound")
+    return payload
+
+
+def _started(command: list[str], errors: IO[bytes], where: str) -> "subprocess.Popen[bytes]":
+    """Start the worker: stdin and stdout piped to this process, stderr to ``errors``."""
+    try:
+        return subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
+    except OSError as exc:
+        raise RenderFailed(f"{where}: cannot start a render worker: {exc}") from exc
+
+
+def _close_pipes(worker: "subprocess.Popen[bytes]") -> None:
+    """Close the parent's ends of the worker's stdin and stdout."""
+    for pipe in (worker.stdin, worker.stdout):
+        if pipe is not None:
+            pipe.close()
 
 
 def _supervised(
-    connection: Connection, worker: BaseProcess, request: _Request, deadline: float
+    worker: "subprocess.Popen[bytes]", payload: bytes, memory_cap_bytes: int, deadline: float
 ) -> tuple[_Reply | None, bool, int | None]:
     """Exchange with the started worker until its reply or ``deadline``, then reap it.
 
-    A timer kills the worker at the deadline, so no wait outlives it (a
-    worker that stalls mid-reply included). Returns the reply (None: none
-    came whole), whether the deadline passed without one, and the exit code.
+    A timer kills the worker at the deadline, which closes its stdout: so
+    no read or write outlives the deadline (a worker that stalls mid-reply
+    included). Returns the reply (None: none came whole), whether the
+    deadline passed without one, and the exit code.
     """
     killer = threading.Timer(max(0.0, deadline - time.monotonic()), worker.kill)
     killer.daemon = True
     killer.start()
     reply: _Reply | None = None
     try:
-        reply = _exchange(connection, request, deadline)
+        reply = _exchange(worker.stdin, worker.stdout, payload, memory_cap_bytes)
     finally:
         # Cancelled and joined before the worker is reaped: a kill never reaches a reaped (reusable) pid.
         killer.cancel()
@@ -387,41 +467,63 @@ def _supervised(
     return reply, timed_out, exitcode
 
 
-def _reaped(worker: BaseProcess, wait_s: float) -> int | None:
+def _reaped(worker: "subprocess.Popen[bytes]", wait_s: float) -> int | None:
     """Give the worker ``wait_s`` seconds to exit, kill it if it has not, reap it; its exit code (None: unreaped)."""
-    worker.join(wait_s)
-    if worker.exitcode is None:
-        worker.kill()
-        worker.join(_REAP_TIMEOUT_S)
-    return worker.exitcode
-
-
-def _exchange(connection: Connection, request: _Request, deadline: float) -> _Reply | None:
-    """Send ``request``; return the worker's whole reply, or None if none came whole by ``deadline``.
-
-    A worker that dies, or is killed at the deadline, closes its pipe and
-    ends the exchange. Its reply is read as bytes, each message within a
-    bound: a refusal's or failure's within ``_MAX_STATUS_BYTES``, the pixels
-    within their claimed size, itself within the worker's memory cap.
-    """
     try:
-        connection.send(request)
-        if not connection.poll(max(0.0, deadline - time.monotonic())):
+        return worker.wait(wait_s)
+    except subprocess.TimeoutExpired:
+        worker.kill()
+    try:
+        return worker.wait(_REAP_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def _exchange(
+    stdin: IO[bytes] | None, stdout: IO[bytes] | None, payload: bytes, memory_cap_bytes: int
+) -> _Reply | None:
+    """Write ``payload`` to the worker; return its whole reply, or None if none came whole.
+
+    A worker that dies, or is killed at the deadline, closes its stdout and
+    ends the exchange. Each message is read within a bound: a refusal's or
+    failure's within ``_MAX_STATUS_BYTES``, the pixels within their claimed
+    size, itself within the worker's memory cap.
+    """
+    if stdin is None or stdout is None:
+        raise ValueError("the worker's stdin and stdout must be pipes")
+    try:
+        stdin.write(payload)
+        stdin.close()
+        status = _read_message(stdout, _MAX_STATUS_BYTES)
+        if status is None:
             return None
-        status = connection.recv_bytes(_MAX_STATUS_BYTES)
         kind = status[:1]
         if kind != _PIXELS:
             return _message_reply(kind, status[1:])
-        size = _pixel_size(status[1:], request.memory_cap_bytes)
+        size = _pixel_size(status[1:], memory_cap_bytes)
         if isinstance(size, str):
             return _Reply(_FAILED, size, None)
         width, height = size
-        pixels = connection.recv_bytes(width * height)
-    except (EOFError, OSError):
+        pixels = _read_message(stdout, width * height)
+    except OSError:  # the worker stopped reading: it died, or was killed
+        return None
+    if pixels is None:
         return None
     if len(pixels) != width * height:
         return _Reply(_FAILED, f"it sent {len(pixels)} pixel bytes for a {width} x {height} px render", None)
     return _Reply(_PIXELS, "", RenderedPage(pixels=pixels, px_width=width, px_height=height))
+
+
+def _read_message(stream: IO[bytes], bound: int) -> bytes | None:
+    """One length-prefixed message from ``stream``; None at its end, or if its length is over ``bound`` (unread)."""
+    header = stream.read(_LENGTH.size)
+    if len(header) != _LENGTH.size:
+        return None
+    (length,) = _LENGTH.unpack(header)
+    if length > bound:
+        return None
+    message = stream.read(length)
+    return message if len(message) == length else None
 
 
 def _message_reply(kind: bytes, message: bytes) -> _Reply:
@@ -447,11 +549,23 @@ def _pixel_size(header: bytes, memory_cap_bytes: int) -> tuple[int, int] | str:
     return width, height
 
 
-def _outcome(reply: _Reply | None, timed_out: bool, exitcode: int | None, request: _Request) -> RenderedPage:
+def _stderr_tail(errors: IO[bytes]) -> str:
+    """The last ``_MAX_STDERR_TAIL`` bytes the worker wrote to its stderr, as text."""
+    end = errors.seek(0, os.SEEK_END)
+    errors.seek(max(0, end - _MAX_STDERR_TAIL))
+    return errors.read(_MAX_STDERR_TAIL).decode("utf-8", errors="backslashreplace").strip()
+
+
+def _outcome(
+    reply: _Reply | None, timed_out: bool, exitcode: int | None, request: _Request, stderr_tail: str
+) -> RenderedPage:
     """The rendered page, or the RenderRefused / RenderFailed the worker's ending makes."""
     where = f"{request.source}: page {request.page_index + 1}"
     if reply is None:
-        raise RenderFailed(f"{where}: {_ending(exitcode, timed_out, request)}")
+        ending = _ending(exitcode, timed_out, request)
+        raise RenderFailed(
+            f"{where}: {ending}; its stderr ends: {stderr_tail}" if stderr_tail else f"{where}: {ending}"
+        )
     if reply.page is not None:
         return reply.page
     if reply.kind == _REFUSED:
@@ -472,30 +586,50 @@ def _ending(exitcode: int | None, timed_out: bool, request: _Request) -> str:
     return f"the render worker exited with code {exitcode} without a reply"
 
 
-def _worker_main(connection: Connection) -> None:
-    """The render worker (a spawned process): one request in, one reply out, as raw bytes.
+def _worker_main(message: object, replies: IO[bytes]) -> None:
+    """The render worker, run by _BOOTSTRAP: one request in, one reply out on ``replies``, as raw bytes.
 
     It caps its own memory before it opens the PDF. Reaching the cap (a
     MemoryError) ends it with ``_CAP_EXIT`` and no reply; a refusal and any
     other error are sent back as messages, never swallowed.
     """
     try:
-        request = connection.recv()
-        if not isinstance(request, _Request):
-            raise TypeError(f"the worker's request must be a _Request, got {type(request).__name__}")
+        request = _request_from(message)
         _apply_memory_cap(request.memory_cap_bytes, request.timeout_s)
         bitmap = _render_guarded(request.source, request.page_index, request.dpi, request.password)
     except MemoryError:
         os._exit(_CAP_EXIT)
     except RenderRefused as exc:
-        connection.send_bytes(_REFUSED + str(exc).encode("utf-8", errors="backslashreplace"))
+        _send(replies, _REFUSED + str(exc).encode("utf-8", errors="backslashreplace"))
         return
     except Exception as exc:  # every other failure reaches the parent, as a RenderFailed
-        message = f"{type(exc).__name__}: {exc}"
-        connection.send_bytes(_FAILED + message.encode("utf-8", errors="backslashreplace"))
+        _send(replies, _FAILED + f"{type(exc).__name__}: {exc}".encode("utf-8", errors="backslashreplace"))
         return
-    connection.send_bytes(_PIXELS + _PIXEL_SIZE.pack(bitmap.width, bitmap.height))
-    connection.send_bytes(bitmap.pixels)
+    _send(replies, _PIXELS + _PIXEL_SIZE.pack(bitmap.width, bitmap.height))
+    _send(replies, bitmap.pixels)
+
+
+def _request_from(message: object) -> _Request:
+    """The request a worker reads (JSON from its parent), its fields checked as render_page checks them."""
+    if not isinstance(message, dict):
+        raise TypeError(f"the worker's request must be a dict, got {type(message).__name__}")
+    if set(message) != set(_REQUEST_FIELDS):
+        raise ValueError(f"the worker's request must hold exactly {_REQUEST_FIELDS}, got {sorted(message)}")
+    return _Request(
+        source=str(_checked_path(message["source"], "source")),
+        page_index=int_at_least("page_index", message["page_index"], 0),
+        dpi=int_at_least("dpi", message["dpi"], 1),
+        password=_checked_password(message["password"]),
+        memory_cap_bytes=int_at_least("memory_cap_bytes", message["memory_cap_bytes"], 1),
+        timeout_s=positive_float("timeout_s", message["timeout_s"]),
+    )
+
+
+def _send(replies: IO[bytes], message: bytes | mmap.mmap) -> None:
+    """Write one message after its 8-byte length, and flush it."""
+    replies.write(_LENGTH.pack(len(message)))
+    replies.write(message)
+    replies.flush()
 
 
 def _apply_memory_cap(cap_bytes: int, timeout_s: float) -> None:

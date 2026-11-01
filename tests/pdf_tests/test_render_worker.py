@@ -1,6 +1,6 @@
 """Tests for the v5 capped render worker (#369, A5a): ``datagrunt.pdf.render.render_page``.
 
-Each render runs in a spawned worker process. Expected pixels come from
+Each render runs in a worker process: a fresh ``python -I`` interpreter. Expected pixels come from
 pdfium itself in this process (the same render call, size and flags), and
 expected sizes from pdfium's page geometry: nothing is pinned from one
 platform's fonts. Peak memory is read as ``test_pdfium_images.BOMB_SCRIPT``
@@ -9,9 +9,7 @@ reads it: VmHWM on Linux (``ru_maxrss`` survives fork + exec there),
 """
 
 import ctypes
-import multiprocessing
-import multiprocessing.process
-import multiprocessing.util
+import json
 import os
 import re
 import signal
@@ -70,16 +68,16 @@ def pixel(page: RenderedPage, x: int, y: int) -> int:
 
 @pytest.fixture
 def started(monkeypatch):
-    """Every process started during the test (its pid read at start, before any close)."""
-    processes = []
-    real_start = multiprocessing.process.BaseProcess.start
+    """Every subprocess started during the test, with the arguments it was started with."""
+    workers = []
 
-    def start(self):
-        real_start(self)
-        processes.append((self, self.pid))
+    class Recorded(subprocess.Popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            workers.append((self, args, kwargs))
 
-    monkeypatch.setattr(multiprocessing.process.BaseProcess, "start", start)
-    return processes
+    monkeypatch.setattr(subprocess, "Popen", Recorded)
+    return workers
 
 
 class TestRenderedPage:
@@ -136,7 +134,7 @@ class TestArguments:
 
 
 class TestRender:
-    """A page renders in a spawned worker, in 8-bit gray, as pdfium draws it, without annotations."""
+    """A page renders in a worker process, in 8-bit gray, as pdfium draws it, without annotations."""
 
     def test_a_page_renders_at_its_effective_dpi_as_pdfium_draws_it(self, tmp_path, started):
         path = letter(tmp_path)
@@ -150,8 +148,9 @@ class TestRender:
         assert (page.px_width, page.px_height, page.pixels) == pdfium_render(path, dpi)
         # The box (72, 72)-(272, 172) pt is black; the margin is white.
         assert (pixel(page, 600, 400), pixel(page, 100, 100)) == (0, 255)
-        # It ran in one worker, which was reaped.
-        assert [process.exitcode for process, _pid in started] == [0]
+        # It ran in one worker, which was reaped, its pipes closed.
+        ((worker, _args, _kwargs),) = started
+        assert (worker.returncode, worker.stdin.closed, worker.stdout.closed) == (0, True, True)
 
     def test_a_36_by_48_inch_sheet_renders_within_max_render_pixels(self, tmp_path):
         path = build_pdf(tmp_path / "sheet.pdf", [PageSpec(width=36 * 72.0, height=48 * 72.0)])
@@ -216,23 +215,14 @@ class TestRender:
             rendered(path, 72, password=password)
         assert not {USER_PW, OWNER_PW, "wrong-pw-5d1e"} & set(re.findall(r"[\w-]+", str(caught.value)))
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX spawn launches through multiprocessing.util")
-    def test_the_password_reaches_the_worker_over_its_pipe_only(self, tmp_path, monkeypatch):
-        launches = []
-        real_spawn = multiprocessing.util.spawnv_passfds
-
-        def spawn(path, args, passfds):
-            launches.append((list(args), dict(os.environ)))
-            return real_spawn(path, args, passfds)
-
-        monkeypatch.setattr(multiprocessing.util, "spawnv_passfds", spawn)
+    def test_the_password_reaches_the_worker_on_its_stdin_only(self, tmp_path, started):
         path = letter(tmp_path, user_password=USER_PW, owner_password=OWNER_PW)
 
         assert rendered(path, 72, password=USER_PW).px_width == 612
-        assert launches
-        for argv, environment in launches:
-            assert not [arg for arg in argv if USER_PW in os.fsdecode(arg)]
-            assert not [name for name, value in environment.items() if USER_PW in value or USER_PW in name]
+        ((_worker, args, kwargs),) = started
+        assert not [arg for arg in args[0] if USER_PW in arg]
+        assert kwargs.get("env") is None  # the caller's environment, which holds no password
+        assert not [name for name, value in os.environ.items() if USER_PW in value or USER_PW in name]
 
     def test_a_missing_file_fails_in_the_worker(self, tmp_path):
         with pytest.raises(
@@ -298,14 +288,27 @@ class TestDrawFailures:
         with pytest.raises(RenderFailed, match=re.escape(f"{tmp_path / 'missing.pdf'}: page 1: the render worker")):
             render_page("missing.pdf", 0, dpi=72, memory_cap_bytes=CAP, timeout_s=TIMEOUT_S)
 
-    def test_the_worker_answers_a_request_it_cannot_read_with_a_failure(self):
-        ours, theirs = multiprocessing.Pipe(duplex=True)
-        ours.send("not a request")
+    @pytest.mark.parametrize(
+        "message,expected",
+        [
+            pytest.param("not a request", "TypeError: the worker's request must be a dict, got str", id="str"),
+            pytest.param({"source": "/x.pdf"}, "ValueError: the worker's request must hold exactly", id="keys"),
+            pytest.param(
+                {**dict.fromkeys(render._REQUEST_FIELDS, 1), "source": "/x.pdf", "password": None, "dpi": 0},
+                "ValueError: dpi must be >= 1, got 0",
+                id="dpi",
+            ),
+        ],
+    )
+    def test_the_worker_answers_a_request_it_cannot_read_with_a_failure(self, monkeypatch, message, expected):
+        # A tripwire: a request read wrongly must never cap this (the test) process's memory.
+        monkeypatch.setattr(render, "_apply_memory_cap", lambda *args: pytest.fail("the cap reached the test process"))
+        replies = Sink()
 
-        render._worker_main(theirs)
+        render._worker_main(message, replies)
 
-        message = b"TypeError: the worker's request must be a _Request, got str"
-        assert ours.recv_bytes() == render._FAILED + message
+        (reply,) = framed(replies.data)
+        assert reply.startswith(render._FAILED + expected.encode())
 
 
 class TestGuardBeforeRender:
@@ -373,11 +376,11 @@ class TestTimeout:
 
         # Drawing the page takes seconds; the worker was killed at its 1 s deadline instead.
         assert elapsed < 4.0
-        (worker, pid), *_tracker = started
-        assert worker.exitcode == (-signal.SIGKILL if sys.platform != "win32" else -signal.SIGTERM)
+        ((worker, _args, _kwargs),) = started
+        assert worker.returncode == (-signal.SIGKILL if sys.platform != "win32" else 1)
         if sys.platform != "win32":
             with pytest.raises(ProcessLookupError):
-                os.kill(pid, 0)  # reaped: not even a zombie holds the pid
+                os.kill(worker.pid, 0)  # reaped: not even a zombie holds the pid
 
     def test_the_parent_renders_the_next_page_after_a_timeout(self, tmp_path):
         with pytest.raises(RenderFailed, match="timed out"):
@@ -538,38 +541,97 @@ def bounded(call, limit_s: float = 10.0):
     return results[0] if results else HUNG
 
 
-class FakeWorker:
-    """The pipe end a worker writes to, in this process: replies are sent before the exchange reads them."""
+def frame(*messages: bytes) -> bytes:
+    """``messages`` as a worker writes them: each after its 8-byte little-endian length."""
+    return b"".join(render._LENGTH.pack(len(message)) + message for message in messages)
+
+
+def framed(data: bytes) -> list[bytes]:
+    """The messages in ``data`` (the inverse of frame)."""
+    messages = []
+    while data:
+        (length,) = render._LENGTH.unpack_from(data)
+        messages.append(data[8 : 8 + length])
+        data = data[8 + length :]
+    return messages
+
+
+class Sink:
+    """A worker's stdin, or a worker's replies, in this process: what is written, and whether it was closed."""
 
     def __init__(self):
-        self.ours, self.theirs = multiprocessing.Pipe(duplex=True)
+        self.data, self.closed, self.flushed = b"", False, b""
 
-    def reply(self, *messages: bytes, cap: int = 1 << 20) -> "render._Reply | None":
-        for message in messages:
-            self.theirs.send_bytes(message)
-        request = render._Request(
-            source="/x.pdf", page_index=0, dpi=72, password="pw", memory_cap_bytes=cap, timeout_s=5.0
-        )
-        # _exchange's own wait for a reply ends at its deadline; a stalled message is _supervised's timer's to end.
-        return bounded(lambda: render._exchange(self.ours, request, time.monotonic() + 5.0))
+    def write(self, data) -> int:
+        self.data += bytes(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self.flushed = self.data
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeProcess:
+    """A worker stand-in: ``stdin`` records the request; a kill closes ``stdout``'s pipe, as a dying worker's is."""
+
+    def __init__(self):
+        read_end, write_end = os.pipe()
+        self.stdin = Sink()
+        self.stdout = os.fdopen(read_end, "rb")
+        self.writer = os.fdopen(write_end, "wb")
+        self.returncode = None
+        self.waits = []
+        self.kills = 0
+
+    def send(self, data: bytes) -> "FakeProcess":
+        self.writer.write(data)
+        self.writer.flush()
+        return self
+
+    def die(self, code: int) -> "FakeProcess":
+        self.returncode = code
+        self.writer.close()
+        return self
+
+    def kill(self):
+        self.kills += 1
+        self.returncode = -9
+        self.writer.close()
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("fake worker", timeout)
+        return self.returncode
+
+
+PAYLOAD = b'{"request": "the request"}'
+
+
+def exchanged(process: FakeProcess, cap: int = 1 << 20):
+    """_exchange with ``process`` (its replies already written), bounded at 10 s."""
+    return bounded(lambda: render._exchange(process.stdin, process.stdout, PAYLOAD, cap))
 
 
 SIZE_3_BY_2 = render._PIXEL_SIZE.pack(3, 2)
 
 
 class TestReplies:
-    """The parent reads a worker's raw-bytes reply defensively: it unpickles nothing a worker sends."""
+    """The parent reads a worker's length-prefixed raw-bytes reply, each message within its bound."""
 
     def test_pixels(self):
-        got = FakeWorker().reply(render._PIXELS + SIZE_3_BY_2, bytes(range(6)))
+        process = FakeProcess().send(frame(render._PIXELS + SIZE_3_BY_2, bytes(range(6))))
 
-        assert got.page == RenderedPage(pixels=bytes(range(6)), px_width=3, px_height=2)
+        assert exchanged(process).page == RenderedPage(pixels=bytes(range(6)), px_width=3, px_height=2)
+        assert (process.stdin.data, process.stdin.closed) == (PAYLOAD, True)
 
     @pytest.mark.parametrize("kind", [render._REFUSED, render._FAILED])
     def test_a_message(self, kind):
-        got = FakeWorker().reply(kind + "page 1: why é".encode())
+        got = exchanged(FakeProcess().send(frame(kind + "page 1: why \u00e9".encode())))
 
-        assert (got.kind, got.detail, got.page) == (kind, "page 1: why é", None)
+        assert (got.kind, got.detail, got.page) == (kind, "page 1: why \u00e9", None)
 
     @pytest.mark.parametrize(
         "messages,detail",
@@ -591,40 +653,44 @@ class TestReplies:
         ],
     )
     def test_a_malformed_reply_is_a_failure(self, messages, detail):
-        got = FakeWorker().reply(*messages)
+        got = exchanged(FakeProcess().send(frame(*messages)))
 
         assert (got.kind, got.detail, got.page) == (render._FAILED, detail, None)
 
     def test_a_claim_of_exactly_the_cap_is_read(self):
-        got = FakeWorker().reply(render._PIXELS + SIZE_3_BY_2, bytes(6), cap=6)
+        got = exchanged(FakeProcess().send(frame(render._PIXELS + SIZE_3_BY_2, bytes(6))), cap=6)
 
         assert got.page == RenderedPage(pixels=bytes(6), px_width=3, px_height=2)
 
-    def test_pixels_longer_than_claimed_end_the_exchange(self):
-        # recv_bytes refuses a message over its maxlength before reading it.
-        assert FakeWorker().reply(render._PIXELS + SIZE_3_BY_2, bytes(7)) is None
+    def test_pixels_longer_than_claimed_end_the_exchange_unread(self):
+        # The length is read first: a message over its bound is refused before it is read.
+        assert exchanged(FakeProcess().send(frame(render._PIXELS + SIZE_3_BY_2) + render._LENGTH.pack(7))) is None
 
     def test_a_message_over_its_bound_ends_the_exchange(self, monkeypatch):
         monkeypatch.setattr(render, "_MAX_STATUS_BYTES", 8)
 
-        assert FakeWorker().reply(render._FAILED + bytes(8)) is None
+        assert exchanged(FakeProcess().send(frame(render._FAILED + bytes(8)))) is None
 
-    def test_a_worker_that_closes_its_pipe_ends_the_exchange(self):
-        worker = FakeWorker()
-        worker.theirs.close()
+    @pytest.mark.parametrize(
+        "data",
+        [
+            pytest.param(b"", id="nothing"),
+            pytest.param(b"\x05\x00\x00", id="part-of-a-length"),
+            pytest.param(render._LENGTH.pack(10) + b"F why", id="part-of-a-message"),
+        ],
+    )
+    def test_a_worker_that_ends_mid_reply_ends_the_exchange(self, data):
+        assert exchanged(FakeProcess().send(data).die(1)) is None
 
-        assert worker.reply() is None
+    def test_a_worker_that_stops_reading_ends_the_exchange(self):
+        process = FakeProcess()
 
-    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
-    def test_no_reply_by_the_deadline_ends_the_exchange_at_the_deadline(self):
-        worker = FakeWorker()
-        request = render._Request(
-            source="/x.pdf", page_index=0, dpi=72, password=None, memory_cap_bytes=1 << 20, timeout_s=0.2
-        )
+        def broken(data):
+            raise BrokenPipeError(32, "Broken pipe")
 
-        began = time.monotonic()
-        assert render._exchange(worker.ours, request, began + 0.2) is None
-        assert 0.15 < time.monotonic() - began < 2.0
+        process.stdin.write = broken
+
+        assert exchanged(process) is None
 
     def test_the_request_never_shows_its_password(self):
         request = render._Request(
@@ -633,70 +699,261 @@ class TestReplies:
 
         assert "pw-6b0d" not in repr(request) and "pw-6b0d" not in str(request)
 
+    def test_the_request_payload_is_json_with_the_callers_sys_path(self):
+        request = render._Request(
+            source="/x.pdf", page_index=2, dpi=72, password="pw-6b0d", memory_cap_bytes=9, timeout_s=1.5
+        )
 
-class FakeProcess:
-    """A worker stand-in for _supervised: ``theirs`` is its pipe end, and a kill closes it, as a dying worker's is."""
+        payload = json.loads(render._request_payload(request))
 
-    def __init__(self):
-        self.ours, self.theirs = multiprocessing.Pipe(duplex=True)
-        self.exitcode = None
-        self.joins = []
-        self.kills = 0
-
-    def kill(self):
-        self.kills += 1
-        self.exitcode = -9
-        self.theirs.close()
-
-    def join(self, timeout=None):
-        self.joins.append(timeout)
+        assert payload == {
+            "sys_path": sys.path,
+            "request": {
+                "source": "/x.pdf",
+                "page_index": 2,
+                "dpi": 72,
+                "password": "pw-6b0d",
+                "memory_cap_bytes": 9,
+                "timeout_s": 1.5,
+            },
+        }
 
 
 def supervised(process: FakeProcess, deadline_s: float):
     """_supervised over ``process``, bounded at 10 s: (reply, timed out, exit code), or HUNG."""
-    request = render._Request(source="/x.pdf", page_index=0, dpi=72, password=None, memory_cap_bytes=99, timeout_s=1.0)
-    return bounded(lambda: render._supervised(process.ours, process, request, time.monotonic() + deadline_s))
+    return bounded(lambda: render._supervised(process, PAYLOAD, 99, time.monotonic() + deadline_s))
 
 
 class TestSupervision:
     """The parent's waits: a timer ends the worker at the deadline, and the worker is reaped once."""
 
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_no_reply_by_the_deadline_kills_the_worker_and_reaps_it_at_once(self):
         process = FakeProcess()
 
+        began = time.monotonic()
         assert supervised(process, 0.2) == (None, True, -9)
-        assert process.joins[0] == 0.0
+        assert 0.15 < time.monotonic() - began < 2.0
+        assert process.waits[0] == 0.0
 
     def test_a_worker_that_stalls_mid_reply_is_killed_at_the_deadline(self):
-        process = FakeProcess()
-        process.theirs.send_bytes(render._PIXELS + SIZE_3_BY_2)  # and never its pixels
+        process = FakeProcess().send(frame(render._PIXELS + SIZE_3_BY_2))  # and never its pixels
 
         assert supervised(process, 0.2) == (None, True, -9)
 
     def test_a_worker_that_dies_without_a_reply_is_given_time_to_exit(self):
-        process = FakeProcess()
-        process.exitcode = render._CAP_EXIT
-        process.theirs.close()
+        process = FakeProcess().die(render._CAP_EXIT)
 
         assert supervised(process, 5.0) == (None, False, render._CAP_EXIT)
-        assert (process.joins, process.kills) == ([render._EXIT_GRACE_S], 0)
+        assert (process.waits, process.kills) == ([render._EXIT_GRACE_S], 0)
 
     def test_a_worker_that_replied_is_reaped_and_never_killed_late(self):
-        process = FakeProcess()
-        process.theirs.send_bytes(render._FAILED + b"page 1: why")
+        process = FakeProcess().send(frame(render._FAILED + b"page 1: why"))
 
         reply, timed_out, _exitcode = supervised(process, 0.2)
         time.sleep(0.4)  # past the deadline: a timer left running would kill again
 
         assert (reply.kind, reply.detail, timed_out) == (render._FAILED, "page 1: why", False)
-        assert process.joins[0] == render._REAP_TIMEOUT_S
+        assert process.waits[0] == render._REAP_TIMEOUT_S
         assert process.kills == 1  # _reaped's own: this stand-in never exits by itself
 
     def test_a_worker_that_will_not_exit_is_killed_then_reaped(self):
         process = FakeProcess()
 
         assert render._reaped(process, 0.0) == -9
-        assert (process.joins, process.kills) == ([0.0, render._REAP_TIMEOUT_S], 1)
+        assert (process.waits, process.kills) == ([0.0, render._REAP_TIMEOUT_S], 1)
+
+    def test_a_worker_that_outlives_its_kill_is_reported_unreaped(self):
+        process = FakeProcess()
+        process.kill = lambda: setattr(process, "kills", process.kills + 1)  # a kill that never lands
+
+        assert render._reaped(process, 0.0) is None
+        assert (process.waits, process.kills) == ([0.0, render._REAP_TIMEOUT_S], 1)
+
+
+NO_GUARD_SCRIPT = """
+import sys
+
+from datagrunt.pdf.render import render_page
+
+with open(sys.argv[2], "a") as marker:
+    marker.write("top level ran\\n")
+page = render_page(sys.argv[1], 0, dpi=72, memory_cap_bytes=1 << 30, timeout_s=120.0)
+print(f"rendered {page.px_width} x {page.px_height}")
+"""
+
+POISON = """
+with open({marker!r}, "a") as marker:
+    marker.write("poisoned json imported\\n")
+raise ImportError("a json module from the caller's cwd or PYTHONPATH reached the render worker")
+"""
+
+
+FAKE_RENDER = """
+def _worker_main(request, replies):
+    print("noise on stdout")
+    replies.write(repr(request).encode())
+    replies.flush()
+"""
+
+
+def run_bootstrap(stdin: bytes) -> subprocess.CompletedProcess:
+    """render._BOOTSTRAP in ``python -I``, fed ``stdin``."""
+    return subprocess.run(
+        [sys.executable, "-I", "-c", render._BOOTSTRAP], input=stdin, capture_output=True, check=False, timeout=60
+    )
+
+
+class TestBootstrap:
+    """The worker's bootstrap: a bounded JSON request in, the caller's sys.path installed, stdout kept for replies."""
+
+    def test_it_installs_the_sent_sys_path_and_keeps_stdout_for_replies(self, tmp_path):
+        package = tmp_path / "datagrunt" / "pdf"
+        package.mkdir(parents=True)
+        (tmp_path / "datagrunt" / "__init__.py").write_text('print("noise at import")\n', encoding="utf-8")
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "render.py").write_text(FAKE_RENDER, encoding="utf-8")
+
+        done = run_bootstrap(json.dumps({"sys_path": [str(tmp_path)], "request": {"page_index": 0}}).encode())
+
+        assert (done.returncode, done.stdout) == (0, b"{'page_index': 0}"), done.stderr
+        assert b"noise at import" in done.stderr and b"noise on stdout" in done.stderr
+
+    def test_a_request_over_its_bound_is_refused_unread(self):
+        done = run_bootstrap(b" " * (render._MAX_REQUEST_BYTES + 1))
+
+        assert done.returncode == 1
+        assert b"the render request is over 1048576 bytes" in done.stderr
+
+    @pytest.mark.parametrize("path", ["/a/path", ["/a/path", 3]], ids=["str", "not-all-str"])
+    def test_a_sys_path_that_is_not_a_list_of_str_is_refused(self, path):
+        done = run_bootstrap(json.dumps({"sys_path": path, "request": {}}).encode())
+
+        assert done.returncode == 1
+        assert b"the render request's sys_path is not a list of str" in done.stderr
+
+    def test_a_message_is_sent_whole_after_its_length_and_flushed(self):
+        replies = Sink()
+
+        render._send(replies, b"F why")
+
+        assert replies.flushed == replies.data == render._LENGTH.pack(5) + b"F why"
+
+    def test_a_request_over_its_bound_is_refused_before_a_worker_starts(self, monkeypatch):
+        request = render._Request(
+            source="/x.pdf", page_index=0, dpi=72, password=None, memory_cap_bytes=9, timeout_s=1.0
+        )
+        monkeypatch.setattr(render, "_MAX_REQUEST_BYTES", 10)
+
+        with pytest.raises(RenderFailed, match=r"the render request is \d+ bytes, over the 10-byte bound"):
+            render._request_payload(request)
+
+    def test_the_exchange_needs_both_pipes(self):
+        with pytest.raises(ValueError, match="the worker's stdin and stdout must be pipes"):
+            render._exchange(None, None, PAYLOAD, 1)
+
+
+class TestWorkerProcess:
+    """The worker is a plain ``python -I`` subprocess: it never imports the caller's main module."""
+
+    def test_a_script_without_a_main_guard_renders_and_runs_its_top_level_once(self, tmp_path):
+        script = tmp_path / "no_guard.py"
+        script.write_text(NO_GUARD_SCRIPT, encoding="utf-8")
+        marker = tmp_path / "marker.txt"
+
+        done = subprocess.run(
+            [sys.executable, str(script), str(letter(tmp_path)), str(marker)],
+            capture_output=True,
+            check=False,
+            timeout=180,
+            text=True,
+        )
+
+        assert (done.returncode, done.stdout) == (0, "rendered 612 x 792\n"), done.stderr
+        assert marker.read_text(encoding="utf-8").splitlines() == ["top level ran"]
+
+    def test_the_worker_is_python_isolated_running_the_bootstrap(self, tmp_path, started):
+        rendered(letter(tmp_path), 72)
+
+        ((_worker, args, kwargs),) = started
+        assert args[0] == [sys.executable, "-I", "-c", render._BOOTSTRAP]
+        assert (kwargs["stdin"], kwargs["stdout"]) == (subprocess.PIPE, subprocess.PIPE)
+
+    def test_the_worker_ignores_the_callers_cwd_and_python_environment(self, tmp_path, monkeypatch):
+        poisoned = tmp_path / "poisoned"
+        poisoned.mkdir()
+        marker = tmp_path / "poison.txt"
+        (poisoned / "json.py").write_text(POISON.format(marker=str(marker)), encoding="utf-8")
+        path = letter(tmp_path)
+        monkeypatch.chdir(poisoned)
+        monkeypatch.setenv("PYTHONPATH", str(poisoned))
+
+        assert rendered(path, 72).px_width == 612
+        assert not marker.exists()
+
+    def test_the_worker_imports_from_the_callers_sys_path(self, tmp_path, monkeypatch):
+        path = letter(tmp_path)
+        # The standard library only: the worker reads its sys.path from the caller, so datagrunt is not found.
+        monkeypatch.setattr(sys, "path", [os.path.dirname(os.__file__)])
+
+        with pytest.raises(RenderFailed) as caught:
+            rendered(path, 72)
+        message = str(caught.value)
+        assert message.startswith(f"{path}: page 1: the render worker exited with code 1 without a reply; ")
+        assert "its stderr ends:" in message and "No module named 'datagrunt'" in message
+
+    @pytest.mark.parametrize(
+        "attribute,value,why",
+        [
+            pytest.param("frozen", True, "a frozen application has no Python interpreter", id="frozen"),
+            pytest.param("executable", "", "sys.executable is empty", id="no-executable"),
+        ],
+    )
+    def test_no_interpreter_to_start_fails_before_anything_starts(
+        self, tmp_path, monkeypatch, started, attribute, value, why
+    ):
+        monkeypatch.setattr(sys, attribute, value, raising=False)
+
+        with pytest.raises(RenderFailed, match=re.escape(why)):
+            rendered(letter(tmp_path), 72)
+        assert started == []
+
+    def test_a_worker_that_cannot_start_is_a_render_failure(self, tmp_path, monkeypatch):
+        def refused(*args, **kwargs):
+            raise OSError(8, "Exec format error")
+
+        monkeypatch.setattr(subprocess, "Popen", refused)
+
+        with pytest.raises(
+            RenderFailed, match=re.escape("page 1: cannot start a render worker: [Errno 8] Exec format")
+        ):
+            rendered(letter(tmp_path), 72)
+
+    @pytest.mark.parametrize(
+        "written,tail",
+        [
+            pytest.param(b"", "", id="empty"),
+            pytest.param(b"boom\n", "boom", id="short"),
+            pytest.param(b"x" * 5000 + b"\xffend", "x" * 4092 + "\\xffend", id="long"),
+        ],
+    )
+    def test_the_stderr_tail_is_its_last_4_kib(self, tmp_path, written, tail):
+        with open(tmp_path / "stderr", "w+b") as errors:
+            errors.write(written)
+
+            assert render._stderr_tail(errors) == tail
+
+    def test_a_failure_without_a_reply_ends_with_the_workers_stderr(self):
+        request = render._Request(
+            source="/x.pdf", page_index=0, dpi=72, password=None, memory_cap_bytes=9, timeout_s=1.0
+        )
+
+        with pytest.raises(RenderFailed) as caught:
+            render._outcome(None, False, 1, request, "Traceback: boom")
+        message = (
+            "/x.pdf: page 1: the render worker exited with code 1 without a reply; its stderr ends: Traceback: boom"
+        )
+        assert str(caught.value) == message
 
 
 class TestEndings:
