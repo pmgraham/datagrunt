@@ -88,13 +88,13 @@ draws it, and assesses it again with its :class:`Backdrop`
 (``assess_page(..., background=...)``). That assessment flags the page's
 pieces, then the recovered pieces (their own reasons first), before the
 duplicate check, then routes, measures and warns: flagged text leaves the
-routing count, the unmapped regions and the duplicate check's visible
-twins, as text with any other reason does. A page that could not be drawn
-(its render refused or failed) is assessed with why (a str) and fails
-closed: each visible piece the gate selects (see :func:`needs_background`)
-is flagged ``unchecked_background``, in the same place in that order, and
-the page warns ``background not checked: ...``. Pieces the gate does not
-select stay visible.
+routing count and ratio, the unmapped regions and the duplicate check's
+visible twins, as text with any other reason does. A page that could not
+be drawn (its render refused or failed) is assessed with why (a str) and
+fails closed: each visible piece the gate selects (see
+:func:`needs_background`) is flagged ``unchecked_background``, in the same
+place in that order, and the page warns ``background not checked: ...``.
+Pieces the gate does not select stay visible.
 
 :func:`assess_page` measures a page and routes it (#366 task 4):
 
@@ -105,15 +105,30 @@ select stay visible.
   Python's Unicode database) or a lone surrogate (``Cs``). Marks, format
   chars (ZWJ, LRM) and control chars are otherwise valid: nothing is
   stripped.
-- ``valid_char_ratio`` is the valid share of every span char, hidden ones
-  included. It is recorded, never routed on: a contents page whose dot
-  leaders read as U+FFFD keeps its digital text.
-- Routing counts the valid, visible (no hidden reason), non-whitespace
-  chars. ``ocr="always"`` routes vision. Under 20 routes vision, or digital
-  with a warning under ``ocr="never"``. 20 or more on a page whose raster
-  cover (of scan-like images, as for ``invisible``) is over 50 % routes
-  hybrid (OCR fills the unmapped regions), or digital under
-  ``ocr="never"``; else digital.
+- ``valid_char_ratio`` (recorded) is the valid share of every span char,
+  hidden ones and leader runs included, as ``char_count`` counts them.
+- Routing (spec §3.3 step 2, #417) reads the visible chars (in a piece with
+  no hidden reason) alone, so hidden text can neither send a page to
+  vision nor keep it out. The count is of the valid, non-whitespace ones.
+  The ratio is the valid share of the rest of them, whitespace included
+  (the spec counts spaces valid), with leader runs left out of both its
+  numerator and its denominator: a leader run is a maximal run of 3 or
+  more identical invalid chars within a piece (dot leaders that read as
+  U+FFFD, a private-use rule glyph repeated), which is layout, not text.
+  This amends the spec's rule (maintainer, 2026-11-01): a contents page
+  whose leaders are most of its chars keeps its route. Garbled text, whose
+  invalid chars vary, counts in full; a run of identical valid chars
+  (``-----``) is valid and counts. A run is found within one piece: A3
+  does not group spans into lines (A4b does), so a run a piece break cuts
+  is two runs, each judged on its own length. The routing ratio differs
+  from the recorded one on a page with hidden text or a leader run.
+- ``ocr="always"`` routes vision. A count under 20, or a ratio under 0.70,
+  routes vision, or digital under ``ocr="never"`` with a warning naming
+  each that held; a page with no visible char outside leader runs has no
+  ratio (its count, 0, routes it). Otherwise, a page whose raster cover (of
+  scan-like images, as for ``invisible``) is over 50 % routes hybrid (OCR
+  fills the unmapped regions), or digital under ``ocr="never"``; else
+  digital.
 - Unmapped regions: the box of each maximal run of invalid chars in a
   visible piece, where OCR (A5) reads what the text layer cannot say.
 
@@ -165,7 +180,7 @@ from bisect import bisect_left
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from itertools import groupby
-from typing import Literal, TypeAlias, get_args
+from typing import Literal, NamedTuple, TypeAlias, get_args
 
 from datagrunt.pdf._hidden_rules import em_reasons, off_page
 from datagrunt.pdf._pdfium_common import Box, union_box
@@ -208,8 +223,9 @@ __all__ = [
 OcrMode: TypeAlias = Literal["auto", "always", "never"]
 """The reader's OCR option: ``"auto"`` routes by the page's text,
 ``"always"`` sends every page to vision, ``"never"`` routes no page to OCR:
-a page without enough text stays digital (with a warning) instead of going
-to vision, and one that would be hybrid stays digital."""
+a page without enough valid text, or whose text is mostly invalid, stays
+digital (with a warning) instead of going to vision, and one that would be
+hybrid stays digital."""
 
 _OCR_MODES: tuple[OcrMode, ...] = get_args(OcrMode)
 
@@ -228,6 +244,10 @@ _FAINT_ALPHA = 12
 _OCR_LAYER_COVER = 0.5
 # Valid, visible, non-whitespace chars a page needs to stay out of vision.
 _MIN_TEXT_CHARS = 20
+# The valid share of its visible chars a page needs to stay out of vision (spec §3.3 step 2, #417).
+_MIN_VALID_RATIO = 0.70
+# A run of this many identical invalid chars or more is a leader or a rule, not text: the routing ratio leaves it out.
+_MIN_LEADER_RUN = 3
 # What a char code with no Unicode mapping reads as.
 _REPLACEMENT_CHAR = "\ufffd"
 # Private use, unassigned and lone-surrogate chars carry no text.
@@ -743,7 +763,7 @@ def assess_page(
     elif background is not None:
         pieces, own = _flag_unchecked(pieces, page), _flag_unchecked(own, page)
     flagged, unchecked = _duplicates_flagged(own, pieces)
-    route, warnings = _route(_text_char_count(pieces), cover, ocr)
+    route, warnings = _route(_visible_text(pieces), cover, ocr)
     warnings += _recovery_warnings(recovered, page.text.stats.dropped_text_objects)
     return PageAssessment(
         pieces=pieces,
@@ -997,28 +1017,71 @@ def _quality(page: RawPage, pieces: tuple[SpanPiece, ...]) -> PageQuality:
     )
 
 
-def _text_char_count(pieces: tuple[SpanPiece, ...]) -> int:
-    """The chars routing counts: valid, visible (in a piece with no reason) and not whitespace."""
-    visible = (piece for piece in pieces if not piece.hidden_reasons)
-    return sum(
-        1
-        for piece in visible
-        for offset in range(piece.start, piece.end)
-        if _valid(piece.span, offset) and not piece.span.text[offset].isspace()
-    )
+class _VisibleText(NamedTuple):
+    """What routing reads of a page's visible chars (those in a piece with no reason).
+
+    Attributes:
+        chars: The visible chars outside leader runs: the ratio's denominator.
+        valid: The valid ones, whitespace included (the spec counts spaces valid): the ratio's numerator.
+        counted: The valid ones that are not whitespace: the routing count.
+    """
+
+    chars: int
+    valid: int
+    counted: int
 
 
-def _route(text_chars: int, cover: float, ocr: OcrMode) -> tuple[PageRoute, tuple[str, ...]]:
-    """The page's route and warnings, from its routing char count and raster cover (see the module notes)."""
+def _visible_text(pieces: tuple[SpanPiece, ...]) -> _VisibleText:
+    """The visible chars of ``pieces`` outside leader runs, the valid ones, and the valid non-whitespace ones.
+
+    A leader run is a maximal run, within a piece, of :data:`_MIN_LEADER_RUN`
+    or more identical invalid chars (see the module notes). O(chars).
+    """
+    chars = valid = counted = 0
+    for piece in pieces:  # bounded: the pieces, then each one's runs of equal chars
+        if piece.hidden_reasons:
+            continue
+        span = piece.span
+        runs = groupby(range(piece.start, piece.end), key=lambda offset: (span.text[offset], _valid(span, offset)))
+        for (char, is_valid), run in runs:
+            length = sum(1 for _ in run)
+            if is_valid:
+                chars, valid = chars + length, valid + length
+                counted += 0 if char.isspace() else length
+            elif length < _MIN_LEADER_RUN:
+                chars += length
+    return _VisibleText(chars=chars, valid=valid, counted=counted)
+
+
+def _route(text: _VisibleText, cover: float, ocr: OcrMode) -> tuple[PageRoute, tuple[str, ...]]:
+    """The page's route and warnings, from its visible text and raster cover (see the module notes)."""
     if ocr == "always":
         return "vision", ()
-    if text_chars < _MIN_TEXT_CHARS:
+    shortfalls = _shortfalls(text)
+    if shortfalls:
         if ocr == "never":
-            count = f"{text_chars} valid, visible, non-whitespace chars (under {_MIN_TEXT_CHARS})"
-            return "digital", (f"ocr='never': the page has {count}; it stays digital instead of going to OCR",)
+            short = " and ".join(shortfalls)
+            return "digital", (f"ocr='never': the page has {short}; it stays digital instead of going to OCR",)
         return "vision", ()
     # hybrid OCRs the unmapped regions, so "never" keeps such a page digital.
     return ("hybrid" if cover > _OCR_LAYER_COVER and ocr != "never" else "digital"), ()
+
+
+def _shortfalls(text: _VisibleText) -> tuple[str, ...]:
+    """Why the page's visible text cannot stand: too few valid chars, too small a valid share, or both; else empty.
+
+    A page with no visible char outside leader runs has no ratio: its count
+    (0) is short. The ratio is shown cut to 3 places (exact, in integers),
+    so one under 0.70 never reads as 0.700.
+    """
+    found: list[str] = []
+    if text.counted < _MIN_TEXT_CHARS:
+        found.append(f"{text.counted} valid, visible, non-whitespace chars (under {_MIN_TEXT_CHARS})")
+    if text.chars and text.valid / text.chars < _MIN_VALID_RATIO:
+        ratio = f"0.{text.valid * 1000 // text.chars:03d}"
+        share = f"{text.valid} valid chars of its {text.chars} visible ones (leader runs aside)"
+        found.append(f"{share}, a ratio of {ratio} (under {_MIN_VALID_RATIO:.2f})")
+    return tuple(found)
 
 
 def _unmapped_regions(pieces: tuple[SpanPiece, ...]) -> tuple[Box, ...]:

@@ -38,6 +38,7 @@ from pdf_tests.test_layout_stream_tables import body_text, table_runs
 from pdf_tests.test_ocr import needs_tesseract
 from pdf_tests.test_ocr_scans import LINES, TOKENS, png_of, rendered
 from pdf_tests.test_pdfium_extract_page import failing
+from pdf_tests.test_routing import BROKEN_LINE, MAPPED_LINE, garbled, garbled_page
 
 LATTICE_XS = (50.0, 150.0, 250.0, 350.0)
 PARTS = (("Part", "Qty", "Price"), ("Bolt", "4", "0.10"), ("Nut", "12", "0.05"))
@@ -866,6 +867,21 @@ class TestVisionEndToEnd:
         assert document.degraded_pages == (3,)
         # A1 verifies a document over its pages that can be (a vision page never is), and none is an error page.
         assert document.integrity_verified
+
+    @needs_tesseract
+    def test_a_page_of_mostly_garbled_text_is_read_by_ocr_and_its_digital_text_superseded(self, tmp_path):
+        # 20 valid chars, but 27 of its 47 visible chars valid: the ratio routes it vision (#417).
+        document = extract_document(garbled_page(tmp_path))
+
+        (page,) = document.pages
+        assert (page.status, page.route, page.integrity_verified) == ("ok", "vision", False)
+        assert page.quality.valid_char_ratio == pytest.approx(27 / 47)
+        hidden = [element for element in page.elements if element.is_hidden]
+        assert {element.hidden_reasons for element in hidden} == {("superseded",)}
+        digital = f"{MAPPED_LINE} {garbled(BROKEN_LINE)}".split()
+        assert " ".join(element.text for element in hidden).split() == digital
+        # What OCR read, not the garbled text layer, is the page's visible text.
+        assert read_tokens(page) == set(f"{MAPPED_LINE} {BROKEN_LINE}".split())
 
     def test_without_tesseract_a_scan_is_ocr_unavailable_and_a_failed_page_an_error(
         self, tmp_path, monkeypatch, scan_png
