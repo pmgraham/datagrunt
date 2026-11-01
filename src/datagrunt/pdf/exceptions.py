@@ -41,3 +41,12 @@ class PDFCorruptError(DatagruntPDFError, RuntimeError):
             int_at_least("page_number", page_number, 1)
         super().__init__(message)
         self.page_number = page_number
+
+
+class PDFSourceChangedError(DatagruntPDFError):
+    """The source PDF changed while it was extracted: its pages and its recorded SHA-256 could disagree.
+
+    Raised whatever ``strict`` says: the whole document is inconsistent, not
+    one page, so no document is returned. The message names what changed:
+    the file's inode (it was replaced), its size or its modification time.
+    """

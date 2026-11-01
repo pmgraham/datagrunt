@@ -543,14 +543,14 @@ def bounded(call, limit_s: float = 10.0):
 
 def frame(*messages: bytes) -> bytes:
     """``messages`` as a worker writes them: each after its 8-byte little-endian length."""
-    return b"".join(render._LENGTH.pack(len(message)) + message for message in messages)
+    return b"".join(_process.LENGTH.pack(len(message)) + message for message in messages)
 
 
 def framed(data: bytes) -> list[bytes]:
     """The messages in ``data`` (the inverse of frame)."""
     messages = []
     while data:
-        (length,) = render._LENGTH.unpack_from(data)
+        (length,) = _process.LENGTH.unpack_from(data)
         messages.append(data[8 : 8 + length])
         data = data[8 + length :]
     return messages
@@ -664,7 +664,7 @@ class TestReplies:
 
     def test_pixels_longer_than_claimed_end_the_exchange_unread(self):
         # The length is read first: a message over its bound is refused before it is read.
-        assert exchanged(FakeProcess().send(frame(render._PIXELS + SIZE_3_BY_2) + render._LENGTH.pack(7))) is None
+        assert exchanged(FakeProcess().send(frame(render._PIXELS + SIZE_3_BY_2) + _process.LENGTH.pack(7))) is None
 
     def test_a_message_over_its_bound_ends_the_exchange(self, monkeypatch):
         monkeypatch.setattr(render, "_MAX_STATUS_BYTES", 8)
@@ -676,7 +676,7 @@ class TestReplies:
         [
             pytest.param(b"", id="nothing"),
             pytest.param(b"\x05\x00\x00", id="part-of-a-length"),
-            pytest.param(render._LENGTH.pack(10) + b"F why", id="part-of-a-message"),
+            pytest.param(_process.LENGTH.pack(10) + b"F why", id="part-of-a-message"),
         ],
     )
     def test_a_worker_that_ends_mid_reply_ends_the_exchange(self, data):
@@ -708,6 +708,7 @@ class TestReplies:
 
         assert payload == {
             "sys_path": sys.path,
+            "worker": "render",
             "request": {
                 "source": "/x.pdf",
                 "page_index": 2,
@@ -798,9 +799,9 @@ def _worker_main(request, replies):
 
 
 def run_bootstrap(stdin: bytes) -> subprocess.CompletedProcess:
-    """render._BOOTSTRAP in ``python -I``, fed ``stdin``."""
+    """_process.BOOTSTRAP in ``python -I``, fed ``stdin``."""
     return subprocess.run(
-        [sys.executable, "-I", "-c", render._BOOTSTRAP], input=stdin, capture_output=True, check=False, timeout=60
+        [sys.executable, "-I", "-c", _process.BOOTSTRAP], input=stdin, capture_output=True, check=False, timeout=60
     )
 
 
@@ -814,7 +815,8 @@ class TestBootstrap:
         (package / "__init__.py").write_text("", encoding="utf-8")
         (package / "render.py").write_text(FAKE_RENDER, encoding="utf-8")
 
-        done = run_bootstrap(json.dumps({"sys_path": [str(tmp_path)], "request": {"page_index": 0}}).encode())
+        request = {"sys_path": [str(tmp_path)], "worker": "render", "request": {"page_index": 0}}
+        done = run_bootstrap(json.dumps(request).encode())
 
         assert (done.returncode, done.stdout) == (0, b"{'page_index': 0}"), done.stderr
         assert b"noise at import" in done.stderr and b"noise on stdout" in done.stderr
@@ -823,21 +825,21 @@ class TestBootstrap:
         done = run_bootstrap(b" " * (render._MAX_REQUEST_BYTES + 1))
 
         assert done.returncode == 1
-        assert b"the render request is over 1048576 bytes" in done.stderr
+        assert b"the worker request is over 1048576 bytes" in done.stderr
 
     @pytest.mark.parametrize("path", ["/a/path", ["/a/path", 3]], ids=["str", "not-all-str"])
     def test_a_sys_path_that_is_not_a_list_of_str_is_refused(self, path):
         done = run_bootstrap(json.dumps({"sys_path": path, "request": {}}).encode())
 
         assert done.returncode == 1
-        assert b"the render request's sys_path is not a list of str" in done.stderr
+        assert b"the worker request's sys_path is not a list of str" in done.stderr
 
     def test_a_message_is_sent_whole_after_its_length_and_flushed(self):
         replies = Sink()
 
         render._send(replies, b"F why")
 
-        assert replies.flushed == replies.data == render._LENGTH.pack(5) + b"F why"
+        assert replies.flushed == replies.data == _process.LENGTH.pack(5) + b"F why"
 
     def test_a_request_over_its_bound_is_refused_before_a_worker_starts(self, monkeypatch):
         request = render._Request(
@@ -876,7 +878,7 @@ class TestWorkerProcess:
         rendered(letter(tmp_path), 72)
 
         ((_worker, args, kwargs),) = started
-        assert args[0] == [sys.executable, "-I", "-c", render._BOOTSTRAP]
+        assert args[0] == [sys.executable, "-I", "-c", _process.BOOTSTRAP]
         assert (kwargs["stdin"], kwargs["stdout"]) == (subprocess.PIPE, subprocess.PIPE)
 
     def test_the_worker_ignores_the_callers_cwd_and_python_environment(self, tmp_path, monkeypatch):

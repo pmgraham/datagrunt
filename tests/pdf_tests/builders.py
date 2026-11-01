@@ -173,19 +173,28 @@ def build_pdf(
     user_password: str | None = None,
     owner_password: str | None = None,
     strength: int = 128,
+    title: str | None = None,
+    author: str | None = None,
 ) -> Path:
     """Write ``pages`` to a PDF at ``path`` and return the path.
 
     Either password encrypts the file with RC4 at ``strength`` bits (40 or 128).
-    With only ``owner_password`` the file opens without a password. Every
-    spec is checked first: a bad one raises ValueError (TypeError for a wrong
-    type) and nothing is written.
+    With only ``owner_password`` the file opens without a password. ``title``
+    and ``author`` set the /Info entries; None keeps ReportLab's own
+    ("untitled", "anonymous"). Every spec is checked first: a bad one raises
+    ValueError (TypeError for a wrong type) and nothing is written.
     """
     _check_spec(pages, strength)
+    _require_optional_str("title", title)
+    _require_optional_str("author", author)
     out = Path(path)
     # invariant=1 fixes CreationDate, ModDate and /ID, so a spec always
     # builds the same bytes (and RC4 keys, which derive from /ID).
     canvas = Canvas(str(out), invariant=1, encrypt=_encryption(user_password, owner_password, strength))
+    if title is not None:
+        canvas.setTitle(title)
+    if author is not None:
+        canvas.setAuthor(author)
     for page in pages:
         _draw_page(canvas, page)
     canvas.save()
@@ -250,6 +259,11 @@ def _require_int(name: str, value: int) -> None:
     # bool is an int subclass and 3.0 == 3; neither is a real int here.
     if type(value) is not int:
         raise TypeError(f"{name} must be an int, got {value!r}")
+
+
+def _require_optional_str(name: str, value: str | None) -> None:
+    if value is not None and not isinstance(value, str):
+        raise TypeError(f"{name} must be a str or None, got {value!r}")
 
 
 def _require_finite(name: str, value: float) -> None:
