@@ -30,6 +30,9 @@ the document (and its JSON) keeps the exact text.
 version, and callers need one stable type.
 """
 
+from collections.abc import Mapping
+from types import MappingProxyType
+
 import polars as pl
 import pyarrow as pa
 
@@ -46,19 +49,31 @@ from datagrunt.pdf.elements import (
     Table,
 )
 
-__all__ = ["ARROW_SCHEMA", "FRAME_SCHEMA", "KINDS", "element_arrow", "element_frame", "element_text", "utf8_text"]
+__all__ = [
+    "ARROW_SCHEMA",
+    "ELEMENT_KINDS",
+    "FRAME_SCHEMA",
+    "KINDS",
+    "element_arrow",
+    "element_frame",
+    "element_text",
+    "utf8_text",
+]
 
 KINDS = ("heading", "paragraph", "key_value", "table", "list", "figure")
 
-# Each element type's kind (DocumentElement's six concrete types).
-_KIND_OF: dict[type, str] = {
-    Heading: "heading",
-    Paragraph: "paragraph",
-    KeyValue: "key_value",
-    Table: "table",
-    BulletList: "list",
-    Figure: "figure",
-}
+# Each element type's kind (DocumentElement's six concrete types), in KINDS order. The JSON codec names
+# an element's type by it too.
+ELEMENT_KINDS: Mapping[type, str] = MappingProxyType(
+    {
+        Heading: "heading",
+        Paragraph: "paragraph",
+        KeyValue: "key_value",
+        Table: "table",
+        BulletList: "list",
+        Figure: "figure",
+    }
+)
 
 _BBOX_FIELDS = ("x0", "y0", "x1", "y1")
 
@@ -174,7 +189,7 @@ def _append_row(columns: dict[str, list[object]], element: DocumentElement, page
     columns["element_id"].append(element.element_id)
     columns["page_number"].append(element.page_number)
     columns["reading_order"].append(element.reading_order)
-    columns["kind"].append(_KIND_OF[type(element)])
+    columns["kind"].append(ELEMENT_KINDS[type(element)])
     columns["scope_path"].append([utf8_text(entry) for entry in element.scope_path])
     columns["text"].append(utf8_text(element_text(element)))
     columns["markdown"].append(utf8_text(element.to_markdown()))
