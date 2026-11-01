@@ -1,7 +1,10 @@
 """Shared OCR: render-agnostic Tesseract block construction."""
 
+import os
+
 from datagrunt.core.pdf_io.extraction.config import _PDFExtractionConfig
 from datagrunt.core.pdf_io.extraction.shapes import BBox, OcrBlock
+from datagrunt.pdf._executables import trusted_executable
 
 
 def dpi_for_page(width: float, height: float, config: "_PDFExtractionConfig | None" = None) -> int:
@@ -67,8 +70,31 @@ def _data_to_blocks(data: dict, dpi: int) -> list:
     return blocks
 
 
+def _use_trusted_tesseract(pytesseract) -> None:
+    """Point pytesseract at an absolute tesseract before it runs one; raise TesseractNotFoundError if none.
+
+    An absolute ``tesseract_cmd`` the caller set is kept. A bare name (the
+    default, ``tesseract``) is found in an absolute ``PATH`` directory only
+    (:func:`~datagrunt.pdf._executables.trusted_executable`) and set as the
+    command, so pytesseract never starts a bare name. Any other command (a
+    relative path) is refused. Setting it is pytesseract's own configuration,
+    and idempotent.
+    """
+    configured = pytesseract.pytesseract.tesseract_cmd
+    if os.path.isabs(configured):
+        return
+    try:
+        found = trusted_executable(configured)
+    except (TypeError, ValueError):
+        found = None
+    if found is None:
+        raise pytesseract.TesseractNotFoundError()
+    pytesseract.pytesseract.tesseract_cmd = found
+
+
 def ocr_data_to_blocks(img, dpi: int) -> list:
-    """Run Tesseract on a PIL image and return ``OcrBlock`` lines."""
+    """Run Tesseract (an absolute, trusted one: :func:`_use_trusted_tesseract`) on a PIL image; ``OcrBlock`` lines."""
     pytesseract, Output = _import_ocr_deps()
+    _use_trusted_tesseract(pytesseract)
     data = pytesseract.image_to_data(img, output_type=Output.DICT)
     return _data_to_blocks(data, dpi)
