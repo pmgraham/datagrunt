@@ -413,6 +413,12 @@ class TestTsv:
 
         assert ocr._tsv_words(stdout, BAND_AT_840) == [ocr._Placed("y", 1, 841, 6, 846, 0.0)]
 
+    def test_only_word_rows_are_words(self):
+        # Only level 5 is a word, whatever text or confidence another level's row carries.
+        stdout = tsv(*(row(level, (1, 1, 5, 5), "50", "x") for level in (1, 2, 3, 4)), row(5, (1, 1, 5, 5), "50", "y"))
+
+        assert ocr._tsv_words(stdout, BAND_AT_840) == [ocr._Placed("y", 1, 841, 6, 846, 50.0)]
+
     def test_crlf_line_ends_are_read(self):
         stdout = tsv(row(5, (1, 2, 3, 4), "50", "fox"), newline="\r\n")
 
@@ -465,7 +471,8 @@ class TestMerged:
         ],
     )
     def test_a_word_read_twice_is_kept_once_with_the_higher_confidence(self, upper, lower, kept):
-        first, second = placed("fox", self.SEAM, upper), placed("fox", self.SEAM, lower)
+        # The lower band's copy sits a row lower (IoU 29 / 31), so the two copies differ.
+        first, second = placed("fox", self.SEAM, upper), placed("fox", (10, 851, 40, 881), lower)
         before, after = placed("the", (0, 100, 20, 120), 80.0), placed("dog", (0, 1000, 20, 1020), 80.0)
 
         merged = ocr._merged([(UPPER, [before, first]), (LOWER, [second, after])])
