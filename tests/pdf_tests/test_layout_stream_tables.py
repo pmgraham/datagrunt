@@ -25,13 +25,16 @@ from datagrunt.pdf.layout import (
     StreamTable,
     TextCell,
     find_lattice_tables,
+    page_layout,
     stream_layout,
     text_lines,
 )
+from datagrunt.pdf.quality import SpanPiece
 from pdf_tests.builders import TextRun
 from pdf_tests.test_layout_classify import described as described_text
 from pdf_tests.test_layout_lattice import box, chars, falling, rising, rules, written
 from pdf_tests.test_layout_stream import cell, column, line, page_of
+from pdf_tests.test_quality import raw_span
 
 NO_TABLES = LatticeResult(tables=(), used_pieces=())
 PARA = "This paragraph runs across the whole width of the page so that it spans every column."
@@ -465,7 +468,7 @@ class TestStreamLayout:
 
 
 class TestStreamLayoutBounds:
-    """Adversarial pages of 20 000 pieces lay out within bounds: banding is O(c log c), the XY-cut O(D n log n).
+    """Adversarial pages of 20 000 pieces lay out within bounds: banding O(c b) for b <= 500, the XY-cut O(D n log n).
 
     Each bound is generous: it catches a pass gone quadratic (20 000 squared steps take minutes), not a slow runner.
     """
@@ -502,6 +505,103 @@ class TestStreamLayoutBounds:
         # Linear: 10 000, 20 000 and 40 000 pieces take 0.24, 0.49 and 0.99 s on a laptop; CI runners took 2.2-2.3 s
         # for these 20 000 against a 2 s bound.
         assert elapsed < 6.0, f"{elapsed:.2f} s"
+
+
+def zero_width(text: str, x: float, y: float) -> SpanPiece:
+    """A visible piece of ``text`` whose every char box is the 1 pt line at ``x`` from ``y``, at 1 pt."""
+    boxes = tuple((x, y, x, y + 1.0) for _ in text)
+    return SpanPiece(
+        span=raw_span(text, boxes, font_size_pt=1.0, em_width_pt=1.0), start=0, end=len(text), hidden_reasons=()
+    )
+
+
+def staircase(rows: int, top: float = 5.0) -> tuple[SpanPiece, ...]:
+    """``rows`` lines of two cells from y ``top``, "A" and "B", each line's a thousandth of a point right of the last's.
+
+    The cells have no width, so no cell meets a band of the lines before: every line adds two bands.
+    """
+    pieces: list[SpanPiece] = []
+    for row in range(rows):
+        y = top + 1.5 * row
+        pieces += [zero_width("A", 10.0 + 0.001 * row, y), zero_width("B", 20.0 + 0.001 * row, y)]
+    return tuple(pieces)
+
+
+def shapes(items) -> list[tuple[int, int]]:
+    """Each stream table's rows and columns."""
+    return [(len(item.rows), item.n_cols) for item in items if isinstance(item, StreamTable)]
+
+
+class TestStreamTableGridBounds:
+    """A run has at most MAX_STREAM_COLUMNS bands, and a page's stream tables at most MAX_STREAM_GRID_UNITS cells."""
+
+    def test_the_bounds_are_a4as(self):
+        assert (
+            (layout.MAX_STREAM_COLUMNS, layout.MAX_STREAM_GRID_UNITS) == (500, layout.MAX_GRID_UNITS) == (500, 250_000)
+        )
+
+    def test_a_500_column_table_reads_as_a_table(self):
+        pieces = tuple(chars("x", 30.0 * col, 14.0 * row) for row in range(2) for col in range(500))
+
+        found = stream_layout(pieces, NO_TABLES, width_pt=15_100.0, height_pt=100.0)
+
+        assert shapes(found) == [(2, 500)]
+
+    def test_a_run_that_needs_501_bands_is_split(self):
+        # 250 lines make 500 bands: the 251st would make 502, so it starts the next run.
+        found = stream_layout(staircase(252), NO_TABLES, width_pt=600.0, height_pt=400.0)
+
+        assert shapes(found) == [(250, 500), (2, 4)]
+
+    def test_a_line_of_501_cells_starts_no_run(self):
+        pieces = tuple(chars("x", 30.0 * col, 14.0 * row) for row in range(2) for col in range(501))
+
+        found = stream_layout(pieces, NO_TABLES, width_pt=15_100.0, height_pt=100.0)
+
+        assert shapes(found) == []
+        assert sum(len(item.pieces) for item in found) == 1002
+
+    @pytest.mark.parametrize("chars_on_page", [8000, 20_000])
+    def test_a_staircase_makes_no_grid_over_the_page_bound_and_warns(self, chars_on_page):
+        rows = chars_on_page // 2
+
+        found = page_layout(staircase(rows), (), NO_TABLES, width_pt=600.0, height_pt=10.0 + 1.5 * rows)
+
+        tables = shapes(found.items)
+        assert tables == [(250, 500), (250, 500)]
+        over = rows // 250 - len(tables)
+        assert found.warnings == (
+            f"{over} borderless table(s) over the 250000-cell page bound: their text reads as paragraphs",
+        )
+        assert sum(len(item.pieces) for item in found.items) == chars_on_page
+
+    def test_the_page_bound_counts_every_table_together(self, monkeypatch):
+        monkeypatch.setattr(layout, "MAX_STREAM_GRID_UNITS", 8 + 8)
+
+        # A line of one cell between them ends each run.
+        pieces = (*staircase(2), chars("Break", 10.0, 50.0), *staircase(2, 100.0), chars("Break", 10.0, 150.0))
+        pieces += staircase(2, 200.0)
+
+        found = page_layout(pieces, (), NO_TABLES, width_pt=600.0, height_pt=400.0)
+
+        assert shapes(found.items) == [(2, 4), (2, 4)]
+        assert found.warnings == ("1 borderless table(s) over the 16-cell page bound: their text reads as paragraphs",)
+
+    def test_the_page_bound_spends_nothing_on_key_values_or_mastheads(self, monkeypatch):
+        monkeypatch.setattr(layout, "MAX_STREAM_GRID_UNITS", 0)
+        pairs = (chars("Weight:", 72.0, 10.0), chars("5 kg", 220.0, 10.0), chars("Colour:", 72.0, 24.0))
+        pairs += (chars("red", 220.0, 24.0),)
+
+        found = page_layout(pairs, (), NO_TABLES, width_pt=612.0, height_pt=792.0)
+
+        assert ([type(item).__name__ for item in found.items], found.warnings) == (["StreamKeyValue"] * 2, ())
+
+    def test_a_table_exactly_at_the_page_bound_is_a_table(self, monkeypatch):
+        monkeypatch.setattr(layout, "MAX_STREAM_GRID_UNITS", 8)
+
+        found = page_layout(staircase(2), (), NO_TABLES, width_pt=600.0, height_pt=400.0)
+
+        assert (shapes(found.items), found.warnings) == ([(2, 4)], ())
 
 
 def two_rows():

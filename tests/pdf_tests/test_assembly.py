@@ -9,12 +9,16 @@ and read them through ``extract_page``.
 import dataclasses
 import hashlib
 import pickle
+import re
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
 from datagrunt.pdf import assembly, layout
 from datagrunt.pdf.assembly import FigureDraft, PageFigures, assemble_page, page_figures, pass_c
-from datagrunt.pdf.elements import BBox, Figure, Page, Paragraph, Table
+from datagrunt.pdf.elements import BBox, Figure, Page, PageQuality, Paragraph, Table
 from datagrunt.pdf.layout import (
     MAX_CROSSINGS,
     LatticeCell,
@@ -34,13 +38,13 @@ from datagrunt.pdf.pdfium_engine import (
     open_document,
     recover_dropped_text,
 )
-from datagrunt.pdf.quality import assess_page
+from datagrunt.pdf.quality import PageAssessment, assess_page
 from datagrunt.pdf.scope import apply_scope
 from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf, solid_png
 from pdf_tests.test_layout_apart import tiny_text_page
 from pdf_tests.test_layout_lattice import rules as lattice_rules
 from pdf_tests.test_layout_lattice import written
-from pdf_tests.test_layout_stream_tables import body_text, table_runs
+from pdf_tests.test_layout_stream_tables import body_text, staircase, table_runs
 from pdf_tests.test_pdfium_engine import imported_modules
 from pdf_tests.test_quality import SHA, image
 
@@ -837,3 +841,97 @@ class TestSplitTablesLinkAcrossPages:
             for element in page.elements
             if isinstance(element, Table)
         ] == [None, None]
+
+
+STAIRCASE_SCRIPT = r"""
+import os, resource, sys, threading, time
+
+LIMIT = 1536 << 20  # bytes of peak RSS; past it the process ends at once
+
+
+def peak() -> int:
+    # Linux keeps ru_maxrss across fork + exec, so a child of a large process
+    # (pytest) reports the parent's peak; VmHWM is this process's own, reset at exec.
+    if sys.platform.startswith("linux"):
+        with open("/proc/self/status") as status:
+            for line in status:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]) * 1024
+        raise RuntimeError("no VmHWM line in /proc/self/status")
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # macOS reports bytes
+
+
+def watch() -> None:
+    while True:
+        if peak() > LIMIT:
+            sys.stdout.write(f"killed: peak RSS over {LIMIT >> 20} MiB\n")
+            sys.stdout.flush()
+            os._exit(99)
+        time.sleep(0.005)
+
+
+sys.path.insert(0, sys.argv[1])
+from datagrunt.pdf import assembly
+from datagrunt.pdf.layout import LatticeResult, page_layout
+from datagrunt.pdf.pdfium_engine import PageGeometry
+from pdf_tests.test_layout_stream_tables import staircase
+
+print(f"imported: peak {peak() >> 20} MiB", flush=True)
+threading.Thread(target=watch, daemon=True).start()
+rows = int(sys.argv[2])
+height = 10.0 + 1.5 * rows
+found = page_layout(staircase(rows), (), LatticeResult(tables=(), used_pieces=()), width_pt=600.0, height_pt=height)
+geometry = PageGeometry(page_number=1, width_pt=600.0, height_pt=height, rotation_deg=0, crop_offset=(0.0, 0.0))
+elements = [assembly._element(item, order, (), geometry) for order, item in enumerate(found.items)]
+print(f"elements {len(elements)}")
+print(f"peak {peak() >> 20} MiB")
+"""
+
+
+def staircase_assessment(pieces) -> PageAssessment:
+    """A3's assessment of a page whose pieces are ``pieces``, all visible."""
+    quality = PageQuality(
+        valid_char_ratio=1.0,
+        char_count=sum(piece.end - piece.start for piece in pieces),
+        vector_line_count=0,
+        hidden_spans_flagged=0,
+        rotation_deg=0,
+        deskew_angle_deg=None,
+        ocr_mean_confidence=None,
+    )
+    return PageAssessment(
+        pieces=pieces, recovered_pieces=(), quality=quality, route="digital", unmapped_regions=(), warnings=()
+    )
+
+
+class TestStreamTableBoundsEndToEnd:
+    """A staircase of cells (each line's in bands of their own) builds no grid past the page bound."""
+
+    @pytest.mark.parametrize("rows", [4000, 10_000], ids=["8000-chars", "20000-chars"])
+    def test_a_staircase_passes_pass_c(self, rows):
+        pieces = staircase(rows)
+        height = 10.0 + 1.5 * rows
+        geometry = PageGeometry(page_number=1, width_pt=600.0, height_pt=height, rotation_deg=0, crop_offset=(0.0, 0.0))
+
+        found = layout.page_layout(
+            pieces, (), LatticeResult(tables=(), used_pieces=()), width_pt=600.0, height_pt=height
+        )
+        elements = tuple(assembly._element(item, order, (), geometry) for order, item in enumerate(found.items))
+
+        assert pass_c(staircase_assessment(pieces), elements) == (True, ())
+        cells = [len(element.rows) * len(element.rows[0]) for element in elements if isinstance(element, Table)]
+        assert sum(cells) <= layout.MAX_STREAM_GRID_UNITS
+
+    def test_a_staircase_of_20000_chars_stays_small_in_a_memory_limited_process(self):
+        tests = Path(__file__).resolve().parent.parent
+        done = subprocess.run(
+            [sys.executable, "-c", STAIRCASE_SCRIPT, str(tests), "10000"],
+            capture_output=True,
+            check=False,
+            timeout=300,
+            text=True,
+        )
+
+        assert done.returncode == 0, done.stdout + done.stderr
+        imported = int(re.search(r"imported: peak (\d+) MiB", done.stdout).group(1))
+        assert int(re.search(r"^peak (\d+) MiB", done.stdout, re.MULTILINE).group(1)) - imported < 200, done.stdout

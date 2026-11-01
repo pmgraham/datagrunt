@@ -106,6 +106,13 @@ MAX_GRID_UNITS = 250_000
 MAX_CROSSINGS = 500_000
 # Grids a page may build: every visible piece is checked against each.
 MAX_GRIDS = 100
+# The stream pass's bounds, A4a's: a run of lines has at most this many X-bands (a line that would take it past
+# them ends the run), so banding a line costs O(its cells x MAX_STREAM_COLUMNS) ...
+MAX_STREAM_COLUMNS = 500
+# ... and a page's stream tables hold at most this many grid cells together: a run that would pass what is left is
+# no table, its text read as paragraphs, and counted so the caller can warn. The corpus has no stream table over
+# 30 cells.
+MAX_STREAM_GRID_UNITS = MAX_GRID_UNITS
 
 # A run joins a line when they overlap across it by this share of the smaller height (spec §3.3 Pass B).
 _LINE_OVERLAP = 0.45
@@ -2125,14 +2132,18 @@ def stream_layout(
     """
     width, height = positive_float("width_pt", width_pt), positive_float("height_pt", height_pt)
     runs = _stream_runs(pieces, lattice)
-    return tuple(item for item in _visible_items(runs, _page_turn(runs), width, height) if isinstance(item, _STREAM))
+    items, _ = _visible_items(runs, _page_turn(runs), width, height)
+    return tuple(item for item in items if isinstance(item, _STREAM))
 
 
 def _visible_items(
     runs: list[_TurnedRun], turn: int, width: float, height: float, units: tuple[_Unit, ...] = ()
-) -> list[StreamElement | _Unit]:
-    """The runs' tables and classified text, and the units, in reading order (:func:`stream_layout`, steps 2 to 4)."""
-    structures = _row_structures(_ordered_lines(runs, turn), width=width, height=height)
+) -> tuple[list[StreamElement | _Unit], int]:
+    """The runs' tables and classified text, and the units, in reading order (:func:`stream_layout`, steps 2 to 4).
+
+    Also returns how many runs were no table for :data:`MAX_STREAM_GRID_UNITS` (:func:`_bounded_structures`).
+    """
+    structures, over = _bounded_structures(_ordered_lines(runs, turn), width=width, height=height)
     structures = _without_page_columns(structures, runs, turn)
     slots = _reading_slots(runs, turn, structures, units)
     classified = iter(_classified_runs([slot for slot in slots if isinstance(slot, list)]))
@@ -2144,7 +2155,7 @@ def _visible_items(
             items.extend(slot.items)
         else:
             items.append(slot)
-    return items
+    return items, over
 
 
 class _Rows(NamedTuple):
@@ -2188,27 +2199,43 @@ def _page_columns(table: StreamTable, segment_of: dict[tuple[int, int, int], int
 
 
 def _row_structures(lines: list[TextLine], *, width: float, height: float) -> list[_Rows]:
-    """The tables, mastheads and key-value lists among the lines (:func:`stream_layout`, step 2), in order.
+    """The tables, mastheads and key-value lists among the lines (:func:`stream_layout`, step 2), in order."""
+    return _bounded_structures(lines, width=width, height=height)[0]
+
+
+def _bounded_structures(lines: list[TextLine], *, width: float, height: float) -> tuple[list[_Rows], int]:
+    """The lines' structures (:func:`_row_structures`), and how many runs were no table for the page's bound.
 
     The page's extent along a run's lines (``width`` for upright text,
-    ``height`` for text turned a quarter turn) weighs a masthead's gap.
+    ``height`` for text turned a quarter turn) weighs a masthead's gap. A
+    table spends its rows x columns of :data:`MAX_STREAM_GRID_UNITS`; one
+    that would pass what is left is no table: its lines read as paragraphs.
     """
     found = []
+    budget, over = MAX_STREAM_GRID_UNITS, 0
     for rows, starts, ends in _aligned_runs(lines):
         extent = width if rows[0].turn == _ACROSS else height
         structure = _row_structure(rows, starts, ends, extent)
+        if structure is not None and isinstance(structure.items[0], StreamTable):
+            units = len(rows) * len(starts)
+            if units > budget:
+                over += 1
+                continue
+            budget -= units
         if structure is not None:
             found.append(structure)
-    return found
+    return found, over
 
 
 def _aligned_runs(lines: list[TextLine]) -> Iterator[tuple[list[TextLine], list[float], list[float]]]:
     """Yield each run of 2 or more neighbouring lines of one turn whose cells fit X-bands, with its bands.
 
     Bands come as their starts and ends along the lines, sorted. A line
-    that does not fit (:func:`_fit`), has one cell or another turn ends
-    the run; one of 2 or more cells starts the next. O(c log c) for c
-    cells: each cell is placed by bisection, and a band is inserted once.
+    that does not fit (:func:`_fit`: past :data:`MAX_STREAM_COLUMNS` bands
+    too), has one cell or another turn ends the run; one of 2 or more
+    cells (and at most :data:`MAX_STREAM_COLUMNS`) starts the next.
+    O(c b) for c cells and b <= :data:`MAX_STREAM_COLUMNS` bands: each
+    cell is placed by bisection, and a band inserted shifts the run's others.
     """
     rows: list[TextLine] = []
     starts: list[float] = []
@@ -2240,7 +2267,8 @@ def _fit(starts: list[float], ends: list[float], spans: list[tuple[float, float]
     Interval projection with no slack: a cell joins the one band it
     overlaps or touches, widening it, or makes a band of its own. The line
     does not fit when its cells overlap, a cell meets two bands, or two
-    cells meet one: its cells would not be one per column.
+    cells meet one: its cells would not be one per column; nor when its
+    new bands would take the run past :data:`MAX_STREAM_COLUMNS`.
     """
     plan: list[tuple[int, bool, float, float]] = []
     reach, joined = -math.inf, -1
@@ -2250,6 +2278,8 @@ def _fit(starts: list[float], ends: list[float], spans: list[tuple[float, float]
             return False
         plan.append((low, high > low, start, end))
         reach, joined = end, (low if high > low else -1)
+    if len(starts) + sum(1 for _, joins, _, _ in plan if not joins) > MAX_STREAM_COLUMNS:
+        return False
     for at, joins, start, end in reversed(plan):
         if joins:
             starts[at], ends[at] = min(starts[at], start), max(ends[at], end)
@@ -2540,10 +2570,14 @@ def page_layout(
     slots = [FigureSlot(index=at, bbox=found) for at, found in enumerate(typed_tuple("figures", figures, BBox))]
     on_page = tuple(slot for slot in slots if slot.bbox.within(width, height))
     turn = _page_turn(runs)
-    visible: list[PageItem] = list(_visible_items(runs, turn, width, height, (*lattice.tables, *on_page)))
+    found, over = _visible_items(runs, turn, width, height, (*lattice.tables, *on_page))
+    visible: list[PageItem] = list(found)
     apart: list[ApartLine | FigureSlot] = [*_apart_lines(pieces, recovered, turn)]
     apart += [slot for slot in slots if slot not in on_page]
     items, warnings = _with_apart(visible, apart, turn)
+    if over:
+        bound = f"{over} borderless table(s) over the {MAX_STREAM_GRID_UNITS}-cell page bound"
+        warnings = (f"{bound}: their text reads as paragraphs", *warnings)
     return PageLayout(items=tuple(items), warnings=warnings)
 
 
