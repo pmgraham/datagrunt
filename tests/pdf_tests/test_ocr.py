@@ -91,6 +91,14 @@ class TestNormalized:
         with pytest.raises(TypeError, match=re.escape("page must be a RenderedPage, got bytes")):
             normalized(b"\x00")
 
+    def test_a_bgr_page_is_refused(self):
+        # OCR reads 8-bit gray: a 24-bit BGR render (#400's background check) is never read as gray.
+        page = RenderedPage(pixels=bytes(18), px_width=3, px_height=2, channels=3)
+
+        for call in (normalized, bands, lambda bgr: rotated(bgr, 90), lambda bgr: orientation(bgr, timeout_s=1.0)):
+            with pytest.raises(ValueError, match=re.escape("page must be 8-bit gray (1 channel), got 3 channels")):
+                call(page)
+
 
 def striped(width: int, height: int) -> RenderedPage:
     """A ``width`` x ``height`` page whose every row has its own grey level (row index mod 256)."""

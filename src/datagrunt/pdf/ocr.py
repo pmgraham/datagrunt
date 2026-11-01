@@ -163,6 +163,7 @@ def normalized(page: RenderedPage) -> RenderedPage:
 
     Raises:
         TypeError: If ``page`` is not a :class:`~datagrunt.pdf.render.RenderedPage`.
+        ValueError: If ``page`` is not 8-bit gray (a BGR render).
     """
     image = ImageOps.autocontrast(_image(page), cutoff=_AUTOCONTRAST_CUTOFF)
     return RenderedPage(pixels=image.tobytes(), px_width=page.px_width, px_height=page.px_height)
@@ -185,8 +186,9 @@ def bands(page: RenderedPage, *, height: int = _BAND_HEIGHT, overlap: int = _BAN
     Raises:
         TypeError: If ``page`` is not a :class:`~datagrunt.pdf.render.RenderedPage`,
             or ``height`` or ``overlap`` is not an int (bool rejected).
-        ValueError: If ``height`` or ``overlap`` is under 1, or ``overlap``
-            is over half of ``height`` (a row would be in three bands).
+        ValueError: If ``page`` is not 8-bit gray (a BGR render), ``height``
+            or ``overlap`` is under 1, or ``overlap`` is over half of
+            ``height`` (a row would be in three bands).
     """
     _checked_page(page)
     int_at_least("height", height, 1)
@@ -208,9 +210,11 @@ def _band(page: RenderedPage, top: int, rows: int) -> Band:
 
 
 def _checked_page(page: RenderedPage) -> RenderedPage:
-    """``page``, if it is a RenderedPage."""
+    """``page``, if it is a RenderedPage in 8-bit gray (a BGR render is never read as gray)."""
     if not isinstance(page, RenderedPage):
         raise TypeError(f"page must be a RenderedPage, got {type(page).__name__}")
+    if page.channels != 1:
+        raise ValueError(f"page must be 8-bit gray (1 channel), got {page.channels} channels")
     return page
 
 
@@ -305,7 +309,7 @@ def rotated(page: RenderedPage, degrees: int) -> RenderedPage:
 
     Raises:
         TypeError: If ``page`` is not a RenderedPage, or ``degrees`` is not an int (bool rejected).
-        ValueError: If ``degrees`` is not 0, 90, 180 or 270.
+        ValueError: If ``page`` is not 8-bit gray (a BGR render), or ``degrees`` is not 0, 90, 180 or 270.
     """
     image = _image(page)
     turn = _checked_turn("degrees", degrees)
@@ -350,8 +354,9 @@ def orientation(page: RenderedPage, *, timeout_s: float) -> Orientation:
     raises: each is 0 degrees with no confidence.
 
     Raises:
-        TypeError, ValueError: If ``page`` is not a RenderedPage, or
-            ``timeout_s`` is not a finite number over 0 (before anything runs).
+        TypeError, ValueError: If ``page`` is not a RenderedPage in 8-bit
+            gray, or ``timeout_s`` is not a finite number over 0 (before
+            anything runs).
     """
     _checked_page(page)
     positive_float("timeout_s", timeout_s)
