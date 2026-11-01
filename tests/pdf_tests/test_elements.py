@@ -435,6 +435,42 @@ class TestBulletList:
         with pytest.raises(TypeError, match="ordered"):
             _element(BulletList, ordered=bad)
 
+    def test_markers_default_to_none(self):
+        assert _element(BulletList).markers == ()
+
+    @pytest.mark.parametrize(
+        ("markers", "ordered"),
+        [(("•", "•"), False), (("1.", "2."), True), (("(a)", "(iv)"), True), (("-", "*"), False)],
+    )
+    def test_markers_are_kept_one_per_item(self, markers, ordered):
+        bullets = _element(BulletList, items=("one", "two"), markers=markers, ordered=ordered)
+
+        assert bullets.markers == markers
+
+    @pytest.mark.parametrize("ordered", [False, True])
+    def test_markers_never_change_the_markdown(self, ordered):
+        plain = _element(BulletList, items=("one", "two"), ordered=ordered)
+        marked = _element(BulletList, items=("one", "two"), markers=("(a)", "(b)"), ordered=ordered)
+
+        assert marked.to_markdown() == plain.to_markdown()
+
+    def test_markers_take_part_in_equality(self):
+        assert _element(BulletList, markers=("•", "•")) != _element(BulletList)
+
+    @pytest.mark.parametrize(
+        ("bad", "exc", "message"),
+        [
+            (("•",), ValueError, "markers must be empty or hold one marker per item (2), got 1"),
+            (("•", "•", "•"), ValueError, "markers must be empty or hold one marker per item (2), got 3"),
+            (("•", " "), ValueError, "markers"),
+            (("•", None), TypeError, "markers"),
+            (["•", "•"], TypeError, "markers"),
+        ],
+    )
+    def test_bad_markers_rejected(self, bad, exc, message):
+        with pytest.raises(exc, match=re.escape(message)):
+            _element(BulletList, markers=bad)
+
 
 def _table(**overrides):
     return _element(Table, **overrides)

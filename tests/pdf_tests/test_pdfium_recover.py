@@ -234,6 +234,7 @@ def raw_span(text: str = "Ab", box=(72.0, 200.0, 72.0, 200.0), **overrides) -> R
         "text": text,
         "bbox": box,
         "char_boxes": (box,) * len(text),
+        "tight_boxes": (box,) * len(text),
         "font_size_pt": 0.0,
         "em_width_pt": 0.0,
         "base_font_name": "Helvetica",
@@ -314,6 +315,18 @@ class TestRecoveredSpan:
                 "char_boxes[0] of a recovered span must be its bbox (72.0, 200.0, 80.0, 210.0)"
                 " (the text object's box), got (72.0, 200.0, 76.0, 210.0)",
                 id="per-char-boxes",
+            ),
+            pytest.param(
+                {
+                    "span": raw_span(
+                        box=(72.0, 200.0, 80.0, 210.0),
+                        tight_boxes=((72.0, 200.0, 76.0, 210.0), (76.0, 201.0, 80.0, 209.0)),
+                    )
+                },
+                ValueError,
+                "tight_boxes[0] of a recovered span must be its bbox (72.0, 200.0, 80.0, 210.0)"
+                " (the text object's box), got (72.0, 200.0, 76.0, 210.0)",
+                id="per-char-tight-boxes",
             ),
         ],
     )
@@ -767,7 +780,8 @@ class TestRecovery:
             where.first_index,
         )
         assert item.span.font_size_pt == 0.0
-        for box in item.span.char_boxes:
+        # Loose and tight alike: the object's original box, not the place it was read at.
+        for box in item.span.char_boxes + item.span.tight_boxes:
             assert_at_point(box, where.point)
         assert got.stats == NO_LOSS
 
