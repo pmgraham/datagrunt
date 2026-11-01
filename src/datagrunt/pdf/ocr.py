@@ -25,7 +25,10 @@ The tesseract CLI (never ``pytesseract``) reads the page:
   maps each word's box back to the displayed page in points: through its
   band's offset, ``72 / dpi`` and the inverse of the turn. A word read in
   both bands of a shared strip (the same text, boxes overlapping by an IoU
-  of 0.5 or more) is kept once, with its higher confidence.
+  of 0.5 or more) is kept once, with its higher confidence. Given a
+  deadline (the vision page's budget, #418), each band's call is given at
+  most the time left, and a band not started by then is not read: the
+  reading is ``"spent"``.
 - A line crossing a band's cut edge (the upper band's bottom row, the
   lower band's top row) is read whole by the other band and, cut, as other
   text by its own ("Initiate" over "LILILIdAlC"). Such a fragment is
@@ -70,6 +73,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import IO, Literal, NamedTuple
 
@@ -99,9 +103,11 @@ _BAND_OVERLAP = 60
 _TURNS = (0, 90, 180, 270)
 _TURN_NAMES = "0, 90, 180 or 270"
 
-OCRStatus = Literal["ok", "unavailable", "failed", "timeout"]
+# How one tesseract call ends; a reading is also "spent" when its deadline passes (ocr_words).
+_CallStatus = Literal["ok", "unavailable", "failed", "timeout"]
+OCRStatus = Literal[_CallStatus, "spent"]
 OrientationStatus = Literal["ok", "undetermined", "unavailable", "failed", "timeout"]
-_OCR_STATUSES: tuple[OCRStatus, ...] = ("ok", "unavailable", "failed", "timeout")
+_OCR_STATUSES: tuple[OCRStatus, ...] = ("ok", "unavailable", "failed", "timeout", "spent")
 _ORIENTATION_STATUSES: tuple[OrientationStatus, ...] = ("ok", "undetermined", "unavailable", "failed", "timeout")
 
 # tesseract's TSV, one row a box: words are level 5, with a confidence of 0..100 (-1 on other levels).
@@ -287,8 +293,11 @@ class OCRResult:
         words: The words, band by band, each band's in tesseract's reading order.
         status: ``"ok"`` (every band read); ``"unavailable"`` (no tesseract to
             run); ``"failed"`` or ``"timeout"`` (a band's call: ``words`` then
-            holds the bands read before it).
-        reason: Why the status is not ok, naming the band; empty when ok.
+            holds the bands read before it); ``"spent"`` (the caller's
+            deadline passed: a band's call was cut at it, or not started;
+            ``words`` holds the bands read before it).
+        reason: Why the status is not ok, naming the band (``"spent"``: how
+            many bands were read); empty when ok.
     """
 
     words: tuple[OCRWord, ...]
@@ -427,6 +436,7 @@ def ocr_words(
     page_size_pt: tuple[float, float],
     timeout_s: float,
     language: str = "eng",
+    deadline: float | None = None,
 ) -> OCRResult:
     """The words tesseract reads in ``page_bands`` (``--psm 3``, TSV, ``-l language``), on the displayed page.
 
@@ -438,6 +448,11 @@ def ocr_words(
     of the bands read before it. Words read twice in a shared strip are kept
     once (the higher confidence).
 
+    ``deadline`` (a :func:`time.monotonic` time, or None) ends the reading:
+    each band's call is given at most the time left before it, and a band
+    not started by it is not read. Either way the result is ``"spent"``,
+    with the words of the bands read before it.
+
     Raises:
         TypeError, ValueError: If an argument is invalid, or a band does not
             fit the righted page (before anything runs).
@@ -446,17 +461,22 @@ def ocr_words(
     positive_float("timeout_s", timeout_s)
     if not isinstance(language, str) or _LANGUAGE.fullmatch(language) is None:
         raise ValueError(f"language must be tesseract language names (like eng or deu+eng), got {language!r}")
+    if deadline is not None:
+        finite_float("deadline", deadline)
     binary = trusted_executable("tesseract")
     if binary is None:
         return OCRResult(words=(), status="unavailable", reason=_NOT_ON_PATH)
     argv = [binary, "stdin", "stdout", "--psm", "3", "-l", language, "tsv"]
     read: list[tuple[Band, list[_Placed]]] = []
     for number, band in enumerate(page_bands, start=1):
-        words = _band_words(argv, band, timeout_s)
+        words = _read_band(argv, band, timeout_s, deadline)
         if isinstance(words, _Failure):
-            where = f"band {number} of {len(page_bands)} (rows {band.top_px} to {band.top_px + band.px_height - 1})"
-            found = _page_words(read, rotation, displayed, dpi)
-            return OCRResult(words=found, status=words.status, reason=f"{where}: {words.reason}")
+            if words.status == "spent":
+                reason = f"OCR stopped after {number - 1} of {len(page_bands)} bands"
+            else:
+                rows = f"rows {band.top_px} to {band.top_px + band.px_height - 1}"
+                reason = f"band {number} of {len(page_bands)} ({rows}): {words.reason}"
+            return OCRResult(words=_page_words(read, rotation, displayed, dpi), status=words.status, reason=reason)
         read.append((band, words))
     return OCRResult(words=_page_words(read, rotation, displayed, dpi), status="ok", reason="")
 
@@ -483,6 +503,21 @@ def _displayed_size(
             rows = f"rows {band.top_px} to {band.top_px + band.px_height - 1}"
             raise ValueError(f"band {number} ({rows}) runs past the {righted[1]} px tall righted page")
     return width, height
+
+
+def _read_band(argv: list[str], band: Band, timeout_s: float, deadline: float | None) -> list[_Placed] | _Failure:
+    """The band's words within ``timeout_s`` and the time left before ``deadline``; ``"spent"`` if that ran out.
+
+    Its call is not started past the deadline, and one cut at it (its
+    timeout shortened to the time left) is spent, not timed out.
+    """
+    call_s = timeout_s if deadline is None else min(timeout_s, deadline - time.monotonic())
+    if call_s <= 0.0:
+        return _Failure("spent", "the deadline passed before the band's call")
+    words = _band_words(argv, band, call_s)
+    if isinstance(words, _Failure) and words.status == "timeout" and call_s < timeout_s:
+        return _Failure("spent", words.reason)
+    return words
 
 
 def _band_words(argv: list[str], band: Band, timeout_s: float) -> list[_Placed] | _Failure:
@@ -728,7 +763,7 @@ def _pgm(image: RenderedPage | Band) -> tuple[bytes, bytes]:
 class _Call(NamedTuple):
     """How one tesseract call ended: its status and reason, its whole stdout when ok, and its stderr's tail."""
 
-    status: OCRStatus
+    status: _CallStatus
     reason: str
     stdout: bytes
     stderr: str

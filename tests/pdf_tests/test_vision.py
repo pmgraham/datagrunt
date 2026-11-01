@@ -12,6 +12,8 @@ absent (CI installs ``tesseract-ocr``).
 import dataclasses
 import io
 import pickle
+import re
+import time
 from pathlib import Path
 
 import pypdfium2 as pdfium
@@ -44,7 +46,8 @@ from datagrunt.pdf.vision import (
     vision_page,
 )
 from pdf_tests.builders import PageSpec, RasterImage, TextRun, break_page, build_pdf
-from pdf_tests.test_ocr import needs_tesseract
+from pdf_tests.test_ocr import fake_tesseract, needs_tesseract, posix_only, tsv
+from pdf_tests.test_ocr import row as tsv_row
 from pdf_tests.test_ocr_scans import LINES, SENTENCES, TOKENS, png_of, rendered, turned, word_boxes
 from pdf_tests.test_pdfium_engine import imported_modules
 from pdf_tests.test_pdfium_spans import content_page
@@ -819,6 +822,7 @@ class TestVisionOptions:
 
         assert (options.vision_dpi, options.max_render_pixels, options.language) == (300, 16_000_000, "eng")
         assert (options.memory_cap_bytes, options.render_timeout_s, options.ocr_timeout_s) == (2 << 30, 120.0, 120.0)
+        assert options.page_budget_s == 600.0
         assert pickle.loads(pickle.dumps(options)) == options
 
     @pytest.mark.parametrize(
@@ -831,6 +835,9 @@ class TestVisionOptions:
             ({"memory_cap_bytes": 0}, ValueError, "memory_cap_bytes"),
             ({"render_timeout_s": 0.0}, ValueError, "render_timeout_s"),
             ({"ocr_timeout_s": float("nan")}, ValueError, "ocr_timeout_s"),
+            ({"page_budget_s": 0.0}, ValueError, "page_budget_s must be > 0"),
+            ({"page_budget_s": float("inf")}, ValueError, "page_budget_s must be finite"),
+            ({"page_budget_s": "600"}, TypeError, "page_budget_s must be an int or float"),
         ],
     )
     def test_rejects_bad_options(self, fields, error, message):
@@ -842,6 +849,124 @@ class TestVisionOptions:
 
         with pytest.raises(TypeError, match="options must be a VisionOptions"):
             vision_page(raw, assessment, source=scans["captioned"], options={"vision_dpi": 300})
+
+
+def budget_warning(reason: str, budget: str = "600") -> str:
+    """The warning of a vision page whose OCR ran out of its page budget (#418)."""
+    return unread_warning(f"{reason}: the page's {budget} s budget is spent")
+
+
+def spy_render(monkeypatch, page: RenderedPage | None = None, *, sleep_s: float = 0.0) -> list[dict]:
+    """Record each render_page call's options; render really, or answer ``page`` after ``sleep_s``."""
+    calls: list[dict] = []
+    real = vision.render_page
+
+    def recorded(*args, **options):
+        calls.append(options)
+        if page is None:
+            return real(*args, **options)
+        time.sleep(sleep_s)
+        return page
+
+    monkeypatch.setattr(vision, "render_page", recorded)
+    return calls
+
+
+def spy_orientation(monkeypatch) -> list[float]:
+    """Record each OSD call's timeout; the page is upright."""
+    timeouts: list[float] = []
+
+    def recorded(page, *, timeout_s):
+        timeouts.append(timeout_s)
+        return UPRIGHT
+
+    monkeypatch.setattr(vision, "orientation", recorded)
+    return timeouts
+
+
+class TestPageBudget:
+    """A vision page's render and OCR stop when its page budget is spent (#418), whatever the page's size."""
+
+    @pytest.mark.parametrize("route", ["vision_page", "fallback_page"])
+    def test_every_call_is_given_at_most_the_time_left(self, scans, monkeypatch, route):
+        failure = failed_at_text(scans["scan"], monkeypatch) if route == "fallback_page" else None
+        renders, timeouts, reads = spy_render(monkeypatch), spy_orientation(monkeypatch), spy_ocr(monkeypatch)
+        options = VisionOptions(page_budget_s=30.0)
+
+        began = time.monotonic()
+        if failure is None:
+            visioned(scans["scan"], options=options)
+        else:
+            fell_back(scans["scan"], failure, options=options)
+        ended = time.monotonic()
+
+        # The render's 120 s and OSD's 120 s are cut to the 30 s left; each band's call is cut by the deadline.
+        ((render,), (osd,), (read,)) = (renders, timeouts, reads)
+        assert 0.0 < render["timeout_s"] <= 30.0 and 0.0 < osd <= render["timeout_s"]
+        assert began + 30.0 <= read["deadline"] <= ended + 30.0
+        assert read["timeout_s"] == 120.0
+
+    def test_a_budget_spent_before_the_render_draws_nothing(self, scans, monkeypatch):
+        monkeypatch.setattr(vision, "render_page", lambda *args, **kwargs: pytest.fail("rendered"))
+
+        page = visioned(scans["captioned"], options=VisionOptions(page_budget_s=1e-9))
+
+        assert (page.status, page.page_image, texts(page)) == ("ocr_unavailable", None, ["Page 7"])
+        assert page.warnings[-1] == unread_warning("the page was not rendered: the page's 1e-09 s budget is spent")
+
+    def test_a_render_that_spends_the_budget_leaves_no_time_for_ocr(self, scans, monkeypatch):
+        spy_render(monkeypatch, rendered(scans["scan"]), sleep_s=0.3)
+        monkeypatch.setattr(vision, "orientation", lambda *args, **kwargs: pytest.fail("OSD ran"))
+
+        page = visioned(scans["captioned"], options=VisionOptions(page_budget_s=0.2))
+
+        assert (page.status, texts(page)) == ("ocr_unavailable", ["Page 7"])
+        assert page.warnings[-1] == budget_warning("OCR stopped before orientation detection", "0.2")
+        assert page.page_image is not None
+
+    def test_a_spent_reading_is_ocr_unavailable_and_its_words_unused(self, scans, monkeypatch):
+        partial = OCRResult(
+            words=tuple(line_words("The quick", 72.0, 100.0)), status="spent", reason="OCR stopped after 2 of 4 bands"
+        )
+        monkeypatch.setattr(vision, "orientation", lambda *args, **kwargs: UPRIGHT)
+        monkeypatch.setattr(vision, "ocr_words", lambda *args, **kwargs: partial)
+
+        page = visioned(scans["captioned"])
+
+        assert (page.status, texts(page)) == ("ocr_unavailable", ["Page 7"])
+        unused = "; the 2 word(s) it read before that are not used"
+        assert page.warnings[-1] == budget_warning("OCR stopped after 2 of 4 bands") + unused
+
+    def test_a_failed_page_whose_reading_is_spent_is_an_error(self, scans, monkeypatch):
+        failure = failed_at_text(scans["scan"], monkeypatch)
+        spent = OCRResult(words=(), status="spent", reason="OCR stopped after 1 of 4 bands")
+        monkeypatch.setattr(vision, "orientation", lambda *args, **kwargs: UPRIGHT)
+        monkeypatch.setattr(vision, "ocr_words", lambda *args, **kwargs: spent)
+
+        page = fell_back(scans["scan"], failure)
+
+        assert (page.status, page.elements, page.quality) == ("error", (), None)
+        reason = "OCR stopped after 1 of 4 bands: the page's 600 s budget is spent"
+        assert page.error == f"{FAILED}{failure.message}; OCR could not read the page: {reason}"
+
+    @posix_only
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_a_page_whose_bands_outrun_its_budget_stops_with_the_warning(self, scans, tmp_path, monkeypatch):
+        # Each tesseract call takes 0.5 s, within its 30 s timeout; the page's 4 bands and OSD would take 2.5 s.
+        body = (
+            "cat > /dev/null\nsleep 0.5\n"
+            'if [ "$4" = "0" ]; then printf "Rotate: 0\\nOrientation confidence: 9.00\\n"; else cat "{d}/stdout"; fi'
+        )
+        fake_tesseract(tmp_path, monkeypatch, body, stdout=tsv(tsv_row(5, (10, 20, 30, 15), "90", "fox")))
+
+        began = time.monotonic()
+        page = visioned(scans["scan"], options=VisionOptions(ocr_timeout_s=30.0, page_budget_s=1.6))
+        elapsed = time.monotonic() - began
+
+        assert (page.status, texts(page)) == ("ocr_unavailable", [])
+        stopped = r"OCR stopped after [01] of 4 bands: the page's 1\.6 s budget is spent"
+        assert re.fullmatch(rf"OCR could not read the page: {stopped}(; the \d+ word\(s\) .*)?", page.warnings[-1])
+        assert elapsed < 6.0  # ~1.6 s here: the budget, then one call's reap at most
 
 
 class TestPageRender:

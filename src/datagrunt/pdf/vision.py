@@ -102,8 +102,18 @@ against the elements: a mismatch is a warning.
    loaders (:class:`PageRender`) draw the page again on demand, so no pixels
    are held between pages.
 
+The page's render and OCR share one time budget (#418),
+:attr:`VisionOptions.page_budget_s` (600 s; a page takes 2-4 s here),
+counted from the page's start: each call (the render, OSD, a band) is given
+at most its own timeout and the time left, and none starts once it is
+spent. So a page's render and OCR end within its budget (and the last
+call's reap) however large the page is: its bands are many on a tall page.
+A page whose budget runs out is not read (the warning says how many of its
+bands were: ``OCR stopped after 1 of 4 bands: the page's 600 s budget is
+spent``).
+
 When the page is not rendered (``RenderRefused``, ``RenderFailed``) or
-tesseract cannot read it (missing, failed, timed out), it is
+tesseract cannot read it (missing, failed, timed out, its budget spent), it is
 ``"ocr_unavailable"``: :func:`~datagrunt.pdf.assembly.assemble_page`'s
 page of its digital text, the page image when it was rendered, and a
 warning naming why. Words read before a band failed are not used: the page
@@ -140,6 +150,7 @@ import io
 import math
 import os
 import statistics
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
@@ -228,6 +239,9 @@ _MEMORY_CAP_BYTES = 2 << 30
 # A render takes ~0.5 s here (a worker's start included) and a tesseract call ~1 s: each bound is over 100 times that.
 _RENDER_TIMEOUT_S = 120.0
 _OCR_TIMEOUT_S = 120.0
+# A vision page's render and OCR together (#418): a page takes 2-4 s here (a render, OSD and 4 bands), so this is over
+# 100 times that, and below what the calls' own timeouts allow a tall page (120 s each, a band each 840 rows).
+_PAGE_BUDGET_S = 600.0
 
 
 class VisionElements(NamedTuple):
@@ -520,6 +534,9 @@ class VisionOptions:
         memory_cap_bytes: The render worker's memory cap past its start (>= 1).
         render_timeout_s: Seconds a render may take, its worker's start included.
         ocr_timeout_s: Seconds each tesseract call may take.
+        page_budget_s: Seconds a page's render and OCR may take in all (see
+            the module notes): each call within its own timeout and the
+            time left.
 
     Raises:
         TypeError, ValueError: If a value is of the wrong type or out of range.
@@ -531,6 +548,7 @@ class VisionOptions:
     memory_cap_bytes: int = _MEMORY_CAP_BYTES
     render_timeout_s: float = _RENDER_TIMEOUT_S
     ocr_timeout_s: float = _OCR_TIMEOUT_S
+    page_budget_s: float = _PAGE_BUDGET_S
 
     def __post_init__(self) -> None:
         int_at_least("vision_dpi", self.vision_dpi, _MIN_DPI)
@@ -539,6 +557,7 @@ class VisionOptions:
         int_at_least("memory_cap_bytes", self.memory_cap_bytes, 1)
         object.__setattr__(self, "render_timeout_s", positive_float("render_timeout_s", self.render_timeout_s))
         object.__setattr__(self, "ocr_timeout_s", positive_float("ocr_timeout_s", self.ocr_timeout_s))
+        object.__setattr__(self, "page_budget_s", positive_float("page_budget_s", self.page_budget_s))
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -635,10 +654,11 @@ def vision_page(
     if not isinstance(options, VisionOptions):
         raise TypeError(f"options must be a VisionOptions, got {type(options).__name__}")
     geometry = raw_page.geometry
-    drawn = _drawn(source, geometry, password, options)
+    deadline = time.monotonic() + options.page_budget_s
+    drawn = _drawn(source, geometry, password, options, deadline)
     if drawn.page is None:
         return _unread(raw_page, assessment, drawn.failure, None, source, password, min_image_dimension)
-    reading = _read(drawn.page, drawn.dpi, geometry, options)
+    reading = _read(drawn.page, drawn.dpi, geometry, options, deadline)
     image = _page_image(drawn.page, drawn.dpi, reading.rotation, geometry, source, password, options)
     if reading.failure:
         return _unread(raw_page, assessment, reading.failure, image, source, password, min_image_dimension)
@@ -676,18 +696,25 @@ class _Drawn(NamedTuple):
 
 
 def _drawn(
-    source: str | os.PathLike[str], geometry: PageGeometry, password: str | None, options: VisionOptions
+    source: str | os.PathLike[str],
+    geometry: PageGeometry,
+    password: str | None,
+    options: VisionOptions,
+    deadline: float,
 ) -> _Drawn:
-    """The page rendered at its effective DPI in the guarded worker; a refusal or failure is its reason."""
+    """The page rendered at its effective DPI in the guarded worker by ``deadline``; a refusal or failure is why not."""
     try:
         dpi = effective_dpi(options.vision_dpi, options.max_render_pixels, geometry.width_pt, geometry.height_pt)
+        left = deadline - time.monotonic()
+        if left <= 0.0:
+            return _Drawn(None, 0, f"the page was not rendered: {_spent(options)}")
         page = render_page(
             source,
             geometry.page_number - 1,
             dpi=dpi,
             password=password,
             memory_cap_bytes=options.memory_cap_bytes,
-            timeout_s=options.render_timeout_s,
+            timeout_s=min(options.render_timeout_s, left),
         )
     except (RenderRefused, RenderFailed) as exc:
         return _Drawn(None, 0, f"the page was not rendered: {exc}")
@@ -703,10 +730,16 @@ class _Reading(NamedTuple):
     failure: str
 
 
-def _read(page: RenderedPage, dpi: int, geometry: PageGeometry, options: VisionOptions) -> _Reading:
-    """The render normalized, oriented, turned, banded and read by tesseract (one OSD call, one call a band)."""
+def _read(page: RenderedPage, dpi: int, geometry: PageGeometry, options: VisionOptions, deadline: float) -> _Reading:
+    """The render normalized, oriented, turned, banded and read by tesseract (one OSD call, one call a band).
+
+    Every call ends by ``deadline`` (the page's budget): none starts after it.
+    """
     grey = normalized(page)
-    found = orientation(grey, timeout_s=options.ocr_timeout_s)
+    left = deadline - time.monotonic()
+    if left <= 0.0:
+        return _Reading((), 0, (), f"OCR stopped before orientation detection: {_spent(options)}")
+    found = orientation(grey, timeout_s=min(options.ocr_timeout_s, left))
     if found.status == "unavailable":
         return _Reading((), 0, (), f"tesseract is unavailable: {found.reason}")
     turn, notes = _turn(found)
@@ -717,12 +750,20 @@ def _read(page: RenderedPage, dpi: int, geometry: PageGeometry, options: VisionO
         page_size_pt=(geometry.width_pt, geometry.height_pt),
         timeout_s=options.ocr_timeout_s,
         language=options.language,
+        deadline=deadline,
     )
     if result.status == "ok":
         return _Reading(result.words, turn, notes, "")
-    why = "is unavailable" if result.status == "unavailable" else result.status
     unused = f"; the {len(result.words)} word(s) it read before that are not used" if result.words else ""
+    if result.status == "spent":
+        return _Reading((), turn, notes, f"{result.reason}: {_spent(options)}{unused}")
+    why = "is unavailable" if result.status == "unavailable" else result.status
     return _Reading((), turn, notes, f"tesseract {why}: {result.reason}{unused}")
+
+
+def _spent(options: VisionOptions) -> str:
+    """Why a page's render or OCR stopped: its budget ran out."""
+    return f"the page's {options.page_budget_s:g} s budget is spent"
 
 
 def _turn(found: Orientation) -> tuple[int, tuple[str, ...]]:
@@ -825,10 +866,11 @@ def fallback_page(
     if ocr == "never":
         never = f"{failed}; ocr='never', so the page is not read by OCR"
         return _error_page(failure.page_number, geometry, _Unread(never))
-    drawn = _drawn(source, geometry, password, options)
+    deadline = time.monotonic() + options.page_budget_s
+    drawn = _drawn(source, geometry, password, options, deadline)
     if drawn.page is None:
         return _error_page(failure.page_number, geometry, _Unread(f"{failed}; {drawn.failure}"))
-    reading = _read(drawn.page, drawn.dpi, geometry, options)
+    reading = _read(drawn.page, drawn.dpi, geometry, options, deadline)
     image = _page_image(drawn.page, drawn.dpi, reading.rotation, geometry, source, password, options)
     if reading.failure:
         why = f"{failed}; OCR could not read the page: {reading.failure}"
