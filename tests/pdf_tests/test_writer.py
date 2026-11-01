@@ -10,6 +10,8 @@ import hashlib
 import json
 import logging
 import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -999,3 +1001,93 @@ class TestWriteBundle:
         with pytest.raises(TypeError, match="output_dir must be a str or os.PathLike, got int"):
             PDFWriter(source_pdf(tmp_path), ocr="never").write_bundle(3)
         assert calls == []
+
+
+# A child process that runs one PDFWriter method (argv: method, pdf, target, signal file), stalled at a point the
+# test kills it in: once the temporary file holds its first write ("fill": each write then sleeps), or once it is
+# complete and about to be renamed onto the target ("rename"). The signal file says the point is reached.
+KILLED_WRITER = """
+import os, sys, time
+from pathlib import Path
+from datagrunt.pdf import writer
+method, pdf, target, signal, stall = sys.argv[1:6]
+if stall == "rename":
+    real_replace = os.replace
+    def replace(src, dst):
+        Path(signal).write_text("complete")
+        time.sleep(60)
+        real_replace(src, dst)
+    writer.os.replace = replace
+else:
+    real_atomic = writer._write_atomically
+    def atomic(path, fill):
+        def stalled(handle):
+            class Slow:
+                def write(self, data):
+                    written = handle.write(data)
+                    handle.flush()
+                    Path(signal).write_text("writing")
+                    time.sleep(1.0)
+                    return written
+            return fill(Slow())
+        return real_atomic(path, stalled)
+    writer._write_atomically = atomic
+getattr(writer.PDFWriter(pdf, ocr="never"), method)(target)
+"""
+
+
+def killed_mid_write(tmp_path: Path, method: str, pdf: Path, target: Path, stall: str) -> None:
+    """Run ``method`` in a child process and kill it (SIGKILL) at ``stall``; fail if it ends first."""
+    signal = tmp_path / "signal"
+    command = [sys.executable, "-c", KILLED_WRITER, method, str(pdf), str(target), str(signal), stall]
+    child = subprocess.Popen(command, cwd=tmp_path)
+    try:
+        deadline = time.monotonic() + 60.0
+        while not signal.exists():
+            assert child.poll() is None, "the writer ended before it was killed"
+            assert time.monotonic() < deadline, "the writer did not reach its stall within 60 s"
+            time.sleep(0.02)
+    finally:
+        child.kill()
+        child.wait(timeout=30)
+    assert child.returncode != 0
+
+
+@pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would slow the child's window
+class TestKilledMidWrite:
+    """A process killed mid-write leaves no partial file: at most its temporary file, beside the target."""
+
+    def test_a_file_killed_mid_fill_is_never_there(self, tmp_path):
+        pdf = text_pdf(tmp_path, pages=3)
+        target = tmp_path / "out" / "doc.jsonl"
+        killed_mid_write(tmp_path, "write_jsonl", pdf, target, "fill")
+        assert not target.exists()
+        [leftover] = temporaries(target.parent)
+        rows = (target.parent / leftover).read_bytes().splitlines()
+        elements = len(PDFWriter(pdf, ocr="never")._extracted().elements)
+        assert 1 <= len(rows) < elements  # it was killed mid-fill
+        # The next write ignores the leftover, the only trace.
+        assert len(PDFWriter(pdf, ocr="never").write_jsonl(target).read_bytes().splitlines()) == elements
+        assert temporaries(target.parent) == [leftover]
+
+    def test_a_file_killed_mid_overwrite_is_the_old_file(self, tmp_path):
+        target = tmp_path / "doc.jsonl"
+        target.write_bytes(b"old\n")
+        killed_mid_write(tmp_path, "write_jsonl", text_pdf(tmp_path, pages=3), target, "fill")
+        assert target.read_bytes() == b"old\n" and len(temporaries(tmp_path)) == 1
+
+    @pytest.mark.parametrize(
+        "method",
+        ["write_json", "write_jsonl", "write_markdown", "write_parquet", "write_csv"],
+    )
+    def test_a_file_killed_before_its_rename_is_never_there(self, tmp_path, method):
+        target = tmp_path / "out" / "doc.out"
+        killed_mid_write(tmp_path, method, text_pdf(tmp_path), target, "rename")
+        assert not target.exists() and len(temporaries(target.parent)) == 1
+
+    @pytest.mark.parametrize(("method", "pdf"), [("extract_images", figures_pdf), ("render_pages_as_images", text_pdf)])
+    def test_a_directorys_file_killed_before_its_rename_is_never_there(self, tmp_path, method, pdf):
+        directory = tmp_path / "out"
+        killed_mid_write(tmp_path, method, pdf(tmp_path), directory, "rename")
+        [leftover] = list(directory.iterdir())
+        assert leftover.name.startswith(".tmp_") and leftover.stat().st_size > 0
