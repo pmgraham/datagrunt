@@ -41,6 +41,7 @@ HiddenReason: TypeAlias = Literal[
     "zero_scale",
     "duplicate",
     "superseded",
+    "unchecked_background",
 ]
 """Why a text span is hidden from a human reader (it is flagged, never dropped).
 
@@ -55,8 +56,12 @@ whose content was read by OCR of the rendered page (a ``"vision"`` page,
 #369): the page went to vision because that layer held too little valid
 text, so the visible elements are OCR's and the layer is kept apart, never
 dropped. Only text with no other reason is superseded: hidden text keeps
-its own reasons. New reasons are appended, so the canonical order of the
-older ones never changes.
+its own reasons. ``unchecked_background`` means the page drew the text where
+a matching background could hide it (its paint is near white, or other
+paint lies under it), but that background could not be checked: the page's
+render was refused or failed (#400). It is flagged, never dropped: a check
+that cannot run fails closed. New reasons are appended, so the canonical
+order of the older ones never changes.
 """
 
 # Canonical order, derived from the Literal so the two can never drift apart.
