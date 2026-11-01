@@ -18,6 +18,7 @@ from typing import get_args
 
 import pytest
 
+from datagrunt.pdf import quality
 from datagrunt.pdf._pdfium_common import union_box
 from datagrunt.pdf.elements import PageQuality
 from datagrunt.pdf.pdfium_engine import (
@@ -29,6 +30,7 @@ from datagrunt.pdf.pdfium_engine import (
     PageText,
     RawPage,
     RawSegment,
+    RawSpan,
     RecoveredSpan,
     RecoveredText,
     RecoveryStats,
@@ -966,6 +968,186 @@ class TestRecoveredPieces:
         recovered = recovery(recovered_span("A"), recovered_span("B"))
 
         assert assess_page(raw_page(letters(24), dropped=1), recovered=recovered).quality.hidden_spans_flagged == 2
+
+
+DUPLICATE_CAP_WARNING = (
+    "{count} recovered piece(s) were not checked for a drawn duplicate: each has over 64 visible pieces "
+    "of the same text on the page; they stay visible"
+)
+# Ink boxes of a visible twin, and the duplicate window (0.9 of a side, 0.5 to 12 pt) a copy of the same size has.
+SQUARE = (20.0, 90.0, 30.0, 100.0)  # "Title" in 2 x 10 pt chars: 9 pt each way.
+WIDE = (20.0, 90.0, 50.0, 100.0)  # 6 x 10 pt chars: 12 pt (the cap) across, 9 pt down.
+TALL = (20.0, 90.0, 50.0, 110.0)  # 6 x 20 pt chars: 12 pt (the cap) each way.
+DOT = (20.0, 90.0, 20.25, 90.25)  # "." in a 0.25 pt box: 0.9 of it is 0.225 pt, so the 0.5 pt floor.
+
+
+def twin(text: str, box, **overrides) -> RawSpan:
+    """A span of ``text`` whose chars fill ``box`` in a row (its tight boxes the same): visible unless overridden."""
+    x0, y0, x1, y1 = box
+    return raw_span(text, row(len(text), x0, y0, width=(x1 - x0) / len(text), height=y1 - y0), **overrides)
+
+
+def drawn_copy(text: str, box, *, reasons=(), **overrides) -> RecoveredSpan:
+    """A recovered span of ``text`` at 11 pt, every char box its object's ink box ``box``, as recovery places it."""
+    span = raw_span(text, (box,) * len(text), **({"object_index": 9} | overrides))
+    return RecoveredSpan(span=span, hidden_reasons=reasons)
+
+
+def shifted(box, dx: float, dy: float):
+    """``box`` moved ``dx`` right and ``dy`` down."""
+    return (box[0] + dx, box[1] + dy, box[2] + dx, box[3] + dy)
+
+
+def copies_read(*spans, copies, unrecovered: int = 0) -> tuple[list, tuple[str, ...]]:
+    """Each recovered piece as ``(text, hidden_reasons)`` on a page of ``spans`` and ``copies``; and the warnings."""
+    result = assess_recovered(*spans, recovered=recovery(*copies, unrecovered=unrecovered))
+    return [(item.text, item.hidden_reasons) for item in result.recovered_pieces], result.warnings
+
+
+def vees(count: int) -> tuple[RawSpan, ...]:
+    """``count`` visible "V" spans, one 6 x 12 pt char each, 25 to a row."""
+    return tuple(raw_span("V", row(1, 10.0 + (at % 25) * 15.0, 10.0 + (at // 25) * 20.0)) for at in range(count))
+
+
+class TestRecoveredDuplicates:
+    """A recovered drawn copy of visible text, drawn on it, is flagged ``duplicate``: a reader reads it once (#406)."""
+
+    @pytest.mark.parametrize(
+        "text,box,dx,dy,flagged",
+        [
+            pytest.param("Title", SQUARE, 0.0, 0.0, True, id="on-it"),
+            pytest.param("Title", SQUARE, 9.0, 0.0, True, id="nine-tenths-right"),
+            pytest.param("Title", SQUARE, -9.0, 0.0, True, id="nine-tenths-left"),
+            pytest.param("Title", SQUARE, 0.0, 9.0, True, id="nine-tenths-down"),
+            pytest.param("Title", SQUARE, 0.0, -9.0, True, id="nine-tenths-up"),
+            pytest.param("Title", SQUARE, 9.0, 9.0, True, id="nine-tenths-each-way"),
+            pytest.param("Title", SQUARE, 9.125, 0.0, False, id="past-nine-tenths-across"),
+            pytest.param("Title", SQUARE, 0.0, -9.125, False, id="past-nine-tenths-down"),
+            pytest.param("Title", WIDE, 12.0, 0.0, True, id="the-cap-across"),
+            pytest.param("Title", WIDE, -12.125, 0.0, False, id="past-the-cap-across"),
+            pytest.param("Title", WIDE, 0.0, 9.0, True, id="down-has-its-own-window"),
+            pytest.param("Title", WIDE, 0.0, 12.0, False, id="the-across-window-is-not-down"),
+            pytest.param("Title", TALL, 0.0, 12.0, True, id="the-cap-down"),
+            pytest.param("Title", TALL, 0.0, 12.125, False, id="past-the-cap-down"),
+            pytest.param(".", DOT, 0.5, -0.5, True, id="the-floor"),
+            pytest.param(".", DOT, 0.515625, 0.0, False, id="past-the-floor-across"),
+            pytest.param(".", DOT, 0.0, 0.515625, False, id="past-the-floor-down"),
+            pytest.param("Title", WIDE, 20.0, 0.0, False, id="20-pt-away"),
+        ],
+    )
+    def test_a_copy_within_its_duplicate_window_of_a_visible_twin_is_a_duplicate(self, text, box, dx, dy, flagged):
+        # The window is recovery's overprint window of the copy's last char box: 0.9 of each side, 0.5 to 12 pt.
+        read, warnings = copies_read(letters(24), twin(text, box), copies=(drawn_copy(text, shifted(box, dx, dy)),))
+
+        assert (read, warnings) == ([(text, ("duplicate",) if flagged else ())], ())
+
+    def test_the_window_is_the_copys(self):
+        # A 20 pt wide copy has a 12 pt window; its 10 pt wide twin's would be 9 pt. Its right edge is 10 pt past.
+        read, _ = copies_read(twin("Title", SQUARE), copies=(drawn_copy("Title", (20.0, 90.0, 40.0, 100.0)),))
+
+        assert read == [("Title", ("duplicate",))]
+
+    def test_every_edge_must_lie_within_the_window(self):
+        # Its left, top and bottom edges are on the twin's; its right edge is 15 pt past it (a 12 pt window).
+        read, _ = copies_read(twin("Title", SQUARE), copies=(drawn_copy("Title", (20.0, 90.0, 45.0, 100.0)),))
+
+        assert read == [("Title", ())]
+
+    def test_the_twins_ink_box_is_compared_not_its_loose_box(self):
+        # A recovered char box is its object's ink (its tight boxes): the twin's ink is (20, 90)-(30, 100), its
+        # loose boxes (advance by the font's height) reach 10 pt above and below it, past the 9 pt window.
+        loose = row(5, 20.0, 80.0, width=2.0, height=30.0)
+        visible = raw_span("Title", loose, tight_boxes=row(5, 20.0, 90.0, width=2.0, height=10.0))
+
+        read, _ = copies_read(visible, copies=(drawn_copy("Title", SQUARE),))
+
+        assert read == [("Title", ("duplicate",))]
+
+    @pytest.mark.parametrize(
+        "reasons,overrides,expected",
+        [
+            pytest.param(("tiny_font",), {}, ("tiny_font",), id="recovered-reason"),
+            pytest.param(("zero_scale",), {}, ("zero_scale",), id="squeezed"),
+            pytest.param((), {"render_mode": 3}, ("invisible",), id="computed-reason"),
+        ],
+    )
+    def test_a_copy_hidden_for_another_reason_is_not_also_a_duplicate(self, reasons, overrides, expected):
+        copy = drawn_copy("Title", SQUARE, reasons=reasons, **overrides)
+
+        read, _ = copies_read(twin("Title", SQUARE), copies=(copy,))
+
+        assert read == [("Title", expected)]
+
+    @pytest.mark.parametrize("hidden", [{"render_mode": 3}, {"font_size_pt": 0.5}], ids=["invisible", "tiny_font"])
+    def test_a_copy_of_hidden_text_stays_visible(self, hidden):
+        # pdfium kept the hidden copy and dropped the drawn one: the drawn copy is the text a reader sees.
+        read, _ = copies_read(letters(24), twin("Title", SQUARE, **hidden), copies=(drawn_copy("Title", SQUARE),))
+
+        assert read == [("Title", ())]
+
+    @pytest.mark.parametrize("text", ["Title ", "title", "TITLE", "Titl", "Title page"])
+    def test_a_copy_of_other_text_stays_visible(self, text):
+        # The texts must be equal: a copy of other text is text a reader reads (recovered unique text included).
+        read, _ = copies_read(twin("Title", SQUARE), copies=(drawn_copy(text, SQUARE),))
+
+        assert read == [(text, ())]
+
+    def test_a_copy_of_part_of_a_visible_piece_stays_visible(self):
+        read, _ = copies_read(twin("Title page", WIDE), copies=(drawn_copy("Title", SQUARE),))
+
+        assert read == [("Title", ())]
+
+    def test_any_visible_twin_within_the_window_counts(self):
+        far = twin("Title", shifted(SQUARE, 200.0, 100.0))
+
+        read, _ = copies_read(far, twin("Title", SQUARE), copies=(drawn_copy("Title", SQUARE),))
+
+        assert read == [("Title", ("duplicate",))]
+
+    def test_each_copy_is_flagged_on_its_own(self):
+        copies = (
+            drawn_copy("Title", SQUARE),
+            drawn_copy("Title", shifted(SQUARE, 0.0, 50.0), object_index=10),
+            drawn_copy("Words", SQUARE, object_index=11),
+        )
+
+        read, _ = copies_read(twin("Title", SQUARE), copies=copies)
+
+        assert read == [("Title", ("duplicate",)), ("Title", ()), ("Words", ())]
+
+    def test_a_duplicate_counts_as_flagged_and_never_routes_the_page(self):
+        result = assess_recovered(letters(24), twin("Title", SQUARE), recovered=recovery(drawn_copy("Title", SQUARE)))
+
+        alone = assess_page(raw_page(letters(24), twin("Title", SQUARE), dropped=1))
+        assert result.quality == dataclasses.replace(alone.quality, hidden_spans_flagged=1)
+        assert (result.route, result.pieces) == (alone.route, alone.pieces)
+
+    def test_the_cap_is_64_visible_pieces_of_the_copys_text(self):
+        assert quality.MAX_DUPLICATE_CANDIDATES == 64
+
+    def test_a_copy_with_64_visible_pieces_of_its_text_is_checked_against_each(self):
+        spans = vees(64)
+
+        read, warnings = copies_read(*spans, copies=(drawn_copy("V", spans[-1].bbox),))
+
+        assert (read, warnings) == ([("V", ("duplicate",))], ())
+
+    def test_past_the_cap_a_copy_stays_visible_with_a_warning(self):
+        # Fail visible: a copy that is not checked is never hidden.
+        spans = vees(65)
+
+        read, warnings = copies_read(*spans, copies=(drawn_copy("V", spans[-1].bbox),))
+
+        assert (read, warnings) == ([("V", ())], (DUPLICATE_CAP_WARNING.format(count=1),))
+
+    def test_the_cap_warning_counts_the_copies_and_follows_the_unrecovered_warning(self):
+        spans = vees(65)
+        copies = (drawn_copy("V", spans[0].bbox), drawn_copy("V", spans[-1].bbox, object_index=10))
+
+        read, warnings = copies_read(*spans, copies=copies, unrecovered=1)
+
+        assert read == [("V", ()), ("V", ())]
+        assert warnings == (UNRECOVERED_WARNING.format(count=1), DUPLICATE_CAP_WARNING.format(count=2))
 
 
 class TestRecoveryIntegration:

@@ -2504,9 +2504,12 @@ class ApartLine:
     """A line of hidden or recovered text, laid out apart from the page's visible text and never mixed with it.
 
     Its pieces all carry its ``hidden_reasons``: hidden pieces of the page's
-    text that share them, or recovered pieces (a copy pdfium dropped though
-    it is drawn has none). It holds no font size: apart text is never
-    classified, and text drawn at ``Tf 0`` has no size to read.
+    text that share them, or recovered pieces. A drawn copy pdfium dropped
+    is ``duplicate`` when it lies on visible text of its own (a shadow or
+    outline title, #406), so it reads once; one of hidden text, or of text
+    the page shows nowhere else, has none: it is visible (A3's notes). It
+    holds no font size: apart text is never classified, and text drawn at
+    ``Tf 0`` has no size to read.
 
     Attributes:
         cells: Its cells along the line, as :class:`TextLine`'s.
