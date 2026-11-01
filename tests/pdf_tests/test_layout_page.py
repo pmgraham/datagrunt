@@ -4,16 +4,20 @@ Unit tests build SpanPiece and LatticeTable values directly: boxes are
 displayed, top-left ``(x0, y0, x1, y1)`` points.
 """
 
+import ast
 import dataclasses
+import inspect
 import pickle
 import time
 
 import pytest
 
-from datagrunt.pdf import layout
+from datagrunt.pdf import assembly, layout
 from datagrunt.pdf.layout import FigureSlot, LatticeResult, LatticeTable, PageLayout, StreamParagraph, page_layout
 from pdf_tests.test_layout_apart import LEFT, RIGHT, column_of, hidden
 from pdf_tests.test_layout_lattice import box, cell, chars
+from pdf_tests.test_layout_stream import block, line
+from pdf_tests.test_layout_stream import cell as text_cell
 
 NO_TABLES = LatticeResult(tables=(), used_pieces=())
 W, H = 400.0, 300.0
@@ -265,6 +269,16 @@ class TestUnits:
             "2 pairs, over the bound of 1",
         )
 
+    def test_a_unit_is_placed_once_when_a_structure_starts_above_the_paragraph_before_it(self):
+        # A structure is placed by its ink, a paragraph by its loose box, so the two tops can run back a little.
+        paragraph = block(line(text_cell("Body", 10.0, 50.0)))
+        structure = layout._Rows(rows=(line(text_cell("Row", 10.0, 40.0)),), items=())
+        unit = FigureSlot(index=0, bbox=box(10.0, 45.0, 20.0, 46.0))
+
+        slots = layout._with_units([[paragraph], structure], [(45.0, unit)], 0)
+
+        assert slots == [unit, [paragraph], structure]
+
     def test_figures_must_be_a_tuple_of_boxes(self):
         with pytest.raises(TypeError, match="figures"):
             page_layout((), (), NO_TABLES, width_pt=W, height_pt=H, figures=[box(0.0, 0.0, 1.0, 1.0)])
@@ -273,3 +287,37 @@ class TestUnits:
         slot, ruling = FigureSlot(index=0, bbox=box(0.0, 0.0, 1.0, 1.0)), ruled(0.0, 0.0, 20.0, 20.0)
 
         assert PageLayout(items=(slot, ruling), warnings=()).items == (slot, ruling)
+
+
+# Statements that open a block of control flow: each one inside another nests a level deeper.
+BLOCKS = (ast.For, ast.AsyncFor, ast.While, ast.If, ast.With, ast.AsyncWith, ast.Try, ast.Match)
+
+
+def nesting(node: ast.AST, level: int = 0) -> int:
+    """The deepest nesting of control-flow blocks under ``node``: an ``elif`` is its ``if``'s level, not one deeper."""
+    deepest = level
+    for field, value in ast.iter_fields(node):
+        children = value if isinstance(value, list) else [value]
+        for child in children:
+            if not isinstance(child, ast.AST) or isinstance(child, (ast.FunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            elif_ = isinstance(node, ast.If) and field == "orelse" and len(children) == 1 and isinstance(child, ast.If)
+            deepest = max(deepest, nesting(child, level + (isinstance(child, BLOCKS) and not elif_)))
+    return deepest
+
+
+class TestNesting:
+    """Flat flow (the clean-code canon): no function of the layout or the assembly nests over 3 blocks."""
+
+    @pytest.mark.parametrize("module", [layout, assembly], ids=lambda module: module.__name__)
+    def test_no_function_nests_over_3_blocks(self, module):
+        tree = ast.parse(inspect.getsource(module))
+        functions = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]
+
+        assert {node.name: nesting(node) for node in functions if nesting(node) > 3} == {}
+
+    def test_the_measure_counts_blocks_in_blocks_and_not_elif(self):
+        flat = ast.parse("def f():\n    if a:\n        pass\n    elif b:\n        pass\n    elif c:\n        pass\n")
+        deep = ast.parse("def f():\n for a in b:\n  for c in d:\n   while e:\n    if f:\n     pass\n")
+
+        assert (nesting(flat.body[0]), nesting(deep.body[0])) == (1, 4)

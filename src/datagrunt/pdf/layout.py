@@ -2454,29 +2454,34 @@ def _with_units(slots: list[list[TextBlock] | _Rows], units: list[tuple[float, _
     """``slots`` (paragraph runs and structures, top to bottom) with each unit before the first that starts below it.
 
     ``units`` come as ``(top, unit)``, sorted by top; a run of paragraphs
-    is split where a unit falls between two of them.
+    is split where a unit falls between two of them. O(s + u log u).
     """
+    tops = [top for top, _ in units]
     out: list[_Slot] = []
-    queue = units[::-1]
+    at = 0
     for slot in slots:
-        blocks: list[TextBlock | _Rows] = list(slot) if isinstance(slot, list) else [slot]
         run: list[TextBlock] = []
-        for block in blocks:
-            first = block.lines[0] if isinstance(block, TextBlock) else block.rows[0]
-            top = _turned(_plain(first.bbox), turn)[1]
-            while queue and queue[-1][0] < top:
-                if run:
-                    out.append(run)
-                    run = []
-                out.append(queue.pop()[1])
+        for block in slot if isinstance(slot, list) else [slot]:
+            above = max(at, bisect_left(tops, _block_top(block, turn)))
+            if above > at and run:
+                out.append(run)
+                run = []
+            out.extend(unit for _, unit in units[at:above])
+            at = above
             if isinstance(block, TextBlock):
                 run.append(block)
             else:
                 out.append(block)
         if run:
             out.append(run)
-    out.extend(unit for _, unit in reversed(queue))
+    out.extend(unit for _, unit in units[at:])
     return out
+
+
+def _block_top(block: TextBlock | _Rows, turn: int) -> float:
+    """Where a paragraph or a structure starts, in the frame of the page's ``turn``: its first line's top."""
+    first = block.lines[0] if isinstance(block, TextBlock) else block.rows[0]
+    return _turned(_plain(first.bbox), turn)[1]
 
 
 # Hidden and recovered text, and the page's reading order (A4b group 3).
