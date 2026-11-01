@@ -228,6 +228,18 @@ class TestOcrPieces:
 
         assert [piece.span.font_size_pt for piece in found] == sizes
 
+    def test_a_zero_confidence_word_is_sized_apart_from_its_lines_other_words(self):
+        # tesseract put art read as letters (confidence 0) on a word's line (Root's Law p. 20: "wx Wible,").
+        words = (
+            word("wx", 10.0, 20.0, 30.0, 27.0, line=1),
+            word("Wible,", 40.0, 0.0, 50.0, 51.0, confidence=0.0, line=1),
+        )
+
+        found = ocr_pieces(words)
+
+        # "wx" alone: x-height letters, 7 x 3/2; with "Wible," (51, one-sided) their median would be 30.75.
+        assert [piece.span.font_size_pt for piece in found] == [10.5, 51.0]
+
     def test_a_word_with_no_height_has_the_least_size_a_line_reads(self):
         (found,) = ocr_pieces((word("rule", 10.0, 20.0, 40.0, 20.0),))
 
@@ -308,6 +320,25 @@ class TestVisionElements:
 
     def test_no_words_no_elements(self):
         assert vision_elements((), geometry=GEOMETRY) == VisionElements(elements=(), warnings=())
+
+    def test_a_zero_confidence_word_is_kept_visible_apart_and_joins_no_line(self):
+        # Art read as one tall word of confidence 0 (Root's Law p. 1: a column of digits read as "PPWWNHD") beside a
+        # paragraph's two lines: laid out with them, it would make one line of both. It reads apart, before the
+        # paragraph (its top is higher), as visible text: kept, never dropped, and every char in an element once.
+        words = (
+            *line_words("The woodland is vast", 72.0, 100.0),
+            *line_words("and its creatures many", 72.0, 112.0),
+            word("PPWWNHD", 200.0, 95.0, 207.0, 140.0, confidence=0.0),
+        )
+
+        found = vision_elements(words, geometry=GEOMETRY)
+
+        assert [(type(element).__name__, element.text, element.hidden_reasons) for element in found.elements] == [
+            ("Paragraph", "PPWWNHD", ()),
+            ("Paragraph", "The woodland is vast and its creatures many", ()),
+        ]
+        assert found.warnings == ()
+        assert conservation(ocr_pieces(words), found.elements) == (True, ())
 
     def test_lines_of_tall_or_short_words_are_body_text_and_a_larger_line_of_capitals_its_heading(self):
         # Ink boxes as OCR draws them (#416): on a 10 pt body, words of x-height letters only are 4.67 pt tall,

@@ -17,6 +17,22 @@ visible piece of a synthetic span of its own (:func:`ocr_pieces`):
   wide; not bold, not italic, painted (render mode 0, opaque black), with
   no hidden reason.
 
+A word tesseract read with a confidence of 0 is, as a rule, art read as
+letters: on A5b's 10 sample pages, 22 of 3,595 words, such as a column of
+page numbers read as "PPWWNHD" in a 48 pt box, or bracketed icons read as
+"[@],"; three are a digital word ("a", "of", "Omega"). It is kept and
+visible, but laid out apart (#416): :func:`vision_elements` passes it to
+the layout with the recovered text, so it reads as a line of its own (an
+``ApartLine`` with no hidden reason: a visible paragraph) placed among
+the page's items by position, and :func:`ocr_pieces` sizes it apart from
+its line's other words. So it never joins a line of the page's text: laid
+out with it, "PPWWNHD" ran Root's Law p. 1's two contents columns into
+one line, glued at its em ("VictoryGoldenKeyKey..."), and the page's
+elements recalled 31.0 % of its digital words; apart, 85.1 % (its OCR
+words 86.2 %). Capping its box's height to the page's median size
+instead recalls as much (80.7 % pooled for both) but still joins it to a
+line, and boxes it smaller than its ink.
+
 A word's box runs from its highest ink to its lowest, so its height is
 not its font's: a word of x-height letters ("over") is shorter than one
 reaching the ascender or cap height ("the", "FACTION") or the descender
@@ -33,10 +49,12 @@ reaching the ascender or cap height ("the", "FACTION") or the descender
 
 So a line's words share one size, and lines compare by the size of their
 type, not by their words' mix of ascenders and descenders. On Root's Law
-pages 5, 10 and 20, OCR finds 7, 5 and 8 headings where the digital text
-has 6, 5 and 7: every digital heading, and on pages 5 and 20 one
-zero-confidence misread. Sized by each word's own box it found 17, 16 and
-18. Other rules tried, on the same pages:
+pages 5, 10 and 20, OCR finds 6, 5 and 8 headings where the digital text
+has 6, 5 and 7: every digital heading, and on page 20 art read as "wx".
+Sized by each word's own box, it found 17, 16 and 18. Each rule below
+was measured with the seams' fragments dropped, before words of no
+confidence were laid apart (the scaled median parted, so: 7, 5 and 8, a
+misread of art on pages 5 and 20). Other rules tried, on the same pages:
 
 - a line's own height (tesseract's line box, its tallest word, or its
   words' span) finds 8 or 9, 0, and 2 to 5: capitals set larger than the
@@ -106,15 +124,15 @@ default 612 x 792 pt, with a warning.
 
 Known limitations (A5b evidence: 10 corpus pages forced to OCR):
 
-- What a word's glyphs reach is read from its text by Latin letters,
-  digits and brackets only: a word of other letters (another script,
-  or accented letters with no plain one beside them) is taken as one-sided.
-- OCR's misreads reach the layout. A column of digits read as one tall
-  word (confidence 0) runs the lines beside it together. Every char is
-  still read once (Pass C), but the elements' words recall 77.2 % of the
-  digital words where the OCR words themselves recall 84.4 %. (A band
-  seam's cut fragments, which glued onto the line's words, "nominalpiii",
-  are dropped by :func:`~datagrunt.pdf.ocr.ocr_words`, #416.)
+- What a word's glyphs reach is read from its plain Latin letters, digits
+  and brackets only: other chars (another script, accents, cedillas)
+  count for nothing, so a word of them alone is taken as one-sided, and
+  "ça" as x-height only.
+- OCR's misreads reach the layout: only words of no confidence are laid
+  out apart. Every char is still read once (Pass C), but the elements'
+  words recall 80.7 % of the digital words where the OCR words themselves
+  recall 84.4 % (#416; 75.2 % and 84.5 % before it dropped the band seams'
+  fragments, sized words by their lines and laid art apart).
 """
 
 import dataclasses
@@ -245,14 +263,20 @@ def _word_sizes(words: tuple[OCRWord, ...]) -> dict[int, float]:
     :func:`_reach_scale`, and at least :data:`LEAST_SIZE_PT`.
     """
     scaled = [(item.bbox.y1 - item.bbox.y0) * _reach_scale(item.text) for item in words]
-    lines: dict[int, list[int]] = {}
+    # A line's words of no confidence are sized apart from its others, as they are laid out apart.
+    lines: dict[tuple[int, bool], list[int]] = {}
     for index, item in enumerate(words):
-        lines.setdefault(item.line, []).append(index)
+        lines.setdefault((item.line, _no_confidence(item)), []).append(index)
     sizes: dict[int, float] = {}
     for members in lines.values():
         for part in _line_parts(words, scaled, members):
             sizes.update(dict.fromkeys(part, max(statistics.median(scaled[index] for index in part), LEAST_SIZE_PT)))
     return sizes
+
+
+def _no_confidence(word: OCRWord) -> bool:
+    """True if tesseract read ``word`` with a confidence of 0: art read as letters, as a rule (module notes)."""
+    return word.confidence == 0.0
 
 
 def _line_parts(words: tuple[OCRWord, ...], scaled: list[float], members: list[int]) -> list[list[int]]:
@@ -335,7 +359,9 @@ def vision_elements(
     ``rotation`` (its words upright, so their lines read in order whatever
     the page's turn); each element's box is then mapped back to the page as
     displayed, and a turned page's table has no column centres (A6 links
-    only columns along the displayed x). A figure keeps its own box.
+    only columns along the displayed x). A figure keeps its own box. A word
+    of no confidence reads apart from the others, as visible text of its
+    own (see the module notes).
 
     Args:
         words: The page's OCR words (``OCRResult.words``), on the displayed page.
@@ -360,13 +386,17 @@ def vision_elements(
     _check_hidden("apart", apart)
     _check_hidden("recovered", recovered)
     typed_tuple("figures", figures, FigureDraft)
-    read = ocr_pieces(tuple(_righted_word(item, frame) for item in words))
+    righted = tuple(_righted_word(item, frame) for item in words)
+    read = ocr_pieces(righted)
+    art = tuple(piece for piece, item in zip(read, righted) if _no_confidence(item))
+    text = tuple(piece for piece, item in zip(read, righted) if not _no_confidence(item))
     spans: dict[int, RawSpan] = {}
     kept = tuple(_righted_piece(piece, frame, spans) for piece in apart)
     copies = tuple(_righted_piece(piece, frame, spans) for piece in recovered)
     width, height = frame.righted_size
     slots = tuple(_bbox(frame.righted(_box(draft.bbox))) for draft in figures)
-    layout = page_layout((*read, *kept), copies, _NO_LATTICE, width_pt=width, height_pt=height, figures=slots)
+    # Words of no confidence go with the recovered text: laid out apart, as lines of their own (visible: no reason).
+    layout = page_layout((*text, *kept), (*copies, *art), _NO_LATTICE, width_pt=width, height_pt=height, figures=slots)
     elements = tuple(_displayed(element, frame) for element in page_elements(layout.items, figures, geometry))
     _, mismatch = conservation((*read, *kept, *copies), elements)
     return VisionElements(elements=elements, warnings=(*layout.warnings, *mismatch))
