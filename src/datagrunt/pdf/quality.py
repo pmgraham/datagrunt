@@ -774,8 +774,10 @@ def needs_background(page: RawPage, assessment: PageAssessment) -> bool:
 
     True when a visible piece of ``assessment`` (page or recovered) that
     paints (render mode not 3 or 7) has a paint under MATCH_DISTANCE of
-    white, or overlaps (with area) a fill A2 reads or an image of ``page``.
-    Cost: O(segments) for the fills, then O(pieces x (fills + images)).
+    white, or overlaps (with area) any non-text page object of ``page``
+    (A2's ``object_boxes``: paths, images, shadings, forms), or when an
+    object's box cannot be read (fail closed). Cost: O(objects) to band the
+    boxes, then O(pieces x boxes in their bands), within MAX_GATE_CHECKS.
 
     Raises:
         TypeError: If ``page`` is not a RawPage or ``assessment`` not a PageAssessment.
