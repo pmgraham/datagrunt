@@ -19,8 +19,8 @@ The writer holds no open file, handle or process between calls (extraction
 and every render close theirs before returning), so there is nothing to
 close.
 
-Each method writes the document as one format and returns the absolute
-path written (``Path.absolute()``: symlinks are not resolved):
+Each method writes the document in one form. A path returned is absolute
+(``Path.absolute()``: symlinks are not resolved):
 
 - :meth:`PDFWriter.write_json`: the codec's document JSON
   (:func:`~datagrunt.pdf.codec.document_to_json_bytes`: ASCII, lossless,
@@ -29,8 +29,9 @@ path written (``Path.absolute()``: symlinks are not resolved):
   of A7a's frame (:func:`~datagrunt.pdf.frame.element_frame`), in document
   order: its columns in order, ``bbox`` an object, ``scope_path`` and
   ``hidden_reasons`` arrays. Compact UTF-8 JSON, each line ending in a
-  newline; no element is an empty file. The frame's strings hold each lone
-  surrogate as its escape (``\\ud800``): the JSON is the lossless form.
+  newline; a document without elements is an empty file. The frame's
+  strings hold each lone surrogate as its escape (``\\ud800``): the JSON is
+  the lossless form.
 - :meth:`PDFWriter.write_markdown`: the document's ``to_markdown()``, UTF-8,
   each lone surrogate written as its escape (as the bundle's Markdown).
   Hidden elements stay behind their ``<!-- hidden: ... -->`` markers (A1).
@@ -96,9 +97,9 @@ are created. Nothing outside them is written.
 Every path is checked before any work: a str or os.PathLike of str (bytes
 are refused); a file target that is a directory raises
 ``IsADirectoryError`` (checked again as the file is written), and an
-``output_dir`` that exists and is not a directory ``NotADirectoryError``. No ``fsync``
-before the rename (as the bundle): a write survives a killed process, not a
-power loss.
+``output_dir`` that exists and is not a directory raises
+``NotADirectoryError``. No ``fsync`` before the rename (as the bundle): a
+write survives a killed process, not a power loss.
 """
 
 import errno
@@ -304,11 +305,12 @@ class PDFWriter:
             The document with its bundle paths set, as :func:`~datagrunt.pdf.bundle.write_bundle` returns it.
 
         Raises:
-            ValueError: If the writer was built from a PDFDocument (before any work); as the bundle raises it.
+            ValueError: If the writer was built from a PDFDocument (before any work), or the source no
+                longer hashes to the document's sha256 (it changed since it was extracted).
             TypeError: If ``output_dir`` is not a path (before any work).
             FileExistsError: If ``output_dir`` exists and is not an empty directory (before any work, and after).
             FileNotFoundError: If ``output_dir``'s parent is missing (before any work).
-            PDFSourceChangedError: If the source changed since it was extracted, or while it is bundled.
+            PDFSourceChangedError: If the source changes while it is bundled: nothing is published.
         """
         source = self._required_source("write_bundle")
         _checked_target(output_dir)

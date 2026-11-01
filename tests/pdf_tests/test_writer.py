@@ -982,6 +982,16 @@ class TestWriteBundle:
         made.render_pages_as_images(tmp_path / "pages")
         assert len(calls) == 1
 
+    def test_a_source_changed_since_its_extraction_is_refused(self, tmp_path, monkeypatch):
+        spied_renders(monkeypatch)
+        source = source_pdf(tmp_path)
+        made = PDFWriter(source, ocr="never", dpi=72)
+        made._extracted()
+        text_pdf(tmp_path, name=source.name)  # rewrites the source in place
+        with pytest.raises(ValueError, match="not the document's"):
+            made.write_bundle(tmp_path / "out")
+        assert not (tmp_path / "out").exists()
+
     def test_a_writer_of_a_document_has_no_pdf_to_bundle(self, tmp_path):
         with pytest.raises(ValueError, match="write_bundle needs the source PDF: this writer was built"):
             PDFWriter(rich_document()).write_bundle(tmp_path / "out")
