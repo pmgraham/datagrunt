@@ -85,6 +85,7 @@ from typing import IO, NamedTuple
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 
+from datagrunt.pdf._process import REAP_TIMEOUT_S, close_pipes, reaped, stderr_tail
 from datagrunt.pdf._validate import int_at_least, positive_float
 from datagrunt.pdf.exceptions import DatagruntPDFError
 from datagrunt.pdf.pdfium_engine import (
@@ -117,14 +118,12 @@ _LENGTH = struct.Struct("<Q")
 _PIXEL_SIZE = struct.Struct("<QQ")
 _MAX_STATUS_BYTES = 1 << 20
 _MAX_REQUEST_BYTES = 1 << 20  # the JSON request on the worker's stdin
-_MAX_STDERR_TAIL = 4096
 
 # A worker's exit codes: it reached its memory cap; its watchdog outlived its
 # own deadline (the parent's timeout, which starts first, kills it before).
 _CAP_EXIT = 86
 _DEADLINE_EXIT = 87
 
-_REAP_TIMEOUT_S = 5.0  # a worker that replied, or was killed, is reaped within this
 _EXIT_GRACE_S = 1.0  # a worker that closed its pipe without a reply is given this to exit
 _WATCH_INTERVAL_S = 0.005
 _MAX_PROC_FILE_BYTES = 1 << 16  # /proc/self/status is ~1.5 KB
@@ -405,8 +404,8 @@ def render_page(
         try:
             reply, timed_out, exitcode = _supervised(worker, payload, request.memory_cap_bytes, deadline)
         finally:
-            _close_pipes(worker)
-        tail = "" if reply is not None else _stderr_tail(errors)
+            close_pipes(worker)
+        tail = "" if reply is not None else stderr_tail(errors)
     return _outcome(reply, timed_out, exitcode, request, tail)
 
 
@@ -435,13 +434,6 @@ def _started(command: list[str], errors: IO[bytes], where: str) -> "subprocess.P
         raise RenderFailed(f"{where}: cannot start a render worker: {exc}") from exc
 
 
-def _close_pipes(worker: "subprocess.Popen[bytes]") -> None:
-    """Close the parent's ends of the worker's stdin and stdout."""
-    for pipe in (worker.stdin, worker.stdout):
-        if pipe is not None:
-            pipe.close()
-
-
 def _supervised(
     worker: "subprocess.Popen[bytes]", payload: bytes, memory_cap_bytes: int, deadline: float
 ) -> tuple[_Reply | None, bool, int | None]:
@@ -461,22 +453,10 @@ def _supervised(
     finally:
         # Cancelled and joined before the worker is reaped: a kill never reaches a reaped (reusable) pid.
         killer.cancel()
-        killer.join(_REAP_TIMEOUT_S)
+        killer.join(REAP_TIMEOUT_S)
         timed_out = reply is None and time.monotonic() >= deadline
-        exitcode = _reaped(worker, _REAP_TIMEOUT_S if reply is not None else 0.0 if timed_out else _EXIT_GRACE_S)
+        exitcode = reaped(worker, REAP_TIMEOUT_S if reply is not None else 0.0 if timed_out else _EXIT_GRACE_S)
     return reply, timed_out, exitcode
-
-
-def _reaped(worker: "subprocess.Popen[bytes]", wait_s: float) -> int | None:
-    """Give the worker ``wait_s`` seconds to exit, kill it if it has not, reap it; its exit code (None: unreaped)."""
-    try:
-        return worker.wait(wait_s)
-    except subprocess.TimeoutExpired:
-        worker.kill()
-    try:
-        return worker.wait(_REAP_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        return None
 
 
 def _exchange(
@@ -549,23 +529,12 @@ def _pixel_size(header: bytes, memory_cap_bytes: int) -> tuple[int, int] | str:
     return width, height
 
 
-def _stderr_tail(errors: IO[bytes]) -> str:
-    """The last ``_MAX_STDERR_TAIL`` bytes the worker wrote to its stderr, as text."""
-    end = errors.seek(0, os.SEEK_END)
-    errors.seek(max(0, end - _MAX_STDERR_TAIL))
-    return errors.read(_MAX_STDERR_TAIL).decode("utf-8", errors="backslashreplace").strip()
-
-
-def _outcome(
-    reply: _Reply | None, timed_out: bool, exitcode: int | None, request: _Request, stderr_tail: str
-) -> RenderedPage:
+def _outcome(reply: _Reply | None, timed_out: bool, exitcode: int | None, request: _Request, tail: str) -> RenderedPage:
     """The rendered page, or the RenderRefused / RenderFailed the worker's ending makes."""
     where = f"{request.source}: page {request.page_index + 1}"
     if reply is None:
         ending = _ending(exitcode, timed_out, request)
-        raise RenderFailed(
-            f"{where}: {ending}; its stderr ends: {stderr_tail}" if stderr_tail else f"{where}: {ending}"
-        )
+        raise RenderFailed(f"{where}: {ending}; its stderr ends: {tail}" if tail else f"{where}: {ending}")
     if reply.page is not None:
         return reply.page
     if reply.kind == _REFUSED:
