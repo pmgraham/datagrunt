@@ -17,7 +17,15 @@ from pathlib import Path
 import pytest
 
 from datagrunt.pdf import assembly, layout
-from datagrunt.pdf.assembly import FigureDraft, PageFigures, assemble_page, page_figures, pass_c
+from datagrunt.pdf.assembly import (
+    FigureDraft,
+    PageFigures,
+    assemble_page,
+    conservation,
+    page_elements,
+    page_figures,
+    pass_c,
+)
 from datagrunt.pdf.elements import BBox, Figure, Page, PageQuality, Paragraph, Table
 from datagrunt.pdf.layout import (
     MAX_CROSSINGS,
@@ -748,6 +756,41 @@ class TestPassC:
         assert page.warnings[-1].endswith(": 8 missing, 0 extra")
 
 
+class TestPageElements:
+    """page_elements converts layout items to A1 elements (assemble_page's step 3, shared with A5b's vision route)."""
+
+    def test_is_assemble_pages_conversion(self, tmp_path):
+        path = letter(tmp_path, *mixed_items())
+        raw, assessment, lattice = inputs(path)
+        figures = page_figures(raw.images, raw.geometry, source=path)
+        found = layout.page_layout(
+            assessment.pieces,
+            assessment.recovered_pieces,
+            lattice,
+            width_pt=raw.geometry.width_pt,
+            height_pt=raw.geometry.height_pt,
+            figures=tuple(draft.bbox for draft in figures.drafts),
+        )
+
+        elements = page_elements(found.items, figures.drafts, raw.geometry)
+
+        assert elements == assemble_page(raw, assessment, lattice, source=path).elements
+
+    def test_rejects_wrong_arguments(self):
+        slot = layout.FigureSlot(index=0, bbox=BBox(x0=60.0, y0=40.0, x1=180.0, y1=120.0))
+
+        with pytest.raises(TypeError, match="items"):
+            page_elements([], (), GEOMETRY)
+        with pytest.raises(TypeError, match=r"items\[0\]"):
+            page_elements(("text",), (), GEOMETRY)
+        with pytest.raises(TypeError, match="drafts"):
+            page_elements((), (None,), GEOMETRY)
+        with pytest.raises(TypeError, match="geometry"):
+            page_elements((), (), None)
+        with pytest.raises(ValueError, match="items\\[0\\] is figure 0, but there are 0 figure drafts"):
+            page_elements((slot,), (), GEOMETRY)
+
+
 class TestAssemblePageArguments:
     """assemble_page checks its arguments at its boundary."""
 
@@ -788,6 +831,28 @@ class TestAssemblePageArguments:
             pass_c(assessment, ("text",))
         with pytest.raises(TypeError, match="elements"):
             pass_c(assessment, [])
+
+    def test_pass_c_is_the_conservation_of_every_piece(self, tmp_path):
+        # A5b's vision route checks its own pieces (OCR words and the digital text kept apart) with the same rule.
+        path = tiny_text_page(tmp_path)
+        raw, assessment, lattice = inputs(path)
+        elements = assemble_page(raw, assessment, lattice, source=path).elements
+        every = (*assessment.pieces, *assessment.recovered_pieces)
+
+        assert conservation(every, elements) == pass_c(assessment, elements) == (True, ())
+        assert conservation(assessment.pieces, elements) == pass_c(
+            dataclasses.replace(assessment, recovered_pieces=()), elements
+        )
+
+    def test_conservation_checks_its_arguments(self, tmp_path):
+        raw, assessment, _ = inputs(letter(tmp_path, *body_text(100.0)))
+
+        with pytest.raises(TypeError, match="pieces"):
+            conservation(list(assessment.pieces), ())
+        with pytest.raises(TypeError, match=r"pieces\[0\]"):
+            conservation(("text",), ())
+        with pytest.raises(TypeError, match=r"elements\[0\]"):
+            conservation(assessment.pieces, ("text",))
 
     def test_a_ruled_table_reaching_past_the_page_is_clipped_to_it(self, tmp_path):
         path = letter(tmp_path, *body_text(100.0))
