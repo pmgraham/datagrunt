@@ -4,16 +4,21 @@ Internal: not exported from ``datagrunt`` or ``datagrunt.pdf`` until the
 5.0 flip (#373).
 
 :class:`PDFWriter` takes a source PDF's path or a
-:class:`~datagrunt.pdf.elements.PDFDocument`. Its construction checks are
-A8a's (:class:`~datagrunt.pdf.pipeline.PipelineOptions`,
-:class:`~datagrunt.pdf.pipeline.PDFSource`), and run before any work: a
-bad option, password or source type raises, and no file is read. A path is
-made absolute at construction (a later ``chdir`` cannot redirect it); the
-file is first read when a method needs the document, which is then
-extracted (A8a's :func:`~datagrunt.pdf.pipeline.extract_document`, with the
-writer's options) and cached for the writer's life. A failed extraction is
-not cached: the next call extracts again. A document given as the source is
-the document, never extracted.
+:class:`~datagrunt.pdf.elements.PDFDocument`. Its construction checks run
+before any work, in order: A8a's (:class:`~datagrunt.pdf.pipeline.PipelineOptions`;
+the source's type and the password, as
+:class:`~datagrunt.pdf.pipeline.PDFSource` checks them), then, for a path,
+the file itself (spec invariant 1), by the check A8b's ``PDFReader`` shares
+(:func:`~datagrunt.pdf._source.checked_pdf_file`): a missing path raises
+``FileNotFoundError``; one that is not a regular file, or has no PDF header
+where pdfium looks for one, ``ValueError``. That check reads at most the
+file's first 1028 bytes and closes it. A path is made absolute at
+construction (a later ``chdir`` cannot redirect it). The document stays
+lazy: it is extracted when a method first needs it (A8a's
+:func:`~datagrunt.pdf.pipeline.extract_document`, with the writer's
+options) and cached for the writer's life. A failed extraction is not
+cached: the next call extracts again. A document given as the source is the
+document, never extracted, and no file is checked.
 
 The writer holds no open file, handle or process between calls (extraction
 and every render close theirs before returning), so there is nothing to
@@ -115,6 +120,7 @@ from typing import Any, BinaryIO
 import polars as pl
 from PIL import Image
 
+from datagrunt.pdf._source import checked_pdf_file
 from datagrunt.pdf._validate import int_at_least, strict_bool
 from datagrunt.pdf.assembly import MIN_IMAGE_DIMENSION
 from datagrunt.pdf.bundle import _checked_target, _chunks, _drawn, _png, write_bundle
@@ -151,8 +157,10 @@ class PDFWriter:
     Raises:
         TypeError: If ``source`` is not a path or a PDFDocument, or an option
             or ``password`` is of the wrong type.
-        ValueError: If an option is out of range (spec invariant 2), or
-            ``password`` holds NUL.
+        ValueError: If an option is out of range (spec invariant 2),
+            ``password`` holds NUL, or the source path is not a regular file
+            or not a PDF (spec invariant 1).
+        FileNotFoundError: If the source path does not exist (spec invariant 1).
     """
 
     def __init__(
@@ -348,13 +356,15 @@ class PDFWriter:
 
 
 def _checked_source(source: object, password: object) -> tuple[PDFSource | None, PDFDocument | None]:
-    """The writer's source PDF (path made absolute) or its document: exactly one is None."""
+    """The writer's source PDF (path made absolute, its file checked) or its document: exactly one is None."""
     if isinstance(source, PDFDocument):
         _checked_password(password)
         return None, source
     if not isinstance(source, (str, os.PathLike)):
         raise TypeError(f"source must be a str, os.PathLike or PDFDocument, got {type(source).__name__}")
-    return PDFSource(path=_checked_path(source, "source"), password=_checked_password(password)), None
+    path = _checked_path(source, "source").absolute()
+    checked = _checked_password(password)
+    return PDFSource(path=checked_pdf_file(path, "source"), password=checked), None
 
 
 def _extract(source: PDFSource, options: PipelineOptions) -> PDFDocument:

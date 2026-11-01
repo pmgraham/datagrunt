@@ -63,6 +63,19 @@ def text_pdf(directory: Path, name: str = "report.pdf", pages: int = 2) -> Path:
     return build_pdf(directory / name, specs)
 
 
+def spy_checked(monkeypatch) -> list:
+    """Record each call of the writer's source-file check (its path and argument name), and let it run."""
+    calls: list = []
+    real = writer.checked_pdf_file
+
+    def spy(path, name):
+        calls.append((path, name))
+        return real(path, name)
+
+    monkeypatch.setattr(writer, "checked_pdf_file", spy)
+    return calls
+
+
 def spy_extract(monkeypatch, outcome=None) -> list:
     """Record each call of the writer's extract_document (its path and options); run it, or return/raise ``outcome``."""
     calls: list = []
@@ -122,15 +135,63 @@ class TestConstruction:
         with pytest.raises(TypeError, match="source must be a str or os.PathLike, got a bytes path"):
             PDFWriter(BytesPath())
 
-    def test_construction_reads_no_file(self, tmp_path, monkeypatch):
-        calls = spy_extract(monkeypatch)
-        PDFWriter(tmp_path / "missing.pdf")
-        assert calls == []
+    def test_construction_checks_the_file_but_extracts_nothing(self, tmp_path, monkeypatch):
+        calls, checked = spy_extract(monkeypatch), spy_checked(monkeypatch)
+        path = text_pdf(tmp_path)
+        PDFWriter(path)
+        assert checked == [(path, "source")] and calls == []
 
-    def test_a_missing_source_fails_on_first_use(self, tmp_path):
-        made = PDFWriter(tmp_path / "missing.pdf")
-        with pytest.raises(FileNotFoundError):
-            made._extracted()
+    def test_a_document_source_checks_no_file(self, monkeypatch):
+        checked = spy_checked(monkeypatch)
+        PDFWriter(rich_document())
+        assert checked == []
+
+    def test_a_missing_source_is_refused_at_construction(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="source does not exist") as caught:
+            PDFWriter(tmp_path / "missing.pdf")
+        assert caught.value.filename == str(tmp_path / "missing.pdf")
+
+    @pytest.mark.parametrize(
+        ("content", "error", "message"),
+        [
+            (None, ValueError, "source is not a regular file"),
+            (b"name,qty\nbolt,4\n", ValueError, "source is not a PDF: no %PDF header"),
+            (b"", ValueError, "source is not a PDF: no %PDF header"),
+        ],
+    )
+    def test_a_source_that_is_not_a_pdf_file_is_refused_at_construction(self, tmp_path, content, error, message):
+        path = tmp_path / "doc.pdf"
+        if content is None:
+            path.mkdir()
+        else:
+            path.write_bytes(content)
+        with pytest.raises(error, match=message):
+            PDFWriter(path)
+
+    def test_a_pdf_after_leading_junk_that_pdfium_reads_is_accepted(self, tmp_path):
+        path = tmp_path / "junk.pdf"
+        path.write_bytes(b"x" * 1024 + text_pdf(tmp_path).read_bytes())
+        assert "Page 1" in PDFWriter(path, ocr="never")._extracted().to_markdown()
+
+    @pytest.mark.parametrize(
+        ("options", "error", "message"),
+        [
+            ({"dpi": 35}, ValueError, "dpi must be >= 36"),
+            ({"password": 5}, TypeError, "password must be a str or None, got int"),
+        ],
+    )
+    def test_options_and_the_password_are_checked_before_the_file(self, tmp_path, options, error, message):
+        with pytest.raises(error, match=message):
+            PDFWriter(tmp_path / "missing.pdf", **options)
+
+    @pytest.mark.parametrize("content", [None, b"not a pdf"])
+    def test_a_source_error_never_holds_the_password(self, tmp_path, content):
+        path = tmp_path / "doc.pdf"
+        if content is not None:
+            path.write_bytes(content)
+        with pytest.raises((FileNotFoundError, ValueError)) as caught:
+            PDFWriter(path, password="hunter2")
+        assert "hunter2" not in str(caught.value) and "hunter2" not in repr(caught.value)
 
 
 class TestDocumentCache:
