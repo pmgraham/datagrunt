@@ -2,11 +2,13 @@
 
 Unit tests build RawPage values directly (on test_quality's 400 x 300 pt
 page) for exact control of each decision: char categories, the 20-char
-threshold, the 50 % raster cover. The A0 regressions run through
+threshold, the 0.70 valid char ratio and the leader runs it leaves out
+(#417), the 50 % raster cover. The A0 regressions run through
 ``extract_page`` on PDFs built portably, with no system font: the ReportLab
-toolkit (``pdf_tests.builders``) for Latin text, scans and blank pages, and
-hand-written pages in a non-embedded CID font with a ToUnicode map for
-CJK, right-to-left, math and dot-leader text.
+toolkit (``pdf_tests.builders``) for Latin text, scans and blank pages,
+hand-written pages in a non-embedded CID font with a ToUnicode map for CJK,
+right-to-left, math and dot-leader text, and a Helvetica page whose
+ToUnicode map reads its lower case as private use.
 """
 
 import dataclasses
@@ -57,6 +59,16 @@ NEVER_WARNING = (
     "ocr='never': the page has {count} valid, visible, non-whitespace chars (under 20); "
     "it stays digital instead of going to OCR"
 )
+# The ratio is shown cut (not rounded) to 3 places, so a ratio under 0.70 never reads as 0.700.
+RATIO_WARNING = (
+    "ocr='never': the page has {valid} valid chars of its {visible} visible ones (leader runs aside), a ratio of "
+    "{ratio} (under 0.70); it stays digital instead of going to OCR"
+)
+BOTH_WARNING = (
+    "ocr='never': the page has {count} valid, visible, non-whitespace chars (under 20) and {valid} valid chars of "
+    "its {visible} visible ones (leader runs aside), a ratio of {ratio} (under 0.70); it stays digital instead of "
+    "going to OCR"
+)
 
 
 def text_span(text: str, x: float = 20.0, y: float = 90.0, **overrides):
@@ -68,6 +80,18 @@ def letters(count: int, y: float = 90.0, **overrides):
     """A span of ``count`` lowercase letters on the line at ``y``."""
     text = "".join(chr(ord("a") + index % 26) for index in range(count))
     return text_span(text, y=y, **overrides)
+
+
+def garbage(count: int) -> str:
+    """``count`` private-use chars, no two neighbours alike: garbled text, never a leader run."""
+    return "".join(chr(0xE000 + index % 64) for index in range(count))
+
+
+def mixed(valid: int, invalid: int, *, per_row: int = 50) -> tuple[RawSpan, ...]:
+    """Visible spans of ``valid`` letters then ``invalid`` garbage chars, ``per_row`` chars a row down the page."""
+    text = "".join(chr(ord("a") + index % 26) for index in range(valid)) + garbage(invalid)
+    rows = [text[start : start + per_row] for start in range(0, len(text), per_row)]
+    return tuple(text_span(chunk, y=10.0 + 14.0 * index) for index, chunk in enumerate(rows))
 
 
 def textpage_chars(text: str) -> int:
@@ -419,19 +443,16 @@ class TestRoutingCount:
 
     @pytest.mark.parametrize("invalid", ["\ufffd", "\ue000", "\u0378", "\ud835", "\udc00"])
     def test_invalid_chars_do_not_count(self, invalid):
-        assert assess(letters(19), text_span(invalid * 30, y=120.0)).route == "vision"
+        # 60 spaces keep the ratio over 0.70 (79 of 109), so only the count decides.
+        assert assess(letters(19), text_span(invalid * 30, y=120.0), text_span(" " * 60, y=150.0)).route == "vision"
 
     def test_map_errors_do_not_count(self):
+        # 60 spaces (valid, never counted) keep the valid char ratio over 0.70, so only the count decides.
         unmapped = letters(30, y=120.0, map_errors=tuple(range(30)))
+        spaces = text_span(" " * 60, y=150.0)
 
-        assert assess(letters(19), unmapped).route == "vision"
-        assert assess(letters(19), letters(30, y=120.0, map_errors=tuple(range(29)))).route == "digital"
-
-    def test_the_ratio_is_recorded_but_never_routed_on(self):
-        got = assess(letters(20), text_span("\ufffd" * 60, y=120.0), text_span("\ufffd" * 60, y=150.0))
-
-        assert got.quality.valid_char_ratio == pytest.approx(20 / 140)
-        assert got.route == "digital"
+        assert assess(letters(19), unmapped, spaces).route == "vision"
+        assert assess(letters(19), letters(30, y=120.0, map_errors=tuple(range(29))), spaces).route == "digital"
 
     def test_an_ocr_layer_over_a_scan_counts(self):
         # Render mode 3 over a full-bleed raster is visible text: the scan's OCR layer.
@@ -439,6 +460,219 @@ class TestRoutingCount:
 
         assert [item.hidden_reasons for item in got.pieces] == [()]
         assert got.route == "hybrid"
+
+
+class TestRoutingRatio:
+    """A page whose visible chars are under 70 % valid routes vision, as spec §3.3 step 2 says (#417)."""
+
+    def test_mostly_invalid_visible_text_is_vision(self):
+        # 20 valid chars, so the count alone keeps the page digital; 20 of its 140 visible chars are valid.
+        got = assess(letters(20), text_span(garbage(60), y=120.0), text_span(garbage(60), y=150.0))
+
+        assert got.quality.valid_char_ratio == pytest.approx(20 / 140)
+        assert (got.route, got.warnings) == ("vision", ())
+
+    @pytest.mark.parametrize(
+        "valid,invalid,route",
+        [
+            pytest.param(21, 9, "digital", id="exactly-0.70-small"),
+            pytest.param(700, 300, "digital", id="exactly-0.70"),
+            pytest.param(699, 301, "vision", id="0.699"),
+            pytest.param(701, 299, "digital", id="0.701"),
+        ],
+    )
+    def test_threshold(self, valid, invalid, route):
+        got = assess(*mixed(valid, invalid))
+
+        assert got.quality.valid_char_ratio == valid / (valid + invalid)
+        assert got.route == route
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            pytest.param({"y": -60.0}, id="off-page"),
+            pytest.param({"render_mode": 3}, id="invisible"),
+            pytest.param({"font_size_pt": 0.5}, id="tiny"),
+            pytest.param({"fill_rgba": (0, 0, 0, 0)}, id="transparent"),
+        ],
+    )
+    def test_hidden_invalid_chars_do_not_lower_it(self, overrides):
+        # Hidden text of corrupt chars cannot send a page of good visible text to vision.
+        position = {"y": overrides.get("y", 150.0)}
+        hidden = text_span(garbage(60), **(overrides | position))
+
+        got = assess(letters(30), hidden)
+
+        assert [item.hidden_reasons for item in got.pieces][1] != ()
+        assert got.quality.valid_char_ratio == pytest.approx(30 / 90)  # recorded over every char, as before
+        assert got.route == "digital"
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            pytest.param({"y": -60.0}, id="off-page"),
+            pytest.param({"render_mode": 3}, id="invisible"),
+            pytest.param({"font_size_pt": 0.5}, id="tiny"),
+            pytest.param({"fill_rgba": (0, 0, 0, 0)}, id="transparent"),
+        ],
+    )
+    def test_hidden_valid_chars_do_not_raise_it(self, overrides):
+        # Hidden valid text cannot keep a page of garbled visible text digital.
+        position = {"y": overrides.get("y", 150.0)}
+        hidden = text_span("x" * 60, **(overrides | position))
+
+        got = assess(letters(20), text_span(garbage(20), y=120.0), hidden)
+
+        assert got.quality.valid_char_ratio == pytest.approx(80 / 100)  # recorded over every char, as before
+        assert got.route == "vision"
+
+    def test_visible_whitespace_counts_as_valid(self):
+        # The spec counts spaces (Zs) valid: 70 of 100 visible chars, so digital (20 of 50 without them).
+        got = assess(text_span("a" * 20 + " " * 30, y=90.0), text_span(" " * 20 + garbage(30), y=120.0))
+
+        assert got.route == "digital"
+
+    def test_recovered_text_does_not_enter_it(self):
+        copy = recovered_span(garbage(60), reasons=(), font_size_pt=12.0)
+
+        result = assess_recovered(letters(24), recovered=recovery(copy))
+
+        assert (result.route, result.recovered_pieces[-1].hidden_reasons) == ("digital", ())
+
+    def test_it_routes_vision_over_a_scan(self):
+        got = assess(letters(20), text_span(garbage(20), y=120.0), images=(FULL_BLEED,))
+
+        assert (got.route, got.warnings) == ("vision", ())
+
+    def test_always_is_vision(self):
+        got = assess(letters(20), text_span(garbage(20), y=120.0), ocr="always")
+
+        assert (got.route, got.warnings) == ("vision", ())
+
+    @pytest.mark.parametrize(
+        "valid,invalid,ratio",
+        [
+            pytest.param(20, 20, "0.500", id="half"),
+            pytest.param(699, 301, "0.699", id="0.699"),
+            # 466 / 666 is 0.69970: rounded to 3 places it would read 0.700.
+            pytest.param(466, 200, "0.699", id="cut-not-rounded"),
+        ],
+    )
+    def test_never_keeps_it_digital_with_a_warning_naming_the_ratio(self, valid, invalid, ratio):
+        got = assess(*mixed(valid, invalid), ocr="never")
+
+        warning = RATIO_WARNING.format(valid=valid, visible=valid + invalid, ratio=ratio)
+        assert (got.route, got.warnings) == ("digital", (warning,))
+
+    def test_never_over_a_scan_is_digital_with_the_warning(self):
+        got = assess(letters(20), text_span(garbage(20), y=120.0), images=(FULL_BLEED,), ocr="never")
+
+        warning = RATIO_WARNING.format(valid=20, visible=40, ratio="0.500")
+        assert (got.route, got.warnings) == ("digital", (warning,))
+
+    def test_never_names_both_conditions_when_both_hold(self):
+        got = assess(letters(5), text_span(garbage(15), y=120.0), ocr="never")
+
+        warning = BOTH_WARNING.format(count=5, valid=5, visible=20, ratio="0.250")
+        assert (got.route, got.warnings) == ("digital", (warning,))
+
+    @pytest.mark.parametrize(
+        "spans",
+        [
+            pytest.param((), id="no-chars"),
+            pytest.param((text_span(garbage(30), font_size_pt=0.5),), id="only-hidden-chars"),
+            pytest.param((text_span(" " * 30),), id="only-whitespace"),
+        ],
+    )
+    def test_never_names_only_the_count_when_the_ratio_holds_or_there_is_none(self, spans):
+        # No visible char, no ratio; visible whitespace alone is all valid.
+        got = assess(*spans, ocr="never")
+
+        assert (got.route, got.warnings) == ("digital", (NEVER_WARNING.format(count=0),))
+
+
+# 21 letters and 9 garbage chars: a ratio of exactly 0.70 once a run is left out, under it while the run counts.
+AT_THE_THRESHOLD = "abcdefghijklmnopqrstu", garbage(9)
+
+
+class TestLeaderRuns:
+    """The routing ratio leaves out runs of 3 or more identical invalid chars: leaders and rules, not text.
+
+    The maintainer's amendment of spec §3.3 step 2 (2026-11-01, #417). The
+    recorded ratio keeps every char.
+    """
+
+    @pytest.mark.parametrize(
+        "run",
+        [
+            pytest.param("\ufffd" * 50, id="replacement-char-leader"),
+            pytest.param("\ue000" * 50, id="private-use-rule-glyph"),
+            pytest.param("\u0378" * 50, id="unassigned"),
+            pytest.param(raw_span("\x03" * 50, row(50, 20.0, 120.0), map_errors=tuple(range(50))), id="map-errors"),
+        ],
+    )
+    def test_a_leader_run_is_left_out(self, run):
+        leader = run if isinstance(run, RawSpan) else text_span(run, y=120.0)
+
+        got = assess(letters(20), leader)
+
+        assert got.quality.valid_char_ratio == pytest.approx(20 / 70)  # recorded over every char
+        assert (got.route, got.warnings) == ("digital", ())
+
+    @pytest.mark.parametrize(
+        "text,route",
+        [
+            pytest.param("{letters}\ufffd\ufffd\ufffd{garbage}", "digital", id="3-in-the-middle"),
+            pytest.param("\ufffd\ufffd\ufffd{letters}{garbage}", "digital", id="3-at-the-start"),
+            pytest.param("{letters}{garbage}\ufffd\ufffd\ufffd", "digital", id="3-at-the-end"),
+            pytest.param("{letters}\ufffd\ufffd\ufffd\ufffd{garbage}", "digital", id="4"),
+            pytest.param("{letters}\ufffd\ufffd{garbage}", "vision", id="2"),
+            pytest.param("{letters}\ufffd\ufffd\ue100\ue100{garbage}", "vision", id="2-and-2-of-another"),
+        ],
+    )
+    def test_a_run_is_3_or_more_identical_invalid_chars(self, text, route):
+        # Left out: 21 of 30, exactly 0.70; counted, its 2 or more invalid chars put it under.
+        valid, garbled = AT_THE_THRESHOLD
+
+        got = assess(text_span(text.format(letters=valid, garbage=garbled)))
+
+        assert got.route == route
+
+    def test_runs_are_found_within_a_piece_not_across_pieces(self):
+        # Two U+FFFD end one span and a third starts the next on its line: no run of 3 in either piece.
+        valid, garbled = AT_THE_THRESHOLD
+        first = text_span(valid + garbled + "\ufffd\ufffd")
+
+        got = assess(first, text_span("\ufffd", x=first.bbox[2]))
+
+        assert got.route == "vision"
+
+    @pytest.mark.parametrize("valid,route", [(20, "vision"), (30, "digital")])
+    def test_a_long_run_among_garbled_text_is_decided_by_the_rest(self, valid, route):
+        # 190 leaders, then 10 garbage chars beside 20 (0.667) or 30 (0.75) letters.
+        leaders = (
+            text_span(garbage(5) + "\ufffd" * 40 + garbage(5), y=120.0),
+            *(text_span("\ufffd" * 50, y=135.0 + 15.0 * index) for index in range(3)),
+        )
+
+        got = assess(letters(valid), *leaders)
+
+        assert got.route == route
+
+    @pytest.mark.parametrize("char", ["-", ".", "_", "\u2026"])
+    def test_a_run_of_identical_valid_chars_counts(self, char):
+        # 60 of 80 visible chars valid with the run (0.75); 20 of 40 without it.
+        got = assess(letters(20), text_span(char * 40, y=120.0), text_span(garbage(20), y=150.0))
+
+        assert got.route == "digital"
+
+    @pytest.mark.parametrize("ocr,route", [("auto", "vision"), ("never", "digital")])
+    def test_a_page_of_only_a_leader_run_has_no_ratio_and_the_count_decides(self, ocr, route):
+        got = assess(text_span("\ufffd" * 40), ocr=ocr)
+
+        assert got.quality.valid_char_ratio == 0.0  # recorded over every char
+        warnings = (NEVER_WARNING.format(count=0),) if ocr == "never" else ()
+        assert (got.route, got.warnings) == (route, warnings)
 
 
 class TestHybrid:
@@ -655,6 +889,34 @@ TOC_ENTRIES = (
 TOC_COLUMNS = 52
 TOC_LINES = tuple(title + "\ufffd" * (TOC_COLUMNS - len(title) - len(page)) + page for title, page in TOC_ENTRIES)
 
+# A broken ToUnicode map (#417): Helvetica's capitals and spaces read as themselves, its lower case as private use.
+MAPPED_LINE, BROKEN_LINE = "SEVEN QUICK ZEBRAS JUMP", "over the lazy brown dogs"
+
+
+def garbled(text: str) -> str:
+    """``text`` as the broken map reads it: each lower-case char as private use (U+E000 + its code)."""
+    return "".join(chr(0xE000 + ord(char)) if char.islower() else char for char in text)
+
+
+def garbled_page(tmp_path: Path) -> Path:
+    """A 400 x 300 pt page of MAPPED_LINE over BROKEN_LINE in 20 pt Helvetica, read through the broken map.
+
+    20 valid non-whitespace chars (the capitals) and 27 valid of its 47 visible chars (with the 7 spaces).
+    """
+    chars = sorted(set(MAPPED_LINE + BROKEN_LINE))
+    pairs = b"\n".join(b"<%02X> <%04X>" % (ord(char), ord(garbled(char))) for char in chars)
+    cmap = (
+        b"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CMapName /Test-UCS def\n/CMapType 2 def\n"
+        b"1 begincodespacerange\n<00> <FF>\nendcodespacerange\n%d beginbfchar\n%s\nendbfchar\nendcmap\n"
+        b"CMapName currentdict /CMap defineresource pop\nend\nend" % (len(chars), pairs)
+    )
+    lines = (MAPPED_LINE.encode("ascii"), BROKEN_LINE.encode("ascii"))
+    content = b"BT /F1 20 Tf 20 200 Td (%s) Tj ET BT /F1 20 Tf 20 150 Td (%s) Tj ET" % lines
+    font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>"
+    stream = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(cmap), cmap)
+    return content_page(tmp_path, content, font=font, extra=(stream,))
+
+
 RTL_TEXT = {
     "hebrew": "\u05e9\u05dc\u05d5\u05dd \u05e2\u05d5\u05dc\u05dd \u05d6\u05d4\u05d5 \u05d8\u05e7\u05e1\u05d8 "
     "\u05d1\u05e2\u05d1\u05e8\u05d9\u05ea",
@@ -681,6 +943,7 @@ class TestRegressions:
     """The A0 regressions, through extract_page."""
 
     def test_dot_leader_contents_page_is_digital(self, tmp_path):
+        # Its 442 leaders are runs of U+FFFD, left out of the routing ratio (#417): its 234 other chars are valid.
         result, raw = assessed(cid_text_page(tmp_path, TOC_LINES, size=8.0))
         quality = result.quality
 
@@ -689,6 +952,33 @@ class TestRegressions:
         assert round(quality.valid_char_ratio * quality.char_count) == 234
         assert quality.valid_char_ratio == pytest.approx(0.346, abs=5e-4)
         assert result.route == "digital"
+
+    def test_dot_leader_contents_page_with_ocr_never_has_no_warning(self, tmp_path):
+        result, _ = assessed(cid_text_page(tmp_path, TOC_LINES, size=8.0), ocr="never")
+
+        assert (result.route, result.warnings) == ("digital", ())
+
+    @pytest.mark.parametrize(
+        "ocr,route,warnings",
+        [
+            pytest.param("auto", "vision", (), id="auto"),
+            pytest.param("never", "digital", (RATIO_WARNING.format(valid=27, visible=47, ratio="0.574"),), id="never"),
+            pytest.param("always", "vision", (), id="always"),
+        ],
+    )
+    def test_a_garbled_font_page_with_enough_valid_chars(self, tmp_path, ocr, route, warnings):
+        # A broken ToUnicode map: 20 valid non-whitespace chars (the count passes) of 47 visible ones, 27 valid.
+        result, raw = assessed(garbled_page(tmp_path), ocr=ocr)
+
+        assert [span.text for span in raw.text.spans] == [MAPPED_LINE, garbled(BROKEN_LINE)]
+        assert result.quality.valid_char_ratio == pytest.approx(27 / 47)
+        assert {piece.hidden_reasons for piece in result.pieces} == {()}
+        assert (result.route, result.warnings) == (route, warnings)
+
+    def test_a_clean_page_is_unchanged(self, tmp_path):
+        result, _ = assessed(built(tmp_path, TextRun("A clean page of plain digital text", x=40.0, y=100.0)))
+
+        assert (result.route, result.quality.valid_char_ratio, result.warnings) == ("digital", 1.0, ())
 
     def test_dot_leaders_are_unmapped_regions(self, tmp_path):
         result, raw = assessed(cid_text_page(tmp_path, TOC_LINES, size=8.0))
