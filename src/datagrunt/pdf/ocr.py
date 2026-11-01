@@ -107,6 +107,7 @@ _ORIENTATION_STATUSES: tuple[OrientationStatus, ...] = ("ok", "undetermined", "u
 # tesseract's TSV, one row a box: words are level 5, with a confidence of 0..100 (-1 on other levels).
 _TSV_HEADER = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext"
 _TSV_FIELDS = 12
+_TSV_LINE = ("block_num", "par_num", "line_num")  # fields 2 to 4
 _TSV_BOX = ("left", "top", "width", "height")  # fields 6 to 9
 _WORD_LEVEL = "5"
 _SAME_WORD_IOU = 0.5
@@ -257,17 +258,21 @@ class OCRWord:
         text: The word, as tesseract read it (punctuation attached).
         bbox: Its box on the displayed page, in points from the top-left corner.
         confidence: tesseract's confidence, 0 to 100.
+        line: The tesseract line it was read on, numbered from 0 across the
+            page in the order read: words read on one line share it (#416).
     """
 
     text: str
     bbox: BBox
     confidence: float
+    line: int
 
     def __post_init__(self) -> None:
         non_blank_str("text", self.text)
         if not isinstance(self.bbox, BBox):
             raise TypeError(f"bbox must be a BBox, got {type(self.bbox).__name__}")
         object.__setattr__(self, "confidence", finite_float("confidence", self.confidence, lo=0.0, hi=100.0))
+        int_at_least("line", self.line, 0)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -387,7 +392,11 @@ def _osd(stdout: bytes) -> Orientation:
 
 
 class _Placed(NamedTuple):
-    """A word tesseract read, its box in pixels on the righted page (its band's offset added)."""
+    """A word tesseract read, its box in pixels on the righted page (its band's offset added), and its line.
+
+    ``line`` is its band's top row, then the TSV's block, paragraph and line
+    numbers: a tesseract line's key on the page.
+    """
 
     text: str
     x0: int
@@ -395,6 +404,7 @@ class _Placed(NamedTuple):
     x1: int
     y1: int
     confidence: float
+    line: tuple[int, int, int, int]
 
 
 class _Failure(NamedTuple):
@@ -513,13 +523,14 @@ def _tsv_word(fields: list[str], band: Band) -> _Placed | None:
         raise ValueError(f"{len(fields)} fields, not {_TSV_FIELDS}")
     if fields[0] != _WORD_LEVEL:
         return None
+    block, paragraph, line = (_tsv_int(name, value) for name, value in zip(_TSV_LINE, fields[2:5]))
     left, top, width, height = (_tsv_int(name, value) for name, value in zip(_TSV_BOX, fields[6:10]))
     confidence = _tsv_confidence(fields[10])
     text = fields[11]
     if confidence < 0.0 or not text.strip():
         return None
     y0 = band.top_px + top
-    return _Placed(text, left, y0, left + width, y0 + height, confidence)
+    return _Placed(text, left, y0, left + width, y0 + height, confidence, (band.top_px, block, paragraph, line))
 
 
 def _tsv_int(name: str, value: str) -> int:
@@ -543,9 +554,15 @@ def _tsv_confidence(value: str) -> float:
 def _page_words(
     read: list[tuple[Band, list[_Placed]]], rotation: int, displayed: tuple[int, int], dpi: int
 ) -> tuple[OCRWord, ...]:
-    """The words read, each word read twice kept once, on the displayed page in points."""
+    """The words read, each word read twice kept once, on the displayed page in points, their lines numbered."""
+    lines: dict[tuple[int, int, int, int], int] = {}
     return tuple(
-        OCRWord(text=word.text, bbox=_displayed_box(word, rotation, displayed, dpi), confidence=word.confidence)
+        OCRWord(
+            text=word.text,
+            bbox=_displayed_box(word, rotation, displayed, dpi),
+            confidence=word.confidence,
+            line=lines.setdefault(word.line, len(lines)),
+        )
         for word in _merged(read)
     )
 

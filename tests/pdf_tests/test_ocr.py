@@ -290,9 +290,9 @@ class TestRecords:
             Orientation(**{"degrees": 90, "confidence": 9.0, "status": "ok", "reason": "", **fields})
 
     def test_a_valid_word(self):
-        word = OCRWord(text="fox", bbox=bbox(1.0, 2.0, 3.0, 4.0), confidence=96.05)
+        word = OCRWord(text="fox", bbox=bbox(1.0, 2.0, 3.0, 4.0), confidence=96.05, line=3)
 
-        assert (word.text, word.bbox.x1, word.confidence) == ("fox", 3.0, 96.05)
+        assert (word.text, word.bbox.x1, word.confidence, word.line) == ("fox", 3.0, 96.05, 3)
 
     @pytest.mark.parametrize(
         "fields,error,message",
@@ -301,14 +301,17 @@ class TestRecords:
             pytest.param({"bbox": (1.0, 2.0, 3.0, 4.0)}, TypeError, "bbox must be a BBox, got tuple", id="bbox"),
             pytest.param({"confidence": 100.5}, ValueError, "confidence must be <= 100.0, got 100.5", id="high"),
             pytest.param({"confidence": -1.0}, ValueError, "confidence must be >= 0.0, got -1.0", id="low"),
+            pytest.param({"line": -1}, ValueError, "line must be >= 0, got -1", id="line-negative"),
+            pytest.param({"line": 1.0}, TypeError, "line must be an int", id="line-float"),
+            pytest.param({"line": True}, TypeError, "line must be an int", id="line-bool"),
         ],
     )
     def test_invalid_words_raise(self, fields, error, message):
         with pytest.raises(error, match=re.escape(message)):
-            OCRWord(**{"text": "fox", "bbox": bbox(1.0, 2.0, 3.0, 4.0), "confidence": 50.0, **fields})
+            OCRWord(**{"text": "fox", "bbox": bbox(1.0, 2.0, 3.0, 4.0), "confidence": 50.0, "line": 0, **fields})
 
     def test_valid_results(self):
-        word = OCRWord(text="fox", bbox=bbox(1.0, 2.0, 3.0, 4.0), confidence=96.0)
+        word = OCRWord(text="fox", bbox=bbox(1.0, 2.0, 3.0, 4.0), confidence=96.0, line=0)
 
         assert OCRResult(words=(word,), status="ok", reason="").words == (word,)
         assert OCRResult(words=(word,), status="timeout", reason="band 2 of 2").status == "timeout"
@@ -383,9 +386,13 @@ def tsv(*rows: str, newline: str = "\n") -> bytes:
     return (newline.join((TSV_HEADER, *rows)) + newline).encode()
 
 
-def row(level: int, box: tuple[int, int, int, int], conf: str, text: str) -> str:
+def row(
+    level: int, box: tuple[int, int, int, int], conf: str, text: str, line: tuple[int, int, int] = (1, 1, 1)
+) -> str:
+    """A TSV row: ``line`` is its block, paragraph and line numbers."""
     left, top, width, height = box
-    return f"{level}\t1\t1\t1\t1\t1\t{left}\t{top}\t{width}\t{height}\t{conf}\t{text}"
+    block, paragraph, number = line
+    return f"{level}\t1\t{block}\t{paragraph}\t{number}\t1\t{left}\t{top}\t{width}\t{height}\t{conf}\t{text}"
 
 
 BAND_AT_840 = Band(top_px=840, pixels=bytes(100 * 900), px_width=100, px_height=900)
@@ -404,25 +411,38 @@ class TestTsv:
         )
 
         assert ocr._tsv_words(stdout, BAND_AT_840) == [
-            ocr._Placed("Hello", 10, 860, 40, 875, 96.050018),
-            ocr._Placed("world,", 45, 861, 80, 875, 91.0),
+            ocr._Placed("Hello", 10, 860, 40, 875, 96.050018, (840, 1, 1, 1)),
+            ocr._Placed("world,", 45, 861, 80, 875, 91.0, (840, 1, 1, 1)),
         ]
 
     def test_words_without_text_or_confidence_are_skipped(self):
         stdout = tsv(row(5, (1, 1, 5, 5), "-1", "x"), row(5, (1, 1, 5, 5), "40", " "), row(5, (1, 1, 5, 5), "0", "y"))
 
-        assert ocr._tsv_words(stdout, BAND_AT_840) == [ocr._Placed("y", 1, 841, 6, 846, 0.0)]
+        assert ocr._tsv_words(stdout, BAND_AT_840) == [ocr._Placed("y", 1, 841, 6, 846, 0.0, (840, 1, 1, 1))]
 
     def test_only_word_rows_are_words(self):
         # Only level 5 is a word, whatever text or confidence another level's row carries.
         stdout = tsv(*(row(level, (1, 1, 5, 5), "50", "x") for level in (1, 2, 3, 4)), row(5, (1, 1, 5, 5), "50", "y"))
 
-        assert ocr._tsv_words(stdout, BAND_AT_840) == [ocr._Placed("y", 1, 841, 6, 846, 50.0)]
+        assert ocr._tsv_words(stdout, BAND_AT_840) == [ocr._Placed("y", 1, 841, 6, 846, 50.0, (840, 1, 1, 1))]
+
+    def test_each_word_keeps_its_bands_top_and_its_block_paragraph_and_line(self):
+        stdout = tsv(
+            row(5, (10, 20, 30, 15), "90", "The", line=(1, 1, 1)),
+            row(5, (45, 20, 30, 15), "90", "fox", line=(1, 1, 1)),
+            row(5, (10, 40, 30, 15), "90", "ran", line=(1, 1, 2)),
+            row(5, (10, 60, 30, 15), "90", "far", line=(1, 2, 1)),
+            row(5, (10, 80, 30, 15), "90", "off", line=(2, 1, 1)),
+        )
+
+        lines = [word.line for word in ocr._tsv_words(stdout, BAND_AT_840)]
+
+        assert lines == [(840, 1, 1, 1), (840, 1, 1, 1), (840, 1, 1, 2), (840, 1, 2, 1), (840, 2, 1, 1)]
 
     def test_crlf_line_ends_are_read(self):
         stdout = tsv(row(5, (1, 2, 3, 4), "50", "fox"), newline="\r\n")
 
-        assert ocr._tsv_words(stdout, BAND_AT_840) == [ocr._Placed("fox", 1, 842, 4, 846, 50.0)]
+        assert ocr._tsv_words(stdout, BAND_AT_840) == [ocr._Placed("fox", 1, 842, 4, 846, 50.0, (840, 1, 1, 1))]
 
     @pytest.mark.parametrize(
         "stdout,message",
@@ -435,6 +455,13 @@ class TestTsv:
                 tsv(row(5, (1, 2, 3, 4), "50", "x").replace("\t1\t2\t", "\tone\t2\t")), "line 2: left", id="int"
             ),
             pytest.param(tsv(row(5, (1, -2, 3, 4), "50", "x")), "line 2: top must be >= 0, got -2", id="negative"),
+            pytest.param(
+                tsv(row(5, (1, 2, 3, 4), "50", "x").replace("5\t1\t1\t", "5\t1\tone\t")),
+                "line 2: block_num",
+                id="block",
+            ),
+            pytest.param(tsv(row(5, (1, 2, 3, 4), "50", "x", line=(1, -1, 1))), "line 2: par_num", id="paragraph"),
+            pytest.param(tsv(row(5, (1, 2, 3, 4), "50", "x", line=(1, 1, 2.5))), "line 2: line_num", id="line"),
             pytest.param(tsv(row(5, (1, 2, 3, 4), "100.5", "x")), "line 2: conf must be <= 100.0", id="conf-high"),
             pytest.param(tsv(row(5, (1, 2, 3, 4), "nan", "x")), "line 2: conf must be finite", id="conf-nan"),
             pytest.param(tsv(row(5, (1, 2, 3, 4), "most", "x")), "line 2: conf", id="conf-text"),
@@ -454,7 +481,8 @@ LAST = Band(top_px=1680, pixels=bytes(900), px_width=1, px_height=900)
 
 
 def placed(text: str, box: tuple[int, int, int, int], confidence: float) -> "ocr._Placed":
-    return ocr._Placed(text, *box, confidence)
+    """A word placed on the righted page: its line is keyed by its top row (its band's, block, paragraph and line)."""
+    return ocr._Placed(text, *box, confidence, (0, 1, 1, box[1]))
 
 
 class TestMerged:
@@ -779,6 +807,26 @@ class TestCli:
 
         assert result.status == "ok"
         assert [word.bbox for word in result.words] == [bbox(10.0, 20.0, 40.0, 35.0), bbox(10.0, 860.0, 40.0, 875.0)]
+
+    def test_lines_are_numbered_across_the_page_in_the_order_read(self, tmp_path, monkeypatch):
+        # The same report for each band, its lines numbered alike: a band's line 1 is not another band's.
+        report = tsv(
+            row(5, (1, 20, 9, 15), "90", "The", line=(1, 1, 1)),
+            row(5, (12, 20, 9, 15), "90", "fox", line=(1, 1, 1)),
+            row(5, (1, 400, 9, 15), "90", "ran", line=(2, 1, 1)),
+        )
+        fake_tesseract(tmp_path, monkeypatch, READS_STDIN, stdout=report)
+
+        result = words_of(PAGE_50_BY_1000)
+
+        assert [(word.text, word.line) for word in result.words] == [
+            ("The", 0),
+            ("fox", 0),
+            ("ran", 1),
+            ("The", 2),
+            ("fox", 2),
+            ("ran", 3),
+        ]
 
     def test_a_band_that_fails_ends_the_page_with_the_words_read_before_it(self, tmp_path, monkeypatch):
         body = (

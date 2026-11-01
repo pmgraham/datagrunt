@@ -12,9 +12,39 @@ visible piece of a synthetic span of its own (:func:`ocr_pieces`):
 - its text, and its box on the displayed page;
 - its chars splitting the box evenly along the word, each as tall as it
   (its loose and tight boxes alike: OCR reads no glyph bounds);
-- a font size of the box's height in points (at least :data:`LEAST_SIZE_PT`,
-  the least size a layout line holds), its em as wide; not bold, not
-  italic, painted (render mode 0, opaque black), with no hidden reason.
+- a font size of its tesseract line's (#416; at least
+  :data:`LEAST_SIZE_PT`, the least size a layout line holds), its em as
+  wide; not bold, not italic, painted (render mode 0, opaque black), with
+  no hidden reason.
+
+A word's box runs from its highest ink to its lowest, so its height is
+not its font's: a word of x-height letters ("over") is shorter than one
+reaching the ascender or cap height ("the", "FACTION") or the descender
+("gun"), and one reaching both ("jumps") taller. So (#416):
+
+1. Each word's height is scaled to a one-sided word's by what its glyphs
+   reach (:func:`_reach_scale`): an x-height word's by 3/2, a both-sided
+   word's by 3/4. On A5b's 10 sample pages those words measure 0.656 and
+   1.323 times the one-sided words of their line (medians).
+2. Each tesseract line is parted at its gutters (:func:`_line_parts`):
+   tesseract can read lines of neighbouring columns as one.
+3. Every word of a part is sized by the median of its words' scaled
+   heights.
+
+So a line's words share one size, and lines compare by the size of their
+type, not by their words' mix of ascenders and descenders. On Root's Law
+pages 5, 10 and 20, OCR finds 7, 5 and 8 headings where the digital text
+has 6, 5 and 7: every digital heading, and on pages 5 and 20 one
+zero-confidence misread. Sized by each word's own box it found 17, 16 and
+18. Other rules tried, on the same pages:
+
+- a line's own height (tesseract's line box, its tallest word, or its
+  words' span) finds 8 or 9, 0, and 2 to 5: capitals set larger than the
+  body ("9.4 BIRDSONG") reach no lower than the baseline, so they are no
+  taller than a body line with a descender, and page 10's headings are lost;
+- the unscaled median finds 9, 6 and 12;
+- the scaled median of unparted lines finds 7, 5 and 8, but page 5's
+  "6.2" heading shares a line with the body across the gutter and is lost.
 
 :func:`vision_elements` lays the pieces out with
 :func:`~datagrunt.pdf.layout.page_layout`, with no lattice (a scan has no
@@ -76,15 +106,9 @@ default 612 x 792 pt, with a warning.
 
 Known limitations (A5b evidence: 10 corpus pages forced to OCR):
 
-- A word's box runs from its highest to its lowest ink, so its height is
-  the font's x-height for a word such as "over", and its ascent to descent
-  for "jumps". Lines whose words mostly reach both read larger than the
-  page's body, so the layout's heading rule (1.15 times the body size)
-  takes some body lines for headings: on Root's Law pages 5, 10 and 20 OCR
-  finds 16, 16 and 19 headings where the digital text has 6, 5 and 7.
-  Sizing each word by its tesseract line's height instead finds 6, 0 and 5:
-  fewer, but it loses page 10's, and with ``--psm 6`` it joined words
-  across their spaces.
+- What a word's glyphs reach is read from its text by Latin letters,
+  digits and brackets only: a word of other letters (another script,
+  or accented letters with no plain one beside them) is taken as one-sided.
 - OCR's misreads reach the layout. A column of digits read as one tall
   word (confidence 0) runs the lines beside it together. Every char is
   still read once (Pass C), but the elements' words recall 77.2 % of the
@@ -97,6 +121,7 @@ import dataclasses
 import io
 import math
 import os
+import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
@@ -148,6 +173,17 @@ __all__ = [
 # The least font size an OCR piece is given: layout reads line sizes to 0.1 pt, and a line's size is over 0.
 LEAST_SIZE_PT = 0.1
 
+# What a word's glyphs reach (module notes): x-height letters only; above it (capitals, digits, ascenders, the dots
+# of i and j); below the baseline (descenders). Brackets and bars reach both sides.
+_X_HEIGHT = frozenset("acemnorsuvwxz")
+_ABOVE = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789bdfhijklt()[]{}|")
+_BELOW = frozenset("gjpqy()[]{}|")
+# A word's box height times this is a one-sided word's on its line (module notes: 1 / 0.656 and 1 / 1.323 measured).
+_X_HEIGHT_SCALE = 1.5
+_BOTH_SIDES_SCALE = 0.75
+# A tesseract line is parted where its words are over this many ems apart (the layout's cell gap; module notes).
+_PART_GAP_EM = 1.8
+
 # OCR reads ink as it is painted: opaque black, filled (render mode 0).
 _PAINTED = (0, 0, 0, 255)
 _FILL = 0
@@ -191,22 +227,79 @@ class VisionElements(NamedTuple):
 def ocr_pieces(words: tuple[OCRWord, ...]) -> tuple[SpanPiece, ...]:
     """Each OCR word as one visible piece of a span of its own, in order (see the module notes). O(chars).
 
-    A span's ``object_index`` is its word's position in ``words``.
+    A span's ``object_index`` is its word's position in ``words``; its size
+    is its line's (:func:`_word_sizes`).
 
     Raises:
         TypeError: If ``words`` is not a tuple of OCRWord.
     """
-    return tuple(_word_piece(item, index) for index, item in enumerate(typed_tuple("words", words, OCRWord)))
+    checked = typed_tuple("words", words, OCRWord)
+    sizes = _word_sizes(checked)
+    return tuple(_word_piece(item, index, sizes[index]) for index, item in enumerate(checked))
 
 
-def _word_piece(word: OCRWord, index: int) -> SpanPiece:
-    """``word`` as the whole of a visible span: its chars split along its box, its size the box's height."""
+def _word_sizes(words: tuple[OCRWord, ...]) -> dict[int, float]:
+    """Each word's font size, by its position: its line part's (:func:`_line_parts`). O(w log w) for w words.
+
+    A part's size is the median of its words' heights, each scaled by
+    :func:`_reach_scale`, and at least :data:`LEAST_SIZE_PT`.
+    """
+    scaled = [(item.bbox.y1 - item.bbox.y0) * _reach_scale(item.text) for item in words]
+    lines: dict[int, list[int]] = {}
+    for index, item in enumerate(words):
+        lines.setdefault(item.line, []).append(index)
+    sizes: dict[int, float] = {}
+    for members in lines.values():
+        for part in _line_parts(words, scaled, members):
+            sizes.update(dict.fromkeys(part, max(statistics.median(scaled[index] for index in part), LEAST_SIZE_PT)))
+    return sizes
+
+
+def _line_parts(words: tuple[OCRWord, ...], scaled: list[float], members: list[int]) -> list[list[int]]:
+    """One tesseract line's words (``members``, by position) in parts along it, cut at its gutters.
+
+    tesseract can read lines of neighbouring columns as one (Root's Law p.
+    5: a body line and the heading "6.2 FACTION RULES AND ABILITIES"
+    across the gutter). A part ends where the next word starts over
+    :data:`_PART_GAP_EM` ems past all before it, the em the larger scaled
+    height of it and the word before: the layout's cell gap.
+    """
+    ordered = sorted(members, key=lambda index: words[index].bbox.x0)
+    parts = [[ordered[0]]]
+    reach = words[ordered[0]].bbox.x1
+    for before, index in zip(ordered, ordered[1:]):
+        box = words[index].bbox
+        if box.x0 - reach > _PART_GAP_EM * max(scaled[before], scaled[index]):
+            parts.append([index])
+        else:
+            parts[-1].append(index)
+        reach = max(reach, box.x1)
+    return parts
+
+
+def _reach_scale(text: str) -> float:
+    """What scales a word's box height to a one-sided word's on its line (module notes), by what its glyphs reach.
+
+    Both sides of the x-height (an ascender or capital and a descender, or a
+    bracket): 3/4. One side: 1. Neither (x-height letters, with any other
+    chars): 3/2. No letter, digit or bracket read (a dash, another script): 1.
+    """
+    above = any(char in _ABOVE for char in text)
+    below = any(char in _BELOW for char in text)
+    if above and below:
+        return _BOTH_SIDES_SCALE
+    if above or below or not any(char in _X_HEIGHT for char in text):
+        return 1.0
+    return _X_HEIGHT_SCALE
+
+
+def _word_piece(word: OCRWord, index: int, size: float) -> SpanPiece:
+    """``word`` as the whole of a visible span of font ``size``: its chars split along its box."""
     box = word.bbox
     count = len(word.text)
     # The last edge is the word's own, so the chars tile its box exactly whatever the float division.
     edges = [box.x0 + (box.x1 - box.x0) * at / count for at in range(count)] + [box.x1]
     chars = tuple((edges[at], box.y0, edges[at + 1], box.y1) for at in range(count))
-    size = max(box.y1 - box.y0, LEAST_SIZE_PT)
     span = RawSpan(
         text=word.text,
         bbox=(box.x0, box.y0, box.x1, box.y1),
@@ -336,7 +429,7 @@ def _righted_word(word: OCRWord, frame: _Frame) -> OCRWord:
     """``word`` on the turned page."""
     if frame.rotation == 0:
         return word
-    return OCRWord(text=word.text, bbox=_bbox(frame.righted(_box(word.bbox))), confidence=word.confidence)
+    return dataclasses.replace(word, bbox=_bbox(frame.righted(_box(word.bbox))))
 
 
 def _righted_piece(piece: SpanPiece, frame: _Frame, spans: dict[int, RawSpan]) -> SpanPiece:

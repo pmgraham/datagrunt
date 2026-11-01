@@ -55,8 +55,12 @@ GEOMETRY = PageGeometry(page_number=3, width_pt=LETTER[0], height_pt=LETTER[1], 
 BODY = 10.0
 
 
-def word(text: str, x0: float, y0: float, x1: float, y1: float, confidence: float = 90.0) -> OCRWord:
-    return OCRWord(text=text, bbox=BBox(x0=x0, y0=y0, x1=x1, y1=y1), confidence=confidence)
+def word(
+    text: str, x0: float, y0: float, x1: float, y1: float, confidence: float = 90.0, line: int | None = None
+) -> OCRWord:
+    """An OCR word; on the line keyed by its top (to 0.01 pt) unless ``line`` is given."""
+    number = round(y0 * 100) if line is None else line
+    return OCRWord(text=text, bbox=BBox(x0=x0, y0=y0, x1=x1, y1=y1), confidence=confidence, line=number)
 
 
 def line_words(text: str, x: float, y: float, size: float = BODY) -> list[OCRWord]:
@@ -65,6 +69,20 @@ def line_words(text: str, x: float, y: float, size: float = BODY) -> list[OCRWor
     for token in text.split():
         width = 0.5 * size * len(token)
         found.append(word(token, x, y, x + width, y + size))
+        x += width + 0.3 * size
+    return found
+
+
+def inked(parts: tuple[tuple[str, str], ...], x: float, baseline: float, size: float, line: int) -> list[OCRWord]:
+    """Words on one line boxed as OCR boxes them, from their ink, for a font of ``size``: each part's reach is "x"
+    (x-height letters only: 0.7 x 2/3 em over the baseline), "above" (to the cap height or ascender: 0.7 em over
+    it), or "both" (that, and 0.7 x 1/3 em under it). Each char 0.5 em wide, words 0.3 em apart."""
+    found = []
+    for text, reach in parts:
+        top = baseline - 0.7 * size * (2 / 3 if reach == "x" else 1.0)
+        bottom = baseline + (0.7 * size / 3 if reach == "both" else 0.0)
+        width = 0.5 * size * len(text)
+        found.append(word(text, x, top, x + width, bottom, line=line))
         x += width + 0.3 * size
     return found
 
@@ -148,6 +166,68 @@ class TestOcrPieces:
         assert (span.fill_rgba, span.stroke_rgba) == ((0, 0, 0, 255), (0, 0, 0, 255))
         assert (span.generated_breaks, span.map_errors) == ((), ())
 
+    def test_a_lines_words_share_its_size_the_median_of_their_heights_scaled_by_what_they_reach(self):
+        # Heights from the ink: "over" x-height only (x 3/2), "The" and "gun" one side of it (x 1), "jumps" and
+        # "dog" both (x 3/4). Scaled: 9, 10, 9, 9, 8.25; their median is 9.
+        heights = (("over", 6.0), ("The", 10.0), ("gun", 9.0), ("jumps", 12.0), ("dog", 11.0))
+        words = tuple(
+            word(text, 10.0 + 40.0 * at, 20.0, 40.0 + 40.0 * at, 20.0 + height, line=4)
+            for at, (text, height) in enumerate(heights)
+        )
+
+        found = ocr_pieces(words)
+
+        assert [piece.span.font_size_pt for piece in found] == [9.0] * 5
+        assert [piece.span.em_width_pt for piece in found] == [9.0] * 5
+        assert [piece.span.bbox for piece in found] == [
+            (item.bbox.x0, item.bbox.y0, item.bbox.x1, item.bbox.y1) for item in words
+        ]
+
+    @pytest.mark.parametrize(
+        "text,height,size",
+        [
+            pytest.param("over", 6.0, 9.0, id="x-height"),
+            pytest.param("a,", 6.0, 9.0, id="x-height-and-punctuation"),
+            pytest.param("the", 9.0, 9.0, id="ascender"),
+            pytest.param("ARE", 9.0, 9.0, id="capitals"),
+            pytest.param("17", 9.0, 9.0, id="digits"),
+            pytest.param("gun", 9.0, 9.0, id="descender"),
+            pytest.param("jumps", 12.0, 9.0, id="both"),
+            pytest.param("(on)", 12.0, 9.0, id="brackets-reach-both"),
+            pytest.param("-", 1.0, 1.0, id="no-letter"),
+            pytest.param("日本", 10.0, 10.0, id="another-script"),
+        ],
+    )
+    def test_each_words_height_is_scaled_by_what_its_glyphs_reach(self, text, height, size):
+        (found,) = ocr_pieces((word(text, 10.0, 20.0, 40.0, 20.0 + height),))
+
+        assert found.span.font_size_pt == size
+
+    def test_each_line_has_its_own_size(self):
+        words = (
+            word("big", 10.0, 20.0, 40.0, 40.0, line=1),
+            word("small", 10.0, 60.0, 40.0, 70.0, line=2),
+            word("fox", 50.0, 20.0, 80.0, 38.0, line=1),
+        )
+
+        found = ocr_pieces(words)
+
+        # Line 1: "big" reaches both sides (20 x 3/4 = 15), "fox" one (18); line 2: "small" one (10).
+        assert [piece.span.font_size_pt for piece in found] == [16.5, 10.0, 16.5]
+
+    @pytest.mark.parametrize("gap,sizes", [(16.0, [7.7] * 7), (16.1, [7.5] * 4 + [10.1] * 3)])
+    def test_a_line_read_across_a_gutter_is_sized_by_each_side(self, gap, sizes):
+        # tesseract read a body line and a heading across the gutter as one line (Root's Law p. 5's "6.2"). Words
+        # over 1.8 ems apart (the taller's scaled height: "6.2"'s 8.9, so 16.02) part it. Scaled heights: on the
+        # left 7.7, 7.5, 7.4, 7.5 (median 7.5); on the right 8.9, 10.1, 10.1 (median 10.1); all seven's median 7.7.
+        left = (("Place", 0.0, 7.7), ("a", 25.0, 5.0), ("ruin", 50.0, 7.4), ("on", 75.0, 5.0))
+        right = (("6.2", 95.0 + gap, 8.9), ("FACTION", 120.0 + gap, 10.1), ("RULES", 145.0 + gap, 10.1))
+        words = tuple(word(text, x, 0.0, x + 20.0, height, line=7) for text, x, height in (*left, *right))
+
+        found = ocr_pieces(words)
+
+        assert [piece.span.font_size_pt for piece in found] == sizes
+
     def test_a_word_with_no_height_has_the_least_size_a_line_reads(self):
         (found,) = ocr_pieces((word("rule", 10.0, 20.0, 40.0, 20.0),))
 
@@ -229,6 +309,34 @@ class TestVisionElements:
     def test_no_words_no_elements(self):
         assert vision_elements((), geometry=GEOMETRY) == VisionElements(elements=(), warnings=())
 
+    def test_lines_of_tall_or_short_words_are_body_text_and_a_larger_line_of_capitals_its_heading(self):
+        # Ink boxes as OCR draws them (#416): on a 10 pt body, words of x-height letters only are 4.67 pt tall,
+        # those reaching the ascender or the descender 7 pt, those reaching both 9.33 pt; the 14 pt heading's
+        # capitals reach 9.8 pt. Sized by its own box, a line of tall words read as a heading and lifted the body
+        # past the capitals; sized by its line, every body line is 7 pt and the capitals a heading.
+        lines = (
+            (("FACTION", "above"), ("SETUP", "above")),
+            (("The", "above"), ("bold", "above"), ("fox", "above"), ("hid", "above")),
+            (("jumpy", "both"), ("yogi", "both"), ("quips", "both")),
+            (("over", "x"), ("a", "x"), ("rose", "x"), ("vase", "x")),
+            (("Light", "both"), ("fog", "both"), ("lifts", "above")),
+        )
+        words = tuple(
+            found
+            for number, parts in enumerate(lines)
+            for found in inked(parts, 72.0, 100.0 + 40.0 * number, 14.0 if number == 0 else BODY, number)
+        )
+
+        found = vision_elements(words, geometry=GEOMETRY)
+
+        assert [(type(element).__name__, element.text) for element in found.elements] == [
+            ("Heading", "FACTION SETUP"),
+            ("Paragraph", "The bold fox hid"),
+            ("Paragraph", "jumpy yogi quips"),
+            ("Paragraph", "over a rose vase"),
+            ("Paragraph", "Light fog lifts"),
+        ]
+
     def test_a_layout_losing_a_word_warns_with_pass_c(self, monkeypatch):
         real = vision.page_layout
 
@@ -289,7 +397,7 @@ class TestVisionElements:
         # mixed_words() as OCR reads them on the righted (upright) page, placed on the page as displayed.
         size = (LETTER[1], LETTER[0]) if rotation in (90, 270) else LETTER
         on_display = tuple(
-            word(item.text, *displayed_box(plain(item.bbox), rotation, *size), item.confidence)
+            word(item.text, *displayed_box(plain(item.bbox), rotation, *size), item.confidence, item.line)
             for item in mixed_words()
         )
         upright = vision_elements(mixed_words(), geometry=GEOMETRY)
