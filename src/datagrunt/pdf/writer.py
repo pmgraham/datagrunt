@@ -18,17 +18,63 @@ the document, never extracted.
 The writer holds no open file, handle or process between calls (extraction
 and every render close theirs before returning), so there is nothing to
 close.
+
+Each method writes the document as one format and returns the absolute
+path written (``Path.absolute()``: symlinks are not resolved):
+
+- :meth:`PDFWriter.write_json`: the codec's document JSON
+  (:func:`~datagrunt.pdf.codec.document_to_json_bytes`: ASCII, lossless,
+  read back by :func:`~datagrunt.pdf.codec.document_from_json_bytes`).
+- :meth:`PDFWriter.write_jsonl`: one JSON object a line, each element's row
+  of A7a's frame (:func:`~datagrunt.pdf.frame.element_frame`), in document
+  order: its columns in order, ``bbox`` an object, ``scope_path`` and
+  ``hidden_reasons`` arrays. Compact UTF-8 JSON, each line ending in a
+  newline; no element is an empty file. The frame's strings hold each lone
+  surrogate as its escape (``\\ud800``): the JSON is the lossless form.
+- :meth:`PDFWriter.write_markdown`: the document's ``to_markdown()``, UTF-8,
+  each lone surrogate written as its escape (as the bundle's Markdown).
+  Hidden elements stay behind their ``<!-- hidden: ... -->`` markers (A1).
+
+Every file is written atomically (:func:`_write_atomically`): a new file,
+``.tmp_<uuid4 hex>`` beside the target (the same directory, so the same
+filesystem), created exclusively with the process's usual permissions,
+filled, then renamed onto the target (``os.replace``). On any failure, an
+interrupt included, the temporary file is removed and the error raised; an
+existing target is then as it was. A writer killed outright can leave its
+temporary file, the only trace: never a partial target. A target that
+exists is replaced (v4 overwrote too); a symlink there is itself replaced,
+and what it pointed to is untouched. Missing directories above the target
+are created. Nothing outside them is written.
+
+Every path is checked before any work: a str or os.PathLike of str (bytes
+are refused), and a target that is a directory raises
+``IsADirectoryError`` (checked again as the file is written). No ``fsync``
+before the rename (as the bundle): a write survives a killed process, not a
+power loss.
 """
 
+import errno
+import json
 import os
+import uuid
+from collections.abc import Callable
+from pathlib import Path
+from typing import BinaryIO
+
+import polars as pl
 
 from datagrunt.pdf.assembly import MIN_IMAGE_DIMENSION
+from datagrunt.pdf.codec import document_to_json_bytes
 from datagrunt.pdf.elements import PDFDocument
+from datagrunt.pdf.frame import element_frame, utf8_text
 from datagrunt.pdf.pdfium_engine import _checked_password, _checked_path
 from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, extract_document
 from datagrunt.pdf.quality import OcrMode
 
 __all__ = ["PDFWriter"]
+
+# A temporary file's name: this, then a uuid4's hex (the bundle's staging prefix).
+_TEMPORARY_PREFIX = ".tmp_"
 
 
 class PDFWriter:
@@ -74,6 +120,55 @@ class PDFWriter:
         )
         self._source, self._document = _checked_source(source, password)
 
+    def write_json(self, out_filepath: str | os.PathLike[str]) -> Path:
+        """Write the document as the codec's JSON at ``out_filepath`` (see the module notes).
+
+        Returns:
+            The absolute path written.
+
+        Raises:
+            TypeError: If ``out_filepath`` is not a path (before any work).
+            IsADirectoryError: If ``out_filepath`` is a directory (before any work).
+            OSError: If the file cannot be written; as extraction raises it.
+        """
+        target = _file_target(out_filepath)
+        data = document_to_json_bytes(self._extracted())
+        return _write_atomically(target, lambda handle: handle.write(data))
+
+    def write_jsonl(self, out_filepath: str | os.PathLike[str]) -> Path:
+        """Write the document's frame as JSON Lines at ``out_filepath``, one element a line (see the module notes).
+
+        Returns:
+            The absolute path written.
+
+        Raises:
+            TypeError: If ``out_filepath`` is not a path (before any work).
+            IsADirectoryError: If ``out_filepath`` is a directory (before any work).
+            OSError: If the file cannot be written; as extraction raises it.
+        """
+        target = _file_target(out_filepath)
+        frame = element_frame(self._extracted())
+        return _write_atomically(target, lambda handle: _write_rows(frame, handle))
+
+    def write_json_newline_delimited(self, out_filepath: str | os.PathLike[str]) -> Path:
+        """:meth:`write_jsonl` under its v4 name."""
+        return self.write_jsonl(out_filepath)
+
+    def write_markdown(self, out_filepath: str | os.PathLike[str]) -> Path:
+        """Write the document's Markdown at ``out_filepath``, UTF-8 (see the module notes).
+
+        Returns:
+            The absolute path written.
+
+        Raises:
+            TypeError: If ``out_filepath`` is not a path (before any work).
+            IsADirectoryError: If ``out_filepath`` is a directory (before any work).
+            OSError: If the file cannot be written; as extraction raises it.
+        """
+        target = _file_target(out_filepath)
+        data = utf8_text(self._extracted().to_markdown()).encode("utf-8")
+        return _write_atomically(target, lambda handle: handle.write(data))
+
     def _extracted(self) -> PDFDocument:
         """The document: the one given, or the source's, extracted on first use and cached."""
         if self._document is None:
@@ -113,3 +208,45 @@ def _extract(source: PDFSource, options: PipelineOptions) -> PDFDocument:
         min_image_dimension=options.min_image_dimension,
         strict=options.strict,
     )
+
+
+def _file_target(out_filepath: object) -> Path:
+    """``out_filepath`` made absolute, if a file may be written there: it is not a directory."""
+    target = _checked_path(out_filepath, "out_filepath").absolute()
+    _refuse_directory(target)
+    return target
+
+
+def _refuse_directory(target: Path) -> None:
+    if target.is_dir():
+        raise IsADirectoryError(errno.EISDIR, "out_filepath is a directory, not a file", str(target))
+
+
+def _write_atomically(target: Path, fill: Callable[[BinaryIO], object]) -> Path:
+    """Write ``target`` through ``fill`` into a new temporary file beside it, then rename it on (see the module notes).
+
+    Returns:
+        ``target``.
+
+    Raises:
+        IsADirectoryError: If ``target`` is a directory, or becomes one.
+        OSError: If a directory cannot be made, or the file written or renamed.
+    """
+    _refuse_directory(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f"{_TEMPORARY_PREFIX}{uuid.uuid4().hex}")
+    try:
+        with temporary.open("xb") as handle:
+            fill(handle)
+        os.replace(temporary, target)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return target
+
+
+def _write_rows(frame: pl.DataFrame, handle: BinaryIO) -> None:
+    """Write each row of ``frame`` as a line of compact UTF-8 JSON, in order."""
+    for row in frame.iter_rows(named=True):
+        line = json.dumps(row, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        handle.write(line.encode("utf-8") + b"\n")
