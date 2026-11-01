@@ -36,6 +36,8 @@ FIGURE_B_SHA = hashlib.sha256(b"figure-b").hexdigest()
 BOX = BBox(x0=72.0, y0=72.25, x1=540.5, y1=90.0)
 OFF_PAGE = BBox(x0=700.0, y0=10.0, x1=720.0, y1=20.0)
 INTRO = ("Intro",)
+# rich_document's page sizes, in points: a PDF of these pages renders as its pages.
+PAGE_SIZES = ((612.0, 792.0), (595.5, 842.25), (612.0, 792.0), (612.0, 792.0))
 DETAILS = ("Intro", "Details")
 
 Loader = Callable[[], bytes]
@@ -80,11 +82,13 @@ def ids(page: int, index: int, scope_path: tuple[str, ...] = (), bbox: BBox = BO
     }
 
 
-def metadata(page_count: int, *, source_name: str = "report.pdf", title=None, author=None) -> DocumentMetadata:
+def metadata(
+    page_count: int, *, source_name: str = "report.pdf", sha: str = SOURCE_SHA, title=None, author=None
+) -> DocumentMetadata:
     return DocumentMetadata(
-        doc_id=DocumentMetadata.make_doc_id(source_name, SOURCE_SHA),
+        doc_id=DocumentMetadata.make_doc_id(source_name, sha),
         source_name=source_name,
-        sha256=SOURCE_SHA,
+        sha256=sha,
         page_count=page_count,
         title=title,
         author=author,
@@ -170,8 +174,18 @@ def error_page() -> Page:
     return page(4, (), status="error", route="vision", quality=None, error="pdfium: bad xref", warnings=("w",))
 
 
-def rich_document(figure_loader: Loader | None = None, other_loader: Loader | None = None) -> PDFDocument:
-    """Four pages holding every element type and field (see the module notes)."""
+def rich_document(
+    figure_loader: Loader | None = None,
+    other_loader: Loader | None = None,
+    *,
+    sha: str = SOURCE_SHA,
+    source_name: str = "report.pdf",
+) -> PDFDocument:
+    """Four pages holding every element type and field (see the module notes).
+
+    ``sha`` and ``source_name`` make it the document of a real PDF of
+    :data:`PAGE_SIZES` pages, for the bundle's renders.
+    """
     pages = (first_page(figure_loader), second_page(figure_loader, other_loader), vision_page(), error_page())
     one, two, three = (p.elements for p in pages[:3])
     sections = (
@@ -180,7 +194,7 @@ def rich_document(figure_loader: Loader | None = None, other_loader: Loader | No
         Section(heading=two[0], scope_path=DETAILS, page_span=(2, 3), elements=(*two, *three)),
     )
     return PDFDocument(
-        metadata=metadata(4, title="Report — Q3", author=None),
+        metadata=metadata(4, source_name=source_name, sha=sha, title="Report — Q3", author=None),
         pages=pages,
         sections=sections,
         header_context=one[:2],
