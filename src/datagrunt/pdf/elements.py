@@ -33,7 +33,14 @@ from datagrunt.pdf._validate import (
 from datagrunt.pdf.exceptions import DatagruntPDFError
 
 HiddenReason: TypeAlias = Literal[
-    "off_page", "invisible", "tiny_font", "transparent", "matches_background", "zero_scale", "duplicate"
+    "off_page",
+    "invisible",
+    "tiny_font",
+    "transparent",
+    "matches_background",
+    "zero_scale",
+    "duplicate",
+    "superseded",
 ]
 """Why a text span is hidden from a human reader (it is flagged, never dropped).
 
@@ -43,8 +50,13 @@ drawn under 1 pt per em wide and narrower than tall, as text pdfium's
 textpage drops (``Tz 0``: the v5 engine recovers it) or keeps (``Tz 0.05``)
 (#366). ``duplicate`` means the text is a drawn copy of text the page
 already shows (a shadow or outline drawn on it), which a reader reads once
-(#406). New reasons are appended, so the canonical order of the older ones
-never changes.
+(#406). ``superseded`` means the text is the digital text layer of a page
+whose content was read by OCR of the rendered page (a ``"vision"`` page,
+#369): the page went to vision because that layer held too little valid
+text, so the visible elements are OCR's and the layer is kept apart, never
+dropped. Only text with no other reason is superseded: hidden text keeps
+its own reasons. New reasons are appended, so the canonical order of the
+older ones never changes.
 """
 
 # Canonical order, derived from the Literal so the two can never drift apart.

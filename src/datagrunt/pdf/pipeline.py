@@ -13,25 +13,26 @@ is opened from (its path and password), in this process or in a worker.
 1. A2 :func:`~datagrunt.pdf.pdfium_engine.extract_page`. A
    :class:`~datagrunt.pdf.pdfium_engine.PageFailure` raises
    :class:`~datagrunt.pdf.exceptions.PDFCorruptError` naming the page under
-   ``strict``; else it is :func:`_fallback_page`'s.
+   ``strict``; else it is A5b's :func:`~datagrunt.pdf.vision.fallback_page`'s
+   (its geometry read again, then render and OCR: ``"ocr_fallback"``, or an
+   error page naming why it was not read).
 2. A2 :func:`~datagrunt.pdf.pdfium_engine.recover_dropped_text`, when the
    page's textpage drops text objects (``TextStats.dropped_text_objects``
    over 0).
 3. A3 :func:`~datagrunt.pdf.quality.assess_page`, with the ``ocr`` option
    and the recovery.
 4. The route: a digital or hybrid page is A4a's lattice tables, then A4b's
-   :func:`~datagrunt.pdf.assembly.assemble_page`; a vision page is
-   :func:`_vision_page`'s.
+   :func:`~datagrunt.pdf.assembly.assemble_page`; a vision page is A5b's
+   :func:`~datagrunt.pdf.vision.vision_page`'s (render and OCR: ``"ok"``,
+   or ``"ocr_unavailable"`` with its digital text when OCR cannot read it).
+   Both A5b steps take the source's password, ``ocr``,
+   ``min_image_dimension`` (a vision page's figures), and ``vision_dpi`` and
+   ``max_render_pixels`` (:class:`~datagrunt.pdf.vision.VisionOptions`).
 5. Isolation: any other exception (an ``Exception``; an interrupt is never
    caught) is an error page whose ``error`` is ``"<type>: <message>"``,
    recorded, never dropped. Under ``strict`` it raises a PDFCorruptError
    naming the page, chained from it (a PDFCorruptError that already names
    the page is raised as it is).
-
-Two stand-ins hold A5b's place, each one small function A5b replaces:
-:func:`_vision_page` (a vision page is ``assemble_page``'s
-``"ocr_unavailable"`` page) and :func:`_fallback_page` (a page A2 cannot
-read is an error page).
 
 :func:`extract_document` runs every page's steps in page order, then the
 document's:
@@ -112,7 +113,9 @@ image's own SHA-256 when it reads.
 
 An error page (A1: no elements, no quality, never verified) is routed
 ``"vision"``, the spec's route for a page whose extraction fails (render
-and OCR, A5b). Its size is the page's, read with
+and OCR, A5b). A page A2 could not read is ``fallback_page``'s; a page
+whose step raised (step 5), or a worker's lost page, is this module's: its
+size is the page's, read with
 :func:`~datagrunt.pdf.pdfium_engine.page_geometry`; when that cannot be
 read either, it is pdfium's default page size (612 x 792 pt, what pdfium
 reads for an empty MediaBox), and a warning says so and why. A worker's
@@ -171,6 +174,7 @@ from datagrunt.pdf.pdfium_engine import (
 from datagrunt.pdf.quality import OcrMode, PageAssessment, assess_page
 from datagrunt.pdf.render import _MIN_RENDER_PIXELS, _MIN_TARGET_DPI
 from datagrunt.pdf.scope import apply_scope
+from datagrunt.pdf.vision import VisionOptions, fallback_page, vision_page
 
 __all__ = ["PDFSource", "PipelineOptions", "SourceIdentity", "extract_document", "extract_page_at"]
 
@@ -500,13 +504,27 @@ def _routed_page(handle: DocumentHandle, source: PDFSource, index: int, options:
     if isinstance(raw, PageFailure):
         if options.strict:
             raise PDFCorruptError(raw.message, page_number=raw.page_number)
-        return _fallback_page(handle, index, raw)
+        return fallback_page(
+            handle, raw, source=source.path, password=source.password, ocr=options.ocr, options=_vision(options)
+        )
     dropped = raw.text.stats.dropped_text_objects
     recovered = recover_dropped_text(handle, index) if dropped > 0 else None
     assessment = assess_page(raw, ocr=options.ocr, recovered=recovered)
     if assessment.route == "vision":
-        return _vision_page(raw, assessment, source, options)
+        return vision_page(
+            raw,
+            assessment,
+            source=source.path,
+            password=source.password,
+            min_image_dimension=options.min_image_dimension,
+            options=_vision(options),
+        )
     return _assembled_page(raw, assessment, source, options)
+
+
+def _vision(options: PipelineOptions) -> VisionOptions:
+    """How A5b renders and reads a page under ``options``: its vision DPI and pixel bound, A5b's other defaults."""
+    return VisionOptions(vision_dpi=options.vision_dpi, max_render_pixels=options.max_render_pixels)
 
 
 def _assembled_page(raw: RawPage, assessment: PageAssessment, source: PDFSource, options: PipelineOptions) -> Page:
@@ -520,26 +538,6 @@ def _assembled_page(raw: RawPage, assessment: PageAssessment, source: PDFSource,
         password=source.password,
         min_image_dimension=options.min_image_dimension,
     )
-
-
-def _vision_page(raw: RawPage, assessment: PageAssessment, source: PDFSource, options: PipelineOptions) -> Page:
-    """A vision page. A stand-in for A5b's ``vision_page``, which replaces this function.
-
-    Until A5b lands, a vision page is :func:`_assembled_page`'s: A4b's
-    :func:`~datagrunt.pdf.assembly.assemble_page` makes it an
-    ``"ocr_unavailable"`` page (A1: its digital text kept as its elements,
-    never ``integrity_verified``), with a warning that OCR has not run.
-    """
-    return _assembled_page(raw, assessment, source, options)
-
-
-def _fallback_page(handle: DocumentHandle, index: int, failure: PageFailure) -> Page:
-    """A page A2 could not read. A stand-in for A5b's ``fallback_page``, which replaces this function.
-
-    Until A5b lands (render and OCR, an ``"ocr_fallback"`` page), it is an
-    error page whose ``error`` is the stage's PDFCorruptError and the stage.
-    """
-    return _error_page(handle, index, f"PDFCorruptError: {failure.message} (stage {failure.stage!r})")
 
 
 def _error_page(handle: DocumentHandle | None, index: int, error: str) -> Page:

@@ -88,9 +88,19 @@ from datagrunt.pdf.pdfium_engine import (
     RawPage,
     _checked_path,
 )
-from datagrunt.pdf.quality import PageAssessment
+from datagrunt.pdf.quality import PageAssessment, SpanPiece
 
-__all__ = ["FigureDraft", "PageFigures", "assemble_page", "page_figures", "pass_c"]
+__all__ = [
+    "FigureDraft",
+    "PageFigures",
+    "assemble_page",
+    "check_assessment",
+    "conservation",
+    "page_elements",
+    "page_figures",
+    "pass_c",
+    "raw_page_warnings",
+]
 
 # v4's default minimum image side in pixels (core.pdf_io.extraction.config._DEFAULT_MIN_IMAGE_DIMENSION).
 MIN_IMAGE_DIMENSION = 40
@@ -104,10 +114,12 @@ _NAMED_OBJECTS = 5
 # The reading turn of an upright table, whose columns run left to right on the page.
 _UPRIGHT = 0
 
-# What a vision page's warnings say: assemble_page lays out its digital text, and never pretends to OCR it.
-_VISION_NOTE = "route 'vision': OCR (A5) has not run on this page; its digital text is kept as its elements"
+# What a vision page's warnings say: assemble_page lays out its digital text, and never pretends to OCR it
+# (A5b's vision route adds why OCR did not read it).
+_VISION_NOTE = "route 'vision': the page was not read by OCR; its digital text is kept as its elements"
 
 _ELEMENT_TYPES: tuple[type, ...] = get_args(DocumentElement)
+_PAGE_ITEMS: tuple[type, ...] = get_args(PageItem)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -313,11 +325,13 @@ def assemble_page(
     (skipped text, path and image objects), then the figures', A3's,
     A4a's (grids past its bounds), the layout's, and Pass C's.
 
-    A vision page (A5's) is not OCR'd here, and not passed off as OCR'd:
-    its digital text is laid out as on any page, its status is
-    ``"ocr_unavailable"`` (A1: a vision page whose OCR has not run, its
+    A vision page is not OCR'd here, and not passed off as OCR'd: its
+    digital text is laid out as on any page, its status is
+    ``"ocr_unavailable"`` (A1: a vision page whose OCR could not run, its
     digital text kept), it is never ``integrity_verified`` (A1) and a
-    warning says OCR has not run. A5 replaces it.
+    warning says OCR did not read it. A5b's
+    :func:`~datagrunt.pdf.vision.vision_page` OCRs a vision page, and lays
+    it out here when OCR cannot read it, adding why.
 
     Raises:
         TypeError: If an argument is of the wrong type.
@@ -338,10 +352,10 @@ def assemble_page(
         height_pt=geometry.height_pt,
         figures=boxes,
     )
-    elements = tuple(_element(item, order, figures.drafts, geometry) for order, item in enumerate(layout.items))
+    elements = page_elements(layout.items, figures.drafts, geometry)
     verified, mismatch = pass_c(assessment, elements)
     vision = assessment.route == "vision"
-    warnings = (*_raw_warnings(raw_page), *figures.warnings, *assessment.warnings, *_lattice_warnings(lattice))
+    warnings = (*raw_page_warnings(raw_page), *figures.warnings, *assessment.warnings, *_lattice_warnings(lattice))
     warnings += (*layout.warnings, *((_VISION_NOTE,) if vision else ()), *mismatch)
     return Page(
         page_number=geometry.page_number,
@@ -358,12 +372,22 @@ def assemble_page(
 
 def _check_inputs(raw_page: object, assessment: object, lattice: object) -> None:
     """Require a RawPage, a PageAssessment of it (same chars and rotation) and a LatticeResult."""
+    check_assessment(raw_page, assessment)
+    if not isinstance(lattice, LatticeResult):
+        raise TypeError(f"lattice must be a LatticeResult, got {type(lattice).__name__}")
+
+
+def check_assessment(raw_page: object, assessment: object) -> None:
+    """Require a RawPage and a PageAssessment of it: the same chars and rotation (A5b's vision route checks so too).
+
+    Raises:
+        TypeError: If ``raw_page`` is not a RawPage or ``assessment`` not a PageAssessment.
+        ValueError: If ``assessment`` is not of ``raw_page`` (its chars or rotation differ).
+    """
     if not isinstance(raw_page, RawPage):
         raise TypeError(f"raw_page must be a RawPage, got {type(raw_page).__name__}")
     if not isinstance(assessment, PageAssessment):
         raise TypeError(f"assessment must be a PageAssessment, got {type(assessment).__name__}")
-    if not isinstance(lattice, LatticeResult):
-        raise TypeError(f"lattice must be a LatticeResult, got {type(lattice).__name__}")
     chars = sum(len(span.text) for span in raw_page.text.spans)
     pieces = sum(piece.end - piece.start for piece in assessment.pieces)
     if assessment.quality.char_count != chars or pieces != chars:
@@ -372,6 +396,32 @@ def _check_inputs(raw_page: object, assessment: object, lattice: object) -> None
     if assessment.quality.rotation_deg != raw_page.geometry.rotation_deg:
         turned = f"assessment is of a page turned {assessment.quality.rotation_deg}"
         raise ValueError(f"{turned}, not {raw_page.geometry.rotation_deg}: the assessment is of another page")
+
+
+def page_elements(
+    items: tuple[PageItem, ...], drafts: tuple[FigureDraft, ...], geometry: PageGeometry
+) -> tuple[DocumentElement, ...]:
+    """The A1 element of each layout item, in order (:func:`assemble_page`, step 3).
+
+    ``reading_order`` is the item's position and ``element_id`` its
+    canonical id on ``geometry``'s page; a figure slot names its draft in
+    ``drafts``. A5b's vision route converts its layout with it too.
+
+    Raises:
+        TypeError: If ``items`` is not a tuple of layout items, ``drafts``
+            not a tuple of FigureDraft, or ``geometry`` not a PageGeometry.
+        ValueError: If a figure slot names no draft.
+    """
+    typed_tuple("items", items, object)
+    typed_tuple("drafts", drafts, FigureDraft)
+    if not isinstance(geometry, PageGeometry):
+        raise TypeError(f"geometry must be a PageGeometry, got {type(geometry).__name__}")
+    for index, item in enumerate(items):
+        if not isinstance(item, _PAGE_ITEMS):
+            raise TypeError(f"items[{index}] must be a layout item, got {type(item).__name__}")
+        if isinstance(item, FigureSlot) and item.index >= len(drafts):
+            raise ValueError(f"items[{index}] is figure {item.index}, but there are {len(drafts)} figure drafts")
+    return tuple(_element(item, order, drafts, geometry) for order, item in enumerate(items))
 
 
 class _Ids(TypedDict):
@@ -442,7 +492,7 @@ def _clamped(bbox: BBox, width: float, height: float) -> BBox:
     )
 
 
-def _raw_warnings(page: RawPage) -> tuple[str, ...]:
+def raw_page_warnings(page: RawPage) -> tuple[str, ...]:
     """A2's text and path counts that cost the page something, as warnings (its image counts: :func:`page_figures`)."""
     text, paths = page.text.stats.skipped_nonfinite_objects, page.segments.stats.skipped_nonfinite_paths
     found = []
@@ -490,10 +540,25 @@ def pass_c(assessment: PageAssessment, elements: tuple[DocumentElement, ...]) ->
     """
     if not isinstance(assessment, PageAssessment):
         raise TypeError(f"assessment must be a PageAssessment, got {type(assessment).__name__}")
+    return conservation((*assessment.pieces, *assessment.recovered_pieces), elements)
+
+
+def conservation(pieces: tuple[SpanPiece, ...], elements: tuple[DocumentElement, ...]) -> tuple[bool, tuple[str, ...]]:
+    """Pass C's rule over any ``pieces``: their non-whitespace chars, as a multiset, are ``elements``' exactly.
+
+    :func:`pass_c` is this over an assessment's pieces and recovered
+    pieces; A5b's vision route checks its OCR pieces and the digital text
+    it keeps apart with it. Returns as :func:`pass_c`. O(chars).
+
+    Raises:
+        TypeError: If ``pieces`` is not a tuple of SpanPiece or ``elements``
+            is not a tuple of A1 elements.
+    """
+    typed_tuple("pieces", pieces, SpanPiece)
     for index, element in enumerate(typed_tuple("elements", elements, object)):
         if not isinstance(element, _ELEMENT_TYPES):
             raise TypeError(f"elements[{index}] must be an A1 element, got {type(element).__name__}")
-    expected = _solid_chars(piece.text for piece in (*assessment.pieces, *assessment.recovered_pieces))
+    expected = _solid_chars(piece.text for piece in pieces)
     found = _solid_chars(text for element in elements for text in _element_texts(element))
     if expected == found:
         return True, ()
