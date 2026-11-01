@@ -20,7 +20,7 @@ from typing import Literal, TypeAlias, Union, get_args
 import polars as pl
 import pyarrow as pa
 
-from datagrunt.core.pdf_io.extraction.markdown_escape import escape_markdown_link_target
+from datagrunt.pdf._markdown_escape import escape_markdown_link_target
 from datagrunt.pdf._validate import (
     finite_float,
     int_at_least,
@@ -33,7 +33,7 @@ from datagrunt.pdf._validate import (
 from datagrunt.pdf.exceptions import DatagruntPDFError
 
 HiddenReason: TypeAlias = Literal[
-    "off_page", "invisible", "tiny_font", "transparent", "matches_background", "zero_scale"
+    "off_page", "invisible", "tiny_font", "transparent", "matches_background", "zero_scale", "duplicate"
 ]
 """Why a text span is hidden from a human reader (it is flagged, never dropped).
 
@@ -41,7 +41,9 @@ HiddenReason: TypeAlias = Literal[
 background it is drawn on. ``zero_scale`` means the text is squeezed flat:
 drawn under 1 pt per em wide and narrower than tall, as text pdfium's
 textpage drops (``Tz 0``: the v5 engine recovers it) or keeps (``Tz 0.05``)
-(#366). New reasons are appended, so the canonical order of the older ones
+(#366). ``duplicate`` means the text is a drawn copy of text the page
+already shows (a shadow or outline drawn on it), which a reader reads once
+(#406). New reasons are appended, so the canonical order of the older ones
 never changes.
 """
 

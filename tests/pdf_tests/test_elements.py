@@ -71,6 +71,7 @@ class TestTypeAliases:
             "transparent",
             "matches_background",
             "zero_scale",
+            "duplicate",
         )
 
     def test_hidden_reason_literal_members(self):
@@ -81,6 +82,7 @@ class TestTypeAliases:
             "transparent",
             "matches_background",
             "zero_scale",
+            "duplicate",
         )
 
     def test_page_status_values(self):
@@ -199,7 +201,8 @@ class TestElementBase:
             _element(cls, scope_path=bad)
 
     @pytest.mark.parametrize(
-        "reasons", [("off_page",), ("invisible", "transparent"), ("matches_background",), HIDDEN_REASONS]
+        "reasons",
+        [("off_page",), ("invisible", "transparent"), ("matches_background",), ("duplicate",), HIDDEN_REASONS],
     )
     def test_hidden_reasons_flag_element_as_hidden(self, cls, reasons):
         element = _element(cls, hidden_reasons=reasons)
@@ -209,11 +212,15 @@ class TestElementBase:
     @pytest.mark.parametrize(
         ("bad", "match"),
         [
-            (("invisible", "invisible"), "duplicate"),
+            # "duplicate" is also a reason's name: match the repeated-entries message itself.
+            (("invisible", "invisible"), "duplicate entries"),
+            (("duplicate", "duplicate"), "duplicate entries"),
             (("blurry",), "unknown"),
             (("tiny_font", "off_page"), "canonical order"),
             (("transparent", "invisible"), "canonical order"),
             (("matches_background", "transparent"), "canonical order"),
+            # Appended last, so it follows every older reason.
+            (("duplicate", "zero_scale"), "canonical order"),
         ],
     )
     def test_bad_hidden_reasons_rejected(self, cls, bad, match):
