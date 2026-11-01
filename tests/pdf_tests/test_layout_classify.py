@@ -107,6 +107,22 @@ class TestHeadings:
 
         assert described(items) == expected
 
+    def test_a_bold_line_inside_a_wrapped_paragraph_is_no_heading(self, tmp_path):
+        # Review probe: the bold line is emphasis set mid-paragraph, not a heading (A6 would scope the page under it).
+        texts = (
+            "Operators must read the manual before use and",
+            "must never exceed the rated load of the hoist",
+            "under any circumstances whatsoever, as the",
+            "chain may fail without warning in that case.",
+        )
+        fonts = ("Helvetica", "Helvetica-Bold", "Helvetica", "Helvetica")
+        items = tuple(
+            TextRun(text, 72.0, 100.0 + 12.0 * at, size=10.0, font=font)
+            for at, (text, font) in enumerate(zip(texts, fonts))
+        )
+
+        assert described(read_items(tmp_path, *items)) == [("paragraph", " ".join(texts))]
+
     def test_a_bold_paragraph_of_two_lines_is_no_heading(self, tmp_path):
         items = read_items(tmp_path, *lines_of(("Bold words", "over two lines"), font="Helvetica-Bold"), *body(150.0))
 

@@ -168,6 +168,8 @@ _SECTION_NUMBER = re.compile(r"(?:\d+|[A-Z])(?:\.\d+)+\.?(?=\s|$)")
 _SAME_SIZE_PT = 0.6
 # ... and each starts at most this many ems (of that size, at least 1 pt) below the one before.
 _PARAGRAPH_GAP_EM = 1.6
+# A line ending in one of these ends a clause, so a change of boldness after it starts a paragraph.
+_CLAUSE_ENDS = (".", "!", "?", ":")
 
 # Sweep events at one x: horizontal rules open, then vertical rules query, then horizontal rules close.
 _OPEN, _QUERY, _CLOSE = 0, 1, 2
@@ -1551,9 +1553,13 @@ def _paragraphs(lines: list[TextLine]) -> list[TextBlock]:
     """Lines (in reading order) merged into paragraphs: v4's ``_merge_lines``, ported (see :func:`_continues`)."""
     groups: list[list[TextLine]] = []
     extents: list[tuple[float, float]] = []
+    measures: dict[int, float] = {}
+    for line in lines:
+        end = _turned(_plain(line.bbox), line.turn)[2]
+        measures[line.turn] = max(measures.get(line.turn, end), end)
     for line in lines:
         box = _turned(_plain(line.bbox), line.turn)
-        if groups and _continues(groups[-1], extents[-1], line, box):
+        if groups and _continues(groups[-1], extents[-1], line, box, measures[line.turn]):
             groups[-1].append(line)
             extents[-1] = (min(extents[-1][0], box[0]), max(extents[-1][1], box[2]))
         else:
@@ -1565,7 +1571,7 @@ def _paragraphs(lines: list[TextLine]) -> list[TextBlock]:
     ]
 
 
-def _continues(group: list[TextLine], extent: tuple[float, float], line: TextLine, box: Box) -> bool:
+def _continues(group: list[TextLine], extent: tuple[float, float], line: TextLine, box: Box, measure: float) -> bool:
     """True if ``line`` (``box`` in its own frame) continues the paragraph ``group`` (v4's ``_should_merge``).
 
     v4's rule: the line does not start a paragraph by its text
@@ -1573,10 +1579,12 @@ def _continues(group: list[TextLine], extent: tuple[float, float], line: TextLin
     :data:`_SAME_SIZE_PT` of the paragraph's first line; it starts at most
     :data:`_PARAGRAPH_GAP_EM` ems below the last line; it overlaps the
     paragraph's extent across. v5 adds: the same turn, the geometry read in
-    its frame; the same boldness as the last line (:attr:`TextLine.is_bold`),
-    so a bold heading set at the body's size, directly over it, stays a
-    block of its own (on the corpus this splits 18 blocks, each a bold
-    question, heading or label from the text under it). v4 asked a gap of
+    its frame; and a change of boldness (:attr:`TextLine.is_bold`) only
+    where the text runs on (:func:`_bold_runs_on`, ``measure`` the column's
+    line end), so a bold heading set at the body's size, directly over or
+    under it, stays a block of its own (on the corpus each of the 16 such
+    splits is a bold question, heading or label), and bold words set
+    mid-paragraph do not. v4 asked a gap of
     at least 0: its object boxes were tight, but pdfium's char boxes run
     ascent to descent, so lines set solid overlap; v5 asks the line to
     start below the last line's top instead. Sizes are to 0.1 pt and their
@@ -1584,13 +1592,31 @@ def _continues(group: list[TextLine], extent: tuple[float, float], line: TextLin
     threshold.
     """
     first, last = group[0], group[-1]
-    if line.turn != first.turn or line.is_bold != last.is_bold or _starts_paragraph(line.text.lstrip()):
+    if line.turn != first.turn or _starts_paragraph(line.text.lstrip()):
+        return False
+    if line.is_bold != last.is_bold and not _bold_runs_on(group, line, measure):
         return False
     if round(abs(line.font_size_pt - first.font_size_pt), 1) >= _SAME_SIZE_PT:
         return False
     _, last_top, _, last_bottom = _turned(_plain(last.bbox), line.turn)
     below = last_top < box[1] and box[1] - last_bottom <= _PARAGRAPH_GAP_EM * max(first.font_size_pt, 1.0)
     return below and box[0] <= extent[1] and box[2] >= extent[0]
+
+
+def _bold_runs_on(group: list[TextLine], line: TextLine, measure: float) -> bool:
+    """True if ``line``, bold where the paragraph's last line is not or the reverse, still runs on from it.
+
+    A paragraph that opened bold is a heading: it ends at its first
+    regular line, however long it runs (so it is bold throughout).
+    Otherwise the last line must have wrapped onto ``line``
+    (:func:`_wrapped`, ``measure`` the column's longest line end in the
+    line's frame) and end no clause (``.``, ``!``, ``?`` or ``:``): bold
+    words set mid-paragraph, not a heading.
+    """
+    last = group[-1]
+    if group[0].is_bold:
+        return False
+    return _wrapped(last, line, measure) and not last.text.rstrip().endswith(_CLAUSE_ENDS)
 
 
 def _starts_paragraph(text: str) -> bool:

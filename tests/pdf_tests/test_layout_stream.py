@@ -723,6 +723,66 @@ class TestTextBlocks:
 
         assert block_texts(read_blocks(tmp_path, *items)) == ["Overview", "The woodland is vast."]
 
+    @staticmethod
+    def bold_lines(*lines: tuple[str, bool]):
+        """text_blocks of ``(text, bold)`` lines in 6 pt chars from x 10, 14 pt apart from y 10."""
+        pieces = tuple(chars(text, 10.0, 10.0 + 14.0 * at, is_bold=bold) for at, (text, bold) in enumerate(lines))
+        return block_texts(text_blocks(pieces, NO_TABLES))
+
+    def test_a_bold_line_a_wrapped_line_runs_into_continues_its_paragraph(self):
+        # Each line runs to the column's measure (45 chars) and none ends a clause: the bold words are emphasis.
+        lines = (
+            ("Operators must read the manual before use and", False),
+            ("must never exceed the rated load of the hoist", True),
+            ("under any circumstances whatsoever, as the", False),
+            ("chain may fail without warning in that case.", False),
+        )
+
+        assert self.bold_lines(*lines) == [" ".join(text for text, _ in lines)]
+
+    @pytest.mark.parametrize("end", [".", "!", "?", ":", ". "])
+    def test_a_bold_line_after_a_full_line_ending_a_clause_starts_a_paragraph(self, end):
+        lines = (("The woodland is vast and its creatures many" + end, False), ("Overview of play", True))
+
+        assert self.bold_lines(*lines, ("The game is played in rounds.", False)) == [
+            "The woodland is vast and its creatures many" + end,
+            "Overview of play",
+            "The game is played in rounds.",
+        ]
+
+    def test_a_bold_line_after_a_line_that_did_not_wrap_starts_a_paragraph(self):
+        # The column's measure is its longest line's end, not the paragraph's so far: "A short line" ends 216 pt
+        # short of it, room for "Overview".
+        lines = (
+            ("The woodland is vast and its creatures many and", False),
+            ("A short line", False),
+            ("Overview of play", True),
+        )
+
+        assert self.bold_lines(*lines) == [
+            "The woodland is vast and its creatures many and A short line",
+            "Overview of play",
+        ]
+
+    def test_a_long_bold_line_opening_a_block_stays_its_own(self):
+        # A heading at a block's start ends at the first regular line, however long it runs.
+        lines = (
+            ("A heading as long as the lines of its body is", True),
+            ("still a heading, for its body is set in regular", False),
+            ("type below it.", False),
+        )
+
+        assert self.bold_lines(*lines) == [lines[0][0], f"{lines[1][0]} {lines[2][0]}"]
+
+    def test_a_bold_line_ending_a_clause_inside_a_paragraph_ends_it(self):
+        lines = (
+            ("Operators must read the manual before use and", False),
+            ("never exceed the rated load of the hoist, ever.", True),
+            ("Maintenance intervals are listed in the annex", False),
+        )
+
+        assert self.bold_lines(*lines) == [f"{lines[0][0]} {lines[1][0]}", lines[2][0]]
+
     def test_lines_that_are_all_bold_merge_as_any_others(self, tmp_path):
         items = column(("A bold paragraph", "set over two lines"), 72.0, 100.0, font="Helvetica-Bold")
 
