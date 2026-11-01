@@ -179,5 +179,9 @@ class TestLoneSurrogates:
         assert frame["scope_path"].to_list() == [["Bad \\ud800 heading"]] * 4
         assert "\\ud800" in frame["markdown"][0]
 
+    def test_element_text_refuses_a_non_element(self):
+        with pytest.raises(TypeError, match="element must be a document element, got str"):
+            element_text("p0001_e000")
+
     def test_text_without_surrogates_is_unchanged(self):
         assert element_text(rich_document().elements[3]) == "Body text.\nSecond line."

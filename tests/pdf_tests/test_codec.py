@@ -434,6 +434,16 @@ class TestBadValues:
         with pytest.raises((TypeError, ValueError), match=where):
             document_from_json(changed(path, value))
 
+    def test_an_element_must_be_an_object_with_a_kind(self):
+        with pytest.raises(TypeError, match=r"pages\[0\]\.elements\[0\] must be a JSON object, got list"):
+            document_from_json(changed(("pages", 0, "elements", 0), []))
+        with pytest.raises(ValueError, match=r"pages\[0\]\.elements\[0\] has missing key\(s\) \['kind'\]"):
+            document_from_json(changed(("pages", 0, "elements", 0, "kind"), delete=True))
+
+    def test_a_band_path_must_be_a_str(self):
+        with pytest.raises(TypeError, match=r"band_paths\[0\] must be a str, got int"):
+            document_from_json(changed(("pages", 2, "page_image", "band_paths"), [5]))
+
     def test_unknown_kind_is_refused(self):
         with pytest.raises(ValueError, match="kind must be one of"):
             document_from_json(changed(("pages", 0, "elements", 0, "kind"), "chart"))
