@@ -53,6 +53,7 @@ from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf, hand_w
 from pdf_tests.test_layout_apart import tiny_text_page
 from pdf_tests.test_layout_lattice import rules as lattice_rules
 from pdf_tests.test_layout_lattice import written
+from pdf_tests.test_layout_stream import after
 from pdf_tests.test_layout_stream_tables import body_text, staircase, table_runs
 from pdf_tests.test_pdfium_engine import imported_modules
 from pdf_tests.test_pdfium_spans import content_page
@@ -891,6 +892,38 @@ class TestAssemblePageArguments:
         assert table.column_centres == (40.0, 200.0)
 
 
+def split_tables(tmp_path, tail, head) -> tuple[Table, Table]:
+    """The tables of a 2-page PDF, after apply_scope: ``tail`` (runs) ending page 1, ``head`` starting page 2."""
+    pages = [
+        PageSpec(items=(TextRun("Parts list", 72.0, 60.0, size=18.0), *body_text(100.0), *tail)),
+        PageSpec(items=(*head, *body_text(300.0))),
+    ]
+    path = build_pdf(tmp_path / "split.pdf", pages)
+    scoped = apply_scope((assembled(path, 0), assembled(path, 1)))
+    (first,) = [element for element in scoped.pages[0].elements if isinstance(element, Table)]
+    (second,) = [element for element in scoped.pages[1].elements if isinstance(element, Table)]
+    return first, second
+
+
+def flush_right(rows, start: float, ends: tuple[float, ...], top: float) -> tuple[TextRun, ...]:
+    """One 11 pt TextRun per cell, rows 14 pt apart from ``top``: column 0 from ``start``, others ending at ``ends``."""
+    runs = []
+    for index, row in enumerate(rows):
+        y = top + 14.0 * index
+        runs.append(TextRun(row[0], start, y))
+        runs.extend(TextRun(text, end - after(text, 0.0), y) for text, end in zip(row[1:], ends))
+    return tuple(runs)
+
+
+def centred_runs(rows, middles: tuple[float, ...], top: float) -> tuple[TextRun, ...]:
+    """One 11 pt TextRun per cell, rows 14 pt apart from ``top``, each column's cells centred on its middle."""
+    return tuple(
+        TextRun(text, middle - after(text, 0.0) / 2, top + 14.0 * index)
+        for index, row in enumerate(rows)
+        for text, middle in zip(row, middles)
+    )
+
+
 class TestSplitTablesLinkAcrossPages:
     """A6's apply_scope links a table split across two pages from real assemble_page output."""
 
@@ -921,6 +954,57 @@ class TestSplitTablesLinkAcrossPages:
         (head_table,) = [element for element in scoped.pages[1].elements if isinstance(element, Table)]
         assert tail_table.extraction_method == head_table.extraction_method == kind
         assert head_table.continued_from_id == tail_table.element_id
+
+    @pytest.mark.parametrize(
+        "tail_rows,head_rows",
+        [
+            # #409's probe: a column is where its cells start, so the widest cells no longer move it.
+            pytest.param(PARTS, (("Washer", "100", "0.01"), ("Pin", "8", "0.02")), id="head-repeats-the-widest-row"),
+            pytest.param(PARTS, (("Pin", "8", "0.02"), ("Rivet", "20", "0.03")), id="head-without-the-widest-cells"),
+            pytest.param(
+                PARTS[:3] + (("Stainless hex bolt M8", "100", "0.01"),),
+                (("Pin", "8", "0.02"), ("Rivet", "20", "0.03")),
+                id="tail-with-a-long-part-name",
+            ),
+        ],
+    )
+    def test_the_parts_link_whatever_their_widest_cells(self, tmp_path, tail_rows, head_rows):
+        tail, head = split_tables(tmp_path, table_runs(tail_rows, top=650.0), table_runs(head_rows, top=60.0))
+
+        assert head.continued_from_id == tail.element_id
+
+    def test_flush_right_amounts_link_by_their_end(self, tmp_path):
+        # The amounts' widest cells differ by 34 pt, so their bands' middles lie 17 pt apart; their ends do not move.
+        tail_rows = (("Item", "Qty", "Amount"), ("Bolt", "4", "1,234,567.00"), ("Nut", "12", "8.00"))
+        head_rows = (("Pin", "8", "5.00"), ("Rivet", "20", "16.50"))
+
+        tail, head = split_tables(
+            tmp_path,
+            flush_right(tail_rows, 72.0, (250.0, 400.0), 650.0),
+            flush_right(head_rows, 72.0, (250.0, 400.0), 60.0),
+        )
+
+        assert head.continued_from_id == tail.element_id
+        assert [round(centre) for centre in (*tail.column_centres, *head.column_centres)] == [72, 250, 400] * 2
+
+    @pytest.mark.parametrize(
+        "head",
+        [
+            # Columns set 12 pt further right: their middles lie 6 to 10 pt from the tail's, their starts 12 pt.
+            pytest.param(
+                table_runs((("Gasket", "3", "1.20"), ("Seal", "6", "0.80")), (84.0, 232.0, 372.0), 60.0), id="moved"
+            ),
+            # Columns centred on the tail's bands' middles (91.0, 229.2, 372.5): a table aligned another way.
+            pytest.param(
+                centred_runs((("Gasket ring", "36", "1.20"), ("O", "6", "0.8")), (91.0, 229.2, 372.5), 60.0),
+                id="centred",
+            ),
+        ],
+    )
+    def test_a_different_table_with_similar_centres_is_not_linked(self, tmp_path, head):
+        _, found = split_tables(tmp_path, table_runs(PARTS, top=650.0), head)
+
+        assert found.continued_from_id is None
 
     def test_a_turned_split_table_is_not_linked(self, tmp_path):
         pages = [

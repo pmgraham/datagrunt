@@ -45,6 +45,7 @@ Known limitations (each a fact this pure pass cannot see):
 
 import math
 import re
+import statistics
 from bisect import bisect_left, bisect_right, insort
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -1998,6 +1999,10 @@ _MASTHEAD_GAP = 0.40
 # corpus, every run of two-column prose lines has a share of 0.5 to 1.0; the fixture tables have none.
 _PROSE_WORDS = 4
 _PROSE_SHARE = Fraction(1, 2)
+# A column's cells align on the edge (start, end or middle) that varies least down it; edges whose spread (standard
+# deviation) is within this of the least tie (#409). pdfium boxes the edge a column was set on exactly (spread 0.000
+# on the probe's fixtures); two one-letter widths differ by 0.15 pt, which must still tell a centred column.
+_ALIGN_SLACK_PT = 0.1
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -2008,10 +2013,14 @@ class StreamTable:
         rows: Its lines, at least 2, top to bottom in their own frame.
         columns: Per row, the column of each of its cells, rising; every
             column holds a cell.
-        column_centres: Each column's centre on the displayed page, along
-            the rows: the middle of the band its cells span (display x for
-            upright text, display y for text turned a quarter turn, so
-            falling for text read up the page). At least 2.
+        column_centres: Each column's position on the displayed page, along
+            the rows: where its cells align (:func:`_column_position`; the
+            start for text set flush left, the end for flush-right numbers,
+            the middle for centred cells), so it does not move with the
+            column's widest cell (#409). Display x for upright text, display
+            y for text turned a quarter turn, so falling for text read up
+            the page. Each lies in its column's band, so they rise strictly
+            (A1's contract). At least 2.
         bbox: The union of its rows' boxes on the displayed page.
     """
 
@@ -2341,7 +2350,7 @@ def _row_structure(rows: list[TextLine], starts: list[float], ends: list[float],
     cells = [found for item in rows for found in item.cells]
     if sum(len(found.text.split()) >= _PROSE_WORDS for found in cells) >= _PROSE_SHARE * len(cells):
         return None
-    return _Rows(tuple(rows), (_stream_table(rows, starts, ends),))
+    return _Rows(tuple(rows), (_stream_table(rows, starts),))
 
 
 def _is_key(text: str) -> bool:
@@ -2364,17 +2373,57 @@ def _cell_item(found: TextCell) -> StreamKeyValue | StreamParagraph:
     return StreamKeyValue(key=parsed[0], value=parsed[1], bbox=found.bbox, pieces=found.pieces)
 
 
-def _stream_table(rows: list[TextLine], starts: list[float], ends: list[float]) -> StreamTable:
-    """A run's lines as a table: each cell in the band holding its start, each column centred on its band."""
+def _stream_table(rows: list[TextLine], starts: list[float]) -> StreamTable:
+    """A run's lines as a table: each cell in the band holding its start, each column where its cells align."""
     turn = rows[0].turn
     columns = tuple(
         tuple(bisect_right(starts, _along(found.bbox, turn)[0]) - 1 for found in item.cells) for item in rows
     )
+    spans: list[list[tuple[float, float]]] = [[] for _ in starts]
+    for item, placed in zip(rows, columns):
+        for found, column in zip(item.cells, placed):
+            spans[column].append(_along(found.bbox, turn))
     # Back to the displayed page: along a line read up it (turn 270), the frame's x is the page's y negated.
     sign = -1.0 if turn == _UP else 1.0
-    centres = tuple(sign * (start + end) / 2 for start, end in zip(starts, ends))
+    centres = tuple(sign * _column_position(found) for found in spans)
     bbox = _bbox(union_box(tuple(_plain(item.bbox) for item in rows)))
     return StreamTable(rows=tuple(rows), columns=columns, column_centres=centres, bbox=bbox)
+
+
+def _column_position(spans: list[tuple[float, float]]) -> float:
+    """Where a column's cells align along its rows, given each cell's ``(start, end)`` there (#409).
+
+    The cells align on the edge (their starts, ends or middles) whose
+    spread down the column is least: its values' standard deviation, the
+    root of their variance. The column is that edge's median, so a header
+    set another way does not move it. Edges within
+    :data:`_ALIGN_SLACK_PT` of the least spread tie, read in the order
+    start, end, middle: in a column whose cells are all one width every
+    edge aligns, and the column is where its text starts.
+
+    The median lies between the column's cells, so in its band: the
+    positions of neighbouring bands, which never meet, rise strictly.
+
+    Known limit: a column of one width tells no alignment. A part of a
+    split table whose flush-right numbers are all one width ("0.02",
+    "0.03") is placed at their start, which does not meet the other
+    part's end. O(k log k) for k cells.
+    """
+    edges = (
+        [start for start, _ in spans],
+        [end for _, end in spans],
+        [(start + end) / 2 for start, end in spans],
+    )
+    spreads = [_spread(values) for values in edges]
+    least = min(spreads)
+    aligned = next(values for values, spread in zip(edges, spreads) if spread <= least + _ALIGN_SLACK_PT)
+    return statistics.median(aligned)
+
+
+def _spread(values: list[float]) -> float:
+    """The population standard deviation of ``values`` (at least one): how far they vary from their mean."""
+    mean = math.fsum(values) / len(values)
+    return math.sqrt(math.fsum((value - mean) ** 2 for value in values) / len(values))
 
 
 # A slot of the page's reading order: neighbouring paragraphs, lines read whole, or a unit.
