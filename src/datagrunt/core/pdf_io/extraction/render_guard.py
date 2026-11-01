@@ -19,6 +19,8 @@ reuses the reason.
 import hashlib
 import logging
 import re
+from collections import Counter
+from typing import NamedTuple
 
 from datagrunt.core.pdf_io.extraction.image_guard import (
     _ARRAY_OUTER_RE,
@@ -326,64 +328,163 @@ def document_block_reason(doc) -> str | None:
     return None
 
 
-def jbig2_streams_without_globals(doc) -> frozenset[str]:
-    """The SHA-256 (hex) of each JBIG2 image stream that no image draws with ``/JBIG2Globals``.
+class Jbig2Agreement(NamedTuple):
+    """What PyMuPDF reads of a document's JBIG2 images, for the pdfium engine to agree with.
 
-    For the pdfium engine, whose API exposes no image's decode parameters: it
-    decodes a JBIG2 image only when its raw stream's hash is here. Every
-    ``/Subtype /Image`` object whose filters hold JBIG2Decode, or cannot be
-    read, has its decode parameters and raw stream read (never decoded); a
-    stream drawn by any such object with ``/JBIG2Globals``, or with decode
-    parameters that cannot be read, is left out. Empty (no JBIG2 image is
-    decoded) when the object table, a ``/Subtype`` or such a raw stream cannot
-    be read, or the scan passes its object or byte bound.
+    pdfium's API exposes no image's decode parameters, so the pdfium engine
+    decodes a JBIG2 image only when its raw stream's SHA-256 is in
+    ``streams`` and the JBIG2 streams it finds on the page are exactly that
+    page's entry in ``page_streams`` (see :func:`jbig2_agreement`).
+    """
+
+    streams: frozenset[str]
+    page_streams: tuple[frozenset[str], ...]
+
+
+_NO_AGREEMENT = Jbig2Agreement(frozenset(), ())
+
+
+class _StreamFact(NamedTuple):
+    """One stream object as the agreement scan reads it: its raw stream's SHA-256 and the bytes read."""
+
+    xref: int
+    digest: str
+    is_image: bool
+    is_jbig2: bool
+    has_globals: bool
+    read: int
+
+
+def jbig2_agreement(doc) -> Jbig2Agreement:
+    """The JBIG2 image streams the pdfium engine may decode, and each page's; none on any doubt.
+
+    None is decoded (``_NO_AGREEMENT``) unless: PyMuPDF opened the file
+    without repairing it and finds a single revision (no incremental
+    update); no content stream (pages, forms, patterns, Type3 glyphs) holds
+    an inline JBIG2 image; and every JBIG2 ``/Image`` object's raw stream is
+    the stream of exactly one ``/Image`` object, with no stream object of
+    those bytes carrying ``/JBIG2Globals`` (or decode parameters that cannot
+    be read). Any read failure, or the scan's object or byte bound, is doubt.
+    """
+    if not _single_unrepaired_revision(doc):
+        return _NO_AGREEMENT
+    scanned = _stream_facts(doc)
+    if scanned is None:
+        return _NO_AGREEMENT
+    facts, content_xrefs, budget = scanned
+    if _holds_inline_jbig2(doc, content_xrefs, budget):
+        return _NO_AGREEMENT
+    jbig2 = {fact.xref: fact.digest for fact in facts if fact.is_jbig2}
+    images = Counter(fact.digest for fact in facts if fact.is_image)
+    with_globals = {fact.digest for fact in facts if fact.has_globals}
+    if any(images[digest] != 1 or digest in with_globals for digest in jbig2.values()):
+        return _NO_AGREEMENT
+    page_streams = _page_jbig2_streams(doc, jbig2)
+    if page_streams is None:
+        return _NO_AGREEMENT
+    return Jbig2Agreement(frozenset(jbig2.values()), page_streams)
+
+
+def _single_unrepaired_revision(doc) -> bool:
+    """True when PyMuPDF opened the file without repair and finds one revision (False if it cannot tell)."""
+    try:
+        return doc.is_repaired is False and doc.version_count == 1
+    except Exception:  # noqa: BLE001 - cannot tell -> treated as several revisions
+        return False
+
+
+def _stream_facts(doc) -> tuple[list[_StreamFact], list[int], int] | None:
+    """Every stream object's facts, the content streams that may hold inline images, and the byte budget left.
+
+    None when the object table or an object cannot be read, or the scan
+    passes its object or byte bound.
     """
     try:
         count = doc.xref_length()
-    except Exception:  # noqa: BLE001 - unreadable object table -> nothing is checked
-        return frozenset()
+    except Exception:  # noqa: BLE001 - unreadable object table
+        return None
     if count > _MAX_SCAN_OBJECTS:
-        return frozenset()
+        return None
     budget = _MAX_SCAN_BYTES
-    without: set[str] = set()
-    unchecked: set[str] = set()
+    facts: list[_StreamFact] = []
+    content_xrefs: list[int] = []
     for xref in range(1, count):
         subtype_name, subtype_unreadable = _resolve_subtype(doc, xref)
         if subtype_unreadable:
-            return frozenset()
-        if subtype_name != "/Image" or not _may_be_jbig2(extract_xref_filters(doc, xref)):
-            continue
-        entry = _jbig2_stream_entry(doc, xref)
-        if entry is None:
-            return frozenset()
-        digest, has_globals, read = entry
-        budget -= read
+            return None
+        found = [] if subtype_name == "/Image" else _object_content_xrefs(doc, xref, subtype_name)
+        if isinstance(found, str):
+            return None
+        fact = _stream_fact(doc, xref, subtype_name == "/Image")
+        if fact is None:
+            return None
+        content_xrefs.extend(found)
+        budget -= fact.read if isinstance(fact, _StreamFact) else 0
         if budget < 0:
-            return frozenset()
-        (unchecked if has_globals else without).add(digest)
-    return frozenset(without - unchecked)
+            return None
+        if isinstance(fact, _StreamFact):
+            facts.append(fact)
+    return facts, content_xrefs, budget
 
 
-def _may_be_jbig2(filters: list[str]) -> bool:
-    """True when ``filters`` hold JBIG2Decode or cannot be read."""
-    return any(name == _UNREADABLE_FILTER or normalize_filter(name) == "JBIG2Decode" for name in filters)
-
-
-def _jbig2_stream_entry(doc, xref: int) -> tuple[str, bool, int] | None:
-    """``(raw stream SHA-256, drawn with /JBIG2Globals or unreadable parameters, bytes read)``; None if unreadable."""
-    globals_data, globals_missing = _jbig2_globals(doc, xref)
+def _stream_fact(doc, xref: int, is_image: bool) -> _StreamFact | bool | None:
+    """``xref``'s facts if it is a stream, False if it is not, None if it cannot be read."""
     try:
+        if not doc.xref_is_stream(xref):
+            return False
         raw = doc.xref_stream_raw(xref)
-    except Exception:  # noqa: BLE001 - unreadable raw stream -> the caller checks nothing
+    except Exception:  # noqa: BLE001 - unreadable stream -> doubt
         return None
     if raw is None:
         return None
+    filters = extract_xref_filters(doc, xref) if is_image else []
+    is_jbig2 = any(name == _UNREADABLE_FILTER or normalize_filter(name) == "JBIG2Decode" for name in filters)
+    globals_data, globals_missing = _jbig2_globals(doc, xref)
     has_globals = globals_missing or globals_data is not None
-    return hashlib.sha256(raw).hexdigest(), has_globals, len(raw) + len(globals_data or b"")
+    read = len(raw) + len(globals_data or b"")
+    return _StreamFact(xref, hashlib.sha256(raw).hexdigest(), is_image, is_jbig2, has_globals, read)
 
 
-def jbig2_streams_without_globals_for_path(filepath) -> frozenset[str]:
-    """Open ``filepath`` with PyMuPDF and return :func:`jbig2_streams_without_globals` (empty if it cannot)."""
+def _holds_inline_jbig2(doc, content_xrefs: list[int], budget: int) -> bool:
+    """True when a page's or listed content stream holds an inline JBIG2 image, or cannot be read within ``budget``."""
+    for source, error_reason in _content_streams(doc, content_xrefs):
+        if error_reason is not None or source is None:
+            return True
+        budget -= len(source)
+        if budget < 0 or _has_inline_jbig2(source):
+            return True
+    return False
+
+
+def _has_inline_jbig2(content: bytes) -> bool:
+    """True when an inline image (``BI``) in ``content`` names JBIG2Decode, or a filter that cannot be read."""
+    start = 0
+    for _ in range(len(content) // 2 + 1):
+        bi_match = _BI_TOKEN.search(content, start)
+        if bi_match is None:
+            return False
+        window = content[bi_match.end() : bi_match.end() + _MAX_INLINE_DICT_BYTES]
+        id_match = _ID_TOKEN.search(window)
+        raw_dict = unescape_pdf_names((window[: id_match.start()] if id_match else window).decode("latin-1"))
+        filters = _inline_dict_filters(raw_dict)
+        if any(name == _UNREADABLE_FILTER or normalize_filter(name) == "JBIG2Decode" for name in filters):
+            return True
+        start = bi_match.end()
+    return True  # unreachable (each step passes a 2-byte token); at the bound, doubt
+
+
+def _page_jbig2_streams(doc, jbig2: dict[int, str]) -> tuple[frozenset[str], ...] | None:
+    """For each page, the raw-stream SHA-256 of the JBIG2 ``/Image`` objects PyMuPDF finds on it, forms included."""
+    try:
+        return tuple(
+            frozenset(jbig2[info[0]] for info in page.get_images(full=True) if info[0] in jbig2) for page in doc
+        )
+    except Exception:  # noqa: BLE001 - a page's images cannot be listed -> doubt
+        return None
+
+
+def jbig2_agreement_for_path(filepath) -> Jbig2Agreement:
+    """Open ``filepath`` with PyMuPDF and return :func:`jbig2_agreement` (no agreement if it cannot)."""
     from datagrunt.core.pdf_io.extraction.pymupdf_backend import _import_pymupdf
 
     pymupdf = _import_pymupdf()
@@ -391,9 +492,9 @@ def jbig2_streams_without_globals_for_path(filepath) -> frozenset[str]:
         doc = pymupdf.open(filepath)
     except Exception as exc:  # noqa: BLE001 - unreadable here -> no JBIG2 image is decoded
         logger.warning("JBIG2 decode parameters of %s could not be read: %s", filepath, exc)
-        return frozenset()
+        return _NO_AGREEMENT
     try:
-        return jbig2_streams_without_globals(doc)
+        return jbig2_agreement(doc)
     finally:
         doc.close()
 

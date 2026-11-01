@@ -1133,76 +1133,163 @@ def test_an_inline_jbig2_image_with_globals_blocks_rendering(tmp_path, no_decode
     assert no_decode == []
 
 
-class TestJbig2StreamsWithoutGlobals:
-    """The pdfium engine's JBIG2 streams drawn without /JBIG2Globals: none whenever the scan cannot finish."""
+class TestJbig2Agreement:
+    """What PyMuPDF agrees the pdfium engine may decode: nothing whenever the scan cannot finish."""
 
     @staticmethod
-    def scan(path: Path) -> frozenset:
+    def scan(path: Path):
         import pymupdf
 
-        from datagrunt.core.pdf_io.extraction.render_guard import jbig2_streams_without_globals
+        from datagrunt.core.pdf_io.extraction.render_guard import jbig2_agreement
 
         with pymupdf.open(path) as doc:
-            return jbig2_streams_without_globals(doc)
+            return jbig2_agreement(doc)
 
-    def test_a_stream_drawn_without_globals_is_listed(self, tmp_path):
+    def test_a_clean_scan_is_agreed_with_its_page(self, tmp_path):
         import hashlib
 
         stream = jbig2_scan()
         path = jbig2_scan_pdf(tmp_path / "scan.pdf", stream)
+        digest = hashlib.sha256(stream).hexdigest()
 
-        assert self.scan(path) == frozenset({hashlib.sha256(stream).hexdigest()})
+        assert tuple(self.scan(path)) == (frozenset({digest}), (frozenset({digest}),))
 
-    def test_over_the_object_bound_nothing_is_listed(self, tmp_path, monkeypatch):
+    def test_over_the_object_bound_nothing_is_agreed(self, tmp_path, monkeypatch):
         from datagrunt.core.pdf_io.extraction import render_guard
 
         path = jbig2_scan_pdf(tmp_path / "scan.pdf", jbig2_scan())
         monkeypatch.setattr(render_guard, "_MAX_SCAN_OBJECTS", 5)
 
-        assert self.scan(path) == frozenset()
+        assert tuple(self.scan(path)) == (frozenset(), ())
 
-    def test_over_the_byte_bound_nothing_is_listed(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("bound", [10, 200], ids=["streams", "content"])
+    def test_over_the_byte_bound_nothing_is_agreed(self, tmp_path, monkeypatch, bound):
+        # 200 bytes holds the image stream (about 140) but not the page content as well.
         from datagrunt.core.pdf_io.extraction import render_guard
 
         path = jbig2_scan_pdf(tmp_path / "scan.pdf", jbig2_scan())
-        monkeypatch.setattr(render_guard, "_MAX_SCAN_BYTES", 10)
+        monkeypatch.setattr(render_guard, "_MAX_SCAN_BYTES", bound)
 
-        assert self.scan(path) == frozenset()
+        assert tuple(self.scan(path)) == (frozenset(), ())
 
-    def test_an_unreadable_subtype_lists_nothing(self, tmp_path):
+    def test_an_unreadable_subtype_agrees_nothing(self, tmp_path):
         path = jbig2_scan_pdf(tmp_path / "scan.pdf", jbig2_scan(), extra_objects=(b"<< /Subtype 99 0 R >>",))
 
-        assert self.scan(path) == frozenset()
+        assert tuple(self.scan(path)) == (frozenset(), ())
 
+    def test_an_unreadable_type3_glyph_list_agrees_nothing(self, tmp_path, monkeypatch):
+        import pymupdf
+
+        font = b"<< /Type /Font /Subtype /Type3 /CharProcs 99 0 R >>"
+        path = jbig2_scan_pdf(tmp_path / "scan.pdf", jbig2_scan(), extra_objects=(font,))
+        monkeypatch.setattr(pymupdf.Document, "xref_get_keys", lambda document, xref: 1 / 0)
+
+        assert tuple(self.scan(path)) == (frozenset(), ())
+
+    @pytest.mark.parametrize("method", ["xref_is_stream", "xref_stream_raw"])
     @pytest.mark.parametrize("fails", ["returns-none", "raises"])
-    def test_an_unreadable_raw_stream_lists_nothing(self, tmp_path, monkeypatch, fails):
+    def test_an_unreadable_stream_agrees_nothing(self, tmp_path, monkeypatch, method, fails):
         import pymupdf
 
         def unreadable(document, xref):
             if fails == "raises":
                 raise RuntimeError("stream unreadable")
+            return None if method == "xref_stream_raw" else True
 
         path = jbig2_scan_pdf(tmp_path / "scan.pdf", jbig2_scan())
-        monkeypatch.setattr(pymupdf.Document, "xref_stream_raw", unreadable)
+        if method == "xref_is_stream" and fails == "returns-none":
+            monkeypatch.setattr(pymupdf.Document, "xref_stream_raw", lambda document, xref: None)
+        monkeypatch.setattr(pymupdf.Document, method, unreadable)
 
-        assert self.scan(path) == frozenset()
+        assert tuple(self.scan(path)) == (frozenset(), ())
 
-    def test_an_unreadable_object_table_lists_nothing(self):
-        from datagrunt.core.pdf_io.extraction.render_guard import jbig2_streams_without_globals
+    def test_a_page_whose_images_cannot_be_listed_agrees_nothing(self, tmp_path, monkeypatch):
+        import pymupdf
+
+        path = jbig2_scan_pdf(tmp_path / "scan.pdf", jbig2_scan())
+        monkeypatch.setattr(pymupdf.Page, "get_images", lambda page, full=False: 1 / 0)
+
+        assert tuple(self.scan(path)) == (frozenset(), ())
+
+    def test_an_unreadable_content_stream_agrees_nothing(self, tmp_path, monkeypatch):
+        import pymupdf
+
+        path = jbig2_scan_pdf(tmp_path / "scan.pdf", jbig2_scan())
+        monkeypatch.setattr(pymupdf.Page, "read_contents", lambda page: 1 / 0)
+
+        assert tuple(self.scan(path)) == (frozenset(), ())
+
+    def test_an_inline_image_whose_filter_cannot_be_read_agrees_nothing(self, tmp_path):
+        stream = jbig2_scan()
+        content = b"q 200 0 0 150 50 50 cm /Im0 Do Q BI /W 4 /H 4 /F [/Fl ID x EI"
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+            b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+            b"<< /Type /XObject /Subtype /Image %s /Length %d >>\nstream\n%s\nendstream"
+            % (SCAN_ENTRIES, len(stream), stream),
+        ]
+
+        assert tuple(self.scan(hand_written_pdf(tmp_path / "inline.pdf", objects))) == (frozenset(), ())
+
+    def test_an_inline_image_of_another_codec_agrees_still(self, tmp_path):
+        import hashlib
+
+        stream = jbig2_scan()
+        content = (
+            b"q 200 0 0 150 50 50 cm /Im0 Do Q q 4 0 0 4 0 0 cm BI /W 2 /H 2 /CS /G /BPC 8 /F /AHx ID 00ff00ff> EI Q"
+        )
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+            b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+            b"<< /Type /XObject /Subtype /Image %s /Length %d >>\nstream\n%s\nendstream"
+            % (SCAN_ENTRIES, len(stream), stream),
+        ]
+
+        agreed = self.scan(hand_written_pdf(tmp_path / "inline.pdf", objects))
+
+        assert agreed.streams == frozenset({hashlib.sha256(stream).hexdigest()})
+
+    def test_a_type3_font_without_glyphs_agrees_still(self, tmp_path):
+        font = b"<< /Type /Font /Subtype /Type3 >>"
+        path = jbig2_scan_pdf(tmp_path / "scan.pdf", jbig2_scan(), extra_objects=(font,))
+
+        assert len(self.scan(path).streams) == 1
+
+    def test_a_document_that_cannot_tell_its_revisions_agrees_nothing(self):
+        from datagrunt.core.pdf_io.extraction.render_guard import jbig2_agreement
+
+        class Unknown:
+            @property
+            def is_repaired(self):
+                raise RuntimeError("cannot tell")
+
+        assert tuple(jbig2_agreement(Unknown())) == (frozenset(), ())
+
+    def test_an_unreadable_object_table_agrees_nothing(self):
+        from datagrunt.core.pdf_io.extraction.render_guard import jbig2_agreement
 
         class NoTable:
+            is_repaired = False
+            version_count = 1
+
             def xref_length(self):
                 raise RuntimeError("no object table")
 
-        assert jbig2_streams_without_globals(NoTable()) == frozenset()
+        assert tuple(jbig2_agreement(NoTable())) == (frozenset(), ())
 
-    def test_a_file_pymupdf_cannot_open_lists_nothing_and_warns(self, tmp_path, caplog):
-        from datagrunt.core.pdf_io.extraction.render_guard import jbig2_streams_without_globals_for_path
+    def test_a_file_pymupdf_cannot_open_agrees_nothing_and_warns(self, tmp_path, caplog):
+        from datagrunt.core.pdf_io.extraction.render_guard import jbig2_agreement_for_path
 
         path = tmp_path / "not.pdf"
         path.write_bytes(b"not a pdf")
 
-        assert jbig2_streams_without_globals_for_path(path) == frozenset()
+        assert tuple(jbig2_agreement_for_path(path)) == (frozenset(), ())
         assert "JBIG2 decode parameters of" in caplog.text
 
 
@@ -1351,3 +1438,206 @@ def test_a_render_is_skipped_when_a_key_the_scan_reads_cannot_be_read(
 
     assert PDFWriter(path, engine=engine).render_pages_as_images(str(tmp_path / "pages"), dpi=72) == []
     assert no_decode == []
+
+
+# ---------------------------------------------------------------------------
+# The pdfium engine decodes a JBIG2 image only when PyMuPDF and pdfium agree on it.
+# ---------------------------------------------------------------------------
+
+JBIG2_UNCHECKED = "JBIG2 decode parameters could not be checked for /JBIG2Globals; skipped (not decoded)"
+
+
+def other_jbig2_scan() -> bytes:
+    """A second clean scan whose stream differs from ``jbig2_scan()`` (an extension segment added)."""
+    return jbig2_scan(extra=jbig2_segment(7, 62, struct.pack(">I", 0x20000000) + b"other\x00"))
+
+
+def append_revision(path: Path, objects: dict, size: int) -> Path:
+    """Append an incremental update to ``path``: ``objects`` (number -> body), a new xref section and trailer."""
+    data = path.read_bytes()
+    previous = int(data.rsplit(b"startxref", 1)[1].split()[0])
+    out = bytearray(data)
+    offsets = {}
+    for number, body in sorted(objects.items()):
+        offsets[number] = len(out)
+        out += b"%d 0 obj\n%s\nendobj\n" % (number, body)
+    xref = len(out)
+    out += b"xref\n" + b"".join(b"%d 1\n%010d 00000 n \n" % (n, offsets[n]) for n in sorted(offsets))
+    out += b"trailer\n<< /Size %d /Root 1 0 R /Prev %d >>\nstartxref\n%d\n%%%%EOF\n" % (size, previous, xref)
+    path.write_bytes(bytes(out))
+    return path
+
+
+def two_image_pdf(path: Path, first: bytes, second: bytes, *, second_entries: bytes = b"", draw_second=True) -> Path:
+    """A page whose resources hold two JBIG2 XObjects (5 and 6); it draws the second only if ``draw_second``."""
+    content = b"q 200 0 0 150 50 50 cm /Im0 Do Q" + (b" q 200 0 0 150 300 50 cm /Im1 Do Q" if draw_second else b"")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /XObject << /Im0 5 0 R /Im1 6 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        b"<< /Type /XObject /Subtype /Image %s /Length %d >>\nstream\n%s\nendstream"
+        % (SCAN_ENTRIES, len(first), first),
+        b"<< /Type /XObject /Subtype /Image %s %s /Length %d >>\nstream\n%s\nendstream"
+        % (SCAN_ENTRIES, second_entries, len(second), second),
+        globals_object(b""),
+    ]
+    return hand_written_pdf(path, objects)
+
+
+def _assert_pdfium_decodes_no_jbig2(path: Path, tmp_path: Path, calls: list) -> None:
+    document = PDFReader(path, engine="pdfium").to_dicts(image_output_dir=str(tmp_path / "out"))
+    assert _image_elements(document) == []
+    assert any(JBIG2_UNCHECKED in warning for warning in _warnings_of(document)), _warnings_of(document)
+    assert PDFWriter(path, engine="pdfium").render_pages_as_images(str(tmp_path / "pages"), dpi=72) == []
+    assert calls == []
+
+
+def test_a_repaired_file_decodes_no_jbig2_in_pdfium(tmp_path, no_decode):
+    path = jbig2_scan_pdf(tmp_path / "scan.pdf", jbig2_scan())
+    data = path.read_bytes()
+    catalog = data.index(b"1 0 obj")
+    path.write_bytes(data.replace(b"%010d 00000 n" % catalog, b"%010d 00000 n" % (catalog + 3), 1))
+
+    _assert_pdfium_decodes_no_jbig2(path, tmp_path, no_decode)
+
+
+def test_an_updated_file_decodes_no_jbig2_in_pdfium(tmp_path, no_decode):
+    path = append_revision(
+        jbig2_scan_pdf(tmp_path / "scan.pdf", jbig2_scan()), {1: b"<< /Type /Catalog /Pages 2 0 R /Lang (en) >>"}, 6
+    )
+
+    _assert_pdfium_decodes_no_jbig2(path, tmp_path, no_decode)
+
+
+def test_an_update_that_adds_globals_decodes_no_jbig2_in_pdfium(tmp_path, no_decode):
+    # Only the first revision's image has no /JBIG2Globals.
+    stream = jbig2_scan()
+    image = b"<< /Type /XObject /Subtype /Image %s /DecodeParms << /JBIG2Globals 6 0 R >> /Length %d >>\n" % (
+        SCAN_ENTRIES,
+        len(stream),
+    )
+    image += b"stream\n" + stream + b"\nendstream"
+    path = append_revision(jbig2_scan_pdf(tmp_path / "scan.pdf", stream), {5: image, 6: globals_object(b"")}, 7)
+
+    _assert_pdfium_decodes_no_jbig2(path, tmp_path, no_decode)
+
+
+def test_an_inline_jbig2_image_with_a_clean_images_data_decodes_no_jbig2_in_pdfium(tmp_path, no_decode):
+    stream = jbig2_scan()
+    content = (
+        b"q 200 0 0 150 50 50 cm /Im0 Do Q q 200 0 0 150 300 50 cm BI /W 64 /H 48 /CS /G /BPC 1 /F /JBIG2Decode "
+        b"/DP << /JBIG2Globals 6 0 R >> ID " + stream + b"\nEI Q"
+    )
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        b"<< /Type /XObject /Subtype /Image %s /Length %d >>\nstream\n%s\nendstream"
+        % (SCAN_ENTRIES, len(stream), stream),
+        globals_object(b""),
+    ]
+    path = hand_written_pdf(tmp_path / "inline.pdf", objects)
+
+    document = PDFReader(path, engine="pdfium").to_dicts(image_output_dir=str(tmp_path / "out"))
+
+    assert _image_elements(document) == []
+    assert any(JBIG2_UNCHECKED in warning for warning in _warnings_of(document)), _warnings_of(document)
+    assert no_decode == []
+
+
+def test_two_images_with_one_stream_one_with_globals_decode_no_jbig2_in_pdfium(tmp_path, no_decode):
+    stream = jbig2_scan()
+    path = two_image_pdf(tmp_path / "two.pdf", stream, stream, second_entries=b"/DecodeParms << /JBIG2Globals 7 0 R >>")
+
+    _assert_pdfium_decodes_no_jbig2(path, tmp_path, no_decode)
+
+
+def test_two_clean_images_with_one_stream_decode_no_jbig2_in_pdfium(tmp_path, no_decode):
+    stream = jbig2_scan()
+    path = two_image_pdf(tmp_path / "two.pdf", stream, stream)
+
+    _assert_pdfium_decodes_no_jbig2(path, tmp_path, no_decode)
+
+
+def test_a_page_whose_jbig2_images_the_readers_count_differently_decodes_none_in_pdfium(tmp_path, no_decode):
+    # PyMuPDF finds both images in the page's resources; pdfium enumerates the one drawn.
+    path = two_image_pdf(tmp_path / "two.pdf", jbig2_scan(), other_jbig2_scan(), draw_second=False)
+
+    _assert_pdfium_decodes_no_jbig2(path, tmp_path, no_decode)
+
+
+def test_two_different_clean_images_drawn_on_a_page_are_decoded_in_pdfium(tmp_path):
+    path = two_image_pdf(tmp_path / "two.pdf", jbig2_scan(), other_jbig2_scan())
+
+    document = PDFReader(path, engine="pdfium").to_dicts(image_output_dir=str(tmp_path / "out"))
+
+    assert len(_image_elements(document)) == 2
+    assert not any("JBIG2" in warning for warning in _warnings_of(document))
+
+
+def test_a_jbig2_image_drawn_twice_through_a_form_is_decoded_in_pdfium(tmp_path):
+    # pdfium enumerates two drawings of one image; PyMuPDF lists the image once: one image either way.
+    stream = jbig2_scan()
+    content = b"q /Fm0 Do Q"
+    form = b"q 200 0 0 150 50 50 cm /Im0 Do Q q 200 0 0 150 50 300 cm /Im0 Do Q"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /XObject << /Fm0 6 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        b"<< /Type /XObject /Subtype /Image %s /Length %d >>\nstream\n%s\nendstream"
+        % (SCAN_ENTRIES, len(stream), stream),
+        b"<< /Type /XObject /Subtype /Form /BBox [0 0 612 792] /Resources << /XObject << /Im0 5 0 R >> >> "
+        b"/Length %d >>\nstream\n%s\nendstream" % (len(form), form),
+    ]
+    path = hand_written_pdf(tmp_path / "form.pdf", objects)
+
+    document = PDFReader(path, engine="pdfium").to_dicts(image_output_dir=str(tmp_path / "out"))
+
+    assert len(_image_elements(document)) == 2
+    assert not any("JBIG2" in warning for warning in _warnings_of(document))
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_type3_font_with_indirect_glyphs_still_renders(tmp_path, engine):
+    path = _type3_indirect_charprocs_pdf(tmp_path / "t3.pdf")
+
+    assert len(PDFWriter(path, engine=engine).render_pages_as_images(str(tmp_path / "pages"), dpi=72)) == 1
+
+
+@pytest.mark.parametrize("unreadable", ["filters", "stream"])
+def test_a_jbig2_image_is_not_decoded_when_another_on_its_page_cannot_be_read(
+    tmp_path, monkeypatch, unreadable, no_decode
+):
+    from datagrunt.core.pdf_io.extraction.pdfium_document import PdfiumPage
+
+    other = other_jbig2_scan()
+    method = "_image_filters" if unreadable == "filters" else "_raw_image_stream"
+    original_raw, original = PdfiumPage._raw_image_stream, getattr(PdfiumPage, method)
+
+    def fails_for_the_other(page, obj):
+        return None if original_raw(page, obj) == other else original(page, obj)
+
+    monkeypatch.setattr(PdfiumPage, method, fails_for_the_other)
+    path = two_image_pdf(tmp_path / "two.pdf", jbig2_scan(), other)
+
+    document = PDFReader(path, engine="pdfium").to_dicts(image_output_dir=str(tmp_path / "out"))
+
+    assert _image_elements(document) == []
+    assert any(w.startswith("page 1 image 0: " + JBIG2_UNCHECKED[:20]) for w in _warnings_of(document)), _warnings_of(
+        document
+    )
+    assert no_decode == []
+
+
+def test_a_non_image_object_with_the_stream_and_globals_decodes_no_jbig2_in_pdfium(tmp_path, no_decode):
+    stream = jbig2_scan()
+    other = b"<< /DecodeParms << /JBIG2Globals 7 0 R >> /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream"
+    path = jbig2_scan_pdf(tmp_path / "scan.pdf", stream, extra_objects=(other, globals_object(b"")))
+
+    _assert_pdfium_decodes_no_jbig2(path, tmp_path, no_decode)
