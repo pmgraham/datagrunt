@@ -60,8 +60,8 @@ its executors are the parallelism). The pool is bounded and always ends:
   the caller's main module.
 - Every worker must return by one deadline,
   :data:`_WORKER_START_S` + :data:`_WORKER_PAGE_S` x the longest chunk,
-  counted from the pool's start. One that has not is killed, and its
-  chunk's pages are error pages.
+  counted from the pool's start. One that has not leaves error pages for
+  its chunk, and is killed when the pool ends.
 - A worker that dies without returning (killed, crashed, ``os._exit``)
   leaves error pages for exactly its chunk's pages, never a lost page; the
   other chunks extract. Under ``strict`` either case raises a
@@ -307,8 +307,9 @@ def extract_document(
             None), or, under ``strict``, for a page that fails (set).
         PDFSourceChangedError: If the file changes while it is extracted
             (see the module notes), ``strict`` or not.
-        DatagruntPDFError: If its title or author is over A2's bound, or a
-            worker returns something that is not its pages.
+        DatagruntPDFError: If its title or author is over A2's bound, a
+            worker returns something that is not its pages, or, under
+            ``strict``, a worker dies or runs out of time.
     """
     options = PipelineOptions(
         workers=workers,
@@ -633,8 +634,7 @@ def _started(context: SpawnContext, source: PDFSource, pages: range, options: Pi
 def _collected(worker: _Worker, deadline: float, budget_s: float, options: PipelineOptions) -> tuple[Page, ...]:
     """The worker's pages; its chunk's error pages if it ran out of time or died first (see the module notes)."""
     lost = f"the worker process extracting pages {_span(worker.pages)}"
-    if not worker.receiver.poll(max(0.0, deadline - time.monotonic())):
-        worker.process.kill()
+    if not worker.receiver.poll(max(0.0, deadline - time.monotonic())):  # _shut_down kills it
         return _lost_chunk(worker.pages, f"{lost} did not return them within {budget_s:g} s: it was killed", options)
     try:
         outcome = worker.receiver.recv()

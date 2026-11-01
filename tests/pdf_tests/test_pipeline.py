@@ -171,8 +171,14 @@ def crash_on_page_3(sender, source, pages, options):
 def hang_on_page_3(sender, source, pages, options):
     """The worker holding page 3 never replies; the rest are the pipeline's."""
     if 2 in pages:
-        time.sleep(600)
+        time.sleep(60)
     pipeline._chunk_worker(sender, source, pages, options)
+
+
+def send_pages_reversed(sender, source, pages, options):
+    """A worker that replies with its own pages, last first."""
+    with sender:
+        sender.send(tuple(reversed(pipeline._extract_chunk(source, pages, options))))
 
 
 def send_other_pages(sender, source, pages, options):
@@ -905,8 +911,8 @@ class TestWorkers:
 
         reason = "the worker process extracting pages 3-4 did not return them within 6 s: it was killed"
         assert [page.error for page in pooled.pages] == [None, None, reason, reason]
-        # The budget is 4 + 1 x 2 = 6 s from the pool's start; the hung worker sleeps 600 s.
-        assert 6.0 <= elapsed < 36.0
+        # The budget is 4 + 1 x 2 = 6 s from the pool's start; the hung worker sleeps 60 s.
+        assert 6.0 <= elapsed < 40.0  # about 6 s here; the hung worker would reply at 60 s
         assert_reaped(started)
 
     def test_a_worker_that_returns_other_pages_fails_loud(self, tmp_path, monkeypatch):
@@ -918,6 +924,32 @@ class TestWorkers:
         with pytest.raises(DatagruntPDFError, match=re.escape(message)):
             extract_document(path, workers=2)
 
+        assert_reaped(started)
+
+    def test_a_worker_that_returns_its_pages_out_of_order_fails_loud(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 4)
+        started = started_workers(monkeypatch)
+        monkeypatch.setattr(pipeline, "_chunk_worker", send_pages_reversed)
+
+        message = "the worker process extracting pages 1-2 returned pages [2, 1], not pages [1, 2]"
+        with pytest.raises(DatagruntPDFError, match=re.escape(message)):
+            extract_document(path, workers=2)
+
+        assert_reaped(started)
+
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_a_strict_failure_kills_the_workers_still_running(self, tmp_path, monkeypatch):
+        path = break_page(build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 4), 1)
+        started = started_workers(monkeypatch)
+        monkeypatch.setattr(pipeline, "_chunk_worker", hang_on_page_3)
+
+        began = time.monotonic()
+        with pytest.raises(PDFCorruptError, match=re.escape("page 1 is unreadable")):
+            extract_document(path, workers=2, strict=True)
+        elapsed = time.monotonic() - began
+
+        # Pages 3-4's worker sleeps 60 s: it was killed, not waited for (under 1 s here).
+        assert elapsed < 30.0
         assert_reaped(started)
 
     def test_the_pool_is_shut_down_when_a_worker_fails_to_start(self, tmp_path, monkeypatch):
