@@ -12,7 +12,7 @@
 import pytest
 from markdown_it import MarkdownIt
 
-from datagrunt.core.pdf_io.extraction.markdown_escape import (
+from datagrunt.pdf._markdown_escape import (
     escape_leading_markdown,
     escape_markdown_link_target,
 )
