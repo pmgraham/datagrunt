@@ -25,6 +25,37 @@ reads as hidden paragraphs placed among them. Pass C
 (:func:`~datagrunt.pdf.assembly.conservation`) checks every piece's chars
 against the elements: a mismatch is a warning.
 
+:func:`vision_page` makes the A1 page of a page A3 routed to vision (spec
+§3.3 steps 2 and 4), with one render and one OCR pass:
+
+1. Render: at :func:`~datagrunt.pdf.render.effective_dpi` of the vision
+   DPI and the pixel bound, in the guarded worker.
+2. Orientation: tesseract's OSD on the normalized render (grey, 1 %
+   autocontrast). Its turn is made only at a confidence of
+   :data:`ROTATION_CONFIDENCE` or more: on the corpus (95 pages, each
+   rendered upright and turned 90, 180 and 270 degrees) every right turn
+   had a confidence of 3.59 or more and the one wrong turn 0.02 (a cover
+   with almost no text). Under it, or when OSD cannot tell, the page reads
+   as displayed, with a warning.
+3. OCR: the righted page's bands (900 px, 60 px shared), each word mapped
+   back to the displayed page.
+4. Elements: :func:`vision_elements` of the words, the page's figures and
+   its digital text kept apart, :func:`superseded`: each visible piece is
+   flagged ``"superseded"`` (A1), each hidden one keeps its own reasons, so
+   nothing is superseded twice and nothing is dropped.
+5. The page: ``status="ok"``, ``route="vision"``, never
+   ``integrity_verified`` (A1); A3's quality with the words' mean
+   confidence; a lazy :class:`~datagrunt.pdf.elements.PageImage` whose
+   loaders (:class:`PageRender`) draw the page again on demand, so no pixels
+   are held between pages.
+
+When the page is not rendered (``RenderRefused``, ``RenderFailed``) or
+tesseract cannot read it (missing, failed, timed out), it is
+``"ocr_unavailable"``: :func:`~datagrunt.pdf.assembly.assemble_page`'s
+page of its digital text, the page image when it was rendered, and a
+warning naming why. Words read before a band failed are not used: the page
+is the digital text's, never half of each.
+
 Known limitation: a word's box runs from its highest to its lowest ink, so
 its height is the font's x-height for a word such as "over", and its
 ascent to descent for "jumps". Lines whose words mostly reach both read
@@ -35,17 +66,45 @@ Sizing each word by its tesseract line's height instead finds as many (14
 to 20) and joins words across their spaces (A5b evidence).
 """
 
+import dataclasses
+import io
+import math
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import NamedTuple
 
-from datagrunt.pdf._validate import typed_tuple
-from datagrunt.pdf.assembly import FigureDraft, conservation, page_elements
-from datagrunt.pdf.elements import DocumentElement
-from datagrunt.pdf.layout import LatticeResult, page_layout
-from datagrunt.pdf.ocr import OCRWord
-from datagrunt.pdf.pdfium_engine import PageGeometry, RawSpan
-from datagrunt.pdf.quality import SpanPiece
+from PIL import Image
 
-__all__ = ["LEAST_SIZE_PT", "VisionElements", "ocr_pieces", "vision_elements"]
+from datagrunt.pdf._validate import int_at_least, non_blank_str, positive_float, typed_tuple
+from datagrunt.pdf.assembly import (
+    MIN_IMAGE_DIMENSION,
+    FigureDraft,
+    assemble_page,
+    check_assessment,
+    conservation,
+    page_elements,
+    page_figures,
+    raw_page_warnings,
+)
+from datagrunt.pdf.elements import DocumentElement, HiddenReason, Page, PageImage
+from datagrunt.pdf.layout import LatticeResult, find_lattice_tables, page_layout
+from datagrunt.pdf.ocr import Band, OCRWord, Orientation, bands, normalized, ocr_words, orientation, rotated
+from datagrunt.pdf.pdfium_engine import PageGeometry, RawPage, RawSpan, _checked_password, _checked_path
+from datagrunt.pdf.quality import PageAssessment, SpanPiece
+from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page
+
+__all__ = [
+    "LEAST_SIZE_PT",
+    "ROTATION_CONFIDENCE",
+    "PageRender",
+    "VisionElements",
+    "VisionOptions",
+    "ocr_pieces",
+    "superseded",
+    "vision_elements",
+    "vision_page",
+]
 
 # The least font size an OCR piece is given: layout reads line sizes to 0.1 pt, and a line's size is over 0.
 LEAST_SIZE_PT = 0.1
@@ -56,6 +115,22 @@ _FILL = 0
 
 # A scan has no vector rules: no lattice tables, no text used by them.
 _NO_LATTICE = LatticeResult(tables=(), used_pieces=())
+
+# OSD's turn is made at this confidence or more (see the module notes: right turns 3.59 and up, the wrong one 0.02).
+ROTATION_CONFIDENCE = 2.0
+
+_SUPERSEDED: tuple[HiddenReason, ...] = ("superseded",)
+_TURNS = (0, 90, 180, 270)
+
+# The spec's construction checks (PDFReader / PDFWriter) and defaults: vision_dpi >= 36, 300; max_render_pixels >=
+# 512 x 512, 16,000,000.
+_MIN_DPI = 36
+_MIN_RENDER_PIXELS = 262_144
+# The render worker's memory past its start: pdfium can spend ~1.7 GiB decoding an image within A2's bounds (render.py).
+_MEMORY_CAP_BYTES = 2 << 30
+# A render takes ~0.5 s here (a worker's start included) and a tesseract call ~1 s: each bound is over 100 times that.
+_RENDER_TIMEOUT_S = 120.0
+_OCR_TIMEOUT_S = 120.0
 
 
 class VisionElements(NamedTuple):
@@ -157,3 +232,302 @@ def _check_hidden(name: str, pieces: object) -> None:
     for index, piece in enumerate(typed_tuple(name, pieces, SpanPiece)):
         if not piece.hidden_reasons:
             raise ValueError(f"{name}[{index}] is visible ({piece.text!r}): a vision page's digital text reads apart")
+
+
+def superseded(pieces: tuple[SpanPiece, ...]) -> tuple[SpanPiece, ...]:
+    """``pieces``, each visible one (no hidden reason) flagged ``"superseded"``; a hidden one as it is. O(pieces).
+
+    Raises:
+        TypeError: If ``pieces`` is not a tuple of SpanPiece.
+    """
+    return tuple(
+        piece
+        if piece.hidden_reasons
+        else SpanPiece(span=piece.span, start=piece.start, end=piece.end, hidden_reasons=_SUPERSEDED)
+        for piece in typed_tuple("pieces", pieces, SpanPiece)
+    )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class VisionOptions:
+    """How a vision page is rendered and read. Picklable, so it crosses the process pool.
+
+    Attributes:
+        vision_dpi: The render's target DPI (>= 36).
+        max_render_pixels: The render's pixel bound (>= 262,144, 512 x 512).
+        language: tesseract's language(s), as ``eng`` or ``deu+eng``.
+        memory_cap_bytes: The render worker's memory cap past its start (>= 1).
+        render_timeout_s: Seconds a render may take, its worker's start included.
+        ocr_timeout_s: Seconds each tesseract call may take.
+
+    Raises:
+        TypeError, ValueError: If a value is of the wrong type or out of range.
+    """
+
+    vision_dpi: int = 300
+    max_render_pixels: int = 16_000_000
+    language: str = "eng"
+    memory_cap_bytes: int = _MEMORY_CAP_BYTES
+    render_timeout_s: float = _RENDER_TIMEOUT_S
+    ocr_timeout_s: float = _OCR_TIMEOUT_S
+
+    def __post_init__(self) -> None:
+        int_at_least("vision_dpi", self.vision_dpi, _MIN_DPI)
+        int_at_least("max_render_pixels", self.max_render_pixels, _MIN_RENDER_PIXELS)
+        non_blank_str("language", self.language)
+        int_at_least("memory_cap_bytes", self.memory_cap_bytes, 1)
+        object.__setattr__(self, "render_timeout_s", positive_float("render_timeout_s", self.render_timeout_s))
+        object.__setattr__(self, "ocr_timeout_s", positive_float("ocr_timeout_s", self.ocr_timeout_s))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PageRender:
+    """How to draw a vision page again: a :class:`~datagrunt.pdf.elements.PageImage`'s loaders.
+
+    It holds no pixels: each call renders the page in the guarded worker,
+    normalizes it as OCR read it, and encodes PNG (8-bit grey). Picklable,
+    so a page crosses the process pool. Each load raises as
+    :func:`~datagrunt.pdf.render.render_page` does (``RenderRefused``,
+    ``RenderFailed``).
+
+    Attributes:
+        source: The PDF's absolute path.
+        page_index: The 0-based page.
+        dpi: The render's DPI (the page's effective DPI).
+        rotation: The clockwise turn OCR read the page at: the bands' turn.
+        password: The PDF's password, or None. Not in repr.
+        memory_cap_bytes: The render worker's memory cap past its start.
+        timeout_s: Seconds a render may take.
+    """
+
+    source: Path
+    page_index: int
+    dpi: int
+    rotation: int
+    password: str | None = field(default=None, repr=False)
+    memory_cap_bytes: int
+    timeout_s: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source", _checked_path(self.source, "source").absolute())
+        int_at_least("page_index", self.page_index, 0)
+        int_at_least("dpi", self.dpi, 1)
+        if type(self.rotation) is not int or self.rotation not in _TURNS:
+            raise ValueError(f"rotation must be an int of 0, 90, 180 or 270, got {self.rotation!r}")
+        _checked_password(self.password)
+        int_at_least("memory_cap_bytes", self.memory_cap_bytes, 1)
+        object.__setattr__(self, "timeout_s", positive_float("timeout_s", self.timeout_s))
+
+    def png_bytes(self) -> bytes:
+        """The page as displayed (before OCR's turn), normalized, as PNG."""
+        return _png(self._drawn())
+
+    def band_png_bytes(self) -> tuple[bytes, ...]:
+        """The bands OCR read (of the page turned by ``rotation``, normalized), top to bottom, each as PNG."""
+        return tuple(_png(band) for band in bands(rotated(self._drawn(), self.rotation)))
+
+    def _drawn(self) -> RenderedPage:
+        page = render_page(
+            self.source,
+            self.page_index,
+            dpi=self.dpi,
+            password=self.password,
+            memory_cap_bytes=self.memory_cap_bytes,
+            timeout_s=self.timeout_s,
+        )
+        return normalized(page)
+
+
+def _png(image: RenderedPage | Band) -> bytes:
+    """8-bit grey pixels as PNG."""
+    buffer = io.BytesIO()
+    Image.frombytes("L", (image.px_width, image.px_height), image.pixels).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def vision_page(
+    raw_page: RawPage,
+    assessment: PageAssessment,
+    *,
+    source: str | os.PathLike[str],
+    password: str | None = None,
+    min_image_dimension: int = MIN_IMAGE_DIMENSION,
+    options: VisionOptions = VisionOptions(),
+) -> Page:
+    """The A1 page of a page A3 routed to vision: OCR's elements, or its digital text's (see the module notes).
+
+    Args:
+        raw_page: The page's raw facts (A2's ``RawPage``).
+        assessment: A3's assessment of it, routed ``"vision"``.
+        source: The PDF the page was read from: it is rendered again from it.
+        password: The PDF's password, or None.
+        min_image_dimension: The least pixel side of a figure (A4b's).
+        options: How the page is rendered and read.
+
+    Raises:
+        TypeError: If an argument is of the wrong type.
+        ValueError: If ``assessment`` is not of ``raw_page``, or does not
+            route it to vision.
+    """
+    check_assessment(raw_page, assessment)
+    if assessment.route != "vision":
+        raise ValueError(f"assessment routes the page {assessment.route!r}, not 'vision': assemble_page lays it out")
+    if not isinstance(options, VisionOptions):
+        raise TypeError(f"options must be a VisionOptions, got {type(options).__name__}")
+    geometry = raw_page.geometry
+    drawn = _drawn(source, geometry, password, options)
+    if drawn.page is None:
+        return _unread(raw_page, assessment, drawn.failure, None, source, password, min_image_dimension)
+    reading = _read(drawn.page, drawn.dpi, geometry, options)
+    image = _page_image(drawn, reading.rotation, geometry, source, password, options)
+    if reading.failure:
+        return _unread(raw_page, assessment, reading.failure, image, source, password, min_image_dimension)
+    figures = page_figures(
+        raw_page.images, geometry, source=source, password=password, min_image_dimension=min_image_dimension
+    )
+    laid = vision_elements(
+        reading.words,
+        geometry=geometry,
+        apart=superseded(assessment.pieces),
+        recovered=superseded(assessment.recovered_pieces),
+        figures=figures.drafts,
+    )
+    warnings = (*raw_page_warnings(raw_page), *figures.warnings, *assessment.warnings, *reading.notes, *laid.warnings)
+    return Page(
+        page_number=geometry.page_number,
+        width_pt=geometry.width_pt,
+        height_pt=geometry.height_pt,
+        status="ok",
+        route="vision",
+        quality=dataclasses.replace(assessment.quality, ocr_mean_confidence=_mean_confidence(reading.words)),
+        elements=laid.elements,
+        page_image=image,
+        warnings=warnings,
+    )
+
+
+class _Drawn(NamedTuple):
+    """A page's render at its DPI, or why it was not rendered (``page`` None)."""
+
+    page: RenderedPage | None
+    dpi: int
+    failure: str
+
+
+def _drawn(
+    source: str | os.PathLike[str], geometry: PageGeometry, password: str | None, options: VisionOptions
+) -> _Drawn:
+    """The page rendered at its effective DPI in the guarded worker; a refusal or failure is its reason."""
+    try:
+        dpi = effective_dpi(options.vision_dpi, options.max_render_pixels, geometry.width_pt, geometry.height_pt)
+        page = render_page(
+            source,
+            geometry.page_number - 1,
+            dpi=dpi,
+            password=password,
+            memory_cap_bytes=options.memory_cap_bytes,
+            timeout_s=options.render_timeout_s,
+        )
+    except (RenderRefused, RenderFailed) as exc:
+        return _Drawn(None, 0, f"the page was not rendered: {exc}")
+    return _Drawn(page, dpi, "")
+
+
+class _Reading(NamedTuple):
+    """What OCR read on a page: its words, the turn it read at, notes on the turn, and why it failed ("" if not)."""
+
+    words: tuple[OCRWord, ...]
+    rotation: int
+    notes: tuple[str, ...]
+    failure: str
+
+
+def _read(page: RenderedPage, dpi: int, geometry: PageGeometry, options: VisionOptions) -> _Reading:
+    """The render normalized, oriented, turned, banded and read by tesseract (one OSD call, one call a band)."""
+    grey = normalized(page)
+    found = orientation(grey, timeout_s=options.ocr_timeout_s)
+    if found.status == "unavailable":
+        return _Reading((), 0, (), f"tesseract is unavailable: {found.reason}")
+    turn, notes = _turn(found)
+    result = ocr_words(
+        bands(rotated(grey, turn)),
+        dpi=dpi,
+        rotation=turn,
+        page_size_pt=(geometry.width_pt, geometry.height_pt),
+        timeout_s=options.ocr_timeout_s,
+        language=options.language,
+    )
+    if result.status == "ok":
+        return _Reading(result.words, turn, notes, "")
+    why = "is unavailable" if result.status == "unavailable" else result.status
+    unused = f"; the {len(result.words)} word(s) it read before that are not used" if result.words else ""
+    return _Reading((), turn, notes, f"tesseract {why}: {result.reason}{unused}")
+
+
+def _turn(found: Orientation) -> tuple[int, tuple[str, ...]]:
+    """The turn OCR reads the page at, from OSD's (made at :data:`ROTATION_CONFIDENCE` or more), and a note on it."""
+    confidence = found.confidence
+    if found.status != "ok" or confidence is None:
+        return 0, (f"orientation detection {found.status}: {found.reason}; OCR read the page as displayed",)
+    if found.degrees == 0:
+        return 0, ()
+    if confidence >= ROTATION_CONFIDENCE:
+        turned = f"OCR righted it by {found.degrees} degrees clockwise (orientation confidence {confidence:g})"
+        return found.degrees, (f"the page reads turned: {turned}",)
+    suggests = f"turning the page {found.degrees} degrees clockwise at a confidence of {confidence:g}"
+    return 0, (f"orientation detection suggests {suggests}, under {ROTATION_CONFIDENCE:g}; OCR read it as displayed",)
+
+
+def _page_image(
+    drawn: _Drawn,
+    rotation: int,
+    geometry: PageGeometry,
+    source: str | os.PathLike[str],
+    password: str | None,
+    options: VisionOptions,
+) -> PageImage | None:
+    """The page's lazy image: the render's size as displayed, its loaders a :class:`PageRender` (no pixels held)."""
+    if drawn.page is None:
+        return None
+    loader = PageRender(
+        source=Path(source),
+        page_index=geometry.page_number - 1,
+        dpi=drawn.dpi,
+        rotation=rotation,
+        password=password,
+        memory_cap_bytes=options.memory_cap_bytes,
+        timeout_s=options.render_timeout_s,
+    )
+    return PageImage(
+        page_number=geometry.page_number,
+        dpi=float(drawn.dpi),
+        width_px=drawn.page.px_width,
+        height_px=drawn.page.px_height,
+        contrast_normalized=True,
+        _loader=loader.png_bytes,
+        _band_loader=loader.band_png_bytes,
+    )
+
+
+def _mean_confidence(words: tuple[OCRWord, ...]) -> float | None:
+    """The words' mean tesseract confidence; None for no words (no mean to take)."""
+    return math.fsum(word.confidence for word in words) / len(words) if words else None
+
+
+def _unread(
+    raw_page: RawPage,
+    assessment: PageAssessment,
+    reason: str,
+    image: PageImage | None,
+    source: str | os.PathLike[str],
+    password: str | None,
+    min_image_dimension: int,
+) -> Page:
+    """The ``"ocr_unavailable"`` page: assemble_page's of the digital text, the image if rendered, and why."""
+    lattice = find_lattice_tables(raw_page.segments.segments, assessment.pieces)
+    page = assemble_page(
+        raw_page, assessment, lattice, source=source, password=password, min_image_dimension=min_image_dimension
+    )
+    return dataclasses.replace(
+        page, page_image=image, warnings=(*page.warnings, f"OCR could not read the page: {reason}")
+    )

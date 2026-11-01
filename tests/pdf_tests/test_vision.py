@@ -10,16 +10,33 @@ absent (CI installs ``tesseract-ocr``).
 """
 
 import dataclasses
+import io
+import pickle
+from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from datagrunt.pdf import vision
-from datagrunt.pdf.assembly import FigureDraft, conservation
-from datagrunt.pdf.elements import BBox, Figure, Paragraph
-from datagrunt.pdf.ocr import OCRWord
-from datagrunt.pdf.pdfium_engine import ImageLoader, PageGeometry
-from datagrunt.pdf.quality import SpanPiece
-from datagrunt.pdf.vision import VisionElements, ocr_pieces, vision_elements
+from datagrunt.pdf.assembly import FigureDraft, assemble_page, conservation
+from datagrunt.pdf.elements import BBox, Figure, Page, Paragraph
+from datagrunt.pdf.layout import find_lattice_tables
+from datagrunt.pdf.ocr import OCRResult, OCRWord, Orientation, bands, normalized, rotated
+from datagrunt.pdf.pdfium_engine import ImageLoader, PageGeometry, extract_page, open_document, recover_dropped_text
+from datagrunt.pdf.quality import SpanPiece, assess_page
+from datagrunt.pdf.render import RenderFailed, RenderRefused
+from datagrunt.pdf.vision import (
+    PageRender,
+    VisionElements,
+    VisionOptions,
+    ocr_pieces,
+    superseded,
+    vision_elements,
+    vision_page,
+)
+from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf
+from pdf_tests.test_ocr import needs_tesseract
+from pdf_tests.test_ocr_scans import LINES, TOKENS, png_of, rendered
 from pdf_tests.test_pdfium_engine import imported_modules
 from pdf_tests.test_quality import SHA, image, raw_span, row
 
@@ -240,3 +257,440 @@ class TestVisionElements:
             vision_elements((), geometry=GEOMETRY, figures=(None,))
         with pytest.raises(TypeError, match="apart"):
             vision_elements((), geometry=GEOMETRY, apart=[None])
+
+
+# The vision page (task 3): the digital text superseded, then render, orientation, OCR, elements and the page image.
+
+
+def flagged(text: str, y: float, *reasons) -> SpanPiece:
+    """A digital piece of ``text`` on the line at ``y``, with ``reasons``."""
+    return SpanPiece(span=raw_span(text, row(len(text), 72.0, y)), start=0, end=len(text), hidden_reasons=reasons)
+
+
+class TestSuperseded:
+    """superseded: each visible piece is flagged "superseded"; a hidden piece keeps its own reasons, never more."""
+
+    def test_visible_pieces_are_superseded_and_hidden_ones_keep_their_reasons(self):
+        pieces = (flagged("Shown", 100.0), flagged("Ghost", 120.0, "invisible"), flagged("Faint", 140.0, "transparent"))
+
+        found = superseded(pieces)
+
+        assert [(piece.text, piece.hidden_reasons) for piece in found] == [
+            ("Shown", ("superseded",)),
+            ("Ghost", ("invisible",)),
+            ("Faint", ("transparent",)),
+        ]
+        assert [(piece.span, piece.start, piece.end) for piece in found] == [
+            (piece.span, piece.start, piece.end) for piece in pieces
+        ]
+        assert found[1:] == pieces[1:]
+
+    def test_nothing_is_superseded_twice(self):
+        pieces = (flagged("Shown", 100.0), flagged("Echo", 120.0, "duplicate"))
+
+        assert superseded(superseded(pieces)) == superseded(pieces)
+
+    def test_no_pieces_none_superseded(self):
+        assert superseded(()) == ()
+
+    def test_rejects_anything_but_a_tuple_of_pieces(self):
+        with pytest.raises(TypeError, match="pieces"):
+            superseded([flagged("Shown", 100.0)])
+
+
+CAPTION = TextRun("Page 7", 500.0, 760.0, size=10.0)
+
+
+@pytest.fixture(scope="module")
+def scans(tmp_path_factory) -> dict[str, Path]:
+    """A scan of four sentences (no text layer), and the same scan with a short digital caption drawn on it."""
+    directory = tmp_path_factory.mktemp("vision")
+    digital = build_pdf(directory / "digital.pdf", [PageSpec(items=LINES)])
+    scan = RasterImage(0.0, 0.0, *LETTER, png_of(rendered(digital)))
+    return {
+        "scan": build_pdf(directory / "scan.pdf", [PageSpec(items=(scan,))]),
+        "captioned": build_pdf(directory / "captioned.pdf", [PageSpec(items=(scan, CAPTION))]),
+    }
+
+
+def inputs(path: Path, ocr: str = "auto"):
+    """Page 1's raw facts and its assessment (with its recovery)."""
+    with open_document(path) as handle:
+        raw = extract_page(handle, 0)
+        recovered = recover_dropped_text(handle, 0) if raw.text.stats.dropped_text_objects else None
+    return raw, assess_page(raw, ocr=ocr, recovered=recovered)
+
+
+def visioned(path: Path, ocr: str = "auto", **options) -> Page:
+    """vision_page of page 1 of ``path``."""
+    raw, assessment = inputs(path, ocr)
+    return vision_page(raw, assessment, source=path, **options)
+
+
+@pytest.fixture(scope="module")
+def read(scans):
+    """read(name): vision_page of that scan (once a scan)."""
+    pages: dict[str, Page] = {}
+
+    def reading(name: str) -> Page:
+        if name not in pages:
+            pages[name] = visioned(scans[name])
+        return pages[name]
+
+    return reading
+
+
+def texts(page: Page, *, hidden: bool = False) -> list[str]:
+    """The texts of the page's text elements, visible ones (or hidden ones)."""
+    return [element.text for element in page.elements if element.is_hidden == hidden and hasattr(element, "text")]
+
+
+def decoded(png: bytes) -> tuple[bytes, int, int]:
+    """A PNG's 8-bit grey pixels and size."""
+    with Image.open(io.BytesIO(png)) as picture:
+        assert picture.mode == "L"
+        return picture.tobytes(), picture.width, picture.height
+
+
+@needs_tesseract
+class TestVisionPage:
+    """A vision page OCR'd: status ok, route vision, never verified; OCR's elements; its page image lazy."""
+
+    def test_a_scan_reads_as_ocr_elements(self, read):
+        page = read("scan")
+
+        assert (page.status, page.route, page.integrity_verified, page.error) == ("ok", "vision", False, None)
+        read_tokens = " ".join(texts(page)).split()
+        assert len(set(TOKENS) & set(read_tokens)) >= 0.9 * len(set(TOKENS))
+        assert texts(page, hidden=True) == []
+        assert not [warning for warning in page.warnings if warning.startswith("Pass C")]
+
+    def test_its_quality_is_a3s_with_the_mean_ocr_confidence(self, scans, read):
+        page = read("scan")
+        _, assessment = inputs(scans["scan"])
+
+        mean = page.quality.ocr_mean_confidence
+        assert 0.0 < mean <= 100.0
+        assert page.quality == dataclasses.replace(assessment.quality, ocr_mean_confidence=mean)
+
+    def test_a_captioned_scan_supersedes_its_digital_caption(self, read):
+        page = read("captioned")
+
+        hidden = [(element.text, element.hidden_reasons) for element in page.elements if element.is_hidden]
+        assert hidden == [("Page 7", ("superseded",))]
+        assert "Page" in " ".join(texts(page)).split()
+        assert page.status == "ok"
+
+    def test_its_page_image_is_the_normalized_render_as_displayed(self, scans, read):
+        image_of = read("scan").page_image
+        expected = normalized(rendered(scans["scan"]))
+
+        assert (image_of.page_number, image_of.dpi, image_of.contrast_normalized) == (1, 300.0, True)
+        assert (image_of.width_px, image_of.height_px) == (expected.px_width, expected.px_height) == (2550, 3300)
+        assert decoded(image_of.read_bytes()) == (expected.pixels, 2550, 3300)
+
+    def test_its_bands_are_the_bands_ocr_read_as_png(self, scans, read):
+        expected = bands(normalized(rendered(scans["scan"])))
+
+        found = [decoded(band) for band in read("scan").page_image.read_bands()]
+
+        assert found == [(band.pixels, band.px_width, band.px_height) for band in expected]
+        assert [height for _, _, height in found] == [900, 900, 900, 3300 - 2520]
+
+    def test_the_page_pickles_with_its_lazy_image(self, read):
+        page = read("captioned")
+
+        again = pickle.loads(pickle.dumps(page))
+
+        assert again == page
+        assert again.page_image.read_bytes() == page.page_image.read_bytes()
+
+
+def no_tesseract(monkeypatch, tmp_path) -> None:
+    """PATH holds no tesseract."""
+    empty = tmp_path / "empty-path"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+
+
+def unread_warning(reason: str) -> str:
+    return f"OCR could not read the page: {reason}"
+
+
+class TestOcrUnavailable:
+    """A vision page OCR cannot read is 'ocr_unavailable': assemble_page's digital elements, and why."""
+
+    def test_no_tesseract(self, scans, monkeypatch, tmp_path):
+        raw, assessment = inputs(scans["captioned"])
+        expected = assemble_page(
+            raw, assessment, find_lattice_tables(raw.segments.segments, assessment.pieces), source=scans["captioned"]
+        )
+        no_tesseract(monkeypatch, tmp_path)
+
+        page = vision_page(raw, assessment, source=scans["captioned"])
+
+        assert (page.status, page.route, page.integrity_verified) == ("ocr_unavailable", "vision", False)
+        assert page.elements == expected.elements
+        assert texts(page) == ["Page 7"]
+        assert page.quality == expected.quality
+        assert page.warnings == (
+            *expected.warnings,
+            unread_warning("tesseract is unavailable: no tesseract in an absolute PATH directory"),
+        )
+        assert page.page_image is not None and page.page_image.width_px == 2550
+
+    @pytest.mark.parametrize("error", [RenderFailed, RenderRefused])
+    @pytest.mark.parametrize("step", ["effective_dpi", "render_page"])
+    def test_a_page_not_rendered(self, scans, monkeypatch, step, error):
+        def fail(*args, **kwargs):
+            raise error("page 1: it cannot be drawn")
+
+        monkeypatch.setattr(vision, step, fail)
+        monkeypatch.setattr(vision, "orientation", lambda *args, **kwargs: pytest.fail("OCR ran"))
+
+        page = visioned(scans["captioned"])
+
+        assert (page.status, page.page_image) == ("ocr_unavailable", None)
+        assert texts(page) == ["Page 7"]
+        assert page.warnings[-1] == unread_warning("the page was not rendered: page 1: it cannot be drawn")
+
+    @pytest.mark.parametrize("status", ["failed", "timeout"])
+    def test_an_ocr_failure_leaves_its_partial_words_unused(self, scans, monkeypatch, status):
+        reason = "band 2 of 4 (rows 840 to 1739): tesseract did not finish"
+        partial = OCRResult(words=tuple(line_words("The quick", 72.0, 100.0)), status=status, reason=reason)
+        monkeypatch.setattr(vision, "orientation", lambda *args, **kwargs: UPRIGHT)
+        monkeypatch.setattr(vision, "ocr_words", lambda *args, **kwargs: partial)
+
+        page = visioned(scans["captioned"])
+
+        assert page.status == "ocr_unavailable"
+        assert texts(page) == ["Page 7"]
+        unused = "the 2 word(s) it read before that are not used"
+        assert page.warnings[-1] == unread_warning(f"tesseract {status}: {reason}; {unused}")
+        assert page.page_image is not None
+
+    def test_ocr_unavailable_at_orientation_runs_no_ocr(self, scans, monkeypatch):
+        gone = Orientation(degrees=0, confidence=None, status="unavailable", reason="cannot start tesseract")
+        monkeypatch.setattr(vision, "orientation", lambda *args, **kwargs: gone)
+        monkeypatch.setattr(vision, "ocr_words", lambda *args, **kwargs: pytest.fail("OCR ran"))
+
+        page = visioned(scans["captioned"])
+
+        assert page.status == "ocr_unavailable"
+        assert page.warnings[-1] == unread_warning("tesseract is unavailable: cannot start tesseract")
+
+
+UPRIGHT = Orientation(degrees=0, confidence=30.0, status="ok", reason="")
+
+
+def spy_ocr(monkeypatch, words=()) -> list[dict]:
+    """Record each ocr_words call's options (its result: ``words``, ok)."""
+    calls: list[dict] = []
+
+    def recorded(page_bands, **options):
+        calls.append({"bands": page_bands, **options})
+        return OCRResult(words=tuple(words), status="ok", reason="")
+
+    monkeypatch.setattr(vision, "ocr_words", recorded)
+    return calls
+
+
+class TestOrientation:
+    """OSD's turn is made only at a confidence of ROTATION_CONFIDENCE or more; otherwise the page reads as displayed."""
+
+    def test_the_threshold_is_set_from_the_evidence(self):
+        # Corpus (95 pages x 4 turns): right turns at 3.59 and up, the one wrong turn at 0.02 (A5b evidence).
+        assert vision.ROTATION_CONFIDENCE == 2.0
+
+    @pytest.mark.parametrize(
+        ("found", "turn", "warning"),
+        [
+            pytest.param(
+                Orientation(degrees=90, confidence=2.0, status="ok", reason=""),
+                90,
+                "the page reads turned: OCR righted it by 90 degrees clockwise (orientation confidence 2)",
+                id="at-the-threshold",
+            ),
+            pytest.param(
+                Orientation(degrees=270, confidence=35.9, status="ok", reason=""),
+                270,
+                "the page reads turned: OCR righted it by 270 degrees clockwise (orientation confidence 35.9)",
+                id="confident",
+            ),
+            pytest.param(
+                Orientation(degrees=90, confidence=1.99, status="ok", reason=""),
+                0,
+                "orientation detection suggests turning the page 90 degrees clockwise at a confidence of 1.99, "
+                "under 2; OCR read it as displayed",
+                id="under-the-threshold",
+            ),
+            pytest.param(UPRIGHT, 0, None, id="upright"),
+            pytest.param(
+                Orientation(degrees=0, confidence=None, status="undetermined", reason="too few characters"),
+                0,
+                "orientation detection undetermined: too few characters; OCR read the page as displayed",
+                id="undetermined",
+            ),
+            pytest.param(
+                Orientation(degrees=0, confidence=None, status="failed", reason="no osd.traineddata"),
+                0,
+                "orientation detection failed: no osd.traineddata; OCR read the page as displayed",
+                id="failed",
+            ),
+            pytest.param(
+                Orientation(degrees=0, confidence=None, status="timeout", reason="killed after 120.0 s"),
+                0,
+                "orientation detection timeout: killed after 120.0 s; OCR read the page as displayed",
+                id="timeout",
+            ),
+        ],
+    )
+    def test_the_turn_ocr_reads_at(self, scans, monkeypatch, found, turn, warning):
+        monkeypatch.setattr(vision, "orientation", lambda *args, **kwargs: found)
+        calls = spy_ocr(monkeypatch)
+
+        page = visioned(scans["captioned"])
+
+        (call,) = calls
+        assert call["rotation"] == turn
+        assert call["dpi"] == 300 and call["page_size_pt"] == LETTER
+        assert call["bands"][0].px_width == (3300 if turn in (90, 270) else 2550)
+        assert [item for item in page.warnings if "orient" in item or "turned" in item] == (
+            [warning] if warning else []
+        )
+
+    def test_the_bands_are_of_the_righted_page(self, scans, monkeypatch):
+        monkeypatch.setattr(
+            vision,
+            "orientation",
+            lambda *args, **kwargs: Orientation(degrees=90, confidence=9.0, status="ok", reason=""),
+        )
+        spy_ocr(monkeypatch)
+
+        page = visioned(scans["captioned"])
+
+        expected = bands(rotated(normalized(rendered(scans["captioned"])), 90))
+        found = [decoded(band) for band in page.page_image.read_bands()]
+        assert found == [(band.pixels, band.px_width, band.px_height) for band in expected]
+        assert (page.page_image.width_px, page.page_image.height_px) == (2550, 3300)
+
+
+class TestVisionPageArguments:
+    """vision_page checks its arguments at its boundary."""
+
+    def test_rejects_wrong_types(self, scans):
+        raw, assessment = inputs(scans["captioned"])
+
+        with pytest.raises(TypeError, match="raw_page"):
+            vision_page(None, assessment, source=scans["captioned"])
+        with pytest.raises(TypeError, match="assessment"):
+            vision_page(raw, None, source=scans["captioned"])
+
+    def test_rejects_a_page_not_routed_to_vision(self, tmp_path):
+        path = build_pdf(tmp_path / "digital.pdf", [PageSpec(items=LINES)])
+        raw, assessment = inputs(path)
+
+        with pytest.raises(ValueError, match="routes the page 'digital', not 'vision'"):
+            vision_page(raw, assessment, source=path)
+
+    def test_rejects_another_pages_assessment(self, scans):
+        raw, _ = inputs(scans["scan"])
+        _, other = inputs(scans["captioned"])
+
+        with pytest.raises(ValueError, match="another page"):
+            vision_page(raw, other, source=scans["scan"])
+
+
+class TestVisionOptions:
+    """VisionOptions holds the spec's defaults and checks each option at construction."""
+
+    def test_defaults(self):
+        options = VisionOptions()
+
+        assert (options.vision_dpi, options.max_render_pixels, options.language) == (300, 16_000_000, "eng")
+        assert (options.memory_cap_bytes, options.render_timeout_s, options.ocr_timeout_s) == (2 << 30, 120.0, 120.0)
+        assert pickle.loads(pickle.dumps(options)) == options
+
+    @pytest.mark.parametrize(
+        ("fields", "error", "message"),
+        [
+            ({"vision_dpi": 35}, ValueError, "vision_dpi"),
+            ({"vision_dpi": 300.0}, TypeError, "vision_dpi"),
+            ({"max_render_pixels": 262_143}, ValueError, "max_render_pixels"),
+            ({"language": " "}, ValueError, "language"),
+            ({"memory_cap_bytes": 0}, ValueError, "memory_cap_bytes"),
+            ({"render_timeout_s": 0.0}, ValueError, "render_timeout_s"),
+            ({"ocr_timeout_s": float("nan")}, ValueError, "ocr_timeout_s"),
+        ],
+    )
+    def test_rejects_bad_options(self, fields, error, message):
+        with pytest.raises(error, match=message):
+            VisionOptions(**fields)
+
+    def test_vision_page_takes_only_vision_options(self, scans):
+        raw, assessment = inputs(scans["captioned"])
+
+        with pytest.raises(TypeError, match="options must be a VisionOptions"):
+            vision_page(raw, assessment, source=scans["captioned"], options={"vision_dpi": 300})
+
+
+class TestPageRender:
+    """A PageImage's loaders: picklable, holding no pixels, checked at construction."""
+
+    def fields(self, tmp_path, **overrides) -> dict:
+        values = {
+            "source": tmp_path / "doc.pdf",
+            "page_index": 0,
+            "dpi": 72,
+            "rotation": 0,
+            "password": "secret",
+            "memory_cap_bytes": 1 << 30,
+            "timeout_s": 60.0,
+        }
+        return values | overrides
+
+    def test_holds_an_absolute_path_and_hides_the_password(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
+        loader = PageRender(**self.fields(tmp_path, source=Path("doc.pdf")))
+
+        assert loader.source == tmp_path / "doc.pdf"
+        assert "secret" not in repr(loader)
+        assert pickle.loads(pickle.dumps(loader)) == loader
+
+    @pytest.mark.parametrize(
+        ("overrides", "error", "message"),
+        [
+            ({"source": b"doc.pdf"}, TypeError, "source"),
+            ({"page_index": -1}, ValueError, "page_index"),
+            ({"dpi": 0}, ValueError, "dpi"),
+            ({"rotation": 45}, ValueError, "rotation"),
+            ({"rotation": 90.0}, ValueError, "rotation"),
+            ({"rotation": False}, ValueError, "rotation"),
+            ({"password": "a\x00b"}, ValueError, "password"),
+            ({"memory_cap_bytes": 0}, ValueError, "memory_cap_bytes"),
+            ({"timeout_s": -1.0}, ValueError, "timeout_s"),
+        ],
+    )
+    def test_rejects_bad_fields(self, tmp_path, overrides, error, message):
+        with pytest.raises(error, match=message):
+            PageRender(**self.fields(tmp_path, **overrides))
+
+    def test_each_load_renders_the_page_again(self, scans, monkeypatch):
+        calls = []
+        real = vision.render_page
+
+        def counted(*args, **kwargs):
+            calls.append(kwargs["dpi"])
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(vision, "render_page", counted)
+        loader = PageRender(
+            source=scans["scan"], page_index=0, dpi=72, rotation=0, memory_cap_bytes=1 << 30, timeout_s=60.0
+        )
+
+        first, second = loader.png_bytes(), loader.png_bytes()
+
+        assert first == second
+        assert decoded(first) == (normalized(rendered(scans["scan"], dpi=72)).pixels, 612, 792)
+        assert calls == [72, 72]

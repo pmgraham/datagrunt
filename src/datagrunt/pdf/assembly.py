@@ -90,7 +90,17 @@ from datagrunt.pdf.pdfium_engine import (
 )
 from datagrunt.pdf.quality import PageAssessment, SpanPiece
 
-__all__ = ["FigureDraft", "PageFigures", "assemble_page", "conservation", "page_elements", "page_figures", "pass_c"]
+__all__ = [
+    "FigureDraft",
+    "PageFigures",
+    "assemble_page",
+    "check_assessment",
+    "conservation",
+    "page_elements",
+    "page_figures",
+    "pass_c",
+    "raw_page_warnings",
+]
 
 # v4's default minimum image side in pixels (core.pdf_io.extraction.config._DEFAULT_MIN_IMAGE_DIMENSION).
 MIN_IMAGE_DIMENSION = 40
@@ -104,8 +114,9 @@ _NAMED_OBJECTS = 5
 # The reading turn of an upright table, whose columns run left to right on the page.
 _UPRIGHT = 0
 
-# What a vision page's warnings say: assemble_page lays out its digital text, and never pretends to OCR it.
-_VISION_NOTE = "route 'vision': OCR (A5) has not run on this page; its digital text is kept as its elements"
+# What a vision page's warnings say: assemble_page lays out its digital text, and never pretends to OCR it
+# (A5b's vision route adds why OCR did not read it).
+_VISION_NOTE = "route 'vision': the page was not read by OCR; its digital text is kept as its elements"
 
 _ELEMENT_TYPES: tuple[type, ...] = get_args(DocumentElement)
 _PAGE_ITEMS: tuple[type, ...] = get_args(PageItem)
@@ -314,11 +325,13 @@ def assemble_page(
     (skipped text, path and image objects), then the figures', A3's,
     A4a's (grids past its bounds), the layout's, and Pass C's.
 
-    A vision page (A5's) is not OCR'd here, and not passed off as OCR'd:
-    its digital text is laid out as on any page, its status is
-    ``"ocr_unavailable"`` (A1: a vision page whose OCR has not run, its
+    A vision page is not OCR'd here, and not passed off as OCR'd: its
+    digital text is laid out as on any page, its status is
+    ``"ocr_unavailable"`` (A1: a vision page whose OCR could not run, its
     digital text kept), it is never ``integrity_verified`` (A1) and a
-    warning says OCR has not run. A5 replaces it.
+    warning says OCR did not read it. A5b's
+    :func:`~datagrunt.pdf.vision.vision_page` OCRs a vision page, and lays
+    it out here when OCR cannot read it, adding why.
 
     Raises:
         TypeError: If an argument is of the wrong type.
@@ -342,7 +355,7 @@ def assemble_page(
     elements = page_elements(layout.items, figures.drafts, geometry)
     verified, mismatch = pass_c(assessment, elements)
     vision = assessment.route == "vision"
-    warnings = (*_raw_warnings(raw_page), *figures.warnings, *assessment.warnings, *_lattice_warnings(lattice))
+    warnings = (*raw_page_warnings(raw_page), *figures.warnings, *assessment.warnings, *_lattice_warnings(lattice))
     warnings += (*layout.warnings, *((_VISION_NOTE,) if vision else ()), *mismatch)
     return Page(
         page_number=geometry.page_number,
@@ -359,12 +372,22 @@ def assemble_page(
 
 def _check_inputs(raw_page: object, assessment: object, lattice: object) -> None:
     """Require a RawPage, a PageAssessment of it (same chars and rotation) and a LatticeResult."""
+    check_assessment(raw_page, assessment)
+    if not isinstance(lattice, LatticeResult):
+        raise TypeError(f"lattice must be a LatticeResult, got {type(lattice).__name__}")
+
+
+def check_assessment(raw_page: object, assessment: object) -> None:
+    """Require a RawPage and a PageAssessment of it: the same chars and rotation (A5b's vision route checks so too).
+
+    Raises:
+        TypeError: If ``raw_page`` is not a RawPage or ``assessment`` not a PageAssessment.
+        ValueError: If ``assessment`` is not of ``raw_page`` (its chars or rotation differ).
+    """
     if not isinstance(raw_page, RawPage):
         raise TypeError(f"raw_page must be a RawPage, got {type(raw_page).__name__}")
     if not isinstance(assessment, PageAssessment):
         raise TypeError(f"assessment must be a PageAssessment, got {type(assessment).__name__}")
-    if not isinstance(lattice, LatticeResult):
-        raise TypeError(f"lattice must be a LatticeResult, got {type(lattice).__name__}")
     chars = sum(len(span.text) for span in raw_page.text.spans)
     pieces = sum(piece.end - piece.start for piece in assessment.pieces)
     if assessment.quality.char_count != chars or pieces != chars:
@@ -469,7 +492,7 @@ def _clamped(bbox: BBox, width: float, height: float) -> BBox:
     )
 
 
-def _raw_warnings(page: RawPage) -> tuple[str, ...]:
+def raw_page_warnings(page: RawPage) -> tuple[str, ...]:
     """A2's text and path counts that cost the page something, as warnings (its image counts: :func:`page_figures`)."""
     text, paths = page.text.stats.skipped_nonfinite_objects, page.segments.stats.skipped_nonfinite_paths
     found = []

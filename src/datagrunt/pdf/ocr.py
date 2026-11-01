@@ -21,11 +21,20 @@ The tesseract CLI (never ``pytesseract``) reads the page:
 - :func:`orientation` runs tesseract's orientation detection (``--psm 0``)
   and reads its ``Rotate``: the clockwise turn, 0, 90, 180 or 270 degrees,
   that rights the page. :func:`rotated` makes that turn.
-- :func:`ocr_words` reads the righted page's bands (``--psm 6``, TSV) and
+- :func:`ocr_words` reads the righted page's bands (``--psm 3``, TSV) and
   maps each word's box back to the displayed page in points: through its
   band's offset, ``72 / dpi`` and the inverse of the turn. A word read in
   both bands of a shared strip (the same text, boxes overlapping by an IoU
   of 0.5 or more) is kept once, with its higher confidence.
+
+``--psm 3`` (tesseract's automatic page segmentation) is chosen over
+``--psm 6`` (one uniform block) by A5b's evidence: forced to OCR, 31 corpus
+pages (the 19 datasheets and 12 rulebook pages) read 93.0 % of their
+digital words with it, at a precision of 88.0 %, against 91.8 % and 83.1 %
+with ``--psm 6``, which reads a multi-column page's lines across its
+columns, and art as words. Its cost: on two art-heavy covers it skipped
+short text among the art (a contents column's page numbers) that
+``--psm 6`` read.
 
 Each call starts ``tesseract`` from an argv list (never a shell), by the
 absolute path :func:`~datagrunt.pdf._executables.trusted_executable` finds
@@ -390,7 +399,7 @@ def ocr_words(
     timeout_s: float,
     language: str = "eng",
 ) -> OCRResult:
-    """The words tesseract reads in ``page_bands`` (``--psm 6``, TSV, ``-l language``), on the displayed page.
+    """The words tesseract reads in ``page_bands`` (``--psm 3``, TSV, ``-l language``), on the displayed page.
 
     ``page_bands`` are the :func:`bands` of the page as :func:`rotated` by
     ``rotation`` degrees righted it; the page was rendered at ``dpi`` from a
@@ -411,7 +420,7 @@ def ocr_words(
     binary = trusted_executable("tesseract")
     if binary is None:
         return OCRResult(words=(), status="unavailable", reason=_NOT_ON_PATH)
-    argv = [binary, "stdin", "stdout", "--psm", "6", "-l", language, "tsv"]
+    argv = [binary, "stdin", "stdout", "--psm", "3", "-l", language, "tsv"]
     read: list[tuple[Band, list[_Placed]]] = []
     for number, band in enumerate(page_bands, start=1):
         words = _band_words(argv, band, timeout_s)

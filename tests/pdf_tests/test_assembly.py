@@ -21,6 +21,7 @@ from datagrunt.pdf.assembly import (
     FigureDraft,
     PageFigures,
     assemble_page,
+    check_assessment,
     conservation,
     page_elements,
     page_figures,
@@ -568,13 +569,13 @@ class TestAssemblePage:
         assert all(isinstance(element, Paragraph) for element in page.elements)
         assert page.integrity_verified is True
 
-    def test_a_vision_page_keeps_its_digital_text_and_says_ocr_has_not_run(self, tmp_path):
+    def test_a_vision_page_keeps_its_digital_text_and_says_ocr_did_not_read_it(self, tmp_path):
         page = assembled(letter(tmp_path, TextRun("Too short", 72.0, 100.0)))
 
         assert (page.route, page.status, page.integrity_verified) == ("vision", "ocr_unavailable", False)
         assert [element.text for element in page.elements] == ["Too short"]
         assert page.warnings == (
-            "route 'vision': OCR (A5) has not run on this page; its digital text is kept as its elements",
+            "route 'vision': the page was not read by OCR; its digital text is kept as its elements",
         )
 
 
@@ -804,6 +805,18 @@ class TestAssemblePageArguments:
             assemble_page(raw, None, lattice, source=path)
         with pytest.raises(TypeError, match="lattice"):
             assemble_page(raw, assessment, None, source=path)
+
+    def test_check_assessment_is_its_check_of_the_page_and_assessment(self, tmp_path):
+        raw, assessment, _ = inputs(letter(tmp_path, *body_text(100.0)))
+        other = inputs(letter(tmp_path, TextRun("Another page entirely", 72.0, 100.0), name="other.pdf"))[1]
+
+        assert check_assessment(raw, assessment) is None
+        with pytest.raises(TypeError, match="raw_page"):
+            check_assessment(None, assessment)
+        with pytest.raises(TypeError, match="assessment"):
+            check_assessment(raw, None)
+        with pytest.raises(ValueError, match="another page"):
+            check_assessment(raw, other)
 
     def test_rejects_another_pages_assessment(self, tmp_path):
         first = letter(tmp_path, *body_text(100.0), name="first.pdf")
