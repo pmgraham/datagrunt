@@ -34,6 +34,17 @@ path written (``Path.absolute()``: symlinks are not resolved):
 - :meth:`PDFWriter.write_markdown`: the document's ``to_markdown()``, UTF-8,
   each lone surrogate written as its escape (as the bundle's Markdown).
   Hidden elements stay behind their ``<!-- hidden: ... -->`` markers (A1).
+- :meth:`PDFWriter.write_parquet`: A7a's frame as it is, by polars (its
+  keyword arguments passed on): List and Struct columns kept.
+- :meth:`PDFWriter.write_csv`: the frame flattened (:func:`_csv_frame`),
+  by polars (its keyword arguments passed on), because CSV cannot hold a
+  List or Struct column: ``bbox`` becomes ``bbox_x0``, ``bbox_y0``,
+  ``bbox_x1`` and ``bbox_y1`` in its place, and ``scope_path`` and
+  ``hidden_reasons`` compact JSON-array strings (``["Intro","Details"]``,
+  ``[]`` for none). Every value is written as it is (preserve, not
+  transform): a cell that starts with ``=``, ``+``, ``-`` or ``@`` is not
+  escaped against spreadsheet formula injection. Guarding a spreadsheet
+  that opens the CSV is the application's concern.
 
 Every file is written atomically (:func:`_write_atomically`): a new file,
 ``.tmp_<uuid4 hex>`` beside the target (the same directory, so the same
@@ -59,14 +70,14 @@ import os
 import uuid
 from collections.abc import Callable
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 import polars as pl
 
 from datagrunt.pdf.assembly import MIN_IMAGE_DIMENSION
 from datagrunt.pdf.codec import document_to_json_bytes
 from datagrunt.pdf.elements import PDFDocument
-from datagrunt.pdf.frame import element_frame, utf8_text
+from datagrunt.pdf.frame import _BBOX_FIELDS, element_frame, utf8_text
 from datagrunt.pdf.pdfium_engine import _checked_password, _checked_path
 from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, extract_document
 from datagrunt.pdf.quality import OcrMode
@@ -75,6 +86,8 @@ __all__ = ["PDFWriter"]
 
 # A temporary file's name: this, then a uuid4's hex (the bundle's staging prefix).
 _TEMPORARY_PREFIX = ".tmp_"
+# The frame's List columns, which a CSV holds as JSON-array strings.
+_LIST_COLUMNS = ("scope_path", "hidden_reasons")
 
 
 class PDFWriter:
@@ -169,6 +182,41 @@ class PDFWriter:
         data = utf8_text(self._extracted().to_markdown()).encode("utf-8")
         return _write_atomically(target, lambda handle: handle.write(data))
 
+    def write_parquet(self, out_filepath: str | os.PathLike[str], **polars_kwargs: Any) -> Path:
+        """Write the document's frame as Parquet at ``out_filepath``, nested types kept (see the module notes).
+
+        ``polars_kwargs`` go to ``polars.DataFrame.write_parquet`` (``compression``, say).
+
+        Returns:
+            The absolute path written.
+
+        Raises:
+            TypeError: If ``out_filepath`` is not a path (before any work); as polars raises it.
+            IsADirectoryError: If ``out_filepath`` is a directory (before any work).
+            OSError: If the file cannot be written; as extraction raises it.
+        """
+        target = _file_target(out_filepath)
+        frame = element_frame(self._extracted())
+        return _write_atomically(target, lambda handle: frame.write_parquet(handle, **polars_kwargs))
+
+    def write_csv(self, out_filepath: str | os.PathLike[str], **polars_kwargs: Any) -> Path:
+        """Write the document's frame, flattened, as CSV at ``out_filepath`` (see the module notes).
+
+        ``polars_kwargs`` go to ``polars.DataFrame.write_csv`` (``separator``, say).
+        Values are never sanitized: formula injection is the application's concern.
+
+        Returns:
+            The absolute path written.
+
+        Raises:
+            TypeError: If ``out_filepath`` is not a path (before any work); as polars raises it.
+            IsADirectoryError: If ``out_filepath`` is a directory (before any work).
+            OSError: If the file cannot be written; as extraction raises it.
+        """
+        target = _file_target(out_filepath)
+        frame = _csv_frame(element_frame(self._extracted()))
+        return _write_atomically(target, lambda handle: frame.write_csv(handle, **polars_kwargs))
+
     def _extracted(self) -> PDFDocument:
         """The document: the one given, or the source's, extracted on first use and cached."""
         if self._document is None:
@@ -250,3 +298,23 @@ def _write_rows(frame: pl.DataFrame, handle: BinaryIO) -> None:
     for row in frame.iter_rows(named=True):
         line = json.dumps(row, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         handle.write(line.encode("utf-8") + b"\n")
+
+
+def _csv_frame(frame: pl.DataFrame) -> pl.DataFrame:
+    """A7a's ``frame`` flattened for CSV: ``bbox`` as four columns in its place, the List columns JSON arrays.
+
+    See the module notes. The other columns are as they are.
+    """
+    columns: list[pl.Expr | pl.Series] = []
+    for name in frame.columns:
+        if name == "bbox":
+            columns.extend(pl.col(name).struct.field(field).alias(f"bbox_{field}") for field in _BBOX_FIELDS)
+        elif name in _LIST_COLUMNS:
+            columns.append(pl.Series(name, [_json_array(items) for items in frame[name].to_list()], dtype=pl.String))
+        else:
+            columns.append(pl.col(name))
+    return frame.select(columns)
+
+
+def _json_array(items: list[str]) -> str:
+    return json.dumps(items, ensure_ascii=False, separators=(",", ":"))

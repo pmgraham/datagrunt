@@ -10,6 +10,8 @@ import json
 import os
 from pathlib import Path
 
+import polars as pl
+import pyarrow.parquet as pq
 import pytest
 
 from datagrunt.pdf import writer
@@ -174,6 +176,8 @@ FILE_METHODS = {
     "write_jsonl": "jsonl",
     "write_json_newline_delimited": "jsonl",
     "write_markdown": "md",
+    "write_parquet": "parquet",
+    "write_csv": "csv",
 }
 
 
@@ -266,6 +270,152 @@ class TestWriteMarkdown:
         path = PDFWriter(document).write_markdown(tmp_path / "doc.md")
         assert path.read_bytes() == utf8_text(document.to_markdown()).encode("utf-8")
         assert "\\ud800" in path.read_text(encoding="utf-8")
+
+
+# The CSV's columns: the frame's, bbox flattened in its place.
+CSV_COLUMNS = [
+    "doc_id",
+    "element_id",
+    "page_number",
+    "reading_order",
+    "kind",
+    "scope_path",
+    "text",
+    "markdown",
+    "bbox_x0",
+    "bbox_y0",
+    "bbox_x1",
+    "bbox_y1",
+    "route",
+    "integrity_verified",
+    "hidden_reasons",
+]
+
+
+def flattened(document: PDFDocument) -> pl.DataFrame:
+    """The document's frame as the CSV holds it, built row by row: bbox as four columns, the lists as JSON arrays."""
+    frame = element_frame(document)
+    rows = []
+    for row in frame.to_dicts():
+        box = row.pop("bbox")
+        flat = {}
+        for name, value in row.items():
+            if name == "route":
+                flat.update({f"bbox_{key}": box[key] for key in ("x0", "y0", "x1", "y1")})
+            flat[name] = (
+                json.dumps(value, ensure_ascii=False, separators=(",", ":")) if isinstance(value, list) else value
+            )
+        rows.append(flat)
+    schema = {name: frame.schema.get(name, pl.Float64) for name in CSV_COLUMNS}
+    schema.update(scope_path=pl.String, hidden_reasons=pl.String)
+    return pl.DataFrame(rows, schema=schema, orient="row") if rows else pl.DataFrame(schema=schema)
+
+
+def formula_document() -> PDFDocument:
+    """One page whose texts start as spreadsheet formulas do."""
+    texts = ("=SUM(A1:A2)", "+1+1", "-2", "@cmd", "\t=1", 'plain, with "quotes"\nand a line')
+    elements = tuple(Paragraph(**ids(1, index), text=text) for index, text in enumerate(texts))
+    return PDFDocument(metadata=metadata(1), pages=(page(1, elements),))
+
+
+class TestWriteParquet:
+    def test_it_reads_back_as_the_frame_nested_types_kept(self, tmp_path):
+        document = rich_document()
+        path = PDFWriter(document).write_parquet(tmp_path / "doc.parquet")
+        back = pl.read_parquet(path)
+        frame = element_frame(document)
+        assert back.schema == frame.schema
+        assert back.equals(frame)
+
+    def test_an_empty_document_writes_the_schema_and_no_row(self, tmp_path):
+        path = PDFWriter(empty_document()).write_parquet(tmp_path / "doc.parquet")
+        back = pl.read_parquet(path)
+        assert back.height == 0 and back.schema == element_frame(empty_document()).schema
+
+    def test_polars_options_are_passed_on(self, tmp_path):
+        made = PDFWriter(rich_document())
+        plain = made.write_parquet(tmp_path / "plain.parquet", compression="uncompressed")
+        packed = made.write_parquet(tmp_path / "packed.parquet", compression="zstd")
+        assert pq.ParquetFile(plain).metadata.row_group(0).column(0).compression == "UNCOMPRESSED"
+        assert pq.ParquetFile(packed).metadata.row_group(0).column(0).compression == "ZSTD"
+        assert pl.read_parquet(plain).equals(pl.read_parquet(packed))
+
+    def test_a_bad_polars_option_writes_nothing(self, tmp_path):
+        with pytest.raises(TypeError):
+            PDFWriter(rich_document()).write_parquet(tmp_path / "doc.parquet", no_such_option=1)
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestWriteCsv:
+    def test_its_columns_are_the_frames_bbox_flattened_in_place(self, tmp_path):
+        path = PDFWriter(rich_document()).write_csv(tmp_path / "doc.csv")
+        assert path.read_text(encoding="utf-8").split("\n")[0].split(",") == CSV_COLUMNS
+
+    def test_it_reads_back_as_the_flattened_frame(self, tmp_path):
+        document = rich_document()
+        path = PDFWriter(document).write_csv(tmp_path / "doc.csv")
+        expected = flattened(document)
+        back = pl.read_csv(path, schema=expected.schema)
+        assert back.equals(expected)
+        assert back.height == len(document.elements)
+
+    def test_the_list_columns_are_json_arrays(self, tmp_path):
+        document = rich_document()
+        path = PDFWriter(document).write_csv(tmp_path / "doc.csv")
+        back = pl.read_csv(path, schema=flattened(document).schema)
+        assert back["scope_path"][0] == "[]" and back["hidden_reasons"][4] == '["tiny_font","transparent"]'
+        assert [json.loads(cell) for cell in back["scope_path"]] == [list(e.scope_path) for e in document.elements]
+        assert [json.loads(cell) for cell in back["hidden_reasons"]] == [
+            list(e.hidden_reasons) for e in document.elements
+        ]
+
+    def test_bbox_columns_are_the_boxes(self, tmp_path):
+        document = rich_document()
+        path = PDFWriter(document).write_csv(tmp_path / "doc.csv")
+        back = pl.read_csv(path, schema=flattened(document).schema)
+        boxes = [(e.bbox.x0, e.bbox.y0, e.bbox.x1, e.bbox.y1) for e in document.elements]
+        assert list(back.select("bbox_x0", "bbox_y0", "bbox_x1", "bbox_y1").iter_rows()) == boxes
+
+    def test_formula_like_values_are_written_as_they_are(self, tmp_path):
+        document = formula_document()
+        path = PDFWriter(document).write_csv(tmp_path / "doc.csv")
+        back = pl.read_csv(path, schema=flattened(document).schema)
+        assert back["text"].to_list() == [element.text for element in document.elements]
+        lines = path.read_text(encoding="utf-8").split("\n")
+        for line, text in zip(lines[1:5], ("=SUM(A1:A2)", "+1+1", "-2", "@cmd"), strict=True):
+            assert f",paragraph,[],{text}," in line
+
+    def test_non_ascii_and_lone_surrogates_read_back_as_the_frames(self, tmp_path):
+        document = surrogate_document()
+        path = PDFWriter(document).write_csv(tmp_path / "doc.csv")
+        expected = flattened(document)
+        assert pl.read_csv(path, schema=expected.schema).equals(expected)
+        assert json.loads(expected["scope_path"][0]) == [utf8_text("Bad \ud800 heading")]
+
+    def test_an_empty_document_writes_the_header_only(self, tmp_path):
+        path = PDFWriter(empty_document()).write_csv(tmp_path / "doc.csv")
+        assert path.read_text(encoding="utf-8") == ",".join(CSV_COLUMNS) + "\n"
+
+    def test_polars_options_are_passed_on(self, tmp_path):
+        document = rich_document()
+        path = PDFWriter(document).write_csv(tmp_path / "doc.csv", separator=";")
+        assert path.read_text(encoding="utf-8").split("\n")[0] == ";".join(CSV_COLUMNS)
+        assert pl.read_csv(path, separator=";", schema=flattened(document).schema).equals(flattened(document))
+
+    def test_a_bad_polars_option_writes_nothing(self, tmp_path):
+        with pytest.raises(TypeError):
+            PDFWriter(rich_document()).write_csv(tmp_path / "doc.csv", no_such_option=1)
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestTabularRows:
+    def test_csv_and_parquet_hold_a_row_for_each_extracted_element(self, tmp_path):
+        made = PDFWriter(text_pdf(tmp_path, pages=3))
+        parquet = pl.read_parquet(made.write_parquet(tmp_path / "doc.parquet"))
+        document = made._extracted()
+        csv = pl.read_csv(made.write_csv(tmp_path / "doc.csv"), schema=flattened(document).schema)
+        assert parquet.height == csv.height == len(document.elements) > 0
+        assert parquet["element_id"].to_list() == csv["element_id"].to_list()
 
 
 @pytest.mark.parametrize(("method", "suffix"), list(FILE_METHODS.items()))
