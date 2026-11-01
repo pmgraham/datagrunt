@@ -1611,12 +1611,20 @@ def _bold_runs_on(group: list[TextLine], line: TextLine, measure: float) -> bool
     Otherwise the last line must have wrapped onto ``line``
     (:func:`_wrapped`, ``measure`` the column's longest line end in the
     line's frame) and end no clause (``.``, ``!``, ``?`` or ``:``): bold
-    words set mid-paragraph, not a heading.
+    words set mid-paragraph, not a heading. A bold ``line`` must also
+    start lower case (:func:`_runs_on_lower`): the longest line is the
+    measure, so it always "wraps", and a heading under it starts with a
+    capital where a sentence running on does not.
     """
     last = group[-1]
-    if group[0].is_bold:
+    if group[0].is_bold or (line.is_bold and not _runs_on_lower(line.text)):
         return False
     return _wrapped(last, line, measure) and not last.text.rstrip().endswith(_CLAUSE_ENDS)
+
+
+def _runs_on_lower(text: str) -> bool:
+    """True if the first letter of ``text`` is lower case; False with no letter, or an upper-case or uncased one."""
+    return next((char for char in text if char.isalpha()), "").islower()
 
 
 def _starts_paragraph(text: str) -> bool:

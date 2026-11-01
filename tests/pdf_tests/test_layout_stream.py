@@ -764,6 +764,52 @@ class TestTextBlocks:
             "Overview of play",
         ]
 
+    @pytest.mark.parametrize(
+        "lines",
+        [
+            pytest.param(
+                (("Rated voltage and current for the drive", False), ("Mechanical", True), ("Weight 2 kg", False)),
+                id="label-longest-then-heading",
+            ),
+            pytest.param(
+                (("Install the unit on a flat surface", False), ("Wiring", True), ("Connect the supply first", False)),
+                id="one-line-paragraph-then-heading",
+            ),
+        ],
+    )
+    def test_a_bold_line_starting_upper_case_under_the_longest_line_starts_a_paragraph(self, lines):
+        # The line above is the column's measure, so it "wrapped"; a heading starts with a capital, a run-on does not.
+        assert self.bold_lines(*lines) == [text for text, _ in lines]
+
+    @pytest.mark.parametrize(
+        "bold",
+        [
+            pytest.param("2 Tonnes Is The Rated Load Of The Hoist", id="digit-then-capital"),
+            pytest.param("2024 / 2025 / 2026 / 2027 / 2028", id="no-letter"),
+            pytest.param("\u4e2d\u6587 is the rated load of the hoist", id="cjk"),
+        ],
+    )
+    def test_a_bold_line_whose_first_letter_is_not_lower_case_starts_a_paragraph(self, bold):
+        # Fail toward splitting: only a lower-case first letter shows a sentence running on (CJK has no case).
+        lines = (("Operators must read the manual before use and", False), (bold, True))
+
+        assert self.bold_lines(*lines) == [text for text, _ in lines]
+
+    def test_a_regular_line_after_bold_words_runs_on_whatever_its_case(self):
+        # The first-letter test is for regular -> bold only: after bold words mid-paragraph, a capital is a name.
+        lines = (
+            ("Operators must read the manual before use and", False),
+            ("must never exceed the rated load of the hoist", True),
+            ("Acme Cranes warns that the chain may then fail.", False),
+        )
+
+        assert self.bold_lines(*lines) == [" ".join(text for text, _ in lines)]
+
+    def test_a_bold_line_runs_on_by_its_first_letter_not_its_first_char(self):
+        lines = (("Operators must read the manual before use and", False), ("(must never exceed the rated load)", True))
+
+        assert self.bold_lines(*lines) == [" ".join(text for text, _ in lines)]
+
     def test_a_long_bold_line_opening_a_block_stays_its_own(self):
         # A heading at a block's start ends at the first regular line, however long it runs.
         lines = (

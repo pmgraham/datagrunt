@@ -123,6 +123,28 @@ class TestHeadings:
 
         assert described(read_items(tmp_path, *items)) == [("paragraph", " ".join(texts))]
 
+    @pytest.mark.parametrize(
+        "texts",
+        [
+            pytest.param(("Rated voltage and current for the drive", "Mechanical", "Weight 2 kg"), id="label-longest"),
+            pytest.param(
+                ("Install the unit on a flat surface", "Wiring", "Connect the supply first"), id="one-line-paragraph"
+            ),
+        ],
+    )
+    def test_a_bold_heading_under_the_longest_line_is_a_heading(self, tmp_path, texts):
+        # The datasheet pattern: a regular line, a bold heading under it, then its body.
+        fonts = ("Helvetica", "Helvetica-Bold", "Helvetica")
+        items = tuple(
+            TextRun(text, 72.0, 100.0 + 14.0 * at, font=font) for at, (text, font) in enumerate(zip(texts, fonts))
+        )
+
+        assert described(read_items(tmp_path, *items)) == [
+            ("paragraph", texts[0]),
+            ("heading", 1, texts[1]),
+            ("paragraph", texts[2]),
+        ]
+
     def test_a_bold_paragraph_of_two_lines_is_no_heading(self, tmp_path):
         items = read_items(tmp_path, *lines_of(("Bold words", "over two lines"), font="Helvetica-Bold"), *body(150.0))
 
