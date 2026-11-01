@@ -6,12 +6,14 @@ imported lazily.
 """
 
 import ctypes
+import hashlib
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 from datagrunt.core.pdf_io.extraction.config import _DEFAULT_MIN_IMAGE_DIMENSION
 from datagrunt.core.pdf_io.extraction.display_frame import display_edges
-from datagrunt.core.pdf_io.extraction.image_guard import _MAX_RAW_HEADER_BYTES, inspect_image
+from datagrunt.core.pdf_io.extraction.image_guard import _MAX_RAW_HEADER_BYTES, inspect_image, normalize_filter
 from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, TextItem
 from datagrunt.core.pdf_io.filenames import embedded_image_filename
 
@@ -42,15 +44,21 @@ def _import_pdfium():
 class PdfiumPage:
     """A single page; exposes text/image/render primitives in datagrunt shapes."""
 
-    def __init__(self, page, raw_module):
+    def __init__(self, page, raw_module, jbig2_streams: Callable[[], frozenset[str]] | None = None):
         """Wrap a pypdfium2 page handle.
 
         Args:
             page: A pypdfium2 page object.
             raw_module: The ``pypdfium2.raw`` module.
+            jbig2_streams: Returns the SHA-256 (hex) of each JBIG2 image stream
+                the document draws with no ``/JBIG2Globals`` (pdfium's API
+                exposes no image's decode parameters; see
+                ``render_guard.jbig2_streams_without_globals``). None: no JBIG2
+                image is decoded.
         """
         self._page = page
         self._raw = raw_module
+        self._jbig2_streams = jbig2_streams
         # If textpage acquisition fails (corrupt page), close the page handle
         # before re-raising — otherwise the constructor aborts before any
         # PdfiumPage is handed to the `with` block, so close()/__exit__ never
@@ -195,10 +203,22 @@ class PdfiumPage:
         return buffer.raw
 
     def _guard(self, obj, page_number: int, idx: int):
-        """Return the guard decision for an image object (raw stream + filters, no decode)."""
+        """Return the guard decision for an image object (raw stream + filters, no decode).
+
+        A JBIG2 image's decode parameters are checked by its raw stream: it is
+        decoded only when the document draws that stream with no ``/JBIG2Globals``.
+        """
         filters = self._image_filters(obj)
         raw = self._raw_image_stream(obj)
-        return inspect_image(raw, filters, label=f"page {page_number + 1} image {idx}")
+        is_jbig2 = bool(filters) and normalize_filter(str(filters[-1])) == "JBIG2Decode"
+        unchecked = is_jbig2 and not self._drawn_without_jbig2_globals(raw)
+        return inspect_image(raw, filters, label=f"page {page_number + 1} image {idx}", jbig2_globals_missing=unchecked)
+
+    def _drawn_without_jbig2_globals(self, raw: bytes | None) -> bool:
+        """True when ``raw`` is a JBIG2 stream the document draws with no ``/JBIG2Globals``."""
+        if raw is None or self._jbig2_streams is None:
+            return False
+        return hashlib.sha256(raw).hexdigest() in self._jbig2_streams()
 
     def guarded_image_reasons(self, page_number: int = 0) -> list:
         """Warning reasons for every image on the page a decode bound would skip.
@@ -334,6 +354,8 @@ class PdfiumDocument:
         """
         pdfium, raw = _import_pdfium()
         self._raw = raw
+        self._filepath = filepath
+        self._jbig2_streams: frozenset[str] | None = None
         try:
             self._pdf = pdfium.PdfDocument(str(filepath))
         except pdfium.PdfiumError as exc:
@@ -355,7 +377,15 @@ class PdfiumDocument:
 
     def page(self, page_number: int) -> PdfiumPage:
         """Return the wrapped page at ``page_number`` (0-indexed)."""
-        return PdfiumPage(self._pdf[page_number], self._raw)
+        return PdfiumPage(self._pdf[page_number], self._raw, self._jbig2_streams_without_globals)
+
+    def _jbig2_streams_without_globals(self) -> frozenset[str]:
+        """The document's JBIG2 streams drawn with no ``/JBIG2Globals``, read with PyMuPDF on first use."""
+        if self._jbig2_streams is None:
+            from datagrunt.core.pdf_io.extraction.render_guard import jbig2_streams_without_globals_for_path
+
+            self._jbig2_streams = jbig2_streams_without_globals_for_path(self._filepath)
+        return self._jbig2_streams
 
     def close(self) -> None:
         """Close the underlying document."""

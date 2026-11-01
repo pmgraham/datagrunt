@@ -16,6 +16,7 @@ The result depends only on the file, so a caller scans once per document and
 reuses the reason.
 """
 
+import hashlib
 import logging
 import re
 
@@ -223,7 +224,11 @@ def _inline_block_reason(content: bytes) -> str | None:
         data_window = content[data_start : data_start + _MAX_INLINE_DATA_BYTES]
         ei_match = _EI_TOKEN.search(data_window)
         data = data_window[: ei_match.start()] if ei_match is not None else data_window
-        decision = inspect_image(data if data else None, filters, label="an inline image")
+        # An inline image's /DP is not resolved here: any /JBIG2Globals in it is not checked.
+        globals_unchecked = _JBIG2_GLOBALS_KEY_RE.search(raw_dict) is not None
+        decision = inspect_image(
+            data if data else None, filters, label="an inline image", jbig2_globals_missing=globals_unchecked
+        )
         if decision.skip:
             return decision.reason
         if ei_match is None:
@@ -307,6 +312,78 @@ def document_block_reason(doc) -> str | None:
         if reason is not None:
             return reason
     return None
+
+
+def jbig2_streams_without_globals(doc) -> frozenset[str]:
+    """The SHA-256 (hex) of each JBIG2 image stream that no image draws with ``/JBIG2Globals``.
+
+    For the pdfium engine, whose API exposes no image's decode parameters: it
+    decodes a JBIG2 image only when its raw stream's hash is here. Every
+    ``/Subtype /Image`` object whose filters hold JBIG2Decode, or cannot be
+    read, has its decode parameters and raw stream read (never decoded); a
+    stream drawn by any such object with ``/JBIG2Globals``, or with decode
+    parameters that cannot be read, is left out. Empty (no JBIG2 image is
+    decoded) when the object table, a ``/Subtype`` or such a raw stream cannot
+    be read, or the scan passes its object or byte bound.
+    """
+    try:
+        count = doc.xref_length()
+    except Exception:  # noqa: BLE001 - unreadable object table -> nothing is checked
+        return frozenset()
+    if count > _MAX_SCAN_OBJECTS:
+        return frozenset()
+    budget = _MAX_SCAN_BYTES
+    without: set[str] = set()
+    unchecked: set[str] = set()
+    for xref in range(1, count):
+        subtype_name, subtype_unreadable = _resolve_subtype(doc, xref)
+        if subtype_unreadable:
+            return frozenset()
+        if subtype_name != "/Image" or not _may_be_jbig2(extract_xref_filters(doc, xref)):
+            continue
+        entry = _jbig2_stream_entry(doc, xref)
+        if entry is None:
+            return frozenset()
+        digest, has_globals, read = entry
+        budget -= read
+        if budget < 0:
+            return frozenset()
+        (unchecked if has_globals else without).add(digest)
+    return frozenset(without - unchecked)
+
+
+def _may_be_jbig2(filters: list[str]) -> bool:
+    """True when ``filters`` hold JBIG2Decode or cannot be read."""
+    return any(name == _UNREADABLE_FILTER or normalize_filter(name) == "JBIG2Decode" for name in filters)
+
+
+def _jbig2_stream_entry(doc, xref: int) -> tuple[str, bool, int] | None:
+    """``(raw stream SHA-256, drawn with /JBIG2Globals or unreadable parameters, bytes read)``; None if unreadable."""
+    globals_data, globals_missing = _jbig2_globals(doc, xref)
+    try:
+        raw = doc.xref_stream_raw(xref)
+    except Exception:  # noqa: BLE001 - unreadable raw stream -> the caller checks nothing
+        return None
+    if raw is None:
+        return None
+    has_globals = globals_missing or globals_data is not None
+    return hashlib.sha256(raw).hexdigest(), has_globals, len(raw) + len(globals_data or b"")
+
+
+def jbig2_streams_without_globals_for_path(filepath) -> frozenset[str]:
+    """Open ``filepath`` with PyMuPDF and return :func:`jbig2_streams_without_globals` (empty if it cannot)."""
+    from datagrunt.core.pdf_io.extraction.pymupdf_backend import _import_pymupdf
+
+    pymupdf = _import_pymupdf()
+    try:
+        doc = pymupdf.open(filepath)
+    except Exception as exc:  # noqa: BLE001 - unreadable here -> no JBIG2 image is decoded
+        logger.warning("JBIG2 decode parameters of %s could not be read: %s", filepath, exc)
+        return frozenset()
+    try:
+        return jbig2_streams_without_globals(doc)
+    finally:
+        doc.close()
 
 
 def _charproc_xrefs(doc, font_xref: int) -> list:

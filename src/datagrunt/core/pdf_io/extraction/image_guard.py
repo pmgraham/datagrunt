@@ -12,7 +12,10 @@ This guard reads those headers from the raw stream bytes and decides, before
 any decode, whether an image is safe to touch. It FAILS CLOSED: an image is
 safe to touch only when every filter is recognised and no readable header
 puts the decode over a documented bound. An unrecognised filter, an
-unreadable header, or a header over a bound is skipped (never decoded).
+unreadable header, or a header over a bound is skipped (never decoded). A
+JBIG2 image is safe only when every segment of its stream is of a type the
+guard checks (page information, generic regions, end markers, extensions)
+and it has no ``/JBIG2Globals`` stream.
 
 JPEG (``/DCTDecode``) is not affected on any datagrunt v4 path (pdfium and
 MuPDF write its stream out undecoded, and a page render scales it within its
@@ -54,12 +57,14 @@ _MAX_RAW_HEADER_BYTES = _MAX_ASSET_BYTES
 # this the data is refused (fail closed).
 _MAX_JBIG2_SEGMENTS = 4096
 _JBIG2_PAGE_INFO = 48  # the page-information segment type (ISO/IEC 14492 7.4.8)
-# Region segments carry a 17-byte region-information field (width x height x
-# location x flags) at the start of their data: immediate generic/text/halftone/
-# refinement regions and their "intermediate" forms (ISO/IEC 14492 7.4.1).
-_JBIG2_REGION_TYPES = frozenset({4, 6, 7, 20, 22, 23, 36, 38, 39, 40, 42, 43})
-# Segments that start with a bitmap width x height (region info / page info).
-_JBIG2_SIZED_TYPES = _JBIG2_REGION_TYPES | {_JBIG2_PAGE_INFO}
+# Generic region segments (intermediate, immediate, immediate lossless) carry a
+# 17-byte region-information field (width x height x location x flags) at the
+# start of their data (ISO/IEC 14492 7.4.1).
+_JBIG2_GENERIC_REGION_TYPES = frozenset({36, 38, 39})
+# The segment types the guard checks: page information, end of page, end of
+# stripe, end of file, the generic regions, and extensions. A stream holding a
+# segment of any other type is not decoded (fail closed).
+_JBIG2_CHECKED_TYPES = _JBIG2_GENERIC_REGION_TYPES | {_JBIG2_PAGE_INFO, 49, 50, 51, 62}
 # In a PDF-embedded JBIG2 stream the (single) page is page 1.
 _JBIG2_EMBEDDED_PAGE = 1
 # A JBIG2 dimension of 0xFFFFFFFF means "unknown" (striped); it is unsized.
@@ -339,14 +344,16 @@ def _inspect_jbig2(
     globals_data: bytes | None,
     globals_missing: bool,
 ) -> GuardDecision:
-    """Guard a JBIG2 image by the width x height of EVERY region and page-info segment.
+    """Guard a JBIG2 image by its segments: only checked types, every size within the pixel bound.
 
     MuPDF decodes a JBIG2 image at the sizes its segments give, ignoring the
-    declared /Width /Height. A bounded walk of the globals stream (shared
-    segments) and the image stream reads each region/page bitmap size; the
-    largest, at 1 bit per pixel, is checked against the pixel cap. A referenced
-    but unreadable globals stream, a malformed/truncated header, a page-info
-    segment for another page, or an unknown size, is skipped (fail closed).
+    declared /Width /Height. The image is decoded only when it has no
+    ``/JBIG2Globals`` stream (and its decode parameters could be read), and a
+    bounded walk of its stream finds only segments of ``_JBIG2_CHECKED_TYPES``,
+    each of known length, with one page-information segment for the embedded
+    page; the page and the generic regions summed, at 1 bit per pixel, are
+    each checked against the pixel bound. Anything else is skipped (fail
+    closed).
     """
     data = _usable_stream(raw_stream, label)
     if isinstance(data, GuardDecision):
@@ -356,67 +363,75 @@ def _inspect_jbig2(
         # here without a decode. Skip it.
         return GuardDecision(True, f"{label}: JBIG2 behind {', '.join(wrappers)}; size unreadable, skipped")
     if globals_missing:
-        return GuardDecision(True, f"{label}: JBIG2 globals stream cannot be read; skipped (not decoded)")
-
-    saw_page = False
-    max_pixels = 0
-    for source in (globals_data, data):
-        if source is None:
-            continue
-        result = _jbig2_segment_pixels(source)
-        if result is None:
-            return GuardDecision(True, f"{label}: JBIG2 segments cannot be read; skipped (not decoded)")
-        pixels, had_page = result
-        max_pixels = max(max_pixels, pixels)
-        saw_page = saw_page or had_page
-
-    if not saw_page:
-        # Every embedded JBIG2 image has a page-information segment; its absence
-        # means the stream could not be parsed as expected.
-        return GuardDecision(True, f"{label}: JBIG2 has no readable page-information segment; skipped")
-    if max_pixels > _MAX_DECODED_PIXELS:
+        return GuardDecision(
+            True, f"{label}: JBIG2 decode parameters could not be checked for /JBIG2Globals; skipped (not decoded)"
+        )
+    if globals_data is not None:
+        return GuardDecision(True, f"{label}: JBIG2 with a /JBIG2Globals stream is not checked; skipped (not decoded)")
+    walked = _jbig2_segment_pixels(data)
+    if isinstance(walked, str):
+        return GuardDecision(True, f"{label}: JBIG2 {walked}; skipped")
+    page_pixels, region_pixels = walked
+    if page_pixels > _MAX_DECODED_PIXELS:
         return GuardDecision(
             True,
-            f"{label}: JBIG2 decodes to {max_pixels} pixels, over the {_MAX_DECODED_PIXELS}-pixel bound; skipped",
+            f"{label}: JBIG2 decodes to {page_pixels} pixels, over the {_MAX_DECODED_PIXELS}-pixel bound; skipped",
+        )
+    if region_pixels > _MAX_DECODED_PIXELS:
+        return GuardDecision(
+            True,
+            f"{label}: JBIG2 regions decode to {region_pixels} pixels together, "
+            f"over the {_MAX_DECODED_PIXELS}-pixel bound; skipped",
         )
     return _SAFE
 
 
-def _jbig2_segment_pixels(data: bytes) -> tuple[int, bool] | None:
-    """Walk a JBIG2 segment sequence; return ``(max_region_or_page_pixels, saw_page_info)``.
+def _jbig2_segment_pixels(data: bytes) -> tuple[int, int] | str:
+    """Walk a JBIG2 embedded stream; return ``(page_pixels, generic_region_pixels_summed)``, or why not.
 
-    Returns None (fail closed) on a malformed/truncated header, a page-info
-    segment for a page other than the single embedded page, or an unknown
-    (0xFFFFFFFF) or zero dimension in a sized segment.
+    The reason (a str) completes "JBIG2 ...": a malformed or truncated
+    header, a segment type outside ``_JBIG2_CHECKED_TYPES``, a segment of
+    unknown length (the walk cannot see past it), a page-information segment
+    for a page other than the single embedded page, an unknown (0xFFFFFFFF)
+    or zero dimension, no page-information segment, or the segment bound.
     """
     position = 0
-    max_pixels = 0
-    saw_page = False
+    page_pixels: int | None = None
+    region_pixels = 0
     for _ in range(_MAX_JBIG2_SEGMENTS):
-        if position >= len(data):
-            return max_pixels, saw_page
         header = _jbig2_segment_header(data, position)
         if header is None:
-            return None
+            return "segments cannot be read"
         segment_type, page_assoc, data_start, data_length, next_position = header
-        if segment_type in _JBIG2_SIZED_TYPES:
-            if data_start + 8 > len(data):
-                return None
-            width = int.from_bytes(data[data_start : data_start + 4], "big")
-            height = int.from_bytes(data[data_start + 4 : data_start + 8], "big")
-            if width == 0 or height == 0 or _JBIG2_UNKNOWN in (width, height):
-                return None
-            if segment_type == _JBIG2_PAGE_INFO:
-                if page_assoc != _JBIG2_EMBEDDED_PAGE:
-                    return None
-                saw_page = True
-            max_pixels = max(max_pixels, width * height)
+        if segment_type not in _JBIG2_CHECKED_TYPES:
+            return f"holds a segment of type {segment_type}, which is not checked"
         if data_length == _JBIG2_UNKNOWN:
-            # An unknown-length segment can only be the last one; we cannot
-            # skip past it to reach any later segment.
-            return (max_pixels, saw_page) if saw_page else None
+            return "holds a segment of unknown length, which is not checked"
+        if segment_type == _JBIG2_PAGE_INFO or segment_type in _JBIG2_GENERIC_REGION_TYPES:
+            pixels = _jbig2_bitmap_pixels(data, data_start, data_length)
+            if pixels is None:
+                return "segments cannot be read"
+            if segment_type != _JBIG2_PAGE_INFO:
+                region_pixels += pixels
+            elif page_assoc != _JBIG2_EMBEDDED_PAGE or page_pixels is not None:
+                return "segments cannot be read"
+            else:
+                page_pixels = pixels
         position = next_position
-    return None
+        if position >= len(data):
+            return (page_pixels, region_pixels) if page_pixels is not None else "has no page-information segment"
+    return f"has more than {_MAX_JBIG2_SEGMENTS} segments"
+
+
+def _jbig2_bitmap_pixels(data: bytes, data_start: int, data_length: int) -> int | None:
+    """The width x height a page-information or region segment's data starts with; None if unreadable or unknown."""
+    if data_length < 8:
+        return None
+    width = int.from_bytes(data[data_start : data_start + 4], "big")
+    height = int.from_bytes(data[data_start + 4 : data_start + 8], "big")
+    if width == 0 or height == 0 or _JBIG2_UNKNOWN in (width, height):
+        return None
+    return width * height
 
 
 def jbig2_page_size(data: bytes) -> tuple[int, int] | None:
