@@ -44,17 +44,50 @@ document's:
    ``author`` are A2's :func:`~datagrunt.pdf.pdfium_engine.document_metadata`;
    ``doc_id`` is :meth:`~datagrunt.pdf.elements.DocumentMetadata.make_doc_id`.
 
+Workers: with ``workers > 1`` the pages run in worker processes, one per
+contiguous chunk (:func:`_chunks`: ``min(workers, page_count)`` chunks whose
+sizes differ by at most one), all at once; each worker opens the document
+itself (a pdfium handle never crosses processes) and returns its pages,
+pickled, and the pages come back in page order. Pages extract in this
+process instead when ``workers`` is 1, the document has one page, or a
+distributed runner is detected (:func:`_is_distributed_env`, ported from v4:
+its executors are the parallelism). The pool is bounded and always ends:
+
+- Workers are started with the ``spawn`` method on every platform, so a
+  worker never inherits a forked copy of pdfium's state. As with any
+  ``multiprocessing`` pool, a script that extracts with ``workers > 1``
+  needs the ``if __name__ == "__main__":`` guard: a spawned worker imports
+  the caller's main module.
+- Every worker must return by one deadline,
+  :data:`_WORKER_START_S` + :data:`_WORKER_PAGE_S` x the longest chunk,
+  counted from the pool's start. One that has not is killed, and its
+  chunk's pages are error pages.
+- A worker that dies without returning (killed, crashed, ``os._exit``)
+  leaves error pages for exactly its chunk's pages, never a lost page; the
+  other chunks extract. Under ``strict`` either case raises a
+  DatagruntPDFError naming the pages instead.
+- An exception a worker raises outside the per-page isolation (``strict``'s
+  PDFCorruptError, an open error) is raised here.
+- Every worker is reaped (killed first if still running) before the pool
+  returns or raises, on every path.
+
 An error page (A1: no elements, no quality, never verified) is routed
 ``"vision"``, the spec's route for a page whose extraction fails (render
 and OCR, A5b). Its size is the page's, read with
 :func:`~datagrunt.pdf.pdfium_engine.page_geometry`; when that cannot be
 read either, it is pdfium's default page size (612 x 792 pt, what pdfium
-reads for an empty MediaBox), and a warning says so and why.
+reads for an empty MediaBox), and a warning says so and why. A worker's
+error pages (it died, or ran out of time) have that default size: their
+pages were never read in this process.
 """
 
 import hashlib
+import multiprocessing
 import os
+import time
 from dataclasses import dataclass, field
+from multiprocessing.connection import Connection
+from multiprocessing.context import SpawnContext, SpawnProcess
 from pathlib import Path
 from typing import BinaryIO, get_args
 
@@ -78,7 +111,7 @@ from datagrunt.pdf.pdfium_engine import (
     recover_dropped_text,
 )
 from datagrunt.pdf.quality import OcrMode, PageAssessment, assess_page
-from datagrunt.pdf.render import _MIN_RENDER_PIXELS, _MIN_TARGET_DPI
+from datagrunt.pdf.render import _MIN_RENDER_PIXELS, _MIN_TARGET_DPI, _REAP_TIMEOUT_S
 from datagrunt.pdf.scope import apply_scope
 
 __all__ = ["PDFSource", "PipelineOptions", "extract_document", "extract_page_at"]
@@ -91,6 +124,16 @@ _DEFAULT_PAGE_SIZE = (612.0, 792.0)
 
 # The source is hashed in reads of at most this many bytes.
 _HASH_CHUNK_BYTES = 1 << 20
+
+# Environment variables that mark a distributed runner (Spark, Beam, Flink, Celery): v4's
+# ``core.pdf_io.engines._is_distributed_env``, ported.
+_DISTRIBUTED_KEYS = ("SPARK_ENV_LOADED", "SPARK_HOME", "BEAM_WORKER_ID", "FLINK_CONF_DIR", "CELERY_BROKER_URL")
+
+# A worker's deadline: this, plus _WORKER_PAGE_S for each page of the longest chunk, from the pool's start.
+# Measured here: a spawned worker imports datagrunt in ~0.6 s, and the corpus's slowest page (95 pages)
+# extracts in ~0.5 s, so each bound is over 100 times what it covers.
+_WORKER_START_S = 60.0
+_WORKER_PAGE_S = 60.0
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -205,9 +248,10 @@ def extract_document(
     )
     pdf = PDFSource(path=_checked_path(source, "source"), password=password)
     with open_document(pdf.path, password=pdf.password) as handle:
-        info, digest = document_metadata(handle), _source_sha256(pdf.path)
-        pages = tuple(_isolated_page(handle, pdf, index, options) for index in range(handle.page_count))
-    return _document(pdf, info, digest, pages)
+        info, digest, count = document_metadata(handle), _source_sha256(pdf.path), handle.page_count
+        if _runs_sequentially(options.workers, count):
+            return _document(pdf, info, digest, _pages_in(handle, pdf, range(count), options))
+    return _document(pdf, info, digest, _pooled_pages(pdf, _chunks(count, options.workers), options))
 
 
 def _document(source: PDFSource, info: DocumentInfo, digest: str, pages: tuple[Page, ...]) -> PDFDocument:
@@ -347,7 +391,7 @@ def _fallback_page(handle: DocumentHandle, index: int, failure: PageFailure) -> 
     return _error_page(handle, index, f"PDFCorruptError: {failure.message} (stage {failure.stage!r})")
 
 
-def _error_page(handle: DocumentHandle, index: int, error: str) -> Page:
+def _error_page(handle: DocumentHandle | None, index: int, error: str) -> Page:
     """The A1 error page of the page at ``index``: no elements, no quality, routed vision (see the module notes)."""
     (width, height), warnings = _error_page_size(handle, index)
     return Page(
@@ -362,8 +406,13 @@ def _error_page(handle: DocumentHandle, index: int, error: str) -> Page:
     )
 
 
-def _error_page_size(handle: DocumentHandle, index: int) -> tuple[tuple[float, float], tuple[str, ...]]:
-    """The page's displayed size, or pdfium's default page size and a warning saying why."""
+def _error_page_size(handle: DocumentHandle | None, index: int) -> tuple[tuple[float, float], tuple[str, ...]]:
+    """The page's displayed size, or pdfium's default page size and a warning saying why.
+
+    With no ``handle`` (a worker's page that never came back) the size is not read.
+    """
+    if handle is None:
+        return _DEFAULT_PAGE_SIZE, (_default_size_warning("its worker process returned nothing"),)
     try:
         geometry = page_geometry(handle, index)
     except Exception as exc:  # an error page is never dropped: its size is read when it can be
@@ -376,3 +425,139 @@ def _default_size_warning(reason: str) -> str:
     width, height = _DEFAULT_PAGE_SIZE
     default = f"{width:g} x {height:g} pt is pdfium's default page size, not this page's"
     return f"the page's size could not be read ({reason}); {default}"
+
+
+def _pages_in(handle: DocumentHandle, source: PDFSource, indices: range, options: PipelineOptions) -> tuple[Page, ...]:
+    """The pages at ``indices`` of the open document, in order, each one's steps isolated."""
+    return tuple(_isolated_page(handle, source, index, options) for index in indices)
+
+
+def _is_distributed_env() -> bool:
+    """True inside a distributed runner (Spark, Beam, Flink, Celery), as v4 detects one."""
+    return any(key in os.environ for key in _DISTRIBUTED_KEYS)
+
+
+def _runs_sequentially(workers: int, page_count: int) -> bool:
+    """True when the pages extract in this process: one worker, one page, or a distributed runner."""
+    return workers == 1 or page_count == 1 or _is_distributed_env()
+
+
+def _chunks(page_count: int, workers: int) -> tuple[range, ...]:
+    """``min(workers, page_count)`` contiguous runs of page indices, in order, sizes differing by at most one."""
+    count = min(workers, page_count)
+    size, extra = divmod(page_count, count)
+    starts = [index * size + min(index, extra) for index in range(count + 1)]
+    return tuple(range(start, stop) for start, stop in zip(starts, starts[1:]))
+
+
+def _extract_chunk(source: PDFSource, pages: range, options: PipelineOptions) -> tuple[Page, ...]:
+    """A worker's work: open the document itself, extract ``pages`` in order, close it."""
+    with open_document(source.path, password=source.password) as handle:
+        return _pages_in(handle, source, pages, options)
+
+
+def _chunk_worker(sender: Connection, source: PDFSource, pages: range, options: PipelineOptions) -> None:
+    """A worker process's body: send its pages, or the exception that stopped them (the parent raises it).
+
+    Module level, so a spawned worker imports it by name.
+    """
+    with sender:
+        try:
+            outcome: tuple[Page, ...] | Exception = _extract_chunk(source, pages, options)
+        except Exception as exc:  # strict's PDFCorruptError, an open error: sent, and raised by the parent
+            outcome = exc
+        sender.send(outcome)
+
+
+@dataclass(frozen=True, slots=True)
+class _Worker:
+    """One running worker: its chunk, its process, and the parent's end of its pipe."""
+
+    pages: range
+    process: SpawnProcess
+    receiver: Connection
+
+
+def _pooled_pages(source: PDFSource, chunks: tuple[range, ...], options: PipelineOptions) -> tuple[Page, ...]:
+    """Each chunk's pages from a worker process of its own, all at once; the pages in page order.
+
+    Every worker is reaped before this returns or raises (see the module notes).
+    """
+    context = multiprocessing.get_context("spawn")
+    budget_s = _WORKER_START_S + _WORKER_PAGE_S * max(len(chunk) for chunk in chunks)
+    deadline = time.monotonic() + budget_s
+    workers: list[_Worker] = []
+    try:
+        for chunk in chunks:
+            workers.append(_started(context, source, chunk, options))
+        return tuple(page for worker in workers for page in _collected(worker, deadline, budget_s, options))
+    finally:
+        _shut_down(workers)
+
+
+def _started(context: SpawnContext, source: PDFSource, pages: range, options: PipelineOptions) -> _Worker:
+    """Start the worker for ``pages``; the parent keeps only its pipe's receiving end."""
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_chunk_worker, args=(sender, source, pages, options), name=f"datagrunt-pdf-{_span(pages)}", daemon=True
+    )
+    try:
+        process.start()
+    except BaseException:
+        receiver.close()
+        raise
+    finally:
+        sender.close()  # the worker holds its own copy: once it ends, the receiver reads end of file
+    return _Worker(pages=pages, process=process, receiver=receiver)
+
+
+def _collected(worker: _Worker, deadline: float, budget_s: float, options: PipelineOptions) -> tuple[Page, ...]:
+    """The worker's pages; its chunk's error pages if it ran out of time or died first (see the module notes)."""
+    lost = f"the worker process extracting pages {_span(worker.pages)}"
+    if not worker.receiver.poll(max(0.0, deadline - time.monotonic())):
+        worker.process.kill()
+        return _lost_chunk(worker.pages, f"{lost} did not return them within {budget_s:g} s: it was killed", options)
+    try:
+        outcome = worker.receiver.recv()
+    except (EOFError, OSError):
+        worker.process.join(_REAP_TIMEOUT_S)
+        ended = f"ended (exit code {worker.process.exitcode}) before returning them"
+        return _lost_chunk(worker.pages, f"{lost} {ended}", options)
+    worker.process.join(_REAP_TIMEOUT_S)
+    if isinstance(outcome, Exception):
+        raise outcome
+    return _checked_chunk(outcome, worker.pages, lost)
+
+
+def _lost_chunk(pages: range, reason: str, options: PipelineOptions) -> tuple[Page, ...]:
+    """The error pages of a chunk its worker never returned; under ``strict``, the reason raised."""
+    if options.strict:
+        raise DatagruntPDFError(reason)
+    return tuple(_error_page(None, index, reason) for index in pages)
+
+
+def _checked_chunk(outcome: object, pages: range, lost: str) -> tuple[Page, ...]:
+    """``outcome`` if it is the chunk's pages, in order: a worker's reply is checked, never trusted."""
+    expected = [index + 1 for index in pages]
+    if not isinstance(outcome, tuple) or not all(isinstance(page, Page) for page in outcome):
+        raise DatagruntPDFError(f"{lost} returned a {type(outcome).__name__}, not its {len(pages)} page(s)")
+    if [page.page_number for page in outcome] != expected:
+        numbers = [page.page_number for page in outcome]
+        raise DatagruntPDFError(f"{lost} returned pages {numbers}, not pages {expected}")
+    return outcome
+
+
+def _shut_down(workers: list[_Worker]) -> None:
+    """End the pool: kill each worker still running, reap it and close its pipe and process."""
+    for worker in workers:
+        worker.receiver.close()
+        if worker.process.is_alive():
+            worker.process.kill()
+        worker.process.join(_REAP_TIMEOUT_S)
+        if worker.process.exitcode is not None:
+            worker.process.close()
+
+
+def _span(pages: range) -> str:
+    """``pages`` (0-based indices) as 1-based page numbers, ``"first-last"``."""
+    return f"{pages.start + 1}-{pages.stop}"

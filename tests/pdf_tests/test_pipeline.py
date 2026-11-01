@@ -7,9 +7,11 @@ and a split table with A4b's own table fixtures. A stage that raises is a
 """
 
 import hashlib
+import multiprocessing
 import os
 import pickle
 import re
+import time
 from pathlib import Path
 
 import pypdfium2.raw as pdfium_c
@@ -151,6 +153,53 @@ def opened_handles(monkeypatch) -> list:
 
     monkeypatch.setattr(pipeline, "open_document", recorded)
     return handles
+
+
+# The environment variables v4 read as a distributed runner (Spark, Beam, Flink, Celery).
+DISTRIBUTED_KEYS = ("SPARK_ENV_LOADED", "SPARK_HOME", "BEAM_WORKER_ID", "FLINK_CONF_DIR", "CELERY_BROKER_URL")
+
+
+# Worker targets: module level, so a spawned worker imports them from this module by name.
+def crash_on_page_3(sender, source, pages, options):
+    """The worker holding page 3 dies at once (``os._exit``: no exception, no reply); the rest are the pipeline's."""
+    if 2 in pages:
+        os._exit(7)
+    pipeline._chunk_worker(sender, source, pages, options)
+
+
+def hang_on_page_3(sender, source, pages, options):
+    """The worker holding page 3 never replies; the rest are the pipeline's."""
+    if 2 in pages:
+        time.sleep(600)
+    pipeline._chunk_worker(sender, source, pages, options)
+
+
+def send_other_pages(sender, source, pages, options):
+    """A worker that replies with something that is not its pages."""
+    with sender:
+        sender.send(("page 1",))
+
+
+def started_workers(monkeypatch) -> list:
+    """Record each worker process the pool starts, with its pid read at once (a closed process has none)."""
+    started: list = []
+    real = pipeline._started
+
+    def recorded(*args, **kwargs):
+        worker = real(*args, **kwargs)
+        started.append(worker.process.pid)
+        return worker
+
+    monkeypatch.setattr(pipeline, "_started", recorded)
+    return started
+
+
+def assert_reaped(pids) -> None:
+    """No live child process, and none of ``pids`` exists (each was reaped, not left a zombie)."""
+    assert multiprocessing.active_children() == []
+    for pid in pids:
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
 
 
 GOOD = {
@@ -709,3 +758,147 @@ class TestExtractDocument:
             extract_document(path)
 
         assert handles and all(handle.closed for handle in handles)
+
+
+class TestWorkers:
+    """``workers > 1``: contiguous chunks, one worker process each, pages back in page order; the pool always ends."""
+
+    @pytest.fixture(autouse=True)
+    def _no_distributed_runner(self, monkeypatch):
+        for key in DISTRIBUTED_KEYS:
+            monkeypatch.delenv(key, raising=False)
+
+    @pytest.mark.parametrize(
+        "count,workers,chunks",
+        [
+            pytest.param(10, 4, ((0, 3), (3, 6), (6, 8), (8, 10)), id="10-by-4"),
+            pytest.param(4, 2, ((0, 2), (2, 4)), id="4-by-2"),
+            pytest.param(3, 8, ((0, 1), (1, 2), (2, 3)), id="more-workers-than-pages"),
+            pytest.param(7, 7, tuple((index, index + 1) for index in range(7)), id="one-page-each"),
+        ],
+    )
+    def test_chunks_are_contiguous_and_near_equal(self, count, workers, chunks):
+        assert pipeline._chunks(count, workers) == tuple(range(*bounds) for bounds in chunks)
+
+    @pytest.mark.parametrize("workers", [2, 3, 4, 8])
+    def test_pooled_pages_equal_sequential_pages_in_page_order(self, tmp_path, monkeypatch, workers):
+        specs = [mixed_page(), *split_table_pages(), tiny_text_page(), mixed_page(120.0)]
+        path = break_page(build_pdf(tmp_path / "doc.pdf", specs, title="Parts"), 4)
+        sequential = extract_document(path, min_image_dimension=32)
+        started = started_workers(monkeypatch)
+
+        pooled = extract_document(path, workers=workers, min_image_dimension=32)
+
+        assert len(started) == min(workers, 5)
+        assert pooled == sequential
+        assert [page.status for page in pooled.pages] == ["ok", "ok", "ok", "error", "ok"]
+        (tail,), (head,) = ([table for table in pooled.tables if table.page_number == n] for n in (2, 3))
+        assert head.continued_from_id == tail.element_id  # linked after the pool, whichever chunks held its parts
+        assert pooled.figures[0].read_raw_bytes() == sequential.figures[0].read_raw_bytes()
+        assert_reaped(started)
+
+    def test_an_encrypted_document_is_pooled_with_its_password(self, tmp_path):
+        path = build_pdf(tmp_path / "enc.pdf", [mixed_page(), mixed_page()], user_password="pw")
+
+        pooled = extract_document(path, password="pw", workers=2, min_image_dimension=32)
+
+        assert pooled == extract_document(path, password="pw", min_image_dimension=32)
+        assert pooled.figures[1].read_raw_bytes()
+
+    def test_strict_raises_from_a_worker_naming_the_page(self, tmp_path, monkeypatch):
+        path = break_page(build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 4), 3)
+        started = started_workers(monkeypatch)
+
+        with pytest.raises(PDFCorruptError, match=re.escape("page 3 is unreadable: Failed to load page.")) as caught:
+            extract_document(path, workers=2, strict=True)
+
+        assert caught.value.page_number == 3
+        assert_reaped(started)
+
+    def test_a_worker_crash_is_error_pages_for_its_chunk_and_the_rest_extract(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 4)
+        sequential = extract_document(path)
+        started = started_workers(monkeypatch)
+        monkeypatch.setattr(pipeline, "_chunk_worker", crash_on_page_3)
+
+        pooled = extract_document(path, workers=2)
+
+        reason = "the worker process extracting pages 3-4 ended (exit code 7) before returning them"
+        note = f"the page's size could not be read (its worker process returned nothing){DEFAULT_SIZE_NOTE}"
+        assert pooled.pages[2:] == (error_page(3, reason, warnings=(note,)), error_page(4, reason, warnings=(note,)))
+        assert pooled.pages[:2] == sequential.pages[:2]
+        assert pooled.degraded_pages == (3, 4)
+        assert_reaped(started)
+
+    def test_strict_raises_on_a_worker_crash_naming_its_pages(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 4)
+        started = started_workers(monkeypatch)
+        monkeypatch.setattr(pipeline, "_chunk_worker", crash_on_page_3)
+
+        message = "the worker process extracting pages 3-4 ended (exit code 7) before returning them"
+        with pytest.raises(DatagruntPDFError, match=re.escape(message)):
+            extract_document(path, workers=2, strict=True)
+
+        assert_reaped(started)
+
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_a_worker_past_its_time_is_killed_and_its_chunk_is_error_pages(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 4)
+        started = started_workers(monkeypatch)
+        monkeypatch.setattr(pipeline, "_chunk_worker", hang_on_page_3)
+        monkeypatch.setattr(pipeline, "_WORKER_START_S", 4.0)
+        monkeypatch.setattr(pipeline, "_WORKER_PAGE_S", 1.0)
+
+        began = time.monotonic()
+        pooled = extract_document(path, workers=2)
+        elapsed = time.monotonic() - began
+
+        reason = "the worker process extracting pages 3-4 did not return them within 6 s: it was killed"
+        assert [page.error for page in pooled.pages] == [None, None, reason, reason]
+        # The budget is 4 + 1 x 2 = 6 s from the pool's start; the hung worker sleeps 600 s.
+        assert 6.0 <= elapsed < 36.0
+        assert_reaped(started)
+
+    def test_a_worker_that_returns_other_pages_fails_loud(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 2)
+        started = started_workers(monkeypatch)
+        monkeypatch.setattr(pipeline, "_chunk_worker", send_other_pages)
+
+        message = "the worker process extracting pages 1-1 returned a tuple, not its 1 page(s)"
+        with pytest.raises(DatagruntPDFError, match=re.escape(message)):
+            extract_document(path, workers=2)
+
+        assert_reaped(started)
+
+    def test_the_pool_is_shut_down_when_a_worker_fails_to_start(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 3)
+        started = started_workers(monkeypatch)
+        recorded = pipeline._started
+
+        def second_fails(*args, **kwargs):
+            if started:
+                raise OSError("no more processes")
+            return recorded(*args, **kwargs)
+
+        monkeypatch.setattr(pipeline, "_started", second_fails)
+
+        with pytest.raises(OSError, match="no more processes"):
+            extract_document(path, workers=3)
+
+        assert len(started) == 1
+        assert_reaped(started)
+
+    @pytest.mark.parametrize("key", DISTRIBUTED_KEYS)
+    def test_a_distributed_runner_extracts_sequentially(self, tmp_path, monkeypatch, key):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 3)
+        monkeypatch.setenv(key, "1")
+        monkeypatch.setattr(pipeline, "_pooled_pages", raising(AssertionError("the pool ran")))
+
+        assert extract_document(path, workers=4) == extract_document(path)
+
+    @pytest.mark.parametrize("pages,workers", [pytest.param(1, 4, id="one-page"), pytest.param(3, 1, id="one-worker")])
+    def test_one_page_or_one_worker_extracts_sequentially(self, tmp_path, monkeypatch, pages, workers):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * pages)
+        monkeypatch.setattr(pipeline, "_pooled_pages", raising(AssertionError("the pool ran")))
+
+        assert len(extract_document(path, workers=workers).pages) == pages
