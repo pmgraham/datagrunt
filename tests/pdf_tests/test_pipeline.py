@@ -6,6 +6,7 @@ and a split table with A4b's own table fixtures. A stage that raises is a
 ``monkeypatch`` of the pipeline's module name for it.
 """
 
+import hashlib
 import os
 import pickle
 import re
@@ -14,13 +15,14 @@ from pathlib import Path
 import pypdfium2.raw as pdfium_c
 import pytest
 
-from datagrunt.pdf import PDFCorruptError, PDFEncryptedError, pipeline
+from datagrunt.pdf import DatagruntPDFError, PDFCorruptError, PDFEncryptedError, pipeline
 from datagrunt.pdf.assembly import _VISION_NOTE, assemble_page
-from datagrunt.pdf.elements import Figure, Page, Paragraph
+from datagrunt.pdf.elements import DocumentMetadata, Figure, KeyValue, Page, Paragraph, PDFDocument
 from datagrunt.pdf.layout import find_lattice_tables
 from datagrunt.pdf.pdfium_engine import extract_page, open_document, recover_dropped_text
-from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, extract_page_at
+from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, extract_document, extract_page_at
 from datagrunt.pdf.quality import assess_page
+from datagrunt.pdf.scope import apply_scope
 from pdf_tests.builders import PageSpec, RasterImage, TextRun, break_page, build_pdf, solid_png
 from pdf_tests.test_layout_lattice import rules as lattice_rules
 from pdf_tests.test_layout_lattice import written
@@ -104,6 +106,51 @@ def error_page(page_number: int, error: str, *, size=(612.0, 792.0), warnings=()
         error=error,
         warnings=warnings,
     )
+
+
+def split_table_pages() -> list[PageSpec]:
+    """A ruled table ending page 1 and continuing at the top of page 2, its columns on the same rules."""
+    tail_ys, head_ys = (600.0, 620.0, 640.0, 660.0), (60.0, 80.0, 100.0)
+    tail = (*lattice_rules(LATTICE_XS, tail_ys), *written(PARTS, LATTICE_XS, tail_ys))
+    rest = (("Washer", "100", "0.01"), ("Pin", "8", "0.02"))
+    head = (*lattice_rules(LATTICE_XS, head_ys), *written(rest, LATTICE_XS, head_ys))
+    return [
+        PageSpec(items=(TextRun("Parts list", 72.0, 60.0, size=18.0), *body_text(100.0), *tail)),
+        PageSpec(items=(*head, *body_text(300.0))),
+    ]
+
+
+def chain_document(path, *, password=None, title=None, author=None, **options) -> PDFDocument:
+    """The per-stage chain's pages, A6's scope over them and the A1 document they make."""
+    with open_document(path, password=password) as handle:
+        count = handle.page_count
+    scoped = apply_scope(tuple(chain_page(path, index, password=password, **options) for index in range(count)))
+    digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    name = Path(path).name
+    metadata = DocumentMetadata(
+        doc_id=DocumentMetadata.make_doc_id(name, digest),
+        source_name=name,
+        sha256=digest,
+        page_count=count,
+        title=title,
+        author=author,
+    )
+    return PDFDocument(
+        metadata=metadata, pages=scoped.pages, sections=scoped.sections, header_context=scoped.header_context
+    )
+
+
+def opened_handles(monkeypatch) -> list:
+    """Record every handle the pipeline opens."""
+    handles: list = []
+    real_open = pipeline.open_document
+
+    def recorded(*args, **kwargs):
+        handles.append(real_open(*args, **kwargs))
+        return handles[-1]
+
+    monkeypatch.setattr(pipeline, "open_document", recorded)
+    return handles
 
 
 GOOD = {
@@ -466,3 +513,199 @@ class TestPageIsolation:
 
         with pytest.raises(type(error)):
             page_at(path)
+
+
+class TestExtractDocument:
+    """Every page's steps in page order, then A6's scope pass, then the A1 document (steps 6-7)."""
+
+    def test_a_document_is_its_pages_scoped(self, tmp_path):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page(), *split_table_pages()], title="Parts", author="Ada")
+
+        document = extract_document(path, min_image_dimension=32)
+
+        assert document == chain_document(path, title="Parts", author="Ada", min_image_dimension=32)
+        # Not vacuous: the pages hold elements and the scope pass set paths and sections.
+        assert [page.page_number for page in document.pages] == [1, 2, 3]
+        assert document.sections and all(page.elements for page in document.pages)
+        assert document.integrity_verified
+
+    def test_a_table_split_across_two_pages_is_linked(self, tmp_path):
+        path = build_pdf(tmp_path / "split.pdf", split_table_pages())
+
+        document = extract_document(path)
+
+        tail, head = document.tables
+        assert (tail.page_number, head.page_number) == (1, 2)
+        assert head.continued_from_id == tail.element_id
+        assert tail.headers == ("Part", "Qty", "Price")
+
+    def test_the_header_context_is_page_ones_leading_key_values(self, tmp_path):
+        ys = (200.0, 220.0, 240.0, 260.0)
+        items = (
+            TextRun("Invoice: 10442", 72.0, 60.0, size=10.0),
+            *body_text(100.0),
+            *lattice_rules(LATTICE_XS, ys),
+            *written(PARTS, LATTICE_XS, ys),
+        )
+        path = build_pdf(tmp_path / "invoice.pdf", [PageSpec(items=items)])
+
+        document = extract_document(path)
+
+        (context,) = document.header_context
+        assert isinstance(context, KeyValue)
+        assert (context.key, context.value, context.page_number) == ("Invoice", "10442", 1)
+
+    def test_the_metadata_names_the_source(self, tmp_path):
+        path = build_pdf(tmp_path / "Q3 report.pdf", [mixed_page()], title="Quarterly", author="Ada")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+
+        metadata = extract_document(path).metadata
+
+        assert metadata == DocumentMetadata(
+            doc_id=f"Q3_report__{digest[:16]}",
+            source_name="Q3 report.pdf",
+            sha256=digest,
+            page_count=1,
+            title="Quarterly",
+            author="Ada",
+        )
+
+    @pytest.mark.parametrize("blank", ["", "   "])
+    def test_a_blank_title_and_author_are_none(self, tmp_path, blank):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()], title=blank, author=blank)
+
+        metadata = extract_document(path).metadata
+
+        assert (metadata.title, metadata.author) == (None, None)
+
+    def test_the_hash_is_streamed_in_bounded_chunks(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
+        reads: list[int] = []
+        monkeypatch.setattr(pipeline, "_HASH_CHUNK_BYTES", 1000)
+        real_read = pipeline._read_chunk
+        monkeypatch.setattr(pipeline, "_read_chunk", lambda stream: reads.append(1) or real_read(stream))
+
+        metadata = extract_document(path).metadata
+
+        assert metadata.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+        # Every chunk but the last is full, and one more read finds the end.
+        assert len(reads) == -(-path.stat().st_size // 1000) + 1
+
+    def test_a_file_that_grows_while_it_is_hashed_fails_loud(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
+        monkeypatch.setattr(pipeline, "_HASH_CHUNK_BYTES", 1000)
+        # The size at open says 0 bytes: the file holds more than its size at open allows.
+        monkeypatch.setattr(pipeline, "_size_at_open", lambda stream: 0)
+
+        message = f"{path} grew while it was hashed: it holds more than its 0 bytes at open"
+        with pytest.raises(DatagruntPDFError, match=re.escape(message)):
+            extract_document(path)
+
+    def test_a_corrupt_page_is_an_error_page_and_the_rest_extract(self, tmp_path):
+        path = break_page(build_pdf(tmp_path / "doc.pdf", [mixed_page(), mixed_page(), mixed_page()]), 2)
+
+        document = extract_document(path)
+
+        assert [page.status for page in document.pages] == ["ok", "error", "ok"]
+        assert document.pages[1].error == "PDFCorruptError: page 2 is unreadable: Failed to load page. (stage 'page')"
+        assert document.degraded_pages == (2,)
+        assert not document.integrity_verified
+        expected = apply_scope((chain_page(path, 0), page_at(path, 1), chain_page(path, 2)))
+        assert document.pages == expected.pages
+
+    def test_strict_raises_on_a_corrupt_page_naming_it(self, tmp_path):
+        path = break_page(build_pdf(tmp_path / "doc.pdf", [mixed_page(), mixed_page(), mixed_page()]), 2)
+
+        with pytest.raises(PDFCorruptError, match=re.escape("page 2 is unreadable: Failed to load page.")) as caught:
+            extract_document(path, strict=True)
+
+        assert caught.value.page_number == 2
+
+    def test_a_page_whose_layout_raises_is_an_error_page_and_the_rest_extract(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page(), mixed_page(), mixed_page()])
+        real, calls = pipeline.find_lattice_tables, []
+
+        def lattice(segments, pieces):
+            calls.append(segments)
+            if len(calls) == 2:  # page 2's: pages are extracted in order
+                raise ValueError("no grid fits")
+            return real(segments, pieces)
+
+        monkeypatch.setattr(pipeline, "find_lattice_tables", lattice)
+
+        document = extract_document(path)
+
+        assert [page.status for page in document.pages] == ["ok", "error", "ok"]
+        assert document.pages[1].error == "ValueError: no grid fits"
+        assert document.pages[1].warnings == ()  # its size was read
+        assert document.degraded_pages == (2,)
+
+    def test_an_encrypted_document_opens_with_its_password(self, tmp_path):
+        path = build_pdf(tmp_path / "enc.pdf", [mixed_page()], user_password="pw", title="Secret", author="Ada")
+
+        document = extract_document(path, password="pw", min_image_dimension=32)
+
+        assert document == chain_document(path, password="pw", title="Secret", author="Ada", min_image_dimension=32)
+        assert document.figures[0].read_raw_bytes()
+
+    @pytest.mark.parametrize("password,message", [(None, "pass its password"), ("nope", "password is incorrect")])
+    def test_an_encrypted_document_without_its_password_raises(self, tmp_path, password, message):
+        path = build_pdf(tmp_path / "enc.pdf", [mixed_page()], user_password="pw")
+
+        with pytest.raises(PDFEncryptedError, match=message):
+            extract_document(path, password=password)
+
+    def test_a_missing_file_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            extract_document(tmp_path / "missing.pdf")
+
+    def test_a_file_that_is_no_pdf_raises(self, tmp_path):
+        path = tmp_path / "notes.pdf"
+        path.write_text("not a PDF")
+
+        with pytest.raises(PDFCorruptError, match="is not a readable PDF") as caught:
+            extract_document(path)
+
+        assert caught.value.page_number is None
+
+    @pytest.mark.parametrize(
+        "options,message",
+        [
+            pytest.param({"workers": 0}, "workers must be >= 1, got 0", id="workers"),
+            pytest.param({"dpi": 35}, "dpi must be >= 36, got 35", id="dpi"),
+            pytest.param({"vision_dpi": 100}, "vision_dpi must be >= dpi (200), got 100", id="vision"),
+            pytest.param({"max_render_pixels": 1}, "max_render_pixels must be >= 262144, got 1", id="pixels"),
+            pytest.param({"min_image_dimension": 0}, "min_image_dimension must be >= 1, got 0", id="min-image"),
+            pytest.param({"ocr": "maybe"}, "ocr must be 'auto' or 'always' or 'never', got 'maybe'", id="ocr"),
+        ],
+    )
+    def test_the_construction_checks_come_before_any_work(self, tmp_path, monkeypatch, options, message):
+        handles = opened_handles(monkeypatch)
+
+        with pytest.raises(ValueError, match=re.escape(message)):
+            extract_document(tmp_path / "missing.pdf", **options)
+
+        assert handles == []
+
+    def test_the_source_and_password_are_checked_before_any_work(self, tmp_path, monkeypatch):
+        handles = opened_handles(monkeypatch)
+
+        with pytest.raises(TypeError, match="source must be a str or os.PathLike, got bytes"):
+            extract_document(b"doc.pdf")
+        with pytest.raises(TypeError, match="password must be a str or None, got int"):
+            extract_document(tmp_path / "missing.pdf", password=1234)
+
+        assert handles == []
+
+    @pytest.mark.parametrize("strict", [False, True])
+    def test_every_document_it_opens_is_closed(self, tmp_path, monkeypatch, strict):
+        path = break_page(build_pdf(tmp_path / "doc.pdf", [mixed_page(), mixed_page()]), 2)
+        handles = opened_handles(monkeypatch)
+
+        if strict:
+            with pytest.raises(PDFCorruptError):
+                extract_document(path, strict=True)
+        else:
+            extract_document(path)
+
+        assert handles and all(handle.closed for handle in handles)

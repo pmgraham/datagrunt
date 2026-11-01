@@ -33,6 +33,17 @@ Two stand-ins hold A5b's place, each one small function A5b replaces:
 ``"ocr_unavailable"`` page) and :func:`_fallback_page` (a page A2 cannot
 read is an error page).
 
+:func:`extract_document` runs every page's steps in page order, then the
+document's:
+
+6. A6 :func:`~datagrunt.pdf.scope.apply_scope`: scope paths, split-table
+   links, sections and header context.
+7. The A1 :class:`~datagrunt.pdf.elements.PDFDocument`. Its metadata:
+   ``source_name`` is the file's name; ``sha256`` is streamed over the
+   file's bytes in chunks of :data:`_HASH_CHUNK_BYTES`; ``title`` and
+   ``author`` are A2's :func:`~datagrunt.pdf.pdfium_engine.document_metadata`;
+   ``doc_id`` is :meth:`~datagrunt.pdf.elements.DocumentMetadata.make_doc_id`.
+
 An error page (A1: no elements, no quality, never verified) is routed
 ``"vision"``, the spec's route for a page whose extraction fails (render
 and OCR, A5b). Its size is the page's, read with
@@ -41,22 +52,26 @@ read either, it is pdfium's default page size (612 x 792 pt, what pdfium
 reads for an empty MediaBox), and a warning says so and why.
 """
 
+import hashlib
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import get_args
+from typing import BinaryIO, get_args
 
 from datagrunt.pdf._validate import choice_str, int_at_least, strict_bool
 from datagrunt.pdf.assembly import MIN_IMAGE_DIMENSION, assemble_page
-from datagrunt.pdf.elements import Page
-from datagrunt.pdf.exceptions import PDFCorruptError
+from datagrunt.pdf.elements import DocumentMetadata, Page, PDFDocument
+from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError
 from datagrunt.pdf.layout import find_lattice_tables
 from datagrunt.pdf.pdfium_engine import (
     DocumentHandle,
+    DocumentInfo,
     PageFailure,
     RawPage,
     _checked_index,
     _checked_password,
     _checked_path,
+    document_metadata,
     extract_page,
     open_document,
     page_geometry,
@@ -64,14 +79,18 @@ from datagrunt.pdf.pdfium_engine import (
 )
 from datagrunt.pdf.quality import OcrMode, PageAssessment, assess_page
 from datagrunt.pdf.render import _MIN_RENDER_PIXELS, _MIN_TARGET_DPI
+from datagrunt.pdf.scope import apply_scope
 
-__all__ = ["PDFSource", "PipelineOptions", "extract_page_at"]
+__all__ = ["PDFSource", "PipelineOptions", "extract_document", "extract_page_at"]
 
 _OCR_MODES: tuple[OcrMode, ...] = get_args(OcrMode)
 
 # pdfium's own default page size (US Letter), as it reads an empty MediaBox: an error page's size when its own
 # cannot be read.
 _DEFAULT_PAGE_SIZE = (612.0, 792.0)
+
+# The source is hashed in reads of at most this many bytes.
+_HASH_CHUNK_BYTES = 1 << 20
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -144,6 +163,96 @@ class PDFSource:
     def __post_init__(self) -> None:
         object.__setattr__(self, "path", _checked_path(self.path, "source").absolute())
         _checked_password(self.password)
+
+
+def extract_document(
+    source: str | os.PathLike[str],
+    *,
+    password: str | None = None,
+    workers: int = 1,
+    ocr: OcrMode = "auto",
+    dpi: int = 200,
+    vision_dpi: int = 300,
+    max_render_pixels: int = 16_000_000,
+    min_image_dimension: int = MIN_IMAGE_DIMENSION,
+    strict: bool = False,
+) -> PDFDocument:
+    """Extract the whole PDF at ``source``: steps 1-5 for every page, then 6-7 (see the module notes).
+
+    The options are :class:`PipelineOptions`', checked before any work. No
+    page is dropped: a page that fails is an error page, or, under
+    ``strict``, a PDFCorruptError naming it. The document is closed before
+    returning, on every path.
+
+    Raises:
+        TypeError, ValueError: As :class:`PipelineOptions` and
+            :class:`PDFSource` raise them, before the file is opened.
+        FileNotFoundError, PermissionError, PDFEncryptedError: As
+            :func:`~datagrunt.pdf.pdfium_engine.open_document` raises them.
+        PDFCorruptError: If the file is not a readable PDF (``page_number``
+            None), or, under ``strict``, for a page that fails (set).
+        DatagruntPDFError: If the file grows while it is hashed, or its
+            title or author is over A2's bound.
+    """
+    options = PipelineOptions(
+        workers=workers,
+        ocr=ocr,
+        dpi=dpi,
+        vision_dpi=vision_dpi,
+        max_render_pixels=max_render_pixels,
+        min_image_dimension=min_image_dimension,
+        strict=strict,
+    )
+    pdf = PDFSource(path=_checked_path(source, "source"), password=password)
+    with open_document(pdf.path, password=pdf.password) as handle:
+        info, digest = document_metadata(handle), _source_sha256(pdf.path)
+        pages = tuple(_isolated_page(handle, pdf, index, options) for index in range(handle.page_count))
+    return _document(pdf, info, digest, pages)
+
+
+def _document(source: PDFSource, info: DocumentInfo, digest: str, pages: tuple[Page, ...]) -> PDFDocument:
+    """Steps 6-7: A6's scope over the pages, then the A1 document and its metadata."""
+    scoped = apply_scope(pages)
+    name = source.path.name
+    metadata = DocumentMetadata(
+        doc_id=DocumentMetadata.make_doc_id(name, digest),
+        source_name=name,
+        sha256=digest,
+        page_count=len(pages),
+        title=info.title,
+        author=info.author,
+    )
+    return PDFDocument(
+        metadata=metadata, pages=scoped.pages, sections=scoped.sections, header_context=scoped.header_context
+    )
+
+
+def _source_sha256(path: Path) -> str:
+    """The SHA-256 of the file's bytes, read in chunks of :data:`_HASH_CHUNK_BYTES`.
+
+    The reads are bounded by the file's size when it was opened: one that
+    grows past it while it is read fails loud rather than hash bytes pdfium
+    may never have read.
+    """
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        size = _size_at_open(stream)
+        for _ in range(size // _HASH_CHUNK_BYTES + 2):
+            block = _read_chunk(stream)
+            if not block:
+                return digest.hexdigest()
+            digest.update(block)
+    raise DatagruntPDFError(f"{path} grew while it was hashed: it holds more than its {size} bytes at open")
+
+
+def _size_at_open(stream: BinaryIO) -> int:
+    """The size, in bytes, of the open file ``stream`` reads."""
+    return os.fstat(stream.fileno()).st_size
+
+
+def _read_chunk(stream: BinaryIO) -> bytes:
+    """The next at most :data:`_HASH_CHUNK_BYTES` bytes of ``stream`` (empty at its end)."""
+    return stream.read(_HASH_CHUNK_BYTES)
 
 
 def extract_page_at(handle_source: PDFSource, index: int, options: PipelineOptions) -> Page:
