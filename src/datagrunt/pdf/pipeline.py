@@ -71,6 +71,29 @@ its executors are the parallelism). The pool is bounded and always ends:
 - Every worker is reaped (killed first if still running) before the pool
   returns or raises, on every path.
 
+The hash is bound to the bytes extracted. The source is opened once, and
+through that open file its identity is taken, once
+(:class:`SourceIdentity`: ``st_dev``, ``st_ino``, ``st_size``,
+``st_mtime_ns`` from ``fstat``), then its first ``st_size`` bytes are
+hashed. pdfium opens the file by path (A2's
+:func:`~datagrunt.pdf.pdfium_engine.open_document`, which maps pdfium's
+load errors itself), so each opening is checked against the identity:
+
+- right after pdfium opens it here, ``os.stat`` of the path;
+- in each worker, right after pdfium opens it and again after its last
+  page, ``os.stat`` of the path;
+- after every page, ``fstat`` of the file the hash was read through.
+
+Any difference raises :class:`~datagrunt.pdf.exceptions.PDFSourceChangedError`
+naming it (inode, size or mtime), ``strict`` or not: no document whose pages
+and hash could disagree is returned. A file replaced after pdfium opened it
+here needs no check: pdfium keeps reading the file it opened, the hashed one.
+What this cannot see: a write that keeps the size and restores the mtime,
+or the path swapped away and back in the moment between pdfium's open and
+the check that follows it (each is a deliberate race on the caller's own
+directory). A figure's loader reopens the path later and verifies each
+image's own SHA-256 when it reads.
+
 An error page (A1: no elements, no quality, never verified) is routed
 ``"vision"``, the spec's route for a page whose extraction fails (render
 and OCR, A5b). Its size is the page's, read with
@@ -81,10 +104,14 @@ error pages (it died, or ran out of time) have that default size: their
 pages were never read in this process.
 """
 
+import dataclasses
+import errno
 import hashlib
 import multiprocessing
 import os
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from multiprocessing.connection import Connection
 from multiprocessing.context import SpawnContext, SpawnProcess
@@ -94,7 +121,7 @@ from typing import BinaryIO, get_args
 from datagrunt.pdf._validate import choice_str, int_at_least, strict_bool
 from datagrunt.pdf.assembly import MIN_IMAGE_DIMENSION, assemble_page
 from datagrunt.pdf.elements import DocumentMetadata, Page, PDFDocument
-from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError
+from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFSourceChangedError
 from datagrunt.pdf.layout import find_lattice_tables
 from datagrunt.pdf.pdfium_engine import (
     DocumentHandle,
@@ -114,7 +141,7 @@ from datagrunt.pdf.quality import OcrMode, PageAssessment, assess_page
 from datagrunt.pdf.render import _MIN_RENDER_PIXELS, _MIN_TARGET_DPI, _REAP_TIMEOUT_S
 from datagrunt.pdf.scope import apply_scope
 
-__all__ = ["PDFSource", "PipelineOptions", "extract_document", "extract_page_at"]
+__all__ = ["PDFSource", "PipelineOptions", "SourceIdentity", "extract_document", "extract_page_at"]
 
 _OCR_MODES: tuple[OcrMode, ...] = get_args(OcrMode)
 
@@ -182,6 +209,43 @@ class PipelineOptions:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class SourceIdentity:
+    """The identity of the file a document's hash was read through, from one ``fstat`` (see the module notes).
+
+    Attributes:
+        device: ``st_dev``.
+        inode: ``st_ino``: with ``device``, which file the path named.
+        size: ``st_size``, in bytes.
+        mtime_ns: ``st_mtime_ns``.
+    """
+
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+
+    def __post_init__(self) -> None:
+        for name in ("device", "inode", "size", "mtime_ns"):
+            int_at_least(name, getattr(self, name), 0)
+
+    @classmethod
+    def of(cls, status: os.stat_result) -> "SourceIdentity":
+        """The identity in a stat result."""
+        return cls(device=status.st_dev, inode=status.st_ino, size=status.st_size, mtime_ns=status.st_mtime_ns)
+
+    def changes(self, other: "SourceIdentity") -> tuple[str, ...]:
+        """What differs in ``other``, in words: its inode, size and mtime, in that order; empty when nothing does."""
+        found: list[str] = []
+        if (self.device, self.inode) != (other.device, other.inode):
+            found.append(f"inode {self.device}:{self.inode} -> {other.device}:{other.inode}")
+        if self.size != other.size:
+            found.append(f"size {self.size} -> {other.size} bytes")
+        if self.mtime_ns != other.mtime_ns:
+            found.append(f"mtime {self.mtime_ns} -> {other.mtime_ns} ns")
+        return tuple(found)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class PDFSource:
     """Where the document is opened from: in this process, or reopened in a worker.
 
@@ -193,19 +257,26 @@ class PDFSource:
         password: The encrypted PDF's password, or None. Excluded from repr
             and equality, and never put in an error message; a pickle of the
             source carries it (the worker needs it).
+        identity: The identity of the file the document's hash was read
+            through; every opening of ``path`` is checked against it. None
+            checks nothing (a caller that hashed nothing).
 
     Raises:
-        TypeError: If ``path`` is not a str or os.PathLike of str, or
-            ``password`` is not a str or None.
+        TypeError: If ``path`` is not a str or os.PathLike of str,
+            ``password`` is not a str or None, or ``identity`` is not a
+            SourceIdentity or None.
         ValueError: If ``password`` contains NUL.
     """
 
     path: Path
     password: str | None = field(default=None, repr=False, compare=False)
+    identity: SourceIdentity | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "path", _checked_path(self.path, "source").absolute())
         _checked_password(self.password)
+        if self.identity is not None and not isinstance(self.identity, SourceIdentity):
+            raise TypeError(f"identity must be a SourceIdentity or None, got {type(self.identity).__name__}")
 
 
 def extract_document(
@@ -234,8 +305,10 @@ def extract_document(
             :func:`~datagrunt.pdf.pdfium_engine.open_document` raises them.
         PDFCorruptError: If the file is not a readable PDF (``page_number``
             None), or, under ``strict``, for a page that fails (set).
-        DatagruntPDFError: If the file grows while it is hashed, or its
-            title or author is over A2's bound.
+        PDFSourceChangedError: If the file changes while it is extracted
+            (see the module notes), ``strict`` or not.
+        DatagruntPDFError: If its title or author is over A2's bound, or a
+            worker returns something that is not its pages.
     """
     options = PipelineOptions(
         workers=workers,
@@ -247,11 +320,22 @@ def extract_document(
         strict=strict,
     )
     pdf = PDFSource(path=_checked_path(source, "source"), password=password)
-    with open_document(pdf.path, password=pdf.password) as handle:
-        info, digest, count = document_metadata(handle), _source_sha256(pdf.path), handle.page_count
+    with _opened_source(pdf.path) as stream:
+        identity = SourceIdentity.of(os.fstat(stream.fileno()))
+        digest = _stream_sha256(stream, identity.size, pdf.path)
+        bound = dataclasses.replace(pdf, identity=identity)
+        info, pages = _extracted_pages(bound, options)
+        _check_unchanged(bound, os.fstat(stream.fileno()), "by the end of its extraction")
+    return _document(bound, info, digest, pages)
+
+
+def _extracted_pages(source: PDFSource, options: PipelineOptions) -> tuple[DocumentInfo, tuple[Page, ...]]:
+    """The document's /Info entries and its pages, in this process or the pool (see the module notes)."""
+    with _opened_checked(source, "when pdfium opened it") as handle:
+        info, count = document_metadata(handle), handle.page_count
         if _runs_sequentially(options.workers, count):
-            return _document(pdf, info, digest, _pages_in(handle, pdf, range(count), options))
-    return _document(pdf, info, digest, _pooled_pages(pdf, _chunks(count, options.workers), options))
+            return info, _pages_in(handle, source, range(count), options)
+    return info, _pooled_pages(source, _chunks(count, options.workers), options)
 
 
 def _document(source: PDFSource, info: DocumentInfo, digest: str, pages: tuple[Page, ...]) -> PDFDocument:
@@ -271,32 +355,55 @@ def _document(source: PDFSource, info: DocumentInfo, digest: str, pages: tuple[P
     )
 
 
-def _source_sha256(path: Path) -> str:
-    """The SHA-256 of the file's bytes, read in chunks of :data:`_HASH_CHUNK_BYTES`.
+def _opened_source(path: Path) -> BinaryIO:
+    """``path`` opened for reading, once: the file the hash is read through and the identity taken from.
 
-    The reads are bounded by the file's size when it was opened: one that
-    grows past it while it is read fails loud rather than hash bytes pdfium
-    may never have read.
+    A path that is not a regular file is refused before it is opened (a FIFO
+    would block), as A2's ``open_document`` refuses it.
     """
+    if not path.is_file():
+        raise FileNotFoundError(errno.ENOENT, "not an existing file", str(path))
+    return path.open("rb")
+
+
+def _stream_sha256(stream: BinaryIO, size: int, path: Path) -> str:
+    """The SHA-256 of the first ``size`` bytes of ``stream``, read in chunks of :data:`_HASH_CHUNK_BYTES`."""
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        size = _size_at_open(stream)
-        for _ in range(size // _HASH_CHUNK_BYTES + 2):
-            block = _read_chunk(stream)
-            if not block:
-                return digest.hexdigest()
-            digest.update(block)
-    raise DatagruntPDFError(f"{path} grew while it was hashed: it holds more than its {size} bytes at open")
+    remaining = size
+    for _ in range(-(-size // _HASH_CHUNK_BYTES)):
+        block = _read_chunk(stream, min(_HASH_CHUNK_BYTES, remaining))
+        if not block:
+            break
+        digest.update(block)
+        remaining -= len(block)
+    if remaining:
+        raise PDFSourceChangedError(
+            f"{path} changed while it was hashed: {size - remaining} of its {size} bytes could be read"
+        )
+    return digest.hexdigest()
 
 
-def _size_at_open(stream: BinaryIO) -> int:
-    """The size, in bytes, of the open file ``stream`` reads."""
-    return os.fstat(stream.fileno()).st_size
+def _read_chunk(stream: BinaryIO, size: int) -> bytes:
+    """The next at most ``size`` bytes of ``stream`` (fewer only at its end)."""
+    return stream.read(size)
 
 
-def _read_chunk(stream: BinaryIO) -> bytes:
-    """The next at most :data:`_HASH_CHUNK_BYTES` bytes of ``stream`` (empty at its end)."""
-    return stream.read(_HASH_CHUNK_BYTES)
+@contextmanager
+def _opened_checked(source: PDFSource, when: str) -> Iterator[DocumentHandle]:
+    """The document, opened by pdfium from ``source.path`` and checked against ``source.identity`` at once."""
+    with open_document(source.path, password=source.password) as handle:
+        _check_unchanged(source, os.stat(source.path), when)
+        yield handle
+
+
+def _check_unchanged(source: PDFSource, status: os.stat_result, when: str) -> None:
+    """Raise PDFSourceChangedError if ``status`` is not ``source.identity`` (nothing to check without one)."""
+    if source.identity is None:
+        return
+    changes = source.identity.changes(SourceIdentity.of(status))
+    if changes:
+        disagree = "its pages and its sha256 could disagree, so it is not extracted"
+        raise PDFSourceChangedError(f"{source.path} changed {when}: {', '.join(changes)}; {disagree}")
 
 
 def extract_page_at(handle_source: PDFSource, index: int, options: PipelineOptions) -> Page:
@@ -314,11 +421,16 @@ def extract_page_at(handle_source: PDFSource, index: int, options: PipelineOptio
             and PDFCorruptError for an unreadable file.
         PDFCorruptError: Under ``options.strict``, for a page that fails,
             naming it (``page_number`` is set).
+        PDFSourceChangedError: If ``handle_source.identity`` is set and the
+            file at its path is not that file, when pdfium opens it or once
+            the page is extracted.
     """
     _check_arguments(handle_source, options)
-    with open_document(handle_source.path, password=handle_source.password) as handle:
+    with _opened_checked(handle_source, "when pdfium opened it") as handle:
         _checked_index(index, handle.page_count)
-        return _isolated_page(handle, handle_source, index, options)
+        page = _isolated_page(handle, handle_source, index, options)
+    _check_unchanged(handle_source, os.stat(handle_source.path), f"by the time page {index + 1} was extracted")
+    return page
 
 
 def _check_arguments(handle_source: object, options: object) -> None:
@@ -451,9 +563,16 @@ def _chunks(page_count: int, workers: int) -> tuple[range, ...]:
 
 
 def _extract_chunk(source: PDFSource, pages: range, options: PipelineOptions) -> tuple[Page, ...]:
-    """A worker's work: open the document itself, extract ``pages`` in order, close it."""
-    with open_document(source.path, password=source.password) as handle:
-        return _pages_in(handle, source, pages, options)
+    """A worker's work: open the document itself, extract ``pages`` in order, close it.
+
+    The file is checked against ``source.identity`` once pdfium opens it and
+    again after the last page.
+    """
+    span = _span(pages)
+    with _opened_checked(source, f"when the worker for pages {span} opened it") as handle:
+        extracted = _pages_in(handle, source, pages, options)
+    _check_unchanged(source, os.stat(source.path), f"by the time the worker for pages {span} finished them")
+    return extracted
 
 
 def _chunk_worker(sender: Connection, source: PDFSource, pages: range, options: PipelineOptions) -> None:

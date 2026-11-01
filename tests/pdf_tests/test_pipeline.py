@@ -20,9 +20,10 @@ import pytest
 from datagrunt.pdf import DatagruntPDFError, PDFCorruptError, PDFEncryptedError, pipeline
 from datagrunt.pdf.assembly import _VISION_NOTE, assemble_page
 from datagrunt.pdf.elements import DocumentMetadata, Figure, KeyValue, Page, Paragraph, PDFDocument
+from datagrunt.pdf.exceptions import PDFSourceChangedError
 from datagrunt.pdf.layout import find_lattice_tables
 from datagrunt.pdf.pdfium_engine import extract_page, open_document, recover_dropped_text
-from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, extract_document, extract_page_at
+from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, SourceIdentity, extract_document, extract_page_at
 from datagrunt.pdf.quality import assess_page
 from datagrunt.pdf.scope import apply_scope
 from pdf_tests.builders import PageSpec, RasterImage, TextRun, break_page, build_pdf, solid_png
@@ -178,6 +179,56 @@ def send_other_pages(sender, source, pages, options):
     """A worker that replies with something that is not its pages."""
     with sender:
         sender.send(("page 1",))
+
+
+def swap_after_first_chunk(sender, source, pages, options):
+    """The first chunk's worker replaces the source with ``other.pdf`` beside it once its pages are extracted."""
+    if 0 in pages:
+        real = pipeline._pages_in
+
+        def then_swap(*args):
+            extracted = real(*args)
+            os.replace(source.path.with_name("other.pdf"), source.path)
+            return extracted
+
+        pipeline._pages_in = then_swap  # this worker process only: it ends with the chunk
+    pipeline._chunk_worker(sender, source, pages, options)
+
+
+def identity_of(path) -> SourceIdentity:
+    status = os.stat(path)
+    return SourceIdentity(device=status.st_dev, inode=status.st_ino, size=status.st_size, mtime_ns=status.st_mtime_ns)
+
+
+def append_in_place(path) -> None:
+    """Append bytes to ``path`` (the same inode) and move its mtime on a second, whatever the clock's grain."""
+    before = os.stat(path)
+    with open(path, "ab") as stream:
+        stream.write(b"\n% appended\n")
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+
+
+def changed(path, when: str, before: SourceIdentity, after: SourceIdentity, *fields: str) -> str:
+    """The PDFSourceChangedError message for ``fields`` (``inode``, ``size``, ``mtime``) changed ``when``."""
+    words = {
+        "inode": f"inode {before.device}:{before.inode} -> {after.device}:{after.inode}",
+        "size": f"size {before.size} -> {after.size} bytes",
+        "mtime": f"mtime {before.mtime_ns} -> {after.mtime_ns} ns",
+    }
+    found = ", ".join(words[name] for name in fields)
+    return f"{path} changed {when}: {found}; its pages and its sha256 could disagree, so it is not extracted"
+
+
+def after_hashing(monkeypatch, change) -> None:
+    """Run ``change()`` once the source is hashed, before pdfium opens it."""
+    real = pipeline._stream_sha256
+
+    def hashed(*args):
+        digest = real(*args)
+        change()
+        return digest
+
+    monkeypatch.setattr(pipeline, "_stream_sha256", hashed)
 
 
 def started_workers(monkeypatch) -> list:
@@ -632,22 +683,21 @@ class TestExtractDocument:
         reads: list[int] = []
         monkeypatch.setattr(pipeline, "_HASH_CHUNK_BYTES", 1000)
         real_read = pipeline._read_chunk
-        monkeypatch.setattr(pipeline, "_read_chunk", lambda stream: reads.append(1) or real_read(stream))
+        monkeypatch.setattr(pipeline, "_read_chunk", lambda stream, size: reads.append(size) or real_read(stream, size))
 
         metadata = extract_document(path).metadata
 
+        size = path.stat().st_size
         assert metadata.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
-        # Every chunk but the last is full, and one more read finds the end.
-        assert len(reads) == -(-path.stat().st_size // 1000) + 1
+        # Exactly the size at open, in full chunks and one last partial one.
+        assert reads == [1000] * (size // 1000) + ([size % 1000] if size % 1000 else [])
 
-    def test_a_file_that_grows_while_it_is_hashed_fails_loud(self, tmp_path, monkeypatch):
+    def test_a_file_that_shrinks_while_it_is_hashed_fails_loud(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
-        monkeypatch.setattr(pipeline, "_HASH_CHUNK_BYTES", 1000)
-        # The size at open says 0 bytes: the file holds more than its size at open allows.
-        monkeypatch.setattr(pipeline, "_size_at_open", lambda stream: 0)
+        monkeypatch.setattr(pipeline, "_read_chunk", lambda stream, size: b"")
 
-        message = f"{path} grew while it was hashed: it holds more than its 0 bytes at open"
-        with pytest.raises(DatagruntPDFError, match=re.escape(message)):
+        message = f"{path} changed while it was hashed: 0 of its {path.stat().st_size} bytes could be read"
+        with pytest.raises(PDFSourceChangedError, match=re.escape(message)):
             extract_document(path)
 
     def test_a_corrupt_page_is_an_error_page_and_the_rest_extract(self, tmp_path):
@@ -902,3 +952,155 @@ class TestWorkers:
         monkeypatch.setattr(pipeline, "_pooled_pages", raising(AssertionError("the pool ran")))
 
         assert len(extract_document(path, workers=workers).pages) == pages
+
+
+class TestSourceIdentity:
+    """The hash is bound to the bytes extracted: the identity, taken once, is checked at every open and at the end.
+
+    The identity is ``(st_dev, st_ino, st_size, st_mtime_ns)`` of the file the
+    hash was read through. A change raises PDFSourceChangedError, strict or
+    not: the whole document would be inconsistent, not one page.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_distributed_runner(self, monkeypatch):
+        for key in DISTRIBUTED_KEYS:
+            monkeypatch.delenv(key, raising=False)
+
+    def test_the_error_is_a_datagrunt_pdf_error(self):
+        assert issubclass(PDFSourceChangedError, DatagruntPDFError)
+
+    @pytest.mark.parametrize("workers", [1, 2])
+    def test_an_untouched_file_extracts_and_its_hash_is_its_bytes(self, tmp_path, workers):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 3)
+
+        document = extract_document(path, workers=workers)
+
+        assert document.metadata.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
+        assert [page.status for page in document.pages] == ["ok"] * 3
+
+    @pytest.mark.parametrize("strict", [False, True])
+    def test_a_file_appended_to_before_pdfium_opens_it_raises_naming_size_and_mtime(
+        self, tmp_path, monkeypatch, strict
+    ):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 2)
+        before = identity_of(path)
+        after_hashing(monkeypatch, lambda: append_in_place(path))
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            extract_document(path, strict=strict)
+
+        assert str(caught.value) == changed(path, "when pdfium opened it", before, identity_of(path), "size", "mtime")
+
+    def test_a_file_replaced_before_pdfium_opens_it_raises_naming_the_inode(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 2)
+        other = build_pdf(tmp_path / "other.pdf", [mixed_page()] * 2)
+        os.utime(other, ns=(os.stat(path).st_atime_ns, os.stat(path).st_mtime_ns))
+        before = identity_of(path)
+        after_hashing(monkeypatch, lambda: os.replace(other, path))
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            extract_document(path)
+
+        # The same bytes (the same spec builds the same file) and the same mtime: only the inode tells.
+        assert identity_of(path).size == before.size
+        assert str(caught.value) == changed(path, "when pdfium opened it", before, identity_of(path), "inode")
+
+    def test_a_file_appended_to_during_extraction_raises_at_the_end(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 2)
+        before = identity_of(path)
+        real = pipeline._pages_in
+
+        def then_append(*args):
+            pages = real(*args)
+            append_in_place(path)
+            return pages
+
+        monkeypatch.setattr(pipeline, "_pages_in", then_append)
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            extract_document(path)
+
+        when = "by the end of its extraction"
+        assert str(caught.value) == changed(path, when, before, identity_of(path), "size", "mtime")
+
+    def test_a_file_replaced_before_the_workers_open_it_raises_in_the_first(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 4)
+        other = build_pdf(tmp_path / "other.pdf", [mixed_page()] * 4)
+        os.utime(other, ns=(os.stat(path).st_atime_ns, os.stat(path).st_mtime_ns))
+        before = identity_of(path)
+        started = started_workers(monkeypatch)
+        real = pipeline._pooled_pages
+
+        def swapped_first(*args):
+            os.replace(other, path)
+            return real(*args)
+
+        monkeypatch.setattr(pipeline, "_pooled_pages", swapped_first)
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            extract_document(path, workers=2)
+
+        when = "when the worker for pages 1-2 opened it"
+        assert str(caught.value) == changed(path, when, before, identity_of(path), "inode")
+        assert_reaped(started)
+
+    def test_a_file_replaced_while_a_worker_extracts_raises_when_it_finishes(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 4)
+        build_pdf(tmp_path / "other.pdf", [mixed_page()] * 4)
+        os.utime(tmp_path / "other.pdf", ns=(os.stat(path).st_atime_ns, os.stat(path).st_mtime_ns))
+        before = identity_of(path)
+        started = started_workers(monkeypatch)
+        monkeypatch.setattr(pipeline, "_chunk_worker", swap_after_first_chunk)
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            extract_document(path, workers=2)
+
+        when = "by the time the worker for pages 1-2 finished them"
+        assert str(caught.value) == changed(path, when, before, identity_of(path), "inode")
+        assert_reaped(started)
+
+    def test_a_page_opened_from_a_stale_identity_raises(self, tmp_path):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
+        other = build_pdf(tmp_path / "other.pdf", [PageSpec(items=body_text(100.0))])
+        os.utime(path, ns=(os.stat(other).st_atime_ns, os.stat(other).st_mtime_ns))
+        stale = identity_of(other)
+        source = PDFSource(path=path, identity=stale)
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            extract_page_at(source, 0, PipelineOptions())
+
+        assert str(caught.value) == changed(path, "when pdfium opened it", stale, identity_of(path), "inode", "size")
+
+    def test_a_page_whose_file_is_replaced_while_it_extracts_raises(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
+        other = build_pdf(tmp_path / "other.pdf", [mixed_page()])
+        os.utime(other, ns=(os.stat(path).st_atime_ns, os.stat(path).st_mtime_ns))
+        before = identity_of(path)
+        real = pipeline._isolated_page
+
+        def then_swap(*args):
+            page = real(*args)
+            os.replace(other, path)
+            return page
+
+        monkeypatch.setattr(pipeline, "_isolated_page", then_swap)
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            extract_page_at(PDFSource(path=path, identity=before), 0, PipelineOptions())
+
+        when = "by the time page 1 was extracted"
+        assert str(caught.value) == changed(path, when, before, identity_of(path), "inode")
+
+    def test_a_page_without_an_identity_is_not_checked(self, tmp_path):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
+
+        assert extract_page_at(PDFSource(path=path), 0, PipelineOptions()) == chain_page(path)
+
+    def test_the_identity_checks_its_fields(self):
+        with pytest.raises(ValueError, match=re.escape("size must be >= 0, got -1")):
+            SourceIdentity(device=1, inode=2, size=-1, mtime_ns=0)
+        with pytest.raises(TypeError, match=re.escape("inode must be an int, got 2.0 (float)")):
+            SourceIdentity(device=1, inode=2.0, size=1, mtime_ns=0)
+        with pytest.raises(TypeError, match=re.escape("identity must be a SourceIdentity or None, got tuple")):
+            PDFSource(path="doc.pdf", identity=(1, 2, 3, 4))
