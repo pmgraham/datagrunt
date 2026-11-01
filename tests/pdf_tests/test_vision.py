@@ -20,7 +20,7 @@ from PIL import Image
 
 from datagrunt.pdf import vision
 from datagrunt.pdf.assembly import FigureDraft, assemble_page, conservation
-from datagrunt.pdf.elements import BBox, Figure, Page, PageQuality, Paragraph
+from datagrunt.pdf.elements import BBox, Figure, Page, PageQuality, Paragraph, Table
 from datagrunt.pdf.layout import find_lattice_tables
 from datagrunt.pdf.ocr import OCRResult, OCRWord, Orientation, bands, normalized, rotated
 from datagrunt.pdf.pdfium_engine import (
@@ -32,7 +32,7 @@ from datagrunt.pdf.pdfium_engine import (
     recover_dropped_text,
 )
 from datagrunt.pdf.quality import SpanPiece, assess_page
-from datagrunt.pdf.render import RenderFailed, RenderRefused
+from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_size
 from datagrunt.pdf.vision import (
     PageRender,
     VisionElements,
@@ -45,8 +45,9 @@ from datagrunt.pdf.vision import (
 )
 from pdf_tests.builders import PageSpec, RasterImage, TextRun, break_page, build_pdf
 from pdf_tests.test_ocr import needs_tesseract
-from pdf_tests.test_ocr_scans import LINES, TOKENS, png_of, rendered
+from pdf_tests.test_ocr_scans import LINES, SENTENCES, TOKENS, png_of, rendered, turned, word_boxes
 from pdf_tests.test_pdfium_engine import imported_modules
+from pdf_tests.test_pdfium_spans import content_page
 from pdf_tests.test_quality import SHA, image, raw_span, row
 
 LETTER = (612.0, 792.0)
@@ -133,6 +134,10 @@ class TestOcrPieces:
         assert boxes[0][0] == 60.96 and boxes[-1][2] == 117.84
         assert all(left[2] == right[0] for left, right in zip(boxes, boxes[1:]))
         assert [right - left for left, _, right, _ in boxes] == pytest.approx([56.88 / 7] * 7)
+        # Here x0 + (x1 - x0) * 10 / 10 is not x1 in floats: the last edge must be x1 itself.
+        assert 44.93 + (111.55 - 44.93) * 10 / 10 != 111.55
+        (found,) = ocr_pieces((word("Conspiracy", 44.93, 87.6, 111.55, 97.92),))
+        assert found.span.char_boxes[-1][2] == found.span.bbox[2] == 111.55
 
     def test_its_font_is_the_box_height_upright_plain_and_painted(self):
         (found,) = ocr_pieces((word("Fox", 10.0, 20.0, 40.0, 32.5),))
@@ -165,6 +170,28 @@ class TestOcrPieces:
     def test_rejects_anything_but_a_tuple_of_ocr_words(self, bad):
         with pytest.raises(TypeError, match="words"):
             ocr_pieces(bad)
+
+
+def displayed_box(box, rotation: int, width: float, height: float):
+    """A box on the righted page, on the ``width`` x ``height`` page displayed (ocr.py's mapping, in points)."""
+    x0, y0, x1, y1 = box
+    if rotation == 90:
+        return (y0, height - x1, y1, height - x0)
+    if rotation == 180:
+        return (width - x1, height - y1, width - x0, height - y0)
+    if rotation == 270:
+        return (width - y1, x0, width - y0, x1)
+    return box
+
+
+def plain(bbox: BBox) -> tuple[float, float, float, float]:
+    return (bbox.x0, bbox.y0, bbox.x1, bbox.y1)
+
+
+def as_upright(element, upright):
+    """A turned page's ``element`` with ``upright``'s box, and column centres for a table (a turned one has none)."""
+    centres = {"column_centres": upright.column_centres} if isinstance(element, Table) else {}
+    return dataclasses.replace(element, bbox=upright.bbox, **centres)
 
 
 def kinds(found: VisionElements) -> list[str]:
@@ -257,9 +284,42 @@ class TestVisionElements:
         with pytest.raises(ValueError, match=f"{name}\\[0\\] is visible"):
             vision_elements(mixed_words(), geometry=GEOMETRY, **{name: (visible,)})
 
+    @pytest.mark.parametrize("rotation", [90, 180, 270])
+    def test_a_turned_pages_words_lay_out_righted_and_box_on_the_displayed_page(self, rotation):
+        # mixed_words() as OCR reads them on the righted (upright) page, placed on the page as displayed.
+        size = (LETTER[1], LETTER[0]) if rotation in (90, 270) else LETTER
+        on_display = tuple(
+            word(item.text, *displayed_box(plain(item.bbox), rotation, *size), item.confidence)
+            for item in mixed_words()
+        )
+        upright = vision_elements(mixed_words(), geometry=GEOMETRY)
+        geometry = dataclasses.replace(GEOMETRY, width_pt=size[0], height_pt=size[1])
+
+        found = vision_elements(on_display, geometry=geometry, rotation=rotation)
+
+        assert kinds(found) == kinds(upright)
+        for element, expected in zip(found.elements, upright.elements):
+            assert plain(element.bbox) == pytest.approx(displayed_box(plain(expected.bbox), rotation, *size))
+            assert as_upright(element, expected) == expected
+        (table,) = [element for element in found.elements if isinstance(element, Table)]
+        assert table.column_centres == ()
+
+    def test_digital_text_kept_apart_reads_on_a_turned_page_where_it_lies(self):
+        size = (LETTER[1], LETTER[0])
+        geometry = dataclasses.replace(GEOMETRY, width_pt=size[0], height_pt=size[1])
+        hidden = flagged("SECRET", 600.0, "invisible")
+
+        found = vision_elements((), geometry=geometry, rotation=90, apart=(hidden,))
+
+        (element,) = found.elements
+        assert (element.text, element.hidden_reasons) == ("SECRET", ("invisible",))
+        assert plain(element.bbox) == pytest.approx(hidden.span.bbox)
+
     def test_rejects_wrong_types(self):
         with pytest.raises(TypeError, match="words"):
             vision_elements([], geometry=GEOMETRY)
+        with pytest.raises(ValueError, match="rotation"):
+            vision_elements((), geometry=GEOMETRY, rotation=45)
         with pytest.raises(TypeError, match="geometry"):
             vision_elements((), geometry=LETTER)
         with pytest.raises(TypeError, match="figures"):
@@ -578,10 +638,12 @@ class TestOrientation:
 
         page = visioned(scans["captioned"])
 
-        expected = bands(rotated(normalized(rendered(scans["captioned"])), 90))
+        displayed = normalized(rendered(scans["captioned"]))
         found = [decoded(band) for band in page.page_image.read_bands()]
-        assert found == [(band.pixels, band.px_width, band.px_height) for band in expected]
+        assert found == [(band.pixels, band.px_width, band.px_height) for band in bands(rotated(displayed, 90))]
+        # The image itself is the page as displayed, not as OCR turned it.
         assert (page.page_image.width_px, page.page_image.height_px) == (2550, 3300)
+        assert decoded(page.page_image.read_bytes()) == (displayed.pixels, 2550, 3300)
 
 
 class TestVisionPageArguments:
@@ -897,3 +959,154 @@ class TestFallbackArguments:
                 fallback_page(handle, failure, source=scans["scan"], ocr="sometimes")
             with pytest.raises(TypeError, match="options"):
                 fallback_page(handle, failure, source=scans["scan"], options=None)
+
+
+# The spec's done-when (§806, task 5): rotated scans, a large-format sheet, a searchable scan, a garbled font.
+
+SHEET = (36 * 72.0, 48 * 72.0)  # 36" x 48", in points
+
+
+def cropped_top(page, rows: int) -> RenderedPage:
+    """The top ``rows`` of a rendered page."""
+    return RenderedPage(pixels=page.pixels[: rows * page.px_width], px_width=page.px_width, px_height=rows)
+
+
+def pua_cmap(text: str) -> bytes:
+    """A one-byte ToUnicode CMap reading each char of ``text`` but the space as private use (U+E000 + its code)."""
+    chars = sorted(set(text))
+    pairs = b"\n".join(b"<%02X> <%04X>" % (ord(char), 0x20 if char == " " else 0xE000 + ord(char)) for char in chars)
+    return (
+        b"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CMapName /Test-UCS def\n/CMapType 2 def\n"
+        b"1 begincodespacerange\n<00> <FF>\nendcodespacerange\n%d beginbfchar\n%s\nendbfchar\nendcmap\n"
+        b"CMapName currentdict /CMap defineresource pop\nend\nend" % (len(chars), pairs)
+    )
+
+
+GARBLED = "Quick zebras jump"
+
+
+@pytest.fixture(scope="module")
+def done_when(tmp_path_factory) -> dict[str, Path]:
+    """The done-when fixtures: the scan at /Rotate 90, 180, 270; searchable scans; a sheet; a garbled font."""
+    directory = tmp_path_factory.mktemp("done-when")
+    digital = build_pdf(directory / "digital.pdf", [PageSpec(items=LINES)])
+    page = rendered(digital)
+    scan = RasterImage(0.0, 0.0, *LETTER, png_of(page))
+    paths = {"digital": digital}
+    for rotate in (90, 180, 270):
+        paths[f"scan-{rotate}"] = build_pdf(directory / f"scan-{rotate}.pdf", [PageSpec(items=(scan,), rotate=rotate)])
+    invisible = tuple(TextRun(line.text, line.x, line.y, size=line.size, render_mode=3) for line in LINES)
+    paths["searchable"] = build_pdf(directory / "searchable.pdf", [PageSpec(items=(scan, *invisible))])
+    # The scan's top half only: raster cover is 50 %, not over it, so its no-paint layer is invisible (A3).
+    half = RasterImage(0.0, 0.0, LETTER[0], LETTER[1] / 2, png_of(cropped_top(page, page.px_height // 2)))
+    paths["half-searchable"] = build_pdf(directory / "half.pdf", [PageSpec(items=(half, *invisible))])
+    sheet = tuple(TextRun(sentence, 144.0, 288.0 + index * 72.0, size=36.0) for index, sentence in enumerate(SENTENCES))
+    paths["sheet"] = build_pdf(directory / "sheet.pdf", [PageSpec(width=SHEET[0], height=SHEET[1], items=sheet)])
+    content = b"BT /F1 24 Tf 40 200 Td (%s) Tj ET" % GARBLED.encode("ascii")
+    font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>"
+    cmap = pua_cmap(GARBLED)
+    stream = b"<< /Length %d >>\nstream\n%s\nendstream" % (len(cmap), cmap)
+    garbled = directory / "garbled"
+    garbled.mkdir()
+    paths["garbled"] = content_page(garbled, content, font=font, extra=(stream,))
+    return paths
+
+
+def union_of(boxes) -> tuple[float, float, float, float]:
+    boxes = list(boxes)
+    return (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+
+@needs_tesseract
+class TestRotatedScans:
+    """90 / 180 / 270 degree scans orient to 0 degrees: OCR reads them righted, in order, where they were drawn."""
+
+    @pytest.mark.parametrize("rotate", [90, 180, 270])
+    def test_a_turned_scan_reads_righted_in_order_where_it_was_drawn(self, done_when, rotate):
+        page = visioned(done_when[f"scan-{rotate}"])
+
+        righted = (360 - rotate) % 360
+        assert page.status == "ok"
+        assert f"the page reads turned: OCR righted it by {righted} degrees clockwise" in " ".join(page.warnings)
+        visible = [element for element in page.elements if not element.is_hidden and not isinstance(element, Figure)]
+        read_tokens = " ".join(element.text for element in visible).split()
+        assert len(set(TOKENS) & set(read_tokens)) >= 0.9 * len(set(TOKENS))
+        assert read_tokens[:4] == ["The", "quick", "brown", "fox"]
+        drawn = turned(union_of(box for _, box in word_boxes(done_when["digital"])), rotate, *LETTER)
+        found = union_of(plain(element.bbox) for element in visible)
+        assert found == pytest.approx(drawn, abs=3.0)
+
+    @pytest.mark.parametrize("rotate", [90, 180, 270])
+    def test_its_bands_are_900_px_bands_of_the_righted_page(self, done_when, rotate):
+        image_of = visioned(done_when[f"scan-{rotate}"]).page_image
+
+        found = [decoded(band) for band in image_of.read_bands()]
+
+        assert (image_of.width_px, image_of.height_px) == ((3300, 2550) if rotate in (90, 270) else (2550, 3300))
+        assert {width for _, width, _ in found} == {2550}
+        assert [height for _, _, height in found] == [900, 900, 900, 3300 - 2520]
+
+
+@needs_tesseract
+class TestLargeFormatSheet:
+    """A 36" x 48" sheet renders, bands and reads within max_render_pixels."""
+
+    @pytest.mark.parametrize("bound", [16_000_000, 4_000_000])
+    def test_the_sheet_reads_within_the_pixel_bound(self, done_when, bound):
+        page = visioned(done_when["sheet"], ocr="always", options=VisionOptions(max_render_pixels=bound))
+
+        image_of = page.page_image
+        dpi = effective_dpi(300, bound, *SHEET)
+        assert (image_of.dpi, image_of.width_px, image_of.height_px) == (float(dpi), *render_size(*SHEET, dpi))
+        assert image_of.width_px * image_of.height_px <= bound
+        found = [decoded(band) for band in image_of.read_bands()]
+        assert all(height <= 900 for _, _, height in found)
+        assert sum(len(pixels) for pixels, _, _ in found) <= 2 * bound
+        read_tokens = " ".join(texts(page)).split()
+        assert len(set(TOKENS) & set(read_tokens)) >= 0.9 * len(set(TOKENS))
+
+
+@needs_tesseract
+class TestSearchableScans:
+    """A searchable scan's text layer stays hidden, by its own reason or superseded, and is never superseded twice."""
+
+    def test_a3_reads_a_whole_page_scans_layer_as_the_scan_so_it_routes_hybrid(self, done_when):
+        _, assessment = inputs(done_when["searchable"])
+
+        assert assessment.route == "hybrid"
+        assert {piece.hidden_reasons for piece in assessment.pieces} == {()}
+
+    def test_forced_to_vision_its_layer_is_superseded_once(self, done_when):
+        page = visioned(done_when["searchable"], ocr="always")
+
+        hidden = [element for element in page.elements if element.is_hidden]
+        assert {element.hidden_reasons for element in hidden} == {("superseded",)}
+        assert " ".join(element.text for element in hidden).split() == TOKENS
+        read_tokens = " ".join(texts(page)).split()
+        assert len(set(TOKENS) & set(read_tokens)) >= 0.9 * len(set(TOKENS))
+
+    def test_an_invisible_layer_keeps_its_reason_and_is_not_superseded(self, done_when):
+        _, assessment = inputs(done_when["half-searchable"])
+        page = visioned(done_when["half-searchable"])
+
+        assert assessment.route == "vision"
+        hidden = [element for element in page.elements if element.is_hidden]
+        assert {element.hidden_reasons for element in hidden} == {("invisible",)}
+        assert " ".join(element.text for element in hidden).split() == TOKENS
+        assert len(set(TOKENS) & set(" ".join(texts(page)).split())) >= 0.9 * len(set(TOKENS))
+
+
+@needs_tesseract
+class TestGarbledFont:
+    """A font mapping its glyphs to private use (valid_char_ratio < 0.70): read by OCR, its digital text superseded."""
+
+    def test_its_digital_text_is_superseded_by_what_ocr_reads(self, done_when):
+        _, assessment = inputs(done_when["garbled"])
+        page = visioned(done_when["garbled"])
+
+        assert (assessment.route, page.status) == ("vision", "ok")
+        assert page.quality.valid_char_ratio == pytest.approx(2 / len(GARBLED)) and page.quality.valid_char_ratio < 0.70
+        hidden = [(element.text, element.hidden_reasons) for element in page.elements if element.is_hidden]
+        garbled = "".join(" " if char == " " else chr(0xE000 + ord(char)) for char in GARBLED)
+        assert hidden == [(garbled, ("superseded",))]
+        assert texts(page) == [GARBLED]

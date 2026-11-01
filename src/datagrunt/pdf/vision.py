@@ -20,7 +20,12 @@ visible piece of a synthetic span of its own (:func:`ocr_pieces`):
 :func:`~datagrunt.pdf.layout.page_layout`, with no lattice (a scan has no
 vector rules), so a scan yields headings, paragraphs, key-values, lists
 and stream tables; each figure is a slot in the reading order, as on any
-page. Digital text kept apart (hidden pieces, every one carrying a reason)
+page. The layout runs on the page as OCR read it, righted, where its words
+are upright: a scan turned 180 degrees reads in order (A4b reads
+upside-down text as displayed, its lines and words reversed), and one
+turned 90 or 270 reads as upright text. Each element's box is then mapped
+back to the displayed page (exactly on an upright page; to within float
+rounding on a turned one). Digital text kept apart (hidden pieces, every one carrying a reason)
 reads as hidden paragraphs placed among them. Pass C
 (:func:`~datagrunt.pdf.assembly.conservation`) checks every piece's chars
 against the elements: a mismatch is a warning.
@@ -69,14 +74,25 @@ no elements, no quality) whose ``error`` names the extraction failure and
 then why it was not read; a page whose geometry cannot be read is pdfium's
 default 612 x 792 pt, with a warning.
 
-Known limitation: a word's box runs from its highest to its lowest ink, so
-its height is the font's x-height for a word such as "over", and its
-ascent to descent for "jumps". Lines whose words mostly reach both read
-larger than the page's body, so the layout's heading rule (1.15 times the
-body size) takes some body lines for headings: on Root's Law (pages 5, 10
-and 20) OCR finds 18 to 22 headings where the digital text has 5 to 7.
-Sizing each word by its tesseract line's height instead finds as many (14
-to 20) and joins words across their spaces (A5b evidence).
+Known limitations (A5b evidence: 10 corpus pages forced to OCR):
+
+- A word's box runs from its highest to its lowest ink, so its height is
+  the font's x-height for a word such as "over", and its ascent to descent
+  for "jumps". Lines whose words mostly reach both read larger than the
+  page's body, so the layout's heading rule (1.15 times the body size)
+  takes some body lines for headings: on Root's Law pages 5, 10 and 20 OCR
+  finds 16, 16 and 19 headings where the digital text has 6, 5 and 7.
+  Sizing each word by its tesseract line's height instead finds 6, 0 and 5:
+  fewer, but it loses page 10's, and with ``--psm 6`` it joined words
+  across their spaces.
+- OCR's misreads reach the layout. A line crossing a band seam is read
+  whole in one band and as a cut fragment, read as other text, in the
+  other (:func:`~datagrunt.pdf.ocr.ocr_words` keeps both: a copy is kept
+  once only when its text is the same); the fragment lies on the line's
+  words and joins them ("nominalpiii"). A column of digits read as one
+  tall word (confidence 0) runs the lines beside it together. Every char
+  is still read once (Pass C), but the elements' words recall 75.2 % of the
+  digital words where the OCR words themselves recall 84.5 %.
 """
 
 import dataclasses
@@ -89,6 +105,7 @@ from typing import NamedTuple
 
 from PIL import Image
 
+from datagrunt.pdf._pdfium_common import Box, union_box
 from datagrunt.pdf._validate import choice_str, int_at_least, non_blank_str, positive_float, typed_tuple
 from datagrunt.pdf.assembly import (
     MIN_IMAGE_DIMENSION,
@@ -100,7 +117,7 @@ from datagrunt.pdf.assembly import (
     page_figures,
     raw_page_warnings,
 )
-from datagrunt.pdf.elements import DocumentElement, HiddenReason, Page, PageImage, PageQuality
+from datagrunt.pdf.elements import BBox, DocumentElement, Figure, HiddenReason, Page, PageImage, PageQuality, Table
 from datagrunt.pdf.exceptions import PDFCorruptError
 from datagrunt.pdf.layout import LatticeResult, find_lattice_tables, page_layout
 from datagrunt.pdf.ocr import Band, OCRWord, Orientation, bands, normalized, ocr_words, orientation, rotated
@@ -216,15 +233,23 @@ def vision_elements(
     words: tuple[OCRWord, ...],
     *,
     geometry: PageGeometry,
+    rotation: int = 0,
     apart: tuple[SpanPiece, ...] = (),
     recovered: tuple[SpanPiece, ...] = (),
     figures: tuple[FigureDraft, ...] = (),
 ) -> VisionElements:
     """The page's elements from its OCR ``words`` (see the module notes), with its digital text kept apart.
 
+    The layout runs on the page as OCR read it, turned clockwise by
+    ``rotation`` (its words upright, so their lines read in order whatever
+    the page's turn); each element's box is then mapped back to the page as
+    displayed, and a turned page's table has no column centres (A6 links
+    only columns along the displayed x). A figure keeps its own box.
+
     Args:
         words: The page's OCR words (``OCRResult.words``), on the displayed page.
         geometry: The page's geometry: its number and displayed size.
+        rotation: The clockwise turn, 0, 90, 180 or 270, OCR read the page at.
         apart: Digital pieces of the page laid out apart from the words:
             each must carry a hidden reason (the vision page supersedes its
             visible ones first).
@@ -233,26 +258,113 @@ def vision_elements(
 
     Raises:
         TypeError: If an argument is of the wrong type.
-        ValueError: If a piece of ``apart`` or ``recovered`` is visible, or
-            as :func:`~datagrunt.pdf.layout.page_layout` raises.
+        ValueError: If ``rotation`` is not a right-angle turn, a piece of
+            ``apart`` or ``recovered`` is visible, or as
+            :func:`~datagrunt.pdf.layout.page_layout` raises.
     """
-    read = ocr_pieces(words)
+    typed_tuple("words", words, OCRWord)
     if not isinstance(geometry, PageGeometry):
         raise TypeError(f"geometry must be a PageGeometry, got {type(geometry).__name__}")
+    frame = _Frame(_checked_turn(rotation), geometry.width_pt, geometry.height_pt)
     _check_hidden("apart", apart)
     _check_hidden("recovered", recovered)
     typed_tuple("figures", figures, FigureDraft)
-    layout = page_layout(
-        (*read, *apart),
-        recovered,
-        _NO_LATTICE,
-        width_pt=geometry.width_pt,
-        height_pt=geometry.height_pt,
-        figures=tuple(draft.bbox for draft in figures),
-    )
-    elements = page_elements(layout.items, figures, geometry)
-    _, mismatch = conservation((*read, *apart, *recovered), elements)
+    read = ocr_pieces(tuple(_righted_word(item, frame) for item in words))
+    spans: dict[int, RawSpan] = {}
+    kept = tuple(_righted_piece(piece, frame, spans) for piece in apart)
+    copies = tuple(_righted_piece(piece, frame, spans) for piece in recovered)
+    width, height = frame.righted_size
+    slots = tuple(_bbox(frame.righted(_box(draft.bbox))) for draft in figures)
+    layout = page_layout((*read, *kept), copies, _NO_LATTICE, width_pt=width, height_pt=height, figures=slots)
+    elements = tuple(_displayed(element, frame) for element in page_elements(layout.items, figures, geometry))
+    _, mismatch = conservation((*read, *kept, *copies), elements)
     return VisionElements(elements=elements, warnings=(*layout.warnings, *mismatch))
+
+
+class _Frame(NamedTuple):
+    """The page as OCR read it: displayed ``width`` x ``height`` points, turned clockwise by ``rotation``."""
+
+    rotation: int
+    width: float
+    height: float
+
+    @property
+    def righted_size(self) -> tuple[float, float]:
+        """The turned page's width and height."""
+        return (self.height, self.width) if self.rotation in (90, 270) else (self.width, self.height)
+
+    def righted(self, box: Box) -> Box:
+        """A box on the displayed page, on the turned page (the turn OCR made)."""
+        x0, y0, x1, y1 = box
+        if self.rotation == 90:
+            return self.height - y1, x0, self.height - y0, x1
+        if self.rotation == 180:
+            return self.width - x1, self.height - y1, self.width - x0, self.height - y0
+        if self.rotation == 270:
+            return y0, self.width - x1, y1, self.width - x0
+        return box
+
+    def displayed(self, box: Box) -> Box:
+        """A box on the turned page, on the displayed page (ocr.py's mapping of a word's box, in points)."""
+        x0, y0, x1, y1 = box
+        if self.rotation == 90:
+            return y0, self.height - x1, y1, self.height - x0
+        if self.rotation == 180:
+            return self.width - x1, self.height - y1, self.width - x0, self.height - y0
+        if self.rotation == 270:
+            return self.width - y1, x0, self.width - y0, x1
+        return box
+
+
+def _checked_turn(rotation: object) -> int:
+    """``rotation`` if it is an int of 0, 90, 180 or 270 (bool rejected)."""
+    if type(rotation) is not int or rotation not in _TURNS:
+        raise ValueError(f"rotation must be an int of 0, 90, 180 or 270, got {rotation!r}")
+    return rotation
+
+
+def _box(bbox: BBox) -> Box:
+    """A BBox as a plain ``(x0, y0, x1, y1)``."""
+    return bbox.x0, bbox.y0, bbox.x1, bbox.y1
+
+
+def _bbox(box: Box) -> BBox:
+    """A plain ``(x0, y0, x1, y1)`` as a BBox."""
+    x0, y0, x1, y1 = box
+    return BBox(x0=x0, y0=y0, x1=x1, y1=y1)
+
+
+def _righted_word(word: OCRWord, frame: _Frame) -> OCRWord:
+    """``word`` on the turned page."""
+    if frame.rotation == 0:
+        return word
+    return OCRWord(text=word.text, bbox=_bbox(frame.righted(_box(word.bbox))), confidence=word.confidence)
+
+
+def _righted_piece(piece: SpanPiece, frame: _Frame, spans: dict[int, RawSpan]) -> SpanPiece:
+    """``piece`` of its span on the turned page; pieces of one span share one turned span (``spans``, by id)."""
+    if frame.rotation == 0:
+        return piece
+    span = spans.get(id(piece.span))
+    if span is None:
+        chars = tuple(frame.righted(box) for box in piece.span.char_boxes)
+        tight = tuple(frame.righted(box) for box in piece.span.tight_boxes)
+        span = dataclasses.replace(piece.span, bbox=union_box(chars), char_boxes=chars, tight_boxes=tight)
+        spans[id(piece.span)] = span
+    return SpanPiece(span=span, start=piece.start, end=piece.end, hidden_reasons=piece.hidden_reasons)
+
+
+def _displayed(element: DocumentElement, frame: _Frame) -> DocumentElement:
+    """An element laid out on the turned page, boxed on the displayed page (the same box when upright).
+
+    A figure keeps its own box; a turned page's table has no column centres.
+    """
+    if isinstance(element, Figure):
+        return element
+    bbox = _bbox(frame.displayed(_box(element.bbox)))
+    if isinstance(element, Table) and frame.rotation != 0:
+        return dataclasses.replace(element, bbox=bbox, column_centres=())
+    return dataclasses.replace(element, bbox=bbox)
 
 
 def _check_hidden(name: str, pieces: object) -> None:
@@ -340,8 +452,7 @@ class PageRender:
         object.__setattr__(self, "source", _checked_path(self.source, "source").absolute())
         int_at_least("page_index", self.page_index, 0)
         int_at_least("dpi", self.dpi, 1)
-        if type(self.rotation) is not int or self.rotation not in _TURNS:
-            raise ValueError(f"rotation must be an int of 0, 90, 180 or 270, got {self.rotation!r}")
+        _checked_turn(self.rotation)
         _checked_password(self.password)
         int_at_least("memory_cap_bytes", self.memory_cap_bytes, 1)
         object.__setattr__(self, "timeout_s", positive_float("timeout_s", self.timeout_s))
@@ -407,7 +518,7 @@ def vision_page(
     if drawn.page is None:
         return _unread(raw_page, assessment, drawn.failure, None, source, password, min_image_dimension)
     reading = _read(drawn.page, drawn.dpi, geometry, options)
-    image = _page_image(drawn, reading.rotation, geometry, source, password, options)
+    image = _page_image(drawn.page, drawn.dpi, reading.rotation, geometry, source, password, options)
     if reading.failure:
         return _unread(raw_page, assessment, reading.failure, image, source, password, min_image_dimension)
     figures = page_figures(
@@ -416,6 +527,7 @@ def vision_page(
     laid = vision_elements(
         reading.words,
         geometry=geometry,
+        rotation=reading.rotation,
         apart=superseded(assessment.pieces),
         recovered=superseded(assessment.recovered_pieces),
         figures=figures.drafts,
@@ -507,20 +619,19 @@ def _turn(found: Orientation) -> tuple[int, tuple[str, ...]]:
 
 
 def _page_image(
-    drawn: _Drawn,
+    page: RenderedPage,
+    dpi: int,
     rotation: int,
     geometry: PageGeometry,
     source: str | os.PathLike[str],
     password: str | None,
     options: VisionOptions,
-) -> PageImage | None:
+) -> PageImage:
     """The page's lazy image: the render's size as displayed, its loaders a :class:`PageRender` (no pixels held)."""
-    if drawn.page is None:
-        return None
     loader = PageRender(
         source=Path(source),
         page_index=geometry.page_number - 1,
-        dpi=drawn.dpi,
+        dpi=dpi,
         rotation=rotation,
         password=password,
         memory_cap_bytes=options.memory_cap_bytes,
@@ -528,9 +639,9 @@ def _page_image(
     )
     return PageImage(
         page_number=geometry.page_number,
-        dpi=float(drawn.dpi),
-        width_px=drawn.page.px_width,
-        height_px=drawn.page.px_height,
+        dpi=float(dpi),
+        width_px=page.px_width,
+        height_px=page.px_height,
         contrast_normalized=True,
         _loader=loader.png_bytes,
         _band_loader=loader.band_png_bytes,
@@ -597,11 +708,11 @@ def fallback_page(
     if drawn.page is None:
         return _error_page(failure.page_number, geometry, _Unread(f"{failed}; {drawn.failure}"))
     reading = _read(drawn.page, drawn.dpi, geometry, options)
-    image = _page_image(drawn, reading.rotation, geometry, source, password, options)
+    image = _page_image(drawn.page, drawn.dpi, reading.rotation, geometry, source, password, options)
     if reading.failure:
         why = f"{failed}; OCR could not read the page: {reading.failure}"
         return _error_page(failure.page_number, geometry, _Unread(why, reading.notes, image))
-    laid = vision_elements(reading.words, geometry=geometry)
+    laid = vision_elements(reading.words, geometry=geometry, rotation=reading.rotation)
     return Page(
         page_number=geometry.page_number,
         width_pt=geometry.width_pt,
