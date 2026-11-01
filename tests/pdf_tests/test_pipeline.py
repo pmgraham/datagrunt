@@ -26,14 +26,17 @@ from datagrunt.pdf.assembly import _VISION_NOTE, assemble_page
 from datagrunt.pdf.elements import DocumentMetadata, Figure, KeyValue, Page, Paragraph, PDFDocument
 from datagrunt.pdf.exceptions import PDFSourceChangedError
 from datagrunt.pdf.layout import find_lattice_tables
-from datagrunt.pdf.pdfium_engine import extract_page, open_document, recover_dropped_text
+from datagrunt.pdf.pdfium_engine import PageFailure, extract_page, open_document, recover_dropped_text
 from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, SourceIdentity, extract_document, extract_page_at
 from datagrunt.pdf.quality import assess_page
 from datagrunt.pdf.scope import apply_scope
+from datagrunt.pdf.vision import VisionOptions, vision_page
 from pdf_tests.builders import PageSpec, RasterImage, TextRun, break_page, build_pdf, solid_png
 from pdf_tests.test_layout_lattice import rules as lattice_rules
 from pdf_tests.test_layout_lattice import written
 from pdf_tests.test_layout_stream_tables import body_text, table_runs
+from pdf_tests.test_ocr import needs_tesseract
+from pdf_tests.test_ocr_scans import LINES, TOKENS, png_of, rendered
 from pdf_tests.test_pdfium_extract_page import failing
 
 LATTICE_XS = (50.0, 150.0, 250.0, 350.0)
@@ -91,6 +94,49 @@ def spy(monkeypatch, name: str) -> list:
 
     monkeypatch.setattr(pipeline, name, recorded)
     return calls
+
+
+def vision_chain_page(path, index: int = 0, *, ocr="auto", password=None, min_image_dimension=40) -> Page:
+    """A vision page by the per-stage chain: A2, recovery, A3, then A5b's vision_page."""
+    with open_document(path, password=password) as handle:
+        raw = extract_page(handle, index)
+        recovered = recover_dropped_text(handle, index) if raw.text.stats.dropped_text_objects else None
+    assessment = assess_page(raw, ocr=ocr, recovered=recovered)
+    return vision_page(raw, assessment, source=path, password=password, min_image_dimension=min_image_dimension)
+
+
+def keyword_spy(monkeypatch, name: str) -> list:
+    """Record each call of the pipeline's ``name`` (its positional and keyword arguments) and let it run."""
+    calls: list = []
+    real = getattr(pipeline, name)
+
+    def recorded(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, name, recorded)
+    return calls
+
+
+def no_tesseract(monkeypatch, tmp_path) -> None:
+    """PATH holds no tesseract."""
+    empty = tmp_path / "empty-path"
+    empty.mkdir(exist_ok=True)
+    monkeypatch.setenv("PATH", str(empty))
+
+
+def element_texts(page: Page) -> list[str]:
+    """The texts of the page's visible text elements."""
+    return [element.text for element in page.elements if not element.is_hidden and hasattr(element, "text")]
+
+
+def unloadable(message: str) -> str:
+    """A5b's error for a page pdfium cannot load: its geometry cannot be read either, so it is not rendered."""
+    return f"extraction failed at stage 'page': {message}; its geometry cannot be read either: {message}"
+
+
+UNAVAILABLE = "tesseract is unavailable: no tesseract in an absolute PATH directory"
+TEXT_FAILURE = "page 1: pdfium cannot count the text page's chars"
 
 
 def raising(error: BaseException):
@@ -469,26 +515,75 @@ class TestExtractPageAt:
         assert (hidden.text, hidden.hidden_reasons) == ("HIDDEN", ("tiny_font",))
         assert not [warning for warning in pages[1].warnings if "not recovered" in warning]
 
-    def test_a_vision_page_takes_the_vision_stand_in(self, tmp_path, monkeypatch):
+    @needs_tesseract
+    def test_a_vision_page_is_read_by_ocr(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
-        visions = spy(monkeypatch, "_vision_page")
+        visions = spy(monkeypatch, "vision_page")
 
         page = page_at(path, ocr="always")
 
         assert len(visions) == 1
-        assert page == chain_page(path, ocr="always")
+        assert page == vision_chain_page(path, ocr="always")
+        assert (page.route, page.status, page.integrity_verified) == ("vision", "ok", False)
+        assert page.quality.ocr_mean_confidence is not None and page.page_image is not None
+        assert {"Parts", "list"} <= set(" ".join(element_texts(page)).split())
+        assert _VISION_NOTE not in page.warnings
+
+    def test_a_vision_page_without_tesseract_is_ocr_unavailable(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
+        no_tesseract(monkeypatch, tmp_path)
+
+        page = page_at(path, ocr="always")
+
+        digital = chain_page(path, ocr="always")
         assert (page.route, page.status, page.integrity_verified) == ("vision", "ocr_unavailable", False)
-        assert _VISION_NOTE in page.warnings
+        assert page.elements == digital.elements
+        assert page.warnings == (*digital.warnings, f"OCR could not read the page: {UNAVAILABLE}")
+        assert _VISION_NOTE in page.warnings and page.page_image is not None
 
     @pytest.mark.parametrize("ocr", ["auto", "never"])
-    def test_a_digital_page_never_takes_the_vision_stand_in(self, tmp_path, monkeypatch, ocr):
+    def test_a_digital_page_never_takes_the_vision_route(self, tmp_path, monkeypatch, ocr):
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
-        visions = spy(monkeypatch, "_vision_page")
+        visions = spy(monkeypatch, "vision_page")
 
         page = page_at(path, ocr=ocr)
 
         assert visions == []
         assert page.route in ("digital", "hybrid")
+
+    def test_the_vision_route_takes_the_pipelines_options(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "enc.pdf", [mixed_page()], user_password="pw")
+        calls = keyword_spy(monkeypatch, "vision_page")
+        no_tesseract(monkeypatch, tmp_path)
+
+        page_at(path, password="pw", ocr="always", vision_dpi=250, max_render_pixels=1_000_000, min_image_dimension=32)
+
+        ((args, kwargs),) = calls
+        assert [type(arg).__name__ for arg in args] == ["RawPage", "PageAssessment"]
+        assert kwargs == {
+            "source": path,
+            "password": "pw",
+            "min_image_dimension": 32,
+            "options": VisionOptions(vision_dpi=250, max_render_pixels=1_000_000),
+        }
+
+    @pytest.mark.parametrize("ocr", ["auto", "always", "never"])
+    def test_the_fallback_route_takes_the_pipelines_options(self, tmp_path, monkeypatch, ocr):
+        path = build_pdf(tmp_path / "enc.pdf", [PageSpec(items=body_text(100.0))], user_password="pw")
+        monkeypatch.setattr(pdfium_c, "FPDFText_CountChars", failing(-1))
+        calls = keyword_spy(monkeypatch, "fallback_page")
+        no_tesseract(monkeypatch, tmp_path)
+
+        page_at(path, password="pw", ocr=ocr, vision_dpi=250, max_render_pixels=1_000_000, min_image_dimension=32)
+
+        ((args, kwargs),) = calls
+        assert [type(arg).__name__ for arg in args] == ["DocumentHandle", "PageFailure"]
+        assert kwargs == {
+            "source": path,
+            "password": "pw",
+            "ocr": ocr,
+            "options": VisionOptions(vision_dpi=250, max_render_pixels=1_000_000),
+        }
 
     @pytest.mark.parametrize("minimum,figures", [(32, 1), (33, 0)])
     def test_min_image_dimension_reaches_assembly(self, tmp_path, minimum, figures):
@@ -589,7 +684,7 @@ class TestPageIsolation:
         pages = [page_at(path, index) for index in (0, 1, 2)]
 
         size_note = f"the page's size could not be read (PDFCorruptError: {message}){DEFAULT_SIZE_NOTE}"
-        assert pages[1] == error_page(2, f"PDFCorruptError: {message} (stage 'page')", warnings=(size_note,))
+        assert pages[1] == error_page(2, unloadable(message), warnings=(size_note,))
         assert [pages[0], pages[2]] == [chain_page(path, 0), chain_page(path, 2)]
 
     def test_strict_raises_a_corrupt_page_naming_it(self, tmp_path):
@@ -601,14 +696,42 @@ class TestPageIsolation:
         assert caught.value.page_number == 2
         assert page_at(path, 0, strict=True) == chain_page(path, 0)
 
-    def test_a_failed_text_stage_is_an_error_page_of_the_pages_own_size(self, tmp_path, monkeypatch):
+    @needs_tesseract
+    def test_a_failed_text_stage_is_read_by_ocr_of_its_render(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "doc.pdf", [PageSpec(width=400.0, height=300.0, items=body_text(100.0))])
         monkeypatch.setattr(pdfium_c, "FPDFText_CountChars", failing(-1))
+        fallbacks = spy(monkeypatch, "fallback_page")
 
         page = page_at(path)
 
-        message = "page 1: pdfium cannot count the text page's chars"
-        assert page == error_page(1, f"PDFCorruptError: {message} (stage 'text')", size=(400.0, 300.0))
+        assert len(fallbacks) == 1
+        assert (page.route, page.status, page.integrity_verified) == ("vision", "ocr_fallback", False)
+        assert (page.width_pt, page.height_pt) == (400.0, 300.0)
+        assert {"woodland", "creatures", "ambitions."} <= set(" ".join(element_texts(page)).split())
+        assert page.warnings[0].startswith(
+            f"extraction failed at stage 'text': {TEXT_FAILURE}; the page was read by OCR"
+        )
+
+    def test_a_failed_text_stage_without_tesseract_is_an_error_page_of_the_pages_own_size(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [PageSpec(width=400.0, height=300.0, items=body_text(100.0))])
+        monkeypatch.setattr(pdfium_c, "FPDFText_CountChars", failing(-1))
+        no_tesseract(monkeypatch, tmp_path)
+
+        page = page_at(path)
+
+        why = f"extraction failed at stage 'text': {TEXT_FAILURE}; OCR could not read the page: {UNAVAILABLE}"
+        assert dataclasses.replace(page, page_image=None) == error_page(1, why, size=(400.0, 300.0))
+        assert page.page_image is not None  # its render was made: OCR could not read it
+
+    def test_a_failed_page_reads_nothing_by_ocr_under_ocr_never(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [PageSpec(width=400.0, height=300.0, items=body_text(100.0))])
+        monkeypatch.setattr(pdfium_c, "FPDFText_CountChars", failing(-1))
+
+        page = page_at(path, ocr="never")
+
+        why = f"extraction failed at stage 'text': {TEXT_FAILURE}; ocr='never', so the page is not read by OCR"
+        assert page == error_page(1, why, size=(400.0, 300.0))
+        assert page.page_image is None
 
     @pytest.mark.parametrize(
         "stage", ["extract_page", "recover_dropped_text", "assess_page", "find_lattice_tables", "assemble_page"]
@@ -635,6 +758,22 @@ class TestPageIsolation:
 
         assert caught.value.page_number == 1
         assert caught.value.__cause__ is cause
+
+    @pytest.mark.parametrize("route", ["vision_page", "fallback_page"])
+    def test_an_ocr_route_that_raises_is_isolated_as_any_step(self, tmp_path, monkeypatch, route):
+        path = build_pdf(tmp_path / "doc.pdf", [PageSpec(width=400.0, height=300.0, items=body_text(100.0))])
+        if route == "fallback_page":
+            monkeypatch.setattr(pdfium_c, "FPDFText_CountChars", failing(-1))
+        cause = RuntimeError(f"{route} exploded")
+        monkeypatch.setattr(pipeline, route, raising(cause))
+
+        page = page_at(path, ocr="always")
+
+        assert page == error_page(1, f"RuntimeError: {route} exploded", size=(400.0, 300.0))
+        if route == "vision_page":  # under strict a failed page raises before its fallback: see the corrupt-page tests
+            with pytest.raises(PDFCorruptError, match=re.escape(f"page 1: RuntimeError: {route} exploded")) as caught:
+                page_at(path, ocr="always", strict=True)
+            assert caught.value.__cause__ is cause
 
     def test_strict_keeps_a_corrupt_error_that_already_names_the_page(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
@@ -678,6 +817,74 @@ class TestPageIsolation:
 
         with pytest.raises(type(error)):
             page_at(path)
+
+
+@pytest.fixture(scope="module")
+def scan_png(tmp_path_factory) -> bytes:
+    """A letter page of four sentences (A5a's scan fixture), rendered at 300 DPI, as PNG: a scan with no text layer."""
+    digital = build_pdf(tmp_path_factory.mktemp("scan") / "digital.pdf", [PageSpec(items=LINES)])
+    return png_of(rendered(digital))
+
+
+def scan_page(png: bytes, *items) -> PageSpec:
+    """A letter page of the scan, then ``items`` drawn on it."""
+    return PageSpec(items=(RasterImage(0.0, 0.0, 612.0, 792.0, png), *items))
+
+
+def failing_at(monkeypatch, index: int) -> None:
+    """A2's extraction of the page at ``index`` fails at its text stage, as a corrupt textpage's does."""
+    real = pipeline.extract_page
+
+    def extract(handle, at):
+        if at == index:
+            return PageFailure(page_number=at + 1, stage="text", message=f"page {at + 1}: {TEXT_FAILURE[8:]}")
+        return real(handle, at)
+
+    monkeypatch.setattr(pipeline, "extract_page", extract)
+
+
+def read_tokens(page: Page) -> set[str]:
+    return set(" ".join(element_texts(page)).split())
+
+
+class TestVisionEndToEnd:
+    """extract_document reads a scanned page by OCR, a page whose extraction raises by OCR of its render."""
+
+    @needs_tesseract
+    def test_a_scan_and_a_failed_page_are_read_by_ocr_and_the_rest_extract(self, tmp_path, monkeypatch, scan_png):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page(), scan_page(scan_png), PageSpec(items=LINES)])
+        failing_at(monkeypatch, 2)
+
+        document = extract_document(path, min_image_dimension=32)
+
+        digital, scanned, failed = document.pages
+        assert digital == apply_scope((chain_page(path, 0, min_image_dimension=32),)).pages[0]
+        assert (scanned.status, scanned.route, scanned.integrity_verified) == ("ok", "vision", False)
+        assert len(set(TOKENS) & read_tokens(scanned)) >= 0.9 * len(set(TOKENS))
+        assert (failed.status, failed.route, failed.integrity_verified) == ("ocr_fallback", "vision", False)
+        assert len(set(TOKENS) & read_tokens(failed)) >= 0.9 * len(set(TOKENS))
+        assert document.degraded_pages == (3,)
+        # A1 verifies a document over its pages that can be (a vision page never is), and none is an error page.
+        assert document.integrity_verified
+
+    def test_without_tesseract_a_scan_is_ocr_unavailable_and_a_failed_page_an_error(
+        self, tmp_path, monkeypatch, scan_png
+    ):
+        caption = TextRun("Page 7", 500.0, 760.0, size=10.0)
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page(), scan_page(scan_png, caption), PageSpec(items=LINES)])
+        failing_at(monkeypatch, 2)
+        no_tesseract(monkeypatch, tmp_path)
+
+        document = extract_document(path, min_image_dimension=32)
+
+        digital, scanned, failed = document.pages
+        assert digital.status == "ok"
+        assert (scanned.status, scanned.route) == ("ocr_unavailable", "vision")
+        assert element_texts(scanned) == ["Page 7"]
+        assert scanned.warnings[-1] == f"OCR could not read the page: {UNAVAILABLE}"
+        assert (failed.status, failed.elements, failed.quality) == ("error", (), None)
+        assert failed.error.endswith(f"; OCR could not read the page: {UNAVAILABLE}")
+        assert document.degraded_pages == (2, 3)
 
 
 class TestExtractDocument:
@@ -771,7 +978,7 @@ class TestExtractDocument:
         document = extract_document(path)
 
         assert [page.status for page in document.pages] == ["ok", "error", "ok"]
-        assert document.pages[1].error == "PDFCorruptError: page 2 is unreadable: Failed to load page. (stage 'page')"
+        assert document.pages[1].error == unloadable("page 2 is unreadable: Failed to load page.")
         assert document.degraded_pages == (2,)
         assert not document.integrity_verified
         expected = apply_scope((chain_page(path, 0), page_at(path, 1), chain_page(path, 2)))
@@ -910,6 +1117,22 @@ class TestWorkers:
         (tail,), (head,) = ([table for table in pooled.tables if table.page_number == n] for n in (2, 3))
         assert head.continued_from_id == tail.element_id  # linked after the pool, whichever chunks held its parts
         assert pooled.figures[0].read_raw_bytes() == sequential.figures[0].read_raw_bytes()
+        assert_reaped(started)
+
+    @needs_tesseract
+    def test_pooled_pages_equal_sequential_pages_with_a_vision_page(self, tmp_path, monkeypatch, scan_png):
+        caption = TextRun("Page 7", 500.0, 760.0, size=10.0)
+        specs = [mixed_page(), scan_page(scan_png), scan_page(scan_png, caption), mixed_page(120.0)]
+        path = build_pdf(tmp_path / "doc.pdf", specs)
+        sequential = extract_document(path, min_image_dimension=32)
+        started = started_workers(monkeypatch)
+
+        pooled = extract_document(path, workers=2, min_image_dimension=32)
+
+        assert len(started) == 2
+        assert pooled == sequential
+        assert [(page.status, page.route) for page in pooled.pages][1:3] == [("ok", "vision"), ("ok", "vision")]
+        assert pooled.pages[2].page_image.read_bytes() == sequential.pages[2].page_image.read_bytes()
         assert_reaped(started)
 
     def test_an_encrypted_document_is_pooled_with_its_password(self, tmp_path):

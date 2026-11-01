@@ -134,7 +134,15 @@ from datagrunt.pdf.elements import (
 )
 from datagrunt.pdf.pdfium_engine import RawPage
 
-__all__ = ["OcrMode", "PageAssessment", "SpanPiece", "assess_page", "classify_spans", "raster_cover_fraction"]
+__all__ = [
+    "OcrMode",
+    "PageAssessment",
+    "SpanPiece",
+    "assess_page",
+    "classify_spans",
+    "raster_cover_fraction",
+    "valid_char",
+]
 
 OcrMode: TypeAlias = Literal["auto", "always", "never"]
 """The reader's OCR option: ``"auto"`` routes by the page's text,
@@ -601,7 +609,29 @@ def _valid(span: RawSpan, offset: int) -> bool:
     at = bisect_left(errors, offset)
     if at < len(errors) and errors[at] == offset:
         return False
-    char = span.text[offset]
+    return _valid_char(span.text[offset])
+
+
+def valid_char(char: str) -> bool:
+    """True unless ``char`` is U+FFFD, private use, unassigned or a lone surrogate: A3's rule for valid text.
+
+    A span's char is also invalid when pdfium could not map it
+    (``RawSpan.map_errors``); text with no such map, as OCR reads, is
+    measured by this rule alone (A5b's vision route).
+
+    Raises:
+        TypeError: If ``char`` is not a str.
+        ValueError: If ``char`` is not one char.
+    """
+    if not isinstance(char, str):
+        raise TypeError(f"char must be a str, got {type(char).__name__}")
+    if len(char) != 1:
+        raise ValueError(f"char must be one char, got {len(char)}: {char!r}")
+    return _valid_char(char)
+
+
+def _valid_char(char: str) -> bool:
+    """:func:`valid_char` of a checked char."""
     return char != _REPLACEMENT_CHAR and unicodedata.category(char) not in _INVALID_CATEGORIES
 
 

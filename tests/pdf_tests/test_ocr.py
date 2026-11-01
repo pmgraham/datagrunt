@@ -683,14 +683,16 @@ class TestCli:
         assert (fake / "omp").read_text() == "1"
         assert (fake / "stdin").read_bytes() == b"P5\n3 2\n255\n" + bytes([0, 64, 128, 192, 255, 7])
 
-    def test_ocr_words_runs_psm_6_tsv_in_the_language_on_each_band_as_pgm(self, tmp_path, monkeypatch):
+    def test_ocr_words_runs_psm_3_tsv_in_the_language_on_each_band_as_pgm(self, tmp_path, monkeypatch):
+        # psm 3 (automatic page segmentation), chosen over psm 6 (one uniform block) on the forced-OCR corpus sample
+        # (A5b): higher word recall and precision against the digital text, pooled over 31 pages.
         fake = fake_tesseract(tmp_path, monkeypatch, RECORDS, stdout=tsv())
 
         result = words_of(PAGE_3_BY_2, language="deu+eng")
 
         assert result == OCRResult(words=(), status="ok", reason="")
         argv = (fake / "argv").read_text().split("\n")[:-1]
-        assert argv == ["stdin", "stdout", "--psm", "6", "-l", "deu+eng", "tsv"]
+        assert argv == ["stdin", "stdout", "--psm", "3", "-l", "deu+eng", "tsv"]
         assert (fake / "omp").read_text() == "1"
         assert (fake / "stdin").read_bytes() == b"P5\n3 2\n255\n" + PAGE_3_BY_2.pixels
 

@@ -72,6 +72,7 @@ class TestTypeAliases:
             "matches_background",
             "zero_scale",
             "duplicate",
+            "superseded",
         )
 
     def test_hidden_reason_literal_members(self):
@@ -83,6 +84,7 @@ class TestTypeAliases:
             "matches_background",
             "zero_scale",
             "duplicate",
+            "superseded",
         )
 
     def test_page_status_values(self):
@@ -202,7 +204,15 @@ class TestElementBase:
 
     @pytest.mark.parametrize(
         "reasons",
-        [("off_page",), ("invisible", "transparent"), ("matches_background",), ("duplicate",), HIDDEN_REASONS],
+        [
+            ("off_page",),
+            ("invisible", "transparent"),
+            ("matches_background",),
+            ("duplicate",),
+            ("superseded",),
+            ("invisible", "superseded"),
+            HIDDEN_REASONS,
+        ],
     )
     def test_hidden_reasons_flag_element_as_hidden(self, cls, reasons):
         element = _element(cls, hidden_reasons=reasons)
@@ -221,6 +231,8 @@ class TestElementBase:
             (("matches_background", "transparent"), "canonical order"),
             # Appended last, so it follows every older reason.
             (("duplicate", "zero_scale"), "canonical order"),
+            (("superseded", "duplicate"), "canonical order"),
+            (("superseded", "superseded"), "duplicate entries"),
         ],
     )
     def test_bad_hidden_reasons_rejected(self, cls, bad, match):
