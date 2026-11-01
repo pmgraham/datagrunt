@@ -274,7 +274,9 @@ _MAX_ASCII_WRAPPED_BYTES = _MAX_ASSET_BYTES // 16
 # decodes it to the same bytes. The cap bounds the work before pdfium is
 # asked for anything (a Flate bomb stops here); the comparison catches a
 # /DecodeParms predictor, which pdfium applies and no pdfium API reports, and
-# which can hide another frame from a reader of the inflated bytes.
+# which can hide another frame from a reader of the inflated bytes. pdfium,
+# like zlib, stops at the first end of stream, as pinned: a bomb concatenated
+# after it is never inflated, by either.
 _MAX_INFLATED_BYTES = 1 << 20
 _FLATE_ONLY = ("FlateDecode",)
 

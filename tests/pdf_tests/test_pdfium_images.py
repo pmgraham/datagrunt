@@ -1779,6 +1779,28 @@ class TestFlateWrappedCodestreams:
 
         assert (image.px_width, image.px_height) == size
 
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_a_bomb_concatenated_after_the_stream_is_never_inflated(self, tmp_path, decoded_reads):
+        # zlib and pdfium both stop at the first end of stream: pdfium's size query, which decodes, never reaches
+        # the 2 GiB second stream. The page collects in 1.2 ms here (max 1.3 ms in 10 runs).
+        jpeg = jpeg_bytes((16, 8))
+        path = xobject_page(tmp_path, zlib.compress(jpeg) + flate_bomb(2048), FLATE_DCT)
+
+        began = time.perf_counter()
+        got = images_of(path)
+        elapsed = time.perf_counter() - began
+
+        assert [(item.px_width, item.px_height) for item in got.images] == [(16, 8)]
+        assert decoded_reads == [0, len(jpeg)]
+        page = pdfium.PdfDocument(path)[0]  # held: its objects die with it
+        assert pdfium_c.FPDFImageObj_GetImageDataDecoded(pdfium_c.FPDFPage_GetObject(page.raw, 0), None, 0) == len(jpeg)
+        assert elapsed < 1.0
+
+    def test_a_newline_after_the_stream_is_ignored(self, tmp_path):
+        (image,) = images_of(xobject_page(tmp_path, zlib.compress(jpeg_bytes((16, 8))) + b"\n", FLATE_DCT)).images
+
+        assert (image.px_width, image.px_height) == (16, 8)
+
     def test_a_predictor_that_hides_a_large_frame_is_unsized(self, tmp_path, decode_calls):
         data, entries = predictor_bomb()
         path = xobject_page(tmp_path, data, entries)
