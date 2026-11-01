@@ -82,11 +82,32 @@ see, and an occlusion follow-up is proposed for the last two):
 Recovered text (#366 task 3,
 :func:`~datagrunt.pdf.pdfium_engine.recover_dropped_text`) is kept apart from
 the page's pieces, in ``PageAssessment.recovered_pieces``, each flagged with
-its recovered reasons and those :func:`classify_spans` computes for it: a
-recovered copy (even a drawn one, with no reason) is never laid out as page
-text. It counts toward ``hidden_spans_flagged`` only: never toward routing,
-the char counts or the unmapped regions. Objects it could not recover are a
-warning, and so are dropped objects when no recovery is passed (the page's
+its recovered reasons and those :func:`classify_spans` computes for it: it is
+never page text (A4 lays it out apart). A recovered piece with no such reason
+is a drawn copy pdfium dropped as a duplicate (recovery emits a copy painted
+or placed unlike the text it copies, or past its window). It is flagged
+``duplicate`` (#406) when a visible piece of the page (no reason) has the same
+text, exactly, and each edge of that piece's ink box (the union of its tight
+boxes; a recovered char box is its object's ink) lies within the recovered
+piece's duplicate window of the same edge: recovery's overprint window
+(:func:`~datagrunt.pdf._pdfium_recover.duplicate_window`) of its last char's
+box, 0.9 of each side, at least 0.5 pt and at most 12 pt. The window is under
+the box's side (above the 0.5 pt floor), so such a copy lies on the text it
+copies: a shadow or an outline drawn on a title, which a reader reads once.
+Every other drawn copy stays visible:
+
+- A copy of hidden text: pdfium kept the hidden copy and dropped the one a
+  reader sees.
+- A copy with no visible twin of its text, or of part of a visible piece
+  (the texts must be equal), or past the window: it is text a reader reads.
+- A copy whose text has over :data:`MAX_DUPLICATE_CANDIDATES` (64) visible
+  pieces on the page: the visible pieces are indexed by text and no more
+  are checked, so it is not checked, and the page warns (fail visible).
+
+A flagged recovered piece (a duplicate too) counts toward
+``hidden_spans_flagged``; recovered text never counts toward routing, the
+char counts or the unmapped regions. Objects recovery could not read back are
+a warning, and so are dropped objects when no recovery is passed (the page's
 ``TextStats.dropped_text_objects`` is over 0 and ``recovered`` is None).
 """
 

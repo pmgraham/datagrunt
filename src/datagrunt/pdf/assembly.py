@@ -297,7 +297,10 @@ def assemble_page(
        it), but a heading's is its own text (A1: a heading opens its
        scope). Headings, paragraphs, key-values and lists convert their
        fields (a list keeps its markers); a hidden or recovered line is a
-       :class:`~datagrunt.pdf.elements.Paragraph` with its reasons; a table
+       :class:`~datagrunt.pdf.elements.Paragraph` with its reasons (a
+       recovered shadow or outline copy of visible text is ``duplicate``,
+       so it reads once; a recovered line with no reason is visible text:
+       A3's notes); a table
        is a :class:`~datagrunt.pdf.elements.Table` of its grid, headed by
        its first row when every cell of it is non-blank (A4a's rule), with
        ``column_centres`` when upright (a lattice table's grid column
