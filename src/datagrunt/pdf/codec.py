@@ -25,8 +25,9 @@ image reads its bytes from its paths only.
 - containers are checked, never coerced (a string is not split into a tuple);
 - values are checked by A1's own validation, as the types are built.
 
-With ``base_dir``, each path must be a plain relative path
-(:func:`relative_path`) and is joined to it.
+With ``base_dir``, each path is joined to it by :func:`contained_path`,
+which refuses a path that is not plain relative names or that resolves
+out of ``base_dir``.
 
 Decoding is iterative: it walks the schema's fixed depth (document, pages,
 elements, fields) with loops. :func:`document_from_json_bytes` reads at most
@@ -45,7 +46,7 @@ wrong value, A1's or the codec's, each naming where in the document it is.
 import json
 import os
 from collections.abc import Callable, Mapping
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, TypeVar
 
@@ -75,8 +76,8 @@ __all__ = [
     "document_from_json_bytes",
     "document_to_json",
     "document_to_json_bytes",
+    "contained_path",
     "parse_json",
-    "relative_path",
 ]
 
 FORMAT = "datagrunt.pdf.document"
@@ -84,6 +85,13 @@ VERSION = 1
 
 # The most JSON bytes read: A1's asset limit.
 _MAX_JSON_BYTES = _MAX_ASSET_BYTES
+
+# A path part may not hold these (or a control character): ":" is a drive or an NTFS alternate data stream.
+_FORBIDDEN_CHARS = frozenset(":\\")
+# Device names Windows reserves in every directory, whatever the case and with or without an extension.
+_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)), *(f"LPT{n}" for n in range(1, 10))}
+)
 
 _DOCUMENT_KEYS = ("format", "version", "metadata", "pages", "sections", "header_context")
 _METADATA_KEYS = ("doc_id", "source_name", "sha256", "page_count", "title", "author")
@@ -275,23 +283,50 @@ def _no_constant(name: str) -> object:
     raise ValueError(f"{name} is not JSON (no NaN or infinity is allowed)")
 
 
-def relative_path(name: str, value: object) -> PurePosixPath:
-    """``value`` as a relative path of plain names joined by ``/``; ``name`` names it in errors.
+def contained_path(name: str, value: object, root: Path) -> Path:
+    """``root`` joined with ``value``, a relative path whose every part is checked, if it stays in ``root``.
 
-    Refused: an absolute path (``/``, a drive), a backslash, NUL, and an
-    empty, ``.`` or ``..`` name; so the path cannot leave the directory it
-    is joined to except through a symlink, which the bundle's loader checks.
+    The one check of every path a bundle names: the document JSON's (figure,
+    page image and band paths, here) and the manifest's (the bundle loader).
+    ``value`` is split on ``/`` only, and each part must be a plain name
+    (:func:`_part_problem`): not empty, ``.`` or ``..``; no ``:`` (a drive,
+    or an NTFS alternate data stream), ``\\``, NUL or other control
+    character; no trailing ``.`` or space (Windows strips them); and not a
+    device name Windows reserves (:data:`_RESERVED_NAMES`), with or without
+    an extension. The joined path, its symlinks resolved, must then lie in
+    ``root``, resolved: a symlink out of it is refused. Nothing is sanitized.
 
     Raises:
         TypeError: If ``value`` is not a str.
-        ValueError: If it is not such a path.
+        ValueError: If a part is refused (naming the path and the part), or
+            the joined path resolves outside ``root``.
+        FileNotFoundError: If ``root`` does not exist.
     """
     if not isinstance(value, str):
         raise TypeError(f"{name} must be a str, got {type(value).__name__}")
-    plain = "\\" not in value and "\x00" not in value and not PureWindowsPath(value).drive
-    if not plain or any(part in ("", ".", "..") for part in value.split("/")):
-        raise ValueError(f"{name} must be a relative path of plain names joined by '/', got {value!r}")
-    return PurePosixPath(value)
+    parts = value.split("/")
+    for part in parts:
+        problem = _part_problem(part)
+        if problem:
+            raise ValueError(f"{name} {value!r}: part {part!r} {problem}")
+    joined = root.joinpath(*parts)
+    base = root.resolve(strict=True)
+    if not joined.resolve(strict=False).is_relative_to(base):
+        raise ValueError(f"{name} {value!r} resolves outside {base}")
+    return joined
+
+
+def _part_problem(part: str) -> str:
+    """Why ``part`` cannot be a name in a bundle path, or ``""`` if it can."""
+    if part in ("", ".", ".."):
+        return "is empty, '.' or '..'"
+    if any(char in _FORBIDDEN_CHARS or ord(char) < 32 for char in part):
+        return "holds ':', '\\', NUL or a control character"
+    if part.endswith((".", " ")):
+        return "ends in '.' or a space, which Windows strips"
+    if part.split(".", 1)[0].rstrip(" ").upper() in _RESERVED_NAMES:
+        return "is a device name Windows reserves"
+    return ""
 
 
 def document_from_json(data: object, *, base_dir: str | os.PathLike[str] | None = None) -> PDFDocument:
@@ -406,12 +441,12 @@ def _path(name: str, value: object, root: Path | None) -> Path | None:
 
 
 def _band_path(name: str, value: object, root: Path | None) -> Path:
-    """A JSON path: as written (no ``root``), or ``root`` joined with a :func:`relative_path`."""
+    """A JSON path: as written (no ``root``), or :func:`contained_path` in ``root``."""
     if not isinstance(value, str):
         raise TypeError(f"{name} must be a str, got {type(value).__name__}")
     if root is None:
         return Path(value)
-    return root.joinpath(*relative_path(name, value).parts)
+    return contained_path(name, value, root)
 
 
 def _page(name: str, value: object, root: Path | None) -> Page:

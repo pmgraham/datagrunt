@@ -17,11 +17,11 @@ from datagrunt.pdf import codec
 from datagrunt.pdf.codec import (
     FORMAT,
     VERSION,
+    contained_path,
     document_from_json,
     document_from_json_bytes,
     document_to_json,
     document_to_json_bytes,
-    relative_path,
 )
 from datagrunt.pdf.elements import (
     BulletList,
@@ -210,15 +210,121 @@ class TestPaths:
         with pytest.raises(ValueError, match="image_path"):
             document_from_json(data, base_dir=tmp_path)
 
-    @pytest.mark.parametrize("bad", ["../a.png", "/abs.png", "C:/x.png", "a\\b.png", "", ".", "a/./b"])
-    def test_relative_path_refuses_what_is_not_a_plain_relative_path(self, bad):
-        with pytest.raises(ValueError, match="where"):
-            relative_path("where", bad)
+    @pytest.mark.parametrize(
+        ("bad", "part"),
+        [
+            ("images/C:evil.png", "C:evil.png"),
+            ("C:/x", "C:"),
+            ("a/b:stream", "b:stream"),
+            ("images/CON", "CON"),
+            ("images/con.png", "con.png"),
+            ("images/LPT1.txt", "LPT1.txt"),
+            ("images/a.", "a."),
+            ("images/a ", "a "),
+            ("images/a\x01.png", "a\x01.png"),
+            ("images\\a.png", "images\\a.png"),
+            ("images/a\x00.png", "a\x00.png"),
+        ],
+    )
+    def test_a_path_part_windows_or_a_parser_would_read_otherwise_is_refused(self, bad, part, tmp_path):
+        data = changed(("pages", 0, "elements", 8, "image_path"), bad)
+        with pytest.raises(ValueError, match="image_path") as info:
+            document_from_json(data, base_dir=tmp_path)
+        assert repr(bad) in str(info.value) and repr(part) in str(info.value)
 
-    def test_relative_path_type(self):
+    def test_a_path_through_a_symlinked_directory_out_of_base_dir_is_refused(self, tmp_path):
+        root, outside = tmp_path / "bundle", tmp_path / "outside"
+        root.mkdir()
+        outside.mkdir()
+        (root / "images").symlink_to(outside, target_is_directory=True)
+        data = changed(("pages", 0, "elements", 8, "image_path"), "images/a.png")
+        with pytest.raises(ValueError, match="resolves outside"):
+            document_from_json(data, base_dir=root)
+
+
+class TestContainedPath:
+    """The one check of every path a bundle names (codec and bundle loader alike)."""
+
+    @pytest.mark.parametrize(
+        ("bad", "part"),
+        [
+            ("images/C:evil.png", "C:evil.png"),
+            ("C:/x", "C:"),
+            ("a/b:stream", "b:stream"),
+            ("images/CON", "CON"),
+            ("images/con.png", "con.png"),
+            ("images/LPT1.txt", "LPT1.txt"),
+            ("images/aux.tar.gz", "aux.tar.gz"),
+            ("PRN/a.png", "PRN"),
+            ("images/nul", "nul"),
+            ("images/COM1", "COM1"),
+            ("images/com9.png", "com9.png"),
+            ("images/lpt9", "lpt9"),
+            ("images/a.", "a."),
+            ("images/a ", "a "),
+            ("images/a\x01.png", "a\x01.png"),
+            ("images/a\x1f", "a\x1f"),
+            ("images\\a.png", "images\\a.png"),
+            ("images/a\x00.png", "a\x00.png"),
+            ("../a.png", ".."),
+            ("a/../../b.png", ".."),
+            ("./a.png", "."),
+            ("/abs.png", ""),
+            ("", ""),
+            ("a//b.png", ""),
+            ("images/", ""),
+        ],
+    )
+    def test_a_bad_part_is_refused_naming_the_path_and_the_part(self, bad, part, tmp_path):
+        with pytest.raises(ValueError, match="where") as info:
+            contained_path("where", bad, tmp_path)
+        assert repr(bad) in str(info.value) and repr(part) in str(info.value)
+
+    @pytest.mark.parametrize(
+        "good",
+        [
+            "images/a.png",
+            "json/document.json",
+            "page_images/bands/page_0001_band_01.png",
+            "a/b/c/d.e.f",
+            "images/console.png",
+            "images/COM10.png",
+            "images/LPT.png",
+            "images/.hidden",
+            "images/a b.png",
+        ],
+    )
+    def test_a_plain_nested_path_is_joined_to_the_root(self, good, tmp_path):
+        assert contained_path("where", good, tmp_path) == tmp_path.joinpath(*good.split("/"))
+
+    def test_a_symlinked_directory_out_of_the_root_is_refused(self, tmp_path):
+        root, outside = tmp_path / "bundle", tmp_path / "outside"
+        root.mkdir()
+        outside.mkdir()
+        (root / "images").symlink_to(outside, target_is_directory=True)
+        with pytest.raises(ValueError, match="'images/a.png' resolves outside"):
+            contained_path("where", "images/a.png", root)
+
+    def test_a_symlinked_file_out_of_the_root_is_refused(self, tmp_path):
+        root = tmp_path / "bundle"
+        root.mkdir()
+        (tmp_path / "secret").write_bytes(b"x")
+        (root / "a.png").symlink_to(tmp_path / "secret")
+        with pytest.raises(ValueError, match="resolves outside"):
+            contained_path("where", "a.png", root)
+
+    def test_a_symlink_inside_the_root_is_accepted(self, tmp_path):
+        (tmp_path / "real").mkdir()
+        (tmp_path / "images").symlink_to(tmp_path / "real", target_is_directory=True)
+        assert contained_path("where", "images/a.png", tmp_path) == tmp_path / "images" / "a.png"
+
+    def test_the_root_must_exist(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            contained_path("where", "a.png", tmp_path / "missing")
+
+    def test_a_non_str_is_refused(self, tmp_path):
         with pytest.raises(TypeError, match="where must be a str, got int"):
-            relative_path("where", 3)
-        assert relative_path("where", "images/a.png").as_posix() == "images/a.png"
+            contained_path("where", 3, tmp_path)
 
 
 class TestVersion:
