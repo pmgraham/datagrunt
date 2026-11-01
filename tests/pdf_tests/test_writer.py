@@ -6,23 +6,36 @@ that raises, or one only counted, is a ``monkeypatch`` of the module name
 for it: the writer's ``extract_document``, the bundle's ``render_page``.
 """
 
+import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 
 import polars as pl
 import pyarrow.parquet as pq
 import pytest
+from PIL import Image
 
 from datagrunt.pdf import writer
 from datagrunt.pdf.codec import document_from_json_bytes, document_to_json_bytes
 from datagrunt.pdf.elements import Paragraph, PDFDocument
-from datagrunt.pdf.exceptions import PDFCorruptError
+from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError
 from datagrunt.pdf.frame import element_frame, utf8_text
 from datagrunt.pdf.pipeline import extract_document
 from datagrunt.pdf.writer import PDFWriter
-from pdf_tests.builders import PageSpec, TextRun, build_pdf
-from pdf_tests.documents import empty_document, ids, metadata, page, rich_document, surrogate_document
+from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf, solid_png
+from pdf_tests.documents import (
+    FIGURE_A_SHA,
+    FIGURE_B_SHA,
+    empty_document,
+    figure,
+    ids,
+    metadata,
+    page,
+    rich_document,
+    surrogate_document,
+)
 
 OPTIONS = {
     "password": None,
@@ -544,3 +557,178 @@ class TestAtomicWrite:
         with pytest.raises(FileExistsError):
             writer._write_atomically(tmp_path / "file" / "out.bin", lambda handle: handle.write(b"y"))
         assert (tmp_path / "file").read_bytes() == b"x"
+
+
+PNG_A = solid_png(64, 32, (0.2, 0.4, 0.6))
+PNG_B = solid_png(16, 16, (0.9, 0.1, 0.1))
+BLUE = solid_png(80, 48, (0.1, 0.1, 0.9))
+RED = solid_png(64, 64, (0.9, 0.1, 0.1))
+WRITER_LOGGER = "datagrunt.pdf.writer"
+
+
+class Counted:
+    """A figure loader that counts its calls and returns (or raises) ``outcome``."""
+
+    def __init__(self, outcome):
+        self.outcome, self.calls = outcome, 0
+
+    def __call__(self):
+        self.calls += 1
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+def figures_document(*loaders) -> PDFDocument:
+    """One page of figures B, A, B (in that order: not sorted by sha256), with ``loaders`` (b, a, b2)."""
+    b, a, b2 = loaders
+    elements = (
+        figure(1, 0, FIGURE_B_SHA, loader=b),
+        Paragraph(**ids(1, 1), text="between"),
+        figure(1, 2, FIGURE_A_SHA, loader=a),
+        figure(1, 3, FIGURE_B_SHA, loader=b2),
+    )
+    return PDFDocument(metadata=metadata(1), pages=(page(1, elements),))
+
+
+def figures_pdf(directory: Path) -> Path:
+    """Two pages: a blue and a red image, then the blue one again (one stream, so one sha256)."""
+    first = PageSpec(
+        items=(TextRun("Figures", 72.0, 60.0), RasterImage(72, 100, 64, 64, BLUE), RasterImage(200, 100, 64, 64, RED))
+    )
+    return build_pdf(directory / "figures.pdf", [first, PageSpec(items=(RasterImage(72, 100, 64, 64, BLUE),))])
+
+
+def warnings_of(caplog) -> list[str]:
+    return [record.getMessage() for record in caplog.records if record.name == WRITER_LOGGER]
+
+
+class TestExtractImages:
+    def test_each_distinct_figure_is_written_once_in_document_order(self, tmp_path):
+        loaders = Counted(PNG_B), Counted(PNG_A), Counted(PNG_B)
+        paths = PDFWriter(figures_document(*loaders)).extract_images(tmp_path / "images")
+        assert FIGURE_A_SHA < FIGURE_B_SHA  # document order (B, A) is not sorted order
+        assert paths == [tmp_path / "images" / f"{FIGURE_B_SHA}.png", tmp_path / "images" / f"{FIGURE_A_SHA}.png"]
+        assert [path.read_bytes() for path in paths] == [PNG_B, PNG_A]
+        assert [loader.calls for loader in loaders] == [1, 1, 0]
+        assert sorted(p.name for p in (tmp_path / "images").iterdir()) == sorted(p.name for p in paths)
+
+    def test_without_dedupe_each_figure_is_its_own_file_in_document_order(self, tmp_path):
+        loaders = Counted(PNG_B), Counted(PNG_A), Counted(PNG_B)
+        paths = PDFWriter(figures_document(*loaders)).extract_images(tmp_path / "images", dedupe=False)
+        names = ["p0001_e000.png", "p0001_e002.png", "p0001_e003.png"]
+        assert paths == [tmp_path / "images" / name for name in names]
+        assert [path.read_bytes() for path in paths] == [PNG_B, PNG_A, PNG_B]
+        assert [loader.calls for loader in loaders] == [1, 1, 1]
+
+    @pytest.mark.parametrize(
+        ("outcome", "reason"),
+        [
+            (DatagruntPDFError("stream refused"), "DatagruntPDFError: stream refused"),
+            (FileNotFoundError(2, "gone"), "FileNotFoundError: [Errno 2] gone"),
+            (b"GIF89a not a png", "its bytes are not a PNG"),
+        ],
+    )
+    def test_a_figure_that_cannot_be_read_is_skipped_with_a_warning(self, tmp_path, caplog, outcome, reason):
+        caplog.set_level(logging.WARNING, logger=WRITER_LOGGER)
+        loaders = Counted(outcome), Counted(PNG_A), Counted(PNG_B)
+        paths = PDFWriter(figures_document(*loaders)).extract_images(tmp_path / "images")
+        assert paths == [tmp_path / "images" / f"{FIGURE_A_SHA}.png"]
+        assert warnings_of(caplog) == [f"figure p0001_e000 (sha256 {FIGURE_B_SHA}) was not written: {reason}"]
+        assert [record.levelno for record in caplog.records if record.name == WRITER_LOGGER] == [logging.WARNING]
+        assert loaders[2].calls == 0  # each distinct sha256 is read once: its first figure
+        assert sorted(p.name for p in (tmp_path / "images").iterdir()) == [f"{FIGURE_A_SHA}.png"]
+
+    def test_without_dedupe_each_failing_figure_is_skipped_with_its_own_warning(self, tmp_path, caplog):
+        caplog.set_level(logging.WARNING, logger=WRITER_LOGGER)
+        failed = DatagruntPDFError("stream refused")
+        paths = PDFWriter(figures_document(Counted(failed), Counted(PNG_A), Counted(failed))).extract_images(
+            tmp_path / "images", dedupe=False
+        )
+        assert paths == [tmp_path / "images" / "p0001_e002.png"]
+        why = "was not written: DatagruntPDFError: stream refused"
+        assert warnings_of(caplog) == [
+            f"figure p0001_e000 (sha256 {FIGURE_B_SHA}) {why}",
+            f"figure p0001_e003 (sha256 {FIGURE_B_SHA}) {why}",
+        ]
+
+    def test_figures_that_load_raise_no_warning(self, tmp_path, caplog):
+        caplog.set_level(logging.DEBUG, logger=WRITER_LOGGER)
+        PDFWriter(figures_document(Counted(PNG_B), Counted(PNG_A), Counted(PNG_B))).extract_images(tmp_path / "i")
+        assert warnings_of(caplog) == []
+
+    def test_a_loader_returning_a_non_bytes_value_fails_loud(self, tmp_path):
+        made = PDFWriter(figures_document(Counted("not bytes"), Counted(PNG_A), Counted(PNG_B)))
+        with pytest.raises(TypeError, match="_loader result must be bytes, got str"):
+            made.extract_images(tmp_path / "images")
+
+    def test_a_document_without_figures_writes_none_but_makes_the_directory(self, tmp_path):
+        assert PDFWriter(surrogate_document()).extract_images(tmp_path / "a" / "images") == []
+        assert list((tmp_path / "a" / "images").iterdir()) == []
+
+    def test_existing_files_are_replaced_and_others_kept(self, tmp_path):
+        directory = tmp_path / "images"
+        directory.mkdir()
+        (directory / f"{FIGURE_A_SHA}.png").write_bytes(b"old")
+        (directory / "other.txt").write_bytes(b"kept")
+        PDFWriter(figures_document(Counted(PNG_B), Counted(PNG_A), Counted(PNG_B))).extract_images(directory)
+        assert (directory / f"{FIGURE_A_SHA}.png").read_bytes() == PNG_A
+        assert (directory / "other.txt").read_bytes() == b"kept"
+        assert temporaries(directory) == []
+
+    def test_a_relative_directory_gives_absolute_paths(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        paths = PDFWriter(rich_document(Counted(PNG_A), Counted(PNG_B))).extract_images("images")
+        assert paths == [tmp_path / "images" / f"{FIGURE_A_SHA}.png", tmp_path / "images" / f"{FIGURE_B_SHA}.png"]
+
+    def test_a_file_at_the_directory_is_refused_before_any_work(self, tmp_path, monkeypatch):
+        calls = spy_extract(monkeypatch)
+        (tmp_path / "images").write_bytes(b"x")
+        with pytest.raises(NotADirectoryError, match="output_dir exists and is not a directory"):
+            PDFWriter(text_pdf(tmp_path)).extract_images(tmp_path / "images")
+        assert calls == [] and (tmp_path / "images").read_bytes() == b"x"
+
+    @pytest.mark.parametrize(
+        ("options", "error", "message"),
+        [
+            ({"output_dir": 3}, TypeError, "output_dir must be a str or os.PathLike, got int"),
+            ({"output_dir": b"images"}, TypeError, "output_dir must be a str or os.PathLike, got bytes"),
+            ({"dedupe": 1}, TypeError, "dedupe must be a bool"),
+            ({"dedupe": None}, TypeError, "dedupe must be a bool"),
+        ],
+    )
+    def test_bad_arguments_are_refused_before_any_work(self, tmp_path, monkeypatch, options, error, message):
+        calls = spy_extract(monkeypatch)
+        arguments = {"output_dir": tmp_path / "images", **options}
+        with pytest.raises(error, match=message):
+            PDFWriter(text_pdf(tmp_path)).extract_images(arguments.pop("output_dir"), **arguments)
+        assert calls == [] and not (tmp_path / "images").exists()
+
+    def test_a_failed_extraction_makes_no_directory(self, tmp_path, monkeypatch):
+        spy_extract(monkeypatch, PDFCorruptError("bad xref"))
+        with pytest.raises(PDFCorruptError):
+            PDFWriter(text_pdf(tmp_path)).extract_images(tmp_path / "images")
+        assert not (tmp_path / "images").exists()
+
+
+class TestExtractImagesFromAPdf:
+    def test_the_files_are_the_distinct_figures_by_sha256_in_document_order(self, tmp_path):
+        made = PDFWriter(figures_pdf(tmp_path))
+        paths = made.extract_images(tmp_path / "images")
+        figures = made._extracted().figures
+        distinct = list(dict.fromkeys(figure.sha256 for figure in figures))
+        assert len(figures) == 3 and len(distinct) == 2 and distinct != sorted(distinct)
+        assert [path.name for path in paths] == [f"{sha}.png" for sha in distinct]
+        first = {sha: next(f for f in figures if f.sha256 == sha) for sha in distinct}
+        for path, sha in zip(paths, distinct, strict=True):
+            assert path.read_bytes() == first[sha].read_bytes()
+            assert hashlib.sha256(first[sha].read_raw_bytes()).hexdigest() == sha
+            with Image.open(path) as image:
+                assert image.size == (first[sha].width_px, first[sha].height_px)
+
+    def test_without_dedupe_every_figure_is_written(self, tmp_path):
+        made = PDFWriter(figures_pdf(tmp_path))
+        paths = made.extract_images(tmp_path / "images", dedupe=False)
+        figures = made._extracted().figures
+        assert [path.name for path in paths] == [f"{figure.element_id}.png" for figure in figures]
+        assert [path.read_bytes() for path in paths] == [figure.read_bytes() for figure in figures]

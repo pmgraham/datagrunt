@@ -45,6 +45,17 @@ path written (``Path.absolute()``: symlinks are not resolved):
   transform): a cell that starts with ``=``, ``+``, ``-`` or ``@`` is not
   escaped against spreadsheet formula injection. Guarding a spreadsheet
   that opens the CSV is the application's concern.
+- :meth:`PDFWriter.extract_images`: each figure's PNG, through its A1
+  loader (``Figure.read_bytes``), into ``output_dir``. With ``dedupe``
+  (the default) each distinct ``sha256`` (the raw stream's: a figure's
+  identity) is read once, from its first figure, and written once, as
+  ``<sha256>.png``; without it, each figure is read and written as
+  ``<element_id>.png`` (``p0001_e003.png``). A figure whose bytes cannot be
+  read (a ``DatagruntPDFError``, an ``OSError``) or are not a PNG is
+  skipped, never silently: a warning on the module logger names the
+  figure, its sha256 and why (with ``dedupe``, its sha256 is not read
+  again). Any other error fails the call. The paths returned are the files
+  written, in document order.
 
 Every file is written atomically (:func:`_write_atomically`): a new file,
 ``.tmp_<uuid4 hex>`` beside the target (the same directory, so the same
@@ -58,14 +69,16 @@ and what it pointed to is untouched. Missing directories above the target
 are created. Nothing outside them is written.
 
 Every path is checked before any work: a str or os.PathLike of str (bytes
-are refused), and a target that is a directory raises
-``IsADirectoryError`` (checked again as the file is written). No ``fsync``
+are refused); a file target that is a directory raises
+``IsADirectoryError`` (checked again as the file is written), and an
+``output_dir`` that exists and is not a directory ``NotADirectoryError``. No ``fsync``
 before the rename (as the bundle): a write survives a killed process, not a
 power loss.
 """
 
 import errno
 import json
+import logging
 import os
 import uuid
 from collections.abc import Callable
@@ -74,15 +87,19 @@ from typing import Any, BinaryIO
 
 import polars as pl
 
+from datagrunt.pdf._validate import strict_bool
 from datagrunt.pdf.assembly import MIN_IMAGE_DIMENSION
+from datagrunt.pdf.bundle import _png
 from datagrunt.pdf.codec import document_to_json_bytes
-from datagrunt.pdf.elements import PDFDocument
+from datagrunt.pdf.elements import Figure, PDFDocument
 from datagrunt.pdf.frame import _BBOX_FIELDS, element_frame, utf8_text
 from datagrunt.pdf.pdfium_engine import _checked_password, _checked_path
 from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, extract_document
 from datagrunt.pdf.quality import OcrMode
 
 __all__ = ["PDFWriter"]
+
+_LOGGER = logging.getLogger(__name__)
 
 # A temporary file's name: this, then a uuid4's hex (the bundle's staging prefix).
 _TEMPORARY_PREFIX = ".tmp_"
@@ -145,8 +162,7 @@ class PDFWriter:
             OSError: If the file cannot be written; as extraction raises it.
         """
         target = _file_target(out_filepath)
-        data = document_to_json_bytes(self._extracted())
-        return _write_atomically(target, lambda handle: handle.write(data))
+        return _write_bytes(target, document_to_json_bytes(self._extracted()))
 
     def write_jsonl(self, out_filepath: str | os.PathLike[str]) -> Path:
         """Write the document's frame as JSON Lines at ``out_filepath``, one element a line (see the module notes).
@@ -179,8 +195,7 @@ class PDFWriter:
             OSError: If the file cannot be written; as extraction raises it.
         """
         target = _file_target(out_filepath)
-        data = utf8_text(self._extracted().to_markdown()).encode("utf-8")
-        return _write_atomically(target, lambda handle: handle.write(data))
+        return _write_bytes(target, utf8_text(self._extracted().to_markdown()).encode("utf-8"))
 
     def write_parquet(self, out_filepath: str | os.PathLike[str], **polars_kwargs: Any) -> Path:
         """Write the document's frame as Parquet at ``out_filepath``, nested types kept (see the module notes).
@@ -216,6 +231,24 @@ class PDFWriter:
         target = _file_target(out_filepath)
         frame = _csv_frame(element_frame(self._extracted()))
         return _write_atomically(target, lambda handle: frame.write_csv(handle, **polars_kwargs))
+
+    def extract_images(self, output_dir: str | os.PathLike[str], *, dedupe: bool = True) -> list[Path]:
+        """Write each figure's PNG into ``output_dir``, made when missing (see the module notes).
+
+        Returns:
+            The absolute paths written, in document order: a figure skipped is not among them.
+
+        Raises:
+            TypeError: If ``output_dir`` is not a path, or ``dedupe`` not a bool (before any work);
+                if a figure's loader returns something other than bytes.
+            NotADirectoryError: If ``output_dir`` exists and is not a directory (before any work).
+            OSError: If a file cannot be written; as extraction raises it.
+        """
+        directory = _directory_target(output_dir)
+        strict_bool("dedupe", dedupe)
+        figures = self._extracted().figures
+        directory.mkdir(parents=True, exist_ok=True)
+        return _write_figures(figures, directory, dedupe=dedupe)
 
     def _extracted(self) -> PDFDocument:
         """The document: the one given, or the source's, extracted on first use and cached."""
@@ -261,13 +294,21 @@ def _extract(source: PDFSource, options: PipelineOptions) -> PDFDocument:
 def _file_target(out_filepath: object) -> Path:
     """``out_filepath`` made absolute, if a file may be written there: it is not a directory."""
     target = _checked_path(out_filepath, "out_filepath").absolute()
-    _refuse_directory(target)
+    _refuse_directory(target, "out_filepath")
     return target
 
 
-def _refuse_directory(target: Path) -> None:
+def _refuse_directory(target: Path, name: str = "the target") -> None:
     if target.is_dir():
-        raise IsADirectoryError(errno.EISDIR, "out_filepath is a directory, not a file", str(target))
+        raise IsADirectoryError(errno.EISDIR, f"{name} is a directory, not a file", str(target))
+
+
+def _directory_target(output_dir: object) -> Path:
+    """``output_dir`` made absolute, if files may be written into it: it is a directory, or is missing."""
+    directory = _checked_path(output_dir, "output_dir").absolute()
+    if directory.exists() and not directory.is_dir():
+        raise NotADirectoryError(errno.ENOTDIR, "output_dir exists and is not a directory", str(directory))
+    return directory
 
 
 def _write_atomically(target: Path, fill: Callable[[BinaryIO], object]) -> Path:
@@ -291,6 +332,10 @@ def _write_atomically(target: Path, fill: Callable[[BinaryIO], object]) -> Path:
         temporary.unlink(missing_ok=True)
         raise
     return target
+
+
+def _write_bytes(target: Path, data: bytes) -> Path:
+    return _write_atomically(target, lambda handle: handle.write(data))
 
 
 def _write_rows(frame: pl.DataFrame, handle: BinaryIO) -> None:
@@ -318,3 +363,23 @@ def _csv_frame(frame: pl.DataFrame) -> pl.DataFrame:
 
 def _json_array(items: list[str]) -> str:
     return json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+
+
+def _write_figures(figures: tuple[Figure, ...], directory: Path, *, dedupe: bool) -> list[Path]:
+    """Write each figure's PNG into ``directory`` (each distinct sha256 once, with ``dedupe``); the paths, in order.
+
+    A figure whose bytes cannot be read, or are not a PNG, is skipped with a warning (see the module notes).
+    """
+    written: list[Path] = []
+    tried: set[str] = set()
+    for figure in figures:
+        if dedupe and figure.sha256 in tried:
+            continue
+        tried.add(figure.sha256)
+        data, why = _png(figure.read_bytes)
+        if data is None:
+            _LOGGER.warning("figure %s (sha256 %s) was not written: %s", figure.element_id, figure.sha256, why)
+            continue
+        name = f"{figure.sha256}.png" if dedupe else f"{figure.element_id}.png"
+        written.append(_write_bytes(directory / name, data))
+    return written
