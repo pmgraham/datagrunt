@@ -516,6 +516,81 @@ class TestMerged:
         assert ocr._merged([(UPPER, words)]) == words
 
 
+class TestSeamFragments:
+    """A word cut by its band's cut edge, wholly in the strip it shares, is dropped when the other band reads it whole.
+
+    UPPER is rows 0..899 and LOWER rows 840..1739: they share rows 840..899.
+    UPPER's cut edge is its bottom (a box ending at row 899 has a y1 of 900);
+    LOWER's is its top (a box starting at row 840 has a y0 of 840). A box
+    within 1 px of the edge touches it (#416).
+    """
+
+    def test_a_fragment_at_the_lower_bands_top_is_dropped_for_the_upper_bands_whole_word(self):
+        whole = placed("quick", (10, 830, 60, 870), 96.0)  # rows 830..869: whole in UPPER, 30 rows above its edge
+        fragment = placed("qnick", (10, 840, 60, 870), 99.0)  # LOWER's read of the rows below its top edge
+
+        assert ocr._merged([(UPPER, [whole]), (LOWER, [fragment])]) == [whole]
+
+    def test_a_fragment_at_the_upper_bands_bottom_is_dropped_for_the_lower_bands_whole_word(self):
+        fragment = placed("qnick", (10, 880, 60, 900), 99.0)  # UPPER's read of the rows above its bottom edge
+        whole = placed("quick", (10, 880, 60, 920), 96.0)  # rows 880..919: whole in LOWER, 40 rows below its edge
+
+        assert ocr._merged([(UPPER, [fragment]), (LOWER, [whole])]) == [whole]
+
+    @pytest.mark.parametrize("gap,cut", [(0, True), (1, True), (2, False)])
+    def test_a_word_within_1_px_of_its_bands_cut_edge_is_cut(self, gap, cut):
+        upper_whole, lower_whole = placed("over", (10, 820, 60, 860), 90.0), placed("lazy", (100, 870, 150, 910), 90.0)
+        lower_part = placed("ovcr", (10, 840 + gap, 60, 860), 90.0)  # its top `gap` rows below LOWER's top
+        upper_part = placed("lazv", (100, 870, 150, 900 - gap), 90.0)  # its bottom `gap` rows above UPPER's bottom
+
+        merged = ocr._merged([(UPPER, [upper_whole, upper_part]), (LOWER, [lower_part, lower_whole])])
+
+        assert merged == ([upper_whole, lower_whole] if cut else [upper_whole, upper_part, lower_part, lower_whole])
+
+    def test_a_cut_word_reaching_past_the_shared_strip_is_kept(self):
+        # Each touches its band's cut edge but reaches a row the other band does not hold: only it read that row.
+        upper_whole, lower_whole = placed("over", (10, 820, 60, 860), 90.0), placed("lazy", (100, 870, 150, 910), 90.0)
+        lower_part = placed("ovcr", (10, 840, 60, 901), 90.0)  # to row 900, below the strip
+        upper_part = placed("lazv", (100, 839, 150, 900), 90.0)  # from row 839, above the strip
+
+        merged = ocr._merged([(UPPER, [upper_whole, upper_part]), (LOWER, [lower_part, lower_whole])])
+
+        assert merged == [upper_whole, upper_part, lower_part, lower_whole]
+
+    @pytest.mark.parametrize(
+        "neighbour",
+        [
+            pytest.param((61, 830, 90, 870), id="sharing-its-right-edge"),
+            pytest.param((10, 800, 61, 841), id="sharing-its-top-row-edge"),
+        ],
+    )
+    def test_a_cut_word_the_other_band_does_not_read_is_kept(self, neighbour):
+        # Words read once are never dropped: nothing in UPPER overlaps the cut word (a shared edge is no overlap).
+        # Its top is 1 row below LOWER's top edge, so it is cut; UPPER's word ends on that row's top edge.
+        beside = placed("fox", neighbour, 90.0)
+        cut = placed("qnick", (10, 841, 61, 870), 90.0)
+
+        assert ocr._merged([(UPPER, [beside]), (LOWER, [cut])]) == [beside, cut]
+
+    def test_a_line_both_bands_cut_is_kept_in_both(self):
+        # Rows 840..899 exactly: UPPER's copy touches its bottom, LOWER's its top; neither band read the line whole.
+        upper, lower = placed("SORT", (10, 840, 60, 900), 0.0), placed("Company", (10, 840, 60, 899), 96.0)
+
+        assert ocr._merged([(UPPER, [upper]), (LOWER, [lower])]) == [upper, lower]
+
+    def test_the_whole_copy_is_kept_over_a_cut_copy_of_higher_confidence(self):
+        # The same text, IoU 0.75: the copy cut by LOWER's top is a fragment, whatever its confidence.
+        whole, cut = placed("fox", (10, 830, 40, 870), 80.0), placed("fox", (10, 840, 40, 870), 95.0)
+
+        assert ocr._merged([(UPPER, [whole]), (LOWER, [cut])]) == [whole]
+
+    def test_each_seam_drops_its_own_fragments(self):
+        first, last = placed("ab", (0, 830, 10, 870), 90.0), placed("cd", (0, 1720, 10, 1760), 90.0)
+        second = [placed("xb", (0, 840, 10, 870), 90.0), placed("cx", (0, 1720, 10, 1740), 90.0)]
+
+        assert ocr._merged([(UPPER, [first]), (LOWER, second), (LAST, [last])]) == [first, last]
+
+
 class TestDisplayedBox:
     """A word's box maps back to displayed-page points: through the rotation that righted the page, then 72 / dpi."""
 
@@ -1079,3 +1154,25 @@ class TestRealTesseract:
         expected = {word for sentence in SENTENCES for word in sentence.split()}
         assert result.status == "ok"
         assert len(expected & {word.text for word in result.words}) >= 0.9 * len(expected)
+
+    @pytest.mark.parametrize(
+        "top",
+        [pytest.param(825, id="across-the-lower-bands-top"), pytest.param(870, id="across-the-upper-bands-bottom")],
+    )
+    def test_a_line_crossing_a_band_edge_is_read_once(self, top):
+        # The bands are rows 0..899 and 840..1649. The line's ink (36 px tall, from ~7 rows below `top`) crosses row
+        # 840 or row 899: one band reads it whole, the other reads its cut part as other words (#416).
+        font = ImageFont.load_default(size=36)
+        image = Image.new("L", (2550, 1650), 255)
+        draw = ImageDraw.Draw(image)
+        draw.text((150, 700), SENTENCES[1], fill=0, font=font)
+        draw.text((150, top), SENTENCES[0], fill=0, font=font)
+        page = RenderedPage(pixels=image.tobytes(), px_width=image.width, px_height=image.height)
+
+        result = ocr_words(bands(page), dpi=300, rotation=0, page_size_pt=(612.0, 396.0), timeout_s=60.0)
+
+        expected = SENTENCES[0].split()
+        line = [word.text for word in result.words if word.bbox.y0 > 790 * 72 / 300]  # below the first line
+        assert result.status == "ok"
+        assert len(line) == len(expected)
+        assert sum(text in expected for text in line) >= 0.9 * len(expected)

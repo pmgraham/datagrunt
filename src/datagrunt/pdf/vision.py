@@ -85,14 +85,12 @@ Known limitations (A5b evidence: 10 corpus pages forced to OCR):
   Sizing each word by its tesseract line's height instead finds 6, 0 and 5:
   fewer, but it loses page 10's, and with ``--psm 6`` it joined words
   across their spaces.
-- OCR's misreads reach the layout. A line crossing a band seam is read
-  whole in one band and as a cut fragment, read as other text, in the
-  other (:func:`~datagrunt.pdf.ocr.ocr_words` keeps both: a copy is kept
-  once only when its text is the same); the fragment lies on the line's
-  words and joins them ("nominalpiii"). A column of digits read as one
-  tall word (confidence 0) runs the lines beside it together. Every char
-  is still read once (Pass C), but the elements' words recall 75.2 % of the
-  digital words where the OCR words themselves recall 84.5 %.
+- OCR's misreads reach the layout. A column of digits read as one tall
+  word (confidence 0) runs the lines beside it together. Every char is
+  still read once (Pass C), but the elements' words recall 77.2 % of the
+  digital words where the OCR words themselves recall 84.4 %. (A band
+  seam's cut fragments, which glued onto the line's words, "nominalpiii",
+  are dropped by :func:`~datagrunt.pdf.ocr.ocr_words`, #416.)
 """
 
 import dataclasses
