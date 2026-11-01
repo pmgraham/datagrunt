@@ -2,10 +2,11 @@
 
 The source is a ReportLab PDF of ``rich_document``'s page sizes, and the
 document is ``rich_document`` bound to it (its sha256), with figure loaders
-returning fixed PNGs. Renders are real (A5a's guarded worker) where their
-bytes are checked; elsewhere ``bundle.render_page`` is a fast stand-in
-(:func:`fake_render`). A failing stage is a ``monkeypatch`` of the bundle's
-module name for it.
+and page 3's own page-image loaders returning fixed PNGs. Renders are real
+(A5a's guarded worker) where their bytes are checked; elsewhere
+``bundle.render_page`` is a fast stand-in (:func:`fake_render`). A5b's vision
+pages come from ``extract_document(ocr="always")`` (tesseract needed). A
+failing stage is a ``monkeypatch`` of the bundle's module name for it.
 """
 
 import dataclasses
@@ -25,39 +26,31 @@ import pytest
 from PIL import Image
 
 from datagrunt.pdf import bundle
-from datagrunt.pdf.bundle import BUNDLE_FORMAT_VERSION, write_bundle
+from datagrunt.pdf.bundle import BUNDLE_FORMAT_VERSION, load_bundle, write_bundle
 from datagrunt.pdf.codec import document_from_json_bytes
 from datagrunt.pdf.elements import Figure, PDFDocument
 from datagrunt.pdf.exceptions import DatagruntPDFError
-from datagrunt.pdf.ocr import bands, normalized
+from datagrunt.pdf.ocr import tesseract_available
 from datagrunt.pdf.pipeline import extract_document
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page, render_size
-from pdf_tests.builders import PageSpec, Rect, TextRun, build_pdf, solid_png
+from pdf_tests.builders import PageSpec, TextRun, build_pdf, solid_png
 from pdf_tests.documents import FIGURE_A_SHA, FIGURE_B_SHA, PAGE_SIZES, metadata, rich_document, surrogate_document
+from pdf_tests.test_layout_stream_tables import body_text
 
 PNG_A = solid_png(64, 32, (0.2, 0.4, 0.6))
 PNG_B = solid_png(16, 16, (0.9, 0.1, 0.1))
+# Page 3's own page image (as A5b's loaders would give it) and its bands.
+OWN_IMAGE = solid_png(100, 130, (0.5, 0.5, 0.5))
+OWN_BANDS = (solid_png(100, 70, (0.1, 0.1, 0.1)), solid_png(100, 70, (0.9, 0.9, 0.9)))
 DPI, VISION_DPI = 72, 100
 STAGING = re.compile(r"\.tmp_[0-9a-f]{32}")
 CAP, TIMEOUT = 2 << 30, 120.0
 
 
 def source_pdf(directory: Path, *, user_password=None, name="report.pdf") -> Path:
-    """A PDF of rich_document's page sizes, one line of text a page.
-
-    Pages 3 and 4 (the vision pages) also hold two grey fills, so their
-    1 % autocontrast changes their pixels.
-    """
-    greys = (
-        Rect(0.0, 0.0, 612.0, 300.0, fill_rgb=(0.6, 0.6, 0.6), stroke=False),
-        Rect(0.0, 300.0, 612.0, 300.0, fill_rgb=(0.3, 0.3, 0.3), stroke=False),
-    )
+    """A PDF of rich_document's page sizes, one line of text a page."""
     pages = [
-        PageSpec(
-            width=width,
-            height=height,
-            items=(TextRun(f"Page {number}", 72.0, 100.0), *(greys if number > 2 else ())),
-        )
+        PageSpec(width=width, height=height, items=(TextRun(f"Page {number}", 72.0, 100.0),))
         for number, (width, height) in enumerate(PAGE_SIZES, 1)
     ]
     return build_pdf(directory / name, pages, user_password=user_password)
@@ -67,9 +60,32 @@ def sha_of(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def bound_document(path: Path, figure_loader=lambda: PNG_A, other_loader=lambda: PNG_B) -> PDFDocument:
-    """rich_document as the document of the PDF at ``path``."""
-    return rich_document(figure_loader, other_loader, sha=sha_of(path), source_name=path.name)
+def bound_document(
+    path: Path,
+    figure_loader=lambda: PNG_A,
+    other_loader=lambda: PNG_B,
+    *,
+    image_loader=lambda: OWN_IMAGE,
+    band_loader=lambda: OWN_BANDS,
+) -> PDFDocument:
+    """rich_document as the document of the PDF at ``path``; page 3 has its own page image."""
+    return rich_document(
+        figure_loader,
+        other_loader,
+        sha=sha_of(path),
+        source_name=path.name,
+        image_loader=image_loader,
+        band_loader=band_loader,
+    )
+
+
+def raising(error: BaseException):
+    """A loader that raises ``error``."""
+
+    def loader():
+        raise error
+
+    return loader
 
 
 def files_in(root: Path) -> set[str]:
@@ -151,8 +167,10 @@ EXPECTED_FILES = {
     f"images/{FIGURE_A_SHA}.png",
     f"images/{FIGURE_B_SHA}.png",
     *(f"page_images/page_000{n}.png" for n in (1, 2, 3, 4)),
-    *(f"page_images/bands/page_000{n}_band_0{k}.png" for n in (3, 4) for k in (1, 2)),
+    *(f"page_images/bands/page_0003_band_0{k}.png" for k in (1, 2)),
 }
+# The pages without their own page image, which the bundle renders.
+RENDERED = (1, 2, 4)
 
 
 class TestLayout:
@@ -172,6 +190,7 @@ class TestManifest:
             "extraction_params",
             "integrity_verified",
             "degraded_pages",
+            "page_images",
             "artifacts",
             "missing",
         ]
@@ -186,6 +205,16 @@ class TestManifest:
         assert manifest["integrity_verified"] is False is written.document.integrity_verified
         assert manifest["degraded_pages"] == [3, 4]
         assert manifest["missing"] == []
+
+    def test_each_page_image_records_its_origin_dpi_and_normalization(self, written):
+        render = {"origin": "render", "dpi": float(DPI), "contrast_normalized": False}
+        own = {"origin": "document", "dpi": 150.5, "contrast_normalized": True}
+        assert manifest_of(written.out)["page_images"] == [
+            {"page_number": 1, **render},
+            {"page_number": 2, **render},
+            {"page_number": 3, **own},
+            {"page_number": 4, **render},
+        ]
 
     def test_every_artifact_has_its_path_size_and_sha256(self, written):
         artifacts = manifest_of(written.out)["artifacts"]
@@ -222,8 +251,8 @@ class TestDocument:
         assert written.calls == {"a": 1, "b": 1}
         assert (written.out / "images" / f"{FIGURE_A_SHA}.png").read_bytes() == PNG_A
 
-    def test_page_images_are_renders_at_the_effective_dpi(self, written):
-        for page in written.returned.pages:
+    def test_pages_without_their_own_image_are_rendered_at_the_effective_dpi(self, written):
+        for page in (written.returned.pages[n - 1] for n in RENDERED):
             image = page.page_image
             dpi = effective_dpi(DPI, 16_000_000, page.width_pt, page.height_pt)
             path = written.out / "page_images" / f"page_{page.page_number:04d}.png"
@@ -232,25 +261,19 @@ class TestDocument:
             drawn = render_page(written.source, page.page_number - 1, dpi=dpi, memory_cap_bytes=CAP, timeout_s=TIMEOUT)
             assert png_pixels(path) == ("L", (drawn.px_width, drawn.px_height), drawn.pixels)
 
-    def test_an_input_page_image_is_replaced_by_the_bundles(self, written):
-        assert written.document.pages[2].page_image.dpi == 150.5
-        assert written.returned.pages[2].page_image.dpi == float(DPI)
+    def test_a_pages_own_image_is_kept_and_written_through_its_loaders(self, written):
+        mine, theirs = written.returned.pages[2], written.document.pages[2]
+        assert mine == theirs  # the page image compares equal: its dpi, size and normalization are kept
+        image, out = mine.page_image, written.out
+        assert (image.dpi, image.width_px, image.height_px, image.contrast_normalized) == (150.5, 100, 130, True)
+        assert image.image_path == out / "page_images" / "page_0003.png"
+        assert image.band_paths == tuple(out / "page_images" / "bands" / f"page_0003_band_0{k}.png" for k in (1, 2))
+        assert image.image_path.read_bytes() == OWN_IMAGE
+        assert tuple(path.read_bytes() for path in image.band_paths) == OWN_BANDS
+        assert (image.read_bytes(), image.read_bands()) == (OWN_IMAGE, OWN_BANDS)
 
-    def test_vision_pages_have_normalized_bands_at_the_vision_dpi(self, written):
-        for page in written.returned.pages[2:]:
-            n = page.page_number
-            dpi = effective_dpi(VISION_DPI, 16_000_000, page.width_pt, page.height_pt)
-            drawn = render_page(written.source, n - 1, dpi=dpi, memory_cap_bytes=CAP, timeout_s=TIMEOUT)
-            expected = bands(normalized(drawn))
-            assert normalized(drawn).pixels != drawn.pixels  # the fixture tells normalized from not
-            paths = page.page_image.band_paths
-            assert paths == tuple(written.out / "page_images" / "bands" / f"page_{n:04d}_band_0{k}.png" for k in (1, 2))
-            assert len(expected) == 2
-            for path, band in zip(paths, expected):
-                assert png_pixels(path) == ("L", (band.px_width, band.px_height), band.pixels)
-
-    def test_digital_and_hybrid_pages_have_no_bands(self, written):
-        assert [page.page_image.band_paths for page in written.returned.pages[:2]] == [(), ()]
+    def test_pages_without_their_own_image_have_no_bands(self, written):
+        assert [written.returned.pages[n - 1].page_image.band_paths for n in RENDERED] == [(), (), ()]
 
     def test_document_json_is_the_returned_document_with_relative_paths(self, written):
         raw = (written.out / "json" / "document.json").read_bytes()
@@ -305,40 +328,65 @@ class TestFailuresAreRecorded:
             }
         ]
 
-    def test_a_failed_render_of_a_vision_page_leaves_no_image_and_no_bands(self, tmp_path, source, monkeypatch):
+    def test_a_failed_render_of_a_vision_page_without_its_own_image_is_recorded(self, tmp_path, source, monkeypatch):
         def failing(src, page_index, **kwargs):
-            if page_index == 2:
+            if page_index == 3:
                 raise RenderFailed("the render worker timed out")
             return fake_render(src, page_index, **kwargs)
 
         monkeypatch.setattr(bundle, "render_page", failing)
         returned = write(bound_document(source), tmp_path / "out", source)
-        assert returned.pages[2].page_image is None
-        names = files_in(tmp_path / "out")
-        assert not any(name.startswith("page_images/bands/page_0003") for name in names)
-        assert "page_images/bands/page_0004_band_01.png" in names
+        assert returned.pages[3].page_image is None
+        assert not any(name.startswith("page_images/bands/page_0004") for name in files_in(tmp_path / "out"))
         [missing] = manifest_of(tmp_path / "out")["missing"]
-        assert (missing["artifact"], missing["page_number"]) == ("page_image", 3)
+        assert (missing["artifact"], missing["page_number"]) == ("page_image", 4)
         assert missing["reason"] == "the page was not rendered: RenderFailed: the render worker timed out"
 
-    def test_a_failed_band_render_keeps_the_page_image_and_says_why(self, tmp_path, source, monkeypatch):
-        def failing_bands(src, page_index, *, dpi, **kwargs):
-            if page_index == 3 and dpi == VISION_DPI:
-                raise RenderFailed("the render worker reached its memory cap")
-            return fake_render(src, page_index, dpi=dpi, **kwargs)
+    @pytest.mark.parametrize(
+        ("loader", "reason"),
+        [
+            (raising(RenderFailed("the render worker timed out")), "RenderFailed: the render worker timed out"),
+            (raising(PermissionError(13, "Permission denied")), "PermissionError: [Errno 13] Permission denied"),
+            (lambda: b"GIF89a", "its bytes are not a PNG"),
+        ],
+    )
+    def test_an_own_image_that_cannot_be_read_leaves_no_page_image(self, tmp_path, source, fast_render, loader, reason):
+        returned = write(bound_document(source, image_loader=loader), tmp_path / "out", source)
+        assert returned.pages[2].page_image is None
+        assert not any(name.startswith("page_images/bands/page_0003") for name in files_in(tmp_path / "out"))
+        assert manifest_of(tmp_path / "out")["missing"] == [
+            {
+                "artifact": "page_image",
+                "page_number": 3,
+                "element_id": None,
+                "reason": f"the page's own image was not written: {reason}",
+            }
+        ]
 
-        monkeypatch.setattr(bundle, "render_page", failing_bands)
-        returned = write(bound_document(source), tmp_path / "out", source)
-        image = returned.pages[3].page_image
-        assert image.image_path == tmp_path / "out" / "page_images" / "page_0004.png" and image.band_paths == ()
+    @pytest.mark.parametrize(
+        ("loader", "reason"),
+        [
+            (
+                raising(RenderRefused("page 3: an image over the bound")),
+                "RenderRefused: page 3: an image over the bound",
+            ),
+            (lambda: (OWN_BANDS[0], b"not a png"), "band 2's bytes are not a PNG"),
+            (None, "DatagruntPDFError: page image 3 has no bands: no band_paths and no band loader"),
+        ],
+    )
+    def test_own_bands_that_cannot_be_read_keep_the_page_image(self, tmp_path, source, fast_render, loader, reason):
+        returned = write(bound_document(source, band_loader=loader), tmp_path / "out", source)
+        image = returned.pages[2].page_image
+        assert image.image_path == tmp_path / "out" / "page_images" / "page_0003.png" and image.band_paths == ()
         assert manifest_of(tmp_path / "out")["missing"] == [
             {
                 "artifact": "bands",
-                "page_number": 4,
+                "page_number": 3,
                 "element_id": None,
-                "reason": "the page's bands were not rendered: RenderFailed: the render worker reached its memory cap",
+                "reason": f"the page's own bands were not written: {reason}",
             }
         ]
+        assert load_bundle(tmp_path / "out") == returned
 
     def test_an_effective_dpi_refusal_is_recorded(self, tmp_path, source, monkeypatch, fast_render):
         real = bundle.effective_dpi
@@ -389,7 +437,6 @@ class TestFailuresAreRecorded:
             (1, "figure"),
             (1, "page_image"),
             (2, "page_image"),
-            (3, "page_image"),
             (4, "page_image"),
         ]
 
@@ -586,10 +633,7 @@ class TestValidation:
 
         monkeypatch.setattr(bundle, "render_page", spy)
         write(bound_document(path), tmp_path / "out", path, password="pw")
-        assert sorted(calls) == sorted(
-            [(path, index, "pw", CAP, TIMEOUT) for index in range(4)]
-            + [(path, index, "pw", CAP, TIMEOUT) for index in (2, 3)]
-        )
+        assert sorted(calls) == [(path, index, "pw", CAP, TIMEOUT) for index in (0, 1, 3)]
 
     def test_an_encrypted_source_renders_with_its_password(self, tmp_path):
         path = source_pdf(tmp_path, user_password="pw")
@@ -637,3 +681,99 @@ class TestChunks:
         mine, theirs = manifest_of(out), manifest_of(written.out)
         assert mine["artifacts"] == theirs["artifacts"] and mine["missing"] == theirs["missing"] == []
         assert returned == written.returned
+
+
+def spied(monkeypatch, real=None) -> list:
+    """Record each bundle render_page call (its page index and dpi), and let it run (or ``real`` run)."""
+    calls: list = []
+    run = real or bundle.render_page
+
+    def spy(src, page_index, **kwargs):
+        calls.append((page_index, kwargs["dpi"]))
+        return run(src, page_index, **kwargs)
+
+    monkeypatch.setattr(bundle, "render_page", spy)
+    return calls
+
+
+class TestVisionRoute:
+    """A5b's vision pages carry their own page image: the bundle writes it through its loaders, never re-renders."""
+
+    @pytest.mark.skipif(not tesseract_available(), reason="tesseract is not installed")
+    def test_an_ocr_page_is_bundled_from_its_own_image_and_bands(self, tmp_path, monkeypatch):
+        path = build_pdf(
+            tmp_path / "scan.pdf",
+            [PageSpec(items=(TextRun("Bundle the righted bands", 72.0, 120.0, size=24.0),)) for _ in range(2)],
+        )
+        document = extract_document(path, ocr="always")
+        assert all(page.route == "vision" and page.page_image is not None for page in document.pages)
+        calls = spied(monkeypatch)
+        written = write_bundle(document, tmp_path / "out", source=path)
+        assert calls == []  # nothing re-rendered
+        for mine, theirs in zip(written.pages, document.pages):
+            image = mine.page_image
+            assert image.image_path.read_bytes() == theirs.page_image.read_bytes()
+            assert tuple(band.read_bytes() for band in image.band_paths) == theirs.page_image.read_bands()
+            assert image.band_paths and (image.contrast_normalized, image.dpi) == (True, theirs.page_image.dpi)
+        assert written == document
+        loaded = load_bundle(tmp_path / "out")
+        assert loaded == written == document
+        assert loaded.pages[1].page_image.read_bands() == document.pages[1].page_image.read_bands()
+        dpi = document.pages[0].page_image.dpi
+        assert manifest_of(tmp_path / "out")["page_images"][0] == {
+            "page_number": 1,
+            "origin": "document",
+            "dpi": dpi,
+            "contrast_normalized": True,
+        }
+
+    def test_a_digital_page_still_renders_at_dpi(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "text.pdf", [PageSpec(items=tuple(body_text(100.0)))])
+        document = extract_document(path)
+        assert (document.pages[0].route, document.pages[0].page_image) == ("digital", None)
+        calls = spied(monkeypatch)
+        written = write(document, tmp_path / "out", path)
+        assert calls == [(0, DPI)]
+        image = written.pages[0].page_image
+        assert (image.dpi, image.contrast_normalized, image.band_paths) == (float(DPI), False, ())
+        assert load_bundle(tmp_path / "out") == written
+
+
+class TestExtractionParams:
+    EXTRA = {"ocr": "always", "min_image_dimension": 40, "strict": False, "note": None, "ratio": 0.5}
+
+    def test_extra_parameters_are_merged_after_the_writers_own(self, tmp_path, source, fast_render):
+        write(bound_document(source), tmp_path / "out", source, extraction_params=self.EXTRA)
+        params = manifest_of(tmp_path / "out")["extraction_params"]
+        assert params == {
+            "dpi": DPI,
+            "vision_dpi": VISION_DPI,
+            "max_render_pixels": 16_000_000,
+            "workers": 1,
+            **self.EXTRA,
+        }
+        assert list(params)[:4] == ["dpi", "vision_dpi", "max_render_pixels", "workers"]
+        assert load_bundle(tmp_path / "out").metadata.sha256 == sha_of(source)
+
+    @pytest.mark.parametrize(
+        ("extra", "error", "message"),
+        [
+            (
+                {"ocr": ["always"]},
+                TypeError,
+                r"extraction_params\['ocr'\] must be a str, int, float, bool or None, got list",
+            ),
+            ({"nested": {"a": 1}}, TypeError, "got dict"),
+            ({"ratio": float("nan")}, ValueError, r"extraction_params\['ratio'\] must be finite"),
+            ({"ratio": float("inf")}, ValueError, "must be finite"),
+            ({"thing": object()}, TypeError, "got object"),
+            ({"dpi": 300}, ValueError, r"extraction_params\['dpi'\] is write_bundle's own parameter"),
+            ({3: "x"}, TypeError, "extraction_params keys must be str, got int"),
+            ({" ": "x"}, ValueError, "extraction_params keys must be non-blank"),
+            (["ocr"], TypeError, "extraction_params must be a Mapping or None, got list"),
+        ],
+    )
+    def test_a_bad_parameter_is_refused_before_anything_is_written(self, tmp_path, source, extra, error, message):
+        with pytest.raises(error, match=message):
+            write(bound_document(source), tmp_path / "out", source, extraction_params=extra)
+        assert sorted(path.name for path in tmp_path.iterdir()) == ["report.pdf"]

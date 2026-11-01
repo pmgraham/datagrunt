@@ -155,9 +155,17 @@ def second_page(figure_loader: Loader | None = None, other_loader: Loader | None
     return page(2, elements, route="hybrid", quality=EMPTY_QUALITY, width_pt=595.5, height_pt=842.25)
 
 
-def vision_page() -> Page:
-    """A vision page whose OCR was unavailable: digital text kept, with a page image."""
-    image = PageImage(page_number=3, dpi=150.5, width_px=100, height_px=130, contrast_normalized=True)
+def vision_page(image_loader: Loader | None = None, band_loader: Callable[[], tuple[bytes, ...]] | None = None) -> Page:
+    """A vision page whose OCR was unavailable: digital text kept, with its own page image (and its loaders)."""
+    image = PageImage(
+        page_number=3,
+        dpi=150.5,
+        width_px=100,
+        height_px=130,
+        contrast_normalized=True,
+        _loader=image_loader,
+        _band_loader=band_loader,
+    )
     return page(
         3,
         (Paragraph(**ids(3, 0, DETAILS), text="Scanned."),),
@@ -180,13 +188,21 @@ def rich_document(
     *,
     sha: str = SOURCE_SHA,
     source_name: str = "report.pdf",
+    image_loader: Loader | None = None,
+    band_loader: Callable[[], tuple[bytes, ...]] | None = None,
 ) -> PDFDocument:
     """Four pages holding every element type and field (see the module notes).
 
     ``sha`` and ``source_name`` make it the document of a real PDF of
-    :data:`PAGE_SIZES` pages, for the bundle's renders.
+    :data:`PAGE_SIZES` pages, for the bundle's renders; ``image_loader`` and
+    ``band_loader`` are page 3's own page image's.
     """
-    pages = (first_page(figure_loader), second_page(figure_loader, other_loader), vision_page(), error_page())
+    pages = (
+        first_page(figure_loader),
+        second_page(figure_loader, other_loader),
+        vision_page(image_loader, band_loader),
+        error_page(),
+    )
     one, two, three = (p.elements for p in pages[:3])
     sections = (
         Section(heading=None, scope_path=(), page_span=(1, 1), elements=one[:2]),

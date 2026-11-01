@@ -12,21 +12,31 @@ Layout (paths relative to the bundle, joined with ``/``):
   a figure links to ``../images/<sha256>.png``, relative to the file.
 - ``images/<sha256>.png``: each distinct figure, once: its PNG from
   ``Figure.read_bytes`` (its ``image_path``, else its loader).
-- ``page_images/page_NNNN.png``: every page, rendered at
-  :func:`~datagrunt.pdf.render.effective_dpi` of ``dpi`` (and
-  ``max_render_pixels``) in A5a's guarded worker, 8-bit grey as drawn.
-- ``page_images/bands/page_NNNN_band_NN.png``: each vision page (route
-  ``"vision"``) rendered again at the effective ``vision_dpi``, normalized
-  (:func:`~datagrunt.pdf.ocr.normalized`) and cut into bands
-  (:func:`~datagrunt.pdf.ocr.bands`), numbered from 1.
+- ``page_images/page_NNNN.png``: every page's image (origin):
+  - a page whose ``page_image`` is set (``"document"``: A5b's vision
+    pages, rendered at the effective ``vision_dpi`` and normalized): its
+    own PNG, from ``PageImage.read_bytes`` (its loader), as it is, at its
+    own DPI; never rendered again;
+  - every other page (``"render"``): rendered at
+    :func:`~datagrunt.pdf.render.effective_dpi` of ``dpi`` (and
+    ``max_render_pixels``) in A5a's guarded worker, 8-bit grey as drawn.
+- ``page_images/bands/page_NNNN_band_NN.png``: a page's own image's bands,
+  numbered from 1, from ``PageImage.read_bands`` (A5b's: the page as OCR
+  read it, righted, which is what a vision model needs). A rendered page
+  has no bands. ``vision_dpi`` is recorded, not rendered at: a vision
+  page's own image carries its DPI.
 - ``manifest.json``: :data:`BUNDLE_FORMAT_VERSION`, the datagrunt version,
   the source's sha256, the extraction parameters (``dpi``, ``vision_dpi``,
-  ``max_render_pixels``, ``workers``), ``integrity_verified`` and
-  ``degraded_pages``, every other file's path, size and sha256 (by path),
-  and each artifact that is missing and why (by page).
+  ``max_render_pixels``, ``workers``, then the caller's
+  ``extraction_params``), ``integrity_verified`` and ``degraded_pages``,
+  each page image's origin, DPI and ``contrast_normalized`` (by page),
+  every other file's path, size and sha256 (by path), and each artifact
+  that is missing and why (by page).
 
-PNGs are encoded with Pillow; PDF content is decoded only by A1's loaders
-and A5a's guarded render. Each file is created exclusively and streamed
+PNGs are encoded with Pillow (the bundle's renders here; figures and own
+page images by their loaders); PDF content is decoded only by A1's loaders
+and A5a's guarded render. A figure's or own page image's bytes must start
+with the PNG signature. Each file is created exclusively and streamed
 through a SHA-256 as it is written.
 
 :func:`write_bundle` is atomic. Every check comes first (the options, as
@@ -41,27 +51,39 @@ included, the staging directory is removed and the error raised. A writer
 killed outright leaves its staging directory, the only trace: no
 ``output_dir``; the next write makes its own and ignores it.
 
-Pages render in chunks of :func:`_chunk_size` (``max(4, 32 // workers)``)
-pages, on ``workers`` threads (each render is a worker process of A5a's).
-Each page's PNGs are written in its own thread, so no page's pixels outlive
-its render; a chunk is done before the next starts.
+Pages are written in chunks of :func:`_chunk_size` (``max(4, 32 //
+workers)``) pages, on ``workers`` threads (each render is a worker process
+of A5a's, as is each own page image's loader). Each page's PNGs are written
+in its own thread, so no page's pixels outlive it; a chunk is done before
+the next starts.
 
 The returned document is the input with paths set: each figure's
-``image_path`` (in ``sections`` too), and each page's ``page_image``, which
-the bundle's render replaces: its ``dpi``, size and ``image_path`` are the
-page render's, ``contrast_normalized`` is False, and ``band_paths`` are the
-vision bands (A1's PageImage has one DPI: the bands' is the effective
-``vision_dpi``, from the manifest's parameters).
-Its figures and page images read their bundle files as a loaded
+``image_path`` (in ``sections`` too), and each page's ``page_image``. A
+page's own image keeps its ``dpi``, size and ``contrast_normalized`` (so it
+equals the input's) and gains its paths; a rendered page's image is the
+render's (its effective ``dpi`` and size, ``contrast_normalized`` False, no
+bands). Its figures and page images read their bundle files as a loaded
 document's do (verified on every read; see below).
 
 Failures are recorded, never silent: a page whose render is refused or
-fails (``RenderRefused``, ``RenderFailed``) has no page image (nor bands);
-a vision page whose band render is refused or fails has no bands; a figure
-whose bytes cannot be read (a ``DatagruntPDFError`` or ``OSError``) or are
-not a PNG is not written (its figures keep no ``image_path``). Each is a
-``missing`` entry naming the artifact, the page, the figure's element id
-(figures) and why. Any other error fails the write.
+fails (``RenderRefused``, ``RenderFailed``), or whose own image cannot be
+read (a ``DatagruntPDFError``, render errors included, or an ``OSError``)
+or is not a PNG, has no page image (nor bands); a page whose own bands
+cannot be read, or one of them is not a PNG, keeps its image and has no
+bands; a figure whose bytes cannot be read or are not a PNG is not written
+(its figures keep no ``image_path``). Each is a ``missing`` entry naming
+the artifact, the page, the figure's element id (figures) and why. Any
+other error fails the write.
+
+Known limitations, documented:
+
+- No ``fsync`` before the rename: a write survives a killed process, not
+  a power loss; a bundle torn by one fails its checksums on load.
+- ``output_dir`` filled by another process between the publish check and
+  the rename makes ``os.replace`` fail with ``OSError`` (``ENOTEMPTY``),
+  not ``FileExistsError``; it is never merged into, and staging is removed.
+- Figures are read one loader call each (each reopens the PDF), not
+  batched by page through one handle.
 
 :func:`load_bundle` takes a bundle directory or its ``manifest.json``
 and returns the document. Nothing is trusted before it is checked:
@@ -84,8 +106,10 @@ and returns the document. Nothing is trusted before it is checked:
 3. The document (the codec, its paths joined to the bundle by the same
    helper): the manifest's source sha256, ``integrity_verified`` and
    ``degraded_pages`` must be its; every path it names must be a verified
-   artifact; and its missing page images, bands and figures must be
-   exactly the manifest's ``missing`` entries.
+   artifact; the manifest's page images must be its (the same pages, DPI
+   and ``contrast_normalized``; a rendered one without bands); and its
+   missing page images, own bands and figures must be exactly the
+   manifest's ``missing`` entries.
 
 What is guaranteed: every byte a loaded document returns matches the
 manifest at the moment it is read. Its figures and page images keep their
@@ -108,6 +132,7 @@ import errno
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import shutil
 import stat
@@ -120,7 +145,15 @@ from typing import IO, BinaryIO, NamedTuple, cast
 
 from PIL import Image
 
-from datagrunt.pdf._validate import choice_str, int_at_least, non_blank_str, optional_str, sha256_hex, strict_bool
+from datagrunt.pdf._validate import (
+    choice_str,
+    int_at_least,
+    non_blank_str,
+    optional_str,
+    positive_float,
+    sha256_hex,
+    strict_bool,
+)
 from datagrunt.pdf.codec import (
     _array,
     _object,
@@ -132,7 +165,6 @@ from datagrunt.pdf.codec import (
 from datagrunt.pdf.elements import _MAX_ASSET_BYTES, Figure, Page, PageImage, PDFDocument
 from datagrunt.pdf.exceptions import BundleCorruptError, DatagruntPDFError
 from datagrunt.pdf.frame import utf8_text
-from datagrunt.pdf.ocr import Band, bands, normalized
 from datagrunt.pdf.pdfium_engine import _checked_path
 from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, _opened_source, _stream_sha256
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page
@@ -163,11 +195,14 @@ _MANIFEST_KEYS = (
     "extraction_params",
     "integrity_verified",
     "degraded_pages",
+    "page_images",
     "artifacts",
     "missing",
 )
 _PARAM_KEYS = ("dpi", "vision_dpi", "max_render_pixels", "workers")
 _MISSING_ARTIFACTS = ("bands", "figure", "page_image")
+# Where a page image came from: the document's own (its loaders), or the bundle's render at dpi.
+_ORIGINS = ("document", "render")
 
 
 class _Artifact(NamedTuple):
@@ -187,13 +222,15 @@ class _Missing(NamedTuple):
     reason: str
 
 
-class _Render(NamedTuple):
-    """A page's render, written: its PageImage's facts and relative paths."""
+class _Written(NamedTuple):
+    """A page image, written: where it came from, its PageImage's facts and relative paths."""
 
     page_number: int
-    dpi: int
+    origin: str
+    dpi: float
     width_px: int
     height_px: int
+    contrast_normalized: bool
     image: str
     bands: tuple[str, ...]
 
@@ -201,7 +238,7 @@ class _Render(NamedTuple):
 class _PageOutcome(NamedTuple):
     """What one page's render task wrote, and what it could not."""
 
-    render: _Render | None
+    written: _Written | None
     artifacts: tuple[_Artifact, ...]
     missing: tuple[_Missing, ...]
 
@@ -249,27 +286,32 @@ def write_bundle(
     vision_dpi: int = 300,
     max_render_pixels: int = 16_000_000,
     workers: int = 1,
+    extraction_params: Mapping[str, object] | None = None,
 ) -> PDFDocument:
     """Write ``document``, extracted from ``source``, as a bundle at ``output_dir``, atomically.
 
     See the module notes for the layout, the checks, the atomic write, the
     chunks and the failures recorded. ``password`` opens ``source`` for the
-    renders.
+    renders. ``extraction_params`` are the document's other extraction
+    parameters (``ocr``, ``min_image_dimension``, ``strict``: what A7b's
+    ``PDFWriter`` extracted with), recorded in the manifest after the
+    writer's own (see :func:`_checked_params`).
 
     Returns:
         ``document`` with paths set (see the module notes).
 
     Raises:
         TypeError, ValueError: If an option is invalid (as ``PipelineOptions``
-            raises it), ``document`` is not a PDFDocument, ``output_dir`` or
-            ``source`` is not a path, or ``source`` does not hash to the
-            document's sha256.
+            raises it), an extraction parameter is (:func:`_checked_params`),
+            ``document`` is not a PDFDocument, ``output_dir`` or ``source`` is
+            not a path, or ``source`` does not hash to the document's sha256.
         FileExistsError: If ``output_dir`` exists and is not an empty
             directory (a symlink is refused too), before or after the write.
         FileNotFoundError: If ``source`` or ``output_dir``'s parent is missing.
         OSError: If a file cannot be written, or the rename fails.
     """
     options = PipelineOptions(workers=workers, dpi=dpi, vision_dpi=vision_dpi, max_render_pixels=max_render_pixels)
+    params = _checked_params(options, extraction_params)
     if not isinstance(document, PDFDocument):
         raise TypeError(f"document must be a PDFDocument, got {type(document).__name__}")
     target = _checked_target(output_dir)
@@ -278,13 +320,49 @@ def write_bundle(
     staging = target.parent / f"{_STAGING_PREFIX}{uuid.uuid4().hex}"
     staging.mkdir()
     try:
-        written = _staged(document, staging, target, pdf, options)
+        written = _staged(document, staging, target, pdf, options, params)
         _refuse_existing(target)
         os.replace(staging, target)
     except BaseException:
         shutil.rmtree(staging)
         raise
     return written
+
+
+def _checked_params(options: PipelineOptions, extra: object) -> dict[str, object]:
+    """The manifest's ``extraction_params``: the writer's own, then ``extra``'s, each a JSON scalar.
+
+    Raises:
+        TypeError: If ``extra`` is not a Mapping or None, a key is not a str,
+            or a value is not a str, int, float, bool or None.
+        ValueError: If a key is blank or one of the writer's own, or a float
+            is not finite.
+    """
+    params: dict[str, object] = {name: getattr(options, name) for name in _PARAM_KEYS}
+    if extra is None:
+        return params
+    if not isinstance(extra, Mapping):
+        raise TypeError(f"extraction_params must be a Mapping or None, got {type(extra).__name__}")
+    for key, value in extra.items():
+        if not isinstance(key, str):
+            raise TypeError(f"extraction_params keys must be str, got {type(key).__name__}")
+        if not key.strip():
+            raise ValueError(f"extraction_params keys must be non-blank, got {key!r}")
+        if key in _PARAM_KEYS:
+            raise ValueError(f"extraction_params[{key!r}] is write_bundle's own parameter: pass it as {key}=")
+        params[key] = _json_scalar(f"extraction_params[{key!r}]", value)
+    return params
+
+
+def _json_scalar(name: str, value: object) -> object:
+    """``value`` if it is a JSON scalar: a str, int, finite float, bool or None."""
+    if value is None or isinstance(value, (str, int)):
+        return value
+    if not isinstance(value, float):
+        raise TypeError(f"{name} must be a str, int, float, bool or None, got {type(value).__name__}")
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+    return value
 
 
 def _checked_target(output_dir: object) -> Path:
@@ -324,7 +402,12 @@ def _check_source(source: PDFSource, expected: str) -> None:
 
 
 def _staged(
-    document: PDFDocument, staging: Path, target: Path, source: PDFSource, options: PipelineOptions
+    document: PDFDocument,
+    staging: Path,
+    target: Path,
+    source: PDFSource,
+    options: PipelineOptions,
+    params: Mapping[str, object],
 ) -> PDFDocument:
     """Write every artifact, then the manifest, into ``staging``; the document with paths in ``target``."""
     ledger = _Ledger()
@@ -334,7 +417,7 @@ def _staged(
     ledger.artifacts.append(_write_bytes(staging, DOCUMENT_JSON, as_json))
     markdown = utf8_text(_with_paths(document, figures, renders, Path("..")).to_markdown())
     ledger.artifacts.append(_write_bytes(staging, DOCUMENT_MARKDOWN, markdown.encode("utf-8")))
-    _write_bytes(staging, MANIFEST, _manifest(document, options, ledger))
+    _write_bytes(staging, MANIFEST, _manifest(document, params, renders, ledger))
     by_path = {artifact.path: artifact for artifact in ledger.artifacts}
     return _with_readers(_with_paths(document, figures, renders, target), target, by_path)
 
@@ -347,7 +430,7 @@ def _write_figures(document: PDFDocument, staging: Path, ledger: _Ledger) -> dic
         if figure.sha256 in tried:
             continue
         tried.add(figure.sha256)
-        data, why = _figure_png(figure)
+        data, why = _png(figure.read_bytes)
         if data is None:
             reason = f"figure {figure.sha256} was not written: {why}"
             ledger.missing.append(_Missing("figure", figure.page_number, figure.element_id, reason))
@@ -358,10 +441,10 @@ def _write_figures(document: PDFDocument, staging: Path, ledger: _Ledger) -> dic
     return written
 
 
-def _figure_png(figure: Figure) -> tuple[bytes | None, str]:
-    """The figure's PNG bytes, or None and why they cannot be read."""
+def _png(read: Callable[[], bytes]) -> tuple[bytes | None, str]:
+    """The PNG bytes ``read`` returns (a figure's or a page image's), or None and why they cannot be read."""
     try:
-        data = figure.read_bytes()
+        data = read()
     except (DatagruntPDFError, OSError) as exc:
         return None, f"{type(exc).__name__}: {exc}"
     if not data.startswith(_PNG_SIGNATURE):
@@ -382,9 +465,9 @@ def _chunks(page_count: int, workers: int) -> tuple[range, ...]:
 
 def _write_renders(
     document: PDFDocument, staging: Path, source: PDFSource, options: PipelineOptions, ledger: _Ledger
-) -> dict[int, _Render]:
-    """Render and write every page, chunk by chunk on ``workers`` threads; each page's render by number."""
-    renders: dict[int, _Render] = {}
+) -> dict[int, _Written]:
+    """Write every page's image, chunk by chunk on ``workers`` threads; each page image written, by number."""
+    renders: dict[int, _Written] = {}
     pages = document.pages
 
     def task(page: Page) -> _PageOutcome:
@@ -400,15 +483,22 @@ def _write_renders(
     return renders
 
 
-def _record(outcome: _PageOutcome, renders: dict[int, _Render], ledger: _Ledger) -> None:
+def _record(outcome: _PageOutcome, renders: dict[int, _Written], ledger: _Ledger) -> None:
     ledger.artifacts.extend(outcome.artifacts)
     ledger.missing.extend(outcome.missing)
-    if outcome.render is not None:
-        renders[outcome.render.page_number] = outcome.render
+    if outcome.written is not None:
+        renders[outcome.written.page_number] = outcome.written
 
 
 def _page_outcome(page: Page, staging: Path, source: PDFSource, options: PipelineOptions) -> _PageOutcome:
-    """Render the page (and a vision page's bands) and write their PNGs; a refusal or failure is recorded."""
+    """Write the page's own image and bands when it has one, else render it at ``dpi``; a failure is recorded."""
+    if page.page_image is not None:
+        return _own_outcome(page.page_image, staging)
+    return _rendered_outcome(page, staging, source, options)
+
+
+def _rendered_outcome(page: Page, staging: Path, source: PDFSource, options: PipelineOptions) -> _PageOutcome:
+    """Render the page at ``dpi`` and write its PNG (no bands); a refusal or failure is recorded."""
     number = page.page_number
     try:
         dpi, drawn = _drawn(source, page, options.dpi, options.max_render_pixels)
@@ -416,31 +506,43 @@ def _page_outcome(page: Page, staging: Path, source: PDFSource, options: Pipelin
         reason = f"the page was not rendered: {type(exc).__name__}: {exc}"
         return _PageOutcome(None, (), (_Missing("page_image", number, None, reason),))
     image = f"page_images/page_{number:04d}.png"
-    width, height = drawn.px_width, drawn.px_height
-    artifacts = [_write_png(staging, image, drawn)]
-    del drawn  # its pixels are written: they need not outlive the page's bands
-    band_artifacts: tuple[_Artifact, ...] = ()
-    missing: tuple[_Missing, ...] = ()
-    if page.route == "vision":
-        band_artifacts, missing = _write_bands(page, staging, source, options)
-    render = _Render(number, dpi, width, height, image, tuple(item.path for item in band_artifacts))
-    return _PageOutcome(render, (*artifacts, *band_artifacts), missing)
+    artifact = _write_png(staging, image, drawn)
+    written = _Written(number, "render", float(dpi), drawn.px_width, drawn.px_height, False, image, ())
+    return _PageOutcome(written, (artifact,), ())
 
 
-def _write_bands(
-    page: Page, staging: Path, source: PDFSource, options: PipelineOptions
-) -> tuple[tuple[_Artifact, ...], tuple[_Missing, ...]]:
-    """Render the vision page at the vision DPI, normalize it, cut it into bands and write them."""
-    number = page.page_number
+def _own_outcome(image: PageImage, staging: Path) -> _PageOutcome:
+    """Write the page's own image and bands (A5b's vision render) through its loaders, as they are."""
+    number = image.page_number
+    data, why = _png(image.read_bytes)
+    if data is None:
+        reason = f"the page's own image was not written: {why}"
+        return _PageOutcome(None, (), (_Missing("page_image", number, None, reason),))
+    path = f"page_images/page_{number:04d}.png"
+    artifact = _write_bytes(staging, path, data)
+    del data  # written: it need not outlive the page's bands
+    band_artifacts, missing = _own_bands(image, staging)
+    bands = tuple(item.path for item in band_artifacts)
+    facts = (image.dpi, image.width_px, image.height_px, image.contrast_normalized)
+    written = _Written(number, "document", *facts, path, bands)
+    return _PageOutcome(written, (artifact, *band_artifacts), missing)
+
+
+def _own_bands(image: PageImage, staging: Path) -> tuple[tuple[_Artifact, ...], tuple[_Missing, ...]]:
+    """Write the page image's own bands (OCR's righted page), each a PNG; a failure is recorded, no band written."""
+    number = image.page_number
+    why = ""
     try:
-        _dpi, drawn = _drawn(source, page, options.vision_dpi, options.max_render_pixels)
-    except (RenderRefused, RenderFailed) as exc:
-        reason = f"the page's bands were not rendered: {type(exc).__name__}: {exc}"
-        return (), (_Missing("bands", number, None, reason),)
-    cut = bands(normalized(drawn))
-    del drawn
+        cut = image.read_bands()
+    except (DatagruntPDFError, OSError) as exc:
+        cut, why = (), f"{type(exc).__name__}: {exc}"
+    not_png = [index for index, band in enumerate(cut, start=1) if not band.startswith(_PNG_SIGNATURE)]
+    if not_png:
+        why = f"band {not_png[0]}'s bytes are not a PNG"
+    if why:
+        return (), (_Missing("bands", number, None, f"the page's own bands were not written: {why}"),)
     written = tuple(
-        _write_png(staging, f"page_images/bands/page_{number:04d}_band_{index:02d}.png", band)
+        _write_bytes(staging, f"page_images/bands/page_{number:04d}_band_{index:02d}.png", band)
         for index, band in enumerate(cut, start=1)
     )
     return written, ()
@@ -460,7 +562,7 @@ def _drawn(source: PDFSource, page: Page, target_dpi: int, max_pixels: int) -> t
     return dpi, drawn
 
 
-def _write_png(staging: Path, relative: str, image: RenderedPage | Band) -> _Artifact:
+def _write_png(staging: Path, relative: str, image: RenderedPage) -> _Artifact:
     """Write 8-bit grey pixels as a PNG, encoded by Pillow straight into the file."""
     picture = Image.frombytes("L", (image.px_width, image.px_height), image.pixels)
     # Pillow needs only write() of a file object: a cast, not a conversion.
@@ -482,7 +584,7 @@ def _write_stream(staging: Path, relative: str, fill: Callable[[_Sink], object])
 
 
 def _with_paths(
-    document: PDFDocument, figures: Mapping[str, str], renders: Mapping[int, _Render], base: Path
+    document: PDFDocument, figures: Mapping[str, str], renders: Mapping[int, _Written], base: Path
 ) -> PDFDocument:
     """``document`` with its figures' and pages' paths at ``base`` (sections hold the same figures)."""
     pages = tuple(_page_with_paths(page, figures, renders.get(page.page_number), base) for page in document.pages)
@@ -499,21 +601,22 @@ def _with_pages(document: PDFDocument, pages: tuple[Page, ...]) -> PDFDocument:
     return dataclasses.replace(document, pages=pages, sections=sections)
 
 
-def _page_with_paths(page: Page, figures: Mapping[str, str], render: _Render | None, base: Path) -> Page:
+def _page_with_paths(page: Page, figures: Mapping[str, str], written: _Written | None, base: Path) -> Page:
+    """The page with its figures' paths and the page image written (None if none was), its paths at ``base``."""
     elements = tuple(
         _figure_with_path(element, figures, base) if isinstance(element, Figure) else element
         for element in page.elements
     )
     image = None
-    if render is not None:
+    if written is not None:
         image = PageImage(
-            page_number=render.page_number,
-            dpi=float(render.dpi),
-            width_px=render.width_px,
-            height_px=render.height_px,
-            image_path=_joined(base, render.image),
-            band_paths=tuple(_joined(base, band) for band in render.bands),
-            contrast_normalized=False,
+            page_number=written.page_number,
+            dpi=written.dpi,
+            width_px=written.width_px,
+            height_px=written.height_px,
+            image_path=_joined(base, written.image),
+            band_paths=tuple(_joined(base, band) for band in written.bands),
+            contrast_normalized=written.contrast_normalized,
         )
     return dataclasses.replace(page, elements=elements, page_image=image)
 
@@ -535,24 +638,35 @@ def _missing_order(entry: _Missing) -> tuple[int, str, str]:
     return entry.page_number, entry.artifact, entry.element_id or ""
 
 
-def _manifest(document: PDFDocument, options: PipelineOptions, ledger: _Ledger) -> bytes:
+def _manifest(
+    document: PDFDocument, params: Mapping[str, object], renders: Mapping[int, _Written], ledger: _Ledger
+) -> bytes:
     """The manifest's bytes: ASCII JSON (see the module notes)."""
+    images = [
+        {"page_number": n, "origin": w.origin, "dpi": w.dpi, "contrast_normalized": w.contrast_normalized}
+        for n, w in sorted(renders.items())
+    ]
     data = {
         "bundle_format_version": BUNDLE_FORMAT_VERSION,
         "datagrunt_version": _datagrunt_version(),
         "source_sha256": document.metadata.sha256,
-        "extraction_params": {
-            "dpi": options.dpi,
-            "vision_dpi": options.vision_dpi,
-            "max_render_pixels": options.max_render_pixels,
-            "workers": options.workers,
-        },
+        "extraction_params": dict(params),
         "integrity_verified": document.integrity_verified,
         "degraded_pages": list(document.degraded_pages),
+        "page_images": images,
         "artifacts": [entry._asdict() for entry in sorted(ledger.artifacts)],
         "missing": [entry._asdict() for entry in sorted(ledger.missing, key=_missing_order)],
     }
     return json.dumps(data, ensure_ascii=True, allow_nan=False, indent=2).encode("ascii")
+
+
+class _ImageEntry(NamedTuple):
+    """A manifest's record of one page image: where it came from, its DPI and normalization."""
+
+    page_number: int
+    origin: str
+    dpi: float
+    contrast_normalized: bool
 
 
 class _Manifest(NamedTuple):
@@ -561,6 +675,7 @@ class _Manifest(NamedTuple):
     source_sha256: str
     integrity_verified: bool
     degraded_pages: tuple[int, ...]
+    page_images: tuple[_ImageEntry, ...]
     artifacts: tuple[_Artifact, ...]
     missing: tuple[_Missing, ...]
 
@@ -593,7 +708,9 @@ def load_bundle(path: str | os.PathLike[str]) -> PDFDocument:
     by_path = {entry.path: entry for entry in manifest.artifacts}
     _check_facts(document, manifest)
     _check_paths(document, set(by_path), root)
-    _check_missing(document, manifest.missing)
+    _check_page_images(document, manifest.page_images)
+    origins = {entry.page_number: entry.origin for entry in manifest.page_images}
+    _check_missing(document, manifest.missing, origins)
     return _with_readers(document, root, by_path)
 
 
@@ -639,16 +756,50 @@ def _manifest_of(data: object, root: Path) -> _Manifest:
         message = f"bundle_format_version {version!r} is not supported: this datagrunt reads {BUNDLE_FORMAT_VERSION!r}"
         raise ValueError(message)
     non_blank_str("datagrunt_version", top["datagrunt_version"])
-    PipelineOptions(**_object("extraction_params", top["extraction_params"], _PARAM_KEYS))
+    _check_params(top["extraction_params"])
     pages = enumerate(_array("degraded_pages", top["degraded_pages"]))
     missing = enumerate(_array("missing", top["missing"]))
     return _Manifest(
         source_sha256=sha256_hex("source_sha256", top["source_sha256"]),
         integrity_verified=strict_bool("integrity_verified", top["integrity_verified"]),
         degraded_pages=tuple(int_at_least(f"degraded_pages[{i}]", page, 1) for i, page in pages),
+        page_images=_image_entries(top["page_images"]),
         artifacts=_listed_artifacts(top["artifacts"], root),
         missing=tuple(_missing_entry(f"missing[{i}]", item) for i, item in missing),
     )
+
+
+def _check_params(value: object) -> None:
+    """The writer's own parameters, as ``PipelineOptions`` checks them, then any other as a JSON scalar."""
+    if not isinstance(value, dict):
+        raise TypeError(f"extraction_params must be a JSON object, got {type(value).__name__}")
+    missing = [key for key in _PARAM_KEYS if key not in value]
+    if missing:
+        raise ValueError(f"extraction_params has missing key(s) {missing}")
+    PipelineOptions(**{key: value[key] for key in _PARAM_KEYS})
+    for key, item in value.items():
+        if key not in _PARAM_KEYS:
+            _json_scalar(f"extraction_params[{key!r}]", item)
+
+
+def _image_entries(value: object) -> tuple[_ImageEntry, ...]:
+    """The manifest's page images: each checked, each page once."""
+    entries: list[_ImageEntry] = []
+    seen: set[int] = set()
+    for index, item in enumerate(_array("page_images", value)):
+        name = f"page_images[{index}]"
+        data = _object(name, item, _ImageEntry._fields)
+        entry = _ImageEntry(
+            page_number=int_at_least(f"{name}.page_number", data["page_number"], 1),
+            origin=choice_str(f"{name}.origin", data["origin"], _ORIGINS),
+            dpi=positive_float(f"{name}.dpi", data["dpi"]),
+            contrast_normalized=strict_bool(f"{name}.contrast_normalized", data["contrast_normalized"]),
+        )
+        if entry.page_number in seen:
+            raise ValueError(f"page_images lists page {entry.page_number} twice")
+        seen.add(entry.page_number)
+        entries.append(entry)
+    return tuple(entries)
 
 
 def _listed_artifacts(value: object, root: Path) -> tuple[_Artifact, ...]:
@@ -850,14 +1001,40 @@ def _check_paths(document: PDFDocument, listed: set[str], root: Path) -> None:
             raise BundleCorruptError(f"{DOCUMENT_JSON}: {relative!r} is not an artifact the manifest lists")
 
 
-def _unwritten(document: PDFDocument) -> set[tuple[str, int, str | None]]:
-    """What the document lacks, as missing entries' keys: page images, vision bands, figures (by first figure)."""
+def _check_page_images(document: PDFDocument, entries: tuple[_ImageEntry, ...]) -> None:
+    """The manifest's page images must be the document's: the same pages, DPI and normalization; no rendered bands."""
+    listed = {entry.page_number: entry for entry in entries}
+    imaged = {page.page_number: page.page_image for page in document.pages if page.page_image is not None}
+    unlisted, absent = sorted(set(imaged) - set(listed)), sorted(set(listed) - set(imaged))
+    if unlisted:
+        raise BundleCorruptError(f"{MANIFEST}: page_images: pages {unlisted} have an image the manifest does not list")
+    if absent:
+        raise BundleCorruptError(
+            f"{MANIFEST}: page_images: pages {absent} are listed but have no image in the document"
+        )
+    for number, image in imaged.items():
+        entry = listed[number]
+        if (entry.dpi, entry.contrast_normalized) != (image.dpi, image.contrast_normalized):
+            mine = f"dpi {entry.dpi}, contrast_normalized {entry.contrast_normalized}"
+            theirs = f"dpi {image.dpi}, contrast_normalized {image.contrast_normalized}"
+            raise BundleCorruptError(f"{MANIFEST}: page_images: page {number} is {mine}; the document's is {theirs}")
+        if entry.origin == "render" and image.band_paths:
+            message = f"page_images: page {number} was rendered by the bundle, which writes no bands"
+            raise BundleCorruptError(f"{MANIFEST}: {message}")
+
+
+def _unwritten(document: PDFDocument, origins: Mapping[int, str]) -> set[tuple[str, int, str | None]]:
+    """What the document lacks, as missing entries' keys: page images, own bands, figures (by first figure).
+
+    Only a page's own image (origin ``"document"``) has bands to lack: the
+    bundle's render has none.
+    """
     keys: set[tuple[str, int, str | None]] = set()
     for page in document.pages:
         image = page.page_image
         if image is None:
             keys.add(("page_image", page.page_number, None))
-        elif page.route == "vision" and not image.band_paths:
+        elif origins.get(page.page_number) == "document" and not image.band_paths:
             keys.add(("bands", page.page_number, None))
     first: dict[str, Figure] = {}
     for figure in document.figures:
@@ -871,12 +1048,12 @@ def _key_order(key: tuple[str, int, str | None]) -> tuple[str, int, str]:
     return key[0], key[1], key[2] or ""
 
 
-def _check_missing(document: PDFDocument, missing: tuple[_Missing, ...]) -> None:
+def _check_missing(document: PDFDocument, missing: tuple[_Missing, ...], origins: Mapping[int, str]) -> None:
     """The manifest's missing entries must be exactly what the document lacks, each once."""
     recorded = {(entry.artifact, entry.page_number, entry.element_id) for entry in missing}
     if len(recorded) != len(missing):
         raise BundleCorruptError(f"{MANIFEST}: missing lists an artifact twice")
-    expected = _unwritten(document)
+    expected = _unwritten(document, origins)
     unrecorded, stale = expected - recorded, recorded - expected
     if unrecorded or stale:
         raise BundleCorruptError(

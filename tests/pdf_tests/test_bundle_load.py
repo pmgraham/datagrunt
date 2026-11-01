@@ -23,7 +23,7 @@ from datagrunt.pdf.bundle import load_bundle
 from datagrunt.pdf.exceptions import BundleCorruptError, DatagruntPDFError
 from pdf_tests.builders import PageSpec, TextRun, build_pdf
 from pdf_tests.documents import FIGURE_A_SHA, FIGURE_B_SHA, metadata, surrogate_document
-from pdf_tests.test_bundle import PNG_A, PNG_B, bound_document, fake_render, sha_of, source_pdf, write
+from pdf_tests.test_bundle import OWN_BANDS, PNG_A, PNG_B, bound_document, fake_render, sha_of, source_pdf, write
 
 A_PNG = f"images/{FIGURE_A_SHA}.png"
 
@@ -109,8 +109,12 @@ class TestRoundTrip:
         for mine, theirs in zip(loaded.pages, written.returned.pages):
             assert mine.page_image.read_bytes() == theirs.page_image.read_bytes()
             assert mine.page_image.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
-        for page in loaded.pages[2:]:
-            assert len(page.page_image.read_bands()) == 2
+        assert loaded.pages[2].page_image.read_bands() == OWN_BANDS
+        assert [page.page_image.band_paths for page in (loaded.pages[0], loaded.pages[1], loaded.pages[3])] == [
+            (),
+            (),
+            (),
+        ]
 
     def test_sections_hold_the_pages_figures(self, written):
         loaded = load_bundle(written.out)
@@ -155,7 +159,7 @@ class TestChecksums:
         "markdown/document.md",
         A_PNG,
         "page_images/page_0001.png",
-        "page_images/bands/page_0004_band_02.png",
+        "page_images/bands/page_0003_band_02.png",
     ]
 
     @pytest.mark.parametrize("path", ARTIFACTS)
@@ -334,6 +338,17 @@ class TestManifest:
             (lambda d: d["extraction_params"].update(dpi=10), "dpi must be >= 36"),
             (lambda d: d["extraction_params"].update(workers=True), "workers must be an int"),
             (lambda d: d["extraction_params"].pop("workers"), r"missing key\(s\) \['workers'\]"),
+            (lambda d: d["extraction_params"].update(ocr=["always"]), r"extraction_params\['ocr'\] must be a str"),
+            (lambda d: d.update(extraction_params=[]), "extraction_params must be a JSON object, got list"),
+            (lambda d: d.update(page_images={}), "page_images must be a JSON array"),
+            (lambda d: d["page_images"][0].update(origin="vlm"), r"page_images\[0\]\.origin must be"),
+            (lambda d: d["page_images"][0].update(dpi=0), r"page_images\[0\]\.dpi must be > 0"),
+            (
+                lambda d: d["page_images"][0].update(contrast_normalized=1),
+                r"page_images\[0\]\.contrast_normalized must",
+            ),
+            (lambda d: d["page_images"][0].update(surprise=1), r"page_images\[0\] has unknown key"),
+            (lambda d: d["page_images"].append(dict(d["page_images"][0])), "page_images lists page 1 twice"),
             (lambda d: d.update(integrity_verified=0), "integrity_verified must be a bool"),
             (lambda d: d.update(degraded_pages="3,4"), "degraded_pages must be a JSON array"),
             (lambda d: d.update(degraded_pages=[0]), r"degraded_pages\[0\] must be >= 1"),
@@ -408,6 +423,9 @@ class TestDocumentAgainstManifest:
 
     def test_a_page_without_its_image_needs_a_missing_entry(self, copy):
         edit_document_json(copy, lambda data: data["pages"][1].update(page_image=None))
+        with pytest.raises(BundleCorruptError, match=r"page_images: pages \[2\] are listed but have no image"):
+            load_bundle(copy)
+        edit_manifest(copy, lambda data: data["page_images"].pop(1))
         with pytest.raises(BundleCorruptError, match=r"unrecorded: \[\('page_image', 2, None\)\]"):
             load_bundle(copy)
 
@@ -431,6 +449,48 @@ class TestDocumentAgainstManifest:
         edit_manifest(tmp_path / "out", lambda data: data["missing"].append(dict(data["missing"][0])))
         with pytest.raises(BundleCorruptError, match="missing lists an artifact twice"):
             load_bundle(tmp_path / "out")
+
+    def test_extra_extraction_params_load(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(bundle, "render_page", fake_render)
+        source = source_pdf(tmp_path)
+        returned = write(bound_document(source), tmp_path / "out", source, extraction_params={"ocr": "auto"})
+        assert load_bundle(tmp_path / "out") == returned
+
+    @pytest.mark.parametrize(
+        ("change", "message"),
+        [
+            (
+                lambda d: d["page_images"][2].update(dpi=72.0),
+                r"page_images: page 3 is .*dpi 72\.0.*the document's .*150\.5",
+            ),
+            (
+                lambda d: d["page_images"][2].update(contrast_normalized=False),
+                r"page_images: page 3 is .*the document's",
+            ),
+            (lambda d: d["page_images"].pop(3), r"page_images: pages \[4\] have an image the manifest does not list"),
+            (
+                lambda d: d["page_images"][0].update(origin="document"),
+                r"its missing artifacts are not the document's; unrecorded: \[\('bands', 1, None\)\]",
+            ),
+        ],
+    )
+    def test_the_page_images_must_be_the_documents(self, copy, change, message):
+        edit_manifest(copy, change)
+        with pytest.raises(BundleCorruptError, match=rf"manifest\.json: {message}"):
+            load_bundle(copy)
+
+    def test_a_rendered_page_image_with_bands_is_refused(self, copy):
+        shutil.copy(copy / "page_images" / "bands" / "page_0003_band_01.png", copy / "page_images" / "extra_band.png")
+        edit_document_json(
+            copy, lambda data: data["pages"][0]["page_image"].update(band_paths=["page_images/extra_band.png"])
+        )
+        entry = {"path": "page_images/extra_band.png", "size": 0, "sha256": "0" * 64}
+        edit_manifest(copy, lambda data: data["artifacts"].append(entry))
+        resigned(copy, "page_images/extra_band.png")
+        with pytest.raises(
+            BundleCorruptError, match=r"page_images: page 1 was rendered by the bundle, which writes no bands"
+        ):
+            load_bundle(copy)
 
     def test_a_missing_entry_for_what_is_there_is_refused(self, copy):
         stale = {"artifact": "page_image", "page_number": 1, "element_id": None, "reason": "not rendered"}
@@ -488,9 +548,7 @@ class TestReadTime:
     def test_an_untouched_bundle_reads_its_bytes(self, copy):
         loaded = load_bundle(copy)
         assert loaded.figures[0].read_bytes() == PNG_A
-        assert loaded.pages[3].page_image.read_bands() == tuple(
-            path.read_bytes() for path in loaded.pages[3].page_image.band_paths
-        )
+        assert loaded.pages[2].page_image.read_bands() == OWN_BANDS
 
     def test_paths_are_kept_for_information(self, copy):
         loaded = load_bundle(copy)
@@ -551,13 +609,13 @@ class TestReadTime:
 
     def test_a_band_replaced_by_a_symlink_is_refused(self, copy):
         loaded = load_bundle(copy)
-        band = copy / "page_images" / "bands" / "page_0004_band_01.png"
+        band = copy / "page_images" / "bands" / "page_0003_band_01.png"
         outside = copy.parent / "band.png"
         outside.write_bytes(band.read_bytes())
         band.unlink()
         band.symlink_to(outside)
-        with pytest.raises(BundleCorruptError, match="page_0004_band_01.png: .*resolves outside"):
-            loaded.pages[3].page_image.read_bands()
+        with pytest.raises(BundleCorruptError, match="page_0003_band_01.png: .*resolves outside"):
+            loaded.pages[2].page_image.read_bands()
 
     def test_a_deleted_artifact_is_refused_at_read(self, copy):
         loaded = load_bundle(copy)
