@@ -505,7 +505,7 @@ class TestAssemblePage:
         assert (ruled.extraction_method, ruled.headers, ruled.rows) == ("lattice", SPEC[0], SPEC[1:])
         assert ruled.column_centres == pytest.approx((100.0, 200.0, 300.0))
 
-    def test_a_borderless_table_is_a_stream_table_with_its_band_centres(self, tmp_path):
+    def test_a_borderless_table_is_a_stream_table_with_its_columns_alignment_edges(self, tmp_path):
         path = letter(tmp_path, *mixed_items())
         raw, assessment, lattice = inputs(path)
         geometry = raw.geometry
