@@ -569,6 +569,26 @@ class TestAssemblePage:
         )
 
 
+class TestFormHeaders:
+    """A form header of Key: Value cells in two columns reads as key-values, so A6 takes it as header context."""
+
+    def test_a_two_column_key_value_header_is_header_context(self, tmp_path):
+        header = (
+            TextRun("Invoice: 10442", 72.0, 100.0, size=10.0),
+            TextRun("Date: 2024-03-01", 300.0, 100.0, size=10.0),
+            TextRun("Terms: 30 days", 72.0, 114.0, size=10.0),
+            TextRun("Due: 2024-03-31", 300.0, 114.0, size=10.0),
+        )
+        rows = (("Part", "Qty", "Price"), ("Bolt", "4", "0.10"), ("Nut", "12", "0.05"))
+
+        page = assembled(letter(tmp_path, *header, *body_text(150.0), *table_runs(rows, top=200.0)))
+
+        pairs = [("Invoice", "10442"), ("Date", "2024-03-01"), ("Terms", "30 days"), ("Due", "2024-03-31")]
+        assert kinds(page) == ["KeyValue"] * 4 + ["Paragraph", "Table"]
+        assert [(pair.key, pair.value) for pair in apply_scope((page,)).header_context] == pairs
+        assert page.integrity_verified is True
+
+
 class TestAssemblePageWarnings:
     """Warnings are carried from A2, A3 and A4a, then the page's own."""
 

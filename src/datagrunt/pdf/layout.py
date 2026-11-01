@@ -2113,7 +2113,8 @@ def stream_layout(
        lines of 2 or more cells whose cells keep to consistent X-bands
        (:func:`_aligned_runs`) is, by the first rule it meets, a list of
        key-value pairs (every line a key cell ending in a colon and a
-       value cell), a masthead (fewer than :data:`_MASTHEAD_ROWS` lines and
+       value cell), pairs in columns (every cell ``Key: Value``: a pair
+       per cell), a masthead (fewer than :data:`_MASTHEAD_ROWS` lines and
        its widest gap between columns over :data:`_MASTHEAD_GAP` of the
        page along them: a pair or paragraph per cell), prose (left to step
        3), or a :class:`StreamTable`, unless its columns are page columns
@@ -2316,9 +2317,16 @@ def _fit(starts: list[float], ends: list[float], spans: list[tuple[float, float]
 
 
 def _row_structure(rows: list[TextLine], starts: list[float], ends: list[float], extent: float) -> _Rows | None:
-    """A run's lines as a key-value list, a masthead, or a table; None for prose (:func:`stream_layout`, step 2)."""
+    """A run's lines as key-value pairs, a masthead, or a table; None for prose (:func:`stream_layout`, step 2).
+
+    Pairs come first: a key-value list (each line a key cell and a value
+    cell), or rows whose every cell is ``Key: Value`` (a form's header in
+    columns: one pair per cell, row by row, whatever the gap or row count).
+    """
     if all(len(item.cells) == _MIN_GRID and _is_key(item.cells[0].text) for item in rows):
         return _Rows(tuple(rows), tuple(_pair_or_paragraph(_key_value(item.text), [item]) for item in rows))
+    if all(_is_pair(found.text) for item in rows for found in item.cells):
+        return _Rows(tuple(rows), tuple(_cell_item(found) for item in rows for found in item.cells))
     gap = max(start - end for end, start in zip(ends, starts[1:]))
     if len(rows) < _MASTHEAD_ROWS and gap > _MASTHEAD_GAP * extent:
         return _Rows(tuple(rows), tuple(_cell_item(found) for item in rows for found in item.cells))
@@ -2332,6 +2340,12 @@ def _is_key(text: str) -> bool:
     """True if ``text`` is a key and its colon, nothing after: ``Weight:``."""
     parsed = _key_value(text)
     return parsed is not None and not parsed[1]
+
+
+def _is_pair(text: str) -> bool:
+    """True if ``text`` is a key, its colon and a value: ``Invoice: 10442``."""
+    parsed = _key_value(text)
+    return parsed is not None and bool(parsed[1])
 
 
 def _cell_item(found: TextCell) -> StreamKeyValue | StreamParagraph:

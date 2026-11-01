@@ -261,6 +261,48 @@ class TestRejections:
             ("paragraph", PARA),
         ]
 
+    @pytest.mark.parametrize("rows", [2, 3, 5], ids=["2-rows", "3-rows", "5-rows"])
+    def test_rows_of_key_value_cells_are_pairs_whatever_the_gap_or_row_count(self, rows):
+        # A two-column form header ("Invoice: 10442 | Date: 2024-03-01"): A6 reads such pairs as header context.
+        keys = (("Invoice", "10442"), ("Date", "2024-03-01"), ("Terms", "30 days"), ("Due", "2024-03-31"))
+        keys += (("Ref", "A-7"), ("Rep", "J. Doe"), ("Ship", "road"), ("Via", "Leith"), ("PO", "991"), ("Desk", "4"))
+        cells = keys[: 2 * rows]
+        pieces = tuple(
+            chars(f"{key}: {value}", 10.0 + 150.0 * (at % 2), 10.0 + 14.0 * (at // 2))
+            for at, (key, value) in enumerate(cells)
+        )
+
+        assert described(stream_layout(pieces, NO_TABLES, width_pt=612.0, height_pt=792.0)) == [
+            ("key_value", key, value) for key, value in cells
+        ]
+
+    @pytest.mark.parametrize(
+        "rows",
+        [
+            pytest.param((("Name: Bolt", "4"), ("Size: M12", "12")), id="values"),
+            pytest.param((("Name: Bolt", "Size:"), ("Name: Nut", "Size:")), id="keys-with-no-value"),
+        ],
+    )
+    def test_rows_where_only_some_cells_are_pairs_are_a_table(self, rows):
+        pieces = tuple(
+            chars(text, 10.0 + 150.0 * col, 10.0 + 14.0 * row)
+            for row, cells in enumerate(rows)
+            for col, text in enumerate(cells)
+        )
+
+        assert described(stream_layout(pieces, NO_TABLES, width_pt=612.0, height_pt=792.0)) == [("table", rows, True)]
+
+    def test_times_are_no_keys(self):
+        # _KEY_END asks whitespace or the end after the colon: "10:30" holds no key.
+        rows = (("10:30", "11:45"), ("12:00", "13:15"))
+        pieces = tuple(
+            chars(text, 10.0 + 150.0 * col, 10.0 + 14.0 * row)
+            for row, cells in enumerate(rows)
+            for col, text in enumerate(cells)
+        )
+
+        assert described(stream_layout(pieces, NO_TABLES, width_pt=612.0, height_pt=792.0)) == [("table", rows, True)]
+
     def test_a_masthead_never_heads_its_page(self, tmp_path):
         # Bold and larger than the body, its cells would be headings as text; a masthead is pairs or paragraphs.
         _, runs = masthead(tmp_path, 1.0, font="Helvetica-Bold", size=13.0)
