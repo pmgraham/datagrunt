@@ -85,8 +85,11 @@ pieces, then the recovered pieces (their own reasons first), before the
 duplicate check, then routes, measures and warns: flagged text leaves the
 routing count, the unmapped regions and the duplicate check's visible
 twins, as text with any other reason does. A page that could not be drawn
-is assessed with why (a str): nothing is flagged, and it warns
-``background not checked: ...``.
+(its render refused or failed) is assessed with why (a str) and fails
+closed: each visible piece the gate selects (see :func:`needs_background`)
+is flagged ``unchecked_background``, in the same place in that order, and
+the page warns ``background not checked: ...``. Pieces the gate does not
+select stay visible.
 
 :func:`assess_page` measures a page and routes it (#366 task 4):
 
@@ -233,6 +236,7 @@ MATCH_DISTANCE = 4.0
 # A char's box is sampled at most this many pixels along each axis, evenly spaced: a bound on each char's cost.
 MAX_SAMPLES_PER_AXIS = 32
 _MATCHES_BACKGROUND: tuple[HiddenReason, ...] = ("matches_background",)
+_UNCHECKED_BACKGROUND: tuple[HiddenReason, ...] = ("unchecked_background",)
 _BGR_BYTES = 3  # blue, green and red bytes a backdrop pixel
 _WHITE_RGB = (255, 255, 255)  # a page's default background
 
@@ -701,8 +705,9 @@ def assess_page(
             :func:`~datagrunt.pdf.pdfium_engine.recover_dropped_text` returns
             it, or None for none.
         background: The page drawn without its text (a :class:`Backdrop`),
-            why it could not be drawn (a str: a warning, nothing flagged), or
-            None: not checked (the gate did not pass it), no warning.
+            why it could not be drawn (a str: a warning, and each piece the
+            gate selects flagged ``unchecked_background``), or None: not
+            checked (the gate did not pass it), no warning.
 
     Raises:
         TypeError: If ``page`` is not a RawPage, ``ocr`` is not a str,
@@ -726,6 +731,8 @@ def assess_page(
     if isinstance(background, Backdrop):
         scale = _scale(background, width, height)
         pieces, own = _flag_background(pieces, background, scale), _flag_background(own, background, scale)
+    elif background is not None:
+        pieces, own = _flag_unchecked(pieces, page), _flag_unchecked(own, page)
     flagged, unchecked = _duplicates_flagged(own, pieces)
     route, warnings = _route(_text_char_count(pieces), cover, ocr)
     warnings += _recovery_warnings(recovered, page.text.stats.dropped_text_objects)
@@ -768,15 +775,30 @@ def needs_background(page: RawPage, assessment: PageAssessment) -> bool:
         raise TypeError(f"page must be a RawPage, got {type(page).__name__}")
     if not isinstance(assessment, PageAssessment):
         raise TypeError(f"assessment must be a PageAssessment, got {type(assessment).__name__}")
-    painted = tuple(
-        piece
-        for piece in (*assessment.pieces, *assessment.recovered_pieces)
-        if not piece.hidden_reasons and piece.span.render_mode not in _NO_PAINT_MODES
-    )
-    if any(_near(_paint_rgb(piece.span), _WHITE_RGB) for piece in painted):
-        return True
+    return any(_gate_selection((*assessment.pieces, *assessment.recovered_pieces), page))
+
+
+def _gate_selection(pieces: tuple[SpanPiece, ...], page: RawPage) -> tuple[bool, ...]:
+    """For each piece, whether the gate selects it: visible, painting, and near white or over paint."""
     covers = (*_fill_boxes(page.segments.segments), *(image.bbox for image in page.images.images))
-    return any(_overlaps_any(piece.bbox, covers) for piece in painted)
+    return tuple(_gate_selects(piece, covers) for piece in pieces)
+
+
+def _gate_selects(piece: SpanPiece, covers: tuple[Box, ...]) -> bool:
+    """True if the piece is visible, paints (render mode not 3 or 7), and is near white or over a cover."""
+    if piece.hidden_reasons or piece.span.render_mode in _NO_PAINT_MODES:
+        return False
+    return _near(_paint_rgb(piece.span), _WHITE_RGB) or _overlaps_any(piece.bbox, covers)
+
+
+def _flag_unchecked(pieces: tuple[SpanPiece, ...], page: RawPage) -> tuple[SpanPiece, ...]:
+    """``pieces``, each one the gate selects flagged ``unchecked_background``: its background could not be checked."""
+    return tuple(
+        SpanPiece(span=piece.span, start=piece.start, end=piece.end, hidden_reasons=_UNCHECKED_BACKGROUND)
+        if selected
+        else piece
+        for piece, selected in zip(pieces, _gate_selection(pieces, page), strict=True)
+    )
 
 
 def _fill_boxes(segments: tuple[RawSegment, ...]) -> tuple[Box, ...]:
