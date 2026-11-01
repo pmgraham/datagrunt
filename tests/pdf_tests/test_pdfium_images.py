@@ -19,6 +19,7 @@ import re
 import struct
 import subprocess
 import sys
+import time
 import traceback
 import zlib
 from functools import partial
@@ -30,6 +31,7 @@ import pytest
 from PIL import Image
 
 from datagrunt.pdf import BBox, DatagruntPDFError, Figure, PDFCorruptError, PDFEncryptedError, _pdfium_images, elements
+from datagrunt.pdf._image_headers import jpeg_size
 from datagrunt.pdf._path_segments import Matrix, NonFiniteGeometry
 from datagrunt.pdf.pdfium_engine import (
     ImageLoader,
@@ -1442,19 +1444,24 @@ class TestDecodeBounds:
         assert got.stats == stats(oversized=1, cover=DRAWN)
         assert decode_calls == []
 
-    def test_a_jpeg_behind_flate_is_never_decoded(self, tmp_path, monkeypatch, decode_calls):
+    def test_a_jpeg_behind_a_flate_filter_and_another_is_never_decoded(self, tmp_path, monkeypatch, decode_calls):
+        # Only exactly [FlateDecode, DCT or JPX] is inflated (TestFlateWrappedCodestreams); two wrappers are not.
         decoded_reads = []
         monkeypatch.setattr(pdfium_c, "FPDFImageObj_GetImageDataDecoded", lambda *args: decoded_reads.append(args))
-        flated = zlib.compress(jpeg_bytes((16, 8)))
-        entries = b"/Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter [/FlateDecode /DCTDecode]"
-        path = xobject_page(tmp_path, flated, entries)
+        wrapped = base64.a85encode(zlib.compress(jpeg_bytes((16, 8)))) + b"~>"
+        entries = b"/Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 "
+        entries += b"/Filter [/ASCII85Decode /FlateDecode /DCTDecode]"
+        path = xobject_page(tmp_path, wrapped, entries)
 
         got = images_of(path)
 
         (image,) = got.images
-        assert (image.px_width, image.px_height, image.declared_px, image.raw_sha256) == (0, 0, (16, 8), sha(flated))
+        assert (image.px_width, image.px_height, image.declared_px, image.raw_sha256) == (0, 0, (16, 8), sha(wrapped))
         assert got.stats == stats(unsized=1, cover=DRAWN)
-        message = "page 1: object 0 is a DCTDecode stream behind FlateDecode: its size cannot be read without decoding"
+        message = (
+            "page 1: object 0 is a DCTDecode stream behind ASCII85Decode, FlateDecode: "
+            "its size cannot be read without decoding"
+        )
         with pytest.raises(DatagruntPDFError, match=re.escape(message)):
             loader_for(path, image).png_bytes()
         assert (decode_calls, decoded_reads) == ([], [])
@@ -1606,6 +1613,265 @@ class TestDecodeBounds:
 
         assert (image.px_width, image.px_height) == (4, 2)
         assert decoded(only_loader(path).png_bytes()).size == (4, 2)
+
+
+def flate_bomb(mib: int) -> bytes:
+    """A valid zlib stream of ``mib`` MiB of zeros (2 GiB in ~2 MB), built in a blink.
+
+    After a full flush deflate keeps no window, so one MiB compresses to the
+    same block every time: the block is repeated, and the trailer's adler32
+    is computed for the whole.
+    """
+    chunk = bytes(1 << 20)
+    compressor = zlib.compressobj(9)
+    head = compressor.compress(chunk) + compressor.flush(zlib.Z_FULL_FLUSH)
+    block = compressor.compress(chunk) + compressor.flush(zlib.Z_FULL_FLUSH)
+    tail = compressor.flush()
+    adler = 1
+    for _ in range(mib):
+        adler = zlib.adler32(chunk, adler)
+    return head + block * (mib - 1) + tail[:-4] + struct.pack(">I", adler)
+
+
+def jpeg_with_app_padding(padding: int) -> bytes:
+    """A 16 x 8 JPEG whose frame (SOF) follows ``padding`` bytes of APP15 segments of zeros."""
+    jpeg = jpeg_bytes((16, 8))
+    segments = []
+    while padding > 0:
+        body = min(padding, 65533)
+        segments.append(b"\xff\xef" + struct.pack(">H", body + 2) + bytes(body))
+        padding -= body
+    return jpeg[:2] + b"".join(segments) + jpeg[2:]
+
+
+def undifferenced(data: bytes, colors: int) -> bytes:
+    """``data`` with /Predictor 2 undone on one row of 8-bit samples: what pdfium decodes."""
+    out = bytearray(data)
+    for index in range(colors, len(out)):
+        out[index] = (out[index] + out[index - colors]) & 0xFF
+    return bytes(out)
+
+
+def differenced(data: bytes, colors: int) -> bytes:
+    """``data`` with /Predictor 2 applied on one row of 8-bit samples: what a PDF stores."""
+    return bytes(data[i] if i < colors else (data[i] - data[i - colors]) & 0xFF for i in range(len(data)))
+
+
+def predictor_bomb() -> tuple[bytes, bytes]:
+    """A Flate stream and its entries: read without its /Predictor 2 it holds a 16 x 16 JPEG frame; pdfium,
+    which applies the predictor, decodes the 2000 x 2000 frame it hides (observed: a 2000 x 2000 bitmap)."""
+    small_frame = bytes.fromhex("ffd8ffc0000b080010001001011100")
+    real = undifferenced(small_frame, 2) + jpeg_with_frame(2000, 2000)[2:]
+    real += bytes(len(real) % 2)
+    entries = b"/Width 16 /Height 16 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter [/FlateDecode /DCTDecode] "
+    entries += b"/DecodeParms [<< /Predictor 2 /Colors 2 /BitsPerComponent 8 /Columns %d >> null]" % (len(real) // 2)
+    return zlib.compress(differenced(real, 2)), entries
+
+
+FLATE_DCT = b"/Width 16 /Height 8 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter [/FlateDecode /DCTDecode]"
+
+
+@pytest.fixture
+def decoded_reads(monkeypatch):
+    """Every pdfium decoded-stream call (FPDFImageObj_GetImageDataDecoded), passed through to pdfium."""
+    calls = []
+    real = pdfium_c.FPDFImageObj_GetImageDataDecoded
+
+    def recorded(image, buffer, size):
+        calls.append(size)
+        return real(image, buffer, size)
+
+    monkeypatch.setattr(pdfium_c, "FPDFImageObj_GetImageDataDecoded", recorded)
+    return calls
+
+
+class TestFlateWrappedCodestreams:
+    """A DCT or JPX stream behind exactly one FlateDecode is sized from the stream pdfium decodes, verified first.
+
+    zlib inflates it, capped at 1 MiB; only a stream that ends within the cap
+    goes to pdfium, whose decoded stream must then be byte for byte what
+    zlib inflated (pdfium applies a /DecodeParms predictor no API reports).
+    Anything else is unsized: fail closed.
+    """
+
+    def test_a_flate_wrapped_jpeg_is_sized_by_its_frame(self, tmp_path, decoded_reads):
+        jpeg = jpeg_bytes((16, 8))
+        path = xobject_page(tmp_path, zlib.compress(jpeg), FLATE_DCT)
+
+        got = images_of(path)
+
+        (image,) = got.images
+        assert (image.px_width, image.px_height, image.bits_per_pixel, image.colorspace) == (16, 8, 24, "DeviceRGB")
+        assert got.stats == stats(cover=DRAWN)
+        assert decoded_reads == [0, len(jpeg)]  # its size, then the stream: after zlib saw it end
+        assert decoded(loader_for(path, image).png_bytes()).size == (16, 8)
+
+    def test_a_flate_wrapped_jpx_is_sized_by_its_codestream(self, tmp_path):
+        path = xobject_page(tmp_path, zlib.compress(j2k((16, 8))), gray(16, 8, b"[/FlateDecode /JPXDecode]"))
+
+        got = images_of(path)
+
+        (image,) = got.images
+        assert (image.px_width, image.px_height, image.bits_per_pixel, image.colorspace) == (16, 8, None, None)
+        assert got.stats == stats(cover=DRAWN)
+        assert decoded(loader_for(path, image).png_bytes()).size == (16, 8)
+
+    def test_a_flate_wrapped_jpeg_bomb_is_sized_and_refused_before_decoding(self, tmp_path, decode_calls):
+        path = xobject_page(
+            tmp_path, zlib.compress(jpeg_with_frame(26000, 26000)), gray(16, 16, b"[/FlateDecode /DCTDecode]")
+        )
+
+        got = images_of(path)
+
+        assert [(item.px_width, item.px_height) for item in got.images] == [(26000, 26000)]
+        assert got.stats == stats(oversized=1, cover=DRAWN)
+        assert decode_calls == []
+
+    @pytest.mark.parametrize(
+        "data,why",
+        [
+            pytest.param(
+                zlib.compress(jpeg_with_app_padding(1 << 20)),
+                "that does not inflate, whole, within 1048576 bytes",
+                id="frame-past-1-MiB",
+            ),
+            pytest.param(zlib.compress(jpeg_bytes((16, 8)))[:-20], "that does not inflate, whole, within", id="cut"),
+            pytest.param(b"\x78\x9c not a zlib stream", "that does not inflate (Error -3 ", id="corrupt"),
+        ],
+    )
+    def test_a_stream_zlib_cannot_inflate_whole_is_unsized_and_never_passed_to_pdfium(
+        self, tmp_path, decoded_reads, decode_calls, data, why
+    ):
+        path = xobject_page(tmp_path, data, FLATE_DCT)
+
+        got = images_of(path)
+
+        assert [(item.px_width, item.px_height) for item in got.images] == [(0, 0)]
+        assert got.stats == stats(unsized=1, cover=DRAWN)
+        message = f"page 1: object 0 is a DCTDecode stream behind FlateDecode {why}"
+        with pytest.raises(DatagruntPDFError, match=re.escape(message)):
+            only_loader(path).png_bytes()
+        assert (decoded_reads, decode_calls) == ([], [])
+
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_a_flate_bomb_is_unsized_at_once_and_never_passed_to_pdfium(self, tmp_path, decoded_reads, decode_calls):
+        # 2 GiB of zeros in ~2 MB; zlib stops at 1 MiB + 1 byte. The page takes 1.2 ms here (max 2.0 ms in 10 runs).
+        path = xobject_page(tmp_path, flate_bomb(2048), FLATE_DCT)
+
+        began = time.perf_counter()
+        got = images_of(path)
+        elapsed = time.perf_counter() - began
+
+        assert got.stats == stats(unsized=1, cover=DRAWN)
+        assert (decoded_reads, decode_calls) == ([], [])
+        assert elapsed < 1.0
+
+    @pytest.mark.parametrize(
+        "extra,size",
+        [pytest.param(0, (16, 8), id="exactly-1-MiB"), pytest.param(1, (0, 0), id="1-MiB-and-a-byte")],
+    )
+    def test_the_stream_may_inflate_to_exactly_1_mib(self, tmp_path, extra, size):
+        # Bytes after a JPEG's end are not read; pdfium decodes the stream as zlib does.
+        jpeg = jpeg_bytes((16, 8))
+        stream = jpeg + bytes(_pdfium_images._MAX_INFLATED_BYTES - len(jpeg) + extra)
+
+        (image,) = images_of(xobject_page(tmp_path, zlib.compress(stream), FLATE_DCT)).images
+
+        assert (image.px_width, image.px_height) == size
+
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_a_bomb_concatenated_after_the_stream_is_never_inflated(self, tmp_path, decoded_reads):
+        # zlib and pdfium both stop at the first end of stream: pdfium's size query, which decodes, never reaches
+        # the 2 GiB second stream. The page collects in 1.2 ms here (max 1.3 ms in 10 runs).
+        jpeg = jpeg_bytes((16, 8))
+        path = xobject_page(tmp_path, zlib.compress(jpeg) + flate_bomb(2048), FLATE_DCT)
+
+        began = time.perf_counter()
+        got = images_of(path)
+        elapsed = time.perf_counter() - began
+
+        assert [(item.px_width, item.px_height) for item in got.images] == [(16, 8)]
+        assert decoded_reads == [0, len(jpeg)]
+        page = pdfium.PdfDocument(path)[0]  # held: its objects die with it
+        assert pdfium_c.FPDFImageObj_GetImageDataDecoded(pdfium_c.FPDFPage_GetObject(page.raw, 0), None, 0) == len(jpeg)
+        assert elapsed < 1.0
+
+    def test_a_newline_after_the_stream_is_ignored(self, tmp_path):
+        (image,) = images_of(xobject_page(tmp_path, zlib.compress(jpeg_bytes((16, 8))) + b"\n", FLATE_DCT)).images
+
+        assert (image.px_width, image.px_height) == (16, 8)
+
+    def test_a_predictor_that_hides_a_large_frame_is_unsized(self, tmp_path, decode_calls):
+        data, entries = predictor_bomb()
+        path = xobject_page(tmp_path, data, entries)
+        # The trap: zlib's bytes read as a 16 x 16 frame; the bytes pdfium decodes hold 2000 x 2000.
+        assert jpeg_size(zlib.decompress(data))[:2] == (16, 16)
+
+        got = images_of(path)
+
+        assert [(item.px_width, item.px_height) for item in got.images] == [(0, 0)]
+        assert got.stats == stats(unsized=1, cover=DRAWN)
+        message = (
+            "page 1: object 0 is a DCTDecode stream behind FlateDecode that pdfium decodes to other bytes than "
+            "zlib inflates (a /DecodeParms predictor): its size cannot be read without decoding"
+        )
+        with pytest.raises(DatagruntPDFError, match=re.escape(message)):
+            only_loader(path).png_bytes()
+        assert decode_calls == []
+
+    def test_a_png_predictor_in_front_of_a_jpeg_is_unsized(self, tmp_path):
+        jpeg = jpeg_bytes((16, 8))
+        columns = 64
+        jpeg += bytes(-len(jpeg) % columns)
+        rows = [jpeg[start : start + columns] for start in range(0, len(jpeg), columns)]
+        stored = b"".join(b"\x00" + row for row in rows)  # PNG "None" rows: pdfium strips each tag byte
+        entries = FLATE_DCT + b" /DecodeParms [<< /Predictor 12 /Colors 1 /BitsPerComponent 8 /Columns 64 >> null]"
+        path = xobject_page(tmp_path, zlib.compress(stored), entries)
+
+        got = images_of(path)
+
+        assert got.stats == stats(unsized=1, cover=DRAWN)
+        message = f"behind FlateDecode that pdfium decodes to {len(jpeg)} bytes, not the {len(stored)} zlib inflates"
+        with pytest.raises(DatagruntPDFError, match=re.escape(message)):
+            only_loader(path).png_bytes()
+
+    @pytest.mark.parametrize(
+        "query,copy,why",
+        [
+            pytest.param(0, None, "that pdfium decodes to 0 bytes, not the", id="pdfium-cannot-decode"),
+            pytest.param(None, 1, "whose decoded stream pdfium cannot copy", id="pdfium-copy-fails"),
+        ],
+    )
+    def test_a_pdfium_failure_leaves_it_unsized(self, tmp_path, monkeypatch, query, copy, why):
+        path = xobject_page(tmp_path, zlib.compress(jpeg_bytes((16, 8))), FLATE_DCT)
+        real = pdfium_c.FPDFImageObj_GetImageDataDecoded
+
+        def failing(image, buffer, size):
+            done = real(image, buffer, size)
+            return query if not buffer and query is not None else copy if buffer and copy is not None else done
+
+        monkeypatch.setattr(pdfium_c, "FPDFImageObj_GetImageDataDecoded", failing)
+
+        got = images_of(path)
+
+        assert got.stats == stats(unsized=1, cover=DRAWN)
+        assert why in str(pytest.raises(DatagruntPDFError, only_loader(path).png_bytes).value)
+
+    def test_both_inflations_are_charged_to_the_page_budget(self, tmp_path, monkeypatch):
+        jpeg = jpeg_bytes((16, 8))
+        raw = zlib.compress(jpeg)
+        twice = b"q 80 0 0 40 10 20 cm /Im Do Q q 80 0 0 40 100 20 cm /Im Do Q"
+        path = xobject_page(tmp_path, raw, FLATE_DCT, content=twice)
+        # The raw copy, zlib's inflation and pdfium's: the first image spends the budget exactly.
+        monkeypatch.setattr(_pdfium_images, "_MAX_PAGE_STREAM_BYTES", len(raw) + 2 * len(jpeg))
+
+        got = images_of(path)
+
+        assert [(item.px_width, item.px_height) for item in got.images] == [(16, 8), (0, 0)]
+        assert got.stats == stats(over_budget=1, cover=DRAWN)
+
+    def test_the_inflate_bound_is_1_mib(self):
+        assert _pdfium_images._MAX_INFLATED_BYTES == 1 << 20
 
 
 def drawn_times(tmp_path: Path, count: int, data: bytes = FLATE, entries: bytes = RGB_4X2 + b" /Filter /FlateDecode"):

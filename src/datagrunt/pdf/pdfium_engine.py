@@ -93,7 +93,10 @@ Images (#365 T4), pinned by ``tests/pdf_tests/test_pdfium_images.py``:
 - ``FPDFImageObj_GetImageDataRaw``'s length query copies the stream too
   (4 ms against 8 ms for the read of a 200 MB stream).
   ``FPDFImageObj_GetImageDataDecoded`` of ``[/ASCII85Decode /DCTDecode]``
-  (what ReportLab writes for every JPEG) is the JPEG as written.
+  (what ReportLab writes for every JPEG) is the JPEG as written; of
+  ``[/FlateDecode /DCTDecode]`` it is the inflated JPEG with its
+  ``/DecodeParms`` predictor undone (no pdfium API reads /DecodeParms), so a
+  predictor can hide one frame behind another (#369 A5a).
 
 Pages (#365 T5), pinned by ``tests/pdf_tests/test_pdfium_extract_page.py``:
 
@@ -133,6 +136,12 @@ Recovery (#366 task 3), pinned by ``tests/pdf_tests/test_pdfium_recover.py``
 - These edits live in their page load only: a fresh load of the page drops
   the same objects. :func:`recover_dropped_text` loads the page itself and
   saves nothing.
+
+Render guard (#369 A5a), pinned by ``tests/pdf_tests/test_render.py``:
+:func:`image_refusal` walks a loaded page as :func:`page_images` does, its
+walk bounded by an object count and the form depth, and refuses the render
+at the first image A2 would not decode (or could not size), never decoding
+a pixel. :func:`loaded_page` keeps that load open for the render.
 """
 
 import ctypes
@@ -170,13 +179,14 @@ from datagrunt.pdf._pdfium_images import (
     PageImages,
     PixelFacts,
     RawImage,
-    ascii_decoded_stream,
     collect_images,
     declared_size,
     decoded_png,
+    image_outcomes,
     pixel_facts,
     read_filters,
     read_raw_stream,
+    wrapped_codestream,
 )
 from datagrunt.pdf._pdfium_recover import (
     Display,
@@ -211,6 +221,8 @@ __all__ = [
     "SegmentStats",
     "TextStats",
     "extract_page",
+    "image_refusal",
+    "loaded_page",
     "open_document",
     "page_geometry",
     "page_images",
@@ -558,14 +570,31 @@ def _children(
     return children
 
 
-def _page_objects(page_raw: pdfium_c.FPDF_PAGE) -> list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]:
+class WalkBoundHit(Exception):
+    """The render guard's object walk reached a bound: objects past it were not walked.
+
+    The message names the bound, and the form that reached it (if one did).
+    """
+
+
+def _page_objects(
+    page_raw: pdfium_c.FPDF_PAGE, *, max_objects: int | None = None
+) -> list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]:
     """Every page object in depth-first paint order (a form, then its contents).
 
     Each comes with the walk index of the form that holds it, -1 for none.
+    A form nested past ``_MAX_FORM_DEPTH`` is walked but not opened (pdfium
+    parses forms 40 deep, so extraction still reads every object parsed).
+
+    With ``max_objects`` (the render guard's walk, which fails closed)
+    WalkBoundHit is raised rather than passing either bound: when the page
+    and the forms it opens hold more than ``max_objects`` objects (checked on
+    pdfium's counts, before those objects are read), or when a form past the
+    depth bound holds any object.
     """
-    top = _children(
-        pdfium_c.FPDFPage_CountObjects(page_raw), partial(pdfium_c.FPDFPage_GetObject, page_raw), "the page"
-    )
+    count = pdfium_c.FPDFPage_CountObjects(page_raw)
+    total = _counted(0, count, max_objects, "the page holds {count} objects, over the guard's {bound}-object bound")
+    top = _children(count, partial(pdfium_c.FPDFPage_GetObject, page_raw), "the page")
     ordered: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] = []
     stack = [(iter(top), -1)]
     # Bounded: one pass per object and one per form, each from a pdfium count,
@@ -577,11 +606,31 @@ def _page_objects(page_raw: pdfium_c.FPDF_PAGE) -> list[tuple[pdfium_c.FPDF_PAGE
             stack.pop()
             continue
         ordered.append((child, parent))
-        if len(stack) <= _MAX_FORM_DEPTH and pdfium_c.FPDFPageObj_GetType(child) == pdfium_c.FPDF_PAGEOBJ_FORM:
-            count, form_index = pdfium_c.FPDFFormObj_CountObjects(child), len(ordered) - 1
-            owner = f"form object {form_index}"
-            stack.append((iter(_children(count, partial(pdfium_c.FPDFFormObj_GetObject, child), owner)), form_index))
+        if pdfium_c.FPDFPageObj_GetType(child) != pdfium_c.FPDF_PAGEOBJ_FORM:
+            continue
+        form_index, count = len(ordered) - 1, pdfium_c.FPDFFormObj_CountObjects(child)
+        owner = f"form object {form_index}"
+        if len(stack) > _MAX_FORM_DEPTH:
+            if max_objects is not None and count > 0:
+                raise WalkBoundHit(
+                    f"{owner} holds {count} object(s) past the walk's {_MAX_FORM_DEPTH}-form depth bound"
+                )
+            continue
+        over = owner + " holds {count} objects, which take the page over the guard's {bound}-object bound"
+        total = _counted(total, count, max_objects, over)
+        stack.append((iter(_children(count, partial(pdfium_c.FPDFFormObj_GetObject, child), owner)), form_index))
     return ordered
+
+
+def _counted(total: int, count: int, max_objects: int | None, message: str) -> int:
+    """``total`` plus a pdfium ``count`` of objects (a negative count fails in _children, called next).
+
+    Raises WalkBoundHit, with ``message`` formatted, if that passes ``max_objects``.
+    """
+    added = total + count
+    if max_objects is not None and added > max_objects:
+        raise WalkBoundHit(message.format(count=count, bound=max_objects))
+    return added
 
 
 def _text_walk(objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]) -> ObjectWalk:
@@ -781,9 +830,14 @@ def _objects_in_forms(
             yield index, obj, own, outer
 
 
-def _placed_objects(page_raw: pdfium_c.FPDF_PAGE, kind: int) -> Iterator[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix]]:
-    """Each page object of type ``kind`` (not a form) with its walk index and its matrix to page space."""
-    for index, obj, own, outer in _objects_in_forms(_page_objects(page_raw), kind):
+def _placed_objects(
+    page_raw: pdfium_c.FPDF_PAGE, kind: int, *, max_objects: int | None = None
+) -> Iterator[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix]]:
+    """Each page object of type ``kind`` (not a form) with its walk index and its matrix to page space.
+
+    ``max_objects`` bounds the walk as :func:`_page_objects` does.
+    """
+    for index, obj, own, outer in _objects_in_forms(_page_objects(page_raw, max_objects=max_objects), kind):
         yield index, obj, own.then(outer)
 
 
@@ -884,6 +938,74 @@ def page_images(handle: DocumentHandle, index: int) -> PageImages:
         return _read_images(page, _read_geometry(page, page_number))
     finally:
         page.close()
+
+
+@contextmanager
+def loaded_page(handle: DocumentHandle, index: int) -> Iterator[tuple[pdfium.PdfPage, PageGeometry]]:
+    """The page at 0-based ``index``, loaded, with its displayed geometry; the page is closed on leaving.
+
+    For a caller that reads a page and then draws it from the same load (the
+    render guard, then the render: no second load can differ from the
+    first).
+
+    Raises:
+        TypeError: If ``handle`` is not a DocumentHandle, or ``index`` is not
+            an int (bool rejected).
+        ValueError: If ``handle`` is closed.
+        IndexError: If ``index`` is outside ``0..page_count - 1``.
+        PDFCorruptError: If pdfium cannot load the page, or its CropBox and
+            MediaBox leave no visible area (``page_number`` is set).
+    """
+    page, page_number = _load_page(handle, index)
+    try:
+        yield page, _read_geometry(page, page_number)
+    finally:
+        page.close()
+
+
+def image_refusal(page: pdfium.PdfPage, geometry: PageGeometry, *, max_objects: int) -> str | None:
+    """Why the loaded ``page`` must not be rendered, naming the object; None when it may be (#369 A5a).
+
+    The render guard. It walks the page's objects as :func:`page_images`
+    does, forms included, bounded by ``max_objects`` and the form depth bound
+    (see :func:`_page_objects`), and reads each image object's decode facts
+    as :func:`page_images` records them, without decoding a pixel. The first
+    of these, in walk order, is the refusal:
+
+    - the walk reaches either bound;
+    - an image A2 refuses to decode (see :class:`ImageStats`: over the pixel,
+      sample, component or JPEG 2000 tile bound; of a size that cannot be
+      read without decoding, which includes every JBIG2 image, so a JBIG2
+      scan is not rendered until its size can be read (#407); its raw
+      stream over the asset limit, or past the page's stream budget);
+    - an image whose matrix to page space is not finite (its size is never
+      read, so it cannot pass the bounds);
+    - a pdfium call fails while walking or sizing.
+
+    Images the object walk cannot see (soft masks, patterns, Type3 glyph
+    procedures, annotation appearance streams) are not checked: the capped
+    render worker is their bound.
+
+    Raises:
+        TypeError: If ``page`` is not a PdfPage, ``geometry`` not a
+            PageGeometry, or ``max_objects`` not an int (bool rejected).
+        ValueError: If ``max_objects`` is under 1.
+    """
+    if not isinstance(page, pdfium.PdfPage):
+        raise TypeError(f"page must be a pypdfium2 PdfPage, got {type(page).__name__}")
+    if not isinstance(geometry, PageGeometry):
+        raise TypeError(f"geometry must be a PageGeometry, got {type(geometry).__name__}")
+    int_at_least("max_objects", max_objects, 1)
+    placed = _placed_objects(page.raw, pdfium_c.FPDF_PAGEOBJ_IMAGE, max_objects=max_objects)
+    try:
+        for outcome in image_outcomes(placed, page.raw, geometry.page_box, _display_mapping(geometry)):
+            if outcome.refusal is not None:
+                return outcome.refusal[1]
+    except WalkBoundHit as exc:
+        return str(exc)
+    except PdfiumFailure as exc:
+        return f"pdfium cannot {exc}"
+    return None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1188,8 +1310,8 @@ class ImageLoader:
         if actual != self.raw_sha256:
             raise self._changed(f"its raw stream hashes to {actual}, not {self.raw_sha256}")
         filters = read_filters(image, label)
-        decoded = partial(ascii_decoded_stream, image, len(raw), label)
-        facts = pixel_facts(image, page_raw, label, filters, declared_size(image, label), raw, decoded)
+        wrapped = partial(wrapped_codestream, image, filters, raw, label, _uncharged)
+        facts = pixel_facts(image, page_raw, label, filters, declared_size(image, label), raw, wrapped)
         found = _described(filters, facts.px_width, facts.px_height, facts.declared_px, facts, facts.read_metadata)
         expected = _described(
             self.image.filters,
@@ -1207,6 +1329,10 @@ class ImageLoader:
         """The error for a source that no longer holds this image (never naming the password)."""
         where = f"{self.source}: page {self.page_index + 1}, object {self.object_index}"
         return DatagruntPDFError(f"{where} is not the image this loader was made for: the file changed ({detail})")
+
+
+def _uncharged(size: int) -> None:
+    """A loader reads one image: there is no page stream budget to charge ``size`` to."""
 
 
 def _described(
