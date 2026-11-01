@@ -865,14 +865,21 @@ class TestFigureReadBytes:
         path.write_bytes(IMAGE)
         assert _figure(image_path=path).read_bytes() == IMAGE
 
-    def test_file_takes_precedence_over_loader(self, tmp_path):
+    def test_loader_takes_precedence_over_file(self, tmp_path):
+        # A bundle's loaded figure keeps image_path for information; its loader verifies each read.
+        path = tmp_path / "fig.png"
+        path.write_bytes(b"unverified file bytes")
+        assert _figure(image_path=path, _loader=lambda: IMAGE).read_bytes() == IMAGE
+
+    def test_a_failing_loader_is_not_bypassed_by_the_file(self, tmp_path):
         path = tmp_path / "fig.png"
         path.write_bytes(IMAGE)
 
         def loader():
-            raise AssertionError("loader must not be called when image_path is set")
+            raise DatagruntPDFError("the bundle changed")
 
-        assert _figure(image_path=path, _loader=loader).read_bytes() == IMAGE
+        with pytest.raises(DatagruntPDFError, match="the bundle changed"):
+            _figure(image_path=path, _loader=loader).read_bytes()
 
     def test_reads_loader_when_no_path(self):
         assert _figure(_loader=lambda: IMAGE).read_bytes() == IMAGE

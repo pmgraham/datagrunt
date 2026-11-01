@@ -10,7 +10,9 @@ import dataclasses
 import hashlib
 import json
 import os
+import pickle
 import shutil
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -172,6 +174,19 @@ class TestChecksums:
         with pytest.raises(BundleCorruptError, match=f"{path}: it is [0-9]+ bytes, the manifest says [0-9]+"):
             load_bundle(copy)
 
+    def test_a_grown_file_is_refused_by_its_fstat_size_before_it_is_read(self, copy, monkeypatch):
+        size = entry_of(manifest(copy), A_PNG)["size"]
+        with (copy / A_PNG).open("ab") as handle:
+            handle.write(b"\x00" * 1000)
+        read = []
+        real = bundle._read_fd
+        monkeypatch.setattr(
+            bundle, "_read_fd", lambda fd, limit, *, keep: read.append(limit) or real(fd, limit, keep=keep)
+        )
+        with pytest.raises(BundleCorruptError, match=f"{A_PNG}: it is {size + 1000} bytes, the manifest says {size}"):
+            load_bundle(copy)
+        assert size not in read
+
     def test_a_manifest_size_that_disagrees_is_refused(self, copy):
         edit_manifest(copy, lambda data: entry_of(data, A_PNG).update(size=entry_of(data, A_PNG)["size"] - 1))
         with pytest.raises(BundleCorruptError, match=f"{A_PNG}: it is"):
@@ -197,13 +212,41 @@ class TestChecksums:
     def test_a_named_pipe_is_refused_without_opening_it(self, copy):
         (copy / A_PNG).unlink()
         os.mkfifo(copy / A_PNG)
-        with pytest.raises(BundleCorruptError, match="not a regular file"):
+        outcome = calls_without_blocking(lambda: load_bundle(copy))
+        assert isinstance(outcome.get("error"), BundleCorruptError)
+        assert f"{A_PNG}: it is not a regular file" in str(outcome["error"])
+
+    def test_an_artifact_over_the_asset_limit_is_refused_unread(self, copy):
+        edit_manifest(copy, lambda data: entry_of(data, A_PNG).update(size=(1 << 30) + 1))
+        message = rf"manifest\.json: artifacts\[0\] \('{A_PNG}'\): size 1073741825 is over the 1073741824-byte"
+        with pytest.raises(BundleCorruptError, match=message):
             load_bundle(copy)
 
-    def test_an_artifact_over_the_asset_limit_is_refused_unread(self, copy, monkeypatch):
-        size = entry_of(manifest(copy), A_PNG)["size"]
+    def test_a_manifest_over_the_asset_limit_is_refused(self, copy, monkeypatch):
+        size = (copy / "manifest.json").stat().st_size
         monkeypatch.setattr(bundle, "_MAX_ARTIFACT_BYTES", size - 1)
-        with pytest.raises(BundleCorruptError, match=f"over the {size - 1}-byte asset limit"):
+        with pytest.raises(BundleCorruptError, match=f"manifest.json: it is over the {size - 1}-byte asset limit"):
+            load_bundle(copy)
+
+    @pytest.mark.skipif(os.name != "posix" or os.geteuid() == 0, reason="needs file permissions that bind")
+    def test_an_artifact_that_cannot_be_opened_is_refused(self, copy):
+        (copy / A_PNG).chmod(0)
+        try:
+            with pytest.raises(BundleCorruptError, match=f"{A_PNG}: it cannot be opened: .*Permission denied"):
+                load_bundle(copy)
+        finally:
+            (copy / A_PNG).chmod(0o644)
+
+    def test_a_file_that_shrinks_while_it_is_read_is_refused(self, copy, monkeypatch):
+        real = bundle._read_fd
+
+        def short(descriptor, limit, *, keep):
+            total, digest, data = real(descriptor, limit, keep=keep)
+            return total - 1, digest, data
+
+        monkeypatch.setattr(bundle, "_read_fd", short)
+        size = entry_of(manifest(copy), A_PNG)["size"]
+        with pytest.raises(BundleCorruptError, match=f"{A_PNG}: it is {size - 1} bytes, the manifest says {size}"):
             load_bundle(copy)
 
     def test_the_artifact_limit_is_the_asset_limit(self):
@@ -371,6 +414,14 @@ class TestDocumentAgainstManifest:
         with pytest.raises(BundleCorruptError, match=r"unrecorded: \[\('figure', 2, 'p0002_e004'\)\]"):
             load_bundle(copy)
 
+    def test_a_missing_entry_listed_twice_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(bundle, "render_page", lambda *a, **k: (_ for _ in ()).throw(bundle.RenderFailed("no")))
+        source = source_pdf(tmp_path)
+        write(bound_document(source), tmp_path / "out", source)
+        edit_manifest(tmp_path / "out", lambda data: data["missing"].append(dict(data["missing"][0])))
+        with pytest.raises(BundleCorruptError, match="missing lists an artifact twice"):
+            load_bundle(tmp_path / "out")
+
     def test_a_missing_entry_for_what_is_there_is_refused(self, copy):
         stale = {"artifact": "page_image", "page_number": 1, "element_id": None, "reason": "not rendered"}
         edit_manifest(copy, lambda data: data["missing"].append(stale))
@@ -395,3 +446,153 @@ class TestArguments:
     def test_path_must_be_a_path(self):
         with pytest.raises(TypeError, match="path must be a str or os.PathLike, got int"):
             load_bundle(3)
+
+
+def flipped(path: Path) -> None:
+    """Change one byte of the file at ``path`` in place: its size stays, its sha256 does not."""
+    data = bytearray(path.read_bytes())
+    data[len(data) // 2] ^= 0xFF
+    path.write_bytes(bytes(data))
+
+
+def calls_without_blocking(read):
+    """Run ``read`` in a thread: a read that blocks (a named pipe opened for reading) fails the test."""
+    outcome: dict = {}
+
+    def run():
+        try:
+            outcome["value"] = read()
+        except BaseException as exc:  # noqa: BLE001 - handed to the test thread
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout=10.0)
+    assert not thread.is_alive(), "the read blocked"
+    return outcome
+
+
+class TestReadTime:
+    """Every byte a loaded (or written) document returns matches the manifest when it is read."""
+
+    def test_an_untouched_bundle_reads_its_bytes(self, copy):
+        loaded = load_bundle(copy)
+        assert loaded.figures[0].read_bytes() == PNG_A
+        assert loaded.pages[3].page_image.read_bands() == tuple(
+            path.read_bytes() for path in loaded.pages[3].page_image.band_paths
+        )
+
+    def test_paths_are_kept_for_information(self, copy):
+        loaded = load_bundle(copy)
+        assert loaded.figures[0].image_path == copy / A_PNG
+        assert loaded.pages[0].page_image.image_path == copy / "page_images" / "page_0001.png"
+
+    def test_an_image_overwritten_after_load_is_refused_naming_it(self, copy):
+        loaded = load_bundle(copy)
+        flipped(copy / A_PNG)
+        with pytest.raises(BundleCorruptError, match=f"{A_PNG}: its sha256 is"):
+            loaded.figures[0].read_bytes()
+
+    def test_an_image_grown_after_load_is_refused(self, copy):
+        loaded = load_bundle(copy)
+        with (copy / A_PNG).open("ab") as handle:
+            handle.write(b"x")
+        with pytest.raises(BundleCorruptError, match=f"{A_PNG}: it is [0-9]+ bytes, the manifest says"):
+            loaded.figures[1].read_bytes()
+
+    def test_an_image_replaced_by_a_symlink_out_of_the_bundle_is_refused(self, copy):
+        loaded = load_bundle(copy)
+        outside = copy.parent / "outside.png"
+        outside.write_bytes((copy / A_PNG).read_bytes())
+        (copy / A_PNG).unlink()
+        (copy / A_PNG).symlink_to(outside)
+        with pytest.raises(BundleCorruptError, match=f"{A_PNG}: .*resolves outside"):
+            loaded.figures[0].read_bytes()
+
+    def test_an_image_replaced_by_a_symlink_to_its_twin_in_the_bundle_is_refused(self, copy):
+        # Its bytes match and it stays in the bundle: only O_NOFOLLOW refuses it.
+        loaded = load_bundle(copy)
+        shutil.copy(copy / A_PNG, copy / "images" / "twin.png")
+        (copy / A_PNG).unlink()
+        (copy / A_PNG).symlink_to(copy / "images" / "twin.png")
+        with pytest.raises(BundleCorruptError, match=f"{A_PNG}: it is a symlink"):
+            loaded.figures[0].read_bytes()
+
+    def test_a_symlinked_directory_inside_the_bundle_is_refused(self, copy):
+        loaded = load_bundle(copy)
+        shutil.move(copy / "images", copy / "real_images")
+        (copy / "images").symlink_to(copy / "real_images", target_is_directory=True)
+        with pytest.raises(BundleCorruptError, match=f"{A_PNG}: its directory 'images' is a symlink"):
+            loaded.figures[0].read_bytes()
+        with pytest.raises(BundleCorruptError, match="its directory 'images' is a symlink"):
+            load_bundle(copy)
+
+    def test_a_page_image_overwritten_after_load_is_refused(self, copy):
+        loaded = load_bundle(copy)
+        flipped(copy / "page_images" / "page_0002.png")
+        with pytest.raises(BundleCorruptError, match="page_images/page_0002.png: its sha256"):
+            loaded.pages[1].page_image.read_bytes()
+
+    def test_a_band_overwritten_after_load_is_refused(self, copy):
+        loaded = load_bundle(copy)
+        flipped(copy / "page_images" / "bands" / "page_0003_band_02.png")
+        with pytest.raises(BundleCorruptError, match="page_images/bands/page_0003_band_02.png: its sha256"):
+            loaded.pages[2].page_image.read_bands()
+
+    def test_a_band_replaced_by_a_symlink_is_refused(self, copy):
+        loaded = load_bundle(copy)
+        band = copy / "page_images" / "bands" / "page_0004_band_01.png"
+        outside = copy.parent / "band.png"
+        outside.write_bytes(band.read_bytes())
+        band.unlink()
+        band.symlink_to(outside)
+        with pytest.raises(BundleCorruptError, match="page_0004_band_01.png: .*resolves outside"):
+            loaded.pages[3].page_image.read_bands()
+
+    def test_a_deleted_artifact_is_refused_at_read(self, copy):
+        loaded = load_bundle(copy)
+        (copy / "page_images" / "page_0001.png").unlink()
+        with pytest.raises(BundleCorruptError, match="page_images/page_0001.png: it is missing"):
+            loaded.pages[0].page_image.read_bytes()
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no named pipes here")
+    def test_a_named_pipe_planted_after_load_is_refused_without_blocking(self, copy):
+        loaded = load_bundle(copy)
+        (copy / A_PNG).unlink()
+        os.mkfifo(copy / A_PNG)
+        outcome = calls_without_blocking(loaded.figures[0].read_bytes)
+        assert isinstance(outcome.get("error"), BundleCorruptError)
+        assert f"{A_PNG}: it is not a regular file" in str(outcome["error"])
+
+    def test_a_directory_planted_after_load_is_refused(self, copy):
+        loaded = load_bundle(copy)
+        (copy / A_PNG).unlink()
+        (copy / A_PNG).mkdir()
+        with pytest.raises(BundleCorruptError, match=f"{A_PNG}: it is not a regular file"):
+            loaded.figures[0].read_bytes()
+
+    def test_bands_over_the_asset_limit_in_total_are_refused(self, copy, monkeypatch):
+        loaded = load_bundle(copy)
+        entries = loaded.pages[2].page_image._band_loader.entries
+        monkeypatch.setattr(bundle, "_MAX_ARTIFACT_BYTES", sum(entry.size for entry in entries) - 1)
+        with pytest.raises(BundleCorruptError, match="page_0003_band_01.png and its page's other bands total"):
+            loaded.pages[2].page_image.read_bands()
+
+    def test_a_pickled_loaded_document_still_verifies(self, copy):
+        loaded = pickle.loads(pickle.dumps(load_bundle(copy)))
+        assert loaded.figures[2].read_bytes() == PNG_B
+        flipped(copy / "images" / f"{FIGURE_B_SHA}.png")
+        with pytest.raises(BundleCorruptError, match="its sha256"):
+            loaded.figures[2].read_bytes()
+
+    def test_the_written_documents_reads_are_verified_too(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(bundle, "render_page", fake_render)
+        source = source_pdf(tmp_path)
+        returned = write(bound_document(source), tmp_path / "out", source)
+        assert returned.figures[0].read_bytes() == PNG_A
+        flipped(tmp_path / "out" / A_PNG)
+        with pytest.raises(BundleCorruptError, match=f"{A_PNG}: its sha256"):
+            returned.figures[0].read_bytes()
+        flipped(tmp_path / "out" / "page_images" / "page_0001.png")
+        with pytest.raises(BundleCorruptError, match="page_0001.png: its sha256"):
+            returned.pages[0].page_image.read_bytes()
