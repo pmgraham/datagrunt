@@ -10,6 +10,8 @@ import hashlib
 import json
 import logging
 import os
+import threading
+import time
 from pathlib import Path
 
 import polars as pl
@@ -17,12 +19,14 @@ import pyarrow.parquet as pq
 import pytest
 from PIL import Image
 
-from datagrunt.pdf import writer
+from datagrunt.pdf import bundle, writer
+from datagrunt.pdf.bundle import load_bundle
 from datagrunt.pdf.codec import document_from_json_bytes, document_to_json_bytes
 from datagrunt.pdf.elements import Paragraph, PDFDocument
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError
 from datagrunt.pdf.frame import element_frame, utf8_text
 from datagrunt.pdf.pipeline import extract_document
+from datagrunt.pdf.render import RenderFailed, RenderRefused, effective_dpi, render_page
 from datagrunt.pdf.writer import PDFWriter
 from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf, solid_png
 from pdf_tests.documents import (
@@ -36,6 +40,8 @@ from pdf_tests.documents import (
     rich_document,
     surrogate_document,
 )
+from pdf_tests.test_bundle import CAP, TIMEOUT, fake_render, manifest_of, png_pixels, source_pdf
+from pdf_tests.test_layout_stream_tables import body_text
 
 OPTIONS = {
     "password": None,
@@ -50,8 +56,8 @@ OPTIONS = {
 
 
 def text_pdf(directory: Path, name: str = "report.pdf", pages: int = 2) -> Path:
-    """A PDF of ``pages`` letter pages, one line of text a page."""
-    specs = [PageSpec(items=(TextRun(f"Page {number}", 72.0, 100.0),)) for number in range(1, pages + 1)]
+    """A PDF of ``pages`` letter pages of prose: digital pages, extracted without OCR."""
+    specs = [PageSpec(items=(TextRun(f"Page {number}", 72.0, 100.0), *body_text())) for number in range(1, pages + 1)]
     return build_pdf(directory / name, specs)
 
 
@@ -173,9 +179,8 @@ class TestDocumentCache:
         assert calls[0][0] == path
 
     def test_an_encrypted_source_is_opened_with_its_password(self, tmp_path):
-        path = build_pdf(
-            tmp_path / "locked.pdf", [PageSpec(items=(TextRun("Secret", 72.0, 100.0),))], user_password="pw"
-        )
+        page_spec = PageSpec(items=(TextRun("Secret", 72.0, 100.0), *body_text()))
+        path = build_pdf(tmp_path / "locked.pdf", [page_spec], user_password="pw")
         document = PDFWriter(path, password="pw")._extracted()
         assert "Secret" in document.to_markdown()
 
@@ -713,7 +718,7 @@ class TestExtractImages:
 
 class TestExtractImagesFromAPdf:
     def test_the_files_are_the_distinct_figures_by_sha256_in_document_order(self, tmp_path):
-        made = PDFWriter(figures_pdf(tmp_path))
+        made = PDFWriter(figures_pdf(tmp_path), ocr="never")
         paths = made.extract_images(tmp_path / "images")
         figures = made._extracted().figures
         distinct = list(dict.fromkeys(figure.sha256 for figure in figures))
@@ -727,8 +732,270 @@ class TestExtractImagesFromAPdf:
                 assert image.size == (first[sha].width_px, first[sha].height_px)
 
     def test_without_dedupe_every_figure_is_written(self, tmp_path):
-        made = PDFWriter(figures_pdf(tmp_path))
+        made = PDFWriter(figures_pdf(tmp_path), ocr="never")
         paths = made.extract_images(tmp_path / "images", dedupe=False)
         figures = made._extracted().figures
         assert [path.name for path in paths] == [f"{figure.element_id}.png" for figure in figures]
         assert [path.read_bytes() for path in paths] == [figure.read_bytes() for figure in figures]
+
+
+def spied_renders(monkeypatch, real=fake_render) -> list:
+    """Record each bundle render_page call (source, page index, dpi, password, cap, timeout); let ``real`` run."""
+    calls: list = []
+
+    def spy(src, page_index, **kwargs):
+        calls.append(
+            (Path(src), page_index, kwargs["dpi"], kwargs["password"], kwargs["memory_cap_bytes"], kwargs["timeout_s"])
+        )
+        return real(src, page_index, **kwargs)
+
+    monkeypatch.setattr(bundle, "render_page", spy)
+    return calls
+
+
+def page_files(directory: Path, numbers) -> list[Path]:
+    return [directory / f"page_{number:04d}.png" for number in numbers]
+
+
+class TestRenderPagesAsImages:
+    def test_every_page_is_rendered_in_the_guarded_worker_at_the_effective_dpi(self, tmp_path):
+        source = source_pdf(tmp_path)
+        made = PDFWriter(source, ocr="never", dpi=72)
+        paths = made.render_pages_as_images(tmp_path / "pages")
+        assert paths == page_files(tmp_path / "pages", (1, 2, 3, 4))
+        for sheet, path in zip(made._extracted().pages, paths, strict=True):
+            dpi = effective_dpi(72, 16_000_000, sheet.width_pt, sheet.height_pt)
+            drawn = render_page(source, sheet.page_number - 1, dpi=dpi, memory_cap_bytes=CAP, timeout_s=TIMEOUT)
+            assert png_pixels(path) == ("L", (drawn.px_width, drawn.px_height), drawn.pixels)
+
+    def test_the_render_gets_the_source_password_cap_and_timeout(self, tmp_path, monkeypatch):
+        source = source_pdf(tmp_path, user_password="pw")
+        calls = spied_renders(monkeypatch)
+        PDFWriter(source, password="pw", ocr="never", dpi=72).render_pages_as_images(tmp_path / "pages")
+        assert sorted(calls) == [(source, index, 72, "pw", CAP, TIMEOUT) for index in range(4)]
+
+    def test_an_encrypted_source_renders_with_its_password(self, tmp_path):
+        source = source_pdf(tmp_path, user_password="pw")
+        paths = PDFWriter(source, password="pw", ocr="never", dpi=72).render_pages_as_images(tmp_path / "pages")
+        assert paths == page_files(tmp_path / "pages", (1, 2, 3, 4))
+        assert png_pixels(paths[0])[0] == "L"
+
+    @pytest.mark.parametrize(("given", "expected"), [(None, 72), (50, 50), (300, 300)])
+    def test_dpi_is_the_arguments_else_the_writers(self, tmp_path, monkeypatch, given, expected):
+        calls = spied_renders(monkeypatch)
+        PDFWriter(source_pdf(tmp_path), ocr="never", dpi=72).render_pages_as_images(tmp_path / "pages", dpi=given)
+        letter = effective_dpi(expected, 16_000_000, 612.0, 792.0)
+        assert letter == expected and [call[2] for call in calls if call[1] != 1] == [expected] * 3
+
+    def test_max_render_pixels_lowers_the_dpi(self, tmp_path, monkeypatch):
+        calls = spied_renders(monkeypatch)
+        made = PDFWriter(source_pdf(tmp_path), ocr="never", max_render_pixels=262_144)
+        made.render_pages_as_images(tmp_path / "pages")
+        expected = [effective_dpi(200, 262_144, sheet.width_pt, sheet.height_pt) for sheet in made._extracted().pages]
+        assert [call[2] for call in sorted(calls, key=lambda call: call[1])] == expected
+        assert max(expected) < 200
+
+    def test_refused_and_failed_pages_are_skipped_with_a_warning(self, tmp_path, monkeypatch, caplog):
+        caplog.set_level(logging.WARNING, logger=WRITER_LOGGER)
+
+        def failing(src, page_index, **kwargs):
+            if page_index == 1:
+                raise RenderRefused("page 2: an image over the bound; the page is not rendered")
+            if page_index == 2:
+                raise RenderFailed("page 3: the worker was killed")
+            return fake_render(src, page_index, **kwargs)
+
+        monkeypatch.setattr(bundle, "render_page", failing)
+        paths = PDFWriter(source_pdf(tmp_path), ocr="never", dpi=72).render_pages_as_images(tmp_path / "pages")
+        assert paths == page_files(tmp_path / "pages", (1, 4))
+        assert sorted(path.name for path in (tmp_path / "pages").iterdir()) == ["page_0001.png", "page_0004.png"]
+        assert warnings_of(caplog) == [
+            "page 2 was not rendered: RenderRefused: page 2: an image over the bound; the page is not rendered",
+            "page 3 was not rendered: RenderFailed: page 3: the worker was killed",
+        ]
+
+    def test_an_effective_dpi_refusal_is_skipped_with_a_warning(self, tmp_path, monkeypatch, caplog):
+        caplog.set_level(logging.WARNING, logger=WRITER_LOGGER)
+        spied_renders(monkeypatch)
+        real = bundle.effective_dpi
+
+        def refusing(target, pixels, width, height):
+            if width == 595.5:
+                raise RenderRefused("a 595.5 x 842.25 pt page renders over the bound")
+            return real(target, pixels, width, height)
+
+        monkeypatch.setattr(bundle, "effective_dpi", refusing)
+        paths = PDFWriter(source_pdf(tmp_path), ocr="never", dpi=72).render_pages_as_images(tmp_path / "pages")
+        assert paths == page_files(tmp_path / "pages", (1, 3, 4))
+        assert warnings_of(caplog) == [
+            "page 2 was not rendered: RenderRefused: a 595.5 x 842.25 pt page renders over the bound"
+        ]
+
+    def test_pages_rendered_without_a_failure_raise_no_warning(self, tmp_path, monkeypatch, caplog):
+        caplog.set_level(logging.DEBUG, logger=WRITER_LOGGER)
+        spied_renders(monkeypatch)
+        PDFWriter(source_pdf(tmp_path), ocr="never", dpi=72).render_pages_as_images(tmp_path / "pages")
+        assert warnings_of(caplog) == []
+
+    def test_any_other_render_error_fails_the_call(self, tmp_path, monkeypatch):
+        def broken(src, page_index, **kwargs):
+            raise RuntimeError("unexpected")
+
+        monkeypatch.setattr(bundle, "render_page", broken)
+        with pytest.raises(RuntimeError, match="unexpected"):
+            PDFWriter(source_pdf(tmp_path), ocr="never", dpi=72).render_pages_as_images(tmp_path / "pages")
+        assert list((tmp_path / "pages").iterdir()) == []
+
+    def test_paths_are_in_page_order_whatever_order_the_pages_finish(self, tmp_path, monkeypatch):
+        def slow_first(src, page_index, **kwargs):
+            time.sleep(0.3 if page_index == 0 else 0.0)
+            return fake_render(src, page_index, **kwargs)
+
+        monkeypatch.setattr(bundle, "render_page", slow_first)
+        paths = PDFWriter(source_pdf(tmp_path), ocr="never", dpi=72, workers=4).render_pages_as_images(
+            tmp_path / "pages"
+        )
+        assert paths == page_files(tmp_path / "pages", (1, 2, 3, 4))
+        first, *others = (path.stat().st_mtime_ns for path in paths)
+        assert all(first >= other for other in others)  # page 1 finished last, yet is listed first
+
+    def test_pages_render_in_chunks_of_the_specs_size(self, tmp_path, monkeypatch):
+        sizes = []
+        real = bundle._chunk_size
+
+        def recorded(workers):
+            sizes.append((workers, real(workers)))
+            return real(workers)
+
+        monkeypatch.setattr(bundle, "_chunk_size", recorded)
+        spied_renders(monkeypatch)
+        PDFWriter(source_pdf(tmp_path), ocr="never", dpi=72, workers=3).render_pages_as_images(tmp_path / "pages")
+        assert sizes == [(3, 10)]
+
+    def test_a_chunk_ends_before_the_next_begins_and_workers_run_together(self, tmp_path, monkeypatch):
+        events, lock = [], threading.Lock()
+        running = {"now": 0, "most": 0}
+
+        def tracked(src, page_index, *, dpi, **kwargs):
+            with lock:
+                running["now"] += 1
+                running["most"] = max(running["most"], running["now"])
+                events.append(("start", page_index))
+            time.sleep(0.05 if page_index == 0 else 0.3)
+            with lock:
+                running["now"] -= 1
+                events.append(("end", page_index))
+            return fake_render(src, page_index, dpi=dpi, **kwargs)
+
+        monkeypatch.setattr(bundle, "render_page", tracked)
+        monkeypatch.setattr(bundle, "_chunk_size", lambda workers: 2)
+        PDFWriter(source_pdf(tmp_path), ocr="never", dpi=72, workers=2).render_pages_as_images(tmp_path / "pages")
+        assert running["most"] == 2
+        first_chunk_end = max(i for i, event in enumerate(events) if event[0] == "end" and event[1] in (0, 1))
+        second_chunk_start = min(i for i, event in enumerate(events) if event[0] == "start" and event[1] in (2, 3))
+        assert first_chunk_end < second_chunk_start
+
+    def test_existing_page_files_are_replaced(self, tmp_path, monkeypatch):
+        spied_renders(monkeypatch)
+        directory = tmp_path / "pages"
+        directory.mkdir()
+        (directory / "page_0001.png").write_bytes(b"old")
+        paths = PDFWriter(source_pdf(tmp_path), ocr="never", dpi=72).render_pages_as_images(directory)
+        assert png_pixels(paths[0])[0] == "L" and temporaries(directory) == []
+
+    def test_a_writer_of_a_document_has_no_pdf_to_render(self, tmp_path):
+        made = PDFWriter(rich_document())
+        with pytest.raises(ValueError, match="render_pages_as_images needs the source PDF: this writer was built"):
+            made.render_pages_as_images(tmp_path / "pages")
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        ("options", "error", "message"),
+        [
+            ({"dpi": 35}, ValueError, "dpi must be >= 36"),
+            ({"dpi": True}, TypeError, "dpi must be an int"),
+            ({"dpi": 72.0}, TypeError, "dpi must be an int"),
+            ({"output_dir": 3}, TypeError, "output_dir must be a str or os.PathLike, got int"),
+        ],
+    )
+    def test_bad_arguments_are_refused_before_any_work(self, tmp_path, monkeypatch, options, error, message):
+        source = source_pdf(tmp_path)
+        calls, renders = spy_extract(monkeypatch), spied_renders(monkeypatch)
+        arguments = {"output_dir": tmp_path / "pages", **options}
+        with pytest.raises(error, match=message):
+            PDFWriter(source, ocr="never").render_pages_as_images(arguments.pop("output_dir"), **arguments)
+        assert calls == renders == [] and not (tmp_path / "pages").exists()
+
+    def test_a_file_at_the_directory_is_refused_before_any_work(self, tmp_path, monkeypatch):
+        calls = spy_extract(monkeypatch)
+        (tmp_path / "pages").write_bytes(b"x")
+        with pytest.raises(NotADirectoryError, match="output_dir exists and is not a directory"):
+            PDFWriter(source_pdf(tmp_path), ocr="never").render_pages_as_images(tmp_path / "pages")
+        assert calls == []
+
+
+class TestWriteBundle:
+    def test_it_is_the_bundle_of_the_writers_document_and_options(self, tmp_path, monkeypatch):
+        source = source_pdf(tmp_path)
+        calls = spied_renders(monkeypatch)
+        made = PDFWriter(source, password=None, dpi=72, vision_dpi=100, max_render_pixels=1_000_000, ocr="never")
+        returned = made.write_bundle(tmp_path / "out")
+        assert load_bundle(tmp_path / "out") == returned
+        assert returned.metadata == made._extracted().metadata
+        assert [element.element_id for element in returned.elements] == [
+            element.element_id for element in made._extracted().elements
+        ]
+        assert manifest_of(tmp_path / "out")["extraction_params"] == {
+            "dpi": 72,
+            "vision_dpi": 100,
+            "max_render_pixels": 1_000_000,
+            "workers": 1,
+            "ocr": "never",
+            "min_image_dimension": 40,
+            "strict": False,
+        }
+        assert sorted(call[:2] for call in calls) == [(source, index) for index in range(4)]
+
+    def test_an_encrypted_source_is_bundled_with_its_password(self, tmp_path, monkeypatch):
+        source = source_pdf(tmp_path, user_password="pw")
+        bundled = []
+
+        def spy(document, output_dir, **options):
+            bundled.append((options["source"], options["password"]))
+            return bundle.write_bundle(document, output_dir, **options)
+
+        monkeypatch.setattr(writer, "write_bundle", spy)
+        calls = spied_renders(monkeypatch)
+        PDFWriter(source, password="pw", ocr="never", dpi=72).write_bundle(tmp_path / "out")
+        assert bundled == [(source, "pw")]
+        assert sorted(call[1] for call in calls) == [0, 1, 2, 3] and {call[3] for call in calls} == {"pw"}
+        assert manifest_of(tmp_path / "out")["missing"] == []
+
+    def test_the_document_is_extracted_once_across_methods(self, tmp_path, monkeypatch):
+        spied_renders(monkeypatch)
+        made = PDFWriter(source_pdf(tmp_path), ocr="never", dpi=72)
+        calls = spy_extract(monkeypatch)
+        made.write_bundle(tmp_path / "out")
+        made.write_json(tmp_path / "doc.json")
+        made.render_pages_as_images(tmp_path / "pages")
+        assert len(calls) == 1
+
+    def test_a_writer_of_a_document_has_no_pdf_to_bundle(self, tmp_path):
+        with pytest.raises(ValueError, match="write_bundle needs the source PDF: this writer was built"):
+            PDFWriter(rich_document()).write_bundle(tmp_path / "out")
+        assert list(tmp_path.iterdir()) == []
+
+    def test_a_non_empty_output_dir_is_refused_before_any_work(self, tmp_path, monkeypatch):
+        source = source_pdf(tmp_path)
+        calls = spy_extract(monkeypatch)
+        (tmp_path / "out").mkdir()
+        (tmp_path / "out" / "keep.txt").write_text("kept")
+        with pytest.raises(FileExistsError, match="output_dir exists and is not empty"):
+            PDFWriter(source, ocr="never").write_bundle(tmp_path / "out")
+        assert calls == [] and sorted(p.name for p in (tmp_path / "out").iterdir()) == ["keep.txt"]
+
+    def test_output_dir_must_be_a_path_before_any_work(self, tmp_path, monkeypatch):
+        calls = spy_extract(monkeypatch)
+        with pytest.raises(TypeError, match="output_dir must be a str or os.PathLike, got int"):
+            PDFWriter(source_pdf(tmp_path), ocr="never").write_bundle(3)
+        assert calls == []
