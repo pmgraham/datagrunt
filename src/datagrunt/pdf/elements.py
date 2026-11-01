@@ -838,8 +838,11 @@ class Figure(_Element):
       still encoded by its filters) from ``_raw_loader``, verified against
       ``sha256``: a mismatch fails loud.
     - :meth:`read_bytes` returns the image as PNG, a derived artifact: from
-      ``image_path`` when set, else from ``_loader``. It is not checked
-      against ``sha256``, which hashes the raw stream, not the PNG.
+      ``_loader`` when set, else from ``image_path``. It is not checked
+      against ``sha256``, which hashes the raw stream, not the PNG. The
+      loader comes first because it can verify: a bundle's figure keeps
+      ``image_path`` for information, and its loader checks the file
+      against the bundle's manifest on every read.
 
     The engine sets both loaders to an ``ImageLoader``'s bound methods,
     which reopen the PDF on demand. For an encrypted PDF that loader holds
@@ -879,24 +882,25 @@ class Figure(_Element):
         _check_optional_callable("_raw_loader", self._raw_loader)
 
     def read_bytes(self) -> bytes:
-        """Return the image as PNG bytes: ``image_path`` first, then the loader.
+        """Return the image as PNG bytes: the loader first, then ``image_path``.
 
         Derived bytes, so they are not checked against ``sha256`` (use
         :meth:`read_raw_bytes` for verified bytes); every read is bounded by
-        the asset limit.
+        the asset limit. A loader that raises is never bypassed by the file.
 
         Raises:
             DatagruntPDFError: If there is no byte source, ``image_path`` is not
-                a regular file, or the bytes exceed the asset limit.
+                a regular file, or the bytes exceed the asset limit (or as the
+                loader raises it).
             OSError: If ``image_path`` cannot be stat'ed or read (e.g.
                 ``FileNotFoundError``, ``PermissionError``).
             TypeError: If the loader returns something other than ``bytes``.
         """
-        if self.image_path is not None:
-            return _read_asset_file(self.image_path)
-        if self._loader is None:
+        if self._loader is not None:
+            return _check_loaded_asset(f"figure {self.element_id}", "_loader result", self._loader())
+        if self.image_path is None:
             raise DatagruntPDFError(f"figure {self.element_id} has no image bytes: no image_path and no loader")
-        return _check_loaded_asset(f"figure {self.element_id}", "_loader result", self._loader())
+        return _read_asset_file(self.image_path)
 
     def read_raw_bytes(self) -> bytes:
         """Return the raw embedded stream after verifying it against ``sha256``.
@@ -938,10 +942,13 @@ DocumentElement: TypeAlias = Union[Heading, Paragraph, KeyValue, Table, BulletLi
 class PageImage:
     """A rendered raster of one page, plus optional horizontal bands of it.
 
-    Bytes come from files when set (``image_path``, ``band_paths``), else from
-    the internal lazy loaders (``_loader``, ``_band_loader``, excluded from
-    equality and repr). The full image and the bands are separate sources:
-    neither stands in for the other. Every read is bounded by the asset limit.
+    Bytes come from the internal lazy loaders when set (``_loader``,
+    ``_band_loader``, excluded from equality and repr), else from files
+    (``image_path``, ``band_paths``): a loader can verify, so a bundle's page
+    image keeps its paths for information and reads through loaders that
+    check each file against the manifest. The full image and the bands are
+    separate sources: neither stands in for the other. Every read is bounded
+    by the asset limit.
 
     Attributes:
         page_number: 1-based page this image renders.
@@ -983,7 +990,7 @@ class PageImage:
         _check_optional_callable("_band_loader", self._band_loader)
 
     def read_bytes(self) -> bytes:
-        """Return the full-page image bytes: ``image_path`` first, then the loader.
+        """Return the full-page image bytes: the loader first, then ``image_path``.
 
         Raises:
             DatagruntPDFError: If there is no byte source, ``image_path`` is not
@@ -992,14 +999,14 @@ class PageImage:
                 ``FileNotFoundError``, ``PermissionError``).
             TypeError: If the loader returns something other than ``bytes``.
         """
-        if self.image_path is not None:
-            return _read_asset_file(self.image_path)
-        if self._loader is None:
+        if self._loader is not None:
+            return _check_loaded_asset(f"page image {self.page_number}", "_loader result", self._loader())
+        if self.image_path is None:
             raise DatagruntPDFError(f"page image {self.page_number} has no image bytes: no image_path and no loader")
-        return _check_loaded_asset(f"page image {self.page_number}", "_loader result", self._loader())
+        return _read_asset_file(self.image_path)
 
     def read_bands(self) -> tuple[bytes, ...]:
-        """Return the band bytes top to bottom: ``band_paths`` first, then the band loader.
+        """Return the band bytes top to bottom: the band loader first, then ``band_paths``.
 
         The bands together are one page image, so the asset limit bounds their
         total, not each band.
@@ -1014,11 +1021,11 @@ class PageImage:
                 of ``bytes``.
         """
         owner = f"page image {self.page_number}"
-        if self.band_paths:
-            return _read_band_files(owner, self.band_paths)
-        if self._band_loader is None:
+        if self._band_loader is not None:
+            return _check_loaded_bands(owner, self._band_loader())
+        if not self.band_paths:
             raise DatagruntPDFError(f"{owner} has no bands: no band_paths and no band loader")
-        return _check_loaded_bands(owner, self._band_loader())
+        return _read_band_files(owner, self.band_paths)
 
 
 _PAGE_STATUSES: tuple[PageStatus, ...] = get_args(PageStatus)
