@@ -23,7 +23,17 @@ from datagrunt.pdf.bundle import load_bundle
 from datagrunt.pdf.exceptions import BundleCorruptError, DatagruntPDFError
 from pdf_tests.builders import PageSpec, TextRun, build_pdf
 from pdf_tests.documents import FIGURE_A_SHA, FIGURE_B_SHA, metadata, surrogate_document
-from pdf_tests.test_bundle import OWN_BANDS, PNG_A, PNG_B, bound_document, fake_render, sha_of, source_pdf, write
+from pdf_tests.test_bundle import (
+    OWN_BANDS,
+    OWN_IMAGE,
+    PNG_A,
+    PNG_B,
+    bound_document,
+    fake_render,
+    sha_of,
+    source_pdf,
+    write,
+)
 
 A_PNG = f"images/{FIGURE_A_SHA}.png"
 
@@ -145,11 +155,16 @@ class TestRoundTrip:
         assert loaded == returned and loaded.elements == document.elements
         assert loaded.pages[0].elements[1].text == "lone \udfff low"
 
-    def test_a_loaded_document_writes_again(self, written, tmp_path, monkeypatch):
+    def test_a_loaded_document_writes_again(self, written, tmp_path, monkeypatch, recwarn):
+        # Its own page image reads through the first bundle's verifying readers: bound to the hashed source.
         monkeypatch.setattr(bundle, "render_page", fake_render)
         loaded = load_bundle(written.out)
         again = write(loaded, tmp_path / "again", written.source)
         assert (tmp_path / "again" / "images" / f"{FIGURE_B_SHA}.png").read_bytes() == PNG_B
+        assert again.pages[2].page_image.read_bytes() == OWN_IMAGE
+        assert again.pages[2].page_image.read_bands() == OWN_BANDS
+        assert manifest(tmp_path / "again")["missing"] == [] and [str(w.message) for w in recwarn] == []
+        assert manifest(tmp_path / "again")["page_images"] == manifest(written.out)["page_images"]
         assert load_bundle(tmp_path / "again") == again
 
 

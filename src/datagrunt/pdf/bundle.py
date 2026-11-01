@@ -20,6 +20,9 @@ Layout (paths relative to the bundle, joined with ``/``):
   - every other page (``"render"``): rendered at
     :func:`~datagrunt.pdf.render.effective_dpi` of ``dpi`` (and
     ``max_render_pixels``) in A5a's guarded worker, 8-bit grey as drawn.
+  A loaded document written again keeps each page image's origin: its
+  reader carries the manifest's, so an earlier render is copied as a
+  render (no bands expected), at its own DPI.
 - ``page_images/bands/page_NNNN_band_NN.png``: a page's own image's bands,
   numbered from 1, from ``PageImage.read_bands`` (A5b's: the page as OCR
   read it, righted, which is what a vision model needs). A rendered page
@@ -74,6 +77,20 @@ bands; a figure whose bytes cannot be read or are not a PNG is not written
 (its figures keep no ``image_path``). Each is a ``missing`` entry naming
 the artifact, the page, the figure's element id (figures) and why. Any
 other error fails the write.
+
+The page images are bound to the hashed source. The source's identity
+(A8a's ``SourceIdentity``: device, inode, size, mtime) is taken with its
+hash, and checked again once every artifact is written, before the rename:
+a source changed, replaced or removed meanwhile raises
+``PDFSourceChangedError`` and nothing is published (the staging directory
+is removed). A page's own image is written only when its loaders are bound
+to that file (:func:`_unbound`): each renders from ``source`` itself
+(A5b's ``PageRender``, compared by resolved path) or is a bundle's
+verifying reader. One that renders from another file, names no source, or
+an image with no loader is not read: the page has no page image, a
+``missing`` entry says why, and a ``UserWarning`` is emitted once the
+bundle is published. What this cannot see is the A8a limit: a write that
+keeps the size and restores the mtime.
 
 Known limitations, documented:
 
@@ -137,6 +154,7 @@ import os
 import shutil
 import stat
 import uuid
+import warnings
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -163,10 +181,10 @@ from datagrunt.pdf.codec import (
     parse_json,
 )
 from datagrunt.pdf.elements import _MAX_ASSET_BYTES, Figure, Page, PageImage, PDFDocument
-from datagrunt.pdf.exceptions import BundleCorruptError, DatagruntPDFError
+from datagrunt.pdf.exceptions import BundleCorruptError, DatagruntPDFError, PDFSourceChangedError
 from datagrunt.pdf.frame import utf8_text
 from datagrunt.pdf.pdfium_engine import _checked_path
-from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, _opened_source, _stream_sha256
+from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, SourceIdentity, _opened_source, _stream_sha256
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page
 
 __all__ = ["BUNDLE_FORMAT_VERSION", "load_bundle", "write_bundle"]
@@ -236,11 +254,12 @@ class _Written(NamedTuple):
 
 
 class _PageOutcome(NamedTuple):
-    """What one page's render task wrote, and what it could not."""
+    """What one page's render task wrote, what it could not, and a warning for the caller ("" for none)."""
 
     written: _Written | None
     artifacts: tuple[_Artifact, ...]
     missing: tuple[_Missing, ...]
+    warning: str = ""
 
 
 @dataclass
@@ -249,6 +268,7 @@ class _Ledger:
 
     artifacts: list[_Artifact] = field(default_factory=list)
     missing: list[_Missing] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 class _Sink:
@@ -308,7 +328,13 @@ def write_bundle(
         FileExistsError: If ``output_dir`` exists and is not an empty
             directory (a symlink is refused too), before or after the write.
         FileNotFoundError: If ``source`` or ``output_dir``'s parent is missing.
+        PDFSourceChangedError: If ``source`` changed (or was removed) between
+            its hash and the publish: the bundle is not published.
         OSError: If a file cannot be written, or the rename fails.
+
+    Warns:
+        UserWarning: For each page whose own image is not written because its
+            loaders are not bound to ``source`` (see the module notes).
     """
     options = PipelineOptions(workers=workers, dpi=dpi, vision_dpi=vision_dpi, max_render_pixels=max_render_pixels)
     params = _checked_params(options, extraction_params)
@@ -316,16 +342,19 @@ def write_bundle(
         raise TypeError(f"document must be a PDFDocument, got {type(document).__name__}")
     target = _checked_target(output_dir)
     pdf = PDFSource(path=_checked_path(source, "source"), password=password)
-    _check_source(pdf, document.metadata.sha256)
+    identity = _check_source(pdf, document.metadata.sha256)
     staging = target.parent / f"{_STAGING_PREFIX}{uuid.uuid4().hex}"
     staging.mkdir()
     try:
-        written = _staged(document, staging, target, pdf, options, params)
+        written, notices = _staged(document, staging, target, pdf, options, params)
+        _check_unchanged(pdf, identity)
         _refuse_existing(target)
         os.replace(staging, target)
     except BaseException:
         shutil.rmtree(staging)
         raise
+    for notice in notices:
+        warnings.warn(notice, UserWarning, stacklevel=2)
     return written
 
 
@@ -390,14 +419,30 @@ def _refuse_existing(target: Path) -> None:
             raise FileExistsError(errno.EEXIST, message, str(target))
 
 
-def _check_source(source: PDFSource, expected: str) -> None:
-    """Refuse a source whose bytes are not the document's: its renders would be another PDF's pages."""
+def _check_source(source: PDFSource, expected: str) -> SourceIdentity:
+    """The identity of the source, taken with its hash; a source whose bytes are not the document's is refused."""
     with _opened_source(source.path) as stream:
-        digest = _stream_sha256(stream, os.fstat(stream.fileno()).st_size, source.path)
+        identity = SourceIdentity.of(os.fstat(stream.fileno()))
+        digest = _stream_sha256(stream, identity.size, source.path)
     if digest != expected:
         raise ValueError(
             f"source {source.path} has sha256 {digest}, not the document's {expected}: "
             "its renders would not be the document's pages"
+        )
+    return identity
+
+
+def _check_unchanged(source: PDFSource, identity: SourceIdentity) -> None:
+    """Refuse to publish if the source is not the file hashed: its page images could be of other bytes."""
+    try:
+        now = SourceIdentity.of(os.stat(source.path))
+    except FileNotFoundError as exc:
+        raise PDFSourceChangedError(f"{source.path} was removed while its bundle was written") from exc
+    changes = identity.changes(now)
+    if changes:
+        raise PDFSourceChangedError(
+            f"{source.path} changed while its bundle was written: {', '.join(changes)}; "
+            "its page images and its sha256 could disagree, so the bundle is not published"
         )
 
 
@@ -408,8 +453,8 @@ def _staged(
     source: PDFSource,
     options: PipelineOptions,
     params: Mapping[str, object],
-) -> PDFDocument:
-    """Write every artifact, then the manifest, into ``staging``; the document with paths in ``target``."""
+) -> tuple[PDFDocument, tuple[str, ...]]:
+    """Write every artifact, then the manifest, into ``staging``: the document (paths in ``target``), and warnings."""
     ledger = _Ledger()
     figures = _write_figures(document, staging, ledger)
     renders = _write_renders(document, staging, source, options, ledger)
@@ -419,7 +464,9 @@ def _staged(
     ledger.artifacts.append(_write_bytes(staging, DOCUMENT_MARKDOWN, markdown.encode("utf-8")))
     _write_bytes(staging, MANIFEST, _manifest(document, params, renders, ledger))
     by_path = {artifact.path: artifact for artifact in ledger.artifacts}
-    return _with_readers(_with_paths(document, figures, renders, target), target, by_path)
+    origins = {number: written.origin for number, written in renders.items()}
+    returned = _with_readers(_with_paths(document, figures, renders, target), target, by_path, origins)
+    return returned, tuple(ledger.warnings)
 
 
 def _write_figures(document: PDFDocument, staging: Path, ledger: _Ledger) -> dict[str, str]:
@@ -488,12 +535,14 @@ def _record(outcome: _PageOutcome, renders: dict[int, _Written], ledger: _Ledger
     ledger.missing.extend(outcome.missing)
     if outcome.written is not None:
         renders[outcome.written.page_number] = outcome.written
+    if outcome.warning:
+        ledger.warnings.append(outcome.warning)
 
 
 def _page_outcome(page: Page, staging: Path, source: PDFSource, options: PipelineOptions) -> _PageOutcome:
     """Write the page's own image and bands when it has one, else render it at ``dpi``; a failure is recorded."""
     if page.page_image is not None:
-        return _own_outcome(page.page_image, staging)
+        return _own_outcome(page.page_image, staging, source)
     return _rendered_outcome(page, staging, source, options)
 
 
@@ -511,9 +560,18 @@ def _rendered_outcome(page: Page, staging: Path, source: PDFSource, options: Pip
     return _PageOutcome(written, (artifact,), ())
 
 
-def _own_outcome(image: PageImage, staging: Path) -> _PageOutcome:
-    """Write the page's own image and bands (A5b's vision render) through its loaders, as they are."""
+def _own_outcome(image: PageImage, staging: Path, source: PDFSource) -> _PageOutcome:
+    """Write the page's own image and bands (A5b's vision render) through its loaders, as they are.
+
+    Only when they are bound to the hashed source (:func:`_unbound`): else no
+    image is written, nor read, and the page gets a missing entry and a warning.
+    """
     number = image.page_number
+    unbound = _unbound(image, source.path)
+    if unbound:
+        reason = f"the page's own image {unbound}: its bytes could not be bound to the hashed source"
+        notice = f"page {number}'s own image {unbound}: no page image is written for it"
+        return _PageOutcome(None, (), (_Missing("page_image", number, None, reason),), notice)
     data, why = _png(image.read_bytes)
     if data is None:
         reason = f"the page's own image was not written: {why}"
@@ -521,11 +579,48 @@ def _own_outcome(image: PageImage, staging: Path) -> _PageOutcome:
     path = f"page_images/page_{number:04d}.png"
     artifact = _write_bytes(staging, path, data)
     del data  # written: it need not outlive the page's bands
-    band_artifacts, missing = _own_bands(image, staging)
+    origin = _origin_of(image)
+    band_artifacts, missing = _own_bands(image, staging) if origin == "document" else ((), ())
     bands = tuple(item.path for item in band_artifacts)
     facts = (image.dpi, image.width_px, image.height_px, image.contrast_normalized)
-    written = _Written(number, "document", *facts, path, bands)
+    written = _Written(number, origin, *facts, path, bands)
     return _PageOutcome(written, (artifact, *band_artifacts), missing)
+
+
+def _origin_of(image: PageImage) -> str:
+    """``"render"`` for a page image an earlier bundle rendered (read back by its reader), else ``"document"``.
+
+    A rendered image has no bands, so none is expected of it: it is written
+    again as the render it is, at its own DPI.
+    """
+    loader = image._loader
+    return "render" if isinstance(loader, _ArtifactReader) and loader.origin == "render" else "document"
+
+
+def _unbound(image: PageImage, source: Path) -> str:
+    """Why the page image's bytes are not bound to ``source``, or ``""`` if they are.
+
+    Its image must come from a loader (a bare path is read unverified). Each
+    loader it has must render from ``source`` itself, compared by resolved
+    path (A5b's ``PageRender`` names the PDF it renders from as ``source``),
+    or be a bundle's verifying reader (its bytes are checked against a
+    manifest whose source sha256 is the document's). Any other loader names
+    no source, so nothing ties it to the hashed bytes.
+    """
+    if image._loader is None:
+        return "has no loader"
+    target = source.resolve()
+    for loader in (image._loader, image._band_loader):
+        owner = getattr(loader, "__self__", loader)
+        if loader is None or isinstance(owner, (_ArtifactReader, _BandsReader)):
+            continue
+        origin = getattr(owner, "source", None)
+        if not isinstance(origin, (str, os.PathLike)):
+            return "has a loader that names no source"
+        resolved = Path(origin).resolve()
+        if resolved != target:
+            return f"renders from {resolved}, not from the source {target}"
+    return ""
 
 
 def _own_bands(image: PageImage, staging: Path) -> tuple[tuple[_Artifact, ...], tuple[_Missing, ...]]:
@@ -711,7 +806,7 @@ def load_bundle(path: str | os.PathLike[str]) -> PDFDocument:
     _check_page_images(document, manifest.page_images)
     origins = {entry.page_number: entry.origin for entry in manifest.page_images}
     _check_missing(document, manifest.missing, origins)
-    return _with_readers(document, root, by_path)
+    return _with_readers(document, root, by_path, origins)
 
 
 def _bundle_root(path: object) -> Path:
@@ -916,11 +1011,14 @@ def _verified(root: Path, entry: _Artifact, *, keep: bool) -> bytes:
 class _ArtifactReader:
     """A loaded figure's or page image's loader: the artifact's bytes, verified against the manifest on each read.
 
-    Picklable (a path and the manifest's entry), so a document crosses a process pool.
+    Picklable (a path and the manifest's entry), so a document crosses a process pool. A page image's
+    reader also keeps the image's origin in its bundle (``"document"`` or ``"render"``; ``""`` for a
+    figure), so a bundle written again from a loaded document keeps it.
     """
 
     root: Path
     entry: _Artifact
+    origin: str = ""
 
     def __call__(self) -> bytes:
         return _verified(self.root, self.entry, keep=True)
@@ -941,8 +1039,13 @@ class _BandsReader:
         return tuple(_verified(self.root, entry, keep=True) for entry in self.entries)
 
 
-def _with_readers(document: PDFDocument, root: Path, by_path: Mapping[str, _Artifact]) -> PDFDocument:
-    """``document`` whose figures and page images (paths in ``root``, kept) read through verifying loaders."""
+def _with_readers(
+    document: PDFDocument, root: Path, by_path: Mapping[str, _Artifact], origins: Mapping[int, str]
+) -> PDFDocument:
+    """``document`` whose figures and page images (paths in ``root``, kept) read through verifying loaders.
+
+    ``origins`` is each page image's origin, by page (the manifest's).
+    """
 
     def entry_of(path: Path) -> _Artifact:
         return by_path[path.relative_to(root).as_posix()]
@@ -955,15 +1058,16 @@ def _with_readers(document: PDFDocument, root: Path, by_path: Mapping[str, _Arti
             else element
             for element in page.elements
         )
-        pages.append(dataclasses.replace(page, elements=elements, page_image=_image_with_readers(page, root, entry_of)))
+        image = _image_with_readers(page, root, entry_of, origins.get(page.page_number, ""))
+        pages.append(dataclasses.replace(page, elements=elements, page_image=image))
     return _with_pages(document, tuple(pages))
 
 
-def _image_with_readers(page: Page, root: Path, entry_of: Callable[[Path], _Artifact]) -> PageImage | None:
+def _image_with_readers(page: Page, root: Path, entry_of: Callable[[Path], _Artifact], origin: str) -> PageImage | None:
     image = page.page_image
     if image is None:
         return None
-    loader = None if image.image_path is None else _ArtifactReader(root, entry_of(image.image_path))
+    loader = None if image.image_path is None else _ArtifactReader(root, entry_of(image.image_path), origin)
     bands = _BandsReader(root, tuple(entry_of(path) for path in image.band_paths)) if image.band_paths else None
     return dataclasses.replace(image, _loader=loader, _band_loader=bands)
 

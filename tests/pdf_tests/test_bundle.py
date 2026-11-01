@@ -29,7 +29,7 @@ from datagrunt.pdf import bundle
 from datagrunt.pdf.bundle import BUNDLE_FORMAT_VERSION, load_bundle, write_bundle
 from datagrunt.pdf.codec import document_from_json_bytes
 from datagrunt.pdf.elements import Figure, PDFDocument
-from datagrunt.pdf.exceptions import DatagruntPDFError
+from datagrunt.pdf.exceptions import DatagruntPDFError, PDFSourceChangedError
 from datagrunt.pdf.ocr import tesseract_available
 from datagrunt.pdf.pipeline import extract_document
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page, render_size
@@ -60,32 +60,50 @@ def sha_of(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+@dataclasses.dataclass(frozen=True)
+class OwnRender:
+    """A stand-in for A5b's PageRender: the PDF it renders from, and the image and bands it gives (or raises)."""
+
+    source: Path
+    image: object = OWN_IMAGE
+    bands: object = OWN_BANDS
+
+    def png_bytes(self) -> bytes:
+        return self._given(self.image)
+
+    def band_png_bytes(self):
+        return self._given(self.bands)
+
+    @staticmethod
+    def _given(value):
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
 def bound_document(
     path: Path,
     figure_loader=lambda: PNG_A,
     other_loader=lambda: PNG_B,
     *,
-    image_loader=lambda: OWN_IMAGE,
-    band_loader=lambda: OWN_BANDS,
+    image=OWN_IMAGE,
+    bands=OWN_BANDS,
+    own_source: Path | None = None,
 ) -> PDFDocument:
-    """rich_document as the document of the PDF at ``path``; page 3 has its own page image."""
+    """rich_document as the document of the PDF at ``path``; page 3 has its own page image.
+
+    Its loaders are an :class:`OwnRender` of ``own_source`` (default: ``path``); ``bands`` None gives it no
+    band loader.
+    """
+    render = OwnRender(own_source or path, image, bands)
     return rich_document(
         figure_loader,
         other_loader,
         sha=sha_of(path),
         source_name=path.name,
-        image_loader=image_loader,
-        band_loader=band_loader,
+        image_loader=render.png_bytes,
+        band_loader=None if bands is None else render.band_png_bytes,
     )
-
-
-def raising(error: BaseException):
-    """A loader that raises ``error``."""
-
-    def loader():
-        raise error
-
-    return loader
 
 
 def files_in(root: Path) -> set[str]:
@@ -343,15 +361,15 @@ class TestFailuresAreRecorded:
         assert missing["reason"] == "the page was not rendered: RenderFailed: the render worker timed out"
 
     @pytest.mark.parametrize(
-        ("loader", "reason"),
+        ("image", "reason"),
         [
-            (raising(RenderFailed("the render worker timed out")), "RenderFailed: the render worker timed out"),
-            (raising(PermissionError(13, "Permission denied")), "PermissionError: [Errno 13] Permission denied"),
-            (lambda: b"GIF89a", "its bytes are not a PNG"),
+            (RenderFailed("the render worker timed out"), "RenderFailed: the render worker timed out"),
+            (PermissionError(13, "Permission denied"), "PermissionError: [Errno 13] Permission denied"),
+            (b"GIF89a", "its bytes are not a PNG"),
         ],
     )
-    def test_an_own_image_that_cannot_be_read_leaves_no_page_image(self, tmp_path, source, fast_render, loader, reason):
-        returned = write(bound_document(source, image_loader=loader), tmp_path / "out", source)
+    def test_an_own_image_that_cannot_be_read_leaves_no_page_image(self, tmp_path, source, fast_render, image, reason):
+        returned = write(bound_document(source, image=image), tmp_path / "out", source)
         assert returned.pages[2].page_image is None
         assert not any(name.startswith("page_images/bands/page_0003") for name in files_in(tmp_path / "out"))
         assert manifest_of(tmp_path / "out")["missing"] == [
@@ -364,18 +382,15 @@ class TestFailuresAreRecorded:
         ]
 
     @pytest.mark.parametrize(
-        ("loader", "reason"),
+        ("bands", "reason"),
         [
-            (
-                raising(RenderRefused("page 3: an image over the bound")),
-                "RenderRefused: page 3: an image over the bound",
-            ),
-            (lambda: (OWN_BANDS[0], b"not a png"), "band 2's bytes are not a PNG"),
+            (RenderRefused("page 3: an image over the bound"), "RenderRefused: page 3: an image over the bound"),
+            ((OWN_BANDS[0], b"not a png"), "band 2's bytes are not a PNG"),
             (None, "DatagruntPDFError: page image 3 has no bands: no band_paths and no band loader"),
         ],
     )
-    def test_own_bands_that_cannot_be_read_keep_the_page_image(self, tmp_path, source, fast_render, loader, reason):
-        returned = write(bound_document(source, band_loader=loader), tmp_path / "out", source)
+    def test_own_bands_that_cannot_be_read_keep_the_page_image(self, tmp_path, source, fast_render, bands, reason):
+        returned = write(bound_document(source, bands=bands), tmp_path / "out", source)
         image = returned.pages[2].page_image
         assert image.image_path == tmp_path / "out" / "page_images" / "page_0003.png" and image.band_paths == ()
         assert manifest_of(tmp_path / "out")["missing"] == [
@@ -777,3 +792,98 @@ class TestExtractionParams:
         with pytest.raises(error, match=message):
             write(bound_document(source), tmp_path / "out", source, extraction_params=extra)
         assert sorted(path.name for path in tmp_path.iterdir()) == ["report.pdf"]
+
+
+class TestBoundToTheSource:
+    """The page images must be of the hashed source: own loaders render from it, and it does not change."""
+
+    def test_an_own_image_rendering_from_another_file_is_not_written(self, tmp_path, source, fast_render):
+        other = build_pdf(tmp_path / "other.pdf", [PageSpec()])
+        never = AssertionError("an own loader of another file must not be called")
+        document = bound_document(source, image=never, bands=never, own_source=other)
+        with pytest.warns(UserWarning, match="page 3's own image renders from .*other.pdf, not from the source"):
+            returned = write(document, tmp_path / "out", source)
+        assert returned.pages[2].page_image is None
+        assert not any("page_0003" in name for name in files_in(tmp_path / "out"))
+        reason = (
+            f"the page's own image renders from {other.resolve()}, not from the source {source.resolve()}: "
+            "its bytes could not be bound to the hashed source"
+        )
+        assert manifest_of(tmp_path / "out")["missing"] == [
+            {"artifact": "page_image", "page_number": 3, "element_id": None, "reason": reason}
+        ]
+        assert load_bundle(tmp_path / "out") == returned
+
+    def test_an_own_band_loader_rendering_from_another_file_is_refused_too(self, tmp_path, source, fast_render):
+        other = build_pdf(tmp_path / "other.pdf", [PageSpec()])
+        document = bound_document(source)
+        image = document.pages[2].page_image
+        stray = OwnRender(other)
+        pages = list(document.pages)
+        pages[2] = dataclasses.replace(
+            pages[2], page_image=dataclasses.replace(image, _band_loader=stray.band_png_bytes)
+        )
+        with pytest.warns(UserWarning, match="renders from .*other.pdf"):
+            returned = write(dataclasses.replace(document, pages=tuple(pages)), tmp_path / "out", source)
+        assert returned.pages[2].page_image is None
+
+    def test_an_own_loader_with_no_source_is_not_written(self, tmp_path, source, fast_render):
+        document = rich_document(
+            sha=sha_of(source), source_name=source.name, image_loader=lambda: OWN_IMAGE, band_loader=lambda: OWN_BANDS
+        )
+        with pytest.warns(UserWarning, match="page 3's own image has a loader that names no source"):
+            returned = write(document, tmp_path / "out", source)
+        assert returned.pages[2].page_image is None
+        [missing] = [m for m in manifest_of(tmp_path / "out")["missing"] if m["page_number"] == 3]
+        assert missing["reason"] == (
+            "the page's own image has a loader that names no source: its bytes could not be bound to the hashed source"
+        )
+
+    def test_an_own_image_with_no_loader_is_not_written(self, tmp_path, source, fast_render):
+        document = bound_document(source)
+        pages = list(document.pages)
+        image = dataclasses.replace(pages[2].page_image, _loader=None, _band_loader=None, image_path=tmp_path / "x.png")
+        pages[2] = dataclasses.replace(pages[2], page_image=image)
+        with pytest.warns(UserWarning, match="has no loader"):
+            returned = write(dataclasses.replace(document, pages=tuple(pages)), tmp_path / "out", source)
+        assert returned.pages[2].page_image is None
+
+    def test_the_same_file_by_another_path_is_the_source(self, tmp_path, source, fast_render):
+        (tmp_path / "link.pdf").symlink_to(source)
+        returned = write(bound_document(source, own_source=tmp_path / "link.pdf"), tmp_path / "out", source)
+        assert returned.pages[2].page_image.read_bytes() == OWN_IMAGE
+
+    @pytest.mark.parametrize("change", ["append", "replace"])
+    def test_a_source_changed_during_the_write_is_never_published(self, tmp_path, source, monkeypatch, change):
+        def changing(src, page_index, **kwargs):
+            if page_index == 3:  # the last page rendered
+                if change == "append":
+                    with source.open("ab") as handle:
+                        handle.write(b"%% appended")
+                else:
+                    copy = tmp_path / "copy.pdf"
+                    copy.write_bytes(source.read_bytes())
+                    os.replace(copy, source)
+            return fake_render(src, page_index, **kwargs)
+
+        monkeypatch.setattr(bundle, "render_page", changing)
+        what = "size" if change == "append" else "inode"
+        with pytest.raises(PDFSourceChangedError, match=f"changed while its bundle was written: .*{what}"):
+            write(bound_document(source), tmp_path / "out", source)
+        assert not (tmp_path / "out").exists() and stagings(tmp_path) == []
+
+    def test_a_source_removed_during_the_write_is_never_published(self, tmp_path, source, monkeypatch):
+        def removing(src, page_index, **kwargs):
+            if page_index == 3:
+                source.unlink()
+            return fake_render(src, page_index, **kwargs)
+
+        monkeypatch.setattr(bundle, "render_page", removing)
+        with pytest.raises(PDFSourceChangedError, match="was removed while its bundle was written"):
+            write(bound_document(source), tmp_path / "out", source)
+        assert not (tmp_path / "out").exists() and stagings(tmp_path) == []
+
+    def test_an_untouched_source_writes_as_before(self, tmp_path, source, fast_render, recwarn):
+        returned = write(bound_document(source), tmp_path / "out", source)
+        assert manifest_of(tmp_path / "out")["missing"] == [] and [str(w.message) for w in recwarn] == []
+        assert load_bundle(tmp_path / "out") == returned
