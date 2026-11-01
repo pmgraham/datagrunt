@@ -23,7 +23,7 @@ import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 import pytest
 
-from datagrunt.pdf import DatagruntPDFError, render
+from datagrunt.pdf import DatagruntPDFError, _process, render
 from datagrunt.pdf.pdfium_engine import open_document, page_geometry
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page, render_size
 from pdf_tests.builders import PageSpec, Rect, TextRun, build_pdf, hand_written_pdf
@@ -754,21 +754,21 @@ class TestSupervision:
         time.sleep(0.4)  # past the deadline: a timer left running would kill again
 
         assert (reply.kind, reply.detail, timed_out) == (render._FAILED, "page 1: why", False)
-        assert process.waits[0] == render._REAP_TIMEOUT_S
-        assert process.kills == 1  # _reaped's own: this stand-in never exits by itself
+        assert process.waits[0] == _process.REAP_TIMEOUT_S
+        assert process.kills == 1  # reaped()'s own: this stand-in never exits by itself
 
     def test_a_worker_that_will_not_exit_is_killed_then_reaped(self):
         process = FakeProcess()
 
-        assert render._reaped(process, 0.0) == -9
-        assert (process.waits, process.kills) == ([0.0, render._REAP_TIMEOUT_S], 1)
+        assert _process.reaped(process, 0.0) == -9
+        assert (process.waits, process.kills) == ([0.0, _process.REAP_TIMEOUT_S], 1)
 
     def test_a_worker_that_outlives_its_kill_is_reported_unreaped(self):
         process = FakeProcess()
         process.kill = lambda: setattr(process, "kills", process.kills + 1)  # a kill that never lands
 
-        assert render._reaped(process, 0.0) is None
-        assert (process.waits, process.kills) == ([0.0, render._REAP_TIMEOUT_S], 1)
+        assert _process.reaped(process, 0.0) is None
+        assert (process.waits, process.kills) == ([0.0, _process.REAP_TIMEOUT_S], 1)
 
 
 NO_GUARD_SCRIPT = """
@@ -941,7 +941,7 @@ class TestWorkerProcess:
         with open(tmp_path / "stderr", "w+b") as errors:
             errors.write(written)
 
-            assert render._stderr_tail(errors) == tail
+            assert _process.stderr_tail(errors) == tail
 
     def test_a_failure_without_a_reply_ends_with_the_workers_stderr(self):
         request = render._Request(

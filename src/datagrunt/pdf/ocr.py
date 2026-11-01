@@ -55,6 +55,7 @@ from typing import IO, Literal, NamedTuple
 from PIL import Image, ImageOps
 
 from datagrunt.pdf._executables import trusted_executable
+from datagrunt.pdf._process import REAP_TIMEOUT_S, close_pipes, reaped, stderr_tail
 from datagrunt.pdf._validate import (
     choice_str,
     finite_float,
@@ -65,7 +66,7 @@ from datagrunt.pdf._validate import (
     typed_tuple,
 )
 from datagrunt.pdf.elements import BBox
-from datagrunt.pdf.render import _REAP_TIMEOUT_S, RenderedPage, _close_pipes, _reaped, _stderr_tail, render_size
+from datagrunt.pdf.render import RenderedPage, render_size
 
 # The spec's autocontrast: the percent of pixels ignored at each end of the histogram.
 _AUTOCONTRAST_CUTOFF = 1
@@ -638,12 +639,12 @@ def _call(argv: list[str], payload: tuple[bytes, ...], timeout_s: float) -> _Cal
         finally:
             # Cancelled and joined before the reap: a kill never reaches a reaped (reusable) pid.
             timer.cancel()
-            timer.join(_REAP_TIMEOUT_S)
+            timer.join(REAP_TIMEOUT_S)
             if stdout is None:  # past its stdout bound, or this call was interrupted
                 _kill(process)
-            returncode = _reaped(process, _REAP_TIMEOUT_S)
-            _close_pipes(process)
-        stderr = _stderr_tail(errors)
+            returncode = reaped(process, REAP_TIMEOUT_S)
+            close_pipes(process)
+        stderr = stderr_tail(errors)
     return _ending(returncode, expired.is_set(), stdout, fed, stderr, timeout_s)
 
 
