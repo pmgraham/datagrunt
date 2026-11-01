@@ -177,8 +177,10 @@ class ImageStats:
         skipped_unsized_images: Images whose decode size cannot be known
             without decoding, recorded without pixel metadata (size 0 where
             unknown): a dimension outside 1..131071, an unreadable JPEG or
-            JPEG 2000 header, or such a codestream behind a filter other than
-            ASCII85 / ASCIIHex (a Flate one could be a bomb). Never decoded.
+            JPEG 2000 header, such a codestream behind a filter other than
+            ASCII85 / ASCIIHex (a Flate one could be a bomb), or a codec whose
+            size is not read from its header (JBIG2: sizing it is #407; until
+            then the render guard refuses a page holding one). Never decoded.
         skipped_over_budget_images: Images recorded without hash, size or
             pixel metadata because the page's stream budget (2 GiB of stream
             bytes copied out of pdfium, length queries included) was spent:

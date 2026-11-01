@@ -972,8 +972,9 @@ def image_refusal(page: pdfium.PdfPage, geometry: PageGeometry, *, max_objects: 
     - the walk reaches either bound;
     - an image A2 refuses to decode (see :class:`ImageStats`: over the pixel,
       sample, component or JPEG 2000 tile bound; of a size that cannot be
-      read without decoding; its raw stream over the asset limit, or past the
-      page's stream budget);
+      read without decoding, which includes every JBIG2 image, so a JBIG2
+      scan is not rendered until its size can be read (#407); its raw
+      stream over the asset limit, or past the page's stream budget);
     - an image whose matrix to page space is not finite (its size is never
       read, so it cannot pass the bounds);
     - a pdfium call fails while walking or sizing.
