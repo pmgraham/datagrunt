@@ -83,8 +83,13 @@ def _norm(text):
 
 def _inline_text(token):
     """Visible text of an inline token; raw HTML other than ``<br>`` is surfaced as a marker."""
+    return _children_text(token.children or [])
+
+
+def _children_text(children):
+    """Visible text of inline children (see :func:`_inline_text`); a line break reads as a space."""
     parts = []
-    for child in token.children or []:
+    for child in children:
         if child.type in ("text", "text_special", "code_inline"):
             parts.append(child.content)
         elif child.type in ("softbreak", "hardbreak") or (child.type == "html_inline" and child.content == "<br>"):
@@ -145,6 +150,14 @@ def _element(kind, text):
             BulletList(**common, items=(text, "second"), ordered=False),
             [("bullet_list", [text, "second"], 2)],
         ),
+        "numbered_list": lambda: (
+            BulletList(**common, items=(text, "second"), ordered=True, markers=("7)", "8)")),
+            [("ordered_list", [text, "second"], 2)],
+        ),
+        "marker_text_list": lambda: (
+            BulletList(**common, items=(text, "second"), ordered=True, markers=("1.", "3.")),
+            [("paragraph", [f"1. {text} 3. second"], 0)],
+        ),
         "table": lambda: (
             Table(**common, headers=("h1", "h2"), rows=((text, "x"),), extraction_method="lattice"),
             [("table", ["h1", "h2", text, "x"], 0)],
@@ -184,10 +197,145 @@ def _assert_faithful(markdown, expected):
 
 
 @pytest.mark.parametrize("text", _TEXTS)
-@pytest.mark.parametrize("kind", ["paragraph", "heading", "key_value", "list", "table", "figure_caption", "figure_alt"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "paragraph",
+        "heading",
+        "key_value",
+        "list",
+        "numbered_list",
+        "marker_text_list",
+        "table",
+        "figure_caption",
+        "figure_alt",
+    ],
+)
 def test_element_text_renders_back_unchanged(kind, text):
     element, expected = _element(kind, text)
     _assert_faithful(_page_around(element).to_markdown(), expected)
+
+
+def _ordered_lists(markdown):
+    """Each top-level ordered list as ``(start, delimiter, item texts)``, as CommonMark reads it."""
+    tokens, lists = _MD.parse(markdown), []
+    for index, token in enumerate(tokens):
+        if token.type == "ordered_list_open" and token.level == 0:
+            inner = tokens[index : _close_index(tokens, index) + 1]
+            start = token.attrGet("start")
+            texts = [_norm(_inline_text(t)) for t in inner if t.type == "inline"]
+            lists.append((1 if start is None else int(start), token.markup, texts))
+    return lists
+
+
+def _hard_lines(children):
+    """A paragraph's inline children as its lines, split at hard line breaks (whitespace-normalised)."""
+    lines = [[]]
+    for child in children:
+        if child.type == "hardbreak":
+            lines.append([])
+        else:
+            lines[-1].append(child)
+    return [_norm(_children_text(line)) for line in lines]
+
+
+def _top_blocks(markdown):
+    """Top-level blocks in order: raw HTML as its text, a paragraph as its hard-broken lines, others by type."""
+    tokens, blocks = _MD.parse(markdown), []
+    for index, token in enumerate(tokens):
+        if token.level != 0 or token.nesting == -1:
+            continue
+        if token.type == "html_block":
+            blocks.append(("html", token.content.strip()))
+        elif token.type == "paragraph_open":
+            blocks.append(("paragraph", _hard_lines(tokens[index + 1].children or [])))
+        else:
+            blocks.append((token.type, None))
+    return blocks
+
+
+def _ordered(markers, hidden_reasons=()):
+    items = tuple(f"item {number}" for number in range(len(markers)))
+    common = {"element_id": "p0001_e001", "page_number": 1, "reading_order": 1, "bbox": _BOX}
+    return BulletList(**common, items=items, ordered=True, markers=markers, hidden_reasons=hidden_reasons), items
+
+
+@pytest.mark.parametrize(
+    "markers",
+    [("2)",), ("7.", "8.", "9."), ("7)", "8)", "9)"), ("1.", "2."), ("1)",), ("0.",), ("9.", "10."), ("123456789.",)],
+)
+def test_ordered_list_renders_its_source_numbers(markers):
+    element, items = _ordered(markers)
+    markdown = _page_around(element).to_markdown()
+
+    _assert_faithful(markdown, [("ordered_list", list(items), len(items))])
+    assert _ordered_lists(markdown) == [(int(markers[0][:-1]), markers[0][-1], list(items))]
+
+
+def test_hidden_ordered_list_keeps_its_start():
+    element, items = _ordered(("2)", "3)"), hidden_reasons=("duplicate",))
+    markdown = _page_around(element).to_markdown()
+
+    assert "<!-- hidden: duplicate -->" in markdown.splitlines()
+    assert _ordered_lists(markdown) == [(2, ")", list(items))]
+
+
+@pytest.mark.parametrize(
+    "markers",
+    [
+        ("a)", "b)"),
+        ("(1)", "(2)"),
+        ("iv.", "v."),
+        ("I", "II"),
+        ("VIII", "IX"),
+        ("1.", "2)"),
+        ("1.", "3."),
+        ("3)", "2)"),
+        ("01.", "02."),
+        ("1234567890.", "1234567891."),
+        ("999999999.", "1000000000."),
+        ("1.", "a)"),
+        ("١.", "٢."),
+    ],
+)
+def test_other_ordered_markers_stay_visible_as_text(markers):
+    element, items = _ordered(markers)
+    markdown = _page_around(element).to_markdown()
+
+    lines = [f"{marker} {item}" for marker, item in zip(markers, items, strict=True)]
+    _assert_faithful(markdown, [("paragraph", [" ".join(lines)], 0)])
+    assert _top_blocks(markdown)[-2:] == [("paragraph", lines), ("paragraph", ["SENTINEL"])]
+    assert _ordered_lists(markdown) == []
+
+
+@pytest.mark.parametrize("position", [0, 1])
+@pytest.mark.parametrize("text", _TEXTS)
+def test_marker_text_list_items_are_its_paragraph_lines(text, position):
+    items = ("first", "second")
+    items = (*items[:position], text, *items[position + 1 :])
+    common = {"element_id": "p0001_e001", "page_number": 1, "reading_order": 1, "bbox": _BOX}
+    element = BulletList(**common, items=items, ordered=True, markers=("1.", "3."))
+    lines = [_norm(f"1. {items[0]}"), _norm(f"3. {items[1]}")]
+
+    assert _top_blocks(_page_around(element).to_markdown())[-2:] == [("paragraph", lines), ("paragraph", ["SENTINEL"])]
+
+
+def test_marker_text_item_ending_in_backslash_renders_literally():
+    common = {"element_id": "p0001_e001", "page_number": 1, "reading_order": 1, "bbox": _BOX}
+    element = BulletList(**common, items=("ends \\", "next \\"), ordered=True, markers=("a)", "b)"))
+    blocks = _top_blocks(_page_around(element).to_markdown())
+
+    assert blocks[-2:] == [("paragraph", ["a) ends \\", "b) next \\"]), ("paragraph", ["SENTINEL"])]
+
+
+def test_hidden_marker_text_list_is_one_block_after_its_comment():
+    markers = ("a)", "b)", "c)")
+    element, items = _ordered(markers, hidden_reasons=("duplicate",))
+    blocks = _top_blocks(_page_around(element).to_markdown())
+    after = blocks[blocks.index(("html", "<!-- hidden: duplicate -->")) + 1 :]
+
+    lines = [f"{marker} {item}" for marker, item in zip(markers, items, strict=True)]
+    assert after == [("paragraph", lines), ("paragraph", ["SENTINEL"])]
 
 
 @pytest.mark.parametrize("text", ["<!-- draft", "*emph*", "    four spaces code"])

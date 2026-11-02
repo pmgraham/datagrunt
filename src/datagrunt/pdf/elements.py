@@ -93,6 +93,10 @@ _MARKDOWN_SYNTAX_CHAR = re.compile(r"[\\`*_\[\]<>&|~#]")
 # [0-9], not \d: list numbers are ASCII digits only.
 _LINE_START_MARKER = re.compile(r"\A(?:[-+=]|[0-9]+(?=[.)]))")
 
+# A marker CommonMark reads as an ordered-list item: 1-9 ASCII digits, then
+# "." or ")" (the digits and the delimiter are the groups).
+_COMMONMARK_NUMBER = re.compile(r"([0-9]{1,9})([.)])")
+
 # The Markdown line datagrunt puts between two consecutive lists: without it a
 # blank line alone would merge them into one loose list (and renumber it).
 _LIST_SEPARATOR = "<!-- -->"
@@ -241,6 +245,52 @@ def _markdown_literal(text: str) -> list[str]:
             escaped = _MARKDOWN_SYNTAX_CHAR.sub(r"\\\g<0>", line)
             lines.append(_LINE_START_MARKER.sub(_escape_line_start, escaped, count=1))
     return lines
+
+
+def _shown_as_written(markers: tuple[str, ...]) -> bool:
+    """True if CommonMark shows ``markers`` exactly as written when they number one list.
+
+    CommonMark takes a list's start from its first number and counts up by
+    one from there, and a change of delimiter starts a new list. So every
+    marker must be a CommonMark number with the first marker's delimiter, and
+    each must be the previous number plus one, written without leading zeros
+    (``01.`` would show as ``1.``).
+    """
+    first = _COMMONMARK_NUMBER.fullmatch(markers[0]) if markers else None
+    if first is None:
+        return False
+    start, delimiter = int(first[1]), first[2]
+    for offset, marker in enumerate(markers):
+        if _COMMONMARK_NUMBER.fullmatch(marker) is None or marker != f"{start + offset}{delimiter}":
+            return False
+    return True
+
+
+def _list_entries(markers: Iterable[str], items: tuple[str, ...]) -> str:
+    """Render one ``marker item`` list entry per item, one marker per item.
+
+    Each item becomes literal Markdown lines, and continuation lines are
+    indented to the item's content column so they stay inside the list item.
+    """
+    entries = []
+    for marker, item in zip(markers, items, strict=True):
+        continuation = "\n" + " " * (len(marker) + 1)
+        entries.append(f"{marker} {continuation.join(_markdown_literal(item))}")
+    return "\n".join(entries)
+
+
+def _marker_text_entries(markers: tuple[str, ...], items: tuple[str, ...]) -> str:
+    """Render the items as one paragraph, each item ``marker item`` as literal text on its own line.
+
+    The marker and item are escaped as one literal text, so a number leading
+    the line is escaped (``2\\)``) and CommonMark reads no list number from it.
+    Every item but the last ends in a backslash, a CommonMark hard line break:
+    the list stays one block, so a ``<!-- hidden -->`` comment covers all of
+    it. Escaping doubles every backslash in the text, so an item's own
+    trailing backslash stays literal and the one added is always the break.
+    """
+    entries = ("\n".join(_markdown_literal(f"{marker} {item}")) for marker, item in zip(markers, items, strict=True))
+    return "\\\n".join(entries)
 
 
 def _gfm_row(cells: tuple[str, ...]) -> str:
@@ -657,8 +707,9 @@ class BulletList(_Element):
         items: Each item's text, its marker not included.
         ordered: True if its markers number the items.
         markers: Each item's marker as written ("•", "1.", "(a)"), one per
-            item and non-blank, or empty when not recorded. Kept, not
-            rendered: Markdown numbers or bullets the items itself.
+            item and non-blank, or empty when not recorded. An ordered
+            list's Markdown shows them (see :meth:`_render_markdown`); an
+            unordered list's bullets every item ``-``.
     """
 
     items: tuple[str, ...]
@@ -677,18 +728,30 @@ class BulletList(_Element):
             )
 
     def _render_markdown(self) -> str:
-        """Render one ``- item`` (or ``N. item``) entry per item.
+        """Render the items in one of three forms, keeping an ordered list's numbering (#434).
 
-        Each item becomes literal Markdown lines, and continuation lines are
-        indented to the item's content column so they stay inside the list item.
+        - Unordered: one ``- item`` list entry per item; markers are not shown.
+        - Ordered, with markers CommonMark shows as written (one delimiter,
+          counting up by one, no leading zeros: ``7.``, ``8.``): one list
+          entry per item under its own marker, so the list starts where the
+          source's does (``2) item`` starts at 2). With no markers recorded
+          the entries are numbered ``1.``, ``2.``, ...
+        - Ordered, with any other markers (``a)``, ``iv.``, ``(1)``, ``I``, or
+          numbers CommonMark would show differently, such as ``1.`` then ``3.``):
+          one paragraph with a line per item, ``marker item`` as literal text,
+          items split by hard line breaks, so every marker stays visible and
+          none reads as a list number.
+
+        A list is never split between forms, so its items render alike, and
+        every form is one Markdown block.
         """
-        entries = []
-        for number, item in enumerate(self.items, start=1):
-            marker = f"{number}." if self.ordered else "-"
-            lines = _markdown_literal(item)
-            continuation = "\n" + " " * (len(marker) + 1)
-            entries.append(f"{marker} {continuation.join(lines)}")
-        return "\n".join(entries)
+        if not self.ordered:
+            return _list_entries(("-",) * len(self.items), self.items)
+        if not self.markers:
+            return _list_entries((f"{number}." for number in range(1, len(self.items) + 1)), self.items)
+        if _shown_as_written(self.markers):
+            return _list_entries(self.markers, self.items)
+        return _marker_text_entries(self.markers, self.items)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
