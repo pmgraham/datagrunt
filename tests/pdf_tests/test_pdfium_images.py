@@ -30,7 +30,16 @@ import pypdfium2.raw as pdfium_c
 import pytest
 from PIL import Image
 
-from datagrunt.pdf import BBox, DatagruntPDFError, Figure, PDFCorruptError, PDFEncryptedError, _pdfium_images, elements
+from datagrunt.pdf import (
+    BBox,
+    DatagruntPDFError,
+    Figure,
+    PDFCorruptError,
+    PDFEncryptedError,
+    _pdfium_images,
+    elements,
+    pdfium_engine,
+)
 from datagrunt.pdf._image_headers import jpeg_size
 from datagrunt.pdf._path_segments import Matrix, NonFiniteGeometry
 from datagrunt.pdf.pdfium_engine import (
@@ -972,6 +981,17 @@ class TestChangedFile:
         rewrite(path, b"10 10 m 100 10 l S")
 
         self.changed(image_loader, "the page has 1 object(s)")
+
+    def test_a_page_now_past_the_walks_object_bound(self, tmp_path, monkeypatch):
+        path = xobject_page(
+            tmp_path, FLATE, RGB_4X2 + b" /Filter /FlateDecode", b"q 80 0 0 40 10 20 cm /Im Do Q 0 0 m 9 9 l S"
+        )
+        image_loader = only_loader(path)
+        monkeypatch.setattr(pdfium_engine, "MAX_PAGE_OBJECTS", 1)
+
+        expected = "the file changed (the page holds 2 objects, over the walk's 1-object bound)"
+        with pytest.raises(DatagruntPDFError, match=re.escape(expected)):
+            image_loader.raw_bytes()
 
     def test_fewer_pages(self, tmp_path):
         pages = [PageSpec(), PageSpec(items=(RasterImage(10.0, 10.0, 40.0, 30.0, PNG),))]

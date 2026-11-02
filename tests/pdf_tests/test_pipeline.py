@@ -23,7 +23,15 @@ from pathlib import Path
 import pypdfium2.raw as pdfium_c
 import pytest
 
-from datagrunt.pdf import DatagruntPDFError, PDFCorruptError, PDFEncryptedError, _page_worker, _process, pipeline
+from datagrunt.pdf import (
+    DatagruntPDFError,
+    PDFCorruptError,
+    PDFEncryptedError,
+    _page_worker,
+    _process,
+    pdfium_engine,
+    pipeline,
+)
 from datagrunt.pdf._memory_cap import Lifetime
 from datagrunt.pdf._page_worker import extract_page_at
 from datagrunt.pdf.assembly import _VISION_NOTE, assemble_page
@@ -41,13 +49,14 @@ from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, SourceIdentity, e
 from datagrunt.pdf.quality import assess_page
 from datagrunt.pdf.scope import apply_scope
 from datagrunt.pdf.vision import VisionOptions, vision_page
-from pdf_tests.builders import PageSpec, RasterImage, TextRun, break_page, build_pdf, solid_png
+from pdf_tests.builders import Line, PageSpec, RasterImage, TextRun, break_page, build_pdf, solid_png
 from pdf_tests.test_layout_lattice import rules as lattice_rules
 from pdf_tests.test_layout_lattice import written
 from pdf_tests.test_layout_stream_tables import body_text, table_runs
 from pdf_tests.test_ocr import fake_tesseract, needs_tesseract, posix_only, row, tsv
 from pdf_tests.test_ocr_scans import LINES, TOKENS, png_of, rendered
 from pdf_tests.test_pdfium_extract_page import failing
+from pdf_tests.test_pdfium_spans import content_page
 from pdf_tests.test_routing import BROKEN_LINE, MAPPED_LINE, garbled, garbled_page
 
 LATTICE_XS = (50.0, 150.0, 250.0, 350.0)
@@ -268,6 +277,12 @@ def hang_on_page_3(message, replies):
     """The worker holding page 3 never replies; the rest are the pipeline's."""
     if holds_page_3(message):
         time.sleep(60)
+    _page_worker._worker_main(message, replies)
+
+
+def with_a_3_object_walk_bound(message, replies):
+    """The pipeline's worker, its page walk bounded at 3 objects (in this worker only)."""
+    pdfium_engine.MAX_PAGE_OBJECTS = 3
     _page_worker._worker_main(message, replies)
 
 
@@ -853,6 +868,16 @@ class TestPageIsolation:
         assert dataclasses.replace(page, page_image=None) == error_page(1, why, size=(400.0, 300.0))
         assert page.page_image is not None  # its render was made: OCR could not read it
 
+    def test_a_page_past_a_walk_bound_is_an_error_page_of_its_own_size_naming_the_bound(self, tmp_path, monkeypatch):
+        path = content_page(tmp_path, b"10 10 m 20 20 l S 30 30 m 40 40 l S 50 50 m 60 60 l S 70 70 m 80 80 l S")
+        monkeypatch.setattr(pdfium_engine, "MAX_PAGE_OBJECTS", 3)
+
+        page = page_at(path, ocr="never")
+
+        bound = "page 1: the page holds 4 objects, over the walk's 3-object bound; the page is not read"
+        why = f"extraction failed at stage 'text': {bound}; ocr='never', so the page is not read by OCR"
+        assert page == error_page(1, why, size=(400.0, 300.0))
+
     def test_a_failed_page_reads_nothing_by_ocr_under_ocr_never(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "doc.pdf", [PageSpec(width=400.0, height=300.0, items=body_text(100.0))])
         monkeypatch.setattr(pdfium_c, "FPDFText_CountChars", failing(-1))
@@ -1362,6 +1387,27 @@ class TestWorkers:
         with pytest.raises(DatagruntPDFError, match=re.escape(message)):
             extract_document(path, workers=2, strict=True)
 
+        assert_reaped(started)
+
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_a_page_past_a_walk_bound_in_a_worker_is_an_error_page_and_the_rest_extract(self, tmp_path, monkeypatch):
+        rules = tuple(Line(20.0, 20.0 + 10.0 * index, 200.0, 20.0 + 10.0 * index) for index in range(4))
+        pages = [
+            PageSpec(items=(TextRun("One", 72.0, 72.0),)),
+            PageSpec(items=rules),
+            PageSpec(items=(TextRun("Three", 72.0, 72.0),)),
+        ]
+        path = build_pdf(tmp_path / "doc.pdf", pages)
+        sequential = extract_document(path, ocr="never")
+        started = started_workers(monkeypatch)
+        run_page_workers_as(monkeypatch, "with_a_3_object_walk_bound")
+
+        pooled = extract_document(path, workers=2, ocr="never")
+
+        bound = "page 2: the page holds 4 objects, over the walk's 3-object bound; the page is not read"
+        why = f"extraction failed at stage 'text': {bound}; ocr='never', so the page is not read by OCR"
+        assert pooled.pages[1] == error_page(2, why)
+        assert [pooled.pages[0], pooled.pages[2]] == [sequential.pages[0], sequential.pages[2]]
         assert_reaped(started)
 
     @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed

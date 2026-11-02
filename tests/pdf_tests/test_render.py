@@ -392,7 +392,7 @@ class TestImageGuard:
             assert pdfium_c.FPDFPage_CountObjects(page.raw) == 4
 
         monkeypatch.setattr(_render_worker, "_MAX_GUARD_OBJECTS", 3)
-        message = "page 1: the page holds 4 objects, over the guard's 3-object bound; the page is not rendered"
+        message = "page 1: the page holds 4 objects, over the walk's 3-object bound; the page is not rendered"
         with pytest.raises(RenderRefused, match=re.escape(message)):
             with _render_worker._guarded_page(path, 0, None):
                 pytest.fail("a page over the guard's bound was yielded")
@@ -433,13 +433,13 @@ class TestBoundedWalk:
         path = content_page(tmp_path, FOUR_PATHS)
         monkeypatch.setattr(pdfium_c, "FPDFPage_GetObject", lambda *args: pytest.fail("an object was read"))
 
-        assert refusal_of(path, max_objects=3) == "the page holds 4 objects, over the guard's 3-object bound"
+        assert refusal_of(path, max_objects=3) == "the page holds 4 objects, over the walk's 3-object bound"
 
     def test_form_contents_count_toward_the_bound(self, tmp_path):
         path = chained_forms(tmp_path, 1, FOUR_PATHS)
 
         assert refusal_of(path, max_objects=5) is None
-        expected = "form object 0 holds 4 objects, which take the page over the guard's 4-object bound"
+        expected = "form object 0 holds 4 objects, which take the page over the walk's 4-object bound"
         assert refusal_of(path, max_objects=4) == expected
 
     def test_a_form_with_objects_past_the_depth_bound_is_refused(self, tmp_path, monkeypatch):
@@ -454,11 +454,11 @@ class TestBoundedWalk:
 
         assert refusal_of(chained_forms(tmp_path, 4, b"")) is None
 
-    def test_the_extraction_walk_keeps_no_bound(self, tmp_path, monkeypatch):
-        # extract_page reads every object pdfium parsed (100 % extraction): only the guard's walk refuses.
+    def test_the_extraction_walk_refuses_a_deep_form_whole(self, tmp_path, monkeypatch):
+        # extract_page reads every object pdfium parsed, or fails the page naming why: never a page read in part.
         monkeypatch.setattr(pdfium_engine, "_MAX_FORM_DEPTH", 3)
-        page = open_document(chained_forms(tmp_path, 4, b"10 10 m 20 20 l S"))._pdf[0]
 
-        assert len(pdfium_engine._page_objects(page.raw)) == 4
-        with pytest.raises(pdfium_engine.WalkBoundHit, match="form object 3 holds 1 object"):
-            pdfium_engine._page_objects(page.raw, max_objects=1_000_000)
+        got = pdfium_engine.extract_page(open_document(chained_forms(tmp_path, 4, b"10 10 m 20 20 l S")), 0)
+
+        message = "page 1: form object 3 holds 1 object(s) past the walk's 3-form depth bound; the page is not read"
+        assert got == pdfium_engine.PageFailure(page_number=1, stage="text", message=message)

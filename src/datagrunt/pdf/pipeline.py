@@ -20,11 +20,13 @@ runs them :data:`_WINDOW_PAGES` pages at a time, steps 1-3 for each page of
 a window before step 4 for any):
 
 1. A2 :func:`~datagrunt.pdf.pdfium_engine.extract_page`. A
-   :class:`~datagrunt.pdf.pdfium_engine.PageFailure` raises
-   :class:`~datagrunt.pdf.exceptions.PDFCorruptError` naming the page under
-   ``strict``; else it is A5b's :func:`~datagrunt.pdf.vision.fallback_page`'s
-   (its geometry read again, then render and OCR: ``"ocr_fallback"``, or an
-   error page naming why it was not read).
+   :class:`~datagrunt.pdf.pdfium_engine.PageFailure` (a page pdfium cannot
+   read, or one past a walk bound: its objects, path segments or textpage
+   chars) raises :class:`~datagrunt.pdf.exceptions.PDFCorruptError` naming
+   the page under ``strict``; else it is A5b's
+   :func:`~datagrunt.pdf.vision.fallback_page`'s (its geometry read again,
+   then render and OCR: ``"ocr_fallback"``, or an error page naming why it
+   was not read).
 2. A2 :func:`~datagrunt.pdf.pdfium_engine.recover_dropped_text`, when the
    page's textpage drops text objects (``TextStats.dropped_text_objects``
    over 0).

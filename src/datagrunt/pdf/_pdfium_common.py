@@ -12,13 +12,23 @@ import pypdfium2.raw as pdfium_c
 
 from datagrunt.pdf._boxes import Box, union_box
 
-__all__ = ["Box", "PdfiumFailure", "object_address", "read_rgba", "union_box"]
+__all__ = ["Box", "PdfiumFailure", "WalkBoundHit", "object_address", "read_rgba", "union_box"]
 
 
 class PdfiumFailure(Exception):
     """A pdfium call failed; the engine reports it as PDFCorruptError for the page.
 
     The message completes "pdfium cannot ...".
+    """
+
+
+class WalkBoundHit(Exception):
+    """A walk of a page reached one of its bounds (objects, form depth, path segments, textpage chars).
+
+    What lies past the bound was not read: extraction fails the page whole
+    (a PDFCorruptError naming it), and the render guard refuses the render.
+    The message names the bound, and the object or form that reached it (if
+    one did).
     """
 
 

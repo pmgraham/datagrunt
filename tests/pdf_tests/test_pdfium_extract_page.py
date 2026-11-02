@@ -15,7 +15,7 @@ import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 import pytest
 
-from datagrunt.pdf import PDFCorruptError, pdfium_engine
+from datagrunt.pdf import PDFCorruptError, _pdfium_text, pdfium_engine
 from datagrunt.pdf.pdfium_engine import (
     ImageStats,
     ObjectBoxes,
@@ -35,7 +35,17 @@ from datagrunt.pdf.pdfium_engine import (
     page_segments,
     page_text,
 )
-from pdf_tests.builders import Line, PageSpec, RasterImage, TextRun, break_page, build_pdf, solid_png
+from pdf_tests.builders import (
+    Line,
+    PageSpec,
+    RasterImage,
+    TextRun,
+    break_page,
+    build_pdf,
+    hand_written_pdf,
+    solid_png,
+)
+from pdf_tests.test_pdfium_spans import content_page
 
 PNG = solid_png(64, 32, (1.0, 0.0, 0.0))
 # On a page holding all three, the text is object 0, the line 1 and the image 2.
@@ -271,6 +281,130 @@ class TestStageFailures:
         assert got == PageFailure(
             page_number=1, stage="objects", message="page 1: pdfium cannot read the draw mode of object 1"
         )
+
+
+# Four 2-segment paths (a MOVETO and a LINETO each): objects 0-3, 8 segments.
+FOUR_PATHS = b"10 10 m 20 20 l S 30 30 m 40 40 l S 50 50 m 60 60 l S 70 70 m 80 80 l S"
+WALKED = ("page_text", "page_segments", "page_images", "page_object_boxes")
+
+
+def form_tree(tmp_path: Path, depth: int, branch: int, leaf: bytes = b"10 10 m 20 20 l S") -> Path:
+    """A page drawing form 0; form i draws form i + 1 ``branch`` times, ``depth`` forms deep; the last draws ``leaf``.
+
+    The file grows by one form a level, the page's object walk by ``branch`` times: depth 10 at branch 4 is
+    a 2.4 KB file of 611,669 objects (349,525 forms and 262,144 paths).
+    """
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Contents 4 0 R "
+        b"/Resources << /XObject << /X 5 0 R >> >> >>",
+        b"<< /Length 5 >>\nstream\n/X Do\nendstream",
+    ]
+    for level in range(depth):
+        last = level == depth - 1
+        body = leaf if last else b" ".join([b"/X Do"] * branch)
+        resources = b"" if last else b"/XObject << /X %d 0 R >>" % (len(objects) + 2)
+        form = b"<< /Type /XObject /Subtype /Form /BBox [0 0 400 300] /Resources << %s >> /Length %d >>"
+        objects.append(form % (resources, len(body)) + b"\nstream\n%s\nendstream" % body)
+    return hand_written_pdf(tmp_path / "tree.pdf", objects)
+
+
+class TestWalkBounds:
+    """Every walk of a page has an explicit bound: objects (forms' included), path segments and textpage chars.
+
+    A page past one fails whole, as a PageFailure naming the bound: nothing of it is read in part.
+    """
+
+    def test_the_bounds(self):
+        assert pdfium_engine.MAX_PAGE_OBJECTS == 500_000
+        assert pdfium_engine.MAX_PAGE_SEGMENTS == 1_000_000
+        assert _pdfium_text.MAX_PAGE_CHARS == 500_000
+
+    def test_a_page_at_every_bound_is_read(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pdfium_engine, "MAX_PAGE_OBJECTS", 5)
+        monkeypatch.setattr(pdfium_engine, "MAX_PAGE_SEGMENTS", 8)
+        monkeypatch.setattr(_pdfium_text, "MAX_PAGE_CHARS", 5)
+        path = content_page(tmp_path, b"BT /F1 12 Tf 72 200 Td (Hello) Tj ET " + FOUR_PATHS)
+
+        got = extract_page(open_document(path), 0)
+
+        assert isinstance(got, RawPage)
+        assert [span.text for span in got.text.spans] == ["Hello"]
+        assert {segment.object_index for segment in got.segments.segments} <= {1, 2, 3, 4}
+
+    def test_a_page_over_the_object_bound_fails_naming_it(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pdfium_engine, "MAX_PAGE_OBJECTS", 3)
+
+        got = extract_page(open_document(content_page(tmp_path, FOUR_PATHS)), 0)
+
+        message = "page 1: the page holds 4 objects, over the walk's 3-object bound; the page is not read"
+        assert got == PageFailure(page_number=1, stage="text", message=message)
+
+    def test_a_forms_contents_count_toward_the_object_bound(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pdfium_engine, "MAX_PAGE_OBJECTS", 4)
+
+        got = extract_page(open_document(form_tree(tmp_path, 1, 1, FOUR_PATHS)), 0)
+
+        message = (
+            "page 1: form object 0 holds 4 objects, which take the page over the walk's 4-object bound; "
+            "the page is not read"
+        )
+        assert got == PageFailure(page_number=1, stage="text", message=message)
+
+    def test_a_page_over_the_segment_bound_fails_naming_the_path(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pdfium_engine, "MAX_PAGE_SEGMENTS", 7)
+
+        got = extract_page(open_document(content_page(tmp_path, FOUR_PATHS)), 0)
+
+        message = (
+            "page 1: object 3's 2 path segments take the page over the walk's 7-segment bound; the page is not read"
+        )
+        assert got == PageFailure(page_number=1, stage="objects", message=message)
+
+    def test_a_page_over_the_char_bound_fails_naming_it(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_pdfium_text, "MAX_PAGE_CHARS", 4)
+
+        got = extract_page(open_document(content_page(tmp_path, b"BT /F1 12 Tf 72 200 Td (Hello) Tj ET")), 0)
+
+        message = "page 1: the text page holds 5 chars, over the walk's 4-char bound; the page is not read"
+        assert got == PageFailure(page_number=1, stage="text", message=message)
+
+    @pytest.mark.parametrize("read", WALKED)
+    def test_each_stage_function_raises_the_bound_for_its_page(self, tmp_path, monkeypatch, read):
+        monkeypatch.setattr(pdfium_engine, "MAX_PAGE_OBJECTS", 3)
+        handle = open_document(content_page(tmp_path, FOUR_PATHS))
+
+        error = corrupt_error(getattr(pdfium_engine, read), handle, 0)
+
+        assert (str(error), error.page_number) == (
+            "page 1: the page holds 4 objects, over the walk's 3-object bound; the page is not read",
+            1,
+        )
+
+    def test_recovery_is_bounded_as_extraction_is(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pdfium_engine, "MAX_PAGE_OBJECTS", 3)
+        handle = open_document(content_page(tmp_path, FOUR_PATHS))
+
+        error = corrupt_error(pdfium_engine.recover_dropped_text, handle, 0)
+
+        assert error.page_number == 1
+        assert "over the walk's 3-object bound" in str(error)
+
+    def test_no_walk_is_unbounded(self, tmp_path):
+        page = open_document(content_page(tmp_path, FOUR_PATHS))._pdf[0]
+
+        with pytest.raises(TypeError, match="max_objects"):
+            pdfium_engine._page_objects(page.raw)  # type: ignore[call-arg]
+
+    def test_a_form_tree_past_the_object_bound_fails_at_the_real_bound(self, tmp_path):
+        # 2.4 KB, 611,669 objects: it took 9 s and 1 GiB to extract unbounded (verify/D4).
+        got = extract_page(open_document(form_tree(tmp_path, 10, 4)), 0)
+
+        assert isinstance(got, PageFailure)
+        assert (got.page_number, got.stage) == (1, "text")
+        assert got.message.startswith("page 1: form object ")
+        assert got.message.endswith("which take the page over the walk's 500000-object bound; the page is not read")
 
 
 def raises_bug(*args, **kwargs):
