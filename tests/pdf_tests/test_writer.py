@@ -42,7 +42,18 @@ from pdf_tests.documents import (
     rich_document,
     surrogate_document,
 )
-from pdf_tests.test_bundle import CAP, TIMEOUT, fake_render, manifest_of, png_pixels, source_pdf
+from pdf_tests.test_bundle import (
+    AS_GREY,
+    AS_RGB,
+    CAP,
+    TIMEOUT,
+    UNREADABLE,
+    fake_render,
+    manifest_of,
+    png_pixels,
+    shared_stream_pdf,
+    source_pdf,
+)
 from pdf_tests.test_layout_stream_tables import body_text
 
 OPTIONS = {
@@ -678,8 +689,20 @@ class TestExtractImages:
         assert FIGURE_A_SHA < FIGURE_B_SHA  # document order (B, A) is not sorted order
         assert paths == [tmp_path / "images" / f"{FIGURE_B_SHA}.png", tmp_path / "images" / f"{FIGURE_A_SHA}.png"]
         assert [path.read_bytes() for path in paths] == [PNG_B, PNG_A]
-        assert [loader.calls for loader in loaders] == [1, 1, 0]
+        assert [loader.calls for loader in loaders] == [1, 1, 1]  # every figure is read: its PNG decides
         assert sorted(p.name for p in (tmp_path / "images").iterdir()) == sorted(p.name for p in paths)
+
+    def test_a_stream_read_as_another_picture_is_written_too(self, tmp_path):
+        paths = PDFWriter(figures_document(Counted(PNG_B), Counted(PNG_A), Counted(RED))).extract_images(
+            tmp_path / "images"
+        )
+        red = hashlib.sha256(RED).hexdigest()
+        assert [path.name for path in paths] == [
+            f"{FIGURE_B_SHA}.png",
+            f"{FIGURE_A_SHA}.png",
+            f"{FIGURE_B_SHA}-{red}.png",
+        ]
+        assert [path.read_bytes() for path in paths] == [PNG_B, PNG_A, RED]
 
     def test_without_dedupe_each_figure_is_its_own_file_in_document_order(self, tmp_path):
         loaders = Counted(PNG_B), Counted(PNG_A), Counted(PNG_B)
@@ -701,11 +724,11 @@ class TestExtractImages:
         caplog.set_level(logging.WARNING, logger=WRITER_LOGGER)
         loaders = Counted(outcome), Counted(PNG_A), Counted(PNG_B)
         paths = PDFWriter(figures_document(*loaders)).extract_images(tmp_path / "images")
-        assert paths == [tmp_path / "images" / f"{FIGURE_A_SHA}.png"]
+        assert paths == [tmp_path / "images" / f"{FIGURE_A_SHA}.png", tmp_path / "images" / f"{FIGURE_B_SHA}.png"]
         assert warnings_of(caplog) == [f"figure p0001_e000 (sha256 {FIGURE_B_SHA}) was not written: {reason}"]
         assert [record.levelno for record in caplog.records if record.name == WRITER_LOGGER] == [logging.WARNING]
-        assert loaders[2].calls == 0  # each distinct sha256 is read once: its first figure
-        assert sorted(p.name for p in (tmp_path / "images").iterdir()) == [f"{FIGURE_A_SHA}.png"]
+        assert loaders[2].calls == 1  # a later figure of the stream is read though the first failed
+        assert paths[1].read_bytes() == PNG_B
 
     def test_without_dedupe_each_failing_figure_is_skipped_with_its_own_warning(self, tmp_path, caplog):
         caplog.set_level(logging.WARNING, logger=WRITER_LOGGER)
@@ -793,6 +816,26 @@ class TestExtractImagesFromAPdf:
             assert hashlib.sha256(first[sha].read_raw_bytes()).hexdigest() == sha
             with Image.open(path) as image:
                 assert image.size == (first[sha].width_px, first[sha].height_px)
+
+    def test_one_stream_read_as_two_pictures_is_written_as_two(self, tmp_path):
+        made = PDFWriter(shared_stream_pdf(tmp_path / "shared.pdf", AS_RGB, AS_GREY), ocr="never")
+        paths = made.extract_images(tmp_path / "images")
+        figures = made._extracted().figures
+        own = [figure.read_bytes() for figure in figures]
+        sha, later = figures[0].sha256, hashlib.sha256(own[1]).hexdigest()
+        assert figures[1].sha256 == sha and own[0] != own[1]
+        assert [path.name for path in paths] == [f"{sha}.png", f"{sha}-{later}.png"]
+        assert [path.read_bytes() for path in paths] == own
+
+    def test_a_figure_is_written_though_an_earlier_one_of_its_stream_failed(self, tmp_path, caplog):
+        caplog.set_level(logging.WARNING, logger=WRITER_LOGGER)
+        made = PDFWriter(shared_stream_pdf(tmp_path / "shared.pdf", UNREADABLE, AS_RGB), ocr="never")
+        paths = made.extract_images(tmp_path / "images")
+        first, second = made._extracted().figures
+        assert [path.name for path in paths] == [f"{second.sha256}.png"]
+        assert paths[0].read_bytes() == second.read_bytes()
+        [warning] = warnings_of(caplog)
+        assert warning.startswith(f"figure p0001_e000 (sha256 {first.sha256}) was not written: PDFCorruptError: ")
 
     def test_without_dedupe_every_figure_is_written(self, tmp_path):
         made = PDFWriter(figures_pdf(tmp_path), ocr="never")

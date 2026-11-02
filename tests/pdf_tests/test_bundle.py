@@ -33,7 +33,7 @@ from datagrunt.pdf.exceptions import DatagruntPDFError, PDFSourceChangedError
 from datagrunt.pdf.ocr import tesseract_available
 from datagrunt.pdf.pipeline import extract_document
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page, render_size
-from pdf_tests.builders import PageSpec, TextRun, build_pdf, solid_png
+from pdf_tests.builders import PageSpec, TextRun, build_pdf, hand_written_pdf, solid_png
 from pdf_tests.documents import FIGURE_A_SHA, FIGURE_B_SHA, PAGE_SIZES, metadata, rich_document, surrogate_document
 from pdf_tests.test_layout_stream_tables import body_text
 
@@ -104,6 +104,36 @@ def bound_document(
         image_loader=render.png_bytes,
         band_loader=None if bands is None else render.band_png_bytes,
     )
+
+
+# One 64 x 64 image stream, which each dictionary below reads as another picture (or none): one sha256, many PNGs.
+SHARED_STREAM = bytes([10, 200, 10]) * (64 * 64)
+UNREADABLE = b"/Width 64 /Height 64 /ColorSpace /NoSuchSpace /BitsPerComponent 8"
+AS_RGB = b"/Width 64 /Height 64 /ColorSpace /DeviceRGB /BitsPerComponent 8"
+AS_GREY = b"/Width 64 /Height 64 /ColorSpace /DeviceGray /BitsPerComponent 8"
+
+
+def shared_stream_pdf(path: Path, first: bytes, second: bytes) -> Path:
+    """Two pages, each drawing one image: the same stream bytes under the image dictionaries ``first``, ``second``."""
+    page = (
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R "
+        b"/Resources << /XObject << /Im0 %d 0 R >> >> >>"
+    )
+
+    def stream(body: bytes, extra: bytes = b"") -> bytes:
+        return b"<< /Length %d %s >>\nstream\n%s\nendstream" % (len(body), extra, body)
+
+    image = b"/Type /XObject /Subtype /Image "
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+        page % 6,
+        page % 7,
+        stream(b"q 200 0 0 200 100 400 cm /Im0 Do Q"),
+        stream(SHARED_STREAM, image + first),
+        stream(SHARED_STREAM, image + second),
+    ]
+    return hand_written_pdf(path, objects)
 
 
 def files_in(root: Path) -> set[str]:
@@ -265,8 +295,8 @@ class TestDocument:
             assert figure.image_path == out / "images" / f"{figure.sha256}.png"
         assert [figure.read_bytes() for figure in written.returned.figures] == [PNG_A, PNG_A, PNG_B]
 
-    def test_each_distinct_figure_is_read_once_through_its_loader(self, written):
-        assert written.calls == {"a": 1, "b": 1}
+    def test_each_figure_is_read_through_its_loader_and_each_picture_written_once(self, written):
+        assert written.calls == {"a": 2, "b": 1}  # figure A twice: its PNG, not its sha256, decides it is the same
         assert (written.out / "images" / f"{FIGURE_A_SHA}.png").read_bytes() == PNG_A
 
     def test_pages_without_their_own_image_are_rendered_at_the_effective_dpi(self, written):
@@ -423,7 +453,7 @@ class TestFailuresAreRecorded:
             (DatagruntPDFError("report.pdf: page 1: the file changed"), "DatagruntPDFError: report.pdf: page 1"),
             (FileNotFoundError(2, "No such file or directory"), "FileNotFoundError: [Errno 2]"),
             (b"GIF89a not a png", "its bytes are not a PNG"),
-            (None, "DatagruntPDFError: figure p0001_e008 has no image bytes"),
+            (None, "has no image bytes: no image_path and no loader"),
         ],
     )
     def test_a_figure_whose_bytes_cannot_be_read_is_recorded(self, tmp_path, source, fast_render, loader, reason):
@@ -440,9 +470,14 @@ class TestFailuresAreRecorded:
             tmp_path / "out" / "images" / f"{FIGURE_B_SHA}.png",
         ]
         assert f"images/{FIGURE_A_SHA}.png" not in files_in(tmp_path / "out")
-        [missing] = manifest_of(tmp_path / "out")["missing"]
-        assert (missing["artifact"], missing["page_number"], missing["element_id"]) == ("figure", 1, "p0001_e008")
-        assert missing["reason"].startswith(f"figure {FIGURE_A_SHA} was not written: ") and reason in missing["reason"]
+        first, second = manifest_of(tmp_path / "out")["missing"]  # each figure of the stream: its own entry
+        assert (first["artifact"], first["page_number"], first["element_id"]) == ("figure", 1, "p0001_e008")
+        assert (second["artifact"], second["page_number"], second["element_id"]) == ("figure", 2, "p0002_e003")
+        for missing in (first, second):
+            assert (
+                missing["reason"].startswith(f"figure {FIGURE_A_SHA} was not written: ") and reason in missing["reason"]
+            )
+        assert load_bundle(tmp_path / "out") == returned
 
     def test_missing_entries_are_in_page_order(self, tmp_path, source, monkeypatch):
         monkeypatch.setattr(bundle, "render_page", lambda *a, **k: (_ for _ in ()).throw(RenderFailed("no")))
@@ -451,6 +486,7 @@ class TestFailuresAreRecorded:
         assert [(m["page_number"], m["artifact"]) for m in missing] == [
             (1, "figure"),
             (1, "page_image"),
+            (2, "figure"),
             (2, "page_image"),
             (4, "page_image"),
         ]
@@ -655,6 +691,53 @@ class TestValidation:
         returned = write(bound_document(path), tmp_path / "out", path, password="pw")
         assert manifest_of(tmp_path / "out")["missing"] == []
         assert png_pixels(returned.pages[0].page_image.image_path)[0] == "L"
+
+
+class TestFiguresSharingAStream:
+    """Figures of one raw stream (one sha256) under other image dictionaries: each its own PNG, or its own entry."""
+
+    def bundled(self, tmp_path: Path, first: bytes, second: bytes):
+        path = shared_stream_pdf(tmp_path / "shared.pdf", first, second)
+        document = extract_document(path, ocr="never")
+        assert [figure.element_id for figure in document.figures] == ["p0001_e000", "p0002_e000"]
+        assert len({figure.sha256 for figure in document.figures}) == 1
+        returned = write_bundle(document, tmp_path / "out", source=path, dpi=72)
+        return document, returned
+
+    def test_one_stream_read_as_two_pictures_is_written_as_two(self, tmp_path):
+        document, returned = self.bundled(tmp_path, AS_RGB, AS_GREY)
+        own = [figure.read_bytes() for figure in document.figures]
+        assert own[0] != own[1]
+        sha = document.figures[0].sha256
+        later = hashlib.sha256(own[1]).hexdigest()
+        out = tmp_path / "out"
+        assert [figure.image_path for figure in returned.figures] == [
+            out / "images" / f"{sha}.png",
+            out / "images" / f"{sha}-{later}.png",
+        ]
+        assert [figure.image_path.read_bytes() for figure in returned.figures] == own
+        assert [png_pixels(figure.image_path)[0] for figure in returned.figures] == ["RGB", "L"]
+        assert manifest_of(out)["missing"] == []
+        assert [figure.read_bytes() for figure in load_bundle(out).figures] == own
+
+    def test_a_figure_is_read_though_an_earlier_one_of_its_stream_failed(self, tmp_path):
+        document, returned = self.bundled(tmp_path, UNREADABLE, AS_RGB)
+        sha, out = document.figures[0].sha256, tmp_path / "out"
+        assert [figure.image_path for figure in returned.figures] == [None, out / "images" / f"{sha}.png"]
+        assert returned.figures[1].image_path.read_bytes() == document.figures[1].read_bytes()
+        [missing] = manifest_of(out)["missing"]
+        assert (missing["artifact"], missing["page_number"], missing["element_id"]) == ("figure", 1, "p0001_e000")
+        assert load_bundle(out) == returned
+
+    def test_each_figure_not_written_has_its_own_missing_entry(self, tmp_path):
+        _, returned = self.bundled(tmp_path, UNREADABLE, UNREADABLE)
+        assert [figure.image_path for figure in returned.figures] == [None, None]
+        missing = manifest_of(tmp_path / "out")["missing"]
+        assert [(m["artifact"], m["page_number"], m["element_id"]) for m in missing] == [
+            ("figure", 1, "p0001_e000"),
+            ("figure", 2, "p0002_e000"),
+        ]
+        assert load_bundle(tmp_path / "out") == returned
 
 
 class TestChunks:

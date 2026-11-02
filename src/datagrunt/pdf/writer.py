@@ -55,16 +55,18 @@ Each method writes the document in one form. A path returned is absolute
   loader, into ``output_dir``: an extracted figure's PNGs are read in
   batches, up to 64 a capped figure worker
   (:func:`~datagrunt.pdf._loaders.figure_pngs`), as ``Figure.read_bytes``
-  reads one; any other figure by its own ``read_bytes``. With ``dedupe``
-  (the default) each distinct ``sha256`` (the raw stream's: a figure's
-  identity) is read once, from its first figure, and written once, as
-  ``<sha256>.png``; without it, each figure is read and written as
-  ``<element_id>.png`` (``p0001_e003.png``). A figure whose bytes cannot be
-  read (a ``DatagruntPDFError``, an ``OSError``) or are not a PNG is
-  skipped, never silently: a warning on the module logger names the
-  figure, its sha256 and why (with ``dedupe``, its sha256 is not read
-  again). Any other error fails the call. The paths returned are the files
-  written, in document order.
+  reads one; any other figure by its own ``read_bytes``. Every figure is
+  read. With ``dedupe`` (the default) each distinct picture is written
+  once, as the bundle names it: ``<sha256>.png`` (the raw stream's sha256,
+  a figure's identity), and another picture of the same stream (the stream
+  under another image dictionary: a colour space, a palette, a
+  ``/Decode``) as ``<sha256>-<its PNG's sha256>.png``; without it, each
+  figure is written as ``<element_id>.png`` (``p0001_e003.png``). A figure
+  whose bytes cannot be read (a ``DatagruntPDFError``, an ``OSError``) or
+  are not a PNG is skipped, never silently: a warning on the module logger
+  names the figure, its sha256 and why; a later figure of its stream is
+  still read. Any other error fails the call. The paths returned are the
+  files written, in document order.
 - :meth:`PDFWriter.render_pages_as_images`: every page, rendered in A5a's
   guarded, capped worker (:func:`~datagrunt.pdf.render.render_page`, as
   the bundle renders: its memory cap and timeout) at
@@ -111,6 +113,7 @@ write survives a killed process, not a power loss.
 """
 
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -129,7 +132,7 @@ from datagrunt.pdf._source import checked_pdf_file
 from datagrunt.pdf._validate import checked_password as _checked_password
 from datagrunt.pdf._validate import checked_path as _checked_path
 from datagrunt.pdf._validate import int_at_least, strict_bool
-from datagrunt.pdf.bundle import _checked_target, _chunks, _drawn, _png, write_bundle
+from datagrunt.pdf.bundle import _checked_target, _chunks, _drawn, _Pictures, _png, write_bundle
 from datagrunt.pdf.codec import document_to_json_bytes
 from datagrunt.pdf.elements import Figure, Page, PDFDocument
 from datagrunt.pdf.frame import _BBOX_FIELDS, element_frame, utf8_text
@@ -461,25 +464,26 @@ def _json_array(items: list[str]) -> str:
 
 
 def _write_figures(figures: tuple[Figure, ...], directory: Path, *, dedupe: bool) -> list[Path]:
-    """Write each figure's PNG into ``directory`` (each distinct sha256 once, with ``dedupe``); the paths, in order.
+    """Write each figure's PNG into ``directory`` (each distinct picture once, with ``dedupe``); the paths, in order.
 
-    A figure whose bytes cannot be read, or are not a PNG, is skipped with a warning (see the module notes).
+    Every figure is read. A figure whose bytes cannot be read, or are not a PNG, is skipped with a warning (see
+    the module notes).
     """
     written: list[Path] = []
-    tried: set[str] = set()
-    chosen: list[Figure] = []
-    for figure in figures:
-        if dedupe and figure.sha256 in tried:
-            continue
-        tried.add(figure.sha256)
-        chosen.append(figure)
-    for figure, read in zip(chosen, figure_pngs(chosen), strict=True):  # read in batches, each when its turn comes
+    pictures = _Pictures()
+    for figure, read in zip(figures, figure_pngs(figures), strict=True):  # read in batches, each when its turn comes
         data, why = _png(read)
         if data is None:
             _LOGGER.warning("figure %s (sha256 %s) was not written: %s", figure.element_id, figure.sha256, why)
             continue
-        name = f"{figure.sha256}.png" if dedupe else f"{figure.element_id}.png"
-        written.append(_write_bytes(directory / name, data))
+        if not dedupe:
+            written.append(_write_bytes(directory / f"{figure.element_id}.png", data))
+            continue
+        digest = hashlib.sha256(data).hexdigest()
+        name, unwritten = pictures.name(figure.sha256, digest)
+        if unwritten:
+            written.append(_write_bytes(directory / name, data))
+            pictures.record(figure.sha256, digest, name)
     return written
 
 

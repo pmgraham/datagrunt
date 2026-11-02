@@ -9,9 +9,15 @@ Layout (paths relative to the bundle, joined with ``/``):
   (ASCII; its paths relative to the bundle).
 - ``markdown/document.md``: the document's Markdown, UTF-8, each lone
   surrogate written as its escape (:func:`~datagrunt.pdf.frame.utf8_text`);
-  a figure links to ``../images/<sha256>.png``, relative to the file.
-- ``images/<sha256>.png``: each distinct figure, once: its PNG from
-  ``Figure.read_bytes`` (its ``image_path``, else its loader).
+  a figure links to its own picture, ``../images/<name>.png``, relative to
+  the file.
+- ``images/<sha256>.png``: each distinct picture, once: a figure's PNG from
+  ``Figure.read_bytes`` (its ``image_path``, else its loader), named by
+  the figure's ``sha256`` (its raw stream's). Every figure is read, and
+  its PNG decides whether it is a picture already written: one stream under
+  two image dictionaries (a colour space, a palette, a ``/Decode``) is two
+  pictures, the second ``images/<sha256>-<its PNG's sha256>.png``
+  (:class:`_Pictures`). Each figure's ``image_path`` is its own picture.
 - ``page_images/page_NNNN.png``: every page's image (origin):
   - a page whose ``page_image`` is set (``"document"``: A5b's vision
     pages, rendered at the effective ``vision_dpi`` and normalized): its
@@ -74,9 +80,9 @@ read (a ``DatagruntPDFError``, render errors included, or an ``OSError``)
 or is not a PNG, has no page image (nor bands); a page whose own bands
 cannot be read, or one of them is not a PNG, keeps its image and has no
 bands; a figure whose bytes cannot be read or are not a PNG is not written
-(its figures keep no ``image_path``). Each is a ``missing`` entry naming
-the artifact, the page, the figure's element id (figures) and why. Any
-other error fails the write.
+(it keeps no ``image_path``; a later figure of its stream is still read).
+Each is a ``missing`` entry naming the artifact, the page, the figure's
+element id (one entry a figure) and why. Any other error fails the write.
 
 The page images are bound to the hashed source. The source's identity
 (A8a's ``SourceIdentity``: device, inode, size, mtime) is taken with its
@@ -101,7 +107,8 @@ Known limitations, documented:
   not ``FileExistsError``; it is never merged into, and staging is removed.
 - Figures are read in batches of up to 64 a figure worker
   (:func:`~datagrunt.pdf._loaders.figure_pngs`), each read reopening the
-  PDF, not batched by page through one handle.
+  PDF, not batched by page through one handle. Every figure is read, the
+  figures of one stream too: only its PNG shows it is the same picture.
 
 :func:`load_bundle` takes a bundle directory or its ``manifest.json``
 and returns the document. Nothing is trusted before it is checked:
@@ -471,25 +478,57 @@ def _staged(
     return returned, tuple(ledger.warnings)
 
 
+@dataclass
+class _Pictures:
+    """The distinct figure pictures written so far: each one's file name, by its stream's and its PNG's sha256.
+
+    A figure's ``sha256`` hashes its raw stream, but its PNG depends on its
+    image dictionary too (a colour space, a palette, a ``/Decode``), so one
+    stream can be two pictures: a picture is its stream's sha256 and its
+    PNG's. The first picture of a stream is ``<sha256>.png``; another
+    picture of it, ``<sha256>-<its PNG's sha256>.png``.
+    """
+
+    names: dict[tuple[str, str], str] = field(default_factory=dict)
+    streams: set[str] = field(default_factory=set)
+
+    def name(self, sha256: str, digest: str) -> tuple[str, bool]:
+        """The file name of the PNG whose sha256 is ``digest``, of stream ``sha256``; and whether it is unwritten."""
+        known = self.names.get((sha256, digest))
+        if known is not None:
+            return known, False
+        return (f"{sha256}-{digest}.png" if sha256 in self.streams else f"{sha256}.png"), True
+
+    def record(self, sha256: str, digest: str, name: str) -> None:
+        """Note the picture written, as ``name`` (once its file is)."""
+        self.names[(sha256, digest)] = name
+        self.streams.add(sha256)
+
+
 def _write_figures(document: PDFDocument, staging: Path, ledger: _Ledger) -> dict[str, str]:
-    """Write each distinct figure (by sha256) once; its relative path by sha256."""
-    written: dict[str, str] = {}
-    tried: set[str] = set()
-    distinct: list[Figure] = []
-    for figure in document.figures:
-        if figure.sha256 not in tried:
-            tried.add(figure.sha256)
-            distinct.append(figure)
-    for figure, read in zip(distinct, figure_pngs(distinct), strict=True):  # read in batches, each in its turn
+    """Write each figure's PNG, each distinct picture once (:class:`_Pictures`); each written figure's path, by id."""
+    paths: dict[str, str] = {}
+    pictures = _Pictures()
+    figures = document.figures
+    for figure, read in zip(figures, figure_pngs(figures), strict=True):  # read in batches, each in its turn
         data, why = _png(read)
         if data is None:
             reason = f"figure {figure.sha256} was not written: {why}"
             ledger.missing.append(_Missing("figure", figure.page_number, figure.element_id, reason))
             continue
-        relative = f"images/{figure.sha256}.png"
+        paths[figure.element_id] = _write_picture(staging, figure.sha256, data, pictures, ledger)
+    return paths
+
+
+def _write_picture(staging: Path, sha256: str, data: bytes, pictures: _Pictures, ledger: _Ledger) -> str:
+    """The relative path of the picture ``data`` (of stream ``sha256``): written now unless it already is."""
+    digest = hashlib.sha256(data).hexdigest()
+    name, unwritten = pictures.name(sha256, digest)
+    relative = f"images/{name}"
+    if unwritten:
         ledger.artifacts.append(_write_bytes(staging, relative, data))
-        written[figure.sha256] = relative
-    return written
+        pictures.record(sha256, digest, name)
+    return relative
 
 
 def _png(read: Callable[[], bytes]) -> tuple[bytes | None, str]:
@@ -685,7 +724,7 @@ def _write_stream(staging: Path, relative: str, fill: Callable[[_Sink], object])
 def _with_paths(
     document: PDFDocument, figures: Mapping[str, str], renders: Mapping[int, _Written], base: Path
 ) -> PDFDocument:
-    """``document`` with its figures' and pages' paths at ``base`` (sections hold the same figures)."""
+    """``document`` with its figures' (``figures``: by element id) and pages' paths at ``base`` (sections too)."""
     pages = tuple(_page_with_paths(page, figures, renders.get(page.page_number), base) for page in document.pages)
     return _with_pages(document, pages)
 
@@ -721,7 +760,7 @@ def _page_with_paths(page: Page, figures: Mapping[str, str], written: _Written |
 
 
 def _figure_with_path(figure: Figure, figures: Mapping[str, str], base: Path) -> Figure:
-    relative = figures.get(figure.sha256)
+    relative = figures.get(figure.element_id)
     return dataclasses.replace(figure, image_path=None if relative is None else _joined(base, relative))
 
 
@@ -1132,7 +1171,7 @@ def _check_page_images(document: PDFDocument, entries: tuple[_ImageEntry, ...]) 
 
 
 def _unwritten(document: PDFDocument, origins: Mapping[int, str]) -> set[tuple[str, int, str | None]]:
-    """What the document lacks, as missing entries' keys: page images, own bands, figures (by first figure).
+    """What the document lacks, as missing entries' keys: page images, own bands, figures (each its own).
 
     Only a page's own image (origin ``"document"``) has bands to lack: the
     bundle's render has none.
@@ -1144,11 +1183,9 @@ def _unwritten(document: PDFDocument, origins: Mapping[int, str]) -> set[tuple[s
             keys.add(("page_image", page.page_number, None))
         elif origins.get(page.page_number) == "document" and not image.band_paths:
             keys.add(("bands", page.page_number, None))
-    first: dict[str, Figure] = {}
     for figure in document.figures:
-        owner = first.setdefault(figure.sha256, figure)
         if figure.image_path is None:
-            keys.add(("figure", owner.page_number, owner.element_id))
+            keys.add(("figure", figure.page_number, figure.element_id))
     return keys
 
 

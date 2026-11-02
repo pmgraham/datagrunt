@@ -457,6 +457,11 @@ class TestDocumentAgainstManifest:
         with pytest.raises(BundleCorruptError, match=r"unrecorded: \[\('figure', 2, 'p0002_e004'\)\]"):
             load_bundle(copy)
 
+    def test_a_later_figure_of_a_stream_without_its_image_needs_its_own_missing_entry(self, copy):
+        edit_document_json(copy, lambda data: data["pages"][1]["elements"][3].update(image_path=None))
+        with pytest.raises(BundleCorruptError, match=r"unrecorded: \[\('figure', 2, 'p0002_e003'\)\]"):
+            load_bundle(copy)
+
     def test_a_missing_entry_listed_twice_is_refused(self, tmp_path, monkeypatch):
         monkeypatch.setattr(bundle, "render_page", lambda *a, **k: (_ for _ in ()).throw(bundle.RenderFailed("no")))
         source = source_pdf(tmp_path)
