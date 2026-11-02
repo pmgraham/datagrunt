@@ -184,7 +184,6 @@ _MAX_JPX_TILES = 4096
 # The most components (colour channels) a DCT or JPX image may decode with: CMYK's 4. A codestream header names its
 # own count (JPEG's Nf, JPEG 2000's Csiz), and the decoder allocates every one.
 _MAX_COMPONENTS = 4
-_MAX_DECODED_SAMPLES = _MAX_DECODED_PIXELS * 4
 
 # An ASCII-wrapped (ASCII85 / ASCIIHex) DCT or JPX stream at most this long
 # is decoded by pdfium to read its header: ASCII85's "z" turns 1 byte into 4,
@@ -735,7 +734,11 @@ def _decode_size(
     wrapped: Callable[[], bytes | str],
     label: str,
 ) -> tuple[int, int, tuple[Skip, str] | None]:
-    """The (width, height) pdfium decodes an image at, and why it must not (None: it may)."""
+    """The (width, height) pdfium decodes an image at, and why it must not (None: it may).
+
+    The size is a DCT or JPX codestream header's, else the declared one; it is
+    kept with a refusal whenever it was read (0 x 0 only when it is unknown).
+    """
     codec = filters[-1] if filters else ""
     wrappers = filters[:-1]
     reader = _HEADER_READERS.get(codec)
@@ -745,7 +748,7 @@ def _decode_size(
         behind = ", ".join(wrappers)
         message = f"{label} is a {codec} stream behind {behind}: its size cannot be read without decoding"
         return 0, 0, ("unsized", message)
-    tiles, components = 1, 1
+    tiles = 1
     if reader is None:
         width, height = declared
     else:
@@ -756,22 +759,14 @@ def _decode_size(
         header = reader(data)
         if header is None:
             return 0, 0, ("unsized", f"{label} has a {codec} header that cannot be read")
+        width, height, tiles = _dimension(header.width), _dimension(header.height), header.tiles
         if header.components > _MAX_COMPONENTS:
             message = f"{label} has {header.components} components, over the {_MAX_COMPONENTS}-component bound"
-            return 0, 0, ("oversized", message)
-        width, height = _dimension(header.width), _dimension(header.height)
-        tiles, components = header.tiles, header.components
+            return width, height, ("oversized", message)
     if not (width and height):
         return width, height, ("unsized", f"{label} has no pixel size pdfium can decode ({width} x {height})")
     if width * height > _MAX_DECODED_PIXELS:
         return width, height, ("oversized", _too_many_pixels(width, height, label))
-    if width * height * components > _MAX_DECODED_SAMPLES:
-        samples = width * height * components
-        message = (
-            f"{label} is {width} x {height} x {components} "
-            f"({samples} decoded samples, over the {_MAX_DECODED_SAMPLES}-sample bound)"
-        )
-        return 0, 0, ("oversized", message)
     if tiles > _MAX_JPX_TILES:
         return width, height, ("oversized", f"{label} decodes in {tiles} tiles, over the {_MAX_JPX_TILES}-tile bound")
     return width, height, None

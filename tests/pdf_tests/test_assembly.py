@@ -29,6 +29,7 @@ from datagrunt.pdf.assembly import (
     pass_c,
 )
 from datagrunt.pdf.elements import BBox, Figure, Page, PageQuality, Paragraph, Table
+from datagrunt.pdf.exceptions import DatagruntPDFError
 from datagrunt.pdf.layout import (
     MAX_CROSSINGS,
     LatticeCell,
@@ -56,6 +57,7 @@ from pdf_tests.test_layout_lattice import written
 from pdf_tests.test_layout_stream import after
 from pdf_tests.test_layout_stream_tables import body_text, staircase, table_runs
 from pdf_tests.test_pdfium_engine import imported_modules
+from pdf_tests.test_pdfium_images import j2k, xobject_page
 from pdf_tests.test_pdfium_spans import content_page
 from pdf_tests.test_quality import SHA, image
 
@@ -255,8 +257,9 @@ class TestPageFigures:
 
         assert (draft.width_px, draft.height_px) == (20000, 20000)
 
-    def test_an_unsized_image_is_a_figure_of_its_declared_size(self, tmp_path):
-        # A JPEG behind Flate: its frame size cannot be read without inflating it, so A2 records px 0 x 0.
+    def test_an_unsized_image_is_no_figure_whatever_its_dictionary_declares(self, tmp_path):
+        # A JPEG behind Flate that does not inflate within 1 MiB: A2 cannot read its frame, so it records px 0 x 0.
+        # pdfium decodes a JPEG at its frame's size, never its /Width and /Height: those are not its size.
         behind_flate = image(
             INSIDE,
             px_width=0,
@@ -265,16 +268,23 @@ class TestPageFigures:
             filters=("FlateDecode", "DCTDecode"),
             bits_per_pixel=None,
             colorspace=None,
+            object_index=4,
         )
 
-        (draft,) = drafted(tmp_path, behind_flate).drafts
+        found = drafted(tmp_path, behind_flate)
 
-        assert (draft.width_px, draft.height_px) == (158, 506)
+        assert found == PageFigures(
+            drafts=(), warnings=("1 image(s) not emitted as figures: their pixel size is unknown (object 4)",)
+        )
 
-    def test_an_unsized_image_declared_under_the_minimum_is_skipped(self, tmp_path):
-        small = image(INSIDE, px_width=0, px_height=0, declared_px=(20, 20), bits_per_pixel=None, colorspace=None)
+    def test_an_unsized_image_declared_under_the_minimum_is_named_not_skipped(self, tmp_path):
+        small = image(
+            INSIDE, px_width=0, px_height=0, declared_px=(20, 20), bits_per_pixel=None, colorspace=None, object_index=2
+        )
 
-        assert drafted(tmp_path, small) == PageFigures(drafts=(), warnings=())
+        found = drafted(tmp_path, small)
+
+        assert found.warnings == ("1 image(s) not emitted as figures: their pixel size is unknown (object 2)",)
 
     @pytest.mark.parametrize(
         "px,declared",
@@ -299,8 +309,13 @@ class TestPageFigures:
         assert found.drafts == ()
         assert found.warnings == ("1 image(s) not emitted as figures: their streams were not read (object 3)",)
 
-    def test_an_image_not_read_and_under_the_minimum_is_skipped_without_a_warning(self, tmp_path):
-        assert drafted(tmp_path, sized(10, 10, raw_sha256=None)) == PageFigures(drafts=(), warnings=())
+    def test_an_image_not_read_is_named_whatever_its_dictionary_declares(self, tmp_path):
+        # A2 records an image it did not read at px 0 x 0: its declared 10 x 10 does not skip it unnamed.
+        unread = image(INSIDE, px_width=0, px_height=0, declared_px=(10, 10), raw_sha256=None, object_index=5)
+
+        found = drafted(tmp_path, unread)
+
+        assert found.warnings == ("1 image(s) not emitted as figures: their streams were not read (object 5)",)
 
     def test_a_warning_names_at_most_5_objects(self, tmp_path):
         unread = [image(INSIDE, raw_sha256=None, object_index=index) for index in range(7)]
@@ -407,6 +422,36 @@ class TestPageFiguresEndToEnd:
         assert figure.bbox == pytest.approx(BBox(x0=60.0, y0=40.0, x1=180.0, y1=120.0))
         assert hashlib.sha256(figure.read_raw_bytes()).hexdigest() == raw.raw_sha256
         assert figure.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+    @pytest.mark.parametrize("declared", [b"", b"/Width 16 /Height 16 ", b"/Width 2000 /Height 2000 "])
+    def test_a_refused_image_is_a_figure_of_its_headers_size_and_says_why(self, tmp_path, declared):
+        # A JPEG 2000 codestream of 2000 x 2000 x 5 components: refused (5 > 4), at its SIZ size whatever /Width says.
+        entries = declared + b"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /JPXDecode"
+        path = xobject_page(tmp_path, j2k((16, 8), siz=(2000, 2000), tile=(2000, 2000), components=5), entries)
+        page = read_page(path)
+
+        found = page_figures(page.images, page.geometry, source=path)
+
+        (draft,) = found.drafts
+        assert (draft.width_px, draft.height_px) == (2000, 2000)
+        assert found.warnings == ("1 image(s) too large to decode or read: never decoded",)
+        figure = draft.figure(page_number=1, reading_order=0)
+        with pytest.raises(DatagruntPDFError, match=re.escape("object 0 has 5 components, over the 4-component bound")):
+            figure.read_bytes()
+
+    def test_a_jpeg_whose_header_cannot_be_read_is_no_figure(self, tmp_path):
+        entries = b"/Width 200 /Height 200 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode"
+        page = read_page(xobject_page(tmp_path, b"not a jpeg header at all" * 4, entries))
+
+        found = page_figures(page.images, page.geometry, source=tmp_path / "hand.pdf")
+
+        assert found == PageFigures(
+            drafts=(),
+            warnings=(
+                "1 image(s) whose decode size cannot be known without decoding: never decoded",
+                "1 image(s) not emitted as figures: their pixel size is unknown (object 0)",
+            ),
+        )
 
     def test_a_small_image_is_skipped(self, tmp_path):
         items = (RasterImage(10.0, 10.0, 30.0, 30.0, solid_png(30, 30, (0.0, 0.0, 0.0))),)

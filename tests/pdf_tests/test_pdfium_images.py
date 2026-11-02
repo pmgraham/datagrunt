@@ -1542,7 +1542,7 @@ class TestDecodeBounds:
         got = images_of(path)
 
         (image,) = got.images
-        assert (image.px_width, image.px_height) == (0, 0)
+        assert (image.px_width, image.px_height) == (16, 8)  # the codestream's size, kept with its refusal
         assert got.stats == stats(oversized=1, cover=DRAWN)
         with pytest.raises(DatagruntPDFError, match=re.escape("5 components, over the 4-component bound")):
             only_loader(path).png_bytes()
@@ -1555,7 +1555,7 @@ class TestDecodeBounds:
 
         (image,) = got.images
         assert got.stats == stats(oversized=1, cover=DRAWN)
-        assert (image.bits_per_pixel, image.colorspace) == (None, None)
+        assert (image.px_width, image.px_height, image.bits_per_pixel, image.colorspace) == (16, 8, None, None)
         with pytest.raises(DatagruntPDFError, match=re.escape("object 0 has 5 components, over the 4-component bound")):
             loader_for(path, image).png_bytes()
         assert decode_calls == []
@@ -1578,17 +1578,15 @@ class TestDecodeBounds:
         assert (image.px_width, image.px_height) == (16, 8)
         assert decoded(loader_for(path, image).png_bytes()).size == (16, 8)
 
-    def test_a_jpx_past_the_decoded_samples_bound_is_refused_before_decoding(self, tmp_path, monkeypatch, decode_calls):
-        monkeypatch.setattr(_pdfium_images, "_MAX_DECODED_SAMPLES", 16 * 8 * 2, raising=False)
-        rgba_jpx = j2k((16, 8), mode="RGBA")
-        path = xobject_page(tmp_path, rgba_jpx, gray(16, 8, b"/JPXDecode"))
+    def test_the_pixel_and_component_bounds_are_the_only_size_bounds(self):
+        # 9459 x 9459 = 89,472,681 pixels (at the 89,478,485 bound) x 4 components: within both, so within every
+        # size bound: a decoded-samples bound of pixels x components could never refuse anything they pass.
+        header = j2k((16, 8), mode="RGBA", siz=(9459, 9459), tile=(9459, 9459))
 
-        got = images_of(path)
+        got = _pdfium_images._decode_size(("JPXDecode",), (0, 0), header, lambda: b"", "object 0")
 
-        assert got.stats == stats(oversized=1, cover=DRAWN)
-        with pytest.raises(DatagruntPDFError, match="decoded samples"):
-            only_loader(path).png_bytes()
-        assert decode_calls == []
+        assert got == (9459, 9459, None)
+        assert not hasattr(_pdfium_images, "_MAX_DECODED_SAMPLES")
 
     @pytest.mark.parametrize("codec", [b"Crypt", b"FooDecode"], ids=["crypt", "unknown"])
     def test_an_unsized_filter_is_recorded_without_size_and_never_decoded(self, tmp_path, decode_calls, codec):

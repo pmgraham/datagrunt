@@ -1044,7 +1044,7 @@ def image_refusal(page: pdfium.PdfPage, geometry: PageGeometry, *, max_objects: 
 
     - the walk reaches either bound;
     - an image A2 refuses to decode (see :class:`ImageStats`: over the pixel,
-      sample, component or JPEG 2000 tile bound; of a size that cannot be
+      component or JPEG 2000 tile bound; of a size that cannot be
       read without decoding; its raw stream over the asset limit, or past
       the page's stream budget), but not one A2 refuses only in the calling
       process (its stream decodes past its declared size, or cannot be

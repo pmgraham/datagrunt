@@ -47,10 +47,11 @@ class RawImage:
             (JPEG frame, JPEG 2000 SIZ), which pdfium uses whatever
             ``/Width`` says; else ``declared_px``'s (a JBIG2 image's too:
             pdfium decodes it at ``/Width``, whatever its page information
-            segment says). 0 when unknown: a side
-            outside 1..131071 (pdfium decodes no larger side), a header that
-            cannot be read, a codestream behind other filters, or a stream
-            not read (see ``raw_sha256``).
+            segment says). Kept when the image must not be decoded (over a
+            bound: see ``ImageStats``). 0 when unknown: a side outside
+            1..131071 (pdfium decodes no larger side), a header that cannot
+            be read, a codestream behind other filters, or a stream not read
+            (see ``raw_sha256``); the declared size never stands in for it.
         px_height: The height, likewise.
         declared_px: The image dictionary's ``(/Width, /Height)`` as pdfium
             reads them, each 0 when missing or outside 1..131071 (pdfium reads
