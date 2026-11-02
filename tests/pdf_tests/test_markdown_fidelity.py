@@ -274,7 +274,7 @@ def test_ordered_list_renders_its_source_numbers(markers):
 
 def test_hidden_ordered_list_keeps_its_start():
     element, items = _ordered(("2)", "3)"), hidden_reasons=("duplicate",))
-    markdown = _page_around(element).to_markdown()
+    markdown = _page_around(element).to_markdown(include_hidden=True)
 
     assert "<!-- hidden: duplicate -->" in markdown.splitlines()
     assert _ordered_lists(markdown) == [(2, ")", list(items))]
@@ -331,7 +331,7 @@ def test_marker_text_item_ending_in_backslash_renders_literally():
 def test_hidden_marker_text_list_is_one_block_after_its_comment():
     markers = ("a)", "b)", "c)")
     element, items = _ordered(markers, hidden_reasons=("duplicate",))
-    blocks = _top_blocks(_page_around(element).to_markdown())
+    blocks = _top_blocks(_page_around(element).to_markdown(include_hidden=True))
     after = blocks[blocks.index(("html", "<!-- hidden: duplicate -->")) + 1 :]
 
     lines = [f"{marker} {item}" for marker, item in zip(markers, items, strict=True)]
@@ -343,6 +343,6 @@ def test_hidden_element_keeps_marker_and_text(text):
     element = Paragraph(
         element_id="p0001_e001", page_number=1, reading_order=1, bbox=_BOX, text=text, hidden_reasons=("invisible",)
     )
-    markdown = _page_around(element).to_markdown()
+    markdown = _page_around(element).to_markdown(include_hidden=True)
     assert "<!-- hidden: invisible -->" in markdown.splitlines()
     _assert_faithful(markdown, [("paragraph", [text], 0)])

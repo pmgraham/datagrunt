@@ -6,12 +6,12 @@ extracted data verbatim (preserve, not transform); Markdown escaping happens
 only when an element is rendered with ``to_markdown()``.
 
 Hidden elements are flagged, never dropped: a page's ``elements``, the JSON
-and the frame keep them. A document's Markdown omits them by default
-(:meth:`PDFDocument.to_markdown`, ``include_hidden=False``): it is what a
+and the frame keep them. Markdown omits them by default
+(``include_hidden=False`` on :meth:`PDFDocument.to_markdown`,
+:meth:`Page.to_markdown` and :meth:`Section.to_markdown`): it is what a
 reader sees. With ``include_hidden=True``, each is rendered after its
-``<!-- hidden: reasons -->`` line, as an element renders itself. A page's and
-a section's Markdown keep that marker form by default and omit hidden
-elements with ``include_hidden=False``.
+``<!-- hidden: reasons -->`` line, as an element renders itself
+(``to_markdown`` of one element, which the frame's ``markdown`` column holds).
 
 Coordinates are PDF points with a top-left origin.
 """
@@ -1320,11 +1320,11 @@ class Page:
                 "an element off the page must carry the 'off_page' hidden reason"
             )
 
-    def to_markdown(self, *, include_hidden: bool = True) -> str:
+    def to_markdown(self, *, include_hidden: bool = False) -> str:
         """Render a ``<!-- page N route=R status=S -->`` comment, then each element, blank-line separated.
 
-        A hidden element is rendered behind its marker, or omitted with
-        ``include_hidden=False`` (see the module notes). Consecutive lists get
+        A hidden element is omitted, or rendered behind its marker with
+        ``include_hidden=True`` (see the module notes). Consecutive lists get
         a ``<!-- -->`` line between them so they stay separate lists.
 
         Raises:
@@ -1452,11 +1452,11 @@ class Section:
         """The section's figures, in document order."""
         return tuple(element for element in self.elements if isinstance(element, Figure))
 
-    def to_markdown(self, *, include_hidden: bool = True) -> str:
+    def to_markdown(self, *, include_hidden: bool = False) -> str:
         """Render the heading (unless it is already in ``elements``), then each element, blank-line separated.
 
-        A hidden element is rendered behind its marker, or omitted with
-        ``include_hidden=False`` (see the module notes). Consecutive lists get
+        A hidden element is omitted, or rendered behind its marker with
+        ``include_hidden=True`` (see the module notes). Consecutive lists get
         a ``<!-- -->`` line between them so they stay separate lists.
 
         Raises:
