@@ -295,3 +295,56 @@ class TestTheGuardSeesWrites:
 
         assert seen.violations == []
         assert seen.after["home"] != seen.before["home"]
+
+
+# Run with a fresh empty HOME: argv[1] is a document JSON file. read_xlsx is the excel extension's, which DuckDB's
+# Python package does not link in: DuckDB installs it into $HOME/.duckdb on first use unless that is turned off.
+EXTENSION_PROBE = r"""
+import json, sys
+import duckdb
+from datagrunt.pdf.reader import PDFReader
+
+with open(sys.argv[1], "rb") as stream:
+    reader = PDFReader(json.load(stream))
+status = reader.query_data(
+    "SELECT install_mode, installed, loaded FROM duckdb_extensions() WHERE extension_name = 'excel'"
+).dicts()
+try:
+    reader.query_data("SELECT * FROM read_xlsx('parts.xlsx')")
+except duckdb.Error as exc:
+    raised = [type(exc).__name__, str(exc)]
+else:
+    raised = None
+print("PROBE " + json.dumps({"excel": status, "raised": raised}))
+"""
+
+
+class TestExtensionsAreNeverInstalled:
+    """A query needing an extension DuckDB does not link in fails: the reader never installs one into HOME."""
+
+    def test_a_query_needing_an_uninstalled_extension_raises_and_writes_nothing(self, fixtures, tmp_path):
+        places = {name: tmp_path / name for name in ("home", "tmp", "cwd")}
+        for place in places.values():
+            place.mkdir()
+        environment = {**os.environ, "HOME": str(places["home"]), **{key: str(places["tmp"]) for key in TMP_KEYS}}
+        before = {name: snapshot(place) for name, place in places.items()}
+
+        done = subprocess.run(
+            [sys.executable, "-I", "-B", "-c", EXTENSION_PROBE, str(fixtures.data)],
+            cwd=places["cwd"],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=GUARD_TIMEOUT_S,
+            check=False,
+        )
+
+        assert done.returncode == 0, done.stderr[-4000:]
+        (line,) = [line for line in done.stdout.splitlines() if line.startswith("PROBE ")]
+        probe = json.loads(line.removeprefix("PROBE "))
+        # The premise: excel is neither linked into DuckDB nor installed in this HOME.
+        assert probe["excel"] == [{"install_mode": "NOT_INSTALLED", "installed": False, "loaded": False}]
+        name, message = probe["raised"]
+        assert name == "Error" and "automatically install the required extension 'excel" in message
+        assert 'Install it first using "INSTALL excel"' in message
+        assert {name: snapshot(place) for name, place in places.items()} == before

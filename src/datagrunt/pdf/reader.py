@@ -77,11 +77,14 @@ DuckDB:
   quoting, and DuckDB matches it in any case.
 - :meth:`PDFReader.query_data` runs SQL on the reader's own in-memory
   connection (:func:`~datagrunt.pdf._database.private_connection`:
-  spilling to disk off), where the frame's Arrow table is registered as
-  ``db_table``, and returns its rows read whole
+  spilling to disk and extension installs off), where the frame's Arrow
+  table is registered as ``db_table``, and returns its rows read whole
   (:class:`~datagrunt.pdf._database.QueryResult`: ``.pl()``, ``.pa()``,
   ``.dicts()``). The connection persists between queries (a table a query
   creates is there for the next), and no other reader shares it.
+- Extensions: a query that needs one DuckDB does not link in (``read_xlsx``,
+  say) raises ``duckdb.Error`` rather than install it: the caller installs
+  it, by an explicit ``INSTALL`` in their own SQL or in their environment.
 - Security: ``sql`` runs as it is written. Building it from untrusted
   input is an injection vector against that connection (which can read and
   write files, as any DuckDB connection can): validating, parameterizing
@@ -100,8 +103,9 @@ Zero writes: no method writes to the filesystem. Extraction's workers,
 renders and tesseract calls drain their stderr in memory
 (:class:`~datagrunt.pdf._process.StderrTail`), PNGs are encoded in memory,
 tesseract reads stdin and writes stdout, a bundle is read through
-descriptors opened read-only, and DuckDB never spills. What a caller's SQL
-writes is the caller's.
+descriptors opened read-only, and DuckDB neither spills nor installs an
+extension. What a caller's SQL writes explicitly (``COPY ... TO``,
+``INSTALL``) is the caller's.
 
 Workers: ``workers`` goes to ``extract_document``, whose pool starts plain
 ``python -I`` processes: a caller's script needs no ``__main__`` guard.
@@ -345,7 +349,9 @@ class PDFReader:
         """Run ``sql`` on the reader's private DuckDB, where :attr:`db_table` is the element frame (module notes).
 
         ``sql`` runs as it is written: SQL built from untrusted input is the
-        application's to guard.
+        application's to guard. DuckDB installs no extension a query needs:
+        the caller installs it, by an explicit ``INSTALL`` in their own SQL
+        or in their environment.
 
         Returns:
             The rows, read whole: ``.pl()``, ``.pa()``, ``.dicts()``.
@@ -353,7 +359,7 @@ class PDFReader:
         Raises:
             TypeError: If ``sql`` is not a str, before any work.
             ValueError: If ``sql`` is blank, before any work.
-            duckdb.Error: As DuckDB raises it.
+            duckdb.Error: As DuckDB raises it; for a query that needs an extension not installed, too.
         """
         statement = non_blank_str("sql", sql)
         with self._lock:
