@@ -35,9 +35,7 @@ from datagrunt.pdf.layout import (
     LatticeCell,
     LatticeResult,
     LatticeTable,
-    StreamTable,
     find_lattice_tables,
-    stream_layout,
 )
 from datagrunt.pdf.pdfium_engine import (
     ImageStats,
@@ -55,6 +53,7 @@ from pdf_tests.test_layout_apart import tiny_text_page
 from pdf_tests.test_layout_lattice import rules as lattice_rules
 from pdf_tests.test_layout_lattice import written
 from pdf_tests.test_layout_stream import after
+from pdf_tests.test_layout_stream_tables import XS as STREAM_XS
 from pdf_tests.test_layout_stream_tables import body_text, staircase, table_runs
 from pdf_tests.test_pdfium_engine import imported_modules
 from pdf_tests.test_pdfium_images import j2k, xobject_page
@@ -563,16 +562,11 @@ class TestAssemblePage:
         )
 
     def test_a_borderless_table_is_a_stream_table_with_its_columns_alignment_edges_and_extents(self, tmp_path):
+        # PARTS is written left-aligned at x 72, 220 and 360 from y 460 (table_runs): each column aligns on its
+        # cells' starts, and spans from there to its widest cell's end, as pdfium places that cell's glyphs.
         path = letter(tmp_path, *mixed_items())
         raw, assessment, lattice = inputs(path)
-        geometry = raw.geometry
-        (stream,) = [
-            item
-            for item in stream_layout(
-                assessment.pieces, lattice, width_pt=geometry.width_pt, height_pt=geometry.height_pt
-            )
-            if isinstance(item, StreamTable)
-        ]
+        cells = [piece for piece in assessment.pieces if piece.bbox[1] >= 440.0]
 
         table = [
             element
@@ -581,8 +575,11 @@ class TestAssemblePage:
         ][1]
 
         assert (table.extraction_method, table.headers, table.rows) == ("stream", PARTS[0], PARTS[1:])
-        assert table.column_centres == stream.column_centres
-        assert table.column_intervals == stream.column_intervals
+        assert table.column_centres == STREAM_XS
+        ends = tuple(max(cell.bbox[2] for cell in cells if cell.bbox[0] == x) for x in STREAM_XS)
+        assert table.column_intervals == tuple(zip(STREAM_XS, ends))
+        assert all(start < end for start, end in table.column_intervals)  # each column has the width of its cells
+        assert [len([cell for cell in cells if cell.bbox[0] == x]) for x in STREAM_XS] == [len(PARTS)] * 3
 
     @pytest.mark.parametrize("rotate", [90, 270])
     def test_a_turned_table_has_no_column_centres_or_intervals(self, tmp_path, rotate):
