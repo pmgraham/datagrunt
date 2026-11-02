@@ -23,10 +23,10 @@ a window before step 4 for any):
    :class:`~datagrunt.pdf.pdfium_engine.PageFailure` (a page pdfium cannot
    read, or one past a walk bound: its objects, path segments or textpage
    chars) raises :class:`~datagrunt.pdf.exceptions.PDFCorruptError` naming
-   the page under ``strict``; else it is A5b's
-   :func:`~datagrunt.pdf.vision.fallback_page`'s (its geometry read again,
-   then render and OCR: ``"ocr_fallback"``, or an error page naming why it
-   was not read).
+   the page under ``strict``; else the page skips steps 2-3 and its step 4
+   is A5b's :func:`~datagrunt.pdf.vision.fallback_page` (its geometry read
+   again, then render and OCR: ``"ocr_fallback"``, or an error page naming
+   why it was not read).
 2. A2 :func:`~datagrunt.pdf.pdfium_engine.recover_dropped_text`, when the
    page's textpage drops text objects (``TextStats.dropped_text_objects``
    over 0).
@@ -48,7 +48,10 @@ a window before step 4 for any):
 4. The route: a digital or hybrid page is A4a's lattice tables, then A4b's
    :func:`~datagrunt.pdf.assembly.assemble_page`; a vision page is A5b's
    :func:`~datagrunt.pdf.vision.vision_page`'s (render and OCR: ``"ok"``,
-   or ``"ocr_unavailable"`` with its digital text when OCR cannot read it).
+   or ``"ocr_unavailable"`` with its digital text when OCR cannot read it);
+   a page A2 could not read is ``fallback_page``'s (step 1). Every render
+   and OCR of a page is its step 4, so each page reply carries at most one
+   page's OCR budget, as its bound (:func:`_reply_bound_s`) counts.
    Both A5b steps take the source's password, ``ocr``,
    ``min_image_dimension`` (a vision page's figures), and ``vision_dpi`` and
    ``max_render_pixels`` (:class:`~datagrunt.pdf.vision.VisionOptions`).

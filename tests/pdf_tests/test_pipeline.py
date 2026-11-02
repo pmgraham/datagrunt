@@ -888,6 +888,45 @@ class TestPageIsolation:
         assert page == error_page(1, why, size=(400.0, 300.0))
         assert page.page_image is None
 
+    def test_a_failed_pages_ocr_runs_in_its_own_step_4_after_the_pages_before_it_are_sent(self, tmp_path, monkeypatch):
+        # Each reply carries at most one page's OCR budget (#418's bound): a page A2 cannot read is read by OCR as its
+        # own step 4, never in steps 1-3 ahead of the window's earlier pages.
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 4)
+        events: list[tuple[str, int]] = []
+        real = _page_worker.extract_page
+
+        def fails_on_pages_1_2_and_4(handle, index):
+            if index == 2:
+                return real(handle, index)
+            return PageFailure(page_number=index + 1, stage="text", message=f"page {index + 1}: failed")
+
+        def fallback(handle, failure, **kwargs):
+            events.append(("fallback", failure.page_number))
+            return pipeline.error_page(failure.page_number - 1, "read by the fallback")
+
+        monkeypatch.setattr(_page_worker, "extract_page", fails_on_pages_1_2_and_4)
+        monkeypatch.setattr(_page_worker, "fallback_page", fallback)
+
+        with open_document(path) as handle:
+            pages = _page_worker._window_pages(
+                handle,
+                PDFSource(path=path),
+                (0, 1, 2, 3),
+                PipelineOptions(),
+                lambda index: events.append(("began", index + 1)),
+            )
+            for page in pages:
+                events.append(("sent", page.page_number))
+
+        steps_1_to_3 = [("began", 1), ("began", 2), ("began", 3), ("began", 4)]
+        assert events == [
+            *steps_1_to_3,
+            *[("began", 1), ("fallback", 1), ("sent", 1)],
+            *[("began", 2), ("fallback", 2), ("sent", 2)],
+            *[("began", 3), ("sent", 3)],
+            *[("began", 4), ("fallback", 4), ("sent", 4)],
+        ]
+
     @pytest.mark.parametrize(
         "stage", ["extract_page", "recover_dropped_text", "assess_page", "find_lattice_tables", "assemble_page"]
     )

@@ -144,21 +144,23 @@ def _window_pages(
     """The window's pages, each as it is done: steps 1-3 for each, its gated pages drawn in one worker, then step 4.
 
     Each step is isolated; ``progress`` hears of each page as its steps 1-3
-    begin, and again as its step 4 does.
+    begin, and again as its step 4 does. A page A2 could not read is read
+    by OCR (``fallback_page``) as its step 4, as a vision page is: each page
+    reply carries at most one page's render and OCR budget, the one its
+    bound gives it (:func:`~datagrunt.pdf.pipeline._reply_bound_s`).
     """
-    staged: list[Page | _Assessed] = []
+    staged: list[Page | _Assessed | PageFailure] = []
     for index in window:  # bounded: the window's pages
         progress(index)
-        staged.append(_isolated(handle, index, options, partial(_assessed, handle, source, index, options)))
+        staged.append(_isolated(handle, index, options, partial(_assessed, handle, index, options)))
     drawn = _backgrounds(source, staged, options)
     for item in staged:  # bounded: the window's pages
         if isinstance(item, Page):
             yield item
             continue
-        progress(item.page_index)
-        yield _isolated(
-            handle, item.page_index, options, partial(_finished, item, drawn.get(item.page_index), source, options)
-        )
+        index = item.page_number - 1 if isinstance(item, PageFailure) else item.page_index
+        progress(index)
+        yield _isolated(handle, index, options, partial(_step_four, handle, item, drawn.get(index), source, options))
 
 
 def _error_page(handle: DocumentHandle, index: int, error: str) -> Page:
@@ -244,20 +246,16 @@ def _isolated(handle: DocumentHandle, index: int, options: PipelineOptions, step
         raise PDFCorruptError(message, page_number=page_number) from exc
 
 
-def _assessed(handle: DocumentHandle, source: PDFSource, index: int, options: PipelineOptions) -> Page | _Assessed:
-    """Steps 1-3 (A2, recovery when the page drops text, A3, the gate); a page A2 could not read is fallback_page's."""
+def _assessed(handle: DocumentHandle, index: int, options: PipelineOptions) -> _Assessed | PageFailure:
+    """Steps 1-3 (A2, recovery when the page drops text, A3, the gate); a page A2 could not read is its PageFailure.
+
+    Under ``strict`` that failure raises here; else the page is read by OCR in its step 4 (:func:`_step_four`).
+    """
     raw = extract_page(handle, index)
     if isinstance(raw, PageFailure):
         if options.strict:
             raise PDFCorruptError(raw.message, page_number=raw.page_number)
-        return fallback_page(
-            handle,
-            raw,
-            source=source.path,
-            password=source.password,
-            ocr=options.ocr,
-            options=pipeline._vision(options),
-        )
+        return raw
     dropped = raw.text.stats.dropped_text_objects
     recovered = recover_dropped_text(handle, index) if dropped > 0 else None
     assessment = assess_page(raw, ocr=options.ocr, recovered=recovered)
@@ -275,7 +273,9 @@ def _background_dpi(raw: RawPage, assessment: PageAssessment, options: PipelineO
         return str(exc)
 
 
-def _backgrounds(source: PDFSource, staged: list[Page | _Assessed], options: PipelineOptions) -> dict[int, _Drawn]:
+def _backgrounds(
+    source: PDFSource, staged: list[Page | _Assessed | PageFailure], options: PipelineOptions
+) -> dict[int, _Drawn]:
     """Each gated page's background render, by page index: the window's, drawn in one worker (see the module notes).
 
     A render call that raises is each of its pages' outcome: each raises it
@@ -301,6 +301,22 @@ def _backgrounds(source: PDFSource, staged: list[Page | _Assessed], options: Pip
     except Exception as exc:  # step 5, page by page: see the docstring
         return dict.fromkeys((index for index, _dpi in pages), exc)
     return {index: result for (index, _dpi), result in zip(pages, drawn, strict=True)}
+
+
+def _step_four(
+    handle: DocumentHandle,
+    item: _Assessed | PageFailure,
+    drawn: _Drawn | None,
+    source: PDFSource,
+    options: PipelineOptions,
+) -> Page:
+    """Step 4: a page A2 could not read is A5b's ``fallback_page`` (render and OCR); else :func:`_finished`."""
+    if isinstance(item, PageFailure):
+        vision = pipeline._vision(options)
+        return fallback_page(
+            handle, item, source=source.path, password=source.password, ocr=options.ocr, options=vision
+        )
+    return _finished(item, drawn, source, options)
 
 
 def _finished(item: _Assessed, drawn: _Drawn | None, source: PDFSource, options: PipelineOptions) -> Page:
