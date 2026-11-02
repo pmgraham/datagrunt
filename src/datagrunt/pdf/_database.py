@@ -14,6 +14,13 @@ on DuckDB 2.0.0: a sort of 1,000,000 md5 strings in 32 MB spills to
 setting is read back: a connection that does not report it empty is
 closed and refused.
 
+:func:`query_result` runs a caller's SQL on such a connection and reads
+its result whole, as Arrow, into a :class:`QueryResult`: the shape of the
+CSV readers' ``query_data`` result (``.pl()``), with ``.pa()`` and
+``.dicts()``. It holds the rows, not the connection, so it outlives the
+connection and its reader. A statement that returns no relation (DDL on
+DuckDB 1.x) is an empty result of no columns.
+
 Nothing else here writes. What a caller's SQL does is the caller's: SQL
 that reads or writes files (``COPY ... TO``), or that needs an extension
 DuckDB installs on first use (the ones a reader's frame needs, ``json``,
@@ -22,9 +29,15 @@ application's to allow or refuse, as for the CSV readers (preserve, not
 transform).
 """
 
-import duckdb
+from typing import Any
 
-__all__ = ["private_connection"]
+import duckdb
+import polars
+import pyarrow
+
+# Full module names: the result's methods are named pl and pa, the CSV readers' result shape.
+
+__all__ = ["QueryResult", "private_connection", "query_result"]
 
 _SPILL_OFF = "SET temp_directory=''"
 _SPILL_SETTING = "SELECT current_setting('temp_directory')"
@@ -48,3 +61,39 @@ def private_connection() -> duckdb.DuckDBPyConnection:
         connection.close()
         raise
     return connection
+
+
+class QueryResult:
+    """A query's rows, read whole when it ran: as polars (``.pl()``), Arrow (``.pa()``) or dicts (``.dicts()``).
+
+    It holds no connection: it outlives the reader that ran it.
+    """
+
+    __slots__ = ("_table",)
+
+    def __init__(self, table: pyarrow.Table) -> None:
+        if not isinstance(table, pyarrow.Table):
+            raise TypeError(f"table must be a pyarrow.Table, got {type(table).__name__}")
+        self._table = table
+
+    def pl(self) -> polars.DataFrame:
+        """The rows as a polars DataFrame (a new one each call)."""
+        return polars.DataFrame(self._table)
+
+    def pa(self) -> pyarrow.Table:
+        """The rows as the Arrow table DuckDB returned (immutable)."""
+        return self._table
+
+    def dicts(self) -> list[dict[str, Any]]:
+        """The rows as new dicts, one a row, in order."""
+        return self._table.to_pylist()
+
+
+def query_result(connection: duckdb.DuckDBPyConnection, sql: str) -> QueryResult:
+    """Run ``sql`` on ``connection`` as it is written, and read its result whole (see the module notes).
+
+    Raises:
+        duckdb.Error: As DuckDB raises it (a syntax error, an unknown table, ...).
+    """
+    relation = connection.sql(sql)
+    return QueryResult(pyarrow.table({}) if relation is None else relation.to_arrow_table())

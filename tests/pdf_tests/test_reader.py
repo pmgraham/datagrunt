@@ -9,13 +9,20 @@ reader module's name for it.
 
 import copy
 import errno
+import gc
 import os
 import re
 import sys
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from types import MappingProxyType, SimpleNamespace
 
+import duckdb
+import polars as pl
+import pyarrow as pa
 import pytest
 
+from datagrunt.pdf import _database
 from datagrunt.pdf import reader as reader_module
 from datagrunt.pdf.bundle import load_bundle, write_bundle
 from datagrunt.pdf.codec import document_from_json, document_to_json
@@ -414,3 +421,232 @@ class TestFrame:
         assert reader.to_dataframe().schema == FRAME_SCHEMA
         assert (reader.to_dataframe().height, reader.to_dicts(), reader.get_sample().height) == (0, [], 0)
         assert reader.to_arrow_table().num_rows == 0
+
+
+def connections_of(monkeypatch) -> list:
+    """Record every DuckDB connection the reader opens."""
+    opened: list = []
+    real = reader_module.private_connection
+
+    def recorded():
+        opened.append(real())
+        return opened[-1]
+
+    monkeypatch.setattr(reader_module, "private_connection", recorded)
+    return opened
+
+
+def is_closed(connection) -> bool:
+    try:
+        connection.execute("SELECT 1")
+    except duckdb.ConnectionException:
+        return True
+    return False
+
+
+class TestDatabase:
+    """``db_table`` names the element frame in ``query_data``'s private in-memory DuckDB."""
+
+    def test_the_table_name_is_the_doc_id_made_an_identifier(self, read):
+        assert read.db_table == f"tbl_{read.metadata.doc_id}"
+        assert read.db_table == f"tbl_parts_list__{read.metadata.sha256[:16]}"
+
+    def test_a_doc_id_with_a_hyphen_or_a_leading_digit_is_a_plain_identifier(self, made, tmp_path):
+        path = tmp_path / "2026-Q1 report.pdf"
+        path.write_bytes(made.path.read_bytes())
+        reader = PDFReader(path, **OPTIONS)
+
+        assert reader.db_table == f"tbl_2026_Q1_report__{made.document.metadata.sha256[:16]}"
+        assert re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", reader.db_table)
+        assert reader.query_data(f"SELECT count(*) AS n FROM {reader.db_table}").dicts() == [
+            {"n": len(made.document.elements)}
+        ]
+
+    def test_the_table_name_is_stable_across_readers_and_sources(self, made, read):
+        assert {PDFReader(made.path).db_table, PDFReader(made.json).db_table, read.db_table} == {read.db_table}
+
+    def test_a_query_reads_the_element_frame(self, read):
+        result = read.query_data(f"SELECT * FROM {read.db_table}")
+
+        assert result.dicts() == read.to_dicts()
+        assert result.pl().columns == read.to_dataframe().columns
+        assert result.pa().num_rows == len(read.document.elements)
+
+    def test_the_result_has_the_csv_readers_shape(self, read):
+        result = read.query_data(f"SELECT kind, count(*) AS n FROM {read.db_table} GROUP BY kind ORDER BY kind")
+        counts = {"heading": len(read.headings), "paragraph": len(read.paragraphs), "table": len(read.tables)}
+        counts["figure"] = len(read.figures)
+        expected = [{"kind": kind, "n": n} for kind, n in sorted(counts.items())]
+
+        assert isinstance(result.pl(), pl.DataFrame) and result.pl().to_dicts() == expected
+        assert isinstance(result.pa(), pa.Table) and result.pa().to_pylist() == expected
+        assert result.dicts() == expected
+
+    def test_a_table_name_is_case_insensitive_as_duckdb_reads_it(self, read):
+        assert read.query_data(f"SELECT count(*) AS n FROM {read.db_table.upper()}").dicts() == [
+            {"n": len(read.document.elements)}
+        ]
+
+    def test_the_sql_runs_as_it_is_written(self, read):
+        assert read.query_data("SELECT 'O''Hara; DROP' AS name").dicts() == [{"name": "O'Hara; DROP"}]
+        with pytest.raises(duckdb.ParserException):
+            read.query_data("SELEC 1")
+
+    def test_spilling_to_disk_is_off(self, read):
+        assert read.query_data("SELECT current_setting('temp_directory') AS t").dicts() == [{"t": ""}]
+
+    @pytest.mark.parametrize(
+        "sql,error,message",
+        [
+            (None, TypeError, "sql must be a str, got None (NoneType)"),
+            (b"SELECT 1", TypeError, "sql must be a str, got b'SELECT 1' (bytes)"),
+            ("", ValueError, "sql must be a non-blank str, got ''"),
+            (" \n\t", ValueError, "sql must be a non-blank str, got ' \\n\\t'"),
+        ],
+    )
+    def test_sql_is_checked_before_any_work(self, made, monkeypatch, sql, error, message):
+        reader = PDFReader(made.path, **OPTIONS)
+        opened = connections_of(monkeypatch)
+        refuse_work(monkeypatch)
+
+        with pytest.raises(error, match=re.escape(message)):
+            reader.query_data(sql)
+        assert opened == []
+
+    def test_the_connection_opens_on_the_first_query_then_is_reused(self, made, monkeypatch):
+        opened = connections_of(monkeypatch)
+        reader = PDFReader(made.path, **OPTIONS)
+        reader.document, reader.to_dataframe(), reader.db_table
+
+        assert opened == []
+        reader.query_data("CREATE TABLE kept AS SELECT 7 AS n")
+        assert reader.query_data("SELECT n FROM kept").dicts() == [{"n": 7}]
+        assert len(opened) == 1
+
+    def test_each_reader_has_its_own_database(self, made):
+        first, second = PDFReader(made.json), PDFReader(made.json)
+        first.query_data("CREATE TABLE only_first AS SELECT 1 AS n")
+
+        with pytest.raises(duckdb.CatalogException):
+            second.query_data("SELECT n FROM only_first")
+
+    def test_a_result_is_read_whole_and_outlives_its_reader(self, made, monkeypatch):
+        opened = connections_of(monkeypatch)
+        result = PDFReader(made.json).query_data("SELECT 1 AS n")
+        gc.collect()
+
+        assert is_closed(opened[0])
+        assert (result.dicts(), result.pl().to_dicts(), result.pa().to_pylist()) == ([{"n": 1}],) * 3
+
+    def test_a_statement_without_rows_is_an_empty_result(self):
+        class NoRows:
+            def sql(self, sql):
+                return None  # DuckDB 1.x's relation for a statement that returns nothing
+
+        result = _database.query_result(NoRows(), "SET threads=1")
+
+        assert (result.dicts(), result.pl().shape, result.pa().num_columns) == ([], (0, 0), 0)
+
+    def test_a_result_holds_an_arrow_table(self):
+        with pytest.raises(TypeError, match="table must be a pyarrow.Table, got DataFrame"):
+            _database.QueryResult(pl.DataFrame({"n": [1]}))
+
+    def test_a_connection_whose_frame_cannot_be_registered_is_closed_not_kept(self, made, monkeypatch):
+        class Refusing:
+            closed = False
+
+            def register(self, name, table):
+                raise duckdb.InvalidInputException("refused")
+
+            def close(self):
+                self.closed = True
+
+        refusing = Refusing()
+        monkeypatch.setattr(reader_module, "private_connection", lambda: refusing)
+        reader = PDFReader(made.json)
+
+        with pytest.raises(duckdb.InvalidInputException, match="refused"):
+            reader.query_data("SELECT 1")
+        assert refusing.closed
+
+        monkeypatch.undo()
+        assert reader.query_data("SELECT 2 AS n").dicts() == [{"n": 2}]  # the next query opens its own
+
+    def test_concurrent_queries_each_read_the_frame_once_extracted(self, made, monkeypatch):
+        calls = calls_of(monkeypatch, "extract_document")
+        reader = PDFReader(made.path, **OPTIONS)
+        sql = "SELECT count(*) AS n FROM {}"
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _: reader.query_data(sql.format(reader.db_table)).dicts(), range(16)))
+
+        assert results == [[{"n": len(made.document.elements)}]] * 16
+        assert len(calls) == 1
+
+
+class TestLifecycle:
+    """The connection is released automatically when the reader goes; close() and ``with`` release it early."""
+
+    def test_a_reader_never_queried_opens_no_connection(self, made, monkeypatch):
+        opened = connections_of(monkeypatch)
+        reader = PDFReader(made.path, **OPTIONS)
+        reader.to_dicts()
+
+        del reader
+        gc.collect()
+
+        assert opened == []
+
+    def test_the_connection_is_closed_when_the_reader_is_collected(self, made, monkeypatch):
+        opened = connections_of(monkeypatch)
+        reader = PDFReader(made.path, **OPTIONS)
+        reader.query_data(f"SELECT count(*) FROM {reader.db_table}")
+        alive = weakref.ref(reader)
+
+        assert not is_closed(opened[0])
+        del reader
+        gc.collect()
+
+        assert alive() is None
+        assert is_closed(opened[0])
+
+    def test_close_releases_the_connection_early_and_the_reader_stays_usable(self, made, monkeypatch):
+        opened = connections_of(monkeypatch)
+        reader = PDFReader(made.json)
+        reader.query_data("SELECT 1")
+
+        reader.close()
+        reader.close()  # idempotent
+
+        assert is_closed(opened[0])
+        assert reader.query_data(f"SELECT count(*) AS n FROM {reader.db_table}").dicts() == [
+            {"n": len(made.document.elements)}
+        ]
+        assert len(opened) == 2 and not is_closed(opened[1])
+
+    def test_with_releases_the_connection_at_its_end(self, made, monkeypatch):
+        opened = connections_of(monkeypatch)
+
+        with PDFReader(made.json) as reader:
+            assert isinstance(reader, PDFReader)
+            reader.query_data("SELECT 1")
+            assert not is_closed(opened[0])
+
+        assert is_closed(opened[0])
+
+    def test_with_does_not_swallow_an_error(self, made, monkeypatch):
+        opened = connections_of(monkeypatch)
+
+        with pytest.raises(RuntimeError, match="the caller's"):
+            with PDFReader(made.json) as reader:
+                reader.query_data("SELECT 1")
+                raise RuntimeError("the caller's")
+
+        assert is_closed(opened[0])
+
+    def test_close_before_any_query_opens_nothing(self, made, monkeypatch):
+        opened = connections_of(monkeypatch)
+
+        PDFReader(made.json).close()
+
+        assert opened == []

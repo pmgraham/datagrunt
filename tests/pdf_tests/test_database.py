@@ -5,6 +5,8 @@ The connection is private and in memory, with spilling off
 writing DuckDB's default ``.tmp`` directory in the working directory.
 """
 
+import re
+
 import duckdb
 import pytest
 
@@ -51,3 +53,16 @@ class TestTheDatabaseWritesNothing:
         finally:
             first.close()
             second.close()
+
+    def test_a_connection_that_could_still_spill_is_closed_and_refused(self, monkeypatch):
+        opened = []
+        real = duckdb.connect
+        monkeypatch.setattr(duckdb, "connect", lambda database: opened.append(real(database)) or opened[-1])
+        monkeypatch.setattr(_database, "_SPILL_OFF", "SET threads=1")
+
+        message = "DuckDB reports temp_directory [('.tmp',)] after SET threads=1: it could spill to disk"
+        with pytest.raises(RuntimeError, match=re.escape(message)):
+            _database.private_connection()
+
+        with pytest.raises(duckdb.ConnectionException):
+            opened[0].execute("SELECT 1")  # closed before the refusal

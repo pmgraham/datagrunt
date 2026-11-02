@@ -64,22 +64,61 @@ own (A1's immutable elements). Its views:
   the document's exactly: a lone surrogate is kept (the frame's strings
   hold its escape, as UTF-8 needs).
 
+DuckDB:
+
+- :attr:`PDFReader.db_table` names the element frame in SQL: ``tbl_`` and
+  the document's ``doc_id`` with each character outside ``[A-Za-z0-9_]``
+  (a ``-``) as ``_``. It is stable (the same bytes under the same name
+  always get it, whatever the source) and a plain identifier: it needs no
+  quoting, and DuckDB matches it in any case.
+- :meth:`PDFReader.query_data` runs SQL on the reader's own in-memory
+  connection (:func:`~datagrunt.pdf._database.private_connection`:
+  spilling to disk off), where the frame's Arrow table is registered as
+  ``db_table``, and returns its rows read whole
+  (:class:`~datagrunt.pdf._database.QueryResult`: ``.pl()``, ``.pa()``,
+  ``.dicts()``). The connection persists between queries (a table a query
+  creates is there for the next), and no other reader shares it.
+- Security: ``sql`` runs as it is written. Building it from untrusted
+  input is an injection vector against that connection (which can read and
+  write files, as any DuckDB connection can): validating, parameterizing
+  and sandboxing such SQL is the application's concern, as for the CSV
+  readers (preserve, not transform: datagrunt never rewrites SQL).
+
+Lifecycle: nothing is required of the caller. The connection opens on the
+first query and is released automatically: a ``weakref.finalize`` closes
+it when the reader is collected (or at exit), and it holds no reference to
+the reader. :meth:`PDFReader.close` and ``with`` release it early, for a
+caller who wants that; the reader stays usable, and a later query opens a
+new connection. pdfium handles and worker processes are already per call:
+the reader holds none between calls.
+
+Zero writes: no method writes to the filesystem. Extraction's workers,
+renders and tesseract calls drain their stderr in memory
+(:class:`~datagrunt.pdf._process.StderrTail`), PNGs are encoded in memory,
+tesseract reads stdin and writes stdout, a bundle is read through
+descriptors opened read-only, and DuckDB never spills. What a caller's SQL
+writes is the caller's.
+
 Workers: ``workers`` goes to ``extract_document``, whose pool starts plain
 ``python -I`` processes: a caller's script needs no ``__main__`` guard.
 """
 
 import os
+import re
 import stat
 import threading
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import duckdb
 import polars as pl
 import pyarrow as pa
 
-from datagrunt.pdf._validate import int_at_least
+from datagrunt.pdf._database import QueryResult, private_connection, query_result
+from datagrunt.pdf._validate import int_at_least, non_blank_str
 from datagrunt.pdf.assembly import MIN_IMAGE_DIMENSION
 from datagrunt.pdf.bundle import MANIFEST, _read_manifest, load_bundle
 from datagrunt.pdf.codec import document_from_json
@@ -113,6 +152,8 @@ _PDF_HEADER_BYTES = _PDF_MARKER_LAST_OFFSET + len(_PDF_MARKER)
 # as bytes (O_BINARY, Windows). Each flag is 0 where it does not exist.
 _OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
 _SAMPLE_ROWS = 20  # get_sample's default, the CSV readers' sample size
+_TABLE_PREFIX = "tbl_"  # a table name starts with a letter, as the CSV readers' do
+_NOT_IDENTIFIER = re.compile(r"[^A-Za-z0-9_]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +164,36 @@ class _Bundle:
 
 
 _Source = PDFSource | _Bundle | PDFDocument
+
+
+class _Connection:
+    """The reader's DuckDB connection: opened on its first query, closed by ``close`` (the reader's finalizer's).
+
+    It holds no reference to its reader, so the reader's finalizer can close it.
+    """
+
+    __slots__ = ("_connection",)
+
+    def __init__(self) -> None:
+        self._connection: duckdb.DuckDBPyConnection | None = None
+
+    def opened(self, table_name: str, table: pa.Table) -> duckdb.DuckDBPyConnection:
+        """The connection, opened now with ``table`` registered as ``table_name`` if it is not open."""
+        if self._connection is None:
+            connection = private_connection()
+            try:
+                connection.register(table_name, table)
+            except BaseException:
+                connection.close()
+                raise
+            self._connection = connection
+        return self._connection
+
+    def close(self) -> None:
+        """Close the connection if it is open (idempotent)."""
+        connection, self._connection = self._connection, None
+        if connection is not None:
+            connection.close()
 
 
 class PDFReader:
@@ -174,6 +245,8 @@ class PDFReader:
         self._frame: pl.DataFrame | None = None
         self._arrow: pa.Table | None = None
         self._lock = threading.RLock()
+        self._connection = _Connection()
+        weakref.finalize(self, self._connection.close)
 
     @property
     def document(self) -> PDFDocument:
@@ -266,6 +339,42 @@ class PDFReader:
     def to_markdown(self) -> str:
         """The document's Markdown (A1's ``PDFDocument.to_markdown``)."""
         return self.document.to_markdown()
+
+    @property
+    def db_table(self) -> str:
+        """The element frame's table name in :meth:`query_data`'s SQL (see the module notes)."""
+        return _TABLE_PREFIX + _NOT_IDENTIFIER.sub("_", self.metadata.doc_id)
+
+    def query_data(self, sql: str) -> QueryResult:
+        """Run ``sql`` on the reader's private DuckDB, where :attr:`db_table` is the element frame (module notes).
+
+        ``sql`` runs as it is written: SQL built from untrusted input is the
+        application's to guard.
+
+        Returns:
+            The rows, read whole: ``.pl()``, ``.pa()``, ``.dicts()``.
+
+        Raises:
+            TypeError: If ``sql`` is not a str, before any work.
+            ValueError: If ``sql`` is blank, before any work.
+            duckdb.Error: As DuckDB raises it.
+        """
+        statement = non_blank_str("sql", sql)
+        with self._lock:
+            connection = self._connection.opened(self.db_table, self.to_arrow_table())
+            return query_result(connection, statement)
+
+    def close(self) -> None:
+        """Release the DuckDB connection now: optional, never required (see the module notes); idempotent."""
+        with self._lock:
+            self._connection.close()
+
+    def __enter__(self) -> "PDFReader":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        """Release the DuckDB connection at the block's end; an error raised in it propagates."""
+        self.close()
 
     def _element_frame(self) -> pl.DataFrame:
         """The element frame, built on first use, then cached: never handed out (callers get clones)."""
