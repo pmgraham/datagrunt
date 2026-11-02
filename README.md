@@ -288,7 +288,7 @@ order. Each element carries its page, its bounding box (in points, top-left
 origin), and the headings it sits under (`scope_path`). Coming from 4.x?
 `engine=`, `native=`, `drop_layout_tables=`, and the PyMuPDF, pdfplumber, and
 pytesseract dependencies are gone, and the output shapes changed; the
-migration guide is in the [documentation](https://www.datagrunt.io/docs).
+[migration guide](https://www.datagrunt.io/docs/guides/migrating-to-5/) lists every change.
 
 ### Reading a PDF
 
