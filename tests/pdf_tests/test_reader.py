@@ -19,9 +19,11 @@ import pytest
 from datagrunt.pdf import reader as reader_module
 from datagrunt.pdf.bundle import load_bundle, write_bundle
 from datagrunt.pdf.codec import document_from_json, document_to_json
+from datagrunt.pdf.frame import ARROW_SCHEMA, FRAME_SCHEMA, element_arrow, element_frame
 from datagrunt.pdf.pipeline import extract_document
 from datagrunt.pdf.reader import PDFReader
 from pdf_tests.builders import build_pdf
+from pdf_tests.documents import empty_document
 from pdf_tests.test_pipeline import mixed_page
 
 # A figure at 32 px (mixed_page's image is 64 x 32 px): every element kind the page holds is read.
@@ -284,3 +286,131 @@ class TestConstructionChecks:
 
         with pytest.raises(error, match=re.escape(message)):
             PDFReader(given[source], **{option: value})
+
+
+COLLECTIONS = (
+    "pages",
+    "headings",
+    "paragraphs",
+    "key_values",
+    "tables",
+    "lists",
+    "figures",
+    "page_images",
+    "sections",
+    "header_context",
+    "metadata",
+)
+
+
+@pytest.fixture(scope="module")
+def read(made):
+    """A reader of the digital PDF, its document read once for the module."""
+    reader = PDFReader(made.path, **OPTIONS)
+    reader.document
+    return reader
+
+
+class TestCollections:
+    """Each collection the spec lists is the document's own."""
+
+    @pytest.mark.parametrize("name", COLLECTIONS)
+    def test_each_collection_is_the_documents(self, read, name):
+        assert getattr(read, name) is getattr(read.document, name)
+
+    def test_the_fixture_holds_every_element_kind_but_lists(self, read):
+        kinds = {name: len(getattr(read, name)) for name in ("headings", "paragraphs", "tables", "figures")}
+
+        assert all(count > 0 for count in kinds.values()), kinds
+        assert len(read.pages) == 2
+
+    @pytest.mark.parametrize("name", COLLECTIONS)
+    def test_a_collection_extracts_on_first_use(self, made, monkeypatch, name):
+        calls = calls_of(monkeypatch, "extract_document")
+        reader = PDFReader(made.path, **OPTIONS)
+
+        getattr(reader, name)
+
+        assert len(calls) == 1
+
+
+class TestFrame:
+    """A7a's element frame: as polars, Arrow, row dicts and a sample; and the document's Markdown."""
+
+    def test_the_dataframe_is_the_documents_element_frame(self, read):
+        frame = read.to_dataframe()
+
+        assert frame.schema == FRAME_SCHEMA  # hidden_reasons included
+        assert frame.equals(element_frame(read.document))
+        assert frame.height == len(read.document.elements)
+
+    def test_the_arrow_table_is_the_frame_of_the_fixed_arrow_schema(self, read):
+        table = read.to_arrow_table()
+
+        assert table.schema == ARROW_SCHEMA
+        assert table.equals(element_arrow(read.document))
+
+    def test_the_dicts_are_the_frames_rows(self, read):
+        assert read.to_dicts() == element_frame(read.document).to_dicts()
+
+    def test_the_frame_is_built_once_and_each_caller_gets_its_own(self, made, monkeypatch):
+        calls = calls_of(monkeypatch, "element_frame")
+        reader = PDFReader(made.path, **OPTIONS)
+
+        first = reader.to_dataframe()
+        first.drop_in_place("text")
+        rows = reader.to_dicts()
+        rows[0]["text"] = "changed"
+        reader.to_arrow_table()
+        reader.get_sample()
+
+        assert "text" in reader.to_dataframe().columns
+        assert reader.to_dicts()[0]["text"] != "changed"
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("n_rows,expected", [(None, 20), (1, 1), (3, 3), (10_000, None)])
+    def test_the_sample_is_the_frames_first_rows(self, read, n_rows, expected):
+        frame = element_frame(read.document)
+
+        sample = read.get_sample() if n_rows is None else read.get_sample(n_rows)
+
+        assert sample.equals(frame.head(expected if expected is not None else frame.height))
+
+    @pytest.mark.parametrize(
+        "n_rows,error,message",
+        [
+            (0, ValueError, "n_rows must be >= 1, got 0"),
+            (-5, ValueError, "n_rows must be >= 1, got -5"),
+            (True, TypeError, "n_rows must be an int, got True (bool)"),
+            (2.0, TypeError, "n_rows must be an int, got 2.0 (float)"),
+            ("20", TypeError, "n_rows must be an int, got '20' (str)"),
+        ],
+    )
+    def test_n_rows_is_checked_before_any_work(self, made, monkeypatch, n_rows, error, message):
+        reader = PDFReader(made.path, **OPTIONS)
+        refuse_work(monkeypatch)
+
+        with pytest.raises(error, match=re.escape(message)):
+            reader.get_sample(n_rows)
+
+    def test_the_markdown_is_the_documents(self, read):
+        assert read.to_markdown() == read.document.to_markdown()
+
+    def test_a_mapping_of_the_document_has_the_same_frame(self, made, read):
+        assert PDFReader(made.json).to_dataframe().equals(read.to_dataframe())
+
+    def test_a_bundle_has_the_same_frame_its_figures_linked_to_their_files(self, made, read):
+        bundled = PDFReader(made.bundle).to_dataframe()
+        extracted = read.to_dataframe()
+
+        assert bundled.drop("markdown").equals(extracted.drop("markdown"))
+        changed = bundled.filter(bundled["markdown"] != extracted["markdown"])
+        assert changed["kind"].to_list() == ["figure"] * len(read.figures)
+        assert all(link.startswith("![](") for link in changed["markdown"].to_list())
+
+    def test_an_empty_document_has_an_empty_frame_of_the_schema(self):
+        reader = PDFReader(document_to_json(empty_document()))
+
+        assert reader.to_dataframe().schema == FRAME_SCHEMA
+        assert (reader.to_dataframe().height, reader.to_dicts(), reader.get_sample().height) == (0, [], 0)
+        assert reader.to_arrow_table().num_rows == 0

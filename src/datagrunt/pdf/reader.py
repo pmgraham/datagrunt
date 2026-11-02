@@ -43,6 +43,27 @@ reader, or A5a's guarded, capped render). A failed extraction or load is
 not cached: the next use tries again. A lock makes the first use
 thread-safe: two threads never extract the same reader's document twice.
 
+The document's collections (``pages``, ``headings``, ``paragraphs``,
+``key_values``, ``tables``, ``lists``, ``figures``, ``page_images``,
+``sections``, ``header_context``) and its ``metadata`` are the document's
+own (A1's immutable elements). Its views:
+
+- :meth:`PDFReader.to_dataframe`: A7a's element frame
+  (:func:`~datagrunt.pdf.frame.element_frame`, ``hidden_reasons``
+  included: hidden text is flagged, never dropped, so filter it out by that
+  column), one row per element in document order. It is built once, on
+  first use, and each call returns its own clone (cheap: the buffers are
+  shared, and a change to one does not reach the reader's).
+- :meth:`PDFReader.to_arrow_table`: that frame as Arrow, of A7a's fixed
+  :data:`~datagrunt.pdf.frame.ARROW_SCHEMA` (immutable, so shared).
+- :meth:`PDFReader.to_dicts`: the frame's rows as new dicts each call.
+- :meth:`PDFReader.get_sample`: its first ``n_rows`` rows (20 by
+  default); ``n_rows`` is checked before any work.
+- :meth:`PDFReader.to_markdown`: the document's Markdown (A1). Hidden
+  elements stay behind their ``<!-- hidden: ... -->`` markers. The text is
+  the document's exactly: a lone surrogate is kept (the frame's strings
+  hold its escape, as UTF-8 needs).
+
 Workers: ``workers`` goes to ``extract_document``, whose pool starts plain
 ``python -I`` processes: a caller's script needs no ``__main__`` guard.
 """
@@ -55,11 +76,28 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import polars as pl
+import pyarrow as pa
+
+from datagrunt.pdf._validate import int_at_least
 from datagrunt.pdf.assembly import MIN_IMAGE_DIMENSION
 from datagrunt.pdf.bundle import MANIFEST, _read_manifest, load_bundle
 from datagrunt.pdf.codec import document_from_json
-from datagrunt.pdf.elements import PDFDocument
+from datagrunt.pdf.elements import (
+    BulletList,
+    DocumentMetadata,
+    Figure,
+    Heading,
+    KeyValue,
+    Page,
+    PageImage,
+    Paragraph,
+    PDFDocument,
+    Section,
+    Table,
+)
 from datagrunt.pdf.exceptions import BundleCorruptError
+from datagrunt.pdf.frame import ARROW_SCHEMA, element_frame
 from datagrunt.pdf.pdfium_engine import _checked_password, _checked_path
 from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, extract_document
 from datagrunt.pdf.quality import OcrMode
@@ -74,6 +112,7 @@ _PDF_HEADER_BYTES = _PDF_MARKER_LAST_OFFSET + len(_PDF_MARKER)
 # How a source file's head is opened: never blocking on a named pipe (O_NONBLOCK, which a regular file ignores),
 # as bytes (O_BINARY, Windows). Each flag is 0 where it does not exist.
 _OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+_SAMPLE_ROWS = 20  # get_sample's default, the CSV readers' sample size
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +171,8 @@ class PDFReader:
         )
         self._source = _checked_source(source, _checked_password(password))
         self._document: PDFDocument | None = None
+        self._frame: pl.DataFrame | None = None
+        self._arrow: pa.Table | None = None
         self._lock = threading.RLock()
 
     @property
@@ -141,6 +182,97 @@ class PDFReader:
             if self._document is None:
                 self._document = _read(self._source, self._options)
             return self._document
+
+    @property
+    def metadata(self) -> DocumentMetadata:
+        """The document's metadata."""
+        return self.document.metadata
+
+    @property
+    def pages(self) -> tuple[Page, ...]:
+        """The document's pages, in order."""
+        return self.document.pages
+
+    @property
+    def headings(self) -> tuple[Heading, ...]:
+        """The document's ``Heading`` elements, in document order."""
+        return self.document.headings
+
+    @property
+    def paragraphs(self) -> tuple[Paragraph, ...]:
+        """The document's ``Paragraph`` elements, in document order."""
+        return self.document.paragraphs
+
+    @property
+    def key_values(self) -> tuple[KeyValue, ...]:
+        """The document's ``KeyValue`` elements, in document order."""
+        return self.document.key_values
+
+    @property
+    def tables(self) -> tuple[Table, ...]:
+        """The document's ``Table`` elements, in document order."""
+        return self.document.tables
+
+    @property
+    def lists(self) -> tuple[BulletList, ...]:
+        """The document's ``BulletList`` elements, in document order."""
+        return self.document.lists
+
+    @property
+    def figures(self) -> tuple[Figure, ...]:
+        """The document's ``Figure`` elements, in document order: their bytes read lazily, by their loaders."""
+        return self.document.figures
+
+    @property
+    def page_images(self) -> tuple[PageImage, ...]:
+        """The document's page images, in page order: their bytes read lazily, by their loaders."""
+        return self.document.page_images
+
+    @property
+    def sections(self) -> tuple[Section, ...]:
+        """The document's sections, in document order."""
+        return self.document.sections
+
+    @property
+    def header_context(self) -> tuple[KeyValue, ...]:
+        """The visible ``KeyValue`` elements that head page 1, in reading order."""
+        return self.document.header_context
+
+    def to_dataframe(self) -> pl.DataFrame:
+        """The element frame, one row per element (see the module notes): the caller's own clone."""
+        return self._element_frame().clone()
+
+    def to_arrow_table(self) -> pa.Table:
+        """The element frame as a ``pyarrow.Table`` of A7a's fixed ``ARROW_SCHEMA``."""
+        with self._lock:
+            if self._arrow is None:
+                self._arrow = self._element_frame().to_arrow().cast(ARROW_SCHEMA)
+            return self._arrow
+
+    def to_dicts(self) -> list[dict[str, Any]]:
+        """The element frame's rows, as new dicts."""
+        return self._element_frame().to_dicts()
+
+    def get_sample(self, n_rows: int = _SAMPLE_ROWS) -> pl.DataFrame:
+        """The element frame's first ``n_rows`` rows (all of them if it has fewer).
+
+        Raises:
+            TypeError: If ``n_rows`` is not an int (bool is not), before any work.
+            ValueError: If ``n_rows`` is under 1, before any work.
+        """
+        rows = int_at_least("n_rows", n_rows, 1)
+        return self._element_frame().head(rows)
+
+    def to_markdown(self) -> str:
+        """The document's Markdown (A1's ``PDFDocument.to_markdown``)."""
+        return self.document.to_markdown()
+
+    def _element_frame(self) -> pl.DataFrame:
+        """The element frame, built on first use, then cached: never handed out (callers get clones)."""
+        with self._lock:
+            if self._frame is None:
+                self._frame = element_frame(self.document)
+            return self._frame
 
 
 def _checked_source(source: object, password: str | None) -> _Source:
