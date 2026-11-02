@@ -6,16 +6,33 @@ imported lazily.
 """
 
 import ctypes
+import hashlib
 import logging
+from collections.abc import Callable
+from functools import partial
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from datagrunt.core.pdf_io.extraction.config import _DEFAULT_MIN_IMAGE_DIMENSION
 from datagrunt.core.pdf_io.extraction.display_frame import display_edges
-from datagrunt.core.pdf_io.extraction.image_guard import _MAX_RAW_HEADER_BYTES, inspect_image
+from datagrunt.core.pdf_io.extraction.image_guard import (
+    _MAX_FILTER_ARRAY_ITEMS,
+    _MAX_RAW_HEADER_BYTES,
+    GuardDecision,
+    inspect_image,
+    normalize_filter,
+)
 from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, TextItem
 from datagrunt.core.pdf_io.filenames import embedded_image_filename
 
+if TYPE_CHECKING:
+    from datagrunt.core.pdf_io.extraction.render_guard import Jbig2Agreement
+
 logger = logging.getLogger(__name__)
+
+# PDF names are at most 127 bytes in practice; this bound, NUL included, only
+# stops a length pdfium reports from sizing the buffer.
+_MAX_FILTER_NAME_BYTES = 4096
 
 # Image objects can be nested inside form XObjects; walk deep enough to reach a
 # bomb hidden behind a few layers of forms before a render would decode it.
@@ -39,18 +56,50 @@ def _import_pdfium():
     return pdfium, raw
 
 
+def pdfium_reads_one_sound_revision(pdf_handle, raw_module) -> bool:
+    """True when pdfium read the document's cross-reference table as valid and finds one trailer end.
+
+    One trailer end is one revision: an incremental update adds one, whether
+    its cross-reference is a table or a stream (observed: 1 and 2 for
+    either). A table pdfium had to rebuild reads as not valid.
+    """
+    if not raw_module.FPDF_DocumentHasValidCrossReferenceTable(pdf_handle):
+        return False
+    return raw_module.FPDF_GetTrailerEnds(pdf_handle, None, 0) == 1
+
+
+def pdfium_reads_one_sound_revision_for_path(filepath) -> bool:
+    """:func:`pdfium_reads_one_sound_revision` of the file at ``filepath``; False when pdfium cannot open it."""
+    try:
+        pdfium, raw = _import_pdfium()
+        pdf = pdfium.PdfDocument(str(filepath))
+    except Exception:  # noqa: BLE001 - unreadable here -> not one sound revision
+        return False
+    try:
+        return pdfium_reads_one_sound_revision(pdf.raw, raw)
+    finally:
+        pdf.close()
+
+
 class PdfiumPage:
     """A single page; exposes text/image/render primitives in datagrunt shapes."""
 
-    def __init__(self, page, raw_module):
+    def __init__(self, page, raw_module, jbig2_decodable: Callable[[str, frozenset[str]], bool] | None = None):
         """Wrap a pypdfium2 page handle.
 
         Args:
             page: A pypdfium2 page object.
             raw_module: The ``pypdfium2.raw`` module.
+            jbig2_decodable: Given a JBIG2 image's raw-stream SHA-256 (hex) and
+                those of every JBIG2 image pdfium finds on this page, whether
+                PyMuPDF agrees it may be decoded (pdfium's API exposes no
+                image's decode parameters; see ``render_guard.jbig2_agreement``).
+                None: no JBIG2 image is decoded.
         """
         self._page = page
         self._raw = raw_module
+        self._jbig2_decodable = jbig2_decodable
+        self._jbig2_page_streams: frozenset[str] | None = None
         # If textpage acquisition fails (corrupt page), close the page handle
         # before re-raising — otherwise the constructor aborts before any
         # PdfiumPage is handed to the `with` block, so close()/__exit__ never
@@ -171,12 +220,35 @@ class PdfiumPage:
                 images += 1
         return texts, images
 
-    def _image_filters(self, obj) -> list:
-        """Return an image object's filter names (decoding order); ``[]`` on failure."""
+    def _image_filters(self, obj) -> list[str] | None:
+        """Return an image object's filter names (decoding order); None when pdfium cannot read them.
+
+        The count, each name's size and each copy are checked; a name that is
+        not UTF-8, or more than ``_MAX_FILTER_ARRAY_ITEMS`` filters, is unreadable too.
+        """
+        count = self._raw.FPDFImageObj_GetImageFilterCount(obj.raw)
+        if not 0 <= count <= _MAX_FILTER_ARRAY_ITEMS:
+            return None
+        names = []
+        for index in range(count):
+            name = self._image_filter(obj, index)
+            if name is None:
+                return None
+            names.append(name)
+        return names
+
+    def _image_filter(self, obj, index: int) -> str | None:
+        """Return filter ``index`` of an image object, or None when pdfium cannot read it."""
+        size = self._raw.FPDFImageObj_GetImageFilter(obj.raw, index, None, 0)
+        if not 1 <= size <= _MAX_FILTER_NAME_BYTES:
+            return None
+        buffer = ctypes.create_string_buffer(size)
+        if self._raw.FPDFImageObj_GetImageFilter(obj.raw, index, buffer, size) != size:
+            return None
         try:
-            return list(obj.get_filters())
-        except Exception:  # noqa: BLE001 - a missing/odd filter list must not fail the page
-            return []
+            return buffer.raw[: size - 1].decode("utf-8")
+        except UnicodeDecodeError:
+            return None
 
     def _raw_image_stream(self, obj) -> bytes | None:
         """Return an image object's raw (still-encoded) stream, or None if unreadable/too large.
@@ -195,10 +267,42 @@ class PdfiumPage:
         return buffer.raw
 
     def _guard(self, obj, page_number: int, idx: int):
-        """Return the guard decision for an image object (raw stream + filters, no decode)."""
+        """Return the guard decision for an image object (raw stream + filters, no decode).
+
+        A JBIG2 image's decode parameters are checked by its raw stream: it is
+        decoded only when the document draws that stream with no ``/JBIG2Globals``.
+        """
+        label = f"page {page_number + 1} image {idx}"
         filters = self._image_filters(obj)
+        if filters is None:
+            return GuardDecision(True, f"{label}: image filters could not be read; skipped (not decoded)")
         raw = self._raw_image_stream(obj)
-        return inspect_image(raw, filters, label=f"page {page_number + 1} image {idx}")
+        is_jbig2 = bool(filters) and normalize_filter(filters[-1]) == "JBIG2Decode"
+        unchecked = is_jbig2 and not self._jbig2_agreed(raw)
+        return inspect_image(raw, filters, label=label, jbig2_globals_missing=unchecked)
+
+    def _jbig2_agreed(self, raw: bytes | None) -> bool:
+        """True when PyMuPDF agrees the JBIG2 image whose raw stream is ``raw`` may be decoded."""
+        if raw is None or self._jbig2_decodable is None:
+            return False
+        on_page = self._jbig2_streams_on_page()
+        return on_page is not None and self._jbig2_decodable(hashlib.sha256(raw).hexdigest(), on_page)
+
+    def _jbig2_streams_on_page(self) -> frozenset[str] | None:
+        """The raw-stream SHA-256 of every JBIG2 image pdfium finds on the page (forms included); None if unreadable."""
+        if self._jbig2_page_streams is None:
+            digests = set()
+            for obj in self._page.get_objects(filter=(self._raw.FPDF_PAGEOBJ_IMAGE,), max_depth=_IMAGE_WALK_DEPTH):
+                filters = self._image_filters(obj)
+                if filters is None:
+                    return None
+                if filters and normalize_filter(filters[-1]) == "JBIG2Decode":
+                    raw = self._raw_image_stream(obj)
+                    if raw is None:
+                        return None
+                    digests.add(hashlib.sha256(raw).hexdigest())
+            self._jbig2_page_streams = frozenset(digests)
+        return self._jbig2_page_streams
 
     def guarded_image_reasons(self, page_number: int = 0) -> list:
         """Warning reasons for every image on the page a decode bound would skip.
@@ -334,6 +438,8 @@ class PdfiumDocument:
         """
         pdfium, raw = _import_pdfium()
         self._raw = raw
+        self._filepath = filepath
+        self._jbig2_agreement: Jbig2Agreement | None = None
         try:
             self._pdf = pdfium.PdfDocument(str(filepath))
         except pdfium.PdfiumError as exc:
@@ -355,7 +461,25 @@ class PdfiumDocument:
 
     def page(self, page_number: int) -> PdfiumPage:
         """Return the wrapped page at ``page_number`` (0-indexed)."""
-        return PdfiumPage(self._pdf[page_number], self._raw)
+        return PdfiumPage(self._pdf[page_number], self._raw, partial(self._jbig2_decodable, page_number))
+
+    def _jbig2_decodable(self, page_number: int, digest: str, on_page: frozenset[str]) -> bool:
+        """True when pdfium reads one sound revision and PyMuPDF agrees: ``digest`` may be decoded and page
+        ``page_number`` holds exactly ``on_page``."""
+        if not pdfium_reads_one_sound_revision(self._pdf.raw, self._raw):
+            return False
+        agreement = self._jbig2_agreement_with_pymupdf()
+        if digest not in agreement.streams or page_number >= len(agreement.page_streams):
+            return False
+        return agreement.page_streams[page_number] == on_page
+
+    def _jbig2_agreement_with_pymupdf(self) -> "Jbig2Agreement":
+        """The document's :class:`~render_guard.Jbig2Agreement`, read with PyMuPDF on first use."""
+        if self._jbig2_agreement is None:
+            from datagrunt.core.pdf_io.extraction.render_guard import jbig2_agreement_for_path
+
+            self._jbig2_agreement = jbig2_agreement_for_path(self._filepath)
+        return self._jbig2_agreement
 
     def close(self) -> None:
         """Close the underlying document."""

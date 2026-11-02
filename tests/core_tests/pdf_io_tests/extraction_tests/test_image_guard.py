@@ -13,8 +13,8 @@ import struct
 import pytest
 from PIL import Image
 
+from datagrunt.core.pdf_io.extraction import image_guard
 from datagrunt.core.pdf_io.extraction.image_guard import (
-    _JBIG2_REGION_TYPES,
     _MAX_DECODED_PIXELS,
     _MAX_JPX_COMPONENTS,
     _MAX_JPX_TILES,
@@ -192,7 +192,7 @@ class TestJbig2Segments:
     SMALL_PAGE = jbig2_segment(0, 48, struct.pack(">IIIIBH", 16, 16, 0, 0, 0, 0))
 
     def test_the_region_types_bounded(self):
-        assert _JBIG2_REGION_TYPES == frozenset({4, 6, 7, 20, 22, 23, 36, 38, 39, 40, 42, 43})
+        assert image_guard._JBIG2_GENERIC_REGION_TYPES == frozenset({36, 38, 39})
 
     @pytest.mark.parametrize("region_type", sorted({4, 6, 7, 20, 22, 23, 36, 38, 39, 40, 42, 43}))
     def test_a_region_segment_bomb_is_skipped(self, region_type):
@@ -223,3 +223,145 @@ class TestJbig2Segments:
         page2 = jbig2_segment(0, 48, struct.pack(">IIIIBH", 16, 16, 0, 0, 0, 0), page=2)
         decision = inspect_image(page2, ["JBIG2Decode"])
         assert decision.skip is True
+
+
+def generic_region(number: int, width: int, height: int, segment_type: int = 38) -> bytes:
+    """A generic region segment: region information, MMR flags, then a few data bytes."""
+    data = struct.pack(">IIIIB", width, height, 0, 0, 0) + b"\x01" + b"\xff" * 4
+    return jbig2_segment(number, segment_type, data)
+
+
+def unknown_length(number: int, segment_type: int, data: bytes) -> bytes:
+    """A short-form segment header whose data length is 0xFFFFFFFF (unknown), then ``data``."""
+    return struct.pack(">IBBBI", number, segment_type, 0x00, 1, 0xFFFFFFFF) + data
+
+
+PAGE_16 = jbig2_segment(0, 48, struct.pack(">IIIIBH", 16, 16, 0, 0, 0, 0))
+END_OF_PAGE = jbig2_segment(9, 49, b"")
+NOT_CHECKED = sorted(set(range(64)) - {36, 38, 39, 48, 49, 50, 51, 62})
+
+
+class TestJbig2SegmentTypes:
+    """A JBIG2 image is decoded only when every segment of its stream is of a checked type."""
+
+    def test_the_checked_types(self):
+        assert image_guard._JBIG2_CHECKED_TYPES == frozenset({36, 38, 39, 48, 49, 50, 51, 62})
+
+    @pytest.mark.parametrize("segment_type", [36, 38, 39])
+    def test_a_generic_region_scan_is_decoded(self, segment_type):
+        stream = PAGE_16 + generic_region(1, 16, 16, segment_type) + END_OF_PAGE
+
+        assert inspect_image(stream, ["JBIG2Decode"]) == (False, None)
+
+    def test_end_of_stripe_end_of_file_and_extension_segments_are_decoded(self):
+        end_of_stripe = jbig2_segment(2, 50, struct.pack(">I", 15))
+        extension = jbig2_segment(3, 62, struct.pack(">I", 0x20000000) + b"note\x00\x00")
+        end_of_file = jbig2_segment(4, 51, b"", page=0)
+        stream = PAGE_16 + generic_region(1, 16, 16) + end_of_stripe + extension + END_OF_PAGE + end_of_file
+
+        assert inspect_image(stream, ["JBIG2Decode"]) == (False, None)
+
+    @pytest.mark.parametrize("segment_type", NOT_CHECKED, ids=[f"type-{t}" for t in NOT_CHECKED])
+    def test_a_segment_of_any_other_type_is_not_decoded(self, segment_type):
+        stream = PAGE_16 + jbig2_segment(1, segment_type, bytes(24)) + generic_region(2, 16, 16) + END_OF_PAGE
+
+        decision = inspect_image(stream, ["JBIG2Decode"], label="xref 5")
+
+        assert decision.skip is True
+        assert decision.reason == f"xref 5: JBIG2 holds a segment of type {segment_type}, which is not checked; skipped"
+
+    def test_a_second_page_information_segment_is_not_decoded(self):
+        stream = PAGE_16 + jbig2_segment(1, 48, struct.pack(">IIIIBH", 16, 16, 0, 0, 0, 0)) + END_OF_PAGE
+
+        assert inspect_image(stream, ["JBIG2Decode"], label="xref 5") == (
+            True,
+            "xref 5: JBIG2 segments cannot be read; skipped",
+        )
+
+    def test_a_page_information_segment_shorter_than_its_size_is_not_decoded(self):
+        # Its 8 size bytes would be read from the next segment's header.
+        stream = jbig2_segment(0, 48, b"") + generic_region(1, 16, 16) + END_OF_PAGE
+
+        decision = inspect_image(stream, ["JBIG2Decode"], label="xref 5")
+
+        assert decision == (True, "xref 5: JBIG2 segments cannot be read; skipped")
+
+    def test_a_stream_past_the_segment_bound_is_not_decoded(self, monkeypatch):
+        monkeypatch.setattr(image_guard, "_MAX_JBIG2_SEGMENTS", 3)
+        stream = PAGE_16 + generic_region(1, 16, 16) + END_OF_PAGE
+
+        assert inspect_image(stream, ["JBIG2Decode"]).skip is False
+        decision = inspect_image(stream + jbig2_segment(10, 51, b"", page=0), ["JBIG2Decode"], label="xref 5")
+        assert decision == (True, "xref 5: JBIG2 has more than 3 segments; skipped")
+
+    def test_a_jbig2_image_with_a_symbol_dictionary_is_not_decoded(self):
+        # A symbol dictionary (type 0) before the page, as an embedded stream may carry it.
+        stream = jbig2_segment(0, 0, bytes(10)) + PAGE_16 + generic_region(2, 16, 16) + END_OF_PAGE
+
+        assert inspect_image(stream, ["JBIG2Decode"]).skip is True
+
+
+class TestJbig2SegmentLengths:
+    """Every segment's length must be known, so the walk sees every segment the stream holds."""
+
+    @pytest.mark.parametrize("segment_type", [38, 49], ids=["immediate-generic-region", "end-of-page"])
+    def test_a_segment_of_unknown_length_is_not_decoded(self, segment_type):
+        region = struct.pack(">IIIIB", 16, 16, 0, 0, 0) + b"\x01" + b"\xff" * 4 + b"\x00\x00" + struct.pack(">I", 16)
+        stream = PAGE_16 + unknown_length(1, segment_type, region)
+
+        decision = inspect_image(stream, ["JBIG2Decode"], label="xref 5")
+
+        assert decision == (True, "xref 5: JBIG2 holds a segment of unknown length, which is not checked; skipped")
+
+    def test_segments_after_one_of_unknown_length_are_not_trusted(self):
+        region = struct.pack(">IIIIB", 16, 16, 0, 0, 0) + b"\x01" + b"\xff" * 4 + b"\x00\x00" + struct.pack(">I", 16)
+        stream = PAGE_16 + unknown_length(1, 38, region) + jbig2_segment(2, 0, bytes(10)) + END_OF_PAGE
+
+        assert inspect_image(stream, ["JBIG2Decode"]).skip is True
+
+
+class TestJbig2RegionsTogether:
+    """The generic regions of one image, summed, are within the decode bound."""
+
+    def test_regions_within_the_bound_together_are_decoded(self):
+        # 6000 x 7000 = 42M pixels each; two of them sum to 84M, under 89,478,485.
+        stream = PAGE_16 + generic_region(1, 6000, 7000, 36) + generic_region(2, 6000, 7000, 36) + END_OF_PAGE
+
+        assert inspect_image(stream, ["JBIG2Decode"]).skip is False
+
+    def test_regions_over_the_bound_together_are_not_decoded(self):
+        # Three regions of 42M pixels: each within the bound, 126M together.
+        regions = b"".join(generic_region(n, 6000, 7000, 36) for n in (1, 2, 3))
+
+        decision = inspect_image(PAGE_16 + regions + END_OF_PAGE, ["JBIG2Decode"], label="xref 5")
+
+        assert decision == (
+            True,
+            "xref 5: JBIG2 regions decode to 126000000 pixels together, over the 89478485-pixel bound; skipped",
+        )
+
+
+class TestJbig2Globals:
+    """A JBIG2 image with a /JBIG2Globals stream is not decoded, whatever the stream holds."""
+
+    @pytest.mark.parametrize(
+        "globals_stream",
+        [b"", PAGE_16, generic_region(0, 16, 16)],
+        ids=["empty", "page-information", "small-generic-region"],
+    )
+    def test_a_jbig2_image_with_globals_is_not_decoded(self, globals_stream):
+        stream = PAGE_16 + generic_region(1, 16, 16) + END_OF_PAGE
+
+        decision = inspect_image(stream, ["JBIG2Decode"], label="xref 5", jbig2_globals=globals_stream)
+
+        assert decision == (True, "xref 5: JBIG2 with a /JBIG2Globals stream is not checked; skipped (not decoded)")
+
+    def test_decode_parameters_that_cannot_be_read_are_not_decoded(self):
+        stream = PAGE_16 + generic_region(1, 16, 16) + END_OF_PAGE
+
+        decision = inspect_image(stream, ["JBIG2Decode"], label="xref 5", jbig2_globals_missing=True)
+
+        assert decision == (
+            True,
+            "xref 5: JBIG2 decode parameters could not be checked for /JBIG2Globals; skipped (not decoded)",
+        )
