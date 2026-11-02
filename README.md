@@ -351,8 +351,11 @@ writer.render_pages_as_images("out/pages")    # every page as page_0001.png, pag
 writer.write_bundle("out/report_bundle")      # all of the above in one checked directory
 ```
 
-- Every output path is required; there are no default filenames. Each method
-  returns the absolute path(s) it wrote and creates missing directories.
+- Every output path is required; there are no default filenames. Each `write_*`
+  method returns the absolute path it wrote, and `extract_images` /
+  `render_pages_as_images` return the paths they wrote; all of them create
+  missing directories. `write_bundle` returns the `PDFDocument` it bundled,
+  and its parent directory must exist.
 - Every file is written atomically (a temporary file, then a rename), so a
   failed write never leaves a partial file. An existing file is replaced.
 - `extract_images(output_dir, dedupe=False)` writes every figure, named by its

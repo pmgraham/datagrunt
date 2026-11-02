@@ -137,11 +137,11 @@ Pieces the gate does not select stay visible.
   or a ratio under 0.70, routes vision, or digital under ``ocr="never"``
   with a warning naming each that held; a page with no visible char
   outside leader runs has no ratio (its count, 0, routes it). Otherwise, a page whose raster cover (of
-  scan-like images, as for ``invisible``) is over 50 % routes hybrid (OCR
-  fills the unmapped regions), or digital under ``ocr="never"``; else
-  digital.
+  scan-like images, as for ``invisible``) is over 50 % routes hybrid (read
+  from its text layer, as a digital page; its unmapped regions are recorded,
+  not OCR'd), or digital under ``ocr="never"``; else digital.
 - Unmapped regions: the box of each maximal run of invalid chars in a
-  visible piece, where OCR (A5) reads what the text layer cannot say.
+  visible piece: recorded, for an OCR pass the pipeline does not run yet.
 
 Known limitations (A3 review M7; each needs what this pure stage cannot
 see, and an occlusion follow-up is proposed for the last two):
@@ -1080,7 +1080,7 @@ def _route(text: _VisibleText, cover: float, painted: bool, ocr: OcrMode) -> tup
             short = " and ".join(shortfalls)
             return "digital", (f"ocr='never': the page has {short}; it stays digital instead of going to OCR",)
         return "vision", ()
-    # hybrid OCRs the unmapped regions, so "never" keeps such a page digital.
+    # hybrid marks a text layer over a scan; under "never" such a page is labelled digital.
     return ("hybrid" if cover > _OCR_LAYER_COVER and ocr != "never" else "digital"), ()
 
 
