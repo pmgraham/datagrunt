@@ -2,7 +2,10 @@
 
 Typed, immutable element types for extracted PDF content, their exceptions,
 and the reader and writer. ``datagrunt`` re-exports the reader, the writer,
-``PDFDocument``, the element types and the exceptions.
+``PDFDocument``, the element types and the three exceptions of spec §2.1
+(``DatagruntPDFError``, ``PDFEncryptedError``, ``PDFCorruptError``);
+``PDFSourceChangedError`` and ``BundleCorruptError``, which the writer's and
+the reader's bundle paths raise, are exported here only.
 
 The element types and exceptions need only datagrunt's core dependencies.
 ``PDFReader`` and ``PDFWriter`` need the [pdf] extra (pypdfium2 and Pillow),
@@ -38,7 +41,13 @@ from datagrunt.pdf.elements import (
     Table,
     make_element_id,
 )
-from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFEncryptedError
+from datagrunt.pdf.exceptions import (
+    BundleCorruptError,
+    DatagruntPDFError,
+    PDFCorruptError,
+    PDFEncryptedError,
+    PDFSourceChangedError,
+)
 
 __all__ = [
     "BBox",
@@ -64,6 +73,8 @@ __all__ = [
     "DatagruntPDFError",
     "PDFEncryptedError",
     "PDFCorruptError",
+    "PDFSourceChangedError",
+    "BundleCorruptError",
     "PDFReader",
     "PDFWriter",
 ]

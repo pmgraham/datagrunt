@@ -364,7 +364,11 @@ writer.write_bundle("out/report_bundle")      # all of the above in one checked 
   `markdown/document.md`, `images/<sha256>.png`, `page_images/page_NNNN.png`
   (plus the OCR bands of scanned pages), and a `manifest.json` that records
   every file's size and SHA-256. `output_dir` must not exist or must be empty.
-  `PDFReader("out/report_bundle")` loads it back, verifying every file.
+  `PDFReader("out/report_bundle")` loads it back, verifying every file: an
+  invalid `manifest.json` raises `ValueError` at construction, and a file that
+  doesn't match its manifest raises `datagrunt.pdf.BundleCorruptError` when the
+  bundle is first loaded. A source PDF that changes while it's read or bundled
+  raises `datagrunt.pdf.PDFSourceChangedError`.
 - `write_csv` writes every value as extracted: a cell that starts with `=`,
   `+`, `-`, or `@` is not escaped, so guarding a spreadsheet against formula
   injection is your application's concern.

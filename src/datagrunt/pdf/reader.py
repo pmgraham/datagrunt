@@ -259,7 +259,17 @@ class PDFReader:
 
     @property
     def document(self) -> PDFDocument:
-        """The document: extracted or loaded on first use, then cached (see the module notes)."""
+        """The document: extracted or loaded on first use, then cached (see the module notes).
+
+        Every property and method that needs the document raises as this does, on first use; a failure is
+        not cached, so the next use tries again.
+
+        Raises:
+            BundleCorruptError: If the source is a bundle and an artifact is not what its manifest says
+                (:func:`~datagrunt.pdf.bundle.load_bundle`).
+            PDFEncryptedError, PDFCorruptError, PDFSourceChangedError: As extraction
+                (:func:`~datagrunt.pdf.pipeline.extract_document`) raises them, when the source is a PDF.
+        """
         with self._lock:
             if self._document is None:
                 self._document = _read(self._source, self._options)

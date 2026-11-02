@@ -226,6 +226,9 @@ class PDFWriter:
             TypeError: If ``out_filepath`` is not a path (before any work).
             IsADirectoryError: If ``out_filepath`` is a directory (before any work).
             OSError: If the file cannot be written; as extraction raises it.
+            PDFEncryptedError, PDFCorruptError, PDFSourceChangedError: As extraction
+                (:func:`~datagrunt.pdf.pipeline.extract_document`) raises them, on the call that first
+                extracts the document.
         """
         target = _file_target(out_filepath)
         return _write_bytes(target, document_to_json_bytes(self._extracted()))
@@ -240,6 +243,9 @@ class PDFWriter:
             TypeError: If ``out_filepath`` is not a path (before any work).
             IsADirectoryError: If ``out_filepath`` is a directory (before any work).
             OSError: If the file cannot be written; as extraction raises it.
+            PDFEncryptedError, PDFCorruptError, PDFSourceChangedError: As extraction
+                (:func:`~datagrunt.pdf.pipeline.extract_document`) raises them, on the call that first
+                extracts the document.
         """
         target = _file_target(out_filepath)
         frame = element_frame(self._extracted())
@@ -261,6 +267,9 @@ class PDFWriter:
             TypeError: If ``out_filepath`` is not a path, or ``include_hidden`` not a bool (before any work).
             IsADirectoryError: If ``out_filepath`` is a directory (before any work).
             OSError: If the file cannot be written; as extraction raises it.
+            PDFEncryptedError, PDFCorruptError, PDFSourceChangedError: As extraction
+                (:func:`~datagrunt.pdf.pipeline.extract_document`) raises them, on the call that first
+                extracts the document.
         """
         target = _file_target(out_filepath)
         shown = strict_bool("include_hidden", include_hidden)
@@ -279,6 +288,9 @@ class PDFWriter:
             TypeError: If ``out_filepath`` is not a path (before any work); as polars raises it.
             IsADirectoryError: If ``out_filepath`` is a directory (before any work).
             OSError: If the file cannot be written; as extraction raises it.
+            PDFEncryptedError, PDFCorruptError, PDFSourceChangedError: As extraction
+                (:func:`~datagrunt.pdf.pipeline.extract_document`) raises them, on the call that first
+                extracts the document.
         """
         target = _file_target(out_filepath)
         frame = element_frame(self._extracted())
@@ -297,6 +309,9 @@ class PDFWriter:
             TypeError: If ``out_filepath`` is not a path (before any work); as polars raises it.
             IsADirectoryError: If ``out_filepath`` is a directory (before any work).
             OSError: If the file cannot be written; as extraction raises it.
+            PDFEncryptedError, PDFCorruptError, PDFSourceChangedError: As extraction
+                (:func:`~datagrunt.pdf.pipeline.extract_document`) raises them, on the call that first
+                extracts the document.
         """
         target = _file_target(out_filepath)
         frame = _csv_frame(element_frame(self._extracted()))
@@ -313,6 +328,9 @@ class PDFWriter:
                 if a figure's loader returns something other than bytes.
             NotADirectoryError: If ``output_dir`` exists and is not a directory (before any work).
             OSError: If a file cannot be written; as extraction raises it.
+            PDFEncryptedError, PDFCorruptError, PDFSourceChangedError: As extraction
+                (:func:`~datagrunt.pdf.pipeline.extract_document`) raises them, on the call that first
+                extracts the document.
         """
         directory = _directory_target(output_dir)
         strict_bool("dedupe", dedupe)
@@ -332,6 +350,9 @@ class PDFWriter:
             TypeError: If ``output_dir`` is not a path, or ``dpi`` not an int or None (before any work).
             NotADirectoryError: If ``output_dir`` exists and is not a directory (before any work).
             OSError: If a file cannot be written; as extraction raises it.
+            PDFEncryptedError, PDFCorruptError, PDFSourceChangedError: As extraction
+                (:func:`~datagrunt.pdf.pipeline.extract_document`) raises them, on the call that first
+                extracts the document.
         """
         source = self._required_source("render_pages_as_images")
         directory = _directory_target(output_dir)
@@ -355,6 +376,9 @@ class PDFWriter:
                 (before any work), or holds a bundle that is not this write's and ``overwrite`` is False.
             FileNotFoundError: If ``output_dir``'s parent is missing (before any work).
             PDFSourceChangedError: If the source changes while it is bundled: nothing is published.
+            PDFEncryptedError, PDFCorruptError, PDFSourceChangedError: As extraction
+                (:func:`~datagrunt.pdf.pipeline.extract_document`) raises them, on the call that first
+                extracts the document.
         """
         source = self._required_source("write_bundle")
         _checked_target(output_dir)

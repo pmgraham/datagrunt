@@ -39,6 +39,8 @@ V5_MODEL_NAMES = [
     "DatagruntPDFError",
     "PDFEncryptedError",
     "PDFCorruptError",
+    "PDFSourceChangedError",
+    "BundleCorruptError",
 ]
 PDF_PACKAGE_NAMES = [*V5_MODEL_NAMES, "PDFReader", "PDFWriter"]
 # Spec §2.1: the classes, the element types and the exceptions (rationalize's names arrive in 5.1).
@@ -71,7 +73,13 @@ TOP_LEVEL_NAMES = [
     "ParquetWriter",
     *TOP_LEVEL_PDF_NAMES,
 ]
-EXCEPTION_NAMES = {"DatagruntPDFError", "PDFEncryptedError", "PDFCorruptError"}
+EXCEPTION_NAMES = {
+    "DatagruntPDFError",
+    "PDFEncryptedError",
+    "PDFCorruptError",
+    "PDFSourceChangedError",
+    "BundleCorruptError",
+}
 CLASS_MODULES = {"PDFReader": datagrunt.pdf.reader, "PDFWriter": datagrunt.pdf.writer}
 
 
@@ -110,6 +118,44 @@ def test_top_level_reader_and_writer_are_v5(name):
     cls = getattr(datagrunt, name)
     assert cls is getattr(CLASS_MODULES[name], name)
     assert cls.__module__ == f"datagrunt.pdf.{name[3:].lower()}"
+
+
+@pytest.mark.parametrize("name", sorted(EXCEPTION_NAMES))
+def test_every_exception_is_a_datagrunt_pdf_error(name):
+    assert issubclass(getattr(datagrunt.pdf, name), datagrunt.pdf.DatagruntPDFError)
+
+
+def _raises_section(member: object) -> str:
+    """The text after the ``Raises:`` heading of ``member``'s docstring ("" if it has none)."""
+    doc = getattr(member, "__doc__", None) or ""
+    return doc.split("Raises:", 1)[1] if "Raises:" in doc else ""
+
+
+READER, WRITER = datagrunt.pdf.reader.PDFReader, datagrunt.pdf.writer.PDFWriter
+WRITER_METHODS = [
+    "write_json",
+    "write_jsonl",
+    "write_markdown",
+    "write_parquet",
+    "write_csv",
+    "extract_images",
+    "render_pages_as_images",
+    "write_bundle",
+]
+# Each public member that raises an exported exception names it under Raises: the reader's document loads a
+# bundle (verified) or extracts the PDF (checked against changes); each writer method extracts on first use.
+RAISERS = [
+    ("PDFReader.document", READER.__dict__["document"], "BundleCorruptError"),
+    ("PDFReader.document", READER.__dict__["document"], "PDFSourceChangedError"),
+    *((f"PDFWriter.{method}", getattr(WRITER, method), "PDFSourceChangedError") for method in WRITER_METHODS),
+]
+
+
+@pytest.mark.parametrize(
+    ("member", "name"), [(member, name) for _, member, name in RAISERS], ids=[f"{at}-{name}" for at, _, name in RAISERS]
+)
+def test_public_raisers_name_the_exception_under_raises(member, name):
+    assert name in _raises_section(member)
 
 
 @pytest.mark.parametrize("package", [datagrunt, datagrunt.pdf], ids=["datagrunt", "datagrunt.pdf"])
