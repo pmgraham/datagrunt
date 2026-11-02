@@ -1014,6 +1014,10 @@ class TestExtractDocument:
         assert (tail.page_number, head.page_number) == (1, 2)
         assert head.continued_from_id == tail.element_id
         assert tail.headers == ("Part", "Qty", "Price")
+        assert tail.rows == (("Bolt", "4", "0.10"), ("Nut", "12", "0.05"))
+        # Page 2 does not repeat the header row: its first row is data, not headers (D5), and no row is lost.
+        assert head.headers == ("Part", "Qty", "Price")
+        assert head.rows == (("Washer", "100", "0.01"), ("Pin", "8", "0.02"))
 
     def test_the_header_context_is_page_ones_leading_key_values(self, tmp_path):
         ys = (200.0, 220.0, 240.0, 260.0)

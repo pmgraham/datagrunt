@@ -367,12 +367,51 @@ class TestSplitTables:
     def test_a_repeated_header_row_is_kept(self):
         pages = (page(1, table(1, 0)), page(2, table(2, 0, headers=HEADERS)))
 
-        assert tables(apply_scope(pages))[1] == ("p0002_e000", "p0001_e000", HEADERS)
+        result = apply_scope(pages)
 
-    def test_a_continuations_own_headers_are_kept(self):
-        pages = (page(1, table(1, 0)), page(2, table(2, 0, headers=("Part", "Count"))))
+        assert tables(result)[1] == ("p0002_e000", "p0001_e000", HEADERS)
+        assert result.pages[1].elements[0].rows == (("bolt", "4"),)  # the repeat is not moved into the rows
 
-        assert tables(apply_scope(pages))[1] == ("p0002_e000", "p0001_e000", ("Part", "Count"))
+    def test_a_header_row_repeated_with_other_whitespace_is_kept_as_it_is(self):
+        # The continuation's own cells, verbatim: the first's are only what it is compared with.
+        own = ("Item\n", "Qty  ")
+        pages = (page(1, table(1, 0)), page(2, table(2, 0, headers=own)))
+
+        result = apply_scope(pages)
+
+        assert tables(result)[1] == ("p0002_e000", "p0001_e000", own)
+        assert result.pages[1].elements[0].rows == (("bolt", "4"),)
+
+    def test_a_first_row_that_does_not_repeat_the_headers_stays_a_row(self):
+        # D5: A4a takes a first row without blank cells for headers, as a continuation's first data row often is.
+        # Linked, it is the first of the continuation's rows again, and the continuation takes the first's headers.
+        tail = table(1, 0, headers=("Item", "Price"), rows=(("A", "$1"), ("B", "$2")))
+        head = table(2, 0, headers=("C", "$3"), rows=(("D", "$4"),))
+
+        result = apply_scope((page(1, tail), page(2, head)))
+        joined = result.pages[1].elements[0]
+
+        assert (joined.continued_from_id, joined.headers) == ("p0001_e000", ("Item", "Price"))
+        assert joined.rows == (("C", "$3"), ("D", "$4"))
+        assert result.pages[0].elements[0] == tail
+
+    def test_a_first_row_under_a_headerless_first_part_stays_a_row(self):
+        # The first part has no header row (its first row has a blank cell), so the table has none to repeat.
+        tail = table(1, 0, headers=(), rows=(("", "Qty"), ("bolt", "4")))
+        head = table(2, 0, headers=("nut", "9"), rows=(("washer", "2"),))
+
+        result = apply_scope((page(1, tail), page(2, head)))
+
+        assert tables(result)[1] == ("p0002_e000", "p0001_e000", ())
+        assert result.pages[1].elements[0].rows == (("nut", "9"), ("washer", "2"))
+
+    def test_an_unlinked_tables_headers_are_its_own(self):
+        # Only a continuation's first row is read against another part: a table that links to none keeps its own.
+        wider = table(2, 0, headers=("nut", "9", "1"), rows=(("washer", "2", "3"),), centres=(100.0, 300.0, 450.0))
+
+        result = apply_scope((page(1, table(1, 0)), page(2, wider)))
+
+        assert result.pages[1].elements[0] == wider
 
     def test_two_headerless_parts_link_and_stay_headerless(self):
         pages = (page(1, table(1, 0, headers=())), page(2, table(2, 0, headers=())))
@@ -518,6 +557,28 @@ class TestSplitTables:
             ("p0002_e000", "p0001_e001", HEADERS),
             ("p0003_e000", "p0002_e000", HEADERS),
         ]
+
+    def test_a_chain_keeps_every_first_row_as_a_row(self):
+        # Each part after the first opens on a data row A4a took for headers: each is a row again, down the chain.
+        pages = (
+            page(1, table(1, 0, rows=(("bolt", "4"),))),
+            page(2, table(2, 0, headers=("nut", "9"), rows=(("pin", "8"),))),
+            page(3, table(3, 0, headers=("washer", "2"), rows=())),
+        )
+
+        result = apply_scope(pages)
+
+        assert tables(result) == [
+            ("p0001_e000", None, HEADERS),
+            ("p0002_e000", "p0001_e000", HEADERS),
+            ("p0003_e000", "p0002_e000", HEADERS),
+        ]
+        assert [item.elements[0].rows for item in result.pages] == [
+            (("bolt", "4"),),
+            (("nut", "9"), ("pin", "8")),
+            (("washer", "2"),),
+        ]
+        assert apply_scope(result.pages) == result  # once a row again, it stays one
 
     def test_an_error_page_breaks_the_chain(self):
         pages = (page(1, table(1, 0)), error_page(2), page(3, table(3, 0, headers=())))
