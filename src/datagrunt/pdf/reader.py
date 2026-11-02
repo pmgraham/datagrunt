@@ -1,7 +1,8 @@
 """The v5 PDFReader (#372, A8b): a PDF's document, read in memory, with zero filesystem writes.
 
-Internal: not exported from ``datagrunt`` or ``datagrunt.pdf`` until the
-5.0 flip (#373).
+Public since 5.0 (#373): ``datagrunt.PDFReader`` and ``datagrunt.pdf.PDFReader``,
+both imported on first access, so ``import datagrunt`` needs no [pdf] extra
+(:mod:`datagrunt.pdf._extra`).
 
 :class:`PDFReader` takes one of three sources:
 

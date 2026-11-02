@@ -25,8 +25,8 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from datagrunt import PDFReader, PDFWriter
 from datagrunt.core.pdf_io.extraction import image_guard
+from datagrunt.pdf_api import PDFReader, PDFWriter
 
 # ---------------------------------------------------------------------------
 # Fixtures: hand-written PDFs embedding real JPEG 2000 / JBIG2 image streams.
@@ -531,7 +531,7 @@ _SUBPROCESS = textwrap.dedent(
             time.sleep(0.005)
 
     threading.Thread(target=watch, daemon=True).start()
-    from datagrunt import PDFReader, PDFWriter
+    from datagrunt.pdf_api import PDFReader, PDFWriter
 
     path, engine, op = sys.argv[1], sys.argv[2], sys.argv[3]
     base = peak()

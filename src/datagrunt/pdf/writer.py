@@ -1,7 +1,8 @@
 """The v5 PDFWriter (#371, A7b): a PDF's document, written to disk.
 
-Internal: not exported from ``datagrunt`` or ``datagrunt.pdf`` until the
-5.0 flip (#373).
+Public since 5.0 (#373): ``datagrunt.PDFWriter`` and ``datagrunt.pdf.PDFWriter``,
+both imported on first access, so ``import datagrunt`` needs no [pdf] extra
+(:mod:`datagrunt.pdf._extra`).
 
 :class:`PDFWriter` takes a source PDF's path or a
 :class:`~datagrunt.pdf.elements.PDFDocument`. Its construction checks run

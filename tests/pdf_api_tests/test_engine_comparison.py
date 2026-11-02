@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from datagrunt import PDFReader
+from datagrunt.pdf_api import PDFReader
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 CORPUS = sorted(glob(str(_REPO_ROOT / "data" / "pdfs" / "Root_Base*.pdf")))
@@ -111,7 +111,7 @@ def _table_cells(doc: dict) -> list:
 @pytest.fixture(scope="module", params=CORPUS, ids=[Path(p).name for p in CORPUS])
 def parsed_structured(request):
     """Parse one corpus doc with pymupdf and with pdfium structured mode."""
-    from datagrunt import PDFReader
+    from datagrunt.pdf_api import PDFReader
 
     path = request.param
     pymupdf_doc = PDFReader(path, engine="pymupdf").to_dicts()
@@ -166,7 +166,7 @@ class TestStructuredParity:
         # Guards against overlapping-text-object double-counting: the structured
         # text stream must not exceed the native full-page text (which already
         # includes table text inline). Allow a small margin for whitespace/joins.
-        from datagrunt import PDFReader
+        from datagrunt.pdf_api import PDFReader
 
         path, _mu, pdf = parsed_structured
         native = PDFReader(path, engine="pdfium", native=True).to_dicts()

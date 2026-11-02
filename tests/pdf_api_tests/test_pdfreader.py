@@ -87,7 +87,7 @@ class TestTopLevelExports:
     """Verify PDF classes are importable from the package root."""
 
     def test_top_level_imports(self):
-        from datagrunt import PDFReader, PDFWriter
+        from datagrunt.pdf_api import PDFReader, PDFWriter
 
         assert PDFReader.__name__ == "PDFReader"
         assert PDFWriter.__name__ == "PDFWriter"
@@ -109,7 +109,7 @@ class TestPDFReaderPdfiumEngine:
 
 class TestPDFReaderStructured:
     def test_reader_structured_unified_schema(self, sample_pdf):
-        from datagrunt import PDFReader
+        from datagrunt.pdf_api import PDFReader
 
         doc = PDFReader(sample_pdf, engine="pdfium").to_dicts()
         page = doc["document"]["pages"][0]

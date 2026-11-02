@@ -14,7 +14,7 @@ from pdf_helpers import (
     text_within_floor,
 )
 
-from datagrunt import PDFReader
+from datagrunt.pdf_api import PDFReader
 
 pytestmark = pytest.mark.usefixtures("pdf_parity_corpus")
 
