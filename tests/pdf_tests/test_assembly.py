@@ -833,6 +833,28 @@ class TestPageElements:
         elements = page_elements(found.items, figures.drafts, raw.geometry)
 
         assert elements == assemble_page(raw, assessment, lattice, source=path).elements
+        assert (found.warnings, figures.warnings) == ((), ())
+        assert [(type(element).__name__, element.element_id, element.reading_order) for element in elements] == [
+            ("Heading", "p0001_e000", 0),
+            ("Paragraph", "p0001_e001", 1),
+            ("KeyValue", "p0001_e002", 2),
+            ("BulletList", "p0001_e003", 3),
+            ("Figure", "p0001_e004", 4),
+            ("Table", "p0001_e005", 5),
+            ("Table", "p0001_e006", 6),
+        ]
+        heading, paragraph, key_value, bullets, figure, ruled, borderless = elements
+        assert (heading.text, heading.level) == ("Results", 1)
+        assert (
+            paragraph.text
+            == "The woodland is vast and its creatures many, each with its own purpose and its own ambitions."
+        )
+        assert (key_value.key, key_value.value) == ("Invoice", "10442")
+        assert bullets.items == ("first item", "second item")
+        assert (figure.width_px, figure.height_px) == (120, 80)
+        assert (ruled.extraction_method, ruled.headers, ruled.rows) == ("lattice", SPEC[0], SPEC[1:])
+        assert (borderless.extraction_method, borderless.headers, borderless.rows) == ("stream", PARTS[0], PARTS[1:])
+        assert not any(element.is_hidden for element in elements)
 
     def test_rejects_wrong_arguments(self):
         slot = layout.FigureSlot(index=0, bbox=BBox(x0=60.0, y0=40.0, x1=180.0, y1=120.0))
