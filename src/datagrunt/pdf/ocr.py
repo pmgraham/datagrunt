@@ -56,8 +56,9 @@ absolute path :func:`~datagrunt.pdf._executables.trusted_executable` finds
 in an absolute PATH directory (never the working directory), in its own
 session, with ``OMP_THREAD_LIMIT=1`` in its environment, and writes the
 image to its stdin as a binary PGM (no temporary image file). Its stdout is
-read within :data:`_MAX_STDOUT_BYTES`; its stderr goes to an anonymous
-temporary file, of which the last 4 KiB is read. At its timeout a timer
+read within :data:`_MAX_STDOUT_BYTES`; its stderr is drained by a thread
+into a 4 KiB ring (:class:`~datagrunt.pdf._process.StderrTail`: nothing is
+written to disk), joined within a bound once it is reaped. At its timeout a timer
 kills it, with everything in its session (a wrapper script's children
 too; on Windows only the process itself), and it is reaped within a
 bounded wait. tesseract missing, failing, timing out or overflowing its
@@ -71,7 +72,6 @@ import re
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -80,7 +80,7 @@ from typing import IO, Literal, NamedTuple
 from PIL import Image, ImageOps
 
 from datagrunt.pdf._executables import trusted_executable
-from datagrunt.pdf._process import REAP_TIMEOUT_S, close_pipes, reaped, stderr_tail
+from datagrunt.pdf._process import REAP_TIMEOUT_S, close_pipes, drained, reaped
 from datagrunt.pdf._validate import (
     choice_str,
     finite_float,
@@ -774,37 +774,41 @@ def _call(argv: list[str], payload: tuple[bytes, ...], timeout_s: float) -> _Cal
 
     tesseract reads all of its stdin before it writes anything, so the
     payload is written, then stdout read (within ``_MAX_STDOUT_BYTES``), in
-    this thread; stderr goes to a temporary file and cannot block it.
+    this thread; its stderr is drained by a thread of its own into a 4 KiB
+    ring, and cannot block it.
     """
-    with tempfile.TemporaryFile() as errors:
-        try:
-            process = subprocess.Popen(
-                argv,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=errors,
-                env={**os.environ, "OMP_THREAD_LIMIT": "1"},
-                start_new_session=_OWN_SESSION,
-            )
-        except OSError as exc:
-            return _Call("unavailable", f"cannot start tesseract ({argv[0]}): {exc}", b"", "")
-        expired = threading.Event()
-        timer = threading.Timer(timeout_s, _expire, (process, expired))
-        timer.daemon = True
-        timer.start()
-        fed, stdout = "", None
-        try:
-            fed = _fed(process.stdin, payload)
-            stdout = _bounded_read(process.stdout, _MAX_STDOUT_BYTES)
-        finally:
-            # Cancelled and joined before the reap: a kill never reaches a reaped (reusable) pid.
-            timer.cancel()
-            timer.join(REAP_TIMEOUT_S)
-            if stdout is None:  # past its stdout bound, or this call was interrupted
-                _kill(process)
-            returncode = reaped(process, REAP_TIMEOUT_S)
-            close_pipes(process)
-        stderr = stderr_tail(errors)
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={**os.environ, "OMP_THREAD_LIMIT": "1"},
+            start_new_session=_OWN_SESSION,
+        )
+    except OSError as exc:
+        return _Call("unavailable", f"cannot start tesseract ({argv[0]}): {exc}", b"", "")
+    try:
+        errors = drained(process)  # if its thread cannot start, tesseract is killed and reaped
+    except RuntimeError as exc:
+        return _Call("unavailable", f"cannot drain tesseract's stderr ({argv[0]}): {exc}", b"", "")
+    expired = threading.Event()
+    timer = threading.Timer(timeout_s, _expire, (process, expired))
+    timer.daemon = True
+    timer.start()
+    fed, stdout = "", None
+    try:
+        fed = _fed(process.stdin, payload)
+        stdout = _bounded_read(process.stdout, _MAX_STDOUT_BYTES)
+    finally:
+        # Cancelled and joined before the reap: a kill never reaches a reaped (reusable) pid.
+        timer.cancel()
+        timer.join(REAP_TIMEOUT_S)
+        if stdout is None:  # past its stdout bound, or this call was interrupted
+            _kill(process)
+        returncode = reaped(process, REAP_TIMEOUT_S)
+        close_pipes(process)
+        stderr = errors.finish(REAP_TIMEOUT_S)  # it is reaped: its drain ends
     return _ending(returncode, expired.is_set(), stdout, fed, stderr, timeout_s)
 
 

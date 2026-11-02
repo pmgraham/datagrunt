@@ -25,9 +25,22 @@ the page workers (``pipeline.py``):
   1 at its stderr first, so a stray print cannot corrupt a reply. Replies are
   length-prefixed messages (:func:`send_message`, :func:`read_message`),
   each read within a bound its reader sets.
-- The parent starts the worker with stdin and stdout piped and stderr to a
-  file (:func:`start_worker`), whose last 4 KiB (:func:`stderr_tail`) end
-  any failure without a reply.
+- The parent starts the worker with stdin, stdout and stderr piped
+  (:func:`start_worker`). Its stderr is drained by a thread of its own into
+  a ring that keeps the last 4 KiB (:class:`StderrTail`), which ends any
+  failure without a reply.
+
+The stderr ring writes nothing to disk (no temporary file: the reader reads
+a PDF with zero filesystem writes, #372) and holds at most
+:data:`_MAX_STDERR_TAIL` bytes, however much the child writes. tesseract's
+calls (:mod:`datagrunt.pdf.ocr`) drain their stderr the same way
+(:func:`drained`). The drain thread reads the pipe until its end, which comes
+when the child has exited (each caller bounds its child's life by a timer
+that kills it); :meth:`StderrTail.finish` joins it within the bound it is
+given, on every path (a reply, a failure, a kill, a timeout). A drain still
+running then (something else holds the pipe open) is left to end on its own
+and close the pipe itself, and the tail says so: the parent never closes a
+pipe another thread is reading.
 """
 
 import json
@@ -36,6 +49,7 @@ import os
 import struct
 import subprocess
 import sys
+import threading
 from types import MappingProxyType
 from typing import IO
 
@@ -44,21 +58,25 @@ __all__ = [
     "LENGTH",
     "MAX_REQUEST_BYTES",
     "REAP_TIMEOUT_S",
+    "STDERR_THREAD",
     "WORKERS",
     "MessageTooLong",
     "NoInterpreter",
+    "StderrTail",
     "close_pipes",
+    "drained",
     "read_message",
     "reaped",
     "request_payload",
     "send_message",
     "start_worker",
-    "stderr_tail",
     "worker_command",
 ]
 
 REAP_TIMEOUT_S = 5.0  # a child that finished, or was killed, is reaped within this
-_MAX_STDERR_TAIL = 4096
+_MAX_STDERR_TAIL = 4096  # the bytes of a child's stderr kept: its last
+_STDERR_READ_BYTES = 4096  # each read of a child's stderr
+STDERR_THREAD = "datagrunt-stderr"  # the name of each stderr drain thread
 
 # The workers a request may name, by key: (module, function). The function takes the request and the replies stream.
 WORKERS = MappingProxyType(
@@ -131,9 +149,36 @@ def request_payload(worker: str, request: object, bound: int) -> bytes:
     return payload
 
 
-def start_worker(command: list[str], errors: IO[bytes]) -> "subprocess.Popen[bytes]":
-    """Start the worker: stdin and stdout piped to this process, stderr to the file ``errors``."""
-    return subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
+def start_worker(command: list[str]) -> tuple["subprocess.Popen[bytes]", "StderrTail"]:
+    """Start the worker, its stdin, stdout and stderr piped to this process; it and its stderr's drain.
+
+    Raises:
+        OSError: If the OS refuses to start it.
+        RuntimeError: If its stderr's drain thread cannot start (it is then killed and reaped).
+    """
+    child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return child, drained(child)
+
+
+def drained(child: "subprocess.Popen[bytes]") -> "StderrTail":
+    """A :class:`StderrTail` draining ``child``'s stderr pipe.
+
+    Raises:
+        ValueError: If ``child``'s stderr is not a pipe.
+        RuntimeError: If the drain thread cannot start: ``child`` is then
+            killed and reaped, and its pipes closed, before this raises.
+    """
+    stream = child.stderr
+    if stream is None:
+        raise ValueError("the child's stderr must be a pipe")
+    try:
+        return StderrTail(stream)
+    except BaseException:  # no drain runs: this process kills and reaps the child, and closes its pipes
+        child.kill()
+        reaped(child, REAP_TIMEOUT_S)
+        close_pipes(child)
+        stream.close()
+        raise
 
 
 def send_message(replies: IO[bytes], message: bytes | mmap.mmap) -> None:
@@ -178,8 +223,62 @@ def reaped(child: "subprocess.Popen[bytes]", wait_s: float) -> int | None:
         return None
 
 
-def stderr_tail(errors: IO[bytes]) -> str:
-    """The last 4 KiB the child wrote to its stderr (the file ``errors``), as text."""
-    end = errors.seek(0, os.SEEK_END)
-    errors.seek(max(0, end - _MAX_STDERR_TAIL))
-    return errors.read(_MAX_STDERR_TAIL).decode("utf-8", errors="backslashreplace").strip()
+class StderrTail:
+    """A child's stderr, drained from its pipe by a thread of its own that keeps the last 4 KiB (see the module notes).
+
+    The thread starts at construction. It reads the pipe until its end, keeps
+    at most :data:`_MAX_STDERR_TAIL` bytes (the last), and closes the pipe
+    when it ends: nothing else closes it.
+    """
+
+    __slots__ = ("_error", "_kept", "_lock", "_thread")
+
+    def __init__(self, stream: IO[bytes]) -> None:
+        self._kept = bytearray()
+        self._lock = threading.Lock()
+        self._error: OSError | None = None
+        self._thread = threading.Thread(target=self._drain, args=(stream,), name=STDERR_THREAD, daemon=True)
+        self._thread.start()
+
+    def _drain(self, stream: IO[bytes]) -> None:
+        """The thread: read ``stream`` to its end, keeping its last bytes; a read that fails is recorded; then close it.
+
+        Each read returns as soon as the child has written anything, up to
+        :data:`_STDERR_READ_BYTES`; the loop ends at the pipe's end, which
+        comes once the child has exited (its caller bounds its life).
+        """
+        try:
+            for chunk in iter(lambda: os.read(stream.fileno(), _STDERR_READ_BYTES), b""):
+                self._keep(chunk)
+        except OSError as exc:  # recorded, and said by finish: never swallowed
+            self._error = exc
+        finally:
+            stream.close()
+
+    def _keep(self, chunk: bytes) -> None:
+        """Append ``chunk``, then drop what is before the last :data:`_MAX_STDERR_TAIL` bytes."""
+        with self._lock:
+            self._kept += chunk
+            del self._kept[: max(0, len(self._kept) - _MAX_STDERR_TAIL)]
+
+    def finish(self, wait_s: float) -> str:
+        """Wait up to ``wait_s`` seconds for the drain to end, then the last 4 KiB the child wrote, as text.
+
+        Called on every path that ends the child, once it is reaped; it may
+        be called again. A drain that has not ended within ``wait_s`` (the
+        pipe is still open) is left to end on its own, and a read that
+        failed is said: either is noted after the text, in parentheses.
+        """
+        self._thread.join(wait_s)
+        with self._lock:
+            text = bytes(self._kept).decode("utf-8", errors="backslashreplace").strip()
+        if self._thread.is_alive():
+            return _noted(text, f"its stderr was still open after {wait_s:g} s")
+        if self._error is not None:
+            return _noted(text, f"its stderr could not be read to its end: {self._error}")
+        return text
+
+
+def _noted(text: str, note: str) -> str:
+    """``text``, then ``note`` in parentheses."""
+    return f"{text} ({note})" if text else f"({note})"

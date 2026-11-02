@@ -931,19 +931,14 @@ class TestWorkerProcess:
         ):
             rendered(letter(tmp_path), 72)
 
-    @pytest.mark.parametrize(
-        "written,tail",
-        [
-            pytest.param(b"", "", id="empty"),
-            pytest.param(b"boom\n", "boom", id="short"),
-            pytest.param(b"x" * 5000 + b"\xffend", "x" * 4092 + "\\xffend", id="long"),
-        ],
-    )
-    def test_the_stderr_tail_is_its_last_4_kib(self, tmp_path, written, tail):
-        with open(tmp_path / "stderr", "w+b") as errors:
-            errors.write(written)
+    def test_a_worker_whose_stderr_cannot_be_drained_is_a_render_failure(self, tmp_path, monkeypatch):
+        def refused(command):
+            raise RuntimeError("can't start new thread")
 
-            assert _process.stderr_tail(errors) == tail
+        monkeypatch.setattr(render, "start_worker", refused)
+
+        with pytest.raises(RenderFailed, match=re.escape("page 1: cannot start a render worker: can't start new")):
+            rendered(letter(tmp_path), 72)
 
     def test_a_failure_without_a_reply_ends_with_the_workers_stderr(self):
         request = render._Request(

@@ -49,8 +49,10 @@ the worker's stdin, never in its argv or environment. The worker replies
 on its stdout in length-prefixed raw bytes, which a stray print cannot
 corrupt. Nothing is pickled either way: the parent decodes nothing but
 bytes from a worker (which parses hostile PDFs), each message within a
-bound. The worker's stderr goes to a temporary file; a failure without a
-reply ends with its last 4 KiB.
+bound. The worker's stderr is drained by a thread into a 4 KiB ring
+(:class:`~datagrunt.pdf._process.StderrTail`: nothing is written to disk),
+joined within a bound on every path; a failure without a reply ends with
+its last 4 KiB.
 
 Every wait is bounded by ``timeout_s``: at the deadline the worker is
 killed and reaped. A worker killed, timed out or failed is a
@@ -92,7 +94,6 @@ import os
 import struct
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -109,11 +110,11 @@ from datagrunt.pdf._process import (
     REAP_TIMEOUT_S,
     MessageTooLong,
     NoInterpreter,
+    StderrTail,
     close_pipes,
     reaped,
     request_payload,
     start_worker,
-    stderr_tail,
     worker_command,
 )
 from datagrunt.pdf._process import read_message as _read_message
@@ -526,15 +527,14 @@ def render_page(
     where = f"{request.source}: page {request.page_index + 1}"
     command = _worker_command(where)
     payload = _request_payload(request)
-    with tempfile.TemporaryFile() as errors:
-        deadline = time.monotonic() + request.timeout_s
-        worker = _started(command, errors, where)
-        try:
-            reply, timed_out, exitcode = _supervised(worker, payload, request.memory_cap_bytes, deadline)
-        finally:
-            close_pipes(worker)
-        tail = "" if reply is not None else stderr_tail(errors)
-    return _outcome(reply, timed_out, exitcode, request, tail)
+    deadline = time.monotonic() + request.timeout_s
+    worker, stderr = _started(command, where)
+    try:
+        reply, timed_out, exitcode = _supervised(worker, payload, request.memory_cap_bytes, deadline)
+    finally:
+        close_pipes(worker)
+        tail = stderr.finish(REAP_TIMEOUT_S)  # the worker is reaped: its drain ends
+    return _outcome(reply, timed_out, exitcode, request, "" if reply is not None else tail)
 
 
 def _one_page_batch(request: _Request, *, colour: bool, without_text: bool) -> RenderedPage:
@@ -624,8 +624,8 @@ def _run_batch(request: _BatchRequest) -> tuple[list[_Reply], bool, int | None, 
     """Run the batch's worker to its replies: them, whether its deadline passed, its exit code and stderr's tail.
 
     Raises:
-        RenderFailed: If no worker can start (no interpreter, no file for
-            its stderr, the OS refuses), or the request is over its bound.
+        RenderFailed: If no worker can start (no interpreter, no thread to
+            drain its stderr, the OS refuses), or the request is over its bound.
     """
     try:
         command = worker_command("a render worker")
@@ -633,29 +633,15 @@ def _run_batch(request: _BatchRequest) -> tuple[list[_Reply], bool, int | None, 
         raise RenderFailed(str(exc)) from exc
     payload = _batch_payload(request)
     count, channels = len(request.pages), (_BGR if request.colour else _GRAY).channels
-    with _stderr_file() as errors:
-        deadline = time.monotonic() + request.timeout_s
-        try:
-            worker = start_worker(command, errors)
-        except OSError as exc:
-            raise RenderFailed(f"cannot start a render worker: {exc}") from exc
-        exchange = partial(
-            _exchange_batch, worker.stdin, worker.stdout, payload, request.memory_cap_bytes, channels, count
-        )
-        try:
-            replies, timed_out, exitcode = _watched(worker, deadline, count, exchange)
-        finally:
-            close_pipes(worker)
-        tail = "" if len(replies) == count else stderr_tail(errors)
-    return replies, timed_out, exitcode, tail
-
-
-def _stderr_file() -> IO[bytes]:
-    """A temporary file for a worker's stderr; RenderFailed if none can be made."""
+    deadline = time.monotonic() + request.timeout_s
+    worker, stderr = _started(command, "")
+    exchange = partial(_exchange_batch, worker.stdin, worker.stdout, payload, request.memory_cap_bytes, channels, count)
     try:
-        return tempfile.TemporaryFile()
-    except OSError as exc:
-        raise RenderFailed(f"cannot make a file for the render worker's stderr: {exc}") from exc
+        replies, timed_out, exitcode = _watched(worker, deadline, count, exchange)
+    finally:
+        close_pipes(worker)
+        tail = stderr.finish(REAP_TIMEOUT_S)  # the worker is reaped: its drain ends
+    return replies, timed_out, exitcode, "" if len(replies) == count else tail
 
 
 def _batch_payload(request: _BatchRequest) -> bytes:
@@ -707,12 +693,18 @@ def _request_payload(request: _Request) -> bytes:
         raise RenderFailed(str(exc)) from exc
 
 
-def _started(command: list[str], errors: IO[bytes], where: str) -> "subprocess.Popen[bytes]":
-    """Start the worker: stdin and stdout piped to this process, stderr to ``errors``."""
+def _started(command: list[str], where: str) -> tuple["subprocess.Popen[bytes]", StderrTail]:
+    """Start the worker, its pipes to this process, and its stderr's drain; ``where`` (if any) heads an error.
+
+    Raises:
+        RenderFailed: If the OS refuses to start it, or no thread can drain
+            its stderr (it is then killed and reaped).
+    """
     try:
-        return start_worker(command, errors)
-    except OSError as exc:
-        raise RenderFailed(f"{where}: cannot start a render worker: {exc}") from exc
+        return start_worker(command)
+    except (OSError, RuntimeError) as exc:
+        lead = f"{where}: " if where else ""
+        raise RenderFailed(f"{lead}cannot start a render worker: {exc}") from exc
 
 
 def _supervised(
