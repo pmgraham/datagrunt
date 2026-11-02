@@ -343,6 +343,22 @@ class TestDocument:
             drawn = render_page(written.source, page.page_number - 1, dpi=dpi, memory_cap_bytes=CAP, timeout_s=TIMEOUT)
             assert png_pixels(path) == ("L", (drawn.px_width, drawn.px_height), drawn.pixels)
 
+    def test_a_page_over_max_render_pixels_is_rendered_below_dpi(self, tmp_path, source, monkeypatch):
+        calls = spied(monkeypatch)
+        returned = write(
+            bound_document(source), tmp_path / "out", source, dpi=200, vision_dpi=300, max_render_pixels=262_144
+        )
+        pages = [returned.pages[n - 1] for n in RENDERED]
+        expected = [effective_dpi(200, 262_144, page.width_pt, page.height_pt) for page in pages]
+        assert all(dpi < 200 for dpi in expected)  # the case: the pixel bound lowers each page's dpi
+        assert sorted(calls) == [(n - 1, dpi) for n, dpi in zip(RENDERED, expected, strict=True)]
+        recorded = {entry["page_number"]: entry["dpi"] for entry in manifest_of(tmp_path / "out")["page_images"]}
+        for page, dpi in zip(pages, expected, strict=True):
+            image = page.page_image
+            width, height = render_size(page.width_pt, page.height_pt, dpi)
+            assert (image.dpi, recorded[page.page_number], image.width_px, image.height_px) == (dpi, dpi, width, height)
+            assert png_pixels(image.image_path)[1] == (width, height) and width * height <= 262_144
+
     def test_a_pages_own_image_is_kept_and_written_through_its_loaders(self, written):
         mine, theirs = written.returned.pages[2], written.document.pages[2]
         assert mine == theirs  # the page image compares equal: its dpi, size and normalization are kept
