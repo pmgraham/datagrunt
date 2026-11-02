@@ -283,9 +283,13 @@ def plain(bbox: BBox) -> tuple[float, float, float, float]:
 
 
 def as_upright(element, upright):
-    """A turned page's ``element`` with ``upright``'s box, and column centres for a table (a turned one has none)."""
-    centres = {"column_centres": upright.column_centres} if isinstance(element, Table) else {}
-    return dataclasses.replace(element, bbox=upright.bbox, **centres)
+    """A turned page's ``element`` with ``upright``'s box, and a table's column centres and intervals (it has none)."""
+    columns = (
+        {"column_centres": upright.column_centres, "column_intervals": upright.column_intervals}
+        if isinstance(element, Table)
+        else {}
+    )
+    return dataclasses.replace(element, bbox=upright.bbox, **columns)
 
 
 def kinds(found: VisionElements) -> list[str]:
@@ -443,7 +447,7 @@ class TestVisionElements:
             assert plain(element.bbox) == pytest.approx(displayed_box(plain(expected.bbox), rotation, *size))
             assert as_upright(element, expected) == expected
         (table,) = [element for element in found.elements if isinstance(element, Table)]
-        assert table.column_centres == ()
+        assert (table.column_centres, table.column_intervals) == ((), ())
 
     def test_digital_text_kept_apart_reads_on_a_turned_page_where_it_lies(self):
         size = (LETTER[1], LETTER[0])

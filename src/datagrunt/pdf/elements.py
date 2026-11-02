@@ -26,6 +26,7 @@ from datagrunt.pdf._validate import (
     int_at_least,
     non_blank_str,
     optional_str,
+    ordered_interval,
     positive_float,
     sha256_hex,
     str_tuple,
@@ -712,6 +713,14 @@ class Table(_Element):
             the column's widest cell; a lattice table's is the middle of
             its ruled column. The scope pass (A6) links a split table's
             parts on them.
+        column_intervals: One display-x ``(start, end)`` per column (finite,
+            ``start <= end``, starts never falling, each holding its
+            column's centre), set exactly when ``column_centres`` are. A
+            stream table's is where its column's cells start and end along
+            the rows, so a column whose cells are all one width, which
+            tells no alignment, still shows where its text ends (#420); a
+            lattice table's is its ruled column's span. A6 links such a
+            part by its end to the other part's flush-right column.
     """
 
     headers: tuple[str, ...]
@@ -719,6 +728,7 @@ class Table(_Element):
     extraction_method: ExtractionMethod
     continued_from_id: str | None = None
     column_centres: tuple[float, ...] = ()
+    column_intervals: tuple[tuple[float, float], ...] = ()
 
     def _validate_fields(self) -> None:
         str_tuple("headers", self.headers, allow_blank=True)
@@ -733,6 +743,7 @@ class Table(_Element):
             if self.continued_from_id == self.element_id:
                 raise ValueError(f"continued_from_id must differ from element_id, got {self.continued_from_id!r}")
         self._validate_centres()
+        self._validate_intervals()
 
     def _validate_centres(self) -> None:
         """Require no centres, or one finite centre per column in strictly increasing order (stored as floats)."""
@@ -749,6 +760,31 @@ class Table(_Element):
         if any(left >= right for left, right in zip(centres, centres[1:])):
             raise ValueError(f"column_centres must strictly increase, got {self.column_centres!r}")
         object.__setattr__(self, "column_centres", centres)
+
+    def _validate_intervals(self) -> None:
+        """Require intervals exactly when centres, one ``(start, end)`` per column (stored as floats), as documented."""
+        if not isinstance(self.column_intervals, tuple):
+            raise TypeError(f"column_intervals must be a tuple, got {type(self.column_intervals).__name__}")
+        if bool(self.column_intervals) != bool(self.column_centres):
+            counts = f"{len(self.column_centres)} centres and {len(self.column_intervals)} intervals"
+            raise ValueError(f"column_intervals must be set exactly when column_centres are, got {counts}")
+        if not self.column_intervals:
+            return
+        width = self._width()
+        if len(self.column_intervals) != width:
+            raise ValueError(
+                f"column_intervals must have {width} values (one per column), got {len(self.column_intervals)}"
+            )
+        intervals = tuple(
+            ordered_interval(f"column_intervals[{i}]", pair) for i, pair in enumerate(self.column_intervals)
+        )
+        if any(later[0] < earlier[0] for earlier, later in zip(intervals, intervals[1:])):
+            raise ValueError(f"column_intervals' starts must not decrease, got {self.column_intervals!r}")
+        for index, (centre, (start, end)) in enumerate(zip(self.column_centres, intervals)):
+            if not start <= centre <= end:
+                where = f"column_intervals[{index}] {(start, end)!r}"
+                raise ValueError(f"column_centres[{index}] {centre!r} must lie within {where}")
+        object.__setattr__(self, "column_intervals", intervals)
 
     def _validate_width(self) -> None:
         if not self.headers and not self.rows:

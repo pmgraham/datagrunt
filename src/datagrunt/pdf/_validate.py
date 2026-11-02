@@ -151,3 +151,11 @@ def ordered_box(name: str, value: object) -> tuple[float, float, float, float]:
     if x0 > x1 or y0 > y1:
         raise ValueError(f"{name} must have x0 <= x1 and y0 <= y1, got {value!r}")
     return x0, y0, x1, y1
+
+
+def ordered_interval(name: str, value: object) -> tuple[float, float]:
+    """Return ``value`` as 2 finite floats ``(start, end)`` with ``start <= end``."""
+    start, end = finite_tuple(name, value, 2)
+    if start > end:
+        raise ValueError(f"{name} must have start <= end, got {(start, end)!r}")
+    return start, end

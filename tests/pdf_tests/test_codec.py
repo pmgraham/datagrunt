@@ -116,6 +116,12 @@ class TestRoundTrip:
         assert loaded.pages[1].height_pt == 842.25
         assert loaded.pages[0].elements[6].column_centres == (100.0, 200.5)
 
+    def test_column_intervals_are_pairs_in_the_json_and_tuples_back(self):
+        data = encoded()
+
+        assert data["pages"][0]["elements"][6]["column_intervals"] == [[60.0, 140.0], [180.0, 221.0]]
+        assert document_from_json(data).pages[0].elements[6].column_intervals == ((60.0, 140.0), (180.0, 221.0))
+
     def test_encoding_is_deterministic(self):
         assert document_to_json_bytes(rich_document()) == document_to_json_bytes(rich_document())
 
@@ -395,6 +401,10 @@ class TestBadValues:
             (("metadata", "page_count"), 3, ValueError, "pages has 4 page"),
             (("metadata", "doc_id"), "other__0000000000000000", ValueError, "doc_id must be"),
             (("pages", 0, "elements", 6, "column_centres"), [1.0], ValueError, "column_centres must have 2"),
+            (("pages", 0, "elements", 6, "column_intervals"), [[60.0, 140.0]], ValueError, "intervals must have 2"),
+            (("pages", 0, "elements", 6, "column_intervals", 0), [140.0, 60.0], ValueError, "must have start <= end"),
+            (("pages", 0, "elements", 6, "column_intervals", 0), [60.0], ValueError, r"\[0\] must have 2 values"),
+            (("pages", 0, "elements", 6, "column_intervals"), [], ValueError, "set exactly when column_centres are"),
             (("pages", 1, "elements", 1, "continued_from_id"), "p0001_e000", ValueError, "must name a table"),
         ],
     )
@@ -408,6 +418,12 @@ class TestBadValues:
             (("pages", 0, "elements", 2, "scope_path"), "Intro", "scope_path must be a JSON array, got str"),
             (("pages", 0, "elements", 6, "rows"), "ab", "rows must be a JSON array, got str"),
             (("pages", 0, "elements", 6, "rows", 0), "ab", r"rows\[0\] must be a JSON array, got str"),
+            (("pages", 0, "elements", 6, "column_intervals"), "ab", "column_intervals must be a JSON array, got str"),
+            (
+                ("pages", 0, "elements", 6, "column_intervals", 0),
+                "ab",
+                r"column_intervals\[0\] must be a JSON array, got str",
+            ),
             (("pages", 0, "warnings"), None, "warnings must be a JSON array, got NoneType"),
             (("pages",), {}, "pages must be a JSON array, got dict"),
             (("pages", 0, "elements", 0, "bbox"), [1, 2, 3, 4], "bbox must be a JSON object, got list"),

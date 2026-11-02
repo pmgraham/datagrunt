@@ -123,6 +123,9 @@ class TestStreamTables:
         cells = [found.cells for found in text_lines(pieces, lattice)]
         assert [{row[col].bbox.x0 for row in cells} for col in range(3)] == [{x} for x in XS]
         assert table.column_centres == XS
+        # Each column runs from its cells' first start to their last end (#420).
+        extents = [(min(row[col].bbox.x0 for row in cells), max(row[col].bbox.x1 for row in cells)) for col in range(3)]
+        assert table.column_intervals == tuple(extents)
         assert (table.n_cols, table.columns) == (3, ((0, 1, 2),) * 4)
         assert [row.text for row in table.rows] == [" ".join(row) for row in PARTS]
         assert (table.bbox.x0, table.bbox.x1) == (72.0, max(row[2].bbox.x1 for row in cells))
@@ -192,6 +195,7 @@ class TestStreamTables:
         starts = [{found.y0 for found in band} for band in bands]
         assert all(len(found) == 1 for found in starts)
         assert table.column_centres == tuple(found.pop() for found in starts)
+        assert table.column_intervals == tuple((min(b.y0 for b in band), max(b.y1 for b in band)) for band in bands)
 
     def test_a_table_read_up_the_page_has_its_column_centres_in_reading_order(self):
         # Text rising up the page reads bottom to top: its first column is the lower one (display y 376-400), each
@@ -202,6 +206,8 @@ class TestStreamTables:
 
         assert found.items[0].grid() == (("Name", "Value"), ("Name", "Value"))
         assert found.items[0].column_centres == (400.0, 200.0)
+        # Its intervals are in display y too, each (least, greatest): "Name" spans 376-400, "Value" 170-200.
+        assert found.items[0].column_intervals == ((376.0, 400.0), (170.0, 200.0))
 
 
 class TestBands:
@@ -346,13 +352,61 @@ class TestColumnPositions:
             line(ending("200", 100.0, 30.0), cell("Nut", 100.5, 30.0)),
         )
 
-        centres = positions(*rows)
+        (found,) = layout._row_structures(list(rows), width=612.0, height=792.0)
+        (table,) = found.items
+        centres, intervals = table.column_centres, table.column_intervals
 
         assert centres == (100.0, 100.5)
         ids = {"element_id": "p0001_e000", "page_number": 1, "reading_order": 0, "bbox": box(88.0, 10.0, 124.5, 42.0)}
         grid = (("10", "Bolt"), ("200", "Nut"))
-        # A1's contract: one strictly increasing centre per column.
-        assert Table(**ids, headers=(), rows=grid, extraction_method="stream", column_centres=centres).column_centres
+        # A1's contract: one strictly increasing centre per column, inside its interval, the intervals' starts rising.
+        measured = {"column_centres": centres, "column_intervals": intervals}
+        assert Table(**ids, headers=(), rows=grid, extraction_method="stream", **measured).column_intervals == intervals
+
+
+def extents(*rows) -> tuple[tuple[float, float], ...]:
+    """The column intervals (``column_intervals``) of the one table ``rows`` make."""
+    (found,) = layout._row_structures(list(rows), width=612.0, height=792.0)
+    (table,) = found.items
+    assert isinstance(table, StreamTable)
+    return table.column_intervals
+
+
+class TestColumnIntervals:
+    """A column's interval runs from its cells' first start to their last end along the rows (#420).
+
+    Its position is where the cells align; its interval is where they lie, so a column whose cells are all one
+    width, which tells no alignment, still shows where its text ends.
+    """
+
+    def test_each_column_runs_from_its_first_start_to_its_last_end(self):
+        rows = (
+            line(cell("Washer", 72.0, 10.0), ending("100", 250.0, 10.0)),
+            line(cell("Pin", 72.0, 30.0), ending("8", 250.0, 30.0)),
+        )
+
+        assert extents(*rows) == ((72.0, 108.0), (232.0, 250.0))
+
+    def test_a_one_width_flush_right_column_still_shows_its_end(self):
+        # The amounts are one width: the column sits at their start (#409), and its interval ends where they end.
+        rows = (
+            line(cell("Pin", 72.0, 10.0), ending("0.02", 250.0, 10.0)),
+            line(cell("Nut", 72.0, 30.0), ending("0.03", 250.0, 30.0)),
+        )
+
+        assert positions(*rows) == (72.0, 226.0)
+        assert extents(*rows) == ((72.0, 90.0), (226.0, 250.0))
+
+    def test_a_header_set_another_way_widens_its_column(self):
+        # A centred header over flush-right amounts: the column sits on the amounts' end, and spans the header too.
+        rows = (
+            line(cell("Item", 72.0, 10.0), centred("Grand total", 276.0, 10.0)),
+            line(cell("Bolt", 72.0, 30.0), ending("8.00", 300.0, 30.0)),
+            line(cell("Nut", 72.0, 50.0), ending("16.50", 300.0, 50.0)),
+        )
+
+        assert positions(*rows) == (72.0, 300.0)
+        assert extents(*rows) == ((72.0, 96.0), (243.0, 309.0))
 
 
 class TestRejections:
@@ -764,7 +818,12 @@ def two_rows():
 
 def table(**overrides) -> StreamTable:
     """A valid StreamTable of two_rows, with ``overrides``."""
-    fields = {"rows": two_rows(), "columns": ((0, 1), (0, 1)), "column_centres": (22.0, 109.0)}
+    fields = {
+        "rows": two_rows(),
+        "columns": ((0, 1), (0, 1)),
+        "column_centres": (22.0, 109.0),
+        "column_intervals": ((10.0, 34.0), (100.0, 118.0)),
+    }
     return StreamTable(**(fields | {"bbox": box(10.0, 10.0, 124.0, 42.0)} | overrides))
 
 
@@ -854,6 +913,36 @@ class TestStreamTableRecord:
                 ValueError,
                 "column_centres[1] must be finite, got nan",
                 id="centre-nan",
+            ),
+            pytest.param(
+                {"column_intervals": [(10.0, 34.0), (100.0, 118.0)]},
+                TypeError,
+                "column_intervals must be a tuple, got list",
+                id="intervals-list",
+            ),
+            pytest.param(
+                {"column_intervals": ((10.0, 34.0),)},
+                ValueError,
+                "column_intervals must hold one interval per column (2), got 1",
+                id="intervals-count",
+            ),
+            pytest.param(
+                {"column_intervals": ((10.0, 34.0), (118.0, 100.0))},
+                ValueError,
+                "column_intervals[1] must have start <= end, got (118.0, 100.0)",
+                id="interval-reversed",
+            ),
+            pytest.param(
+                {"column_intervals": ((10.0, 34.0), (100.0, float("nan")))},
+                ValueError,
+                "column_intervals[1][1] must be finite, got nan",
+                id="interval-nan",
+            ),
+            pytest.param(
+                {"column_intervals": ((10.0, 20.0), (100.0, 118.0))},
+                ValueError,
+                "column_centres[0] 22.0 must lie within column_intervals[0] (10.0, 20.0)",
+                id="centre-outside",
             ),
             pytest.param({"bbox": None}, TypeError, "bbox must be a BBox, got NoneType", id="bbox-none"),
             pytest.param(

@@ -581,6 +581,11 @@ class TestTableContinuation:
             _table(continued_from_id=1)
 
 
+def _around(centres):
+    """``column_intervals`` for ``centres``, 1 pt either side of each: A1 sets the two fields together (#420)."""
+    return tuple((centre - 1, centre + 1) for centre in centres)
+
+
 class TestTableColumnCentres:
     """``column_centres``: each column's display-space x centre, which the scope pass links split tables by."""
 
@@ -588,21 +593,26 @@ class TestTableColumnCentres:
         assert _table().column_centres == ()
 
     def test_one_centre_per_column(self):
-        assert _table(column_centres=(10.5, 80.0)).column_centres == (10.5, 80.0)
+        centres = (10.5, 80.0)
+
+        assert _table(column_centres=centres, column_intervals=_around(centres)).column_centres == centres
 
     def test_ints_are_stored_as_floats(self):
-        centres = _table(column_centres=(10, 80)).column_centres
+        centres = _table(column_centres=(10, 80), column_intervals=_around((10, 80))).column_centres
 
         assert centres == (10.0, 80.0)
         assert [type(centre) for centre in centres] == [float, float]
 
     def test_a_table_without_headers_counts_its_columns_in_the_first_row(self):
-        table = _table(headers=(), rows=(("1", "2", "3"),), column_centres=(1.0, 2.0, 3.0))
+        centres = (1.0, 2.0, 3.0)
+        table = _table(headers=(), rows=(("1", "2", "3"),), column_centres=centres, column_intervals=_around(centres))
 
-        assert table.column_centres == (1.0, 2.0, 3.0)
+        assert table.column_centres == centres
 
     def test_off_page_centres_keep_their_raw_coordinates(self):
-        assert _table(column_centres=(-40.0, -10.0)).column_centres == (-40.0, -10.0)
+        centres = (-40.0, -10.0)
+
+        assert _table(column_centres=centres, column_intervals=_around(centres)).column_centres == centres
 
     @pytest.mark.parametrize("bad", [(10.0,), (10.0, 20.0, 30.0)], ids=["one", "three"])
     def test_count_must_match_the_width(self, bad):
@@ -631,7 +641,115 @@ class TestTableColumnCentres:
             _table(column_centres=bad)
 
     def test_part_of_equality(self):
-        assert _table(column_centres=(1.0, 2.0)) != _table()
+        assert _table(column_centres=(1.0, 2.0), column_intervals=_around((1.0, 2.0))) != _table()
+
+
+CENTRES = (10.0, 80.0)
+
+
+def _measured(intervals, centres=CENTRES):
+    """A two-column table with ``centres`` and ``intervals``."""
+    return _table(column_centres=centres, column_intervals=intervals)
+
+
+class TestTableColumnIntervals:
+    """``column_intervals``: each column's display-x ``(start, end)``, set exactly when its centres are (#420).
+
+    A stream table's are its cells' extent, so a column of one width still shows where its text ends.
+    """
+
+    def test_defaults_to_empty(self):
+        assert _table().column_intervals == ()
+
+    def test_one_interval_per_column(self):
+        # Each centre may lie on its interval's start or end: a column set flush left, or flush right.
+        assert _measured(((10.0, 40.0), (62.5, 80.0))).column_intervals == ((10.0, 40.0), (62.5, 80.0))
+
+    def test_ints_are_stored_as_floats(self):
+        intervals = _measured(((10, 40), (62, 80))).column_intervals
+
+        assert intervals == ((10.0, 40.0), (62.0, 80.0))
+        assert [type(value) for pair in intervals for value in pair] == [float] * 4
+
+    def test_an_interval_may_be_a_point(self):
+        assert _measured(((10.0, 10.0), (80.0, 80.0))).column_intervals == ((10.0, 10.0), (80.0, 80.0))
+
+    def test_intervals_may_overlap_and_share_a_start(self):
+        # Only the starts are ordered: a column's extent may reach past the next column's start.
+        assert _measured(((0.0, 90.0), (0.0, 100.0))).column_intervals == ((0.0, 90.0), (0.0, 100.0))
+
+    def test_a_table_without_headers_counts_its_columns_in_the_first_row(self):
+        intervals = ((0.0, 1.0), (2.0, 2.5), (3.0, 4.0))
+        table = _table(headers=(), rows=(("1", "2", "3"),), column_centres=(1.0, 2.0, 3.0), column_intervals=intervals)
+
+        assert table.column_intervals == intervals
+
+    def test_off_page_intervals_keep_their_raw_coordinates(self):
+        intervals = ((-50.0, -40.0), (-10.0, 0.0))
+
+        assert _measured(intervals, centres=(-40.0, -10.0)).column_intervals == intervals
+
+    @pytest.mark.parametrize("bad", [((10.0, 40.0),), ((10.0, 40.0), (62.0, 80.0), (90.0, 99.0))], ids=["one", "three"])
+    def test_count_must_match_the_width(self, bad):
+        message = f"column_intervals must have 2 values (one per column), got {len(bad)}"
+        with pytest.raises(ValueError, match=re.escape(message)):
+            _measured(bad)
+
+    def test_start_must_not_pass_end(self):
+        message = "column_intervals[1] must have start <= end, got (90.0, 62.0)"
+        with pytest.raises(ValueError, match=re.escape(message)):
+            _measured(((10.0, 40.0), (90.0, 62.0)))
+
+    def test_starts_must_not_decrease(self):
+        bad = ((5.0, 90.0), (0.0, 100.0))
+        with pytest.raises(ValueError, match=re.escape(f"column_intervals' starts must not decrease, got {bad!r}")):
+            _measured(bad)
+
+    @pytest.mark.parametrize(
+        ("bad", "message"),
+        [
+            (((10.5, 40.0), (62.0, 80.0)), "column_centres[0] 10.0 must lie within column_intervals[0] (10.5, 40.0)"),
+            (((10.0, 40.0), (62.0, 79.5)), "column_centres[1] 80.0 must lie within column_intervals[1] (62.0, 79.5)"),
+        ],
+        ids=["before-the-start", "past-the-end"],
+    )
+    def test_each_centre_lies_within_its_interval(self, bad, message):
+        with pytest.raises(ValueError, match=re.escape(message)):
+            _measured(bad)
+
+    @pytest.mark.parametrize(
+        ("bad", "exc", "match"),
+        [
+            ([(10.0, 40.0), (62.0, 80.0)], TypeError, "column_intervals must be a tuple, got list"),
+            (((10.0, 40.0), [62.0, 80.0]), TypeError, "column_intervals[1] must be a tuple, got list"),
+            (((10.0, 40.0, 50.0), (62.0, 80.0)), ValueError, "column_intervals[0] must have 2 values, got 3"),
+            (((10.0,), (62.0, 80.0)), ValueError, "column_intervals[0] must have 2 values, got 1"),
+            (((10.0, "40"), (62.0, 80.0)), TypeError, "column_intervals[0][1] must be an int or float"),
+            (((True, 40.0), (62.0, 80.0)), TypeError, "column_intervals[0][0] must be an int or float"),
+            (((10.0, 40.0), (62.0, float("nan"))), ValueError, "column_intervals[1][1] must be finite"),
+            (((10.0, 40.0), (float("-inf"), 80.0)), ValueError, "column_intervals[1][0] must be finite"),
+        ],
+        ids=["list", "inner-list", "three-values", "one-value", "str", "bool", "nan", "inf"],
+    )
+    def test_bad_values_rejected(self, bad, exc, match):
+        with pytest.raises(exc, match=re.escape(match)):
+            _measured(bad)
+
+    @pytest.mark.parametrize(
+        ("centres", "intervals", "counts"),
+        [
+            ((10.0, 80.0), (), "2 centres and 0 intervals"),
+            ((), ((10.0, 40.0), (62.0, 80.0)), "0 centres and 2 intervals"),
+        ],
+        ids=["centres-alone", "intervals-alone"],
+    )
+    def test_set_exactly_when_the_centres_are(self, centres, intervals, counts):
+        message = f"column_intervals must be set exactly when column_centres are, got {counts}"
+        with pytest.raises(ValueError, match=re.escape(message)):
+            _table(column_centres=centres, column_intervals=intervals)
+
+    def test_part_of_equality(self):
+        assert _measured(((10.0, 40.0), (62.0, 80.0))) != _measured(((10.0, 40.0), (61.0, 80.0)))
 
 
 class TestTableColumnNames:

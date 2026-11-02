@@ -21,12 +21,18 @@ change.
    invoice's number and date above its line items, say).
 3. **Split tables.** When page p's last visible element is a ``Table`` and
    page p+1's first visible element is a ``Table`` with as many columns,
-   each column centre within :data:`SPLIT_TABLE_TOLERANCE_PT` of the
-   other's, the second continues the first: its ``continued_from_id`` names
-   the first, and when it has no headers it takes the first's (headers it
-   has, repeated or its own, are kept). Both tables need
-   ``column_centres``; without them there is no link. Chains link pairwise
-   (p -> p+1 -> p+2). A link already on a table is left alone.
+   each column one with the other's (:func:`_one_column`), the second
+   continues the first: its ``continued_from_id`` names the first, and
+   when it has no headers it takes the first's (headers it has, repeated
+   or its own, are kept). A column is one when its centres lie within
+   :data:`SPLIT_TABLE_TOLERANCE_PT`, or (#420) when one part sits on its
+   interval's end (set flush right) and the other on its interval's start
+   (set flush left, or of one width: such a column tells no alignment and
+   sits at its start, #409) and the two intervals' ends lie within
+   :data:`_END_TOLERANCE_PT`. Both tables need ``column_centres``, which
+   A1 sets with ``column_intervals``; without them there is no link.
+   Chains link pairwise (p -> p+1 -> p+2). A link already on a table is
+   left alone.
 4. **Sections.** One flat A1 ``Section`` per visible heading, holding that
    heading (as ``elements[0]``) and everything after it up to the next
    visible heading of any level, plus a leading heading-less section for
@@ -46,6 +52,13 @@ Known limitations:
 - A hidden heading is in no section: A1 makes a heading's ``scope_path``
   end with its own text and a section's elements share its path, so a
   heading that opens no scope fits none. It stays in its page's elements.
+- Of a column that tells no alignment, only its end stands in, and only
+  against a part set flush right. Two parts that both tell none meet only
+  by their centres (their starts), and a part of one width set centred,
+  wider than twice the tolerance, does not meet the other part's middle:
+  pairing ends of two start-set parts would pair left-set columns of
+  different tables whose ends meet, and pairing middles links tables
+  centred on each other's bands (#409's probe N2).
 """
 
 import dataclasses
@@ -58,9 +71,18 @@ from datagrunt.pdf.elements import DocumentElement, Heading, KeyValue, Page, Sec
 
 # How far apart, in points, the same column's centres may lie on the two parts of a split table (spec §3.3).
 SPLIT_TABLE_TOLERANCE_PT = 8.0
+# How far apart, in points, the two parts' interval ends may lie where one part sits on its end and the other on its
+# start (#420). A split's flush-right ends share one anchor. In #409's Monte Carlo every split links at 1 pt, and
+# different tables link within 0.1 percentage points as often as by centres alone (at 8 pt, up to 1.2 more).
+_END_TOLERANCE_PT = 1.0
+# How far, in points, a column's centre may lie from its interval's start or end and still sit on it: layout's tie
+# slack (#409). pdfium boxes a flush-right column's ends up to 3e-5 pt apart, so its median end is not its last.
+_EDGE_SLACK_PT = 0.1
 
 # The open headings as (level, text), outermost first; levels strictly increase.
 _Stack: TypeAlias = tuple[tuple[int, str], ...]
+# One part's column: its centre and its interval, (start, end).
+_Column: TypeAlias = tuple[float, tuple[float, float]]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -162,11 +184,36 @@ def _first_visible(elements: Iterable[DocumentElement]) -> DocumentElement | Non
 
 
 def _same_columns(first: Table, second: Table) -> bool:
-    """True if both tables have column centres, as many columns, and each centre within the tolerance."""
+    """True if both tables have column centres, as many columns, and each column one (:func:`_one_column`).
+
+    A1 sets ``column_intervals`` exactly when ``column_centres``, so tables with centres have both.
+    """
     if not first.column_centres or len(first.column_centres) != len(second.column_centres):
         return False
-    pairs = zip(first.column_centres, second.column_centres, strict=True)
-    return all(abs(left - right) <= SPLIT_TABLE_TOLERANCE_PT for left, right in pairs)
+    tail = zip(first.column_centres, first.column_intervals, strict=True)
+    head = zip(second.column_centres, second.column_intervals, strict=True)
+    return all(_one_column(left, right) for left, right in zip(tail, head, strict=True))
+
+
+def _one_column(first: _Column, second: _Column) -> bool:
+    """True if two parts' columns are one: centres within the tolerance, or ends within 1 pt, end paired with start.
+
+    The ends pair only when one part sits on its end and the other on its
+    start, either way round: a flush-right column, and its other part of
+    one width, which tells no alignment and so sits at its start (#420).
+    """
+    (centre, (_, end)), (other_centre, (_, other_end)) = first, second
+    if abs(centre - other_centre) <= SPLIT_TABLE_TOLERANCE_PT:
+        return True
+    if abs(end - other_end) > _END_TOLERANCE_PT:
+        return False
+    return (_sits_on(first, 1) and _sits_on(second, 0)) or (_sits_on(second, 1) and _sits_on(first, 0))
+
+
+def _sits_on(column: _Column, edge: int) -> bool:
+    """True if the column's centre lies within :data:`_EDGE_SLACK_PT` of its interval's start (0) or end (1)."""
+    centre, interval = column
+    return abs(centre - interval[edge]) <= _EDGE_SLACK_PT
 
 
 def _sections(pages: tuple[Page, ...]) -> tuple[Section, ...]:

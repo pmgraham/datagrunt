@@ -492,13 +492,13 @@ def _righted_piece(piece: SpanPiece, frame: _Frame, spans: dict[int, RawSpan]) -
 def _displayed(element: DocumentElement, frame: _Frame) -> DocumentElement:
     """An element laid out on the turned page, boxed on the displayed page (the same box when upright).
 
-    A figure keeps its own box; a turned page's table has no column centres.
+    A figure keeps its own box; a turned page's table has no column centres or intervals.
     """
     if isinstance(element, Figure):
         return element
     bbox = _bbox(frame.displayed(_box(element.bbox)))
     if isinstance(element, Table) and frame.rotation != 0:
-        return dataclasses.replace(element, bbox=bbox, column_centres=())
+        return dataclasses.replace(element, bbox=bbox, column_centres=(), column_intervals=())
     return dataclasses.replace(element, bbox=bbox)
 
 
