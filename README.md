@@ -368,7 +368,12 @@ writer.write_bundle("out/report_bundle")      # all of the above in one checked 
 - `write_bundle(output_dir)` writes `json/document.json`,
   `markdown/document.md`, `images/<sha256>.png`, `page_images/page_NNNN.png`
   (plus the OCR bands of scanned pages), and a `manifest.json` that records
-  every file's size and SHA-256. `output_dir` must not exist or must be empty.
+  every file's size and SHA-256, plus `json/elements.jsonl` and one Markdown
+  file per page (`markdown/pages/page_NNNN.md`). `output_dir` must not exist or
+  must be empty. If it already holds a bundle of the same PDF, written with the
+  same options and extractor version, that bundle is returned as it is;
+  `overwrite=True` replaces any other valid bundle there. A directory without a
+  valid bundle manifest is never overwritten.
   `PDFReader("out/report_bundle")` loads it back, verifying every file: an
   invalid `manifest.json` raises `ValueError` at construction, and a file that
   doesn't match its manifest raises `datagrunt.pdf.BundleCorruptError` when the
@@ -387,8 +392,10 @@ Text a human reader can't see is flagged, never dropped. Each element's
 `hidden_reasons` lists why: `off_page`, `invisible`, `tiny_font`,
 `transparent`, `matches_background`, `zero_scale`, `duplicate`, `superseded`,
 or `unchecked_background`. An empty list means the element is visible. Markdown
-keeps a hidden element behind a `<!-- hidden: reasons -->` comment. Filter on
-the column before you pass text on, for example to an LLM:
+(`to_markdown()`, `write_markdown()` and a bundle's Markdown) leaves hidden
+elements out by default; pass `include_hidden=True` to keep each behind a
+`<!-- hidden: reasons -->` comment. JSON and the DataFrame always keep every
+element. Filter on the column before you pass text on, for example to an LLM:
 
 ```python
 import polars as pl
@@ -450,14 +457,17 @@ slivers); it must be at least 1.
 
 ### Parallel processing
 
-With `workers` greater than `1`, pages are extracted in that many worker
-processes and come back in page order. Each worker is a fresh, isolated
-`python` process that never imports your script, so no
-`if __name__ == "__main__":` guard is needed. A one-page document, or a run
-inside a distributed runtime (**Apache Spark**, **Apache Beam**,
-**Apache Flink**, or **Celery**, detected through variables such as
-`SPARK_ENV_LOADED` and `BEAM_WORKER_ID`), extracts in the calling process
-instead.
+Every PDF is parsed in worker processes, never in your own: pages are
+extracted in `workers` processes (one when `workers=1`) and come back in page
+order, and figure reads and page renders run in workers too. Each worker is a
+fresh, isolated `python` process with a memory cap (2 GiB), and it never imports
+your script, so no `if __name__ == "__main__":` guard is needed. A page that
+passes the cap, or its time bound, becomes an error page with the reason; the
+other pages are read by a new worker. Inside a distributed runtime
+(**Apache Spark**, **Apache Beam**, **Apache Flink**, or **Celery**, detected
+through variables such as `SPARK_ENV_LOADED` and `BEAM_WORKER_ID`) one worker
+extracts the pages. A frozen application (PyInstaller) cannot start workers
+yet, so reading a PDF there raises `DatagruntPDFError` saying so.
 
 ## Engine Comparison
 
