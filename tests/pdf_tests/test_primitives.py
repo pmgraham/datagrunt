@@ -17,6 +17,7 @@ from datagrunt.pdf._validate import (
     non_blank_str,
     optional_str,
     ordered_box,
+    ordered_interval,
     positive_float,
     rgba_tuple,
     sha256_hex,
@@ -212,6 +213,30 @@ class TestOrderedBox:
     def test_rejects_non_finite(self):
         with pytest.raises(ValueError, match=r"bbox\[0\] must be finite"):
             ordered_box("bbox", (math.nan, 0.0, 1.0, 1.0))
+
+
+class TestOrderedInterval:
+    @pytest.mark.parametrize("value", [(0, 10), (5.0, 5.0), (-3.0, -1.0)])
+    def test_returns_floats_start_then_end(self, value):
+        assert ordered_interval("span", value) == tuple(float(v) for v in value)
+
+    def test_rejects_a_start_past_its_end(self):
+        with pytest.raises(ValueError, match=re.escape("span must have start <= end, got (10.0, 0.0)")):
+            ordered_interval("span", (10, 0))
+
+    @pytest.mark.parametrize(
+        ("bad", "error", "message"),
+        [
+            ([0.0, 1.0], TypeError, "span must be a tuple, got list"),
+            ((0.0, 1.0, 2.0), ValueError, "span must have 2 values, got 3"),
+            ((0.0, math.inf), ValueError, r"span[1] must be finite"),
+            ((True, 1.0), TypeError, r"span[0] must be an int or float"),
+        ],
+        ids=["list", "three-values", "inf", "bool"],
+    )
+    def test_rejects_what_finite_tuple_rejects(self, bad, error, message):
+        with pytest.raises(error, match=re.escape(message)):
+            ordered_interval("span", bad)
 
 
 class TestPositiveFloat:

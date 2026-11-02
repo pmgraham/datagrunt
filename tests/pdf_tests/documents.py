@@ -130,6 +130,7 @@ def first_page(figure_loader: Loader | None = None) -> Page:
             rows=(("Bolt", "4"), ("Nut", "")),
             extraction_method="lattice",
             column_centres=(100.0, 200.5),
+            column_intervals=((60.0, 140.0), (180.0, 221.0)),
         ),
         BulletList(**ids(1, 7, INTRO), items=("one", "two"), ordered=True, markers=("1.", "2.")),
         figure(1, 8, FIGURE_A_SHA, INTRO, loader=figure_loader, caption="A figure\nwith two lines"),

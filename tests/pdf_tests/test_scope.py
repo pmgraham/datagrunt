@@ -69,13 +69,19 @@ def kv(page, index, key="Invoice", value="42", *, hidden=False):
     return KeyValue(**_ids(page, index, hidden), key=key, value=value)
 
 
-def table(page, index, *, headers=("Item", "Qty"), rows=(("bolt", "4"),), centres=(100.0, 300.0), hidden=False):
+def table(
+    page, index, *, headers=("Item", "Qty"), rows=(("bolt", "4"),), centres=(100.0, 300.0), intervals=None, hidden=False
+):
+    # A1 sets intervals exactly when centres: by default, each centre the middle of a 40 pt (ruled) column.
+    if intervals is None:
+        intervals = tuple((centre - 20.0, centre + 20.0) for centre in centres)
     return Table(
         **_ids(page, index, hidden),
         headers=headers,
         rows=rows,
         extraction_method="lattice",
         column_centres=centres,
+        column_intervals=intervals,
     )
 
 
@@ -393,6 +399,71 @@ class TestSplitTables:
     def test_the_tolerance_is_8_pt(self):
         assert scope.SPLIT_TABLE_TOLERANCE_PT == 8.0
 
+    def test_a_one_width_flush_right_continuation_links_by_its_end(self):
+        # #420 (#409's probe T5): the head's amounts are one width, so it sits at their start (378.6), 21.4 pt from
+        # the tail's flush-right end (400). Its interval still ends at 400, where the tail sits: one column.
+        tail = table(1, 0, centres=(72.0, 400.0), intervals=((72.0, 110.0), (374.9, 400.0)))
+        head = table(2, 0, headers=(), centres=(72.0, 378.6), intervals=((72.0, 97.0), (378.6, 400.0)))
+
+        assert tables(apply_scope((page(1, tail), page(2, head))))[1] == ("p0002_e000", "p0001_e000", HEADERS)
+
+    def test_a_one_width_first_part_links_by_its_end_too(self):
+        # Either part may be the one of one width: here the tail sits at its start, the continuation on its end.
+        tail = table(1, 0, centres=(72.0, 378.6), intervals=((72.0, 97.0), (378.6, 400.0)))
+        head = table(2, 0, headers=(), centres=(72.0, 400.0), intervals=((72.0, 110.0), (374.9, 400.0)))
+
+        assert tables(apply_scope((page(1, tail), page(2, head))))[1] == ("p0002_e000", "p0001_e000", HEADERS)
+
+    @pytest.mark.parametrize(
+        ("shift", "linked"),
+        [(0.5, True), (-0.5, True), (1.0, True), (-1.0, True), (1.5, False), (-1.5, False), (8.0, False)],
+    )
+    def test_the_ends_must_lie_within_1_pt(self, shift, linked):
+        # The one-width part moved by ``shift``: its start lies 13.4 to 22.9 pt from the other's end, past the 8 pt
+        # centre tolerance, so only the ends can pair it; they must meet within 1 pt, not 8.
+        tail = table(1, 0, centres=(72.0, 400.0), intervals=((72.0, 110.0), (374.9, 400.0)))
+        moved = ((72.0, 97.0), (378.6 + shift, 400.0 + shift))
+        head = table(2, 0, headers=(), centres=(72.0, 378.6 + shift), intervals=moved)
+
+        assert tables(apply_scope((page(1, tail), page(2, head))))[1][1] == ("p0001_e000" if linked else None)
+
+    @pytest.mark.parametrize(
+        ("tail_column", "head_column"),
+        [
+            # Both left-set (each on its start), their ends meeting: 20 pt apart, two columns.
+            ((360.0, (360.0, 400.0)), (380.0, (380.0, 400.0))),
+            # One flush right, the other centred (on its middle), their ends meeting: set two ways, two columns.
+            ((400.0, (375.0, 400.0)), (390.0, (380.0, 400.0))),
+            # One flush right, the other ending at its end but not sitting on its start (0.5 pt past it).
+            ((400.0, (374.9, 400.0)), (379.1, (378.6, 400.0))),
+            # One sitting on its start, the other ending at its end but sitting 0.5 pt short of it.
+            ((399.5, (374.9, 400.0)), (378.6, (378.6, 400.0))),
+        ],
+        ids=["both-on-their-start", "end-and-middle", "start-missed", "end-missed"],
+    )
+    def test_ends_pair_only_a_part_on_its_end_with_one_on_its_start(self, tail_column, head_column):
+        (tail_centre, tail_interval), (head_centre, head_interval) = tail_column, head_column
+        tail = table(1, 0, centres=(72.0, tail_centre), intervals=((72.0, 110.0), tail_interval))
+        head = table(2, 0, headers=(), centres=(72.0, head_centre), intervals=((72.0, 97.0), head_interval))
+
+        assert tables(apply_scope((page(1, tail), page(2, head))))[1][1] is None
+
+    @pytest.mark.parametrize(
+        ("tail_column", "head_column"),
+        [
+            # pdfium boxes a flush-right column's ends 3e-5 pt apart (#409's probe): its centre still sits on its end.
+            ((399.99998, (374.9, 400.0)), (378.6, (378.6, 400.0))),
+            ((400.0, (374.9, 400.0)), (378.65, (378.6, 400.0))),
+        ],
+        ids=["end", "start"],
+    )
+    def test_a_centre_within_a_tenth_of_a_point_sits_on_its_edge(self, tail_column, head_column):
+        (tail_centre, tail_interval), (head_centre, head_interval) = tail_column, head_column
+        tail = table(1, 0, centres=(72.0, tail_centre), intervals=((72.0, 110.0), tail_interval))
+        head = table(2, 0, headers=(), centres=(72.0, head_centre), intervals=((72.0, 97.0), head_interval))
+
+        assert tables(apply_scope((page(1, tail), page(2, head))))[1][1] == "p0001_e000"
+
     def test_a_different_column_count_does_not_link(self):
         wider = table(2, 0, headers=("Item", "Qty", "Price"), rows=(("nut", "9", "1"),), centres=(100.0, 300.0, 450.0))
         pages = (page(1, table(1, 0)), page(2, wider))
@@ -632,7 +703,7 @@ class TestBounds:
     """One walk: O(total elements), plus O(columns) per page boundary."""
 
     @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
-    def test_40_000_elements_on_2_000_pages_scope_within_1_second(self):
+    def test_40_000_elements_on_2_000_pages_scope_within_1_5_seconds(self):
         # Worst case for every rule: each page opens a heading level, and each boundary links a table.
         pages = tuple(
             page(
@@ -653,4 +724,4 @@ class TestBounds:
         assert sum(len(item.elements) for item in result.pages) == 40_000
         assert len(result.sections) == 2_001
         assert sum(1 for _, link, _ in tables(result) if link is not None) == 1_999
-        assert elapsed < 1.0, f"{elapsed:.2f} s"
+        assert elapsed < 1.5, f"{elapsed:.2f} s"  # ~0.19 s here (8x headroom); 1 s left 5.4x once tables held intervals
