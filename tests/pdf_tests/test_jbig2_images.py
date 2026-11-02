@@ -25,7 +25,7 @@ from PIL import Image
 
 from datagrunt.pdf import DatagruntPDFError, _render_worker
 from datagrunt.pdf.pipeline import extract_document
-from datagrunt.pdf.render import RenderFailed, render_page
+from datagrunt.pdf.render import RenderedPage, RenderFailed, render_page, render_pages
 from pdf_tests.builders import PageSpec, build_pdf, hand_written_pdf
 from pdf_tests.test_ocr import needs_tesseract
 from pdf_tests.test_ocr_scans import LINES, TOKENS, rendered
@@ -286,6 +286,36 @@ class TestDecodedBeforeTheRender:
         drawn = _render_worker._render_guarded(path, 0, 72, None)
 
         assert (drawn.width, drawn.height, len(decoded)) == (400, 300, 1)
+
+    @pytest.mark.parametrize(
+        "colour,without_text", [(True, True), (False, False)], ids=["background-render", "plain-batch"]
+    )
+    def test_an_undecodable_jbig2_image_fails_its_page_in_a_render_pages_batch(self, tmp_path, colour, without_text):
+        # Bytes that are no JBIG2 segment at all: pdfium decodes no bitmap of them. Drawn without decoding first,
+        # pdfium would leave the image out and return the rest of the page; the batch path (the background check's
+        # render) decodes it first, so the page fails with why. No pdfium call is stood in for.
+        path = xobject_page(tmp_path, b"\x00\x01\x02\x03" * 16, entries(64, 48))
+
+        (got,) = render_pages(
+            path, ((0, 72),), memory_cap_bytes=1 << 30, timeout_s=120.0, colour=colour, without_text=without_text
+        )
+
+        assert isinstance(got, RenderFailed)
+        assert str(got) == (
+            f"{path}: page 1: the render worker failed: RenderFailed: page 1: pdfium cannot decode JBIG2 image "
+            "object 0 in the render worker; the page is not rendered"
+        )
+
+    def test_a_decodable_jbig2_image_is_drawn_in_a_render_pages_batch(self, tmp_path):
+        content = b"q 64 0 0 48 0 0 cm /Im Do Q"
+        path = xobject_page(tmp_path, jbig2(pattern()), entries(64, 48), content=content)
+
+        (got,) = render_pages(
+            path, ((0, 72),), memory_cap_bytes=1 << 30, timeout_s=120.0, colour=True, without_text=True
+        )
+
+        assert isinstance(got, RenderedPage)
+        assert (got.px_width, got.px_height) == (400, 300)
 
     def test_a_page_without_jbig2_images_decodes_none_first(self, tmp_path, monkeypatch):
 
