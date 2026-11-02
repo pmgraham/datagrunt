@@ -66,13 +66,19 @@ def raw_image(**overrides) -> RawImage:
 
 
 def stats(
-    nonfinite: int = 0, oversized: int = 0, cover: float = 0.0, unsized: int = 0, over_budget: int = 0
+    nonfinite: int = 0,
+    oversized: int = 0,
+    cover: float = 0.0,
+    unsized: int = 0,
+    over_budget: int = 0,
+    overlong: int = 0,
 ) -> ImageStats:
     return ImageStats(
         skipped_nonfinite_images=nonfinite,
         skipped_oversized_images=oversized,
         skipped_unsized_images=unsized,
         skipped_over_budget_images=over_budget,
+        skipped_overlong_images=overlong,
         max_cover_fraction=cover,
     )
 
@@ -161,7 +167,7 @@ class TestPageImagesAndStats:
     """PageImages and ImageStats are frozen, slotted, picklable, validated records."""
 
     def test_pickle_round_trip(self):
-        original = PageImages(images=(raw_image(),), stats=stats(1, 2, 0.5, unsized=3, over_budget=4))
+        original = PageImages(images=(raw_image(),), stats=stats(1, 2, 0.5, unsized=3, over_budget=4, overlong=5))
 
         assert pickle.loads(pickle.dumps(original)) == original
         with pytest.raises(dataclasses.FrozenInstanceError):
@@ -188,6 +194,9 @@ class TestPageImagesAndStats:
                 TypeError,
                 "skipped_over_budget_images must be an int, got 1.0",
                 id="budget",
+            ),
+            pytest.param(
+                lambda: stats(overlong=-1), ValueError, "skipped_overlong_images must be >= 0, got -1", id="overlong"
             ),
             pytest.param(lambda: stats(cover=1.5), ValueError, "max_cover_fraction must be <= 1.0, got 1.5", id="over"),
             pytest.param(
@@ -1901,7 +1910,8 @@ class TestPageBudget:
         assert _pdfium_images._MAX_PAGE_STREAM_BYTES == 2 * elements._MAX_ASSET_BYTES
 
     def test_streams_past_the_budget_are_recorded_without_reading_them(self, tmp_path, monkeypatch, raw_reads):
-        monkeypatch.setattr(_pdfium_images, "_MAX_PAGE_STREAM_BYTES", 2 * len(FLATE))
+        # Each image costs its raw stream and the 24 bytes the stream check inflates it to.
+        monkeypatch.setattr(_pdfium_images, "_MAX_PAGE_STREAM_BYTES", 2 * (len(FLATE) + len(SAMPLES)))
 
         got = images_of(drawn_times(tmp_path, 5))
 
@@ -1914,7 +1924,7 @@ class TestPageBudget:
         assert raw_reads == ["size", "copy", "size", "copy"]
 
     def test_a_stream_that_does_not_fit_spends_the_budget(self, tmp_path, monkeypatch, raw_reads):
-        monkeypatch.setattr(_pdfium_images, "_MAX_PAGE_STREAM_BYTES", 3 * len(FLATE) // 2)
+        monkeypatch.setattr(_pdfium_images, "_MAX_PAGE_STREAM_BYTES", len(SAMPLES) + 3 * len(FLATE) // 2)
 
         got = images_of(drawn_times(tmp_path, 4))
 

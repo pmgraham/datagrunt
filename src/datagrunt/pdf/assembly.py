@@ -276,6 +276,11 @@ def _image_count_warnings(stats: ImageStats) -> tuple[str, ...]:
         (stats.skipped_oversized_images, "image(s) too large to decode or read: never decoded"),
         (stats.skipped_unsized_images, "image(s) whose decode size cannot be known without decoding: never decoded"),
         (stats.skipped_over_budget_images, "image(s) not read: the page's image stream budget was spent"),
+        (
+            stats.skipped_overlong_images,
+            "image(s) whose stream decodes past their declared size, or cannot be checked: "
+            "decoded only by a page render",
+        ),
     )
     return tuple(f"{count} {what}" for count, what in counted if count)
 

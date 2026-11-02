@@ -365,6 +365,7 @@ EMPTY_IMAGES = PageImages(
         skipped_oversized_images=0,
         skipped_unsized_images=0,
         skipped_over_budget_images=0,
+        skipped_overlong_images=0,
         max_cover_fraction=0.0,
     ),
 )

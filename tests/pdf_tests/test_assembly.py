@@ -71,6 +71,7 @@ def stats(**overrides) -> ImageStats:
         "skipped_oversized_images": 0,
         "skipped_unsized_images": 0,
         "skipped_over_budget_images": 0,
+        "skipped_overlong_images": 0,
         "max_cover_fraction": 0.0,
     }
     return ImageStats(**(fields | overrides))
@@ -331,6 +332,12 @@ class TestPageFigures:
                 {"skipped_over_budget_images": 4},
                 "4 image(s) not read: the page's image stream budget was spent",
                 id="over-budget",
+            ),
+            pytest.param(
+                {"skipped_overlong_images": 5},
+                "5 image(s) whose stream decodes past their declared size, or cannot be checked: "
+                "decoded only by a page render",
+                id="overlong",
             ),
         ],
     )
