@@ -1910,9 +1910,7 @@ class TestGlobalsTokenCount:
         body = b"9 0 << /DecodeParms << /JBIG2Globals 7 0 R >> >>"
         path = self.object_stream_pdf(tmp_path / "objstm.pdf", b"", body)
 
-        assert (
-            self.block_reason(path) == "a /JBIG2Globals name in the file is not one the scan resolved; render skipped"
-        )
+        assert self.block_reason(path) == "a /JBIG2Globals name is in the file; render skipped"
 
     @pytest.mark.parametrize(
         "entries,data",
@@ -2093,15 +2091,6 @@ def test_a_codec_name_escaped_twice_does_not_stand_for_a_name_outside_the_images
     assert reason == "an inline image: unrecognised image filter 'JPX#44ecode'; skipped (not decoded)"
 
 
-def test_inline_codec_names_are_counted_in_the_dictionary_bytes():
-    from datagrunt.core.pdf_io.extraction.content_lexer import inline_images
-    from datagrunt.core.pdf_io.extraction.render_guard import _codec_names
-
-    (decoy, real) = inline_images(b"BI /F /JPX#2344ecode ID x EI BI /F [/AHx /JBIG2#44ecode] ID y EI")
-
-    assert (_codec_names(decoy), _codec_names(real)) == (0, 1)
-
-
 def _with_an_object_stream_of_indirect_type(path: Path) -> Path:
     """A scan whose file holds a Flate object stream (object 6) whose /Type is object 8, the name /ObjStm."""
     import zlib
@@ -2153,9 +2142,7 @@ def test_an_object_stream_is_found_by_the_xref_entries_that_point_into_it(tmp_pa
     path = _pymupdf_object_stream_pdf(tmp_path / "objstm.pdf")
     monkeypatch.setattr(render_guard, "_resolved_type", lambda doc, xref: "/Other")
 
-    assert TestGlobalsTokenCount.block_reason(path) == (
-        "a /JBIG2Globals name in the file is not one the scan resolved; render skipped"
-    )
+    assert TestGlobalsTokenCount.block_reason(path) == ("a /JBIG2Globals name is in the file; render skipped")
 
 
 def test_without_xref_entries_every_stream_without_a_type_is_counted(tmp_path, monkeypatch):
@@ -2169,9 +2156,7 @@ def test_without_xref_entries_every_stream_without_a_type_is_counted(tmp_path, m
         render_guard, "_resolved_type", lambda doc, xref: "" if real(doc, xref) == "/ObjStm" else real(doc, xref)
     )
 
-    assert TestGlobalsTokenCount.block_reason(path) == (
-        "a /JBIG2Globals name in the file is not one the scan resolved; render skipped"
-    )
+    assert TestGlobalsTokenCount.block_reason(path) == ("a /JBIG2Globals name is in the file; render skipped")
 
 
 def test_a_jbig2_name_only_in_an_earlier_revision_still_needs_both_readers_to_agree(tmp_path, no_decode):
@@ -2211,3 +2196,84 @@ def test_an_object_that_cannot_be_read_as_a_stream_blocks_the_render(tmp_path, m
     monkeypatch.setattr(pymupdf.Document, "xref_is_stream", lambda document, xref: 1 / 0)
 
     assert TestGlobalsTokenCount.block_reason(path) == "the file's JBIG2 names could not be counted; render skipped"
+
+
+def _two_images_sharing_decode_parms_pdf(path: Path, first: bytes, entries: bytes, *, stray: bool) -> Path:
+    """A page drawing two images (5 and 6) whose /DecodeParms are one object (7) holding /JBIG2Globals.
+
+    With ``stray``, a ninth object also holds a /JBIG2Globals name, which no image refers to.
+    """
+    content = b"q 200 0 0 150 50 50 cm /Im0 Do Q q 200 0 0 150 300 50 cm /Im1 Do Q"
+    image = b"<< /Type /XObject /Subtype /Image %s /DecodeParms 7 0 R /Length %d >>\nstream\n" % (entries, len(first))
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /XObject << /Im0 5 0 R /Im1 6 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        image + first + b"\nendstream",
+        image + first + b"\nendstream",
+        b"<< /JBIG2Globals 8 0 R >>",
+        globals_object(b""),
+        *((b"<< /DecodeParms << /JBIG2Globals 8 0 R >> >>",) if stray else ()),
+    ]
+    return hand_written_pdf(path, objects)
+
+
+@pytest.mark.parametrize(
+    "first,entries",
+    [
+        pytest.param(FLATE_GRAY_64, FLATE_GRAY_ENTRIES, id="flate-images"),
+        pytest.param(jbig2_scan(), SCAN_ENTRIES, id="jbig2-images"),
+    ],
+)
+@pytest.mark.parametrize("engine", ENGINES)
+def test_images_sharing_one_decode_parms_object_do_not_hide_a_stray_globals_name(
+    tmp_path, engine, first, entries, no_decode
+):
+    path = _two_images_sharing_decode_parms_pdf(tmp_path / "shared.pdf", first, entries, stray=True)
+
+    assert PDFWriter(path, engine=engine).render_pages_as_images(str(tmp_path / "pages"), dpi=72) == []
+    assert no_decode == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(b"", id="name-in-another-key"),
+        pytest.param(b" BT (/JBIG2Decode) Tj ET", id="name-in-another-key-and-a-name-outside"),
+    ],
+)
+def test_a_codec_name_in_an_inline_image_that_is_not_its_filter_blocks_the_render(tmp_path, content):
+    import pymupdf
+
+    from datagrunt.core.pdf_io.extraction.render_guard import document_block_reason
+
+    stream = b"q 100 0 0 100 50 50 cm BI /W 2 /H 2 /CS /G /BPC 8 /Foo /JPXDecode /F /AHx ID 00ff00ff> EI Q" + content
+
+    with pymupdf.open(content_pdf(tmp_path / "decoy.pdf", stream)) as doc:
+        reason = document_block_reason(doc)
+
+    assert reason == "a JPXDecode or JBIG2Decode name lies outside the inline images read; render skipped"
+
+
+def test_inline_codec_names_are_the_filter_names_only():
+    from datagrunt.core.pdf_io.extraction.content_lexer import inline_images
+    from datagrunt.core.pdf_io.extraction.render_guard import _codec_names
+
+    found = inline_images(
+        b"BI /F /JPX#2344ecode ID x EI BI /F [/AHx /JBIG2#44ecode] ID y EI BI /Foo /JPXDecode /F /AHx ID z EI"
+    )
+
+    assert [_codec_names(image) for image in found] == [0, 1, 0]
+
+
+def test_the_inline_image_check_refuses_jbig2_with_globals_itself():
+    # The document's /JBIG2Globals count blocks such a page too; this pins the inline check on its own.
+    from datagrunt.core.pdf_io.extraction.render_guard import _inline_block_reason
+
+    content = b"BI /W 64 /H 48 /CS /G /BPC 1 /F /JBIG2Decode /DP << /JBIG2Globals 5 0 R >> ID " + jbig2_scan() + b"\nEI"
+
+    assert _inline_block_reason(content) == (
+        "an inline image: JBIG2 decode parameters could not be checked for /JBIG2Globals; skipped (not decoded)"
+    )

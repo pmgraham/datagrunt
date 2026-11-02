@@ -27,7 +27,7 @@ class TestInlineImages:
     def test_reads_filters_parameters_and_data(self):
         image = one(b"q BI /W 2 /H 1 /CS /G /BPC 8 /F [/AHx /Fl] /DP [null << /Predictor 2 >>] ID 0aff> EI Q")
 
-        assert image[:4] == (("AHx", "Fl"), False, b"0aff>", True)
+        assert image == InlineImage(("AHx", "Fl"), False, b"0aff>", True)
 
     def test_reads_a_single_filter_name_and_globals_in_the_parameters(self):
         image = one(b"BI /F /JBIG2Decode /DecodeParms << /JBIG2Glob#61ls 6 0 R >> ID \x00\x01 EI")
@@ -122,8 +122,8 @@ class TestInlineImages:
     def test_ei_at_the_end_of_the_stream_ends_the_data(self):
         assert one(b"BI /F /Fl ID abc EI").data == b"abc"
 
-    def test_the_dictionary_bytes_are_kept(self):
-        assert one(b"q BI /W 2 /F /JPX#2344ecode ID x EI").dictionary == b" /W 2 /F /JPX#2344ecode "
+    def test_names_are_unescaped_once(self):
+        assert one(b"q BI /W 2 /F /JPX#2344ecode ID x EI").filters == ("JPX#44ecode",)
 
     def test_a_filter_array_of_100k_names_is_a_reason_and_fast(self):
         import time

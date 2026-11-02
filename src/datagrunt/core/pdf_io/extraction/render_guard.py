@@ -54,6 +54,8 @@ _MAX_SCAN_BYTES = 2 << 30  # 2 GiB
 # Most objects (xref entries) a document may have for this scan to run; past it
 # the document is refused rather than scanned.
 _MAX_SCAN_OBJECTS = 500_000
+# The codec names the byte-level counts look for (JPXDecode and JBIG2Decode have no abbreviation).
+_CODEC_NAMES = frozenset({"JPXDecode", "JBIG2Decode"})
 # The file is read in chunks of this many bytes to count name tokens; each
 # chunk keeps this many bytes of the one before (a #-escaped /JBIG2Globals is 37).
 _TOKEN_CHUNK_BYTES = 1 << 20
@@ -166,7 +168,6 @@ class _ImageScan(NamedTuple):
     reason: str | None
     read: int
     is_jbig2: bool
-    resolved_globals: bool
 
 
 def _image_block_reason(doc, xref: int) -> _ImageScan:
@@ -182,7 +183,7 @@ def _image_block_reason(doc, xref: int) -> _ImageScan:
         raw, filters, label=f"xref {xref}", jbig2_globals=globals_data, jbig2_globals_missing=globals_missing
     )
     is_jbig2 = _may_be_jbig2(filters)
-    return _ImageScan(decision.reason if decision.skip else None, read, is_jbig2, globals_data is not None)
+    return _ImageScan(decision.reason if decision.skip else None, read, is_jbig2)
 
 
 def _may_be_jbig2(filters: list[str]) -> bool:
@@ -190,8 +191,8 @@ def _may_be_jbig2(filters: list[str]) -> bool:
     return any(name == _UNREADABLE_FILTER or normalize_filter(name) == "JBIG2Decode" for name in filters)
 
 
-def _inline_block_reason(content: bytes) -> tuple[str | None, int]:
-    """Why a render must not decode one of ``content``'s inline images (None: it may), and how many name globals.
+def _inline_block_reason(content: bytes) -> str | None:
+    """Why a render must not decode one of ``content``'s inline images, or None when it may.
 
     Every inline image is read by :func:`~content_lexer.inline_images`; one it
     cannot read for certain blocks the render. Each is run through the guard
@@ -203,7 +204,7 @@ def _inline_block_reason(content: bytes) -> tuple[str | None, int]:
     """
     found = inline_images(content)
     if isinstance(found, str):
-        return f"an inline image {found}; render skipped", 0
+        return f"an inline image {found}; render skipped"
     for image in found:
         # The lexer has unescaped each name once, as a reader does: escape "#" so the guard's unescape keeps it.
         filters = [name.replace("#", "#23") for name in image.filters]
@@ -211,18 +212,22 @@ def _inline_block_reason(content: bytes) -> tuple[str | None, int]:
             image.data or None, filters, label="an inline image", jbig2_globals_missing=image.has_globals
         )
         if decision.skip:
-            return decision.reason, 0
+            return decision.reason
         if filters and normalize_filter(filters[-1]) not in _NON_IMAGE_FILTERS and not image.delimited:
-            return "an inline image could not be delimited; render skipped", 0
+            return "an inline image could not be delimited; render skipped"
     named = sum(_codec_names(image) for image in found)
     if count_tokens(JPX_DECODE_TOKEN, content) + count_tokens(JBIG2_DECODE_TOKEN, content) > named:
-        return "a JPXDecode or JBIG2Decode name lies outside the inline images read; render skipped", 0
-    return None, sum(image.has_globals for image in found)
+        return "a JPXDecode or JBIG2Decode name lies outside the inline images read; render skipped"
+    return None
 
 
 def _codec_names(image: InlineImage) -> int:
-    """The JPXDecode and JBIG2Decode names in an inline image's dictionary bytes, counted as the stream is."""
-    return count_tokens(JPX_DECODE_TOKEN, image.dictionary) + count_tokens(JBIG2_DECODE_TOKEN, image.dictionary)
+    """How many of an inline image's filter names (unescaped once) are JPXDecode or JBIG2Decode.
+
+    Only its filter value counts: a codec name under any other key is not one
+    the guard inspected, so it is left to count against the stream's.
+    """
+    return sum(name in _CODEC_NAMES for name in image.filters)
 
 
 def _resolve_subtype(doc, xref: int) -> tuple[str | None, bool]:
@@ -275,8 +280,9 @@ def document_block_reason(doc) -> str | None:
     fail-closed reason. Then, for a document holding a JBIG2 image, or whose
     bytes (the file's, its decoded object streams' or its content streams')
     name JBIG2Decode at all, both readers must find one sound revision
-    (:func:`_one_sound_revision`); and the file may hold no more
-    ``/JBIG2Globals`` names than the scan resolved.
+    (:func:`_one_sound_revision`); and those bytes may hold no
+    ``/JBIG2Globals`` name. (A JBIG2 image whose globals PyMuPDF resolves is
+    refused above, so no such name is ever one the scan checked.)
     """
     try:
         count = doc.xref_length()
@@ -288,7 +294,7 @@ def document_block_reason(doc) -> str | None:
     if isinstance(scanned, str):
         return scanned
     budget = _MAX_SCAN_BYTES - scanned.read
-    content_tokens, inline_resolved, inline_jbig2 = 0, 0, 0
+    content_tokens, inline_jbig2 = 0, 0
     # Inline images live in content streams, not in xref /Subtype: scan every
     # page's content and every Form XObject / tiling-pattern stream.
     for source, error_reason in _content_streams(doc, scanned.content_xrefs):
@@ -297,10 +303,9 @@ def document_block_reason(doc) -> str | None:
         budget -= len(source)
         if budget < 0:
             return "content stream scan exceeded the per-document byte budget; render skipped"
-        reason, resolved = _inline_block_reason(source)
+        reason = _inline_block_reason(source)
         if reason is not None:
             return reason
-        inline_resolved += resolved
         content_tokens += count_tokens(GLOBALS_TOKEN, source)
         inline_jbig2 += count_tokens(JBIG2_DECODE_TOKEN, source)
     outside = _tokens_outside_content(doc)
@@ -309,8 +314,8 @@ def document_block_reason(doc) -> str | None:
     globals_outside, jbig2_outside = outside
     if (scanned.jbig2_images or inline_jbig2 or jbig2_outside) and not _one_sound_revision(doc):
         return "a JBIG2 image is in a file both readers do not read as one sound revision; render skipped"
-    if globals_outside + content_tokens > scanned.resolved_globals + inline_resolved:
-        return "a /JBIG2Globals name in the file is not one the scan resolved; render skipped"
+    if globals_outside + content_tokens:
+        return "a /JBIG2Globals name is in the file; render skipped"
     return None
 
 
@@ -320,13 +325,12 @@ class _ObjectScan(NamedTuple):
     content_xrefs: list[int]
     read: int
     jbig2_images: int
-    resolved_globals: int
 
 
 def _scan_objects(doc, count: int) -> _ObjectScan | str:
     """Every image object guarded and every content stream found, or the first reason to block the render."""
     content_xrefs: list[int] = []  # Form XObjects and tiling patterns: streams that may hold inline images
-    read, jbig2_images, resolved_globals = 0, 0, 0
+    read, jbig2_images = 0, 0
     for xref in range(1, count):
         subtype_name, subtype_unreadable = _resolve_subtype(doc, xref)
         if subtype_unreadable:
@@ -342,10 +346,9 @@ def _scan_objects(doc, count: int) -> _ObjectScan | str:
             return image.reason
         read += image.read
         jbig2_images += image.is_jbig2
-        resolved_globals += image.resolved_globals
         if read > _MAX_SCAN_BYTES:
             return "image stream scan exceeded the per-document byte budget; render skipped"
-    return _ObjectScan(content_xrefs, read, jbig2_images, resolved_globals)
+    return _ObjectScan(content_xrefs, read, jbig2_images)
 
 
 def _one_sound_revision(doc) -> bool:

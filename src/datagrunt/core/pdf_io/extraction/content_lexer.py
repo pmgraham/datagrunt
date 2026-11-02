@@ -42,15 +42,13 @@ class InlineImage(NamedTuple):
 
     ``data`` runs from the byte after ``ID``'s whitespace to the whitespace
     before ``EI``; ``delimited`` is False when no ``EI`` follows (the data is
-    then the rest of the stream). ``dictionary`` is the bytes between ``BI``
-    and ``ID``, as written.
+    then the rest of the stream).
     """
 
     filters: tuple[str, ...]
     has_globals: bool
     data: bytes
     delimited: bool
-    dictionary: bytes = b""
 
 
 class _Token(NamedTuple):
@@ -89,14 +87,13 @@ def inline_images(content: bytes) -> tuple[InlineImage, ...] | str:
 
 def _inline_image(content: bytes, position: int) -> tuple[InlineImage, int] | str:
     """The inline image whose dictionary starts at ``position`` (after ``BI``), and where scanning resumes."""
-    start = position
     entries: dict[str, list[str] | bool] = {}
     for _ in range(_MAX_ENTRIES + 1):  # each step consumes a key and its value, or ends
         key = _next_token(content, position)
         if key.kind in ("end", "error"):
             return "has no ID before its content stream ends" if key.kind == "end" else key.value
         if key.kind == "word" and key.value == "ID":
-            return _image_data(content, key.end, entries, content[start : key.end - 2])
+            return _image_data(content, key.end, entries)
         if key.kind != "name":
             return f"has a dictionary that cannot be read (a {key.kind} where a key belongs)"
         value = _value(content, key.end, 0)
@@ -124,9 +121,7 @@ def _add_entry(entries: dict[str, list[str] | bool], key: str, value: "_Value") 
     return None
 
 
-def _image_data(
-    content: bytes, id_end: int, entries: dict[str, list[str] | bool], dictionary: bytes
-) -> tuple[InlineImage, int] | str:
+def _image_data(content: bytes, id_end: int, entries: dict[str, list[str] | bool]) -> tuple[InlineImage, int] | str:
     """The image whose ``ID`` ends at ``id_end``: its data up to ``EI``, and where scanning resumes.
 
     ``EI`` must be followed by whitespace or the end of the stream: one
@@ -138,10 +133,10 @@ def _image_data(
     has_globals = bool(entries.get("globals", False))
     names = tuple(filters) if isinstance(filters, list) else ()
     if ei_match is None:
-        return InlineImage(names, has_globals, content[start:], False, dictionary), len(content)
+        return InlineImage(names, has_globals, content[start:], False), len(content)
     if ei_match.end() < len(content) and content[ei_match.end()] not in _WHITESPACE:
         return "has an EI followed by a delimiter, not whitespace"
-    return InlineImage(names, has_globals, content[start : ei_match.start()], True, dictionary), ei_match.end()
+    return InlineImage(names, has_globals, content[start : ei_match.start()], True), ei_match.end()
 
 
 class _Value(NamedTuple):
