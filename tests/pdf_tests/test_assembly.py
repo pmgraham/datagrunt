@@ -48,7 +48,7 @@ from datagrunt.pdf.pdfium_engine import (
 )
 from datagrunt.pdf.quality import PageAssessment, assess_page
 from datagrunt.pdf.scope import apply_scope
-from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf, hand_written_pdf, solid_png
+from pdf_tests.builders import PageSpec, RasterImage, Rect, TextRun, build_pdf, hand_written_pdf, solid_png
 from pdf_tests.test_layout_apart import tiny_text_page
 from pdf_tests.test_layout_lattice import rules as lattice_rules
 from pdf_tests.test_layout_lattice import written
@@ -627,7 +627,9 @@ class TestAssemblePage:
         assert page.integrity_verified is True
 
     def test_a_vision_page_keeps_its_digital_text_and_says_ocr_did_not_read_it(self, tmp_path):
-        page = assembled(letter(tmp_path, TextRun("Too short", 72.0, 100.0)))
+        # A grey box under no text: paint OCR could read, so the short page routes vision (P2-C).
+        box = Rect(400.0, 600.0, 60.0, 40.0, fill_rgb=(0.5, 0.5, 0.5), stroke=False)
+        page = assembled(letter(tmp_path, TextRun("Too short", 72.0, 100.0), box))
 
         assert (page.route, page.status, page.integrity_verified) == ("vision", "ocr_unavailable", False)
         assert [element.text for element in page.elements] == ["Too short"]

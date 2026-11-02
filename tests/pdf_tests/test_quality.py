@@ -964,7 +964,10 @@ class TestZeroScaleThroughExtractPage:
 
     @pytest.mark.parametrize("scale,route", [(b"1", "vision"), (b"100", "digital")], ids=["tz-1", "tz-100"])
     def test_squeezed_text_is_kept_but_never_routes_the_page(self, tmp_path, scale, route):
-        content = b"q BT /F1 12 Tf %s Tz 20 150 Td (Thirty characters of body text.) Tj ET Q" % scale
+        # A rule under the text is paint OCR could read, so the count rule applies (P2-C): squeezed text counts for
+        # nothing, and the page has no other text.
+        rule = b"10 120 m 390 120 l S "
+        content = rule + b"q BT /F1 12 Tf %s Tz 20 150 Td (Thirty characters of body text.) Tj ET Q" % scale
 
         result = assess_page(extract_page(open_document(content_page(tmp_path, content)), 0))
 

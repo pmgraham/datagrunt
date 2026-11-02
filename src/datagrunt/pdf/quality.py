@@ -123,10 +123,20 @@ Pieces the gate does not select stay visible.
   does not group spans into lines (A4b does), so a run a piece break cuts
   is two runs, each judged on its own length. The routing ratio differs
   from the recorded one on a page with hidden text or a leader run.
-- ``ocr="always"`` routes vision. A count under 20, or a ratio under 0.70,
-  routes vision, or digital under ``ocr="never"`` with a warning naming
-  each that held; a page with no visible char outside leader runs has no
-  ratio (its count, 0, routes it). Otherwise, a page whose raster cover (of
+- A count under 20 counts only on a page that also holds paint OCR could
+  read and its text layer may not say: an image on the visible page, or
+  vector paint (a path, a shading, inside a form or not: A2's object
+  boxes) with area on it, or an object A2 could give no box (fail
+  closed). A page of short, clean text alone (a cover page's title, a
+  blank page) has nothing for OCR to read: it stays digital. This amends
+  the spec's count rule as #417 amended its ratio rule (maintainer,
+  2026-11-02, P2-C). Any area counts: a short word drawn as outlines
+  covers under 0.1 % of a letter page, so any larger bound would leave
+  such a page's words unread.
+- ``ocr="always"`` routes vision. A count under 20 (on a page with paint),
+  or a ratio under 0.70, routes vision, or digital under ``ocr="never"``
+  with a warning naming each that held; a page with no visible char
+  outside leader runs has no ratio (its count, 0, routes it). Otherwise, a page whose raster cover (of
   scan-like images, as for ``invisible``) is over 50 % routes hybrid (OCR
   fills the unmapped regions), or digital under ``ocr="never"``; else
   digital.
@@ -758,7 +768,7 @@ def assess_page(
     elif background is not None:
         pieces, own = _flag_unchecked(pieces, page), _flag_unchecked(own, page)
     flagged, unchecked = _duplicates_flagged(own, pieces)
-    route, warnings = _route(_visible_text(pieces), cover, ocr)
+    route, warnings = _route(_visible_text(pieces), cover, _painted(page), ocr)
     warnings += _recovery_warnings(recovered, page.text.stats.dropped_text_objects)
     return PageAssessment(
         pieces=pieces,
@@ -1048,11 +1058,23 @@ def _visible_text(pieces: tuple[SpanPiece, ...]) -> _VisibleText:
     return _VisibleText(chars=chars, valid=valid, counted=counted)
 
 
-def _route(text: _VisibleText, cover: float, ocr: OcrMode) -> tuple[PageRoute, tuple[str, ...]]:
-    """The page's route and warnings, from its visible text and raster cover (see the module notes)."""
+def _painted(page: RawPage) -> bool:
+    """Whether the page holds paint OCR could read: an image or vector paint with area on the visible page.
+
+    An image or object whose place A2 could not read (a matrix that is not
+    finite, bounds pdfium cannot give) counts: fail closed (module notes).
+    """
+    images, objects = page.images.stats, page.object_boxes
+    if images.max_cover_fraction > 0.0 or images.skipped_nonfinite_images or objects.unboxed:
+        return True
+    return _cover_fraction(objects.boxes, page.geometry.width_pt, page.geometry.height_pt) > 0.0
+
+
+def _route(text: _VisibleText, cover: float, painted: bool, ocr: OcrMode) -> tuple[PageRoute, tuple[str, ...]]:
+    """The page's route and warnings, from its visible text, raster cover and paint (see the module notes)."""
     if ocr == "always":
         return "vision", ()
-    shortfalls = _shortfalls(text)
+    shortfalls = _shortfalls(text, painted)
     if shortfalls:
         if ocr == "never":
             short = " and ".join(shortfalls)
@@ -1062,15 +1084,16 @@ def _route(text: _VisibleText, cover: float, ocr: OcrMode) -> tuple[PageRoute, t
     return ("hybrid" if cover > _OCR_LAYER_COVER and ocr != "never" else "digital"), ()
 
 
-def _shortfalls(text: _VisibleText) -> tuple[str, ...]:
+def _shortfalls(text: _VisibleText, painted: bool) -> tuple[str, ...]:
     """Why the page's visible text cannot stand: too few valid chars, too small a valid share, or both; else empty.
 
-    A page with no visible char outside leader runs has no ratio: its count
-    (0) is short. The ratio is shown cut to 3 places (exact, in integers),
-    so one under 0.70 never reads as 0.700.
+    Too few counts only on a ``painted`` page (module notes, P2-C). A page
+    with no visible char outside leader runs has no ratio: its count (0)
+    decides. The ratio is shown cut to 3 places (exact, in integers), so
+    one under 0.70 never reads as 0.700.
     """
     found: list[str] = []
-    if text.counted < _MIN_TEXT_CHARS:
+    if text.counted < _MIN_TEXT_CHARS and painted:
         found.append(f"{text.counted} valid, visible, non-whitespace chars (under {_MIN_TEXT_CHARS})")
     if text.chars and text.valid / text.chars < _MIN_VALID_RATIO:
         ratio = f"0.{text.valid * 1000 // text.chars:03d}"

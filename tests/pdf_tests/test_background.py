@@ -580,13 +580,15 @@ class TestGate:
 
 BLACK_12 = TextRun("ABCDEFGHIJKL", x=40.0, y=40.0, size=14.0)
 WHITE_14 = TextRun("MNOPQRSTUVWXYZ", x=40.0, y=120.0, size=14.0, rgb=(1.0, 1.0, 1.0))
+# Grey paint in the bottom-right corner, under no text: a page under the count routes vision only with paint (P2-C).
+CORNER = Rect(340.0, 250.0, 40.0, 30.0, fill_rgb=(0.5, 0.5, 0.5), stroke=False)
 
 
 class TestAssessWithBackground:
     """Assess, then flag, then route: flagged text leaves the routing count, as A3's other hidden reasons do."""
 
     def test_flagged_text_leaves_the_route_and_is_counted(self, tmp_path):
-        path = page_of(tmp_path, BLACK_12, WHITE_14)
+        path = page_of(tmp_path, BLACK_12, WHITE_14, CORNER)
         raw, plain = raw_and_assessed(path)
 
         checked_ = assess_page(raw, background=drawn(path))
@@ -597,7 +599,7 @@ class TestAssessWithBackground:
         assert checked_.warnings == plain.warnings == ()
 
     def test_ocr_never_warns_with_the_count_left_once_flagged(self, tmp_path):
-        path = page_of(tmp_path, BLACK_12, WHITE_14)
+        path = page_of(tmp_path, BLACK_12, WHITE_14, CORNER)
         raw, _plain = raw_and_assessed(path, ocr="never")
 
         checked_ = assess_page(raw, ocr="never", background=drawn(path))
@@ -606,9 +608,19 @@ class TestAssessWithBackground:
         assert checked_.route == "digital"
         assert checked_.warnings == (f"ocr='never': the page has {count}; it stays digital instead of going to OCR",)
 
+    def test_flagged_text_on_a_page_of_text_alone_leaves_it_digital(self, tmp_path):
+        # The 12 black chars left are short, but the page holds no paint for OCR to read (P2-C): it stays digital.
+        path = page_of(tmp_path, BLACK_12, WHITE_14)
+        raw, _plain = raw_and_assessed(path)
+
+        checked_ = assess_page(raw, background=drawn(path))
+
+        assert [piece.hidden_reasons for piece in checked_.pieces] == [(), FLAGGED]
+        assert (checked_.route, checked_.warnings) == ("digital", ())
+
     def test_a_background_not_checked_flags_the_gated_pieces_unchecked_and_warns(self, tmp_path):
         # Fail closed: the near-white piece a matching background could hide is flagged; the black one stays.
-        raw, plain = raw_and_assessed(page_of(tmp_path, BLACK_12, WHITE_14))
+        raw, plain = raw_and_assessed(page_of(tmp_path, BLACK_12, WHITE_14, CORNER))
 
         unchecked = assess_page(raw, background="the page was not rendered: why")
 

@@ -114,8 +114,18 @@ def segment(index: int) -> RawSegment:
     )
 
 
-def raw_page(*spans, images=(), segments: int = 0, rotation: int = 0, dropped: int = 0) -> RawPage:
-    """A RawPage of the 400 x 300 pt page: ``spans``, ``images``, ``segments`` strokes, ``dropped`` text objects."""
+# Vector paint OCR could read and a text layer may not say (a 90 x 40 pt fill, top-left): the count rule's
+# precondition (P2-C). raw_page draws it unless a test says ``paint=()``.
+PAINT = ((300.0, 10.0, 390.0, 50.0),)
+
+
+def raw_page(
+    *spans, images=(), segments: int = 0, rotation: int = 0, dropped: int = 0, paint=PAINT, unboxed: int = 0
+) -> RawPage:
+    """A RawPage of the 400 x 300 pt page: ``spans``, ``images``, ``segments`` strokes, ``dropped`` text objects.
+
+    ``paint`` is its non-text objects' boxes (A2's ``ObjectBoxes``), ``unboxed`` those without one.
+    """
     geometry = PageGeometry(page_number=1, width_pt=W, height_pt=H, rotation_deg=rotation, crop_offset=(0.0, 0.0))
     stats = TextStats(
         char_count=sum(textpage_chars(span.text) for span in spans),
@@ -143,7 +153,7 @@ def raw_page(*spans, images=(), segments: int = 0, rotation: int = 0, dropped: i
             stats=SegmentStats(skipped_nonfinite_paths=0),
         ),
         images=PageImages(images=images, stats=image_stats),
-        object_boxes=ObjectBoxes(boxes=(), unboxed=0),
+        object_boxes=ObjectBoxes(boxes=paint, unboxed=unboxed),
     )
 
 
@@ -714,6 +724,60 @@ class TestHybrid:
 
     def test_too_little_text_over_a_scan_is_vision(self):
         assert assess(letters(19), images=(FULL_BLEED,)).route == "vision"
+        assert assess(letters(19), images=(FULL_BLEED,), paint=()).route == "vision"  # the image is enough
+
+
+class TestShortCleanPages:
+    """A page under the count routes vision only with an image or vector paint, or a ratio under 0.70 (P2-C).
+
+    A page of short, clean text alone (a cover page's title, a blank page) has nothing OCR could read that its
+    text layer does not say: it stays digital, without a warning, whatever ``ocr`` (but "always") says.
+    """
+
+    @pytest.mark.parametrize("count", [0, 5, 19])
+    @pytest.mark.parametrize("ocr", ["auto", "never"])
+    def test_short_clean_text_alone_stays_digital(self, count, ocr):
+        spans = (letters(count),) if count else ()
+
+        got = assess(*spans, paint=(), ocr=ocr)
+
+        assert (got.route, got.warnings) == ("digital", ())
+
+    @pytest.mark.parametrize(
+        "page",
+        [
+            pytest.param({"images": (image((300.0, 10.0, 390.0, 50.0)),)}, id="an-image"),
+            pytest.param({"paint": PAINT}, id="vector-paint"),
+            pytest.param({"paint": ((10.0, 280.0, 390.0, 280.5),)}, id="a-hairline-rule"),
+            pytest.param({"unboxed": 1}, id="an-object-without-a-box"),
+        ],
+    )
+    def test_short_text_with_an_image_or_paint_is_vision(self, page):
+        assert assess(letters(15), **({"paint": ()} | page)).route == "vision"
+
+    def test_paint_off_the_visible_page_does_not_count(self):
+        assert assess(letters(15), paint=((-90.0, 10.0, -10.0, 50.0),)).route == "digital"
+
+    def test_a_ratio_under_070_is_vision_without_paint(self):
+        assert assess(*mixed(10, 10), paint=()).route == "vision"
+
+    def test_always_is_still_vision(self):
+        assert assess(letters(15), paint=(), ocr="always").route == "vision"
+
+    def test_the_reports_cover_page_stays_digital(self, tmp_path):
+        # A title of under 30 chars (16 counted), nothing else on the page: a clean digital page.
+        result, raw = assessed(built(tmp_path, TextRun("Annual Report 2025", x=60.0, y=120.0, size=24.0)))
+
+        assert (raw.object_boxes, raw.images.images) == (ObjectBoxes(boxes=(), unboxed=0), ())
+        assert result.quality.valid_char_ratio == 1.0
+        assert (result.route, result.warnings) == ("digital", ())
+
+    def test_a_near_empty_scan_with_an_image_is_still_vision(self, tmp_path):
+        path = built(tmp_path, RasterImage(0.0, 0.0, W, H, PNG), TextRun("Scan 07", x=20.0, y=20.0))
+
+        result, _ = assessed(path)
+
+        assert result.route == "vision"
 
 
 class TestOcrModes:
@@ -1036,15 +1100,24 @@ class TestRegressions:
         assert reasons == [("tiny_font",), ("transparent",), ("off_page",)]
         assert (result.route, result.quality.hidden_spans_flagged) == ("vision", 3)
 
-    def test_invisible_text_without_a_scan_is_vision(self, tmp_path):
+    def test_invisible_text_without_a_scan_or_paint_is_digital(self, tmp_path):
+        # Nothing on the page shows: no paint for OCR to read. The invisible text is kept, flagged.
         path = built(tmp_path, TextRun("Invisible text with no scan under it", x=40.0, y=100.0, render_mode=3))
 
         result, _ = assessed(path)
 
         assert [item.hidden_reasons for item in result.pieces] == [("invisible",)]
+        assert result.route == "digital"
+
+    def test_invisible_text_over_paint_is_vision(self, tmp_path):
+        rule = Line(20.0, 200.0, 380.0, 200.0)
+        path = built(tmp_path, rule, TextRun("Invisible text with no scan under it", x=40.0, y=100.0, render_mode=3))
+
+        result, _ = assessed(path)
+
         assert result.route == "vision"
 
-    def test_blank_page_is_vision(self, tmp_path):
+    def test_blank_page_is_digital(self, tmp_path):
         result, _ = assessed(built(tmp_path))
 
         assert result.quality == PageQuality(
@@ -1056,12 +1129,12 @@ class TestRegressions:
             deskew_angle_deg=None,
             ocr_mean_confidence=None,
         )
-        assert (result.pieces, result.route, result.unmapped_regions, result.warnings) == ((), "vision", (), ())
+        assert (result.pieces, result.route, result.unmapped_regions, result.warnings) == ((), "digital", (), ())
 
-    def test_blank_page_with_ocr_never_is_digital_with_a_warning(self, tmp_path):
+    def test_blank_page_with_ocr_never_is_digital_without_a_warning(self, tmp_path):
         result, _ = assessed(built(tmp_path), ocr="never")
 
-        assert (result.route, result.warnings) == ("digital", (NEVER_WARNING.format(count=0),))
+        assert (result.route, result.warnings) == ("digital", ())
 
     def test_accented_latin_text_is_digital_byte_for_byte(self, tmp_path):
         # Precomposed Latin-1 letters, which Helvetica's WinAnsi encoding draws as themselves.
