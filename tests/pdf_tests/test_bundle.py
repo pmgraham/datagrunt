@@ -27,6 +27,7 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 
+import datagrunt
 from datagrunt.pdf import _loaders, bundle
 from datagrunt.pdf.bundle import BUNDLE_FORMAT_VERSION, load_bundle, write_bundle
 from datagrunt.pdf.codec import document_from_json_bytes
@@ -284,7 +285,7 @@ class TestManifest:
     def test_manifest_values(self, written):
         manifest = manifest_of(written.out)
         assert manifest["bundle_format_version"] == BUNDLE_FORMAT_VERSION == "5.0"
-        assert manifest["datagrunt_version"] == importlib.metadata.version("datagrunt")
+        assert manifest["datagrunt_version"] == datagrunt.__version__
         assert manifest["source_sha256"] == sha_of(written.source) == written.document.metadata.sha256
         params = {"dpi": DPI, "vision_dpi": VISION_DPI, "max_render_pixels": 16_000_000, "workers": 1}
         assert manifest["extraction_params"] == params
@@ -1295,6 +1296,51 @@ class TestReuse:
         changed = with_element(bound_document(source), "p0001_e003", text="Other text.")
         with pytest.raises(FileExistsError, match="its document is not this one"):
             write(changed, tmp_path / "out", source)
+
+
+# A version an editable install's metadata can still hold after the code moved on: installed metadata is stale there.
+STALE = "4.6.37"
+
+
+def stale_metadata(monkeypatch) -> None:
+    """Make the installed package metadata report STALE for datagrunt, as an editable install's can."""
+    real = importlib.metadata.version
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: STALE if name == "datagrunt" else real(name))
+
+
+class TestTheVersionIsTheCodes:
+    """The manifest records, and reuse compares, ``datagrunt.__version__``: never installed package metadata."""
+
+    def test_the_manifest_records_datagrunt_version(self, tmp_path, source, fast_render, monkeypatch):
+        stale_metadata(monkeypatch)
+
+        write(bound_document(source), tmp_path / "out", source)
+
+        assert datagrunt.__version__ != STALE  # the case: metadata and code disagree
+        assert manifest_of(tmp_path / "out")["datagrunt_version"] == datagrunt.__version__
+
+    def test_a_bundle_of_this_code_is_reused_whatever_metadata_says(self, tmp_path, source, fast_render, monkeypatch):
+        first = write(bound_document(source), tmp_path / "out", source)
+        before = tree_of(tmp_path / "out")
+        stale_metadata(monkeypatch)
+
+        again = write(bound_document(source), tmp_path / "out", source)
+
+        assert again == first and tree_of(tmp_path / "out") == before
+
+    def test_a_bundle_of_the_metadatas_version_is_refused(self, tmp_path, source, fast_render, monkeypatch):
+        write(bound_document(source), tmp_path / "out", source)
+        _set_manifest(tmp_path / "out", "datagrunt_version", STALE)
+        stale_metadata(monkeypatch)
+
+        with pytest.raises(FileExistsError, match=f"written by datagrunt {STALE}, not {datagrunt.__version__}"):
+            write(bound_document(source), tmp_path / "out", source)
+
+    def test_no_v5_module_reads_the_installed_metadata(self):
+        package = Path(bundle.__file__).parent
+        readers = [path.name for path in sorted(package.glob("*.py")) if "importlib.metadata" in path.read_text()]
+
+        assert readers == []
 
 
 def _set_manifest(out: Path, key: str, value) -> None:

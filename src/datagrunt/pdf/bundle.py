@@ -51,7 +51,8 @@ Layout (paths relative to the bundle, joined with ``/``):
   read it, righted, which is what a vision model needs). A rendered page
   has no bands. ``vision_dpi`` is recorded, not rendered at: a vision
   page's own image carries its DPI.
-- ``manifest.json``: :data:`BUNDLE_FORMAT_VERSION`, the datagrunt version,
+- ``manifest.json``: :data:`BUNDLE_FORMAT_VERSION`, the datagrunt version
+  (``datagrunt.__version__``),
   the source's sha256, the extraction parameters (``dpi``, ``vision_dpi``,
   ``max_render_pixels``, ``workers``, then the caller's
   ``extraction_params``), ``integrity_verified`` and ``degraded_pages``,
@@ -205,7 +206,6 @@ there is nothing to close.
 import dataclasses
 import errno
 import hashlib
-import importlib.metadata
 import json
 import math
 import os
@@ -223,6 +223,7 @@ from typing import IO, BinaryIO, NamedTuple, TypeVar, cast
 import polars as pl
 from PIL import Image
 
+import datagrunt
 from datagrunt.pdf._loaders import PageDraw, figure_pngs
 from datagrunt.pdf._validate import checked_path as _checked_path
 from datagrunt.pdf._validate import (
@@ -1009,7 +1010,13 @@ def _joined(base: Path, relative: str) -> Path:
 
 
 def _datagrunt_version() -> str:
-    return importlib.metadata.version("datagrunt")
+    """The extractor's version: ``datagrunt.__version__``, the code's own.
+
+    Never the installed package metadata: an editable install keeps the
+    version it was installed at while the code moves on, and reuse compares
+    this version.
+    """
+    return datagrunt.__version__
 
 
 def _missing_order(entry: _Missing) -> tuple[int, str, str]:
