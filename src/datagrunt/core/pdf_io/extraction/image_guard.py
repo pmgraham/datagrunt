@@ -287,6 +287,27 @@ def inspect_image(
     return GuardDecision(True, f"{label}: unrecognised image filter {codec!r}; skipped (not decoded)")
 
 
+def inspect_declared_size(size: tuple[int, int] | None, label: str) -> GuardDecision:
+    """Skip an image whose declared ``/Width`` x ``/Height`` is over the pixel bound, whatever its filters.
+
+    pdfium allocates a bitmap of the declared size to read an image, and the
+    stream check allows a decode in proportion to it; past
+    ``_MAX_DECODED_PIXELS`` the image is not decoded. A size pdfium cannot
+    give (None) is left to the other checks.
+    """
+    if size is None:
+        return _SAFE
+    width, height = size
+    pixels = width * height
+    if pixels > _MAX_DECODED_PIXELS:
+        return GuardDecision(
+            True,
+            f"{label}: image declares {width} x {height} = {pixels} pixels, "
+            f"over the {_MAX_DECODED_PIXELS}-pixel bound; skipped",
+        )
+    return _SAFE
+
+
 def _usable_stream(raw_stream: bytes | None, label: str) -> bytes | GuardDecision:
     """Return the bytes of a readable, bounded stream, or a skip ``GuardDecision``."""
     if raw_stream is None:

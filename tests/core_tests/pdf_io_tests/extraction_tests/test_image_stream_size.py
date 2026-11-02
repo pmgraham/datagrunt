@@ -107,6 +107,17 @@ def no_pdfium_decode(monkeypatch):
     return calls
 
 
+@pytest.fixture
+def no_pdfium_render(monkeypatch):
+    """Fail the test if pdfium draws a page (the images here are small, so they may be decoded)."""
+    from datagrunt.core.pdf_io.extraction import pdfium_document
+
+    def forbid(*args, **kwargs):
+        raise AssertionError("a page was drawn")
+
+    monkeypatch.setattr(pdfium_document.PdfiumPage, "render_pil", forbid)
+
+
 def _warnings(document: dict) -> list[str]:
     return [w for page in document["document"]["pages"] for w in (page.get("warnings") or [])]
 
@@ -223,6 +234,122 @@ def test_pdfium_still_extracts_an_inline_image_of_its_declared_size(tmp_path, na
 
     assert len(_images(document)) == 1
     assert _warnings(document) == []
+
+
+# ---------------------------------------------------------------------------
+# The declared size: an image declaring more pixels than the bound is skipped.
+# ---------------------------------------------------------------------------
+
+HUGE_GRAY = b"/Width 20000 /Height 20000 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter "
+PIXEL_BOUND = "page 1 image 0: image declares 20000 x 20000 = 400000000 pixels, over the 89478485-pixel bound; skipped"
+HUGE_DECLARED = {
+    "flate": (b"/FlateDecode", zlib.compress(b"")),
+    "flate-past-its-size": (b"/FlateDecode", flate_zeros(8 * MIB)),
+    "dct": (b"/DCTDecode", b"\xff\xd8\xff\xd9"),
+    "unfiltered": (b"[]", bytes(64)),
+}
+
+
+def huge_pdf(tmp_path: Path, case: str, *, text: bool = True) -> Path:
+    filters, stream = HUGE_DECLARED[case]
+    return image_page_pdf(tmp_path / f"huge-{case}.pdf", stream, HUGE_GRAY + filters, text=text)
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("case", sorted(HUGE_DECLARED))
+def test_pdfium_skips_an_image_declaring_more_pixels_than_the_bound(tmp_path, case, native, no_pdfium_decode):
+    document = PDFReader(huge_pdf(tmp_path, case), engine="pdfium", native=native).to_dicts(
+        image_output_dir=str(tmp_path / "out")
+    )
+
+    assert _warnings(document) == [PIXEL_BOUND]  # before the stream is read or checked
+    assert _images(document) == []
+    assert no_pdfium_decode == []
+
+
+def test_pdfium_renders_no_page_drawing_an_image_declaring_more_pixels_than_the_bound(tmp_path, no_pdfium_decode):
+    assert PDFWriter(huge_pdf(tmp_path, "flate"), engine="pdfium").render_pages_as_images(str(tmp_path / "p")) == []
+    assert no_pdfium_decode == []
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_pdfium_does_not_ocr_a_scanned_page_drawing_an_image_declaring_more_pixels_than_the_bound(
+    tmp_path, native, no_pdfium_decode
+):
+    document = PDFReader(huge_pdf(tmp_path, "flate", text=False), engine="pdfium", native=native).to_dicts()
+
+    assert PIXEL_BOUND in _warnings(document)
+    assert no_pdfium_decode == []
+
+
+def test_an_image_declaring_exactly_the_pixel_bound_is_checked_as_usual(tmp_path):
+    # 89,478,485 = 5 x 17,895,697: at the bound, not past it.
+    entries = b"/Width 5 /Height 17895697 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode"
+    path = image_page_pdf(tmp_path / "at-bound.pdf", zlib.compress(b""), entries)
+
+    document = PDFReader(path, engine="pdfium").to_dicts()
+
+    assert not any("pixel bound" in warning for warning in _warnings(document))
+
+
+# ---------------------------------------------------------------------------
+# One decode budget a document: past it, every image that needs a check is skipped.
+# ---------------------------------------------------------------------------
+
+BUDGET_SPENT = "its stream's decoded size could not be checked within the byte budget; skipped (not decoded)"
+
+
+def _images_pdf(path: Path, pages: list[list[bytes]]) -> Path:
+    """A PDF drawing, on each page, a line of text and one 64 x 64 gray Flate image per stream given for it."""
+    from pdf_io_tests.extraction_tests._stream_fixtures import hand_written_pdf, text_content
+
+    streams = [stream for page in pages for stream in page]
+    font = 3 + 2 * len(pages)
+    first_image = font + 1
+    objects = [b"<< /Type /Catalog /Pages 2 0 R >>"]
+    kids = b" ".join(b"%d 0 R" % (3 + i) for i in range(len(pages)))
+    objects.append(b"<< /Type /Pages /Kids [%s] /Count %d >>" % (kids, len(pages)))
+    contents, number = [], first_image
+    for page_index, page in enumerate(pages):
+        names = b" ".join(b"/Im%d %d 0 R" % (i, number + i) for i in range(len(page)))
+        draws = text_content(b" ".join(b"q 64 0 0 64 %d 100 cm /Im%d Do Q" % (70 * i, i) for i in range(len(page))))
+        objects.append(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 %d 0 R >> "
+            b"/XObject << %s >> >> /Contents %d 0 R >>" % (font, names, 3 + len(pages) + page_index)
+        )
+        contents.append(b"<< /Length %d >>\nstream\n%s\nendstream" % (len(draws), draws))
+        number += len(page)
+    objects += contents
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    objects += [
+        b"<< /Type /XObject /Subtype /Image %s/FlateDecode /Length %d >>\nstream\n%s\nendstream"
+        % (GRAY_64, len(stream), stream)
+        for stream in streams
+    ]
+    return hand_written_pdf(path, objects)
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_pdfium_skips_the_images_past_its_documents_decode_budget(tmp_path, monkeypatch, native, no_pdfium_render):
+    from datagrunt.core.pdf_io.extraction import pdfium_document
+
+    # Room for three 4,096-byte images and 100 bytes: the fourth is past it, and the fifth
+    # (decoding to only 50 bytes) is skipped too, the budget being spent.
+    monkeypatch.setattr(pdfium_document, "_DOCUMENT_DECODE_BUDGET_BYTES", 3 * 4096 + 100)
+    page_1 = [zlib.compress(bytes((value,)) * 4096) for value in (1, 2, 3)]
+    page_2 = [zlib.compress(bytes((4,)) * 4096), zlib.compress(bytes((5,)) * 50)]
+    path = _images_pdf(tmp_path / "budget.pdf", [page_1, page_2])
+
+    document = PDFReader(path, engine="pdfium", native=native).to_dicts(image_output_dir=str(tmp_path / "out"))
+
+    assert len(_images(document)) == 3
+    assert _warnings(document) == [f"page 2 image 0: {BUDGET_SPENT}"] * 2
+
+
+def test_a_documents_decode_budget_is_two_gib():
+    from datagrunt.core.pdf_io.extraction import pdfium_document
+
+    assert pdfium_document._DOCUMENT_DECODE_BUDGET_BYTES == 2 << 30
 
 
 # ---------------------------------------------------------------------------

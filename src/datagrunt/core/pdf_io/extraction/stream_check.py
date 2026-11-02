@@ -83,7 +83,7 @@ _A85_ZEROS = re.compile(rb"z+")
 
 
 class ByteBudget:
-    """The bytes a check may still decode; a decode that would pass it is stopped."""
+    """The bytes checks may still decode; a decode that would pass it is stopped, and every later one refused."""
 
     def __init__(self, total: int) -> None:
         if not isinstance(total, int) or isinstance(total, bool) or total < 0:
@@ -95,11 +95,17 @@ class ByteBudget:
         """The bytes left to decode."""
         return self._remaining
 
+    @property
+    def spent(self) -> bool:
+        """True once nothing remains, or a charge has failed: no further decode may run."""
+        return self._remaining == 0
+
     def charge(self, size: int) -> bool:
-        """Spend ``size`` bytes; False (and nothing spent) when fewer than ``size`` remain."""
+        """Spend ``size`` bytes; False when fewer than ``size`` remain, and the budget is then spent."""
         if not isinstance(size, int) or size < 0:
             raise ValueError(f"a charge must be a whole number of bytes, not {size!r}")
         if size > self._remaining:
+            self._remaining = 0
             return False
         self._remaining -= size
         return True
@@ -141,8 +147,9 @@ def stream_size_problem(
         raw: The image's raw (still-encoded) stream, or None if unreadable.
         filters: Its filter names in decoding order.
         size: Its ``(/Width, /Height)``, or None if unreadable.
-        budget: The bytes the check may decode (charged as it decodes); a
-            fresh :data:`_DEFAULT_BUDGET_BYTES` budget when None.
+        budget: The bytes the check may decode (charged as it decodes),
+            shared with other checks; a fresh :data:`_DEFAULT_BUDGET_BYTES`
+            budget when None. Once spent, every check is refused.
 
     A stream with no decoding filter is not checked (None). Otherwise the text
     says it decodes past its declared size, or that its size could not be
@@ -158,8 +165,11 @@ def stream_size_problem(
     plan = _plan([normalize_filter(str(name)) for name in filters], pixels)
     if isinstance(plan, str):
         return _unchecked(plan)
+    budget = budget if budget is not None else ByteBudget(_DEFAULT_BUDGET_BYTES)
     try:
-        _decode_every_reading(raw, plan, budget if budget is not None else ByteBudget(_DEFAULT_BUDGET_BYTES))
+        if budget.spent:
+            raise _OverBudget
+        _decode_every_reading(raw, plan, budget)
     except _OverLimit:
         return "its stream decodes to more than its declared size; skipped (not decoded)"
     except _OverBudget:

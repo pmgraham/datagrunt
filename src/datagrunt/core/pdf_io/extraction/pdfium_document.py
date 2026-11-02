@@ -19,11 +19,12 @@ from datagrunt.core.pdf_io.extraction.image_guard import (
     _MAX_FILTER_ARRAY_ITEMS,
     _MAX_RAW_HEADER_BYTES,
     GuardDecision,
+    inspect_declared_size,
     inspect_image,
     normalize_filter,
 )
 from datagrunt.core.pdf_io.extraction.shapes import BBox, ImageBlock, TextItem
-from datagrunt.core.pdf_io.extraction.stream_check import has_simple_filter, stream_size_problem
+from datagrunt.core.pdf_io.extraction.stream_check import ByteBudget, has_simple_filter, stream_size_problem
 from datagrunt.core.pdf_io.filenames import embedded_image_filename
 
 if TYPE_CHECKING:
@@ -38,6 +39,10 @@ logger = logging.getLogger(__name__)
 # PDF names are at most 127 bytes in practice; this bound, NUL included, only
 # stops a length pdfium reports from sizing the buffer.
 _MAX_FILTER_NAME_BYTES = 4096
+
+# The bytes the stream checks of one document may decode in all; past it, every
+# image that needs a check is skipped (see ``stream_check``).
+_DOCUMENT_DECODE_BUDGET_BYTES = 2 << 30  # 2 GiB
 
 # Image objects can be nested inside form XObjects; walk deep enough to reach a
 # bomb hidden behind a few layers of forms before a render would decode it.
@@ -107,8 +112,9 @@ class PdfiumPage:
                 image's decode parameters; see ``render_guard.jbig2_agreement``).
                 None: no JBIG2 image is decoded.
             stream_problem: Checks an image's stream against its declared size
-                (see ``stream_check``), as the document caches it. None: each
-                image is checked here, uncached.
+                (see ``stream_check``), as the document caches it and charges
+                its decode budget. None: each image is checked here, uncached,
+                with a budget of its own.
         """
         self._page = page
         self._raw = raw_module
@@ -286,27 +292,32 @@ class PdfiumPage:
 
         A JBIG2 image's decode parameters are checked by its raw stream: it is
         decoded only when the document draws that stream with no ``/JBIG2Globals``.
-        An image with a decoding filter (FlateDecode, LZWDecode, ...) is decoded
-        only when its stream decodes to no more than its declared size.
+        An image declaring more pixels than the bound is skipped first; one
+        with a decoding filter (FlateDecode, LZWDecode, ...) is decoded only
+        when its stream decodes to no more than its declared size.
         """
         label = f"page {page_number + 1} image {idx}"
         filters = self._image_filters(obj)
         if filters is None:
             return GuardDecision(True, f"{label}: image filters could not be read; skipped (not decoded)")
+        size = self._pixel_size(obj)
+        declared = inspect_declared_size(size, label)
+        if declared.skip:
+            return declared
         raw = self._raw_image_stream(obj)
         is_jbig2 = bool(filters) and normalize_filter(filters[-1]) == "JBIG2Decode"
         unchecked = is_jbig2 and not self._jbig2_agreed(raw)
         decision = inspect_image(raw, filters, label=label, jbig2_globals_missing=unchecked)
         if decision.skip or not has_simple_filter(filters):
             return decision
-        problem = self._stream_size_problem(obj, raw, filters)
+        problem = self._stream_size_problem(raw, filters, size)
         return decision if problem is None else GuardDecision(True, f"{label}: {problem}")
 
-    def _stream_size_problem(self, obj, raw: bytes | None, filters: list[str]) -> str | None:
+    def _stream_size_problem(self, raw: bytes | None, filters: list[str], size: tuple[int, int] | None) -> str | None:
         """What is wrong with an image's stream for its declared size; None when nothing is (see ``_guard``)."""
         if raw is None or self._stream_problem is None:
-            return stream_size_problem(raw, filters, self._pixel_size(obj))
-        return self._stream_problem(raw, filters, self._pixel_size(obj))
+            return stream_size_problem(raw, filters, size)
+        return self._stream_problem(raw, filters, size)
 
     def _pixel_size(self, obj) -> tuple[int, int] | None:
         """The image's ``/Width`` x ``/Height`` as pdfium reads them (no decode); None when pdfium cannot."""
@@ -476,6 +487,7 @@ class PdfiumDocument:
         self._filepath = filepath
         self._jbig2_agreement: Jbig2Agreement | None = None
         self._stream_problems: dict[tuple[str, tuple[str, ...], tuple[int, int] | None], str | None] = {}
+        self._decode_budget = ByteBudget(_DOCUMENT_DECODE_BUDGET_BYTES)
         try:
             self._pdf = pdfium.PdfDocument(str(filepath))
         except pdfium.PdfiumError as exc:
@@ -502,10 +514,13 @@ class PdfiumDocument:
         )
 
     def _stream_size_problem(self, raw: bytes, filters: list[str], size: tuple[int, int] | None) -> str | None:
-        """What is wrong with an image's stream for its declared size, checked once a stream; None if nothing."""
+        """What is wrong with an image's stream for its declared size, checked once a stream; None if nothing.
+
+        Every check charges the document's one decode budget.
+        """
         key = (hashlib.sha256(raw).hexdigest(), tuple(filters), size)
         if key not in self._stream_problems:
-            self._stream_problems[key] = stream_size_problem(raw, filters, size)
+            self._stream_problems[key] = stream_size_problem(raw, filters, size, self._decode_budget)
         return self._stream_problems[key]
 
     def _jbig2_decodable(self, page_number: int, digest: str, on_page: frozenset[str]) -> bool:
