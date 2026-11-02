@@ -8,6 +8,7 @@ and read them through ``extract_page``.
 
 import dataclasses
 import hashlib
+import io
 import pickle
 import re
 import subprocess
@@ -15,8 +16,9 @@ import sys
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
-from datagrunt.pdf import assembly, layout
+from datagrunt.pdf import _loaders, assembly, layout
 from datagrunt.pdf._loaders import FigureRead
 from datagrunt.pdf.assembly import (
     FigureDraft,
@@ -28,7 +30,7 @@ from datagrunt.pdf.assembly import (
     page_figures,
     pass_c,
 )
-from datagrunt.pdf.elements import BBox, Figure, Page, PageQuality, Paragraph, Table
+from datagrunt.pdf.elements import BBox, Figure, Page, PageImage, PageQuality, Paragraph, Table
 from datagrunt.pdf.exceptions import DatagruntPDFError
 from datagrunt.pdf.layout import (
     MAX_CROSSINGS,
@@ -47,6 +49,7 @@ from datagrunt.pdf.pdfium_engine import (
     recover_dropped_text,
 )
 from datagrunt.pdf.quality import PageAssessment, assess_page
+from datagrunt.pdf.render import RenderRefused, effective_dpi, render_page, render_size
 from datagrunt.pdf.scope import apply_scope
 from pdf_tests.builders import PageSpec, RasterImage, Rect, TextRun, build_pdf, hand_written_pdf, solid_png
 from pdf_tests.test_layout_apart import tiny_text_page
@@ -528,7 +531,7 @@ class TestAssemblePage:
             "ok",
             "digital",
             assessment.quality,
-            None,
+            PageImage(page_number=1, dpi=200.0, width_px=1700, height_px=2200),
             None,
         )
         assert (page.integrity_verified, page.warnings) == (True, ())
@@ -636,6 +639,198 @@ class TestAssemblePage:
         assert page.warnings == (
             "route 'vision': the page was not read by OCR; its digital text is kept as its elements",
         )
+
+
+# A render worker's memory cap past its start, and its time: what a PageDraw is given by default.
+RENDER_CAP, RENDER_TIMEOUT = 2 << 30, 120.0
+
+
+def grey_png(data: bytes) -> tuple[str, str, tuple[int, int], bytes]:
+    """A PNG's format, mode, size and pixels."""
+    with Image.open(io.BytesIO(data)) as picture:
+        return picture.format, picture.mode, picture.size, picture.tobytes()
+
+
+class TestPageDraw:
+    """A digital or hybrid page's image loader (P2-A): picklable, holding no pixels, checked at construction."""
+
+    def fields(self, tmp_path, **overrides) -> dict:
+        values = {
+            "source": tmp_path / "doc.pdf",
+            "page_index": 0,
+            "dpi": 72,
+            "width_pt": LETTER_W,
+            "height_pt": LETTER_H,
+            "password": "secret",
+        }
+        return values | overrides
+
+    def test_holds_an_absolute_path_and_its_size_and_hides_the_password(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+
+        draw = _loaders.PageDraw(**self.fields(tmp_path, source=Path("doc.pdf")))
+
+        assert draw.source == tmp_path / "doc.pdf"
+        assert draw.size == (612, 792) == render_size(LETTER_W, LETTER_H, 72)
+        assert (draw.memory_cap_bytes, draw.timeout_s) == (RENDER_CAP, RENDER_TIMEOUT)
+        assert "secret" not in repr(draw)
+        assert not hasattr(draw, "__dict__")
+        assert pickle.loads(pickle.dumps(draw)) == draw
+
+    @pytest.mark.parametrize(
+        ("overrides", "error", "message"),
+        [
+            ({"source": b"doc.pdf"}, TypeError, "source"),
+            ({"page_index": -1}, ValueError, "page_index"),
+            ({"dpi": 0}, ValueError, "dpi"),
+            ({"dpi": 72.0}, TypeError, "dpi"),
+            ({"width_pt": 0.0}, ValueError, "width_pt"),
+            ({"height_pt": float("nan")}, ValueError, "height_pt"),
+            ({"width_pt": 0.5}, ValueError, "draws 0 px wide at 72 DPI"),
+            ({"height_pt": 0.5}, ValueError, "draws 0 px tall at 72 DPI"),
+            ({"password": "a\x00b"}, ValueError, "password"),
+            ({"memory_cap_bytes": 0}, ValueError, "memory_cap_bytes"),
+            ({"timeout_s": -1.0}, ValueError, "timeout_s"),
+        ],
+    )
+    def test_rejects_bad_fields(self, tmp_path, overrides, error, message):
+        with pytest.raises(error, match=message):
+            _loaders.PageDraw(**self.fields(tmp_path, **overrides))
+
+    def test_each_read_draws_the_page_again_in_the_render_worker(self, tmp_path, monkeypatch):
+        path = letter(tmp_path, *mixed_items())
+        calls = []
+        real = _loaders.render_page
+
+        def counted(*args, **kwargs):
+            calls.append((args, kwargs))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(_loaders, "render_page", counted)
+        draw = _loaders.PageDraw(source=path, page_index=0, dpi=72, width_pt=LETTER_W, height_pt=LETTER_H)
+
+        first, second = draw.png_bytes(), draw.png_bytes()
+
+        drawn = render_page(path, 0, dpi=72, memory_cap_bytes=RENDER_CAP, timeout_s=RENDER_TIMEOUT)
+        assert first == second
+        assert grey_png(first) == ("PNG", "L", (612, 792), drawn.pixels)  # as drawn: no contrast normalization
+        options = {"dpi": 72, "password": None, "memory_cap_bytes": RENDER_CAP, "timeout_s": RENDER_TIMEOUT}
+        assert calls == [((path, 0), options)] * 2
+
+    def test_a_read_passes_its_password_cap_and_timeout(self, tmp_path, monkeypatch):
+        calls = []
+
+        def recorded(*args, **kwargs):
+            calls.append(kwargs)
+            raise RenderRefused("stop here")
+
+        monkeypatch.setattr(_loaders, "render_page", recorded)
+        draw = _loaders.PageDraw(**self.fields(tmp_path, memory_cap_bytes=1 << 20, timeout_s=5.0))
+
+        with pytest.raises(RenderRefused, match="stop here"):
+            draw.png_bytes()
+
+        assert calls == [{"dpi": 72, "password": "secret", "memory_cap_bytes": 1 << 20, "timeout_s": 5.0}]
+
+    @pytest.mark.parametrize(("width", "height"), [(600.0, LETTER_H), (LETTER_W, 800.0)])
+    def test_a_draw_of_another_size_than_its_page_is_refused(self, tmp_path, width, height):
+        path = letter(tmp_path, *mixed_items())
+        draw = _loaders.PageDraw(source=path, page_index=0, dpi=72, width_pt=width, height_pt=height)
+        expected = f"{int(width)} x {int(height)} px"
+
+        with pytest.raises(DatagruntPDFError, match=f"page 1 draws 612 x 792 px, not the {expected} of its page"):
+            draw.png_bytes()
+
+
+class TestPageImage:
+    """assemble_page gives the page an image drawn when read: 8-bit grey at the effective DPI (P2-A, spec §3.2)."""
+
+    def test_the_page_image_is_bound_and_never_drawn(self, tmp_path, monkeypatch):
+        def refuse(*args, **kwargs):
+            raise AssertionError("a page was drawn")
+
+        monkeypatch.setattr(_loaders, "render_page", refuse)
+        path = letter(tmp_path, *mixed_items())
+
+        image = assembled(path).page_image
+
+        assert image == PageImage(page_number=1, dpi=200.0, width_px=1700, height_px=2200)
+        assert (image.contrast_normalized, image.image_path, image.band_paths, image._band_loader) == (
+            False,
+            None,
+            (),
+            None,
+        )
+        draw = _loaders.PageDraw(source=path, page_index=0, dpi=200, width_pt=LETTER_W, height_pt=LETTER_H)
+        assert (image._loader.__self__, image._loader.__func__) == (draw, _loaders.PageDraw.png_bytes)
+        with pytest.raises(AssertionError, match="a page was drawn"):
+            image.read_bytes()
+
+    def test_its_bytes_are_the_page_drawn_at_its_dpi(self, tmp_path):
+        path = letter(tmp_path, *mixed_items())
+
+        image = assembled(path).page_image
+
+        drawn = render_page(path, 0, dpi=200, memory_cap_bytes=RENDER_CAP, timeout_s=RENDER_TIMEOUT)
+        assert grey_png(image.read_bytes()) == ("PNG", "L", (1700, 2200), drawn.pixels)
+        with pytest.raises(DatagruntPDFError, match="has no bands"):
+            image.read_bands()
+
+    def test_dpi_and_the_pixel_bound_are_options(self, tmp_path):
+        path = letter(tmp_path, *mixed_items())
+        dpi = effective_dpi(100, 262_144, LETTER_W, LETTER_H)
+
+        image = assembled(path, dpi=100, max_render_pixels=262_144).page_image
+
+        assert dpi < 100  # the case: the pixel bound lowers the dpi
+        assert (image.dpi, image.width_px, image.height_px) == (float(dpi), *render_size(LETTER_W, LETTER_H, dpi))
+        assert image._loader.__self__.dpi == dpi
+
+    def test_the_draw_holds_the_page_and_the_password(self, tmp_path):
+        path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=tuple(body_text(100.0)))] * 2)
+
+        image = assembled(path, 1, password="secret").page_image
+
+        draw = image._loader.__self__
+        assert (image.page_number, draw.page_index, draw.password) == (2, 1, "secret")
+
+    def test_a_turned_page_is_drawn_as_displayed(self, tmp_path):
+        image = assembled(letter(tmp_path, *mixed_items(), rotate=90)).page_image
+
+        assert (image.width_px, image.height_px) == (2200, 1700)
+        assert grey_png(image.read_bytes())[2] == (2200, 1700)
+
+    def test_a_page_that_cannot_be_drawn_has_no_image_and_says_why(self, tmp_path, monkeypatch):
+        def refused(*args):
+            raise RenderRefused("a 612.0 x 792.0 pt page renders 0 px tall at 200 DPI")
+
+        monkeypatch.setattr(assembly, "effective_dpi", refused)
+
+        page = assembled(letter(tmp_path, *mixed_items()))
+
+        assert page.page_image is None
+        assert page.warnings[-1] == ("the page has no page image: a 612.0 x 792.0 pt page renders 0 px tall at 200 DPI")
+        assert kinds(page) == ["Heading", "Paragraph", "KeyValue", "BulletList", "Figure", "Table", "Table"]
+
+    @pytest.mark.parametrize(
+        ("option", "bad", "error", "message"),
+        [
+            ("dpi", 35, ValueError, "dpi must be >= 36, got 35"),
+            ("dpi", True, TypeError, "dpi must be an int"),
+            ("max_render_pixels", 262_143, ValueError, "max_render_pixels must be >= 262144, got 262143"),
+            ("max_render_pixels", 1.5e7, TypeError, "max_render_pixels must be an int"),
+        ],
+    )
+    def test_bad_render_options_are_refused_before_any_work(self, tmp_path, monkeypatch, option, bad, error, message):
+        inputs_of_page = inputs(letter(tmp_path, *mixed_items()))
+
+        def no_work(*args, **kwargs):
+            raise AssertionError("the page was worked on")
+
+        monkeypatch.setattr(assembly, "page_figures", no_work)
+
+        with pytest.raises(error, match=f"^{message}"):
+            assemble_page(*inputs_of_page, source=tmp_path / "doc.pdf", **{option: bad})
 
 
 class TestFormHeaders:

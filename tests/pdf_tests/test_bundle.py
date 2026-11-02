@@ -27,7 +27,7 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 
-from datagrunt.pdf import bundle
+from datagrunt.pdf import _loaders, bundle
 from datagrunt.pdf.bundle import BUNDLE_FORMAT_VERSION, load_bundle, write_bundle
 from datagrunt.pdf.codec import document_from_json_bytes
 from datagrunt.pdf.elements import Figure, PDFDocument
@@ -858,7 +858,7 @@ class TestWorkers:
     @pytest.mark.parametrize("workers", [2, 8])
     def test_workers_pages_render_together_and_no_more_are_in_flight(self, tmp_path, monkeypatch, workers):
         path = paged_pdf(tmp_path, 10)
-        document = extract_document(path, ocr="never")
+        document = without_page_images(extract_document(path, ocr="never"))  # each page rendered by the bundle
         flight = InFlight()
         monkeypatch.setattr(bundle, "render_page", gathered(workers))
         monkeypatch.setattr(bundle, "ThreadPoolExecutor", flight.executor)
@@ -868,7 +868,7 @@ class TestWorkers:
 
     def test_a_slow_page_holds_one_thread_never_the_others(self, tmp_path, monkeypatch):
         path = paged_pdf(tmp_path, 5)
-        document = extract_document(path, ocr="never")
+        document = without_page_images(extract_document(path, ocr="never"))  # each page rendered by the bundle
         render, ended = last_first(5)
         monkeypatch.setattr(bundle, "render_page", render)
         returned = write(document, tmp_path / "out", path, workers=2)
@@ -929,16 +929,110 @@ class TestVisionRoute:
             "contrast_normalized": True,
         }
 
-    def test_a_digital_page_still_renders_at_dpi(self, tmp_path, monkeypatch):
+    def test_a_digital_page_is_bundled_from_its_drawn_image_at_its_own_dpi(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "text.pdf", [PageSpec(items=tuple(body_text(100.0)))])
         document = extract_document(path)
-        assert (document.pages[0].route, document.pages[0].page_image) == ("digital", None)
+        assert (document.pages[0].route, document.pages[0].page_image.dpi) == ("digital", 200.0)
         calls = spied(monkeypatch)
-        written = write(document, tmp_path / "out", path)
-        assert calls == [(0, DPI)]
+        written = write(document, tmp_path / "out", path)  # dpi=72: a page with an image keeps its own
+        assert calls == []  # drawn through its own loader, never rendered by the bundle
         image = written.pages[0].page_image
-        assert (image.dpi, image.contrast_normalized, image.band_paths) == (float(DPI), False, ())
-        assert load_bundle(tmp_path / "out") == written
+        assert (image.dpi, image.contrast_normalized, image.band_paths) == (200.0, False, ())
+        assert manifest_of(tmp_path / "out")["page_images"][0] == {
+            "page_number": 1,
+            "origin": "render",
+            "dpi": 200.0,
+            "contrast_normalized": False,
+        }
+        assert load_bundle(tmp_path / "out") == written == document
+
+
+def without_page_images(document: PDFDocument) -> PDFDocument:
+    """``document`` whose pages have no page image: each one the bundle renders, as every page was before P2-A."""
+    return dataclasses.replace(
+        document, pages=tuple(dataclasses.replace(page, page_image=None) for page in document.pages)
+    )
+
+
+def contents(root: Path) -> dict[str, bytes]:
+    """Every file under ``root`` and its bytes, by relative path."""
+    return {path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+
+def digital_pdf(directory: Path) -> Path:
+    """Two digital pages of prose: a letter page and a smaller landscape one."""
+    pages = [
+        PageSpec(items=tuple(body_text(100.0))),
+        PageSpec(width=400.0, height=300.0, items=tuple(body_text(60.0))),
+    ]
+    return build_pdf(directory / "digital.pdf", pages)
+
+
+class TestDrawnPageImages:
+    """A digital or hybrid page's own image is drawn when read (P2-A): the bundle writes it through its loader."""
+
+    def test_a_bundle_of_drawn_pages_is_byte_identical_to_one_that_renders_them(self, tmp_path, monkeypatch):
+        path = digital_pdf(tmp_path)
+        document = extract_document(path)
+        assert all(isinstance(page.page_image._loader.__self__, _loaders.PageDraw) for page in document.pages)
+        calls = spied(monkeypatch)
+
+        drawn = write_bundle(document, tmp_path / "drawn", source=path)
+        assert calls == []  # each page read through its own loader
+        rendered = write_bundle(without_page_images(document), tmp_path / "rendered", source=path)
+
+        assert sorted(calls) == [(0, 200), (1, 200)]  # each page rendered by the bundle, as before
+        assert contents(tmp_path / "drawn") == contents(tmp_path / "rendered")
+        assert drawn == rendered == document
+        assert load_bundle(tmp_path / "drawn") == drawn
+
+    def test_a_drawn_page_image_is_recorded_as_a_render_without_bands(self, tmp_path):
+        path = digital_pdf(tmp_path)
+        document = extract_document(path)
+        assert [type(page.page_image._loader.__self__) for page in document.pages] == [_loaders.PageDraw] * 2
+
+        written = write_bundle(document, tmp_path / "out", source=path)
+
+        render = {"origin": "render", "dpi": 200.0, "contrast_normalized": False}
+        assert manifest_of(tmp_path / "out")["page_images"] == [{"page_number": n, **render} for n in (1, 2)]
+        assert [page.page_image.band_paths for page in written.pages] == [(), ()]
+        assert not (tmp_path / "out" / "page_images" / "bands").exists()
+
+    def test_a_draw_that_fails_is_recorded_as_a_failed_render_is(self, tmp_path, monkeypatch):
+        path = digital_pdf(tmp_path)
+        document = extract_document(path)
+        assert [type(page.page_image._loader.__self__) for page in document.pages] == [_loaders.PageDraw] * 2
+
+        def failing(source, page_index, **kwargs):
+            raise RenderFailed(f"{source}: page {page_index + 1}: the render worker reached its memory cap")
+
+        monkeypatch.setattr(_loaders, "render_page", failing)
+        monkeypatch.setattr(bundle, "render_page", failing)
+
+        write_bundle(document, tmp_path / "drawn", source=path)
+        write_bundle(without_page_images(document), tmp_path / "rendered", source=path)
+
+        assert contents(tmp_path / "drawn") == contents(tmp_path / "rendered")
+        assert [entry["reason"] for entry in manifest_of(tmp_path / "drawn")["missing"]] == [
+            f"the page was not rendered: RenderFailed: {path}: page {n}: the render worker reached its memory cap"
+            for n in (1, 2)
+        ]
+
+    def test_a_draw_from_another_file_is_not_written(self, tmp_path):
+        path = digital_pdf(tmp_path)
+        copy = tmp_path / "copy.pdf"
+        copy.write_bytes(path.read_bytes())
+        document = extract_document(copy)
+
+        with pytest.warns(UserWarning) as caught:
+            written = write_bundle(document, tmp_path / "out", source=path)
+
+        renders = f"renders from {copy.resolve()}, not from the source {path.resolve()}"
+        assert [str(item.message) for item in caught] == [
+            f"page {n}'s own image {renders}: no page image is written for it" for n in (1, 2)
+        ]
+        assert [page.page_image for page in written.pages] == [None, None]
+        assert [entry["page_number"] for entry in manifest_of(tmp_path / "out")["missing"]] == [1, 2]
 
 
 class TestExtractionParams:

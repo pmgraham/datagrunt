@@ -1219,6 +1219,8 @@ class Page:
             tuple order and ``element_id`` is unique. An element is flagged
             ``"off_page"`` exactly when its bbox lies outside the page.
         page_image: The rendered page, if one was made; same ``page_number``.
+            Extraction gives every page one it can draw: a digital or hybrid
+            page's is drawn when read; a vision page's is its OCR render.
         integrity_verified: True if the elements passed the integrity check.
         error: Why extraction failed; set exactly when ``status == "error"``.
         warnings: Non-fatal problems met while extracting the page.

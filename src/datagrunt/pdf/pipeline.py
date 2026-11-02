@@ -46,7 +46,8 @@ a window before step 4 for any):
    never dropped), and it warns ``background not checked: ...``. A render
    call that raises instead is each of its pages' step-5 failure.
 4. The route: a digital or hybrid page is A4a's lattice tables, then A4b's
-   :func:`~datagrunt.pdf.assembly.assemble_page`; a vision page is A5b's
+   :func:`~datagrunt.pdf.assembly.assemble_page`, with ``dpi`` and
+   ``max_render_pixels`` for its lazy ``page_image``; a vision page is A5b's
    :func:`~datagrunt.pdf.vision.vision_page`'s (render and OCR: ``"ok"``,
    or ``"ocr_unavailable"`` with its digital text when OCR cannot read it);
    a page A2 could not read is ``fallback_page``'s (step 1). Every render
@@ -208,7 +209,7 @@ from pathlib import Path
 from typing import IO, BinaryIO, NamedTuple, get_args
 
 from datagrunt.pdf._memory_cap import ending
-from datagrunt.pdf._options import MIN_IMAGE_DIMENSION, OcrMode, VisionOptions
+from datagrunt.pdf._options import DPI, MAX_RENDER_PIXELS, MIN_IMAGE_DIMENSION, OcrMode, VisionOptions
 from datagrunt.pdf._process import (
     MAX_REQUEST_BYTES,
     REAP_TIMEOUT_S,
@@ -290,10 +291,11 @@ class PipelineOptions:
         workers: Worker processes to extract pages with (>= 1); 1 extracts
             every page in one worker.
         ocr: ``"auto"``, ``"always"`` or ``"never"`` (A3's routing option).
-        dpi: The page render's target DPI (>= 36). A5b renders with it.
+        dpi: The page render's target DPI (>= 36): a digital or hybrid
+            page's image is drawn at it (A4b's lazy ``page_image``).
         vision_dpi: A vision page's render DPI (>= ``dpi``). A5b renders with it.
         max_render_pixels: The pixel bound of any render (>= 262,144, 512 x
-            512). A5b renders within it.
+            512). A4b's page images and A5b render within it.
         min_image_dimension: The smallest image side, in pixels, that is a
             figure (>= 1).
         strict: Raise :class:`~datagrunt.pdf.exceptions.PDFCorruptError` on a
@@ -308,9 +310,9 @@ class PipelineOptions:
 
     workers: int = 1
     ocr: OcrMode = "auto"
-    dpi: int = 200
+    dpi: int = DPI
     vision_dpi: int = 300
-    max_render_pixels: int = 16_000_000
+    max_render_pixels: int = MAX_RENDER_PIXELS
     min_image_dimension: int = MIN_IMAGE_DIMENSION
     strict: bool = False
 

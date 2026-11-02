@@ -20,7 +20,7 @@ import pyarrow.parquet as pq
 import pytest
 from PIL import Image
 
-from datagrunt.pdf import bundle, writer
+from datagrunt.pdf import _loaders, bundle, writer
 from datagrunt.pdf.bundle import load_bundle
 from datagrunt.pdf.codec import document_from_json_bytes, document_to_json_bytes
 from datagrunt.pdf.elements import Paragraph, PDFDocument
@@ -908,8 +908,11 @@ class TestExtractImagesFromAPdf:
         assert [path.read_bytes() for path in paths] == [figure.read_bytes() for figure in figures]
 
 
-def spied_renders(monkeypatch, real=fake_render) -> list:
-    """Record each bundle render_page call (source, page index, dpi, password, cap, timeout); let ``real`` run."""
+def spied_renders(monkeypatch, real=fake_render, module=bundle) -> list:
+    """Record each ``module``'s render_page call (source, page index, dpi, password, cap, timeout); let ``real`` run.
+
+    The bundle's own renders are ``bundle``'s; a page image drawn when read (P2-A) is ``_loaders``'.
+    """
     calls: list = []
 
     def spy(src, page_index, **kwargs):
@@ -918,7 +921,7 @@ def spied_renders(monkeypatch, real=fake_render) -> list:
         )
         return real(src, page_index, **kwargs)
 
-    monkeypatch.setattr(bundle, "render_page", spy)
+    monkeypatch.setattr(module, "render_page", spy)
     return calls
 
 
@@ -1085,7 +1088,7 @@ class TestRenderPagesAsImages:
 class TestWriteBundle:
     def test_it_is_the_bundle_of_the_writers_document_and_options(self, tmp_path, monkeypatch):
         source = source_pdf(tmp_path)
-        calls = spied_renders(monkeypatch)
+        calls = spied_renders(monkeypatch, render_page, _loaders)  # each page's own image, drawn when read (P2-A)
         made = PDFWriter(source, password=None, dpi=72, vision_dpi=100, max_render_pixels=1_000_000, ocr="never")
         returned = made.write_bundle(tmp_path / "out")
         assert load_bundle(tmp_path / "out") == returned
@@ -1113,7 +1116,7 @@ class TestWriteBundle:
             return bundle.write_bundle(document, output_dir, **options)
 
         monkeypatch.setattr(writer, "write_bundle", spy)
-        calls = spied_renders(monkeypatch)
+        calls = spied_renders(monkeypatch, render_page, _loaders)  # each page's own image, drawn when read (P2-A)
         PDFWriter(source, password="pw", ocr="never", dpi=72).write_bundle(tmp_path / "out")
         assert bundled == [(source, "pw")]
         assert sorted(call[1] for call in calls) == [0, 1, 2, 3] and {call[3] for call in calls} == {"pw"}

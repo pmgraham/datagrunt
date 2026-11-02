@@ -391,4 +391,6 @@ def _assembled_page(raw: RawPage, assessment: PageAssessment, source: PDFSource,
         source=source.path,
         password=source.password,
         min_image_dimension=options.min_image_dimension,
+        dpi=options.dpi,
+        max_render_pixels=options.max_render_pixels,
     )
