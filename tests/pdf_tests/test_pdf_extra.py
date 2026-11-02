@@ -9,6 +9,7 @@ import json
 import subprocess
 import sys
 import textwrap
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -142,11 +143,7 @@ def test_another_import_failure_propagates_unmasked():
 
 
 def _pyproject() -> dict:
-    """pyproject.toml, parsed (tomllib from Python 3.11; tomli, mypy's dependency, on 3.10)."""
-    try:
-        import tomllib
-    except ModuleNotFoundError:
-        tomllib = pytest.importorskip("tomli")
+    """pyproject.toml, parsed."""
     return tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
 
 
@@ -154,17 +151,14 @@ def test_pdf_extra_is_exactly_pypdfium2_and_pillow():
     assert _pyproject()["project"]["optional-dependencies"]["pdf"] == ["pypdfium2>=5.9.0", "Pillow>=12.2.0"]
 
 
-def test_core_dependencies_and_python_floor_are_unchanged():
-    project = _pyproject()["project"]
-
-    assert project["dependencies"] == [
+def test_core_dependencies_are_unchanged():
+    assert _pyproject()["project"]["dependencies"] == [
         "duckdb>=1.5.3",
         "polars>=1.41.2",
         "pyarrow>=24.0.0",
         "XlsxWriter>=3.2.9",
         "fastexcel>=0.20.2",
     ]
-    assert project["requires-python"] == ">=3.10"
 
 
 def test_no_mypy_override_names_a_removed_library():

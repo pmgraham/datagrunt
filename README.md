@@ -48,6 +48,8 @@ To install Datagrunt using `uv`:
 uv pip install datagrunt
 ```
 
+Datagrunt 5.0 requires Python 3.11 or newer.
+
 > **PDF parsing** is an optional extra — install it with `uv pip install "datagrunt[pdf]"`. See [PDF parsing](#pdf-parsing) below for details and OCR setup.
 
 ## Quick Start
