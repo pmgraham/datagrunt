@@ -365,6 +365,78 @@ class TestKeyValues:
         assert described(read_items(tmp_path, *lines_of(texts))) == [("paragraph", " ".join(texts))]
 
 
+# The 2026-11-02 audit's P2-C case: two lines of prose whose first starts "Operating envelope:", the second wrapped
+# from it.
+ENVELOPE = (
+    "Operating envelope: -40°C to +185°C at rated speed and load. Lubrication conforms to",
+    "ISO VG-32 turbine oil with an oil-mist feed at 2.5 bar.",
+)
+# The corpus datasheets' stream pairs, and the two longest values of their parameter tables (53 chars).
+DATASHEET_PAIRS = (
+    ("Document", "DS-GSK-PTFE-3IN-150"),
+    ("Revision", "C.3"),
+    ("Issue Date", "2025-03-27"),
+    ("Category", "Gasket"),
+    ("Certifications", "IEC 60584-1, ASTM E230, NIST traceable cert available"),
+    ("Operating Medium", "Filtered compressed air, lubricated or non-lubricated"),
+)
+
+
+def one_line(text: str) -> list[tuple]:
+    """``text`` as one line of 6 pt chars, classified."""
+    return described(classify_blocks((block(line(cell(text, 10.0, 10.0))),)))
+
+
+class TestProseIsNoPair:
+    """A ``Key: Value`` whose value is prose, two sentences or past 80 chars, is a paragraph (P2-C)."""
+
+    def test_the_audits_paragraph_is_a_paragraph(self, tmp_path):
+        assert described(read_items(tmp_path, *lines_of(ENVELOPE))) == [("paragraph", " ".join(ENVELOPE))]
+
+    def test_the_corpus_datasheet_pairs_stay_pairs(self, tmp_path):
+        texts = tuple(f"{key}: {value}" for key, value in DATASHEET_PAIRS)
+
+        assert described(read_items(tmp_path, *lines_of(texts))) == [
+            ("key_value", key, value) for key, value in DATASHEET_PAIRS
+        ]
+
+    @pytest.mark.parametrize(
+        "length,kind", [pytest.param(80, "key_value", id="80-chars"), pytest.param(81, "paragraph", id="81-chars")]
+    )
+    def test_a_value_is_at_most_80_chars(self, length, kind):
+        assert one_line("Note: " + "v" * length)[0][0] == kind
+
+    def test_the_cap_weighs_the_whole_value_with_its_wrapped_lines(self):
+        # Each line's value is under 80 chars; wrapped together they are 87.
+        pair, after = line(cell("Ab: " + "c" * 40, 10.0, 10.0)), line(cell("e" * 46, 10.0, 24.0))
+
+        assert described(classify_blocks((block(pair, after),))) == [("paragraph", f"Ab: {'c' * 40} {'e' * 46}")]
+
+    @pytest.mark.parametrize(
+        "value,kind",
+        [
+            pytest.param("Fill the housing before use. Check the level every week.", "paragraph", id="two-sentences"),
+            pytest.param("Fill the housing now! Check the level every week.", "paragraph", id="after-an-exclamation"),
+            pytest.param("one two three four. five six seven eight", "paragraph", id="two-of-four-words"),
+            pytest.param("one two three. five six seven eight", "key_value", id="three-words-then-four"),
+            pytest.param("J. Smith, Acme Inc. Springfield", "key_value", id="initials-and-abbreviations"),
+            pytest.param("approx. 25 mm by 40 mm", "key_value", id="an-abbreviation-first"),
+            pytest.param("A.2", "key_value", id="a-revision"),
+            pytest.param("Fill the housing with oil before use.", "key_value", id="one-sentence"),
+        ],
+    )
+    def test_a_value_of_two_sentences_of_4_words_or_more_is_prose(self, value, kind):
+        assert one_line(f"Note: {value}")[0][0] == kind
+
+    def test_a_pair_after_a_prose_one_in_its_block_stays_a_pair(self, tmp_path):
+        texts = ("Note: Fill the housing before use. Check the level every week.", "Weight: 5 kg")
+
+        assert described(read_items(tmp_path, *lines_of(texts))) == [
+            ("paragraph", texts[0]),
+            ("key_value", "Weight", "5 kg"),
+        ]
+
+
 class TestLists:
     """BulletList: one item per marker, continuation lines joining their item, ordered when numbered."""
 

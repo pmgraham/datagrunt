@@ -539,6 +539,19 @@ class TestRejections:
             ("key_value", key, value) for key, value in cells
         ]
 
+    def test_a_form_cell_whose_value_is_prose_is_a_paragraph(self):
+        # P2-C: every cell reads "Key: Value", but one value is two sentences of prose.
+        note = "Note: Pay within 30 days. Late payment accrues interest."
+        cells = ("Invoice: 10442", "Date: 2024-03-01", "Terms: 30 days", note)
+        pieces = tuple(chars(text, 10.0 + 150.0 * (at % 2), 10.0 + 14.0 * (at // 2)) for at, text in enumerate(cells))
+
+        assert described(stream_layout(pieces, NO_TABLES, width_pt=612.0, height_pt=792.0)) == [
+            ("key_value", "Invoice", "10442"),
+            ("key_value", "Date", "2024-03-01"),
+            ("key_value", "Terms", "30 days"),
+            ("paragraph", note),
+        ]
+
     @pytest.mark.parametrize(
         "rows",
         [

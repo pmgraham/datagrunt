@@ -1711,6 +1711,13 @@ _MAX_KEY_CHARS = 40
 _SENTENCE_END = frozenset(".!?")
 # A key ends at the first colon before whitespace or the end of the line: "10:30" or "https://" holds none.
 _KEY_END = re.compile(r":(?=\s|$)")
+# A pair's value is prose, so its lines are a paragraph (P2-C, the 2026-11-02 audit), when it is longer than this
+# many chars: on the corpus, the pairs' values run to 19 chars and the datasheets' parameter-table values to 53;
+# the prose read as pairs before this rule ran 158 to 299 ...
+_MAX_VALUE_CHARS = 80
+# ... or when it holds two sentences of at least _PROSE_WORDS words each. A sentence ends at ".", "!" or "?" before
+# whitespace, so "J. Smith" or "approx. 25 mm" (a first sentence of one word) is no prose.
+_SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1841,7 +1848,8 @@ def classify_blocks(blocks: tuple[TextBlock, ...]) -> tuple[StreamItem, ...]:
        ``Key: Value``, the key at most :data:`_MAX_KEY_CHARS` chars with no
        sentence-ending punctuation; each such line starts a pair, the
        lines after it continue its value while they wrap, and a paragraph
-       then runs to the block's end.
+       then runs to the block's end. A pair whose value is prose
+       (:func:`_is_prose`) is a paragraph of its lines.
     4. Else a paragraph.
 
     Items keep their blocks' order and every char of them once, in their
@@ -1983,6 +1991,17 @@ def _key_value(text: str) -> tuple[str, str] | None:
     return key, text[end.end() :].strip()
 
 
+def _is_prose(value: str) -> bool:
+    """True if a pair's ``value`` is prose: over :data:`_MAX_VALUE_CHARS` chars, or two sentences of prose.
+
+    A sentence of prose holds at least :data:`_PROSE_WORDS` words, as a
+    table cell of running text does.
+    """
+    if len(value) > _MAX_VALUE_CHARS:
+        return True
+    return sum(len(part.split()) >= _PROSE_WORDS for part in _SENTENCE_BREAK.split(value)) >= 2
+
+
 def _pairs_and_paragraphs(found: TextBlock) -> list[StreamKeyValue | StreamParagraph]:
     """The block as key-value pairs and paragraphs (:func:`classify_blocks`, rules 3 and 4).
 
@@ -2031,12 +2050,17 @@ def _length(boxes: list[Box]) -> float:
 
 
 def _pair_or_paragraph(parsed: tuple[str, str] | None, lines: list[TextLine]) -> StreamKeyValue | StreamParagraph:
-    """A pair over ``lines`` (``parsed`` from the first: key, then value and the other lines), or a paragraph."""
-    bbox = _bbox(union_box(tuple(_plain(item.bbox) for item in lines)))
-    if parsed is None:
-        return StreamParagraph(text=" ".join(item.text for item in lines), bbox=bbox, pieces=_lines_pieces(lines))
-    value = " ".join(part for part in (parsed[1], *(item.text.strip() for item in lines[1:])) if part)
-    return StreamKeyValue(key=parsed[0], value=value, bbox=bbox, pieces=_lines_pieces(lines))
+    """A pair over ``lines`` (``parsed`` from the first: key, then value and the other lines), or a paragraph.
+
+    A paragraph if ``parsed`` is None, or if the value, its wrapped lines
+    and all, is prose (:func:`_is_prose`).
+    """
+    bbox, pieces = _bbox(union_box(tuple(_plain(item.bbox) for item in lines))), _lines_pieces(lines)
+    if parsed is not None:
+        value = " ".join(part for part in (parsed[1], *(item.text.strip() for item in lines[1:])) if part)
+        if not _is_prose(value):
+            return StreamKeyValue(key=parsed[0], value=value, bbox=bbox, pieces=pieces)
+    return StreamParagraph(text=" ".join(item.text for item in lines), bbox=bbox, pieces=pieces)
 
 
 # Stream tables and the page's reading order (spec §3.3 step 3, Pass B).
@@ -2503,9 +2527,9 @@ def _is_pair(text: str) -> bool:
 
 
 def _cell_item(found: TextCell) -> StreamKeyValue | StreamParagraph:
-    """A masthead cell as a pair, if it reads ``Key: Value``, else a paragraph."""
+    """A masthead cell as a pair if it reads ``Key: Value`` of no prose (:func:`_is_prose`), else a paragraph."""
     parsed = _key_value(found.text)
-    if parsed is None:
+    if parsed is None or _is_prose(parsed[1]):
         return StreamParagraph(text=found.text, bbox=found.bbox, pieces=found.pieces)
     return StreamKeyValue(key=parsed[0], value=parsed[1], bbox=found.bbox, pieces=found.pieces)
 
