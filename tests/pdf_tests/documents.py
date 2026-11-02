@@ -141,7 +141,7 @@ def first_page(figure_loader: Loader | None = None) -> Page:
 def second_page(figure_loader: Loader | None = None, other_loader: Loader | None = None) -> Page:
     """A nested heading, a headerless table continuing page 1's, an unordered list and two figures."""
     elements: tuple[DocumentElement, ...] = (
-        Heading(**ids(2, 0, DETAILS), level=2, text="Details"),
+        Heading(**ids(2, 0, DETAILS), level=2, text="Details", font_size_pt=14.5, is_bold=True),
         Table(
             **ids(2, 1, DETAILS),
             headers=(),

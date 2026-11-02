@@ -244,6 +244,43 @@ class TestHeadings:
 
         assert [type(item) for item in classify_blocks((*words, prose))] == [StreamHeading] * 4 + [StreamParagraph]
 
+    @pytest.mark.parametrize(
+        ("size", "tier"), [(14.2, 14.0), (14.3, 14.5), (14.7, 14.5), (14.8, 15.0), (18.0, 18.0), (12.6, 12.5)]
+    )
+    def test_a_heading_carries_its_first_lines_size_to_half_a_point(self, size, tier):
+        prose = block(line(cell("x" * 80, 10.0, 200.0), font_size_pt=10.0))
+
+        (heading, _) = classify_blocks((sized("Overview", size), prose))
+
+        assert (heading.font_size_pt, heading.is_bold) == (tier, False)
+
+    def test_a_size_under_a_quarter_point_is_the_least_tier(self):
+        # A1 needs a size over 0: 0.2 pt rounds to 0, so it is 0.5 pt, the least tier.
+        prose = block(line(cell("x" * 80, 10.0, 200.0), font_size_pt=0.1))
+
+        (heading, _) = classify_blocks((sized("Overview", 0.2), prose))
+
+        assert heading.font_size_pt == 0.5
+
+    @pytest.mark.parametrize(("first", "second"), [(True, False), (False, True)])
+    def test_a_heading_carries_its_first_lines_boldness(self, first, second):
+        two = block(
+            line(cell("Bearing", 10.0, 10.0), font_size_pt=16.0, is_bold=first),
+            line(cell("Assembly", 10.0, 30.0), font_size_pt=16.0, is_bold=second),
+        )
+        prose = block(line(cell("x" * 80, 10.0, 200.0), font_size_pt=10.0))
+
+        (heading, _) = classify_blocks((two, prose))
+
+        assert (heading.text, heading.font_size_pt, heading.is_bold) == ("Bearing Assembly", 16.0, first)
+
+    def test_a_bold_line_carries_its_tier_end_to_end(self, tmp_path):
+        items = read_items(tmp_path, TextRun("Clearings", 72.0, 80.0, font="Helvetica-Bold", size=10.0), *body(100.0))
+
+        assert [(item.font_size_pt, item.is_bold) for item in items if isinstance(item, StreamHeading)] == [
+            (10.0, True)
+        ]
+
     def test_the_body_size_is_the_upper_median(self):
         # 20 chars at 10 pt and 20 at 12 pt: the upper median is 12 pt, so the 12 pt line is no heading.
         items = classify_blocks((sized("a" * 20, 10.0), sized("b" * 20, 12.0, y=30.0)))
@@ -591,7 +628,7 @@ SHARED_CASES = [
     pytest.param({"bbox": box(40.0, 10.0, 60.0, 22.0)}, ValueError, OUTSIDE_MESSAGE, id="piece-outside"),
 ]
 RECORDS = {
-    StreamHeading: {"text": "Name", "level": 1},
+    StreamHeading: {"text": "Name", "level": 1, "font_size_pt": 14.0, "is_bold": False},
     StreamParagraph: {"text": "Name"},
     StreamKeyValue: {"key": "Name", "value": ""},
     StreamListItem: {"marker": "•", "text": "Name"},
@@ -601,6 +638,15 @@ OWN_CASES = [
     pytest.param(StreamHeading, {"level": 0}, ValueError, "level must be >= 1, got 0", id="heading-level-0"),
     pytest.param(StreamHeading, {"level": 7}, ValueError, "level must be <= 6, got 7", id="heading-level-7"),
     pytest.param(StreamHeading, {"level": True}, TypeError, "level must be an int, got True (bool)", id="level-bool"),
+    pytest.param(StreamHeading, {"font_size_pt": 0.0}, ValueError, "font_size_pt must be > 0, got 0.0", id="size-0"),
+    pytest.param(
+        StreamHeading,
+        {"font_size_pt": "14"},
+        TypeError,
+        "font_size_pt must be an int or float, got '14' (str)",
+        id="size-str",
+    ),
+    pytest.param(StreamHeading, {"is_bold": 1}, TypeError, "is_bold must be a bool, got 1 (int)", id="bold-int"),
     pytest.param(StreamParagraph, {"text": None}, TypeError, "text must be a str, got None (NoneType)", id="paragraph"),
     pytest.param(StreamKeyValue, {"key": ""}, ValueError, "key must be a non-blank str, got ''", id="key-blank"),
     pytest.param(

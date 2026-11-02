@@ -306,6 +306,36 @@ class TestHeading:
         with pytest.raises(ValueError, match=r"scope_path must end with the heading's own text 'Overview'"):
             _element(Heading, scope_path=scope_path)
 
+    def test_its_tier_is_unset_by_default(self):
+        heading = _element(Heading)
+
+        assert (heading.font_size_pt, heading.is_bold) == (None, None)
+
+    @pytest.mark.parametrize(("size", "bold"), [(14.5, True), (18, False)])
+    def test_its_tier_is_its_size_and_boldness(self, size, bold):
+        heading = _element(Heading, font_size_pt=size, is_bold=bold)
+
+        assert (heading.font_size_pt, heading.is_bold) == (float(size), bold)
+        assert type(heading.font_size_pt) is float
+
+    @pytest.mark.parametrize(("size", "bold"), [(14.0, None), (None, False)])
+    def test_its_size_and_boldness_are_set_together(self, size, bold):
+        with pytest.raises(ValueError, match="font_size_pt and is_bold are both set or both None"):
+            _element(Heading, font_size_pt=size, is_bold=bold)
+
+    @pytest.mark.parametrize(
+        ("size", "bold", "error", "message"),
+        [
+            (0.0, False, ValueError, "font_size_pt must be > 0, got 0.0"),
+            (float("inf"), False, ValueError, "font_size_pt must be finite"),
+            (True, False, TypeError, "font_size_pt must be an int or float"),
+            (14.0, 1, TypeError, "is_bold must be a bool, got 1"),
+        ],
+    )
+    def test_a_bad_tier_is_rejected(self, size, bold, error, message):
+        with pytest.raises(error, match=message):
+            _element(Heading, font_size_pt=size, is_bold=bold)
+
     @pytest.mark.parametrize(("level", "expected"), [(1, "# Overview"), (3, "### Overview"), (6, "###### Overview")])
     def test_to_markdown(self, level, expected):
         assert _element(Heading, level=level).to_markdown() == expected

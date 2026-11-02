@@ -322,7 +322,7 @@ def assemble_page(
        ``element_id`` its canonical id; ``scope_path`` is ``()`` (A6 sets
        it), but a heading's is its own text (A1: a heading opens its
        scope). Headings, paragraphs, key-values and lists convert their
-       fields (a list keeps its markers); a hidden or recovered line is a
+       fields (a heading keeps its tier, a list its markers); a hidden or recovered line is a
        :class:`~datagrunt.pdf.elements.Paragraph` with its reasons (a
        recovered shadow or outline copy of visible text is ``duplicate``,
        so it reads once; a recovered line with no reason is visible text:
@@ -495,7 +495,15 @@ def _element(item: PageItem, order: int, drafts: tuple[FigureDraft, ...], geomet
     if isinstance(item, FigureSlot):
         return drafts[item.index].figure(page_number=page, reading_order=order)
     if isinstance(item, StreamHeading):
-        return Heading(**ids, bbox=item.bbox, level=item.level, text=item.text, scope_path=(item.text,))
+        return Heading(
+            **ids,
+            bbox=item.bbox,
+            level=item.level,
+            text=item.text,
+            scope_path=(item.text,),
+            font_size_pt=item.font_size_pt,
+            is_bold=item.is_bold,
+        )
     if isinstance(item, StreamParagraph):
         return Paragraph(**ids, bbox=item.bbox, text=item.text)
     if isinstance(item, ApartLine):

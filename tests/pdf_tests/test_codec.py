@@ -117,6 +117,20 @@ class TestRoundTrip:
         assert loaded.pages[1].height_pt == 842.25
         assert loaded.pages[0].elements[6].column_centres == (100.0, 200.5)
 
+    def test_a_headings_tier_round_trips_and_an_unset_one_is_null(self):
+        data = encoded()
+
+        tiered, untiered = data["pages"][1]["elements"][0], data["pages"][0]["elements"][2]
+        assert (tiered["font_size_pt"], tiered["is_bold"]) == (14.5, True)
+        assert (untiered["font_size_pt"], untiered["is_bold"]) == (None, None)
+        loaded = document_from_json(data)
+        assert (loaded.pages[1].elements[0].font_size_pt, loaded.pages[1].elements[0].is_bold) == (14.5, True)
+        assert (loaded.pages[0].elements[2].font_size_pt, loaded.pages[0].elements[2].is_bold) == (None, None)
+
+    def test_the_format_version_stays_1(self):
+        # Heading's tier is new, but the format is unpublished until 5.0: its keys change and its version does not.
+        assert VERSION == 1 and encoded()["version"] == 1
+
     def test_column_intervals_are_pairs_in_the_json_and_tuples_back(self):
         data = encoded()
 
@@ -410,6 +424,11 @@ class TestBadValues:
         [
             (("pages", 0, "elements", 2, "level"), 7, ValueError, "level must be <= 6"),
             (("pages", 0, "elements", 2, "level"), True, TypeError, "level must be an int"),
+            (("pages", 1, "elements", 0, "is_bold"), None, ValueError, "both set or both None"),
+            (("pages", 0, "elements", 2, "font_size_pt"), 12.0, ValueError, "both set or both None"),
+            (("pages", 1, "elements", 0, "font_size_pt"), 0, ValueError, "font_size_pt must be > 0"),
+            (("pages", 1, "elements", 0, "font_size_pt"), "14", TypeError, "font_size_pt must be an int or float"),
+            (("pages", 1, "elements", 0, "is_bold"), "yes", TypeError, "is_bold must be a bool"),
             (("pages", 0, "page_number"), "1", TypeError, "page_number must be an int"),
             (("pages", 0, "elements", 0, "bbox", "x0"), 600.0, ValueError, "x0 must be <= x1"),
             (("pages", 0, "elements", 0, "bbox", "y1"), "90", TypeError, "y1 must be an int or float"),

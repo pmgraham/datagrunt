@@ -1743,15 +1743,24 @@ class _StreamText:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class StreamHeading(_StreamText):
-    """A heading of the stream text, ``level`` 1-6: A1's ``Heading`` before its id and scope."""
+    """A heading of the stream text, ``level`` 1-6: A1's ``Heading`` before its id and scope.
+
+    ``font_size_pt`` (its first line's size to 0.5 pt) and ``is_bold`` (its
+    first line's) are its tier: ``level`` ranks the page's heading sizes, and
+    A6 ranks every heading's tier across the document.
+    """
 
     text: str
     level: int
+    font_size_pt: float
+    is_bold: bool
 
     def _validate_fields(self) -> None:
         non_blank_str("text", self.text)
         if int_at_least("level", self.level, 1) > _MAX_LEVEL:
             raise ValueError(f"level must be <= {_MAX_LEVEL}, got {self.level}")
+        object.__setattr__(self, "font_size_pt", positive_float("font_size_pt", self.font_size_pt))
+        strict_bool("is_bold", self.is_bold)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1838,7 +1847,9 @@ def classify_blocks(blocks: tuple[TextBlock, ...]) -> tuple[StreamItem, ...]:
        or it is one bold line; either way its text
        is at most :data:`_HEADING_MAX_CHARS` chars, does not end with a
        full stop and does not start with a bullet. Levels rank the page's
-       heading sizes, largest first, from 1 to :data:`_MAX_LEVEL`.
+       heading sizes, largest first, from 1 to :data:`_MAX_LEVEL`. Each
+       heading carries its first line's size, to 0.5 pt, and boldness: its
+       tier, which A6 ranks across the document (P1-A).
     2. A list item: its text starts with a list marker
        (:data:`_LIST_MARKER`) and holds text after it; its continuation
        lines are the block's other lines (the merge starts a block at each
@@ -1892,10 +1903,7 @@ def _classified(blocks: list[TextBlock], headings: list[bool], levels: dict[int,
         if entry is not None:
             pending.append(entry)
         elif is_heading:
-            level = levels[_tenths(found.lines[0].font_size_pt)]
-            items.append(
-                StreamHeading(text=found.text, level=level, bbox=found.bbox, pieces=_lines_pieces(found.lines))
-            )
+            items.append(_stream_heading(found, levels))
         else:
             items.extend(_pairs_and_paragraphs(found))
     if pending:
@@ -1903,9 +1911,31 @@ def _classified(blocks: list[TextBlock], headings: list[bool], levels: dict[int,
     return items
 
 
+def _stream_heading(found: TextBlock, levels: dict[int, int]) -> StreamHeading:
+    """The heading block as a StreamHeading: its page level, and its first line's size (to 0.5 pt) and boldness."""
+    first = found.lines[0]
+    return StreamHeading(
+        text=found.text,
+        level=levels[_tenths(first.font_size_pt)],
+        font_size_pt=_half_points(first.font_size_pt),
+        is_bold=first.is_bold,
+        bbox=found.bbox,
+        pieces=_lines_pieces(found.lines),
+    )
+
+
 def _tenths(size: float) -> int:
     """A font size (to 0.1 pt, as lines hold it) in tenths of a point: exact for comparing."""
     return round(size * 10)
+
+
+def _half_points(size: float) -> float:
+    """A font size (to 0.1 pt) to the nearest 0.5 pt, at least 0.5 pt: a heading's tier.
+
+    Its tenths over 5 never end in .5, so the rounding has no ties. A size
+    under 0.25 pt is 0.5 pt, the least tier: A1 needs a size over 0.
+    """
+    return max(1, round(_tenths(size) / 5)) / 2
 
 
 def _body_size(blocks: list[TextBlock]) -> int:

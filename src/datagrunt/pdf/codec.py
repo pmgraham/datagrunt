@@ -84,6 +84,7 @@ __all__ = [
 ]
 
 FORMAT = "datagrunt.pdf.document"
+# The format is unpublished until 5.0: a heading's tier (P1-A) changed its keys under version 1.
 VERSION = 1
 
 # The most JSON bytes read: A1's asset limit.
@@ -128,7 +129,7 @@ _SECTION_KEYS = ("heading", "scope_path", "page_span", "elements")
 # Each kind's own keys, after the shared _ELEMENT_KEYS.
 _KIND_KEYS: Mapping[str, tuple[str, ...]] = MappingProxyType(
     {
-        "heading": ("level", "text"),
+        "heading": ("level", "text", "font_size_pt", "is_bold"),
         "paragraph": ("text",),
         "key_value": ("key", "value"),
         "table": ("headers", "rows", "extraction_method", "continued_from_id", "column_centres", "column_intervals"),
@@ -519,7 +520,9 @@ def _element(name: str, value: object, root: Path | None) -> DocumentElement:
 
 
 def _heading(name: str, data: Json, shared: Json, root: Path | None) -> Heading:
-    return Heading(**shared, level=data["level"], text=data["text"])
+    return Heading(
+        **shared, level=data["level"], text=data["text"], font_size_pt=data["font_size_pt"], is_bold=data["is_bold"]
+    )
 
 
 def _paragraph(name: str, data: Json, shared: Json, root: Path | None) -> Paragraph:

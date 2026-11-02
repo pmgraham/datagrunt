@@ -544,6 +544,15 @@ class TestAssemblePage:
         assert (pair.key, pair.value) == ("Invoice", "10442")
         assert (bullets.items, bullets.markers, bullets.ordered) == (("first item", "second item"), ("•", "•"), False)
 
+    def test_a_heading_carries_its_tier(self, tmp_path):
+        items = (TextRun("Clearings", 72.0, 300.0, font="Helvetica-Bold", size=10.0), *body_text(320.0))
+
+        heading = assembled(letter(tmp_path, *mixed_items())).elements[0]
+        bold = assembled(letter(tmp_path, *items, name="bold.pdf")).elements[0]
+
+        assert (heading.text, heading.font_size_pt, heading.is_bold) == ("Results", 18.0, False)
+        assert (bold.text, bold.font_size_pt, bold.is_bold) == ("Clearings", 10.0, True)
+
     def test_an_ordered_list_keeps_its_markers(self, tmp_path):
         items = (TextRun("1. one", 72.0, 100.0, size=10.0), TextRun("2. two", 72.0, 114.0, size=10.0))
 

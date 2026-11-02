@@ -652,10 +652,17 @@ class Heading(_Element):
     A heading opens its own scope, so its ``scope_path`` includes its text:
     it is non-empty and ends with ``text`` (verbatim), after the texts of the
     headings enclosing it.
+
+    Its tier is ``font_size_pt``, its first line's font size to 0.5 pt, and
+    ``is_bold``, whether that line is bold: both set, or both None (a heading
+    with no tier, such as one built by hand). Extraction ranks ``level`` over
+    the document's tiers, so a level means the same prominence on every page.
     """
 
     level: int
     text: str
+    font_size_pt: float | None = None
+    is_bold: bool | None = None
 
     def _validate_fields(self) -> None:
         int_at_least("level", self.level, 1)
@@ -664,6 +671,17 @@ class Heading(_Element):
         non_blank_str("text", self.text)
         if not self.scope_path or self.scope_path[-1] != self.text:
             raise ValueError(f"scope_path must end with the heading's own text {self.text!r}, got {self.scope_path!r}")
+        self._validate_tier()
+
+    def _validate_tier(self) -> None:
+        """Require ``font_size_pt`` (finite, > 0) and ``is_bold`` (a bool) both set, or both None."""
+        if (self.font_size_pt is None) != (self.is_bold is None):
+            tier = f"{self.font_size_pt!r} and {self.is_bold!r}"
+            raise ValueError(f"font_size_pt and is_bold are both set or both None, got {tier}")
+        if self.font_size_pt is None:
+            return
+        object.__setattr__(self, "font_size_pt", positive_float("font_size_pt", self.font_size_pt))
+        strict_bool("is_bold", self.is_bold)
 
     def _render_markdown(self) -> str:
         """Render as an ATX heading on one line: the text's lines joined with spaces.

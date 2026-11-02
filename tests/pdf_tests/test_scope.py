@@ -259,6 +259,103 @@ class TestHeadingStack:
         assert paths(apply_scope(pages))[1] == ("p0001_e001", ("  Report\n2026 ",))
 
 
+def tiered(page_number, index, text, size, bold=False, *, level=1, hidden=False):
+    """A heading with its tier: its first line's size (to 0.5 pt) and boldness; ``level`` as its page ranked it."""
+    return dataclasses.replace(heading(page_number, index, level, text, hidden=hidden), font_size_pt=size, is_bold=bold)
+
+
+def levels(result):
+    """``(text, level)`` of every heading, in document order."""
+    found = (element for item in result.pages for element in item.elements)
+    return [(element.text, element.level) for element in found if isinstance(element, Heading)]
+
+
+class TestHeadingLevels:
+    """Rule 0 (P1-A): a tiered heading's level is its rank among the document's visible tiers, not its page's."""
+
+    def test_the_audits_case_nests_page_twos_section_under_page_ones_chapter(self):
+        # Page 2's largest heading is 14 pt, so its page ranked it 1: it popped page 1's open 18 pt chapter.
+        chapter = "1. Turbomachinery Bearing Assembly"
+        pages = (
+            page(1, tiered(1, 0, chapter, 18.0), para(1, 1), tiered(1, 2, "1.2 Schedule of Line Items", 14.0, level=2)),
+            page(2, tiered(2, 0, "1.3 Inspection Checklist", 14.0, level=1), para(2, 1)),
+        )
+
+        result = apply_scope(pages)
+
+        assert levels(result) == [(chapter, 1), ("1.2 Schedule of Line Items", 2), ("1.3 Inspection Checklist", 2)]
+        assert paths(result)[3:] == [
+            ("p0002_e000", (chapter, "1.3 Inspection Checklist")),
+            ("p0002_e001", (chapter, "1.3 Inspection Checklist")),
+        ]
+        assert result.pages[1].elements[0].to_markdown() == "## 1.3 Inspection Checklist"
+        assert [section.scope_path for section in result.sections][-1] == (chapter, "1.3 Inspection Checklist")
+
+    def test_bold_ranks_above_regular_at_one_size(self):
+        pages = (
+            page(1, tiered(1, 0, "Section A", 14.0), para(1, 1)),
+            page(2, tiered(2, 0, "Chapter", 14.0, bold=True), tiered(2, 1, "Section B", 14.0, level=1), para(2, 2)),
+        )
+
+        result = apply_scope(pages)
+
+        assert levels(result) == [("Section A", 2), ("Chapter", 1), ("Section B", 2)]
+        assert paths(result)[-1] == ("p0002_e002", ("Chapter", "Section B"))
+
+    def test_size_ranks_before_boldness(self):
+        pages = (page(1, tiered(1, 0, "Bold", 14.0, bold=True), tiered(1, 1, "Larger", 14.5, level=2)),)
+
+        assert levels(apply_scope(pages)) == [("Bold", 2), ("Larger", 1)]
+
+    def test_levels_stop_at_6(self):
+        sizes = (20.0, 19.0, 18.0, 17.0, 16.0, 15.0, 14.0, 13.0)
+        pages = tuple(page(number, tiered(number, 0, f"Size {size}", size)) for number, size in enumerate(sizes, 1))
+
+        assert [level for _, level in levels(apply_scope(pages))] == [1, 2, 3, 4, 5, 6, 6, 6]
+
+    def test_hidden_headings_take_no_rank(self):
+        # A hidden 24 pt heading would rank 1 and a hidden 16 pt one 3 if they counted: the visible ones keep 1 and 2.
+        pages = (
+            page(
+                1,
+                tiered(1, 0, "Huge secret", 24.0, hidden=True, level=1),
+                tiered(1, 1, "Chapter", 18.0, level=2),
+                tiered(1, 2, "Secret", 16.0, hidden=True, level=3),
+                tiered(1, 3, "Section", 14.0, level=4),
+                para(1, 4),
+            ),
+        )
+
+        result = apply_scope(pages)
+
+        # Each heading's level is 1 + the visible tiers above it; a hidden one's too, though it opens no scope.
+        assert levels(result) == [("Huge secret", 1), ("Chapter", 1), ("Secret", 2), ("Section", 2)]
+        assert paths(result)[-1] == ("p0001_e004", ("Chapter", "Section"))
+
+    def test_a_heading_without_a_tier_keeps_its_level_and_takes_no_rank(self):
+        pages = (
+            page(1, heading(1, 0, 3, "Built by hand"), tiered(1, 1, "Chapter", 18.0, level=2), para(1, 2)),
+            page(2, tiered(2, 0, "Section", 14.0, level=1), heading(2, 1, 1, "Also by hand"), para(2, 2)),
+        )
+
+        result = apply_scope(pages)
+
+        assert levels(result) == [("Built by hand", 3), ("Chapter", 1), ("Section", 2), ("Also by hand", 1)]
+        assert [item.font_size_pt for item in result.pages[0].elements[:2]] == [None, 18.0]
+
+    def test_a_ranked_heading_keeps_its_tier(self):
+        pages = (page(1, tiered(1, 0, "Chapter", 18.0, bold=True, level=4)),)
+
+        (ranked,) = apply_scope(pages).pages[0].elements
+
+        assert (ranked.level, ranked.font_size_pt, ranked.is_bold) == (1, 18.0, True)
+
+    def test_a_document_accepts_the_ranked_levels(self):
+        pages = (page(1, tiered(1, 0, "Chapter", 18.0)), page(2, tiered(2, 0, "Section", 14.0)))
+
+        assert document(apply_scope(pages)).headings[1].level == 2
+
+
 class TestHiddenHeadings:
     """A hidden heading never pushes or pops: hidden text cannot re-scope visible content."""
 
@@ -786,3 +883,21 @@ class TestBounds:
         assert len(result.sections) == 2_001
         assert sum(1 for _, link, _ in tables(result) if link is not None) == 1_999
         assert elapsed < 1.5, f"{elapsed:.2f} s"  # ~0.19 s here (8x headroom); 1 s left 5.4x once tables held intervals
+
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_20_000_headings_of_20_000_tiers_rank_within_1_5_seconds(self):
+        # Each heading its own tier: ranking is a binary search of the tiers a heading, never a scan of them.
+        pages = tuple(
+            page(
+                number,
+                *(tiered(number, index, f"H {number}.{index}", (number * 10 + index) / 2) for index in range(10)),
+            )
+            for number in range(1, 2_001)
+        )
+
+        started = time.perf_counter()
+        result = apply_scope(pages)
+        elapsed = time.perf_counter() - started
+
+        assert [level for _, level in levels(result)][:7] == [6, 6, 6, 6, 6, 6, 6]  # the smallest tiers, capped
+        assert elapsed < 1.5, f"{elapsed:.2f} s"  # ~0.12 s here (12x headroom); a scan of the tiers took 7.8 s

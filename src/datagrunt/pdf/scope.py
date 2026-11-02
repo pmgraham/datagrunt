@@ -6,8 +6,19 @@ pdfium function. A1 types are frozen, so changed elements and pages are
 rebuilt with :func:`dataclasses.replace`; element ids and reading order never
 change.
 
-:func:`apply_scope` applies four rules to pages 1..N in document order, each in one walk:
+:func:`apply_scope` applies its rules to pages 1..N in document order, each in one walk:
 
+0. **Heading levels** (P1-A). A heading's tier is its ``font_size_pt`` and
+   ``is_bold`` (A4b: its first line's size to 0.5 pt, and boldness). The
+   document's tiers are the distinct tiers of its visible headings, ranked
+   by size, largest first, and at one size bold first. Each heading with a
+   tier, hidden ones included, takes as its ``level`` 1 + the number of
+   those tiers ranked above its own, at most 6. A hidden heading's tier is
+   not among them, so hidden text cannot shift a visible heading's level;
+   a heading with no tier keeps its level. Layout ranks each page's
+   headings apart, so a page whose largest heading is a section made it
+   level 1, and it popped the open chapter (the 2026-11-02 audit). Ranked
+   over the document, a level means the same tier on every page.
 1. **Heading stack.** A visible level-L ``Heading`` pops every heading of
    level >= L and pushes itself. Every element's ``scope_path`` becomes the
    stack's texts, outermost first; a visible heading's includes its own text
@@ -48,7 +59,8 @@ change.
    element's page to its last's.
 
 The stack holds at most six entries (levels 1-6 strictly increase down it),
-so each walk is O(total elements); rule 3 adds O(columns) per page boundary.
+so each walk is O(total elements); rule 0 adds O(log tiers) per heading (a
+binary search of the sorted tiers), and rule 3 O(columns) per page boundary.
 
 Known limitations:
 
@@ -70,6 +82,7 @@ Known limitations:
 """
 
 import dataclasses
+from bisect import bisect_left
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TypeAlias
@@ -87,8 +100,13 @@ _END_TOLERANCE_PT = 1.0
 # slack (#409). pdfium boxes a flush-right column's ends up to 3e-5 pt apart, so its median end is not its last.
 _EDGE_SLACK_PT = 0.1
 
+# A1's deepest heading level.
+_MAX_LEVEL = 6
+
 # The open headings as (level, text), outermost first; levels strictly increase.
 _Stack: TypeAlias = tuple[tuple[int, str], ...]
+# A heading tier's rank key: its size negated, then not bold, so the most prominent tier sorts first.
+_Rank: TypeAlias = tuple[float, bool]
 # One part's column: its centre and its interval, (start, end).
 _Column: TypeAlias = tuple[float, tuple[float, float]]
 
@@ -139,16 +157,48 @@ def _check_pages(pages: object) -> None:
 
 
 def _scope_pages(pages: tuple[Page, ...]) -> tuple[Page, ...]:
-    """Return the pages with each element's ``scope_path`` set from the heading stack (rule 1)."""
+    """Return the pages with each heading's level ranked (rule 0), then each ``scope_path`` from the stack (rule 1)."""
+    ranks = _visible_ranks(pages)
     stack: _Stack = ()
     scoped: list[Page] = []
     for item in pages:
         elements: list[DocumentElement] = []
         for element in item.elements:
-            stack, path = _step(stack, element)
-            elements.append(element if element.scope_path == path else dataclasses.replace(element, scope_path=path))
+            ranked = _ranked(element, ranks)
+            stack, path = _step(stack, ranked)
+            elements.append(ranked if ranked.scope_path == path else dataclasses.replace(ranked, scope_path=path))
         scoped.append(dataclasses.replace(item, elements=tuple(elements)))
     return tuple(scoped)
+
+
+def _visible_ranks(pages: tuple[Page, ...]) -> list[_Rank]:
+    """The rank keys of the distinct tiers of the document's visible headings, most prominent first (rule 0)."""
+    found = {
+        rank
+        for item in pages
+        for element in item.elements
+        if isinstance(element, Heading) and not element.is_hidden
+        for rank in _rank_of(element)
+    }
+    return sorted(found)
+
+
+def _rank_of(heading: Heading) -> tuple[_Rank, ...]:
+    """The heading's rank key, ``(-font_size_pt, not is_bold)``; none when it has no tier."""
+    if heading.font_size_pt is None or heading.is_bold is None:
+        return ()
+    return ((-heading.font_size_pt, not heading.is_bold),)
+
+
+def _ranked(element: DocumentElement, ranks: list[_Rank]) -> DocumentElement:
+    """``element``, a heading with a tier given 1 + the visible tiers ranked above its own as its level (at most 6)."""
+    if not isinstance(element, Heading):
+        return element
+    found = _rank_of(element)
+    if not found:
+        return element
+    level = min(1 + bisect_left(ranks, found[0]), _MAX_LEVEL)
+    return element if element.level == level else dataclasses.replace(element, level=level)
 
 
 def _step(stack: _Stack, element: DocumentElement) -> tuple[_Stack, tuple[str, ...]]:
