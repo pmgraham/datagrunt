@@ -13,23 +13,27 @@ Internal: not exported from ``datagrunt`` or ``datagrunt.pdf`` until the
 - a Mapping: A7a's codec's document JSON
   (:func:`~datagrunt.pdf.codec.document_from_json`).
 
-Construction checks (spec invariants 1-2) run before any work, in order:
+Construction checks (spec invariants 1-2) run before any work, in order,
+as ``PDFWriter`` (A7b) runs its own:
 
 1. The options, as :class:`~datagrunt.pdf.pipeline.PipelineOptions`
    checks them (``ValueError`` out of bounds, ``TypeError`` of the wrong
-   type), and the password (a str without NUL, or None), whatever the
-   source. They apply to a PDF; a bundle or a Mapping does not use them.
-2. The source. A path that does not exist is a ``FileNotFoundError``. A
-   directory is a bundle: it must hold a ``manifest.json``, read and
-   checked as ``load_bundle`` checks it (its artifacts are read on first
-   use). A file named ``manifest.json`` is its directory's bundle. Any
-   other path must be a regular file with ``%PDF`` starting at an offset
-   from 0 to 1024, as pdfium finds it (:func:`_checked_pdf_file`: opened
-   once, without blocking on a named pipe, checked as a regular file
-   through ``fstat``, at most 1028 bytes read). Anything else is a ``ValueError``,
-   chained from the bundle's error where there is one. A Mapping is decoded
-   at construction: decoding is its check, and the reader keeps the
-   document, so the Mapping changed later does not change the reader.
+   type), whatever the source.
+2. The source's type, then the password (a str without NUL, or None), as
+   :class:`~datagrunt.pdf.pipeline.PDFSource` checks it. The options and
+   the password apply to a PDF; a bundle or a Mapping does not use them.
+3. The source itself. A directory is a bundle: it must hold a
+   ``manifest.json``, read and checked as ``load_bundle`` checks it (its
+   artifacts are read on first use). A file named ``manifest.json`` is its
+   directory's bundle. Any other path is a PDF, checked by the check
+   ``PDFWriter`` shares (:func:`~datagrunt.pdf._source.checked_pdf_file`):
+   a path that does not exist raises ``FileNotFoundError``; one that is not
+   a regular file, or has no PDF header where pdfium looks for one,
+   ``ValueError`` (it reads at most the file's first 1028 bytes, and never
+   blocks on a named pipe). A bundle that is not valid is a ``ValueError``
+   chained from its ``BundleCorruptError``. A Mapping is decoded at
+   construction: decoding is its check, and the reader keeps the document,
+   so the Mapping changed later does not change the reader.
 
 A path is made absolute at construction: a later ``chdir`` cannot
 redirect it.
@@ -105,7 +109,6 @@ Workers: ``workers`` goes to ``extract_document``, whose pool starts plain
 
 import os
 import re
-import stat
 import threading
 import weakref
 from collections.abc import Mapping
@@ -118,6 +121,7 @@ import polars as pl
 import pyarrow as pa
 
 from datagrunt.pdf._database import QueryResult, private_connection, query_result
+from datagrunt.pdf._source import checked_pdf_file
 from datagrunt.pdf._validate import int_at_least, non_blank_str
 from datagrunt.pdf.assembly import MIN_IMAGE_DIMENSION
 from datagrunt.pdf.bundle import MANIFEST, _read_manifest, load_bundle
@@ -143,14 +147,6 @@ from datagrunt.pdf.quality import OcrMode
 
 __all__ = ["PDFReader"]
 
-# A PDF's header may follow other bytes: pdfium finds "%PDF" (case-sensitive) starting at any offset from 0 to 1024,
-# so at most 1028 bytes are read.
-_PDF_MARKER = b"%PDF"
-_PDF_MARKER_LAST_OFFSET = 1024
-_PDF_HEADER_BYTES = _PDF_MARKER_LAST_OFFSET + len(_PDF_MARKER)
-# How a source file's head is opened: never blocking on a named pipe (O_NONBLOCK, which a regular file ignores),
-# as bytes (O_BINARY, Windows). Each flag is 0 where it does not exist.
-_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
 _SAMPLE_ROWS = 20  # get_sample's default, the CSV readers' sample size
 _TABLE_PREFIX = "tbl_"  # a table name starts with a letter, as the CSV readers' do
 _NOT_IDENTIFIER = re.compile(r"[^A-Za-z0-9_]")
@@ -240,7 +236,7 @@ class PDFReader:
             min_image_dimension=min_image_dimension,
             strict=strict,
         )
-        self._source = _checked_source(source, _checked_password(password))
+        self._source = _checked_source(source, password)
         self._document: PDFDocument | None = None
         self._frame: pl.DataFrame | None = None
         self._arrow: pa.Table | None = None
@@ -384,18 +380,20 @@ class PDFReader:
             return self._frame
 
 
-def _checked_source(source: object, password: str | None) -> _Source:
-    """The reader's source, checked (see the module notes): a PDF, a bundle, or a Mapping's decoded document."""
+def _checked_source(source: object, password: object) -> _Source:
+    """The reader's source, checked in the writer's order (see the module notes): a PDF, a bundle, or a document."""
     if isinstance(source, Mapping):
+        _checked_password(password)
         return document_from_json(dict(source))
     if not isinstance(source, (str, os.PathLike)):
         raise TypeError(f"source must be a str, os.PathLike or Mapping, got {type(source).__name__}")
     path = _checked_path(source, "source").absolute()
+    checked = _checked_password(password)
     if path.is_dir():
         return _checked_bundle(path, path)
     if path.name == MANIFEST and path.is_file():
         return _checked_bundle(path, path.parent)
-    return PDFSource(path=_checked_pdf_file(path, "source"), password=password)
+    return PDFSource(path=checked_pdf_file(path, "source"), password=checked)
 
 
 def _checked_bundle(path: Path, root: Path) -> _Bundle:
@@ -407,32 +405,6 @@ def _checked_bundle(path: Path, root: Path) -> _Bundle:
     except BundleCorruptError as exc:
         raise ValueError(f"source {root} is not a valid bundle: {exc}") from exc
     return _Bundle(root)
-
-
-def _checked_pdf_file(path: Path, name: str) -> Path:
-    """``path`` if it is a regular file with ``%PDF`` starting at an offset from 0 to 1024 (pdfium's rule).
-
-    The file is opened once (``O_NONBLOCK``: a named pipe does not block),
-    checked as a regular file through ``fstat`` of that descriptor, and at
-    most 1028 bytes are read from it. A local stand-in for the writer
-    branch's shared ``datagrunt.pdf._source.checked_pdf_file`` (#371), of
-    the same contract: the two are one at its merge.
-
-    Raises:
-        FileNotFoundError: If ``path`` does not exist.
-        ValueError: If it is not a regular file, or no ``%PDF`` starts at
-            an offset from 0 to 1024.
-    """
-    descriptor = os.open(path, _OPEN_FLAGS)
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise ValueError(f"{name} {path} is not a regular file")
-        head = os.read(descriptor, _PDF_HEADER_BYTES)
-    finally:
-        os.close(descriptor)
-    if _PDF_MARKER not in head:  # the head is 1028 bytes at most: a marker in it starts at offset 1024 at most
-        raise ValueError(f"{name} {path} is not a PDF: no %PDF at any offset from 0 to {_PDF_MARKER_LAST_OFFSET}")
-    return path
 
 
 def _read(source: _Source, options: PipelineOptions) -> PDFDocument:

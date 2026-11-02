@@ -192,39 +192,24 @@ class TestConstructionChecks:
         with pytest.raises(FileNotFoundError):
             PDFReader(tmp_path / "manifest.json")
 
-    @pytest.mark.parametrize(
-        "content",
-        [TEXT, b"", b" " * 1025 + b"%PDF-1.7\n", b"%pdf-1.7\n", b"%PD" + b" " * 2000],
-        ids=["csv", "empty", "header-at-offset-1025", "lower-case", "cut-marker"],
-    )
+    @pytest.mark.parametrize("content", [TEXT, b"", b" " * 1025 + b"%PDF-1.7\n"], ids=["csv", "empty", "late-header"])
     def test_a_file_that_is_not_a_pdf_is_a_value_error(self, tmp_path, monkeypatch, content):
         refuse_work(monkeypatch)
         path = tmp_path / "parts.pdf"
         path.write_bytes(content)
 
-        message = f"source {path} is not a PDF: no %PDF at any offset from 0 to 1024"
+        message = f"source is not a PDF: no %PDF header starts in its first 1025 bytes: {path}"
         with pytest.raises(ValueError, match=re.escape(message)):
             PDFReader(path)
 
-    @pytest.mark.parametrize("offset", [0, 1, 1020, 1024], ids=lambda offset: f"offset-{offset}")
-    @pytest.mark.parametrize("marker", [b"%PDF-1.7\n", b"%PDF"], ids=["versioned", "bare"])
-    def test_a_file_with_the_marker_at_offsets_0_to_1024_passes_the_check(self, tmp_path, monkeypatch, offset, marker):
-        refuse_work(monkeypatch)
-        path = tmp_path / "parts.pdf"
-        path.write_bytes(b" " * offset + marker)
+    def test_a_pdf_path_is_checked_by_the_check_the_writer_shares(self, made, monkeypatch):
+        calls = []
+        monkeypatch.setattr(reader_module, "checked_pdf_file", lambda path, name: calls.append((path, name)) or path)
+        monkeypatch.chdir(made.path.parent)
 
-        PDFReader(path)  # checked, not read: extraction is on first use
+        PDFReader(made.path.name)
 
-    def test_at_most_1028_bytes_are_read_to_check_the_header(self, tmp_path, monkeypatch):
-        path = tmp_path / "parts.pdf"
-        path.write_bytes(b" " * 4096)
-        reads = []
-        real = os.read
-        monkeypatch.setattr(reader_module.os, "read", lambda fd, size: reads.append(size) or real(fd, size))
-
-        with pytest.raises(ValueError, match="is not a PDF"):
-            PDFReader(path)
-        assert reads == [1028]
+        assert calls == [(made.path.absolute(), "source")]
 
     def test_a_directory_without_a_manifest_is_a_value_error(self, tmp_path, monkeypatch):
         refuse_work(monkeypatch)
@@ -249,7 +234,7 @@ class TestConstructionChecks:
         fifo = tmp_path / "pipe.pdf"
         os.mkfifo(fifo)
 
-        with pytest.raises(ValueError, match=re.escape(f"source {fifo} is not a regular file")):
+        with pytest.raises(ValueError, match=re.escape(f"source is not a regular file: {fifo}")):
             PDFReader(fifo)
 
     @pytest.mark.parametrize(
@@ -257,11 +242,11 @@ class TestConstructionChecks:
         [(42, "int"), (b"parts.pdf", "bytes"), (None, "NoneType"), (["parts.pdf"], "list")],
         ids=["int", "bytes", "none", "list"],
     )
-    def test_a_source_of_another_type_is_a_type_error(self, monkeypatch, source, kind):
+    def test_a_source_of_another_type_is_a_type_error_before_the_password(self, monkeypatch, source, kind):
         refuse_work(monkeypatch)
 
         with pytest.raises(TypeError, match=re.escape(f"source must be a str, os.PathLike or Mapping, got {kind}")):
-            PDFReader(source)
+            PDFReader(source, password=b"checked after the source's type, as the writer checks it")
 
     def test_a_mapping_that_is_not_a_document_is_refused(self, made):
         with pytest.raises(ValueError, match=re.escape("document has missing key(s)")):
