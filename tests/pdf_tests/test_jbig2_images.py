@@ -88,6 +88,25 @@ def entries(width: int, height: int) -> bytes:
     return b"/Width %d /Height %d /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /JBIG2Decode" % (width, height)
 
 
+def pattern_page(tmp_path: Path, data: bytes, image_entries: bytes) -> Path:
+    """A 400 x 300 pt page filled with a tiling pattern whose one cell draws an image (stream ``data``) over it."""
+    cell = b"q 400 0 0 300 0 0 cm /Im Do Q"
+    content = b"/Pattern cs /P0 scn 0 0 400 300 re f"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Contents 4 0 R "
+        b"/Resources << /Pattern << /P0 5 0 R >> >> >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        b"<< /Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 400 300] /XStep 400 /YStep 300 "
+        b"/Resources << /XObject << /Im 6 0 R >> >> /Length %d >>\nstream\n%s\nendstream" % (len(cell), cell),
+        b"<< /Type /XObject /Subtype /Image %s /Length %d >>\nstream\n" % (image_entries, len(data))
+        + data
+        + b"\nendstream",
+    ]
+    return hand_written_pdf(tmp_path / "pattern.pdf", objects)
+
+
 def pdfium_bitmap_size(path: Path) -> tuple[int, int]:
     """The size of the bitmap pdfium decodes page 1's first image object to."""
     document = pdfium.PdfDocument(str(path))
@@ -211,6 +230,19 @@ class TestRender:
         with pytest.raises(RenderFailed):
             render_page(path, 0, dpi=72, memory_cap_bytes=4 << 20, timeout_s=120.0)
         assert render_page(path, 0, dpi=72, memory_cap_bytes=1 << 30, timeout_s=120.0).px_width == 400
+
+    def test_a_decode_the_guards_walk_cannot_see_over_the_worker_cap_is_a_render_failure(self, tmp_path):
+        # A black 8000 x 8000 image in a tiling pattern: the walk does not enter patterns, so it is not decoded
+        # first; pdfium decodes it while drawing the page. Past the cap the page must fail, never be drawn without
+        # the image (#435: under Linux's RLIMIT_AS alone, this page rendered white, and no error was raised).
+        path = pattern_page(tmp_path, jbig2(Image.new("1", (8000, 8000), 0)), entries(8000, 8000))
+
+        assert refusal_of(path) is None
+        message = f"{path}: page 1: the render worker reached its 4194304-byte memory cap and was ended"
+        with pytest.raises(RenderFailed, match=re.escape(message)):
+            render_page(path, 0, dpi=72, memory_cap_bytes=4 << 20, timeout_s=120.0)
+        page = render_page(path, 0, dpi=72, memory_cap_bytes=1 << 30, timeout_s=120.0)
+        assert page.pixels == bytes(400 * 300)  # black: the pattern drew the image
 
 
 class TestDecodedBeforeTheRender:
