@@ -7,9 +7,12 @@ the request names by a key of the fixed allowlist, nothing else.
 
 import io
 import json
+import os
 import re
 import subprocess
 import sys
+import threading
+import time
 from types import MappingProxyType
 
 import pytest
@@ -132,14 +135,168 @@ class TestLaunch:
         with pytest.raises(ValueError, match=re.escape("worker must be one of ('render', 'pages'), got 'os'")):
             _process.request_payload("os", {}, 1 << 20)
 
-    def test_a_worker_starts_with_its_stdin_and_stdout_piped_and_stderr_to_the_file(self, tmp_path, monkeypatch):
+    def test_a_worker_starts_with_its_stdin_stdout_and_stderr_piped(self, monkeypatch):
         seen = []
-        monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: seen.append((args, kwargs)) or "child")
+        real = subprocess.Popen
 
-        with open(tmp_path / "stderr", "w+b") as errors:
-            assert _process.start_worker(["python"], errors) == "child"
+        def recorded(*args, **kwargs):
+            seen.append((args, kwargs))
+            return real(*args, **kwargs)
 
-            assert seen == [((["python"],), {"stdin": subprocess.PIPE, "stdout": subprocess.PIPE, "stderr": errors})]
+        monkeypatch.setattr(subprocess, "Popen", recorded)
+        command = [sys.executable, "-c", "import sys; sys.stderr.write('started')"]
+
+        child, stderr = _process.start_worker(command)
+
+        assert seen == [((command,), {"stdin": subprocess.PIPE, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE})]
+        assert _process.reaped(child, 60.0) == 0
+        _process.close_pipes(child)
+        assert stderr.finish(_process.REAP_TIMEOUT_S) == "started"
+
+    def test_a_worker_whose_stderr_cannot_be_drained_is_killed_and_reaped(self, monkeypatch):
+        started = []
+        real = subprocess.Popen
+
+        def recorded(*args, **kwargs):
+            started.append(real(*args, **kwargs))
+            return started[-1]
+
+        def refused(thread):
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(subprocess, "Popen", recorded)
+        monkeypatch.setattr(threading.Thread, "start", refused)
+
+        with pytest.raises(RuntimeError, match="can't start new thread"):
+            _process.start_worker([sys.executable, "-c", "import time; time.sleep(60)"])
+
+        ((child,),) = [started]
+        assert child.returncode is not None  # killed and reaped, not left running
+        assert (child.stdin.closed, child.stdout.closed, child.stderr.closed) == (True, True, True)
+
+
+def child_writing(data: bytes) -> "subprocess.Popen[bytes]":
+    """A child that writes ``data`` to its stderr, in 1000-byte writes, then exits."""
+    script = "import sys\ndata = sys.stdin.buffer.read()\nfor i in range(0, len(data), 1000):\n"
+    script += "    sys.stderr.buffer.write(data[i:i + 1000])\n    sys.stderr.buffer.flush()\n"
+    child = subprocess.Popen([sys.executable, "-c", script], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    child.stdin.write(data)
+    child.stdin.close()
+    return child
+
+
+def drained_child(data: bytes) -> tuple["subprocess.Popen[bytes]", _process.StderrTail]:
+    child = child_writing(data)
+    return child, _process.drained(child)
+
+
+def stderr_threads() -> list[threading.Thread]:
+    """The stderr drain threads still running."""
+    return [thread for thread in threading.enumerate() if thread.name == _process.STDERR_THREAD]
+
+
+class TestStderrTail:
+    """A child's stderr is drained by a thread of its own into a 4 KiB ring: nothing is written to disk."""
+
+    @pytest.mark.parametrize(
+        "written,tail",
+        [
+            pytest.param(b"", "", id="empty"),
+            pytest.param(b"boom\n", "boom", id="short"),
+            pytest.param(b"x" * 5000 + b"\xffend", "x" * 4092 + "\\xffend", id="long"),
+            pytest.param(b"y" * (1 << 20) + b"last words", "y" * 4086 + "last words", id="1-mib"),
+        ],
+    )
+    def test_the_tail_is_the_last_4_kib_the_child_wrote(self, written, tail):
+        child, stderr = drained_child(written)
+
+        assert _process.reaped(child, 60.0) == 0
+        assert stderr.finish(_process.REAP_TIMEOUT_S) == tail
+
+    def test_at_most_4_kib_is_held_however_much_the_child_writes(self):
+        child, stderr = drained_child(b"z" * (1 << 20))
+
+        assert _process.reaped(child, 60.0) == 0
+        stderr.finish(_process.REAP_TIMEOUT_S)
+        assert len(stderr._kept) == 4096
+
+    def test_finish_waits_for_the_drain_to_reach_the_end(self):
+        read_end, write_end = os.pipe()
+        stderr = _process.StderrTail(os.fdopen(read_end, "rb"))
+
+        def late():
+            os.write(write_end, b"late words")
+            os.close(write_end)
+
+        threading.Timer(0.5, late).start()
+
+        assert stderr.finish(_process.REAP_TIMEOUT_S) == "late words"  # written after finish began waiting
+        assert not stderr._thread.is_alive()
+
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_finish_is_bounded_when_the_stderr_stays_open(self):
+        read_end, write_end = os.pipe()
+        stream = os.fdopen(read_end, "rb")
+        stderr = _process.StderrTail(stream)
+        os.write(write_end, b"so far")
+        try:
+            began = time.monotonic()
+            said = stderr.finish(0.2)
+            elapsed = time.monotonic() - began
+        finally:
+            os.close(write_end)  # the drain then ends on its own, and closes the stream
+
+        assert said == "so far (its stderr was still open after 0.2 s)"
+        assert elapsed < 1.5  # its bound, 0.2 s, with over 6 times the headroom
+        assert stderr.finish(_process.REAP_TIMEOUT_S) == "so far"
+        assert stream.closed
+
+    def test_a_drain_still_running_is_said_and_left_to_end_on_its_own(self):
+        read_end, write_end = os.pipe()
+        stream = os.fdopen(read_end, "rb")
+        stderr = _process.StderrTail(stream)
+        try:
+            said = stderr.finish(0.0)
+        finally:
+            os.close(write_end)
+
+        assert said == "(its stderr was still open after 0 s)"
+        assert stderr.finish(_process.REAP_TIMEOUT_S) == ""
+        assert stream.closed  # by the drain, at its end: never by finish
+
+    def test_the_drain_closes_the_stream_at_its_end_and_finish_is_idempotent(self):
+        child, stderr = drained_child(b"once")
+        stream = child.stderr
+
+        assert _process.reaped(child, 60.0) == 0
+        assert [stderr.finish(_process.REAP_TIMEOUT_S) for _ in range(2)] == ["once", "once"]
+        assert stream.closed
+        assert stderr_threads() == []
+
+    def test_a_read_that_fails_is_said_never_swallowed(self):
+        class Unreadable:
+            closed = False
+
+            def fileno(self):
+                return -1  # os.read raises EBADF: no descriptor of this process is read
+
+            def close(self):
+                self.closed = True
+
+        stream = Unreadable()
+
+        said = _process.StderrTail(stream).finish(_process.REAP_TIMEOUT_S)
+
+        assert said.startswith("(its stderr could not be read to its end: [Errno 9] Bad file descriptor")
+        assert stream.closed
+
+    def test_a_child_without_a_stderr_pipe_is_refused(self):
+        child = subprocess.Popen([sys.executable, "-c", ""], stdout=subprocess.DEVNULL)
+        try:
+            with pytest.raises(ValueError, match="the child's stderr must be a pipe"):
+                _process.drained(child)
+        finally:
+            _process.reaped(child, 60.0)
 
 
 class TestMessages:

@@ -167,7 +167,6 @@ import hashlib
 import os
 import pickle
 import subprocess
-import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -182,13 +181,13 @@ from datagrunt.pdf._process import (
     REAP_TIMEOUT_S,
     MessageTooLong,
     NoInterpreter,
+    StderrTail,
     close_pipes,
     read_message,
     reaped,
     request_payload,
     send_message,
     start_worker,
-    stderr_tail,
     worker_command,
 )
 from datagrunt.pdf._validate import choice_str, int_at_least, strict_bool
@@ -840,11 +839,11 @@ def _chunk_request(message: object) -> tuple[PDFSource, range, PipelineOptions]:
 
 @dataclass(frozen=True, slots=True)
 class _Worker:
-    """One running page worker: its chunk, its process, the file its stderr goes to, and when it started."""
+    """One running page worker: its chunk, its process, its stderr's drain (a 4 KiB ring), and when it started."""
 
     pages: range
     child: "subprocess.Popen[bytes]"
-    errors: IO[bytes]
+    stderr: StderrTail
     started: float  # time.monotonic(), just before it was started
 
 
@@ -931,14 +930,10 @@ def _pool_command() -> list[str]:
 
 
 def _started(command: list[str], pages: range) -> _Worker:
-    """Start the worker for ``pages``, its stderr to a temporary file."""
-    errors = tempfile.TemporaryFile()
-    try:
-        started = time.monotonic()
-        return _Worker(pages=pages, child=start_worker(command, errors), errors=errors, started=started)
-    except BaseException:
-        errors.close()
-        raise
+    """Start the worker for ``pages``, its stderr drained into a 4 KiB ring (nothing is written to disk)."""
+    started = time.monotonic()
+    child, stderr = start_worker(command)
+    return _Worker(pages=pages, child=child, stderr=stderr, started=started)
 
 
 def _send_request(worker: _Worker, payload: bytes) -> None:
@@ -1116,7 +1111,7 @@ def _why_lost(worker: _Worker, replies: _Replies, unsent: range) -> str:
         return f"{lost} sent {replies.detail}: it was killed"
     what = "them" if not replies.pages else f"pages {_span(unsent)}"
     ended = f"{lost} ended (exit code {reaped(worker.child, _EXIT_GRACE_S)}) before returning {what}"
-    tail = stderr_tail(worker.errors)
+    tail = worker.stderr.finish(REAP_TIMEOUT_S)  # it is reaped: its drain ends
     return f"{ended}; its stderr ends: {tail}" if tail else ended
 
 
@@ -1134,9 +1129,10 @@ def _kill_all(workers: list[_Worker]) -> None:
 
 
 def _shut_down(workers: list[_Worker], readers: list[tuple[threading.Thread, _Replies]]) -> None:
-    """End the pool: kill each worker still running, wait for its reader, then close and reap it.
+    """End the pool: kill each worker still running, wait for its reader, then close and reap it, and end its drain.
 
-    Each reader stops its timers before it ends, so a kill never reaches a reaped (reusable) pid.
+    Each reader stops its timers before it ends, so a kill never reaches a
+    reaped (reusable) pid. Each stderr drain is joined within its bound.
     """
     _kill_all(workers)
     for thread, _replies in readers:
@@ -1144,7 +1140,7 @@ def _shut_down(workers: list[_Worker], readers: list[tuple[threading.Thread, _Re
     for worker in workers:
         close_pipes(worker.child)
         reaped(worker.child, 0.0)
-        worker.errors.close()
+        worker.stderr.finish(REAP_TIMEOUT_S)
 
 
 def _span(pages: range) -> str:

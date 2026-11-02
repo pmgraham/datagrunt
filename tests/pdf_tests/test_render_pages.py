@@ -86,10 +86,10 @@ def started(monkeypatch):
     workers = []
     real = render.start_worker
 
-    def recorded(command, errors):
-        worker = real(command, errors)
+    def recorded(command):
+        worker, stderr = real(command)
         workers.append(worker)
-        return worker
+        return worker, stderr
 
     monkeypatch.setattr(render, "start_worker", recorded)
     return workers
@@ -319,17 +319,16 @@ class TestBatch:
 
         assert "cannot start a render worker: [Errno 8] Exec format error" in str(results[0])
 
-    def test_no_file_for_the_workers_stderr_fails_every_page(self, tmp_path, monkeypatch, started):
-        def refused():
-            raise OSError(28, "No space left on device")
+    def test_a_worker_whose_stderr_cannot_be_drained_fails_every_page(self, tmp_path, monkeypatch):
+        def refused(command):
+            raise RuntimeError("can't start new thread")
 
-        monkeypatch.setattr(render.tempfile, "TemporaryFile", refused)
+        monkeypatch.setattr(render, "start_worker", refused)
 
         results = batch(coloured(tmp_path), ((0, 72), (0, 36)))
 
-        why = "cannot make a file for the render worker's stderr: [Errno 28] No space left on device"
+        why = "cannot start a render worker: can't start new thread"
         assert [str(result).endswith(why) for result in results] == [True, True]
-        assert started == []
 
     def test_a_request_over_its_bound_fails_every_page_before_a_worker_starts(self, tmp_path, monkeypatch, started):
         monkeypatch.setattr(render, "_MAX_REQUEST_BYTES", 10)

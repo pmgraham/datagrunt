@@ -1457,9 +1457,7 @@ class TestWorkers:
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 2, user_password="pw-6b0d")
         seen = []
         real = pipeline.start_worker
-        monkeypatch.setattr(
-            pipeline, "start_worker", lambda command, errors: seen.append(command) or real(command, errors)
-        )
+        monkeypatch.setattr(pipeline, "start_worker", lambda command: seen.append(command) or real(command))
         written = []
         real_send = pipeline._send_request
         monkeypatch.setattr(
@@ -1641,8 +1639,16 @@ class TestPageDeadline:
 
 def sleeping_worker(pages: range) -> pipeline._Worker:
     """A worker process that sends nothing for a minute."""
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdout=subprocess.PIPE)
-    return pipeline._Worker(pages=pages, child=child, errors=io.BytesIO(), started=time.monotonic())
+    command = [sys.executable, "-c", "import time; time.sleep(60)"]
+    child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return pipeline._Worker(pages=pages, child=child, stderr=_process.drained(child), started=time.monotonic())
+
+
+def empty_stderr() -> _process.StderrTail:
+    """The drain of a stderr pipe already at its end: nothing was written."""
+    read_end, write_end = os.pipe()
+    os.close(write_end)
+    return _process.StderrTail(os.fdopen(read_end, "rb"))
 
 
 class TestReplies:
@@ -1673,7 +1679,7 @@ class TestReplies:
         ],
     )
     def test_why_a_chunks_pages_were_lost(self, ending, received, detail, why):
-        worker = pipeline._Worker(pages=range(2, 5), child=None, errors=io.BytesIO(), started=0.0)
+        worker = pipeline._Worker(pages=range(2, 5), child=None, stderr=empty_stderr(), started=0.0)
         replies = pipeline._Replies()
         replies.pages, replies.ending, replies.detail, replies.bound_s = [None] * received, ending, detail, 9.0
 
