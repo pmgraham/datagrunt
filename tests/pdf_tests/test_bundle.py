@@ -19,6 +19,8 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,10 +32,12 @@ from datagrunt.pdf.bundle import BUNDLE_FORMAT_VERSION, load_bundle, write_bundl
 from datagrunt.pdf.codec import document_from_json_bytes
 from datagrunt.pdf.elements import Figure, PDFDocument
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFSourceChangedError
+from datagrunt.pdf.frame import utf8_text
 from datagrunt.pdf.ocr import tesseract_available
 from datagrunt.pdf.pipeline import extract_document
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page, render_size
-from pdf_tests.builders import PageSpec, TextRun, build_pdf, solid_png
+from datagrunt.pdf.writer import PDFWriter
+from pdf_tests.builders import PageSpec, TextRun, build_pdf, hand_written_pdf, solid_png
 from pdf_tests.documents import FIGURE_A_SHA, FIGURE_B_SHA, PAGE_SIZES, metadata, rich_document, surrogate_document
 from pdf_tests.test_layout_stream_tables import body_text
 
@@ -81,6 +85,17 @@ class OwnRender:
         return value
 
 
+@dataclasses.dataclass(frozen=True)
+class OwnFigure:
+    """A stand-in for A5a's FigureRead: the PDF it reads a figure from, and what its PNG read gives."""
+
+    source: Path
+    read: Callable[[], bytes]
+
+    def png_bytes(self) -> bytes:
+        return self.read()
+
+
 def bound_document(
     path: Path,
     figure_loader=lambda: PNG_A,
@@ -92,18 +107,69 @@ def bound_document(
 ) -> PDFDocument:
     """rich_document as the document of the PDF at ``path``; page 3 has its own page image.
 
-    Its loaders are an :class:`OwnRender` of ``own_source`` (default: ``path``); ``bands`` None gives it no
-    band loader.
+    Its figures read through an :class:`OwnFigure` of ``path`` calling ``figure_loader`` (figure A, twice)
+    and ``other_loader`` (figure B); None gives a figure no loader. Page 3's loaders are an
+    :class:`OwnRender` of ``own_source`` (default: ``path``); ``bands`` None gives it no band loader.
     """
     render = OwnRender(own_source or path, image, bands)
     return rich_document(
-        figure_loader,
-        other_loader,
+        None if figure_loader is None else OwnFigure(path, figure_loader).png_bytes,
+        None if other_loader is None else OwnFigure(path, other_loader).png_bytes,
         sha=sha_of(path),
         source_name=path.name,
         image_loader=render.png_bytes,
         band_loader=None if bands is None else render.band_png_bytes,
     )
+
+
+# One 64 x 64 image stream, which each dictionary below reads as another picture (or none): one sha256, many PNGs.
+SHARED_STREAM = bytes([10, 200, 10]) * (64 * 64)
+UNREADABLE = b"/Width 64 /Height 64 /ColorSpace /NoSuchSpace /BitsPerComponent 8"
+AS_RGB = b"/Width 64 /Height 64 /ColorSpace /DeviceRGB /BitsPerComponent 8"
+AS_GREY = b"/Width 64 /Height 64 /ColorSpace /DeviceGray /BitsPerComponent 8"
+
+
+def shared_stream_pdf(path: Path, first: bytes, second: bytes) -> Path:
+    """Two pages, each drawing one image: the same stream bytes under the image dictionaries ``first``, ``second``."""
+    page = (
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R "
+        b"/Resources << /XObject << /Im0 %d 0 R >> >> >>"
+    )
+
+    def stream(body: bytes, extra: bytes = b"") -> bytes:
+        return b"<< /Length %d %s >>\nstream\n%s\nendstream" % (len(body), extra, body)
+
+    image = b"/Type /XObject /Subtype /Image "
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+        page % 6,
+        page % 7,
+        stream(b"q 200 0 0 200 100 400 cm /Im0 Do Q"),
+        stream(SHARED_STREAM, image + first),
+        stream(SHARED_STREAM, image + second),
+    ]
+    return hand_written_pdf(path, objects)
+
+
+def with_element(document: PDFDocument, element_id: str, **changes) -> PDFDocument:
+    """``document`` with its element ``element_id`` changed by ``changes``; its sections hold the new one."""
+    pages = tuple(
+        dataclasses.replace(
+            page,
+            elements=tuple(
+                dataclasses.replace(item, **changes) if item.element_id == element_id else item
+                for item in page.elements
+            ),
+        )
+        for page in document.pages
+    )
+    by_id = {item.element_id: item for page in pages for item in page.elements}
+    sections = tuple(
+        dataclasses.replace(section, elements=tuple(by_id[item.element_id] for item in section.elements))
+        for section in document.sections
+    )
+    return dataclasses.replace(document, pages=pages, sections=sections)
 
 
 def files_in(root: Path) -> set[str]:
@@ -181,7 +247,9 @@ def written(tmp_path_factory):
 EXPECTED_FILES = {
     "manifest.json",
     "json/document.json",
+    "json/elements.jsonl",
     "markdown/document.md",
+    *(f"markdown/pages/page_000{n}.md" for n in (1, 2, 3, 4)),
     f"images/{FIGURE_A_SHA}.png",
     f"images/{FIGURE_B_SHA}.png",
     *(f"page_images/page_000{n}.png" for n in (1, 2, 3, 4)),
@@ -265,8 +333,8 @@ class TestDocument:
             assert figure.image_path == out / "images" / f"{figure.sha256}.png"
         assert [figure.read_bytes() for figure in written.returned.figures] == [PNG_A, PNG_A, PNG_B]
 
-    def test_each_distinct_figure_is_read_once_through_its_loader(self, written):
-        assert written.calls == {"a": 1, "b": 1}
+    def test_each_figure_is_read_through_its_loader_and_each_picture_written_once(self, written):
+        assert written.calls == {"a": 2, "b": 1}  # figure A twice: its PNG, not its sha256, decides it is the same
         assert (written.out / "images" / f"{FIGURE_A_SHA}.png").read_bytes() == PNG_A
 
     def test_pages_without_their_own_image_are_rendered_at_the_effective_dpi(self, written):
@@ -278,6 +346,22 @@ class TestDocument:
             assert (image.width_px, image.height_px) == render_size(page.width_pt, page.height_pt, dpi)
             drawn = render_page(written.source, page.page_number - 1, dpi=dpi, memory_cap_bytes=CAP, timeout_s=TIMEOUT)
             assert png_pixels(path) == ("L", (drawn.px_width, drawn.px_height), drawn.pixels)
+
+    def test_a_page_over_max_render_pixels_is_rendered_below_dpi(self, tmp_path, source, monkeypatch):
+        calls = spied(monkeypatch)
+        returned = write(
+            bound_document(source), tmp_path / "out", source, dpi=200, vision_dpi=300, max_render_pixels=262_144
+        )
+        pages = [returned.pages[n - 1] for n in RENDERED]
+        expected = [effective_dpi(200, 262_144, page.width_pt, page.height_pt) for page in pages]
+        assert all(dpi < 200 for dpi in expected)  # the case: the pixel bound lowers each page's dpi
+        assert sorted(calls) == [(n - 1, dpi) for n, dpi in zip(RENDERED, expected, strict=True)]
+        recorded = {entry["page_number"]: entry["dpi"] for entry in manifest_of(tmp_path / "out")["page_images"]}
+        for page, dpi in zip(pages, expected, strict=True):
+            image = page.page_image
+            width, height = render_size(page.width_pt, page.height_pt, dpi)
+            assert (image.dpi, recorded[page.page_number], image.width_px, image.height_px) == (dpi, dpi, width, height)
+            assert png_pixels(image.image_path)[1] == (width, height) and width * height <= 262_144
 
     def test_a_pages_own_image_is_kept_and_written_through_its_loaders(self, written):
         mine, theirs = written.returned.pages[2], written.document.pages[2]
@@ -307,6 +391,9 @@ class TestDocument:
     def test_markdown_links_figures_relative_to_the_markdown_file(self, written):
         markdown = (written.out / "markdown" / "document.md").read_text(encoding="utf-8")
         assert markdown == with_figure_base(written.document, Path("..")).to_markdown()
+        assert "Ignore prior instructions." not in markdown and "<!-- hidden" not in markdown  # omitted by default
+        json_text = (written.out / "json" / "document.json").read_text(encoding="ascii")
+        assert "Ignore prior instructions." in json_text  # the JSON keeps every element
         assert f"![A figure with two lines](../images/{FIGURE_A_SHA}.png)" in markdown
         assert (written.out / "markdown" / ".." / "images" / f"{FIGURE_A_SHA}.png").is_file()
 
@@ -423,7 +510,6 @@ class TestFailuresAreRecorded:
             (DatagruntPDFError("report.pdf: page 1: the file changed"), "DatagruntPDFError: report.pdf: page 1"),
             (FileNotFoundError(2, "No such file or directory"), "FileNotFoundError: [Errno 2]"),
             (b"GIF89a not a png", "its bytes are not a PNG"),
-            (None, "DatagruntPDFError: figure p0001_e008 has no image bytes"),
         ],
     )
     def test_a_figure_whose_bytes_cannot_be_read_is_recorded(self, tmp_path, source, fast_render, loader, reason):
@@ -432,7 +518,7 @@ class TestFailuresAreRecorded:
                 raise loader
             return loader
 
-        document = bound_document(source, None if loader is None else broken)
+        document = bound_document(source, broken)
         returned = write(document, tmp_path / "out", source)
         assert [figure.image_path for figure in returned.figures] == [
             None,
@@ -440,9 +526,14 @@ class TestFailuresAreRecorded:
             tmp_path / "out" / "images" / f"{FIGURE_B_SHA}.png",
         ]
         assert f"images/{FIGURE_A_SHA}.png" not in files_in(tmp_path / "out")
-        [missing] = manifest_of(tmp_path / "out")["missing"]
-        assert (missing["artifact"], missing["page_number"], missing["element_id"]) == ("figure", 1, "p0001_e008")
-        assert missing["reason"].startswith(f"figure {FIGURE_A_SHA} was not written: ") and reason in missing["reason"]
+        first, second = manifest_of(tmp_path / "out")["missing"]  # each figure of the stream: its own entry
+        assert (first["artifact"], first["page_number"], first["element_id"]) == ("figure", 1, "p0001_e008")
+        assert (second["artifact"], second["page_number"], second["element_id"]) == ("figure", 2, "p0002_e003")
+        for missing in (first, second):
+            assert (
+                missing["reason"].startswith(f"figure {FIGURE_A_SHA} was not written: ") and reason in missing["reason"]
+            )
+        assert load_bundle(tmp_path / "out") == returned
 
     def test_missing_entries_are_in_page_order(self, tmp_path, source, monkeypatch):
         monkeypatch.setattr(bundle, "render_page", lambda *a, **k: (_ for _ in ()).throw(RenderFailed("no")))
@@ -451,6 +542,7 @@ class TestFailuresAreRecorded:
         assert [(m["page_number"], m["artifact"]) for m in missing] == [
             (1, "figure"),
             (1, "page_image"),
+            (2, "figure"),
             (2, "page_image"),
             (4, "page_image"),
         ]
@@ -657,38 +749,133 @@ class TestValidation:
         assert png_pixels(returned.pages[0].page_image.image_path)[0] == "L"
 
 
-class TestChunks:
-    @pytest.mark.parametrize(("workers", "size"), [(1, 32), (2, 16), (3, 10), (4, 8), (8, 4), (9, 4), (64, 4)])
-    def test_chunk_size_is_the_specs(self, workers, size):
-        assert bundle._chunk_size(workers) == size
+class TestFiguresSharingAStream:
+    """Figures of one raw stream (one sha256) under other image dictionaries: each its own PNG, or its own entry."""
 
-    def test_chunks_cover_the_pages_in_order(self):
-        assert bundle._chunks(70, 1) == (range(0, 32), range(32, 64), range(64, 70))
-        assert bundle._chunks(9, 8) == (range(0, 4), range(4, 8), range(8, 9))
-        assert bundle._chunks(0, 1) == ()
+    def bundled(self, tmp_path: Path, first: bytes, second: bytes):
+        path = shared_stream_pdf(tmp_path / "shared.pdf", first, second)
+        document = extract_document(path, ocr="never")
+        assert [figure.element_id for figure in document.figures] == ["p0001_e000", "p0002_e000"]
+        assert len({figure.sha256 for figure in document.figures}) == 1
+        returned = write_bundle(document, tmp_path / "out", source=path, dpi=72)
+        return document, returned
 
-    def test_a_chunk_ends_before_the_next_begins_and_workers_run_together(self, tmp_path, source, monkeypatch):
-        events, lock = [], threading.Lock()
-        running = {"now": 0, "most": 0}
+    def test_one_stream_read_as_two_pictures_is_written_as_two(self, tmp_path):
+        document, returned = self.bundled(tmp_path, AS_RGB, AS_GREY)
+        own = [figure.read_bytes() for figure in document.figures]
+        assert own[0] != own[1]
+        sha = document.figures[0].sha256
+        later = hashlib.sha256(own[1]).hexdigest()
+        out = tmp_path / "out"
+        assert [figure.image_path for figure in returned.figures] == [
+            out / "images" / f"{sha}.png",
+            out / "images" / f"{sha}-{later}.png",
+        ]
+        assert [figure.image_path.read_bytes() for figure in returned.figures] == own
+        assert [png_pixels(figure.image_path)[0] for figure in returned.figures] == ["RGB", "L"]
+        assert manifest_of(out)["missing"] == []
+        assert [figure.read_bytes() for figure in load_bundle(out).figures] == own
 
-        def tracked(src, page_index, *, dpi, **kwargs):
-            with lock:
-                running["now"] += 1
-                running["most"] = max(running["most"], running["now"])
-                events.append(("start", page_index))
-            time.sleep(0.05 if page_index == 0 else 0.3)
-            with lock:
-                running["now"] -= 1
-                events.append(("end", page_index))
-            return fake_render(src, page_index, dpi=dpi, **kwargs)
+    def test_a_figure_is_read_though_an_earlier_one_of_its_stream_failed(self, tmp_path):
+        document, returned = self.bundled(tmp_path, UNREADABLE, AS_RGB)
+        sha, out = document.figures[0].sha256, tmp_path / "out"
+        assert [figure.image_path for figure in returned.figures] == [None, out / "images" / f"{sha}.png"]
+        assert returned.figures[1].image_path.read_bytes() == document.figures[1].read_bytes()
+        [missing] = manifest_of(out)["missing"]
+        assert (missing["artifact"], missing["page_number"], missing["element_id"]) == ("figure", 1, "p0001_e000")
+        assert load_bundle(out) == returned
 
-        monkeypatch.setattr(bundle, "render_page", tracked)
-        monkeypatch.setattr(bundle, "_chunk_size", lambda workers: 2)
-        write(bound_document(source), tmp_path / "out", source, workers=2)
-        assert running["most"] == 2
-        first_chunk_end = max(i for i, event in enumerate(events) if event[0] == "end" and event[1] in (0, 1))
-        second_chunk_start = min(i for i, event in enumerate(events) if event[0] == "start" and event[1] in (2, 3))
-        assert first_chunk_end < second_chunk_start
+    def test_each_figure_not_written_has_its_own_missing_entry(self, tmp_path):
+        _, returned = self.bundled(tmp_path, UNREADABLE, UNREADABLE)
+        assert [figure.image_path for figure in returned.figures] == [None, None]
+        missing = manifest_of(tmp_path / "out")["missing"]
+        assert [(m["artifact"], m["page_number"], m["element_id"]) for m in missing] == [
+            ("figure", 1, "p0001_e000"),
+            ("figure", 2, "p0002_e000"),
+        ]
+        assert load_bundle(tmp_path / "out") == returned
+
+
+def paged_pdf(directory: Path, count: int) -> Path:
+    """A PDF of ``count`` letter pages, a line of text each: digital pages, which a bundle renders."""
+    pages = [PageSpec(items=(TextRun(f"Page {number}", 72.0, 100.0),)) for number in range(1, count + 1)]
+    return build_pdf(directory / "pages.pdf", pages)
+
+
+class InFlight:
+    """A ThreadPoolExecutor stand-in's record: the most tasks submitted and not yet done at any submit."""
+
+    def __init__(self) -> None:
+        self.lock, self.futures, self.most = threading.Lock(), [], 0
+
+    def executor(self, *args, **kwargs) -> ThreadPoolExecutor:
+        record = self
+
+        class Counting(ThreadPoolExecutor):
+            def submit(self, fn, /, *call_args, **call_kwargs):
+                with record.lock:
+                    live = sum(not future.done() for future in record.futures) + 1
+                    record.most = max(record.most, live)
+                    future = super().submit(fn, *call_args, **call_kwargs)
+                    record.futures.append(future)
+                return future
+
+        return Counting(*args, **kwargs)
+
+
+def gathered(parties: int):
+    """A render stand-in whose first ``parties`` pages wait for each other: the call fails unless they run together."""
+    together = threading.Barrier(parties, timeout=10.0)
+
+    def render(src, page_index, **kwargs):
+        if page_index < parties:
+            together.wait()  # BrokenBarrierError, failing the call, unless the pages are in flight at once
+        return fake_render(src, page_index, **kwargs)
+
+    return render
+
+
+def last_first(count: int):
+    """A render stand-in whose page 1 ends only once the other ``count - 1`` pages have; and the order pages end in."""
+    others, lock, ended = threading.Event(), threading.Lock(), []
+
+    def render(src, page_index, **kwargs):
+        if page_index == 0:
+            assert others.wait(timeout=10.0), "page 1 held up the pages after it"
+        drawn = fake_render(src, page_index, **kwargs)
+        with lock:
+            ended.append(page_index)
+            if len(ended) == count - 1 and 0 not in ended:
+                others.set()
+        return drawn
+
+    return render, ended
+
+
+class TestWorkers:
+    """Pages render on ``workers`` threads in a sliding window: at most ``workers`` in flight, the next as one ends."""
+
+    @pytest.mark.parametrize("workers", [2, 8])
+    def test_workers_pages_render_together_and_no_more_are_in_flight(self, tmp_path, monkeypatch, workers):
+        path = paged_pdf(tmp_path, 10)
+        document = extract_document(path, ocr="never")
+        flight = InFlight()
+        monkeypatch.setattr(bundle, "render_page", gathered(workers))
+        monkeypatch.setattr(bundle, "ThreadPoolExecutor", flight.executor)
+        write(document, tmp_path / "out", path, workers=workers)
+        assert flight.most == workers
+        assert manifest_of(tmp_path / "out")["missing"] == []
+
+    def test_a_slow_page_holds_one_thread_never_the_others(self, tmp_path, monkeypatch):
+        path = paged_pdf(tmp_path, 5)
+        document = extract_document(path, ocr="never")
+        render, ended = last_first(5)
+        monkeypatch.setattr(bundle, "render_page", render)
+        returned = write(document, tmp_path / "out", path, workers=2)
+        assert ended == [1, 2, 3, 4, 0]  # one thread held page 1; the other rendered the rest, one after another
+        assert [page.page_image.image_path.name for page in returned.pages] == [
+            f"page_000{number}.png" for number in range(1, 6)
+        ]
 
     def test_workers_write_the_same_bundle(self, tmp_path, written):
         out = tmp_path / "out"
@@ -804,7 +991,7 @@ class TestBoundToTheSource:
         with pytest.warns(UserWarning, match="page 3's own image renders from .*other.pdf, not from the source"):
             returned = write(document, tmp_path / "out", source)
         assert returned.pages[2].page_image is None
-        assert not any("page_0003" in name for name in files_in(tmp_path / "out"))
+        assert not any(name.startswith("page_images/") and "page_0003" in name for name in files_in(tmp_path / "out"))
         reason = (
             f"the page's own image renders from {other.resolve()}, not from the source {source.resolve()}: "
             "its bytes could not be bound to the hashed source"
@@ -848,6 +1035,51 @@ class TestBoundToTheSource:
             returned = write(dataclasses.replace(document, pages=tuple(pages)), tmp_path / "out", source)
         assert returned.pages[2].page_image is None
 
+    def test_a_figure_with_only_a_path_is_not_read_whatever_file_it_names(self, tmp_path, source, fast_render):
+        secret = tmp_path / "secret.png"
+        secret.write_bytes(solid_png(8, 8, (0.3, 0.3, 0.3)))
+        document = with_element(bound_document(source), "p0002_e004", _loader=None, image_path=secret)
+        with pytest.warns(UserWarning, match="figure p0002_e004 has no loader: no image is written for it"):
+            returned = write(document, tmp_path / "out", source)
+        assert returned.figures[2].image_path is None
+        assert files_in(tmp_path / "out") == EXPECTED_FILES - {f"images/{FIGURE_B_SHA}.png"}
+        held = [path.read_bytes() for path in (tmp_path / "out").rglob("*") if path.is_file()]
+        assert secret.read_bytes() not in held
+        reason = f"figure {FIGURE_B_SHA} has no loader: its bytes could not be bound to the hashed source"
+        assert manifest_of(tmp_path / "out")["missing"] == [
+            {"artifact": "figure", "page_number": 2, "element_id": "p0002_e004", "reason": reason}
+        ]
+        assert load_bundle(tmp_path / "out") == returned
+
+    def test_a_figure_reading_another_file_is_not_read(self, tmp_path, source, fast_render):
+        other = build_pdf(tmp_path / "other.pdf", [PageSpec()])
+        never = OwnFigure(other, lambda: pytest.fail("a figure loader of another file must not be called"))
+        document = with_element(bound_document(source), "p0002_e004", _loader=never.png_bytes)
+        with pytest.warns(UserWarning, match="figure p0002_e004 reads from .*other.pdf, not from the source"):
+            returned = write(document, tmp_path / "out", source)
+        assert returned.figures[2].image_path is None
+        [missing] = manifest_of(tmp_path / "out")["missing"]
+        assert missing["reason"] == (
+            f"figure {FIGURE_B_SHA} reads from {other.resolve()}, not from the source {source.resolve()}: "
+            "its bytes could not be bound to the hashed source"
+        )
+
+    def test_a_figure_loader_naming_no_source_is_not_read(self, tmp_path, source, fast_render):
+        document = with_element(
+            bound_document(source), "p0002_e004", _loader=lambda: pytest.fail("an unbound loader was called")
+        )
+        with pytest.warns(UserWarning, match="figure p0002_e004 has a loader that names no source"):
+            returned = write(document, tmp_path / "out", source)
+        assert returned.figures[2].image_path is None
+        [missing] = manifest_of(tmp_path / "out")["missing"]
+        assert (missing["artifact"], missing["element_id"]) == ("figure", "p0002_e004")
+
+    def test_a_loaded_bundles_figures_are_bound_by_its_verifying_reader(self, written, tmp_path, recwarn):
+        loaded = load_bundle(written.out)
+        returned = write(loaded, tmp_path / "again", written.source)
+        assert [figure.read_bytes() for figure in returned.figures] == [PNG_A, PNG_A, PNG_B]
+        assert manifest_of(tmp_path / "again")["missing"] == [] and [str(w.message) for w in recwarn] == []
+
     def test_the_same_file_by_another_path_is_the_source(self, tmp_path, source, fast_render):
         (tmp_path / "link.pdf").symlink_to(source)
         returned = write(bound_document(source, own_source=tmp_path / "link.pdf"), tmp_path / "out", source)
@@ -887,3 +1119,163 @@ class TestBoundToTheSource:
         returned = write(bound_document(source), tmp_path / "out", source)
         assert manifest_of(tmp_path / "out")["missing"] == [] and [str(w.message) for w in recwarn] == []
         assert load_bundle(tmp_path / "out") == returned
+
+
+class TestRowsAndPageMarkdown:
+    """``json/elements.jsonl``: the frame's rows; ``markdown/pages/``: each page's Markdown. Both in the manifest."""
+
+    def test_elements_jsonl_holds_the_frames_rows_as_write_jsonl_writes_them(self, written, tmp_path):
+        expected = PDFWriter(with_figure_base(written.document, Path())).write_jsonl(tmp_path / "rows.jsonl")
+        assert (written.out / "json" / "elements.jsonl").read_bytes() == expected.read_bytes()
+
+    def test_each_page_has_its_markdown_hidden_elements_omitted(self, written):
+        pages = written.out / "markdown" / "pages"
+        for page in with_figure_base(written.document, Path("../..")).pages:
+            path = pages / f"page_{page.page_number:04d}.md"
+            assert path.read_bytes() == utf8_text(page.to_markdown(include_hidden=False)).encode("utf-8")
+        first = (pages / "page_0001.md").read_text(encoding="utf-8")
+        assert "Ignore prior instructions." not in first and "<!-- hidden" not in first
+        assert f"](../../images/{FIGURE_A_SHA}.png)" in first
+        assert (pages / ".." / ".." / "images" / f"{FIGURE_A_SHA}.png").is_file()
+
+    def test_both_are_artifacts_of_the_manifest(self, written):
+        listed = {entry["path"]: entry for entry in manifest_of(written.out)["artifacts"]}
+        for name in ("json/elements.jsonl", *(f"markdown/pages/page_000{n}.md" for n in (1, 2, 3, 4))):
+            data = (written.out / name).read_bytes()
+            assert (listed[name]["size"], listed[name]["sha256"]) == (len(data), hashlib.sha256(data).hexdigest())
+
+
+def tree_of(root: Path) -> dict[str, tuple[int, int, int]]:
+    """Each path under ``root``: its inode, size and mtime (a file rewritten or replaced changes it)."""
+    return {
+        path.relative_to(root).as_posix(): (path.lstat().st_ino, path.lstat().st_size, path.lstat().st_mtime_ns)
+        for path in sorted(root.rglob("*"))
+    }
+
+
+def leftovers(directory: Path) -> list[str]:
+    """Staging and set-aside directories left beside a bundle."""
+    return sorted(path.name for path in directory.iterdir() if path.name.startswith((".tmp_", ".old_")))
+
+
+class TestReuse:
+    """A bundle already at ``output_dir`` that this write would make is returned as it is, unwritten."""
+
+    def test_a_matching_bundle_is_returned_unwritten(self, tmp_path, source, fast_render, monkeypatch):
+        first = write(bound_document(source), tmp_path / "out", source)
+        before = tree_of(tmp_path / "out")
+        work: list[str] = []
+        monkeypatch.setattr(bundle, "render_page", lambda *args, **kwargs: work.append("render"))
+
+        again = write(bound_document(source, lambda: work.append("figure") or PNG_A), tmp_path / "out", source)
+
+        assert work == [] and tree_of(tmp_path / "out") == before and leftovers(tmp_path) == []
+        assert again == first == load_bundle(tmp_path / "out")
+        assert [figure.read_bytes() for figure in again.figures] == [PNG_A, PNG_A, PNG_B]
+
+    def test_overwrite_reuses_a_matching_bundle_too(self, tmp_path, source, fast_render):
+        write(bound_document(source), tmp_path / "out", source)
+        before = tree_of(tmp_path / "out")
+        write(bound_document(source), tmp_path / "out", source, overwrite=True)
+        assert tree_of(tmp_path / "out") == before
+
+    @pytest.mark.parametrize(
+        ("change", "why"),
+        [
+            (lambda out: None, "its extraction_params"),
+            (lambda out: _set_manifest(out, "datagrunt_version", "0.0.1"), "written by datagrunt 0.0.1"),
+            (lambda out: flip_byte(out / "markdown" / "document.md"), "it is not a valid bundle"),
+        ],
+        ids=["other-parameters", "other-datagrunt", "corrupt"],
+    )
+    def test_any_other_bundle_is_refused_untouched(self, tmp_path, source, fast_render, change, why):
+        write(bound_document(source), tmp_path / "out", source, dpi=100, vision_dpi=100)
+        change(tmp_path / "out")
+        before = tree_of(tmp_path / "out")
+        with pytest.raises(FileExistsError, match=f"output_dir holds a bundle that is not this write's.*{why}"):
+            write(bound_document(source), tmp_path / "out", source)
+        assert tree_of(tmp_path / "out") == before and leftovers(tmp_path) == []
+
+    def test_another_documents_bundle_is_refused(self, tmp_path, source, fast_render):
+        write(bound_document(source), tmp_path / "out", source)
+        changed = with_element(bound_document(source), "p0001_e003", text="Other text.")
+        with pytest.raises(FileExistsError, match="its document is not this one"):
+            write(changed, tmp_path / "out", source)
+
+
+def _set_manifest(out: Path, key: str, value) -> None:
+    data = manifest_of(out)
+    data[key] = value
+    (out / "manifest.json").write_text(json.dumps(data, indent=2), encoding="ascii")
+
+
+def flip_byte(path: Path) -> None:
+    data = bytearray(path.read_bytes())
+    data[len(data) // 2] ^= 0xFF
+    path.write_bytes(bytes(data))
+
+
+class TestOverwrite:
+    """``overwrite=True`` replaces a bundle that is not this write's: staged, then swapped in, the old one removed."""
+
+    def test_a_bundle_of_other_parameters_is_replaced(self, tmp_path, source, fast_render):
+        write(bound_document(source), tmp_path / "out", source, dpi=100, vision_dpi=100)
+        returned = write(bound_document(source), tmp_path / "out", source, overwrite=True)
+        assert manifest_of(tmp_path / "out")["extraction_params"]["dpi"] == DPI
+        assert load_bundle(tmp_path / "out") == returned and leftovers(tmp_path) == []
+        assert files_in(tmp_path / "out") == EXPECTED_FILES
+
+    def test_a_directory_that_is_not_a_bundle_is_never_replaced(self, tmp_path, source, fast_render):
+        (tmp_path / "out").mkdir()
+        (tmp_path / "out" / "keep.txt").write_text("mine")
+        with pytest.raises(FileExistsError, match="holds no bundle"):
+            write(bound_document(source), tmp_path / "out", source, overwrite=True)
+        assert files_in(tmp_path / "out") == {"keep.txt"} and leftovers(tmp_path) == []
+
+    def test_a_directory_whose_manifest_is_not_a_bundles_is_never_replaced(self, tmp_path, source, fast_render):
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "manifest.json").write_text('{"name": "web app", "start_url": "/"}', encoding="ascii")
+        (out / "index.html").write_text("<p>mine</p>", encoding="ascii")
+        before = tree_of(out)
+        with pytest.raises(FileExistsError, match="holds no bundle"):
+            write(bound_document(source), out, source, overwrite=True)
+        assert tree_of(out) == before and leftovers(tmp_path) == []
+
+    def test_a_symlink_is_never_replaced(self, tmp_path, source, fast_render):
+        write(bound_document(source), tmp_path / "real", source, dpi=100, vision_dpi=100)
+        (tmp_path / "out").symlink_to(tmp_path / "real", target_is_directory=True)
+        with pytest.raises(FileExistsError, match="symlink"):
+            write(bound_document(source), tmp_path / "out", source, overwrite=True)
+        assert (tmp_path / "out").is_symlink() and manifest_of(tmp_path / "real")["extraction_params"]["dpi"] == 100
+
+    def test_a_failed_write_leaves_the_old_bundle(self, tmp_path, source, fast_render, monkeypatch):
+        old = write(bound_document(source), tmp_path / "out", source, dpi=100, vision_dpi=100)
+        before = tree_of(tmp_path / "out")
+        monkeypatch.setattr(bundle, "render_page", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
+        with pytest.raises(KeyboardInterrupt):
+            write(bound_document(source), tmp_path / "out", source, overwrite=True)
+        assert tree_of(tmp_path / "out") == before and load_bundle(tmp_path / "out") == old
+        assert leftovers(tmp_path) == []
+
+    def test_a_failed_swap_puts_the_old_bundle_back(self, tmp_path, source, fast_render, monkeypatch):
+        old = write(bound_document(source), tmp_path / "out", source, dpi=100, vision_dpi=100)
+        before = tree_of(tmp_path / "out")
+        real = os.replace
+
+        def failing(src, dst):
+            if Path(src).name.startswith(".tmp_"):
+                raise OSError(5, "Input/output error")
+            return real(src, dst)
+
+        monkeypatch.setattr(os, "replace", failing)
+        with pytest.raises(OSError, match="Input/output error"):
+            write(bound_document(source), tmp_path / "out", source, overwrite=True)
+        assert tree_of(tmp_path / "out") == before and load_bundle(tmp_path / "out") == old
+        assert leftovers(tmp_path) == []
+
+    @pytest.mark.parametrize("value", [1, None, "yes"])
+    def test_overwrite_must_be_a_bool(self, tmp_path, source, value):
+        with pytest.raises(TypeError, match="overwrite must be a bool"):
+            write(bound_document(source), tmp_path / "out", source, overwrite=value)
+        assert not (tmp_path / "out").exists()

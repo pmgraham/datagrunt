@@ -171,7 +171,9 @@ class TestRoundTrip:
 class TestChecksums:
     ARTIFACTS = [
         "json/document.json",
+        "json/elements.jsonl",
         "markdown/document.md",
+        "markdown/pages/page_0002.md",
         A_PNG,
         "page_images/page_0001.png",
         "page_images/bands/page_0003_band_02.png",
@@ -378,6 +380,14 @@ class TestManifest:
                 r"lists no json/document\.json",
             ),
             (
+                lambda d: d.update(artifacts=[a for a in d["artifacts"] if a["path"] != "json/elements.jsonl"]),
+                r"lists no json/elements\.jsonl",
+            ),
+            (
+                lambda d: d.update(artifacts=[a for a in d["artifacts"] if a["path"] != "markdown/pages/page_0003.md"]),
+                r"lists no markdown/pages/page_0003\.md",
+            ),
+            (
                 lambda d: d["missing"].append({"artifact": "x", "page_number": 1, "element_id": None, "reason": "r"}),
                 r"missing\[0\]\.artifact must be",
             ),
@@ -455,6 +465,22 @@ class TestDocumentAgainstManifest:
 
         edit_document_json(copy, change)
         with pytest.raises(BundleCorruptError, match=r"unrecorded: \[\('figure', 2, 'p0002_e004'\)\]"):
+            load_bundle(copy)
+
+    def test_a_later_figure_of_a_stream_without_its_image_needs_its_own_missing_entry(self, copy):
+        edit_document_json(copy, lambda data: data["pages"][1]["elements"][3].update(image_path=None))
+        with pytest.raises(BundleCorruptError, match=r"unrecorded: \[\('figure', 2, 'p0002_e003'\)\]"):
+            load_bundle(copy)
+
+    def test_page_markdown_for_a_page_the_document_lacks_is_refused(self, copy):
+        extra = copy / "markdown" / "pages" / "page_0009.md"
+        extra.write_bytes(b"page nine")
+        digest = hashlib.sha256(b"page nine").hexdigest()
+        entry = {"path": "markdown/pages/page_0009.md", "size": 9, "sha256": digest}
+        edit_manifest(copy, lambda data: data["artifacts"].append(entry))
+        with pytest.raises(
+            BundleCorruptError, match=r"markdown/pages/page_0009\.md is not one of the document's pages"
+        ):
             load_bundle(copy)
 
     def test_a_missing_entry_listed_twice_is_refused(self, tmp_path, monkeypatch):

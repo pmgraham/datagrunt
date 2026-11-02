@@ -4,6 +4,13 @@ A worker's or tesseract's stderr is drained by a thread into a 4 KiB ring
 (``datagrunt.pdf._process.StderrTail``), never a temporary file: each test
 here refuses every ``tempfile`` call, and checks that each path still ends
 its drain thread (success, failure, kill and timeout).
+
+A child's own writes (a render worker's, a page worker's, tesseract's) are
+not this process's calls, so each test also runs with ``HOME``, ``TMPDIR``
+(``TMP`` and ``TEMP`` too) and its working directory each a fresh empty
+directory, which the children inherit and where their writes would land:
+each must be unchanged afterwards, as ``test_reader_writes`` checks the
+reader's (its :func:`~pdf_tests.test_reader_writes.snapshot`).
 """
 
 import re
@@ -21,6 +28,7 @@ from datagrunt.pdf.render import RenderFailed, render_page, render_pages
 from pdf_tests.builders import PageSpec, TextRun, break_page, build_pdf
 from pdf_tests.test_ocr import fake_tesseract, needs_tesseract, posix_only
 from pdf_tests.test_pipeline import mixed_page, run_page_workers_as, started_workers
+from pdf_tests.test_reader_writes import TMP_KEYS, snapshot
 from pdf_tests.test_render_worker import slow_page
 
 CAP = 1 << 30
@@ -29,16 +37,26 @@ TEMPFILE_CALLS = ("TemporaryFile", "NamedTemporaryFile", "SpooledTemporaryFile",
 
 
 @pytest.fixture
-def no_temporary_files(monkeypatch):
-    """Every ``tempfile`` call fails the test: nothing here may make a temporary file."""
+def no_temporary_files(monkeypatch, tmp_path_factory):
+    """Every ``tempfile`` call fails the test, and no child's write lands in HOME, TMPDIR or the working directory.
+
+    Each is a fresh empty directory for the test (see the module notes), unchanged at its end.
+    """
 
     def refused(*args, **kwargs):
         raise AssertionError("a temporary file was made")
 
+    places = {name: tmp_path_factory.mktemp(name) for name in ("home", "tmp", "cwd")}
+    monkeypatch.setenv("HOME", str(places["home"]))
+    for key in TMP_KEYS:
+        monkeypatch.setenv(key, str(places["tmp"]))
+    monkeypatch.chdir(places["cwd"])
     for name in TEMPFILE_CALLS:
         monkeypatch.setattr(tempfile, name, refused)
+    before = {name: snapshot(place) for name, place in places.items()}
     yield
     assert stderr_threads() == []
+    assert {name: snapshot(place) for name, place in places.items()} == before
 
 
 def stderr_threads() -> list[threading.Thread]:

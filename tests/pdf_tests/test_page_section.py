@@ -699,7 +699,7 @@ class TestPageMarkdown:
         # Hidden spans are flagged, never dropped (spec review D2-b); the marker lets consumers filter them.
         hidden = _paragraph(1, bbox=OFF_PAGE_BBOX, hidden_reasons=("off_page",))
         page = _page(elements=(_paragraph(0), hidden))
-        assert page.to_markdown() == (
+        assert page.to_markdown(include_hidden=True) == (
             "<!-- page 1 route=digital status=ok -->\n\nParagraph 0.\n\n<!-- hidden: off_page -->\nParagraph 1."
         )
 

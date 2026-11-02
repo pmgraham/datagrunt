@@ -7,11 +7,30 @@ Layout (paths relative to the bundle, joined with ``/``):
 
 - ``json/document.json``: the document, by :mod:`datagrunt.pdf.codec`
   (ASCII; its paths relative to the bundle).
+- ``json/elements.jsonl``: the element frame's rows, one compact UTF-8 JSON
+  object a line, as ``PDFWriter.write_jsonl`` writes them (hidden elements
+  included, flagged by ``hidden_reasons``); a figure's ``markdown`` links to
+  its picture relative to the bundle, as ``document.json`` names it.
 - ``markdown/document.md``: the document's Markdown, UTF-8, each lone
-  surrogate written as its escape (:func:`~datagrunt.pdf.frame.utf8_text`);
-  a figure links to ``../images/<sha256>.png``, relative to the file.
-- ``images/<sha256>.png``: each distinct figure, once: its PNG from
-  ``Figure.read_bytes`` (its ``image_path``, else its loader).
+  surrogate written as its escape (:func:`~datagrunt.pdf.frame.utf8_text`),
+  hidden elements omitted (``PDFDocument.to_markdown``'s default: the JSON
+  keeps them); a figure links to its own picture, ``../images/<name>.png``,
+  relative to the file.
+- ``markdown/pages/page_NNNN.md``: each page's Markdown, written as the
+  document's is (hidden elements omitted), a figure linking to
+  ``../../images/<name>.png``.
+- ``images/<sha256>.png``: each distinct picture, once: a figure's PNG from
+  ``Figure.read_bytes`` (its ``image_path``, else its loader), named by
+  the figure's ``sha256`` (its raw stream's). Every figure is read, and
+  its PNG decides whether it is a picture already written: one stream under
+  two image dictionaries (a colour space, a palette, a ``/Decode``) is two
+  pictures, the second ``images/<sha256>-<its PNG's sha256>.png``
+  (:class:`_Pictures`). Each figure's ``image_path`` is its own picture.
+  Why every figure: its ``sha256`` hashes the stream, not the dictionary
+  that decodes it, and nothing else the document records tells two such
+  pictures apart. Keying on the stream alone gave a figure another
+  figure's picture; reading each costs one read a figure (a logo repeated
+  on every page is read on every page), and correctness comes first.
 - ``page_images/page_NNNN.png``: every page's image (origin):
   - a page whose ``page_image`` is set (``"document"``: A5b's vision
     pages, rendered at the effective ``vision_dpi`` and normalized): its
@@ -43,22 +62,44 @@ with the PNG signature. Each file is created exclusively and streamed
 through a SHA-256 as it is written.
 
 :func:`write_bundle` is atomic. Every check comes first (the options, as
-``PipelineOptions`` checks them; the document; ``output_dir``, which must
-not exist or be an empty directory: a non-empty one, a file or a symlink is
-a FileExistsError, never merged into or deleted; its parent; the source,
-which must hash to the document's sha256). The bundle is then written into
-a new staging directory, ``.tmp_<uuid4 hex>`` in ``output_dir``'s parent
-(the same filesystem), ``output_dir`` is checked again and the staging
-directory renamed onto it (``os.replace``). On any failure, an interrupt
-included, the staging directory is removed and the error raised. A writer
-killed outright leaves its staging directory, the only trace: no
-``output_dir``; the next write makes its own and ignores it.
+``PipelineOptions`` checks them; the document; ``overwrite``;
+``output_dir``, which must not exist, or be an empty directory or one
+holding a bundle's manifest (a ``manifest.json`` that reads and checks as
+:func:`load_bundle`'s step 1 checks it): a file, a symlink or any other
+directory, one holding some other ``manifest.json`` included, is a
+FileExistsError, never merged into, replaced or deleted, whatever
+``overwrite`` says; its parent; the source, which must hash to the
+document's sha256).
 
-Pages are written in chunks of :func:`_chunk_size` (``max(4, 32 //
-workers)``) pages, on ``workers`` threads (each render is a worker process
-of A5a's, as is each own page image's loader). Each page's PNGs are written
-in its own thread, so no page's pixels outlive it; a chunk is done before
-the next starts.
+A bundle already at ``output_dir`` is reused when it is this write's
+(:func:`_existing`): it loads and verifies (:func:`load_bundle`), its
+manifest's datagrunt version is this one's, its source sha256 the
+document's, its extraction parameters this write's, and its document this
+one (the pages the bundle rendered compared without their page image).
+Its document is then returned as :func:`load_bundle` returns it, and
+nothing is written. Any other bundle there is a FileExistsError naming why,
+unless ``overwrite`` is True (a reusable bundle is reused either way).
+
+The bundle is then written into a new staging directory, ``.tmp_<uuid4
+hex>`` in ``output_dir``'s parent (the same filesystem), ``output_dir`` is
+checked again and the staging directory renamed onto it (``os.replace``).
+With ``overwrite``, a bundle there is first renamed aside, to ``.old_<uuid4
+hex>`` beside it; the staging directory is renamed in, and the old bundle
+removed. If that second rename fails, the old bundle is renamed back. On
+any failure before the swap, an interrupt included, the staging directory
+is removed and the error raised, and an old bundle is untouched. A writer
+killed outright leaves its staging directory (or, between the two
+renames, the old bundle aside), the only trace: never a half-written
+``output_dir``; the next write makes its own and ignores it. If removing
+the old bundle fails, the error is raised: the new bundle is in place.
+
+Pages are written on ``workers`` threads (each render is a worker process
+of A5a's, as is each own page image's loader), in a sliding window
+(:func:`_in_page_order`): at most ``workers`` pages are in flight, and the
+next page starts as soon as one ends, so a slow page holds one thread,
+never the others. Each page's PNGs are written in its own thread, so no
+page's pixels outlive it: at most ``workers`` pages' pixels are held at
+once. The outcomes are recorded in page order.
 
 The returned document is the input with paths set: each figure's
 ``image_path`` (in ``sections`` too), and each page's ``page_image``. A
@@ -73,10 +114,11 @@ fails (``RenderRefused``, ``RenderFailed``), or whose own image cannot be
 read (a ``DatagruntPDFError``, render errors included, or an ``OSError``)
 or is not a PNG, has no page image (nor bands); a page whose own bands
 cannot be read, or one of them is not a PNG, keeps its image and has no
-bands; a figure whose bytes cannot be read or are not a PNG is not written
-(its figures keep no ``image_path``). Each is a ``missing`` entry naming
-the artifact, the page, the figure's element id (figures) and why. Any
-other error fails the write.
+bands; a figure whose bytes cannot be read or are not a PNG, or that is
+not bound to the source (see below), is not written (it keeps no
+``image_path``; a later figure of its stream is still read).
+Each is a ``missing`` entry naming the artifact, the page, the figure's
+element id (one entry a figure) and why. Any other error fails the write.
 
 The page images are bound to the hashed source. The source's identity
 (A8a's ``SourceIdentity``: device, inode, size, mtime) is taken with its
@@ -89,8 +131,13 @@ to that file (:func:`_unbound`): each renders from ``source`` itself
 verifying reader. One that renders from another file, names no source, or
 an image with no loader is not read: the page has no page image, a
 ``missing`` entry says why, and a ``UserWarning`` is emitted once the
-bundle is published. What this cannot see is the A8a limit: a write that
-keeps the size and restores the mtime.
+bundle is published. A figure is bound the same way
+(:func:`_figure_unbound`): its PNG loader reads from ``source`` (A5a's
+``FigureRead``) or is a bundle's verifying reader. A figure with no loader
+(a bare ``image_path``, which would be read unverified, whatever file it
+names) or another loader is not read: it has no image, a ``missing`` entry
+says why, and a ``UserWarning`` is emitted. What this cannot see is the A8a
+limit: a write that keeps the size and restores the mtime.
 
 Known limitations, documented:
 
@@ -101,7 +148,9 @@ Known limitations, documented:
   not ``FileExistsError``; it is never merged into, and staging is removed.
 - Figures are read in batches of up to 64 a figure worker
   (:func:`~datagrunt.pdf._loaders.figure_pngs`), each read reopening the
-  PDF, not batched by page through one handle.
+  PDF, not batched by page through one handle. Every figure is read, the
+  figures of one stream too: only its PNG shows it is the same picture
+  (see ``images/`` above).
 
 :func:`load_bundle` takes a bundle directory or its ``manifest.json``
 and returns the document. Nothing is trusted before it is checked:
@@ -111,8 +160,9 @@ and returns the document. Nothing is trusted before it is checked:
    (exactly, at every level) and values; every artifact path through
    :func:`~datagrunt.pdf.codec.contained_path` (plain relative parts,
    resolved inside the bundle: no ``..``, absolute path or symlink out),
-   listed once, ``json/document.json`` and ``markdown/document.md`` among
-   them, each no larger than the asset limit.
+   listed once, ``json/document.json``, ``json/elements.jsonl`` and
+   ``markdown/document.md`` among them, each no larger than the asset
+   limit.
 2. Every artifact, opened safely (:func:`_opened`): its path through
    ``contained_path`` again, no directory on it below the bundle a symlink,
    and the file opened with ``O_NOFOLLOW`` (a symlink is refused) and
@@ -125,9 +175,10 @@ and returns the document. Nothing is trusted before it is checked:
    helper): the manifest's source sha256, ``integrity_verified`` and
    ``degraded_pages`` must be its; every path it names must be a verified
    artifact; the manifest's page images must be its (the same pages, DPI
-   and ``contrast_normalized``; a rendered one without bands); and its
-   missing page images, own bands and figures must be exactly the
-   manifest's ``missing`` entries.
+   and ``contrast_normalized``; a rendered one without bands); the
+   manifest must list a ``markdown/pages/page_NNNN.md`` for each of its
+   pages and no other; and its missing page images, own bands and figures
+   must be exactly the manifest's ``missing`` entries.
 
 What is guaranteed: every byte a loaded document returns matches the
 manifest at the moment it is read. Its figures and page images keep their
@@ -157,11 +208,13 @@ import stat
 import uuid
 import warnings
 from collections.abc import Callable, Iterator, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
-from typing import IO, BinaryIO, NamedTuple, cast
+from typing import IO, BinaryIO, NamedTuple, TypeVar, cast
 
+import polars as pl
 from PIL import Image
 
 from datagrunt.pdf._loaders import figure_pngs
@@ -185,7 +238,7 @@ from datagrunt.pdf.codec import (
 )
 from datagrunt.pdf.elements import _MAX_ASSET_BYTES, Figure, Page, PageImage, PDFDocument
 from datagrunt.pdf.exceptions import BundleCorruptError, DatagruntPDFError, PDFSourceChangedError
-from datagrunt.pdf.frame import utf8_text
+from datagrunt.pdf.frame import element_frame, utf8_text
 from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, SourceIdentity, _opened_source, _stream_sha256
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page
 
@@ -194,9 +247,13 @@ __all__ = ["BUNDLE_FORMAT_VERSION", "load_bundle", "write_bundle"]
 BUNDLE_FORMAT_VERSION = "5.0"
 MANIFEST = "manifest.json"
 DOCUMENT_JSON = "json/document.json"
+ELEMENTS_JSONL = "json/elements.jsonl"
 DOCUMENT_MARKDOWN = "markdown/document.md"
+_PAGE_MARKDOWN_DIR = "markdown/pages/"
 
 _STAGING_PREFIX = ".tmp_"
+# An old bundle renamed aside while an overwrite swaps the new one in.
+_ASIDE_PREFIX = ".old_"
 # A render worker's memory past its start, and its time: A5b's vision route's.
 _MEMORY_CAP_BYTES = 2 << 30
 _RENDER_TIMEOUT_S = 120.0
@@ -223,6 +280,7 @@ _PARAM_KEYS = ("dpi", "vision_dpi", "max_render_pixels", "workers")
 _MISSING_ARTIFACTS = ("bands", "figure", "page_image")
 # Where a page image came from: the document's own (its loaders), or the bundle's render at dpi.
 _ORIGINS = ("document", "render")
+_T = TypeVar("_T")
 
 
 class _Artifact(NamedTuple):
@@ -309,26 +367,33 @@ def write_bundle(
     max_render_pixels: int = 16_000_000,
     workers: int = 1,
     extraction_params: Mapping[str, object] | None = None,
+    overwrite: bool = False,
 ) -> PDFDocument:
     """Write ``document``, extracted from ``source``, as a bundle at ``output_dir``, atomically.
 
-    See the module notes for the layout, the checks, the atomic write, the
-    chunks and the failures recorded. ``password`` opens ``source`` for the
-    renders. ``extraction_params`` are the document's other extraction
-    parameters (``ocr``, ``min_image_dimension``, ``strict``: what A7b's
-    ``PDFWriter`` extracted with), recorded in the manifest after the
-    writer's own (see :func:`_checked_params`).
+    See the module notes for the layout, the checks, the reuse of a bundle
+    already there, the atomic write (and swap, with ``overwrite``), the
+    page window and the failures recorded. ``password`` opens ``source``
+    for the renders. ``extraction_params`` are the document's other
+    extraction parameters (``ocr``, ``min_image_dimension``, ``strict``:
+    what A7b's ``PDFWriter`` extracted with), recorded in the manifest after
+    the writer's own (see :func:`_checked_params`). ``overwrite`` replaces a
+    bundle at ``output_dir`` that is not this write's.
 
     Returns:
-        ``document`` with paths set (see the module notes).
+        ``document`` with paths set (see the module notes), or the reused
+        bundle's document, as :func:`load_bundle` returns it.
 
     Raises:
         TypeError, ValueError: If an option is invalid (as ``PipelineOptions``
             raises it), an extraction parameter is (:func:`_checked_params`),
-            ``document`` is not a PDFDocument, ``output_dir`` or ``source`` is
-            not a path, or ``source`` does not hash to the document's sha256.
-        FileExistsError: If ``output_dir`` exists and is not an empty
-            directory (a symlink is refused too), before or after the write.
+            ``document`` is not a PDFDocument, ``overwrite`` is not a bool,
+            ``output_dir`` or ``source`` is not a path, or ``source`` does not
+            hash to the document's sha256.
+        FileExistsError: If ``output_dir`` is a file, a symlink or a
+            non-empty directory holding no bundle; or holds a bundle that is
+            not this write's and ``overwrite`` is False (before or after the
+            write).
         FileNotFoundError: If ``source`` or ``output_dir``'s parent is missing.
         PDFSourceChangedError: If ``source`` changed (or was removed) between
             its hash and the publish: the bundle is not published.
@@ -342,19 +407,24 @@ def write_bundle(
     params = _checked_params(options, extraction_params)
     if not isinstance(document, PDFDocument):
         raise TypeError(f"document must be a PDFDocument, got {type(document).__name__}")
+    replace = strict_bool("overwrite", overwrite)
     target = _checked_target(output_dir)
     pdf = PDFSource(path=_checked_path(source, "source"), password=password)
     identity = _check_source(pdf, document.metadata.sha256)
+    reused = _reused(target, document, params, replace)
+    if reused is not None:
+        return reused
     staging = target.parent / f"{_STAGING_PREFIX}{uuid.uuid4().hex}"
     staging.mkdir()
     try:
         written, notices = _staged(document, staging, target, pdf, options, params)
         _check_unchanged(pdf, identity)
-        _refuse_existing(target)
-        os.replace(staging, target)
+        aside = _publish(staging, target, replace)
     except BaseException:
         shutil.rmtree(staging)
         raise
+    if aside is not None:
+        shutil.rmtree(aside)
     for notice in notices:
         warnings.warn(notice, UserWarning, stacklevel=2)
     return written
@@ -397,14 +467,43 @@ def _json_scalar(name: str, value: object) -> object:
 
 
 def _checked_target(output_dir: object) -> Path:
-    """``output_dir`` made absolute, if it may be written: absent or an empty directory, in an existing one."""
+    """``output_dir`` made absolute, if it may hold the bundle: absent, empty or a bundle's, in a directory."""
     if not isinstance(output_dir, (str, os.PathLike)):
         raise TypeError(f"output_dir must be a str or os.PathLike, got {type(output_dir).__name__}")
     target = Path(output_dir).absolute()
-    _refuse_existing(target)
+    _refuse_unusable(target)
     if not target.parent.is_dir():
         raise FileNotFoundError(errno.ENOENT, "output_dir's parent is not an existing directory", str(target.parent))
     return target
+
+
+def _refuse_unusable(target: Path) -> None:
+    """Raise FileExistsError unless ``target`` is absent, an empty directory, or a bundle's (:func:`_holds_bundle`).
+
+    A symlink, a file and any other directory are refused: a bundle is never
+    merged into one, nor replaces one, whatever ``overwrite`` says.
+    """
+    if target.is_symlink() or not target.exists() or not target.is_dir():
+        _refuse_existing(target)
+        return
+    if _is_empty(target) or _holds_bundle(target):
+        return
+    message = "output_dir exists and is not empty, and holds no bundle: a bundle never merges into it, nor replaces it"
+    raise FileExistsError(errno.EEXIST, message, str(target))
+
+
+def _holds_bundle(directory: Path) -> bool:
+    """True if ``directory`` holds a bundle's manifest: one that reads and checks as :func:`load_bundle`'s does."""
+    try:
+        _read_manifest(directory)
+    except BundleCorruptError:
+        return False
+    return True
+
+
+def _is_empty(directory: Path) -> bool:
+    with os.scandir(directory) as entries:
+        return next(entries, None) is None
 
 
 def _refuse_existing(target: Path) -> None:
@@ -415,10 +514,74 @@ def _refuse_existing(target: Path) -> None:
         return
     if not target.is_dir():
         raise FileExistsError(errno.EEXIST, "output_dir exists and is not a directory", str(target))
-    with os.scandir(target) as entries:
-        if next(entries, None) is not None:
-            message = "output_dir exists and is not empty: a bundle is never merged into it"
-            raise FileExistsError(errno.EEXIST, message, str(target))
+    if not _is_empty(target):
+        message = "output_dir exists and is not empty: a bundle is never merged into it"
+        raise FileExistsError(errno.EEXIST, message, str(target))
+
+
+def _reused(target: Path, document: PDFDocument, params: Mapping[str, object], replace: bool) -> PDFDocument | None:
+    """The bundle at ``target`` if it is this write's (:func:`_existing`); None if there is none, or it may be replaced.
+
+    Raises:
+        FileExistsError: If ``target`` holds a bundle that is not this write's and ``replace`` is False.
+    """
+    if not target.is_dir() or _is_empty(target):
+        return None
+    loaded, why = _existing(target, document, params)
+    if loaded is not None:
+        return loaded
+    if replace:
+        return None
+    message = f"output_dir holds a bundle that is not this write's ({why}): pass overwrite=True to replace it"
+    raise FileExistsError(errno.EEXIST, message, str(target))
+
+
+def _existing(target: Path, document: PDFDocument, params: Mapping[str, object]) -> tuple[PDFDocument | None, str]:
+    """The bundle at ``target`` and ``""`` if this write would make it (see the module notes); else None and why."""
+    try:
+        manifest, loaded = _loaded(target)
+    except (BundleCorruptError, OSError) as exc:
+        return None, f"it is not a valid bundle: {exc}"
+    version = _datagrunt_version()
+    if manifest.datagrunt_version != version:
+        return None, f"it was written by datagrunt {manifest.datagrunt_version}, not {version}"
+    if manifest.source_sha256 != document.metadata.sha256:
+        return None, f"its source_sha256 is {manifest.source_sha256}, not the document's {document.metadata.sha256}"
+    if manifest.extraction_params != dict(params):
+        return None, f"its extraction_params {manifest.extraction_params} are not this write's {dict(params)}"
+    rendered = {entry.page_number for entry in manifest.page_images if entry.origin == "render"}
+    if _without_renders(loaded, rendered) != _without_renders(document, rendered):
+        return None, "its document is not this one"
+    return loaded, ""
+
+
+def _without_renders(document: PDFDocument, rendered: set[int]) -> PDFDocument:
+    """``document`` whose pages in ``rendered`` (the bundle's renders) have no page image: what a write compares."""
+    pages = tuple(
+        dataclasses.replace(page, page_image=None) if page.page_number in rendered else page for page in document.pages
+    )
+    return dataclasses.replace(document, pages=pages)
+
+
+def _publish(staging: Path, target: Path, replace: bool) -> Path | None:
+    """Rename ``staging`` onto ``target``; with ``replace``, a bundle there is renamed aside first, and returned.
+
+    The caller removes what is returned once the new bundle is in place. If
+    the rename onto ``target`` fails, the old bundle is renamed back.
+    """
+    _refuse_unusable(target)
+    if not replace or not target.is_dir() or _is_empty(target):
+        _refuse_existing(target)
+        os.replace(staging, target)
+        return None
+    aside = target.parent / f"{_ASIDE_PREFIX}{uuid.uuid4().hex}"
+    os.replace(target, aside)
+    try:
+        os.replace(staging, target)
+    except BaseException:
+        os.replace(aside, target)
+        raise
+    return aside
 
 
 def _check_source(source: PDFSource, expected: str) -> SourceIdentity:
@@ -458,12 +621,9 @@ def _staged(
 ) -> tuple[PDFDocument, tuple[str, ...]]:
     """Write every artifact, then the manifest, into ``staging``: the document (paths in ``target``), and warnings."""
     ledger = _Ledger()
-    figures = _write_figures(document, staging, ledger)
+    figures = _write_figures(document, staging, source.path, ledger)
     renders = _write_renders(document, staging, source, options, ledger)
-    as_json = document_to_json_bytes(_with_paths(document, figures, renders, Path()))
-    ledger.artifacts.append(_write_bytes(staging, DOCUMENT_JSON, as_json))
-    markdown = utf8_text(_with_paths(document, figures, renders, Path("..")).to_markdown())
-    ledger.artifacts.append(_write_bytes(staging, DOCUMENT_MARKDOWN, markdown.encode("utf-8")))
+    _write_texts(document, figures, renders, staging, ledger)
     _write_bytes(staging, MANIFEST, _manifest(document, params, renders, ledger))
     by_path = {artifact.path: artifact for artifact in ledger.artifacts}
     origins = {number: written.origin for number, written in renders.items()}
@@ -471,25 +631,101 @@ def _staged(
     return returned, tuple(ledger.warnings)
 
 
-def _write_figures(document: PDFDocument, staging: Path, ledger: _Ledger) -> dict[str, str]:
-    """Write each distinct figure (by sha256) once; its relative path by sha256."""
-    written: dict[str, str] = {}
-    tried: set[str] = set()
-    distinct: list[Figure] = []
-    for figure in document.figures:
-        if figure.sha256 not in tried:
-            tried.add(figure.sha256)
-            distinct.append(figure)
-    for figure, read in zip(distinct, figure_pngs(distinct), strict=True):  # read in batches, each in its turn
+@dataclass
+class _Pictures:
+    """The distinct figure pictures written so far: each one's file name, by its stream's and its PNG's sha256.
+
+    A figure's ``sha256`` hashes its raw stream, but its PNG depends on its
+    image dictionary too (a colour space, a palette, a ``/Decode``), so one
+    stream can be two pictures: a picture is its stream's sha256 and its
+    PNG's. The first picture of a stream is ``<sha256>.png``; another
+    picture of it, ``<sha256>-<its PNG's sha256>.png``.
+    """
+
+    names: dict[tuple[str, str], str] = field(default_factory=dict)
+    streams: set[str] = field(default_factory=set)
+
+    def name(self, sha256: str, digest: str) -> tuple[str, bool]:
+        """The file name of the PNG whose sha256 is ``digest``, of stream ``sha256``; and whether it is unwritten."""
+        known = self.names.get((sha256, digest))
+        if known is not None:
+            return known, False
+        return (f"{sha256}-{digest}.png" if sha256 in self.streams else f"{sha256}.png"), True
+
+    def record(self, sha256: str, digest: str, name: str) -> None:
+        """Note the picture written, as ``name`` (once its file is)."""
+        self.names[(sha256, digest)] = name
+        self.streams.add(sha256)
+
+
+def _write_texts(
+    document: PDFDocument, figures: Mapping[str, str], renders: Mapping[int, _Written], staging: Path, ledger: _Ledger
+) -> None:
+    """Write the document's JSON, its frame's rows, its Markdown and each page's, its paths relative to each file."""
+    relative = _with_paths(document, figures, renders, Path())
+    ledger.artifacts.append(_write_bytes(staging, DOCUMENT_JSON, document_to_json_bytes(relative)))
+    rows = element_frame(relative)
+    ledger.artifacts.append(_write_stream(staging, ELEMENTS_JSONL, lambda sink: _write_rows(rows, sink.write)))
+    markdown = utf8_text(_with_paths(document, figures, renders, Path("..")).to_markdown())
+    ledger.artifacts.append(_write_bytes(staging, DOCUMENT_MARKDOWN, markdown.encode("utf-8")))
+    for page in _with_paths(document, figures, renders, Path("../..")).pages:
+        text = utf8_text(page.to_markdown(include_hidden=False))
+        ledger.artifacts.append(_write_bytes(staging, _page_markdown(page.page_number), text.encode("utf-8")))
+
+
+def _page_markdown(page_number: int) -> str:
+    """A page's Markdown file in the bundle."""
+    return f"{_PAGE_MARKDOWN_DIR}page_{page_number:04d}.md"
+
+
+def _write_rows(frame: pl.DataFrame, write: Callable[[bytes], object]) -> None:
+    """Write each row of ``frame`` as a line of compact UTF-8 JSON, in order (``PDFWriter.write_jsonl``'s lines)."""
+    for row in frame.iter_rows(named=True):
+        line = json.dumps(row, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        write(line.encode("utf-8") + b"\n")
+
+
+def _write_figures(document: PDFDocument, staging: Path, source: Path, ledger: _Ledger) -> dict[str, str]:
+    """Write each bound figure's PNG, each distinct picture once (:class:`_Pictures`); each written one's path, by id.
+
+    A figure not bound to ``source`` (:func:`_figure_unbound`) is not read: it gets a missing entry and a warning.
+    """
+    paths: dict[str, str] = {}
+    pictures = _Pictures()
+    figures = _bound_figures(document.figures, source, ledger)
+    for figure, read in zip(figures, figure_pngs(figures), strict=True):  # read in batches, each in its turn
         data, why = _png(read)
         if data is None:
             reason = f"figure {figure.sha256} was not written: {why}"
             ledger.missing.append(_Missing("figure", figure.page_number, figure.element_id, reason))
             continue
-        relative = f"images/{figure.sha256}.png"
+        paths[figure.element_id] = _write_picture(staging, figure.sha256, data, pictures, ledger)
+    return paths
+
+
+def _bound_figures(figures: tuple[Figure, ...], source: Path, ledger: _Ledger) -> tuple[Figure, ...]:
+    """The figures bound to ``source`` (:func:`_figure_unbound`); each other is unread: a missing entry, a warning."""
+    bound: list[Figure] = []
+    for figure in figures:
+        unbound = _figure_unbound(figure, source)
+        if not unbound:
+            bound.append(figure)
+            continue
+        reason = f"figure {figure.sha256} {unbound}: its bytes could not be bound to the hashed source"
+        ledger.missing.append(_Missing("figure", figure.page_number, figure.element_id, reason))
+        ledger.warnings.append(f"figure {figure.element_id} {unbound}: no image is written for it")
+    return tuple(bound)
+
+
+def _write_picture(staging: Path, sha256: str, data: bytes, pictures: _Pictures, ledger: _Ledger) -> str:
+    """The relative path of the picture ``data`` (of stream ``sha256``): written now unless it already is."""
+    digest = hashlib.sha256(data).hexdigest()
+    name, unwritten = pictures.name(sha256, digest)
+    relative = f"images/{name}"
+    if unwritten:
         ledger.artifacts.append(_write_bytes(staging, relative, data))
-        written[figure.sha256] = relative
-    return written
+        pictures.record(sha256, digest, name)
+    return relative
 
 
 def _png(read: Callable[[], bytes]) -> tuple[bytes | None, str]:
@@ -503,34 +739,43 @@ def _png(read: Callable[[], bytes]) -> tuple[bytes | None, str]:
     return data, ""
 
 
-def _chunk_size(workers: int) -> int:
-    """Pages a chunk holds: the spec's ``max(4, 32 // workers)``."""
-    return max(4, 32 // workers)
+def _in_page_order(task: Callable[[Page], _T], pages: tuple[Page, ...], workers: int, prefix: str) -> list[_T]:
+    """``task`` of every page on ``workers`` threads, at most ``workers`` in flight; the outcomes, in page order.
 
-
-def _chunks(page_count: int, workers: int) -> tuple[range, ...]:
-    """The page indices, in order, in runs of :func:`_chunk_size` (the last may be shorter)."""
-    size = _chunk_size(workers)
-    return tuple(range(start, min(start + size, page_count)) for start in range(0, page_count, size))
+    A sliding window: the next page is submitted as soon as one ends, so a
+    slow page holds one thread, never the others, and no more than
+    ``workers`` pages are ever submitted and unfinished. An error a task
+    raises fails the call, once the pages in flight have ended.
+    """
+    outcomes: dict[int, _T] = {}
+    queued = iter(range(len(pages)))
+    running: dict[Future[_T], int] = {}
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix=prefix)
+    try:
+        for _ in range(len(pages) + 1):  # bounded: each pass collects at least one page, but the last
+            for index in islice(queued, workers - len(running)):
+                running[pool.submit(task, pages[index])] = index
+            if not running:
+                break
+            done, _pending = wait(running, return_when=FIRST_COMPLETED)
+            for future in done:
+                outcomes[running.pop(future)] = future.result()
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    return [outcomes[index] for index in range(len(pages))]
 
 
 def _write_renders(
     document: PDFDocument, staging: Path, source: PDFSource, options: PipelineOptions, ledger: _Ledger
 ) -> dict[int, _Written]:
-    """Write every page's image, chunk by chunk on ``workers`` threads; each page image written, by number."""
+    """Write every page's image on ``workers`` threads (:func:`_in_page_order`); each page image written, by number."""
     renders: dict[int, _Written] = {}
-    pages = document.pages
 
     def task(page: Page) -> _PageOutcome:
         return _page_outcome(page, staging, source, options)
 
-    pool = ThreadPoolExecutor(max_workers=options.workers, thread_name_prefix="datagrunt-bundle")
-    try:
-        for chunk in _chunks(len(pages), options.workers):
-            for outcome in pool.map(task, [pages[index] for index in chunk]):
-                _record(outcome, renders, ledger)
-    finally:
-        pool.shutdown(wait=True, cancel_futures=True)
+    for outcome in _in_page_order(task, document.pages, options.workers, "datagrunt-bundle"):
+        _record(outcome, renders, ledger)
     return renders
 
 
@@ -613,8 +858,28 @@ def _unbound(image: PageImage, source: Path) -> str:
     """
     if image._loader is None:
         return "has no loader"
-    target = source.resolve()
-    for loader in (image._loader, image._band_loader):
+    return _loaders_unbound((image._loader, image._band_loader), source, "renders")
+
+
+def _figure_unbound(figure: Figure, source: Path | None) -> str:
+    """Why the figure's PNG is not bound to ``source``, or ``""`` if it is: as :func:`_unbound` binds a page image.
+
+    Its PNG must come from a loader (a bare ``image_path`` is read
+    unverified, whatever file it names) that reads from ``source`` itself
+    (A5a's ``FigureRead`` names the PDF it reads as ``source``; compared by
+    resolved path) or is a bundle's verifying reader. With no ``source`` (a
+    ``PDFWriter`` built from a document has none) the loader must still name
+    the PDF it reads, or be a bundle's verifying reader.
+    """
+    if figure._loader is None:
+        return "has no loader"
+    return _loaders_unbound((figure._loader,), source, "reads")
+
+
+def _loaders_unbound(loaders: tuple[object, ...], source: Path | None, verb: str) -> str:
+    """Why one of ``loaders`` (None ones skipped) is not bound to ``source``, or ``""``; ``verb`` says what it does."""
+    target = None if source is None else source.resolve()
+    for loader in loaders:
         owner = getattr(loader, "__self__", loader)
         if loader is None or isinstance(owner, (_ArtifactReader, _BandsReader)):
             continue
@@ -622,8 +887,8 @@ def _unbound(image: PageImage, source: Path) -> str:
         if not isinstance(origin, (str, os.PathLike)):
             return "has a loader that names no source"
         resolved = Path(origin).resolve()
-        if resolved != target:
-            return f"renders from {resolved}, not from the source {target}"
+        if target is not None and resolved != target:
+            return f"{verb} from {resolved}, not from the source {target}"
     return ""
 
 
@@ -685,7 +950,7 @@ def _write_stream(staging: Path, relative: str, fill: Callable[[_Sink], object])
 def _with_paths(
     document: PDFDocument, figures: Mapping[str, str], renders: Mapping[int, _Written], base: Path
 ) -> PDFDocument:
-    """``document`` with its figures' and pages' paths at ``base`` (sections hold the same figures)."""
+    """``document`` with its figures' (``figures``: by element id) and pages' paths at ``base`` (sections too)."""
     pages = tuple(_page_with_paths(page, figures, renders.get(page.page_number), base) for page in document.pages)
     return _with_pages(document, pages)
 
@@ -721,7 +986,7 @@ def _page_with_paths(page: Page, figures: Mapping[str, str], written: _Written |
 
 
 def _figure_with_path(figure: Figure, figures: Mapping[str, str], base: Path) -> Figure:
-    relative = figures.get(figure.sha256)
+    relative = figures.get(figure.element_id)
     return dataclasses.replace(figure, image_path=None if relative is None else _joined(base, relative))
 
 
@@ -771,7 +1036,9 @@ class _ImageEntry(NamedTuple):
 class _Manifest(NamedTuple):
     """A manifest's values, checked (see the module notes)."""
 
+    datagrunt_version: str
     source_sha256: str
+    extraction_params: dict[str, object]
     integrity_verified: bool
     degraded_pages: tuple[int, ...]
     page_images: tuple[_ImageEntry, ...]
@@ -792,7 +1059,12 @@ def load_bundle(path: str | os.PathLike[str]) -> PDFDocument:
         BundleCorruptError: If the bundle is not what its manifest says
             (naming the artifact).
     """
-    root = _bundle_root(path)
+    _manifest, document = _loaded(_bundle_root(path))
+    return document
+
+
+def _loaded(root: Path) -> tuple[_Manifest, PDFDocument]:
+    """The bundle at ``root``'s manifest and its document, every check done (see the module notes)."""
     manifest = _read_manifest(root)
     raw = b""
     for entry in manifest.artifacts:
@@ -807,10 +1079,11 @@ def load_bundle(path: str | os.PathLike[str]) -> PDFDocument:
     by_path = {entry.path: entry for entry in manifest.artifacts}
     _check_facts(document, manifest)
     _check_paths(document, set(by_path), root)
+    _check_page_markdown(document, set(by_path))
     _check_page_images(document, manifest.page_images)
     origins = {entry.page_number: entry.origin for entry in manifest.page_images}
     _check_missing(document, manifest.missing, origins)
-    return _with_readers(document, root, by_path, origins)
+    return manifest, _with_readers(document, root, by_path, origins)
 
 
 def _bundle_root(path: object) -> Path:
@@ -854,12 +1127,14 @@ def _manifest_of(data: object, root: Path) -> _Manifest:
     if not isinstance(version, str) or version != BUNDLE_FORMAT_VERSION:
         message = f"bundle_format_version {version!r} is not supported: this datagrunt reads {BUNDLE_FORMAT_VERSION!r}"
         raise ValueError(message)
-    non_blank_str("datagrunt_version", top["datagrunt_version"])
+    datagrunt_version = non_blank_str("datagrunt_version", top["datagrunt_version"])
     _check_params(top["extraction_params"])
     pages = enumerate(_array("degraded_pages", top["degraded_pages"]))
     missing = enumerate(_array("missing", top["missing"]))
     return _Manifest(
+        datagrunt_version=datagrunt_version,
         source_sha256=sha256_hex("source_sha256", top["source_sha256"]),
+        extraction_params=dict(top["extraction_params"]),
         integrity_verified=strict_bool("integrity_verified", top["integrity_verified"]),
         degraded_pages=tuple(int_at_least(f"degraded_pages[{i}]", page, 1) for i, page in pages),
         page_images=_image_entries(top["page_images"]),
@@ -911,7 +1186,7 @@ def _listed_artifacts(value: object, root: Path) -> tuple[_Artifact, ...]:
             raise ValueError(f"artifacts lists {artifact.path!r} twice")
         seen.add(artifact.path)
         listed.append(artifact)
-    for required in (DOCUMENT_JSON, DOCUMENT_MARKDOWN):
+    for required in (DOCUMENT_JSON, ELEMENTS_JSONL, DOCUMENT_MARKDOWN):
         if required not in seen:
             raise ValueError(f"artifacts lists no {required}")
     return tuple(listed)
@@ -1109,6 +1384,17 @@ def _check_paths(document: PDFDocument, listed: set[str], root: Path) -> None:
             raise BundleCorruptError(f"{DOCUMENT_JSON}: {relative!r} is not an artifact the manifest lists")
 
 
+def _check_page_markdown(document: PDFDocument, listed: set[str]) -> None:
+    """The manifest must list each page's Markdown, and no Markdown for a page the document does not have."""
+    expected = {_page_markdown(page.page_number) for page in document.pages}
+    present = {path for path in listed if path.startswith(_PAGE_MARKDOWN_DIR)}
+    unlisted, stray = sorted(expected - present), sorted(present - expected)
+    if unlisted:
+        raise BundleCorruptError(f"{MANIFEST}: artifacts lists no {unlisted[0]}")
+    if stray:
+        raise BundleCorruptError(f"{MANIFEST}: {stray[0]} is not one of the document's pages' Markdown")
+
+
 def _check_page_images(document: PDFDocument, entries: tuple[_ImageEntry, ...]) -> None:
     """The manifest's page images must be the document's: the same pages, DPI and normalization; no rendered bands."""
     listed = {entry.page_number: entry for entry in entries}
@@ -1132,7 +1418,7 @@ def _check_page_images(document: PDFDocument, entries: tuple[_ImageEntry, ...]) 
 
 
 def _unwritten(document: PDFDocument, origins: Mapping[int, str]) -> set[tuple[str, int, str | None]]:
-    """What the document lacks, as missing entries' keys: page images, own bands, figures (by first figure).
+    """What the document lacks, as missing entries' keys: page images, own bands, figures (each its own).
 
     Only a page's own image (origin ``"document"``) has bands to lack: the
     bundle's render has none.
@@ -1144,11 +1430,9 @@ def _unwritten(document: PDFDocument, origins: Mapping[int, str]) -> set[tuple[s
             keys.add(("page_image", page.page_number, None))
         elif origins.get(page.page_number) == "document" and not image.band_paths:
             keys.add(("bands", page.page_number, None))
-    first: dict[str, Figure] = {}
     for figure in document.figures:
-        owner = first.setdefault(figure.sha256, figure)
         if figure.image_path is None:
-            keys.add(("figure", owner.page_number, owner.element_id))
+            keys.add(("figure", figure.page_number, figure.element_id))
     return keys
 
 

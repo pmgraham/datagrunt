@@ -5,6 +5,14 @@ fields in ``__post_init__`` and rejects bad input at construction. Fields hold
 extracted data verbatim (preserve, not transform); Markdown escaping happens
 only when an element is rendered with ``to_markdown()``.
 
+Hidden elements are flagged, never dropped: a page's ``elements``, the JSON
+and the frame keep them. Markdown omits them by default
+(``include_hidden=False`` on :meth:`PDFDocument.to_markdown`,
+:meth:`Page.to_markdown` and :meth:`Section.to_markdown`): it is what a
+reader sees. With ``include_hidden=True``, each is rendered after its
+``<!-- hidden: reasons -->`` line, as an element renders itself
+(``to_markdown`` of one element, which the frame's ``markdown`` column holds).
+
 Coordinates are PDF points with a top-left origin.
 """
 
@@ -30,6 +38,7 @@ from datagrunt.pdf._validate import (
     positive_float,
     sha256_hex,
     str_tuple,
+    strict_bool,
 )
 from datagrunt.pdf.exceptions import DatagruntPDFError
 
@@ -89,9 +98,11 @@ _MARKDOWN_SYNTAX_CHAR = re.compile(r"[\\`*_\[\]<>&|~#]")
 
 # What can still open a block at the start of a line once every
 # _MARKDOWN_SYNTAX_CHAR is escaped: a list, thematic-break, or setext marker
-# (``-``, ``+``, ``=``), or an ordered-list number (digits before ``.``/``)``).
-# [0-9], not \d: list numbers are ASCII digits only.
-_LINE_START_MARKER = re.compile(r"\A(?:[-+=]|[0-9]+(?=[.)]))")
+# (``-``, ``+``, ``=``), or an ordered-list number (digits before ``.``/``)``
+# that whitespace or the line's end follows, as CommonMark requires: ``45.00``
+# and ``3)x`` are text, ``1. item`` and ``3.`` open a list). [0-9], not \d:
+# list numbers are ASCII digits only.
+_LINE_START_MARKER = re.compile(r"\A(?:[-+=]|[0-9]+(?=[.)](?:[ \t]|\Z)))")
 
 # A marker CommonMark reads as an ordered-list item: 1-9 ASCII digits, then
 # "." or ")" (the digits and the delimiter are the groups).
@@ -1151,15 +1162,24 @@ def _check_document_elements(name: str, value: object) -> None:
     _check_instances(name, value, _ELEMENT_TYPES, f"document element ({names})")
 
 
-def _render_elements(elements: Iterable[DocumentElement]) -> list[str]:
-    """Render each element's Markdown, with ``_LIST_SEPARATOR`` between two consecutive lists.
+def _render_elements(elements: Iterable[DocumentElement], include_hidden: object) -> list[str]:
+    """Render each element's Markdown (a hidden one only with ``include_hidden``), lists kept apart.
 
-    Two lists separated only by a blank line merge into one loose list (an
-    ordered pair is renumbered); an HTML comment line between them ends the first.
+    ``_LIST_SEPARATOR`` goes between two consecutive lists rendered: two
+    lists separated only by a blank line merge into one loose list (an
+    ordered pair is renumbered); an HTML comment line between them ends the
+    first. Lists a hidden element stood between are consecutive once it is
+    omitted, so they get it too.
+
+    Raises:
+        TypeError: If ``include_hidden`` is not a bool.
     """
+    shown = strict_bool("include_hidden", include_hidden)
     parts: list[str] = []
     previous: DocumentElement | None = None
     for element in elements:
+        if element.is_hidden and not shown:
+            continue
         if isinstance(element, BulletList) and isinstance(previous, BulletList):
             parts.append(_LIST_SEPARATOR)
         parts.append(element.to_markdown())
@@ -1300,13 +1320,18 @@ class Page:
                 "an element off the page must carry the 'off_page' hidden reason"
             )
 
-    def to_markdown(self) -> str:
+    def to_markdown(self, *, include_hidden: bool = False) -> str:
         """Render a ``<!-- page N route=R status=S -->`` comment, then each element, blank-line separated.
 
-        Consecutive lists get a ``<!-- -->`` line between them so they stay separate lists.
+        A hidden element is omitted, or rendered behind its marker with
+        ``include_hidden=True`` (see the module notes). Consecutive lists get
+        a ``<!-- -->`` line between them so they stay separate lists.
+
+        Raises:
+            TypeError: If ``include_hidden`` is not a bool.
         """
         header = f"<!-- page {self.page_number} route={self.route} status={self.status} -->"
-        return "\n\n".join([header, *_render_elements(self.elements)])
+        return "\n\n".join([header, *_render_elements(self.elements, include_hidden)])
 
 
 def _check_page_span(value: object) -> tuple[int, int]:
@@ -1427,16 +1452,21 @@ class Section:
         """The section's figures, in document order."""
         return tuple(element for element in self.elements if isinstance(element, Figure))
 
-    def to_markdown(self) -> str:
+    def to_markdown(self, *, include_hidden: bool = False) -> str:
         """Render the heading (unless it is already in ``elements``), then each element, blank-line separated.
 
-        Consecutive lists get a ``<!-- -->`` line between them so they stay separate lists.
+        A hidden element is omitted, or rendered behind its marker with
+        ``include_hidden=True`` (see the module notes). Consecutive lists get
+        a ``<!-- -->`` line between them so they stay separate lists.
+
+        Raises:
+            TypeError: If ``include_hidden`` is not a bool.
         """
         elements: tuple[DocumentElement, ...] = self.elements
         heading = self.heading
         if heading is not None and all(element.element_id != heading.element_id for element in elements):
             elements = (heading, *elements)
-        return "\n\n".join(_render_elements(elements))
+        return "\n\n".join(_render_elements(elements, include_hidden))
 
 
 def _index_by_id(elements: tuple[DocumentElement, ...]) -> dict[str, DocumentElement]:
@@ -1705,6 +1735,15 @@ class PDFDocument:
         """False if any page is an error page; else True iff >= 1 non-vision page exists and all are verified."""
         return self._index.integrity_verified
 
-    def to_markdown(self) -> str:
-        """Render every page's Markdown, blank-line separated (empty for a zero-page document)."""
-        return "\n\n".join(page.to_markdown() for page in self.pages)
+    def to_markdown(self, *, include_hidden: bool = False) -> str:
+        """Render every page's Markdown, blank-line separated (empty for a zero-page document).
+
+        Hidden elements are omitted, as a reader sees the document; with
+        ``include_hidden=True`` each is rendered behind its
+        ``<!-- hidden: reasons -->`` line (see the module notes).
+
+        Raises:
+            TypeError: If ``include_hidden`` is not a bool.
+        """
+        shown = strict_bool("include_hidden", include_hidden)
+        return "\n\n".join(page.to_markdown(include_hidden=shown) for page in self.pages)
