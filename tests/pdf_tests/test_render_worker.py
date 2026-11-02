@@ -480,7 +480,7 @@ class TestMemoryCap:
 
         assert got == expected
 
-    @pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="peak RSS is read on Linux and macOS")
+    @pytest.mark.skipif(sys.platform not in render._CAPPED_PLATFORMS, reason="no peak RSS reader here")
     def test_the_peak_rss_reader_sees_an_allocation(self):
         done = subprocess.run(
             [
@@ -497,7 +497,7 @@ class TestMemoryCap:
 
         assert 60 << 20 < int(done.stdout) < 80 << 20
 
-    @pytest.mark.skipif(sys.platform not in ("linux", "darwin"), reason="peak RSS is read on Linux and macOS")
+    @pytest.mark.skipif(sys.platform not in render._CAPPED_PLATFORMS, reason="no peak RSS reader here")
     @pytest.mark.parametrize(
         "limit,deadline_s,code",
         [
@@ -520,6 +520,29 @@ class TestMemoryCap:
         with pytest.raises(OSError, match=re.escape("no memory cap is implemented for platform 'sunos5'")):
             render._apply_memory_cap(1 << 20, 10.0)
 
+    def test_an_allocation_the_backstop_refuses_ends_the_worker_at_its_cap(self, tmp_path):
+        # Simulated in a real worker: the bitmap's mapping fails as RLIMIT_AS (Linux) or the Job Object's commit
+        # limit (Windows) makes it fail. The worker ends at its cap, with no reply: a RenderFailed, never a blank page.
+        request = {
+            "source": str(letter(tmp_path)),
+            "page_index": 0,
+            "dpi": 72,
+            "password": None,
+            "memory_cap_bytes": CAP,
+            "timeout_s": 60.0,
+        }
+
+        done = subprocess.run(
+            [sys.executable, "-c", BACKSTOP_REFUSES_SCRIPT, json.dumps(request)],
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+
+        assert (done.returncode, done.stdout) == (render._CAP_EXIT, b""), done.stderr
+        ending = render._ending(done.returncode, False, render._Request(**request))
+        assert ending == "the render worker reached its 1073741824-byte memory cap and was ended"
+
     @pytest.mark.skipif(ctypes.sizeof(ctypes.c_void_p) != 8, reason="the 64-bit Windows layouts")
     def test_the_job_object_structures_match_the_windows_x64_layouts(self):
         # JOBOBJECT_EXTENDED_LIMIT_INFORMATION and PROCESS_MEMORY_COUNTERS_EX on x64 (winnt.h, psapi.h).
@@ -527,6 +550,173 @@ class TestMemoryCap:
         assert render._ExtendedLimits.ProcessMemoryLimit.offset == 112
         assert ctypes.sizeof(render._MemoryCounters) == 80
         assert render._MemoryCounters.PrivateUsage.offset == 72
+
+
+BACKSTOP_REFUSES_SCRIPT = """
+import errno, json, sys
+
+from datagrunt.pdf import render
+
+
+def refused(*args):
+    raise OSError(errno.ENOMEM, "Cannot allocate memory")
+
+
+render.mmap.mmap = refused
+render._worker_main(json.loads(sys.argv[1]), sys.stdout.buffer)
+print("replied")
+"""
+
+# The backstop's margin over the cap: 4 GiB (ASCII85 decodes "z" to 4 bytes, so a stream within the 1 GiB asset
+# limit decodes to at most 4 GiB in one allocation). Pinned here: a margin of 0 is the bug of #435.
+BACKSTOP_MARGIN = 4 << 30
+WATCHDOG = "datagrunt-pdf-render-watchdog"
+
+
+def run_python(script: str, *args: str) -> subprocess.CompletedProcess:
+    """``script`` in a new interpreter, its output as text."""
+    return subprocess.run(
+        [sys.executable, "-c", script, *args], capture_output=True, check=False, timeout=60, text=True
+    )
+
+
+class TestCapPerPlatform:
+    """Every platform runs the peak-RSS watchdog (#435); Linux and Windows keep a looser backstop: the cap plus 4 GiB.
+
+    A hard limit alone (RLIMIT_AS, a Job Object) makes pdfium's allocation fail, and pdfium then draws the page
+    without the image, and without an error. The watchdog ends the worker instead, so the page fails loudly.
+    """
+
+    PEAK = 100 << 20
+    CAP = 64 << 20
+
+    @pytest.fixture
+    def applied(self, monkeypatch):
+        """Each part of a cap _apply_memory_cap applies, in order; none reaches this (the test) process."""
+        applied = []
+        monkeypatch.setattr(render, "_peak_rss_bytes", lambda: self.PEAK)
+        monkeypatch.setattr(render, "_watch_peak_rss", lambda limit, deadline: applied.append(("watchdog", limit)))
+        monkeypatch.setattr(render, "_cap_address_space", lambda limit: applied.append(("address space", limit)))
+        monkeypatch.setattr(render, "_cap_commit", lambda limit: applied.append(("commit", limit)))
+        return applied
+
+    @pytest.mark.parametrize(
+        "platform,backstop",
+        [
+            pytest.param("linux", [("address space", CAP + BACKSTOP_MARGIN)], id="linux"),
+            pytest.param("win32", [("commit", CAP + BACKSTOP_MARGIN)], id="windows"),
+            pytest.param("darwin", [], id="macos"),
+        ],
+    )
+    def test_each_platform_watches_its_peak_rss_then_sets_its_backstop(self, monkeypatch, applied, platform, backstop):
+        monkeypatch.setattr(sys, "platform", platform)
+
+        render._apply_memory_cap(self.CAP, 30.0)
+
+        assert applied == [("watchdog", self.PEAK + self.CAP), *backstop]
+
+    def test_the_watchdog_runs_to_the_workers_deadline(self, monkeypatch):
+        deadlines = []
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(render, "_peak_rss_bytes", lambda: self.PEAK)
+        monkeypatch.setattr(render, "_watch_peak_rss", lambda limit, deadline: deadlines.append(deadline))
+
+        before = time.monotonic()
+        render._apply_memory_cap(self.CAP, 30.0)
+        after = time.monotonic()
+
+        (deadline,) = deadlines
+        assert before + 30.0 <= deadline <= after + 30.0
+
+    def test_windows_reads_its_peak_rss_from_the_peak_working_set(self, monkeypatch):
+        counters = render._MemoryCounters(PeakWorkingSetSize=123 << 20, WorkingSetSize=99 << 20)
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(render, "_memory_counters", lambda: counters)
+
+        assert render._peak_rss_bytes() == 123 << 20
+
+    def test_on_windows_no_peak_reading_is_no_render(self, tmp_path, monkeypatch):
+        def unavailable():
+            raise OSError("[WinError 5] Access is denied")
+
+        applied = []
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(render, "_memory_counters", unavailable)
+        monkeypatch.setattr(render, "_watch_peak_rss", lambda *args: applied.append("watchdog"))
+        monkeypatch.setattr(render, "_cap_commit", lambda *args: applied.append("commit"))
+        monkeypatch.setattr(render, "_render_guarded", lambda *args: pytest.fail("rendered without a peak reading"))
+        request = {"source": str(letter(tmp_path)), "page_index": 0, "dpi": 72, "password": None}
+        replies = Sink()
+
+        render._worker_main({**request, "memory_cap_bytes": self.CAP, "timeout_s": 30.0}, replies)
+
+        (reply,) = framed(replies.data)
+        assert reply == render._FAILED + b"OSError: [WinError 5] Access is denied"
+        assert applied == []
+
+    @pytest.mark.parametrize(
+        "private,extra,size_max,expected",
+        [
+            pytest.param(100, 50, (1 << 64) - 1, 150, id="x64"),
+            # A 32-bit size_t cannot hold the cap plus 4 GiB: the limit is size_t's largest, never a wrapped one.
+            pytest.param(100 << 20, (1 << 30) + BACKSTOP_MARGIN, (1 << 32) - 1, (1 << 32) - 1, id="x86"),
+        ],
+    )
+    def test_the_commit_limit_fits_a_size_t(self, private, extra, size_max, expected):
+        assert render._commit_limit(private, extra, size_max) == expected
+
+    def test_the_watchdog_has_read_once_when_it_returns(self):
+        # Its thread's first reading maps the thread's allocator arena: done before the backstop measures the worker.
+        done = run_python(
+            "import os, time\n"
+            "from datagrunt.pdf import render\n"
+            "readings = []\n"
+            "render._peak_rss_bytes = lambda: readings.append(1) or 1\n"
+            "render._watch_peak_rss(1 << 40, time.monotonic() + 30)\n"
+            "print(len(readings), flush=True)\n"
+            "os._exit(0)\n"
+        )
+
+        assert done.returncode == 0, done.stderr
+        assert int(done.stdout) >= 1
+
+    def test_a_watchdog_that_cannot_read_ends_its_process(self):
+        code = render._WATCH_FAILED_EXIT
+        done = run_python(
+            "import time\n"
+            "from datagrunt.pdf import render\n"
+            "readings = []\n"
+            "def peak():\n"
+            "    readings.append(1)\n"
+            "    if len(readings) > 1:\n"
+            "        raise OSError('the reading is gone')\n"
+            "    return 1\n"
+            "render._peak_rss_bytes = peak\n"
+            "render._watch_peak_rss(1 << 40, time.monotonic() + 30)\n"
+            "time.sleep(20)\n"
+            "print('outlived')\n"
+        )
+
+        assert (done.returncode, done.stdout) == (code, "")
+        assert "the memory watchdog cannot read this process's peak RSS: OSError: the reading is gone" in done.stderr
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS is Linux's backstop")
+    def test_on_linux_a_worker_runs_its_watchdog_under_an_address_space_backstop(self):
+        done = run_python(
+            "import os, resource, threading\n"
+            "from datagrunt.pdf import render\n"
+            "render._apply_memory_cap(64 << 20, 60.0)\n"
+            "soft, hard = resource.getrlimit(resource.RLIMIT_AS)\n"
+            "names = [thread.name for thread in threading.enumerate()]\n"
+            f"print(soft, hard, render._mapped_bytes(), {WATCHDOG!r} in names, flush=True)\n"
+            "os._exit(0)\n"
+        )
+
+        assert done.returncode == 0, done.stderr
+        soft, hard, mapped, watching = done.stdout.split()
+        assert (soft, watching) == (hard, "True")
+        # The limit is what the worker mapped (its watchdog thread's stack and arena included) plus the cap and 4 GiB.
+        assert abs(int(soft) - (64 << 20) - BACKSTOP_MARGIN - int(mapped)) < 16 << 20
 
 
 HUNG = "the exchange outlived its 10 s bound"
@@ -973,6 +1163,11 @@ class TestEndings:
     )
     def test_each_ending(self, exitcode, timed_out, expected):
         assert render._ending(exitcode, timed_out, self.REQUEST) == expected
+
+    def test_a_watchdog_that_could_not_read(self):
+        expected = "the render worker's memory watchdog could not read its peak RSS and ended it"
+
+        assert render._ending(render._WATCH_FAILED_EXIT, False, self.REQUEST) == expected
 
 
 class TestRenderCallsStayInRender:
