@@ -213,6 +213,59 @@ class TestRender:
         assert render_page(path, 0, dpi=72, memory_cap_bytes=1 << 30, timeout_s=120.0).px_width == 400
 
 
+class TestDecodedBeforeTheRender:
+    """The render worker decodes each JBIG2 image on its own before drawing the page.
+
+    pdfium drops an image it cannot decode and draws the rest of the page: a
+    decode that fails for memory (Linux and Windows cap the worker's address
+    space or commit, so the allocation fails) would leave a blank where the
+    image was. Decoded first, its failure is the page's: a RenderFailed.
+    """
+
+    def test_a_jbig2_image_that_cannot_be_decoded_fails_the_page(self, tmp_path, monkeypatch):
+        from datagrunt.pdf import render
+
+        path = xobject_page(tmp_path, jbig2(pattern()), entries(64, 48))
+        decoded = []
+
+        def cannot_decode(image):
+            decoded.append(image)
+            return None
+
+        monkeypatch.setattr(pdfium_c, "FPDFImageObj_GetBitmap", cannot_decode)
+
+        message = "page 1: pdfium cannot decode JBIG2 image object 0 in the render worker; the page is not rendered"
+        with pytest.raises(RenderFailed, match=re.escape(message)):
+            render._render_guarded(path, 0, 72, None)
+        assert len(decoded) == 1
+
+    def test_a_page_whose_jbig2_images_decode_is_drawn(self, tmp_path, monkeypatch):
+        from datagrunt.pdf import render
+
+        content = b"q 64 0 0 48 0 0 cm /Im Do Q"
+        path = xobject_page(tmp_path, jbig2(pattern()), entries(64, 48), content=content)
+        real = pdfium_c.FPDFImageObj_GetBitmap
+        decoded = []
+
+        def counted(image):
+            decoded.append(image)
+            return real(image)
+
+        monkeypatch.setattr(pdfium_c, "FPDFImageObj_GetBitmap", counted)
+
+        drawn = render._render_guarded(path, 0, 72, None)
+
+        assert (drawn.width, drawn.height, len(decoded)) == (400, 300, 1)
+
+    def test_a_page_without_jbig2_images_decodes_none_first(self, tmp_path, monkeypatch):
+        from datagrunt.pdf import render
+
+        path = xobject_page(tmp_path, b"\x80" * 64, b"/Width 8 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8")
+        monkeypatch.setattr(pdfium_c, "FPDFImageObj_GetBitmap", lambda image: pytest.fail("decoded before the render"))
+
+        assert render._render_guarded(path, 0, 72, None).width == 400
+
+
 @pytest.fixture(scope="module")
 def jbig2_scan_pdf(tmp_path_factory) -> Path:
     """A letter page of four sentences rendered at 300 DPI, made bilevel and embedded as one JBIG2 image."""
