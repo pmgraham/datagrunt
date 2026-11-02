@@ -145,6 +145,14 @@ def _element(kind, text):
             BulletList(**common, items=(text, "second"), ordered=False),
             [("bullet_list", [text, "second"], 2)],
         ),
+        "numbered_list": lambda: (
+            BulletList(**common, items=(text, "second"), ordered=True, markers=("7)", "8)")),
+            [("ordered_list", [text, "second"], 2)],
+        ),
+        "marker_text_list": lambda: (
+            BulletList(**common, items=(text, "second"), ordered=True, markers=("1.", "3.")),
+            [("paragraph", [f"1. {text}"], 0), ("paragraph", ["3. second"], 0)],
+        ),
         "table": lambda: (
             Table(**common, headers=("h1", "h2"), rows=((text, "x"),), extraction_method="lattice"),
             [("table", ["h1", "h2", text, "x"], 0)],
@@ -184,10 +192,89 @@ def _assert_faithful(markdown, expected):
 
 
 @pytest.mark.parametrize("text", _TEXTS)
-@pytest.mark.parametrize("kind", ["paragraph", "heading", "key_value", "list", "table", "figure_caption", "figure_alt"])
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "paragraph",
+        "heading",
+        "key_value",
+        "list",
+        "numbered_list",
+        "marker_text_list",
+        "table",
+        "figure_caption",
+        "figure_alt",
+    ],
+)
 def test_element_text_renders_back_unchanged(kind, text):
     element, expected = _element(kind, text)
     _assert_faithful(_page_around(element).to_markdown(), expected)
+
+
+def _ordered_lists(markdown):
+    """Each top-level ordered list as ``(start, delimiter, item texts)``, as CommonMark reads it."""
+    tokens, lists = _MD.parse(markdown), []
+    for index, token in enumerate(tokens):
+        if token.type == "ordered_list_open" and token.level == 0:
+            inner = tokens[index : _close_index(tokens, index) + 1]
+            start = token.attrGet("start")
+            texts = [_norm(_inline_text(t)) for t in inner if t.type == "inline"]
+            lists.append((1 if start is None else int(start), token.markup, texts))
+    return lists
+
+
+def _ordered(markers, hidden_reasons=()):
+    items = tuple(f"item {number}" for number in range(len(markers)))
+    common = {"element_id": "p0001_e001", "page_number": 1, "reading_order": 1, "bbox": _BOX}
+    return BulletList(**common, items=items, ordered=True, markers=markers, hidden_reasons=hidden_reasons), items
+
+
+@pytest.mark.parametrize(
+    "markers",
+    [("2)",), ("7.", "8.", "9."), ("7)", "8)", "9)"), ("1.", "2."), ("1)",), ("0.",), ("9.", "10."), ("123456789.",)],
+)
+def test_ordered_list_renders_its_source_numbers(markers):
+    element, items = _ordered(markers)
+    markdown = _page_around(element).to_markdown()
+
+    _assert_faithful(markdown, [("ordered_list", list(items), len(items))])
+    assert _ordered_lists(markdown) == [(int(markers[0][:-1]), markers[0][-1], list(items))]
+
+
+def test_hidden_ordered_list_keeps_its_start():
+    element, items = _ordered(("2)", "3)"), hidden_reasons=("duplicate",))
+    markdown = _page_around(element).to_markdown()
+
+    assert "<!-- hidden: duplicate -->" in markdown.splitlines()
+    assert _ordered_lists(markdown) == [(2, ")", list(items))]
+
+
+@pytest.mark.parametrize(
+    "markers",
+    [
+        ("a)", "b)"),
+        ("(1)", "(2)"),
+        ("iv.", "v."),
+        ("I", "II"),
+        ("VIII", "IX"),
+        ("1.", "2)"),
+        ("1.", "3."),
+        ("3)", "2)"),
+        ("01.", "02."),
+        ("1234567890.", "1234567891."),
+        ("999999999.", "1000000000."),
+        ("1.", "a)"),
+        ("١.", "٢."),
+    ],
+)
+def test_other_ordered_markers_stay_visible_as_text(markers):
+    element, items = _ordered(markers)
+    markdown = _page_around(element).to_markdown()
+
+    _assert_faithful(
+        markdown, [("paragraph", [f"{marker} {item}"], 0) for marker, item in zip(markers, items, strict=True)]
+    )
+    assert _ordered_lists(markdown) == []
 
 
 @pytest.mark.parametrize("text", ["<!-- draft", "*emph*", "    four spaces code"])

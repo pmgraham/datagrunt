@@ -468,12 +468,73 @@ class TestBulletList:
 
         assert bullets.markers == markers
 
-    @pytest.mark.parametrize("ordered", [False, True])
-    def test_markers_never_change_the_markdown(self, ordered):
-        plain = _element(BulletList, items=("one", "two"), ordered=ordered)
-        marked = _element(BulletList, items=("one", "two"), markers=("(a)", "(b)"), ordered=ordered)
+    @pytest.mark.parametrize("markers", [("(a)", "(b)"), ("2.", "3."), ("7)", "8)"), ("•", "•")])
+    def test_unordered_markers_never_change_the_markdown(self, markers):
+        plain = _element(BulletList, items=("one", "two"), ordered=False)
+        marked = _element(BulletList, items=("one", "two"), markers=markers, ordered=False)
 
-        assert marked.to_markdown() == plain.to_markdown()
+        assert marked.to_markdown() == plain.to_markdown() == "- one\n- two"
+
+    @pytest.mark.parametrize(
+        ("markers", "items", "expected"),
+        [
+            (("2)",), ("The second clause applies.",), "2) The second clause applies."),
+            (("7.", "8.", "9."), ("a", "b", "c"), "7. a\n8. b\n9. c"),
+            (("7)", "8)"), ("a", "b"), "7) a\n8) b"),
+            (("1.", "2."), ("a", "b"), "1. a\n2. b"),
+            (("1)", "2)"), ("a", "b"), "1) a\n2) b"),
+            (("0.", "1."), ("a", "b"), "0. a\n1. b"),
+            (("9.", "10."), ("a", "b"), "9. a\n10. b"),
+            (("123456789)",), ("a",), "123456789) a"),
+        ],
+    )
+    def test_ordered_list_keeps_its_source_numbers(self, markers, items, expected):
+        bullets = _element(BulletList, items=items, markers=markers, ordered=True)
+
+        assert bullets.to_markdown() == expected
+        assert bullets.markers == markers
+
+    def test_numbered_continuation_indent_tracks_the_source_marker(self):
+        bullets = _element(
+            BulletList, items=("ninety-nine\n- no", "hundred\n# no"), markers=("99)", "100)"), ordered=True
+        )
+
+        assert bullets.to_markdown() == "99) ninety-nine\n    \\- no\n100) hundred\n     \\# no"
+
+    @pytest.mark.parametrize(
+        ("markers", "expected"),
+        [
+            (("a)", "b)"), "a) one\n\nb) two"),
+            (("(1)", "(2)"), "(1) one\n\n(2) two"),
+            (("iv.", "v."), "iv. one\n\nv. two"),
+            (("I", "II"), "I one\n\nII two"),
+            (("(a)", "(iv)"), "(a) one\n\n(iv) two"),
+            # Numbers CommonMark would not show as written: each is escaped text too.
+            (("1.", "2)"), "1\\. one\n\n2\\) two"),  # a change of delimiter starts a new list
+            (("1.", "3."), "1\\. one\n\n3\\. two"),  # only the first number sets the start
+            (("3)", "2)"), "3\\) one\n\n2\\) two"),
+            (("01.", "02."), "01\\. one\n\n02\\. two"),  # the start would read 1
+            (("1234567890.", "1234567891."), "1234567890\\. one\n\n1234567891\\. two"),  # over 9 digits
+            (("999999999.", "1000000000."), "999999999\\. one\n\n1000000000\\. two"),  # counts past 9 digits
+            (("1.", "a)"), "1\\. one\n\na) two"),
+            (("١.", "٢."), "١. one\n\n٢. two"),  # non-ASCII digits are no list number
+        ],
+    )
+    def test_other_ordered_markers_stay_visible_as_text(self, markers, expected):
+        bullets = _element(BulletList, items=("one", "two"), markers=markers, ordered=True)
+
+        assert bullets.to_markdown() == expected
+
+    def test_text_marker_item_lines_escaped(self):
+        bullets = _element(BulletList, items=("first\n# second", "*x* <b>"), markers=("(a)", "(b)"), ordered=True)
+
+        assert bullets.to_markdown() == "(a) first\n\\# second\n\n(b) \\*x\\* \\<b\\>"
+        assert bullets.items == ("first\n# second", "*x* <b>")
+
+    def test_text_marker_is_escaped_too(self):
+        bullets = _element(BulletList, items=("one",), markers=("*1*",), ordered=True)
+
+        assert bullets.to_markdown() == "\\*1\\* one"
 
     def test_markers_take_part_in_equality(self):
         assert _element(BulletList, markers=("•", "•")) != _element(BulletList)
