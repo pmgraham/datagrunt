@@ -453,6 +453,21 @@ class TestTsv:
         assert ocr._tsv_words(stdout, BAND_AT_840) == [ocr._Placed("fox", 1, 842, 4, 846, 50.0, (840, 1, 1, 1))]
 
     @pytest.mark.parametrize(
+        "box,placed_box",
+        [
+            pytest.param((90, 20, 30, 15), (90, 860, 100, 875), id="right"),
+            pytest.param((10, 890, 30, 20), (10, 1730, 40, 1740), id="bottom"),
+            pytest.param((99, 899, 10, 10), (99, 1739, 100, 1740), id="both"),
+            pytest.param((120, 950, 5, 5), (100, 1740, 100, 1740), id="wholly-past"),
+        ],
+    )
+    def test_a_box_past_the_bands_edge_is_clamped_to_it(self, box, placed_box):
+        # D8: the band is 100 x 900 px. A box past it would map off the page, which A1's Page refuses.
+        stdout = tsv(row(5, box, "90", "Edge"))
+
+        assert ocr._tsv_words(stdout, BAND_AT_840) == [ocr._Placed("Edge", *placed_box, 90.0, (840, 1, 1, 1))]
+
+    @pytest.mark.parametrize(
         "stdout,message",
         [
             pytest.param(b"", "tesseract's TSV has an unexpected header: ''", id="empty"),
@@ -928,6 +943,22 @@ class TestCli:
 
         assert result.status == "ok"
         assert [word.bbox for word in result.words] == [bbox(10.0, 20.0, 40.0, 35.0), bbox(10.0, 860.0, 40.0, 875.0)]
+
+    @pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+    def test_a_word_reported_past_the_images_edges_lies_on_the_page(self, tmp_path, monkeypatch, rotation):
+        # D8: rows and columns 50..90 of a righted page 60 x 80 px (80 x 60 turned): past its right and bottom edges.
+        # Clamped to the band, the box maps inside the displayed 60 x 80 pt page at any turn, so A1's Page takes it.
+        fake_tesseract(tmp_path, monkeypatch, READS_STDIN, stdout=tsv(row(5, (50, 50, 40, 40), "90", "Edge")))
+        page = RenderedPage(pixels=bytes(60 * 80), px_width=60, px_height=80)
+
+        result = ocr_words(
+            bands(rotated(page, rotation)), dpi=72, rotation=rotation, page_size_pt=(60.0, 80.0), timeout_s=30.0
+        )
+
+        (word,) = result.words
+        assert result.status == "ok"
+        assert word.bbox.within(60.0, 80.0, tolerance=0.0), word.bbox
+        assert word.bbox.area > 0.0
 
     def test_lines_are_numbered_across_the_page_in_the_order_read(self, tmp_path, monkeypatch):
         # The same report for each band, its lines numbered alike: a band's line 1 is not another band's.

@@ -565,6 +565,11 @@ def _tsv_words(stdout: bytes, band: Band) -> list[_Placed] | str:
 def _tsv_word(fields: list[str], band: Band) -> _Placed | None:
     """The word on one TSV row, placed on the righted page; None for a row that is not a word.
 
+    Its box is clamped to the band (D8): the band spans the righted page's
+    width and its rows lie on it, so a box tesseract reports past the
+    image's right or bottom edge can never map off the displayed page,
+    which A1's ``Page`` refuses for a word that is not hidden.
+
     Raises:
         ValueError: If the row is malformed.
     """
@@ -578,8 +583,9 @@ def _tsv_word(fields: list[str], band: Band) -> _Placed | None:
     text = fields[11]
     if confidence < 0.0 or not text.strip():
         return None
-    y0 = band.top_px + top
-    return _Placed(text, left, y0, left + width, y0 + height, confidence, (band.top_px, block, paragraph, line))
+    x0, x1 = (min(edge, band.px_width) for edge in (left, left + width))
+    y0, y1 = (band.top_px + min(edge, band.px_height) for edge in (top, top + height))
+    return _Placed(text, x0, y0, x1, y1, confidence, (band.top_px, block, paragraph, line))
 
 
 def _tsv_int(name: str, value: str) -> int:
