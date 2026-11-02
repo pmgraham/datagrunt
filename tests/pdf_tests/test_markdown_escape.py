@@ -352,18 +352,13 @@ class TestEscapeMarkdownLinkTargetIssue221:
         assert "\n" not in result
 
     def test_carriage_return_stripped(self):
-        result = escape_markdown_link_target("https://example.com\rpath")
-        assert "\r" not in result
+        # carriage return removed → "https://example.compath" → no spaces → bare form, unchanged
+        assert escape_markdown_link_target("https://example.com\rpath") == "https://example.compath"
 
     def test_newline_stripped_whitespace_remains_wraps(self):
-        # newline removed but a space still present → angle-bracket wrap
-        result = escape_markdown_link_target("/my path\nfile")
-        assert result.startswith("<")
-        assert result.endswith(">")
-        assert "\n" not in result
+        # newline removed but a space still present → angle-bracket wrap of the rest, every character kept
+        assert escape_markdown_link_target("/my path\nfile") == "</my pathfile>"
 
     def test_only_newline_no_space_bare_form(self):
-        # After stripping newline, no whitespace remains → bare form
-        result = escape_markdown_link_target("https://example.com\n/path")
-        assert "\n" not in result
-        assert not result.startswith("<")
+        # After stripping newline, no whitespace remains → bare form, every other character kept
+        assert escape_markdown_link_target("https://example.com\n/path") == "https://example.com/path"
