@@ -719,7 +719,8 @@ class Table(_Element):
             stream table's is where its column's cells start and end along
             the rows, so a column whose cells are all one width, which
             tells no alignment, still shows where its text ends (#420); a
-            lattice table's is its ruled column's span.
+            lattice table's is its ruled column's span. A6 links such a
+            part by its end to the other part's flush-right column.
     """
 
     headers: tuple[str, ...]

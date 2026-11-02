@@ -996,6 +996,41 @@ class TestSplitTablesLinkAcrossPages:
         assert [round(centre) for centre in (*tail.column_centres, *head.column_centres)] == [72, 250, 400] * 2
 
     @pytest.mark.parametrize(
+        "tail_rows,head_rows",
+        [
+            # #409's probe T5: the continuation's quantities and prices are each one width, so each sits at its start.
+            pytest.param(
+                (("Part", "Qty", "Price"), ("Bolt", "4", "10.10"), ("Nut", "12", "0.05"), ("Washer", "100", "0.01")),
+                (("Pin", "8", "0.02"), ("Rivet", "9", "0.03")),
+                id="continuation-one-width",
+            ),
+            # T8: a long amount on the tail, one-width amounts on the continuation.
+            pytest.param(
+                (("Item", "Qty", "Amount"), ("Bolt", "4", "1,234,567.00"), ("Nut", "12", "8.00")),
+                (("Pin", "8", "5.00"), ("Rivet", "20", "6.00")),
+                id="amounts-one-width",
+            ),
+            # The mirror: the first part's columns are one width, the continuation's flush right.
+            pytest.param(
+                (("Pin", "8", "0.02"), ("Rivet", "9", "0.03")),
+                (("Bolt", "4", "10.10"), ("Nut", "12", "0.05"), ("Washer", "100", "0.01")),
+                id="first-part-one-width",
+            ),
+        ],
+    )
+    def test_a_one_width_flush_right_part_links_by_its_end(self, tmp_path, tail_rows, head_rows):
+        # #420: a column of one width tells no alignment and sits at its start (#409); its interval ends where the
+        # other part's flush-right column sits.
+        tail, head = split_tables(
+            tmp_path,
+            flush_right(tail_rows, 72.0, (250.0, 400.0), 650.0),
+            flush_right(head_rows, 72.0, (250.0, 400.0), 60.0),
+        )
+
+        assert head.continued_from_id == tail.element_id
+        assert round(tail.column_intervals[2][1]) == round(head.column_intervals[2][1]) == 400
+
+    @pytest.mark.parametrize(
         "head",
         [
             # Columns set 12 pt further right: their middles lie 6 to 10 pt from the tail's, their starts 12 pt.
