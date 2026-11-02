@@ -2,7 +2,6 @@
 
 import ast
 import importlib.util
-import pkgutil
 from pathlib import Path
 
 import pytest
@@ -135,61 +134,83 @@ def test_unknown_name_is_an_attribute_error(package):
     assert "PDFBatchWriter" not in package.__all__
 
 
-# v4's packages, which the 5.0 flip (#373) deletes: no v5 module may reach them by any chain of imports.
-V4_PACKAGES = ("datagrunt.core.pdf_io", "datagrunt.pdf_api")
+# v4's packages and its PDF libraries, which the 5.0 flip (#373) deleted.
+V4_PACKAGES = ("datagrunt.pdf_api", "datagrunt.core.pdf_io")
+V4_LIBRARIES = ("fitz", "pymupdf", "pdfplumber", "pytesseract")
+SRC = Path(datagrunt.__file__).resolve().parent
+TESTS = Path(__file__).resolve().parents[1]
+# datagrunt.core's names after the flip: its v4 PDF names went with core.pdf_io.
+CORE_NAMES = [
+    "CSVEngineFactory",
+    "CSVReaderDuckDBEngine",
+    "CSVReaderPolarsEngine",
+    "CSVReaderPyArrowEngine",
+    "CSVWriterDuckDBEngine",
+    "CSVWriterPolarsEngine",
+    "CSVWriterPyArrowEngine",
+    "CSVEngineProperties",
+    "CSVComponents",
+    "CSVColumnNameNormalizer",
+    "CSVColumns",
+    "CSVDelimiter",
+    "CSVDialect",
+    "CSVRows",
+    "CSVStringSample",
+    "DuckDBQueries",
+    "ExcelComponents",
+    "ExcelEngineFactory",
+    "ExcelEngineProperties",
+    "ExcelReaderEngine",
+    "ExcelWriterEngine",
+    "FileProperties",
+    "ParquetComponents",
+    "ParquetEngineFactory",
+    "ParquetEngineProperties",
+    "ParquetReaderEngine",
+    "ParquetWriterEngine",
+]
 
 
-def _source_imports(name: str) -> set[str]:
-    """The modules the source of module ``name`` imports, read from its AST (every import statement, nested too)."""
-    spec = importlib.util.find_spec(name)
-    assert spec is not None and spec.origin is not None, name
-    tree = ast.parse(Path(spec.origin).read_text(encoding="utf-8"))
+def _imported_names(path: Path) -> set[str]:
+    """Every module the file at ``path`` names in an import statement (nested ones too), ``from x import y`` as x.y."""
     found: set[str] = set()
-    for node in ast.walk(tree):
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
         if isinstance(node, ast.Import):
             found.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
-            assert node.level == 0, f"{name} uses a relative import: the walk below reads absolute ones only"
-            assert node.module is not None
-            found.add(node.module)
-            # ``from package import module`` imports the submodule too.
-            if _is_package(node.module):
-                found.update(f"{node.module}.{alias.name}" for alias in node.names)
+            module = "." * node.level + (node.module or "")
+            found.add(module)
+            found.update(f"{module}.{alias.name}" for alias in node.names)
     return found
 
 
-def _is_package(name: str) -> bool:
-    """True if ``name`` is a datagrunt package (its submodules can be imported from it)."""
-    if not name.startswith("datagrunt"):
-        return False
-    spec = importlib.util.find_spec(name)
-    return spec is not None and spec.submodule_search_locations is not None
+def _is_v4(name: str) -> bool:
+    """True if the module ``name`` is (or is inside) a v4 package or a v4 PDF library."""
+    return (
+        name.startswith(tuple(f"{package}." for package in V4_PACKAGES))
+        or name in V4_PACKAGES
+        or (name.split(".")[0] in V4_LIBRARIES)
+    )
 
 
-def _with_v5_parents(name: str) -> list[str]:
-    """``name`` and the ``datagrunt.pdf`` packages above it: importing a submodule runs each one's ``__init__``."""
-    if not name.startswith("datagrunt.pdf."):
-        return [name]
-    parts = name.split(".")
-    return [".".join(parts[:end]) for end in range(2, len(parts) + 1)]
+@pytest.mark.parametrize("name", V4_PACKAGES)
+def test_v4_package_is_gone(name):
+    assert importlib.util.find_spec(name) is None
 
 
-def _v5_modules() -> list[str]:
-    """Every module of the ``datagrunt.pdf`` package."""
-    return ["datagrunt.pdf", *(info.name for info in pkgutil.walk_packages(datagrunt.pdf.__path__, "datagrunt.pdf."))]
+@pytest.mark.parametrize("root", [SRC, TESTS], ids=["src", "tests"])
+def test_no_module_imports_v4_or_its_pdf_libraries(root):
+    found = sorted(
+        f"{path.relative_to(root)}: {name}"
+        for path in sorted(root.rglob("*.py"))
+        for name in _imported_names(path)
+        if _is_v4(name)
+    )
+
+    assert found == []
 
 
-@pytest.mark.parametrize("start", _v5_modules())
-def test_no_v5_module_imports_v4_by_any_chain(start):
-    # The import statements, followed transitively through datagrunt's own modules (bounded: each module once).
-    seen, stack, chains = {start}, [start], {start: (start,)}
-    while stack:
-        name = stack.pop()
-        for target in sorted({parent for found in _source_imports(name) for parent in _with_v5_parents(found)}):
-            if not target.startswith("datagrunt.") or target in seen or importlib.util.find_spec(target) is None:
-                continue
-            chain = (*chains[name], target)
-            assert not target.startswith(V4_PACKAGES), " -> ".join(chain)
-            seen.add(target)
-            chains[target] = chain
-            stack.append(target)
+def test_core_exports_no_v4_pdf_names():
+    import datagrunt.core
+
+    assert datagrunt.core.__all__ == CORE_NAMES

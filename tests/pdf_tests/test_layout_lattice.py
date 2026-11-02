@@ -453,7 +453,7 @@ class TestCollinearMerge:
         assert snapped(h(100.0, 10.0, 60.0), h(101.0, 55.0, 120.0)) == ([(100.5, 10.0, 120.0)], [])
 
     def test_every_kind_dash_and_colour_rules(self):
-        # v4's pdfplumber (and the A0 prototype) rule a table with every edge: fill edges, thin fills,
+        # v4's pdfplumber (and the A0 prototype) ruled a table with every edge: fill edges, thin fills,
         # dashed and white strokes alike.
         got = snapped(
             h(100.0, 10.0, 40.0, kind="fill_edge", width=0.0),

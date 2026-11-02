@@ -242,8 +242,7 @@ _DEFAULT_PAGE_SIZE = (612.0, 792.0)
 # The source is hashed in reads of at most this many bytes.
 _HASH_CHUNK_BYTES = 1 << 20
 
-# Environment variables that mark a distributed runner (Spark, Beam, Flink, Celery): v4's
-# ``core.pdf_io.engines._is_distributed_env``, ported.
+# Environment variables that mark a distributed runner (Spark, Beam, Flink, Celery): v4's check, ported.
 _DISTRIBUTED_KEYS = ("SPARK_ENV_LOADED", "SPARK_HOME", "BEAM_WORKER_ID", "FLINK_CONF_DIR", "CELERY_BROKER_URL")
 
 # A worker's first page is given this to start, and every page this for its own work (the module notes' bounds).

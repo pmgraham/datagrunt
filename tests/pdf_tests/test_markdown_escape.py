@@ -16,7 +16,9 @@ from datagrunt.pdf._markdown_escape import (
     escape_leading_markdown,
     escape_markdown_link_target,
 )
-from datagrunt.pdf_api.pdfwriter import PDFWriter
+from datagrunt.pdf.reader import PDFReader
+from datagrunt.pdf.writer import PDFWriter
+from pdf_tests.builders import PageSpec, TextRun, build_pdf
 
 _COMMONMARK = MarkdownIt("commonmark")
 
@@ -230,37 +232,80 @@ class TestEscapeLeadingMarkdownIssue376:
         assert _rendered_paragraph_text(text) == text
 
 
-class TestEscapeLeadingMarkdownIssue376EndToEnd:
-    """A v4 PDF paragraph starting with 'N) ' must come out as a paragraph."""
+# Lines that open Markdown block syntax at their start but which the v5 layout reads as plain paragraph text.
+_PARAGRAPH_LINES = [
+    "# not a heading",
+    "> not a quote",
+    "= not an underline",
+    "+ not a bullet",
+    "| a | b |",
+    "``` not a fence",
+    "~~~ not a fence",
+    "<div> not html",
+    "_x_ not emphasis",
+]
 
-    @pytest.fixture
-    def clause_pdf(self, tmp_path):
-        """One page: a 24pt title and three 11pt body blocks, one starting '2) '."""
-        import pymupdf
 
-        doc = pymupdf.open()
-        page = doc.new_page(width=612, height=792)  # US Letter
-        page.insert_text((72, 72), "Quarterly Report", fontsize=24)
-        page.insert_text((72, 120), "This is body text for testing.", fontsize=11)
-        page.insert_text((72, 160), "2) The second clause applies.", fontsize=11)
-        page.insert_text((72, 200), "Body line four wraps up the text.", fontsize=11)
-        pdf_path = tmp_path / "clause.pdf"
-        doc.save(str(pdf_path))
-        doc.close()
-        return str(pdf_path)
+def _clause_pdf(tmp_path, line):
+    """One page: a 24pt title and three 11pt body lines, the middle one ``line``."""
+    page = PageSpec(
+        items=(
+            TextRun("Quarterly Report", 72, 72, size=24),
+            TextRun("This is body text for testing.", 72, 120),
+            TextRun(line, 72, 160),
+            TextRun("Body line four wraps up the text.", 72, 200),
+        )
+    )
+    return build_pdf(tmp_path / "clause.pdf", [page])
 
-    @pytest.mark.parametrize("engine", ["pymupdf", "pdfium"])
-    def test_paren_marker_paragraph_renders_as_paragraph(self, clause_pdf, tmp_path, engine):
-        path = PDFWriter(clause_pdf, engine=engine).write_markdown(export_filename=str(tmp_path / "out.md"))
-        with open(path, encoding="utf-8") as handle:
-            tokens = _COMMONMARK.parse(handle.read())
-        blocks = [
-            (tokens[index - 1].type, "".join(child.content for child in token.children or []))
-            for index, token in enumerate(tokens)
-            if token.type == "inline"
+
+def _markdown_blocks(path):
+    """The CommonMark file at ``path``: its top-level block types, and each inline's (opener type, visible text)."""
+    tokens = _COMMONMARK.parse(path.read_text(encoding="utf-8"))
+    top_level = [token.type for token in tokens if token.level == 0 and token.nesting != -1]
+    inlines = [
+        (tokens[index - 1].type, "".join(child.content for child in token.children or []))
+        for index, token in enumerate(tokens)
+        if token.type == "inline"
+    ]
+    return top_level, inlines
+
+
+class TestWriteMarkdownEndToEnd:
+    """A PDF line that opens Markdown syntax comes out of the v5 ``PDFWriter.write_markdown`` as its own text.
+
+    v4's end-to-end case (#376) was a paragraph starting ``2) ``: v5's layout reads such a line as an ordered
+    list item instead, keeping its marker (the last test). The escape is checked end to end on the lines v5
+    keeps as paragraphs.
+    """
+
+    @pytest.mark.parametrize("line", _PARAGRAPH_LINES)
+    def test_block_syntax_line_renders_as_its_paragraph(self, tmp_path, line):
+        pdf = _clause_pdf(tmp_path, line)
+        assert [element.text for element in PDFReader(pdf).paragraphs if element.text == line] == [line]
+
+        top_level, inlines = _markdown_blocks(PDFWriter(pdf).write_markdown(tmp_path / "out.md"))
+
+        # The page's marker comment, the title, then three paragraphs: the line opened no block of its own.
+        assert top_level == ["html_block", "heading_open", "paragraph_open", "paragraph_open", "paragraph_open"]
+        assert inlines == [
+            ("heading_open", "Quarterly Report"),
+            ("paragraph_open", "This is body text for testing."),
+            ("paragraph_open", line),
+            ("paragraph_open", "Body line four wraps up the text."),
         ]
-        assert "ordered_list_open" not in [token.type for token in tokens]
-        assert ("paragraph_open", "2) The second clause applies.") in blocks
+
+    def test_numbered_clause_is_an_ordered_list_item_whose_marker_is_kept(self, tmp_path):
+        pdf = _clause_pdf(tmp_path, "2) The second clause applies.")
+        reader = PDFReader(pdf)
+        (found,) = reader.lists
+        assert (found.items, found.ordered, found.markers) == (("The second clause applies.",), True, ("2)",))
+        assert not [element for element in reader.paragraphs if "clause" in element.text]
+
+        top_level, inlines = _markdown_blocks(PDFWriter(pdf).write_markdown(tmp_path / "out.md"))
+
+        assert top_level == ["html_block", "heading_open", "paragraph_open", "ordered_list_open", "paragraph_open"]
+        assert ("paragraph_open", "The second clause applies.") in inlines
 
 
 # ---------------------------------------------------------------------------
