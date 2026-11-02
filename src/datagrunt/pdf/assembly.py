@@ -22,16 +22,21 @@ meets:
    skips, in ``core.pdf_io.extraction.pdfium_document.image_items``; v4's
    default, 40, is ``_DEFAULT_MIN_IMAGE_DIMENSION`` in
    ``core.pdf_io.extraction.config``). Its pixel size is the decode size
-   A2 read (a DCT or JPX stream's own header), or, when that cannot be
-   known without decoding (a JPEG behind Flate), the image dictionary's
-   declared ``/Width`` and ``/Height``.
-2. No figure, and a warning, when its stream was not read (no SHA-256: a
-   stream over the asset limit, or the page's stream budget spent): A1's
-   ``Figure`` is identified by that hash and its loader verifies reads by it.
-3. No figure, and a warning, when its pixel size is unknown (neither size
-   has both sides): A1's ``Figure`` needs both sides >= 1.
-4. Else a figure with the facts A2 recorded: an oversized image too (its
-   loader refuses to decode it, so its PNG cannot be read; its raw bytes can).
+   A2 read, the size pdfium decodes it at: a DCT or JPX stream's own
+   header (kept when A2 refuses to decode it), else the declared
+   ``/Width`` and ``/Height``. The declared size never stands in for a
+   size A2 could not read: pdfium does not decode a DCT or JPX image at it.
+2. No figure, and a warning naming it, when its stream was not read (no
+   SHA-256: a stream over the asset limit, or the page's stream budget
+   spent; A2 then reads no size): A1's ``Figure`` is identified by that
+   hash and its loader verifies reads by it.
+3. No figure, and a warning naming it, when its pixel size is unknown (A2
+   read no size with both sides: a DCT or JPX header it could not read, a
+   filter it cannot size, a side outside 1..131071): A1's ``Figure`` needs
+   both sides >= 1.
+4. Else a figure with the facts A2 recorded: an oversized image too, at its
+   header's size (its loader refuses to decode it and says why, so its PNG
+   cannot be read; its raw bytes can).
 
 A figure lies on the page as A1's ``Page`` requires: its box, when within
 the page (A1's :meth:`~datagrunt.pdf.elements.BBox.within`); else the part
@@ -243,11 +248,10 @@ def page_figures(
 
 
 def _pixel_size(item: RawImage) -> tuple[int, int] | None:
-    """The image's decode size if A2 read both sides, else its declared size if both are known, else None."""
+    """The image's decode size if A2 read both sides, else None (rule 1: never the declared size)."""
     if item.px_width and item.px_height:
         return item.px_width, item.px_height
-    width, height = item.declared_px
-    return (width, height) if width and height else None
+    return None
 
 
 def _draft(item: RawImage, size: tuple[int, int], loader: FigureRead, geometry: PageGeometry) -> FigureDraft:

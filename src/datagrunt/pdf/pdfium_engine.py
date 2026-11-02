@@ -108,7 +108,16 @@ Pages (#365 T5), pinned by ``tests/pdf_tests/test_pdfium_extract_page.py``:
   segments and images from that load, in that order. A PDFCorruptError in a
   stage becomes a :class:`PageFailure` naming the stage, with the message
   that stage's own function raises, so one bad page never fails a batch;
-  any other error is a bug and propagates. :class:`RawPage` and
+  any other error is a bug and propagates.
+- Every walk of a page is bounded, each bound checked on pdfium's counts
+  before what it counts is read: its objects, forms' contents included
+  (:data:`MAX_PAGE_OBJECTS`, and no object in a form nested past 64), its
+  path segments (:data:`MAX_PAGE_SEGMENTS`) and its textpage chars
+  (``_pdfium_text.MAX_PAGE_CHARS``). A page past one is the PDFCorruptError
+  of the stage that reached it, naming the bound: the page is not read,
+  never read in part. A page whose own load passes the worker's memory cap
+  (pdfium parses every form a page draws as it loads it) ends its worker
+  instead (:mod:`datagrunt.pdf.pipeline`). :class:`RawPage` and
   :class:`PageFailure` are picklable: they cross the process pool.
 
 Recovery (#366 task 3), pinned by ``tests/pdf_tests/test_pdfium_recover.py``
@@ -150,11 +159,13 @@ terminator alone (2 bytes). Its length query copies nothing, so
 
 Object boxes (#400), pinned by ``tests/pdf_tests/test_pdfium_object_boxes.py``:
 :func:`page_object_boxes` gives the displayed box of every non-text object
-the walk visits (paths, images, shadings, forms and their contents, any
-object of an unknown type): pdfium's bounds in the object's form space
+the walk visits (paths, images, shadings, any object of an unknown type,
+inside forms or not): pdfium's bounds in the object's form space
 (``FPDFPageObj_GetBounds``: a stroke's box includes its width, a shading's
-is its clip's, or the page's when it is unclipped, a form's holds its
-contents), through every enclosing form's matrix to page space. An object
+is its clip's, or the page's when it is unclipped), through every
+enclosing form's matrix to page space. A form object itself has no box:
+its bounds hold its contents, text included, and the walk boxes those
+contents one by one. An object
 whose bounds pdfium cannot read, or whose box is not finite, is counted in
 ``ObjectBoxes.unboxed``: the background check counts it as under all text.
 
@@ -193,7 +204,7 @@ from datagrunt.pdf._path_segments import (
     SegmentStats,
     path_segments,
 )
-from datagrunt.pdf._pdfium_common import Box, PdfiumFailure, object_address, read_rgba
+from datagrunt.pdf._pdfium_common import Box, PdfiumFailure, WalkBoundHit, object_address, read_rgba
 from datagrunt.pdf._pdfium_images import (
     DecodeRefused,
     ImageStats,
@@ -624,6 +635,13 @@ def page_geometry(handle: DocumentHandle, index: int) -> PageGeometry:
 # forms yield the text of 40), so this bound reaches every object it parsed.
 _MAX_FORM_DEPTH = 64
 
+# The most objects one page's walk reads, forms' contents included; each extraction walk and a loader's walk pass it
+# (the render guard passes its own). A page holding more is not read: it fails whole, naming the bound, never read in
+# part. Extraction walks a page five times and asks pdfium about each object: ~1.5 KiB of its worker's memory an
+# object (a page of 611,669 objects, nested forms in a 2.4 KB file, peaked at 1 GiB and took 9 s), so a page at the
+# bound stays well inside the page worker's 2 GiB memory cap.
+MAX_PAGE_OBJECTS = 500_000
+
 
 def _children(
     count: int, get_child: Callable[[int], pdfium_c.FPDF_PAGEOBJECT], owner: str
@@ -640,30 +658,20 @@ def _children(
     return children
 
 
-class WalkBoundHit(Exception):
-    """The render guard's object walk reached a bound: objects past it were not walked.
-
-    The message names the bound, and the form that reached it (if one did).
-    """
-
-
-def _page_objects(
-    page_raw: pdfium_c.FPDF_PAGE, *, max_objects: int | None = None
-) -> list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]:
-    """Every page object in depth-first paint order (a form, then its contents).
+def _page_objects(page_raw: pdfium_c.FPDF_PAGE, *, max_objects: int) -> list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]:
+    """Every page object in depth-first paint order (a form, then its contents), within ``max_objects``.
 
     Each comes with the walk index of the form that holds it, -1 for none.
-    A form nested past ``_MAX_FORM_DEPTH`` is walked but not opened (pdfium
-    parses forms 40 deep, so extraction still reads every object parsed).
-
-    With ``max_objects`` (the render guard's walk, which fails closed)
-    WalkBoundHit is raised rather than passing either bound: when the page
-    and the forms it opens hold more than ``max_objects`` objects (checked on
-    pdfium's counts, before those objects are read), or when a form past the
-    depth bound holds any object.
+    Every walk names its bound: extraction's and a loader's
+    :data:`MAX_PAGE_OBJECTS`, the render guard's its own. WalkBoundHit is
+    raised rather than passing either bound: when the page and the forms it
+    opens hold more than ``max_objects`` objects (checked on pdfium's counts,
+    before those objects are read), or when a form nested past
+    ``_MAX_FORM_DEPTH`` holds any object (pdfium parses forms 40 deep, so a
+    form past 64 holds none).
     """
     count = pdfium_c.FPDFPage_CountObjects(page_raw)
-    total = _counted(0, count, max_objects, "the page holds {count} objects, over the guard's {bound}-object bound")
+    total = _counted(0, count, max_objects, "the page holds {count} objects, over the walk's {bound}-object bound")
     top = _children(count, partial(pdfium_c.FPDFPage_GetObject, page_raw), "the page")
     ordered: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] = []
     stack = [(iter(top), -1)]
@@ -681,24 +689,24 @@ def _page_objects(
         form_index, count = len(ordered) - 1, pdfium_c.FPDFFormObj_CountObjects(child)
         owner = f"form object {form_index}"
         if len(stack) > _MAX_FORM_DEPTH:
-            if max_objects is not None and count > 0:
+            if count > 0:
                 raise WalkBoundHit(
                     f"{owner} holds {count} object(s) past the walk's {_MAX_FORM_DEPTH}-form depth bound"
                 )
             continue
-        over = owner + " holds {count} objects, which take the page over the guard's {bound}-object bound"
+        over = owner + " holds {count} objects, which take the page over the walk's {bound}-object bound"
         total = _counted(total, count, max_objects, over)
         stack.append((iter(_children(count, partial(pdfium_c.FPDFFormObj_GetObject, child), owner)), form_index))
     return ordered
 
 
-def _counted(total: int, count: int, max_objects: int | None, message: str) -> int:
+def _counted(total: int, count: int, max_objects: int, message: str) -> int:
     """``total`` plus a pdfium ``count`` of objects (a negative count fails in _children, called next).
 
     Raises WalkBoundHit, with ``message`` formatted, if that passes ``max_objects``.
     """
     added = total + count
-    if max_objects is not None and added > max_objects:
+    if added > max_objects:
         raise WalkBoundHit(message.format(count=count, bound=max_objects))
     return added
 
@@ -725,11 +733,14 @@ def _pdfium_error(page_number: int, failure: PdfiumFailure) -> PDFCorruptError:
 
 @contextmanager
 def _pdfium_errors(page_number: int) -> Iterator[None]:
-    """Raise a PdfiumFailure from inside as page ``page_number``'s PDFCorruptError."""
+    """Raise a PdfiumFailure or a WalkBoundHit from inside as page ``page_number``'s PDFCorruptError."""
     try:
         yield
     except PdfiumFailure as exc:
         raise _pdfium_error(page_number, exc) from exc
+    except WalkBoundHit as exc:
+        message = f"page {page_number}: {exc}; the page is not read"
+        raise PDFCorruptError(message, page_number=page_number) from exc
 
 
 @contextmanager
@@ -750,7 +761,8 @@ def _read_page_text(page: pdfium.PdfPage, geometry: PageGeometry) -> PageText:
     """Read a loaded page's spans, closing its textpage."""
     page_number = geometry.page_number
     with _opened_textpage(page, page_number) as textpage, _pdfium_errors(page_number):
-        return collect_text(textpage.raw, _display_mapping(geometry), _text_walk(_page_objects(page.raw))).page_text
+        walk = _text_walk(_page_objects(page.raw, max_objects=MAX_PAGE_OBJECTS))
+        return collect_text(textpage.raw, _display_mapping(geometry), walk).page_text
 
 
 def page_text(handle: DocumentHandle, index: int) -> PageText:
@@ -774,7 +786,9 @@ def page_text(handle: DocumentHandle, index: int) -> PageText:
         ValueError: If ``handle`` is closed.
         IndexError: If ``index`` is outside ``0..page_count - 1``.
         PDFCorruptError: If pdfium cannot load the page or its textpage, or a
-            pdfium call on them fails (``page_number`` is set).
+            pdfium call on them fails, or the page is past a walk bound: its
+            objects (:data:`MAX_PAGE_OBJECTS`) or its textpage's chars
+            (``_pdfium_text.MAX_PAGE_CHARS``) (``page_number`` is set).
     """
     page, page_number = _load_page(handle, index)
     try:
@@ -836,11 +850,35 @@ def _leaves_gaps(dashes: tuple[float, ...]) -> bool:
     return any(value > 0 for value in gaps) and any(value != 0 for value in dashes)
 
 
-def _read_points(path: pdfium_c.FPDF_PAGEOBJECT, label: str) -> list[PathPoint]:
-    """Read a path object's points, in its own space."""
+# The most path segments (points) one page's walk reads, over all its paths. A page holding more is not read: it fails
+# whole, naming the path that passed the bound. Each segment costs its worker ~0.9 KiB as it is read and laid out (a
+# path of 1,000,001 segments, in a 23 KB file, peaked at 0.95 GiB and took 6 s), so a page at the bound stays inside
+# the page worker's 2 GiB memory cap.
+MAX_PAGE_SEGMENTS = 1_000_000
+
+
+class _SegmentRoom:
+    """The path segments a page's walk may still read: :data:`MAX_PAGE_SEGMENTS` at first."""
+
+    __slots__ = ("remaining",)
+
+    def __init__(self) -> None:
+        self.remaining = MAX_PAGE_SEGMENTS
+
+    def take(self, count: int, label: str) -> None:
+        """Take ``count`` segments of path ``label``; WalkBoundHit, naming it, if they are more than are left."""
+        if count > self.remaining:
+            bound = f"the walk's {MAX_PAGE_SEGMENTS}-segment bound"
+            raise WalkBoundHit(f"{label}'s {count} path segments take the page over {bound}")
+        self.remaining -= count
+
+
+def _read_points(path: pdfium_c.FPDF_PAGEOBJECT, label: str, room: _SegmentRoom) -> list[PathPoint]:
+    """Read a path object's points, in its own space, once ``room`` takes their count (none is read past it)."""
     count = pdfium_c.FPDFPath_CountSegments(path)
     if count < 0:
         raise PdfiumFailure(f"count the path segments of {label}")
+    room.take(count, label)
     points = []
     x, y = ctypes.c_float(), ctypes.c_float()
     for index in range(count):
@@ -861,16 +899,17 @@ def _read_matrix(obj: pdfium_c.FPDF_PAGEOBJECT, label: str) -> Matrix:
 
 
 def _path_object_segments(
-    path: pdfium_c.FPDF_PAGEOBJECT, index: int, matrix: Matrix, to_display: Callable[[Box], Box]
+    path: pdfium_c.FPDF_PAGEOBJECT, index: int, matrix: Matrix, to_display: Callable[[Box], Box], room: _SegmentRoom
 ) -> list[RawSegment] | None:
     """The segments of path object ``index`` (matrix to page space ``matrix``), or None if its geometry is not finite.
 
-    pdfium call failures raise; non-finite geometry is a fact of the page
-    (pdfium renders the rest of it), so only that path is skipped.
+    pdfium call failures raise, and so does a path past the page's segment
+    bound (``room``); non-finite geometry is a fact of the page (pdfium
+    renders the rest of it), so only that path is skipped.
     """
     label = f"object {index}"
     paint = _read_paint(path, label)
-    points = _read_points(path, label)
+    points = _read_points(path, label, room)
     try:
         return path_segments(points, matrix=matrix, paint=paint, object_index=index, to_display=to_display)
     except NonFiniteGeometry:
@@ -901,7 +940,7 @@ def _objects_in_forms(
 
 
 def _placed_objects(
-    page_raw: pdfium_c.FPDF_PAGE, kind: int, *, max_objects: int | None = None
+    page_raw: pdfium_c.FPDF_PAGE, kind: int, *, max_objects: int
 ) -> Iterator[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix]]:
     """Each page object of type ``kind`` (not a form) with its walk index and its matrix to page space.
 
@@ -917,12 +956,13 @@ def _display_mapping(geometry: PageGeometry) -> Callable[[Box], Box]:
 
 
 def _collect_segments(page_raw: pdfium_c.FPDF_PAGE, geometry: PageGeometry) -> PageSegments:
-    """The segments of every path object on the page, forms' included, in object-walk order."""
+    """The segments of every path object on the page, forms' included, in object-walk order, within the bounds."""
     to_display = _display_mapping(geometry)
     segments: list[RawSegment] = []
     skipped = 0
-    for index, path, matrix in _placed_objects(page_raw, pdfium_c.FPDF_PAGEOBJ_PATH):
-        found = _path_object_segments(path, index, matrix, to_display)
+    room = _SegmentRoom()
+    for index, path, matrix in _placed_objects(page_raw, pdfium_c.FPDF_PAGEOBJ_PATH, max_objects=MAX_PAGE_OBJECTS):
+        found = _path_object_segments(path, index, matrix, to_display, room)
         if found is None:
             skipped += 1
         else:
@@ -932,10 +972,8 @@ def _collect_segments(page_raw: pdfium_c.FPDF_PAGE, geometry: PageGeometry) -> P
 
 def _read_segments(page: pdfium.PdfPage, geometry: PageGeometry) -> PageSegments:
     """Read a loaded page's segments."""
-    try:
+    with _pdfium_errors(geometry.page_number):
         return _collect_segments(page.raw, geometry)
-    except PdfiumFailure as exc:
-        raise _pdfium_error(geometry.page_number, exc) from exc
 
 
 def page_segments(handle: DocumentHandle, index: int) -> PageSegments:
@@ -960,7 +998,9 @@ def page_segments(handle: DocumentHandle, index: int) -> PageSegments:
         ValueError: If ``handle`` is closed.
         IndexError: If ``index`` is outside ``0..page_count - 1``.
         PDFCorruptError: If pdfium cannot load the page or a pdfium call on
-            it fails (``page_number`` is set).
+            it fails, or the page is past a walk bound: its objects
+            (:data:`MAX_PAGE_OBJECTS`) or its path segments
+            (:data:`MAX_PAGE_SEGMENTS`) (``page_number`` is set).
     """
     page, page_number = _load_page(handle, index)
     try:
@@ -971,11 +1011,9 @@ def page_segments(handle: DocumentHandle, index: int) -> PageSegments:
 
 def _read_images(page: pdfium.PdfPage, geometry: PageGeometry) -> PageImages:
     """Read a loaded page's image objects (no pixel is decoded)."""
-    try:
-        placed = _placed_objects(page.raw, pdfium_c.FPDF_PAGEOBJ_IMAGE)
+    with _pdfium_errors(geometry.page_number):
+        placed = _placed_objects(page.raw, pdfium_c.FPDF_PAGEOBJ_IMAGE, max_objects=MAX_PAGE_OBJECTS)
         return collect_images(placed, page.raw, geometry.page_box, _display_mapping(geometry))
-    except PdfiumFailure as exc:
-        raise _pdfium_error(geometry.page_number, exc) from exc
 
 
 def page_images(handle: DocumentHandle, index: int) -> PageImages:
@@ -1001,7 +1039,8 @@ def page_images(handle: DocumentHandle, index: int) -> PageImages:
         ValueError: If ``handle`` is closed.
         IndexError: If ``index`` is outside ``0..page_count - 1``.
         PDFCorruptError: If pdfium cannot load the page or a pdfium call on
-            it fails (``page_number`` is set).
+            it fails, or the page holds more than :data:`MAX_PAGE_OBJECTS`
+            objects (``page_number`` is set).
     """
     page, page_number = _load_page(handle, index)
     try:
@@ -1044,7 +1083,7 @@ def image_refusal(page: pdfium.PdfPage, geometry: PageGeometry, *, max_objects: 
 
     - the walk reaches either bound;
     - an image A2 refuses to decode (see :class:`ImageStats`: over the pixel,
-      sample, component or JPEG 2000 tile bound; of a size that cannot be
+      component or JPEG 2000 tile bound; of a size that cannot be
       read without decoding; its raw stream over the asset limit, or past
       the page's stream budget), but not one A2 refuses only in the calling
       process (its stream decodes past its declared size, or cannot be
@@ -1086,9 +1125,12 @@ class ObjectBoxes:
     """The displayed box of each of the page's non-text objects: what may paint under its text (#400).
 
     Attributes:
-        boxes: One displayed, top-left box per path, image, shading, form
-            and unknown-type object, in object-walk order (a form, then its
-            contents): pdfium's bounds through every enclosing form's matrix.
+        boxes: One displayed, top-left box per path, image, shading and
+            unknown-type object, in object-walk order, those inside forms
+            included: pdfium's bounds through every enclosing form's matrix.
+            A form object has none: it paints nothing of its own, and its
+            bounds (the union of its contents, text included) would put
+            paint under text the form draws.
         unboxed: How many such objects have no box the walk can give
             (pdfium cannot read their bounds, or the box is not finite). The
             background check counts each as under every piece of text.
@@ -1106,9 +1148,9 @@ class ObjectBoxes:
 
 
 def _collect_object_boxes(page_raw: pdfium_c.FPDF_PAGE, geometry: PageGeometry) -> ObjectBoxes:
-    """The displayed box of every non-text object on the page, forms' contents included, in object-walk order."""
+    """The displayed box of every non-text, non-form object on the page, forms' contents included, in walk order."""
     to_display = _display_mapping(geometry)
-    objects = _page_objects(page_raw)
+    objects = _page_objects(page_raw, max_objects=MAX_PAGE_OBJECTS)
     form_matrices: dict[int, Matrix] = {}
     boxes: list[Box] = []
     unboxed = 0
@@ -1116,7 +1158,9 @@ def _collect_object_boxes(page_raw: pdfium_c.FPDF_PAGE, geometry: PageGeometry) 
         kind = pdfium_c.FPDFPageObj_GetType(obj)
         outer = form_matrices[form] if form >= 0 else IDENTITY
         if kind == pdfium_c.FPDF_PAGEOBJ_FORM:
+            # A form paints nothing of its own: the walk visits its contents next, and boxes each.
             form_matrices[index] = _read_matrix(obj, f"object {index}").then(outer)
+            continue
         if kind == pdfium_c.FPDF_PAGEOBJ_TEXT:
             continue
         box = _object_box(obj, outer, to_display)
@@ -1141,10 +1185,8 @@ def _object_box(obj: pdfium_c.FPDF_PAGEOBJECT, outer: Matrix, to_display: Callab
 
 def _read_object_boxes(page: pdfium.PdfPage, geometry: PageGeometry) -> ObjectBoxes:
     """Read a loaded page's object boxes."""
-    try:
+    with _pdfium_errors(geometry.page_number):
         return _collect_object_boxes(page.raw, geometry)
-    except PdfiumFailure as exc:
-        raise _pdfium_error(geometry.page_number, exc) from exc
 
 
 def page_object_boxes(handle: DocumentHandle, index: int) -> ObjectBoxes:
@@ -1159,7 +1201,8 @@ def page_object_boxes(handle: DocumentHandle, index: int) -> ObjectBoxes:
         ValueError: If ``handle`` is closed.
         IndexError: If ``index`` is outside ``0..page_count - 1``.
         PDFCorruptError: If pdfium cannot load the page or read a form's
-            matrix (``page_number`` is set).
+            matrix, or the page holds more than :data:`MAX_PAGE_OBJECTS`
+            objects (``page_number`` is set).
     """
     page, page_number = _load_page(handle, index)
     try:
@@ -1253,9 +1296,12 @@ def extract_page(handle: DocumentHandle, index: int) -> RawPage | PageFailure:
     :func:`page_geometry`, :func:`page_text`, :func:`page_segments`,
     :func:`page_images` and :func:`page_object_boxes` (each of which loads
     the page again). A page pdfium
-    cannot read is no error here: the PDFCorruptError a stage raises becomes
-    a :class:`PageFailure` of that stage with the same message, so one bad
-    page never fails a batch. Any other error (a PDFCorruptError naming no
+    cannot read, or one past a walk bound (more than :data:`MAX_PAGE_OBJECTS`
+    objects, :data:`MAX_PAGE_SEGMENTS` path segments or
+    ``_pdfium_text.MAX_PAGE_CHARS`` textpage chars), is no error here: the
+    PDFCorruptError a stage raises becomes a :class:`PageFailure` of that
+    stage with the same message, so one bad page never fails a batch, and
+    no page is ever read in part. Any other error (a PDFCorruptError naming no
     page included) propagates unchanged: it is a bug, not a page fault.
 
     Raises:
@@ -1316,7 +1362,8 @@ def recover_dropped_text(handle: DocumentHandle, index: int) -> RecoveredText:
         ValueError: If ``handle`` is closed.
         IndexError: If ``index`` is outside ``0..page_count - 1``.
         PDFCorruptError: If pdfium cannot load the page or a textpage, or a
-            pdfium call on them fails (``page_number`` is set).
+            pdfium call on them fails, or the page is past a walk bound
+            (objects, textpage chars) (``page_number`` is set).
     """
     page, page_number = _load_page(handle, index)
     try:
@@ -1329,7 +1376,7 @@ def _recover(page: pdfium.PdfPage, geometry: PageGeometry) -> RecoveredText:
     """Recover a loaded page's dropped text: read a textpage, move the dropped objects, read another."""
     page_number, to_display = geometry.page_number, _display_mapping(geometry)
     with _pdfium_errors(page_number):
-        objects = _page_objects(page.raw)
+        objects = _page_objects(page.raw, max_objects=MAX_PAGE_OBJECTS)
         walk = _text_walk(objects)
         texts = tuple(TextObject(*placed) for placed in _objects_in_forms(objects, pdfium_c.FPDF_PAGEOBJ_TEXT))
         with _opened_textpage(page, page_number) as textpage:
@@ -1421,8 +1468,9 @@ class ImageLoader:
             DatagruntPDFError: As :meth:`raw_bytes` raises it, or, before
                 pdfium decodes anything, if the image would decode to more
                 than 89,478,485 pixels (Pillow's default decompression-bomb
-                bound: 1 GiB / 4 / 3) or in more than 4096 JPEG 2000 tiles,
-                or its decode size cannot be known first (see
+                bound: 1 GiB / 4 / 3), with more than 4 components (a JPEG
+                or JPEG 2000 codestream) or in more than 4096 JPEG 2000
+                tiles, or its decode size cannot be known first (see
                 :class:`ImageStats`), or it is a JBIG2 image, or its stream
                 decodes past its declared size or cannot be checked (each
                 decoded only by a page render, in the render worker); or if
@@ -1464,7 +1512,10 @@ class ImageLoader:
         to another picture. Dictionary changes that keep all of these (a
         /Decode array, a palette's colours) are not detected.
         """
-        objects = _page_objects(page_raw)
+        try:
+            objects = _page_objects(page_raw, max_objects=MAX_PAGE_OBJECTS)
+        except WalkBoundHit as exc:  # its page was within the bound when the image was recorded
+            raise self._changed(str(exc)) from exc
         if self.object_index >= len(objects):
             raise self._changed(f"the page has {len(objects)} object(s)")
         image, _form = objects[self.object_index]

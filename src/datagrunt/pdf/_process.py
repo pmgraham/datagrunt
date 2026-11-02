@@ -31,6 +31,13 @@ reads their replies, and never imports pypdfium2.
   (:func:`start_worker`). Its stderr is drained by a thread of its own into
   a ring that keeps the last 4 KiB (:class:`StderrTail`), which ends any
   failure without a reply.
+- A page worker (``own_group``) leads a process group of its own on POSIX,
+  and :func:`kill_group` ends it with every process it started that stayed
+  in the group (its render workers and tesseract runs, or any process that
+  inherited its pipes): a killed worker's replies end even when a
+  descendant held its stdout, so a reply's bound holds. Being in a session
+  of its own, it does not get the terminal's interrupt: its caller ends it.
+  On Windows only the worker itself is killed.
 
 The stderr ring writes nothing to disk (no temporary file: the reader reads
 a PDF with zero filesystem writes, #372) and holds at most
@@ -49,10 +56,12 @@ import json
 import mmap
 import os
 import pickle
+import signal
 import struct
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from types import MappingProxyType
 from typing import IO
 
@@ -71,6 +80,7 @@ __all__ = [
     "close_pipes",
     "drained",
     "error_reply",
+    "kill_group",
     "next_reply",
     "read_error",
     "read_message",
@@ -166,15 +176,46 @@ def request_payload(worker: str, request: object, bound: int) -> bytes:
     return payload
 
 
-def start_worker(command: list[str]) -> tuple["subprocess.Popen[bytes]", "StderrTail"]:
+def start_worker(command: list[str], *, own_group: bool = False) -> tuple["subprocess.Popen[bytes]", "StderrTail"]:
     """Start the worker, its stdin, stdout and stderr piped to this process; it and its stderr's drain.
+
+    With ``own_group`` (POSIX), the worker leads a session and process group
+    of its own, for :func:`kill_group` (see the module notes).
 
     Raises:
         OSError: If the OS refuses to start it.
         RuntimeError: If its stderr's drain thread cannot start (it is then killed and reaped).
     """
-    child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    child = subprocess.Popen(
+        command,
+        start_new_session=own_group and os.name == "posix",
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
     return child, drained(child)
+
+
+def kill_group(child: "subprocess.Popen[bytes]") -> None:
+    """Kill ``child`` with the process group it leads (started with ``own_group``): on POSIX, its descendants too.
+
+    Only an unreaped child is signalled: its pid, the group's id, is not
+    reused before it is reaped. A group whose every process has ended is
+    nothing to kill. macOS refuses (EPERM) to signal a group whose only
+    process is the exited, unreaped child; the child alone is then
+    signalled, as it is elsewhere (Windows).
+    """
+    if child.returncode is not None:  # reaped: never signal a pid the OS may reuse
+        return
+    if os.name != "posix":
+        child.kill()
+        return
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:  # every process of the group has ended: nothing is left to kill
+        return
+    except PermissionError:  # macOS, a group of only the exited child (see above): signal the child itself
+        child.kill()
 
 
 def drained(child: "subprocess.Popen[bytes]") -> "StderrTail":
@@ -221,20 +262,32 @@ def read_message(stream: IO[bytes], bound: int) -> bytes | None:
     return message if len(message) == length else None
 
 
+def _kill(child: "subprocess.Popen[bytes]") -> None:
+    """Kill ``child`` alone (a worker in its caller's process group)."""
+    child.kill()
+
+
 def next_reply(
-    child: "subprocess.Popen[bytes]", stream: IO[bytes], bound_s: float, max_bytes: int
+    child: "subprocess.Popen[bytes]",
+    stream: IO[bytes],
+    bound_s: float,
+    max_bytes: int,
+    *,
+    kill: Callable[["subprocess.Popen[bytes]"], None] = _kill,
 ) -> tuple[bytes | None, bool]:
     """``child``'s next reply on ``stream`` within ``bound_s``, or None when its replies end; and whether it was killed.
 
-    A timer kills ``child`` at the bound, which ends ``stream``: no read
-    outlives it. The timer is stopped before this returns, so a kill never
-    reaches a reaped (reusable) pid.
+    A timer calls ``kill`` on ``child`` at the bound (:func:`kill_group` for a
+    worker that leads its own group, so a descendant holding the pipe ends
+    with it), which ends ``stream``: no read outlives it. The timer is
+    stopped before this returns, so a kill never reaches a reaped
+    (reusable) pid.
 
     Raises:
         MessageTooLong: If the reply's length is over ``max_bytes`` (unread).
     """
     expired = threading.Event()
-    killer = threading.Timer(max(0.0, bound_s), _expire, args=(child, expired))
+    killer = threading.Timer(max(0.0, bound_s), _expire, args=(child, expired, kill))
     killer.daemon = True
     killer.start()
     try:
@@ -244,10 +297,12 @@ def next_reply(
         killer.join(REAP_TIMEOUT_S)
 
 
-def _expire(child: "subprocess.Popen[bytes]", expired: threading.Event) -> None:
-    """The timer's: the child's reply is past its bound; kill it."""
+def _expire(
+    child: "subprocess.Popen[bytes]", expired: threading.Event, kill: Callable[["subprocess.Popen[bytes]"], None]
+) -> None:
+    """The timer's: the child's reply is past its bound; ``kill`` it."""
     expired.set()
-    child.kill()
+    kill(child)
 
 
 # The exceptions a worker sends as they are: the caller can import them without pdfium. Any other is sent as a

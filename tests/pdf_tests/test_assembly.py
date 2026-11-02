@@ -29,14 +29,13 @@ from datagrunt.pdf.assembly import (
     pass_c,
 )
 from datagrunt.pdf.elements import BBox, Figure, Page, PageQuality, Paragraph, Table
+from datagrunt.pdf.exceptions import DatagruntPDFError
 from datagrunt.pdf.layout import (
     MAX_CROSSINGS,
     LatticeCell,
     LatticeResult,
     LatticeTable,
-    StreamTable,
     find_lattice_tables,
-    stream_layout,
 )
 from datagrunt.pdf.pdfium_engine import (
     ImageStats,
@@ -49,13 +48,15 @@ from datagrunt.pdf.pdfium_engine import (
 )
 from datagrunt.pdf.quality import PageAssessment, assess_page
 from datagrunt.pdf.scope import apply_scope
-from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf, hand_written_pdf, solid_png
+from pdf_tests.builders import PageSpec, RasterImage, Rect, TextRun, build_pdf, hand_written_pdf, solid_png
 from pdf_tests.test_layout_apart import tiny_text_page
 from pdf_tests.test_layout_lattice import rules as lattice_rules
 from pdf_tests.test_layout_lattice import written
 from pdf_tests.test_layout_stream import after
+from pdf_tests.test_layout_stream_tables import XS as STREAM_XS
 from pdf_tests.test_layout_stream_tables import body_text, staircase, table_runs
 from pdf_tests.test_pdfium_engine import imported_modules
+from pdf_tests.test_pdfium_images import j2k, xobject_page
 from pdf_tests.test_pdfium_spans import content_page
 from pdf_tests.test_quality import SHA, image
 
@@ -255,8 +256,9 @@ class TestPageFigures:
 
         assert (draft.width_px, draft.height_px) == (20000, 20000)
 
-    def test_an_unsized_image_is_a_figure_of_its_declared_size(self, tmp_path):
-        # A JPEG behind Flate: its frame size cannot be read without inflating it, so A2 records px 0 x 0.
+    def test_an_unsized_image_is_no_figure_whatever_its_dictionary_declares(self, tmp_path):
+        # A JPEG behind Flate that does not inflate within 1 MiB: A2 cannot read its frame, so it records px 0 x 0.
+        # pdfium decodes a JPEG at its frame's size, never its /Width and /Height: those are not its size.
         behind_flate = image(
             INSIDE,
             px_width=0,
@@ -265,16 +267,23 @@ class TestPageFigures:
             filters=("FlateDecode", "DCTDecode"),
             bits_per_pixel=None,
             colorspace=None,
+            object_index=4,
         )
 
-        (draft,) = drafted(tmp_path, behind_flate).drafts
+        found = drafted(tmp_path, behind_flate)
 
-        assert (draft.width_px, draft.height_px) == (158, 506)
+        assert found == PageFigures(
+            drafts=(), warnings=("1 image(s) not emitted as figures: their pixel size is unknown (object 4)",)
+        )
 
-    def test_an_unsized_image_declared_under_the_minimum_is_skipped(self, tmp_path):
-        small = image(INSIDE, px_width=0, px_height=0, declared_px=(20, 20), bits_per_pixel=None, colorspace=None)
+    def test_an_unsized_image_declared_under_the_minimum_is_named_not_skipped(self, tmp_path):
+        small = image(
+            INSIDE, px_width=0, px_height=0, declared_px=(20, 20), bits_per_pixel=None, colorspace=None, object_index=2
+        )
 
-        assert drafted(tmp_path, small) == PageFigures(drafts=(), warnings=())
+        found = drafted(tmp_path, small)
+
+        assert found.warnings == ("1 image(s) not emitted as figures: their pixel size is unknown (object 2)",)
 
     @pytest.mark.parametrize(
         "px,declared",
@@ -299,8 +308,13 @@ class TestPageFigures:
         assert found.drafts == ()
         assert found.warnings == ("1 image(s) not emitted as figures: their streams were not read (object 3)",)
 
-    def test_an_image_not_read_and_under_the_minimum_is_skipped_without_a_warning(self, tmp_path):
-        assert drafted(tmp_path, sized(10, 10, raw_sha256=None)) == PageFigures(drafts=(), warnings=())
+    def test_an_image_not_read_is_named_whatever_its_dictionary_declares(self, tmp_path):
+        # A2 records an image it did not read at px 0 x 0: its declared 10 x 10 does not skip it unnamed.
+        unread = image(INSIDE, px_width=0, px_height=0, declared_px=(10, 10), raw_sha256=None, object_index=5)
+
+        found = drafted(tmp_path, unread)
+
+        assert found.warnings == ("1 image(s) not emitted as figures: their streams were not read (object 5)",)
 
     def test_a_warning_names_at_most_5_objects(self, tmp_path):
         unread = [image(INSIDE, raw_sha256=None, object_index=index) for index in range(7)]
@@ -407,6 +421,36 @@ class TestPageFiguresEndToEnd:
         assert figure.bbox == pytest.approx(BBox(x0=60.0, y0=40.0, x1=180.0, y1=120.0))
         assert hashlib.sha256(figure.read_raw_bytes()).hexdigest() == raw.raw_sha256
         assert figure.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+    @pytest.mark.parametrize("declared", [b"", b"/Width 16 /Height 16 ", b"/Width 2000 /Height 2000 "])
+    def test_a_refused_image_is_a_figure_of_its_headers_size_and_says_why(self, tmp_path, declared):
+        # A JPEG 2000 codestream of 2000 x 2000 x 5 components: refused (5 > 4), at its SIZ size whatever /Width says.
+        entries = declared + b"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /JPXDecode"
+        path = xobject_page(tmp_path, j2k((16, 8), siz=(2000, 2000), tile=(2000, 2000), components=5), entries)
+        page = read_page(path)
+
+        found = page_figures(page.images, page.geometry, source=path)
+
+        (draft,) = found.drafts
+        assert (draft.width_px, draft.height_px) == (2000, 2000)
+        assert found.warnings == ("1 image(s) too large to decode or read: never decoded",)
+        figure = draft.figure(page_number=1, reading_order=0)
+        with pytest.raises(DatagruntPDFError, match=re.escape("object 0 has 5 components, over the 4-component bound")):
+            figure.read_bytes()
+
+    def test_a_jpeg_whose_header_cannot_be_read_is_no_figure(self, tmp_path):
+        entries = b"/Width 200 /Height 200 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode"
+        page = read_page(xobject_page(tmp_path, b"not a jpeg header at all" * 4, entries))
+
+        found = page_figures(page.images, page.geometry, source=tmp_path / "hand.pdf")
+
+        assert found == PageFigures(
+            drafts=(),
+            warnings=(
+                "1 image(s) whose decode size cannot be known without decoding: never decoded",
+                "1 image(s) not emitted as figures: their pixel size is unknown (object 0)",
+            ),
+        )
 
     def test_a_small_image_is_skipped(self, tmp_path):
         items = (RasterImage(10.0, 10.0, 30.0, 30.0, solid_png(30, 30, (0.0, 0.0, 0.0))),)
@@ -518,16 +562,11 @@ class TestAssemblePage:
         )
 
     def test_a_borderless_table_is_a_stream_table_with_its_columns_alignment_edges_and_extents(self, tmp_path):
+        # PARTS is written left-aligned at x 72, 220 and 360 from y 460 (table_runs): each column aligns on its
+        # cells' starts, and spans from there to its widest cell's end, as pdfium places that cell's glyphs.
         path = letter(tmp_path, *mixed_items())
         raw, assessment, lattice = inputs(path)
-        geometry = raw.geometry
-        (stream,) = [
-            item
-            for item in stream_layout(
-                assessment.pieces, lattice, width_pt=geometry.width_pt, height_pt=geometry.height_pt
-            )
-            if isinstance(item, StreamTable)
-        ]
+        cells = [piece for piece in assessment.pieces if piece.bbox[1] >= 440.0]
 
         table = [
             element
@@ -536,8 +575,11 @@ class TestAssemblePage:
         ][1]
 
         assert (table.extraction_method, table.headers, table.rows) == ("stream", PARTS[0], PARTS[1:])
-        assert table.column_centres == stream.column_centres
-        assert table.column_intervals == stream.column_intervals
+        assert table.column_centres == STREAM_XS
+        ends = tuple(max(cell.bbox[2] for cell in cells if cell.bbox[0] == x) for x in STREAM_XS)
+        assert table.column_intervals == tuple(zip(STREAM_XS, ends))
+        assert all(start < end for start, end in table.column_intervals)  # each column has the width of its cells
+        assert [len([cell for cell in cells if cell.bbox[0] == x]) for x in STREAM_XS] == [len(PARTS)] * 3
 
     @pytest.mark.parametrize("rotate", [90, 270])
     def test_a_turned_table_has_no_column_centres_or_intervals(self, tmp_path, rotate):
@@ -585,7 +627,9 @@ class TestAssemblePage:
         assert page.integrity_verified is True
 
     def test_a_vision_page_keeps_its_digital_text_and_says_ocr_did_not_read_it(self, tmp_path):
-        page = assembled(letter(tmp_path, TextRun("Too short", 72.0, 100.0)))
+        # A grey box under no text: paint OCR could read, so the short page routes vision (P2-C).
+        box = Rect(400.0, 600.0, 60.0, 40.0, fill_rgb=(0.5, 0.5, 0.5), stroke=False)
+        page = assembled(letter(tmp_path, TextRun("Too short", 72.0, 100.0), box))
 
         assert (page.route, page.status, page.integrity_verified) == ("vision", "ocr_unavailable", False)
         assert [element.text for element in page.elements] == ["Too short"]
@@ -791,6 +835,28 @@ class TestPageElements:
         elements = page_elements(found.items, figures.drafts, raw.geometry)
 
         assert elements == assemble_page(raw, assessment, lattice, source=path).elements
+        assert (found.warnings, figures.warnings) == ((), ())
+        assert [(type(element).__name__, element.element_id, element.reading_order) for element in elements] == [
+            ("Heading", "p0001_e000", 0),
+            ("Paragraph", "p0001_e001", 1),
+            ("KeyValue", "p0001_e002", 2),
+            ("BulletList", "p0001_e003", 3),
+            ("Figure", "p0001_e004", 4),
+            ("Table", "p0001_e005", 5),
+            ("Table", "p0001_e006", 6),
+        ]
+        heading, paragraph, key_value, bullets, figure, ruled, borderless = elements
+        assert (heading.text, heading.level) == ("Results", 1)
+        assert (
+            paragraph.text
+            == "The woodland is vast and its creatures many, each with its own purpose and its own ambitions."
+        )
+        assert (key_value.key, key_value.value) == ("Invoice", "10442")
+        assert bullets.items == ("first item", "second item")
+        assert (figure.width_px, figure.height_px) == (120, 80)
+        assert (ruled.extraction_method, ruled.headers, ruled.rows) == ("lattice", SPEC[0], SPEC[1:])
+        assert (borderless.extraction_method, borderless.headers, borderless.rows) == ("stream", PARTS[0], PARTS[1:])
+        assert not any(element.is_hidden for element in elements)
 
     def test_rejects_wrong_arguments(self):
         slot = layout.FigureSlot(index=0, bbox=BBox(x0=60.0, y0=40.0, x1=180.0, y1=120.0))

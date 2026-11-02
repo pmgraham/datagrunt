@@ -30,7 +30,16 @@ import pypdfium2.raw as pdfium_c
 import pytest
 from PIL import Image
 
-from datagrunt.pdf import BBox, DatagruntPDFError, Figure, PDFCorruptError, PDFEncryptedError, _pdfium_images, elements
+from datagrunt.pdf import (
+    BBox,
+    DatagruntPDFError,
+    Figure,
+    PDFCorruptError,
+    PDFEncryptedError,
+    _pdfium_images,
+    elements,
+    pdfium_engine,
+)
 from datagrunt.pdf._image_headers import jpeg_size
 from datagrunt.pdf._path_segments import Matrix, NonFiniteGeometry
 from datagrunt.pdf.pdfium_engine import (
@@ -973,6 +982,17 @@ class TestChangedFile:
 
         self.changed(image_loader, "the page has 1 object(s)")
 
+    def test_a_page_now_past_the_walks_object_bound(self, tmp_path, monkeypatch):
+        path = xobject_page(
+            tmp_path, FLATE, RGB_4X2 + b" /Filter /FlateDecode", b"q 80 0 0 40 10 20 cm /Im Do Q 0 0 m 9 9 l S"
+        )
+        image_loader = only_loader(path)
+        monkeypatch.setattr(pdfium_engine, "MAX_PAGE_OBJECTS", 1)
+
+        expected = "the file changed (the page holds 2 objects, over the walk's 1-object bound)"
+        with pytest.raises(DatagruntPDFError, match=re.escape(expected)):
+            image_loader.raw_bytes()
+
     def test_fewer_pages(self, tmp_path):
         pages = [PageSpec(), PageSpec(items=(RasterImage(10.0, 10.0, 40.0, 30.0, PNG),))]
         path = build_pdf(tmp_path / "two.pdf", pages)
@@ -1253,6 +1273,18 @@ def jpeg_with_frame(width: int, height: int) -> bytes:
     return bytes(data)
 
 
+def jpeg_with_components(count: int, mode: str = "L", size=(16, 8)) -> bytes:
+    """A Pillow JPEG whose frame header (SOF0) claims ``count`` components, each a copy of its first one's spec."""
+    buffer = io.BytesIO()
+    Image.new(mode, size).save(buffer, "JPEG")
+    data = buffer.getvalue()
+    sof = data.find(b"\xff\xc0")
+    (length,) = struct.unpack_from(">H", data, sof + 2)
+    entry = data[sof + 10 : sof + 13]
+    frame = struct.pack(">H", 8 + 3 * count) + data[sof + 4 : sof + 9] + bytes([count]) + entry * count
+    return data[: sof + 2] + frame + data[sof + 2 + length :]
+
+
 def gray(width: int, height: int, codec: bytes) -> bytes:
     return b"/Width %d /Height %d /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter %s" % (width, height, codec)
 
@@ -1530,24 +1562,51 @@ class TestDecodeBounds:
         got = images_of(path)
 
         (image,) = got.images
-        assert (image.px_width, image.px_height) == (0, 0)
+        assert (image.px_width, image.px_height) == (16, 8)  # the codestream's size, kept with its refusal
         assert got.stats == stats(oversized=1, cover=DRAWN)
         with pytest.raises(DatagruntPDFError, match=re.escape("5 components, over the 4-component bound")):
             only_loader(path).png_bytes()
         assert decode_calls == []
-        assert _pdfium_images._MAX_JPX_COMPONENTS == 4
 
-    def test_a_jpx_past_the_decoded_samples_bound_is_refused_before_decoding(self, tmp_path, monkeypatch, decode_calls):
-        monkeypatch.setattr(_pdfium_images, "_MAX_DECODED_SAMPLES", 16 * 8 * 2, raising=False)
-        rgba_jpx = j2k((16, 8), mode="RGBA")
-        path = xobject_page(tmp_path, rgba_jpx, gray(16, 8, b"/JPXDecode"))
+    def test_a_jpeg_past_the_component_bound_is_refused_before_decoding(self, tmp_path, decode_calls):
+        path = xobject_page(tmp_path, jpeg_with_components(5), gray(16, 8, b"/DCTDecode"))
 
         got = images_of(path)
 
+        (image,) = got.images
         assert got.stats == stats(oversized=1, cover=DRAWN)
-        with pytest.raises(DatagruntPDFError, match="decoded samples"):
-            only_loader(path).png_bytes()
+        assert (image.px_width, image.px_height, image.bits_per_pixel, image.colorspace) == (16, 8, None, None)
+        with pytest.raises(DatagruntPDFError, match=re.escape("object 0 has 5 components, over the 4-component bound")):
+            loader_for(path, image).png_bytes()
         assert decode_calls == []
+
+    def test_the_component_bound_is_four_for_jpeg_and_jpeg_2000(self):
+        assert _pdfium_images._MAX_COMPONENTS == 4
+
+    @pytest.mark.parametrize("progressive", [False, True], ids=["baseline", "progressive"])
+    def test_a_cmyk_jpeg_at_the_component_bound_is_decoded(self, tmp_path, progressive):
+        buffer = io.BytesIO()
+        Image.new("CMYK", (16, 8), (0, 255, 255, 0)).save(buffer, "JPEG", progressive=progressive)
+        path = xobject_page(
+            tmp_path,
+            buffer.getvalue(),
+            b"/Width 16 /Height 8 /ColorSpace /DeviceCMYK /BitsPerComponent 8 /Filter /DCTDecode",
+        )
+
+        (image,) = images_of(path).images
+
+        assert (image.px_width, image.px_height) == (16, 8)
+        assert decoded(loader_for(path, image).png_bytes()).size == (16, 8)
+
+    def test_the_pixel_and_component_bounds_are_the_only_size_bounds(self):
+        # 9459 x 9459 = 89,472,681 pixels (at the 89,478,485 bound) x 4 components: within both, so within every
+        # size bound: a decoded-samples bound of pixels x components could never refuse anything they pass.
+        header = j2k((16, 8), mode="RGBA", siz=(9459, 9459), tile=(9459, 9459))
+
+        got = _pdfium_images._decode_size(("JPXDecode",), (0, 0), header, lambda: b"", "object 0")
+
+        assert got == (9459, 9459, None)
+        assert not hasattr(_pdfium_images, "_MAX_DECODED_SAMPLES")
 
     @pytest.mark.parametrize("codec", [b"Crypt", b"FooDecode"], ids=["crypt", "unknown"])
     def test_an_unsized_filter_is_recorded_without_size_and_never_decoded(self, tmp_path, decode_calls, codec):

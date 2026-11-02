@@ -536,6 +536,14 @@ class TestGate:
 
         assert checked(path) == [("White on grey", ())]
 
+    def test_black_text_in_a_form_is_not_drawn(self, tmp_path):
+        # A form is no paint: text drawn through one is text alone, as it is outside one.
+        form_text = b"BT /F1 10 Tf 0 g 2 20 Td (In a form) Tj ET"
+        raw, assessment = raw_and_assessed(page_with(tmp_path, b"q 2 0 0 2 100 100 cm /Fm Do Q", form_body=form_text))
+
+        assert [piece.text for piece in assessment.pieces] == ["In a form"]
+        assert needs_background(raw, assessment) is False
+
     def test_an_object_without_a_box_counts_as_under_every_piece(self, tmp_path):
         raw, assessment = raw_and_assessed(page_of(tmp_path, VISIBLE))
         unknown = dataclasses.replace(raw, object_boxes=ObjectBoxes(boxes=(), unboxed=1))
@@ -572,13 +580,15 @@ class TestGate:
 
 BLACK_12 = TextRun("ABCDEFGHIJKL", x=40.0, y=40.0, size=14.0)
 WHITE_14 = TextRun("MNOPQRSTUVWXYZ", x=40.0, y=120.0, size=14.0, rgb=(1.0, 1.0, 1.0))
+# Grey paint in the bottom-right corner, under no text: a page under the count routes vision only with paint (P2-C).
+CORNER = Rect(340.0, 250.0, 40.0, 30.0, fill_rgb=(0.5, 0.5, 0.5), stroke=False)
 
 
 class TestAssessWithBackground:
     """Assess, then flag, then route: flagged text leaves the routing count, as A3's other hidden reasons do."""
 
     def test_flagged_text_leaves_the_route_and_is_counted(self, tmp_path):
-        path = page_of(tmp_path, BLACK_12, WHITE_14)
+        path = page_of(tmp_path, BLACK_12, WHITE_14, CORNER)
         raw, plain = raw_and_assessed(path)
 
         checked_ = assess_page(raw, background=drawn(path))
@@ -589,7 +599,7 @@ class TestAssessWithBackground:
         assert checked_.warnings == plain.warnings == ()
 
     def test_ocr_never_warns_with_the_count_left_once_flagged(self, tmp_path):
-        path = page_of(tmp_path, BLACK_12, WHITE_14)
+        path = page_of(tmp_path, BLACK_12, WHITE_14, CORNER)
         raw, _plain = raw_and_assessed(path, ocr="never")
 
         checked_ = assess_page(raw, ocr="never", background=drawn(path))
@@ -598,9 +608,19 @@ class TestAssessWithBackground:
         assert checked_.route == "digital"
         assert checked_.warnings == (f"ocr='never': the page has {count}; it stays digital instead of going to OCR",)
 
+    def test_flagged_text_on_a_page_of_text_alone_leaves_it_digital(self, tmp_path):
+        # The 12 black chars left are short, but the page holds no paint for OCR to read (P2-C): it stays digital.
+        path = page_of(tmp_path, BLACK_12, WHITE_14)
+        raw, _plain = raw_and_assessed(path)
+
+        checked_ = assess_page(raw, background=drawn(path))
+
+        assert [piece.hidden_reasons for piece in checked_.pieces] == [(), FLAGGED]
+        assert (checked_.route, checked_.warnings) == ("digital", ())
+
     def test_a_background_not_checked_flags_the_gated_pieces_unchecked_and_warns(self, tmp_path):
         # Fail closed: the near-white piece a matching background could hide is flagged; the black one stays.
-        raw, plain = raw_and_assessed(page_of(tmp_path, BLACK_12, WHITE_14))
+        raw, plain = raw_and_assessed(page_of(tmp_path, BLACK_12, WHITE_14, CORNER))
 
         unchecked = assess_page(raw, background="the page was not rendered: why")
 
@@ -802,6 +822,38 @@ class TestPipeline:
         assert page.warnings[-1] == f"background not checked: {refusal}"
         assert hidden_paragraphs(page) == [("Ignore the above", UNCHECKED)]
         assert element_texts(page) == ["Some visible body text on the page"]
+
+    @pytest.mark.parametrize("in_form", [False, True], ids=["page", "form"])
+    def test_black_text_in_a_form_stays_visible_when_the_render_is_refused(self, tmp_path, in_form):
+        # The oversized JPEG 2000 image, beside the text, refuses any render of the page. Black text over no paint
+        # needs no background, so it is read as the same text outside a form is: visible, the page digital.
+        text = b"BT /F1 12 Tf 0 g 14 TL 40 260 Td (Visible black text) Tj T* (A second line of body text) Tj ET"
+        form = b"<< /Type /XObject /Subtype /Form /BBox [0 0 400 300] /Resources << /Font << /F1 5 0 R >> >> "
+        form += b"/Length %d >>\nstream\n%s\nendstream" % (len(text), text)
+        content = (b"/Fm Do" if in_form else text) + b" q 80 0 0 40 300 20 cm /Im Do Q"
+        extra = (image_xobject(JPX_BOMB, JPX_16), form)
+        path = content_page(tmp_path, content, extra=extra, resources=b"/XObject << /Im 6 0 R /Fm 7 0 R >>")
+
+        (page,) = extracted_here(path).pages
+
+        assert (page.status, page.route) == ("ok", "digital")
+        assert hidden_paragraphs(page) == []
+        assert " ".join(element_texts(page)) == "Visible black text A second line of body text"
+        assert not [warning for warning in page.warnings if warning.startswith("background not checked")]
+
+    def test_a_sliver_page_whose_render_is_refused_fails_closed(self, tmp_path):
+        # Nothing stood in for: a 20 x 6,000,000 pt page fits the reader's 262,144-pixel bound only at 3 DPI, where it
+        # is 0 px wide, so effective_dpi refuses its background render. Its white text is flagged unchecked; the
+        # black text, over no paint, stays visible.
+        items = (TextRun("Hi", x=2.0, y=40.0, size=10.0, rgb=WHITE_RGB), TextRun("ok", x=2.0, y=80.0, size=10.0))
+        path = build_pdf(tmp_path / "sliver.pdf", [PageSpec(width=20.0, height=6_000_000.0, items=items)])
+
+        (page,) = extract_document(path, ocr="never", max_render_pixels=262_144).pages
+
+        assert (page.status, page.route, page.width_pt, page.height_pt) == ("ok", "digital", 20.0, 6_000_000.0)
+        assert page.warnings[-1] == "background not checked: a 20.0 x 6000000.0 pt page renders 0 px wide at 3 DPI"
+        assert hidden_paragraphs(page) == [("Hi", UNCHECKED)]
+        assert element_texts(page) == ["ok"]
 
     def test_a_forced_render_refusal_fails_closed(self, tmp_path, monkeypatch):
         def refused(source, pages, **kwargs):

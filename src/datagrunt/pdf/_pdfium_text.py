@@ -63,7 +63,7 @@ from typing import NamedTuple
 import pypdfium2.raw as pdfium_c
 
 from datagrunt.pdf._hidden_rules import em_size
-from datagrunt.pdf._pdfium_common import Box, PdfiumFailure, object_address, read_rgba, union_box
+from datagrunt.pdf._pdfium_common import Box, PdfiumFailure, WalkBoundHit, object_address, read_rgba, union_box
 from datagrunt.pdf._validate import finite_float, int_at_least, ordered_box, rgba_tuple, strict_bool, typed_tuple
 
 
@@ -529,6 +529,12 @@ class _Textpage(NamedTuple):
     skipped: frozenset[int]
 
 
+# The most textpage chars one page's text walk reads (generated ones included). A page holding more is not read: it
+# fails whole, naming the bound. Each char costs its worker ~1.3 KiB as it is read and laid out (a page of 1,000,000
+# chars peaked at 1.35 GiB and took 12 s), so a page at the bound stays well inside the page worker's 2 GiB memory
+# cap; the densest text page holds tens of thousands.
+MAX_PAGE_CHARS = 500_000
+
 _HIGH_SURROGATES = range(0xD800, 0xDC00)
 _LOW_SURROGATES = range(0xDC00, 0xE000)
 _MAX_CODE_POINT = 0x10FFFF
@@ -631,10 +637,18 @@ def _textpage_flag(result: int, char_index: int, question: str) -> bool:
 
 
 def _read_textpage(textpage: pdfium_c.FPDF_TEXTPAGE, object_indices: dict[int, int]) -> _Textpage:
-    """Read every textpage char once, each owner's style once, and which owners pdfium cannot place."""
+    """Read every textpage char once, each owner's style once, and which owners pdfium cannot place.
+
+    Raises:
+        PdfiumFailure: If a pdfium call fails.
+        WalkBoundHit: If the textpage holds more than :data:`MAX_PAGE_CHARS`
+            chars (none is read).
+    """
     count = pdfium_c.FPDFText_CountChars(textpage)
     if count < 0:
         raise PdfiumFailure("count the text page's chars")
+    if count > MAX_PAGE_CHARS:
+        raise WalkBoundHit(f"the text page holds {count} chars, over the walk's {MAX_PAGE_CHARS}-char bound")
     chars: list[_OwnedChar | None] = []
     styles: dict[int, _Style] = {}
     skipped: set[int] = set()
@@ -685,6 +699,7 @@ def collect_text(textpage: pdfium_c.FPDF_TEXTPAGE, to_display: Callable[[Box], B
 
     Raises:
         PdfiumFailure: If a pdfium call fails.
+        WalkBoundHit: If the textpage holds more than :data:`MAX_PAGE_CHARS` chars.
     """
     read = _read_textpage(textpage, walk.indices)
     ownerless = walk.text_objects - {char.owner for char in read.chars if char is not None}

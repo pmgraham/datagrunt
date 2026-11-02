@@ -20,11 +20,13 @@ runs them :data:`_WINDOW_PAGES` pages at a time, steps 1-3 for each page of
 a window before step 4 for any):
 
 1. A2 :func:`~datagrunt.pdf.pdfium_engine.extract_page`. A
-   :class:`~datagrunt.pdf.pdfium_engine.PageFailure` raises
-   :class:`~datagrunt.pdf.exceptions.PDFCorruptError` naming the page under
-   ``strict``; else it is A5b's :func:`~datagrunt.pdf.vision.fallback_page`'s
-   (its geometry read again, then render and OCR: ``"ocr_fallback"``, or an
-   error page naming why it was not read).
+   :class:`~datagrunt.pdf.pdfium_engine.PageFailure` (a page pdfium cannot
+   read, or one past a walk bound: its objects, path segments or textpage
+   chars) raises :class:`~datagrunt.pdf.exceptions.PDFCorruptError` naming
+   the page under ``strict``; else the page skips steps 2-3 and its step 4
+   is A5b's :func:`~datagrunt.pdf.vision.fallback_page` (its geometry read
+   again, then render and OCR: ``"ocr_fallback"``, or an error page naming
+   why it was not read).
 2. A2 :func:`~datagrunt.pdf.pdfium_engine.recover_dropped_text`, when the
    page's textpage drops text objects (``TextStats.dropped_text_objects``
    over 0).
@@ -46,7 +48,10 @@ a window before step 4 for any):
 4. The route: a digital or hybrid page is A4a's lattice tables, then A4b's
    :func:`~datagrunt.pdf.assembly.assemble_page`; a vision page is A5b's
    :func:`~datagrunt.pdf.vision.vision_page`'s (render and OCR: ``"ok"``,
-   or ``"ocr_unavailable"`` with its digital text when OCR cannot read it).
+   or ``"ocr_unavailable"`` with its digital text when OCR cannot read it);
+   a page A2 could not read is ``fallback_page``'s (step 1). Every render
+   and OCR of a page is its step 4, so each page reply carries at most one
+   page's OCR budget, as its bound (:func:`_reply_bound_s`) counts.
    Both A5b steps take the source's password, ``ocr``,
    ``min_image_dimension`` (a vision page's figures), and ``vision_dpi`` and
    ``max_render_pixels`` (:class:`~datagrunt.pdf.vision.VisionOptions`).
@@ -149,7 +154,11 @@ to start a worker raises its OSError. The pool is bounded and always ends:
   PDFCorruptError, an open error) is raised here, after the pages before
   its chunk; the workers after it are killed.
 - Every worker is reaped (killed first if still running) before the pool
-  returns or raises, on every path.
+  returns or raises, on every path. A page worker leads a process group of
+  its own (POSIX), and each kill of it (at a bound, at a stop, at its end)
+  ends the group: the render workers and tesseract runs it started, and
+  any process holding its pipes, end with it, so a reply's bound holds and
+  no reader is left blocked on a pipe.
 
 The hash is bound to the bytes extracted. The source is opened once, and
 through that open file its identity is taken, once
@@ -207,6 +216,7 @@ from datagrunt.pdf._process import (
     NoInterpreter,
     StderrTail,
     close_pipes,
+    kill_group,
     next_reply,
     read_error,
     reaped,
@@ -708,7 +718,7 @@ class _Worker:
 def _started(command: list[str], pages: tuple[int, ...] | None) -> _Worker:
     """Start the worker for ``pages``, its stderr drained into a 4 KiB ring (nothing is written to disk)."""
     started = time.monotonic()
-    child, stderr = start_worker(command)
+    child, stderr = start_worker(command, own_group=True)
     return _Worker(pages=pages, child=child, stderr=stderr, started=started)
 
 
@@ -789,7 +799,7 @@ class _Chunk:
         with self._lock:
             self._stopped = True
             if self._worker is not None:
-                self._worker.child.kill()
+                kill_group(self._worker.child)
 
     def _run(self) -> None:
         """The thread: workers until each page is a page, an error, or a stop; what it raises recorded."""
@@ -834,7 +844,7 @@ class _Chunk:
         """Forget, kill and reap ``worker``, and end its stderr's drain (a kill never reaches a reaped pid)."""
         with self._lock:
             self._worker = None
-        worker.child.kill()
+        kill_group(worker.child)
         close_pipes(worker.child)
         reaped(worker.child, REAP_TIMEOUT_S)
         worker.stderr.finish(REAP_TIMEOUT_S)
@@ -891,10 +901,10 @@ def _read_into(worker: _Worker, replies: _Replies, chunk: _Chunk) -> None:
         bound_s = _reply_bound_s(len(pages), len(replies.pages), chunk.options)
         try:
             message, expired = next_reply(
-                worker.child, stdout, since + bound_s - time.monotonic(), _MAX_PAGE_MESSAGE_BYTES
+                worker.child, stdout, since + bound_s - time.monotonic(), _MAX_PAGE_MESSAGE_BYTES, kill=kill_group
             )
         except MessageTooLong as exc:
-            worker.child.kill()  # it may be blocked writing the rest: the pool reaps it
+            kill_group(worker.child)  # it may be blocked writing the rest: the pool reaps it
             replies.ending, replies.detail = "too long", str(exc)
             return
         if message is None:
@@ -918,10 +928,10 @@ def _read_facts(worker: _Worker, stdout: IO[bytes], replies: _Replies, chunk: _C
     bound_s = _facts_bound_s()
     try:
         message, expired = next_reply(
-            worker.child, stdout, worker.started + bound_s - time.monotonic(), _MAX_PAGE_MESSAGE_BYTES
+            worker.child, stdout, worker.started + bound_s - time.monotonic(), _MAX_PAGE_MESSAGE_BYTES, kill=kill_group
         )
     except MessageTooLong as exc:
-        worker.child.kill()
+        kill_group(worker.child)
         replies.ending, replies.detail = "too long", str(exc)
         return False
     if message is None:

@@ -12,18 +12,29 @@ import io
 import json
 import os
 import pickle
+import random
 import re
 import subprocess
 import sys
 import threading
 import time
+import types
 from functools import partial
 from pathlib import Path
 
 import pypdfium2.raw as pdfium_c
 import pytest
+from PIL import Image
 
-from datagrunt.pdf import DatagruntPDFError, PDFCorruptError, PDFEncryptedError, _page_worker, _process, pipeline
+from datagrunt.pdf import (
+    DatagruntPDFError,
+    PDFCorruptError,
+    PDFEncryptedError,
+    _page_worker,
+    _process,
+    pdfium_engine,
+    pipeline,
+)
 from datagrunt.pdf._memory_cap import Lifetime
 from datagrunt.pdf._page_worker import extract_page_at
 from datagrunt.pdf.assembly import _VISION_NOTE, assemble_page
@@ -41,13 +52,14 @@ from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, SourceIdentity, e
 from datagrunt.pdf.quality import assess_page
 from datagrunt.pdf.scope import apply_scope
 from datagrunt.pdf.vision import VisionOptions, vision_page
-from pdf_tests.builders import PageSpec, RasterImage, TextRun, break_page, build_pdf, solid_png
+from pdf_tests.builders import Line, PageSpec, RasterImage, TextRun, break_page, build_pdf, solid_png
 from pdf_tests.test_layout_lattice import rules as lattice_rules
 from pdf_tests.test_layout_lattice import written
 from pdf_tests.test_layout_stream_tables import body_text, table_runs
 from pdf_tests.test_ocr import fake_tesseract, needs_tesseract, posix_only, row, tsv
 from pdf_tests.test_ocr_scans import LINES, TOKENS, png_of, rendered
 from pdf_tests.test_pdfium_extract_page import failing
+from pdf_tests.test_pdfium_spans import content_page
 from pdf_tests.test_routing import BROKEN_LINE, MAPPED_LINE, garbled, garbled_page
 
 LATTICE_XS = (50.0, 150.0, 250.0, 350.0)
@@ -55,6 +67,7 @@ PARTS = (("Part", "Qty", "Price"), ("Bolt", "4", "0.10"), ("Nut", "12", "0.05"))
 # A 64 x 32 px image: a figure at min_image_dimension 32, none at 40 (the default).
 PNG = solid_png(64, 32, (0.2, 0.4, 0.6))
 DEFAULT_SIZE_NOTE = "; 612 x 792 pt is pdfium's default page size, not this page's"
+BODY_TEXT = "The woodland is vast and its creatures many, each with its own purpose and its own ambitions."
 
 
 def mixed_page(top: float = 60.0) -> PageSpec:
@@ -271,6 +284,12 @@ def hang_on_page_3(message, replies):
     _page_worker._worker_main(message, replies)
 
 
+def with_a_3_object_walk_bound(message, replies):
+    """The pipeline's worker, its page walk bounded at 3 objects (in this worker only)."""
+    pdfium_engine.MAX_PAGE_OBJECTS = 3
+    _page_worker._worker_main(message, replies)
+
+
 def facts_then_pages(message, replies) -> tuple[Page, ...]:
     """Send the document's facts if the worker is its first; the pages the pipeline's worker would send."""
     request = pipeline._chunk_request(message)
@@ -434,6 +453,36 @@ with open(sys.argv[2], "a") as marker:
 document = extract_document(sys.argv[1], workers=2)
 print(f"extracted {len(document.pages)} pages: {[page.status for page in document.pages]}")
 """
+
+
+def noise_png(width: int, height: int) -> bytes:
+    """An RGB PNG of random pixels (one seed): it compresses to about its raw size, ``width * height * 3`` bytes."""
+    rng = random.Random(width * height)
+    buffer = io.BytesIO()
+    Image.frombytes("RGB", (width, height), rng.randbytes(width * height * 3)).save(buffer, "PNG")
+    return buffer.getvalue()
+
+
+def digest_that_then(change):
+    """A stand-in for pipeline's ``hashlib``: its sha256 hashes as hashlib's does, and calls ``change()`` once, after
+    the first chunk it is given (the reads stay the real reads of the real file)."""
+    real = hashlib.sha256
+    done: list[bool] = []
+
+    class Digest:
+        def __init__(self) -> None:
+            self._digest = real()
+
+        def update(self, block: bytes) -> None:
+            self._digest.update(block)
+            if not done:
+                done.append(True)
+                change()
+
+        def hexdigest(self) -> str:
+            return self._digest.hexdigest()
+
+    return types.SimpleNamespace(sha256=Digest)
 
 
 def identity_of(path) -> SourceIdentity:
@@ -627,8 +676,16 @@ class TestExtractPageAt:
         page = page_at(path, min_image_dimension=32)
 
         assert page == chain_page(path, min_image_dimension=32)
-        # Not vacuous: the page has text, a figure and both kinds of table.
-        assert {type(element).__name__ for element in page.elements} >= {"Heading", "Paragraph", "Figure", "Table"}
+        # Not vacuous, and not only the chain's: the page's own facts, turned on /Rotate 90.
+        assert (page.width_pt, page.height_pt) == ((792.0, 612.0) if rotate == 90 else (612.0, 792.0))
+        assert page.quality.rotation_deg == rotate
+        heading, paragraph, figure, lattice, stream = page.elements
+        assert (heading.text, paragraph.text) == ("Parts list", BODY_TEXT)
+        assert (figure.width_px, figure.height_px) == (64, 32)
+        assert [(table.extraction_method, table.headers, table.rows) for table in (lattice, stream)] == [
+            ("lattice", PARTS[0], PARTS[1:]),
+            ("stream", PARTS[0], PARTS[1:]),
+        ]
         assert page.status == "ok"
         assert page.integrity_verified
 
@@ -853,6 +910,16 @@ class TestPageIsolation:
         assert dataclasses.replace(page, page_image=None) == error_page(1, why, size=(400.0, 300.0))
         assert page.page_image is not None  # its render was made: OCR could not read it
 
+    def test_a_page_past_a_walk_bound_is_an_error_page_of_its_own_size_naming_the_bound(self, tmp_path, monkeypatch):
+        path = content_page(tmp_path, b"10 10 m 20 20 l S 30 30 m 40 40 l S 50 50 m 60 60 l S 70 70 m 80 80 l S")
+        monkeypatch.setattr(pdfium_engine, "MAX_PAGE_OBJECTS", 3)
+
+        page = page_at(path, ocr="never")
+
+        bound = "page 1: the page holds 4 objects, over the walk's 3-object bound; the page is not read"
+        why = f"extraction failed at stage 'text': {bound}; ocr='never', so the page is not read by OCR"
+        assert page == error_page(1, why, size=(400.0, 300.0))
+
     def test_a_failed_page_reads_nothing_by_ocr_under_ocr_never(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "doc.pdf", [PageSpec(width=400.0, height=300.0, items=body_text(100.0))])
         monkeypatch.setattr(pdfium_c, "FPDFText_CountChars", failing(-1))
@@ -862,6 +929,45 @@ class TestPageIsolation:
         why = f"extraction failed at stage 'text': {TEXT_FAILURE}; ocr='never', so the page is not read by OCR"
         assert page == error_page(1, why, size=(400.0, 300.0))
         assert page.page_image is None
+
+    def test_a_failed_pages_ocr_runs_in_its_own_step_4_after_the_pages_before_it_are_sent(self, tmp_path, monkeypatch):
+        # Each reply carries at most one page's OCR budget (#418's bound): a page A2 cannot read is read by OCR as its
+        # own step 4, never in steps 1-3 ahead of the window's earlier pages.
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 4)
+        events: list[tuple[str, int]] = []
+        real = _page_worker.extract_page
+
+        def fails_on_pages_1_2_and_4(handle, index):
+            if index == 2:
+                return real(handle, index)
+            return PageFailure(page_number=index + 1, stage="text", message=f"page {index + 1}: failed")
+
+        def fallback(handle, failure, **kwargs):
+            events.append(("fallback", failure.page_number))
+            return pipeline.error_page(failure.page_number - 1, "read by the fallback")
+
+        monkeypatch.setattr(_page_worker, "extract_page", fails_on_pages_1_2_and_4)
+        monkeypatch.setattr(_page_worker, "fallback_page", fallback)
+
+        with open_document(path) as handle:
+            pages = _page_worker._window_pages(
+                handle,
+                PDFSource(path=path),
+                (0, 1, 2, 3),
+                PipelineOptions(),
+                lambda index: events.append(("began", index + 1)),
+            )
+            for page in pages:
+                events.append(("sent", page.page_number))
+
+        steps_1_to_3 = [("began", 1), ("began", 2), ("began", 3), ("began", 4)]
+        assert events == [
+            *steps_1_to_3,
+            *[("began", 1), ("fallback", 1), ("sent", 1)],
+            *[("began", 2), ("fallback", 2), ("sent", 2)],
+            *[("began", 3), ("sent", 3)],
+            *[("began", 4), ("fallback", 4), ("sent", 4)],
+        ]
 
     @pytest.mark.parametrize(
         "stage", ["extract_page", "recover_dropped_text", "assess_page", "find_lattice_tables", "assemble_page"]
@@ -1041,9 +1147,20 @@ class TestExtractDocument:
         document = extract_document(path, min_image_dimension=32)
 
         assert document == chain_document(path, title="Parts", author="Ada", min_image_dimension=32)
-        # Not vacuous: the pages hold elements and the scope pass set paths and sections.
+        # Not vacuous, and not only the chain's: the scope pass's own facts. The table that ends page 2 goes on at the
+        # top of page 3, and each page's "Parts list" opens a section.
         assert [page.page_number for page in document.pages] == [1, 2, 3]
-        assert document.sections and all(page.elements for page in document.pages)
+        assert [(table.element_id, table.continued_from_id) for table in document.tables] == [
+            ("p0001_e003", None),
+            ("p0001_e004", None),
+            ("p0002_e002", None),
+            ("p0003_e000", "p0002_e002"),
+        ]
+        assert [(section.heading.element_id, section.page_span) for section in document.sections] == [
+            ("p0001_e000", (1, 1)),
+            ("p0002_e000", (2, 3)),
+        ]
+        assert {element.scope_path for page in document.pages for element in page.elements} == {("Parts list",)}
         assert document.integrity_verified
 
     def test_a_table_split_across_two_pages_is_linked(self, tmp_path):
@@ -1154,6 +1271,45 @@ class TestExtractDocument:
         message = f"{path} changed while it was hashed: 0 of its {path.stat().st_size} bytes could be read"
         with pytest.raises(PDFSourceChangedError, match=re.escape(message)):
             extract_document(path)
+
+    def test_a_file_cut_short_on_disk_while_it_is_hashed_fails_loud(self, tmp_path, monkeypatch):
+        # The real reads of the real file, over 1 MiB (one chunk, read past the stream's buffer): it is cut to nothing
+        # once the hash has its first chunk, so its next read is short.
+        noise = RasterImage(72.0, 400.0, 200.0, 150.0, noise_png(800, 600))
+        path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=(*mixed_page().items, noise))])
+        size = path.stat().st_size
+        assert size > pipeline._HASH_CHUNK_BYTES == 1 << 20
+        monkeypatch.setattr(pipeline, "hashlib", digest_that_then(lambda: os.truncate(path, 0)))
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            extract_document(path)
+
+        assert str(caught.value) == f"{path} changed while it was hashed: 1048576 of its {size} bytes could be read"
+
+    def test_a_file_cut_short_once_its_bytes_are_hashed_is_said_to_have_changed(self, tmp_path, monkeypatch):
+        # The hash read the whole small file at once (its stream's buffer); the file is cut to nothing before pdfium
+        # opens it. Its open fails, but on a file that is not the one hashed: that is what is said.
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
+        size = path.stat().st_size
+        monkeypatch.setattr(pipeline, "_HASH_CHUNK_BYTES", 256)
+        monkeypatch.setattr(pipeline, "hashlib", digest_that_then(lambda: os.truncate(path, 0)))
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            extract_document(path)
+
+        assert str(caught.value).startswith(f"{path} changed when pdfium opened it: size {size} -> 0 bytes")
+
+    def test_a_file_grown_on_disk_while_it_is_hashed_fails_loud(self, tmp_path, monkeypatch):
+        # The hash reads the size the file had when it was opened; the growth is caught when pdfium opens it.
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
+        before = identity_of(path)
+        monkeypatch.setattr(pipeline, "_HASH_CHUNK_BYTES", 256)
+        monkeypatch.setattr(pipeline, "hashlib", digest_that_then(lambda: append_in_place(path)))
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            extract_document(path)
+
+        assert str(caught.value) == changed(path, "when pdfium opened it", before, identity_of(path), "size", "mtime")
 
     def test_a_corrupt_page_is_an_error_page_and_the_rest_extract(self, tmp_path):
         path = break_page(build_pdf(tmp_path / "doc.pdf", [mixed_page(), mixed_page(), mixed_page()]), 2)
@@ -1365,6 +1521,27 @@ class TestWorkers:
         assert_reaped(started)
 
     @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_a_page_past_a_walk_bound_in_a_worker_is_an_error_page_and_the_rest_extract(self, tmp_path, monkeypatch):
+        rules = tuple(Line(20.0, 20.0 + 10.0 * index, 200.0, 20.0 + 10.0 * index) for index in range(4))
+        pages = [
+            PageSpec(items=(TextRun("One", 72.0, 72.0),)),
+            PageSpec(items=rules),
+            PageSpec(items=(TextRun("Three", 72.0, 72.0),)),
+        ]
+        path = build_pdf(tmp_path / "doc.pdf", pages)
+        sequential = extract_document(path, ocr="never")
+        started = started_workers(monkeypatch)
+        run_page_workers_as(monkeypatch, "with_a_3_object_walk_bound")
+
+        pooled = extract_document(path, workers=2, ocr="never")
+
+        bound = "page 2: the page holds 4 objects, over the walk's 3-object bound; the page is not read"
+        why = f"extraction failed at stage 'text': {bound}; ocr='never', so the page is not read by OCR"
+        assert pooled.pages[1] == error_page(2, why)
+        assert [pooled.pages[0], pooled.pages[2]] == [sequential.pages[0], sequential.pages[2]]
+        assert_reaped(started)
+
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_a_worker_past_its_time_is_killed_and_its_page_is_an_error_page(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 4)
         started = started_workers(monkeypatch)
@@ -1545,7 +1722,7 @@ class TestWorkers:
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 2, user_password="pw-6b0d")
         seen = []
         real = pipeline.start_worker
-        monkeypatch.setattr(pipeline, "start_worker", lambda command: seen.append(command) or real(command))
+        monkeypatch.setattr(pipeline, "start_worker", lambda command, **kw: seen.append(command) or real(command, **kw))
         written = []
         real_send = pipeline._send_request
         monkeypatch.setattr(
@@ -1751,6 +1928,39 @@ def ended_up(worker: pipeline._Worker) -> None:
     worker.stderr.finish(5.0)
 
 
+# A worker that starts a descendant holding the worker's stdout and stderr (it inherits them) for a minute, writes
+# that descendant's pid to argv[1], then sends nothing.
+HOLDS_ITS_PIPES = """
+import subprocess, sys, time
+descendant = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+with open(sys.argv[1], "w") as out:
+    out.write(str(descendant.pid))
+time.sleep(60)
+"""
+process_groups = pytest.mark.skipif(sys.platform == "win32", reason="a page worker leads a process group on POSIX only")
+
+
+def descendant_of(pidfile: Path) -> int:
+    """The pid HOLDS_ITS_PIPES wrote, once it is written (within 30 s)."""
+    deadline = time.monotonic() + 30.0
+    while not pidfile.exists() or not pidfile.read_text():
+        assert time.monotonic() < deadline, "the worker did not start its descendant"
+        time.sleep(0.02)
+    return int(pidfile.read_text())
+
+
+def assert_ends(pid: int) -> None:
+    """``pid`` ends (and its new parent reaps it) within 5 s."""
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.02)
+    pytest.fail(f"process {pid} still runs")
+
+
 def empty_stderr() -> _process.StderrTail:
     """The drain of a stderr pipe already at its end: nothing was written."""
     read_end, write_end = os.pipe()
@@ -1840,6 +2050,44 @@ class TestReplies:
             ended_up(worker)
 
         assert reason == "the page worker opening it did not return its facts within 120 s of its start: it was killed"
+
+    @process_groups
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_a_descendant_holding_a_workers_pipes_ends_with_it_at_its_bound(self, tmp_path, monkeypatch):
+        # #418's bounds hold only if a killed worker's replies end: a descendant holding its pipes is ended with it.
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
+        pidfile = tmp_path / "descendant.pid"
+        allowances(monkeypatch, _WORKER_START_S=0.5, _WORKER_PAGE_S=0.5)  # its facts' bound: 1 s from its start
+        command = [sys.executable, "-c", HOLDS_ITS_PIPES, str(pidfile)]
+
+        began = time.monotonic()
+        with pytest.raises(PDFCorruptError) as caught:
+            pipeline._pooled_pages(PDFSource(path=path), PipelineOptions(), command)
+        elapsed = time.monotonic() - began
+
+        why = "the page worker opening it did not return its facts within 1 s of its start: it was killed"
+        assert str(caught.value) == f"{path}: {why}; the document is not read"
+        assert elapsed < 6.0  # ~1.1 s here: the bound, a kill and a reap; the descendant would hold the pipes 60 s
+        assert_ends(descendant_of(pidfile))
+
+    @process_groups
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_shutting_down_ends_a_reader_a_descendant_holds_open(self, tmp_path):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
+        pidfile = tmp_path / "descendant.pid"
+        chunk = pipeline._Chunk(
+            PDFSource(path=path), PipelineOptions(), [sys.executable, "-c", HOLDS_ITS_PIPES, str(pidfile)], None, 1
+        )
+        chunk.start()
+        descendant = descendant_of(pidfile)
+
+        began = time.monotonic()
+        pipeline._shut_down([chunk])
+        elapsed = time.monotonic() - began
+
+        assert not chunk.thread.is_alive()
+        assert elapsed < 3.0  # ~0.1 s here; a reader left blocked on the pipes waits out its 5 s join
+        assert_ends(descendant)
 
     def test_a_reader_that_does_not_end_fails_loud(self, monkeypatch):
         monkeypatch.setattr(pipeline, "_lifetime_s", lambda count, options: 0.01)

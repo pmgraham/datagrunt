@@ -303,9 +303,9 @@ def started(monkeypatch, module) -> list:
     commands: list = []
     real = module.start_worker
 
-    def recorded(command):
+    def recorded(command, **options):
         commands.append(command)
-        return real(command)
+        return real(command, **options)
 
     monkeypatch.setattr(module, "start_worker", recorded)
     return commands

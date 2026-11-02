@@ -144,7 +144,8 @@ class TestLaunch:
         ):
             _process.request_payload("os", {}, 1 << 20)
 
-    def test_a_worker_starts_with_its_stdin_stdout_and_stderr_piped(self, monkeypatch):
+    @pytest.mark.parametrize("own_group", [False, True], ids=["callers-group", "own-group"])
+    def test_a_worker_starts_with_its_stdin_stdout_and_stderr_piped(self, monkeypatch, own_group):
         seen = []
         real = subprocess.Popen
 
@@ -155,9 +156,11 @@ class TestLaunch:
         monkeypatch.setattr(subprocess, "Popen", recorded)
         command = [sys.executable, "-c", "import sys; sys.stderr.write('started')"]
 
-        child, stderr = _process.start_worker(command)
+        child, stderr = _process.start_worker(command, own_group=own_group)
 
-        assert seen == [((command,), {"stdin": subprocess.PIPE, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE})]
+        session = own_group and os.name == "posix"
+        piped = {"stdin": subprocess.PIPE, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+        assert seen == [((command,), {"start_new_session": session, **piped})]
         assert _process.reaped(child, 60.0) == 0
         _process.close_pipes(child)
         assert stderr.finish(_process.REAP_TIMEOUT_S) == "started"
@@ -202,6 +205,76 @@ def drained_child(data: bytes) -> tuple["subprocess.Popen[bytes]", _process.Stde
 def stderr_threads() -> list[threading.Thread]:
     """The stderr drain threads still running."""
     return [thread for thread in threading.enumerate() if thread.name == _process.STDERR_THREAD]
+
+
+# A child that starts a descendant (it stays in the child's process group) and writes its pid to argv[1].
+WITH_A_DESCENDANT = """
+import subprocess, sys, time
+descendant = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+with open(sys.argv[1], "w") as out:
+    out.write(str(descendant.pid))
+time.sleep(60)
+"""
+
+
+def written_pid(path) -> int:
+    deadline = time.monotonic() + 30.0
+    while not path.exists() or not path.read_text():
+        assert time.monotonic() < deadline, "the child did not start its descendant"
+        time.sleep(0.02)
+    return int(path.read_text())
+
+
+def ends_within(pid: int, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.02)
+    return False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="a worker leads a process group on POSIX only")
+class TestKillGroup:
+    """kill_group ends a worker started with own_group and every process that stayed in its group."""
+
+    def test_a_workers_descendant_ends_with_it(self, tmp_path):
+        child, stderr = _process.start_worker(
+            [sys.executable, "-c", WITH_A_DESCENDANT, str(tmp_path / "pid")], own_group=True
+        )
+        descendant = written_pid(tmp_path / "pid")
+
+        _process.kill_group(child)
+
+        assert _process.reaped(child, 5.0) == -9
+        _process.close_pipes(child)
+        assert ends_within(descendant, 5.0)
+        assert stderr.finish(5.0) == ""  # the descendant held the stderr pipe too: it ended
+
+    def test_a_reaped_worker_is_never_signalled(self, monkeypatch):
+        child, stderr = _process.start_worker([sys.executable, "-c", "pass"], own_group=True)
+        assert _process.reaped(child, 60.0) == 0
+        _process.close_pipes(child)
+        stderr.finish(5.0)
+        monkeypatch.setattr(os, "killpg", lambda *args: pytest.fail("a reaped worker's group was signalled"))
+
+        _process.kill_group(child)
+
+    def test_a_refused_group_signal_falls_back_to_the_worker(self, monkeypatch):
+        # macOS refuses (EPERM) to signal a group whose only process is the exited, unreaped worker.
+        child, stderr = _process.start_worker([sys.executable, "-c", "import time; time.sleep(60)"], own_group=True)
+
+        def refused(*args):
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr(os, "killpg", refused)
+        _process.kill_group(child)
+
+        assert _process.reaped(child, 5.0) == -9
+        _process.close_pipes(child)
+        stderr.finish(5.0)
 
 
 class TestStderrTail:
