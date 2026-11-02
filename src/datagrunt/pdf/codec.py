@@ -128,7 +128,7 @@ _KIND_KEYS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         "heading": ("level", "text"),
         "paragraph": ("text",),
         "key_value": ("key", "value"),
-        "table": ("headers", "rows", "extraction_method", "continued_from_id", "column_centres"),
+        "table": ("headers", "rows", "extraction_method", "continued_from_id", "column_centres", "column_intervals"),
         "list": ("items", "ordered", "markers"),
         "figure": ("sha256", "width_px", "height_px", "image_path", "caption"),
     }
@@ -215,7 +215,7 @@ def _element_json(element: DocumentElement) -> Json:
 
 
 def _plain(value: object) -> object:
-    """A field's JSON value: a path as a ``/`` string, a tuple (of tuples: a table's rows) as a list."""
+    """A field's JSON value: a path as a ``/`` string, a tuple (of tuples: a table's rows, its intervals) as a list."""
     if isinstance(value, Path):
         return value.as_posix()
     if isinstance(value, tuple):
@@ -427,7 +427,8 @@ def _tuple(name: str, value: object) -> tuple[Any, ...]:
     return tuple(_array(name, value))
 
 
-def _rows(name: str, value: object) -> tuple[tuple[Any, ...], ...]:
+def _nested(name: str, value: object) -> tuple[tuple[Any, ...], ...]:
+    """A JSON array of arrays as a tuple of tuples: a table's rows, or its column intervals."""
     return tuple(_tuple(f"{name}[{i}]", row) for i, row in enumerate(_array(name, value)))
 
 
@@ -522,10 +523,11 @@ def _table(name: str, data: Json, shared: Json, root: Path | None) -> Table:
     return Table(
         **shared,
         headers=_tuple(f"{name}.headers", data["headers"]),
-        rows=_rows(f"{name}.rows", data["rows"]),
+        rows=_nested(f"{name}.rows", data["rows"]),
         extraction_method=data["extraction_method"],
         continued_from_id=data["continued_from_id"],
         column_centres=_tuple(f"{name}.column_centres", data["column_centres"]),
+        column_intervals=_nested(f"{name}.column_intervals", data["column_intervals"]),
     )
 
 

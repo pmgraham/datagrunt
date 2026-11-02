@@ -353,6 +353,18 @@ def _check_bool(name: str, value: object) -> None:
         raise TypeError(f"{name} must be a bool, got {value!r} ({type(value).__name__})")
 
 
+def _interval(name: str, value: object) -> tuple[float, float]:
+    """Return ``value``, a ``(start, end)`` tuple of finite numbers with ``start <= end``, as floats."""
+    if not isinstance(value, tuple):
+        raise TypeError(f"{name} must be a (start, end) tuple, got {type(value).__name__}")
+    if len(value) != 2:
+        raise ValueError(f"{name} must hold 2 values, got {len(value)}")
+    start, end = finite_float(f"{name}[0]", value[0]), finite_float(f"{name}[1]", value[1])
+    if start > end:
+        raise ValueError(f"{name} must have start <= end, got {(start, end)!r}")
+    return start, end
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class BBox:
     """An axis-aligned bounding box in PDF points, top-left origin.
@@ -712,6 +724,11 @@ class Table(_Element):
             the column's widest cell; a lattice table's is the middle of
             its ruled column. The scope pass (A6) links a split table's
             parts on them.
+        column_intervals: One display-x ``(start, end)`` per column (finite,
+            ``start <= end``, starts never falling, each holding its
+            column's centre), or empty when not measured: where the
+            column's cells start and end along the rows, so a column whose
+            cells are all one width still shows where its text ends (#420).
     """
 
     headers: tuple[str, ...]
@@ -719,6 +736,7 @@ class Table(_Element):
     extraction_method: ExtractionMethod
     continued_from_id: str | None = None
     column_centres: tuple[float, ...] = ()
+    column_intervals: tuple[tuple[float, float], ...] = ()
 
     def _validate_fields(self) -> None:
         str_tuple("headers", self.headers, allow_blank=True)
@@ -733,6 +751,7 @@ class Table(_Element):
             if self.continued_from_id == self.element_id:
                 raise ValueError(f"continued_from_id must differ from element_id, got {self.continued_from_id!r}")
         self._validate_centres()
+        self._validate_intervals()
 
     def _validate_centres(self) -> None:
         """Require no centres, or one finite centre per column in strictly increasing order (stored as floats)."""
@@ -749,6 +768,26 @@ class Table(_Element):
         if any(left >= right for left, right in zip(centres, centres[1:])):
             raise ValueError(f"column_centres must strictly increase, got {self.column_centres!r}")
         object.__setattr__(self, "column_centres", centres)
+
+    def _validate_intervals(self) -> None:
+        """Require no intervals, or one ``(start, end)`` per column (stored as floats), as the docstring says."""
+        if not isinstance(self.column_intervals, tuple):
+            raise TypeError(f"column_intervals must be a tuple, got {type(self.column_intervals).__name__}")
+        if not self.column_intervals:
+            return
+        width = self._width()
+        if len(self.column_intervals) != width:
+            raise ValueError(
+                f"column_intervals must have {width} values (one per column), got {len(self.column_intervals)}"
+            )
+        intervals = tuple(_interval(f"column_intervals[{i}]", pair) for i, pair in enumerate(self.column_intervals))
+        if any(later[0] < earlier[0] for earlier, later in zip(intervals, intervals[1:])):
+            raise ValueError(f"column_intervals' starts must not decrease, got {self.column_intervals!r}")
+        for index, (centre, (start, end)) in enumerate(zip(self.column_centres, intervals)):
+            if not start <= centre <= end:
+                where = f"column_intervals[{index}] {(start, end)!r}"
+                raise ValueError(f"column_centres[{index}] {centre!r} must lie within {where}")
+        object.__setattr__(self, "column_intervals", intervals)
 
     def _validate_width(self) -> None:
         if not self.headers and not self.rows:
