@@ -135,6 +135,20 @@ class TestRecord:
 
         assert (image.px_width, image.px_height) == (64, 48)
 
+    def test_a_jbig2_image_behind_flatedecode_is_unsized(self, tmp_path, decode_calls):
+        import zlib
+
+        filters = entries(64, 48).replace(b"/JBIG2Decode", b"[/FlateDecode /JBIG2Decode]")
+        path = xobject_page(tmp_path, zlib.compress(jbig2(pattern())), filters)
+
+        got = images_of(path)
+
+        assert [(image.px_width, image.px_height) for image in got.images] == [(0, 0)]
+        assert got.stats == stats(unsized=1, cover=DRAWN)
+        message = "object 0 is a JBIG2Decode stream behind FlateDecode: its size cannot be read without decoding"
+        assert refusal_of(path) == message
+        assert decode_calls == []
+
     def test_a_jbig2_image_over_the_pixel_bound_is_oversized(self, tmp_path, decode_calls):
         path = xobject_page(tmp_path, jbig2(pattern()), entries(10000, 10000))
 
