@@ -71,10 +71,11 @@ _JBIG2_EMBEDDED_PAGE = 1
 _JBIG2_UNKNOWN = 0xFFFFFFFF
 
 # Filter names, normalised, that do not decode an image to a raster bigger than
-# its declared /Width x /Height (so pdfium/MuPDF bound them by the declared
-# size, not by the stream): the simple stream filters and CCITT fax. DCTDecode
-# is treated the same on v4 paths (its stream is written out undecoded, and a
-# page render scales it within its box), so it is left to the engine unchanged.
+# its declared /Width x /Height: the simple stream filters and CCITT fax. MuPDF
+# stops a simple filter at the declared size; pdfium decodes it whole, so the
+# pdfium engine checks its decoded size first (``stream_check``). DCTDecode is
+# treated the same on v4 paths (its stream is written out undecoded, and a page
+# render scales it within its box), so it is left to the engine unchanged.
 _NON_IMAGE_FILTERS = frozenset(
     {
         "ASCIIHexDecode",
@@ -278,8 +279,8 @@ def inspect_image(
     if codec == "JBIG2Decode":
         return _inspect_jbig2(raw_stream, wrappers, label, jbig2_globals, jbig2_globals_missing)
     if codec in _NON_IMAGE_FILTERS:
-        # Simple filter or DCT as the image codec: bounded by the declared
-        # size; v4 behaviour is unchanged (no decode beyond the declared size).
+        # Simple filter or DCT as the image codec: this guard passes it; the
+        # pdfium engine checks a simple filter's decoded size (``stream_check``).
         return _SAFE
     # Anything else is an unrecognised image codec. Do not assume the declared
     # size (that was the advisory's bypass); skip it.
