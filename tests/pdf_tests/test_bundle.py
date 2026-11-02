@@ -32,9 +32,11 @@ from datagrunt.pdf.bundle import BUNDLE_FORMAT_VERSION, load_bundle, write_bundl
 from datagrunt.pdf.codec import document_from_json_bytes
 from datagrunt.pdf.elements import Figure, PDFDocument
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFSourceChangedError
+from datagrunt.pdf.frame import utf8_text
 from datagrunt.pdf.ocr import tesseract_available
 from datagrunt.pdf.pipeline import extract_document
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page, render_size
+from datagrunt.pdf.writer import PDFWriter
 from pdf_tests.builders import PageSpec, TextRun, build_pdf, hand_written_pdf, solid_png
 from pdf_tests.documents import FIGURE_A_SHA, FIGURE_B_SHA, PAGE_SIZES, metadata, rich_document, surrogate_document
 from pdf_tests.test_layout_stream_tables import body_text
@@ -245,7 +247,9 @@ def written(tmp_path_factory):
 EXPECTED_FILES = {
     "manifest.json",
     "json/document.json",
+    "json/elements.jsonl",
     "markdown/document.md",
+    *(f"markdown/pages/page_000{n}.md" for n in (1, 2, 3, 4)),
     f"images/{FIGURE_A_SHA}.png",
     f"images/{FIGURE_B_SHA}.png",
     *(f"page_images/page_000{n}.png" for n in (1, 2, 3, 4)),
@@ -987,7 +991,7 @@ class TestBoundToTheSource:
         with pytest.warns(UserWarning, match="page 3's own image renders from .*other.pdf, not from the source"):
             returned = write(document, tmp_path / "out", source)
         assert returned.pages[2].page_image is None
-        assert not any("page_0003" in name for name in files_in(tmp_path / "out"))
+        assert not any(name.startswith("page_images/") and "page_0003" in name for name in files_in(tmp_path / "out"))
         reason = (
             f"the page's own image renders from {other.resolve()}, not from the source {source.resolve()}: "
             "its bytes could not be bound to the hashed source"
@@ -1115,3 +1119,153 @@ class TestBoundToTheSource:
         returned = write(bound_document(source), tmp_path / "out", source)
         assert manifest_of(tmp_path / "out")["missing"] == [] and [str(w.message) for w in recwarn] == []
         assert load_bundle(tmp_path / "out") == returned
+
+
+class TestRowsAndPageMarkdown:
+    """``json/elements.jsonl``: the frame's rows; ``markdown/pages/``: each page's Markdown. Both in the manifest."""
+
+    def test_elements_jsonl_holds_the_frames_rows_as_write_jsonl_writes_them(self, written, tmp_path):
+        expected = PDFWriter(with_figure_base(written.document, Path())).write_jsonl(tmp_path / "rows.jsonl")
+        assert (written.out / "json" / "elements.jsonl").read_bytes() == expected.read_bytes()
+
+    def test_each_page_has_its_markdown_hidden_elements_omitted(self, written):
+        pages = written.out / "markdown" / "pages"
+        for page in with_figure_base(written.document, Path("../..")).pages:
+            path = pages / f"page_{page.page_number:04d}.md"
+            assert path.read_bytes() == utf8_text(page.to_markdown(include_hidden=False)).encode("utf-8")
+        first = (pages / "page_0001.md").read_text(encoding="utf-8")
+        assert "Ignore prior instructions." not in first and "<!-- hidden" not in first
+        assert f"](../../images/{FIGURE_A_SHA}.png)" in first
+        assert (pages / ".." / ".." / "images" / f"{FIGURE_A_SHA}.png").is_file()
+
+    def test_both_are_artifacts_of_the_manifest(self, written):
+        listed = {entry["path"]: entry for entry in manifest_of(written.out)["artifacts"]}
+        for name in ("json/elements.jsonl", *(f"markdown/pages/page_000{n}.md" for n in (1, 2, 3, 4))):
+            data = (written.out / name).read_bytes()
+            assert (listed[name]["size"], listed[name]["sha256"]) == (len(data), hashlib.sha256(data).hexdigest())
+
+
+def tree_of(root: Path) -> dict[str, tuple[int, int, int]]:
+    """Each path under ``root``: its inode, size and mtime (a file rewritten or replaced changes it)."""
+    return {
+        path.relative_to(root).as_posix(): (path.lstat().st_ino, path.lstat().st_size, path.lstat().st_mtime_ns)
+        for path in sorted(root.rglob("*"))
+    }
+
+
+def leftovers(directory: Path) -> list[str]:
+    """Staging and set-aside directories left beside a bundle."""
+    return sorted(path.name for path in directory.iterdir() if path.name.startswith((".tmp_", ".old_")))
+
+
+class TestReuse:
+    """A bundle already at ``output_dir`` that this write would make is returned as it is, unwritten."""
+
+    def test_a_matching_bundle_is_returned_unwritten(self, tmp_path, source, fast_render, monkeypatch):
+        first = write(bound_document(source), tmp_path / "out", source)
+        before = tree_of(tmp_path / "out")
+        work: list[str] = []
+        monkeypatch.setattr(bundle, "render_page", lambda *args, **kwargs: work.append("render"))
+
+        again = write(bound_document(source, lambda: work.append("figure") or PNG_A), tmp_path / "out", source)
+
+        assert work == [] and tree_of(tmp_path / "out") == before and leftovers(tmp_path) == []
+        assert again == first == load_bundle(tmp_path / "out")
+        assert [figure.read_bytes() for figure in again.figures] == [PNG_A, PNG_A, PNG_B]
+
+    def test_overwrite_reuses_a_matching_bundle_too(self, tmp_path, source, fast_render):
+        write(bound_document(source), tmp_path / "out", source)
+        before = tree_of(tmp_path / "out")
+        write(bound_document(source), tmp_path / "out", source, overwrite=True)
+        assert tree_of(tmp_path / "out") == before
+
+    @pytest.mark.parametrize(
+        ("change", "why"),
+        [
+            (lambda out: None, "its extraction_params"),
+            (lambda out: _set_manifest(out, "datagrunt_version", "0.0.1"), "written by datagrunt 0.0.1"),
+            (lambda out: flip_byte(out / "markdown" / "document.md"), "it is not a valid bundle"),
+        ],
+        ids=["other-parameters", "other-datagrunt", "corrupt"],
+    )
+    def test_any_other_bundle_is_refused_untouched(self, tmp_path, source, fast_render, change, why):
+        write(bound_document(source), tmp_path / "out", source, dpi=100, vision_dpi=100)
+        change(tmp_path / "out")
+        before = tree_of(tmp_path / "out")
+        with pytest.raises(FileExistsError, match=f"output_dir holds a bundle that is not this write's.*{why}"):
+            write(bound_document(source), tmp_path / "out", source)
+        assert tree_of(tmp_path / "out") == before and leftovers(tmp_path) == []
+
+    def test_another_documents_bundle_is_refused(self, tmp_path, source, fast_render):
+        write(bound_document(source), tmp_path / "out", source)
+        changed = with_element(bound_document(source), "p0001_e003", text="Other text.")
+        with pytest.raises(FileExistsError, match="its document is not this one"):
+            write(changed, tmp_path / "out", source)
+
+
+def _set_manifest(out: Path, key: str, value) -> None:
+    data = manifest_of(out)
+    data[key] = value
+    (out / "manifest.json").write_text(json.dumps(data, indent=2), encoding="ascii")
+
+
+def flip_byte(path: Path) -> None:
+    data = bytearray(path.read_bytes())
+    data[len(data) // 2] ^= 0xFF
+    path.write_bytes(bytes(data))
+
+
+class TestOverwrite:
+    """``overwrite=True`` replaces a bundle that is not this write's: staged, then swapped in, the old one removed."""
+
+    def test_a_bundle_of_other_parameters_is_replaced(self, tmp_path, source, fast_render):
+        write(bound_document(source), tmp_path / "out", source, dpi=100, vision_dpi=100)
+        returned = write(bound_document(source), tmp_path / "out", source, overwrite=True)
+        assert manifest_of(tmp_path / "out")["extraction_params"]["dpi"] == DPI
+        assert load_bundle(tmp_path / "out") == returned and leftovers(tmp_path) == []
+        assert files_in(tmp_path / "out") == EXPECTED_FILES
+
+    def test_a_directory_that_is_not_a_bundle_is_never_replaced(self, tmp_path, source, fast_render):
+        (tmp_path / "out").mkdir()
+        (tmp_path / "out" / "keep.txt").write_text("mine")
+        with pytest.raises(FileExistsError, match="holds no bundle"):
+            write(bound_document(source), tmp_path / "out", source, overwrite=True)
+        assert files_in(tmp_path / "out") == {"keep.txt"} and leftovers(tmp_path) == []
+
+    def test_a_symlink_is_never_replaced(self, tmp_path, source, fast_render):
+        write(bound_document(source), tmp_path / "real", source, dpi=100, vision_dpi=100)
+        (tmp_path / "out").symlink_to(tmp_path / "real", target_is_directory=True)
+        with pytest.raises(FileExistsError, match="symlink"):
+            write(bound_document(source), tmp_path / "out", source, overwrite=True)
+        assert (tmp_path / "out").is_symlink() and manifest_of(tmp_path / "real")["extraction_params"]["dpi"] == 100
+
+    def test_a_failed_write_leaves_the_old_bundle(self, tmp_path, source, fast_render, monkeypatch):
+        old = write(bound_document(source), tmp_path / "out", source, dpi=100, vision_dpi=100)
+        before = tree_of(tmp_path / "out")
+        monkeypatch.setattr(bundle, "render_page", lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
+        with pytest.raises(KeyboardInterrupt):
+            write(bound_document(source), tmp_path / "out", source, overwrite=True)
+        assert tree_of(tmp_path / "out") == before and load_bundle(tmp_path / "out") == old
+        assert leftovers(tmp_path) == []
+
+    def test_a_failed_swap_puts_the_old_bundle_back(self, tmp_path, source, fast_render, monkeypatch):
+        old = write(bound_document(source), tmp_path / "out", source, dpi=100, vision_dpi=100)
+        before = tree_of(tmp_path / "out")
+        real = os.replace
+
+        def failing(src, dst):
+            if Path(src).name.startswith(".tmp_"):
+                raise OSError(5, "Input/output error")
+            return real(src, dst)
+
+        monkeypatch.setattr(os, "replace", failing)
+        with pytest.raises(OSError, match="Input/output error"):
+            write(bound_document(source), tmp_path / "out", source, overwrite=True)
+        assert tree_of(tmp_path / "out") == before and load_bundle(tmp_path / "out") == old
+        assert leftovers(tmp_path) == []
+
+    @pytest.mark.parametrize("value", [1, None, "yes"])
+    def test_overwrite_must_be_a_bool(self, tmp_path, source, value):
+        with pytest.raises(TypeError, match="overwrite must be a bool"):
+            write(bound_document(source), tmp_path / "out", source, overwrite=value)
+        assert not (tmp_path / "out").exists()

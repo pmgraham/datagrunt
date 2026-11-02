@@ -1158,6 +1158,28 @@ class TestWriteBundle:
             PDFWriter(source_pdf(tmp_path), ocr="never").write_bundle(3)
         assert calls == []
 
+    def test_a_second_write_of_the_same_bundle_reuses_it(self, tmp_path, monkeypatch):
+        made = PDFWriter(source_pdf(tmp_path), ocr="never", dpi=72)
+        first = made.write_bundle(tmp_path / "out")
+        calls = spied_renders(monkeypatch)
+        assert made.write_bundle(tmp_path / "out") == first and calls == []
+
+    def test_overwrite_is_passed_on(self, tmp_path, monkeypatch):
+        source = source_pdf(tmp_path)
+        PDFWriter(source, ocr="never", dpi=72).write_bundle(tmp_path / "out")
+        with pytest.raises(FileExistsError, match="holds a bundle that is not this write's"):
+            PDFWriter(source, ocr="never", dpi=100).write_bundle(tmp_path / "out")
+        returned = PDFWriter(source, ocr="never", dpi=100).write_bundle(tmp_path / "out", overwrite=True)
+        assert manifest_of(tmp_path / "out")["extraction_params"]["dpi"] == 100
+        assert load_bundle(tmp_path / "out") == returned
+
+    @pytest.mark.parametrize("value", [1, None])
+    def test_overwrite_must_be_a_bool_before_any_work(self, tmp_path, monkeypatch, value):
+        calls = spy_extract(monkeypatch)
+        with pytest.raises(TypeError, match="overwrite must be a bool"):
+            PDFWriter(source_pdf(tmp_path), ocr="never").write_bundle(tmp_path / "out", overwrite=value)
+        assert calls == [] and not (tmp_path / "out").exists()
+
 
 # A child process that runs one PDFWriter method (argv: method, pdf, target, signal file), stalled at a point the
 # test kills it in: once the temporary file holds its first write ("fill": each write then sleeps), or once it is

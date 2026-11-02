@@ -7,12 +7,18 @@ Layout (paths relative to the bundle, joined with ``/``):
 
 - ``json/document.json``: the document, by :mod:`datagrunt.pdf.codec`
   (ASCII; its paths relative to the bundle).
+- ``json/elements.jsonl``: the element frame's rows, one compact UTF-8 JSON
+  object a line, as ``PDFWriter.write_jsonl`` writes them (hidden elements
+  included, flagged by ``hidden_reasons``); a figure's ``markdown`` links to
+  its picture relative to the bundle, as ``document.json`` names it.
 - ``markdown/document.md``: the document's Markdown, UTF-8, each lone
   surrogate written as its escape (:func:`~datagrunt.pdf.frame.utf8_text`),
   hidden elements omitted (``PDFDocument.to_markdown``'s default: the JSON
-  keeps them);
-  a figure links to its own picture, ``../images/<name>.png``, relative to
-  the file.
+  keeps them); a figure links to its own picture, ``../images/<name>.png``,
+  relative to the file.
+- ``markdown/pages/page_NNNN.md``: each page's Markdown, written as the
+  document's is (hidden elements omitted), a figure linking to
+  ``../../images/<name>.png``.
 - ``images/<sha256>.png``: each distinct picture, once: a figure's PNG from
   ``Figure.read_bytes`` (its ``image_path``, else its loader), named by
   the figure's ``sha256`` (its raw stream's). Every figure is read, and
@@ -51,16 +57,33 @@ with the PNG signature. Each file is created exclusively and streamed
 through a SHA-256 as it is written.
 
 :func:`write_bundle` is atomic. Every check comes first (the options, as
-``PipelineOptions`` checks them; the document; ``output_dir``, which must
-not exist or be an empty directory: a non-empty one, a file or a symlink is
-a FileExistsError, never merged into or deleted; its parent; the source,
-which must hash to the document's sha256). The bundle is then written into
-a new staging directory, ``.tmp_<uuid4 hex>`` in ``output_dir``'s parent
-(the same filesystem), ``output_dir`` is checked again and the staging
-directory renamed onto it (``os.replace``). On any failure, an interrupt
-included, the staging directory is removed and the error raised. A writer
-killed outright leaves its staging directory, the only trace: no
-``output_dir``; the next write makes its own and ignores it.
+``PipelineOptions`` checks them; the document; ``overwrite``;
+``output_dir``, which must not exist, or be an empty directory or one
+holding a bundle's ``manifest.json``: a file, a symlink or any other
+directory is a FileExistsError, never merged into, replaced or deleted;
+its parent; the source, which must hash to the document's sha256).
+
+A bundle already at ``output_dir`` is reused when it is this write's
+(:func:`_existing`): it loads and verifies (:func:`load_bundle`), its
+manifest's datagrunt version is this one's, its source sha256 the
+document's, its extraction parameters this write's, and its document this
+one (the pages the bundle rendered compared without their page image).
+Its document is then returned as :func:`load_bundle` returns it, and
+nothing is written. Any other bundle there is a FileExistsError naming why,
+unless ``overwrite`` is True (a reusable bundle is reused either way).
+
+The bundle is then written into a new staging directory, ``.tmp_<uuid4
+hex>`` in ``output_dir``'s parent (the same filesystem), ``output_dir`` is
+checked again and the staging directory renamed onto it (``os.replace``).
+With ``overwrite``, a bundle there is first renamed aside, to ``.old_<uuid4
+hex>`` beside it; the staging directory is renamed in, and the old bundle
+removed. If that second rename fails, the old bundle is renamed back. On
+any failure before the swap, an interrupt included, the staging directory
+is removed and the error raised, and an old bundle is untouched. A writer
+killed outright leaves its staging directory (or, between the two
+renames, the old bundle aside), the only trace: never a half-written
+``output_dir``; the next write makes its own and ignores it. If removing
+the old bundle fails, the error is raised: the new bundle is in place.
 
 Pages are written on ``workers`` threads (each render is a worker process
 of A5a's, as is each own page image's loader), in a sliding window
@@ -128,8 +151,9 @@ and returns the document. Nothing is trusted before it is checked:
    (exactly, at every level) and values; every artifact path through
    :func:`~datagrunt.pdf.codec.contained_path` (plain relative parts,
    resolved inside the bundle: no ``..``, absolute path or symlink out),
-   listed once, ``json/document.json`` and ``markdown/document.md`` among
-   them, each no larger than the asset limit.
+   listed once, ``json/document.json``, ``json/elements.jsonl`` and
+   ``markdown/document.md`` among them, each no larger than the asset
+   limit.
 2. Every artifact, opened safely (:func:`_opened`): its path through
    ``contained_path`` again, no directory on it below the bundle a symlink,
    and the file opened with ``O_NOFOLLOW`` (a symlink is refused) and
@@ -142,9 +166,10 @@ and returns the document. Nothing is trusted before it is checked:
    helper): the manifest's source sha256, ``integrity_verified`` and
    ``degraded_pages`` must be its; every path it names must be a verified
    artifact; the manifest's page images must be its (the same pages, DPI
-   and ``contrast_normalized``; a rendered one without bands); and its
-   missing page images, own bands and figures must be exactly the
-   manifest's ``missing`` entries.
+   and ``contrast_normalized``; a rendered one without bands); the
+   manifest must list a ``markdown/pages/page_NNNN.md`` for each of its
+   pages and no other; and its missing page images, own bands and figures
+   must be exactly the manifest's ``missing`` entries.
 
 What is guaranteed: every byte a loaded document returns matches the
 manifest at the moment it is read. Its figures and page images keep their
@@ -180,6 +205,7 @@ from itertools import islice
 from pathlib import Path
 from typing import IO, BinaryIO, NamedTuple, TypeVar, cast
 
+import polars as pl
 from PIL import Image
 
 from datagrunt.pdf._loaders import figure_pngs
@@ -203,7 +229,7 @@ from datagrunt.pdf.codec import (
 )
 from datagrunt.pdf.elements import _MAX_ASSET_BYTES, Figure, Page, PageImage, PDFDocument
 from datagrunt.pdf.exceptions import BundleCorruptError, DatagruntPDFError, PDFSourceChangedError
-from datagrunt.pdf.frame import utf8_text
+from datagrunt.pdf.frame import element_frame, utf8_text
 from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, SourceIdentity, _opened_source, _stream_sha256
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page
 
@@ -212,9 +238,13 @@ __all__ = ["BUNDLE_FORMAT_VERSION", "load_bundle", "write_bundle"]
 BUNDLE_FORMAT_VERSION = "5.0"
 MANIFEST = "manifest.json"
 DOCUMENT_JSON = "json/document.json"
+ELEMENTS_JSONL = "json/elements.jsonl"
 DOCUMENT_MARKDOWN = "markdown/document.md"
+_PAGE_MARKDOWN_DIR = "markdown/pages/"
 
 _STAGING_PREFIX = ".tmp_"
+# An old bundle renamed aside while an overwrite swaps the new one in.
+_ASIDE_PREFIX = ".old_"
 # A render worker's memory past its start, and its time: A5b's vision route's.
 _MEMORY_CAP_BYTES = 2 << 30
 _RENDER_TIMEOUT_S = 120.0
@@ -328,26 +358,33 @@ def write_bundle(
     max_render_pixels: int = 16_000_000,
     workers: int = 1,
     extraction_params: Mapping[str, object] | None = None,
+    overwrite: bool = False,
 ) -> PDFDocument:
     """Write ``document``, extracted from ``source``, as a bundle at ``output_dir``, atomically.
 
-    See the module notes for the layout, the checks, the atomic write, the
-    chunks and the failures recorded. ``password`` opens ``source`` for the
-    renders. ``extraction_params`` are the document's other extraction
-    parameters (``ocr``, ``min_image_dimension``, ``strict``: what A7b's
-    ``PDFWriter`` extracted with), recorded in the manifest after the
-    writer's own (see :func:`_checked_params`).
+    See the module notes for the layout, the checks, the reuse of a bundle
+    already there, the atomic write (and swap, with ``overwrite``), the
+    page window and the failures recorded. ``password`` opens ``source``
+    for the renders. ``extraction_params`` are the document's other
+    extraction parameters (``ocr``, ``min_image_dimension``, ``strict``:
+    what A7b's ``PDFWriter`` extracted with), recorded in the manifest after
+    the writer's own (see :func:`_checked_params`). ``overwrite`` replaces a
+    bundle at ``output_dir`` that is not this write's.
 
     Returns:
-        ``document`` with paths set (see the module notes).
+        ``document`` with paths set (see the module notes), or the reused
+        bundle's document, as :func:`load_bundle` returns it.
 
     Raises:
         TypeError, ValueError: If an option is invalid (as ``PipelineOptions``
             raises it), an extraction parameter is (:func:`_checked_params`),
-            ``document`` is not a PDFDocument, ``output_dir`` or ``source`` is
-            not a path, or ``source`` does not hash to the document's sha256.
-        FileExistsError: If ``output_dir`` exists and is not an empty
-            directory (a symlink is refused too), before or after the write.
+            ``document`` is not a PDFDocument, ``overwrite`` is not a bool,
+            ``output_dir`` or ``source`` is not a path, or ``source`` does not
+            hash to the document's sha256.
+        FileExistsError: If ``output_dir`` is a file, a symlink or a
+            non-empty directory holding no bundle; or holds a bundle that is
+            not this write's and ``overwrite`` is False (before or after the
+            write).
         FileNotFoundError: If ``source`` or ``output_dir``'s parent is missing.
         PDFSourceChangedError: If ``source`` changed (or was removed) between
             its hash and the publish: the bundle is not published.
@@ -361,19 +398,24 @@ def write_bundle(
     params = _checked_params(options, extraction_params)
     if not isinstance(document, PDFDocument):
         raise TypeError(f"document must be a PDFDocument, got {type(document).__name__}")
+    replace = strict_bool("overwrite", overwrite)
     target = _checked_target(output_dir)
     pdf = PDFSource(path=_checked_path(source, "source"), password=password)
     identity = _check_source(pdf, document.metadata.sha256)
+    reused = _reused(target, document, params, replace)
+    if reused is not None:
+        return reused
     staging = target.parent / f"{_STAGING_PREFIX}{uuid.uuid4().hex}"
     staging.mkdir()
     try:
         written, notices = _staged(document, staging, target, pdf, options, params)
         _check_unchanged(pdf, identity)
-        _refuse_existing(target)
-        os.replace(staging, target)
+        aside = _publish(staging, target, replace)
     except BaseException:
         shutil.rmtree(staging)
         raise
+    if aside is not None:
+        shutil.rmtree(aside)
     for notice in notices:
         warnings.warn(notice, UserWarning, stacklevel=2)
     return written
@@ -416,14 +458,34 @@ def _json_scalar(name: str, value: object) -> object:
 
 
 def _checked_target(output_dir: object) -> Path:
-    """``output_dir`` made absolute, if it may be written: absent or an empty directory, in an existing one."""
+    """``output_dir`` made absolute, if it may hold the bundle: absent, empty or a bundle's, in a directory."""
     if not isinstance(output_dir, (str, os.PathLike)):
         raise TypeError(f"output_dir must be a str or os.PathLike, got {type(output_dir).__name__}")
     target = Path(output_dir).absolute()
-    _refuse_existing(target)
+    _refuse_unusable(target)
     if not target.parent.is_dir():
         raise FileNotFoundError(errno.ENOENT, "output_dir's parent is not an existing directory", str(target.parent))
     return target
+
+
+def _refuse_unusable(target: Path) -> None:
+    """Raise FileExistsError unless ``target`` is absent, an empty directory, or a directory holding a manifest.
+
+    A symlink, a file and any other directory are refused: a bundle is never
+    merged into one, nor replaces one, whatever ``overwrite`` says.
+    """
+    if target.is_symlink() or not target.exists() or not target.is_dir():
+        _refuse_existing(target)
+        return
+    if _is_empty(target) or os.path.lexists(target / MANIFEST):
+        return
+    message = "output_dir exists and is not empty, and holds no bundle: a bundle never merges into it, nor replaces it"
+    raise FileExistsError(errno.EEXIST, message, str(target))
+
+
+def _is_empty(directory: Path) -> bool:
+    with os.scandir(directory) as entries:
+        return next(entries, None) is None
 
 
 def _refuse_existing(target: Path) -> None:
@@ -434,10 +496,74 @@ def _refuse_existing(target: Path) -> None:
         return
     if not target.is_dir():
         raise FileExistsError(errno.EEXIST, "output_dir exists and is not a directory", str(target))
-    with os.scandir(target) as entries:
-        if next(entries, None) is not None:
-            message = "output_dir exists and is not empty: a bundle is never merged into it"
-            raise FileExistsError(errno.EEXIST, message, str(target))
+    if not _is_empty(target):
+        message = "output_dir exists and is not empty: a bundle is never merged into it"
+        raise FileExistsError(errno.EEXIST, message, str(target))
+
+
+def _reused(target: Path, document: PDFDocument, params: Mapping[str, object], replace: bool) -> PDFDocument | None:
+    """The bundle at ``target`` if it is this write's (:func:`_existing`); None if there is none, or it may be replaced.
+
+    Raises:
+        FileExistsError: If ``target`` holds a bundle that is not this write's and ``replace`` is False.
+    """
+    if not target.is_dir() or _is_empty(target):
+        return None
+    loaded, why = _existing(target, document, params)
+    if loaded is not None:
+        return loaded
+    if replace:
+        return None
+    message = f"output_dir holds a bundle that is not this write's ({why}): pass overwrite=True to replace it"
+    raise FileExistsError(errno.EEXIST, message, str(target))
+
+
+def _existing(target: Path, document: PDFDocument, params: Mapping[str, object]) -> tuple[PDFDocument | None, str]:
+    """The bundle at ``target`` and ``""`` if this write would make it (see the module notes); else None and why."""
+    try:
+        manifest, loaded = _loaded(target)
+    except (BundleCorruptError, OSError) as exc:
+        return None, f"it is not a valid bundle: {exc}"
+    version = _datagrunt_version()
+    if manifest.datagrunt_version != version:
+        return None, f"it was written by datagrunt {manifest.datagrunt_version}, not {version}"
+    if manifest.source_sha256 != document.metadata.sha256:
+        return None, f"its source_sha256 is {manifest.source_sha256}, not the document's {document.metadata.sha256}"
+    if manifest.extraction_params != dict(params):
+        return None, f"its extraction_params {manifest.extraction_params} are not this write's {dict(params)}"
+    rendered = {entry.page_number for entry in manifest.page_images if entry.origin == "render"}
+    if _without_renders(loaded, rendered) != _without_renders(document, rendered):
+        return None, "its document is not this one"
+    return loaded, ""
+
+
+def _without_renders(document: PDFDocument, rendered: set[int]) -> PDFDocument:
+    """``document`` whose pages in ``rendered`` (the bundle's renders) have no page image: what a write compares."""
+    pages = tuple(
+        dataclasses.replace(page, page_image=None) if page.page_number in rendered else page for page in document.pages
+    )
+    return dataclasses.replace(document, pages=pages)
+
+
+def _publish(staging: Path, target: Path, replace: bool) -> Path | None:
+    """Rename ``staging`` onto ``target``; with ``replace``, a bundle there is renamed aside first, and returned.
+
+    The caller removes what is returned once the new bundle is in place. If
+    the rename onto ``target`` fails, the old bundle is renamed back.
+    """
+    _refuse_unusable(target)
+    if not replace or not target.is_dir() or _is_empty(target):
+        _refuse_existing(target)
+        os.replace(staging, target)
+        return None
+    aside = target.parent / f"{_ASIDE_PREFIX}{uuid.uuid4().hex}"
+    os.replace(target, aside)
+    try:
+        os.replace(staging, target)
+    except BaseException:
+        os.replace(aside, target)
+        raise
+    return aside
 
 
 def _check_source(source: PDFSource, expected: str) -> SourceIdentity:
@@ -479,10 +605,7 @@ def _staged(
     ledger = _Ledger()
     figures = _write_figures(document, staging, source.path, ledger)
     renders = _write_renders(document, staging, source, options, ledger)
-    as_json = document_to_json_bytes(_with_paths(document, figures, renders, Path()))
-    ledger.artifacts.append(_write_bytes(staging, DOCUMENT_JSON, as_json))
-    markdown = utf8_text(_with_paths(document, figures, renders, Path("..")).to_markdown())
-    ledger.artifacts.append(_write_bytes(staging, DOCUMENT_MARKDOWN, markdown.encode("utf-8")))
+    _write_texts(document, figures, renders, staging, ledger)
     _write_bytes(staging, MANIFEST, _manifest(document, params, renders, ledger))
     by_path = {artifact.path: artifact for artifact in ledger.artifacts}
     origins = {number: written.origin for number, written in renders.items()}
@@ -515,6 +638,33 @@ class _Pictures:
         """Note the picture written, as ``name`` (once its file is)."""
         self.names[(sha256, digest)] = name
         self.streams.add(sha256)
+
+
+def _write_texts(
+    document: PDFDocument, figures: Mapping[str, str], renders: Mapping[int, _Written], staging: Path, ledger: _Ledger
+) -> None:
+    """Write the document's JSON, its frame's rows, its Markdown and each page's, its paths relative to each file."""
+    relative = _with_paths(document, figures, renders, Path())
+    ledger.artifacts.append(_write_bytes(staging, DOCUMENT_JSON, document_to_json_bytes(relative)))
+    rows = element_frame(relative)
+    ledger.artifacts.append(_write_stream(staging, ELEMENTS_JSONL, lambda sink: _write_rows(rows, sink.write)))
+    markdown = utf8_text(_with_paths(document, figures, renders, Path("..")).to_markdown())
+    ledger.artifacts.append(_write_bytes(staging, DOCUMENT_MARKDOWN, markdown.encode("utf-8")))
+    for page in _with_paths(document, figures, renders, Path("../..")).pages:
+        text = utf8_text(page.to_markdown(include_hidden=False))
+        ledger.artifacts.append(_write_bytes(staging, _page_markdown(page.page_number), text.encode("utf-8")))
+
+
+def _page_markdown(page_number: int) -> str:
+    """A page's Markdown file in the bundle."""
+    return f"{_PAGE_MARKDOWN_DIR}page_{page_number:04d}.md"
+
+
+def _write_rows(frame: pl.DataFrame, write: Callable[[bytes], object]) -> None:
+    """Write each row of ``frame`` as a line of compact UTF-8 JSON, in order (``PDFWriter.write_jsonl``'s lines)."""
+    for row in frame.iter_rows(named=True):
+        line = json.dumps(row, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        write(line.encode("utf-8") + b"\n")
 
 
 def _write_figures(document: PDFDocument, staging: Path, source: Path, ledger: _Ledger) -> dict[str, str]:
@@ -868,7 +1018,9 @@ class _ImageEntry(NamedTuple):
 class _Manifest(NamedTuple):
     """A manifest's values, checked (see the module notes)."""
 
+    datagrunt_version: str
     source_sha256: str
+    extraction_params: dict[str, object]
     integrity_verified: bool
     degraded_pages: tuple[int, ...]
     page_images: tuple[_ImageEntry, ...]
@@ -889,7 +1041,12 @@ def load_bundle(path: str | os.PathLike[str]) -> PDFDocument:
         BundleCorruptError: If the bundle is not what its manifest says
             (naming the artifact).
     """
-    root = _bundle_root(path)
+    _manifest, document = _loaded(_bundle_root(path))
+    return document
+
+
+def _loaded(root: Path) -> tuple[_Manifest, PDFDocument]:
+    """The bundle at ``root``'s manifest and its document, every check done (see the module notes)."""
     manifest = _read_manifest(root)
     raw = b""
     for entry in manifest.artifacts:
@@ -904,10 +1061,11 @@ def load_bundle(path: str | os.PathLike[str]) -> PDFDocument:
     by_path = {entry.path: entry for entry in manifest.artifacts}
     _check_facts(document, manifest)
     _check_paths(document, set(by_path), root)
+    _check_page_markdown(document, set(by_path))
     _check_page_images(document, manifest.page_images)
     origins = {entry.page_number: entry.origin for entry in manifest.page_images}
     _check_missing(document, manifest.missing, origins)
-    return _with_readers(document, root, by_path, origins)
+    return manifest, _with_readers(document, root, by_path, origins)
 
 
 def _bundle_root(path: object) -> Path:
@@ -951,12 +1109,14 @@ def _manifest_of(data: object, root: Path) -> _Manifest:
     if not isinstance(version, str) or version != BUNDLE_FORMAT_VERSION:
         message = f"bundle_format_version {version!r} is not supported: this datagrunt reads {BUNDLE_FORMAT_VERSION!r}"
         raise ValueError(message)
-    non_blank_str("datagrunt_version", top["datagrunt_version"])
+    datagrunt_version = non_blank_str("datagrunt_version", top["datagrunt_version"])
     _check_params(top["extraction_params"])
     pages = enumerate(_array("degraded_pages", top["degraded_pages"]))
     missing = enumerate(_array("missing", top["missing"]))
     return _Manifest(
+        datagrunt_version=datagrunt_version,
         source_sha256=sha256_hex("source_sha256", top["source_sha256"]),
+        extraction_params=dict(top["extraction_params"]),
         integrity_verified=strict_bool("integrity_verified", top["integrity_verified"]),
         degraded_pages=tuple(int_at_least(f"degraded_pages[{i}]", page, 1) for i, page in pages),
         page_images=_image_entries(top["page_images"]),
@@ -1008,7 +1168,7 @@ def _listed_artifacts(value: object, root: Path) -> tuple[_Artifact, ...]:
             raise ValueError(f"artifacts lists {artifact.path!r} twice")
         seen.add(artifact.path)
         listed.append(artifact)
-    for required in (DOCUMENT_JSON, DOCUMENT_MARKDOWN):
+    for required in (DOCUMENT_JSON, ELEMENTS_JSONL, DOCUMENT_MARKDOWN):
         if required not in seen:
             raise ValueError(f"artifacts lists no {required}")
     return tuple(listed)
@@ -1204,6 +1364,17 @@ def _check_paths(document: PDFDocument, listed: set[str], root: Path) -> None:
         relative = path.relative_to(root).as_posix()
         if relative not in listed:
             raise BundleCorruptError(f"{DOCUMENT_JSON}: {relative!r} is not an artifact the manifest lists")
+
+
+def _check_page_markdown(document: PDFDocument, listed: set[str]) -> None:
+    """The manifest must list each page's Markdown, and no Markdown for a page the document does not have."""
+    expected = {_page_markdown(page.page_number) for page in document.pages}
+    present = {path for path in listed if path.startswith(_PAGE_MARKDOWN_DIR)}
+    unlisted, stray = sorted(expected - present), sorted(present - expected)
+    if unlisted:
+        raise BundleCorruptError(f"{MANIFEST}: artifacts lists no {unlisted[0]}")
+    if stray:
+        raise BundleCorruptError(f"{MANIFEST}: {stray[0]} is not one of the document's pages' Markdown")
 
 
 def _check_page_images(document: PDFDocument, entries: tuple[_ImageEntry, ...]) -> None:

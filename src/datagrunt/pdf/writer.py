@@ -95,7 +95,8 @@ Each method writes the document in one form. A path returned is absolute
   :func:`~datagrunt.pdf.bundle.write_bundle` of the document, with the
   writer's source, password and options (``ocr``,
   ``min_image_dimension`` and ``strict`` recorded as its
-  ``extraction_params``).
+  ``extraction_params``) and ``overwrite``: a bundle already there that is
+  this write's is reused, any other replaced only with ``overwrite=True``.
 
 A writer built from a PDFDocument has no PDF to render:
 :meth:`PDFWriter.render_pages_as_images` and :meth:`PDFWriter.write_bundle`
@@ -147,6 +148,7 @@ from datagrunt.pdf.bundle import (
     _in_page_order,
     _Pictures,
     _png,
+    _write_rows,
     write_bundle,
 )
 from datagrunt.pdf.codec import document_to_json_bytes
@@ -237,7 +239,7 @@ class PDFWriter:
         """
         target = _file_target(out_filepath)
         frame = element_frame(self._extracted())
-        return _write_atomically(target, lambda handle: _write_rows(frame, handle))
+        return _write_atomically(target, lambda handle: _write_rows(frame, handle.write))
 
     def write_json_newline_delimited(self, out_filepath: str | os.PathLike[str]) -> Path:
         """:meth:`write_jsonl` under its v4 name."""
@@ -334,22 +336,25 @@ class PDFWriter:
         directory.mkdir(parents=True, exist_ok=True)
         return _write_renders(pages, directory, source, target_dpi, self._options)
 
-    def write_bundle(self, output_dir: str | os.PathLike[str]) -> PDFDocument:
+    def write_bundle(self, output_dir: str | os.PathLike[str], *, overwrite: bool = False) -> PDFDocument:
         """Write the document's bundle at ``output_dir``, atomically (A7a; see the module notes).
 
         Returns:
-            The document with its bundle paths set, as :func:`~datagrunt.pdf.bundle.write_bundle` returns it.
+            The document with its bundle paths set, as :func:`~datagrunt.pdf.bundle.write_bundle` returns it
+            (a reused bundle's document, as ``load_bundle`` returns it).
 
         Raises:
             ValueError: If the writer was built from a PDFDocument (before any work), or the source no
                 longer hashes to the document's sha256 (it changed since it was extracted).
-            TypeError: If ``output_dir`` is not a path (before any work).
-            FileExistsError: If ``output_dir`` exists and is not an empty directory (before any work, and after).
+            TypeError: If ``output_dir`` is not a path, or ``overwrite`` not a bool (before any work).
+            FileExistsError: If ``output_dir`` is a file, a symlink or a non-empty directory holding no bundle
+                (before any work), or holds a bundle that is not this write's and ``overwrite`` is False.
             FileNotFoundError: If ``output_dir``'s parent is missing (before any work).
             PDFSourceChangedError: If the source changes while it is bundled: nothing is published.
         """
         source = self._required_source("write_bundle")
         _checked_target(output_dir)
+        replace = strict_bool("overwrite", overwrite)
         options = self._options
         return write_bundle(
             self._extracted(),
@@ -365,6 +370,7 @@ class PDFWriter:
                 "min_image_dimension": options.min_image_dimension,
                 "strict": options.strict,
             },
+            overwrite=replace,
         )
 
     def _extracted(self) -> PDFDocument:
@@ -455,13 +461,6 @@ def _write_atomically(target: Path, fill: Callable[[BinaryIO], object]) -> Path:
 
 def _write_bytes(target: Path, data: bytes) -> Path:
     return _write_atomically(target, lambda handle: handle.write(data))
-
-
-def _write_rows(frame: pl.DataFrame, handle: BinaryIO) -> None:
-    """Write each row of ``frame`` as a line of compact UTF-8 JSON, in order."""
-    for row in frame.iter_rows(named=True):
-        line = json.dumps(row, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-        handle.write(line.encode("utf-8") + b"\n")
 
 
 def _csv_frame(frame: pl.DataFrame) -> pl.DataFrame:
