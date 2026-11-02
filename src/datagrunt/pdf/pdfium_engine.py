@@ -1063,16 +1063,17 @@ def image_refusal(page: pdfium.PdfPage, geometry: PageGeometry, *, max_objects: 
     - the walk reaches either bound;
     - an image A2 refuses to decode (see :class:`ImageStats`: over the pixel,
       sample, component or JPEG 2000 tile bound; of a size that cannot be
-      read without decoding, which includes every JBIG2 image, so a JBIG2
-      scan is not rendered until its size can be read (#407); its raw
-      stream over the asset limit, or past the page's stream budget);
+      read without decoding; its raw stream over the asset limit, or past
+      the page's stream budget);
     - an image whose matrix to page space is not finite (its size is never
       read, so it cannot pass the bounds);
     - a pdfium call fails while walking or sizing.
 
-    Images the object walk cannot see (soft masks, patterns, Type3 glyph
-    procedures, annotation appearance streams) are not checked: the capped
-    render worker is their bound.
+    A JBIG2 image passes at its declared size (A2's, within the pixel bound):
+    pdfium decodes it only in a page render, in the render worker, whose
+    memory cap bounds its decode (#407). Images the object walk cannot see (soft
+    masks, patterns, Type3 glyph procedures, annotation appearance streams)
+    are not checked: the capped render worker is their bound.
 
     Raises:
         TypeError: If ``page`` is not a PdfPage, ``geometry`` not a
@@ -1438,8 +1439,9 @@ class ImageLoader:
                 than 89,478,485 pixels (Pillow's default decompression-bomb
                 bound: 1 GiB / 4 / 3) or in more than 4096 JPEG 2000 tiles,
                 or its decode size cannot be known first (see
-                :class:`ImageStats`); or if the bitmap pdfium decodes is over
-                the pixel bound after all.
+                :class:`ImageStats`), or it is a JBIG2 image (decoded only by a
+                page render, in the render worker); or if the bitmap pdfium
+                decodes is over the pixel bound after all.
             PDFCorruptError: If pdfium cannot load the page, decode the image,
                 or a pdfium call fails (``page_number`` is set).
             FileNotFoundError, PermissionError, PDFEncryptedError: As

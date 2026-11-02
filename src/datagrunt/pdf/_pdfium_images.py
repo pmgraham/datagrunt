@@ -80,7 +80,9 @@ class RawImage:
             FlateDecode that inflates whole within 1 MiB to exactly the
             stream pdfium decodes) its own header's
             (JPEG frame, JPEG 2000 SIZ), which pdfium uses whatever
-            ``/Width`` says; else ``declared_px``'s. 0 when unknown: a side
+            ``/Width`` says; else ``declared_px``'s (a JBIG2 image's too:
+            pdfium decodes it at ``/Width``, whatever its page information
+            segment says). 0 when unknown: a side
             outside 1..131071 (pdfium decodes no larger side), a header that
             cannot be read, a codestream behind other filters, or a stream
             not read (see ``raw_sha256``).
@@ -187,9 +189,11 @@ class ImageStats:
             JPEG 2000 header, such a codestream behind other filters than
             ASCII85 / ASCIIHex or exactly one FlateDecode, or behind a
             FlateDecode that zlib cannot inflate whole within 1 MiB (a bomb)
-            or that pdfium decodes to other bytes (a predictor), or a codec whose
-            size is not read from its header (JBIG2: sizing it is #407; until
-            then the render guard refuses a page holding one). Never decoded.
+            or that pdfium decodes to other bytes (a predictor), or an image
+            codec pdfium does not decode at a size read first (any but DCT,
+            JPX and JBIG2). Never decoded. A JBIG2 image is not counted: it is
+            recorded at its declared size and decoded only by a page render,
+            in the render worker (``ImageLoader`` refuses it).
         skipped_over_budget_images: Images recorded without hash, size or
             pixel metadata because the page's stream budget (2 GiB of stream
             bytes copied out of pdfium, length queries included) was spent:
@@ -311,6 +315,12 @@ _HEADER_READERS: MappingProxyType[str, Callable[[bytes], CodestreamSize | None]]
 # ASCII85 and ASCIIHex grow data at most fourfold (Flate or LZW could be a bomb).
 _ASCII_FILTERS = frozenset({"ASCII85Decode", "ASCIIHexDecode"})
 _SIMPLE_FILTERS = frozenset({*_ASCII_FILTERS, "LZWDecode", "FlateDecode", "RunLengthDecode", "CCITTFaxDecode"})
+# pdfium decodes a JBIG2 image at its dictionary's /Width x /Height, whatever its
+# page information segment says (observed), so it is sized like a simple filter;
+# its pixels are decoded only by a page render, in the render worker, whose
+# memory is capped (see decoded_png).
+_JBIG2 = "JBIG2Decode"
+_DECLARED_SIZE_CODECS = _SIMPLE_FILTERS | {_JBIG2}
 # Codecs pdfium decodes in full to report an image's metadata (observed for
 # JPX: 0.14 s and 78 MB at 9000 x 9000); JBIG2 is treated alike, unobserved
 # (no encoder here). Their bits per pixel and colour space are never read.
@@ -348,7 +358,9 @@ class PixelFacts(NamedTuple):
 
     ``refusal`` says why pdfium must not decode it (None: it may), with the
     ImageStats count it falls under; ``read_metadata`` whether the bits per
-    pixel and colour space came from pdfium.
+    pixel and colour space came from pdfium; ``in_process`` whether pdfium
+    may decode it in the calling process (False for JBIG2: only a page
+    render, in the render worker, decodes it).
     """
 
     px_width: int
@@ -358,6 +370,7 @@ class PixelFacts(NamedTuple):
     colorspace: str | None
     refusal: tuple[Skip, str] | None
     read_metadata: bool
+    in_process: bool = True
 
 
 class _PageBudget:
@@ -702,7 +715,8 @@ def pixel_facts(
     width, height, refusal = _decode_size(filters, declared, raw, wrapped, label)
     read_metadata = refusal is None and not _DECODED_FOR_METADATA.intersection(filters)
     bits_per_pixel, colorspace = _metadata(image, page_raw, label) if read_metadata else (None, None)
-    return PixelFacts(width, height, declared, bits_per_pixel, colorspace, refusal, read_metadata)
+    in_process = _JBIG2 not in filters
+    return PixelFacts(width, height, declared, bits_per_pixel, colorspace, refusal, read_metadata, in_process)
 
 
 def _decode_size(
@@ -716,7 +730,7 @@ def _decode_size(
     codec = filters[-1] if filters else ""
     wrappers = filters[:-1]
     reader = _HEADER_READERS.get(codec)
-    if reader is None and filters and codec not in _SIMPLE_FILTERS:
+    if reader is None and filters and codec not in _DECLARED_SIZE_CODECS:
         return 0, 0, ("unsized", f"{label} uses filter {codec!r}: its decode size cannot be read without decoding")
     if not (_ASCII_FILTERS.issuperset(wrappers) or (reader is not None and wrappers == _FLATE_ONLY)):
         behind = ", ".join(wrappers)
@@ -788,12 +802,17 @@ def decoded_png(image: pdfium_c.FPDF_PAGEOBJECT, facts: PixelFacts, label: str) 
     checked again, and Pillow reads its pixels in place (no copy).
 
     Raises:
-        DecodeRefused: If ``facts`` refuse decoding, or the bitmap pdfium
-            decodes has more pixels than ``_MAX_DECODED_PIXELS``.
+        DecodeRefused: If ``facts`` refuse decoding, or do not allow it in
+            this process (a JBIG2 image), or the bitmap pdfium decodes has
+            more pixels than ``_MAX_DECODED_PIXELS``.
         PdfiumFailure: If pdfium cannot decode the image.
     """
     if facts.refusal is not None:
         raise DecodeRefused(facts.refusal[1])
+    if not facts.in_process:
+        raise DecodeRefused(
+            f"{label} is a JBIG2 image: it is decoded only when its page is rendered, in the render worker"
+        )
     bitmap = pdfium_c.FPDFImageObj_GetBitmap(image)
     if not bitmap:
         raise PdfiumFailure(f"decode {label}")

@@ -1540,7 +1540,7 @@ class TestDecodeBounds:
             only_loader(path).png_bytes()
         assert decode_calls == []
 
-    @pytest.mark.parametrize("codec", [b"JBIG2Decode", b"Crypt"], ids=["jbig2", "crypt"])
+    @pytest.mark.parametrize("codec", [b"Crypt", b"FooDecode"], ids=["crypt", "unknown"])
     def test_an_unsized_filter_is_recorded_without_size_and_never_decoded(self, tmp_path, decode_calls, codec):
         path = xobject_page(tmp_path, bytes(16), gray(16, 8, b"/" + codec))
 

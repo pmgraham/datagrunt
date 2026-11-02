@@ -60,6 +60,15 @@ killed and reaped. A worker killed, timed out or failed is a
 whose ``sys.executable`` is empty, has no interpreter to start: every
 render is a :class:`RenderFailed`, raised before anything starts.
 
+Each JBIG2 image the guard's object walk reaches is decoded on its own
+(``FPDFImageObj_GetBitmap``) before the page is drawn, with the page's
+bitmap already mapped and filled. pdfium draws a page whose image it cannot
+decode without that image and without an error, and a JBIG2 decode can
+fail for memory where the cap makes allocations fail (Linux, Windows);
+decoded first, its failure is the page's :class:`RenderFailed`, naming the
+image. JBIG2 images the walk cannot see (in patterns, Type3 glyph
+procedures or soft masks) are not decoded first.
+
 Annotations are not drawn (no ``FPDF_ANNOT``): their appearance streams
 are content the guard's object walk cannot see, so a vision page's form
 field values, stamps and markup are not rendered, and not read by OCR.
@@ -105,6 +114,7 @@ from typing import IO, NamedTuple
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 
+from datagrunt.pdf._pdfium_images import read_filters
 from datagrunt.pdf._process import MAX_REQUEST_BYTES as _MAX_REQUEST_BYTES
 from datagrunt.pdf._process import (
     REAP_TIMEOUT_S,
@@ -354,12 +364,41 @@ def _draw(page: pdfium.PdfPage, geometry: PageGeometry, dpi: int, *, colour: boo
     try:
         if not pdfium_c.FPDFBitmap_FillRect(bitmap, 0, 0, width, height, _WHITE):
             raise RenderFailed(f"page {geometry.page_number}: pdfium cannot fill a {width} x {height} bitmap")
+        _decode_jbig2_first(page, geometry.page_number)
         # Rotation 0 draws the page as displayed (its /Rotate applied), filling the bitmap.
         pdfium_c.FPDF_RenderPageBitmap(bitmap, page.raw, 0, 0, width, height, 0, drawn.flags)
     finally:
         pdfium_c.FPDFBitmap_Destroy(bitmap)
     del buffer  # releases the mapping's export, so it can be sent and closed
     return _Bitmap(width, height, pixels, drawn.channels)
+
+
+def _decode_jbig2_first(page: pdfium.PdfPage, page_number: int) -> int:
+    """Decode each JBIG2 image the guard's walk reaches on its own, then free it; how many.
+
+    Walks :func:`~datagrunt.pdf.pdfium_engine._page_objects` within
+    :data:`_MAX_GUARD_OBJECTS` (forms included), as the guard did. The
+    worker calls this under its memory cap, with the page's bitmap mapped.
+
+    Raises:
+        RenderFailed: If pdfium cannot decode one (named by its walk index).
+        PdfiumFailure: If an image's filters cannot be read.
+    """
+    decoded = 0
+    for index, (item, _form) in enumerate(_page_objects(page.raw, max_objects=_MAX_GUARD_OBJECTS)):
+        if pdfium_c.FPDFPageObj_GetType(item) != pdfium_c.FPDF_PAGEOBJ_IMAGE:
+            continue
+        if "JBIG2Decode" not in read_filters(item, f"object {index}"):
+            continue
+        bitmap = pdfium_c.FPDFImageObj_GetBitmap(item)
+        if not bitmap:
+            raise RenderFailed(
+                f"page {page_number}: pdfium cannot decode JBIG2 image object {index} in the render worker; "
+                "the page is not rendered"
+            )
+        pdfium_c.FPDFBitmap_Destroy(bitmap)
+        decoded += 1
+    return decoded
 
 
 def _render_loaded(handle: DocumentHandle, page_index: int, dpi: int, *, colour: bool, without_text: bool) -> _Bitmap:
