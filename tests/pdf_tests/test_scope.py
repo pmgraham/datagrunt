@@ -414,9 +414,13 @@ class TestSplitTables:
 
         assert tables(apply_scope((page(1, tail), page(2, head))))[1] == ("p0002_e000", "p0001_e000", HEADERS)
 
-    @pytest.mark.parametrize(("shift", "linked"), [(8.0, True), (-8.0, True), (8.5, False), (-8.5, False)])
-    def test_the_ends_must_lie_within_8_pt(self, shift, linked):
-        # The one-width part moved by ``shift``: its start lies 12.9 to 29.9 pt from the other's end, past 8 pt.
+    @pytest.mark.parametrize(
+        ("shift", "linked"),
+        [(0.5, True), (-0.5, True), (1.0, True), (-1.0, True), (1.5, False), (-1.5, False), (8.0, False)],
+    )
+    def test_the_ends_must_lie_within_1_pt(self, shift, linked):
+        # The one-width part moved by ``shift``: its start lies 13.4 to 22.9 pt from the other's end, past the 8 pt
+        # centre tolerance, so only the ends can pair it; they must meet within 1 pt, not 8.
         tail = table(1, 0, centres=(72.0, 400.0), intervals=((72.0, 110.0), (374.9, 400.0)))
         moved = ((72.0, 97.0), (378.6 + shift, 400.0 + shift))
         head = table(2, 0, headers=(), centres=(72.0, 378.6 + shift), intervals=moved)

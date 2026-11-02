@@ -28,10 +28,11 @@ change.
    :data:`SPLIT_TABLE_TOLERANCE_PT`, or (#420) when one part sits on its
    interval's end (set flush right) and the other on its interval's start
    (set flush left, or of one width: such a column tells no alignment and
-   sits at its start, #409) and the two intervals' ends lie within the
-   tolerance. Both tables need ``column_centres``, which A1 sets with
-   ``column_intervals``; without them there is no link. Chains link
-   pairwise (p -> p+1 -> p+2). A link already on a table is left alone.
+   sits at its start, #409) and the two intervals' ends lie within
+   :data:`_END_TOLERANCE_PT`. Both tables need ``column_centres``, which
+   A1 sets with ``column_intervals``; without them there is no link.
+   Chains link pairwise (p -> p+1 -> p+2). A link already on a table is
+   left alone.
 4. **Sections.** One flat A1 ``Section`` per visible heading, holding that
    heading (as ``elements[0]``) and everything after it up to the next
    visible heading of any level, plus a leading heading-less section for
@@ -68,9 +69,12 @@ from typing import TypeAlias
 from datagrunt.pdf._validate import typed_tuple
 from datagrunt.pdf.elements import DocumentElement, Heading, KeyValue, Page, Section, Table
 
-# How far apart, in points, the same column's centres may lie on the two parts of a split table (spec §3.3); its
-# intervals' ends too, where one part sits on its end and the other on its start (#420).
+# How far apart, in points, the same column's centres may lie on the two parts of a split table (spec §3.3).
 SPLIT_TABLE_TOLERANCE_PT = 8.0
+# How far apart, in points, the two parts' interval ends may lie where one part sits on its end and the other on its
+# start (#420). A split's flush-right ends share one anchor. In #409's Monte Carlo every split links at 1 pt, and
+# different tables link within 0.1 percentage points as often as by centres alone (at 8 pt, up to 1.2 more).
+_END_TOLERANCE_PT = 1.0
 # How far, in points, a column's centre may lie from its interval's start or end and still sit on it: layout's tie
 # slack (#409). pdfium boxes a flush-right column's ends up to 3e-5 pt apart, so its median end is not its last.
 _EDGE_SLACK_PT = 0.1
@@ -192,7 +196,7 @@ def _same_columns(first: Table, second: Table) -> bool:
 
 
 def _one_column(first: _Column, second: _Column) -> bool:
-    """True if two parts' columns are one: centres within the tolerance, or ends within it, end paired with start.
+    """True if two parts' columns are one: centres within the tolerance, or ends within 1 pt, end paired with start.
 
     The ends pair only when one part sits on its end and the other on its
     start, either way round: a flush-right column, and its other part of
@@ -201,7 +205,7 @@ def _one_column(first: _Column, second: _Column) -> bool:
     (centre, (_, end)), (other_centre, (_, other_end)) = first, second
     if abs(centre - other_centre) <= SPLIT_TABLE_TOLERANCE_PT:
         return True
-    if abs(end - other_end) > SPLIT_TABLE_TOLERANCE_PT:
+    if abs(end - other_end) > _END_TOLERANCE_PT:
         return False
     return (_sits_on(first, 1) and _sits_on(second, 0)) or (_sits_on(second, 1) and _sits_on(first, 0))
 
