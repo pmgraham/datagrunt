@@ -73,10 +73,11 @@ The gate (:func:`needs_background`) selects each visible piece that paints
 :data:`MATCH_DISTANCE` of white (a page's default background), or whose box
 shares area with the box of any non-text object of the page (A2's
 :class:`~datagrunt.pdf.pdfium_engine.ObjectBoxes`: paths of any shape and
-strokes, images, shadings, forms and their contents), and every such piece
-when the page holds an object A2 could give no box (fail closed). A page is
-drawn when it selects a piece: only pages of text alone, none near white,
-are skipped. The boxes are indexed by :data:`_GATE_BANDS` bands down the
+strokes, images and shadings, those a form draws included; a form itself
+paints nothing and has no box), and every such piece when the page holds
+an object A2 could give no box (fail closed). A page is drawn when it
+selects a piece: only pages of text alone, none near white, are skipped,
+whether the text is drawn through forms or not. The boxes are indexed by :data:`_GATE_BANDS` bands down the
 page, and a page spends at most :data:`MAX_GATE_CHECKS` box checks: a piece
 whose checks the budget cannot pay for is selected (fail closed). Known
 limit: a background drawn with text glyphs (a ``█`` under the text) is
@@ -789,7 +790,7 @@ def needs_background(page: RawPage, assessment: PageAssessment) -> bool:
     True when a visible piece of ``assessment`` (page or recovered) that
     paints (render mode not 3 or 7) has a paint under MATCH_DISTANCE of
     white, or overlaps (with area) any non-text page object of ``page``
-    (A2's ``object_boxes``: paths, images, shadings, forms), or when an
+    (A2's ``object_boxes``: paths, images, shadings, in forms or not), or when an
     object's box cannot be read (fail closed). Cost: O(objects) to band the
     boxes, then O(pieces x boxes in their bands), within MAX_GATE_CHECKS.
 

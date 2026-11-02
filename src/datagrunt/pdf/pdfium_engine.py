@@ -159,11 +159,13 @@ terminator alone (2 bytes). Its length query copies nothing, so
 
 Object boxes (#400), pinned by ``tests/pdf_tests/test_pdfium_object_boxes.py``:
 :func:`page_object_boxes` gives the displayed box of every non-text object
-the walk visits (paths, images, shadings, forms and their contents, any
-object of an unknown type): pdfium's bounds in the object's form space
+the walk visits (paths, images, shadings, any object of an unknown type,
+inside forms or not): pdfium's bounds in the object's form space
 (``FPDFPageObj_GetBounds``: a stroke's box includes its width, a shading's
-is its clip's, or the page's when it is unclipped, a form's holds its
-contents), through every enclosing form's matrix to page space. An object
+is its clip's, or the page's when it is unclipped), through every
+enclosing form's matrix to page space. A form object itself has no box:
+its bounds hold its contents, text included, and the walk boxes those
+contents one by one. An object
 whose bounds pdfium cannot read, or whose box is not finite, is counted in
 ``ObjectBoxes.unboxed``: the background check counts it as under all text.
 
@@ -1123,9 +1125,12 @@ class ObjectBoxes:
     """The displayed box of each of the page's non-text objects: what may paint under its text (#400).
 
     Attributes:
-        boxes: One displayed, top-left box per path, image, shading, form
-            and unknown-type object, in object-walk order (a form, then its
-            contents): pdfium's bounds through every enclosing form's matrix.
+        boxes: One displayed, top-left box per path, image, shading and
+            unknown-type object, in object-walk order, those inside forms
+            included: pdfium's bounds through every enclosing form's matrix.
+            A form object has none: it paints nothing of its own, and its
+            bounds (the union of its contents, text included) would put
+            paint under text the form draws.
         unboxed: How many such objects have no box the walk can give
             (pdfium cannot read their bounds, or the box is not finite). The
             background check counts each as under every piece of text.
@@ -1143,7 +1148,7 @@ class ObjectBoxes:
 
 
 def _collect_object_boxes(page_raw: pdfium_c.FPDF_PAGE, geometry: PageGeometry) -> ObjectBoxes:
-    """The displayed box of every non-text object on the page, forms' contents included, in object-walk order."""
+    """The displayed box of every non-text, non-form object on the page, forms' contents included, in walk order."""
     to_display = _display_mapping(geometry)
     objects = _page_objects(page_raw, max_objects=MAX_PAGE_OBJECTS)
     form_matrices: dict[int, Matrix] = {}
@@ -1153,7 +1158,9 @@ def _collect_object_boxes(page_raw: pdfium_c.FPDF_PAGE, geometry: PageGeometry) 
         kind = pdfium_c.FPDFPageObj_GetType(obj)
         outer = form_matrices[form] if form >= 0 else IDENTITY
         if kind == pdfium_c.FPDF_PAGEOBJ_FORM:
+            # A form paints nothing of its own: the walk visits its contents next, and boxes each.
             form_matrices[index] = _read_matrix(obj, f"object {index}").then(outer)
+            continue
         if kind == pdfium_c.FPDF_PAGEOBJ_TEXT:
             continue
         box = _object_box(obj, outer, to_display)

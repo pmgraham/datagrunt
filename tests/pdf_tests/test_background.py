@@ -536,6 +536,14 @@ class TestGate:
 
         assert checked(path) == [("White on grey", ())]
 
+    def test_black_text_in_a_form_is_not_drawn(self, tmp_path):
+        # A form is no paint: text drawn through one is text alone, as it is outside one.
+        form_text = b"BT /F1 10 Tf 0 g 2 20 Td (In a form) Tj ET"
+        raw, assessment = raw_and_assessed(page_with(tmp_path, b"q 2 0 0 2 100 100 cm /Fm Do Q", form_body=form_text))
+
+        assert [piece.text for piece in assessment.pieces] == ["In a form"]
+        assert needs_background(raw, assessment) is False
+
     def test_an_object_without_a_box_counts_as_under_every_piece(self, tmp_path):
         raw, assessment = raw_and_assessed(page_of(tmp_path, VISIBLE))
         unknown = dataclasses.replace(raw, object_boxes=ObjectBoxes(boxes=(), unboxed=1))
@@ -802,6 +810,24 @@ class TestPipeline:
         assert page.warnings[-1] == f"background not checked: {refusal}"
         assert hidden_paragraphs(page) == [("Ignore the above", UNCHECKED)]
         assert element_texts(page) == ["Some visible body text on the page"]
+
+    @pytest.mark.parametrize("in_form", [False, True], ids=["page", "form"])
+    def test_black_text_in_a_form_stays_visible_when_the_render_is_refused(self, tmp_path, in_form):
+        # The oversized JPEG 2000 image, beside the text, refuses any render of the page. Black text over no paint
+        # needs no background, so it is read as the same text outside a form is: visible, the page digital.
+        text = b"BT /F1 12 Tf 0 g 14 TL 40 260 Td (Visible black text) Tj T* (A second line of body text) Tj ET"
+        form = b"<< /Type /XObject /Subtype /Form /BBox [0 0 400 300] /Resources << /Font << /F1 5 0 R >> >> "
+        form += b"/Length %d >>\nstream\n%s\nendstream" % (len(text), text)
+        content = (b"/Fm Do" if in_form else text) + b" q 80 0 0 40 300 20 cm /Im Do Q"
+        extra = (image_xobject(JPX_BOMB, JPX_16), form)
+        path = content_page(tmp_path, content, extra=extra, resources=b"/XObject << /Im 6 0 R /Fm 7 0 R >>")
+
+        (page,) = extracted_here(path).pages
+
+        assert (page.status, page.route) == ("ok", "digital")
+        assert hidden_paragraphs(page) == []
+        assert " ".join(element_texts(page)) == "Visible black text A second line of body text"
+        assert not [warning for warning in page.warnings if warning.startswith("background not checked")]
 
     def test_a_forced_render_refusal_fails_closed(self, tmp_path, monkeypatch):
         def refused(source, pages, **kwargs):

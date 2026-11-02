@@ -37,9 +37,14 @@ def stream(body: bytes, entries: bytes = b"") -> bytes:
     return b"<< %s/Length %d >>\nstream\n%s\nendstream" % (entries, len(body), body)
 
 
-def page_with(tmp_path: Path, content: bytes, *, rotate: int = 0, shading: bytes = AXIAL) -> Path:
-    """A 400 x 300 pt page drawing ``content`` with font /F1, shading /Sh (AXIAL) and form /Fm (a 50 pt blue box)."""
-    form = stream(FORM_FILL, b"/Type /XObject /Subtype /Form /BBox [0 0 50 50] ")
+def page_with(
+    tmp_path: Path, content: bytes, *, rotate: int = 0, shading: bytes = AXIAL, form_body: bytes = FORM_FILL
+) -> Path:
+    """A 400 x 300 pt page drawing ``content`` with font /F1, shading /Sh (AXIAL) and form /Fm (a 50 pt blue box).
+
+    ``form_body`` replaces the form's content; the form reads font /F1 too.
+    """
+    form = stream(form_body, b"/Type /XObject /Subtype /Form /BBox [0 0 50 50] /Resources << /Font << /F1 5 0 R >> >> ")
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
@@ -84,11 +89,44 @@ class TestObjectBoxes:
     def test_a_curved_fill_covers_its_curves(self, tmp_path):
         assert rounded(boxes_of(page_with(tmp_path, DISC))) == [(150.0, 100.0, 250.0, 200.0)]
 
-    def test_a_form_and_its_contents_each_have_a_box_on_the_page(self, tmp_path):
-        # The form is drawn at (300, 50) scaled by 2: its 50 pt box is 100 pt on the page.
+    def test_a_forms_contents_each_have_a_box_on_the_page_and_the_form_none(self, tmp_path):
+        # The form is drawn at (300, 50) scaled by 2: its 50 pt fill is 100 pt on the page. The form itself paints
+        # nothing of its own: its contents are walked and boxed one by one.
         found = boxes_of(page_with(tmp_path, b"q 2 0 0 2 300 50 cm /Fm Do Q"))
 
-        assert rounded(found) == [(300.0, 150.0, 400.0, 250.0), (300.0, 150.0, 400.0, 250.0)]
+        assert found == ObjectBoxes(boxes=found.boxes, unboxed=0)
+        assert rounded(found) == [(300.0, 150.0, 400.0, 250.0)]
+
+    def test_a_form_of_text_alone_has_no_box(self, tmp_path):
+        # Text is no paint under text: a form holding only text adds no box, as the same text outside it adds none.
+        form_text = b"BT /F1 10 Tf 2 20 Td (In a form) Tj ET"
+
+        found = boxes_of(page_with(tmp_path, b"q 2 0 0 2 100 100 cm /Fm Do Q", form_body=form_text))
+
+        assert found == ObjectBoxes(boxes=(), unboxed=0)
+
+    def test_a_form_in_a_form_places_its_contents_through_both_matrices(self, tmp_path):
+        # /Fm draws its fill, then itself is drawn inside /Outer at (100, 0), and /Outer at (0, 100) scaled by 2.
+        outer = stream(
+            b"q 1 0 0 1 100 0 cm /Fm Do Q",
+            b"/Type /XObject /Subtype /Form /BBox [0 0 400 300] /Resources << /XObject << /Fm 7 0 R >> >> ",
+        )
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Contents 4 0 R "
+            b"/Resources << /XObject << /Outer 6 0 R >> >> >>",
+            stream(b"q 2 0 0 2 0 0 cm /Outer Do Q"),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            outer,
+            stream(FORM_FILL, b"/Type /XObject /Subtype /Form /BBox [0 0 50 50] "),
+        ]
+
+        found = boxes_of(hand_written_pdf(tmp_path / "nested.pdf", objects))
+
+        # (100, 0)-(150, 50) in /Outer's space, scaled by 2: (200, 0)-(300, 100) on the page, (200, 200)-(300, 300)
+        # displayed top-left.
+        assert rounded(found) == [(200.0, 200.0, 300.0, 300.0)]
 
     def test_an_image_covers_its_box(self, tmp_path):
         spec = PageSpec(
