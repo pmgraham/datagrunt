@@ -2,6 +2,9 @@
 
 Each case runs in a fresh interpreter, so the modules it imports (or blocks) are its own. A missing extra is
 simulated as Python documents it: ``sys.modules[name] = None`` makes ``import name`` raise ModuleNotFoundError.
+An extra that goes missing after construction is simulated in the workers only: a worker installs its caller's
+``sys.path``, so a directory put first on it, holding a package of the extra's name that fails to import as a
+missing one does, hides the real one from every worker started after.
 """
 
 import importlib.metadata
@@ -16,8 +19,11 @@ import pytest
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
+from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf, solid_png
+
 HINT = 'Install PDF support with: uv pip install "datagrunt[pdf]"'
 EXTRA_MODULES = ("pypdfium2", "PIL")  # Pillow imports as PIL
+PACKAGES = {"pypdfium2": "pypdfium2", "PIL": "Pillow"}
 CLASS_PATHS = ("datagrunt.PDFReader", "datagrunt.PDFWriter", "datagrunt.pdf.PDFReader", "datagrunt.pdf.PDFWriter")
 TIMEOUT_S = 120  # a cold interpreter imports polars, pyarrow and duckdb in about 1 s here
 PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
@@ -95,6 +101,7 @@ def test_without_the_extra_import_works_and_first_use_raises_the_hint(missing):
         message, name, cause = result[path]
         assert HINT in message, path
         assert path.rsplit(".", 1)[1] in message
+        assert all(PACKAGES[module] in message for module in missing), message
         assert name.split(".")[0] in missing
         assert cause == "ModuleNotFoundError"
 
@@ -129,8 +136,97 @@ def test_without_the_extra_the_bundle_functions_raise_the_hint_when_called(missi
         function_name, message, missing_name, cause = result[name]
         assert function_name == name
         assert HINT in message and name in message
+        assert all(PACKAGES[module] in message for module in missing), message
         assert missing_name.split(".")[0] in missing
         assert cause == "ModuleNotFoundError"
+
+
+@pytest.fixture(scope="module")
+def figure_pdf(tmp_path_factory) -> Path:
+    """A one-page PDF of text and one figure: its pages, its figure and its render each need a worker."""
+    page = PageSpec(
+        items=(
+            TextRun("Quarterly Report", 72, 72, size=24),
+            TextRun("This is body text for testing the figure below it.", 72, 120),
+            RasterImage(72, 160, 144, 144, solid_png(120, 120, (0.8, 0.1, 0.1))),
+        )
+    )
+    return build_pdf(tmp_path_factory.mktemp("extra") / "figure.pdf", [page])
+
+
+def shadowing(tmp_path: Path, module: str) -> Path:
+    """A directory holding a package ``module`` whose import fails as a missing package's does."""
+    root = tmp_path / "shadow"
+    (root / module).mkdir(parents=True)
+    failure = f"raise ModuleNotFoundError({f'No module named {module!r}'!r}, name={module!r})\n"
+    (root / module / "__init__.py").write_text(failure, encoding="utf-8")
+    return root
+
+
+# Each worker: what runs while the extra is there (the PDF read first where a writer needs its document), then the
+# call that starts that worker after it is gone.
+WORKER_CALLS = {
+    "pages": ("reader = datagrunt.PDFReader(pdf)", "reader.to_dataframe()"),
+    "figures": ("writer = datagrunt.PDFWriter(pdf); writer.write_json(out / 'doc.json')", "writer.extract_images(out)"),
+    "render": (
+        "writer = datagrunt.PDFWriter(pdf); writer.write_json(out / 'doc.json')",
+        "writer.render_pages_as_images(out)",
+    ),
+}
+
+
+def _raised_after_shadowing(pdf: Path, out: Path, shadow: Path, setup: str, call: str) -> list | None:
+    """What ``call`` raises once ``shadow`` heads the caller's sys.path (so every later worker's): or None."""
+    return run_python(
+        f"""
+        import json, sys
+        from pathlib import Path
+        import datagrunt
+        from datagrunt.pdf import DatagruntPDFError
+        pdf, out = Path({str(pdf)!r}), Path({str(out)!r})
+        {setup}
+        sys.path.insert(0, {str(shadow)!r})
+        try:
+            {call}
+        except Exception as exc:
+            found = [type(exc).__name__, isinstance(exc, DatagruntPDFError), str(exc), getattr(exc, "name", None)]
+            print(json.dumps(found))
+        else:
+            print(json.dumps(None))
+        """
+    )
+
+
+@pytest.mark.parametrize("worker", sorted(WORKER_CALLS))
+@pytest.mark.parametrize("module", EXTRA_MODULES, ids=["pypdfium2", "Pillow"])
+def test_an_extra_package_gone_after_construction_raises_the_hint_from_the_worker(tmp_path, figure_pdf, worker, module):
+    setup, call = WORKER_CALLS[worker]
+
+    raised = _raised_after_shadowing(figure_pdf, tmp_path / "out", shadowing(tmp_path, module), setup, call)
+
+    assert raised is not None, f"{call} raised nothing"
+    kind, is_pdf_error, message, name = raised
+    assert (kind, is_pdf_error) == ("ImportError", False), message
+    assert HINT in message and PACKAGES[module] in message
+    assert name == module
+
+
+def test_a_worker_failing_on_another_import_is_not_the_hint(tmp_path, figure_pdf):
+    # polars is a core dependency, not the extra: its failure in a worker stays the worker's failure, unmasked.
+    setup, call = WORKER_CALLS["pages"]
+
+    raised = _raised_after_shadowing(figure_pdf, tmp_path / "out", shadowing(tmp_path, "polars"), setup, call)
+
+    assert raised is not None
+    kind, is_pdf_error, message, _name = raised
+    assert is_pdf_error, kind
+    assert "polars" in message and HINT not in message
+
+
+def test_every_worker_protocol_raises_an_e_reply():
+    from datagrunt.pdf import _loaders, _process, pipeline, render
+
+    assert pipeline._ERROR == _loaders._ERROR == render._ERROR == _process.ERROR == b"E"
 
 
 def test_without_the_extra_csv_and_parquet_still_work(tmp_path):

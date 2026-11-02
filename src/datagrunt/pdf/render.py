@@ -98,6 +98,7 @@ from functools import partial
 from typing import IO, NamedTuple
 
 from datagrunt.pdf._memory_cap import ending as _worker_ending
+from datagrunt.pdf._process import ERROR as _PROCESS_ERROR
 from datagrunt.pdf._process import MAX_REQUEST_BYTES as _MAX_REQUEST_BYTES
 from datagrunt.pdf._process import (
     REAP_TIMEOUT_S,
@@ -110,6 +111,7 @@ from datagrunt.pdf._process import (
     start_worker,
     worker_command,
 )
+from datagrunt.pdf._process import read_error as _read_error
 from datagrunt.pdf._process import read_message as _read_message
 from datagrunt.pdf._validate import checked_password as _checked_password
 from datagrunt.pdf._validate import checked_path as _checked_path
@@ -125,6 +127,7 @@ _POINTS_PER_INCH = 72.0
 # byte, then a UTF-8 message (refused, failed) or the pixel size, followed by
 # the pixels as a second message.
 _PIXELS, _REFUSED, _FAILED = b"P", b"R", b"F"
+_ERROR = _PROCESS_ERROR  # a worker that cannot import the [pdf] extra says so first (raised: see _read_reply)
 _PIXEL_SIZE = struct.Struct("<QQ")
 _MAX_STATUS_BYTES = 1 << 20
 
@@ -631,6 +634,8 @@ def _read_reply(stdout: IO[bytes], memory_cap_bytes: int, channels: int) -> _Rep
     if status is None:
         return None
     kind = status[:1]
+    if kind == _ERROR:  # the worker could not import the [pdf] extra: no page of it renders, so it is raised
+        raise _read_error(status[1:], "the render worker")
     if kind != _PIXELS:
         return _message_reply(kind, status[1:])
     width, height = _pixel_size(status[1:], memory_cap_bytes, channels)

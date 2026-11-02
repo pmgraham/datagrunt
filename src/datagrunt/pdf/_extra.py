@@ -43,6 +43,7 @@ LAZY_FUNCTIONS = MappingProxyType({"load_bundle": "datagrunt.pdf.bundle", "write
 
 # The [pdf] extra's top-level import names, each with its package's name: pypdfium2, and Pillow's PIL.
 _EXTRA_PACKAGES = MappingProxyType({"pypdfium2": "pypdfium2", "PIL": "Pillow"})
+EXTRA_IMPORTS = tuple(_EXTRA_PACKAGES)
 
 
 @functools.cache
@@ -84,6 +85,22 @@ def _installed(module: str) -> bool:
     if module in sys.modules:
         return sys.modules[module] is not None  # None: its import is blocked
     return importlib.util.find_spec(module) is not None
+
+
+def missing_in_worker(exc: ImportError) -> ImportError | None:
+    """The install hint, as an ImportError, for a worker that failed to import the extra (``exc``); else None.
+
+    A worker reports it to its caller (:func:`datagrunt.pdf._process.missing_extra_reply`), which raises it:
+    the extra was there when the reader or writer was built, and is gone where the worker runs.
+    """
+    if not _is_missing_extra(exc):
+        return None
+    module = _root(exc)
+    message = (
+        f"datagrunt reads PDFs in worker processes, and a worker could not import {_EXTRA_PACKAGES[module]}, "
+        f"part of the [pdf] extra (pypdfium2 and Pillow): {exc}. {PDF_EXTRA_HINT}"
+    )
+    return ImportError(message, name=module)
 
 
 def _root(exc: ImportError) -> str:
