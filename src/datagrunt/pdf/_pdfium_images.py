@@ -17,6 +17,18 @@ within 1 MiB and pdfium then decodes it to the very same bytes (see
 :class:`~datagrunt.pdf.pdfium_engine.ImageLoader`, one image at a time, after
 the decode bounds (``_MAX_DECODED_PIXELS``, ``_MAX_JPX_TILES``) pass.
 
+An image behind simple filters (FlateDecode, LZWDecode, RunLengthDecode,
+ASCII85Decode, ASCIIHexDecode) is sized by its declared ``/Width`` and
+``/Height``, but pdfium decodes its stream in full to read its metadata or
+pixels, whatever they say. So its stream is decoded first, by the bounded
+decoders of :mod:`datagrunt.pdf._stream_decode` (each stage's output charged
+to the page budget), and pdfium may decode the image in this process only
+when the stream decodes within the most its declared size takes
+(:func:`stream_limit`). An image past it, or whose stream cannot be checked,
+is recorded without pixel metadata and counted
+(``ImageStats.skipped_overlong_images``); only a page render, in the render
+worker, whose memory is capped, decodes it.
+
 Memory for one decode at the pixel bound (``png_bytes`` of a 9400 x 9400
 image, 88.4 M pixels, peak RSS over the interpreter's, measured on macOS
 arm64 with pypdfium2 5.14 and Pillow 12): Flate RGB +590 MiB (pdfium's
@@ -45,6 +57,7 @@ from PIL import Image
 from datagrunt.pdf._image_headers import MAX_DIMENSION, CodestreamSize, jpeg_size, jpx_size
 from datagrunt.pdf._path_segments import Matrix, NonFiniteGeometry
 from datagrunt.pdf._pdfium_common import Box, PdfiumFailure
+from datagrunt.pdf._stream_decode import BudgetSpent, OverLimit, Unchecked, decoded_length
 from datagrunt.pdf._validate import finite_float, int_at_least, ordered_box, sha256_hex, str_tuple
 from datagrunt.pdf.elements import _MAX_ASSET_BYTES
 
@@ -104,9 +117,10 @@ class RawImage:
         bits_per_pixel: Bits per pixel of the image as pdfium decodes it (24
             for 8-bit RGB, and for CMYK, which pdfium decodes to RGB; 8 for
             8-bit Indexed; 1 for 1-bit gray and image masks). None when
-            pdfium cannot load the image, when it must not be decoded (see
-            ``ImageStats``), for JPX and JBIG2 (pdfium decodes those in full
-            to report it), and when the stream was not read.
+            pdfium cannot load the image, when it must not be decoded, or
+            not in this process (see ``ImageStats``), for JPX and JBIG2
+            (pdfium decodes those in full to report it), and when the stream
+            was not read.
         colorspace: The colour space family, one of :data:`COLORSPACES`, or
             None when there is none (an image mask), or, as for
             ``bits_per_pixel``, it is not read.
@@ -196,8 +210,19 @@ class ImageStats:
             in the render worker (``ImageLoader`` refuses it).
         skipped_over_budget_images: Images recorded without hash, size or
             pixel metadata because the page's stream budget (2 GiB of stream
-            bytes copied out of pdfium, length queries included) was spent:
-            one stream drawn 33,000 times cannot cost 33,000 reads.
+            bytes copied out of pdfium, length queries included, and of
+            stream bytes the stream check decodes) was spent: one stream
+            drawn 33,000 times cannot cost 33,000 reads.
+        skipped_overlong_images: Images behind simple filters whose stream
+            decodes past the most their declared size takes
+            (:func:`stream_limit`: ``/Width`` x ``/Height`` at 64 bits a
+            pixel, plus a predictor byte a row), or cannot be checked (data
+            outside its filter's format; see
+            :mod:`datagrunt.pdf._stream_decode`). Recorded at their declared
+            size without pixel metadata, and never decoded in this process:
+            ``ImageLoader`` refuses them. The render guard passes them: a
+            page render, in the render worker, whose memory is capped, may
+            decode them.
         max_cover_fraction: The largest fraction, 0 to 1, of the visible page
             (CropBox within MediaBox) that one image's painted area covers:
             its unit square under its matrix, clipped to the visible page
@@ -210,6 +235,7 @@ class ImageStats:
     skipped_oversized_images: int
     skipped_unsized_images: int
     skipped_over_budget_images: int
+    skipped_overlong_images: int
     max_cover_fraction: float
 
     def __post_init__(self) -> None:
@@ -217,6 +243,7 @@ class ImageStats:
         int_at_least("skipped_oversized_images", self.skipped_oversized_images, 0)
         int_at_least("skipped_unsized_images", self.skipped_unsized_images, 0)
         int_at_least("skipped_over_budget_images", self.skipped_over_budget_images, 0)
+        int_at_least("skipped_overlong_images", self.skipped_overlong_images, 0)
         cover = finite_float("max_cover_fraction", self.max_cover_fraction, lo=0.0, hi=1.0)
         object.__setattr__(self, "max_cover_fraction", cover)
 
@@ -321,6 +348,20 @@ _SIMPLE_FILTERS = frozenset({*_ASCII_FILTERS, "LZWDecode", "FlateDecode", "RunLe
 # memory is capped (see decoded_png).
 _JBIG2 = "JBIG2Decode"
 _DECLARED_SIZE_CODECS = _SIMPLE_FILTERS | {_JBIG2}
+# The filters pdfium decodes in full in this process (see the module notes),
+# so checked first. A stream ending in CCITTFaxDecode is checked up to it
+# (pdfium decodes CCITT at the declared size). A stream holding DCT, JPX or
+# JBIG2 is not: a DCT or JPX codestream's wrappers are bounded by
+# wrapped_codestream's reads, and a JBIG2 image is never decoded here.
+_CHECKED_FILTERS = frozenset({*_ASCII_FILTERS, "LZWDecode", "FlateDecode", "RunLengthDecode"})
+_UNCHECKED_CODECS = frozenset({"DCTDecode", "JPXDecode", _JBIG2})
+# The most bits one pixel declares: 4 components (CMYK, the most any colour
+# space but DeviceN has) of 16 bits. pdfium reads neither /ColorSpace nor
+# /BitsPerComponent without decoding the stream (FPDFImageObj_GetImageMetadata
+# decodes it), nor /DecodeParms at all, so a stream is checked against the
+# most its declared /Width and /Height can take: a DeviceN image of more
+# components is refused in this process (its page still renders).
+_MAX_PIXEL_BITS = 4 * 16
 # Codecs pdfium decodes in full to report an image's metadata (observed for
 # JPX: 0.14 s and 78 MB at 9000 x 9000); JBIG2 is treated alike, unobserved
 # (no encoder here). Their bits per pixel and colour space are never read.
@@ -336,7 +377,9 @@ class Placement(NamedTuple):
 
 Skip = Literal["oversized", "unsized", "over_budget"]
 # The ImageStats count an image falls under, with why it must not be decoded (its message names the object).
-Refusal = tuple[Literal["nonfinite", "oversized", "unsized", "over_budget"], str]
+Refusal = tuple[Literal["nonfinite", "oversized", "unsized", "over_budget", "overlong"], str]
+# The counts whose images pdfium must not decode in this process only: a page render may.
+_IN_PROCESS_ONLY = frozenset({"overlong"})
 
 
 class ImageOutcome(NamedTuple):
@@ -352,6 +395,13 @@ class ImageOutcome(NamedTuple):
     cover_fraction: float
     refusal: Refusal | None
 
+    @property
+    def render_refusal(self) -> str | None:
+        """Why a page render must not decode the image (None: it may): every refusal but an in-process one."""
+        if self.refusal is None or self.refusal[0] in _IN_PROCESS_ONLY:
+            return None
+        return self.refusal[1]
+
 
 class PixelFacts(NamedTuple):
     """What an image decodes to, read without decoding it.
@@ -360,7 +410,10 @@ class PixelFacts(NamedTuple):
     ImageStats count it falls under; ``read_metadata`` whether the bits per
     pixel and colour space came from pdfium; ``in_process`` whether pdfium
     may decode it in the calling process (False for JBIG2: only a page
-    render, in the render worker, decodes it).
+    render, in the render worker, decodes it); ``stream_refusal`` why pdfium
+    must not decode it in the calling process (None: it may) because its
+    stream decodes past its declared size or cannot be checked
+    (``ImageStats.skipped_overlong_images``).
     """
 
     px_width: int
@@ -371,6 +424,7 @@ class PixelFacts(NamedTuple):
     refusal: tuple[Skip, str] | None
     read_metadata: bool
     in_process: bool = True
+    stream_refusal: str | None = None
 
 
 class _PageBudget:
@@ -409,7 +463,7 @@ def collect_images(
     refused (see :class:`ImageStats`). No pixel is decoded.
     """
     images: list[RawImage] = []
-    counts = dict.fromkeys(("nonfinite", "oversized", "unsized", "over_budget"), 0)
+    counts = dict.fromkeys(("nonfinite", "oversized", "unsized", "over_budget", "overlong"), 0)
     cover = 0.0
     for outcome in image_outcomes(placed, page_raw, page_box, to_display):
         if outcome.refusal is not None:
@@ -422,6 +476,7 @@ def collect_images(
         skipped_oversized_images=counts["oversized"],
         skipped_unsized_images=counts["unsized"],
         skipped_over_budget_images=counts["over_budget"],
+        skipped_overlong_images=counts["overlong"],
         max_cover_fraction=cover,
     )
     return PageImages(images=tuple(images), stats=stats)
@@ -478,7 +533,10 @@ def _page_image(
         return unread, _over_budget(label)
     raw = _copied_raw_stream(image, size, label)
     wrapped = partial(wrapped_codestream, image, filters, raw, label, budget.charge)
-    facts = pixel_facts(image, page_raw, label, filters, declared, raw, wrapped)
+    try:
+        facts = pixel_facts(image, page_raw, label, filters, declared, raw, wrapped, budget.charge)
+    except BudgetSpent:
+        return unread, _over_budget(label)
     recorded = RawImage(
         bbox=bbox,
         px_width=facts.px_width,
@@ -490,6 +548,8 @@ def _page_image(
         bits_per_pixel=facts.bits_per_pixel,
         colorspace=facts.colorspace,
     )
+    if facts.stream_refusal is not None:
+        return recorded, ("overlong", facts.stream_refusal)
     return recorded, facts.refusal
 
 
@@ -703,20 +763,78 @@ def pixel_facts(
     declared: tuple[int, int],
     raw: bytes,
     wrapped: Callable[[], bytes | str],
+    charge: Callable[[int], bool],
 ) -> PixelFacts:
-    """What image object ``image`` decodes to, without decoding it.
+    """What image object ``image`` decodes to, without pdfium decoding it.
 
     The size is the codestream header's for a DCT or JPX stream (alone, or
     behind ASCII filters or one FlateDecode: read by ``wrapped``, see
-    :func:`wrapped_codestream`), else ``declared``. pdfium's metadata (bits
-    per pixel, colour space) is read only when the image may be decoded and
-    the codec reads it without decoding.
+    :func:`wrapped_codestream`), else ``declared``. A stream behind simple
+    filters is then decoded by :func:`stream_refusal`'s check, each piece
+    passed to ``charge``. pdfium's metadata (bits per pixel, colour space) is
+    read only when the image may be decoded in this process and the codec
+    reads it without decoding.
+
+    Raises:
+        BudgetSpent: If ``charge`` returns False during the stream check.
     """
     width, height, refusal = _decode_size(filters, declared, raw, wrapped, label)
-    read_metadata = refusal is None and not _DECODED_FOR_METADATA.intersection(filters)
+    overlong = None if refusal is not None else stream_refusal(filters, width, height, raw, label, charge)
+    read_metadata = refusal is None and overlong is None and not _DECODED_FOR_METADATA.intersection(filters)
     bits_per_pixel, colorspace = _metadata(image, page_raw, label) if read_metadata else (None, None)
     in_process = _JBIG2 not in filters
-    return PixelFacts(width, height, declared, bits_per_pixel, colorspace, refusal, read_metadata, in_process)
+    return PixelFacts(width, height, declared, bits_per_pixel, colorspace, refusal, read_metadata, in_process, overlong)
+
+
+def stream_limit(width: int, height: int) -> int:
+    """The most bytes a ``width`` x ``height`` image's stream may decode to: rows of 64-bit pixels and a byte.
+
+    pdfium's API reads no ``/DecodeParms``, so each row may carry a PNG
+    predictor's tag byte, at the declared width.
+    """
+    row = (width * _MAX_PIXEL_BITS + 7) // 8
+    return height * (row + 1)
+
+
+def stream_refusal(
+    filters: tuple[str, ...], width: int, height: int, raw: bytes, label: str, charge: Callable[[int], bool]
+) -> str | None:
+    """Why pdfium must not decode the image in this process, by its stream; None when it may.
+
+    The filters pdfium decodes in full (``_CHECKED_FILTERS``, before any
+    codec that follows them) are decoded by
+    :func:`~datagrunt.pdf._stream_decode.decoded_length` within
+    :func:`stream_limit` of the decode size; a stream with none of them is
+    not checked.
+
+    Raises:
+        BudgetSpent: If ``charge`` returns False.
+    """
+    checked = _checked_filters(filters)
+    if not checked:
+        return None
+    unchecked = f"{label}'s stream cannot be checked against its declared size"
+    rendered = "it is decoded only when its page is rendered, in the render worker"
+    if not (width and height):
+        return f"{unchecked}: its size is unknown; {rendered}"
+    limit = stream_limit(width, height)
+    try:
+        decoded_length(raw, checked, limit=limit, charge=charge)
+    except OverLimit as exc:
+        size = f"{width} x {height} pixels at {_MAX_PIXEL_BITS} bits a pixel, and a predictor byte a row"
+        return f"{label}'s stream does not decode within its declared size: {exc} ({size}); {rendered}"
+    except Unchecked as exc:
+        return f"{unchecked}: {exc}; {rendered}"
+    return None
+
+
+def _checked_filters(filters: tuple[str, ...]) -> tuple[str, ...]:
+    """The filters the stream check decodes: all but a CCITT codec after them; none before DCT, JPX or JBIG2."""
+    if not filters or _UNCHECKED_CODECS.intersection(filters):
+        return ()
+    if filters[-1] == "CCITTFaxDecode":
+        return filters[:-1]  # pdfium decodes the codec itself, at the declared size
+    return filters
 
 
 def _decode_size(
@@ -803,8 +921,9 @@ def decoded_png(image: pdfium_c.FPDF_PAGEOBJECT, facts: PixelFacts, label: str) 
 
     Raises:
         DecodeRefused: If ``facts`` refuse decoding, or do not allow it in
-            this process (a JBIG2 image), or the bitmap pdfium decodes has
-            more pixels than ``_MAX_DECODED_PIXELS``.
+            this process (a JBIG2 image, or one whose stream decodes past
+            its declared size or cannot be checked), or the bitmap pdfium
+            decodes has more pixels than ``_MAX_DECODED_PIXELS``.
         PdfiumFailure: If pdfium cannot decode the image.
     """
     if facts.refusal is not None:
@@ -813,6 +932,8 @@ def decoded_png(image: pdfium_c.FPDF_PAGEOBJECT, facts: PixelFacts, label: str) 
         raise DecodeRefused(
             f"{label} is a JBIG2 image: it is decoded only when its page is rendered, in the render worker"
         )
+    if facts.stream_refusal is not None:
+        raise DecodeRefused(facts.stream_refusal)
     bitmap = pdfium_c.FPDFImageObj_GetBitmap(image)
     if not bitmap:
         raise PdfiumFailure(f"decode {label}")

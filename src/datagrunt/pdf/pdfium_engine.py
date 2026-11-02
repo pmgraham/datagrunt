@@ -87,7 +87,11 @@ Images (#365 T4), pinned by ``tests/pdf_tests/test_pdfium_images.py``:
   image in full (0.14 s, 78 MB at 9000 x 9000) and OpenJPEG allocates ~12
   KB per tile as it reads the header (761 MB for a 2000 x 2000 codestream
   in 16 x 16 tiles); for DCT, Flate and CCITT the call reads no pixels
-  (unchanged RSS at a 9000 x 9000 frame and a 9400 x 9400 Flate bomb).
+  (unchanged RSS at a 9000 x 9000 frame and a 9400 x 9400 Flate image of
+  zeros). Behind LZWDecode, ASCII85Decode or ASCIIHexDecode (or FlateDecode
+  or RunLengthDecode before another filter) it decodes the stream in full,
+  whatever /Width says, so such a stream is checked first
+  (:mod:`datagrunt.pdf._stream_decode`, see ``ImageStats``).
 - pdfium decodes no side over 131071 (``/Width 131072`` reads bits per
   pixel 0 and a NULL bitmap) and reads ``/Width -5`` as 4294967291.
 - ``FPDFImageObj_GetImageDataRaw``'s length query copies the stream too
@@ -1064,7 +1068,9 @@ def image_refusal(page: pdfium.PdfPage, geometry: PageGeometry, *, max_objects: 
     - an image A2 refuses to decode (see :class:`ImageStats`: over the pixel,
       sample, component or JPEG 2000 tile bound; of a size that cannot be
       read without decoding; its raw stream over the asset limit, or past
-      the page's stream budget);
+      the page's stream budget), but not one A2 refuses only in the calling
+      process (its stream decodes past its declared size, or cannot be
+      checked): the worker's memory cap bounds its decode;
     - an image whose matrix to page space is not finite (its size is never
       read, so it cannot pass the bounds);
     - a pdfium call fails while walking or sizing.
@@ -1088,8 +1094,8 @@ def image_refusal(page: pdfium.PdfPage, geometry: PageGeometry, *, max_objects: 
     placed = _placed_objects(page.raw, pdfium_c.FPDF_PAGEOBJ_IMAGE, max_objects=max_objects)
     try:
         for outcome in image_outcomes(placed, page.raw, geometry.page_box, _display_mapping(geometry)):
-            if outcome.refusal is not None:
-                return outcome.refusal[1]
+            if outcome.render_refusal is not None:
+                return outcome.render_refusal
     except WalkBoundHit as exc:
         return str(exc)
     except PdfiumFailure as exc:
@@ -1439,9 +1445,10 @@ class ImageLoader:
                 than 89,478,485 pixels (Pillow's default decompression-bomb
                 bound: 1 GiB / 4 / 3) or in more than 4096 JPEG 2000 tiles,
                 or its decode size cannot be known first (see
-                :class:`ImageStats`), or it is a JBIG2 image (decoded only by a
-                page render, in the render worker); or if the bitmap pdfium
-                decodes is over the pixel bound after all.
+                :class:`ImageStats`), or it is a JBIG2 image, or its stream
+                decodes past its declared size or cannot be checked (each
+                decoded only by a page render, in the render worker); or if
+                the bitmap pdfium decodes is over the pixel bound after all.
             PDFCorruptError: If pdfium cannot load the page, decode the image,
                 or a pdfium call fails (``page_number`` is set).
             FileNotFoundError, PermissionError, PDFEncryptedError: As
@@ -1494,7 +1501,7 @@ class ImageLoader:
             raise self._changed(f"its raw stream hashes to {actual}, not {self.raw_sha256}")
         filters = read_filters(image, label)
         wrapped = partial(wrapped_codestream, image, filters, raw, label, _uncharged)
-        facts = pixel_facts(image, page_raw, label, filters, declared_size(image, label), raw, wrapped)
+        facts = pixel_facts(image, page_raw, label, filters, declared_size(image, label), raw, wrapped, _uncharged)
         found = _described(filters, facts.px_width, facts.px_height, facts.declared_px, facts, facts.read_metadata)
         expected = _described(
             self.image.filters,
@@ -1514,8 +1521,9 @@ class ImageLoader:
         return DatagruntPDFError(f"{where} is not the image this loader was made for: the file changed ({detail})")
 
 
-def _uncharged(size: int) -> None:
-    """A loader reads one image: there is no page stream budget to charge ``size`` to."""
+def _uncharged(size: int) -> bool:
+    """A loader reads one image: there is no page stream budget to charge ``size`` to, so it always fits."""
+    return True
 
 
 def _described(

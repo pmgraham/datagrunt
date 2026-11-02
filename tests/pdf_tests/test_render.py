@@ -304,9 +304,10 @@ class TestImageGuard:
     def test_an_image_past_the_page_stream_budget_refuses_the_render(self, tmp_path, monkeypatch):
         twice = b"q 80 0 0 40 10 20 cm /Im Do Q q 80 0 0 40 100 20 cm /Im Do Q"
         path = xobject_page(tmp_path, FLATE, RGB_4X2 + b" /Filter /FlateDecode", content=twice)
-        monkeypatch.setattr(_pdfium_images, "_MAX_PAGE_STREAM_BYTES", len(FLATE))
+        # Room for the first draw's raw stream and the 24 bytes the stream check inflates it to.
+        monkeypatch.setattr(_pdfium_images, "_MAX_PAGE_STREAM_BYTES", len(FLATE) + len(SAMPLES))
 
-        expected = f"object 1 was not read: the page's {len(FLATE)}-byte image stream budget is spent"
+        expected = f"object 1 was not read: the page's {len(FLATE) + len(SAMPLES)}-byte image stream budget is spent"
         assert refusal_of(path) == expected
 
     def test_an_image_drawn_under_an_overflowing_cm_refuses_the_render(self, tmp_path):
