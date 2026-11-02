@@ -67,6 +67,7 @@ PARTS = (("Part", "Qty", "Price"), ("Bolt", "4", "0.10"), ("Nut", "12", "0.05"))
 # A 64 x 32 px image: a figure at min_image_dimension 32, none at 40 (the default).
 PNG = solid_png(64, 32, (0.2, 0.4, 0.6))
 DEFAULT_SIZE_NOTE = "; 612 x 792 pt is pdfium's default page size, not this page's"
+BODY_TEXT = "The woodland is vast and its creatures many, each with its own purpose and its own ambitions."
 
 
 def mixed_page(top: float = 60.0) -> PageSpec:
@@ -675,8 +676,16 @@ class TestExtractPageAt:
         page = page_at(path, min_image_dimension=32)
 
         assert page == chain_page(path, min_image_dimension=32)
-        # Not vacuous: the page has text, a figure and both kinds of table.
-        assert {type(element).__name__ for element in page.elements} >= {"Heading", "Paragraph", "Figure", "Table"}
+        # Not vacuous, and not only the chain's: the page's own facts, turned on /Rotate 90.
+        assert (page.width_pt, page.height_pt) == ((792.0, 612.0) if rotate == 90 else (612.0, 792.0))
+        assert page.quality.rotation_deg == rotate
+        heading, paragraph, figure, lattice, stream = page.elements
+        assert (heading.text, paragraph.text) == ("Parts list", BODY_TEXT)
+        assert (figure.width_px, figure.height_px) == (64, 32)
+        assert [(table.extraction_method, table.headers, table.rows) for table in (lattice, stream)] == [
+            ("lattice", PARTS[0], PARTS[1:]),
+            ("stream", PARTS[0], PARTS[1:]),
+        ]
         assert page.status == "ok"
         assert page.integrity_verified
 
@@ -1138,9 +1147,20 @@ class TestExtractDocument:
         document = extract_document(path, min_image_dimension=32)
 
         assert document == chain_document(path, title="Parts", author="Ada", min_image_dimension=32)
-        # Not vacuous: the pages hold elements and the scope pass set paths and sections.
+        # Not vacuous, and not only the chain's: the scope pass's own facts. The table that ends page 2 goes on at the
+        # top of page 3, and each page's "Parts list" opens a section.
         assert [page.page_number for page in document.pages] == [1, 2, 3]
-        assert document.sections and all(page.elements for page in document.pages)
+        assert [(table.element_id, table.continued_from_id) for table in document.tables] == [
+            ("p0001_e003", None),
+            ("p0001_e004", None),
+            ("p0002_e002", None),
+            ("p0003_e000", "p0002_e002"),
+        ]
+        assert [(section.heading.element_id, section.page_span) for section in document.sections] == [
+            ("p0001_e000", (1, 1)),
+            ("p0002_e000", (2, 3)),
+        ]
+        assert {element.scope_path for page in document.pages for element in page.elements} == {("Parts list",)}
         assert document.integrity_verified
 
     def test_a_table_split_across_two_pages_is_linked(self, tmp_path):

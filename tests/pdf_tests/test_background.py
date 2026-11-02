@@ -829,6 +829,20 @@ class TestPipeline:
         assert " ".join(element_texts(page)) == "Visible black text A second line of body text"
         assert not [warning for warning in page.warnings if warning.startswith("background not checked")]
 
+    def test_a_sliver_page_whose_render_is_refused_fails_closed(self, tmp_path):
+        # Nothing stood in for: a 20 x 6,000,000 pt page fits the reader's 262,144-pixel bound only at 3 DPI, where it
+        # is 0 px wide, so effective_dpi refuses its background render. Its white text is flagged unchecked; the
+        # black text, over no paint, stays visible.
+        items = (TextRun("Hi", x=2.0, y=40.0, size=10.0, rgb=WHITE_RGB), TextRun("ok", x=2.0, y=80.0, size=10.0))
+        path = build_pdf(tmp_path / "sliver.pdf", [PageSpec(width=20.0, height=6_000_000.0, items=items)])
+
+        (page,) = extract_document(path, ocr="never", max_render_pixels=262_144).pages
+
+        assert (page.status, page.route, page.width_pt, page.height_pt) == ("ok", "digital", 20.0, 6_000_000.0)
+        assert page.warnings[-1] == "background not checked: a 20.0 x 6000000.0 pt page renders 0 px wide at 3 DPI"
+        assert hidden_paragraphs(page) == [("Hi", UNCHECKED)]
+        assert element_texts(page) == ["ok"]
+
     def test_a_forced_render_refusal_fails_closed(self, tmp_path, monkeypatch):
         def refused(source, pages, **kwargs):
             return tuple(RenderRefused(f"{source}: page {index + 1}: refused") for index, _dpi in pages)
