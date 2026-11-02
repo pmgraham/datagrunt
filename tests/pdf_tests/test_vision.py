@@ -19,13 +19,13 @@ import pypdfium2 as pdfium
 import pytest
 from PIL import Image
 
-from datagrunt.pdf import vision
+from datagrunt.pdf import _loaders, vision
+from datagrunt.pdf._loaders import FigureRead
 from datagrunt.pdf.assembly import FigureDraft, assemble_page, conservation
 from datagrunt.pdf.elements import BBox, Figure, Page, PageQuality, Paragraph, Table
 from datagrunt.pdf.layout import find_lattice_tables
 from datagrunt.pdf.ocr import OCRResult, OCRWord, Orientation, bands, normalized, rotated
 from datagrunt.pdf.pdfium_engine import (
-    ImageLoader,
     PageFailure,
     PageGeometry,
     extract_page,
@@ -393,7 +393,7 @@ class TestVisionElements:
 
     def test_a_figure_is_a_slot_in_reading_order_and_never_loaded(self, tmp_path, monkeypatch):
         raw = image((72.0, 400.0, 272.0, 550.0))
-        loader = ImageLoader(source=tmp_path / "doc.pdf", page_index=2, image=raw)
+        loader = FigureRead(source=tmp_path / "doc.pdf", page_index=2, image=raw)
         draft = FigureDraft(
             bbox=BBox(x0=72.0, y0=400.0, x1=272.0, y1=550.0),
             hidden_reasons=(),
@@ -402,7 +402,7 @@ class TestVisionElements:
             height_px=750,
             loader=loader,
         )
-        monkeypatch.setattr(ImageLoader, "png_bytes", lambda self: pytest.fail("a figure was loaded"))
+        monkeypatch.setattr(FigureRead, "png_bytes", lambda self: pytest.fail("a figure was loaded"))
 
         found = vision_elements(mixed_words(), geometry=GEOMETRY, figures=(draft,))
 
@@ -1016,13 +1016,13 @@ class TestPageRender:
 
     def test_each_load_renders_the_page_again(self, scans, monkeypatch):
         calls = []
-        real = vision.render_page
+        real = _loaders.render_page
 
         def counted(*args, **kwargs):
             calls.append(kwargs["dpi"])
             return real(*args, **kwargs)
 
-        monkeypatch.setattr(vision, "render_page", counted)
+        monkeypatch.setattr(_loaders, "render_page", counted)
         loader = PageRender(
             source=scans["scan"], page_index=0, dpi=72, rotation=0, memory_cap_bytes=1 << 30, timeout_s=60.0
         )

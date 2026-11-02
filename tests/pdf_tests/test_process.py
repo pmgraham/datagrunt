@@ -19,7 +19,11 @@ import pytest
 
 from datagrunt.pdf import _process
 
-ALLOWLIST = {"render": ("datagrunt.pdf.render", "_worker_main"), "pages": ("datagrunt.pdf.pipeline", "_worker_main")}
+ALLOWLIST = {
+    "figures": ("datagrunt.pdf._figure_worker", "_worker_main"),
+    "pages": ("datagrunt.pdf._page_worker", "_worker_main"),
+    "render": ("datagrunt.pdf._render_worker", "_worker_main"),
+}
 
 FAKE_WORKER = """
 def _worker_main(request, replies):
@@ -36,12 +40,12 @@ def run_bootstrap(stdin: bytes) -> subprocess.CompletedProcess:
 
 
 def fake_package(tmp_path):
-    """A ``datagrunt.pdf`` whose ``pipeline`` and ``render`` workers each echo their request."""
+    """A ``datagrunt.pdf`` whose figure, page and render workers each echo their request."""
     package = tmp_path / "datagrunt" / "pdf"
     package.mkdir(parents=True)
     (tmp_path / "datagrunt" / "__init__.py").write_text('print("noise at import")\n', encoding="utf-8")
     (package / "__init__.py").write_text("", encoding="utf-8")
-    for name in ("pipeline", "render"):
+    for name in ("_figure_worker", "_page_worker", "_render_worker"):
         (package / f"{name}.py").write_text(FAKE_WORKER.replace("request).encode", f"('{name}', request)).encode"))
     return tmp_path
 
@@ -49,11 +53,11 @@ def fake_package(tmp_path):
 class TestAllowlist:
     """A request names its worker by a key of a fixed allowlist: never a module or a function."""
 
-    def test_the_allowlist_is_exactly_the_two_workers_and_read_only(self):
+    def test_the_allowlist_is_exactly_the_three_workers_and_read_only(self):
         assert isinstance(_process.WORKERS, MappingProxyType)
         assert dict(_process.WORKERS) == ALLOWLIST
 
-    @pytest.mark.parametrize("worker", ["render", "pages"])
+    @pytest.mark.parametrize("worker", ["figures", "pages", "render"])
     def test_a_named_worker_runs_with_the_sent_sys_path_and_stdout_kept_for_replies(self, tmp_path, worker):
         root = fake_package(tmp_path)
         request = {"sys_path": [str(root)], "worker": worker, "request": {"page_index": 0}}
@@ -76,7 +80,7 @@ class TestAllowlist:
         done = run_bootstrap(json.dumps(request).encode())
 
         assert done.returncode == 1
-        assert b"the worker request names no worker of ('render', 'pages')" in done.stderr
+        assert b"the worker request names no worker of ('figures', 'pages', 'render')" in done.stderr
         assert b"noise at import" not in done.stderr  # nothing of the caller's sys.path was imported
 
     def test_a_request_over_its_bound_is_refused_unread(self):
@@ -97,7 +101,7 @@ class TestLaunch:
     """The command, the request and the start: ``python -I``, JSON on stdin, stdout and stdin piped."""
 
     def test_the_command_is_python_isolated_running_the_bootstrap(self):
-        assert _process.worker_command("a page worker") == [sys.executable, "-I", "-c", _process.BOOTSTRAP]
+        assert _process.worker_command() == [sys.executable, "-I", "-c", _process.BOOTSTRAP]
 
     @pytest.mark.parametrize(
         "attribute,value,message",
@@ -105,22 +109,25 @@ class TestLaunch:
             pytest.param(
                 "frozen",
                 True,
-                "a frozen application has no Python interpreter to start a page worker with",
+                "this application is frozen (sys.frozen): datagrunt reads PDFs in worker processes and cannot start "
+                "one here",
                 id="frozen",
             ),
             pytest.param(
                 "executable",
                 "",
-                "sys.executable is empty: there is no Python interpreter for a page worker",
+                "sys.executable is empty: datagrunt reads PDFs in worker processes and cannot start one here",
                 id="empty",
             ),
         ],
     )
-    def test_no_interpreter_is_refused_naming_the_worker(self, monkeypatch, attribute, value, message):
+    def test_no_interpreter_is_refused_naming_the_cause(self, monkeypatch, attribute, value, message):
         monkeypatch.setattr(sys, attribute, value, raising=False)
 
-        with pytest.raises(_process.NoInterpreter, match=re.escape(message)):
-            _process.worker_command("a page worker")
+        with pytest.raises(_process.NoInterpreter) as caught:
+            _process.worker_command()
+
+        assert str(caught.value) == message
 
     def test_the_request_is_json_with_the_callers_sys_path_and_the_workers_key(self):
         payload = json.loads(_process.request_payload("pages", {"pages": [0, 2]}, 1 << 20))
@@ -132,7 +139,9 @@ class TestLaunch:
             _process.request_payload("pages", {"pages": [0, 2]}, 10)
 
     def test_a_request_for_no_allowlisted_worker_is_refused(self):
-        with pytest.raises(ValueError, match=re.escape("worker must be one of ('render', 'pages'), got 'os'")):
+        with pytest.raises(
+            ValueError, match=re.escape("worker must be one of ('figures', 'pages', 'render'), got 'os'")
+        ):
             _process.request_payload("os", {}, 1 << 20)
 
     def test_a_worker_starts_with_its_stdin_stdout_and_stderr_piped(self, monkeypatch):

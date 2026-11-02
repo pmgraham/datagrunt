@@ -43,7 +43,7 @@ use (the first property or method that needs the document), then cached
 for the reader's life. Text and layout are read then, eagerly; a figure's
 and a page image's bytes stay lazy, read only through their A1 loaders
 (``Figure.read_bytes``, ``PageImage.read_bytes``: a bundle's verifying
-reader, or A5a's guarded, capped render). A failed extraction or load is
+reader, a capped figure worker, or A5a's guarded, capped render). A failed extraction or load is
 not cached: the next use tries again. A lock makes the first use
 thread-safe: two threads never extract the same reader's document twice.
 
@@ -109,6 +109,9 @@ extension. What a caller's SQL writes explicitly (``COPY ... TO``,
 
 Workers: ``workers`` goes to ``extract_document``, whose pool starts plain
 ``python -I`` processes: a caller's script needs no ``__main__`` guard.
+pdfium reads the PDF only in those workers, each capped in memory: this
+process never imports pypdfium2, and where no worker can start (a frozen
+application) reading a PDF fails, saying why.
 """
 
 import os
@@ -125,9 +128,11 @@ import polars as pl
 import pyarrow as pa
 
 from datagrunt.pdf._database import QueryResult, private_connection, query_result
+from datagrunt.pdf._options import MIN_IMAGE_DIMENSION, OcrMode
 from datagrunt.pdf._source import checked_pdf_file
+from datagrunt.pdf._validate import checked_password as _checked_password
+from datagrunt.pdf._validate import checked_path as _checked_path
 from datagrunt.pdf._validate import int_at_least, non_blank_str
-from datagrunt.pdf.assembly import MIN_IMAGE_DIMENSION
 from datagrunt.pdf.bundle import MANIFEST, _read_manifest, load_bundle
 from datagrunt.pdf.codec import document_from_json
 from datagrunt.pdf.elements import (
@@ -145,9 +150,7 @@ from datagrunt.pdf.elements import (
 )
 from datagrunt.pdf.exceptions import BundleCorruptError
 from datagrunt.pdf.frame import ARROW_SCHEMA, element_frame
-from datagrunt.pdf.pdfium_engine import _checked_password, _checked_path
 from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, extract_document
-from datagrunt.pdf.quality import OcrMode
 
 __all__ = ["PDFReader"]
 

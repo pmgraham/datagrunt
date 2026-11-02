@@ -10,7 +10,9 @@ from collections.abc import Callable
 
 import pypdfium2.raw as pdfium_c
 
-Box = tuple[float, float, float, float]
+from datagrunt.pdf._boxes import Box, union_box
+
+__all__ = ["Box", "PdfiumFailure", "object_address", "read_rgba", "union_box"]
 
 
 class PdfiumFailure(Exception):
@@ -18,16 +20,6 @@ class PdfiumFailure(Exception):
 
     The message completes "pdfium cannot ...".
     """
-
-
-def union_box(boxes: tuple[Box, ...]) -> Box:
-    """The smallest box holding every one of ``boxes`` (at least one)."""
-    return (
-        min(box[0] for box in boxes),
-        min(box[1] for box in boxes),
-        max(box[2] for box in boxes),
-        max(box[3] for box in boxes),
-    )
 
 
 def object_address(pointer: pdfium_c.FPDF_PAGEOBJECT) -> int:

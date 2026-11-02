@@ -1,6 +1,8 @@
-"""Guarded page render for the v5 vision route (#369, A5a).
+"""Guarded page render for the v5 vision route (#369, A5a): the caller's side.
 
-Internal: not exported from ``datagrunt`` or ``datagrunt.pdf``.
+Internal: not exported from ``datagrunt`` or ``datagrunt.pdf``. Imports no
+pdfium: every pdfium call of a render is the render worker's
+(:mod:`datagrunt.pdf._render_worker`).
 
 A page renders at :func:`effective_dpi`: the spec's
 ``min(target_dpi, int(72 * sqrt(max_render_pixels / (width_pt * height_pt))))``,
@@ -17,76 +19,27 @@ guard's walk reaching its bound, is a :class:`RenderRefused` naming the
 object, and nothing is drawn.
 
 :func:`render_page` runs the guard and the render in a worker process
-whose memory is capped, because pdfium decodes what the object
-walk cannot see (soft masks, patterns, Type3 glyph procedures) and an image
-within A2's bounds can still cost ~1.7 GiB to decode. The cap is the
-worker's peak RSS over its peak once started (the interpreter and
-datagrunt's imports), on every platform (#435):
-
-- A watchdog thread in the worker ends it (``_CAP_EXIT``) once its peak RSS
-  passes its starting peak plus the cap: VmHWM on Linux, ``ru_maxrss`` on
-  macOS, ``PeakWorkingSetSize`` (``GetProcessMemoryInfo``) on Windows.
-  pdfium's ctypes calls release the GIL, so it runs while pdfium allocates;
-  it polls every 5 ms, and its overshoot is what is allocated in one poll,
-  or in one allocation made holding the GIL (at most an image stream the
-  guard copies: the 1 GiB asset limit). It reads the peak, so a spike
-  between two polls still ends the worker. A reading that fails ends the
-  worker (``_WATCH_FAILED_EXIT``), and with no first reading the page is
-  not rendered: the worker never draws unwatched.
-- Linux and Windows keep a hard limit as a backstop, at the cap plus
-  :data:`_BACKSTOP_MARGIN_BYTES` (4 GiB), so memory stays bounded should the
-  watchdog not see an allocation: ``RLIMIT_AS`` at the address space mapped
-  then (Linux; past it a new mapping fails), a Job Object's per-process
-  commit limit at the commit then (Windows). The watchdog starts first, so
-  its thread's stack and allocator arena (72 MiB of address space, measured
-  on Linux) are in the backstop's baseline. macOS, which does not enforce
-  ``RLIMIT_AS``, has the watchdog alone. No test runs on Windows: its
-  watchdog's reading and its Job Object are untested.
-- Anywhere else the worker refuses to render (a :class:`RenderFailed`).
-
-A hard limit alone fails quietly: an allocation past it fails inside
-pdfium, which then draws the page without that image, and without an error.
-The watchdog fails the page instead, so the backstop sits above it. The
-margin, from measurements on Linux (arm64, pypdfium2 5.14, pdfium 156; 125
-pages: the corpus, an image at each of the guard's bounds, large JBIG2 images):
-
-- A worker's peak RSS and its address space grow alike while it draws,
-  within 3 MiB, though it holds ~840 MiB of address space beyond its RSS
-  once started (its imports' libraries, thread stacks and allocator arenas,
-  all in the baseline). So for allocations that grow gradually, the cap is
-  reached in RSS first, and the watchdog ends the worker long before the
-  margin is used.
-- The margin is set by single allocations, mapped whole before they are
-  touched. For an image the guard sizes, the largest is a filter's output
-  ahead of the image codec, at most 4 times the 1 GiB asset limit in one
-  allocation (measured: 1,200 MiB from a 300 MiB stream). The others measured
-  are smaller: a raw stream loaded whole (674 MiB; at most the asset
-  limit), a decoded bitmap (253 MiB at 88.4 M pixels; at most
-  89,478,485 x 4 bytes, 341 MiB), JBIG2's buffers (249 MiB), a progressive
-  JPEG's coefficients (169 MiB), JPEG 2000's components (84 MiB each).
-
-The residual: one allocation larger than the room left under the backstop
-is still refused, and that image is drawn blank, unflagged. While the
-watchdog has not ended the worker, that room is the margin, less a few MiB
-(the 3 MiB above, and one poll's growth). For an image the guard sizes,
-that takes an allocation of nearly 4 GiB: by the bounds above, none is
-larger. An image the guard does not size (in a pattern, a Type3 glyph
-procedure or a soft mask) has no bound but pdfium's own, so an allocation
-larger than the margin is not excluded for it.
+whose memory is capped (:mod:`datagrunt.pdf._memory_cap`: a watchdog on
+every platform, and a backstop on Linux and Windows), because pdfium decodes
+what the object walk cannot see (soft masks, patterns, Type3 glyph
+procedures) and an image within A2's bounds can still cost ~1.7 GiB to
+decode. A worker past its cap ends, and its page is a :class:`RenderFailed`
+saying so.
 
 The worker is a plain subprocess, ``python -I -c BOOTSTRAP``, started by
-the launcher the page workers share (:mod:`datagrunt.pdf._process`, worker
-key ``"render"``): it never imports the caller's main module, so a caller's
-script runs once, however it is written; ``-I`` keeps the caller's working
-directory and ``PYTHON*`` environment out of it; the bootstrap installs the
-caller's exact ``sys.path``, sent with the request.
+the launcher the page and figure workers share
+(:mod:`datagrunt.pdf._process`, worker key ``"render"``): it never imports
+the caller's main module, so a caller's script runs once, however it is
+written; ``-I`` keeps the caller's working directory and ``PYTHON*``
+environment out of it; the bootstrap installs the caller's exact
+``sys.path``, sent with the request.
 
 The request (with ``sys.path`` and the password) is one JSON message on
 the worker's stdin, never in its argv or environment. The worker replies
 on its stdout in length-prefixed raw bytes, which a stray print cannot
-corrupt. Nothing is pickled either way: the parent decodes nothing but
-bytes from a worker (which parses hostile PDFs), each message within a
-bound. The worker's stderr is drained by a thread into a 4 KiB ring
+corrupt. Nothing is pickled either way: the caller decodes nothing but
+bytes from a worker (which parses PDFs from anywhere), each message within
+a bound. The worker's stderr is drained by a thread into a 4 KiB ring
 (:class:`~datagrunt.pdf._process.StderrTail`: nothing is written to disk),
 joined within a bound on every path; a failure without a reply ends with
 its last 4 KiB.
@@ -128,30 +81,23 @@ worker caps its memory once, opens the document once, then guards and
 draws each page in turn, from a load of its own, and replies for each in
 order. The cap is per worker and one timeout covers the whole batch. A page
 refused or failed is that page's outcome and the batch goes on; a worker
-that ends (its cap, the timeout, a crash) fails every page it had not
-answered, each with why. Every page's pixels are held at once: the caller
-bounds the batch (at most :data:`MAX_BATCH_PAGES` pages).
+that ends (its cap, the timeout, an unexpected exit) fails every page it
+had not answered, each with why. Every page's pixels are held at once: the
+caller bounds the batch (at most :data:`MAX_BATCH_PAGES` pages).
 """
 
-import ctypes
 import math
-import mmap
 import os
 import struct
 import subprocess
-import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
 from functools import partial
 from typing import IO, NamedTuple
 
-import pypdfium2 as pdfium
-import pypdfium2.raw as pdfium_c
-
-from datagrunt.pdf._pdfium_images import read_filters
+from datagrunt.pdf._memory_cap import ending as _worker_ending
 from datagrunt.pdf._process import MAX_REQUEST_BYTES as _MAX_REQUEST_BYTES
 from datagrunt.pdf._process import (
     REAP_TIMEOUT_S,
@@ -165,33 +111,15 @@ from datagrunt.pdf._process import (
     worker_command,
 )
 from datagrunt.pdf._process import read_message as _read_message
-from datagrunt.pdf._process import send_message as _send
+from datagrunt.pdf._validate import checked_password as _checked_password
+from datagrunt.pdf._validate import checked_path as _checked_path
 from datagrunt.pdf._validate import int_at_least, positive_float, strict_bool
-from datagrunt.pdf.elements import _MAX_ASSET_BYTES
 from datagrunt.pdf.exceptions import DatagruntPDFError
-from datagrunt.pdf.pdfium_engine import (
-    DocumentHandle,
-    PageGeometry,
-    _checked_password,
-    _checked_path,
-    _page_objects,
-    image_refusal,
-    loaded_page,
-    open_document,
-)
-
-if sys.platform != "win32":
-    import resource
 
 # The spec's construction checks (PDFReader / PDFWriter): dpi >= 36, max_render_pixels >= 512 x 512.
 _MIN_TARGET_DPI = 36
 _MIN_RENDER_PIXELS = 262_144
 _POINTS_PER_INCH = 72.0
-
-# The objects (forms' contents included) the guard walks before it refuses a
-# page: ~250 times the corpus's busiest page (3,977). The walk costs ~0.4 us
-# an object here, so the bound is about half a second of guard.
-_MAX_GUARD_OBJECTS = 1_000_000
 
 # A worker's replies, raw bytes, each message after its 8-byte length: a kind
 # byte, then a UTF-8 message (refused, failed) or the pixel size, followed by
@@ -200,44 +128,14 @@ _PIXELS, _REFUSED, _FAILED = b"P", b"R", b"F"
 _PIXEL_SIZE = struct.Struct("<QQ")
 _MAX_STATUS_BYTES = 1 << 20
 
-# A worker's exit codes: it reached its memory cap; its watchdog outlived its
-# own deadline (the parent's timeout, which starts first, kills it before);
-# its watchdog could not read its peak RSS (the worker never draws unwatched).
-_CAP_EXIT = 86
-_DEADLINE_EXIT = 87
-_WATCH_FAILED_EXIT = 88
-
 _EXIT_GRACE_S = 1.0  # a worker that closed its pipe without a reply is given this to exit
-_WATCH_INTERVAL_S = 0.005
-_WATCH_START_S = 5.0  # the watchdog's first reading is taken within this, or the page is not rendered
-_MAX_PROC_FILE_BYTES = 1 << 16  # /proc/self/status is ~1.5 KB
-_CAPPED_PLATFORMS = ("linux", "darwin", "win32")
-
-# The backstop's margin over the cap (Linux's RLIMIT_AS, Windows' commit limit; see the module notes): a filter's
-# output ahead of the image codec is at most 4 times the asset limit in one allocation.
-_BACKSTOP_MARGIN_BYTES = 4 * _MAX_ASSET_BYTES
-
-_WHITE = 0xFFFFFFFF
-# Gray output and nothing else: no FPDF_ANNOT (annotations are not drawn), no LCD text, no printing mode.
-_RENDER_FLAGS = pdfium_c.FPDF_GRAYSCALE
 
 # The pages one render_pages call draws, at most: each page's pixels are held at once.
 MAX_BATCH_PAGES = 64
 
-
-class _Format(NamedTuple):
-    """How a page is drawn: bytes a pixel, pdfium's bitmap format and render flags, and the format's name."""
-
-    channels: int
-    bitmap: int
-    flags: int
-    name: str
-
-
-_GRAY = _Format(1, pdfium_c.FPDFBitmap_Gray, _RENDER_FLAGS, "gray")
-# Colour, and nothing else: no flag (no annotations, no LCD text, no printing mode).
-_BGR = _Format(3, pdfium_c.FPDFBitmap_BGR, 0, "BGR")
-_CHANNELS = (_GRAY.channels, _BGR.channels)
+# Bytes a pixel: 8-bit gray, and 24-bit BGR (``colour``), named in a size's words.
+GRAY_CHANNELS, BGR_CHANNELS = 1, 3
+_CHANNELS = (GRAY_CHANNELS, BGR_CHANNELS)
 
 
 class RenderRefused(DatagruntPDFError):
@@ -332,176 +230,6 @@ def effective_dpi(target_dpi: int, max_render_pixels: int, width_pt: float, heig
     if height_px < 1:
         raise RenderRefused(f"{page} renders 0 px tall at {dpi} DPI")
     return dpi
-
-
-@contextmanager
-def _guarded_page(
-    source: str | os.PathLike[str], page_index: int, password: str | None
-) -> Iterator[tuple[pdfium.PdfPage, PageGeometry]]:
-    """The loaded page at ``page_index`` with its geometry, once the image guard passes it.
-
-    The guard and the render that follows share this one load of the page.
-    The document and page are closed on leaving.
-
-    Raises:
-        RenderRefused: If :func:`~datagrunt.pdf.pdfium_engine.image_refusal`
-            refuses the page; nothing is yielded.
-        FileNotFoundError, PermissionError, PDFEncryptedError, PDFCorruptError,
-        IndexError: As :func:`~datagrunt.pdf.pdfium_engine.open_document` and
-            :func:`~datagrunt.pdf.pdfium_engine.loaded_page` raise them.
-    """
-    with open_document(source, password=password) as handle, _guarded(handle, page_index) as loaded:
-        yield loaded
-
-
-@contextmanager
-def _guarded(handle: DocumentHandle, page_index: int) -> Iterator[tuple[pdfium.PdfPage, PageGeometry]]:
-    """The page at ``page_index`` of the open document, loaded, once the image guard passes it; closed on leaving.
-
-    Raises:
-        RenderRefused: If the guard refuses the page; nothing is yielded.
-        IndexError, PDFCorruptError: As
-            :func:`~datagrunt.pdf.pdfium_engine.loaded_page` raises them.
-    """
-    with loaded_page(handle, page_index) as (page, geometry):
-        refusal = image_refusal(page, geometry, max_objects=_MAX_GUARD_OBJECTS)
-        if refusal is not None:
-            raise RenderRefused(f"page {geometry.page_number}: {refusal}; the page is not rendered")
-        yield page, geometry
-
-
-class _Bitmap(NamedTuple):
-    """A page drawn in this process: its size, its pixels (unpadded rows) in anonymous memory, and bytes a pixel."""
-
-    width: int
-    height: int
-    pixels: mmap.mmap
-    channels: int = 1
-
-
-def _render_guarded(source: str | os.PathLike[str], page_index: int, dpi: int, password: str | None) -> _Bitmap:
-    """Guard the page, then draw it at ``dpi`` from the same load, in this process.
-
-    The worker calls this under its memory cap; never call it outside one.
-
-    Raises:
-        RenderRefused: If the guard refuses the page, or it draws under one
-            pixel across at ``dpi``; nothing is drawn.
-        RenderFailed: If pdfium cannot make or fill the bitmap.
-        MemoryError: If the bitmap cannot be mapped (a memory cap).
-    """
-    with _guarded_page(source, page_index, password) as (page, geometry):
-        return _draw(page, geometry, dpi)
-
-
-def _draw(page: pdfium.PdfPage, geometry: PageGeometry, dpi: int, *, colour: bool = False) -> _Bitmap:
-    """Draw the loaded page at ``dpi`` on white, in 8-bit gray (24-bit BGR if ``colour``), without its annotations."""
-    drawn = _BGR if colour else _GRAY
-    width, height = render_size(geometry.width_pt, geometry.height_pt, dpi)
-    if width < 1 or height < 1:
-        message = f"page {geometry.page_number} renders {width} x {height} px at {dpi} DPI; the page is not rendered"
-        raise RenderRefused(message)
-    stride = width * drawn.channels  # unpadded rows
-    pixels = _blank(stride * height)
-    buffer = (ctypes.c_ubyte * (stride * height)).from_buffer(pixels)
-    bitmap = pdfium_c.FPDFBitmap_CreateEx(width, height, drawn.bitmap, buffer, stride)
-    if not bitmap:
-        raise RenderFailed(f"page {geometry.page_number}: pdfium cannot make a {width} x {height} {drawn.name} bitmap")
-    try:
-        if not pdfium_c.FPDFBitmap_FillRect(bitmap, 0, 0, width, height, _WHITE):
-            raise RenderFailed(f"page {geometry.page_number}: pdfium cannot fill a {width} x {height} bitmap")
-        _decode_jbig2_first(page, geometry.page_number)
-        # Rotation 0 draws the page as displayed (its /Rotate applied), filling the bitmap.
-        pdfium_c.FPDF_RenderPageBitmap(bitmap, page.raw, 0, 0, width, height, 0, drawn.flags)
-    finally:
-        pdfium_c.FPDFBitmap_Destroy(bitmap)
-    del buffer  # releases the mapping's export, so it can be sent and closed
-    return _Bitmap(width, height, pixels, drawn.channels)
-
-
-def _decode_jbig2_first(page: pdfium.PdfPage, page_number: int) -> int:
-    """Decode each JBIG2 image the guard's walk reaches on its own, then free it; how many.
-
-    Walks :func:`~datagrunt.pdf.pdfium_engine._page_objects` within
-    :data:`_MAX_GUARD_OBJECTS` (forms included), as the guard did. The
-    worker calls this under its memory cap, with the page's bitmap mapped.
-
-    Raises:
-        RenderFailed: If pdfium cannot decode one (named by its walk index).
-        PdfiumFailure: If an image's filters cannot be read.
-    """
-    decoded = 0
-    for index, (item, _form) in enumerate(_page_objects(page.raw, max_objects=_MAX_GUARD_OBJECTS)):
-        if pdfium_c.FPDFPageObj_GetType(item) != pdfium_c.FPDF_PAGEOBJ_IMAGE:
-            continue
-        if "JBIG2Decode" not in read_filters(item, f"object {index}"):
-            continue
-        bitmap = pdfium_c.FPDFImageObj_GetBitmap(item)
-        if not bitmap:
-            raise RenderFailed(
-                f"page {page_number}: pdfium cannot decode JBIG2 image object {index} in the render worker; "
-                "the page is not rendered"
-            )
-        pdfium_c.FPDFBitmap_Destroy(bitmap)
-        decoded += 1
-    return decoded
-
-
-def _render_loaded(handle: DocumentHandle, page_index: int, dpi: int, *, colour: bool, without_text: bool) -> _Bitmap:
-    """Guard the page of the open document, remove its text if asked, then draw it from the same load.
-
-    The batch worker calls this under its memory cap; never call it outside one.
-
-    Raises:
-        RenderRefused: If the guard refuses the page, or it draws under one pixel across at ``dpi``.
-        RenderFailed: If pdfium cannot remove a text object, or make or fill the bitmap.
-        MemoryError: If the bitmap cannot be mapped (a memory cap).
-    """
-    with _guarded(handle, page_index) as (page, geometry):
-        if without_text:
-            _remove_text(page, geometry.page_number)
-        return _draw(page, geometry, dpi, colour=colour)
-
-
-def _remove_text(page: pdfium.PdfPage, page_number: int) -> int:
-    """Remove every text object from the loaded page, forms' included; how many. In this load only: nothing is saved.
-
-    Walks the guard's walk (:func:`~datagrunt.pdf.pdfium_engine._page_objects`
-    within :data:`_MAX_GUARD_OBJECTS`), so it is bounded by the page the guard
-    passed. Each removed object is destroyed (pdfium hands it to the caller).
-
-    Raises:
-        RenderFailed: If pdfium cannot remove a text object (named by its walk index).
-    """
-    objects = _page_objects(page.raw, max_objects=_MAX_GUARD_OBJECTS)
-    removed = 0
-    for index, (item, form) in enumerate(objects):  # bounded: the walk's objects
-        if pdfium_c.FPDFPageObj_GetType(item) != pdfium_c.FPDF_PAGEOBJ_TEXT:
-            continue
-        if form < 0:
-            done = pdfium_c.FPDFPage_RemoveObject(page.raw, item)
-        else:
-            done = pdfium_c.FPDFFormObj_RemoveObject(objects[form][0], item)
-        if not done:
-            raise RenderFailed(
-                f"page {page_number}: pdfium cannot remove text object {index}; the page is not rendered"
-            )
-        pdfium_c.FPDFPageObj_Destroy(item)
-        removed += 1
-    return removed
-
-
-def _blank(size: int) -> mmap.mmap:
-    """``size`` bytes of anonymous memory, mapped but untouched: pdfium writes them with the GIL released.
-
-    A ``bytearray`` would be zeroed here, holding the GIL, out of the macOS
-    watchdog's sight.
-    """
-    try:
-        return mmap.mmap(-1, size)
-    except OSError as exc:
-        # Linux refuses a mapping past RLIMIT_AS, and Windows one past the Job Object's commit limit.
-        raise MemoryError(f"cannot map {size} bytes for the bitmap: {exc}") from exc
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -655,7 +383,7 @@ def render_pages(
     worker's and ``timeout_s`` covers the whole batch, the worker's start
     included. A page the guard refuses is its :class:`RenderRefused`, a page
     that fails (unloadable, past the last) its :class:`RenderFailed`, and the
-    batch goes on. When the worker ends (its cap, the timeout, a crash), no
+    batch goes on. When the worker ends (its cap, the timeout, an unexpected exit), no
     worker can start, or the PDF cannot be opened, every page not yet
     answered is a :class:`RenderFailed` saying why. Nothing else is raised.
 
@@ -713,11 +441,11 @@ def _run_batch(request: _BatchRequest) -> tuple[list[_Reply], bool, int | None, 
             drain its stderr, the OS refuses), or the request is over its bound.
     """
     try:
-        command = worker_command("a render worker")
+        command = worker_command()
     except NoInterpreter as exc:
         raise RenderFailed(str(exc)) from exc
     payload = _batch_payload(request)
-    count, channels = len(request.pages), (_BGR if request.colour else _GRAY).channels
+    count, channels = len(request.pages), BGR_CHANNELS if request.colour else GRAY_CHANNELS
     deadline = time.monotonic() + request.timeout_s
     worker, stderr = _started(command, "")
     exchange = partial(_exchange_batch, worker.stdin, worker.stdout, payload, request.memory_cap_bytes, channels, count)
@@ -765,7 +493,7 @@ def _page_outcome(reply: _Reply, source: str, where: str) -> RenderedPage | Rend
 def _worker_command(where: str) -> list[str]:
     """The worker's command line, which holds nothing of the request; RenderFailed if there is no interpreter."""
     try:
-        return worker_command("a render worker")
+        return worker_command()
     except NoInterpreter as exc:
         raise RenderFailed(f"{where}: {exc}") from exc
 
@@ -850,7 +578,7 @@ def _exchange(
     try:
         stdin.write(payload)
         stdin.close()
-        return _read_reply(stdout, memory_cap_bytes, _GRAY.channels)
+        return _read_reply(stdout, memory_cap_bytes, GRAY_CHANNELS)
     except _Malformed as exc:
         return _Reply(_FAILED, str(exc), None)
     except (OSError, MessageTooLong):  # the worker stopped reading (it died, or was killed), or overran a bound
@@ -944,7 +672,7 @@ def _pixel_size(header: bytes, memory_cap_bytes: int, channels: int) -> tuple[in
 
 def _px(width: int, height: int, channels: int) -> str:
     """A render's size in words: ``"3 x 2 px"``, and ``"3 x 2 px BGR"`` in colour."""
-    return f"{width} x {height} px" + (f" {_BGR.name}" if channels == _BGR.channels else "")
+    return f"{width} x {height} px" + (" BGR" if channels == BGR_CHANNELS else "")
 
 
 def _outcome(reply: _Reply | None, timed_out: bool, exitcode: int | None, request: _Request, tail: str) -> RenderedPage:
@@ -963,344 +691,4 @@ def _ending(exitcode: int | None, timed_out: bool, request: _Request | _BatchReq
     """Why a worker ended without a whole reply."""
     if timed_out:
         return f"the render timed out after {request.timeout_s} s; its worker was killed"
-    if exitcode is None:
-        return "the render worker ended without a reply and could not be reaped"
-    if exitcode == _CAP_EXIT:
-        return f"the render worker reached its {request.memory_cap_bytes}-byte memory cap and was ended"
-    if exitcode == _WATCH_FAILED_EXIT:
-        return "the render worker's memory watchdog could not read its peak RSS and ended it"
-    if exitcode < 0:
-        return f"the render worker was killed by signal {-exitcode}"
-    return f"the render worker exited with code {exitcode} without a reply"
-
-
-def _worker_main(message: object, replies: IO[bytes]) -> None:
-    """The render worker, run by _BOOTSTRAP: one request in, one reply out on ``replies``, as raw bytes.
-
-    A request holding ``pages`` is a batch (:func:`_batch_main`). It caps its
-    own memory before it opens the PDF. Reaching the cap (a MemoryError)
-    ends it with ``_CAP_EXIT`` and no reply; a refusal and any other error
-    are sent back as messages, never swallowed.
-    """
-    if isinstance(message, dict) and "pages" in message:
-        _batch_main(message, replies)
-        return
-    try:
-        request = _request_from(message)
-        _apply_memory_cap(request.memory_cap_bytes, request.timeout_s)
-        bitmap = _render_guarded(request.source, request.page_index, request.dpi, request.password)
-    except MemoryError:
-        os._exit(_CAP_EXIT)
-    except RenderRefused as exc:
-        _send(replies, _REFUSED + str(exc).encode("utf-8", errors="backslashreplace"))
-        return
-    except Exception as exc:  # every other failure reaches the parent, as a RenderFailed
-        _send(replies, _FAILED + f"{type(exc).__name__}: {exc}".encode("utf-8", errors="backslashreplace"))
-        return
-    _send(replies, _PIXELS + _PIXEL_SIZE.pack(bitmap.width, bitmap.height))
-    _send(replies, bitmap.pixels)
-
-
-def _batch_main(message: dict[str, object], replies: IO[bytes]) -> None:
-    """The batch worker: a batch in; each page's reply (its pixels after it) out on ``replies``, in order.
-
-    It caps its own memory once, before it opens the PDF, then opens it once.
-    Reaching the cap ends it with ``_CAP_EXIT``: the parent fails the pages
-    not yet answered. A batch it cannot read is one failure; a PDF it cannot
-    open fails each page with the reason. Nothing is swallowed.
-    """
-    try:
-        request = _batch_request_from(message)
-    except Exception as exc:  # sent, never swallowed: the parent fails the batch's pages
-        _send(replies, _failure(exc))
-        return
-    sent = 0
-    try:
-        _apply_memory_cap(request.memory_cap_bytes, request.timeout_s)
-        with open_document(request.source, password=request.password) as handle:
-            for index, dpi in request.pages:  # bounded: at most MAX_BATCH_PAGES
-                _send_page(replies, handle, index, dpi, request)
-                sent += 1
-    except MemoryError:
-        os._exit(_CAP_EXIT)
-    except Exception as exc:  # no page left can be drawn (the PDF cannot be opened): each fails with it
-        for _ in request.pages[sent:]:
-            _send(replies, _failure(exc))
-
-
-def _send_page(replies: IO[bytes], handle: DocumentHandle, index: int, dpi: int, request: _BatchRequest) -> None:
-    """Draw one page of the batch and send its reply; a refusal or failure is its reply, and the batch goes on.
-
-    A MemoryError (the cap) is raised: it ends the worker.
-    """
-    try:
-        bitmap = _render_loaded(handle, index, dpi, colour=request.colour, without_text=request.without_text)
-    except MemoryError:
-        raise
-    except RenderRefused as exc:
-        _send(replies, _REFUSED + str(exc).encode("utf-8", errors="backslashreplace"))
-        return
-    except Exception as exc:  # this page's failure, sent to the parent
-        _send(replies, _failure(exc))
-        return
-    with bitmap.pixels:  # unmapped once sent: a batch holds one page's pixels at a time
-        _send(replies, _PIXELS + _PIXEL_SIZE.pack(bitmap.width, bitmap.height))
-        _send(replies, bitmap.pixels)
-
-
-def _failure(exc: Exception) -> bytes:
-    """A failed reply naming ``exc``: its type and message."""
-    return _FAILED + f"{type(exc).__name__}: {exc}".encode("utf-8", errors="backslashreplace")
-
-
-def _request_from(message: object) -> _Request:
-    """The request a worker reads (JSON from its parent), its fields checked as render_page checks them."""
-    if not isinstance(message, dict):
-        raise TypeError(f"the worker's request must be a dict, got {type(message).__name__}")
-    if set(message) != set(_REQUEST_FIELDS):
-        raise ValueError(f"the worker's request must hold exactly {_REQUEST_FIELDS}, got {sorted(message)}")
-    return _Request(
-        source=str(_checked_path(message["source"], "source")),
-        page_index=int_at_least("page_index", message["page_index"], 0),
-        dpi=int_at_least("dpi", message["dpi"], 1),
-        password=_checked_password(message["password"]),
-        memory_cap_bytes=int_at_least("memory_cap_bytes", message["memory_cap_bytes"], 1),
-        timeout_s=positive_float("timeout_s", message["timeout_s"]),
-    )
-
-
-def _batch_request_from(message: dict[str, object]) -> _BatchRequest:
-    """The batch a worker reads (JSON from its parent), its fields checked as render_pages checks them."""
-    if set(message) != set(_BATCH_FIELDS):
-        raise ValueError(f"the batch request must hold exactly {_BATCH_FIELDS}, got {sorted(message)}")
-    return _BatchRequest(
-        source=str(_checked_path(message["source"], "source")),
-        pages=_checked_pages(message["pages"], list),
-        password=_checked_password(message["password"]),
-        memory_cap_bytes=int_at_least("memory_cap_bytes", message["memory_cap_bytes"], 1),
-        timeout_s=positive_float("timeout_s", message["timeout_s"]),
-        colour=strict_bool("colour", message["colour"]),
-        without_text=strict_bool("without_text", message["without_text"]),
-    )
-
-
-def _apply_memory_cap(cap_bytes: int, timeout_s: float) -> None:
-    """Cap this worker's peak RSS at ``cap_bytes`` over its peak now; call it in a worker only.
-
-    The watchdog starts first, on every platform; then Linux and Windows set
-    their backstop at ``cap_bytes`` plus :data:`_BACKSTOP_MARGIN_BYTES` over
-    what the worker holds then (see the module notes).
-
-    Raises:
-        OSError: On a platform with no cap here, or when the peak RSS cannot
-            be read (or the watchdog takes no first reading): the page is not
-            rendered uncapped.
-        RuntimeError: If the watchdog's thread cannot start.
-    """
-    if sys.platform not in _CAPPED_PLATFORMS:
-        raise OSError(f"no memory cap is implemented for platform {sys.platform!r}; the page is not rendered")
-    _watch_peak_rss(_peak_rss_bytes() + cap_bytes, time.monotonic() + timeout_s)
-    backstop = cap_bytes + _BACKSTOP_MARGIN_BYTES
-    if sys.platform == "linux":
-        _cap_address_space(backstop)
-    elif sys.platform == "win32":
-        _cap_commit(backstop)
-
-
-def _cap_address_space(backstop_bytes: int) -> None:
-    """Linux: limit this process's address space (RLIMIT_AS, soft and hard) to what it maps now plus ``backstop_bytes``.
-
-    Past it the kernel refuses every new mapping: malloc returns NULL, Python
-    raises MemoryError, mmap fails. Lowering the hard limit too means nothing
-    in the worker can lift it again.
-    """
-    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
-    limit = _address_space_limit(_mapped_bytes(), backstop_bytes, soft, hard)
-    resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
-
-
-def _address_space_limit(mapped: int, cap_bytes: int, soft: int, hard: int) -> int:
-    """``mapped + cap_bytes``, never above a limit already set (``RLIM_INFINITY``: none)."""
-    limits = [mapped + cap_bytes] + [limit for limit in (soft, hard) if limit != resource.RLIM_INFINITY]
-    return min(limits)
-
-
-def _mapped_bytes() -> int:
-    """Linux: this process's mapped address space (VmSize) in bytes, from /proc/self/statm."""
-    with open("/proc/self/statm", "rb") as statm:
-        pages = int(statm.read(_MAX_PROC_FILE_BYTES).split()[0])
-    return pages * os.sysconf("SC_PAGE_SIZE")
-
-
-def _peak_rss_bytes() -> int:
-    """This process's peak resident set size in bytes (Linux, macOS and Windows).
-
-    Linux reads VmHWM: its ru_maxrss survives fork + exec, so a spawned
-    worker would read its parent's peak. macOS's ru_maxrss is bytes, reset
-    at exec. Windows reads PeakWorkingSetSize (``GetProcessMemoryInfo``).
-
-    Raises:
-        OSError: If the peak cannot be read, or on another platform.
-    """
-    if sys.platform == "linux":
-        with open("/proc/self/status", "rb") as status:
-            for line in status.read(_MAX_PROC_FILE_BYTES).splitlines():
-                if line.startswith(b"VmHWM:"):
-                    return int(line.split()[1]) * 1024
-        raise OSError("no VmHWM line in /proc/self/status")
-    if sys.platform == "darwin":
-        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    if sys.platform == "win32":
-        return _memory_counters().PeakWorkingSetSize
-    raise OSError(f"no peak RSS reader for platform {sys.platform!r}")
-
-
-def _watch_peak_rss(limit_bytes: int, deadline: float) -> None:
-    """End this process once its peak RSS passes ``limit_bytes``, or at ``deadline``; return once it has read it.
-
-    A daemon thread polls every 5 ms and exits the process with
-    ``_CAP_EXIT`` (past the limit), ``_DEADLINE_EXIT``, or
-    ``_WATCH_FAILED_EXIT`` (a reading failed). It reads the peak, not the
-    current RSS, so a spike between two polls still ends the process. This
-    returns once the thread has taken its first reading, which maps the
-    thread's stack and allocator arena.
-
-    Raises:
-        RuntimeError: If the thread cannot start.
-        OSError: If the thread takes no reading within ``_WATCH_START_S``.
-    """
-    watching = threading.Event()
-
-    def watch() -> None:
-        while time.monotonic() < deadline:  # bounded: by the deadline
-            if _watched_peak() > limit_bytes:
-                os._exit(_CAP_EXIT)
-            watching.set()
-            time.sleep(_WATCH_INTERVAL_S)
-        os._exit(_DEADLINE_EXIT)
-
-    threading.Thread(target=watch, name="datagrunt-pdf-render-watchdog", daemon=True).start()
-    if not watching.wait(_WATCH_START_S):
-        raise OSError(f"the memory watchdog took no reading within {_WATCH_START_S} s; the page is not rendered")
-
-
-def _watched_peak() -> int:
-    """The watchdog's reading of this process's peak RSS; a reading that fails ends the process.
-
-    The failure is written to stderr (its tail ends the parent's RenderFailed),
-    then the process exits with ``_WATCH_FAILED_EXIT``: never swallowed.
-    """
-    try:
-        return _peak_rss_bytes()
-    except Exception as exc:  # the worker never draws unwatched: it ends, saying why
-        try:
-            why = f"the memory watchdog cannot read this process's peak RSS: {type(exc).__name__}: {exc}\n"
-            os.write(2, why.encode("utf-8", errors="backslashreplace"))
-        finally:
-            os._exit(_WATCH_FAILED_EXIT)
-
-
-class _BasicLimits(ctypes.Structure):
-    """JOBOBJECT_BASIC_LIMIT_INFORMATION (winnt.h)."""
-
-    _fields_ = (
-        ("PerProcessUserTimeLimit", ctypes.c_int64),
-        ("PerJobUserTimeLimit", ctypes.c_int64),
-        ("LimitFlags", ctypes.c_uint32),
-        ("MinimumWorkingSetSize", ctypes.c_size_t),
-        ("MaximumWorkingSetSize", ctypes.c_size_t),
-        ("ActiveProcessLimit", ctypes.c_uint32),
-        ("Affinity", ctypes.c_size_t),
-        ("PriorityClass", ctypes.c_uint32),
-        ("SchedulingClass", ctypes.c_uint32),
-    )
-
-
-class _ExtendedLimits(ctypes.Structure):
-    """JOBOBJECT_EXTENDED_LIMIT_INFORMATION (winnt.h), its IO_COUNTERS as six 64-bit counts."""
-
-    _fields_ = (
-        ("BasicLimitInformation", _BasicLimits),
-        ("IoInfo", ctypes.c_uint64 * 6),
-        ("ProcessMemoryLimit", ctypes.c_size_t),
-        ("JobMemoryLimit", ctypes.c_size_t),
-        ("PeakProcessMemoryUsed", ctypes.c_size_t),
-        ("PeakJobMemoryUsed", ctypes.c_size_t),
-    )
-
-
-class _MemoryCounters(ctypes.Structure):
-    """PROCESS_MEMORY_COUNTERS_EX (psapi.h)."""
-
-    _fields_ = (
-        ("cb", ctypes.c_uint32),
-        ("PageFaultCount", ctypes.c_uint32),
-        ("PeakWorkingSetSize", ctypes.c_size_t),
-        ("WorkingSetSize", ctypes.c_size_t),
-        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-        ("QuotaPagedPoolUsage", ctypes.c_size_t),
-        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-        ("PagefileUsage", ctypes.c_size_t),
-        ("PeakPagefileUsage", ctypes.c_size_t),
-        ("PrivateUsage", ctypes.c_size_t),
-    )
-
-
-_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9  # JOBOBJECTINFOCLASS
-_JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x100
-_SIZE_MAX = (1 << (8 * ctypes.sizeof(ctypes.c_size_t))) - 1
-
-
-def _memory_counters() -> _MemoryCounters:
-    """Windows: this process's memory counters (``GetProcessMemoryInfo``). Untested: no test runs on Windows.
-
-    Raises:
-        OSError: Off Windows, or if the call fails (its WinError).
-    """
-    if sys.platform != "win32":
-        raise OSError("GetProcessMemoryInfo reads a Windows process only")
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
-    kernel32.K32GetProcessMemoryInfo.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32)
-    counters = _MemoryCounters(cb=ctypes.sizeof(_MemoryCounters))
-    if not kernel32.K32GetProcessMemoryInfo(kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
-        raise ctypes.WinError(ctypes.get_last_error())
-    return counters
-
-
-def _commit_limit(private: int, extra: int, size_max: int) -> int:
-    """``private + extra`` bytes, at most ``size_max``: a 32-bit size_t field never holds a wrapped (lower) limit."""
-    return min(private + extra, size_max)
-
-
-def _cap_commit(backstop_bytes: int) -> None:
-    """Windows: put this process in a new Job Object limiting its commit to what it commits now plus ``backstop_bytes``.
-
-    Past it the kernel refuses every commit (VirtualAlloc fails, Python
-    raises MemoryError), as RLIMIT_AS does on Linux. Jobs nest (Windows 8
-    and later), so this works inside a CI runner's or terminal's job. No
-    test runs on Windows: this is untested.
-    """
-    if sys.platform != "win32":
-        raise OSError("a Job Object caps a Windows process only")
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
-    kernel32.CreateJobObjectW.restype = ctypes.c_void_p
-    kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p)
-    kernel32.SetInformationJobObject.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32)
-    kernel32.AssignProcessToJobObject.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
-    process = kernel32.GetCurrentProcess()
-    limits = _ExtendedLimits()
-    limits.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_PROCESS_MEMORY
-    limits.ProcessMemoryLimit = _commit_limit(_memory_counters().PrivateUsage, backstop_bytes, _SIZE_MAX)
-    job = kernel32.CreateJobObjectW(None, None)
-    if not job:
-        raise ctypes.WinError(ctypes.get_last_error())
-    information = ctypes.byref(limits)
-    if not kernel32.SetInformationJobObject(
-        job, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, information, ctypes.sizeof(limits)
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
-    if not kernel32.AssignProcessToJobObject(job, process):
-        raise ctypes.WinError(ctypes.get_last_error())
+    return _worker_ending(exitcode, "the render worker", request.memory_cap_bytes)

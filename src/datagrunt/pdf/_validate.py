@@ -6,7 +6,9 @@ Every message names the offending field so construction errors are actionable.
 """
 
 import math
+import os
 import re
+from pathlib import Path
 from typing import TypeVar
 
 _T = TypeVar("_T")
@@ -159,3 +161,27 @@ def ordered_interval(name: str, value: object) -> tuple[float, float]:
     if start > end:
         raise ValueError(f"{name} must have start <= end, got {(start, end)!r}")
     return start, end
+
+
+def checked_path(path: object, name: str = "path") -> Path:
+    """Return ``path`` as a Path; bytes are refused (pypdfium2 reads them as PDF data)."""
+    if not isinstance(path, (str, os.PathLike)):
+        raise TypeError(f"{name} must be a str or os.PathLike, got {type(path).__name__}")
+    text = os.fspath(path)
+    if not isinstance(text, str):
+        raise TypeError(f"{name} must be a str or os.PathLike, got a {type(text).__name__} path")
+    return Path(text)
+
+
+def checked_password(password: object) -> str | None:
+    """Return ``password`` if it is None or a str pdfium can read whole."""
+    if password is None:
+        return None
+    # Name the type only: a password must never reach an error message.
+    if not isinstance(password, str):
+        raise TypeError(f"password must be a str or None, got {type(password).__name__}")
+    # pypdfium2 hands the password to pdfium as a NUL-terminated C string: an
+    # embedded NUL would silently truncate it to a different password.
+    if "\x00" in password:
+        raise ValueError("password must not contain NUL: pdfium would read only the part before it")
+    return password

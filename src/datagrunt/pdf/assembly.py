@@ -3,9 +3,9 @@
 Internal: not exported from ``datagrunt`` or ``datagrunt.pdf``. Pure: it
 reads A2's raw facts (:class:`~datagrunt.pdf.pdfium_engine.RawPage`), A3's
 assessment and A4a's lattice tables, and calls no pdfium function. A
-figure's bytes come from an
-:class:`~datagrunt.pdf.pdfium_engine.ImageLoader`, which assembly binds and
-never calls: nothing is decoded until a caller reads the figure.
+figure's bytes come from a :class:`~datagrunt.pdf._loaders.FigureRead`,
+which assembly binds and never calls: nothing is decoded until a caller
+reads the figure, and then in a capped figure worker.
 
 :func:`assemble_page` makes the A1 :class:`~datagrunt.pdf.elements.Page`
 of a digital or hybrid page (see its notes): its figures
@@ -48,6 +48,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TypedDict, get_args
 
+from datagrunt.pdf._loaders import FigureRead
+from datagrunt.pdf._options import MIN_IMAGE_DIMENSION
 from datagrunt.pdf._pdfium_common import Box
 from datagrunt.pdf._validate import int_at_least, sha256_hex, str_tuple, typed_tuple
 from datagrunt.pdf.elements import (
@@ -80,7 +82,6 @@ from datagrunt.pdf.layout import (
     page_layout,
 )
 from datagrunt.pdf.pdfium_engine import (
-    ImageLoader,
     ImageStats,
     PageGeometry,
     PageImages,
@@ -91,6 +92,7 @@ from datagrunt.pdf.pdfium_engine import (
 from datagrunt.pdf.quality import PageAssessment, SpanPiece
 
 __all__ = [
+    "MIN_IMAGE_DIMENSION",
     "FigureDraft",
     "PageFigures",
     "assemble_page",
@@ -102,8 +104,6 @@ __all__ = [
     "raw_page_warnings",
 ]
 
-# v4's default minimum image side in pixels (core.pdf_io.extraction.config._DEFAULT_MIN_IMAGE_DIMENSION).
-MIN_IMAGE_DIMENSION = 40
 
 # The only hidden reason a figure can carry: images have no font, paint mode or alpha A3 reads.
 _OFF_PAGE: tuple[HiddenReason, ...] = ("off_page",)
@@ -142,7 +142,7 @@ class FigureDraft:
     sha256: str
     width_px: int
     height_px: int
-    loader: ImageLoader
+    loader: FigureRead
 
     def __post_init__(self) -> None:
         if not isinstance(self.bbox, BBox):
@@ -153,8 +153,8 @@ class FigureDraft:
         sha256_hex("sha256", self.sha256)
         int_at_least("width_px", self.width_px, 1)
         int_at_least("height_px", self.height_px, 1)
-        if not isinstance(self.loader, ImageLoader):
-            raise TypeError(f"loader must be an ImageLoader, got {type(self.loader).__name__}")
+        if not isinstance(self.loader, FigureRead):
+            raise TypeError(f"loader must be a FigureRead, got {type(self.loader).__name__}")
         if self.loader.raw_sha256 != self.sha256:
             raise ValueError(f"sha256 must be the loader's {self.loader.raw_sha256}, got {self.sha256}")
 
@@ -211,7 +211,7 @@ def page_figures(
 
     Raises:
         TypeError: If an argument is of the wrong type (``source`` as for
-            :class:`~datagrunt.pdf.pdfium_engine.ImageLoader`).
+            :class:`~datagrunt.pdf._loaders.FigureRead`).
         ValueError: If ``min_image_dimension`` is negative, or ``password`` holds a NUL.
     """
     if not isinstance(images, PageImages):
@@ -232,7 +232,7 @@ def page_figures(
         elif size is None:
             unsized.append(item.object_index)
         else:
-            loader = ImageLoader(source=path, page_index=geometry.page_number - 1, image=item, password=password)
+            loader = FigureRead(source=path, page_index=geometry.page_number - 1, image=item, password=password)
             drafts.append(_draft(item, size, loader, geometry))
     warnings = (
         *_image_count_warnings(images.stats),
@@ -250,7 +250,7 @@ def _pixel_size(item: RawImage) -> tuple[int, int] | None:
     return (width, height) if width and height else None
 
 
-def _draft(item: RawImage, size: tuple[int, int], loader: ImageLoader, geometry: PageGeometry) -> FigureDraft:
+def _draft(item: RawImage, size: tuple[int, int], loader: FigureRead, geometry: PageGeometry) -> FigureDraft:
     """The image's draft, placed on the page (see the module notes)."""
     bbox, reasons = _placed(item.bbox, geometry.width_pt, geometry.height_pt)
     return FigureDraft(

@@ -52,7 +52,10 @@ Each method writes the document in one form. A path returned is absolute
   escaped against spreadsheet formula injection. Guarding a spreadsheet
   that opens the CSV is the application's concern.
 - :meth:`PDFWriter.extract_images`: each figure's PNG, through its A1
-  loader (``Figure.read_bytes``), into ``output_dir``. With ``dedupe``
+  loader, into ``output_dir``: an extracted figure's PNGs are read in
+  batches, up to 64 a capped figure worker
+  (:func:`~datagrunt.pdf._loaders.figure_pngs`), as ``Figure.read_bytes``
+  reads one; any other figure by its own ``read_bytes``. With ``dedupe``
   (the default) each distinct ``sha256`` (the raw stream's: a figure's
   identity) is read once, from its first figure, and written once, as
   ``<sha256>.png``; without it, each figure is read and written as
@@ -120,16 +123,17 @@ from typing import Any, BinaryIO
 import polars as pl
 from PIL import Image
 
+from datagrunt.pdf._loaders import figure_pngs
+from datagrunt.pdf._options import MIN_IMAGE_DIMENSION, OcrMode
 from datagrunt.pdf._source import checked_pdf_file
+from datagrunt.pdf._validate import checked_password as _checked_password
+from datagrunt.pdf._validate import checked_path as _checked_path
 from datagrunt.pdf._validate import int_at_least, strict_bool
-from datagrunt.pdf.assembly import MIN_IMAGE_DIMENSION
 from datagrunt.pdf.bundle import _checked_target, _chunks, _drawn, _png, write_bundle
 from datagrunt.pdf.codec import document_to_json_bytes
 from datagrunt.pdf.elements import Figure, Page, PDFDocument
 from datagrunt.pdf.frame import _BBOX_FIELDS, element_frame, utf8_text
-from datagrunt.pdf.pdfium_engine import _checked_password, _checked_path
 from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, extract_document
-from datagrunt.pdf.quality import OcrMode
 from datagrunt.pdf.render import _MIN_TARGET_DPI, RenderedPage, RenderFailed, RenderRefused
 
 __all__ = ["PDFWriter"]
@@ -463,11 +467,14 @@ def _write_figures(figures: tuple[Figure, ...], directory: Path, *, dedupe: bool
     """
     written: list[Path] = []
     tried: set[str] = set()
+    chosen: list[Figure] = []
     for figure in figures:
         if dedupe and figure.sha256 in tried:
             continue
         tried.add(figure.sha256)
-        data, why = _png(figure.read_bytes)
+        chosen.append(figure)
+    for figure, read in zip(chosen, figure_pngs(chosen), strict=True):  # read in batches, each when its turn comes
+        data, why = _png(read)
         if data is None:
             _LOGGER.warning("figure %s (sha256 %s) was not written: %s", figure.element_id, figure.sha256, why)
             continue

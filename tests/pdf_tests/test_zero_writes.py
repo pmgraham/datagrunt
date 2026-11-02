@@ -150,14 +150,14 @@ class TestThePoolWritesNothing:
 
         assert extract_document(path, workers=2, ocr="never") == extract_document(path, ocr="never")
 
-    def test_a_crashed_worker_quotes_its_stderr(self, tmp_path, monkeypatch):
+    def test_an_ended_worker_quotes_its_stderr(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 4)
-        run_page_workers_as(monkeypatch, "complain_and_crash_on_page_3")
+        run_page_workers_as(monkeypatch, "complains_and_stops_on_page_3")
 
         pooled = extract_document(path, workers=2, ocr="never")
 
-        ended = "the worker process extracting pages 3-4 ended (exit code 3) before returning them"
-        assert [page.error for page in pooled.pages[2:]] == [f"{ended}; its stderr ends: pdfium: boom"] * 2
+        ended = "the worker process extracting pages 3-4 exited with code 3 without a reply before it began page 3"
+        assert [page.error for page in pooled.pages[2:]] == [f"{ended}; its stderr ends: pdfium: a message", None]
 
     def test_a_worker_killed_at_a_strict_failure_ends_its_drain(self, tmp_path, monkeypatch):
         path = break_page(build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 4), 1)
@@ -171,7 +171,7 @@ class TestThePoolWritesNothing:
 
     def test_a_worker_lost_under_strict_is_raised_with_its_stderr(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 4)
-        run_page_workers_as(monkeypatch, "complain_and_crash_on_page_3")
+        run_page_workers_as(monkeypatch, "complains_and_stops_on_page_3")
 
-        with pytest.raises(DatagruntPDFError, match=re.escape("its stderr ends: pdfium: boom")):
+        with pytest.raises(DatagruntPDFError, match=re.escape("its stderr ends: pdfium: a message")):
             extract_document(path, workers=2, ocr="never", strict=True)

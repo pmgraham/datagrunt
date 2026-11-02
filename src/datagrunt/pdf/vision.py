@@ -146,19 +146,17 @@ Known limitations (A5b evidence: 10 corpus pages forced to OCR):
 """
 
 import dataclasses
-import io
 import math
 import os
 import statistics
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
-from PIL import Image
-
+from datagrunt.pdf._loaders import PageRender, _checked_turn
+from datagrunt.pdf._options import VisionOptions
 from datagrunt.pdf._pdfium_common import Box, union_box
-from datagrunt.pdf._validate import choice_str, int_at_least, non_blank_str, positive_float, typed_tuple
+from datagrunt.pdf._validate import choice_str, typed_tuple
 from datagrunt.pdf.assembly import (
     MIN_IMAGE_DIMENSION,
     FigureDraft,
@@ -172,15 +170,13 @@ from datagrunt.pdf.assembly import (
 from datagrunt.pdf.elements import BBox, DocumentElement, Figure, HiddenReason, Page, PageImage, PageQuality, Table
 from datagrunt.pdf.exceptions import PDFCorruptError
 from datagrunt.pdf.layout import LatticeResult, find_lattice_tables, page_layout
-from datagrunt.pdf.ocr import Band, OCRWord, Orientation, bands, normalized, ocr_words, orientation, rotated
+from datagrunt.pdf.ocr import OCRWord, Orientation, bands, normalized, ocr_words, orientation, rotated
 from datagrunt.pdf.pdfium_engine import (
     DocumentHandle,
     PageFailure,
     PageGeometry,
     RawPage,
     RawSpan,
-    _checked_password,
-    _checked_path,
     page_geometry,
 )
 from datagrunt.pdf.quality import OcrMode, PageAssessment, SpanPiece, valid_char
@@ -224,24 +220,10 @@ _NO_LATTICE = LatticeResult(tables=(), used_pieces=())
 ROTATION_CONFIDENCE = 2.0
 
 _SUPERSEDED: tuple[HiddenReason, ...] = ("superseded",)
-_TURNS = (0, 90, 180, 270)
 _OCR_MODES: tuple[OcrMode, ...] = ("auto", "always", "never")
 # What pdfium reads for a page with no MediaBox: an error page whose own size cannot be read has this one.
 _DEFAULT_PAGE_SIZE = (612.0, 792.0)
 _NOT_READ = "the page was read by OCR of its render: its text layer, vector rules and images were not read"
-
-# The spec's construction checks (PDFReader / PDFWriter) and defaults: vision_dpi >= 36, 300; max_render_pixels >=
-# 512 x 512, 16,000,000.
-_MIN_DPI = 36
-_MIN_RENDER_PIXELS = 262_144
-# The render worker's memory past its start: pdfium can spend ~1.7 GiB decoding an image within A2's bounds (render.py).
-_MEMORY_CAP_BYTES = 2 << 30
-# A render takes ~0.5 s here (a worker's start included) and a tesseract call ~1 s: each bound is over 100 times that.
-_RENDER_TIMEOUT_S = 120.0
-_OCR_TIMEOUT_S = 120.0
-# A vision page's render and OCR together (#418): a page takes 2-4 s here (a render, OSD and 4 bands), so this is over
-# 100 times that, and below what the calls' own timeouts allow a tall page (120 s each, a band each 840 rows).
-_PAGE_BUDGET_S = 600.0
 
 
 class VisionElements(NamedTuple):
@@ -451,13 +433,6 @@ class _Frame(NamedTuple):
         return box
 
 
-def _checked_turn(rotation: object) -> int:
-    """``rotation`` if it is an int of 0, 90, 180 or 270 (bool rejected)."""
-    if type(rotation) is not int or rotation not in _TURNS:
-        raise ValueError(f"rotation must be an int of 0, 90, 180 or 270, got {rotation!r}")
-    return rotation
-
-
 def _box(bbox: BBox) -> Box:
     """A BBox as a plain ``(x0, y0, x1, y1)``."""
     return bbox.x0, bbox.y0, bbox.x1, bbox.y1
@@ -521,107 +496,6 @@ def superseded(pieces: tuple[SpanPiece, ...]) -> tuple[SpanPiece, ...]:
         else SpanPiece(span=piece.span, start=piece.start, end=piece.end, hidden_reasons=_SUPERSEDED)
         for piece in typed_tuple("pieces", pieces, SpanPiece)
     )
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class VisionOptions:
-    """How a vision page is rendered and read. Picklable, so it crosses the process pool.
-
-    Attributes:
-        vision_dpi: The render's target DPI (>= 36).
-        max_render_pixels: The render's pixel bound (>= 262,144, 512 x 512).
-        language: tesseract's language(s), as ``eng`` or ``deu+eng``.
-        memory_cap_bytes: The render worker's memory cap past its start (>= 1).
-        render_timeout_s: Seconds a render may take, its worker's start included.
-        ocr_timeout_s: Seconds each tesseract call may take.
-        page_budget_s: Seconds a page's render and OCR may take in all (see
-            the module notes): each call within its own timeout and the
-            time left.
-
-    Raises:
-        TypeError, ValueError: If a value is of the wrong type or out of range.
-    """
-
-    vision_dpi: int = 300
-    max_render_pixels: int = 16_000_000
-    language: str = "eng"
-    memory_cap_bytes: int = _MEMORY_CAP_BYTES
-    render_timeout_s: float = _RENDER_TIMEOUT_S
-    ocr_timeout_s: float = _OCR_TIMEOUT_S
-    page_budget_s: float = _PAGE_BUDGET_S
-
-    def __post_init__(self) -> None:
-        int_at_least("vision_dpi", self.vision_dpi, _MIN_DPI)
-        int_at_least("max_render_pixels", self.max_render_pixels, _MIN_RENDER_PIXELS)
-        non_blank_str("language", self.language)
-        int_at_least("memory_cap_bytes", self.memory_cap_bytes, 1)
-        object.__setattr__(self, "render_timeout_s", positive_float("render_timeout_s", self.render_timeout_s))
-        object.__setattr__(self, "ocr_timeout_s", positive_float("ocr_timeout_s", self.ocr_timeout_s))
-        object.__setattr__(self, "page_budget_s", positive_float("page_budget_s", self.page_budget_s))
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class PageRender:
-    """How to draw a vision page again: a :class:`~datagrunt.pdf.elements.PageImage`'s loaders.
-
-    It holds no pixels: each call renders the page in the guarded worker,
-    normalizes it as OCR read it, and encodes PNG (8-bit grey). Picklable,
-    so a page crosses the process pool. Each load raises as
-    :func:`~datagrunt.pdf.render.render_page` does (``RenderRefused``,
-    ``RenderFailed``).
-
-    Attributes:
-        source: The PDF's absolute path.
-        page_index: The 0-based page.
-        dpi: The render's DPI (the page's effective DPI).
-        rotation: The clockwise turn OCR read the page at: the bands' turn.
-        password: The PDF's password, or None. Not in repr.
-        memory_cap_bytes: The render worker's memory cap past its start.
-        timeout_s: Seconds a render may take.
-    """
-
-    source: Path
-    page_index: int
-    dpi: int
-    rotation: int
-    password: str | None = field(default=None, repr=False)
-    memory_cap_bytes: int
-    timeout_s: float
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "source", _checked_path(self.source, "source").absolute())
-        int_at_least("page_index", self.page_index, 0)
-        int_at_least("dpi", self.dpi, 1)
-        _checked_turn(self.rotation)
-        _checked_password(self.password)
-        int_at_least("memory_cap_bytes", self.memory_cap_bytes, 1)
-        object.__setattr__(self, "timeout_s", positive_float("timeout_s", self.timeout_s))
-
-    def png_bytes(self) -> bytes:
-        """The page as displayed (before OCR's turn), normalized, as PNG."""
-        return _png(self._drawn())
-
-    def band_png_bytes(self) -> tuple[bytes, ...]:
-        """The bands OCR read (of the page turned by ``rotation``, normalized), top to bottom, each as PNG."""
-        return tuple(_png(band) for band in bands(rotated(self._drawn(), self.rotation)))
-
-    def _drawn(self) -> RenderedPage:
-        page = render_page(
-            self.source,
-            self.page_index,
-            dpi=self.dpi,
-            password=self.password,
-            memory_cap_bytes=self.memory_cap_bytes,
-            timeout_s=self.timeout_s,
-        )
-        return normalized(page)
-
-
-def _png(image: RenderedPage | Band) -> bytes:
-    """8-bit grey pixels as PNG."""
-    buffer = io.BytesIO()
-    Image.frombytes("L", (image.px_width, image.px_height), image.pixels).save(buffer, format="PNG")
-    return buffer.getvalue()
 
 
 def vision_page(

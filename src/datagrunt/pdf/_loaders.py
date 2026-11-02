@@ -1,0 +1,434 @@
+"""The lazy loaders a document's figures and page images carry (#369 A5a, #371): the caller's side, no pdfium.
+
+Internal: not exported from ``datagrunt`` or ``datagrunt.pdf``. A loader
+holds where its bytes are (the PDF's path, the page, the image's facts, the
+password) and reads them in a worker process whose memory is capped
+(:mod:`datagrunt.pdf._memory_cap`), so the caller never hands the PDF to
+pdfium. Each is picklable: a page worker builds them, and its pages cross
+to the caller with them.
+
+- :class:`PageRender`: a vision page's image and bands, drawn again in the
+  render worker (:func:`~datagrunt.pdf.render.render_page`).
+- :class:`FigureRead`: a figure's PNG (:meth:`FigureRead.png_bytes`) or raw
+  stream (:meth:`FigureRead.raw_bytes`), read in a figure worker (the
+  launcher's key ``"figures"``, :mod:`datagrunt.pdf._figure_worker`) by
+  the engine's own :class:`~datagrunt.pdf.pdfium_engine.ImageLoader`, which
+  verifies the image against its facts before it returns anything.
+
+Figure reads are batched: :func:`read_figures` reads up to
+:data:`FIGURE_BATCH` figures of one PDF in one worker, and
+:func:`figure_pngs` batches a document's figure reads for ``PDFWriter``'s
+``extract_images`` and the bundle. A single lazy read is a batch of one.
+Each read's outcome comes in order, as its worker sends it: the caller
+holds one figure's bytes at a time. Each reply is read within its bound
+(:data:`_FIGURE_START_S` for a worker's first, then :data:`_FIGURE_READ_S`
+a figure, each counted from the reply before it); a reply longer than the
+asset limit is refused unread. A worker that ends early (its cap, a reply
+past its bound, an unexpected exit) fails the figure it was reading with
+why, a :class:`~datagrunt.pdf.exceptions.DatagruntPDFError`, and the
+figures after it are read by a new worker: each worker answers or fails at
+least one figure, so a batch starts at most as many workers as it holds
+figures. An error a figure's read raises (the file changed, a decode
+refused) is that figure's outcome, raised as it was.
+"""
+
+import dataclasses
+import io
+import subprocess
+import time
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, field
+from functools import partial
+from pathlib import Path
+from typing import IO, Literal, NamedTuple
+
+from PIL import Image
+
+from datagrunt.pdf._image_facts import RawImage
+from datagrunt.pdf._memory_cap import ending
+from datagrunt.pdf._options import MEMORY_CAP_BYTES
+from datagrunt.pdf._process import (
+    MAX_REQUEST_BYTES,
+    REAP_TIMEOUT_S,
+    MessageTooLong,
+    NoInterpreter,
+    StderrTail,
+    close_pipes,
+    next_reply,
+    read_error,
+    reaped,
+    request_payload,
+    start_worker,
+    worker_command,
+)
+from datagrunt.pdf._validate import checked_password, checked_path, int_at_least, positive_float
+from datagrunt.pdf.elements import _MAX_ASSET_BYTES, Figure
+from datagrunt.pdf.exceptions import DatagruntPDFError
+from datagrunt.pdf.ocr import Band, bands, normalized, rotated
+from datagrunt.pdf.render import RenderedPage, render_page
+
+__all__ = ["FIGURE_BATCH", "FigureRead", "PageRender", "figure_pngs", "read_figures"]
+
+_TURNS = (0, 90, 180, 270)
+
+# The figures one worker reads, at most: a batch's request is ~0.5 KB a figure, within the launcher's 1 MiB bound.
+FIGURE_BATCH = 64
+# A figure worker's first reply is given this to start, and each figure this. Measured here: a worker starts in ~0.2
+# s and reads a figure in 12-67 ms (a JPEG 2000 image at the pixel bound in seconds), so each bound is over 100 times
+# what it covers.
+_FIGURE_START_S = 60.0
+_FIGURE_READ_S = 60.0
+_EXIT_GRACE_S = 1.0  # a worker whose replies ended early is given this to exit
+# A figure worker's replies: the bytes (this kind, then the bytes as a second message), or the read's error, pickled.
+_BYTES, _ERROR = b"B", b"E"
+_KINDS = ("png", "raw")
+Kind = Literal["png", "raw"]
+
+
+def _checked_turn(rotation: object) -> int:
+    """``rotation`` if it is an int of 0, 90, 180 or 270 (bool rejected)."""
+    if type(rotation) is not int or rotation not in _TURNS:
+        raise ValueError(f"rotation must be an int of 0, 90, 180 or 270, got {rotation!r}")
+    return rotation
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PageRender:
+    """How to draw a vision page again: a :class:`~datagrunt.pdf.elements.PageImage`'s loaders.
+
+    It holds no pixels: each call renders the page in the guarded worker,
+    normalizes it as OCR read it, and encodes PNG (8-bit grey). Picklable,
+    so a page crosses the process pool. Each load raises as
+    :func:`~datagrunt.pdf.render.render_page` does (``RenderRefused``,
+    ``RenderFailed``).
+
+    Attributes:
+        source: The PDF's absolute path.
+        page_index: The 0-based page.
+        dpi: The render's DPI (the page's effective DPI).
+        rotation: The clockwise turn OCR read the page at: the bands' turn.
+        password: The PDF's password, or None. Not in repr.
+        memory_cap_bytes: The render worker's memory cap past its start.
+        timeout_s: Seconds a render may take.
+    """
+
+    source: Path
+    page_index: int
+    dpi: int
+    rotation: int
+    password: str | None = field(default=None, repr=False)
+    memory_cap_bytes: int
+    timeout_s: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source", checked_path(self.source, "source").absolute())
+        int_at_least("page_index", self.page_index, 0)
+        int_at_least("dpi", self.dpi, 1)
+        _checked_turn(self.rotation)
+        checked_password(self.password)
+        int_at_least("memory_cap_bytes", self.memory_cap_bytes, 1)
+        object.__setattr__(self, "timeout_s", positive_float("timeout_s", self.timeout_s))
+
+    def png_bytes(self) -> bytes:
+        """The page as displayed (before OCR's turn), normalized, as PNG."""
+        return _png(self._drawn())
+
+    def band_png_bytes(self) -> tuple[bytes, ...]:
+        """The bands OCR read (of the page turned by ``rotation``, normalized), top to bottom, each as PNG."""
+        return tuple(_png(band) for band in bands(rotated(self._drawn(), self.rotation)))
+
+    def _drawn(self) -> RenderedPage:
+        page = render_page(
+            self.source,
+            self.page_index,
+            dpi=self.dpi,
+            password=self.password,
+            memory_cap_bytes=self.memory_cap_bytes,
+            timeout_s=self.timeout_s,
+        )
+        return normalized(page)
+
+
+def _png(image: RenderedPage | Band) -> bytes:
+    """8-bit grey pixels as PNG."""
+    buffer = io.BytesIO()
+    Image.frombytes("L", (image.px_width, image.px_height), image.pixels).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FigureRead:
+    """How to read a figure again: a :class:`~datagrunt.pdf.elements.Figure`'s loaders, in a capped worker.
+
+    It holds no bytes: each call reads the image in a figure worker, which
+    reopens ``source`` (with ``password``), finds the object by the walk that
+    numbered it and checks it is still ``image`` (its raw stream's hash and
+    its pixel facts) before it returns anything, as the engine's
+    :class:`~datagrunt.pdf.pdfium_engine.ImageLoader` does. Picklable, so a
+    page crosses the process pool with its figures.
+
+    Attributes:
+        source: The PDF's path, made absolute at construction.
+        page_index: The 0-based page holding the image.
+        image: The image's facts as the engine recorded them; it must have a
+            ``raw_sha256`` (its stream was read).
+        password: The encrypted PDF's password, or None. Excluded from repr
+            and equality, and never put in an error message; a pickle of the
+            loader carries it (the worker needs it).
+        memory_cap_bytes: The figure worker's memory cap past its start.
+    """
+
+    source: Path
+    page_index: int
+    image: RawImage
+    password: str | None = field(default=None, repr=False, compare=False)
+    memory_cap_bytes: int = MEMORY_CAP_BYTES
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source", checked_path(self.source, "source").absolute())
+        int_at_least("page_index", self.page_index, 0)
+        if not isinstance(self.image, RawImage):
+            raise TypeError(f"image must be a RawImage, got {type(self.image).__name__}")
+        if self.image.raw_sha256 is None:
+            raise ValueError(
+                "image has no raw_sha256 (its stream was not read): there is nothing to verify a read against"
+            )
+        checked_password(self.password)
+        int_at_least("memory_cap_bytes", self.memory_cap_bytes, 1)
+
+    @property
+    def object_index(self) -> int:
+        """The image object's index in its page's object walk."""
+        return self.image.object_index
+
+    @property
+    def raw_sha256(self) -> str:
+        """The SHA-256 every read verifies the image's raw stream against."""
+        digest = self.image.raw_sha256
+        if digest is None:  # refused at construction; this narrows the type
+            raise ValueError("image has no raw_sha256")
+        return digest
+
+    def png_bytes(self) -> bytes:
+        """The image decoded by pdfium at its own pixel size, as PNG bytes (``ImageLoader.png_bytes``'s, in a worker).
+
+        Raises:
+            DatagruntPDFError: As ``ImageLoader.png_bytes`` raises it, or if
+                its worker cannot start, reaches its memory cap, runs past
+                its bound or ends without a reply (saying why).
+            PDFCorruptError, FileNotFoundError, PermissionError, PDFEncryptedError:
+                As ``ImageLoader.png_bytes`` raises them.
+        """
+        return _read_one(self, "png")
+
+    def raw_bytes(self) -> bytes:
+        """The image's raw stream, verified (``ImageLoader.raw_bytes``'s, in a worker); raises as :meth:`png_bytes`."""
+        return _read_one(self, "raw")
+
+    def where(self) -> str:
+        """The image in words, for an error: its PDF, page and object (never the password)."""
+        return f"{self.source}: page {self.page_index + 1}, object {self.image.object_index}"
+
+
+def _read_one(read: FigureRead, kind: Kind) -> bytes:
+    """One figure's bytes, read in a worker of its own; its error raised."""
+    (outcome,) = read_figures((read,), kind)
+    if isinstance(outcome, Exception):
+        raise outcome
+    return outcome
+
+
+def figure_pngs(figures: Sequence[Figure]) -> Iterator[Callable[[], bytes]]:
+    """Each figure's PNG read, in order, as a callable that returns its bytes or raises its error.
+
+    The figures whose PNG loader is a :class:`FigureRead`'s are read in
+    batches (:func:`read_figures`), each when its turn comes; any other
+    figure (a bundle's, read from its file) is read by its own
+    ``read_bytes``.
+    """
+    index = 0
+    while index < len(figures):  # bounded: each pass consumes at least one figure
+        run = _run_of_reads(figures, index)
+        if not run:
+            yield figures[index].read_bytes
+            index += 1
+            continue
+        for outcome in read_figures(run, "png"):  # bounded: one outcome a read
+            yield partial(_outcome_of, outcome)
+        index += len(run)
+
+
+def _run_of_reads(figures: Sequence[Figure], start: int) -> list[FigureRead]:
+    """The FigureReads of the figures from ``start`` whose PNG loader is a FigureRead's, until one is not."""
+    run: list[FigureRead] = []
+    for figure in figures[start:]:  # bounded: the figures
+        owner = getattr(figure._loader, "__self__", None)
+        if not isinstance(owner, FigureRead) or getattr(figure._loader, "__func__", None) is not FigureRead.png_bytes:
+            break
+        run.append(owner)
+    return run
+
+
+def _outcome_of(outcome: bytes | Exception) -> bytes:
+    """``outcome``'s bytes; its error raised."""
+    if isinstance(outcome, Exception):
+        raise outcome
+    return outcome
+
+
+def read_figures(reads: Sequence[FigureRead], kind: Kind) -> Iterator[bytes | Exception]:
+    """Each read's bytes (``kind``: ``"png"`` or ``"raw"``), or the exception it raised, in order (module notes).
+
+    Consecutive reads of one PDF (its path, password and memory cap) share a
+    worker, at most :data:`FIGURE_BATCH` of them.
+
+    Raises:
+        ValueError: If ``kind`` is neither ``"png"`` nor ``"raw"``.
+        TypeError: If a read is not a FigureRead.
+    """
+    if kind not in _KINDS:
+        raise ValueError(f"kind must be one of {_KINDS}, got {kind!r}")
+    for read in reads:
+        if not isinstance(read, FigureRead):
+            raise TypeError(f"each read must be a FigureRead, got {type(read).__name__}")
+    for batch in _batches(reads):  # bounded: the reads, FIGURE_BATCH at a time
+        yield from _batch_outcomes(batch, kind)
+
+
+def _batches(reads: Sequence[FigureRead]) -> Iterator[list[FigureRead]]:
+    """``reads`` in runs that share a worker: the same PDF, password and cap, at most FIGURE_BATCH long."""
+    batch: list[FigureRead] = []
+    for read in reads:
+        if batch and (len(batch) == FIGURE_BATCH or _worker_key(batch[0]) != _worker_key(read)):
+            yield batch
+            batch = []
+        batch.append(read)
+    if batch:
+        yield batch
+
+
+def _worker_key(read: FigureRead) -> tuple[Path, str | None, int]:
+    return read.source, read.password, read.memory_cap_bytes
+
+
+def _batch_outcomes(batch: list[FigureRead], kind: Kind) -> Iterator[bytes | Exception]:
+    """The batch's outcomes, in order: one worker, then a new one for the reads after any it fails (module notes)."""
+    done = 0
+    for _ in range(len(batch)):  # bounded: each worker answers or fails at least one read
+        if done == len(batch):
+            return
+        for outcome in _worker_outcomes(batch[done:], kind):
+            done += 1
+            yield outcome
+
+
+def _worker_outcomes(reads: list[FigureRead], kind: Kind) -> Iterator[bytes | Exception]:
+    """What one worker answers for ``reads``, in order; when it ends early, the failure of the read it was on.
+
+    Yields at least one outcome. A worker that cannot start fails every read
+    with why. The worker is reaped before this ends, on every path: waited
+    for once it has answered each read, else killed first.
+    """
+    try:
+        command = worker_command()
+    except NoInterpreter as exc:
+        yield from (DatagruntPDFError(str(exc)) for _ in reads)
+        return
+    payload = _batch_payload(reads, kind)
+    started = time.monotonic()
+    try:
+        child, stderr = start_worker(command)
+    except (OSError, RuntimeError) as exc:
+        yield from (DatagruntPDFError(f"cannot start a figure worker: {exc}") for _ in reads)
+        return
+    answered = 0
+    try:
+        _write_request(child.stdin, payload)
+        for outcome in _answers(child, stderr, reads, started):  # bounded: one outcome a read
+            answered += 1
+            yield outcome
+    finally:
+        if answered < len(reads):  # ended early, or its reader stopped: it is not waited for
+            child.kill()
+        close_pipes(child)
+        reaped(child, REAP_TIMEOUT_S)
+        stderr.finish(REAP_TIMEOUT_S)
+
+
+def _write_request(stdin: IO[bytes] | None, payload: bytes) -> None:
+    """Write the request to the worker's stdin and close it; a worker that ended at once is reported by its replies."""
+    if stdin is None:
+        raise ValueError("the worker's stdin must be a pipe")
+    try:
+        stdin.write(payload)
+        stdin.close()
+    except OSError:  # it ended at once: its replies end, and its exit code and stderr say why
+        pass
+
+
+class _Lost(NamedTuple):
+    """No answer came for a read: why, in words, or ``""`` when the worker ended (its exit code and stderr say why)."""
+
+    why: str
+
+
+def _answers(
+    child: "subprocess.Popen[bytes]", stderr: StderrTail, reads: list[FigureRead], started: float
+) -> Iterator[bytes | Exception]:
+    """The worker's outcome for each read, each within its bound; at its early end, the read it was on fails."""
+    stdout = child.stdout
+    if stdout is None:
+        raise ValueError("the worker's stdout must be a pipe")
+    since = started
+    for position, read in enumerate(reads):  # bounded: one reply a read
+        bound_s = _FIGURE_READ_S + (_FIGURE_START_S if position == 0 else 0.0)
+        outcome = _answer(child, stdout, since + bound_s, bound_s)
+        since = time.monotonic()
+        if isinstance(outcome, _Lost):
+            why = outcome.why or _ended(child, stderr, read)
+            yield DatagruntPDFError(f"{read.where()}: {why}")
+            return
+        yield outcome
+
+
+def _answer(
+    child: "subprocess.Popen[bytes]", stdout: IO[bytes], due: float, bound_s: float
+) -> bytes | Exception | _Lost:
+    """One read's outcome from the worker by ``due`` (a monotonic time); or why none came."""
+    try:
+        head, expired = next_reply(child, stdout, due - time.monotonic(), _MAX_ASSET_BYTES)
+        if head is not None and head[:1] == _ERROR:
+            return read_error(head[1:], "the figure worker")
+        if head is not None and head != _BYTES:
+            child.kill()
+            return _Lost(f"the figure worker sent a reply of unknown kind {head[:1]!r}: it was killed")
+        data, expired = (
+            (None, expired) if head is None else next_reply(child, stdout, due - time.monotonic(), _MAX_ASSET_BYTES)
+        )
+    except MessageTooLong as exc:
+        child.kill()  # it may be blocked writing the rest
+        return _Lost(f"the figure worker sent {exc}: it was killed")
+    if data is None:
+        return _Lost(f"the figure worker did not return it within {bound_s:g} s: it was killed" if expired else "")
+    return data
+
+
+def _ended(child: "subprocess.Popen[bytes]", stderr: StderrTail, read: FigureRead) -> str:
+    """Why the figure worker ended before it answered ``read``: its exit code and its stderr's last 4 KiB."""
+    said = ending(reaped(child, _EXIT_GRACE_S), "the figure worker", read.memory_cap_bytes)
+    tail = stderr.finish(REAP_TIMEOUT_S)  # it is reaped: its drain ends
+    return f"{said}; its stderr ends: {tail}" if tail else said
+
+
+def _batch_payload(reads: Sequence[FigureRead], kind: Kind) -> bytes:
+    """The JSON a figure worker reads from its stdin: one PDF's reads and a lifetime (the password on stdin only)."""
+    first = reads[0]
+    request = {
+        "source": str(first.source),
+        "password": first.password,
+        "kind": kind,
+        "memory_cap_bytes": first.memory_cap_bytes,
+        "timeout_s": _FIGURE_START_S + _FIGURE_READ_S * len(reads),
+        "figures": [[read.page_index, dataclasses.asdict(read.image)] for read in reads],
+    }
+    return request_payload("figures", request, MAX_REQUEST_BYTES)

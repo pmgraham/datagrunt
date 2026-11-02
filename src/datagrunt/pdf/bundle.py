@@ -99,8 +99,9 @@ Known limitations, documented:
 - ``output_dir`` filled by another process between the publish check and
   the rename makes ``os.replace`` fail with ``OSError`` (``ENOTEMPTY``),
   not ``FileExistsError``; it is never merged into, and staging is removed.
-- Figures are read one loader call each (each reopens the PDF), not
-  batched by page through one handle.
+- Figures are read in batches of up to 64 a figure worker
+  (:func:`~datagrunt.pdf._loaders.figure_pngs`), each read reopening the
+  PDF, not batched by page through one handle.
 
 :func:`load_bundle` takes a bundle directory or its ``manifest.json``
 and returns the document. Nothing is trusted before it is checked:
@@ -163,6 +164,8 @@ from typing import IO, BinaryIO, NamedTuple, cast
 
 from PIL import Image
 
+from datagrunt.pdf._loaders import figure_pngs
+from datagrunt.pdf._validate import checked_path as _checked_path
 from datagrunt.pdf._validate import (
     choice_str,
     int_at_least,
@@ -183,7 +186,6 @@ from datagrunt.pdf.codec import (
 from datagrunt.pdf.elements import _MAX_ASSET_BYTES, Figure, Page, PageImage, PDFDocument
 from datagrunt.pdf.exceptions import BundleCorruptError, DatagruntPDFError, PDFSourceChangedError
 from datagrunt.pdf.frame import utf8_text
-from datagrunt.pdf.pdfium_engine import _checked_path
 from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, SourceIdentity, _opened_source, _stream_sha256
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page
 
@@ -473,11 +475,13 @@ def _write_figures(document: PDFDocument, staging: Path, ledger: _Ledger) -> dic
     """Write each distinct figure (by sha256) once; its relative path by sha256."""
     written: dict[str, str] = {}
     tried: set[str] = set()
+    distinct: list[Figure] = []
     for figure in document.figures:
-        if figure.sha256 in tried:
-            continue
-        tried.add(figure.sha256)
-        data, why = _png(figure.read_bytes)
+        if figure.sha256 not in tried:
+            tried.add(figure.sha256)
+            distinct.append(figure)
+    for figure, read in zip(distinct, figure_pngs(distinct), strict=True):  # read in batches, each in its turn
+        data, why = _png(read)
         if data is None:
             reason = f"figure {figure.sha256} was not written: {why}"
             ledger.missing.append(_Missing("figure", figure.page_number, figure.element_id, reason))

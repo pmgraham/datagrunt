@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from datagrunt.pdf import assembly, layout
+from datagrunt.pdf._loaders import FigureRead
 from datagrunt.pdf.assembly import (
     FigureDraft,
     PageFigures,
@@ -38,7 +39,6 @@ from datagrunt.pdf.layout import (
     stream_layout,
 )
 from datagrunt.pdf.pdfium_engine import (
-    ImageLoader,
     ImageStats,
     PageGeometry,
     PageImages,
@@ -114,7 +114,7 @@ class TestFigureDraft:
             "sha256": SHA,
             "width_px": 1000,
             "height_px": 750,
-            "loader": ImageLoader(source=tmp_path / "doc.pdf", page_index=0, image=raw),
+            "loader": FigureRead(source=tmp_path / "doc.pdf", page_index=0, image=raw),
         }
         return FigureDraft(**(fields | overrides))
 
@@ -174,7 +174,7 @@ class TestPageFigures:
 
         assert draft.bbox == BBox(x0=60.0, y0=40.0, x1=180.0, y1=120.0)
         assert (draft.sha256, draft.width_px, draft.height_px, draft.hidden_reasons) == (SHA, 1000, 750, ())
-        assert draft.loader == ImageLoader(source=tmp_path / "doc.pdf", page_index=0, image=raw)
+        assert draft.loader == FigureRead(source=tmp_path / "doc.pdf", page_index=0, image=raw)
 
     def test_the_loader_reads_the_geometrys_page_with_the_password(self, tmp_path):
         geometry = dataclasses.replace(GEOMETRY, page_number=3)
@@ -197,8 +197,8 @@ class TestPageFigures:
         def refuse(self):
             raise AssertionError("a loader was called")
 
-        monkeypatch.setattr(ImageLoader, "png_bytes", refuse)
-        monkeypatch.setattr(ImageLoader, "raw_bytes", refuse)
+        monkeypatch.setattr(FigureRead, "png_bytes", refuse)
+        monkeypatch.setattr(FigureRead, "raw_bytes", refuse)
 
         (draft,) = drafted(tmp_path, image(INSIDE)).drafts
         figure = draft.figure(page_number=1, reading_order=0)
@@ -247,7 +247,8 @@ class TestPageFigures:
             drafted(tmp_path, image(INSIDE), min_image_dimension=bad)
 
     def test_an_oversized_image_is_a_figure_of_its_recorded_size(self, tmp_path):
-        # A2 records a decode size over the pixel bound without pixel metadata; ImageLoader refuses to decode it.
+        # A2 records a decode size over the pixel bound without pixel metadata; ImageLoader (its figure worker's)
+        # refuses to decode it.
         huge = image(INSIDE, px_width=20000, px_height=20000, declared_px=(20000, 20000), bits_per_pixel=None)
 
         (draft,) = drafted(tmp_path, huge).drafts
@@ -557,8 +558,8 @@ class TestAssemblePage:
         def refuse(self):
             raise AssertionError("a loader was called")
 
-        monkeypatch.setattr(ImageLoader, "png_bytes", refuse)
-        monkeypatch.setattr(ImageLoader, "raw_bytes", refuse)
+        monkeypatch.setattr(FigureRead, "png_bytes", refuse)
+        monkeypatch.setattr(FigureRead, "raw_bytes", refuse)
 
         page = assembled(letter(tmp_path, *mixed_items()))
 

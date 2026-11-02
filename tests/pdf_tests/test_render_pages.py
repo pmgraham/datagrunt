@@ -19,7 +19,7 @@ import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 import pytest
 
-from datagrunt.pdf import _process, render
+from datagrunt.pdf import _process, _render_worker, render
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, render_page, render_pages, render_size
 from pdf_tests.builders import FormXObject, PageSpec, Rect, TextRun, build_pdf, hand_written_pdf
 from pdf_tests.test_pdfium_images import JPX_16, image_xobject
@@ -293,7 +293,7 @@ class TestBatch:
     @pytest.mark.parametrize(
         "attribute,value,why",
         [
-            pytest.param("frozen", True, "a frozen application has no Python interpreter", id="frozen"),
+            pytest.param("frozen", True, "this application is frozen (sys.frozen)", id="frozen"),
             pytest.param("executable", "", "sys.executable is empty", id="no-executable"),
         ],
     )
@@ -421,12 +421,12 @@ class TestBatchWorker:
 
     def test_the_cap_is_applied_once_for_the_whole_batch(self, tmp_path, monkeypatch):
         caps = []
-        monkeypatch.setattr(render, "_apply_memory_cap", lambda cap, timeout: caps.append((cap, timeout)))
+        monkeypatch.setattr(_render_worker, "apply_memory_cap", lambda cap, timeout: caps.append((cap, timeout)))
         path = coloured(tmp_path)
         message = json.loads(render._batch_payload(batch_request(path, ((0, 72), (0, 36)))))["request"]
         replies = Sink()
 
-        render._worker_main(message, replies)
+        _render_worker._worker_main(message, replies)
 
         first, first_pixels, second, second_pixels = framed(replies.data)
         assert caps == [(CAP, TIMEOUT_S)]
@@ -434,12 +434,12 @@ class TestBatchWorker:
         assert (second, len(second_pixels)) == (render._PIXELS + render._PIXEL_SIZE.pack(200, 150), 200 * 150 * 3)
 
     def test_a_refused_or_failed_page_is_its_reply_and_the_batch_goes_on(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(render, "_apply_memory_cap", lambda *args: None)
+        monkeypatch.setattr(_render_worker, "apply_memory_cap", lambda *args: None)
         path = refused_middle(tmp_path)
         message = json.loads(render._batch_payload(batch_request(path, ((1, 72), (5, 72), (0, 72)))))["request"]
         replies = Sink()
 
-        render._worker_main(message, replies)
+        _render_worker._worker_main(message, replies)
 
         refused, failed, size, pixels = framed(replies.data)
         assert (
@@ -450,11 +450,11 @@ class TestBatchWorker:
         assert (size, len(pixels)) == (render._PIXELS + render._PIXEL_SIZE.pack(400, 300), 400 * 300 * 3)
 
     def test_a_pdf_it_cannot_open_fails_each_page_with_the_reason(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(render, "_apply_memory_cap", lambda *args: None)
+        monkeypatch.setattr(_render_worker, "apply_memory_cap", lambda *args: None)
         message = json.loads(render._batch_payload(batch_request(tmp_path / "missing.pdf", ((0, 72), (1, 72)))))
         replies = Sink()
 
-        render._worker_main(message["request"], replies)
+        _render_worker._worker_main(message["request"], replies)
 
         first, second = framed(replies.data)
         assert first == second and first.startswith(render._FAILED + b"FileNotFoundError: ")
@@ -471,10 +471,12 @@ class TestBatchWorker:
         ],
     )
     def test_a_batch_it_cannot_read_is_answered_with_a_failure(self, monkeypatch, message, expected):
-        monkeypatch.setattr(render, "_apply_memory_cap", lambda *args: pytest.fail("the cap reached the test process"))
+        monkeypatch.setattr(
+            _render_worker, "apply_memory_cap", lambda *args: pytest.fail("the cap reached the test process")
+        )
         replies = Sink()
 
-        render._worker_main(message, replies)
+        _render_worker._worker_main(message, replies)
 
         (reply,) = framed(replies.data)
         assert reply.startswith(render._FAILED + expected.encode())
@@ -602,7 +604,7 @@ class TestTextRemoval:
         page = document[0]
         before = len(list(page.get_objects(max_depth=2)))
 
-        removed = render._remove_text(page, 1)
+        removed = _render_worker._remove_text(page, 1)
 
         types = [pdfium_c.FPDFPageObj_GetType(item.raw) for item in page.get_objects(max_depth=2)]
         assert (before, removed, types) == (3, 2, [pdfium_c.FPDF_PAGEOBJ_FORM])
@@ -612,13 +614,14 @@ class TestTextRemoval:
         monkeypatch.setattr(pdfium_c, "FPDFPage_RemoveObject", lambda *args: 0)
 
         with pytest.raises(RenderFailed, match=re.escape("page 1: pdfium cannot remove text object 0")):
-            render._remove_text(page, 1)
+            _render_worker._remove_text(page, 1)
 
 
 def test_the_process_allowlist_is_unchanged():
     # The batch is the render worker's: it needs no worker key of its own.
     assert dict(_process.WORKERS) == {
-        "render": ("datagrunt.pdf.render", "_worker_main"),
-        "pages": ("datagrunt.pdf.pipeline", "_worker_main"),
+        "figures": ("datagrunt.pdf._figure_worker", "_worker_main"),
+        "pages": ("datagrunt.pdf._page_worker", "_worker_main"),
+        "render": ("datagrunt.pdf._render_worker", "_worker_main"),
     }
-    assert os.path.basename(render.__file__) == "render.py"
+    assert os.path.basename(_render_worker.__file__) == "_render_worker.py"

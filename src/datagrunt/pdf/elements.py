@@ -943,8 +943,9 @@ class Figure(_Element):
       ``image_path`` for information, and its loader checks the file
       against the bundle's manifest on every read.
 
-    The engine sets both loaders to an ``ImageLoader``'s bound methods,
-    which reopen the PDF on demand. For an encrypted PDF that loader holds
+    The engine sets both loaders to a ``FigureRead``'s bound methods
+    (:mod:`datagrunt.pdf._loaders`), which reopen the PDF on demand in a
+    capped figure worker. For an encrypted PDF that loader holds
     the password, so a pickled Figure (one sent across a process pool)
     carries the password inside its loaders' pickle: never store or send
     such a pickle anywhere the PDF's readers could not already go. The
