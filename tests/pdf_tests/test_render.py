@@ -278,9 +278,9 @@ class TestImageGuard:
             ),
             pytest.param(
                 b"\x00" * 16,
-                gray(16, 16, b"/JBIG2Decode"),
-                "object 0 uses filter 'JBIG2Decode': its decode size cannot be read without decoding",
-                id="jbig2",
+                gray(16, 16, b"/Crypt"),
+                "object 0 uses filter 'Crypt': its decode size cannot be read without decoding",
+                id="unsized-codec",
             ),
             pytest.param(
                 FLATE,
