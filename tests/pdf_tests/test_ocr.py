@@ -551,6 +551,43 @@ class TestMerged:
 
         assert ocr._merged([(UPPER, words)]) == words
 
+    def test_an_upper_word_matches_one_lower_copy_at_most(self):
+        # D6: the upper "to" covers two lower ones, each at an IoU of exactly 0.5. Matched one to one, it is one word
+        # with the first (the IoUs tie, so by position) and the second is another word: two words stay two.
+        upper = placed("to", (10, 850, 50, 870), 80.0)
+        first, second = placed("to", (10, 850, 30, 870), 75.0), placed("to", (30, 850, 50, 870), 85.0)
+
+        assert ocr._merged([(UPPER, [upper]), (LOWER, [first, second])]) == [upper, second]
+
+    def test_a_lower_word_matches_one_upper_copy_at_most(self):
+        first, second = placed("to", (10, 850, 30, 870), 70.0), placed("to", (30, 850, 50, 870), 70.0)
+        lower = placed("to", (10, 850, 50, 870), 90.0)
+
+        assert ocr._merged([(UPPER, [first, second]), (LOWER, [lower])]) == [second, lower]
+
+    def test_the_closest_copy_is_matched_first(self):
+        # The upper word is one lower copy's box exactly (IoU 1) and overlaps the other's at an IoU of 0.6.
+        upper = placed("fox", (10, 850, 40, 880), 90.0)
+        exact, near = placed("fox", (10, 850, 40, 880), 80.0), placed("fox", (22, 850, 40, 880), 95.0)
+
+        assert ocr._merged([(UPPER, [upper]), (LOWER, [exact, near])]) == [upper, near]
+
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_a_strip_dense_with_one_word_merges_within_a_second(self):
+        # 6,600 words a band (11 rows of 600 in the shared strip, none at a cut edge), every one "the" and read in
+        # both bands, a pixel apart (IoU 0.6): the worst case for matching by text alone, 43.6 M pairs. Matching the
+        # boxes that overlap along x keeps it O(n log n) plus the overlaps.
+        upper = [placed("the", (x, y, x + 4, y + 4), 90.0) for y in range(842, 893, 5) for x in range(0, 3_000, 5)]
+        lower = [placed("the", (word.x0 + 1, word.y0, word.x1 + 1, word.y1), 80.0) for word in upper]
+
+        started = time.perf_counter()
+        merged = ocr._merged([(UPPER, upper), (LOWER, lower)])
+        elapsed = time.perf_counter() - started
+
+        assert len(upper) == 6_600
+        assert merged == upper
+        assert elapsed < 1.0, f"{elapsed:.2f} s"  # ~0.03 s here (38x headroom); matched by text alone, 9.95 s
+
 
 class TestSeamFragments:
     """A word cut by its band's cut edge, wholly in the strip it shares, is dropped when the other band reads it whole.
@@ -608,11 +645,12 @@ class TestSeamFragments:
 
         assert ocr._merged([(UPPER, [beside]), (LOWER, [cut])]) == [beside, cut]
 
-    def test_a_line_both_bands_cut_is_kept_in_both(self):
-        # Rows 840..899 exactly: UPPER's copy touches its bottom, LOWER's its top; neither band read the line whole.
+    def test_a_line_filling_the_strip_is_kept_once(self):
+        # Rows 840..899 exactly: UPPER's copy touches its bottom, LOWER's its top. Each band holds every row of it, so
+        # both read all of it: one line read twice, kept once (D6), with the higher confidence.
         upper, lower = placed("SORT", (10, 840, 60, 900), 0.0), placed("Company", (10, 840, 60, 899), 96.0)
 
-        assert ocr._merged([(UPPER, [upper]), (LOWER, [lower])]) == [upper, lower]
+        assert ocr._merged([(UPPER, [upper]), (LOWER, [lower])]) == [lower]
 
     def test_the_whole_copy_is_kept_over_a_cut_copy_of_higher_confidence(self):
         # The same text, IoU 0.75: the copy cut by LOWER's top is a fragment, whatever its confidence.
@@ -625,6 +663,81 @@ class TestSeamFragments:
         second = [placed("xb", (0, 840, 10, 870), 90.0), placed("cx", (0, 1720, 10, 1740), 90.0)]
 
         assert ocr._merged([(UPPER, [first]), (LOWER, second), (LAST, [last])]) == [first, last]
+
+
+class TestSeamClips:
+    """A line no band reads whole is kept from the band that read more of it, never from both (D6).
+
+    A line taller than the 60 rows two bands share, crossing them, reaches
+    both cut edges: each band reads only its part, cut at its own edge
+    (tesseract 5.5.3 reads such parts as garbled or split words). The parts
+    that overlap across the seam, linked by their overlaps, are one line.
+    The band whose parts reach farther past the strip (rows the other band
+    does not hold) keeps its parts; the other band's are dropped. Equal
+    reaches keep the higher mean confidence, then the upper band's.
+    UPPER is rows 0..899 and LOWER rows 840..1739: they share rows 840..899.
+    """
+
+    def test_the_upper_band_keeps_a_tall_word_it_read_more_of(self):
+        # Rows 790..910: UPPER read 50 rows past the strip, LOWER 10. The reach decides, not the confidence.
+        upper, lower = placed("Quarterly", (10, 790, 200, 900), 40.0), placed("WU", (10, 840, 200, 910), 95.0)
+
+        assert ocr._merged([(UPPER, [upper]), (LOWER, [lower])]) == [upper]
+
+    def test_the_lower_band_keeps_a_tall_word_it_read_more_of(self):
+        # Rows 830..960: UPPER read 10 rows past the strip, LOWER 60.
+        upper, lower = placed("Quartcrlv", (10, 830, 200, 900), 90.0), placed("Quarterly", (10, 840, 200, 960), 70.0)
+
+        assert ocr._merged([(UPPER, [upper]), (LOWER, [lower])]) == [lower]
+
+    def test_every_part_the_other_band_read_is_dropped(self):
+        # tesseract 5.5.3's read of a 24 pt heading at rows 810..904 (the review's D6 case): LOWER reads its part as two
+        # words, one of them wholly in the strip; both go, as no word UPPER read is whole there to drop them for.
+        upper = placed("Quarterly", (10, 810, 200, 900), 96.0)
+        parts = [placed("WU", (10, 840, 60, 893), 0.0), placed("AEUSTTLY", (70, 840, 200, 908), 0.0)]
+
+        assert ocr._merged([(UPPER, [upper]), (LOWER, parts)]) == [upper]
+
+    def test_parts_linked_by_their_overlaps_are_one_line(self):
+        # The UPPER parts do not overlap each other; the LOWER part overlaps both, so all three are one line.
+        left, right = placed("Qu", (10, 830, 60, 900), 90.0), placed("arterly", (70, 830, 200, 900), 90.0)
+        lower = placed("Quarterly", (40, 840, 200, 950), 60.0)
+
+        assert ocr._merged([(UPPER, [left, right]), (LOWER, [lower])]) == [lower]
+
+    @pytest.mark.parametrize(
+        "upper_confidence,kept",
+        [pytest.param(80.0, "upper", id="upper-higher"), pytest.param(70.0, "lower", id="lower-higher")],
+    )
+    def test_equal_reaches_keep_the_higher_mean_confidence(self, upper_confidence, kept):
+        # Rows 820..920: each band read 20 rows past the strip. LOWER's two parts' mean is 75 (their best is 100).
+        upper = placed("HEADING", (10, 820, 200, 900), upper_confidence)
+        parts = [placed("HF", (10, 840, 60, 920), 50.0), placed("ADING", (70, 840, 200, 920), 100.0)]
+
+        merged = ocr._merged([(UPPER, [upper]), (LOWER, parts)])
+
+        assert merged == ([upper] if kept == "upper" else parts)
+
+    def test_equal_reaches_and_confidences_keep_the_upper_bands(self):
+        upper, lower = placed("HEADING", (10, 820, 200, 900), 75.0), placed("HFADINC", (10, 840, 200, 920), 75.0)
+
+        assert ocr._merged([(UPPER, [upper]), (LOWER, [lower])]) == [upper]
+
+    def test_lines_apart_along_the_seam_are_each_their_own(self):
+        # Two headings cut by the seam in two columns: each line's parts are matched only with each other.
+        first = (placed("Parts", (10, 800, 200, 900), 90.0), placed("Pqrts", (10, 840, 200, 905), 90.0))
+        second = (placed("Prlce", (300, 835, 500, 900), 90.0), placed("Price", (300, 840, 500, 950), 90.0))
+
+        merged = ocr._merged([(UPPER, [first[0], second[0]]), (LOWER, [first[1], second[1]])])
+
+        assert merged == [first[0], second[1]]
+
+    def test_each_seam_keeps_its_own_lines_once(self):
+        # A tall word across each seam: rows 790..910 (UPPER read more) and 1650..1790 (LAST read more).
+        first, second = placed("Parts", (0, 790, 90, 900), 90.0), placed("Pqrts", (0, 840, 90, 910), 90.0)
+        third, last = placed("Prlce", (0, 1670, 90, 1740), 90.0), placed("Price", (0, 1680, 90, 1790), 90.0)
+
+        assert ocr._merged([(UPPER, [first]), (LOWER, [second, third]), (LAST, [last])]) == [first, last]
 
 
 class TestDisplayedBox:
@@ -1303,3 +1416,27 @@ class TestRealTesseract:
         assert result.status == "ok"
         assert len(line) == len(expected)
         assert sum(text in expected for text in line) >= 0.9 * len(expected)
+
+    @pytest.mark.parametrize("size", [100, 150, 200], ids=["24pt", "36pt", "48pt"])  # px at 300 DPI
+    @pytest.mark.parametrize("middle", [860, 870, 880])
+    def test_a_heading_taller_than_the_shared_strip_is_kept_from_one_band(self, size, middle):
+        # D6: the heading's ink, centred on row `middle`, is taller than the rows 840..899 the bands share and crosses
+        # both of their cut edges: neither band reads it whole, and tesseract reads each band's part as other words.
+        # Once merged, the words kept are one band's read of it, never both bands' (which duplicated it).
+        font = ImageFont.load_default(size=size)
+        image = Image.new("L", (2550, 1650), 255)
+        draw = ImageDraw.Draw(image)
+        _, top, _, bottom = draw.textbbox((0, 0), "Quarterly", font=font)
+        draw.text((150, middle - (top + bottom) // 2), "Quarterly", fill=0, font=font)
+        page = RenderedPage(pixels=image.tobytes(), px_width=image.width, px_height=image.height)
+        argv = [trusted_executable("tesseract"), "stdin", "stdout", "--psm", "3", "-l", "eng", "tsv"]
+
+        read = [(band, ocr._band_words(argv, band, 60.0)) for band in bands(page)]
+        merged = ocr._merged(read)
+
+        ink = ImageOps.invert(image).getbbox()
+        assert ink is not None and ink[1] < 840 and ink[3] > 900  # it crosses both cut edges
+        (_, upper), (_, lower) = read
+        assert isinstance(upper, list) and upper and isinstance(lower, list) and lower  # each band read a part
+        assert merged  # the heading is not lost
+        assert all(word in upper for word in merged) or all(word in lower for word in merged)
