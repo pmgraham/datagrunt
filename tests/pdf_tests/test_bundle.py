@@ -930,22 +930,44 @@ class TestVisionRoute:
             "contrast_normalized": True,
         }
 
-    def test_a_digital_page_is_bundled_from_its_drawn_image_at_its_own_dpi(self, tmp_path, monkeypatch):
+    def test_a_digital_page_still_renders_at_dpi(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "text.pdf", [PageSpec(items=tuple(body_text(100.0)))])
         document = extract_document(path)
         assert (document.pages[0].route, document.pages[0].page_image.dpi) == ("digital", 200.0)
-        calls = spied(monkeypatch)
-        written = write(document, tmp_path / "out", path)  # dpi=72: a page with an image keeps its own
-        assert calls == []  # drawn through its own loader, never rendered by the bundle
+        page = document.pages[0]
+        calls, draws = spied(monkeypatch), drawn_dpis(monkeypatch)
+        written = write(document, tmp_path / "out", path)  # dpi=72, not the 200 it was extracted at
+        assert (calls, draws) == ([], [DPI])  # drawn again at the write's dpi, through the page's draw: one render path
         image = written.pages[0].page_image
-        assert (image.dpi, image.contrast_normalized, image.band_paths) == (200.0, False, ())
+        size = render_size(page.width_pt, page.height_pt, DPI)
+        assert (image.dpi, (image.width_px, image.height_px), image.contrast_normalized, image.band_paths) == (
+            float(DPI),
+            size,
+            False,
+            (),
+        )
         assert manifest_of(tmp_path / "out")["page_images"][0] == {
             "page_number": 1,
             "origin": "render",
-            "dpi": 200.0,
+            "dpi": float(DPI),
             "contrast_normalized": False,
         }
-        assert load_bundle(tmp_path / "out") == written == document
+        drawn = render_page(path, 0, dpi=DPI, memory_cap_bytes=CAP, timeout_s=TIMEOUT)
+        assert png_pixels(image.image_path) == ("L", size, drawn.pixels)
+        assert load_bundle(tmp_path / "out") == written
+
+
+def drawn_dpis(monkeypatch) -> list:
+    """Record the dpi of each draw a page image's PageDraw makes (``_loaders.render_page``), and let it run."""
+    dpis: list = []
+    real = _loaders.render_page
+
+    def spy(src, page_index, **kwargs):
+        dpis.append(kwargs["dpi"])
+        return real(src, page_index, **kwargs)
+
+    monkeypatch.setattr(_loaders, "render_page", spy)
+    return dpis
 
 
 def without_page_images(document: PDFDocument) -> PDFDocument:
@@ -1017,6 +1039,66 @@ class TestDrawnPageImages:
         assert [entry["reason"] for entry in manifest_of(tmp_path / "drawn")["missing"]] == [
             f"the page was not rendered: RenderFailed: {path}: page {n}: the render worker reached its memory cap"
             for n in (1, 2)
+        ]
+
+    def test_a_drawn_image_at_the_writes_dpi_is_read_through_its_own_loader(self, tmp_path, monkeypatch):
+        path = digital_pdf(tmp_path)
+        document = extract_document(path)
+        written_from = []
+        real = bundle._own_outcome
+
+        def recorded(image, staging, source):
+            written_from.append(image)
+            return real(image, staging, source)
+
+        monkeypatch.setattr(bundle, "_own_outcome", recorded)
+
+        write_bundle(document, tmp_path / "out", source=path)  # dpi=200, as extracted
+
+        own = [page.page_image for page in document.pages]
+        assert sorted(map(id, written_from)) == sorted(map(id, own))  # each page's own image and loader, no other
+
+    @pytest.mark.parametrize(
+        ("dpi", "pixels"), [pytest.param(72, 16_000_000, id="lower-dpi"), pytest.param(200, 262_144, id="pixel-bound")]
+    )
+    def test_a_write_at_another_dpi_holds_images_drawn_at_it(self, tmp_path, monkeypatch, dpi, pixels):
+        path = digital_pdf(tmp_path)
+        document = extract_document(path)
+        draws = drawn_dpis(monkeypatch)
+
+        written = write_bundle(document, tmp_path / "drawn", source=path, dpi=dpi, max_render_pixels=pixels)
+        rendered = write_bundle(
+            without_page_images(document), tmp_path / "rendered", source=path, dpi=dpi, max_render_pixels=pixels
+        )
+
+        expected = [effective_dpi(dpi, pixels, page.width_pt, page.height_pt) for page in document.pages]
+        assert expected != [200, 200] and sorted(draws) == sorted(expected)
+        recorded = [entry["dpi"] for entry in manifest_of(tmp_path / "drawn")["page_images"]]
+        assert [page.page_image.dpi for page in written.pages] == recorded == [float(value) for value in expected]
+        for page, value in zip(written.pages, expected, strict=True):
+            size = render_size(page.width_pt, page.height_pt, value)
+            assert (
+                (page.page_image.width_px, page.page_image.height_px)
+                == size
+                == png_pixels(page.page_image.image_path)[1]
+            )
+        assert contents(tmp_path / "drawn") == contents(tmp_path / "rendered")  # as the bundle's own render writes them
+        assert load_bundle(tmp_path / "drawn") == written == rendered
+
+    def test_a_write_dpi_the_page_cannot_be_drawn_at_is_recorded(self, tmp_path, monkeypatch):
+        path = digital_pdf(tmp_path)
+        document = extract_document(path)
+
+        def refused(target_dpi, max_pixels, width, height):
+            raise RenderRefused(f"a {width} x {height} pt page renders 0 px tall at {target_dpi} DPI")
+
+        monkeypatch.setattr(bundle, "effective_dpi", refused)
+
+        write_bundle(document, tmp_path / "out", source=path, dpi=72)
+
+        assert [entry["reason"] for entry in manifest_of(tmp_path / "out")["missing"]] == [
+            "the page was not rendered: RenderRefused: a 612.0 x 792.0 pt page renders 0 px tall at 72 DPI",
+            "the page was not rendered: RenderRefused: a 400.0 x 300.0 pt page renders 0 px tall at 72 DPI",
         ]
 
     def test_a_draw_from_another_file_is_not_written(self, tmp_path):
