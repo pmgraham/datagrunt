@@ -210,6 +210,107 @@ class TestStreamTables:
         assert found.items[0].column_intervals == ((376.0, 400.0), (170.0, 200.0))
 
 
+# The 2026-11-02 audit's page 3 (P0-A): a table of figures with no header row, its first row a row like the others.
+FIGURES = (
+    ("2023", "101.4%", "$11,200.00", "+1.4%"),
+    ("2024", "98.2%", "$10,950.00", "-2.2%"),
+    ("2025", "103.0%", "$11,540.00", "+5.4%"),
+)
+FIGURE_XS = (72.0, 160.0, 260.0, 400.0)
+
+
+class TestHeaderRows:
+    """A first row of values like every row under it is a row, not headers, unless it is set apart (P0-A)."""
+
+    def test_a_first_row_of_figures_like_the_rows_under_it_stays_a_row(self, tmp_path):
+        items = laid_out(tmp_path, *table_runs(FIGURES, FIGURE_XS))
+
+        assert described(items) == [("table", FIGURES, False)]
+
+    def test_text_headers_over_rows_of_figures_are_headers(self, tmp_path):
+        rows = (("Year", "Utilization", "Cost", "Change"), *FIGURES)
+
+        assert described(laid_out(tmp_path, *table_runs(rows, FIGURE_XS))) == [("table", rows, True)]
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [pytest.param({"font": "Helvetica-Bold"}, id="bold"), pytest.param({"size": 13.0}, id="larger")],
+    )
+    def test_a_first_row_of_figures_set_apart_from_the_next_is_a_header(self, tmp_path, overrides):
+        # Years over counts: every cell a number, but the first row is set in another weight or size.
+        heads, counts = ("2023", "2024", "2025"), (("1,200", "1,350", "1,500"), ("980", "1,020", "1,110"))
+        runs = (*table_runs((heads,), **overrides), *table_runs(counts, top=154.0))
+
+        assert described(laid_out(tmp_path, *runs)) == [("table", (heads, *counts), True)]
+
+    def test_a_blank_cell_under_the_first_row_takes_no_part(self, tmp_path):
+        rows = (*FIGURES[:2], ("2025", "103.0%", "$11,540.00", ""))
+
+        assert described(laid_out(tmp_path, *table_runs(rows, FIGURE_XS))) == [("table", rows, False)]
+
+    @pytest.mark.parametrize(
+        "rows",
+        [
+            pytest.param((("12", "4"), ("2024-01-31", "5"), ("14", "6")), id="a-date-under-a-number"),
+            pytest.param((("12", "4"), ("13", "5"), ("Total", "9")), id="a-word-in-the-last-row"),
+            pytest.param((("12%", "4"), ("$13", "5")), id="an-amount-under-a-percentage"),
+        ],
+    )
+    def test_a_cell_under_it_of_another_kind_leaves_the_first_row_a_header(self, rows):
+        # Every row under the first must read as it does, column by column: one that does not is a header signal
+        # (a totals row with a word in a figures column, too: a known limitation of the rule).
+        lines = tuple(
+            line(*(cell(text, 10.0 + 100.0 * at, 10.0 + 20.0 * index) for at, text in enumerate(row)))
+            for index, row in enumerate(rows)
+        )
+
+        (found,) = layout._row_structures(list(lines), width=612.0, height=792.0)
+
+        assert (found.items[0].grid(), found.items[0].has_header) == (rows, True)
+
+    @pytest.mark.parametrize(
+        "text,kind",
+        [
+            ("2023", "number"),
+            ("-2.2", "number"),
+            ("+1,200", "number"),
+            ("11,200.00", "number"),
+            ("1.200,50", "number"),
+            (".5", "number"),
+            ("(1,200)", "number"),
+            ("\u22125", "number"),
+            ("11\u00a0200", "number"),
+            ("101.4%", "percent"),
+            ("+1.4 %", "percent"),
+            ("$11,200.00", "currency"),
+            ("-$5.00", "currency"),
+            ("€ 1.200,50", "currency"),
+            ("12 £", "currency"),
+            ("($40.00)", "currency"),
+            ("2023-02-14", "date"),
+            ("14/02/2023", "date"),
+            ("2.14.23", "date"),
+            ("14 Feb 2023", "date"),
+            ("February 14, 2023", "date"),
+            ("Sept. 2023", "date"),
+            ("14-Feb, 2023", "date"),
+            ("14 Feb#2023", None),
+            ("Bolt", None),
+            ("M12 x 1.75", None),
+            ("A.2", None),
+            ("10:30", None),
+            ("1.2.3.4", None),
+            ("1,2,3", None),
+            ("$", None),
+            ("%", None),
+            ("(12", None),
+            ("", None),
+        ],
+    )
+    def test_value_kinds(self, text, kind):
+        assert layout._value_kind(text) == kind
+
+
 class TestBands:
     """Cells cluster into X-bands by interval projection: a cell joins the band it overlaps or touches, no slack."""
 

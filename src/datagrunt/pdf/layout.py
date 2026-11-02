@@ -2156,13 +2156,78 @@ class StreamTable:
 
     @property
     def has_header(self) -> bool:
-        """A4a's rule (:func:`_has_header`): every cell of the first row non-blank."""
-        return _has_header(self.grid())
+        """A4a's rule (:func:`_has_header`: every cell of the first row non-blank), unless that row is values.
+
+        A first row of values like every row under it (:func:`_values_row`)
+        is a row: the PDF gives no header signal, unless the row is set
+        apart from the next (:func:`_set_apart`). Either way the row stays
+        verbatim; only where it goes (headers or rows) changes.
+        """
+        grid = self.grid()
+        return _has_header(grid) and (_set_apart(self.rows) or not _values_row(grid))
 
     @property
     def pieces(self) -> tuple[SpanPiece, ...]:
         """The char ranges its rows read, row by row."""
         return _lines_pieces(self.rows)
+
+
+def _values_row(grid: tuple[tuple[str, ...], ...]) -> bool:
+    """True if the first row is values like every row under it (P0-A, the 2026-11-02 audit's page 3).
+
+    Every first-row cell is a value (:func:`_value_kind`), and every
+    non-blank cell under it, in every row, is a value of the same kind as
+    the first row's cell in its column; at least one is. A row under it
+    with a word in a figures column (a "Total" row) leaves the first row a
+    header: a known limitation.
+    """
+    kinds = [_value_kind(text) for text in grid[0]]
+    if None in kinds:
+        return False
+    below = [(kind, row[column]) for row in grid[1:] for column, kind in enumerate(kinds) if row[column].strip()]
+    return bool(below) and all(_value_kind(text) == kind for kind, text in below)
+
+
+def _set_apart(rows: tuple[TextLine, ...]) -> bool:
+    """True if the first row is set apart from the second: one is bold and the other not, or their sizes differ."""
+    first, second = rows[0], rows[1]
+    return first.is_bold != second.is_bold or _tenths(first.font_size_pt) != _tenths(second.font_size_pt)
+
+
+def _value_kind(text: str) -> str | None:
+    """The kind of value ``text`` reads as, stripped: "percent", "currency", "date" or "number"; else None.
+
+    A value in brackets (a negative, in accounts) reads as the value.
+    """
+    value = text.strip()
+    if len(value) > 2 and value[0] == "(" and value[-1] == ")":
+        value = value[1:-1].strip()
+    return next((kind for kind, pattern in _VALUE_KINDS if pattern.fullmatch(value)), None)
+
+
+# Values (P0-A). A number: digits in groups of three between "," "." or a no-break space, or a run of digits; then
+# a decimal part after "." or ","; or only a decimal part. A sign: plus, hyphen-minus or the minus sign.
+_NUMBER = r"(?:(?:\d{1,3}(?:[,.\u00a0\u202f]\d{3})+|\d+)(?:[.,]\d+)?|[.,]\d+)"
+_SIGN = r"[+\-\u2212]?"
+_CURRENCY = r"[$\u00a2\u00a3\u00a5\u20ac\u20b9]"
+_MONTH = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]{0,6}\.?"
+# Each kind in the order tried: a percentage and an amount hold a number, so they come first.
+_VALUE_KINDS = (
+    ("percent", re.compile(rf"{_SIGN}{_NUMBER}\s?%")),
+    ("currency", re.compile(rf"{_SIGN}{_CURRENCY}\s?{_SIGN}{_NUMBER}|{_SIGN}{_NUMBER}\s?{_CURRENCY}")),
+    (
+        "date",
+        re.compile(
+            r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}"
+            r"|\d{1,2}[-/.]\d{1,2}[-/.](?:\d{4}|\d{2})"
+            rf"|\d{{1,2}}[- ]{_MONTH}[-, ]{{1,2}}(?:\d{{4}}|\d{{2}})"
+            rf"|{_MONTH} \d{{1,2}},? \d{{4}}"
+            rf"|{_MONTH} \d{{4}}",
+            re.IGNORECASE,
+        ),
+    ),
+    ("number", re.compile(rf"{_SIGN}{_NUMBER}")),
+)
 
 
 StreamElement = StreamItem | StreamTable
