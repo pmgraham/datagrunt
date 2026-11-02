@@ -4,17 +4,24 @@ Each case runs in a fresh interpreter, so the modules it imports (or blocks) are
 simulated as Python documents it: ``sys.modules[name] = None`` makes ``import name`` raise ModuleNotFoundError.
 """
 
+import importlib.metadata
 import json
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
 HINT = 'Install PDF support with: uv pip install "datagrunt[pdf]"'
 EXTRA_MODULES = ("pypdfium2", "PIL")  # Pillow imports as PIL
 CLASS_PATHS = ("datagrunt.PDFReader", "datagrunt.PDFWriter", "datagrunt.pdf.PDFReader", "datagrunt.pdf.PDFWriter")
 TIMEOUT_S = 120  # a cold interpreter imports polars, pyarrow and duckdb in about 1 s here
+PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
+# v4's PDF libraries, which 5.0 removed (#373), by their distribution and import names.
+REMOVED = frozenset({"pymupdf", "pdfplumber", "pytesseract", "fitz"})
 
 
 def run_python(code: str) -> dict:
@@ -132,3 +139,48 @@ def test_another_import_failure_propagates_unmasked():
     )
 
     assert result == ["ModuleNotFoundError", "datagrunt.pdf.pipeline", False]
+
+
+def _pyproject() -> dict:
+    """pyproject.toml, parsed (tomllib from Python 3.11; tomli, mypy's dependency, on 3.10)."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        tomllib = pytest.importorskip("tomli")
+    return tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+
+
+def test_pdf_extra_is_exactly_pypdfium2_and_pillow():
+    assert _pyproject()["project"]["optional-dependencies"]["pdf"] == ["pypdfium2>=5.9.0", "Pillow>=12.2.0"]
+
+
+def test_core_dependencies_and_python_floor_are_unchanged():
+    project = _pyproject()["project"]
+
+    assert project["dependencies"] == [
+        "duckdb>=1.5.3",
+        "polars>=1.41.2",
+        "pyarrow>=24.0.0",
+        "XlsxWriter>=3.2.9",
+        "fastexcel>=0.20.2",
+    ]
+    assert project["requires-python"] == ">=3.10"
+
+
+def test_no_mypy_override_names_a_removed_library():
+    overrides = _pyproject()["tool"]["mypy"]["overrides"]
+    modules = [module for override in overrides for module in override["module"]]
+
+    assert [module for module in modules if module.split(".")[0] in REMOVED] == []
+
+
+def test_installed_distribution_requires_no_removed_library():
+    requirements = [Requirement(line) for line in importlib.metadata.requires("datagrunt") or []]
+    pdf_extra = sorted(
+        f"{canonicalize_name(requirement.name)}{requirement.specifier}"
+        for requirement in requirements
+        if requirement.marker is not None and requirement.marker.evaluate({"extra": "pdf"})
+    )
+
+    assert [requirement.name for requirement in requirements if canonicalize_name(requirement.name) in REMOVED] == []
+    assert pdf_extra == ["pillow>=12.2.0", "pypdfium2>=5.9.0"]

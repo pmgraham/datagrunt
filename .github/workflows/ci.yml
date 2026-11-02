@@ -123,7 +123,7 @@ jobs:
     name: dependency audit (advisory)
     runs-on: ubuntu-latest
     # Advisory, NOT blocking: a newly published advisory in a transitive
-    # dependency (duckdb, polars, pyarrow, pymupdf, …) must not break CI or the
+    # dependency (duckdb, polars, pyarrow, pypdfium2, …) must not break CI or the
     # release path overnight. Findings surface in the step logs; promote to
     # blocking once a clean baseline + an ignore-list of accepted advisories is
     # curated (RUSTSEC-* / GHSA-* / PYSEC-*).
