@@ -55,7 +55,7 @@ from datagrunt.pdf import (
     Table,
 )
 from datagrunt.pdf._extra import LAZY_CLASSES as _LAZY_CLASSES
-from datagrunt.pdf._extra import load_class as _load_class
+from datagrunt.pdf._extra import load as _load
 
 # You can define __all__ to specify what gets imported with "from package
 # import *"
@@ -90,7 +90,7 @@ if TYPE_CHECKING:
     from datagrunt.pdf import PDFReader, PDFWriter
 
 
-def __getattr__(name: str) -> type:
+def __getattr__(name: str) -> object:
     """``PDFReader`` and ``PDFWriter`` load on first access: ``import datagrunt`` never needs the [pdf] extra.
 
     Without the extra, constructing either raises ``ImportError`` with the install hint
@@ -98,7 +98,7 @@ def __getattr__(name: str) -> type:
     """
     if name not in _LAZY_CLASSES:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    return _load_class(name)
+    return _load(name)
 
 
 def __dir__() -> list[str]:

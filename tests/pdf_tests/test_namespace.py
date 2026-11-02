@@ -8,6 +8,7 @@ import pytest
 
 import datagrunt
 import datagrunt.pdf
+import datagrunt.pdf.bundle
 import datagrunt.pdf.elements
 import datagrunt.pdf.exceptions
 import datagrunt.pdf.reader
@@ -42,7 +43,7 @@ V5_MODEL_NAMES = [
     "PDFSourceChangedError",
     "BundleCorruptError",
 ]
-PDF_PACKAGE_NAMES = [*V5_MODEL_NAMES, "PDFReader", "PDFWriter"]
+PDF_PACKAGE_NAMES = [*V5_MODEL_NAMES, "PDFReader", "PDFWriter", "load_bundle", "write_bundle"]
 # Spec §2.1: the classes, the element types and the exceptions (rationalize's names arrive in 5.1).
 TOP_LEVEL_PDF_NAMES = [
     "PDFReader",
@@ -81,11 +82,14 @@ EXCEPTION_NAMES = {
     "BundleCorruptError",
 }
 CLASS_MODULES = {"PDFReader": datagrunt.pdf.reader, "PDFWriter": datagrunt.pdf.writer}
+FUNCTION_MODULES = {"load_bundle": datagrunt.pdf.bundle, "write_bundle": datagrunt.pdf.bundle}
 
 
 def _defining_module(name: str):
     if name in CLASS_MODULES:
         return CLASS_MODULES[name]
+    if name in FUNCTION_MODULES:
+        return FUNCTION_MODULES[name]
     return datagrunt.pdf.exceptions if name in EXCEPTION_NAMES else datagrunt.pdf.elements
 
 
@@ -161,6 +165,13 @@ def test_public_raisers_name_the_exception_under_raises(member, name):
 @pytest.mark.parametrize("package", [datagrunt, datagrunt.pdf], ids=["datagrunt", "datagrunt.pdf"])
 def test_lazy_classes_are_listed_by_dir(package):
     assert {"PDFReader", "PDFWriter"} <= set(dir(package))
+
+
+def test_bundle_functions_are_listed_by_dir_and_stay_in_the_pdf_package():
+    assert set(FUNCTION_MODULES) <= set(dir(datagrunt.pdf))
+    for name in FUNCTION_MODULES:
+        assert name not in datagrunt.__all__
+        assert not hasattr(datagrunt, name)
 
 
 @pytest.mark.parametrize("package", [datagrunt, datagrunt.pdf], ids=["datagrunt", "datagrunt.pdf"])

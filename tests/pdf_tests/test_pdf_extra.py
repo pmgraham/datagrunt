@@ -99,6 +99,40 @@ def test_without_the_extra_import_works_and_first_use_raises_the_hint(missing):
         assert cause == "ModuleNotFoundError"
 
 
+@pytest.mark.parametrize("missing", [("pypdfium2",), ("PIL",), EXTRA_MODULES], ids=["pypdfium2", "Pillow", "both"])
+def test_without_the_extra_the_bundle_functions_raise_the_hint_when_called(missing):
+    result = run_python(
+        blocking(missing)
+        + textwrap.dedent(
+            """
+            import json
+            import datagrunt.pdf
+            from datagrunt.pdf import *
+
+            outcome = {"star": sorted(name for name in datagrunt.pdf.__all__ if name not in globals())}
+            for name in ("load_bundle", "write_bundle"):
+                function = getattr(datagrunt.pdf, name)
+                try:
+                    function("bundle")
+                except ImportError as exc:
+                    outcome[name] = [function.__name__, str(exc), exc.name, type(exc.__cause__).__name__]
+                else:
+                    outcome[name] = None
+            print(json.dumps(outcome))
+            """
+        )
+    )
+
+    assert result.pop("star") == []
+    for name in ("load_bundle", "write_bundle"):
+        assert result[name] is not None, f"{name}(...) raised nothing"
+        function_name, message, missing_name, cause = result[name]
+        assert function_name == name
+        assert HINT in message and name in message
+        assert missing_name.split(".")[0] in missing
+        assert cause == "ModuleNotFoundError"
+
+
 def test_without_the_extra_csv_and_parquet_still_work(tmp_path):
     source = tmp_path / "data.csv"
     source.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
