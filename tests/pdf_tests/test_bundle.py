@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -772,38 +773,86 @@ class TestFiguresSharingAStream:
         assert load_bundle(tmp_path / "out") == returned
 
 
-class TestChunks:
-    @pytest.mark.parametrize(("workers", "size"), [(1, 32), (2, 16), (3, 10), (4, 8), (8, 4), (9, 4), (64, 4)])
-    def test_chunk_size_is_the_specs(self, workers, size):
-        assert bundle._chunk_size(workers) == size
+def paged_pdf(directory: Path, count: int) -> Path:
+    """A PDF of ``count`` letter pages, a line of text each: digital pages, which a bundle renders."""
+    pages = [PageSpec(items=(TextRun(f"Page {number}", 72.0, 100.0),)) for number in range(1, count + 1)]
+    return build_pdf(directory / "pages.pdf", pages)
 
-    def test_chunks_cover_the_pages_in_order(self):
-        assert bundle._chunks(70, 1) == (range(0, 32), range(32, 64), range(64, 70))
-        assert bundle._chunks(9, 8) == (range(0, 4), range(4, 8), range(8, 9))
-        assert bundle._chunks(0, 1) == ()
 
-    def test_a_chunk_ends_before_the_next_begins_and_workers_run_together(self, tmp_path, source, monkeypatch):
-        events, lock = [], threading.Lock()
-        running = {"now": 0, "most": 0}
+class InFlight:
+    """A ThreadPoolExecutor stand-in's record: the most tasks submitted and not yet done at any submit."""
 
-        def tracked(src, page_index, *, dpi, **kwargs):
-            with lock:
-                running["now"] += 1
-                running["most"] = max(running["most"], running["now"])
-                events.append(("start", page_index))
-            time.sleep(0.05 if page_index == 0 else 0.3)
-            with lock:
-                running["now"] -= 1
-                events.append(("end", page_index))
-            return fake_render(src, page_index, dpi=dpi, **kwargs)
+    def __init__(self) -> None:
+        self.lock, self.futures, self.most = threading.Lock(), [], 0
 
-        monkeypatch.setattr(bundle, "render_page", tracked)
-        monkeypatch.setattr(bundle, "_chunk_size", lambda workers: 2)
-        write(bound_document(source), tmp_path / "out", source, workers=2)
-        assert running["most"] == 2
-        first_chunk_end = max(i for i, event in enumerate(events) if event[0] == "end" and event[1] in (0, 1))
-        second_chunk_start = min(i for i, event in enumerate(events) if event[0] == "start" and event[1] in (2, 3))
-        assert first_chunk_end < second_chunk_start
+    def executor(self, *args, **kwargs) -> ThreadPoolExecutor:
+        record = self
+
+        class Counting(ThreadPoolExecutor):
+            def submit(self, fn, /, *call_args, **call_kwargs):
+                with record.lock:
+                    live = sum(not future.done() for future in record.futures) + 1
+                    record.most = max(record.most, live)
+                    future = super().submit(fn, *call_args, **call_kwargs)
+                    record.futures.append(future)
+                return future
+
+        return Counting(*args, **kwargs)
+
+
+def gathered(parties: int):
+    """A render stand-in whose first ``parties`` pages wait for each other: the call fails unless they run together."""
+    together = threading.Barrier(parties, timeout=10.0)
+
+    def render(src, page_index, **kwargs):
+        if page_index < parties:
+            together.wait()  # BrokenBarrierError, failing the call, unless the pages are in flight at once
+        return fake_render(src, page_index, **kwargs)
+
+    return render
+
+
+def last_first(count: int):
+    """A render stand-in whose page 1 ends only once the other ``count - 1`` pages have; and the order pages end in."""
+    others, lock, ended = threading.Event(), threading.Lock(), []
+
+    def render(src, page_index, **kwargs):
+        if page_index == 0:
+            assert others.wait(timeout=10.0), "page 1 held up the pages after it"
+        drawn = fake_render(src, page_index, **kwargs)
+        with lock:
+            ended.append(page_index)
+            if len(ended) == count - 1 and 0 not in ended:
+                others.set()
+        return drawn
+
+    return render, ended
+
+
+class TestWorkers:
+    """Pages render on ``workers`` threads in a sliding window: at most ``workers`` in flight, the next as one ends."""
+
+    @pytest.mark.parametrize("workers", [2, 8])
+    def test_workers_pages_render_together_and_no_more_are_in_flight(self, tmp_path, monkeypatch, workers):
+        path = paged_pdf(tmp_path, 10)
+        document = extract_document(path, ocr="never")
+        flight = InFlight()
+        monkeypatch.setattr(bundle, "render_page", gathered(workers))
+        monkeypatch.setattr(bundle, "ThreadPoolExecutor", flight.executor)
+        write(document, tmp_path / "out", path, workers=workers)
+        assert flight.most == workers
+        assert manifest_of(tmp_path / "out")["missing"] == []
+
+    def test_a_slow_page_holds_one_thread_never_the_others(self, tmp_path, monkeypatch):
+        path = paged_pdf(tmp_path, 5)
+        document = extract_document(path, ocr="never")
+        render, ended = last_first(5)
+        monkeypatch.setattr(bundle, "render_page", render)
+        returned = write(document, tmp_path / "out", path, workers=2)
+        assert ended == [1, 2, 3, 4, 0]  # one thread held page 1; the other rendered the rest, one after another
+        assert [page.page_image.image_path.name for page in returned.pages] == [
+            f"page_000{number}.png" for number in range(1, 6)
+        ]
 
     def test_workers_write_the_same_bundle(self, tmp_path, written):
         out = tmp_path / "out"

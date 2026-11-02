@@ -60,11 +60,13 @@ included, the staging directory is removed and the error raised. A writer
 killed outright leaves its staging directory, the only trace: no
 ``output_dir``; the next write makes its own and ignores it.
 
-Pages are written in chunks of :func:`_chunk_size` (``max(4, 32 //
-workers)``) pages, on ``workers`` threads (each render is a worker process
-of A5a's, as is each own page image's loader). Each page's PNGs are written
-in its own thread, so no page's pixels outlive it; a chunk is done before
-the next starts.
+Pages are written on ``workers`` threads (each render is a worker process
+of A5a's, as is each own page image's loader), in a sliding window
+(:func:`_in_page_order`): at most ``workers`` pages are in flight, and the
+next page starts as soon as one ends, so a slow page holds one thread,
+never the others. Each page's PNGs are written in its own thread, so no
+page's pixels outlive it: at most ``workers`` pages' pixels are held at
+once. The outcomes are recorded in page order.
 
 The returned document is the input with paths set: each figure's
 ``image_path`` (in ``sections`` too), and each page's ``page_image``. A
@@ -170,10 +172,11 @@ import stat
 import uuid
 import warnings
 from collections.abc import Callable, Iterator, Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
-from typing import IO, BinaryIO, NamedTuple, cast
+from typing import IO, BinaryIO, NamedTuple, TypeVar, cast
 
 from PIL import Image
 
@@ -236,6 +239,7 @@ _PARAM_KEYS = ("dpi", "vision_dpi", "max_render_pixels", "workers")
 _MISSING_ARTIFACTS = ("bands", "figure", "page_image")
 # Where a page image came from: the document's own (its loaders), or the bundle's render at dpi.
 _ORIGINS = ("document", "render")
+_T = TypeVar("_T")
 
 
 class _Artifact(NamedTuple):
@@ -565,34 +569,43 @@ def _png(read: Callable[[], bytes]) -> tuple[bytes | None, str]:
     return data, ""
 
 
-def _chunk_size(workers: int) -> int:
-    """Pages a chunk holds: the spec's ``max(4, 32 // workers)``."""
-    return max(4, 32 // workers)
+def _in_page_order(task: Callable[[Page], _T], pages: tuple[Page, ...], workers: int, prefix: str) -> list[_T]:
+    """``task`` of every page on ``workers`` threads, at most ``workers`` in flight; the outcomes, in page order.
 
-
-def _chunks(page_count: int, workers: int) -> tuple[range, ...]:
-    """The page indices, in order, in runs of :func:`_chunk_size` (the last may be shorter)."""
-    size = _chunk_size(workers)
-    return tuple(range(start, min(start + size, page_count)) for start in range(0, page_count, size))
+    A sliding window: the next page is submitted as soon as one ends, so a
+    slow page holds one thread, never the others, and no more than
+    ``workers`` pages are ever submitted and unfinished. An error a task
+    raises fails the call, once the pages in flight have ended.
+    """
+    outcomes: dict[int, _T] = {}
+    queued = iter(range(len(pages)))
+    running: dict[Future[_T], int] = {}
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix=prefix)
+    try:
+        for _ in range(len(pages) + 1):  # bounded: each pass collects at least one page, but the last
+            for index in islice(queued, workers - len(running)):
+                running[pool.submit(task, pages[index])] = index
+            if not running:
+                break
+            done, _pending = wait(running, return_when=FIRST_COMPLETED)
+            for future in done:
+                outcomes[running.pop(future)] = future.result()
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    return [outcomes[index] for index in range(len(pages))]
 
 
 def _write_renders(
     document: PDFDocument, staging: Path, source: PDFSource, options: PipelineOptions, ledger: _Ledger
 ) -> dict[int, _Written]:
-    """Write every page's image, chunk by chunk on ``workers`` threads; each page image written, by number."""
+    """Write every page's image on ``workers`` threads (:func:`_in_page_order`); each page image written, by number."""
     renders: dict[int, _Written] = {}
-    pages = document.pages
 
     def task(page: Page) -> _PageOutcome:
         return _page_outcome(page, staging, source, options)
 
-    pool = ThreadPoolExecutor(max_workers=options.workers, thread_name_prefix="datagrunt-bundle")
-    try:
-        for chunk in _chunks(len(pages), options.workers):
-            for outcome in pool.map(task, [pages[index] for index in chunk]):
-                _record(outcome, renders, ledger)
-    finally:
-        pool.shutdown(wait=True, cancel_futures=True)
+    for outcome in _in_page_order(task, document.pages, options.workers, "datagrunt-bundle"):
+        _record(outcome, renders, ledger)
     return renders
 
 

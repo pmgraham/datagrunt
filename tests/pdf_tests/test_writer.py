@@ -12,7 +12,6 @@ import logging
 import os
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -48,9 +47,13 @@ from pdf_tests.test_bundle import (
     CAP,
     TIMEOUT,
     UNREADABLE,
+    InFlight,
     OwnFigure,
     fake_render,
+    gathered,
+    last_first,
     manifest_of,
+    paged_pdf,
     png_pixels,
     shared_stream_pdf,
     source_pdf,
@@ -999,53 +1002,32 @@ class TestRenderPagesAsImages:
         assert list((tmp_path / "pages").iterdir()) == []
 
     def test_paths_are_in_page_order_whatever_order_the_pages_finish(self, tmp_path, monkeypatch):
-        def slow_first(src, page_index, **kwargs):
-            time.sleep(0.3 if page_index == 0 else 0.0)
-            return fake_render(src, page_index, **kwargs)
-
-        monkeypatch.setattr(bundle, "render_page", slow_first)
+        render, ended = last_first(4)
+        monkeypatch.setattr(bundle, "render_page", render)
         paths = PDFWriter(source_pdf(tmp_path), ocr="never", dpi=72, workers=4).render_pages_as_images(
             tmp_path / "pages"
         )
+        assert ended[-1] == 0  # page 1 ended last, yet is listed first
         assert paths == page_files(tmp_path / "pages", (1, 2, 3, 4))
-        first, *others = (path.stat().st_mtime_ns for path in paths)
-        assert all(first >= other for other in others)  # page 1 finished last, yet is listed first
 
-    def test_pages_render_in_chunks_of_the_specs_size(self, tmp_path, monkeypatch):
-        sizes = []
-        real = bundle._chunk_size
+    @pytest.mark.parametrize("workers", [2, 8])
+    def test_workers_pages_render_together_and_no_more_are_in_flight(self, tmp_path, monkeypatch, workers):
+        made = PDFWriter(paged_pdf(tmp_path, 10), ocr="never", dpi=72, workers=workers)
+        made._extracted()
+        flight = InFlight()
+        monkeypatch.setattr(bundle, "render_page", gathered(workers))
+        monkeypatch.setattr(bundle, "ThreadPoolExecutor", flight.executor)
+        paths = made.render_pages_as_images(tmp_path / "pages")
+        assert flight.most == workers
+        assert paths == page_files(tmp_path / "pages", range(1, 11))
 
-        def recorded(workers):
-            sizes.append((workers, real(workers)))
-            return real(workers)
-
-        monkeypatch.setattr(bundle, "_chunk_size", recorded)
-        spied_renders(monkeypatch)
-        PDFWriter(source_pdf(tmp_path), ocr="never", dpi=72, workers=3).render_pages_as_images(tmp_path / "pages")
-        assert sizes == [(3, 10)]
-
-    def test_a_chunk_ends_before_the_next_begins_and_workers_run_together(self, tmp_path, monkeypatch):
-        events, lock = [], threading.Lock()
-        running = {"now": 0, "most": 0}
-
-        def tracked(src, page_index, *, dpi, **kwargs):
-            with lock:
-                running["now"] += 1
-                running["most"] = max(running["most"], running["now"])
-                events.append(("start", page_index))
-            time.sleep(0.05 if page_index == 0 else 0.3)
-            with lock:
-                running["now"] -= 1
-                events.append(("end", page_index))
-            return fake_render(src, page_index, dpi=dpi, **kwargs)
-
-        monkeypatch.setattr(bundle, "render_page", tracked)
-        monkeypatch.setattr(bundle, "_chunk_size", lambda workers: 2)
-        PDFWriter(source_pdf(tmp_path), ocr="never", dpi=72, workers=2).render_pages_as_images(tmp_path / "pages")
-        assert running["most"] == 2
-        first_chunk_end = max(i for i, event in enumerate(events) if event[0] == "end" and event[1] in (0, 1))
-        second_chunk_start = min(i for i, event in enumerate(events) if event[0] == "start" and event[1] in (2, 3))
-        assert first_chunk_end < second_chunk_start
+    def test_a_slow_page_holds_one_thread_never_the_others(self, tmp_path, monkeypatch):
+        render, ended = last_first(5)
+        monkeypatch.setattr(bundle, "render_page", render)
+        made = PDFWriter(paged_pdf(tmp_path, 5), ocr="never", dpi=72, workers=2)
+        paths = made.render_pages_as_images(tmp_path / "pages")
+        assert ended == [1, 2, 3, 4, 0]
+        assert paths == page_files(tmp_path / "pages", range(1, 6))
 
     def test_existing_page_files_are_replaced(self, tmp_path, monkeypatch):
         spied_renders(monkeypatch)

@@ -81,10 +81,10 @@ Each method writes the document in one form. A path returned is absolute
   :func:`~datagrunt.pdf.render.effective_dpi` of ``dpi`` (the writer's when
   None) and ``max_render_pixels``, each page's size the document's, as 8-bit
   grey ``page_NNNN.png`` in ``output_dir``. A vision page is rendered too:
-  its own page image is the bundle's to keep. Pages render in chunks of the
-  bundle's ``max(4, 32 // workers)`` pages on ``workers`` threads, a chunk
-  done before the next starts; each page's pixels are written in its own
-  thread and do not outlive it. A page whose render is refused or fails
+  its own page image is the bundle's to keep. Pages render on ``workers``
+  threads in the bundle's sliding window: at most ``workers`` in flight,
+  the next starting as soon as one ends; each page's pixels are written in
+  its own thread and do not outlive it. A page whose render is refused or fails
   (``RenderRefused``, ``RenderFailed``: its effective DPI's refusal too) is
   skipped, never silently: a warning on the module logger names the page
   and why. Any other error fails the call. The paths returned are the files
@@ -127,7 +127,6 @@ import logging
 import os
 import uuid
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -140,7 +139,15 @@ from datagrunt.pdf._source import checked_pdf_file
 from datagrunt.pdf._validate import checked_password as _checked_password
 from datagrunt.pdf._validate import checked_path as _checked_path
 from datagrunt.pdf._validate import int_at_least, strict_bool
-from datagrunt.pdf.bundle import _checked_target, _chunks, _drawn, _figure_unbound, _Pictures, _png, write_bundle
+from datagrunt.pdf.bundle import (
+    _checked_target,
+    _drawn,
+    _figure_unbound,
+    _in_page_order,
+    _Pictures,
+    _png,
+    write_bundle,
+)
 from datagrunt.pdf.codec import document_to_json_bytes
 from datagrunt.pdf.elements import Figure, Page, PDFDocument
 from datagrunt.pdf.frame import _BBOX_FIELDS, element_frame, utf8_text
@@ -512,20 +519,13 @@ def _write_figures(figures: tuple[Figure, ...], directory: Path, *, dedupe: bool
 def _write_renders(
     pages: tuple[Page, ...], directory: Path, source: PDFSource, dpi: int, options: PipelineOptions
 ) -> list[Path]:
-    """Render and write every page, chunk by chunk on ``workers`` threads; the paths written, in page order."""
-    written: list[Path] = []
+    """Render and write every page on ``workers`` threads (the bundle's window); the paths written, in page order."""
 
     def task(page: Page) -> Path | None:
         return _rendered(page, directory, source, dpi, options.max_render_pixels)
 
-    pool = ThreadPoolExecutor(max_workers=options.workers, thread_name_prefix="datagrunt-writer")
-    try:
-        for chunk in _chunks(len(pages), options.workers):
-            outcomes = pool.map(task, [pages[index] for index in chunk])
-            written.extend(path for path in outcomes if path is not None)
-    finally:
-        pool.shutdown(wait=True, cancel_futures=True)
-    return written
+    outcomes = _in_page_order(task, pages, options.workers, "datagrunt-writer")
+    return [path for path in outcomes if path is not None]
 
 
 def _rendered(page: Page, directory: Path, source: PDFSource, dpi: int, max_pixels: int) -> Path | None:
