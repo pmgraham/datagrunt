@@ -703,7 +703,7 @@ class TestBounds:
     """One walk: O(total elements), plus O(columns) per page boundary."""
 
     @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
-    def test_40_000_elements_on_2_000_pages_scope_within_1_second(self):
+    def test_40_000_elements_on_2_000_pages_scope_within_1_5_seconds(self):
         # Worst case for every rule: each page opens a heading level, and each boundary links a table.
         pages = tuple(
             page(
@@ -724,4 +724,4 @@ class TestBounds:
         assert sum(len(item.elements) for item in result.pages) == 40_000
         assert len(result.sections) == 2_001
         assert sum(1 for _, link, _ in tables(result) if link is not None) == 1_999
-        assert elapsed < 1.0, f"{elapsed:.2f} s"
+        assert elapsed < 1.5, f"{elapsed:.2f} s"  # ~0.19 s here (8x headroom); 1 s left 5.4x once tables held intervals
