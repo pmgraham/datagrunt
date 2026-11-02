@@ -48,7 +48,7 @@ A hard limit alone fails quietly: an allocation past it fails inside
 pdfium, which then draws the page without that image, and without an error.
 The watchdog fails the page instead, so the backstop sits above it. The
 margin, from measurements on Linux (arm64, pypdfium2 5.14, pdfium 156; 125
-pages: the corpus, an image at each of the guard's bounds, JBIG2 bombs):
+pages: the corpus, an image at each of the guard's bounds, large JBIG2 images):
 
 - A worker's peak RSS and its address space grow alike while it draws,
   within 3 MiB, though it holds ~840 MiB of address space beyond its RSS
@@ -58,9 +58,8 @@ pages: the corpus, an image at each of the guard's bounds, JBIG2 bombs):
   margin is used.
 - The margin is set by single allocations, mapped whole before they are
   touched. For an image the guard sizes, the largest is a filter's output
-  ahead of the image codec: ASCII85 decodes "z" to 4 bytes, so a stream
-  within the 1 GiB asset limit decodes, in one allocation, to at most
-  4 GiB (measured: 1,200 MiB from a 300 MiB stream). The others measured
+  ahead of the image codec, at most 4 times the 1 GiB asset limit in one
+  allocation (measured: 1,200 MiB from a 300 MiB stream). The others measured
   are smaller: a raw stream loaded whole (674 MiB; at most the asset
   limit), a decoded bitmap (253 MiB at 88.4 M pixels; at most
   89,478,485 x 4 bytes, 341 MiB), JBIG2's buffers (249 MiB), a progressive
@@ -214,8 +213,8 @@ _WATCH_START_S = 5.0  # the watchdog's first reading is taken within this, or th
 _MAX_PROC_FILE_BYTES = 1 << 16  # /proc/self/status is ~1.5 KB
 _CAPPED_PLATFORMS = ("linux", "darwin", "win32")
 
-# The backstop's margin over the cap (Linux's RLIMIT_AS, Windows' commit limit; see the module notes): ASCII85
-# decodes "z" to 4 bytes, so a stream within the asset limit decodes to at most 4 times it in one allocation.
+# The backstop's margin over the cap (Linux's RLIMIT_AS, Windows' commit limit; see the module notes): a filter's
+# output ahead of the image codec is at most 4 times the asset limit in one allocation.
 _BACKSTOP_MARGIN_BYTES = 4 * _MAX_ASSET_BYTES
 
 _WHITE = 0xFFFFFFFF
