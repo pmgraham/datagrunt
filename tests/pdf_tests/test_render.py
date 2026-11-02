@@ -14,7 +14,7 @@ from pathlib import Path
 import pypdfium2.raw as pdfium_c
 import pytest
 
-from datagrunt.pdf import DatagruntPDFError, PDFCorruptError, _pdfium_images, pdfium_engine, render
+from datagrunt.pdf import DatagruntPDFError, PDFCorruptError, _pdfium_images, _render_worker, pdfium_engine
 from datagrunt.pdf.pdfium_engine import image_refusal, loaded_page, open_document, page_images
 from datagrunt.pdf.render import RenderRefused, effective_dpi, render_size
 from pdf_tests.builders import FormXObject, PageSpec, RasterImage, break_page, build_pdf, hand_written_pdf
@@ -345,13 +345,13 @@ class TestImageGuard:
 
         message = f"page 1: {JPX_BOMB_REFUSAL.format(index=0)}; the page is not rendered"
         with pytest.raises(RenderRefused, match=re.escape(message)):
-            with render._guarded_page(path, 0, None):
+            with _render_worker._guarded_page(path, 0, None):
                 pytest.fail("the guard let a refused page through")
 
     def test_a_page_that_passes_is_yielded_loaded_with_its_geometry(self, tmp_path):
         path = one_page(tmp_path, RasterImage(60.0, 40.0, 120.0, 80.0, PNG), rotate=90)
 
-        with render._guarded_page(path, 0, None) as (page, geometry):
+        with _render_worker._guarded_page(path, 0, None) as (page, geometry):
             assert (geometry.page_number, geometry.width_pt, geometry.height_pt) == (1, 300.0, 400.0)
             assert pdfium_c.FPDFPage_CountObjects(page.raw) == 1
 
@@ -359,7 +359,7 @@ class TestImageGuard:
         path = break_page(build_pdf(tmp_path / "broken.pdf", [PageSpec()]), 1)
 
         with pytest.raises(PDFCorruptError, match="page 1 is unreadable"):
-            with render._guarded_page(path, 0, None):
+            with _render_worker._guarded_page(path, 0, None):
                 pytest.fail("an unloadable page was yielded")
 
     @pytest.mark.parametrize(
@@ -380,19 +380,19 @@ class TestImageGuard:
 
     def test_the_guard_walks_under_its_bound(self, tmp_path, monkeypatch):
         path = content_page(tmp_path, FOUR_PATHS)
-        monkeypatch.setattr(render, "_MAX_GUARD_OBJECTS", 4)
-        with render._guarded_page(path, 0, None) as (page, _geometry):
+        monkeypatch.setattr(_render_worker, "_MAX_GUARD_OBJECTS", 4)
+        with _render_worker._guarded_page(path, 0, None) as (page, _geometry):
             assert pdfium_c.FPDFPage_CountObjects(page.raw) == 4
 
-        monkeypatch.setattr(render, "_MAX_GUARD_OBJECTS", 3)
+        monkeypatch.setattr(_render_worker, "_MAX_GUARD_OBJECTS", 3)
         message = "page 1: the page holds 4 objects, over the guard's 3-object bound; the page is not rendered"
         with pytest.raises(RenderRefused, match=re.escape(message)):
-            with render._guarded_page(path, 0, None):
+            with _render_worker._guarded_page(path, 0, None):
                 pytest.fail("a page over the guard's bound was yielded")
 
     def test_the_guard_walk_bound(self):
         # ~250 times the corpus's busiest page (3,977 objects, forms' included).
-        assert render._MAX_GUARD_OBJECTS == 1_000_000
+        assert _render_worker._MAX_GUARD_OBJECTS == 1_000_000
 
 
 def chained_forms(tmp_path: Path, depth: int, last: bytes) -> Path:

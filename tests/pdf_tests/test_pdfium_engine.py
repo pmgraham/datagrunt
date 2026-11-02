@@ -132,7 +132,7 @@ class TestModuleImports:
     @pytest.mark.parametrize(
         "module,allowed",
         [
-            pytest.param(_pdfium_common, set(), id="common"),
+            pytest.param(_pdfium_common, {"datagrunt.pdf._boxes"}, id="common"),
             pytest.param(_hidden_rules, {"datagrunt.pdf.elements"}, id="hidden-rules"),
             pytest.param(
                 _pdfium_text,

@@ -961,6 +961,7 @@ class TestModuleImports:
     def test_imports_only_the_raw_fact_types_and_a1(self):
         allowed = {
             "datagrunt.pdf._hidden_rules",
+            "datagrunt.pdf._options",  # OcrMode, which the caller checks without pdfium
             "datagrunt.pdf._pdfium_common",
             "datagrunt.pdf._pdfium_images",
             "datagrunt.pdf._pdfium_recover",

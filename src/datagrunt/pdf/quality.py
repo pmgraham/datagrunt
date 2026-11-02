@@ -180,9 +180,10 @@ from bisect import bisect_left
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from itertools import groupby
-from typing import Literal, NamedTuple, TypeAlias, get_args
+from typing import NamedTuple, get_args
 
 from datagrunt.pdf._hidden_rules import em_reasons, off_page
+from datagrunt.pdf._options import OcrMode
 from datagrunt.pdf._pdfium_common import Box, union_box
 from datagrunt.pdf._pdfium_images import RawImage
 from datagrunt.pdf._pdfium_recover import RecoveredText, duplicate_window
@@ -219,13 +220,6 @@ __all__ = [
     "raster_cover_fraction",
     "valid_char",
 ]
-
-OcrMode: TypeAlias = Literal["auto", "always", "never"]
-"""The reader's OCR option: ``"auto"`` routes by the page's text,
-``"always"`` sends every page to vision, ``"never"`` routes no page to OCR:
-a page without enough valid text, or whose text is mostly invalid, stays
-digital (with a warning) instead of going to vision, and one that would be
-hybrid stays digital."""
 
 _OCR_MODES: tuple[OcrMode, ...] = get_args(OcrMode)
 

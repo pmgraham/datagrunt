@@ -3,8 +3,10 @@
 Internal: not exported from ``datagrunt`` or ``datagrunt.pdf``. Each wait is
 bounded, and each read of a child's stderr too.
 
-The Python worker launcher, shared by the render worker (``render.py``) and
-the page workers (``pipeline.py``):
+The Python worker launcher, shared by the render worker (``render.py``), the
+page workers (``pipeline.py``) and the figure workers (``_loaders.py``).
+Every pdfium call on a PDF is a worker's: the caller starts workers and
+reads their replies, and never imports pypdfium2.
 
 - The worker is a plain subprocess, ``python -I -c BOOTSTRAP``
   (:func:`worker_command`): it never imports the caller's main module, so a
@@ -46,12 +48,15 @@ pipe another thread is reading.
 import json
 import mmap
 import os
+import pickle
 import struct
 import subprocess
 import sys
 import threading
 from types import MappingProxyType
 from typing import IO
+
+from datagrunt.pdf.exceptions import DatagruntPDFError
 
 __all__ = [
     "BOOTSTRAP",
@@ -65,6 +70,9 @@ __all__ = [
     "StderrTail",
     "close_pipes",
     "drained",
+    "error_reply",
+    "next_reply",
+    "read_error",
     "read_message",
     "reaped",
     "request_payload",
@@ -80,7 +88,11 @@ STDERR_THREAD = "datagrunt-stderr"  # the name of each stderr drain thread
 
 # The workers a request may name, by key: (module, function). The function takes the request and the replies stream.
 WORKERS = MappingProxyType(
-    {"render": ("datagrunt.pdf.render", "_worker_main"), "pages": ("datagrunt.pdf.pipeline", "_worker_main")}
+    {
+        "figures": ("datagrunt.pdf._figure_worker", "_worker_main"),
+        "pages": ("datagrunt.pdf._page_worker", "_worker_main"),
+        "render": ("datagrunt.pdf._render_worker", "_worker_main"),
+    }
 )
 MAX_REQUEST_BYTES = 1 << 20  # the JSON request on a worker's stdin
 LENGTH = struct.Struct("<Q")  # each reply's length, before it
@@ -111,6 +123,9 @@ getattr(importlib.import_module(module), function)(message.get("request"), repli
 """
 
 
+_NO_WORKER = "datagrunt reads PDFs in worker processes and cannot start one here"
+
+
 class NoInterpreter(Exception):
     """There is no Python interpreter to start a worker with: nothing is started."""
 
@@ -119,18 +134,20 @@ class MessageTooLong(Exception):
     """A reply's length is over its reader's bound: it is not read."""
 
 
-def worker_command(label: str) -> list[str]:
-    """The worker's command line, which holds nothing of the request; ``label`` names the worker in an error.
+def worker_command() -> list[str]:
+    """The worker's command line, which holds nothing of the request.
 
     Reads :data:`BOOTSTRAP` when called.
 
     Raises:
-        NoInterpreter: In a frozen application, or when ``sys.executable`` is empty.
+        NoInterpreter: In a frozen application, or when ``sys.executable`` is
+            empty, naming the cause plainly: datagrunt reads PDFs in worker
+            processes only, so nothing is read.
     """
     if getattr(sys, "frozen", False):
-        raise NoInterpreter(f"a frozen application has no Python interpreter to start {label} with")
+        raise NoInterpreter(f"this application is frozen (sys.frozen): {_NO_WORKER}")
     if not sys.executable:
-        raise NoInterpreter(f"sys.executable is empty: there is no Python interpreter for {label}")
+        raise NoInterpreter(f"sys.executable is empty: {_NO_WORKER}")
     return [sys.executable, "-I", "-c", BOOTSTRAP]
 
 
@@ -202,6 +219,70 @@ def read_message(stream: IO[bytes], bound: int) -> bytes | None:
         raise MessageTooLong(f"a {length}-byte message, over the {bound}-byte bound")
     message = stream.read(length)
     return message if len(message) == length else None
+
+
+def next_reply(
+    child: "subprocess.Popen[bytes]", stream: IO[bytes], bound_s: float, max_bytes: int
+) -> tuple[bytes | None, bool]:
+    """``child``'s next reply on ``stream`` within ``bound_s``, or None when its replies end; and whether it was killed.
+
+    A timer kills ``child`` at the bound, which ends ``stream``: no read
+    outlives it. The timer is stopped before this returns, so a kill never
+    reaches a reaped (reusable) pid.
+
+    Raises:
+        MessageTooLong: If the reply's length is over ``max_bytes`` (unread).
+    """
+    expired = threading.Event()
+    killer = threading.Timer(max(0.0, bound_s), _expire, args=(child, expired))
+    killer.daemon = True
+    killer.start()
+    try:
+        return read_message(stream, max_bytes), expired.is_set()
+    finally:
+        killer.cancel()
+        killer.join(REAP_TIMEOUT_S)
+
+
+def _expire(child: "subprocess.Popen[bytes]", expired: threading.Event) -> None:
+    """The timer's: the child's reply is past its bound; kill it."""
+    expired.set()
+    child.kill()
+
+
+# The exceptions a worker sends as they are: the caller can import them without pdfium. Any other is sent as a
+# DatagruntPDFError naming its type and message.
+_PORTABLE_MODULES = ("builtins", "datagrunt.pdf.exceptions")
+
+
+def error_reply(exc: Exception) -> bytes:
+    """``exc``, pickled for its caller: as it is if the caller can import its type, else as a DatagruntPDFError.
+
+    A worker sends the exception that stops it; the caller raises it. An
+    exception whose type lives in a pdfium module (or that cannot be
+    pickled) crosses as a ``DatagruntPDFError`` saying ``"<type>: <message>"``.
+    """
+    if type(exc).__module__ in _PORTABLE_MODULES:
+        try:
+            return pickle.dumps(exc)
+        except Exception:  # an argument that cannot be pickled: sent in words below, never dropped
+            pass
+    return pickle.dumps(DatagruntPDFError(f"{type(exc).__name__}: {exc}"))
+
+
+def read_error(body: bytes, who: str) -> Exception:
+    """The exception a worker (``who``) sent (:func:`error_reply`); anything else is a DatagruntPDFError saying so.
+
+    Unpickling is acceptable here: the worker is the caller's own process
+    image, run with its privileges and its exact ``sys.path``.
+    """
+    try:
+        error = pickle.loads(body)
+    except Exception as exc:  # a reply that is not an exception's pickle: said, never raised as something else
+        return DatagruntPDFError(f"{who} sent an error that cannot be read: {type(exc).__name__}: {exc}")
+    if not isinstance(error, Exception):
+        return DatagruntPDFError(f"{who} sent a {type(error).__name__} as its error")
+    return error
 
 
 def close_pipes(child: "subprocess.Popen[bytes]") -> None:
