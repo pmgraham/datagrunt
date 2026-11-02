@@ -107,6 +107,16 @@ class TestSources:
     def test_a_mapping_is_the_codecs_document_json(self, made, wrap):
         assert PDFReader(wrap(copy.deepcopy(made.json))).document == document_from_json(made.json)
 
+    def test_a_mapping_naming_a_file_is_refused_at_construction(self, made, tmp_path):
+        secret = tmp_path / "secret.png"
+        secret.write_bytes(b"\x89PNG\r\n\x1a\nnot the document's")
+        data = copy.deepcopy(made.json)
+        index = next(i for i, item in enumerate(data["pages"][0]["elements"]) if item["kind"] == "figure")
+        data["pages"][0]["elements"][index]["image_path"] = str(secret)
+
+        with pytest.raises(ValueError, match=re.escape(f"pages[0].elements[{index}].image_path {str(secret)!r}: ")):
+            PDFReader(data)
+
     def test_a_mapping_changed_after_construction_does_not_change_the_reader(self, made):
         data = copy.deepcopy(made.json)
         reader = PDFReader(data)

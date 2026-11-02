@@ -65,8 +65,16 @@ Each method writes the document in one form. A path returned is absolute
   whose bytes cannot be read (a ``DatagruntPDFError``, an ``OSError``) or
   are not a PNG is skipped, never silently: a warning on the module logger
   names the figure, its sha256 and why; a later figure of its stream is
-  still read. Any other error fails the call. The paths returned are the
-  files written, in document order.
+  still read. A figure is read only when its loader is bound to the
+  writer's source as the bundle binds one
+  (:func:`~datagrunt.pdf.bundle._figure_unbound`): it reads from the
+  source PDF (A5a's ``FigureRead``) or is a bundle's verifying reader. A
+  writer built from a PDFDocument has no source to compare: its figures'
+  loaders must still name the PDF they read, or be a bundle's reader. A
+  figure with no loader (a bare ``image_path``, which would be read
+  unverified, whatever file it names) or another loader is skipped unread,
+  with a warning. Any other error fails the call. The paths returned are
+  the files written, in document order.
 - :meth:`PDFWriter.render_pages_as_images`: every page, rendered in A5a's
   guarded, capped worker (:func:`~datagrunt.pdf.render.render_page`, as
   the bundle renders: its memory cap and timeout) at
@@ -132,7 +140,7 @@ from datagrunt.pdf._source import checked_pdf_file
 from datagrunt.pdf._validate import checked_password as _checked_password
 from datagrunt.pdf._validate import checked_path as _checked_path
 from datagrunt.pdf._validate import int_at_least, strict_bool
-from datagrunt.pdf.bundle import _checked_target, _chunks, _drawn, _Pictures, _png, write_bundle
+from datagrunt.pdf.bundle import _checked_target, _chunks, _drawn, _figure_unbound, _Pictures, _png, write_bundle
 from datagrunt.pdf.codec import document_to_json_bytes
 from datagrunt.pdf.elements import Figure, Page, PDFDocument
 from datagrunt.pdf.frame import _BBOX_FIELDS, element_frame, utf8_text
@@ -292,7 +300,8 @@ class PDFWriter:
         strict_bool("dedupe", dedupe)
         figures = self._extracted().figures
         directory.mkdir(parents=True, exist_ok=True)
-        return _write_figures(figures, directory, dedupe=dedupe)
+        source = None if self._source is None else self._source.path
+        return _write_figures(_bound(figures, source), directory, dedupe=dedupe)
 
     def render_pages_as_images(self, output_dir: str | os.PathLike[str], *, dpi: int | None = None) -> list[Path]:
         """Render every page into ``output_dir``, made when missing, as ``page_NNNN.png`` (see the module notes).
@@ -461,6 +470,19 @@ def _csv_frame(frame: pl.DataFrame) -> pl.DataFrame:
 
 def _json_array(items: list[str]) -> str:
     return json.dumps(items, ensure_ascii=False, separators=(",", ":"))
+
+
+def _bound(figures: tuple[Figure, ...], source: Path | None) -> tuple[Figure, ...]:
+    """The figures bound to ``source`` (as the bundle binds one); each other is skipped unread, with a warning."""
+    bound: list[Figure] = []
+    for figure in figures:
+        unbound = _figure_unbound(figure, source)
+        if unbound:
+            why = f"it {unbound}: its bytes could not be bound to the source"
+            _LOGGER.warning("figure %s (sha256 %s) was not written: %s", figure.element_id, figure.sha256, why)
+            continue
+        bound.append(figure)
+    return tuple(bound)
 
 
 def _write_figures(figures: tuple[Figure, ...], directory: Path, *, dedupe: bool) -> list[Path]:

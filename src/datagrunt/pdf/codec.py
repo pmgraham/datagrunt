@@ -27,7 +27,10 @@ image reads its bytes from its paths only.
 
 With ``base_dir``, each path is joined to it by :func:`contained_path`,
 which refuses a path that is not plain relative names or that resolves
-out of ``base_dir``.
+out of ``base_dir``. Without it, a document names no file: any path (a
+figure's or page image's ``image_path``, a band path) is refused, a
+``ValueError`` naming its field. Its figures and page images then have no
+bytes to read, so a document from JSON cannot read a file its JSON names.
 
 Decoding is iterative: it walks the schema's fixed depth (document, pages,
 elements, fields) with loops. :func:`document_from_json_bytes` reads at most
@@ -236,6 +239,8 @@ def _section_json(section: Section) -> Json:
 def document_from_json_bytes(raw: bytes, *, base_dir: str | os.PathLike[str] | None = None) -> PDFDocument:
     """The document in ``raw``, UTF-8 JSON of at most :data:`_MAX_JSON_BYTES` (see the module notes).
 
+    ``base_dir`` is the directory its paths are relative to; without it, a path is refused.
+
     Raises:
         TypeError: If ``raw`` is not bytes, or as :func:`document_from_json` raises it.
         ValueError: If ``raw`` is over the bound (refused unparsed), not
@@ -332,8 +337,11 @@ def _part_problem(part: str) -> str:
 def document_from_json(data: object, *, base_dir: str | os.PathLike[str] | None = None) -> PDFDocument:
     """The document :func:`document_to_json` wrote as ``data`` (see the module notes); ``data`` is not changed.
 
+    ``base_dir`` is the directory its paths are relative to; without it, a path is refused.
+
     Raises:
-        TypeError, ValueError: If ``data`` is not such a document, naming where.
+        TypeError, ValueError: If ``data`` is not such a document, naming where; ValueError for a path
+            without ``base_dir``, or one :func:`contained_path` refuses.
     """
     root = _checked_base_dir(base_dir)
     top = _object("document", data, _DOCUMENT_KEYS)
@@ -442,11 +450,14 @@ def _path(name: str, value: object, root: Path | None) -> Path | None:
 
 
 def _band_path(name: str, value: object, root: Path | None) -> Path:
-    """A JSON path: as written (no ``root``), or :func:`contained_path` in ``root``."""
+    """A JSON path, :func:`contained_path` in ``root``; refused without ``root`` (a document names no file then)."""
     if not isinstance(value, str):
         raise TypeError(f"{name} must be a str, got {type(value).__name__}")
     if root is None:
-        return Path(value)
+        raise ValueError(
+            f"{name} {value!r}: a document decoded without base_dir names no file; "
+            "pass base_dir, the directory its paths are relative to"
+        )
     return contained_path(name, value, root)
 
 

@@ -79,8 +79,9 @@ fails (``RenderRefused``, ``RenderFailed``), or whose own image cannot be
 read (a ``DatagruntPDFError``, render errors included, or an ``OSError``)
 or is not a PNG, has no page image (nor bands); a page whose own bands
 cannot be read, or one of them is not a PNG, keeps its image and has no
-bands; a figure whose bytes cannot be read or are not a PNG is not written
-(it keeps no ``image_path``; a later figure of its stream is still read).
+bands; a figure whose bytes cannot be read or are not a PNG, or that is
+not bound to the source (see below), is not written (it keeps no
+``image_path``; a later figure of its stream is still read).
 Each is a ``missing`` entry naming the artifact, the page, the figure's
 element id (one entry a figure) and why. Any other error fails the write.
 
@@ -95,8 +96,13 @@ to that file (:func:`_unbound`): each renders from ``source`` itself
 verifying reader. One that renders from another file, names no source, or
 an image with no loader is not read: the page has no page image, a
 ``missing`` entry says why, and a ``UserWarning`` is emitted once the
-bundle is published. What this cannot see is the A8a limit: a write that
-keeps the size and restores the mtime.
+bundle is published. A figure is bound the same way
+(:func:`_figure_unbound`): its PNG loader reads from ``source`` (A5a's
+``FigureRead``) or is a bundle's verifying reader. A figure with no loader
+(a bare ``image_path``, which would be read unverified, whatever file it
+names) or another loader is not read: it has no image, a ``missing`` entry
+says why, and a ``UserWarning`` is emitted. What this cannot see is the A8a
+limit: a write that keeps the size and restores the mtime.
 
 Known limitations, documented:
 
@@ -465,7 +471,7 @@ def _staged(
 ) -> tuple[PDFDocument, tuple[str, ...]]:
     """Write every artifact, then the manifest, into ``staging``: the document (paths in ``target``), and warnings."""
     ledger = _Ledger()
-    figures = _write_figures(document, staging, ledger)
+    figures = _write_figures(document, staging, source.path, ledger)
     renders = _write_renders(document, staging, source, options, ledger)
     as_json = document_to_json_bytes(_with_paths(document, figures, renders, Path()))
     ledger.artifacts.append(_write_bytes(staging, DOCUMENT_JSON, as_json))
@@ -505,11 +511,14 @@ class _Pictures:
         self.streams.add(sha256)
 
 
-def _write_figures(document: PDFDocument, staging: Path, ledger: _Ledger) -> dict[str, str]:
-    """Write each figure's PNG, each distinct picture once (:class:`_Pictures`); each written figure's path, by id."""
+def _write_figures(document: PDFDocument, staging: Path, source: Path, ledger: _Ledger) -> dict[str, str]:
+    """Write each bound figure's PNG, each distinct picture once (:class:`_Pictures`); each written one's path, by id.
+
+    A figure not bound to ``source`` (:func:`_figure_unbound`) is not read: it gets a missing entry and a warning.
+    """
     paths: dict[str, str] = {}
     pictures = _Pictures()
-    figures = document.figures
+    figures = _bound_figures(document.figures, source, ledger)
     for figure, read in zip(figures, figure_pngs(figures), strict=True):  # read in batches, each in its turn
         data, why = _png(read)
         if data is None:
@@ -518,6 +527,20 @@ def _write_figures(document: PDFDocument, staging: Path, ledger: _Ledger) -> dic
             continue
         paths[figure.element_id] = _write_picture(staging, figure.sha256, data, pictures, ledger)
     return paths
+
+
+def _bound_figures(figures: tuple[Figure, ...], source: Path, ledger: _Ledger) -> tuple[Figure, ...]:
+    """The figures bound to ``source`` (:func:`_figure_unbound`); each other is unread: a missing entry, a warning."""
+    bound: list[Figure] = []
+    for figure in figures:
+        unbound = _figure_unbound(figure, source)
+        if not unbound:
+            bound.append(figure)
+            continue
+        reason = f"figure {figure.sha256} {unbound}: its bytes could not be bound to the hashed source"
+        ledger.missing.append(_Missing("figure", figure.page_number, figure.element_id, reason))
+        ledger.warnings.append(f"figure {figure.element_id} {unbound}: no image is written for it")
+    return tuple(bound)
 
 
 def _write_picture(staging: Path, sha256: str, data: bytes, pictures: _Pictures, ledger: _Ledger) -> str:
@@ -652,8 +675,28 @@ def _unbound(image: PageImage, source: Path) -> str:
     """
     if image._loader is None:
         return "has no loader"
-    target = source.resolve()
-    for loader in (image._loader, image._band_loader):
+    return _loaders_unbound((image._loader, image._band_loader), source, "renders")
+
+
+def _figure_unbound(figure: Figure, source: Path | None) -> str:
+    """Why the figure's PNG is not bound to ``source``, or ``""`` if it is: as :func:`_unbound` binds a page image.
+
+    Its PNG must come from a loader (a bare ``image_path`` is read
+    unverified, whatever file it names) that reads from ``source`` itself
+    (A5a's ``FigureRead`` names the PDF it reads as ``source``; compared by
+    resolved path) or is a bundle's verifying reader. With no ``source`` (a
+    ``PDFWriter`` built from a document has none) the loader must still name
+    the PDF it reads, or be a bundle's verifying reader.
+    """
+    if figure._loader is None:
+        return "has no loader"
+    return _loaders_unbound((figure._loader,), source, "reads")
+
+
+def _loaders_unbound(loaders: tuple[object, ...], source: Path | None, verb: str) -> str:
+    """Why one of ``loaders`` (None ones skipped) is not bound to ``source``, or ``""``; ``verb`` says what it does."""
+    target = None if source is None else source.resolve()
+    for loader in loaders:
         owner = getattr(loader, "__self__", loader)
         if loader is None or isinstance(owner, (_ArtifactReader, _BandsReader)):
             continue
@@ -661,8 +704,8 @@ def _unbound(image: PageImage, source: Path) -> str:
         if not isinstance(origin, (str, os.PathLike)):
             return "has a loader that names no source"
         resolved = Path(origin).resolve()
-        if resolved != target:
-            return f"renders from {resolved}, not from the source {target}"
+        if target is not None and resolved != target:
+            return f"{verb} from {resolved}, not from the source {target}"
     return ""
 
 

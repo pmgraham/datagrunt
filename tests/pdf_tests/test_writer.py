@@ -48,6 +48,7 @@ from pdf_tests.test_bundle import (
     CAP,
     TIMEOUT,
     UNREADABLE,
+    OwnFigure,
     fake_render,
     manifest_of,
     png_pixels,
@@ -646,10 +647,10 @@ WRITER_LOGGER = "datagrunt.pdf.writer"
 
 
 class Counted:
-    """A figure loader that counts its calls and returns (or raises) ``outcome``."""
+    """A figure loader that counts its calls and returns (or raises) ``outcome``; it reads from ``source``."""
 
-    def __init__(self, outcome):
-        self.outcome, self.calls = outcome, 0
+    def __init__(self, outcome, source: Path = Path("figures.pdf")):
+        self.outcome, self.calls, self.source = outcome, 0, source
 
     def __call__(self):
         self.calls += 1
@@ -752,6 +753,51 @@ class TestExtractImages:
         made = PDFWriter(figures_document(Counted("not bytes"), Counted(PNG_A), Counted(PNG_B)))
         with pytest.raises(TypeError, match="_loader result must be bytes, got str"):
             made.extract_images(tmp_path / "images")
+
+    def test_a_figure_with_only_a_path_is_not_read_whatever_file_it_names(self, tmp_path, caplog):
+        caplog.set_level(logging.WARNING, logger=WRITER_LOGGER)
+        secret = tmp_path / "secret.png"
+        secret.write_bytes(PNG_A)
+        document = PDFDocument(metadata=metadata(1), pages=(page(1, (figure(1, 0, FIGURE_A_SHA, image_path=secret),)),))
+
+        assert PDFWriter(document).extract_images(tmp_path / "images") == []
+
+        assert list((tmp_path / "images").iterdir()) == []
+        assert warnings_of(caplog) == [
+            f"figure p0001_e000 (sha256 {FIGURE_A_SHA}) was not written: "
+            "it has no loader: its bytes could not be bound to the source"
+        ]
+
+    def test_a_figure_loader_naming_no_source_is_not_read(self, tmp_path, caplog):
+        caplog.set_level(logging.WARNING, logger=WRITER_LOGGER)
+        unbound = figure(1, 0, FIGURE_A_SHA, loader=lambda: pytest.fail("an unbound loader was called"))
+        document = PDFDocument(metadata=metadata(1), pages=(page(1, (unbound,)),))
+
+        assert PDFWriter(document).extract_images(tmp_path / "images") == []
+
+        assert warnings_of(caplog) == [
+            f"figure p0001_e000 (sha256 {FIGURE_A_SHA}) was not written: "
+            "it has a loader that names no source: its bytes could not be bound to the source"
+        ]
+
+    def test_a_figure_reading_another_pdf_than_the_writers_is_not_read(self, tmp_path, monkeypatch, caplog):
+        caplog.set_level(logging.WARNING, logger=WRITER_LOGGER)
+        source, other = text_pdf(tmp_path), text_pdf(tmp_path, "other.pdf")
+        stray = OwnFigure(other, lambda: pytest.fail("a figure loader of another file must not be called"))
+        own = OwnFigure(source, lambda: PNG_B)
+        elements = (
+            figure(1, 0, FIGURE_A_SHA, loader=stray.png_bytes),
+            figure(1, 1, FIGURE_B_SHA, loader=own.png_bytes),
+        )
+        spy_extract(monkeypatch, PDFDocument(metadata=metadata(1), pages=(page(1, elements),)))
+
+        paths = PDFWriter(source).extract_images(tmp_path / "images")
+
+        assert paths == [tmp_path / "images" / f"{FIGURE_B_SHA}.png"] and paths[0].read_bytes() == PNG_B
+        assert warnings_of(caplog) == [
+            f"figure p0001_e000 (sha256 {FIGURE_A_SHA}) was not written: it reads from {other.resolve()}, "
+            f"not from the source {source.resolve()}: its bytes could not be bound to the source"
+        ]
 
     def test_a_document_without_figures_writes_none_but_makes_the_directory(self, tmp_path):
         assert PDFWriter(surrogate_document()).extract_images(tmp_path / "a" / "images") == []

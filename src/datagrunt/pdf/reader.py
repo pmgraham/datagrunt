@@ -11,7 +11,9 @@ Internal: not exported from ``datagrunt`` or ``datagrunt.pdf`` until the
 - a bundle directory, or its ``manifest.json``: A7a's
   :func:`~datagrunt.pdf.bundle.load_bundle`, which verifies every artifact;
 - a Mapping: A7a's codec's document JSON
-  (:func:`~datagrunt.pdf.codec.document_from_json`).
+  (:func:`~datagrunt.pdf.codec.document_from_json`), decoded without a
+  base directory: it names no file, so a path in it is refused, and its
+  figures and page images have no bytes to read.
 
 Construction checks (spec invariants 1-2) run before any work, in order,
 as ``PDFWriter`` (A7b) runs its own:
@@ -217,7 +219,8 @@ class PDFReader:
             ``password`` is of the wrong type.
         ValueError: If an option is out of range (spec invariant 2),
             ``password`` holds NUL, the path is not a PDF or a valid bundle,
-            or the Mapping is not a document's JSON.
+            or the Mapping is not a document's JSON (one naming a file path
+            included).
         FileNotFoundError: If the path does not exist.
     """
 

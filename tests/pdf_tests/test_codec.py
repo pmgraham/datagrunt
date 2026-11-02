@@ -9,6 +9,7 @@ corrupted JSON value is one key of a document's JSON changed by its path
 import copy
 import dataclasses
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -200,9 +201,30 @@ class TestPaths:
         assert loaded.pages[2].page_image.image_path == tmp_path / "page_images" / "page_0003.png"
         assert loaded.pages[2].page_image.band_paths == (tmp_path / "b" / "1.png",)
 
-    def test_paths_without_base_dir_are_as_written(self):
-        loaded = document_from_json(document_to_json(self.with_paths()))
-        assert loaded.pages[0].elements[8].image_path == Path("images/a.png")
+    @pytest.mark.parametrize(
+        ("path", "field"),
+        [
+            (("pages", 0, "elements", 8, "image_path"), "pages[0].elements[8].image_path"),
+            (("pages", 2, "page_image", "image_path"), "pages[2].page_image.image_path"),
+            (("pages", 2, "page_image", "band_paths"), "pages[2].page_image.band_paths[0]"),
+        ],
+    )
+    @pytest.mark.parametrize("where", ["absolute", "relative"])
+    def test_a_path_without_base_dir_is_refused_naming_its_field(self, tmp_path, path, field, where):
+        secret = tmp_path / "secret.png"
+        secret.write_bytes(b"\x89PNG\r\n\x1a\nnot the document's")
+        value = str(secret) if where == "absolute" else "images/a.png"
+        data = changed(path, [value] if path[-1] == "band_paths" else value)
+        for decode in (document_from_json, lambda d: document_from_json_bytes(json.dumps(d).encode("ascii"))):
+            with pytest.raises(ValueError) as info:
+                decode(data)
+            assert str(info.value).startswith(f"{field} {value!r}: ") and "base_dir" in str(info.value)
+
+    def test_a_document_written_with_paths_reads_back_only_with_base_dir(self, tmp_path):
+        data = document_to_json(self.with_paths())
+        with pytest.raises(ValueError, match=re.escape("pages[0].elements[8].image_path 'images/a.png'")):
+            document_from_json(data)
+        assert document_from_json(data, base_dir=tmp_path).pages[0].elements[8].image_path == tmp_path / "images/a.png"
 
     def test_bytes_are_not_in_the_json(self):
         calls = []

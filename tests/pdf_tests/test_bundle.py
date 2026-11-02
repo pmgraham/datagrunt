@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -81,6 +82,17 @@ class OwnRender:
         return value
 
 
+@dataclasses.dataclass(frozen=True)
+class OwnFigure:
+    """A stand-in for A5a's FigureRead: the PDF it reads a figure from, and what its PNG read gives."""
+
+    source: Path
+    read: Callable[[], bytes]
+
+    def png_bytes(self) -> bytes:
+        return self.read()
+
+
 def bound_document(
     path: Path,
     figure_loader=lambda: PNG_A,
@@ -92,13 +104,14 @@ def bound_document(
 ) -> PDFDocument:
     """rich_document as the document of the PDF at ``path``; page 3 has its own page image.
 
-    Its loaders are an :class:`OwnRender` of ``own_source`` (default: ``path``); ``bands`` None gives it no
-    band loader.
+    Its figures read through an :class:`OwnFigure` of ``path`` calling ``figure_loader`` (figure A, twice)
+    and ``other_loader`` (figure B); None gives a figure no loader. Page 3's loaders are an
+    :class:`OwnRender` of ``own_source`` (default: ``path``); ``bands`` None gives it no band loader.
     """
     render = OwnRender(own_source or path, image, bands)
     return rich_document(
-        figure_loader,
-        other_loader,
+        None if figure_loader is None else OwnFigure(path, figure_loader).png_bytes,
+        None if other_loader is None else OwnFigure(path, other_loader).png_bytes,
         sha=sha_of(path),
         source_name=path.name,
         image_loader=render.png_bytes,
@@ -134,6 +147,26 @@ def shared_stream_pdf(path: Path, first: bytes, second: bytes) -> Path:
         stream(SHARED_STREAM, image + second),
     ]
     return hand_written_pdf(path, objects)
+
+
+def with_element(document: PDFDocument, element_id: str, **changes) -> PDFDocument:
+    """``document`` with its element ``element_id`` changed by ``changes``; its sections hold the new one."""
+    pages = tuple(
+        dataclasses.replace(
+            page,
+            elements=tuple(
+                dataclasses.replace(item, **changes) if item.element_id == element_id else item
+                for item in page.elements
+            ),
+        )
+        for page in document.pages
+    )
+    by_id = {item.element_id: item for page in pages for item in page.elements}
+    sections = tuple(
+        dataclasses.replace(section, elements=tuple(by_id[item.element_id] for item in section.elements))
+        for section in document.sections
+    )
+    return dataclasses.replace(document, pages=pages, sections=sections)
 
 
 def files_in(root: Path) -> set[str]:
@@ -453,7 +486,6 @@ class TestFailuresAreRecorded:
             (DatagruntPDFError("report.pdf: page 1: the file changed"), "DatagruntPDFError: report.pdf: page 1"),
             (FileNotFoundError(2, "No such file or directory"), "FileNotFoundError: [Errno 2]"),
             (b"GIF89a not a png", "its bytes are not a PNG"),
-            (None, "has no image bytes: no image_path and no loader"),
         ],
     )
     def test_a_figure_whose_bytes_cannot_be_read_is_recorded(self, tmp_path, source, fast_render, loader, reason):
@@ -462,7 +494,7 @@ class TestFailuresAreRecorded:
                 raise loader
             return loader
 
-        document = bound_document(source, None if loader is None else broken)
+        document = bound_document(source, broken)
         returned = write(document, tmp_path / "out", source)
         assert [figure.image_path for figure in returned.figures] == [
             None,
@@ -930,6 +962,51 @@ class TestBoundToTheSource:
         with pytest.warns(UserWarning, match="has no loader"):
             returned = write(dataclasses.replace(document, pages=tuple(pages)), tmp_path / "out", source)
         assert returned.pages[2].page_image is None
+
+    def test_a_figure_with_only_a_path_is_not_read_whatever_file_it_names(self, tmp_path, source, fast_render):
+        secret = tmp_path / "secret.png"
+        secret.write_bytes(solid_png(8, 8, (0.3, 0.3, 0.3)))
+        document = with_element(bound_document(source), "p0002_e004", _loader=None, image_path=secret)
+        with pytest.warns(UserWarning, match="figure p0002_e004 has no loader: no image is written for it"):
+            returned = write(document, tmp_path / "out", source)
+        assert returned.figures[2].image_path is None
+        assert files_in(tmp_path / "out") == EXPECTED_FILES - {f"images/{FIGURE_B_SHA}.png"}
+        held = [path.read_bytes() for path in (tmp_path / "out").rglob("*") if path.is_file()]
+        assert secret.read_bytes() not in held
+        reason = f"figure {FIGURE_B_SHA} has no loader: its bytes could not be bound to the hashed source"
+        assert manifest_of(tmp_path / "out")["missing"] == [
+            {"artifact": "figure", "page_number": 2, "element_id": "p0002_e004", "reason": reason}
+        ]
+        assert load_bundle(tmp_path / "out") == returned
+
+    def test_a_figure_reading_another_file_is_not_read(self, tmp_path, source, fast_render):
+        other = build_pdf(tmp_path / "other.pdf", [PageSpec()])
+        never = OwnFigure(other, lambda: pytest.fail("a figure loader of another file must not be called"))
+        document = with_element(bound_document(source), "p0002_e004", _loader=never.png_bytes)
+        with pytest.warns(UserWarning, match="figure p0002_e004 reads from .*other.pdf, not from the source"):
+            returned = write(document, tmp_path / "out", source)
+        assert returned.figures[2].image_path is None
+        [missing] = manifest_of(tmp_path / "out")["missing"]
+        assert missing["reason"] == (
+            f"figure {FIGURE_B_SHA} reads from {other.resolve()}, not from the source {source.resolve()}: "
+            "its bytes could not be bound to the hashed source"
+        )
+
+    def test_a_figure_loader_naming_no_source_is_not_read(self, tmp_path, source, fast_render):
+        document = with_element(
+            bound_document(source), "p0002_e004", _loader=lambda: pytest.fail("an unbound loader was called")
+        )
+        with pytest.warns(UserWarning, match="figure p0002_e004 has a loader that names no source"):
+            returned = write(document, tmp_path / "out", source)
+        assert returned.figures[2].image_path is None
+        [missing] = manifest_of(tmp_path / "out")["missing"]
+        assert (missing["artifact"], missing["element_id"]) == ("figure", "p0002_e004")
+
+    def test_a_loaded_bundles_figures_are_bound_by_its_verifying_reader(self, written, tmp_path, recwarn):
+        loaded = load_bundle(written.out)
+        returned = write(loaded, tmp_path / "again", written.source)
+        assert [figure.read_bytes() for figure in returned.figures] == [PNG_A, PNG_A, PNG_B]
+        assert manifest_of(tmp_path / "again")["missing"] == [] and [str(w.message) for w in recwarn] == []
 
     def test_the_same_file_by_another_path_is_the_source(self, tmp_path, source, fast_render):
         (tmp_path / "link.pdf").symlink_to(source)
