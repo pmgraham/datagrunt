@@ -8,6 +8,7 @@ its drain thread (success, failure, kill and timeout).
 
 import re
 import shutil
+import subprocess
 import tempfile
 import threading
 
@@ -112,6 +113,32 @@ class TestTesseractWritesNothing:
 
         assert call.status == "timeout"
         assert call.reason == "tesseract did not finish within 0.5 s and was killed; its stderr ends: warming up"
+
+    @posix_only
+    def test_a_call_whose_stderr_cannot_be_drained_is_unavailable_and_reaped(self, tmp_path, monkeypatch):
+        directory = fake_tesseract(tmp_path, monkeypatch, "exec sleep 60")
+        started = []
+        real = subprocess.Popen
+
+        def recorded(*args, **kwargs):
+            started.append(real(*args, **kwargs))
+            return started[-1]
+
+        def refused(stream):
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(subprocess, "Popen", recorded)
+        monkeypatch.setattr(_process, "StderrTail", refused)
+        binary = str(directory / "tesseract")
+
+        call = ocr._call([binary], (), 60.0)
+
+        assert (call.status, call.reason) == (
+            "unavailable",
+            f"cannot drain tesseract's stderr ({binary}): can't start new thread",
+        )
+        ((process,),) = [started]
+        assert process.returncode is not None  # killed and reaped
 
 
 @pytest.mark.usefixtures("no_temporary_files")

@@ -251,6 +251,19 @@ class TestStderrTail:
         assert stderr.finish(_process.REAP_TIMEOUT_S) == "so far"
         assert stream.closed
 
+    def test_a_drain_still_running_is_said_and_left_to_end_on_its_own(self):
+        read_end, write_end = os.pipe()
+        stream = os.fdopen(read_end, "rb")
+        stderr = _process.StderrTail(stream)
+        try:
+            said = stderr.finish(0.0)
+        finally:
+            os.close(write_end)
+
+        assert said == "(its stderr was still open after 0 s)"
+        assert stderr.finish(_process.REAP_TIMEOUT_S) == ""
+        assert stream.closed  # by the drain, at its end: never by finish
+
     def test_the_drain_closes_the_stream_at_its_end_and_finish_is_idempotent(self):
         child, stderr = drained_child(b"once")
         stream = child.stderr
