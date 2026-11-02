@@ -70,12 +70,14 @@ def kv(page, index, key="Invoice", value="42", *, hidden=False):
 
 
 def table(page, index, *, headers=("Item", "Qty"), rows=(("bolt", "4"),), centres=(100.0, 300.0), hidden=False):
+    # A1 sets intervals exactly when centres: each centre in the middle of a 40 pt interval, a ruled column's.
     return Table(
         **_ids(page, index, hidden),
         headers=headers,
         rows=rows,
         extraction_method="lattice",
         column_centres=centres,
+        column_intervals=tuple((centre - 20.0, centre + 20.0) for centre in centres),
     )
 
 

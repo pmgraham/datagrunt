@@ -403,7 +403,8 @@ class TestBadValues:
             (("pages", 0, "elements", 6, "column_centres"), [1.0], ValueError, "column_centres must have 2"),
             (("pages", 0, "elements", 6, "column_intervals"), [[60.0, 140.0]], ValueError, "intervals must have 2"),
             (("pages", 0, "elements", 6, "column_intervals", 0), [140.0, 60.0], ValueError, "must have start <= end"),
-            (("pages", 0, "elements", 6, "column_intervals", 0), [60.0], ValueError, r"\[0\] must hold 2 values"),
+            (("pages", 0, "elements", 6, "column_intervals", 0), [60.0], ValueError, r"\[0\] must have 2 values"),
+            (("pages", 0, "elements", 6, "column_intervals"), [], ValueError, "set exactly when column_centres are"),
             (("pages", 1, "elements", 1, "continued_from_id"), "p0001_e000", ValueError, "must name a table"),
         ],
     )

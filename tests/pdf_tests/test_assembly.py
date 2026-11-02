@@ -496,7 +496,7 @@ class TestAssemblePage:
 
         assert (bullets.items, bullets.markers, bullets.ordered) == (("one", "two"), ("1.", "2."), True)
 
-    def test_a_ruled_table_is_a_lattice_table_with_its_grid_column_centres(self, tmp_path):
+    def test_a_ruled_table_is_a_lattice_table_with_its_grid_columns_centres_and_intervals(self, tmp_path):
         tables = [
             element for element in assembled(letter(tmp_path, *mixed_items())).elements if isinstance(element, Table)
         ]
@@ -504,8 +504,12 @@ class TestAssemblePage:
         ruled = tables[0]
         assert (ruled.extraction_method, ruled.headers, ruled.rows) == ("lattice", SPEC[0], SPEC[1:])
         assert ruled.column_centres == pytest.approx((100.0, 200.0, 300.0))
+        # Each ruled column's interval is its span between its rules (#420).
+        assert [value for pair in ruled.column_intervals for value in pair] == pytest.approx(
+            (50.0, 150.0, 150.0, 250.0, 250.0, 350.0)
+        )
 
-    def test_a_borderless_table_is_a_stream_table_with_its_columns_alignment_edges(self, tmp_path):
+    def test_a_borderless_table_is_a_stream_table_with_its_columns_alignment_edges_and_extents(self, tmp_path):
         path = letter(tmp_path, *mixed_items())
         raw, assessment, lattice = inputs(path)
         geometry = raw.geometry
@@ -525,9 +529,10 @@ class TestAssemblePage:
 
         assert (table.extraction_method, table.headers, table.rows) == ("stream", PARTS[0], PARTS[1:])
         assert table.column_centres == stream.column_centres
+        assert table.column_intervals == stream.column_intervals
 
     @pytest.mark.parametrize("rotate", [90, 270])
-    def test_a_turned_table_has_no_column_centres(self, tmp_path, rotate):
+    def test_a_turned_table_has_no_column_centres_or_intervals(self, tmp_path, rotate):
         ys = (340.0, 360.0, 380.0, 400.0)
         items = (*lattice_rules(LATTICE_XS, ys), *written(SPEC, LATTICE_XS, ys), *table_runs(PARTS, top=460.0))
 
@@ -539,6 +544,7 @@ class TestAssemblePage:
 
         assert sorted(table.extraction_method for table in tables) == ["lattice", "stream"]
         assert [table.column_centres for table in tables] == [(), ()]
+        assert [table.column_intervals for table in tables] == [(), ()]
 
     def test_a_figure_is_bound_and_never_loaded(self, tmp_path, monkeypatch):
         def refuse(self):
@@ -890,6 +896,8 @@ class TestAssemblePageArguments:
         (table,) = [element for element in page.elements if isinstance(element, Table)]
         assert table.bbox == BBox(x0=0.0, y0=700.0, x1=300.0, y1=LETTER_H)
         assert table.column_centres == (40.0, 200.0)
+        # The box is clamped, the columns are not: they keep their raw coordinates.
+        assert table.column_intervals == ((-20.0, 100.0), (100.0, 300.0))
 
 
 def split_tables(tmp_path, tail, head) -> tuple[Table, Table]:

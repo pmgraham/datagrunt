@@ -721,9 +721,9 @@ class TestTableColumnIntervals:
         ("bad", "exc", "match"),
         [
             ([(10.0, 40.0), (62.0, 80.0)], TypeError, "column_intervals must be a tuple, got list"),
-            (((10.0, 40.0), [62.0, 80.0]), TypeError, "column_intervals[1] must be a (start, end) tuple, got list"),
-            (((10.0, 40.0, 50.0), (62.0, 80.0)), ValueError, "column_intervals[0] must hold 2 values, got 3"),
-            (((10.0,), (62.0, 80.0)), ValueError, "column_intervals[0] must hold 2 values, got 1"),
+            (((10.0, 40.0), [62.0, 80.0]), TypeError, "column_intervals[1] must be a tuple, got list"),
+            (((10.0, 40.0, 50.0), (62.0, 80.0)), ValueError, "column_intervals[0] must have 2 values, got 3"),
+            (((10.0,), (62.0, 80.0)), ValueError, "column_intervals[0] must have 2 values, got 1"),
             (((10.0, "40"), (62.0, 80.0)), TypeError, "column_intervals[0][1] must be an int or float"),
             (((True, 40.0), (62.0, 80.0)), TypeError, "column_intervals[0][0] must be an int or float"),
             (((10.0, 40.0), (62.0, float("nan"))), ValueError, "column_intervals[1][1] must be finite"),
@@ -734,6 +734,19 @@ class TestTableColumnIntervals:
     def test_bad_values_rejected(self, bad, exc, match):
         with pytest.raises(exc, match=re.escape(match)):
             _measured(bad)
+
+    @pytest.mark.parametrize(
+        ("centres", "intervals", "counts"),
+        [
+            ((10.0, 80.0), (), "2 centres and 0 intervals"),
+            ((), ((10.0, 40.0), (62.0, 80.0)), "0 centres and 2 intervals"),
+        ],
+        ids=["centres-alone", "intervals-alone"],
+    )
+    def test_set_exactly_when_the_centres_are(self, centres, intervals, counts):
+        message = f"column_intervals must be set exactly when column_centres are, got {counts}"
+        with pytest.raises(ValueError, match=re.escape(message)):
+            _table(column_centres=centres, column_intervals=intervals)
 
     def test_part_of_equality(self):
         assert _measured(((10.0, 40.0), (62.0, 80.0))) != _measured(((10.0, 40.0), (61.0, 80.0)))

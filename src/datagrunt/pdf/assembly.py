@@ -315,12 +315,13 @@ def assemble_page(
        A3's notes); a table
        is a :class:`~datagrunt.pdf.elements.Table` of its grid, headed by
        its first row when every cell of it is non-blank (A4a's rule), with
-       ``column_centres`` when upright (the middle of each of a lattice
-       table's grid columns; each of a stream table's columns' alignment
-       edge, the start, end or middle its cells share), else ``()``: a
-       turned table's run along display y, and A6 links only increasing
-       display x. A lattice table's box is clamped to the page (its rules
-       may run past it).
+       ``column_centres`` and ``column_intervals`` when upright (the middle
+       and the span of each of a lattice table's grid columns; each of a
+       stream table's columns' alignment edge, the start, end or middle its
+       cells share, and its cells' extent), else ``()``: a turned table's
+       run along display y, and A6 links only increasing display x. A
+       lattice table's box is clamped to the page (its rules may run past
+       it); its columns are not.
     4. Pass C (:func:`pass_c`) sets ``integrity_verified``.
 
     The page's ``quality`` and ``route`` are A3's. Its warnings are A2's
@@ -452,10 +453,16 @@ def _element(item: PageItem, order: int, drafts: tuple[FigureDraft, ...], geomet
         items, markers = tuple(entry.text for entry in item.items), tuple(entry.marker for entry in item.items)
         return BulletList(**ids, bbox=item.bbox, items=items, markers=markers, ordered=item.ordered)
     if isinstance(item, StreamTable):
-        centres = item.column_centres if item.rows[0].turn == _UPRIGHT else ()
-        return _table(ids, item.grid(), item.has_header, "stream", centres, item.bbox)
+        upright = item.rows[0].turn == _UPRIGHT
+        columns = (item.column_centres, item.column_intervals) if upright else _NO_COLUMNS
+        return _table(ids, item.grid(), item.has_header, "stream", columns, item.bbox)
     bbox = _clamped(item.bbox, geometry.width_pt, geometry.height_pt)
-    return _table(ids, item.grid(), item.has_header, "lattice", _lattice_centres(item), bbox)
+    return _table(ids, item.grid(), item.has_header, "lattice", _lattice_columns(item), bbox)
+
+
+# A table's column centres and intervals (A1 sets both or neither).
+_Columns = tuple[tuple[float, ...], tuple[tuple[float, float], ...]]
+_NO_COLUMNS: _Columns = ((), ())
 
 
 def _table(
@@ -463,24 +470,35 @@ def _table(
     grid: tuple[tuple[str, ...], ...],
     has_header: bool,
     method: ExtractionMethod,
-    centres: tuple[float, ...],
+    columns: _Columns,
     bbox: BBox,
 ) -> Table:
     """An A1 table of ``grid``, its first row the headers when ``has_header`` (A4a's rule)."""
     headers, rows = (grid[0], grid[1:]) if has_header else ((), grid)
-    return Table(**ids, bbox=bbox, headers=headers, rows=rows, extraction_method=method, column_centres=centres)
+    centres, intervals = columns
+    return Table(
+        **ids,
+        bbox=bbox,
+        headers=headers,
+        rows=rows,
+        extraction_method=method,
+        column_centres=centres,
+        column_intervals=intervals,
+    )
 
 
-def _lattice_centres(table: LatticeTable) -> tuple[float, ...]:
-    """An upright lattice table's column centres: the middle of each grid column's span; ``()`` when turned.
+def _lattice_columns(table: LatticeTable) -> _Columns:
+    """An upright lattice table's column centres and intervals: each grid column's middle and span; none when turned.
 
     An upright table's grid columns are its cells' distinct x edges, in
-    order (A4a's ``_grid_positions``), so the centres strictly increase.
+    order (A4a's ``_grid_positions``), so the centres strictly increase and
+    each lies in its span.
     """
     if table.turn != _UPRIGHT:
-        return ()
+        return _NO_COLUMNS
     edges = sorted({cell.bbox.x0 for cell in table.cells} | {cell.bbox.x1 for cell in table.cells})
-    return tuple((left + right) / 2 for left, right in zip(edges, edges[1:]))
+    spans = tuple(zip(edges, edges[1:]))
+    return tuple((left + right) / 2 for left, right in spans), spans
 
 
 def _clamped(bbox: BBox, width: float, height: float) -> BBox:

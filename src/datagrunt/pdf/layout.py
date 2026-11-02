@@ -59,6 +59,7 @@ from datagrunt.pdf._validate import (
     finite_float,
     int_at_least,
     non_blank_str,
+    ordered_interval,
     positive_float,
     str_tuple,
     strict_bool,
@@ -2070,12 +2071,19 @@ class StreamTable:
             y for text turned a quarter turn, so falling for text read up
             the page. Each lies in its column's band, so they rise strictly
             (A1's contract). At least 2.
+        column_intervals: Each column's ``(start, end)`` in the same
+            display coordinate: from its cells' least to their greatest
+            extent along the rows (its band), so it holds its centre. A
+            column whose cells are all one width tells no alignment and
+            sits at its start; its interval still ends where its text ends
+            (#420). One per column.
         bbox: The union of its rows' boxes on the displayed page.
     """
 
     rows: tuple[TextLine, ...]
     columns: tuple[tuple[int, ...], ...]
     column_centres: tuple[float, ...]
+    column_intervals: tuple[tuple[float, float], ...]
     bbox: BBox
 
     def __post_init__(self) -> None:
@@ -2089,6 +2097,7 @@ class StreamTable:
         for index, centre in enumerate(self.column_centres):
             finite_float(f"column_centres[{index}]", centre)
         self._check_columns()
+        self._check_intervals()
         _check_bbox("bbox", self.bbox)
         for index, item in enumerate(self.rows):
             if _outside(_plain(item.bbox), self.bbox):
@@ -2115,6 +2124,20 @@ class StreamTable:
         if len(held) <= last:
             missing = min(set(range(last + 1)) - held)
             raise ValueError(f"every column must hold a cell: column {missing} holds none")
+
+    def _check_intervals(self) -> None:
+        """One ``(start, end)`` per column (``start <= end``, finite), each holding its column's centre."""
+        if not isinstance(self.column_intervals, tuple):
+            raise TypeError(f"column_intervals must be a tuple, got {type(self.column_intervals).__name__}")
+        if len(self.column_intervals) != self.n_cols:
+            raise ValueError(
+                f"column_intervals must hold one interval per column ({self.n_cols}), got {len(self.column_intervals)}"
+            )
+        for index, (centre, pair) in enumerate(zip(self.column_centres, self.column_intervals)):
+            start, end = ordered_interval(f"column_intervals[{index}]", pair)
+            if not start <= centre <= end:
+                where = f"column_intervals[{index}] {(start, end)!r}"
+                raise ValueError(f"column_centres[{index}] {centre!r} must lie within {where}")
 
     @property
     def n_cols(self) -> int:
@@ -2423,7 +2446,10 @@ def _cell_item(found: TextCell) -> StreamKeyValue | StreamParagraph:
 
 
 def _stream_table(rows: list[TextLine], starts: list[float]) -> StreamTable:
-    """A run's lines as a table: each cell in the band holding its start, each column where its cells align."""
+    """A run's lines as a table: each cell in the band holding its start, each column where its cells align.
+
+    Each column's interval is where its cells lie: their least start to their greatest end (#420).
+    """
     turn = rows[0].turn
     columns = tuple(
         tuple(bisect_right(starts, _along(found.bbox, turn)[0]) - 1 for found in item.cells) for item in rows
@@ -2435,8 +2461,9 @@ def _stream_table(rows: list[TextLine], starts: list[float]) -> StreamTable:
     # Back to the displayed page: along a line read up it (turn 270), the frame's x is the page's y negated.
     sign = -1.0 if turn == _UP else 1.0
     centres = tuple(sign * _column_position(found) for found in spans)
+    intervals = tuple(_column_extent(found, sign) for found in spans)
     bbox = _bbox(union_box(tuple(_plain(item.bbox) for item in rows)))
-    return StreamTable(rows=tuple(rows), columns=columns, column_centres=centres, bbox=bbox)
+    return StreamTable(rows=tuple(rows), columns=columns, column_centres=centres, column_intervals=intervals, bbox=bbox)
 
 
 def _column_position(spans: list[tuple[float, float]]) -> float:
@@ -2467,6 +2494,16 @@ def _column_position(spans: list[tuple[float, float]]) -> float:
     least = min(spreads)
     aligned = next(values for values, spread in zip(edges, spreads) if spread <= least + _ALIGN_SLACK_PT)
     return statistics.median(aligned)
+
+
+def _column_extent(spans: list[tuple[float, float]], sign: float) -> tuple[float, float]:
+    """Where a column's cells lie on the displayed page: ``(least, greatest)``, from each cell's ``(start, end)``.
+
+    ``sign`` takes the rows' frame back to the page: -1 along a line read up it (the frame's x is the page's y
+    negated), else 1. The column's position, a median of its cells' edges, lies within. O(k) for k cells (#420).
+    """
+    low, high = sign * min(start for start, _ in spans), sign * max(end for _, end in spans)
+    return (low, high) if low <= high else (high, low)
 
 
 def _spread(values: list[float]) -> float:
