@@ -12,7 +12,7 @@ import itertools
 import pickle
 import random
 import re
-import time
+import sys
 import zlib
 from pathlib import Path
 
@@ -618,6 +618,32 @@ def random_box(rng: random.Random):
     return float(x0), float(y0), float(x1), float(y1)
 
 
+def lines_run(count: int) -> int:
+    """How many lines of quality.py run (sys.settrace line events) while raster_cover_fraction reads ``count`` images.
+
+    The images are random_box's, from one seed. The trace function in place before is restored.
+    """
+    rng = random.Random(20_000)
+    images = tuple(image(random_box(rng), object_index=index) for index in range(count))
+    counted = [0]
+
+    def local(frame, event, arg):
+        counted[0] += event == "line"
+        return local
+
+    def tracer(frame, event, arg):
+        return local if frame.f_code.co_filename == quality.__file__ else None
+
+    previous = sys.gettrace()
+    sys.settrace(tracer)
+    try:
+        got = raster_cover_fraction(images, W, H)
+    finally:
+        sys.settrace(previous)
+    assert 0.0 < got <= 1.0
+    return counted[0]
+
+
 class TestRasterCoverFraction:
     """The exact union of image boxes, clipped to the page, as a fraction of it."""
 
@@ -661,17 +687,13 @@ class TestRasterCoverFraction:
 
         assert raster_cover_fraction(images, W, H) == pytest.approx(brute_force_cover(boxes, W, H), abs=1e-9)
 
-    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
-    def test_twenty_thousand_images_in_under_two_seconds(self):
-        rng = random.Random(20_000)
-        images = tuple(image(random_box(rng), object_index=index) for index in range(20_000))
+    @pytest.mark.no_cover  # this test sets its own trace function: coverage's must not be running
+    def test_its_work_grows_as_n_log_n_not_as_n_squared(self):
+        # Lines of quality.py run for n and 4n images: n log n grows ~4.7x (measured 4.70 from 2,000 to 8,000),
+        # n squared 16x. A count, not a time: the same on any machine, under any load.
+        small, large = lines_run(2_000), lines_run(8_000)
 
-        started = time.perf_counter()
-        got = raster_cover_fraction(images, W, H)
-        elapsed = time.perf_counter() - started
-
-        assert 0.0 < got <= 1.0
-        assert elapsed < 2.0, f"raster_cover_fraction took {elapsed:.2f}s for {len(images)} images"
+        assert large / small < 5.5, f"{small} lines for 2,000 images, {large} for 8,000"
 
     def test_twenty_thousand_tiles_cover_the_page(self):
         tiles = itertools.product(range(200), range(100))
