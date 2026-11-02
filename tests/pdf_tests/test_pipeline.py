@@ -1630,7 +1630,7 @@ class TestWorkers:
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 2, user_password="pw-6b0d")
         seen = []
         real = pipeline.start_worker
-        monkeypatch.setattr(pipeline, "start_worker", lambda command: seen.append(command) or real(command))
+        monkeypatch.setattr(pipeline, "start_worker", lambda command, **kw: seen.append(command) or real(command, **kw))
         written = []
         real_send = pipeline._send_request
         monkeypatch.setattr(
@@ -1836,6 +1836,39 @@ def ended_up(worker: pipeline._Worker) -> None:
     worker.stderr.finish(5.0)
 
 
+# A worker that starts a descendant holding the worker's stdout and stderr (it inherits them) for a minute, writes
+# that descendant's pid to argv[1], then sends nothing.
+HOLDS_ITS_PIPES = """
+import subprocess, sys, time
+descendant = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+with open(sys.argv[1], "w") as out:
+    out.write(str(descendant.pid))
+time.sleep(60)
+"""
+process_groups = pytest.mark.skipif(sys.platform == "win32", reason="a page worker leads a process group on POSIX only")
+
+
+def descendant_of(pidfile: Path) -> int:
+    """The pid HOLDS_ITS_PIPES wrote, once it is written (within 30 s)."""
+    deadline = time.monotonic() + 30.0
+    while not pidfile.exists() or not pidfile.read_text():
+        assert time.monotonic() < deadline, "the worker did not start its descendant"
+        time.sleep(0.02)
+    return int(pidfile.read_text())
+
+
+def assert_ends(pid: int) -> None:
+    """``pid`` ends (and its new parent reaps it) within 5 s."""
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.02)
+    pytest.fail(f"process {pid} still runs")
+
+
 def empty_stderr() -> _process.StderrTail:
     """The drain of a stderr pipe already at its end: nothing was written."""
     read_end, write_end = os.pipe()
@@ -1925,6 +1958,44 @@ class TestReplies:
             ended_up(worker)
 
         assert reason == "the page worker opening it did not return its facts within 120 s of its start: it was killed"
+
+    @process_groups
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_a_descendant_holding_a_workers_pipes_ends_with_it_at_its_bound(self, tmp_path, monkeypatch):
+        # #418's bounds hold only if a killed worker's replies end: a descendant holding its pipes is ended with it.
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
+        pidfile = tmp_path / "descendant.pid"
+        allowances(monkeypatch, _WORKER_START_S=0.5, _WORKER_PAGE_S=0.5)  # its facts' bound: 1 s from its start
+        command = [sys.executable, "-c", HOLDS_ITS_PIPES, str(pidfile)]
+
+        began = time.monotonic()
+        with pytest.raises(PDFCorruptError) as caught:
+            pipeline._pooled_pages(PDFSource(path=path), PipelineOptions(), command)
+        elapsed = time.monotonic() - began
+
+        why = "the page worker opening it did not return its facts within 1 s of its start: it was killed"
+        assert str(caught.value) == f"{path}: {why}; the document is not read"
+        assert elapsed < 6.0  # ~1.1 s here: the bound, a kill and a reap; the descendant would hold the pipes 60 s
+        assert_ends(descendant_of(pidfile))
+
+    @process_groups
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_shutting_down_ends_a_reader_a_descendant_holds_open(self, tmp_path):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
+        pidfile = tmp_path / "descendant.pid"
+        chunk = pipeline._Chunk(
+            PDFSource(path=path), PipelineOptions(), [sys.executable, "-c", HOLDS_ITS_PIPES, str(pidfile)], None, 1
+        )
+        chunk.start()
+        descendant = descendant_of(pidfile)
+
+        began = time.monotonic()
+        pipeline._shut_down([chunk])
+        elapsed = time.monotonic() - began
+
+        assert not chunk.thread.is_alive()
+        assert elapsed < 3.0  # ~0.1 s here; a reader left blocked on the pipes waits out its 5 s join
+        assert_ends(descendant)
 
     def test_a_reader_that_does_not_end_fails_loud(self, monkeypatch):
         monkeypatch.setattr(pipeline, "_lifetime_s", lambda count, options: 0.01)
