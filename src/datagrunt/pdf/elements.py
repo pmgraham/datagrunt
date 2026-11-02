@@ -89,9 +89,11 @@ _MARKDOWN_SYNTAX_CHAR = re.compile(r"[\\`*_\[\]<>&|~#]")
 
 # What can still open a block at the start of a line once every
 # _MARKDOWN_SYNTAX_CHAR is escaped: a list, thematic-break, or setext marker
-# (``-``, ``+``, ``=``), or an ordered-list number (digits before ``.``/``)``).
-# [0-9], not \d: list numbers are ASCII digits only.
-_LINE_START_MARKER = re.compile(r"\A(?:[-+=]|[0-9]+(?=[.)]))")
+# (``-``, ``+``, ``=``), or an ordered-list number (digits before ``.``/``)``
+# that whitespace or the line's end follows, as CommonMark requires: ``45.00``
+# and ``3)x`` are text, ``1. item`` and ``3.`` open a list). [0-9], not \d:
+# list numbers are ASCII digits only.
+_LINE_START_MARKER = re.compile(r"\A(?:[-+=]|[0-9]+(?=[.)](?:[ \t]|\Z)))")
 
 # A marker CommonMark reads as an ordered-list item: 1-9 ASCII digits, then
 # "." or ")" (the digits and the delimiter are the groups).

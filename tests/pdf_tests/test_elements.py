@@ -2,6 +2,7 @@
 
 import dataclasses
 import hashlib
+import html
 import os
 import re
 import time
@@ -11,6 +12,7 @@ from typing import get_args
 import polars as pl
 import pyarrow as pa
 import pytest
+from markdown_it import MarkdownIt
 
 import datagrunt.pdf.elements as elements_module
 from datagrunt.pdf import (
@@ -1416,6 +1418,28 @@ class TestMarkdownLineStartMarkers:
     )
     def test_paragraph(self, text, expected):
         assert _element(Paragraph, text=text).to_markdown() == expected
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            # A number ends a list marker only before whitespace or the line's end (CommonMark): else it is text.
+            ("45.00 mm", "45.00 mm"),
+            ("10.000", "10.000"),
+            ("3)x", "3)x"),
+            ("1.5", "1.5"),
+            # Still list markers: escaped.
+            ("1. item", "1\\. item"),
+            ("2) item", "2\\) item"),
+            ("3.", "3\\."),
+            ("4)", "4\\)"),
+            ("5.\titem", "5\\.\titem"),
+        ],
+    )
+    def test_a_number_is_escaped_only_where_it_opens_a_list(self, text, expected):
+        markdown = _element(Paragraph, text=text).to_markdown()
+
+        assert markdown == expected
+        assert MarkdownIt("commonmark").render(markdown) == f"<p>{html.escape(text, quote=False)}</p>\n"
 
     def test_list_item_and_figure_caption(self):
         assert _element(BulletList, items=("2) x", "___"), ordered=False).to_markdown() == "- 2\\) x\n- \\_\\_\\_"
