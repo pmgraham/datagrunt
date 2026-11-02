@@ -12,16 +12,19 @@ import io
 import json
 import os
 import pickle
+import random
 import re
 import subprocess
 import sys
 import threading
 import time
+import types
 from functools import partial
 from pathlib import Path
 
 import pypdfium2.raw as pdfium_c
 import pytest
+from PIL import Image
 
 from datagrunt.pdf import (
     DatagruntPDFError,
@@ -449,6 +452,36 @@ with open(sys.argv[2], "a") as marker:
 document = extract_document(sys.argv[1], workers=2)
 print(f"extracted {len(document.pages)} pages: {[page.status for page in document.pages]}")
 """
+
+
+def noise_png(width: int, height: int) -> bytes:
+    """An RGB PNG of random pixels (one seed): it compresses to about its raw size, ``width * height * 3`` bytes."""
+    rng = random.Random(width * height)
+    buffer = io.BytesIO()
+    Image.frombytes("RGB", (width, height), rng.randbytes(width * height * 3)).save(buffer, "PNG")
+    return buffer.getvalue()
+
+
+def digest_that_then(change):
+    """A stand-in for pipeline's ``hashlib``: its sha256 hashes as hashlib's does, and calls ``change()`` once, after
+    the first chunk it is given (the reads stay the real reads of the real file)."""
+    real = hashlib.sha256
+    done: list[bool] = []
+
+    class Digest:
+        def __init__(self) -> None:
+            self._digest = real()
+
+        def update(self, block: bytes) -> None:
+            self._digest.update(block)
+            if not done:
+                done.append(True)
+                change()
+
+        def hexdigest(self) -> str:
+            return self._digest.hexdigest()
+
+    return types.SimpleNamespace(sha256=Digest)
 
 
 def identity_of(path) -> SourceIdentity:
@@ -1218,6 +1251,45 @@ class TestExtractDocument:
         message = f"{path} changed while it was hashed: 0 of its {path.stat().st_size} bytes could be read"
         with pytest.raises(PDFSourceChangedError, match=re.escape(message)):
             extract_document(path)
+
+    def test_a_file_cut_short_on_disk_while_it_is_hashed_fails_loud(self, tmp_path, monkeypatch):
+        # The real reads of the real file, over 1 MiB (one chunk, read past the stream's buffer): it is cut to nothing
+        # once the hash has its first chunk, so its next read is short.
+        noise = RasterImage(72.0, 400.0, 200.0, 150.0, noise_png(800, 600))
+        path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=(*mixed_page().items, noise))])
+        size = path.stat().st_size
+        assert size > pipeline._HASH_CHUNK_BYTES == 1 << 20
+        monkeypatch.setattr(pipeline, "hashlib", digest_that_then(lambda: os.truncate(path, 0)))
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            extract_document(path)
+
+        assert str(caught.value) == f"{path} changed while it was hashed: 1048576 of its {size} bytes could be read"
+
+    def test_a_file_cut_short_once_its_bytes_are_hashed_is_said_to_have_changed(self, tmp_path, monkeypatch):
+        # The hash read the whole small file at once (its stream's buffer); the file is cut to nothing before pdfium
+        # opens it. Its open fails, but on a file that is not the one hashed: that is what is said.
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
+        size = path.stat().st_size
+        monkeypatch.setattr(pipeline, "_HASH_CHUNK_BYTES", 256)
+        monkeypatch.setattr(pipeline, "hashlib", digest_that_then(lambda: os.truncate(path, 0)))
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            extract_document(path)
+
+        assert str(caught.value).startswith(f"{path} changed when pdfium opened it: size {size} -> 0 bytes")
+
+    def test_a_file_grown_on_disk_while_it_is_hashed_fails_loud(self, tmp_path, monkeypatch):
+        # The hash reads the size the file had when it was opened; the growth is caught when pdfium opens it.
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
+        before = identity_of(path)
+        monkeypatch.setattr(pipeline, "_HASH_CHUNK_BYTES", 256)
+        monkeypatch.setattr(pipeline, "hashlib", digest_that_then(lambda: append_in_place(path)))
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            extract_document(path)
+
+        assert str(caught.value) == changed(path, "when pdfium opened it", before, identity_of(path), "size", "mtime")
 
     def test_a_corrupt_page_is_an_error_page_and_the_rest_extract(self, tmp_path):
         path = break_page(build_pdf(tmp_path / "doc.pdf", [mixed_page(), mixed_page(), mixed_page()]), 2)

@@ -32,7 +32,7 @@ from datagrunt.pdf._memory_cap import CAP_EXIT, Lifetime, apply_memory_cap
 from datagrunt.pdf._process import error_reply, send_message
 from datagrunt.pdf.assembly import assemble_page
 from datagrunt.pdf.elements import Page
-from datagrunt.pdf.exceptions import PDFCorruptError
+from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFSourceChangedError
 from datagrunt.pdf.layout import find_lattice_tables
 from datagrunt.pdf.pdfium_engine import (
     DocumentHandle,
@@ -123,10 +123,36 @@ def _send_started(replies: IO[bytes], index: int) -> None:
 
 @contextmanager
 def _opened_checked(source: PDFSource, when: str) -> Iterator[DocumentHandle]:
-    """The document, opened by pdfium from ``source.path`` and checked against ``source.identity`` at once."""
-    with open_document(source.path, password=source.password) as handle:
+    """The document, opened by pdfium from ``source.path`` and checked against ``source.identity`` at once.
+
+    An open that fails on a file that is no longer the one hashed (cut
+    short, replaced) raises PDFSourceChangedError, chained from the open's
+    error: the file changed, which is what is said, not what pdfium made of
+    the other file.
+    """
+    try:
+        opened = open_document(source.path, password=source.password)
+    except (DatagruntPDFError, OSError) as exc:
+        _raise_if_changed(source, when, exc)
+        raise
+    with opened as handle:
         _check_unchanged(source, os.stat(source.path), when)
         yield handle
+
+
+def _raise_if_changed(source: PDFSource, when: str, error: Exception) -> None:
+    """Raise PDFSourceChangedError, from ``error``, if the file at the path is not ``source``'s; else return.
+
+    A path that cannot be stat'ed has nothing to compare: the open's own error, re-raised by the caller, says why.
+    """
+    try:
+        status = os.stat(source.path)
+    except OSError:
+        return
+    try:
+        _check_unchanged(source, status, when)
+    except PDFSourceChangedError as changed:
+        raise changed from error
 
 
 def _iter_pages(
