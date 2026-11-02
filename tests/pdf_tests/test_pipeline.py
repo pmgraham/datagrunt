@@ -1055,6 +1055,44 @@ class TestExtractDocument:
         assert (tail.page_number, head.page_number) == (1, 2)
         assert head.continued_from_id == tail.element_id
         assert tail.headers == ("Part", "Qty", "Price")
+        assert tail.rows == (("Bolt", "4", "0.10"), ("Nut", "12", "0.05"))
+        # Page 2 does not repeat the header row: its first row is data, not headers (D5), and no row is lost.
+        assert head.headers == ("Part", "Qty", "Price")
+        assert head.rows == (("Washer", "100", "0.01"), ("Pin", "8", "0.02"))
+
+    def test_a_borderless_continuation_without_a_header_row_keeps_its_first_row(self, tmp_path):
+        # The audit's P0-A: a stream (borderless) order table ends page 1; page 2 opens on data row 004, no header
+        # repeated. A4a takes a first row without blank cells for headers; linked, it is page 2's first row again.
+        xs = (72.0, 140.0, 260.0, 330.0)
+        first = (
+            ("Line", "SKU", "Qty", "Amount"),
+            ("001", "BOLT-12", "4", "10.00"),
+            ("002", "NUT-08", "12", "6.00"),
+            ("003", "WASH-05", "100", "5.00"),
+        )
+        rest = (("004", "SEAL-09", "1", "95.00"), ("005", "PIN-03", "8", "2.40"), ("006", "GSKT-11", "2", "18.50"))
+        pages = [
+            PageSpec(
+                items=(
+                    TextRun("Purchase order", 72.0, 60.0, size=18.0),
+                    *body_text(100.0),
+                    *table_runs(first, xs, top=660.0),
+                )
+            ),
+            PageSpec(items=(*table_runs(rest, xs, top=72.0), *body_text(300.0))),
+        ]
+
+        tail, head = extract_document(build_pdf(tmp_path / "order.pdf", pages)).tables
+
+        assert (tail.extraction_method, head.extraction_method) == ("stream", "stream")
+        assert (tail.headers, tail.rows) == (first[0], first[1:])
+        assert head.continued_from_id == tail.element_id
+        assert head.headers == tail.headers
+        assert head.rows == rest
+        assert head.rows[0] == ("004", "SEAL-09", "1", "95.00")
+        frame = head.to_dataframe()
+        assert frame.columns == ["Line", "SKU", "Qty", "Amount"]
+        assert frame.height == 3
 
     def test_the_header_context_is_page_ones_leading_key_values(self, tmp_path):
         ys = (200.0, 220.0, 240.0, 260.0)

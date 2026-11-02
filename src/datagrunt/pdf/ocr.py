@@ -25,7 +25,8 @@ The tesseract CLI (never ``pytesseract``) reads the page:
   maps each word's box back to the displayed page in points: through its
   band's offset, ``72 / dpi`` and the inverse of the turn. A word read in
   both bands of a shared strip (the same text, boxes overlapping by an IoU
-  of 0.5 or more) is kept once, with its higher confidence. Given a
+  of 0.5 or more) is kept once, with its higher confidence; copies match
+  one to one, closest first, so two words are never one's copies. Given a
   deadline (the vision page's budget, #418), each band's call is given at
   most the time left, and a band not started by then is not read: the
   reading is ``"spent"``.
@@ -41,6 +42,14 @@ The tesseract CLI (never ``pytesseract``) reads the page:
   drops 210 of 3,893 band words; the words' recall of the digital text
   goes from 84.5 % to 84.4 % (one "f"), their precision from 87.9 % to
   93.9 %.
+- A line no band reads whole (taller than the shared strip and crossing
+  both cut edges, a large heading, say, or one filling the strip) is cut
+  in both bands, each reading its part as other words. Its parts at the
+  two cut edges overlap across the seam: only those of the band that read
+  more of the line (farther past the strip; then the higher mean
+  confidence; then the upper band's) are kept, so it is read once (D6).
+  Its text is that band's read of its part: a heading cut so is often
+  misread, as no band holds it whole.
 
 ``--psm 3`` (tesseract's automatic page segmentation) is chosen over
 ``--psm 6`` (one uniform block) by A5b's evidence: forced to OCR, 31 corpus
@@ -75,7 +84,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import IO, Literal, NamedTuple
+from typing import IO, Literal, NamedTuple, TypeAlias
 
 from PIL import Image, ImageOps
 
@@ -556,6 +565,11 @@ def _tsv_words(stdout: bytes, band: Band) -> list[_Placed] | str:
 def _tsv_word(fields: list[str], band: Band) -> _Placed | None:
     """The word on one TSV row, placed on the righted page; None for a row that is not a word.
 
+    Its box is clamped to the band (D8): the band spans the righted page's
+    width and its rows lie on it, so a box tesseract reports past the
+    image's right or bottom edge can never map off the displayed page,
+    which A1's ``Page`` refuses for a word that is not hidden.
+
     Raises:
         ValueError: If the row is malformed.
     """
@@ -569,8 +583,9 @@ def _tsv_word(fields: list[str], band: Band) -> _Placed | None:
     text = fields[11]
     if confidence < 0.0 or not text.strip():
         return None
-    y0 = band.top_px + top
-    return _Placed(text, left, y0, left + width, y0 + height, confidence, (band.top_px, block, paragraph, line))
+    x0, x1 = (min(edge, band.px_width) for edge in (left, left + width))
+    y0, y1 = (band.top_px + min(edge, band.px_height) for edge in (top, top + height))
+    return _Placed(text, x0, y0, x1, y1, confidence, (band.top_px, block, paragraph, line))
 
 
 def _tsv_int(name: str, value: str) -> int:
@@ -607,18 +622,15 @@ def _page_words(
     )
 
 
-def _merged(read: list[tuple[Band, list[_Placed]]]) -> list[_Placed]:
-    """Every band's words, band by band, without the seams' fragments, a word read twice kept once (higher confidence).
+# A word a band read: its position in that band's words, and the word.
+_Entry: TypeAlias = tuple[int, _Placed]
 
-    Fragments (:func:`_fragments`) go first, so a copy read twice is never
-    kept over a whole copy for being cut.
-    """
-    fragments: set[tuple[int, int]] = set()
+
+def _merged(read: list[tuple[Band, list[_Placed]]]) -> list[_Placed]:
+    """Every band's words, band by band, less those each seam drops (:func:`_seam_drops`)."""
+    dropped: set[tuple[int, int]] = set()
     for index in range(len(read) - 1):
-        fragments |= _fragments(read[index], read[index + 1], index)
-    dropped = set(fragments)
-    for index in range(len(read) - 1):
-        dropped |= _read_twice(read[index], read[index + 1], index, fragments)
+        dropped |= _seam_drops(read[index], read[index + 1], index, dropped)
     return [
         word
         for index, (_band, words) in enumerate(read)
@@ -627,99 +639,197 @@ def _merged(read: list[tuple[Band, list[_Placed]]]) -> list[_Placed]:
     ]
 
 
-def _fragments(
-    upper: tuple[Band, list[_Placed]], lower: tuple[Band, list[_Placed]], index: int
+def _seam_drops(
+    upper: tuple[Band, list[_Placed]], lower: tuple[Band, list[_Placed]], index: int, dropped: set[tuple[int, int]]
 ) -> set[tuple[int, int]]:
-    """(band, position) of each word the seam of ``upper`` (band ``index``) and ``lower`` cuts, read whole across it.
+    """(band, position) of each word the seam of ``upper`` (band ``index``) and ``lower`` drops.
 
-    A word is cut when it lies wholly in the strip the bands share and its
-    box is within :data:`_CUT_EDGE_PX` rows of its band's cut edge (the upper
-    band's bottom, the lower band's top). It is a fragment when a word of
-    the other band, more than that from the edge (whole there), overlaps it.
-    A cut word nothing whole overlaps is kept: words read once are never
-    dropped.
+    Only the words reaching into the strip the two bands share take part,
+    less those an earlier seam ``dropped``. Three steps, each over what the
+    one before kept: the cut fragments of words the other band read whole
+    (:func:`_fragments`), so a copy is never kept over a whole one for being
+    cut; the parts of lines neither band read whole (:func:`_clipped`); then
+    the lesser copy of each word read in both (:func:`_read_twice`).
     """
     (upper_band, upper_words), (lower_band, lower_words) = upper, lower
     strip = (lower_band.top_px, upper_band.top_px + upper_band.px_height)
-    upper_cut, upper_whole = _at_edge(upper_words, strip, at_top=False)
-    lower_cut, lower_whole = _at_edge(lower_words, strip, at_top=True)
-    return {
-        *((index, at) for at in _overlapped(upper_cut, lower_whole)),
-        *((index + 1, at) for at in _overlapped(lower_cut, upper_whole)),
-    }
+    above = _reaching(upper_words, strip, index, dropped)
+    below = _reaching(lower_words, strip, index + 1, dropped)
+    upper_edge, upper_whole = _at_edge(above, strip, at_top=False)
+    lower_edge, lower_whole = _at_edge(below, strip, at_top=True)
+    gone = {(index, at) for at in _fragments(upper_edge, lower_whole, strip)}
+    gone |= {(index + 1, at) for at in _fragments(lower_edge, upper_whole, strip)}
+    gone |= _clipped(_kept(upper_edge, index, gone), _kept(lower_edge, index + 1, gone), strip, index)
+    return gone | _read_twice(_kept(above, index, gone), _kept(below, index + 1, gone), index)
 
 
-def _at_edge(
-    words: list[_Placed], strip: tuple[int, int], *, at_top: bool
-) -> tuple[list[tuple[int, _Placed]], list[_Placed]]:
-    """A band's words reaching into ``strip`` (its first row, and the row past its last): those cut, those whole.
+def _reaching(words: list[_Placed], strip: tuple[int, int], band: int, dropped: set[tuple[int, int]]) -> list[_Entry]:
+    """Band ``band``'s words reaching into ``strip`` (its first row, and the row past its last), less ``dropped``."""
+    top, bottom = strip
+    return [
+        (position, word)
+        for position, word in enumerate(words)
+        if word.y0 < bottom and word.y1 > top and (band, position) not in dropped
+    ]
+
+
+def _kept(entries: list[_Entry], band: int, gone: set[tuple[int, int]]) -> list[_Entry]:
+    """``entries`` of band ``band`` that are not ``gone``."""
+    return [entry for entry in entries if (band, entry[0]) not in gone]
+
+
+def _at_edge(entries: list[_Entry], strip: tuple[int, int], *, at_top: bool) -> tuple[list[_Entry], list[_Entry]]:
+    """A band's words reaching into ``strip``: those at its cut edge, and those whole.
 
     The band's cut edge is the strip's top when ``at_top`` (the lower band),
-    else its bottom (the upper band). A word farther than
-    :data:`_CUT_EDGE_PX` rows from it is whole; one within it is cut, with
-    its position, if it lies wholly in the strip, else neither: it reaches a
-    row the other band does not hold.
+    else its bottom (the upper band). A word within :data:`_CUT_EDGE_PX` rows
+    of it is at the edge: the edge cut it, unless the ink ends there. One
+    farther from it is whole.
     """
     top, bottom = strip
-    cut: list[tuple[int, _Placed]] = []
-    whole: list[_Placed] = []
-    for position, word in enumerate(words):
-        if word.y1 <= top or word.y0 >= bottom:
-            continue
-        if (word.y0 - top if at_top else bottom - word.y1) > _CUT_EDGE_PX:
-            whole.append(word)
-        elif top <= word.y0 and word.y1 <= bottom:
-            cut.append((position, word))
-    return cut, whole
+    edge: list[_Entry] = []
+    whole: list[_Entry] = []
+    for entry in entries:
+        word = entry[1]
+        gap = word.y0 - top if at_top else bottom - word.y1
+        (whole if gap > _CUT_EDGE_PX else edge).append(entry)
+    return edge, whole
 
 
-def _overlapped(cut: list[tuple[int, _Placed]], whole: list[_Placed]) -> list[int]:
-    """The positions of the ``cut`` words some ``whole`` word overlaps (boxes sharing an area over 0).
+def _fragments(edge: list[_Entry], whole: list[_Entry], strip: tuple[int, int]) -> set[int]:
+    """The positions of the ``edge`` words lying wholly in ``strip`` that a ``whole`` word of the other band overlaps.
 
-    A sweep along x, cut words by their left edges: each is checked against
-    the whole words starting before its right edge that reach past its left
-    one. O((c + w) log(c + w)) to sort, then O(c a) for a whole words
-    active at once (a few on a strip of text lines).
+    Such a word is OCR's read of a line its band's edge cut and the other
+    band read whole (#416). One reaching past the strip, or that nothing
+    whole overlaps, is not: words read once are never dropped.
     """
-    pending = sorted(whole, key=lambda word: word.x0)
-    active: list[_Placed] = []
-    taken = 0
-    found: list[int] = []
-    for position, word in sorted(cut, key=lambda item: item[1].x0):
-        while taken < len(pending) and pending[taken].x0 < word.x1:
-            active.append(pending[taken])
-            taken += 1
-        active = [other for other in active if other.x1 > word.x0]
-        if any(_overlap(word, other) > 0 for other in active):
-            found.append(position)
-    return found
+    top, bottom = strip
+    cut = [entry for entry in edge if top <= entry[1].y0 and entry[1].y1 <= bottom]
+    return {cut[first][0] for first, _ in _overlapping(cut, whole)}
 
 
-def _read_twice(
-    upper: tuple[Band, list[_Placed]], lower: tuple[Band, list[_Placed]], index: int, fragments: set[tuple[int, int]]
-) -> set[tuple[int, int]]:
-    """(band, position) of the lesser copy of each word read in both ``upper`` (band ``index``) and ``lower``.
+def _clipped(upper: list[_Entry], lower: list[_Entry], strip: tuple[int, int], index: int) -> set[tuple[int, int]]:
+    """(band, position) of the parts of each line no band read whole, from the band that read less of it (D6).
 
-    Only words reaching into the strip the two bands share can be read in
-    both; a copy is the same text with a box IoU of 0.5 or more. A tie keeps
-    the upper band's. ``fragments`` take no part.
+    ``upper`` (band ``index``) and ``lower`` are the two bands' words at
+    their cut edges. Those overlapping across the seam, linked by their
+    overlaps (:func:`_lines`), are parts of one line that reaches both cut
+    edges: it is taller than the strip, or fills it, so each band read only
+    its part, and tesseract reads a cut part as other words. Only the parts
+    of the band that read more of it (:func:`_upper_read_more`) are kept.
     """
-    (upper_band, upper_words), (lower_band, lower_words) = upper, lower
-    strip_top, strip_bottom = lower_band.top_px, upper_band.top_px + upper_band.px_height
-    below: dict[str, list[int]] = {}
-    for position, word in enumerate(lower_words):
-        if word.y0 < strip_bottom and (index + 1, position) not in fragments:
-            below.setdefault(word.text, []).append(position)
+    dropped: set[tuple[int, int]] = set()
+    for above, below in _lines(_overlapping(upper, lower)):
+        upper_parts, lower_parts = [upper[at] for at in above], [lower[at] for at in below]
+        if _upper_read_more(upper_parts, lower_parts, strip):
+            dropped |= {(index + 1, position) for position, _ in lower_parts}
+        else:
+            dropped |= {(index, position) for position, _ in upper_parts}
+    return dropped
+
+
+def _upper_read_more(upper: list[_Entry], lower: list[_Entry], strip: tuple[int, int]) -> bool:
+    """True if the upper band's parts of a line read more of it than the lower band's, which are its other parts.
+
+    More is farther past the strip: rows the other band does not hold. When
+    the two reach as far (both none, for a line filling the strip: both
+    read all of it), the higher mean confidence; then the upper band's.
+    """
+    top, bottom = strip
+    above = max(top - min(word.y0 for _, word in upper), 0)
+    below = max(max(word.y1 for _, word in lower) - bottom, 0)
+    if above != below:
+        return above > below
+    return _mean_confidence(upper) >= _mean_confidence(lower)
+
+
+def _mean_confidence(entries: list[_Entry]) -> float:
+    """The mean confidence of ``entries`` (at least one)."""
+    return sum(word.confidence for _, word in entries) / len(entries)
+
+
+def _lines(pairs: list[tuple[int, int]]) -> list[tuple[list[int], list[int]]]:
+    """The groups of (upper, lower) word indices that ``pairs`` link, directly or through other words.
+
+    Each group is a connected part of the pairs' graph. Each word is reached
+    once, so this is O(words + pairs).
+    """
+    links: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for above, below in pairs:
+        links.setdefault((0, above), []).append((1, below))
+        links.setdefault((1, below), []).append((0, above))
+    seen: set[tuple[int, int]] = set()
+    groups: list[tuple[list[int], list[int]]] = []
+    for start in links:
+        if start not in seen:
+            groups.append(_linked(start, links, seen))
+    return groups
+
+
+def _linked(
+    start: tuple[int, int], links: dict[tuple[int, int], list[tuple[int, int]]], seen: set[tuple[int, int]]
+) -> tuple[list[int], list[int]]:
+    """The upper and lower word indices ``links`` reach from ``start``, each added to ``seen`` (once: bounded)."""
+    group: tuple[list[int], list[int]] = ([], [])
+    seen.add(start)
+    pending = [start]
+    while pending:
+        side, at = pending.pop()
+        group[side].append(at)
+        for other in links[(side, at)]:
+            if other not in seen:
+                seen.add(other)
+                pending.append(other)
+    return sorted(group[0]), sorted(group[1])
+
+
+def _read_twice(above: list[_Entry], below: list[_Entry], index: int) -> set[tuple[int, int]]:
+    """(band, position) of the lesser copy of each word read in both ``above`` (band ``index``) and ``below``.
+
+    A copy is the same text with a box IoU of 0.5 or more. Copies match one
+    to one (D6): pairs are taken closest first (highest IoU, then by
+    position), passing over a pair one of whose words is matched already,
+    so two words never count as one's copies. Of a match, the lesser
+    confidence is dropped; a tie keeps the upper band's.
+    """
+    pairs: list[tuple[float, int, int]] = []
+    for first, second in _overlapping(above, below):
+        upper, lower = above[first][1], below[second][1]
+        if upper.text == lower.text and (iou := _iou(upper, lower)) >= _SAME_WORD_IOU:
+            pairs.append((-iou, first, second))
+    matched: tuple[set[int], set[int]] = (set(), set())
     lesser: set[tuple[int, int]] = set()
-    for position, word in enumerate(upper_words):
-        if word.y1 <= strip_top or (index, position) in fragments:
+    for _, first, second in sorted(pairs):
+        if first in matched[0] or second in matched[1]:
             continue
-        for other in below.get(word.text, ()):
-            if _iou(word, lower_words[other]) >= _SAME_WORD_IOU:
-                lesser.add(
-                    (index + 1, other) if lower_words[other].confidence <= word.confidence else (index, position)
-                )
+        matched[0].add(first)
+        matched[1].add(second)
+        (upper_at, upper), (lower_at, lower) = above[first], below[second]
+        lesser.add((index + 1, lower_at) if lower.confidence <= upper.confidence else (index, upper_at))
     return lesser
+
+
+def _overlapping(first: list[_Entry], second: list[_Entry]) -> list[tuple[int, int]]:
+    """Each (i, j) whose words ``first[i]`` and ``second[j]`` overlap (boxes sharing an area over 0), found once.
+
+    A sweep along x by left edges: each word is checked against the other
+    list's words that started before it and reach past its left edge, so a
+    pair is found when its second word starts. O((f + s) log(f + s)) to
+    sort, then O((f + s) a) for a words of the other list active at once (a
+    few on a strip of text lines), plus the pairs found.
+    """
+    lists = (first, second)
+    starts = sorted((entry[1].x0, side, at) for side, entries in enumerate(lists) for at, entry in enumerate(entries))
+    active: tuple[list[int], list[int]] = ([], [])
+    pairs: list[tuple[int, int]] = []
+    for x0, side, at in starts:
+        other = 1 - side
+        active[other][:] = [held for held in active[other] if lists[other][held][1].x1 > x0]
+        word = lists[side][at][1]
+        hits = [held for held in active[other] if _overlap(word, lists[other][held][1]) > 0]
+        pairs.extend((at, held) if side == 0 else (held, at) for held in hits)
+        active[side].append(at)
+    return pairs
 
 
 def _iou(first: _Placed, second: _Placed) -> float:

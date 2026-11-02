@@ -23,8 +23,13 @@ change.
    page p+1's first visible element is a ``Table`` with as many columns,
    each column one with the other's (:func:`_one_column`), the second
    continues the first: its ``continued_from_id`` names the first, and
-   when it has no headers it takes the first's (headers it has, repeated
-   or its own, are kept). A column is one when its centres lie within
+   its headers are the first's. A header row it repeats (the first's
+   cells, runs of whitespace aside) stays its headers, as it is. Any
+   other first row is data (D5): A4a takes a page's first row for headers
+   when none of its cells is blank, as a continuation's first data row
+   often is, so that row goes back to the head of its rows. No row is
+   lost or added; only a repeated header row stays out of the rows.
+   A column is one when its centres lie within
    :data:`SPLIT_TABLE_TOLERANCE_PT`, or (#420) when one part sits on its
    interval's end (set flush right) and the other on its interval's start
    (set flush left, or of one width: such a column tells no alignment and
@@ -49,6 +54,9 @@ Known limitations:
 
 - A visible element above a continuation (a running page header, say)
   makes it not page p+1's first visible element, so it does not link.
+- A continuation whose first row is a header row that does not repeat
+  the first part's (other words, not only other whitespace) cannot be
+  told from a data row: it becomes the first of its rows.
 - A hidden heading is in no section: A1 makes a heading's ``scope_path``
   end with its own text and a section's elements share its path, so a
   heading that opens no scope fits none. It stays in its page's elements.
@@ -172,10 +180,21 @@ def _continue_from(previous: Page, item: Page) -> Page:
     head = _first_visible(item.elements)
     if not isinstance(tail, Table) or not isinstance(head, Table) or not _same_columns(tail, head):
         return item
-    joined = dataclasses.replace(head, continued_from_id=tail.element_id, headers=head.headers or tail.headers)
+    if head.headers and _repeats(head.headers, tail.headers):
+        joined = dataclasses.replace(head, continued_from_id=tail.element_id)
+    else:
+        rows = (head.headers, *head.rows) if head.headers else head.rows
+        joined = dataclasses.replace(head, continued_from_id=tail.element_id, headers=tail.headers, rows=rows)
     return dataclasses.replace(
         item, elements=tuple(joined if element is head else element for element in item.elements)
     )
+
+
+def _repeats(cells: tuple[str, ...], headers: tuple[str, ...]) -> bool:
+    """True if ``cells`` are ``headers`` cell for cell, runs of whitespace aside (a header row repeated)."""
+    if len(cells) != len(headers):
+        return False
+    return all(cell.split() == header.split() for cell, header in zip(cells, headers, strict=True))
 
 
 def _first_visible(elements: Iterable[DocumentElement]) -> DocumentElement | None:
