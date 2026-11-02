@@ -1421,8 +1421,9 @@ class ImageLoader:
             DatagruntPDFError: As :meth:`raw_bytes` raises it, or, before
                 pdfium decodes anything, if the image would decode to more
                 than 89,478,485 pixels (Pillow's default decompression-bomb
-                bound: 1 GiB / 4 / 3) or in more than 4096 JPEG 2000 tiles,
-                or its decode size cannot be known first (see
+                bound: 1 GiB / 4 / 3), with more than 4 components (a JPEG
+                or JPEG 2000 codestream) or in more than 4096 JPEG 2000
+                tiles, or its decode size cannot be known first (see
                 :class:`ImageStats`), or it is a JBIG2 image, or its stream
                 decodes past its declared size or cannot be checked (each
                 decoded only by a page render, in the render worker); or if

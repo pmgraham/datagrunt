@@ -1253,6 +1253,18 @@ def jpeg_with_frame(width: int, height: int) -> bytes:
     return bytes(data)
 
 
+def jpeg_with_components(count: int, mode: str = "L", size=(16, 8)) -> bytes:
+    """A Pillow JPEG whose frame header (SOF0) claims ``count`` components, each a copy of its first one's spec."""
+    buffer = io.BytesIO()
+    Image.new(mode, size).save(buffer, "JPEG")
+    data = buffer.getvalue()
+    sof = data.find(b"\xff\xc0")
+    (length,) = struct.unpack_from(">H", data, sof + 2)
+    entry = data[sof + 10 : sof + 13]
+    frame = struct.pack(">H", 8 + 3 * count) + data[sof + 4 : sof + 9] + bytes([count]) + entry * count
+    return data[: sof + 2] + frame + data[sof + 2 + length :]
+
+
 def gray(width: int, height: int, codec: bytes) -> bytes:
     return b"/Width %d /Height %d /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter %s" % (width, height, codec)
 
@@ -1535,7 +1547,36 @@ class TestDecodeBounds:
         with pytest.raises(DatagruntPDFError, match=re.escape("5 components, over the 4-component bound")):
             only_loader(path).png_bytes()
         assert decode_calls == []
-        assert _pdfium_images._MAX_JPX_COMPONENTS == 4
+
+    def test_a_jpeg_past_the_component_bound_is_refused_before_decoding(self, tmp_path, decode_calls):
+        path = xobject_page(tmp_path, jpeg_with_components(5), gray(16, 8, b"/DCTDecode"))
+
+        got = images_of(path)
+
+        (image,) = got.images
+        assert got.stats == stats(oversized=1, cover=DRAWN)
+        assert (image.bits_per_pixel, image.colorspace) == (None, None)
+        with pytest.raises(DatagruntPDFError, match=re.escape("object 0 has 5 components, over the 4-component bound")):
+            loader_for(path, image).png_bytes()
+        assert decode_calls == []
+
+    def test_the_component_bound_is_four_for_jpeg_and_jpeg_2000(self):
+        assert _pdfium_images._MAX_COMPONENTS == 4
+
+    @pytest.mark.parametrize("progressive", [False, True], ids=["baseline", "progressive"])
+    def test_a_cmyk_jpeg_at_the_component_bound_is_decoded(self, tmp_path, progressive):
+        buffer = io.BytesIO()
+        Image.new("CMYK", (16, 8), (0, 255, 255, 0)).save(buffer, "JPEG", progressive=progressive)
+        path = xobject_page(
+            tmp_path,
+            buffer.getvalue(),
+            b"/Width 16 /Height 8 /ColorSpace /DeviceCMYK /BitsPerComponent 8 /Filter /DCTDecode",
+        )
+
+        (image,) = images_of(path).images
+
+        assert (image.px_width, image.px_height) == (16, 8)
+        assert decoded(loader_for(path, image).png_bytes()).size == (16, 8)
 
     def test_a_jpx_past_the_decoded_samples_bound_is_refused_before_decoding(self, tmp_path, monkeypatch, decode_calls):
         monkeypatch.setattr(_pdfium_images, "_MAX_DECODED_SAMPLES", 16 * 8 * 2, raising=False)

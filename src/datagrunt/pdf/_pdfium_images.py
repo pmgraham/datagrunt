@@ -15,7 +15,8 @@ exactly one FlateDecode is read only when zlib inflates the stream whole
 within 1 MiB and pdfium then decodes it to the very same bytes (see
 ``_MAX_INFLATED_BYTES``); both inflations count against the page budget. Pixels are decoded by
 :class:`~datagrunt.pdf.pdfium_engine.ImageLoader`, one image at a time, after
-the decode bounds (``_MAX_DECODED_PIXELS``, ``_MAX_JPX_TILES``) pass.
+the decode bounds (``_MAX_DECODED_PIXELS``, ``_MAX_COMPONENTS``, ``_MAX_JPX_TILES``)
+pass.
 
 An image behind simple filters (FlateDecode, LZWDecode, RunLengthDecode,
 ASCII85Decode, ASCIIHexDecode) is sized by its declared ``/Width`` and
@@ -81,7 +82,8 @@ class ImageStats:
         skipped_oversized_images: Images too big to decode or read, recorded
             without pixel metadata: a raw stream over the asset limit (1 GiB;
             not read, so no hash and no size either), a decode size over
-            89,478,485 pixels, or a JPEG 2000 codestream in over 4096 tiles.
+            89,478,485 pixels, a JPEG or JPEG 2000 codestream of over 4
+            components, or a JPEG 2000 codestream in over 4096 tiles.
             :class:`~datagrunt.pdf.pdfium_engine.ImageLoader` refuses to
             decode them.
         skipped_unsized_images: Images whose decode size cannot be known
@@ -179,7 +181,9 @@ _MAX_DECODED_PIXELS = _MAX_ASSET_BYTES // 4 // 3
 # 62500 tiles 761 MB), before any pixel is decoded. 4096 tiles cost ~50 MB
 # and admit tiles of 148 x 148 or larger over a full-bound image.
 _MAX_JPX_TILES = 4096
-_MAX_JPX_COMPONENTS = 4
+# The most components (colour channels) a DCT or JPX image may decode with: CMYK's 4. A codestream header names its
+# own count (JPEG's Nf, JPEG 2000's Csiz), and the decoder allocates every one.
+_MAX_COMPONENTS = 4
 _MAX_DECODED_SAMPLES = _MAX_DECODED_PIXELS * 4
 
 # An ASCII-wrapped (ASCII85 / ASCIIHex) DCT or JPX stream at most this long
@@ -752,8 +756,8 @@ def _decode_size(
         header = reader(data)
         if header is None:
             return 0, 0, ("unsized", f"{label} has a {codec} header that cannot be read")
-        if header.components > _MAX_JPX_COMPONENTS:
-            message = f"{label} has {header.components} components, over the {_MAX_JPX_COMPONENTS}-component bound"
+        if header.components > _MAX_COMPONENTS:
+            message = f"{label} has {header.components} components, over the {_MAX_COMPONENTS}-component bound"
             return 0, 0, ("oversized", message)
         width, height = _dimension(header.width), _dimension(header.height)
         tiles, components = header.tiles, header.components

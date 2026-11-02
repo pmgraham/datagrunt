@@ -36,10 +36,10 @@ class TestJpegSize:
     @pytest.mark.parametrize(
         "data,expected",
         [
-            pytest.param(jpeg(), CodestreamSize(16, 8, 1), id="baseline-gray"),
-            pytest.param(jpeg((33, 17), "RGB", progressive=True), CodestreamSize(33, 17, 1), id="progressive-rgb"),
-            pytest.param(jpeg((9, 5), "RGB", icc_profile=b"p" * 200_000), CodestreamSize(9, 5, 1), id="icc-app2"),
-            pytest.param(b"junk" + jpeg(), CodestreamSize(16, 8, 1), id="junk-before-soi"),
+            pytest.param(jpeg(), CodestreamSize(16, 8, 1, 1), id="baseline-gray"),
+            pytest.param(jpeg((33, 17), "RGB", progressive=True), CodestreamSize(33, 17, 1, 3), id="progressive-rgb"),
+            pytest.param(jpeg((9, 5), "RGB", icc_profile=b"p" * 200_000), CodestreamSize(9, 5, 1, 3), id="icc-app2"),
+            pytest.param(b"junk" + jpeg(), CodestreamSize(16, 8, 1, 1), id="junk-before-soi"),
         ],
     )
     def test_reads_the_frame_size(self, data, expected):
@@ -167,8 +167,36 @@ class TestJpxComponents:
         assert size is not None
         assert size.components == 40
 
-    def test_codestream_size_defaults_components_to_one_and_jpeg_is_one(self):
+    def test_codestream_size_defaults_components_to_one(self):
         assert CodestreamSize(16, 8, 1) == CodestreamSize(16, 8, 1, 1)
-        size = jpeg_size(jpeg((9, 5), "RGB"))
-        assert size is not None
-        assert size.components == 1
+
+
+def with_frame_components(data: bytes, count: int) -> bytes:
+    """``data``, a JPEG, its SOF0 rewritten to claim ``count`` components (each a copy of its first one's spec)."""
+    data = bytearray(data)
+    sof = data.find(b"\xff\xc0")
+    (length,) = struct.unpack_from(">H", data, sof + 2)
+    entry = bytes(data[sof + 10 : sof + 13])
+    frame = struct.pack(">H", 8 + 3 * count) + bytes(data[sof + 4 : sof + 9]) + bytes([count]) + entry * count
+    return bytes(data[: sof + 2]) + frame + bytes(data[sof + 2 + length :])
+
+
+class TestJpegComponents:
+    """jpeg_size reads the frame header's component count (Nf): pdfium's decoder allocates every component."""
+
+    @pytest.mark.parametrize(
+        "mode,expected",
+        [("L", 1), ("RGB", 3), ("CMYK", 4)],
+    )
+    def test_reads_the_frames_component_count(self, mode, expected):
+        assert jpeg_size(jpeg((9, 5), mode)) == CodestreamSize(9, 5, 1, expected)
+
+    @pytest.mark.parametrize("progressive", [False, True], ids=["baseline", "progressive"])
+    def test_reads_a_cmyk_frame_as_four_components(self, progressive):
+        assert jpeg_size(jpeg((33, 17), "CMYK", progressive=progressive)) == CodestreamSize(33, 17, 1, 4)
+
+    def test_a_frame_claiming_10_components_is_read_as_written(self):
+        assert jpeg_size(with_frame_components(jpeg((9, 5)), 10)) == CodestreamSize(9, 5, 1, 10)
+
+    def test_a_frame_of_no_component_has_no_size(self):
+        assert jpeg_size(with_frame_components(jpeg((9, 5)), 0)) is None

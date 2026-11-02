@@ -37,9 +37,11 @@ _CODESTREAM_START = b"\xff\x4f\xff\x51"
 
 
 class CodestreamSize(NamedTuple):
-    """The size a codec decodes an image at, and its JPEG 2000 tile and component counts (1 for JPEG).
+    """The size a codec decodes an image at, its JPEG 2000 tile count (1 for JPEG) and its component count.
 
-    ``components`` defaults to 1, so a three-field CodestreamSize is unchanged.
+    ``components`` is the frame header's Nf for JPEG and the SIZ marker's
+    Csiz for JPEG 2000: the decoder allocates every component. It defaults
+    to 1, so a three-field CodestreamSize is unchanged.
     """
 
     width: int
@@ -49,12 +51,13 @@ class CodestreamSize(NamedTuple):
 
 
 def jpeg_size(data: bytes) -> CodestreamSize | None:
-    """The frame size of the JPEG in ``data``, or None if its headers cannot be read.
+    """The frame size and component count of the JPEG in ``data``, or None if its headers cannot be read.
 
     Like pdfium, the JPEG starts at the first ``FF D8`` (SOI). Segments are
     walked to the first SOFn; a scan (SOS) before it, a malformed or
-    truncated segment, or more than ``_MAX_JPEG_MARKERS`` segments, is None.
-    The size is as written: a zero height (a DNL frame) reads as 0.
+    truncated segment, more than ``_MAX_JPEG_MARKERS`` segments, or a frame
+    of no component, is None. The size is as written: a zero height (a DNL
+    frame) reads as 0.
     """
     start = data.find(b"\xff\xd8")
     if start < 0:
@@ -81,12 +84,12 @@ def jpeg_size(data: bytes) -> CodestreamSize | None:
 
 
 def _frame_size(data: bytes, body: int, length: int) -> CodestreamSize | None:
-    """The size in a SOFn segment whose body (after its length) starts at ``body``."""
+    """The size and component count in a SOFn segment whose body (after its length) starts at ``body``."""
     # Precision (1), height (2), width (2), component count (1).
     if length < 8 or body + 6 > len(data):
         return None
     _precision, height, width, components = struct.unpack_from(">BHHB", data, body)
-    return CodestreamSize(width, height, 1) if components >= 1 else None
+    return CodestreamSize(width, height, 1, components) if components >= 1 else None
 
 
 def jpx_size(data: bytes) -> CodestreamSize | None:

@@ -32,6 +32,7 @@ from pdf_tests.test_pdfium_images import (
     image_xobject,
     j2k,
     jpeg_bytes,
+    jpeg_with_components,
     jpeg_with_frame,
     one_page,
     predictor_bomb,
@@ -250,6 +251,12 @@ class TestImageGuard:
                 gray(16, 8, b"/JPXDecode"),
                 "object 0 has 5 components, over the 4-component bound",
                 id="jpx-components",
+            ),
+            pytest.param(
+                jpeg_with_components(5),
+                gray(16, 8, b"/DCTDecode"),
+                "object 0 has 5 components, over the 4-component bound",
+                id="jpeg-components",
             ),
             pytest.param(
                 FLATE,
