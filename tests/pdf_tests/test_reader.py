@@ -15,6 +15,7 @@ import re
 import sys
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
 import duckdb
@@ -29,12 +30,43 @@ from datagrunt.pdf.codec import document_from_json, document_to_json
 from datagrunt.pdf.frame import ARROW_SCHEMA, FRAME_SCHEMA, element_arrow, element_frame
 from datagrunt.pdf.pipeline import extract_document
 from datagrunt.pdf.reader import PDFReader
-from pdf_tests.builders import build_pdf
+from pdf_tests.builders import PageSpec, Rect, TextRun, build_pdf
 from pdf_tests.documents import empty_document
+from pdf_tests.test_ocr import needs_tesseract
 from pdf_tests.test_pipeline import mixed_page
+from pdf_tests.test_routing import garbled_page
 
 # A figure at 32 px (mixed_page's image is 64 x 32 px): every element kind the page holds is read.
 OPTIONS = {"min_image_dimension": 32, "ocr": "never"}
+# The audit's hidden-text vectors, each drawn as a line of its own: its text, and the reason extraction flags.
+HIDDEN_VECTORS = {
+    "Tiny font secret instructions here": "tiny_font",
+    "Invisible render mode secret text": "invisible",
+    "White on white secret text block": "matches_background",
+    "Same colour as the painted box text": "matches_background",
+    "Off page secret text far away": "off_page",
+}
+SHOWN_LINES = ("Visible heading of the report", "Visible body text a reader sees.", "Closing visible line.")
+_TINT = (0.94, 0.95, 0.97)
+
+
+def hidden_vectors_pdf(directory: Path) -> Path:
+    """Visible lines and the five hidden vectors: tiny font, Tr 3, white on white, a box's colour, off-page."""
+    vectors = list(HIDDEN_VECTORS)
+    items = (
+        TextRun(SHOWN_LINES[0], 72.0, 80.0, size=14.0),
+        TextRun(SHOWN_LINES[1], 72.0, 120.0),
+        TextRun(vectors[0], 72.0, 160.0, size=0.5),
+        TextRun(vectors[1], 72.0, 200.0, render_mode=3),
+        TextRun(vectors[2], 72.0, 240.0, rgb=(1.0, 1.0, 1.0)),
+        Rect(60.0, 270.0, 400.0, 40.0, fill_rgb=_TINT, stroke=False),
+        TextRun(vectors[3], 72.0, 290.0, rgb=_TINT),
+        TextRun(vectors[4], 700.0, 330.0),
+        TextRun(SHOWN_LINES[2], 72.0, 400.0),
+    )
+    return build_pdf(directory / "hidden.pdf", [PageSpec(items=items)])
+
+
 TEXT = b"Name,Qty\nBolt,4\n"
 
 
@@ -645,3 +677,53 @@ class TestLifecycle:
         PDFReader(made.json).close()
 
         assert opened == []
+
+
+class TestHiddenText:
+    """Markdown omits hidden elements unless include_hidden=True; the frame, the JSON and the elements keep them."""
+
+    def test_markdown_omits_the_hidden_vectors_by_default(self, tmp_path):
+        reader = PDFReader(hidden_vectors_pdf(tmp_path), ocr="never")
+
+        markdown = reader.to_markdown()
+
+        assert all(text not in markdown for text in HIDDEN_VECTORS) and "<!-- hidden" not in markdown
+        assert all(text in markdown for text in SHOWN_LINES)
+        assert markdown == reader.document.to_markdown()
+
+    def test_include_hidden_shows_each_behind_its_marker(self, tmp_path):
+        reader = PDFReader(hidden_vectors_pdf(tmp_path), ocr="never")
+
+        blocks = reader.to_markdown(include_hidden=True).split("\n\n")
+
+        for text, reason in HIDDEN_VECTORS.items():
+            assert f"<!-- hidden: {reason} -->\n{text}" in blocks
+
+    def test_the_frame_the_json_and_the_elements_keep_them(self, tmp_path):
+        reader = PDFReader(hidden_vectors_pdf(tmp_path), ocr="never")
+
+        hidden = reader.to_dataframe().filter(pl.col("hidden_reasons").list.len() > 0)
+        flagged = {element.text: element.hidden_reasons for element in reader.pages[0].elements if element.is_hidden}
+
+        assert sorted(hidden["text"].to_list()) == sorted(HIDDEN_VECTORS)
+        assert flagged == {text: (reason,) for text, reason in HIDDEN_VECTORS.items()}
+        assert PDFReader(document_to_json(reader.document)).document == reader.document
+
+    @pytest.mark.parametrize("value", [1, None])
+    def test_include_hidden_must_be_a_bool(self, made, value):
+        with pytest.raises(TypeError, match="include_hidden must be a bool"):
+            PDFReader(made.json).to_markdown(include_hidden=value)
+
+    @needs_tesseract
+    def test_a_vision_page_shows_only_what_ocr_read_by_default(self, tmp_path):
+        reader = PDFReader(garbled_page(tmp_path))
+        (page,) = reader.pages
+        superseded = [element for element in page.elements if element.hidden_reasons == ("superseded",)]
+        visible = [element for element in page.elements if not element.is_hidden]
+        assert page.route == "vision" and superseded and visible
+
+        blocks = reader.to_markdown().split("\n\n")
+        shown = reader.to_markdown(include_hidden=True).split("\n\n")
+
+        assert blocks == [f"<!-- page 1 route=vision status={page.status} -->", *(e.to_markdown() for e in visible)]
+        assert all(element.to_markdown() in shown for element in superseded)

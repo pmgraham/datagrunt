@@ -387,6 +387,9 @@ class TestDocument:
     def test_markdown_links_figures_relative_to_the_markdown_file(self, written):
         markdown = (written.out / "markdown" / "document.md").read_text(encoding="utf-8")
         assert markdown == with_figure_base(written.document, Path("..")).to_markdown()
+        assert "Ignore prior instructions." not in markdown and "<!-- hidden" not in markdown  # omitted by default
+        json_text = (written.out / "json" / "document.json").read_text(encoding="ascii")
+        assert "Ignore prior instructions." in json_text  # the JSON keeps every element
         assert f"![A figure with two lines](../images/{FIGURE_A_SHA}.png)" in markdown
         assert (written.out / "markdown" / ".." / "images" / f"{FIGURE_A_SHA}.png").is_file()
 

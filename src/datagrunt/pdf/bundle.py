@@ -8,7 +8,9 @@ Layout (paths relative to the bundle, joined with ``/``):
 - ``json/document.json``: the document, by :mod:`datagrunt.pdf.codec`
   (ASCII; its paths relative to the bundle).
 - ``markdown/document.md``: the document's Markdown, UTF-8, each lone
-  surrogate written as its escape (:func:`~datagrunt.pdf.frame.utf8_text`);
+  surrogate written as its escape (:func:`~datagrunt.pdf.frame.utf8_text`),
+  hidden elements omitted (``PDFDocument.to_markdown``'s default: the JSON
+  keeps them);
   a figure links to its own picture, ``../images/<name>.png``, relative to
   the file.
 - ``images/<sha256>.png``: each distinct picture, once: a figure's PNG from

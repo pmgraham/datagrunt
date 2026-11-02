@@ -66,9 +66,11 @@ own (A1's immutable elements). Its views:
 - :meth:`PDFReader.get_sample`: its first ``n_rows`` rows (20 by
   default); ``n_rows`` is checked before any work.
 - :meth:`PDFReader.to_markdown`: the document's Markdown (A1). Hidden
-  elements stay behind their ``<!-- hidden: ... -->`` markers. The text is
-  the document's exactly: a lone surrogate is kept (the frame's strings
-  hold its escape, as UTF-8 needs).
+  elements are omitted by default, as a reader sees the page; with
+  ``include_hidden=True`` each is rendered behind its
+  ``<!-- hidden: ... -->`` marker. The frame and the document keep them
+  either way. The text is the document's exactly: a lone surrogate is kept
+  (the frame's strings hold its escape, as UTF-8 needs).
 
 DuckDB:
 
@@ -134,7 +136,7 @@ from datagrunt.pdf._options import MIN_IMAGE_DIMENSION, OcrMode
 from datagrunt.pdf._source import checked_pdf_file
 from datagrunt.pdf._validate import checked_password as _checked_password
 from datagrunt.pdf._validate import checked_path as _checked_path
-from datagrunt.pdf._validate import int_at_least, non_blank_str
+from datagrunt.pdf._validate import int_at_least, non_blank_str, strict_bool
 from datagrunt.pdf.bundle import MANIFEST, _read_manifest, load_bundle
 from datagrunt.pdf.codec import document_from_json
 from datagrunt.pdf.elements import (
@@ -342,9 +344,14 @@ class PDFReader:
         rows = int_at_least("n_rows", n_rows, 1)
         return self._element_frame().head(rows)
 
-    def to_markdown(self) -> str:
-        """The document's Markdown (A1's ``PDFDocument.to_markdown``)."""
-        return self.document.to_markdown()
+    def to_markdown(self, *, include_hidden: bool = False) -> str:
+        """The document's Markdown (A1's ``PDFDocument.to_markdown``): hidden elements only with ``include_hidden``.
+
+        Raises:
+            TypeError: If ``include_hidden`` is not a bool, before any work.
+        """
+        shown = strict_bool("include_hidden", include_hidden)
+        return self.document.to_markdown(include_hidden=shown)
 
     @property
     def db_table(self) -> str:

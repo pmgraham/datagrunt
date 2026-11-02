@@ -39,7 +39,8 @@ Each method writes the document in one form. A path returned is absolute
   the lossless form.
 - :meth:`PDFWriter.write_markdown`: the document's ``to_markdown()``, UTF-8,
   each lone surrogate written as its escape (as the bundle's Markdown).
-  Hidden elements stay behind their ``<!-- hidden: ... -->`` markers (A1).
+  Hidden elements are omitted by default; with ``include_hidden=True`` each
+  is written behind its ``<!-- hidden: ... -->`` marker (A1).
 - :meth:`PDFWriter.write_parquet`: A7a's frame as it is, by polars (its
   keyword arguments passed on): List and Struct columns kept.
 - :meth:`PDFWriter.write_csv`: the frame flattened (:func:`_csv_frame`),
@@ -242,19 +243,23 @@ class PDFWriter:
         """:meth:`write_jsonl` under its v4 name."""
         return self.write_jsonl(out_filepath)
 
-    def write_markdown(self, out_filepath: str | os.PathLike[str]) -> Path:
-        """Write the document's Markdown at ``out_filepath``, UTF-8 (see the module notes).
+    def write_markdown(self, out_filepath: str | os.PathLike[str], *, include_hidden: bool = False) -> Path:
+        """Write the document's Markdown at ``out_filepath``, UTF-8: hidden elements only with ``include_hidden``.
+
+        See the module notes.
 
         Returns:
             The absolute path written.
 
         Raises:
-            TypeError: If ``out_filepath`` is not a path (before any work).
+            TypeError: If ``out_filepath`` is not a path, or ``include_hidden`` not a bool (before any work).
             IsADirectoryError: If ``out_filepath`` is a directory (before any work).
             OSError: If the file cannot be written; as extraction raises it.
         """
         target = _file_target(out_filepath)
-        return _write_bytes(target, utf8_text(self._extracted().to_markdown()).encode("utf-8"))
+        shown = strict_bool("include_hidden", include_hidden)
+        markdown = self._extracted().to_markdown(include_hidden=shown)
+        return _write_bytes(target, utf8_text(markdown).encode("utf-8"))
 
     def write_parquet(self, out_filepath: str | os.PathLike[str], **polars_kwargs: Any) -> Path:
         """Write the document's frame as Parquet at ``out_filepath``, nested types kept (see the module notes).
