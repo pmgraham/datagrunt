@@ -504,20 +504,20 @@ class TestBulletList:
     @pytest.mark.parametrize(
         ("markers", "expected"),
         [
-            (("a)", "b)"), "a) one\n\nb) two"),
-            (("(1)", "(2)"), "(1) one\n\n(2) two"),
-            (("iv.", "v."), "iv. one\n\nv. two"),
-            (("I", "II"), "I one\n\nII two"),
-            (("(a)", "(iv)"), "(a) one\n\n(iv) two"),
-            # Numbers CommonMark would not show as written: each is escaped text too.
-            (("1.", "2)"), "1\\. one\n\n2\\) two"),  # a change of delimiter starts a new list
-            (("1.", "3."), "1\\. one\n\n3\\. two"),  # only the first number sets the start
-            (("3)", "2)"), "3\\) one\n\n2\\) two"),
-            (("01.", "02."), "01\\. one\n\n02\\. two"),  # the start would read 1
-            (("1234567890.", "1234567891."), "1234567890\\. one\n\n1234567891\\. two"),  # over 9 digits
-            (("999999999.", "1000000000."), "999999999\\. one\n\n1000000000\\. two"),  # counts past 9 digits
-            (("1.", "a)"), "1\\. one\n\na) two"),
-            (("١.", "٢."), "١. one\n\n٢. two"),  # non-ASCII digits are no list number
+            (("a)", "b)"), "a) one\\\nb) two"),
+            (("(1)", "(2)"), "(1) one\\\n(2) two"),
+            (("iv.", "v."), "iv. one\\\nv. two"),
+            (("I", "II"), "I one\\\nII two"),
+            (("(a)", "(iv)"), "(a) one\\\n(iv) two"),
+            # Numbers CommonMark would not show as written: escaped text too.
+            (("1.", "2)"), "1\\. one\\\n2\\) two"),  # a change of delimiter starts a new list
+            (("1.", "3."), "1\\. one\\\n3\\. two"),  # only the first number sets the start
+            (("3)", "2)"), "3\\) one\\\n2\\) two"),
+            (("01.", "02."), "01\\. one\\\n02\\. two"),  # the start would read 1
+            (("1234567890.", "1234567891."), "1234567890\\. one\\\n1234567891\\. two"),  # over 9 digits
+            (("999999999.", "1000000000."), "999999999\\. one\\\n1000000000\\. two"),  # counts past 9 digits
+            (("1.", "a)"), "1\\. one\\\na) two"),
+            (("١.", "٢."), "١. one\\\n٢. two"),  # non-ASCII digits are no list number
         ],
     )
     def test_other_ordered_markers_stay_visible_as_text(self, markers, expected):
@@ -528,8 +528,14 @@ class TestBulletList:
     def test_text_marker_item_lines_escaped(self):
         bullets = _element(BulletList, items=("first\n# second", "*x* <b>"), markers=("(a)", "(b)"), ordered=True)
 
-        assert bullets.to_markdown() == "(a) first\n\\# second\n\n(b) \\*x\\* \\<b\\>"
+        assert bullets.to_markdown() == "(a) first\n\\# second\\\n(b) \\*x\\* \\<b\\>"
         assert bullets.items == ("first\n# second", "*x* <b>")
+
+    def test_text_marker_items_keep_their_own_trailing_backslash(self):
+        # Escaping doubles the item's backslash, so the one added after it is always the hard break.
+        bullets = _element(BulletList, items=("ends \\", "next \\"), markers=("a)", "b)"), ordered=True)
+
+        assert bullets.to_markdown() == "a) ends \\\\\\\nb) next \\\\"
 
     def test_text_marker_is_escaped_too(self):
         bullets = _element(BulletList, items=("one",), markers=("*1*",), ordered=True)

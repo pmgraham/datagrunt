@@ -280,13 +280,17 @@ def _list_entries(markers: Iterable[str], items: tuple[str, ...]) -> str:
 
 
 def _marker_text_entries(markers: tuple[str, ...], items: tuple[str, ...]) -> str:
-    """Render each item as its own paragraph that starts with its marker as literal text.
+    """Render the items as one paragraph, each item ``marker item`` as literal text on its own line.
 
     The marker and item are escaped as one literal text, so a number leading
     the line is escaped (``2\\)``) and CommonMark reads no list number from it.
+    Every item but the last ends in a backslash, a CommonMark hard line break:
+    the list stays one block, so a ``<!-- hidden -->`` comment covers all of
+    it. Escaping doubles every backslash in the text, so an item's own
+    trailing backslash stays literal and the one added is always the break.
     """
-    paragraphs = (_markdown_literal(f"{marker} {item}") for marker, item in zip(markers, items, strict=True))
-    return "\n\n".join("\n".join(lines) for lines in paragraphs)
+    entries = ("\n".join(_markdown_literal(f"{marker} {item}")) for marker, item in zip(markers, items, strict=True))
+    return "\\\n".join(entries)
 
 
 def _gfm_row(cells: tuple[str, ...]) -> str:
@@ -734,10 +738,12 @@ class BulletList(_Element):
           the entries are numbered ``1.``, ``2.``, ...
         - Ordered, with any other markers (``a)``, ``iv.``, ``(1)``, ``I``, or
           numbers CommonMark would show differently, such as ``1.`` then ``3.``):
-          one paragraph per item, ``marker item`` as literal text, so every
-          marker stays visible and none reads as a list number.
+          one paragraph with a line per item, ``marker item`` as literal text,
+          items split by hard line breaks, so every marker stays visible and
+          none reads as a list number.
 
-        A list is never split between forms, so its items render alike.
+        A list is never split between forms, so its items render alike, and
+        every form is one Markdown block.
         """
         if not self.ordered:
             return _list_entries(("-",) * len(self.items), self.items)
