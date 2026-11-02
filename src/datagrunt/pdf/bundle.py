@@ -26,6 +26,11 @@ Layout (paths relative to the bundle, joined with ``/``):
   two image dictionaries (a colour space, a palette, a ``/Decode``) is two
   pictures, the second ``images/<sha256>-<its PNG's sha256>.png``
   (:class:`_Pictures`). Each figure's ``image_path`` is its own picture.
+  Why every figure: its ``sha256`` hashes the stream, not the dictionary
+  that decodes it, and nothing else the document records tells two such
+  pictures apart. Keying on the stream alone gave a figure another
+  figure's picture; reading each costs one read a figure (a logo repeated
+  on every page is read on every page), and correctness comes first.
 - ``page_images/page_NNNN.png``: every page's image (origin):
   - a page whose ``page_image`` is set (``"document"``: A5b's vision
     pages, rendered at the effective ``vision_dpi`` and normalized): its
@@ -59,9 +64,12 @@ through a SHA-256 as it is written.
 :func:`write_bundle` is atomic. Every check comes first (the options, as
 ``PipelineOptions`` checks them; the document; ``overwrite``;
 ``output_dir``, which must not exist, or be an empty directory or one
-holding a bundle's ``manifest.json``: a file, a symlink or any other
-directory is a FileExistsError, never merged into, replaced or deleted;
-its parent; the source, which must hash to the document's sha256).
+holding a bundle's manifest (a ``manifest.json`` that reads and checks as
+:func:`load_bundle`'s step 1 checks it): a file, a symlink or any other
+directory, one holding some other ``manifest.json`` included, is a
+FileExistsError, never merged into, replaced or deleted, whatever
+``overwrite`` says; its parent; the source, which must hash to the
+document's sha256).
 
 A bundle already at ``output_dir`` is reused when it is this write's
 (:func:`_existing`): it loads and verifies (:func:`load_bundle`), its
@@ -141,7 +149,8 @@ Known limitations, documented:
 - Figures are read in batches of up to 64 a figure worker
   (:func:`~datagrunt.pdf._loaders.figure_pngs`), each read reopening the
   PDF, not batched by page through one handle. Every figure is read, the
-  figures of one stream too: only its PNG shows it is the same picture.
+  figures of one stream too: only its PNG shows it is the same picture
+  (see ``images/`` above).
 
 :func:`load_bundle` takes a bundle directory or its ``manifest.json``
 and returns the document. Nothing is trusted before it is checked:
@@ -469,7 +478,7 @@ def _checked_target(output_dir: object) -> Path:
 
 
 def _refuse_unusable(target: Path) -> None:
-    """Raise FileExistsError unless ``target`` is absent, an empty directory, or a directory holding a manifest.
+    """Raise FileExistsError unless ``target`` is absent, an empty directory, or a bundle's (:func:`_holds_bundle`).
 
     A symlink, a file and any other directory are refused: a bundle is never
     merged into one, nor replaces one, whatever ``overwrite`` says.
@@ -477,10 +486,19 @@ def _refuse_unusable(target: Path) -> None:
     if target.is_symlink() or not target.exists() or not target.is_dir():
         _refuse_existing(target)
         return
-    if _is_empty(target) or os.path.lexists(target / MANIFEST):
+    if _is_empty(target) or _holds_bundle(target):
         return
     message = "output_dir exists and is not empty, and holds no bundle: a bundle never merges into it, nor replaces it"
     raise FileExistsError(errno.EEXIST, message, str(target))
+
+
+def _holds_bundle(directory: Path) -> bool:
+    """True if ``directory`` holds a bundle's manifest: one that reads and checks as :func:`load_bundle`'s does."""
+    try:
+        _read_manifest(directory)
+    except BundleCorruptError:
+        return False
+    return True
 
 
 def _is_empty(directory: Path) -> bool:

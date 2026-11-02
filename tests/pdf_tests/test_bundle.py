@@ -1232,6 +1232,16 @@ class TestOverwrite:
             write(bound_document(source), tmp_path / "out", source, overwrite=True)
         assert files_in(tmp_path / "out") == {"keep.txt"} and leftovers(tmp_path) == []
 
+    def test_a_directory_whose_manifest_is_not_a_bundles_is_never_replaced(self, tmp_path, source, fast_render):
+        out = tmp_path / "out"
+        out.mkdir()
+        (out / "manifest.json").write_text('{"name": "web app", "start_url": "/"}', encoding="ascii")
+        (out / "index.html").write_text("<p>mine</p>", encoding="ascii")
+        before = tree_of(out)
+        with pytest.raises(FileExistsError, match="holds no bundle"):
+            write(bound_document(source), out, source, overwrite=True)
+        assert tree_of(out) == before and leftovers(tmp_path) == []
+
     def test_a_symlink_is_never_replaced(self, tmp_path, source, fast_render):
         write(bound_document(source), tmp_path / "real", source, dpi=100, vision_dpi=100)
         (tmp_path / "out").symlink_to(tmp_path / "real", target_is_directory=True)

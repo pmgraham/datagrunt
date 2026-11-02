@@ -1152,6 +1152,15 @@ class TestWriteBundle:
             PDFWriter(source, ocr="never").write_bundle(tmp_path / "out")
         assert calls == [] and sorted(p.name for p in (tmp_path / "out").iterdir()) == ["keep.txt"]
 
+    def test_a_directory_whose_manifest_is_not_a_bundles_is_refused_before_any_work(self, tmp_path, monkeypatch):
+        source = source_pdf(tmp_path)
+        calls = spy_extract(monkeypatch)
+        (tmp_path / "out").mkdir()
+        (tmp_path / "out" / "manifest.json").write_text('{"name": "web app"}', encoding="ascii")
+        with pytest.raises(FileExistsError, match="holds no bundle"):
+            PDFWriter(source, ocr="never").write_bundle(tmp_path / "out", overwrite=True)
+        assert calls == [] and sorted(p.name for p in (tmp_path / "out").iterdir()) == ["manifest.json"]
+
     def test_output_dir_must_be_a_path_before_any_work(self, tmp_path, monkeypatch):
         calls = spy_extract(monkeypatch)
         with pytest.raises(TypeError, match="output_dir must be a str or os.PathLike, got int"):

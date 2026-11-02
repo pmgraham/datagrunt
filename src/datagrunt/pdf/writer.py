@@ -57,7 +57,10 @@ Each method writes the document in one form. A path returned is absolute
   batches, up to 64 a capped figure worker
   (:func:`~datagrunt.pdf._loaders.figure_pngs`), as ``Figure.read_bytes``
   reads one; any other figure by its own ``read_bytes``. Every figure is
-  read. With ``dedupe`` (the default) each distinct picture is written
+  read: its ``sha256`` hashes the raw stream, not the image dictionary that
+  decodes it, so only its PNG shows whether it is a picture already written
+  (one read a figure: correctness over speed, as the bundle's notes say).
+  With ``dedupe`` (the default) each distinct picture is written
   once, as the bundle names it: ``<sha256>.png`` (the raw stream's sha256,
   a figure's identity), and another picture of the same stream (the stream
   under another image dictionary: a colour space, a palette, a
