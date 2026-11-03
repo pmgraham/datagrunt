@@ -35,11 +35,14 @@ change.
    each column one with the other's (:func:`_one_column`), the second
    continues the first: its ``continued_from_id`` names the first, and
    its headers are the first's. A header row it repeats (the first's
-   cells, runs of whitespace aside) stays its headers, as it is. Any
-   other first row is data (D5): A4a takes a page's first row for headers
-   when none of its cells is blank, as a continuation's first data row
-   often is, so that row goes back to the head of its rows. No row is
-   lost or added; only a repeated header row stays out of the rows.
+   cells, runs of whitespace aside) is its headers, as it is, whether
+   read as its headers or as its first row (when headerless: A4b takes
+   an all-value row for headers only when set apart, so a repeat set
+   like the rows is its first row). Any other first row is data (D5):
+   A4a takes a page's first row for headers when none of its cells is
+   blank, as a continuation's first data row often is, so that row goes
+   back to the head of its rows. No row is lost or added; only a
+   repeated header row stays out of the rows.
    A column is one when its centres lie within
    :data:`SPLIT_TABLE_TOLERANCE_PT`, or (#420) when one part sits on its
    interval's end (set flush right) and the other on its interval's start
@@ -48,7 +51,7 @@ change.
    :data:`_END_TOLERANCE_PT`. Both tables need ``column_centres``, which
    A1 sets with ``column_intervals``; without them there is no link.
    Chains link pairwise (p -> p+1 -> p+2). A link already on a table is
-   left alone.
+   left alone: the table keeps it, and its headers and rows.
 4. **Sections.** One flat A1 ``Section`` per visible heading, holding that
    heading (as ``elements[0]``) and everything after it up to the next
    visible heading of any level, plus a leading heading-less section for
@@ -225,19 +228,35 @@ def _link_split_tables(pages: tuple[Page, ...]) -> tuple[Page, ...]:
 
 
 def _continue_from(previous: Page, item: Page) -> Page:
-    """Return ``item`` with its leading table linked to ``previous``'s trailing table if they are one table."""
+    """Return ``item`` with its leading table linked to ``previous``'s trailing table if they are one table.
+
+    A leading table already linked is left alone (rule 3).
+    """
     tail = _first_visible(reversed(previous.elements))
     head = _first_visible(item.elements)
-    if not isinstance(tail, Table) or not isinstance(head, Table) or not _same_columns(tail, head):
+    if not isinstance(tail, Table) or not isinstance(head, Table) or head.continued_from_id is not None:
         return item
-    if head.headers and _repeats(head.headers, tail.headers):
-        joined = dataclasses.replace(head, continued_from_id=tail.element_id)
-    else:
-        rows = (head.headers, *head.rows) if head.headers else head.rows
-        joined = dataclasses.replace(head, continued_from_id=tail.element_id, headers=tail.headers, rows=rows)
+    if not _same_columns(tail, head):
+        return item
+    joined = _joined(head, tail)
     return dataclasses.replace(
         item, elements=tuple(joined if element is head else element for element in item.elements)
     )
+
+
+def _joined(head: Table, tail: Table) -> Table:
+    """``head`` linked to ``tail``: a header row repeating ``tail``'s is its headers, any other row is a row (rule 3).
+
+    The repeat is ``head``'s headers when its page read it as a header
+    row, else its first row (A4b reads an all-value row as one only when
+    set apart): either way it stays out of the rows, as it is.
+    """
+    if head.headers and _repeats(head.headers, tail.headers):
+        return dataclasses.replace(head, continued_from_id=tail.element_id)
+    if not head.headers and head.rows and _repeats(head.rows[0], tail.headers):
+        return dataclasses.replace(head, continued_from_id=tail.element_id, headers=head.rows[0], rows=head.rows[1:])
+    rows = (head.headers, *head.rows) if head.headers else head.rows
+    return dataclasses.replace(head, continued_from_id=tail.element_id, headers=tail.headers, rows=rows)
 
 
 def _repeats(cells: tuple[str, ...], headers: tuple[str, ...]) -> bool:

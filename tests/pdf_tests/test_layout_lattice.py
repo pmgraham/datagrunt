@@ -22,6 +22,7 @@ from datagrunt.pdf.pdfium_engine import extract_page, open_document
 from datagrunt.pdf.quality import SpanPiece, assess_page
 from pdf_tests.builders import FormXObject, Line, PageSpec, Rect, TextRun, build_pdf
 from pdf_tests.test_pdfium_engine import ENGINE_MODULES, imported_modules
+from pdf_tests.test_pdfium_recover import pdf as raw_pdf
 from pdf_tests.test_quality import raw_span
 
 
@@ -829,6 +830,45 @@ class TestCellText:
         assert got == [["", "", "out", ""], ["in", "", "", ""]]
 
 
+def whole_runs(*pieces: SpanPiece) -> list:
+    """Each piece as one run of all its chars."""
+    return [layout._Run(piece, piece.start, piece.end) for piece in pieces]
+
+
+class TestReadingTurn:
+    """A table or cell reads at the turn most of its runs' chars advance at, as page text does."""
+
+    @pytest.mark.parametrize(
+        "pieces,default,turn",
+        [
+            # f8's cell: 11 chars rising and a 2-char run across.
+            pytest.param((rising("Value three", 10.0, 90.0), chars("ab", 30.0, 10.0)), 0, 270, id="most-chars"),
+            # Three runs across of 6 chars in all, one run rising of 7: chars count, not runs.
+            pytest.param(
+                (*(chars("ab", 10.0, 10.0 + 20.0 * row) for row in range(3)), rising("Seventh", 60.0, 90.0)),
+                0,
+                270,
+                id="chars-not-runs",
+            ),
+            pytest.param((chars("x", 10.0, 10.0), falling("y", 30.0, 10.0)), 90, 90, id="no-direction-is-default"),
+            pytest.param((), 270, 270, id="no-runs-is-default"),
+        ],
+    )
+    def test_the_turn_most_chars_advance_at(self, pieces, default, turn):
+        assert layout._reading_turn(whole_runs(*pieces), default) == turn
+
+    @pytest.mark.parametrize(
+        "pieces,default,turn",
+        [
+            pytest.param((chars("abc", 10.0, 10.0), falling("abc", 60.0, 10.0)), 90, 90, id="default-among-the-tied"),
+            pytest.param((chars("abc", 10.0, 10.0), falling("abc", 60.0, 10.0)), 270, 0, id="across-before-down"),
+            pytest.param((falling("abc", 10.0, 10.0), rising("abc", 60.0, 90.0)), 0, 90, id="down-before-up"),
+        ],
+    )
+    def test_a_tie_goes_to_the_default_if_tied_else_across_down_up(self, pieces, default, turn):
+        assert layout._reading_turn(whole_runs(*pieces), default) == turn
+
+
 def read_tables(tmp_path, *items, rotate: int = 0) -> LatticeResult:
     """find_lattice_tables over page 1 of a 400 x 300 pt PDF of ``items``, through extract_page and assess_page."""
     path = build_pdf(tmp_path / "page.pdf", [PageSpec(width=400.0, height=300.0, items=items, rotate=rotate)])
@@ -869,6 +909,28 @@ def shape(result: LatticeResult):
 def spans_of(table: LatticeTable):
     """Each cell as ``(row, col, row_span, col_span, text)``."""
     return [(item.row, item.col, item.row_span, item.col_span, item.text) for item in table.cells]
+
+
+# A ruled grid of 3 columns by 2 rows on a 400 x 300 pt page, in PDF space (y up), and the text of each cell set a
+# quarter turn anticlockwise (it reads up the page) from (x, y): each column's lower cell, then its upper one.
+TURNED_XS, TURNED_YS = (40, 140, 240, 340), (40, 140, 240)
+TURNED_TEXT = (
+    (b"Name one", 90, 50),
+    (b"Value one", 90, 150),
+    (b"Name two", 190, 50),
+    (b"Value two", 190, 150),
+    (b"Name three", 290, 50),
+    (b"Value three", 290, 150),
+)
+
+
+def turned_table(tmp_path, extra: bytes = b"") -> LatticeResult:
+    """find_lattice_tables over the turned grid, drawn raw (ReportLab sets no text matrix), then ``extra``."""
+    drawn = b"".join(b"%d %d m %d %d l S\n" % (x, TURNED_YS[0], x, TURNED_YS[-1]) for x in TURNED_XS)
+    drawn += b"".join(b"%d %d m %d %d l S\n" % (TURNED_XS[0], y, TURNED_XS[-1], y) for y in TURNED_YS)
+    drawn += b"".join(b"BT /F1 11 Tf 0 1 -1 0 %d %d Tm (%s) Tj ET\n" % (x, y, text) for text, x, y in TURNED_TEXT)
+    page = extract_page(open_document(raw_pdf(tmp_path, drawn + extra)), 0)
+    return find_lattice_tables(page.segments.segments, assess_page(page).pieces)
 
 
 XS, YS = (50.0, 150.0, 250.0, 350.0), (40.0, 60.0, 80.0, 100.0)
@@ -967,6 +1029,21 @@ class TestFindLatticeTables:
         result = read_tables(tmp_path, *rules(XS, YS), *written(SPEC, XS, YS), rotate=180)
 
         assert result.tables[0].grid() == tuple(tuple(reversed(row)) for row in reversed(SPEC_GRID))
+
+    @pytest.mark.parametrize(
+        "extra,last",
+        [
+            pytest.param(b"", "Value three", id="all-turned"),
+            # A 2-char run across in the last cell: most of the table's chars still read up the page.
+            pytest.param(b"BT /F1 8 Tf 300 200 Td (ab) Tj ET\n", "Value three ab", id="one-short-run-across"),
+        ],
+    )
+    def test_a_table_drawn_turned_reads_along_its_text_with_a_short_run_across(self, tmp_path, extra, last):
+        result = turned_table(tmp_path, extra)
+
+        assert [(table.turn, table.grid()) for table in result.tables] == [
+            (270, (("Name one", "Value one"), ("Name two", "Value two"), ("Name three", last)))
+        ]
 
     def test_a_page_border_frame_is_no_table_and_uses_no_text(self, tmp_path):
         items = (Rect(10.0, 10.0, 380.0, 280.0), TextRun("Inside the frame", 50.0, 50.0))
@@ -1134,6 +1211,44 @@ class TestPageBounds:
         assert [table.grid()[0][0] for table in result.tables] == ["t0", "t1"]
         assert result.skipped_grids == 1
         assert [piece.text for piece in result.used_pieces] == ["t0", "t1"]
+
+    @pytest.mark.parametrize(
+        "last,skipped",
+        [
+            # A box: 2 + 2 rules, too few positions to be a grid, so _grid would turn it down.
+            pytest.param(frame(10.0, 10_000.0, 90.0, 10_040.0), 0, id="a-box"),
+            pytest.param(small_table(10.0, 10_000.0, "past")[0], 1, id="a-grid"),
+        ],
+    )
+    def test_past_max_grids_only_a_component_that_can_be_a_grid_is_skipped(self, last, skipped):
+        built = [small_table(10.0, 10.0 + 100.0 * index, f"t{index}") for index in range(layout.MAX_GRIDS)]
+
+        result = find_lattice_tables(
+            (*(item for segments, _ in built for item in segments), *last),
+            tuple(item for _, pieces in built for item in pieces),
+        )
+
+        assert len(result.tables) == layout.MAX_GRIDS
+        assert result.skipped_grids == skipped
+
+    @pytest.mark.parametrize(
+        "first",
+        [
+            pytest.param(frame(10.0, 10.0, 90.0, 50.0), id="a-box"),
+            # One row of 10 boxes: 10 units, but only 2 horizontal positions.
+            pytest.param(ruled_grid(tuple(10.0 + 8.0 * index for index in range(11)), (10.0, 50.0)), id="a-row"),
+        ],
+    )
+    def test_a_component_that_cannot_be_a_grid_spends_no_units_and_is_not_skipped(self, monkeypatch, first):
+        # A 4-unit page: the table fits only if the component before it spends nothing; the box after the table
+        # comes once the page has no units left.
+        monkeypatch.setattr(layout, "MAX_GRID_UNITS", 4)
+        table_segments, table_pieces = small_table(1000.0, 1000.0, "fits")
+
+        result = find_lattice_tables((*first, *table_segments, *frame(10.0, 2000.0, 90.0, 2040.0)), table_pieces)
+
+        assert [table.grid() for table in result.tables] == [(("fits", ""), ("", ""))]
+        assert result.skipped_grids == 0
 
     @pytest.mark.parametrize(
         "cap,found", [pytest.param(16, True, id="at-the-cap"), pytest.param(15, False, id="past-it")]

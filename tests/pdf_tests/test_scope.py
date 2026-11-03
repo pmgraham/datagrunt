@@ -479,6 +479,26 @@ class TestSplitTables:
         assert tables(result)[1] == ("p0002_e000", "p0001_e000", own)
         assert result.pages[1].elements[0].rows == (("bolt", "4"),)
 
+    @pytest.mark.parametrize(
+        ("repeat", "body"),
+        [
+            pytest.param(HEADERS, (("nut", "9"),), id="verbatim"),
+            pytest.param(("Item\n", "Qty  "), (("nut", "9"),), id="other-whitespace"),
+            pytest.param(HEADERS, (), id="the-repeat-alone"),
+        ],
+    )
+    def test_a_header_row_repeated_as_the_first_row_of_a_headerless_continuation_is_its_header_row(self, repeat, body):
+        # A page reads a repeat set apart (bold, say) as headers; A4b reads an all-number repeat set like the rows as
+        # the first row. Either way it is the repeated header row: the same continuation, the repeat its headers.
+        set_apart = table(2, 0, headers=repeat, rows=body)
+        set_as_a_row = table(2, 0, headers=(), rows=(repeat, *body))
+
+        found = [apply_scope((page(1, table(1, 0)), page(2, head))).pages[1] for head in (set_apart, set_as_a_row)]
+
+        assert found[1] == found[0]
+        joined = found[1].elements[0]
+        assert (joined.continued_from_id, joined.headers, joined.rows) == ("p0001_e000", repeat, body)
+
     def test_a_first_row_that_does_not_repeat_the_headers_stays_a_row(self):
         # D5: A4a takes a first row without blank cells for headers, as a continuation's first data row often is.
         # Linked, it is the first of the continuation's rows again, and the continuation takes the first's headers.
@@ -688,6 +708,13 @@ class TestSplitTables:
         pages = (page(1, source), page(2, para(2, 0)), page(3, later))
 
         assert tables(apply_scope(pages))[1] == ("p0003_e000", "p0001_e000", HEADERS)
+
+    def test_a_linked_continuation_after_a_matching_table_is_left_alone(self):
+        # Its link, headers and rows stay as they came, though page 1's last table would link it otherwise.
+        linked = dataclasses.replace(table(2, 0, headers=(), rows=(("nut", "9"),)), continued_from_id="p0001_e000")
+        pages = (page(1, table(1, 0), table(1, 1)), page(2, linked))
+
+        assert apply_scope(pages).pages[1].elements[0] == linked
 
     def test_a_document_accepts_the_links(self):
         pages = (page(1, table(1, 0)), page(2, table(2, 0, headers=())), page(3, table(3, 0, headers=())))
