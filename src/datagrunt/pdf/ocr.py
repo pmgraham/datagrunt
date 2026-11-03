@@ -25,9 +25,10 @@ The tesseract CLI (never ``pytesseract``) reads the page:
   sparse text, TSV): each word's text and confidence, no boxes; a
   :class:`SampleReading` gives their mean confidence and counts their
   letters and digits (``text_chars``). The vision
-  route checks a turn OSD suggests on a sample of the page so (#456), its
-  bands as :func:`inked_bands` orders them: the band holding the most ink
-  (pixels darker than mid-grey) first. Not ``--psm 3``: its page
+  route checks an uncertain turn OSD suggests (one under its trusted
+  confidence; a confident one is made unchecked) on a sample of the page
+  so (#456), its bands as :func:`inked_bands` orders them: the band holding
+  the most ink (pixels darker than mid-grey) first. Not ``--psm 3``: its page
   segmentation rights sideways text itself, so a sample read as displayed
   and turned 90 degrees read alike (see :mod:`datagrunt.pdf.vision`).
 - :func:`ocr_words` reads the righted page's bands (``--psm 3``, TSV) and

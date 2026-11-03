@@ -800,10 +800,10 @@ SUGGESTS = "orientation detection suggests turning the page 180 degrees clockwis
 
 
 class TestOrientation:
-    """OSD's turn is checked only at a confidence of ROTATION_CONFIDENCE or more; else the page reads as displayed."""
+    """OSD's turn is made at TRUSTED_ROTATION_CONFIDENCE or more, checked from ROTATION_CONFIDENCE, else not made."""
 
     def test_the_threshold_is_set_from_the_evidence(self):
-        # Corpus (95 pages x 4 turns): right turns at 3.59 and up, the one wrong turn at 0.02 (A5b evidence).
+        # As at base. 1,462 renders (vision module notes, step 2): under it, 19 right turns and 40 wrong ones.
         assert vision.ROTATION_CONFIDENCE == 2.0
 
     @pytest.mark.parametrize(
@@ -881,6 +881,52 @@ def checked(scans, monkeypatch, tmp_path, found: Orientation, *reports: bytes, f
     return page, calls, fake
 
 
+def made(degrees: int, osd: str) -> str:
+    """The note of a turn made as OSD gives it, at TRUSTED_ROTATION_CONFIDENCE or more: base's note, unchanged."""
+    return f"the page reads turned: OCR righted it by {degrees} degrees clockwise (orientation confidence {osd})"
+
+
+@posix_only
+class TestConfidentTurn:
+    """A turn OSD suggests at TRUSTED_ROTATION_CONFIDENCE or more is made as it gives it, its sample unread (#456)."""
+
+    def test_the_cutoff_is_set_from_the_evidence(self):
+        # 1,462 renders (vision module notes, step 2): wrong turns 2.48 at most; the corpus's right turns 3.59 or more.
+        assert vision.TRUSTED_ROTATION_CONFIDENCE == 3.0
+
+    @pytest.mark.parametrize("degrees", [90, 180, 270])
+    @pytest.mark.parametrize(
+        "confidence", [pytest.param(None, id="at-the-cutoff"), pytest.param(37.39, id="a-sideways-config-scan")]
+    )
+    def test_a_confident_turn_is_made_without_a_sample_read(self, scans, monkeypatch, tmp_path, degrees, confidence):
+        # Tesseract fails on any sample: had one been read, as a sample read timing out at OSD 48 was (#456 review), the
+        # turn would not be checked and the page would read as displayed.
+        at = vision.TRUSTED_ROTATION_CONFIDENCE if confidence is None else confidence
+        found = Orientation(degrees=degrees, confidence=at, status="ok", reason="")
+
+        page, (call,), fake = checked(scans, monkeypatch, tmp_path, found, fail=1)
+
+        assert call["rotation"] == degrees
+        assert call["bands"][0].px_width == (3300 if degrees in (90, 270) else 2550)
+        assert not (fake / "calls").exists()
+        assert turn_notes(page) == [made(degrees, f"{at:g}")]
+
+    @pytest.mark.parametrize("confidence", [2.0, 2.99])
+    def test_a_turn_under_the_cutoff_is_checked(self, scans, monkeypatch, tmp_path, confidence):
+        found = Orientation(degrees=180, confidence=confidence, status="ok", reason="")
+
+        page, (call,), fake = checked(scans, monkeypatch, tmp_path, found, HIGH, LOW)
+
+        assert call["rotation"] == 0
+        assert (fake / "calls").read_text() == "2\n"
+        suggests = (
+            f"orientation detection suggests turning the page 180 degrees clockwise at a confidence of {confidence:g}"
+        )
+        reads = "its sample reads at 37.0 turned and at 96.0 as displayed"
+        needs = f"mean word confidence; a turn needs {vision.TURN_MARGIN:g} more"
+        assert turn_notes(page) == [f"{suggests}, but {reads} ({needs}); OCR read it as displayed"]
+
+
 def refused(turned: str, displayed: str) -> str:
     """The warning of a turn OSD suggests (180 at 2.04) that its sample does not bear out."""
     needs = f"mean word confidence; a turn needs {vision.TURN_MARGIN:g} more"
@@ -923,10 +969,10 @@ def text(confidence: float) -> bytes:
 
 @posix_only
 class TestTurnCheck:
-    """OSD's suggestion alone never turns a page (#456): its turn is kept only when the page's sample reads better."""
+    """An uncertain turn OSD suggests (under TRUSTED_ROTATION_CONFIDENCE) is kept only if its sample reads better."""
 
     def test_the_margin_is_set_from_the_evidence(self):
-        # Corpus (95 pages x 4 turns) and sparse capitals: see the vision module notes, step 2.
+        # The corpus and the synthetic sets, each turn checked as if OSD suggested it: see the module notes, step 2.
         assert vision.TURN_MARGIN == 15.0
 
     def test_the_least_text_is_set_from_the_evidence(self):
@@ -1034,7 +1080,7 @@ class TestTurnCheck:
         self, scans, monkeypatch, tmp_path, degrees
     ):
         # A quarter turn's sample is read the other way too: three calls, not two.
-        found = Orientation(degrees=degrees, confidence=9.0, status="ok", reason="")
+        found = Orientation(degrees=degrees, confidence=2.0, status="ok", reason="")
 
         _, (call,), fake = checked(scans, monkeypatch, tmp_path, found, LOW, HIGH, LOW)
 
@@ -2032,12 +2078,18 @@ def union_of(boxes) -> tuple[float, float, float, float]:
     return (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
 
 
-# A kept turn's note: the turn, then the sample's reading turned, as displayed, and (a quarter turn) the other way.
-KEPT = re.compile(
-    r"the page reads turned: OCR righted it by (\d+) degrees clockwise \(orientation confidence [\d.]+; "
-    r"its sample reads at ([\d.]+) turned,? (?:and )?(?:at ([\d.]+)|no words) as displayed"
-    r"(?: and (?:at ([\d.]+)|no words) turned (\d+) degrees)?\)"
+# A turn made as OSD gives it, at TRUSTED_ROTATION_CONFIDENCE or more: the turn and OSD's confidence, no sample read.
+MADE = re.compile(
+    r"the page reads turned: OCR righted it by (\d+) degrees clockwise \(orientation confidence ([\d.]+)\)"
 )
+
+
+def made_turn(page: Page) -> tuple[int, float]:
+    """The turn a page was read at, as OSD gave it, and OSD's confidence; the page's one note on its orientation."""
+    (note,) = turn_notes(page)
+    found = MADE.fullmatch(note)
+    assert found is not None, page.warnings
+    return int(found.group(1)), float(found.group(2))
 
 
 @needs_tesseract
@@ -2045,19 +2097,13 @@ class TestRotatedScans:
     """90 / 180 / 270 degree scans orient to 0 degrees: OCR reads them righted, in order, where they were drawn."""
 
     @pytest.mark.parametrize("rotate", [90, 180, 270])
-    def test_a_turned_scan_is_righted_through_the_check(self, done_when, rotate):
-        # #456: OSD's turn is kept because the scan's sample reads better turned than as displayed (and, a quarter
-        # turn, than turned the other way), by the margin or more.
+    def test_a_turned_scan_is_righted_as_osd_gives_it(self, done_when, rotate):
+        # #456: OSD's turn is confident (TRUSTED_ROTATION_CONFIDENCE or more), so it is made with no sample read.
         page = visioned(done_when[f"scan-{rotate}"])
 
-        (note,) = turn_notes(page)
-        found = KEPT.fullmatch(note)
-        assert found is not None, note
-        degrees, turned_at, displayed_at, other_at, other = found.groups()
-        assert int(degrees) == (360 - rotate) % 360
-        assert (int(other) if other else None) == (None if rotate == 180 else (int(degrees) + 180) % 360)
-        for reading in (displayed_at, other_at):
-            assert float(turned_at) >= float(reading or 0.0) + vision.TURN_MARGIN
+        degrees, confidence = made_turn(page)
+        assert degrees == (360 - rotate) % 360
+        assert confidence >= vision.TRUSTED_ROTATION_CONFIDENCE
 
     @pytest.mark.parametrize("rotate", [90, 180, 270])
     def test_a_turned_scan_reads_righted_in_order_where_it_was_drawn(self, done_when, rotate):
@@ -2350,3 +2396,77 @@ class TestArtFirst:
             assert (page.status, page.route) == ("ok", "vision")
             assert not [note for note in page.warnings if note.startswith("the page reads turned")], page.warnings
             assert sum((expected & read).values()) >= 9, (number, texts(page), page.warnings)
+
+
+# A config file and a page of code, in Courier: OSD turns their sideways scans at 37.39 and 38.73 here, and their sample
+# reads alike turned and as displayed (psm 11 reads "=", ":" and brackets as words): checked, both turns were refused.
+CONFIG = tuple(
+    line
+    for number in range(10)
+    for line in (
+        f"[section{number}]",
+        f"    host = server{number}.example.com",
+        f"    port = {8000 + number}",
+        "    enabled = true",
+        "",
+    )
+)[:46]
+CODE_LINES = (
+    "import os",
+    "def main(argv):",
+    "    for name in argv:",
+    "        path = os.path.join(base, name)",
+    "        if os.path.exists(path):",
+    "            print(path)",
+    "        else:",
+    "            raise SystemExit(name)",
+    "    return 0",
+    "",
+)
+CODE = (CODE_LINES * 5)[:44]
+CODE_REPEAT = "import os def main(argv): for name in argv: path = os.path.join(base, name)"
+
+
+@pytest.fixture(scope="module")
+def listings(tmp_path_factory) -> dict[str, Path]:
+    """Raster scans (no text layer) of the config file at /Rotate 90 and of the code at /Rotate 270."""
+    directory = tmp_path_factory.mktemp("listings")
+    pages = {
+        "config": (
+            90,
+            tuple(TextRun(t, 50.0, 50.0 + i * 13.5, font="Courier", size=10.0) for i, t in enumerate(CONFIG)),
+        ),
+        "code": (270, tuple(TextRun(t, 60.0, 60.0 + i * 15.0, font="Courier", size=12.0) for i, t in enumerate(CODE))),
+    }
+    scans = {}
+    for name, (rotate, lines) in pages.items():
+        digital = build_pdf(directory / f"{name}.pdf", [PageSpec(items=tuple(line for line in lines if line.text))])
+        scan = RasterImage(0.0, 0.0, *LETTER, png_of(rendered(digital)))
+        scans[name] = build_pdf(directory / f"{name}-{rotate}.pdf", [PageSpec(items=(scan,), rotate=rotate)])
+    return scans
+
+
+@needs_tesseract
+class TestSidewaysListings:
+    """Sideways scans of a config file and of code read righted, in order: OSD's confident turn is made (#456)."""
+
+    def test_a_config_file_reads_righted_in_order(self, listings):
+        (page,) = PDFReader(listings["config"], ocr="auto").pages
+
+        assert (page.status, page.route) == ("ok", "vision")
+        degrees, confidence = made_turn(page)
+        assert degrees == 270 and confidence >= vision.TRUSTED_ROTATION_CONFIDENCE
+        read = " ".join(texts(page))
+        # Sections 0 and 1 read as "server0O" and "serverl" (tesseract's 0 and 1 in Courier); 2 to 8, top to bottom (the
+        # page ends at "[section9]").
+        at = [read.find(f"server{number}.example.com") for number in range(2, 9)]
+        assert -1 not in at and at == sorted(at), read
+
+    def test_a_page_of_code_reads_righted_in_order(self, listings):
+        (page,) = PDFReader(listings["code"], ocr="auto").pages
+
+        assert (page.status, page.route) == ("ok", "vision")
+        degrees, confidence = made_turn(page)
+        assert degrees == 90 and confidence >= vision.TRUSTED_ROTATION_CONFIDENCE
+        read = " ".join(texts(page))
+        assert read.startswith(CODE_REPEAT) and read.count(CODE_REPEAT) == 5, read

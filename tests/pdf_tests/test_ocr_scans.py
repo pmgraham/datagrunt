@@ -176,15 +176,17 @@ class TestScans:
         assert (found.status, found.degrees) == ("ok", (360 - rotate) % 360)
 
     @pytest.mark.parametrize("rotate", [90, 180, 270])
-    def test_the_turn_osd_finds_is_kept_by_the_check(self, built, read, rotate):
-        # #456: OSD's suggestion alone never turns a page; each scan's sample reads better turned, so it is righted.
+    def test_the_turn_osd_finds_is_made_as_it_gives_it(self, built, read, rotate):
+        # #456: OSD finds each scan's turn at TRUSTED_ROTATION_CONFIDENCE or more: made as it gives it, no sample read.
         found, _words = read(f"scan-{rotate}")
         page = normalized(rendered(built[f"scan-{rotate}"]))
 
         turn = vision._turn(page, found, vision.VisionOptions(), time.monotonic() + 600.0)
 
+        assert found.confidence is not None and found.confidence >= vision.TRUSTED_ROTATION_CONFIDENCE
         assert (turn.degrees, turn.failure) == ((360 - rotate) % 360, "")
-        assert turn.notes[0].startswith(f"the page reads turned: OCR righted it by {turn.degrees} degrees clockwise")
+        righted = f"OCR righted it by {turn.degrees} degrees clockwise (orientation confidence {found.confidence:g})"
+        assert turn.notes == (f"the page reads turned: {righted}",)
 
     @pytest.mark.parametrize("rotate", [0, 90, 180, 270])
     def test_ocr_reads_the_sentences_where_they_were_drawn(self, built, read, rotate):
