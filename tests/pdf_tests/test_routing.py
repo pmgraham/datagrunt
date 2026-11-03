@@ -51,6 +51,7 @@ from datagrunt.pdf.quality import (
     raster_cover_fraction,
     valid_char,
 )
+from datagrunt.pdf.reader import PDFReader
 from pdf_tests.builders import Line, PageSpec, RasterImage, TextRun, build_pdf
 from pdf_tests.test_pdfium_spans import OVERFLOW, bfchar_cmap, cid_font_page, content_page
 from pdf_tests.test_quality import FULL_BLEED, PNG, STRIPS, H, W, image, raw_span, row
@@ -378,7 +379,7 @@ class TestPageQuality:
 
     def test_signals(self):
         spans = (
-            # Off the page on the left, then visible, then off on the right: two flagged pieces.
+            # Off the page on the left, then visible, then off on the right: two flagged pieces of one span.
             raw_span("ABCDEFGH", (*row(2, -20.0), *row(4, 100.0), *row(2, 450.0))),
             letters(10, y=120.0, font_size_pt=0.5),
             text_span("\ufffd\ufffd", y=150.0),
@@ -390,11 +391,31 @@ class TestPageQuality:
             valid_char_ratio=18 / 20,
             char_count=20,
             vector_line_count=3,
-            hidden_spans_flagged=3,
+            hidden_spans_flagged=2,
             rotation_deg=90,
             deskew_angle_deg=None,
             ocr_mean_confidence=None,
         )
+
+    def test_a_span_cut_into_flagged_pieces_counts_once(self):
+        # #456: one span off both side edges is two flagged pieces, and one span flagged as hidden.
+        result = assess(letters(24), raw_span("ABCDEFGH", (*row(2, -20.0), *row(4, 100.0), *row(2, 450.0))))
+
+        assert [piece.hidden_reasons for piece in result.pieces] == [(), ("off_page",), (), ("off_page",)]
+        assert result.quality.hidden_spans_flagged == 1
+
+    def test_a_span_whose_pieces_have_different_reasons_counts_once(self):
+        # A tiny span partly off the page: an off-page tiny piece, then a tiny one.
+        result = assess(letters(24), raw_span("ABCD", (*row(2, -20.0), *row(2, 100.0)), font_size_pt=0.5))
+
+        assert [piece.hidden_reasons for piece in result.pieces[1:]] == [("off_page", "tiny_font"), ("tiny_font",)]
+        assert result.quality.hidden_spans_flagged == 1
+
+    def test_equal_spans_each_count(self):
+        # Two spans of the same text in the same place are two spans of the page, as char_count counts them.
+        result = assess(letters(24), text_span("Gone", y=-60.0), text_span("Gone", y=-60.0))
+
+        assert (result.quality.char_count, result.quality.hidden_spans_flagged) == (32, 2)
 
     def test_hidden_chars_count_toward_char_count_and_ratio(self):
         got = assess(letters(4), text_span("\ufffd" * 4, y=-60.0)).quality
@@ -414,6 +435,32 @@ class TestPageQuality:
 
     def test_visible_pieces_are_not_flagged(self):
         assert assess(letters(30), letters(5, y=120.0)).quality.hidden_spans_flagged == 0
+
+
+# A line of visible text, then text objects that start 60 pt left of the 400 pt page and run past its right edge.
+VISIBLE_LINE = b"BT /F1 12 Tf 20 270 Td (A digital page with enough visible text) Tj ET\n"
+PAST_BOTH_EDGES = b"LEFTOFFPAGE " + b"visible middle words of one text object " * 2 + b"RIGHTOFFPAGE TAIL"
+
+
+def past_both_edges(y: int) -> bytes:
+    """A text object whose line, at PDF ``y``, starts left of the page and ends right of it."""
+    return b"BT /F1 12 Tf -60 %d Td (%s) Tj ET\n" % (y, PAST_BOTH_EDGES)
+
+
+class TestHiddenSpanCount:
+    """#456: hidden_spans_flagged counts the spans with a flagged piece, each once, end to end."""
+
+    @pytest.mark.parametrize("count", [1, 2])
+    def test_spans_cut_by_both_side_edges_count_once_each(self, tmp_path, count):
+        lines = b"".join(past_both_edges(200 - 40 * line) for line in range(count))
+        path = content_page(tmp_path, VISIBLE_LINE + lines)
+        result, raw = assessed(path, ocr="never")
+        assert len(raw.text.spans) == 1 + count
+        assert [piece.hidden_reasons for piece in result.pieces] == [()] + [("off_page",), (), ("off_page",)] * count
+
+        (page,) = PDFReader(path, ocr="never").pages
+
+        assert (page.route, page.quality.hidden_spans_flagged) == ("digital", count)
 
 
 class TestRoutingCount:
@@ -1280,6 +1327,15 @@ class TestRecoveredPieces:
         result = assess_recovered(*spans, recovered=recovered)
 
         assert result.quality.hidden_spans_flagged == 3
+
+    def test_a_recovered_span_past_both_side_edges_is_one_piece_and_counts_once(self):
+        # #456: a recovered span is a span of its own, and one piece: each of its char boxes is its object's box.
+        span = raw_span("ABCDEFGH", ((-20.0, 200.0, 462.0, 212.0),) * 8, font_size_pt=12.0, object_index=9)
+
+        result = assess_recovered(letters(24), recovered=recovery(RecoveredSpan(span=span, hidden_reasons=())))
+
+        assert [piece.hidden_reasons for piece in result.recovered_pieces] == [("off_page",)]
+        assert result.quality.hidden_spans_flagged == 1
 
     def test_recovered_text_never_routes_the_page(self):
         # 30 recovered chars with no hidden reason (a drawn copy of invisible text) still leave 5 visible chars.
