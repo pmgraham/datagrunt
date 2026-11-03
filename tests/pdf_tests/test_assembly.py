@@ -1346,6 +1346,20 @@ class TestSplitTablesLinkAcrossPages:
             if isinstance(element, Table)
         ] == [None, None]
 
+    @pytest.mark.parametrize("font", ["Helvetica-Bold", "Helvetica"], ids=["repeated-bold", "repeated-plain"])
+    def test_a_repeated_all_number_header_row_is_the_continuations_header_row(self, tmp_path, font):
+        # An all-number row is a header row only when set apart (bold, here), so page 2's plain repeat is read as
+        # its first row. Bold or plain, the repeat is the continuation's header row and none of its rows.
+        years = ("2023", "2024", "2025")
+        numbers = tuple((str(100 + 10 * i), str(101 + 10 * i), str(102 + 10 * i)) for i in range(7))
+        tail = (*table_runs((years,), top=650.0, font="Helvetica-Bold"), *table_runs(numbers[:4], top=664.0))
+        head = (*table_runs((years,), top=60.0, font=font), *table_runs(numbers[4:], top=74.0))
+
+        tail_table, head_table = split_tables(tmp_path, tail, head)
+
+        assert head_table.continued_from_id == tail_table.element_id
+        assert (head_table.headers, head_table.rows) == (years, numbers[4:])
+
 
 STAIRCASE_SCRIPT = r"""
 import os, resource, sys, threading, time
