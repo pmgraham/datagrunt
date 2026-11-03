@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pypdfium2 as pdfium
 import pytest
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from datagrunt.pdf import _loaders, vision
 from datagrunt.pdf._loaders import FigureRead
@@ -923,32 +923,30 @@ class TestConfidentTurn:
             f"orientation detection suggests turning the page 180 degrees clockwise at a confidence of {confidence:g}"
         )
         reads = "its sample reads at 37.0 turned and at 96.0 as displayed"
-        needs = f"mean word confidence; a turn needs {vision.TURN_MARGIN:g} more"
-        assert turn_notes(page) == [f"{suggests}, but {reads} ({needs}); OCR read it as displayed"]
+        assert turn_notes(page) == [f"{suggests}, but {reads} ({clearly('as displayed')}); OCR read it as displayed"]
+
+
+def clearly(way: str) -> str:
+    """Why a turn is refused: its sample read ``way`` reads clearly, and the margin over it turned."""
+    clear = f"{vision.LEAST_TEXT_CHARS} letters or digits or more at {vision.CLEAR_READING_CONFIDENCE:g} or more"
+    return f"{way}, it reads clearly ({clear}) and {vision.TURN_MARGIN:g} or more over it turned"
 
 
 def refused(turned: str, displayed: str) -> str:
-    """The warning of a turn OSD suggests (180 at 2.04) that its sample does not bear out."""
-    needs = f"mean word confidence; a turn needs {vision.TURN_MARGIN:g} more"
+    """The warning of a turn OSD suggests (180 at 2.04) that its sample read as displayed refuses."""
     reads = f"its sample reads {turned} turned and {displayed} as displayed"
-    return f"{SUGGESTS}, but {reads} ({needs}); OCR read it as displayed"
+    return f"{SUGGESTS}, but {reads} ({clearly('as displayed')}); OCR read it as displayed"
 
 
 def kept(degrees: int, osd: str, turned: str, displayed: str) -> str:
-    """The warning of a turn of 180 degrees its sample bears out."""
+    """The warning of a turn of 180 degrees no reading of its sample refuses."""
     righted = f"the page reads turned: OCR righted it by {degrees} degrees clockwise"
     return f"{righted} (orientation confidence {osd}; its sample reads {turned} turned and {displayed} as displayed)"
 
 
-def too_little(reads: str, chars: int, suggests: str = SUGGESTS) -> str:
-    """The warning of a turn whose turned sample reads ``chars`` letters or digits, too few to bear it out."""
-    under = f"under {vision.LEAST_TEXT_CHARS}: too little text to bear a turn out"
-    few = f"turned, it reads {chars} letters or digits, {under}"
-    return f"{suggests}, but {reads} ({few}); OCR read it as displayed"
-
-
 QUARTER = Orientation(degrees=90, confidence=2.0, status="ok", reason="")
 SUGGESTS_90 = "orientation detection suggests turning the page 90 degrees clockwise at a confidence of 2"
+MADE_90 = "the page reads turned: OCR righted it by 90 degrees clockwise (orientation confidence 2; its sample reads"
 
 
 # The captioned scan's 4 bands, each read as displayed and turned: a check reads 8 samples at most.
@@ -969,24 +967,39 @@ def text(confidence: float) -> bytes:
 
 @posix_only
 class TestTurnCheck:
-    """An uncertain turn OSD suggests (under TRUSTED_ROTATION_CONFIDENCE) is kept only if its sample reads better."""
+    """An uncertain turn OSD suggests (under TRUSTED_ROTATION_CONFIDENCE) is made unless another reading is clearly
+    better (#456): of LEAST_TEXT_CHARS or more, at CLEAR_READING_CONFIDENCE or more, TURN_MARGIN over it turned."""
 
     def test_the_margin_is_set_from_the_evidence(self):
-        # The corpus and the synthetic sets, each turn checked as if OSD suggested it: see the module notes, step 2.
+        # Real suggestions in the band and each turn of each render as if suggested there: module notes, step 2.
         assert vision.TURN_MARGIN == 15.0
 
     def test_the_least_text_is_set_from_the_evidence(self):
-        # Art pages, corpus and sparse capitals: see the vision module notes, step 2.
+        # Art pages, a word or two, corpus and sparse capitals: see the vision module notes, step 2.
         assert vision.LEAST_TEXT_CHARS == 12
 
-    def test_a_turn_its_sample_reads_better_is_kept(self, scans, monkeypatch, tmp_path):
-        page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, LOW, HIGH)
+    def test_the_clear_reading_floor_is_set_from_the_evidence(self):
+        # Right turns in the band refused by a reading at 63.9 at most; sparse capitals' wrong ones refused by readings
+        # of 78.1 or more: see the vision module notes, step 2.
+        assert vision.CLEAR_READING_CONFIDENCE == 70.0
+
+    def test_a_turn_no_reading_refuses_is_made_once_every_band_is_read(self, scans, monkeypatch, tmp_path):
+        page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, *(LOW, HIGH) * EVERY_BAND)
 
         assert call["rotation"] == 180
-        assert (fake / "calls").read_text() == "2\n"
+        assert (fake / "calls").read_text() == f"{2 * EVERY_BAND}\n"
         assert turn_notes(page) == [kept(180, "2.04", "at 96.0", "at 37.0")]
 
-    def test_a_turn_its_sample_reads_worse_is_refused(self, scans, monkeypatch, tmp_path):
+    def test_a_sample_read_poorly_every_way_makes_the_turn(self, scans, monkeypatch, tmp_path):
+        # #456 review: text eng cannot read upright (CJK, displayed math) reads poorly every way, sideways junk often
+        # better than upright: no reading is clear, so OSD's turn is made, as at base.
+        page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, *(text(45.0), text(20.0)) * EVERY_BAND)
+
+        assert call["rotation"] == 180
+        assert (fake / "calls").read_text() == f"{2 * EVERY_BAND}\n"
+        assert turn_notes(page) == [kept(180, "2.04", "at 20.0", "at 45.0")]
+
+    def test_a_clear_reading_the_margin_better_refuses_the_turn(self, scans, monkeypatch, tmp_path):
         page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, HIGH, LOW)
 
         assert call["rotation"] == 0
@@ -994,11 +1007,42 @@ class TestTurnCheck:
         assert (fake / "calls").read_text() == "2\n"
         assert turn_notes(page) == [refused("at 37.0", "at 96.0")]
 
-    @pytest.mark.parametrize(("over", "turn", "calls"), [pytest.param(0.0, 180, 2, id="by-the-margin"), (-0.1, 0, 8)])
-    def test_the_turned_sample_must_read_the_margin_better(self, scans, monkeypatch, tmp_path, over, turn, calls):
-        # Under the margin, a band decides nothing: every band is read, and the page's sample is still under it.
-        better = 50.0 + vision.TURN_MARGIN + over
-        reports = (text(50.0), text(better)) * EVERY_BAND
+    @pytest.mark.parametrize(
+        ("turned", "turn", "calls"),
+        [pytest.param(70.0, 0, 2, id="by-the-margin"), pytest.param(70.1, 180, 2 * EVERY_BAND, id="under-it")],
+    )
+    def test_a_clear_reading_must_read_the_margin_better(self, scans, monkeypatch, tmp_path, turned, turn, calls):
+        # As displayed at 85.0, clear: it refuses the turn read at 70.0 (15.0 under it), not one at 70.1.
+        reports = (text(85.0), text(turned)) * EVERY_BAND
+
+        _, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, *reports)
+
+        assert call["rotation"] == turn
+        assert (fake / "calls").read_text() == f"{calls}\n"
+
+    @pytest.mark.parametrize(
+        ("displayed", "turn", "calls"),
+        [pytest.param(70.0, 0, 2, id="at-the-floor"), pytest.param(69.9, 180, 2 * EVERY_BAND, id="under-it")],
+    )
+    def test_only_a_clear_reading_refuses_the_turn(self, scans, monkeypatch, tmp_path, displayed, turn, calls):
+        # A reading 29.9 or 30.0 over the sample turned refuses it only at CLEAR_READING_CONFIDENCE or more.
+        reports = (text(displayed), text(40.0)) * EVERY_BAND
+
+        _, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, *reports)
+
+        assert call["rotation"] == turn
+        assert (fake / "calls").read_text() == f"{calls}\n"
+
+    @pytest.mark.parametrize(
+        ("first", "turn", "calls"),
+        [
+            pytest.param(sample_tsv(("ALPHA", 96.0), ("DOCUMEN", 96.0)), 0, 2, id="twelve-letters"),
+            pytest.param(sample_tsv(("ALPHA", 96.0), ("DOCUME", 96.0)), 180, 2 * EVERY_BAND, id="eleven"),
+        ],
+    )
+    def test_a_clear_reading_holds_the_least_text(self, scans, monkeypatch, tmp_path, first, turn, calls):
+        # Only the first band reads any words: a reading of under LEAST_TEXT_CHARS letters or digits refuses nothing.
+        reports = (first, LOW) + (NO_WORDS, NO_WORDS) * (EVERY_BAND - 1)
 
         _, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, *reports)
 
@@ -1006,64 +1050,53 @@ class TestTurnCheck:
         assert (fake / "calls").read_text() == f"{calls}\n"
 
     def test_the_mean_is_weighted_by_chars(self, scans, monkeypatch, tmp_path):
-        # Turned: words of 20 and 80 confidence, the 80 one 11 chars of 12: 75.0 (unweighted, 50.0); displayed 50.0.
-        reports = (text(50.0), sample_tsv(("a", 20.0), ("typesetters", 80.0)))
+        # As displayed: words of 20 and 80 confidence, the 80 one 11 chars of 12: 75.0, clear (unweighted, 50.0: not).
+        reports = (sample_tsv(("a", 20.0), ("typesetters", 80.0)), text(50.0))
 
         page, (call,), _ = checked(scans, monkeypatch, tmp_path, TURNED_180, *reports)
 
-        assert call["rotation"] == 180
-        assert turn_notes(page) == [kept(180, "2.04", "at 75.0", "at 50.0")]
+        assert call["rotation"] == 0
+        assert turn_notes(page) == [refused("at 50.0", "at 75.0")]
 
     @pytest.mark.parametrize(
-        ("displayed", "shown", "calls", "decided"),
-        [(HIGH, "at 96.0", 2, True), (LOW, "at 37.0", 6, True), (NO_WORDS, "no words", 8, False)],
-        ids=["high", "low", "none"],
+        ("displayed", "shown", "calls", "turn"),
+        [(HIGH, "at 96.0", 2, 0), (LOW, "at 37.0", 8, 180), (NO_WORDS, "no words", 8, 180)],
+        ids=["clear", "poor", "none"],
     )
-    def test_a_turned_sample_of_no_words_is_never_better(
-        self, scans, monkeypatch, tmp_path, displayed, shown, calls, decided
+    def test_a_turned_sample_of_no_words_is_refused_only_by_a_clear_reading(
+        self, scans, monkeypatch, tmp_path, displayed, shown, calls, turn
     ):
-        # No words turned counts as no confidence, never as a refusal by itself: the bands are read until the sample
-        # as displayed holds LEAST_TEXT_CHARS letters or digits (LOW's 5 a band: 3 bands), or to the last.
+        # No words turned counts as no confidence: a clear reading as displayed refuses it; a poor one does not.
         reports = (displayed, NO_WORDS) * EVERY_BAND
 
         page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, *reports)
 
-        assert call["rotation"] == 0
+        assert call["rotation"] == turn
         assert (fake / "calls").read_text() == f"{calls}\n"
-        reads = f"its sample reads no words turned and {shown} as displayed"
-        assert turn_notes(page) == [refused("no words", shown) if decided else too_little(reads, 0)]
+        note = refused("no words", shown) if turn == 0 else kept(180, "2.04", "no words", shown)
+        assert turn_notes(page) == [note]
 
-    @pytest.mark.parametrize(
-        ("turned", "turn"), [pytest.param(HIGH, 180, id="kept"), pytest.param(text(14.9), 0, id="refused")]
-    )
-    def test_a_displayed_sample_of_no_words_reads_as_no_confidence(self, scans, monkeypatch, tmp_path, turned, turn):
-        # A sideways page's sample reads no words as displayed (psm 11): a turn is kept by the margin over 0.
+    @pytest.mark.parametrize("turned", [pytest.param(HIGH, id="high"), pytest.param(text(14.9), id="low")])
+    def test_a_displayed_sample_of_no_words_refuses_nothing(self, scans, monkeypatch, tmp_path, turned):
+        # A sideways page's sample reads no words as displayed (psm 11): however poorly it reads turned, it is made.
         page, (call,), _ = checked(scans, monkeypatch, tmp_path, TURNED_180, *(NO_WORDS, turned) * EVERY_BAND)
 
-        assert call["rotation"] == turn
-        assert "turned and no words as displayed" in turn_notes(page)[0]
+        assert call["rotation"] == 180
+        assert "turned and no words as displayed)" in turn_notes(page)[0]
 
     @pytest.mark.parametrize(
         ("reports", "turn", "note"),
         [
             pytest.param(
-                (NO_WORDS, HIGH, LOW),
+                (NO_WORDS, HIGH, LOW) * EVERY_BAND,
                 90,
-                "the page reads turned: OCR righted it by 90 degrees clockwise (orientation confidence 2; "
-                "its sample reads at 96.0 turned, no words as displayed and at 37.0 turned 270 degrees)",
-                id="kept",
+                f"{MADE_90} at 96.0 turned, no words as displayed and at 37.0 turned 270 degrees)",
+                id="made",
             ),
-            pytest.param(
-                (NO_WORDS, LOW, HIGH),
-                0,
-                "orientation detection suggests turning the page 90 degrees clockwise at a confidence of 2, but its "
-                "sample reads at 37.0 turned, no words as displayed and at 96.0 turned 270 degrees "
-                "(mean word confidence; a turn needs 15 more); OCR read it as displayed",
-                id="the-other-way-reads-better",
-            ),
+            pytest.param((NO_WORDS, LOW, HIGH), 0, None, id="the-other-way-reads-clearly-better"),
         ],
     )
-    def test_a_quarter_turn_must_read_better_than_the_other_way_too(
+    def test_a_quarter_turn_is_refused_when_the_other_way_reads_clearly_better(
         self, scans, monkeypatch, tmp_path, reports, turn, note
     ):
         # A sideways page reads no words as displayed: its turn is checked against the opposite turn too, so OSD's
@@ -1073,16 +1106,18 @@ class TestTurnCheck:
         sample = inked_bands(normalized(rendered(scans["captioned"])))[0]
         assert (fake / "stdin-3").read_bytes() == pgm(rotated(sample, 270))
         assert call["rotation"] == turn
-        assert turn_notes(page) == [note]
+        reads = "its sample reads at 37.0 turned, no words as displayed and at 96.0 turned 270 degrees"
+        other_way = f"{SUGGESTS_90}, but {reads} ({clearly('turned 270 degrees')}); OCR read it as displayed"
+        assert turn_notes(page) == [note or other_way]
 
     @pytest.mark.parametrize("degrees", [90, 180, 270])
     def test_the_sample_is_the_band_holding_the_most_ink_read_as_displayed_then_turned(
         self, scans, monkeypatch, tmp_path, degrees
     ):
-        # A quarter turn's sample is read the other way too: three calls, not two.
+        # A quarter turn's sample is read the other way too: three calls, not two. Its first band refuses the turn.
         found = Orientation(degrees=degrees, confidence=2.0, status="ok", reason="")
 
-        _, (call,), fake = checked(scans, monkeypatch, tmp_path, found, LOW, HIGH, LOW)
+        _, (call,), fake = checked(scans, monkeypatch, tmp_path, found, HIGH, LOW, LOW)
 
         sample = inked_bands(normalized(rendered(scans["captioned"])))[0]
         turns = (0, degrees) if degrees == 180 else (0, degrees, (degrees + 180) % 360)
@@ -1090,27 +1125,27 @@ class TestTurnCheck:
         assert (fake / "calls").read_text() == f"{len(turns)}\n"
         for number, turn in enumerate(turns, start=1):
             assert (fake / f"stdin-{number}").read_bytes() == pgm(rotated(sample, turn))
-        assert call["rotation"] == degrees
+        assert call["rotation"] == 0
 
     @pytest.mark.parametrize(
         "first", [pytest.param(sample_tsv(("text", 50.0)), id="undecided"), pytest.param(NO_WORDS, id="no-words")]
     )
-    def test_a_band_that_decides_nothing_is_followed_by_the_next_by_ink(self, scans, monkeypatch, tmp_path, first):
+    def test_a_band_that_refuses_nothing_is_followed_by_the_next_by_ink(self, scans, monkeypatch, tmp_path, first):
         # The first band reads alike both ways (or nothing): the second band by ink is read, and its words join.
-        page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, first, first, LOW, HIGH)
+        page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, first, first, HIGH, LOW)
 
         by_ink = inked_bands(normalized(rendered(scans["captioned"])))
         assert (fake / "calls").read_text() == "4\n"
         assert (fake / "stdin-3").read_bytes() == pgm(by_ink[1])
         assert (fake / "stdin-4").read_bytes() == pgm(rotated(by_ink[1], 180))
-        assert call["rotation"] == 180
-        # Joined: (4 x 50 + 5 x 37) / 9 = 42.8 and (4 x 50 + 13 x 96) / 17 = 85.2; no words joins nothing.
-        joined = ("at 85.2", "at 42.8") if first != NO_WORDS else ("at 96.0", "at 37.0")
-        assert turn_notes(page) == [kept(180, "2.04", *joined)]
+        assert call["rotation"] == 0
+        # Joined: (4 x 50 + 13 x 96) / 17 = 85.2 and (4 x 50 + 5 x 37) / 9 = 42.8; no words joins nothing.
+        joined = ("at 42.8", "at 85.2") if first != NO_WORDS else ("at 37.0", "at 96.0")
+        assert turn_notes(page) == [refused(*joined)]
 
-    def test_a_band_of_art_read_as_a_few_letters_decides_nothing(self, scans, monkeypatch, tmp_path):
+    def test_a_band_of_art_read_as_a_few_letters_refuses_nothing(self, scans, monkeypatch, tmp_path):
         # #456 review: sparse capitals over an art block, upright; the art band holds the most ink, and reads 17.8
-        # better turned on 4 letters. Under LEAST_TEXT_CHARS either way, it decides nothing: the next band by ink,
+        # better turned on 4 letters. Under LEAST_TEXT_CHARS either way, it refuses nothing: the next band by ink,
         # the capitals, is read and joined, and refuses the turn.
         page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, ART, ART_TURNED, HIGH, LOW)
 
@@ -1121,44 +1156,44 @@ class TestTurnCheck:
         # Joined: (3 x 34.0 + 13 x 96.0) / 16 = 84.4 as displayed; (4 x 51.8 + 5 x 37.0) / 9 = 43.6 turned.
         assert turn_notes(page) == [refused("at 43.6", "at 84.4")]
 
-    def test_a_turned_reading_of_no_words_is_not_decisive_alone(self, scans, monkeypatch, tmp_path):
+    def test_a_glyph_of_art_refuses_nothing(self, scans, monkeypatch, tmp_path):
         # #456 review: an upside-down scan whose drawing holds the most ink reads one glyph as displayed and no words
-        # turned. That refuses nothing: the next band by ink, the text, is read and keeps the turn.
-        page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, GLYPH, NO_WORDS, LOW, HIGH)
+        # turned. That refuses nothing, nor does its text read upside down: every band is read and the turn is made.
+        reports = (GLYPH, NO_WORDS) + (LOW, HIGH) * (EVERY_BAND - 1)
+
+        page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, *reports)
 
         by_ink = inked_bands(normalized(rendered(scans["captioned"])))
         assert call["rotation"] == 180
-        assert (fake / "calls").read_text() == "4\n"
+        assert (fake / "calls").read_text() == f"{2 * EVERY_BAND}\n"
         assert (fake / "stdin-3").read_bytes() == pgm(by_ink[1])
         assert (fake / "stdin-4").read_bytes() == pgm(rotated(by_ink[1], 180))
-        # Joined as displayed: (1 x 13.4 + 5 x 37.0) / 6 = 33.1.
-        assert turn_notes(page) == [kept(180, "2.04", "at 96.0", "at 33.1")]
+        # Joined as displayed: (1 x 13.4 + 15 x 37.0) / 16 = 35.5.
+        assert turn_notes(page) == [kept(180, "2.04", "at 96.0", "at 35.5")]
 
-    def test_a_turn_read_from_too_few_letters_or_digits_is_never_kept(self, scans, monkeypatch, tmp_path):
+    def test_a_turned_reading_of_too_few_letters_or_digits_is_made_unless_refused(self, scans, monkeypatch, tmp_path):
         # Turned a quarter, an upside-down page of art and text reads a glyph or two at a high confidence, over its
-        # text as displayed (#456 review: 62.5 on 2 chars against 41.1 on 96). The turned reading must hold
-        # LEAST_TEXT_CHARS itself: every band is read, it never does, and the page reads as displayed.
+        # text as displayed (#456 review: 62.5 on 2 chars against 41.1 on 96). No reading is clear: the turn is
+        # made, as OSD gives it.
         displayed = sample_tsv(("WHdWHdWHd", 41.0), ("1V1V1V", 41.0))
         reports = (displayed, sample_tsv(("l", 62.5)), sample_tsv(("i", 40.5))) * EVERY_BAND
 
         page, (call,), fake = checked(scans, monkeypatch, tmp_path, QUARTER, *reports)
 
-        assert call["rotation"] == 0
+        assert call["rotation"] == 90
         assert (fake / "calls").read_text() == f"{3 * EVERY_BAND}\n"
-        reads = "its sample reads at 62.5 turned, at 41.0 as displayed and at 40.5 turned 270 degrees"
-        assert turn_notes(page) == [too_little(reads, EVERY_BAND, SUGGESTS_90)]
+        assert turn_notes(page) == [f"{MADE_90} at 62.5 turned, at 41.0 as displayed and at 40.5 turned 270 degrees)"]
 
-    def test_a_sample_of_too_little_text_any_way_reads_as_displayed(self, scans, monkeypatch, tmp_path):
-        # Every band read, no way reaches LEAST_TEXT_CHARS (2 letters a band): the turn is not borne out, however
-        # much better it reads, and the page reads as displayed (module notes, step 2).
-        reports = (sample_tsv(("ab", 30.0)), sample_tsv(("cd", 90.0))) * EVERY_BAND
+    def test_a_sample_of_too_little_text_any_way_makes_the_turn(self, scans, monkeypatch, tmp_path):
+        # Every band read, no way reaches LEAST_TEXT_CHARS (2 letters a band): no reading is clear, so none refuses
+        # the turn, however much better it reads (module notes, step 2).
+        reports = (sample_tsv(("ab", 90.0)), sample_tsv(("cd", 30.0))) * EVERY_BAND
 
         page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, *reports)
 
-        assert call["rotation"] == 0
+        assert call["rotation"] == 180
         assert (fake / "calls").read_text() == f"{2 * EVERY_BAND}\n"
-        reads = "its sample reads at 90.0 turned and at 30.0 as displayed"
-        assert turn_notes(page) == [too_little(reads, 2 * EVERY_BAND)]
+        assert turn_notes(page) == [kept(180, "2.04", "at 30.0", "at 90.0")]
 
     @pytest.mark.parametrize("fail", [1, 2], ids=["as-displayed", "turned"])
     def test_a_sample_tesseract_cannot_read_leaves_the_page_as_displayed(self, scans, monkeypatch, tmp_path, fail):
@@ -2270,7 +2305,7 @@ class TestSparseCapitals:
     def test_a_wrong_turn_is_refused_and_a_right_one_kept(self, capitals, shown, index):
         # Displayed at each turn, OSD suggests a wrong one (the turn it is displayed at: 180 upright at 2.04, 90 at
         # 1.99, 270 at 2.04 or 2.05 here), or reads it upside down as upright (2.07 or 2.08): OSD's own turn is kept
-        # only were it the right one. Suggested at the threshold, each right turn is kept and each wrong one refused.
+        # only were it the right one.
         page = rotated(
             normalized(render_page(capitals, index, dpi=300, memory_cap_bytes=1 << 30, timeout_s=120.0)), shown
         )
@@ -2281,10 +2316,26 @@ class TestSparseCapitals:
 
         osd_right = found.degrees == right and (found.confidence or 0.0) >= vision.ROTATION_CONFIDENCE
         assert turn.degrees == (right if osd_right else 0), (found, turn)
+
+    @pytest.mark.parametrize("shown", [0, 90, 180, 270])
+    @pytest.mark.parametrize("index", [0, 2])
+    def test_a_turn_suggested_in_the_band_is_refused_by_the_capitals_read_upright(self, capitals, shown, index):
+        # Each turn as if OSD suggested it at the threshold (it does not: module notes, step 2). A right turn is made;
+        # a wrong one is refused when the capitals are read right way up by the check (as displayed upright, or turned
+        # the other way for a quarter turn of a sideways page), at 93.9 or more. Otherwise every reading is of the
+        # capitals turned (sideways, or upside down at 45.5 to 57.3): none is clear, and the turn is made as at base.
+        page = rotated(
+            normalized(render_page(capitals, index, dpi=300, memory_cap_bytes=1 << 30, timeout_s=120.0)), shown
+        )
+        right = (360 - shown) % 360
         for degrees in (90, 180, 270):
             suggested = Orientation(degrees=degrees, confidence=vision.ROTATION_CONFIDENCE, status="ok", reason="")
+
             checked_turn = vision._turn(page, suggested, VisionOptions(), time.monotonic() + 600.0)
-            assert checked_turn.degrees == (right if degrees == right else 0), (degrees, checked_turn)
+
+            read_upright = right == 0 or (degrees != 180 and (degrees + 180) % 360 == right)
+            expected = 0 if degrees != right and read_upright else degrees
+            assert checked_turn.degrees == expected, (degrees, checked_turn)
 
 
 def drawing_png(seed: int) -> bytes:
@@ -2470,3 +2521,75 @@ class TestSidewaysListings:
         assert degrees == 90 and confidence >= vision.TRUSTED_ROTATION_CONFIDENCE
         read = " ".join(texts(page))
         assert read.startswith(CODE_REPEAT) and read.count(CODE_REPEAT) == 5, read
+
+
+# A Chinese invoice: labels in Hiragino Sans GB, Latin values beside them (#456 review, "cjkmix"). eng cannot read the
+# labels: upright, its sample reads 57.2; sideways, as displayed 49.1 or 41.6, the other way 34.5. No reading is clear.
+CJK_FONT = Path("/System/Library/Fonts/Hiragino Sans GB.ttc")
+INVOICE = (
+    ("发票号码", "2026-02-11"),
+    ("开票日期", "INV-97782"),
+    ("购买方名称", "837.85"),
+    ("商品名称", "INV-81326"),
+    ("数量", "2026-08-15"),
+)
+INVOICE_VALUES = [value for _, value in INVOICE]
+# The clockwise turn of the scan's pixels, as PIL's transposition makes it.
+TRANSPOSED = {90: Image.Transpose.ROTATE_270, 270: Image.Transpose.ROTATE_90}
+needs_cjk_font = pytest.mark.skipif(
+    not CJK_FONT.exists(),
+    reason=f"needs the CJK font {CJK_FONT.name} ({CJK_FONT}, macOS) the invoice scan was measured with; CI has no "
+    "CJK font, and the fake-reading TestTurnCheck tests carry the rule there",
+)
+
+
+@pytest.fixture(scope="module")
+def cjk_invoices(tmp_path_factory) -> dict[int, Path]:
+    """By turn: a raster scan (no text layer) of the invoice at 300 DPI, its pixels turned 90 or 270 degrees."""
+    face = ImageFont.truetype(str(CJK_FONT), 50)
+    upright = Image.new("L", (2550, 3300), 255)
+    draw = ImageDraw.Draw(upright)
+    for line, (label, value) in enumerate(INVOICE):
+        draw.text((250, 400 + 90 * line), f"{label}：", font=face, fill=0)
+        draw.text((900, 400 + 90 * line), value, font=face, fill=0)
+    directory = tmp_path_factory.mktemp("cjk")
+    scans = {}
+    for shown, transposition in TRANSPOSED.items():
+        picture = upright.transpose(transposition)
+        buffer = io.BytesIO()
+        picture.save(buffer, format="PNG")
+        size = (picture.width * 72.0 / 300, picture.height * 72.0 / 300)
+        page = PageSpec(width=size[0], height=size[1], items=(RasterImage(0.0, 0.0, *size, buffer.getvalue()),))
+        scans[shown] = build_pdf(directory / f"invoice-{shown}.pdf", [page])
+    return scans
+
+
+@needs_tesseract
+@needs_cjk_font
+class TestTextEngCannotRead:
+    """A sideways scan of text eng cannot read upright, OSD's turn in the checked band, reads righted (#456 review).
+
+    eng reads it poorly every way, sideways junk better than upright: no reading refuses the turn, so it is made as
+    OSD gives it, as at base, and the invoice's Latin values read in order.
+    """
+
+    @pytest.mark.parametrize("shown", [90, 270])
+    def test_osd_suggests_the_right_turn_in_the_checked_band(self, cjk_invoices, shown):
+        page = normalized(render_page(cjk_invoices[shown], 0, dpi=300, memory_cap_bytes=1 << 30, timeout_s=120.0))
+
+        found = vision.orientation(page, timeout_s=120.0)
+
+        assert found.degrees == (360 - shown) % 360, found
+        assert vision.ROTATION_CONFIDENCE <= found.confidence < vision.TRUSTED_ROTATION_CONFIDENCE, found
+
+    @pytest.mark.parametrize("shown", [90, 270])
+    def test_a_sideways_invoice_reads_its_latin_values_in_order(self, cjk_invoices, shown):
+        (page,) = PDFReader(cjk_invoices[shown], ocr="auto").pages
+
+        assert (page.status, page.route) == ("ok", "vision")
+        righted = [note for note in page.warnings if note.startswith("the page reads turned")]
+        assert len(righted) == 1, page.warnings
+        assert f"OCR righted it by {(360 - shown) % 360} degrees clockwise" in righted[0], page.warnings
+        read = " ".join(texts(page))
+        at = [read.find(value) for value in INVOICE_VALUES]
+        assert -1 not in at and at == sorted(at), read

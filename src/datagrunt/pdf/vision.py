@@ -89,32 +89,38 @@ each way when a turn is checked):
    suggested turn does depends on its confidence (:func:`_turn`):
 
    - :data:`TRUSTED_ROTATION_CONFIDENCE` or more: the turn is made as OSD
-     gives it, with no sample read.
+     gives it, with no sample read, as at base.
    - From :data:`ROTATION_CONFIDENCE` up to it: the turn is checked by
      reading. A sample of the page is read as displayed and turned
      (:func:`~datagrunt.pdf.ocr.read_sample`), and, for a quarter turn,
      turned the other way too (half a turn from it: OSD can pick the wrong
-     side of a sideways page).
+     side of a sideways page). The turn is made as OSD gives it unless
+     another reading refuses it.
    - Under :data:`ROTATION_CONFIDENCE`, or when OSD cannot tell: the page
      reads as displayed.
 
    In the check, a reading weighs as its mean word confidence, each word
-   weighted by its chars (a reading of no words: 0), and decides only when it
-   is of text: of :data:`LEAST_TEXT_CHARS` letters or digits or more
-   (``SampleReading.text_chars``). The turn is kept once the sample turned is
-   of text and reads :data:`TURN_MARGIN` or more over each other reading; it
-   is refused once another reading is of text and reads the margin or more
-   over it turned. The sample is the page's bands, the one holding the most
-   ink first (:func:`~datagrunt.pdf.ocr.inked_bands`): each band read joins
-   its words to those before, until the sample decides or every band is read.
-   A band of text decides alone. A band of art, often the one holding the most
-   ink, reads as a few letters or none as a rule, at any confidence: such a
-   reading decides nothing, and the next band is read. A sample that decides neither way once every
-   band is read leaves the page as displayed. A turn made has a warning naming
-   it (a checked one, its sample's confidences too); a page read as displayed
-   though OSD suggested a turn has one saying why (the check's naming each of
-   the sample's confidences, and the letters or digits it read turned when
-   they are too few).
+   weighted by its chars (a reading of no words: 0). A reading is clear when
+   it holds :data:`LEAST_TEXT_CHARS` letters or digits or more
+   (``SampleReading.text_chars``) and reads at
+   :data:`CLEAR_READING_CONFIDENCE` or more. Another reading (as displayed,
+   or the other way) refuses the turn once it is clear and reads
+   :data:`TURN_MARGIN` or more over the sample turned. The sample is the
+   page's bands, the one holding the most ink first
+   (:func:`~datagrunt.pdf.ocr.inked_bands`): each band read joins its words
+   to those before, until a reading refuses the turn or every band is read.
+   No reading refusing it, the turn is made. So a page eng reads poorly
+   every way has its turn made as at base: text eng cannot read upright
+   (Chinese, Japanese, Korean, Arabic, displayed math), read upright, reads
+   no better than its sideways or upside-down junk, and no reading of it
+   is clear. A band of text eng reads clearly, right way up, refuses a
+   wrong turn alone as a rule (the sparse capitals: on their first band); a
+   band of art, often the one holding the most ink, reads as a few letters
+   or none as a rule, at any confidence, refuses nothing, and the next band
+   is read. A turn made has a warning naming it (a checked one, its
+   sample's confidences too); a page read as displayed though OSD suggested
+   a turn has one saying why (the check's naming each of the sample's
+   confidences and the reading that refused the turn).
 
    Evidence, tesseract 5.5.3: OSD's suggestion on 1,462 renders, each page
    rendered upright and turned 90, 180 and 270 degrees (7 raster scans
@@ -141,81 +147,112 @@ each way when a turn is checked):
      55 right, at 0.21 to 22.62; 8 wrong, at 0.38 to 1.16; OSD cannot tell
      on 8.
 
+   And on 3,016 synthetic raster scans of the #456 review, each upright and
+   turned (receipts, charts, forms, envelopes, notebooks, hands and display
+   fonts, Wingdings, scripts eng cannot read, math, fax-resolution and
+   low-resolution scans): OSD suggests a turn in the checked band on 233.
+
    So:
 
-   - Every wrong turn is at 2.48 or under (95: 31 on upright renders, at 2.41
-     at most); every right turn on the corpus is at 3.59 or more, and on code,
-     config, logs, tables of contents, two-column prose and typed letters at
-     7.16 or more.
-   - :data:`TRUSTED_ROTATION_CONFIDENCE` is 3.0: 0.52 over the highest wrong
-     turn (21 %), under the corpus's least right turn. 737 of the 766 right
-     turns are made unchecked; no wrong one is.
+   - On the 1,462 renders, every wrong turn is at 2.48 or under (95: 31 on
+     upright renders, at 2.41 at most); every right turn on the corpus is
+     at 3.59 or more, and on code, config, logs, tables of contents,
+     two-column prose and typed letters at 7.16 or more. That holds for
+     those sets only: on the review's scans OSD gives wrong turns over 3.0
+     to fax-resolution scans (bilevel at 100 or 120 DPI: 46, at 3.15 to
+     21.27, each half a turn from the right one, an upright page upside
+     down or a sideways one the wrong side; at the standard fax resolution,
+     204 x 98 DPI, upright pages turned 180 degrees at 7.63 and 8.21) and to
+     calligraphic hands (Snell Roundhand, Trattatello, Zapfino: 16, at 3.02
+     to 6.68). Those are made unchecked, as at base (see the known
+     limitations).
+   - :data:`TRUSTED_ROTATION_CONFIDENCE` is 3.0: 0.52 over the 1,462
+     renders' highest wrong turn (21 %), under the corpus's least right
+     turn. 737 of their 766 right turns are made unchecked.
    - Under it, right and wrong turns overlap, on sparse pages. 19 right turns
-     are under 2.0 (art alone, a grid of short words, a shipping label,
-     forms, key-value pages), with 40 wrong ones: none is made, as at base.
-     10 are from 2.0 up to 3.0: key-value pages of three lines (2.04 to 2.30,
-     among the wrong turns, 2.00 to 2.48), a business card (2.84 to 2.93) and
-     a poem (2.97). That band is what the check is for: of its 65
-     suggestions, it keeps the 10 right turns and refuses the 55 wrong ones,
-     each on its first band but 16:
+     of the 1,462 renders are under 2.0 (art alone, a grid of short words, a
+     shipping label, forms, key-value pages), with 40 wrong ones: none is
+     made, as at base.
 
-     - The right turns read 87.3 to 94.4 turned, 0 (no words) to 56.3 as
-       displayed.
-     - Sparse capitals (8): upright, OSD suggests turning each 180 degrees,
-       at 1.83 to 2.04 (3 pages from 2.0); the sample reads 95.6 to 95.8 as
-       displayed, 45.5 to 57.3 turned. Displayed sideways, OSD suggests the
-       turn they are displayed at (the wrong side), at 1.78 to 2.05 (5 from
-       2.0): turned so, the sample reads 47.3 or 55.6 (upside down), as
-       displayed no words, the other way 93.9 or 94.4.
-     - Capitals over a blotch of art or a dark bar (47, at 2.05 to 2.48): an
-       upright one on its third band (two of art, then the capitals: 78.1 to
-       96.3 as displayed, 41.4 to 57.7 turned).
+   OSD's own suggestions in the checked band, right turns made and wrong
+   ones refused: at base (every one made) | by the check's first form
+   (bb1de45: a turn kept only when its turned reading was of text and read
+   the margin over every other, the page otherwise read as displayed) | by
+   this check:
 
-   Checked as if OSD suggested it from 2.0, each turn of each render:
+   - The 1,462 renders, 65 suggestions: 10 right turns (key-value pages of
+     three lines, at 2.04 to 2.30; a business card, 2.84 to 2.93; a poem,
+     2.97): 10 | 10 | 10 made. 55 wrong (2.00 to 2.48): 0 | 55 | 55
+     refused: sparse capitals, upright 3 and sideways 5; capitals over art
+     or a bar, 47.
+   - The review's 233: 149 right turns of Latin text: 149 | 149 | 149 made.
+     62 right turns of text eng cannot read (Chinese 13, a Chinese invoice
+     of Latin values 25, Japanese 3, Korean 7, Arabic 1, math 13): 62 | 15
+     | 62 made. 22 wrong: 0 | 22 | 11 refused.
 
-   - The corpus: 280 of its 285 right turns are kept: turned, the sample
-     reads 16.9 or more over as displayed (21.7 or more on a quarter turn),
-     and 24.9 or more over the other way, on 108 letters or digits or more;
-     273 decided by their first band, none past the third. The 5 refused: 2
-     renders of a cover of art and a few words of title (OSD right at 13.86
-     and 14.83, made unchecked: the sample reads only 5.1 and 4.1 better
-     turned), and 3 OSD does not right (a wrong turn at 0.02, or none). The
-     3 wrong turns of each of its 95 upright renders are refused (285), 272
-     on their first band, none past the third.
-   - Code, config, tables of contents, two-column prose: 22 of 63, 17 of
-     117 and 1 of 34 right turns are refused: their sample reads -8.2 to
-     11.7 over as displayed (psm 11 reads "=", ":", brackets and dot leaders
-     as words alike either way). OSD gives each at 14.69 or more: made
-     unchecked. Checked, a sideways config file read as displayed, as
-     ``enabledport= host=``, at 92.7 (#456 review).
-   - Of the 1,089 wrong turns of upright renders, all are refused but 2, on
-     pages OSD reads upright or under 2.0: a page of art alone (16 letters or
-     digits of art, read 28.5 better turned) and a table of contents (13 of
-     its dot leaders read 20.6 over its 2,937 letters and digits as
-     displayed). A band of a wrong turn whose turned reading is of text reads
-     11.6 better at most on a page of text (the margin is over it).
-   - Of the turned renders' other wrong turns, 59 of 2,198 are kept (text
-     turned the wrong way is junk, and junk can read the margin over junk);
-     OSD suggests none of them.
+   The 11 wrong turns the first form refused and this check makes are on
+   pages eng reads poorly every way: fax at 100 DPI (4), scans at 72 DPI
+   (2), calligraphic hands and a calligraphic font (3), Wingdings (2). No
+   reading of their samples refuses the turn (4 have none 15 over it
+   turned; 7 have one at 46.9 to 69.95, under the floor), so each turn is
+   made as at base; read so, each page reads at a mean word confidence of
+   0.0 to 44.7, under :data:`LOW_OCR_CONFIDENCE`, and is flagged (step 5).
 
-   :data:`LEAST_TEXT_CHARS` is 12. On the corpus, the capitals and the art
-   pages of text, at a least of 1 (any letter or digit decides), a reading of
-   art kept a wrong turn of an upright render 9 times, on 5 letters or digits
-   at most, and refused 6 more right turns than at 12; the sparsest text
-   keeping a right turn, two short lines of capitals under a blotch, read 22.
-   Any least from 6 to 22 refuses every such wrong turn and keeps every right
-   turn but the corpus's 5 above; from 23, 2 more are refused. 12 is about
-   mid-way (their geometric mean is 11.5). The turned reading must be of text
-   itself, not only some reading of the sample: weighed so, 11 wrong turns of
-   those pages' turned renders were kept, such as a quarter turn of a drawing
-   displayed upside down on 2 letters or digits read turned at 62.5, against
-   41.1 on 96 as displayed.
+   Checked as if OSD suggested it from 2.0, each turn of each of the 1,462
+   renders (hypothetical: OSD suggested none of these in the band, by the
+   figures above):
 
-   A page whose sample reads under 12 letters or digits every way reads as
-   displayed. No page measured reached the check so: OSD could not tell on
-   all 224 renders of 56 pages of a word or two ("Page 3", "INVOICE", alone
-   at 12 to 72 pt or under a drawing), nor on 71 of the 96 renders of 24
-   pages of art alone, and read the other 25 under 2.0 (1.72 at most).
+   - Right turns: all 1,099 are made (the first form refused 279: 162 of a
+     word or two, 72 of art, 22 of code and config, 17 of tables of
+     contents, 5 of the corpus, 1 of two-column prose).
+   - Wrong turns of upright renders: 748 of 1,089 are refused (the first
+     form refused 1,087). Those made are on pages no reading of which is
+     clear: a word or two (166 of 168: too few letters), art (86 of 138),
+     tables of contents (46 of 114: psm 11 reads them upright at 21.3 to
+     54.3 but one, at 87.6 and its turn at 76.2), code and config (23 of
+     60), the corpus (12 of 285) and others (8).
+   - Wrong turns of turned renders: 538 of 2,198 are refused (the first
+     form refused 2,139). Refused, such a page reads turned the wrong way
+     all the same, unless a reading checked is the right one: a half turn
+     of a sideways page, or a quarter turn of an upside-down one, is made
+     as OSD gives it, none of its readings being upright.
+
+   :data:`CLEAR_READING_CONFIDENCE` is 70. Of OSD's own suggestions in the
+   band, a reading at 63.9 at most could refuse a right turn (a math
+   worksheet displayed sideways, read as displayed), and the readings
+   refusing the sparse capitals' wrong turns are at 78.1 or more (capitals
+   over art, upright, read as displayed): any floor over 63.9 up to 78.1
+   makes every right turn and refuses those 55. 70 is about mid-way, and
+   :data:`LOW_OCR_CONFIDENCE`. A lower floor refuses more of the review's
+   wrong turns and, under 65, right turns of text eng cannot read: with no
+   floor, 26 of its 62 right turns are refused (sideways junk reads 15 or
+   more over the upright reading, on 12 letters or more) and 18 of its 22
+   wrong turns; at 60, 4 and 15; at 65, 0 and 14; at 70, 0 and 11; at 75,
+   0 and 8. No floor from 0 to 95 with any margin from 5 to 35 both makes
+   every right turn and refuses those 11 (8 stay made at least): the
+   readings that could refuse them (46.9 to 69.95, on 7) and those of the
+   right turns' junk (to 63.9) overlap, and 4 have none.
+
+   :data:`TURN_MARGIN` is 15: any margin from 9 to 16 makes the same
+   decisions on OSD's own suggestions in the band, and makes all 1,099 right
+   turns checked as if suggested. Under 9, a page of code displayed
+   sideways has its right turn refused; from 17, one more wrong turn is
+   made.
+
+   :data:`LEAST_TEXT_CHARS` is 12, as before: any least from 8 to 45 makes
+   the same decisions on OSD's own suggestions in the band, and makes all
+   1,099 right turns checked as if suggested. Under 8, a few letters read
+   at 70 or more refuse right turns of pages of a word or two or of art
+   alone (1 at a least of 7, 8 at 1); from 46, 11 more of OSD's wrong turns
+   in the band are made. A lower least refuses more of the hypothetical
+   wrong turns (of the 3,287, 1,336 at 8, 1,286 at 12, 1,256 at 45); 12 is
+   kept, 5 over the least that refuses a right turn.
+
+   A page whose sample reads under 12 letters or digits every way has no
+   clear reading: its turn is made, as at base. OSD could not tell on all
+   224 renders of 56 pages of a word or two ("Page 3", "INVOICE", alone at
+   12 to 72 pt or under a drawing), nor on 71 of the 96 renders of 24 pages
+   of art alone, and read the other 25 under 2.0 (1.72 at most).
 
    The sample is read as sparse text (``--psm 11``), not as the page's bands
    are (``--psm 3``): psm 3 rights sideways text itself, so an upright page's
@@ -227,15 +264,18 @@ each way when a turn is checked):
    Cost: a turn made unchecked costs no tesseract call. A page whose turn is
    checked is OCR'd one extra sample: two tesseract calls a band read (three
    for a quarter turn), the band holding the most ink first, then the next
-   bands by ink only while that does not decide. The 65 checked here took 2
-   to 6 calls, 0.26 to 1.86 s (median 1.11), where the page's own OCR took
-   0.13 to 1.44 s (median 1.08). The sample's calls are within the page's
-   budget and OCR timeout, as its bands' are: a check the budget runs out in
-   leaves the page unread (``OCR stopped while checking orientation
-   detection's turn of 180 degrees: the page's 600 s budget is spent``), as
-   any page whose budget runs out; a sample tesseract cannot read (it failed,
-   or timed out) leaves the page as displayed, with a warning saying why. The
-   displayed page is the PDF's own orientation.
+   bands by ink until a reading refuses the turn: a turn refused stops at
+   the band that refuses it, a turn made reads every band. OSD's 298
+   suggestions in the band above took 2 to 12 calls (median 8; the first
+   form, which stopped at the first band that decided either way, a median
+   of 3), 0.26 to 4.41 s (median 2.28, four pages checked at a time). The
+   sample's calls are within the page's budget and OCR timeout, as its
+   bands' are: a check the budget runs out in leaves the page unread (``OCR
+   stopped while checking orientation detection's turn of 180 degrees: the
+   page's 600 s budget is spent``), as any page whose budget runs out; a
+   sample tesseract cannot read (it failed, or timed out) leaves the page as
+   displayed, with a warning saying why. The displayed page is the PDF's own
+   orientation.
 3. OCR: the righted page's bands (900 px, 60 px shared), each word mapped
    back to the displayed page.
 4. Elements: :func:`vision_elements` of the words, the page's figures and
@@ -334,31 +374,38 @@ Known limitations (A5b evidence: 10 corpus pages forced to OCR):
   are so: OSD reads each as upright (at 1.86 to 2.09), and its OCR is
   gibberish, at 50.9 to 59.3. Such a page is flagged (step 5), not
   righted: righting it would need more OCR of every page OSD reads as
-  upright. One read the wrong way at :data:`LOW_OCR_CONFIDENCE` or more
-  would not be flagged; none was measured (59.3 at most).
+  upright. One read the wrong way at :data:`LOW_OCR_CONFIDENCE` or more is
+  not flagged: upside-down pages of the digits 0, 1, 6, 8 and 9 alone,
+  which read as digits either way up, read at 71.0 to 84.3 (8 pages, #456
+  review), and an upright one OSD turns 180 degrees at 4.35 at 83.7.
 - A turn OSD suggests at :data:`TRUSTED_ROTATION_CONFIDENCE` or more is
-  made unchecked (step 2): were it wrong, the page would read the wrong
-  way, flagged only when its OCR reads under :data:`LOW_OCR_CONFIDENCE`.
-  None was measured: of 1,462 renders, OSD's wrong turns are at 2.48 at
-  most.
-- A right turn OSD suggests from :data:`ROTATION_CONFIDENCE` up to
-  :data:`TRUSTED_ROTATION_CONFIDENCE` that the check refuses reads as
-  displayed, and may not be flagged. None of the 10 measured was refused,
-  but the check cannot tell some pages from their turn: checked as if OSD
-  suggested them so, 40 of the 214 right turns of code, config, tables of
-  contents and two-column prose are refused (step 2), and the sideways
-  config file, its turn of 270 degrees suggested at 2.5, reads as
-  displayed (``enabledport= host=``) at 92.7, not flagged. OSD gives each
-  of the 40 at 14.69 or more: made unchecked.
+  made unchecked (step 2), as at base: were it wrong, the page would read
+  the wrong way, flagged only when its OCR reads under
+  :data:`LOW_OCR_CONFIDENCE`. Of the 1,462 renders, OSD's wrong turns are
+  at 2.48 at most, but on the #456 review's scans it gives wrong turns
+  over it to fax-resolution scans (bilevel at 100 or 120 DPI: 46, at 3.15
+  to 21.27; at 204 x 98 DPI, 7.63 and 8.21) and calligraphic hands (16, at
+  3.02 to 6.68). Those read through the reader (the two standard-fax
+  pages, 7 of the hands) read at 24.9 to 40.0, and are flagged.
+- A turn OSD suggests from :data:`ROTATION_CONFIDENCE` up to
+  :data:`TRUSTED_ROTATION_CONFIDENCE` is made unless a clear reading of
+  its sample refuses it (step 2), so a wrong one is made on a page eng
+  reads poorly every way, as at base: of OSD's 77 wrong turns in that band,
+  11 (fax at 100 DPI, scans at 72 DPI, calligraphic hands, Wingdings),
+  each page then read at 0.0 to 44.7 and flagged (step 5). Checked as if
+  OSD suggested them so (it did not), 341 of the 1,089 wrong turns of the
+  upright renders would be made (a word or two, art, tables of contents
+  and code that psm 11 reads under 70), and 1,660 of the 2,198 of the
+  turned ones (such a page reads turned the wrong way, refused or not,
+  unless a reading checked is the right one).
+- A right turn OSD suggests in that band is refused only by a clear
+  reading the margin over it: none of OSD's 221 was, nor any of the 1,099
+  right turns checked as if suggested. Refused, it would read as
+  displayed, and might not be flagged.
 - The flag cannot tell a page read the wrong way from one hard to read:
   two corpus pages of art read right way up (56.3 and 58.3) are flagged
-  too.
-- A wrong turn OSD suggests from :data:`ROTATION_CONFIDENCE` up to
-  :data:`TRUSTED_ROTATION_CONFIDENCE` on a page displayed turned can be
-  kept (step 2): checked as if OSD suggested them so, 59 of the 2,198
-  wrong turns of the turned renders were (text read turned the wrong way
-  is junk, and junk can read the margin over junk). OSD suggested none of
-  them; its 36 wrong turns of turned renders in that band were refused.
+  too, as is text eng cannot read upright, righted (the #456 review's
+  Chinese invoice: 42.0).
 """
 
 import dataclasses
@@ -411,6 +458,7 @@ from datagrunt.pdf.quality import OcrMode, PageAssessment, SpanPiece, valid_char
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page
 
 __all__ = [
+    "CLEAR_READING_CONFIDENCE",
     "LEAST_SIZE_PT",
     "LEAST_TEXT_CHARS",
     "LOW_OCR_CONFIDENCE",
@@ -451,16 +499,20 @@ _NO_LATTICE = LatticeResult(tables=(), used_pieces=())
 # OSD's turn is not made under this confidence, as at base, and is checked from it up to TRUSTED_ROTATION_CONFIDENCE
 # (module notes, step 2: under it, 19 right turns and 40 wrong ones of 1,462 renders).
 ROTATION_CONFIDENCE = 2.0
-# OSD's turn is made as it gives it, unchecked, at this confidence or more (module notes, step 2: wrong turns 2.48 at
-# most; the corpus's right turns 3.59 and up; from 2.0 up to it, 10 right turns and 55 wrong ones, each decided by the
-# check).
+# OSD's turn is made as it gives it, unchecked, at this confidence or more, as at base (module notes, step 2: of 1,462
+# renders, wrong turns 2.48 at most, the corpus's right turns 3.59 and up; but fax-resolution scans and calligraphic
+# hands get wrong turns over it, made as at base).
 TRUSTED_ROTATION_CONFIDENCE = 3.0
-# A checked turn is kept when its sample's mean word confidence turned is this much over it as displayed and, for a
-# quarter turn, over it turned the other way, or more (module notes, step 2: the corpus's right turns 16.9 and up over
-# as displayed, 24.9 over the other way; a band of a wrong turn read as text, 11.6 over at most on a page of text).
+# A checked turn is refused when another reading of its sample (as displayed, or turned the other way for a quarter
+# turn) reads clearly and this much over it turned, or more (module notes, step 2: any margin from 9 to 16 makes the
+# same decisions on every suggestion OSD made in the band, and refuses no right turn of any render).
 TURN_MARGIN = 15.0
-# A sample reading decides a turn only when it holds this many letters or digits, or more: it is of text (module notes,
-# step 2: art that kept a wrong turn read 5 at most; the sparsest text keeping a right turn, 22).
+# A sample reading is clear, and can refuse a turn, only at this mean word confidence or more (module notes, step 2:
+# right turns in the band could be refused by readings of 63.9 at most; the sparse capitals' wrong turns are refused by
+# readings of 78.1 or more).
+CLEAR_READING_CONFIDENCE = 70.0
+# A sample reading is clear only when it holds this many letters or digits, or more (module notes, step 2: any least
+# from 8 to 45 makes the same decisions; a few letters of art read at a high confidence refuse right turns under 8).
 LEAST_TEXT_CHARS = 12
 # A page OCR read at a mean word confidence (its ocr_mean_confidence) under this is flagged in its warnings (module
 # notes, step 5: pages read upside down 59.3 at most; right way up 79.7 and over, but for 2 pages of art).
@@ -934,9 +986,10 @@ def _turn(grey: RenderedPage, found: Orientation, options: VisionOptions, deadli
 
     A turn suggested at :data:`TRUSTED_ROTATION_CONFIDENCE` or more is made
     as OSD gives it, with no sample read; from :data:`ROTATION_CONFIDENCE`
-    up to it, only when its sample reads better so; under it, never. The
-    check's calls end by ``deadline``: one cut at it, or not started, leaves
-    the page unread (its ``failure``).
+    up to it, unless another reading of its sample refuses it
+    (:meth:`_Sample.veto`); under it, never. The check's calls end by
+    ``deadline``: one cut at it, or not started, leaves the page unread (its
+    ``failure``).
     """
     confidence = found.confidence
     if found.status != "ok" or confidence is None:
@@ -957,12 +1010,13 @@ def _turn(grey: RenderedPage, found: Orientation, options: VisionOptions, deadli
         unread = f"its sample could not be read ({_tesseract(sample.status, sample.reason)})"
         return _Turn(0, (f"{suggests}, but {unread}, so the turn is not checked; OCR read it as displayed",))
     reads = sample.reads(found.degrees)
-    verdict = sample.verdict()
-    if verdict:
+    veto = sample.veto()
+    if veto is None:
         return _Turn(
             found.degrees, (f"the page reads turned: {righted} (orientation confidence {confidence:g}; {reads})",)
         )
-    return _Turn(0, (f"{suggests}, but {reads} ({_not_borne_out(sample, verdict)}); OCR read it as displayed",))
+    way = "as displayed" if veto is sample.displayed else f"turned {_opposite(found.degrees)} degrees"
+    return _Turn(0, (f"{suggests}, but {reads} ({_clearly(way)}); OCR read it as displayed",))
 
 
 def _suggested(found: Orientation) -> str:
@@ -981,24 +1035,18 @@ class _Sample(NamedTuple):
         """The readings the turned one is weighed against: as displayed, and turned the other way if read."""
         return (self.displayed,) if self.opposite is None else (self.displayed, self.opposite)
 
-    def gaps(self) -> tuple[float, ...]:
-        """How much better the sample reads turned than each other way it was read (:func:`_gap`)."""
-        return tuple(_gap(other, self.turned) for other in self.others())
+    def veto(self) -> SampleReading | None:
+        """The first other reading that refuses the turn, or None while none does (module notes, step 2).
 
-    def verdict(self) -> bool | None:
-        """True, the turn is borne out; False, refused; None while the sample decides neither (notes, step 2).
-
-        A gap decides only for a reading of text: of :data:`LEAST_TEXT_CHARS`
-        letters or digits or more. The turn is borne out once the sample
-        turned is one, and reads better than every other way by
-        :data:`TURN_MARGIN`; refused once another way is one, and reads
-        better than it turned by the margin.
+        A reading refuses it when it reads clearly (:func:`_clear`) and
+        :data:`TURN_MARGIN` or more over the sample turned (a turned reading of
+        no words counts as a confidence of 0).
         """
-        gaps = self.gaps()
-        if self.turned.text_chars >= LEAST_TEXT_CHARS and all(gap >= TURN_MARGIN for gap in gaps):
-            return True
-        texts = (other.text_chars >= LEAST_TEXT_CHARS for other in self.others())
-        return False if any(gap <= -TURN_MARGIN and text for gap, text in zip(gaps, texts)) else None
+        turned = _confidence_or_0(self.turned)
+        return next(
+            (other for other in self.others() if _clear(other) and _confidence_or_0(other) - turned >= TURN_MARGIN),
+            None,
+        )
 
     def reads(self, degrees: int) -> str:
         """How the sample reads each way, as a warning names it (``degrees``: the turn OSD suggests)."""
@@ -1014,24 +1062,27 @@ def _opposite(degrees: int) -> int:
     return (degrees + 180) % 360
 
 
-def _not_borne_out(sample: _Sample, verdict: bool | None) -> str:
-    """Why the sample does not bear its turn out: another way read better, or turned it read too little text."""
-    chars = sample.turned.text_chars
-    if verdict is None and chars < LEAST_TEXT_CHARS:
-        under = f"under {LEAST_TEXT_CHARS}: too little text to bear a turn out"
-        return f"turned, it reads {chars} letters or digits, {under}"
-    return f"mean word confidence; a turn needs {TURN_MARGIN:g} more"
+def _clear(reading: SampleReading) -> bool:
+    """True if ``reading`` reads clearly: :data:`LEAST_TEXT_CHARS` letters or digits or more, at
+    :data:`CLEAR_READING_CONFIDENCE` or more (module notes, step 2)."""
+    confidence = reading.confidence
+    return reading.text_chars >= LEAST_TEXT_CHARS and confidence is not None and confidence >= CLEAR_READING_CONFIDENCE
+
+
+def _clearly(way: str) -> str:
+    """Why a turn is refused: its sample read ``way`` reads clearly, and the margin over it turned."""
+    clear = f"{LEAST_TEXT_CHARS} letters or digits or more at {CLEAR_READING_CONFIDENCE:g} or more"
+    return f"{way}, it reads clearly ({clear}) and {TURN_MARGIN:g} or more over it turned"
 
 
 def _sampled(grey: RenderedPage, degrees: int, options: VisionOptions, deadline: float) -> _Sample | SampleReading:
     """The page's sample read as displayed and turned by ``degrees``, and the other way too for a quarter turn.
 
     Its bands are read most ink first (:func:`~datagrunt.pdf.ocr.inked_bands`),
-    each every way, joining the words read before, until the joined
-    readings decide (:meth:`_Sample.verdict`; readings of too few letters
-    and digits decide nothing) or every band is read: two calls a band
-    (three for a quarter turn), each within its timeout and ``deadline``.
-    The first reading that fails ends it, and is returned.
+    each every way, joining the words read before, until another joined
+    reading refuses the turn (:meth:`_Sample.veto`) or every band is read:
+    two calls a band (three for a quarter turn), each within its timeout and
+    ``deadline``. The first reading that fails ends it, and is returned.
     """
     turns = (0, degrees) if degrees == 180 else (0, degrees, _opposite(degrees))
     words: tuple[list[tuple[str, float]], ...] = tuple([] for _ in turns)
@@ -1043,7 +1094,7 @@ def _sampled(grey: RenderedPage, degrees: int, options: VisionOptions, deadline:
             if reading.status != "ok":
                 return reading
             words[side].extend(reading.words)
-        if _joined(words).verdict() is not None:
+        if _joined(words).veto() is not None:
             break
     return _joined(words)
 
@@ -1052,11 +1103,6 @@ def _joined(words: tuple[list[tuple[str, float]], ...]) -> _Sample:
     """The words of a sample's bands read so far each way (displayed, turned, other way if read), as one sample."""
     readings = [SampleReading(words=tuple(read), status="ok", reason="") for read in words]
     return _Sample(displayed=readings[0], turned=readings[1], opposite=readings[2] if len(readings) > 2 else None)
-
-
-def _gap(other: SampleReading, turned: SampleReading) -> float:
-    """How much better the sample reads turned than ``other``: a reading of no words counts as a confidence of 0."""
-    return _confidence_or_0(turned) - _confidence_or_0(other)
 
 
 def _confidence_or_0(reading: SampleReading) -> float:
