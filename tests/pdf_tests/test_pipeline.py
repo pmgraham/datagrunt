@@ -1456,6 +1456,10 @@ class TestExtractDocument:
         with pytest.raises(FileNotFoundError):
             extract_document(tmp_path / "missing.pdf")
 
+    def test_a_source_that_is_not_a_regular_file_raises(self, tmp_path):
+        with pytest.raises(ValueError, match=f"^source is not a regular file: {re.escape(str(tmp_path))}$"):
+            extract_document(tmp_path)
+
     def test_a_file_that_is_no_pdf_raises(self, tmp_path):
         path = tmp_path / "notes.pdf"
         path.write_text("not a PDF")

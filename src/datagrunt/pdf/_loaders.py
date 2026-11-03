@@ -31,15 +31,20 @@ one descriptor whose ``fstat`` must be the stat just taken
 (:func:`~datagrunt.pdf._source._stream_sha256`), and is drawn only when its
 bytes hash to the document's sha256. After the render the path is stat'ed
 again and must be the file stat'ed before it: nothing is hashed then. A
-file gone, of other bytes, replaced between the stat and the hash, cut
-short as it is hashed, or changed during the render raises
+file gone or not a regular file (a directory, a named pipe: it is never
+opened blocking, :func:`~datagrunt.pdf._source._opened_source`), of other
+bytes, replaced between the stat and the hash, cut short as it is hashed,
+or changed during the render raises
 :class:`~datagrunt.pdf.exceptions.PDFSourceChangedError`, naming the path,
 the page and what changed (for other bytes, that they are not the
 document's): no image of other bytes than the document's pages is
 returned. A loader bound to neither checks nothing. A draw of a file of
-another identity reads the whole file first, each time. What this cannot
-see is the pipeline's limit: a write that keeps the size and restores the
-mtime, or a swap away and back between the stats.
+another identity reads the whole file first, each time; a bundle write,
+which has hashed the file already, draws through copies bound to the
+identity it hashed (:func:`~datagrunt.pdf.bundle._draws_bound`), so it
+hashes the file once. What this cannot see is the pipeline's limit: a
+write that keeps the size and restores the mtime, or a swap away and back
+between the stats.
 
 Figure reads are batched: :func:`read_figures` reads up to
 :data:`FIGURE_BATCH` figures of one PDF in one worker, and
@@ -61,6 +66,7 @@ refused) is that figure's outcome, raised as it was.
 import dataclasses
 import io
 import os
+import stat
 import subprocess
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -177,8 +183,8 @@ class PageRender:
         """The page as displayed (before OCR's turn), normalized, as PNG.
 
         Raises:
-            PDFSourceChangedError: If the file at ``source`` is gone or its bytes are not the document's before the
-                render, or it changed during it (module notes).
+            PDFSourceChangedError: If the file at ``source`` is gone, not a regular file or its bytes are not the
+                document's before the render, or it changed during it (module notes).
         """
         return _png(self._drawn())
 
@@ -265,9 +271,9 @@ class PageDraw:
         """The page as displayed, 8-bit grey as drawn, as PNG.
 
         Raises:
-            PDFSourceChangedError: If the file at ``source`` is gone or its
-                bytes are not the document's before the render, or it
-                changed during it (module notes).
+            PDFSourceChangedError: If the file at ``source`` is gone, not a
+                regular file or its bytes are not the document's before the
+                render, or it changed during it (module notes).
             DatagruntPDFError: If the page draws at another size than
                 :attr:`size` (the PDF is not the one read), or as
                 ``render_page`` raises (``RenderRefused``, ``RenderFailed``).
@@ -305,10 +311,10 @@ def _drawable(loader: PageRender | PageDraw, when: str) -> SourceIdentity | None
     holds them when its bytes hash to the loader's sha256 (module notes).
 
     Raises:
-        PDFSourceChangedError: If the file is gone, or of another identity
-            and bytes that are not the document's (naming ``when``, what
-            changed and both hashes), or replaced or cut short as it is
-            hashed.
+        PDFSourceChangedError: If the file is gone or not a regular file, or
+            of another identity and bytes that are not the document's (naming
+            ``when``, what changed and both hashes), or replaced or cut short
+            as it is hashed.
         OSError: If the file cannot be stat'ed or read for another reason
             (``PermissionError``, say).
     """
@@ -326,16 +332,20 @@ def _drawable(loader: PageRender | PageDraw, when: str) -> SourceIdentity | None
 
 
 def _identity_at(source: Path, when: str) -> SourceIdentity:
-    """The identity of the file at ``source`` now, from one ``stat``.
+    """The identity of the regular file at ``source`` now, from one ``stat``.
 
     Raises:
-        PDFSourceChangedError: If no file is there, naming ``when``.
+        PDFSourceChangedError: If no file is there, or what is there is not a
+            regular file (a directory, a named pipe), naming ``when``.
         OSError: If ``source`` cannot be stat'ed for another reason.
     """
     try:
-        return SourceIdentity.of(os.stat(source))
+        status = os.stat(source)
     except (FileNotFoundError, NotADirectoryError) as exc:
-        raise PDFSourceChangedError(f"{source} was removed {when}; {_NOT_RETURNED}") from exc
+        raise _removed(source, when) from exc
+    if not stat.S_ISREG(status.st_mode):
+        raise _not_regular(source, when)
+    return SourceIdentity.of(status)
 
 
 def _check_unchanged(source: Path, before: SourceIdentity | None, when: str) -> None:
@@ -355,15 +365,19 @@ def _sha256_at(source: Path, status: SourceIdentity, when: str) -> str:
     """The SHA-256 of the file at ``source``, read through one descriptor that must be the file ``status`` is of.
 
     Raises:
-        PDFSourceChangedError: If the file is gone, is not ``status``'s when
-            opened (its ``fstat``), or is cut short as it is hashed.
+        PDFSourceChangedError: If the file is gone or not a regular file when
+            opened, is not ``status``'s (its ``fstat``), or is cut short as it
+            is hashed.
         OSError: If it cannot be opened or read for another reason.
     """
     try:
-        with _opened_source(source) as stream:
-            return _hashed(stream, source, status, when)
-    except (FileNotFoundError, NotADirectoryError) as exc:
-        raise PDFSourceChangedError(f"{source} was removed {when}; {_NOT_RETURNED}") from exc
+        stream = _opened_source(source)
+    except FileNotFoundError as exc:
+        raise _removed(source, when) from exc
+    except ValueError as exc:  # not a regular file: put there since the stat
+        raise _not_regular(source, when) from exc
+    with stream:
+        return _hashed(stream, source, status, when)
 
 
 def _hashed(stream: BinaryIO, source: Path, status: SourceIdentity, when: str) -> str:
@@ -378,6 +392,16 @@ def _hashed(stream: BinaryIO, source: Path, status: SourceIdentity, when: str) -
 def _changed(source: Path, when: str, changes: tuple[str, ...], *why: str) -> PDFSourceChangedError:
     """The error of a draw that found the file at ``source`` changed ``when``: what changed, why, and so no image."""
     return PDFSourceChangedError("; ".join((f"{source} changed {when}: {', '.join(changes)}", *why, _NOT_RETURNED)))
+
+
+def _not_regular(source: Path, when: str) -> PDFSourceChangedError:
+    """The error of a draw that found something other than a regular file at ``source`` ``when``."""
+    return _changed(source, when, ("it is not a regular file",))
+
+
+def _removed(source: Path, when: str) -> PDFSourceChangedError:
+    """The error of a draw that found nothing at ``source`` ``when``."""
+    return PDFSourceChangedError(f"{source} was removed {when}; {_NOT_RETURNED}")
 
 
 def _png(image: RenderedPage | Band) -> bytes:

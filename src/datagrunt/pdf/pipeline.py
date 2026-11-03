@@ -398,6 +398,8 @@ def extract_document(
     Raises:
         TypeError, ValueError: As :class:`PipelineOptions` and
             :class:`PDFSource` raise them, before the file is opened.
+        ValueError: If ``source`` is not a regular file (a directory, a
+            named pipe), refused without blocking on a pipe.
         FileNotFoundError, PermissionError, PDFEncryptedError: As
             :func:`~datagrunt.pdf.pdfium_engine.open_document` raises them,
             in the first worker.
