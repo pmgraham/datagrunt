@@ -309,7 +309,7 @@ markdown = reader.to_markdown()     # the whole document as Markdown
 for table in reader.tables:
     print(table.scope_path, table.to_dataframe())
 reader.headings, reader.paragraphs, reader.key_values, reader.lists, reader.figures
-reader.sections, reader.pages, reader.metadata
+reader.sections, reader.pages, reader.page_images, reader.metadata
 
 # SQL over the element rows (an in-memory DuckDB connection per reader)
 result = reader.query_data(f"SELECT kind, count(*) AS n FROM {reader.db_table} GROUP BY kind")
@@ -323,6 +323,13 @@ or `figure`), `scope_path`, `text`, `markdown`, `bbox`, `route`,
 
 - `PDFReader` writes nothing to disk, not even temporary files. Figures load
   lazily (`figure.read_bytes()`); write them with `PDFWriter`.
+- Each page has a `page_image`. A digital or hybrid page's is drawn at the
+  reader's `dpi` only when you read it (`page.page_image.read_bytes()`, a PNG);
+  a scanned page's is the image OCR read. An error page has none, nor does a
+  page too large to draw (a warning on the page says so).
+- A heading's `level` (1 to 6) is ranked over the whole document by its font
+  size and boldness (`font_size_pt`, `is_bold`), largest first, so a level
+  means the same prominence on every page. Hidden headings never shift it.
 - The PDF is read on first use, then cached for the reader's life. Errors in the
   arguments are raised at construction: a missing path raises
   `FileNotFoundError`; a file that isn't a PDF raises `ValueError`.
