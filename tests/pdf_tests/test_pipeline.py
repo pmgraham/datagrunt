@@ -32,6 +32,7 @@ from datagrunt.pdf import (
     PDFEncryptedError,
     _page_worker,
     _process,
+    _source,
     pdfium_engine,
     pipeline,
 )
@@ -464,7 +465,7 @@ def noise_png(width: int, height: int) -> bytes:
 
 
 def digest_that_then(change):
-    """A stand-in for pipeline's ``hashlib``: its sha256 hashes as hashlib's does, and calls ``change()`` once, after
+    """A stand-in for _source's ``hashlib``: its sha256 hashes as hashlib's does, and calls ``change()`` once, after
     the first chunk it is given (the reads stay the real reads of the real file)."""
     real = hashlib.sha256
     done: list[bool] = []
@@ -488,6 +489,11 @@ def digest_that_then(change):
 def identity_of(path) -> SourceIdentity:
     status = os.stat(path)
     return SourceIdentity(device=status.st_dev, inode=status.st_ino, size=status.st_size, mtime_ns=status.st_mtime_ns)
+
+
+def sha256_of(path) -> str:
+    """The SHA-256 of the bytes of the file at ``path`` now."""
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def append_in_place(path) -> None:
@@ -621,6 +627,10 @@ class TestPipelineOptions:
             options.workers = 2  # type: ignore[misc]
 
 
+# A source identity that names no file: a PDFSource's fields checked at construction.
+SOME_IDENTITY = SourceIdentity(device=1, inode=2, size=3, mtime_ns=4)
+
+
 class TestPDFSource:
     """Where a worker opens the document: an absolute path, and the password (never shown)."""
 
@@ -652,6 +662,24 @@ class TestPDFSource:
                 "password must not contain NUL: pdfium would read only the part before it",
                 id="pw-nul",
             ),
+            pytest.param(
+                {"path": "doc.pdf", "identity": SOME_IDENTITY, "sha256": "F" * 64},
+                ValueError,
+                f"sha256 must be 64 lowercase hex characters, got {'F' * 64!r}",
+                id="sha256",
+            ),
+            pytest.param(
+                {"path": "doc.pdf", "identity": SOME_IDENTITY},
+                ValueError,
+                "identity and sha256 must both be given or both be None, got only the identity",
+                id="no-sha256",
+            ),
+            pytest.param(
+                {"path": "doc.pdf", "sha256": "0" * 64},
+                ValueError,
+                "identity and sha256 must both be given or both be None, got only the sha256",
+                id="no-identity",
+            ),
         ],
     )
     def test_bad_fields_raise(self, fields, error, message):
@@ -663,6 +691,15 @@ class TestPDFSource:
             PDFSource(path=os.devnull, password=b"s3cret")
 
         assert "s3cret" not in str(caught.value)
+
+    def test_its_identity_and_sha256_reach_the_page_worker(self, tmp_path):
+        source = PDFSource(path=tmp_path / "doc.pdf", identity=SOME_IDENTITY, sha256="0" * 64)
+
+        payload = pipeline._chunk_payload(source, (0, 1), 1, PipelineOptions())
+        request = pipeline._chunk_request(json.loads(json.dumps(payload)))
+
+        assert (request.source.identity, request.source.sha256) == (SOME_IDENTITY, "0" * 64)
+        assert request.source == source
 
 
 class TestExtractPageAt:
@@ -750,6 +787,8 @@ class TestExtractPageAt:
         assert kwargs == {
             "source": path,
             "password": "pw",
+            "identity": None,  # page_at's source has none: the worker passes its source's
+            "sha256": None,
             "min_image_dimension": 32,
             "options": VisionOptions(vision_dpi=250, max_render_pixels=1_000_000),
         }
@@ -768,6 +807,8 @@ class TestExtractPageAt:
         assert kwargs == {
             "source": path,
             "password": "pw",
+            "identity": None,  # page_at's source has none: the worker passes its source's
+            "sha256": None,
             "ocr": ocr,
             "options": VisionOptions(vision_dpi=250, max_render_pixels=1_000_000),
         }
@@ -898,6 +939,19 @@ class TestPageIsolation:
         assert page.warnings[0].startswith(
             f"extraction failed at stage 'text': {TEXT_FAILURE}; the page was read by OCR"
         )
+
+    def test_a_failed_text_stages_page_image_holds_the_source_identity_and_sha256(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [PageSpec(width=400.0, height=300.0, items=body_text(100.0))])
+        monkeypatch.setattr(pdfium_c, "FPDFText_CountChars", failing(-1))
+        identity, digest = identity_of(path), sha256_of(path)
+
+        page = extract_page_at(PDFSource(path=path, identity=identity, sha256=digest), 0, PipelineOptions())
+
+        image = page.page_image
+        assert page.route == "vision" and page.status in ("ocr_fallback", "error")  # "error" without tesseract
+        owners = (image._loader.__self__, image._band_loader.__self__)
+        found = [(type(owner).__name__, owner.identity, owner.sha256) for owner in owners]
+        assert found == [("PageRender", identity, digest)] * 2
 
     def test_a_failed_text_stage_without_tesseract_is_an_error_page_of_the_pages_own_size(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "doc.pdf", [PageSpec(width=400.0, height=300.0, items=body_text(100.0))])
@@ -1286,9 +1340,9 @@ class TestExtractDocument:
     def test_the_hash_is_streamed_in_bounded_chunks(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
         reads: list[int] = []
-        monkeypatch.setattr(pipeline, "_HASH_CHUNK_BYTES", 1000)
-        real_read = pipeline._read_chunk
-        monkeypatch.setattr(pipeline, "_read_chunk", lambda stream, size: reads.append(size) or real_read(stream, size))
+        monkeypatch.setattr(_source, "_HASH_CHUNK_BYTES", 1000)
+        real_read = _source._read_chunk
+        monkeypatch.setattr(_source, "_read_chunk", lambda stream, size: reads.append(size) or real_read(stream, size))
 
         metadata = extract_document(path).metadata
 
@@ -1299,7 +1353,7 @@ class TestExtractDocument:
 
     def test_a_file_that_shrinks_while_it_is_hashed_fails_loud(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
-        monkeypatch.setattr(pipeline, "_read_chunk", lambda stream, size: b"")
+        monkeypatch.setattr(_source, "_read_chunk", lambda stream, size: b"")
 
         message = f"{path} changed while it was hashed: 0 of its {path.stat().st_size} bytes could be read"
         with pytest.raises(PDFSourceChangedError, match=re.escape(message)):
@@ -1311,8 +1365,8 @@ class TestExtractDocument:
         noise = RasterImage(72.0, 400.0, 200.0, 150.0, noise_png(800, 600))
         path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=(*mixed_page().items, noise))])
         size = path.stat().st_size
-        assert size > pipeline._HASH_CHUNK_BYTES == 1 << 20
-        monkeypatch.setattr(pipeline, "hashlib", digest_that_then(lambda: os.truncate(path, 0)))
+        assert size > _source._HASH_CHUNK_BYTES == 1 << 20
+        monkeypatch.setattr(_source, "hashlib", digest_that_then(lambda: os.truncate(path, 0)))
 
         with pytest.raises(PDFSourceChangedError) as caught:
             extract_document(path)
@@ -1324,8 +1378,8 @@ class TestExtractDocument:
         # opens it. Its open fails, but on a file that is not the one hashed: that is what is said.
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
         size = path.stat().st_size
-        monkeypatch.setattr(pipeline, "_HASH_CHUNK_BYTES", 256)
-        monkeypatch.setattr(pipeline, "hashlib", digest_that_then(lambda: os.truncate(path, 0)))
+        monkeypatch.setattr(_source, "_HASH_CHUNK_BYTES", 256)
+        monkeypatch.setattr(_source, "hashlib", digest_that_then(lambda: os.truncate(path, 0)))
 
         with pytest.raises(PDFSourceChangedError) as caught:
             extract_document(path)
@@ -1336,8 +1390,8 @@ class TestExtractDocument:
         # The hash reads the size the file had when it was opened; the growth is caught when pdfium opens it.
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
         before = identity_of(path)
-        monkeypatch.setattr(pipeline, "_HASH_CHUNK_BYTES", 256)
-        monkeypatch.setattr(pipeline, "hashlib", digest_that_then(lambda: append_in_place(path)))
+        monkeypatch.setattr(_source, "_HASH_CHUNK_BYTES", 256)
+        monkeypatch.setattr(_source, "hashlib", digest_that_then(lambda: append_in_place(path)))
 
         with pytest.raises(PDFSourceChangedError) as caught:
             extract_document(path)
@@ -1401,6 +1455,10 @@ class TestExtractDocument:
     def test_a_missing_file_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             extract_document(tmp_path / "missing.pdf")
+
+    def test_a_source_that_is_not_a_regular_file_raises(self, tmp_path):
+        with pytest.raises(ValueError, match=f"^source is not a regular file: {re.escape(str(tmp_path))}$"):
+            extract_document(tmp_path)
 
     def test_a_file_that_is_no_pdf_raises(self, tmp_path):
         path = tmp_path / "notes.pdf"
@@ -2249,7 +2307,7 @@ class TestSourceIdentity:
         other = build_pdf(tmp_path / "other.pdf", [PageSpec(items=body_text(100.0))])
         os.utime(path, ns=(os.stat(other).st_atime_ns, os.stat(other).st_mtime_ns))
         stale = identity_of(other)
-        source = PDFSource(path=path, identity=stale)
+        source = PDFSource(path=path, identity=stale, sha256=sha256_of(other))
 
         with pytest.raises(PDFSourceChangedError) as caught:
             extract_page_at(source, 0, PipelineOptions())
@@ -2271,7 +2329,7 @@ class TestSourceIdentity:
         monkeypatch.setattr(_page_worker, "_isolated_page", then_swap)
 
         with pytest.raises(PDFSourceChangedError) as caught:
-            extract_page_at(PDFSource(path=path, identity=before), 0, PipelineOptions())
+            extract_page_at(PDFSource(path=path, identity=before, sha256=sha256_of(path)), 0, PipelineOptions())
 
         when = "by the time page 1 was extracted"
         assert str(caught.value) == changed(path, when, before, identity_of(path), "inode")

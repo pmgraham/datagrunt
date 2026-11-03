@@ -98,7 +98,9 @@ With ``overwrite``, a bundle there is first renamed aside, to ``.old_<uuid4
 hex>`` beside it; the staging directory is renamed in, and the old bundle
 removed. If that second rename fails, the old bundle is renamed back. On
 any failure before the swap, an interrupt included, the staging directory
-is removed and the error raised, and an old bundle is untouched. A writer
+is removed and the error raised, and an old bundle is untouched; one after
+the rename (an interrupt) is raised as it is, the new bundle in place (with
+``overwrite``, the old bundle may be left aside as ``.old_<hex>``). A writer
 killed outright leaves its staging directory (or, between the two
 renames, the old bundle aside), the only trace: never a half-written
 ``output_dir``; the next write makes its own and ignores it. If removing
@@ -144,7 +146,15 @@ to that file (:func:`_unbound`): each renders from ``source`` itself
 verifying reader. One that renders from another file, names no source, or
 an image with no loader is not read: the page has no page image, a
 ``missing`` entry says why, and a ``UserWarning`` is emitted once the
-bundle is published. A figure is bound the same way
+bundle is published. A ``PageRender`` or ``PageDraw`` draws only a file
+whose bytes are its document's (#453; :mod:`datagrunt.pdf._loaders`): a
+file of the identity it holds at once, a file of another identity once it
+hashes to its sha256. The source hashed here to the document's sha256 is
+such a file, so the write draws through a copy of each loader bound to the
+document's bytes, holding the identity taken with the hash
+(:func:`_draws_bound`): a source touched or rewritten with those same bytes
+(another inode, another mtime) is drawn, and the write hashes its source
+once, never again a page. A figure is bound the same way
 (:func:`_figure_unbound`): its PNG loader reads from ``source`` (A5a's
 ``FigureRead``) or is a bundle's verifying reader. A figure with no loader
 (a bare ``image_path``, which would be read unverified, whatever file it
@@ -224,13 +234,15 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from itertools import islice
 from pathlib import Path
+from types import MethodType
 from typing import IO, BinaryIO, NamedTuple, TypeVar, cast
 
 import polars as pl
 from PIL import Image
 
 import datagrunt
-from datagrunt.pdf._loaders import PageDraw, figure_pngs
+from datagrunt.pdf._loaders import PageDraw, PageRender, figure_pngs
+from datagrunt.pdf._source import SourceIdentity, _opened_source, _stream_sha256
 from datagrunt.pdf._validate import checked_path as _checked_path
 from datagrunt.pdf._validate import (
     choice_str,
@@ -252,7 +264,7 @@ from datagrunt.pdf.codec import (
 from datagrunt.pdf.elements import _MAX_ASSET_BYTES, Figure, Page, PageImage, PDFDocument
 from datagrunt.pdf.exceptions import BundleCorruptError, DatagruntPDFError, PDFSourceChangedError
 from datagrunt.pdf.frame import element_frame, utf8_text
-from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, SourceIdentity, _opened_source, _stream_sha256
+from datagrunt.pdf.pipeline import PDFSource, PipelineOptions
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page
 
 __all__ = ["BUNDLE_FORMAT_VERSION", "load_bundle", "write_bundle"]
@@ -401,8 +413,8 @@ def write_bundle(
         TypeError, ValueError: If an option is invalid (as ``PipelineOptions``
             raises it), an extraction parameter is (:func:`_checked_params`),
             ``document`` is not a PDFDocument, ``overwrite`` is not a bool,
-            ``output_dir`` or ``source`` is not a path, or ``source`` does not
-            hash to the document's sha256.
+            ``output_dir`` or ``source`` is not a path, or ``source`` is not a
+            regular file or does not hash to the document's sha256.
         FileExistsError: If ``output_dir`` is a file, a symlink or a
             non-empty directory holding no bundle; or holds a bundle that is
             not this write's and ``overwrite`` is False (before or after the
@@ -424,6 +436,7 @@ def write_bundle(
     target = _checked_target(output_dir)
     pdf = PDFSource(path=_checked_path(source, "source"), password=password)
     identity = _check_source(pdf, document.metadata.sha256)
+    pdf = dataclasses.replace(pdf, identity=identity, sha256=document.metadata.sha256)  # the file hashed
     reused = _reused(target, document, params, replace)
     if reused is not None:
         return reused
@@ -434,7 +447,8 @@ def write_bundle(
         _check_unchanged(pdf, identity)
         aside = _publish(staging, target, replace)
     except BaseException:
-        shutil.rmtree(staging)
+        if os.path.lexists(staging):  # gone once _publish renamed it: the error raised is the one to keep
+            shutil.rmtree(staging)
         raise
     if aside is not None:
         shutil.rmtree(aside)
@@ -810,6 +824,7 @@ def _page_outcome(page: Page, staging: Path, source: PDFSource, options: Pipelin
     image = page.page_image
     if image is None:
         return _rendered_outcome(page, staging, source, options)
+    image = _draws_bound(image, source)
     if _page_draw(image) is None:
         return _own_outcome(image, staging, source)
     try:
@@ -836,6 +851,40 @@ def _at_write_dpi(image: PageImage, page: Page, options: PipelineOptions) -> Pag
     redrawn = dataclasses.replace(draw, dpi=dpi)
     width, height = redrawn.size
     return dataclasses.replace(image, dpi=float(dpi), width_px=width, height_px=height, _loader=redrawn.png_bytes)
+
+
+def _draws_bound(image: PageImage, source: PDFSource) -> PageImage:
+    """``image`` whose PageDraw or PageRender loaders draw through the file this write hashed, by its identity.
+
+    The write hashed the file at the source to the document's sha256 and took
+    its identity with the hash (:func:`_check_source`): a loader bound to the
+    document's bytes under another identity (the file it was extracted from,
+    since touched or rewritten with the same bytes) is bound to that identity
+    on a copy, so each draw takes the identity's fast path instead of hashing
+    the file again. Any other loader, and an image with none, is as it is.
+    """
+    loader, bands = _rebound(image._loader, source), _rebound(image._band_loader, source)
+    if loader is image._loader and bands is image._band_loader:
+        return image
+    return dataclasses.replace(image, _loader=loader, _band_loader=bands)
+
+
+def _rebound(loader: Callable[[], _T] | None, source: PDFSource) -> Callable[[], _T] | None:
+    """``loader`` on a copy of its owner that holds the hashed file's identity, if it needs one; else ``loader``.
+
+    It needs one when it is a PageDraw's or PageRender's method bound to the
+    document's bytes (the source's sha256) under another identity. A loader
+    bound to other bytes, or to none (it checks nothing), is left as it is.
+    """
+    owner = getattr(loader, "__self__", None)
+    if not isinstance(owner, (PageDraw, PageRender)) or owner.sha256 != source.sha256:
+        return loader
+    if owner.identity == source.identity:
+        return loader
+    method: Callable[[], _T] = MethodType(
+        getattr(loader, "__func__"), dataclasses.replace(owner, identity=source.identity)
+    )
+    return method
 
 
 def _rendered_outcome(page: Page, staging: Path, source: PDFSource, options: PipelineOptions) -> _PageOutcome:

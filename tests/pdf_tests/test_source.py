@@ -1,4 +1,4 @@
-"""Tests for the v5 source-file check (#371): ``datagrunt.pdf._source.checked_pdf_file``.
+"""Tests for the v5 source-file check (#371): ``datagrunt.pdf._source.checked_pdf_file``; and ``_opened_source`` (#453).
 
 PDFs are ReportLab builds (``pdf_tests.builders``); a header after leading
 junk is that build with bytes put before it. Where the check claims to agree
@@ -6,8 +6,10 @@ with pdfium, pdfium (pypdfium2) opens the same file in the test.
 """
 
 import os
+import re
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import pypdfium2 as pdfium
@@ -223,3 +225,99 @@ class TestRead:
             checked_pdf_file(path, "source")
         monkeypatch.undo()
         assert len(opened) == 1 and closed == opened
+
+
+def promptly(call: Callable[[], object], pipe: Path) -> BaseException | None:
+    """What ``call()`` raised (None if it returned), run in a thread given 10 s: a call still blocked fails the test.
+
+    A call blocked opening the named pipe ``pipe`` for reading is let go first (the pipe opened for writing, held
+    until the call ends), so no thread is left blocked.
+    """
+    raised: list[BaseException | None] = []
+
+    def run() -> None:
+        try:
+            returned = call()
+        except Exception as exc:
+            raised.append(exc)
+            return
+        raised.append(None)
+        if hasattr(returned, "close"):
+            returned.close()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(10.0)
+    if not thread.is_alive():
+        return raised[0]
+    writer = os.open(pipe, os.O_WRONLY | os.O_NONBLOCK)  # a reader blocked opening it holds it open: this succeeds
+    try:
+        thread.join(10.0)
+    finally:
+        os.close(writer)
+    pytest.fail(f"opening the named pipe {pipe} blocked")
+
+
+def stat_of_a_regular_file_at(monkeypatch, path: Path, regular: Path) -> None:
+    """Make ``os.stat`` of ``path`` (``is_file``'s too) see the regular file ``regular``: what is there came later."""
+    real = os.stat
+
+    def stat(target, *args, **kwargs):
+        named = isinstance(target, (str, os.PathLike)) and Path(target) == path
+        return real(regular if named else target, *args, **kwargs)
+
+    monkeypatch.setattr(_source.os, "stat", stat)
+
+
+class TestOpenedSource:
+    """``_opened_source``: the source opened once for its hash and identity, as checked_pdf_file opens it (#453)."""
+
+    def test_a_pdf_is_opened_for_reading_as_bytes(self, tmp_path, pdf_bytes):
+        path = tmp_path / "doc.pdf"
+        path.write_bytes(pdf_bytes)
+
+        with _source._opened_source(path) as stream:
+            assert os.fstat(stream.fileno()).st_ino == path.stat().st_ino
+            assert stream.read(5) == pdf_bytes[:5] and stream.read() == pdf_bytes[5:]
+
+    @pytest.mark.parametrize("missing", ["missing.pdf", "file/doc.pdf"], ids=["missing", "through-a-file"])
+    def test_a_missing_path_is_file_not_found(self, tmp_path, missing):
+        (tmp_path / "file").write_bytes(b"x")
+        path = tmp_path / missing
+
+        with pytest.raises(FileNotFoundError, match="not an existing file") as caught:
+            _source._opened_source(path)
+        assert caught.value.filename == str(path)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="a directory does not open for reading on Windows")
+    def test_a_directory_is_refused_and_its_descriptor_closed(self, tmp_path, monkeypatch):
+        opened, closed = [], []
+        real_open, real_close = os.open, os.close
+
+        def spy_open(target, flags, *args):
+            opened.append(real_open(target, flags, *args))
+            return opened[-1]
+
+        def spy_close(descriptor):
+            closed.append(descriptor)
+            real_close(descriptor)
+
+        monkeypatch.setattr(_source.os, "open", spy_open)
+        monkeypatch.setattr(_source.os, "close", spy_close)
+        with pytest.raises(ValueError, match=f"^source is not a regular file: {re.escape(str(tmp_path))}$"):
+            _source._opened_source(tmp_path)
+        monkeypatch.undo()
+        assert len(opened) == 1 and closed == opened
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="no named pipes as files on Windows")
+    def test_a_named_pipe_put_at_the_path_after_its_stat_is_refused_without_blocking(
+        self, tmp_path, monkeypatch, pdf_bytes
+    ):
+        pipe, regular = tmp_path / "doc.pdf", tmp_path / "regular.pdf"
+        regular.write_bytes(pdf_bytes)
+        os.mkfifo(pipe)
+        stat_of_a_regular_file_at(monkeypatch, pipe, regular)
+
+        raised = promptly(lambda: _source._opened_source(pipe), pipe)
+
+        assert isinstance(raised, ValueError) and str(raised) == f"source is not a regular file: {pipe}"

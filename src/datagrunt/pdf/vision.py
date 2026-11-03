@@ -156,6 +156,7 @@ from typing import NamedTuple
 from datagrunt.pdf._loaders import PageRender, _checked_turn
 from datagrunt.pdf._options import VisionOptions
 from datagrunt.pdf._pdfium_common import Box, union_box
+from datagrunt.pdf._source import SourceIdentity, check_binding
 from datagrunt.pdf._validate import choice_str, typed_tuple
 from datagrunt.pdf.assembly import (
     MIN_IMAGE_DIMENSION,
@@ -504,6 +505,8 @@ def vision_page(
     *,
     source: str | os.PathLike[str],
     password: str | None = None,
+    identity: SourceIdentity | None = None,
+    sha256: str | None = None,
     min_image_dimension: int = MIN_IMAGE_DIMENSION,
     options: VisionOptions = VisionOptions(),
 ) -> Page:
@@ -514,15 +517,23 @@ def vision_page(
         assessment: A3's assessment of it, routed ``"vision"``.
         source: The PDF the page was read from: it is rendered again from it.
         password: The PDF's password, or None.
+        identity: The identity of the file at ``source`` the document was
+            extracted from (the pipeline's); given with ``sha256`` or not at
+            all.
+        sha256: The document's sha256: the page image's draws refuse a file
+            at ``source`` whose bytes are not the document's (both None
+            check nothing).
         min_image_dimension: The least pixel side of a figure (A4b's).
         options: How the page is rendered and read.
 
     Raises:
         TypeError: If an argument is of the wrong type.
         ValueError: If ``assessment`` is not of ``raw_page``, or does not
-            route it to vision.
+            route it to vision, or only one of ``identity`` and ``sha256``
+            is given.
     """
     check_assessment(raw_page, assessment)
+    check_binding(identity, sha256)
     if assessment.route != "vision":
         raise ValueError(f"assessment routes the page {assessment.route!r}, not 'vision': assemble_page lays it out")
     if not isinstance(options, VisionOptions):
@@ -530,12 +541,13 @@ def vision_page(
     geometry = raw_page.geometry
     deadline = time.monotonic() + options.page_budget_s
     drawn = _drawn(source, geometry, password, options, deadline)
+    where = _Where(source, password, identity, sha256)
     if drawn.page is None:
-        return _unread(raw_page, assessment, drawn.failure, None, source, password, min_image_dimension)
+        return _unread(raw_page, assessment, drawn.failure, None, where, min_image_dimension)
     reading = _read(drawn.page, drawn.dpi, geometry, options, deadline)
-    image = _page_image(drawn.page, drawn.dpi, reading.rotation, geometry, source, password, options)
+    image = _page_image(drawn.page, drawn.dpi, reading.rotation, geometry, where, options)
     if reading.failure:
-        return _unread(raw_page, assessment, reading.failure, image, source, password, min_image_dimension)
+        return _unread(raw_page, assessment, reading.failure, image, where, min_image_dimension)
     figures = page_figures(
         raw_page.images, geometry, source=source, password=password, min_image_dimension=min_image_dimension
     )
@@ -559,6 +571,15 @@ def vision_page(
         page_image=image,
         warnings=warnings,
     )
+
+
+class _Where(NamedTuple):
+    """The PDF a page image is drawn from: its path, its password, and the identity and sha256 of the file read."""
+
+    source: str | os.PathLike[str]
+    password: str | None
+    identity: SourceIdentity | None
+    sha256: str | None
 
 
 class _Drawn(NamedTuple):
@@ -659,19 +680,20 @@ def _page_image(
     dpi: int,
     rotation: int,
     geometry: PageGeometry,
-    source: str | os.PathLike[str],
-    password: str | None,
+    where: _Where,
     options: VisionOptions,
 ) -> PageImage:
     """The page's lazy image: the render's size as displayed, its loaders a :class:`PageRender` (no pixels held)."""
     loader = PageRender(
-        source=Path(source),
+        source=Path(where.source),
         page_index=geometry.page_number - 1,
         dpi=dpi,
         rotation=rotation,
-        password=password,
+        password=where.password,
         memory_cap_bytes=options.memory_cap_bytes,
         timeout_s=options.render_timeout_s,
+        identity=where.identity,
+        sha256=where.sha256,
     )
     return PageImage(
         page_number=geometry.page_number,
@@ -694,14 +716,20 @@ def _unread(
     assessment: PageAssessment,
     reason: str,
     image: PageImage | None,
-    source: str | os.PathLike[str],
-    password: str | None,
+    where: _Where,
     min_image_dimension: int,
 ) -> Page:
     """The ``"ocr_unavailable"`` page: assemble_page's of the digital text, the image if rendered, and why."""
     lattice = find_lattice_tables(raw_page.segments.segments, assessment.pieces)
     page = assemble_page(
-        raw_page, assessment, lattice, source=source, password=password, min_image_dimension=min_image_dimension
+        raw_page,
+        assessment,
+        lattice,
+        source=where.source,
+        password=where.password,
+        identity=where.identity,
+        sha256=where.sha256,
+        min_image_dimension=min_image_dimension,
     )
     return dataclasses.replace(
         page, page_image=image, warnings=(*page.warnings, f"OCR could not read the page: {reason}")
@@ -714,6 +742,8 @@ def fallback_page(
     *,
     source: str | os.PathLike[str],
     password: str | None = None,
+    identity: SourceIdentity | None = None,
+    sha256: str | None = None,
     ocr: OcrMode = "auto",
     options: VisionOptions = VisionOptions(),
 ) -> Page:
@@ -724,14 +754,22 @@ def fallback_page(
         failure: A2's ``PageFailure`` of the page.
         source: The PDF's path: the page is rendered from it.
         password: The PDF's password, or None.
+        identity: The identity of the file at ``source`` the document was
+            extracted from (the pipeline's); given with ``sha256`` or not at
+            all.
+        sha256: The document's sha256: the page image's draws refuse a file
+            at ``source`` whose bytes are not the document's (both None
+            check nothing).
         ocr: The reader's OCR option: ``"never"`` reads nothing by OCR.
         options: How the page is rendered and read.
 
     Raises:
-        TypeError, ValueError: If an argument is of the wrong type or value.
+        TypeError, ValueError: If an argument is of the wrong type or value
+            (only one of ``identity`` and ``sha256`` given, say).
         IndexError: If ``failure`` names a page the document does not have.
     """
     _check_fallback(handle, failure, ocr, options)
+    check_binding(identity, sha256)
     failed = f"extraction failed at stage {failure.stage!r}: {failure.message}"
     try:
         geometry = page_geometry(handle, failure.page_number - 1)
@@ -745,7 +783,8 @@ def fallback_page(
     if drawn.page is None:
         return _error_page(failure.page_number, geometry, _Unread(f"{failed}; {drawn.failure}"))
     reading = _read(drawn.page, drawn.dpi, geometry, options, deadline)
-    image = _page_image(drawn.page, drawn.dpi, reading.rotation, geometry, source, password, options)
+    where = _Where(source, password, identity, sha256)
+    image = _page_image(drawn.page, drawn.dpi, reading.rotation, geometry, where, options)
     if reading.failure:
         why = f"{failed}; OCR could not read the page: {reading.failure}"
         return _error_page(failure.page_number, geometry, _Unread(why, reading.notes, image))

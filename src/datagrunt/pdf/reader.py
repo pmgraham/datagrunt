@@ -46,7 +46,12 @@ use (the first property or method that needs the document), then cached
 for the reader's life. Text and layout are read then, eagerly; a figure's
 and a page image's bytes stay lazy, read only through their A1 loaders
 (``Figure.read_bytes``, ``PageImage.read_bytes``: a bundle's verifying
-reader, a capped figure worker, or A5a's guarded, capped render). A failed extraction or load is
+reader, a capped figure worker, or A5a's guarded, capped render). A page
+image of a PDF is drawn from the file at the source path when it is read:
+that read raises ``PDFSourceChangedError`` when the file there no longer
+holds the document's bytes (its ``metadata.sha256``), or changes while it
+is drawn; a file only touched, or rewritten with the same bytes, is drawn
+(:mod:`datagrunt.pdf._loaders`, #453). A failed extraction or load is
 not cached: the next use tries again. A lock makes the first use
 thread-safe: two threads never extract the same reader's document twice.
 
