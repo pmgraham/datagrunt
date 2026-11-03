@@ -836,13 +836,16 @@ def whole_runs(*pieces: SpanPiece) -> list:
 
 
 class TestReadingTurn:
-    """A cell reads at the one turn its runs with a direction share, else at its table's turn."""
+    """Runs read at the one turn their runs with a direction share, else at the default.
+
+    A table's runs default to across, and a cell's to its table's turn.
+    """
 
     @pytest.mark.parametrize(
         "pieces,default,turn",
         [
             pytest.param((rising("Value", 10.0, 90.0), rising("one", 30.0, 90.0)), 0, 270, id="shared"),
-            # f8's cell: 11 chars rising and a 2-char run across disagree, so the table's turn decides, not chars.
+            # 11 chars rising and a 2-char run across disagree, so the default decides, not chars.
             pytest.param((rising("Value three", 10.0, 90.0), chars("ab", 30.0, 10.0)), 0, 0, id="mixed-is-default"),
             pytest.param((rising("Value three", 10.0, 90.0), chars("ab", 30.0, 10.0)), 270, 270, id="mixed-turned"),
             pytest.param((chars("x", 10.0, 10.0), falling("y", 30.0, 10.0)), 90, 90, id="no-direction-is-default"),
@@ -851,51 +854,6 @@ class TestReadingTurn:
     )
     def test_the_one_turn_the_runs_share_else_the_default(self, pieces, default, turn):
         assert layout._reading_turn(whole_runs(*pieces), default) == turn
-
-
-def cells_of(*cells: tuple[SpanPiece, ...]) -> list:
-    """Each cell's pieces as runs of all their chars."""
-    return [whole_runs(*pieces) for pieces in cells]
-
-
-class TestTableTurn:
-    """A table reads at the one turn its pure cells share (each cell's runs with a direction agree), else across."""
-
-    @pytest.mark.parametrize(
-        "cells,turn",
-        [
-            pytest.param(((rising("Name", 10.0, 90.0),), (rising("Value", 60.0, 90.0),), ()), 270, id="pure-agree-up"),
-            pytest.param(((falling("Name", 10.0, 10.0),), (falling("Value", 60.0, 10.0),)), 90, id="pure-agree-down"),
-            # A vertical header over a 2-char number: each cell is pure, but they disagree.
-            pytest.param(((rising("Respondents", 10.0, 90.0),), (chars("12", 60.0, 10.0),)), 0, id="pure-disagree"),
-            # f8's table: the mixed cell has no say, so its 2-char run across does not turn the table back.
-            pytest.param(
-                ((rising("Name one", 10.0, 90.0),), (rising("Value three", 60.0, 90.0), chars("ab", 70.0, 10.0))),
-                270,
-                id="mixed-ignored",
-            ),
-            # Nor does the mixed cell's longer text: the one pure cell, 4 chars falling, decides.
-            pytest.param(
-                ((falling("Name", 10.0, 10.0),), (rising("Value three", 60.0, 90.0), chars("ab", 70.0, 10.0))),
-                90,
-                id="mixed-majority-ignored",
-            ),
-        ],
-    )
-    def test_the_one_turn_the_pure_cells_share(self, cells, turn):
-        assert layout._table_turn(cells_of(*cells)) == turn
-
-    @pytest.mark.parametrize(
-        "cells",
-        [
-            pytest.param((), id="no-cells"),
-            pytest.param(((), ()), id="blank-cells"),
-            pytest.param(((chars("x", 10.0, 10.0),), (falling("y", 60.0, 10.0),)), id="no-direction"),
-            pytest.param(((rising("Value three", 10.0, 90.0), chars("ab", 30.0, 10.0)),), id="only-mixed"),
-        ],
-    )
-    def test_no_pure_cell_reads_across(self, cells):
-        assert layout._table_turn(cells_of(*cells)) == layout._ACROSS
 
 
 def read_tables(tmp_path, *items, rotate: int = 0) -> LatticeResult:
@@ -974,11 +932,6 @@ def raw_table(tmp_path, xs, ys, text: bytes) -> LatticeResult:
     return find_lattice_tables(page.segments.segments, assess_page(page).pieces)
 
 
-def turned_table(tmp_path, extra: bytes = b"") -> LatticeResult:
-    """find_lattice_tables over the turned grid, then ``extra``."""
-    return raw_table(tmp_path, TURNED_XS, TURNED_YS, b"".join(up(*item) for item in TURNED_TEXT) + extra)
-
-
 # A feature matrix: a label column and 5 product columns; 3 body rows under a tall header row (PDF y 130-270). Product
 # names are set up the page in the header, row labels across, and the body holds one-char marks.
 MATRIX_XS, MATRIX_YS = (20, 120, 160, 200, 240, 280, 320), (40, 70, 100, 130, 270)
@@ -1003,6 +956,34 @@ SURVEY_TEXT = b"".join(up(b"Respondents", x + 55, 168, size=10) for x in SURVEY_
     for col, number in enumerate(numbers)
 )
 SURVEY_GRID = (("Respondents",) * 3, ("12", "34", "56"), ("78", "90", "11"))
+
+# A feature matrix with no row labels: a column of one-char row numbers and 3 product columns of one-char marks, under
+# a tall header row (PDF y 130-270) of product names set up the page; the first header cell also holds "(beta)" across.
+BETA_XS, BETA_YS = (20, 120, 160, 200, 240), (40, 70, 100, 130, 270)
+BETA_TEXT = (
+    b"".join(up(b"Product " + name, x + 25, 150, size=10) for name, x in zip((b"A", b"B", b"C"), BETA_XS[1:-1]))
+    + across(b"(beta)", BETA_XS[1] + 3, 136, size=6)
+    + b"".join(
+        b"".join(across(b"x", x + 16, y, size=10) for x in BETA_XS[1:-1]) + across(b"1", 30, y, size=9)
+        for y in (50, 80, 110)
+    )
+)
+BETA_GRID = (("", "Product A (beta)", "Product B", "Product C"), *(("1", "x", "x", "x"),) * 3)
+
+# Three columns: a header row (PDF y 160-200) of words set up the page, the first running down into the body cell
+# below it, which holds a 2-char number across; the other body cells hold one-char numbers.
+SPILL_XS, SPILL_YS = (40, 140, 240, 340), (40, 100, 160, 200)
+SPILL_TEXT = (
+    up(b"Respondents surveyed", 95, 110, size=10)
+    + up(b"Share", 195, 168, size=10)
+    + up(b"Delta", 295, 168, size=10)
+    + b"".join(
+        across(number, x, y, size=9)
+        for y, numbers in ((120, (b"12", b"5", b"7")), (60, (b"8", b"9", b"3")))
+        for x, number in zip((60, 160, 260), numbers)
+    )
+)
+SPILL_GRID = (("ts survey", "Share", "Delta"), ("12 Responden", "5", "7"), ("8", "9", "3"))
 
 
 XS, YS = (50.0, 150.0, 250.0, 350.0), (40.0, 60.0, 80.0, 100.0)
@@ -1102,23 +1083,15 @@ class TestFindLatticeTables:
 
         assert result.tables[0].grid() == tuple(tuple(reversed(row)) for row in reversed(SPEC_GRID))
 
-    @pytest.mark.parametrize(
-        "extra,last",
-        [
-            pytest.param(b"", "Value three", id="all-turned"),
-            # A 2-char run across in the last cell besides its turned text: a mixed cell, which has no say (#453).
-            pytest.param(across(b"ab", 300, 200, size=8), "Value three ab", id="one-short-run-across"),
-        ],
-    )
-    def test_a_table_drawn_turned_reads_along_its_text_with_a_short_run_across(self, tmp_path, extra, last):
-        result = turned_table(tmp_path, extra)
+    def test_a_table_drawn_turned_reads_along_its_text(self, tmp_path):
+        result = raw_table(tmp_path, TURNED_XS, TURNED_YS, b"".join(up(*item) for item in TURNED_TEXT))
 
         assert [(table.turn, table.grid()) for table in result.tables] == [
-            (270, (("Name one", "Value one"), ("Name two", "Value two"), ("Name three", last)))
+            (270, (("Name one", "Value one"), ("Name two", "Value two"), ("Name three", "Value three")))
         ]
 
     def test_a_table_drawn_turned_with_a_cell_only_across_reads_across(self, tmp_path):
-        # Known limitation, as before #453: a lone "OK" is a pure cell across, which disagrees with the turned ones.
+        # Known limitation (v4 parity, #391): a lone "OK" across disagrees with the turned text.
         text = b"".join(up(*item) for item in TURNED_TEXT[:-1]) + across(b"OK", 300, 200)
 
         result = raw_table(tmp_path, TURNED_XS, TURNED_YS, text)
@@ -1132,16 +1105,20 @@ class TestFindLatticeTables:
         [
             pytest.param(MATRIX_XS, MATRIX_YS, MATRIX_TEXT, MATRIX_GRID, id="feature-matrix-of-one-char-marks"),
             pytest.param(SURVEY_XS, SURVEY_YS, SURVEY_TEXT, SURVEY_GRID, id="2-char-numbers"),
+            pytest.param(BETA_XS, BETA_YS, BETA_TEXT, BETA_GRID, id="a-header-cell-with-a-note-across"),
+            pytest.param(SPILL_XS, SPILL_YS, SPILL_TEXT, SPILL_GRID, id="a-header-running-into-a-2-char-number"),
         ],
     )
     def test_an_upright_table_with_headers_set_up_the_page_reads_across(self, tmp_path, xs, ys, text, grid):
-        # Its header cells are pure up and its label or number cells pure across: they disagree.
+        # Its headers advance up the page and its labels, numbers or a note of two or more chars across: they disagree,
+        # in different cells or in one.
         result = raw_table(tmp_path, xs, ys, text)
 
         assert [(table.turn, table.grid()) for table in result.tables] == [(0, grid)]
 
-    def test_an_upright_table_whose_only_pure_cells_are_headers_set_up_the_page_reads_turned(self, tmp_path):
-        # Known limitation, as before #453: with no row labels, nothing across tells it from a table drawn turned.
+    def test_an_upright_table_whose_only_text_with_a_direction_is_headers_set_up_the_page_reads_turned(self, tmp_path):
+        # Known limitation (v4 parity, #391): with no text across of two or more chars, nothing tells it from a table
+        # drawn turned.
         result = raw_table(tmp_path, MATRIX_XS, MATRIX_YS, MATRIX_HEADERS + MATRIX_MARKS)
 
         assert [(table.turn, table.grid()) for table in result.tables] == [
