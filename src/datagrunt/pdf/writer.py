@@ -17,8 +17,10 @@ construction (a later ``chdir`` cannot redirect it). The document stays
 lazy: it is extracted when a method first needs it (A8a's
 :func:`~datagrunt.pdf.pipeline.extract_document`, with the writer's
 options) and cached for the writer's life. A failed extraction is not
-cached: the next call extracts again. A document given as the source is the
-document, never extracted, and no file is checked.
+cached: the next call extracts again. A lock makes the first use
+thread-safe: two threads never extract the same writer's document twice. A
+document given as the source is the document, never extracted, and no file
+is checked.
 
 The writer holds no open file, handle or process between calls (extraction
 and every render close theirs before returning), so there is nothing to
@@ -130,6 +132,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -214,6 +217,7 @@ class PDFWriter:
             strict=strict,
         )
         self._source, self._document = _checked_source(source, password)
+        self._lock = threading.RLock()
 
     def write_json(self, out_filepath: str | os.PathLike[str]) -> Path:
         """Write the document as the codec's JSON at ``out_filepath`` (see the module notes).
@@ -378,9 +382,10 @@ class PDFWriter:
 
     def _extracted(self) -> PDFDocument:
         """The document: the one given, or the source's, extracted on first use and cached."""
-        if self._document is None:
-            self._document = _extract(self._required_source("extraction"), self._options)
-        return self._document
+        with self._lock:
+            if self._document is None:
+                self._document = _extract(self._required_source("extraction"), self._options)
+            return self._document
 
     def _required_source(self, method: str) -> PDFSource:
         """The source PDF, which ``method`` reads; a writer built from a PDFDocument has none."""
