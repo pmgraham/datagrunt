@@ -409,6 +409,16 @@ INVOICE = ("Invoice Details", "Invoice Date: 2026-01-15", "Payment Terms: Net 30
 INVOICE_PAIRS = [("key_value", "Invoice Date", "2026-01-15"), ("key_value", "Payment Terms", "Net 30")]
 # A line of body text set apart under the block.
 PAGE_BODY = "Body text of the page that is long enough to read as a digital page here."
+# One block of prose wrapped over 4 lines, two of them shaped as pairs mid-sentence (#456).
+WRAPPED_PROSE = (
+    "When the round starts, each player in turn and the",
+    "dealer says: shuffle the deck and deal five cards",
+    "to each player; the next one says: draw one card",
+    "and play then continues clockwise round the table.",
+)
+# A lead-in over three pairs, the first's value wrapped onto the line after it (#456).
+SHIP_TO = ("Invoice Details", "Ship To: 1 Harbour Road, Leith, by the", "Docks", *INVOICE[1:])
+SHIP_TO_PAIRS = [("key_value", "Ship To", "1 Harbour Road, Leith, by the Docks"), *INVOICE_PAIRS]
 
 
 def stacked(*texts: str) -> TextBlock:
@@ -514,6 +524,69 @@ class TestKeyValueRuns:
             INVOICE_PAIRS[0],
             ("key_value", "Ship To", "1 Harbour Road, Leith Edinburgh EH6"),
         ]
+
+    @pytest.mark.parametrize(
+        "texts",
+        [
+            # 6 pt chars: each line ends within a word of the block's end (x 310), ending no clause.
+            pytest.param(WRAPPED_PROSE, id="two-pair-shaped-lines-mid-sentence"),
+            # The prose ran onto "dealer says: ..."; "Bob says: ..." starts a line of its own, a run of one.
+            pytest.param(
+                (WRAPPED_PROSE[0], "dealer says: shuffle the deck and deal five cards.", "Bob says: draw one card"),
+                id="no-run-starts-on-a-line-the-prose-ran-onto",
+            ),
+            # "Setup: ..." starts a line of its own, and its sentence runs onto the pair-shaped line after it.
+            pytest.param(
+                (
+                    "Rules of the game",
+                    "Setup: each player in turn and then the dealer says",
+                    "to each player; the next one says: draw one card",
+                ),
+                id="no-run-extends-by-a-line-a-pair-ran-onto",
+            ),
+        ],
+    )
+    def test_a_pair_shaped_line_a_sentence_runs_onto_stays_in_its_paragraph(self, texts):
+        assert described(classify_blocks((stacked(*texts),))) == [("paragraph", " ".join(texts))]
+
+    def test_a_pair_line_under_a_lead_in_that_ends_a_clause_starts_a_line_of_its_own(self):
+        # The lead-in is the block's longest line, so by geometry it wrapped onto "mode: fast"; it ends with a colon.
+        texts = ("Set the options below for the page as follows:", "mode: fast", "level: high")
+
+        assert described(classify_blocks((stacked(*texts),))) == [
+            ("paragraph", texts[0]),
+            ("key_value", "mode", "fast"),
+            ("key_value", "level", "high"),
+        ]
+
+    @pytest.mark.parametrize(
+        "texts,expected",
+        [
+            pytest.param(SHIP_TO, [("paragraph", "Invoice Details"), *SHIP_TO_PAIRS], id="three-pairs"),
+            pytest.param(SHIP_TO[:4], [("paragraph", "Invoice Details"), *SHIP_TO_PAIRS[:2]], id="two-pairs"),
+            pytest.param(SHIP_TO[:3], [("paragraph", " ".join(SHIP_TO[:3]))], id="one-pair-stays-prose"),
+        ],
+    )
+    def test_a_run_counts_pairs_each_with_the_lines_its_value_wraps_onto(self, texts, expected):
+        # 6 pt chars: "Ship To: ..." ends where the block does, at x 238, so "Docks" continues its value.
+        assert described(classify_blocks((stacked(*texts),))) == expected
+
+    @pytest.mark.parametrize(
+        "texts,expected",
+        [
+            pytest.param(WRAPPED_PROSE, [("Paragraph", " ".join(WRAPPED_PROSE))], id="wrapped-prose"),
+            pytest.param(
+                SHIP_TO,
+                [("Paragraph", "Invoice Details"), *(("KeyValue", key, value) for _, key, value in SHIP_TO_PAIRS)],
+                id="a-lead-in-over-a-wrapped-first-pair",
+            ),
+        ],
+    )
+    def test_runs_through_the_reader(self, tmp_path, texts, expected):
+        items = (*lines_of(texts), TextRun(PAGE_BODY, 72.0, 300.0, size=10.0))
+        reader = PDFReader(build_pdf(tmp_path / "runs.pdf", [PageSpec(items=items)]), ocr="never")
+
+        assert [element_fields(item) for item in reader.pages[0].elements] == [*expected, ("Paragraph", PAGE_BODY)]
 
 
 # The 2026-11-02 audit's P2-C case: two lines of prose whose first starts "Operating envelope:", the second wrapped
