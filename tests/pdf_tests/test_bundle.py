@@ -12,6 +12,7 @@ failing stage is a ``monkeypatch`` of the bundle's module name for it.
 import dataclasses
 import hashlib
 import importlib.metadata
+import io
 import json
 import os
 import re
@@ -207,7 +208,7 @@ def manifest_of(out: Path) -> dict:
     return json.loads((out / "manifest.json").read_text(encoding="ascii"))
 
 
-def png_pixels(path: Path) -> tuple[str, tuple[int, int], bytes]:
+def png_pixels(path: Path | io.BytesIO) -> tuple[str, tuple[int, int], bytes]:
     with Image.open(path) as image:
         return image.mode, image.size, image.tobytes()
 
@@ -628,6 +629,21 @@ class TestAtomicWrite:
             write(bound_document(source), tmp_path / "out", source)
         assert stagings(tmp_path) == [] and not (tmp_path / "out").exists()
 
+    def test_an_interrupt_after_the_rename_propagates_as_it_is(self, tmp_path, source, fast_render, monkeypatch):
+        class Interrupted(BaseException):
+            pass
+
+        real = bundle._publish
+
+        def interrupted(staging, target, replace):
+            real(staging, target, replace)
+            raise Interrupted("after the rename")
+
+        monkeypatch.setattr(bundle, "_publish", interrupted)
+        with pytest.raises(Interrupted, match="after the rename"):
+            write(bound_document(source), tmp_path / "out", source)
+        assert (tmp_path / "out" / "manifest.json").is_file() and stagings(tmp_path) == []
+
     def test_an_unexpected_loader_error_fails_the_write_cleanly(self, tmp_path, source, fast_render):
         with pytest.raises(TypeError, match="_loader result must be bytes, got str"):
             write(bound_document(source, lambda: "not bytes"), tmp_path / "out", source)
@@ -700,6 +716,13 @@ class TestValidation:
     def test_a_missing_source_is_refused(self, tmp_path, source, fast_render):
         with pytest.raises(FileNotFoundError):
             write(bound_document(source), tmp_path / "out", tmp_path / "gone.pdf")
+        assert not (tmp_path / "out").exists()
+
+    def test_a_source_that_is_not_a_regular_file_is_refused(self, tmp_path, source, fast_render):
+        directory = tmp_path / "doc.pdf"
+        directory.mkdir()
+        with pytest.raises(ValueError, match=f"^source is not a regular file: {re.escape(str(directory))}$"):
+            write(bound_document(source), tmp_path / "out", directory)
         assert not (tmp_path / "out").exists()
 
     @pytest.mark.parametrize(
@@ -930,6 +953,23 @@ class TestVisionRoute:
             "contrast_normalized": True,
         }
 
+    def test_a_source_rewritten_with_its_own_bytes_writes_the_own_images_and_bands(self, tmp_path):
+        path = build_pdf(
+            tmp_path / "scan.pdf", [PageSpec(items=(TextRun("Bundle the righted bands", 72.0, 120.0, size=24.0),))]
+        )
+        document = extract_document(path, ocr="always")
+        image = document.pages[0].page_image
+        assert isinstance(image._loader.__self__, _loaders.PageRender)
+        own = (image.read_bytes(), image.read_bands())
+        rewritten_in_place(path)
+
+        written = write_bundle(document, tmp_path / "out", source=path)
+
+        mine = written.pages[0].page_image
+        assert manifest_of(tmp_path / "out")["missing"] == []
+        assert (mine.image_path.read_bytes(), tuple(band.read_bytes() for band in mine.band_paths)) == own
+        assert (image.read_bytes(), image.read_bands()) == own  # the document's own loaders: its bytes are there
+
     def test_a_digital_page_still_renders_at_dpi(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "text.pdf", [PageSpec(items=tuple(body_text(100.0)))])
         document = extract_document(path)
@@ -980,6 +1020,13 @@ def without_page_images(document: PDFDocument) -> PDFDocument:
 def contents(root: Path) -> dict[str, bytes]:
     """Every file under ``root`` and its bytes, by relative path."""
     return {path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+
+def rewritten_in_place(path: Path) -> None:
+    """Put another file of ``path``'s own bytes at ``path``: the same sha256, another inode."""
+    copy = path.with_name(f"{path.stem}-copy.pdf")
+    copy.write_bytes(path.read_bytes())
+    os.replace(copy, path)
 
 
 def digital_pdf(directory: Path) -> Path:
@@ -1040,6 +1087,22 @@ class TestDrawnPageImages:
             f"the page was not rendered: RenderFailed: {path}: page {n}: the render worker reached its memory cap"
             for n in (1, 2)
         ]
+
+    @pytest.mark.parametrize("write_dpi", [200, DPI])
+    def test_a_source_rewritten_with_its_own_bytes_writes_the_drawn_images(self, tmp_path, write_dpi):
+        path = digital_pdf(tmp_path)
+        document = extract_document(path)
+        rewritten_in_place(path)
+
+        written = write_bundle(document, tmp_path / "out", source=path, dpi=write_dpi)
+
+        assert manifest_of(tmp_path / "out")["missing"] == []
+        drawn = render_page(path, 0, dpi=write_dpi, memory_cap_bytes=CAP, timeout_s=TIMEOUT)
+        size = (drawn.px_width, drawn.px_height)
+        assert png_pixels(written.pages[0].page_image.image_path) == ("L", size, drawn.pixels)
+        own = render_page(path, 0, dpi=200, memory_cap_bytes=CAP, timeout_s=TIMEOUT)  # the document's own draw's
+        found = png_pixels(io.BytesIO(document.pages[0].page_image.read_bytes()))  # its bytes are there: it draws
+        assert found == ("L", (own.px_width, own.px_height), own.pixels)
 
     def test_a_drawn_image_at_the_writes_dpi_is_read_through_its_own_loader(self, tmp_path, monkeypatch):
         path = digital_pdf(tmp_path)
@@ -1116,6 +1179,62 @@ class TestDrawnPageImages:
         ]
         assert [page.page_image for page in written.pages] == [None, None]
         assert [entry["page_number"] for entry in manifest_of(tmp_path / "out")["missing"]] == [1, 2]
+
+
+def touched(path: Path) -> None:
+    """Move ``path``'s mtime on a second: the same file and bytes, another identity."""
+    status = path.stat()
+    os.utime(path, ns=(status.st_atime_ns, status.st_mtime_ns + 1_000_000_000))
+
+
+def source_hashes(monkeypatch) -> list[Path]:
+    """Record the path of each hash of a source (``_stream_sha256``: the write's, its page images'), and let it run."""
+    hashed: list[Path] = []
+    real = bundle._stream_sha256
+
+    def recorded(stream, size, path):
+        hashed.append(path)
+        return real(stream, size, path)
+
+    for module in (bundle, _loaders):
+        monkeypatch.setattr(module, "_stream_sha256", recorded)
+    return hashed
+
+
+class TestTheSourceIsHashedOnce:
+    """A write hashes its source once, whatever its identity at extraction: its page images draw the file hashed."""
+
+    @pytest.mark.parametrize("change", [touched, rewritten_in_place], ids=["touched", "copied-back"])
+    @pytest.mark.parametrize("write_dpi", [200, DPI])
+    def test_drawn_pages(self, tmp_path, monkeypatch, write_dpi, change):
+        path = digital_pdf(tmp_path)
+        document = extract_document(path)
+        draws = [page.page_image._loader.__self__ for page in document.pages]
+        change(path)
+        hashed = source_hashes(monkeypatch)
+
+        write_bundle(document, tmp_path / "out", source=path, dpi=write_dpi)
+
+        assert hashed == [path]  # the write's own: no page image hashes it again
+        assert manifest_of(tmp_path / "out")["missing"] == []
+        assert [page.page_image._loader.__self__ for page in document.pages] == draws  # the document's, as they were
+
+    @pytest.mark.parametrize("change", [touched, rewritten_in_place], ids=["touched", "copied-back"])
+    def test_a_vision_page_and_its_bands(self, tmp_path, monkeypatch, change):
+        path = build_pdf(
+            tmp_path / "scan.pdf", [PageSpec(items=(TextRun("Bundle the righted bands", 72.0, 120.0, size=24.0),))]
+        )
+        document = extract_document(path, ocr="always")
+        image = document.pages[0].page_image
+        assert isinstance(image._loader.__self__, _loaders.PageRender)
+        assert isinstance(image._band_loader.__self__, _loaders.PageRender)
+        change(path)
+        hashed = source_hashes(monkeypatch)
+
+        written = write_bundle(document, tmp_path / "out", source=path)
+
+        assert hashed == [path]  # the write's own: neither the image nor its bands hash it again
+        assert manifest_of(tmp_path / "out")["missing"] == [] and written.pages[0].page_image.band_paths
 
 
 class TestExtractionParams:

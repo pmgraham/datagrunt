@@ -18,6 +18,34 @@ to the caller with them.
   the engine's own :class:`~datagrunt.pdf.pdfium_engine.ImageLoader`, which
   verifies the image against its facts before it returns anything.
 
+Each page image's draw is bound to the bytes its document was extracted
+from (#453): a :class:`PageRender` or :class:`PageDraw` holds the
+:class:`~datagrunt.pdf._source.SourceIdentity` of that file and the
+document's sha256, the pipeline's, taken together
+(:func:`~datagrunt.pdf._source.check_binding`). Identity is the fast path;
+content decides. Each draw stats the path first: a file of that identity
+is drawn. A file of another identity (touched; rewritten with the same
+bytes by a checkout, a sync tool or a copy back; read on another host,
+whose ``st_dev`` is its own) is hashed as the pipeline hashes it, through
+one descriptor whose ``fstat`` must be the stat just taken
+(:func:`~datagrunt.pdf._source._stream_sha256`), and is drawn only when its
+bytes hash to the document's sha256. After the render the path is stat'ed
+again and must be the file stat'ed before it: nothing is hashed then. A
+file gone or not a regular file (a directory, a named pipe: it is never
+opened blocking, :func:`~datagrunt.pdf._source._opened_source`), of other
+bytes, replaced between the stat and the hash, cut short as it is hashed,
+or changed during the render raises
+:class:`~datagrunt.pdf.exceptions.PDFSourceChangedError`, naming the path,
+the page and what changed (for other bytes, that they are not the
+document's): no image of other bytes than the document's pages is
+returned. A loader bound to neither checks nothing. A draw of a file of
+another identity reads the whole file first, each time; a bundle write,
+which has hashed the file already, draws through copies bound to the
+identity it hashed (:func:`~datagrunt.pdf.bundle._draws_bound`), so it
+hashes the file once. What this cannot see is the pipeline's limit: a
+write that keeps the size and restores the mtime, or a swap away and back
+between the stats.
+
 Figure reads are batched: :func:`read_figures` reads up to
 :data:`FIGURE_BATCH` figures of one PDF in one worker, and
 :func:`figure_pngs` batches a document's figure reads for ``PDFWriter``'s
@@ -37,13 +65,15 @@ refused) is that figure's outcome, raised as it was.
 
 import dataclasses
 import io
+import os
+import stat
 import subprocess
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import IO, Literal, NamedTuple
+from typing import IO, BinaryIO, Literal, NamedTuple
 
 from PIL import Image
 
@@ -64,9 +94,10 @@ from datagrunt.pdf._process import (
     start_worker,
     worker_command,
 )
+from datagrunt.pdf._source import SourceIdentity, _opened_source, _stream_sha256, check_binding
 from datagrunt.pdf._validate import checked_password, checked_path, int_at_least, positive_float
 from datagrunt.pdf.elements import _MAX_ASSET_BYTES, Figure
-from datagrunt.pdf.exceptions import DatagruntPDFError
+from datagrunt.pdf.exceptions import DatagruntPDFError, PDFSourceChangedError
 from datagrunt.pdf.ocr import Band, bands, normalized, rotated
 from datagrunt.pdf.render import RenderedPage, render_page, render_size
 
@@ -86,6 +117,8 @@ _EXIT_GRACE_S = 1.0  # a worker whose replies ended early is given this to exit
 _BYTES, _ERROR = b"B", b"E"
 _KINDS = ("png", "raw")
 Kind = Literal["png", "raw"]
+# Why a page image of a file that is not its document's is refused: each PDFSourceChangedError of a draw ends so.
+_NOT_RETURNED = "the page image and the document's pages could disagree, so it is not returned"
 
 
 def _checked_turn(rotation: object) -> int:
@@ -101,7 +134,9 @@ class PageRender:
 
     It holds no pixels: each call renders the page in the guarded worker,
     normalizes it as OCR read it, and encodes PNG (8-bit grey). Picklable,
-    so a page crosses the process pool. Each load raises as
+    so a page crosses the process pool. Each load draws only a file at
+    ``source`` that is ``identity``'s or whose bytes hash to ``sha256``,
+    checked before and after its render (module notes), and raises as
     :func:`~datagrunt.pdf.render.render_page` does (``RenderRefused``,
     ``RenderFailed``).
 
@@ -113,6 +148,15 @@ class PageRender:
         password: The PDF's password, or None. Not in repr.
         memory_cap_bytes: The render worker's memory cap past its start.
         timeout_s: Seconds a render may take.
+        identity: The identity of the file the document was extracted from;
+            given with ``sha256`` or not at all.
+        sha256: The document's sha256: a file at ``source`` of another
+            identity is drawn only when its bytes hash to it. With
+            ``identity`` None, None: nothing is checked.
+
+    Raises:
+        TypeError, ValueError: If a field is invalid, or only one of
+            ``identity`` and ``sha256`` is given.
     """
 
     source: Path
@@ -122,6 +166,8 @@ class PageRender:
     password: str | None = field(default=None, repr=False)
     memory_cap_bytes: int
     timeout_s: float
+    identity: SourceIdentity | None = None
+    sha256: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source", checked_path(self.source, "source").absolute())
@@ -131,25 +177,27 @@ class PageRender:
         checked_password(self.password)
         int_at_least("memory_cap_bytes", self.memory_cap_bytes, 1)
         object.__setattr__(self, "timeout_s", positive_float("timeout_s", self.timeout_s))
+        check_binding(self.identity, self.sha256)
 
     def png_bytes(self) -> bytes:
-        """The page as displayed (before OCR's turn), normalized, as PNG."""
+        """The page as displayed (before OCR's turn), normalized, as PNG.
+
+        Raises:
+            PDFSourceChangedError: If the file at ``source`` is gone, not a regular file or its bytes are not the
+                document's before the render, or it changed during it (module notes).
+        """
         return _png(self._drawn())
 
     def band_png_bytes(self) -> tuple[bytes, ...]:
-        """The bands OCR read (of the page turned by ``rotation``, normalized), top to bottom, each as PNG."""
+        """The bands OCR read (of the page turned by ``rotation``, normalized), top to bottom, each as PNG.
+
+        Raises:
+            PDFSourceChangedError: As :meth:`png_bytes` raises it.
+        """
         return tuple(_png(band) for band in bands(rotated(self._drawn(), self.rotation)))
 
     def _drawn(self) -> RenderedPage:
-        page = render_page(
-            self.source,
-            self.page_index,
-            dpi=self.dpi,
-            password=self.password,
-            memory_cap_bytes=self.memory_cap_bytes,
-            timeout_s=self.timeout_s,
-        )
-        return normalized(page)
+        return normalized(_bound_render(self))
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -162,7 +210,9 @@ class PageDraw:
     It has no band loader: no OCR read the page. Its size is
     :func:`~datagrunt.pdf.render.render_size`'s of the page at ``dpi``, known
     before any draw, and each draw must be that size. Picklable, so a page
-    crosses the process pool. Each load raises as ``render_page`` does
+    crosses the process pool. Each load draws only a file at ``source``
+    that is ``identity``'s or whose bytes hash to ``sha256``, checked before
+    and after its render (module notes), and raises as ``render_page`` does
     (``RenderRefused``, ``RenderFailed``).
 
     Attributes:
@@ -175,10 +225,16 @@ class PageDraw:
         password: The PDF's password, or None. Not in repr.
         memory_cap_bytes: The render worker's memory cap past its start.
         timeout_s: Seconds a render may take.
+        identity: The identity of the file the document was extracted from;
+            given with ``sha256`` or not at all.
+        sha256: The document's sha256: a file at ``source`` of another
+            identity is drawn only when its bytes hash to it. With
+            ``identity`` None, None: nothing is checked.
 
     Raises:
-        TypeError, ValueError: If a field is invalid, or the page draws under
-            one pixel across at ``dpi``.
+        TypeError, ValueError: If a field is invalid, only one of
+            ``identity`` and ``sha256`` is given, or the page draws under one
+            pixel across at ``dpi``.
     """
 
     source: Path
@@ -189,6 +245,8 @@ class PageDraw:
     password: str | None = field(default=None, repr=False)
     memory_cap_bytes: int = MEMORY_CAP_BYTES
     timeout_s: float = _RENDER_TIMEOUT_S
+    identity: SourceIdentity | None = None
+    sha256: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source", checked_path(self.source, "source").absolute())
@@ -202,6 +260,7 @@ class PageDraw:
         checked_password(self.password)
         int_at_least("memory_cap_bytes", self.memory_cap_bytes, 1)
         object.__setattr__(self, "timeout_s", positive_float("timeout_s", self.timeout_s))
+        check_binding(self.identity, self.sha256)
 
     @property
     def size(self) -> tuple[int, int]:
@@ -212,18 +271,14 @@ class PageDraw:
         """The page as displayed, 8-bit grey as drawn, as PNG.
 
         Raises:
+            PDFSourceChangedError: If the file at ``source`` is gone, not a
+                regular file or its bytes are not the document's before the
+                render, or it changed during it (module notes).
             DatagruntPDFError: If the page draws at another size than
                 :attr:`size` (the PDF is not the one read), or as
                 ``render_page`` raises (``RenderRefused``, ``RenderFailed``).
         """
-        page = render_page(
-            self.source,
-            self.page_index,
-            dpi=self.dpi,
-            password=self.password,
-            memory_cap_bytes=self.memory_cap_bytes,
-            timeout_s=self.timeout_s,
-        )
+        page = _bound_render(self)
         if (page.px_width, page.px_height) != self.size:
             width, height = self.size
             drew = f"page {self.page_index + 1} draws {page.px_width} x {page.px_height} px"
@@ -231,6 +286,122 @@ class PageDraw:
                 f"{self.source}: {drew}, not the {width} x {height} px of its page image: the PDF is not the one read"
             )
         return _png(page)
+
+
+def _bound_render(loader: PageRender | PageDraw) -> RenderedPage:
+    """The loader's page, drawn by ``render_page`` only from a file of its document's bytes (module notes)."""
+    image = f"page {loader.page_index + 1}'s image"
+    before = _drawable(loader, f"before {image} was drawn")
+    page = render_page(
+        loader.source,
+        loader.page_index,
+        dpi=loader.dpi,
+        password=loader.password,
+        memory_cap_bytes=loader.memory_cap_bytes,
+        timeout_s=loader.timeout_s,
+    )
+    _check_unchanged(loader.source, before, f"while {image} was drawn")
+    return page
+
+
+def _drawable(loader: PageRender | PageDraw, when: str) -> SourceIdentity | None:
+    """The identity of the file at the loader's source if it holds the document's bytes; None if it is bound to none.
+
+    The file of the loader's identity holds them; a file of another identity
+    holds them when its bytes hash to the loader's sha256 (module notes).
+
+    Raises:
+        PDFSourceChangedError: If the file is gone or not a regular file, or
+            of another identity and bytes that are not the document's (naming
+            ``when``, what changed and both hashes), or replaced or cut short
+            as it is hashed.
+        OSError: If the file cannot be stat'ed or read for another reason
+            (``PermissionError``, say).
+    """
+    if loader.identity is None or loader.sha256 is None:
+        return None
+    now = _identity_at(loader.source, when)
+    changes = loader.identity.changes(now)
+    if not changes:
+        return now
+    digest = _sha256_at(loader.source, now, when)
+    if digest != loader.sha256:
+        mismatch = f"its bytes are not the document's (sha256 {digest}, not {loader.sha256})"
+        raise _changed(loader.source, when, changes, mismatch)
+    return now
+
+
+def _identity_at(source: Path, when: str) -> SourceIdentity:
+    """The identity of the regular file at ``source`` now, from one ``stat``.
+
+    Raises:
+        PDFSourceChangedError: If no file is there, or what is there is not a
+            regular file (a directory, a named pipe), naming ``when``.
+        OSError: If ``source`` cannot be stat'ed for another reason.
+    """
+    try:
+        status = os.stat(source)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise _removed(source, when) from exc
+    if not stat.S_ISREG(status.st_mode):
+        raise _not_regular(source, when)
+    return SourceIdentity.of(status)
+
+
+def _check_unchanged(source: Path, before: SourceIdentity | None, when: str) -> None:
+    """Raise PDFSourceChangedError if the file at ``source`` is not the one ``before`` was taken of; nothing without."""
+    if before is not None:
+        _check_same(source, before, _identity_at(source, when), when)
+
+
+def _check_same(source: Path, before: SourceIdentity, now: SourceIdentity, when: str) -> None:
+    """Raise PDFSourceChangedError, naming what changed, if ``now`` is not ``before``."""
+    changes = before.changes(now)
+    if changes:
+        raise _changed(source, when, changes)
+
+
+def _sha256_at(source: Path, status: SourceIdentity, when: str) -> str:
+    """The SHA-256 of the file at ``source``, read through one descriptor that must be the file ``status`` is of.
+
+    Raises:
+        PDFSourceChangedError: If the file is gone or not a regular file when
+            opened, is not ``status``'s (its ``fstat``), or is cut short as it
+            is hashed.
+        OSError: If it cannot be opened or read for another reason.
+    """
+    try:
+        stream = _opened_source(source)
+    except FileNotFoundError as exc:
+        raise _removed(source, when) from exc
+    except ValueError as exc:  # not a regular file: put there since the stat
+        raise _not_regular(source, when) from exc
+    with stream:
+        return _hashed(stream, source, status, when)
+
+
+def _hashed(stream: BinaryIO, source: Path, status: SourceIdentity, when: str) -> str:
+    """The SHA-256 of ``stream``'s first ``status.size`` bytes, if ``fstat`` of it is ``status``."""
+    _check_same(source, status, SourceIdentity.of(os.fstat(stream.fileno())), when)
+    try:
+        return _stream_sha256(stream, status.size, source)
+    except PDFSourceChangedError as exc:  # cut short: its words, and the draw's
+        raise PDFSourceChangedError(f"{exc} {when}; {_NOT_RETURNED}") from exc
+
+
+def _changed(source: Path, when: str, changes: tuple[str, ...], *why: str) -> PDFSourceChangedError:
+    """The error of a draw that found the file at ``source`` changed ``when``: what changed, why, and so no image."""
+    return PDFSourceChangedError("; ".join((f"{source} changed {when}: {', '.join(changes)}", *why, _NOT_RETURNED)))
+
+
+def _not_regular(source: Path, when: str) -> PDFSourceChangedError:
+    """The error of a draw that found something other than a regular file at ``source`` ``when``."""
+    return _changed(source, when, ("it is not a regular file",))
+
+
+def _removed(source: Path, when: str) -> PDFSourceChangedError:
+    """The error of a draw that found nothing at ``source`` ``when``."""
+    return PDFSourceChangedError(f"{source} was removed {when}; {_NOT_RETURNED}")
 
 
 def _png(image: RenderedPage | Band) -> bytes:

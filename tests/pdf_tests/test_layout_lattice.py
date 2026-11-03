@@ -22,6 +22,7 @@ from datagrunt.pdf.pdfium_engine import extract_page, open_document
 from datagrunt.pdf.quality import SpanPiece, assess_page
 from pdf_tests.builders import FormXObject, Line, PageSpec, Rect, TextRun, build_pdf
 from pdf_tests.test_pdfium_engine import ENGINE_MODULES, imported_modules
+from pdf_tests.test_pdfium_recover import pdf as raw_pdf
 from pdf_tests.test_quality import raw_span
 
 
@@ -829,6 +830,32 @@ class TestCellText:
         assert got == [["", "", "out", ""], ["in", "", "", ""]]
 
 
+def whole_runs(*pieces: SpanPiece) -> list:
+    """Each piece as one run of all its chars."""
+    return [layout._Run(piece, piece.start, piece.end) for piece in pieces]
+
+
+class TestReadingTurn:
+    """Runs read at the one turn their runs with a direction share, else at the default.
+
+    A table's runs default to across, and a cell's to its table's turn.
+    """
+
+    @pytest.mark.parametrize(
+        "pieces,default,turn",
+        [
+            pytest.param((rising("Value", 10.0, 90.0), rising("one", 30.0, 90.0)), 0, 270, id="shared"),
+            # 11 chars rising and a 2-char run across disagree, so the default decides, not chars.
+            pytest.param((rising("Value three", 10.0, 90.0), chars("ab", 30.0, 10.0)), 0, 0, id="mixed-is-default"),
+            pytest.param((rising("Value three", 10.0, 90.0), chars("ab", 30.0, 10.0)), 270, 270, id="mixed-turned"),
+            pytest.param((chars("x", 10.0, 10.0), falling("y", 30.0, 10.0)), 90, 90, id="no-direction-is-default"),
+            pytest.param((), 270, 270, id="no-runs-is-default"),
+        ],
+    )
+    def test_the_one_turn_the_runs_share_else_the_default(self, pieces, default, turn):
+        assert layout._reading_turn(whole_runs(*pieces), default) == turn
+
+
 def read_tables(tmp_path, *items, rotate: int = 0) -> LatticeResult:
     """find_lattice_tables over page 1 of a 400 x 300 pt PDF of ``items``, through extract_page and assess_page."""
     path = build_pdf(tmp_path / "page.pdf", [PageSpec(width=400.0, height=300.0, items=items, rotate=rotate)])
@@ -869,6 +896,94 @@ def shape(result: LatticeResult):
 def spans_of(table: LatticeTable):
     """Each cell as ``(row, col, row_span, col_span, text)``."""
     return [(item.row, item.col, item.row_span, item.col_span, item.text) for item in table.cells]
+
+
+# A ruled grid of 3 columns by 2 rows on a 400 x 300 pt page, in PDF space (y up), and the text of each cell set a
+# quarter turn anticlockwise (it reads up the page) from (x, y): each column's lower cell, then its upper one.
+TURNED_XS, TURNED_YS = (40, 140, 240, 340), (40, 140, 240)
+TURNED_TEXT = (
+    (b"Name one", 90, 50),
+    (b"Value one", 90, 150),
+    (b"Name two", 190, 50),
+    (b"Value two", 190, 150),
+    (b"Name three", 290, 50),
+    (b"Value three", 290, 150),
+)
+
+
+def up(text: bytes, x: int, y: int, size: int = 11) -> bytes:
+    """Content drawing ``text`` a quarter turn anticlockwise (it reads up the page) from (x, y)."""
+    return b"BT /F1 %d Tf 0 1 -1 0 %d %d Tm (%s) Tj ET\n" % (size, x, y, text)
+
+
+def across(text: bytes, x: int, y: int, size: int = 11) -> bytes:
+    """Content drawing ``text`` upright from (x, y)."""
+    return b"BT /F1 %d Tf %d %d Td (%s) Tj ET\n" % (size, x, y, text)
+
+
+def raw_table(tmp_path, xs, ys, text: bytes) -> LatticeResult:
+    """find_lattice_tables over a grid ruled at ``xs`` and ``ys`` (PDF space), drawn raw with ``text``.
+
+    Drawn raw because ReportLab sets no text matrix.
+    """
+    drawn = b"".join(b"%d %d m %d %d l S\n" % (x, ys[0], x, ys[-1]) for x in xs)
+    drawn += b"".join(b"%d %d m %d %d l S\n" % (xs[0], y, xs[-1], y) for y in ys)
+    page = extract_page(open_document(raw_pdf(tmp_path, drawn + text)), 0)
+    return find_lattice_tables(page.segments.segments, assess_page(page).pieces)
+
+
+# A feature matrix: a label column and 5 product columns; 3 body rows under a tall header row (PDF y 130-270). Product
+# names are set up the page in the header, row labels across, and the body holds one-char marks.
+MATRIX_XS, MATRIX_YS = (20, 120, 160, 200, 240, 280, 320), (40, 70, 100, 130, 270)
+MATRIX_LABELS = ((b"Single sign-on", 110), (b"Audit logging", 80), (b"Export to CSV", 50))
+MATRIX_HEADERS = b"".join(
+    up(b"Product " + name, x + 25, 138, size=10) for name, x in zip((b"A", b"B", b"C", b"D", b"E"), MATRIX_XS[1:-1])
+)
+MATRIX_MARKS = b"".join(across(b"x", x + 16, y, size=10) for _, y in MATRIX_LABELS for x in MATRIX_XS[1:-1])
+MATRIX_TEXT = MATRIX_HEADERS + MATRIX_MARKS + b"".join(across(label, 24, y, size=9) for label, y in MATRIX_LABELS)
+MATRIX_GRID = (
+    ("", "Product A", "Product B", "Product C", "Product D", "Product E"),
+    ("Single sign-on", "x", "x", "x", "x", "x"),
+    ("Audit logging", "x", "x", "x", "x", "x"),
+    ("Export to CSV", "x", "x", "x", "x", "x"),
+)
+
+# Three columns: a header row (PDF y 160-280) of one word set up the page, over two rows of 2-char numbers across.
+SURVEY_XS, SURVEY_YS = (40, 140, 240, 340), (40, 100, 160, 280)
+SURVEY_TEXT = b"".join(up(b"Respondents", x + 55, 168, size=10) for x in SURVEY_XS[:-1]) + b"".join(
+    across(number, SURVEY_XS[col] + 10, y, size=10)
+    for y, numbers in ((120, (b"12", b"34", b"56")), (60, (b"78", b"90", b"11")))
+    for col, number in enumerate(numbers)
+)
+SURVEY_GRID = (("Respondents",) * 3, ("12", "34", "56"), ("78", "90", "11"))
+
+# A feature matrix with no row labels: a column of one-char row numbers and 3 product columns of one-char marks, under
+# a tall header row (PDF y 130-270) of product names set up the page; the first header cell also holds "(beta)" across.
+BETA_XS, BETA_YS = (20, 120, 160, 200, 240), (40, 70, 100, 130, 270)
+BETA_TEXT = (
+    b"".join(up(b"Product " + name, x + 25, 150, size=10) for name, x in zip((b"A", b"B", b"C"), BETA_XS[1:-1]))
+    + across(b"(beta)", BETA_XS[1] + 3, 136, size=6)
+    + b"".join(
+        b"".join(across(b"x", x + 16, y, size=10) for x in BETA_XS[1:-1]) + across(b"1", 30, y, size=9)
+        for y in (50, 80, 110)
+    )
+)
+BETA_GRID = (("", "Product A (beta)", "Product B", "Product C"), *(("1", "x", "x", "x"),) * 3)
+
+# Three columns: a header row (PDF y 160-200) of words set up the page, the first running down into the body cell
+# below it, which holds a 2-char number across; the other body cells hold one-char numbers.
+SPILL_XS, SPILL_YS = (40, 140, 240, 340), (40, 100, 160, 200)
+SPILL_TEXT = (
+    up(b"Respondents surveyed", 95, 110, size=10)
+    + up(b"Share", 195, 168, size=10)
+    + up(b"Delta", 295, 168, size=10)
+    + b"".join(
+        across(number, x, y, size=9)
+        for y, numbers in ((120, (b"12", b"5", b"7")), (60, (b"8", b"9", b"3")))
+        for x, number in zip((60, 160, 260), numbers)
+    )
+)
+SPILL_GRID = (("ts survey", "Share", "Delta"), ("12 Responden", "5", "7"), ("8", "9", "3"))
 
 
 XS, YS = (50.0, 150.0, 250.0, 350.0), (40.0, 60.0, 80.0, 100.0)
@@ -967,6 +1082,48 @@ class TestFindLatticeTables:
         result = read_tables(tmp_path, *rules(XS, YS), *written(SPEC, XS, YS), rotate=180)
 
         assert result.tables[0].grid() == tuple(tuple(reversed(row)) for row in reversed(SPEC_GRID))
+
+    def test_a_table_drawn_turned_reads_along_its_text(self, tmp_path):
+        result = raw_table(tmp_path, TURNED_XS, TURNED_YS, b"".join(up(*item) for item in TURNED_TEXT))
+
+        assert [(table.turn, table.grid()) for table in result.tables] == [
+            (270, (("Name one", "Value one"), ("Name two", "Value two"), ("Name three", "Value three")))
+        ]
+
+    def test_a_table_drawn_turned_with_a_cell_only_across_reads_across(self, tmp_path):
+        # Known limitation (v4 parity, #391): a lone "OK" across disagrees with the turned text.
+        text = b"".join(up(*item) for item in TURNED_TEXT[:-1]) + across(b"OK", 300, 200)
+
+        result = raw_table(tmp_path, TURNED_XS, TURNED_YS, text)
+
+        assert [(table.turn, table.grid()) for table in result.tables] == [
+            (0, (("Value one", "Value two", "OK"), ("Name one", "Name two", "Name three")))
+        ]
+
+    @pytest.mark.parametrize(
+        "xs,ys,text,grid",
+        [
+            pytest.param(MATRIX_XS, MATRIX_YS, MATRIX_TEXT, MATRIX_GRID, id="feature-matrix-of-one-char-marks"),
+            pytest.param(SURVEY_XS, SURVEY_YS, SURVEY_TEXT, SURVEY_GRID, id="2-char-numbers"),
+            pytest.param(BETA_XS, BETA_YS, BETA_TEXT, BETA_GRID, id="a-header-cell-with-a-note-across"),
+            pytest.param(SPILL_XS, SPILL_YS, SPILL_TEXT, SPILL_GRID, id="a-header-running-into-a-2-char-number"),
+        ],
+    )
+    def test_an_upright_table_with_headers_set_up_the_page_reads_across(self, tmp_path, xs, ys, text, grid):
+        # Its headers advance up the page and its labels, numbers or a note of two or more chars across: they disagree,
+        # in different cells or in one.
+        result = raw_table(tmp_path, xs, ys, text)
+
+        assert [(table.turn, table.grid()) for table in result.tables] == [(0, grid)]
+
+    def test_an_upright_table_whose_only_text_with_a_direction_is_headers_set_up_the_page_reads_turned(self, tmp_path):
+        # Known limitation (v4 parity, #391): with no text across of two or more chars, nothing tells it from a table
+        # drawn turned.
+        result = raw_table(tmp_path, MATRIX_XS, MATRIX_YS, MATRIX_HEADERS + MATRIX_MARKS)
+
+        assert [(table.turn, table.grid()) for table in result.tables] == [
+            (270, (("", "", "", ""), *(("x", "x", "x", f"Product {name}") for name in "ABCDE")))
+        ]
 
     def test_a_page_border_frame_is_no_table_and_uses_no_text(self, tmp_path):
         items = (Rect(10.0, 10.0, 380.0, 280.0), TextRun("Inside the frame", 50.0, 50.0))
@@ -1134,6 +1291,44 @@ class TestPageBounds:
         assert [table.grid()[0][0] for table in result.tables] == ["t0", "t1"]
         assert result.skipped_grids == 1
         assert [piece.text for piece in result.used_pieces] == ["t0", "t1"]
+
+    @pytest.mark.parametrize(
+        "last,skipped",
+        [
+            # A box: 2 + 2 rules, too few positions to be a grid, so _grid would turn it down.
+            pytest.param(frame(10.0, 10_000.0, 90.0, 10_040.0), 0, id="a-box"),
+            pytest.param(small_table(10.0, 10_000.0, "past")[0], 1, id="a-grid"),
+        ],
+    )
+    def test_past_max_grids_only_a_component_that_can_be_a_grid_is_skipped(self, last, skipped):
+        built = [small_table(10.0, 10.0 + 100.0 * index, f"t{index}") for index in range(layout.MAX_GRIDS)]
+
+        result = find_lattice_tables(
+            (*(item for segments, _ in built for item in segments), *last),
+            tuple(item for _, pieces in built for item in pieces),
+        )
+
+        assert len(result.tables) == layout.MAX_GRIDS
+        assert result.skipped_grids == skipped
+
+    @pytest.mark.parametrize(
+        "first",
+        [
+            pytest.param(frame(10.0, 10.0, 90.0, 50.0), id="a-box"),
+            # One row of 10 boxes: 10 units, but only 2 horizontal positions.
+            pytest.param(ruled_grid(tuple(10.0 + 8.0 * index for index in range(11)), (10.0, 50.0)), id="a-row"),
+        ],
+    )
+    def test_a_component_that_cannot_be_a_grid_spends_no_units_and_is_not_skipped(self, monkeypatch, first):
+        # A 4-unit page: the table fits only if the component before it spends nothing; the box after the table
+        # comes once the page has no units left.
+        monkeypatch.setattr(layout, "MAX_GRID_UNITS", 4)
+        table_segments, table_pieces = small_table(1000.0, 1000.0, "fits")
+
+        result = find_lattice_tables((*first, *table_segments, *frame(10.0, 2000.0, 90.0, 2040.0)), table_pieces)
+
+        assert [table.grid() for table in result.tables] == [(("fits", ""), ("", ""))]
+        assert result.skipped_grids == 0
 
     @pytest.mark.parametrize(
         "cap,found", [pytest.param(16, True, id="at-the-cap"), pytest.param(15, False, id="past-it")]

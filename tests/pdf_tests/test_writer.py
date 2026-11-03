@@ -12,7 +12,9 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import polars as pl
@@ -227,6 +229,28 @@ class TestDocumentCache:
         first = made._extracted()
         assert made._extracted() is first
         assert len(calls) == 1
+
+    def test_concurrent_first_uses_extract_the_document_once(self, tmp_path, monkeypatch):
+        entered, overlapped = threading.Event(), threading.Event()
+        calls: list = []
+
+        def counting(source, options):
+            calls.append(source.path)
+            if len(calls) > 1:
+                overlapped.set()
+            entered.set()
+            overlapped.wait(timeout=1.0)  # unserialized, the second thread's call arrives while this one waits
+            return rich_document()
+
+        monkeypatch.setattr(writer, "_extract", counting)
+        made = PDFWriter(text_pdf(tmp_path))
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(made._extracted)
+            assert entered.wait(timeout=10.0)
+            second = pool.submit(made._extracted)
+            documents = (first.result(timeout=10.0), second.result(timeout=10.0))
+        assert len(calls) == 1
+        assert documents[0] is documents[1]
 
     def test_a_failed_extraction_is_not_cached(self, tmp_path, monkeypatch):
         path = text_pdf(tmp_path)
