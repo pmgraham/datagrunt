@@ -326,7 +326,9 @@ or `figure`), `scope_path`, `text`, `markdown`, `bbox`, `route`,
 - Each page has a `page_image`. A digital or hybrid page's is drawn at the
   reader's `dpi` only when you read it (`page.page_image.read_bytes()`, a PNG);
   a scanned page's is the image OCR read. An error page has none, nor does a
-  page too large to draw (a warning on the page says so).
+  page too large to draw (a warning on the page says so). A page image is
+  drawn from the source PDF, so if the file at its path no longer holds the
+  document's bytes, reading it raises `datagrunt.pdf.PDFSourceChangedError`.
 - A heading's `level` (1 to 6) is ranked over the whole document by its font
   size and boldness (`font_size_pt`, `is_bold`), largest first, so a level
   means the same prominence on every page. Hidden headings never shift it.
