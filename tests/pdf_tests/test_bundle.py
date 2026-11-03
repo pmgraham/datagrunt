@@ -628,6 +628,21 @@ class TestAtomicWrite:
             write(bound_document(source), tmp_path / "out", source)
         assert stagings(tmp_path) == [] and not (tmp_path / "out").exists()
 
+    def test_an_interrupt_after_the_rename_propagates_as_it_is(self, tmp_path, source, fast_render, monkeypatch):
+        class Interrupted(BaseException):
+            pass
+
+        real = bundle._publish
+
+        def interrupted(staging, target, replace):
+            real(staging, target, replace)
+            raise Interrupted("after the rename")
+
+        monkeypatch.setattr(bundle, "_publish", interrupted)
+        with pytest.raises(Interrupted, match="after the rename"):
+            write(bound_document(source), tmp_path / "out", source)
+        assert (tmp_path / "out" / "manifest.json").is_file() and stagings(tmp_path) == []
+
     def test_an_unexpected_loader_error_fails_the_write_cleanly(self, tmp_path, source, fast_render):
         with pytest.raises(TypeError, match="_loader result must be bytes, got str"):
             write(bound_document(source, lambda: "not bytes"), tmp_path / "out", source)

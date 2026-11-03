@@ -95,7 +95,8 @@ With ``overwrite``, a bundle there is first renamed aside, to ``.old_<uuid4
 hex>`` beside it; the staging directory is renamed in, and the old bundle
 removed. If that second rename fails, the old bundle is renamed back. On
 any failure before the swap, an interrupt included, the staging directory
-is removed and the error raised, and an old bundle is untouched. A writer
+is removed and the error raised, and an old bundle is untouched; one after
+the rename (an interrupt) is raised as it is, the new bundle in place. A writer
 killed outright leaves its staging directory (or, between the two
 renames, the old bundle aside), the only trace: never a half-written
 ``output_dir``; the next write makes its own and ignores it. If removing
@@ -438,7 +439,8 @@ def write_bundle(
         _check_unchanged(pdf, identity)
         aside = _publish(staging, target, replace)
     except BaseException:
-        shutil.rmtree(staging)
+        if os.path.lexists(staging):  # gone once _publish renamed it: the error raised is the one to keep
+            shutil.rmtree(staging)
         raise
     if aside is not None:
         shutil.rmtree(aside)
