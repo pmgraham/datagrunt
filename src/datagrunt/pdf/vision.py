@@ -176,7 +176,9 @@ tesseract cannot read it (missing, failed, timed out, its budget spent), it is
 ``"ocr_unavailable"``: :func:`~datagrunt.pdf.assembly.assemble_page`'s
 page of its digital text, the page image when it was rendered, and a
 warning naming why. Words read before a band failed are not used: the page
-is the digital text's, never half of each.
+is the digital text's, never half of each. assemble_page is given the
+vision DPI and pixel bound the page was rendered within, so its warning
+that the page has no page image agrees with the image (#456).
 
 :func:`fallback_page` makes the A1 page of a page A2 could not read (its
 ``PageFailure``; spec §3.3 step 2, per-page fault isolation): only its
@@ -621,11 +623,11 @@ def vision_page(
     drawn = _drawn(source, geometry, password, options, deadline)
     where = _Where(source, password, identity, sha256)
     if drawn.page is None:
-        return _unread(raw_page, assessment, drawn.failure, None, where, min_image_dimension)
+        return _unread(raw_page, assessment, drawn.failure, None, where, min_image_dimension, options)
     reading = _read(drawn.page, drawn.dpi, geometry, options, deadline)
     image = _page_image(drawn.page, drawn.dpi, reading.rotation, geometry, where, options)
     if reading.failure:
-        return _unread(raw_page, assessment, reading.failure, image, where, min_image_dimension)
+        return _unread(raw_page, assessment, reading.failure, image, where, min_image_dimension, options)
     figures = page_figures(
         raw_page.images, geometry, source=source, password=password, min_image_dimension=min_image_dimension
     )
@@ -909,8 +911,14 @@ def _unread(
     image: PageImage | None,
     where: _Where,
     min_image_dimension: int,
+    options: VisionOptions,
 ) -> Page:
-    """The ``"ocr_unavailable"`` page: assemble_page's of the digital text, the image if rendered, and why."""
+    """The ``"ocr_unavailable"`` page: assemble_page's of the digital text, the image if rendered, and why.
+
+    assemble_page checks the page image at the vision DPI and pixel bound
+    the render used, so its warning that the page has none is given exactly
+    when ``image`` is None for that reason (#456), never by its defaults.
+    """
     lattice = find_lattice_tables(raw_page.segments.segments, assessment.pieces)
     page = assemble_page(
         raw_page,
@@ -921,6 +929,8 @@ def _unread(
         identity=where.identity,
         sha256=where.sha256,
         min_image_dimension=min_image_dimension,
+        dpi=options.vision_dpi,
+        max_render_pixels=options.max_render_pixels,
     )
     return dataclasses.replace(
         page, page_image=image, warnings=(*page.warnings, f"OCR could not read the page: {reason}")

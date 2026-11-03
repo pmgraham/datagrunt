@@ -705,6 +705,30 @@ class TestOcrUnavailable:
         assert page.warnings[-1] == unread_warning(f"tesseract {status}: {reason}; {unused}")
         assert page.page_image is not None
 
+    @pytest.mark.parametrize(
+        ("width_pt", "bound", "drawn"),
+        [
+            # 80 DPI within 25M pixels: 22,222,222 x 1 px; at the defaults (16M) it would render 0 px tall at 64 DPI.
+            pytest.param(2e7, 25_000_000, True, id="drawn-only-under-a-raised-bound"),
+            # 26 DPI within 262,144 pixels: 0 px tall; at the defaults (200 DPI, 16M) it would be 5,555,555 x 2 px.
+            pytest.param(2e6, 262_144, False, id="refused-under-a-lowered-bound"),
+        ],
+    )
+    def test_its_page_image_and_its_warnings_agree(self, tmp_path, monkeypatch, width_pt, bound, drawn):
+        # #456: the page image is the OCR render, within the reader's pixel bound at its vision DPI; the warning that
+        # the page has none is from the same bound, never assemble_page's defaults.
+        path = build_pdf(tmp_path / "extreme.pdf", [PageSpec(width=width_pt, height=1.0)])
+        no_tesseract(monkeypatch, tmp_path)
+
+        page = visioned(path, ocr="always", options=VisionOptions(max_render_pixels=bound))
+
+        assert page.status == "ocr_unavailable"
+        assert (page.page_image is not None) is drawn
+        undrawn = [note for note in page.warnings if note.startswith("the page has no page image")]
+        assert undrawn == (
+            [] if drawn else [f"the page has no page image: a {width_pt} x 1.0 pt page renders 0 px tall at 26 DPI"]
+        )
+
     def test_ocr_unavailable_at_orientation_runs_no_ocr(self, scans, monkeypatch):
         gone = Orientation(degrees=0, confidence=None, status="unavailable", reason="cannot start tesseract")
         monkeypatch.setattr(vision, "orientation", lambda *args, **kwargs: gone)
