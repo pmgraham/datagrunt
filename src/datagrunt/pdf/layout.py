@@ -2174,9 +2174,13 @@ class StreamTable:
             start for text set flush left, the end for flush-right numbers,
             the middle for centred cells), so it does not move with the
             column's widest cell (#409). Display x for upright text, display
-            y for text turned a quarter turn, so falling for text read up
-            the page. Each lies in its column's band, so they rise strictly
-            (A1's contract). At least 2.
+            y for text turned a quarter turn. Each lies in its column's
+            band, and the bands never meet, so they rise strictly along the
+            rows: on the page they rise for text read across or down it and
+            fall for text read up it (turn 270). This record checks that
+            each is finite and within its interval, not their order; A1's
+            ``Table``, which needs them to rise, takes them only from an
+            upright table (``assembly``). At least 2.
         column_intervals: Each column's ``(start, end)`` in the same
             display coordinate: from its cells' least to their greatest
             extent along the rows (its band), so it holds its centre. A
