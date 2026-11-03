@@ -335,10 +335,13 @@ class LatticeResult:
         used_pieces: The char ranges of visible pieces whose chars lie in a
             table's cells, as pieces of the same spans: A4b lays out only
             the rest of the page's text.
-        skipped_grids: Components that could be grids left out, their
-            text to the stream pass, because they would pass the page's
+        skipped_grids: Components left out, their text to the stream
+            pass, because they would pass the page's
             :data:`MAX_GRID_UNITS` or :data:`MAX_GRIDS`: a warning for the
-            page. One that cannot be a grid (a box, say) is never counted.
+            page. One with fewer than 2 unit columns or rows (a box, say)
+            cannot be a grid and is never counted; one with more is
+            counted unbuilt, so the count can take in one that would not
+            have made a grid (a box with stubs of rule inside, say).
         crossing_cap_reached: True when the page's rules cross more than
             :data:`MAX_CROSSINGS` times: the sweep stopped, so the page has
             no lattice tables and all its text goes to the stream pass.
@@ -380,23 +383,33 @@ def find_lattice_tables(segments: tuple[RawSegment, ...], pieces: tuple[SpanPiec
        (:func:`_cell_text`). A grid whose every cell is blank is
        decoration, not a table.
 
-    A table most of whose chars advance down or up the page (one turned
-    by /Rotate 90 or 270, or drawn turned) reads as it was written: its
-    rows run along that text's lines (v4 parity, #391), whatever a short
-    run across in it (ties: across, down, up). Text advancing leftward
-    reads as displayed: pdfium's boxes cannot tell upside-down text from
+    A table reads at the one turn its pure cells share, else across
+    (:func:`_table_turn`): a cell is pure when it has runs with a
+    direction (two or more chars) and they all advance one way; a mixed
+    cell (turned text and a short run across, say) has no say. A table
+    whose pure cells all advance down or up the page (one turned by
+    /Rotate 90 or 270, or drawn turned) reads as it was written: its rows
+    run along that text's lines (v4 parity, #391). A table with headers
+    set up the page over rows labelled across reads across, as does a
+    turned table with a cell holding only text across (a lone "OK", say);
+    an upright table whose only pure cells are headers set up the page
+    (over one-char marks, say) reads turned. Text advancing leftward reads
+    as displayed: pdfium's boxes cannot tell upside-down text from
     right-to-left text.
 
     Tables come in the order of their top rules: top to bottom, then left
     to right.
 
     Bounds, per page: the sweep stops past :data:`MAX_CROSSINGS`
-    crossings (the page then has no lattice tables); components that can
-    be grids (2 or more unit columns and rows: a box cannot) build grids
+    crossings (the page then has no lattice tables). A component with
+    fewer than 2 unit columns or rows (a box, say) cannot be a grid: it
+    spends no units and is never counted. The others go to :func:`_grid`
     in order while their units (X - 1) x (Y - 1), for X vertical and Y
     horizontal positions, fit the :data:`MAX_GRID_UNITS` left and fewer
-    than :data:`MAX_GRIDS` grids are built; any other that can be one is
-    left out, its text kept for the stream pass, and counted. So the cost is
+    than :data:`MAX_GRIDS` grids are built; any other is left out, its
+    text kept for the stream pass, and counted without going to
+    :func:`_grid`, so the count can take in one that :func:`_grid` would
+    have turned down (a box with stubs of rule inside, say). So the cost is
     O(n log n + MAX_CROSSINGS + MAX_GRID_UNITS + pieces x MAX_GRIDS +
     chars x (G + log(X + Y))) for n segments and the G grids near a piece.
 
@@ -575,15 +588,18 @@ class _Grid(NamedTuple):
 
 
 def _bounded_grids(groups: list[_Component]) -> tuple[list[_Grid], int]:
-    """The components' grids, in order, within the page's bounds, and how many that could be grids were left out.
+    """The components' grids, in order, within the page's bounds, and how many were left out.
 
     A component with fewer than :data:`_MIN_GRID` unit columns or rows (a
     box, or one row or column of boxes) cannot be a grid, which is
     :func:`_grid`'s first test: it is passed over before the bounds,
     spending no units and never counted. Any other is left out when its
     units would pass the :data:`MAX_GRID_UNITS` the page has left, or
-    :data:`MAX_GRIDS` grids are built; one built (or rejected by
-    :func:`_grid`) spends its units. O(R) for R rules, besides building grids.
+    :data:`MAX_GRIDS` grids are built, and counted without going to
+    :func:`_grid`: so the count can take in one that :func:`_grid`'s later
+    tests would turn down (a box with stubs of rule inside, say). One
+    that goes to :func:`_grid` spends its units, built or turned down.
+    O(R) for R rules, besides building grids.
     """
     grids: list[_Grid] = []
     skipped, budget = 0, MAX_GRID_UNITS
@@ -814,17 +830,17 @@ def _place(grids: list[_Grid], nearby: list[int], box: Box) -> tuple[int, int] |
 def _cell_text(runs: list[_Run], default_turn: int) -> str:
     """A cell's text: its runs in lines, read in the direction its text advances.
 
-    The direction is the one most of the chars in its runs of two or more
-    advance at, else ``default_turn``, which a tie goes to when it is
-    among the tied (:func:`_reading_turn`). In that frame, runs
-    overlapping a line by at least :data:`_LINE_OVERLAP` of the smaller
-    height are on it; lines read top to bottom and join with one space;
-    runs on a line read left to right and join as the stream pass joins
-    them (:func:`_separator`: nothing across a gap of at most
-    :data:`_JOIN_GAP_EM` ems of the larger font or next to a degree or
-    punctuation glyph, else one space); a run keeps its span's char
-    order, with one space at each break pdfium generated inside it. Text
-    is otherwise verbatim. O(r log r) for r runs.
+    The direction is the one the cell's runs with a direction
+    (:func:`_run_turn`) share, else ``default_turn``: the table's, for a
+    mixed cell or one with no run with a direction (:func:`_table_turn`).
+    In that frame, runs overlapping a line by at least
+    :data:`_LINE_OVERLAP` of the smaller height are on it; lines read top
+    to bottom and join with one space; runs on a line read left to right
+    and join as the stream pass joins them (:func:`_separator`: nothing
+    across a gap of at most :data:`_JOIN_GAP_EM` ems of the larger font or
+    next to a degree or punctuation glyph, else one space); a run keeps
+    its span's char order, with one space at each break pdfium generated
+    inside it. Text is otherwise verbatim. O(r log r) for r runs.
     """
     if not runs:
         return ""
@@ -834,17 +850,33 @@ def _cell_text(runs: list[_Run], default_turn: int) -> str:
 
 
 def _reading_turn(runs: list[_Run], default: int) -> int:
-    """The turn most of the runs' chars advance at, as :func:`_page_turn` weighs them; ``default`` when none has one.
+    """The one reading turn the runs with a direction share, else ``default``."""
+    turns = _run_turns(runs)
+    return turns.pop() if len(turns) == 1 else default
 
-    A tie goes to ``default`` when it is among the tied, else as
-    :func:`_page_turn` breaks it (across, down, up). So a short run across
-    in a turned table does not turn the table back. O(r) for r runs.
+
+def _table_turn(cell_runs: list[list[_Run]]) -> int:
+    """The one turn a table's pure cells share; across when they disagree or no cell is pure.
+
+    A cell is pure when it has a run with a direction (:func:`_run_turn`)
+    and all such runs share one turn. A mixed cell (its runs with a
+    direction disagree) has no say, nor has a cell with no run with a
+    direction, and chars are not counted. So a turned table with turned
+    text and a short run across in one cell reads turned, and an upright
+    table with headers set up the page over labels or numbers across
+    reads across. A table with no mixed cell reads as when every run with
+    a direction had to agree, limits included: a turned table with a pure
+    cell across (a lone "OK", say) reads across, and an upright one whose
+    only pure cells are headers set up the page (over one-char marks,
+    say) reads turned. O(r) for r runs.
     """
-    chars = _chars_by_turn((_run_turn(run), run) for run in runs)
-    most = max(chars.values())
-    if most == 0 or chars[default] == most:
-        return default
-    return max(_TURNS, key=chars.__getitem__)
+    pure = {turns.pop() for runs in cell_runs if len(turns := _run_turns(runs)) == 1}
+    return pure.pop() if len(pure) == 1 else _ACROSS
+
+
+def _run_turns(runs: list[_Run]) -> set[int]:
+    """The turns the runs with a direction advance at."""
+    return {turn for run in runs if (turn := _run_turn(run)) is not None}
 
 
 def _run_turn(run: _Run) -> int | None:
@@ -940,8 +972,8 @@ def _run_text(run: _Run) -> str:
 
 
 def _table(grid: _Grid, cell_runs: list[list[_Run]]) -> LatticeTable | None:
-    """A grid's table, read at the turn most of its text advances at, or None if every cell is blank (decoration)."""
-    turn = _reading_turn([run for runs in cell_runs for run in runs], _ACROSS)
+    """A grid's table, read at the turn :func:`_table_turn` gives, or None if every cell is blank (decoration)."""
+    turn = _table_turn(cell_runs)
     texts = [_cell_text(runs, turn) for runs in cell_runs]
     if not any(text.strip() for text in texts):
         return None
@@ -1201,17 +1233,11 @@ def _run_chars(run: _Run) -> str:
 
 def _page_turn(runs: list[_TurnedRun]) -> int:
     """The turn most of the runs' chars advance at (ties: across, down, up); across for none."""
-    chars = _chars_by_turn(runs)
-    return max(_TURNS, key=chars.__getitem__)
-
-
-def _chars_by_turn(runs: Iterable[_TurnedRun]) -> dict[int, int]:
-    """How many chars advance at each turn: each run with a turn adds its char count to it."""
     chars = dict.fromkeys(_TURNS, 0)
     for turn, run in runs:
         if turn is not None:
             chars[turn] += run.end - run.start
-    return chars
+    return max(_TURNS, key=chars.__getitem__)
 
 
 def _ordered_lines(runs: list[_TurnedRun], page_turn: int) -> list[TextLine]:

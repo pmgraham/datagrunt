@@ -836,37 +836,66 @@ def whole_runs(*pieces: SpanPiece) -> list:
 
 
 class TestReadingTurn:
-    """A table or cell reads at the turn most of its runs' chars advance at, as page text does."""
+    """A cell reads at the one turn its runs with a direction share, else at its table's turn."""
 
     @pytest.mark.parametrize(
         "pieces,default,turn",
         [
-            # f8's cell: 11 chars rising and a 2-char run across.
-            pytest.param((rising("Value three", 10.0, 90.0), chars("ab", 30.0, 10.0)), 0, 270, id="most-chars"),
-            # Three runs across of 6 chars in all, one run rising of 7: chars count, not runs.
-            pytest.param(
-                (*(chars("ab", 10.0, 10.0 + 20.0 * row) for row in range(3)), rising("Seventh", 60.0, 90.0)),
-                0,
-                270,
-                id="chars-not-runs",
-            ),
+            pytest.param((rising("Value", 10.0, 90.0), rising("one", 30.0, 90.0)), 0, 270, id="shared"),
+            # f8's cell: 11 chars rising and a 2-char run across disagree, so the table's turn decides, not chars.
+            pytest.param((rising("Value three", 10.0, 90.0), chars("ab", 30.0, 10.0)), 0, 0, id="mixed-is-default"),
+            pytest.param((rising("Value three", 10.0, 90.0), chars("ab", 30.0, 10.0)), 270, 270, id="mixed-turned"),
             pytest.param((chars("x", 10.0, 10.0), falling("y", 30.0, 10.0)), 90, 90, id="no-direction-is-default"),
             pytest.param((), 270, 270, id="no-runs-is-default"),
         ],
     )
-    def test_the_turn_most_chars_advance_at(self, pieces, default, turn):
+    def test_the_one_turn_the_runs_share_else_the_default(self, pieces, default, turn):
         assert layout._reading_turn(whole_runs(*pieces), default) == turn
 
+
+def cells_of(*cells: tuple[SpanPiece, ...]) -> list:
+    """Each cell's pieces as runs of all their chars."""
+    return [whole_runs(*pieces) for pieces in cells]
+
+
+class TestTableTurn:
+    """A table reads at the one turn its pure cells share (each cell's runs with a direction agree), else across."""
+
     @pytest.mark.parametrize(
-        "pieces,default,turn",
+        "cells,turn",
         [
-            pytest.param((chars("abc", 10.0, 10.0), falling("abc", 60.0, 10.0)), 90, 90, id="default-among-the-tied"),
-            pytest.param((chars("abc", 10.0, 10.0), falling("abc", 60.0, 10.0)), 270, 0, id="across-before-down"),
-            pytest.param((falling("abc", 10.0, 10.0), rising("abc", 60.0, 90.0)), 0, 90, id="down-before-up"),
+            pytest.param(((rising("Name", 10.0, 90.0),), (rising("Value", 60.0, 90.0),), ()), 270, id="pure-agree-up"),
+            pytest.param(((falling("Name", 10.0, 10.0),), (falling("Value", 60.0, 10.0),)), 90, id="pure-agree-down"),
+            # A vertical header over a 2-char number: each cell is pure, but they disagree.
+            pytest.param(((rising("Respondents", 10.0, 90.0),), (chars("12", 60.0, 10.0),)), 0, id="pure-disagree"),
+            # f8's table: the mixed cell has no say, so its 2-char run across does not turn the table back.
+            pytest.param(
+                ((rising("Name one", 10.0, 90.0),), (rising("Value three", 60.0, 90.0), chars("ab", 70.0, 10.0))),
+                270,
+                id="mixed-ignored",
+            ),
+            # Nor does the mixed cell's longer text: the one pure cell, 4 chars falling, decides.
+            pytest.param(
+                ((falling("Name", 10.0, 10.0),), (rising("Value three", 60.0, 90.0), chars("ab", 70.0, 10.0))),
+                90,
+                id="mixed-majority-ignored",
+            ),
         ],
     )
-    def test_a_tie_goes_to_the_default_if_tied_else_across_down_up(self, pieces, default, turn):
-        assert layout._reading_turn(whole_runs(*pieces), default) == turn
+    def test_the_one_turn_the_pure_cells_share(self, cells, turn):
+        assert layout._table_turn(cells_of(*cells)) == turn
+
+    @pytest.mark.parametrize(
+        "cells",
+        [
+            pytest.param((), id="no-cells"),
+            pytest.param(((), ()), id="blank-cells"),
+            pytest.param(((chars("x", 10.0, 10.0),), (falling("y", 60.0, 10.0),)), id="no-direction"),
+            pytest.param(((rising("Value three", 10.0, 90.0), chars("ab", 30.0, 10.0)),), id="only-mixed"),
+        ],
+    )
+    def test_no_pure_cell_reads_across(self, cells):
+        assert layout._table_turn(cells_of(*cells)) == layout._ACROSS
 
 
 def read_tables(tmp_path, *items, rotate: int = 0) -> LatticeResult:
@@ -924,13 +953,56 @@ TURNED_TEXT = (
 )
 
 
-def turned_table(tmp_path, extra: bytes = b"") -> LatticeResult:
-    """find_lattice_tables over the turned grid, drawn raw (ReportLab sets no text matrix), then ``extra``."""
-    drawn = b"".join(b"%d %d m %d %d l S\n" % (x, TURNED_YS[0], x, TURNED_YS[-1]) for x in TURNED_XS)
-    drawn += b"".join(b"%d %d m %d %d l S\n" % (TURNED_XS[0], y, TURNED_XS[-1], y) for y in TURNED_YS)
-    drawn += b"".join(b"BT /F1 11 Tf 0 1 -1 0 %d %d Tm (%s) Tj ET\n" % (x, y, text) for text, x, y in TURNED_TEXT)
-    page = extract_page(open_document(raw_pdf(tmp_path, drawn + extra)), 0)
+def up(text: bytes, x: int, y: int, size: int = 11) -> bytes:
+    """Content drawing ``text`` a quarter turn anticlockwise (it reads up the page) from (x, y)."""
+    return b"BT /F1 %d Tf 0 1 -1 0 %d %d Tm (%s) Tj ET\n" % (size, x, y, text)
+
+
+def across(text: bytes, x: int, y: int, size: int = 11) -> bytes:
+    """Content drawing ``text`` upright from (x, y)."""
+    return b"BT /F1 %d Tf %d %d Td (%s) Tj ET\n" % (size, x, y, text)
+
+
+def raw_table(tmp_path, xs, ys, text: bytes) -> LatticeResult:
+    """find_lattice_tables over a grid ruled at ``xs`` and ``ys`` (PDF space), drawn raw with ``text``.
+
+    Drawn raw because ReportLab sets no text matrix.
+    """
+    drawn = b"".join(b"%d %d m %d %d l S\n" % (x, ys[0], x, ys[-1]) for x in xs)
+    drawn += b"".join(b"%d %d m %d %d l S\n" % (xs[0], y, xs[-1], y) for y in ys)
+    page = extract_page(open_document(raw_pdf(tmp_path, drawn + text)), 0)
     return find_lattice_tables(page.segments.segments, assess_page(page).pieces)
+
+
+def turned_table(tmp_path, extra: bytes = b"") -> LatticeResult:
+    """find_lattice_tables over the turned grid, then ``extra``."""
+    return raw_table(tmp_path, TURNED_XS, TURNED_YS, b"".join(up(*item) for item in TURNED_TEXT) + extra)
+
+
+# A feature matrix: a label column and 5 product columns; 3 body rows under a tall header row (PDF y 130-270). Product
+# names are set up the page in the header, row labels across, and the body holds one-char marks.
+MATRIX_XS, MATRIX_YS = (20, 120, 160, 200, 240, 280, 320), (40, 70, 100, 130, 270)
+MATRIX_LABELS = ((b"Single sign-on", 110), (b"Audit logging", 80), (b"Export to CSV", 50))
+MATRIX_HEADERS = b"".join(
+    up(b"Product " + name, x + 25, 138, size=10) for name, x in zip((b"A", b"B", b"C", b"D", b"E"), MATRIX_XS[1:-1])
+)
+MATRIX_MARKS = b"".join(across(b"x", x + 16, y, size=10) for _, y in MATRIX_LABELS for x in MATRIX_XS[1:-1])
+MATRIX_TEXT = MATRIX_HEADERS + MATRIX_MARKS + b"".join(across(label, 24, y, size=9) for label, y in MATRIX_LABELS)
+MATRIX_GRID = (
+    ("", "Product A", "Product B", "Product C", "Product D", "Product E"),
+    ("Single sign-on", "x", "x", "x", "x", "x"),
+    ("Audit logging", "x", "x", "x", "x", "x"),
+    ("Export to CSV", "x", "x", "x", "x", "x"),
+)
+
+# Three columns: a header row (PDF y 160-280) of one word set up the page, over two rows of 2-char numbers across.
+SURVEY_XS, SURVEY_YS = (40, 140, 240, 340), (40, 100, 160, 280)
+SURVEY_TEXT = b"".join(up(b"Respondents", x + 55, 168, size=10) for x in SURVEY_XS[:-1]) + b"".join(
+    across(number, SURVEY_XS[col] + 10, y, size=10)
+    for y, numbers in ((120, (b"12", b"34", b"56")), (60, (b"78", b"90", b"11")))
+    for col, number in enumerate(numbers)
+)
+SURVEY_GRID = (("Respondents",) * 3, ("12", "34", "56"), ("78", "90", "11"))
 
 
 XS, YS = (50.0, 150.0, 250.0, 350.0), (40.0, 60.0, 80.0, 100.0)
@@ -1034,8 +1106,8 @@ class TestFindLatticeTables:
         "extra,last",
         [
             pytest.param(b"", "Value three", id="all-turned"),
-            # A 2-char run across in the last cell: most of the table's chars still read up the page.
-            pytest.param(b"BT /F1 8 Tf 300 200 Td (ab) Tj ET\n", "Value three ab", id="one-short-run-across"),
+            # A 2-char run across in the last cell besides its turned text: a mixed cell, which has no say (#453).
+            pytest.param(across(b"ab", 300, 200, size=8), "Value three ab", id="one-short-run-across"),
         ],
     )
     def test_a_table_drawn_turned_reads_along_its_text_with_a_short_run_across(self, tmp_path, extra, last):
@@ -1043,6 +1115,37 @@ class TestFindLatticeTables:
 
         assert [(table.turn, table.grid()) for table in result.tables] == [
             (270, (("Name one", "Value one"), ("Name two", "Value two"), ("Name three", last)))
+        ]
+
+    def test_a_table_drawn_turned_with_a_cell_only_across_reads_across(self, tmp_path):
+        # Known limitation, as before #453: a lone "OK" is a pure cell across, which disagrees with the turned ones.
+        text = b"".join(up(*item) for item in TURNED_TEXT[:-1]) + across(b"OK", 300, 200)
+
+        result = raw_table(tmp_path, TURNED_XS, TURNED_YS, text)
+
+        assert [(table.turn, table.grid()) for table in result.tables] == [
+            (0, (("Value one", "Value two", "OK"), ("Name one", "Name two", "Name three")))
+        ]
+
+    @pytest.mark.parametrize(
+        "xs,ys,text,grid",
+        [
+            pytest.param(MATRIX_XS, MATRIX_YS, MATRIX_TEXT, MATRIX_GRID, id="feature-matrix-of-one-char-marks"),
+            pytest.param(SURVEY_XS, SURVEY_YS, SURVEY_TEXT, SURVEY_GRID, id="2-char-numbers"),
+        ],
+    )
+    def test_an_upright_table_with_headers_set_up_the_page_reads_across(self, tmp_path, xs, ys, text, grid):
+        # Its header cells are pure up and its label or number cells pure across: they disagree.
+        result = raw_table(tmp_path, xs, ys, text)
+
+        assert [(table.turn, table.grid()) for table in result.tables] == [(0, grid)]
+
+    def test_an_upright_table_whose_only_pure_cells_are_headers_set_up_the_page_reads_turned(self, tmp_path):
+        # Known limitation, as before #453: with no row labels, nothing across tells it from a table drawn turned.
+        result = raw_table(tmp_path, MATRIX_XS, MATRIX_YS, MATRIX_HEADERS + MATRIX_MARKS)
+
+        assert [(table.turn, table.grid()) for table in result.tables] == [
+            (270, (("", "", "", ""), *(("x", "x", "x", f"Product {name}") for name in "ABCDE")))
         ]
 
     def test_a_page_border_frame_is_no_table_and_uses_no_text(self, tmp_path):
