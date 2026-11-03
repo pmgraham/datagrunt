@@ -7,6 +7,7 @@ re-exported from the top-level ``datagrunt`` package; the v4 ``PDFReader`` /
 
 from datagrunt.pdf.elements import (
     HIDDEN_REASONS,
+    PAGE_ROUTES,
     BBox,
     BulletList,
     DocumentElement,
@@ -48,6 +49,7 @@ __all__ = [
     "HIDDEN_REASONS",
     "PageStatus",
     "PageRoute",
+    "PAGE_ROUTES",
     "ExtractionMethod",
     "make_element_id",
     "DatagruntPDFError",

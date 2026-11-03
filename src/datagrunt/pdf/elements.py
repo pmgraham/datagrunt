@@ -1166,7 +1166,8 @@ class PageImage:
 _PAGE_STATUSES: tuple[PageStatus, ...] = get_args(PageStatus)
 # Statuses that only a vision-route page can have.
 _VISION_ONLY_STATUSES: tuple[PageStatus, ...] = ("ocr_fallback", "ocr_unavailable")
-# Public, like HIDDEN_REASONS: the v5 quality stage (datagrunt.pdf.quality) checks routes with it.
+# Public (exported from datagrunt.pdf), like HIDDEN_REASONS: the routes a page can take, in PageRoute's order;
+# the v5 quality stage (datagrunt.pdf.quality) checks routes with it.
 PAGE_ROUTES: tuple[PageRoute, ...] = get_args(PageRoute)
 _ELEMENT_TYPES: tuple[type, ...] = get_args(DocumentElement)
 
