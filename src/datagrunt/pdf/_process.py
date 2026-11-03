@@ -119,7 +119,7 @@ ERROR = b"E"
 # installs the caller's sys.path, and hands the request to the named worker.
 # A worker module that cannot be imported because the [pdf] extra is missing
 # where the worker runs (pypdfium2 or PIL, by the ImportError's name, written
-# here) is reported, not crashed on: its first reply is the install hint as an
+# here) is reported rather than ending the worker: its first reply is the install hint as an
 # ERROR (missing_extra_reply), which every worker's caller raises. Any other
 # import failure ends the worker as before, its traceback on stderr.
 # Fixed text: nothing from the caller or the PDF is in it.
