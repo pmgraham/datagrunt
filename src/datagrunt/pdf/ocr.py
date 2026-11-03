@@ -22,7 +22,9 @@ The tesseract CLI (never ``pytesseract``) reads the page:
   and reads its ``Rotate``: the clockwise turn, 0, 90, 180 or 270 degrees,
   that rights the page. :func:`rotated` makes that turn.
 - :func:`read_sample` reads one image whole in one call (``--psm 11``,
-  sparse text, TSV): each word's text and confidence, no boxes. The vision
+  sparse text, TSV): each word's text and confidence, no boxes; a
+  :class:`SampleReading` gives their mean confidence and counts their
+  letters and digits (``text_chars``). The vision
   route checks a turn OSD suggests on a sample of the page so (#456), its
   bands as :func:`inked_bands` orders them: the band holding the most ink
   (pixels darker than mid-grey) first. Not ``--psm 3``: its page
@@ -389,6 +391,14 @@ class SampleReading:
         if chars == 0:
             return None
         return math.fsum(len(text) * confidence for text, confidence in self.words) / chars
+
+    @property
+    def text_chars(self) -> int:
+        """The words' letters and digits (of any script: ``str.isalnum``), counted: what of the reading is text (#456).
+
+        Art read as marks (``~|``, ``[@],``) counts for nothing.
+        """
+        return sum(char.isalnum() for text, _ in self.words for char in text)
 
 
 def _checked_pairs(words: object) -> tuple[tuple[str, float], ...]:

@@ -13,6 +13,7 @@ import dataclasses
 import io
 import os
 import pickle
+import random
 import re
 import shutil
 import time
@@ -21,7 +22,7 @@ from pathlib import Path
 
 import pypdfium2 as pdfium
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFilter
 
 from datagrunt.pdf import _loaders, vision
 from datagrunt.pdf._loaders import FigureRead
@@ -893,11 +894,31 @@ def kept(degrees: int, osd: str, turned: str, displayed: str) -> str:
     return f"{righted} (orientation confidence {osd}; its sample reads {turned} turned and {displayed} as displayed)"
 
 
+def too_little(reads: str, chars: int, suggests: str = SUGGESTS) -> str:
+    """The warning of a turn whose turned sample reads ``chars`` letters or digits, too few to bear it out."""
+    under = f"under {vision.LEAST_TEXT_CHARS}: too little text to bear a turn out"
+    few = f"turned, it reads {chars} letters or digits, {under}"
+    return f"{suggests}, but {reads} ({few}); OCR read it as displayed"
+
+
 QUARTER = Orientation(degrees=90, confidence=2.0, status="ok", reason="")
+SUGGESTS_90 = "orientation detection suggests turning the page 90 degrees clockwise at a confidence of 2"
 
 
 # The captioned scan's 4 bands, each read as displayed and turned: a check reads 8 samples at most.
 EVERY_BAND = 4
+
+# Readings of under LEAST_TEXT_CHARS letters or digits (#456 review): a band of art read as displayed (3 chars, 2
+# of them letters, at 34.0) and turned (4 letters at 51.8), as tesseract read the art block under sparse capitals;
+# and art read as one letter (13.4).
+ART = sample_tsv(("Ww", 34.0), ("|", 34.0))
+ART_TURNED = sample_tsv(("ii", 51.8), ("oO", 51.8))
+GLYPH = sample_tsv(("l", 13.4))
+
+
+def text(confidence: float) -> bytes:
+    """A sample of 13 letters (``LEAST_TEXT_CHARS`` or more) read at ``confidence``."""
+    return sample_tsv(("ALPHA", confidence), ("DOCUMENT", confidence))
 
 
 @posix_only
@@ -907,6 +928,10 @@ class TestTurnCheck:
     def test_the_margin_is_set_from_the_evidence(self):
         # Corpus (95 pages x 4 turns) and sparse capitals: see the vision module notes, step 2.
         assert vision.TURN_MARGIN == 15.0
+
+    def test_the_least_text_is_set_from_the_evidence(self):
+        # Art pages, corpus and sparse capitals: see the vision module notes, step 2.
+        assert vision.LEAST_TEXT_CHARS == 12
 
     def test_a_turn_its_sample_reads_better_is_kept(self, scans, monkeypatch, tmp_path):
         page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, LOW, HIGH)
@@ -927,7 +952,7 @@ class TestTurnCheck:
     def test_the_turned_sample_must_read_the_margin_better(self, scans, monkeypatch, tmp_path, over, turn, calls):
         # Under the margin, a band decides nothing: every band is read, and the page's sample is still under it.
         better = 50.0 + vision.TURN_MARGIN + over
-        reports = (sample_tsv(("text", 50.0)), sample_tsv(("text", better))) * EVERY_BAND
+        reports = (text(50.0), text(better)) * EVERY_BAND
 
         _, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, *reports)
 
@@ -935,31 +960,35 @@ class TestTurnCheck:
         assert (fake / "calls").read_text() == f"{calls}\n"
 
     def test_the_mean_is_weighted_by_chars(self, scans, monkeypatch, tmp_path):
-        # Turned: words of 20 and 80 confidence, the 80 one 4 chars of 5: 68.0 (unweighted, 50.0); displayed 50.0.
-        reports = (sample_tsv(("text", 50.0)), sample_tsv(("a", 20.0), ("word", 80.0)))
+        # Turned: words of 20 and 80 confidence, the 80 one 11 chars of 12: 75.0 (unweighted, 50.0); displayed 50.0.
+        reports = (text(50.0), sample_tsv(("a", 20.0), ("typesetters", 80.0)))
 
         page, (call,), _ = checked(scans, monkeypatch, tmp_path, TURNED_180, *reports)
 
         assert call["rotation"] == 180
-        assert turn_notes(page) == [kept(180, "2.04", "at 68.0", "at 50.0")]
+        assert turn_notes(page) == [kept(180, "2.04", "at 75.0", "at 50.0")]
 
     @pytest.mark.parametrize(
-        ("displayed", "shown", "calls"),
-        [(HIGH, "at 96.0", 2), (LOW, "at 37.0", 2), (NO_WORDS, "no words", 8)],
+        ("displayed", "shown", "calls", "decided"),
+        [(HIGH, "at 96.0", 2, True), (LOW, "at 37.0", 6, True), (NO_WORDS, "no words", 8, False)],
         ids=["high", "low", "none"],
     )
-    def test_a_turned_sample_of_no_words_is_never_better(self, scans, monkeypatch, tmp_path, displayed, shown, calls):
-        # No words either way is no evidence: the next band is read, to the last.
+    def test_a_turned_sample_of_no_words_is_never_better(
+        self, scans, monkeypatch, tmp_path, displayed, shown, calls, decided
+    ):
+        # No words turned counts as no confidence, never as a refusal by itself: the bands are read until the sample
+        # as displayed holds LEAST_TEXT_CHARS letters or digits (LOW's 5 a band: 3 bands), or to the last.
         reports = (displayed, NO_WORDS) * EVERY_BAND
 
         page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, *reports)
 
         assert call["rotation"] == 0
         assert (fake / "calls").read_text() == f"{calls}\n"
-        assert turn_notes(page) == [refused("no words", shown)]
+        reads = f"its sample reads no words turned and {shown} as displayed"
+        assert turn_notes(page) == [refused("no words", shown) if decided else too_little(reads, 0)]
 
     @pytest.mark.parametrize(
-        ("turned", "turn"), [pytest.param(HIGH, 180, id="kept"), pytest.param(sample_tsv(("x", 14.9)), 0, id="refused")]
+        ("turned", "turn"), [pytest.param(HIGH, 180, id="kept"), pytest.param(text(14.9), 0, id="refused")]
     )
     def test_a_displayed_sample_of_no_words_reads_as_no_confidence(self, scans, monkeypatch, tmp_path, turned, turn):
         # A sideways page's sample reads no words as displayed (psm 11): a turn is kept by the margin over 0.
@@ -1032,6 +1061,58 @@ class TestTurnCheck:
         # Joined: (4 x 50 + 5 x 37) / 9 = 42.8 and (4 x 50 + 13 x 96) / 17 = 85.2; no words joins nothing.
         joined = ("at 85.2", "at 42.8") if first != NO_WORDS else ("at 96.0", "at 37.0")
         assert turn_notes(page) == [kept(180, "2.04", *joined)]
+
+    def test_a_band_of_art_read_as_a_few_letters_decides_nothing(self, scans, monkeypatch, tmp_path):
+        # #456 review: sparse capitals over an art block, upright; the art band holds the most ink, and reads 17.8
+        # better turned on 4 letters. Under LEAST_TEXT_CHARS either way, it decides nothing: the next band by ink,
+        # the capitals, is read and joined, and refuses the turn.
+        page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, ART, ART_TURNED, HIGH, LOW)
+
+        by_ink = inked_bands(normalized(rendered(scans["captioned"])))
+        assert call["rotation"] == 0
+        assert (fake / "calls").read_text() == "4\n"
+        assert (fake / "stdin-3").read_bytes() == pgm(by_ink[1])
+        # Joined: (3 x 34.0 + 13 x 96.0) / 16 = 84.4 as displayed; (4 x 51.8 + 5 x 37.0) / 9 = 43.6 turned.
+        assert turn_notes(page) == [refused("at 43.6", "at 84.4")]
+
+    def test_a_turned_reading_of_no_words_is_not_decisive_alone(self, scans, monkeypatch, tmp_path):
+        # #456 review: an upside-down scan whose drawing holds the most ink reads one glyph as displayed and no words
+        # turned. That refuses nothing: the next band by ink, the text, is read and keeps the turn.
+        page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, GLYPH, NO_WORDS, LOW, HIGH)
+
+        by_ink = inked_bands(normalized(rendered(scans["captioned"])))
+        assert call["rotation"] == 180
+        assert (fake / "calls").read_text() == "4\n"
+        assert (fake / "stdin-3").read_bytes() == pgm(by_ink[1])
+        assert (fake / "stdin-4").read_bytes() == pgm(rotated(by_ink[1], 180))
+        # Joined as displayed: (1 x 13.4 + 5 x 37.0) / 6 = 33.1.
+        assert turn_notes(page) == [kept(180, "2.04", "at 96.0", "at 33.1")]
+
+    def test_a_turn_read_from_too_few_letters_or_digits_is_never_kept(self, scans, monkeypatch, tmp_path):
+        # Turned a quarter, an upside-down page of art and text reads a glyph or two at a high confidence, over its
+        # text as displayed (#456 review: 62.5 on 2 chars against 41.1 on 96). The turned reading must hold
+        # LEAST_TEXT_CHARS itself: every band is read, it never does, and the page reads as displayed.
+        displayed = sample_tsv(("WHdWHdWHd", 41.0), ("1V1V1V", 41.0))
+        reports = (displayed, sample_tsv(("l", 62.5)), sample_tsv(("i", 40.5))) * EVERY_BAND
+
+        page, (call,), fake = checked(scans, monkeypatch, tmp_path, QUARTER, *reports)
+
+        assert call["rotation"] == 0
+        assert (fake / "calls").read_text() == f"{3 * EVERY_BAND}\n"
+        reads = "its sample reads at 62.5 turned, at 41.0 as displayed and at 40.5 turned 270 degrees"
+        assert turn_notes(page) == [too_little(reads, EVERY_BAND, SUGGESTS_90)]
+
+    def test_a_sample_of_too_little_text_any_way_reads_as_displayed(self, scans, monkeypatch, tmp_path):
+        # Every band read, no way reaches LEAST_TEXT_CHARS (2 letters a band): the turn is not borne out, however
+        # much better it reads, and the page reads as displayed (module notes, step 2).
+        reports = (sample_tsv(("ab", 30.0)), sample_tsv(("cd", 90.0))) * EVERY_BAND
+
+        page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, *reports)
+
+        assert call["rotation"] == 0
+        assert (fake / "calls").read_text() == f"{2 * EVERY_BAND}\n"
+        reads = "its sample reads at 90.0 turned and at 30.0 as displayed"
+        assert turn_notes(page) == [too_little(reads, 2 * EVERY_BAND)]
 
     @pytest.mark.parametrize("fail", [1, 2], ids=["as-displayed", "turned"])
     def test_a_sample_tesseract_cannot_read_leaves_the_page_as_displayed(self, scans, monkeypatch, tmp_path, fail):
@@ -2140,14 +2221,132 @@ class TestSparseCapitals:
 
     @pytest.mark.parametrize("shown", [0, 90, 180, 270])
     @pytest.mark.parametrize("index", [0, 2])
-    def test_a_page_is_never_turned_a_wrong_way(self, capitals, shown, index):
-        # Displayed at each turn, OSD suggests the wrong turn (the one it is displayed at, at 1.95 to 2.05 here); the
-        # check refuses it, and keeps a right one. (Displayed upside down, OSD reads it as upright: not checked.)
+    def test_a_wrong_turn_is_refused_and_a_right_one_kept(self, capitals, shown, index):
+        # Displayed at each turn, OSD suggests a wrong one (the turn it is displayed at: 180 upright at 2.04, 90 at
+        # 1.99, 270 at 2.04 or 2.05 here), or reads it upside down as upright (2.07 or 2.08): OSD's own turn is kept
+        # only were it the right one. Suggested at the threshold, each right turn is kept and each wrong one refused.
         page = rotated(
             normalized(render_page(capitals, index, dpi=300, memory_cap_bytes=1 << 30, timeout_s=120.0)), shown
         )
+        right = (360 - shown) % 360
         found = vision.orientation(page, timeout_s=120.0)
 
         turn = vision._turn(page, found, VisionOptions(), time.monotonic() + 600.0)
 
-        assert turn.degrees in (0, (360 - shown) % 360), (found, turn)
+        osd_right = found.degrees == right and (found.confidence or 0.0) >= vision.ROTATION_CONFIDENCE
+        assert turn.degrees == (right if osd_right else 0), (found, turn)
+        for degrees in (90, 180, 270):
+            suggested = Orientation(degrees=degrees, confidence=vision.ROTATION_CONFIDENCE, status="ok", reason="")
+            checked_turn = vision._turn(page, suggested, VisionOptions(), time.monotonic() + 600.0)
+            assert checked_turn.degrees == (right if degrees == right else 0), (degrees, checked_turn)
+
+
+def drawing_png(seed: int) -> bytes:
+    """A drawing of 8 to 29 random ellipses and boxes and up to 19 lines, 900 x 700 px: art with no text."""
+    rnd = random.Random(seed)
+    picture = Image.new("L", (900, 700), 255)
+    draw = ImageDraw.Draw(picture)
+    for _ in range(rnd.randrange(8, 30)):
+        x0, y0 = rnd.randrange(900), rnd.randrange(700)
+        x1, y1 = x0 + rnd.randrange(20, 300), y0 + rnd.randrange(20, 300)
+        fill = rnd.randrange(0, 160)
+        shape = draw.ellipse if rnd.random() < 0.5 else draw.rectangle
+        shape((x0, y0, x1, y1), fill=fill, outline=0, width=rnd.randrange(1, 8))
+    for _ in range(rnd.randrange(0, 20)):
+        draw.line([(rnd.randrange(900), rnd.randrange(700)) for _ in range(2)], fill=0, width=rnd.randrange(1, 10))
+    buffer = io.BytesIO()
+    picture.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def blotch_png(seed: int) -> bytes:
+    """A 156 x 100 px blotch of blurred noise, its contrast raised: art like a photo, with no text."""
+    rnd = random.Random(seed)
+    picture = Image.new("L", (156, 100))
+    picture.putdata([rnd.randrange(0, 256) for _ in range(156 * 100)])
+    picture = picture.filter(ImageFilter.GaussianBlur(2)).point(lambda level: max(0, min(255, (level - 128) * 4 + 128)))
+    buffer = io.BytesIO()
+    picture.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+DRAWN_LINES = tuple(
+    TextRun(sentence, 72.0, 560.0 + 24.0 * index, size=12.0) for index, sentence in enumerate(SENTENCES[:2])
+)
+DRAWN_TOKENS = [token for sentence in SENTENCES[:2] for token in sentence.split()]
+
+
+@pytest.fixture(scope="module")
+def drawn_scans(tmp_path_factory) -> dict[int, tuple[Path, Path]]:
+    """By seed: a page of a drawing over two sentences, and its raster scan (no text layer) displayed upside down."""
+    directory = tmp_path_factory.mktemp("drawn")
+    scans = {}
+    for seed in (2, 3, 9):
+        drawing = RasterImage(36.0, 60.0, 540.0, 420.0, drawing_png(seed))
+        digital = build_pdf(directory / f"digital-{seed}.pdf", [PageSpec(items=(drawing, *DRAWN_LINES))])
+        scan = RasterImage(0.0, 0.0, *LETTER, png_of(rendered(digital)))
+        scans[seed] = (digital, build_pdf(directory / f"scan-{seed}.pdf", [PageSpec(items=(scan,), rotate=180)]))
+    return scans
+
+
+@pytest.fixture(scope="module")
+def capitals_over_art(tmp_path_factory) -> Path:
+    """The sparse capitals (#456), each page with a blotch of art below them holding more ink than they do."""
+    pages = [
+        PageSpec(
+            items=(
+                TextRun(f"ALPHA DOCUMENT PAGE {number}", 72.0, 100.0, size=28.0),
+                TextRun("ALPHA ALPHA ALPHA body text line", 72.0, 160.0, size=20.0),
+                RasterImage(72.0, 300.0, 468.0, 300.0, blotch_png(number)),
+            )
+        )
+        for number in range(1, 9)
+    ]
+    return build_pdf(tmp_path_factory.mktemp("capitals") / "over-art.pdf", pages)
+
+
+def most_ink_rows(page: RenderedPage) -> tuple[int, int]:
+    """The rows of ``page``'s band holding the most ink (the first band its turn check reads)."""
+    first = inked_bands(page)[0]
+    (top,) = [band.top_px for band in bands(page) if band.pixels == first.pixels]
+    return top, top + first.px_height
+
+
+@needs_tesseract
+class TestArtFirst:
+    """A band of art read first never decides a turn: the check reads on to the page's text (#456 review)."""
+
+    @pytest.mark.parametrize("seed", [2, 3, 9])
+    def test_an_upside_down_scan_whose_most_ink_is_a_drawing_is_righted(self, drawn_scans, seed):
+        digital, scan = drawn_scans[seed]
+        # The text lies outside the band holding the most ink: that band is the drawing's.
+        top, bottom = most_ink_rows(normalized(rendered(scan)))
+        lines = turned(union_of(box for _, box in word_boxes(digital)), 180, *LETTER)
+        assert lines[3] * 300 / 72 < top or lines[1] * 300 / 72 >= bottom, (lines, top, bottom)
+
+        (page,) = PDFReader(scan, ocr="auto").pages
+
+        assert (page.status, page.route) == ("ok", "vision")
+        righted = [note for note in page.warnings if note.startswith("the page reads turned")]
+        assert len(righted) == 1 and "OCR righted it by 180 degrees clockwise" in righted[0], page.warnings
+        read = " ".join(texts(page))
+        assert " ".join(SENTENCES[0].split()[:9]) in read, read
+        assert len(set(DRAWN_TOKENS) & set(read.split())) >= 0.9 * len(set(DRAWN_TOKENS)), read
+
+    def test_sparse_capitals_over_art_read_upright(self, capitals_over_art):
+        # #456 again, with art: OSD suggests turning the upright pages 180 degrees; page 2's art band (the most ink)
+        # read 51.8 turned and 34.0 as displayed, which kept the turn on art alone, and the page read as gibberish.
+        top, _ = most_ink_rows(
+            normalized(render_page(capitals_over_art, 1, dpi=300, memory_cap_bytes=1 << 30, timeout_s=120.0))
+        )
+        assert top >= 170.0 * 300 / 72  # the band read first lies below the capitals (their baselines: 100, 160 pt)
+
+        pages = PDFReader(capitals_over_art, ocr="always", workers=4).pages
+
+        assert len(pages) == 8
+        for number, page in enumerate(pages, start=1):
+            expected = Counter(f"ALPHA DOCUMENT PAGE {number} ALPHA ALPHA ALPHA body text line".split())
+            read = Counter(" ".join(texts(page)).split())
+            assert (page.status, page.route) == ("ok", "vision")
+            assert not [note for note in page.warnings if note.startswith("the page reads turned")], page.warnings
+            assert sum((expected & read).values()) >= 9, (number, texts(page), page.warnings)

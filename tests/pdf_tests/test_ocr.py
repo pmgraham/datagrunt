@@ -414,6 +414,19 @@ class TestRecords:
         assert SampleReading(words=words, status="ok", reason="").confidence == confidence
 
     @pytest.mark.parametrize(
+        ("words", "chars"),
+        [
+            pytest.param((("Page", 90.0), ("3,", 80.0)), 5, id="letters-and-digits"),
+            pytest.param((("~|", 30.0), ("—", 10.0), ("[@],", 0.0)), 0, id="art-read-as-marks"),
+            pytest.param((("ça", 90.0), ("Ωmega", 90.0)), 7, id="any-script"),
+            pytest.param((), 0, id="no-words"),
+        ],
+    )
+    def test_a_sample_readings_text_chars_are_its_words_letters_and_digits(self, words, chars):
+        # What of a reading is text (#456): art read as marks counts for nothing, a letter of any script for one.
+        assert SampleReading(words=words, status="ok", reason="").text_chars == chars
+
+    @pytest.mark.parametrize(
         "fields,error,message",
         [
             pytest.param({"words": [("fox", 9.0)]}, TypeError, "words must be a tuple, got list", id="list"),
