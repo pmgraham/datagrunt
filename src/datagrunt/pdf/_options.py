@@ -4,8 +4,10 @@ Internal: not exported from ``datagrunt`` or ``datagrunt.pdf``. The caller
 checks its options before any work and sends them to its workers, so these
 live apart from the modules only a worker imports: :data:`OcrMode` (A3's,
 re-exported by :mod:`datagrunt.pdf.quality`), :data:`MIN_IMAGE_DIMENSION`
-(A4b's, re-exported by :mod:`datagrunt.pdf.assembly`) and
-:class:`VisionOptions` (A5b's, re-exported by :mod:`datagrunt.pdf.vision`).
+(A4b's, re-exported by :mod:`datagrunt.pdf.assembly`), :data:`DPI` and
+:data:`MAX_RENDER_PIXELS` (the reader's defaults, and A4b's for a page's
+image) and :class:`VisionOptions` (A5b's, re-exported by
+:mod:`datagrunt.pdf.vision`).
 """
 
 from dataclasses import dataclass
@@ -13,7 +15,7 @@ from typing import Literal, TypeAlias
 
 from datagrunt.pdf._validate import int_at_least, non_blank_str, positive_float
 
-__all__ = ["MEMORY_CAP_BYTES", "MIN_IMAGE_DIMENSION", "OcrMode", "VisionOptions"]
+__all__ = ["DPI", "MAX_RENDER_PIXELS", "MEMORY_CAP_BYTES", "MIN_IMAGE_DIMENSION", "OcrMode", "VisionOptions"]
 
 OcrMode: TypeAlias = Literal["auto", "always", "never"]
 """The reader's OCR option: ``"auto"`` routes by the page's text,
@@ -25,10 +27,12 @@ hybrid stays digital."""
 # v4's default minimum image side in pixels (core.pdf_io.extraction.config._DEFAULT_MIN_IMAGE_DIMENSION).
 MIN_IMAGE_DIMENSION = 40
 
-# The spec's construction checks (PDFReader / PDFWriter) and defaults: vision_dpi >= 36, 300; max_render_pixels >=
-# 512 x 512, 16,000,000.
+# The spec's construction checks (PDFReader / PDFWriter) and defaults: dpi >= 36, 200; vision_dpi >= 36, 300;
+# max_render_pixels >= 512 x 512, 16,000,000. A page's image (P2-A) is drawn at dpi.
 _MIN_DPI = 36
 _MIN_RENDER_PIXELS = 262_144
+DPI = 200
+MAX_RENDER_PIXELS = 16_000_000
 # Every pdfium worker's memory past its start (render, page and figure workers): pdfium can spend ~1.7 GiB decoding an
 # image within A2's bounds (_pdfium_images).
 MEMORY_CAP_BYTES = 2 << 30
@@ -61,7 +65,7 @@ class VisionOptions:
     """
 
     vision_dpi: int = 300
-    max_render_pixels: int = 16_000_000
+    max_render_pixels: int = MAX_RENDER_PIXELS
     language: str = "eng"
     memory_cap_bytes: int = MEMORY_CAP_BYTES
     render_timeout_s: float = _RENDER_TIMEOUT_S

@@ -851,7 +851,10 @@ class TestPipeline:
         (page,) = extract_document(path, ocr="never", max_render_pixels=262_144).pages
 
         assert (page.status, page.route, page.width_pt, page.height_pt) == ("ok", "digital", 20.0, 6_000_000.0)
-        assert page.warnings[-1] == "background not checked: a 20.0 x 6000000.0 pt page renders 0 px wide at 3 DPI"
+        refused = "a 20.0 x 6000000.0 pt page renders 0 px wide at 3 DPI"
+        # Its page image (P2-A) cannot be drawn within the bound either: it has none, and says why.
+        assert page.warnings[-2:] == (f"background not checked: {refused}", f"the page has no page image: {refused}")
+        assert page.page_image is None
         assert hidden_paragraphs(page) == [("Hi", UNCHECKED)]
         assert element_texts(page) == ["ok"]
 

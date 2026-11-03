@@ -4,14 +4,15 @@ Internal: not exported from ``datagrunt`` or ``datagrunt.pdf``. Pure: it
 reads A2's raw facts (:class:`~datagrunt.pdf.pdfium_engine.RawPage`), A3's
 assessment and A4a's lattice tables, and calls no pdfium function. A
 figure's bytes come from a :class:`~datagrunt.pdf._loaders.FigureRead`,
-which assembly binds and never calls: nothing is decoded until a caller
-reads the figure, and then in a capped figure worker.
+and the page image's from a :class:`~datagrunt.pdf._loaders.PageDraw`,
+which assembly binds and never calls: nothing is decoded or drawn until a
+caller reads the figure or the page image, and then in a capped worker.
 
 :func:`assemble_page` makes the A1 :class:`~datagrunt.pdf.elements.Page`
 of a digital or hybrid page (see its notes): its figures
 (:func:`page_figures`), its layout in reading order
 (:func:`~datagrunt.pdf.layout.page_layout`), each item an A1 element with
-its canonical id, and Pass C (:func:`pass_c`).
+its canonical id, Pass C (:func:`pass_c`) and its page image (P2-A).
 
 :func:`page_figures` drafts the page's figures (:class:`FigureDraft`), in
 A2's object-walk order. Each image A2 recorded is, by the first rule it
@@ -53,8 +54,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TypedDict, get_args
 
-from datagrunt.pdf._loaders import FigureRead
-from datagrunt.pdf._options import MIN_IMAGE_DIMENSION
+from datagrunt.pdf._loaders import FigureRead, PageDraw
+from datagrunt.pdf._options import _MIN_DPI, _MIN_RENDER_PIXELS, DPI, MAX_RENDER_PIXELS, MIN_IMAGE_DIMENSION
 from datagrunt.pdf._pdfium_common import Box
 from datagrunt.pdf._validate import int_at_least, sha256_hex, str_tuple, typed_tuple
 from datagrunt.pdf.elements import (
@@ -67,6 +68,7 @@ from datagrunt.pdf.elements import (
     HiddenReason,
     KeyValue,
     Page,
+    PageImage,
     Paragraph,
     Table,
     check_hidden_reasons,
@@ -95,6 +97,7 @@ from datagrunt.pdf.pdfium_engine import (
     _checked_path,
 )
 from datagrunt.pdf.quality import PageAssessment, SpanPiece
+from datagrunt.pdf.render import RenderRefused, effective_dpi
 
 __all__ = [
     "MIN_IMAGE_DIMENSION",
@@ -307,8 +310,10 @@ def assemble_page(
     source: str | os.PathLike[str],
     password: str | None = None,
     min_image_dimension: int = MIN_IMAGE_DIMENSION,
+    dpi: int = DPI,
+    max_render_pixels: int = MAX_RENDER_PIXELS,
 ) -> Page:
-    """The A1 page of a digital or hybrid page: its elements in reading order, its facts and Pass C.
+    """The A1 page of a digital or hybrid page: its elements in reading order, its facts, Pass C and its image.
 
     1. Figures: :func:`page_figures` (loaders bound, never called).
     2. Layout: :func:`~datagrunt.pdf.layout.page_layout` of the page's
@@ -317,7 +322,7 @@ def assemble_page(
        ``element_id`` its canonical id; ``scope_path`` is ``()`` (A6 sets
        it), but a heading's is its own text (A1: a heading opens its
        scope). Headings, paragraphs, key-values and lists convert their
-       fields (a list keeps its markers); a hidden or recovered line is a
+       fields (a heading keeps its tier, a list its markers); a hidden or recovered line is a
        :class:`~datagrunt.pdf.elements.Paragraph` with its reasons (a
        recovered shadow or outline copy of visible text is ``duplicate``,
        so it reads once; a recovered line with no reason is visible text:
@@ -332,10 +337,19 @@ def assemble_page(
        lattice table's box is clamped to the page (its rules may run past
        it); its columns are not.
     4. Pass C (:func:`pass_c`) sets ``integrity_verified``.
+    5. The page image (P2-A, spec §3.2: every page has one): a
+       :class:`~datagrunt.pdf._loaders.PageDraw`, bound and never called
+       here, that draws the page in the render worker, 8-bit grey at the
+       effective DPI of ``dpi`` within ``max_render_pixels``
+       (:func:`~datagrunt.pdf.render.effective_dpi`) when it is read. Its
+       ``dpi`` and size are that render's; it is not contrast-normalized and
+       has no bands. A page that cannot be drawn within the bound
+       (``effective_dpi`` refuses it) has no image, and a warning says why.
 
     The page's ``quality`` and ``route`` are A3's. Its warnings are A2's
     (skipped text, path and image objects), then the figures', A3's,
-    A4a's (grids past its bounds), the layout's, and Pass C's.
+    A4a's (grids past its bounds), the layout's, Pass C's and the page
+    image's.
 
     A vision page is not OCR'd here, and not passed off as OCR'd: its
     digital text is laid out as on any page, its status is
@@ -343,14 +357,19 @@ def assemble_page(
     digital text kept), it is never ``integrity_verified`` (A1) and a
     warning says OCR did not read it. A5b's
     :func:`~datagrunt.pdf.vision.vision_page` OCRs a vision page, and lays
-    it out here when OCR cannot read it, adding why.
+    it out here when OCR cannot read it, adding why; its page image is then
+    A5b's (its OCR render), never this one.
 
     Raises:
         TypeError: If an argument is of the wrong type.
         ValueError: If ``assessment`` is not of ``raw_page`` (its chars or
-            rotation differ), or as :func:`page_figures` and ``page_layout``.
+            rotation differ), ``dpi`` is under 36 or ``max_render_pixels``
+            under 262,144 (512 x 512), or as :func:`page_figures` and
+            ``page_layout``.
     """
     _check_inputs(raw_page, assessment, lattice)
+    int_at_least("dpi", dpi, _MIN_DPI)
+    int_at_least("max_render_pixels", max_render_pixels, _MIN_RENDER_PIXELS)
     geometry = raw_page.geometry
     figures = page_figures(
         raw_page.images, geometry, source=source, password=password, min_image_dimension=min_image_dimension
@@ -368,7 +387,8 @@ def assemble_page(
     verified, mismatch = pass_c(assessment, elements)
     vision = assessment.route == "vision"
     warnings = (*raw_page_warnings(raw_page), *figures.warnings, *assessment.warnings, *_lattice_warnings(lattice))
-    warnings += (*layout.warnings, *((_VISION_NOTE,) if vision else ()), *mismatch)
+    image, undrawn = _page_image(geometry, source, password, dpi, max_render_pixels)
+    warnings += (*layout.warnings, *((_VISION_NOTE,) if vision else ()), *mismatch, *undrawn)
     return Page(
         page_number=geometry.page_number,
         width_pt=geometry.width_pt,
@@ -377,9 +397,33 @@ def assemble_page(
         route=assessment.route,
         quality=assessment.quality,
         elements=elements,
+        page_image=image,
         integrity_verified=verified and not vision,
         warnings=warnings,
     )
+
+
+def _page_image(
+    geometry: PageGeometry, source: str | os.PathLike[str], password: str | None, dpi: int, max_render_pixels: int
+) -> tuple[PageImage | None, tuple[str, ...]]:
+    """The page's image, drawn when read (:func:`assemble_page`, step 5); or None and why it cannot be drawn."""
+    try:
+        drawn_at = effective_dpi(dpi, max_render_pixels, geometry.width_pt, geometry.height_pt)
+    except RenderRefused as exc:
+        return None, (f"the page has no page image: {exc}",)
+    draw = PageDraw(
+        source=_checked_path(source, "source"),
+        page_index=geometry.page_number - 1,
+        dpi=drawn_at,
+        width_pt=geometry.width_pt,
+        height_pt=geometry.height_pt,
+        password=password,
+    )
+    width, height = draw.size
+    image = PageImage(
+        page_number=geometry.page_number, dpi=float(drawn_at), width_px=width, height_px=height, _loader=draw.png_bytes
+    )
+    return image, ()
 
 
 def _check_inputs(raw_page: object, assessment: object, lattice: object) -> None:
@@ -451,7 +495,15 @@ def _element(item: PageItem, order: int, drafts: tuple[FigureDraft, ...], geomet
     if isinstance(item, FigureSlot):
         return drafts[item.index].figure(page_number=page, reading_order=order)
     if isinstance(item, StreamHeading):
-        return Heading(**ids, bbox=item.bbox, level=item.level, text=item.text, scope_path=(item.text,))
+        return Heading(
+            **ids,
+            bbox=item.bbox,
+            level=item.level,
+            text=item.text,
+            scope_path=(item.text,),
+            font_size_pt=item.font_size_pt,
+            is_bold=item.is_bold,
+        )
     if isinstance(item, StreamParagraph):
         return Paragraph(**ids, bbox=item.bbox, text=item.text)
     if isinstance(item, ApartLine):

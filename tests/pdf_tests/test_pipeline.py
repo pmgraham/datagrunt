@@ -1163,6 +1163,39 @@ class TestExtractDocument:
         assert {element.scope_path for page in document.pages for element in page.elements} == {("Parts list",)}
         assert document.integrity_verified
 
+    def test_heading_levels_rank_across_the_document(self, tmp_path):
+        # The audit's P1-A: page 1 has an 18 pt chapter and a 14 pt section; page 2's largest heading is a 14 pt
+        # section. Ranked per page, page 2's was level 1 and popped the chapter from its scope_path.
+        chapter, schedule, checklist = (
+            "1. Turbomachinery Bearing Assembly",
+            "1.2 Schedule of Line Items",
+            "1.3 Inspection Checklist",
+        )
+        pages = [
+            PageSpec(
+                items=(
+                    TextRun(chapter, 72.0, 90.0, size=18.0),
+                    *body_text(120.0),
+                    TextRun(schedule, 72.0, 260.0, size=14.0),
+                    *body_text(290.0),
+                )
+            ),
+            PageSpec(items=(TextRun(checklist, 72.0, 90.0, size=14.0), *body_text(120.0))),
+        ]
+        path = build_pdf(tmp_path / "manual.pdf", pages)
+
+        document = extract_document(path)
+
+        assert [(item.text, item.level, item.font_size_pt, item.is_bold) for item in document.headings] == [
+            (chapter, 1, 18.0, False),
+            (schedule, 2, 14.0, False),
+            (checklist, 2, 14.0, False),
+        ]
+        assert {element.scope_path for element in document.pages[1].elements} == {(chapter, checklist)}
+        assert document.sections[-1].scope_path == (chapter, checklist)
+        assert f"## {checklist}" in document.pages[1].to_markdown().splitlines()
+        assert document == chain_document(path, title="untitled", author="anonymous")
+
     def test_a_table_split_across_two_pages_is_linked(self, tmp_path):
         path = build_pdf(tmp_path / "split.pdf", split_table_pages())
 

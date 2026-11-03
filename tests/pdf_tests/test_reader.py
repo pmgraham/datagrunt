@@ -10,6 +10,7 @@ reader module's name for it.
 import copy
 import errno
 import gc
+import io
 import os
 import re
 import sys
@@ -22,15 +23,17 @@ import duckdb
 import polars as pl
 import pyarrow as pa
 import pytest
+from PIL import Image
 
-from datagrunt.pdf import _database
+from datagrunt.pdf import _database, _loaders
 from datagrunt.pdf import reader as reader_module
 from datagrunt.pdf.bundle import load_bundle, write_bundle
 from datagrunt.pdf.codec import document_from_json, document_to_json
 from datagrunt.pdf.frame import ARROW_SCHEMA, FRAME_SCHEMA, element_arrow, element_frame
 from datagrunt.pdf.pipeline import extract_document
 from datagrunt.pdf.reader import PDFReader
-from pdf_tests.builders import PageSpec, Rect, TextRun, build_pdf
+from datagrunt.pdf.render import effective_dpi, render_page, render_size
+from pdf_tests.builders import PageSpec, RasterImage, Rect, TextRun, build_pdf, solid_png
 from pdf_tests.documents import empty_document
 from pdf_tests.test_ocr import needs_tesseract
 from pdf_tests.test_pipeline import mixed_page
@@ -366,6 +369,68 @@ class TestCollections:
         getattr(reader, name)
 
         assert len(calls) == 1
+
+
+def searchable_scan(directory: Path) -> Path:
+    """A hybrid page (test_routing's): a 400 x 300 pt page under one raster and its OCR layer (invisible text)."""
+    items = (
+        RasterImage(0.0, 0.0, 400.0, 300.0, solid_png(400, 300, (1.0, 1.0, 1.0))),
+        TextRun("Scanned page with its OCR layer", 40.0, 100.0, render_mode=3),
+    )
+    return build_pdf(directory / "scan.pdf", [PageSpec(width=400.0, height=300.0, items=items)])
+
+
+def png_facts(data: bytes) -> tuple[str, str, tuple[int, int], bytes]:
+    """A PNG's format, mode, size and pixels."""
+    with Image.open(io.BytesIO(data)) as picture:
+        return picture.format, picture.mode, picture.size, picture.tobytes()
+
+
+class TestPageImages:
+    """Every digital and hybrid page has a page image (spec §3.2), drawn in the render worker when read (P2-A)."""
+
+    @pytest.mark.parametrize("route", ["digital", "hybrid"])
+    def test_a_pages_image_is_drawn_at_the_effective_dpi_when_read(self, tmp_path, monkeypatch, route):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()]) if route == "digital" else searchable_scan(tmp_path)
+        calls = []
+        real = _loaders.render_page
+
+        def counted(*args, **kwargs):
+            calls.append(kwargs["dpi"])
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(_loaders, "render_page", counted)
+
+        page = PDFReader(path).pages[0]
+
+        image = page.page_image
+        assert page.route == route and image is not None and calls == []  # nothing is drawn until it is read
+        dpi = effective_dpi(200, 16_000_000, page.width_pt, page.height_pt)
+        size = render_size(page.width_pt, page.height_pt, dpi)
+        assert (image.page_number, image.dpi, (image.width_px, image.height_px)) == (1, float(dpi), size)
+        assert (image.contrast_normalized, image.image_path, image.band_paths) == (False, None, ())
+        drawn = render_page(path, 0, dpi=dpi, memory_cap_bytes=2 << 30, timeout_s=120.0)
+        assert png_facts(image.read_bytes()) == ("PNG", "L", size, drawn.pixels)
+        assert calls == [dpi]
+
+    def test_the_readers_dpi_and_pixel_bound_set_its_size(self, tmp_path):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
+
+        page = PDFReader(path, dpi=100, max_render_pixels=262_144).pages[0]
+
+        dpi = effective_dpi(100, 262_144, page.width_pt, page.height_pt)
+        size = render_size(page.width_pt, page.height_pt, dpi)
+        assert dpi < 100  # the case: the pixel bound lowers the dpi
+        assert (page.page_image.dpi, (page.page_image.width_px, page.page_image.height_px)) == (float(dpi), size)
+        assert png_facts(page.page_image.read_bytes())[2] == size
+
+    def test_every_page_has_one_and_an_encrypted_pdfs_reads_with_its_password(self, tmp_path):
+        path = build_pdf(tmp_path / "locked.pdf", [mixed_page(), mixed_page(top=100.0)], user_password="secret")
+
+        reader = PDFReader(path, password="secret", workers=2)
+
+        assert [image.page_number for image in reader.page_images] == [1, 2]
+        assert png_facts(reader.page_images[1].read_bytes())[2] == (1700, 2200)
 
 
 class TestFrame:

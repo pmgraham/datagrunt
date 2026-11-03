@@ -9,6 +9,9 @@ to the caller with them.
 
 - :class:`PageRender`: a vision page's image and bands, drawn again in the
   render worker (:func:`~datagrunt.pdf.render.render_page`).
+- :class:`PageDraw`: a digital or hybrid page's image (P2-A, spec §3.2),
+  drawn in the render worker at the reader's effective ``dpi`` only when it
+  is read; it has no bands.
 - :class:`FigureRead`: a figure's PNG (:meth:`FigureRead.png_bytes`) or raw
   stream (:meth:`FigureRead.raw_bytes`), read in a figure worker (the
   launcher's key ``"figures"``, :mod:`datagrunt.pdf._figure_worker`) by
@@ -46,7 +49,7 @@ from PIL import Image
 
 from datagrunt.pdf._image_facts import RawImage
 from datagrunt.pdf._memory_cap import ending
-from datagrunt.pdf._options import MEMORY_CAP_BYTES
+from datagrunt.pdf._options import _RENDER_TIMEOUT_S, MEMORY_CAP_BYTES
 from datagrunt.pdf._process import (
     MAX_REQUEST_BYTES,
     REAP_TIMEOUT_S,
@@ -65,9 +68,9 @@ from datagrunt.pdf._validate import checked_password, checked_path, int_at_least
 from datagrunt.pdf.elements import _MAX_ASSET_BYTES, Figure
 from datagrunt.pdf.exceptions import DatagruntPDFError
 from datagrunt.pdf.ocr import Band, bands, normalized, rotated
-from datagrunt.pdf.render import RenderedPage, render_page
+from datagrunt.pdf.render import RenderedPage, render_page, render_size
 
-__all__ = ["FIGURE_BATCH", "FigureRead", "PageRender", "figure_pngs", "read_figures"]
+__all__ = ["FIGURE_BATCH", "FigureRead", "PageDraw", "PageRender", "figure_pngs", "read_figures"]
 
 _TURNS = (0, 90, 180, 270)
 
@@ -147,6 +150,87 @@ class PageRender:
             timeout_s=self.timeout_s,
         )
         return normalized(page)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PageDraw:
+    """How to draw a digital or hybrid page (P2-A): a :class:`~datagrunt.pdf.elements.PageImage`'s loader.
+
+    It holds no pixels: each call renders the page in the guarded worker
+    (:func:`~datagrunt.pdf.render.render_page`) and encodes PNG, 8-bit grey
+    as drawn, as the bundle's renders are (no normalization: that is OCR's).
+    It has no band loader: no OCR read the page. Its size is
+    :func:`~datagrunt.pdf.render.render_size`'s of the page at ``dpi``, known
+    before any draw, and each draw must be that size. Picklable, so a page
+    crosses the process pool. Each load raises as ``render_page`` does
+    (``RenderRefused``, ``RenderFailed``).
+
+    Attributes:
+        source: The PDF's absolute path.
+        page_index: The 0-based page.
+        dpi: The render's DPI: the effective DPI of the reader's ``dpi``
+            (:func:`~datagrunt.pdf.render.effective_dpi`).
+        width_pt: The page's displayed width.
+        height_pt: The page's displayed height.
+        password: The PDF's password, or None. Not in repr.
+        memory_cap_bytes: The render worker's memory cap past its start.
+        timeout_s: Seconds a render may take.
+
+    Raises:
+        TypeError, ValueError: If a field is invalid, or the page draws under
+            one pixel across at ``dpi``.
+    """
+
+    source: Path
+    page_index: int
+    dpi: int
+    width_pt: float
+    height_pt: float
+    password: str | None = field(default=None, repr=False)
+    memory_cap_bytes: int = MEMORY_CAP_BYTES
+    timeout_s: float = _RENDER_TIMEOUT_S
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source", checked_path(self.source, "source").absolute())
+        int_at_least("page_index", self.page_index, 0)
+        object.__setattr__(self, "width_pt", positive_float("width_pt", self.width_pt))
+        object.__setattr__(self, "height_pt", positive_float("height_pt", self.height_pt))
+        width, height = render_size(self.width_pt, self.height_pt, int_at_least("dpi", self.dpi, 1))
+        if width < 1 or height < 1:
+            side = "wide" if width < 1 else "tall"
+            raise ValueError(f"a {self.width_pt} x {self.height_pt} pt page draws 0 px {side} at {self.dpi} DPI")
+        checked_password(self.password)
+        int_at_least("memory_cap_bytes", self.memory_cap_bytes, 1)
+        object.__setattr__(self, "timeout_s", positive_float("timeout_s", self.timeout_s))
+
+    @property
+    def size(self) -> tuple[int, int]:
+        """The page's ``(width, height)`` in pixels at ``dpi``."""
+        return render_size(self.width_pt, self.height_pt, self.dpi)
+
+    def png_bytes(self) -> bytes:
+        """The page as displayed, 8-bit grey as drawn, as PNG.
+
+        Raises:
+            DatagruntPDFError: If the page draws at another size than
+                :attr:`size` (the PDF is not the one read), or as
+                ``render_page`` raises (``RenderRefused``, ``RenderFailed``).
+        """
+        page = render_page(
+            self.source,
+            self.page_index,
+            dpi=self.dpi,
+            password=self.password,
+            memory_cap_bytes=self.memory_cap_bytes,
+            timeout_s=self.timeout_s,
+        )
+        if (page.px_width, page.px_height) != self.size:
+            width, height = self.size
+            drew = f"page {self.page_index + 1} draws {page.px_width} x {page.px_height} px"
+            raise DatagruntPDFError(
+                f"{self.source}: {drew}, not the {width} x {height} px of its page image: the PDF is not the one read"
+            )
+        return _png(page)
 
 
 def _png(image: RenderedPage | Band) -> bytes:

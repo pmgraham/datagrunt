@@ -32,10 +32,17 @@ Layout (paths relative to the bundle, joined with ``/``):
   figure's picture; reading each costs one read a figure (a logo repeated
   on every page is read on every page), and correctness comes first.
 - ``page_images/page_NNNN.png``: every page's image (origin):
-  - a page whose ``page_image`` is set (``"document"``: A5b's vision
-    pages, rendered at the effective ``vision_dpi`` and normalized): its
-    own PNG, from ``PageImage.read_bytes`` (its loader), as it is, at its
-    own DPI; never rendered again;
+  - a page whose ``page_image`` is set: its own PNG, from
+    ``PageImage.read_bytes`` (its loader), as it is, at its own DPI; never
+    rendered again. A5b's vision pages' (``"document"``: rendered at the
+    effective ``vision_dpi`` and normalized), and each digital or hybrid
+    page's (``"render"``, no bands: A4b's ``PageDraw``, P2-A, which draws
+    the page on read, 8-bit grey as drawn: the bytes this bundle's own
+    render of the page writes). A drawn page is written at the effective
+    DPI of this write's ``dpi`` (and ``max_render_pixels``): through its
+    own loader when that is its DPI, else by its ``PageDraw`` at that DPI
+    (the same page, source and render worker), so the manifest's ``dpi``
+    is always its image's;
   - every other page (``"render"``): rendered at
     :func:`~datagrunt.pdf.render.effective_dpi` of ``dpi`` (and
     ``max_render_pixels``) in A5a's guarded worker, 8-bit grey as drawn.
@@ -47,7 +54,8 @@ Layout (paths relative to the bundle, joined with ``/``):
   read it, righted, which is what a vision model needs). A rendered page
   has no bands. ``vision_dpi`` is recorded, not rendered at: a vision
   page's own image carries its DPI.
-- ``manifest.json``: :data:`BUNDLE_FORMAT_VERSION`, the datagrunt version,
+- ``manifest.json``: :data:`BUNDLE_FORMAT_VERSION`, the datagrunt version
+  (``datagrunt.__version__``),
   the source's sha256, the extraction parameters (``dpi``, ``vision_dpi``,
   ``max_render_pixels``, ``workers``, then the caller's
   ``extraction_params``), ``integrity_verified`` and ``degraded_pages``,
@@ -112,7 +120,9 @@ document's do (verified on every read; see below).
 Failures are recorded, never silent: a page whose render is refused or
 fails (``RenderRefused``, ``RenderFailed``), or whose own image cannot be
 read (a ``DatagruntPDFError``, render errors included, or an ``OSError``)
-or is not a PNG, has no page image (nor bands); a page whose own bands
+or is not a PNG, has no page image (nor bands); a page image drawn on read
+that fails is recorded as the bundle's render of it is ("the page was not
+rendered: ..."); a page whose own bands
 cannot be read, or one of them is not a PNG, keeps its image and has no
 bands; a figure whose bytes cannot be read or are not a PNG, or that is
 not bound to the source (see below), is not written (it keeps no
@@ -127,7 +137,7 @@ a source changed, replaced or removed meanwhile raises
 ``PDFSourceChangedError`` and nothing is published (the staging directory
 is removed). A page's own image is written only when its loaders are bound
 to that file (:func:`_unbound`): each renders from ``source`` itself
-(A5b's ``PageRender``, compared by resolved path) or is a bundle's
+(A5b's ``PageRender`` or A4b's ``PageDraw``, compared by resolved path) or is a bundle's
 verifying reader. One that renders from another file, names no source, or
 an image with no loader is not read: the page has no page image, a
 ``missing`` entry says why, and a ``UserWarning`` is emitted once the
@@ -199,7 +209,6 @@ there is nothing to close.
 import dataclasses
 import errno
 import hashlib
-import importlib.metadata
 import json
 import math
 import os
@@ -217,7 +226,8 @@ from typing import IO, BinaryIO, NamedTuple, TypeVar, cast
 import polars as pl
 from PIL import Image
 
-from datagrunt.pdf._loaders import figure_pngs
+import datagrunt
+from datagrunt.pdf._loaders import PageDraw, figure_pngs
 from datagrunt.pdf._validate import checked_path as _checked_path
 from datagrunt.pdf._validate import (
     choice_str,
@@ -789,10 +799,40 @@ def _record(outcome: _PageOutcome, renders: dict[int, _Written], ledger: _Ledger
 
 
 def _page_outcome(page: Page, staging: Path, source: PDFSource, options: PipelineOptions) -> _PageOutcome:
-    """Write the page's own image and bands when it has one, else render it at ``dpi``; a failure is recorded."""
-    if page.page_image is not None:
-        return _own_outcome(page.page_image, staging, source)
-    return _rendered_outcome(page, staging, source, options)
+    """Write the page's own image and bands when it has one, else render it at ``dpi``; a failure is recorded.
+
+    A page image drawn on read is written at the effective DPI of ``dpi``
+    (:func:`_at_write_dpi`): its own when that is its DPI, else drawn again at it.
+    """
+    image = page.page_image
+    if image is None:
+        return _rendered_outcome(page, staging, source, options)
+    if _page_draw(image) is None:
+        return _own_outcome(image, staging, source)
+    try:
+        drawn = _at_write_dpi(image, page, options)
+    except RenderRefused as exc:
+        reason = f"the page was not rendered: {type(exc).__name__}: {exc}"
+        return _PageOutcome(None, (), (_Missing("page_image", page.page_number, None, reason),))
+    return _own_outcome(drawn, staging, source)
+
+
+def _at_write_dpi(image: PageImage, page: Page, options: PipelineOptions) -> PageImage:
+    """A drawn page image at the effective DPI of the write's ``dpi``: itself at that DPI, else its draw at it.
+
+    The draw at another DPI is its :class:`~datagrunt.pdf._loaders.PageDraw`
+    with that DPI: the same page, source, password and render path.
+
+    Raises:
+        RenderRefused: If no DPI draws the page within ``max_render_pixels``.
+    """
+    dpi = effective_dpi(options.dpi, options.max_render_pixels, page.width_pt, page.height_pt)
+    draw = _page_draw(image)
+    if draw is None or image.dpi == dpi:
+        return image
+    redrawn = dataclasses.replace(draw, dpi=dpi)
+    width, height = redrawn.size
+    return dataclasses.replace(image, dpi=float(dpi), width_px=width, height_px=height, _loader=redrawn.png_bytes)
 
 
 def _rendered_outcome(page: Page, staging: Path, source: PDFSource, options: PipelineOptions) -> _PageOutcome:
@@ -823,8 +863,8 @@ def _own_outcome(image: PageImage, staging: Path, source: PDFSource) -> _PageOut
         return _PageOutcome(None, (), (_Missing("page_image", number, None, reason),), notice)
     data, why = _png(image.read_bytes)
     if data is None:
-        reason = f"the page's own image was not written: {why}"
-        return _PageOutcome(None, (), (_Missing("page_image", number, None, reason),))
+        failed = "the page was not rendered" if _drawn_on_read(image) else "the page's own image was not written"
+        return _PageOutcome(None, (), (_Missing("page_image", number, None, f"{failed}: {why}"),))
     path = f"page_images/page_{number:04d}.png"
     artifact = _write_bytes(staging, path, data)
     del data  # written: it need not outlive the page's bands
@@ -837,13 +877,27 @@ def _own_outcome(image: PageImage, staging: Path, source: PDFSource) -> _PageOut
 
 
 def _origin_of(image: PageImage) -> str:
-    """``"render"`` for a page image an earlier bundle rendered (read back by its reader), else ``"document"``.
+    """``"render"`` for a render: a page image drawn on read, or one an earlier bundle rendered; else ``"document"``.
 
-    A rendered image has no bands, so none is expected of it: it is written
-    again as the render it is, at its own DPI.
+    A digital or hybrid page's image (P2-A) is drawn on read by its
+    :class:`~datagrunt.pdf._loaders.PageDraw`; an earlier bundle's render is
+    read back by its reader. A render has no bands, so none is expected of
+    it: it is written as the render it is, at its own DPI.
     """
     loader = image._loader
-    return "render" if isinstance(loader, _ArtifactReader) and loader.origin == "render" else "document"
+    reread = isinstance(loader, _ArtifactReader) and loader.origin == "render"
+    return "render" if _drawn_on_read(image) or reread else "document"
+
+
+def _drawn_on_read(image: PageImage) -> bool:
+    """True if the page image is drawn when read: its loader is a PageDraw's (P2-A)."""
+    return _page_draw(image) is not None
+
+
+def _page_draw(image: PageImage) -> PageDraw | None:
+    """The PageDraw whose ``png_bytes`` is the page image's loader, or None."""
+    owner = getattr(image._loader, "__self__", None)
+    return owner if isinstance(owner, PageDraw) else None
 
 
 def _unbound(image: PageImage, source: Path) -> str:
@@ -995,7 +1049,13 @@ def _joined(base: Path, relative: str) -> Path:
 
 
 def _datagrunt_version() -> str:
-    return importlib.metadata.version("datagrunt")
+    """The extractor's version: ``datagrunt.__version__``, the code's own.
+
+    Never the installed package metadata: an editable install keeps the
+    version it was installed at while the code moves on, and reuse compares
+    this version.
+    """
+    return datagrunt.__version__
 
 
 def _missing_order(entry: _Missing) -> tuple[int, str, str]:

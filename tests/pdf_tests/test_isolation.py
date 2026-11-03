@@ -31,6 +31,7 @@ from datagrunt.pdf.elements import Page
 from datagrunt.pdf.frame import element_frame
 from datagrunt.pdf.pdfium_engine import ImageLoader, open_document, page_images
 from datagrunt.pdf.pipeline import extract_document
+from datagrunt.pdf.render import render_page
 from pdf_tests.builders import PageSpec, RasterImage, build_pdf, hand_written_pdf, solid_png
 from pdf_tests.test_layout_stream_tables import body_text
 from pdf_tests.test_pipeline import DISTRIBUTED_KEYS, chain_document, mixed_page
@@ -160,8 +161,8 @@ def figures_pdf(path: Path, count: int) -> Path:
     return build_pdf(path, [PageSpec(items=(*body_text(72.0), *images))])
 
 
-# The calling process, pypdfium2 blocked: it reads, writes every PDFWriter output and reads a figure's bytes.
-BLOCKED_CALLER = """
+# A calling process's first lines: pypdfium2 cannot be imported in it.
+BLOCK_PYPDFIUM2 = """
 import hashlib, importlib.abc, io, json, sys
 from pathlib import Path
 
@@ -174,7 +175,12 @@ class Blocked(importlib.abc.MetaPathFinder):
 
 
 sys.meta_path.insert(0, Blocked())
+"""
 
+# The calling process, pypdfium2 blocked: it reads, writes every PDFWriter output and reads a figure's bytes.
+BLOCKED_CALLER = (
+    BLOCK_PYPDFIUM2
+    + """
 from datagrunt.pdf.exceptions import PDFEncryptedError
 from datagrunt.pdf.reader import PDFReader
 from datagrunt.pdf.writer import PDFWriter
@@ -210,6 +216,25 @@ except PDFEncryptedError as exc:
 result["loaded"] = sorted(name for name in sys.modules if name.split(".")[0] == "pypdfium2" or name in worker_only)
 print(json.dumps(result))
 """
+)
+
+# The calling process, pypdfium2 blocked: it reads a digital page's image, drawn in the render worker (P2-A).
+BLOCKED_PAGE_IMAGE = (
+    BLOCK_PYPDFIUM2
+    + """
+from PIL import Image
+
+from datagrunt.pdf.reader import PDFReader
+
+source, worker_only = Path(sys.argv[1]), json.loads(sys.argv[2])
+image = PDFReader(source).pages[0].page_image
+data = image.read_bytes()
+with Image.open(io.BytesIO(data)) as picture:
+    drawn = [picture.format, picture.mode, list(picture.size), hashlib.sha256(picture.tobytes()).hexdigest()]
+loaded = sorted(name for name in sys.modules if name.split(".")[0] == "pypdfium2" or name in worker_only)
+print(json.dumps({"image": [image.dpi, image.width_px, image.height_px], "drawn": drawn, "loaded": loaded}))
+"""
+)
 
 
 class TestTheCallerNeverLoadsPdfium:
@@ -261,6 +286,24 @@ class TestTheCallerNeverLoadsPdfium:
             "page_images/page_0002.png",
         ]
         assert result["encrypted"] == "PDFEncryptedError"
+        assert result["loaded"] == []
+
+    def test_a_caller_without_pypdfium2_reads_a_digital_pages_image_through_the_render_worker(self, tmp_path):
+        source = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
+
+        done = subprocess.run(
+            [sys.executable, "-I", "-c", BLOCKED_PAGE_IMAGE, str(source), json.dumps(WORKER_ONLY)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+
+        assert done.returncode == 0, done.stderr
+        result = json.loads(done.stdout)
+        drawn = render_page(source, 0, dpi=200, memory_cap_bytes=2 << 30, timeout_s=120.0)
+        assert result["image"] == [200.0, 1700, 2200]
+        assert result["drawn"] == ["PNG", "L", [1700, 2200], sha(drawn.pixels)]
         assert result["loaded"] == []
 
 

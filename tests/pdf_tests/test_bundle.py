@@ -27,7 +27,8 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 
-from datagrunt.pdf import bundle
+import datagrunt
+from datagrunt.pdf import _loaders, bundle
 from datagrunt.pdf.bundle import BUNDLE_FORMAT_VERSION, load_bundle, write_bundle
 from datagrunt.pdf.codec import document_from_json_bytes
 from datagrunt.pdf.elements import Figure, PDFDocument
@@ -284,7 +285,7 @@ class TestManifest:
     def test_manifest_values(self, written):
         manifest = manifest_of(written.out)
         assert manifest["bundle_format_version"] == BUNDLE_FORMAT_VERSION == "5.0"
-        assert manifest["datagrunt_version"] == importlib.metadata.version("datagrunt")
+        assert manifest["datagrunt_version"] == datagrunt.__version__
         assert manifest["source_sha256"] == sha_of(written.source) == written.document.metadata.sha256
         params = {"dpi": DPI, "vision_dpi": VISION_DPI, "max_render_pixels": 16_000_000, "workers": 1}
         assert manifest["extraction_params"] == params
@@ -858,7 +859,7 @@ class TestWorkers:
     @pytest.mark.parametrize("workers", [2, 8])
     def test_workers_pages_render_together_and_no_more_are_in_flight(self, tmp_path, monkeypatch, workers):
         path = paged_pdf(tmp_path, 10)
-        document = extract_document(path, ocr="never")
+        document = without_page_images(extract_document(path, ocr="never"))  # each page rendered by the bundle
         flight = InFlight()
         monkeypatch.setattr(bundle, "render_page", gathered(workers))
         monkeypatch.setattr(bundle, "ThreadPoolExecutor", flight.executor)
@@ -868,7 +869,7 @@ class TestWorkers:
 
     def test_a_slow_page_holds_one_thread_never_the_others(self, tmp_path, monkeypatch):
         path = paged_pdf(tmp_path, 5)
-        document = extract_document(path, ocr="never")
+        document = without_page_images(extract_document(path, ocr="never"))  # each page rendered by the bundle
         render, ended = last_first(5)
         monkeypatch.setattr(bundle, "render_page", render)
         returned = write(document, tmp_path / "out", path, workers=2)
@@ -932,13 +933,189 @@ class TestVisionRoute:
     def test_a_digital_page_still_renders_at_dpi(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "text.pdf", [PageSpec(items=tuple(body_text(100.0)))])
         document = extract_document(path)
-        assert (document.pages[0].route, document.pages[0].page_image) == ("digital", None)
-        calls = spied(monkeypatch)
-        written = write(document, tmp_path / "out", path)
-        assert calls == [(0, DPI)]
+        assert (document.pages[0].route, document.pages[0].page_image.dpi) == ("digital", 200.0)
+        page = document.pages[0]
+        calls, draws = spied(monkeypatch), drawn_dpis(monkeypatch)
+        written = write(document, tmp_path / "out", path)  # dpi=72, not the 200 it was extracted at
+        assert (calls, draws) == ([], [DPI])  # drawn again at the write's dpi, through the page's draw: one render path
         image = written.pages[0].page_image
-        assert (image.dpi, image.contrast_normalized, image.band_paths) == (float(DPI), False, ())
+        size = render_size(page.width_pt, page.height_pt, DPI)
+        assert (image.dpi, (image.width_px, image.height_px), image.contrast_normalized, image.band_paths) == (
+            float(DPI),
+            size,
+            False,
+            (),
+        )
+        assert manifest_of(tmp_path / "out")["page_images"][0] == {
+            "page_number": 1,
+            "origin": "render",
+            "dpi": float(DPI),
+            "contrast_normalized": False,
+        }
+        drawn = render_page(path, 0, dpi=DPI, memory_cap_bytes=CAP, timeout_s=TIMEOUT)
+        assert png_pixels(image.image_path) == ("L", size, drawn.pixels)
         assert load_bundle(tmp_path / "out") == written
+
+
+def drawn_dpis(monkeypatch) -> list:
+    """Record the dpi of each draw a page image's PageDraw makes (``_loaders.render_page``), and let it run."""
+    dpis: list = []
+    real = _loaders.render_page
+
+    def spy(src, page_index, **kwargs):
+        dpis.append(kwargs["dpi"])
+        return real(src, page_index, **kwargs)
+
+    monkeypatch.setattr(_loaders, "render_page", spy)
+    return dpis
+
+
+def without_page_images(document: PDFDocument) -> PDFDocument:
+    """``document`` whose pages have no page image: each one the bundle renders, as every page was before P2-A."""
+    return dataclasses.replace(
+        document, pages=tuple(dataclasses.replace(page, page_image=None) for page in document.pages)
+    )
+
+
+def contents(root: Path) -> dict[str, bytes]:
+    """Every file under ``root`` and its bytes, by relative path."""
+    return {path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+
+def digital_pdf(directory: Path) -> Path:
+    """Two digital pages of prose: a letter page and a smaller landscape one."""
+    pages = [
+        PageSpec(items=tuple(body_text(100.0))),
+        PageSpec(width=400.0, height=300.0, items=tuple(body_text(60.0))),
+    ]
+    return build_pdf(directory / "digital.pdf", pages)
+
+
+class TestDrawnPageImages:
+    """A digital or hybrid page's own image is drawn when read (P2-A): the bundle writes it through its loader."""
+
+    def test_a_bundle_of_drawn_pages_is_byte_identical_to_one_that_renders_them(self, tmp_path, monkeypatch):
+        path = digital_pdf(tmp_path)
+        document = extract_document(path)
+        assert all(isinstance(page.page_image._loader.__self__, _loaders.PageDraw) for page in document.pages)
+        calls = spied(monkeypatch)
+
+        drawn = write_bundle(document, tmp_path / "drawn", source=path)
+        assert calls == []  # each page read through its own loader
+        rendered = write_bundle(without_page_images(document), tmp_path / "rendered", source=path)
+
+        assert sorted(calls) == [(0, 200), (1, 200)]  # each page rendered by the bundle, as before
+        assert contents(tmp_path / "drawn") == contents(tmp_path / "rendered")
+        assert drawn == rendered == document
+        assert load_bundle(tmp_path / "drawn") == drawn
+
+    def test_a_drawn_page_image_is_recorded_as_a_render_without_bands(self, tmp_path):
+        path = digital_pdf(tmp_path)
+        document = extract_document(path)
+        assert [type(page.page_image._loader.__self__) for page in document.pages] == [_loaders.PageDraw] * 2
+
+        written = write_bundle(document, tmp_path / "out", source=path)
+
+        render = {"origin": "render", "dpi": 200.0, "contrast_normalized": False}
+        assert manifest_of(tmp_path / "out")["page_images"] == [{"page_number": n, **render} for n in (1, 2)]
+        assert [page.page_image.band_paths for page in written.pages] == [(), ()]
+        assert not (tmp_path / "out" / "page_images" / "bands").exists()
+
+    def test_a_draw_that_fails_is_recorded_as_a_failed_render_is(self, tmp_path, monkeypatch):
+        path = digital_pdf(tmp_path)
+        document = extract_document(path)
+        assert [type(page.page_image._loader.__self__) for page in document.pages] == [_loaders.PageDraw] * 2
+
+        def failing(source, page_index, **kwargs):
+            raise RenderFailed(f"{source}: page {page_index + 1}: the render worker reached its memory cap")
+
+        monkeypatch.setattr(_loaders, "render_page", failing)
+        monkeypatch.setattr(bundle, "render_page", failing)
+
+        write_bundle(document, tmp_path / "drawn", source=path)
+        write_bundle(without_page_images(document), tmp_path / "rendered", source=path)
+
+        assert contents(tmp_path / "drawn") == contents(tmp_path / "rendered")
+        assert [entry["reason"] for entry in manifest_of(tmp_path / "drawn")["missing"]] == [
+            f"the page was not rendered: RenderFailed: {path}: page {n}: the render worker reached its memory cap"
+            for n in (1, 2)
+        ]
+
+    def test_a_drawn_image_at_the_writes_dpi_is_read_through_its_own_loader(self, tmp_path, monkeypatch):
+        path = digital_pdf(tmp_path)
+        document = extract_document(path)
+        written_from = []
+        real = bundle._own_outcome
+
+        def recorded(image, staging, source):
+            written_from.append(image)
+            return real(image, staging, source)
+
+        monkeypatch.setattr(bundle, "_own_outcome", recorded)
+
+        write_bundle(document, tmp_path / "out", source=path)  # dpi=200, as extracted
+
+        own = [page.page_image for page in document.pages]
+        assert sorted(map(id, written_from)) == sorted(map(id, own))  # each page's own image and loader, no other
+
+    @pytest.mark.parametrize(
+        ("dpi", "pixels"), [pytest.param(72, 16_000_000, id="lower-dpi"), pytest.param(200, 262_144, id="pixel-bound")]
+    )
+    def test_a_write_at_another_dpi_holds_images_drawn_at_it(self, tmp_path, monkeypatch, dpi, pixels):
+        path = digital_pdf(tmp_path)
+        document = extract_document(path)
+        draws = drawn_dpis(monkeypatch)
+
+        written = write_bundle(document, tmp_path / "drawn", source=path, dpi=dpi, max_render_pixels=pixels)
+        rendered = write_bundle(
+            without_page_images(document), tmp_path / "rendered", source=path, dpi=dpi, max_render_pixels=pixels
+        )
+
+        expected = [effective_dpi(dpi, pixels, page.width_pt, page.height_pt) for page in document.pages]
+        assert expected != [200, 200] and sorted(draws) == sorted(expected)
+        recorded = [entry["dpi"] for entry in manifest_of(tmp_path / "drawn")["page_images"]]
+        assert [page.page_image.dpi for page in written.pages] == recorded == [float(value) for value in expected]
+        for page, value in zip(written.pages, expected, strict=True):
+            size = render_size(page.width_pt, page.height_pt, value)
+            assert (
+                (page.page_image.width_px, page.page_image.height_px)
+                == size
+                == png_pixels(page.page_image.image_path)[1]
+            )
+        assert contents(tmp_path / "drawn") == contents(tmp_path / "rendered")  # as the bundle's own render writes them
+        assert load_bundle(tmp_path / "drawn") == written == rendered
+
+    def test_a_write_dpi_the_page_cannot_be_drawn_at_is_recorded(self, tmp_path, monkeypatch):
+        path = digital_pdf(tmp_path)
+        document = extract_document(path)
+
+        def refused(target_dpi, max_pixels, width, height):
+            raise RenderRefused(f"a {width} x {height} pt page renders 0 px tall at {target_dpi} DPI")
+
+        monkeypatch.setattr(bundle, "effective_dpi", refused)
+
+        write_bundle(document, tmp_path / "out", source=path, dpi=72)
+
+        assert [entry["reason"] for entry in manifest_of(tmp_path / "out")["missing"]] == [
+            "the page was not rendered: RenderRefused: a 612.0 x 792.0 pt page renders 0 px tall at 72 DPI",
+            "the page was not rendered: RenderRefused: a 400.0 x 300.0 pt page renders 0 px tall at 72 DPI",
+        ]
+
+    def test_a_draw_from_another_file_is_not_written(self, tmp_path):
+        path = digital_pdf(tmp_path)
+        copy = tmp_path / "copy.pdf"
+        copy.write_bytes(path.read_bytes())
+        document = extract_document(copy)
+
+        with pytest.warns(UserWarning) as caught:
+            written = write_bundle(document, tmp_path / "out", source=path)
+
+        renders = f"renders from {copy.resolve()}, not from the source {path.resolve()}"
+        assert [str(item.message) for item in caught] == [
+            f"page {n}'s own image {renders}: no page image is written for it" for n in (1, 2)
+        ]
+        assert [page.page_image for page in written.pages] == [None, None]
+        assert [entry["page_number"] for entry in manifest_of(tmp_path / "out")["missing"]] == [1, 2]
 
 
 class TestExtractionParams:
@@ -1201,6 +1378,51 @@ class TestReuse:
         changed = with_element(bound_document(source), "p0001_e003", text="Other text.")
         with pytest.raises(FileExistsError, match="its document is not this one"):
             write(changed, tmp_path / "out", source)
+
+
+# A version an editable install's metadata can still hold after the code moved on: installed metadata is stale there.
+STALE = "4.6.37"
+
+
+def stale_metadata(monkeypatch) -> None:
+    """Make the installed package metadata report STALE for datagrunt, as an editable install's can."""
+    real = importlib.metadata.version
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: STALE if name == "datagrunt" else real(name))
+
+
+class TestTheVersionIsTheCodes:
+    """The manifest records, and reuse compares, ``datagrunt.__version__``: never installed package metadata."""
+
+    def test_the_manifest_records_datagrunt_version(self, tmp_path, source, fast_render, monkeypatch):
+        stale_metadata(monkeypatch)
+
+        write(bound_document(source), tmp_path / "out", source)
+
+        assert datagrunt.__version__ != STALE  # the case: metadata and code disagree
+        assert manifest_of(tmp_path / "out")["datagrunt_version"] == datagrunt.__version__
+
+    def test_a_bundle_of_this_code_is_reused_whatever_metadata_says(self, tmp_path, source, fast_render, monkeypatch):
+        first = write(bound_document(source), tmp_path / "out", source)
+        before = tree_of(tmp_path / "out")
+        stale_metadata(monkeypatch)
+
+        again = write(bound_document(source), tmp_path / "out", source)
+
+        assert again == first and tree_of(tmp_path / "out") == before
+
+    def test_a_bundle_of_the_metadatas_version_is_refused(self, tmp_path, source, fast_render, monkeypatch):
+        write(bound_document(source), tmp_path / "out", source)
+        _set_manifest(tmp_path / "out", "datagrunt_version", STALE)
+        stale_metadata(monkeypatch)
+
+        with pytest.raises(FileExistsError, match=f"written by datagrunt {STALE}, not {datagrunt.__version__}"):
+            write(bound_document(source), tmp_path / "out", source)
+
+    def test_no_v5_module_reads_the_installed_metadata(self):
+        package = Path(bundle.__file__).parent
+        readers = [path.name for path in sorted(package.glob("*.py")) if "importlib.metadata" in path.read_text()]
+
+        assert readers == []
 
 
 def _set_manifest(out: Path, key: str, value) -> None:
