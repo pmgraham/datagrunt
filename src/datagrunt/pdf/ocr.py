@@ -21,6 +21,13 @@ The tesseract CLI (never ``pytesseract``) reads the page:
 - :func:`orientation` runs tesseract's orientation detection (``--psm 0``)
   and reads its ``Rotate``: the clockwise turn, 0, 90, 180 or 270 degrees,
   that rights the page. :func:`rotated` makes that turn.
+- :func:`read_sample` reads one image whole in one call (``--psm 11``,
+  sparse text, TSV): each word's text and confidence, no boxes. The vision
+  route checks a turn OSD suggests on a sample of the page so (#456), its
+  bands as :func:`inked_bands` orders them: the band holding the most ink
+  (pixels darker than mid-grey) first. Not ``--psm 3``: its page
+  segmentation rights sideways text itself, so a sample read as displayed
+  and turned 90 degrees read alike (see :mod:`datagrunt.pdf.vision`).
 - :func:`ocr_words` reads the righted page's bands (``--psm 3``, TSV) and
   maps each word's box back to the displayed page in points: through its
   band's offset, ``72 / dpi`` and the inverse of the turn. A word read in
@@ -108,6 +115,12 @@ _AUTOCONTRAST_CUTOFF = 1
 # The spec's bands: 900 px tall, neighbours sharing 60 rows.
 _BAND_HEIGHT = 900
 _BAND_OVERLAP = 60
+# Ink: a pixel darker than mid-grey (a grey level under this).
+_INK_BELOW = 128
+
+# A page's bands are read with tesseract's automatic page segmentation; a sample (#456) as sparse text (module notes).
+_PAGE_PSM = "3"
+_SAMPLE_PSM = "11"
 
 _TURNS = (0, 90, 180, 270)
 _TURN_NAMES = "0, 90, 180 or 270"
@@ -224,6 +237,29 @@ def _band(page: RenderedPage, top: int, rows: int) -> Band:
     )
 
 
+def inked_bands(page: RenderedPage) -> tuple[RenderedPage, ...]:
+    """``page``'s :func:`bands` as images, the one holding the most ink first; equals keep the page's order (#456).
+
+    Ink is a pixel darker than mid-grey (a grey level under 128), counted by
+    Pillow's histogram of each band (in C): O(pixels).
+
+    Raises:
+        TypeError: If ``page`` is not a :class:`~datagrunt.pdf.render.RenderedPage`.
+        ValueError: If ``page`` is not 8-bit gray (a BGR render).
+    """
+    cut = bands(page)
+    inks = [_ink(band) for band in cut]
+    order = sorted(range(len(cut)), key=lambda at: -inks[at])  # a stable sort: equals keep the page's order
+    return tuple(
+        RenderedPage(pixels=cut[at].pixels, px_width=cut[at].px_width, px_height=cut[at].px_height) for at in order
+    )
+
+
+def _ink(band: Band) -> int:
+    """The pixels of ``band`` darker than mid-grey."""
+    return sum(Image.frombytes("L", (band.px_width, band.px_height), band.pixels).histogram()[:_INK_BELOW])
+
+
 def _checked_page(page: RenderedPage) -> RenderedPage:
     """``page``, if it is a RenderedPage in 8-bit gray (a BGR render is never read as gray)."""
     if not isinstance(page, RenderedPage):
@@ -320,6 +356,52 @@ class OCRResult:
             non_blank_str("reason", self.reason)
         elif self.reason != "":
             raise ValueError(f"an ok result has no reason, got {self.reason!r}")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SampleReading:
+    """The words :func:`read_sample` read in one image, and how the reading went.
+
+    Attributes:
+        words: Each word's text and tesseract confidence (0 to 100), in tesseract's order.
+        status: As :class:`OCRResult`'s: ``"ok"``; ``"unavailable"``;
+            ``"failed"`` or ``"timeout"`` (the call); ``"spent"`` (the
+            caller's deadline passed: the call was cut at it, or not started).
+        reason: Why the status is not ok; empty when ok.
+    """
+
+    words: tuple[tuple[str, float], ...]
+    status: OCRStatus
+    reason: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "words", _checked_pairs(self.words))
+        choice_str("status", self.status, _OCR_STATUSES)
+        if self.status != "ok":
+            non_blank_str("reason", self.reason)
+        elif self.reason != "":
+            raise ValueError(f"an ok reading has no reason, got {self.reason!r}")
+
+    @property
+    def confidence(self) -> float | None:
+        """The words' mean confidence, each weighted by its chars; None for no words."""
+        chars = sum(len(text) for text, _ in self.words)
+        if chars == 0:
+            return None
+        return math.fsum(len(text) * confidence for text, confidence in self.words) / chars
+
+
+def _checked_pairs(words: object) -> tuple[tuple[str, float], ...]:
+    """``words``, if a tuple of (non-blank text, confidence 0..100) pairs; each confidence a float."""
+    if not isinstance(words, tuple):
+        raise TypeError(f"words must be a tuple, got {type(words).__name__}")
+    checked = []
+    for index, pair in enumerate(words):
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            raise TypeError(f"words[{index}] must be a (text, confidence) pair, got {pair!r}")
+        text = non_blank_str(f"words[{index}] text", pair[0])
+        checked.append((text, finite_float(f"words[{index}] confidence", pair[1], lo=0.0, hi=100.0)))
+    return tuple(checked)
 
 
 def rotated(page: RenderedPage, degrees: int) -> RenderedPage:
@@ -467,15 +549,11 @@ def ocr_words(
             fit the righted page (before anything runs).
     """
     displayed = _displayed_size(page_bands, dpi, rotation, page_size_pt)
-    positive_float("timeout_s", timeout_s)
-    if not isinstance(language, str) or _LANGUAGE.fullmatch(language) is None:
-        raise ValueError(f"language must be tesseract language names (like eng or deu+eng), got {language!r}")
-    if deadline is not None:
-        finite_float("deadline", deadline)
+    _check_call_options(timeout_s, language, deadline)
     binary = trusted_executable("tesseract")
     if binary is None:
         return OCRResult(words=(), status="unavailable", reason=_NOT_ON_PATH)
-    argv = [binary, "stdin", "stdout", "--psm", "3", "-l", language, "tsv"]
+    argv = _tsv_argv(binary, _PAGE_PSM, language)
     read: list[tuple[Band, list[_Placed]]] = []
     for number, band in enumerate(page_bands, start=1):
         words = _read_band(argv, band, timeout_s, deadline)
@@ -488,6 +566,49 @@ def ocr_words(
             return OCRResult(words=_page_words(read, rotation, displayed, dpi), status=words.status, reason=reason)
         read.append((band, words))
     return OCRResult(words=_page_words(read, rotation, displayed, dpi), status="ok", reason="")
+
+
+def read_sample(
+    image: RenderedPage,
+    *,
+    timeout_s: float,
+    language: str = "eng",
+    deadline: float | None = None,
+) -> SampleReading:
+    """The words tesseract reads in ``image`` (``--psm 11``, TSV, ``-l language``): their text and confidence.
+
+    ``image`` is read whole, in one call of ``timeout_s`` at most (never cut
+    into bands): a sample of a page (#456; see the module notes). Given a
+    ``deadline`` (a :func:`time.monotonic` time), the call is given at most
+    the time left, and is not started past it: the reading is ``"spent"``.
+
+    Raises:
+        TypeError, ValueError: If ``image`` is not a RenderedPage in 8-bit
+            gray, or another argument is invalid (before anything runs).
+    """
+    band = Band(top_px=0, pixels=_checked_page(image).pixels, px_width=image.px_width, px_height=image.px_height)
+    _check_call_options(timeout_s, language, deadline)
+    binary = trusted_executable("tesseract")
+    if binary is None:
+        return SampleReading(words=(), status="unavailable", reason=_NOT_ON_PATH)
+    words = _read_band(_tsv_argv(binary, _SAMPLE_PSM, language), band, timeout_s, deadline)
+    if isinstance(words, _Failure):
+        return SampleReading(words=(), status=words.status, reason=words.reason)
+    return SampleReading(words=tuple((word.text, word.confidence) for word in words), status="ok", reason="")
+
+
+def _check_call_options(timeout_s: object, language: object, deadline: object) -> None:
+    """Require a timeout over 0, tesseract language names (never an option) and a finite deadline or None."""
+    positive_float("timeout_s", timeout_s)
+    if not isinstance(language, str) or _LANGUAGE.fullmatch(language) is None:
+        raise ValueError(f"language must be tesseract language names (like eng or deu+eng), got {language!r}")
+    if deadline is not None:
+        finite_float("deadline", deadline)
+
+
+def _tsv_argv(binary: str, psm: str, language: str) -> list[str]:
+    """tesseract's argv reading a PGM on stdin as TSV on stdout, with page segmentation mode ``psm``."""
+    return [binary, "stdin", "stdout", "--psm", psm, "-l", language, "tsv"]
 
 
 def _displayed_size(
@@ -522,7 +643,7 @@ def _read_band(argv: list[str], band: Band, timeout_s: float, deadline: float | 
     """
     call_s = timeout_s if deadline is None else min(timeout_s, deadline - time.monotonic())
     if call_s <= 0.0:
-        return _Failure("spent", "the deadline passed before the band's call")
+        return _Failure("spent", "the deadline passed before the call")
     words = _band_words(argv, band, call_s)
     if isinstance(words, _Failure) and words.status == "timeout" and call_s < timeout_s:
         return _Failure("spent", words.reason)

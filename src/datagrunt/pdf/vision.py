@@ -79,17 +79,76 @@ reads as hidden paragraphs placed among them. Pass C
 against the elements: a mismatch is a warning.
 
 :func:`vision_page` makes the A1 page of a page A3 routed to vision (spec
-§3.3 steps 2 and 4), with one render and one OCR pass:
+§3.3 steps 2 and 4), with one render and one OCR pass (and a sample read
+each way when a turn is checked):
 
 1. Render: at :func:`~datagrunt.pdf.render.effective_dpi` of the vision
    DPI and the pixel bound, in the guarded worker.
 2. Orientation: tesseract's OSD on the normalized render (grey, 1 %
-   autocontrast). Its turn is made only at a confidence of
-   :data:`ROTATION_CONFIDENCE` or more: on the corpus (95 pages, each
-   rendered upright and turned 90, 180 and 270 degrees) every right turn
-   had a confidence of 3.59 or more and the one wrong turn 0.02 (a cover
-   with almost no text). Under it, or when OSD cannot tell, the page reads
-   as displayed, with a warning.
+   autocontrast). Its suggestion alone never turns the page (#456): OSD is
+   unreliable on sparse text. A turn it suggests at a confidence of
+   :data:`ROTATION_CONFIDENCE` or more is checked by reading (:func:`_turn`):
+   a sample of the page is read as displayed and turned
+   (:func:`~datagrunt.pdf.ocr.read_sample`), and, for a quarter turn, turned
+   the other way too (half a turn from it: OSD can pick the wrong side of a
+   sideways page). The turn is kept only when the turned sample's mean word
+   confidence, each word weighted by its chars, is :data:`TURN_MARGIN` or
+   more over each other reading's (a reading of no words counts as 0, and
+   is never better turned). The sample is the page's bands, the one
+   holding the most ink first (:func:`~datagrunt.pdf.ocr.inked_bands`):
+   each band read joins its words to those before, until the turn reads
+   better than every other way by the margin, or worse than one by it, or
+   every band is read. A band of text decides alone; one of art often reads
+   alike every way, so the next band is read. Under the threshold, when OSD
+   cannot tell, or when the check does not bear the turn out, the page
+   reads as displayed, with a warning (the check's naming each of the
+   sample's confidences).
+
+   Evidence, tesseract 5.5.3, on the corpus (95 pages, each rendered
+   upright and turned 90, 180 and 270 degrees, as their scans display):
+
+   - OSD gave the right turn at a confidence of 3.59 or more on 282 of the
+     285 turned renders (on the other 3, a cover with almost no text, it
+     could not tell, or suggested a wrong turn at 0.02).
+   - The check kept 280 of those 282 turns: turned, the sample read 16.9 or
+     more over as displayed (21.7 or more on a quarter turn), and 24.9 or
+     more over the other way; 273 were decided by their first band, none
+     took more than 3. It refused 2: a cover of art and a few words of
+     title, turned 90 and 270, whose whole page reads only 4.1 and 5.1
+     better turned. They read as displayed, with the warning.
+   - Each upright page's 3 wrong turns, checked as if OSD suggested them
+     (285): all refused. One band of art read 10.4 better at a wrong turn
+     of 90 degrees (the margin is over it), the whole page 0.9 at most.
+   - Sparse capitals (#456: 8 upright pages, two lines of capitals each):
+     OSD suggests turning each 180 degrees, at 1.83 to 2.04 (3 pages over
+     the threshold, read upside down before the check). Their sample reads
+     95.5 to 95.8 as displayed and 45.2 to 57.3 turned: refused on the
+     first band. Displayed sideways, OSD suggests the wrong side (the turn
+     they are displayed at, at 1.78 to 2.05): turned so, the sample reads
+     47.3 or 55.6 (upside down), as displayed no words, and the other way
+     93.9 or 94.4: refused on the first band.
+
+   The sample is read as sparse text (``--psm 11``), not as the page's
+   bands are (``--psm 3``): psm 3 rights sideways text itself, so an
+   upright page's sample turned 90 degrees read as well as displayed (on
+   the corpus, a median of 0.0 apart, up to 8.2 better turned): it cannot
+   tell a page from its quarter turn. psm 11 reads sideways text as no
+   words or poor ones (a median 51 to 61 under the upright reading).
+
+   Cost: a page whose turn is checked is OCR'd one extra sample: the band
+   holding the most ink, read as displayed and turned (two tesseract calls
+   of one band; three for a quarter turn), and the next bands by ink only
+   while that does not decide (1.04 bands on average on the corpus's
+   turned renders). Here that is 0.8 to 1.4 s a page turned 180 degrees and
+   1.4 to 2.5 s one turned 90, where its OCR takes 1.5 to 2.7 s. A page
+   OSD reads upright, or under the threshold, is not checked. The sample's
+   calls are within the page's budget and OCR timeout, as its bands' are:
+   a check the budget runs out in leaves the page unread (``OCR stopped
+   while checking orientation detection's turn of 180 degrees: the page's
+   600 s budget is spent``), as any page whose budget runs out; a sample
+   tesseract cannot read (it failed, or timed out) leaves the page as
+   displayed, with a warning saying why. A turn is never made unchecked,
+   and the displayed page is the PDF's own orientation.
 3. OCR: the righted page's bands (900 px, 60 px shared), each word mapped
    back to the displayed page.
 4. Elements: :func:`vision_elements` of the words, the page's figures and
@@ -104,9 +163,9 @@ against the elements: a mismatch is a warning.
 
 The page's render and OCR share one time budget (#418),
 :attr:`VisionOptions.page_budget_s` (600 s; a page takes 2-4 s here),
-counted from the page's start: each call (the render, OSD, a band) is given
-at most its own timeout and the time left, and none starts once it is
-spent. So a page's render and OCR end within its budget (and the last
+counted from the page's start: each call (the render, OSD, a sample's, a
+band) is given at most its own timeout and the time left, and none starts
+once it is spent. So a page's render and OCR end within its budget (and the last
 call's reap) however large the page is: its bands are many on a tall page.
 A page whose budget runs out is not read (the warning says how many of its
 bands were: ``OCR stopped after 1 of 4 bands: the page's 600 s budget is
@@ -143,6 +202,10 @@ Known limitations (A5b evidence: 10 corpus pages forced to OCR):
   words recall 80.7 % of the digital words where the OCR words themselves
   recall 84.4 % (#416; 75.2 % and 84.5 % before it dropped the band seams'
   fragments, sized words by their lines and laid art apart).
+- Only a turn OSD suggests is checked (step 2): a turned page OSD reads as
+  upright is read as displayed. The sparse capitals displayed upside down
+  are so: OSD reads each as upright (at 1.86 to 2.09), and its OCR is
+  gibberish.
 """
 
 import dataclasses
@@ -171,7 +234,18 @@ from datagrunt.pdf.assembly import (
 from datagrunt.pdf.elements import BBox, DocumentElement, Figure, HiddenReason, Page, PageImage, PageQuality, Table
 from datagrunt.pdf.exceptions import PDFCorruptError
 from datagrunt.pdf.layout import LatticeResult, find_lattice_tables, page_layout
-from datagrunt.pdf.ocr import OCRWord, Orientation, bands, normalized, ocr_words, orientation, rotated
+from datagrunt.pdf.ocr import (
+    OCRWord,
+    Orientation,
+    SampleReading,
+    bands,
+    inked_bands,
+    normalized,
+    ocr_words,
+    orientation,
+    read_sample,
+    rotated,
+)
 from datagrunt.pdf.pdfium_engine import (
     DocumentHandle,
     PageFailure,
@@ -186,6 +260,7 @@ from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effe
 __all__ = [
     "LEAST_SIZE_PT",
     "ROTATION_CONFIDENCE",
+    "TURN_MARGIN",
     "PageRender",
     "VisionElements",
     "VisionOptions",
@@ -217,8 +292,11 @@ _FILL = 0
 # A scan has no vector rules: no lattice tables, no text used by them.
 _NO_LATTICE = LatticeResult(tables=(), used_pieces=())
 
-# OSD's turn is made at this confidence or more (see the module notes: right turns 3.59 and up, the wrong one 0.02).
+# OSD's turn is checked at this confidence or more (see the module notes: right turns 3.59 and up, the wrong one 0.02).
 ROTATION_CONFIDENCE = 2.0
+# A turn OSD suggests is kept when its sample's mean word confidence turned is this much over it as displayed, or more
+# (module notes, step 2: right turns 16.9 and up; a band of a wrong turn 10.4 at most).
+TURN_MARGIN = 15.0
 
 _SUPERSEDED: tuple[HiddenReason, ...] = ("superseded",)
 _OCR_MODES: tuple[OcrMode, ...] = ("auto", "always", "never")
@@ -626,9 +704,11 @@ class _Reading(NamedTuple):
 
 
 def _read(page: RenderedPage, dpi: int, geometry: PageGeometry, options: VisionOptions, deadline: float) -> _Reading:
-    """The render normalized, oriented, turned, banded and read by tesseract (one OSD call, one call a band).
+    """The render normalized, oriented, turned, banded and read by tesseract.
 
-    Every call ends by ``deadline`` (the page's budget): none starts after it.
+    One OSD call; when it suggests a turn to check, two or three calls a band
+    of its sample (:func:`_turn`); then one call a band. Every call ends by
+    ``deadline`` (the page's budget): none starts after it.
     """
     grey = normalized(page)
     left = deadline - time.monotonic()
@@ -637,23 +717,24 @@ def _read(page: RenderedPage, dpi: int, geometry: PageGeometry, options: VisionO
     found = orientation(grey, timeout_s=min(options.ocr_timeout_s, left))
     if found.status == "unavailable":
         return _Reading((), 0, (), f"tesseract is unavailable: {found.reason}")
-    turn, notes = _turn(found)
+    turn = _turn(grey, found, options, deadline)
+    if turn.failure:
+        return _Reading((), 0, turn.notes, turn.failure)
     result = ocr_words(
-        bands(rotated(grey, turn)),
+        bands(rotated(grey, turn.degrees)),
         dpi=dpi,
-        rotation=turn,
+        rotation=turn.degrees,
         page_size_pt=(geometry.width_pt, geometry.height_pt),
         timeout_s=options.ocr_timeout_s,
         language=options.language,
         deadline=deadline,
     )
     if result.status == "ok":
-        return _Reading(result.words, turn, notes, "")
+        return _Reading(result.words, turn.degrees, turn.notes, "")
     unused = f"; the {len(result.words)} word(s) it read before that are not used" if result.words else ""
     if result.status == "spent":
-        return _Reading((), turn, notes, f"{result.reason}: {_spent(options)}{unused}")
-    why = "is unavailable" if result.status == "unavailable" else result.status
-    return _Reading((), turn, notes, f"tesseract {why}: {result.reason}{unused}")
+        return _Reading((), turn.degrees, turn.notes, f"{result.reason}: {_spent(options)}{unused}")
+    return _Reading((), turn.degrees, turn.notes, f"{_tesseract(result.status, result.reason)}{unused}")
 
 
 def _spent(options: VisionOptions) -> str:
@@ -661,18 +742,128 @@ def _spent(options: VisionOptions) -> str:
     return f"the page's {options.page_budget_s:g} s budget is spent"
 
 
-def _turn(found: Orientation) -> tuple[int, tuple[str, ...]]:
-    """The turn OCR reads the page at, from OSD's (made at :data:`ROTATION_CONFIDENCE` or more), and a note on it."""
+def _tesseract(status: str, reason: str) -> str:
+    """Why tesseract read nothing: its call's status and reason."""
+    return f"tesseract {'is unavailable' if status == 'unavailable' else status}: {reason}"
+
+
+class _Turn(NamedTuple):
+    """The turn OCR reads the page at, notes on it, and why the page is not read ("" when it is)."""
+
+    degrees: int
+    notes: tuple[str, ...]
+    failure: str = ""
+
+
+def _turn(grey: RenderedPage, found: Orientation, options: VisionOptions, deadline: float) -> _Turn:
+    """The turn OCR reads ``grey`` at: OSD's ``found``, made only when its sample reads better so (module notes, 2).
+
+    A turn suggested under :data:`ROTATION_CONFIDENCE` is not checked. The
+    check's calls end by ``deadline``: one cut at it, or not started, leaves
+    the page unread (its ``failure``).
+    """
     confidence = found.confidence
     if found.status != "ok" or confidence is None:
-        return 0, (f"orientation detection {found.status}: {found.reason}; OCR read the page as displayed",)
+        return _Turn(0, (f"orientation detection {found.status}: {found.reason}; OCR read the page as displayed",))
     if found.degrees == 0:
-        return 0, ()
-    if confidence >= ROTATION_CONFIDENCE:
-        turned = f"OCR righted it by {found.degrees} degrees clockwise (orientation confidence {confidence:g})"
-        return found.degrees, (f"the page reads turned: {turned}",)
-    suggests = f"turning the page {found.degrees} degrees clockwise at a confidence of {confidence:g}"
-    return 0, (f"orientation detection suggests {suggests}, under {ROTATION_CONFIDENCE:g}; OCR read it as displayed",)
+        return _Turn(0, ())
+    turning = f"turning the page {found.degrees} degrees clockwise at a confidence of {confidence:g}"
+    suggests = f"orientation detection suggests {turning}"
+    if confidence < ROTATION_CONFIDENCE:
+        return _Turn(0, (f"{suggests}, under {ROTATION_CONFIDENCE:g}; OCR read it as displayed",))
+    sample = _sampled(grey, found.degrees, options, deadline)
+    if isinstance(sample, SampleReading):
+        if sample.status == "spent":
+            return _Turn(0, (), f"OCR stopped while checking {_suggested(found)}: {_spent(options)}")
+        unread = f"its sample could not be read ({_tesseract(sample.status, sample.reason)})"
+        return _Turn(0, (f"{suggests}, but {unread}, so the turn is not checked; OCR read it as displayed",))
+    reads = sample.reads(found.degrees)
+    if all(gap >= TURN_MARGIN for gap in sample.gaps()):
+        righted = f"OCR righted it by {found.degrees} degrees clockwise"
+        return _Turn(
+            found.degrees, (f"the page reads turned: {righted} (orientation confidence {confidence:g}; {reads})",)
+        )
+    needs = f"mean word confidence; a turn needs {TURN_MARGIN:g} more"
+    return _Turn(0, (f"{suggests}, but {reads} ({needs}); OCR read it as displayed",))
+
+
+def _suggested(found: Orientation) -> str:
+    """The turn OSD suggests, named."""
+    return f"orientation detection's turn of {found.degrees} degrees"
+
+
+class _Sample(NamedTuple):
+    """A page's sample read as displayed, turned as OSD suggests, and (a quarter turn) turned the other way."""
+
+    displayed: SampleReading
+    turned: SampleReading
+    opposite: SampleReading | None
+
+    def gaps(self) -> tuple[float, ...]:
+        """How much better the sample reads turned than each other way it was read (:func:`_gap`)."""
+        others = (self.displayed,) if self.opposite is None else (self.displayed, self.opposite)
+        return tuple(_gap(other, self.turned) for other in others)
+
+    def decided(self) -> bool:
+        """True once the turn reads better than every other way by the margin, or worse than one by it."""
+        gaps = self.gaps()
+        return all(gap >= TURN_MARGIN for gap in gaps) or any(gap <= -TURN_MARGIN for gap in gaps)
+
+    def reads(self, degrees: int) -> str:
+        """How the sample reads each way, as a warning names it (``degrees``: the turn OSD suggests)."""
+        turned, displayed = _reads(self.turned), _reads(self.displayed)
+        if self.opposite is None:
+            return f"its sample reads {turned} turned and {displayed} as displayed"
+        other = f"{_reads(self.opposite)} turned {_opposite(degrees)} degrees"
+        return f"its sample reads {turned} turned, {displayed} as displayed and {other}"
+
+
+def _opposite(degrees: int) -> int:
+    """The turn half a turn from ``degrees``."""
+    return (degrees + 180) % 360
+
+
+def _sampled(grey: RenderedPage, degrees: int, options: VisionOptions, deadline: float) -> _Sample | SampleReading:
+    """The page's sample read as displayed and turned by ``degrees``, and the other way too for a quarter turn.
+
+    Its bands are read most ink first (:func:`~datagrunt.pdf.ocr.inked_bands`),
+    each every way, joining the words read before, until the joined
+    readings decide (:meth:`_Sample.decided`; a band of no words read any
+    way decides nothing) or every band is read: two calls a band (three for
+    a quarter turn), each within its timeout and ``deadline``. The first
+    reading that fails ends it, and is returned.
+    """
+    turns = (0, degrees) if degrees == 180 else (0, degrees, _opposite(degrees))
+    words: tuple[list[tuple[str, float]], ...] = tuple([] for _ in turns)
+    for band in inked_bands(grey):
+        for side, turn in enumerate(turns):
+            reading = read_sample(
+                rotated(band, turn), timeout_s=options.ocr_timeout_s, language=options.language, deadline=deadline
+            )
+            if reading.status != "ok":
+                return reading
+            words[side].extend(reading.words)
+        if any(words) and _joined(words).decided():
+            break
+    return _joined(words)
+
+
+def _joined(words: tuple[list[tuple[str, float]], ...]) -> _Sample:
+    """The words of a sample's bands read so far each way (displayed, turned, other way if read), as one sample."""
+    readings = [SampleReading(words=tuple(read), status="ok", reason="") for read in words]
+    return _Sample(displayed=readings[0], turned=readings[1], opposite=readings[2] if len(readings) > 2 else None)
+
+
+def _gap(other: SampleReading, turned: SampleReading) -> float:
+    """How much better the sample reads turned than ``other``: no words turned is -inf; no words ``other``, 0."""
+    if turned.confidence is None:
+        return -math.inf
+    return turned.confidence - (other.confidence if other.confidence is not None else 0.0)
+
+
+def _reads(reading: SampleReading) -> str:
+    """A sample reading's mean word confidence, as a warning names it."""
+    return "no words" if reading.confidence is None else f"at {reading.confidence:.1f}"
 
 
 def _page_image(

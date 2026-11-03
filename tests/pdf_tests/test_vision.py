@@ -16,6 +16,7 @@ import pickle
 import re
 import shutil
 import time
+from collections import Counter
 from pathlib import Path
 
 import pypdfium2 as pdfium
@@ -28,7 +29,7 @@ from datagrunt.pdf.assembly import FigureDraft, assemble_page, conservation
 from datagrunt.pdf.elements import BBox, Figure, Page, PageQuality, Paragraph, Table
 from datagrunt.pdf.exceptions import PDFSourceChangedError
 from datagrunt.pdf.layout import find_lattice_tables
-from datagrunt.pdf.ocr import OCRResult, OCRWord, Orientation, bands, normalized, rotated
+from datagrunt.pdf.ocr import OCRResult, OCRWord, Orientation, bands, inked_bands, normalized, rotated
 from datagrunt.pdf.pdfium_engine import (
     PageFailure,
     PageGeometry,
@@ -730,8 +731,46 @@ def spy_ocr(monkeypatch, words=()) -> list[dict]:
     return calls
 
 
+def fake_samples(tmp_path, monkeypatch, *reports: bytes, fail: int = 0) -> Path:
+    """A fake tesseract answering its n-th call with ``reports[n - 1]`` (keeping its stdin as ``stdin-n``).
+
+    Its ``fail``-th call, if any, exits 3 instead.
+    """
+    body = (
+        'n=$(( $(cat "{d}/calls" 2>/dev/null || echo 0) + 1 ))\necho "$n" > "{d}/calls"\ncat > "{d}/stdin-$n"\n'
+        f'if [ "$n" = "{fail}" ]; then echo "Error: the sample" >&2; exit 3; fi\n'
+        'cat "{d}/stdout-$n"'
+    )
+    fake = fake_tesseract(tmp_path, monkeypatch, body)
+    for number, report in enumerate(reports, start=1):
+        (fake / f"stdout-{number}").write_bytes(report)
+    return fake
+
+
+def sample_tsv(*words: tuple[str, float]) -> bytes:
+    """A sample's TSV: each word's text and confidence, side by side on one line."""
+    return tsv(*(tsv_row(5, (10 + 60 * at, 20, 50, 15), f"{conf:g}", text) for at, (text, conf) in enumerate(words)))
+
+
+def pgm(page: RenderedPage) -> bytes:
+    """``page`` as the binary PGM tesseract is given."""
+    return b"P5\n%d %d\n255\n" % (page.px_width, page.px_height) + page.pixels
+
+
+def turn_notes(page: Page) -> list[str]:
+    """The page's warnings on its orientation."""
+    return [item for item in page.warnings if "orient" in item or "turned" in item]
+
+
+LOW = sample_tsv(("WHd", 37.0), ("1V", 37.0))  # upside-down capitals, as tesseract read them (#456): 37.0
+HIGH = sample_tsv(("ALPHA", 96.0), ("DOCUMENT", 96.0))  # the same, upright: 96.0
+NO_WORDS = tsv()
+TURNED_180 = Orientation(degrees=180, confidence=2.04, status="ok", reason="")
+SUGGESTS = "orientation detection suggests turning the page 180 degrees clockwise at a confidence of 2.04"
+
+
 class TestOrientation:
-    """OSD's turn is made only at a confidence of ROTATION_CONFIDENCE or more; otherwise the page reads as displayed."""
+    """OSD's turn is checked only at a confidence of ROTATION_CONFIDENCE or more; else the page reads as displayed."""
 
     def test_the_threshold_is_set_from_the_evidence(self):
         # Corpus (95 pages x 4 turns): right turns at 3.59 and up, the one wrong turn at 0.02 (A5b evidence).
@@ -740,18 +779,6 @@ class TestOrientation:
     @pytest.mark.parametrize(
         ("found", "turn", "warning"),
         [
-            pytest.param(
-                Orientation(degrees=90, confidence=2.0, status="ok", reason=""),
-                90,
-                "the page reads turned: OCR righted it by 90 degrees clockwise (orientation confidence 2)",
-                id="at-the-threshold",
-            ),
-            pytest.param(
-                Orientation(degrees=270, confidence=35.9, status="ok", reason=""),
-                270,
-                "the page reads turned: OCR righted it by 270 degrees clockwise (orientation confidence 35.9)",
-                id="confident",
-            ),
             pytest.param(
                 Orientation(degrees=90, confidence=1.99, status="ok", reason=""),
                 0,
@@ -782,6 +809,7 @@ class TestOrientation:
     )
     def test_the_turn_ocr_reads_at(self, scans, monkeypatch, found, turn, warning):
         monkeypatch.setattr(vision, "orientation", lambda *args, **kwargs: found)
+        monkeypatch.setattr(vision, "read_sample", lambda *args, **kwargs: pytest.fail("a turn was checked"))
         calls = spy_ocr(monkeypatch)
 
         page = visioned(scans["captioned"])
@@ -794,12 +822,14 @@ class TestOrientation:
             [warning] if warning else []
         )
 
-    def test_the_bands_are_of_the_righted_page(self, scans, monkeypatch):
+    @posix_only
+    def test_the_bands_are_of_the_righted_page(self, scans, monkeypatch, tmp_path):
         monkeypatch.setattr(
             vision,
             "orientation",
             lambda *args, **kwargs: Orientation(degrees=90, confidence=9.0, status="ok", reason=""),
         )
+        fake_samples(tmp_path, monkeypatch, LOW, HIGH, LOW)
         spy_ocr(monkeypatch)
 
         page = visioned(scans["captioned"])
@@ -810,6 +840,227 @@ class TestOrientation:
         # The image itself is the page as displayed, not as OCR turned it.
         assert (page.page_image.width_px, page.page_image.height_px) == (2550, 3300)
         assert decoded(page.page_image.read_bytes()) == (displayed.pixels, 2550, 3300)
+
+
+def checked(scans, monkeypatch, tmp_path, found: Orientation, *reports: bytes, fail: int = 0, **options):
+    """vision_page of the captioned scan with OSD's ``found`` and the samples' ``reports``: (page, OCR calls, fake)."""
+    monkeypatch.setattr(vision, "orientation", lambda *args, **kwargs: found)
+    fake = fake_samples(tmp_path, monkeypatch, *reports, fail=fail)
+    calls = spy_ocr(monkeypatch)
+    page = visioned(scans["captioned"], **options)
+    return page, calls, fake
+
+
+def refused(turned: str, displayed: str) -> str:
+    """The warning of a turn OSD suggests (180 at 2.04) that its sample does not bear out."""
+    needs = f"mean word confidence; a turn needs {vision.TURN_MARGIN:g} more"
+    reads = f"its sample reads {turned} turned and {displayed} as displayed"
+    return f"{SUGGESTS}, but {reads} ({needs}); OCR read it as displayed"
+
+
+def kept(degrees: int, osd: str, turned: str, displayed: str) -> str:
+    """The warning of a turn of 180 degrees its sample bears out."""
+    righted = f"the page reads turned: OCR righted it by {degrees} degrees clockwise"
+    return f"{righted} (orientation confidence {osd}; its sample reads {turned} turned and {displayed} as displayed)"
+
+
+QUARTER = Orientation(degrees=90, confidence=2.0, status="ok", reason="")
+
+
+# The captioned scan's 4 bands, each read as displayed and turned: a check reads 8 samples at most.
+EVERY_BAND = 4
+
+
+@posix_only
+class TestTurnCheck:
+    """OSD's suggestion alone never turns a page (#456): its turn is kept only when the page's sample reads better."""
+
+    def test_the_margin_is_set_from_the_evidence(self):
+        # Corpus (95 pages x 4 turns) and sparse capitals: see the vision module notes, step 2.
+        assert vision.TURN_MARGIN == 15.0
+
+    def test_a_turn_its_sample_reads_better_is_kept(self, scans, monkeypatch, tmp_path):
+        page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, LOW, HIGH)
+
+        assert call["rotation"] == 180
+        assert (fake / "calls").read_text() == "2\n"
+        assert turn_notes(page) == [kept(180, "2.04", "at 96.0", "at 37.0")]
+
+    def test_a_turn_its_sample_reads_worse_is_refused(self, scans, monkeypatch, tmp_path):
+        page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, HIGH, LOW)
+
+        assert call["rotation"] == 0
+        assert call["bands"][0].px_width == 2550
+        assert (fake / "calls").read_text() == "2\n"
+        assert turn_notes(page) == [refused("at 37.0", "at 96.0")]
+
+    @pytest.mark.parametrize(("over", "turn", "calls"), [pytest.param(0.0, 180, 2, id="by-the-margin"), (-0.1, 0, 8)])
+    def test_the_turned_sample_must_read_the_margin_better(self, scans, monkeypatch, tmp_path, over, turn, calls):
+        # Under the margin, a band decides nothing: every band is read, and the page's sample is still under it.
+        better = 50.0 + vision.TURN_MARGIN + over
+        reports = (sample_tsv(("text", 50.0)), sample_tsv(("text", better))) * EVERY_BAND
+
+        _, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, *reports)
+
+        assert call["rotation"] == turn
+        assert (fake / "calls").read_text() == f"{calls}\n"
+
+    def test_the_mean_is_weighted_by_chars(self, scans, monkeypatch, tmp_path):
+        # Turned: words of 20 and 80 confidence, the 80 one 4 chars of 5: 68.0 (unweighted, 50.0); displayed 50.0.
+        reports = (sample_tsv(("text", 50.0)), sample_tsv(("a", 20.0), ("word", 80.0)))
+
+        page, (call,), _ = checked(scans, monkeypatch, tmp_path, TURNED_180, *reports)
+
+        assert call["rotation"] == 180
+        assert turn_notes(page) == [kept(180, "2.04", "at 68.0", "at 50.0")]
+
+    @pytest.mark.parametrize(
+        ("displayed", "shown", "calls"),
+        [(HIGH, "at 96.0", 2), (LOW, "at 37.0", 2), (NO_WORDS, "no words", 8)],
+        ids=["high", "low", "none"],
+    )
+    def test_a_turned_sample_of_no_words_is_never_better(self, scans, monkeypatch, tmp_path, displayed, shown, calls):
+        # No words either way is no evidence: the next band is read, to the last.
+        reports = (displayed, NO_WORDS) * EVERY_BAND
+
+        page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, *reports)
+
+        assert call["rotation"] == 0
+        assert (fake / "calls").read_text() == f"{calls}\n"
+        assert turn_notes(page) == [refused("no words", shown)]
+
+    @pytest.mark.parametrize(
+        ("turned", "turn"), [pytest.param(HIGH, 180, id="kept"), pytest.param(sample_tsv(("x", 14.9)), 0, id="refused")]
+    )
+    def test_a_displayed_sample_of_no_words_reads_as_no_confidence(self, scans, monkeypatch, tmp_path, turned, turn):
+        # A sideways page's sample reads no words as displayed (psm 11): a turn is kept by the margin over 0.
+        page, (call,), _ = checked(scans, monkeypatch, tmp_path, TURNED_180, *(NO_WORDS, turned) * EVERY_BAND)
+
+        assert call["rotation"] == turn
+        assert "turned and no words as displayed" in turn_notes(page)[0]
+
+    @pytest.mark.parametrize(
+        ("reports", "turn", "note"),
+        [
+            pytest.param(
+                (NO_WORDS, HIGH, LOW),
+                90,
+                "the page reads turned: OCR righted it by 90 degrees clockwise (orientation confidence 2; "
+                "its sample reads at 96.0 turned, no words as displayed and at 37.0 turned 270 degrees)",
+                id="kept",
+            ),
+            pytest.param(
+                (NO_WORDS, LOW, HIGH),
+                0,
+                "orientation detection suggests turning the page 90 degrees clockwise at a confidence of 2, but its "
+                "sample reads at 37.0 turned, no words as displayed and at 96.0 turned 270 degrees "
+                "(mean word confidence; a turn needs 15 more); OCR read it as displayed",
+                id="the-other-way-reads-better",
+            ),
+        ],
+    )
+    def test_a_quarter_turn_must_read_better_than_the_other_way_too(
+        self, scans, monkeypatch, tmp_path, reports, turn, note
+    ):
+        # A sideways page reads no words as displayed: its turn is checked against the opposite turn too, so OSD's
+        # choice of side is never taken alone (sparse capitals displayed sideways: OSD picks the wrong side, #456).
+        page, (call,), fake = checked(scans, monkeypatch, tmp_path, QUARTER, *reports)
+
+        sample = inked_bands(normalized(rendered(scans["captioned"])))[0]
+        assert (fake / "stdin-3").read_bytes() == pgm(rotated(sample, 270))
+        assert call["rotation"] == turn
+        assert turn_notes(page) == [note]
+
+    @pytest.mark.parametrize("degrees", [90, 180, 270])
+    def test_the_sample_is_the_band_holding_the_most_ink_read_as_displayed_then_turned(
+        self, scans, monkeypatch, tmp_path, degrees
+    ):
+        # A quarter turn's sample is read the other way too: three calls, not two.
+        found = Orientation(degrees=degrees, confidence=9.0, status="ok", reason="")
+
+        _, (call,), fake = checked(scans, monkeypatch, tmp_path, found, LOW, HIGH, LOW)
+
+        sample = inked_bands(normalized(rendered(scans["captioned"])))[0]
+        turns = (0, degrees) if degrees == 180 else (0, degrees, (degrees + 180) % 360)
+        assert (sample.px_width, sample.px_height) == (2550, 900)
+        assert (fake / "calls").read_text() == f"{len(turns)}\n"
+        for number, turn in enumerate(turns, start=1):
+            assert (fake / f"stdin-{number}").read_bytes() == pgm(rotated(sample, turn))
+        assert call["rotation"] == degrees
+
+    @pytest.mark.parametrize(
+        "first", [pytest.param(sample_tsv(("text", 50.0)), id="undecided"), pytest.param(NO_WORDS, id="no-words")]
+    )
+    def test_a_band_that_decides_nothing_is_followed_by_the_next_by_ink(self, scans, monkeypatch, tmp_path, first):
+        # The first band reads alike both ways (or nothing): the second band by ink is read, and its words join.
+        page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, first, first, LOW, HIGH)
+
+        by_ink = inked_bands(normalized(rendered(scans["captioned"])))
+        assert (fake / "calls").read_text() == "4\n"
+        assert (fake / "stdin-3").read_bytes() == pgm(by_ink[1])
+        assert (fake / "stdin-4").read_bytes() == pgm(rotated(by_ink[1], 180))
+        assert call["rotation"] == 180
+        # Joined: (4 x 50 + 5 x 37) / 9 = 42.8 and (4 x 50 + 13 x 96) / 17 = 85.2; no words joins nothing.
+        joined = ("at 85.2", "at 42.8") if first != NO_WORDS else ("at 96.0", "at 37.0")
+        assert turn_notes(page) == [kept(180, "2.04", *joined)]
+
+    @pytest.mark.parametrize("fail", [1, 2], ids=["as-displayed", "turned"])
+    def test_a_sample_tesseract_cannot_read_leaves_the_page_as_displayed(self, scans, monkeypatch, tmp_path, fail):
+        page, (call,), fake = checked(scans, monkeypatch, tmp_path, TURNED_180, LOW, HIGH, fail=fail)
+
+        assert call["rotation"] == 0
+        assert (fake / "calls").read_text() == f"{fail}\n"  # a failed reading as displayed is not followed by another
+        unread = "tesseract failed: tesseract exited with code 3; its stderr ends: Error: the sample"
+        assert turn_notes(page) == [
+            f"{SUGGESTS}, but its sample could not be read ({unread}), so the turn is not checked; "
+            "OCR read it as displayed"
+        ]
+
+    def test_a_budget_spent_before_the_check_reads_nothing(self, scans, monkeypatch, tmp_path):
+        spy_render(monkeypatch, rendered(scans["captioned"]))
+
+        def slow(*args, **kwargs):
+            time.sleep(1.2)
+            return TURNED_180
+
+        monkeypatch.setattr(vision, "orientation", slow)
+        fake = fake_samples(tmp_path, monkeypatch, LOW, HIGH)
+        monkeypatch.setattr(vision, "ocr_words", lambda *args, **kwargs: pytest.fail("OCR ran"))
+
+        page = visioned(scans["captioned"], options=VisionOptions(page_budget_s=1.0))
+
+        assert (page.status, texts(page)) == ("ocr_unavailable", ["Page 7"])
+        checking = "OCR stopped while checking orientation detection's turn of 180 degrees"
+        assert page.warnings[-1] == budget_warning(checking, "1")
+        assert not (fake / "calls").exists()
+
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_a_sample_call_cut_at_the_budget_reads_nothing(self, scans, monkeypatch, tmp_path):
+        spy_render(monkeypatch, rendered(scans["captioned"]))
+        monkeypatch.setattr(vision, "orientation", lambda *args, **kwargs: TURNED_180)
+        fake_tesseract(tmp_path, monkeypatch, "cat > /dev/null\nexec sleep 60")
+        monkeypatch.setattr(vision, "ocr_words", lambda *args, **kwargs: pytest.fail("OCR ran"))
+
+        began = time.monotonic()
+        page = visioned(scans["captioned"], options=VisionOptions(page_budget_s=2.0))
+        elapsed = time.monotonic() - began
+
+        assert page.status == "ocr_unavailable"
+        checking = "OCR stopped while checking orientation detection's turn of 180 degrees"
+        assert page.warnings[-1] == budget_warning(checking, "2")
+        assert elapsed < 10.0  # ~2 s here: the budget, then the call's reap; its own timeout would allow 120 s
+
+    def test_a_fallback_page_is_checked_too(self, scans, monkeypatch, tmp_path):
+        failure = failed_at_text(scans["scan"], monkeypatch)
+        monkeypatch.setattr(vision, "orientation", lambda *args, **kwargs: TURNED_180)
+        fake_samples(tmp_path, monkeypatch, HIGH, LOW)
+        calls = spy_ocr(monkeypatch, line_words("The quick", 72.0, 100.0))
+
+        page = fell_back(scans["scan"], failure)
+
+        (call,) = calls
+        assert (page.status, call["rotation"]) == ("ocr_fallback", 0)
+        assert turn_notes(page) == [refused("at 37.0", "at 96.0")]
 
 
 class TestVisionPageArguments:
@@ -1601,9 +1852,32 @@ def union_of(boxes) -> tuple[float, float, float, float]:
     return (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
 
 
+# A kept turn's note: the turn, then the sample's reading turned, as displayed, and (a quarter turn) the other way.
+KEPT = re.compile(
+    r"the page reads turned: OCR righted it by (\d+) degrees clockwise \(orientation confidence [\d.]+; "
+    r"its sample reads at ([\d.]+) turned,? (?:and )?(?:at ([\d.]+)|no words) as displayed"
+    r"(?: and (?:at ([\d.]+)|no words) turned (\d+) degrees)?\)"
+)
+
+
 @needs_tesseract
 class TestRotatedScans:
     """90 / 180 / 270 degree scans orient to 0 degrees: OCR reads them righted, in order, where they were drawn."""
+
+    @pytest.mark.parametrize("rotate", [90, 180, 270])
+    def test_a_turned_scan_is_righted_through_the_check(self, done_when, rotate):
+        # #456: OSD's turn is kept because the scan's sample reads better turned than as displayed (and, a quarter
+        # turn, than turned the other way), by the margin or more.
+        page = visioned(done_when[f"scan-{rotate}"])
+
+        (note,) = turn_notes(page)
+        found = KEPT.fullmatch(note)
+        assert found is not None, note
+        degrees, turned_at, displayed_at, other_at, other = found.groups()
+        assert int(degrees) == (360 - rotate) % 360
+        assert (int(other) if other else None) == (None if rotate == 180 else (int(degrees) + 180) % 360)
+        for reading in (displayed_at, other_at):
+            assert float(turned_at) >= float(reading or 0.0) + vision.TURN_MARGIN
 
     @pytest.mark.parametrize("rotate", [90, 180, 270])
     def test_a_turned_scan_reads_righted_in_order_where_it_was_drawn(self, done_when, rotate):
@@ -1694,3 +1968,52 @@ class TestGarbledFont:
         garbled = "".join(" " if char == " " else chr(0xE000 + ord(char)) for char in GARBLED)
         assert hidden == [(garbled, ("superseded",))]
         assert texts(page) == [GARBLED]
+
+
+def sparse_capitals(path: Path) -> Path:
+    """8 upright pages of two lines of capitals (#456): tesseract 5.5.3's OSD suggests turning each 180 degrees."""
+    pages = [
+        PageSpec(
+            items=(
+                TextRun(f"ALPHA DOCUMENT PAGE {number}", 72.0, 100.0, size=28.0),
+                TextRun("ALPHA ALPHA ALPHA body text line", 72.0, 160.0, size=20.0),
+            )
+        )
+        for number in range(1, 9)
+    ]
+    return build_pdf(path, pages)
+
+
+@pytest.fixture(scope="module")
+def capitals(tmp_path_factory) -> Path:
+    return sparse_capitals(tmp_path_factory.mktemp("capitals") / "capitals.pdf")
+
+
+@needs_tesseract
+class TestSparseCapitals:
+    """Upright pages OSD suggests turning (at 1.83 to 2.04 here, 3 of 8 over the threshold) read upright (#456)."""
+
+    def test_every_page_reads_its_upright_text(self, capitals):
+        pages = PDFReader(capitals, ocr="always", workers=4).pages
+
+        assert len(pages) == 8
+        for number, page in enumerate(pages, start=1):
+            expected = Counter(f"ALPHA DOCUMENT PAGE {number} ALPHA ALPHA ALPHA body text line".split())
+            read = Counter(" ".join(texts(page)).split())
+            assert (page.status, page.route) == ("ok", "vision")
+            assert sum((expected & read).values()) >= 9, (number, texts(page), page.warnings)
+            assert not [note for note in page.warnings if note.startswith("the page reads turned")], page.warnings
+
+    @pytest.mark.parametrize("shown", [0, 90, 180, 270])
+    @pytest.mark.parametrize("index", [0, 2])
+    def test_a_page_is_never_turned_a_wrong_way(self, capitals, shown, index):
+        # Displayed at each turn, OSD suggests the wrong turn (the one it is displayed at, at 1.95 to 2.05 here); the
+        # check refuses it, and keeps a right one. (Displayed upside down, OSD reads it as upright: not checked.)
+        page = rotated(
+            normalized(render_page(capitals, index, dpi=300, memory_cap_bytes=1 << 30, timeout_s=120.0)), shown
+        )
+        found = vision.orientation(page, timeout_s=120.0)
+
+        turn = vision._turn(page, found, VisionOptions(), time.monotonic() + 600.0)
+
+        assert turn.degrees in (0, (360 - shown) % 360), (found, turn)
