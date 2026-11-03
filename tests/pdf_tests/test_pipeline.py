@@ -750,6 +750,7 @@ class TestExtractPageAt:
         assert kwargs == {
             "source": path,
             "password": "pw",
+            "identity": None,  # page_at's source has none: the worker passes its source's
             "min_image_dimension": 32,
             "options": VisionOptions(vision_dpi=250, max_render_pixels=1_000_000),
         }
@@ -768,6 +769,7 @@ class TestExtractPageAt:
         assert kwargs == {
             "source": path,
             "password": "pw",
+            "identity": None,  # page_at's source has none: the worker passes its source's
             "ocr": ocr,
             "options": VisionOptions(vision_dpi=250, max_render_pixels=1_000_000),
         }
@@ -898,6 +900,18 @@ class TestPageIsolation:
         assert page.warnings[0].startswith(
             f"extraction failed at stage 'text': {TEXT_FAILURE}; the page was read by OCR"
         )
+
+    def test_a_failed_text_stages_page_image_holds_the_source_identity(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [PageSpec(width=400.0, height=300.0, items=body_text(100.0))])
+        monkeypatch.setattr(pdfium_c, "FPDFText_CountChars", failing(-1))
+        identity = identity_of(path)
+
+        page = extract_page_at(PDFSource(path=path, identity=identity), 0, PipelineOptions())
+
+        image = page.page_image
+        assert page.route == "vision" and page.status in ("ocr_fallback", "error")  # "error" without tesseract
+        owners = (image._loader.__self__, image._band_loader.__self__)
+        assert [(type(owner).__name__, owner.identity) for owner in owners] == [("PageRender", identity)] * 2
 
     def test_a_failed_text_stage_without_tesseract_is_an_error_page_of_the_pages_own_size(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "doc.pdf", [PageSpec(width=400.0, height=300.0, items=body_text(100.0))])

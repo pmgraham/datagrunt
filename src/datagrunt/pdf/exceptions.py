@@ -49,6 +49,9 @@ class PDFSourceChangedError(DatagruntPDFError):
     Raised whatever ``strict`` says: the whole document is inconsistent, not
     one page, so no document is returned. The message names what changed:
     the file's inode (it was replaced), its size or its modification time.
+    A page image's read (``PageImage.read_bytes``, ``read_bands``) raises it
+    too when the file at the path is no longer the one its document was
+    extracted from: no image of other bytes than the pages is returned.
     """
 
 

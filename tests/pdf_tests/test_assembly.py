@@ -9,6 +9,7 @@ and read them through ``extract_page``.
 import dataclasses
 import hashlib
 import io
+import os
 import pickle
 import re
 import subprocess
@@ -31,7 +32,7 @@ from datagrunt.pdf.assembly import (
     pass_c,
 )
 from datagrunt.pdf.elements import BBox, Figure, Page, PageImage, PageQuality, Paragraph, Table
-from datagrunt.pdf.exceptions import DatagruntPDFError
+from datagrunt.pdf.exceptions import DatagruntPDFError, PDFSourceChangedError
 from datagrunt.pdf.layout import (
     MAX_CROSSINGS,
     LatticeCell,
@@ -48,9 +49,12 @@ from datagrunt.pdf.pdfium_engine import (
     open_document,
     recover_dropped_text,
 )
+from datagrunt.pdf.pipeline import SourceIdentity
 from datagrunt.pdf.quality import PageAssessment, assess_page
+from datagrunt.pdf.reader import PDFReader
 from datagrunt.pdf.render import RenderRefused, effective_dpi, render_page, render_size
 from datagrunt.pdf.scope import apply_scope
+from datagrunt.pdf.writer import PDFWriter
 from pdf_tests.builders import PageSpec, RasterImage, Rect, TextRun, build_pdf, hand_written_pdf, solid_png
 from pdf_tests.test_layout_apart import tiny_text_page
 from pdf_tests.test_layout_lattice import rules as lattice_rules
@@ -751,6 +755,133 @@ class TestPageDraw:
             draw.png_bytes()
 
 
+# Why a page image of a file that is not its document's is refused: the end of each PDFSourceChangedError (#453).
+NOT_RETURNED = "the page image and the document's pages could disagree, so it is not returned"
+
+
+def identity_of(path: Path) -> SourceIdentity:
+    """The identity of the file at ``path`` now."""
+    return SourceIdentity.of(os.stat(path))
+
+
+def held_identity(path: Path, field: str) -> tuple[SourceIdentity, str]:
+    """An identity of ``path`` whose ``field`` (``inode``, ``size``, ``mtime_ns``) is one off; its change, in words."""
+    now = identity_of(path)
+    held = dataclasses.replace(now, **{field: getattr(now, field) + 1})
+    words = {
+        "inode": f"inode {held.device}:{held.inode} -> {now.device}:{now.inode}",
+        "size": f"size {held.size} -> {now.size} bytes",
+        "mtime_ns": f"mtime {held.mtime_ns} -> {now.mtime_ns} ns",
+    }
+    return held, words[field]
+
+
+def no_draw(*args, **kwargs):
+    raise AssertionError("the page was drawn")
+
+
+def after_the_draw(monkeypatch, change) -> None:
+    """Run ``change()`` once the render worker has drawn the page, before the draw returns."""
+    real = _loaders.render_page
+
+    def changing(*args, **kwargs):
+        drawn = real(*args, **kwargs)
+        change()
+        return drawn
+
+    monkeypatch.setattr(_loaders, "render_page", changing)
+
+
+def appended(path: Path) -> None:
+    """Append 12 bytes to ``path``, in place."""
+    with path.open("ab") as stream:
+        stream.write(b"\n% appended\n")
+
+
+class TestPageDrawSource:
+    """A PageDraw bound to its document's file draws from that file only: checked before and after each draw (#453)."""
+
+    def draw(self, path: Path, identity: object, page_index: int = 0) -> _loaders.PageDraw:
+        return _loaders.PageDraw(
+            source=path, page_index=page_index, dpi=72, width_pt=LETTER_W, height_pt=LETTER_H, identity=identity
+        )
+
+    def test_holds_its_identity_through_a_pickle_and_hides_the_password(self, tmp_path):
+        path = letter(tmp_path, *body_text(100.0))
+        values = TestPageDraw().fields(tmp_path, source=path) | {"identity": identity_of(path)}
+
+        draw = _loaders.PageDraw(**values)
+        copy = pickle.loads(pickle.dumps(draw))
+
+        assert copy == draw
+        assert (copy.identity, copy.password) == (identity_of(path), "secret")
+        assert "secret" not in repr(copy)
+        assert _loaders.PageDraw(**TestPageDraw().fields(tmp_path)).identity is None
+
+    def test_rejects_an_identity_that_is_not_a_source_identity(self, tmp_path):
+        with pytest.raises(TypeError, match=re.escape("identity must be a SourceIdentity or None, got tuple")):
+            self.draw(tmp_path / "doc.pdf", (1, 2, 3, 4))
+
+    def test_the_file_of_its_identity_draws(self, tmp_path):
+        path = letter(tmp_path, *body_text(100.0))
+
+        data = self.draw(path, identity_of(path)).png_bytes()
+
+        drawn = render_page(path, 0, dpi=72, memory_cap_bytes=RENDER_CAP, timeout_s=RENDER_TIMEOUT)
+        assert grey_png(data) == ("PNG", "L", (612, 792), drawn.pixels)
+
+    @pytest.mark.parametrize("field", ["inode", "size", "mtime_ns"])
+    def test_a_file_that_is_not_its_identitys_is_refused_before_it_is_drawn(self, tmp_path, monkeypatch, field):
+        path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=tuple(body_text(100.0)))] * 2)
+        held, change = held_identity(path, field)
+        monkeypatch.setattr(_loaders, "render_page", no_draw)
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            self.draw(path, held, page_index=1).png_bytes()
+
+        assert str(caught.value) == f"{path} changed before page 2's image was drawn: {change}; {NOT_RETURNED}"
+
+    def test_a_file_changed_while_it_is_drawn_is_refused(self, tmp_path, monkeypatch):
+        path = letter(tmp_path, *body_text(100.0))
+        held = identity_of(path)
+        after_the_draw(monkeypatch, lambda: appended(path))
+
+        changed = f"{path} changed while page 1's image was drawn: size {held.size} -> {held.size + 12} bytes"
+        with pytest.raises(PDFSourceChangedError, match=f"^{re.escape(changed)}"):
+            self.draw(path, held).png_bytes()
+
+    def test_a_file_removed_before_it_is_drawn_is_refused(self, tmp_path, monkeypatch):
+        path = letter(tmp_path, *body_text(100.0))
+        held = identity_of(path)
+        path.unlink()
+        monkeypatch.setattr(_loaders, "render_page", no_draw)
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            self.draw(path, held).png_bytes()
+
+        assert str(caught.value) == f"{path} was removed before page 1's image was drawn; {NOT_RETURNED}"
+
+    def test_a_file_removed_while_it_is_drawn_is_refused(self, tmp_path, monkeypatch):
+        path = letter(tmp_path, *body_text(100.0))
+        held = identity_of(path)
+        after_the_draw(monkeypatch, path.unlink)
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            self.draw(path, held).png_bytes()
+
+        assert str(caught.value) == f"{path} was removed while page 1's image was drawn; {NOT_RETURNED}"
+
+    def test_without_an_identity_the_file_at_its_path_is_drawn_as_before(self, tmp_path):
+        path = letter(tmp_path, *body_text(100.0))
+        draw = self.draw(path, None)
+        os.replace(letter(tmp_path, *mixed_items(), name="other.pdf"), path)
+
+        data = draw.png_bytes()
+
+        drawn = render_page(path, 0, dpi=72, memory_cap_bytes=RENDER_CAP, timeout_s=RENDER_TIMEOUT)
+        assert grey_png(data)[3] == drawn.pixels
+
+
 class TestPageImage:
     """assemble_page gives the page an image drawn when read: 8-bit grey at the effective DPI (P2-A, spec §3.2)."""
 
@@ -803,6 +934,14 @@ class TestPageImage:
         draw = image._loader.__self__
         assert (image.page_number, draw.page_index, draw.password) == (2, 1, "secret")
 
+    def test_the_draw_holds_the_source_identity_it_is_given(self, tmp_path):
+        path = letter(tmp_path, *mixed_items())
+
+        bound, unbound = assembled(path, identity=identity_of(path)), assembled(path)
+
+        assert bound.page_image._loader.__self__.identity == identity_of(path)
+        assert unbound.page_image._loader.__self__.identity is None
+
     def test_a_turned_page_is_drawn_as_displayed(self, tmp_path):
         image = assembled(letter(tmp_path, *mixed_items(), rotate=90)).page_image
 
@@ -840,6 +979,68 @@ class TestPageImage:
 
         with pytest.raises(error, match=f"^{message}"):
             assemble_page(*inputs_of_page, source=tmp_path / "doc.pdf", **{option: bad})
+
+
+def two_pages(path: Path, words: str, top: float) -> Path:
+    """Two letter pages, each of one line of ``words`` at ``top``."""
+    return build_pdf(path, [PageSpec(items=(TextRun(words, 72.0, top, size=24.0),))] * 2)
+
+
+def reader_document(path: Path):
+    return PDFReader(path).document
+
+
+def writer_document(path: Path):
+    return PDFWriter(path)._extracted()
+
+
+class TestDrawnPageImageSource:
+    """A document read from a PDF path draws its pages' images from that file, or refuses (#453)."""
+
+    @pytest.mark.parametrize("extracted", [reader_document, writer_document])
+    def test_every_page_image_holds_the_identity_of_the_file_read(self, tmp_path, extracted):
+        path = two_pages(tmp_path / "doc.pdf", "Alpha document text", 100.0)
+
+        document = extracted(path)
+
+        draws = [page.page_image._loader.__self__ for page in document.pages]
+        assert [type(draw) for draw in draws] == [_loaders.PageDraw] * 2
+        assert [draw.identity for draw in draws] == [identity_of(path)] * 2
+
+    def test_a_page_image_of_the_file_read_draws(self, tmp_path):
+        path = two_pages(tmp_path / "doc.pdf", "Alpha document text", 100.0)
+        document = PDFReader(path).document
+
+        data = document.pages[1].page_image.read_bytes()
+
+        drawn = render_page(path, 1, dpi=200, memory_cap_bytes=RENDER_CAP, timeout_s=RENDER_TIMEOUT)
+        assert grey_png(data) == ("PNG", "L", (1700, 2200), drawn.pixels)
+
+    def test_a_page_image_of_a_file_replaced_since_is_refused(self, tmp_path):
+        path = two_pages(tmp_path / "doc.pdf", "Alpha document text", 100.0)
+        other = two_pages(tmp_path / "other.pdf", "Bravo other words entirely", 400.0)
+        document = PDFReader(path).document
+        held = identity_of(path)
+
+        os.replace(other, path)
+
+        now = identity_of(path)
+        replaced = f"{path} changed before page 2's image was drawn: inode {held.device}:{held.inode} -> "
+        with pytest.raises(PDFSourceChangedError, match=f"^{re.escape(replaced)}{now.device}:{now.inode}"):
+            document.pages[1].page_image.read_bytes()
+        assert [element.text for element in document.pages[1].elements] == ["Alpha document text"]
+
+    def test_a_page_image_of_a_file_touched_since_is_refused(self, tmp_path):
+        path = two_pages(tmp_path / "doc.pdf", "Alpha document text", 100.0)
+        document = PDFReader(path).document
+        held = identity_of(path)
+
+        os.utime(path, ns=(held.mtime_ns, held.mtime_ns + 1_000_000_000))
+
+        moved = f"mtime {held.mtime_ns} -> {held.mtime_ns + 1_000_000_000} ns"
+        with pytest.raises(PDFSourceChangedError) as caught:
+            document.pages[0].page_image.read_bytes()
+        assert str(caught.value) == f"{path} changed before page 1's image was drawn: {moved}; {NOT_RETURNED}"
 
 
 class TestFormHeaders:

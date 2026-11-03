@@ -225,6 +225,7 @@ from datagrunt.pdf._process import (
     start_worker,
     worker_command,
 )
+from datagrunt.pdf._source import SourceIdentity
 from datagrunt.pdf._validate import checked_password, checked_path, choice_str, int_at_least, strict_bool
 from datagrunt.pdf.elements import _MAX_ASSET_BYTES, DocumentMetadata, Page, PDFDocument
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFSourceChangedError
@@ -326,43 +327,6 @@ class PipelineOptions:
         int_at_least("min_image_dimension", self.min_image_dimension, 1)
         choice_str("ocr", self.ocr, _OCR_MODES)
         strict_bool("strict", self.strict)
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class SourceIdentity:
-    """The identity of the file a document's hash was read through, from one ``fstat`` (see the module notes).
-
-    Attributes:
-        device: ``st_dev``.
-        inode: ``st_ino``: with ``device``, which file the path named.
-        size: ``st_size``, in bytes.
-        mtime_ns: ``st_mtime_ns``.
-    """
-
-    device: int
-    inode: int
-    size: int
-    mtime_ns: int
-
-    def __post_init__(self) -> None:
-        for name in ("device", "inode", "size", "mtime_ns"):
-            int_at_least(name, getattr(self, name), 0)
-
-    @classmethod
-    def of(cls, status: os.stat_result) -> "SourceIdentity":
-        """The identity in a stat result."""
-        return cls(device=status.st_dev, inode=status.st_ino, size=status.st_size, mtime_ns=status.st_mtime_ns)
-
-    def changes(self, other: "SourceIdentity") -> tuple[str, ...]:
-        """What differs in ``other``, in words: its inode, size and mtime, in that order; empty when nothing does."""
-        found: list[str] = []
-        if (self.device, self.inode) != (other.device, other.inode):
-            found.append(f"inode {self.device}:{self.inode} -> {other.device}:{other.inode}")
-        if self.size != other.size:
-            found.append(f"size {self.size} -> {other.size} bytes")
-        if self.mtime_ns != other.mtime_ns:
-            found.append(f"mtime {self.mtime_ns} -> {other.mtime_ns} ns")
-        return tuple(found)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

@@ -18,6 +18,18 @@ to the caller with them.
   the engine's own :class:`~datagrunt.pdf.pdfium_engine.ImageLoader`, which
   verifies the image against its facts before it returns anything.
 
+Each page image's draw is bound to the file its document was extracted
+from (#453): a :class:`PageRender` or :class:`PageDraw` holds that file's
+:class:`~datagrunt.pdf._source.SourceIdentity` (the pipeline's, taken with
+its hash), and each draw stats the path before the render and again after
+it. A file at the path that is not that one (its inode, size or mtime
+differ) or no file raises
+:class:`~datagrunt.pdf.exceptions.PDFSourceChangedError`, naming the path,
+the page and what changed: no image of other bytes than the document's
+pages is returned. A loader with no identity checks nothing. What this
+cannot see is the pipeline's limit: a write that keeps the size and
+restores the mtime, or a swap away and back between the stats.
+
 Figure reads are batched: :func:`read_figures` reads up to
 :data:`FIGURE_BATCH` figures of one PDF in one worker, and
 :func:`figure_pngs` batches a document's figure reads for ``PDFWriter``'s
@@ -37,6 +49,7 @@ refused) is that figure's outcome, raised as it was.
 
 import dataclasses
 import io
+import os
 import subprocess
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -64,9 +77,10 @@ from datagrunt.pdf._process import (
     start_worker,
     worker_command,
 )
+from datagrunt.pdf._source import SourceIdentity
 from datagrunt.pdf._validate import checked_password, checked_path, int_at_least, positive_float
 from datagrunt.pdf.elements import _MAX_ASSET_BYTES, Figure
-from datagrunt.pdf.exceptions import DatagruntPDFError
+from datagrunt.pdf.exceptions import DatagruntPDFError, PDFSourceChangedError
 from datagrunt.pdf.ocr import Band, bands, normalized, rotated
 from datagrunt.pdf.render import RenderedPage, render_page, render_size
 
@@ -86,6 +100,8 @@ _EXIT_GRACE_S = 1.0  # a worker whose replies ended early is given this to exit
 _BYTES, _ERROR = b"B", b"E"
 _KINDS = ("png", "raw")
 Kind = Literal["png", "raw"]
+# Why a page image of a file that is not its document's is refused: each PDFSourceChangedError of a draw ends so.
+_NOT_RETURNED = "the page image and the document's pages could disagree, so it is not returned"
 
 
 def _checked_turn(rotation: object) -> int:
@@ -101,9 +117,10 @@ class PageRender:
 
     It holds no pixels: each call renders the page in the guarded worker,
     normalizes it as OCR read it, and encodes PNG (8-bit grey). Picklable,
-    so a page crosses the process pool. Each load raises as
-    :func:`~datagrunt.pdf.render.render_page` does (``RenderRefused``,
-    ``RenderFailed``).
+    so a page crosses the process pool. Each load checks the file at
+    ``source`` against ``identity`` before and after its render (module
+    notes), and raises as :func:`~datagrunt.pdf.render.render_page` does
+    (``RenderRefused``, ``RenderFailed``).
 
     Attributes:
         source: The PDF's absolute path.
@@ -113,6 +130,11 @@ class PageRender:
         password: The PDF's password, or None. Not in repr.
         memory_cap_bytes: The render worker's memory cap past its start.
         timeout_s: Seconds a render may take.
+        identity: The identity of the file the document was extracted from;
+            None checks nothing.
+
+    Raises:
+        TypeError, ValueError: If a field is invalid.
     """
 
     source: Path
@@ -122,6 +144,7 @@ class PageRender:
     password: str | None = field(default=None, repr=False)
     memory_cap_bytes: int
     timeout_s: float
+    identity: SourceIdentity | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source", checked_path(self.source, "source").absolute())
@@ -131,25 +154,26 @@ class PageRender:
         checked_password(self.password)
         int_at_least("memory_cap_bytes", self.memory_cap_bytes, 1)
         object.__setattr__(self, "timeout_s", positive_float("timeout_s", self.timeout_s))
+        _checked_identity(self.identity)
 
     def png_bytes(self) -> bytes:
-        """The page as displayed (before OCR's turn), normalized, as PNG."""
+        """The page as displayed (before OCR's turn), normalized, as PNG.
+
+        Raises:
+            PDFSourceChangedError: If the file at ``source`` is not ``identity``'s, before or after the render.
+        """
         return _png(self._drawn())
 
     def band_png_bytes(self) -> tuple[bytes, ...]:
-        """The bands OCR read (of the page turned by ``rotation``, normalized), top to bottom, each as PNG."""
+        """The bands OCR read (of the page turned by ``rotation``, normalized), top to bottom, each as PNG.
+
+        Raises:
+            PDFSourceChangedError: If the file at ``source`` is not ``identity``'s, before or after the render.
+        """
         return tuple(_png(band) for band in bands(rotated(self._drawn(), self.rotation)))
 
     def _drawn(self) -> RenderedPage:
-        page = render_page(
-            self.source,
-            self.page_index,
-            dpi=self.dpi,
-            password=self.password,
-            memory_cap_bytes=self.memory_cap_bytes,
-            timeout_s=self.timeout_s,
-        )
-        return normalized(page)
+        return normalized(_bound_render(self))
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -162,8 +186,9 @@ class PageDraw:
     It has no band loader: no OCR read the page. Its size is
     :func:`~datagrunt.pdf.render.render_size`'s of the page at ``dpi``, known
     before any draw, and each draw must be that size. Picklable, so a page
-    crosses the process pool. Each load raises as ``render_page`` does
-    (``RenderRefused``, ``RenderFailed``).
+    crosses the process pool. Each load checks the file at ``source``
+    against ``identity`` before and after its render (module notes), and
+    raises as ``render_page`` does (``RenderRefused``, ``RenderFailed``).
 
     Attributes:
         source: The PDF's absolute path.
@@ -175,6 +200,8 @@ class PageDraw:
         password: The PDF's password, or None. Not in repr.
         memory_cap_bytes: The render worker's memory cap past its start.
         timeout_s: Seconds a render may take.
+        identity: The identity of the file the document was extracted from;
+            None checks nothing.
 
     Raises:
         TypeError, ValueError: If a field is invalid, or the page draws under
@@ -189,6 +216,7 @@ class PageDraw:
     password: str | None = field(default=None, repr=False)
     memory_cap_bytes: int = MEMORY_CAP_BYTES
     timeout_s: float = _RENDER_TIMEOUT_S
+    identity: SourceIdentity | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source", checked_path(self.source, "source").absolute())
@@ -202,6 +230,7 @@ class PageDraw:
         checked_password(self.password)
         int_at_least("memory_cap_bytes", self.memory_cap_bytes, 1)
         object.__setattr__(self, "timeout_s", positive_float("timeout_s", self.timeout_s))
+        _checked_identity(self.identity)
 
     @property
     def size(self) -> tuple[int, int]:
@@ -212,18 +241,13 @@ class PageDraw:
         """The page as displayed, 8-bit grey as drawn, as PNG.
 
         Raises:
+            PDFSourceChangedError: If the file at ``source`` is not
+                ``identity``'s, before or after the render.
             DatagruntPDFError: If the page draws at another size than
                 :attr:`size` (the PDF is not the one read), or as
                 ``render_page`` raises (``RenderRefused``, ``RenderFailed``).
         """
-        page = render_page(
-            self.source,
-            self.page_index,
-            dpi=self.dpi,
-            password=self.password,
-            memory_cap_bytes=self.memory_cap_bytes,
-            timeout_s=self.timeout_s,
-        )
+        page = _bound_render(self)
         if (page.px_width, page.px_height) != self.size:
             width, height = self.size
             drew = f"page {self.page_index + 1} draws {page.px_width} x {page.px_height} px"
@@ -231,6 +255,46 @@ class PageDraw:
                 f"{self.source}: {drew}, not the {width} x {height} px of its page image: the PDF is not the one read"
             )
         return _png(page)
+
+
+def _checked_identity(identity: object) -> None:
+    """Require a SourceIdentity or None."""
+    if identity is not None and not isinstance(identity, SourceIdentity):
+        raise TypeError(f"identity must be a SourceIdentity or None, got {type(identity).__name__}")
+
+
+def _bound_render(loader: PageRender | PageDraw) -> RenderedPage:
+    """The loader's page, drawn by ``render_page`` between two checks of its ``source`` against its ``identity``."""
+    image = f"page {loader.page_index + 1}'s image"
+    _check_source(loader.source, loader.identity, f"before {image} was drawn")
+    page = render_page(
+        loader.source,
+        loader.page_index,
+        dpi=loader.dpi,
+        password=loader.password,
+        memory_cap_bytes=loader.memory_cap_bytes,
+        timeout_s=loader.timeout_s,
+    )
+    _check_source(loader.source, loader.identity, f"while {image} was drawn")
+    return page
+
+
+def _check_source(source: Path, identity: SourceIdentity | None, when: str) -> None:
+    """Raise PDFSourceChangedError if the file at ``source`` is not ``identity``'s, or is gone; nothing without one.
+
+    Raises:
+        PDFSourceChangedError: Naming ``source``, ``when`` and what changed.
+        OSError: If ``source`` cannot be stat'ed for another reason (``PermissionError``, say).
+    """
+    if identity is None:
+        return
+    try:
+        status = os.stat(source)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise PDFSourceChangedError(f"{source} was removed {when}; {_NOT_RETURNED}") from exc
+    changes = identity.changes(SourceIdentity.of(status))
+    if changes:
+        raise PDFSourceChangedError(f"{source} changed {when}: {', '.join(changes)}; {_NOT_RETURNED}")
 
 
 def _png(image: RenderedPage | Band) -> bytes:

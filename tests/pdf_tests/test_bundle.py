@@ -930,6 +930,24 @@ class TestVisionRoute:
             "contrast_normalized": True,
         }
 
+    def test_a_source_rewritten_with_its_own_bytes_writes_the_own_images_and_bands(self, tmp_path):
+        path = build_pdf(
+            tmp_path / "scan.pdf", [PageSpec(items=(TextRun("Bundle the righted bands", 72.0, 120.0, size=24.0),))]
+        )
+        document = extract_document(path, ocr="always")
+        image = document.pages[0].page_image
+        assert isinstance(image._loader.__self__, _loaders.PageRender)
+        own = (image.read_bytes(), image.read_bands())
+        rewritten_in_place(path)
+
+        written = write_bundle(document, tmp_path / "out", source=path)
+
+        with pytest.raises(PDFSourceChangedError):  # the document's own loaders refuse the file now at its path
+            image.read_bytes()
+        mine = written.pages[0].page_image
+        assert manifest_of(tmp_path / "out")["missing"] == []
+        assert (mine.image_path.read_bytes(), tuple(band.read_bytes() for band in mine.band_paths)) == own
+
     def test_a_digital_page_still_renders_at_dpi(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "text.pdf", [PageSpec(items=tuple(body_text(100.0)))])
         document = extract_document(path)
@@ -980,6 +998,13 @@ def without_page_images(document: PDFDocument) -> PDFDocument:
 def contents(root: Path) -> dict[str, bytes]:
     """Every file under ``root`` and its bytes, by relative path."""
     return {path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+
+def rewritten_in_place(path: Path) -> None:
+    """Put another file of ``path``'s own bytes at ``path``: the same sha256, another inode."""
+    copy = path.with_name(f"{path.stem}-copy.pdf")
+    copy.write_bytes(path.read_bytes())
+    os.replace(copy, path)
 
 
 def digital_pdf(directory: Path) -> Path:
@@ -1040,6 +1065,21 @@ class TestDrawnPageImages:
             f"the page was not rendered: RenderFailed: {path}: page {n}: the render worker reached its memory cap"
             for n in (1, 2)
         ]
+
+    @pytest.mark.parametrize("write_dpi", [200, DPI])
+    def test_a_source_rewritten_with_its_own_bytes_writes_the_drawn_images(self, tmp_path, write_dpi):
+        path = digital_pdf(tmp_path)
+        document = extract_document(path)
+        rewritten_in_place(path)
+
+        written = write_bundle(document, tmp_path / "out", source=path, dpi=write_dpi)
+
+        with pytest.raises(PDFSourceChangedError):  # the document's own draw refuses the file now at its path
+            document.pages[0].page_image.read_bytes()
+        assert manifest_of(tmp_path / "out")["missing"] == []
+        drawn = render_page(path, 0, dpi=write_dpi, memory_cap_bytes=CAP, timeout_s=TIMEOUT)
+        size = (drawn.px_width, drawn.px_height)
+        assert png_pixels(written.pages[0].page_image.image_path) == ("L", size, drawn.pixels)
 
     def test_a_drawn_image_at_the_writes_dpi_is_read_through_its_own_loader(self, tmp_path, monkeypatch):
         path = digital_pdf(tmp_path)

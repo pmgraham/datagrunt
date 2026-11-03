@@ -30,16 +30,22 @@ are followed: a link to a PDF is that PDF.
 
 Errors name the argument (``name``) and the path. No password reaches this
 module, so none can reach its messages.
+
+:class:`SourceIdentity` is which file a path named, from one ``stat``: the
+pipeline takes it when it hashes the source (A8a), and every later opening
+of the path is checked against it (the page workers', the bundle's, a page
+image's draws).
 """
 
 import errno
 import os
 import stat
+from dataclasses import dataclass
 from pathlib import Path
 
-from datagrunt.pdf._validate import non_blank_str
+from datagrunt.pdf._validate import int_at_least, non_blank_str
 
-__all__ = ["checked_pdf_file"]
+__all__ = ["SourceIdentity", "checked_pdf_file"]
 
 _HEADER = b"%PDF"
 # The last offset pdfium's parser looks for the header at (see the module notes).
@@ -48,6 +54,43 @@ _HEADER_WINDOW = _MAX_HEADER_OFFSET + len(_HEADER)
 # Never blocking on a named pipe (O_NONBLOCK, which a regular file ignores), as bytes (O_BINARY, Windows). Each
 # flag is 0 where it does not exist.
 _OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SourceIdentity:
+    """The identity of the file a document's hash was read through, from one ``fstat`` (see the module notes).
+
+    Attributes:
+        device: ``st_dev``.
+        inode: ``st_ino``: with ``device``, which file the path named.
+        size: ``st_size``, in bytes.
+        mtime_ns: ``st_mtime_ns``.
+    """
+
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+
+    def __post_init__(self) -> None:
+        for name in ("device", "inode", "size", "mtime_ns"):
+            int_at_least(name, getattr(self, name), 0)
+
+    @classmethod
+    def of(cls, status: os.stat_result) -> "SourceIdentity":
+        """The identity in a stat result."""
+        return cls(device=status.st_dev, inode=status.st_ino, size=status.st_size, mtime_ns=status.st_mtime_ns)
+
+    def changes(self, other: "SourceIdentity") -> tuple[str, ...]:
+        """What differs in ``other``, in words: its inode, size and mtime, in that order; empty when nothing does."""
+        found: list[str] = []
+        if (self.device, self.inode) != (other.device, other.inode):
+            found.append(f"inode {self.device}:{self.inode} -> {other.device}:{other.inode}")
+        if self.size != other.size:
+            found.append(f"size {self.size} -> {other.size} bytes")
+        if self.mtime_ns != other.mtime_ns:
+            found.append(f"mtime {self.mtime_ns} -> {other.mtime_ns} ns")
+        return tuple(found)
 
 
 def checked_pdf_file(path: Path, name: str) -> Path:

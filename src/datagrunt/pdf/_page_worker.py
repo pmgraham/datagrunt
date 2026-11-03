@@ -340,7 +340,13 @@ def _step_four(
     if isinstance(item, PageFailure):
         vision = pipeline._vision(options)
         return fallback_page(
-            handle, item, source=source.path, password=source.password, ocr=options.ocr, options=vision
+            handle,
+            item,
+            source=source.path,
+            password=source.password,
+            identity=source.identity,
+            ocr=options.ocr,
+            options=vision,
         )
     return _finished(item, drawn, source, options)
 
@@ -375,6 +381,7 @@ def _routed(raw: RawPage, assessment: PageAssessment, source: PDFSource, options
             assessment,
             source=source.path,
             password=source.password,
+            identity=source.identity,
             min_image_dimension=options.min_image_dimension,
             options=pipeline._vision(options),
         )
@@ -390,6 +397,7 @@ def _assembled_page(raw: RawPage, assessment: PageAssessment, source: PDFSource,
         lattice,
         source=source.path,
         password=source.password,
+        identity=source.identity,
         min_image_dimension=options.min_image_dimension,
         dpi=options.dpi,
         max_render_pixels=options.max_render_pixels,
