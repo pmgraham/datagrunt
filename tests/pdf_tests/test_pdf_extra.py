@@ -2,9 +2,10 @@
 
 Each case runs in a fresh interpreter, so the modules it imports (or blocks) are its own. A missing extra is
 simulated as Python documents it: ``sys.modules[name] = None`` makes ``import name`` raise ModuleNotFoundError.
-An extra that goes missing after construction is simulated in the workers only: a worker installs its caller's
-``sys.path``, so a directory put first on it, holding a package of the extra's name that fails to import as a
-missing one does, hides the real one from every worker started after.
+Deleting that entry installs it again, as a notebook's ``%pip install`` does mid-session. An extra that goes
+missing after construction is simulated in the workers only: a worker installs its caller's ``sys.path``, so a
+directory put first on it, holding a package of the extra's name that fails to import as a missing one does,
+hides the real one from every worker started after.
 """
 
 import importlib.metadata
@@ -74,7 +75,9 @@ def test_without_the_extra_import_works_and_first_use_raises_the_hint(missing):
             from datagrunt import PDFReader, PDFWriter
 
             outcome = {"star": sorted(name for name in datagrunt.__all__ if name not in globals())}
-            outcome["same"] = datagrunt.PDFReader is datagrunt.pdf.PDFReader is PDFReader
+            # Each access builds its stand-in afresh (none is kept), each the same class by name, module and hint.
+            stand_ins = (datagrunt.PDFReader, datagrunt.pdf.PDFReader, PDFReader)
+            outcome["alike"] = len({(cls.__name__, cls.__module__, cls.__doc__) for cls in stand_ins}) == 1
             classes = {
                 "datagrunt.PDFReader": datagrunt.PDFReader,
                 "datagrunt.PDFWriter": datagrunt.PDFWriter,
@@ -94,7 +97,7 @@ def test_without_the_extra_import_works_and_first_use_raises_the_hint(missing):
     )
 
     assert result.pop("star") == []
-    assert result.pop("same") is True
+    assert result.pop("alike") is True
     assert set(result) == set(CLASS_PATHS)
     for path in CLASS_PATHS:
         assert result[path] is not None, f"{path}(...) raised nothing"
@@ -139,6 +142,85 @@ def test_without_the_extra_the_bundle_functions_raise_the_hint_when_called(missi
         assert all(PACKAGES[module] in message for module in missing), message
         assert missing_name.split(".")[0] in missing
         assert cause == "ModuleNotFoundError"
+
+
+# What a later install adds: a package of the extra that was not installed, or a module of Pillow it lacked.
+LATER_INSTALLS = {
+    "pypdfium2": ("pypdfium2",),
+    "Pillow": ("PIL",),
+    "both": EXTRA_MODULES,
+    "Pillow's PIL.Image": ("PIL.Image",),
+}
+
+
+@pytest.mark.parametrize("installed", list(LATER_INSTALLS.values()), ids=list(LATER_INSTALLS))
+def test_the_extra_installed_after_a_stand_in_was_taken_loads_the_real_names(installed):
+    result = run_python(
+        blocking(installed)
+        + f"INSTALLED = {installed!r}\n"
+        + textwrap.dedent(
+            """
+            import importlib, json, sys
+            import datagrunt
+            import datagrunt.pdf
+            from datagrunt.pdf._extra import LAZY_CLASSES, LAZY_FUNCTIONS
+
+            modules = {**LAZY_CLASSES, **LAZY_FUNCTIONS}
+            paths = [("datagrunt.pdf", name) for name in modules] + [("datagrunt", name) for name in LAZY_CLASSES]
+
+            def refusal(value):
+                try:
+                    value("report.pdf")
+                except Exception as exc:
+                    return [type(exc).__name__, "datagrunt[pdf]" in str(exc)]
+                return None
+
+            before = {f"{package}.{name}": refusal(getattr(sys.modules[package], name)) for package, name in paths}
+            for module in INSTALLED:
+                del sys.modules[module]
+            after = {}
+            for package, name in paths:
+                first, second = getattr(sys.modules[package], name), getattr(sys.modules[package], name)
+                real = getattr(importlib.import_module(modules[name]), name)
+                after[f"{package}.{name}"] = [first is real, second is first]
+            print(json.dumps({"before": before, "after": after}))
+            """
+        )
+    )
+
+    expected = [f"datagrunt.pdf.{name}" for name in ("PDFReader", "PDFWriter", "load_bundle", "write_bundle")]
+    expected += ["datagrunt.PDFReader", "datagrunt.PDFWriter"]
+    assert result["before"] == dict.fromkeys(expected, ["ImportError", True])
+    assert result["after"] == dict.fromkeys(expected, [True, True])
+
+
+def test_a_package_installed_after_its_directory_was_listed_is_found(tmp_path):
+    # The import system's finders keep each sys.path directory's listing, read again only when the directory's
+    # modification time changes: an install within the file system's time granularity leaves it unchanged.
+    site = tmp_path / "site"
+    site.mkdir()
+    result = run_python(
+        f"""
+        import importlib.util, json, os, sys
+        from pathlib import Path
+        from types import MappingProxyType
+        from datagrunt.pdf import _extra
+        from datagrunt.pdf.reader import PDFReader
+
+        site = Path({str(site)!r})
+        sys.path.insert(0, str(site))
+        _extra._EXTRA_PACKAGES = MappingProxyType({{"later_package": "later-package"}})  # not installed yet
+        before = _extra.load("PDFReader")
+        listed = site.stat()
+        (site / "later_package").mkdir()
+        (site / "later_package" / "__init__.py").write_text("", encoding="utf-8")
+        os.utime(site, ns=(listed.st_atime_ns, listed.st_mtime_ns))
+        unlisted = importlib.util.find_spec("later_package") is None
+        print(json.dumps([before is PDFReader, unlisted, _extra.load("PDFReader") is PDFReader]))
+        """
+    )
+
+    assert result == [False, True, True]
 
 
 @pytest.fixture(scope="module")

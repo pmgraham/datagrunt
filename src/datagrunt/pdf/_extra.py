@@ -21,8 +21,16 @@ pypdfium2 (every pdfium call runs in a worker process, #443), so its absence
 would otherwise first show in a worker. A package that is found but fails to
 import is a missing extra too, by the ImportError's name. Only a missing
 extra becomes the hint: any other import failure (a broken datagrunt module,
-say) propagates unchanged. Each name resolves once, then is cached, so it is
-the same object at every access.
+say) propagates unchanged.
+
+A name that loads is cached, so it is the same object at every access. A
+stand-in is never kept: each access checks for the extra again, so one
+installed later in the session (a notebook's ``%pip install``) loads at the
+next. A miss is believed only after ``importlib.invalidate_caches()`` and a
+second check, since the import system's finders keep each directory's listing
+until its modification time changes (an install within the file system's time
+granularity does not change it), and never search a ``sys.path`` directory
+created after they first looked for it.
 """
 
 import functools
@@ -46,13 +54,44 @@ _EXTRA_PACKAGES = MappingProxyType({"pypdfium2": "pypdfium2", "PIL": "Pillow"})
 EXTRA_IMPORTS = tuple(_EXTRA_PACKAGES)
 
 
-@functools.cache
+class _MissingExtra(Exception):
+    """Raised by :func:`_loaded` when the [pdf] extra is missing: which packages (import names), and the cause."""
+
+    def __init__(self, missing: tuple[str, ...], cause: ImportError) -> None:
+        super().__init__(missing, cause)
+        self.missing = missing
+        self.cause = cause
+
+
 def load(name: str) -> Callable[..., object]:
     """The class or function ``name`` (in :data:`LAZY_CLASSES` or :data:`LAZY_FUNCTIONS`), or its stand-in.
 
-    The stand-in is returned when the [pdf] extra is missing (see the module notes).
+    The stand-in is returned when the [pdf] extra is missing at two checks, the import system's caches invalidated
+    between them, and is never kept: the next call looks for the extra again (see the module notes).
 
     Raises:
+        KeyError: If ``name`` is not lazily loaded.
+        ImportError: As the import raises it, unless the [pdf] extra is what is missing.
+        TypeError: If the module's ``name`` is not the class or function it should be.
+    """
+    try:
+        return _loaded(name)
+    except _MissingExtra:
+        importlib.invalidate_caches()  # a finder's directory listing can predate the install (module notes)
+    try:
+        return _loaded(name)
+    except _MissingExtra as missing:
+        return _stand_in(name in LAZY_CLASSES, name, missing.missing, missing.cause)
+
+
+@functools.cache
+def _loaded(name: str) -> Callable[..., object]:
+    """The class or function ``name``, imported at the first call that finds the [pdf] extra, then cached.
+
+    ``functools.cache`` keeps only a returned value, never a raised exception, so a missing extra is not cached.
+
+    Raises:
+        _MissingExtra: If the [pdf] extra is missing.
         KeyError: If ``name`` is not lazily loaded.
         ImportError: As the import raises it, unless the [pdf] extra is what is missing.
         TypeError: If the module's ``name`` is not the class or function it should be.
@@ -61,14 +100,13 @@ def load(name: str) -> Callable[..., object]:
     module_name = LAZY_CLASSES[name] if is_class else LAZY_FUNCTIONS[name]
     missing = missing_extra()
     if missing:
-        cause = ModuleNotFoundError(f"No module named {missing[0]!r}", name=missing[0])
-        return _stand_in(is_class, name, missing, cause)
+        raise _MissingExtra(missing, ModuleNotFoundError(f"No module named {missing[0]!r}", name=missing[0]))
     try:
         module = importlib.import_module(module_name)
     except ImportError as exc:
         if not _is_missing_extra(exc):
             raise
-        return _stand_in(is_class, name, (_root(exc),), exc)
+        raise _MissingExtra((_root(exc),), exc) from exc
     value = getattr(module, name)
     if not (isinstance(value, type) if is_class else inspect.isfunction(value)):
         raise TypeError(f"{module_name}.{name} is not a {'class' if is_class else 'function'}")
