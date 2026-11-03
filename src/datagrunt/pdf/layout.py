@@ -379,11 +379,12 @@ def find_lattice_tables(segments: tuple[RawSegment, ...], pieces: tuple[SpanPiec
        (:func:`_cell_text`). A grid whose every cell is blank is
        decoration, not a table.
 
-    A table whose text all advances one way down or up the page (one
-    turned by /Rotate 90 or 270, or drawn turned) reads as it was written:
-    its rows run along that text's lines (v4 parity, #391). Text advancing
-    leftward reads as displayed: pdfium's boxes cannot tell upside-down
-    text from right-to-left text.
+    A table most of whose chars advance down or up the page (one turned
+    by /Rotate 90 or 270, or drawn turned) reads as it was written: its
+    rows run along that text's lines (v4 parity, #391), whatever a short
+    run across in it (ties: across, down, up). Text advancing leftward
+    reads as displayed: pdfium's boxes cannot tell upside-down text from
+    right-to-left text.
 
     Tables come in the order of their top rules: top to bottom, then left
     to right.
@@ -806,15 +807,17 @@ def _place(grids: list[_Grid], nearby: list[int], box: Box) -> tuple[int, int] |
 def _cell_text(runs: list[_Run], default_turn: int) -> str:
     """A cell's text: its runs in lines, read in the direction its text advances.
 
-    The direction is the one the cell's runs of two or more chars share,
-    else ``default_turn``. In that frame, runs overlapping a line by at
-    least :data:`_LINE_OVERLAP` of the smaller height are on it; lines read
-    top to bottom and join with one space; runs on a line read left to
-    right and join as the stream pass joins them (:func:`_separator`:
-    nothing across a gap of at most :data:`_JOIN_GAP_EM` ems of the larger
-    font or next to a degree or punctuation glyph, else one space); a
-    run keeps its span's char order, with one space at each break pdfium
-    generated inside it. Text is otherwise verbatim. O(r log r) for r runs.
+    The direction is the one most of the chars in its runs of two or more
+    advance at, else ``default_turn``, which a tie goes to when it is
+    among the tied (:func:`_reading_turn`). In that frame, runs
+    overlapping a line by at least :data:`_LINE_OVERLAP` of the smaller
+    height are on it; lines read top to bottom and join with one space;
+    runs on a line read left to right and join as the stream pass joins
+    them (:func:`_separator`: nothing across a gap of at most
+    :data:`_JOIN_GAP_EM` ems of the larger font or next to a degree or
+    punctuation glyph, else one space); a run keeps its span's char
+    order, with one space at each break pdfium generated inside it. Text
+    is otherwise verbatim. O(r log r) for r runs.
     """
     if not runs:
         return ""
@@ -824,9 +827,17 @@ def _cell_text(runs: list[_Run], default_turn: int) -> str:
 
 
 def _reading_turn(runs: list[_Run], default: int) -> int:
-    """The one reading turn the runs with a direction share, else ``default``."""
-    turns = {turn for run in runs if (turn := _run_turn(run)) is not None}
-    return turns.pop() if len(turns) == 1 else default
+    """The turn most of the runs' chars advance at, as :func:`_page_turn` weighs them; ``default`` when none has one.
+
+    A tie goes to ``default`` when it is among the tied, else as
+    :func:`_page_turn` breaks it (across, down, up). So a short run across
+    in a turned table does not turn the table back. O(r) for r runs.
+    """
+    chars = _chars_by_turn((_run_turn(run), run) for run in runs)
+    most = max(chars.values())
+    if most == 0 or chars[default] == most:
+        return default
+    return max(_TURNS, key=chars.__getitem__)
 
 
 def _run_turn(run: _Run) -> int | None:
@@ -922,7 +933,7 @@ def _run_text(run: _Run) -> str:
 
 
 def _table(grid: _Grid, cell_runs: list[list[_Run]]) -> LatticeTable | None:
-    """A grid's table, read in its text's turn, or None if every cell is blank (decoration)."""
+    """A grid's table, read at the turn most of its text advances at, or None if every cell is blank (decoration)."""
     turn = _reading_turn([run for runs in cell_runs for run in runs], _ACROSS)
     texts = [_cell_text(runs, turn) for runs in cell_runs]
     if not any(text.strip() for text in texts):
@@ -1183,11 +1194,17 @@ def _run_chars(run: _Run) -> str:
 
 def _page_turn(runs: list[_TurnedRun]) -> int:
     """The turn most of the runs' chars advance at (ties: across, down, up); across for none."""
+    chars = _chars_by_turn(runs)
+    return max(_TURNS, key=chars.__getitem__)
+
+
+def _chars_by_turn(runs: Iterable[_TurnedRun]) -> dict[int, int]:
+    """How many chars advance at each turn: each run with a turn adds its char count to it."""
     chars = dict.fromkeys(_TURNS, 0)
     for turn, run in runs:
         if turn is not None:
             chars[turn] += run.end - run.start
-    return max(_TURNS, key=chars.__getitem__)
+    return chars
 
 
 def _ordered_lines(runs: list[_TurnedRun], page_turn: int) -> list[TextLine]:
