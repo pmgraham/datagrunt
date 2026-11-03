@@ -14,6 +14,7 @@ from collections import Counter
 
 import pytest
 
+from datagrunt.pdf.elements import KeyValue
 from datagrunt.pdf.layout import (
     StreamHeading,
     StreamKeyValue,
@@ -25,7 +26,8 @@ from datagrunt.pdf.layout import (
     find_lattice_tables,
     text_blocks,
 )
-from pdf_tests.builders import TextRun
+from datagrunt.pdf.reader import PDFReader
+from pdf_tests.builders import PageSpec, TextRun, build_pdf
 from pdf_tests.test_layout_lattice import box, chars
 from pdf_tests.test_layout_stream import block, cell, column, line, page_of
 
@@ -400,6 +402,118 @@ class TestKeyValues:
         texts = ("The rules are short and the game", "is simple: each player draws a card.")
 
         assert described(read_items(tmp_path, *lines_of(texts))) == [("paragraph", " ".join(texts))]
+
+
+# A lead-in line over two pairs, set as one block (#456).
+INVOICE = ("Invoice Details", "Invoice Date: 2026-01-15", "Payment Terms: Net 30")
+INVOICE_PAIRS = [("key_value", "Invoice Date", "2026-01-15"), ("key_value", "Payment Terms", "Net 30")]
+# A line of body text set apart under the block.
+PAGE_BODY = "Body text of the page that is long enough to read as a digital page here."
+
+
+def stacked(*texts: str) -> TextBlock:
+    """One block of ``texts``, a line each: 6 pt chars from x 10, the lines 14 pt apart."""
+    return block(*(line(cell(text, 10.0, 10.0 + 14.0 * index)) for index, text in enumerate(texts)))
+
+
+def element_fields(element) -> tuple:
+    """An A1 element as a plain tuple: its kind, then its key and value or its text."""
+    if isinstance(element, KeyValue):
+        return ("KeyValue", element.key, element.value)
+    return (type(element).__name__, element.text)
+
+
+class TestKeyValueRuns:
+    """A run of 2 or more whole-line pairs splits a paragraph; one pair-shaped line in prose stays prose (#456)."""
+
+    def test_a_lead_in_over_two_pairs_reads_as_a_paragraph_then_pairs_through_the_reader(self, tmp_path):
+        items = (*lines_of(INVOICE), TextRun(PAGE_BODY, 72.0, 300.0, size=10.0))
+        reader = PDFReader(build_pdf(tmp_path / "invoice.pdf", [PageSpec(items=items)]), ocr="never")
+
+        assert [element_fields(item) for item in reader.pages[0].elements] == [
+            ("Paragraph", "Invoice Details"),
+            ("KeyValue", "Invoice Date", "2026-01-15"),
+            ("KeyValue", "Payment Terms", "Net 30"),
+            ("Paragraph", PAGE_BODY),
+        ]
+
+    def test_a_lead_in_then_two_pairs_is_a_paragraph_then_two_pairs(self):
+        assert described(classify_blocks((stacked(*INVOICE),))) == [("paragraph", "Invoice Details"), *INVOICE_PAIRS]
+
+    def test_lines_before_the_run_are_one_paragraph(self):
+        texts = ("Invoice Details for the order", "placed online", *INVOICE[1:])
+
+        assert described(classify_blocks((stacked(*texts),))) == [
+            ("paragraph", "Invoice Details for the order placed online"),
+            *INVOICE_PAIRS,
+        ]
+
+    @pytest.mark.parametrize(
+        "texts",
+        [
+            pytest.param(INVOICE[:2], id="a-lead-in-then-one-pair"),
+            pytest.param(
+                ("Each player draws a card and then", "Setup: deal five cards to each player", "before play begins."),
+                id="one-pair-shaped-line-inside-prose",
+            ),
+        ],
+    )
+    def test_one_pair_shaped_line_after_a_lead_in_stays_in_its_paragraph(self, texts):
+        assert described(classify_blocks((stacked(*texts),))) == [("paragraph", " ".join(texts))]
+
+    def test_colons_late_in_lines_make_no_run(self):
+        # Each colon follows more than 40 chars, so neither line is a pair (rule 3's key).
+        texts = (
+            "The rules of the game are short to read",
+            "and when the round ends with every card played: score",
+            "each clearing and when every player has passed: draw.",
+        )
+
+        assert described(classify_blocks((stacked(*texts),))) == [("paragraph", " ".join(texts))]
+
+    @pytest.mark.parametrize(
+        "after,expected",
+        [
+            # 6 pt chars: the block ends at x 184; "Payment Terms: Net 30" ends at x 136, room for "Thank".
+            pytest.param(
+                ("Thank you for your business.",),
+                [("paragraph", "Thank you for your business.")],
+                id="a-line-that-did-not-wrap-starts-a-paragraph",
+            ),
+            pytest.param(
+                ("Thank you for your business.", "Account: 10442"),
+                [("paragraph", "Thank you for your business. Account: 10442")],
+                id="one-pair-line-after-it-stays-in-that-paragraph",
+            ),
+            pytest.param(
+                ("Thank you for your business.", "Account: 10442", "Sort Code: 80-22-60"),
+                [
+                    ("paragraph", "Thank you for your business."),
+                    ("key_value", "Account", "10442"),
+                    ("key_value", "Sort Code", "80-22-60"),
+                ],
+                id="a-later-run-splits-that-paragraph-too",
+            ),
+        ],
+    )
+    def test_lines_after_the_run(self, after, expected):
+        texts = ("Invoice Details for the order", *INVOICE[1:], *after)
+
+        assert described(classify_blocks((stacked(*texts),))) == [
+            ("paragraph", "Invoice Details for the order"),
+            *INVOICE_PAIRS,
+            *expected,
+        ]
+
+    def test_a_line_that_wrapped_from_the_runs_last_pair_continues_its_value(self):
+        # "Ship To: 1 Harbour Road, Leith" ends where the block does, at x 190: "Edinburgh" did not fit after it.
+        texts = ("Invoice Details for the order", INVOICE[1], "Ship To: 1 Harbour Road, Leith", "Edinburgh EH6")
+
+        assert described(classify_blocks((stacked(*texts),))) == [
+            ("paragraph", "Invoice Details for the order"),
+            INVOICE_PAIRS[0],
+            ("key_value", "Ship To", "1 Harbour Road, Leith Edinburgh EH6"),
+        ]
 
 
 # The 2026-11-02 audit's P2-C case: two lines of prose whose first starts "Operating envelope:", the second wrapped

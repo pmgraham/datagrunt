@@ -1725,6 +1725,9 @@ _MAX_LEVEL = 6
 # A key is at most this many chars (spec) and holds none of these (sentence-ending punctuation).
 _MAX_KEY_CHARS = 40
 _SENTENCE_END = frozenset(".!?")
+# A run of at least this many lines, each a pair, ends the paragraph before it: a lead-in over pairs (#456). One
+# pair-shaped line in prose ("Setup: deal five cards") stays prose.
+_MIN_PAIR_RUN = 2
 # A key ends at the first colon before whitespace or the end of the line: "10:30" or "https://" holds none.
 _KEY_END = re.compile(r":(?=\s|$)")
 # A pair's value is prose, so its lines are a paragraph (P2-C, the 2026-11-02 audit), when it is longer than this
@@ -1871,12 +1874,17 @@ def classify_blocks(blocks: tuple[TextBlock, ...]) -> tuple[StreamItem, ...]:
        lines are the block's other lines (the merge starts a block at each
        marker). Neighbouring items, all bulleted or all numbered, are one
        list.
-    3. Key-value pairs (:func:`_pairs_and_paragraphs`): its first line is
-       ``Key: Value``, the key at most :data:`_MAX_KEY_CHARS` chars with no
-       sentence-ending punctuation; each such line starts a pair, the
-       lines after it continue its value while they wrap, and a paragraph
-       then runs to the block's end. A pair whose value is prose
-       (:func:`_is_prose`) is a paragraph of its lines.
+    3. Key-value pairs (:func:`_pairs_and_paragraphs`): a ``Key: Value``
+       line, the key at most :data:`_MAX_KEY_CHARS` chars with no
+       sentence-ending punctuation, starts a pair when it is the block's
+       first line or follows a pair; the lines after a pair continue its
+       value while they wrap, and a line that neither continues nor
+       starts one starts a paragraph. A paragraph runs on until a run of
+       :data:`_MIN_PAIR_RUN` or more pair lines (#456), which reads as
+       pairs, or to the block's end: a lead-in over pairs is a paragraph
+       and then pairs; one pair-shaped line in prose stays prose. A pair
+       whose value is prose (:func:`_is_prose`) is a paragraph of its
+       lines.
     4. Else a paragraph.
 
     Items keep their blocks' order and every char of them once, in their
@@ -2051,23 +2059,51 @@ def _is_prose(value: str) -> bool:
 def _pairs_and_paragraphs(found: TextBlock) -> list[StreamKeyValue | StreamParagraph]:
     """The block as key-value pairs and paragraphs (:func:`classify_blocks`, rules 3 and 4).
 
-    A ``Key: Value`` line starts a pair; a line after it continues its
-    value only if that line wrapped (:func:`_wrapped`), else it starts a
-    paragraph. A paragraph runs to the block's end, so a colon later in a
-    paragraph makes no pair, and a block whose first line is no pair is
-    one paragraph. On the corpus datasheets, a paragraph set close under
-    "Category: Fastener" merges into its block, though that line ends
-    405 pt short of the column.
+    A ``Key: Value`` line (:func:`_key_value`) starts a pair; a line after
+    it continues its value only if that line wrapped (:func:`_wrapped`),
+    else it starts a paragraph, or a pair if it is one. A paragraph runs
+    on until a run of :data:`_MIN_PAIR_RUN` or more lines that are each a
+    pair (#456), or to the block's end: the run's first line starts a pair,
+    and the lines after it follow the rule above. So a lead-in over pairs
+    ("Invoice Details" over "Invoice Date: 2026-01-15" and "Payment Terms:
+    Net 30") is a paragraph and then pairs, while one pair-shaped line in
+    a paragraph, or two broken by a line the first's value wraps onto,
+    stay in the paragraph. A line is a pair by :func:`_key_value` alone,
+    so a colon after a key past :data:`_MAX_KEY_CHARS` chars, or holding
+    a full stop, makes none. On the corpus datasheets, a paragraph set
+    close under "Category: Fastener" merges into its block, though that
+    line ends 405 pt short of the column.
     """
     right = max(_turned(_plain(item.bbox), item.turn)[2] for item in found.lines)
+    parsed = [_key_value(item.text) for item in found.lines]
     groups: list[tuple[tuple[str, str] | None, list[TextLine]]] = []
-    for item in found.lines:
-        parsed = _key_value(item.text)
-        if groups and (groups[-1][0] is None or (parsed is None and _wrapped(groups[-1][1][-1], item, right))):
+    for index, item in enumerate(found.lines):
+        if groups and _joins(groups[-1], item, parsed, index, right):
             groups[-1][1].append(item)
         else:
-            groups.append((parsed, [item]))
-    return [_pair_or_paragraph(parsed, lines) for parsed, lines in groups]
+            groups.append((parsed[index], [item]))
+    return [_pair_or_paragraph(head, lines) for head, lines in groups]
+
+
+def _joins(
+    group: tuple[tuple[str, str] | None, list[TextLine]],
+    item: TextLine,
+    parsed: list[tuple[str, str] | None],
+    index: int,
+    right: float,
+) -> bool:
+    """True if line ``index`` (``item``) joins the ``group`` before it (:func:`_pairs_and_paragraphs`).
+
+    A paragraph (``group`` parsed None) takes every line but the first of
+    a run of :data:`_MIN_PAIR_RUN` pairs; a pair takes a line of no pair
+    that its last line wrapped onto. ``parsed`` holds each line's
+    :func:`_key_value`; ``right`` is the block's end along its lines.
+    """
+    head, lines = group
+    if head is None:
+        run = parsed[index : index + _MIN_PAIR_RUN]
+        return len(run) < _MIN_PAIR_RUN or None in run
+    return parsed[index] is None and _wrapped(lines[-1], item, right)
 
 
 def _wrapped(before: TextLine, after: TextLine, right: float) -> bool:
@@ -2138,9 +2174,13 @@ class StreamTable:
             start for text set flush left, the end for flush-right numbers,
             the middle for centred cells), so it does not move with the
             column's widest cell (#409). Display x for upright text, display
-            y for text turned a quarter turn, so falling for text read up
-            the page. Each lies in its column's band, so they rise strictly
-            (A1's contract). At least 2.
+            y for text turned a quarter turn. Each lies in its column's
+            band, and the bands never meet, so they rise strictly along the
+            rows: on the page they rise for text read across or down it and
+            fall for text read up it (turn 270). This record checks that
+            each is finite and within its interval, not their order; A1's
+            ``Table``, which needs them to rise, takes them only from an
+            upright table (``assembly``). At least 2.
         column_intervals: Each column's ``(start, end)`` in the same
             display coordinate: from its cells' least to their greatest
             extent along the rows (its band), so it holds its centre. A
