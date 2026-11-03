@@ -1213,6 +1213,44 @@ class TestPageBounds:
         assert [piece.text for piece in result.used_pieces] == ["t0", "t1"]
 
     @pytest.mark.parametrize(
+        "last,skipped",
+        [
+            # A box: 2 + 2 rules, too few positions to be a grid, so _grid would turn it down.
+            pytest.param(frame(10.0, 10_000.0, 90.0, 10_040.0), 0, id="a-box"),
+            pytest.param(small_table(10.0, 10_000.0, "past")[0], 1, id="a-grid"),
+        ],
+    )
+    def test_past_max_grids_only_a_component_that_can_be_a_grid_is_skipped(self, last, skipped):
+        built = [small_table(10.0, 10.0 + 100.0 * index, f"t{index}") for index in range(layout.MAX_GRIDS)]
+
+        result = find_lattice_tables(
+            (*(item for segments, _ in built for item in segments), *last),
+            tuple(item for _, pieces in built for item in pieces),
+        )
+
+        assert len(result.tables) == layout.MAX_GRIDS
+        assert result.skipped_grids == skipped
+
+    @pytest.mark.parametrize(
+        "first",
+        [
+            pytest.param(frame(10.0, 10.0, 90.0, 50.0), id="a-box"),
+            # One row of 10 boxes: 10 units, but only 2 horizontal positions.
+            pytest.param(ruled_grid(tuple(10.0 + 8.0 * index for index in range(11)), (10.0, 50.0)), id="a-row"),
+        ],
+    )
+    def test_a_component_that_cannot_be_a_grid_spends_no_units_and_is_not_skipped(self, monkeypatch, first):
+        # A 4-unit page: the table fits only if the component before it spends nothing; the box after the table
+        # comes once the page has no units left.
+        monkeypatch.setattr(layout, "MAX_GRID_UNITS", 4)
+        table_segments, table_pieces = small_table(1000.0, 1000.0, "fits")
+
+        result = find_lattice_tables((*first, *table_segments, *frame(10.0, 2000.0, 90.0, 2040.0)), table_pieces)
+
+        assert [table.grid() for table in result.tables] == [(("fits", ""), ("", ""))]
+        assert result.skipped_grids == 0
+
+    @pytest.mark.parametrize(
         "cap,found", [pytest.param(16, True, id="at-the-cap"), pytest.param(15, False, id="past-it")]
     )
     def test_past_max_crossings_the_page_has_no_lattice_tables(self, monkeypatch, cap, found):

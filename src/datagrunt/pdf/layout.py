@@ -335,9 +335,10 @@ class LatticeResult:
         used_pieces: The char ranges of visible pieces whose chars lie in a
             table's cells, as pieces of the same spans: A4b lays out only
             the rest of the page's text.
-        skipped_grids: Components left out, their text to the stream pass,
-            because they would pass the page's :data:`MAX_GRID_UNITS` or
-            :data:`MAX_GRIDS`: a warning for the page.
+        skipped_grids: Components that could be grids left out, their
+            text to the stream pass, because they would pass the page's
+            :data:`MAX_GRID_UNITS` or :data:`MAX_GRIDS`: a warning for the
+            page. One that cannot be a grid (a box, say) is never counted.
         crossing_cap_reached: True when the page's rules cross more than
             :data:`MAX_CROSSINGS` times: the sweep stopped, so the page has
             no lattice tables and all its text goes to the stream pass.
@@ -390,11 +391,12 @@ def find_lattice_tables(segments: tuple[RawSegment, ...], pieces: tuple[SpanPiec
     to right.
 
     Bounds, per page: the sweep stops past :data:`MAX_CROSSINGS`
-    crossings (the page then has no lattice tables); components build
-    grids in order while their units (X - 1) x (Y - 1), for X vertical and
-    Y horizontal positions, fit the :data:`MAX_GRID_UNITS` left and fewer
-    than :data:`MAX_GRIDS` grids are built; any other is left out, its
-    text kept for the stream pass, and counted. So the cost is
+    crossings (the page then has no lattice tables); components that can
+    be grids (2 or more unit columns and rows: a box cannot) build grids
+    in order while their units (X - 1) x (Y - 1), for X vertical and Y
+    horizontal positions, fit the :data:`MAX_GRID_UNITS` left and fewer
+    than :data:`MAX_GRIDS` grids are built; any other that can be one is
+    left out, its text kept for the stream pass, and counted. So the cost is
     O(n log n + MAX_CROSSINGS + MAX_GRID_UNITS + pieces x MAX_GRIDS +
     chars x (G + log(X + Y))) for n segments and the G grids near a piece.
 
@@ -573,16 +575,23 @@ class _Grid(NamedTuple):
 
 
 def _bounded_grids(groups: list[_Component]) -> tuple[list[_Grid], int]:
-    """The components' grids, in order, within the page's bounds, and how many components were left out.
+    """The components' grids, in order, within the page's bounds, and how many that could be grids were left out.
 
-    A component is left out when its units would pass the
-    :data:`MAX_GRID_UNITS` the page has left, or :data:`MAX_GRIDS` grids
-    are built; one built (or rejected by :func:`_grid`) spends its units.
+    A component with fewer than :data:`_MIN_GRID` unit columns or rows (a
+    box, or one row or column of boxes) cannot be a grid, which is
+    :func:`_grid`'s first test: it is passed over before the bounds,
+    spending no units and never counted. Any other is left out when its
+    units would pass the :data:`MAX_GRID_UNITS` the page has left, or
+    :data:`MAX_GRIDS` grids are built; one built (or rejected by
+    :func:`_grid`) spends its units. O(R) for R rules, besides building grids.
     """
     grids: list[_Grid] = []
     skipped, budget = 0, MAX_GRID_UNITS
     for horizontal, vertical in groups:
-        units = _unit_count(horizontal, vertical)
+        across, down = _unit_extent(horizontal, vertical)
+        if across < _MIN_GRID or down < _MIN_GRID:
+            continue
+        units = across * down
         if units > budget or len(grids) >= MAX_GRIDS:
             skipped += 1
             continue
@@ -593,11 +602,9 @@ def _bounded_grids(groups: list[_Component]) -> tuple[list[_Grid], int]:
     return grids, skipped
 
 
-def _unit_count(horizontal: list[_Line], vertical: list[_Line]) -> int:
-    """The units a component's grid would have: (X - 1) x (Y - 1) for its X vertical and Y horizontal positions."""
-    across = len({line.position for line in vertical}) - 1
-    down = len({line.position for line in horizontal}) - 1
-    return max(across, 0) * max(down, 0)
+def _unit_extent(horizontal: list[_Line], vertical: list[_Line]) -> tuple[int, int]:
+    """A component's unit columns and rows: X - 1 and Y - 1 for its X vertical and Y horizontal positions."""
+    return len({line.position for line in vertical}) - 1, len({line.position for line in horizontal}) - 1
 
 
 def _grid(horizontal: list[_Line], vertical: list[_Line]) -> _Grid | None:
