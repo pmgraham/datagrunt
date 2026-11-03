@@ -689,7 +689,10 @@ class PageAssessment:
             (see the module notes): never page text. Empty without a
             recovery.
         quality: The page's quality signals; ``deskew_angle_deg`` and
-            ``ocr_mean_confidence`` are None (A5 measures them).
+            ``ocr_mean_confidence`` are None. A5's vision route sets
+            ``ocr_mean_confidence`` on a page OCR reads; nothing measures
+            ``deskew_angle_deg``, which stays None (``PageQuality``: not
+            measured).
         route: ``"digital"``, ``"hybrid"`` or ``"vision"``.
         unmapped_regions: One box per maximal run of invalid chars in a
             visible piece, in piece order: where OCR (A5) reads what the
