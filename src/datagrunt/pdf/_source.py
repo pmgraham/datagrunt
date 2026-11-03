@@ -37,7 +37,9 @@ of the path is checked against it (the page workers', the bundle's, a page
 image's draws).
 
 The source is hashed the one way, by the pipeline, the bundle and a page
-image's draw: opened once (:func:`_opened_source`), its identity taken
+image's draw: opened once, as :func:`checked_pdf_file` opens it
+(:func:`_opened_source`: ``O_NONBLOCK``, then ``fstat`` of the descriptor
+must show a regular file, else ``ValueError``), its identity taken
 through that descriptor, then its first ``st_size`` bytes streamed through
 SHA-256 in reads of at most :data:`_HASH_CHUNK_BYTES`
 (:func:`_stream_sha256`), a file cut short meanwhile raising
@@ -49,6 +51,7 @@ one that decides.
 
 import errno
 import hashlib
+import io
 import os
 import stat
 from dataclasses import dataclass
@@ -127,15 +130,30 @@ def check_binding(identity: object, sha256: object) -> None:
 def _opened_source(path: Path) -> BinaryIO:
     """``path`` opened for reading, once: the file the hash is read through and the identity taken from.
 
-    A path that is not a regular file is refused before it is opened (a FIFO
-    would block), as A2's ``open_document`` refuses it.
+    Opened as :func:`checked_pdf_file` opens it: with :data:`_OPEN_FLAGS`
+    (``O_NONBLOCK``: a named pipe at the path, however late it was put
+    there, cannot block the open), then checked through ``fstat`` of that
+    descriptor to be a regular file. The descriptor is closed on every path
+    but the one that returns it, in a stream that closes it.
 
     Raises:
-        FileNotFoundError: If ``path`` is not an existing regular file.
+        FileNotFoundError: If ``path`` does not exist (or runs through a file).
+        ValueError: If ``path`` is not a regular file (a directory, a named
+            pipe, a device), as :func:`checked_pdf_file` raises it.
+        OSError: If ``path`` cannot be opened for another reason
+            (``PermissionError``, say).
     """
-    if not path.is_file():
-        raise FileNotFoundError(errno.ENOENT, "not an existing file", str(path))
-    return path.open("rb")
+    try:
+        descriptor = os.open(path, _OPEN_FLAGS)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise FileNotFoundError(errno.ENOENT, "not an existing file", str(path)) from exc
+    try:
+        _require_regular(os.fstat(descriptor), "source", path)
+        raw = io.FileIO(descriptor, "r")  # a FileIO that fails to start leaves the descriptor to this close
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return io.BufferedReader(raw)
 
 
 def _stream_sha256(stream: BinaryIO, size: int, path: Path) -> str:

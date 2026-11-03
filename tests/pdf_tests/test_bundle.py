@@ -718,6 +718,13 @@ class TestValidation:
             write(bound_document(source), tmp_path / "out", tmp_path / "gone.pdf")
         assert not (tmp_path / "out").exists()
 
+    def test_a_source_that_is_not_a_regular_file_is_refused(self, tmp_path, source, fast_render):
+        directory = tmp_path / "doc.pdf"
+        directory.mkdir()
+        with pytest.raises(ValueError, match=f"^source is not a regular file: {re.escape(str(directory))}$"):
+            write(bound_document(source), tmp_path / "out", directory)
+        assert not (tmp_path / "out").exists()
+
     @pytest.mark.parametrize(
         ("options", "error", "message"),
         [
@@ -1172,6 +1179,62 @@ class TestDrawnPageImages:
         ]
         assert [page.page_image for page in written.pages] == [None, None]
         assert [entry["page_number"] for entry in manifest_of(tmp_path / "out")["missing"]] == [1, 2]
+
+
+def touched(path: Path) -> None:
+    """Move ``path``'s mtime on a second: the same file and bytes, another identity."""
+    status = path.stat()
+    os.utime(path, ns=(status.st_atime_ns, status.st_mtime_ns + 1_000_000_000))
+
+
+def source_hashes(monkeypatch) -> list[Path]:
+    """Record the path of each hash of a source (``_stream_sha256``: the write's, its page images'), and let it run."""
+    hashed: list[Path] = []
+    real = bundle._stream_sha256
+
+    def recorded(stream, size, path):
+        hashed.append(path)
+        return real(stream, size, path)
+
+    for module in (bundle, _loaders):
+        monkeypatch.setattr(module, "_stream_sha256", recorded)
+    return hashed
+
+
+class TestTheSourceIsHashedOnce:
+    """A write hashes its source once, whatever its identity at extraction: its page images draw the file hashed."""
+
+    @pytest.mark.parametrize("change", [touched, rewritten_in_place], ids=["touched", "copied-back"])
+    @pytest.mark.parametrize("write_dpi", [200, DPI])
+    def test_drawn_pages(self, tmp_path, monkeypatch, write_dpi, change):
+        path = digital_pdf(tmp_path)
+        document = extract_document(path)
+        draws = [page.page_image._loader.__self__ for page in document.pages]
+        change(path)
+        hashed = source_hashes(monkeypatch)
+
+        write_bundle(document, tmp_path / "out", source=path, dpi=write_dpi)
+
+        assert hashed == [path]  # the write's own: no page image hashes it again
+        assert manifest_of(tmp_path / "out")["missing"] == []
+        assert [page.page_image._loader.__self__ for page in document.pages] == draws  # the document's, as they were
+
+    @pytest.mark.parametrize("change", [touched, rewritten_in_place], ids=["touched", "copied-back"])
+    def test_a_vision_page_and_its_bands(self, tmp_path, monkeypatch, change):
+        path = build_pdf(
+            tmp_path / "scan.pdf", [PageSpec(items=(TextRun("Bundle the righted bands", 72.0, 120.0, size=24.0),))]
+        )
+        document = extract_document(path, ocr="always")
+        image = document.pages[0].page_image
+        assert isinstance(image._loader.__self__, _loaders.PageRender)
+        assert isinstance(image._band_loader.__self__, _loaders.PageRender)
+        change(path)
+        hashed = source_hashes(monkeypatch)
+
+        written = write_bundle(document, tmp_path / "out", source=path)
+
+        assert hashed == [path]  # the write's own: neither the image nor its bands hash it again
+        assert manifest_of(tmp_path / "out")["missing"] == [] and written.pages[0].page_image.band_paths
 
 
 class TestExtractionParams:

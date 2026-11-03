@@ -67,6 +67,7 @@ from pdf_tests.test_pdfium_engine import imported_modules
 from pdf_tests.test_pdfium_images import j2k, xobject_page
 from pdf_tests.test_pdfium_spans import content_page
 from pdf_tests.test_quality import SHA, image
+from pdf_tests.test_source import promptly
 
 W, H = 400.0, 300.0
 GEOMETRY = PageGeometry(page_number=1, width_pt=W, height_pt=H, rotation_deg=0, crop_offset=(0.0, 0.0))
@@ -1039,6 +1040,27 @@ class TestPageDrawSource:
 
         assert str(caught.value) == f"{path} was removed before page 1's image was drawn; {NOT_RETURNED}"
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="a directory does not open for reading on Windows")
+    def test_a_directory_put_there_between_its_stat_and_its_hash_is_refused_saying_so(self, tmp_path, monkeypatch):
+        path = letter(tmp_path, *body_text(100.0))
+        bound = binding(path)
+        touched(path)
+        real = _loaders._opened_source
+
+        def replaced_then_opened(source):
+            source.unlink()
+            source.mkdir()
+            return real(source)
+
+        monkeypatch.setattr(_loaders, "_opened_source", replaced_then_opened)
+        monkeypatch.setattr(_loaders, "render_page", no_draw)
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            self.draw(path, **bound).png_bytes()
+
+        changed = f"{path} changed before page 1's image was drawn: it is not a regular file"
+        assert str(caught.value) == f"{changed}; {NOT_RETURNED}"
+
     def test_a_file_cut_short_while_it_is_hashed_is_refused(self, tmp_path, monkeypatch):
         path = letter(tmp_path, *body_text(100.0))
         bound = binding(path)
@@ -1072,6 +1094,33 @@ class TestPageDrawSource:
             self.draw(path, **bound).png_bytes()
 
         assert str(caught.value) == f"{path} was removed while page 1's image was drawn; {NOT_RETURNED}"
+
+    @pytest.mark.parametrize("kind", ["directory", "named pipe"])
+    @pytest.mark.parametrize("when", ["before", "while"])
+    def test_a_path_that_is_not_a_regular_file_is_refused_saying_so(self, tmp_path, monkeypatch, when, kind):
+        if kind == "named pipe" and sys.platform == "win32":
+            pytest.skip("no named pipes as files on Windows")
+        path = letter(tmp_path, *body_text(100.0))
+        bound = binding(path)
+
+        def replaced() -> None:
+            path.unlink()
+            if kind == "directory":
+                path.mkdir()
+            else:
+                os.mkfifo(path)
+
+        if when == "before":
+            replaced()
+            monkeypatch.setattr(_loaders, "render_page", no_draw)
+        else:
+            after_the_draw(monkeypatch, replaced)
+
+        raised = promptly(lambda: self.draw(path, **bound).png_bytes(), path)
+
+        assert isinstance(raised, PDFSourceChangedError)
+        changed = f"{path} changed {when} page 1's image was drawn: it is not a regular file"
+        assert str(raised) == f"{changed}; {NOT_RETURNED}"
 
     def test_without_a_binding_the_file_at_its_path_is_drawn_as_before(self, tmp_path, monkeypatch):
         path = letter(tmp_path, *body_text(100.0))

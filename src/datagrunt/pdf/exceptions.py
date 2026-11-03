@@ -52,9 +52,9 @@ class PDFSourceChangedError(DatagruntPDFError):
     A page image's read (``PageImage.read_bytes``, ``read_bands``) raises it
     too when the file at the source path no longer holds the document's
     bytes (a file of another identity whose SHA-256 is not the document's),
-    is gone, or changes while the page is drawn: no image of other bytes
-    than the pages is returned. A file only touched, or rewritten with the
-    same bytes, is drawn.
+    is gone or not a regular file, or changes while the page is drawn: no
+    image of other bytes than the pages is returned. A file only touched,
+    or rewritten with the same bytes, is drawn.
     """
 
 
