@@ -1725,9 +1725,6 @@ _MAX_LEVEL = 6
 # A key is at most this many chars (spec) and holds none of these (sentence-ending punctuation).
 _MAX_KEY_CHARS = 40
 _SENTENCE_END = frozenset(".!?")
-# A run of this many pairs in a row, each on a line of its own, ends the paragraph before it: a lead-in over pairs
-# (#456). One pair-shaped line in prose ("Setup: deal five cards") stays prose.
-_MIN_PAIR_RUN = 2
 # A key ends at the first colon before whitespace or the end of the line: "10:30" or "https://" holds none.
 _KEY_END = re.compile(r":(?=\s|$)")
 # A pair's value is prose, so its lines are a paragraph (P2-C, the 2026-11-02 audit), when it is longer than this
@@ -1874,21 +1871,12 @@ def classify_blocks(blocks: tuple[TextBlock, ...]) -> tuple[StreamItem, ...]:
        lines are the block's other lines (the merge starts a block at each
        marker). Neighbouring items, all bulleted or all numbered, are one
        list.
-    3. Key-value pairs (:func:`_pairs_and_paragraphs`): a ``Key: Value``
-       line, the key at most :data:`_MAX_KEY_CHARS` chars with no
-       sentence-ending punctuation, starts a pair when it is the block's
-       first line or follows a pair; a line of no pair after a pair
-       continues its value if the line before wrapped onto it, and a line
-       that neither continues nor starts one starts a paragraph. A
-       paragraph runs on to the block's end or until a run of
-       :data:`_MIN_PAIR_RUN` pairs in a row (#456): each a pair line that
-       starts a line of its own, no sentence running onto it from the
-       line before, with the lines its value wraps onto, so a run counts
-       pairs, not lines. The run's first line starts a pair, and from it
-       the lines follow the rules above. So a lead-in over pairs is a
-       paragraph and then pairs, while one pair-shaped line in prose, or
-       prose wrapped onto pair-shaped lines, stays prose. A pair whose
-       value is prose (:func:`_is_prose`) is a paragraph of its lines.
+    3. Key-value pairs (:func:`_pairs_and_paragraphs`): its first line is
+       ``Key: Value``, the key at most :data:`_MAX_KEY_CHARS` chars with no
+       sentence-ending punctuation; each such line starts a pair, the
+       lines after it continue its value while they wrap, and a paragraph
+       then runs to the block's end. A pair whose value is prose
+       (:func:`_is_prose`) is a paragraph of its lines.
     4. Else a paragraph.
 
     Items keep their blocks' order and every char of them once, in their
@@ -2063,103 +2051,23 @@ def _is_prose(value: str) -> bool:
 def _pairs_and_paragraphs(found: TextBlock) -> list[StreamKeyValue | StreamParagraph]:
     """The block as key-value pairs and paragraphs (:func:`classify_blocks`, rules 3 and 4).
 
-    A ``Key: Value`` line (:func:`_key_value`) starts a pair when it is
-    the block's first line or follows a pair. A line of no pair after a
-    pair continues its value if the line before wrapped onto it
-    (:func:`_wrapped`), else it starts a paragraph. A paragraph runs on
-    to the block's end or until a run of :data:`_MIN_PAIR_RUN` pairs in a
-    row (:func:`_starts_run`, #456): each a pair line no sentence runs
-    onto from the line before (:func:`_runs_on`), with the lines that
-    continue its value. The run's first line starts a pair, and from it
-    the lines follow the rules above. So a lead-in over
-    pairs ("Invoice Details" over "Invoice Date: 2026-01-15" and
-    "Payment Terms: Net 30") is a paragraph and then pairs, also when the
-    first pair's value wraps; while one pair-shaped line in a paragraph,
-    or prose wrapped onto pair-shaped lines ("each player in turn and
-    the" over "dealer says: shuffle the deck"), stays in the paragraph. A
-    line is a pair by :func:`_key_value` alone, so a colon after a key
-    past :data:`_MAX_KEY_CHARS` chars, or holding a full stop, makes none.
-    On the corpus datasheets, a paragraph set close under "Category:
-    Fastener" merges into its block, though that line ends 405 pt short
-    of the column.
+    A ``Key: Value`` line starts a pair; a line after it continues its
+    value only if that line wrapped (:func:`_wrapped`), else it starts a
+    paragraph. A paragraph runs to the block's end, so a colon later in a
+    paragraph makes no pair, and a block whose first line is no pair is
+    one paragraph. On the corpus datasheets, a paragraph set close under
+    "Category: Fastener" merges into its block, though that line ends
+    405 pt short of the column.
     """
     right = max(_turned(_plain(item.bbox), item.turn)[2] for item in found.lines)
-    parsed = [_key_value(item.text) for item in found.lines]
     groups: list[tuple[tuple[str, str] | None, list[TextLine]]] = []
-    for index, item in enumerate(found.lines):
-        if groups and _joins(groups[-1][0] is None, found.lines, parsed, index, right):
+    for item in found.lines:
+        parsed = _key_value(item.text)
+        if groups and (groups[-1][0] is None or (parsed is None and _wrapped(groups[-1][1][-1], item, right))):
             groups[-1][1].append(item)
         else:
-            groups.append((parsed[index], [item]))
-    return [_pair_or_paragraph(head, lines) for head, lines in groups]
-
-
-def _joins(
-    in_paragraph: bool, lines: tuple[TextLine, ...], parsed: list[tuple[str, str] | None], index: int, right: float
-) -> bool:
-    """True if line ``index`` joins the group of the line before it (:func:`_pairs_and_paragraphs`).
-
-    A paragraph (``in_paragraph``) takes every line but the first of a run
-    of pairs (:func:`_starts_run`); a pair takes a line of no pair that the
-    line before wrapped onto (:func:`_wrapped`). ``parsed`` holds each
-    line's :func:`_key_value`; ``right`` is the block's end along its lines.
-    """
-    if in_paragraph:
-        return not _starts_run(lines, parsed, index, right)
-    return parsed[index] is None and _wrapped(lines[index - 1], lines[index], right)
-
-
-def _starts_run(lines: tuple[TextLine, ...], parsed: list[tuple[str, str] | None], index: int, right: float) -> bool:
-    """True if line ``index``, after a paragraph's line, starts a run of :data:`_MIN_PAIR_RUN` pairs in a row (#456).
-
-    Each pair of the run starts a line of its own (:func:`_own_pair`), and
-    the lines that continue its value (:func:`_past_value`) are part of it:
-    the run counts pairs, not lines, so "Ship To: 1 Harbour Road, Leith,
-    by the" over "Docks" is one pair of a run. The scan stops at the first
-    line that neither continues a value nor is a pair of its own, so the
-    paragraph's lines read O(lines x :data:`_MIN_PAIR_RUN`) in all.
-    """
-    pairs, at = 0, index
-    while _own_pair(lines, parsed, at, right):  # bounded: ``at`` rises each pass, to the block's end
-        pairs += 1
-        if pairs >= _MIN_PAIR_RUN:
-            return True
-        at = _past_value(lines, parsed, at, right)
-    return False
-
-
-def _own_pair(lines: tuple[TextLine, ...], parsed: list[tuple[str, str] | None], index: int, right: float) -> bool:
-    """True if line ``index`` is a pair on a line of its own: no sentence runs onto it (:func:`_runs_on`).
-
-    False past the block's last line.
-    """
-    if index >= len(lines) or parsed[index] is None:
-        return False
-    return index == 0 or not _runs_on(lines[index - 1], lines[index], right)
-
-
-def _past_value(lines: tuple[TextLine, ...], parsed: list[tuple[str, str] | None], index: int, right: float) -> int:
-    """The index of the line after pair ``index`` and the lines of no pair that continue its value (:func:`_joins`)."""
-    at = index + 1
-    while at < len(lines) and parsed[at] is None and _wrapped(lines[at - 1], lines[at], right):  # bounded: the lines
-        at += 1
-    return at
-
-
-def _runs_on(before: TextLine, after: TextLine, right: float) -> bool:
-    """True if a sentence runs on from ``before`` onto ``after``, so ``after`` starts no line of its own.
-
-    ``before`` wrapped onto ``after`` (:func:`_wrapped`, ``right`` the
-    block's end along its lines) and ends no clause (``.``, ``!``, ``?``
-    or ``:``), and ``after`` starts lower case (:func:`_runs_on_lower`),
-    as :func:`_bold_runs_on` reads a sentence running on: the block's
-    longest line is the measure, so it always "wraps", and a key under it
-    ("Invoice Date: 2026-01-15" under "Invoice Details for the order")
-    starts with a capital where a sentence running on does not.
-    """
-    if not _wrapped(before, after, right) or before.text.rstrip().endswith(_CLAUSE_ENDS):
-        return False
-    return _runs_on_lower(after.text)
+            groups.append((parsed, [item]))
+    return [_pair_or_paragraph(parsed, lines) for parsed, lines in groups]
 
 
 def _wrapped(before: TextLine, after: TextLine, right: float) -> bool:
