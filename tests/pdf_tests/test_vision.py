@@ -641,6 +641,11 @@ class TestVisionPage:
         assert again == page
         assert again.page_image.read_bytes() == page.page_image.read_bytes()
 
+    def test_a_scan_read_upright_is_not_flagged(self, read):
+        page = read("scan")
+
+        assert low_notes(page) == [], (page.quality, page.warnings)
+
 
 def no_tesseract(monkeypatch, tmp_path) -> None:
     """PATH holds no tesseract."""
@@ -1729,6 +1734,76 @@ class TestFallbackQuality:
         assert (page.status, page.elements) == ("ocr_fallback", ())
 
 
+def low_confidence(shown: str) -> str:
+    """The warning of a page OCR read at a mean word confidence (``shown``) under LOW_OCR_CONFIDENCE (#456)."""
+    return (
+        f"OCR read the page at a mean word confidence of {shown}, under {vision.LOW_OCR_CONFIDENCE:g}: it may be "
+        "turned the wrong way or unreadable, so its text should not be trusted as is"
+    )
+
+
+def low_notes(page: Page) -> list[str]:
+    """The page's warnings that OCR read it at a low mean word confidence."""
+    return [item for item in page.warnings if item.startswith("OCR read the page at a mean word confidence")]
+
+
+# Two words whose mean confidence is 69.9 and 70.0: weighted by chars ("a" is 1 of 5), 87.8 and 88.0.
+UNDER = (word("a", 72.0, 100.0, 77.0, 110.0, 40.0), word("word", 80.0, 100.0, 100.0, 110.0, 99.8))
+AT = (word("a", 72.0, 100.0, 77.0, 110.0, 40.0), word("word", 80.0, 100.0, 100.0, 110.0, 100.0))
+
+
+class TestLowConfidence:
+    """A page whose text is OCR's, read at a mean word confidence under LOW_OCR_CONFIDENCE, says so (#456)."""
+
+    def test_the_threshold_is_set_from_the_evidence(self):
+        # Corpus and sparse capitals, right way up and upside down: see the vision module notes, step 5.
+        assert vision.LOW_OCR_CONFIDENCE == 70.0
+        assert "LOW_OCR_CONFIDENCE" in vision.__all__
+
+    def test_a_page_read_under_it_is_flagged_and_keeps_its_text(self, scans, monkeypatch):
+        # The page's own ocr_mean_confidence is the mean: weighted by chars, it would be 87.8, not flagged.
+        ok_reading(monkeypatch, UNDER)
+
+        page = visioned(scans["scan"])
+
+        assert page.quality.ocr_mean_confidence == pytest.approx(69.9)
+        assert (page.status, texts(page)) == ("ok", ["a word"])
+        assert low_notes(page) == [low_confidence("69.9")]
+
+    @pytest.mark.parametrize("words", [pytest.param(AT, id="at-it"), pytest.param((), id="no-words")])
+    def test_a_page_read_at_it_or_reading_no_words_is_not_flagged(self, scans, monkeypatch, words):
+        ok_reading(monkeypatch, words)
+
+        page = visioned(scans["scan"])
+
+        assert page.quality.ocr_mean_confidence == (70.0 if words else None)
+        assert page.status == "ok"
+        assert low_notes(page) == []
+
+    @pytest.mark.parametrize(
+        ("words", "flagged"), [pytest.param(UNDER, True, id="under"), pytest.param(AT, False, id="at")]
+    )
+    def test_a_fallback_page_is_flagged_alike(self, scans, monkeypatch, words, flagged):
+        failure = failed_at_text(scans["scan"], monkeypatch)
+        ok_reading(monkeypatch, words)
+
+        page = fell_back(scans["scan"], failure)
+
+        assert page.status == "ocr_fallback"
+        assert low_notes(page) == ([low_confidence("69.9")] if flagged else [])
+
+    def test_an_unread_page_is_not_flagged(self, scans, monkeypatch):
+        # Its text is the digital text's: the words OCR read before tesseract failed are not used.
+        partial = OCRResult(words=UNDER, status="failed", reason="band 2 of 4: tesseract exited with code 1")
+        monkeypatch.setattr(vision, "orientation", lambda *args, **kwargs: UPRIGHT)
+        monkeypatch.setattr(vision, "ocr_words", lambda *args, **kwargs: partial)
+
+        page = visioned(scans["captioned"])
+
+        assert (page.status, texts(page)) == ("ocr_unavailable", ["Page 7"])
+        assert low_notes(page) == []
+
+
 class TestFallbackErrors:
     """A failed page whose geometry, render or OCR fails too is an error page: why, and no elements (A1)."""
 
@@ -1994,14 +2069,18 @@ class TestGarbledFont:
         assert texts(page) == [GARBLED]
 
 
-def sparse_capitals(path: Path) -> Path:
-    """8 upright pages of two lines of capitals (#456): tesseract 5.5.3's OSD suggests turning each 180 degrees."""
+def sparse_capitals(path: Path, rotate: int = 0) -> Path:
+    """8 pages of two lines of capitals (#456), displayed turned ``rotate`` degrees (/Rotate).
+
+    Upright, tesseract 5.5.3's OSD suggests turning each 180 degrees; displayed upside down, it reads each as upright.
+    """
     pages = [
         PageSpec(
             items=(
                 TextRun(f"ALPHA DOCUMENT PAGE {number}", 72.0, 100.0, size=28.0),
                 TextRun("ALPHA ALPHA ALPHA body text line", 72.0, 160.0, size=20.0),
-            )
+            ),
+            rotate=rotate,
         )
         for number in range(1, 9)
     ]
@@ -2013,12 +2092,25 @@ def capitals(tmp_path_factory) -> Path:
     return sparse_capitals(tmp_path_factory.mktemp("capitals") / "capitals.pdf")
 
 
+@pytest.fixture(scope="module")
+def capital_pages(capitals) -> tuple[Page, ...]:
+    return PDFReader(capitals, ocr="always", workers=4).pages
+
+
+@pytest.fixture(scope="module")
+def upside_down_capitals(tmp_path_factory) -> Path:
+    return sparse_capitals(tmp_path_factory.mktemp("capitals") / "upside-down.pdf", rotate=180)
+
+
 @needs_tesseract
 class TestSparseCapitals:
-    """Upright pages OSD suggests turning (at 1.83 to 2.04 here, 3 of 8 over the threshold) read upright (#456)."""
+    """Upright pages OSD suggests turning (at 1.83 to 2.04 here, 3 of 8 over the threshold) read upright (#456).
 
-    def test_every_page_reads_its_upright_text(self, capitals):
-        pages = PDFReader(capitals, ocr="always", workers=4).pages
+    Displayed upside down, OSD reads them as upright: OCR reads them as displayed, and flags them.
+    """
+
+    def test_every_page_reads_its_upright_text(self, capital_pages):
+        pages = capital_pages
 
         assert len(pages) == 8
         for number, page in enumerate(pages, start=1):
@@ -2027,6 +2119,24 @@ class TestSparseCapitals:
             assert (page.status, page.route) == ("ok", "vision")
             assert sum((expected & read).values()) >= 9, (number, texts(page), page.warnings)
             assert not [note for note in page.warnings if note.startswith("the page reads turned")], page.warnings
+
+    def test_no_upright_page_is_flagged(self, capital_pages):
+        # Read upright at a mean word confidence of 95.1 to 95.9 here.
+        for page in capital_pages:
+            assert low_notes(page) == [], (page.page_number, page.quality, page.warnings)
+
+    def test_every_upside_down_page_is_flagged_and_keeps_its_text(self, upside_down_capitals):
+        # OSD reads each page as upright, so no turn is checked and OCR reads it upside down, as gibberish: at a mean
+        # word confidence of 50.9 to 59.3 here (module notes, step 5). Its text is kept; the warning says so.
+        pages = PDFReader(upside_down_capitals, ocr="always", workers=4).pages
+
+        assert len(pages) == 8
+        for page in pages:
+            assert (page.status, page.route) == ("ok", "vision")
+            assert not [note for note in page.warnings if note.startswith("the page reads turned")], page.warnings
+            assert texts(page), page.page_number
+            mean = page.quality.ocr_mean_confidence
+            assert low_notes(page) == [low_confidence(f"{mean:.1f}")], (page.page_number, page.warnings)
 
     @pytest.mark.parametrize("shown", [0, 90, 180, 270])
     @pytest.mark.parametrize("index", [0, 2])
