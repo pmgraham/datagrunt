@@ -411,6 +411,13 @@ class TestPageQuality:
         assert [piece.hidden_reasons for piece in result.pieces[1:]] == [("off_page", "tiny_font"), ("tiny_font",)]
         assert result.quality.hidden_spans_flagged == 1
 
+    def test_a_span_flagged_only_after_its_first_piece_counts_once(self):
+        # A visible piece, then one off the right edge: the span's flag is on a later piece.
+        result = assess(letters(24), raw_span("ABCDEFGH", (*row(4, 100.0), *row(4, 450.0))))
+
+        assert [piece.hidden_reasons for piece in result.pieces[1:]] == [(), ("off_page",)]
+        assert result.quality.hidden_spans_flagged == 1
+
     def test_equal_spans_each_count(self):
         # Two spans of the same text in the same place are two spans of the page, as char_count counts them.
         result = assess(letters(24), text_span("Gone", y=-60.0), text_span("Gone", y=-60.0))
