@@ -50,8 +50,11 @@ class PDFSourceChangedError(DatagruntPDFError):
     one page, so no document is returned. The message names what changed:
     the file's inode (it was replaced), its size or its modification time.
     A page image's read (``PageImage.read_bytes``, ``read_bands``) raises it
-    too when the file at the path is no longer the one its document was
-    extracted from: no image of other bytes than the pages is returned.
+    too when the file at the source path no longer holds the document's
+    bytes (a file of another identity whose SHA-256 is not the document's),
+    is gone, or changes while the page is drawn: no image of other bytes
+    than the pages is returned. A file only touched, or rewritten with the
+    same bytes, is drawn.
     """
 
 

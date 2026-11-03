@@ -1122,6 +1122,10 @@ class PageImage:
         """Return the full-page image bytes: the loader first, then ``image_path``.
 
         Raises:
+            PDFSourceChangedError: If the image is drawn from its source PDF
+                when read (a document extracted from a path) and the file at
+                that path no longer holds the document's bytes, or changes
+                while it is drawn: no image of other bytes is returned.
             DatagruntPDFError: If there is no byte source, ``image_path`` is not
                 a regular file, or the bytes exceed the asset limit.
             OSError: If ``image_path`` cannot be stat'ed or read (e.g.
@@ -1141,6 +1145,8 @@ class PageImage:
         total, not each band.
 
         Raises:
+            PDFSourceChangedError: As :meth:`read_bytes` raises it: the bands
+                are drawn from the source PDF when read, as the image is.
             DatagruntPDFError: If there is no band source (a loader returning no
                 bands counts as none), a band path is not a regular file, or the
                 bands exceed the asset limit in total.

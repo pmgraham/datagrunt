@@ -35,17 +35,30 @@ module, so none can reach its messages.
 pipeline takes it when it hashes the source (A8a), and every later opening
 of the path is checked against it (the page workers', the bundle's, a page
 image's draws).
+
+The source is hashed the one way, by the pipeline, the bundle and a page
+image's draw: opened once (:func:`_opened_source`), its identity taken
+through that descriptor, then its first ``st_size`` bytes streamed through
+SHA-256 in reads of at most :data:`_HASH_CHUNK_BYTES`
+(:func:`_stream_sha256`), a file cut short meanwhile raising
+``PDFSourceChangedError``. A page image's loaders are bound to the file
+their document was extracted from by its identity and its sha256 together
+(:func:`check_binding`): the identity is the fast check, the sha256 the
+one that decides.
 """
 
 import errno
+import hashlib
 import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
-from datagrunt.pdf._validate import int_at_least, non_blank_str
+from datagrunt.pdf._validate import int_at_least, non_blank_str, sha256_hex
+from datagrunt.pdf.exceptions import PDFSourceChangedError
 
-__all__ = ["SourceIdentity", "checked_pdf_file"]
+__all__ = ["SourceIdentity", "check_binding", "checked_pdf_file"]
 
 _HEADER = b"%PDF"
 # The last offset pdfium's parser looks for the header at (see the module notes).
@@ -54,6 +67,8 @@ _HEADER_WINDOW = _MAX_HEADER_OFFSET + len(_HEADER)
 # Never blocking on a named pipe (O_NONBLOCK, which a regular file ignores), as bytes (O_BINARY, Windows). Each
 # flag is 0 where it does not exist.
 _OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+# The source is hashed in reads of at most this many bytes.
+_HASH_CHUNK_BYTES = 1 << 20
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -91,6 +106,62 @@ class SourceIdentity:
         if self.mtime_ns != other.mtime_ns:
             found.append(f"mtime {self.mtime_ns} -> {other.mtime_ns} ns")
         return tuple(found)
+
+
+def check_binding(identity: object, sha256: object) -> None:
+    """Require the file a document was extracted from as its identity and its sha256 together, or neither (None).
+
+    Raises:
+        TypeError: If ``identity`` is not a SourceIdentity or None, or ``sha256`` not a str or None.
+        ValueError: If ``sha256`` is not 64 lowercase hex characters, or only one of the two is given.
+    """
+    if identity is not None and not isinstance(identity, SourceIdentity):
+        raise TypeError(f"identity must be a SourceIdentity or None, got {type(identity).__name__}")
+    if sha256 is not None:
+        sha256_hex("sha256", sha256)
+    if (identity is None) != (sha256 is None):
+        given = "sha256" if identity is None else "identity"
+        raise ValueError(f"identity and sha256 must both be given or both be None, got only the {given}")
+
+
+def _opened_source(path: Path) -> BinaryIO:
+    """``path`` opened for reading, once: the file the hash is read through and the identity taken from.
+
+    A path that is not a regular file is refused before it is opened (a FIFO
+    would block), as A2's ``open_document`` refuses it.
+
+    Raises:
+        FileNotFoundError: If ``path`` is not an existing regular file.
+    """
+    if not path.is_file():
+        raise FileNotFoundError(errno.ENOENT, "not an existing file", str(path))
+    return path.open("rb")
+
+
+def _stream_sha256(stream: BinaryIO, size: int, path: Path) -> str:
+    """The SHA-256 of the first ``size`` bytes of ``stream``, read in chunks of :data:`_HASH_CHUNK_BYTES`.
+
+    Raises:
+        PDFSourceChangedError: If fewer than ``size`` bytes can be read (the file was cut short), naming ``path``.
+    """
+    digest = hashlib.sha256()
+    remaining = size
+    for _ in range(-(-size // _HASH_CHUNK_BYTES)):
+        block = _read_chunk(stream, min(_HASH_CHUNK_BYTES, remaining))
+        if not block:
+            break
+        digest.update(block)
+        remaining -= len(block)
+    if remaining:
+        raise PDFSourceChangedError(
+            f"{path} changed while it was hashed: {size - remaining} of its {size} bytes could be read"
+        )
+    return digest.hexdigest()
+
+
+def _read_chunk(stream: BinaryIO, size: int) -> bytes:
+    """The next at most ``size`` bytes of ``stream`` (fewer only at its end)."""
+    return stream.read(size)
 
 
 def checked_pdf_file(path: Path, name: str) -> Path:

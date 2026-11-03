@@ -57,7 +57,7 @@ from typing import TypedDict, get_args
 from datagrunt.pdf._loaders import FigureRead, PageDraw
 from datagrunt.pdf._options import _MIN_DPI, _MIN_RENDER_PIXELS, DPI, MAX_RENDER_PIXELS, MIN_IMAGE_DIMENSION
 from datagrunt.pdf._pdfium_common import Box
-from datagrunt.pdf._source import SourceIdentity
+from datagrunt.pdf._source import SourceIdentity, check_binding
 from datagrunt.pdf._validate import int_at_least, sha256_hex, str_tuple, typed_tuple
 from datagrunt.pdf.elements import (
     BBox,
@@ -311,6 +311,7 @@ def assemble_page(
     source: str | os.PathLike[str],
     password: str | None = None,
     identity: SourceIdentity | None = None,
+    sha256: str | None = None,
     min_image_dimension: int = MIN_IMAGE_DIMENSION,
     dpi: int = DPI,
     max_render_pixels: int = MAX_RENDER_PIXELS,
@@ -345,10 +346,11 @@ def assemble_page(
        effective DPI of ``dpi`` within ``max_render_pixels``
        (:func:`~datagrunt.pdf.render.effective_dpi`) when it is read. Its
        ``dpi`` and size are that render's; it is not contrast-normalized and
-       has no bands. It holds ``identity``, the identity of the file at
-       ``source`` the document was extracted from (the pipeline's): each draw
-       of another file there is refused (None checks nothing). A page that
-       cannot be drawn within the bound (``effective_dpi`` refuses it) has no
+       has no bands. It holds ``identity`` and ``sha256``, the identity and
+       the hash of the file at ``source`` the document was extracted from
+       (the pipeline's): a draw of a file there whose bytes are not the
+       document's is refused (both None check nothing). A page that cannot
+       be drawn within the bound (``effective_dpi`` refuses it) has no
        image, and a warning says why.
 
     The page's ``quality`` and ``route`` are A3's. Its warnings are A2's
@@ -369,10 +371,12 @@ def assemble_page(
         TypeError: If an argument is of the wrong type.
         ValueError: If ``assessment`` is not of ``raw_page`` (its chars or
             rotation differ), ``dpi`` is under 36 or ``max_render_pixels``
-            under 262,144 (512 x 512), or as :func:`page_figures` and
-            ``page_layout``.
+            under 262,144 (512 x 512), only one of ``identity`` and
+            ``sha256`` is given (:func:`~datagrunt.pdf._source.check_binding`),
+            or as :func:`page_figures` and ``page_layout``.
     """
     _check_inputs(raw_page, assessment, lattice)
+    check_binding(identity, sha256)
     int_at_least("dpi", dpi, _MIN_DPI)
     int_at_least("max_render_pixels", max_render_pixels, _MIN_RENDER_PIXELS)
     geometry = raw_page.geometry
@@ -392,7 +396,7 @@ def assemble_page(
     verified, mismatch = pass_c(assessment, elements)
     vision = assessment.route == "vision"
     warnings = (*raw_page_warnings(raw_page), *figures.warnings, *assessment.warnings, *_lattice_warnings(lattice))
-    image, undrawn = _page_image(geometry, source, password, identity, dpi, max_render_pixels)
+    image, undrawn = _page_image(geometry, source, password, (identity, sha256), dpi, max_render_pixels)
     warnings += (*layout.warnings, *((_VISION_NOTE,) if vision else ()), *mismatch, *undrawn)
     return Page(
         page_number=geometry.page_number,
@@ -412,11 +416,14 @@ def _page_image(
     geometry: PageGeometry,
     source: str | os.PathLike[str],
     password: str | None,
-    identity: SourceIdentity | None,
+    binding: tuple[SourceIdentity | None, str | None],
     dpi: int,
     max_render_pixels: int,
 ) -> tuple[PageImage | None, tuple[str, ...]]:
-    """The page's image, drawn when read (:func:`assemble_page`, step 5); or None and why it cannot be drawn."""
+    """The page's image, drawn when read (:func:`assemble_page`, step 5); or None and why it cannot be drawn.
+
+    ``binding`` is the identity and the sha256 of the file its document was extracted from (or two Nones).
+    """
     try:
         drawn_at = effective_dpi(dpi, max_render_pixels, geometry.width_pt, geometry.height_pt)
     except RenderRefused as exc:
@@ -428,7 +435,8 @@ def _page_image(
         width_pt=geometry.width_pt,
         height_pt=geometry.height_pt,
         password=password,
-        identity=identity,
+        identity=binding[0],
+        sha256=binding[1],
     )
     width, height = draw.size
     image = PageImage(

@@ -38,7 +38,7 @@ from datagrunt.pdf.pdfium_engine import (
 )
 from datagrunt.pdf.quality import SpanPiece, assess_page
 from datagrunt.pdf.reader import PDFReader
-from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_size
+from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page, render_size
 from datagrunt.pdf.vision import (
     PageRender,
     VisionElements,
@@ -54,10 +54,16 @@ from pdf_tests.test_assembly import (
     NOT_RETURNED,
     after_the_draw,
     appended,
+    binding,
     held_identity,
     identity_of,
     no_draw,
+    not_its_bytes,
     reader_document,
+    rewritten_with_its_own_bytes,
+    rewritten_with_other_bytes,
+    sha256_of,
+    touched,
     writer_document,
 )
 from pdf_tests.test_ocr import fake_tesseract, needs_tesseract, posix_only, tsv
@@ -1059,9 +1065,9 @@ def copied(source: Path, target: Path) -> Path:
 
 
 class TestPageRenderSource:
-    """A PageRender bound to its document's file renders from that file only: checked before and after (#453)."""
+    """A PageRender bound to its document's file renders only the document's bytes: identity, then content (#453)."""
 
-    def render(self, path: Path, identity: object, page_index: int = 0) -> PageRender:
+    def render(self, path: Path, page_index: int = 0, **bound) -> PageRender:
         return PageRender(
             source=path,
             page_index=page_index,
@@ -1069,28 +1075,52 @@ class TestPageRenderSource:
             rotation=0,
             memory_cap_bytes=1 << 30,
             timeout_s=60.0,
-            identity=identity,
+            **bound,
         )
 
-    def test_holds_its_identity_through_a_pickle_and_hides_the_password(self, tmp_path):
-        path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=LINES)])
-        values = TestPageRender().fields(tmp_path, source=path) | {"identity": identity_of(path)}
+    def drawn(self, path: Path, page_index: int = 0) -> tuple:
+        """The page's normalized pixels at 72 DPI and its bands' pixels, as a PageRender there draws them."""
+        page = normalized(render_page(path, page_index, dpi=72, memory_cap_bytes=1 << 30, timeout_s=60.0))
+        return page.pixels, [band.pixels for band in bands(page)]
 
-        loader = PageRender(**values)
+    def loaded(self, loader: PageRender) -> tuple:
+        """What ``loader`` draws: its image's pixels and its bands' pixels."""
+        return decoded(loader.png_bytes())[0], [decoded(band)[0] for band in loader.band_png_bytes()]
+
+    def test_holds_its_identity_and_sha256_through_a_pickle_and_hides_the_password(self, tmp_path):
+        path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=LINES)])
+
+        loader = PageRender(**TestPageRender().fields(tmp_path, source=path), **binding(path))
         copy = pickle.loads(pickle.dumps(loader))
 
         assert copy == loader
-        assert (copy.identity, copy.password) == (identity_of(path), "secret")
+        assert (copy.identity, copy.sha256, copy.password) == (identity_of(path), sha256_of(path), "secret")
         assert "secret" not in repr(copy)
-        assert PageRender(**TestPageRender().fields(tmp_path)).identity is None
+        unbound = PageRender(**TestPageRender().fields(tmp_path))
+        assert (unbound.identity, unbound.sha256) == (None, None)
 
-    def test_rejects_an_identity_that_is_not_a_source_identity(self, tmp_path):
-        with pytest.raises(TypeError, match=re.escape("identity must be a SourceIdentity or None, got dict")):
-            self.render(tmp_path / "doc.pdf", {"inode": 1})
+    @pytest.mark.parametrize(
+        ("bound", "error", "message"),
+        [
+            (
+                {"identity": {"inode": 1}, "sha256": SHA},
+                TypeError,
+                "identity must be a SourceIdentity or None, got dict",
+            ),
+            (
+                {"sha256": SHA},
+                ValueError,
+                "identity and sha256 must both be given or both be None, got only the sha256",
+            ),
+        ],
+    )
+    def test_rejects_a_binding_that_is_not_an_identity_and_its_sha256(self, tmp_path, bound, error, message):
+        with pytest.raises(error, match=f"^{re.escape(message)}"):
+            self.render(tmp_path / "doc.pdf", **bound)
 
     def test_the_file_of_its_identity_draws_its_image_and_bands(self, tmp_path):
         path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=LINES)])
-        loader = self.render(path, identity_of(path))
+        loader = self.render(path, **binding(path))
 
         image, cut = loader.png_bytes(), loader.band_png_bytes()
 
@@ -1098,33 +1128,84 @@ class TestPageRenderSource:
         assert decoded(image) == (page.pixels, 612, 792)
         assert [decoded(band)[0] for band in cut] == [band.pixels for band in bands(page)]
 
+    @pytest.mark.parametrize("field", ["device", "inode", "size", "mtime_ns"])
+    def test_a_file_of_another_identity_holding_the_documents_bytes_draws(self, tmp_path, field):
+        path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=LINES)] * 2)
+        held, _ = held_identity(path, field)
+
+        found = self.loaded(self.render(path, page_index=1, identity=held, sha256=sha256_of(path)))
+
+        assert found == self.drawn(path, 1)
+
+    @pytest.mark.parametrize("change", [touched, rewritten_with_its_own_bytes], ids=["touched", "own-bytes"])
+    def test_its_own_bytes_at_its_path_draw_whatever_the_identity(self, tmp_path, change):
+        path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=LINES)])
+        bound = binding(path)
+        change(path)
+
+        found = self.loaded(self.render(path, **bound))
+
+        assert identity_of(path) != bound["identity"]
+        assert found == self.drawn(path)
+
     @pytest.mark.parametrize("load", LOADS)
-    @pytest.mark.parametrize("field", ["inode", "size", "mtime_ns"])
-    def test_a_file_that_is_not_its_identitys_is_refused_before_it_is_drawn(self, tmp_path, monkeypatch, load, field):
+    def test_other_bytes_of_its_size_are_refused_before_they_are_drawn(self, tmp_path, monkeypatch, load):
+        path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=LINES)] * 2)
+        bound = binding(path)
+        held = bound["identity"]
+        rewritten_with_other_bytes(path)
+        monkeypatch.setattr(_loaders, "render_page", no_draw)
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            getattr(self.render(path, page_index=1, **bound), load)()
+
+        change = f"mtime {held.mtime_ns} -> {identity_of(path).mtime_ns} ns"
+        assert str(caught.value) == not_its_bytes(path, "before page 2's image was drawn", change, bound["sha256"])
+
+    @pytest.mark.parametrize("load", LOADS)
+    @pytest.mark.parametrize("field", ["device", "inode", "size", "mtime_ns"])
+    def test_a_file_of_another_identity_and_other_bytes_is_refused_naming_both(
+        self, tmp_path, monkeypatch, load, field
+    ):
         path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=LINES)] * 2)
         held, change = held_identity(path, field)
         monkeypatch.setattr(_loaders, "render_page", no_draw)
 
         with pytest.raises(PDFSourceChangedError) as caught:
-            getattr(self.render(path, held, page_index=1), load)()
+            getattr(self.render(path, page_index=1, identity=held, sha256=SHA), load)()
 
-        assert str(caught.value) == f"{path} changed before page 2's image was drawn: {change}; {NOT_RETURNED}"
+        assert str(caught.value) == not_its_bytes(path, "before page 2's image was drawn", change, SHA)
 
     @pytest.mark.parametrize("load", LOADS)
     def test_a_file_changed_while_it_is_drawn_is_refused(self, tmp_path, monkeypatch, load):
         path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=LINES)])
-        held = identity_of(path)
+        bound = binding(path)
+        held = bound["identity"]
         after_the_draw(monkeypatch, lambda: appended(path))
 
         changed = f"{path} changed while page 1's image was drawn: size {held.size} -> {held.size + 12} bytes"
         with pytest.raises(PDFSourceChangedError, match=f"^{re.escape(changed)}"):
-            getattr(self.render(path, held), load)()
+            getattr(self.render(path, **bound), load)()
+
+    @pytest.mark.parametrize("load", LOADS)
+    def test_its_own_bytes_swapped_in_while_it_is_drawn_are_refused(self, tmp_path, monkeypatch, load):
+        path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=LINES)])
+        bound = binding(path)
+        held = bound["identity"]
+        after_the_draw(monkeypatch, lambda: rewritten_with_its_own_bytes(path))
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            getattr(self.render(path, **bound), load)()
+
+        now = identity_of(path)
+        change = f"inode {held.device}:{held.inode} -> {now.device}:{now.inode}"
+        assert str(caught.value) == f"{path} changed while page 1's image was drawn: {change}; {NOT_RETURNED}"
 
     @pytest.mark.parametrize("load", LOADS)
     @pytest.mark.parametrize("when", ["before", "while"])
     def test_a_removed_file_is_refused(self, tmp_path, monkeypatch, load, when):
         path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=LINES)])
-        held = identity_of(path)
+        bound = binding(path)
         if when == "before":
             path.unlink()
             monkeypatch.setattr(_loaders, "render_page", no_draw)
@@ -1132,13 +1213,13 @@ class TestPageRenderSource:
             after_the_draw(monkeypatch, path.unlink)
 
         with pytest.raises(PDFSourceChangedError) as caught:
-            getattr(self.render(path, held), load)()
+            getattr(self.render(path, **bound), load)()
 
         assert str(caught.value) == f"{path} was removed {when} page 1's image was drawn; {NOT_RETURNED}"
 
-    def test_without_an_identity_the_file_at_its_path_is_drawn_as_before(self, tmp_path):
+    def test_without_a_binding_the_file_at_its_path_is_drawn_as_before(self, tmp_path):
         path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=LINES)])
-        loader = self.render(path, None)
+        loader = self.render(path)
         os.replace(build_pdf(tmp_path / "other.pdf", [PageSpec(items=(CAPTION,))]), path)
 
         image = loader.png_bytes()
@@ -1153,59 +1234,66 @@ def owners(page: Page) -> list:
     return [loader.__self__ for loader in loaders if loader is not None]
 
 
-class TestVisionPageSource:
-    """vision_page and fallback_page bind their page images to the source identity they are given (#453)."""
+def bound_to(page: Page) -> list:
+    """Each of the page image's loaders' owners: its type, the identity and the sha256 it is bound to."""
+    return [(type(owner), owner.identity, owner.sha256) for owner in owners(page)]
 
-    def test_a_vision_pages_loaders_hold_its_identity(self, scans, tmp_path, monkeypatch):
+
+class TestVisionPageSource:
+    """vision_page and fallback_page bind their page images to the source identity and sha256 they are given (#453)."""
+
+    def test_a_vision_pages_loaders_hold_its_binding(self, scans, tmp_path, monkeypatch):
         path = copied(scans["scan"], tmp_path / "scan.pdf")
         ok_reading(monkeypatch, ())
 
-        bound, unbound = visioned(path, identity=identity_of(path)), visioned(path)
+        bound, unbound = visioned(path, **binding(path)), visioned(path)
 
-        assert [(type(owner), owner.identity) for owner in owners(bound)] == [(PageRender, identity_of(path))] * 2
-        assert [owner.identity for owner in owners(unbound)] == [None, None]
+        assert bound_to(bound) == [(PageRender, identity_of(path), sha256_of(path))] * 2
+        assert bound_to(unbound) == [(PageRender, None, None)] * 2
 
-    def test_an_unread_vision_pages_layout_is_given_its_identity(self, scans, tmp_path, monkeypatch):
+    def test_an_unread_vision_pages_layout_is_given_its_binding(self, scans, tmp_path, monkeypatch):
         path = copied(scans["scan"], tmp_path / "scan.pdf")
         no_tesseract(monkeypatch, tmp_path)
         given = []
         real = vision.assemble_page
 
         def spied(*args, **kwargs):
-            given.append(kwargs.get("identity"))
+            given.append((kwargs.get("identity"), kwargs.get("sha256")))
             return real(*args, **kwargs)
 
         monkeypatch.setattr(vision, "assemble_page", spied)
 
-        page = visioned(path, identity=identity_of(path))
+        page = visioned(path, **binding(path))
 
-        assert (page.status, given) == ("ocr_unavailable", [identity_of(path)])
-        assert [owner.identity for owner in owners(page)] == [identity_of(path)] * 2
+        assert (page.status, given) == ("ocr_unavailable", [(identity_of(path), sha256_of(path))])
+        assert bound_to(page) == [(PageRender, identity_of(path), sha256_of(path))] * 2
 
-    def test_a_fallback_pages_loaders_hold_its_identity(self, scans, tmp_path, monkeypatch):
+    def test_a_fallback_pages_loaders_hold_its_binding(self, scans, tmp_path, monkeypatch):
         path = copied(scans["scan"], tmp_path / "scan.pdf")
         failure = failed_at_text(path, monkeypatch)
         ok_reading(monkeypatch, ())
 
-        page = fell_back(path, failure, identity=identity_of(path))
+        page = fell_back(path, failure, **binding(path))
 
         assert page.status == "ocr_fallback"
-        assert [(type(owner), owner.identity) for owner in owners(page)] == [(PageRender, identity_of(path))] * 2
+        assert bound_to(page) == [(PageRender, identity_of(path), sha256_of(path))] * 2
 
 
 class TestRenderedPageImageSource:
-    """A vision page of a document read from a PDF path draws its image and bands from that file, or refuses (#453)."""
+    """A vision page of a document read from a PDF path draws its image and bands only from the document's bytes."""
 
     @pytest.mark.parametrize("extracted", [reader_document, writer_document])
-    def test_every_page_image_holds_the_identity_of_the_file_read(self, scans, tmp_path, extracted):
+    def test_every_page_image_holds_the_identity_and_sha256_of_the_file_read(self, scans, tmp_path, extracted):
         scan = RasterImage(0.0, 0.0, *LETTER, png_of(rendered(scans["scan"])))
         path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=LINES), PageSpec(items=(scan,))])
 
         document = extracted(path)
 
         assert [page.route for page in document.pages] == ["digital", "vision"]
-        found = [(type(owner), owner.identity) for page in document.pages for owner in owners(page)]
-        assert found == [(_loaders.PageDraw, identity_of(path))] + [(PageRender, identity_of(path))] * 2
+        found = [entry for page in document.pages for entry in bound_to(page)]
+        held = (identity_of(path), document.metadata.sha256)
+        assert document.metadata.sha256 == sha256_of(path)
+        assert found == [(_loaders.PageDraw, *held)] + [(PageRender, *held)] * 2
 
     def test_a_vision_page_image_of_the_file_read_draws(self, scans, tmp_path):
         path = copied(scans["scan"], tmp_path / "scan.pdf")
@@ -1216,9 +1304,22 @@ class TestRenderedPageImageSource:
         assert decoded(image.read_bytes())[1:] == (image.width_px, image.height_px)
         assert len(image.read_bands()) >= 1
 
+    @pytest.mark.parametrize("change", [touched, rewritten_with_its_own_bytes], ids=["touched", "own-bytes"])
+    def test_a_vision_page_image_of_the_documents_bytes_draws_whatever_the_identity(self, scans, tmp_path, change):
+        path = copied(scans["scan"], tmp_path / "scan.pdf")
+        image = PDFReader(path).document.pages[0].page_image
+        before = (image.read_bytes(), image.read_bands())
+        held = identity_of(path)
+
+        change(path)
+
+        assert identity_of(path) != held
+        assert (image.read_bytes(), image.read_bands()) == before
+
     def test_a_vision_page_image_of_a_file_replaced_since_is_refused(self, scans, tmp_path):
         path = copied(scans["scan"], tmp_path / "scan.pdf")
-        page = PDFReader(path).document.pages[0]
+        document = PDFReader(path).document
+        page = document.pages[0]
         held = identity_of(path)
 
         os.replace(copied(scans["captioned"], tmp_path / "other.pdf"), path)
@@ -1226,9 +1327,28 @@ class TestRenderedPageImageSource:
         now = identity_of(path)
         assert page.route == "vision"
         replaced = f"{path} changed before page 1's image was drawn: inode {held.device}:{held.inode} -> "
+        mismatch = f"its bytes are not the document's (sha256 {sha256_of(path)}, not {document.metadata.sha256})"
         for load in (page.page_image.read_bytes, page.page_image.read_bands):
-            with pytest.raises(PDFSourceChangedError, match=f"^{re.escape(replaced)}{now.device}:{now.inode}"):
+            with pytest.raises(
+                PDFSourceChangedError, match=f"^{re.escape(replaced)}{now.device}:{now.inode}"
+            ) as caught:
                 load()
+            assert str(caught.value).endswith(f"; {mismatch}; {NOT_RETURNED}")
+
+    @pytest.mark.parametrize("load", ["read_bytes", "read_bands"])
+    def test_a_vision_page_image_of_other_bytes_of_its_size_is_refused(self, scans, tmp_path, monkeypatch, load):
+        path = copied(scans["scan"], tmp_path / "scan.pdf")
+        document = PDFReader(path).document
+        held = identity_of(path)
+        rewritten_with_other_bytes(path)
+        monkeypatch.setattr(_loaders, "render_page", no_draw)
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            getattr(document.pages[0].page_image, load)()
+
+        change = f"mtime {held.mtime_ns} -> {identity_of(path).mtime_ns} ns"
+        expected = not_its_bytes(path, "before page 1's image was drawn", change, document.metadata.sha256)
+        assert str(caught.value) == expected
 
 
 # The page whose extraction failed (task 4): its geometry, then render + OCR; else an error page.
