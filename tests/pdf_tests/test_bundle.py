@@ -12,6 +12,7 @@ failing stage is a ``monkeypatch`` of the bundle's module name for it.
 import dataclasses
 import hashlib
 import importlib.metadata
+import io
 import json
 import os
 import re
@@ -207,7 +208,7 @@ def manifest_of(out: Path) -> dict:
     return json.loads((out / "manifest.json").read_text(encoding="ascii"))
 
 
-def png_pixels(path: Path) -> tuple[str, tuple[int, int], bytes]:
+def png_pixels(path: Path | io.BytesIO) -> tuple[str, tuple[int, int], bytes]:
     with Image.open(path) as image:
         return image.mode, image.size, image.tobytes()
 
@@ -957,11 +958,10 @@ class TestVisionRoute:
 
         written = write_bundle(document, tmp_path / "out", source=path)
 
-        with pytest.raises(PDFSourceChangedError):  # the document's own loaders refuse the file now at its path
-            image.read_bytes()
         mine = written.pages[0].page_image
         assert manifest_of(tmp_path / "out")["missing"] == []
         assert (mine.image_path.read_bytes(), tuple(band.read_bytes() for band in mine.band_paths)) == own
+        assert (image.read_bytes(), image.read_bands()) == own  # the document's own loaders: its bytes are there
 
     def test_a_digital_page_still_renders_at_dpi(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "text.pdf", [PageSpec(items=tuple(body_text(100.0)))])
@@ -1089,12 +1089,13 @@ class TestDrawnPageImages:
 
         written = write_bundle(document, tmp_path / "out", source=path, dpi=write_dpi)
 
-        with pytest.raises(PDFSourceChangedError):  # the document's own draw refuses the file now at its path
-            document.pages[0].page_image.read_bytes()
         assert manifest_of(tmp_path / "out")["missing"] == []
         drawn = render_page(path, 0, dpi=write_dpi, memory_cap_bytes=CAP, timeout_s=TIMEOUT)
         size = (drawn.px_width, drawn.px_height)
         assert png_pixels(written.pages[0].page_image.image_path) == ("L", size, drawn.pixels)
+        own = render_page(path, 0, dpi=200, memory_cap_bytes=CAP, timeout_s=TIMEOUT)  # the document's own draw's
+        found = png_pixels(io.BytesIO(document.pages[0].page_image.read_bytes()))  # its bytes are there: it draws
+        assert found == ("L", (own.px_width, own.px_height), own.pixels)
 
     def test_a_drawn_image_at_the_writes_dpi_is_read_through_its_own_loader(self, tmp_path, monkeypatch):
         path = digital_pdf(tmp_path)

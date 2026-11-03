@@ -12,6 +12,7 @@ import io
 import os
 import pickle
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -19,7 +20,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from datagrunt.pdf import _loaders, assembly, layout
+from datagrunt.pdf import _loaders, _source, assembly, layout
 from datagrunt.pdf._loaders import FigureRead
 from datagrunt.pdf.assembly import (
     FigureDraft,
@@ -757,6 +758,8 @@ class TestPageDraw:
 
 # Why a page image of a file that is not its document's is refused: the end of each PDFSourceChangedError (#453).
 NOT_RETURNED = "the page image and the document's pages could disagree, so it is not returned"
+# A source identity that names no file: a binding's fields checked at construction.
+SOME_IDENTITY = SourceIdentity(device=1, inode=2, size=3, mtime_ns=4)
 
 
 def identity_of(path: Path) -> SourceIdentity:
@@ -764,20 +767,74 @@ def identity_of(path: Path) -> SourceIdentity:
     return SourceIdentity.of(os.stat(path))
 
 
+def sha256_of(path: Path) -> str:
+    """The SHA-256 of the bytes of the file at ``path`` now."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def binding(path: Path) -> dict:
+    """The file at ``path`` now, as a page image's loaders are bound to it: its identity and its bytes' sha256."""
+    return {"identity": identity_of(path), "sha256": sha256_of(path)}
+
+
 def held_identity(path: Path, field: str) -> tuple[SourceIdentity, str]:
-    """An identity of ``path`` whose ``field`` (``inode``, ``size``, ``mtime_ns``) is one off; its change, in words."""
+    """An identity of ``path`` whose ``field`` (``device``, ``inode``, ``size``, ``mtime_ns``) is one off; its change.
+
+    A ``device`` one off is the file read on another host (``st_dev`` is the host's own): its change is the inode's.
+    """
     now = identity_of(path)
     held = dataclasses.replace(now, **{field: getattr(now, field) + 1})
+    inode = f"inode {held.device}:{held.inode} -> {now.device}:{now.inode}"
     words = {
-        "inode": f"inode {held.device}:{held.inode} -> {now.device}:{now.inode}",
+        "device": inode,
+        "inode": inode,
         "size": f"size {held.size} -> {now.size} bytes",
         "mtime_ns": f"mtime {held.mtime_ns} -> {now.mtime_ns} ns",
     }
     return held, words[field]
 
 
+def not_its_bytes(path: Path, when: str, change: str, expected: str) -> str:
+    """The PDFSourceChangedError of a draw ``when`` of the file at ``path``: ``change``, its bytes not ``expected``."""
+    found = f"its bytes are not the document's (sha256 {sha256_of(path)}, not {expected})"
+    return f"{path} changed {when}: {change}; {found}; {NOT_RETURNED}"
+
+
+def touched(path: Path) -> None:
+    """Move ``path``'s mtime on a second, whatever the clock's grain: its bytes and inode are as they were."""
+    status = os.stat(path)
+    os.utime(path, ns=(status.st_atime_ns, status.st_mtime_ns + 1_000_000_000))
+
+
+def rewritten_with_its_own_bytes(path: Path) -> None:
+    """Put another file of ``path``'s own bytes and mtime at ``path`` (a checkout, a sync): only its inode changes."""
+    copy = path.with_name(f"{path.stem}-copy{path.suffix}")
+    shutil.copy2(path, copy)
+    os.replace(copy, path)
+
+
+def rewritten_with_other_bytes(path: Path) -> None:
+    """Rewrite ``path`` in place with another last byte, then move its mtime on: its size and inode are as they were."""
+    data = path.read_bytes()
+    path.write_bytes(data[:-1] + (b"\n" if data.endswith(b" ") else b" "))
+    touched(path)
+
+
 def no_draw(*args, **kwargs):
     raise AssertionError("the page was drawn")
+
+
+def hashes(monkeypatch) -> list[Path]:
+    """Record each path the loaders hash (through ``_stream_sha256``), and let it hash."""
+    hashed: list[Path] = []
+    real = _loaders._stream_sha256
+
+    def recorded(stream, size, path):
+        hashed.append(path)
+        return real(stream, size, path)
+
+    monkeypatch.setattr(_loaders, "_stream_sha256", recorded)
+    return hashed
 
 
 def after_the_draw(monkeypatch, change) -> None:
@@ -798,88 +855,234 @@ def appended(path: Path) -> None:
         stream.write(b"\n% appended\n")
 
 
-class TestPageDrawSource:
-    """A PageDraw bound to its document's file draws from that file only: checked before and after each draw (#453)."""
+def drawn_at_72(path: Path, page_index: int = 0) -> bytes:
+    """The pixels of page ``page_index`` of ``path`` drawn at 72 DPI, as a PageDraw there draws them."""
+    return render_page(path, page_index, dpi=72, memory_cap_bytes=RENDER_CAP, timeout_s=RENDER_TIMEOUT).pixels
 
-    def draw(self, path: Path, identity: object, page_index: int = 0) -> _loaders.PageDraw:
+
+class TestPageDrawSource:
+    """A PageDraw bound to its document's file draws only the document's bytes: identity first, then content (#453)."""
+
+    def draw(self, path: Path, page_index: int = 0, **bound) -> _loaders.PageDraw:
         return _loaders.PageDraw(
-            source=path, page_index=page_index, dpi=72, width_pt=LETTER_W, height_pt=LETTER_H, identity=identity
+            source=path, page_index=page_index, dpi=72, width_pt=LETTER_W, height_pt=LETTER_H, **bound
         )
 
-    def test_holds_its_identity_through_a_pickle_and_hides_the_password(self, tmp_path):
+    def test_holds_its_identity_and_sha256_through_a_pickle_and_hides_the_password(self, tmp_path):
         path = letter(tmp_path, *body_text(100.0))
-        values = TestPageDraw().fields(tmp_path, source=path) | {"identity": identity_of(path)}
 
-        draw = _loaders.PageDraw(**values)
+        draw = _loaders.PageDraw(**TestPageDraw().fields(tmp_path, source=path), **binding(path))
         copy = pickle.loads(pickle.dumps(draw))
 
         assert copy == draw
-        assert (copy.identity, copy.password) == (identity_of(path), "secret")
+        assert (copy.identity, copy.sha256, copy.password) == (identity_of(path), sha256_of(path), "secret")
         assert "secret" not in repr(copy)
-        assert _loaders.PageDraw(**TestPageDraw().fields(tmp_path)).identity is None
+        unbound = _loaders.PageDraw(**TestPageDraw().fields(tmp_path))
+        assert (unbound.identity, unbound.sha256) == (None, None)
 
-    def test_rejects_an_identity_that_is_not_a_source_identity(self, tmp_path):
-        with pytest.raises(TypeError, match=re.escape("identity must be a SourceIdentity or None, got tuple")):
-            self.draw(tmp_path / "doc.pdf", (1, 2, 3, 4))
+    @pytest.mark.parametrize(
+        ("bound", "error", "message"),
+        [
+            (
+                {"identity": (1, 2, 3, 4), "sha256": SHA},
+                TypeError,
+                "identity must be a SourceIdentity or None, got tuple",
+            ),
+            ({"identity": SOME_IDENTITY, "sha256": 7}, TypeError, "sha256 must be a str, got 7 (int)"),
+            ({"identity": SOME_IDENTITY, "sha256": "F" * 64}, ValueError, "sha256 must be 64 lowercase hex characters"),
+            (
+                {"identity": SOME_IDENTITY},
+                ValueError,
+                "identity and sha256 must both be given or both be None, got only the identity",
+            ),
+            (
+                {"sha256": SHA},
+                ValueError,
+                "identity and sha256 must both be given or both be None, got only the sha256",
+            ),
+        ],
+    )
+    def test_rejects_a_binding_that_is_not_an_identity_and_its_sha256(self, tmp_path, bound, error, message):
+        with pytest.raises(error, match=f"^{re.escape(message)}"):
+            self.draw(tmp_path / "doc.pdf", **bound)
 
-    def test_the_file_of_its_identity_draws(self, tmp_path):
+    def test_the_file_of_its_identity_draws_without_being_hashed(self, tmp_path, monkeypatch):
         path = letter(tmp_path, *body_text(100.0))
+        hashed = hashes(monkeypatch)
 
-        data = self.draw(path, identity_of(path)).png_bytes()
+        data = self.draw(path, **binding(path)).png_bytes()
 
-        drawn = render_page(path, 0, dpi=72, memory_cap_bytes=RENDER_CAP, timeout_s=RENDER_TIMEOUT)
-        assert grey_png(data) == ("PNG", "L", (612, 792), drawn.pixels)
+        assert grey_png(data) == ("PNG", "L", (612, 792), drawn_at_72(path))
+        assert hashed == []
 
-    @pytest.mark.parametrize("field", ["inode", "size", "mtime_ns"])
-    def test_a_file_that_is_not_its_identitys_is_refused_before_it_is_drawn(self, tmp_path, monkeypatch, field):
+    @pytest.mark.parametrize("field", ["device", "inode", "size", "mtime_ns"])
+    def test_a_file_of_another_identity_holding_the_documents_bytes_draws(self, tmp_path, monkeypatch, field):
+        path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=tuple(body_text(100.0)))] * 2)
+        held, _ = held_identity(path, field)
+        hashed = hashes(monkeypatch)
+
+        data = self.draw(path, page_index=1, identity=held, sha256=sha256_of(path)).png_bytes()
+
+        assert grey_png(data) == ("PNG", "L", (612, 792), drawn_at_72(path, 1))
+        assert hashed == [path]  # the content decided, once
+
+    @pytest.mark.parametrize("change", [touched, rewritten_with_its_own_bytes], ids=["touched", "own-bytes"])
+    def test_its_own_bytes_at_its_path_draw_whatever_the_identity(self, tmp_path, change):
+        path = letter(tmp_path, *body_text(100.0))
+        bound = binding(path)
+        change(path)
+
+        data = self.draw(path, **bound).png_bytes()
+
+        assert identity_of(path) != bound["identity"]
+        assert grey_png(data) == ("PNG", "L", (612, 792), drawn_at_72(path))
+
+    def test_other_bytes_of_its_size_are_refused_before_they_are_drawn(self, tmp_path, monkeypatch):
+        path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=tuple(body_text(100.0)))] * 2)
+        bound = binding(path)
+        held = bound["identity"]
+        rewritten_with_other_bytes(path)
+        now = identity_of(path)
+        monkeypatch.setattr(_loaders, "render_page", no_draw)
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            self.draw(path, page_index=1, **bound).png_bytes()
+
+        assert (now.inode, now.size) == (held.inode, held.size)
+        change = f"mtime {held.mtime_ns} -> {now.mtime_ns} ns"
+        assert str(caught.value) == not_its_bytes(path, "before page 2's image was drawn", change, bound["sha256"])
+
+    @pytest.mark.parametrize("field", ["device", "inode", "size", "mtime_ns"])
+    def test_a_file_of_another_identity_and_other_bytes_is_refused_naming_both(self, tmp_path, monkeypatch, field):
         path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=tuple(body_text(100.0)))] * 2)
         held, change = held_identity(path, field)
         monkeypatch.setattr(_loaders, "render_page", no_draw)
 
         with pytest.raises(PDFSourceChangedError) as caught:
-            self.draw(path, held, page_index=1).png_bytes()
+            self.draw(path, page_index=1, identity=held, sha256=SHA).png_bytes()
 
-        assert str(caught.value) == f"{path} changed before page 2's image was drawn: {change}; {NOT_RETURNED}"
+        assert str(caught.value) == not_its_bytes(path, "before page 2's image was drawn", change, SHA)
 
     def test_a_file_changed_while_it_is_drawn_is_refused(self, tmp_path, monkeypatch):
         path = letter(tmp_path, *body_text(100.0))
-        held = identity_of(path)
+        bound = binding(path)
+        held = bound["identity"]
         after_the_draw(monkeypatch, lambda: appended(path))
 
         changed = f"{path} changed while page 1's image was drawn: size {held.size} -> {held.size + 12} bytes"
         with pytest.raises(PDFSourceChangedError, match=f"^{re.escape(changed)}"):
-            self.draw(path, held).png_bytes()
+            self.draw(path, **bound).png_bytes()
+
+    def test_its_own_bytes_swapped_in_while_it_is_drawn_are_refused(self, tmp_path, monkeypatch):
+        # After the render nothing is hashed: the file drawn must be the file stat'ed before it.
+        path = letter(tmp_path, *body_text(100.0))
+        bound = binding(path)
+        held = bound["identity"]
+        after_the_draw(monkeypatch, lambda: rewritten_with_its_own_bytes(path))
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            self.draw(path, **bound).png_bytes()
+
+        now = identity_of(path)
+        change = f"inode {held.device}:{held.inode} -> {now.device}:{now.inode}"
+        assert str(caught.value) == f"{path} changed while page 1's image was drawn: {change}; {NOT_RETURNED}"
+
+    def test_a_touched_file_changed_while_it_is_drawn_is_refused(self, tmp_path, monkeypatch):
+        # The touch is the content's to decide, before the render; the change during it is refused after it.
+        path = letter(tmp_path, *body_text(100.0))
+        bound = binding(path)
+        touched(path)
+        size = identity_of(path).size
+        after_the_draw(monkeypatch, lambda: appended(path))
+
+        changed = f"{path} changed while page 1's image was drawn: size {size} -> {size + 12} bytes"
+        with pytest.raises(PDFSourceChangedError, match=f"^{re.escape(changed)}"):
+            self.draw(path, **bound).png_bytes()
+
+    def test_a_file_replaced_between_its_stat_and_its_hash_is_refused(self, tmp_path, monkeypatch):
+        # The file hashed must be the file stat'ed (its fstat): even its own bytes, swapped in between, are refused.
+        path = letter(tmp_path, *body_text(100.0))
+        bound = binding(path)
+        touched(path)
+        stated = identity_of(path)
+        real = _loaders._opened_source
+
+        def swapped_then_opened(source):
+            rewritten_with_its_own_bytes(source)
+            return real(source)
+
+        monkeypatch.setattr(_loaders, "_opened_source", swapped_then_opened)
+        monkeypatch.setattr(_loaders, "render_page", no_draw)
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            self.draw(path, **bound).png_bytes()
+
+        now = identity_of(path)
+        change = f"inode {stated.device}:{stated.inode} -> {now.device}:{now.inode}"
+        assert str(caught.value) == f"{path} changed before page 1's image was drawn: {change}; {NOT_RETURNED}"
+
+    def test_a_file_removed_between_its_stat_and_its_hash_is_refused(self, tmp_path, monkeypatch):
+        path = letter(tmp_path, *body_text(100.0))
+        bound = binding(path)
+        touched(path)
+        real = _loaders._opened_source
+
+        def removed_then_opened(source):
+            source.unlink()
+            return real(source)
+
+        monkeypatch.setattr(_loaders, "_opened_source", removed_then_opened)
+        monkeypatch.setattr(_loaders, "render_page", no_draw)
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            self.draw(path, **bound).png_bytes()
+
+        assert str(caught.value) == f"{path} was removed before page 1's image was drawn; {NOT_RETURNED}"
+
+    def test_a_file_cut_short_while_it_is_hashed_is_refused(self, tmp_path, monkeypatch):
+        path = letter(tmp_path, *body_text(100.0))
+        bound = binding(path)
+        touched(path)
+        monkeypatch.setattr(_source, "_read_chunk", lambda stream, size: b"")
+        monkeypatch.setattr(_loaders, "render_page", no_draw)
+
+        with pytest.raises(PDFSourceChangedError) as caught:
+            self.draw(path, **bound).png_bytes()
+
+        short = f"{path} changed while it was hashed: 0 of its {identity_of(path).size} bytes could be read"
+        assert str(caught.value) == f"{short} before page 1's image was drawn; {NOT_RETURNED}"
 
     def test_a_file_removed_before_it_is_drawn_is_refused(self, tmp_path, monkeypatch):
         path = letter(tmp_path, *body_text(100.0))
-        held = identity_of(path)
+        bound = binding(path)
         path.unlink()
         monkeypatch.setattr(_loaders, "render_page", no_draw)
 
         with pytest.raises(PDFSourceChangedError) as caught:
-            self.draw(path, held).png_bytes()
+            self.draw(path, **bound).png_bytes()
 
         assert str(caught.value) == f"{path} was removed before page 1's image was drawn; {NOT_RETURNED}"
 
     def test_a_file_removed_while_it_is_drawn_is_refused(self, tmp_path, monkeypatch):
         path = letter(tmp_path, *body_text(100.0))
-        held = identity_of(path)
+        bound = binding(path)
         after_the_draw(monkeypatch, path.unlink)
 
         with pytest.raises(PDFSourceChangedError) as caught:
-            self.draw(path, held).png_bytes()
+            self.draw(path, **bound).png_bytes()
 
         assert str(caught.value) == f"{path} was removed while page 1's image was drawn; {NOT_RETURNED}"
 
-    def test_without_an_identity_the_file_at_its_path_is_drawn_as_before(self, tmp_path):
+    def test_without_a_binding_the_file_at_its_path_is_drawn_as_before(self, tmp_path, monkeypatch):
         path = letter(tmp_path, *body_text(100.0))
-        draw = self.draw(path, None)
+        draw = self.draw(path)
         os.replace(letter(tmp_path, *mixed_items(), name="other.pdf"), path)
+        hashed = hashes(monkeypatch)
 
         data = draw.png_bytes()
 
-        drawn = render_page(path, 0, dpi=72, memory_cap_bytes=RENDER_CAP, timeout_s=RENDER_TIMEOUT)
-        assert grey_png(data)[3] == drawn.pixels
+        assert grey_png(data)[3] == drawn_at_72(path)
+        assert hashed == []
 
 
 class TestPageImage:
@@ -934,13 +1137,14 @@ class TestPageImage:
         draw = image._loader.__self__
         assert (image.page_number, draw.page_index, draw.password) == (2, 1, "secret")
 
-    def test_the_draw_holds_the_source_identity_it_is_given(self, tmp_path):
+    def test_the_draw_holds_the_source_identity_and_sha256_it_is_given(self, tmp_path):
         path = letter(tmp_path, *mixed_items())
 
-        bound, unbound = assembled(path, identity=identity_of(path)), assembled(path)
+        bound, unbound = assembled(path, **binding(path)), assembled(path)
 
-        assert bound.page_image._loader.__self__.identity == identity_of(path)
-        assert unbound.page_image._loader.__self__.identity is None
+        draw, bare = bound.page_image._loader.__self__, unbound.page_image._loader.__self__
+        assert (draw.identity, draw.sha256) == (identity_of(path), sha256_of(path))
+        assert (bare.identity, bare.sha256) == (None, None)
 
     def test_a_turned_page_is_drawn_as_displayed(self, tmp_path):
         image = assembled(letter(tmp_path, *mixed_items(), rotate=90)).page_image
@@ -995,17 +1199,18 @@ def writer_document(path: Path):
 
 
 class TestDrawnPageImageSource:
-    """A document read from a PDF path draws its pages' images from that file, or refuses (#453)."""
+    """A document read from a PDF path draws its pages' images only while the file there holds its bytes (#453)."""
 
     @pytest.mark.parametrize("extracted", [reader_document, writer_document])
-    def test_every_page_image_holds_the_identity_of_the_file_read(self, tmp_path, extracted):
+    def test_every_page_image_holds_the_identity_and_sha256_of_the_file_read(self, tmp_path, extracted):
         path = two_pages(tmp_path / "doc.pdf", "Alpha document text", 100.0)
 
         document = extracted(path)
 
         draws = [page.page_image._loader.__self__ for page in document.pages]
         assert [type(draw) for draw in draws] == [_loaders.PageDraw] * 2
-        assert [draw.identity for draw in draws] == [identity_of(path)] * 2
+        assert document.metadata.sha256 == sha256_of(path)
+        assert [(draw.identity, draw.sha256) for draw in draws] == [(identity_of(path), sha256_of(path))] * 2
 
     def test_a_page_image_of_the_file_read_draws(self, tmp_path):
         path = two_pages(tmp_path / "doc.pdf", "Alpha document text", 100.0)
@@ -1016,31 +1221,51 @@ class TestDrawnPageImageSource:
         drawn = render_page(path, 1, dpi=200, memory_cap_bytes=RENDER_CAP, timeout_s=RENDER_TIMEOUT)
         assert grey_png(data) == ("PNG", "L", (1700, 2200), drawn.pixels)
 
-    def test_a_page_image_of_a_file_replaced_since_is_refused(self, tmp_path):
+    @pytest.mark.parametrize("extracted", [reader_document, writer_document])
+    @pytest.mark.parametrize("change", [touched, rewritten_with_its_own_bytes], ids=["touched", "own-bytes"])
+    def test_a_page_image_of_the_documents_bytes_draws_whatever_the_identity(self, tmp_path, extracted, change):
+        path = two_pages(tmp_path / "doc.pdf", "Alpha document text", 100.0)
+        document = extracted(path)
+        held = identity_of(path)
+
+        change(path)
+
+        data = document.pages[1].page_image.read_bytes()
+        drawn = render_page(path, 1, dpi=200, memory_cap_bytes=RENDER_CAP, timeout_s=RENDER_TIMEOUT)
+        assert identity_of(path) != held
+        assert grey_png(data) == ("PNG", "L", (1700, 2200), drawn.pixels)
+
+    @pytest.mark.parametrize("extracted", [reader_document, writer_document])
+    def test_a_page_image_of_a_file_replaced_since_is_refused(self, tmp_path, extracted):
         path = two_pages(tmp_path / "doc.pdf", "Alpha document text", 100.0)
         other = two_pages(tmp_path / "other.pdf", "Bravo other words entirely", 400.0)
-        document = PDFReader(path).document
+        document = extracted(path)
         held = identity_of(path)
 
         os.replace(other, path)
 
         now = identity_of(path)
         replaced = f"{path} changed before page 2's image was drawn: inode {held.device}:{held.inode} -> "
-        with pytest.raises(PDFSourceChangedError, match=f"^{re.escape(replaced)}{now.device}:{now.inode}"):
+        with pytest.raises(PDFSourceChangedError, match=f"^{re.escape(replaced)}{now.device}:{now.inode}") as caught:
             document.pages[1].page_image.read_bytes()
+        mismatch = f"its bytes are not the document's (sha256 {sha256_of(path)}, not {document.metadata.sha256})"
+        assert str(caught.value).endswith(f"; {mismatch}; {NOT_RETURNED}")
         assert [element.text for element in document.pages[1].elements] == ["Alpha document text"]
 
-    def test_a_page_image_of_a_file_touched_since_is_refused(self, tmp_path):
+    @pytest.mark.parametrize("extracted", [reader_document, writer_document])
+    def test_a_page_image_of_other_bytes_of_its_size_is_refused(self, tmp_path, extracted, monkeypatch):
         path = two_pages(tmp_path / "doc.pdf", "Alpha document text", 100.0)
-        document = PDFReader(path).document
+        document = extracted(path)
         held = identity_of(path)
+        rewritten_with_other_bytes(path)
+        monkeypatch.setattr(_loaders, "render_page", no_draw)
 
-        os.utime(path, ns=(held.mtime_ns, held.mtime_ns + 1_000_000_000))
-
-        moved = f"mtime {held.mtime_ns} -> {held.mtime_ns + 1_000_000_000} ns"
         with pytest.raises(PDFSourceChangedError) as caught:
             document.pages[0].page_image.read_bytes()
-        assert str(caught.value) == f"{path} changed before page 1's image was drawn: {moved}; {NOT_RETURNED}"
+
+        change = f"mtime {held.mtime_ns} -> {identity_of(path).mtime_ns} ns"
+        expected = not_its_bytes(path, "before page 1's image was drawn", change, document.metadata.sha256)
+        assert str(caught.value) == expected
 
 
 class TestFormHeaders:

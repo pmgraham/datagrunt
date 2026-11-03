@@ -345,6 +345,7 @@ def _step_four(
             source=source.path,
             password=source.password,
             identity=source.identity,
+            sha256=source.sha256,
             ocr=options.ocr,
             options=vision,
         )
@@ -382,6 +383,7 @@ def _routed(raw: RawPage, assessment: PageAssessment, source: PDFSource, options
             source=source.path,
             password=source.password,
             identity=source.identity,
+            sha256=source.sha256,
             min_image_dimension=options.min_image_dimension,
             options=pipeline._vision(options),
         )
@@ -398,6 +400,7 @@ def _assembled_page(raw: RawPage, assessment: PageAssessment, source: PDFSource,
         source=source.path,
         password=source.password,
         identity=source.identity,
+        sha256=source.sha256,
         min_image_dimension=options.min_image_dimension,
         dpi=options.dpi,
         max_render_pixels=options.max_render_pixels,

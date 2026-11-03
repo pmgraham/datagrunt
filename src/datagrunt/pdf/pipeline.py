@@ -69,7 +69,8 @@ document's:
    links, sections and header context.
 7. The A1 :class:`~datagrunt.pdf.elements.PDFDocument`. Its metadata:
    ``source_name`` is the file's name; ``sha256`` is streamed over the
-   file's bytes in chunks of :data:`_HASH_CHUNK_BYTES`; ``title`` and
+   file's bytes in chunks of
+   :data:`~datagrunt.pdf._source._HASH_CHUNK_BYTES`; ``title`` and
    ``author`` are A2's :func:`~datagrunt.pdf.pdfium_engine.document_metadata`,
    read by the first page worker; ``doc_id`` is
    :meth:`~datagrunt.pdf.elements.DocumentMetadata.make_doc_id`.
@@ -89,8 +90,8 @@ to start a worker raises its OSError. The pool is bounded and always ends:
   render and figure workers share (:mod:`datagrunt.pdf._process`, worker
   key ``"pages"``): it never imports the caller's main module, so a caller's
   script runs once, however it is written, with or without a ``__main__``
-  guard. Its request (the source, the password, the file's identity, its
-  pages, the options and its memory cap) is JSON on its stdin. Each worker
+  guard. Its request (the source, the password, the file's identity and
+  sha256, its pages, the options and its memory cap) is JSON on its stdin. Each worker
   caps its own memory, at the vision route's cap
   (``VisionOptions.memory_cap_bytes``), before it opens the PDF.
 - The first worker opens the document first: its first reply is the
@@ -181,7 +182,10 @@ this cannot see: a write that keeps the size and restores the mtime, or the
 path swapped away and back in the moment between pdfium's open and the
 check that follows it (each is a deliberate race on the caller's own
 directory). A figure's loader reopens the path later and verifies each
-image's own SHA-256 when it reads.
+image's own SHA-256 when it reads. A page image's loaders hold the
+identity and the hash (the worker's ``PDFSource`` carries both): each draw
+of a file of another identity hashes it, and draws it only when its bytes
+are the document's (:mod:`datagrunt.pdf._loaders`).
 
 An error page (A1: no elements, no quality, never verified) is routed
 ``"vision"``, the spec's route for a page whose extraction fails (render
@@ -194,8 +198,6 @@ that ended its worker has that default size: it was never read here.
 """
 
 import dataclasses
-import errno
-import hashlib
 import json
 import os
 import pickle
@@ -206,7 +208,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, BinaryIO, NamedTuple, get_args
+from typing import IO, NamedTuple, get_args
 
 from datagrunt.pdf._memory_cap import ending
 from datagrunt.pdf._options import DPI, MAX_RENDER_PIXELS, MIN_IMAGE_DIMENSION, OcrMode, VisionOptions
@@ -225,7 +227,7 @@ from datagrunt.pdf._process import (
     start_worker,
     worker_command,
 )
-from datagrunt.pdf._source import SourceIdentity
+from datagrunt.pdf._source import SourceIdentity, _opened_source, _stream_sha256, check_binding
 from datagrunt.pdf._validate import checked_password, checked_path, choice_str, int_at_least, strict_bool
 from datagrunt.pdf.elements import _MAX_ASSET_BYTES, DocumentMetadata, Page, PDFDocument
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFSourceChangedError
@@ -239,9 +241,6 @@ _OCR_MODES: tuple[OcrMode, ...] = get_args(OcrMode)
 # pdfium's own default page size (US Letter), as it reads an empty MediaBox: an error page's size when its own
 # cannot be read.
 _DEFAULT_PAGE_SIZE = (612.0, 792.0)
-
-# The source is hashed in reads of at most this many bytes.
-_HASH_CHUNK_BYTES = 1 << 20
 
 # Environment variables that mark a distributed runner (Spark, Beam, Flink, Celery): v4's
 # ``core.pdf_io.engines._is_distributed_env``, ported.
@@ -263,7 +262,7 @@ _EXIT_GRACE_S = 1.0  # a worker whose replies ended without its pages is given t
 _FACTS, _STARTED, _PAGE, _DONE, _ERROR = b"F", b"S", b"P", b"D", b"E"
 _INDEX = struct.Struct("<Q")
 _MAX_PAGE_MESSAGE_BYTES = _MAX_ASSET_BYTES
-_CHUNK_REQUEST_KEYS = ("source", "password", "identity", "pages", "workers", "options", "memory_cap_bytes")
+_CHUNK_REQUEST_KEYS = ("source", "password", "identity", "sha256", "pages", "workers", "options", "memory_cap_bytes")
 # A chunk's pages are page ranges: one at first, and after a page ends its worker, the rest of the unsent pages. They
 # lie in at most two windows, so a chunk is at most this many ranges.
 _MAX_CHUNK_RANGES = 64
@@ -344,23 +343,29 @@ class PDFSource:
         identity: The identity of the file the document's hash was read
             through; every opening of ``path`` is checked against it. None
             checks nothing (a caller that hashed nothing).
+        sha256: The document's sha256, the hash read through ``identity``'s
+            file: given with ``identity`` or not at all. The page images
+            hold both: a draw of a file of another identity is made only
+            when its bytes hash to it (:mod:`datagrunt.pdf._loaders`).
 
     Raises:
         TypeError: If ``path`` is not a str or os.PathLike of str,
-            ``password`` is not a str or None, or ``identity`` is not a
-            SourceIdentity or None.
-        ValueError: If ``password`` contains NUL.
+            ``password`` is not a str or None, ``identity`` is not a
+            SourceIdentity or None, or ``sha256`` not a str or None.
+        ValueError: If ``password`` contains NUL, ``sha256`` is not 64
+            lowercase hex characters, or only one of ``identity`` and
+            ``sha256`` is given.
     """
 
     path: Path
     password: str | None = field(default=None, repr=False, compare=False)
     identity: SourceIdentity | None = None
+    sha256: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "path", checked_path(self.path, "source").absolute())
         checked_password(self.password)
-        if self.identity is not None and not isinstance(self.identity, SourceIdentity):
-            raise TypeError(f"identity must be a SourceIdentity or None, got {type(self.identity).__name__}")
+        check_binding(self.identity, self.sha256)
 
 
 class Facts(NamedTuple):
@@ -421,7 +426,7 @@ def extract_document(
     with _opened_source(pdf.path) as stream:
         identity = SourceIdentity.of(os.fstat(stream.fileno()))
         digest = _stream_sha256(stream, identity.size, pdf.path)
-        bound = dataclasses.replace(pdf, identity=identity)
+        bound = dataclasses.replace(pdf, identity=identity, sha256=digest)
         facts, pages = _pooled_pages(bound, options, command)
         _check_unchanged(bound, os.fstat(stream.fileno()), "by the end of its extraction")
     return _document(bound, facts, digest, pages)
@@ -442,39 +447,6 @@ def _document(source: PDFSource, facts: Facts, digest: str, pages: tuple[Page, .
     return PDFDocument(
         metadata=metadata, pages=scoped.pages, sections=scoped.sections, header_context=scoped.header_context
     )
-
-
-def _opened_source(path: Path) -> BinaryIO:
-    """``path`` opened for reading, once: the file the hash is read through and the identity taken from.
-
-    A path that is not a regular file is refused before it is opened (a FIFO
-    would block), as A2's ``open_document`` refuses it.
-    """
-    if not path.is_file():
-        raise FileNotFoundError(errno.ENOENT, "not an existing file", str(path))
-    return path.open("rb")
-
-
-def _stream_sha256(stream: BinaryIO, size: int, path: Path) -> str:
-    """The SHA-256 of the first ``size`` bytes of ``stream``, read in chunks of :data:`_HASH_CHUNK_BYTES`."""
-    digest = hashlib.sha256()
-    remaining = size
-    for _ in range(-(-size // _HASH_CHUNK_BYTES)):
-        block = _read_chunk(stream, min(_HASH_CHUNK_BYTES, remaining))
-        if not block:
-            break
-        digest.update(block)
-        remaining -= len(block)
-    if remaining:
-        raise PDFSourceChangedError(
-            f"{path} changed while it was hashed: {size - remaining} of its {size} bytes could be read"
-        )
-    return digest.hexdigest()
-
-
-def _read_chunk(stream: BinaryIO, size: int) -> bytes:
-    """The next at most ``size`` bytes of ``stream`` (fewer only at its end)."""
-    return stream.read(size)
 
 
 def _check_unchanged(source: PDFSource, status: os.stat_result, when: str) -> None:
@@ -569,6 +541,7 @@ def _chunk_payload(
         "source": str(source.path),
         "password": source.password,
         "identity": identity,
+        "sha256": source.sha256,
         "pages": None if pages is None else _ranges(pages),
         "workers": workers,
         "options": dataclasses.asdict(options),
@@ -596,6 +569,7 @@ def _chunk_request(message: object) -> ChunkRequest:
         path=message["source"],
         password=message["password"],
         identity=None if identity is None else SourceIdentity(**identity),
+        sha256=message["sha256"],
     )
     pages = None if message["pages"] is None else _checked_ranges(message["pages"])
     workers = int_at_least("workers", message["workers"], 1)
