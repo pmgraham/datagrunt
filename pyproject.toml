@@ -38,6 +38,13 @@ pdf = [
     "pypdfium2>=5.9.0",
     "Pillow>=12.2.0",
 ]
+# rationalize() over v5 PDF documents (#360): pydantic validates the caller's
+# schemas and the records models return; httpx calls the model providers over
+# HTTPS, with no vendor SDK.
+rationalize = [
+    "pydantic>=2.14.2",
+    "httpx>=0.28.1",
+]
 dev = [
     "pytest>=9.0.3",
     "pytest-cov>=7.1.0",

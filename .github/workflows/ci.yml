@@ -26,14 +26,14 @@ jobs:
       - name: Install tesseract (for PDF OCR tests)
         run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
 
-      - name: Create venv, build the extension (editable), install dev/pdf extras
+      - name: Create venv, build the extension (editable), install dev/pdf/rationalize extras
         # Explicit venv + editable install (uv handles maturin build isolation
         # automatically). We then call .venv/bin/<tool> directly rather than
         # `uv run`, which would re-sync the project env and drop the editable
         # install + dev extras (that was the earlier "pytest: not found" failure).
         run: |
           uv venv --clear   # setup-uv already created .venv; --clear makes this idempotent
-          uv pip install -e ".[dev,pdf]"
+          uv pip install -e ".[dev,pdf,rationalize]"
 
       - name: cargo test
         working-directory: rust
@@ -102,10 +102,10 @@ jobs:
       - name: Install tesseract (for PDF OCR tests)
         run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
 
-      - name: Create venv, build the extension (editable), install dev/pdf extras
+      - name: Create venv, build the extension (editable), install dev/pdf/rationalize extras
         run: |
           uv venv --clear
-          uv pip install -e ".[dev,pdf]"
+          uv pip install -e ".[dev,pdf,rationalize]"
 
       - name: pytest (Rust backend)
         run: .venv/bin/pytest tests/ -q

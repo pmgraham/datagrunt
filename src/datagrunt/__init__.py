@@ -6,9 +6,10 @@ module provides inferred CSV delimiters and helper methods for reading and
 writing CSV files. PDF support (``PDFReader``, ``PDFWriter``) needs the [pdf]
 extra: ``uv pip install "datagrunt[pdf]"``.
 
-``import datagrunt`` loads only the PDF element types and exceptions, none of
-the readers and writers. Each API loads, with the libraries it uses, the first
-time one of its names is used: ``from datagrunt import CSVReader`` (or
+``import datagrunt`` loads only the PDF element types and exceptions and the
+``Key`` schema marker (:mod:`datagrunt.rationalization`), none of the readers
+and writers. Each API loads, with the libraries it uses, the first time one
+of its names is used: ``from datagrunt import CSVReader`` (or
 ``datagrunt.CSVReader``) loads the CSV reader and writer, and the Excel,
 Parquet and PDF APIs stay unloaded until one of their names is used.
 
@@ -61,6 +62,7 @@ from datagrunt.pdf import (
 )
 from datagrunt.pdf._extra import LAZY_CLASSES as _LAZY_CLASSES
 from datagrunt.pdf._extra import load as _load
+from datagrunt.rationalization import Key  # needs no extra: the package imports neither pydantic nor httpx
 
 # You can define __all__ to specify what gets imported with "from package
 # import *"
@@ -89,6 +91,7 @@ __all__ = [
     "DatagruntPDFError",
     "PDFEncryptedError",
     "PDFCorruptError",
+    "Key",
 ]
 
 # Each CSV, Excel and Parquet name, and the module that defines it: imported at its first access (#439).

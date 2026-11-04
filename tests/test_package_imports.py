@@ -5,6 +5,7 @@ imported on the first access of one of its names (PEP 562). Each case runs in a 
 the modules it finds loaded are its own.
 """
 
+import importlib.util
 import json
 import subprocess
 import sys
@@ -23,8 +24,8 @@ API_NAMES = {
 }
 # The subpackages ``import datagrunt`` bound as its attributes before #439, which it still resolves.
 SUBPACKAGES = ("core", "csv_api", "excel_api", "parquet_api")
-# The CSV, Excel and Parquet stacks, and polars and pyarrow (the PDF model imports them where a table becomes a
-# frame): each package, and every module inside it.
+# The CSV, Excel and Parquet stacks, polars and pyarrow (the PDF model imports them where a table becomes a
+# frame), and the [rationalize] extra's pydantic and httpx (#360): each package, and every module inside it.
 STACKS = (
     "datagrunt.core",
     "datagrunt.csv_api",
@@ -35,6 +36,8 @@ STACKS = (
     "polars",
     "pyarrow",
     "xlsxwriter",
+    "pydantic",
+    "httpx",
 )
 TIMEOUT_S = 120
 
@@ -68,6 +71,34 @@ def test_import_datagrunt_loads_none_of_the_stacks_and_dir_lists_every_name():
 
     assert inside(result["loaded"], STACKS) == []
     assert set(result["all"]) | set(SUBPACKAGES) <= set(result["dir"])
+
+
+@pytest.mark.parametrize("package", ["pydantic", "httpx"])
+def test_the_rationalize_extra_is_installed_so_the_stack_checks_can_fail(package):
+    # Without the extra, a module importing pydantic or httpx would never show up in sys.modules, and the stack
+    # checks above and below would pass vacuously: the suite runs with `.[dev,pdf,rationalize]` installed.
+    assert importlib.util.find_spec(package) is not None, f'{package} is missing: uv pip install -e ".[rationalize]"'
+
+
+def test_import_datagrunt_rationalization_loads_none_of_the_stacks_and_its_key_is_the_packages():
+    result = run_python(
+        """
+        import json, sys
+        import datagrunt.rationalization
+        loaded = sorted(sys.modules)
+        import datagrunt
+        from datagrunt import Key
+        print(json.dumps({
+            "loaded": loaded,
+            "same": datagrunt.Key is Key is datagrunt.rationalization.Key,
+            "exported": "Key" in datagrunt.__all__,
+        }))
+        """
+    )
+
+    assert inside(result["loaded"], STACKS) == []
+    assert result["same"] is True
+    assert result["exported"] is True
 
 
 @pytest.mark.parametrize("name", list(API_NAMES))
