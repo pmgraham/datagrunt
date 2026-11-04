@@ -6,11 +6,11 @@ module provides inferred CSV delimiters and helper methods for reading and
 writing CSV files. PDF support (``PDFReader``, ``PDFWriter``) needs the [pdf]
 extra: ``uv pip install "datagrunt[pdf]"``.
 
-Each API is imported at the first access of one of its names (PEP 562): the
-CSV, Excel and Parquet readers and writers, and ``PDFReader`` and
-``PDFWriter``. ``import datagrunt``, which every PDF worker process does as it
-starts, loads none of them (#439); ``from datagrunt import CSVReader`` imports
-the CSV API and binds its ``CSVReader``, the same object as before.
+``import datagrunt`` loads only the PDF element types and exceptions, none of
+the readers and writers. Each API loads, with the libraries it uses, the first
+time one of its names is used: ``from datagrunt import CSVReader`` (or
+``datagrunt.CSVReader``) loads the CSV reader and writer, and the Excel,
+Parquet and PDF APIs stay unloaded until one of their names is used.
 
 Example:
     A simple example of how to use the main functionality of your package:
@@ -116,19 +116,22 @@ if TYPE_CHECKING:
 def __getattr__(name: str) -> object:
     """Each API's name, imported at its first access (module notes).
 
-    ``PDFReader`` and ``PDFWriter`` never need the [pdf] extra to be named:
-    without it, constructing either raises ``ImportError`` with the install
-    hint (see :mod:`datagrunt.pdf`).
+    A CSV, Excel or Parquet name is then kept as the package's attribute, so
+    later accesses find it there. ``PDFReader`` and ``PDFWriter`` never need
+    the [pdf] extra to be named: without it, constructing either raises
+    ``ImportError`` with the install hint (see :mod:`datagrunt.pdf`).
 
     Raises:
         AttributeError: If ``name`` is none of this package's names.
         ImportError: As importing the API that defines ``name`` raises it.
     """
     if name in _LAZY_CLASSES:
-        return _load(name)
+        return _load(name)  # never kept: without the [pdf] extra it is a stand-in, and the extra can arrive later
     if name in _API_NAMES:
-        return getattr(_import_module(_API_NAMES[name]), name)
-    if name in _SUBPACKAGES:
+        value = getattr(_import_module(_API_NAMES[name]), name)
+        globals()[name] = value
+        return value
+    if name in _SUBPACKAGES:  # the import system binds an imported subpackage as the package's attribute
         return _import_module(f"{__name__}.{name}")
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 

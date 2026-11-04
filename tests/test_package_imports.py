@@ -119,6 +119,57 @@ def test_star_import_binds_every_name_in_a_fresh_interpreter():
     assert set(result.values()) == {True}
 
 
+@pytest.mark.parametrize("name", list(API_NAMES))
+def test_a_names_first_access_keeps_it_as_the_packages_attribute(name):
+    result = run_python(
+        f"""
+        import json
+        import datagrunt
+        before = {name!r} in vars(datagrunt)
+        value = datagrunt.{name}
+        print(json.dumps({{"before": before, "kept": vars(datagrunt).get({name!r}) is value}}))
+        """
+    )
+
+    assert result == {"before": False, "kept": True}
+
+
+# A fresh interpreter's first lines: datagrunt's Rust extension, ``datagrunt._native``, cannot be imported in it.
+BLOCK_NATIVE = """
+import importlib.abc, json, sys
+
+
+class Blocked(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name == "datagrunt._native":
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+        return None
+
+
+sys.meta_path.insert(0, Blocked())
+"""
+
+
+def test_without_the_rust_extension_import_datagrunt_works_and_csv_reader_raises_import_error():
+    result = run_python(
+        BLOCK_NATIVE
+        + """
+import datagrunt
+errors = []
+for _ in range(2):
+    try:
+        datagrunt.CSVReader
+    except ImportError as exc:
+        errors.append(str(exc))
+print(json.dumps({"errors": errors, "kept": "CSVReader" in vars(datagrunt)}))
+"""
+    )
+
+    assert len(result["errors"]) == 2  # no pure-Python fallback, at the first access or a later one
+    assert all("_native" in error for error in result["errors"])
+    assert result["kept"] is False
+
+
 # The rest of a race's code, after its ``setup`` and its ``targets`` and ``use``: one thread per target, barrier-synced
 # so each makes its first use of its target at once ("import" imports the module; else it is an attribute of
 # datagrunt). Every error a thread raises is reported, and so is a thread still running at the bound.
