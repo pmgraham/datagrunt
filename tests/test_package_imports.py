@@ -117,3 +117,61 @@ def test_star_import_binds_every_name_in_a_fresh_interpreter():
     )
 
     assert set(result.values()) == {True}
+
+
+# The rest of a race's code, after its ``setup`` and its ``targets`` and ``use``: one thread per target, barrier-synced
+# so each makes its first use of its target at once ("import" imports the module; else it is an attribute of
+# datagrunt). Every error a thread raises is reported, and so is a thread still running at the bound.
+RACE = """
+import importlib, json, threading
+
+barrier, errors = threading.Barrier(len(targets), timeout=60), []
+
+
+def first_use(target):
+    try:
+        barrier.wait()
+        importlib.import_module(target) if use == "import" else getattr(sys.modules["datagrunt"], target)
+    except BaseException as exc:
+        errors.append(f"{target}: {type(exc).__name__}: {exc}")
+
+
+threads = [threading.Thread(target=first_use, args=(target,), daemon=True) for target in targets]
+for thread in threads:
+    thread.start()
+for thread in threads:
+    thread.join(timeout=90)
+errors += [f"{thread.name} is still running" for thread in threads if thread.is_alive()]
+print(json.dumps({"errors": errors}))
+"""
+# Fresh interpreters per race: a deadlock between two first imports shows in nearly every one.
+RACE_ROUNDS = 10
+
+
+def race(setup: str, use: str, targets: tuple[str, ...]) -> list[list[str]]:
+    """The errors of each round that had any: ``RACE_ROUNDS`` fresh interpreters, each racing ``targets``."""
+    code = f"import sys\n{setup}\ntargets, use = {targets!r}, {use!r}\n{RACE}"
+    rounds = (run_python(code)["errors"] for _ in range(RACE_ROUNDS))
+    return [errors for errors in rounds if errors]
+
+
+@pytest.mark.parametrize(
+    "targets",
+    [("ExcelReader", "ParquetReader"), ("CSVReader", "ExcelReader", "ParquetReader")],
+    ids=["excel-parquet", "csv-excel-parquet"],
+)
+def test_threads_first_accessing_api_names_at_once_all_succeed(targets):
+    assert race("import datagrunt", "attribute", targets) == []
+
+
+@pytest.mark.parametrize(
+    ("setup", "targets"),
+    [
+        ("", ("datagrunt.excel_api", "datagrunt.parquet_api")),
+        ("import datagrunt", ("datagrunt.excel_api", "datagrunt.parquet_api")),
+        ("", ("datagrunt.csv_api", "datagrunt.excel_api", "datagrunt.parquet_api")),
+    ],
+    ids=["excel-parquet-cold", "excel-parquet-after-import-datagrunt", "csv-excel-parquet-cold"],
+)
+def test_threads_importing_api_packages_at_once_all_succeed(setup, targets):
+    assert race(setup, "import", targets) == []
