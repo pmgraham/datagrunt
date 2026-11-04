@@ -55,14 +55,14 @@ def test_to_dicts(sample_xlsx):
 def test_query_data_returns_relation(sample_xlsx):
     engine = ExcelReaderEngine(sample_xlsx)
     rel = engine.query_data(f"SELECT count(*) AS n FROM {engine.db_table}")
-    assert rel.fetchone()[0] == 2
+    assert rel.fetchall()[0][0] == 2
     engine.close()
 
 
 def test_query_data_targets_selected_sheet(sample_xlsx):
     engine = ExcelReaderEngine(sample_xlsx)
     rel = engine.query_data(f"SELECT product FROM {engine.db_table}", sheet="Products")
-    assert rel.fetchone()[0] == "A"
+    assert rel.fetchall()[0][0] == "A"
     engine.close()
 
 
@@ -116,7 +116,7 @@ def test_query_data_re_registration_replaces_prior_sheet(sample_xlsx):
     assert "product" not in products or set(products) == {"A", "B"}
     # Confirm the second result reflects Products columns, not People's.
     rel_check = engine.query_data(f"SELECT product FROM {engine.db_table}", sheet="Products")
-    assert rel_check.fetchone()[0] == "A"
+    assert rel_check.fetchall()[0][0] == "A"
     engine.close()
 
 
