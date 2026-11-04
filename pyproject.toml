@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.7,<2.0"]
+requires = ["maturin>=1.14.1,<2.0"]
 build-backend = "maturin"
 
 [project]
@@ -51,7 +51,7 @@ dev = [
     # releases, and this gate is blocking.
     "mypy>=1.14,<2.4",
     "bumpver>=2026.1132",
-    "maturin>=1.7,<2.0",
+    "maturin>=1.14.1,<2.0",
     "pre-commit>=4.0.0",
     # Dev-only (BSD) PDF writer for v5 test fixtures: tests/pdf_tests/builders.py
     # builds every v5 test PDF with it, replacing PyMuPDF as the test-PDF
