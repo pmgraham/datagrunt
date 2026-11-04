@@ -438,6 +438,11 @@ Every page reports how extraction went (`page.status`):
 - `error`: nothing could be read; `page.error` says why. The rest of the
   document still extracts.
 
+A page read by OCR at a mean word confidence under 70 carries a warning that
+it may be turned the wrong way or unreadable, so its text shouldn't be trusted
+as is; the text is kept. Tesseract's orientation detection can turn a page with
+little text the wrong way; such a page reads at low confidence and is flagged.
+
 Extraction is always complete: a bad page is recorded, never dropped. Pass
 `strict=True` to raise `PDFCorruptError` on a bad page instead.
 
