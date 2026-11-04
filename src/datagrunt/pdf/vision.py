@@ -98,9 +98,45 @@ against the elements: a mismatch is a warning.
    nothing is superseded twice and nothing is dropped.
 5. The page: ``status="ok"``, ``route="vision"``, never
    ``integrity_verified`` (A1); A3's quality with the words' mean
-   confidence; a lazy :class:`~datagrunt.pdf.elements.PageImage` whose
-   loaders (:class:`PageRender`) draw the page again on demand, so no pixels
-   are held between pages.
+   confidence (``ocr_mean_confidence``, each word counting once); a lazy
+   :class:`~datagrunt.pdf.elements.PageImage` whose loaders
+   (:class:`PageRender`) draw the page again on demand, so no pixels are
+   held between pages. A page whose ``ocr_mean_confidence`` is under
+   :data:`LOW_OCR_CONFIDENCE` has a warning naming it: the page may be
+   turned the wrong way or unreadable, so its text should not be trusted
+   as is (#456). Its status and its text stay as they are (extraction never
+   drops text), and no more OCR is run: the mean is the one the page
+   carries. A page of no words has no mean, and no such warning.
+
+   It is how a page read the wrong way up shows: step 2 makes OSD's turn as
+   OSD gives it, and on sparse text OSD can be wrong (see the known
+   limitations). It reads the sparse capitals displayed upside down as
+   upright (at 1.85 to 2.11), so they are read upside down, as gibberish.
+   Evidence, tesseract 5.5.3, each page read as this route reads it:
+
+   - The corpus (95 pages, ``ocr="always"``), right way up: 94 pages of
+     words (a cover reads none), at 56.3 at least, 87.5 at the 5th
+     percentile, 94.3 the median and 96.5 at most. Only 3 are under 87.4:
+     79.7, and two pages of art: 58.3, a picture of the board with cards of
+     small, slanted text, and 56.3, a cover with a contents list whose dot
+     leaders read as words of no confidence. With ``ocr="auto"`` no corpus
+     page is read by OCR (76 hybrid, 19 digital).
+   - The corpus upside down (each page's render turned 180 degrees and
+     read as displayed, unturned: what a turn OSD misses reads): 7.3 at
+     least, 37.2 the median, 41.0 at the 95th percentile and 43.9 at most.
+     As this route reads them, step 2 rights 94 of the 95; the other, the
+     cover OSD cannot orient, reads 2 words, at 20.1.
+   - Sparse capitals (#456, 8 pages): upright, 95.1 to 95.9; displayed
+     upside down (``/Rotate 180``), 50.9 to 59.3.
+
+   :data:`LOW_OCR_CONFIDENCE` is 70, about mid-way between the highest
+   reading upside down (59.3) and the third lowest right way up (79.7). It
+   flags all 103 pages read upside down and 2 of the 102 read right way up:
+   the corpus's two pages of art, whose text OCR reads in part from the
+   art. The mean weighted by chars flags the same pages at 70 (upside down
+   57.4 at most; right way up 20.8 and 59.8, then 83.0 and over), so the
+   page's own ``ocr_mean_confidence`` is used: the warning names the number
+   the page carries.
 
 The page's render and OCR share one time budget (#418),
 :attr:`VisionOptions.page_budget_s` (600 s; a page takes 2-4 s here),
@@ -117,7 +153,9 @@ tesseract cannot read it (missing, failed, timed out, its budget spent), it is
 ``"ocr_unavailable"``: :func:`~datagrunt.pdf.assembly.assemble_page`'s
 page of its digital text, the page image when it was rendered, and a
 warning naming why. Words read before a band failed are not used: the page
-is the digital text's, never half of each.
+is the digital text's, never half of each. assemble_page is given the
+vision DPI and pixel bound the page was rendered within, so its warning
+that the page has no page image agrees with the image (#456).
 
 :func:`fallback_page` makes the A1 page of a page A2 could not read (its
 ``PageFailure``; spec §3.3 step 2, per-page fault isolation): only its
@@ -125,8 +163,11 @@ geometry is read (``page_geometry``), then it is rendered and read as a
 vision page is, with no digital text and no figures (none was read). Read,
 it is ``"ocr_fallback"`` (route ``"vision"``, never verified): its quality
 is the OCR's (the words' chars by A3's rule, their mean confidence; no
-vector line, hidden span or skew was measured: 0, 0 and None), and its first
-warning says extraction failed and what was not read. When its geometry,
+vector line, hidden span or skew was measured: 0, 0 and None), its first
+warning says extraction failed and what was not read, and a mean word
+confidence under :data:`LOW_OCR_CONFIDENCE` is flagged as on a vision page
+(step 5). Only a page whose text is OCR's is so flagged: never an
+``"ocr_unavailable"`` page (its text is the digital text's). When its geometry,
 render or OCR fails too, or ``ocr="never"``, it is an ``"error"`` page (A1:
 no elements, no quality) whose ``error`` names the extraction failure and
 then why it was not read; a page whose geometry cannot be read is pdfium's
@@ -143,6 +184,29 @@ Known limitations (A5b evidence: 10 corpus pages forced to OCR):
   words recall 80.7 % of the digital words where the OCR words themselves
   recall 84.4 % (#416; 75.2 % and 84.5 % before it dropped the band seams'
   fragments, sized words by their lines and laid art apart).
+- OSD can suggest a wrong turn at :data:`ROTATION_CONFIDENCE` or more on
+  sparse text, and step 2 makes it (#456; tesseract 5.5.3). It turns 3 of
+  the 8 upright pages of the sparse capitals upside down, at 2.01 to 2.04,
+  and capitals over art at 2.05 to 2.48; on the #456 review's scans,
+  fax-resolution scans and calligraphic hands are turned the wrong way at
+  3.02 to 21.27. Such a page reads at a low mean word confidence and is
+  flagged (step 5): the sparse capitals at 50.7 to 58.4, 8 pages of
+  capitals over art at 49.3 to 58.6, and the fax and calligraphic scans
+  read through the reader (2 standard-fax pages and 7 of the hands) at
+  24.9 to 40.0. Its text is kept, read the wrong way.
+- A page read the wrong way at :data:`LOW_OCR_CONFIDENCE` or more is not
+  flagged: upside-down pages of the digits 0, 1, 6, 8 and 9 alone, which
+  read as digits either way up, read at 71.0 to 84.3 (8 pages, #456
+  review), and an upright one OSD turns 180 degrees (at 4.35) reads at
+  83.7.
+- A check of OSD's turn by reading a sample of the page each way was tried
+  for #456 and withdrawn for 5.0 (#454): each version refused right turns
+  this rule makes, on a new class of page each time (the last: a scan
+  displayed sideways and stamped upright after, its stamp read upright).
+  A page OCR reads the wrong way is flagged, not righted.
+- The flag cannot tell a page read the wrong way from one hard to read:
+  two corpus pages of art read right way up (56.3 and 58.3) are flagged
+  too.
 """
 
 import dataclasses
@@ -185,6 +249,7 @@ from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effe
 
 __all__ = [
     "LEAST_SIZE_PT",
+    "LOW_OCR_CONFIDENCE",
     "ROTATION_CONFIDENCE",
     "PageRender",
     "VisionElements",
@@ -219,6 +284,9 @@ _NO_LATTICE = LatticeResult(tables=(), used_pieces=())
 
 # OSD's turn is made at this confidence or more (see the module notes: right turns 3.59 and up, the wrong one 0.02).
 ROTATION_CONFIDENCE = 2.0
+# A page OCR read at a mean word confidence (its ocr_mean_confidence) under this is flagged in its warnings (module
+# notes, step 5: pages read upside down 59.3 at most; right way up 79.7 and over, but for 2 pages of art).
+LOW_OCR_CONFIDENCE = 70.0
 
 _SUPERSEDED: tuple[HiddenReason, ...] = ("superseded",)
 _OCR_MODES: tuple[OcrMode, ...] = ("auto", "always", "never")
@@ -512,6 +580,10 @@ def vision_page(
 ) -> Page:
     """The A1 page of a page A3 routed to vision: OCR's elements, or its digital text's (see the module notes).
 
+    A page OCR read at a mean word confidence under
+    :data:`LOW_OCR_CONFIDENCE` keeps its status and text, with a warning
+    that its text should not be trusted as is (module notes, step 5).
+
     Args:
         raw_page: The page's raw facts (A2's ``RawPage``).
         assessment: A3's assessment of it, routed ``"vision"``.
@@ -543,11 +615,11 @@ def vision_page(
     drawn = _drawn(source, geometry, password, options, deadline)
     where = _Where(source, password, identity, sha256)
     if drawn.page is None:
-        return _unread(raw_page, assessment, drawn.failure, None, where, min_image_dimension)
+        return _unread(raw_page, assessment, drawn.failure, None, where, min_image_dimension, options)
     reading = _read(drawn.page, drawn.dpi, geometry, options, deadline)
     image = _page_image(drawn.page, drawn.dpi, reading.rotation, geometry, where, options)
     if reading.failure:
-        return _unread(raw_page, assessment, reading.failure, image, where, min_image_dimension)
+        return _unread(raw_page, assessment, reading.failure, image, where, min_image_dimension, options)
     figures = page_figures(
         raw_page.images, geometry, source=source, password=password, min_image_dimension=min_image_dimension
     )
@@ -559,14 +631,16 @@ def vision_page(
         recovered=superseded(assessment.recovered_pieces),
         figures=figures.drafts,
     )
-    warnings = (*raw_page_warnings(raw_page), *figures.warnings, *assessment.warnings, *reading.notes, *laid.warnings)
+    confidence = _mean_confidence(reading.words)
+    notes = (*reading.notes, *_low_confidence(confidence))
+    warnings = (*raw_page_warnings(raw_page), *figures.warnings, *assessment.warnings, *notes, *laid.warnings)
     return Page(
         page_number=geometry.page_number,
         width_pt=geometry.width_pt,
         height_pt=geometry.height_pt,
         status="ok",
         route="vision",
-        quality=dataclasses.replace(assessment.quality, ocr_mean_confidence=_mean_confidence(reading.words)),
+        quality=dataclasses.replace(assessment.quality, ocr_mean_confidence=confidence),
         elements=laid.elements,
         page_image=image,
         warnings=warnings,
@@ -707,8 +781,20 @@ def _page_image(
 
 
 def _mean_confidence(words: tuple[OCRWord, ...]) -> float | None:
-    """The words' mean tesseract confidence; None for no words (no mean to take)."""
+    """The words' mean tesseract confidence, each word counting once; None for no words (no mean to take)."""
     return math.fsum(word.confidence for word in words) / len(words) if words else None
+
+
+def _low_confidence(confidence: float | None) -> tuple[str, ...]:
+    """The warning of a page OCR read at a mean word ``confidence`` under :data:`LOW_OCR_CONFIDENCE`, if it was.
+
+    See the module notes, step 5. No words read (None) warns of nothing: no
+    text of OCR's is on the page.
+    """
+    if confidence is None or confidence >= LOW_OCR_CONFIDENCE:
+        return ()
+    read = f"OCR read the page at a mean word confidence of {confidence:.1f}, under {LOW_OCR_CONFIDENCE:g}"
+    return (f"{read}: it may be turned the wrong way or unreadable, so its text should not be trusted as is",)
 
 
 def _unread(
@@ -718,8 +804,14 @@ def _unread(
     image: PageImage | None,
     where: _Where,
     min_image_dimension: int,
+    options: VisionOptions,
 ) -> Page:
-    """The ``"ocr_unavailable"`` page: assemble_page's of the digital text, the image if rendered, and why."""
+    """The ``"ocr_unavailable"`` page: assemble_page's of the digital text, the image if rendered, and why.
+
+    assemble_page checks the page image at the vision DPI and pixel bound
+    the render used, so its warning that the page has none is given exactly
+    when ``image`` is None for that reason (#456), never by its defaults.
+    """
     lattice = find_lattice_tables(raw_page.segments.segments, assessment.pieces)
     page = assemble_page(
         raw_page,
@@ -730,6 +822,8 @@ def _unread(
         identity=where.identity,
         sha256=where.sha256,
         min_image_dimension=min_image_dimension,
+        dpi=options.vision_dpi,
+        max_render_pixels=options.max_render_pixels,
     )
     return dataclasses.replace(
         page, page_image=image, warnings=(*page.warnings, f"OCR could not read the page: {reason}")
@@ -748,6 +842,9 @@ def fallback_page(
     options: VisionOptions = VisionOptions(),
 ) -> Page:
     """The A1 page of a page whose extraction failed: read by OCR of its render, or an error page (module notes).
+
+    Read at a mean word confidence under :data:`LOW_OCR_CONFIDENCE`, it is
+    flagged as a vision page is (module notes, step 5).
 
     Args:
         handle: The open document the page failed in; its geometry is read again from it.
@@ -789,16 +886,18 @@ def fallback_page(
         why = f"{failed}; OCR could not read the page: {reading.failure}"
         return _error_page(failure.page_number, geometry, _Unread(why, reading.notes, image))
     laid = vision_elements(reading.words, geometry=geometry, rotation=reading.rotation)
+    quality = _ocr_quality(reading.words, geometry)
+    notes = (*reading.notes, *_low_confidence(quality.ocr_mean_confidence))
     return Page(
         page_number=geometry.page_number,
         width_pt=geometry.width_pt,
         height_pt=geometry.height_pt,
         status="ocr_fallback",
         route="vision",
-        quality=_ocr_quality(reading.words, geometry),
+        quality=quality,
         elements=laid.elements,
         page_image=image,
-        warnings=(f"{failed}; {_NOT_READ}", *reading.notes, *laid.warnings),
+        warnings=(f"{failed}; {_NOT_READ}", *notes, *laid.warnings),
     )
 
 

@@ -16,11 +16,12 @@ import pickle
 import re
 import shutil
 import time
+from collections import Counter
 from pathlib import Path
 
 import pypdfium2 as pdfium
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from datagrunt.pdf import _loaders, vision
 from datagrunt.pdf._loaders import FigureRead
@@ -49,7 +50,7 @@ from datagrunt.pdf.vision import (
     vision_elements,
     vision_page,
 )
-from pdf_tests.builders import PageSpec, RasterImage, TextRun, break_page, build_pdf
+from pdf_tests.builders import PageSpec, RasterImage, Rect, TextRun, break_page, build_pdf
 from pdf_tests.test_assembly import (
     NOT_RETURNED,
     after_the_draw,
@@ -640,6 +641,11 @@ class TestVisionPage:
         assert again == page
         assert again.page_image.read_bytes() == page.page_image.read_bytes()
 
+    def test_a_scan_read_upright_is_not_flagged(self, read):
+        page = read("scan")
+
+        assert low_notes(page) == [], (page.quality, page.warnings)
+
 
 def no_tesseract(monkeypatch, tmp_path) -> None:
     """PATH holds no tesseract."""
@@ -703,6 +709,30 @@ class TestOcrUnavailable:
         unused = "the 2 word(s) it read before that are not used"
         assert page.warnings[-1] == unread_warning(f"tesseract {status}: {reason}; {unused}")
         assert page.page_image is not None
+
+    @pytest.mark.parametrize(
+        ("width_pt", "bound", "drawn"),
+        [
+            # 80 DPI within 25M pixels: 22,222,222 x 1 px; at the defaults (16M) it would render 0 px tall at 64 DPI.
+            pytest.param(2e7, 25_000_000, True, id="drawn-only-under-a-raised-bound"),
+            # 26 DPI within 262,144 pixels: 0 px tall; at the defaults (200 DPI, 16M) it would be 5,555,555 x 2 px.
+            pytest.param(2e6, 262_144, False, id="refused-under-a-lowered-bound"),
+        ],
+    )
+    def test_its_page_image_and_its_warnings_agree(self, tmp_path, monkeypatch, width_pt, bound, drawn):
+        # #456: the page image is the OCR render, within the reader's pixel bound at its vision DPI; the warning that
+        # the page has none is from the same bound, never assemble_page's defaults.
+        path = build_pdf(tmp_path / "extreme.pdf", [PageSpec(width=width_pt, height=1.0)])
+        no_tesseract(monkeypatch, tmp_path)
+
+        page = visioned(path, ocr="always", options=VisionOptions(max_render_pixels=bound))
+
+        assert page.status == "ocr_unavailable"
+        assert (page.page_image is not None) is drawn
+        undrawn = [note for note in page.warnings if note.startswith("the page has no page image")]
+        assert undrawn == (
+            [] if drawn else [f"the page has no page image: a {width_pt} x 1.0 pt page renders 0 px tall at 26 DPI"]
+        )
 
     def test_ocr_unavailable_at_orientation_runs_no_ocr(self, scans, monkeypatch):
         gone = Orientation(degrees=0, confidence=None, status="unavailable", reason="cannot start tesseract")
@@ -1454,6 +1484,76 @@ class TestFallbackQuality:
         assert (page.status, page.elements) == ("ocr_fallback", ())
 
 
+def low_confidence(shown: str) -> str:
+    """The warning of a page OCR read at a mean word confidence (``shown``) under LOW_OCR_CONFIDENCE (#456)."""
+    return (
+        f"OCR read the page at a mean word confidence of {shown}, under {vision.LOW_OCR_CONFIDENCE:g}: it may be "
+        "turned the wrong way or unreadable, so its text should not be trusted as is"
+    )
+
+
+def low_notes(page: Page) -> list[str]:
+    """The page's warnings that OCR read it at a low mean word confidence."""
+    return [item for item in page.warnings if item.startswith("OCR read the page at a mean word confidence")]
+
+
+# Two words whose mean confidence is 69.9 and 70.0: weighted by chars ("a" is 1 of 5), 87.8 and 88.0.
+UNDER = (word("a", 72.0, 100.0, 77.0, 110.0, 40.0), word("word", 80.0, 100.0, 100.0, 110.0, 99.8))
+AT = (word("a", 72.0, 100.0, 77.0, 110.0, 40.0), word("word", 80.0, 100.0, 100.0, 110.0, 100.0))
+
+
+class TestLowConfidence:
+    """A page whose text is OCR's, read at a mean word confidence under LOW_OCR_CONFIDENCE, says so (#456)."""
+
+    def test_the_threshold_is_set_from_the_evidence(self):
+        # Corpus and sparse capitals, right way up and upside down: see the vision module notes, step 5.
+        assert vision.LOW_OCR_CONFIDENCE == 70.0
+        assert "LOW_OCR_CONFIDENCE" in vision.__all__
+
+    def test_a_page_read_under_it_is_flagged_and_keeps_its_text(self, scans, monkeypatch):
+        # The page's own ocr_mean_confidence is the mean: weighted by chars, it would be 87.8, not flagged.
+        ok_reading(monkeypatch, UNDER)
+
+        page = visioned(scans["scan"])
+
+        assert page.quality.ocr_mean_confidence == pytest.approx(69.9)
+        assert (page.status, texts(page)) == ("ok", ["a word"])
+        assert low_notes(page) == [low_confidence("69.9")]
+
+    @pytest.mark.parametrize("words", [pytest.param(AT, id="at-it"), pytest.param((), id="no-words")])
+    def test_a_page_read_at_it_or_reading_no_words_is_not_flagged(self, scans, monkeypatch, words):
+        ok_reading(monkeypatch, words)
+
+        page = visioned(scans["scan"])
+
+        assert page.quality.ocr_mean_confidence == (70.0 if words else None)
+        assert page.status == "ok"
+        assert low_notes(page) == []
+
+    @pytest.mark.parametrize(
+        ("words", "flagged"), [pytest.param(UNDER, True, id="under"), pytest.param(AT, False, id="at")]
+    )
+    def test_a_fallback_page_is_flagged_alike(self, scans, monkeypatch, words, flagged):
+        failure = failed_at_text(scans["scan"], monkeypatch)
+        ok_reading(monkeypatch, words)
+
+        page = fell_back(scans["scan"], failure)
+
+        assert page.status == "ocr_fallback"
+        assert low_notes(page) == ([low_confidence("69.9")] if flagged else [])
+
+    def test_an_unread_page_is_not_flagged(self, scans, monkeypatch):
+        # Its text is the digital text's: the words OCR read before tesseract failed are not used.
+        partial = OCRResult(words=UNDER, status="failed", reason="band 2 of 4: tesseract exited with code 1")
+        monkeypatch.setattr(vision, "orientation", lambda *args, **kwargs: UPRIGHT)
+        monkeypatch.setattr(vision, "ocr_words", lambda *args, **kwargs: partial)
+
+        page = visioned(scans["captioned"])
+
+        assert (page.status, texts(page)) == ("ocr_unavailable", ["Page 7"])
+        assert low_notes(page) == []
+
+
 class TestFallbackErrors:
     """A failed page whose geometry, render or OCR fails too is an error page: why, and no elements (A1)."""
 
@@ -1694,3 +1794,268 @@ class TestGarbledFont:
         garbled = "".join(" " if char == " " else chr(0xE000 + ord(char)) for char in GARBLED)
         assert hidden == [(garbled, ("superseded",))]
         assert texts(page) == [GARBLED]
+
+
+def made_by_osd(found: Orientation) -> int:
+    """The turn OCR reads a page at, from OSD's ``found``: its turn at ROTATION_CONFIDENCE or more, as in 4.x (#456)."""
+    confident = found.status == "ok" and found.confidence is not None and found.confidence >= vision.ROTATION_CONFIDENCE
+    return found.degrees if confident else 0
+
+
+def righted_notes(page: Page) -> list[str]:
+    """The page's warnings that OCR read it turned."""
+    return [note for note in page.warnings if note.startswith("the page reads turned")]
+
+
+def made_notes(found: Orientation) -> list[str]:
+    """The warnings that OCR read a page turned, for OSD's ``found``: its turn made as OSD gives it, if it is made."""
+    if not made_by_osd(found):
+        return []
+    righted = f"OCR righted it by {found.degrees} degrees clockwise (orientation confidence {found.confidence:g})"
+    return [f"the page reads turned: {righted}"]
+
+
+def osd_of(path: Path, index: int) -> Orientation:
+    """OSD's reading of the page at ``index``, as the vision route reads it: its 300 DPI render, normalized."""
+    page = render_page(path, index, dpi=300, memory_cap_bytes=1 << 30, timeout_s=120.0)
+    return vision.orientation(normalized(page), timeout_s=120.0)
+
+
+def sparse_capitals(path: Path, rotate: int = 0) -> Path:
+    """8 pages of two lines of capitals (#456), displayed turned ``rotate`` degrees (/Rotate).
+
+    Upright, tesseract 5.5.3's OSD suggests turning each 180 degrees; displayed upside down, it reads each as upright.
+    """
+    pages = [
+        PageSpec(
+            items=(
+                TextRun(f"ALPHA DOCUMENT PAGE {number}", 72.0, 100.0, size=28.0),
+                TextRun("ALPHA ALPHA ALPHA body text line", 72.0, 160.0, size=20.0),
+            ),
+            rotate=rotate,
+        )
+        for number in range(1, 9)
+    ]
+    return build_pdf(path, pages)
+
+
+@pytest.fixture(scope="module")
+def capitals(tmp_path_factory) -> Path:
+    return sparse_capitals(tmp_path_factory.mktemp("capitals") / "capitals.pdf")
+
+
+@pytest.fixture(scope="module")
+def capital_pages(capitals) -> tuple[Page, ...]:
+    return PDFReader(capitals, ocr="always", workers=4).pages
+
+
+@pytest.fixture(scope="module")
+def capital_turns(capitals) -> tuple[Orientation, ...]:
+    return tuple(osd_of(capitals, index) for index in range(8))
+
+
+@pytest.fixture(scope="module")
+def upside_down_capitals(tmp_path_factory) -> Path:
+    return sparse_capitals(tmp_path_factory.mktemp("capitals") / "upside-down.pdf", rotate=180)
+
+
+@needs_tesseract
+class TestSparseCapitals:
+    """#456: OSD suggests turning each upright page 180 degrees (here, tesseract 5.5.3, at 1.83 to 2.04). Its turn is
+    made at ROTATION_CONFIDENCE or more, as in 4.x (3 of the 8 pages here): such a page reads upside down, at a low
+    mean word confidence, and is flagged; its status and text are kept. A page whose turn is not made reads upright
+    and is not flagged.
+
+    Displayed upside down, OSD reads each page as upright: OCR reads it as displayed, upside down, and flags it.
+    """
+
+    def test_a_page_is_read_at_the_turn_osd_gives_it(self, capital_pages, capital_turns):
+        assert len(capital_pages) == 8
+        for page, found in zip(capital_pages, capital_turns, strict=True):
+            assert righted_notes(page) == made_notes(found), (page.page_number, found, page.warnings)
+
+    def test_a_page_osd_turns_upside_down_is_flagged_and_keeps_its_text(self, capital_pages, capital_turns):
+        # Read upside down at a mean word confidence of 50.7 to 58.4 here (vision module notes, known limitations).
+        turned = [page for page, found in zip(capital_pages, capital_turns, strict=True) if made_by_osd(found) == 180]
+        if not turned:
+            pytest.skip(f"OSD turns no page at {vision.ROTATION_CONFIDENCE:g} or more here: {capital_turns}")
+        for page in turned:
+            assert (page.status, page.route) == ("ok", "vision")
+            assert texts(page), page.page_number
+            mean = page.quality.ocr_mean_confidence
+            assert low_notes(page) == [low_confidence(f"{mean:.1f}")], (page.page_number, page.warnings)
+
+    def test_a_page_read_upright_reads_its_text_and_is_not_flagged(self, capital_pages, capital_turns):
+        # Read upright at a mean word confidence of 95.1 to 95.8 here.
+        for number, (page, found) in enumerate(zip(capital_pages, capital_turns, strict=True), start=1):
+            if made_by_osd(found):
+                continue
+            expected = Counter(f"ALPHA DOCUMENT PAGE {number} ALPHA ALPHA ALPHA body text line".split())
+            read = Counter(" ".join(texts(page)).split())
+            assert (page.status, page.route) == ("ok", "vision")
+            assert sum((expected & read).values()) >= 9, (number, texts(page), page.warnings)
+            assert low_notes(page) == [], (number, page.quality, page.warnings)
+
+    def test_every_upside_down_page_is_flagged_and_keeps_its_text(self, upside_down_capitals):
+        # OSD reads each page as upright, so no turn is made and OCR reads it upside down, as gibberish: at a mean
+        # word confidence of 50.9 to 59.3 here (module notes, step 5). Its text is kept; the warning says so.
+        pages = PDFReader(upside_down_capitals, ocr="always", workers=4).pages
+
+        assert len(pages) == 8
+        for page in pages:
+            assert (page.status, page.route) == ("ok", "vision")
+            assert righted_notes(page) == [], page.warnings
+            assert texts(page), page.page_number
+            mean = page.quality.ocr_mean_confidence
+            assert low_notes(page) == [low_confidence(f"{mean:.1f}")], (page.page_number, page.warnings)
+
+
+# A pixel of a 300 DPI render, in points.
+PX = 72.0 / 300
+EFILE_STAMP = "Case 1:26-cv-01234-ABC Document 45-3 Filed 03/04/26 Page 2 of 17"
+RETURN_ADDRESS = ("J. Brown", "22 Mill Lane", "Oxford OX1 2AB")
+ADDRESS = ("Margaret Holloway", "14 Queens Road", "Bristol", "BS8 1QU")
+
+
+def envelope_scan(directory: Path) -> Image.Image:
+    """An envelope's 300 DPI scan, 2850 x 1500 px: a return address, the address, a stamp box and a postmark."""
+    lines = [TextRun(t, 100 * PX, (109 + 45 * i) * PX, size=32 * PX) for i, t in enumerate(RETURN_ADDRESS)]
+    lines += [TextRun(t, 1100 * PX, (745 + 75 * i) * PX, size=50 * PX) for i, t in enumerate(ADDRESS)]
+    box = Rect(2453 * PX, 83 * PX, 294 * PX, 334 * PX, line_width=6 * PX)
+    digital = build_pdf(directory / "envelope.pdf", [PageSpec(width=2850 * PX, height=1500 * PX, items=(*lines, box))])
+    scan = rendered(digital)
+    picture = Image.frombytes("L", (scan.px_width, scan.px_height), scan.pixels)
+    draw = ImageDraw.Draw(picture)
+    for arc in range(6):  # the postmark's wavy lines
+        box_px = (2250 - 30 * arc, 150 + 10 * arc, 2650 + 30 * arc, 400 + 10 * arc)
+        draw.arc(box_px, 0, 180, fill=0, width=4)
+    return picture
+
+
+def scan_page(path: Path, picture: Image.Image, *items: TextRun) -> Path:
+    """A one-page PDF of ``picture`` drawn at 300 DPI over the whole page, then ``items``."""
+    buffer = io.BytesIO()
+    picture.save(buffer, format="PNG")
+    size = (picture.width * PX, picture.height * PX)
+    return build_pdf(
+        path, [PageSpec(width=size[0], height=size[1], items=(RasterImage(0.0, 0.0, *size, buffer.getvalue()), *items))]
+    )
+
+
+@pytest.fixture(scope="module")
+def stamped_envelope(tmp_path_factory) -> Path:
+    """A raster scan (no text layer) of an envelope displayed turned 270 degrees, stamped upright after (#456 review).
+
+    As a filing system stamps a scanned page: the stamp, an e-filing header, reads right as displayed; the envelope
+    reads right turned 90 degrees clockwise.
+    """
+    directory = tmp_path_factory.mktemp("stamped")
+    sideways = envelope_scan(directory).transpose(Image.Transpose.ROTATE_90)
+    stamp = TextRun(EFILE_STAMP, 150 * PX, (40 + 0.72 * 30) * PX, size=30 * PX)
+    stamped = scan_page(directory / "stamped.pdf", sideways, stamp)
+    page = rendered(stamped)
+    picture = Image.frombytes("L", (page.px_width, page.px_height), page.pixels)
+    return scan_page(directory / "stamped-scan.pdf", picture)
+
+
+@needs_tesseract
+class TestStampedScan:
+    """A scan displayed sideways and stamped upright after reads as in 4.x: OSD's turn, at ROTATION_CONFIDENCE or
+    more, is made (#456 review: a check of the turn by reading refused it, on the stamp read upright, and the
+    envelope read sideways)."""
+
+    def test_it_is_read_at_the_turn_osd_gives_it(self, stamped_envelope):
+        found = osd_of(stamped_envelope, 0)
+
+        (page,) = PDFReader(stamped_envelope, ocr="auto").pages
+
+        assert (page.status, page.route) == ("ok", "vision")
+        assert righted_notes(page) == made_notes(found), (found, page.warnings)
+
+    def test_turned_as_osd_gives_it_the_envelope_reads_righted(self, stamped_envelope):
+        # Here, OSD turns it 90 degrees clockwise at 2.02: the right turn.
+        found = osd_of(stamped_envelope, 0)
+        if made_by_osd(found) != 90:
+            pytest.skip(f"OSD does not give the right turn at {vision.ROTATION_CONFIDENCE:g} or more here: {found}")
+
+        (page,) = PDFReader(stamped_envelope, ocr="auto").pages
+
+        read = page.to_markdown()
+        assert all(line in read for line in (*RETURN_ADDRESS, *ADDRESS)), read
+
+
+# A config file and a page of code, in Courier: OSD turns their sideways scans at 37.39 and 38.73 here. A check of the
+# turn by reading its sample (#454) refused both (psm 11 read "=", ":" and brackets as words alike either way).
+CONFIG = tuple(
+    line
+    for number in range(10)
+    for line in (
+        f"[section{number}]",
+        f"    host = server{number}.example.com",
+        f"    port = {8000 + number}",
+        "    enabled = true",
+        "",
+    )
+)[:46]
+CODE_LINES = (
+    "import os",
+    "def main(argv):",
+    "    for name in argv:",
+    "        path = os.path.join(base, name)",
+    "        if os.path.exists(path):",
+    "            print(path)",
+    "        else:",
+    "            raise SystemExit(name)",
+    "    return 0",
+    "",
+)
+CODE = (CODE_LINES * 5)[:44]
+# The code's first lines, to the first argument of its fourth: tesseract 5.3.4 reads one "base, name" as "base,ON name".
+CODE_REPEAT = "import os def main(argv): for name in argv: path = os.path.join(base,"
+
+
+@pytest.fixture(scope="module")
+def listings(tmp_path_factory) -> dict[str, Path]:
+    """Raster scans (no text layer) of the config file at /Rotate 90 and of the code at /Rotate 270."""
+    directory = tmp_path_factory.mktemp("listings")
+    pages = {
+        "config": (
+            90,
+            tuple(TextRun(t, 50.0, 50.0 + i * 13.5, font="Courier", size=10.0) for i, t in enumerate(CONFIG)),
+        ),
+        "code": (270, tuple(TextRun(t, 60.0, 60.0 + i * 15.0, font="Courier", size=12.0) for i, t in enumerate(CODE))),
+    }
+    scans = {}
+    for name, (rotate, lines) in pages.items():
+        digital = build_pdf(directory / f"{name}.pdf", [PageSpec(items=tuple(line for line in lines if line.text))])
+        scan = RasterImage(0.0, 0.0, *LETTER, png_of(rendered(digital)))
+        scans[name] = build_pdf(directory / f"{name}-{rotate}.pdf", [PageSpec(items=(scan,), rotate=rotate)])
+    return scans
+
+
+@needs_tesseract
+class TestSidewaysListings:
+    """Sideways scans of a config file and of code read righted, in order: OSD's turn is made as it gives it (#456)."""
+
+    def test_a_config_file_reads_righted_in_order(self, listings):
+        found = osd_of(listings["config"], 0)
+
+        (page,) = PDFReader(listings["config"], ocr="auto").pages
+
+        assert (page.status, page.route) == ("ok", "vision")
+        assert made_by_osd(found) == 270 and righted_notes(page) == made_notes(found), (found, page.warnings)
+        read = " ".join(texts(page))
+        # Sections 0 and 1 read as "server0O" and "serverl" (tesseract's 0 and 1 in Courier); 2 to 8, top to bottom (the
+        # page ends at "[section9]").
+        at = [read.find(f"server{number}.example.com") for number in range(2, 9)]
+        assert -1 not in at and at == sorted(at), read
+
+    def test_a_page_of_code_reads_righted_in_order(self, listings):
+        found = osd_of(listings["code"], 0)
+
+        (page,) = PDFReader(listings["code"], ocr="auto").pages
+
+        assert (page.status, page.route) == ("ok", "vision")
+        assert made_by_osd(found) == 90 and righted_notes(page) == made_notes(found), (found, page.warnings)
+        read = " ".join(texts(page))
+        assert read.startswith(CODE_REPEAT) and read.count(CODE_REPEAT) == 5, read
