@@ -4,8 +4,25 @@ These cases don't fit the shared corpus: the adversarial input is multi-MB, and
 the empty-delimiter case needs an explicit argument the corpus tests don't pass.
 """
 
+import time
+
+import pytest
+
 from datagrunt import _native as datagrunt_rs
 from datagrunt.core.csv_io import _compute_python as py
+
+# #378: adversarial lines for the quoted-field body (gh-98820) and the
+# doubled-quote search (gh-109638). The first four are the ReDoS probe's shapes;
+# `mixed_quote_openers` is where the pre-fix Rust patterns were super-linear.
+REDOS_SHAPES = {
+    "unterminated_quote": lambda n: "id,note\n1," + '"' + "a" * n + "\n",
+    "quote_run": lambda n: "a,b\n" + '"' * n + "\n",
+    "comma_quote_openers": lambda n: "a,b\n" + ',"' * (n // 2) + "\n",
+    "doubled_unterminated": lambda n: 'a,"' + '""' * (n // 2) + "\n",
+    "mixed_quote_openers": lambda n: "a,b\n" + ",'\"" * (n // 3) + "\n",
+}
+REDOS_LINE_CHARS = 64 * 1024
+REDOS_MAX_SECONDS = 2.0  # generous: both backends take milliseconds when linear
 
 
 def test_adversarial_long_line_does_not_panic_and_matches_python(tmp_path):
@@ -43,3 +60,22 @@ def test_empty_delimiter_is_treated_as_unrestricted(tmp_path):
     assert rust_empty == rust_none == python_empty
     assert rust_empty is not None
     assert rust_empty["delimiter"] == ";"
+
+
+@pytest.mark.parametrize("shape", sorted(REDOS_SHAPES))
+def test_redos_shapes_agree_in_bounded_time(tmp_path, shape):
+    """Both backends give the same dialect on each shape, each within the bound.
+
+    A super-linear pattern would blow the bound (CPython's pre-fix Sniffer was
+    quadratic on `comma_quote_openers`), or, in Rust, stop at fancy-regex's
+    backtrack limit and answer differently from the oracle.
+    """
+    path = tmp_path / f"{shape}.csv"
+    path.write_text(REDOS_SHAPES[shape](REDOS_LINE_CHARS))
+    results = {}
+    for name, sniff in (("rust", datagrunt_rs.sniff_dialect), ("python", py.sniff_dialect)):
+        start = time.perf_counter()
+        results[name] = sniff(str(path))
+        elapsed = time.perf_counter() - start
+        assert elapsed < REDOS_MAX_SECONDS, f"{name} took {elapsed:.2f}s on {shape}"
+    assert results["rust"] == results["python"], shape

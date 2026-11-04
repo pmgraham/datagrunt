@@ -1,0 +1,1073 @@
+"""Tests for the v5 stream pass's tables and page layout (#368, A4b): stream tables, mastheads, reading order.
+
+The corpus has no borderless table (#368), so these fixtures are the stream
+tables' ground truth. Unit tests build TextLine values directly: boxes are
+displayed, top-left ``(x0, y0, x1, y1)`` points. End-to-end tests build PDFs
+with the ReportLab toolkit (``pdf_tests.builders``) and read them through
+``extract_page``, ``assess_page``, ``find_lattice_tables`` and
+``stream_layout``. Boxes come from the font pdfium substitutes for
+Helvetica, which differs by platform: expected geometry is read from
+pdfium's own boxes in the same run.
+"""
+
+import dataclasses
+import pickle
+import re
+import time
+from collections import Counter
+
+import pytest
+
+from datagrunt.pdf import layout
+from datagrunt.pdf.elements import Table
+from datagrunt.pdf.layout import (
+    LatticeResult,
+    StreamParagraph,
+    StreamTable,
+    TextCell,
+    find_lattice_tables,
+    page_layout,
+    stream_layout,
+    text_lines,
+)
+from datagrunt.pdf.quality import SpanPiece
+from pdf_tests.builders import TextRun
+from pdf_tests.test_layout_classify import described as described_text
+from pdf_tests.test_layout_lattice import box, chars, falling, rising, rules, written
+from pdf_tests.test_layout_stream import cell, column, line, page_of
+from pdf_tests.test_quality import raw_span
+
+NO_TABLES = LatticeResult(tables=(), used_pieces=())
+PARA = "This paragraph runs across the whole width of the page so that it spans every column."
+PARTS = (("Part", "Qty", "Price"), ("Bolt", "4", "0.10"), ("Nut", "12", "0.05"), ("Washer", "100", "0.01"))
+XS = (72.0, 220.0, 360.0)
+
+
+def laid_out(tmp_path, *items, rotate: int = 0):
+    """stream_layout of page 1, through extract_page, assess_page and find_lattice_tables."""
+    page, pieces = page_of(tmp_path, *items, rotate=rotate)
+    lattice = find_lattice_tables(page.segments.segments, pieces)
+    return stream_layout(pieces, lattice, width_pt=page.geometry.width_pt, height_pt=page.geometry.height_pt)
+
+
+def described(items) -> list[tuple]:
+    """Each item as a plain tuple: a table as its grid and header flag, text items as test_layout_classify does."""
+    return [
+        ("table", item.grid(), item.has_header) if isinstance(item, StreamTable) else described_text([item])[0]
+        for item in items
+    ]
+
+
+def table_runs(rows, xs=XS, top: float = 140.0, *, pitch: float = 14.0, **overrides) -> tuple[TextRun, ...]:
+    """One TextRun per non-empty cell text, each row's cells from ``xs``, rows ``pitch`` apart from ``top``."""
+    return tuple(
+        TextRun(text, x, top + pitch * index, **overrides)
+        for index, row in enumerate(rows)
+        for text, x in zip(row, xs)
+        if text
+    )
+
+
+def body_text(top: float = 130.0) -> tuple[TextRun, ...]:
+    """Three lines of 10 pt prose from x 72: one paragraph, the page's body size."""
+    texts = ("The woodland is vast and its creatures many,", "each with its own purpose and", "its own ambitions.")
+    return column(texts, 72.0, top, pitch=12.0, size=10.0)
+
+
+def masthead(tmp_path, gap_over: float, rows: int = 2, **overrides):
+    """Masthead rows and their runs: two columns ``gap_over`` points further apart than 0.40 of a 612 pt page.
+
+    The left column's end is read from pdfium in this run: the font it substitutes for Helvetica sets it.
+    """
+    left = ("ACME Industrial Supply", "1 Harbour Road, Leith", "Edinburgh EH6 6LX")[:rows]
+    right = ("Invoice: 10442", "Date: 2024-03-01", "Terms: 30 days")[:rows]
+    probe = tmp_path / "probe"
+    probe.mkdir(exist_ok=True)
+    _, pieces = page_of(probe, *table_runs(tuple((text,) for text in left), (72.0,), top=60.0, **overrides))
+    x = max(piece.bbox[2] for piece in pieces) + 0.40 * 612.0 + gap_over
+    grid = tuple(zip(left, right))
+    return grid, table_runs(grid, (72.0, x), top=60.0, **overrides)
+
+
+def down_cell(text: str, x: float, y: float) -> TextCell:
+    """A TextCell of ``text`` running down the page from ``(x, y)``, 6 pt a char, boxed exactly."""
+    return TextCell(text=text, bbox=box(x, y, x + 12.0, y + 6.0 * len(text)), pieces=(falling(text, x, y),))
+
+
+def up_cell(text: str, x: float, y: float) -> TextCell:
+    """A TextCell of ``text`` running up the page from ``(x, y)``, 6 pt a char, boxed exactly."""
+    return TextCell(text=text, bbox=box(x, y - 6.0 * len(text), x + 12.0, y), pieces=(rising(text, x, y),))
+
+
+class TestStreamTables:
+    """Runs of 2 or more lines of 2 or more cells, in consistent X-bands, are tables (spec §3.3 Pass B)."""
+
+    def test_a_borderless_3_column_table_between_paragraphs(self, tmp_path):
+        items = laid_out(tmp_path, TextRun(PARA, 72.0, 100.0), *table_runs(PARTS), TextRun(PARA, 72.0, 230.0))
+
+        assert described(items) == [("paragraph", PARA), ("table", PARTS, True), ("paragraph", PARA)]
+
+    def test_a_table_alone_on_its_page_reads_by_rows(self, tmp_path):
+        # Read as text, the XY-cut cuts at the gaps between the columns: "Part Bolt Nut Washer", "Qty", ...
+        assert described(laid_out(tmp_path, *table_runs(PARTS))) == [("table", PARTS, True)]
+
+    def test_a_table_keeps_its_rows_boxes_and_column_centres(self, tmp_path):
+        page, pieces = page_of(tmp_path, *table_runs(PARTS))
+        lattice = find_lattice_tables(page.segments.segments, pieces)
+
+        (table,) = stream_layout(pieces, lattice, width_pt=612.0, height_pt=792.0)
+
+        # Every cell starts where its column was drawn, so each column is at that start (#409), whatever its widest
+        # cell. The table ends where pdfium ends its last column's widest cell, as it boxes it in this run (the
+        # substitute font sets some advances: "Washer" ends 0.15 pt past its Helvetica width on macOS).
+        cells = [found.cells for found in text_lines(pieces, lattice)]
+        assert [{row[col].bbox.x0 for row in cells} for col in range(3)] == [{x} for x in XS]
+        assert table.column_centres == XS
+        # Each column runs from its cells' first start to their last end (#420).
+        extents = [(min(row[col].bbox.x0 for row in cells), max(row[col].bbox.x1 for row in cells)) for col in range(3)]
+        assert table.column_intervals == tuple(extents)
+        assert (table.n_cols, table.columns) == (3, ((0, 1, 2),) * 4)
+        assert [row.text for row in table.rows] == [" ".join(row) for row in PARTS]
+        assert (table.bbox.x0, table.bbox.x1) == (72.0, max(row[2].bbox.x1 for row in cells))
+        assert table.pieces == tuple(piece for row in table.rows for found in row.cells for piece in found.pieces)
+
+    @pytest.mark.parametrize(
+        "rows,has_header",
+        [
+            pytest.param(
+                (("Name", "Qty", "Price"), ("Bolt", "4", "0.10"), ("Nut", "", "0.05"), ("Washer", "10", "")),
+                True,
+                id="missing-body-cells",
+            ),
+            pytest.param(
+                (("", "Qty", "Price"), ("Bolt", "4", "0.10"), ("Nut", "12", "0.05")), False, id="missing-header-cell"
+            ),
+        ],
+    )
+    def test_a_ragged_table_leaves_its_missing_cells_empty(self, tmp_path, rows, has_header):
+        assert described(laid_out(tmp_path, *table_runs(rows))) == [("table", rows, has_header)]
+
+    def test_a_row_of_one_cell_ends_the_table(self, tmp_path):
+        # Known limitation (spec: runs of multi-cell lines): a cell wrapped onto a line of its own splits the table.
+        rows = (("Part", "Qty", "Price"), ("Bolt", "4", "0.10"), ("Spacer", "", ""), ("Nut", "12", "0.05"))
+        rows += (("Washer", "100", "0.01"),)
+
+        assert described(laid_out(tmp_path, *table_runs(rows))) == [
+            ("table", rows[:2], True),
+            ("paragraph", "Spacer"),
+            ("table", rows[3:], True),
+        ]
+
+    def test_a_row_with_a_cell_across_two_columns_ends_the_table(self, tmp_path):
+        # The title's cell reaches from the first column into the second: it fits neither, nor do the rows under it.
+        rows = (("Part", "Qty", "Price"), ("Bolt", "4", "0.10"))
+        title = (TextRun("A title running over the first two columns", 72.0, 168.0), TextRun("x", 360.0, 168.0))
+        under = (("Nut", "12", "0.05"), ("Washer", "100", "0.01"))
+
+        assert described(laid_out(tmp_path, *table_runs(rows), *title, *table_runs(under, top=182.0))) == [
+            ("table", rows, True),
+            ("paragraph", "A title running over the first two columns x"),
+            ("table", under, True),
+        ]
+
+    def test_the_lattice_tables_text_never_enters_a_stream_table(self, tmp_path):
+        xs, ys = (50.0, 150.0, 250.0), (40.0, 60.0, 80.0)
+        items = rules(xs, ys) + written((("Part", "Qty"), ("Bolt", "4")), xs, ys) + table_runs(PARTS)
+
+        assert described(laid_out(tmp_path, *items)) == [("table", PARTS, True)]
+
+    def test_a_table_on_a_page_turned_by_rotate_90_reads_as_written(self, tmp_path):
+        (table,) = laid_out(tmp_path, *table_runs(PARTS), rotate=90)
+
+        # Along its rows the turned table runs down the displayed page: its columns are where their cells start, in
+        # display y (#409).
+        bands = [
+            [
+                found.bbox
+                for row, cols in zip(table.rows, table.columns)
+                for found, at in zip(row.cells, cols)
+                if at == col
+            ]
+            for col in range(3)
+        ]
+        assert table.grid() == PARTS
+        assert {row.turn for row in table.rows} == {90}
+        starts = [{found.y0 for found in band} for band in bands]
+        assert all(len(found) == 1 for found in starts)
+        assert table.column_centres == tuple(found.pop() for found in starts)
+        assert table.column_intervals == tuple((min(b.y0 for b in band), max(b.y1 for b in band)) for band in bands)
+
+    def test_a_table_read_up_the_page_has_its_column_centres_in_reading_order(self):
+        # Text rising up the page reads bottom to top: its first column is the lower one (display y 376-400), each
+        # column where its text starts (#409): at its bottom.
+        rows = [line(up_cell("Name", x, 400.0), up_cell("Value", x, 200.0), turn=270) for x in (10.0, 30.0)]
+
+        (found,) = layout._row_structures(rows, width=612.0, height=792.0)
+
+        assert found.items[0].grid() == (("Name", "Value"), ("Name", "Value"))
+        assert found.items[0].column_centres == (400.0, 200.0)
+        # Its intervals are in display y too, each (least, greatest): "Name" spans 376-400, "Value" 170-200.
+        assert found.items[0].column_intervals == ((376.0, 400.0), (170.0, 200.0))
+
+
+# The 2026-11-02 audit's page 3 (P0-A): a table of figures with no header row, its first row a row like the others.
+FIGURES = (
+    ("2023", "101.4%", "$11,200.00", "+1.4%"),
+    ("2024", "98.2%", "$10,950.00", "-2.2%"),
+    ("2025", "103.0%", "$11,540.00", "+5.4%"),
+)
+FIGURE_XS = (72.0, 160.0, 260.0, 400.0)
+
+
+class TestHeaderRows:
+    """A first row of values like every row under it is a row, not headers, unless it is set apart (P0-A)."""
+
+    def test_a_first_row_of_figures_like_the_rows_under_it_stays_a_row(self, tmp_path):
+        items = laid_out(tmp_path, *table_runs(FIGURES, FIGURE_XS))
+
+        assert described(items) == [("table", FIGURES, False)]
+
+    def test_text_headers_over_rows_of_figures_are_headers(self, tmp_path):
+        rows = (("Year", "Utilization", "Cost", "Change"), *FIGURES)
+
+        assert described(laid_out(tmp_path, *table_runs(rows, FIGURE_XS))) == [("table", rows, True)]
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [pytest.param({"font": "Helvetica-Bold"}, id="bold"), pytest.param({"size": 13.0}, id="larger")],
+    )
+    def test_a_first_row_of_figures_set_apart_from_the_next_is_a_header(self, tmp_path, overrides):
+        # Years over counts: every cell a number, but the first row is set in another weight or size.
+        heads, counts = ("2023", "2024", "2025"), (("1,200", "1,350", "1,500"), ("980", "1,020", "1,110"))
+        runs = (*table_runs((heads,), **overrides), *table_runs(counts, top=154.0))
+
+        assert described(laid_out(tmp_path, *runs)) == [("table", (heads, *counts), True)]
+
+    def test_a_blank_cell_under_the_first_row_takes_no_part(self, tmp_path):
+        rows = (*FIGURES[:2], ("2025", "103.0%", "$11,540.00", ""))
+
+        assert described(laid_out(tmp_path, *table_runs(rows, FIGURE_XS))) == [("table", rows, False)]
+
+    @pytest.mark.parametrize(
+        "rows",
+        [
+            pytest.param((("12", "4"), ("2024-01-31", "5"), ("14", "6")), id="a-date-under-a-number"),
+            pytest.param((("12", "4"), ("13", "5"), ("Total", "9")), id="a-word-in-the-last-row"),
+            pytest.param((("12%", "4"), ("$13", "5")), id="an-amount-under-a-percentage"),
+        ],
+    )
+    def test_a_cell_under_it_of_another_kind_leaves_the_first_row_a_header(self, rows):
+        # Every row under the first must read as it does, column by column: one that does not is a header signal
+        # (a totals row with a word in a figures column, too: a known limitation of the rule).
+        lines = tuple(
+            line(*(cell(text, 10.0 + 100.0 * at, 10.0 + 20.0 * index) for at, text in enumerate(row)))
+            for index, row in enumerate(rows)
+        )
+
+        (found,) = layout._row_structures(list(lines), width=612.0, height=792.0)
+
+        assert (found.items[0].grid(), found.items[0].has_header) == (rows, True)
+
+    @pytest.mark.parametrize(
+        "text,kind",
+        [
+            ("2023", "number"),
+            ("-2.2", "number"),
+            ("+1,200", "number"),
+            ("11,200.00", "number"),
+            ("1.200,50", "number"),
+            (".5", "number"),
+            ("(1,200)", "number"),
+            ("\u22125", "number"),
+            ("11\u00a0200", "number"),
+            ("101.4%", "percent"),
+            ("+1.4 %", "percent"),
+            ("$11,200.00", "currency"),
+            ("-$5.00", "currency"),
+            ("€ 1.200,50", "currency"),
+            ("12 £", "currency"),
+            ("($40.00)", "currency"),
+            ("2023-02-14", "date"),
+            ("14/02/2023", "date"),
+            ("2.14.23", "date"),
+            ("14 Feb 2023", "date"),
+            ("February 14, 2023", "date"),
+            ("Sept. 2023", "date"),
+            ("14-Feb, 2023", "date"),
+            ("14 Feb#2023", None),
+            ("Bolt", None),
+            ("M12 x 1.75", None),
+            ("A.2", None),
+            ("10:30", None),
+            ("1.2.3.4", None),
+            ("1,2,3", None),
+            ("$", None),
+            ("%", None),
+            ("(12", None),
+            ("", None),
+        ],
+    )
+    def test_value_kinds(self, text, kind):
+        assert layout._value_kind(text) == kind
+
+
+class TestBands:
+    """Cells cluster into X-bands by interval projection: a cell joins the band it overlaps or touches, no slack."""
+
+    @pytest.mark.parametrize(
+        "x0,columns",
+        [
+            # Row 1's first cell ends at x 34; row 2's starts at 34 (touching: one band) or 34.5 (a band of its own).
+            pytest.param(34.0, ((0, 1), (0, 1)), id="touching-joins"),
+            pytest.param(34.5, ((0, 2), (1, 2)), id="any-gap-separates"),
+        ],
+    )
+    def test_a_cell_joins_a_band_it_touches(self, x0, columns):
+        first = line(cell("Name", 10.0, 10.0), cell("Value", 200.0, 10.0))
+        second = line(cell("Code", x0, 30.0), cell("Price", 200.0, 30.0))
+
+        (found,) = layout._row_structures([first, second], width=612.0, height=792.0)
+
+        assert found.items[0].columns == columns
+
+    def test_a_line_that_fits_no_band_ends_the_run(self):
+        # Row 3's wide cell reaches both bands of the run; row 4's two cells both fall in row 3's first band.
+        rows = [
+            line(cell("Name", 10.0, 10.0), cell("Value", 200.0, 10.0)),
+            line(cell("Bolt", 10.0, 30.0), cell("4", 200.0, 30.0)),
+            line(cell("Wide" * 10, 10.0, 50.0), cell("x", 300.0, 50.0)),
+            line(cell("Nut", 10.0, 70.0), cell("12", 200.0, 70.0)),
+        ]
+
+        structures = layout._row_structures(rows, width=612.0, height=792.0)
+
+        assert [[row.text for row in found.items[0].rows] for found in structures] == [["Name Value", "Bolt 4"]]
+
+    def test_a_line_whose_cells_overlap_fits_no_band(self):
+        # Never so from text_lines, whose cells are over 1.8 em apart; a hand-made line must not break the bands.
+        # Row 2's cells (x 40-64 and 50-80) overlap each other and meet neither of row 1's bands.
+        rows = [
+            line(cell("Name", 10.0, 10.0), cell("Value", 200.0, 10.0)),
+            line(cell("Name", 40.0, 30.0), cell("Value", 50.0, 30.0)),
+        ]
+
+        assert layout._row_structures(rows, width=612.0, height=792.0) == []
+
+    def test_a_line_of_another_turn_ends_the_run(self):
+        upright = [line(cell("Name", 10.0, 10.0 + 40.0 * at), cell("Value", 200.0, 10.0 + 40.0 * at)) for at in (0, 1)]
+        turned = line(down_cell("Name", 10.0, 100.0), down_cell("Value", 10.0, 300.0), turn=90)
+
+        assert layout._row_structures([upright[0], turned, upright[1]], width=612.0, height=792.0) == []
+
+
+def ending(text: str, end: float, y: float) -> TextCell:
+    """A cell of ``text`` in 6 pt chars ending at ``end``: set flush right."""
+    return cell(text, end - 6.0 * len(text), y)
+
+
+def centred(text: str, middle: float, y: float) -> TextCell:
+    """A cell of ``text`` in 6 pt chars centred on ``middle``."""
+    return cell(text, middle - 3.0 * len(text), y)
+
+
+def positions(*rows) -> tuple[float, ...]:
+    """The column positions (``column_centres``) of the one table ``rows`` make."""
+    (found,) = layout._row_structures(list(rows), width=612.0, height=792.0)
+    (table,) = found.items
+    assert isinstance(table, StreamTable)
+    return table.column_centres
+
+
+class TestColumnPositions:
+    """A column is where its cells align, the edge that varies least down it: not its band's middle (#409).
+
+    The middle of a band moves with the column's widest cell, so the two parts of one split table could
+    differ there; the edge the cells align on does not.
+    """
+
+    def test_text_aligns_on_its_start_and_numbers_on_their_end(self):
+        rows = (
+            line(cell("Washer", 72.0, 10.0), ending("100", 250.0, 10.0)),
+            line(cell("Pin", 72.0, 30.0), ending("8", 250.0, 30.0)),
+        )
+
+        assert positions(*rows) == (72.0, 250.0)
+
+    def test_centred_cells_align_on_their_middle(self):
+        rows = (
+            line(cell("Grade", 72.0, 10.0), centred("AB", 200.0, 10.0)),
+            line(cell("Code", 72.0, 30.0), centred("ABCD", 200.0, 30.0)),
+        )
+
+        assert positions(*rows) == (72.0, 200.0)
+
+    def test_a_column_of_one_width_is_where_its_text_starts(self):
+        # Every edge aligns, so none tells the alignment: the column is at its start, as left-set text is.
+        rows = (
+            line(cell("Pin", 72.0, 10.0), cell("0.01", 200.0, 10.0)),
+            line(cell("Nut", 72.0, 30.0), cell("0.02", 200.0, 30.0)),
+        )
+
+        assert positions(*rows) == (72.0, 200.0)
+
+    def test_a_header_off_the_alignment_moves_no_column(self):
+        # A centred header over flush-right amounts: the column is the amounts' end, the median (their mean is 297.75).
+        rows = (
+            line(cell("Item", 72.0, 10.0), centred("Total", 276.0, 10.0)),
+            line(cell("Bolt", 72.0, 30.0), ending("1,250.00", 300.0, 30.0)),
+            line(cell("Nut", 72.0, 50.0), ending("8.00", 300.0, 50.0)),
+            line(cell("Pin", 72.0, 70.0), ending("16.50", 300.0, 70.0)),
+        )
+
+        assert positions(*rows) == (72.0, 300.0)
+
+    @pytest.mark.parametrize(
+        "starts,position",
+        [
+            # Two cells ending together 36 pt past the first's start: their starts spread 0.09 pt (within the 0.1 pt
+            # slack: a tie, read at the start), exactly 0.1 pt (the float 0.1: a tie too) or 0.11 pt (past it: the
+            # ends, which do not vary, are the alignment).
+            pytest.param((72.0, 72.18), 72.09, id="within-the-slack"),
+            pytest.param((0.0, 0.2), 0.1, id="at-the-slack"),
+            pytest.param((72.0, 72.22), 108.0, id="past-the-slack"),
+        ],
+    )
+    def test_edges_within_the_slack_of_the_least_spread_tie(self, starts, position):
+        end = starts[0] + 36.0
+        rows = tuple(
+            line(
+                TextCell(
+                    text="Washer", bbox=box(start, y, end, y + 12.0), pieces=(chars("Washer", start, y, advance=5.9),)
+                ),
+                cell("100", 200.0, y),
+            )
+            for start, y in zip(starts, (10.0, 30.0))
+        )
+
+        assert positions(*rows)[0] == pytest.approx(position, abs=1e-9)
+
+    def test_each_column_is_inside_its_band_so_they_rise_strictly(self):
+        # Column 0 ends flush at 100, column 1 starts at 100.5: the two edges the bands share are the positions.
+        rows = (
+            line(ending("10", 100.0, 10.0), cell("Bolt", 100.5, 10.0)),
+            line(ending("200", 100.0, 30.0), cell("Nut", 100.5, 30.0)),
+        )
+
+        (found,) = layout._row_structures(list(rows), width=612.0, height=792.0)
+        (table,) = found.items
+        centres, intervals = table.column_centres, table.column_intervals
+
+        assert centres == (100.0, 100.5)
+        ids = {"element_id": "p0001_e000", "page_number": 1, "reading_order": 0, "bbox": box(88.0, 10.0, 124.5, 42.0)}
+        grid = (("10", "Bolt"), ("200", "Nut"))
+        # A1's contract: one strictly increasing centre per column, inside its interval, the intervals' starts rising.
+        measured = {"column_centres": centres, "column_intervals": intervals}
+        assert Table(**ids, headers=(), rows=grid, extraction_method="stream", **measured).column_intervals == intervals
+
+
+def extents(*rows) -> tuple[tuple[float, float], ...]:
+    """The column intervals (``column_intervals``) of the one table ``rows`` make."""
+    (found,) = layout._row_structures(list(rows), width=612.0, height=792.0)
+    (table,) = found.items
+    assert isinstance(table, StreamTable)
+    return table.column_intervals
+
+
+class TestColumnIntervals:
+    """A column's interval runs from its cells' first start to their last end along the rows (#420).
+
+    Its position is where the cells align; its interval is where they lie, so a column whose cells are all one
+    width, which tells no alignment, still shows where its text ends.
+    """
+
+    def test_each_column_runs_from_its_first_start_to_its_last_end(self):
+        rows = (
+            line(cell("Washer", 72.0, 10.0), ending("100", 250.0, 10.0)),
+            line(cell("Pin", 72.0, 30.0), ending("8", 250.0, 30.0)),
+        )
+
+        assert extents(*rows) == ((72.0, 108.0), (232.0, 250.0))
+
+    def test_a_one_width_flush_right_column_still_shows_its_end(self):
+        # The amounts are one width: the column sits at their start (#409), and its interval ends where they end.
+        rows = (
+            line(cell("Pin", 72.0, 10.0), ending("0.02", 250.0, 10.0)),
+            line(cell("Nut", 72.0, 30.0), ending("0.03", 250.0, 30.0)),
+        )
+
+        assert positions(*rows) == (72.0, 226.0)
+        assert extents(*rows) == ((72.0, 90.0), (226.0, 250.0))
+
+    def test_a_header_set_another_way_widens_its_column(self):
+        # A centred header over flush-right amounts: the column sits on the amounts' end, and spans the header too.
+        rows = (
+            line(cell("Item", 72.0, 10.0), centred("Grand total", 276.0, 10.0)),
+            line(cell("Bolt", 72.0, 30.0), ending("8.00", 300.0, 30.0)),
+            line(cell("Nut", 72.0, 50.0), ending("16.50", 300.0, 50.0)),
+        )
+
+        assert positions(*rows) == (72.0, 300.0)
+        assert extents(*rows) == ((72.0, 96.0), (243.0, 309.0))
+
+
+class TestRejections:
+    """Text in rows that is no table: a masthead, a key-value list, prose (spec §3.3 Pass B)."""
+
+    def test_a_2_row_masthead_wider_than_0_40_of_the_page_is_pairs_and_paragraphs(self, tmp_path):
+        _, runs = masthead(tmp_path, 1.0)
+
+        assert described(laid_out(tmp_path, *runs, TextRun(PARA, 72.0, 120.0))) == [
+            ("paragraph", "ACME Industrial Supply"),
+            ("key_value", "Invoice", "10442"),
+            ("paragraph", "1 Harbour Road, Leith"),
+            ("key_value", "Date", "2024-03-01"),
+            ("paragraph", PARA),
+        ]
+
+    @pytest.mark.parametrize("rows", [2, 3, 5], ids=["2-rows", "3-rows", "5-rows"])
+    def test_rows_of_key_value_cells_are_pairs_whatever_the_gap_or_row_count(self, rows):
+        # A two-column form header ("Invoice: 10442 | Date: 2024-03-01"): A6 reads such pairs as header context.
+        keys = (("Invoice", "10442"), ("Date", "2024-03-01"), ("Terms", "30 days"), ("Due", "2024-03-31"))
+        keys += (("Ref", "A-7"), ("Rep", "J. Doe"), ("Ship", "road"), ("Via", "Leith"), ("PO", "991"), ("Desk", "4"))
+        cells = keys[: 2 * rows]
+        pieces = tuple(
+            chars(f"{key}: {value}", 10.0 + 150.0 * (at % 2), 10.0 + 14.0 * (at // 2))
+            for at, (key, value) in enumerate(cells)
+        )
+
+        assert described(stream_layout(pieces, NO_TABLES, width_pt=612.0, height_pt=792.0)) == [
+            ("key_value", key, value) for key, value in cells
+        ]
+
+    def test_a_form_cell_whose_value_is_prose_is_a_paragraph(self):
+        # P2-C: every cell reads "Key: Value", but one value is two sentences of prose.
+        note = "Note: Pay within 30 days. Late payment accrues interest."
+        cells = ("Invoice: 10442", "Date: 2024-03-01", "Terms: 30 days", note)
+        pieces = tuple(chars(text, 10.0 + 150.0 * (at % 2), 10.0 + 14.0 * (at // 2)) for at, text in enumerate(cells))
+
+        assert described(stream_layout(pieces, NO_TABLES, width_pt=612.0, height_pt=792.0)) == [
+            ("key_value", "Invoice", "10442"),
+            ("key_value", "Date", "2024-03-01"),
+            ("key_value", "Terms", "30 days"),
+            ("paragraph", note),
+        ]
+
+    @pytest.mark.parametrize(
+        "rows",
+        [
+            pytest.param((("Name: Bolt", "4"), ("Size: M12", "12")), id="values"),
+            pytest.param((("Name: Bolt", "Size:"), ("Name: Nut", "Size:")), id="keys-with-no-value"),
+        ],
+    )
+    def test_rows_where_only_some_cells_are_pairs_are_a_table(self, rows):
+        pieces = tuple(
+            chars(text, 10.0 + 150.0 * col, 10.0 + 14.0 * row)
+            for row, cells in enumerate(rows)
+            for col, text in enumerate(cells)
+        )
+
+        assert described(stream_layout(pieces, NO_TABLES, width_pt=612.0, height_pt=792.0)) == [("table", rows, True)]
+
+    def test_times_are_no_keys(self):
+        # _KEY_END asks whitespace or the end after the colon: "10:30" holds no key.
+        rows = (("10:30", "11:45"), ("12:00", "13:15"))
+        pieces = tuple(
+            chars(text, 10.0 + 150.0 * col, 10.0 + 14.0 * row)
+            for row, cells in enumerate(rows)
+            for col, text in enumerate(cells)
+        )
+
+        assert described(stream_layout(pieces, NO_TABLES, width_pt=612.0, height_pt=792.0)) == [("table", rows, True)]
+
+    def test_a_masthead_never_heads_its_page(self, tmp_path):
+        # Bold and larger than the body, its cells would be headings as text; a masthead is pairs or paragraphs.
+        _, runs = masthead(tmp_path, 1.0, font="Helvetica-Bold", size=13.0)
+
+        assert [kind for kind, *_ in described(laid_out(tmp_path, *runs, *body_text()))] == [
+            "paragraph",
+            "key_value",
+            "paragraph",
+            "key_value",
+            "paragraph",
+        ]
+
+    @pytest.mark.parametrize(
+        "gap_over,rows",
+        [pytest.param(-1.0, 2, id="gap-under-0.40-of-the-page"), pytest.param(1.0, 3, id="3-rows")],
+    )
+    def test_rows_with_a_narrower_gap_or_more_rows_are_a_table(self, tmp_path, gap_over, rows):
+        grid, runs = masthead(tmp_path, gap_over, rows)
+
+        assert described(laid_out(tmp_path, *runs)) == [("table", grid, True)]
+
+    @pytest.mark.parametrize(
+        "x,kind",
+        [
+            # "Name" ends at x 34: a gap of 400 pt is exactly 0.40 of a 1000 pt page, which is no masthead.
+            pytest.param(434.0, StreamTable, id="exactly-0.40"),
+            pytest.param(434.5, StreamParagraph, id="over-0.40"),
+        ],
+    )
+    def test_a_masthead_gap_is_over_0_40_of_the_page(self, x, kind):
+        rows = [line(cell("Name", 10.0, y), cell("Value", x, y)) for y in (10.0, 30.0)]
+
+        (found,) = layout._row_structures(rows, width=1000.0, height=792.0)
+
+        assert type(found.items[0]) is kind
+
+    @pytest.mark.parametrize(
+        "height,kinds",
+        [
+            # The rows run down the page: their gap (201 pt) is weighed against the page's height, not its width.
+            pytest.param(500.0, [StreamParagraph] * 4, id="over-0.40-of-the-height"),
+            pytest.param(2000.0, [StreamTable], id="under-0.40-of-the-height"),
+        ],
+    )
+    def test_a_turned_masthead_weighs_its_gap_against_the_page_along_its_rows(self, height, kinds):
+        rows = [line(down_cell("Name", x, 10.0), down_cell("Value", x, 235.0), turn=90) for x in (10.0, 30.0)]
+
+        (found,) = layout._row_structures(rows, width=2000.0, height=height)
+
+        assert [type(item) for item in found.items] == kinds
+
+    @pytest.mark.parametrize("alone", [True, False], ids=["alone", "between-paragraphs"])
+    def test_a_key_value_list_is_pairs_not_a_table(self, tmp_path, alone):
+        runs = table_runs((("Weight:", "5 kg"), ("Colour:", "red"), ("Size:", "large")), (72.0, 200.0))
+        around = () if alone else (TextRun(PARA, 72.0, 100.0), TextRun(PARA, 72.0, 230.0))
+        pairs = [("key_value", "Weight", "5 kg"), ("key_value", "Colour", "red"), ("key_value", "Size", "large")]
+
+        found = described(laid_out(tmp_path, *runs, *around))
+
+        assert found == (pairs if alone else [("paragraph", PARA), *pairs, ("paragraph", PARA)])
+
+    @pytest.mark.parametrize(
+        "rows",
+        [
+            pytest.param((("Weight", "5 kg"), ("Colour", "red"), ("Size", "large")), id="keys-without-colons"),
+            pytest.param((("Weight:", "5", "kg"), ("Colour:", "red", "-")), id="three-cells"),
+            pytest.param((("Weight: 5", "kg"), ("Colour: red", "-")), id="values-in-the-key-cells"),
+        ],
+    )
+    def test_rows_that_are_not_one_key_and_one_value_are_a_table(self, tmp_path, rows):
+        assert described(laid_out(tmp_path, *table_runs(rows, (72.0, 200.0, 300.0)))) == [("table", rows, True)]
+
+    def test_two_column_prose_reads_column_by_column(self, tmp_path):
+        left = ("The woodland creatures gathered at", "dawn to plan the long campaign", "against the marquise.")
+        right = ("Their sympathy spread from glade", "to glade, each clearing taking up", "the cause in turn.")
+        items = (*column(left, 72.0, 130.0), *column(right, 316.0, 130.0))
+
+        assert described(laid_out(tmp_path, *items)) == [("paragraph", " ".join(left)), ("paragraph", " ".join(right))]
+
+    def test_two_page_columns_of_short_lines_on_one_baseline_grid_are_no_table(self, tmp_path):
+        # Root's Law p. 31: an index in two columns, each running on past the lines the other shares its baselines
+        # with. The XY-cut reads the columns apart, each holding text no row holds: page columns, not a table.
+        left = ("Battle, 4.3", "ambush in, 4.3.1", "defenseless, 4.3.5", "Cards, 2.1", "Clearings, 2.2", "Craft, 4.1")
+        right = ("Pieces", "limits of, 1.5.1", "ownership of, 1.5.3", "Rivers, 2.3", "Rule, 2.5", "Ruins, 2.2.4")
+        items = (*column(left, 72.0, 100.0), *column(right, 330.0, 100.0))
+        # Their last lines sit 8 pt apart: on no shared line (overlap 0.35 of a line), each close under its column.
+        items += (TextRun("Dominance, 3.3", 72.0, 196.0), TextRun("Setup, 5.1", 330.0, 188.0))
+
+        assert described(laid_out(tmp_path, *items)) == [
+            ("paragraph", " ".join((*left, "Dominance, 3.3"))),
+            ("paragraph", " ".join((*right, "Setup, 5.1"))),
+        ]
+
+    def test_a_table_whose_first_column_has_a_title_over_it_stays_a_table(self, tmp_path):
+        # The title shares the first column's XY-cut segment; the other columns' segments hold only the table.
+        items = laid_out(tmp_path, TextRun("Parts list", 72.0, 120.0), *table_runs(PARTS))
+
+        assert described(items) == [("paragraph", "Parts list"), ("table", PARTS, True)]
+
+    def test_a_table_the_xy_cut_leaves_whole_stays_a_table_beside_free_text(self, tmp_path):
+        # The long second column covers the middle of the page, so the XY-cut finds no gutter: one segment,
+        # shared with the paragraph under the table, holds both columns. They are not page columns.
+        code = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        rows = (("A", code), ("B", code))
+
+        assert described(laid_out(tmp_path, *table_runs(rows, (72.0, 130.0)), TextRun(PARA, 72.0, 200.0))) == [
+            ("table", rows, True),
+            ("paragraph", PARA),
+        ]
+
+    def test_a_key_value_list_in_page_columns_stays_pairs(self, tmp_path):
+        # Only tables are tested for page columns: a key cell and its colon say the rows are pairs.
+        runs = table_runs((("Weight:", "5 kg"), ("Colour:", "red")), (72.0, 330.0), top=100.0)
+        after = (TextRun("Notes on the left", 72.0, 136.0), TextRun("Notes on the right", 330.0, 128.0))
+
+        found = described(laid_out(tmp_path, *runs, *after))
+
+        assert [item for item in found if item[0] == "key_value"] == [
+            ("key_value", "Weight", "5 kg"),
+            ("key_value", "Colour", "red"),
+        ]
+
+    @pytest.mark.parametrize(
+        "first,kind",
+        [
+            # Two rows of two cells: the right ones of 1 word, the left ones of 4 words, or of 3 and 4 words.
+            pytest.param("one two three four", "paragraph", id="half-the-cells-of-4-words"),
+            pytest.param("one two three", "table", id="fewer"),
+        ],
+    )
+    def test_rows_whose_cells_are_half_running_text_are_prose(self, tmp_path, first, kind):
+        rows = ((first, "x"), ("five six seven eight", "y"))
+
+        assert described(laid_out(tmp_path, *table_runs(rows, (72.0, 300.0))))[0][0] == kind
+
+
+class TestStreamLayout:
+    """The page's stream text in reading order: tables and rows kept whole, the rest classified."""
+
+    def test_every_char_is_read_once(self, tmp_path):
+        _, top = masthead(tmp_path, 1.0)
+        xs, ys = (50.0, 150.0, 250.0), (300.0, 320.0, 340.0)
+        ruled = rules(xs, ys) + written((("Part", "Qty"), ("Bolt", "4")), xs, ys)
+        items = (*top, TextRun("Overview", 72.0, 110.0, size=16.0), *body_text(), *table_runs(PARTS, top=200.0))
+        page, pieces = page_of(tmp_path, *items, *ruled, TextRun("• last", 72.0, 400.0))
+        lattice = find_lattice_tables(page.segments.segments, pieces)
+
+        found = stream_layout(pieces, lattice, width_pt=page.geometry.width_pt, height_pt=page.geometry.height_pt)
+
+        def chars_of(source):
+            return Counter(char for piece in source for char in piece.text if not char.isspace())
+
+        visible = chars_of(piece for piece in pieces if not piece.hidden_reasons)
+        assert chars_of(piece for item in found for piece in item.pieces) == visible - chars_of(lattice.used_pieces)
+        assert [type(item).__name__ for item in found] == [
+            "StreamParagraph",
+            "StreamKeyValue",
+            "StreamParagraph",
+            "StreamKeyValue",
+            "StreamHeading",
+            "StreamParagraph",
+            "StreamTable",
+            "StreamList",
+        ]
+
+    def test_the_body_size_is_read_from_the_text_outside_the_rows(self, tmp_path):
+        # The table's 160 chars of 12 pt outweigh the body's 10 pt: read with them, the body size would be 12 pt
+        # and an 11.5 pt line no heading. Read without them, it is 1.15 times the body.
+        rows = (("Washer M12", "100", "0.01"),) * 10
+        table = table_runs(rows, top=200.0, pitch=16.0, size=12.0)
+        items = (TextRun("Parts", 72.0, 100.0, size=11.5), *body_text(), *table)
+
+        assert described(laid_out(tmp_path, *items))[0] == ("heading", 1, "Parts")
+
+    def test_a_list_never_runs_across_a_table(self, tmp_path):
+        items = (TextRun("• one", 72.0, 100.0), *table_runs(PARTS, top=130.0), TextRun("• two", 72.0, 200.0))
+
+        assert described(laid_out(tmp_path, *items)) == [
+            ("list", False, [("•", "one")]),
+            ("table", PARTS, True),
+            ("list", False, [("•", "two")]),
+        ]
+
+    def test_no_text_no_items(self):
+        assert stream_layout((), NO_TABLES, width_pt=612.0, height_pt=792.0) == ()
+
+    @pytest.mark.parametrize(
+        "overrides,error,message",
+        [
+            pytest.param(
+                {"pieces": [chars("x", 0.0, 0.0)]}, TypeError, "pieces must be a tuple, got list", id="pieces"
+            ),
+            pytest.param({"lattice": None}, TypeError, "lattice must be a LatticeResult, got NoneType", id="lattice"),
+            pytest.param({"width_pt": 0.0}, ValueError, "width_pt must be > 0, got 0.0", id="width-zero"),
+            pytest.param(
+                {"height_pt": "1"}, TypeError, "height_pt must be an int or float, got '1' (str)", id="height"
+            ),
+        ],
+    )
+    def test_invalid_argument_raises(self, overrides, error, message):
+        fields = {"pieces": (), "lattice": NO_TABLES, "width_pt": 612.0, "height_pt": 792.0}
+
+        with pytest.raises(error, match=f"^{re.escape(message)}$"):
+            stream_layout(**(fields | overrides))
+
+
+class TestStreamLayoutBounds:
+    """Adversarial pages of 20 000 pieces lay out within bounds: banding O(c b) for b <= 500, the XY-cut O(D n log n).
+
+    Each bound is generous: it catches a pass gone quadratic (20 000 squared steps take minutes), not a slow runner.
+    """
+
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_a_grid_of_20_000_one_char_pieces_is_one_table(self):
+        # Every char 24 pt clear of the next: over 1.8 em of 11 pt, so a cell of its own, in a column of its own.
+        pieces = tuple(chars("x", 30.0 * col, 14.0 * row) for row in range(100) for col in range(200))
+
+        started = time.perf_counter()
+        (table,) = stream_layout(pieces, NO_TABLES, width_pt=6000.0, height_pt=1400.0)
+        elapsed = time.perf_counter() - started
+
+        assert (len(table.rows), table.n_cols) == (100, 200)
+        assert elapsed < 2.0, f"{elapsed:.2f} s"
+
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_20_000_pieces_in_lines_that_never_fit_the_line_before(self):
+        # Odd lines' first cell (x 0-60) spans both cells of an even line (x 0-10, 40-46); an even line's two
+        # cells both fall in an odd line's first band. Every line ends a run and starts one.
+        pieces = []
+        for row in range(10_000):
+            if row % 2:
+                pieces += [chars("abcdefghij", 0.0, 14.0 * row), chars("k", 100.0, 14.0 * row)]
+            else:
+                pieces += [chars("ab", 0.0, 14.0 * row, advance=5.0), chars("c", 40.0, 14.0 * row)]
+
+        started = time.perf_counter()
+        found = stream_layout(tuple(pieces), NO_TABLES, width_pt=612.0, height_pt=140_100.0)
+        elapsed = time.perf_counter() - started
+
+        assert not [item for item in found if isinstance(item, StreamTable)]
+        assert sum(len(item.pieces) for item in found) == 20_000
+        # Linear: 10 000, 20 000 and 40 000 pieces take 0.24, 0.49 and 0.99 s on a laptop; CI runners took 2.2-2.3 s
+        # for these 20 000 against a 2 s bound.
+        assert elapsed < 6.0, f"{elapsed:.2f} s"
+
+
+def zero_width(text: str, x: float, y: float) -> SpanPiece:
+    """A visible piece of ``text`` whose every char box is the 1 pt line at ``x`` from ``y``, at 1 pt."""
+    boxes = tuple((x, y, x, y + 1.0) for _ in text)
+    return SpanPiece(
+        span=raw_span(text, boxes, font_size_pt=1.0, em_width_pt=1.0), start=0, end=len(text), hidden_reasons=()
+    )
+
+
+def staircase(rows: int, top: float = 5.0) -> tuple[SpanPiece, ...]:
+    """``rows`` lines of two cells from y ``top``, "A" and "B", each line's a thousandth of a point right of the last's.
+
+    The cells have no width, so no cell meets a band of the lines before: every line adds two bands.
+    """
+    pieces: list[SpanPiece] = []
+    for row in range(rows):
+        y = top + 1.5 * row
+        pieces += [zero_width("A", 10.0 + 0.001 * row, y), zero_width("B", 20.0 + 0.001 * row, y)]
+    return tuple(pieces)
+
+
+def shapes(items) -> list[tuple[int, int]]:
+    """Each stream table's rows and columns."""
+    return [(len(item.rows), item.n_cols) for item in items if isinstance(item, StreamTable)]
+
+
+class TestStreamTableGridBounds:
+    """A run has at most MAX_STREAM_COLUMNS bands, and a page's stream tables at most MAX_STREAM_GRID_UNITS cells."""
+
+    def test_the_bounds_are_a4as(self):
+        assert (
+            (layout.MAX_STREAM_COLUMNS, layout.MAX_STREAM_GRID_UNITS) == (500, layout.MAX_GRID_UNITS) == (500, 250_000)
+        )
+
+    def test_a_500_column_table_reads_as_a_table(self):
+        pieces = tuple(chars("x", 30.0 * col, 14.0 * row) for row in range(2) for col in range(500))
+
+        found = stream_layout(pieces, NO_TABLES, width_pt=15_100.0, height_pt=100.0)
+
+        assert shapes(found) == [(2, 500)]
+
+    def test_a_run_that_needs_501_bands_is_split(self):
+        # 250 lines make 500 bands: the 251st would make 502, so it starts the next run.
+        found = stream_layout(staircase(252), NO_TABLES, width_pt=600.0, height_pt=400.0)
+
+        assert shapes(found) == [(250, 500), (2, 4)]
+
+    def test_a_line_of_501_cells_starts_no_run(self):
+        pieces = tuple(chars("x", 30.0 * col, 14.0 * row) for row in range(2) for col in range(501))
+
+        found = stream_layout(pieces, NO_TABLES, width_pt=15_100.0, height_pt=100.0)
+
+        assert shapes(found) == []
+        assert sum(len(item.pieces) for item in found) == 1002
+
+    @pytest.mark.parametrize("chars_on_page", [8000, 20_000])
+    def test_a_staircase_makes_no_grid_over_the_page_bound_and_warns(self, chars_on_page):
+        rows = chars_on_page // 2
+
+        found = page_layout(staircase(rows), (), NO_TABLES, width_pt=600.0, height_pt=10.0 + 1.5 * rows)
+
+        tables = shapes(found.items)
+        assert tables == [(250, 500), (250, 500)]
+        over = rows // 250 - len(tables)
+        assert found.warnings == (
+            f"{over} borderless table(s) over the 250000-cell page bound: their text reads as paragraphs",
+        )
+        assert sum(len(item.pieces) for item in found.items) == chars_on_page
+
+    def test_the_page_bound_counts_every_table_together(self, monkeypatch):
+        monkeypatch.setattr(layout, "MAX_STREAM_GRID_UNITS", 8 + 8)
+
+        # A line of one cell between them ends each run.
+        pieces = (*staircase(2), chars("Break", 10.0, 50.0), *staircase(2, 100.0), chars("Break", 10.0, 150.0))
+        pieces += staircase(2, 200.0)
+
+        found = page_layout(pieces, (), NO_TABLES, width_pt=600.0, height_pt=400.0)
+
+        assert shapes(found.items) == [(2, 4), (2, 4)]
+        assert found.warnings == ("1 borderless table(s) over the 16-cell page bound: their text reads as paragraphs",)
+
+    def test_the_page_bound_spends_nothing_on_key_values_or_mastheads(self, monkeypatch):
+        monkeypatch.setattr(layout, "MAX_STREAM_GRID_UNITS", 0)
+        pairs = (chars("Weight:", 72.0, 10.0), chars("5 kg", 220.0, 10.0), chars("Colour:", 72.0, 24.0))
+        pairs += (chars("red", 220.0, 24.0),)
+
+        found = page_layout(pairs, (), NO_TABLES, width_pt=612.0, height_pt=792.0)
+
+        assert ([type(item).__name__ for item in found.items], found.warnings) == (["StreamKeyValue"] * 2, ())
+
+    def test_a_table_exactly_at_the_page_bound_is_a_table(self, monkeypatch):
+        monkeypatch.setattr(layout, "MAX_STREAM_GRID_UNITS", 8)
+
+        found = page_layout(staircase(2), (), NO_TABLES, width_pt=600.0, height_pt=400.0)
+
+        assert (shapes(found.items), found.warnings) == ([(2, 4)], ())
+
+
+def two_rows():
+    """Two lines of two cells: Part | Qty, Bolt | 4."""
+    return (
+        line(cell("Part", 10.0, 10.0), cell("Qty", 100.0, 10.0)),
+        line(cell("Bolt", 10.0, 30.0), cell("4", 100.0, 30.0)),
+    )
+
+
+def table(**overrides) -> StreamTable:
+    """A valid StreamTable of two_rows, with ``overrides``."""
+    fields = {
+        "rows": two_rows(),
+        "columns": ((0, 1), (0, 1)),
+        "column_centres": (22.0, 109.0),
+        "column_intervals": ((10.0, 34.0), (100.0, 118.0)),
+    }
+    return StreamTable(**(fields | {"bbox": box(10.0, 10.0, 124.0, 42.0)} | overrides))
+
+
+class TestStreamTableRecord:
+    """StreamTable is a frozen, slotted, picklable, validated record; its grid, header and pieces derive from it."""
+
+    def test_pickle_round_trip_frozen_and_slotted(self):
+        original = table()
+
+        assert pickle.loads(pickle.dumps(original)) == original
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            original.rows = ()
+        assert not hasattr(original, "__dict__")
+
+    def test_grid_header_and_pieces(self):
+        rows = (two_rows()[0], line(cell("4", 100.0, 30.0)))
+        found = table(rows=rows, columns=((0, 1), (1,)))
+
+        assert found.grid() == (("Part", "Qty"), ("", "4"))
+        assert found.has_header
+        assert found.n_cols == 2
+        assert found.pieces == rows[0].cells[0].pieces + rows[0].cells[1].pieces + rows[1].cells[0].pieces
+
+    def test_a_blank_first_row_cell_means_no_header(self):
+        rows = (line(cell("Qty", 100.0, 10.0)), two_rows()[1])
+
+        assert not table(rows=rows, columns=((1,), (0, 1))).has_header
+
+    @pytest.mark.parametrize(
+        "overrides,error,message",
+        [
+            pytest.param({"rows": list(two_rows())}, TypeError, "rows must be a tuple, got list", id="rows-list"),
+            pytest.param(
+                {"rows": two_rows()[:1], "columns": ((0, 1),)},
+                ValueError,
+                "rows must hold at least 2 rows, got 1",
+                id="one-row",
+            ),
+            pytest.param({"columns": [(0, 1), (0, 1)]}, TypeError, "columns must be a tuple, got list", id="list"),
+            pytest.param(
+                {"columns": ((0, 1),)}, ValueError, "columns must hold one entry per row (2), got 1", id="count"
+            ),
+            pytest.param(
+                {"columns": ((0, 1), (0,))},
+                ValueError,
+                "columns[1] must place each of the row's 2 cells, got (0,)",
+                id="row-count",
+            ),
+            pytest.param(
+                {"columns": ((0, 1), (1, 0))},
+                ValueError,
+                "columns[1] must rise strictly within 0..1, got (1, 0)",
+                id="not-rising",
+            ),
+            pytest.param(
+                {"columns": ((0, 1), (0, 2))},
+                ValueError,
+                "columns[1] must rise strictly within 0..1, got (0, 2)",
+                id="past-the-last",
+            ),
+            pytest.param(
+                {"columns": ((0, 1), (0, True))},
+                TypeError,
+                "columns[1][1] must be an int, got True (bool)",
+                id="column-bool",
+            ),
+            pytest.param(
+                {"column_centres": [22.0, 109.0]},
+                TypeError,
+                "column_centres must be a tuple, got list",
+                id="centres-list",
+            ),
+            pytest.param(
+                {"column_centres": (22.0,)},
+                ValueError,
+                "column_centres must hold at least 2 columns, got 1",
+                id="one-column",
+            ),
+            pytest.param(
+                {"column_centres": (22.0, 109.0, 200.0)},
+                ValueError,
+                "every column must hold a cell: column 2 holds none",
+                id="empty-column",
+            ),
+            pytest.param(
+                {"column_centres": (22.0, float("nan"))},
+                ValueError,
+                "column_centres[1] must be finite, got nan",
+                id="centre-nan",
+            ),
+            pytest.param(
+                {"column_intervals": [(10.0, 34.0), (100.0, 118.0)]},
+                TypeError,
+                "column_intervals must be a tuple, got list",
+                id="intervals-list",
+            ),
+            pytest.param(
+                {"column_intervals": ((10.0, 34.0),)},
+                ValueError,
+                "column_intervals must hold one interval per column (2), got 1",
+                id="intervals-count",
+            ),
+            pytest.param(
+                {"column_intervals": ((10.0, 34.0), (118.0, 100.0))},
+                ValueError,
+                "column_intervals[1] must have start <= end, got (118.0, 100.0)",
+                id="interval-reversed",
+            ),
+            pytest.param(
+                {"column_intervals": ((10.0, 34.0), (100.0, float("nan")))},
+                ValueError,
+                "column_intervals[1][1] must be finite, got nan",
+                id="interval-nan",
+            ),
+            pytest.param(
+                {"column_intervals": ((10.0, 20.0), (100.0, 118.0))},
+                ValueError,
+                "column_centres[0] 22.0 must lie within column_intervals[0] (10.0, 20.0)",
+                id="centre-outside",
+            ),
+            pytest.param({"bbox": None}, TypeError, "bbox must be a BBox, got NoneType", id="bbox-none"),
+            pytest.param(
+                {"bbox": box(10.0, 10.0, 50.0, 42.0)},
+                ValueError,
+                "rows[0].bbox must lie within the bbox, got BBox(x0=10.0, y0=10.0, x1=118.0, y1=22.0) in "
+                "BBox(x0=10.0, y0=10.0, x1=50.0, y1=42.0)",
+                id="row-outside",
+            ),
+        ],
+    )
+    def test_invalid_field_raises(self, overrides, error, message):
+        with pytest.raises(error, match=f"^{re.escape(message)}$"):
+            table(**overrides)

@@ -41,3 +41,28 @@ class PDFCorruptError(DatagruntPDFError, RuntimeError):
             int_at_least("page_number", page_number, 1)
         super().__init__(message)
         self.page_number = page_number
+
+
+class PDFSourceChangedError(DatagruntPDFError):
+    """The source PDF changed while it was extracted: its pages and its recorded SHA-256 could disagree.
+
+    Raised whatever ``strict`` says: the whole document is inconsistent, not
+    one page, so no document is returned. The message names what changed:
+    the file's inode (it was replaced), its size or its modification time.
+    A page image's read (``PageImage.read_bytes``, ``read_bands``) raises it
+    too when the file at the source path no longer holds the document's
+    bytes (a file of another identity whose SHA-256 is not the document's),
+    is gone or not a regular file, or changes while the page is drawn: no
+    image of other bytes than the pages is returned. A file only touched,
+    or rewritten with the same bytes, is drawn.
+    """
+
+
+class BundleCorruptError(DatagruntPDFError):
+    """A bundle is not what its manifest says, so it is not loaded.
+
+    The manifest is invalid, or an artifact it lists is missing, not a
+    regular file, of another size or sha256, or out of the bundle, or the
+    document disagrees with the manifest. The message names the artifact
+    (its path in the bundle, or ``manifest.json``).
+    """

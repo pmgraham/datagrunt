@@ -1,0 +1,348 @@
+"""Cross-page scope for the v5 PDF document model (#370, A6: spec §3.3 step 5).
+
+Internal: not exported from ``datagrunt`` or ``datagrunt.pdf``. Pure: it
+reads A1 :class:`~datagrunt.pdf.elements.Page` values only and calls no
+pdfium function. A1 types are frozen, so changed elements and pages are
+rebuilt with :func:`dataclasses.replace`; element ids and reading order never
+change.
+
+:func:`apply_scope` applies its rules to pages 1..N in document order, each in one walk:
+
+0. **Heading levels** (P1-A). A heading's tier is its ``font_size_pt`` and
+   ``is_bold`` (A4b: its first line's size to 0.5 pt, and boldness). The
+   document's tiers are the distinct tiers of its visible headings, ranked
+   by size, largest first, and at one size bold first. Each heading with a
+   tier, hidden ones included, takes as its ``level`` 1 + the number of
+   those tiers ranked above its own, at most 6. A hidden heading's tier is
+   not among them, so hidden text cannot shift a visible heading's level;
+   a heading with no tier keeps its level. Layout ranks each page's
+   headings apart, so a page whose largest heading is a section made it
+   level 1, and it popped the open chapter (the 2026-11-02 audit). Ranked
+   over the document, a level means the same tier on every page.
+1. **Heading stack.** A visible level-L ``Heading`` pops every heading of
+   level >= L and pushes itself. Every element's ``scope_path`` becomes the
+   stack's texts, outermost first; a visible heading's includes its own text
+   (A1: a heading opens its own scope). A hidden heading never pushes or
+   pops, so hidden text cannot re-scope visible content; its own
+   ``scope_path`` is the current path plus its text (A1 requires a heading's
+   path to end with its text), and every other hidden element gets the
+   current path.
+2. **Header context.** Page 1's visible ``KeyValue`` elements that come, in
+   reading order, before its first visible ``Table`` or ``Heading`` (an
+   invoice's number and date above its line items, say).
+3. **Split tables.** When page p's last visible element is a ``Table`` and
+   page p+1's first visible element is a ``Table`` with as many columns,
+   each column one with the other's (:func:`_one_column`), the second
+   continues the first: its ``continued_from_id`` names the first, and
+   its headers are the first's. A header row it repeats (the first's
+   cells, runs of whitespace aside) is its headers, as it is, whether
+   read as its headers or as its first row (when headerless: A4b takes
+   an all-value row for headers only when set apart, so a repeat set
+   like the rows is its first row). Any other first row is data (D5):
+   A4a takes a page's first row for headers when none of its cells is
+   blank, as a continuation's first data row often is, so that row goes
+   back to the head of its rows. No row is lost or added; only a
+   repeated header row stays out of the rows.
+   A column is one when its centres lie within
+   :data:`SPLIT_TABLE_TOLERANCE_PT`, or (#420) when one part sits on its
+   interval's end (set flush right) and the other on its interval's start
+   (set flush left, or of one width: such a column tells no alignment and
+   sits at its start, #409) and the two intervals' ends lie within
+   :data:`_END_TOLERANCE_PT`. Both tables need ``column_centres``, which
+   A1 sets with ``column_intervals``; without them there is no link.
+   Chains link pairwise (p -> p+1 -> p+2). A link already on a table is
+   left alone: the table keeps it, and its headers and rows.
+4. **Sections.** One flat A1 ``Section`` per visible heading, holding that
+   heading (as ``elements[0]``) and everything after it up to the next
+   visible heading of any level, plus a leading heading-less section for
+   what comes before the first visible heading (only if there is any).
+   A1 sections do not nest (every element shares its section's
+   ``scope_path``), so a subsection is its own section and nesting is read
+   from ``scope_path`` prefixes. ``page_span`` runs from the section's first
+   element's page to its last's.
+
+The stack holds at most six entries (levels 1-6 strictly increase down it),
+so each walk is O(total elements); rule 0 adds O(log tiers) per heading (a
+binary search of the sorted tiers), and rule 3 O(columns) per page boundary.
+
+Known limitations:
+
+- A visible element above a continuation (a running page header, say)
+  makes it not page p+1's first visible element, so it does not link.
+- A continuation whose first row is a header row that does not repeat
+  the first part's (other words, not only other whitespace) cannot be
+  told from a data row: it becomes the first of its rows.
+- A hidden heading is in no section: A1 makes a heading's ``scope_path``
+  end with its own text and a section's elements share its path, so a
+  heading that opens no scope fits none. It stays in its page's elements.
+- Of a column that tells no alignment, only its end stands in, and only
+  against a part set flush right. Two parts that both tell none meet only
+  by their centres (their starts), and a part of one width set centred,
+  wider than twice the tolerance, does not meet the other part's middle:
+  pairing ends of two start-set parts would pair left-set columns of
+  different tables whose ends meet, and pairing middles links tables
+  centred on each other's bands (#409's probe N2).
+"""
+
+import dataclasses
+from bisect import bisect_left
+from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import TypeAlias
+
+from datagrunt.pdf._validate import typed_tuple
+from datagrunt.pdf.elements import DocumentElement, Heading, KeyValue, Page, Section, Table
+
+# How far apart, in points, the same column's centres may lie on the two parts of a split table (spec §3.3).
+SPLIT_TABLE_TOLERANCE_PT = 8.0
+# How far apart, in points, the two parts' interval ends may lie where one part sits on its end and the other on its
+# start (#420). A split's flush-right ends share one anchor. In #409's Monte Carlo every split links at 1 pt, and
+# different tables link within 0.1 percentage points as often as by centres alone (at 8 pt, up to 1.2 more).
+_END_TOLERANCE_PT = 1.0
+# How far, in points, a column's centre may lie from its interval's start or end and still sit on it: layout's tie
+# slack (#409). pdfium boxes a flush-right column's ends up to 3e-5 pt apart, so its median end is not its last.
+_EDGE_SLACK_PT = 0.1
+
+# A1's deepest heading level.
+_MAX_LEVEL = 6
+
+# The open headings as (level, text), outermost first; levels strictly increase.
+_Stack: TypeAlias = tuple[tuple[int, str], ...]
+# A heading tier's rank key: its size negated, then not bold, so the most prominent tier sorts first.
+_Rank: TypeAlias = tuple[float, bool]
+# One part's column: its centre and its interval, (start, end).
+_Column: TypeAlias = tuple[float, tuple[float, float]]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ScopeResult:
+    """What :func:`apply_scope` derives from a document's pages.
+
+    Attributes:
+        pages: The pages, each element carrying its ``scope_path``.
+        sections: Flat, heading-scoped runs of the pages' own elements, in
+            document order (see rule 4).
+        header_context: Page 1's visible key-values that head the document,
+            in reading order: the elements of ``pages[0]`` themselves.
+    """
+
+    pages: tuple[Page, ...]
+    sections: tuple[Section, ...]
+    header_context: tuple[KeyValue, ...]
+
+    def __post_init__(self) -> None:
+        typed_tuple("pages", self.pages, Page)
+        typed_tuple("sections", self.sections, Section)
+        typed_tuple("header_context", self.header_context, KeyValue)
+
+
+def apply_scope(pages: tuple[Page, ...]) -> ScopeResult:
+    """Return ``pages`` scoped (``scope_path``, split-table links), plus their sections and header context.
+
+    Args:
+        pages: The document's pages, numbered 1..N in order.
+
+    Raises:
+        TypeError: If ``pages`` is not a tuple of ``Page``.
+        ValueError: If the pages are not numbered 1..N in order.
+    """
+    _check_pages(pages)
+    scoped = _link_split_tables(_scope_pages(pages))
+    return ScopeResult(pages=scoped, sections=_sections(scoped), header_context=_header_context(scoped))
+
+
+def _check_pages(pages: object) -> None:
+    """Require a tuple of ``Page`` numbered 1..N in order (document order is page order)."""
+    checked = typed_tuple("pages", pages, Page)
+    for index, item in enumerate(checked):
+        if item.page_number != index + 1:
+            raise ValueError(f"pages[{index}] has page_number {item.page_number}, expected {index + 1}")
+
+
+def _scope_pages(pages: tuple[Page, ...]) -> tuple[Page, ...]:
+    """Return the pages with each heading's level ranked (rule 0), then each ``scope_path`` from the stack (rule 1)."""
+    ranks = _visible_ranks(pages)
+    stack: _Stack = ()
+    scoped: list[Page] = []
+    for item in pages:
+        elements: list[DocumentElement] = []
+        for element in item.elements:
+            ranked = _ranked(element, ranks)
+            stack, path = _step(stack, ranked)
+            elements.append(ranked if ranked.scope_path == path else dataclasses.replace(ranked, scope_path=path))
+        scoped.append(dataclasses.replace(item, elements=tuple(elements)))
+    return tuple(scoped)
+
+
+def _visible_ranks(pages: tuple[Page, ...]) -> list[_Rank]:
+    """The rank keys of the distinct tiers of the document's visible headings, most prominent first (rule 0)."""
+    found = {
+        rank
+        for item in pages
+        for element in item.elements
+        if isinstance(element, Heading) and not element.is_hidden
+        for rank in _rank_of(element)
+    }
+    return sorted(found)
+
+
+def _rank_of(heading: Heading) -> tuple[_Rank, ...]:
+    """The heading's rank key, ``(-font_size_pt, not is_bold)``; none when it has no tier."""
+    if heading.font_size_pt is None or heading.is_bold is None:
+        return ()
+    return ((-heading.font_size_pt, not heading.is_bold),)
+
+
+def _ranked(element: DocumentElement, ranks: list[_Rank]) -> DocumentElement:
+    """``element``, a heading with a tier given 1 + the visible tiers ranked above its own as its level (at most 6)."""
+    if not isinstance(element, Heading):
+        return element
+    found = _rank_of(element)
+    if not found:
+        return element
+    level = min(1 + bisect_left(ranks, found[0]), _MAX_LEVEL)
+    return element if element.level == level else dataclasses.replace(element, level=level)
+
+
+def _step(stack: _Stack, element: DocumentElement) -> tuple[_Stack, tuple[str, ...]]:
+    """Return the stack after ``element`` and the element's own ``scope_path``."""
+    path = tuple(text for _, text in stack)
+    if not isinstance(element, Heading):
+        return stack, path
+    if element.is_hidden:
+        return stack, (*path, element.text)
+    pushed = (*(entry for entry in stack if entry[0] < element.level), (element.level, element.text))
+    return pushed, tuple(text for _, text in pushed)
+
+
+def _link_split_tables(pages: tuple[Page, ...]) -> tuple[Page, ...]:
+    """Return the pages with each split table's continuation linked to its previous part (rule 3).
+
+    Each page is linked against the already-linked previous page, so headers
+    a continuation took pass on down a chain.
+    """
+    linked: list[Page] = []
+    for item in pages:
+        linked.append(_continue_from(linked[-1], item) if linked else item)
+    return tuple(linked)
+
+
+def _continue_from(previous: Page, item: Page) -> Page:
+    """Return ``item`` with its leading table linked to ``previous``'s trailing table if they are one table.
+
+    A leading table already linked is left alone (rule 3).
+    """
+    tail = _first_visible(reversed(previous.elements))
+    head = _first_visible(item.elements)
+    if not isinstance(tail, Table) or not isinstance(head, Table) or head.continued_from_id is not None:
+        return item
+    if not _same_columns(tail, head):
+        return item
+    joined = _joined(head, tail)
+    return dataclasses.replace(
+        item, elements=tuple(joined if element is head else element for element in item.elements)
+    )
+
+
+def _joined(head: Table, tail: Table) -> Table:
+    """``head`` linked to ``tail``: a header row repeating ``tail``'s is its headers, any other row is a row (rule 3).
+
+    The repeat is ``head``'s headers when its page read it as a header
+    row, else its first row (A4b reads an all-value row as one only when
+    set apart): either way it stays out of the rows, as it is.
+    """
+    if head.headers and _repeats(head.headers, tail.headers):
+        return dataclasses.replace(head, continued_from_id=tail.element_id)
+    if not head.headers and head.rows and _repeats(head.rows[0], tail.headers):
+        return dataclasses.replace(head, continued_from_id=tail.element_id, headers=head.rows[0], rows=head.rows[1:])
+    rows = (head.headers, *head.rows) if head.headers else head.rows
+    return dataclasses.replace(head, continued_from_id=tail.element_id, headers=tail.headers, rows=rows)
+
+
+def _repeats(cells: tuple[str, ...], headers: tuple[str, ...]) -> bool:
+    """True if ``cells`` are ``headers`` cell for cell, runs of whitespace aside (a header row repeated)."""
+    if len(cells) != len(headers):
+        return False
+    return all(cell.split() == header.split() for cell, header in zip(cells, headers, strict=True))
+
+
+def _first_visible(elements: Iterable[DocumentElement]) -> DocumentElement | None:
+    """Return the first element that is not hidden, or None."""
+    return next((element for element in elements if not element.is_hidden), None)
+
+
+def _same_columns(first: Table, second: Table) -> bool:
+    """True if both tables have column centres, as many columns, and each column one (:func:`_one_column`).
+
+    A1 sets ``column_intervals`` exactly when ``column_centres``, so tables with centres have both.
+    """
+    if not first.column_centres or len(first.column_centres) != len(second.column_centres):
+        return False
+    tail = zip(first.column_centres, first.column_intervals, strict=True)
+    head = zip(second.column_centres, second.column_intervals, strict=True)
+    return all(_one_column(left, right) for left, right in zip(tail, head, strict=True))
+
+
+def _one_column(first: _Column, second: _Column) -> bool:
+    """True if two parts' columns are one: centres within the tolerance, or ends within 1 pt, end paired with start.
+
+    The ends pair only when one part sits on its end and the other on its
+    start, either way round: a flush-right column, and its other part of
+    one width, which tells no alignment and so sits at its start (#420).
+    """
+    (centre, (_, end)), (other_centre, (_, other_end)) = first, second
+    if abs(centre - other_centre) <= SPLIT_TABLE_TOLERANCE_PT:
+        return True
+    if abs(end - other_end) > _END_TOLERANCE_PT:
+        return False
+    return (_sits_on(first, 1) and _sits_on(second, 0)) or (_sits_on(second, 1) and _sits_on(first, 0))
+
+
+def _sits_on(column: _Column, edge: int) -> bool:
+    """True if the column's centre lies within :data:`_EDGE_SLACK_PT` of its interval's start (0) or end (1)."""
+    centre, interval = column
+    return abs(centre - interval[edge]) <= _EDGE_SLACK_PT
+
+
+def _sections(pages: tuple[Page, ...]) -> tuple[Section, ...]:
+    """Return a flat section per visible heading, after a leading heading-less one if needed (rule 4)."""
+    found: list[Section] = []
+    heading: Heading | None = None
+    members: list[DocumentElement] = []
+    for element in (element for item in pages for element in item.elements):
+        if not isinstance(element, Heading):
+            members.append(element)
+        elif not element.is_hidden:
+            found.extend(_section(heading, members))
+            heading, members = element, [element]
+    found.extend(_section(heading, members))
+    return tuple(found)
+
+
+def _section(heading: Heading | None, members: list[DocumentElement]) -> tuple[Section, ...]:
+    """Return the section of ``members`` under ``heading``, or nothing when there are no members."""
+    if not members:
+        return ()
+    return (
+        Section(
+            heading=heading,
+            scope_path=() if heading is None else heading.scope_path,
+            page_span=(members[0].page_number, members[-1].page_number),
+            elements=tuple(members),
+        ),
+    )
+
+
+def _header_context(pages: tuple[Page, ...]) -> tuple[KeyValue, ...]:
+    """Return page 1's visible key-values before its first visible table or heading (rule 2)."""
+    if not pages:
+        return ()
+    context: list[KeyValue] = []
+    for element in pages[0].elements:
+        if element.is_hidden:
+            continue
+        if isinstance(element, (Table, Heading)):
+            break
+        if isinstance(element, KeyValue):
+            context.append(element)
+    return tuple(context)

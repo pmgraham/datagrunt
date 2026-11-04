@@ -24,7 +24,7 @@ Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow
 - **Excel Reading & Writing:** Read `.xlsx`/`.xls` workbooks sheet by sheet into DataFrames, dicts, Arrow, or SQL, and export any sheet (or all of them) to CSV, JSON, JSONL, Parquet, or Excel.
 - **Parquet Reading & Writing:** Read `.parquet` files into DataFrames, dicts, Arrow tables, or SQL, and export to CSV, JSON, JSONL, Parquet, or Excel. Backed by a single Polars engine with full `read_options`/`write_options` passthrough.
 - **Robust by Default:** Fail-fast validation with clear errors (invalid engine names, missing paths, directories, encrypted PDFs), graceful handling of empty files, no `UnicodeDecodeError` when constructing a reader over a non-UTF-8 file, and sane comment semantics — only leading `#` lines are treated as comments, so `#`-prefixed data rows such as hex colors are preserved on all engines.
-- **PDF Parsing & OCR:** Extract text, tables, and images from PDF files as dicts, DataFrames, or JSON, with optional [Tesseract](https://github.com/tesseract-ocr/tesseract) OCR for scanned pages. Powered by the permissively-licensed **PDFium** engine by default, with **PyMuPDF** available as an alternative.
+- **PDF Parsing & OCR:** Read PDFs into a typed document of headings, paragraphs, key-value pairs, tables, lists, and figures, as DataFrames, Arrow tables, dicts, Markdown, or SQL, and write JSON, JSONL, Markdown, Parquet, CSV, images, or a checksummed bundle. Hidden text is flagged, never dropped, and scanned pages are read with optional [Tesseract](https://github.com/tesseract-ocr/tesseract) OCR. Powered by the permissively-licensed **PDFium** engine.
 - **Pythonic API:** Enjoy a clean and intuitive API that integrates seamlessly into your existing Python workflows.
 
 ### Powertools Under The Hood
@@ -34,10 +34,9 @@ Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow
 | [DuckDB](https://duckdb.org)| Fast in-process analytical database with excellent SQL support |
 | [Polars](https://pola.rs) | Multi-threaded DataFrame library written in Rust, optimized for performance |
 | [PyArrow](https://arrow.apache.org/docs/python/) | Python bindings for Apache Arrow with efficient columnar data processing |
-| [PDFium](https://github.com/pypdfium2-team/pypdfium2) | Default PDF engine (via `pypdfium2`) — permissively licensed (BSD-3 / Apache-2.0); fast text + image extraction, with a structured mode at parity with PyMuPDF |
-| [pdfplumber](https://github.com/jsvine/pdfplumber) | Table detection and extraction (MIT), shared by both PDF engines |
-| [PyMuPDF](https://pymupdf.readthedocs.io/) | Alternative PDF engine for text, tables, and images (AGPL-3.0 / commercial). Note: selecting `engine='pymupdf'` pulls an AGPL-3.0 component into your environment — evaluate those license obligations for your use case, or stay on the default PDFium engine |
-| [Tesseract](https://github.com/tesseract-ocr/tesseract) | OCR for scanned/image-only pages (optional) |
+| [PDFium](https://github.com/pypdfium2-team/pypdfium2) | The PDF engine (via `pypdfium2`) — permissively licensed (BSD-3 / Apache-2.0); text, vector rules, images, and page renders |
+| [Pillow](https://python-pillow.org) | Image encoding and OCR preprocessing for PDF pages (MIT-CMU) |
+| [Tesseract](https://github.com/tesseract-ocr/tesseract) | OCR for scanned/image-only pages, run as the system `tesseract` program (optional) |
 
 ## Installation
 
@@ -48,6 +47,8 @@ To install Datagrunt using `uv`:
 ```bash
 uv pip install datagrunt
 ```
+
+Datagrunt 5.0 requires Python 3.11 or newer.
 
 > **PDF parsing** is an optional extra — install it with `uv pip install "datagrunt[pdf]"`. See [PDF parsing](#pdf-parsing) below for details and OCR setup.
 
@@ -278,145 +279,209 @@ PDF support is an optional extra:
 uv pip install "datagrunt[pdf]"
 ```
 
-OCR of scanned pages additionally requires the **Tesseract** system binary
-(e.g. `brew install tesseract` on macOS, `apt-get install tesseract-ocr` on
-Debian/Ubuntu). On Windows, Tesseract runs natively (no WSL needed) via the
+The extra installs [pypdfium2](https://github.com/pypdfium2-team/pypdfium2)
+(PDFium) and [Pillow](https://python-pillow.org). `import datagrunt` works
+without it; constructing a `PDFReader` or `PDFWriter` without it raises an
+`ImportError` that names the install command.
+
+Datagrunt 5.0 reads every PDF with one engine, PDFium, into a typed document:
+headings, paragraphs, key-value pairs, tables, lists, and figures, in reading
+order. Each element carries its page, its bounding box (in points, top-left
+origin), and the headings it sits under (`scope_path`). Coming from 4.x?
+`engine=`, `native=`, `drop_layout_tables=`, and the PyMuPDF, pdfplumber, and
+pytesseract dependencies are gone, and the output shapes changed; the
+[migration guide](https://www.datagrunt.io/docs/guides/migrating-to-5/) lists every change.
+
+### Reading a PDF
+
+```python
+from datagrunt import PDFReader
+
+reader = PDFReader("report.pdf")
+
+df = reader.to_dataframe()          # Polars: one row per element, in document order
+arrow = reader.to_arrow_table()     # the same rows as a PyArrow table
+rows = reader.to_dicts()            # the same rows as dicts
+reader.get_sample()                 # the first 20 rows (n_rows=...)
+markdown = reader.to_markdown()     # the whole document as Markdown
+
+# The typed document model
+for table in reader.tables:
+    print(table.scope_path, table.to_dataframe())
+reader.headings, reader.paragraphs, reader.key_values, reader.lists, reader.figures
+reader.sections, reader.pages, reader.page_images, reader.metadata
+
+# SQL over the element rows (an in-memory DuckDB connection per reader)
+result = reader.query_data(f"SELECT kind, count(*) AS n FROM {reader.db_table} GROUP BY kind")
+result.pl()                         # also .pa() and .dicts()
+```
+
+Every row has the same columns: `doc_id`, `element_id`, `page_number`,
+`reading_order`, `kind` (`heading`, `paragraph`, `key_value`, `table`, `list`,
+or `figure`), `scope_path`, `text`, `markdown`, `bbox`, `route`,
+`integrity_verified`, and `hidden_reasons`.
+
+- `PDFReader` writes nothing to disk, not even temporary files. Figures load
+  lazily (`figure.read_bytes()`); write them with `PDFWriter`.
+- Each page has a `page_image`. A digital or hybrid page's is drawn at the
+  reader's `dpi` only when you read it (`page.page_image.read_bytes()`, a PNG);
+  a scanned page's is the image OCR read. An error page has none, nor does a
+  page too large to draw (a warning on the page says so). A page image is
+  drawn from the source PDF, so if the file at its path no longer holds the
+  document's bytes, reading it raises `datagrunt.pdf.PDFSourceChangedError`.
+- A heading's `level` (1 to 6) is ranked over the whole document by its font
+  size and boldness (`font_size_pt`, `is_bold`), largest first, so a level
+  means the same prominence on every page. Hidden headings never shift it.
+- The PDF is read on first use, then cached for the reader's life. Errors in the
+  arguments are raised at construction: a missing path raises
+  `FileNotFoundError`; a file that isn't a PDF raises `ValueError`.
+- An encrypted PDF needs `password=`; without it, reading raises
+  `PDFEncryptedError` (also a `ValueError`). A structurally unreadable PDF
+  raises `PDFCorruptError` (also a `RuntimeError`). Both derive from
+  `DatagruntPDFError`.
+- `PDFReader` also reads a bundle directory (see `write_bundle` below), its
+  `manifest.json`, or a document's JSON as a dict.
+- `query_data` runs your SQL as written: building it from untrusted input is
+  your application's concern. DuckDB never installs an extension on its own; a
+  query that needs one raises until you `INSTALL` it.
+
+### Writing outputs
+
+```python
+from datagrunt import PDFWriter
+
+writer = PDFWriter("report.pdf")
+
+writer.write_json("out/report.json")          # the whole document, lossless
+writer.write_jsonl("out/report.jsonl")        # one element per line
+writer.write_markdown("out/report.md")
+writer.write_parquet("out/report.parquet")    # nested columns kept
+writer.write_csv("out/report.csv")            # bbox as four columns, lists as JSON arrays
+writer.extract_images("out/images")           # each distinct figure once, as <sha256>.png
+writer.render_pages_as_images("out/pages")    # every page as page_0001.png, page_0002.png, ...
+writer.write_bundle("out/report_bundle")      # all of the above in one checked directory
+```
+
+- Every output path is required; there are no default filenames. Each `write_*`
+  method returns the absolute path it wrote, and `extract_images` /
+  `render_pages_as_images` return the paths they wrote; all of them create
+  missing directories. `write_bundle` returns the `PDFDocument` it bundled,
+  and its parent directory must exist.
+- Every file is written atomically (a temporary file, then a rename), so a
+  failed write never leaves a partial file. An existing file is replaced.
+- `extract_images(output_dir, dedupe=False)` writes every figure, named by its
+  element id (`p0001_e003.png`).
+- `render_pages_as_images(output_dir, dpi=None)` writes 8-bit grayscale PNGs at
+  the writer's `dpi` (or the one you pass), through a memory-capped renderer. A
+  page that can't be rendered is logged and skipped; the others are written.
+- `write_bundle(output_dir)` writes `json/document.json`,
+  `markdown/document.md`, `images/<sha256>.png`, `page_images/page_NNNN.png`
+  (plus the OCR bands of scanned pages), and a `manifest.json` that records
+  every file's size and SHA-256, plus `json/elements.jsonl` and one Markdown
+  file per page (`markdown/pages/page_NNNN.md`). `output_dir` must not exist or
+  must be empty. If it already holds a bundle of the same PDF, written with the
+  same options and extractor version, that bundle is returned as it is;
+  `overwrite=True` replaces any other valid bundle there. A directory without a
+  valid bundle manifest is never overwritten.
+  `PDFReader("out/report_bundle")` loads it back, verifying every file: an
+  invalid `manifest.json` raises `ValueError` at construction, and a file that
+  doesn't match its manifest raises `datagrunt.pdf.BundleCorruptError` when the
+  bundle is first loaded. A source PDF that changes while it's read or bundled
+  raises `datagrunt.pdf.PDFSourceChangedError`.
+- `write_csv` writes every value as extracted: a cell that starts with `=`,
+  `+`, `-`, or `@` is not escaped, so guarding a spreadsheet against formula
+  injection is your application's concern.
+- A `PDFWriter` also accepts a `PDFDocument` (for example `reader.document`).
+  It has no PDF to render, so `render_pages_as_images` and `write_bundle` raise
+  `ValueError`.
+
+### Hidden text
+
+Text a human reader can't see is flagged, never dropped. Each element's
+`hidden_reasons` lists why: `off_page`, `invisible`, `tiny_font`,
+`transparent`, `matches_background`, `zero_scale`, `duplicate`, `superseded`,
+or `unchecked_background`. An empty list means the element is visible. Markdown
+(`to_markdown()`, `write_markdown()` and a bundle's Markdown) leaves hidden
+elements out by default; pass `include_hidden=True` to keep each behind a
+`<!-- hidden: reasons -->` comment. JSON and the DataFrame always keep every
+element. Filter on the column before you pass text on, for example to an LLM:
+
+```python
+import polars as pl
+
+visible = reader.to_dataframe().filter(pl.col("hidden_reasons").list.len() == 0)
+```
+
+### Scanned pages and OCR
+
+Each page is routed `digital`, `hybrid`, or `vision` (`page.route`). A vision
+page (a scan, or a page with too little text or mostly unreadable characters)
+is rendered at `vision_dpi` and read by the **Tesseract** program; there is no
+Python wrapper. The page's own digital text is kept, flagged `superseded`.
+
+Install Tesseract with its English (`eng`) and orientation (`osd`) data, e.g.
+`brew install tesseract` on macOS or `apt-get install tesseract-ocr` on
+Debian/Ubuntu. On Windows, use the
 [UB-Mannheim installer](https://github.com/UB-Mannheim/tesseract/wiki) or a
 package manager (`winget install UB-Mannheim.TesseractOCR`,
-`choco install tesseract`, or `scoop install tesseract`); after installing,
-either add the Tesseract directory to your PATH or point pytesseract at it
-with `pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"`.
-Native-text PDFs, tables, and embedded images work without it.
+`choco install tesseract`, or `scoop install tesseract`). Datagrunt runs the
+`tesseract` it finds in an absolute directory on your `PATH`, never one in the
+working directory, so add the Tesseract directory to `PATH`.
+
+Every page reports how extraction went (`page.status`):
+
+- `ok`: extracted on its route.
+- `ocr_fallback`: the page couldn't be read digitally, so it was rendered and
+  read by OCR.
+- `ocr_unavailable`: a vision page OCR couldn't read (no Tesseract, say); its
+  digital text is kept.
+- `error`: nothing could be read; `page.error` says why. The rest of the
+  document still extracts.
+
+A page read by OCR at a mean word confidence under 70 carries a warning that
+it may be turned the wrong way or unreadable, so its text shouldn't be trusted
+as is; the text is kept. Tesseract's orientation detection can turn a page with
+little text the wrong way; such a page reads at low confidence and is flagged.
+
+Extraction is always complete: a bad page is recorded, never dropped. Pass
+`strict=True` to raise `PDFCorruptError` on a bad page instead.
+
+### Options
+
+`PDFReader` and `PDFWriter` take the same keyword-only options:
 
 ```python
-from datagrunt import PDFReader, PDFWriter
-
-# Parse a PDF into the unified document structure (PDFium engine by default).
-reader = PDFReader("report.pdf")
-document = reader.to_dicts()           # {"document": {"pages": [...]}}
-df = reader.to_dataframe()             # one row per extracted element
-
-# Write JSON and extract embedded images to disk.
-writer = PDFWriter("report.pdf")
-writer.write_json("report.json", image_output_dir="report_images")
-writer.extract_images(output_dir="report_images")
-
-# Render each whole page to an image file (rasterization, not embedded-image
-# extraction). Returns the written paths, in page order.
-writer.render_pages_as_images(output_dir="report_pages", dpi=300, image_format="png")
+reader = PDFReader(
+    "report.pdf",
+    password=None,                  # an encrypted PDF's password
+    workers=1,                      # processes to extract pages with
+    ocr="auto",                     # "auto", "always" (every page to OCR), or "never"
+    dpi=200,                        # page images (render_pages_as_images, bundles)
+    vision_dpi=300,                 # pages read by OCR; at least dpi
+    max_render_pixels=16_000_000,   # caps every render: a huge page gets a lower DPI
+    min_image_dimension=40,         # smaller embedded images aren't figures
+    strict=False,                   # raise on a bad page instead of recording it
+)
 ```
 
-### Choosing a PDF engine
+Options are checked at construction: an out-of-range value raises `ValueError`
+and a wrong type raises `TypeError`. `min_image_dimension` drops embedded
+images narrower or shorter than that many pixels (rule lines, separators, icon
+slivers); it must be at least 1.
 
-`PDFReader` and `PDFWriter` accept an `engine` argument:
+### Parallel processing
 
-```python
-# Default: PDFium — permissively licensed (BSD-3 / Apache-2.0).
-reader = PDFReader("report.pdf")                      # engine="pdfium"
-
-# Lean, fast mode: text + positioned text objects + images, no table detection.
-reader = PDFReader("report.pdf", native=True)
-
-# Alternative engine: PyMuPDF (AGPL-3.0 / commercial).
-reader = PDFReader("report.pdf", engine="pymupdf")
-```
-
-Both engines emit the same **unified element schema** by default, so output is
-interchangeable. **PDFium** is the default because it is **permissively
-licensed** (unlike PyMuPDF, which is AGPL-3.0 / commercial) and is faster on
-text-heavy documents. Table detection (via pdfplumber) and OCR work identically
-on either engine.
-
-- `native=True` (PDFium only) switches to a lean schema — full page text,
-  positioned text objects, and images, with **no table detection** — which is
-  dramatically faster (~20–80×) when you don't need structured tables.
-- Image-only / scanned pages fall back to **Tesseract OCR** automatically on
-  both engines (requires the Tesseract binary; see above). If OCR is
-  unavailable or fails, the page is **not dropped** — it is kept with whatever
-  text and images were extracted, plus a page-level warning, so extraction is
-  always complete.
-- Encrypted / password-protected PDFs raise a clear `ValueError` on every
-  engine instead of a raw backend exception.
-
-### Filtering small embedded images
-
-By default, embedded images smaller than **40 px** on either side are dropped as
-layout artifacts (rule lines, separators, icon slivers). Pass the keyword-only
-`min_image_dimension` argument to `PDFReader` or `PDFWriter` to change that
-threshold:
-
-```python
-# Keep smaller images — e.g. capture logos, signatures, or small icons.
-reader = PDFReader("report.pdf", min_image_dimension=15)
-
-# Filter more aggressively — keep only large figures.
-reader = PDFReader("report.pdf", min_image_dimension=200)
-
-# Keep every image, including 1×1 px artifacts (disable the filter).
-reader = PDFReader("report.pdf", min_image_dimension=0)
-```
-
-The threshold applies to **both PDF engines** and every conversion/output method,
-and defaults to `40` (the long-standing behavior). It must be a non-negative
-integer; invalid values raise immediately when the reader/writer is constructed.
-
-### Rendering pages as images
-
-`extract_images` pulls the images **embedded** in a PDF. To rasterize **whole
-pages** instead — one image file per page — use `render_pages_as_images`:
-
-```python
-writer = PDFWriter("report.pdf")
-
-# One PNG per page at 300 DPI, written to ./report_pages/, returned in page order.
-paths = writer.render_pages_as_images(output_dir="report_pages", dpi=300, image_format="png")
-
-# JPEG at a lower resolution.
-writer.render_pages_as_images(output_dir="report_pages", dpi=150, image_format="jpg")
-```
-
-- `image_format` is one of `png`, `jpg`, or `jpeg` (case-insensitive); any other
-  value raises `ValueError`. Both engines produce identical output.
-- Works on **both engines**; on **PDFium** it honors the `workers` count for
-  parallel rendering (PyMuPDF renders sequentially).
-- Extraction stays **complete**: a page that fails to render is logged and
-  skipped, never aborting the batch — the returned list contains every page that
-  rendered successfully, in page order.
-
-### Parallel Processing & Concurrency
-By default, `PDFReader` and `PDFWriter` run sequentially (`workers=1`). On the default **PDFium engine**, you can enable parallel processing on multi-core systems by passing a `workers` count greater than `1`:
-```python
-if __name__ == '__main__':
-    # Run with 8 processes to parse pages concurrently
-    reader = PDFReader("report.pdf", workers=8)
-    document = reader.to_dicts()
-```
-
-`workers` applies to the **PDFium engine only**. The PyMuPDF engine always
-parses pages sequentially because the underlying MuPDF library is not
-thread-safe — passing `workers > 1` with `engine="pymupdf"` logs a warning and
-is ignored. Use the default PDFium engine when you need parallel
-(process-based) parsing.
-
-#### Multiprocessing Guard Requirement
-Because PDFium is not thread-safe within a single process, `datagrunt` uses a process pool (`ProcessPoolExecutor` with the `spawn` start context on macOS and Windows) to parse pages concurrently.
-
-Under Python's `spawn` start context, child processes import the main module to initialize. If you call `PDFReader` or `PDFWriter` with `workers > 1` outside of a `if __name__ == '__main__':` block, the child processes will recursively spawn their own process pools, leading to a crash or infinite recursion loop.
-
-For single-page documents, `datagrunt` automatically bypasses the process pool and executes sequentially to avoid process spawning overhead.
-
-#### Distributed Runtimes Fallback
-When running inside managed distributed environments (e.g. **Apache Spark**, **Apache Beam**, **Apache Flink**, or **Celery**), nested process spawning is restricted or causes container sandbox permission errors. `datagrunt` automatically detects these environments (by checking variables like `SPARK_ENV_LOADED`, `BEAM_WORKER_ID`, etc.) and falls back to sequential, parent-process execution to ensure robust, conflict-free operation.
-
-When images are written to disk, byte-identical duplicates (common with repeated
-icons or backgrounds) are collapsed to a single file and all references are
-repointed to it. Pass `dedupe=False` / `dedupe_images=False` to keep every copy.
-
-On graphically dense PDFs, line-based table detection can pick up decorative
-boxes and rule lines as 1×N or N×1 "tables". Pass `drop_layout_tables=True` to
-the reader (`to_dicts`, `to_dataframe`, `to_arrow_table`) or writer
-(`write_json`, `write_json_newline_delimited`) to discard those and keep only
-tables with at least two rows and two columns. It is off by default.
+Every PDF is parsed in worker processes, never in your own: pages are
+extracted in `workers` processes (one when `workers=1`) and come back in page
+order, and figure reads and page renders run in workers too. Each worker is a
+fresh, isolated `python` process with a memory cap (2 GiB), and it never imports
+your script, so no `if __name__ == "__main__":` guard is needed. A page that
+passes the cap, or its time bound, becomes an error page with the reason; the
+other pages are read by a new worker. Inside a distributed runtime
+(**Apache Spark**, **Apache Beam**, **Apache Flink**, or **Celery**, detected
+through variables such as `SPARK_ENV_LOADED` and `BEAM_WORKER_ID`) one worker
+extracts the pages. A frozen application (PyInstaller) cannot start workers
+yet, so reading a PDF there raises `DatagruntPDFError` saying so.
 
 ## Engine Comparison
 
@@ -427,7 +492,7 @@ tables with at least two rows and two columns. It is off by default.
 | **Default for** | CSVReader | CSVWriter | - |
 | **Export Quality** | Good | Excellent (especially JSON) | Native Parquet support |
 
-_The engines above apply to CSV processing. Whichever you pick, results are consistent: leading `#` comment lines, leading blank lines, logical record counts (quoted embedded newlines count as one record), and column-name normalization — including collision handling like `Col A,col_a` → `col_a, col_a_1` — behave identically across all three. Mid-file lines starting with `#` are kept as data on all three engines. PDF parsing uses the **PDFium** engine by default (permissively licensed), with **PyMuPDF** available via `engine="pymupdf"` — see [PDF parsing](#pdf-parsing)._
+_The engines above apply to CSV processing. Whichever you pick, results are consistent: leading `#` comment lines, leading blank lines, logical record counts (quoted embedded newlines count as one record), and column-name normalization — including collision handling like `Col A,col_a` → `col_a, col_a_1` — behave identically across all three. Mid-file lines starting with `#` are kept as data on all three engines. PDF parsing uses the **PDFium** engine (permissively licensed) — see [PDF parsing](#pdf-parsing)._
 
 ## Primary Classes
 
@@ -435,13 +500,13 @@ _The engines above apply to CSV processing. Whichever you pick, results are cons
 - **`CSVReader`**: Read and process CSV files with intelligent delimiter detection
 - **`ExcelReader`**: Read Excel workbooks sheet by sheet into Polars DataFrames, dicts, PyArrow tables, or SQL query results
 - **`ParquetReader`**: Read Parquet files into Polars DataFrames, dicts, PyArrow tables, or SQL query results
-- **`PDFReader`**: Parse PDF files into text, tables, and images as dicts, Polars DataFrames, or PyArrow tables
+- **`PDFReader`**: Read PDF files into a typed document (headings, paragraphs, key-value pairs, tables, lists, figures) as Polars DataFrames, PyArrow tables, dicts, Markdown, or SQL query results
 
 ### Writers
 - **`CSVWriter`**: Export CSV data to multiple formats (CSV, Excel, JSON, Parquet)
 - **`ExcelWriter`**: Export a sheet (or all sheets) of an Excel workbook to CSV, Excel, JSON, JSONL, or Parquet
 - **`ParquetWriter`**: Export Parquet files to multiple formats (CSV, Excel, JSON, JSONL, Parquet)
-- **`PDFWriter`**: Write parsed PDF output to JSON or JSONL, extract embedded images, and render whole pages to image files
+- **`PDFWriter`**: Write a PDF's document to JSON, JSONL, Markdown, Parquet, or CSV, extract its figures, render whole pages to PNG files, or write a checksummed bundle
 
 ## Full Documentation
 

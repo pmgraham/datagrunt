@@ -1,0 +1,997 @@
+"""Page normalization, bands and the tesseract CLI for the v5 vision route (#369, A5a).
+
+Internal: not exported from ``datagrunt`` or ``datagrunt.pdf``. Its input is
+our own render (:class:`~datagrunt.pdf.render.RenderedPage`): nothing here
+decodes PDF content.
+
+:func:`normalized` is the spec's grayscale + 1 % autocontrast (spec §3.3
+step 4): Pillow's ``ImageOps.autocontrast(cutoff=1)``, whose histogram runs
+in C. It ignores the darkest and the lightest 1 % of pixels and stretches
+the grey levels between them to 0..255; a page with nothing left to stretch
+(one grey level, or black to white already) comes back unchanged.
+
+:func:`bands` cuts a page into horizontal :class:`Band` s for OCR (spec
+§3.3 step 4): 900 px tall, stepping by 840 px, so neighbours share 60 rows
+and a line of text up to 60 px tall (14.4 pt at 300 DPI) is whole in one of
+them. The last band ends at the page's bottom row, so it may be shorter
+than 900 px; every row is in one band or two.
+
+The tesseract CLI (never ``pytesseract``) reads the page:
+
+- :func:`orientation` runs tesseract's orientation detection (``--psm 0``)
+  and reads its ``Rotate``: the clockwise turn, 0, 90, 180 or 270 degrees,
+  that rights the page. :func:`rotated` makes that turn.
+- :func:`ocr_words` reads the righted page's bands (``--psm 3``, TSV) and
+  maps each word's box back to the displayed page in points: through its
+  band's offset, ``72 / dpi`` and the inverse of the turn. A word read in
+  both bands of a shared strip (the same text, boxes overlapping by an IoU
+  of 0.5 or more) is kept once, with its higher confidence; copies match
+  one to one, closest first, so two words are never one's copies. Given a
+  deadline (the vision page's budget, #418), each band's call is given at
+  most the time left, and a band not started by then is not read: the
+  reading is ``"spent"``.
+- A line crossing a band's cut edge (the upper band's bottom row, the
+  lower band's top row) is read whole by the other band and, cut, as other
+  text by its own ("Initiate" over "LILILIdAlC"). Such a fragment is
+  OCR's artefact of the cut, not the page's text: a word lying wholly in
+  the shared strip within 1 px of its band's cut edge is dropped when a
+  word the other band reads whole (farther from its own cut edge)
+  overlaps it, before copies are matched, so a whole copy is kept over a
+  cut one. A cut word nothing whole overlaps was read once and is kept, as
+  is one reaching past the strip. On A5b's 10 sample pages (#416) this
+  drops 210 of 3,893 band words; the words' recall of the digital text
+  goes from 84.5 % to 84.4 % (one "f"), their precision from 87.9 % to
+  93.9 %.
+- A line no band reads whole (taller than the shared strip and crossing
+  both cut edges, a large heading, say, or one filling the strip) is cut
+  in both bands, each reading its part as other words. Its parts at the
+  two cut edges overlap across the seam: only those of the band that read
+  more of the line (farther past the strip; then the higher mean
+  confidence; then the upper band's) are kept, so it is read once (D6).
+  Its text is that band's read of its part: a heading cut so is often
+  misread, as no band holds it whole.
+
+``--psm 3`` (tesseract's automatic page segmentation) is chosen over
+``--psm 6`` (one uniform block) by A5b's evidence: forced to OCR, 31 corpus
+pages (the 19 datasheets and 12 rulebook pages) read 93.0 % of their
+digital words with it, at a precision of 88.0 %, against 91.8 % and 83.1 %
+with ``--psm 6``, which reads a multi-column page's lines across its
+columns, and art as words. Its cost: on two art-heavy covers it skipped
+short text among the art (a contents column's page numbers) that
+``--psm 6`` read.
+
+Each call starts ``tesseract`` from an argv list (never a shell), by the
+absolute path :func:`~datagrunt.pdf._executables.trusted_executable` finds
+in an absolute PATH directory (never the working directory), in its own
+session, with ``OMP_THREAD_LIMIT=1`` in its environment, and writes the
+image to its stdin as a binary PGM (no temporary image file). Its stdout is
+read within :data:`_MAX_STDOUT_BYTES`; its stderr is drained by a thread
+into a 4 KiB ring (:class:`~datagrunt.pdf._process.StderrTail`: nothing is
+written to disk), joined within a bound once it is reaped. At its timeout a timer
+kills it, with everything in its session (a wrapper script's children
+too; on Windows only the process itself), and it is reaped within a
+bounded wait. tesseract missing, failing, timing out or overflowing its
+bound is a status with its reason (:class:`Orientation`,
+:class:`OCRResult`), never an empty success and never an exception.
+"""
+
+import math
+import os
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import IO, Literal, NamedTuple, TypeAlias
+
+from PIL import Image, ImageOps
+
+from datagrunt.pdf._executables import trusted_executable
+from datagrunt.pdf._process import REAP_TIMEOUT_S, close_pipes, drained, reaped
+from datagrunt.pdf._validate import (
+    choice_str,
+    finite_float,
+    finite_tuple,
+    int_at_least,
+    non_blank_str,
+    positive_float,
+    typed_tuple,
+)
+from datagrunt.pdf.elements import BBox
+from datagrunt.pdf.render import RenderedPage, render_size
+
+# The spec's autocontrast: the percent of pixels ignored at each end of the histogram.
+_AUTOCONTRAST_CUTOFF = 1
+
+# The spec's bands: 900 px tall, neighbours sharing 60 rows.
+_BAND_HEIGHT = 900
+_BAND_OVERLAP = 60
+
+_TURNS = (0, 90, 180, 270)
+_TURN_NAMES = "0, 90, 180 or 270"
+
+# How one tesseract call ends; a reading is also "spent" when its deadline passes (ocr_words).
+_CallStatus = Literal["ok", "unavailable", "failed", "timeout"]
+OCRStatus = Literal[_CallStatus, "spent"]
+OrientationStatus = Literal["ok", "undetermined", "unavailable", "failed", "timeout"]
+_OCR_STATUSES: tuple[OCRStatus, ...] = ("ok", "unavailable", "failed", "timeout", "spent")
+_ORIENTATION_STATUSES: tuple[OrientationStatus, ...] = ("ok", "undetermined", "unavailable", "failed", "timeout")
+
+# tesseract's TSV, one row a box: words are level 5, with a confidence of 0..100 (-1 on other levels).
+_TSV_HEADER = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext"
+_TSV_FIELDS = 12
+_TSV_LINE = ("block_num", "par_num", "line_num")  # fields 2 to 4
+_TSV_BOX = ("left", "top", "width", "height")  # fields 6 to 9
+_WORD_LEVEL = "5"
+_SAME_WORD_IOU = 0.5
+# A word within this many rows of its band's cut edge (the shared strip's) is cut by it (#416).
+_CUT_EDGE_PX = 1
+
+_ROTATE = re.compile(r"^Rotate: *(\S+) *$", re.MULTILINE)
+_CONFIDENCE = re.compile(r"^Orientation confidence: *(\S+) *$", re.MULTILINE)
+_TOO_FEW_CHARACTERS = "Too few characters"  # tesseract's OSD on a page without enough text
+# One tesseract language, or several joined by "+" (deu+eng): never an option.
+_LANGUAGE = re.compile(r"[A-Za-z0-9_]+(?:\+[A-Za-z0-9_]+)*")
+
+# A band's TSV is ~40 bytes a word: a 900 x 2550 px band of noise reads as ~21 KB, a 900 x 6000 one ~48 KB.
+_MAX_STDOUT_BYTES = 16 << 20
+_READ_CHUNK = 1 << 16
+_VERSION_TIMEOUT_S = 10.0
+_NOT_ON_PATH = "no tesseract in an absolute PATH directory"
+# POSIX: each call is its own session, so a timeout ends a wrapper script's children too.
+_OWN_SESSION = sys.platform != "win32"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Band:
+    """Rows ``top_px`` to ``top_px + px_height`` of a page, across its whole width.
+
+    Attributes:
+        top_px: The band's first row on the page it was cut from.
+        pixels: ``px_width * px_height`` bytes, 8-bit gray, row by row as on
+            the page. Not in repr.
+        px_width: The page's width in pixels.
+        px_height: The band's rows.
+    """
+
+    top_px: int
+    pixels: bytes = field(repr=False)
+    px_width: int
+    px_height: int
+
+    def __post_init__(self) -> None:
+        int_at_least("top_px", self.top_px, 0)
+        int_at_least("px_width", self.px_width, 1)
+        int_at_least("px_height", self.px_height, 1)
+        if not isinstance(self.pixels, bytes):
+            raise TypeError(f"pixels must be bytes, got {type(self.pixels).__name__}")
+        expected = self.px_width * self.px_height
+        if len(self.pixels) != expected:
+            message = f"pixels must hold {self.px_width} x {self.px_height} = {expected} bytes, got {len(self.pixels)}"
+            raise ValueError(message)
+
+
+def normalized(page: RenderedPage) -> RenderedPage:
+    """``page`` with its grey levels stretched by a 1 % autocontrast (the spec's normalization).
+
+    Raises:
+        TypeError: If ``page`` is not a :class:`~datagrunt.pdf.render.RenderedPage`.
+        ValueError: If ``page`` is not 8-bit gray (a BGR render).
+    """
+    image = ImageOps.autocontrast(_image(page), cutoff=_AUTOCONTRAST_CUTOFF)
+    return RenderedPage(pixels=image.tobytes(), px_width=page.px_width, px_height=page.px_height)
+
+
+def _image(page: RenderedPage) -> Image.Image:
+    """``page`` as a Pillow 8-bit grey (``L``) image."""
+    _checked_page(page)
+    return Image.frombytes("L", (page.px_width, page.px_height), page.pixels)
+
+
+def bands(page: RenderedPage, *, height: int = _BAND_HEIGHT, overlap: int = _BAND_OVERLAP) -> tuple[Band, ...]:
+    """``page`` cut into bands ``height`` rows tall whose neighbours share ``overlap`` rows.
+
+    Bands start every ``height - overlap`` rows from the top; the last is the
+    first to reach the bottom, and ends there (it may be shorter). A page up
+    to ``height`` rows tall is one band. Every row is in one band or two, and
+    there are at most as many bands as rows.
+
+    Raises:
+        TypeError: If ``page`` is not a :class:`~datagrunt.pdf.render.RenderedPage`,
+            or ``height`` or ``overlap`` is not an int (bool rejected).
+        ValueError: If ``page`` is not 8-bit gray (a BGR render), ``height``
+            or ``overlap`` is under 1, or ``overlap`` is over half of
+            ``height`` (a row would be in three bands).
+    """
+    _checked_page(page)
+    int_at_least("height", height, 1)
+    int_at_least("overlap", overlap, 1)
+    if 2 * overlap > height:
+        raise ValueError(f"overlap ({overlap}) must be at most half of height ({height})")
+    step = height - overlap
+    # The last band is the first whose top is at or past this row: it reaches the bottom.
+    last_top = max(page.px_height - height, 0)
+    return tuple(_band(page, top, min(height, page.px_height - top)) for top in range(0, last_top + step, step))
+
+
+def _band(page: RenderedPage, top: int, rows: int) -> Band:
+    """Rows ``top`` to ``top + rows`` of ``page``: one contiguous slice of its bytes."""
+    start = top * page.px_width
+    return Band(
+        top_px=top, pixels=page.pixels[start : start + rows * page.px_width], px_width=page.px_width, px_height=rows
+    )
+
+
+def _checked_page(page: RenderedPage) -> RenderedPage:
+    """``page``, if it is a RenderedPage in 8-bit gray (a BGR render is never read as gray)."""
+    if not isinstance(page, RenderedPage):
+        raise TypeError(f"page must be a RenderedPage, got {type(page).__name__}")
+    if page.channels != 1:
+        raise ValueError(f"page must be 8-bit gray (1 channel), got {page.channels} channels")
+    return page
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Orientation:
+    """What tesseract's orientation detection found on a page.
+
+    Attributes:
+        degrees: The clockwise turn, 0, 90, 180 or 270, that rights the page
+            (tesseract's ``Rotate``): pass it to :func:`rotated`. 0 when not ok.
+        confidence: tesseract's orientation confidence when ok, else None.
+        status: ``"ok"``; ``"undetermined"`` (too little text to tell);
+            ``"unavailable"`` (no tesseract to run); ``"failed"``; ``"timeout"``.
+        reason: Why the status is not ok; empty when ok.
+    """
+
+    degrees: int
+    confidence: float | None
+    status: OrientationStatus
+    reason: str
+
+    def __post_init__(self) -> None:
+        _checked_turn("degrees", self.degrees)
+        if self.confidence is not None:
+            object.__setattr__(self, "confidence", finite_float("confidence", self.confidence))
+        choice_str("status", self.status, _ORIENTATION_STATUSES)
+        if self.status == "ok":
+            if self.confidence is None:
+                raise ValueError("an ok orientation has a confidence, got None")
+            if self.reason != "":
+                raise ValueError(f"an ok orientation has no reason, got {self.reason!r}")
+            return
+        if self.confidence is not None:
+            raise ValueError(f"an orientation that is not ok has no confidence, got {self.confidence!r}")
+        if self.degrees != 0:
+            raise ValueError(f"an orientation that is not ok is 0 degrees, got {self.degrees}")
+        non_blank_str("reason", self.reason)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class OCRWord:
+    """A word tesseract read, where it sits on the displayed page.
+
+    Attributes:
+        text: The word, as tesseract read it (punctuation attached).
+        bbox: Its box on the displayed page, in points from the top-left corner.
+        confidence: tesseract's confidence, 0 to 100.
+        line: The tesseract line it was read on, numbered from 0 across the
+            page in the order read: words read on one line share it (#416).
+    """
+
+    text: str
+    bbox: BBox
+    confidence: float
+    line: int
+
+    def __post_init__(self) -> None:
+        non_blank_str("text", self.text)
+        if not isinstance(self.bbox, BBox):
+            raise TypeError(f"bbox must be a BBox, got {type(self.bbox).__name__}")
+        object.__setattr__(self, "confidence", finite_float("confidence", self.confidence, lo=0.0, hi=100.0))
+        int_at_least("line", self.line, 0)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class OCRResult:
+    """The words :func:`ocr_words` read on a page, and how the reading went.
+
+    Attributes:
+        words: The words, band by band, each band's in tesseract's reading order.
+        status: ``"ok"`` (every band read); ``"unavailable"`` (no tesseract to
+            run); ``"failed"`` or ``"timeout"`` (a band's call: ``words`` then
+            holds the bands read before it); ``"spent"`` (the caller's
+            deadline passed: a band's call was cut at it, or not started;
+            ``words`` holds the bands read before it).
+        reason: Why the status is not ok, naming the band (``"spent"``: how
+            many bands were read); empty when ok.
+    """
+
+    words: tuple[OCRWord, ...]
+    status: OCRStatus
+    reason: str
+
+    def __post_init__(self) -> None:
+        typed_tuple("words", self.words, OCRWord)
+        choice_str("status", self.status, _OCR_STATUSES)
+        if self.status != "ok":
+            non_blank_str("reason", self.reason)
+        elif self.reason != "":
+            raise ValueError(f"an ok result has no reason, got {self.reason!r}")
+
+
+def rotated(page: RenderedPage, degrees: int) -> RenderedPage:
+    """``page`` turned clockwise by ``degrees`` (0, 90, 180 or 270); 0 returns it as it is.
+
+    Raises:
+        TypeError: If ``page`` is not a RenderedPage, or ``degrees`` is not an int (bool rejected).
+        ValueError: If ``page`` is not 8-bit gray (a BGR render), or ``degrees`` is not 0, 90, 180 or 270.
+    """
+    image = _image(page)
+    turn = _checked_turn("degrees", degrees)
+    if turn == 0:
+        return page
+    turned = image.transpose(_transpose(turn))
+    return RenderedPage(pixels=turned.tobytes(), px_width=turned.width, px_height=turned.height)
+
+
+def _transpose(degrees: int) -> Image.Transpose:
+    """Pillow's transpose for a clockwise turn of ``degrees`` (Pillow's ROTATE_* turn counter-clockwise)."""
+    if degrees == 90:
+        return Image.Transpose.ROTATE_270
+    if degrees == 180:
+        return Image.Transpose.ROTATE_180
+    return Image.Transpose.ROTATE_90
+
+
+def _checked_turn(name: str, value: object) -> int:
+    """``value`` if it is 0, 90, 180 or 270 (an int; bool rejected)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an int, got {value!r}")
+    if value not in _TURNS:
+        raise ValueError(f"{name} must be {_TURN_NAMES}, got {value}")
+    return value
+
+
+def tesseract_available() -> bool:
+    """Whether a ``tesseract`` in an absolute PATH directory answers ``--version`` as tesseract within a timeout."""
+    binary = trusted_executable("tesseract")
+    if binary is None:
+        return False
+    call = _call([binary, "--version"], (), _VERSION_TIMEOUT_S)
+    return call.status == "ok" and call.stdout.startswith(b"tesseract ")
+
+
+def orientation(page: RenderedPage, *, timeout_s: float) -> Orientation:
+    """The clockwise turn that rights ``page``, by tesseract's orientation detection (``--psm 0``).
+
+    A page with too little text for tesseract to tell is ``"undetermined"``;
+    no tesseract, a failure or a timeout has its status and reason. None
+    raises: each is 0 degrees with no confidence.
+
+    Raises:
+        TypeError, ValueError: If ``page`` is not a RenderedPage in 8-bit
+            gray, or ``timeout_s`` is not a finite number over 0 (before
+            anything runs).
+    """
+    _checked_page(page)
+    positive_float("timeout_s", timeout_s)
+    binary = trusted_executable("tesseract")
+    if binary is None:
+        return _unoriented("unavailable", _NOT_ON_PATH)
+    call = _call([binary, "stdin", "stdout", "--psm", "0"], _pgm(page), timeout_s)
+    if call.status == "failed" and _TOO_FEW_CHARACTERS in call.stderr:
+        return _unoriented("undetermined", "tesseract's OSD found too few characters to orient the page")
+    if call.status != "ok":
+        return _unoriented(call.status, call.reason)
+    return _osd(call.stdout)
+
+
+def _unoriented(status: OrientationStatus, reason: str) -> Orientation:
+    """No orientation: 0 degrees, no confidence, and why."""
+    return Orientation(degrees=0, confidence=None, status=status, reason=reason)
+
+
+def _osd(stdout: bytes) -> Orientation:
+    """The orientation in tesseract's OSD report; a report that does not parse is a failure."""
+    report = stdout.decode("utf-8", errors="replace")
+    rotate = _ROTATE.search(report)
+    if rotate is None:
+        return _unoriented("failed", f"tesseract's OSD report has no Rotate line: {stdout[:200]!r}")
+    confidence = _CONFIDENCE.search(report)
+    if confidence is None:
+        return _unoriented("failed", f"tesseract's OSD report has no Orientation confidence line: {stdout[:200]!r}")
+    if rotate.group(1) not in {str(turn) for turn in _TURNS}:
+        return _unoriented("failed", f"tesseract's OSD gave Rotate: {rotate.group(1)}, not {_TURN_NAMES}")
+    try:
+        value = float(confidence.group(1))
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value):
+        return _unoriented("failed", f"tesseract's OSD gave a confidence of {confidence.group(1)}, not a finite number")
+    return Orientation(degrees=int(rotate.group(1)), confidence=value, status="ok", reason="")
+
+
+class _Placed(NamedTuple):
+    """A word tesseract read, its box in pixels on the righted page (its band's offset added), and its line.
+
+    ``line`` is its band's top row, then the TSV's block, paragraph and line
+    numbers: a tesseract line's key on the page.
+    """
+
+    text: str
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+    confidence: float
+    line: tuple[int, int, int, int]
+
+
+class _Failure(NamedTuple):
+    """Why a band was not read."""
+
+    status: OCRStatus
+    reason: str
+
+
+def ocr_words(
+    page_bands: tuple[Band, ...],
+    *,
+    dpi: int,
+    rotation: int,
+    page_size_pt: tuple[float, float],
+    timeout_s: float,
+    language: str = "eng",
+    deadline: float | None = None,
+) -> OCRResult:
+    """The words tesseract reads in ``page_bands`` (``--psm 3``, TSV, ``-l language``), on the displayed page.
+
+    ``page_bands`` are the :func:`bands` of the page as :func:`rotated` by
+    ``rotation`` degrees righted it; the page was rendered at ``dpi`` from a
+    displayed ``page_size_pt`` (width, height). Each band is a call of
+    ``timeout_s`` at most. The first band that fails or times out ends the
+    reading: its status and reason (naming the band) come back with the words
+    of the bands read before it. Words read twice in a shared strip are kept
+    once (the higher confidence).
+
+    ``deadline`` (a :func:`time.monotonic` time, or None) ends the reading:
+    each band's call is given at most the time left before it, and a band
+    not started by it is not read. Either way the result is ``"spent"``,
+    with the words of the bands read before it.
+
+    Raises:
+        TypeError, ValueError: If an argument is invalid, or a band does not
+            fit the righted page (before anything runs).
+    """
+    displayed = _displayed_size(page_bands, dpi, rotation, page_size_pt)
+    positive_float("timeout_s", timeout_s)
+    if not isinstance(language, str) or _LANGUAGE.fullmatch(language) is None:
+        raise ValueError(f"language must be tesseract language names (like eng or deu+eng), got {language!r}")
+    if deadline is not None:
+        finite_float("deadline", deadline)
+    binary = trusted_executable("tesseract")
+    if binary is None:
+        return OCRResult(words=(), status="unavailable", reason=_NOT_ON_PATH)
+    argv = [binary, "stdin", "stdout", "--psm", "3", "-l", language, "tsv"]
+    read: list[tuple[Band, list[_Placed]]] = []
+    for number, band in enumerate(page_bands, start=1):
+        words = _read_band(argv, band, timeout_s, deadline)
+        if isinstance(words, _Failure):
+            if words.status == "spent":
+                reason = f"OCR stopped after {number - 1} of {len(page_bands)} bands"
+            else:
+                rows = f"rows {band.top_px} to {band.top_px + band.px_height - 1}"
+                reason = f"band {number} of {len(page_bands)} ({rows}): {words.reason}"
+            return OCRResult(words=_page_words(read, rotation, displayed, dpi), status=words.status, reason=reason)
+        read.append((band, words))
+    return OCRResult(words=_page_words(read, rotation, displayed, dpi), status="ok", reason="")
+
+
+def _displayed_size(
+    page_bands: tuple[Band, ...], dpi: int, rotation: int, page_size_pt: tuple[float, float]
+) -> tuple[int, int]:
+    """The displayed page's size in pixels, once every band is checked to fit the righted page."""
+    typed_tuple("page_bands", page_bands, Band)
+    if not page_bands:
+        raise ValueError("page_bands must hold at least one band")
+    int_at_least("dpi", dpi, 1)
+    _checked_turn("rotation", rotation)
+    width_pt, height_pt = finite_tuple("page_size_pt", page_size_pt, 2)
+    width, height = render_size(
+        positive_float("page_size_pt[0]", width_pt), positive_float("page_size_pt[1]", height_pt), dpi
+    )
+    righted = (height, width) if rotation in (90, 270) else (width, height)
+    for number, band in enumerate(page_bands, start=1):
+        if band.px_width != righted[0]:
+            message = f"band {number} is {band.px_width} px wide; a {width} x {height} px page righted by {rotation}"
+            raise ValueError(f"{message} degrees is {righted[0]} px wide")
+        if band.top_px + band.px_height > righted[1]:
+            rows = f"rows {band.top_px} to {band.top_px + band.px_height - 1}"
+            raise ValueError(f"band {number} ({rows}) runs past the {righted[1]} px tall righted page")
+    return width, height
+
+
+def _read_band(argv: list[str], band: Band, timeout_s: float, deadline: float | None) -> list[_Placed] | _Failure:
+    """The band's words within ``timeout_s`` and the time left before ``deadline``; ``"spent"`` if that ran out.
+
+    Its call is not started past the deadline, and one cut at it (its
+    timeout shortened to the time left) is spent, not timed out.
+    """
+    call_s = timeout_s if deadline is None else min(timeout_s, deadline - time.monotonic())
+    if call_s <= 0.0:
+        return _Failure("spent", "the deadline passed before the band's call")
+    words = _band_words(argv, band, call_s)
+    if isinstance(words, _Failure) and words.status == "timeout" and call_s < timeout_s:
+        return _Failure("spent", words.reason)
+    return words
+
+
+def _band_words(argv: list[str], band: Band, timeout_s: float) -> list[_Placed] | _Failure:
+    """The words tesseract reads in ``band``, placed on the righted page; or why it read none."""
+    call = _call(argv, _pgm(band), timeout_s)
+    if call.status != "ok":
+        return _Failure(call.status, call.reason)
+    words = _tsv_words(call.stdout, band)
+    if isinstance(words, str):
+        return _Failure("failed", words)
+    return words
+
+
+def _tsv_words(stdout: bytes, band: Band) -> list[_Placed] | str:
+    """The word rows of tesseract's TSV for ``band``, placed on the righted page; or why it does not parse."""
+    try:
+        text = stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return f"tesseract's TSV is not UTF-8: {exc}"
+    lines = text.split("\n")  # bounded: stdout is within _MAX_STDOUT_BYTES
+    if lines[0].rstrip("\r") != _TSV_HEADER:
+        return f"tesseract's TSV has an unexpected header: {lines[0][:200]!r}"
+    words: list[_Placed] = []
+    for number, line in enumerate(lines[1:], start=2):
+        if not line:
+            continue
+        try:
+            word = _tsv_word(line.rstrip("\r").split("\t"), band)
+        except ValueError as exc:
+            return f"tesseract's TSV line {number}: {exc}"
+        if word is not None:
+            words.append(word)
+    return words
+
+
+def _tsv_word(fields: list[str], band: Band) -> _Placed | None:
+    """The word on one TSV row, placed on the righted page; None for a row that is not a word.
+
+    Its box is clamped to the band (D8): the band spans the righted page's
+    width and its rows lie on it, so a box tesseract reports past the
+    image's right or bottom edge can never map off the displayed page,
+    which A1's ``Page`` refuses for a word that is not hidden.
+
+    Raises:
+        ValueError: If the row is malformed.
+    """
+    if len(fields) != _TSV_FIELDS:
+        raise ValueError(f"{len(fields)} fields, not {_TSV_FIELDS}")
+    if fields[0] != _WORD_LEVEL:
+        return None
+    block, paragraph, line = (_tsv_int(name, value) for name, value in zip(_TSV_LINE, fields[2:5]))
+    left, top, width, height = (_tsv_int(name, value) for name, value in zip(_TSV_BOX, fields[6:10]))
+    confidence = _tsv_confidence(fields[10])
+    text = fields[11]
+    if confidence < 0.0 or not text.strip():
+        return None
+    x0, x1 = (min(edge, band.px_width) for edge in (left, left + width))
+    y0, y1 = (band.top_px + min(edge, band.px_height) for edge in (top, top + height))
+    return _Placed(text, x0, y0, x1, y1, confidence, (band.top_px, block, paragraph, line))
+
+
+def _tsv_int(name: str, value: str) -> int:
+    """A TSV box field: a non-negative int."""
+    try:
+        number = int(value)
+    except ValueError:
+        raise ValueError(f"{name} must be an int, got {value!r}") from None
+    return int_at_least(name, number, 0)
+
+
+def _tsv_confidence(value: str) -> float:
+    """A TSV confidence: a finite number up to 100 (-1 on rows that are not words)."""
+    try:
+        number = float(value)
+    except ValueError:
+        raise ValueError(f"conf must be a number, got {value!r}") from None
+    return finite_float("conf", number, hi=100.0)
+
+
+def _page_words(
+    read: list[tuple[Band, list[_Placed]]], rotation: int, displayed: tuple[int, int], dpi: int
+) -> tuple[OCRWord, ...]:
+    """The words read, each word read twice kept once, on the displayed page in points, their lines numbered."""
+    lines: dict[tuple[int, int, int, int], int] = {}
+    return tuple(
+        OCRWord(
+            text=word.text,
+            bbox=_displayed_box(word, rotation, displayed, dpi),
+            confidence=word.confidence,
+            line=lines.setdefault(word.line, len(lines)),
+        )
+        for word in _merged(read)
+    )
+
+
+# A word a band read: its position in that band's words, and the word.
+_Entry: TypeAlias = tuple[int, _Placed]
+
+
+def _merged(read: list[tuple[Band, list[_Placed]]]) -> list[_Placed]:
+    """Every band's words, band by band, less those each seam drops (:func:`_seam_drops`)."""
+    dropped: set[tuple[int, int]] = set()
+    for index in range(len(read) - 1):
+        dropped |= _seam_drops(read[index], read[index + 1], index, dropped)
+    return [
+        word
+        for index, (_band, words) in enumerate(read)
+        for position, word in enumerate(words)
+        if (index, position) not in dropped
+    ]
+
+
+def _seam_drops(
+    upper: tuple[Band, list[_Placed]], lower: tuple[Band, list[_Placed]], index: int, dropped: set[tuple[int, int]]
+) -> set[tuple[int, int]]:
+    """(band, position) of each word the seam of ``upper`` (band ``index``) and ``lower`` drops.
+
+    Only the words reaching into the strip the two bands share take part,
+    less those an earlier seam ``dropped``. Three steps, each over what the
+    one before kept: the cut fragments of words the other band read whole
+    (:func:`_fragments`), so a copy is never kept over a whole one for being
+    cut; the parts of lines neither band read whole (:func:`_clipped`); then
+    the lesser copy of each word read in both (:func:`_read_twice`).
+    """
+    (upper_band, upper_words), (lower_band, lower_words) = upper, lower
+    strip = (lower_band.top_px, upper_band.top_px + upper_band.px_height)
+    above = _reaching(upper_words, strip, index, dropped)
+    below = _reaching(lower_words, strip, index + 1, dropped)
+    upper_edge, upper_whole = _at_edge(above, strip, at_top=False)
+    lower_edge, lower_whole = _at_edge(below, strip, at_top=True)
+    gone = {(index, at) for at in _fragments(upper_edge, lower_whole, strip)}
+    gone |= {(index + 1, at) for at in _fragments(lower_edge, upper_whole, strip)}
+    gone |= _clipped(_kept(upper_edge, index, gone), _kept(lower_edge, index + 1, gone), strip, index)
+    return gone | _read_twice(_kept(above, index, gone), _kept(below, index + 1, gone), index)
+
+
+def _reaching(words: list[_Placed], strip: tuple[int, int], band: int, dropped: set[tuple[int, int]]) -> list[_Entry]:
+    """Band ``band``'s words reaching into ``strip`` (its first row, and the row past its last), less ``dropped``."""
+    top, bottom = strip
+    return [
+        (position, word)
+        for position, word in enumerate(words)
+        if word.y0 < bottom and word.y1 > top and (band, position) not in dropped
+    ]
+
+
+def _kept(entries: list[_Entry], band: int, gone: set[tuple[int, int]]) -> list[_Entry]:
+    """``entries`` of band ``band`` that are not ``gone``."""
+    return [entry for entry in entries if (band, entry[0]) not in gone]
+
+
+def _at_edge(entries: list[_Entry], strip: tuple[int, int], *, at_top: bool) -> tuple[list[_Entry], list[_Entry]]:
+    """A band's words reaching into ``strip``: those at its cut edge, and those whole.
+
+    The band's cut edge is the strip's top when ``at_top`` (the lower band),
+    else its bottom (the upper band). A word within :data:`_CUT_EDGE_PX` rows
+    of it is at the edge: the edge cut it, unless the ink ends there. One
+    farther from it is whole.
+    """
+    top, bottom = strip
+    edge: list[_Entry] = []
+    whole: list[_Entry] = []
+    for entry in entries:
+        word = entry[1]
+        gap = word.y0 - top if at_top else bottom - word.y1
+        (whole if gap > _CUT_EDGE_PX else edge).append(entry)
+    return edge, whole
+
+
+def _fragments(edge: list[_Entry], whole: list[_Entry], strip: tuple[int, int]) -> set[int]:
+    """The positions of the ``edge`` words lying wholly in ``strip`` that a ``whole`` word of the other band overlaps.
+
+    Such a word is OCR's read of a line its band's edge cut and the other
+    band read whole (#416). One reaching past the strip, or that nothing
+    whole overlaps, is not: words read once are never dropped.
+    """
+    top, bottom = strip
+    cut = [entry for entry in edge if top <= entry[1].y0 and entry[1].y1 <= bottom]
+    return {cut[first][0] for first, _ in _overlapping(cut, whole)}
+
+
+def _clipped(upper: list[_Entry], lower: list[_Entry], strip: tuple[int, int], index: int) -> set[tuple[int, int]]:
+    """(band, position) of the parts of each line no band read whole, from the band that read less of it (D6).
+
+    ``upper`` (band ``index``) and ``lower`` are the two bands' words at
+    their cut edges. Those overlapping across the seam, linked by their
+    overlaps (:func:`_lines`), are parts of one line that reaches both cut
+    edges: it is taller than the strip, or fills it, so each band read only
+    its part, and tesseract reads a cut part as other words. Only the parts
+    of the band that read more of it (:func:`_upper_read_more`) are kept.
+    """
+    dropped: set[tuple[int, int]] = set()
+    for above, below in _lines(_overlapping(upper, lower)):
+        upper_parts, lower_parts = [upper[at] for at in above], [lower[at] for at in below]
+        if _upper_read_more(upper_parts, lower_parts, strip):
+            dropped |= {(index + 1, position) for position, _ in lower_parts}
+        else:
+            dropped |= {(index, position) for position, _ in upper_parts}
+    return dropped
+
+
+def _upper_read_more(upper: list[_Entry], lower: list[_Entry], strip: tuple[int, int]) -> bool:
+    """True if the upper band's parts of a line read more of it than the lower band's, which are its other parts.
+
+    More is farther past the strip: rows the other band does not hold. When
+    the two reach as far (both none, for a line filling the strip: both
+    read all of it), the higher mean confidence; then the upper band's.
+    """
+    top, bottom = strip
+    above = max(top - min(word.y0 for _, word in upper), 0)
+    below = max(max(word.y1 for _, word in lower) - bottom, 0)
+    if above != below:
+        return above > below
+    return _mean_confidence(upper) >= _mean_confidence(lower)
+
+
+def _mean_confidence(entries: list[_Entry]) -> float:
+    """The mean confidence of ``entries`` (at least one)."""
+    return sum(word.confidence for _, word in entries) / len(entries)
+
+
+def _lines(pairs: list[tuple[int, int]]) -> list[tuple[list[int], list[int]]]:
+    """The groups of (upper, lower) word indices that ``pairs`` link, directly or through other words.
+
+    Each group is a connected part of the pairs' graph. Each word is reached
+    once, so this is O(words + pairs).
+    """
+    links: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for above, below in pairs:
+        links.setdefault((0, above), []).append((1, below))
+        links.setdefault((1, below), []).append((0, above))
+    seen: set[tuple[int, int]] = set()
+    groups: list[tuple[list[int], list[int]]] = []
+    for start in links:
+        if start not in seen:
+            groups.append(_linked(start, links, seen))
+    return groups
+
+
+def _linked(
+    start: tuple[int, int], links: dict[tuple[int, int], list[tuple[int, int]]], seen: set[tuple[int, int]]
+) -> tuple[list[int], list[int]]:
+    """The upper and lower word indices ``links`` reach from ``start``, each added to ``seen`` (once: bounded)."""
+    group: tuple[list[int], list[int]] = ([], [])
+    seen.add(start)
+    pending = [start]
+    while pending:
+        side, at = pending.pop()
+        group[side].append(at)
+        for other in links[(side, at)]:
+            if other not in seen:
+                seen.add(other)
+                pending.append(other)
+    return sorted(group[0]), sorted(group[1])
+
+
+def _read_twice(above: list[_Entry], below: list[_Entry], index: int) -> set[tuple[int, int]]:
+    """(band, position) of the lesser copy of each word read in both ``above`` (band ``index``) and ``below``.
+
+    A copy is the same text with a box IoU of 0.5 or more. Copies match one
+    to one (D6): pairs are taken closest first (highest IoU, then by
+    position), passing over a pair one of whose words is matched already,
+    so two words never count as one's copies. Of a match, the lesser
+    confidence is dropped; a tie keeps the upper band's.
+    """
+    pairs: list[tuple[float, int, int]] = []
+    for first, second in _overlapping(above, below):
+        upper, lower = above[first][1], below[second][1]
+        if upper.text == lower.text and (iou := _iou(upper, lower)) >= _SAME_WORD_IOU:
+            pairs.append((-iou, first, second))
+    matched: tuple[set[int], set[int]] = (set(), set())
+    lesser: set[tuple[int, int]] = set()
+    for _, first, second in sorted(pairs):
+        if first in matched[0] or second in matched[1]:
+            continue
+        matched[0].add(first)
+        matched[1].add(second)
+        (upper_at, upper), (lower_at, lower) = above[first], below[second]
+        lesser.add((index + 1, lower_at) if lower.confidence <= upper.confidence else (index, upper_at))
+    return lesser
+
+
+def _overlapping(first: list[_Entry], second: list[_Entry]) -> list[tuple[int, int]]:
+    """Each (i, j) whose words ``first[i]`` and ``second[j]`` overlap (boxes sharing an area over 0), found once.
+
+    A sweep along x by left edges: each word is checked against the other
+    list's words that started before it and reach past its left edge, so a
+    pair is found when its second word starts. O((f + s) log(f + s)) to
+    sort, then O((f + s) a) for a words of the other list active at once (a
+    few on a strip of text lines), plus the pairs found.
+    """
+    lists = (first, second)
+    starts = sorted((entry[1].x0, side, at) for side, entries in enumerate(lists) for at, entry in enumerate(entries))
+    active: tuple[list[int], list[int]] = ([], [])
+    pairs: list[tuple[int, int]] = []
+    for x0, side, at in starts:
+        other = 1 - side
+        active[other][:] = [held for held in active[other] if lists[other][held][1].x1 > x0]
+        word = lists[side][at][1]
+        hits = [held for held in active[other] if _overlap(word, lists[other][held][1]) > 0]
+        pairs.extend((at, held) if side == 0 else (held, at) for held in hits)
+        active[side].append(at)
+    return pairs
+
+
+def _iou(first: _Placed, second: _Placed) -> float:
+    """The boxes' intersection over their union; 0 when the union has no area."""
+    overlap = _overlap(first, second)
+    union = (first.x1 - first.x0) * (first.y1 - first.y0) + (second.x1 - second.x0) * (second.y1 - second.y0) - overlap
+    return overlap / union if union > 0 else 0.0
+
+
+def _overlap(first: _Placed, second: _Placed) -> int:
+    """The area, in px, the boxes share; 0 when they do not overlap."""
+    width = min(first.x1, second.x1) - max(first.x0, second.x0)
+    height = min(first.y1, second.y1) - max(first.y0, second.y0)
+    return max(width, 0) * max(height, 0)
+
+
+def _displayed_box(word: _Placed, rotation: int, displayed: tuple[int, int], dpi: int) -> BBox:
+    """``word``'s box on the displayed page, in points: the inverse of the clockwise ``rotation`` that righted it.
+
+    ``displayed`` is the displayed page's (width, height) in pixels.
+    """
+    width, height = displayed
+    x0, y0, x1, y1 = word.x0, word.y0, word.x1, word.y1
+    if rotation == 90:
+        box = (y0, height - x1, y1, height - x0)
+    elif rotation == 180:
+        box = (width - x1, height - y1, width - x0, height - y0)
+    elif rotation == 270:
+        box = (width - y1, x0, width - y0, x1)
+    else:
+        box = (x0, y0, x1, y1)
+    scale = 72.0 / dpi
+    return BBox(x0=box[0] * scale, y0=box[1] * scale, x1=box[2] * scale, y1=box[3] * scale)
+
+
+def _pgm(image: RenderedPage | Band) -> tuple[bytes, bytes]:
+    """``image`` as a binary PGM (P5, 8-bit): its header, then its pixels."""
+    return b"P5\n%d %d\n255\n" % (image.px_width, image.px_height), image.pixels
+
+
+class _Call(NamedTuple):
+    """How one tesseract call ended: its status and reason, its whole stdout when ok, and its stderr's tail."""
+
+    status: _CallStatus
+    reason: str
+    stdout: bytes
+    stderr: str
+
+
+def _call(argv: list[str], payload: tuple[bytes, ...], timeout_s: float) -> _Call:
+    """Run ``argv`` with ``payload`` on its stdin, killing it (and its session) past ``timeout_s``.
+
+    tesseract reads all of its stdin before it writes anything, so the
+    payload is written, then stdout read (within ``_MAX_STDOUT_BYTES``), in
+    this thread; its stderr is drained by a thread of its own into a 4 KiB
+    ring, and cannot block it.
+    """
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={**os.environ, "OMP_THREAD_LIMIT": "1"},
+            start_new_session=_OWN_SESSION,
+        )
+    except OSError as exc:
+        return _Call("unavailable", f"cannot start tesseract ({argv[0]}): {exc}", b"", "")
+    try:
+        errors = drained(process)  # if its thread cannot start, tesseract is killed and reaped
+    except RuntimeError as exc:
+        return _Call("unavailable", f"cannot drain tesseract's stderr ({argv[0]}): {exc}", b"", "")
+    expired = threading.Event()
+    timer = threading.Timer(timeout_s, _expire, (process, expired))
+    timer.daemon = True
+    timer.start()
+    fed, stdout = "", None
+    try:
+        fed = _fed(process.stdin, payload)
+        stdout = _bounded_read(process.stdout, _MAX_STDOUT_BYTES)
+    finally:
+        # Cancelled and joined before the reap: a kill never reaches a reaped (reusable) pid.
+        timer.cancel()
+        timer.join(REAP_TIMEOUT_S)
+        if stdout is None:  # past its stdout bound, or this call was interrupted
+            _kill(process)
+        returncode = reaped(process, REAP_TIMEOUT_S)
+        close_pipes(process)
+        stderr = errors.finish(REAP_TIMEOUT_S)  # it is reaped: its drain ends
+    return _ending(returncode, expired.is_set(), stdout, fed, stderr, timeout_s)
+
+
+def _fed(stdin: IO[bytes] | None, payload: tuple[bytes, ...]) -> str:
+    """Write ``payload`` to the child's stdin and close it: "" once all of it is written, else why not."""
+    if stdin is None:
+        raise ValueError("tesseract's stdin must be a pipe")
+    try:
+        for part in payload:
+            stdin.write(part)
+        stdin.close()
+    except OSError as exc:  # it stopped reading: it ended, or was killed
+        _discard(stdin)
+        return str(exc) or type(exc).__name__
+    return ""
+
+
+def _discard(stdin: IO[bytes]) -> None:
+    """Close a stdin whose write failed; its unwritten bytes can only fail the same way (already reported)."""
+    try:
+        stdin.close()
+    except OSError:
+        return
+
+
+def _bounded_read(stdout: IO[bytes] | None, bound: int) -> bytes | None:
+    """All of ``stdout`` to its end, or None once it passes ``bound`` bytes.
+
+    Each read asks for a whole chunk (or the one byte past the bound) and
+    returns it whole unless the stream ends, so the loop makes at most
+    ``bound // _READ_CHUNK + 2`` passes.
+    """
+    if stdout is None:
+        raise ValueError("tesseract's stdout must be a pipe")
+    data = bytearray()
+    while len(data) <= bound:
+        chunk = stdout.read(min(_READ_CHUNK, bound + 1 - len(data)))
+        if not chunk:
+            return bytes(data)
+        data += chunk
+    return None
+
+
+def _expire(process: "subprocess.Popen[bytes]", expired: threading.Event) -> None:
+    """The timer's: the call's time is up; kill it."""
+    expired.set()
+    _kill(process)
+
+
+def _kill(process: "subprocess.Popen[bytes]") -> None:
+    """Kill ``process`` and, on POSIX, everything in its session (its process group)."""
+    if not _OWN_SESSION:
+        process.kill()
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError:  # its group has ended, or cannot be signalled: kill the process itself
+        process.kill()
+
+
+def _ending(
+    returncode: int | None, expired: bool, stdout: bytes | None, fed: str, stderr: str, timeout_s: float
+) -> _Call:
+    """How a call ended: ok only if it exited 0 with its whole stdout, having read the whole image."""
+    if returncode == 0 and stdout is not None and not fed:
+        return _Call("ok", "", stdout, stderr)
+    said = f"; its stderr ends: {stderr}" if stderr else ""
+    if expired:
+        return _Call("timeout", f"tesseract did not finish within {timeout_s} s and was killed{said}", b"", stderr)
+    if stdout is None:
+        return _Call("failed", f"tesseract wrote over {_MAX_STDOUT_BYTES} bytes to stdout and was killed", b"", stderr)
+    if returncode is None:
+        return _Call("failed", "tesseract could not be reaped", b"", stderr)
+    if returncode != 0:
+        return _Call("failed", f"tesseract exited with code {returncode}{said}", b"", stderr)
+    return _Call("failed", f"tesseract did not read the whole image: {fed}", b"", stderr)

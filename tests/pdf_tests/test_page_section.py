@@ -215,11 +215,9 @@ class TestPageImageReadBytes:
     def test_reads_file(self, tmp_path):
         assert _page_image(image_path=_write(tmp_path, "p.png", PNG)).read_bytes() == PNG
 
-    def test_file_takes_precedence_over_loader(self, tmp_path):
-        def loader():
-            raise AssertionError("loader must not be called when image_path is set")
-
-        image = _page_image(image_path=_write(tmp_path, "p.png", PNG), _loader=loader)
+    def test_loader_takes_precedence_over_file(self, tmp_path):
+        # A bundle's loaded page image keeps image_path for information; its loader verifies each read.
+        image = _page_image(image_path=_write(tmp_path, "p.png", b"unverified"), _loader=lambda: PNG)
         assert image.read_bytes() == PNG
 
     def test_reads_loader_when_no_path(self):
@@ -260,12 +258,9 @@ class TestPageImageReadBands:
         paths = (_write(tmp_path, "b1.png", BANDS[0]), _write(tmp_path, "b2.png", BANDS[1]))
         assert _page_image(band_paths=paths).read_bands() == BANDS
 
-    def test_band_files_take_precedence_over_band_loader(self, tmp_path):
-        def loader():
-            raise AssertionError("band loader must not be called when band_paths is set")
-
-        image = _page_image(band_paths=(_write(tmp_path, "b1.png", BANDS[0]),), _band_loader=loader)
-        assert image.read_bands() == (BANDS[0],)
+    def test_band_loader_takes_precedence_over_band_files(self, tmp_path):
+        image = _page_image(band_paths=(_write(tmp_path, "b1.png", b"unverified"),), _band_loader=lambda: BANDS)
+        assert image.read_bands() == BANDS
 
     def test_reads_band_loader_when_no_band_paths(self):
         assert _page_image(_band_loader=lambda: BANDS).read_bands() == BANDS
@@ -704,7 +699,7 @@ class TestPageMarkdown:
         # Hidden spans are flagged, never dropped (spec review D2-b); the marker lets consumers filter them.
         hidden = _paragraph(1, bbox=OFF_PAGE_BBOX, hidden_reasons=("off_page",))
         page = _page(elements=(_paragraph(0), hidden))
-        assert page.to_markdown() == (
+        assert page.to_markdown(include_hidden=True) == (
             "<!-- page 1 route=digital status=ok -->\n\nParagraph 0.\n\n<!-- hidden: off_page -->\nParagraph 1."
         )
 

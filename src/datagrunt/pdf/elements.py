@@ -5,7 +5,19 @@ fields in ``__post_init__`` and rejects bad input at construction. Fields hold
 extracted data verbatim (preserve, not transform); Markdown escaping happens
 only when an element is rendered with ``to_markdown()``.
 
+Hidden elements are flagged, never dropped: a page's ``elements``, the JSON
+and the frame keep them. Markdown omits them by default
+(``include_hidden=False`` on :meth:`PDFDocument.to_markdown`,
+:meth:`Page.to_markdown` and :meth:`Section.to_markdown`): it is what a
+reader sees. With ``include_hidden=True``, each is rendered after its
+``<!-- hidden: reasons -->`` line, as an element renders itself
+(``to_markdown`` of one element, which the frame's ``markdown`` column holds).
+
 Coordinates are PDF points with a top-left origin.
+
+polars and pyarrow are imported where a :class:`Table` becomes a frame
+(:meth:`Table.to_dataframe`, :meth:`Table.to_arrow_table`), not with this
+module: every PDF worker imports this model and none makes a frame (#439).
 """
 
 import hashlib
@@ -15,20 +27,56 @@ import unicodedata
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, TypeAlias, Union, get_args
+from typing import TYPE_CHECKING, Literal, TypeAlias, Union, get_args
 
-import polars as pl
-import pyarrow as pa
-
-from datagrunt.core.pdf_io.extraction.markdown_escape import escape_markdown_link_target
-from datagrunt.pdf._validate import finite_float, int_at_least, non_blank_str, optional_str, str_tuple
+from datagrunt.pdf._markdown_escape import escape_markdown_link_target
+from datagrunt.pdf._validate import (
+    finite_float,
+    int_at_least,
+    non_blank_str,
+    optional_str,
+    ordered_interval,
+    positive_float,
+    sha256_hex,
+    str_tuple,
+    strict_bool,
+)
 from datagrunt.pdf.exceptions import DatagruntPDFError
 
-HiddenReason: TypeAlias = Literal["off_page", "invisible", "tiny_font", "transparent", "matches_background"]
+if TYPE_CHECKING:
+    import polars as pl
+    import pyarrow as pa
+
+HiddenReason: TypeAlias = Literal[
+    "off_page",
+    "invisible",
+    "tiny_font",
+    "transparent",
+    "matches_background",
+    "zero_scale",
+    "duplicate",
+    "superseded",
+    "unchecked_background",
+]
 """Why a text span is hidden from a human reader (it is flagged, never dropped).
 
 ``matches_background`` means the text colour is indistinguishable from the
-background it is drawn on.
+background it is drawn on. ``zero_scale`` means the text is squeezed flat:
+drawn under 1 pt per em wide and narrower than tall, as text pdfium's
+textpage drops (``Tz 0``: the v5 engine recovers it) or keeps (``Tz 0.05``)
+(#366). ``duplicate`` means the text is a drawn copy of text the page
+already shows (a shadow or outline drawn on it), which a reader reads once
+(#406). ``superseded`` means the text is the digital text layer of a page
+whose content was read by OCR of the rendered page (a ``"vision"`` page,
+#369): the page went to vision because that layer held too little valid
+text, so the visible elements are OCR's and the layer is kept apart, never
+dropped. Only text with no other reason is superseded: hidden text keeps
+its own reasons. ``unchecked_background`` means the page drew the text where
+a matching background could hide it (its paint is near white, or other
+paint lies under it), but that background could not be checked: the page's
+render was refused or failed (#400). It is flagged, never dropped: a check
+that cannot run fails closed. New reasons are appended, so the canonical
+order of the older ones never changes.
 """
 
 # Canonical order, derived from the Literal so the two can never drift apart.
@@ -55,9 +103,15 @@ _MARKDOWN_SYNTAX_CHAR = re.compile(r"[\\`*_\[\]<>&|~#]")
 
 # What can still open a block at the start of a line once every
 # _MARKDOWN_SYNTAX_CHAR is escaped: a list, thematic-break, or setext marker
-# (``-``, ``+``, ``=``), or an ordered-list number (digits before ``.``/``)``).
-# [0-9], not \d: list numbers are ASCII digits only.
-_LINE_START_MARKER = re.compile(r"\A(?:[-+=]|[0-9]+(?=[.)]))")
+# (``-``, ``+``, ``=``), or an ordered-list number (digits before ``.``/``)``
+# that whitespace or the line's end follows, as CommonMark requires: ``45.00``
+# and ``3)x`` are text, ``1. item`` and ``3.`` open a list). [0-9], not \d:
+# list numbers are ASCII digits only.
+_LINE_START_MARKER = re.compile(r"\A(?:[-+=]|[0-9]+(?=[.)](?:[ \t]|\Z)))")
+
+# A marker CommonMark reads as an ordered-list item: 1-9 ASCII digits, then
+# "." or ")" (the digits and the delimiter are the groups).
+_COMMONMARK_NUMBER = re.compile(r"([0-9]{1,9})([.)])")
 
 # The Markdown line datagrunt puts between two consecutive lists: without it a
 # blank line alone would merge them into one loose list (and renumber it).
@@ -76,10 +130,6 @@ _QUALITY_RANGES = (
     ("deskew_angle_deg", -45.0, 45.0),
     ("ocr_mean_confidence", 0.0, 100.0),
 )
-
-# A SHA-256 hex digest exactly as hashlib's hexdigest() produces it. Matched
-# with fullmatch() so a trailing newline cannot slip past a `$` anchor.
-_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 # Either path separator, so a doc_id never depends on the OS that built it.
 _PATH_SEPARATOR = re.compile(r"[\\/]")
@@ -105,15 +155,6 @@ def _ascii_folded(text: str) -> str:
     """
     decomposed = unicodedata.normalize("NFKD", text)
     return "".join(char for char in decomposed if not unicodedata.category(char).startswith("M"))
-
-
-def _check_sha256(name: str, value: object) -> str:
-    """Return ``value`` if it is a 64-char lowercase hex SHA-256 digest."""
-    if not isinstance(value, str):
-        raise TypeError(f"{name} must be a str, got {value!r} ({type(value).__name__})")
-    if _SHA256_HEX.fullmatch(value) is None:
-        raise ValueError(f"{name} must be 64 lowercase hex characters, got {value!r}")
-    return value
 
 
 def make_element_id(page_number: int, index: int) -> str:
@@ -143,8 +184,16 @@ def _parse_element_id(name: str, value: object) -> tuple[int, int]:
     return page, index
 
 
-def _check_hidden_reasons(value: object) -> None:
-    """Require unique, known hidden reasons in ``HIDDEN_REASONS`` order."""
+def check_hidden_reasons(value: object) -> None:
+    """Require unique, known hidden reasons in ``HIDDEN_REASONS`` order.
+
+    The one rule for every ``hidden_reasons`` field: elements here, and the
+    v5 quality stage's span pieces (:mod:`datagrunt.pdf.quality`).
+
+    Raises:
+        TypeError: If ``value`` is not a tuple of str.
+        ValueError: If a reason is unknown, repeated, or out of canonical order.
+    """
     reasons = str_tuple("hidden_reasons", value)
     unknown = [reason for reason in reasons if reason not in HIDDEN_REASONS]
     if unknown:
@@ -212,6 +261,52 @@ def _markdown_literal(text: str) -> list[str]:
             escaped = _MARKDOWN_SYNTAX_CHAR.sub(r"\\\g<0>", line)
             lines.append(_LINE_START_MARKER.sub(_escape_line_start, escaped, count=1))
     return lines
+
+
+def _shown_as_written(markers: tuple[str, ...]) -> bool:
+    """True if CommonMark shows ``markers`` exactly as written when they number one list.
+
+    CommonMark takes a list's start from its first number and counts up by
+    one from there, and a change of delimiter starts a new list. So every
+    marker must be a CommonMark number with the first marker's delimiter, and
+    each must be the previous number plus one, written without leading zeros
+    (``01.`` would show as ``1.``).
+    """
+    first = _COMMONMARK_NUMBER.fullmatch(markers[0]) if markers else None
+    if first is None:
+        return False
+    start, delimiter = int(first[1]), first[2]
+    for offset, marker in enumerate(markers):
+        if _COMMONMARK_NUMBER.fullmatch(marker) is None or marker != f"{start + offset}{delimiter}":
+            return False
+    return True
+
+
+def _list_entries(markers: Iterable[str], items: tuple[str, ...]) -> str:
+    """Render one ``marker item`` list entry per item, one marker per item.
+
+    Each item becomes literal Markdown lines, and continuation lines are
+    indented to the item's content column so they stay inside the list item.
+    """
+    entries = []
+    for marker, item in zip(markers, items, strict=True):
+        continuation = "\n" + " " * (len(marker) + 1)
+        entries.append(f"{marker} {continuation.join(_markdown_literal(item))}")
+    return "\n".join(entries)
+
+
+def _marker_text_entries(markers: tuple[str, ...], items: tuple[str, ...]) -> str:
+    """Render the items as one paragraph, each item ``marker item`` as literal text on its own line.
+
+    The marker and item are escaped as one literal text, so a number leading
+    the line is escaped (``2\\)``) and CommonMark reads no list number from it.
+    Every item but the last ends in a backslash, a CommonMark hard line break:
+    the list stays one block, so a ``<!-- hidden -->`` comment covers all of
+    it. Escaping doubles every backslash in the text, so an item's own
+    trailing backslash stays literal and the one added is always the break.
+    """
+    entries = ("\n".join(_markdown_literal(f"{marker} {item}")) for marker, item in zip(markers, items, strict=True))
+    return "\\\n".join(entries)
 
 
 def _gfm_row(cells: tuple[str, ...]) -> str:
@@ -317,14 +412,6 @@ def _check_optional_callable(name: str, value: object) -> None:
     """Require ``value`` to be callable or None."""
     if value is not None and not callable(value):
         raise TypeError(f"{name} must be callable or None, got {type(value).__name__}")
-
-
-def _positive_finite(name: str, value: object) -> float:
-    """Return ``value`` as a finite float strictly greater than zero."""
-    result = finite_float(name, value)
-    if result <= 0.0:
-        raise ValueError(f"{name} must be > 0, got {result!r}")
-    return result
 
 
 def _check_bool(name: str, value: object) -> None:
@@ -459,7 +546,7 @@ class DocumentMetadata:
 
     def __post_init__(self) -> None:
         non_blank_str("source_name", self.source_name)
-        _check_sha256("sha256", self.sha256)
+        sha256_hex("sha256", self.sha256)
         int_at_least("page_count", self.page_count, 0)
         optional_str("title", self.title)
         optional_str("author", self.author)
@@ -484,7 +571,7 @@ class DocumentMetadata:
         ``stem`` differs across OSes and versions.
         """
         non_blank_str("source_name", source_name)
-        _check_sha256("sha256", sha256)
+        sha256_hex("sha256", sha256)
         name = _PATH_SEPARATOR.split(source_name)[-1]
         dot = name.rfind(".")
         raw_stem = _ascii_folded(name[:dot] if dot > 0 else name)
@@ -531,7 +618,7 @@ class _Element:
         if not isinstance(self.bbox, BBox):
             raise TypeError(f"bbox must be a BBox, got {type(self.bbox).__name__}")
         str_tuple("scope_path", self.scope_path)
-        _check_hidden_reasons(self.hidden_reasons)
+        check_hidden_reasons(self.hidden_reasons)
         self._validate_fields()
 
     def _validate_fields(self) -> None:
@@ -570,10 +657,17 @@ class Heading(_Element):
     A heading opens its own scope, so its ``scope_path`` includes its text:
     it is non-empty and ends with ``text`` (verbatim), after the texts of the
     headings enclosing it.
+
+    Its tier is ``font_size_pt``, its first line's font size to 0.5 pt, and
+    ``is_bold``, whether that line is bold: both set, or both None (a heading
+    with no tier, such as one built by hand). Extraction ranks ``level`` over
+    the document's tiers, so a level means the same prominence on every page.
     """
 
     level: int
     text: str
+    font_size_pt: float | None = None
+    is_bold: bool | None = None
 
     def _validate_fields(self) -> None:
         int_at_least("level", self.level, 1)
@@ -582,6 +676,17 @@ class Heading(_Element):
         non_blank_str("text", self.text)
         if not self.scope_path or self.scope_path[-1] != self.text:
             raise ValueError(f"scope_path must end with the heading's own text {self.text!r}, got {self.scope_path!r}")
+        self._validate_tier()
+
+    def _validate_tier(self) -> None:
+        """Require ``font_size_pt`` (finite, > 0) and ``is_bold`` (a bool) both set, or both None."""
+        if (self.font_size_pt is None) != (self.is_bold is None):
+            tier = f"{self.font_size_pt!r} and {self.is_bold!r}"
+            raise ValueError(f"font_size_pt and is_bold are both set or both None, got {tier}")
+        if self.font_size_pt is None:
+            return
+        object.__setattr__(self, "font_size_pt", positive_float("font_size_pt", self.font_size_pt))
+        strict_bool("is_bold", self.is_bold)
 
     def _render_markdown(self) -> str:
         """Render as an ATX heading on one line: the text's lines joined with spaces.
@@ -630,30 +735,57 @@ class KeyValue(_Element):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class BulletList(_Element):
-    """A non-empty list of non-blank items, numbered when ``ordered``."""
+    """A non-empty list of non-blank items, numbered when ``ordered``.
+
+    Attributes:
+        items: Each item's text, its marker not included.
+        ordered: True if its markers number the items.
+        markers: Each item's marker as written ("•", "1.", "(a)"), one per
+            item and non-blank, or empty when not recorded. An ordered
+            list's Markdown shows them (see :meth:`_render_markdown`); an
+            unordered list's bullets every item ``-``.
+    """
 
     items: tuple[str, ...]
     ordered: bool
+    markers: tuple[str, ...] = ()
 
     def _validate_fields(self) -> None:
         str_tuple("items", self.items)
         if not self.items:
             raise ValueError("items must contain at least one item")
         _check_bool("ordered", self.ordered)
+        str_tuple("markers", self.markers)
+        if self.markers and len(self.markers) != len(self.items):
+            raise ValueError(
+                f"markers must be empty or hold one marker per item ({len(self.items)}), got {len(self.markers)}"
+            )
 
     def _render_markdown(self) -> str:
-        """Render one ``- item`` (or ``N. item``) entry per item.
+        """Render the items in one of three forms, keeping an ordered list's numbering (#434).
 
-        Each item becomes literal Markdown lines, and continuation lines are
-        indented to the item's content column so they stay inside the list item.
+        - Unordered: one ``- item`` list entry per item; markers are not shown.
+        - Ordered, with markers CommonMark shows as written (one delimiter,
+          counting up by one, no leading zeros: ``7.``, ``8.``): one list
+          entry per item under its own marker, so the list starts where the
+          source's does (``2) item`` starts at 2). With no markers recorded
+          the entries are numbered ``1.``, ``2.``, ...
+        - Ordered, with any other markers (``a)``, ``iv.``, ``(1)``, ``I``, or
+          numbers CommonMark would show differently, such as ``1.`` then ``3.``):
+          one paragraph with a line per item, ``marker item`` as literal text,
+          items split by hard line breaks, so every marker stays visible and
+          none reads as a list number.
+
+        A list is never split between forms, so its items render alike, and
+        every form is one Markdown block.
         """
-        entries = []
-        for number, item in enumerate(self.items, start=1):
-            marker = f"{number}." if self.ordered else "-"
-            lines = _markdown_literal(item)
-            continuation = "\n" + " " * (len(marker) + 1)
-            entries.append(f"{marker} {continuation.join(lines)}")
-        return "\n".join(entries)
+        if not self.ordered:
+            return _list_entries(("-",) * len(self.items), self.items)
+        if not self.markers:
+            return _list_entries((f"{number}." for number in range(1, len(self.items) + 1)), self.items)
+        if _shown_as_written(self.markers):
+            return _list_entries(self.markers, self.items)
+        return _marker_text_entries(self.markers, self.items)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -671,12 +803,29 @@ class Table(_Element):
         extraction_method: ``"lattice"`` (ruled lines) or ``"stream"`` (whitespace).
         continued_from_id: Element id of the table this one continues (a table
             split across pages), or None.
+        column_centres: One display-x position per column, left to right
+            (finite, strictly increasing), or empty when not measured. A
+            stream table's is the column's alignment edge: the start, end
+            or middle, whichever its cells share, so it does not move with
+            the column's widest cell; a lattice table's is the middle of
+            its ruled column. The scope pass (A6) links a split table's
+            parts on them.
+        column_intervals: One display-x ``(start, end)`` per column (finite,
+            ``start <= end``, starts never falling, each holding its
+            column's centre), set exactly when ``column_centres`` are. A
+            stream table's is where its column's cells start and end along
+            the rows, so a column whose cells are all one width, which
+            tells no alignment, still shows where its text ends (#420); a
+            lattice table's is its ruled column's span. A6 links such a
+            part by its end to the other part's flush-right column.
     """
 
     headers: tuple[str, ...]
     rows: tuple[tuple[str, ...], ...]
     extraction_method: ExtractionMethod
     continued_from_id: str | None = None
+    column_centres: tuple[float, ...] = ()
+    column_intervals: tuple[tuple[float, float], ...] = ()
 
     def _validate_fields(self) -> None:
         str_tuple("headers", self.headers, allow_blank=True)
@@ -690,6 +839,49 @@ class Table(_Element):
             _parse_element_id("continued_from_id", self.continued_from_id)
             if self.continued_from_id == self.element_id:
                 raise ValueError(f"continued_from_id must differ from element_id, got {self.continued_from_id!r}")
+        self._validate_centres()
+        self._validate_intervals()
+
+    def _validate_centres(self) -> None:
+        """Require no centres, or one finite centre per column in strictly increasing order (stored as floats)."""
+        if not isinstance(self.column_centres, tuple):
+            raise TypeError(f"column_centres must be a tuple, got {type(self.column_centres).__name__}")
+        if not self.column_centres:
+            return
+        width = self._width()
+        if len(self.column_centres) != width:
+            raise ValueError(
+                f"column_centres must have {width} values (one per column), got {len(self.column_centres)}"
+            )
+        centres = tuple(finite_float(f"column_centres[{i}]", centre) for i, centre in enumerate(self.column_centres))
+        if any(left >= right for left, right in zip(centres, centres[1:])):
+            raise ValueError(f"column_centres must strictly increase, got {self.column_centres!r}")
+        object.__setattr__(self, "column_centres", centres)
+
+    def _validate_intervals(self) -> None:
+        """Require intervals exactly when centres, one ``(start, end)`` per column (stored as floats), as documented."""
+        if not isinstance(self.column_intervals, tuple):
+            raise TypeError(f"column_intervals must be a tuple, got {type(self.column_intervals).__name__}")
+        if bool(self.column_intervals) != bool(self.column_centres):
+            counts = f"{len(self.column_centres)} centres and {len(self.column_intervals)} intervals"
+            raise ValueError(f"column_intervals must be set exactly when column_centres are, got {counts}")
+        if not self.column_intervals:
+            return
+        width = self._width()
+        if len(self.column_intervals) != width:
+            raise ValueError(
+                f"column_intervals must have {width} values (one per column), got {len(self.column_intervals)}"
+            )
+        intervals = tuple(
+            ordered_interval(f"column_intervals[{i}]", pair) for i, pair in enumerate(self.column_intervals)
+        )
+        if any(later[0] < earlier[0] for earlier, later in zip(intervals, intervals[1:])):
+            raise ValueError(f"column_intervals' starts must not decrease, got {self.column_intervals!r}")
+        for index, (centre, (start, end)) in enumerate(zip(self.column_centres, intervals)):
+            if not start <= centre <= end:
+                where = f"column_intervals[{index}] {(start, end)!r}"
+                raise ValueError(f"column_centres[{index}] {centre!r} must lie within {where}")
+        object.__setattr__(self, "column_intervals", intervals)
 
     def _validate_width(self) -> None:
         if not self.headers and not self.rows:
@@ -732,20 +924,24 @@ class Table(_Element):
             names.append(name)
         return tuple(names)
 
-    def to_dataframe(self) -> pl.DataFrame:
+    def to_dataframe(self) -> "pl.DataFrame":
         """Return the rows as a DataFrame of ``pl.String`` columns named by :meth:`column_names`."""
+        import polars as pl  # here, not with the module (module notes)
+
         names = self.column_names()
         columns = {name: [row[i] for row in self.rows] for i, name in enumerate(names)}
         # Explicit schema: a zero-row table still yields correctly typed columns.
         return pl.DataFrame(columns, schema={name: pl.String for name in names})
 
-    def to_arrow_table(self) -> pa.Table:
+    def to_arrow_table(self) -> "pa.Table":
         """Return the rows as a ``pyarrow.Table`` of ``pa.large_string()`` columns.
 
         Converted via :meth:`to_dataframe`, then cast to an explicit schema:
         polars' default Arrow string type varies by version (``large_string``,
         ``string_view``), and callers need one stable type.
         """
+        import pyarrow as pa  # here, not with the module (module notes)
+
         frame = self.to_dataframe()
         schema = pa.schema([(name, pa.large_string()) for name in frame.columns])
         return frame.to_arrow().cast(schema)
@@ -771,17 +967,35 @@ class Table(_Element):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Figure(_Element):
-    """An embedded image, identified by the SHA-256 of its bytes.
+    """An embedded image, identified by the SHA-256 of its raw embedded stream.
 
-    Bytes come from ``image_path`` when set, else from ``_loader`` (an internal
-    lazy source, excluded from equality and repr). :meth:`read_bytes` verifies
-    them against ``sha256`` and fails loud on a mismatch.
+    Two byte sources, each excluded from equality and repr:
+
+    - :meth:`read_raw_bytes` returns the raw stream (as stored in the PDF,
+      still encoded by its filters) from ``_raw_loader``, verified against
+      ``sha256``: a mismatch fails loud.
+    - :meth:`read_bytes` returns the image as PNG, a derived artifact: from
+      ``_loader`` when set, else from ``image_path``. It is not checked
+      against ``sha256``, which hashes the raw stream, not the PNG. The
+      loader comes first because it can verify: a bundle's figure keeps
+      ``image_path`` for information, and its loader checks the file
+      against the bundle's manifest on every read.
+
+    The engine sets both loaders to a ``FigureRead``'s bound methods
+    (:mod:`datagrunt.pdf._loaders`), which reopen the PDF on demand in a
+    capped figure worker. For an encrypted PDF that loader holds
+    the password, so a pickled Figure (one sent across a process pool)
+    carries the password inside its loaders' pickle: never store or send
+    such a pickle anywhere the PDF's readers could not already go. The
+    password stays out of the Figure's repr and equality.
 
     Attributes:
-        sha256: SHA-256 of the image bytes, 64 lowercase hex characters.
+        sha256: SHA-256 of the image's raw embedded stream, 64 lowercase hex
+            characters. Unlike a hash of exported bytes, it survives encoder
+            upgrades, so image dedupe and cache keys stay stable.
         width_px: Image width in pixels (>= 1).
         height_px: Image height in pixels (>= 1).
-        image_path: Where the image was written, if it was. Not part of
+        image_path: Where the PNG was written, if it was. Not part of
             equality: the same image stored elsewhere is the same figure.
         caption: Caption text, if one was found.
     """
@@ -792,39 +1006,56 @@ class Figure(_Element):
     # Storage location, not identity: excluded from equality and hashing.
     image_path: Path | None = field(default=None, compare=False)
     caption: str | None = None
+    # Internal lazy sources: PNG bytes, and the raw stream sha256 hashes.
     _loader: Callable[[], bytes] | None = field(default=None, compare=False, repr=False)
+    _raw_loader: Callable[[], bytes] | None = field(default=None, compare=False, repr=False)
 
     def _validate_fields(self) -> None:
-        _check_sha256("sha256", self.sha256)
+        sha256_hex("sha256", self.sha256)
         int_at_least("width_px", self.width_px, 1)
         int_at_least("height_px", self.height_px, 1)
         _check_optional_path("image_path", self.image_path)
         optional_str("caption", self.caption)
         _check_optional_callable("_loader", self._loader)
+        _check_optional_callable("_raw_loader", self._raw_loader)
 
     def read_bytes(self) -> bytes:
-        """Return the image bytes after verifying them against ``sha256``.
+        """Return the image as PNG bytes: the loader first, then ``image_path``.
+
+        Derived bytes, so they are not checked against ``sha256`` (use
+        :meth:`read_raw_bytes` for verified bytes); every read is bounded by
+        the asset limit. A loader that raises is never bypassed by the file.
 
         Raises:
             DatagruntPDFError: If there is no byte source, ``image_path`` is not
-                a regular file, the bytes exceed the asset limit, or their
-                SHA-256 does not match ``sha256``.
+                a regular file, or the bytes exceed the asset limit (or as the
+                loader raises it).
             OSError: If ``image_path`` cannot be stat'ed or read (e.g.
                 ``FileNotFoundError``, ``PermissionError``).
             TypeError: If the loader returns something other than ``bytes``.
         """
-        data = self._load_bytes()
+        if self._loader is not None:
+            return _check_loaded_asset(f"figure {self.element_id}", "_loader result", self._loader())
+        if self.image_path is None:
+            raise DatagruntPDFError(f"figure {self.element_id} has no image bytes: no image_path and no loader")
+        return _read_asset_file(self.image_path)
+
+    def read_raw_bytes(self) -> bytes:
+        """Return the raw embedded stream after verifying it against ``sha256``.
+
+        Raises:
+            DatagruntPDFError: If there is no raw loader, its bytes exceed the
+                asset limit, or their SHA-256 does not match ``sha256``.
+            TypeError: If the raw loader returns something other than ``bytes``.
+        """
+        owner = f"figure {self.element_id}"
+        if self._raw_loader is None:
+            raise DatagruntPDFError(f"{owner} has no raw image bytes: no raw loader")
+        data = _check_loaded_asset(owner, "_raw_loader result", self._raw_loader())
         actual = hashlib.sha256(data).hexdigest()
         if actual != self.sha256:
-            raise DatagruntPDFError(f"figure {self.element_id}: sha256 mismatch (expected {self.sha256}, got {actual})")
+            raise DatagruntPDFError(f"{owner}: sha256 mismatch (expected {self.sha256}, got {actual})")
         return data
-
-    def _load_bytes(self) -> bytes:
-        if self.image_path is not None:
-            return _read_asset_file(self.image_path)
-        if self._loader is None:
-            raise DatagruntPDFError(f"figure {self.element_id} has no image bytes: no image_path and no loader")
-        return _check_loaded_asset(f"figure {self.element_id}", "_loader result", self._loader())
 
     def _render_markdown(self) -> str:
         """Render an image link when ``image_path`` is set, else a placeholder comment.
@@ -849,10 +1080,13 @@ DocumentElement: TypeAlias = Union[Heading, Paragraph, KeyValue, Table, BulletLi
 class PageImage:
     """A rendered raster of one page, plus optional horizontal bands of it.
 
-    Bytes come from files when set (``image_path``, ``band_paths``), else from
-    the internal lazy loaders (``_loader``, ``_band_loader``, excluded from
-    equality and repr). The full image and the bands are separate sources:
-    neither stands in for the other. Every read is bounded by the asset limit.
+    Bytes come from the internal lazy loaders when set (``_loader``,
+    ``_band_loader``, excluded from equality and repr), else from files
+    (``image_path``, ``band_paths``): a loader can verify, so a bundle's page
+    image keeps its paths for information and reads through loaders that
+    check each file against the manifest. The full image and the bands are
+    separate sources: neither stands in for the other. Every read is bounded
+    by the asset limit.
 
     Attributes:
         page_number: 1-based page this image renders.
@@ -880,7 +1114,7 @@ class PageImage:
 
     def __post_init__(self) -> None:
         int_at_least("page_number", self.page_number, 1)
-        object.__setattr__(self, "dpi", _positive_finite("dpi", self.dpi))
+        object.__setattr__(self, "dpi", positive_float("dpi", self.dpi))
         int_at_least("width_px", self.width_px, 1)
         int_at_least("height_px", self.height_px, 1)
         _check_optional_path("image_path", self.image_path)
@@ -894,28 +1128,34 @@ class PageImage:
         _check_optional_callable("_band_loader", self._band_loader)
 
     def read_bytes(self) -> bytes:
-        """Return the full-page image bytes: ``image_path`` first, then the loader.
+        """Return the full-page image bytes: the loader first, then ``image_path``.
 
         Raises:
+            PDFSourceChangedError: If the image is drawn from its source PDF
+                when read (a document extracted from a path) and the file at
+                that path no longer holds the document's bytes, or changes
+                while it is drawn: no image of other bytes is returned.
             DatagruntPDFError: If there is no byte source, ``image_path`` is not
                 a regular file, or the bytes exceed the asset limit.
             OSError: If ``image_path`` cannot be stat'ed or read (e.g.
                 ``FileNotFoundError``, ``PermissionError``).
             TypeError: If the loader returns something other than ``bytes``.
         """
-        if self.image_path is not None:
-            return _read_asset_file(self.image_path)
-        if self._loader is None:
+        if self._loader is not None:
+            return _check_loaded_asset(f"page image {self.page_number}", "_loader result", self._loader())
+        if self.image_path is None:
             raise DatagruntPDFError(f"page image {self.page_number} has no image bytes: no image_path and no loader")
-        return _check_loaded_asset(f"page image {self.page_number}", "_loader result", self._loader())
+        return _read_asset_file(self.image_path)
 
     def read_bands(self) -> tuple[bytes, ...]:
-        """Return the band bytes top to bottom: ``band_paths`` first, then the band loader.
+        """Return the band bytes top to bottom: the band loader first, then ``band_paths``.
 
         The bands together are one page image, so the asset limit bounds their
         total, not each band.
 
         Raises:
+            PDFSourceChangedError: As :meth:`read_bytes` raises it: the bands
+                are drawn from the source PDF when read, as the image is.
             DatagruntPDFError: If there is no band source (a loader returning no
                 bands counts as none), a band path is not a regular file, or the
                 bands exceed the asset limit in total.
@@ -925,17 +1165,19 @@ class PageImage:
                 of ``bytes``.
         """
         owner = f"page image {self.page_number}"
-        if self.band_paths:
-            return _read_band_files(owner, self.band_paths)
-        if self._band_loader is None:
+        if self._band_loader is not None:
+            return _check_loaded_bands(owner, self._band_loader())
+        if not self.band_paths:
             raise DatagruntPDFError(f"{owner} has no bands: no band_paths and no band loader")
-        return _check_loaded_bands(owner, self._band_loader())
+        return _read_band_files(owner, self.band_paths)
 
 
 _PAGE_STATUSES: tuple[PageStatus, ...] = get_args(PageStatus)
 # Statuses that only a vision-route page can have.
 _VISION_ONLY_STATUSES: tuple[PageStatus, ...] = ("ocr_fallback", "ocr_unavailable")
-_PAGE_ROUTES: tuple[PageRoute, ...] = get_args(PageRoute)
+# Public (exported from datagrunt.pdf), like HIDDEN_REASONS: the routes a page can take, in PageRoute's order;
+# the v5 quality stage (datagrunt.pdf.quality) checks routes with it.
+PAGE_ROUTES: tuple[PageRoute, ...] = get_args(PageRoute)
 _ELEMENT_TYPES: tuple[type, ...] = get_args(DocumentElement)
 
 
@@ -954,15 +1196,24 @@ def _check_document_elements(name: str, value: object) -> None:
     _check_instances(name, value, _ELEMENT_TYPES, f"document element ({names})")
 
 
-def _render_elements(elements: Iterable[DocumentElement]) -> list[str]:
-    """Render each element's Markdown, with ``_LIST_SEPARATOR`` between two consecutive lists.
+def _render_elements(elements: Iterable[DocumentElement], include_hidden: object) -> list[str]:
+    """Render each element's Markdown (a hidden one only with ``include_hidden``), lists kept apart.
 
-    Two lists separated only by a blank line merge into one loose list (an
-    ordered pair is renumbered); an HTML comment line between them ends the first.
+    ``_LIST_SEPARATOR`` goes between two consecutive lists rendered: two
+    lists separated only by a blank line merge into one loose list (an
+    ordered pair is renumbered); an HTML comment line between them ends the
+    first. Lists a hidden element stood between are consecutive once it is
+    omitted, so they get it too.
+
+    Raises:
+        TypeError: If ``include_hidden`` is not a bool.
     """
+    shown = strict_bool("include_hidden", include_hidden)
     parts: list[str] = []
     previous: DocumentElement | None = None
     for element in elements:
+        if element.is_hidden and not shown:
+            continue
         if isinstance(element, BulletList) and isinstance(previous, BulletList):
             parts.append(_LIST_SEPARATOR)
         parts.append(element.to_markdown())
@@ -1002,6 +1253,8 @@ class Page:
             tuple order and ``element_id`` is unique. An element is flagged
             ``"off_page"`` exactly when its bbox lies outside the page.
         page_image: The rendered page, if one was made; same ``page_number``.
+            Extraction gives every page one it can draw: a digital or hybrid
+            page's is drawn when read; a vision page's is its OCR render.
         integrity_verified: True if the elements passed the integrity check.
         error: Why extraction failed; set exactly when ``status == "error"``.
         warnings: Non-fatal problems met while extracting the page.
@@ -1031,10 +1284,10 @@ class Page:
     def _validate_fields(self) -> None:
         """Check each field's own type and range (coercing the dimensions to float)."""
         int_at_least("page_number", self.page_number, 1)
-        object.__setattr__(self, "width_pt", _positive_finite("width_pt", self.width_pt))
-        object.__setattr__(self, "height_pt", _positive_finite("height_pt", self.height_pt))
+        object.__setattr__(self, "width_pt", positive_float("width_pt", self.width_pt))
+        object.__setattr__(self, "height_pt", positive_float("height_pt", self.height_pt))
         _check_choice("status", self.status, _PAGE_STATUSES)
-        _check_choice("route", self.route, _PAGE_ROUTES)
+        _check_choice("route", self.route, PAGE_ROUTES)
         if self.quality is not None and not isinstance(self.quality, PageQuality):
             raise TypeError(f"quality must be a PageQuality or None, got {type(self.quality).__name__}")
         _check_document_elements("elements", self.elements)
@@ -1103,13 +1356,18 @@ class Page:
                 "an element off the page must carry the 'off_page' hidden reason"
             )
 
-    def to_markdown(self) -> str:
+    def to_markdown(self, *, include_hidden: bool = False) -> str:
         """Render a ``<!-- page N route=R status=S -->`` comment, then each element, blank-line separated.
 
-        Consecutive lists get a ``<!-- -->`` line between them so they stay separate lists.
+        A hidden element is omitted, or rendered behind its marker with
+        ``include_hidden=True`` (see the module notes). Consecutive lists get
+        a ``<!-- -->`` line between them so they stay separate lists.
+
+        Raises:
+            TypeError: If ``include_hidden`` is not a bool.
         """
         header = f"<!-- page {self.page_number} route={self.route} status={self.status} -->"
-        return "\n\n".join([header, *_render_elements(self.elements)])
+        return "\n\n".join([header, *_render_elements(self.elements, include_hidden)])
 
 
 def _check_page_span(value: object) -> tuple[int, int]:
@@ -1230,16 +1488,21 @@ class Section:
         """The section's figures, in document order."""
         return tuple(element for element in self.elements if isinstance(element, Figure))
 
-    def to_markdown(self) -> str:
+    def to_markdown(self, *, include_hidden: bool = False) -> str:
         """Render the heading (unless it is already in ``elements``), then each element, blank-line separated.
 
-        Consecutive lists get a ``<!-- -->`` line between them so they stay separate lists.
+        A hidden element is omitted, or rendered behind its marker with
+        ``include_hidden=True`` (see the module notes). Consecutive lists get
+        a ``<!-- -->`` line between them so they stay separate lists.
+
+        Raises:
+            TypeError: If ``include_hidden`` is not a bool.
         """
         elements: tuple[DocumentElement, ...] = self.elements
         heading = self.heading
         if heading is not None and all(element.element_id != heading.element_id for element in elements):
             elements = (heading, *elements)
-        return "\n\n".join(_render_elements(elements))
+        return "\n\n".join(_render_elements(elements, include_hidden))
 
 
 def _index_by_id(elements: tuple[DocumentElement, ...]) -> dict[str, DocumentElement]:
@@ -1394,11 +1657,15 @@ class PDFDocument:
         sections: Flat, heading-scoped runs of the document's own elements, in
             document order, no element in two sections, each ending by the
             last page (nesting is expressed by ``scope_path`` prefixes).
+        header_context: The visible ``KeyValue`` elements that head page 1
+            (an invoice's number and date, say), in reading order; each is
+            the document's own element. The scope pass fills it.
     """
 
     metadata: DocumentMetadata
     pages: tuple[Page, ...]
     sections: tuple[Section, ...] = ()
+    header_context: tuple[KeyValue, ...] = ()
     _index: _DocumentIndex = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -1406,11 +1673,13 @@ class PDFDocument:
             raise TypeError(f"metadata must be a DocumentMetadata, got {type(self.metadata).__name__}")
         _check_instances("pages", self.pages, (Page,), "Page")
         _check_instances("sections", self.sections, (Section,), "Section")
+        _check_instances("header_context", self.header_context, (KeyValue,), "KeyValue")
         self._check_page_numbers()
         elements = tuple(element for page in self.pages for element in page.elements)
         by_id = _index_by_id(elements)
         _check_continuations(elements, by_id)
         self._check_sections(by_id)
+        self._check_header_context(by_id)
         object.__setattr__(self, "_index", _build_index(self.pages, elements))
 
     def _check_page_numbers(self) -> None:
@@ -1436,6 +1705,21 @@ class PDFDocument:
             for element in section.elements:
                 _check_member(f"sections[{index}] element", element, by_id)
         _check_section_layout(self.sections)
+
+    def _check_header_context(self, by_id: dict[str, DocumentElement]) -> None:
+        """Require visible page-1 key-values of the document's own, in strictly increasing reading order."""
+        previous = -1
+        for index, item in enumerate(self.header_context):
+            label = f"header_context[{index}] ({item.element_id})"
+            if item.page_number != 1:
+                raise ValueError(f"{label} is on page {item.page_number}, not page 1")
+            if item.is_hidden:
+                reasons = ", ".join(item.hidden_reasons)
+                raise ValueError(f"{label} is hidden ({reasons}): header context holds visible text only")
+            _check_member(f"header_context[{index}]", item, by_id)
+            if item.reading_order <= previous:
+                raise ValueError(f"{label} is not after header_context[{index - 1}] in reading order")
+            previous = item.reading_order
 
     @property
     def elements(self) -> tuple[DocumentElement, ...]:
@@ -1487,6 +1771,15 @@ class PDFDocument:
         """False if any page is an error page; else True iff >= 1 non-vision page exists and all are verified."""
         return self._index.integrity_verified
 
-    def to_markdown(self) -> str:
-        """Render every page's Markdown, blank-line separated (empty for a zero-page document)."""
-        return "\n\n".join(page.to_markdown() for page in self.pages)
+    def to_markdown(self, *, include_hidden: bool = False) -> str:
+        """Render every page's Markdown, blank-line separated (empty for a zero-page document).
+
+        Hidden elements are omitted, as a reader sees the document; with
+        ``include_hidden=True`` each is rendered behind its
+        ``<!-- hidden: reasons -->`` line (see the module notes).
+
+        Raises:
+            TypeError: If ``include_hidden`` is not a bool.
+        """
+        shown = strict_bool("include_hidden", include_hidden)
+        return "\n\n".join(page.to_markdown(include_hidden=shown) for page in self.pages)

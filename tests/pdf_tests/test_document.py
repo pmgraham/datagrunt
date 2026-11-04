@@ -117,8 +117,8 @@ DERIVED = (
 )
 
 
-def _document(*pages, sections=()):
-    return PDFDocument(metadata=_metadata(len(pages)), pages=pages, sections=sections)
+def _document(*pages, sections=(), header_context=()):
+    return PDFDocument(metadata=_metadata(len(pages)), pages=pages, sections=sections, header_context=header_context)
 
 
 def _two_page_document(**kwargs):
@@ -183,7 +183,8 @@ class TestDocumentFields:
         hidden = [f for f in dataclasses.fields(PDFDocument) if not f.init]
         assert [f.name for f in hidden] == ["_index"]
         assert (hidden[0].repr, hidden[0].compare) == (False, False)
-        assert [f.name for f in dataclasses.fields(PDFDocument) if f.init] == ["metadata", "pages", "sections"]
+        init_fields = [f.name for f in dataclasses.fields(PDFDocument) if f.init]
+        assert init_fields == ["metadata", "pages", "sections", "header_context"]
 
     def test_replace_revalidates(self):
         with pytest.raises(ValueError, match="metadata.page_count is 5"):
@@ -204,7 +205,7 @@ class TestDocumentFields:
         # Page reprs nest their own elements= / integrity_verified=, so check the outer shape.
         text = repr(_two_page_document())
         assert text.startswith("PDFDocument(metadata=DocumentMetadata(")
-        assert text.endswith(", sections=())")
+        assert text.endswith(", sections=(), header_context=())")
         assert "headings=" not in text
         assert "degraded_pages=" not in text
 
@@ -394,6 +395,67 @@ class TestDocumentSections:
         copy = _paragraph(2, 0)  # equal to, but not the same object as, the page's element
         section = Section(heading=None, scope_path=(), page_span=(2, 2), elements=(copy,))
         assert _two_page_document(sections=(section,)).sections[0].elements == (copy,)
+
+
+def _key_value(page, index, key="Invoice", hidden_reasons=()):
+    return KeyValue(**_ids(page, index), key=key, value=f"{page}.{index}", hidden_reasons=hidden_reasons)
+
+
+def _headed(*header_context):
+    """A two-page document whose page 1 holds key-values at 0 and 2 (around a paragraph) and page 2 one at 0."""
+    page_one = (_key_value(1, 0), _paragraph(1, 1), _key_value(1, 2, key="Date"))
+    pages = (_page(1, elements=page_one), _page(2, elements=(_key_value(2, 0),)))
+    return _document(*pages, header_context=header_context)
+
+
+class TestDocumentHeaderContext:
+    """``header_context``: page 1's visible key-values that head the document (the scope pass fills it)."""
+
+    def test_defaults_to_empty(self):
+        assert _two_page_document().header_context == ()
+
+    def test_holds_page_one_key_values_in_reading_order(self):
+        context = (_key_value(1, 0), _key_value(1, 2, key="Date"))
+
+        assert _headed(*context).header_context == context
+
+    def test_part_of_equality(self):
+        assert _headed(_key_value(1, 0)) != _headed()
+
+    @pytest.mark.parametrize(
+        ("bad", "match"),
+        [([], "header_context must be a tuple"), ((_paragraph(1, 1),), r"header_context\[0\] must be a KeyValue")],
+    )
+    def test_must_be_a_tuple_of_key_values(self, bad, match):
+        with pytest.raises(TypeError, match=match):
+            _document(_page(1, elements=(_paragraph(1, 1),)), header_context=bad)
+
+    def test_a_key_value_past_page_one_rejected(self):
+        with pytest.raises(ValueError, match=re.escape("header_context[0] (p0002_e000) is on page 2, not page 1")):
+            _headed(_key_value(2, 0))
+
+    def test_a_hidden_key_value_rejected(self):
+        hidden = _key_value(1, 0, hidden_reasons=("invisible",))
+        message = "header_context[0] (p0001_e000) is hidden (invisible): header context holds visible text only"
+        with pytest.raises(ValueError, match=re.escape(message)):
+            _document(_page(1, elements=(hidden,)), header_context=(hidden,))
+
+    def test_a_key_value_not_in_the_document_rejected(self):
+        with pytest.raises(ValueError, match=re.escape("header_context[0] 'p0001_e005' is not in the document")):
+            _headed(_key_value(1, 5))
+
+    def test_a_key_value_differing_from_the_documents_rejected(self):
+        message = "header_context[0] 'p0001_e000' differs from the document's element with that id"
+        with pytest.raises(ValueError, match=re.escape(message)):
+            _headed(_key_value(1, 0, key="Order"))
+
+    @pytest.mark.parametrize("order", [(2, 0), (0, 0)], ids=["out-of-order", "repeated"])
+    def test_must_strictly_follow_reading_order(self, order):
+        keys = {0: "Invoice", 2: "Date"}
+        context = tuple(_key_value(1, index, key=keys[index]) for index in order)
+        message = f"header_context[1] (p0001_e{order[1]:03d}) is not after header_context[0] in reading order"
+        with pytest.raises(ValueError, match=re.escape(message)):
+            _headed(*context)
 
 
 # Two pages, two flat sections: "Intro" runs from p1 e000 to p2 e000, "Next" from p2 e001.

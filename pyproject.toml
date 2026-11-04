@@ -4,16 +4,15 @@ build-backend = "maturin"
 
 [project]
 name = "datagrunt"
-version = "4.6.4"
+version = "5.0.1"
 description = "Read, process, and convert CSV, Excel, Parquet, and PDF files easily"
 readme = "README.md"
 authors = [{ name = "Martin Graham", email = "datagrunt@datagrunt.io" }]
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.txt"]
 classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -29,15 +28,15 @@ dependencies = [
     "XlsxWriter>=3.2.9",
     "fastexcel>=0.20.2",
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 
 [project.optional-dependencies]
+# The v5 PDF stack: pypdfium2 reads and renders pages, Pillow processes
+# images. OCR runs the system `tesseract` program when it is on PATH; no
+# Python wrapper (#373).
 pdf = [
-    "PyMuPDF>=1.27.2",
-    "pdfplumber>=0.11.9",
-    "pytesseract>=0.3.13",
-    "Pillow>=12.2.0",
     "pypdfium2>=5.9.0",
+    "Pillow>=12.2.0",
 ]
 dev = [
     "pytest>=9.0.3",
@@ -95,7 +94,7 @@ module-name = "datagrunt._native"
 manifest-path = "rust/datagrunt-python/Cargo.toml"
 
 [tool.bumpver]
-current_version = "4.6.4"
+current_version = "5.0.1"
 version_pattern = "MAJOR.MINOR.PATCH"
 commit_message = "build: bump version {old_version} -> {new_version} [skip ci]"
 commit = true
@@ -129,7 +128,7 @@ markers = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = [
@@ -151,7 +150,7 @@ line-ending = "auto"
 exclude = ["*.md"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 mypy_path = "src"
 # Whole-tree, blocking (the ratchet from the original 3-file compute-contract
 # scope is now complete). check_untyped_defs keeps unannotated bodies
@@ -188,15 +187,15 @@ disallow_untyped_defs = true
 # both cases: ignore_missing_imports only silences the "missing stubs"
 # diagnostic, it never substitutes Any for a type mypy can actually resolve.
 [[tool.mypy.overrides]]
-module = ["pytesseract.*", "pypdfium2.*", "xlsxwriter.*", "pyarrow.*"]
+module = ["pypdfium2.*", "xlsxwriter.*", "pyarrow.*"]
 ignore_missing_imports = true
 
 # numpy is never imported by datagrunt; mypy only reaches it because polars
 # (py.typed) references numpy.typing. numpy >= 2.5 stubs use the PEP 695
-# `type` statement, which mypy rejects as a *syntax* error under
-# python_version = "3.10" — a blocking error that stops the whole-tree run
-# before any datagrunt module is checked (#374). Skipping numpy keeps the 3.10
-# target for our own code. follow_imports_for_stubs is required: without it
+# `type` statement (Python 3.12 syntax), which mypy rejects as a *syntax* error
+# under python_version = "3.11" — a blocking error that stops the whole-tree
+# run before any datagrunt module is checked (#374). Skipping numpy keeps the
+# 3.11 target for our own code. follow_imports_for_stubs is required: without it
 # mypy ignores follow_imports = "skip" for .pyi files, and numpy ships .pyi.
 [[tool.mypy.overrides]]
 module = ["numpy", "numpy.*"]

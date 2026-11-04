@@ -3,12 +3,28 @@
 import dataclasses
 import hashlib
 import math
+import re
 import unicodedata
 
 import pytest
 
 from datagrunt.pdf import BBox, DocumentMetadata, PageQuality
-from datagrunt.pdf._validate import finite_float, int_at_least, non_blank_str, optional_str, str_tuple
+from datagrunt.pdf._validate import (
+    choice_str,
+    finite_float,
+    finite_tuple,
+    int_at_least,
+    non_blank_str,
+    optional_str,
+    ordered_box,
+    ordered_interval,
+    positive_float,
+    rgba_tuple,
+    sha256_hex,
+    str_tuple,
+    strict_bool,
+    typed_tuple,
+)
 
 NON_FINITE = [math.nan, math.inf, -math.inf]
 BBOX_FIELDS = ["x0", "y0", "x1", "y1"]
@@ -88,6 +104,175 @@ class TestNonBlankStr:
     def test_rejects_non_str(self, bad):
         with pytest.raises(TypeError, match="text"):
             non_blank_str("text", bad)
+
+
+class TestChoiceStr:
+    @pytest.mark.parametrize("value", ["h", "v"])
+    def test_returns_a_listed_choice(self, value):
+        assert choice_str("orientation", value, ("h", "v")) == value
+
+    def test_rejects_an_unlisted_str_naming_every_choice(self):
+        with pytest.raises(ValueError, match="orientation must be 'h' or 'v', got 'x'"):
+            choice_str("orientation", "x", ("h", "v"))
+
+    @pytest.mark.parametrize("bad", [None, 1, b"h"])
+    def test_rejects_non_str(self, bad):
+        with pytest.raises(TypeError, match="orientation must be a str"):
+            choice_str("orientation", bad, ("h", "v"))
+
+
+class TestFiniteTuple:
+    def test_returns_floats(self):
+        assert finite_tuple("point", (1, 2.5), 2) == (1.0, 2.5)
+
+    def test_rejects_non_tuple(self):
+        with pytest.raises(TypeError, match="point must be a tuple, got list"):
+            finite_tuple("point", [1.0, 2.0], 2)
+
+    def test_rejects_wrong_size(self):
+        with pytest.raises(ValueError, match="point must have 2 values, got 3"):
+            finite_tuple("point", (1.0, 2.0, 3.0), 2)
+
+    @pytest.mark.parametrize("bad", NON_FINITE)
+    def test_rejects_non_finite_entry_naming_index(self, bad):
+        with pytest.raises(ValueError, match=r"point\[1\] must be finite"):
+            finite_tuple("point", (1.0, bad), 2)
+
+
+class TestStrictBool:
+    @pytest.mark.parametrize("value", [True, False])
+    def test_returns_bool(self, value):
+        assert strict_bool("flag", value) is value
+
+    @pytest.mark.parametrize("bad", [0, 1, None, "true"])
+    def test_rejects_non_bool(self, bad):
+        with pytest.raises(TypeError, match="flag must be a bool"):
+            strict_bool("flag", bad)
+
+
+class TestRgbaTuple:
+    @pytest.mark.parametrize("value", [(0, 0, 0, 0), (255, 255, 255, 255), (1, 2, 3, 4)])
+    def test_returns_channels(self, value):
+        assert rgba_tuple("fill", value) == value
+
+    def test_rejects_non_tuple(self):
+        with pytest.raises(TypeError, match="fill must be a tuple, got list"):
+            rgba_tuple("fill", [0, 0, 0, 0])
+
+    def test_rejects_wrong_channel_count(self):
+        with pytest.raises(ValueError, match="fill must have 4 channels, got 3"):
+            rgba_tuple("fill", (0, 0, 0))
+
+    @pytest.mark.parametrize("bad", [True, 1.0, "1"])
+    def test_rejects_non_int_channel_naming_index(self, bad):
+        with pytest.raises(TypeError, match=r"fill\[2\] must be an int"):
+            rgba_tuple("fill", (0, 0, bad, 0))
+
+    @pytest.mark.parametrize("bad", [-1, 256])
+    def test_rejects_channel_out_of_range(self, bad):
+        with pytest.raises(ValueError, match=r"fill\[3\] must be in 0..255"):
+            rgba_tuple("fill", (0, 0, 0, bad))
+
+
+class TestSha256Hex:
+    def test_returns_digest(self):
+        digest = hashlib.sha256(b"x").hexdigest()
+
+        assert sha256_hex("sha256", digest) == digest
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            pytest.param(hashlib.sha256(b"x").hexdigest().upper(), id="uppercase"),
+            pytest.param("a" * 63, id="short"),
+            pytest.param("a" * 65, id="long"),
+            pytest.param("g" * 64, id="not-hex"),
+            pytest.param("a" * 64 + "\n", id="trailing-newline"),
+        ],
+    )
+    def test_rejects_malformed_digest(self, bad):
+        with pytest.raises(ValueError, match="sha256 must be 64 lowercase hex characters"):
+            sha256_hex("sha256", bad)
+
+    @pytest.mark.parametrize("bad", [None, b"a" * 64])
+    def test_rejects_non_str(self, bad):
+        with pytest.raises(TypeError, match="sha256 must be a str"):
+            sha256_hex("sha256", bad)
+
+
+class TestOrderedBox:
+    @pytest.mark.parametrize("value", [(0, 0, 10, 20), (5.0, 5.0, 5.0, 5.0), (-3.0, -2.0, -1.0, 0.0)])
+    def test_returns_floats_edges_in_order(self, value):
+        assert ordered_box("bbox", value) == tuple(float(v) for v in value)
+
+    @pytest.mark.parametrize("bad", [(10.0, 0.0, 0.0, 20.0), (0.0, 20.0, 10.0, 0.0)], ids=["x-reversed", "y-reversed"])
+    def test_rejects_reversed_edges(self, bad):
+        with pytest.raises(ValueError, match="bbox must have x0 <= x1 and y0 <= y1"):
+            ordered_box("bbox", bad)
+
+    def test_rejects_non_finite(self):
+        with pytest.raises(ValueError, match=r"bbox\[0\] must be finite"):
+            ordered_box("bbox", (math.nan, 0.0, 1.0, 1.0))
+
+
+class TestOrderedInterval:
+    @pytest.mark.parametrize("value", [(0, 10), (5.0, 5.0), (-3.0, -1.0)])
+    def test_returns_floats_start_then_end(self, value):
+        assert ordered_interval("span", value) == tuple(float(v) for v in value)
+
+    def test_rejects_a_start_past_its_end(self):
+        with pytest.raises(ValueError, match=re.escape("span must have start <= end, got (10.0, 0.0)")):
+            ordered_interval("span", (10, 0))
+
+    @pytest.mark.parametrize(
+        ("bad", "error", "message"),
+        [
+            ([0.0, 1.0], TypeError, "span must be a tuple, got list"),
+            ((0.0, 1.0, 2.0), ValueError, "span must have 2 values, got 3"),
+            ((0.0, math.inf), ValueError, r"span[1] must be finite"),
+            ((True, 1.0), TypeError, r"span[0] must be an int or float"),
+        ],
+        ids=["list", "three-values", "inf", "bool"],
+    )
+    def test_rejects_what_finite_tuple_rejects(self, bad, error, message):
+        with pytest.raises(error, match=re.escape(message)):
+            ordered_interval("span", bad)
+
+
+class TestPositiveFloat:
+    @pytest.mark.parametrize("value", [1, 0.001, 1e300])
+    def test_returns_a_float_above_zero(self, value):
+        assert positive_float("width_pt", value) == float(value)
+
+    @pytest.mark.parametrize("bad", [0, 0.0, -1.0])
+    def test_rejects_zero_and_negative(self, bad):
+        with pytest.raises(ValueError, match="width_pt must be > 0"):
+            positive_float("width_pt", bad)
+
+    @pytest.mark.parametrize("bad", NON_FINITE)
+    def test_rejects_non_finite(self, bad):
+        with pytest.raises(ValueError, match="width_pt must be finite"):
+            positive_float("width_pt", bad)
+
+    @pytest.mark.parametrize("bad", [True, "1", None])
+    def test_rejects_non_number(self, bad):
+        with pytest.raises(TypeError, match="width_pt"):
+            positive_float("width_pt", bad)
+
+
+class TestTypedTuple:
+    def test_returns_the_tuple(self):
+        value = (1, 2)
+
+        assert typed_tuple("items", value, int) is value
+
+    def test_rejects_non_tuple(self):
+        with pytest.raises(TypeError, match="items must be a tuple, got list"):
+            typed_tuple("items", [1], int)
+
+    def test_rejects_wrong_item_type_naming_index(self):
+        with pytest.raises(TypeError, match=re.escape("items[1] must be a int, got str")):
+            typed_tuple("items", (1, "2"), int)
 
 
 class TestStrTuple:

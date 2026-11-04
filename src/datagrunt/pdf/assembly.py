@@ -1,0 +1,683 @@
+"""Page assembly for the v5 PDF document model (#368, A4b group 3): figures, then the page's elements.
+
+Internal: not exported from ``datagrunt`` or ``datagrunt.pdf``. Pure: it
+reads A2's raw facts (:class:`~datagrunt.pdf.pdfium_engine.RawPage`), A3's
+assessment and A4a's lattice tables, and calls no pdfium function. A
+figure's bytes come from a :class:`~datagrunt.pdf._loaders.FigureRead`,
+and the page image's from a :class:`~datagrunt.pdf._loaders.PageDraw`,
+which assembly binds and never calls: nothing is decoded or drawn until a
+caller reads the figure or the page image, and then in a capped worker.
+
+:func:`assemble_page` makes the A1 :class:`~datagrunt.pdf.elements.Page`
+of a digital or hybrid page (see its notes): its figures
+(:func:`page_figures`), its layout in reading order
+(:func:`~datagrunt.pdf.layout.page_layout`), each item an A1 element with
+its canonical id, Pass C (:func:`pass_c`) and its page image (P2-A).
+
+:func:`page_figures` drafts the page's figures (:class:`FigureDraft`), in
+A2's object-walk order. Each image A2 recorded is, by the first rule it
+meets:
+
+1. Skipped when its pixel size is known and either side is under
+   ``min_image_dimension`` (v4's rule, ported: ``px_w < min or px_h < min``
+   skips; v4's default was 40 too). Its pixel size is the decode size
+   A2 read, the size pdfium decodes it at: a DCT or JPX stream's own
+   header (kept when A2 refuses to decode it), else the declared
+   ``/Width`` and ``/Height``. The declared size never stands in for a
+   size A2 could not read: pdfium does not decode a DCT or JPX image at it.
+2. No figure, and a warning naming it, when its stream was not read (no
+   SHA-256: a stream over the asset limit, or the page's stream budget
+   spent; A2 then reads no size): A1's ``Figure`` is identified by that
+   hash and its loader verifies reads by it.
+3. No figure, and a warning naming it, when its pixel size is unknown (A2
+   read no size with both sides: a DCT or JPX header it could not read, a
+   filter it cannot size, a side outside 1..131071): A1's ``Figure`` needs
+   both sides >= 1.
+4. Else a figure with the facts A2 recorded: an oversized image too, at its
+   header's size (its loader refuses to decode it and says why, so its PNG
+   cannot be read; its raw bytes can).
+
+A figure lies on the page as A1's ``Page`` requires: its box, when within
+the page (A1's :meth:`~datagrunt.pdf.elements.BBox.within`); else the part
+of it on the page, when that has area (an image bleeding past the page
+edge); else its whole box, flagged ``off_page`` (nothing of it shows).
+
+Captions are not read: the corpus (``data/pdfs``) holds no "Figure" or
+"Fig." text, so no rule for them can be checked against it (deferred).
+"""
+
+import os
+from collections import Counter
+from collections.abc import Iterable
+from dataclasses import dataclass
+from typing import TypedDict, get_args
+
+from datagrunt.pdf._loaders import FigureRead, PageDraw
+from datagrunt.pdf._options import _MIN_DPI, _MIN_RENDER_PIXELS, DPI, MAX_RENDER_PIXELS, MIN_IMAGE_DIMENSION
+from datagrunt.pdf._pdfium_common import Box
+from datagrunt.pdf._source import SourceIdentity, check_binding
+from datagrunt.pdf._validate import int_at_least, sha256_hex, str_tuple, typed_tuple
+from datagrunt.pdf.elements import (
+    BBox,
+    BulletList,
+    DocumentElement,
+    ExtractionMethod,
+    Figure,
+    Heading,
+    HiddenReason,
+    KeyValue,
+    Page,
+    PageImage,
+    Paragraph,
+    Table,
+    check_hidden_reasons,
+    make_element_id,
+)
+from datagrunt.pdf.layout import (
+    MAX_CROSSINGS,
+    ApartLine,
+    FigureSlot,
+    LatticeResult,
+    LatticeTable,
+    PageItem,
+    StreamHeading,
+    StreamKeyValue,
+    StreamList,
+    StreamParagraph,
+    StreamTable,
+    page_layout,
+)
+from datagrunt.pdf.pdfium_engine import (
+    ImageStats,
+    PageGeometry,
+    PageImages,
+    RawImage,
+    RawPage,
+    _checked_path,
+)
+from datagrunt.pdf.quality import PageAssessment, SpanPiece
+from datagrunt.pdf.render import RenderRefused, effective_dpi
+
+__all__ = [
+    "MIN_IMAGE_DIMENSION",
+    "FigureDraft",
+    "PageFigures",
+    "assemble_page",
+    "check_assessment",
+    "conservation",
+    "page_elements",
+    "page_figures",
+    "pass_c",
+    "raw_page_warnings",
+]
+
+
+# The only hidden reason a figure can carry: images have no font, paint mode or alpha A3 reads.
+_OFF_PAGE: tuple[HiddenReason, ...] = ("off_page",)
+
+# A warning names at most this many image objects; the rest are counted.
+_NAMED_OBJECTS = 5
+
+# The reading turn of an upright table, whose columns run left to right on the page.
+_UPRIGHT = 0
+
+# What a vision page's warnings say: assemble_page lays out its digital text, and never pretends to OCR it
+# (A5b's vision route adds why OCR did not read it).
+_VISION_NOTE = "route 'vision': the page was not read by OCR; its digital text is kept as its elements"
+
+_ELEMENT_TYPES: tuple[type, ...] = get_args(DocumentElement)
+_PAGE_ITEMS: tuple[type, ...] = get_args(PageItem)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FigureDraft:
+    """A page image as an A1 ``Figure`` before page assembly gives it its id and place in reading order.
+
+    Picklable, so it crosses the process pool.
+
+    Attributes:
+        bbox: Where it lies on the displayed page (see the module notes).
+        hidden_reasons: ``()``, or ``("off_page",)`` when nothing of it is on the page.
+        sha256: Its raw stream's SHA-256: the loader's.
+        width_px: Its width in pixels (>= 1; see the module notes).
+        height_px: Its height in pixels (>= 1).
+        loader: Reads its bytes on demand; never called here.
+    """
+
+    bbox: BBox
+    hidden_reasons: tuple[HiddenReason, ...]
+    sha256: str
+    width_px: int
+    height_px: int
+    loader: FigureRead
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.bbox, BBox):
+            raise TypeError(f"bbox must be a BBox, got {type(self.bbox).__name__}")
+        check_hidden_reasons(self.hidden_reasons)
+        if self.hidden_reasons not in ((), _OFF_PAGE):
+            raise ValueError(f"hidden_reasons of a figure must be () or {_OFF_PAGE}, got {self.hidden_reasons}")
+        sha256_hex("sha256", self.sha256)
+        int_at_least("width_px", self.width_px, 1)
+        int_at_least("height_px", self.height_px, 1)
+        if not isinstance(self.loader, FigureRead):
+            raise TypeError(f"loader must be a FigureRead, got {type(self.loader).__name__}")
+        if self.loader.raw_sha256 != self.sha256:
+            raise ValueError(f"sha256 must be the loader's {self.loader.raw_sha256}, got {self.sha256}")
+
+    def figure(self, *, page_number: int, reading_order: int) -> Figure:
+        """The A1 ``Figure`` at ``reading_order`` on ``page_number``: its loaders bound, neither called."""
+        return Figure(
+            element_id=make_element_id(page_number, reading_order),
+            page_number=page_number,
+            reading_order=reading_order,
+            bbox=self.bbox,
+            hidden_reasons=self.hidden_reasons,
+            sha256=self.sha256,
+            width_px=self.width_px,
+            height_px=self.height_px,
+            _loader=self.loader.png_bytes,
+            _raw_loader=self.loader.raw_bytes,
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PageFigures:
+    """One page's figure drafts, in A2's object-walk order, and the warnings drafting them raised.
+
+    Attributes:
+        drafts: The figures (see the module notes).
+        warnings: A2's image counts as warnings, then the images that are
+            no figure (``Page.warnings``).
+    """
+
+    drafts: tuple[FigureDraft, ...]
+    warnings: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        typed_tuple("drafts", self.drafts, FigureDraft)
+        str_tuple("warnings", self.warnings)
+
+
+def page_figures(
+    images: PageImages,
+    geometry: PageGeometry,
+    *,
+    source: str | os.PathLike[str],
+    password: str | None = None,
+    min_image_dimension: int = MIN_IMAGE_DIMENSION,
+) -> PageFigures:
+    """Draft the page's figures from the images A2 recorded (see the module notes). O(images).
+
+    Args:
+        images: The page's images (``RawPage.images``).
+        geometry: The page's geometry (``RawPage.geometry``): its number and size.
+        source: The PDF the page was read from; each figure's loader reopens it.
+        password: The PDF's password, or None; each loader holds it.
+        min_image_dimension: The least pixel side kept (0 keeps every image of known size).
+
+    Raises:
+        TypeError: If an argument is of the wrong type (``source`` as for
+            :class:`~datagrunt.pdf._loaders.FigureRead`).
+        ValueError: If ``min_image_dimension`` is negative, or ``password`` holds a NUL.
+    """
+    if not isinstance(images, PageImages):
+        raise TypeError(f"images must be a PageImages, got {type(images).__name__}")
+    if not isinstance(geometry, PageGeometry):
+        raise TypeError(f"geometry must be a PageGeometry, got {type(geometry).__name__}")
+    minimum = int_at_least("min_image_dimension", min_image_dimension, 0)
+    path = _checked_path(source, "source")
+    drafts: list[FigureDraft] = []
+    unread: list[int] = []
+    unsized: list[int] = []
+    for item in images.images:
+        size = _pixel_size(item)
+        if size is not None and min(size) < minimum:
+            continue
+        if item.raw_sha256 is None:
+            unread.append(item.object_index)
+        elif size is None:
+            unsized.append(item.object_index)
+        else:
+            loader = FigureRead(source=path, page_index=geometry.page_number - 1, image=item, password=password)
+            drafts.append(_draft(item, size, loader, geometry))
+    warnings = (
+        *_image_count_warnings(images.stats),
+        *_not_figures(unread, "their streams were not read"),
+        *_not_figures(unsized, "their pixel size is unknown"),
+    )
+    return PageFigures(drafts=tuple(drafts), warnings=warnings)
+
+
+def _pixel_size(item: RawImage) -> tuple[int, int] | None:
+    """The image's decode size if A2 read both sides, else None (rule 1: never the declared size)."""
+    if item.px_width and item.px_height:
+        return item.px_width, item.px_height
+    return None
+
+
+def _draft(item: RawImage, size: tuple[int, int], loader: FigureRead, geometry: PageGeometry) -> FigureDraft:
+    """The image's draft, placed on the page (see the module notes)."""
+    bbox, reasons = _placed(item.bbox, geometry.width_pt, geometry.height_pt)
+    return FigureDraft(
+        bbox=bbox, hidden_reasons=reasons, sha256=loader.raw_sha256, width_px=size[0], height_px=size[1], loader=loader
+    )
+
+
+def _placed(box: Box, width: float, height: float) -> tuple[BBox, tuple[HiddenReason, ...]]:
+    """The image box as A1's page rule takes it: within, clipped to the page, or wholly off it (flagged)."""
+    whole = BBox(x0=box[0], y0=box[1], x1=box[2], y1=box[3])
+    if whole.within(width, height):
+        return whole, ()
+    x0, y0, x1, y1 = max(box[0], 0.0), max(box[1], 0.0), min(box[2], width), min(box[3], height)
+    if x0 < x1 and y0 < y1:
+        return BBox(x0=x0, y0=y0, x1=x1, y1=y1), ()
+    return whole, _OFF_PAGE
+
+
+def _image_count_warnings(stats: ImageStats) -> tuple[str, ...]:
+    """A2's image counts that cost the page something, each as a warning."""
+    counted = (
+        (stats.skipped_nonfinite_images, "image object(s) skipped: their placement on the page is not finite"),
+        (stats.skipped_oversized_images, "image(s) too large to decode or read: never decoded"),
+        (stats.skipped_unsized_images, "image(s) whose decode size cannot be known without decoding: never decoded"),
+        (stats.skipped_over_budget_images, "image(s) not read: the page's image stream budget was spent"),
+        (
+            stats.skipped_overlong_images,
+            "image(s) whose stream decodes past their declared size, or cannot be checked: "
+            "decoded only by a page render",
+        ),
+    )
+    return tuple(f"{count} {what}" for count, what in counted if count)
+
+
+def _not_figures(objects: list[int], why: str) -> tuple[str, ...]:
+    """A warning for the image ``objects`` that are no figure, naming at most :data:`_NAMED_OBJECTS` of them."""
+    if not objects:
+        return ()
+    named = ", ".join(str(index) for index in objects[:_NAMED_OBJECTS])
+    more = len(objects) - _NAMED_OBJECTS
+    which = f"objects {named} and {more} more" if more > 0 else f"object{'s' if len(objects) > 1 else ''} {named}"
+    return (f"{len(objects)} image(s) not emitted as figures: {why} ({which})",)
+
+
+def assemble_page(
+    raw_page: RawPage,
+    assessment: PageAssessment,
+    lattice: LatticeResult,
+    *,
+    source: str | os.PathLike[str],
+    password: str | None = None,
+    identity: SourceIdentity | None = None,
+    sha256: str | None = None,
+    min_image_dimension: int = MIN_IMAGE_DIMENSION,
+    dpi: int = DPI,
+    max_render_pixels: int = MAX_RENDER_PIXELS,
+) -> Page:
+    """The A1 page of a digital or hybrid page: its elements in reading order, its facts, Pass C and its image.
+
+    1. Figures: :func:`page_figures` (loaders bound, never called).
+    2. Layout: :func:`~datagrunt.pdf.layout.page_layout` of the page's
+       pieces, recovered pieces, lattice tables and figure boxes.
+    3. Elements, one per item in order, ``reading_order`` its position and
+       ``element_id`` its canonical id; ``scope_path`` is ``()`` (A6 sets
+       it), but a heading's is its own text (A1: a heading opens its
+       scope). Headings, paragraphs, key-values and lists convert their
+       fields (a heading keeps its tier, a list its markers); a hidden or recovered line is a
+       :class:`~datagrunt.pdf.elements.Paragraph` with its reasons (a
+       recovered shadow or outline copy of visible text is ``duplicate``,
+       so it reads once; a recovered line with no reason is visible text:
+       A3's notes); a table
+       is a :class:`~datagrunt.pdf.elements.Table` of its grid, headed by
+       its first row when every cell of it is non-blank (A4a's rule), with
+       ``column_centres`` and ``column_intervals`` when upright (the middle
+       and the span of each of a lattice table's grid columns; each of a
+       stream table's columns' alignment edge, the start, end or middle its
+       cells share, and its cells' extent), else ``()``: a turned table's
+       run along display y, and A6 links only increasing display x. A
+       lattice table's box is clamped to the page (its rules may run past
+       it); its columns are not.
+    4. Pass C (:func:`pass_c`) sets ``integrity_verified``.
+    5. The page image (P2-A, spec §3.2: every page has one): a
+       :class:`~datagrunt.pdf._loaders.PageDraw`, bound and never called
+       here, that draws the page in the render worker, 8-bit grey at the
+       effective DPI of ``dpi`` within ``max_render_pixels``
+       (:func:`~datagrunt.pdf.render.effective_dpi`) when it is read. Its
+       ``dpi`` and size are that render's; it is not contrast-normalized and
+       has no bands. It holds ``identity`` and ``sha256``, the identity and
+       the hash of the file at ``source`` the document was extracted from
+       (the pipeline's): a draw of a file there whose bytes are not the
+       document's is refused (both None check nothing). A page that cannot
+       be drawn within the bound (``effective_dpi`` refuses it) has no
+       image, and a warning says why.
+
+    The page's ``quality`` and ``route`` are A3's. Its warnings are A2's
+    (skipped text, path and image objects), then the figures', A3's,
+    A4a's (grids past its bounds), the layout's, Pass C's and the page
+    image's.
+
+    A vision page is not OCR'd here, and not passed off as OCR'd: its
+    digital text is laid out as on any page, its status is
+    ``"ocr_unavailable"`` (A1: a vision page whose OCR could not run, its
+    digital text kept), it is never ``integrity_verified`` (A1) and a
+    warning says OCR did not read it. A5b's
+    :func:`~datagrunt.pdf.vision.vision_page` OCRs a vision page, and lays
+    it out here when OCR cannot read it, adding why; its page image is then
+    A5b's (its OCR render), never this one.
+
+    Raises:
+        TypeError: If an argument is of the wrong type.
+        ValueError: If ``assessment`` is not of ``raw_page`` (its chars or
+            rotation differ), ``dpi`` is under 36 or ``max_render_pixels``
+            under 262,144 (512 x 512), only one of ``identity`` and
+            ``sha256`` is given (:func:`~datagrunt.pdf._source.check_binding`),
+            or as :func:`page_figures` and ``page_layout``.
+    """
+    _check_inputs(raw_page, assessment, lattice)
+    check_binding(identity, sha256)
+    int_at_least("dpi", dpi, _MIN_DPI)
+    int_at_least("max_render_pixels", max_render_pixels, _MIN_RENDER_PIXELS)
+    geometry = raw_page.geometry
+    figures = page_figures(
+        raw_page.images, geometry, source=source, password=password, min_image_dimension=min_image_dimension
+    )
+    boxes = tuple(draft.bbox for draft in figures.drafts)
+    layout = page_layout(
+        assessment.pieces,
+        assessment.recovered_pieces,
+        lattice,
+        width_pt=geometry.width_pt,
+        height_pt=geometry.height_pt,
+        figures=boxes,
+    )
+    elements = page_elements(layout.items, figures.drafts, geometry)
+    verified, mismatch = pass_c(assessment, elements)
+    vision = assessment.route == "vision"
+    warnings = (*raw_page_warnings(raw_page), *figures.warnings, *assessment.warnings, *_lattice_warnings(lattice))
+    image, undrawn = _page_image(geometry, source, password, (identity, sha256), dpi, max_render_pixels)
+    warnings += (*layout.warnings, *((_VISION_NOTE,) if vision else ()), *mismatch, *undrawn)
+    return Page(
+        page_number=geometry.page_number,
+        width_pt=geometry.width_pt,
+        height_pt=geometry.height_pt,
+        status="ocr_unavailable" if vision else "ok",
+        route=assessment.route,
+        quality=assessment.quality,
+        elements=elements,
+        page_image=image,
+        integrity_verified=verified and not vision,
+        warnings=warnings,
+    )
+
+
+def _page_image(
+    geometry: PageGeometry,
+    source: str | os.PathLike[str],
+    password: str | None,
+    binding: tuple[SourceIdentity | None, str | None],
+    dpi: int,
+    max_render_pixels: int,
+) -> tuple[PageImage | None, tuple[str, ...]]:
+    """The page's image, drawn when read (:func:`assemble_page`, step 5); or None and why it cannot be drawn.
+
+    ``binding`` is the identity and the sha256 of the file its document was extracted from (or two Nones).
+    """
+    try:
+        drawn_at = effective_dpi(dpi, max_render_pixels, geometry.width_pt, geometry.height_pt)
+    except RenderRefused as exc:
+        return None, (f"the page has no page image: {exc}",)
+    draw = PageDraw(
+        source=_checked_path(source, "source"),
+        page_index=geometry.page_number - 1,
+        dpi=drawn_at,
+        width_pt=geometry.width_pt,
+        height_pt=geometry.height_pt,
+        password=password,
+        identity=binding[0],
+        sha256=binding[1],
+    )
+    width, height = draw.size
+    image = PageImage(
+        page_number=geometry.page_number, dpi=float(drawn_at), width_px=width, height_px=height, _loader=draw.png_bytes
+    )
+    return image, ()
+
+
+def _check_inputs(raw_page: object, assessment: object, lattice: object) -> None:
+    """Require a RawPage, a PageAssessment of it (same chars and rotation) and a LatticeResult."""
+    check_assessment(raw_page, assessment)
+    if not isinstance(lattice, LatticeResult):
+        raise TypeError(f"lattice must be a LatticeResult, got {type(lattice).__name__}")
+
+
+def check_assessment(raw_page: object, assessment: object) -> None:
+    """Require a RawPage and a PageAssessment of it: the same chars and rotation (A5b's vision route checks so too).
+
+    Raises:
+        TypeError: If ``raw_page`` is not a RawPage or ``assessment`` not a PageAssessment.
+        ValueError: If ``assessment`` is not of ``raw_page`` (its chars or rotation differ).
+    """
+    if not isinstance(raw_page, RawPage):
+        raise TypeError(f"raw_page must be a RawPage, got {type(raw_page).__name__}")
+    if not isinstance(assessment, PageAssessment):
+        raise TypeError(f"assessment must be a PageAssessment, got {type(assessment).__name__}")
+    chars = sum(len(span.text) for span in raw_page.text.spans)
+    pieces = sum(piece.end - piece.start for piece in assessment.pieces)
+    if assessment.quality.char_count != chars or pieces != chars:
+        found = f"assessment counts {assessment.quality.char_count} chars and its pieces hold {pieces}"
+        raise ValueError(f"{found}, but the page's spans hold {chars}: the assessment is of another page")
+    if assessment.quality.rotation_deg != raw_page.geometry.rotation_deg:
+        turned = f"assessment is of a page turned {assessment.quality.rotation_deg}"
+        raise ValueError(f"{turned}, not {raw_page.geometry.rotation_deg}: the assessment is of another page")
+
+
+def page_elements(
+    items: tuple[PageItem, ...], drafts: tuple[FigureDraft, ...], geometry: PageGeometry
+) -> tuple[DocumentElement, ...]:
+    """The A1 element of each layout item, in order (:func:`assemble_page`, step 3).
+
+    ``reading_order`` is the item's position and ``element_id`` its
+    canonical id on ``geometry``'s page; a figure slot names its draft in
+    ``drafts``. A5b's vision route converts its layout with it too.
+
+    Raises:
+        TypeError: If ``items`` is not a tuple of layout items, ``drafts``
+            not a tuple of FigureDraft, or ``geometry`` not a PageGeometry.
+        ValueError: If a figure slot names no draft.
+    """
+    typed_tuple("items", items, object)
+    typed_tuple("drafts", drafts, FigureDraft)
+    if not isinstance(geometry, PageGeometry):
+        raise TypeError(f"geometry must be a PageGeometry, got {type(geometry).__name__}")
+    for index, item in enumerate(items):
+        if not isinstance(item, _PAGE_ITEMS):
+            raise TypeError(f"items[{index}] must be a layout item, got {type(item).__name__}")
+        if isinstance(item, FigureSlot) and item.index >= len(drafts):
+            raise ValueError(f"items[{index}] is figure {item.index}, but there are {len(drafts)} figure drafts")
+    return tuple(_element(item, order, drafts, geometry) for order, item in enumerate(items))
+
+
+class _Ids(TypedDict):
+    """An element's identity: its canonical id, page and place in reading order."""
+
+    element_id: str
+    page_number: int
+    reading_order: int
+
+
+def _element(item: PageItem, order: int, drafts: tuple[FigureDraft, ...], geometry: PageGeometry) -> DocumentElement:
+    """The A1 element of one layout ``item`` at ``order`` on the page (:func:`assemble_page`, step 3)."""
+    page = geometry.page_number
+    ids = _Ids(element_id=make_element_id(page, order), page_number=page, reading_order=order)
+    if isinstance(item, FigureSlot):
+        return drafts[item.index].figure(page_number=page, reading_order=order)
+    if isinstance(item, StreamHeading):
+        return Heading(
+            **ids,
+            bbox=item.bbox,
+            level=item.level,
+            text=item.text,
+            scope_path=(item.text,),
+            font_size_pt=item.font_size_pt,
+            is_bold=item.is_bold,
+        )
+    if isinstance(item, StreamParagraph):
+        return Paragraph(**ids, bbox=item.bbox, text=item.text)
+    if isinstance(item, ApartLine):
+        return Paragraph(**ids, bbox=item.bbox, text=item.text, hidden_reasons=item.hidden_reasons)
+    if isinstance(item, StreamKeyValue):
+        return KeyValue(**ids, bbox=item.bbox, key=item.key, value=item.value)
+    if isinstance(item, StreamList):
+        items, markers = tuple(entry.text for entry in item.items), tuple(entry.marker for entry in item.items)
+        return BulletList(**ids, bbox=item.bbox, items=items, markers=markers, ordered=item.ordered)
+    if isinstance(item, StreamTable):
+        upright = item.rows[0].turn == _UPRIGHT
+        columns = (item.column_centres, item.column_intervals) if upright else _NO_COLUMNS
+        return _table(ids, item.grid(), item.has_header, "stream", columns, item.bbox)
+    bbox = _clamped(item.bbox, geometry.width_pt, geometry.height_pt)
+    return _table(ids, item.grid(), item.has_header, "lattice", _lattice_columns(item), bbox)
+
+
+# A table's column centres and intervals (A1 sets both or neither).
+_Columns = tuple[tuple[float, ...], tuple[tuple[float, float], ...]]
+_NO_COLUMNS: _Columns = ((), ())
+
+
+def _table(
+    ids: _Ids,
+    grid: tuple[tuple[str, ...], ...],
+    has_header: bool,
+    method: ExtractionMethod,
+    columns: _Columns,
+    bbox: BBox,
+) -> Table:
+    """An A1 table of ``grid``, its first row the headers when ``has_header`` (A4a's rule)."""
+    headers, rows = (grid[0], grid[1:]) if has_header else ((), grid)
+    centres, intervals = columns
+    return Table(
+        **ids,
+        bbox=bbox,
+        headers=headers,
+        rows=rows,
+        extraction_method=method,
+        column_centres=centres,
+        column_intervals=intervals,
+    )
+
+
+def _lattice_columns(table: LatticeTable) -> _Columns:
+    """An upright lattice table's column centres and intervals: each grid column's middle and span; none when turned.
+
+    An upright table's grid columns are its cells' distinct x edges, in
+    order (A4a's ``_grid_positions``), so the centres strictly increase and
+    each lies in its span.
+    """
+    if table.turn != _UPRIGHT:
+        return _NO_COLUMNS
+    edges = sorted({cell.bbox.x0 for cell in table.cells} | {cell.bbox.x1 for cell in table.cells})
+    spans = tuple(zip(edges, edges[1:]))
+    return tuple((left + right) / 2 for left, right in spans), spans
+
+
+def _clamped(bbox: BBox, width: float, height: float) -> BBox:
+    """``bbox`` with each side clamped to the page: within it, as A1's page rule asks of a visible element."""
+
+    def clamp(value: float, limit: float) -> float:
+        return min(max(value, 0.0), limit)
+
+    return BBox(
+        x0=clamp(bbox.x0, width), y0=clamp(bbox.y0, height), x1=clamp(bbox.x1, width), y1=clamp(bbox.y1, height)
+    )
+
+
+def raw_page_warnings(page: RawPage) -> tuple[str, ...]:
+    """A2's text and path counts that cost the page something, as warnings (its image counts: :func:`page_figures`)."""
+    text, paths = page.text.stats.skipped_nonfinite_objects, page.segments.stats.skipped_nonfinite_paths
+    found = []
+    if text:
+        why = "pdfium places them at a non-finite position or size; their text is missing from this page"
+        found.append(f"{text} text object(s) skipped: {why}")
+    if paths:
+        found.append(
+            f"{paths} path object(s) skipped: their geometry is not finite; their rules are missing from this page"
+        )
+    return tuple(found)
+
+
+def _lattice_warnings(lattice: LatticeResult) -> tuple[str, ...]:
+    """A4a's bounds that left rules unread, as warnings."""
+    if lattice.crossing_cap_reached:
+        return (
+            f"the page's rules cross more than {MAX_CROSSINGS} times: no lattice tables were read; "
+            "its text reads as stream text",
+        )
+    if lattice.skipped_grids:
+        grids = f"{lattice.skipped_grids} ruled grid(s) left out of the lattice pass (over its per-page bounds)"
+        return (f"{grids}: their text reads as stream text",)
+    return ()
+
+
+def pass_c(assessment: PageAssessment, elements: tuple[DocumentElement, ...]) -> tuple[bool, tuple[str, ...]]:
+    """Pass C (spec §3.3 step 3): the page's non-whitespace chars, as a multiset, are its elements' exactly.
+
+    The page's chars are every piece's: its visible pieces (the chars its
+    lattice tables used among them), its hidden pieces and its recovered
+    pieces, each char once. An element's chars are a heading's or a
+    paragraph's text; a key-value's key, ``":"`` and value; a list's
+    markers and items; a table's header and body cells; a figure's
+    caption. Whitespace (``str.isspace``) never counts. O(chars).
+
+    Returns:
+        ``(True, ())`` when the multisets are equal; else ``(False,
+        (warning,))``, the warning naming both counts and how many chars
+        are missing and extra. A mismatch never raises.
+
+    Raises:
+        TypeError: If ``assessment`` is not a PageAssessment or ``elements``
+            is not a tuple of A1 elements.
+    """
+    if not isinstance(assessment, PageAssessment):
+        raise TypeError(f"assessment must be a PageAssessment, got {type(assessment).__name__}")
+    return conservation((*assessment.pieces, *assessment.recovered_pieces), elements)
+
+
+def conservation(pieces: tuple[SpanPiece, ...], elements: tuple[DocumentElement, ...]) -> tuple[bool, tuple[str, ...]]:
+    """Pass C's rule over any ``pieces``: their non-whitespace chars, as a multiset, are ``elements``' exactly.
+
+    :func:`pass_c` is this over an assessment's pieces and recovered
+    pieces; A5b's vision route checks its OCR pieces and the digital text
+    it keeps apart with it. Returns as :func:`pass_c`. O(chars).
+
+    Raises:
+        TypeError: If ``pieces`` is not a tuple of SpanPiece or ``elements``
+            is not a tuple of A1 elements.
+    """
+    typed_tuple("pieces", pieces, SpanPiece)
+    for index, element in enumerate(typed_tuple("elements", elements, object)):
+        if not isinstance(element, _ELEMENT_TYPES):
+            raise TypeError(f"elements[{index}] must be an A1 element, got {type(element).__name__}")
+    expected = _solid_chars(piece.text for piece in pieces)
+    found = _solid_chars(text for element in elements for text in _element_texts(element))
+    if expected == found:
+        return True, ()
+    missing, extra = (expected - found).total(), (found - expected).total()
+    counts = f"the page's text holds {expected.total()} non-whitespace chars and its elements {found.total()}"
+    return False, (f"Pass C: {counts}: {missing} missing, {extra} extra",)
+
+
+def _solid_chars(texts: Iterable[str]) -> Counter[str]:
+    """The multiset of the non-whitespace chars of ``texts``."""
+    return Counter(char for text in texts for char in text if not char.isspace())
+
+
+def _element_texts(element: DocumentElement) -> tuple[str, ...]:
+    """The texts that make an element's chars for Pass C (see :func:`pass_c`)."""
+    if isinstance(element, (Heading, Paragraph)):
+        return (element.text,)
+    if isinstance(element, KeyValue):
+        return (element.key, ":", element.value)
+    if isinstance(element, BulletList):
+        return (*element.markers, *element.items)
+    if isinstance(element, Table):
+        return (*element.headers, *(cell for row in element.rows for cell in row))
+    return (element.caption or "",)

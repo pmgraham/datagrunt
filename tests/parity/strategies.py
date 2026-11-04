@@ -25,12 +25,11 @@ EXTENSIONS = [".csv", ".tsv", ".TSV", ".txt"]
 # generated input must reach it.
 C0_WHITESPACE = ["\x1c", "\x1d", "\x1e", "\x1f"]
 
-# A NUL is a version-dependent seam, not just an odd byte: Python < 3.11's csv
-# module raises "line contains NUL" where the Rust csv crate reads it as
-# ordinary field content, which is why _compute_python._nul_safe_lines exists.
-# CI's compat matrix still includes 3.10, so the property layer has to be able
-# to combine a NUL with ragged/BOM/CRLF — corpus.py's static interior_nul.csv
-# covers the plain case only.
+# A NUL is a seam, not just an odd byte: Python's csv module and the Rust csv
+# crate must both read it as ordinary field content (Python < 3.11 raised "line
+# contains NUL"; 5.0 requires 3.11, #373). The property layer combines a NUL
+# with ragged/BOM/CRLF — corpus.py's static interior_nul.csv covers the plain
+# case only.
 NUL = "\x00"
 
 BOM = b"\xef\xbb\xbf"
