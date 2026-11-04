@@ -36,7 +36,7 @@ def test_to_arrow_table(sample_xlsx):
 def test_query_data(sample_xlsx):
     xl = ExcelReader(sample_xlsx)
     rel = xl.query_data(f"SELECT count(*) AS n FROM {xl.db_table}")
-    assert rel.fetchone()[0] == 2
+    assert rel.fetchall()[0][0] == 2
 
 
 def test_read_options_passthrough(sample_xlsx):

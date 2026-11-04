@@ -79,15 +79,15 @@ jobs:
 
   python-compat:
     # The main test job covers 3.12; this proves the rest of the advertised
-    # range (requires-python >= 3.10, classifiers through 3.14). The native
-    # extension is abi3-py310, so this mostly exercises the pure-Python paths
+    # range (requires-python >= 3.11, classifiers through 3.14). The native
+    # extension is abi3-py311, so this mostly exercises the pure-Python paths
     # (the whole PDF subsystem) and the dependency set per version.
     name: python compat
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.13", "3.14"]
+        python-version: ["3.11", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
@@ -123,7 +123,7 @@ jobs:
     name: dependency audit (advisory)
     runs-on: ubuntu-latest
     # Advisory, NOT blocking: a newly published advisory in a transitive
-    # dependency (duckdb, polars, pyarrow, pymupdf, …) must not break CI or the
+    # dependency (duckdb, polars, pyarrow, pypdfium2, …) must not break CI or the
     # release path overnight. Findings surface in the step logs; promote to
     # blocking once a clean baseline + an ignore-list of accepted advisories is
     # curated (RUSTSEC-* / GHSA-* / PYSEC-*).
