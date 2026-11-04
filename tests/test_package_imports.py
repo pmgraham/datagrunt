@@ -23,7 +23,8 @@ API_NAMES = {
 }
 # The subpackages ``import datagrunt`` bound as its attributes before #439, which it still resolves.
 SUBPACKAGES = ("core", "csv_api", "excel_api", "parquet_api")
-# The CSV, Excel and Parquet stacks: each package, and every module inside it.
+# The CSV, Excel and Parquet stacks, and polars and pyarrow (the PDF model imports them where a table becomes a
+# frame): each package, and every module inside it.
 STACKS = (
     "datagrunt.core",
     "datagrunt.csv_api",
@@ -31,6 +32,8 @@ STACKS = (
     "datagrunt.parquet_api",
     "duckdb",
     "fastexcel",
+    "polars",
+    "pyarrow",
     "xlsxwriter",
 )
 TIMEOUT_S = 120

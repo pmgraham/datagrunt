@@ -414,7 +414,8 @@ class TestMessages:
         assert stream.tell() == _process.LENGTH.size  # the message itself was not read
 
 
-# The CSV, Excel and Parquet stacks: no worker's work uses them (#439). Each package, and every module inside it.
+# The CSV, Excel and Parquet stacks, and polars and pyarrow, which only a caller's frames and tables use: no
+# worker's work uses them (#439). Each package, and every module inside it.
 NOT_IN_A_WORKER = (
     "datagrunt.core",
     "datagrunt.csv_api",
@@ -422,6 +423,8 @@ NOT_IN_A_WORKER = (
     "datagrunt.parquet_api",
     "duckdb",
     "fastexcel",
+    "polars",
+    "pyarrow",
     "xlsxwriter",
 )
 # The bootstrap's last line hands the request to the worker. The probe runs there instead: it replies with the

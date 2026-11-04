@@ -308,8 +308,9 @@ class TestTheCallerNeverLoadsPdfium:
         assert result["loaded"] == []
 
 
-# The CSV, Excel and Parquet stacks' packages, which no worker imports (#439).
-NOT_IN_A_WORKER = ("duckdb", "fastexcel", "xlsxwriter")
+# The CSV, Excel and Parquet stacks' packages, which no worker imports (#439): polars and pyarrow are only a
+# caller's, for its frames and tables.
+NOT_IN_A_WORKER = ("duckdb", "fastexcel", "polars", "pyarrow", "xlsxwriter")
 
 # A calling process whose workers cannot import NOT_IN_A_WORKER: it imports its own first, then puts first on
 # sys.path (which each worker installs, and passes on to the render workers it starts) a directory holding a
