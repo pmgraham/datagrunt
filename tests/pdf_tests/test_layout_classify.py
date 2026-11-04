@@ -14,6 +14,7 @@ from collections import Counter
 
 import pytest
 
+from datagrunt.pdf.elements import KeyValue
 from datagrunt.pdf.layout import (
     StreamHeading,
     StreamKeyValue,
@@ -25,7 +26,8 @@ from datagrunt.pdf.layout import (
     find_lattice_tables,
     text_blocks,
 )
-from pdf_tests.builders import TextRun
+from datagrunt.pdf.reader import PDFReader
+from pdf_tests.builders import PageSpec, TextRun, build_pdf
 from pdf_tests.test_layout_lattice import box, chars
 from pdf_tests.test_layout_stream import block, cell, column, line, page_of
 
@@ -400,6 +402,62 @@ class TestKeyValues:
         texts = ("The rules are short and the game", "is simple: each player draws a card.")
 
         assert described(read_items(tmp_path, *lines_of(texts))) == [("paragraph", " ".join(texts))]
+
+
+# A line of body text set apart under the block.
+PAGE_BODY = "Body text of the page that is long enough to read as a digital page here."
+# Prose whose first line is no pair, two of its later lines starting "Schedule N:".
+SCHEDULE_PROSE = (
+    "The Supplier shall provide the services described in the schedules, namely",
+    "Schedule 2: the Services, and the charges for them as set out in",
+    "Schedule 3: the Charges, in each case as amended from time to time.",
+)
+# Prose wrapped over 4 lines, two of them shaped as pairs mid-sentence.
+DEALER_PROSE = (
+    "When the round starts, each player in turn and the",
+    "dealer says: shuffle the deck and deal five cards",
+    "to each player; the next one says: draw one card",
+    "and play then continues clockwise round the table.",
+)
+# A lead-in line over two pairs, set as one block.
+INVOICE_LEAD_IN = ("Invoice Details", "Invoice Date: 2026-01-15", "Payment Terms: Net 30")
+LEAD_IN_CASES = [
+    pytest.param(SCHEDULE_PROSE, id="schedules-after-namely"),
+    pytest.param(DEALER_PROSE, id="dealer-says-mid-sentence"),
+    # The documented rule for 5.0, as in 4.x: a lead-in over pairs is one paragraph with them. Reading it as a
+    # paragraph then pairs is #454; each rule tried for 5.0 (#456) also split prose like the two cases above.
+    pytest.param(INVOICE_LEAD_IN, id="invoice-lead-in"),
+]
+
+
+def stacked(*texts: str) -> TextBlock:
+    """One block of ``texts``, a line each: 6 pt chars from x 10, the lines 14 pt apart."""
+    return block(*(line(cell(text, 10.0, 10.0 + 14.0 * index)) for index, text in enumerate(texts)))
+
+
+def element_fields(element) -> tuple:
+    """An A1 element as a plain tuple: its kind, then its key and value or its text."""
+    if isinstance(element, KeyValue):
+        return ("KeyValue", element.key, element.value)
+    return (type(element).__name__, element.text)
+
+
+class TestABlockWhoseFirstLineIsNoPair:
+    """A block whose first line is no pair is one paragraph: colons on its later lines make no pairs (rule 3)."""
+
+    @pytest.mark.parametrize("texts", LEAD_IN_CASES)
+    def test_is_one_paragraph(self, texts):
+        assert described(classify_blocks((stacked(*texts),))) == [("paragraph", " ".join(texts))]
+
+    @pytest.mark.parametrize("texts", LEAD_IN_CASES)
+    def test_is_one_paragraph_through_the_reader(self, tmp_path, texts):
+        items = (*lines_of(texts), TextRun(PAGE_BODY, 72.0, 300.0, size=10.0))
+        reader = PDFReader(build_pdf(tmp_path / "lead_in.pdf", [PageSpec(items=items)]), ocr="never")
+
+        assert [element_fields(item) for item in reader.pages[0].elements] == [
+            ("Paragraph", " ".join(texts)),
+            ("Paragraph", PAGE_BODY),
+        ]
 
 
 # The 2026-11-02 audit's P2-C case: two lines of prose whose first starts "Operating envelope:", the second wrapped

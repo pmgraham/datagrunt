@@ -23,6 +23,7 @@ from datagrunt.pdf._extra import LAZY_FUNCTIONS as _LAZY_FUNCTIONS
 from datagrunt.pdf._extra import load as _load
 from datagrunt.pdf.elements import (
     HIDDEN_REASONS,
+    PAGE_ROUTES,
     BBox,
     BulletList,
     DocumentElement,
@@ -70,6 +71,7 @@ __all__ = [
     "HIDDEN_REASONS",
     "PageStatus",
     "PageRoute",
+    "PAGE_ROUTES",
     "ExtractionMethod",
     "make_element_id",
     "DatagruntPDFError",

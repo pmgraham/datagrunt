@@ -139,9 +139,10 @@ def small_cap(monkeypatch) -> None:
 
 
 def frame_sha(document) -> str:
-    buffer = io.BytesIO()
-    element_frame(document).write_ipc(buffer)
-    return hashlib.sha256(buffer.getvalue()).hexdigest()
+    """The frame's schema and values, hashed: not its IPC bytes, whose buffer layout can differ for equal frames."""
+    frame = element_frame(document)
+    values = json.dumps(frame.to_dicts(), sort_keys=True, default=str)
+    return hashlib.sha256((str(frame.schema) + values).encode()).hexdigest()
 
 
 def sha(data: bytes) -> str:
@@ -190,9 +191,9 @@ sha = lambda data: hashlib.sha256(data).hexdigest()
 result = {}
 for workers in (1, 2):
     reader = PDFReader(source, workers=workers, min_image_dimension=32)
-    buffer = io.BytesIO()
-    reader.to_dataframe().write_ipc(buffer)
-    result[f"frame_{workers}"] = sha(buffer.getvalue())
+    frame = reader.to_dataframe()  # hashed by schema and values, as frame_sha hashes it, never by IPC bytes
+    values = json.dumps(frame.to_dicts(), sort_keys=True, default=str)
+    result[f"frame_{workers}"] = sha((str(frame.schema) + values).encode())
 figure = reader.figures[0]
 result["figure"] = [figure.sha256, sha(figure.read_bytes()), sha(figure.read_raw_bytes())]
 writer = PDFWriter(source, min_image_dimension=32)

@@ -166,26 +166,36 @@ The hash is bound to the bytes extracted. The source is opened once, and
 through that open file its identity is taken, once
 (:class:`SourceIdentity`: ``st_dev``, ``st_ino``, ``st_size``,
 ``st_mtime_ns`` from ``fstat``), then its first ``st_size`` bytes are
-hashed. pdfium opens the file by path (A2's
+hashed. pdfium opens the file by path in each page worker (A2's
 :func:`~datagrunt.pdf.pdfium_engine.open_document`, which maps pdfium's
-load errors itself), so each opening is checked against the identity:
+load errors itself) and keeps reading the file it opened. The renders a
+page worker starts open the path again, each in its render worker: step
+3's background render and step 4's render for OCR (a vision page's, a
+fallback page's). No render is checked on its own. What is checked against
+the identity:
 
-- in each worker, right after pdfium opens it and again after its last
-  page, ``os.stat`` of the path;
-- after every page, ``fstat`` of the file the hash was read through.
+- in each page worker, ``os.stat`` of the path right after pdfium opens it
+  (an open that fails while the path holds another file raises that it
+  changed, not the open's error), and again after its last page: the
+  end-of-chunk check, which a file replaced at any time during the chunk
+  and still at the path fails;
+- in the caller, once every page is in, ``fstat`` of the file the hash was
+  read through: a write to that file that changes its size or mtime.
 
 Any difference raises :class:`~datagrunt.pdf.exceptions.PDFSourceChangedError`
-naming it (inode, size or mtime), ``strict`` or not: no document whose pages
-and hash could disagree is returned. A file replaced after pdfium opened it
-in a worker needs no check: pdfium keeps reading the file it opened. What
-this cannot see: a write that keeps the size and restores the mtime, or the
-path swapped away and back in the moment between pdfium's open and the
-check that follows it (each is a deliberate race on the caller's own
-directory). A figure's loader reopens the path later and verifies each
-image's own SHA-256 when it reads. A page image's loaders hold the
-identity and the hash (the worker's ``PDFSource`` carries both): each draw
-of a file of another identity hashes it, and draws it only when its bytes
-are the document's (:mod:`datagrunt.pdf._loaders`).
+naming it (inode, size or mtime), ``strict`` or not. What this cannot see:
+a write that keeps the size and restores the mtime, or the path swapped
+away and back between two of these stats: between pdfium's open and the
+check after it, or within a chunk, so that a render reads another file
+(a page's background check or its OCR text is then that file's) and the
+end-of-chunk check finds the hashed file back in place (each is a
+deliberate race on the caller's own directory). A figure's loader reopens
+the path later and verifies each image's own SHA-256 when it reads. A page
+image's loaders hold the identity and the hash (the worker's ``PDFSource``
+carries both, #453): each draw stats the path, draws a file of that
+identity, hashes a file of another identity and draws it only when its
+bytes are the document's, and stats the path again after the render
+(:mod:`datagrunt.pdf._loaders`). They share the swap-away-and-back limit.
 
 An error page (A1: no elements, no quality, never verified) is routed
 ``"vision"``, the spec's route for a page whose extraction fails (render

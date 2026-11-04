@@ -178,9 +178,12 @@ Every other drawn copy stays visible:
   pieces on the page: the visible pieces are indexed by text and no more
   are checked, so it is not checked, and the page warns (fail visible).
 
-A flagged recovered piece (a duplicate too) counts toward
-``hidden_spans_flagged``; recovered text never counts toward routing, the
-char counts or the unmapped regions. Objects recovery could not read back are
+``hidden_spans_flagged`` counts each span with a flagged piece once (#456):
+a page span cut by both side edges is two ``off_page`` pieces and one span.
+A recovered span is a span of its own and always one piece (each of its
+char boxes is its object's box), so a flagged recovered piece (a duplicate
+too) counts once; recovered text never counts toward routing, the char
+counts or the unmapped regions. Objects recovery could not read back are
 a warning, and so are dropped objects when no recovery is passed (the page's
 ``TextStats.dropped_text_objects`` is over 0 and ``recovered`` is None).
 """
@@ -686,7 +689,10 @@ class PageAssessment:
             (see the module notes): never page text. Empty without a
             recovery.
         quality: The page's quality signals; ``deskew_angle_deg`` and
-            ``ocr_mean_confidence`` are None (A5 measures them).
+            ``ocr_mean_confidence`` are None. A5's vision route sets
+            ``ocr_mean_confidence`` on a page OCR reads; nothing measures
+            ``deskew_angle_deg``, which stays None (``PageQuality``: not
+            measured).
         route: ``"digital"``, ``"hybrid"`` or ``"vision"``.
         unmapped_regions: One box per maximal run of invalid chars in a
             visible piece, in piece order: where OCR (A5) reads what the
@@ -1007,7 +1013,11 @@ def _valid_char(char: str) -> bool:
 
 
 def _quality(page: RawPage, pieces: tuple[SpanPiece, ...]) -> PageQuality:
-    """The page's quality signals; every span char, hidden or not, counts toward the ratio."""
+    """The page's quality signals; every span char, hidden or not, counts toward the ratio.
+
+    ``pieces`` are the page's pieces, then the recovered ones: each span with
+    a flagged piece counts once toward ``hidden_spans_flagged``.
+    """
     spans = page.text.spans
     count = sum(len(span.text) for span in spans)
     valid = sum(1 for span in spans for offset in range(len(span.text)) if _valid(span, offset))
@@ -1015,11 +1025,27 @@ def _quality(page: RawPage, pieces: tuple[SpanPiece, ...]) -> PageQuality:
         valid_char_ratio=valid / count if count else None,
         char_count=count,
         vector_line_count=len(page.segments.segments),
-        hidden_spans_flagged=sum(1 for piece in pieces if piece.hidden_reasons),
+        hidden_spans_flagged=_spans_flagged(pieces),
         rotation_deg=page.geometry.rotation_deg,
         deskew_angle_deg=None,
         ocr_mean_confidence=None,
     )
+
+
+def _spans_flagged(pieces: tuple[SpanPiece, ...]) -> int:
+    """How many spans have a flagged piece among ``pieces``, cut as :func:`classify_spans` cuts them (#456).
+
+    A span's pieces are consecutive and its first starts at offset 0, so a
+    span cut into several flagged pieces (off both side edges) counts once,
+    and two spans of equal text count twice, as ``char_count`` counts them.
+    O(pieces).
+    """
+    count, counted = 0, False
+    for piece in pieces:  # bounded: the pieces
+        counted = counted and piece.start > 0  # a piece at offset 0 begins the next span
+        if piece.hidden_reasons and not counted:
+            count, counted = count + 1, True
+    return count
 
 
 class _VisibleText(NamedTuple):

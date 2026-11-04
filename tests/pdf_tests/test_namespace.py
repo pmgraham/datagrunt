@@ -3,6 +3,7 @@
 import ast
 import importlib.util
 from pathlib import Path
+from typing import get_args
 
 import pytest
 
@@ -35,6 +36,7 @@ V5_MODEL_NAMES = [
     "HIDDEN_REASONS",
     "PageStatus",
     "PageRoute",
+    "PAGE_ROUTES",
     "ExtractionMethod",
     "make_element_id",
     "DatagruntPDFError",
@@ -99,6 +101,13 @@ def test_pdf_package_exports_exactly_the_v5_names():
 
 def test_top_level_package_exports_exactly_the_pinned_names():
     assert datagrunt.__all__ == TOP_LEVEL_NAMES
+
+
+def test_page_routes_is_exported_as_the_routes_of_page_route():
+    # #456: public, like HIDDEN_REASONS, so the routes a page can take are importable from datagrunt.pdf.
+    from datagrunt.pdf import PAGE_ROUTES, PageRoute
+
+    assert PAGE_ROUTES == get_args(PageRoute) == ("digital", "hybrid", "vision")
 
 
 @pytest.mark.parametrize("name", PDF_PACKAGE_NAMES)
