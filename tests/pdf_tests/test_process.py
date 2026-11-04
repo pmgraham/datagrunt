@@ -412,3 +412,44 @@ class TestMessages:
             _process.read_message(stream, 6)
 
         assert stream.tell() == _process.LENGTH.size  # the message itself was not read
+
+
+# The CSV, Excel and Parquet stacks, and polars and pyarrow, which only a caller's frames and tables use: no
+# worker's work uses them (#439). Each package, and every module inside it.
+NOT_IN_A_WORKER = (
+    "datagrunt.core",
+    "datagrunt.csv_api",
+    "datagrunt.excel_api",
+    "datagrunt.parquet_api",
+    "duckdb",
+    "fastexcel",
+    "polars",
+    "pyarrow",
+    "xlsxwriter",
+)
+# The bootstrap's last line hands the request to the worker. The probe runs there instead: it replies with the
+# names in sys.modules as the worker finds them when it begins its request, its module imported, its entry found.
+ENTRY = 'entry(message.get("request"), replies)'
+PROBE = "replies.write(json.dumps(sorted(sys.modules)).encode()); replies.flush()"
+
+
+def inside(name: str, packages: tuple[str, ...]) -> bool:
+    """True if the module ``name`` is one of ``packages``, or inside one."""
+    return any(name == package or name.startswith(f"{package}.") for package in packages)
+
+
+class TestWorkerImports:
+    """A worker starts with what its work imports, and nothing of the CSV, Excel or Parquet stacks (#439)."""
+
+    @pytest.mark.parametrize("worker", sorted(ALLOWLIST))
+    def test_a_worker_begins_its_request_without_the_csv_excel_or_parquet_stacks(self, worker):
+        assert _process.BOOTSTRAP.count(ENTRY) == 1
+        command = [sys.executable, "-I", "-c", _process.BOOTSTRAP.replace(ENTRY, PROBE)]
+        payload = _process.request_payload(worker, None, _process.MAX_REQUEST_BYTES)  # the caller's own sys.path
+
+        done = subprocess.run(command, input=payload, capture_output=True, check=False, timeout=60)
+
+        assert done.returncode == 0, done.stderr
+        loaded = json.loads(done.stdout)
+        assert ALLOWLIST[worker][0] in loaded  # the probe ran where the request is handled
+        assert [name for name in loaded if inside(name, NOT_IN_A_WORKER)] == []

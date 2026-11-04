@@ -294,15 +294,17 @@ def test_an_extra_package_gone_after_construction_raises_the_hint_from_the_worke
 
 
 def test_a_worker_failing_on_another_import_is_not_the_hint(tmp_path, figure_pdf):
-    # polars is a core dependency, not the extra: its failure in a worker stays the worker's failure, unmasked.
+    # A module a page worker imports that is not the extra: its failure in a worker stays the worker's failure,
+    # unmasked. statistics, which the page worker's layout and vision import and the caller never does (polars was
+    # the example until no worker imported it, #439).
     setup, call = WORKER_CALLS["pages"]
 
-    raised = _raised_after_shadowing(figure_pdf, tmp_path / "out", shadowing(tmp_path, "polars"), setup, call)
+    raised = _raised_after_shadowing(figure_pdf, tmp_path / "out", shadowing(tmp_path, "statistics"), setup, call)
 
     assert raised is not None
     kind, is_pdf_error, message, _name = raised
     assert is_pdf_error, kind
-    assert "polars" in message and HINT not in message
+    assert "statistics" in message and HINT not in message
 
 
 def test_every_worker_protocol_raises_an_e_reply():

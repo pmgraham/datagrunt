@@ -14,6 +14,10 @@ reader sees. With ``include_hidden=True``, each is rendered after its
 (``to_markdown`` of one element, which the frame's ``markdown`` column holds).
 
 Coordinates are PDF points with a top-left origin.
+
+polars and pyarrow are imported where a :class:`Table` becomes a frame
+(:meth:`Table.to_dataframe`, :meth:`Table.to_arrow_table`), not with this
+module: every PDF worker imports this model and none makes a frame (#439).
 """
 
 import hashlib
@@ -23,10 +27,7 @@ import unicodedata
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, TypeAlias, Union, get_args
-
-import polars as pl
-import pyarrow as pa
+from typing import TYPE_CHECKING, Literal, TypeAlias, Union, get_args
 
 from datagrunt.pdf._markdown_escape import escape_markdown_link_target
 from datagrunt.pdf._validate import (
@@ -41,6 +42,10 @@ from datagrunt.pdf._validate import (
     strict_bool,
 )
 from datagrunt.pdf.exceptions import DatagruntPDFError
+
+if TYPE_CHECKING:
+    import polars as pl
+    import pyarrow as pa
 
 HiddenReason: TypeAlias = Literal[
     "off_page",
@@ -919,20 +924,24 @@ class Table(_Element):
             names.append(name)
         return tuple(names)
 
-    def to_dataframe(self) -> pl.DataFrame:
+    def to_dataframe(self) -> "pl.DataFrame":
         """Return the rows as a DataFrame of ``pl.String`` columns named by :meth:`column_names`."""
+        import polars as pl  # here, not with the module (module notes)
+
         names = self.column_names()
         columns = {name: [row[i] for row in self.rows] for i, name in enumerate(names)}
         # Explicit schema: a zero-row table still yields correctly typed columns.
         return pl.DataFrame(columns, schema={name: pl.String for name in names})
 
-    def to_arrow_table(self) -> pa.Table:
+    def to_arrow_table(self) -> "pa.Table":
         """Return the rows as a ``pyarrow.Table`` of ``pa.large_string()`` columns.
 
         Converted via :meth:`to_dataframe`, then cast to an explicit schema:
         polars' default Arrow string type varies by version (``large_string``,
         ``string_view``), and callers need one stable type.
         """
+        import pyarrow as pa  # here, not with the module (module notes)
+
         frame = self.to_dataframe()
         schema = pa.schema([(name, pa.large_string()) for name in frame.columns])
         return frame.to_arrow().cast(schema)
