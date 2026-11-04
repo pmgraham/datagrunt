@@ -308,6 +308,52 @@ class TestTheCallerNeverLoadsPdfium:
         assert result["loaded"] == []
 
 
+# The CSV, Excel and Parquet stacks' packages, which no worker imports (#439).
+NOT_IN_A_WORKER = ("duckdb", "fastexcel", "xlsxwriter")
+
+# A calling process whose workers cannot import NOT_IN_A_WORKER: it imports its own first, then puts first on
+# sys.path (which each worker installs, and passes on to the render workers it starts) a directory holding a
+# package of each name that refuses to import. It reads the document in two page workers, a figure's bytes in a
+# figure worker and a page's image in a render worker.
+BLOCKED_IN_WORKERS = """
+import importlib, json, sys
+from pathlib import Path
+
+source, blocked, names = Path(sys.argv[1]), Path(sys.argv[2]), json.loads(sys.argv[3])
+for name in names:
+    importlib.import_module(name)  # the caller's own, before the directory hides it
+    (blocked / name).mkdir(parents=True)
+    refusal = f"raise ImportError('a PDF worker imported {name}', name={name!r})\\n"
+    (blocked / name / "__init__.py").write_text(refusal, encoding="utf-8")
+sys.path.insert(0, str(blocked))
+
+from datagrunt.pdf.reader import PDFReader
+
+reader = PDFReader(source, workers=2, min_image_dimension=32)
+result = {"pages": [[page.status, page.error] for page in reader.document.pages]}
+result["figure"] = len(reader.figures[0].read_bytes())
+result["page_image"] = len(reader.pages[0].page_image.read_bytes())
+print(json.dumps(result))
+"""
+
+
+class TestWorkersNeverLoadTheTabularStacks:
+    """Every worker a read starts does its work without the CSV, Excel and Parquet stacks (#439)."""
+
+    def test_a_read_whose_workers_cannot_import_them_reads_every_page_figure_and_image(self, tmp_path):
+        source = build_pdf(tmp_path / "doc.pdf", [mixed_page(), mixed_page()])
+        command = [sys.executable, "-I", "-c", BLOCKED_IN_WORKERS, str(source), str(tmp_path / "blocked")]
+
+        done = subprocess.run(
+            [*command, json.dumps(NOT_IN_A_WORKER)], capture_output=True, text=True, timeout=300, check=False
+        )
+
+        assert done.returncode == 0, done.stderr
+        result = json.loads(done.stdout)
+        assert result["pages"] == [["ok", None], ["ok", None]]
+        assert result["figure"] > 0 and result["page_image"] > 0
+
+
 class TestNoWorkerCanStart:
     """Where no worker can start, reading a PDF fails closed, saying why: nothing is read in the caller."""
 

@@ -6,6 +6,12 @@ module provides inferred CSV delimiters and helper methods for reading and
 writing CSV files. PDF support (``PDFReader``, ``PDFWriter``) needs the [pdf]
 extra: ``uv pip install "datagrunt[pdf]"``.
 
+Each API is imported at the first access of one of its names (PEP 562): the
+CSV, Excel and Parquet readers and writers, and ``PDFReader`` and
+``PDFWriter``. ``import datagrunt``, which every PDF worker process does as it
+starts, loads none of them (#439); ``from datagrunt import CSVReader`` imports
+the CSV API and binds its ``CSVReader``, the same object as before.
+
 Example:
     A simple example of how to use the main functionality of your package:
 
@@ -31,11 +37,10 @@ __license__ = "MIT"
 # Import key classes, functions, or submodules that should be available at
 # the package level
 import logging
+from importlib import import_module as _import_module
+from types import MappingProxyType as _MappingProxyType
 from typing import TYPE_CHECKING
 
-from datagrunt.csv_api import CSVReader, CSVWriter
-from datagrunt.excel_api import ExcelReader, ExcelWriter
-from datagrunt.parquet_api import ParquetReader, ParquetWriter
 from datagrunt.pdf import (
     BBox,
     BulletList,
@@ -86,23 +91,50 @@ __all__ = [
     "PDFCorruptError",
 ]
 
+# Each CSV, Excel and Parquet name, and the module that defines it: imported at its first access (#439).
+_API_NAMES = _MappingProxyType(
+    {
+        "CSVReader": "datagrunt.csv_api",
+        "CSVWriter": "datagrunt.csv_api",
+        "ExcelReader": "datagrunt.excel_api",
+        "ExcelWriter": "datagrunt.excel_api",
+        "ParquetReader": "datagrunt.parquet_api",
+        "ParquetWriter": "datagrunt.parquet_api",
+    }
+)
+# The subpackages that ``import datagrunt`` bound as its attributes when it imported these APIs eagerly: each is
+# still an attribute, imported at its first access.
+_SUBPACKAGES = frozenset({"core", "csv_api", "excel_api", "parquet_api"})
+
 if TYPE_CHECKING:
+    from datagrunt.csv_api import CSVReader, CSVWriter
+    from datagrunt.excel_api import ExcelReader, ExcelWriter
+    from datagrunt.parquet_api import ParquetReader, ParquetWriter
     from datagrunt.pdf import PDFReader, PDFWriter
 
 
 def __getattr__(name: str) -> object:
-    """``PDFReader`` and ``PDFWriter`` load on first access: ``import datagrunt`` never needs the [pdf] extra.
+    """Each API's name, imported at its first access (module notes).
 
-    Without the extra, constructing either raises ``ImportError`` with the install hint
-    (see :mod:`datagrunt.pdf`).
+    ``PDFReader`` and ``PDFWriter`` never need the [pdf] extra to be named:
+    without it, constructing either raises ``ImportError`` with the install
+    hint (see :mod:`datagrunt.pdf`).
+
+    Raises:
+        AttributeError: If ``name`` is none of this package's names.
+        ImportError: As importing the API that defines ``name`` raises it.
     """
-    if name not in _LAZY_CLASSES:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    return _load(name)
+    if name in _LAZY_CLASSES:
+        return _load(name)
+    if name in _API_NAMES:
+        return getattr(_import_module(_API_NAMES[name]), name)
+    if name in _SUBPACKAGES:
+        return _import_module(f"{__name__}.{name}")
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def __dir__() -> list[str]:
-    return sorted({*globals(), *_LAZY_CLASSES})
+    return sorted({*globals(), *_LAZY_CLASSES, *_API_NAMES, *_SUBPACKAGES})
 
 
 # Optionally, you can include a logger for your package
