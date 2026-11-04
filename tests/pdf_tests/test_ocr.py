@@ -27,13 +27,10 @@ from datagrunt.pdf.ocr import (
     OCRResult,
     OCRWord,
     Orientation,
-    SampleReading,
     bands,
-    inked_bands,
     normalized,
     ocr_words,
     orientation,
-    read_sample,
     rotated,
     tesseract_available,
 )
@@ -261,61 +258,6 @@ class TestRotated:
             rotated(None, 90)
 
 
-def inked_rows(width: int, height: int, inked: dict[int, int]) -> RenderedPage:
-    """A white ``width`` x ``height`` page; row ``r`` of ``inked`` has its first ``inked[r]`` pixels black."""
-    return RenderedPage(
-        pixels=b"".join(bytes(inked.get(at, 0)) + b"\xff" * (width - inked.get(at, 0)) for at in range(height)),
-        px_width=width,
-        px_height=height,
-    )
-
-
-def as_image(band: Band) -> RenderedPage:
-    return RenderedPage(pixels=band.pixels, px_width=band.px_width, px_height=band.px_height)
-
-
-class TestInkedBands:
-    """inked_bands() is the page's bands (bands()), the most ink (pixels darker than mid-grey) first (#456)."""
-
-    def test_a_page_of_one_band_is_all_of_it(self):
-        page = inked_rows(4, 900, {5: 2})
-
-        assert inked_bands(page) == (page,)
-
-    @pytest.mark.parametrize(
-        ("inked", "order"),
-        [
-            pytest.param({100: 10, 1000: 9, 1900: 8}, (0, 1, 2), id="in-page-order"),
-            pytest.param({100: 8, 1000: 10, 1900: 9}, (1, 2, 0), id="most-first"),
-            pytest.param({860: 10, 1000: 1, 1900: 10}, (1, 0, 2), id="a-shared-row-counts-in-both"),
-            pytest.param({100: 5, 1000: 9, 1900: 5}, (1, 0, 2), id="equals-upper-first"),
-            pytest.param({}, (0, 1, 2), id="a-blank-page-in-page-order"),
-        ],
-    )
-    def test_the_bands_by_ink_most_first(self, inked, order):
-        # Bands: rows 0..899, 840..1739 and 1680..1999 (row 1000 is only in the second, 1900 only in the third).
-        page = inked_rows(10, 2000, inked)
-
-        found = inked_bands(page)
-
-        cut = bands(page)
-        assert found == tuple(as_image(cut[at]) for at in order)
-
-    def test_ink_is_darker_than_mid_grey(self):
-        # Band 1 (rows 0..899) holds 3 pixels of grey 127 (ink); band 2 (rows 840..999) holds 4 of grey 128 (not).
-        rows = [[127] * 3 + [255] if at == 100 else [128] * 4 if at == 950 else [255] * 4 for at in range(1000)]
-
-        assert [band.px_height for band in inked_bands(page_of(rows))] == [900, 160]
-
-    def test_a_non_page_is_refused(self):
-        with pytest.raises(TypeError, match=re.escape("page must be a RenderedPage, got NoneType")):
-            inked_bands(None)
-
-    def test_a_bgr_page_is_refused(self):
-        with pytest.raises(ValueError, match="8-bit gray"):
-            inked_bands(RenderedPage(pixels=bytes(9), px_width=1, px_height=3, channels=3))
-
-
 class TestRecords:
     """Orientation, OCRWord and OCRResult are validated, frozen records."""
 
@@ -395,54 +337,6 @@ class TestRecords:
     def test_invalid_results_raise(self, fields, error, message):
         with pytest.raises(error, match=re.escape(message)):
             OCRResult(**{"words": (), "status": "ok", "reason": "", **fields})
-
-    def test_valid_sample_readings(self):
-        reading = SampleReading(words=(("fox", 90.0), ("ran", 80)), status="ok", reason="")
-
-        assert reading.words == (("fox", 90.0), ("ran", 80.0))
-        assert SampleReading(words=(), status="spent", reason="the deadline passed").status == "spent"
-
-    @pytest.mark.parametrize(
-        ("words", "confidence"),
-        [
-            pytest.param((("ab", 90.0), ("c", 60.0)), 80.0, id="weighted-by-chars"),
-            pytest.param((("fox", 0.0),), 0.0, id="no-confidence"),
-            pytest.param((), None, id="no-words"),
-        ],
-    )
-    def test_a_sample_readings_confidence_is_its_words_mean_weighted_by_their_chars(self, words, confidence):
-        assert SampleReading(words=words, status="ok", reason="").confidence == confidence
-
-    @pytest.mark.parametrize(
-        ("words", "chars"),
-        [
-            pytest.param((("Page", 90.0), ("3,", 80.0)), 5, id="letters-and-digits"),
-            pytest.param((("~|", 30.0), ("—", 10.0), ("[@],", 0.0)), 0, id="art-read-as-marks"),
-            pytest.param((("ça", 90.0), ("Ωmega", 90.0)), 7, id="any-script"),
-            pytest.param((), 0, id="no-words"),
-        ],
-    )
-    def test_a_sample_readings_text_chars_are_its_words_letters_and_digits(self, words, chars):
-        # What of a reading is text (#456): art read as marks counts for nothing, a letter of any script for one.
-        assert SampleReading(words=words, status="ok", reason="").text_chars == chars
-
-    @pytest.mark.parametrize(
-        "fields,error,message",
-        [
-            pytest.param({"words": [("fox", 9.0)]}, TypeError, "words must be a tuple, got list", id="list"),
-            pytest.param({"words": ("fox",)}, TypeError, "words[0] must be a (text, confidence) pair", id="word"),
-            pytest.param({"words": (("fox",),)}, TypeError, "words[0] must be a (text, confidence) pair", id="one"),
-            pytest.param({"words": ((" ", 9.0),)}, ValueError, "words[0] text must be a non-blank str", id="blank"),
-            pytest.param({"words": (("fox", 101.0),)}, ValueError, "words[0] confidence must be <= 100.0", id="high"),
-            pytest.param({"words": (("fox", "9"),)}, TypeError, "words[0] confidence must be an int or float", id="s"),
-            pytest.param({"status": "undetermined"}, ValueError, "status must be 'ok' or 'unavailable'", id="status"),
-            pytest.param({"reason": "why"}, ValueError, "an ok reading has no reason, got 'why'", id="ok-reason"),
-            pytest.param({"status": "failed"}, ValueError, "reason must be a non-blank str", id="failed-reason"),
-        ],
-    )
-    def test_invalid_sample_readings_raise(self, fields, error, message):
-        with pytest.raises(error, match=re.escape(message)):
-            SampleReading(**{"words": (), "status": "ok", "reason": "", **fields})
 
 
 def osd(rotate: str, confidence: str = "9.12", degrees: str = "270") -> bytes:
@@ -1427,98 +1321,8 @@ class TestDeadline:
             OCRResult(words=(), status="spent", reason="")
 
 
-def sample_of(page: RenderedPage, **options) -> SampleReading:
-    """read_sample of ``page`` with a 30 s timeout."""
-    return read_sample(page, **{"timeout_s": 30.0, **options})
-
-
-@posix_only
-class TestReadSample:
-    """read_sample() reads one image (a sample of a page, #456) in one call: its words' text and confidence."""
-
-    def test_it_runs_psm_11_tsv_in_the_language_on_the_image_as_pgm(self, tmp_path, monkeypatch):
-        # psm 11 (sparse text), not the page's psm 3: psm 3 rights a sideways sample itself (vision's notes).
-        fake = fake_tesseract(tmp_path, monkeypatch, RECORDS, stdout=tsv())
-        monkeypatch.setenv("OMP_THREAD_LIMIT", "8")
-
-        result = sample_of(PAGE_3_BY_2, language="deu+eng")
-
-        assert result == SampleReading(words=(), status="ok", reason="")
-        argv = (fake / "argv").read_text().split("\n")[:-1]
-        assert argv == ["stdin", "stdout", "--psm", "11", "-l", "deu+eng", "tsv"]
-        assert (fake / "omp").read_text() == "1"
-        assert (fake / "stdin").read_bytes() == b"P5\n3 2\n255\n" + PAGE_3_BY_2.pixels
-
-    def test_its_words_are_read_in_order_with_their_confidence(self, tmp_path, monkeypatch):
-        report = tsv(
-            row(4, (10, 20, 70, 15), "-1", ""),
-            row(5, (10, 20, 30, 15), "96.050018", "Hello"),
-            row(5, (45, 20, 30, 15), "-1", " "),
-            row(5, (80, 21, 35, 14), "91", "world,"),
-        )
-        fake_tesseract(tmp_path, monkeypatch, READS_STDIN, stdout=report)
-
-        result = sample_of(PAGE_50_BY_1000)
-
-        assert result == SampleReading(words=(("Hello", 96.050018), ("world,", 91.0)), status="ok", reason="")
-
-    def test_a_tall_image_is_one_call(self, tmp_path, monkeypatch):
-        # A sample is never cut into bands: a 1000-row image is one call (a page's would be two).
-        fake = fake_tesseract(tmp_path, monkeypatch, 'echo x >> "{d}/calls"\n' + READS_STDIN, stdout=tsv())
-
-        sample_of(PAGE_50_BY_1000)
-
-        assert (fake / "calls").read_text() == "x\n"
-
-    @pytest.mark.parametrize(
-        ("body", "timeout_s", "status", "reason"),
-        [
-            pytest.param(
-                'cat > /dev/null\necho "Error: no eng" >&2\nexit 1',
-                30.0,
-                "failed",
-                "tesseract exited with code 1; its stderr ends: Error: no eng",
-                id="failed",
-            ),
-            pytest.param(
-                READS_STDIN, 30.0, "failed", "tesseract's TSV has an unexpected header: 'not a tsv'", id="tsv"
-            ),
-            pytest.param(
-                "exec sleep 60", 0.3, "timeout", "tesseract did not finish within 0.3 s and was killed", id="slow"
-            ),
-        ],
-    )
-    def test_a_failure_is_a_status_with_its_reason(self, tmp_path, monkeypatch, body, timeout_s, status, reason):
-        fake_tesseract(tmp_path, monkeypatch, body, stdout=b"not a tsv\n")
-
-        result = sample_of(PAGE_3_BY_2, timeout_s=timeout_s)
-
-        assert result == SampleReading(words=(), status=status, reason=reason)
-
-    def test_no_tesseract_is_unavailable(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("PATH", str(tmp_path))
-
-        assert sample_of(PAGE_3_BY_2) == SampleReading(words=(), status="unavailable", reason=NO_TESSERACT)
-
-    def test_past_the_deadline_it_is_not_started(self, tmp_path, monkeypatch):
-        fake = fake_tesseract(tmp_path, monkeypatch, ': > "{d}/called"\n' + READS_STDIN, stdout=tsv())
-
-        result = sample_of(PAGE_3_BY_2, deadline=time.monotonic() - 1.0)
-
-        assert result == SampleReading(words=(), status="spent", reason="the deadline passed before the call")
-        assert not (fake / "called").exists()
-
-    def test_a_call_cut_at_the_deadline_is_spent(self, tmp_path, monkeypatch):
-        fake_tesseract(tmp_path, monkeypatch, "exec sleep 60")
-
-        result = sample_of(PAGE_3_BY_2, deadline=time.monotonic() + 1.0)
-
-        assert result.status == "spent"
-        assert result.reason.startswith("tesseract did not finish within 0.")  # its 30 s cut to the ~1 s left
-
-
 class TestArguments:
-    """orientation(), ocr_words() and read_sample() validate their arguments before anything runs."""
+    """orientation() and ocr_words() validate their arguments before anything runs."""
 
     @pytest.mark.parametrize(
         "change,error,message",
@@ -1566,28 +1370,6 @@ class TestArguments:
 
         with pytest.raises(error, match=re.escape(message)):
             orientation(page, timeout_s=timeout_s)
-
-    @pytest.mark.parametrize(
-        "change,error,message",
-        [
-            pytest.param({"image": b""}, TypeError, "page must be a RenderedPage, got bytes", id="image"),
-            pytest.param(
-                {"image": RenderedPage(pixels=bytes(18), px_width=3, px_height=2, channels=3)},
-                ValueError,
-                "page must be 8-bit gray (1 channel), got 3 channels",
-                id="bgr",
-            ),
-            pytest.param({"timeout_s": 0.0}, ValueError, "timeout_s must be > 0", id="timeout"),
-            pytest.param({"language": "eng --psm"}, ValueError, "language must be tesseract language names", id="lang"),
-            pytest.param({"deadline": float("nan")}, ValueError, "deadline must be finite", id="deadline"),
-        ],
-    )
-    def test_invalid_read_sample_arguments_raise(self, change, error, message, monkeypatch):
-        monkeypatch.setattr(ocr, "trusted_executable", lambda name: pytest.fail("tesseract must not be looked up"))
-        arguments = {"image": PAGE_3_BY_2, "timeout_s": 10.0, **change}
-
-        with pytest.raises(error, match=re.escape(message)):
-            read_sample(arguments.pop("image"), **arguments)
 
 
 SENTENCES = (

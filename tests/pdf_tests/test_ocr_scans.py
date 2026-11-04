@@ -11,14 +11,12 @@ never from one platform's font metrics.
 """
 
 import io
-import time
 from pathlib import Path
 
 import pypdfium2 as pdfium
 import pytest
 from PIL import Image
 
-from datagrunt.pdf import vision
 from datagrunt.pdf.ocr import bands, normalized, ocr_words, orientation, rotated
 from datagrunt.pdf.render import RenderedPage, effective_dpi, render_page, render_size
 from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf
@@ -174,19 +172,6 @@ class TestScans:
         found, _words = read(f"scan-{rotate}")
 
         assert (found.status, found.degrees) == ("ok", (360 - rotate) % 360)
-
-    @pytest.mark.parametrize("rotate", [90, 180, 270])
-    def test_the_turn_osd_finds_is_made_as_it_gives_it(self, built, read, rotate):
-        # #456: OSD finds each scan's turn at TRUSTED_ROTATION_CONFIDENCE or more: made as it gives it, no sample read.
-        found, _words = read(f"scan-{rotate}")
-        page = normalized(rendered(built[f"scan-{rotate}"]))
-
-        turn = vision._turn(page, found, vision.VisionOptions(), time.monotonic() + 600.0)
-
-        assert found.confidence is not None and found.confidence >= vision.TRUSTED_ROTATION_CONFIDENCE
-        assert (turn.degrees, turn.failure) == ((360 - rotate) % 360, "")
-        righted = f"OCR righted it by {turn.degrees} degrees clockwise (orientation confidence {found.confidence:g})"
-        assert turn.notes == (f"the page reads turned: {righted}",)
 
     @pytest.mark.parametrize("rotate", [0, 90, 180, 270])
     def test_ocr_reads_the_sentences_where_they_were_drawn(self, built, read, rotate):
