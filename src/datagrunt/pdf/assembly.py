@@ -20,9 +20,7 @@ meets:
 
 1. Skipped when its pixel size is known and either side is under
    ``min_image_dimension`` (v4's rule, ported: ``px_w < min or px_h < min``
-   skips, in ``core.pdf_io.extraction.pdfium_document.image_items``; v4's
-   default, 40, is ``_DEFAULT_MIN_IMAGE_DIMENSION`` in
-   ``core.pdf_io.extraction.config``). Its pixel size is the decode size
+   skips; v4's default was 40 too). Its pixel size is the decode size
    A2 read, the size pdfium decodes it at: a DCT or JPX stream's own
    header (kept when A2 refuses to decode it), else the declared
    ``/Width`` and ``/Height``. The declared size never stands in for a

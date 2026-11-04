@@ -65,10 +65,12 @@ from collections.abc import Callable
 from types import MappingProxyType
 from typing import IO
 
+from datagrunt.pdf._extra import EXTRA_IMPORTS, missing_in_worker
 from datagrunt.pdf.exceptions import DatagruntPDFError
 
 __all__ = [
     "BOOTSTRAP",
+    "ERROR",
     "LENGTH",
     "MAX_REQUEST_BYTES",
     "REAP_TIMEOUT_S",
@@ -81,6 +83,7 @@ __all__ = [
     "drained",
     "error_reply",
     "kill_group",
+    "missing_extra_reply",
     "next_reply",
     "read_error",
     "read_message",
@@ -106,11 +109,19 @@ WORKERS = MappingProxyType(
 )
 MAX_REQUEST_BYTES = 1 << 20  # the JSON request on a worker's stdin
 LENGTH = struct.Struct("<Q")  # each reply's length, before it
+# Every worker's reply kind for an exception its caller raises (error_reply's pickle after it). A worker that cannot
+# import the [pdf] extra sends one as its first reply, whichever worker it is (see BOOTSTRAP).
+ERROR = b"E"
 
 # The worker's program: ``python -I -c BOOTSTRAP``. It keeps the real stdout
 # for replies and points file descriptor 1 at stderr, reads one bounded JSON
 # message from stdin, refuses a worker key outside the allowlist written here,
 # installs the caller's sys.path, and hands the request to the named worker.
+# A worker module that cannot be imported because the [pdf] extra is missing
+# where the worker runs (pypdfium2 or PIL, by the ImportError's name, written
+# here) is reported rather than ending the worker: its first reply is the install hint as an
+# ERROR (missing_extra_reply), which every worker's caller raises. Any other
+# import failure ends the worker as before, its traceback on stderr.
 # Fixed text: nothing from the caller or the PDF is in it.
 BOOTSTRAP = f"""
 import importlib, json, os, sys
@@ -129,7 +140,15 @@ if not isinstance(name, str) or name not in workers:
     raise SystemExit("the worker request names no worker of {tuple(WORKERS)!r}")
 sys.path[:] = path
 module, function = workers[name]
-getattr(importlib.import_module(module), function)(message.get("request"), replies)
+try:
+    entry = getattr(importlib.import_module(module), function)
+except ImportError as exc:
+    if (exc.name or "").partition(".")[0] not in {EXTRA_IMPORTS!r}:
+        raise
+    process = importlib.import_module("datagrunt.pdf._process")
+    process.send_message(replies, process.missing_extra_reply(exc))
+    raise SystemExit(0)
+entry(message.get("request"), replies)
 """
 
 
@@ -323,6 +342,18 @@ def error_reply(exc: Exception) -> bytes:
         except Exception:  # an argument that cannot be pickled: sent in words below, never dropped
             pass
     return pickle.dumps(DatagruntPDFError(f"{type(exc).__name__}: {exc}"))
+
+
+def missing_extra_reply(exc: ImportError) -> bytes:
+    """The ERROR reply of a worker that cannot import the [pdf] extra (``exc``): the install hint, for its caller.
+
+    Raises:
+        ValueError: If ``exc`` is not a failure to import the extra (the bootstrap checks first).
+    """
+    error = missing_in_worker(exc)
+    if error is None:
+        raise ValueError(f"not a missing [pdf] extra: {exc!r}")
+    return ERROR + error_reply(error)
 
 
 def read_error(body: bytes, who: str) -> Exception:

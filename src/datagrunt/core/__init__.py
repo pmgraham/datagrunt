@@ -33,21 +33,6 @@ from datagrunt.core.parquet_io import (
     ParquetReaderEngine,
     ParquetWriterEngine,
 )
-from datagrunt.core.pdf_io import (
-    DocumentAssembler,
-    ExtractionBackend,
-    ParsedDocument,
-    PDFComponents,
-    PDFEngineFactory,
-    PDFEngineProperties,
-    PdfiumBackend,
-    PdfiumNativeReader,
-    PdfPlumberTableExtractor,
-    PDFReaderPyMuPDFEngine,
-    PDFWriterPyMuPDFEngine,
-    PyMuPDFBackend,
-    set_export_filename,
-)
 
 __all__ = [
     # CSV IO
@@ -83,18 +68,4 @@ __all__ = [
     "ParquetEngineProperties",
     "ParquetReaderEngine",
     "ParquetWriterEngine",
-    # PDF IO
-    "PDFComponents",
-    "DocumentAssembler",
-    "ParsedDocument",
-    "PDFEngineFactory",
-    "PDFEngineProperties",
-    "PDFReaderPyMuPDFEngine",
-    "PDFWriterPyMuPDFEngine",
-    "set_export_filename",
-    "ExtractionBackend",
-    "PdfiumBackend",
-    "PdfiumNativeReader",
-    "PdfPlumberTableExtractor",
-    "PyMuPDFBackend",
 ]

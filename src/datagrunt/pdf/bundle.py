@@ -1,7 +1,10 @@
 """The v5 artifact bundle (#371, A7a): an atomic write and a verified load.
 
-Internal: not exported from ``datagrunt`` or ``datagrunt.pdf``. A7b's
-``PDFWriter.write_bundle`` and A8b's ``PDFReader`` stand on it.
+:func:`load_bundle` and :func:`write_bundle` are public since 5.0 (#373):
+``datagrunt.pdf.load_bundle`` and ``datagrunt.pdf.write_bundle``, imported
+on first access (:mod:`datagrunt.pdf._extra`); the rest of the module is
+internal. A7b's ``PDFWriter.write_bundle`` and A8b's ``PDFReader`` stand on
+it.
 
 Layout (paths relative to the bundle, joined with ``/``):
 

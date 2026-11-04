@@ -34,8 +34,8 @@ position, so it never changes their order.
 Known limitations (each a fact this pure pass cannot see):
 
 - Clip paths are not applied to segments (A2): a rule clipped away rules.
-- Every segment rules, whatever its colour, alpha or dash (v4's
-  pdfplumber and the A0 prototype read every edge): a white, transparent
+- Every segment rules, whatever its colour, alpha or dash (v4, through
+  pdfplumber, and the A0 prototype read every edge): a white, transparent
   or dotted rule rules a table as a black one does.
 - A table drawn upside down reads in display order: pdfium's boxes cannot
   tell upside-down text from right-to-left text.
@@ -453,11 +453,11 @@ def _snapped_lines(segments: Iterable[RawSegment]) -> tuple[list[_Line], list[_L
     """The horizontal and vertical rules of ``segments``, snapped and merged.
 
     Per orientation, positions chain into clusters (sorted, each within
-    :data:`SNAP_PT` of the one before, as pdfplumber snaps) and each
+    :data:`SNAP_PT` of the one before, as v4's pdfplumber snapped) and each
     cluster's segments move to its mean; then the segments at each
     position merge where they overlap, touch or leave a gap of at most
     :data:`SNAP_PT`. Every segment rules, whatever its kind, dash or
-    colour (v4's pdfplumber reads every edge). Lines come sorted by
+    colour (v4's pdfplumber read every edge). Lines come sorted by
     position, then start. O(n log n) for n segments.
     """
     horizontal = [item for item in segments if item.orientation == "h"]

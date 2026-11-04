@@ -250,7 +250,7 @@ class TestStrokedLines:
         assert rows(got) == [("h", 290.0, 10.0, 100.0, 1.0, "stroke", 0), ("h", 270.0, 10.0, 100.0, 1.0, "stroke", 0)]
 
     def test_a_dashed_line_is_one_segment(self, tmp_path):
-        # As v4's pdfplumber reads it: a dashed rule still rules a table.
+        # As v4's pdfplumber read it: a dashed rule still rules a table.
         got = segments_of(content_page(tmp_path, b"[3 2] 0 d 10 10 m 100 10 l S"))
 
         assert rows(got) == [("h", 290.0, 10.0, 100.0, 1.0, "stroke", 0)]
@@ -332,7 +332,7 @@ class TestFillEdges:
     """Each side (>= 12 pt) of a filled rectangle thicker than 3 pt is a zero-width fill_edge."""
 
     def test_a_table_of_shaded_cells_gives_every_cell_edge(self, tmp_path):
-        # A 3 x 3 table drawn only as shaded cells, 1 pt apart (as v4's pdfplumber still finds).
+        # A 3 x 3 table drawn only as shaded cells, 1 pt apart (as v4's pdfplumber found).
         lefts, bottoms = (50, 150, 250), (100, 120, 140)
         cells = b" ".join(b"%d %d 99 19 re f" % (x, y) for y in bottoms for x in lefts)
 

@@ -24,7 +24,7 @@ a page without enough valid text, or whose text is mostly invalid, stays
 digital (with a warning) instead of going to vision, and one that would be
 hybrid stays digital."""
 
-# v4's default minimum image side in pixels (core.pdf_io.extraction.config._DEFAULT_MIN_IMAGE_DIMENSION).
+# The default minimum image side in pixels: v4's, kept.
 MIN_IMAGE_DIMENSION = 40
 
 # The spec's construction checks (PDFReader / PDFWriter) and defaults: dpi >= 36, 200; vision_dpi >= 36, 300;

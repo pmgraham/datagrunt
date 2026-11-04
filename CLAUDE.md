@@ -2,7 +2,7 @@
 
 Project-specific guidance for Claude Code (in addition to the global `~/.claude/CLAUDE.md` clean-code standards). This file is the source of truth for **how we work on datagrunt**. When asked to do something "the usual way" / "per the usual" / via `/ship`, follow this.
 
-datagrunt is a CSV/PDF data utility. CSV delimiter/dialect/row inference runs in a **required Rust extension** (`datagrunt._native`, PyO3/maturin) with a pure-Python mirror (`_compute_python.py`) as the parity oracle. PDF parsing is **pure Python** (pymupdf + pdfium + pdfplumber + tesseract OCR).
+datagrunt is a CSV/PDF data utility. CSV delimiter/dialect/row inference runs in a **required Rust extension** (`datagrunt._native`, PyO3/maturin) with a pure-Python mirror (`_compute_python.py`) as the parity oracle. PDF parsing (5.0+) is **pure Python** on pypdfium2 (PDFium) and Pillow, with the system `tesseract` program for OCR.
 
 ---
 
@@ -13,7 +13,7 @@ datagrunt is a CSV/PDF data utility. CSV delimiter/dialect/row inference runs in
 - **Automatic resource lifecycle — never require the user to call `.close()`.** Reuse by default (cache the engine per public object); cleanup is automatic via reference-counted release on scope exit. `close()` / `with` are optional power-user tools for *early* release only; the default path must be correct and fast without them.
 - **DRY + single-responsibility, within each domain — never across.** Deduplicate inside the CSV domain and inside the PDF domain; do **not** create a shared CSV/PDF base (they are separate subsystems). Don't over-abstract.
 - **Preserve, not transform.** datagrunt never silently sanitizes/mutates data for hypothetical risks. SQL via `query_data` and CSV/Excel formula-injection (values starting with `=,+,-,@`) are **documented app-layer concerns** — document and defer; do not "fix" by mutating data.
-- **PDF extraction must be 100% complete.** Never propose selective or stage-skipping extraction; preserve per-page error isolation (a bad page is recorded and skipped, never drops a batch).
+- **PDF extraction must be 100% complete.** Never propose selective or stage-skipping extraction; preserve per-page error isolation (a bad page becomes `status="error"` with its reason and never drops the document; `strict=True` raises instead). Text a reader can't see is flagged in `hidden_reasons`, never dropped.
 
 ---
 
@@ -50,7 +50,12 @@ For any substantive change, follow this end-to-end. (Trivial 1–2 line fixes ma
 
 - **CSV compute:** `core/csv_io/_compute.py` dispatches `backend()` → `_native` (Rust) or `_compute_python` (oracle/toggle). Both expose the same function set (`infer_delimiter`, `sniff_dialect`, `probe_csv_header`, `leading_rows`, `first_row`, `count_leading_comments`, `row_count_with_header`, `check_ragged`, `normalize_columns`, …).
 - **CSV API:** `CSVReader`/`CSVWriter` share `csv_api/_engine_backed.py::_CSVEngineBacked` (cached `_engine` + optional `close()`/context-manager). Engines (`core/csv_io/engines.py`) share `_DuckDBBackedEngine`; DuckDB access via `core/databases/databases.py::DuckDBQueries`.
-- **PDF (pure Python):** `PDFReader`/`PDFWriter` share `pdf_api/_engine_backed.py::_PDFEngineBacked` (cached `_engine`). `core/pdf_io/pdfcomponents.py::DocumentAssembler.parse_page` does single-pass per-page extraction; backends under `core/pdf_io/extraction/` (pymupdf, pdfium, OCR, tables, layout) expose `extract_page`, which `parse_page` calls. PDFium parallelism uses a process pool (per-page batching was investigated and declined — see issue #216).
+- **PDF (pure Python, `src/datagrunt/pdf/`):**
+  - **Public surface:** `reader.py` (`PDFReader`: a PDF, a bundle or a document dict; zero filesystem writes; DuckDB via `_database.py`, released by `weakref.finalize`), `writer.py` (`PDFWriter`: atomic writes), `elements.py` (the typed `PDFDocument` model) and `exceptions.py`. `datagrunt` and `datagrunt.pdf` load the reader, the writer, `load_bundle` and `write_bundle` lazily through `_extra.py`; without the `[pdf]` extra, constructing either raises `ImportError` with the install hint.
+  - **Per page** (`pipeline.py::extract_document`): the pdfium engine (`pdfium_engine.py` with `_pdfium_text`, `_pdfium_images`, `_pdfium_recover`, `_path_segments`, `_image_headers`) → `quality.py` and `_hidden_rules.py` (hidden-text flags, routing `digital` / `hybrid` / `vision`, the background check) → `layout.py` + `assembly.py`, or `vision.py` for a vision page → `scope.py` (document-wide heading levels, sections, split tables) → `PDFDocument`.
+  - **Isolation:** every pdfium call (document open, page extraction, figure reads, renders) runs in memory-capped worker processes (`_page_worker.py`, `_figure_worker.py`, `_render_worker.py`; the cap is `_memory_cap.py`: a peak-RSS watchdog on every platform plus a Linux/Windows backstop). The caller never imports pypdfium2; never call pdfium outside a worker. `ocr.py` runs the `tesseract` CLI over stdin/stdout, found by `_executables.trusted_executable` (absolute `PATH` directories only).
+  - **Workers:** `_process.py` starts plain `python -I` subprocesses (a fixed allowlist, JSON over stdin; no `__main__` guard needed), with a bounded deadline per page reply and a 4 KiB stderr ring. Page workers run for every `workers` value (one at `workers=1`); a worker that ends early turns only its current page into an error page and a new worker reads the rest. A frozen app fails closed (#440).
+  - **Outputs:** `frame.py` (the element frame), `codec.py` (lossless JSON), `bundle.py` (atomic, checksummed bundles with verified load), `_source.py` (the source-file check), `_validate.py`.
 
 ---
 

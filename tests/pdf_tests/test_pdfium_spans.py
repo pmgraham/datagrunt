@@ -825,7 +825,7 @@ class TestBoldItalic:
         (text_object,) = pdfium.PdfDocument(path)[0].get_objects()
         v4_font = text_object.get_font()
 
-        # v4 (core/pdf_io/extraction/pdfium_document.py) read the family name
+        # v4 read the family name
         # (Arial, Times New Roman) and weight (0 -> 400): never bold here.
         assert "bold" not in v4_font.get_family_name().lower()
         assert (v4_font.get_weight() or 400) < 600

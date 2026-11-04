@@ -13,7 +13,7 @@ uv venv
 uv pip install -e ".[dev,pdf]"   # builds the Rust extension via maturin
 ```
 
-Requirements: Python >= 3.10, a Rust toolchain (stable), and — for the PDF OCR tests — [Tesseract](https://github.com/tesseract-ocr/tesseract) (`brew install tesseract` / `apt-get install tesseract-ocr`).
+Requirements: Python >= 3.11, a Rust toolchain (stable), and — for the PDF OCR tests — [Tesseract](https://github.com/tesseract-ocr/tesseract) (`brew install tesseract` / `apt-get install tesseract-ocr`).
 
 After changing Rust code, rebuild the extension so tests see it:
 
@@ -23,7 +23,7 @@ uv pip install -e ".[dev,pdf]"
 
 ## Architecture in one paragraph
 
-CSV delimiter/dialect/row inference runs in a required Rust extension (`datagrunt._native`, PyO3/maturin) with a pure-Python mirror (`src/datagrunt/core/csv_io/_compute_python.py`) serving as the differential-parity oracle. **Python leads, Rust follows**: change compute logic in the Python mirror first, validate it, then port to Rust and prove agreement via the parity suite. The pure-Python path is a diagnostics toggle (`DATAGRUNT_DISABLE_RUST=1`), not an automatic fallback. PDF parsing is pure Python (PDFium by default, PyMuPDF as an alternative, pdfplumber tables, Tesseract OCR).
+CSV delimiter/dialect/row inference runs in a required Rust extension (`datagrunt._native`, PyO3/maturin) with a pure-Python mirror (`src/datagrunt/core/csv_io/_compute_python.py`) serving as the differential-parity oracle. **Python leads, Rust follows**: change compute logic in the Python mirror first, validate it, then port to Rust and prove agreement via the parity suite. The pure-Python path is a diagnostics toggle (`DATAGRUNT_DISABLE_RUST=1`), not an automatic fallback. PDF parsing (`datagrunt.pdf`) is pure Python on PDFium (pypdfium2), with the system `tesseract` program for OCR.
 
 ## Test gates — all must pass before merge
 
