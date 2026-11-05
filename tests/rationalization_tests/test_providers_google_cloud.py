@@ -31,6 +31,8 @@ from datagrunt.rationalization.providers.base import (
     MODEL_NAME_MAX_CHARS,
     UNKNOWN_FAMILY,
     PermanentProviderError,
+    ProviderError,
+    TransientProviderError,
     _Secret,
     family_problem,
 )
@@ -640,7 +642,16 @@ class TestTokenAuth:
         assert GoogleCloudAuth(token=lambda: value).headers()["authorization"].reveal() == f"Bearer {value}"
 
     @pytest.mark.parametrize(
-        "error", [RuntimeError(f"refresh failed for {TOKEN}"), ValueError(TOKEN), OSError(), LookupError("hunter2")]
+        "error",
+        [
+            RuntimeError(f"refresh failed for {TOKEN}"),
+            ValueError(TOKEN),
+            OSError(),
+            LookupError("hunter2"),
+            PermanentProviderError(401, f"bad refresh token {TOKEN}"),
+            ProviderError(503, f"refresh failed for {TOKEN}"),
+            TimeoutError(TOKEN),
+        ],
     )
     def test_a_raising_token_provider_is_permanent_without_its_message(self, error):
         def token():
@@ -692,6 +703,50 @@ class TestTokenAuth:
     def test_the_longest_token_is_bounded(self):
         assert TOKEN_MAX_CHARS == 16_384
         assert "more than" in token_failure("x" * (TOKEN_MAX_CHARS + 1)).detail
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            TransientProviderError(503, 2.5, f"refresh failed for {TOKEN}"),
+            TransientProviderError(None, None, "hunter2"),
+            type("RefreshRetry", (TransientProviderError,), {})(429, 1.0, f"token {TOKEN}"),
+        ],
+    )
+    def test_a_transient_token_provider_failure_is_transient_without_its_detail(self, error):
+        def token():
+            raise error
+
+        with pytest.raises(TransientProviderError) as raised:
+            GoogleCloudAuth(token=token).headers()
+
+        assert type(raised.value) is TransientProviderError
+        assert raised.value is not error
+        assert not isinstance(raised.value, PermanentProviderError)
+        assert raised.value.status_code is None
+        assert raised.value.retry_after_s is None
+        assert raised.value.detail == "the Google Cloud token provider failed transiently"
+        assert_secret_free(raised.value)
+
+    def test_a_transient_failure_lets_the_next_call_succeed(self):
+        calls = []
+
+        def token():
+            calls.append(1)
+            if len(calls) == 1:
+                raise TransientProviderError(None, None, f"refresh failed for {TOKEN}")
+            return TOKEN
+
+        auth = GoogleCloudAuth(token=token)
+        with pytest.raises(TransientProviderError):
+            auth.headers()
+        assert auth.headers()["authorization"].reveal() == f"Bearer {TOKEN}"
+        assert len(calls) == 2
+
+    def test_the_module_notes_say_how_to_signal_a_transient_failure_and_to_return_promptly(self):
+        notes = " ".join(google_cloud_module.__doc__.split())
+        assert "TransientProviderError" in notes
+        assert "return promptly" in notes
+        assert "deadline" in notes
 
     def test_a_keyboard_interrupt_in_the_token_provider_propagates(self):
         def token():

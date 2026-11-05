@@ -18,10 +18,16 @@ imports no HTTP stack and holds no state but a credential. The rules:
    :class:`~datagrunt.rationalization.providers.base._Secret`, sent as the ``x-goog-api-key`` header, never in a
    URL) or a token source (a zero-argument callable, called once per :meth:`GoogleCloudAuth.headers` call and never
    at construction, sent as ``Authorization: Bearer``). A token must be an exact ``str`` of 1 to
-   :data:`TOKEN_MAX_CHARS` printable ASCII characters without whitespace and without its own ``Bearer`` scheme; a
-   token source that raises or returns anything else fails the request with a
-   :class:`~datagrunt.rationalization.providers.base.PermanentProviderError` naming the exception's class or the
-   value's type, never a message or a value, raised outside the ``except`` so nothing chains. The auth object never
+   :data:`TOKEN_MAX_CHARS` printable ASCII characters without whitespace and without its own ``Bearer`` scheme. A
+   token source signals a failure worth a retry (a credential refresh that may work next time) by raising
+   :class:`~datagrunt.rationalization.providers.base.TransientProviderError`: the request then fails with a fresh
+   ``TransientProviderError(None, None, "the Google Cloud token provider failed transiently")``, which the runner
+   retries. A token source that raises anything else (``Exception``; anything else propagates), or returns anything
+   but a token, fails the request with a :class:`~datagrunt.rationalization.providers.base.PermanentProviderError`
+   naming the exception's class or the value's type. Neither carries the source's message, detail or value, and both
+   are raised outside the ``except`` so nothing chains. A token source must return promptly (a cached token, refreshed
+   ahead of time): it runs on a worker thread before the request is sent, and the request's deadline bounds the HTTP
+   exchange, not a Python call, so a hung source holds its worker until it returns. The auth object never
    pickles or copies, its ``repr`` shows only its kind, and no frame of this module that raises holds a key or a
    token (a log with ``capture_locals`` prints them). :func:`check_access` refuses, before any request, the pairs
    Google does not document: an API key anywhere but ``generateContent`` / ``streamGenerateContent``, and express
@@ -150,6 +156,7 @@ from datagrunt.rationalization.providers.base import (
     MODEL_NAME_MAX_CHARS,
     UNKNOWN_FAMILY,
     PermanentProviderError,
+    TransientProviderError,
     _Secret,
     api_key_from_env,
     check_gcp_label,
@@ -248,6 +255,7 @@ _DOT_SEGMENTS = frozenset({".", ".."})
 _BEARER = "bearer "
 _TOKEN_TEXT = re.compile(r"[\x21-\x7e]+")
 _TOKEN_FAILED = "the Google Cloud token provider failed"
+_TOKEN_TRANSIENT = "the Google Cloud token provider failed transiently"
 _KEY_RULE = "the Google Cloud API key must be non-blank printable ASCII without leading or trailing whitespace"
 
 
@@ -488,22 +496,35 @@ def _token_problem(value: object) -> str:
     return ""
 
 
-def _token_secret(source: TokenSource) -> _Secret | str:
+@dataclass(frozen=True, slots=True)
+class _TokenFailure:
+    """Why no token was fetched: worth a retry (the source raised ``TransientProviderError``) or not."""
+
+    transient: bool
+    detail: str
+
+
+def _token_secret(source: TokenSource) -> _Secret | _TokenFailure:
     """The token ``source()`` returns as a ``_Secret``, or the failure; it never raises for the source's sake."""
     value: object = None
     failure = ""
+    transient = False
     try:
         value = source()
-    except Exception as error:  # the caller's code: whatever it raises fails the request, named by class only
+    except TransientProviderError:  # the source's own signal of a failure worth a retry; its detail is never kept
+        transient = True
+    except Exception as error:  # the caller's code: whatever else it raises fails the request, named by class only
         failure = type(error).__name__
+    if transient:
+        return _TokenFailure(True, _TOKEN_TRANSIENT)
     if not failure:
         failure = _token_problem(value)
     if failure:
-        return f"{_TOKEN_FAILED} ({failure})"
+        return _TokenFailure(False, f"{_TOKEN_FAILED} ({failure})")
     try:
         return _Secret(str(value))
     except ValueError:  # unreachable: _token_problem's rule is stricter than _Secret's
-        return f"{_TOKEN_FAILED} (it returned no valid token)"
+        return _TokenFailure(False, f"{_TOKEN_FAILED} (it returned no valid token)")
 
 
 class GoogleCloudAuth:
@@ -513,7 +534,9 @@ class GoogleCloudAuth:
         api_key: The API key (a standard key, a key bound to a service account, or an express-mode key), or a
             ``_Secret`` holding one. Sent as the ``x-goog-api-key`` header.
         token: Called with no arguments once per :meth:`headers` call, on a worker thread: returns the current OAuth
-            access token (``credentials.token`` after a refresh). It must be thread-safe and return promptly.
+            access token (``credentials.token`` after a refresh). It must be thread-safe and return promptly (no
+            deadline can cut a hung Python call); it raises ``TransientProviderError`` for a failure worth a
+            retry (module notes, 2).
 
     Raises:
         RationalizationError: If neither or both are given, the key is not non-blank printable ASCII without
@@ -555,15 +578,19 @@ class GoogleCloudAuth:
         """A new mapping: ``{"x-goog-api-key": key}``, or ``{"authorization": "Bearer <token>"}`` fetched now.
 
         Raises:
-            PermanentProviderError: If the token source raises (``Exception``; anything else propagates) or returns
-                no valid token; the detail names the exception's class or the value's type, never a message or a
-                value, and nothing chains.
+            TransientProviderError: If the token source raises ``TransientProviderError``: a fresh one, without
+                the source's status, wait or detail, and not chained.
+            PermanentProviderError: If the token source raises anything else (``Exception``; anything else
+                propagates) or returns no valid token; the detail names the exception's class or the value's type,
+                never a message or a value, and nothing chains.
         """
         if isinstance(self._credential, _Secret):
             return {API_KEY_HEADER: self._credential}
         secret = _token_secret(self._credential)  # no local here holds the source (its repr) or the raw token
-        if isinstance(secret, str):
-            raise PermanentProviderError(None, secret)
+        if isinstance(secret, _TokenFailure):
+            if secret.transient:
+                raise TransientProviderError(None, None, secret.detail)
+            raise PermanentProviderError(None, secret.detail)
         return {"authorization": secret.prefixed("Bearer ")}
 
     def __setattr__(self, name: str, value: object) -> NoReturn:
