@@ -32,6 +32,8 @@ from pathlib import Path
 import h11
 import httpx
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 import datagrunt
 from datagrunt.rationalization import RationalizationError
@@ -43,6 +45,7 @@ from datagrunt.rationalization.providers.base import (
     ProviderError,
     TransientProviderError,
     _Secret,
+    check_endpoint,
 )
 from datagrunt.rationalization.providers.http import (
     CONNECT_TIMEOUT_S,
@@ -417,6 +420,9 @@ def test_headers_must_be_a_str_mapping(headers):
         "ftp://x",
         "https://999.1.1.1/v1",
         "https://xn--zz/v1",
+        "https://api.example.com@evil.example/v1",
+        "https://api.example.com:443@evil.example/v1",
+        "https://@api.example.com/v1",
     ],
 )
 def test_a_refused_url_is_a_permanent_error_and_nothing_is_sent(url):
@@ -425,6 +431,35 @@ def test_a_refused_url_is_a_permanent_error_and_nothing_is_sent(url):
     with pytest.raises(PermanentProviderError, match="endpoint URL refused"):
         post(make_client(handler), url=url)
     assert handler.seen == []
+
+
+@settings(max_examples=200, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
+@given(path=st.text(alphabet="ab@:./-_~", min_size=0, max_size=24))
+def test_a_path_holding_an_at_sign_is_sent_to_the_checked_host(path):
+    handler = reply_with(200, json_body={})
+    url = f"https://api.example.com/v1/{path}"
+    checked = check_endpoint(url)
+
+    post(make_client(handler), url=url)
+
+    sent = handler.seen[0].url
+    assert (sent.scheme, sent.host, sent.port) == ("https", "api.example.com", None)
+    assert sent.userinfo == b""
+    assert str(sent) == checked
+
+
+def test_a_google_cloud_model_version_reaches_its_path_unchanged():
+    handler = reply_with(200, json_body={})
+    url = (
+        "https://us-east5-aiplatform.googleapis.com/v1/projects/my-project/locations/us-east5/publishers/anthropic/"
+        "models/claude-opus-4-5@20251101:rawPredict"
+    )
+
+    post(make_client(handler), url=url)
+
+    sent = handler.seen[0].url
+    assert sent.host == "us-east5-aiplatform.googleapis.com"
+    assert sent.raw_path.endswith(b"/models/claude-opus-4-5@20251101:rawPredict")
 
 
 def test_insecure_http_is_sent_only_when_allowed():

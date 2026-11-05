@@ -273,6 +273,15 @@ def test_provider_errors_survive_pickling(make, protocol):
             "openai-compatible:org/model:tag@https://gw.example",
             ("openai-compatible", "org/model:tag", "https://gw.example"),
         ),
+        ("openai-compatible:claude@1@https://x.example", ("openai-compatible", "claude@1", "https://x.example")),
+        (
+            "openai-compatible:m@https://gw.example/v1/models/a@b",
+            ("openai-compatible", "m", "https://gw.example/v1/models/a@b"),
+        ),
+        (
+            "openai-compatible:claude@1@https://gw.example/x@2/@y",
+            ("openai-compatible", "claude@1", "https://gw.example/x@2/@y"),
+        ),
     ],
 )
 def test_a_prefixed_model_string_parses(spec, expected):
@@ -365,7 +374,6 @@ def test_a_gemini_model_that_is_one_path_segment_parses(spec):
         "gemini:a?key=x",
         "gemini:a#frag",
         "gemini:a%2F..%2Fb",
-        "gemini:a@b",
         "gemini:a/b",
         "gemini:.",
         "gemini:..",
@@ -393,8 +401,34 @@ def test_a_body_borne_model_name_may_hold_slashes_and_colons(spec):
 
 
 def test_vertex_is_refused_pointing_at_the_provider_object():
-    with pytest.raises(RationalizationError, match=r"GeminiProvider\.vertex"):
+    with pytest.raises(RationalizationError, match=r"GeminiProvider\.google_cloud\(") as caught:
         parse_model_string("vertex:gemini-2.5-pro")
+
+    assert "GeminiProvider.vertex" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("spec", "factory"),
+    [
+        ("anthropic:claude-opus-4-5@20251101", "AnthropicProvider.google_cloud"),
+        ("anthropic:claude@1", "AnthropicProvider.google_cloud"),
+        ("gemini:gemini-1.0-pro@001", "GeminiProvider.google_cloud"),
+        ("gemini:a@b", "GeminiProvider.google_cloud"),
+    ],
+)
+def test_an_at_version_in_an_anthropic_or_gemini_string_points_at_google_cloud(spec, factory):
+    with pytest.raises(RationalizationError, match="Google Cloud") as caught:
+        parse_model_string(spec)
+
+    assert factory in str(caught.value)
+    kind, model = spec.split(":", 1)
+    with pytest.raises(RationalizationError, match="Google Cloud"):
+        endpoint_model_id(kind, model, None)
+
+
+@pytest.mark.parametrize("spec", ["openai:gpt@1", "ollama:llama3@1", "openai-compatible:m@1@https://gw.example"])
+def test_an_at_sign_stays_allowed_in_the_other_kinds_model_names(spec):
+    assert "@" in parse_model_string(spec).model
 
 
 @pytest.mark.parametrize("spec", ["openai:", "anthropic:", "ollama:", "openai-compatible:@https://gw.example/v1"])
@@ -549,20 +583,87 @@ def test_other_schemes_are_refused_even_when_http_is_allowed(url, allow):
         check_endpoint(url, allow_insecure_http=allow)
 
 
+AUTHORITY_AT_URLS = [
+    "https://user:hunter2@gw.example/v1",
+    "https://hunter2@gw.example",
+    "https://@gw.example",
+    "https://hunter2@gw.example:443/v1",
+    "https://gw.example@hunter2.example/v1",
+    "https://gw.example@hunter2.example",
+    "https://gw.example:443@hunter2.example/v1",
+    "https://a@b@hunter2.example/v1",
+    "https://hunter2:@gw.example/v1",
+    "https://user:hunter2@[::1]/v1",
+    "http://hunter2@localhost:8080/v1",
+    "http://hunter2@127.0.0.1/v1",
+    "HTTPS://Hunter2@GW.Example/v1",
+]
+
+
+@pytest.mark.parametrize("url", AUTHORITY_AT_URLS)
+@pytest.mark.parametrize("allow", [False, True])
+def test_a_url_with_an_at_sign_in_its_authority_is_refused_without_echoing_it(url, allow):
+    with pytest.raises(RationalizationError, match="credentials") as caught:
+        check_endpoint(url, allow_insecure_http=allow)
+
+    assert "hunter2" not in str(caught.value).lower()
+    with pytest.raises(RationalizationError, match="credentials"):
+        is_loopback_endpoint(url)
+
+
 @pytest.mark.parametrize(
-    "url",
+    ("url", "host"),
     [
-        "https://user:hunter2@gw.example/v1",
-        "https://hunter2@gw.example",
-        "https://@gw.example",
-        "https://gw.example/a@hunter2",
+        ("https://gw.example/a@b", "gw.example"),
+        ("https://gw.example/@", "gw.example"),
+        ("https://gw.example/a/@hunter2.example", "gw.example"),
+        ("https://gw.example/@hunter2.example:443/x", "gw.example"),
+        ("https://gw.example:8443/v1/@x@y", "gw.example"),
+        ("http://localhost:8080/@x", "localhost"),
+        ("https://[2001:db8::1]/@x", "2001:db8::1"),
+        (
+            "https://aiplatform.googleapis.com/v1/projects/p-123456/locations/global/publishers/anthropic/models/"
+            "claude-opus-4-5@20251101:rawPredict",
+            "aiplatform.googleapis.com",
+        ),
     ],
 )
-def test_a_url_with_an_at_sign_is_refused_without_echoing_it(url):
-    with pytest.raises(RationalizationError, match="credentials") as caught:
-        check_endpoint(url)
+def test_an_at_sign_in_the_path_is_kept_and_never_changes_the_host(url, host):
+    checked = check_endpoint(url)
 
-    assert "hunter2" not in str(caught.value)
+    assert checked == url
+    assert urlsplit(checked).hostname == host
+    assert httpx.URL(checked).host == host
+    assert "@" not in urlsplit(checked).netloc
+    assert check_endpoint(checked) == checked
+
+
+# Path text an attacker might try: '@' with hosts, ports, userinfo, slashes, dots and escapes around it.
+AT_PATHS = st.lists(
+    st.sampled_from(
+        ["a", "b", "@", ":", ".", "..", "/", "-", "_", "~", "%40", "@evil.example", "@evil.example:443", "user:pw@"]
+    ),
+    max_size=12,
+).map("".join)
+
+
+@settings(max_examples=400, deadline=None)
+@given(path=AT_PATHS)
+def test_no_path_holding_an_at_sign_changes_the_checked_host(path):
+    checked = check_endpoint(f"https://gw.example/{path}")
+
+    assert urlsplit(checked).hostname == "gw.example"
+    assert urlsplit(checked).port is None
+    assert httpx.URL(checked).host == "gw.example"
+    assert httpx.URL(checked).port is None
+    assert check_endpoint(checked) == checked
+
+
+@settings(max_examples=400, deadline=None)
+@given(userinfo=st.text(alphabet="ab@:.-_~%", min_size=0, max_size=12), path=AT_PATHS)
+def test_every_authority_holding_an_at_sign_is_refused(userinfo, path):
+    with pytest.raises(RationalizationError):
+        check_endpoint(f"https://{userinfo}@gw.example/{path}")
 
 
 @pytest.mark.parametrize(
@@ -900,6 +1001,8 @@ def test_a_bad_kind_model_or_endpoint_is_refused(kind, model, base_url):
         "ollama:llama3.1:8b",
         "openai-compatible:llama3@https://gw.example/v1",
         "openai-compatible:claude-3@20240620@https://gw.example/v1",
+        "openai-compatible:claude@1@https://gw.example/v1/models/x@2",
+        "openai-compatible:m@https://gw.example/v1@https://other.example/v1",
     ],
 )
 def test_a_parsed_model_string_gives_back_its_own_model_id(spec):
@@ -918,6 +1021,8 @@ ENDPOINTS = [
     "http://127.0.0.1:11434/v1",
     "https://api.openai.com/v1",
     "https://gw.example/a:b",
+    "https://gw.example/a@b",
+    "https://gw.example/v1@https://other.example/v1",
 ]
 DEFAULTS = {"openai": "https://api.openai.com/v1", "ollama": "http://localhost:11434/v1"}
 

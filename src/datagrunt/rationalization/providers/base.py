@@ -24,27 +24,32 @@ The rules and guarantees:
 3. **Model strings** (R3: explicit prefix only, since a guess decides which vendor receives the documents).
    :func:`parse_model_string` takes ``<kind>:<model>`` for the five :data:`PROVIDER_KINDS`. The prefix runs to the
    first ``:``, so an Ollama name keeps its own colons (``ollama:llama3.1:8b``); ``openai-compatible:<model>@<url>``
-   takes its endpoint after the last ``@``. A bare name (``gpt-4o``), an unknown prefix (never echoed: it could be a
-   mistyped key), ``vertex:`` (a string cannot carry the OAuth token Vertex needs), an empty model and
-   ``openai-compatible`` without its endpoint are refused, each with its remedy. A model name is non-blank, at most
+   takes its endpoint after the last ``@`` before the URL's ``://`` (the model may hold ``@``, and so may the URL's
+   path). A bare name (``gpt-4o``), an unknown prefix (never echoed: it could be a mistyped key), ``vertex:`` (a
+   string cannot carry the project and credential Google Cloud needs), an empty model, ``openai-compatible`` without
+   its endpoint, and an ``anthropic:`` or ``gemini:`` model holding ``@`` (a ``model@version`` name is a Google Cloud
+   model ID; neither API names a model so) are refused, each with its remedy. A model name is non-blank, at most
    :data:`MODEL_NAME_MAX_CHARS` characters, holds no whitespace and no control or format character (Unicode
    categories ``Z*`` and ``C*``), and no ``://``: a model name never holds a URL, so a model id can always tell its
    model from its endpoint. A model sent in a request body may hold ``/`` and ``:`` (``meta-llama/Llama-3-8b``); a
    Gemini model goes in the URL path, so it must be one :func:`check_path_segment`.
 4. **Endpoints.** :func:`check_endpoint` allows ``https`` always, and ``http`` only for a loopback host
-   (``localhost``, ``127.0.0.0/8``, ``::1``) unless ``allow_insecure_http=True``. It refuses an ``@`` anywhere
-   (credentials never go in a URL), a query, a fragment, a backslash, whitespace and control characters, non-ASCII
-   text (a host goes in punycode), more than :data:`URL_MAX_CHARS` characters, a bad port, and a host that is
-   missing or malformed: one whose last label is all digits or ``0x``-hex unless it is a canonical IP address (no
-   leading zeros, no octet past 255), an IPv4-mapped IPv6 literal (``[::ffff:127.0.0.1]``, which a proxy would not
-   treat as loopback), and one with a punycode label that does not decode to letters, digits and ``-``. It returns
-   the normalized base: lower-case scheme and host, the default port (443, 80) dropped, percent-encoded unreserved
-   characters decoded and other escapes in upper case, dot segments removed, no trailing slash; normalizing twice
-   changes nothing. Its errors never echo the URL, which may hold a credential. :func:`endpoint_model_id` composes a
-   ``model_id`` naming the endpoint (``openai-compatible:llama3@https://gw.example/v1``; plain ``openai:gpt-4o`` for
-   a kind's default endpoint exactly), so two endpoints never share a model id and one endpoint written two ways
-   gets one. :func:`check_path_segment` and :func:`check_gcp_label` check what a URL-path adapter (Gemini, Vertex)
-   puts in a URL.
+   (``localhost``, ``127.0.0.0/8``, ``::1``) unless ``allow_insecure_http=True``. It refuses an ``@`` in the
+   authority (userinfo: credentials never go in a URL, and an ``@`` there changes the host; the path may hold one, a
+   Google Cloud model version as in ``…/models/claude-opus-4-5@20251101:rawPredict``, since the authority ends at the
+   first ``/`` and the host is read from it alone), a query, a fragment, a backslash, whitespace and control
+   characters, non-ASCII text (a host goes in punycode), more than :data:`URL_MAX_CHARS` characters, a bad port, and
+   a host that is missing or malformed: one whose last label is all digits or ``0x``-hex unless it is a canonical IP
+   address (no leading zeros, no octet past 255), an IPv4-mapped IPv6 literal (``[::ffff:127.0.0.1]``, which a proxy
+   would not treat as loopback), and one with a punycode label that does not decode to letters, digits and ``-``. It
+   returns the normalized base: lower-case scheme and host, the default port (443, 80) dropped, percent-encoded
+   unreserved characters decoded and other escapes in upper case, dot segments removed, no trailing slash;
+   normalizing twice changes nothing. Its errors never echo the URL, which may hold a credential.
+   :func:`endpoint_model_id` composes a ``model_id`` naming the endpoint
+   (``openai-compatible:llama3@https://gw.example/v1``; plain ``openai:gpt-4o`` for a kind's default endpoint
+   exactly), so two endpoints never share a model id and one endpoint written two ways gets one.
+   :func:`check_path_segment` and :func:`check_gcp_label` check what a URL-path adapter (Gemini, Vertex) puts in a
+   URL.
 5. **API keys.** :class:`_Secret` holds a key: printable ASCII without leading or trailing whitespace (so a bad key
    fails where it is read, not in a header). Its ``repr`` and ``str`` are ``<secret>``, it has no ``__dict__``, and
    it refuses to pickle, copy or give its state, so a key reaches neither a pickle nor a log by accident.
@@ -141,6 +146,9 @@ _DOMAIN = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[
 _PROJECT = re.compile(rf"{_PROJECT_ID}|[1-9][0-9]{{0,18}}|{_DOMAIN}:{_PROJECT_ID}")
 _GCP_LABEL_MAX_CHARS = 256
 _KINDS_TEXT = ", ".join(sorted(PROVIDER_KINDS))
+_GOOGLE_CLOUD_FACTORIES: Mapping[str, str] = MappingProxyType(
+    {"anthropic": "AnthropicProvider.google_cloud", "gemini": "GeminiProvider.google_cloud"}
+)  # the kinds whose own API never names a model with '@', and where a model@version (a Google Cloud ID) goes
 # What bounded_detail turns into spaces: whitespace (line breaks included), C0, DEL and C1 controls, bidi controls
 # (the R8 set), tag characters and lone surrogates.
 _DETAIL_BLANKS = re.compile(r"[\s\x00-\x1f\x7f-\x9f‪-‮⁦-⁩\U000e0000-\U000e007f\ud800-\udfff]+")
@@ -440,8 +448,6 @@ def _check_url_text(url: object) -> str:
         _refuse_url("it must be ASCII: write the host in punycode (xn--...) and percent-encode the path")
     if any(character <= " " or character == "\x7f" for character in url):
         _refuse_url("it holds whitespace or control characters")
-    if "@" in url:
-        _refuse_url("it holds '@': credentials never go in a URL (pass the key to the provider object)")
     if "?" in url:
         _refuse_url("it holds a query ('?'): keys go in headers, and the endpoint takes none")
     if "#" in url:
@@ -452,9 +458,14 @@ def _check_url_text(url: object) -> str:
 
 
 def _split(url: str) -> tuple[SplitResult, str, int | None]:
-    """Parse a checked URL into its parts, its lower-case host and its port."""
+    """Parse a checked URL into its parts, its lower-case host and its port; an ``@`` in the authority is refused."""
     try:
         parts = urlsplit(url)
+    except ValueError:
+        _refuse_url("its host or port is malformed")
+    if "@" in parts.netloc:  # userinfo, or an '@' that moves the host: the path may hold one, the authority never
+        _refuse_url("its authority holds '@': credentials never go in a URL (pass the key to the provider object)")
+    try:
         host, port = parts.hostname, parts.port
     except ValueError:
         _refuse_url("its host or port is malformed")
@@ -647,6 +658,12 @@ def _check_model(kind: str, model: object) -> str:
     problem = _model_problem(model)
     if problem is not None or not isinstance(model, str):
         raise RationalizationError(f"the {kind} model string {problem}: write {kind}:<model>")
+    factory = _GOOGLE_CLOUD_FACTORIES.get(kind)
+    if factory is not None and "@" in model:
+        raise RationalizationError(
+            f"the {kind} model string holds '@': a model@version name is a Google Cloud model ID, reached through "
+            f"{factory}(model, project=..., location=..., auth=...); the {kind} API names its models without '@'"
+        )
     if kind == "gemini":
         if model.startswith("models/"):
             raise RationalizationError("write the Gemini model without its models/ prefix, as in gemini:gemini-2.5-pro")
@@ -712,13 +729,18 @@ def _refuse_prefix(spec: str, *, bare: bool) -> NoReturn:
 
 
 def _split_compatible(rest: str) -> tuple[str, str]:
-    """The model and the endpoint of ``openai-compatible:<model>@<url>``: the URL after the last ``@``."""
-    if "@" not in rest:
+    """The model and the endpoint of ``openai-compatible:<model>@<url>``: the URL after the last ``@`` before ``://``.
+
+    A model never holds ``://`` and a URL's scheme never holds ``@``, so that ``@`` is where the URL starts, however
+    many ``@`` the model or the URL's path holds.
+    """
+    scheme = rest.find("://")
+    cut = rest.rfind("@", 0, scheme) if scheme >= 0 else -1
+    if cut < 0:
         raise RationalizationError(
             "the openai-compatible model string needs its endpoint: write openai-compatible:<model>@https://host/v1"
         )
-    model, url = rest.rsplit("@", 1)
-    return _check_model("openai-compatible", model), check_endpoint(url)
+    return _check_model("openai-compatible", rest[:cut]), check_endpoint(rest[cut + 1 :])
 
 
 def parse_model_string(spec: str) -> ModelString:
@@ -743,8 +765,8 @@ def parse_model_string(spec: str) -> ModelString:
     prefix, rest = spec.split(":", 1)
     if prefix == "vertex":
         raise RationalizationError(
-            "Vertex needs a token, which a model string cannot carry: use "
-            "GeminiProvider.vertex(model, project=..., location=..., token=...)"
+            "Vertex AI (now Google Cloud's Agent Platform) needs a project and a credential, which a model string "
+            "cannot carry: use GeminiProvider.google_cloud(model, project=..., location=..., auth=...)"
         )
     if prefix not in PROVIDER_KINDS:
         _refuse_prefix(spec, bare=False)
@@ -760,8 +782,9 @@ def endpoint_model_id(kind: str, model: str, base_url: str | None) -> str:
 
     ``<kind>:<model>`` when ``base_url`` is ``None`` or exactly the kind's default endpoint (:data:`OPENAI_BASE_URL`,
     :data:`OLLAMA_BASE_URL`) once normalized, else ``<kind>:<model>@<normalized base_url>`` (an endpoint extending a
-    default keeps its URL). A model name never holds ``://`` and a URL never holds ``@``, so two endpoints, or two
-    models, never share a model id.
+    default keeps its URL). A model name never holds ``://`` and a URL's scheme never holds ``@``, so the endpoint
+    starts after the last ``@`` before the first ``://`` (the model and the URL's path may hold ``@``): two
+    endpoints, or two models, never share a model id.
 
     Raises:
         RationalizationError: If ``kind`` is not a provider kind, ``model`` is not a model name, ``base_url`` is not

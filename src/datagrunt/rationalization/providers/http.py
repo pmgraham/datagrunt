@@ -26,8 +26,8 @@ client loses nothing.
 
 1. **Egress.** The URL passes :func:`~datagrunt.rationalization.providers.base.check_endpoint` and is sent in its
    normalized form: ``https``, or ``http`` to a loopback host (another host only with ``allow_insecure_http=True``),
-   never credentials, a query or a fragment in it. A redirect (any 3xx) is never followed, so no document reaches a
-   host the caller did not name.
+   never credentials, a query or a fragment in it (an ``@`` only in the path, never in the authority). A redirect
+   (any 3xx) is never followed, so no document reaches a host the caller did not name.
 2. **Headers.** Every header name must be an HTTP token. The framing and routing headers (``Host``,
    ``Content-Length``, ``Transfer-Encoding``, ``Connection``, ``Upgrade``, ``TE``, ``Trailer``, ``Keep-Alive``,
    ``Expect`` and every ``Proxy-*``) belong to the client and are refused. A plain value must be printable ASCII
