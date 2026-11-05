@@ -18,6 +18,15 @@ for what must be exactly JSON (a cache key's parts, a provider's answer): it par
 requires the result to equal the value, so every key is a ``str`` and every array a ``list`` at every level, and
 nothing folds. :func:`sha256_hex` is the SHA-256 hex digest of a text's UTF-8 bytes.
 
+:func:`strict_loads` is the package's one strict JSON parser: ``json.loads`` with three hooks, each raising
+``ValueError``. :func:`refuse_constant` refuses ``NaN``, ``Infinity`` and ``-Infinity``; :func:`finite_float`
+refuses a number that overflows a float (``1e999``), and its message never quotes the number; :func:`unique_keys`
+refuses an object that repeats a key. Otherwise it raises what ``json.loads`` raises (a ``JSONDecodeError``, a
+``ValueError`` for an integer past the interpreter's digit limit, a ``RecursionError`` for nesting past the recursion
+limit), and the caller decides what a failure means. The HTTP helper reads reply bodies and
+:func:`~datagrunt.rationalization.providers.responses.parse_json_object` reads a model's text with it. The cache
+reads its entries with the first and last hooks only: it leaves an overflowing number to its field checks.
+
 Nothing here recurses but the JSON coder and the comparison, bounded by the recursion limit. The module imports
 only the standard library and the package's error: no pydantic, no httpx, nothing from ``datagrunt.core``, and no
 import inside a function (invariant 9).
@@ -25,7 +34,8 @@ import inside a function (invariant 9).
 
 import hashlib
 import json
-from typing import Any
+import math
+from typing import Any, NoReturn
 
 from datagrunt.rationalization.exceptions import RationalizationError
 
@@ -101,3 +111,54 @@ def sha256_hex(text: str) -> str:
     except UnicodeEncodeError as error:
         raise RationalizationError(f"text is not valid Unicode: a lone surrogate at {error.start}") from error
     return hashlib.sha256(data).hexdigest()
+
+
+def refuse_constant(name: str) -> NoReturn:
+    """``json.loads``' ``parse_constant`` hook: ``NaN``, ``Infinity`` and ``-Infinity`` are not JSON.
+
+    Raises:
+        ValueError: Always, naming the constant.
+    """
+    raise ValueError(f"{name} is not JSON")
+
+
+def finite_float(text: str) -> float:
+    """``json.loads``' ``parse_float`` hook: the number as a float, unless it overflows one (``1e999``).
+
+    Raises:
+        ValueError: If the float is not finite; the message never quotes the number.
+    """
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError("a number overflows a float")
+    return value
+
+
+def unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """``json.loads``' ``object_pairs_hook``: the object of ``pairs``, unless two of them share a key.
+
+    Raises:
+        ValueError: If a key is repeated.
+    """
+    found = dict(pairs)
+    if len(found) != len(pairs):
+        raise ValueError("an object repeats a key")
+    return found
+
+
+def strict_loads(text: str) -> object:
+    """Parse ``text`` as ``json.loads`` does, with :func:`refuse_constant`, :func:`finite_float` and
+    :func:`unique_keys` (module notes).
+
+    Returns:
+        Any JSON value; the caller checks its shape.
+
+    Raises:
+        TypeError: If ``text`` is not a ``str``.
+        ValueError: If ``text`` is not JSON, holds ``NaN``, an infinity, a number that overflows a float, a
+            repeated key, or an integer past the digit limit.
+        RecursionError: If it nests past the recursion limit (as ``json.loads``).
+    """
+    if not isinstance(text, str):
+        raise TypeError(f"text must be a str, got {type(text).__name__}")
+    return json.loads(text, parse_constant=refuse_constant, parse_float=finite_float, object_pairs_hook=unique_keys)

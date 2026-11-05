@@ -106,6 +106,7 @@ import httpcore
 import httpx
 
 from datagrunt import __version__
+from datagrunt.rationalization._canonical import strict_loads
 from datagrunt.rationalization.exceptions import RationalizationError
 from datagrunt.rationalization.providers.base import (
     PermanentProviderError,
@@ -346,33 +347,11 @@ def _encode_body(body: object) -> bytes:
 # ---------------------------------------------------------------------------------------------------------------
 
 
-def _refuse_constant(name: str) -> NoReturn:
-    raise ValueError(f"{name} is not JSON")
-
-
-def _finite_float(text: str) -> float:
-    value = float(text)
-    if not math.isfinite(value):
-        raise ValueError(f"{text[:20]} overflows a float")
-    return value
-
-
-def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    found = dict(pairs)
-    if len(found) != len(pairs):
-        raise ValueError("an object repeats a key")
-    return found
-
-
 def _json_object(data: bytes) -> dict[str, Any] | None:
-    """The body as a strict JSON object (rule 6), or ``None``."""
+    """The body as a strict JSON object (rule 6), or ``None``: parsed by
+    :func:`~datagrunt.rationalization._canonical.strict_loads`, as a model's JSON text is."""
     try:
-        value = json.loads(
-            data.decode("utf-8"),
-            parse_constant=_refuse_constant,
-            parse_float=_finite_float,
-            object_pairs_hook=_unique_keys,
-        )
+        value = strict_loads(data.decode("utf-8"))
     except (ValueError, RecursionError):  # a UnicodeDecodeError or a JSONDecodeError is a ValueError
         return None
     return value if isinstance(value, dict) else None

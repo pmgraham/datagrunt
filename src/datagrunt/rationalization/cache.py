@@ -89,9 +89,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal, NoReturn, TypeAlias, get_args
+from typing import Any, Literal, TypeAlias, get_args
 
-from datagrunt.rationalization._canonical import canonical_copy, canonical_json, sha256_hex
+from datagrunt.rationalization._canonical import (
+    canonical_copy,
+    canonical_json,
+    refuse_constant,
+    sha256_hex,
+    unique_keys,
+)
 from datagrunt.rationalization.envelope import Envelope
 from datagrunt.rationalization.exceptions import RationalizationError
 from datagrunt.rationalization.wire import ProviderResponse
@@ -728,22 +734,15 @@ def _read_by_path(directory: Path, identity: os.stat_result, name: str) -> bytes
     return data
 
 
-def _refuse_constant(name: str) -> NoReturn:
-    raise ValueError(f"{name} is not JSON")
-
-
-def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    """A JSON object from its pairs, refusing a repeated key (a file ``put`` wrote never repeats one)."""
-    found = dict(pairs)
-    if len(found) != len(pairs):
-        raise ValueError("an object repeats a key")
-    return found
-
-
 def _parse_entry(data: bytes, key: str) -> CacheLookup:
-    """Check an entry's bytes whole (module notes, 4): a hit, or a corrupt miss with its reason, never an error."""
+    """Check an entry's bytes whole (module notes, 4): a hit, or a corrupt miss with its reason, never an error.
+
+    Constants and repeated keys (a file ``put`` wrote never repeats one) are refused at the parse, by the shared
+    hooks of :mod:`~datagrunt.rationalization._canonical`; a number that overflows a float is left to the field
+    checks, so such an entry is ``invalid_meta`` or ``invalid_response``.
+    """
     try:
-        entry = json.loads(data.decode("utf-8"), parse_constant=_refuse_constant, object_pairs_hook=_unique_keys)
+        entry = json.loads(data.decode("utf-8"), parse_constant=refuse_constant, object_pairs_hook=unique_keys)
     except (ValueError, RecursionError):  # a UnicodeDecodeError or a JSONDecodeError is a ValueError
         return _corrupt("not_json")
     if not isinstance(entry, dict):
