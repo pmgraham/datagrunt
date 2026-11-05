@@ -37,14 +37,17 @@ words; see the known limits); datagrunt still validates every record locally, wh
 
 1. **Construction** checks everything before any request, and every rejection is a
    :class:`~datagrunt.rationalization.RationalizationError` naming the option (never a key): the model name (as
-   :func:`~datagrunt.rationalization.providers.base.endpoint_model_id` checks it); the key, given or read from
-   ``ANTHROPIC_API_KEY`` (missing names the variable), held as a ``_Secret``; ``base_url`` through
-   :func:`~datagrunt.rationalization.providers.base.check_endpoint`; ``api_version`` one of :data:`API_VERSIONS`
-   (default the latest, 2026-10-21); ``temperature`` ``None`` (the default) or, with ``api_version="2023-06-01"``
-   only, a finite number in 0-1 (held as a float, ``-0.0`` as ``0.0``); ``max_connections`` 1-1,024; ``transport``
-   an httpx transport. ``from_model_string`` takes the constructor's keyword options and refuses any other, naming
-   only the option names. A key passed as text never sits in a local of a frame that raises: it is wrapped (or its
-   problem found) before any check and its text deleted, so a traceback printed with its locals shows no key.
+   :func:`~datagrunt.rationalization.providers.base.endpoint_model_id` checks it); the key, given, or read from
+   ``ANTHROPIC_API_KEY`` only when the normalized ``base_url`` is Anthropic's own (:data:`DEFAULT_BASE_URL`, however
+   written): any other endpoint, a gateway, needs an explicit ``api_key=``, so the caller's Anthropic key never
+   reaches a third party unasked (a missing key names the variable, never a value); held as a ``_Secret``.
+   ``base_url`` goes through :func:`~datagrunt.rationalization.providers.base.check_endpoint`; ``api_version`` is one
+   of :data:`API_VERSIONS` (default the latest, 2026-10-21); ``temperature`` ``None`` (the default) or, with
+   ``api_version="2023-06-01"`` only, a finite number in 0-1 (held as a float, ``-0.0`` as ``0.0``);
+   ``max_connections`` 1-1,024; ``transport`` an httpx transport. ``from_model_string`` takes the constructor's
+   keyword options and refuses any other, naming only the option names. A key passed as text never sits in a local
+   of a frame that raises: it is wrapped (or its problem found) before any check and its text deleted, so a
+   traceback printed with its locals shows no key.
 2. **Identity.** ``model_id`` is ``anthropic:<model>`` for the default endpoint however written, else
    ``anthropic:<model>@<normalized base_url>``, so a gateway never shares a cache entry with Anthropic.
    ``rate_key`` is the normalized base URL; ``model_family`` is ``"anthropic"`` (Claude, whatever the endpoint).
@@ -155,6 +158,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Final, NoReturn, cast
+from urllib.parse import urlsplit
 
 from datagrunt.rationalization._canonical import canonical_copy, canonical_json
 from datagrunt.rationalization.exceptions import RationalizationError
@@ -307,23 +311,35 @@ def _refuse(message: str) -> NoReturn:
 
 
 def _wrap_key(value: object) -> tuple[_Secret | None, str | None]:
-    """The key as a ``_Secret``, or the problem with it; never raises, so no frame holding the key is on a
-    traceback (rule 1)."""
+    """A given key as a ``_Secret`` (``None`` when none is given), or the problem with it; it reads no environment
+    variable and never raises, so no frame holding the key is on a traceback (rule 1)."""
     if isinstance(value, _Secret):
         return value, None
     if value is None:
-        try:
-            found = api_key_from_env(API_KEY_VARIABLE)
-        except RationalizationError as error:  # its message names the variable, never the value
-            return None, str(error)
-        if found is None:
-            return None, f"no API key: set {API_KEY_VARIABLE} or pass api_key="
-        return found, None
+        return None, None
     if not isinstance(value, str):
         return None, f"api_key must be a str, got {type(value).__name__}"
     if _secret_problem(value, what="api_key") is not None:  # checked without raising, so no frame holds the text
         return None, "api_key must be non-blank printable ASCII without leading or trailing whitespace"
     return _Secret(value), None
+
+
+def _env_key(base: str) -> tuple[_Secret | None, str]:
+    """The ``ANTHROPIC_API_KEY`` key for the normalized endpoint ``base``, or the problem (rule 1).
+
+    The variable is read only for :data:`DEFAULT_BASE_URL`: any other endpoint (a gateway) needs an explicit
+    ``api_key=``, so the caller's Anthropic key never reaches a third party unasked. Never raises, never quotes a key.
+    """
+    if base != DEFAULT_BASE_URL:
+        host = urlsplit(base).netloc
+        return None, f"{API_KEY_VARIABLE} is read only for {DEFAULT_BASE_URL}; pass api_key= for {host} explicitly"
+    try:
+        found = api_key_from_env(API_KEY_VARIABLE)
+    except RationalizationError as error:  # its message names the variable, never the value
+        return None, str(error)
+    if found is None:
+        return None, f"no API key: set {API_KEY_VARIABLE} or pass api_key="
+    return found, ""
 
 
 def _check_temperature(value: object) -> float | None:
@@ -773,7 +789,8 @@ class AnthropicProvider:
 
     Args:
         model: The model name (``"claude-opus-5-5"``).
-        api_key: The API key; ``None`` reads ``ANTHROPIC_API_KEY``.
+        api_key: The API key; ``None`` reads ``ANTHROPIC_API_KEY``, for Anthropic's own endpoint only (a gateway
+            needs an explicit key).
         base_url: The endpoint: Anthropic's, or a gateway that speaks the Messages API.
         api_version: The ``anthropic-version`` header: one of :data:`API_VERSIONS`, the latest by default.
         temperature: ``None`` (the default) leaves it out. A number in 0-1 needs ``api_version="2023-06-01"``, and
@@ -784,8 +801,8 @@ class AnthropicProvider:
         transport: An ``httpx.BaseTransport`` to use instead of the network (tests), checked by the HTTP helper.
 
     Raises:
-        RationalizationError: If an option breaks its rule (``transport`` included) or no key is found; the message
-            names the option and never shows a key.
+        RationalizationError: If an option breaks its rule (``transport`` included), no key is found, or a gateway
+            has no explicit key; the message names the option or the variable and never shows a key.
     """
 
     __slots__ = ("_http", "_max_connections", "_model", "_route", "_temperature")
@@ -804,9 +821,13 @@ class AnthropicProvider:
     ) -> None:
         secret, problem = _wrap_key(api_key)
         del api_key  # a key given as text never sits in this frame's locals past this line
-        if secret is None:
-            _refuse(problem or "no API key")
+        if problem is not None:
+            _refuse(problem)
         base = check_endpoint(base_url, allow_insecure_http=allow_insecure_http)
+        if secret is None:  # no key given: the environment's, for Anthropic's own endpoint only
+            secret, missing = _env_key(base)
+            if secret is None:
+                _refuse(missing)
         checked_temperature = _check_temperature(temperature)
         version = _check_api_version(api_version, checked_temperature)
         route = _Route(
@@ -915,8 +936,8 @@ class AnthropicProvider:
                 f"from_model_string takes no option {', '.join(unknown[:_OPTIONS_SHOWN])}: the options are api_key, "
                 f"{', '.join(sorted(_OPTIONS))}"
             )
-        if secret is None:
-            _refuse(problem or "no API key")
+        if problem is not None:
+            _refuse(problem)
         if model_string.base_url is not None:
             options.setdefault("base_url", model_string.base_url)
         return cls(model_string.model, api_key=secret, **options)

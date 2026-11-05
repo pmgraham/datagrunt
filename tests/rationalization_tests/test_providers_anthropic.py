@@ -871,6 +871,82 @@ def test_the_key_comes_from_the_environment_when_not_given(monkeypatch):
     assert handler.seen[0].headers["x-api-key"] == KEY
 
 
+# The environment key goes only to Anthropic: a gateway never receives ANTHROPIC_API_KEY unless it is passed.
+
+GATEWAYS = ["https://gw.example/anthropic", "https://GW.example:8443/v1/", "http://localhost:8080"]
+
+
+@pytest.mark.parametrize("base_url", GATEWAYS)
+def test_a_gateway_never_gets_the_environment_key_and_nothing_is_sent(monkeypatch, base_url):
+    monkeypatch.setenv(API_KEY_VARIABLE, KEY)
+    handler = reply_with(json_body=MESSAGE)
+
+    with pytest.raises(RationalizationError) as caught:
+        make_provider(handler, api_key=None, base_url=base_url)
+
+    message = str(caught.value)
+    assert "ANTHROPIC_API_KEY is read only for https://api.anthropic.com" in message
+    assert "pass api_key=" in message
+    assert check_endpoint(base_url).split("://", 1)[1].split("/", 1)[0] in message
+    assert handler.seen == []
+    assert_secret_free(caught.value)
+
+
+@pytest.mark.parametrize("base_url", GATEWAYS)
+def test_a_gateway_from_a_model_string_never_gets_the_environment_key(monkeypatch, base_url):
+    monkeypatch.setenv(API_KEY_VARIABLE, KEY)
+    handler = reply_with(json_body=MESSAGE)
+
+    with pytest.raises(RationalizationError, match="ANTHROPIC_API_KEY is read only for") as caught:
+        AnthropicProvider.from_model_string(PARSED, base_url=base_url, transport=httpx.MockTransport(handler))
+
+    assert handler.seen == []
+    assert_secret_free(caught.value)
+
+
+@pytest.mark.parametrize("base_url", GATEWAYS)
+def test_a_gateway_with_an_explicit_key_sends_that_key_only(monkeypatch, base_url):
+    monkeypatch.setenv(API_KEY_VARIABLE, KEY)
+    explicit = "sk-gateway-explicit-KEY"
+    handler = reply_with(json_body=MESSAGE)
+
+    make_provider(handler, api_key=explicit, base_url=base_url).generate(REQUEST)
+    AnthropicProvider.from_model_string(
+        PARSED, api_key=explicit, base_url=base_url, transport=httpx.MockTransport(handler)
+    ).generate(REQUEST)
+
+    assert len(handler.seen) == 2
+    for sent in handler.seen:
+        assert sent.headers["x-api-key"] == explicit
+        assert "hunter2" not in str(sent.headers)
+        assert b"hunter2" not in sent.content
+        assert "hunter2" not in str(sent.url)
+
+
+@pytest.mark.parametrize(
+    "base_url", [DEFAULT_BASE_URL, "https://api.anthropic.com/", "https://API.Anthropic.com:443", None]
+)
+def test_the_default_endpoint_however_written_still_reads_the_environment_key(monkeypatch, base_url):
+    monkeypatch.setenv(API_KEY_VARIABLE, KEY)
+    handler = reply_with(json_body=MESSAGE)
+    options = {} if base_url is None else {"base_url": base_url}
+
+    make_provider(handler, api_key=None, **options).generate(REQUEST)
+    AnthropicProvider.from_model_string(PARSED, transport=httpx.MockTransport(handler), **options).generate(REQUEST)
+
+    assert [sent.headers["x-api-key"] for sent in handler.seen] == [KEY, KEY]
+
+
+def test_a_gateway_without_any_key_is_refused_naming_the_rule(monkeypatch):
+    handler = reply_with(json_body=MESSAGE)
+
+    with pytest.raises(RationalizationError, match="pass api_key= for gw.example explicitly") as caught:
+        make_provider(handler, api_key=None, base_url="https://gw.example/anthropic")
+
+    assert handler.seen == []
+    assert_secret_free(caught.value)
+
+
 @pytest.mark.parametrize("value", [None, "", "   "])
 def test_a_missing_key_is_refused_naming_the_variable(monkeypatch, value):
     if value is not None:
