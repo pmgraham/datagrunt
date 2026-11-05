@@ -71,7 +71,6 @@ names (``Key``, ``RationalizationError``) never load pydantic.
 """
 
 import copy
-import hashlib
 import json
 import typing
 from collections.abc import Iterable, Mapping, Sequence
@@ -94,6 +93,7 @@ from pydantic import (
 )
 from pydantic.fields import FieldInfo
 
+from datagrunt.rationalization._canonical import canonical_json, sha256_hex
 from datagrunt.rationalization.exceptions import RationalizationError
 from datagrunt.rationalization.markers import _KeyMarker
 
@@ -393,7 +393,11 @@ class PreparedSchema:
             raise ValueError(f"PreparedSchema spec describes {self.spec.model.__name__}, not {self.model.__name__}")
         if not isinstance(self.wrapper_json, str):
             raise TypeError(f"PreparedSchema wrapper_json must be a str, got {type(self.wrapper_json).__name__}")
-        if self.sha256 != _sha256_text(self.wrapper_json):
+        try:
+            digest = sha256_hex(self.wrapper_json)
+        except RationalizationError as error:  # a lone surrogate: no digest can match it
+            raise ValueError("PreparedSchema wrapper_json is not valid Unicode") from error
+        if self.sha256 != digest:
             raise ValueError("PreparedSchema sha256 does not match wrapper_json")
 
     @property
@@ -536,7 +540,7 @@ def schema_sha256(wrapper: Mapping[str, Any]) -> str:
             is not JSON, a non-finite float, keys that do not sort, a string that is not UTF-8, or nesting deeper
             than the stack (the ``RecursionError`` chained).
     """
-    return _sha256_text(_canonical_json(wrapper))
+    return sha256_hex(_canonical_json(wrapper))
 
 
 def prepare(schema: object, key: str | Sequence[str] | None = None) -> PreparedSchema:
@@ -562,7 +566,7 @@ def prepare(schema: object, key: str | Sequence[str] | None = None) -> PreparedS
     _check_agreement(spec, document)
     _check_document(document, model.__name__)
     text = _canonical_json(_wrap(document))
-    return PreparedSchema(model=model, spec=spec, wrapper_json=text, sha256=_sha256_text(text))
+    return PreparedSchema(model=model, spec=spec, wrapper_json=text, sha256=sha256_hex(text))
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1529,20 +1533,10 @@ def _wrap(document: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _canonical_json(wrapper: object) -> str:
-    """``wrapper`` as canonical JSON text: sorted keys, compact separators, no ASCII escaping, encodable in UTF-8."""
+    """``wrapper``, which must be a mapping, as canonical JSON text (``_canonical.canonical_json``)."""
     if not isinstance(wrapper, Mapping):
         raise RationalizationError(f"the response schema must be a mapping, got {type(wrapper).__name__}")
-    try:
-        text = json.dumps(wrapper, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
-        text.encode("utf-8")
-    except (TypeError, ValueError, RecursionError) as error:
-        raise RationalizationError(f"the response schema is not canonical JSON: {error}") from error
-    return text
-
-
-def _sha256_text(text: str) -> str:
-    """The SHA-256 hex digest of ``text`` in UTF-8."""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return canonical_json(wrapper, subject="the response schema")
 
 
 # ---------------------------------------------------------------------------------------------------------------
