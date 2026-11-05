@@ -2,21 +2,25 @@
 
 The rules and guarantees:
 
-1. **The protocol.** A provider is any object with the six members of :class:`ModelProvider`: ``model_id`` (it
+1. **The protocol.** A provider is any object with the seven members of :class:`ModelProvider`: ``model_id`` (it
    names the endpoint, since the cache key holds no URL), ``provider_kind`` (a cache-key field), ``rate_key`` (the
-   endpoint identity the runner's semaphores and token bucket share), ``generation_params`` (exactly JSON: what it
-   sends that shapes the output), ``transform_schema`` (pure) and ``generate``. :func:`check_provider` checks one at
-   preflight, before any request: each member a real attribute (found without calling ``__getattr__``, so a
-   ``Mock`` is refused by name), each identity a non-blank single-line ``str`` of at most :data:`IDENTITY_MAX_CHARS`
-   characters (:func:`identity_problem`), ``generation_params`` exactly JSON, both methods callable. A property that
-   raises is refused naming the attribute and the exception's class. Its errors never quote a value or a message.
-2. **Errors.** A provider raises :class:`TransientProviderError` for a failure worth a retry (HTTP 408, 429, 500, 502,
-   503 and 504, timeouts, transport failures) and :class:`PermanentProviderError` for every other failure; both are
-   :class:`ProviderError`, which itself carries ``status_code`` and ``detail``. Any other exception from a provider
-   is a bug and propagates. ``detail`` is always :func:`bounded_detail` of what it is given: one line of at most
-   :data:`DETAIL_MAX_CHARS` characters, without control, bidi, tag or surrogate code points. It can echo document
-   text (a provider's error message may quote the request), so it is bounded but never a place for secrets. Every
-   provider error pickles (they cross threads).
+   endpoint identity the runner's semaphores and token bucket share), ``model_family`` (the model's vendor lineage,
+   not its transport: ``google``, ``anthropic``, ``openai``, ``meta``, ... or :data:`UNKNOWN_FAMILY`, which adds no
+   family diversity to consensus; not a cache-key field, since it shapes no output), ``generation_params`` (exactly
+   JSON: what it sends that shapes the output), ``transform_schema`` (pure) and ``generate``. :func:`check_provider`
+   checks one at preflight, before any request: each member a real attribute (found without calling
+   ``__getattr__``, so a ``Mock`` is refused by name), each identity a non-blank single-line ``str`` of at most
+   :data:`IDENTITY_MAX_CHARS` characters (:func:`identity_problem`), the family exactly a ``str`` of 1-32 of
+   ``a-z``, ``0-9`` and ``-`` (:func:`family_problem`), ``generation_params`` exactly JSON, both methods callable. A
+   property that raises is refused naming the attribute and the exception's class. Its errors never quote a value
+   or a message.
+2. **Errors.** A provider raises :class:`TransientProviderError` for a failure worth a retry (HTTP 408, 429, 500,
+   502-504, 520-524 and 529, the HTTP helper's ``TRANSIENT_STATUSES``; timeouts; transport failures) and
+   :class:`PermanentProviderError` for every other failure; both are :class:`ProviderError`, which itself carries
+   ``status_code`` and ``detail``. Any other exception from a provider is a bug and propagates. ``detail`` is always
+   :func:`bounded_detail` of what it is given: one line of at most :data:`DETAIL_MAX_CHARS` characters, without
+   control, bidi, tag or surrogate code points. It can echo document text (a provider's error message may quote the
+   request), so it is bounded but never a place for secrets. Every provider error pickles (they cross threads).
 3. **Model strings** (R3: explicit prefix only, since a guess decides which vendor receives the documents).
    :func:`parse_model_string` takes ``<kind>:<model>`` for the five :data:`PROVIDER_KINDS`. The prefix runs to the
    first ``:``, so an Ollama name keeps its own colons (``ollama:llama3.1:8b``); ``openai-compatible:<model>@<url>``
@@ -46,7 +50,9 @@ The rules and guarantees:
    it refuses to pickle, copy or give its state, so a key reaches neither a pickle nor a log by accident.
    :meth:`_Secret.prefixed` builds ``Bearer <key>`` without the key passing through the caller's code. Adapters send
    a key in a header only, as a ``_Secret`` (the HTTP helper reveals it only to build the request), never in a URL.
-   :func:`api_key_from_env` reads one variable.
+   :func:`api_key_from_env` reads one variable. A refused key never sits in a traceback local of this module (a log
+   with ``capture_locals`` prints them): the check returns its error instead of raising it, and the function that
+   raises deletes the text first. Only the caller's own frame, which passed the text, still holds it.
 
 Every rejection a caller can cause is a :class:`~datagrunt.rationalization.RationalizationError`; building an error
 or a secret wrongly is a ``TypeError`` or ``ValueError`` at the call. Bounds: every check is linear in its input,
@@ -81,11 +87,22 @@ PROVIDER_KINDS: tuple[ProviderKind, ...] = get_args(ProviderKind)
 GcpField: TypeAlias = Literal["project", "location"]
 """What :func:`check_gcp_label` checks."""
 
-PROVIDER_MEMBERS = ("model_id", "provider_kind", "rate_key", "generation_params", "transform_schema", "generate")
+PROVIDER_MEMBERS = (
+    "model_id",
+    "provider_kind",
+    "rate_key",
+    "model_family",
+    "generation_params",
+    "transform_schema",
+    "generate",
+)
 """The members every :class:`ModelProvider` has."""
 
 IDENTITY_MAX_CHARS = 512
 """The most characters a provider's ``model_id``, ``provider_kind`` or ``rate_key`` may take."""
+
+UNKNOWN_FAMILY = "unknown"
+"""The ``model_family`` of a model whose vendor lineage is not known: it adds no family diversity."""
 
 MODEL_NAME_MAX_CHARS = 256
 """The most characters a model name, or a path segment, may take."""
@@ -129,6 +146,7 @@ _KINDS_TEXT = ", ".join(sorted(PROVIDER_KINDS))
 _DETAIL_BLANKS = re.compile(r"[\s\x00-\x1f\x7f-\x9f‪-‮⁦-⁩\U000e0000-\U000e007f\ud800-\udfff]+")
 _IDENTITY_FORBIDDEN = frozenset({"Cc", "Cs", "Zl", "Zp"})
 _SECRET_TEXT = re.compile(r"[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?")
+_FAMILY = re.compile(r"[a-z0-9-]{1,32}")
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -217,7 +235,7 @@ class ProviderError(Exception):
 
 
 class TransientProviderError(ProviderError):
-    """A failure worth a retry: HTTP 408/429/500/502/503/504, a timeout or a transport failure (module notes, 2).
+    """A failure worth a retry: a retryable HTTP status, a timeout or a transport failure (module notes, 2).
 
     Args:
         status_code: The HTTP status (100-599), or ``None``.
@@ -242,7 +260,7 @@ class TransientProviderError(ProviderError):
 
 
 class PermanentProviderError(ProviderError):
-    """A failure no retry fixes: a 3xx, a 4xx or 5xx outside the transient six, a refused request (module notes, 2).
+    """A failure no retry fixes: a 3xx, a 4xx or 5xx outside the retryable set, a refused request (module notes, 2).
 
     Args:
         status_code: The HTTP status (100-599), or ``None``.
@@ -284,6 +302,11 @@ class ModelProvider(Protocol):
         ...
 
     @property
+    def model_family(self) -> str:
+        """The model's vendor lineage (``"google"``, ``"anthropic"``, ``"openai"``, ...) or ``"unknown"``."""
+        ...
+
+    @property
     def generation_params(self) -> Mapping[str, Any]:
         """What the provider sends that shapes the output (temperature, seed, ...), exactly JSON."""
         ...
@@ -316,6 +339,22 @@ def identity_problem(value: object) -> str | None:
         return f"must be at most {IDENTITY_MAX_CHARS} characters, got {len(value)}"
     if any(unicodedata.category(character) in _IDENTITY_FORBIDDEN for character in value):
         return "must be a single line without control characters, line separators or lone surrogates"
+    return None
+
+
+def family_problem(value: object) -> str | None:
+    """What is wrong with ``value`` as a ``model_family`` (module notes, 1), or ``None`` when nothing is.
+
+    A family is exactly a ``str`` (no subclass) of 1-32 of ``a-z``, ``0-9`` and ``-``: the model's vendor lineage
+    (``google``, ``anthropic``, ``openai``, ``meta``, ...) or :data:`UNKNOWN_FAMILY`. The answer never quotes ``value``.
+    """
+    if type(value) is not str:
+        return f"must be exactly a str, got {type(value).__name__}"
+    if not _FAMILY.fullmatch(value):
+        return (
+            "must be 1-32 of a-z, 0-9 and '-': the model's vendor lineage (google, anthropic, openai, meta, ...) or "
+            "unknown"
+        )
     return None
 
 
@@ -360,7 +399,8 @@ def check_provider(obj: object) -> ModelProvider:
     Raises:
         RationalizationError: If a member is missing or answered only by ``__getattr__``, a property raises, an
             identity is not a non-blank single-line ``str`` of at most :data:`IDENTITY_MAX_CHARS` characters,
-            ``generation_params`` is not exactly JSON, or a method is not callable; the message names the attribute.
+            ``model_family`` is not a family (:func:`family_problem`), ``generation_params`` is not exactly JSON, or
+            a method is not callable; the message names the attribute, never its value.
     """
     owner = type(obj).__name__
     _check_members(obj, owner)
@@ -368,6 +408,9 @@ def check_provider(obj: object) -> ModelProvider:
         problem = identity_problem(_read_member(obj, owner, member))
         if problem is not None:
             _refuse_provider(owner, f"{member} {problem}")
+    problem = family_problem(_read_member(obj, owner, "model_family"))
+    if problem is not None:
+        _refuse_provider(owner, f"model_family {problem}")
     params = _read_member(obj, owner, "generation_params")
     if not isinstance(params, Mapping):
         _refuse_provider(owner, f"generation_params must be a JSON object (a Mapping), got {type(params).__name__}")
@@ -742,14 +785,19 @@ def endpoint_model_id(kind: str, model: str, base_url: str | None) -> str:
 # ---------------------------------------------------------------------------------------------------------------
 
 
-def _check_secret_text(value: object, *, what: str) -> str:
+def _secret_problem(value: object, *, what: str) -> TypeError | ValueError | None:
+    """The error ``value`` earns as key text (module notes, 5), or ``None`` for a valid key.
+
+    It returns the error rather than raising it, so the caller deletes the text before it raises: no frame that
+    raises holds a key.
+    """
     if not isinstance(value, str):
-        raise TypeError(f"{what} must be a str, got {type(value).__name__}")
+        return TypeError(f"{what} must be a str, got {type(value).__name__}")
     if not value.strip():
-        raise ValueError(f"{what} must be non-blank")
+        return ValueError(f"{what} must be non-blank")
     if not _SECRET_TEXT.fullmatch(value):
-        raise ValueError(f"{what} must be printable ASCII without leading or trailing whitespace")
-    return value
+        return ValueError(f"{what} must be printable ASCII without leading or trailing whitespace")
+    return None
 
 
 class _Secret:
@@ -766,7 +814,11 @@ class _Secret:
     __slots__ = ("_value",)
 
     def __init__(self, value: str) -> None:
-        self._value = _check_secret_text(value, what="a secret")
+        problem = _secret_problem(value, what="a secret")
+        if problem is not None:
+            del value  # the frame that raises holds no key text (module notes, 5)
+            raise problem
+        self._value = value
 
     def reveal(self) -> str:
         """Return the key, for the one header that sends it."""
@@ -790,7 +842,9 @@ class _Secret:
             TypeError: If ``text`` is not a ``str``.
         """
         if not isinstance(text, str):
-            raise TypeError(f"text must be a str, got {type(text).__name__}")
+            kind = type(text).__name__
+            del text  # it may hold the key (an echo): the frame that raises holds none of it
+            raise TypeError(f"text must be a str, got {kind}")
         words = self._value.split()
         for word in sorted({self._value, *(words[1:] if len(words) > 1 else words)}, key=len, reverse=True):
             text = text.replace(word, "<secret>")
@@ -825,9 +879,11 @@ def api_key_from_env(var: str) -> _Secret | None:
     value = os.environ.get(var)
     if value is None or not value.strip():
         return None
-    if not _SECRET_TEXT.fullmatch(value):
+    key = _Secret(value) if _secret_problem(value, what="an API key") is None else None
+    del value  # the frame that raises holds no key text (module notes, 5)
+    if key is None:
         raise RationalizationError(
             f"the {var} environment variable holds no valid API key: it must be printable ASCII without leading or "
             "trailing whitespace (a newline included)"
         )
-    return _Secret(value)
+    return key

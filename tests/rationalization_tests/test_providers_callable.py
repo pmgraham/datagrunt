@@ -1,10 +1,12 @@
 """Tests for ``datagrunt.rationalization.providers.callable``: a caller's own function as a model provider (plan §4.5).
 
-``CallableProvider(model_id, fn)`` is a ``ModelProvider`` of kind ``"callable"`` whose ``generate`` calls
+``CallableProvider(model_id, fn, *, family="unknown")`` is a ``ModelProvider`` of kind ``"callable"`` and the
+family the caller declares, whose ``generate`` calls
 ``fn(request)``: a ``ProviderResponse`` is returned as is, a JSON-object mapping is wrapped as a complete response, and
 anything else is a loud ``TypeError``. Provider errors and every other exception from ``fn`` propagate unchanged.
 ``as_provider`` checks a provider object, wraps a bare callable under the id ``callable:<module>.<qualname>``, and
-refuses a bare callable when a persistent cache would key on that unstable id.
+refuses a bare callable when a persistent cache would key on that unstable id. A bare callable's family is
+``"unknown"``.
 """
 
 import ast
@@ -21,6 +23,7 @@ from datagrunt.rationalization._canonical import canonical_json
 from datagrunt.rationalization.providers import callable as callable_module
 from datagrunt.rationalization.providers.base import (
     IDENTITY_MAX_CHARS,
+    UNKNOWN_FAMILY,
     ModelProvider,
     PermanentProviderError,
     TransientProviderError,
@@ -112,6 +115,46 @@ def test_a_model_id_of_the_limit_is_accepted():
 def test_a_function_that_is_not_callable_is_a_type_error(fn):
     with pytest.raises(TypeError, match="fn"):
         CallableProvider("mine", fn)  # type: ignore[arg-type]
+
+
+def test_its_family_is_unknown_unless_declared():
+    provider = CallableProvider("mine", answer)
+
+    assert provider.model_family == UNKNOWN_FAMILY == "unknown"
+
+
+@pytest.mark.parametrize("family", ["google", "anthropic", "meta", "qwen", "x" * 32, "a-1"])
+def test_a_declared_family_is_kept_and_passes_the_preflight_check(family):
+    provider = CallableProvider("mine", answer, family=family)
+
+    assert provider.model_family == family
+    assert check_provider(provider) is provider
+
+
+def test_the_family_is_keyword_only():
+    with pytest.raises(TypeError):
+        CallableProvider("mine", answer, "meta")  # type: ignore[misc]
+
+
+class Lineage(str):
+    """A str subclass: a family must be exactly a str."""
+
+
+@pytest.mark.parametrize("family", [None, 1, b"zorgle", Lineage("zorgle")])
+def test_a_family_that_is_not_exactly_a_str_is_a_type_error_never_quoting_it(family):
+    with pytest.raises(TypeError, match="family") as caught:
+        CallableProvider("mine", answer, family=family)  # type: ignore[arg-type]
+
+    assert "zorgle" not in str(caught.value)
+
+
+@pytest.mark.parametrize("family", ["", "Zorgle", "zorgle probe", "zorgle_x", "zörgle", "zorgle\n", "z" * 33])
+def test_a_family_that_breaks_the_rule_is_a_value_error_never_quoting_it(family):
+    with pytest.raises(ValueError, match="family") as caught:
+        CallableProvider("mine", answer, family=family)
+
+    assert "orgle" not in str(caught.value)
+    assert "z" * 33 not in str(caught.value)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -222,6 +265,7 @@ class ObjectProvider:
     model_id = "custom:m"
     provider_kind = "custom"
     rate_key = "custom"
+    model_family = "mistral"
     generation_params = {"temperature": 0.0}
 
     def transform_schema(self, schema):
@@ -271,6 +315,27 @@ def test_a_bare_function_is_wrapped_under_its_module_and_qualname():
     assert provider.model_id == f"callable:{answer.__module__}.answer"
     assert provider.rate_key == f"callable:callable:{answer.__module__}.answer"
     assert provider.generate(REQUEST).content == answer(REQUEST)
+
+
+@pytest.mark.parametrize(
+    "bare", [answer, Answerer(), functools.partial(answer)], ids=["function", "instance", "partial"]
+)
+def test_a_bare_callable_has_the_unknown_family(bare):
+    assert as_provider(bare, persistent_cache=False).model_family == UNKNOWN_FAMILY
+
+
+def test_a_provider_object_keeps_its_own_family():
+    assert as_provider(ObjectProvider(), persistent_cache=False).model_family == "mistral"
+
+
+def test_a_provider_object_with_a_bad_family_is_refused_naming_it():
+    provider = ObjectProvider()
+    provider.model_family = "Mistral AI"
+
+    with pytest.raises(RationalizationError, match="model_family") as caught:
+        as_provider(provider, persistent_cache=False)
+
+    assert "Mistral AI" not in str(caught.value)
 
 
 def test_a_nested_function_keeps_its_qualname():

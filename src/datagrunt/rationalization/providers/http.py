@@ -50,12 +50,17 @@ client loses nothing.
    deflate stream (no zlib header) and a gzip body of several members do not decode, and are refused as such.
 6. **Statuses.** 2xx is an :class:`HttpReply`: ``json`` the body when it is a strict JSON object (UTF-8, no NaN, no
    infinity or overflowing number, no repeated key), else ``None``; ``text`` the body decoded as UTF-8 with errors
-   replaced. 408, 429, 500, 502, 503 and 504 are a
+   replaced. The statuses of :data:`TRANSIENT_STATUSES`, an explicit allow-list, are a
    :class:`~datagrunt.rationalization.providers.base.TransientProviderError` with the wait from ``Retry-After``
    (seconds, or an HTTP date relative to now, never negative) or else ``x-ratelimit-reset-requests`` (``1s``,
    ``6m0s``, ``250ms``), not capped here (the runner caps it at 30 s), and stay transient even when their body is
-   too long or does not decode. Every other status is a
-   :class:`~datagrunt.rationalization.providers.base.PermanentProviderError`.
+   too long or does not decode: 408 (request timeout), 429 (rate limited), 500, 502, 503 and 504 (a server or
+   gateway that may answer next time), 520-524 (Cloudflare, which fronts many endpoints, reporting an origin that
+   failed, refused, timed out or is unreachable) and 529 (Anthropic's "overloaded", sent under load, so one
+   overload never stops a whole run). Every other status is a
+   :class:`~datagrunt.rationalization.providers.base.PermanentProviderError`, since a retry would only repeat it:
+   every other 4xx, and 501 (not implemented), 505-511 (version, negotiation, storage, loop, extension and network
+   authentication failures) and the rest of 5xx.
 7. **Transport failures** are named from a fixed vocabulary, never the exception's message (which can hold the URL
    or a header): "TLS certificate verification failed" is permanent; "DNS resolution failed", "connection
    refused", "connection reset", the four timeouts, "proxy error" and the like are transient. Provider errors are
@@ -119,8 +124,8 @@ from datagrunt.rationalization.providers.base import (
 RESPONSE_MAX_BYTES = 8 * 1024 * 1024
 """The most bytes of a response body that are read, on the wire and decoded (plan §5)."""
 
-TRANSIENT_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
-"""The HTTP statuses worth a retry."""
+TRANSIENT_STATUSES = frozenset({408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529})
+"""The HTTP statuses worth a retry, an explicit allow-list (module notes, 6); every other 4xx and 5xx is permanent."""
 
 CONNECT_TIMEOUT_S = 10.0
 WRITE_TIMEOUT_S = 15.0

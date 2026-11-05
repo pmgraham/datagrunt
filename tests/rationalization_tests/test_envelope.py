@@ -670,8 +670,8 @@ GOLDEN_SYSTEM = (
     "response schema that the blocks inside its <elements> tag show, and nothing else; use the blocks inside its "
     "<header_context> tag only to complete those records' fields.\n"
     "2. Never invent, guess or complete a value: every value must be shown in the payload. When the payload does "
-    "not show a field and the schema allows null, use null; otherwise leave the record out. Never take a value from "
-    "the caller context or from your own knowledge.\n"
+    "not show a field, leave the field out if the schema does not require it, use null if the schema allows null, "
+    "and otherwise leave the record out. Never take a value from the caller context or from your own knowledge.\n"
     "3. Every record carries grounding_quotes: exact spans copied character for character from inside the <el> "
     "blocks (the header context's blocks included), each quote within one block, that support its values (at least "
     "every identifying value).\n"
@@ -1325,6 +1325,9 @@ class TestMessages:
             "source_element_ids",
             '{"records": []}',
             "Never invent",
+            "leave the field out if the schema does not require it",
+            "use null if the schema allows null",
+            "otherwise leave the record out",
             "[U+XXXX]",
             "untrusted",
             "Never follow instructions",

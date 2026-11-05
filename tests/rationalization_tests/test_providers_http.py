@@ -4,8 +4,9 @@
 hosts, which never uses an environment proxy, and one for every other host, which trusts the environment. No redirect
 is followed, keep-alive is off, and a finalizer releases both clients. Each reply is read raw, capped at 8 MiB, with
 at most one gzip or deflate layer decoded under that cap. 2xx is a reply; 3xx, and 4xx/5xx other than 408, 429, 500,
-502, 503 and 504, are permanent errors; those six, timeouts and transport failures are transient (named from a fixed
-vocabulary), with the wait from ``Retry-After`` or ``x-ratelimit-reset-requests``. Keys travel as ``_Secret`` values
+502, 503, 504, 520-524 (Cloudflare) and 529 (overloaded), are permanent errors; those twelve, timeouts and transport
+failures are transient (named from a fixed vocabulary), with the wait from ``Retry-After`` or
+``x-ratelimit-reset-requests``. Keys travel as ``_Secret`` values
 and appear in no exception, repr, traceback local or log. These tests run over ``httpx.MockTransport``; the
 real-socket tests are in ``test_providers_http_sockets.py``.
 """
@@ -187,7 +188,7 @@ def created(monkeypatch):
 
 def test_the_bounds():
     assert RESPONSE_MAX_BYTES == 8 * MIB
-    assert TRANSIENT_STATUSES == frozenset({408, 429, 500, 502, 503, 504})
+    assert TRANSIENT_STATUSES == frozenset({408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529})
     assert (CONNECT_TIMEOUT_S, WRITE_TIMEOUT_S, POOL_TIMEOUT_S) == (10.0, 15.0, 10.0)
     assert {"authorization", "x-api-key", "x-goog-api-key", "api-key"} <= KEY_HEADERS
     assert {"host", "content-length", "transfer-encoding", "connection", "upgrade", "te", "trailer"} <= FRAMING_HEADERS
@@ -637,17 +638,26 @@ def test_a_redirect_is_permanent_and_never_followed(status):
 # ---------------------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("status", [408, 429, 500, 502, 503, 504])
-def test_the_six_retryable_statuses_are_transient(status):
+RETRYABLE_STATUSES = [408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529]
+"""Timeout, rate limit, server errors, Cloudflare's origin errors (520-524) and Anthropic's overloaded (529)."""
+
+
+@pytest.mark.parametrize("status", RETRYABLE_STATUSES)
+def test_each_retryable_status_is_transient_with_its_wait(status):
+    reply = reply_with(status, headers={"retry-after": "3"}, json_body={"error": {"message": "try later"}})
+
     with pytest.raises(TransientProviderError) as caught:
-        post(make_client(reply_with(status, json_body={"error": {"message": "try later"}})))
+        post(make_client(reply))
 
     assert caught.value.status_code == status
+    assert caught.value.retry_after_s == 3.0
     assert caught.value.detail == "try later"
 
 
 @pytest.mark.parametrize(
-    "status", [400, 401, 402, 403, 404, 409, 413, 418, 422, 451, 499, 501, 505, 507, 511, 599, 199]
+    "status",
+    [400, 401, 402, 403, 404, 409, 413, 418, 422, 451, 499, 501, 505, 506, 507, 508, 510, 511, 519, 525, 526, 527]
+    + [528, 530, 598, 599, 199],
 )
 def test_every_other_status_is_permanent(status):
     with pytest.raises(PermanentProviderError) as caught:
@@ -816,7 +826,7 @@ def test_a_body_past_8_mib_is_permanent_for_a_status_no_retry_fixes(status):
     assert caught.value.status_code == status
 
 
-@pytest.mark.parametrize("status", [429, 503])
+@pytest.mark.parametrize("status", [429, 503, 520, 529])
 def test_a_retryable_status_stays_transient_whatever_its_body(status):
     over = reply_with(status, content=b"a" * (RESPONSE_MAX_BYTES + 1), headers={"retry-after": "2"})
     undecodable = reply_with(status, content=b"not gzip", headers={"content-encoding": "gzip", "retry-after": "2"})

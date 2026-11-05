@@ -1,6 +1,7 @@
 """Tests for ``datagrunt.rationalization.providers.base``: the protocol and what every adapter shares (plan §4.5).
 
-A provider is any object with the six ``ModelProvider`` members; ``check_provider`` checks one at preflight. Provider
+A provider is any object with the seven ``ModelProvider`` members (``model_family`` its vendor lineage, or
+``"unknown"``); ``check_provider`` checks one at preflight. Provider
 failures are ``TransientProviderError`` (worth a retry) or ``PermanentProviderError``, both ``ProviderError``s with a
 bounded, one-line ``detail``, and both picklable. A model string must name its provider (R3: a guess decides which
 vendor receives the documents); ``check_endpoint`` allows ``https`` anywhere and ``http`` only on loopback unless
@@ -14,6 +15,7 @@ import json
 import pickle
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 from unittest import mock
 from urllib.parse import urlsplit
@@ -34,6 +36,7 @@ from datagrunt.rationalization.providers.base import (
     OPENAI_BASE_URL,
     PROVIDER_KINDS,
     PROVIDER_MEMBERS,
+    UNKNOWN_FAMILY,
     URL_MAX_CHARS,
     ModelProvider,
     ModelString,
@@ -48,6 +51,7 @@ from datagrunt.rationalization.providers.base import (
     check_path_segment,
     check_provider,
     endpoint_model_id,
+    family_problem,
     identity_problem,
     is_loopback_endpoint,
     parse_model_string,
@@ -1161,6 +1165,92 @@ def test_the_variable_name_must_be_a_non_blank_str(var):
         api_key_from_env(var)  # type: ignore[arg-type]
 
 
+PROBE = "probe-KEY-7f3a"
+"""The text of a key that must never reach a traceback local."""
+
+
+def traceback_text(error):
+    """The error's traceback with the locals of datagrunt's frames, as a log with ``capture_locals`` prints them.
+
+    The test's own frame is left out: it is the caller, which holds what it passed.
+    """
+    summary = traceback.TracebackException.from_exception(error, capture_locals=True)
+    frames = [frame for frame in summary.stack if "datagrunt/rationalization" in frame.filename.replace("\\", "/")]
+    assert frames, "vacuous: no datagrunt frame on the traceback"
+    return "".join(f"{frame.name}: {frame.locals}\n" for frame in frames) + "".join(summary.format_exception_only())
+
+
+def assert_secret_free(error):
+    """No key text in the error's traceback locals, text or repr, and no chained exception that could hold it."""
+    for text in (traceback_text(error), str(error), repr(error)):
+        assert PROBE not in text
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "value", [f"AIza-{PROBE}\n", f" sk-{PROBE}", f"sk-{PROBE}é", f"sk-{PROBE}\x7f", f"sk-{PROBE}\r\n"]
+)
+def test_an_invalid_key_in_the_environment_never_reaches_a_traceback_local(monkeypatch, value):
+    monkeypatch.setenv("DATAGRUNT_TEST_KEY", value)
+
+    with pytest.raises(RationalizationError, match="DATAGRUNT_TEST_KEY") as caught:
+        api_key_from_env("DATAGRUNT_TEST_KEY")
+
+    assert_secret_free(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [
+        (f"sk-{PROBE}\n", ValueError),
+        (f" sk-{PROBE}", ValueError),
+        (f"sk-{PROBE}é", ValueError),
+        (f"sk-{PROBE}\x7f", ValueError),
+        (f"sk-{PROBE}".encode(), TypeError),
+        (bytearray(f"sk-{PROBE}".encode()), TypeError),
+    ],
+)
+def test_a_refused_secret_never_reaches_a_traceback_local(value, error):
+    with pytest.raises(error) as caught:
+        _Secret(value)
+
+    assert_secret_free(caught.value)
+
+
+@pytest.mark.parametrize("prefix", ["Bearer\r\n", "Béarer ", " Bearer ", "Bearer\x00"])
+def test_a_refused_prefixed_secret_never_reaches_a_traceback_local(prefix):
+    with pytest.raises(ValueError) as caught:
+        _Secret(f"sk-{PROBE}").prefixed(prefix)
+
+    assert_secret_free(caught.value)
+
+
+def test_redacting_a_non_str_never_puts_what_it_holds_in_a_traceback_local():
+    with pytest.raises(TypeError) as caught:
+        _Secret("sk-x").redact(f"echo sk-{PROBE}".encode())  # type: ignore[arg-type]
+
+    assert_secret_free(caught.value)
+
+
+@pytest.mark.parametrize(
+    "act",
+    [
+        lambda secret: pickle.dumps(secret),
+        copy.copy,
+        copy.deepcopy,
+        lambda secret: secret.__getstate__(),
+        lambda secret: secret.prefixed(1),
+    ],
+    ids=["pickle", "copy", "deepcopy", "getstate", "non-str-prefix"],
+)
+def test_every_other_refusal_of_a_secret_holds_no_key_text(act):
+    with pytest.raises(TypeError) as caught:
+        act(_Secret(f"sk-{PROBE}"))
+
+    assert_secret_free(caught.value)
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # ModelProvider and check_provider
 # ---------------------------------------------------------------------------------------------------------------
@@ -1177,6 +1267,7 @@ class AttributeProvider:
         self.model_id = "fake:model@https://gw.example/v1"
         self.provider_kind = "fake"
         self.rate_key = "fake:https://gw.example/v1"
+        self.model_family = "google"
         self.generation_params = {"temperature": 0.0, "seed": 0}
         for name, value in overrides.items():
             setattr(self, name, value)
@@ -1204,6 +1295,10 @@ class PropertyProvider:
         return "fake"
 
     @property
+    def model_family(self):
+        return "unknown"
+
+    @property
     def generation_params(self):
         return {}
 
@@ -1214,11 +1309,12 @@ class PropertyProvider:
         return RESPONSE
 
 
-def test_the_members_are_the_six_of_the_protocol():
+def test_the_members_are_the_seven_of_the_protocol():
     assert PROVIDER_MEMBERS == (
         "model_id",
         "provider_kind",
         "rate_key",
+        "model_family",
         "generation_params",
         "transform_schema",
         "generate",
@@ -1267,6 +1363,68 @@ def test_an_identity_of_the_limit_passes(member):
     assert check_provider(provider) is provider
 
 
+class Lineage(str):
+    """A str subclass: a family must be exactly a str."""
+
+
+def test_the_unknown_family_is_unknown_and_valid():
+    assert UNKNOWN_FAMILY == "unknown"
+    assert family_problem(UNKNOWN_FAMILY) is None
+
+
+@pytest.mark.parametrize(
+    "value", ["google", "anthropic", "openai", "meta", "mistral", "deepseek", "qwen", "x" * 32, "a-1", "-", "0"]
+)
+def test_a_family_of_lower_case_letters_digits_and_hyphens_passes(value):
+    assert family_problem(value) is None
+    provider = AttributeProvider(model_family=value)
+
+    assert check_provider(provider) is provider
+
+
+BAD_FAMILIES = [
+    1,
+    None,
+    b"zorgleprobe",
+    Lineage("zorgleprobe"),
+    "",
+    "x" * 33,
+    "Zorgleprobe",
+    "zorgle probe",
+    "zorgleprobe\n",
+    "zorgle_probe",
+    "zorgle.probe",
+    "zorgle/probe",
+    "zörgleprobe",
+    "zorgleprobe\u200b",
+    "ｚorgleprobe",
+]
+
+
+@pytest.mark.parametrize("value", BAD_FAMILIES)
+def test_family_problem_refuses_anything_but_1_to_32_of_a_z_0_9_and_hyphen_never_quoting_it(value):
+    problem = family_problem(value)
+
+    assert isinstance(problem, str)
+    assert "orgle" not in problem
+
+
+@pytest.mark.parametrize("value", BAD_FAMILIES)
+def test_a_bad_family_is_refused_naming_the_member_never_its_value(value):
+    with pytest.raises(RationalizationError, match="model_family") as caught:
+        check_provider(AttributeProvider(model_family=value))
+
+    assert "orgle" not in str(caught.value)
+
+
+def test_family_problem_names_what_a_family_must_be():
+    assert family_problem(1) == "must be exactly a str, got int"
+    assert family_problem(Lineage("google")) == "must be exactly a str, got Lineage"
+    assert family_problem("Google") == (
+        "must be 1-32 of a-z, 0-9 and '-': the model's vendor lineage (google, anthropic, openai, meta, ...) or unknown"
+    )
+
+
 @pytest.mark.parametrize(
     "params", [[], "temperature=0", None, {1: "x"}, {"t": float("nan")}, {"t": (1, 2)}, {"t": {1, 2}}, {"t": object()}]
 )
@@ -1285,7 +1443,7 @@ class DynamicProvider:
     """Answers every member through __getattr__."""
 
     def __getattr__(self, name):
-        if name in ("model_id", "provider_kind", "rate_key"):
+        if name in ("model_id", "provider_kind", "rate_key", "model_family"):
             return "x"
         if name == "generation_params":
             return {}
@@ -1316,7 +1474,16 @@ class RaisingParams(PropertyProvider):
         raise KeyError("sk-hunter2")
 
 
-@pytest.mark.parametrize(("cls", "member"), [(RaisingProvider, "model_id"), (RaisingParams, "generation_params")])
+class RaisingFamily(PropertyProvider):
+    @property
+    def model_family(self):
+        raise LookupError("family lookup failed: sk-hunter2")
+
+
+@pytest.mark.parametrize(
+    ("cls", "member"),
+    [(RaisingProvider, "model_id"), (RaisingParams, "generation_params"), (RaisingFamily, "model_family")],
+)
 def test_a_property_that_raises_is_refused_naming_it_without_its_message(cls, member):
     with pytest.raises(RationalizationError, match=member) as caught:
         check_provider(cls())
