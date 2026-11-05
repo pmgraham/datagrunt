@@ -59,7 +59,14 @@ PAYLOAD = (
     '<document>doc</document>\n<scope></scope>\n<elements>\n<el id="p0001_e000" kind="paragraph" page="1">\n'
     "Body\n</el>\n</elements>"
 )
-ENVELOPE = Envelope(unit_id="doc:p0001_e000-p0001_e000", prompt="Extract parts.", context_json="null", payload=PAYLOAD)
+SCHEMA_JSON = '{"properties":{"records":{"type":"array"}},"required":["records"],"type":"object"}'
+ENVELOPE = Envelope(
+    unit_id="doc:p0001_e000-p0001_e000",
+    prompt="Extract parts.",
+    context_json="null",
+    payload=PAYLOAD,
+    schema_json=SCHEMA_JSON,
+)
 KEY_ARGS = {
     "provider_kind": "anthropic",
     "model_id": "anthropic:claude-x",
@@ -210,7 +217,11 @@ class TestRequestKey:
         first = ENVELOPE.render(NONCES[0])
         second = ENVELOPE.render(NONCES[1])
         rebuilt = Envelope(
-            unit_id=ENVELOPE.unit_id, prompt=ENVELOPE.prompt, context_json=ENVELOPE.context_json, payload=PAYLOAD
+            unit_id=ENVELOPE.unit_id,
+            prompt=ENVELOPE.prompt,
+            context_json=ENVELOPE.context_json,
+            payload=PAYLOAD,
+            schema_json=SCHEMA_JSON,
         )
 
         assert first != second
@@ -252,12 +263,14 @@ class TestRequestKey:
             ("envelope_format", "datagrunt.rationalize/2"),
             ("unit_id", "doc:p0001_e000-p0001_e001"),
             ("system_rules", "other rules"),
+            ("schema_lead", "\n\nThe schema:\n"),
             ("directive", ("a", "b", "c", "d", "e")),
             ("user_layout", ("<a_", ">\n", "\n</a_", ">\n<b_", ">\n", "\n</b_", ">")),
             ("header_element_ids", ("p0001_e009",)),
             ("prompt", "Extract parts!"),
             ("context_json", '{"a":1}'),
             ("payload", PAYLOAD + "\n"),
+            ("schema_json", '{"properties":{"records":{"type":"array"}},"type":"object"}'),
         ],
     )
     def test_changes_with_each_envelope_component(self, name, value):
@@ -272,10 +285,12 @@ class TestRequestKey:
             "format",
             "unit_id",
             "system_rules",
+            "schema_lead",
             "directive",
             "user_layout",
             "header_element_ids",
             "prompt",
+            "schema",
             "context",
             "payload",
         }
@@ -310,7 +325,11 @@ class TestRequestKey:
             from datagrunt.rationalization.envelope import Envelope
 
             envelope = Envelope(
-                unit_id={ENVELOPE.unit_id!r}, prompt={ENVELOPE.prompt!r}, context_json="null", payload={PAYLOAD!r}
+                unit_id={ENVELOPE.unit_id!r},
+                prompt={ENVELOPE.prompt!r},
+                context_json="null",
+                payload={PAYLOAD!r},
+                schema_json={SCHEMA_JSON!r},
             )
             print(request_key(
                 provider_kind={KEY_ARGS["provider_kind"]!r},

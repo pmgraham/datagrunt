@@ -53,17 +53,24 @@ document is never changed (invariant 2): everything below applies to the copy th
    the original's rows: units come from :func:`~datagrunt.rationalization.units.build_units`, which cuts them from
    it, and checking them would cost each part its whole table.
 4. **Messages** (:meth:`Envelope.render`). The system message is :data:`SYSTEM_RULES`, then the caller's prompt
-   verbatim (it is trusted), then the directive naming this request's tags. The user message follows the user
-   layout: ``<caller_context_<nonce>>``, the caller's context as canonical JSON (sorted keys, compact, not
-   ASCII-escaped but for ``<``, ``>`` and ``&`` as ``\\u003c``, ``\\u003e`` and ``\\u0026``, no NaN,
-   :func:`escape`-d, ``null`` when there is none, at most :data:`CONTEXT_MAX_BYTES` in UTF-8, refused while it is
-   serialized once it passes), ``</caller_context_<nonce>>``, then ``<document_payload_<nonce>>``, the payload and
-   ``</document_payload_<nonce>>``, each on its own line. The nonce is 32 lowercase hex characters
-   (:func:`new_nonce`: 128 random bits) and may appear in no component, so it appears only in tag names.
+   verbatim (it is trusted), then the response schema, then the directive naming this request's tags. The schema is
+   a fixed lead-in line, ``The response schema, as JSON:``, and the response wrapper's canonical JSON (the
+   ``PreparedSchema.wrapper_json`` the API passes: sorted keys, compact separators, unescaped). It is always sent,
+   so a model on a route that does not enforce the schema server-side still sees the field names. It is trusted data
+   from the caller's model, outside both nonce'd blocks, so a schema text that spells a tag cannot open or close a
+   block. It must be exactly a JSON object's canonical JSON, without an R8 code point, in at most
+   :data:`SCHEMA_MAX_BYTES` of UTF-8 (:func:`build_envelopes` refuses another one before any work). The user
+   message follows the user layout: ``<caller_context_<nonce>>``, the caller's context as canonical JSON (sorted
+   keys, compact, not ASCII-escaped but for ``<``, ``>`` and ``&`` as ``\\u003c``, ``\\u003e`` and ``\\u0026``, no
+   NaN, :func:`escape`-d, ``null`` when there is none, at most :data:`CONTEXT_MAX_BYTES` in UTF-8, refused while it
+   is serialized once it passes), ``</caller_context_<nonce>>``, then ``<document_payload_<nonce>>``, the payload
+   and ``</document_payload_<nonce>>``, each on its own line. The nonce is 32 lowercase hex characters
+   (:func:`new_nonce`: 128 random bits) and may appear in no component (the schema included), so it appears only in
+   tag names.
 5. **Components.** Messages are assembled by concatenating fixed pieces with the components, never by a string
    replace or ``format`` over text that holds document text, which could hold a placeholder. The cache key's
-   material is the components alone (the header ids included, which :class:`Envelope` ties to its payload), so it
-   never depends on the nonce.
+   material is the components alone (the header ids included, which :class:`Envelope` ties to its payload, and the
+   schema with its lead-in), so it never depends on the nonce.
 
 **What the envelope guarantees, and what it does not.** Document text can never put an unescaped ``<``, ``>`` or
 ``&`` into the payload, so it can neither open nor close an ``<el>`` block, nor close either nonce'd block, even
@@ -73,7 +80,8 @@ make a model ignore instructions written in a document's visible text. The real 
 downstream: the model answers only JSON of the response schema (no tools), and local validation, grounding and
 consensus send what a manipulated answer holds to ``needs_review``.
 
-Bounds: the context is at most :data:`CONTEXT_MAX_BYTES` as sent, the header-context copy at most
+Bounds: the context is at most :data:`CONTEXT_MAX_BYTES` as sent, the schema at most :data:`SCHEMA_MAX_BYTES`
+(parsed once per :func:`build_envelopes` call and once per envelope it checks), the header-context copy at most
 :data:`HEADER_CONTEXT_MAX_CHARS` characters (plus its note), and everything else is linear in what the unit holds
 (a header copy reads at most the blocks it shows, the unit's own and one more), plus one pass over the document's
 elements and header context per :func:`build_envelopes` call. Nothing here recurses (the JSON encoder does,
@@ -92,6 +100,7 @@ from dataclasses import dataclass, field
 from typing import Literal, TypeAlias, get_args
 
 from datagrunt.pdf.elements import BulletList, DocumentElement, Figure, Heading, KeyValue, Paragraph, PDFDocument, Table
+from datagrunt.rationalization._canonical import canonical_json, strict_loads
 from datagrunt.rationalization.exceptions import RationalizationError
 from datagrunt.rationalization.units import BLOCK_SEPARATOR, PartOf, Unit
 
@@ -112,13 +121,16 @@ CONTEXT_MAX_BYTES = 64 * 1024
 HEADER_CONTEXT_MAX_CHARS = 4_096
 """The most characters of header-context blocks one payload copies (the line breaks between them included)."""
 
+SCHEMA_MAX_BYTES = 1024 * 1024
+"""The most UTF-8 bytes the response schema's JSON may take in the system message."""
+
 SYSTEM_RULES = (
     f"You extract structured records from one part of a document, for datagrunt ({ENVELOPE_FORMAT}).\n"
     "\n"
     "Rules:\n"
     "1. Read the document only from the document payload block of the user message. Return every record of the "
-    "response schema that the blocks inside its <elements> tag show, and nothing else; use the blocks inside its "
-    "<header_context> tag only to complete those records' fields.\n"
+    "response schema (given below) that the blocks inside its <elements> tag show, and nothing else; use the blocks "
+    "inside its <header_context> tag only to complete those records' fields.\n"
     "2. Never invent, guess or complete a value: every value must be shown in the payload. When the payload does "
     "not show a field, leave the field out if the schema does not require it, use null if the schema allows null, "
     "and otherwise leave the record out. Never take a value from the caller context or from your own knowledge.\n"
@@ -145,6 +157,9 @@ SYSTEM_RULES = (
     "\n"
 )
 """The fixed rules that open every system message; the caller's prompt follows them."""
+
+_SCHEMA_LEAD = "\n\nThe response schema, as JSON:\n"
+"""What stands between the caller's prompt and the response schema's JSON in the system message."""
 
 _DIRECTIVE: tuple[str, ...] = (
     "\n\nThis request's two blocks are delimited by these exact tags, which carry a random value:\n<caller_context_",
@@ -496,6 +511,44 @@ def _check_component(name: str, value: object) -> str:
     return value
 
 
+def _schema_json_problem(text: str) -> str | None:
+    """What keeps ``text`` from being a JSON object exactly as canonical JSON writes it, or ``None``."""
+    try:
+        parsed = strict_loads(text)
+    except (ValueError, RecursionError) as exc:
+        return f"schema_json is not JSON ({type(exc).__name__})"
+    if not isinstance(parsed, dict):
+        return f"schema_json must be a JSON object, got {type(parsed).__name__}"
+    try:
+        exact = canonical_json(parsed, subject="schema_json") == text
+    except RationalizationError:  # it nests past what the encoder can write back
+        exact = False
+    if not exact:
+        return "schema_json must be canonical JSON (sorted keys, compact separators, unescaped), as the API writes it"
+    return None
+
+
+def _schema_problem(text: str) -> str | None:
+    """What keeps ``text`` from being the response schema the system message carries (module notes, 4), or ``None``.
+
+    It is a JSON object written as canonical JSON, without an R8 code point, in at most :data:`SCHEMA_MAX_BYTES` of
+    UTF-8. No message quotes the text.
+    """
+    if not text.strip():
+        return "schema_json must be non-blank"
+    if len(text) > SCHEMA_MAX_BYTES:  # each character takes at least one byte
+        return f"schema_json passes {SCHEMA_MAX_BYTES} bytes of UTF-8"
+    found = _ESCAPED.search(text)
+    if found is not None:
+        return (
+            f"schema_json holds U+{ord(found.group(0)[0]):04X}, a code point R8 escapes: remove it from the schema's "
+            "text (a description, a title, an enum value)"
+        )
+    if len(text.encode("utf-8")) > SCHEMA_MAX_BYTES:  # no lone surrogate is left: R8 covers them
+        return f"schema_json passes {SCHEMA_MAX_BYTES} bytes of UTF-8"
+    return _schema_json_problem(text)
+
+
 def _header_block_ids(payload: str) -> tuple[str, ...]:
     """The ids of the ``<el>`` blocks inside the payload's ``<header_context>`` tag, in order (none without one)."""
     lines = payload.split("\n")
@@ -530,6 +583,8 @@ class Envelope:
         prompt: The caller's prompt, verbatim.
         context_json: The caller's context as sent: canonical JSON, escaped (``"null"`` for none).
         payload: The framing and the unit's blocks.
+        schema_json: The response wrapper's canonical JSON (module notes, 4): exactly a JSON object as canonical JSON
+            writes it, without an R8 code point, at most :data:`SCHEMA_MAX_BYTES` of UTF-8.
         header_element_ids: The ids of the header-context blocks the payload shows, in order (they can be cited,
             so grounding reads them too): exactly those of the ``<el>`` blocks inside its ``<header_context>`` tag,
             none of them opening another block of it.
@@ -537,6 +592,7 @@ class Envelope:
     Attributes:
         envelope_format: :data:`ENVELOPE_FORMAT`.
         system_rules: :data:`SYSTEM_RULES`.
+        schema_lead: The fixed text between the prompt and the schema (``_SCHEMA_LEAD``).
         directive: The directive's fixed pieces, between which :meth:`render` puts the nonce.
         user_layout: The user message's fixed pieces (``_USER_LAYOUT``).
 
@@ -545,16 +601,19 @@ class Envelope:
     Raises:
         TypeError: If a component is not a ``str``, or ``header_element_ids`` not a tuple of ``str``.
         ValueError: If a component is blank or not UTF-8-encodable, the payload or context still holds an R8 code
-            point, or the header element ids are not the payload's header-context block ids.
+            point, the schema is not such a JSON object's text, or the header element ids are not the payload's
+            header-context block ids.
     """
 
     unit_id: str
     prompt: str = field(repr=False)
     context_json: str = field(repr=False)
     payload: str = field(repr=False)
+    schema_json: str = field(repr=False)
     header_element_ids: tuple[str, ...] = ()
     envelope_format: str = field(default=ENVELOPE_FORMAT, init=False)
     system_rules: str = field(default=SYSTEM_RULES, init=False, repr=False)
+    schema_lead: str = field(default=_SCHEMA_LEAD, init=False, repr=False)
     directive: tuple[str, ...] = field(default=_DIRECTIVE, init=False, repr=False)
     user_layout: tuple[str, ...] = field(default=_USER_LAYOUT, init=False, repr=False)
 
@@ -566,6 +625,10 @@ class Envelope:
             found = _ESCAPED.search(value)
             if found is not None:
                 raise ValueError(f"{name} holds an unescaped U+{ord(found.group(0)[0]):04X}: escape() it first")
+        _check_component("schema_json", self.schema_json)
+        problem = _schema_problem(self.schema_json)
+        if problem is not None:
+            raise ValueError(problem)
         _check_header_ids(self.header_element_ids, self.payload)
 
     def render(self, nonce: str) -> tuple[str, str]:
@@ -576,10 +639,15 @@ class Envelope:
             ValueError: If it is not 32 lowercase hex characters, or a component already holds it (draw another).
         """
         _check_nonce(nonce)
-        for name, text in (("prompt", self.prompt), ("context", self.context_json), ("payload", self.payload)):
+        for name, text in (
+            ("prompt", self.prompt),
+            ("schema", self.schema_json),
+            ("context", self.context_json),
+            ("payload", self.payload),
+        ):
             if nonce in text:
                 raise ValueError(f"the {name} already holds this nonce: draw a new nonce")
-        system = self.system_rules + self.prompt + nonce.join(self.directive)
+        system = self.system_rules + self.prompt + self.schema_lead + self.schema_json + nonce.join(self.directive)
         layout = self.user_layout
         user = "".join(
             (
@@ -598,10 +666,12 @@ class Envelope:
             "format": self.envelope_format,
             "unit_id": self.unit_id,
             "system_rules": self.system_rules,
+            "schema_lead": self.schema_lead,
             "directive": list(self.directive),
             "user_layout": list(self.user_layout),
             "header_element_ids": list(self.header_element_ids),
             "prompt": self.prompt,
+            "schema": self.schema_json,
             "context": self.context_json,
             "payload": self.payload,
         }
@@ -620,6 +690,16 @@ def _check_prompt(prompt: object) -> str:
             f"prompt must be valid Unicode text: it holds a lone surrogate at {exc.start}"
         ) from exc
     return prompt
+
+
+def _check_schema(schema_json: object) -> str:
+    """Require the response schema's text (:func:`_schema_problem`): a ``TypeError`` for a non-``str``."""
+    if not isinstance(schema_json, str):
+        raise TypeError(f"schema_json must be a str, got {type(schema_json).__name__}")
+    problem = _schema_problem(schema_json)
+    if problem is not None:
+        raise RationalizationError(problem)
+    return schema_json
 
 
 def _json_escape(match: re.Match[str]) -> str:
@@ -695,7 +775,7 @@ def _check_unit(unit: object, frame: _Frame) -> Unit:
 
 
 def build_envelopes(
-    units: Sequence[Unit], document: PDFDocument, *, prompt: str, context: object
+    units: Sequence[Unit], document: PDFDocument, *, prompt: str, context: object, schema_json: str
 ) -> tuple[Envelope, ...]:
     """Build the envelope of each of a document's units, reading the document once.
 
@@ -704,18 +784,21 @@ def build_envelopes(
         document: The document; it is never changed.
         prompt: The caller's prompt, sent verbatim.
         context: The caller's context: any value that serializes to JSON, or ``None``.
+        schema_json: The response wrapper's canonical JSON (``PreparedSchema.wrapper_json``), sent in every system
+            message (module notes, 4).
 
     Returns:
         One envelope per unit, in order.
 
     Raises:
         TypeError: If ``units`` is not a tuple or list of ``Unit``, ``document`` not a ``PDFDocument``, or
-            ``prompt`` not a ``str``.
+            ``prompt`` or ``schema_json`` not a ``str``.
         ValueError: If a unit is of another document, holds an element that is not the document's, has blocks
             that are not :func:`render_element`'s or a scope entry that is no visible heading's text, or a header
             context entry is hidden, off page 1 or not the document's.
-        RationalizationError: If ``prompt`` is blank or not encodable, or ``context`` does not serialize to JSON
-            or is past :data:`CONTEXT_MAX_BYTES`.
+        RationalizationError: If ``prompt`` is blank or not encodable, ``context`` does not serialize to JSON or
+            is past :data:`CONTEXT_MAX_BYTES`, or ``schema_json`` is not a JSON object's canonical JSON, holds an R8
+            code point or is past :data:`SCHEMA_MAX_BYTES`.
     """
     if not isinstance(document, PDFDocument):
         raise TypeError(f"document must be a PDFDocument, got {type(document).__name__}")
@@ -723,6 +806,7 @@ def build_envelopes(
         raise TypeError(f"units must be a tuple or list of Unit, got {type(units).__name__}")
     checked_prompt = _check_prompt(prompt)
     context_json = _context_json(context)
+    checked_schema = _check_schema(schema_json)
     frame = _frame(document)
     envelopes = []
     for unit in units:
@@ -734,13 +818,14 @@ def build_envelopes(
                 prompt=checked_prompt,
                 context_json=context_json,
                 payload=payload,
+                schema_json=checked_schema,
                 header_element_ids=header_ids,
             )
         )
     return tuple(envelopes)
 
 
-def build_envelope(unit: Unit, document: PDFDocument, *, prompt: str, context: object) -> Envelope:
+def build_envelope(unit: Unit, document: PDFDocument, *, prompt: str, context: object, schema_json: str) -> Envelope:
     """Build one unit's envelope (:func:`build_envelopes` for one unit; use that for many).
 
     Raises:
@@ -748,4 +833,4 @@ def build_envelope(unit: Unit, document: PDFDocument, *, prompt: str, context: o
         ValueError: As :func:`build_envelopes`.
         RationalizationError: As :func:`build_envelopes`.
     """
-    return build_envelopes((unit,), document, prompt=prompt, context=context)[0]
+    return build_envelopes((unit,), document, prompt=prompt, context=context, schema_json=schema_json)[0]
