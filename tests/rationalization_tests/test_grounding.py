@@ -1605,6 +1605,20 @@ class TestKeysLieInTheModelsOwnQuotes:
 
         assert reasons(found) == [("key_not_found", G, None, "number"), ("key_not_quoted", G, None, "number")]
 
+    def test_agreeing_models_with_identical_evidence_evaluate_reasons_once(self, monkeypatch):
+        calls: list[str] = []
+        real = grounding_module._key_reasons
+
+        def counting(model_id, *args, **kwargs):
+            calls.append(model_id)
+            return real(model_id, *args, **kwargs)
+
+        monkeypatch.setattr(grounding_module, "_key_reasons", counting)
+        (found,) = both(GOOD, GOOD)
+
+        assert found.grounded
+        assert len(calls) == 1
+
 
 class TestKeysGroundedByQuotesOnly:
     @pytest.mark.parametrize(

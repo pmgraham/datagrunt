@@ -127,7 +127,6 @@ library, pydantic and its sibling modules: nothing from ``datagrunt.core``, and 
 (invariant 9).
 """
 
-import json
 import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -556,7 +555,7 @@ def normalized_text(value: str) -> str:
     """
     if not isinstance(value, str):
         raise TypeError(f"value must be a str, got {type(value).__name__}")
-    return " ".join(unicodedata.normalize("NFC", value).split())
+    return " ".join((value if value.isascii() else unicodedata.normalize("NFC", value)).split())
 
 
 def normalized_key(record: BaseModel, spec: ModelSpec) -> tuple[object, ...]:
@@ -828,7 +827,11 @@ def _validated(wire: object, schema: PreparedSchema) -> BaseModel | str:
 
 def _json_copy(value: object) -> Any:
     """A deep copy of ``value``, exactly JSON (a response's content is, and so is every part of it)."""
-    return json.loads(json.dumps(value))
+    if type(value) is dict:
+        return {key: _json_copy(item) for key, item in value.items()}
+    if type(value) is list:
+        return [_json_copy(item) for item in value]
+    return value
 
 
 def _error_text(error: ValidationError) -> str:
@@ -870,8 +873,13 @@ def _drop_in_node(node: dict[str, Any], spec: ModelSpec) -> list[tuple[dict[str,
     by_name = _reads_by_name(spec.model)
     children: list[tuple[dict[str, Any], ModelSpec]] = []
     for field_spec in spec.fields:
-        names = {field_spec.wire_name, field_spec.name} if by_name else {field_spec.wire_name}
-        for name in sorted(names):
+        if not by_name or field_spec.wire_name == field_spec.name:
+            names: tuple[str, ...] = (field_spec.wire_name,)
+        elif field_spec.wire_name < field_spec.name:
+            names = (field_spec.wire_name, field_spec.name)
+        else:
+            names = (field_spec.name, field_spec.wire_name)
+        for name in names:
             value = node.get(name, _ABSENT)
             if value is None and not field_spec.optional and not field_spec.required:
                 del node[name]
@@ -1224,12 +1232,20 @@ class _Quorum:
     families: tuple[str, ...]
     min_families: int
     must_agree: frozenset[str]
+    all_families_ok: bool = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "all_families_ok", _family_count(range(self.requested), self.families) >= self.min_families
+        )
 
     def agrees(self, supporters: Sequence[int], spec_path: str) -> bool:
         """Whether a winning value's ``supporters`` (model indices) span enough families, and all models if it must."""
+        if len(supporters) == self.requested:
+            return self.all_families_ok
         if _family_count(supporters, self.families) < self.min_families:
             return False
-        return len(supporters) == self.requested or not self._must(spec_path)
+        return not self._must(spec_path)
 
     def _must(self, spec_path: str) -> bool:
         """Whether ``spec_path`` is a ``must_agree`` path or lies under one."""
@@ -1374,9 +1390,19 @@ class _Comparison:
         self, field_spec: FieldSpec, path: str, spec_path: str, values: list[_Entry]
     ) -> _Merged | _NoWinner:
         """Compare a scalar's values, or a list's as normalized sequences: the winner, or no winner."""
+        prefer_wire = not field_spec.required
+        if _same_raw_values(field_spec, values):
+            supporters = [index for index, _, _ in values]
+            wins = self.wins(supporters)
+            if not wins or not self.agreed(supporters, len(values), spec_path):
+                self.disputed.append(path)
+            if not wins:
+                return _NO_WINNER
+            wire, source = _single_wire(values, prefer_wire=prefer_wire)
+            return _Merged(wire, source)
         clusters = _clusters(
             [(index, wire, _normalized_field(field_spec, value)) for index, value, wire in values],
-            prefer_wire=not field_spec.required,
+            prefer_wire=prefer_wire,
         )
         self.split = self.split or len(clusters) > 1
         winner = next((cluster for cluster in clusters if self.wins(cluster.supporters)), None)
@@ -1457,6 +1483,43 @@ def _differ(first: BaseModel, second: BaseModel, spec: ModelSpec) -> bool:
     comparison = _Comparison(voters=2, quorum=None)
     comparison.compare_model(spec, "", "", [(0, first, _ABSENT), (1, second, _ABSENT)], 1)
     return bool(comparison.disputed)
+
+
+def _same_scalar(first: object, second: object) -> bool:
+    """Whether two validated scalars have the exact same type and value (and timezone, for datetime)."""
+    return (
+        type(first) is type(second)
+        and first == second
+        and (not isinstance(first, datetime) or first.tzinfo == cast(datetime, second).tzinfo)
+    )
+
+
+def _same_raw_values(field_spec: FieldSpec, values: list[_Entry]) -> bool:
+    """Whether every entry in ``values`` already holds the same raw scalar or scalar list value."""
+    if field_spec.child is not None:
+        return False
+    if len(values) <= 1:
+        return True
+    first = values[0][1]
+    if field_spec.kind == "scalar":
+        return all(_same_scalar(first, value) for _, value, _ in values[1:])
+    if field_spec.kind == "scalar_list":
+        return all(
+            len(value) == len(first) and all(_same_scalar(a, b) for a, b in zip(first, value))
+            for _, value, _ in values[1:]
+        )
+    return False
+
+
+def _single_wire(values: list[_Entry], *, prefer_wire: bool) -> tuple[object, int]:
+    """The wire value and source index when every entry in ``values`` holds the same value."""
+    first_index, _, first_wire = values[0]
+    wire, source = first_wire, first_index
+    if prefer_wire and wire is _ABSENT:
+        for index, _, entry_wire in values[1:]:
+            if entry_wire is not _ABSENT:
+                return entry_wire, index
+    return wire, source
 
 
 def _clusters(values: Iterable[tuple[int, object, object]], *, prefer_wire: bool = True) -> list[_Cluster]:

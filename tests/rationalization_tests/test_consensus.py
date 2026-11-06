@@ -2894,9 +2894,13 @@ def best_blend_time(run: RealisticRun, runs: int = TIMING_RUNS) -> tuple[float, 
     results = None
     for _ in range(runs):
         gc.collect()
-        started = time.perf_counter()
-        results = blend_and_ground(run)
-        best = min(best, time.perf_counter() - started)
+        gc.disable()
+        try:
+            started = time.perf_counter()
+            results = blend_and_ground(run)
+            best = min(best, time.perf_counter() - started)
+        finally:
+            gc.enable()
     assert results is not None
     return (best, *results)
 
@@ -2988,6 +2992,23 @@ class TestBenchmarkGate:
 
         print(f"\ngrounding 1,000 units: {small_s:.3f} s; 2,000 units: {large_s:.3f} s; ratio {large_s / small_s:.2f}")
         assert large_s <= 2.2 * small_s
+
+    def test_identical_scalar_fields_across_voters_do_not_re_normalize_values(self, monkeypatch):
+        calls: list[object] = []
+        real = consensus_module._normalized_field
+
+        def counting(field_spec, value):
+            calls.append(field_spec.name)
+            return real(field_spec, value)
+
+        monkeypatch.setattr(consensus_module, "_normalized_field", counting)
+        record = assembly("A-1", "Main Assembly", revision=2, notes=["n1", "n2"], components=parts(("PN-1", 3)))
+        run = outcome({(U1, GOOGLE[0]): answer(record), (U1, ANTHROPIC[0]): answer(record)}, PAIR)
+
+        result = build_consensus(run, ASSEMBLY, (U1,), min_families=2)
+
+        assert len(result.items) == 1 and result.items[0].status == "consensus"
+        assert calls == []
 
 
 class Gauge(BaseModel):

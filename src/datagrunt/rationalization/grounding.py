@@ -104,7 +104,7 @@ import sys
 import unicodedata
 from collections import Counter
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from fractions import Fraction
 from typing import Literal, TypeAlias, cast, get_args
@@ -810,13 +810,22 @@ def _item_reasons(
 ) -> tuple[GroundingReason, ...]:
     """Every supporting model's reasons, in model order (module notes, 4)."""
     found: list[GroundingReason] = []
+    seen: dict[tuple[tuple[str, ...], tuple[str, ...]], list[GroundingReason]] = {}
     for model_id, votes in item.model_votes.items():
         if votes:
             element_ids, quotes = item.element_ids_by_model[model_id], item.quotes_by_model[model_id]
+            evidence = (element_ids, quotes)
+            cached = seen.get(evidence)
+            if cached is not None:
+                found.extend(replace(reason, model_id=model_id) for reason in cached)
+                continue
             cited = [element_id for element_id in element_ids if texts.citable(element_id)]
-            found.extend(_cited_reasons(model_id, element_ids, texts))
-            found.extend(_quote_reasons(model_id, quotes, cited, texts, keyless=not checks))
-            found.extend(_key_reasons(model_id, item.key, checks, cited, quotes, texts))
+            own: list[GroundingReason] = []
+            own.extend(_cited_reasons(model_id, element_ids, texts))
+            own.extend(_quote_reasons(model_id, quotes, cited, texts, keyless=not checks))
+            own.extend(_key_reasons(model_id, item.key, checks, cited, quotes, texts))
+            seen[evidence] = own
+            found.extend(own)
     return tuple(found)
 
 

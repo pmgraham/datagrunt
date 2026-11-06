@@ -1719,6 +1719,19 @@ def _value_problems(visit: _Visit, stack: list[_Visit]) -> list[str]:
     field_spec, value, path = visit.field, visit.value, visit.path
     if value is _MISSING:
         return [_at(path, "is missing (the instance was built without it, as model_construct() can)")]
+    if field_spec.child is None and field_spec.kind not in _LIST_KINDS:
+        if value is None:
+            return [] if field_spec.optional else [_at(path, "holds None, but the field is not Optional")]
+        problem = _item_problem(field_spec, value)
+        return [] if problem is None else [_at(path, problem)]
+    if field_spec.child is None:
+        if type(value) is not list:
+            return [_at(path, f"holds {_type_of(value)}, but the field holds a list")]
+        return [
+            _at(f"{path}[{index}]", problem)
+            for index, item in enumerate(value)
+            if (problem := _item_problem(field_spec, item)) is not None
+        ]
     if field_spec.kind in _LIST_KINDS:
         if type(value) is not list:
             return [_at(path, f"holds {_type_of(value)}, but the field holds a list")]
@@ -1745,20 +1758,36 @@ def _child_visits(spec: ModelSpec, item: object, path: str, defaulted: bool | No
     A field the input did not set holds its default; a field the instance lacks holds nothing, so only the default
     that gave the instance (``defaulted``) can be at fault for it.
     """
-    given = _fields_set(item)
+    given: set[str] | frozenset[str] | None = None
     visits: list[_Visit] = []
     for child in spec.fields:
         value = getattr(item, child.name, _MISSING)
-        own_default = value is not _MISSING and child.name not in given
+        if child.child is None and _scalar_field_ok(child, value):
+            continue
+        if given is None and defaulted is not None:
+            given = _fields_set(item)
+        own_default = value is not _MISSING and given is not None and child.name not in given
         child_path = f"{path}.{child.name}" if path else child.name
         visits.append(_Visit(child, value, child_path, None if defaulted is None else defaulted or own_default))
     return visits
 
 
-def _fields_set(instance: object) -> frozenset[str]:
+def _scalar_field_ok(field_spec: FieldSpec, value: object) -> bool:
+    """Whether ``value`` is valid for a scalar or scalar_list field (``field_spec.child is None``)."""
+    if value is _MISSING:
+        return False
+    if field_spec.kind not in _LIST_KINDS:
+        return field_spec.optional if value is None else _item_problem(field_spec, value) is None
+    return type(value) is list and all(_item_problem(field_spec, each) is None for each in value)
+
+
+_EMPTY_FIELDS: frozenset[str] = frozenset()
+
+
+def _fields_set(instance: object) -> set[str] | frozenset[str]:
     """The fields validation (or ``model_construct``) set on ``instance``: the others hold their defaults."""
     found = getattr(instance, "__pydantic_fields_set__", None)
-    return frozenset(found) if isinstance(found, set) else frozenset()
+    return found if isinstance(found, set) else _EMPTY_FIELDS
 
 
 def _item_problem(field_spec: FieldSpec, value: object) -> str | None:
@@ -1768,6 +1797,13 @@ def _item_problem(field_spec: FieldSpec, value: object) -> str | None:
         return None if type(value) is model else f"holds {_type_of(value)}, but the field holds {model.__name__}"
     scalar = field_spec.scalar
     if scalar is None:
+        return None
+    if (
+        type(value) is scalar.base
+        and scalar.enum is None
+        and scalar.literal is None
+        and type(value) in (str, int, bool, date)
+    ):
         return None
     if not _finite(value):
         return f"holds a non-finite {_type_of(value)}"
