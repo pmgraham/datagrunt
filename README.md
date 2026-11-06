@@ -25,6 +25,7 @@ Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow
 - **Parquet Reading & Writing:** Read `.parquet` files into DataFrames, dicts, Arrow tables, or SQL, and export to CSV, JSON, JSONL, Parquet, or Excel. Backed by a single Polars engine with full `read_options`/`write_options` passthrough.
 - **Robust by Default:** Fail-fast validation with clear errors (invalid engine names, missing paths, directories, encrypted PDFs), graceful handling of empty files, no `UnicodeDecodeError` when constructing a reader over a non-UTF-8 file, and sane comment semantics — only leading `#` lines are treated as comments, so `#`-prefixed data rows such as hex colors are preserved on all engines.
 - **PDF Parsing & OCR:** Read PDFs into a typed document of headings, paragraphs, key-value pairs, tables, lists, and figures, as DataFrames, Arrow tables, dicts, Markdown, or SQL, and write JSON, JSONL, Markdown, Parquet, CSV, images, or a checksummed bundle. Hidden text is flagged, never dropped, and scanned pages are read with optional [Tesseract](https://github.com/tesseract-ocr/tesseract) OCR. Powered by the permissively-licensed **PDFium** engine.
+- **Schema-Driven PDF Rationalization (v5.1+):** Extract Pydantic records from v5 PDF documents (`rationalize()`) with cross-family model consensus (`min_families=2`), verbatim quote and key grounding against visible elements, cross-page entity folding, and deterministic Polars/Arrow export (`to_dataframe(flatten=...)`).
 - **Pythonic API:** Enjoy a clean and intuitive API that integrates seamlessly into your existing Python workflows.
 
 ### Powertools Under The Hood
@@ -50,7 +51,7 @@ uv pip install datagrunt
 
 Datagrunt 5.0 requires Python 3.11 or newer.
 
-> **PDF parsing** is an optional extra — install it with `uv pip install "datagrunt[pdf]"`. See [PDF parsing](#pdf-parsing) below for details and OCR setup.
+> **PDF parsing** is an optional extra — install it with `uv pip install "datagrunt[pdf]"`. For **schema-driven PDF extraction** (`rationalize`), install `uv pip install "datagrunt[pdf,rationalize]"`. See [PDF parsing](#pdf-parsing) and [Schema-driven extraction (`rationalize`)](#schema-driven-extraction-rationalize) below.
 
 ## Quick Start
 
@@ -483,6 +484,53 @@ through variables such as `SPARK_ENV_LOADED` and `BEAM_WORKER_ID`) one worker
 extracts the pages. A frozen application (PyInstaller) cannot start workers
 yet, so reading a PDF there raises `DatagruntPDFError` saying so.
 
+### Schema-driven extraction (`rationalize`)
+
+Install the `[rationalize]` extra (`pydantic` and `httpx`) alongside `[pdf]`:
+
+```bash
+uv pip install "datagrunt[pdf,rationalize]"
+```
+
+`rationalize()` extracts structured Pydantic records from one or more PDF documents (`PDFDocument`, PDF path, bundle path, or a sequence of them). Hidden elements (`hidden_reasons` non-empty) are excluded before any model request is built, bidi/tag/control characters are escaped in the wire envelope, and every model response is validated, compared across model families, grounded against the cited visible elements, and folded across pages by entity key:
+
+```python
+from decimal import Decimal
+from typing import Annotated
+from pydantic import BaseModel
+from datagrunt import Key, PDFReader, rationalize
+
+
+class LineItem(BaseModel):
+    part_no: Annotated[str, Key]
+    qty: int
+    unit_price: Decimal
+
+
+class Invoice(BaseModel):
+    invoice_id: Annotated[str, Key("Invoice #")]
+    vendor: str
+    items: list[LineItem] = []
+
+
+doc = PDFReader("invoice.pdf").document
+result = rationalize(
+    doc,
+    schema=Invoice,
+    prompt="Extract each invoice and its line items.",
+    models=("openai:gpt-5.4", "anthropic:claude-sonnet-4-6"),
+    min_families=2,          # require agreement across >= 2 distinct model families
+    cache_dir=".dg-cache",   # optional atomic on-disk response cache
+)
+
+df = result.to_dataframe(flatten="items")   # deterministic Polars schema + left-outer explode
+review = result.needs_review                # disputed, ungrounded, or cross-page-conflict items
+```
+
+- **Cross-family consensus (`min_families=2`):** by default, a record reaches `"consensus"` only when a strict majority of requested models from at least two distinct model families agree on every field (`must_agree=("vendor",)` requires unanimity on named paths).
+- **Quote and key grounding:** every supporting model must cite non-header unit elements (`source_element_ids`) and supply `grounding_quotes` that appear in those cited elements (exact substring on digital/hybrid pages; token containment ≥ 0.85 on vision/OCR pages) and contain the record's root `Key` values. Grounding checks root keys and verbatim quotes against cited elements; non-key field values are verified by cross-family consensus.
+- **Explicit provider endpoints:** model strings require an explicit prefix (`openai:`, `anthropic:`, `gemini:`, `ollama:`, or `openai-compatible:<model>@<url>`). Google Cloud (Vertex AI / Agent Platform) endpoints are configured through `GeminiProvider.google_cloud(...)`, `GeminiProvider.google_cloud_express(...)`, `AnthropicProvider.google_cloud(...)`, and `OpenAICompatibleProvider.google_cloud(...)` with `GoogleCloudAuth`.
+
 ## Engine Comparison
 
 | Feature | Polars | DuckDB | PyArrow |
@@ -507,6 +555,11 @@ _The engines above apply to CSV processing. Whichever you pick, results are cons
 - **`ExcelWriter`**: Export a sheet (or all sheets) of an Excel workbook to CSV, Excel, JSON, JSONL, or Parquet
 - **`ParquetWriter`**: Export Parquet files to multiple formats (CSV, Excel, JSON, JSONL, Parquet)
 - **`PDFWriter`**: Write a PDF's document to JSON, JSONL, Markdown, Parquet, or CSV, extract its figures, render whole pages to PNG files, or write a checksummed bundle
+
+### Rationalization
+- **`rationalize`**: Extract, ground, reach cross-family consensus on, and fold Pydantic schema records over `PDFDocument`s
+- **`Key`**: `Annotated` schema marker identifying entity key fields (and optional document label aliases)
+- **`RationalizedResult`**: Consensus records (`records`), review queue (`needs_review`), quarantine log (`quarantined`), telemetry (`telemetry`), and deterministic Polars/Arrow/dict exports (`to_dataframe`, `to_arrow_table`, `to_dicts`)
 
 ## Full Documentation
 

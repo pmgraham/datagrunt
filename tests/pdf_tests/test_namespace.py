@@ -46,7 +46,7 @@ V5_MODEL_NAMES = [
     "BundleCorruptError",
 ]
 PDF_PACKAGE_NAMES = [*V5_MODEL_NAMES, "PDFReader", "PDFWriter", "load_bundle", "write_bundle"]
-# Spec §2.1: the classes, the element types and the exceptions (rationalize's names arrive in 5.1).
+# Spec §2.1: the classes, the element types and the exceptions (rationalize's names, 5.1, follow them).
 TOP_LEVEL_PDF_NAMES = [
     "PDFReader",
     "PDFWriter",
@@ -67,6 +67,8 @@ TOP_LEVEL_PDF_NAMES = [
     "PDFEncryptedError",
     "PDFCorruptError",
 ]
+# 5.1 (#360): the schema marker, rationalize() and RationalizedResult, defined in datagrunt.rationalization.
+TOP_LEVEL_RATIONALIZATION_NAMES = ["Key", "rationalize", "RationalizedResult"]
 TOP_LEVEL_NAMES = [
     "CSVReader",
     "CSVWriter",
@@ -75,6 +77,7 @@ TOP_LEVEL_NAMES = [
     "ParquetReader",
     "ParquetWriter",
     *TOP_LEVEL_PDF_NAMES,
+    *TOP_LEVEL_RATIONALIZATION_NAMES,
 ]
 EXCEPTION_NAMES = {
     "DatagruntPDFError",

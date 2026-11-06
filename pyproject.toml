@@ -38,6 +38,13 @@ pdf = [
     "pypdfium2>=5.9.0",
     "Pillow>=12.2.0",
 ]
+# rationalize() over v5 PDF documents (#360): pydantic validates the caller's
+# schemas and the records models return; httpx calls the model providers over
+# HTTPS, with no vendor SDK.
+rationalize = [
+    "pydantic>=2.14.2",
+    "httpx>=0.28.1",
+]
 dev = [
     "pytest>=9.0.3",
     "pytest-cov>=7.1.0",
@@ -115,7 +122,7 @@ testpaths = "tests"
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
-addopts = "-v --cov=src/datagrunt --cov-report=term-missing -m 'not corpus'"
+addopts = "-v --cov=src/datagrunt --cov-report=term-missing -m 'not corpus and not live'"
 pythonpath = "."
 # No `deep` marker on purpose. The scheduled deep search selects its work by
 # Hypothesis profile (HYPOTHESIS_PROFILE=deep) and file path, never by marker,
@@ -124,6 +131,7 @@ pythonpath = "."
 # nowhere. Depth is a profile, not a marker.
 markers = [
     "corpus: slow, local-only cross-engine tests over the data/pdfs corpus (deselected by default; run with -m corpus)",
+    "live: opt-in smoke tests that call live model provider endpoints when API keys are set (deselected by default; run with -m live)",
 ]
 
 [tool.ruff]
