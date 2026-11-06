@@ -1774,6 +1774,10 @@ class TestReprAndSecrets:
 
         assert not hasattr(provider, "__dict__")
 
+    def test_a_half_built_provider_still_has_a_safe_repr(self):
+        half = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
+        assert repr(half) == "OpenAICompatibleProvider(<unset>)"
+
     def test_a_constructor_error_after_the_key_holds_no_key_in_its_traceback_locals(self):
         with pytest.raises(RationalizationError) as caught:
             OpenAICompatibleProvider("llama3", base_url=GATEWAY, api_key=KEY, temperature=9.0)

@@ -1944,7 +1944,7 @@ BAD_SCHEMAS = [
     ('{"a":"\x85"}', "c1"),
     ('{"a":"\U000e0041"}', "tag"),
     ('{"a":"\ud800"}', "surrogate"),
-    ('{"a":' + "[" * 100_000 + "]" * 100_000 + "}", "deep"),
+    ('{"a":' + "[" * 200_000 + "]" * 200_000 + "}", "deep"),
 ]
 
 
@@ -2350,6 +2350,7 @@ def long_table_document(rows: int) -> PDFDocument:
     return document(page(1, (table,)))
 
 
+@pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
 def test_envelopes_of_a_200k_row_table_split_at_5000_build_fast():
     doc = long_table_document(200_000)
     units = units_of(doc, limit=5_000)

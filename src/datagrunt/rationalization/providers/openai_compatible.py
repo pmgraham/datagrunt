@@ -1372,6 +1372,8 @@ class OpenAICompatibleProvider:
         return body
 
     def __repr__(self) -> str:
+        if not hasattr(self, "_auth"):  # not built (__new__ alone, or a refused construction)
+            return "OpenAICompatibleProvider(<unset>)"
         params = ", ".join(f"{name}={value!r}" for name, value in self.generation_params.items())
         identity = f"model_id={self.model_id!r}, family={self._family!r}"
         return f"OpenAICompatibleProvider({identity}, {params}, auth={self._auth!r})"

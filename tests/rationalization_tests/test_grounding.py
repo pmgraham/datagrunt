@@ -579,6 +579,7 @@ class TestNumericValues:
     def test_a_number_glued_after_a_comma_is_not_read(self, text):
         assert numeric_values(text) == frozenset()
 
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_reading_numbers_takes_linear_time(self):
         small, large = "1," * 20_000 + "1x", "1," * 40_000 + "1x"  # 40k and 80k characters, no number in either
 
@@ -1533,6 +1534,7 @@ class TestNumericKeys:
         assert single({"count": -42}, ("\\-42",), (TABLE,), schema=COUNTED).grounded
         assert single({"count": 1200}, ("1,200",), (INVOICE,), schema=COUNTED).grounded
 
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_grounding_a_long_run_of_comma_joined_digits_takes_linear_time(self):
         def run_of(length: int) -> Prepared:
             return prepared(document(page(1, (para(1, 0, "1," * (length // 2) + "1x"),))), limit=100_000)

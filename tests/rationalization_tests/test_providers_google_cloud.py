@@ -285,6 +285,13 @@ class TestTarget:
             "host='us-central1-aiplatform.googleapis.com')"
         )
 
+    def test_a_half_built_target_still_has_a_safe_repr(self):
+        half = GoogleCloudTarget.__new__(GoogleCloudTarget)
+        object.__setattr__(half, "project", None)
+        object.__setattr__(half, "location", "us-central1")
+        assert "GoogleCloudTarget(" in repr(half)
+        assert "GoogleCloudTarget(" in repr(GoogleCloudTarget.__new__(GoogleCloudTarget))
+
 
 # ---------------------------------------------------------------------------------------------------------------
 # URL builders

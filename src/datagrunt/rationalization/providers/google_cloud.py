@@ -350,6 +350,12 @@ class GoogleCloudTarget:
             check_gcp_label(self.project, field="project")
         object.__setattr__(self, "host", host_for(self.location))
 
+    def __repr__(self) -> str:
+        project = getattr(self, "project", "?")
+        location = getattr(self, "location", "?")
+        host = getattr(self, "host", "?")
+        return f"GoogleCloudTarget(project={project!r}, location={location!r}, host={host!r})"
+
     @classmethod
     def express(cls) -> "GoogleCloudTarget":
         """Express mode: an API key, no project, the global host (Gemini models only)."""

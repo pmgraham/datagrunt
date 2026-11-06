@@ -2918,6 +2918,7 @@ def best_grounding_time(run: RealisticRun, runs: int = 5) -> float:
 
 
 class TestBenchmarkGate:
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_blending_takes_at_most_one_percent_of_the_runs_wall_time(self):
         run = realistic_run(1_000)
         requests = len(run.outcome.responses)
@@ -2944,6 +2945,7 @@ class TestBenchmarkGate:
         )
         assert elapsed <= budget_s
 
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_twice_the_repeated_copies_of_a_key_take_about_twice_the_time(self):
         def copies_run(count: int) -> tuple[RunOutcome, tuple[str, ...]]:
             records = [assembly("A-1", f"Title {index}", revision=index) for index in range(count)]
@@ -2968,6 +2970,7 @@ class TestBenchmarkGate:
         print(f"\n1,000 copies: {small_s:.3f} s; 2,000 copies: {large_s:.3f} s; ratio {large_s / small_s:.2f}")
         assert large_s <= 2.2 * small_s
 
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_twice_the_units_take_about_twice_the_time(self):
         small, large = light_run(1_000), light_run(2_000)
 
@@ -2977,6 +2980,7 @@ class TestBenchmarkGate:
         print(f"\n1,000 units: {small_s:.3f} s; 2,000 units: {large_s:.3f} s; ratio {large_s / small_s:.2f}")
         assert large_s <= 2.2 * small_s
 
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_twice_the_units_take_about_twice_the_time_to_ground(self):
         small, large = realistic_run(1_000, records=2, children=1), realistic_run(2_000, records=2, children=1)
 

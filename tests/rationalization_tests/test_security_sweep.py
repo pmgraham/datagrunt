@@ -365,15 +365,34 @@ def test_document_immutability_and_zero_pdf_package_diff() -> None:
     assert doc == before
     assert result.records == (PartRecord(part="PN-700", name="Titanium Valve", qty=5),)
 
-    diff = subprocess.run(
-        ["git", "diff", "main", "--", "src/datagrunt/pdf"],
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--", "src/datagrunt/pdf"],
         cwd=REPO_ROOT,
         check=True,
         capture_output=True,
         text=True,
         timeout=30,
     )
-    assert diff.stdout == ""
+    assert status.stdout == ""
+    for ref in ("main", "origin/main"):
+        probe = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", ref],
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if probe.returncode == 0:
+            diff = subprocess.run(
+                ["git", "diff", ref, "--", "src/datagrunt/pdf"],
+                cwd=REPO_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert diff.stdout == ""
 
 
 # ---------------------------------------------------------------------------------------------------------------
