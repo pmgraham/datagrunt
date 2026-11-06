@@ -10,7 +10,7 @@ Datagrunt uses [uv](https://docs.astral.sh/uv/) for all Python package and envir
 git clone https://github.com/pmgraham/datagrunt.git
 cd datagrunt
 uv venv
-uv pip install -e ".[dev,pdf]"   # builds the Rust extension via maturin
+uv pip install -e ".[dev,pdf,rationalize]"   # builds the Rust extension via maturin
 ```
 
 Requirements: Python >= 3.11, a Rust toolchain (stable), and — for the PDF OCR tests — [Tesseract](https://github.com/tesseract-ocr/tesseract) (`brew install tesseract` / `apt-get install tesseract-ocr`).
@@ -18,7 +18,7 @@ Requirements: Python >= 3.11, a Rust toolchain (stable), and — for the PDF OCR
 After changing Rust code, rebuild the extension so tests see it:
 
 ```bash
-uv pip install -e ".[dev,pdf]"
+uv pip install -e ".[dev,pdf,rationalize]"
 ```
 
 ## Architecture in one paragraph
