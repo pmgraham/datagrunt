@@ -16,7 +16,9 @@ its normalized key, and each model's records, quotes, element ids and family. Th
    schema that raises what pydantic does not wrap into a ``ValidationError`` (a ``KeyError``, say) quarantines the
    record too, its message naming the exception's class only, since its text can quote the input; a
    ``MemoryError``, a ``RecursionError`` and an exception that is not an ``Exception`` (``KeyboardInterrupt``)
-   propagate. The same holds for the merged record's rebuild (rule 8), as a note.
+   propagate. The same holds for the merged record's rebuild (rule 8), as a note. ``model_validate`` is given a
+   copy of the record (pydantic hands a ``mode="before"`` validator the very dict, and it may change it in place),
+   so the record as sent is kept, unchanged, for rule 8.
 2. **Null = not shown** (maintainer, 2026-11-05). Before validation, in each record and recursively in its child
    records (following the spec by wire name, and by attribute name too in a model that validates by name:
    ``validate_by_name`` or ``populate_by_name``), a key whose value is ``null`` is dropped when its field is neither
@@ -39,8 +41,11 @@ its normalized key, and each model's records, quotes, element ids and family. Th
    instance not exactly of its class quarantines the record (``"validation"``; the message names the field by
    attribute path, and says a default gave the value only when one did, its field never set by the model). A
    non-finite float or ``Decimal`` (lax validation takes ``"Infinity"`` and ``"NaN"``) is quarantined the same way.
-4. **One model.** With one requested model (``min_families`` 1), every valid record is an item of status
-   ``single_model``, but for repeated keys (rule 9).
+4. **One model.** With one requested model (``min_families`` 1), each record is compared as the one voter (a keyed
+   root's copies of one key first with each other, rule 9; a root without keys, each record on its own), so rule 9
+   holds inside it at every depth: its item is ``single_model``, or ``field_disagreement`` when it repeats a
+   child's key with differing values. Its record is the model's own, or rebuilt when a repeated child merged
+   (rule 8).
 5. **Grouping** (several models). A keyed root's records are grouped by their normalized key tuple
    (:func:`normalized_key`). Values normalize by kind (maintainer, 2026-11-05):
 
@@ -61,7 +66,8 @@ its normalized key, and each model's records, quotes, element ids and family. Th
    clustered by their normalized form (rule 5; a list's as the tuple of its items'), which is exact and hashable,
    so matching is transitive and grouping a dictionary lookup; clusters keep model order, and a cluster's first
    value (its representative) is the value it stands for. The merged value is that representative: the first
-   backing model's own value, which every backer matched under rule 5's normalization and nothing looser. A
+   backing model's own value (as it sent it, rule 8), which every backer matched under rule 5's normalization and
+   nothing looser. A
    field's winning value is the representative of the cluster backed by more than half of the
    ``k`` models; with none (a tie) the field has no winner, never a pick. When ``k == N``, a field is agreed when
    its winning value is backed by more than half of the requested models **and** by at least ``min_families``
@@ -76,18 +82,36 @@ its normalized key, and each model's records, quotes, element ids and family. Th
    the ``k`` models have it, left out when more than half do not, and has no winner otherwise. A list whose child
    has no keys, and a list of scalars, compares as one normalized sequence, in order. Comparison follows the spec,
    so its recursion is bounded by the spec's depth (at most :data:`~datagrunt.rationalization.schema.MAX_DEPTH`).
-8. **Statuses.** A field not agreed makes the item ``field_disagreement``, naming each disputed field's path
-   relative to the record, by attribute name, in field order (``title``, ``components['PN-104'].quantity``,
-   ``steps[2]``: a keyed child by its key, a sequence by its differing positions when its versions have one
-   length); otherwise a key missing in some models makes it ``missing_in_some_models``, and else it is
-   ``consensus``. When every field has a winning value, the merged record is rebuilt from them with
-   ``model_validate``; else it is ``None``. A rebuild ``model_validate`` refuses (a cross-field validator) makes the
-   item ``field_disagreement`` with a note, never an exception.
+8. **Statuses and the merged record.** A field not agreed makes the item ``field_disagreement``, naming each
+   disputed field's path relative to the record, by attribute name, in field order (``title``,
+   ``components['PN-104'].quantity``, ``steps[2]``: a keyed child by its key, a sequence by its differing positions
+   when its versions have one length); otherwise a key missing in some models makes it ``missing_in_some_models``,
+   and else it is ``consensus`` (``single_model`` with one model). When every field has a winning value the item has
+   a merged record; else it is ``None``. Values are compared validated, but the merged record is validated exactly
+   once, from JSON as the models sent it, never from validated values (a validator would run twice), so one model
+   and several give the same record:
+
+   - when every winning value is one model's own (its representative everywhere) and no child of its lists was
+     left out or merged, the record is that model's validated instance, unchanged;
+   - else it is rebuilt from the representatives' own JSON: each record as rule 2 left it, a value found under its
+     wire name (or its attribute name, in a model that validates by name), a child by its position in the list
+     sent, and a part one model gave whole taken whole, so a default stays a default. It is validated once, on a
+     copy (rule 1), checked like any record (rule 3), then compared with the records it came from: it must hold
+     every winning value and every kept child, and nothing else. A validator that reorders or reshapes what it is
+     given can set a value apart from the JSON it was found by; this check sends that record to review.
+
+   A rebuild ``model_validate`` refuses (a cross-field validator), that rule 3 refuses, or that does not hold the
+   agreed values makes the item ``field_disagreement`` with the note ``the merged record failed validation: ...``
+   (field paths and kinds, never a value) and no record, never an exception.
 9. **Repeated keys.** Records of one key from one model in one unit merge when they are identical (rule 6 finds
    no dispute between them), their quotes and element ids united; when they differ, the item is
-   ``field_disagreement`` with a note, the paths where they differ disputed, its record ``None``, and every copy
-   kept. A child key repeated in one model's list is likewise one child when identical, else disputed at its path
-   without a winner.
+   ``field_disagreement`` with the note ``<model> returned this key N times, with differing values``, the paths
+   where they differ disputed, its record ``None``, and every copy kept. A child key repeated in one model's list,
+   at any depth and with one model or several, is likewise one child when identical (the merged record keeps the
+   first), else disputed at its path without a winner, with the note ``<model> repeated a child key within a list,
+   with differing values``; the model's votes keep every version. Such a child is disputed whole and compared no
+   further, so copies of a key count as differing (the first note) only where they differ outside it, or where one
+   repeats it and another does not; both notes come when both happen. Notes never hold a value.
 10. **Output.** Units in the given order; within a unit, keyed items by key tuple, compared part by part in a
     total order over the kinds of normalized values: ``bool`` < numbers (``int``, ``Decimal``, by value) < ``str``
     < ``date`` < naive ``datetime`` < aware ``datetime`` (by instant); items without keys in model order, then
@@ -97,11 +121,13 @@ its normalized key, and each model's records, quotes, element ids and family. Th
 
 Bounds: every walk is linear in a response's records and values, and follows the spec, never deeper than its depth;
 clustering is a dictionary lookup per value, so it is linear too, across models and across one model's repeated
-copies of a key (rule 9) alike. The module imports only the standard
+copies of a key (rule 9) alike. Each record is copied once to be validated, and a rebuilt record is compared once
+more with the records it came from (rule 8), both linear. The module imports only the standard
 library, pydantic and its sibling modules: nothing from ``datagrunt.core``, and no import inside a function
 (invariant 9).
 """
 
+import json
 import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -144,6 +170,12 @@ ERROR_MESSAGE_MAX_CHARS = 2_000
 RAW_JSON_MAX_CHARS = 65_536
 """The longest :attr:`QuarantinedItem.raw_json`: a longer text is cut, and says so."""
 
+QUOTES_MAX = 256
+"""The most grounding quotes a :class:`ValidRecord` or wrapper entry may hold."""
+
+QUOTE_MAX_CHARS = 16_384
+"""The longest grounding quote a :class:`ValidRecord` or wrapper entry may hold."""
+
 SOURCE_IDS_MAX = 256
 """The most element ids a :class:`QuarantinedItem` keeps (the entry's first ones)."""
 
@@ -154,8 +186,34 @@ FLOAT_SIGNIFICANT_DIGITS = 15
 """Two floats match when they are equal once each is rounded to this many significant digits (maintainer, 2026-11-05):
 this absorbs binary noise (``0.1 + 0.2`` is ``0.3``), and any real decimal difference disputes."""
 
+__all__ = [
+    "CONSENSUS_STATUSES",
+    "ConsensusItem",
+    "ConsensusResult",
+    "ConsensusStatus",
+    "ERROR_MESSAGE_MAX_CHARS",
+    "FLOAT_SIGNIFICANT_DIGITS",
+    "QUARANTINE_REASONS",
+    "QUOTES_MAX",
+    "QUOTE_MAX_CHARS",
+    "QuarantineReason",
+    "QuarantinedItem",
+    "RAW_JSON_MAX_CHARS",
+    "SOURCE_IDS_MAX",
+    "SOURCE_ID_MAX_CHARS",
+    "ValidRecord",
+    "ValidatedResponse",
+    "build_consensus",
+    "check_must_agree",
+    "key_order",
+    "normalized_key",
+    "normalized_text",
+    "validate_response",
+]
+
 _BRIEF_CHARS = 80
 _ABSENT = object()
+_REBUILT = -1  # the entry index of a rebuilt record, compared with the records it was merged from
 _LIST_KINDS = frozenset({"scalar_list", "model_list"})
 _CLEAN_STATUSES = ("consensus", "single_model")
 _WRAPPER_SHAPE = '{"records": [...]}'
@@ -299,22 +357,38 @@ class ValidRecord:
         grounding_quotes: The quotes the model gave for it, in its order.
         source_element_ids: The element ids the model gave for it, in its order.
         position: Its index among the response's entries (0-based).
+        wire: Keyword-only. The record as the model sent it, less the nulls that mean "not shown" (module notes,
+            2): a copy of exactly what ``record`` was validated from, by wire name, which a merged record is
+            rebuilt from (module notes, 8). It holds document text, so the ``repr`` leaves it out.
 
     Raises:
-        TypeError: If a field has the wrong type.
-        ValueError: If ``position`` is negative.
+        TypeError: If a field has the wrong type (``wire`` is a ``dict`` with ``str`` keys).
+        ValueError: If ``position`` is negative, or a quote or element id is past its bound.
     """
 
     record: BaseModel = field(repr=False)
     grounding_quotes: tuple[str, ...] = field(repr=False)
     source_element_ids: tuple[str, ...]
     position: int
+    wire: dict[str, Any] = field(kw_only=True, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.record, BaseModel):
             raise TypeError(f"record must be a pydantic model instance, got {type(self.record).__name__}")
+        if not isinstance(self.wire, dict) or not all(isinstance(name, str) for name in self.wire):
+            raise TypeError(f"wire must be a dict with str keys (a JSON object), got {type(self.wire).__name__}")
         _check_strings("grounding_quotes", self.grounding_quotes)
         _check_strings("source_element_ids", self.source_element_ids)
+        if len(self.grounding_quotes) > QUOTES_MAX or any(len(q) > QUOTE_MAX_CHARS for q in self.grounding_quotes):
+            raise ValueError(
+                f"grounding_quotes holds at most {QUOTES_MAX} quotes of at most {QUOTE_MAX_CHARS} characters"
+            )
+        if len(self.source_element_ids) > SOURCE_IDS_MAX or any(
+            len(element_id) > SOURCE_ID_MAX_CHARS for element_id in self.source_element_ids
+        ):
+            raise ValueError(
+                f"source_element_ids holds at most {SOURCE_IDS_MAX} ids of at most {SOURCE_ID_MAX_CHARS} characters"
+            )
         if type(self.position) is not int:
             raise TypeError(f"position must be an int, got {type(self.position).__name__}")
         if self.position < 0:
@@ -345,11 +419,14 @@ class ConsensusItem:
         unit_id: The unit it was found in.
         status: One of :data:`CONSENSUS_STATUSES`.
         key: Its normalized root key (:func:`normalized_key`), ``()`` for a root without keys: what T12 folds on.
-        record: The merged record (for ``single_model``, the model's own), or ``None``: for ``unmatched``, when a
-            field has no winning value, when one model's copies differ, or when the rebuild failed.
+        record: The merged record (module notes, 8: a model's own validated record when it is entirely that
+            model's, else rebuilt once from what the models sent), or ``None``: for ``unmatched``, when a field has
+            no winning value, when one model's copies differ or a child key repeats with differing values, or when
+            the rebuild failed.
         disputed_fields: The paths of the fields not agreed, in field order, each once (module notes, 8); ``()``
             for ``consensus`` and ``single_model``.
-        notes: What else needs review (a failed rebuild, a model's differing copies), else ``()``. A path or a
+        notes: What else needs review (a failed rebuild, a model's differing copies, a child key it repeated with
+            differing values), else ``()``. A path or a
             note can hold model-chosen text (a child's key, an extra key a rebuild refused), so the ``repr`` leaves
             both out, like every field holding document text; they stay in the data, for review.
         model_votes: Each requested model's validated records for this item, as JSON-mode dicts (``()`` for a model
@@ -471,6 +548,17 @@ def check_must_agree(spec: ModelSpec, paths: object) -> tuple[str, ...]:
     return tuple(checked)
 
 
+def normalized_text(value: str) -> str:
+    """``value`` in consensus's canonical string form (module notes, 5): NFC, whitespace runs made one space.
+
+    Raises:
+        TypeError: If ``value`` is not a ``str``.
+    """
+    if not isinstance(value, str):
+        raise TypeError(f"value must be a str, got {type(value).__name__}")
+    return " ".join(unicodedata.normalize("NFC", value).split())
+
+
 def normalized_key(record: BaseModel, spec: ModelSpec) -> tuple[object, ...]:
     """The normalized key tuple of ``record`` (module notes, 5): hashable, and equal for records of one entity.
 
@@ -549,7 +637,11 @@ def validate_response(
             message = f"records[{position}]: {checked}"
             quarantine.append(origin.item("validation", _json_text(record), message, ids))
             continue
-        records.append(ValidRecord(record=checked, grounding_quotes=quotes, source_element_ids=ids, position=position))
+        instance, wire = checked
+        valid = ValidRecord(
+            record=instance, grounding_quotes=quotes, source_element_ids=ids, position=position, wire=wire
+        )
+        records.append(valid)
     return ValidatedResponse(records=tuple(records), quarantined=tuple(quarantine))
 
 
@@ -673,6 +765,16 @@ def _entry_parts(entry: object) -> tuple[dict[str, Any], tuple[str, ...], tuple[
     for name, value in (("grounding_quotes", quotes), ("source_element_ids", ids)):
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
             return f'"{name}" is not a list of strings'
+    if len(quotes) > QUOTES_MAX or any(len(q) > QUOTE_MAX_CHARS for q in quotes):
+        return (
+            f'"grounding_quotes" holds more than {QUOTES_MAX} quotes or a quote longer than '
+            f"{QUOTE_MAX_CHARS} characters"
+        )
+    if len(ids) > SOURCE_IDS_MAX or any(len(element_id) > SOURCE_ID_MAX_CHARS for element_id in ids):
+        return (
+            f'"source_element_ids" holds more than {SOURCE_IDS_MAX} ids or an id longer than '
+            f"{SOURCE_ID_MAX_CHARS} characters"
+        )
     return record, tuple(quotes), tuple(ids)
 
 
@@ -697,10 +799,23 @@ def _json_kind(value: object) -> str:
     return "array" if isinstance(value, list) else "object"
 
 
-def _validate_record(record: dict[str, Any], schema: PreparedSchema) -> BaseModel | str:
-    """The validated instance of ``record``, or why it is not one (module notes, 2-3)."""
+def _validate_record(record: dict[str, Any], schema: PreparedSchema) -> tuple[BaseModel, dict[str, Any]] | str:
+    """The validated instance of ``record`` and what it was validated from, or why it is not one (module notes, 2-3)."""
+    wire = _drop_unshown(record, schema.spec)
+    checked = _validated(wire, schema)
+    return checked if isinstance(checked, str) else (checked, wire)
+
+
+def _validated(wire: object, schema: PreparedSchema) -> BaseModel | str:
+    """``model_validate`` of a copy of ``wire``, checked like any record (module notes, 1 and 3), or why it is not one.
+
+    Every record goes through it once: each model's as it sent it, and a merged one rebuilt (module notes, 8). A
+    validator may change what it is given in place (pydantic hands a ``mode="before"`` validator the very dict),
+    so it is given a copy, and ``wire`` stays what the models sent.
+    """
+    given = _json_copy(wire)
     try:
-        instance = schema.model.model_validate(_drop_unshown(record, schema.spec))
+        instance = schema.model.model_validate(given)
     except ValidationError as error:
         return _error_text(error)
     except (MemoryError, RecursionError):
@@ -709,6 +824,11 @@ def _validate_record(record: dict[str, Any], schema: PreparedSchema) -> BaseMode
         return _raised_text(error)
     problems = instance_problems(instance, schema.spec)
     return "; ".join(problems) if problems else instance
+
+
+def _json_copy(value: object) -> Any:
+    """A deep copy of ``value``, exactly JSON (a response's content is, and so is every part of it)."""
+    return json.loads(json.dumps(value))
 
 
 def _error_text(error: ValidationError) -> str:
@@ -747,7 +867,7 @@ def _drop_unshown(record: dict[str, Any], spec: ModelSpec) -> dict[str, Any]:
 
 def _drop_in_node(node: dict[str, Any], spec: ModelSpec) -> list[tuple[dict[str, Any], ModelSpec]]:
     """Drop one record object's unshown nulls, under each name its model reads; return its child records."""
-    by_name = bool(spec.model.model_config.get("validate_by_name") or spec.model.model_config.get("populate_by_name"))
+    by_name = _reads_by_name(spec.model)
     children: list[tuple[dict[str, Any], ModelSpec]] = []
     for field_spec in spec.fields:
         names = {field_spec.wire_name, field_spec.name} if by_name else {field_spec.wire_name}
@@ -890,6 +1010,22 @@ def _unit_votes(
 _PerModel: TypeAlias = list[list[ValidRecord]]
 """One entity's records from each requested model, in model order: ``[]`` for a model without one."""
 
+_Entry: TypeAlias = tuple[int, Any, object]
+"""One entry at a node of a comparison: its index (a model's, or a copy's), its validated value, and that value's
+JSON as the model sent it (``_ABSENT`` where the record holds none: a default)."""
+
+
+class _Merged:
+    """A merged value as the models sent it (module notes, 8): its JSON (``_ABSENT`` for a default), and the entry
+    whose own JSON it is, unchanged (every value under it that entry's, no child of its lists left out or merged),
+    else ``None``."""
+
+    __slots__ = ("source", "wire")
+
+    def __init__(self, wire: object, source: int | None) -> None:
+        self.wire = wire
+        self.source = source
+
 
 def _unit_items(unit_id: str, votes: Sequence[tuple[ValidRecord, ...]], context: _Context) -> list[ConsensusItem]:
     """One unit's items, in output order (module notes, 10), from each requested model's valid records."""
@@ -908,14 +1044,15 @@ def _unkeyed_items(unit_id: str, votes: Sequence[tuple[ValidRecord, ...]], conte
     """The items of a root without keys: paired when every model returned one record, else one per record."""
     if len(votes) > 1 and all(len(records) == 1 for records in votes):
         return [_compared_item(unit_id, (), [list(records) for records in votes], context)]
-    status: ConsensusStatus = "single_model" if len(votes) == 1 else "unmatched"
     items: list[ConsensusItem] = []
     for index, records in enumerate(votes):
         for valid in records:
             per_model: _PerModel = [[] for _ in votes]
             per_model[index].append(valid)
-            record = valid.record if status == "single_model" else None
-            items.append(_item(unit_id, status, (), record, per_model, context))
+            if len(votes) == 1:
+                items.append(_compared_item(unit_id, (), per_model, context))
+            else:
+                items.append(_item(unit_id, "unmatched", (), None, per_model, context))
     return items
 
 
@@ -924,58 +1061,87 @@ def _keyed_item(unit_id: str, key: tuple[object, ...], per_model: _PerModel, con
     disputed: list[str] = []
     notes: list[str] = []
     for model_id, copies in zip(context.model_ids, per_model, strict=True):
-        differing = _copy_disputes(copies, context.schema.spec)
-        if differing:
-            disputed.extend(differing)
+        if len(copies) < 2:
+            continue
+        comparison = _copies_compared(copies, context.schema.spec)
+        disputed.extend(comparison.disputed)
+        if comparison.split:
             notes.append(f"{model_id} returned this key {len(copies)} times, with differing values")
+        if comparison.repeated:
+            notes.append(_repeated_note(model_id))
     if notes:
         return _item(unit_id, "field_disagreement", key, None, per_model, context, disputed=disputed, notes=notes)
-    if len(per_model) == 1:
-        return _item(unit_id, "single_model", key, per_model[0][0].record, per_model, context, merged=True)
     return _compared_item(unit_id, key, per_model, context)
 
 
-def _copy_disputes(copies: Sequence[ValidRecord], spec: ModelSpec) -> list[str]:
-    """The paths where one model's copies of one key differ; ``[]`` when they are identical (or one)."""
-    if len(copies) < 2:
-        return []
+def _copies_compared(copies: Sequence[ValidRecord], spec: ModelSpec) -> "_Comparison":
+    """One model's copies of one key compared with each other (module notes, 9), each copy a voter."""
     comparison = _Comparison(voters=len(copies), quorum=None)
-    comparison.compare_model(spec, "", "", list(enumerate(valid.record for valid in copies)), 1)
-    return comparison.disputed
+    comparison.compare_model(spec, "", "", [(index, valid.record, valid.wire) for index, valid in enumerate(copies)], 1)
+    return comparison
 
 
 def _compared_item(unit_id: str, key: tuple[object, ...], per_model: _PerModel, context: _Context) -> ConsensusItem:
-    """The item of one entity several models described, each by one record (or identical copies): rules 6-8."""
-    voters = [(index, copies[0].record) for index, copies in enumerate(per_model) if copies]
+    """The item of one entity the requested models described, each by one record (or identical copies): rules 4, 6-9.
+
+    With one requested model its one record is the one voter, so its repeated child keys are found (rule 9).
+    """
+    voters: list[_Entry] = [
+        (index, copies[0].record, copies[0].wire) for index, copies in enumerate(per_model) if copies
+    ]
     everyone = len(voters) == len(per_model)
     quorum = _Quorum(len(per_model), context.families, context.min_families, context.must_agree) if everyone else None
     comparison = _Comparison(voters=len(voters), quorum=quorum)
     merged = comparison.compare_model(context.schema.spec, "", "", voters, 1)
     record: BaseModel | None = None
-    notes: list[str] = []
+    notes = [_repeated_note(context.model_ids[index]) for index in sorted(comparison.repeated)]
     if not isinstance(merged, _NoWinner):
-        rebuilt = _rebuild(merged, context.schema)
-        if isinstance(rebuilt, str):
-            notes.append(f"the merged record failed validation: {rebuilt}")
+        built = _merged_record(merged, voters, context.schema)
+        if isinstance(built, str):
+            notes.append(f"the merged record failed validation: {built}")
         else:
-            record = rebuilt
+            record = built
     status: ConsensusStatus = "consensus" if everyone else "missing_in_some_models"
+    if len(per_model) == 1:
+        status = "single_model"
     if comparison.disputed or notes:
         status = "field_disagreement"
     disputed = comparison.disputed
     return _item(unit_id, status, key, record, per_model, context, disputed=disputed, notes=notes, merged=True)
 
 
-def _rebuild(merged: dict[str, Any], schema: PreparedSchema) -> BaseModel | str:
-    """The merged record, validated from the winning values (wire names), or why ``model_validate`` refused it."""
-    try:
-        return schema.model.model_validate(merged)
-    except ValidationError as error:
-        return _error_text(error)
-    except (MemoryError, RecursionError):
-        raise
-    except Exception as error:  # a validator of the caller's schema raised what pydantic does not wrap
-        return _raised_text(error)
+def _repeated_note(model_id: str) -> str:
+    """The note of a model whose record repeats a child's key with differing values (module notes, 9)."""
+    return f"{model_id} repeated a child key within a list, with differing values"
+
+
+def _merged_record(merged: _Merged, voters: Sequence[_Entry], schema: PreparedSchema) -> BaseModel | str:
+    """The merged record (module notes, 8), or why it is none.
+
+    A merge that is one model's own record unchanged is that model's validated instance; any other is rebuilt.
+    """
+    if merged.source is not None:
+        record: BaseModel = next(instance for index, instance, _ in voters if index == merged.source)
+        return record
+    rebuilt = _validated(merged.wire, schema)
+    if isinstance(rebuilt, str):
+        return rebuilt
+    if not _holds_agreed(rebuilt, voters, schema.spec):
+        return "rebuilt from what the models sent, it does not hold the values they agreed on"
+    return rebuilt
+
+
+def _holds_agreed(rebuilt: BaseModel, voters: Sequence[_Entry], spec: ModelSpec) -> bool:
+    """Whether ``rebuilt`` holds the values its voters agreed on, and no others (module notes, 8).
+
+    Placed first among them and compared, it must be the source of their merge: the representative of every winning
+    value, holding every child that wins and no other. A value no majority backs, or a child it lacks, gives the
+    merge another source, or none. A validator that reorders or reshapes what it is given can set a value apart
+    from the JSON it was found by; this check sends such a record to review.
+    """
+    entries = [(_REBUILT, rebuilt, _ABSENT), *((index, instance, _ABSENT) for index, instance, _ in voters)]
+    check = _Comparison(voters=len(entries), quorum=None).compare_model(spec, "", "", entries, 1)
+    return not isinstance(check, _NoWinner) and check.source == _REBUILT
 
 
 def _item(
@@ -1081,28 +1247,33 @@ def _family_count(supporters: Sequence[int], families: Sequence[str]) -> int:
 
 @dataclass(slots=True)
 class _Cluster:
-    """Values matching one representative (the first of them, in model order), and the entries that gave them."""
+    """Values matching one representative (the first of them, in model order): its JSON, and the entries backing it."""
 
     normalized: object
-    value: object
+    wire: object
+    source: int
     supporters: list[int]
 
 
 class _Comparison:
-    """One item's field-by-field comparison: the merged values, and the paths not agreed (module notes, 6-7).
+    """One item's field-by-field comparison: the merged values, and the paths not agreed (module notes, 6-9).
 
     ``voters`` is the number of entries at the root (``k``): a value wins with more than half of them. With a
     ``quorum`` (every requested model returned the record), a winning value is agreed when it meets the quorum;
     without one (the record missing in some models, or one model's copies), when every entry at its node backs it.
-    Entries are ``(index, value)`` pairs, the index a model's (or a copy's).
+    Values are compared validated; the merged value is the JSON its representative sent (module notes, 8).
+    ``repeated`` collects the entries that repeat a child's key with differing values, and ``split`` says whether
+    the entries differ anywhere (a repeated child's versions aside).
     """
 
-    __slots__ = ("disputed", "quorum", "voters")
+    __slots__ = ("disputed", "quorum", "repeated", "split", "voters")
 
     def __init__(self, voters: int, quorum: _Quorum | None) -> None:
         self.voters = voters
         self.quorum = quorum
         self.disputed: list[str] = []
+        self.repeated: set[int] = set()
+        self.split = False
 
     def agreed(self, supporters: Sequence[int], at_node: int, spec_path: str) -> bool:
         """Whether a winning value backed by ``supporters`` (of the ``at_node`` entries there) is agreed."""
@@ -1115,27 +1286,31 @@ class _Comparison:
         return len(supporters) * 2 > self.voters
 
     def compare_model(
-        self, spec: ModelSpec, path: str, spec_path: str, entries: list[tuple[int, BaseModel]], depth: int
-    ) -> dict[str, Any] | _NoWinner:
-        """Compare instances of one model field by field: the merged object (by wire name), or no winner."""
+        self, spec: ModelSpec, path: str, spec_path: str, entries: list[_Entry], depth: int
+    ) -> _Merged | _NoWinner:
+        """Compare instances of one model field by field: the merged object (JSON, by wire name), or no winner."""
         if depth > MAX_DEPTH:
             raise RationalizationError(f"{path or 'the record'}: nesting is deeper than {MAX_DEPTH} levels")
-        merged: dict[str, Any] = {}
+        by_name = _reads_by_name(spec.model)
+        parts: list[tuple[FieldSpec, _Merged]] = []
         complete = True
         for field_spec in spec.fields:
             field_path = f"{path}.{field_spec.name}" if path else field_spec.name
             field_spec_path = f"{spec_path}.{field_spec.name}" if spec_path else field_spec.name
-            values = [(index, getattr(instance, field_spec.name)) for index, instance in entries]
+            values = [
+                (index, getattr(instance, field_spec.name), _wire_value(wire, field_spec, by_name))
+                for index, instance, wire in entries
+            ]
             result = self.compare_field(field_spec, field_path, field_spec_path, values, depth)
             if isinstance(result, _NoWinner):
                 complete = False
             else:
-                merged[field_spec.wire_name] = result
-        return merged if complete else _NO_WINNER
+                parts.append((field_spec, result))
+        return _assembled(parts, entries) if complete else _NO_WINNER
 
     def compare_field(
-        self, field_spec: FieldSpec, path: str, spec_path: str, values: list[tuple[int, Any]], depth: int
-    ) -> object:
+        self, field_spec: FieldSpec, path: str, spec_path: str, values: list[_Entry], depth: int
+    ) -> _Merged | _NoWinner:
         """Compare one field's values: its merged value, or no winner."""
         child = field_spec.child
         if field_spec.kind == "model" and child is not None:
@@ -1145,25 +1320,26 @@ class _Comparison:
         return self.compare_value(field_spec, path, spec_path, values)
 
     def compare_child(
-        self, child: ModelSpec, path: str, spec_path: str, values: list[tuple[int, Any]], depth: int
-    ) -> dict[str, Any] | None | _NoWinner:
+        self, child: ModelSpec, path: str, spec_path: str, values: list[_Entry], depth: int
+    ) -> _Merged | _NoWinner:
         """Compare a nested model: when some hold ``None`` (it is Optional), first as present or ``None``."""
-        present = [(index, value) for index, value in values if value is not None]
+        present = [(index, value, wire) for index, value, wire in values if value is not None]
         if len(present) < len(values):
-            shown = [index for index, _ in present]
-            absent = [index for index, value in values if value is None]
+            shown = [index for index, _, _ in present]
+            absent = [index for index, value, _ in values if value is None]
+            self.split = self.split or bool(shown)
             winner = shown if self.wins(shown) else absent if self.wins(absent) else None
             if winner is None or not self.agreed(winner, len(values), spec_path):
                 self.disputed.append(path)
             if winner is None:
                 return _NO_WINNER
             if winner is absent:
-                return None
+                return _Merged(_wire_of(values, absent[0]), absent[0])
         return self.compare_model(child, path, spec_path, present, depth + 1)
 
     def compare_keyed_list(
-        self, child: ModelSpec, path: str, spec_path: str, values: list[tuple[int, Any]], depth: int
-    ) -> list[dict[str, Any]] | _NoWinner:
+        self, child: ModelSpec, path: str, spec_path: str, values: list[_Entry], depth: int
+    ) -> _Merged | _NoWinner:
         """Match a keyed list's children by key across the entries (module notes, 7): the merged list, or none.
 
         Children are agreed field by field. Lists empty in every entry have no child to carry the quorum, so their
@@ -1171,73 +1347,136 @@ class _Comparison:
         """
         members, conflicts = _children_by_key(child, values)
         if not members:
-            if not self.agreed([index for index, _ in values], len(values), spec_path):
+            if not self.agreed([index for index, _, _ in values], len(values), spec_path):
                 self.disputed.append(path)
-            return []
-        merged: list[dict[str, Any]] = []
+            return _Merged(values[0][2], values[0][0])
+        merged: list[_Merged] = []
         complete = True
         for key, found in members.items():
             child_path = f"{path}[{_key_text(found[0][1], child)}]"
-            if key in conflicts or len(found) < len(values):
+            clashing = conflicts.get(key, ())
+            self.repeated.update(clashing)
+            self.split = self.split or len(found) < len(values) or 0 < len(clashing) < len(found)
+            if clashing or len(found) < len(values):
                 self.disputed.append(child_path)
-            if key in conflicts or not self.wins([index for index, _ in found]):
+            if clashing or not self.wins([index for index, _, _ in found]):
                 left_out = (len(values) - len(found)) * 2 > self.voters
-                complete = complete and key not in conflicts and left_out
+                complete = complete and not clashing and left_out
                 continue
             result = self.compare_model(child, child_path, spec_path, found, depth + 1)
             if isinstance(result, _NoWinner):
                 complete = False
             else:
                 merged.append(result)
-        return merged if complete else _NO_WINNER
+        return _listed(merged, values) if complete else _NO_WINNER
 
-    def compare_value(self, field_spec: FieldSpec, path: str, spec_path: str, values: list[tuple[int, Any]]) -> object:
-        """Compare a scalar's values, or a list's as normalized sequences: the winning value, or no winner."""
-        clusters = _clusters([(index, value, _normalized_field(field_spec, value)) for index, value in values])
+    def compare_value(
+        self, field_spec: FieldSpec, path: str, spec_path: str, values: list[_Entry]
+    ) -> _Merged | _NoWinner:
+        """Compare a scalar's values, or a list's as normalized sequences: the winner, or no winner."""
+        clusters = _clusters(
+            [(index, wire, _normalized_field(field_spec, value)) for index, value, wire in values],
+            prefer_wire=not field_spec.required,
+        )
+        self.split = self.split or len(clusters) > 1
         winner = next((cluster for cluster in clusters if self.wins(cluster.supporters)), None)
         if winner is None or not self.agreed(winner.supporters, len(values), spec_path):
             self.disputed.extend(_value_paths(field_spec, path, clusters))
-        return _NO_WINNER if winner is None else winner.value
+        return _NO_WINNER if winner is None else _Merged(winner.wire, winner.source)
+
+
+def _assembled(parts: Sequence[tuple[FieldSpec, _Merged]], entries: Sequence[_Entry]) -> _Merged:
+    """A model's merged object: one entry's own JSON when every field is that entry's own, else its fields' JSON by
+    wire name (a default left out, so it applies again)."""
+    sources = {merged.source for _, merged in parts}
+    source = sources.pop() if len(sources) == 1 else None
+    if source is not None:
+        return _Merged(_wire_of(entries, source), source)
+    wire = {field_spec.wire_name: merged.wire for field_spec, merged in parts if merged.wire is not _ABSENT}
+    return _Merged(wire, None)
+
+
+def _listed(children: Sequence[_Merged], values: Sequence[_Entry]) -> _Merged:
+    """A keyed list's merged children: one entry's own list when they are all of it, each its own, else their JSON."""
+    sources = {merged.source for merged in children}
+    source = sources.pop() if len(sources) == 1 else None
+    if source is not None:
+        _, own, wire = next(entry for entry in values if entry[0] == source)
+        if len(own) == len(children):
+            return _Merged(wire, source)
+    return _Merged([merged.wire for merged in children if merged.wire is not _ABSENT], None)
+
+
+def _reads_by_name(model: type[BaseModel]) -> bool:
+    """Whether ``model`` validates a field by its attribute name too (``validate_by_name`` or ``populate_by_name``)."""
+    return bool(model.model_config.get("validate_by_name") or model.model_config.get("populate_by_name"))
+
+
+def _wire_value(node: object, field_spec: FieldSpec, by_name: bool) -> object:
+    """A field's JSON in a record object as its model sent it: under its wire name, else (``by_name``) its attribute
+    name; ``_ABSENT`` when the object holds neither (the field took its default) or is no object."""
+    if not isinstance(node, dict):
+        return _ABSENT
+    if field_spec.wire_name in node:
+        return node[field_spec.wire_name]
+    if by_name and field_spec.name in node:
+        return node[field_spec.name]
+    return _ABSENT
+
+
+def _wire_of(entries: Sequence[_Entry], index: int) -> object:
+    """The JSON of the entry ``index`` among ``entries``."""
+    return next(wire for at, _, wire in entries if at == index)
 
 
 def _children_by_key(
-    child: ModelSpec, values: list[tuple[int, Any]]
-) -> tuple[dict[tuple[object, ...], list[tuple[int, BaseModel]]], set[tuple[object, ...]]]:
-    """Each child key's first instance per entry, in first-seen order; and the keys an entry repeats unequally."""
-    members: dict[tuple[object, ...], list[tuple[int, BaseModel]]] = {}
-    conflicts: set[tuple[object, ...]] = set()
-    for index, children in values:
+    child: ModelSpec, values: list[_Entry]
+) -> tuple[dict[tuple[object, ...], list[_Entry]], dict[tuple[object, ...], set[int]]]:
+    """Each child key's first instance per entry with its JSON, in first-seen order; and per key, the entries
+    repeating it with differing values.
+
+    A child's JSON is the item at its position in the list the model sent, when that list has one item per child.
+    """
+    members: dict[tuple[object, ...], list[_Entry]] = {}
+    conflicts: dict[tuple[object, ...], set[int]] = {}
+    for index, children, wire in values:
+        items = wire if isinstance(wire, list) and len(wire) == len(children) else None
         own: dict[tuple[object, ...], BaseModel] = {}
-        for instance in children:
+        for position, instance in enumerate(children):
             key = _key_of(instance, child)
             if key not in own:
                 own[key] = instance
-                members.setdefault(key, []).append((index, instance))
+                members.setdefault(key, []).append((index, instance, _ABSENT if items is None else items[position]))
             elif _differ(own[key], instance, child):
-                conflicts.add(key)
+                conflicts.setdefault(key, set()).add(index)
     return members, conflicts
 
 
 def _differ(first: BaseModel, second: BaseModel, spec: ModelSpec) -> bool:
     """Whether two instances of ``spec`` differ anywhere (compared as one model's copies)."""
     comparison = _Comparison(voters=2, quorum=None)
-    comparison.compare_model(spec, "", "", [(0, first), (1, second)], 1)
+    comparison.compare_model(spec, "", "", [(0, first, _ABSENT), (1, second, _ABSENT)], 1)
     return bool(comparison.disputed)
 
 
-def _clusters(values: Iterable[tuple[int, object, object]]) -> list[_Cluster]:
-    """Group ``(index, value, normalized)`` triples by their normalized value, clusters in first-seen order.
+def _clusters(values: Iterable[tuple[int, object, object]], *, prefer_wire: bool = True) -> list[_Cluster]:
+    """Group ``(index, wire, normalized)`` triples by their normalized value, clusters in first-seen order.
 
     A normalized value is a hashable canonical form (:func:`_normalized_field`) and the values of one field share
     one exact type (validation and the widening of ints see to it), so grouping is a dictionary lookup, linear in
-    the values; the first value of a cluster is its representative.
+    the values; the first value of a cluster is its representative, and the cluster keeps its JSON (or, when
+    ``prefer_wire`` is true, the first supporter's explicit wire value when earlier supporters left the field to its
+    default).
     """
     clusters: dict[object, _Cluster] = {}
-    for index, value, normalized in values:
+    for index, wire, normalized in values:
         cluster = clusters.get(normalized)
         if cluster is None:
-            clusters[normalized] = _Cluster(normalized=normalized, value=value, supporters=[index])
+            clusters[normalized] = _Cluster(normalized=normalized, wire=wire, source=index, supporters=[index])
         else:
+            if prefer_wire and cluster.wire is _ABSENT and wire is not _ABSENT:
+                cluster.wire = wire
+                cluster.source = index
             cluster.supporters.append(index)
     return list(clusters.values())
 
@@ -1272,7 +1511,7 @@ def _normalized(value: object) -> object:
     if type(value) is float:
         return float(format(value, f".{FLOAT_SIGNIFICANT_DIGITS}g"))
     if type(value) is str:
-        return " ".join(unicodedata.normalize("NFC", value).split())
+        return normalized_text(value)
     if type(value) is datetime and value.utcoffset() is not None:
         return value.astimezone(timezone.utc)
     return value

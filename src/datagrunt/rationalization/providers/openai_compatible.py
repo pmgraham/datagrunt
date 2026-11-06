@@ -52,9 +52,24 @@ rules:
      ``{"anyOf": [<schema>, {"type": "null"}]}`` with its description on the outer node. A null there means "not
      shown": consensus (T10) drops the key before validation, so the caller's pydantic default applies (a factory's
      included); the adapter never changes a reply. Optional fields are sent as they are;
-   - a ``$ref`` must name an entry of the root's ``$defs``, and stands alone, but for a text ``description``, kept as
-     ``{"anyOf": [{"$ref": ...}], "description": ...}`` so the field's instruction survives; a ``const`` becomes a
-     one-value ``enum``;
+   - a ``$ref`` must name an entry of the root's ``$defs`` (``#/$defs/<name>``, the name one RFC 6901 token, read by
+     :func:`~datagrunt.rationalization._refs.def_name` as every transform reads it), and stands alone, but for a
+     text ``description``, kept as ``{"anyOf": [{"$ref": ...}], "description": ...}`` so the field's instruction
+     survives; a ``const`` becomes a one-value ``enum``;
+   - a recursive schema, a ``$ref`` cycle among the ``$defs`` entries through a ``properties`` value, ``items``, an
+     ``anyOf`` member, a schema-valued ``additionalProperties`` or a ``$ref``'s siblings (a ``$ref`` or an
+     ``anyOf`` alone on it included, which no nesting count would ever catch, and an unreferenced entry's), is
+     refused at ``#/$defs`` before anything is transformed, naming its path (``#/$defs/A -> #/$defs/B ->
+     #/$defs/A``, ten hops at most), by the check every transform shares
+     (:func:`~datagrunt.rationalization._refs.ref_cycle`, which reads at most :data:`SCHEMA_MAX_NODES` nodes of the
+     entries and refuses more at ``#/$defs``); ``schema.prepare()`` already refuses a recursive model, so this is
+     defense in depth for a direct caller of the transform;
+   - a keyword that holds subschemas the strict subset does not read, or changes what a ``$ref`` resolves to
+     (:data:`~datagrunt.rationalization._refs.UNREAD_KEYWORDS`: ``oneOf``, ``allOf``, ``not``, ``if`` / ``then`` /
+     ``else``, ``prefixItems``, ``patternProperties``, ``$id``, ...), is refused naming the JSON pointer, as the
+     Anthropic and Gemini adapters refuse it: dropping it would loosen the schema silently, and a ``$ref`` under it
+     would escape the cycle check. ``schema.prepare()`` refuses every one of them, so no prepared schema meets this;
+     beside a ``$ref``, which stands alone, it is dropped with the ``$ref``'s other siblings;
    - every node keeps ``type``, ``description`` (text only), ``enum`` and ``anyOf``, plus its type's own keywords:
      ``pattern`` and ``format`` (one of :data:`SENT_FORMATS`) on a string; ``multipleOf``, ``maximum``,
      ``exclusiveMaximum``, ``minimum`` and ``exclusiveMinimum`` on a number or integer; ``items``, ``minItems`` and
@@ -66,7 +81,7 @@ rules:
      every constraint anyway (plan §4.1);
    - **OpenAI's limits**, checked here, before any request: at most :data:`OPENAI_MAX_PROPERTIES` object properties;
      at most :data:`OPENAI_MAX_NESTING` levels of nesting, counting every object and array on a path (the response
-     wrapper's root, ``records`` and item included), every ``$ref`` followed (a reference cycle nests without end);
+     wrapper's root, ``records`` and item included), every ``$ref`` followed (no cycle is left to follow);
      at most :data:`OPENAI_MAX_ENUM_VALUES` enum values; at most :data:`OPENAI_MAX_TEXT_CHARS` characters of property
      names, definition names and enum values together (a value that is not a string counted as its JSON text, since
      the limit names "enum values" of any type); and at most :data:`OPENAI_MAX_LARGE_ENUM_CHARS` characters in the
@@ -75,8 +90,8 @@ rules:
      definition used twice counts once (if OpenAI counts each use, such a schema fails at its first request with a
      400, a permanent error). Each breach is named with its limit and its count.
 
-   ``strict=False`` sends the schema as given, a fresh equal copy, with none of these checks: a gateway's own limits
-   may differ.
+   ``strict=False`` sends the schema as given, a fresh equal copy, with none of these checks (the ``$ref`` reading,
+   the cycle check and the keyword refusals included): a gateway's own limits may differ.
 5. **The reply.** ``choices[0]`` is read: a ``message.refusal`` other than ``null`` or ``""`` is ``"refused"`` (fail
    closed); else ``finish_reason`` ``"length"`` is ``"truncated"``, ``"content_filter"`` ``"refused"``, and
    ``"stop"`` or anything else (``tool_calls``, a missing or new reason) ``"complete"``. ``content`` is
@@ -162,6 +177,15 @@ from types import MappingProxyType
 from typing import Any, Literal, NoReturn, Protocol, TypeAlias, cast, get_args
 
 from datagrunt.rationalization._canonical import canonical_copy, canonical_json
+from datagrunt.rationalization._refs import (
+    DEFS_POINTER,
+    UNREAD_KEYWORDS,
+    NodeBoundError,
+    cycle_text,
+    def_name,
+    json_pointer,
+    ref_cycle,
+)
 from datagrunt.rationalization.exceptions import RationalizationError
 from datagrunt.rationalization.providers.base import (
     OLLAMA_BASE_URL,
@@ -264,9 +288,8 @@ _OTHER_INTERFACES: Mapping[str, str] = MappingProxyType(
         "ai21": "ai21 models on Google Cloud use rawPredict with no documented request body: they are not supported",
     }
 )
-_DEFS_POINTER = "#/$defs/"
 _CONTAINER_TYPES = ("object", "array")
-_DEPTH_CAP = 4 * OPENAI_MAX_NESTING  # the nesting count stops descending here: a $ref cycle reaches it
+_DEPTH_CAP = 4 * OPENAI_MAX_NESTING  # the nesting count stops descending here: past the limit, deeper adds nothing
 _SHOWN = 10
 _NAME_CHARS = 120
 _COMMON_KEYWORDS = frozenset({"type", "description", "enum", "anyOf"})
@@ -345,18 +368,6 @@ def _refuse_schema(pointer: str, reason: str) -> NoReturn:
     raise RationalizationError(f"the response schema at {pointer} cannot be sent in OpenAI's strict mode: {reason}")
 
 
-def _pointer(base: str, token: str) -> str:
-    """``base`` extended by one JSON-pointer ``token`` (RFC 6901: ``~`` as ``~0``, ``/`` as ``~1``)."""
-    return f"{base}/{token.replace('~', '~0').replace('/', '~1')}"
-
-
-def _def_name(ref: object) -> str | None:
-    """The ``$defs`` entry a local ``#/$defs/<name>`` reference names (RFC 6901 unescaped), else ``None``."""
-    if not isinstance(ref, str) or not ref.startswith(_DEFS_POINTER) or "/" in ref[len(_DEFS_POINTER) :]:
-        return None
-    return ref[len(_DEFS_POINTER) :].replace("~1", "/").replace("~0", "~")
-
-
 def strict_schema(schema: Mapping[str, Any], *, fine_tuned: bool = False) -> dict[str, Any]:
     """Return a fresh copy of ``schema`` in OpenAI's strict subset, within its limits (module notes, 4).
 
@@ -368,9 +379,9 @@ def strict_schema(schema: Mapping[str, Any], *, fine_tuned: bool = False) -> dic
         TypeError: If ``schema`` is not a ``Mapping``.
         RationalizationError: If it is not exactly JSON; its root is not an object or uses ``anyOf``; a node is not
             a schema object; an object has no ``properties`` map; ``anyOf`` is not a list; ``$defs`` is not a map or
-            sits below the root; a ``$ref`` names no ``$defs`` entry; it holds more than :data:`SCHEMA_MAX_NODES`
-            nodes; or it passes one of OpenAI's limits. Each message names where (the JSON pointer, or the limit and
-            the count).
+            sits below the root; a ``$ref`` names no ``$defs`` entry; the ``$defs`` entries refer to one another in a
+            cycle; it holds more than :data:`SCHEMA_MAX_NODES` nodes; or it passes one of OpenAI's limits. Each
+            message names where (the JSON pointer, the cycle's path, or the limit and the count).
     """
     root = _json_copy(schema)
     if root.get("type") != "object" or "anyOf" in root:
@@ -378,11 +389,22 @@ def strict_schema(schema: Mapping[str, Any], *, fine_tuned: bool = False) -> dic
     defs = root.get("$defs", {})
     if not isinstance(defs, dict):
         _refuse_schema(_ROOT, "$defs must map names to schemas")
+    _check_acyclic(defs)
     walk = _Walk(defs=defs, fine_tuned=fine_tuned, text_chars=sum(len(name) for name in defs))
     _transform(root, walk)
     _check_sizes(walk)
     _check_nesting(root, defs)
     return root
+
+
+def _check_acyclic(defs: Mapping[str, Any]) -> None:
+    """Refuse a ``$ref`` cycle among the ``$defs`` entries, naming its path (module notes, 4)."""
+    try:
+        cycle = ref_cycle(defs, max_nodes=SCHEMA_MAX_NODES)
+    except NodeBoundError:
+        _refuse_schema(DEFS_POINTER, f"it has more than {SCHEMA_MAX_NODES} nodes")
+    if cycle is not None:
+        _refuse_schema(DEFS_POINTER, f"it is recursive (a $ref cycle: {cycle_text(cycle)})")
 
 
 def _json_copy(schema: object) -> dict[str, Any]:
@@ -413,6 +435,9 @@ def _strict_node(node: object, pointer: str, walk: _Walk) -> list[_Pending]:
         return []
     if "$defs" in node and pointer != _ROOT:
         _refuse_schema(pointer, "$defs may only sit at the root")
+    unread = sorted(keyword for keyword in node if keyword in UNREAD_KEYWORDS)
+    if unread:
+        _refuse_schema(pointer, f"{unread[0]!r} holds subschemas strict mode would drop, loosening the schema silently")
     is_object = node.get("type") == "object"
     if is_object:
         _null_defaults(node)
@@ -428,7 +453,7 @@ def _strict_node(node: object, pointer: str, walk: _Walk) -> list[_Pending]:
 def _strict_ref(node: dict[str, Any], pointer: str, defs: Mapping[str, Any]) -> None:
     """A ``$ref`` alone, or beside its text description inside a one-member ``anyOf``; it must resolve."""
     ref, description = node.get("$ref"), node.get("description")
-    name = _def_name(ref)
+    name = def_name(ref)
     if name is None or name not in defs:
         _refuse_schema(pointer, "a $ref must name an entry of the root's $defs (#/$defs/<name>)")
     node.clear()
@@ -530,7 +555,7 @@ def _tally_enum(node: Mapping[str, Any], pointer: str, walk: _Walk) -> None:
 def _children(node: dict[str, Any], pointer: str) -> list[_Pending]:
     """The schemas under ``node``: its properties, its items, its anyOf members, then (at the root) its $defs."""
     children: list[_Pending] = [
-        (child, _pointer(f"{pointer}/properties", name)) for name, child in node.get("properties", {}).items()
+        (child, json_pointer(f"{pointer}/properties", name)) for name, child in node.get("properties", {}).items()
     ]
     if "items" in node:
         children.append((node["items"], f"{pointer}/items"))
@@ -539,7 +564,7 @@ def _children(node: dict[str, Any], pointer: str) -> list[_Pending]:
         _refuse_schema(pointer, "anyOf must be a list of schemas")
     children.extend((member, f"{pointer}/anyOf/{index}") for index, member in enumerate(members))
     defs = node.get("$defs", {}) if pointer == _ROOT else {}
-    children.extend((child, _pointer(f"{pointer}/$defs", name)) for name, child in defs.items())
+    children.extend((child, json_pointer(f"{pointer}/$defs", name)) for name, child in defs.items())
     return children
 
 
@@ -575,7 +600,7 @@ def _subschemas(node: Mapping[str, Any]) -> list[dict[str, Any]]:
 def _deepest(root: dict[str, Any], defs: Mapping[str, Any]) -> int:
     """The most objects and arrays on one path of a transformed schema, every ``$ref`` followed, at most
     :data:`_DEPTH_CAP`. A definition is entered again only at a deeper level than before, so each is entered at most
-    once per level, and a cycle ends at the cap."""
+    once per level. :func:`_check_acyclic` has refused every ``$ref`` cycle already; the cap bounds the walk anyway."""
     entered: dict[str, int] = {}
     stack: list[tuple[dict[str, Any], int]] = [(root, 0)]
     deepest = 0
@@ -583,7 +608,7 @@ def _deepest(root: dict[str, Any], defs: Mapping[str, Any]) -> int:
         if not stack:
             return deepest
         node, level = stack.pop()
-        name = _def_name(node.get("$ref"))
+        name = def_name(node.get("$ref"))
         if name is not None:
             if entered.get(name, -1) < level:
                 entered[name] = level
@@ -599,7 +624,7 @@ def _deepest(root: dict[str, Any], defs: Mapping[str, Any]) -> int:
 def _check_nesting(root: dict[str, Any], defs: Mapping[str, Any]) -> None:
     deepest = _deepest(root, defs)
     if deepest > OPENAI_MAX_NESTING:
-        more = " or more (a $ref cycle?)" if deepest >= _DEPTH_CAP else ""
+        more = " or more" if deepest >= _DEPTH_CAP else ""
         raise RationalizationError(
             f"the response schema passes OpenAI's strict-mode limit of {OPENAI_MAX_NESTING} levels of nesting "
             f"(objects and arrays on one path, every $ref followed, the response wrapper's three included): it nests "

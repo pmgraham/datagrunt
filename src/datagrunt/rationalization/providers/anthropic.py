@@ -68,14 +68,22 @@ words; see the known limits); datagrunt still validates every record locally, wh
    among them too: pydantic gives an aware and a naive datetime the same ``format: date-time``, and RFC 3339 requires
    an offset, so enforcing it would force one onto a naive value that pydantic then rejects. Other annotations
    (``title``, ``examples``, ``deprecated``, ``x-...``) are dropped. A ``$ref`` must be a local ``#/$defs/<name>``
-   naming a root ``$defs`` entry and is kept alone: its siblings are dropped, as the SDKs drop them. Refused, naming
-   the JSON pointer: a keyword that combines or conditions schemas or holds subschemas the walk does not read
-   (``oneOf``, ``allOf``, ``not``, ``if``, ``patternProperties``, ``prefixItems``, ``dependentRequired``, ``$id``,
-   ``$anchor``, ...), ``$defs`` anywhere but the root, a node with no ``type``, ``$ref``, ``anyOf``, ``enum`` or
-   ``const`` (``{}``, pydantic's ``Any``: nothing to enforce), a tuple ``items``, an enum or const holding an object
-   or array, a malformed keyword (a type list naming a type twice included), and a recursive schema (a ``$defs``
-   cycle). The walk is iterative: at most :data:`SCHEMA_MAX_NODES` nodes, at most :data:`SCHEMA_MAX_DEPTH` levels
-   deep.
+   naming a root ``$defs`` entry, the name one RFC 6901 token (``~1`` for ``/``, ``~0`` for ``~``), read by
+   :func:`~datagrunt.rationalization._refs.def_name` as every transform reads it, and is kept alone: its siblings
+   are dropped, as the SDKs drop them. Refused, naming the JSON pointer (RFC 6901 escaped): a keyword that combines
+   or conditions schemas or holds subschemas the walk does not read (``oneOf``, ``allOf``, ``not``, ``if``,
+   ``patternProperties``, ``prefixItems``, ``dependentRequired``, ``$id``, ``$anchor``, ...), ``$defs`` anywhere but
+   the root, a node with no ``type``, ``$ref``, ``anyOf``, ``enum`` or ``const`` (``{}``, pydantic's ``Any``:
+   nothing to enforce), a tuple ``items``, an enum or const holding an object or array, and a malformed keyword (a
+   type list naming a type twice included). A recursive schema, a ``$ref`` cycle among the ``$defs`` entries (an
+   unreferenced entry's included) through a ``properties`` value, ``items``, an ``anyOf`` member, a schema-valued
+   ``additionalProperties`` or a ``$ref``'s siblings, is refused at ``#/$defs`` before anything is converted,
+   naming its path (``#/$defs/A -> #/$defs/B -> #/$defs/A``, ten hops at most), by the check every transform
+   shares (:func:`~datagrunt.rationalization._refs.ref_cycle`; the other keywords holding subschemas are refused
+   above); ``schema.prepare()`` already refuses a recursive model, so this is defense in depth for a direct caller
+   of the transform. The walk is iterative: at most :data:`SCHEMA_MAX_NODES` nodes, at most
+   :data:`SCHEMA_MAX_DEPTH` levels deep; the cycle check reads at most :data:`SCHEMA_MAX_NODES` nodes of the
+   ``$defs`` entries, a ``$ref``'s dropped siblings included, and refuses more at ``#/$defs``.
 4. **The limits.** Structured outputs accept at most :data:`MAX_OPTIONAL_PARAMETERS` (24) optional parameters
    ("each parameter not listed in ``required``") and :data:`MAX_UNION_PARAMETERS` (16) union-typed ones ("parameters
    that use ``anyOf`` or type arrays") per request. :func:`parameter_counts` counts both once per definition: the
@@ -161,6 +169,15 @@ from typing import Any, Final, NoReturn, cast
 from urllib.parse import urlsplit
 
 from datagrunt.rationalization._canonical import canonical_copy, canonical_json
+from datagrunt.rationalization._refs import (
+    DEFS_POINTER,
+    UNREAD_KEYWORDS,
+    NodeBoundError,
+    cycle_text,
+    def_name,
+    json_pointer,
+    ref_cycle,
+)
 from datagrunt.rationalization.exceptions import RationalizationError
 from datagrunt.rationalization.providers.base import (
     ModelString,
@@ -250,7 +267,6 @@ _OPTIONS = frozenset({"base_url", "api_version", "temperature", "allow_insecure_
 _TYPED_KEYWORDS = ("type", "anyOf", "enum", "const")
 _OPTIONS_SHOWN = 10
 _JSON_TYPES = frozenset({"object", "array", "string", "integer", "number", "boolean", "null"})
-_DEFS_PREFIX = "#/$defs/"
 # Constraints the grammar does not take: removed, and appended to the description as a hint.
 _HINTED = frozenset(
     {
@@ -270,35 +286,9 @@ _HINTED = frozenset(
         "maxContains",
     }
 )
-# Keywords that combine, condition or hold schemas the walk does not read, or change what a $ref resolves to.
-_REFUSED = frozenset(
-    {
-        "oneOf",
-        "allOf",
-        "not",
-        "if",
-        "then",
-        "else",
-        "patternProperties",
-        "prefixItems",
-        "additionalItems",
-        "contains",
-        "propertyNames",
-        "dependentSchemas",
-        "dependencies",
-        "dependentRequired",
-        "unevaluatedProperties",
-        "unevaluatedItems",
-        "contentSchema",
-        "definitions",
-        "$dynamicRef",
-        "$recursiveRef",
-        "$id",
-        "$anchor",
-        "$dynamicAnchor",
-        "$recursiveAnchor",
-    }
-)
+# Keywords that combine, condition or hold schemas the walk does not read, or change what a $ref resolves to; and
+# dependentRequired, which the grammar does not take.
+_REFUSED = UNREAD_KEYWORDS | frozenset({"dependentRequired"})
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -402,13 +392,12 @@ def _is_scalar(value: object) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class _Node:
-    """A schema node still to convert: its source, its (empty) copy, where it is, and whose ``$defs`` entry it is in."""
+    """A schema node still to convert: its source, its (empty) copy, where it is, and how deep."""
 
     source: object
     target: dict[str, Any] = field(repr=False)
     pointer: str
     depth: int
-    owner: str | None
 
 
 class _Walk:
@@ -417,7 +406,6 @@ class _Walk:
     def __init__(self, definitions: Mapping[str, Any]) -> None:
         self.definitions = definitions
         self.stack: list[_Node] = []
-        self.edges: dict[str, set[str]] = {name: set() for name in definitions}
         self.visited = 0
 
     def run(self) -> None:
@@ -432,7 +420,7 @@ class _Walk:
 
     def push(self, source: object, pointer: str, parent: _Node) -> dict[str, Any]:
         target: dict[str, Any] = {}
-        self.stack.append(_Node(source, target, pointer, parent.depth + 1, parent.owner))
+        self.stack.append(_Node(source, target, pointer, parent.depth + 1))
         return target
 
     def convert(self, node: _Node) -> None:
@@ -459,16 +447,14 @@ class _Walk:
 
     def convert_ref(self, node: _Node, ref: object) -> None:
         """A ``$ref`` is kept alone (its siblings dropped), and must name a root ``$defs`` entry."""
-        if not isinstance(ref, str) or not ref.startswith(_DEFS_PREFIX):
+        name = def_name(ref)
+        if name is None:
             _refuse_at(
                 node.pointer, "a $ref must be a local #/$defs/<name> reference (an external $ref is not supported)"
             )
-        name = ref[len(_DEFS_PREFIX) :]
         if name not in self.definitions:
             _refuse_at(node.pointer, f"the $ref names no $defs entry {name}")
         node.target["$ref"] = ref
-        if node.owner is not None:
-            self.edges[node.owner].add(name)
 
     def copy_values(self, node: _Node, source: Mapping[str, Any]) -> None:
         """``type``, ``enum``, ``const``, ``description`` and ``default``, each checked."""
@@ -499,7 +485,8 @@ class _Walk:
             if not isinstance(properties, dict):
                 _refuse_at(pointer, "properties must be an object")
             target["properties"] = {
-                name: self.push(child, f"{pointer}/properties/{name}", node) for name, child in properties.items()
+                name: self.push(child, json_pointer(f"{pointer}/properties", name), node)
+                for name, child in properties.items()
             }
         if "items" in source:
             if not isinstance(source["items"], dict):
@@ -555,28 +542,15 @@ def _add_hints(target: dict[str, Any], hints: Mapping[str, Any]) -> None:
     target["description"] = f"{description}\n\n{text}" if description else text
 
 
-def _check_acyclic(edges: Mapping[str, set[str]]) -> None:
-    """Refuse a ``$defs`` cycle (structured outputs refuse recursive schemas): an iterative depth-first search."""
-    done: set[str] = set()
-    for start in sorted(edges):
-        if start in done:
-            continue
-        path: list[str] = [start]
-        pending: list[list[str]] = [sorted(edges[start])]
-        while pending:  # bounded: each entry joins the path once and leaves it for done
-            if not pending[-1]:
-                done.add(path.pop())
-                pending.pop()
-                continue
-            following = pending[-1].pop()
-            if following in path:
-                raise RationalizationError(
-                    f"the response schema is recursive (the $defs entry {following} refers back to itself), which "
-                    "Anthropic structured outputs do not support"
-                )
-            if following not in done:
-                path.append(following)
-                pending.append(sorted(edges[following]))
+def _check_acyclic(definitions: Mapping[str, Any]) -> None:
+    """Refuse a ``$ref`` cycle among the ``$defs`` entries, naming its path (module notes, 3): structured outputs
+    refuse recursive schemas."""
+    try:
+        cycle = ref_cycle(definitions, max_nodes=SCHEMA_MAX_NODES)
+    except NodeBoundError:
+        _refuse_at(DEFS_POINTER, f"it has more than {SCHEMA_MAX_NODES:,} schema nodes")
+    if cycle is not None:
+        _refuse_at(DEFS_POINTER, f"it is recursive (a $ref cycle: {cycle_text(cycle)})")
 
 
 def _is_union(node: object) -> bool:
@@ -598,8 +572,9 @@ def _count_body(body: object) -> tuple[set[str], int, int]:
             continue
         ref = node.get("$ref")
         if isinstance(ref, str):
-            if ref.startswith(_DEFS_PREFIX):
-                refs.add(ref[len(_DEFS_PREFIX) :])
+            name = def_name(ref)
+            if name is not None:
+                refs.add(name)
             continue
         properties = node.get("properties")
         if isinstance(properties, Mapping):
@@ -668,16 +643,16 @@ def transform_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
         _refuse_at("#", "the root must be an object schema (type object)")
     definitions = document.get("$defs", {})
     if not isinstance(definitions, dict):
-        _refuse_at("#/$defs", "$defs must be an object")
+        _refuse_at(DEFS_POINTER, "$defs must be an object")
+    _check_acyclic(definitions)
     walk = _Walk(definitions)
     result: dict[str, Any] = {}
-    walk.stack.append(_Node(document, result, "#", 1, None))
+    walk.stack.append(_Node(document, result, "#", 1))
     if definitions:
         result["$defs"] = {name: {} for name in definitions}
         for name, definition in definitions.items():
-            walk.stack.append(_Node(definition, result["$defs"][name], f"#/$defs/{name}", 1, name))
+            walk.stack.append(_Node(definition, result["$defs"][name], json_pointer(DEFS_POINTER, name), 1))
     walk.run()
-    _check_acyclic(walk.edges)
     _check_limits(*parameter_counts(result))
     copy: dict[str, Any] = canonical_copy(result, subject="the transformed response schema")
     return copy

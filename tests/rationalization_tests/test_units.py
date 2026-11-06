@@ -40,7 +40,15 @@ from datagrunt.pdf.elements import (
     Table,
 )
 from datagrunt.rationalization import units as units_module
-from datagrunt.rationalization.units import BLOCK_SEPARATOR, SkippedUnit, Unit, UnitPlan, build_units
+from datagrunt.rationalization.units import (
+    BLOCK_SEPARATOR,
+    GroupScope,
+    SkippedUnit,
+    Unit,
+    UnitPlan,
+    build_units,
+    group_scopes,
+)
 
 DOC = metadata(0).doc_id  # a document's id depends on its source name and hash, not its pages
 BIG = 1_000_000
@@ -157,6 +165,61 @@ def section(elements, heading_element: Heading | None = None) -> Section:
         page_span=(min(pages), max(pages)),
         elements=tuple(elements),
     )
+
+
+CONTRACT = ("Contract",)
+CANCELLED = ("Contract", "Cancelled")
+PAYMENT = "Payment due: $100."
+
+
+def cancelled_document(*, twin: Heading, before: tuple[Heading, ...] = (), hidden=("invisible",)) -> PDFDocument:
+    """Page 1: a visible "Contract", the headings ``before``, then a "Cancelled" (hidden by default) whose section
+    holds the payment line; page 2: ``twin``, a visible heading, over a line of its own.
+
+    Each heading records the scope path the scope pass would give it, and opens a section of its own.
+    """
+    contract = heading(1, 0, "Contract")
+    at = 1 + len(before)
+    cancelled = Heading(**fields(1, at, CANCELLED, hidden), level=2, text="Cancelled")
+    payment = para(1, at + 1, PAYMENT, scope=CANCELLED)
+    note = para(2, twin.reading_order + 1, "Order 7 was cancelled.", scope=twin.scope_path)
+    openers = (contract, *before)
+    return document(
+        page(1, (*openers, cancelled, payment)),
+        page(2, (twin, note)),
+        sections=[
+            *(section((item,), item) for item in openers),
+            section((cancelled, payment), cancelled),
+            section((twin, note), twin),
+        ],
+    )
+
+
+def late_heading_document(*, hidden=("invisible",)) -> PDFDocument:
+    """Page 1: a visible "Contract"; a visible "Cancelled" over an old order's line; a visible "Active" closing it;
+    the payment line; then the payment section's own "Cancelled" heading (hidden by default), after the line it
+    opens and named only as the section's heading, not among its elements."""
+    contract = heading(1, 0, "Contract")
+    twin = Heading(**fields(1, 1, CANCELLED), level=2, text="Cancelled")
+    old = para(1, 2, "Order 7 was cancelled.", scope=CANCELLED)
+    active = Heading(**fields(1, 3, ("Contract", "Active")), level=2, text="Active")
+    payment = para(1, 4, PAYMENT, scope=CANCELLED)
+    own = Heading(**fields(1, 5, CANCELLED, hidden), level=2, text="Cancelled")
+    return document(
+        page(1, (contract, twin, old, active, payment, own)),
+        sections=[
+            section((contract,), contract),
+            section((twin, old), twin),
+            section((active,), active),
+            Section(heading=own, scope_path=CANCELLED, page_span=(1, 1), elements=(payment,)),
+        ],
+    )
+
+
+def payment_unit(plan: UnitPlan) -> Unit:
+    """The unit holding :data:`PAYMENT`."""
+    (unit,) = [unit for unit in plan.units if any(getattr(item, "text", None) == PAYMENT for item in unit.elements)]
+    return unit
 
 
 def unit_ids(plan: UnitPlan) -> list[str]:
@@ -517,18 +580,114 @@ class TestScopePath:
         assert [item.reason for item in plan.skipped] == ["all_hidden"]
         assert all("SECRET" not in entry for entry in unit.scope_path)
 
-    def test_an_entry_stays_when_a_visible_heading_has_its_text_and_order_is_kept(self):
-        outer = heading(1, 0, "Zed")
-        scope = ("Zed", "Ghost", "Alpha")
-        hidden_inner = heading(1, 2, "Alpha", scope=scope, hidden=("invisible",))
-        body = para(1, 3, scope=scope)
-        visible_twin = heading(2, 0, "Alpha")
+    def test_a_hidden_openers_entry_is_dropped_though_a_visible_heading_elsewhere_has_its_text(self):
+        # An invisible "Cancelled" heading must not re-label the visible payment line, whatever an unrelated visible
+        # "Cancelled" heading elsewhere says.
+        doc = cancelled_document(twin=heading(2, 0, "Cancelled"))
+        plan = build_units(doc, max_unit_chars=BIG, render=markdown)
+
+        by_first = {unit.elements[0].element_id: unit for unit in plan.units}
+        assert (by_first["p0001_e002"].scope_path, by_first["p0001_e002"].scope_entries_excluded) == (CONTRACT, 1)
+        assert (by_first["p0002_e000"].scope_path, by_first["p0002_e000"].scope_entries_excluded) == (("Cancelled",), 0)
+        assert plan.scope_entries_excluded_total == 1
+
+    def test_a_visible_heading_recording_the_path_after_the_section_did_not_open_it(self):
+        # Page 2's visible twin records the very path ("Contract", "Cancelled"), but it opens nothing before it.
+        doc = cancelled_document(twin=heading(2, 0, "Cancelled", scope=CANCELLED))
+        plan = build_units(doc, max_unit_chars=BIG, render=markdown)
+
+        unit = payment_unit(plan)
+        assert (unit.scope_path, unit.scope_entries_excluded) == (CONTRACT, 1)
+
+    def test_the_last_heading_to_open_a_path_is_its_opener_so_a_hidden_one_reopening_it_drops_it(self):
+        # An earlier visible "Cancelled" records the same path, but the hidden one opens the payment's section.
+        earlier = heading(1, 1, "Cancelled", scope=CANCELLED)
+        doc = cancelled_document(twin=heading(2, 0, "Cancelled"), before=(earlier,))
+        plan = build_units(doc, max_unit_chars=BIG, render=markdown)
+
+        unit = payment_unit(plan)
+        assert (unit.scope_path, unit.scope_entries_excluded) == (CONTRACT, 1)
+        assert [item.scope_path for item in plan.units if earlier in item.elements] == [CANCELLED]
+
+    def test_a_hidden_section_heading_after_its_first_member_still_opens_its_last_entry(self):
+        # The section names its heading: that heading opens the last entry wherever it stands, so the earlier
+        # visible "Cancelled" (closed by "Active") opens nothing here, in a document read from a mapping too.
+        doc = late_heading_document()
+        loaded = PDFReader(json.loads(json.dumps(document_to_json(doc)))).document
+        for item in (doc, loaded):
+            unit = payment_unit(build_units(item, max_unit_chars=BIG, render=markdown))
+            assert (unit.scope_path, unit.scope_entries_excluded) == (CONTRACT, 1)
+
+    def test_a_visible_section_heading_after_its_first_member_keeps_its_last_entry(self):
+        intro = heading(1, 0, "Intro")
+        body = para(1, 1, "Body before its heading", scope=("Intro", "Terms"))
+        terms = Heading(**fields(1, 2, ("Intro", "Terms")), level=2, text="Terms")
         doc = document(
-            page(1, (outer, para(1, 1, scope=("Zed",)), hidden_inner, body)),
-            page(2, (visible_twin,)),
+            page(1, (intro, body, terms)),
+            sections=[
+                section((intro,), intro),
+                Section(heading=terms, scope_path=("Intro", "Terms"), page_span=(1, 1), elements=(body,)),
+            ],
+        )
+        plan = build_units(doc, max_unit_chars=BIG, render=markdown)
+
+        assert [(unit.scope_path, unit.scope_entries_excluded) for unit in plan.units] == [
+            (("Intro",), 0),
+            (("Intro", "Terms"), 0),
+        ]
+
+    def test_after_an_entry_no_heading_records_no_later_entry_has_an_opener(self):
+        # Nothing records a path through "X", so the visible top-level "Y", on another branch, opens nothing here.
+        top = heading(1, 0, "Y")
+        under_top = para(1, 1, "Under the top-level Y", scope=("Y",))
+        body = para(1, 2, "Under X > Y", scope=("X", "Y"))
+        doc = document(
+            page(1, (top, under_top, body)),
+            sections=[
+                section((top, under_top), top),
+                Section(heading=None, scope_path=("X", "Y"), page_span=(1, 1), elements=(body,)),
+            ],
+        )
+        plan = build_units(doc, max_unit_chars=BIG, render=markdown)
+
+        assert [(unit.scope_path, unit.scope_entries_excluded) for unit in plan.units] == [(("Y",), 0), ((), 2)]
+
+    def test_a_middle_entry_no_heading_opened_is_dropped_between_visible_ones(self):
+        outer = heading(1, 0, "Zed")
+        inner = Heading(**fields(1, 1, ("Zed", "Mid", "Alpha")), level=3, text="Alpha")
+        body = para(1, 2, scope=("Zed", "Mid", "Alpha"))
+        doc = document(
+            page(1, (outer, inner, body)),
+            sections=[section((outer,), outer), section((inner, body), inner)],
+        )
+        plan = build_units(doc, max_unit_chars=BIG, render=markdown)
+
+        assert [(unit.scope_path, unit.scope_entries_excluded) for unit in plan.units] == [
+            (("Zed",), 0),
+            (("Zed", "Alpha"), 1),
+        ]
+
+    def test_a_visible_opener_on_the_sections_own_branch_keeps_its_entry(self):
+        doc = cancelled_document(twin=heading(2, 0, "Cancelled"), hidden=())
+        unit = payment_unit(build_units(doc, max_unit_chars=BIG, render=markdown))
+
+        assert (unit.scope_path, unit.scope_entries_excluded) == (CANCELLED, 0)
+
+    def test_a_hidden_ancestor_between_visible_openers_drops_only_itself_and_order_is_kept(self):
+        outer = heading(1, 0, "Zed")
+        ghost = heading(1, 2, "Ghost", scope=("Zed", "Ghost"), hidden=("invisible",))
+        scope = ("Zed", "Ghost", "Alpha")
+        inner = heading(1, 3, "Alpha", scope=scope)
+        body = para(1, 4, scope=scope)
+        twin = heading(2, 0, "Ghost")  # a visible "Ghost" elsewhere opens nothing on this branch
+        doc = document(
+            page(1, (outer, para(1, 1, scope=("Zed",)), ghost, inner, body)),
+            page(2, (twin,)),
             sections=[
                 Section(heading=outer, scope_path=("Zed",), page_span=(1, 1), elements=(outer,)),
-                Section(heading=hidden_inner, scope_path=scope, page_span=(1, 1), elements=(hidden_inner, body)),
+                section((ghost,), ghost),
+                section((inner, body), inner),
+                section((twin,), twin),
             ],
         )
         plan = build_units(doc, max_unit_chars=BIG, render=markdown)
@@ -537,6 +696,7 @@ class TestScopePath:
         assert by_first["p0001_e003"].scope_path == ("Zed", "Alpha")  # in order, not sorted
         assert by_first["p0001_e003"].scope_entries_excluded == 1
         assert by_first["p0001_e001"].scope_path == ()
+        assert [item.reason for item in plan.skipped] == ["all_hidden"]
 
     @pytest.mark.parametrize(
         ("entry", "kept"),
@@ -623,6 +783,37 @@ class TestScopePath:
             assert plan.hidden_elements_total >= 2
             sent = "\n".join(block for unit in plan.units for block in unit.blocks)
             assert "SECRET" not in sent + repr([unit.scope_path for unit in plan.units])
+
+
+class TestGroupScope:
+    """The rule's value type and entry point, shared with the envelope, refuse what they cannot hold."""
+
+    @pytest.mark.parametrize(
+        ("changes", "error"),
+        [
+            ({"openers": (heading(1, 0, "H", hidden=("invisible",)),)}, ValueError),
+            ({"openers": [heading(1, 0, "H")]}, TypeError),
+            ({"openers": (para(1, 0),)}, TypeError),
+            ({"section": -1}, ValueError),
+            ({"section": True}, TypeError),
+            ({"excluded": -1}, ValueError),
+            ({"excluded": 1.0}, TypeError),
+        ],
+        ids=["hidden-opener", "list", "not-a-heading", "negative-section", "bool-section", "negative", "float"],
+    )
+    def test_a_malformed_scope_is_refused(self, changes, error):
+        with pytest.raises(error):
+            GroupScope(**{"section": 0, "openers": (), "excluded": 0, **changes})
+
+    def test_a_scopes_path_is_its_openers_texts_in_order(self):
+        openers = (heading(1, 0, "Zed"), heading(1, 1, "Alpha", scope=("Zed", "Alpha")))
+
+        assert GroupScope(section=0, openers=openers, excluded=1).path == ("Zed", "Alpha")
+
+    @pytest.mark.parametrize("value", [None, "doc", rich_document().pages[0]])
+    def test_group_scopes_takes_a_document_only(self, value):
+        with pytest.raises(TypeError, match="PDFDocument"):
+            group_scopes(value)
 
 
 class TestNoText:
@@ -1332,12 +1523,36 @@ def bodies(draw, page_number: int, index: int, scope: tuple[str, ...]) -> Docume
     return Table(**shared, headers=headers, rows=tuple(rows), extraction_method="stream")
 
 
+def prefixes(run_index: int, texts: list[str], paths: list[tuple[str, ...]]) -> list[tuple[str, ...]]:
+    """The scope prefixes a run may take: none; a text no heading has ("Ghost"); an earlier heading's text, or its
+    recorded path at any depth; such a path with a middle entry no heading opens ("Mid") after it; or such a path
+    under this run's own "X<n>", which nothing records before it, so every entry lies off every recorded path."""
+    return [
+        (),
+        ("Ghost",),
+        *((text,) for text in texts),
+        *paths,
+        *((*path, "Mid") for path in paths),
+        *((f"X{run_index}", *path) for path in paths),
+    ]
+
+
+@st.composite
+def orphan(draw, number: int, index: int, run_index: int, texts: list[str], paths: list) -> Heading:
+    """A heading in no section, hidden or visible: a text of its own or an earlier one, or an earlier path again."""
+    if paths and draw(st.booleans()):
+        recorded = draw(st.sampled_from(paths))
+    else:
+        recorded = (draw(st.sampled_from(["Ghost", f"O{run_index}", *texts])),)
+    return heading(number, index, recorded[-1], scope=recorded, hidden=draw(HIDDEN))
+
+
 @st.composite
 def documents(draw) -> PDFDocument:
     """Up to 4 pages (digital, hybrid, vision or error); runs of elements as headed or plain sections, or none.
 
-    Scope paths nest under earlier headings' texts (hidden or visible) or a text no heading has ("Ghost"); orphan
-    headings, hidden or visible, may repeat a text.
+    Scope paths nest under :func:`prefixes`. A headed section's heading is listed first among its elements, or not
+    listed, standing first or last among its members. Orphan headings may re-record an earlier heading's path.
     """
     routes = draw(st.lists(st.sampled_from(ROUTES), max_size=4))
     slots = []
@@ -1352,28 +1567,32 @@ def documents(draw) -> PDFDocument:
         runs[-1].append(slot)
     on_page: dict[int, list[DocumentElement]] = {number: [] for number in range(1, len(routes) + 1)}
     sections = []
-    texts: list[str] = []  # every heading text so far, hidden or visible: scope paths reuse them
+    texts: list[str] = []  # every heading's text so far, hidden or visible
+    paths: list[tuple[str, ...]] = []  # every heading's recorded path so far, hidden or visible
     for run_index, run in enumerate(runs):
         kind = draw(st.sampled_from(("orphans", "plain", "headed")))
-        prefix = () if kind == "orphans" else draw(st.sampled_from([(), ("Ghost",), *((text,) for text in texts)]))
+        prefix = () if kind == "orphans" else draw(st.sampled_from(prefixes(run_index, texts, paths)))
         scope = (*prefix, f"S{run_index}") if kind == "headed" else prefix
-        members = []
+        place = draw(st.sampled_from(("listed", "unlisted", "late"))) if kind == "headed" else "none"
+        at = len(run) - 1 if place == "late" else 0  # where a headed run's heading stands
+        members: list[DocumentElement] = []
+        opener = None
         for position, (number, index) in enumerate(run):
-            if kind == "headed" and position == 0:
-                element = heading(number, index, scope[-1], scope=scope, hidden=draw(HIDDEN))
-                texts.append(scope[-1])
+            if kind == "headed" and position == at:
+                element = opener = heading(number, index, scope[-1], scope=scope, hidden=draw(HIDDEN))
             elif kind == "orphans" and draw(st.integers(0, 3)) == 0:
-                text = draw(st.sampled_from(["Ghost", f"O{run_index}", *texts]))
-                element = heading(number, index, text, hidden=draw(HIDDEN))
-                texts.append(text)
+                element = draw(orphan(number, index, run_index, texts, paths))
             else:
                 element = draw(bodies(number, index, scope))
+            if isinstance(element, Heading):
+                texts.append(element.text)
+                paths.append(element.scope_path)
             members.append(element)
             on_page[number].append(element)
         if kind != "orphans":
-            opener = members[0] if kind == "headed" else None
+            listed = tuple(element for element in members if place == "listed" or element is not opener)
             span = (run[0][0], run[-1][0])
-            sections.append(Section(heading=opener, scope_path=scope, page_span=span, elements=tuple(members)))
+            sections.append(Section(heading=opener, scope_path=scope, page_span=span, elements=listed))
     pages = [
         error(number) if route == "error" else page(number, tuple(on_page[number]), route=route)
         for number, route in enumerate(routes, start=1)
@@ -1555,6 +1774,28 @@ def skipped_start(doc: PDFDocument, item: SkippedUnit) -> tuple[int, int, int]:
     return element.page_number, element.reading_order, part or 0
 
 
+def opened_scope(doc: PDFDocument, key: tuple[str, int]) -> tuple[tuple[str, ...], int]:
+    """A group's kept scope entries and dropped count, by brute force (the oracle for module notes, 2).
+
+    Entry k is kept when its opener is visible: the section's own heading for its last entry, when it has one, else
+    the last heading, at or before the section's first member, whose own path is the section's first k entries.
+    """
+    if key[0] == "page":
+        return (), 0
+    item = doc.sections[key[1]]
+    members = [element for element in (item.heading, *item.elements) if element is not None]
+    start = min((element.page_number, element.reading_order) for element in members)
+    kept = []
+    for size in range(1, len(item.scope_path) + 1):
+        prefix = item.scope_path[:size]
+        found = [h for h in doc.headings if h.scope_path == prefix and (h.page_number, h.reading_order) <= start]
+        own = size == len(item.scope_path) and item.heading is not None
+        opener = item.heading if own else (found[-1] if found else None)
+        if opener is not None and not opener.hidden_reasons:
+            kept.append(prefix[-1])
+    return tuple(kept), len(item.scope_path) - len(kept)
+
+
 def check_grouping(doc: PDFDocument, plan: UnitPlan, limit: int) -> None:
     """Each unit in one group, units in document order of their first elements, each full before its group's next."""
     keys = group_keys(doc)
@@ -1565,10 +1806,7 @@ def check_grouping(doc: PDFDocument, plan: UnitPlan, limit: int) -> None:
     for unit in plan.units:
         (key,) = {keys[element.element_id] for element in unit.elements}
         by_group.setdefault(key, []).append(unit)
-        scope = doc.sections[key[1]].scope_path if key[0] == "section" else ()
-        kept = tuple(entry for entry in scope if entry in shown)
-        assert unit.scope_path == kept
-        assert unit.scope_entries_excluded == len(scope) - len(kept)
+        assert (unit.scope_path, unit.scope_entries_excluded) == opened_scope(doc, key)
         assert not hidden_only & set(unit.scope_path)  # C1: no hidden heading's text, unless a visible one's too
     assert plan.scope_entries_excluded_total == sum(unit.scope_entries_excluded for unit in plan.units)
     starts = [first_position(unit) for unit in plan.units]

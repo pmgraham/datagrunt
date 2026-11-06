@@ -11,12 +11,23 @@ parts are copies made by :func:`dataclasses.replace`. The rules, in order:
    out and never passed to ``render``. It counts once under each of its reasons, in one unit (or skipped unit) and
    in the plan's totals: in the unit holding the visible element before it in its group, or in its group's first
    unit when none comes before it.
-2. **Scope paths** (invariant 1). A unit's scope path is its group's, keeping, in order, only the entries that are
-   the text of a visible heading somewhere in the document. Every other entry is dropped and counted in the unit's
-   ``scope_entries_excluded``: the text of a hidden heading, which a hand-built or loaded document can put in a
-   scope path, or a text no heading has. The pipeline opens sections at visible headings only, so its paths pass
-   whole. An element's own ``scope_path`` is never used: T3 must render a unit's ``scope_path`` only, never an
-   element's.
+2. **Scope paths** (invariant 1). A unit's scope path is its group's, keeping, in order, only the entries whose
+   opening heading is visible. A section's last entry is opened by its own ``heading`` when it has one, by
+   identity, wherever that heading stands (the document records it: its path is the section's). Any other entry
+   ``k`` (an ancestor, or the last entry of a section without a heading) is opened by the last heading, in document
+   order at or before the section's first member, whose own ``scope_path`` is the section's first ``k`` entries,
+   found by recorded path and position; a heading's path ends with its text, so that text is the entry. In the
+   pipeline these are the headings the scope pass pushed (``scope.py`` gives each element the texts of the open
+   visible headings: a visible heading records the path it opens, a hidden one, which opens nothing, the current
+   path and its text), and each section's heading is visible and its first member. No entry is matched by its text
+   alone: a visible heading with the same text on another branch, or later in the document, opens nothing here.
+   Every other entry is dropped and counted in the unit's ``scope_entries_excluded``: one a hidden heading opened
+   (a hidden section heading, or a hidden heading recording an ancestor's path last), which a hand-built or loaded
+   document can put in a scope path, or one no heading opened (a path no heading records by then). A hidden
+   ancestor drops only its own entry. The pipeline opens sections at visible headings only, so its paths pass
+   whole. :func:`group_scopes` is the rule, read once per section, and T3's envelope reads it too. A heading's own
+   path serves only to find openers: no element's ``scope_path`` reaches a unit, and T3 must render a unit's
+   ``scope_path`` only, never an element's.
 3. **Groups** (R5). One group per :class:`~datagrunt.pdf.elements.Section`, whose members are its elements and its
    heading (as the document counts them). An element in no section joins its page's group, whose scope path is
    ``()``. The pipeline leaves only hidden headings in no section (``scope.py``): a page group of them is an
@@ -58,7 +69,8 @@ parts are copies made by :func:`dataclasses.replace`. The rules, in order:
    depend on the renderer only through the sizes of its blocks.
 
 Every loop is linear in the document's elements, rows and items (a split renders O(log n) candidate parts for each
-part it makes), and nothing recurses. The module imports only the standard library and the element model: no
+part it makes) and in its headings' and sections' scope paths (a trie of the headings' paths, never a copy of a
+prefix), and nothing recurses. The module imports only the standard library and the element model: no
 pydantic, no httpx, nothing from ``datagrunt.core``, and no import inside a function (invariant 9).
 """
 
@@ -72,6 +84,7 @@ from datagrunt.pdf.elements import (
     BulletList,
     DocumentElement,
     Figure,
+    Heading,
     HiddenReason,
     PDFDocument,
     Section,
@@ -248,8 +261,8 @@ class Unit:
             provenance says so), not the box of its own rows.
         blocks: Each element's rendered block, in the same order.
         part_of: For each element, ``None``, or ``(part_index, part_count)`` of the split it is a part of.
-        scope_path: The group's scope path, its section's (``()`` for a page group), keeping only the text of
-            visible headings (module notes, 2). T3 renders this, never an element's own ``scope_path``.
+        scope_path: The group's scope path, its section's (``()`` for a page group), keeping only the entries a
+            visible heading opened (module notes, 2). T3 renders this, never an element's own ``scope_path``.
         scope_entries_excluded: How many entries of the group's scope path were dropped from ``scope_path``.
         page_numbers: The distinct pages of ``elements``, sorted.
         vision: Whether any of those pages has route ``"vision"`` (it selects the grounding mode, plan §4.8).
@@ -610,10 +623,110 @@ def _section_owners(sections: tuple[Section, ...]) -> dict[str, int]:
     return owners
 
 
-def _visible_scope(scope_path: tuple[str, ...], shown: frozenset[str]) -> tuple[tuple[str, ...], int]:
-    """The entries of ``scope_path`` that are a visible heading's text, in order, and how many were dropped."""
-    kept = tuple(entry for entry in scope_path if entry in shown)
-    return kept, len(scope_path) - len(kept)
+_NO_NODE = -1
+"""A trie node no key names: once an entry leads off every recorded path, every later entry has no opener."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class GroupScope:
+    """A section's scope path as its units show it: the entries a visible heading opened (module notes, 2).
+
+    Args:
+        section: The section's index in ``document.sections``.
+        openers: The visible heading that opened each kept entry, outermost first: the document's own objects.
+        excluded: How many entries of the section's ``scope_path`` were dropped.
+
+    Raises:
+        TypeError: If ``section`` or ``excluded`` is not an ``int``, or ``openers`` not a tuple of ``Heading``.
+        ValueError: If ``section`` or ``excluded`` is negative, or an opener is hidden (invariant 1).
+    """
+
+    section: int
+    openers: tuple[Heading, ...]
+    excluded: int
+
+    def __post_init__(self) -> None:
+        _check_count("section", self.section)
+        _check_count("excluded", self.excluded)
+        _check_tuple_of("openers", self.openers, Heading)
+        if any(opener.hidden_reasons for opener in self.openers):
+            raise ValueError("a scope's openers are visible headings only (invariant 1)")
+
+    @property
+    def path(self) -> tuple[str, ...]:
+        """The kept entries, outermost first: each its opener's text."""
+        return tuple(opener.text for opener in self.openers)
+
+
+class _Openers:
+    """The headings read so far, each the last to record its own scope path (module notes, 2).
+
+    The recorded paths form a trie keyed by ``(parent node, entry)`` (the root is node 0), so recording a heading and
+    reading a section's path each take one step per entry, never a copy of a prefix.
+    """
+
+    __slots__ = ("nodes", "last")
+
+    def __init__(self) -> None:
+        self.nodes: dict[tuple[int, str], int] = {}
+        self.last: dict[int, Heading] = {}
+
+    def record(self, heading: Heading) -> None:
+        """Record ``heading``, hidden or not, as the last heading read with its scope path: that entry's opener."""
+        node = 0
+        for entry in heading.scope_path:
+            node = self.nodes.setdefault((node, entry), len(self.nodes) + 1)
+        self.last[node] = heading
+
+    def scope(self, index: int, section: Section) -> GroupScope:
+        """The section's path keeping each entry whose opener is visible: the section's own heading for its last
+        entry, when it has one, and for any other entry the last heading read whose own path is the entry's prefix."""
+        node = 0
+        kept: list[Heading] = []
+        path = section.scope_path
+        for position, entry in enumerate(path, start=1):
+            node = self.nodes.get((node, entry), _NO_NODE)
+            last = position == len(path)
+            opener = section.heading if last and section.heading is not None else self.last.get(node)
+            if opener is not None and not opener.hidden_reasons:
+                kept.append(opener)
+        return GroupScope(section=index, openers=tuple(kept), excluded=len(path) - len(kept))
+
+
+def group_scopes(document: PDFDocument) -> dict[str, GroupScope]:
+    """Map each section member's element id, its heading included, to its section's scope (module notes, 2).
+
+    One pass over the document's elements in document order: each heading is recorded where it stands, and a
+    section's scope is read once, at its first member, so only the headings at or before that member can open its
+    ancestor entries; its own heading opens its last entry wherever it stands.
+    :mod:`~datagrunt.rationalization.envelope` reads scopes from here too, so both apply one rule.
+
+    Args:
+        document: The document; it is never changed.
+
+    Returns:
+        A section member's id to its section's scope, one object per section; an element in no section is absent
+        (its page group's scope path is ``()``).
+
+    Raises:
+        TypeError: If ``document`` is not a ``PDFDocument``.
+    """
+    if not isinstance(document, PDFDocument):
+        raise TypeError(f"document must be a PDFDocument, got {type(document).__name__}")
+    owners = _section_owners(document.sections)
+    openers = _Openers()
+    scopes: dict[int, GroupScope] = {}
+    found: dict[str, GroupScope] = {}
+    for element in document.elements:
+        if isinstance(element, Heading):
+            openers.record(element)
+        index = owners.get(element.element_id)
+        if index is None:
+            continue
+        if index not in scopes:
+            scopes[index] = openers.scope(index, document.sections[index])
+        found[element.element_id] = scopes[index]
+    return found
 
 
 def _groups(document: PDFDocument) -> list[tuple[DocumentElement, _Group] | int]:
@@ -621,19 +734,17 @@ def _groups(document: PDFDocument) -> list[tuple[DocumentElement, _Group] | int]
 
     Groups, their members and their scope paths are as module notes 2-4 say.
     """
-    owners = _section_owners(document.sections)
-    shown = frozenset(heading.text for heading in document.headings if not heading.hidden_reasons)
+    scopes = group_scopes(document)
     steps: list[tuple[DocumentElement, _Group] | int] = []
     groups: dict[tuple[str, int], _Group] = {}
     for page in document.pages:
         if page.status == "error":
             steps.append(page.page_number)
         for element in page.elements:
-            index = owners.get(element.element_id)
-            key = ("page", page.page_number) if index is None else ("section", index)
+            scope = scopes.get(element.element_id)
+            key = ("page", page.page_number) if scope is None else ("section", scope.section)
             if key not in groups:
-                scope_path = () if index is None else document.sections[index].scope_path
-                groups[key] = _Group(*_visible_scope(scope_path, shown))
+                groups[key] = _Group((), 0) if scope is None else _Group(scope.path, scope.excluded)
             groups[key].take(element)
             steps.append((element, groups[key]))
     return steps

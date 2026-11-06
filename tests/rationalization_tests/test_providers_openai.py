@@ -104,7 +104,7 @@ from datagrunt.rationalization.providers.http import HttpClient
 from datagrunt.rationalization.providers.openai_compatible import OpenAICompatibleProvider
 from datagrunt.rationalization.schema import response_schema
 from datagrunt.rationalization.wire import ModelRequest, ProviderResponse
-from tests.rationalization_tests.test_schema import REALISTIC
+from rationalization_tests.test_schema import REALISTIC
 
 KEY = "sk-test-hunter2-KEY"
 GATEWAY = "https://gw.example.com/v1"
@@ -1524,19 +1524,29 @@ class TestLimits:
 
         assert "11" in refusal_of(schema)
 
-    def test_a_reference_cycle_is_refused_as_unbounded_nesting(self):
+    def test_nesting_past_the_walks_cap_is_refused_without_suggesting_a_cycle(self):
+        # Every cycle is refused before nesting is counted, so a count at the cap is a deep schema, never a cycle.
+        node = {"type": "string"}
+        for _ in range(45):
+            node = {"type": "array", "items": node}
+
+        message = refusal_of(obj(deep=node))
+
+        assert "it nests 40 or more;" in message
+        assert "cycle" not in message
+
+    def test_a_reference_cycle_through_an_object_is_refused_naming_its_path(self):
         schema = obj(a={"$ref": "#/$defs/A"}) | {
             "$defs": {"A": obj(b={"anyOf": [{"$ref": "#/$defs/A"}, {"type": "null"}]})}
         }
 
-        assert "10 levels" in refusal_of(schema)
+        assert "recursive (a $ref cycle: #/$defs/A -> #/$defs/A)" in refusal_of(schema)
 
-    def test_a_reference_cycle_through_anyof_alone_ends(self):
+    def test_a_reference_cycle_through_anyof_alone_is_refused(self):
+        # No object or array on the cycle: the nesting count never grows, so only the cycle check refuses it.
         schema = obj(a={"$ref": "#/$defs/A"}) | {"$defs": {"A": {"anyOf": [{"$ref": "#/$defs/A"}, {"type": "null"}]}}}
 
-        assert strict_provider().transform_schema(schema)["$defs"]["A"] == {
-            "anyOf": [{"$ref": "#/$defs/A"}, {"type": "null"}]
-        }
+        assert "recursive (a $ref cycle: #/$defs/A -> #/$defs/A)" in refusal_of(schema)
 
     def test_1000_enum_values_pass_and_1001_are_refused(self):
         within = obj(a={"type": "integer", "enum": list(range(600))}, b={"type": "integer", "enum": list(range(400))})

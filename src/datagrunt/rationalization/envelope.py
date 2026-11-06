@@ -34,16 +34,20 @@ document is never changed (invariant 2): everything below applies to the copy th
 3. **Framing** (:func:`build_envelope`). Every framing item is a tag, which document text can never forge (it never
    holds an unescaped ``<``), and everything inside one is document-derived and escaped. In order:
    ``<document>`` with the doc id; ``<scope>`` with ``Unit.scope_path`` joined by ``" > "`` (the unit's path only,
-   never an element's own, and each entry must be a visible heading's text); ``<header_context>``, a copy of the
-   document's ``header_context`` (its visible page-1 key-values, each the document's own element) as ordinary
-   :func:`render_element` blocks with their own ids, so their values can be cited and grounded, leaving out any block
-   the unit itself holds (every header key-value is a block of exactly one unit, so a record shown only there is
-   extracted once), and left out when nothing is left to show; one ``<continues table="<id>" from="<earlier id>">``
-   per table of the unit that continues a visible table of the document, holding the earlier table's header row (a
-   link to a hidden or missing table shows nothing of it); and ``<elements>``, holding the unit's blocks joined by
-   :data:`~datagrunt.rationalization.units.BLOCK_SEPARATOR`. Each framing text (the id, a scope entry, a header
-   row) is escaped as element text is (a transient paragraph, as for a caption), its lines joined by spaces and
-   U+2028 and U+2029 made spaces, then :func:`escape`-d, so it stays on one line. The framing lies outside
+   never an element's own; it must be its group's path as :func:`~datagrunt.rationalization.units.group_scopes`
+   keeps it, each entry opened by a visible heading: the section's own heading, by identity, for its last entry,
+   and each ancestor's opener by its recorded path and position, never by text alone: units module notes, 2);
+   ``<header_context>``, a copy of the document's ``header_context`` (its visible page-1 key-values, each the
+   document's own element) as ordinary :func:`render_element` blocks with their own ids, so their values can be
+   cited and grounded, leaving out any block the unit itself holds (every header key-value is a block of exactly
+   one unit, so a record shown only there is extracted once), and left out when nothing is left to show; one
+   ``<continues table="<id>" from="<earlier id>">`` per table of the unit that continues a visible table of the
+   document, named by the table's ``continued_from_id`` (never by its headers or any text), holding the earlier
+   table's header row (a link to a hidden or missing table shows nothing of it); and ``<elements>``, holding the
+   unit's blocks joined by :data:`~datagrunt.rationalization.units.BLOCK_SEPARATOR`. Each framing text (the id, a
+   scope entry, a header row) is escaped as element text is (a transient paragraph, as for a caption, a scope
+   entry's built on its opener's id fields), its lines joined by spaces and U+2028 and U+2029 made spaces, then
+   :func:`escape`-d, so it stays on one line. The framing lies outside
    ``max_unit_chars``, which measures the blocks. The header copy is framing, a copy of blocks page 1's own units
    send whole, so it is capped at :data:`HEADER_CONTEXT_MAX_CHARS`: blocks go in whole, in order, until the next
    would pass the cap, then one line says how many more are not shown. A first entry larger than the cap therefore
@@ -51,7 +55,8 @@ document is never changed (invariant 2): everything below applies to the copy th
    of the document. A unit's elements must be the document's own: an element equal to the document's with its id,
    a part of a split one equal to it but for its rows (or items and markers). A part's rows are not checked against
    the original's rows: units come from :func:`~datagrunt.rationalization.units.build_units`, which cuts them from
-   it, and checking them would cost each part its whole table.
+   it, and checking them would cost each part its whole table. A unit's elements must share one group (one
+   section, or one page's elements in no section, units module notes, 3), whose scope is the unit's.
 4. **Messages** (:meth:`Envelope.render`). The system message is :data:`SYSTEM_RULES`, then the caller's prompt
    verbatim (it is trusted), then the response schema, then the directive naming this request's tags. The schema is
    a fixed lead-in line, ``The response schema, as JSON:``, and the response wrapper's canonical JSON (the
@@ -83,9 +88,10 @@ consensus send what a manipulated answer holds to ``needs_review``.
 Bounds: the context is at most :data:`CONTEXT_MAX_BYTES` as sent, the schema at most :data:`SCHEMA_MAX_BYTES`
 (parsed once per :func:`build_envelopes` call and once per envelope it checks), the header-context copy at most
 :data:`HEADER_CONTEXT_MAX_CHARS` characters (plus its note), and everything else is linear in what the unit holds
-(a header copy reads at most the blocks it shows, the unit's own and one more), plus one pass over the document's
-elements and header context per :func:`build_envelopes` call. Nothing here recurses (the JSON encoder does,
-bounded by the interpreter's recursion limit, which refuses a deeper context). The module imports only the
+(a header copy reads at most the blocks it shows, the unit's own and one more), plus two passes over the
+document's elements (one is :func:`~datagrunt.rationalization.units.group_scopes`, linear in the scope paths
+too) and one over its header context per :func:`build_envelopes` call. Nothing here recurses (the JSON encoder
+does, bounded by the interpreter's recursion limit, which refuses a deeper context). The module imports only the
 standard library, the element model and its sibling modules: no pydantic, no httpx, nothing from
 ``datagrunt.core``, and no import inside a function (invariant 9).
 """
@@ -102,7 +108,28 @@ from typing import Literal, TypeAlias, get_args
 from datagrunt.pdf.elements import BulletList, DocumentElement, Figure, Heading, KeyValue, Paragraph, PDFDocument, Table
 from datagrunt.rationalization._canonical import canonical_json, strict_loads
 from datagrunt.rationalization.exceptions import RationalizationError
-from datagrunt.rationalization.units import BLOCK_SEPARATOR, PartOf, Unit
+from datagrunt.rationalization.units import BLOCK_SEPARATOR, GroupScope, PartOf, Unit, group_scopes
+
+__all__ = [
+    "CONTEXT_MAX_BYTES",
+    "ENVELOPE_FORMAT",
+    "ESCAPE_CATEGORIES",
+    "HEADER_CONTEXT_MAX_CHARS",
+    "PROMPT_MAX_BYTES",
+    "SCHEMA_MAX_BYTES",
+    "SYSTEM_RULES",
+    "Envelope",
+    "EscapeCategory",
+    "EscapeCounts",
+    "build_envelope",
+    "build_envelopes",
+    "element_escape_counts",
+    "element_text",
+    "escape",
+    "escape_counts",
+    "new_nonce",
+    "render_element",
+]
 
 ENVELOPE_FORMAT = "datagrunt.rationalize/1"
 """The envelope's version: change it with any change to the rules, the directive or the messages' layout."""
@@ -121,6 +148,9 @@ CONTEXT_MAX_BYTES = 64 * 1024
 HEADER_CONTEXT_MAX_CHARS = 4_096
 """The most characters of header-context blocks one payload copies (the line breaks between them included)."""
 
+PROMPT_MAX_BYTES = 1024 * 1024
+"""The most UTF-8 bytes the caller's prompt may take in the system message."""
+
 SCHEMA_MAX_BYTES = 1024 * 1024
 """The most UTF-8 bytes the response schema's JSON may take in the system message."""
 
@@ -136,9 +166,9 @@ SYSTEM_RULES = (
     "and otherwise leave the record out. Never take a value from the caller context or from your own knowledge.\n"
     "3. Every record carries grounding_quotes: exact spans copied character for character from inside the <el> "
     "blocks (the header context's blocks included), each quote within one block, that support its values (at least "
-    "every identifying value).\n"
-    "4. Every record carries source_element_ids: the id attributes of the <el> blocks its values come from. The "
-    "header context's blocks may be cited like any other block.\n"
+    "every identifying value, and at least one quote of three or more words).\n"
+    "4. Every record carries source_element_ids: the id attributes of the <el> blocks its values come from "
+    "(at least one block inside <elements>; the header context's blocks may be cited in addition).\n"
     '5. When the blocks inside the <elements> tag show no record of the schema, return {"records": []}.\n'
     "6. In the payload, document text writes Markdown punctuation with a backslash before it (\\< is <, \\\\ is \\) "
     "and a table cell's line breaks as <br>. In values, write the characters themselves (drop those backslashes; "
@@ -371,13 +401,14 @@ def element_escape_counts(element: DocumentElement) -> EscapeCounts:
 @dataclass(frozen=True, slots=True)
 class _Frame:
     """What every unit of one document shares, read once: its id, its header-context blocks (with their ids), its
-    visible tables and headings (by id, by text), and all its elements by id (to check a unit's)."""
+    visible tables (by id), its sections' scopes (by member id, :func:`~datagrunt.rationalization.units.group_scopes`)
+    and all its elements by id (to check a unit's)."""
 
     doc_id: str
     header: tuple[tuple[str, str], ...]
     header_ids: frozenset[str]
     tables: Mapping[str, Table]
-    headings: Mapping[str, Heading]
+    scopes: Mapping[str, GroupScope]
     elements: Mapping[str, DocumentElement]
 
 
@@ -437,7 +468,7 @@ def _frame(document: PDFDocument) -> _Frame:
         header=header,
         header_ids=frozenset(element_id for element_id, _ in header),
         tables={table.element_id: table for table in document.tables if not table.hidden_reasons},
-        headings={heading.text: heading for heading in document.headings if not heading.hidden_reasons},
+        scopes=group_scopes(document),
         elements=elements,
     )
 
@@ -464,9 +495,19 @@ def _continuation_lines(unit: Unit, tables: Mapping[str, Table]) -> list[str]:
     return lines
 
 
+def _openers(unit: Unit, frame: _Frame) -> tuple[Heading, ...]:
+    """The visible headings that opened the kept entries of the unit's group's scope path (none for a page group).
+
+    The group is its first element's: every element of the unit shares it (:func:`_check_one_group`).
+    """
+    scope = frame.scopes.get(unit.elements[0].element_id)
+    return () if scope is None else scope.openers
+
+
 def _payload(unit: Unit, frame: _Frame) -> tuple[str, tuple[str, ...]]:
     """The tagged framing and the unit's blocks (module notes, 3), and the header ids it shows; the unit is checked."""
-    scope = " > ".join(_one_line(entry, frame.headings[entry]) for entry in unit.scope_path)
+    openers = _openers(unit, frame)
+    scope = " > ".join(_one_line(entry, opener) for entry, opener in zip(unit.scope_path, openers, strict=True))
     header, shown = _header_lines(frame, frozenset(element.element_id for element in unit.elements))
     lines = [
         f"<document>{_one_line(frame.doc_id, unit.elements[0])}</document>",
@@ -620,6 +661,8 @@ class Envelope:
     def __post_init__(self) -> None:
         _check_component("unit_id", self.unit_id)
         _check_component("prompt", self.prompt)
+        if len(self.prompt.encode("utf-8")) > PROMPT_MAX_BYTES:
+            raise ValueError(f"prompt passes {PROMPT_MAX_BYTES} bytes of UTF-8")
         for name, value in (("context_json", self.context_json), ("payload", self.payload)):
             _check_component(name, value)
             found = _ESCAPED.search(value)
@@ -678,17 +721,19 @@ class Envelope:
 
 
 def _check_prompt(prompt: object) -> str:
-    """Require a non-blank ``str`` that UTF-8 can encode (it is sent verbatim)."""
+    """Require a non-blank ``str`` that UTF-8 can encode within :data:`PROMPT_MAX_BYTES` (it is sent verbatim)."""
     if not isinstance(prompt, str):
         raise TypeError(f"prompt must be a str, got {type(prompt).__name__}")
     if not prompt.strip():
         raise RationalizationError("prompt must be non-blank")
     try:
-        prompt.encode("utf-8")
+        encoded = prompt.encode("utf-8")
     except UnicodeEncodeError as exc:
         raise RationalizationError(
             f"prompt must be valid Unicode text: it holds a lone surrogate at {exc.start}"
         ) from exc
+    if len(encoded) > PROMPT_MAX_BYTES:
+        raise RationalizationError(f"prompt passes {PROMPT_MAX_BYTES} bytes of UTF-8")
     return prompt
 
 
@@ -761,16 +806,35 @@ def _check_elements(unit: Unit, elements: Mapping[str, DocumentElement]) -> None
             )
 
 
+def _group_of(element: DocumentElement, frame: _Frame) -> tuple[str, int]:
+    """An element's group (units module notes, 3): its section's index, else its page's number."""
+    scope = frame.scopes.get(element.element_id)
+    return ("page", element.page_number) if scope is None else ("section", scope.section)
+
+
+def _check_one_group(unit: Unit, frame: _Frame) -> None:
+    """Require the unit's elements to share one group, whose scope is the unit's: one section, or one page's
+    elements in no section."""
+    groups = {_group_of(element, frame) for element in unit.elements}
+    if len(groups) != 1:
+        raise ValueError(f"unit {unit.unit_id}: its elements are of {len(groups)} groups; a unit holds one group's")
+
+
 def _check_unit(unit: object, frame: _Frame) -> Unit:
-    """Require a unit of this document: its elements the document's, its blocks rendered, its scope visible."""
+    """Require a unit of this document: its elements the document's and of one group, its blocks rendered, its
+    group's scope."""
     if not isinstance(unit, Unit):
         raise TypeError(f"each unit must be a Unit, got {type(unit).__name__}")
     if unit.doc_id != frame.doc_id:
         raise ValueError(f"unit {unit.unit_id} has doc_id {unit.doc_id!r}, not the document's {frame.doc_id!r}")
     _check_elements(unit, frame.elements)
-    hidden = [entry for entry in unit.scope_path if entry not in frame.headings]
-    if hidden:
-        raise ValueError(f"unit {unit.unit_id}: scope entries that are no visible heading's text: {len(hidden)}")
+    _check_one_group(unit, frame)
+    expected = tuple(opener.text for opener in _openers(unit, frame))
+    if unit.scope_path != expected:
+        raise ValueError(
+            f"unit {unit.unit_id}: its scope_path is not its group's scope, the {len(expected)} entries visible "
+            "headings opened"
+        )
     return unit
 
 
@@ -794,8 +858,9 @@ def build_envelopes(
         TypeError: If ``units`` is not a tuple or list of ``Unit``, ``document`` not a ``PDFDocument``, or
             ``prompt`` or ``schema_json`` not a ``str``.
         ValueError: If a unit is of another document, holds an element that is not the document's, has blocks
-            that are not :func:`render_element`'s or a scope entry that is no visible heading's text, or a header
-            context entry is hidden, off page 1 or not the document's.
+            that are not :func:`render_element`'s, elements of more than one group or a scope path other than its
+            group's (each entry opened by a visible heading), or a header context entry is hidden, off page 1 or
+            not the document's.
         RationalizationError: If ``prompt`` is blank or not encodable, ``context`` does not serialize to JSON or
             is past :data:`CONTEXT_MAX_BYTES`, or ``schema_json`` is not a JSON object's canonical JSON, holds an R8
             code point or is past :data:`SCHEMA_MAX_BYTES`.

@@ -1358,6 +1358,22 @@ class SlashAlias(BaseModel):
     value: int = Field(alias="a/b~c", json_schema_extra={"oneOf": [{"type": "integer"}]})
 
 
+class BadTilde(BaseModel):
+    """A model whose JSON schema names a ``$defs`` entry with a ``~`` RFC 6901 does not allow (pydantic never emits
+    one: it refuses a ``$ref`` it did not define, so the schema is given whole)."""
+
+    code: str
+
+    @classmethod
+    def model_json_schema(cls, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {"code": {"$ref": "#/$defs/a~2b"}},
+            "required": ["code"],
+            "$defs": {"a~2b": {"type": "string"}},
+        }
+
+
 class NoJsonSchema(BaseModel):
     callback: Callable[[], int]
 
@@ -2352,6 +2368,13 @@ class TestCheckJsonSchema:
         with raises_json("SlashAlias", "#/properties/a~1b~0c"):
             check_json_schema(SlashAlias)
 
+    def test_a_ref_whose_tilde_escapes_neither_tilde_nor_slash(self):
+        # RFC 6901: "~" is only ever "~0" or "~1" in a reference token.
+        with raises_json("BadTilde", "#/properties/code") as error:
+            check_json_schema(BadTilde)
+
+        assert "is not supported" in str(error.value)
+
     @pytest.mark.parametrize(
         ("model", "pointer"),
         [(Node, "#/$defs/Node/properties/children/items"), (Ping, "#/$defs/Pong/properties/ping")],
@@ -3113,6 +3136,168 @@ class TestMessageOrder:
             describe(create_model("Aliased", value=(alias, ...)))
 
         assert "type alias" in str(error.value)
+
+
+R8_PRIMARY_CASES: dict[str, tuple[str, str]] = {
+    "bidi": ("\u202e", "U+202E"),
+    "tag": ("\U000e0001", "U+E0001"),
+    "control-nul": ("\x00", "U+0000"),
+    "control-bel": ("\x07", "U+0007"),
+    "control-del": ("\x7f", "U+007F"),
+    "control-nel": ("\x85", "U+0085"),
+    "carriage-return": ("\r", "U+000D"),
+    "crlf": ("\r\n", "U+000D"),
+    "lone-surrogate": ("\ud800", "U+D800"),
+}
+
+R8_BOUNDARY_CASES: tuple[tuple[str, str], ...] = (
+    ("\u202a", "U+202A"),
+    ("\u202e", "U+202E"),
+    ("\u2066", "U+2066"),
+    ("\u2069", "U+2069"),
+    ("\U000e0000", "U+E0000"),
+    ("\U000e007f", "U+E007F"),
+    ("\x00", "U+0000"),
+    ("\x08", "U+0008"),
+    ("\x0b", "U+000B"),
+    ("\x0c", "U+000C"),
+    ("\x0e", "U+000E"),
+    ("\x1f", "U+001F"),
+    ("\x7f", "U+007F"),
+    ("\x80", "U+0080"),
+    ("\x9f", "U+009F"),
+    ("\r", "U+000D"),
+    ("\r\n", "U+000D"),
+    ("\ud800", "U+D800"),
+    ("\udfff", "U+DFFF"),
+)
+
+
+class TestR8CodePointsInDescriptions:
+    """Major M5: refuse R8 code points in field/schema descriptions at describe, check_json_schema, and prepare."""
+
+    @pytest.mark.parametrize("case", list(R8_PRIMARY_CASES))
+    def test_field_description_with_r8_code_point_is_rejected_at_root(self, case):
+        offending, token = R8_PRIMARY_CASES[case]
+        model = create_model("Described", value=(str, Field(description=f"sensitive-marker {offending} tail")))
+
+        for check in (describe, prepare):
+            with raises_at("Described.value") as error:
+                check(model)
+
+            message = str(error.value)
+            assert token in message
+            assert "sensitive-marker" not in message
+            assert offending[0] not in message
+
+    def test_field_and_json_schema_descriptions_reject_every_r8_range_boundary(self):
+        for offending, token in R8_BOUNDARY_CASES:
+            model = create_model("Boundary", value=(str, Field(description=f"secret-text {offending}")))
+            for check in (describe, prepare):
+                with raises_at("Boundary.value") as error:
+                    check(model)
+                assert token in str(error.value)
+                assert "secret-text" not in str(error.value)
+
+            extra_model = create_model(
+                "BoundaryExtra",
+                value=(str, Field(json_schema_extra={"description": f"secret-text {offending}"})),
+            )
+            for check in (check_json_schema, prepare):
+                with raises_json("BoundaryExtra", "#/properties/value") as error:
+                    check(extra_model)
+                assert token in str(error.value)
+                assert "secret-text" not in str(error.value)
+
+    def test_nested_field_description_with_r8_code_point_is_rejected_naming_field_path(self):
+        for offending, token in R8_PRIMARY_CASES.values():
+            leaf = create_model("Leaf", code=(Annotated[str, Field(description=f"nested-secret {offending}")], ...))
+            middle = create_model("Middle", leaves=(list[leaf], ...))
+            root = create_model("Root", middle=(middle, ...))
+
+            for check in (describe, prepare):
+                with raises_at("Root.middle.leaves[].code") as error:
+                    check(root)
+
+                message = str(error.value)
+                assert token in message
+                assert "nested-secret" not in message
+                assert offending[0] not in message
+
+    def test_json_schema_root_description_with_r8_code_point_is_rejected(self):
+        for offending, token in R8_PRIMARY_CASES.values():
+            model = create_model(
+                "RootExtra",
+                __config__=ConfigDict(json_schema_extra={"description": f"root-secret {offending}"}),
+                value=(str, ...),
+            )
+
+            for check in (check_json_schema, prepare):
+                with raises_json("RootExtra", "#") as error:
+                    check(model)
+
+                message = str(error.value)
+                assert token in message
+                assert "root-secret" not in message
+                assert offending[0] not in message
+
+    def test_json_schema_property_description_with_r8_code_point_is_rejected(self):
+        for offending, token in R8_PRIMARY_CASES.values():
+            model = create_model(
+                "FieldExtra",
+                value=(str, Field(json_schema_extra={"description": f"prop-secret {offending}"})),
+            )
+
+            for check in (check_json_schema, prepare):
+                with raises_json("FieldExtra", "#/properties/value") as error:
+                    check(model)
+
+                message = str(error.value)
+                assert token in message
+                assert "prop-secret" not in message
+                assert offending[0] not in message
+
+    def test_json_schema_nested_node_description_with_r8_code_point_is_rejected(self):
+        child = create_model(
+            "ChildExtra",
+            __config__=ConfigDict(json_schema_extra={"description": "def-secret \U000e0001"}),
+            code=(str, ...),
+        )
+        parent = create_model(
+            "ParentExtra",
+            items=(
+                list[str],
+                Field(json_schema_extra={"items": {"type": "string", "description": "item-secret \x07"}}),
+            ),
+        )
+        holds_child = create_model("HoldsChild", child=(child, ...))
+
+        for check in (check_json_schema, prepare):
+            with raises_json("ParentExtra", "#/properties/items/items") as item_error:
+                check(parent)
+            assert "U+0007" in str(item_error.value)
+            assert "item-secret" not in str(item_error.value)
+
+            with raises_json("HoldsChild", "#/$defs/ChildExtra") as def_error:
+                check(holds_child)
+            assert "U+E0001" in str(def_error.value)
+            assert "def-secret" not in str(def_error.value)
+
+    def test_normal_newline_and_tab_in_descriptions_are_accepted(self):
+        child = create_model("CleanChild", note=(str, Field(description="child line 1\n\tchild line 2")))
+        model = create_model(
+            "CleanModel",
+            __config__=ConfigDict(json_schema_extra={"description": "root line 1\n\troot line 2"}),
+            value=(str, Field(description="line 1\n\tline 2")),
+            child=(child, ...),
+        )
+
+        spec = describe(model)
+        check_json_schema(model)
+        prepared = prepare(model)
+
+        assert spec.fields[0].name == "value"
+        assert prepared.spec == spec
 
 
 # ---------------------------------------------------------------------------------------------------------------

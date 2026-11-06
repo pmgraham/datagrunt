@@ -585,12 +585,12 @@ class ProviderSnapshot:
     @property
     def generation_params(self) -> dict[str, Any]:
         """The generation params, parsed afresh on each access."""
-        return _parse_object("generation_params_json", self.generation_params_json)
+        return cast(dict[str, Any], strict_loads(self.generation_params_json))
 
     @property
     def provider_schema(self) -> dict[str, Any]:
         """The schema this provider sends, parsed afresh on each access."""
-        return _parse_object("provider_schema_json", self.provider_schema_json)
+        return cast(dict[str, Any], strict_loads(self.provider_schema_json))
 
 
 def snapshot_providers(providers: Sequence[object], schema: PreparedSchema) -> tuple[ProviderSnapshot, ...]:
@@ -1306,6 +1306,20 @@ class _EventOrder:
                 return
             self._next += 1
 
+    def drain(self) -> None:
+        """Drain the queue and deliver every remaining buffered event in request order, when a failing run stops."""
+        while True:
+            try:
+                position, event = self._events.get_nowait()
+            except queue.Empty:
+                break
+            self._buffers[position].append(event)
+        while self._next < len(self._buffers):
+            pending, self._buffers[self._next] = self._buffers[self._next], []
+            for event in pending:
+                self._deliver(event)
+            self._next += 1
+
 
 class _Overrun(Exception):
     """A request passed its own bound, or the caller's loop its: a call outlived every deadline."""
@@ -1341,7 +1355,7 @@ def _drive(
     run: _Run,
     pool: ThreadPoolExecutor,
     misses: Sequence[_Request],
-    deliver: Callable[[TelemetryEvent], None],
+    order: _EventOrder,
     flights: dict["Future[_Result]", _Flight],
 ) -> dict[int, _Result]:
     """Submit the misses into free slots, collect their results and deliver their events until every one is done.
@@ -1353,7 +1367,6 @@ def _drive(
         _Overrun: If a request passes its own bound (:func:`_check_overrun`), or the loop its (:func:`_wait_bound`).
     """
     scheduler = _Scheduler(misses, run)
-    order = _EventOrder(run.events, len(misses), deliver)
     active: dict[Future[_Result], int] = {}
     results: dict[int, _Result] = {}
     for _ in range(_wait_bound(run, len(misses))):
@@ -1433,7 +1446,11 @@ def _earliest_failure(flights: Mapping["Future[_Result]", _Flight]) -> BaseExcep
 
 
 def _stop(
-    run: _Run, pool: ThreadPoolExecutor, flights: Mapping["Future[_Result]", _Flight], failure: BaseException
+    run: _Run,
+    pool: ThreadPoolExecutor,
+    flights: Mapping["Future[_Result]", _Flight],
+    order: _EventOrder,
+    failure: BaseException,
 ) -> BaseException:
     """Stop a failing run (module notes, 6) and return what to raise.
 
@@ -1447,6 +1464,8 @@ def _stop(
     _join_in_flight(run, flights)
     # with every request done the threads are idle and exit at once, so join them; else leave the hung one running
     pool.shutdown(wait=all(future.done() for future in flights), cancel_futures=True)
+    if isinstance(failure, (_WorkerFailed, _Overrun)):
+        order.drain()
     if isinstance(failure, _WorkerFailed):
         return _earliest_failure(flights)
     if isinstance(failure, _Overrun):
@@ -1470,16 +1489,17 @@ def _execute(run: _Run, misses: Sequence[_Request], deliver: Callable[[Telemetry
     if not misses:
         return {}
     pool = ThreadPoolExecutor(max_workers=min(run.limits.max_concurrency, len(misses)), thread_name_prefix=_THREADS)
+    order = _EventOrder(run.events, len(misses), deliver)
     flights: dict[Future[_Result], _Flight] = {}
     try:
-        results = _drive(run, pool, misses, deliver, flights)
+        results = _drive(run, pool, misses, order, flights)
     except BaseException as error:  # every way out stops the run within its bounds, then raises
         failure: BaseException = error
     else:
         run.stop.set()
         pool.shutdown(wait=True)  # every request is done: this joins idle threads
         return results
-    raise _stop(run, pool, flights, failure)
+    raise _stop(run, pool, flights, order, failure)
 
 
 # ---------------------------------------------------------------------------------------------------------------

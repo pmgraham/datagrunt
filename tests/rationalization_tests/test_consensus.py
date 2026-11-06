@@ -16,6 +16,7 @@ from enum import Enum
 from typing import Annotated, Any, Literal
 
 import pytest
+from pdf_tests.documents import ids, metadata, page
 from pydantic import (
     AfterValidator,
     AwareDatetime,
@@ -29,7 +30,9 @@ from pydantic import (
 )
 from pydantic.alias_generators import to_camel
 
+from datagrunt.pdf.elements import Paragraph, PDFDocument, Table, make_element_id
 from datagrunt.rationalization import Key, RationalizationError
+from datagrunt.rationalization import consensus as consensus_module
 from datagrunt.rationalization.consensus import (
     CONSENSUS_STATUSES,
     ERROR_MESSAGE_MAX_CHARS,
@@ -48,8 +51,11 @@ from datagrunt.rationalization.consensus import (
     normalized_key,
     validate_response,
 )
+from datagrunt.rationalization.envelope import Envelope, build_envelopes, render_element
+from datagrunt.rationalization.grounding import GroundingResult, ground
 from datagrunt.rationalization.runner import FailedUnit, RunOutcome
 from datagrunt.rationalization.schema import prepare
+from datagrunt.rationalization.units import Unit, build_units
 from datagrunt.rationalization.wire import ProviderResponse
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -246,15 +252,28 @@ class TestQuarantinedItem:
 class TestValidRecordTypes:
     def test_valid_record_holds_its_fields(self):
         record = Assembly(assembly_id="A-1", title="Pump")
+        wire = assembly()
 
-        valid = ValidRecord(record=record, grounding_quotes=("q",), source_element_ids=("e1",), position=0)
+        valid = ValidRecord(record=record, grounding_quotes=("q",), source_element_ids=("e1",), position=0, wire=wire)
 
-        assert (valid.record, valid.grounding_quotes, valid.source_element_ids, valid.position) == (
+        assert (valid.record, valid.grounding_quotes, valid.source_element_ids, valid.position, valid.wire) == (
             record,
             ("q",),
             ("e1",),
             0,
+            wire,
         )
+        assert "wire" not in repr(valid)
+
+    def test_valid_record_needs_what_the_record_was_validated_from(self):
+        fields: dict[str, Any] = {
+            "record": Assembly(assembly_id="A-1", title="Pump"),
+            "grounding_quotes": (),
+            "source_element_ids": (),
+            "position": 0,
+        }
+        with pytest.raises(TypeError):
+            ValidRecord(**fields)
 
     @pytest.mark.parametrize(
         ("overrides", "error"),
@@ -266,6 +285,8 @@ class TestValidRecordTypes:
             ({"position": -1}, ValueError),
             ({"position": True}, TypeError),
             ({"position": 1.0}, TypeError),
+            ({"wire": [assembly()]}, TypeError),
+            ({"wire": {1: "A-1"}}, TypeError),
         ],
     )
     def test_valid_record_rejects(self, overrides, error):
@@ -274,6 +295,7 @@ class TestValidRecordTypes:
             "grounding_quotes": (),
             "source_element_ids": (),
             "position": 0,
+            "wire": assembly(),
             **overrides,
         }
         with pytest.raises(error):
@@ -460,7 +482,26 @@ class TestQuarantinedSources:
 # ---------------------------------------------------------------------------------------------------------------
 
 
+class InPlace(BaseModel):
+    """A model whose before-validator rewrites its input in place, as pydantic lets it."""
+
+    in_place_id: Annotated[str, Key]
+    amount: int
+
+    @model_validator(mode="before")
+    @classmethod
+    def parse_in_place(cls, data: Any) -> Any:
+        if isinstance(data, dict) and isinstance(data.get("amount"), str):
+            data["amount"] = int(data["amount"].replace(",", ""))
+        return data
+
+
 class TestValidRecords:
+    def test_a_validator_that_rewrites_its_input_in_place_leaves_the_kept_record_as_sent(self):
+        (valid,) = validate(answer({"in_place_id": "I", "amount": "1,234"}), prepare(InPlace)).records
+
+        assert (valid.record.amount, valid.wire) == (1234, {"in_place_id": "I", "amount": "1,234"})
+
     def test_a_valid_entry_is_a_valid_record_with_its_grounding_and_position(self):
         content = {
             "records": [
@@ -645,6 +686,13 @@ class TestNullIsNotShown:
         (valid,) = validate(answer({"orderId": "O", "max_qty": "not read"}), prepare(AliasOnlyOrder)).records
 
         assert valid.record.max_qty == 7
+
+    def test_a_valid_record_keeps_the_record_as_sent_without_its_unshown_nulls(self):
+        sent = shelf(rowCount=None, bins=[{"code": "B", "capacity": None, "label": None}], tags=["t"])
+
+        (valid,) = validate(answer(sent), SHELF).records
+
+        assert valid.wire == shelf(bins=[{"code": "B", "label": None}], tags=["t"])
 
     def test_raw_json_keeps_the_nulls_the_model_sent(self):
         bad = shelf(must=None, rowCount=None)
@@ -2306,6 +2354,370 @@ class TestDuplicatesAcrossModels:
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# build_consensus: a child key repeated in one model's record (module notes, 4 and 9)
+# ---------------------------------------------------------------------------------------------------------------
+
+
+class Box(BaseModel):
+    box_id: Annotated[str, Key]
+    section: Section
+
+
+class Warehouse(BaseModel):
+    site: Annotated[str, Key]
+    boxes: list[Box]
+
+
+class Basket(BaseModel):
+    """A root without keys, holding a keyed list."""
+
+    label: str
+    items: list[Item]
+
+
+WAREHOUSE = prepare(Warehouse)
+BASKET = prepare(Basket)
+
+
+def stocked(*counts: tuple[str, int]) -> dict[str, Any]:
+    """A Warehouse record of one box whose section lists the (sku, count) pairs ``counts``, in order."""
+    items = [{"sku": sku, "count": count} for sku, count in counts]
+    return {"site": "S-1", "boxes": [{"box_id": "B-1", "section": {"title": "Bolts", "items": items}}]}
+
+
+def assembled(*counts: tuple[str, int]) -> dict[str, Any]:
+    """An Assembly record whose components are the (part number, quantity) pairs ``counts``, in order."""
+    return assembly(components=parts(*counts))
+
+
+DEPTHS = {  # a schema, a record of keyed children, and the path of those children
+    "a keyed list": (ASSEMBLY, assembled, "components"),
+    "a keyed list in a nested model in a keyed list": (WAREHOUSE, stocked, "boxes['B-1'].section.items"),
+}
+
+
+class TestRepeatedChildKeysInOneModel:
+    @pytest.mark.parametrize("depth", DEPTHS)
+    def test_a_child_key_one_model_repeats_with_differing_values_is_disputed_without_a_record(self, depth):
+        schema, record, at = DEPTHS[depth]
+        sent = record(("K-1", 1), ("K-2", 5), ("K-1", 2))
+
+        found = only(blend({(U1, OPENAI): answer(sent)}, (OPENAI,), schema=schema))
+
+        assert (found.status, found.disputed_fields, found.record) == ("field_disagreement", (f"{at}['K-1']",), None)
+        assert dict(found.model_votes) == {OPENAI[0]: (vote(sent, schema),)}
+
+    @pytest.mark.parametrize("copies", [1, 2])
+    @pytest.mark.parametrize("depth", DEPTHS)
+    def test_a_child_key_one_model_repeats_identically_is_one_child(self, depth, copies):
+        schema, record, _ = DEPTHS[depth]
+        sent = record(("K-1", 1), ("K-2", 5), ("K-1", 1))
+
+        found = only(blend({(U1, OPENAI): answer(*[sent] * copies)}, (OPENAI,), schema=schema))
+
+        assert (found.status, found.disputed_fields, found.notes) == ("single_model", (), ())
+        assert found.record == schema.model.model_validate(record(("K-1", 1), ("K-2", 5)))
+        assert dict(found.model_votes) == {OPENAI[0]: (vote(sent, schema),)}
+
+    def test_each_record_of_a_root_without_keys_is_checked_on_its_own(self):
+        clashing = {"label": "L", "items": [{"sku": "X", "count": 1}, {"sku": "X", "count": 2}]}
+        repeated = {"label": "M", "items": [{"sku": "Y", "count": 1}, {"sku": "Y", "count": 1}]}
+
+        first, second = blend({(U1, OPENAI): answer(clashing, repeated)}, (OPENAI,), schema=BASKET).items
+
+        assert (first.status, first.disputed_fields, first.record) == ("field_disagreement", ("items['X']",), None)
+        assert (second.status, second.record) == ("single_model", Basket(label="M", items=[Item(sku="Y", count=1)]))
+
+    @pytest.mark.parametrize("models", [(OPENAI,), PAIR], ids=["one model", "two models"])
+    def test_a_child_key_repeated_with_differing_values_has_a_note_naming_the_model(self, models):
+        clean, clashing = assembled(("PN-1", 1)), assembled(("PN-1", 1), ("PN-1", 2))
+        responses = {(U1, model): answer(clashing if model == models[-1] else clean) for model in models}
+
+        found = only(blend(responses, models))
+
+        assert found.notes == (f"{models[-1][0]} repeated a child key within a list, with differing values",)
+
+    def test_differing_copies_that_repeat_a_child_key_have_both_notes(self):
+        first = assembly(title="Pump", components=parts(("PN-1", 1), ("PN-1", 2)))
+        second = assembly(title="Valve", components=parts(("PN-1", 1), ("PN-1", 2)))
+
+        found = only(blend({(U1, OPENAI): answer(first, second)}, (OPENAI,)))
+
+        assert (found.status, found.record) == ("field_disagreement", None)
+        assert found.disputed_fields == ("title", "components['PN-1']")
+        assert found.notes == (
+            f"{OPENAI[0]} returned this key 2 times, with differing values",
+            f"{OPENAI[0]} repeated a child key within a list, with differing values",
+        )
+        assert dict(found.model_votes) == {OPENAI[0]: (vote(first), vote(second))}
+
+    def test_identical_copies_that_repeat_a_child_key_have_the_repeats_note_alone(self):
+        sent = assembled(("PN-1", 1), ("PN-1", 2))
+
+        found = only(blend({(U1, OPENAI): answer(sent, sent)}, (OPENAI,)))
+
+        assert (found.status, found.record, found.disputed_fields) == (
+            "field_disagreement",
+            None,
+            ("components['PN-1']",),
+        )
+        assert found.notes == (f"{OPENAI[0]} repeated a child key within a list, with differing values",)
+        assert dict(found.model_votes) == {OPENAI[0]: (vote(sent), vote(sent))}
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# build_consensus: the merged record, validated once from what the models sent (module notes, 8)
+# ---------------------------------------------------------------------------------------------------------------
+
+
+class Prefixed(BaseModel):
+    """An after-validator that is not idempotent: validated twice, a code gains two prefixes."""
+
+    prefixed_id: Annotated[str, Key]
+    code: str
+    label: str = ""
+
+    @field_validator("code")
+    @classmethod
+    def prefix(cls, value: str) -> str:
+        return f"PFX_{value}"
+
+
+class Textual(BaseModel):
+    """A before-validator that takes an amount only as the text a model sends."""
+
+    textual_id: Annotated[str, Key]
+    amount: int
+    label: str = ""
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def parse(cls, value: object) -> int:
+        if not isinstance(value, str):
+            raise ValueError("amount must arrive as text")
+        return int(value.replace(",", ""))
+
+
+class Tag(BaseModel):
+    tag_id: Annotated[str, Key]
+    code: str
+
+    @field_validator("code")
+    @classmethod
+    def prefix(cls, value: str) -> str:
+        return f"PFX_{value}"
+
+
+class Tagged(BaseModel):
+    tagged_id: Annotated[str, Key]
+    tags: list[Tag]
+
+
+class Appending(BaseModel):
+    """A before-validator that appends to the list it is given, in place."""
+
+    appending_id: Annotated[str, Key]
+    tags: list[str] = []
+    label: str = ""
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def mark(cls, value: Any) -> Any:
+        if isinstance(value, list):
+            value.append("seen")
+        return value
+
+
+class Poisoned(BaseModel):
+    """A model validator that writes a non-finite float when a, b and c are all 1."""
+
+    poisoned_id: Annotated[str, Key]
+    a: int
+    b: int
+    c: int
+    ratio: float = 0.0
+
+    @model_validator(mode="after")
+    def poison(self) -> "Poisoned":
+        if (self.a, self.b, self.c) == (1, 1, 1):
+            object.__setattr__(self, "ratio", float("nan"))
+        return self
+
+
+class Row(BaseModel):
+    row_no: Annotated[int, Key]
+    qty: int
+
+
+class Ledger(BaseModel):
+    """An after-validator that orders the rows it is given: a row's position is not always the one its model sent."""
+
+    ledger_id: Annotated[str, Key]
+    rows: list[Row]
+
+    @field_validator("rows")
+    @classmethod
+    def by_number(cls, rows: list[Row]) -> list[Row]:
+        return sorted(rows, key=lambda row: row.row_no)
+
+
+class Piece(BaseModel):
+    sku: Annotated[str, Key]
+    count: int
+
+
+class Kit(BaseModel):
+    kit_id: Annotated[str, Key]
+    pieces: list[Piece] = Field(default_factory=lambda: [Piece(sku="S", count=1), Piece(sku="T", count=1)])
+
+
+class Dims(BaseModel):
+    width: int
+    height: int
+
+
+class Framed(BaseModel):
+    framed_id: Annotated[str, Key]
+    dims: Dims = Dims(width=1, height=2)
+    label: str = ""
+
+
+EVERY_PATH = pytest.mark.parametrize(
+    ("models", "labels", "status"),
+    [((OPENAI,), ("x",), "single_model"), (PAIR, ("x", "x"), "consensus"), (THREE, ("x", "y", "y"), "consensus")],
+    ids=["one model", "two models", "three models, the first outvoted on the label"],
+)
+
+
+def labelled(
+    schema: Any, models: tuple[tuple[str, str, str], ...], labels: tuple[str, ...], **record: Any
+) -> ConsensusItem:
+    """The one item of models each sending ``record`` with its own label."""
+    responses = {(U1, model): answer({**record, "label": label}) for model, label in zip(models, labels, strict=True)}
+    return only(blend(responses, models, schema=prepare(schema)))
+
+
+class TestRebuildFromWhatTheModelsSent:
+    @EVERY_PATH
+    def test_an_after_validator_runs_once_whatever_the_models(self, models, labels, status):
+        found = labelled(Prefixed, models, labels, prefixed_id="P", code="123")
+
+        assert (found.status, found.record) == (status, Prefixed(prefixed_id="P", code="123", label=labels[-1]))
+        assert found.record.code == "PFX_123"
+
+    @EVERY_PATH
+    def test_a_before_validator_meets_what_a_model_sent(self, models, labels, status):
+        found = labelled(Textual, models, labels, textual_id="T", amount="1,234")
+
+        assert (found.status, found.notes) == (status, ())
+        assert found.record == Textual.model_validate({"textual_id": "T", "amount": "1,234", "label": labels[-1]})
+
+    def test_a_merged_repeat_is_rebuilt_from_what_the_model_sent(self):
+        sent = {"tagged_id": "T", "tags": [{"tag_id": "A", "code": "1"}, {"tag_id": "A", "code": "1"}]}
+
+        found = only(blend({(U1, OPENAI): answer(sent)}, (OPENAI,), schema=prepare(Tagged)))
+
+        assert (found.status, found.record) == ("single_model", Tagged(tagged_id="T", tags=[Tag(tag_id="A", code="1")]))
+        assert found.record.tags[0].code == "PFX_1"
+
+    def test_a_nested_model_one_model_left_to_its_default_keeps_it_in_a_rebuilt_record(self):
+        sent = (
+            {"framed_id": "F", "label": "x"},
+            *({"framed_id": "F", "dims": {"width": 1, "height": 2}, "label": "y"},) * 2,
+        )
+        responses = {(U1, model): answer(record) for model, record in zip(THREE, sent, strict=True)}
+
+        found = only(blend(responses, THREE, schema=prepare(Framed)))
+
+        assert (found.status, found.notes, found.record) == ("consensus", (), Framed(framed_id="F", label="y"))
+
+    def test_a_model_that_validates_by_name_is_rebuilt_from_the_names_its_models_used(self):
+        sent = (
+            {"orderId": "O", "max_qty": 9, "lineItems": [{"partNumber": "P", "unitCount": 1}]},
+            {"orderId": "O", "maxQty": 9, "lineItems": [{"part_number": "P", "unit_count": 2}]},
+            {"orderId": "O", "maxQty": 9, "lineItems": [{"partNumber": "P", "unitCount": 2}]},
+        )
+        responses = {(U1, model): answer(record) for model, record in zip(THREE, sent, strict=True)}
+
+        found = only(blend(responses, THREE, schema=prepare(CamelOrder)))
+
+        expected = CamelOrder(order_id="O", max_qty=9, line_items=[CamelLine(part_number="P", unit_count=2)])
+        assert (found.status, found.notes, found.record) == ("consensus", (), expected)
+
+    def test_a_merge_with_children_a_default_gave_goes_to_review_never_raising(self):
+        sent = {"kit_id": "K", "pieces": [{"sku": "S", "count": 1}, {"sku": "T", "count": 2}]}
+        responses = {(U1, THREE[0]): answer({"kit_id": "K"}), **{(U1, model): answer(sent) for model in THREE[1:]}}
+
+        found = only(blend(responses, THREE, schema=prepare(Kit)))
+
+        assert (found.status, found.record, found.disputed_fields) == ("field_disagreement", None, ())
+        assert found.notes == ("the merged record failed validation: 1 validation error: pieces[0].sku: missing",)
+
+    def test_a_record_one_model_gave_whole_is_its_own_never_validated_again(self):
+        calls: list[str] = []
+
+        class Counted(BaseModel):
+            counted_id: Annotated[str, Key]
+            code: str
+
+            @field_validator("code")
+            @classmethod
+            def count(cls, value: str) -> str:
+                calls.append(value)
+                return value
+
+        responses = {(U1, model): answer({"counted_id": "C", "code": "1"}) for model in PAIR}
+
+        found = only(blend(responses, schema=prepare(Counted)))
+        validations = len(calls)
+
+        assert validations == 2  # each model's record once, at validation; none for the merged record
+        assert (found.status, found.record) == ("consensus", Counted(counted_id="C", code="1"))
+
+    def test_a_rebuild_leaves_every_response_as_it_was(self):
+        responses = {
+            (U1, model): answer({"appending_id": "A", "tags": ["t"], "label": label})
+            for model, label in zip(THREE, ("x", "y", "y"), strict=True)
+        }
+        before = [response.to_json() for response in responses.values()]
+
+        found = only(blend(responses, THREE, schema=prepare(Appending)))
+
+        assert [response.to_json() for response in responses.values()] == before
+        assert (found.status, found.record) == ("consensus", Appending(appending_id="A", tags=["t"], label="y"))
+
+    def test_a_rebuilt_record_is_checked_like_any_record(self):
+        sent = ((1, 1, 0), (1, 0, 1), (0, 1, 1))  # no one record has a, b and c all 1; their merge does
+        responses = {
+            (U1, model): answer({"poisoned_id": "P", "a": a, "b": b, "c": c, "ratio": 1.0})
+            for model, (a, b, c) in zip(THREE, sent, strict=True)
+        }
+
+        found = only(blend(responses, THREE, schema=prepare(Poisoned)))
+
+        assert (found.status, found.record, found.disputed_fields) == ("field_disagreement", None, ())
+        assert found.notes == ("the merged record failed validation: ratio: holds a non-finite float",)
+
+    def test_a_rebuilt_record_that_does_not_hold_the_agreed_values_is_a_disagreement(self):
+        sent = (
+            [{"row_no": 2, "qty": 5}, {"row_no": 1, "qty": 3}],
+            [{"row_no": 1, "qty": 3}, {"row_no": 2, "qty": 6}],
+            [{"row_no": 2, "qty": 6}, {"row_no": 1, "qty": 3}],
+        )
+        responses = {
+            (U1, model): answer({"ledger_id": "L", "rows": rows}) for model, rows in zip(THREE, sent, strict=True)
+        }
+
+        found = only(blend(responses, THREE, schema=prepare(Ledger)))
+
+        assert (found.status, found.record, found.disputed_fields) == ("field_disagreement", None, ())
+        assert found.notes == (
+            "the merged record failed validation: rebuilt from what the models sent, it does not hold the values "
+            "they agreed on",
+        )
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # Benchmark gate (maintainer-approved 2026-11-05)
 # ---------------------------------------------------------------------------------------------------------------
 
@@ -2314,41 +2726,130 @@ MEDIAN_LATENCY_S = 2.0
 CONCURRENCY = 8
 """rationalize()'s default max_concurrency."""
 BLEND_SHARE = 0.01
-"""The share of a run's wall time validation and consensus may take."""
+"""The share of a run's wall time validation, consensus and grounding may take."""
 RECORDS_PER_UNIT = 10
 CHILDREN_PER_RECORD = 5
 TIMING_RUNS = 3
 
 
-def synthetic_run(units: int) -> tuple[RunOutcome, tuple[str, ...]]:
-    """A two-family run: per unit and model ~10 Assembly records of 5 components each.
+@dataclasses.dataclass(frozen=True)
+class RealisticRun:
+    """A run over a real document of :data:`LOT` records: its outcome, its units and envelopes by unit id, in
+    document order, and its document."""
 
-    The second model disputes one component quantity per unit and leaves out a record in every seventh unit, so
-    the run exercises agreement, disputes and missing keys, not only the happy path.
+    outcome: RunOutcome
+    units: dict[str, Unit]
+    envelopes: dict[str, Envelope]
+    document: PDFDocument
+
+    @property
+    def unit_ids(self) -> tuple[str, ...]:
+        return tuple(self.units)
+
+    def ground(self, consensus: ConsensusResult) -> GroundingResult:
+        """Grounding of ``consensus``, an outcome of this run."""
+        documents = {self.document.metadata.doc_id: self.document}
+        return ground(
+            consensus,
+            outcome=self.outcome,
+            units=self.units,
+            envelopes=self.envelopes,
+            documents=documents,
+            schema=LOT,
+        )
+
+
+class Lot(BaseModel):
+    """An assembly of one production lot: keyed by a str and an int, so grounding checks a text and a number."""
+
+    assembly_id: Annotated[str, Key]
+    lot: Annotated[int, Key]
+    title: str
+    revision: int = 1
+    components: list[Component] = []
+    notes: list[str] = []
+
+
+LOT = prepare(Lot)
+VISION_EVERY, VISION_AT = 13, 6
+"""Unit ``u`` is a page of route ``vision`` when ``u % 13 == 6``: 77 of 1,000 units."""
+
+
+def lot_of(unit: int, index: int) -> int:
+    return 1_000 + 10 * unit + index
+
+
+def synthetic_document(pages: int, records: int, children: int) -> PDFDocument:
+    """One page per unit: per record a paragraph naming the assembly and its lot (written ``1,060``), then a table
+    of its components. Every thirteenth page is a vision page."""
+    built = []
+    for unit in range(pages):
+        number, elements = unit + 1, []
+        for index in range(records):
+            text = f"Assembly A-{unit}-{index}: Assembly {index}, lot {lot_of(unit, index):,}, revision 2."
+            elements.append(Paragraph(**ids(number, 2 * index), text=text))
+            rows = tuple((f"PN-{unit}-{index}-{child}", str(child), str(1.5 * child)) for child in range(children))
+            headers = ("Part", "Qty", "Unit price")
+            elements.append(
+                Table(**ids(number, 2 * index + 1), headers=headers, rows=rows, extraction_method="lattice")
+            )
+        route = "vision" if unit % VISION_EVERY == VISION_AT else "digital"
+        built.append(page(number, tuple(elements), route=route))
+    return PDFDocument(metadata=metadata(pages), pages=tuple(built))
+
+
+def realistic_run(units: int, records: int = RECORDS_PER_UNIT, children: int = CHILDREN_PER_RECORD) -> RealisticRun:
+    """A two-family run over :func:`synthetic_document`: each record quotes and cites its paragraph and its table.
+
+    With the full sizes the second model disputes one component quantity per unit, leaves out a record in every
+    seventh unit and misquotes record 5 of every eleventh unit (a quote its paragraph does not hold, by two of its
+    ten tokens), so the run exercises agreement, disputes, missing keys and ungrounded quotes, not only the happy
+    path. On a vision page each model quotes each paragraph as OCR might (``Assernbly``): not a substring, so it
+    grounds through token containment (7 of 8 tokens).
     """
+    full = (records, children) == (RECORDS_PER_UNIT, CHILDREN_PER_RECORD)
+    document = synthetic_document(units, records, children)
+    plan = build_units(document, max_unit_chars=120_000, render=render_element)
+    envelopes = build_envelopes(plan.units, document, prompt="Extract.", context=None, schema_json=LOT.wrapper_json)
     responses: dict[tuple[str, str], ProviderResponse] = {}
-    unit_ids = tuple(f"doc:p{unit:04d}_e001-p{unit:04d}_e050" for unit in range(units))
-    for unit, unit_id in enumerate(unit_ids):
+    for unit, built in enumerate(plan.units):
         for second, model in enumerate(PAIR):
-            records = [
-                assembly(
-                    f"A-{unit}-{index}",
-                    f"Assembly {index}",
-                    revision=2,
-                    notes=["n1", "n2"],
-                    components=[
-                        {
-                            "part_number": f"PN-{unit}-{index}-{child}",
-                            "quantity": child + (1 if second and index == 3 and child == 2 else 0),
-                            "unit_price": 1.5 * child,
-                        }
-                        for child in range(CHILDREN_PER_RECORD)
-                    ],
+            disputing = full and bool(second)
+            entries = []
+            for index in range(records - (1 if disputing and unit % 7 == 0 else 0)):
+                components = [
+                    {
+                        "part_number": f"PN-{unit}-{index}-{child}",
+                        "quantity": child + (1 if disputing and index == 3 and child == 2 else 0),
+                        "unit_price": 1.5 * child,
+                    }
+                    for child in range(children)
+                ]
+                record = assembly(
+                    f"A-{unit}-{index}", f"Assembly {index}", revision=2, notes=["n1", "n2"], components=components
                 )
-                for index in range(RECORDS_PER_UNIT - (1 if second and unit % 7 == 0 else 0))
-            ]
-            responses[(unit_id, model[0])] = raw({"records": [entry(record) for record in records]})
-    return outcome(responses, PAIR), unit_ids
+                record["lot"] = lot_of(unit, index)
+                misquoted = disputing and unit % 11 == 0 and index == 5
+                word = "Assernbly" if built.vision else "Assembly"
+                named = f"A-{unit}-{index}: {word} {index}, lot {lot_of(unit, index):,}"
+                if misquoted:
+                    named = f"A-{unit}-{index}: Assembly five, lot {lot_of(unit, index):,}, revision two"
+                quotes = (named, f"| PN-{unit}-{index}-0 | 0 |")
+                cited = (make_element_id(unit + 1, 2 * index), make_element_id(unit + 1, 2 * index + 1))
+                entries.append(entry(record, quotes, cited))
+            responses[(built.unit_id, model[0])] = raw({"records": entries})
+    return RealisticRun(
+        outcome=outcome(responses, PAIR),
+        units={built.unit_id: built for built in plan.units},
+        envelopes={envelope.unit_id: envelope for envelope in envelopes},
+        document=document,
+    )
+
+
+def blend_and_ground(run: RealisticRun) -> tuple[ConsensusResult, GroundingResult]:
+    """Validation, consensus and grounding of ``run``."""
+    consensus = build_consensus(run.outcome, LOT, run.unit_ids, min_families=2)
+    return consensus, run.ground(consensus)
 
 
 def light_run(units: int) -> tuple[RunOutcome, tuple[str, ...]]:
@@ -2387,20 +2888,60 @@ def best_time(
     return best, result
 
 
+def best_blend_time(run: RealisticRun, runs: int = TIMING_RUNS) -> tuple[float, ConsensusResult, GroundingResult]:
+    """The fastest of ``runs`` runs of validation, consensus and grounding together, and the results."""
+    best = math.inf
+    results = None
+    for _ in range(runs):
+        gc.collect()
+        started = time.perf_counter()
+        results = blend_and_ground(run)
+        best = min(best, time.perf_counter() - started)
+    assert results is not None
+    return (best, *results)
+
+
+def best_grounding_time(run: RealisticRun, runs: int = 5) -> float:
+    """The fastest of ``runs`` runs of grounding alone (consensus done once, before), the collector paused."""
+    consensus = build_consensus(run.outcome, LOT, run.unit_ids, min_families=2)
+    best = math.inf
+    for _ in range(runs):
+        gc.collect()
+        gc.disable()
+        try:
+            started = time.perf_counter()
+            run.ground(consensus)
+            best = min(best, time.perf_counter() - started)
+        finally:
+            gc.enable()
+    return best
+
+
 class TestBenchmarkGate:
     def test_blending_takes_at_most_one_percent_of_the_runs_wall_time(self):
-        run, unit_ids = synthetic_run(1_000)
-        requests = len(run.responses)
+        run = realistic_run(1_000)
+        requests = len(run.outcome.responses)
         budget_s = requests * MEDIAN_LATENCY_S / CONCURRENCY * BLEND_SHARE  # 2,000 x 2.0 s / 8 x 1% = 5 s
 
-        elapsed, result = best_time(run, unit_ids)
+        elapsed, consensus, grounded = best_blend_time(run)
 
         assert requests == 2_000 and budget_s == pytest.approx(5.0)
-        statuses = [found.status for found in result.items]
+        statuses = [found.status for found in consensus.items]
         assert len(statuses) == 10_000
         assert statuses.count("field_disagreement") == 1_000
         assert statuses.count("missing_in_some_models") == 143
-        print(f"\nvalidation + consensus, 1,000 units x 2 families x 10 records: {elapsed:.3f} s (budget {budget_s} s)")
+        vision = {unit_id for unit_id, unit in run.units.items() if unit.vision}
+        assert len(vision) == 77
+        # Each of their 770 items grounds through containment (its quotes are no substrings) but the 7 misquoted.
+        assert sum(found.item.unit_id in vision and found.grounded for found in grounded.items) == 770 - 7
+        after = [found.status for found in grounded.items]
+        assert (after.count("consensus"), after.count("ungrounded_value")) == (8_766, 91)
+        assert after.count("field_disagreement") == 1_000 and after.count("missing_in_some_models") == 143
+        assert sum(not found.grounded for found in grounded.items) == 91 and grounded.empty_units == ()
+        print(
+            f"\nvalidation + consensus + grounding, 1,000 units x 2 families x 10 records: {elapsed:.3f} s "
+            f"(budget {budget_s} s)"
+        )
         assert elapsed <= budget_s
 
     def test_twice_the_repeated_copies_of_a_key_take_about_twice_the_time(self):
@@ -2434,6 +2975,14 @@ class TestBenchmarkGate:
         large_s, _ = best_time(*large, runs=5, collect=False)
 
         print(f"\n1,000 units: {small_s:.3f} s; 2,000 units: {large_s:.3f} s; ratio {large_s / small_s:.2f}")
+        assert large_s <= 2.2 * small_s
+
+    def test_twice_the_units_take_about_twice_the_time_to_ground(self):
+        small, large = realistic_run(1_000, records=2, children=1), realistic_run(2_000, records=2, children=1)
+
+        small_s, large_s = best_grounding_time(small), best_grounding_time(large)
+
+        print(f"\ngrounding 1,000 units: {small_s:.3f} s; 2,000 units: {large_s:.3f} s; ratio {large_s / small_s:.2f}")
         assert large_s <= 2.2 * small_s
 
 
@@ -2478,3 +3027,112 @@ class TestWidenedComparison:
         responses = {(U1, GOOGLE): answer({"gauge_id": "G"}), (U1, ANTHROPIC): answer({"gauge_id": "G", "ratio": 0.5})}
 
         assert only(blend(responses, schema=GAUGE)).disputed_fields == ("ratio",)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Tier 1 Unit 1A: Order-independent model_fields_set, per-record quote/id bounds, and public normalized_text
+# ---------------------------------------------------------------------------------------------------------------
+
+
+class RevisionedPart(BaseModel):
+    code: Annotated[str, Key]
+    revision: str = "A"
+
+
+REVISIONED_PART = prepare(RevisionedPart)
+OPENAI_GPT = ("openai:gpt-5.4", "gpt", "openai")
+ANTHROPIC_CLAUDE = ("anthropic:claude-sonnet-4-6", "claude", "anthropic")
+
+
+class TestOrderIndependentModelFieldsSet:
+    @pytest.mark.parametrize(
+        "models",
+        [(OPENAI_GPT, ANTHROPIC_CLAUDE), (ANTHROPIC_CLAUDE, OPENAI_GPT)],
+        ids=["openai-then-anthropic", "anthropic-then-openai"],
+    )
+    def test_null_not_shown_vs_explicit_default_preserves_model_fields_set_in_both_orders(self, models):
+        responses = {
+            (U1, OPENAI_GPT): answer({"code": "P-1", "revision": None}),
+            (U1, ANTHROPIC_CLAUDE): answer({"code": "P-1", "revision": "A"}),
+        }
+
+        found = only(blend(responses, models, schema=REVISIONED_PART))
+
+        assert found.status == "consensus"
+        assert found.record == RevisionedPart(code="P-1", revision="A")
+        assert found.record is not None
+        assert "revision" in found.record.model_fields_set
+
+    def test_when_both_models_send_null_not_shown_field_is_not_in_model_fields_set(self):
+        models = (OPENAI_GPT, ANTHROPIC_CLAUDE)
+        responses = {
+            (U1, OPENAI_GPT): answer({"code": "P-1", "revision": None}),
+            (U1, ANTHROPIC_CLAUDE): answer({"code": "P-1", "revision": None}),
+        }
+
+        found = only(blend(responses, models, schema=REVISIONED_PART))
+
+        assert found.status == "consensus"
+        assert found.record == RevisionedPart(code="P-1", revision="A")
+        assert found.record is not None
+        assert "revision" not in found.record.model_fields_set
+
+
+OVER_BOUND_OVERRIDES: dict[str, dict[str, Any]] = {
+    "too-many-quotes": {"grounding_quotes": ("q",) * 257},
+    "quote-too-long": {"grounding_quotes": ("q" * 16_385,)},
+    "too-many-source-ids": {"source_element_ids": ("e1",) * (SOURCE_IDS_MAX + 1)},
+    "source-id-too-long": {"source_element_ids": ("e" * (SOURCE_ID_MAX_CHARS + 1),)},
+}
+
+OVER_BOUND_ENTRIES: dict[str, tuple[list[str], list[str]]] = {
+    "too-many-quotes": (["q"] * 257, ["p0001_e001"]),
+    "quote-too-long": (["q" * 16_385], ["p0001_e001"]),
+    "too-many-source-ids": (["a quote"], ["p0001_e001"] * (SOURCE_IDS_MAX + 1)),
+    "source-id-too-long": (["a quote"], ["e" * (SOURCE_ID_MAX_CHARS + 1)]),
+}
+
+
+class TestRecordGroundingAndSourceIdBounds:
+    def test_quotes_and_source_id_bounds_are_exported_in_all(self):
+        assert consensus_module.QUOTES_MAX == 256
+        assert consensus_module.QUOTE_MAX_CHARS == 16_384
+        assert consensus_module.SOURCE_IDS_MAX == 256
+        assert consensus_module.SOURCE_ID_MAX_CHARS == 256
+        exported = set(consensus_module.__all__)
+        assert {"QUOTES_MAX", "QUOTE_MAX_CHARS", "SOURCE_IDS_MAX", "SOURCE_ID_MAX_CHARS"} <= exported
+
+    @pytest.mark.parametrize("case", list(OVER_BOUND_OVERRIDES))
+    def test_valid_record_rejects_quotes_and_source_ids_past_bounds(self, case):
+        fields: dict[str, Any] = {
+            "record": Assembly(assembly_id="A-1", title="Pump"),
+            "grounding_quotes": ("q",),
+            "source_element_ids": ("e1",),
+            "position": 0,
+            "wire": assembly(),
+            **OVER_BOUND_OVERRIDES[case],
+        }
+        with pytest.raises(ValueError):
+            ValidRecord(**fields)
+
+    @pytest.mark.parametrize("case", list(OVER_BOUND_ENTRIES))
+    def test_validate_response_quarantines_entries_past_quote_or_source_id_bounds_as_unparseable(self, case):
+        quotes, ids = OVER_BOUND_ENTRIES[case]
+        validated = validate(raw({"records": [entry(assembly(), quotes=quotes, ids=ids)]}))
+
+        assert [found.reason for found in validated.quarantined] == ["unparseable"]
+        assert validated.records == ()
+
+
+class TestNormalizedText:
+    def test_normalized_text_is_exported_in_all(self):
+        assert callable(consensus_module.normalized_text)
+        assert "normalized_text" in consensus_module.__all__
+
+    def test_normalized_text_applies_nfc_and_collapses_whitespace(self):
+        assert consensus_module.normalized_text("  caf\u0065\u0301 \n\t  bar ") == "caf\u00e9 bar"
+
+    @pytest.mark.parametrize("bad", [123, None, b"bytes", ["str"]])
+    def test_normalized_text_rejects_non_str(self, bad):
+        with pytest.raises(TypeError):
+            consensus_module.normalized_text(bad)

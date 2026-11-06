@@ -60,10 +60,12 @@ paid for whose answers the schema would then reject. Each rejection raises
    in the subset every provider adapter expresses: objects with properties, arrays with one ``items`` schema,
    scalars, ``enum`` and ``const``, ``anyOf`` only as ``[X, {"type": "null"}]`` (Optional) or as pydantic's
    ``Decimal`` (a ``number`` then a ``string``, then ``null`` when Optional), and local ``#/$defs/<name>``
-   references without cycles, each entry referenced. Keywords that combine or condition schemas, or hold
-   subschemas the walk does not read, are refused (``oneOf``, ``allOf``, ``not``, ``if`` / ``then`` / ``else``,
-   ``patternProperties``, ``prefixItems``, ``contains``, ``$id``, ...), as are ``additionalProperties`` other
-   than ``false``, an unconstrained schema, an object without properties and an array without ``items``.
+   references without cycles, each entry referenced (the name one RFC 6901 token, read by
+   :func:`~datagrunt.rationalization._refs.def_name` as every adapter reads it). Keywords that combine or
+   condition schemas, or hold subschemas the walk does not read, are refused (``oneOf``, ``allOf``, ``not``,
+   ``if`` / ``then`` / ``else``, ``patternProperties``, ``prefixItems``, ``contains``, ``$id``, ...), as are
+   ``additionalProperties`` other than ``false``, an unconstrained schema, an object without properties and an
+   array without ``items``.
    Constraints (``pattern``, ``maximum``, ``format``, ...) and annotations (``title``, ``description``,
    ``default``, ...) pass: adapters handle them. Pydantic 2.14 emits a model field with a description as ``$ref``
    with a sibling ``description``, never ``allOf``. A path holds at most 32 objects and arrays, counted as
@@ -81,6 +83,7 @@ names (``Key``, ``RationalizationError``) never load pydantic.
 import copy
 import json
 import math
+import re
 import typing
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -104,6 +107,7 @@ from pydantic import (
 from pydantic.fields import FieldInfo
 
 from datagrunt.rationalization._canonical import canonical_json, sha256_hex
+from datagrunt.rationalization._refs import DEFS_POINTER, DEFS_PREFIX, UNREAD_KEYWORDS, def_name, json_pointer
 from datagrunt.rationalization.exceptions import RationalizationError
 from datagrunt.rationalization.markers import _KeyMarker
 
@@ -156,37 +160,6 @@ _NAMES_SHOWN = 10
 _JSON_TYPES = frozenset({"array", "boolean", "integer", "null", "number", "object", "string"})
 _CONTAINER_TYPES = frozenset({"array", "object"})
 _TYPED_KEYWORDS = ("type", "$ref", "anyOf", "enum", "const")
-_REJECTED_KEYWORDS = frozenset(
-    {
-        # Combine or condition schemas.
-        "oneOf",
-        "allOf",
-        "not",
-        "if",
-        "then",
-        "else",
-        # Hold subschemas the walk does not read.
-        "patternProperties",
-        "prefixItems",
-        "additionalItems",
-        "contains",
-        "propertyNames",
-        "dependentSchemas",
-        "dependencies",
-        "unevaluatedProperties",
-        "unevaluatedItems",
-        "contentSchema",
-        "definitions",
-        # Change what a $ref resolves to.
-        "$dynamicRef",
-        "$recursiveRef",
-        "$id",
-        "$anchor",
-        "$dynamicAnchor",
-        "$recursiveAnchor",
-    }
-)
-_DEFS_PREFIX = "#/$defs/"
 # What model_json_schema() raises on a schema it cannot build: its own error, and what escapes it on a tampered
 # WithJsonSchema (a $ref to a missing $defs entry, a $ref that is not a str, nesting deeper than the stack).
 _PYDANTIC_SCHEMA_ERRORS: tuple[type[BaseException], ...] = (PydanticUserError, KeyError, AttributeError, RecursionError)
@@ -205,6 +178,10 @@ _DECIMAL_TYPES = ("number", "string")
 _VALUE_KEYWORDS = ("type", "enum", "const", "format", "items", "properties", "anyOf", "$ref")
 # Keywords that describe a value without shaping it: left out of the JSON a message shows.
 _ANNOTATION_KEYWORDS = frozenset({"title", "description", "default", "examples", "deprecated"})
+_R8_ESCAPED = re.compile(
+    r"\r\n?|[\u0000-\u0008\u000b-\u000c\u000e-\u001f\u007f-\u009f"
+    r"\u202a-\u202e\u2066-\u2069\ud800-\udfff\U000e0000-\U000e007f]"
+)
 _JSON_SHOWN = 200
 _FROZEN_ERRORS = frozenset({"frozen_field", "frozen_instance"})
 _MISSING = object()  # what getattr gives for a field an instance lacks (a model_construct() instance)
@@ -810,6 +787,11 @@ def _describe_field(
     if info.discriminator is not None or _has_discriminator(info.metadata):
         raise RationalizationError(f"{path}: {_DISCRIMINATED}")
     shape = _shape(info.annotation, path)
+    if isinstance(info.description, str) and (found := _R8_ESCAPED.search(info.description)) is not None:
+        raise RationalizationError(
+            f"{path}: its description holds U+{ord(found.group(0)[0]):04X}, a code point R8 escapes: "
+            "remove it from the description"
+        )
     _check_none_default(info, shape, path)
     wire_name = _wire_name(model, name, info, path)
     if shape.kind != "scalar":
@@ -1239,7 +1221,7 @@ def _check_agreement(spec: ModelSpec, document: Mapping[str, Any]) -> None:
     """
     defs = document.get("$defs", {})
     if not isinstance(defs, Mapping):
-        raise _json_error(spec.model.__name__, "#/$defs", "$defs must map names to schemas")
+        raise _json_error(spec.model.__name__, DEFS_POINTER, "$defs must map names to schemas")
     stack: list[tuple[ModelSpec, object, str]] = [(spec, document, spec.model.__name__)]
     for _ in range(MAX_FIELDS + 1):
         if not stack:
@@ -1454,7 +1436,7 @@ def _resolve(node: object, defs: Mapping[str, Any], path: str) -> tuple[Mapping[
             raise RationalizationError(f"{path}: its JSON schema is not a schema object")
         if "$ref" in node:
             _check_siblings(node, "$ref", path)
-            entry = _local_def(node["$ref"])
+            entry = def_name(node["$ref"])
             if entry is None or entry not in defs:
                 raise RationalizationError(f"{path}: its JSON schema's $ref {node['$ref']!r} names no $defs entry")
             node = defs[entry]
@@ -1528,11 +1510,11 @@ def _check_document(document: Mapping[str, Any], name: str) -> None:
     """Raise unless the JSON schema ``document`` of the model ``name`` stays in the supported subset."""
     defs = document.get("$defs", {})
     if not isinstance(defs, Mapping):
-        raise _json_error(name, "#/$defs", "$defs must map names to schemas")
+        raise _json_error(name, DEFS_POINTER, "$defs must map names to schemas")
     reached = _walk(document, defs, name)
     for entry in defs:
         if entry not in reached:
-            raise _json_error(name, _pointer("#/$defs", entry), "this $defs entry is not referenced")
+            raise _json_error(name, json_pointer(DEFS_POINTER, entry), "this $defs entry is not referenced")
     if document.get("type") != "object":
         raise _json_error(name, "#", "the root schema must be an object")
 
@@ -1571,13 +1553,21 @@ def _visit(node: _Node, defs: Mapping[str, Any], name: str) -> list[_Node]:
 def _check_keywords(schema: Mapping[str, Any], pointer: str, name: str) -> None:
     """Raise if the node at ``pointer`` uses a refused keyword or form, or constrains nothing."""
     for keyword in schema:
-        if keyword in _REJECTED_KEYWORDS:
+        if keyword in UNREAD_KEYWORDS:  # they combine or condition schemas, or hide subschemas or $ref targets
             raise _json_error(name, pointer, f"{keyword!r} is not supported")
     if "$defs" in schema and pointer != "#":
         raise _json_error(name, pointer, "$defs is only supported at the root")
     if schema.get("additionalProperties", False) is not False:
         raise _json_error(
             name, pointer, "additionalProperties must be absent or false: a dict field or extra='allow' is unbounded"
+        )
+    description = schema.get("description")
+    if isinstance(description, str) and (found := _R8_ESCAPED.search(description)) is not None:
+        raise _json_error(
+            name,
+            pointer,
+            f"description holds U+{ord(found.group(0)[0]):04X}, a code point R8 escapes: "
+            "remove it from the description",
         )
     _check_type(schema, pointer, name)
     if "anyOf" in schema:
@@ -1625,7 +1615,7 @@ def _subschemas(schema: Mapping[str, Any], pointer: str, depth: int, refs: froze
     if not isinstance(properties, Mapping):
         raise _json_error(name, pointer, "'properties' must map names to schemas")
     children = [
-        _Node(schema=value, pointer=_pointer(f"{pointer}/properties", str(key)), depth=depth, refs=refs)
+        _Node(schema=value, pointer=json_pointer(f"{pointer}/properties", str(key)), depth=depth, refs=refs)
         for key, value in properties.items()
     ]
     if "items" in schema:
@@ -1641,10 +1631,10 @@ def _subschemas(schema: Mapping[str, Any], pointer: str, depth: int, refs: froze
 
 def _follow(ref: object, node: _Node, depth: int, defs: Mapping[str, Any], name: str) -> _Node:
     """The ``$defs`` entry the ``ref`` of ``node`` names; any other reference, or a cycle, raises."""
-    entry = _local_def(ref)
+    entry = def_name(ref)
     if entry is None:
         raise _json_error(
-            name, node.pointer, f"$ref {ref!r} is not supported: only local {_DEFS_PREFIX}<name> references are"
+            name, node.pointer, f"$ref {ref!r} is not supported: only local {DEFS_PREFIX}<name> references are"
         )
     if entry not in defs:
         raise _json_error(name, node.pointer, f"$ref {ref!r} names no $defs entry")
@@ -1652,19 +1642,7 @@ def _follow(ref: object, node: _Node, depth: int, defs: Mapping[str, Any], name:
         raise _json_error(
             name, node.pointer, f"$ref cycle: {ref!r} refers back to a schema that contains it (a recursive model)"
         )
-    return _Node(schema=defs[entry], pointer=_pointer("#/$defs", entry), depth=depth, refs=node.refs | {entry})
-
-
-def _local_def(ref: object) -> str | None:
-    """The ``$defs`` entry a local ``#/$defs/<name>`` reference names (RFC 6901 unescaped), else ``None``."""
-    if not isinstance(ref, str) or not ref.startswith(_DEFS_PREFIX) or "/" in ref[len(_DEFS_PREFIX) :]:
-        return None
-    return ref[len(_DEFS_PREFIX) :].replace("~1", "/").replace("~0", "~")
-
-
-def _pointer(base: str, token: str) -> str:
-    """``base`` extended by one JSON-pointer ``token`` (RFC 6901: ``~`` as ``~0``, ``/`` as ``~1``)."""
-    return f"{base}/{token.replace('~', '~0').replace('/', '~1')}"
+    return _Node(schema=defs[entry], pointer=json_pointer(DEFS_POINTER, entry), depth=depth, refs=node.refs | {entry})
 
 
 def _json_error(name: str, pointer: str, reason: str) -> RationalizationError:

@@ -39,22 +39,32 @@ through the bounded HTTP helper (:class:`~datagrunt.rationalization.providers.ht
    ``responseJsonSchema``, a JSON Schema subset; :meth:`GeminiProvider.transform_schema` keeps the documented
    keywords (``type``, ``title``, ``description``, ``properties``, ``required``, ``additionalProperties``,
    ``items``, ``enum``, ``format`` (date and time), ``minimum``, ``maximum``, ``minItems``, ``maxItems``, ``anyOf``,
-   ``$ref``, ``$defs``) and turns ``const`` into a one-value ``enum``. Google Cloud takes ``responseSchema``, the
-   field its structured-output guide documents, an OpenAPI subset: its ``Schema`` object has root-level ``ref`` and
-   ``defs``, but the guide's list of supported fields names neither, so every local ``$ref`` is inlined (at most
-   :data:`SCHEMA_MAX_NODES` nodes; a cycle refused), ``anyOf [X, null]`` becomes ``X`` with ``nullable: true`` (the
-   outer keywords, such as a field's ``description``, win over the inlined ones), types become ``STRING``,
-   ``NUMBER``, ``INTEGER``, ``BOOLEAN``, ``ARRAY``, ``OBJECT`` or ``NULL``, an ``enum`` (or ``const``) stays only when
-   all its values are strings (string enums only), ``format`` stays only on a string and only for date, time and
-   duration, and only the documented keywords (``type``, ``description``, ``nullable``, ``properties``,
-   ``required``, ``items``, ``enum``, ``format``, ``minimum``, ``maximum``, ``minItems``, ``maxItems``, ``anyOf``)
-   are kept. On either API, an integer's ``exclusiveMinimum: n`` becomes ``minimum: floor(n) + 1`` and
-   ``exclusiveMaximum: n`` becomes ``maximum: ceil(n) - 1`` (the stricter of it and a given inclusive bound), and
-   every other constraint the field cannot hold (``pattern``, ``minLength``, ``maxLength``, a number's exclusive
-   bounds, ``multipleOf``, ``uniqueItems``, ``minProperties``, ``maxProperties``, ``minContains``, ``maxContains``, any
-   other ``format``, ``date-time`` included, and on Google Cloud an integer or boolean ``enum`` or ``const``, an int
-   or bool ``Literal``, and ``additionalProperties: false``, which ``responseSchema`` cannot state) is removed and
-   appended to the field's description as ``{enum: [0,1], pattern: "^P"}``
+   ``$ref``, ``$defs``) and turns ``const`` into a one-value ``enum``. On either API a ``$ref`` is a local
+   ``#/$defs/<name>``, the name one RFC 6901 token (``~1`` for ``/``, ``~0`` for ``~``) read by
+   :func:`~datagrunt.rationalization._refs.def_name` as every transform reads it, and a recursive schema, a ``$ref``
+   cycle among the ``$defs`` entries through a ``properties`` value, ``items``, an ``anyOf`` member, a
+   schema-valued ``additionalProperties`` or a ``$ref``'s siblings (and an unreferenced entry's), is refused at
+   ``#/$defs`` before anything is converted, naming its path (``#/$defs/A -> #/$defs/B -> #/$defs/A``, ten hops at
+   most), by the check every transform shares (:func:`~datagrunt.rationalization._refs.ref_cycle`, which reads at
+   most :data:`SCHEMA_MAX_NODES` nodes of the entries and refuses more at ``#/$defs``; the other keywords holding
+   subschemas are refused by name, below); ``schema.prepare()`` already refuses a recursive model, so this is defense
+   in depth for a direct caller of the transform. Google Cloud takes ``responseSchema``, the field its
+   structured-output guide documents, an OpenAPI subset: its ``Schema`` object has root-level ``ref`` and ``defs``,
+   but the guide's list of supported fields names neither, so every local ``$ref`` is inlined (at most
+   :data:`SCHEMA_MAX_NODES` nodes; the ``$defs`` are acyclic by then, so an entry used twice on one path, as a
+   ``$ref`` beside a sibling naming the same entry, is inlined twice), ``anyOf [X, null]`` becomes ``X`` with
+   ``nullable: true`` (the outer keywords, such as a field's ``description``, win over the inlined ones), types
+   become ``STRING``, ``NUMBER``, ``INTEGER``, ``BOOLEAN``, ``ARRAY``, ``OBJECT`` or ``NULL``, an ``enum`` (or
+   ``const``) stays only when all its values are strings (string enums only), ``format`` stays only on a string and
+   only for date, time and duration, and only the documented keywords (``type``, ``description``, ``nullable``,
+   ``properties``, ``required``, ``items``, ``enum``, ``format``, ``minimum``, ``maximum``, ``minItems``,
+   ``maxItems``, ``anyOf``) are kept. On either API, an integer's ``exclusiveMinimum: n`` becomes
+   ``minimum: floor(n) + 1`` and ``exclusiveMaximum: n`` becomes ``maximum: ceil(n) - 1`` (the stricter of it and a
+   given inclusive bound), and every other constraint the field cannot hold (``pattern``, ``minLength``, ``maxLength``,
+   a number's exclusive bounds, ``multipleOf``, ``uniqueItems``, ``minProperties``, ``maxProperties``, ``minContains``,
+   ``maxContains``, any other ``format``, ``date-time`` included, and on Google Cloud an integer or boolean ``enum`` or
+   ``const``, an int or bool ``Literal``, and ``additionalProperties: false``, which ``responseSchema`` cannot state) is
+   removed and appended to the field's description as ``{enum: [0,1], pattern: "^P"}``
    (canonical JSON values, keys sorted; the Anthropic adapter's form), so the model still reads it and no paid answer
    is always quarantined for a rule the model never saw. ``date-time`` is only a hint because pydantic writes it for
    an aware and a naive datetime alike, and RFC 3339, which the grammar would enforce, requires the offset a
@@ -121,6 +131,16 @@ from types import MappingProxyType
 from typing import Any, Final, Literal, NoReturn, TypeAlias, cast
 
 from datagrunt.rationalization._canonical import canonical_copy, canonical_json
+from datagrunt.rationalization._refs import (
+    DEFS_POINTER,
+    DEFS_PREFIX,
+    UNREAD_KEYWORDS,
+    NodeBoundError,
+    cycle_text,
+    def_name,
+    json_pointer,
+    ref_cycle,
+)
 from datagrunt.rationalization.exceptions import RationalizationError
 from datagrunt.rationalization.providers.base import (
     ModelString,
@@ -196,7 +216,6 @@ REFUSED_REASONS = frozenset(
 """The finish reasons of an answer a filter or policy blocked."""
 
 _FINISH_PREFIX = "FINISH_REASON_"  # Google Cloud's inference reference spells the reasons FINISH_REASON_STOP, ...
-_DEFS_PREFIX = "#/$defs/"
 _JSON_TYPES = frozenset({"string", "number", "integer", "boolean", "object", "array", "null"})
 _OPENAPI_TYPES: Mapping[str, str] = MappingProxyType({name: name.upper() for name in _JSON_TYPES})
 # date-time is only hinted: pydantic writes it for an aware and a naive datetime alike, and RFC 3339 (which the
@@ -227,34 +246,6 @@ _INTEGER_BOUNDS: tuple[tuple[str, str, Callable[[float], int], Callable[..., Any
     ("exclusiveMaximum", "maximum", lambda bound: math.ceil(bound) - 1, min),
 )
 _OPENAPI_VALUES = frozenset({"description", "required", "minimum", "maximum", "minItems", "maxItems"})
-# Keywords holding subschemas the transforms do not read: dropping one would loosen the schema silently.
-_REFUSED_KEYWORDS = frozenset(
-    {
-        "oneOf",
-        "allOf",
-        "not",
-        "if",
-        "then",
-        "else",
-        "patternProperties",
-        "prefixItems",
-        "additionalItems",
-        "contains",
-        "propertyNames",
-        "dependentSchemas",
-        "dependencies",
-        "unevaluatedProperties",
-        "unevaluatedItems",
-        "contentSchema",
-        "definitions",
-        "$dynamicRef",
-        "$recursiveRef",
-        "$id",
-        "$anchor",
-        "$dynamicAnchor",
-        "$recursiveAnchor",
-    }
-)
 
 MODEL_FAMILY = "google"
 """The vendor lineage of every model this adapter reaches (Gemini, Gemma): Google's."""
@@ -388,13 +379,12 @@ def _google_cloud_endpoint(model: str, target: GoogleCloudTarget) -> _Endpoint:
 
 @dataclass(frozen=True, slots=True)
 class _Task:
-    """One schema object to convert into ``target``: where it is, how deep, and the ``$defs`` inlined above it."""
+    """One schema object to convert into ``target``: where it is, and how deep."""
 
     source: Mapping[str, Any]
     target: dict[str, Any]
     pointer: str
     depth: int
-    inlining: frozenset[str]
 
 
 _Convert: TypeAlias = Callable[[_Task, Mapping[str, Any]], list[_Task]]
@@ -402,11 +392,6 @@ _Convert: TypeAlias = Callable[[_Task, Mapping[str, Any]], list[_Task]]
 
 def _schema_error(pointer: str, reason: str) -> RationalizationError:
     return RationalizationError(f"the response schema at {pointer} cannot be sent to Gemini: {reason}")
-
-
-def _pointer(base: str, token: str) -> str:
-    """``base`` extended by one JSON-pointer ``token`` (RFC 6901)."""
-    return f"{base}/{token.replace('~', '~0').replace('/', '~1')}"
 
 
 def _fresh_schema(schema: object) -> dict[str, Any]:
@@ -425,25 +410,37 @@ def _fresh_schema(schema: object) -> dict[str, Any]:
 def _root_defs(root: Mapping[str, Any]) -> Mapping[str, Any]:
     defs = root.get("$defs", {})
     if not isinstance(defs, Mapping):
-        raise _schema_error("#/$defs", "'$defs' must map names to schemas")
+        raise _schema_error(DEFS_POINTER, "'$defs' must map names to schemas")
     return defs
 
 
-def _def_name(ref: object, defs: Mapping[str, Any], pointer: str) -> str:
-    """The ``$defs`` entry a local ``#/$defs/<name>`` reference names; any other reference raises."""
-    if not isinstance(ref, str) or not ref.startswith(_DEFS_PREFIX) or "/" in ref[len(_DEFS_PREFIX) :]:
-        raise _schema_error(pointer, f"$ref must be a local {_DEFS_PREFIX}<name> reference")
-    name = ref[len(_DEFS_PREFIX) :].replace("~1", "/").replace("~0", "~")
+def _check_acyclic(defs: Mapping[str, Any]) -> None:
+    """Refuse a ``$ref`` cycle among the ``$defs`` entries, naming its path, on either API (module notes, 4)."""
+    try:
+        cycle = ref_cycle(defs, max_nodes=SCHEMA_MAX_NODES)
+    except NodeBoundError as error:
+        raise _schema_error(DEFS_POINTER, f"it has more than {SCHEMA_MAX_NODES} schema nodes") from error
+    if cycle is not None:
+        raise _schema_error(DEFS_POINTER, f"it is recursive (a $ref cycle: {cycle_text(cycle)})")
+
+
+def _entry_name(ref: object, defs: Mapping[str, Any], pointer: str) -> str:
+    """The ``$defs`` entry a local ``#/$defs/<name>`` reference names (RFC 6901); any other reference raises."""
+    name = def_name(ref)
+    if name is None:
+        raise _schema_error(pointer, f"$ref must be a local {DEFS_PREFIX}<name> reference")
     if name not in defs:
         raise _schema_error(pointer, "$ref names no $defs entry")
     return name
 
 
 def _walk(root: Mapping[str, Any], convert: _Convert) -> dict[str, Any]:
-    """Convert ``root`` object by object with ``convert``, iteratively, under both bounds."""
+    """Convert ``root`` object by object with ``convert``, iteratively, under both bounds, once its ``$defs`` are
+    known to hold no ``$ref`` cycle."""
     defs = _root_defs(root)
+    _check_acyclic(defs)
     out: dict[str, Any] = {}
-    stack = [_Task(root, out, "#", 1, frozenset())]
+    stack = [_Task(root, out, "#", 1)]
     built = 0
     while stack:  # bounded: each task is a schema object counted against SCHEMA_MAX_NODES
         task = stack.pop()
@@ -462,13 +459,13 @@ def _as_schema(value: object, pointer: str) -> Mapping[str, Any]:
     return value
 
 
-def _child(task: _Task, source: object, pointer: str, inlining: frozenset[str]) -> tuple[dict[str, Any], _Task]:
+def _child(task: _Task, source: object, pointer: str) -> tuple[dict[str, Any], _Task]:
     """A new empty target for the subschema ``source`` and the task that fills it."""
     target: dict[str, Any] = {}
-    return target, _Task(_as_schema(source, pointer), target, pointer, task.depth + 1, inlining)
+    return target, _Task(_as_schema(source, pointer), target, pointer, task.depth + 1)
 
 
-def _subschemas(task: _Task, source: Mapping[str, Any], keyword: str, inlining: frozenset[str]) -> list[_Task]:
+def _subschemas(task: _Task, source: Mapping[str, Any], keyword: str) -> list[_Task]:
     """The tasks for one container keyword: ``properties`` / ``$defs`` (named), ``items`` (one), ``anyOf`` (a list)."""
     value, base = source[keyword], f"{task.pointer}/{keyword}"
     if keyword in ("properties", "$defs"):
@@ -477,24 +474,24 @@ def _subschemas(task: _Task, source: Mapping[str, Any], keyword: str, inlining: 
         named: dict[str, Any] = {}
         tasks = []
         for name, child in value.items():
-            named[name], made = _child(task, child, _pointer(base, name), inlining)
+            named[name], made = _child(task, child, json_pointer(base, name))
             tasks.append(made)
         task.target[keyword] = named
         return tasks
     if keyword == "anyOf":
         if not isinstance(value, list):
             raise _schema_error(base, "'anyOf' must be a list of schemas")
-        pairs = [_child(task, member, f"{base}/{index}", inlining) for index, member in enumerate(value)]
+        pairs = [_child(task, member, f"{base}/{index}") for index, member in enumerate(value)]
         task.target[keyword] = [target for target, _ in pairs]
         return [made for _, made in pairs]
-    target, made = _child(task, value, base, inlining)
+    target, made = _child(task, value, base)
     task.target[keyword] = target
     return [made]
 
 
 def _refuse_unread(source: Mapping[str, Any], pointer: str) -> None:
     for keyword in source:
-        if keyword in _REFUSED_KEYWORDS:
+        if keyword in UNREAD_KEYWORDS:  # dropping one would loosen the schema silently
             raise _schema_error(pointer, f"{keyword!r} holds subschemas the Gemini adapter cannot express")
 
 
@@ -525,12 +522,12 @@ def _json_node(task: _Task, defs: Mapping[str, Any]) -> list[_Task]:
         elif keyword in _JSON_HINTED:
             hints[keyword] = value
         elif keyword == "$ref":
-            _def_name(value, defs, task.pointer)
+            _entry_name(value, defs, task.pointer)
             target[keyword] = value
         elif keyword == "additionalProperties" and isinstance(value, bool):
             target[keyword] = value
         elif keyword in ("properties", "$defs", "items", "anyOf", "additionalProperties"):
-            tasks.extend(_subschemas(task, source, keyword, task.inlining))
+            tasks.extend(_subschemas(task, source, keyword))
     if "const" in source and "enum" not in source:
         target["enum"] = [source["const"]]
     _integer_bounds(target, hints, "integer")
@@ -580,27 +577,30 @@ def _is_null(member: object) -> bool:
     return isinstance(member, Mapping) and member.get("type") == "null"
 
 
-def _flatten(task: _Task, defs: Mapping[str, Any]) -> tuple[Mapping[str, Any], frozenset[str], bool]:
-    """``task``'s object through ``$ref`` (inlined) and Optional's ``anyOf`` (collapsed); and whether null passes."""
-    node, inlining, nullable = task.source, task.inlining, False
-    for _ in range(SCHEMA_MAX_DEPTH):  # bounded: each step inlines a new $defs entry or removes one anyOf level
+def _flatten(task: _Task, defs: Mapping[str, Any]) -> tuple[Mapping[str, Any], bool]:
+    """``task``'s object through ``$ref`` (inlined) and Optional's ``anyOf`` (collapsed); and whether null passes.
+
+    The ``$defs`` hold no ``$ref`` cycle (``_walk`` refused one), so each ``$ref`` it inlines follows an edge of an
+    acyclic graph: an entry used twice on one path (a ``$ref`` beside a sibling naming the same entry) is inlined
+    twice, never forever; the loop's bound and the walk's ``SCHEMA_MAX_NODES`` and ``SCHEMA_MAX_DEPTH`` bound it
+    anyway.
+    """
+    node, nullable = task.source, False
+    for _ in range(SCHEMA_MAX_DEPTH):  # bounded: each step inlines one $defs entry or removes one anyOf level
         if "$ref" in node:
-            name = _def_name(node["$ref"], defs, task.pointer)
-            if name in inlining:
-                raise _schema_error(task.pointer, "a $ref cycle (a recursive schema) cannot be inlined")
-            inlining = inlining | {name}
+            name = _entry_name(node["$ref"], defs, task.pointer)
             node = _merged(_as_schema(defs[name], task.pointer), node, "$ref")
             continue
         members = node.get("anyOf")
         if not isinstance(members, list) or not any(_is_null(member) for member in members):
-            return node, inlining, nullable
+            return node, nullable
         others = [member for member in members if not _is_null(member)]
         nullable = True
         if len(others) == 1:
             node = _merged(_as_schema(others[0], task.pointer), node, "anyOf")
             continue
         rest = {keyword: value for keyword, value in node.items() if keyword != "anyOf"}
-        return ({**rest, "anyOf": others} if others else {**rest, "type": "null"}), inlining, nullable
+        return ({**rest, "anyOf": others} if others else {**rest, "type": "null"}), nullable
     raise _schema_error(task.pointer, f"its $ref and anyOf chain runs more than {SCHEMA_MAX_DEPTH} deep")
 
 
@@ -643,7 +643,7 @@ def _openapi_format(source: Mapping[str, Any], target: dict[str, Any], hints: di
 def _openapi_node(task: _Task, defs: Mapping[str, Any]) -> list[_Task]:
     """Convert one object for ``responseSchema``: ``$ref`` inlined, Optional nullable, OpenAPI types, an integer's
     exclusive bounds made inclusive, the other constraints a description hint (rule 4)."""
-    source, inlining, nullable = _flatten(task, defs)
+    source, nullable = _flatten(task, defs)
     _refuse_unread(source, task.pointer)
     target = task.target
     hints = {keyword: value for keyword, value in source.items() if keyword in _JSON_HINTED}
@@ -668,7 +668,7 @@ def _openapi_node(task: _Task, defs: Mapping[str, Any]) -> list[_Task]:
     tasks: list[_Task] = []
     for keyword in ("properties", "items", "anyOf"):
         if keyword in source:
-            tasks.extend(_subschemas(task, source, keyword, inlining))
+            tasks.extend(_subschemas(task, source, keyword))
     return tasks
 
 

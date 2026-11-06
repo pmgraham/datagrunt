@@ -35,7 +35,7 @@ from datagrunt.rationalization.runner import (
 )
 from datagrunt.rationalization.schema import prepare
 from datagrunt.rationalization.units import build_units
-from datagrunt.rationalization.wire import ProviderResponse
+from datagrunt.rationalization.wire import ModelRequest, ProviderResponse
 
 
 class Part(BaseModel):
@@ -2272,3 +2272,139 @@ def test_a_keys_unit_deadline_counts_only_its_own_slots():
         sleep=fake.sleep,
     )
     assert [request.timeout_s for request in calls] == [10.0, 4.0]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Tier 1 — Unit 1D (M3, N2, M6)
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def test_stop_drains_buffered_events_in_request_order_on_worker_failure():
+    work = make_work(2)
+    unit_0, unit_1 = work[0][0].unit_id, work[1][0].unit_id
+
+    # 1. Strict failure on unit 0 after unit 1 already finished and buffered its event in _EventOrder.
+    unit_1_done = threading.Event()
+    strict_events = Events()
+
+    def strict_provider(request):
+        if request.unit_id == unit_1:
+            unit_1_done.set()
+            return answer(request)
+        unit_1_done.wait(5)
+        time.sleep(0.05)
+        raise TransientProviderError(503, 0.0, "busy")
+
+    with pytest.raises(RationalizationError, match="strict"):
+        run(
+            work,
+            [CallableProvider("callable:a", strict_provider)],
+            limits=RunLimits(max_concurrency=2, max_concurrency_per_provider=2, max_retries=0, strict=True),
+            on_event=strict_events,
+        )
+    assert [(e.kind, e.unit_id, e.attempt, e.status_code, e.detail) for e in strict_events.events] == [
+        ("request", unit_0, 1, 503, "TransientProviderError"),
+        ("request", unit_1, 1, None, "complete"),
+    ]
+
+    # 2. Unhandled exception on unit 0 (after a retry and on first attempt) drains unit 0 and unit 1 events in order.
+    retry_unit_1_done = threading.Event()
+    retry_events = Events()
+    attempts = {"unit_0": 0}
+
+    def unhandled_after_retry(request):
+        if request.unit_id == unit_1:
+            retry_unit_1_done.set()
+            return answer(request)
+        retry_unit_1_done.wait(5)
+        time.sleep(0.05)
+        attempts["unit_0"] += 1
+        if attempts["unit_0"] == 1:
+            raise TransientProviderError(503, 0.0, "busy")
+        raise RuntimeError("boom after retry")
+
+    with pytest.raises(RuntimeError, match="boom after retry"):
+        run(
+            work,
+            [CallableProvider("callable:a", unhandled_after_retry)],
+            limits=RunLimits(max_concurrency=2, max_concurrency_per_provider=2, max_retries=1),
+            on_event=retry_events,
+        )
+    assert [(e.kind, e.unit_id, e.attempt) for e in retry_events.events] == [
+        ("request", unit_0, 1),
+        ("retry", unit_0, 1),
+        ("request", unit_1, 1),
+    ]
+
+    direct_unit_1_done = threading.Event()
+    direct_events = Events()
+
+    def unhandled_direct(request):
+        if request.unit_id == unit_1:
+            direct_unit_1_done.set()
+            return answer(request)
+        direct_unit_1_done.wait(5)
+        time.sleep(0.05)
+        raise RuntimeError("boom direct")
+
+    with pytest.raises(RuntimeError, match="boom direct"):
+        run(
+            work,
+            [CallableProvider("callable:a", unhandled_direct)],
+            limits=RunLimits(max_concurrency=2, max_concurrency_per_provider=2, max_retries=0),
+            on_event=direct_events,
+        )
+    assert [(e.kind, e.unit_id, e.attempt, e.detail) for e in direct_events.events] == [
+        ("request", unit_1, 1, "complete"),
+    ]
+
+    # 3. If on_event itself raises on unit 0's event while unit 1's event is buffered, _stop does not call on_event.
+    hook_unit_1_done = threading.Event()
+    seen = []
+
+    def both_succeed(request):
+        if request.unit_id == unit_1:
+            hook_unit_1_done.set()
+            return answer(request)
+        hook_unit_1_done.wait(5)
+        time.sleep(0.05)
+        return answer(request)
+
+    def raising_hook(event):
+        seen.append(event)
+        raise Stop("from on_event")
+
+    with pytest.raises(Stop, match="from on_event"):
+        run(
+            work,
+            [CallableProvider("callable:a", both_succeed)],
+            limits=RunLimits(max_concurrency=2, max_concurrency_per_provider=2, max_retries=0),
+            on_event=raising_hook,
+        )
+    assert [e.unit_id for e in seen] == [unit_0]
+
+
+def test_snapshot_property_reads_do_not_call_canonical_json(monkeypatch):
+    snapshot = ProviderSnapshot(**snapshot_fields(generation_params_json='{"seed":1}'))
+    monkeypatch.setattr(
+        runner_module,
+        "canonical_json",
+        lambda *args, **kwargs: pytest.fail("canonical_json must not be called when reading snapshot properties"),
+    )
+    params = snapshot.generation_params
+    schema = snapshot.provider_schema
+    assert params == {"seed": 1}
+    assert schema == SCHEMA.wrapper
+    params["seed"] = 99
+    schema.clear()
+    assert snapshot.generation_params == {"seed": 1}
+    assert snapshot.provider_schema == SCHEMA.wrapper
+
+
+def test_model_request_docstring_describes_provider_transformed_wire_schema():
+    doc = ModelRequest.__doc__
+    assert doc is not None
+    assert "The neutral response schema, which each adapter transforms" not in doc
+    schema_lines = [line.strip() for line in doc.splitlines() if "json_schema:" in line]
+    assert len(schema_lines) == 1
+    assert "transform" in doc.lower() and "provider" in doc.lower()

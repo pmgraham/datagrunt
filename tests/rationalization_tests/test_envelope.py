@@ -713,9 +713,9 @@ GOLDEN_SYSTEM = (
     "and otherwise leave the record out. Never take a value from the caller context or from your own knowledge.\n"
     "3. Every record carries grounding_quotes: exact spans copied character for character from inside the <el> "
     "blocks (the header context's blocks included), each quote within one block, that support its values (at least "
-    "every identifying value).\n"
-    "4. Every record carries source_element_ids: the id attributes of the <el> blocks its values come from. The "
-    "header context's blocks may be cited like any other block.\n"
+    "every identifying value, and at least one quote of three or more words).\n"
+    "4. Every record carries source_element_ids: the id attributes of the <el> blocks its values come from (at least "
+    "one block inside <elements>; the header context's blocks may be cited in addition).\n"
     '5. When the blocks inside the <elements> tag show no record of the schema, return {"records": []}.\n'
     "6. In the payload, document text writes Markdown punctuation with a backslash before it (\\< is <, \\\\ is \\) "
     "and a table cell's line breaks as <br>. In values, write the characters themselves (drop those backslashes; "
@@ -800,6 +800,114 @@ def header_copy(payload: str) -> str | None:
 
 def continues_lines(payload: str) -> list[str]:
     return [line for line in payload.split("\n") if line.startswith("<continues ")]
+
+
+CANCELLED = ("Contract", "Cancelled")
+PAYMENT = "Payment due: $100."
+
+
+def cancelled_document() -> PDFDocument:
+    """Page 1: a visible "Contract" over a hidden "Cancelled" whose section holds the payment line; page 2: an
+    unrelated visible "Cancelled" heading over a line of its own. Each heading records its own scope path."""
+    contract = heading(1, 0, "Contract")
+    cancelled = Heading(**fields(1, 1, CANCELLED, ("invisible",)), level=2, text="Cancelled")
+    payment = para(1, 2, PAYMENT, scope=CANCELLED)
+    twin = heading(2, 0, "Cancelled")
+    note = para(2, 1, "Order 7 was cancelled.", scope=("Cancelled",))
+    return document(
+        page(1, (contract, cancelled, payment)),
+        page(2, (twin, note)),
+        sections=[
+            section((contract,), contract),
+            section((cancelled, payment), cancelled),
+            section((twin, note), twin),
+        ],
+    )
+
+
+def payment_unit(doc: PDFDocument) -> Unit:
+    """The unit of ``doc`` whose first element is the payment line (p0001_e002)."""
+    (unit,) = [unit for unit in units_of(doc) if unit.elements[0].element_id == "p0001_e002"]
+    return unit
+
+
+def late_heading_document() -> PDFDocument:
+    """Page 1: a visible "Contract"; a visible "Cancelled" over an old order's line; a visible "Active" closing it;
+    the payment line (p0001_e004); then the payment section's own hidden "Cancelled" heading, after the line it
+    opens and named only as the section's heading."""
+    contract = heading(1, 0, "Contract")
+    twin = Heading(**fields(1, 1, CANCELLED), level=2, text="Cancelled")
+    old = para(1, 2, "Order 7 was cancelled.", scope=CANCELLED)
+    active = Heading(**fields(1, 3, ("Contract", "Active")), level=2, text="Active")
+    payment = para(1, 4, PAYMENT, scope=CANCELLED)
+    own = Heading(**fields(1, 5, CANCELLED, ("invisible",)), level=2, text="Cancelled")
+    return document(
+        page(1, (contract, twin, old, active, payment, own)),
+        sections=[
+            section((contract,), contract),
+            section((twin, old), twin),
+            section((active,), active),
+            Section(heading=own, scope_path=CANCELLED, page_span=(1, 1), elements=(payment,)),
+        ],
+    )
+
+
+def joined_unit(doc: PDFDocument, elements: tuple[DocumentElement, ...], scope_path: tuple[str, ...]) -> Unit:
+    """A hand-built unit of ``doc``'s ``elements``, whole and rendered, with ``scope_path``."""
+    return Unit(
+        unit_id=f"{doc.metadata.doc_id}:{elements[0].element_id}-{elements[-1].element_id}",
+        doc_id=doc.metadata.doc_id,
+        elements=elements,
+        blocks=tuple(render_element(element) for element in elements),
+        part_of=(None,) * len(elements),
+        scope_path=scope_path,
+        scope_entries_excluded=0,
+        page_numbers=tuple(sorted({element.page_number for element in elements})),
+        vision=False,
+        oversize=False,
+        hidden_excluded=(),
+    )
+
+
+def two_sections() -> tuple[PDFDocument, Unit]:
+    """The payment line (its section's scope ``("Contract",)``) joined to page 2's line, of another section."""
+    doc = cancelled_document()
+    payment, note = doc.pages[0].elements[2], doc.pages[1].elements[1]
+    return doc, joined_unit(doc, (payment, note), ("Contract",))
+
+
+def a_page_and_a_section() -> tuple[PDFDocument, Unit]:
+    """A line in no section joined to a section's line, with the page group's scope ``()``."""
+    loose, opener, body = para(1, 0, "Loose"), heading(1, 1, "H"), para(1, 2, "Body", scope=("H",))
+    doc = document(page(1, (loose, opener, body)), sections=[section((opener, body), opener)])
+    return doc, joined_unit(doc, (loose, body), ())
+
+
+def two_pages() -> tuple[PDFDocument, Unit]:
+    """Two lines in no section, on two pages: two page groups."""
+    doc = document(page(1, (para(1, 0, "One"),)), page(2, (para(2, 0, "Two"),)))
+    return doc, joined_unit(doc, (doc.pages[0].elements[0], doc.pages[1].elements[0]), ())
+
+
+def intro_unit() -> tuple[PDFDocument, Unit]:
+    """:func:`continued_document` and its "Intro" section's unit (scope ``("Intro",)``)."""
+    doc = continued_document()
+    return doc, units_of(doc)[1]
+
+
+def cancelled_payment_unit() -> tuple[PDFDocument, Unit]:
+    """:func:`cancelled_document` and its payment line's unit (scope ``("Contract",)``)."""
+    doc = cancelled_document()
+    return doc, payment_unit(doc)
+
+
+def nested_unit() -> tuple[PDFDocument, Unit]:
+    """A visible "A" over a visible "B" that opens the section of a line, and that section's unit (``("A", "B")``)."""
+    outer = heading(1, 0, "A")
+    inner = Heading(**fields(1, 1, ("A", "B")), level=2, text="B")
+    body = para(1, 2, "Body", scope=("A", "B"))
+    doc = document(page(1, (outer, inner, body)), sections=[section((outer,), outer), section((inner, body), inner)])
+    return doc, units_of(doc)[1]
 
 
 def header_document(entries: tuple[KeyValue, ...]) -> PDFDocument:
@@ -904,6 +1012,81 @@ class TestFraming:
         assert not re.search("[\u2028\u2029\x0b\x0c\x1c-\x1e\x85]", line)
         assert bare_angles(inner) == []
         assert seen(inner) == " ".join(visible_lines(text).split("\n")).replace("\u2028", " ").replace("\u2029", " ")
+
+    def test_a_hidden_openers_text_never_reaches_scope_though_a_visible_heading_elsewhere_has_it(self):
+        doc = cancelled_document()
+        env = build_envelope(payment_unit(doc), doc, prompt="p", context=None, schema_json=SCHEMA_JSON)
+        system, user = env.render(NONCE)
+
+        assert payload_of(user).split("\n")[1] == "<scope>Contract</scope>"
+        assert "Cancelled" not in system + user
+        assert PAYMENT in payload_of(user)
+
+    def test_a_hidden_section_heading_after_its_first_member_never_reaches_scope(self):
+        doc = late_heading_document()
+        (unit,) = [unit for unit in units_of(doc) if unit.elements[0].element_id == "p0001_e004"]
+        system, user = build_envelope(unit, doc, prompt="p", context=None, schema_json=SCHEMA_JSON).render(NONCE)
+
+        assert payload_of(user).split("\n")[1] == "<scope>Contract</scope>"
+        assert "Cancelled" not in system + user
+
+    def test_every_unit_of_a_section_shares_the_scope_read_at_its_first_member(self):
+        # A hidden heading re-recording the ancestor path ("Contract",) between the section's members changes
+        # nothing: one scope per section, read at its first member, for build_units and the envelope alike.
+        contract = heading(1, 0, "Contract")
+        cancelled = Heading(**fields(1, 1, CANCELLED), level=2, text="Cancelled")
+        first = para(1, 2, "First payment line.", scope=CANCELLED)
+        ghost = heading(1, 3, "Contract", hidden=("invisible",))
+        second = para(1, 4, "Second payment line.", scope=CANCELLED)
+        doc = document(
+            page(1, (contract, cancelled, first, ghost, second)),
+            sections=[section((contract,), contract), section((cancelled, first, second), cancelled)],
+        )
+        units = units_of(doc, limit=1)  # one oversize unit per element
+        envelopes = build_envelopes(units, doc, prompt="p", context=None, schema_json=SCHEMA_JSON)
+
+        assert [unit.elements[0].element_id for unit in units] == [
+            "p0001_e000",
+            "p0001_e001",
+            "p0001_e002",
+            "p0001_e004",
+        ]
+        assert [unit.scope_path for unit in units[1:]] == [CANCELLED] * 3
+        assert [env.payload.split("\n")[1] for env in envelopes[1:]] == ["<scope>Contract > Cancelled</scope>"] * 3
+
+    @pytest.mark.parametrize("build", [two_sections, a_page_and_a_section, two_pages])
+    def test_a_unit_whose_elements_span_groups_is_refused(self, build):
+        # A unit is one group's (module notes, 3): its scope is that group's, so a unit mixing groups has none.
+        doc, unit = build()
+
+        with pytest.raises(ValueError, match="group"):
+            build_envelope(unit, doc, prompt="p", context=None, schema_json=SCHEMA_JSON)
+
+    def test_a_scope_entry_a_hidden_heading_opened_is_refused_though_a_visible_heading_elsewhere_has_its_text(self):
+        doc = cancelled_document()
+        forged = dataclasses.replace(payment_unit(doc), scope_path=CANCELLED, scope_entries_excluded=0)
+
+        with pytest.raises(ValueError, match="scope"):
+            build_envelope(forged, doc, prompt="p", context=None, schema_json=SCHEMA_JSON)
+
+    @pytest.mark.parametrize(
+        ("build", "path"),
+        [
+            (intro_unit, ()),
+            (intro_unit, ("Intro", "Intro")),
+            (intro_unit, ("Other",)),
+            (cancelled_payment_unit, ("Cancelled",)),  # as long as ("Contract",), and a visible heading's text
+            (nested_unit, ("B", "A")),  # its group's ("A", "B"), every entry visible, in another order
+        ],
+        ids=["dropped", "repeated", "replaced", "visible-text-of-another-branch", "reordered"],
+    )
+    def test_a_scope_path_other_than_its_groups_is_refused(self, build, path):
+        # A unit's entries are its group's, each opened by a visible heading, in order: none added, dropped or moved.
+        doc, unit = build()
+        forged = dataclasses.replace(unit, scope_path=path)
+
+        with pytest.raises(ValueError, match="scope"):
+            build_envelope(forged, doc, prompt="p", context=None, schema_json=SCHEMA_JSON)
 
     def test_a_scope_entry_naming_a_hidden_heading_is_refused(self):
         ghost = heading(1, 0, "SECRET HIDDEN HEADING", hidden=("invisible",))
@@ -1410,6 +1593,20 @@ class TestMessages:
             "in the payload, document text writes a literal [ or ]",
         ):
             assert phrase in SYSTEM_RULES
+
+    def test_system_rules_rules_3_and_4_match_grounding(self):
+        rule_3 = (
+            "3. Every record carries grounding_quotes: exact spans copied character for character from inside the <el> "
+            "blocks (the header context's blocks included), each quote within one block, that support its values "
+            "(at least every identifying value, and at least one quote of three or more words).\n"
+        )
+        rule_4 = (
+            "4. Every record carries source_element_ids: the id attributes of the <el> blocks its values come from "
+            "(at least one block inside <elements>; the header context's blocks may be cited in addition).\n"
+        )
+
+        assert rule_3 in SYSTEM_RULES
+        assert rule_4 in SYSTEM_RULES
 
     def test_the_format_is_pinned(self):
         assert ENVELOPE_FORMAT == "datagrunt.rationalize/1"
@@ -2021,6 +2218,47 @@ class TestCallerInputs:
         system, _ = messages(document(page(1, (para(1, 0),))), prompt=prompt)
 
         assert prompt in system
+
+    def test_prompt_max_bytes_is_one_mib_and_exported(self):
+        assert envelope_module.PROMPT_MAX_BYTES == 1024 * 1024
+        assert "PROMPT_MAX_BYTES" in envelope_module.__all__
+
+    def test_prompt_at_max_bytes_is_accepted_and_over_max_bytes_is_refused(self):
+        limit = getattr(envelope_module, "PROMPT_MAX_BYTES", 1024 * 1024)
+        assert limit == 1024 * 1024
+        doc = document(page(1, (para(1, 0),)))
+        unit = one_unit(doc)
+        exact = "a" * limit
+
+        assert build_envelope(unit, doc, prompt=exact, context=None, schema_json=SCHEMA_JSON).prompt == exact
+        assert build_envelopes((unit,), doc, prompt=exact, context=None, schema_json=SCHEMA_JSON)[0].prompt == exact
+
+        ascii_over = "a" * (limit + 1)
+        multibyte_over = "é" * (limit // 2 + 1)
+        assert len(multibyte_over) < limit
+        assert len(multibyte_over.encode("utf-8")) > limit
+
+        for over in (ascii_over, multibyte_over):
+            with pytest.raises(RationalizationError, match=r"prompt passes 1048576 bytes of UTF-8"):
+                build_envelope(unit, doc, prompt=over, context=None, schema_json=SCHEMA_JSON)
+            with pytest.raises(RationalizationError, match=r"prompt passes 1048576 bytes of UTF-8"):
+                build_envelopes((unit,), doc, prompt=over, context=None, schema_json=SCHEMA_JSON)
+
+    def test_envelope_refuses_prompt_over_max_bytes(self):
+        limit = getattr(envelope_module, "PROMPT_MAX_BYTES", 1024 * 1024)
+        env = envelope_of(document(page(1, (para(1, 0),))))
+        exact = "a" * limit
+
+        assert dataclasses.replace(env, prompt=exact).prompt == exact
+        for over in ("a" * (limit + 1), "é" * (limit // 2 + 1)):
+            with pytest.raises(ValueError, match=r"prompt passes 1048576 bytes of UTF-8"):
+                Envelope(
+                    unit_id=env.unit_id,
+                    prompt=over,
+                    context_json="null",
+                    payload=env.payload,
+                    schema_json=SCHEMA_JSON,
+                )
 
 
 # ---------------------------------------------------------------------------------------------------------------

@@ -130,7 +130,7 @@ class ModelRequest:
         model_id: The provider-qualified model id (``"anthropic:claude-..."``).
         system_prompt: The system message.
         user_envelope: The user message (the nonce'd envelope).
-        json_schema: The neutral response schema, which each adapter transforms; held as its own canonical copy.
+        json_schema: The provider-transformed wire schema produced at preflight; held as its own canonical copy.
         max_output_tokens: The output limit, 1-:data:`MAX_OUTPUT_TOKENS`.
         timeout_s: The read timeout in seconds, finite and positive (held as a ``float``).
 

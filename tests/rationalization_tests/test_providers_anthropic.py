@@ -1674,6 +1674,17 @@ def test_a_definition_reached_from_two_definitions_is_counted_once():
     assert parameter_counts(make_provider().transform_schema(schema)) == (13, 0)
 
 
+@pytest.mark.parametrize(("name", "ref"), [("a/b~c", "#/$defs/a~1b~0c"), ("a~1", "#/$defs/a~01")])
+def test_a_definition_named_by_an_escaped_ref_is_counted(name, ref):
+    schema = {**obj(child={"$ref": ref}), "required": ["child"], "$defs": {name: fields(25, OPTIONAL, required=False)}}
+
+    with pytest.raises(RationalizationError) as caught:
+        make_provider().transform_schema(schema)
+
+    assert "25 optional parameters" in str(caught.value)
+    assert parameter_counts(schema) == (25, 0)
+
+
 def test_an_object_inside_an_any_of_is_counted():
     inline = {"anyOf": [fields(25, OPTIONAL, required=False), {"type": "null"}]}
 
