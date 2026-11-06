@@ -181,8 +181,8 @@ class ProviderResponse:
     content: Mapping[str, Any] | None = field(repr=False)
     raw_text: str = field(repr=False)
     finish: FinishReason
-    input_tokens: int | None
-    output_tokens: int | None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if self.content is not None:

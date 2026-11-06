@@ -67,8 +67,8 @@ TOP_LEVEL_PDF_NAMES = [
     "PDFEncryptedError",
     "PDFCorruptError",
 ]
-# 5.1 (#360): the schema marker, defined in datagrunt.rationalization.
-TOP_LEVEL_RATIONALIZATION_NAMES = ["Key"]
+# 5.1 (#360): the schema marker, rationalize() and RationalizedResult, defined in datagrunt.rationalization.
+TOP_LEVEL_RATIONALIZATION_NAMES = ["Key", "rationalize", "RationalizedResult"]
 TOP_LEVEL_NAMES = [
     "CSVReader",
     "CSVWriter",

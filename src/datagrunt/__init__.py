@@ -63,6 +63,7 @@ from datagrunt.pdf import (
 from datagrunt.pdf._extra import LAZY_CLASSES as _LAZY_CLASSES
 from datagrunt.pdf._extra import load as _load
 from datagrunt.rationalization import Key  # needs no extra: the package imports neither pydantic nor httpx
+from datagrunt.rationalization._extra import load as _load_rationalize
 
 # You can define __all__ to specify what gets imported with "from package
 # import *"
@@ -92,6 +93,8 @@ __all__ = [
     "PDFEncryptedError",
     "PDFCorruptError",
     "Key",
+    "rationalize",
+    "RationalizedResult",
 ]
 
 # Each CSV, Excel and Parquet name, and the module that defines it: imported at its first access (#439).
@@ -105,6 +108,7 @@ _API_NAMES = _MappingProxyType(
         "ParquetWriter": "datagrunt.parquet_api",
     }
 )
+_RATIONALIZE_NAMES = frozenset({"rationalize", "RationalizedResult"})
 # The subpackages that ``import datagrunt`` bound as its attributes when it imported these APIs eagerly: each is
 # still an attribute, imported at its first access.
 _SUBPACKAGES = frozenset({"core", "csv_api", "excel_api", "parquet_api"})
@@ -114,6 +118,7 @@ if TYPE_CHECKING:
     from datagrunt.excel_api import ExcelReader, ExcelWriter
     from datagrunt.parquet_api import ParquetReader, ParquetWriter
     from datagrunt.pdf import PDFReader, PDFWriter
+    from datagrunt.rationalization import RationalizedResult, rationalize
 
 
 def __getattr__(name: str) -> object:
@@ -123,6 +128,8 @@ def __getattr__(name: str) -> object:
     later accesses find it there. ``PDFReader`` and ``PDFWriter`` never need
     the [pdf] extra to be named: without it, constructing either raises
     ``ImportError`` with the install hint (see :mod:`datagrunt.pdf`).
+    ``rationalize`` and ``RationalizedResult`` likewise resolve through
+    :mod:`datagrunt.rationalization._extra`.
 
     Raises:
         AttributeError: If ``name`` is none of this package's names.
@@ -130,6 +137,8 @@ def __getattr__(name: str) -> object:
     """
     if name in _LAZY_CLASSES:
         return _load(name)  # never kept: without the [pdf] extra it is a stand-in, and the extra can arrive later
+    if name in _RATIONALIZE_NAMES:
+        return _load_rationalize(name)
     if name in _API_NAMES:
         value = getattr(_import_module(_API_NAMES[name]), name)
         globals()[name] = value
@@ -140,7 +149,7 @@ def __getattr__(name: str) -> object:
 
 
 def __dir__() -> list[str]:
-    return sorted({*globals(), *_LAZY_CLASSES, *_API_NAMES, *_SUBPACKAGES})
+    return sorted({*globals(), *_LAZY_CLASSES, *_RATIONALIZE_NAMES, *_API_NAMES, *_SUBPACKAGES})
 
 
 # Optionally, you can include a logger for your package
