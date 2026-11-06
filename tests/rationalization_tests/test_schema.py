@@ -18,7 +18,7 @@ import textwrap
 import time
 import typing
 from collections.abc import Callable
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum, Flag, IntEnum, IntFlag, StrEnum
 from pathlib import Path
@@ -26,6 +26,7 @@ from typing import Annotated, Any, Literal, NewType
 
 import pytest
 from pydantic import (
+    AfterValidator,
     AliasChoices,
     AliasPath,
     AwareDatetime,
@@ -40,6 +41,8 @@ from pydantic import (
     StringConstraints,
     WithJsonSchema,
     create_model,
+    field_validator,
+    model_validator,
 )
 from pydantic.alias_generators import to_camel
 from pydantic.json_schema import SkipJsonSchema
@@ -58,6 +61,7 @@ from datagrunt.rationalization.schema import (
     check_json_schema,
     check_schema,
     describe,
+    instance_problems,
     prepare,
     response_schema,
     schema_sha256,
@@ -162,9 +166,23 @@ PART_SPEC = ModelSpec(
     keys=KeySpec(fields=("number",), namespace="part"),
     fields=(
         FieldSpec(
-            name="number", wire_name="number", kind="scalar", optional=False, child=None, scalar=ScalarSpec(base=str)
+            name="number",
+            wire_name="number",
+            kind="scalar",
+            optional=False,
+            required=True,
+            child=None,
+            scalar=ScalarSpec(base=str),
         ),
-        FieldSpec(name="name", wire_name="name", kind="scalar", optional=True, child=None, scalar=ScalarSpec(base=str)),
+        FieldSpec(
+            name="name",
+            wire_name="name",
+            kind="scalar",
+            optional=True,
+            required=False,
+            child=None,
+            scalar=ScalarSpec(base=str),
+        ),
     ),
 )
 LINE_SPEC = ModelSpec(
@@ -172,14 +190,23 @@ LINE_SPEC = ModelSpec(
     keys=KeySpec(fields=("line_no",), namespace=None),
     fields=(
         FieldSpec(
-            name="line_no", wire_name="line_no", kind="scalar", optional=False, child=None, scalar=ScalarSpec(base=int)
+            name="line_no",
+            wire_name="line_no",
+            kind="scalar",
+            optional=False,
+            required=True,
+            child=None,
+            scalar=ScalarSpec(base=int),
         ),
-        FieldSpec(name="part", wire_name="part", kind="model", optional=False, child=PART_SPEC, scalar=None),
+        FieldSpec(
+            name="part", wire_name="part", kind="model", optional=False, required=True, child=PART_SPEC, scalar=None
+        ),
         FieldSpec(
             name="quantity",
             wire_name="quantity",
             kind="scalar",
             optional=False,
+            required=True,
             child=None,
             scalar=ScalarSpec(base=Decimal),
         ),
@@ -194,15 +221,36 @@ ORDER_SPEC = ModelSpec(
             wire_name="order_id",
             kind="scalar",
             optional=False,
+            required=True,
             child=None,
             scalar=ScalarSpec(base=str),
         ),
         FieldSpec(
-            name="placed", wire_name="placed", kind="scalar", optional=False, child=None, scalar=ScalarSpec(base=date)
+            name="placed",
+            wire_name="placed",
+            kind="scalar",
+            optional=False,
+            required=True,
+            child=None,
+            scalar=ScalarSpec(base=date),
         ),
-        FieldSpec(name="lines", wire_name="lines", kind="model_list", optional=False, child=LINE_SPEC, scalar=None),
         FieldSpec(
-            name="tags", wire_name="tags", kind="scalar_list", optional=False, child=None, scalar=ScalarSpec(base=str)
+            name="lines",
+            wire_name="lines",
+            kind="model_list",
+            optional=False,
+            required=True,
+            child=LINE_SPEC,
+            scalar=None,
+        ),
+        FieldSpec(
+            name="tags",
+            wire_name="tags",
+            kind="scalar_list",
+            optional=False,
+            required=False,
+            child=None,
+            scalar=ScalarSpec(base=str),
         ),
     ),
 )
@@ -288,9 +336,9 @@ SCALAR_FORMS = {
 # Each way a field holds a scalar: its pydantic field definition for an annotation, and the FieldSpec kind and
 # optional flag describe() gives it.
 SCALAR_HOLDERS = {
-    "plain": (lambda annotation: (annotation, ...), "scalar", False),
-    "optional": (lambda annotation: (annotation | None, None), "scalar", True),
-    "list": (lambda annotation: (list[annotation], []), "scalar_list", False),
+    "plain": (lambda annotation: (annotation, ...), "scalar", False, True),
+    "optional": (lambda annotation: (annotation | None, None), "scalar", True, False),
+    "list": (lambda annotation: (list[annotation], []), "scalar_list", False, False),
 }
 
 # What pydantic 2.14 emits for each scalar form, its $ref followed and its title dropped: what the agreement step
@@ -1631,13 +1679,72 @@ class TestDescribeAnnotations:
     @pytest.mark.parametrize("form", list(SCALAR_FORMS))
     def test_each_scalar_form_has_its_scalar_spec(self, form, holder):
         annotation, scalar = SCALAR_FORMS[form]
-        definition, kind, optional = SCALAR_HOLDERS[holder]
+        definition, kind, optional, required = SCALAR_HOLDERS[holder]
 
         spec = describe(create_model("Holder", value=definition(annotation)))
 
         assert spec.fields == (
-            FieldSpec(name="value", wire_name="value", kind=kind, optional=optional, child=None, scalar=scalar),
+            FieldSpec(
+                name="value",
+                wire_name="value",
+                kind=kind,
+                optional=optional,
+                required=required,
+                child=None,
+                scalar=scalar,
+            ),
         )
+
+    def test_required_is_whether_model_validate_requires_the_field(self):
+        spec = describe(Order)
+        line = spec.fields[2].child
+        assert line is not None
+        part = line.fields[1].child
+        assert part is not None
+
+        assert [(field.name, field.required) for field in spec.fields] == [
+            ("order_id", True),
+            ("placed", True),
+            ("lines", True),
+            ("tags", False),
+        ]
+        assert [field.required for field in line.fields] == [True, True, True]
+        assert [(field.name, field.required) for field in part.fields] == [("number", True), ("name", False)]
+
+    def test_required_follows_is_required_for_every_form(self):
+        spec = describe(EveryForm)
+
+        assert {field.name: field.required for field in spec.fields} == {
+            name: info.is_required() for name, info in EveryForm.model_fields.items()
+        }
+        assert {field.name for field in spec.fields if not field.required} == {
+            "maybe_text",
+            "maybe_amount",
+            "maybe_color",
+            "maybe_letter",
+            "maybe_part",
+            "texts",
+            "amounts",
+            "colors",
+            "letters",
+            "parts",
+        }
+
+    def test_required_is_independent_of_optional(self):
+        class Defaults(BaseModel):
+            maybe: int | None
+            counted: int = Field(default_factory=lambda: 0)
+            plain: int = 1
+            maybe_defaulted: int | None = None
+
+        spec = describe(Defaults)
+
+        assert [(field.name, field.optional, field.required) for field in spec.fields] == [
+            ("maybe", True, True),
+            ("counted", False, False),
+            ("plain", False, False),
+            ("maybe_defaulted", True, False),
+        ]
 
     def test_a_model_field_has_no_scalar_spec(self):
         spec = describe(EveryForm)
@@ -1666,6 +1773,296 @@ class TestDescribeAnnotations:
             spec.keys = KeySpec(fields=(), namespace=None)
         assert not hasattr(spec, "__dict__")
         assert hash(spec) == hash(describe(Order))
+
+
+class SubPart(Part):
+    """A subclass: an instance of it is not exactly a Part."""
+
+
+UTC_ZONE = timezone.utc
+NAIVE_AT = datetime(2026, 1, 2, 3, 4, 5)
+AWARE_AT = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC_ZONE)
+
+# A static default pydantic would leave unchecked in every record that omits the field, and what the field holds.
+BAD_STATIC_DEFAULTS = {
+    "str-for-int": (int, "1", "holds str, but the field holds int"),
+    "int-for-bool": (bool, 0, "holds int, but the field holds bool"),
+    "bool-for-int": (int, True, "holds bool, but the field holds int"),
+    "bool-for-float": (float, True, "holds bool, but the field holds float (or an int within 2**53 of 0)"),
+    "int-past-the-float-bound": (
+        float,
+        2**53 + 1,
+        "holds int, but the field holds float (or an int within 2**53 of 0)",
+    ),
+    "float-for-decimal": (Decimal, 1.5, "holds float, but the field holds Decimal (or an int)"),
+    "datetime-for-date": (date, NAIVE_AT, "holds datetime, but the field holds date"),
+    "date-for-aware": (AwareDatetime, date(2026, 1, 2), "holds date, but the field holds an aware datetime"),
+    "naive-for-aware": (AwareDatetime, NAIVE_AT, "holds datetime, but the field holds an aware datetime"),
+    "aware-for-naive": (NaiveDatetime, AWARE_AT, "holds datetime, but the field holds a naive datetime"),
+    "str-for-enum": (Color, "red", "holds str, but the field holds Color"),
+    "int-for-int-enum": (Level, 1, "holds int, but the field holds Level"),
+    "unlisted-literal": (Literal["a", "b"], "c", "holds str, but the field holds Literal['a', 'b']"),
+    "bool-for-int-literal": (Literal[1, 2], True, "holds bool, but the field holds Literal[1, 2]"),
+    "str-for-optional-int": (int | None, "1", "holds str, but the field holds int"),
+    "bad-list-item": (list[str], ["a", 1], "[1]: holds int, but the field holds str"),
+    "tuple-for-list": (list[str], ("a",), "holds tuple, but the field holds a list"),
+    "dict-for-model": (Part, {"number": "PN-1"}, "holds dict, but the field holds Part"),
+    "subclass-for-model": (Part, SubPart(number="PN-1"), "holds SubPart, but the field holds Part"),
+    "dicts-for-models": (list[Part], [{"number": "PN-1"}], "[0]: holds dict, but the field holds Part"),
+    "constructed-model-of-bad-values": (
+        Part,
+        Part.model_construct(number=1, name=2),
+        "number: holds int, but the field holds str; name: holds int, but the field holds str",
+    ),
+    "constructed-model-without-a-field": (
+        Part,
+        Part.model_construct(),
+        "number: is missing (the instance was built without it, as model_construct() can)",
+    ),
+    "constructed-model-in-a-list": (list[Part], [Part(number="PN-1"), Part.model_construct(number=1)], "[1].number: "),
+    "constructed-line-of-a-bad-part": (
+        Line,
+        Line.model_construct(line_no=1, part=Part.model_construct(number=2), quantity=Decimal(1)),
+        "part.number: holds int, but the field holds str",
+    ),
+}
+
+GOOD_STATIC_DEFAULTS = {
+    "int-for-float": (float, 0),
+    "int-at-the-float-bound": (float, -(2**53)),
+    "int-for-decimal": (Decimal, 2),
+    "ints-for-float-list": (list[float], [0, 1.5]),
+    "int": (int, 1),
+    "bool": (bool, False),
+    "str": (str, "x"),
+    "date": (date, date(2026, 1, 2)),
+    "aware": (AwareDatetime, AWARE_AT),
+    "naive": (NaiveDatetime, NAIVE_AT),
+    "enum-member": (Color, Color.RED),
+    "listed-literal": (Literal["a", "b"], "a"),
+    "optional-none": (int | None, None),
+    "optional-value": (int | None, 3),
+    "empty-list": (list[str], []),
+    "model": (Part, Part(number="PN-1")),
+    "models": (list[Part], [Part(number="PN-1")]),
+    "constructed-model-of-good-values": (Part, Part.model_construct(number="PN-1", name=None)),
+}
+
+
+FACTORY_CALLS: list[int] = []
+
+
+def counted_factory() -> int:
+    FACTORY_CALLS.append(1)
+    return 1
+
+
+class SplitTags(BaseModel):
+    """A before-validator of the model's own turns the default into the field's type."""
+
+    model_config = ConfigDict(validate_default=True)
+    k: Annotated[str, Key]
+    tags: list[str] = "a,b"  # type: ignore[assignment]
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def split(cls, value: object) -> object:
+        return value.split(",") if isinstance(value, str) else value
+
+
+class Coerced(BaseModel):
+    model_config = ConfigDict(validate_default=True, coerce_numbers_to_str=True)
+    k: Annotated[str, Key]
+    code: str = 5  # type: ignore[assignment]
+
+
+class AfterOnHalfBuilt(BaseModel):
+    """A model validator that fails on the half-built instance the check validates against: inconclusive."""
+
+    model_config = ConfigDict(validate_default=True)
+    k: Annotated[str, Key]
+    code: int = "5"  # type: ignore[assignment]
+
+    @model_validator(mode="after")
+    def check(self) -> "AfterOnHalfBuilt":
+        if self.k.startswith("x"):
+            raise ValueError("no")
+        return self
+
+
+class ErrorElsewhere(BaseModel):
+    """A model validator refusing the half-built instance with a ValidationError located at the model: inconclusive."""
+
+    model_config = ConfigDict(validate_default=True)
+    k: Annotated[str, Key]
+    code: int = "5"  # type: ignore[assignment]
+
+    @model_validator(mode="after")
+    def needs_k(self) -> "ErrorElsewhere":
+        if self.k is None:
+            raise ValueError("k is required")
+        return self
+
+
+class FrozenDefault(BaseModel):
+    model_config = ConfigDict(validate_default=True)
+    k: Annotated[str, Key]
+    code: int = Field("5", frozen=True)  # type: ignore[assignment]
+
+
+class FactoryAlongside(BaseModel):
+    """A factory beside a validated default: the check must not call it."""
+
+    model_config = ConfigDict(validate_default=True)
+    k: Annotated[str, Key]
+    code: int = "5"  # type: ignore[assignment]
+    counted: int = Field(default_factory=counted_factory)
+
+
+class StrictDate(BaseModel):
+    model_config = ConfigDict(validate_default=True, strict=True)
+    k: Annotated[str, Key]
+    when: date = "2026-01-01"  # type: ignore[assignment]
+
+
+class BadInt(BaseModel):
+    model_config = ConfigDict(validate_default=True)
+    k: Annotated[str, Key]
+    code: int = "oops"  # type: ignore[assignment]
+
+
+class ShortStrings(BaseModel):
+    model_config = ConfigDict(validate_default=True, str_max_length=3)
+    k: Annotated[str, Key]
+    code: str = "toolong"
+
+
+def _brief(value: object) -> str:
+    """The default as the message shows it: its repr, cut to 80 characters."""
+    text = repr(value)
+    return text if len(text) <= 80 else f"{text[:77]}..."
+
+
+class TestStaticDefaults:
+    @pytest.mark.parametrize("case", list(BAD_STATIC_DEFAULTS))
+    def test_a_static_default_that_is_no_value_of_its_field_is_refused(self, case):
+        annotation, default, holds = BAD_STATIC_DEFAULTS[case]
+
+        with raises_at("Holder.value") as error:
+            prepare(create_model("Holder", value=(annotation, default)))
+
+        message = str(error.value)
+        assert message.startswith(f"Holder.value: its default {_brief(default)} is not a value of the field ({holds}")
+        assert "pydantic does not validate defaults" in message
+        assert "Field(validate_default=True)" in message
+
+    @pytest.mark.parametrize("case", list(GOOD_STATIC_DEFAULTS))
+    def test_a_static_default_of_the_fields_type_passes(self, case):
+        annotation, default = GOOD_STATIC_DEFAULTS[case]
+
+        assert prepare(create_model("Holder", value=(annotation, default))).spec.fields[0].name == "value"
+
+    def test_a_bad_static_default_in_a_child_model_names_its_path(self):
+        class Inner(BaseModel):
+            count: int = "none"  # type: ignore[assignment]
+
+        class Outer(BaseModel):
+            inner: list[Inner] = []
+
+        with raises_at("Outer.inner[].count"):
+            describe(Outer)
+
+    def test_instance_problems_names_a_field_a_constructed_root_lacks(self):
+        problems = instance_problems(Part.model_construct(name=1), describe(Part))
+
+        assert problems == [
+            "number: is missing (the instance was built without it, as model_construct() can)",
+            "name: holds int, but the field holds str",
+        ]
+
+    def test_a_default_factory_is_not_called_so_it_passes(self):
+        model = create_model("Holder", value=(int, Field(default_factory=lambda: "not an int")))
+
+        assert prepare(model).spec.fields[0].required is False
+
+    def test_a_default_pydantic_validates_passes(self):
+        field_level = create_model("Holder", value=(int, Field(default="1", validate_default=True)))
+        model_level = create_model("Holder", __config__=ConfigDict(validate_default=True), value=(int, "1"))
+
+        assert prepare(field_level).model is field_level
+        assert prepare(model_level).model is model_level
+
+    @pytest.mark.parametrize(
+        ("annotation", "field"),
+        [
+            (int, Field("oops", validate_default=True)),
+            (Annotated[int, Field(gt=0)], Field(0, validate_default=True)),
+            (list[int], Field(["1", "x"], validate_default=True)),
+        ],
+    )
+    def test_a_default_pydantic_validates_must_validate(self, annotation, field):
+        with raises_at("Holder.value") as error:
+            prepare(create_model("Holder", value=(annotation, field)))
+
+        assert "fails the field's own validation" in str(error.value)
+        assert "validate_default" in str(error.value)
+
+    def test_a_models_validate_default_validates_its_static_defaults(self):
+        model = create_model("Holder", __config__=ConfigDict(validate_default=True), value=(int, "oops"))
+
+        with raises_at(
+            "Holder.value",
+        ):
+            prepare(model)
+
+    def test_a_validator_raising_another_exception_on_the_default_is_inconclusive(self):
+        annotation = Annotated[int, AfterValidator(lambda value: {}[value])]
+        model = create_model("Holder", value=(annotation, Field(1, validate_default=True)))
+
+        assert prepare(model).model is model
+
+    @pytest.mark.parametrize(
+        "model", [SplitTags, Coerced, AfterOnHalfBuilt, ErrorElsewhere, FrozenDefault, FactoryAlongside]
+    )
+    def test_a_default_the_models_own_validation_accepts_passes(self, model):
+        FACTORY_CALLS.clear()
+
+        assert prepare(model).model is model
+        assert FACTORY_CALLS == []
+
+    @pytest.mark.parametrize(
+        ("model", "path", "kind"),
+        [
+            (StrictDate, "StrictDate.when", "date_type"),
+            (BadInt, "BadInt.code", "int_parsing"),
+            (ShortStrings, "ShortStrings.code", "string_too_long"),
+        ],
+    )
+    def test_a_default_the_models_own_validation_refuses_is_refused(self, model, path, kind):
+        with raises_at(path) as error:
+            prepare(model)
+
+        assert f"fails the field's own validation ({kind})" in str(error.value)
+
+    @pytest.mark.parametrize("error", [MemoryError, RecursionError])
+    def test_memory_and_recursion_errors_propagate(self, error):
+        def explode(value: int) -> int:
+            raise error
+
+        model = create_model("Holder", value=(Annotated[int, AfterValidator(explode)], Field(1, validate_default=True)))
+
+        with pytest.raises(error):
+            prepare(model)
+
+    def test_a_field_that_opts_out_of_its_models_validate_default_is_checked(self):
+        model = create_model(
+            "Holder",
+            __config__=ConfigDict(validate_default=True),
+            value=(int, Field(default="1", validate_default=False)),
+        )
+
+        with raises_at("Holder.value"):
+            prepare(model)
 
 
 class TestDescribeRecursionAndDepth:
@@ -2207,7 +2604,7 @@ class TestPrepare:
 
 
 SCALAR = FieldSpec(
-    name="code", wire_name="code", kind="scalar", optional=False, child=None, scalar=ScalarSpec(base=str)
+    name="code", wire_name="code", kind="scalar", optional=False, required=True, child=None, scalar=ScalarSpec(base=str)
 )
 
 
@@ -2261,11 +2658,39 @@ class TestSpecTypes:
                     "wire_name": "code",
                     "kind": "scalar",
                     "optional": False,
+                    "required": True,
                     "child": None,
                     "scalar": ScalarSpec(str),
                     **kwargs,
                 }
             )
+
+    @pytest.mark.parametrize("required", [1, 0, None, "yes"])
+    def test_field_spec_requires_a_bool_required(self, required):
+        with pytest.raises(TypeError, match=r"^FieldSpec 'code': required must be a bool"):
+            FieldSpec(
+                name="code",
+                wire_name="code",
+                kind="scalar",
+                optional=False,
+                required=required,
+                child=None,
+                scalar=ScalarSpec(str),
+            )
+
+    @pytest.mark.parametrize("required", [True, False])
+    def test_field_spec_keeps_required(self, required):
+        field = FieldSpec(
+            name="code",
+            wire_name="code",
+            kind="scalar",
+            optional=True,
+            required=required,
+            child=None,
+            scalar=ScalarSpec(str),
+        )
+
+        assert field.required is required
 
     @pytest.mark.parametrize(
         ("kind", "child", "scalar"),
@@ -2276,7 +2701,9 @@ class TestSpecTypes:
         ],
     )
     def test_field_spec_accepts(self, kind, child, scalar):
-        field = FieldSpec(name="code", wire_name="code", kind=kind, optional=False, child=child, scalar=scalar)
+        field = FieldSpec(
+            name="code", wire_name="code", kind=kind, optional=False, required=True, child=child, scalar=scalar
+        )
 
         assert field.scalar == scalar
 
@@ -2294,13 +2721,27 @@ class TestSpecTypes:
             ({"keys": KeySpec(fields=("missing",), namespace=None)}, ValueError),
             ({"keys": ("code",)}, TypeError),
             (
-                {"fields": (FieldSpec("code", "code", "scalar", optional=True, child=None, scalar=ScalarSpec(str)),)},
+                {
+                    "fields": (
+                        FieldSpec(
+                            "code", "code", "scalar", optional=True, required=True, child=None, scalar=ScalarSpec(str)
+                        ),
+                    )
+                },
                 ValueError,
             ),
             (
                 {
                     "fields": (
-                        FieldSpec("code", "code", "scalar_list", optional=False, child=None, scalar=ScalarSpec(str)),
+                        FieldSpec(
+                            "code",
+                            "code",
+                            "scalar_list",
+                            optional=False,
+                            required=True,
+                            child=None,
+                            scalar=ScalarSpec(str),
+                        ),
                     )
                 },
                 ValueError,

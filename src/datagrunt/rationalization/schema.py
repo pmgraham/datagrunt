@@ -21,16 +21,24 @@ paid for whose answers the schema would then reject. Each rejection raises
    Nothing else is: no plain ``datetime`` (one field would hold naive and aware values alike), ``dict``,
    ``tuple``, ``set``, ``bytes``, ``Any``, ``NewType`` or ``type`` alias, union of two or more types (a
    discriminated one included), list of lists, list of Optional, Optional list, or recursive model. A field whose
-   type does not admit ``None`` may not default to ``None`` (``SkipJsonSchema[None]`` counts as ``None``). Known
-   limit: pydantic does not validate defaults, and a ``default_factory`` is never called here, so a factory that
-   returns ``None``, or a default of another type, reaches a validated record as is when a response omits the
-   field; consensus must treat such a value (``None`` in a non-Optional field above all) as a quarantine reason.
+   type does not admit ``None`` may not default to ``None`` (``SkipJsonSchema[None]`` counts as ``None``).
+   Pydantic does not validate defaults, so a record that leaves a field out holds its default unchecked; a static
+   default must therefore be a value of its field (:func:`value_problems`): for a scalar, a finite one
+   :func:`admits_scalar` admits (its exact type, or an ``int`` widening losslessly to a ``float`` within
+   :data:`FLOAT_INT_LIMIT` or to a ``Decimal``); for a list, a ``list`` of such items; for a model, an instance of
+   exactly its class whose own fields hold such values, checked in turn. A default pydantic validates
+   (``validate_default=True`` on the field, or on its model unless the field sets it false) must instead pass
+   that validation: the model's own, as assigning the default to the field would run it (inconclusive outcomes,
+   such as a model validator meeting the half-built instance, pass).
+   A ``default_factory`` is never called here, so what it gives is checked after validation, by consensus, which
+   quarantines a record holding a value its field does not admit (``None`` in a non-Optional field above all).
    A field's value travels under one plain name, its
    wire name (an ``AliasPath`` is refused), and no two fields of a model share one. A path holds at most 32
    models and lists: the root is level 1, a nested model adds one, ``list[Child]`` adds two (the list and the
    model in it). The expanded field tree, where a model reached by two paths counts twice, holds at most 10,000
    fields. Each scalar or scalar-list field's :class:`ScalarSpec` records the exact type of its values, its Enum
-   or Literal, and whether a datetime is aware or naive, so no later step reads an annotation again.
+   or Literal, and whether a datetime is aware or naive, and each :class:`FieldSpec` whether ``model_validate``
+   requires the field (``required``, from ``FieldInfo.is_required()``), so no later step reads an annotation again.
 
    A field is a key when ``Key`` marks it (``Annotated[str, Key]``, ``Key("part")``). The root may instead name
    its keys with ``key=`` (attribute names, not aliases); when both are given, they must name the same fields. A
@@ -72,6 +80,7 @@ names (``Key``, ``RationalizationError``) never load pydantic.
 
 import copy
 import json
+import math
 import typing
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -90,6 +99,7 @@ from pydantic import (
     NaiveDatetime,
     PydanticUserError,
     RootModel,
+    ValidationError,
 )
 from pydantic.fields import FieldInfo
 
@@ -103,6 +113,11 @@ MAX_FIELDS = 10_000
 """Fields in a schema's expanded tree: a model reached by two paths counts twice."""
 MAX_WALK_STEPS = 100_000
 """Nodes one walk visits: annotations for :func:`check_schema`, JSON-schema nodes for :func:`check_json_schema`."""
+DEFAULT_HINT = " (a default: pydantic does not validate defaults, so fix the field's default)"
+"""What :func:`instance_problems` adds to a problem whose value a default gave (one the input never set)."""
+FLOAT_INT_LIMIT = 2**53
+"""The largest magnitude of an ``int`` a ``float`` field admits (:func:`admits_scalar`): every int up to it is exactly
+a float, and 2**53 + 1 is the first int with no exact float."""
 
 FieldKind: TypeAlias = Literal["scalar", "scalar_list", "model", "model_list"]
 """What a field holds: a scalar, a list of scalars, a model, or a list of models."""
@@ -191,6 +206,8 @@ _VALUE_KEYWORDS = ("type", "enum", "const", "format", "items", "properties", "an
 # Keywords that describe a value without shaping it: left out of the JSON a message shows.
 _ANNOTATION_KEYWORDS = frozenset({"title", "description", "default", "examples", "deprecated"})
 _JSON_SHOWN = 200
+_FROZEN_ERRORS = frozenset({"frozen_field", "frozen_instance"})
+_MISSING = object()  # what getattr gives for a field an instance lacks (a model_construct() instance)
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,11 +298,16 @@ class FieldSpec:
         optional: Whether the field's annotation admits ``None`` (``X | None``). A list is never Optional. A
             record may still hold ``None`` in a non-Optional field: a ``default_factory`` returning it is not
             validated (module notes, 2).
+        required: Whether ``model_validate`` requires the field (``FieldInfo.is_required()``: it has neither a
+            default nor a ``default_factory``). Independent of ``optional``: ``x: int | None`` is required, and
+            ``n: int = 1`` is not. Consensus reads it for "null = not shown": a null in a field that is neither
+            Optional nor required is dropped, so its default applies.
         child: The spec of the model a ``"model"`` or ``"model_list"`` field holds, else ``None``.
         scalar: The type of the values a ``"scalar"`` or ``"scalar_list"`` field holds, else ``None``.
 
     Raises:
-        TypeError: If ``name`` or ``wire_name`` is not a ``str``, ``optional`` not a ``bool``, ``child`` neither
+        TypeError: If ``name`` or ``wire_name`` is not a ``str``, ``optional`` or ``required`` not a ``bool``,
+            ``child`` neither
             ``None`` nor a :class:`ModelSpec`, or ``scalar`` neither ``None`` nor a :class:`ScalarSpec`.
         ValueError: If ``name`` is empty, ``wire_name`` blank, ``kind`` unknown, ``child`` given exactly for a
             scalar kind, ``scalar`` given exactly for a model kind, or a list is Optional.
@@ -295,6 +317,7 @@ class FieldSpec:
     wire_name: str
     kind: FieldKind
     optional: bool
+    required: bool
     child: "ModelSpec | None"
     scalar: ScalarSpec | None
 
@@ -309,6 +332,8 @@ class FieldSpec:
             )
         if not isinstance(self.optional, bool):
             raise TypeError(f"FieldSpec {self.name!r}: optional must be a bool, got {_brief(self.optional)}")
+        if not isinstance(self.required, bool):
+            raise TypeError(f"FieldSpec {self.name!r}: required must be a bool, got {_brief(self.required)}")
         if self.child is not None and not isinstance(self.child, ModelSpec):
             raise TypeError(f"FieldSpec {self.name!r}: child must be a ModelSpec or None, got {_brief(self.child)}")
         if self.scalar is not None and not isinstance(self.scalar, ScalarSpec):
@@ -543,6 +568,77 @@ def schema_sha256(wrapper: Mapping[str, Any]) -> str:
     return sha256_hex(_canonical_json(wrapper))
 
 
+def admits_scalar(scalar: ScalarSpec, value: object) -> bool:
+    """Whether a field of ``scalar`` admits ``value`` (not ``None``), as a validated record holds it.
+
+    The value's exact type must be the field's base (a ``bool`` is not an ``int``, a ``datetime`` not a ``date``),
+    with two lossless widenings: an ``int`` (never a ``bool``) in a ``float`` field when its magnitude is at most
+    :data:`FLOAT_INT_LIMIT`, and any ``int`` in a ``Decimal`` field. An Enum field admits only its own members, a
+    Literal field only its values (each of its exact type), a datetime field only datetimes of its kind (aware or
+    naive). Pydantic does not validate defaults, so :func:`describe` checks static defaults with this, and consensus
+    every value a record holds after validation (what a ``default_factory`` gave included).
+
+    Args:
+        scalar: The field's scalar spec.
+        value: The value.
+
+    Returns:
+        Whether the field admits it.
+    """
+    if scalar.enum is not None:
+        return type(value) is scalar.enum
+    kind = type(value)
+    if isinstance(value, int) and kind is int and scalar.base is float:
+        return abs(value) <= FLOAT_INT_LIMIT
+    if kind is int and scalar.base is Decimal:
+        return True
+    if kind is not scalar.base:
+        return False
+    if scalar.literal is not None:  # its values all have the exact type ``kind`` (a ScalarSpec rule)
+        return value in scalar.literal
+    if isinstance(value, datetime):
+        return (value.utcoffset() is not None) == (scalar.tz == "aware")
+    return True
+
+
+def value_problems(field: FieldSpec, value: object, path: str = "") -> list[str]:
+    """Each way ``value`` is not a value of ``field``, as a ``"<path>: <problem>"`` line (``path`` leads each).
+
+    The check pydantic leaves undone for defaults (module notes, 2): a value whose type the field does not admit
+    (:func:`admits_scalar` for a scalar, a ``list`` of admitted items for a list, an instance of exactly its class
+    for a model), ``None`` in a non-Optional field, and, inside a model instance, a field it lacks (an instance
+    built by ``model_construct()`` can). A model instance's fields are checked in turn, by its spec. The walk follows
+    the spec, so it goes no deeper than the spec's depth, even through an instance that contains itself, and checks
+    each value it reaches once. A problem never shows a value, only its type.
+
+    Args:
+        field: The field's spec.
+        value: The value it holds.
+        path: The field's attribute path, prefixed to each problem; ``""`` for none.
+
+    Returns:
+        The problems in field order; ``[]`` when the field admits ``value``.
+    """
+    return _walk_values([_Visit(field, value, path, None)])
+
+
+def instance_problems(instance: BaseModel, spec: ModelSpec) -> list[str]:
+    """Each way the fields of ``instance`` are not values of ``spec`` (:func:`value_problems`, by attribute path).
+
+    A problem whose value a default gave (its field, or a model holding it, was not set by the input: not in the
+    instance's ``model_fields_set``) ends with :data:`DEFAULT_HINT`; one the input gave (a non-finite float that
+    lax validation took, say) does not, so the message never blames a default for what the model sent.
+
+    Args:
+        instance: An instance of ``spec.model`` (a validated record, say).
+        spec: Its spec.
+
+    Returns:
+        The problems in field order; ``[]`` when every field holds a value the spec admits.
+    """
+    return _walk_values(list(reversed(_child_visits(spec, instance, "", False))))
+
+
 def prepare(schema: object, key: str | Sequence[str] | None = None) -> PreparedSchema:
     """Check ``schema`` and derive everything rationalize() needs from it, before any work starts.
 
@@ -718,15 +814,22 @@ def _describe_field(
     wire_name = _wire_name(model, name, info, path)
     if shape.kind != "scalar":
         _check_depth(depth + 1, path)  # a list, or a nested model
-    if shape.model is None:
-        return FieldSpec(
-            name=name, wire_name=wire_name, kind=shape.kind, optional=shape.optional, child=None, scalar=shape.scalar
-        )
-    if shape.kind == "model":
+    child: ModelSpec | None = None
+    if shape.model is not None and shape.kind == "model":
         child = _describe_model(shape.model, path, depth + 1, active, None, budget)
-    else:
+    elif shape.model is not None:
         child = _describe_model(shape.model, f"{path}[]", depth + 2, active, None, budget)
-    return FieldSpec(name=name, wire_name=wire_name, kind=shape.kind, optional=shape.optional, child=child, scalar=None)
+    spec = FieldSpec(
+        name=name,
+        wire_name=wire_name,
+        kind=shape.kind,
+        optional=shape.optional,
+        required=info.is_required(),
+        child=child,
+        scalar=shape.scalar if child is None else None,
+    )
+    _check_static_default(model, info, spec, path)
+    return spec
 
 
 def _check_depth(depth: int, path: str) -> None:
@@ -748,6 +851,71 @@ def _check_none_default(info: FieldInfo, shape: _Shape, path: str) -> None:
     raise RationalizationError(
         f"{path}: its default is None, which {named} does not admit: annotate {named} | None, or drop the default"
     )
+
+
+def _check_static_default(model: type[BaseModel], info: FieldInfo, spec: FieldSpec, path: str) -> None:
+    """Raise if the field at ``path`` has a static default that is no value of the field (module notes, 2).
+
+    Pydantic does not validate defaults, so every record that left the field out would hold it unchecked, and
+    consensus would quarantine each one, after its request was paid. The default is checked as consensus checks a
+    record (:func:`value_problems`): a model instance field by field, by the field's spec. A ``None`` default was
+    checked before (only an Optional field takes one), a ``default_factory`` is never called here (consensus checks
+    what it gives), and a default pydantic validates (``validate_default``, on the field or, unless the field says
+    otherwise, its model) must pass that validation instead (:func:`_check_validated_default`).
+    """
+    if info.is_required() or info.default_factory is not None or info.default is None:
+        return
+    validated = info.validate_default
+    if validated is None:
+        validated = bool(model.model_config.get("validate_default", False))
+    if validated:
+        _check_validated_default(model, spec.name, info, path)
+        return
+    problems = value_problems(spec, info.default)
+    if problems:
+        raise RationalizationError(
+            f"{path}: its default {_brief(info.default)} is not a value of the field ({'; '.join(problems)}): "
+            f"pydantic does not validate defaults, so every record that leaves the field out would hold it and be "
+            f"quarantined; give a default of the field's own type, or set Field(validate_default=True)"
+        )
+
+
+def _check_validated_default(model: type[BaseModel], name: str, info: FieldInfo, path: str) -> None:
+    """Raise if a static default pydantic validates (``validate_default``) fails the model's own validation of it.
+
+    Pydantic would refuse it for every record that leaves the field out. The check is the model's own validator
+    (``validate_assignment`` of the default to the field), so the model's field validators, its ``model_config``
+    (``strict``, ``coerce_numbers_to_str``, ``str_max_length``, ...) and the field's constraints all apply. It runs
+    against an instance built with every field set to ``None`` (``model_construct``), so no ``default_factory`` is
+    called. Only a ``ValidationError`` whose every error lies at this field refuses the default; anything else is
+    inconclusive and the default passes (consensus quarantines a record its validation refuses): an error elsewhere
+    (a model validator meeting the half-built instance), a frozen field, which takes no assignment, or another
+    exception. A ``MemoryError`` or ``RecursionError`` propagates.
+    """
+    names = {found for found in (name, info.alias, info.validation_alias) if isinstance(found, str)}
+    try:
+        instance = model.model_construct(**dict.fromkeys(model.model_fields))
+        model.__pydantic_validator__.validate_assignment(instance, name, info.default)
+    except ValidationError as error:
+        details = error.errors(include_url=False)
+        if not details or not all(_refuses(detail, names) for detail in details):
+            return
+        kinds = ", ".join(sorted({str(detail["type"]) for detail in details}))
+        raise RationalizationError(
+            f"{path}: its default {_brief(info.default)} fails the field's own validation ({kinds}), and "
+            f"validate_default makes pydantic validate it for every record that leaves the field out; give a default "
+            f"that validates"
+        ) from error
+    except (MemoryError, RecursionError):
+        raise
+    except Exception:  # inconclusive: a validator meeting the half-built instance, model_post_init, ...
+        return
+
+
+def _refuses(detail: Mapping[str, Any], names: set[str]) -> bool:
+    """Whether a validation error refuses the default itself: it lies at the field, and it is not a frozen field's."""
+    loc = detail.get("loc", ())
+    return bool(loc) and loc[0] in names and detail.get("type") not in _FROZEN_ERRORS
 
 
 def _wire_name(model: type[BaseModel], name: str, info: FieldInfo, path: str) -> str:
@@ -1537,6 +1705,134 @@ def _canonical_json(wrapper: object) -> str:
     if not isinstance(wrapper, Mapping):
         raise RationalizationError(f"the response schema must be a mapping, got {type(wrapper).__name__}")
     return canonical_json(wrapper, subject="the response schema")
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Values (value_problems)
+# ---------------------------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _Visit:
+    """One value to check: its field, its path, and whether a default gave it (``None``: not told)."""
+
+    field: FieldSpec
+    value: object
+    path: str
+    defaulted: bool | None
+
+
+def _walk_values(stack: list[_Visit]) -> list[str]:
+    """The problems of every value on ``stack`` (popped last first), and of what they hold."""
+    problems: list[str] = []
+    while stack:
+        visit = stack.pop()
+        problems.extend(_marked(problem, visit.defaulted) for problem in _value_problems(visit, stack))
+    return problems
+
+
+def _marked(problem: str, defaulted: bool | None) -> str:
+    """``problem``, with :data:`DEFAULT_HINT` when a default gave the value (so the fix is the field's default)."""
+    return f"{problem}{DEFAULT_HINT}" if defaulted else problem
+
+
+def _value_problems(visit: _Visit, stack: list[_Visit]) -> list[str]:
+    """What is wrong with one field's value; the fields of each model instance it holds go on ``stack``."""
+    field_spec, value, path = visit.field, visit.value, visit.path
+    if value is _MISSING:
+        return [_at(path, "is missing (the instance was built without it, as model_construct() can)")]
+    if field_spec.kind in _LIST_KINDS:
+        if type(value) is not list:
+            return [_at(path, f"holds {_type_of(value)}, but the field holds a list")]
+        items = [(f"{path}[{index}]", item) for index, item in enumerate(value)]
+    elif value is None:
+        return [] if field_spec.optional else [_at(path, "holds None, but the field is not Optional")]
+    else:
+        items = [(path, value)]
+    problems: list[str] = []
+    children: list[_Visit] = []
+    for item_path, item in items:
+        problem = _item_problem(field_spec, item)
+        if problem is not None:
+            problems.append(_at(item_path, problem))
+        elif field_spec.child is not None:
+            children.extend(_child_visits(field_spec.child, item, item_path, visit.defaulted))
+    stack.extend(reversed(children))  # popped in field order
+    return problems
+
+
+def _child_visits(spec: ModelSpec, item: object, path: str, defaulted: bool | None) -> list[_Visit]:
+    """The fields of a model instance to check, in field order.
+
+    A field the input did not set holds its default; a field the instance lacks holds nothing, so only the default
+    that gave the instance (``defaulted``) can be at fault for it.
+    """
+    given = _fields_set(item)
+    visits: list[_Visit] = []
+    for child in spec.fields:
+        value = getattr(item, child.name, _MISSING)
+        own_default = value is not _MISSING and child.name not in given
+        child_path = f"{path}.{child.name}" if path else child.name
+        visits.append(_Visit(child, value, child_path, None if defaulted is None else defaulted or own_default))
+    return visits
+
+
+def _fields_set(instance: object) -> frozenset[str]:
+    """The fields validation (or ``model_construct``) set on ``instance``: the others hold their defaults."""
+    found = getattr(instance, "__pydantic_fields_set__", None)
+    return frozenset(found) if isinstance(found, set) else frozenset()
+
+
+def _item_problem(field_spec: FieldSpec, value: object) -> str | None:
+    """What is wrong with one value (not ``None``, not a list) of a field, else ``None``."""
+    if field_spec.child is not None:
+        model = field_spec.child.model
+        return None if type(value) is model else f"holds {_type_of(value)}, but the field holds {model.__name__}"
+    scalar = field_spec.scalar
+    if scalar is None:
+        return None
+    if not _finite(value):
+        return f"holds a non-finite {_type_of(value)}"
+    if admits_scalar(scalar, value):
+        return None
+    return f"holds {_type_of(value)}, but the field holds {_held_text(scalar)}"
+
+
+def _finite(value: object) -> bool:
+    """Whether ``value`` is not a non-finite ``float`` or ``Decimal`` (NaN, an infinity): lax validation takes
+    ``"Infinity"`` and ``"NaN"`` for a float, and neither has a JSON form."""
+    if type(value) is float:
+        return math.isfinite(value)
+    if type(value) is Decimal:
+        return value.is_finite()
+    return True
+
+
+def _held_text(scalar: ScalarSpec) -> str:
+    """What a scalar field holds, for a message: an int widening to it named too."""
+    if scalar.enum is not None:
+        return scalar.enum.__name__
+    if scalar.base is float:
+        return "float (or an int within 2**53 of 0)"
+    if scalar.base is Decimal:
+        return "Decimal (or an int)"
+    if scalar.literal is not None:
+        return f"Literal[{', '.join(repr(item) for item in scalar.literal)}]"
+    if scalar.tz == "aware":
+        return "an aware datetime"
+    if scalar.tz == "naive":
+        return "a naive datetime"
+    return scalar.base.__name__
+
+
+def _type_of(value: object) -> str:
+    """The name of ``value``'s type (``None`` for ``None``), for a message that never shows the value."""
+    return "None" if value is None else type(value).__name__
+
+
+def _at(path: str, problem: str) -> str:
+    """``problem`` at ``path`` (``"path: problem"``), or alone for the empty path."""
+    return f"{path}: {problem}" if path else problem
 
 
 # ---------------------------------------------------------------------------------------------------------------
