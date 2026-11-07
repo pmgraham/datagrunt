@@ -130,7 +130,16 @@ SCHEMA_JSON = canonical(WRAPPER)
 OTHER_SCHEMA_JSON = SCHEMA_JSON.replace("The part number.", "The part's number.")
 SCHEMA_LEAD = "\n\nThe response schema, as JSON:\n"
 # Every code point R8 escapes, CR included, written independently of the module under test.
-ESCAPABLE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069\ud800-\udfff\U000e0000-\U000e007f]")
+ESCAPABLE_RANGES = (
+    (0x0000, 0x0008),
+    (0x000B, 0x001F),
+    (0x007F, 0x009F),
+    (0x202A, 0x202E),
+    (0x2066, 0x2069),
+    (0xD800, 0xDFFF),
+    (0xE0000, 0xE007F),
+)
+ESCAPABLE_CHARS = frozenset(chr(cp) for lo, hi in ESCAPABLE_RANGES for cp in range(lo, hi + 1))
 TOKEN = re.compile(r"\[U\+([0-9A-F]{4,5})\]")
 # Text that tries to open or close a block or a tag, with and without a backslash before it.
 FORGERY = (
@@ -229,7 +238,7 @@ def payload_of(user: str, nonce: str = NONCE) -> str:
     It also checks that no R8 code point (CR included) is left anywhere in the user message: all of it is escaped.
     """
     opening, closing = f"<document_payload_{nonce}>\n", f"\n</document_payload_{nonce}>"
-    assert ESCAPABLE.search(user) is None
+    assert ESCAPABLE_CHARS.isdisjoint(user)
     assert user.count(opening) == 1 and user.count(closing) == 1
     assert user.endswith(closing)
     return user[user.index(opening) + len(opening) : -len(closing)]
@@ -271,7 +280,7 @@ def assert_safe_block(block: str, element: DocumentElement) -> str:
     assert tail == "</el>"
     assert bare_angles(body) == []
     assert bare_ampersands(body) == []
-    assert ESCAPABLE.search(block) is None
+    assert ESCAPABLE_CHARS.isdisjoint(block)
     assert body == element_text(element)
     block.encode("utf-8")
     return body
@@ -436,7 +445,7 @@ class TestEscape:
         escaped = escape(text)
         tokens = TOKEN.findall(escaped)
 
-        assert ESCAPABLE.search(escaped) is None
+        assert ESCAPABLE_CHARS.isdisjoint(escaped)
         assert unescape(escaped) == text.replace("\r\n", "\n").replace("\r", "\n")
         assert sum(count for _, count in escape_counts(text)) == len(tokens) + text.count("\r")
         assert escape(escaped) == escaped
