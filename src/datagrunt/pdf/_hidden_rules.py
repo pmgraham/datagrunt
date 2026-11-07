@@ -10,11 +10,13 @@ same two, so a span and recovered text are flagged alike.
 
 import math
 
-from datagrunt.pdf.elements import BBox, HiddenReason
+from datagrunt.pdf.elements import HiddenReason
 
 RECOVERY_REASONS: tuple[HiddenReason, ...] = ("tiny_font", "zero_scale")
 # A font size (or an em's width) under this many points is too small to read.
 TINY_FONT_PT = 1.0
+# Sub-point tolerance matching BBox.within's default (0.5 pt).
+OFF_PAGE_TOLERANCE_PT = 0.5
 
 
 def em_size(size: float, a: float, b: float, c: float, d: float) -> tuple[float, float]:
@@ -61,4 +63,9 @@ def off_page(box: tuple[float, float, float, float], width: float, height: float
     textpage chars (:mod:`datagrunt.pdf.quality` flags ``off_page`` by it).
     """
     x0, y0, x1, y1 = box
-    return not BBox(x0=x0, y0=y0, x1=x1, y1=y1).within(width, height)
+    return not (
+        x0 >= -OFF_PAGE_TOLERANCE_PT
+        and y0 >= -OFF_PAGE_TOLERANCE_PT
+        and x1 <= width + OFF_PAGE_TOLERANCE_PT
+        and y1 <= height + OFF_PAGE_TOLERANCE_PT
+    )

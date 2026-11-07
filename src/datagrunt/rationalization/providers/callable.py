@@ -64,7 +64,7 @@ class CallableProvider:
             its rule; no message quotes the family.
     """
 
-    __slots__ = ("_family", "_fn", "_model_id")
+    __slots__ = ("_family", "_fn", "_max_concurrency", "_model_id")
 
     def __init__(self, model_id: str, fn: ProviderFunction, *, family: str = UNKNOWN_FAMILY) -> None:
         problem = identity_problem(model_id)
@@ -80,6 +80,7 @@ class CallableProvider:
         self._model_id = model_id
         self._fn = fn
         self._family = family
+        self._max_concurrency: int | None = None
 
     @property
     def model_id(self) -> str:
@@ -100,6 +101,18 @@ class CallableProvider:
     def model_family(self) -> str:
         """The family given, ``"unknown"`` by default."""
         return self._family
+
+    @property
+    def max_concurrency(self) -> int | None:
+        """Optional per-provider concurrency cap (1-64), or ``None``."""
+        return self._max_concurrency
+
+    def with_max_concurrency(self, max_concurrency: int | None) -> "CallableProvider":
+        """Configure a per-provider concurrency cap (1-64, or ``None``) and return ``self``."""
+        if max_concurrency is not None and (type(max_concurrency) is not int or not 1 <= max_concurrency <= 64):
+            raise RationalizationError("max_concurrency must be None or an int in 1-64")
+        self._max_concurrency = max_concurrency
+        return self
 
     @property
     def generation_params(self) -> dict[str, Any]:

@@ -358,6 +358,8 @@ def write_bundle(
     workers: int = 1,
     extraction_params: Mapping[str, object] | None = None,
     overwrite: bool = False,
+    include_images: bool = True,
+    render_pages: bool = True,
 ) -> PDFDocument:
     """Write ``document``, extracted from ``source``, as a bundle at ``output_dir``, atomically.
 
@@ -368,7 +370,9 @@ def write_bundle(
     extraction parameters (``ocr``, ``min_image_dimension``, ``strict``:
     what A7b's ``PDFWriter`` extracted with), recorded in the manifest after
     the writer's own (see :func:`_checked_params`). ``overwrite`` replaces a
-    bundle at ``output_dir`` that is not this write's.
+    bundle at ``output_dir`` that is not this write's. ``include_images=False``
+    skips writing figure PNGs and rendering page PNGs; ``render_pages=False``
+    skips rendering page PNGs while keeping figure PNGs.
 
     Returns:
         ``document`` with paths set (see the module notes), or the reused
@@ -394,7 +398,9 @@ def write_bundle(
             loaders are not bound to ``source`` (see the module notes).
     """
     options = PipelineOptions(workers=workers, dpi=dpi, vision_dpi=vision_dpi, max_render_pixels=max_render_pixels)
-    params = _checked_params(options, extraction_params)
+    include_imgs = strict_bool("include_images", include_images)
+    render_pgs = strict_bool("render_pages", render_pages)
+    params = _checked_params(options, extraction_params, include_images=include_imgs, render_pages=render_pgs)
     if not isinstance(document, PDFDocument):
         raise TypeError(f"document must be a PDFDocument, got {type(document).__name__}")
     replace = strict_bool("overwrite", overwrite)
@@ -408,7 +414,16 @@ def write_bundle(
     staging = target.parent / f"{_STAGING_PREFIX}{uuid.uuid4().hex}"
     staging.mkdir()
     try:
-        written, notices = _staged(document, staging, target, pdf, options, params)
+        written, notices = _staged(
+            document,
+            staging,
+            target,
+            pdf,
+            options,
+            params,
+            include_images=include_imgs,
+            render_pages=render_pgs,
+        )
         _check_unchanged(pdf, identity)
         aside = _publish(staging, target, replace)
     except BaseException:
@@ -422,7 +437,13 @@ def write_bundle(
     return written
 
 
-def _checked_params(options: PipelineOptions, extra: object) -> dict[str, object]:
+def _checked_params(
+    options: PipelineOptions,
+    extra: object,
+    *,
+    include_images: bool = True,
+    render_pages: bool = True,
+) -> dict[str, object]:
     """The manifest's ``extraction_params``: the writer's own, then ``extra``'s, each a JSON scalar.
 
     Raises:
@@ -432,18 +453,21 @@ def _checked_params(options: PipelineOptions, extra: object) -> dict[str, object
             is not finite.
     """
     params: dict[str, object] = {name: getattr(options, name) for name in _PARAM_KEYS}
-    if extra is None:
-        return params
-    if not isinstance(extra, Mapping):
-        raise TypeError(f"extraction_params must be a Mapping or None, got {type(extra).__name__}")
-    for key, value in extra.items():
-        if not isinstance(key, str):
-            raise TypeError(f"extraction_params keys must be str, got {type(key).__name__}")
-        if not key.strip():
-            raise ValueError(f"extraction_params keys must be non-blank, got {key!r}")
-        if key in _PARAM_KEYS:
-            raise ValueError(f"extraction_params[{key!r}] is write_bundle's own parameter: pass it as {key}=")
-        params[key] = _json_scalar(f"extraction_params[{key!r}]", value)
+    if extra is not None:
+        if not isinstance(extra, Mapping):
+            raise TypeError(f"extraction_params must be a Mapping or None, got {type(extra).__name__}")
+        for key, value in extra.items():
+            if not isinstance(key, str):
+                raise TypeError(f"extraction_params keys must be str, got {type(key).__name__}")
+            if not key.strip():
+                raise ValueError(f"extraction_params keys must be non-blank, got {key!r}")
+            if key in _PARAM_KEYS:
+                raise ValueError(f"extraction_params[{key!r}] is write_bundle's own parameter: pass it as {key}=")
+            params[key] = _json_scalar(f"extraction_params[{key!r}]", value)
+    if not include_images:
+        params["include_images"] = False
+    if not render_pages:
+        params["render_pages"] = False
     return params
 
 
@@ -531,13 +555,20 @@ def _existing(target: Path, document: PDFDocument, params: Mapping[str, object])
     if manifest.extraction_params != dict(params):
         return None, f"its extraction_params {manifest.extraction_params} are not this write's {dict(params)}"
     rendered = {entry.page_number for entry in manifest.page_images if entry.origin == "render"}
-    if _without_renders(loaded, rendered) != _without_renders(document, rendered):
+    strip_figures = params.get("include_images") is False
+    if strip_figures or params.get("render_pages") is False:
+        rendered |= {page.page_number for page in document.pages}
+    if _without_renders(loaded, rendered, strip_figures=strip_figures) != _without_renders(
+        document, rendered, strip_figures=strip_figures
+    ):
         return None, "its document is not this one"
     return loaded, ""
 
 
-def _without_renders(document: PDFDocument, rendered: set[int]) -> PDFDocument:
+def _without_renders(document: PDFDocument, rendered: set[int], *, strip_figures: bool = False) -> PDFDocument:
     """``document`` whose pages in ``rendered`` (the bundle's renders) have no page image: what a write compares."""
+    if strip_figures:
+        return _with_paths(document, {}, {}, Path())
     pages = tuple(
         dataclasses.replace(page, page_image=None) if page.page_number in rendered else page for page in document.pages
     )
@@ -599,17 +630,42 @@ def _staged(
     source: PDFSource,
     options: PipelineOptions,
     params: Mapping[str, object],
+    *,
+    include_images: bool = True,
+    render_pages: bool = True,
 ) -> tuple[PDFDocument, tuple[str, ...]]:
     """Write every artifact, then the manifest, into ``staging``: the document (paths in ``target``), and warnings."""
     ledger = _Ledger()
-    figures = _write_figures(document, staging, source.path, ledger)
-    renders = _write_renders(document, staging, source, options, ledger)
+    if include_images:
+        figures = _write_figures(document, staging, source.path, ledger)
+    else:
+        figures = _skip_figures(document, ledger)
+    if include_images and render_pages:
+        renders = _write_renders(document, staging, source, options, ledger)
+    else:
+        why = "include_images=False" if not include_images else "render_pages=False"
+        renders = _skip_renders(document, ledger, why)
     _write_texts(document, figures, renders, staging, ledger)
     _write_bytes(staging, MANIFEST, _manifest(document, params, renders, ledger))
     by_path = {artifact.path: artifact for artifact in ledger.artifacts}
     origins = {number: written.origin for number, written in renders.items()}
     returned = _with_readers(_with_paths(document, figures, renders, target), target, by_path, origins)
     return returned, tuple(ledger.warnings)
+
+
+def _skip_figures(document: PDFDocument, ledger: _Ledger) -> dict[str, str]:
+    """Record each figure as skipped when ``include_images=False``."""
+    for figure in document.figures:
+        reason = f"figure {figure.sha256} was not written: include_images=False"
+        ledger.missing.append(_Missing("figure", figure.page_number, figure.element_id, reason))
+    return {}
+
+
+def _skip_renders(document: PDFDocument, ledger: _Ledger, why: str) -> dict[int, _Written]:
+    """Record each page render as skipped when ``include_images=False`` or ``render_pages=False``."""
+    for page in document.pages:
+        ledger.missing.append(_Missing("page_image", page.page_number, None, f"the page was not rendered: {why}"))
+    return {}
 
 
 @dataclass

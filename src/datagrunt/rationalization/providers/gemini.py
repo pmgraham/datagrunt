@@ -815,7 +815,16 @@ class GeminiProvider:
             never quoting a key.
     """
 
-    __slots__ = ("_auth", "_client", "_endpoint", "_max_connections", "_seed", "_temperature", "_thinking_level")
+    __slots__ = (
+        "_auth",
+        "_client",
+        "_endpoint",
+        "_max_concurrency",
+        "_max_connections",
+        "_seed",
+        "_temperature",
+        "_thinking_level",
+    )
 
     def __init__(
         self,
@@ -1011,6 +1020,7 @@ class GeminiProvider:
         self._thinking_level = _check_thinking_level(thinking_level)
         self._client = _http_client(max_connections, transport)
         self._max_connections = _check_max_connections(max_connections)
+        self._max_concurrency: int | None = None
 
     @property
     def model_id(self) -> str:
@@ -1031,6 +1041,18 @@ class GeminiProvider:
     def max_connections(self) -> int:
         """The HTTP pool size given (1-1,024)."""
         return self._max_connections
+
+    @property
+    def max_concurrency(self) -> int | None:
+        """Optional per-provider concurrency cap (1-64), or ``None``."""
+        return self._max_concurrency
+
+    def with_max_concurrency(self, max_concurrency: int | None) -> "GeminiProvider":
+        """Configure a per-provider concurrency cap (1-64, or ``None``) and return ``self``."""
+        if max_concurrency is not None and (type(max_concurrency) is not int or not 1 <= max_concurrency <= 64):
+            raise RationalizationError("max_concurrency must be None or an int in 1-64")
+        self._max_concurrency = max_concurrency
+        return self
 
     @property
     def rate_key(self) -> str:

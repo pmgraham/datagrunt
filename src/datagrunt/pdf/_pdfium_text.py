@@ -477,20 +477,26 @@ def _read_style(
     )
 
 
-def _loose_box(textpage: pdfium_c.FPDF_TEXTPAGE, char_index: int) -> Box:
+def _loose_box(textpage: pdfium_c.FPDF_TEXTPAGE, char_index: int, rect: pdfium_c.FS_RECTF | None = None) -> Box:
     """Read a char's loose box as ``(left, bottom, right, top)`` in PDF user space (:func:`_in_order`)."""
-    rect = pdfium_c.FS_RECTF()
-    if not pdfium_c.FPDFText_GetLooseCharBox(textpage, char_index, rect):
+    buf = pdfium_c.FS_RECTF() if rect is None else rect
+    if not pdfium_c.FPDFText_GetLooseCharBox(textpage, char_index, buf):
         raise PdfiumFailure(f"read the box of char {char_index}")
-    return _in_order(rect.left, rect.bottom, rect.right, rect.top)
+    return _in_order(buf.left, buf.bottom, buf.right, buf.top)
 
 
-def _tight_box(textpage: pdfium_c.FPDF_TEXTPAGE, char_index: int) -> Box:
+def _tight_box(
+    textpage: pdfium_c.FPDF_TEXTPAGE,
+    char_index: int,
+    coords: tuple[ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double] | None = None,
+) -> Box:
     """Read a char's tight box (its glyph's bounds) as ``(left, bottom, right, top)`` in PDF user space.
 
     Edges as :func:`_in_order` gives them.
     """
-    left, right, bottom, top = (ctypes.c_double() for _ in range(4))
+    left, right, bottom, top = (
+        (ctypes.c_double(), ctypes.c_double(), ctypes.c_double(), ctypes.c_double()) if coords is None else coords
+    )
     if not pdfium_c.FPDFText_GetCharBox(textpage, char_index, left, right, bottom, top):
         raise PdfiumFailure(f"read the tight box of char {char_index}")
     return _in_order(left.value, bottom.value, right.value, top.value)
@@ -503,9 +509,14 @@ def _in_order(left: float, bottom: float, right: float, top: float) -> Box:
     then skips the char's object); a finite one has its edges in order, so a
     mirrored (negative-size) char still reads as a box.
     """
-    if not all(math.isfinite(edge) for edge in (left, bottom, right, top)):
+    if not (math.isfinite(left) and math.isfinite(bottom) and math.isfinite(right) and math.isfinite(top)):
         return left, bottom, right, top
-    return min(left, right), min(bottom, top), max(left, right), max(bottom, top)
+    return (
+        left if left <= right else right,
+        bottom if bottom <= top else top,
+        right if left <= right else left,
+        top if bottom <= top else bottom,
+    )
 
 
 class _OwnedChar(NamedTuple):
@@ -653,6 +664,8 @@ def _read_textpage(textpage: pdfium_c.FPDF_TEXTPAGE, object_indices: dict[int, i
     styles: dict[int, _Style] = {}
     skipped: set[int] = set()
     generated = ownerless = 0
+    loose_rect = pdfium_c.FS_RECTF()
+    tight_coords = (ctypes.c_double(), ctypes.c_double(), ctypes.c_double(), ctypes.c_double())
     for char_index in range(count):
         if _textpage_flag(pdfium_c.FPDFText_IsGenerated(textpage, char_index), char_index, "is generated"):
             generated += 1
@@ -674,7 +687,7 @@ def _read_textpage(textpage: pdfium_c.FPDF_TEXTPAGE, object_indices: dict[int, i
             if owner not in object_indices:
                 raise PdfiumFailure(f"read the text object of char {char_index}: it is not in the page's object tree")
             styles[owner] = _read_style(textpage, text_object, char_index, object_indices[owner])
-        box, tight = _loose_box(textpage, char_index), _tight_box(textpage, char_index)
+        box, tight = _loose_box(textpage, char_index, loose_rect), _tight_box(textpage, char_index, tight_coords)
         style = styles[owner]
         if not all(math.isfinite(value) for value in (*box, *tight, style.font_size_pt, style.em_width_pt)):
             skipped.add(owner)

@@ -196,7 +196,8 @@ from dataclasses import dataclass, field
 from itertools import groupby
 from typing import NamedTuple, get_args
 
-from datagrunt.pdf._hidden_rules import em_reasons, off_page
+from datagrunt.pdf._compute import backend as compute_backend
+from datagrunt.pdf._hidden_rules import em_reasons, off_page  # noqa: F401
 from datagrunt.pdf._options import OcrMode
 from datagrunt.pdf._pdfium_common import Box, union_box
 from datagrunt.pdf._pdfium_images import RawImage
@@ -399,16 +400,13 @@ def _span_pieces(span: RawSpan, width: float, height: float, raster: tuple[Box, 
     under = _overlapping(span.bbox, raster) if no_paint else ()
     flagged = dict.fromkeys(em_reasons(span.em_width_pt, abs(span.font_size_pt)), True)
     flagged["transparent"] = _transparent(span)
-    reasons: list[tuple[HiddenReason, ...]] = []
-    for box in span.char_boxes:
-        flagged["off_page"] = off_page(box, width, height)
-        flagged["invisible"] = no_paint and not _over_raster(box, under)
-        reasons.append(tuple(reason for reason in HIDDEN_REASONS if flagged.get(reason, False)))
-    start = 0
-    for end in range(1, len(reasons) + 1):
-        if end == len(reasons) or reasons[end] != reasons[start]:
-            yield SpanPiece(span=span, start=start, end=end, hidden_reasons=reasons[start])
-            start = end
+    for start, end, is_off, is_inv in compute_backend().pdf_char_reason_runs(
+        span.char_boxes, width, height, no_paint, under
+    ):
+        flagged["off_page"] = is_off
+        flagged["invisible"] = is_inv
+        reasons = tuple(reason for reason in HIDDEN_REASONS if flagged.get(reason, False))
+        yield SpanPiece(span=span, start=start, end=end, hidden_reasons=reasons)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -522,29 +520,23 @@ def _paint_rgb(span: RawSpan) -> tuple[int, int, int]:
 
 def _background_rgb(piece: SpanPiece, backdrop: Backdrop, scale: tuple[float, float]) -> tuple[int, int, int]:
     """The piece's background: each channel's median over its chars' backgrounds, as red, green, blue."""
-    samples = [_char_bgr(box, backdrop, scale) for box in piece.span.char_boxes[piece.start : piece.end]]
+    samples = compute_backend().pdf_char_bgr_medians(
+        backdrop.pixels,
+        backdrop.px_width,
+        backdrop.px_height,
+        scale[0],
+        scale[1],
+        piece.span.char_boxes[piece.start : piece.end],
+    )
     blue, green, red = (_median([sample[channel] for sample in samples]) for channel in range(_BGR_BYTES))
     return red, green, blue
 
 
 def _char_bgr(box: Box, backdrop: Backdrop, scale: tuple[float, float]) -> tuple[int, int, int]:
-    """A char's background: each channel's median over the backdrop's pixels under its box, as blue, green, red.
-
-    Each row is three strided slices of the backdrop (one a channel): at
-    most MAX_SAMPLES_PER_AXIS rows of at most MAX_SAMPLES_PER_AXIS pixels.
-    """
-    x0, y0, x1, y1 = box
-    columns = _pixel_run(x0 * scale[0], x1 * scale[0], backdrop.px_width)
-    rows = _pixel_run(y0 * scale[1], y1 * scale[1], backdrop.px_height)
-    row_bytes, step = backdrop.px_width * _BGR_BYTES, columns.step * _BGR_BYTES
-    first, last = columns.start * _BGR_BYTES, columns[-1] * _BGR_BYTES
-    channels: tuple[list[int], list[int], list[int]] = ([], [], [])
-    for row in rows:  # at most MAX_SAMPLES_PER_AXIS
-        base = row * row_bytes
-        for channel, values in enumerate(channels):
-            values.extend(backdrop.pixels[base + first + channel : base + last + channel + 1 : step])
-    blue, green, red = (_median(values) for values in channels)
-    return blue, green, red
+    """A char's background: each channel's median over the backdrop's pixels under its box, as blue, green, red."""
+    return compute_backend().pdf_char_bgr_medians(
+        backdrop.pixels, backdrop.px_width, backdrop.px_height, scale[0], scale[1], (box,)
+    )[0]
 
 
 def _pixel_run(low: float, high: float, size: int) -> range:
@@ -600,18 +592,7 @@ def _cover_fraction(boxes: tuple[Box, ...], width: float, height: float) -> floa
 
 def _union_area(boxes: list[Box]) -> float:
     """The exact area of the union of non-empty ``boxes``: sweep over x, cover tree over y."""
-    edges = sorted({y for box in boxes for y in (box[1], box[3])})
-    rank = {y: index for index, y in enumerate(edges)}
-    opening = [(box[0], 1, rank[box[1]], rank[box[3]]) for box in boxes]
-    closing = [(box[2], -1, rank[box[1]], rank[box[3]]) for box in boxes]
-    events = sorted(opening + closing)
-    tree = _CoverTree(edges)
-    area, previous_x = 0.0, events[0][0]
-    for x, delta, low, high in events:
-        area += tree.covered() * (x - previous_x)
-        tree.add(low, high, delta)
-        previous_x = x
-    return area
+    return compute_backend().pdf_union_area(boxes)
 
 
 class _CoverTree:
@@ -725,6 +706,7 @@ def assess_page(
     ocr: OcrMode = "auto",
     recovered: RecoveredText | None = None,
     background: Backdrop | str | None = None,
+    _initial: PageAssessment | None = None,
 ) -> PageAssessment:
     """Classify a page's spans, check them against its background, measure its quality and route it.
 
@@ -766,8 +748,12 @@ def assess_page(
     width, height = page.geometry.width_pt, page.geometry.height_pt
     boxes = _scan_boxes(page.images.images)
     cover = _cover_fraction(boxes, width, height)
-    pieces = _classify(page.text.spans, width, height, boxes, cover)
-    own = _recovered_own(recovered, width, height, boxes, cover)
+    if _initial is not None and recovered is None:
+        pieces: tuple[SpanPiece, ...] = _initial.pieces
+        own: tuple[SpanPiece, ...] = ()
+    else:
+        pieces = _classify(page.text.spans, width, height, boxes, cover)
+        own = _recovered_own(recovered, width, height, boxes, cover)
     if isinstance(background, Backdrop):
         scale = _scale(background, width, height)
         pieces, own = _flag_background(pieces, background, scale), _flag_background(own, background, scale)
@@ -779,7 +765,7 @@ def assess_page(
     return PageAssessment(
         pieces=pieces,
         recovered_pieces=flagged,
-        quality=_quality(page, pieces + flagged),
+        quality=_quality(page, pieces + flagged, _initial=_initial),
         route=route,
         unmapped_regions=_unmapped_regions(pieces),
         warnings=warnings + _duplicate_warnings(unchecked) + _background_warnings(background),
@@ -1012,17 +998,21 @@ def _valid_char(char: str) -> bool:
     return char != _REPLACEMENT_CHAR and unicodedata.category(char) not in _INVALID_CATEGORIES
 
 
-def _quality(page: RawPage, pieces: tuple[SpanPiece, ...]) -> PageQuality:
+def _quality(page: RawPage, pieces: tuple[SpanPiece, ...], *, _initial: PageAssessment | None = None) -> PageQuality:
     """The page's quality signals; every span char, hidden or not, counts toward the ratio.
 
     ``pieces`` are the page's pieces, then the recovered ones: each span with
     a flagged piece counts once toward ``hidden_spans_flagged``.
     """
-    spans = page.text.spans
-    count = sum(len(span.text) for span in spans)
-    valid = sum(1 for span in spans for offset in range(len(span.text)) if _valid(span, offset))
+    if _initial is not None:
+        ratio, count = _initial.quality.valid_char_ratio, _initial.quality.char_count
+    else:
+        spans = page.text.spans
+        count = sum(len(span.text) for span in spans)
+        valid = sum(1 for span in spans for offset in range(len(span.text)) if _valid(span, offset))
+        ratio = valid / count if count else None
     return PageQuality(
-        valid_char_ratio=valid / count if count else None,
+        valid_char_ratio=ratio,
         char_count=count,
         vector_line_count=len(page.segments.segments),
         hidden_spans_flagged=_spans_flagged(pieces),

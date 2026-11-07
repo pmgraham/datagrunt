@@ -59,6 +59,10 @@ EXPECTED_RATIONALIZATION_ALL: tuple[str, ...] = (
     "GoogleCloudAuth",
     "TransientProviderError",
     "PermanentProviderError",
+    "BatchItem",
+    "BatchPlan",
+    "prepare_batch",
+    "ingest_batch",
 )
 
 EXPECTED_HINT = 'Install rationalization support with: uv pip install "datagrunt[rationalize]"'
@@ -276,7 +280,7 @@ def _fake_render(source: Path, page_index: int, *, dpi: int, password: str | Non
 class TestPublicNamespaceAndLazyExports:
     def test_rationalization_all_has_exact_21_names(self) -> None:
         assert tuple(datagrunt.rationalization.__all__) == EXPECTED_RATIONALIZATION_ALL
-        assert len(datagrunt.rationalization.__all__) == 21
+        assert len(datagrunt.rationalization.__all__) == 25
 
     @pytest.mark.parametrize("name", EXPECTED_RATIONALIZATION_ALL)
     def test_every_exported_name_is_accessible_and_in_dir(self, name: str) -> None:

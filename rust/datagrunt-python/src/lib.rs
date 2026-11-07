@@ -1,6 +1,6 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBytes, PyDict};
 use std::path::PathBuf;
 
 /// Map an IO error to a Python exception via PyO3's `From` impl, which
@@ -144,6 +144,65 @@ fn probe_csv_header(py: Python<'_>, path: PathBuf) -> PyResult<Py<PyDict>> {
     Ok(d.into())
 }
 
+#[pyfunction]
+fn pdf_char_bgr_medians(
+    py: Python<'_>,
+    pixels: &[u8],
+    px_width: usize,
+    px_height: usize,
+    scale_x: f64,
+    scale_y: f64,
+    boxes: Vec<(f64, f64, f64, f64)>,
+) -> Vec<(u8, u8, u8)> {
+    py.detach(|| {
+        datagrunt_core::pdf::pdf_char_bgr_medians(
+            pixels, px_width, px_height, scale_x, scale_y, &boxes,
+        )
+    })
+}
+
+#[pyfunction]
+fn pdf_union_area(py: Python<'_>, boxes: Vec<(f64, f64, f64, f64)>) -> f64 {
+    py.detach(|| datagrunt_core::pdf::pdf_union_area(&boxes))
+}
+
+#[pyfunction]
+fn pdf_char_reason_runs(
+    py: Python<'_>,
+    char_boxes: Vec<(f64, f64, f64, f64)>,
+    width: f64,
+    height: f64,
+    no_paint: bool,
+    under: Vec<(f64, f64, f64, f64)>,
+) -> Vec<(usize, usize, bool, bool)> {
+    py.detach(|| {
+        datagrunt_core::pdf::pdf_char_reason_runs(&char_boxes, width, height, no_paint, &under)
+    })
+}
+
+#[pyfunction]
+fn pdf_snap_and_merge_segments(
+    py: Python<'_>,
+    segments: Vec<(f64, f64, f64)>,
+    snap_pt: f64,
+) -> Vec<(f64, f64, f64)> {
+    py.detach(|| datagrunt_core::pdf::pdf_snap_and_merge_segments(&segments, snap_pt))
+}
+
+#[pyfunction]
+fn pdf_lzw_decode(
+    py: Python<'_>,
+    data: &[u8],
+    early: i32,
+    max_output: usize,
+) -> Vec<Py<PyBytes>> {
+    let chunks = py.detach(|| datagrunt_core::pdf::pdf_lzw_decode(data, early, max_output));
+    chunks
+        .into_iter()
+        .map(|chunk| PyBytes::new(py, &chunk).unbind())
+        .collect()
+}
+
 #[pymodule]
 #[pyo3(name = "_native")]
 fn datagrunt_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -161,5 +220,10 @@ fn datagrunt_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(check_ragged, m)?)?;
     m.add_function(wrap_pyfunction!(sniff_dialect, m)?)?;
     m.add_function(wrap_pyfunction!(probe_csv_header, m)?)?;
+    m.add_function(wrap_pyfunction!(pdf_char_bgr_medians, m)?)?;
+    m.add_function(wrap_pyfunction!(pdf_union_area, m)?)?;
+    m.add_function(wrap_pyfunction!(pdf_char_reason_runs, m)?)?;
+    m.add_function(wrap_pyfunction!(pdf_snap_and_merge_segments, m)?)?;
+    m.add_function(wrap_pyfunction!(pdf_lzw_decode, m)?)?;
     Ok(())
 }

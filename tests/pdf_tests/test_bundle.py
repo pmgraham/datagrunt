@@ -1620,3 +1620,47 @@ class TestOverwrite:
         with pytest.raises(TypeError, match="overwrite must be a bool"):
             write(bound_document(source), tmp_path / "out", source, overwrite=value)
         assert not (tmp_path / "out").exists()
+
+
+class TestImageAndRenderSkipping:
+    """``include_images=False`` and ``render_pages=False`` skip figure and/or page PNG rasterization."""
+
+    def test_render_pages_false_skips_page_images_and_keeps_figures(self, tmp_path, source, fast_render):
+        out = tmp_path / "out"
+        doc = write(bound_document(source), out, source, render_pages=False)
+
+        assert all(page.page_image is None for page in doc.pages)
+        assert all(fig.image_path is not None for fig in doc.figures)
+        assert not (out / "page_images").exists()
+        assert (out / "images").is_dir()
+        manifest = manifest_of(out)
+        assert manifest["extraction_params"]["render_pages"] is False
+        assert manifest["page_images"] == []
+        assert any(m["artifact"] == "page_image" and "render_pages=False" in m["reason"] for m in manifest["missing"])
+        assert load_bundle(out) == doc
+        # Reuse with identical flags
+        assert write(bound_document(source), out, source, render_pages=False) == doc
+
+    def test_include_images_false_skips_figures_and_page_images(self, tmp_path, source, fast_render):
+        out = tmp_path / "out"
+        doc = write(bound_document(source), out, source, include_images=False)
+
+        assert all(page.page_image is None for page in doc.pages)
+        assert all(fig.image_path is None for fig in doc.figures)
+        assert not (out / "page_images").exists()
+        assert not (out / "images").exists()
+        manifest = manifest_of(out)
+        assert manifest["extraction_params"]["include_images"] is False
+        assert manifest["page_images"] == []
+        assert any(m["artifact"] == "figure" and "include_images=False" in m["reason"] for m in manifest["missing"])
+        assert any(m["artifact"] == "page_image" and "include_images=False" in m["reason"] for m in manifest["missing"])
+        assert load_bundle(out) == doc
+        # Reuse with identical flags
+        assert write(bound_document(source), out, source, include_images=False) == doc
+
+    @pytest.mark.parametrize("param", ["include_images", "render_pages"])
+    @pytest.mark.parametrize("value", [1, None, "no"])
+    def test_flags_must_be_bool(self, tmp_path, source, param, value):
+        with pytest.raises(TypeError, match=f"{param} must be a bool"):
+            write(bound_document(source), tmp_path / "out", source, **{param: value})
+        assert not (tmp_path / "out").exists()

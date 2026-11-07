@@ -22,6 +22,7 @@ was on an error page and gives the rest to a new worker.
 import json
 import os
 import pickle
+import sys
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from functools import partial
@@ -29,7 +30,7 @@ from typing import IO, NamedTuple, TypeVar
 
 from datagrunt.pdf import pipeline
 from datagrunt.pdf._memory_cap import CAP_EXIT, Lifetime, apply_memory_cap
-from datagrunt.pdf._process import error_reply, send_message
+from datagrunt.pdf._process import MAX_REQUEST_BYTES, error_reply, read_message, send_message
 from datagrunt.pdf.assembly import assemble_page
 from datagrunt.pdf.elements import Page
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFSourceChangedError
@@ -67,6 +68,7 @@ from datagrunt.pdf.vision import fallback_page, vision_page
 __all__ = ["extract_page_at"]
 
 _T = TypeVar("_T")
+_IDLE_LIFETIME_S = 3600.0
 
 # Each page's begun steps, said to the caller: the page's index. extract_page_at says nothing.
 Progress = Callable[[int], None]
@@ -97,6 +99,37 @@ def _worker_main(message: object, replies: IO[bytes]) -> None:
         send_message(replies, _ERROR + error_reply(exc))
         return
     send_message(replies, _DONE)
+
+
+def _pool_worker_main(replies: IO[bytes]) -> None:
+    """A persistent page worker for :class:`~datagrunt.pdf.pipeline.PageWorkerPool`: loops over chunks on stdin."""
+    lifetime: Lifetime | None = None
+    while True:
+        if lifetime is not None:
+            lifetime.extend(_IDLE_LIFETIME_S)
+        raw = read_message(sys.stdin.buffer, MAX_REQUEST_BYTES)
+        if raw is None:
+            return
+        try:
+            message = json.loads(raw)
+            request = pipeline._chunk_request(message)
+            if lifetime is None:
+                lifetime = apply_memory_cap(request.memory_cap_bytes, pipeline._facts_bound_s())
+            else:
+                lifetime.extend(pipeline._facts_bound_s())
+            _extract(request, replies, lifetime)
+        except MemoryError:
+            os._exit(CAP_EXIT)
+        except Exception as exc:  # sent, and raised by the caller: never swallowed here
+            try:
+                send_message(replies, _ERROR + error_reply(exc))
+            except OSError:
+                return
+            continue
+        try:
+            send_message(replies, _DONE)
+        except OSError:
+            return
 
 
 def _extract(request: ChunkRequest, replies: IO[bytes], lifetime: Lifetime) -> None:
@@ -357,7 +390,9 @@ def _finished(item: _Assessed, drawn: _Drawn | None, source: PDFSource, options:
     background = _background(item, drawn)
     assessment = item.assessment
     if background is not None:
-        assessment = assess_page(item.raw, ocr=options.ocr, recovered=item.recovered, background=background)
+        assessment = assess_page(
+            item.raw, ocr=options.ocr, recovered=item.recovered, background=background, _initial=item.assessment
+        )
     return _routed(item.raw, assessment, source, options)
 
 

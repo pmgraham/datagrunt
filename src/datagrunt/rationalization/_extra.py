@@ -41,10 +41,18 @@ LAZY_CLASSES = MappingProxyType(
         "OpenAICompatibleProvider": "datagrunt.rationalization.providers.openai_compatible",
         "AnthropicProvider": "datagrunt.rationalization.providers.anthropic",
         "GeminiProvider": "datagrunt.rationalization.providers.gemini",
+        "BatchItem": "datagrunt.rationalization.batch",
+        "BatchPlan": "datagrunt.rationalization.batch",
     }
 )
 # Each lazily loaded function, and the module that defines it.
-LAZY_FUNCTIONS = MappingProxyType({"rationalize": "datagrunt.rationalization.api"})
+LAZY_FUNCTIONS = MappingProxyType(
+    {
+        "rationalize": "datagrunt.rationalization.api",
+        "prepare_batch": "datagrunt.rationalization.batch",
+        "ingest_batch": "datagrunt.rationalization.batch",
+    }
+)
 
 # The [rationalize] extra's top-level import names, each with its package's name.
 _EXTRA_PACKAGES = MappingProxyType({"pydantic": "pydantic", "httpx": "httpx"})
@@ -143,6 +151,27 @@ def _hint(name: str, missing: tuple[str, ...], cause: ImportError) -> str:
 
 def _stand_in(is_class: bool, name: str, missing: tuple[str, ...], cause: ImportError) -> Callable[..., object]:
     """The stand-in for ``name``: a class, or a function (see the module notes)."""
+    return _stand_in_cached(
+        is_class,
+        name,
+        missing,
+        isinstance(cause, ModuleNotFoundError),
+        str(cause),
+        getattr(cause, "name", None),
+    )
+
+
+@functools.cache
+def _stand_in_cached(
+    is_class: bool,
+    name: str,
+    missing: tuple[str, ...],
+    is_module_not_found: bool,
+    cause_text: str,
+    cause_name: str | None,
+) -> Callable[..., object]:
+    cls: type[ImportError] = ModuleNotFoundError if is_module_not_found else ImportError
+    cause = cls(cause_text, name=cause_name) if cause_name is not None else cls(cause_text)
     if is_class:
         return _stand_in_class(name, missing, cause)
     return _stand_in_function(name, missing, cause)

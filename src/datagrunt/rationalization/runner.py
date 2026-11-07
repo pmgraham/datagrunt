@@ -549,6 +549,7 @@ class ProviderSnapshot:
         schema_sha256: The prepared schema it was made for (``PreparedSchema.sha256``).
         generate: Its ``generate`` method, read once.
         open: Its ``open`` method, read once, or ``None``.
+        max_concurrency: Its optional per-provider concurrency cap (1-:data:`CONCURRENCY_LIMIT`), or ``None``.
 
     Raises:
         TypeError: If a field has the wrong type.
@@ -566,6 +567,7 @@ class ProviderSnapshot:
     schema_sha256: str
     generate: Callable[[ModelRequest], object] = field(repr=False)
     open: Callable[[], object] | None = field(repr=False)
+    max_concurrency: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("model_id", "provider_kind", "rate_key"):
@@ -578,6 +580,8 @@ class ProviderSnapshot:
         _parse_object("provider_schema_json", self.provider_schema_json)
         if self.max_connections is not None:
             _check_int("max_connections", self.max_connections, 1, MAX_CONNECTIONS_LIMIT)
+        if self.max_concurrency is not None:
+            _check_int("max_concurrency", self.max_concurrency, 1, CONCURRENCY_LIMIT)
         _check_digest("schema_sha256", self.schema_sha256)
         _check_callable("generate", self.generate)
         _check_callable("open", self.open, optional=True)
@@ -755,15 +759,18 @@ def _read_params(obj: object, owner: str) -> dict[str, Any]:
     return copy
 
 
-def _read_optional(obj: object, owner: str) -> tuple[Callable[[], object] | None, int | None]:
-    """The provider's ``open`` method and ``max_connections``, each ``None`` when it has no real such member."""
+def _read_optional(obj: object, owner: str) -> tuple[Callable[[], object] | None, int | None, int | None]:
+    """The provider's ``open`` method, ``max_connections`` and ``max_concurrency``, each ``None`` when absent."""
     opener = _read(obj, owner, "open") if has_real_member(obj, "open") else None
     if opener is not None and not callable(opener):
         _refuse(owner, "open must be callable")
     connections = _read(obj, owner, "max_connections") if has_real_member(obj, "max_connections") else None
     if connections is not None and (type(connections) is not int or not 1 <= connections <= MAX_CONNECTIONS_LIMIT):
         _refuse(owner, f"max_connections must be an int in 1-{MAX_CONNECTIONS_LIMIT}")
-    return cast(Callable[[], object] | None, opener), connections
+    concurrency = _read(obj, owner, "max_concurrency") if has_real_member(obj, "max_concurrency") else None
+    if concurrency is not None and (type(concurrency) is not int or not 1 <= concurrency <= CONCURRENCY_LIMIT):
+        _refuse(owner, f"max_concurrency must be an int in 1-{CONCURRENCY_LIMIT}")
+    return cast(Callable[[], object] | None, opener), connections, concurrency
 
 
 def _snapshot(obj: object, schema: PreparedSchema) -> ProviderSnapshot:
@@ -781,7 +788,7 @@ def _snapshot(obj: object, schema: PreparedSchema) -> ProviderSnapshot:
     params = _read_params(obj, owner)
     transform = cast(Callable[[Mapping[str, Any]], object], _read_callable(obj, owner, "transform_schema"))
     generate = cast(Callable[[ModelRequest], object], _read_callable(obj, owner, "generate"))
-    opener, connections = _read_optional(obj, owner)
+    opener, connections, concurrency = _read_optional(obj, owner)
     transformed = transform(schema.wrapper)
     if not isinstance(transformed, Mapping):
         _refuse(owner, f"transform_schema must return a JSON object (a Mapping), got {type(transformed).__name__}")
@@ -800,6 +807,7 @@ def _snapshot(obj: object, schema: PreparedSchema) -> ProviderSnapshot:
         schema_sha256=schema.sha256,
         generate=generate,
         open=opener,
+        max_concurrency=concurrency,
     )
 
 
@@ -987,13 +995,16 @@ class _TokenBucket:
 
 
 def _slot_counts(providers: Sequence[ProviderSnapshot], limits: RunLimits) -> dict[str, int]:
-    """Each rate key's slots: ``max_concurrency_per_provider``, cut to the smallest ``max_connections`` among the
-    providers sharing the key (each has its own pool), so no request waits on a connection pool."""
+    """Each rate key's slots: ``max_concurrency_per_provider``, cut to the smallest ``max_connections`` and
+    ``max_concurrency`` among the providers sharing the key (each has its own pool), so no request waits on a
+    connection pool or exceeds a provider's concurrency cap."""
     counts: dict[str, int] = {}
     for provider in providers:
         size = counts.get(provider.rate_key, limits.max_concurrency_per_provider)
         if provider.max_connections is not None:
             size = min(size, provider.max_connections)
+        if provider.max_concurrency is not None:
+            size = min(size, provider.max_concurrency)
         counts[provider.rate_key] = size
     return counts
 
