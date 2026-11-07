@@ -190,12 +190,7 @@ fn pdf_snap_and_merge_segments(
 }
 
 #[pyfunction]
-fn pdf_lzw_decode(
-    py: Python<'_>,
-    data: &[u8],
-    early: i32,
-    max_output: usize,
-) -> Vec<Py<PyBytes>> {
+fn pdf_lzw_decode(py: Python<'_>, data: &[u8], early: i32, max_output: usize) -> Vec<Py<PyBytes>> {
     let chunks = py.detach(|| datagrunt_core::pdf::pdf_lzw_decode(data, early, max_output));
     chunks
         .into_iter()
