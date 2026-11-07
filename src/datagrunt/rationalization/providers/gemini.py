@@ -273,17 +273,20 @@ ApiKind: TypeAlias = Literal["gemini", "google-cloud-gemini"]
 
 
 def _check_thinking_level(value: object) -> ThinkingLevel | None:
-    """``None``, or ``"LOW"``, ``"MEDIUM"`` or ``"HIGH"`` (a ``str``, never a subclass); never echoes ``value``."""
+    """``None``, or ``"LOW"``, ``"MEDIUM"`` or ``"HIGH"`` (a ``str``, never a subclass, stripped and uppercased);
+    never echoes ``value``."""
     if value is None:
         return None
     if type(value) is not str:
         kind = type(value).__name__
         del value
         raise RationalizationError(f"thinking_level must be None or a str, got {kind}")
-    if value not in THINKING_LEVELS:
-        del value
+    normalized = value.strip().upper()
+    del value
+    if normalized not in THINKING_LEVELS:
+        del normalized
         raise RationalizationError('thinking_level must be None, "LOW", "MEDIUM" or "HIGH"')
-    return cast(ThinkingLevel, value)
+    return cast(ThinkingLevel, normalized)
 
 
 def _check_temperature(value: object) -> float | None:
@@ -821,7 +824,7 @@ class GeminiProvider:
         api_key: "str | _Secret | None" = None,
         temperature: float | None = None,
         seed: int | None = 0,
-        thinking_level: ThinkingLevel | None = None,
+        thinking_level: ThinkingLevel | str | None = None,
         max_connections: int = 8,
         transport: object = None,
     ) -> None:
@@ -845,7 +848,7 @@ class GeminiProvider:
         auth: GoogleCloudAuth,
         temperature: float | None = None,
         seed: int | None = 0,
-        thinking_level: ThinkingLevel | None = None,
+        thinking_level: ThinkingLevel | str | None = None,
         max_connections: int = 8,
         transport: object = None,
     ) -> "GeminiProvider":
@@ -899,7 +902,7 @@ class GeminiProvider:
         auth: GoogleCloudAuth,
         temperature: float | None = None,
         seed: int | None = 0,
-        thinking_level: ThinkingLevel | None = None,
+        thinking_level: ThinkingLevel | str | None = None,
         max_connections: int = 8,
         transport: object = None,
     ) -> "GeminiProvider":
