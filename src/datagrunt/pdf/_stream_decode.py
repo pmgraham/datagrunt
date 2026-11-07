@@ -53,6 +53,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from types import MappingProxyType
 from typing import Protocol
 
+from datagrunt.pdf._compute import backend as compute_backend
 from datagrunt.pdf._validate import int_at_least
 
 # The most bytes a decoder hands on at once (and reads at once from the raw stream).
@@ -146,7 +147,7 @@ def decoded_pieces(
     last = len(filters) - 1
     for index, name in enumerate(filters):
         bound = limit if index == last else encoded_limit(limit)
-        pieces = _limited(_decoded(_decoder(name, early), pieces), name, bound, charge)
+        pieces = _limited(_decoded(_decoder(name, early, bound), pieces), name, bound, charge)
     return pieces
 
 
@@ -175,11 +176,11 @@ def _chunks(raw: bytes) -> Iterator[bytes]:
         yield bytes(view[start : start + _CHUNK])
 
 
-def _decoder(name: str, early: int) -> _Decoder:
+def _decoder(name: str, early: int, bound: int = _CHUNK) -> _Decoder:
     """A fresh decoder for filter ``name``."""
     makers: dict[str, Callable[[], _Decoder]] = {
         "FlateDecode": _Flate,
-        _LZW: lambda: _Lzw(early),
+        _LZW: lambda: _Lzw(early, bound),
         "ASCII85Decode": _Ascii85,
         "ASCIIHexDecode": _AsciiHex,
         "RunLengthDecode": _RunLength,
@@ -258,108 +259,29 @@ class _Flate:
 class _Lzw:
     """LZWDecode, read as pdfium reads it (see the module notes), with one ``/EarlyChange``."""
 
-    def __init__(self, early: int) -> None:
+    def __init__(self, early: int, bound: int = _CHUNK) -> None:
         self.done = False
         self._early = early
-        self._width = 9
-        self._prefix: list[int] = []
-        self._char: list[int] = []
-        # Each entry's string while it is fixed (kept to its last _LZW_STACK bytes, all a code decodes to); else None.
-        self._text: list[bytes | None] = []
-        self._old = -1
-        self._last = 0
-        self._bits = 0
-        self._bit_count = 0
-        self._out = bytearray()
+        self._bound = bound
+        self._in = bytearray()
 
     def feed(self, data: bytes) -> Iterator[bytes]:
-        for byte in data:  # bounded: the input; a byte completes at most one code (9 bits or more)
-            if self.done:
-                return
-            self._bits = (self._bits << 8) | byte
-            self._bit_count += 8
-            if self._bit_count >= self._width:
-                self._bit_count -= self._width
-                code = self._bits >> self._bit_count
-                self._bits &= (1 << self._bit_count) - 1
-                self._code(code)
-            if len(self._out) >= _CHUNK:
-                yield from _full_pieces(self._out)
+        if self.done:
+            return
+        self._in += data
+        if len(self._in) >= _CHUNK:
+            pieces = compute_backend().pdf_lzw_decode(bytes(self._in), self._early, self._bound)
+            if sum(len(piece) for piece in pieces) > self._bound:
+                self.done = True
+                self._in.clear()
+                yield from pieces
 
     def finish(self) -> Iterator[bytes]:
-        # Bits left over, fewer than a code, are not read (as in pdfium).
-        yield from _all_pieces(self._out)
-
-    def _code(self, code: int) -> None:
-        """Decode one code: pdfium's CLZWDecoder::Decode loop body."""
-        if code < 256:
-            self._out.append(code)
-            self._last = code
-            if self._old >= 0:
-                self._add(self._old, code)
-            self._old = code
-            return
-        if code == 256:
-            self._width = 9
-            self._prefix.clear()
-            self._char.clear()
-            self._text.clear()
-            self._old = -1
-            return
-        if code == 257 or self._old < 0:
-            # The end of the data; or a code past the literals before any entry, where pdfium fails.
+        if self._in and not self.done:
+            pieces = compute_backend().pdf_lzw_decode(bytes(self._in), self._early, self._bound)
+            self._in.clear()
             self.done = True
-            return
-        if code - 258 >= len(self._prefix):
-            text = self._string(self._old, _LZW_STACK - 1) + bytes([self._last])
-        else:
-            text = self._string(code, _LZW_STACK)
-        self._out += text
-        self._last = text[0]
-        if self._old >= 258 and self._old - 258 >= len(self._prefix):
-            self.done = True  # pdfium stops after decoding a code past the table and another
-            return
-        self._add(self._old, self._last)
-        self._old = code
-
-    def _string(self, code: int, room: int) -> bytes:
-        """What ``code`` decodes to, its last ``room`` bytes at most (pdfium's DecodeString)."""
-        index = code - 258
-        if index < 0 or index >= len(self._prefix):
-            return bytes([code & 0xFF])
-        fixed = self._text[index]
-        if fixed is not None:
-            return fixed[-room:]
-        return self._walked(code, room)
-
-    def _walked(self, code: int, room: int) -> bytes:
-        """``code``'s string by walking its prefixes, as pdfium does, for an entry whose prefix came later."""
-        pushed = bytearray()
-        for _ in range(room):  # bounded: pdfium's decode stack
-            index = code - 258
-            if index < 0 or index >= len(self._prefix):
-                pushed.append(code & 0xFF)
-                break
-            pushed.append(self._char[index])
-            code = self._prefix[index]
-        pushed.reverse()
-        return bytes(pushed)
-
-    def _add(self, prefix: int, char: int) -> None:
-        """Add the entry ``prefix`` + ``char`` (pdfium's AddCode), widening the codes at its table sizes."""
-        index = len(self._prefix)
-        if index + self._early >= _LZW_TABLE:
-            return
-        if prefix < 256:
-            text: bytes | None = bytes([prefix, char])
-        else:
-            before = prefix - 258
-            known = self._text[before] if 0 <= before < index else None
-            text = (known + bytes([char]))[-_LZW_STACK:] if known is not None else None
-        self._prefix.append(prefix)
-        self._char.append(char)
-        self._text.append(text)
-        self._width = _LZW_WIDTHS.get(index + 1 + self._early, self._width)
+            yield from pieces
 
 
 class _Ascii85:

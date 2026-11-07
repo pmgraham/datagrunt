@@ -103,6 +103,10 @@ __all__ = [
     "Key",
     "rationalize",
     "RationalizedResult",
+    "BatchItem",
+    "BatchPlan",
+    "prepare_batch",
+    "ingest_batch",
 ]
 
 # Each CSV, Excel and Parquet name, and the module that defines it: imported at its first access (#439).
@@ -126,7 +130,9 @@ _PDF_DIRECT_NAMES = _MappingProxyType(
         "load_corpus": "datagrunt.pdf.corpus",
     }
 )
-_RATIONALIZE_NAMES = frozenset({"rationalize", "RationalizedResult"})
+_RATIONALIZE_NAMES = frozenset(
+    {"rationalize", "RationalizedResult", "BatchItem", "BatchPlan", "prepare_batch", "ingest_batch"}
+)
 # The subpackages that ``import datagrunt`` bound as its attributes when it imported these APIs eagerly: each is
 # still an attribute, imported at its first access.
 _SUBPACKAGES = frozenset({"core", "csv_api", "excel_api", "parquet_api"})
@@ -146,7 +152,14 @@ if TYPE_CHECKING:
         load_corpus,
         write_bundle,
     )
-    from datagrunt.rationalization import RationalizedResult, rationalize
+    from datagrunt.rationalization import (
+        BatchItem,
+        BatchPlan,
+        RationalizedResult,
+        ingest_batch,
+        prepare_batch,
+        rationalize,
+    )
 
 
 def __getattr__(name: str) -> object:

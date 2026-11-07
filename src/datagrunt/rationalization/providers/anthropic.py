@@ -780,7 +780,7 @@ class AnthropicProvider:
             has no explicit key; the message names the option or the variable and never shows a key.
     """
 
-    __slots__ = ("_http", "_max_connections", "_model", "_route", "_temperature")
+    __slots__ = ("_http", "_max_concurrency", "_max_connections", "_model", "_route", "_temperature")
 
     def __init__(
         self,
@@ -830,6 +830,7 @@ class AnthropicProvider:
         connections = _check_max_connections(max_connections)
         self._http = _http_client(connections, allow_insecure_http, transport)
         self._max_connections = connections
+        self._max_concurrency: int | None = None
         self._route = route
         self._model = model
         self._temperature = temperature
@@ -942,6 +943,18 @@ class AnthropicProvider:
     def max_connections(self) -> int:
         """The HTTP connection pool size (read-only); the runner sizes its per-provider concurrency within it."""
         return self._max_connections
+
+    @property
+    def max_concurrency(self) -> int | None:
+        """Optional per-provider concurrency cap (1-64), or ``None``."""
+        return self._max_concurrency
+
+    def with_max_concurrency(self, max_concurrency: int | None) -> "AnthropicProvider":
+        """Configure a per-provider concurrency cap (1-64, or ``None``) and return ``self``."""
+        if max_concurrency is not None and (type(max_concurrency) is not int or not 1 <= max_concurrency <= 64):
+            _refuse("max_concurrency must be None or an int in 1-64")
+        self._max_concurrency = max_concurrency
+        return self
 
     @property
     def generation_params(self) -> dict[str, Any]:

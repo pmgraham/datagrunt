@@ -254,3 +254,50 @@ class TestBatchExtractionAndLoading:
         bundle_doc_json.write_bytes(b"{corrupt")
         with pytest.raises(BundleCorruptError):
             load_corpus(out)
+
+    def test_extract_corpus_without_page_renders_or_images(self, tmp_path, sample_pdfs):
+        pdf_a, pdf_b = sample_pdfs
+        out = tmp_path / "corpus_no_images"
+        first = extract_corpus(
+            [pdf_a, pdf_b],
+            out,
+            dpi=72,
+            vision_dpi=72,
+            include_images=False,
+            render_pages=False,
+        )
+        assert len(first.entries) == 2
+        assert all(not e.reused for e in first.entries)
+        for bundle_path in first.bundle_paths:
+            assert not (bundle_path / "page_images").exists()
+            assert not (bundle_path / "images").exists()
+            assert (bundle_path / "json" / "document.json").is_file()
+
+        second = extract_corpus(
+            [pdf_a, pdf_b],
+            out,
+            dpi=72,
+            vision_dpi=72,
+            include_images=False,
+            render_pages=False,
+            overwrite=False,
+        )
+        assert all(e.reused for e in second.entries)
+        docs = second.load_documents()
+        assert len(docs) == 2
+        assert all(page.page_image is None for doc in docs for page in doc.pages)
+
+    def test_page_worker_pool_reuses_worker_process_across_documents(self, tmp_path, sample_pdfs):
+        from datagrunt.pdf.pipeline import PageWorkerPool, extract_document
+
+        pdf_a, pdf_b = sample_pdfs
+        with PageWorkerPool() as pool:
+            doc_a = extract_document(pdf_a, dpi=72, vision_dpi=72, _worker_pool=pool)
+            assert len(pool._idle) == 1
+            first_pid = pool._idle[0][0].pid
+            doc_b = extract_document(pdf_b, dpi=72, vision_dpi=72, _worker_pool=pool)
+            assert len(pool._idle) == 1
+            assert pool._idle[0][0].pid == first_pid
+        assert doc_a.page_count == 1
+        assert doc_b.page_count == 2
+        assert pool._idle == []

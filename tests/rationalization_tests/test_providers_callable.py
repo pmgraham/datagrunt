@@ -439,3 +439,75 @@ def test_imports_only_the_stdlib_and_the_package_and_nothing_inside_functions():
     assert nested == []
     assert foreign == []
     assert [m for m in modules if m.startswith("datagrunt.rationalization.providers.http")] == []
+
+
+def test_callable_provider_with_max_concurrency():
+    base = CallableProvider("callable:fast", answer)
+    assert base.max_concurrency is None
+
+    capped = base.with_max_concurrency(2)
+    assert capped is base
+    assert base.max_concurrency == 2
+
+    uncapped = capped.with_max_concurrency(None)
+    assert uncapped is base
+    assert base.max_concurrency is None
+
+    for bad in (0, -1, 65, True, False, "2", 2.0):
+        with pytest.raises(RationalizationError, match="max_concurrency"):
+            base.with_max_concurrency(bad)  # type: ignore[arg-type]
+
+
+def test_envelope_include_schema_trimming():
+    from datagrunt.rationalization.envelope import _SCHEMA_LEAD, Envelope, new_nonce
+
+    schema_json = '{"properties":{"x":{"type":"integer"}},"required":["x"],"type":"object"}'
+    payload = (
+        '<document id="doc1">\n<elements>\n'
+        '<el id="p0001_e000" kind="paragraph" page="1">\nx=1\n</el>\n'
+        "</elements>\n</document>"
+    )
+    env_with = Envelope(
+        unit_id="u0000",
+        prompt="Extract x.",
+        schema_json=schema_json,
+        context_json="null",
+        payload=payload,
+        header_element_ids=(),
+        include_schema=True,
+    )
+    env_without = Envelope(
+        unit_id="u0000",
+        prompt="Extract x.",
+        schema_json=schema_json,
+        context_json="null",
+        payload=payload,
+        header_element_ids=(),
+        include_schema=False,
+    )
+    nonce = new_nonce()
+    sys_with, user_with = env_with.render(nonce)
+    sys_without, user_without = env_without.render(nonce)
+
+    assert _SCHEMA_LEAD in sys_with
+    assert schema_json in sys_with
+    assert _SCHEMA_LEAD not in sys_without
+    assert schema_json not in sys_without
+    assert user_with == user_without
+    assert len(sys_without) < len(sys_with)
+    # Cache key material remains identical because provider_schema is hashed separately by request_key().
+    assert env_with.key_material() == env_without.key_material()
+
+
+def test_every_rationalization_module_has_no_imports_inside_functions():
+    rat_dir = Path(callable_module.__file__).resolve().parents[1]
+    py_files = sorted(rat_dir.rglob("*.py"))
+    assert len(py_files) >= 15
+    offenders: list[str] = []
+    for path in py_files:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for fn in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+            for inner in ast.walk(fn):
+                if isinstance(inner, (ast.Import, ast.ImportFrom)):
+                    offenders.append(f"{path.relative_to(rat_dir)}:{inner.lineno}")
+    assert offenders == []

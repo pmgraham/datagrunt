@@ -303,6 +303,21 @@ def _checked_box(name: str, box: object, *, allow_empty: bool) -> Box:
     return left, bottom, right, top
 
 
+def _to_display_checked(box: Box, *, rotation: int, page_box: Box) -> Box:
+    """Map ``box`` to display coordinates given pre-checked ``rotation`` and ``page_box``."""
+    left, bottom, right, top = _checked_box("box", box, allow_empty=True)
+    page_left, page_bottom, page_right, page_top = page_box
+    match rotation:
+        case 0:
+            return left - page_left, page_top - top, right - page_left, page_top - bottom
+        case 90:
+            return bottom - page_bottom, left - page_left, top - page_bottom, right - page_left
+        case 180:
+            return page_right - right, bottom - page_bottom, page_right - left, top - page_bottom
+        case _:  # 270: the only value left after _checked_rotation
+            return page_top - top, page_right - right, page_top - bottom, page_right - left
+
+
 def to_display_box(box: Box, *, rotation_deg: int, page_box: Box) -> Box:
     """Map a pdfium page-space box to a displayed, top-left box.
 
@@ -325,17 +340,9 @@ def to_display_box(box: Box, *, rotation_deg: int, page_box: Box) -> Box:
             not finite, ``box`` has reversed edges, or ``page_box`` is empty.
     """
     rotation = _checked_rotation(rotation_deg)
-    left, bottom, right, top = _checked_box("box", box, allow_empty=True)
-    page_left, page_bottom, page_right, page_top = _checked_box("page_box", page_box, allow_empty=False)
-    match rotation:
-        case 0:
-            return left - page_left, page_top - top, right - page_left, page_top - bottom
-        case 90:
-            return bottom - page_bottom, left - page_left, top - page_bottom, right - page_left
-        case 180:
-            return page_right - right, bottom - page_bottom, page_right - left, top - page_bottom
-        case _:  # 270: the only value left after _checked_rotation
-            return page_top - top, page_right - right, page_top - bottom, page_right - left
+    _checked_box("box", box, allow_empty=True)
+    checked_page = _checked_box("page_box", page_box, allow_empty=False)
+    return _to_display_checked(box, rotation=rotation, page_box=checked_page)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -757,12 +764,20 @@ def _opened_textpage(page: pdfium.PdfPage, page_number: int) -> Iterator[pdfium.
         textpage.close()
 
 
-def _read_page_text(page: pdfium.PdfPage, geometry: PageGeometry) -> PageText:
-    """Read a loaded page's spans, closing its textpage."""
+def _read_page_text_and_objects(
+    page: pdfium.PdfPage, geometry: PageGeometry
+) -> tuple[PageText, list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]]:
+    """Read a loaded page's spans and walked object tree once, closing its textpage."""
     page_number = geometry.page_number
     with _opened_textpage(page, page_number) as textpage, _pdfium_errors(page_number):
-        walk = _text_walk(_page_objects(page.raw, max_objects=MAX_PAGE_OBJECTS))
-        return collect_text(textpage.raw, _display_mapping(geometry), walk).page_text
+        objects = _page_objects(page.raw, max_objects=MAX_PAGE_OBJECTS)
+        walk = _text_walk(objects)
+        return collect_text(textpage.raw, _display_mapping(geometry), walk).page_text, objects
+
+
+def _read_page_text(page: pdfium.PdfPage, geometry: PageGeometry) -> PageText:
+    """Read a loaded page's spans, closing its textpage."""
+    return _read_page_text_and_objects(page, geometry)[0]
 
 
 def page_text(handle: DocumentHandle, index: int) -> PageText:
@@ -940,28 +955,40 @@ def _objects_in_forms(
 
 
 def _placed_objects(
-    page_raw: pdfium_c.FPDF_PAGE, kind: int, *, max_objects: int
+    page_raw: pdfium_c.FPDF_PAGE,
+    kind: int,
+    *,
+    max_objects: int,
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
 ) -> Iterator[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix]]:
     """Each page object of type ``kind`` (not a form) with its walk index and its matrix to page space.
 
     ``max_objects`` bounds the walk as :func:`_page_objects` does.
     """
-    for index, obj, own, outer in _objects_in_forms(_page_objects(page_raw, max_objects=max_objects), kind):
+    walked = _page_objects(page_raw, max_objects=max_objects) if objects is None else objects
+    for index, obj, own, outer in _objects_in_forms(walked, kind):
         yield index, obj, own.then(outer)
 
 
 def _display_mapping(geometry: PageGeometry) -> Callable[[Box], Box]:
     """:func:`to_display_box` for the page ``geometry`` describes."""
-    return partial(to_display_box, rotation_deg=geometry.rotation_deg, page_box=geometry.page_box)
+    rotation = _checked_rotation(geometry.rotation_deg)
+    checked_page = _checked_box("page_box", geometry.page_box, allow_empty=False)
+    return partial(_to_display_checked, rotation=rotation, page_box=checked_page)
 
 
-def _collect_segments(page_raw: pdfium_c.FPDF_PAGE, geometry: PageGeometry) -> PageSegments:
+def _collect_segments(
+    page_raw: pdfium_c.FPDF_PAGE,
+    geometry: PageGeometry,
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
+) -> PageSegments:
     """The segments of every path object on the page, forms' included, in object-walk order, within the bounds."""
     to_display = _display_mapping(geometry)
     segments: list[RawSegment] = []
     skipped = 0
     room = _SegmentRoom()
-    for index, path, matrix in _placed_objects(page_raw, pdfium_c.FPDF_PAGEOBJ_PATH, max_objects=MAX_PAGE_OBJECTS):
+    placed = _placed_objects(page_raw, pdfium_c.FPDF_PAGEOBJ_PATH, max_objects=MAX_PAGE_OBJECTS, objects=objects)
+    for index, path, matrix in placed:
         found = _path_object_segments(path, index, matrix, to_display, room)
         if found is None:
             skipped += 1
@@ -970,10 +997,14 @@ def _collect_segments(page_raw: pdfium_c.FPDF_PAGE, geometry: PageGeometry) -> P
     return PageSegments(segments=tuple(segments), stats=SegmentStats(skipped_nonfinite_paths=skipped))
 
 
-def _read_segments(page: pdfium.PdfPage, geometry: PageGeometry) -> PageSegments:
+def _read_segments(
+    page: pdfium.PdfPage,
+    geometry: PageGeometry,
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
+) -> PageSegments:
     """Read a loaded page's segments."""
     with _pdfium_errors(geometry.page_number):
-        return _collect_segments(page.raw, geometry)
+        return _collect_segments(page.raw, geometry, objects=objects)
 
 
 def page_segments(handle: DocumentHandle, index: int) -> PageSegments:
@@ -1009,10 +1040,14 @@ def page_segments(handle: DocumentHandle, index: int) -> PageSegments:
         page.close()
 
 
-def _read_images(page: pdfium.PdfPage, geometry: PageGeometry) -> PageImages:
+def _read_images(
+    page: pdfium.PdfPage,
+    geometry: PageGeometry,
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
+) -> PageImages:
     """Read a loaded page's image objects (no pixel is decoded)."""
     with _pdfium_errors(geometry.page_number):
-        placed = _placed_objects(page.raw, pdfium_c.FPDF_PAGEOBJ_IMAGE, max_objects=MAX_PAGE_OBJECTS)
+        placed = _placed_objects(page.raw, pdfium_c.FPDF_PAGEOBJ_IMAGE, max_objects=MAX_PAGE_OBJECTS, objects=objects)
         return collect_images(placed, page.raw, geometry.page_box, _display_mapping(geometry))
 
 
@@ -1147,14 +1182,19 @@ class ObjectBoxes:
         int_at_least("unboxed", self.unboxed, 0)
 
 
-def _collect_object_boxes(page_raw: pdfium_c.FPDF_PAGE, geometry: PageGeometry) -> ObjectBoxes:
+def _collect_object_boxes(
+    page_raw: pdfium_c.FPDF_PAGE,
+    geometry: PageGeometry,
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
+) -> ObjectBoxes:
     """The displayed box of every non-text, non-form object on the page, forms' contents included, in walk order."""
     to_display = _display_mapping(geometry)
-    objects = _page_objects(page_raw, max_objects=MAX_PAGE_OBJECTS)
+    walked = _page_objects(page_raw, max_objects=MAX_PAGE_OBJECTS) if objects is None else objects
     form_matrices: dict[int, Matrix] = {}
     boxes: list[Box] = []
     unboxed = 0
-    for index, (obj, form) in enumerate(objects):  # bounded: the walk's objects
+    bounds_buf = (ctypes.c_float(), ctypes.c_float(), ctypes.c_float(), ctypes.c_float())
+    for index, (obj, form) in enumerate(walked):  # bounded: the walk's objects
         kind = pdfium_c.FPDFPageObj_GetType(obj)
         outer = form_matrices[form] if form >= 0 else IDENTITY
         if kind == pdfium_c.FPDF_PAGEOBJ_FORM:
@@ -1163,7 +1203,7 @@ def _collect_object_boxes(page_raw: pdfium_c.FPDF_PAGE, geometry: PageGeometry) 
             continue
         if kind == pdfium_c.FPDF_PAGEOBJ_TEXT:
             continue
-        box = _object_box(obj, outer, to_display)
+        box = _object_box(obj, outer, to_display, bounds_buf)
         if box is None:
             unboxed += 1
         else:
@@ -1171,9 +1211,16 @@ def _collect_object_boxes(page_raw: pdfium_c.FPDF_PAGE, geometry: PageGeometry) 
     return ObjectBoxes(boxes=tuple(boxes), unboxed=unboxed)
 
 
-def _object_box(obj: pdfium_c.FPDF_PAGEOBJECT, outer: Matrix, to_display: Callable[[Box], Box]) -> Box | None:
+def _object_box(
+    obj: pdfium_c.FPDF_PAGEOBJECT,
+    outer: Matrix,
+    to_display: Callable[[Box], Box],
+    bounds: tuple[ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float] | None = None,
+) -> Box | None:
     """The object's displayed box: its bounds (in its form's space) through ``outer`` to page space; None if none."""
-    left, bottom, right, top = (ctypes.c_float() for _ in range(4))
+    left, bottom, right, top = (
+        (ctypes.c_float(), ctypes.c_float(), ctypes.c_float(), ctypes.c_float()) if bounds is None else bounds
+    )
     if not pdfium_c.FPDFPageObj_GetBounds(obj, left, bottom, right, top):
         return None
     corners = [outer.apply(x, y) for x in (left.value, right.value) for y in (bottom.value, top.value)]
@@ -1183,10 +1230,14 @@ def _object_box(obj: pdfium_c.FPDF_PAGEOBJECT, outer: Matrix, to_display: Callab
     return to_display((min(xs), min(ys), max(xs), max(ys)))
 
 
-def _read_object_boxes(page: pdfium.PdfPage, geometry: PageGeometry) -> ObjectBoxes:
+def _read_object_boxes(
+    page: pdfium.PdfPage,
+    geometry: PageGeometry,
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
+) -> ObjectBoxes:
     """Read a loaded page's object boxes."""
     with _pdfium_errors(geometry.page_number):
-        return _collect_object_boxes(page.raw, geometry)
+        return _collect_object_boxes(page.raw, geometry, objects=objects)
 
 
 def page_object_boxes(handle: DocumentHandle, index: int) -> ObjectBoxes:
@@ -1328,11 +1379,11 @@ def _read_stages(page: pdfium.PdfPage, page_number: int) -> RawPage | PageFailur
     try:
         geometry = _read_geometry(page, page_number)
         stage = "text"
-        text = _read_page_text(page, geometry)
+        text, objects = _read_page_text_and_objects(page, geometry)
         stage = "objects"
-        segments = _read_segments(page, geometry)
-        images = _read_images(page, geometry)
-        object_boxes = _read_object_boxes(page, geometry)
+        segments = _read_segments(page, geometry, objects=objects)
+        images = _read_images(page, geometry, objects=objects)
+        object_boxes = _read_object_boxes(page, geometry, objects=objects)
     except PDFCorruptError as exc:
         return PageFailure(page_number=page_number, stage=stage, message=str(exc))
     return RawPage(geometry=geometry, text=text, segments=segments, images=images, object_boxes=object_boxes)

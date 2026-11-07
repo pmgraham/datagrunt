@@ -48,10 +48,15 @@ __all__ = [
     "GoogleCloudAuth",
     "TransientProviderError",
     "PermanentProviderError",
+    "BatchItem",
+    "BatchPlan",
+    "prepare_batch",
+    "ingest_batch",
 ]
 
 if TYPE_CHECKING:
     from datagrunt.rationalization.api import rationalize
+    from datagrunt.rationalization.batch import BatchItem, BatchPlan, ingest_batch, prepare_batch
     from datagrunt.rationalization.consensus import QuarantinedItem
     from datagrunt.rationalization.folding import ElementSource, GroundedRecord
     from datagrunt.rationalization.providers.anthropic import AnthropicProvider

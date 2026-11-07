@@ -656,6 +656,7 @@ class Envelope:
     payload: str = field(repr=False)
     schema_json: str = field(repr=False)
     header_element_ids: tuple[str, ...] = ()
+    include_schema: bool = field(default=True, repr=False)
     envelope_format: str = field(default=ENVELOPE_FORMAT, init=False)
     system_rules: str = field(default=SYSTEM_RULES, init=False, repr=False)
     schema_lead: str = field(default=_SCHEMA_LEAD, init=False, repr=False)
@@ -663,6 +664,7 @@ class Envelope:
     user_layout: tuple[str, ...] = field(default=_USER_LAYOUT, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        _check_bool("include_schema", self.include_schema)
         _check_component("unit_id", self.unit_id)
         _check_component("prompt", self.prompt)
         if len(self.prompt.encode("utf-8")) > PROMPT_MAX_BYTES:
@@ -694,7 +696,8 @@ class Envelope:
         ):
             if nonce in text:
                 raise ValueError(f"the {name} already holds this nonce: draw a new nonce")
-        system = self.system_rules + self.prompt + self.schema_lead + self.schema_json + nonce.join(self.directive)
+        schema_block = (self.schema_lead + self.schema_json) if self.include_schema else ""
+        system = self.system_rules + self.prompt + schema_block + nonce.join(self.directive)
         layout = self.user_layout
         user = "".join(
             (
@@ -850,6 +853,7 @@ def build_envelopes(
     context: object,
     schema_json: str,
     coalesce_sections: bool = False,
+    include_schema: bool = True,
 ) -> tuple[Envelope, ...]:
     """Build the envelope of each of a document's units, reading the document once.
 
@@ -859,16 +863,18 @@ def build_envelopes(
         prompt: The caller's prompt, sent verbatim.
         context: The caller's context: any value that serializes to JSON, or ``None``.
         schema_json: The response wrapper's canonical JSON (``PreparedSchema.wrapper_json``), sent in every system
-            message (module notes, 4).
+            message when ``include_schema`` is ``True`` (module notes, 4).
         coalesce_sections: When ``True``, allow a unit's elements to span multiple groups and require its
             ``scope_path`` to be their longest common visible opener prefix.
+        include_schema: When ``True`` (default), inline ``schema_json`` in the rendered system prompt; when
+            ``False``, omit the inline schema block when the provider natively enforces ``json_schema``.
 
     Returns:
         One envelope per unit, in order.
 
     Raises:
         TypeError: If ``units`` is not a tuple or list of ``Unit``, ``document`` not a ``PDFDocument``,
-            ``prompt`` or ``schema_json`` not a ``str``, or ``coalesce_sections`` not a ``bool``.
+            ``prompt`` or ``schema_json`` not a ``str``, or ``coalesce_sections`` / ``include_schema`` not a ``bool``.
         ValueError: If a unit is of another document, holds an element that is not the document's, has blocks
             that are not :func:`render_element`'s, elements of more than one group (when ``coalesce_sections`` is
             ``False``) or a scope path other than its expected visible opener scope, or a header context entry is
@@ -878,6 +884,7 @@ def build_envelopes(
             code point or is past :data:`SCHEMA_MAX_BYTES`.
     """
     _check_bool("coalesce_sections", coalesce_sections)
+    _check_bool("include_schema", include_schema)
     if not isinstance(document, PDFDocument):
         raise TypeError(f"document must be a PDFDocument, got {type(document).__name__}")
     if not isinstance(units, (tuple, list)):
@@ -898,6 +905,7 @@ def build_envelopes(
                 payload=payload,
                 schema_json=checked_schema,
                 header_element_ids=header_ids,
+                include_schema=include_schema,
             )
         )
     return tuple(envelopes)
@@ -911,6 +919,7 @@ def build_envelope(
     context: object,
     schema_json: str,
     coalesce_sections: bool = False,
+    include_schema: bool = True,
 ) -> Envelope:
     """Build one unit's envelope (:func:`build_envelopes` for one unit; use that for many).
 
@@ -926,4 +935,5 @@ def build_envelope(
         context=context,
         schema_json=schema_json,
         coalesce_sections=coalesce_sections,
+        include_schema=include_schema,
     )[0]

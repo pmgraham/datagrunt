@@ -78,6 +78,7 @@ from datagrunt.rationalization.runner import (
     EventHook,
     ProviderSnapshot,
     RunLimits,
+    RunOutcome,
     run_requests,
     snapshot_providers,
 )
@@ -115,6 +116,7 @@ def _check_scalar_params(
     expect_non_empty: bool,
     strict: bool,
     coalesce_sections: bool,
+    include_schema_in_prompt: bool = True,
     on_event: EventHook | None,
     min_families: int,
 ) -> RunLimits:
@@ -140,6 +142,8 @@ def _check_scalar_params(
         raise TypeError(f"expect_non_empty must be a bool, got {type(expect_non_empty).__name__}")
     if type(coalesce_sections) is not bool:
         raise TypeError(f"coalesce_sections must be a bool, got {type(coalesce_sections).__name__}")
+    if type(include_schema_in_prompt) is not bool:
+        raise TypeError(f"include_schema_in_prompt must be a bool, got {type(include_schema_in_prompt).__name__}")
     if on_event is not None and not callable(on_event):
         raise TypeError(f"on_event must be callable or None, got {type(on_event).__name__}")
     if type(min_families) is not int:
@@ -335,6 +339,7 @@ def _build_target_work(
     *,
     max_unit_chars: int,
     coalesce_sections: bool,
+    include_schema_in_prompt: bool = True,
     prompt_text: str,
     context: object,
     prepared: PreparedSchema,
@@ -377,6 +382,7 @@ def _build_target_work(
             context=context,
             schema_json=prepared.wrapper_json,
             coalesce_sections=coalesce_sections,
+            include_schema=include_schema_in_prompt,
         )
         miss_count = _count_new_misses(
             envelopes,
@@ -422,31 +428,16 @@ def _escaped_totals(units: Mapping[str, Unit]) -> dict[str, int]:
     return totals
 
 
-def _run_pipeline(
+def _assemble_pipeline_result(
     target_work: _TargetWork,
-    snapshots: Sequence[ProviderSnapshot],
+    outcome: RunOutcome,
     prepared: PreparedSchema,
     *,
-    schema_version: str,
-    memory_cache: MemoryCache,
-    file_cache: FileCache | None,
-    limits: RunLimits,
     min_families: int,
     must_agree: Sequence[str],
     expect_non_empty: bool,
-    on_event: EventHook | None,
 ) -> RationalizedResult[Any]:
-    """Execute runner, consensus, grounding and folding, then assemble :class:`RationalizedResult`."""
-    outcome = run_requests(
-        target_work.work,
-        snapshots,
-        prepared,
-        schema_version=schema_version,
-        memory_cache=memory_cache,
-        file_cache=file_cache,
-        limits=limits,
-        on_event=on_event,
-    )
+    """Execute consensus, grounding and folding over ``outcome`` and assemble :class:`RationalizedResult`."""
     if target_work.units_by_id:
         consensus_res = build_consensus(
             outcome,
@@ -511,6 +502,41 @@ def _run_pipeline(
     return result
 
 
+def _run_pipeline(
+    target_work: _TargetWork,
+    snapshots: Sequence[ProviderSnapshot],
+    prepared: PreparedSchema,
+    *,
+    schema_version: str,
+    memory_cache: MemoryCache,
+    file_cache: FileCache | None,
+    limits: RunLimits,
+    min_families: int,
+    must_agree: Sequence[str],
+    expect_non_empty: bool,
+    on_event: EventHook | None,
+) -> RationalizedResult[Any]:
+    """Execute runner, consensus, grounding and folding, then assemble :class:`RationalizedResult`."""
+    outcome = run_requests(
+        target_work.work,
+        snapshots,
+        prepared,
+        schema_version=schema_version,
+        memory_cache=memory_cache,
+        file_cache=file_cache,
+        limits=limits,
+        on_event=on_event,
+    )
+    return _assemble_pipeline_result(
+        target_work,
+        outcome,
+        prepared,
+        min_families=min_families,
+        must_agree=must_agree,
+        expect_non_empty=expect_non_empty,
+    )
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------------------------------------------
@@ -539,6 +565,7 @@ def rationalize(
     expect_non_empty: bool = False,
     strict: bool = False,
     coalesce_sections: bool = True,
+    include_schema_in_prompt: bool = True,
     on_event: EventHook | None = None,
 ) -> RationalizedResult[T]:
     """Extract, ground, reach cross-family consensus on, and fold schema records over v5 PDF documents (plan §4.11).
@@ -568,6 +595,8 @@ def rationalize(
         strict: If ``True``, raise :class:`RationalizationError` on any unit request failure.
         coalesce_sections: If ``True`` (default), pack consecutive text-bearing groups greedily across section
             boundaries up to ``max_unit_chars``.
+        include_schema_in_prompt: If ``True`` (default), inline the JSON schema in the system prompt in addition
+            to provider-enforced structured outputs; set ``False`` to trim system prompt token overhead.
         on_event: Optional callback invoked on the caller's thread with each :class:`TelemetryEvent`.
 
     Returns:
@@ -593,6 +622,7 @@ def rationalize(
         expect_non_empty=expect_non_empty,
         strict=strict,
         coalesce_sections=coalesce_sections,
+        include_schema_in_prompt=include_schema_in_prompt,
         on_event=on_event,
         min_families=min_families,
     )
@@ -614,6 +644,7 @@ def rationalize(
         raw_targets,
         max_unit_chars=max_unit_chars,
         coalesce_sections=coalesce_sections,
+        include_schema_in_prompt=include_schema_in_prompt,
         prompt_text=prompt_text,
         context=context,
         prepared=prepared,

@@ -213,6 +213,7 @@ import os
 import pickle
 import struct
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Sequence
@@ -234,6 +235,7 @@ from datagrunt.pdf._process import (
     read_error,
     reaped,
     request_payload,
+    send_message,
     start_worker,
     worker_command,
 )
@@ -244,7 +246,7 @@ from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFSour
 from datagrunt.pdf.render import _MIN_RENDER_PIXELS, _MIN_TARGET_DPI
 from datagrunt.pdf.scope import apply_scope
 
-__all__ = ["PDFSource", "PipelineOptions", "SourceIdentity", "extract_document"]
+__all__ = ["PDFSource", "PageWorkerPool", "PipelineOptions", "SourceIdentity", "extract_document"]
 
 _OCR_MODES: tuple[OcrMode, ...] = get_args(OcrMode)
 
@@ -396,6 +398,7 @@ def extract_document(
     max_render_pixels: int = 16_000_000,
     min_image_dimension: int = MIN_IMAGE_DIMENSION,
     strict: bool = False,
+    _worker_pool: "PageWorkerPool | None" = None,
 ) -> PDFDocument:
     """Extract the whole PDF at ``source``: steps 1-5 for every page, in workers, then 6-7 (see the module notes).
 
@@ -438,7 +441,11 @@ def extract_document(
         identity = SourceIdentity.of(os.fstat(stream.fileno()))
         digest = _stream_sha256(stream, identity.size, pdf.path)
         bound = dataclasses.replace(pdf, identity=identity, sha256=digest)
-        facts, pages = _pooled_pages(bound, options, command)
+        facts, pages = (
+            _pooled_pages(bound, options, command)
+            if _worker_pool is None
+            else _pooled_pages(bound, options, command, worker_pool=_worker_pool)
+        )
         _check_unchanged(bound, os.fstat(stream.fileno()), "by the end of its extraction")
     return _document(bound, facts, digest, pages)
 
@@ -666,6 +673,83 @@ class _Worker:
     started: float  # time.monotonic(), just before it was started
 
 
+_POOL_BOOTSTRAP = (
+    "import json, os, sys; "
+    "sys.path[:] = json.loads(sys.stdin.buffer.readline()); "
+    "out = os.fdopen(os.dup(1), 'wb'); "
+    "devnull = open(os.devnull, 'wb'); os.dup2(devnull.fileno(), 1); devnull.close(); "
+    "sys.stdout = open(1, 'w', encoding='utf-8', closefd=False); "
+    "from datagrunt.pdf._page_worker import _pool_worker_main; "
+    "_pool_worker_main(out)"
+)
+
+
+class PageWorkerPool:
+    """A pool of warm page worker subprocesses reused across documents in a batch."""
+
+    __slots__ = ("_closed", "_idle", "_lock")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._idle: list[tuple[subprocess.Popen[bytes], StderrTail]] = []
+        self._closed = False
+
+    def acquire(self, command: list[str], pages: tuple[int, ...] | None) -> _Worker:
+        """Return a warm idle worker, or start a new persistent page worker if none is available."""
+        with self._lock:
+            if self._closed:
+                raise ValueError("PageWorkerPool is closed")
+            while self._idle:
+                child, stderr = self._idle.pop()
+                if child.poll() is None:
+                    return _Worker(pages=pages, child=child, stderr=stderr, started=time.monotonic())
+                close_pipes(child)
+                reaped(child, REAP_TIMEOUT_S)
+                stderr.finish(REAP_TIMEOUT_S)
+        pool_cmd = [command[0], "-I", "-c", _POOL_BOOTSTRAP]
+        started = time.monotonic()
+        child, stderr = start_worker(pool_cmd, own_group=True)
+        stdin = child.stdin
+        if stdin is not None:
+            try:
+                path = [os.path.abspath(entry) if entry else os.getcwd() for entry in sys.path]
+                stdin.write((json.dumps(path) + "\n").encode("utf-8"))
+                stdin.flush()
+            except OSError:
+                pass
+        return _Worker(pages=pages, child=child, stderr=stderr, started=started)
+
+    def release(self, worker: _Worker) -> None:
+        """Return a healthy worker to the idle pool, or reap it if the pool is closed or the worker died."""
+        if worker.child.poll() is None:
+            with self._lock:
+                if not self._closed:
+                    self._idle.append((worker.child, worker.stderr))
+                    return
+        kill_group(worker.child)
+        close_pipes(worker.child)
+        reaped(worker.child, REAP_TIMEOUT_S)
+        worker.stderr.finish(REAP_TIMEOUT_S)
+
+    def close(self) -> None:
+        """Kill and reap all idle workers in the pool."""
+        with self._lock:
+            self._closed = True
+            idle = list(self._idle)
+            self._idle.clear()
+        for child, stderr in idle:
+            close_pipes(child)
+            kill_group(child)
+            reaped(child, REAP_TIMEOUT_S)
+            stderr.finish(REAP_TIMEOUT_S)
+
+    def __enter__(self) -> "PageWorkerPool":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+
 def _started(command: list[str], pages: tuple[int, ...] | None) -> _Worker:
     """Start the worker for ``pages``, its stderr drained into a 4 KiB ring (nothing is written to disk)."""
     started = time.monotonic()
@@ -686,6 +770,17 @@ def _send_request(worker: _Worker, payload: bytes) -> None:
         stdin.write(payload)
         stdin.close()
     except OSError:  # it died at once: its replies end, and its exit code and stderr say why
+        pass
+
+
+def _send_pool_request(worker: _Worker, raw_json: bytes) -> None:
+    """Write a length-prefixed JSON request to a pooled worker's stdin without closing it."""
+    stdin = worker.child.stdin
+    if stdin is None:
+        raise ValueError("the worker's stdin must be a pipe")
+    try:
+        send_message(stdin, raw_json)
+    except OSError:
         pass
 
 
@@ -729,8 +824,10 @@ class _Chunk:
         command: list[str],
         pages: tuple[int, ...] | None,
         workers: int,
+        worker_pool: PageWorkerPool | None = None,
     ) -> None:
         self.source, self.options, self.command, self.workers = source, options, command, workers
+        self.worker_pool = worker_pool
         self.pages = pages
         self.facts: Facts | None = None
         self.got: dict[int, Page] = {}
@@ -768,10 +865,12 @@ class _Chunk:
             worker = self._next_worker(remaining)
             if worker is None:
                 return
+            reusable = False
             try:
                 replies = self._read(worker)
+                reusable = replies.ending in ("done", "error_reply") and not self._stopped
             finally:
-                self._finished(worker)
+                self._finished(worker, reusable=reusable)
             remaining = self._settled(worker, replies)
             if not remaining:
                 return
@@ -779,9 +878,20 @@ class _Chunk:
 
     def _next_worker(self, pages: tuple[int, ...] | None) -> _Worker | None:
         """Start a worker for ``pages`` and send it its request; None once the chunk is stopped."""
-        payload = request_payload(
-            "pages", _chunk_payload(self.source, pages, self.workers, self.options), MAX_REQUEST_BYTES
-        )
+        chunk_dict = _chunk_payload(self.source, pages, self.workers, self.options)
+        if self.worker_pool is not None:
+            raw_json = json.dumps(chunk_dict).encode("utf-8")
+            if len(raw_json) > MAX_REQUEST_BYTES:
+                raise ValueError(f"worker request is {len(raw_json)} bytes, over the {MAX_REQUEST_BYTES}-byte bound")
+            with self._lock:
+                if self._stopped:
+                    return None
+                worker = self.worker_pool.acquire(self.command, pages)
+                self._worker = worker
+                self.started.append(worker.child.pid)
+            _send_pool_request(worker, raw_json)
+            return worker
+        payload = request_payload("pages", chunk_dict, MAX_REQUEST_BYTES)
         with self._lock:
             if self._stopped:
                 return None
@@ -791,10 +901,13 @@ class _Chunk:
         _send_request(worker, payload)
         return worker
 
-    def _finished(self, worker: _Worker) -> None:
-        """Forget, kill and reap ``worker``, and end its stderr's drain (a kill never reaches a reaped pid)."""
+    def _finished(self, worker: _Worker, *, reusable: bool = False) -> None:
+        """Forget, kill and reap ``worker``, and end its stderr's drain (or return to ``worker_pool`` if healthy)."""
         with self._lock:
             self._worker = None
+        if self.worker_pool is not None and reusable:
+            self.worker_pool.release(worker)
+            return
         kill_group(worker.child)
         close_pipes(worker.child)
         reaped(worker.child, REAP_TIMEOUT_S)
@@ -807,7 +920,7 @@ class _Chunk:
             _read_into(worker, replies, self)
         except Exception as exc:  # recorded, and raised by the pool: never swallowed
             replies.error = exc
-        if replies.ending in ("", "done") or replies.error is not None:
+        if replies.ending in ("", "done", "error_reply") or replies.error is not None:
             return replies
         replies.detail = _why_lost(worker, replies, self)
         return replies
@@ -869,6 +982,8 @@ def _read_into(worker: _Worker, replies: _Replies, chunk: _Chunk) -> None:
             _check_count(replies.pages, pages, lost)
             replies.ending = "done"
             return
+        if kind == _ERROR:
+            replies.ending = "error_reply"
         replies.pages.append(_next_page(message, pages, len(replies.pages), lost))
         since = time.monotonic()
     raise DatagruntPDFError(f"{lost} sent more replies than its pages")
@@ -889,6 +1004,7 @@ def _read_facts(worker: _Worker, stdout: IO[bytes], replies: _Replies, chunk: _C
         replies.ending, replies.bound_s = ("expired" if expired else "ended"), bound_s
         return False
     if message[:1] == _ERROR:
+        replies.ending = "error_reply"
         raise read_error(message[1:], "the first page worker")
     facts = _facts_of(message)
     chunk.facts = replies.facts = facts
@@ -979,18 +1095,24 @@ def _why_lost(worker: _Worker, replies: _Replies, chunk: _Chunk) -> str:
     return f"{said}; its stderr ends: {tail}" if tail else said
 
 
-def _pooled_pages(source: PDFSource, options: PipelineOptions, command: list[str]) -> tuple[Facts, tuple[Page, ...]]:
+def _pooled_pages(
+    source: PDFSource,
+    options: PipelineOptions,
+    command: list[str],
+    *,
+    worker_pool: PageWorkerPool | None = None,
+) -> tuple[Facts, tuple[Page, ...]]:
     """The document's facts and every page, from workers (see the module notes); the pages in page order.
 
-    Every worker is reaped before this returns or raises.
+    Every worker is reaped (or returned to ``worker_pool`` if healthy) before this returns or raises.
     """
     workers = _pool_size(options.workers)
-    chunks = [_Chunk(source, options, command, None, workers)]
+    chunks = [_Chunk(source, options, command, None, workers, worker_pool=worker_pool)]
     try:
         chunks[0].start()
         facts = _facts_from(chunks[0])
         for span in _chunks(facts.page_count, workers)[1:]:
-            chunks.append(_Chunk(source, options, command, tuple(span), workers))
+            chunks.append(_Chunk(source, options, command, tuple(span), workers, worker_pool=worker_pool))
             chunks[-1].start()
         return facts, _gathered(chunks, options)
     finally:

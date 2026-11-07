@@ -365,7 +365,14 @@ class PDFWriter:
         directory.mkdir(parents=True, exist_ok=True)
         return _write_renders(pages, directory, source, target_dpi, self._options)
 
-    def write_bundle(self, output_dir: str | os.PathLike[str], *, overwrite: bool = False) -> PDFDocument:
+    def write_bundle(
+        self,
+        output_dir: str | os.PathLike[str],
+        *,
+        overwrite: bool = False,
+        include_images: bool = True,
+        render_pages: bool = True,
+    ) -> PDFDocument:
         """Write the document's bundle at ``output_dir``, atomically (A7a; see the module notes).
 
         Returns:
@@ -387,6 +394,8 @@ class PDFWriter:
         source = self._required_source("write_bundle")
         _checked_target(output_dir)
         replace = strict_bool("overwrite", overwrite)
+        include_imgs = strict_bool("include_images", include_images)
+        render_pgs = strict_bool("render_pages", render_pages)
         options = self._options
         return write_bundle(
             self._extracted(),
@@ -403,6 +412,8 @@ class PDFWriter:
                 "strict": options.strict,
             },
             overwrite=replace,
+            include_images=include_imgs,
+            render_pages=render_pgs,
         )
 
     def _extracted(self) -> PDFDocument:
