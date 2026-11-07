@@ -890,3 +890,156 @@ class TestFoldDocumentsArgumentValidation:
             fold_documents(empty_grounding, units=units, envelopes={}, documents=docs, schema=ASSEMBLY)
         with pytest.raises(ValueError):
             fold_documents(empty_grounding, units=units, envelopes=envs, documents={}, schema=ASSEMBLY)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# 10. Section Coalescing Provenance (coalesce_sections=True)
+# ---------------------------------------------------------------------------------------------------------------
+
+
+class TestCoalesceSectionsFolding:
+    def test_coalesced_unit_resolves_each_element_source_to_its_own_sanitized_section_scope_path(self) -> None:
+        h1 = titled(1, 0, "1. Electrical")
+        p1 = para(1, 1, "Assembly A-100 Main Pump.", scope_path=("1. Electrical",), bbox=BBOX_P1)
+        h2 = titled(1, 2, "2. Mechanical")
+        p2 = para(1, 3, "Part PN-1 qty 2 steel.", scope_path=("2. Mechanical",), bbox=BBOX_P2)
+        h3_hidden = titled(
+            1,
+            4,
+            "SECRET_HIDDEN_HEADING",
+            scope_path=("2. Mechanical", "SECRET_HIDDEN_HEADING"),
+            hidden_reasons=("tiny_font",),
+        )
+        p3 = para(
+            1,
+            5,
+            "Pressure 10 bar.",
+            scope_path=("2. Mechanical", "SECRET_HIDDEN_HEADING"),
+            bbox=BBOX_P3,
+        )
+        doc = make_doc(
+            page(1, (h1, p1, h2, p2, h3_hidden, p3)),
+            sections=(
+                Section(heading=h1, scope_path=("1. Electrical",), page_span=(1, 1), elements=(h1, p1)),
+                Section(heading=h2, scope_path=("2. Mechanical",), page_span=(1, 1), elements=(h2, p2)),
+                Section(
+                    heading=h3_hidden,
+                    scope_path=("2. Mechanical", "SECRET_HIDDEN_HEADING"),
+                    page_span=(1, 1),
+                    elements=(p3,),
+                ),
+            ),
+        )
+        visible_els = (h1, p1, h2, p2, p3)
+        blocks = tuple(render_element(el) for el in visible_els)
+        u_id = f"{doc.metadata.doc_id}:{visible_els[0].element_id}-{visible_els[-1].element_id}"
+        coalesced_unit = Unit(
+            unit_id=u_id,
+            doc_id=doc.metadata.doc_id,
+            elements=visible_els,
+            blocks=blocks,
+            part_of=(None,) * len(visible_els),
+            scope_path=(),
+            scope_entries_excluded=1,
+            page_numbers=(1,),
+            vision=False,
+            oversize=False,
+            hidden_excluded=(("tiny_font", 1),),
+        )
+        payload = "\n".join(
+            [
+                f"<document>{doc.metadata.doc_id.replace('_', chr(92) + '_')}</document>",
+                "<scope></scope>",
+                "<elements>",
+                "\n".join(blocks),
+                "</elements>",
+            ]
+        )
+        env = Envelope(
+            unit_id=u_id,
+            prompt="Extract.",
+            context_json="null",
+            payload=payload,
+            schema_json=ASSEMBLY.wrapper_json,
+        )
+        run = PreparedDoc(document=doc, units={u_id: coalesced_unit}, envelopes={u_id: env})
+        rec = {
+            "assembly_id": "A-100",
+            "title": "Main Pump",
+            "spec": {"pressure_bar": 10},
+            "components": [{"part_no": "PN-1", "qty": 2, "material": "steel"}],
+        }
+        ans = response(
+            entry(
+                rec,
+                ("Assembly A-100 Main Pump.", "Part PN-1 qty 2 steel.", "Pressure 10 bar."),
+                (p1.element_id, p2.element_id, p3.element_id),
+            )
+        )
+        result = run_and_fold({(u_id, G): ans, (u_id, A): ans}, run)
+        (item,) = result.items
+        assert [(s.element_id, s.scope_path) for s in item.sources] == [
+            (p1.element_id, ("1. Electrical",)),
+            (p2.element_id, ("2. Mechanical",)),
+            (p3.element_id, ("2. Mechanical",)),
+        ]
+        assert all("SECRET_HIDDEN_HEADING" not in s.scope_path for s in item.sources)
+
+    def test_end_to_end_coalesced_build_units_and_envelopes_preserve_per_element_section_scope(self) -> None:
+        h_spec = titled(1, 0, "Spec")
+        h_elec = titled(1, 1, "1. Electrical", scope_path=("Spec", "1. Electrical"))
+        p1 = para(1, 2, "Assembly A-100 Main Pump.", scope_path=("Spec", "1. Electrical"), bbox=BBOX_P1)
+        h_mech = titled(1, 3, "2. Mechanical", scope_path=("Spec", "2. Mechanical"))
+        p2 = para(1, 4, "Part PN-1 qty 2 steel.", scope_path=("Spec", "2. Mechanical"), bbox=BBOX_P2)
+        doc = make_doc(
+            page(1, (h_spec, h_elec, p1, h_mech, p2)),
+            sections=(
+                Section(heading=h_spec, scope_path=("Spec",), page_span=(1, 1), elements=(h_spec,)),
+                Section(
+                    heading=h_elec,
+                    scope_path=("Spec", "1. Electrical"),
+                    page_span=(1, 1),
+                    elements=(h_elec, p1),
+                ),
+                Section(
+                    heading=h_mech,
+                    scope_path=("Spec", "2. Mechanical"),
+                    page_span=(1, 1),
+                    elements=(h_mech, p2),
+                ),
+            ),
+        )
+        plan = build_units(doc, max_unit_chars=BIG, render=render_element, coalesce_sections=True)
+        envelopes = build_envelopes(
+            plan.units,
+            doc,
+            prompt="Extract.",
+            context=None,
+            schema_json=ASSEMBLY.wrapper_json,
+            coalesce_sections=True,
+        )
+        (unit,) = plan.units
+        assert unit.scope_path == ("Spec",)
+        run = PreparedDoc(
+            document=doc,
+            units={u.unit_id: u for u in plan.units},
+            envelopes={e.unit_id: e for e in envelopes},
+        )
+        rec = {
+            "assembly_id": "A-100",
+            "title": "Main Pump",
+            "components": [{"part_no": "PN-1", "qty": 2, "material": "steel"}],
+        }
+        ans = response(
+            entry(
+                rec,
+                ("Assembly A-100 Main Pump.", "Part PN-1 qty 2 steel."),
+                (p1.element_id, p2.element_id),
+            )
+        )
+        result = run_and_fold({(unit.unit_id, G): ans, (unit.unit_id, A): ans}, run)
+        (item,) = result.items
+        assert [(s.element_id, s.scope_path) for s in item.sources] == [
+            (p1.element_id, ("Spec", "1. Electrical")),
+            (p2.element_id, ("Spec", "2. Mechanical")),
+        ]

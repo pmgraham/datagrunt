@@ -20,9 +20,10 @@ through the bounded HTTP helper (:class:`~datagrunt.rationalization.providers.ht
    checked by the shared builders, and no redirect is followed.
 2. **What it sends.** ``systemInstruction`` (the system prompt), one ``user`` turn (the envelope), and
    ``generationConfig``: ``responseMimeType`` ``application/json``, the request's schema under the API's schema
-   field (rule 4), ``maxOutputTokens``, then ``temperature`` and ``seed`` unless they are ``None``. By default no
-   temperature is sent (Google recommends keeping Gemini 3's default 1.0, Gemini 3.6 Flash and newer ignore it, and
-   later models will refuse it with HTTP 400) and ``seed`` is 0.
+   field (rule 4), ``maxOutputTokens``, then ``temperature``, ``seed`` and ``thinkingConfig``
+   (``{"thinkingLevel": thinking_level}``) unless they are ``None``. By default no temperature or thinking config is
+   sent (Google recommends keeping Gemini 3's default 1.0, Gemini 3.6 Flash and newer ignore temperature, and later
+   models will refuse it with HTTP 400) and ``seed`` is 0.
 3. **What it never sends or shows.** Keys and tokens travel only as
    :class:`~datagrunt.rationalization.providers.base._Secret` headers, never in a URL (no ``?key=``), a ``repr``, an
    error, a log or a traceback local: key text is checked without an exception and deleted before anything here
@@ -100,8 +101,8 @@ through the bounded HTTP helper (:class:`~datagrunt.rationalization.providers.ht
    it), ``provider_kind`` ``google-cloud-gemini``, ``rate_key`` the model id itself (Google Cloud quotas are per
    model, so two models in one project never share a semaphore or a token bucket), ``api`` ``v1``. The credential is not
    part of the identity. Both: ``model_family`` ``google`` (:data:`MODEL_FAMILY`), ``max_connections`` as given, and
-   ``generation_params`` ``{"api", "schema_field", "wire", "temperature", "seed"}``, ``None`` values left out,
-   ``wire`` the format marker :data:`WIRE`.
+   ``generation_params`` ``{"api", "schema_field", "wire", "temperature", "seed", "thinking_level"}``, ``None`` values
+   left out, ``wire`` the format marker :data:`WIRE`.
 
 Docs read on 2026-11-04 and 2026-11-05 (ai.google.dev answers with a 301 to aistudio.google.com, followed; the Google
 Cloud hosts, auth and names are cited in :mod:`~datagrunt.rationalization.providers.google_cloud`):
@@ -253,7 +254,14 @@ MODEL_FAMILY = "google"
 WIRE = "generate-content/1"
 """The wire format marker in ``generation_params``: a change to what this adapter sends bumps it (a new cache key)."""
 
-FROM_MODEL_STRING_OPTIONS = frozenset({"api_key", "temperature", "seed", "max_connections", "transport"})
+THINKING_LEVELS: Final = frozenset({"LOW", "MEDIUM", "HIGH"})
+"""The ``thinkingLevel`` values ``generationConfig.thinkingConfig`` accepts."""
+
+ThinkingLevel: TypeAlias = Literal["LOW", "MEDIUM", "HIGH"]
+
+FROM_MODEL_STRING_OPTIONS = frozenset(
+    {"api_key", "temperature", "seed", "thinking_level", "max_connections", "transport"}
+)
 """The keywords :meth:`GeminiProvider.from_model_string` passes on."""
 
 ApiKind: TypeAlias = Literal["gemini", "google-cloud-gemini"]
@@ -262,6 +270,20 @@ ApiKind: TypeAlias = Literal["gemini", "google-cloud-gemini"]
 # ---------------------------------------------------------------------------------------------------------------
 # Arguments
 # ---------------------------------------------------------------------------------------------------------------
+
+
+def _check_thinking_level(value: object) -> ThinkingLevel | None:
+    """``None``, or ``"LOW"``, ``"MEDIUM"`` or ``"HIGH"`` (a ``str``, never a subclass); never echoes ``value``."""
+    if value is None:
+        return None
+    if type(value) is not str:
+        kind = type(value).__name__
+        del value
+        raise RationalizationError(f"thinking_level must be None or a str, got {kind}")
+    if value not in THINKING_LEVELS:
+        del value
+        raise RationalizationError('thinking_level must be None, "LOW", "MEDIUM" or "HIGH"')
+    return cast(ThinkingLevel, value)
 
 
 def _check_temperature(value: object) -> float | None:
@@ -780,6 +802,8 @@ class GeminiProvider:
         temperature: Sent when not ``None`` (the default, module notes 2): finite, 0-2. Gemini 3.6 Flash and newer
             ignore it, and Google says later models will refuse it with HTTP 400 (a permanent error).
         seed: Sent when not ``None``: a 32-bit ``int``.
+        thinking_level: Sent as ``generationConfig.thinkingConfig.thinkingLevel`` when not ``None``: ``"LOW"``,
+            ``"MEDIUM"`` or ``"HIGH"`` (:data:`THINKING_LEVELS`).
         max_connections: The HTTP pool size, 1-1,024.
         transport: An ``httpx.BaseTransport`` instead of the network (tests); the helper checks its type.
 
@@ -788,7 +812,7 @@ class GeminiProvider:
             never quoting a key.
     """
 
-    __slots__ = ("_auth", "_client", "_endpoint", "_max_connections", "_seed", "_temperature")
+    __slots__ = ("_auth", "_client", "_endpoint", "_max_connections", "_seed", "_temperature", "_thinking_level")
 
     def __init__(
         self,
@@ -797,14 +821,19 @@ class GeminiProvider:
         api_key: "str | _Secret | None" = None,
         temperature: float | None = None,
         seed: int | None = 0,
+        thinking_level: ThinkingLevel | None = None,
         max_connections: int = 8,
         transport: object = None,
     ) -> None:
         key = _api_key(api_key)
         del api_key  # the raw key leaves this frame before anything here can raise (a traceback shows its locals)
+        try:
+            level = _check_thinking_level(thinking_level)
+        finally:
+            del thinking_level
         if isinstance(key, str):
             raise RationalizationError(key)
-        self._configure(_gemini_endpoint(model), key, temperature, seed, max_connections, transport)
+        self._configure(_gemini_endpoint(model), key, temperature, seed, level, max_connections, transport)
 
     @classmethod
     def google_cloud(
@@ -816,6 +845,7 @@ class GeminiProvider:
         auth: GoogleCloudAuth,
         temperature: float | None = None,
         seed: int | None = 0,
+        thinking_level: ThinkingLevel | None = None,
         max_connections: int = 8,
         transport: object = None,
     ) -> "GeminiProvider":
@@ -834,6 +864,8 @@ class GeminiProvider:
                 after the request's deadline is set).
             temperature: Sent when not ``None`` (the default, module notes 2): finite, 0-2.
             seed: Sent when not ``None``: a 32-bit ``int``.
+            thinking_level: Sent as ``generationConfig.thinkingConfig.thinkingLevel`` when not ``None``: ``"LOW"``,
+                ``"MEDIUM"`` or ``"HIGH"`` (:data:`THINKING_LEVELS`).
             max_connections: The HTTP pool size, 1-1,024.
             transport: An ``httpx.BaseTransport`` instead of the network (tests); the helper checks its type.
 
@@ -845,6 +877,10 @@ class GeminiProvider:
         """
         credential, problem = _google_cloud_auth(auth)
         del auth  # a key or token passed bare leaves this frame before anything here can raise (a traceback's locals)
+        try:
+            level = _check_thinking_level(thinking_level)
+        finally:
+            del thinking_level
         if credential is None:
             raise RationalizationError(problem)
         if project is None:
@@ -853,7 +889,7 @@ class GeminiProvider:
                 "project, is GeminiProvider.google_cloud_express(model, auth=...))"
             )
         target = GoogleCloudTarget(project, location)
-        return cls._on_google_cloud(model, target, credential, temperature, seed, max_connections, transport)
+        return cls._on_google_cloud(model, target, credential, temperature, seed, level, max_connections, transport)
 
     @classmethod
     def google_cloud_express(
@@ -863,6 +899,7 @@ class GeminiProvider:
         auth: GoogleCloudAuth,
         temperature: float | None = None,
         seed: int | None = 0,
+        thinking_level: ThinkingLevel | None = None,
         max_connections: int = 8,
         transport: object = None,
     ) -> "GeminiProvider":
@@ -878,6 +915,8 @@ class GeminiProvider:
             auth: ``GoogleCloudAuth(api_key=...)``: express mode takes an API key, never a token.
             temperature: Sent when not ``None`` (the default, module notes 2): finite, 0-2.
             seed: Sent when not ``None``: a 32-bit ``int``.
+            thinking_level: Sent as ``generationConfig.thinkingConfig.thinkingLevel`` when not ``None``: ``"LOW"``,
+                ``"MEDIUM"`` or ``"HIGH"`` (:data:`THINKING_LEVELS`).
             max_connections: The HTTP pool size, 1-1,024.
             transport: An ``httpx.BaseTransport`` instead of the network (tests); the helper checks its type.
 
@@ -888,10 +927,14 @@ class GeminiProvider:
         """
         credential, problem = _google_cloud_auth(auth)
         del auth  # a key or token passed bare leaves this frame before anything here can raise (a traceback's locals)
+        try:
+            level = _check_thinking_level(thinking_level)
+        finally:
+            del thinking_level
         if credential is None:
             raise RationalizationError(problem)
         target = GoogleCloudTarget.express()
-        return cls._on_google_cloud(model, target, credential, temperature, seed, max_connections, transport)
+        return cls._on_google_cloud(model, target, credential, temperature, seed, level, max_connections, transport)
 
     @classmethod
     def _on_google_cloud(
@@ -901,6 +944,7 @@ class GeminiProvider:
         credential: GoogleCloudAuth,
         temperature: object,
         seed: object,
+        thinking_level: object,
         max_connections: object,
         transport: object,
     ) -> "GeminiProvider":
@@ -908,7 +952,7 @@ class GeminiProvider:
         endpoint = _google_cloud_endpoint(model, target)
         check_access(target, credential, interface="generateContent")
         provider = cls.__new__(cls)
-        provider._configure(endpoint, credential, temperature, seed, max_connections, transport)
+        provider._configure(endpoint, credential, temperature, seed, thinking_level, max_connections, transport)
         return provider
 
     @classmethod
@@ -930,6 +974,7 @@ class GeminiProvider:
         known = {name: value for name, value in options.items() if name in FROM_MODEL_STRING_OPTIONS}
         unknown = sorted(str(name) for name in options if name not in FROM_MODEL_STRING_OPTIONS)
         options.clear()  # an unknown option's value (a misspelt key=...) leaves this frame before anything can raise
+        level = _check_thinking_level(known.pop("thinking_level", None))
         if not isinstance(spec, ModelString):
             raise RationalizationError(f"from_model_string takes a ModelString, got {type(spec).__name__}")
         if spec.kind != "gemini":
@@ -944,7 +989,7 @@ class GeminiProvider:
             )
         if isinstance(key, str):
             raise RationalizationError(key)
-        return cls(spec.model, api_key=key, **known)
+        return cls(spec.model, api_key=key, thinking_level=level, **known)
 
     def _configure(
         self,
@@ -952,6 +997,7 @@ class GeminiProvider:
         auth: _Secret | GoogleCloudAuth,
         temperature: object,
         seed: object,
+        thinking_level: object,
         max_connections: object,
         transport: object,
     ) -> None:
@@ -959,6 +1005,7 @@ class GeminiProvider:
         self._auth = auth
         self._temperature = _check_temperature(temperature)
         self._seed = _check_seed(seed)
+        self._thinking_level = _check_thinking_level(thinking_level)
         self._client = _http_client(max_connections, transport)
         self._max_connections = _check_max_connections(max_connections)
 
@@ -989,13 +1036,15 @@ class GeminiProvider:
 
     @property
     def generation_params(self) -> dict[str, Any]:
-        """A new mapping: the API version, the schema field, the wire marker, then temperature and seed unless
-        ``None`` (``maxOutputTokens``, sent per request, is the runner's cache-key field)."""
+        """A new mapping: the API version, the schema field, the wire marker, then temperature, seed and
+        thinking_level unless ``None`` (``maxOutputTokens``, sent per request, is the runner's cache-key field)."""
         params: dict[str, Any] = {"api": self._endpoint.api, "schema_field": self._endpoint.schema_field, "wire": WIRE}
         if self._temperature is not None:
             params["temperature"] = self._temperature
         if self._seed is not None:
             params["seed"] = self._seed
+        if self._thinking_level is not None:
+            params["thinking_level"] = self._thinking_level
         return params
 
     def transform_schema(self, schema: Mapping[str, Any]) -> dict[str, Any]:
@@ -1056,6 +1105,8 @@ class GeminiProvider:
             config["temperature"] = self._temperature
         if self._seed is not None:
             config["seed"] = self._seed
+        if self._thinking_level is not None:
+            config["thinkingConfig"] = {"thinkingLevel": self._thinking_level}
         return {
             "systemInstruction": {"parts": [{"text": request.system_prompt}]},
             "contents": [{"role": "user", "parts": [{"text": request.user_envelope}]}],

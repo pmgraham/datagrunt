@@ -1901,3 +1901,180 @@ def test_importing_the_module_loads_neither_pydantic_nor_httpx():
     )
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout.strip().splitlines()[-1]) == []
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Section coalescing (coalesce_sections=True)
+# ---------------------------------------------------------------------------------------------------------------
+
+
+class TestCoalesceSections:
+    def test_coalesce_sections_defaults_to_false_and_rejects_non_bool(self):
+        doc = rich_document()
+        default_plan = build_units(doc, max_unit_chars=BIG, render=markdown)
+        explicit_false = build_units(doc, max_unit_chars=BIG, render=markdown, coalesce_sections=False)
+        assert explicit_false == default_plan
+
+        for bad in (1, 0, "true", None, [True]):
+            with pytest.raises(TypeError, match="coalesce_sections must be a bool"):
+                build_units(doc, max_unit_chars=BIG, render=markdown, coalesce_sections=bad)  # type: ignore[arg-type]
+
+    def test_consecutive_sections_and_page_groups_pack_greedily_up_to_max_unit_chars(self):
+        plan = build_units(rich_document(), max_unit_chars=BIG, render=markdown, coalesce_sections=True)
+        assert unit_ids(plan) == [f"{DOC}:p0001_e000-p0003_e000"]
+        (unit,) = plan.units
+        assert unit.scope_path == ()
+        assert unit.page_numbers == (1, 2, 3)
+        assert unit.vision is True
+        assert unit.hidden_excluded == (("off_page", 1), ("tiny_font", 1), ("transparent", 1))
+        assert plan.skipped == (SkippedUnit(unit_id=f"{DOC}:p0004", reason="page_error", page_numbers=(4,)),)
+
+        h1, p1 = heading(1, 0, "S1"), para(1, 1, "a", scope=("S1",))
+        h2, p2 = heading(1, 2, "S2"), para(1, 3, "b", scope=("S2",))
+        doc = document(
+            page(1, (h1, p1, h2, p2)),
+            sections=[section((h1, p1), h1), section((h2, p2), h2)],
+        )
+        # 3 blocks of 10 chars + 2 separators (len 1) = 32 chars; 4th block starts a second unit.
+        packed = build_units(doc, max_unit_chars=32, render=fixed(10), coalesce_sections=True)
+        assert [element_ids(u) for u in packed.units] == [
+            ["p0001_e000", "p0001_e001", "p0001_e002"],
+            ["p0001_e003"],
+        ]
+        assert [u.scope_path for u in packed.units] == [(), ("S2",)]
+
+    def test_oversize_element_gets_own_unit_and_flushes_open_coalesced_draft(self):
+        p1 = para(1, 0, "short1", scope=("S1",))
+        big = para(1, 1, "oversize", scope=("S2",))
+        p2 = para(1, 2, "short2", scope=("S2",))
+        p3 = para(1, 3, "short3", scope=("S3",))
+        doc = document(
+            page(1, (p1, big, p2, p3)),
+            sections=[
+                Section(heading=None, scope_path=("S1",), page_span=(1, 1), elements=(p1,)),
+                Section(heading=None, scope_path=("S2",), page_span=(1, 1), elements=(big, p2)),
+                Section(heading=None, scope_path=("S3",), page_span=(1, 1), elements=(p3,)),
+            ],
+        )
+        plan = build_units(
+            doc,
+            max_unit_chars=25,
+            render=sized({"p0001_e001": 50}, default=10),
+            coalesce_sections=True,
+        )
+        assert [element_ids(u) for u in plan.units] == [
+            ["p0001_e000"],
+            ["p0001_e001"],
+            ["p0001_e002", "p0001_e003"],
+        ]
+        assert [u.oversize for u in plan.units] == [False, True, False]
+
+    def test_error_page_flushes_coalesced_draft_and_produces_skipped_unit_in_order(self):
+        h1, p1 = heading(1, 0, "S1"), para(1, 1, "one", scope=("S1",))
+        h2, p2 = heading(3, 0, "S2"), para(3, 1, "two", scope=("S2",))
+        h3, p3 = heading(3, 2, "S3"), para(3, 3, "three", scope=("S3",))
+        doc = document(
+            page(1, (h1, p1)),
+            error(2),
+            page(3, (h2, p2, h3, p3)),
+            sections=[section((h1, p1), h1), section((h2, p2), h2), section((h3, p3), h3)],
+        )
+        plan = build_units(doc, max_unit_chars=BIG, render=markdown, coalesce_sections=True)
+        assert [element_ids(u) for u in plan.units] == [
+            ["p0001_e000", "p0001_e001"],
+            ["p0003_e000", "p0003_e001", "p0003_e002", "p0003_e003"],
+        ]
+        assert [u.page_numbers for u in plan.units] == [(1,), (3,)]
+        assert plan.skipped == (SkippedUnit(unit_id=f"{DOC}:p0002", reason="page_error", page_numbers=(2,)),)
+
+    def test_all_hidden_and_no_text_groups_produce_skipped_units_without_blocking_coalescing(self):
+        h1, p1 = heading(1, 0, "S1"), para(1, 1, "text1", scope=("S1",))
+        ghost = para(1, 2, "hidden", hidden=("invisible",))
+        blank_fig = picture(1, 3, caption=None)
+        h4, p4 = heading(1, 4, "S4"), para(1, 5, "text4", scope=("S4",))
+        doc = document(
+            page(1, (h1, p1, ghost, blank_fig, h4, p4)),
+            sections=[
+                section((h1, p1), h1),
+                section((ghost,)),
+                section((blank_fig,)),
+                section((h4, p4), h4),
+            ],
+        )
+        plan = build_units(doc, max_unit_chars=BIG, render=guarded, coalesce_sections=True)
+        (unit,) = plan.units
+        assert element_ids(unit) == ["p0001_e000", "p0001_e001", "p0001_e004", "p0001_e005"]
+        assert plan.skipped == (
+            SkippedUnit(
+                unit_id=f"{DOC}:p0001_e002-p0001_e002",
+                reason="all_hidden",
+                page_numbers=(1,),
+                hidden_excluded=(("invisible", 1),),
+            ),
+            SkippedUnit(
+                unit_id=f"{DOC}:p0001_e003-p0001_e003",
+                reason="no_text",
+                page_numbers=(1,),
+                hidden_excluded=(),
+            ),
+        )
+        assert plan.hidden_excluded_total == (("invisible", 1),)
+        assert plan.hidden_elements_total == 1
+
+    def test_hidden_elements_inside_coalesced_groups_are_counted_in_coalesced_unit(self):
+        g1_lead = para(1, 0, scope=("S1",), hidden=("invisible",))
+        h1 = heading(1, 1, "S1")
+        g1_trail = para(1, 2, scope=("S1",), hidden=("tiny_font",))
+        g2_lead = para(1, 3, scope=("S2",), hidden=("duplicate",))
+        h2 = heading(1, 4, "S2")
+        g2_trail = para(1, 5, scope=("S2",), hidden=("off_page",))
+        doc = document(
+            page(1, (g1_lead, h1, g1_trail, g2_lead, h2, g2_trail)),
+            sections=[
+                Section(heading=h1, scope_path=("S1",), page_span=(1, 1), elements=(g1_lead, g1_trail)),
+                Section(heading=h2, scope_path=("S2",), page_span=(1, 1), elements=(g2_lead, g2_trail)),
+            ],
+        )
+        plan = build_units(doc, max_unit_chars=BIG, render=guarded, coalesce_sections=True)
+        (unit,) = plan.units
+        expected = (("off_page", 1), ("invisible", 1), ("tiny_font", 1), ("duplicate", 1))
+        assert unit.hidden_excluded == expected
+        assert plan.hidden_excluded_total == expected
+        assert plan.hidden_elements_total == 4
+
+    def test_scope_path_is_longest_common_visible_opener_prefix_across_contributing_groups(self):
+        h_spec = heading(1, 0, "Spec")
+        h_elec = Heading(**fields(1, 1, ("Spec", "Electrical")), level=2, text="Electrical")
+        p_elec = para(1, 2, "Volts", scope=("Spec", "Electrical"))
+        h_mech = Heading(**fields(1, 3, ("Spec", "Mechanical")), level=2, text="Mechanical")
+        p_mech = para(1, 4, "Torque", scope=("Spec", "Mechanical"))
+        doc = document(
+            page(1, (h_spec, h_elec, p_elec, h_mech, p_mech)),
+            sections=[
+                section((h_spec,), h_spec),
+                section((h_elec, p_elec), h_elec),
+                section((h_mech, p_mech), h_mech),
+            ],
+        )
+        plan = build_units(doc, max_unit_chars=BIG, render=markdown, coalesce_sections=True)
+        (unit,) = plan.units
+        assert unit.scope_path == ("Spec",)
+        assert units_module.common_openers(doc, unit.elements) == (h_spec,)
+
+    def test_scope_entries_excluded_sums_across_distinct_groups_in_coalesced_unit(self):
+        ghost = heading(1, 0, "HiddenH1", hidden=("invisible",))
+        p1a = para(1, 1, "first", scope=("HiddenH1",))
+        p1b = para(1, 2, "second", scope=("HiddenH1",))
+        p2 = para(1, 3, "third", scope=("NoOpener1", "NoOpener2"))
+        doc = document(
+            page(1, (ghost, p1a, p1b, p2)),
+            sections=[
+                section((ghost, p1a, p1b), ghost),
+                Section(heading=None, scope_path=("NoOpener1", "NoOpener2"), page_span=(1, 1), elements=(p2,)),
+            ],
+        )
+        plan = build_units(doc, max_unit_chars=BIG, render=guarded, coalesce_sections=True)
+        (unit,) = plan.units
+        assert unit.scope_path == ()
+        assert unit.scope_entries_excluded == 3
+        assert plan.scope_entries_excluded_total == 3

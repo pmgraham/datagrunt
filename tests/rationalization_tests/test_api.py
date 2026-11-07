@@ -15,8 +15,10 @@ from pydantic import BaseModel
 
 import datagrunt
 import datagrunt.rationalization
+from datagrunt.pdf import _extra as pdf_extra
 from datagrunt.pdf import bundle
 from datagrunt.pdf.bundle import write_bundle
+from datagrunt.pdf.corpus import CORPUS_FORMAT_VERSION, CorpusEntry, CorpusManifest, _write_corpus_manifest
 from datagrunt.pdf.elements import (
     BBox,
     Heading,
@@ -194,6 +196,44 @@ def _bom_response_for(request: ModelRequest) -> ProviderResponse:
                 "source_element_ids": ["p0002_e001", "p0001_e001"],
             },
         ]
+    elif request.unit_id.endswith(":p0001_e001-p0002_e001"):
+        records = [
+            {
+                "record": {
+                    "assembly_id": "A-100",
+                    "drawing": "DWG-900",
+                    "title": "Main Pump",
+                    "notes": "see page 2",
+                    "components": [
+                        {"part_no": "PN-1", "qty": 2},
+                        {"part_no": "PN-2", "qty": 4},
+                    ],
+                },
+                "grounding_quotes": [
+                    "Assembly A-100 Main Pump",
+                    "Notes: see page 2",
+                    "**Drawing:** DWG-900",
+                    "| A-100 |  | PN-1 | 2 |",
+                    "| A-100 |  | PN-2 | 4 |",
+                ],
+                "source_element_ids": ["p0001_e003", "p0001_e001", "p0002_e001"],
+            },
+            {
+                "record": {
+                    "assembly_id": "A-200",
+                    "drawing": "DWG-900",
+                    "title": "Booster",
+                    "components": [
+                        {"part_no": "PN-9", "qty": 1},
+                    ],
+                },
+                "grounding_quotes": [
+                    "| A-200 | Booster | PN-9 | 1 |",
+                    "**Drawing:** DWG-900",
+                ],
+                "source_element_ids": ["p0002_e001", "p0001_e001"],
+            },
+        ]
     else:
         records = []
     return ProviderResponse(
@@ -344,6 +384,8 @@ class TestZeroIoPreflightOrder:
             ({"schema_version": 123}, (TypeError, RationalizationError)),
             ({"expect_non_empty": "yes"}, (TypeError, RationalizationError)),
             ({"strict": "no"}, (TypeError, RationalizationError)),
+            ({"coalesce_sections": "yes"}, (TypeError, RationalizationError)),
+            ({"coalesce_sections": 1}, (TypeError, RationalizationError)),
             ({"on_event": "not_callable"}, (TypeError, RationalizationError)),
         ],
     )
@@ -363,6 +405,7 @@ class TestZeroIoPreflightOrder:
         kwargs.update(bad_kwargs)
         with pytest.raises(expected_exc) as exc_info:
             rationalize(NEVER_OPENED, **kwargs)
+        assert "unexpected keyword argument" not in str(exc_info.value)
         assert "never_opened.pdf" not in str(exc_info.value)
         assert counts == {"google": 0, "anthropic": 0}
 
@@ -625,6 +668,7 @@ class TestTargetResolutionAndPreflight:
                 prompt="Extract BOM.",
                 models=(p_google, p_anthropic),
                 max_requests=4,
+                coalesce_sections=False,
             )
         assert counts == {"google": 0, "anthropic": 0}
 
@@ -651,6 +695,7 @@ class TestTargetResolutionAndPreflight:
             schema=Assembly,
             prompt="Extract BOM.",
             models=(p_google, p_anthropic),
+            coalesce_sections=False,
         )
         assert len(res_from_path.records) == 2
         assert counts == {"google": 3, "anthropic": 3}
@@ -661,6 +706,7 @@ class TestTargetResolutionAndPreflight:
             schema=Assembly,
             prompt="Extract BOM.",
             models=(p_google2, p_anthropic2),
+            coalesce_sections=False,
         )
         assert res_from_str.records == res_from_path.records
         assert counts2 == {"google": 3, "anthropic": 3}
@@ -691,6 +737,7 @@ class TestEndToEndBomExtraction:
             context={"program": "PUMP-2026"},
             cache_dir=cache_dir,
             expect_non_empty=True,
+            coalesce_sections=False,
             on_event=events.append,
         )
 
@@ -804,6 +851,7 @@ class TestEndToEndBomExtraction:
             context={"program": "PUMP-2026"},
             cache_dir=cache_dir,
             expect_non_empty=True,
+            coalesce_sections=False,
             on_event=cached_events.append,
         )
         assert counts == {"google": 3, "anthropic": 3}
@@ -898,3 +946,164 @@ class TestEndToEndBomExtraction:
         assert res.needs_review[0].status == "missing_in_some_models"
         assert res.telemetry.failed_unit_count == 1
         assert res.telemetry.skipped_unit_count == 1
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# 6. Two-Stage Corpus Handoff & coalesce_sections Default (5.2, #463)
+# ---------------------------------------------------------------------------------------------------------------
+
+
+class TestTwoStageCorpusAndCoalesceSections:
+    def test_coalesce_sections_defaults_to_true_and_packs_bom_doc_into_single_unit(self) -> None:
+        from datagrunt.rationalization import rationalize
+
+        assert inspect.signature(real_rationalize).parameters["coalesce_sections"].default is True
+
+        p_google, p_anthropic, counts = make_bom_providers()
+        result = rationalize(
+            BOM_DOC,
+            schema=Assembly,
+            prompt="Extract BOM.",
+            models=(p_google, p_anthropic),
+        )
+        assert result.telemetry.unit_count == 1
+        assert counts == {"google": 1, "anthropic": 1}
+        assert len(result.records) == 2
+        assert result.records[0].assembly_id == "A-100"
+        assert len(result.records[0].components) == 2
+        assert result.records[1].assembly_id == "A-200"
+        assert len(result.records[1].components) == 1
+        assert [(s.element_id, s.page_number, s.scope_path) for s in result.items[0].sources] == [
+            ("p0001_e003", 1, SCOPE_P1),
+            ("p0001_e001", 1, ()),
+            ("p0002_e001", 2, ()),
+        ]
+
+    def test_rationalize_accepts_corpus_manifest_corpus_dir_and_manifest_file_without_pdf_extra(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from datagrunt.rationalization import rationalize
+
+        corpus_dir = (tmp_path / "corpus").resolve()
+        (corpus_dir / "bundles").mkdir(parents=True, exist_ok=True)
+
+        source_a = tmp_path / "bom_a.pdf"
+        source_a.write_bytes(b"%PDF-1.4\n%bom_a\n%%EOF\n")
+        sha_a = hashlib.sha256(source_a.read_bytes()).hexdigest()
+        doc_a = build_bom_document(source_name="bom_a.pdf", sha=sha_a)
+        rel_a = f"bundles/{doc_a.metadata.doc_id}"
+
+        source_b = tmp_path / "bom_b.pdf"
+        source_b.write_bytes(b"%PDF-1.4\n%bom_b\n%%EOF\n")
+        sha_b = hashlib.sha256(source_b.read_bytes()).hexdigest()
+        doc_b = build_bom_document(source_name="bom_b.pdf", sha=sha_b)
+        rel_b = f"bundles/{doc_b.metadata.doc_id}"
+
+        with monkeypatch.context() as m:
+            m.setattr(bundle, "render_page", _fake_render)
+            written_a = write_bundle(doc_a, corpus_dir / rel_a, source=source_a, dpi=72)
+            written_b = write_bundle(doc_b, corpus_dir / rel_b, source=source_b, dpi=72)
+
+        entries = (
+            CorpusEntry(
+                doc_id=written_a.metadata.doc_id,
+                source_name=written_a.metadata.source_name,
+                source_sha256=written_a.metadata.sha256,
+                bundle_relpath=rel_a,
+                page_count=written_a.metadata.page_count,
+                integrity_verified=written_a.integrity_verified,
+                degraded_pages=written_a.degraded_pages,
+                reused=False,
+            ),
+            CorpusEntry(
+                doc_id=written_b.metadata.doc_id,
+                source_name=written_b.metadata.source_name,
+                source_sha256=written_b.metadata.sha256,
+                bundle_relpath=rel_b,
+                page_count=written_b.metadata.page_count,
+                integrity_verified=written_b.integrity_verified,
+                degraded_pages=written_b.degraded_pages,
+                reused=False,
+            ),
+        )
+        manifest = CorpusManifest(
+            corpus_format_version=CORPUS_FORMAT_VERSION,
+            output_dir=corpus_dir,
+            entries=entries,
+            failures=(),
+        )
+        _write_corpus_manifest(corpus_dir, manifest)
+
+        pdf_extra._loaded.cache_clear()
+        try:
+            with monkeypatch.context() as m:
+                m.setitem(sys.modules, "pypdfium2", None)
+                m.setitem(sys.modules, "PIL", None)
+                pdf_extra._loaded.cache_clear()
+
+                p_g1, p_a1, counts1 = make_bom_providers()
+                res_bundle = rationalize(
+                    corpus_dir / rel_a,
+                    schema=Assembly,
+                    prompt="Extract BOM.",
+                    models=(p_g1, p_a1),
+                )
+                assert res_bundle.telemetry.document_count == 1
+                assert len(res_bundle.records) == 2
+                assert counts1 == {"google": 1, "anthropic": 1}
+
+                p_g2, p_a2, counts2 = make_bom_providers()
+                res_manifest = rationalize(
+                    manifest,
+                    schema=Assembly,
+                    prompt="Extract BOM.",
+                    models=(p_g2, p_a2),
+                )
+                assert res_manifest.telemetry.document_count == 2
+                assert len(res_manifest.records) == 4
+                assert counts2 == {"google": 2, "anthropic": 2}
+
+                p_g3, p_a3, counts3 = make_bom_providers()
+                res_corpus_dir = rationalize(
+                    corpus_dir,
+                    schema=Assembly,
+                    prompt="Extract BOM.",
+                    models=(p_g3, p_a3),
+                )
+                assert res_corpus_dir.telemetry.document_count == 2
+                assert res_corpus_dir.records == res_manifest.records
+                assert counts3 == {"google": 2, "anthropic": 2}
+
+                p_g4, p_a4, counts4 = make_bom_providers()
+                res_manifest_file = rationalize(
+                    corpus_dir / "corpus_manifest.json",
+                    schema=Assembly,
+                    prompt="Extract BOM.",
+                    models=(p_g4, p_a4),
+                )
+                assert res_manifest_file.telemetry.document_count == 2
+                assert res_manifest_file.records == res_manifest.records
+                assert counts4 == {"google": 2, "anthropic": 2}
+        finally:
+            pdf_extra._loaded.cache_clear()
+
+    def test_rationalize_rejects_empty_corpus_manifest(self, tmp_path: Path) -> None:
+        from datagrunt.rationalization import rationalize
+
+        empty_manifest = CorpusManifest(
+            corpus_format_version="5.2",
+            output_dir=tmp_path,
+            entries=(),
+            failures=(),
+        )
+        p_google, p_anthropic, counts = make_bom_providers()
+        with pytest.raises(RationalizationError, match="entries"):
+            rationalize(
+                empty_manifest,
+                schema=Assembly,
+                prompt="Extract BOM.",
+                models=(p_google, p_anthropic),
+            )
+        assert counts == {"google": 0, "anthropic": 0}

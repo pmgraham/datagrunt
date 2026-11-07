@@ -1,6 +1,7 @@
 """The public PDF surface (5.0, #373): ``datagrunt`` and ``datagrunt.pdf`` export v5's reader, writer and model."""
 
 import ast
+import importlib
 import importlib.util
 from pathlib import Path
 from typing import get_args
@@ -45,8 +46,15 @@ V5_MODEL_NAMES = [
     "PDFSourceChangedError",
     "BundleCorruptError",
 ]
-PDF_PACKAGE_NAMES = [*V5_MODEL_NAMES, "PDFReader", "PDFWriter", "load_bundle", "write_bundle"]
-# Spec §2.1: the classes, the element types and the exceptions (rationalize's names, 5.1, follow them).
+CORPUS_NAMES = [
+    "CorpusEntry",
+    "CorpusFailure",
+    "CorpusManifest",
+    "extract_corpus",
+    "load_corpus",
+]
+PDF_PACKAGE_NAMES = [*V5_MODEL_NAMES, "PDFReader", "PDFWriter", "load_bundle", "write_bundle", *CORPUS_NAMES]
+# Spec §2.1: the classes, the element types and the exceptions, plus 5.2's bundle and corpus batch API (#463).
 TOP_LEVEL_PDF_NAMES = [
     "PDFReader",
     "PDFWriter",
@@ -66,6 +74,13 @@ TOP_LEVEL_PDF_NAMES = [
     "DatagruntPDFError",
     "PDFEncryptedError",
     "PDFCorruptError",
+    "CorpusEntry",
+    "CorpusFailure",
+    "CorpusManifest",
+    "load_bundle",
+    "write_bundle",
+    "extract_corpus",
+    "load_corpus",
 ]
 # 5.1 (#360): the schema marker, rationalize() and RationalizedResult, defined in datagrunt.rationalization.
 TOP_LEVEL_RATIONALIZATION_NAMES = ["Key", "rationalize", "RationalizedResult"]
@@ -87,14 +102,21 @@ EXCEPTION_NAMES = {
     "BundleCorruptError",
 }
 CLASS_MODULES = {"PDFReader": datagrunt.pdf.reader, "PDFWriter": datagrunt.pdf.writer}
-FUNCTION_MODULES = {"load_bundle": datagrunt.pdf.bundle, "write_bundle": datagrunt.pdf.bundle}
+FUNCTION_MODULES = {
+    "load_bundle": "datagrunt.pdf.bundle",
+    "write_bundle": "datagrunt.pdf.bundle",
+    "extract_corpus": "datagrunt.pdf.corpus",
+    "load_corpus": "datagrunt.pdf.corpus",
+}
 
 
 def _defining_module(name: str):
     if name in CLASS_MODULES:
         return CLASS_MODULES[name]
     if name in FUNCTION_MODULES:
-        return FUNCTION_MODULES[name]
+        return importlib.import_module(FUNCTION_MODULES[name])
+    if name in CORPUS_NAMES:
+        return importlib.import_module("datagrunt.pdf.corpus")
     return datagrunt.pdf.exceptions if name in EXCEPTION_NAMES else datagrunt.pdf.elements
 
 
@@ -179,11 +201,12 @@ def test_lazy_classes_are_listed_by_dir(package):
     assert {"PDFReader", "PDFWriter"} <= set(dir(package))
 
 
-def test_bundle_functions_are_listed_by_dir_and_stay_in_the_pdf_package():
-    assert set(FUNCTION_MODULES) <= set(dir(datagrunt.pdf))
+@pytest.mark.parametrize("package", [datagrunt, datagrunt.pdf], ids=["datagrunt", "datagrunt.pdf"])
+def test_bundle_and_corpus_functions_are_listed_by_dir(package):
+    assert set(FUNCTION_MODULES) <= set(dir(package))
     for name in FUNCTION_MODULES:
-        assert name not in datagrunt.__all__
-        assert not hasattr(datagrunt, name)
+        assert name in package.__all__
+        assert hasattr(package, name)
 
 
 @pytest.mark.parametrize("package", [datagrunt, datagrunt.pdf], ids=["datagrunt", "datagrunt.pdf"])

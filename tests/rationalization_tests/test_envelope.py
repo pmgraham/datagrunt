@@ -2422,3 +2422,110 @@ def test_importing_the_module_loads_neither_pydantic_nor_httpx():
     )
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout.strip().splitlines()[-1]) == []
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Section coalescing in envelopes (coalesce_sections=True)
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def coalesced_spec_document() -> PDFDocument:
+    """Sections sharing visible parent heading 'Spec', with header_context and a continued table."""
+    hdr1 = pair(1, 0, "Program", "A-100")
+    p_intro = para(1, 1, "x" * 200)
+    h_spec = heading(1, 2, "Spec")
+    hdr2 = pair(1, 3, "Customer", "Acme", scope=("Spec",))
+    h_elec = Heading(**fields(1, 4, ("Spec", "Electrical")), level=2, text="Electrical")
+    t1 = grid(1, 5, [("Bolt", "4")], headers=("Part", "Qty"), scope=("Spec", "Electrical"))
+    h_mech = Heading(**fields(2, 0, ("Spec", "Mechanical")), level=2, text="Mechanical")
+    t2 = grid(
+        2,
+        1,
+        [("Nut", "5")],
+        headers=("Part", "Qty"),
+        scope=("Spec", "Mechanical"),
+        continued_from_id=t1.element_id,
+    )
+    return document(
+        page(1, (hdr1, p_intro, h_spec, hdr2, h_elec, t1)),
+        page(2, (h_mech, t2)),
+        sections=[
+            section((hdr1, p_intro)),
+            section((h_spec, hdr2), h_spec),
+            section((h_elec, t1), h_elec),
+            section((h_mech, t2), h_mech),
+        ],
+        header_context=(hdr1, hdr2),
+    )
+
+
+class TestCoalesceSectionsEnvelope:
+    def test_coalesce_sections_defaults_to_false_and_rejects_non_bool(self):
+        doc, multi_unit = two_sections()
+        with pytest.raises(ValueError, match="group"):
+            build_envelope(multi_unit, doc, prompt="p", context=None, schema_json=SCHEMA_JSON)
+        with pytest.raises(ValueError, match="group"):
+            build_envelopes((multi_unit,), doc, prompt="p", context=None, schema_json=SCHEMA_JSON)
+        with pytest.raises(ValueError, match="group"):
+            build_envelope(multi_unit, doc, prompt="p", context=None, schema_json=SCHEMA_JSON, coalesce_sections=False)
+
+        single_unit = units_of(doc)[0]
+        for bad in (1, 0, "true", None, [True]):
+            with pytest.raises(TypeError, match="coalesce_sections must be a bool"):
+                build_envelope(
+                    single_unit,
+                    doc,
+                    prompt="p",
+                    context=None,
+                    schema_json=SCHEMA_JSON,
+                    coalesce_sections=bad,  # type: ignore[arg-type]
+                )
+            with pytest.raises(TypeError, match="coalesce_sections must be a bool"):
+                build_envelopes(
+                    (single_unit,),
+                    doc,
+                    prompt="p",
+                    context=None,
+                    schema_json=SCHEMA_JSON,
+                    coalesce_sections=bad,  # type: ignore[arg-type]
+                )
+
+    def test_coalesced_unit_across_sections_renders_common_scope_header_continues_and_elements(self):
+        doc = coalesced_spec_document()
+        # Section 0 fills unit 0; sections 1, 2, 3 (h_spec, hdr2, h_elec, t1, h_mech, t2) coalesce into unit 1.
+        coalesced_els = (*doc.pages[0].elements[2:], *doc.pages[1].elements)
+        coalesced_blocks = [render_element(el) for el in coalesced_els]
+        limit = len(BLOCK_SEPARATOR.join(coalesced_blocks))
+        units = build_units(doc, max_unit_chars=limit, render=render_element, coalesce_sections=True).units
+        assert len(units) == 2
+        u1 = units[1]
+        assert u1.scope_path == ("Spec",)
+
+        env = build_envelope(u1, doc, prompt="p", context=None, schema_json=SCHEMA_JSON, coalesce_sections=True)
+        envs = build_envelopes(units, doc, prompt="p", context=None, schema_json=SCHEMA_JSON, coalesce_sections=True)
+        assert envs[1] == env
+
+        payload = payload_of(env.render(NONCE)[1])
+        assert "<scope>Spec</scope>" in payload
+        assert env.header_element_ids == (doc.header_context[0].element_id,)
+        assert header_copy(payload) == render_element(doc.header_context[0])
+        assert continues_lines(payload) == [
+            '<continues table="p0002_e001" from="p0001_e005">| Part | Qty |</continues>'
+        ]
+        assert payload.endswith("\n<elements>\n" + BLOCK_SEPARATOR.join(u1.blocks) + "\n</elements>")
+
+    def test_coalesced_unit_with_disjoint_sections_renders_empty_scope_and_refuses_forged_scope(self):
+        h1, p1 = heading(1, 0, "1. Electrical"), para(1, 1, "Volts", scope=("1. Electrical",))
+        h2, p2 = heading(1, 2, "2. Mechanical"), para(1, 3, "Torque", scope=("2. Mechanical",))
+        doc = document(
+            page(1, (h1, p1, h2, p2)),
+            sections=[section((h1, p1), h1), section((h2, p2), h2)],
+        )
+        (unit,) = build_units(doc, max_unit_chars=BIG, render=render_element, coalesce_sections=True).units
+        assert unit.scope_path == ()
+        env = build_envelope(unit, doc, prompt="p", context=None, schema_json=SCHEMA_JSON, coalesce_sections=True)
+        assert "<scope></scope>" in payload_of(env.render(NONCE)[1])
+
+        forged = dataclasses.replace(unit, scope_path=("1. Electrical",))
+        with pytest.raises(ValueError, match="scope"):
+            build_envelope(forged, doc, prompt="p", context=None, schema_json=SCHEMA_JSON, coalesce_sections=True)

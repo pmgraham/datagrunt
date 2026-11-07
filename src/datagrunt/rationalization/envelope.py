@@ -108,7 +108,15 @@ from typing import Literal, TypeAlias, get_args
 from datagrunt.pdf.elements import BulletList, DocumentElement, Figure, Heading, KeyValue, Paragraph, PDFDocument, Table
 from datagrunt.rationalization._canonical import canonical_json, strict_loads
 from datagrunt.rationalization.exceptions import RationalizationError
-from datagrunt.rationalization.units import BLOCK_SEPARATOR, GroupScope, PartOf, Unit, group_scopes
+from datagrunt.rationalization.units import (
+    BLOCK_SEPARATOR,
+    GroupScope,
+    PartOf,
+    Unit,
+    _check_bool,
+    _shared_openers,
+    group_scopes,
+)
 
 __all__ = [
     "CONTEXT_MAX_BYTES",
@@ -496,12 +504,8 @@ def _continuation_lines(unit: Unit, tables: Mapping[str, Table]) -> list[str]:
 
 
 def _openers(unit: Unit, frame: _Frame) -> tuple[Heading, ...]:
-    """The visible headings that opened the kept entries of the unit's group's scope path (none for a page group).
-
-    The group is its first element's: every element of the unit shares it (:func:`_check_one_group`).
-    """
-    scope = frame.scopes.get(unit.elements[0].element_id)
-    return () if scope is None else scope.openers
+    """The visible headings that opened the kept entries of the unit's scope path (none for a page group)."""
+    return _shared_openers(frame.scopes, unit.elements)
 
 
 def _payload(unit: Unit, frame: _Frame) -> tuple[str, tuple[str, ...]]:
@@ -820,15 +824,15 @@ def _check_one_group(unit: Unit, frame: _Frame) -> None:
         raise ValueError(f"unit {unit.unit_id}: its elements are of {len(groups)} groups; a unit holds one group's")
 
 
-def _check_unit(unit: object, frame: _Frame) -> Unit:
-    """Require a unit of this document: its elements the document's and of one group, its blocks rendered, its
-    group's scope."""
+def _check_unit(unit: object, frame: _Frame, *, coalesce_sections: bool = False) -> Unit:
+    """Require a unit of this document: its elements the document's, its blocks rendered, its scope valid."""
     if not isinstance(unit, Unit):
         raise TypeError(f"each unit must be a Unit, got {type(unit).__name__}")
     if unit.doc_id != frame.doc_id:
         raise ValueError(f"unit {unit.unit_id} has doc_id {unit.doc_id!r}, not the document's {frame.doc_id!r}")
     _check_elements(unit, frame.elements)
-    _check_one_group(unit, frame)
+    if not coalesce_sections:
+        _check_one_group(unit, frame)
     expected = tuple(opener.text for opener in _openers(unit, frame))
     if unit.scope_path != expected:
         raise ValueError(
@@ -839,7 +843,13 @@ def _check_unit(unit: object, frame: _Frame) -> Unit:
 
 
 def build_envelopes(
-    units: Sequence[Unit], document: PDFDocument, *, prompt: str, context: object, schema_json: str
+    units: Sequence[Unit],
+    document: PDFDocument,
+    *,
+    prompt: str,
+    context: object,
+    schema_json: str,
+    coalesce_sections: bool = False,
 ) -> tuple[Envelope, ...]:
     """Build the envelope of each of a document's units, reading the document once.
 
@@ -850,21 +860,24 @@ def build_envelopes(
         context: The caller's context: any value that serializes to JSON, or ``None``.
         schema_json: The response wrapper's canonical JSON (``PreparedSchema.wrapper_json``), sent in every system
             message (module notes, 4).
+        coalesce_sections: When ``True``, allow a unit's elements to span multiple groups and require its
+            ``scope_path`` to be their longest common visible opener prefix.
 
     Returns:
         One envelope per unit, in order.
 
     Raises:
-        TypeError: If ``units`` is not a tuple or list of ``Unit``, ``document`` not a ``PDFDocument``, or
-            ``prompt`` or ``schema_json`` not a ``str``.
+        TypeError: If ``units`` is not a tuple or list of ``Unit``, ``document`` not a ``PDFDocument``,
+            ``prompt`` or ``schema_json`` not a ``str``, or ``coalesce_sections`` not a ``bool``.
         ValueError: If a unit is of another document, holds an element that is not the document's, has blocks
-            that are not :func:`render_element`'s, elements of more than one group or a scope path other than its
-            group's (each entry opened by a visible heading), or a header context entry is hidden, off page 1 or
-            not the document's.
+            that are not :func:`render_element`'s, elements of more than one group (when ``coalesce_sections`` is
+            ``False``) or a scope path other than its expected visible opener scope, or a header context entry is
+            hidden, off page 1 or not the document's.
         RationalizationError: If ``prompt`` is blank or not encodable, ``context`` does not serialize to JSON or
             is past :data:`CONTEXT_MAX_BYTES`, or ``schema_json`` is not a JSON object's canonical JSON, holds an R8
             code point or is past :data:`SCHEMA_MAX_BYTES`.
     """
+    _check_bool("coalesce_sections", coalesce_sections)
     if not isinstance(document, PDFDocument):
         raise TypeError(f"document must be a PDFDocument, got {type(document).__name__}")
     if not isinstance(units, (tuple, list)):
@@ -875,7 +888,7 @@ def build_envelopes(
     frame = _frame(document)
     envelopes = []
     for unit in units:
-        checked = _check_unit(unit, frame)
+        checked = _check_unit(unit, frame, coalesce_sections=coalesce_sections)
         payload, header_ids = _payload(checked, frame)
         envelopes.append(
             Envelope(
@@ -890,7 +903,15 @@ def build_envelopes(
     return tuple(envelopes)
 
 
-def build_envelope(unit: Unit, document: PDFDocument, *, prompt: str, context: object, schema_json: str) -> Envelope:
+def build_envelope(
+    unit: Unit,
+    document: PDFDocument,
+    *,
+    prompt: str,
+    context: object,
+    schema_json: str,
+    coalesce_sections: bool = False,
+) -> Envelope:
     """Build one unit's envelope (:func:`build_envelopes` for one unit; use that for many).
 
     Raises:
@@ -898,4 +919,11 @@ def build_envelope(unit: Unit, document: PDFDocument, *, prompt: str, context: o
         ValueError: As :func:`build_envelopes`.
         RationalizationError: As :func:`build_envelopes`.
     """
-    return build_envelopes((unit,), document, prompt=prompt, context=context, schema_json=schema_json)[0]
+    return build_envelopes(
+        (unit,),
+        document,
+        prompt=prompt,
+        context=context,
+        schema_json=schema_json,
+        coalesce_sections=coalesce_sections,
+    )[0]

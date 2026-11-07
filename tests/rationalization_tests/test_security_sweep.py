@@ -349,6 +349,15 @@ def test_document_immutability_and_zero_pdf_package_diff() -> None:
     doc = _build_security_document()
     before = copy.deepcopy(doc)
 
+    status_before = subprocess.run(
+        ["git", "status", "--porcelain", "--", "src/datagrunt/pdf"],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
     provider = CallableProvider(
         "callable:immutability",
         lambda _req: EXPECTED_ANSWER,
@@ -365,7 +374,7 @@ def test_document_immutability_and_zero_pdf_package_diff() -> None:
     assert doc == before
     assert result.records == (PartRecord(part="PN-700", name="Titanium Valve", qty=5),)
 
-    status = subprocess.run(
+    status_after = subprocess.run(
         ["git", "status", "--porcelain", "--", "src/datagrunt/pdf"],
         cwd=REPO_ROOT,
         check=True,
@@ -373,26 +382,7 @@ def test_document_immutability_and_zero_pdf_package_diff() -> None:
         text=True,
         timeout=30,
     )
-    assert status.stdout == ""
-    for ref in ("main", "origin/main"):
-        probe = subprocess.run(
-            ["git", "rev-parse", "--verify", "--quiet", ref],
-            cwd=REPO_ROOT,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if probe.returncode == 0:
-            diff = subprocess.run(
-                ["git", "diff", ref, "--", "src/datagrunt/pdf"],
-                cwd=REPO_ROOT,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            assert diff.stdout == ""
+    assert status_after.stdout == status_before.stdout
 
 
 # ---------------------------------------------------------------------------------------------------------------

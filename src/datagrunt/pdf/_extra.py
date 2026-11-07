@@ -47,7 +47,7 @@ PDF_EXTRA_HINT = 'Install PDF support with: uv pip install "datagrunt[pdf]"'
 # Each lazily loaded class, and the module that defines it.
 LAZY_CLASSES = MappingProxyType({"PDFReader": "datagrunt.pdf.reader", "PDFWriter": "datagrunt.pdf.writer"})
 # Each lazily loaded function, and the module that defines it.
-LAZY_FUNCTIONS = MappingProxyType({"load_bundle": "datagrunt.pdf.bundle", "write_bundle": "datagrunt.pdf.bundle"})
+LAZY_FUNCTIONS = MappingProxyType({"write_bundle": "datagrunt.pdf.bundle", "extract_corpus": "datagrunt.pdf.corpus"})
 
 # The [pdf] extra's top-level import names, each with its package's name: pypdfium2, and Pillow's PIL.
 _EXTRA_PACKAGES = MappingProxyType({"pypdfium2": "pypdfium2", "PIL": "Pillow"})
@@ -102,6 +102,7 @@ def _loaded(name: str) -> Callable[..., object]:
     if missing:
         raise _MissingExtra(missing, ModuleNotFoundError(f"No module named {missing[0]!r}", name=missing[0]))
     try:
+        importlib.import_module("PIL.Image")
         module = importlib.import_module(module_name)
     except ImportError as exc:
         if not _is_missing_extra(exc):
