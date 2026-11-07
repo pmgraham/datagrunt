@@ -44,7 +44,9 @@ from typing import Any, TypeAlias, TypeVar, cast
 
 from pydantic import BaseModel
 
+from datagrunt.pdf._bundle_load import MANIFEST, load_bundle
 from datagrunt.pdf._extra import load as _pdf_load
+from datagrunt.pdf.corpus import CORPUS_MANIFEST, CorpusManifest, load_corpus
 from datagrunt.pdf.elements import PDFDocument
 from datagrunt.rationalization.cache import FileCache, MemoryCache, request_key
 from datagrunt.rationalization.consensus import ConsensusResult, build_consensus, check_must_agree
@@ -87,8 +89,9 @@ MAX_TARGETS = 10_000
 """The most targets a single :func:`rationalize` call accepts (plan §4.11)."""
 
 T = TypeVar("T", bound=BaseModel)
-TargetInput: TypeAlias = PDFDocument | str | PathLike[str]
+TargetInput: TypeAlias = PDFDocument | CorpusManifest | str | PathLike[str]
 ModelInput: TypeAlias = str | ModelProvider | Callable[[ModelRequest], ProviderResponse]
+_TARGET_TYPES = (PDFDocument, CorpusManifest, str, PathLike)
 
 __all__ = ["MAX_TARGETS", "rationalize"]
 
@@ -111,6 +114,7 @@ def _check_scalar_params(
     schema_version: str,
     expect_non_empty: bool,
     strict: bool,
+    coalesce_sections: bool,
     on_event: EventHook | None,
     min_families: int,
 ) -> RunLimits:
@@ -134,6 +138,8 @@ def _check_scalar_params(
         raise (TypeError if not isinstance(schema_version, str) else ValueError)(f"schema_version {version_problem}")
     if type(expect_non_empty) is not bool:
         raise TypeError(f"expect_non_empty must be a bool, got {type(expect_non_empty).__name__}")
+    if type(coalesce_sections) is not bool:
+        raise TypeError(f"coalesce_sections must be a bool, got {type(coalesce_sections).__name__}")
     if on_event is not None and not callable(on_event):
         raise TypeError(f"on_event must be callable or None, got {type(on_event).__name__}")
     if type(min_families) is not int:
@@ -231,7 +237,7 @@ class _TargetWork:
 
 def _normalize_targets(target: object) -> tuple[TargetInput, ...]:
     """Validate and normalize ``target`` into a non-empty tuple of at most :data:`MAX_TARGETS` items."""
-    if isinstance(target, (PDFDocument, str, PathLike)):
+    if isinstance(target, _TARGET_TYPES):
         return (target,)
     if isinstance(target, Sequence) and not isinstance(target, (bytes, bytearray)):
         items = tuple(target)
@@ -240,19 +246,51 @@ def _normalize_targets(target: object) -> tuple[TargetInput, ...]:
         if len(items) > MAX_TARGETS:
             raise RationalizationError(f"target sequence holds {len(items)} items, past MAX_TARGETS ({MAX_TARGETS})")
         for idx, item in enumerate(items):
-            if not isinstance(item, (PDFDocument, str, PathLike)):
-                raise TypeError(f"target[{idx}] must be a PDFDocument, str, or PathLike, got {type(item).__name__}")
+            if not isinstance(item, _TARGET_TYPES):
+                raise TypeError(
+                    f"target[{idx}] must be a PDFDocument, CorpusManifest, str, or PathLike, got {type(item).__name__}"
+                )
         return items
-    raise TypeError(f"target must be a PDFDocument, str, PathLike, or Sequence thereof, got {type(target).__name__}")
+    raise TypeError(
+        f"target must be a PDFDocument, CorpusManifest, str, PathLike, or Sequence thereof, got {type(target).__name__}"
+    )
 
 
-def _resolve_document(item: TargetInput) -> PDFDocument:
-    """Return ``item`` if already a :class:`PDFDocument`, else load it through :class:`~datagrunt.pdf.PDFReader`."""
+def _is_corpus_target(path: Path) -> bool:
+    """True when ``path`` is ``corpus_manifest.json`` or a directory containing ``corpus_manifest.json``."""
+    try:
+        return path.name == CORPUS_MANIFEST or (path.is_dir() and (path / CORPUS_MANIFEST).exists())
+    except (OSError, ValueError):
+        return False
+
+
+def _is_bundle_target(path: Path) -> bool:
+    """True when ``path`` is a directory containing ``manifest.json``."""
+    try:
+        return path.is_dir() and (path / MANIFEST).exists()
+    except (OSError, ValueError):
+        return False
+
+
+def _resolve_documents(item: TargetInput) -> tuple[PDFDocument, ...]:
+    """Resolve one target item into one or more :class:`PDFDocument` instances."""
     if isinstance(item, PDFDocument):
-        return item
+        return (item,)
+    if isinstance(item, CorpusManifest):
+        if not item.entries:
+            raise RationalizationError("corpus manifest has no extracted document entries")
+        return item.load_documents()
+    path = Path(item)
+    if _is_corpus_target(path):
+        manifest = load_corpus(path)
+        if not manifest.entries:
+            raise RationalizationError("corpus manifest has no extracted document entries")
+        return manifest.load_documents()
+    if _is_bundle_target(path):
+        return (load_bundle(path),)
     reader_cls = _pdf_load("PDFReader")
     reader = reader_cls(item)
-    return cast(PDFDocument, getattr(reader, "document"))
+    return (cast(PDFDocument, getattr(reader, "document")),)
 
 
 def _count_new_misses(
@@ -296,6 +334,7 @@ def _build_target_work(
     raw_targets: Sequence[TargetInput],
     *,
     max_unit_chars: int,
+    coalesce_sections: bool,
     prompt_text: str,
     context: object,
     prepared: PreparedSchema,
@@ -318,19 +357,26 @@ def _build_target_work(
     }
     schemas_by_model = {s.model_id: s.provider_schema for s in snapshots}
 
-    for item in raw_targets:
-        doc = _resolve_document(item)
+    for doc in (doc for item in raw_targets for doc in _resolve_documents(item)):
         doc_id = doc.metadata.doc_id
         if doc_id in docs_by_id:
             raise RationalizationError(f"duplicate doc_id {doc_id!r} across targets: each target must be distinct")
+        if len(docs_by_id) >= MAX_TARGETS:
+            raise RationalizationError(f"resolved targets exceed MAX_TARGETS ({MAX_TARGETS})")
         docs_by_id[doc_id] = doc
-        plan = build_units(doc, max_unit_chars=max_unit_chars, render=render_element)
+        plan = build_units(
+            doc,
+            max_unit_chars=max_unit_chars,
+            render=render_element,
+            coalesce_sections=coalesce_sections,
+        )
         envelopes = build_envelopes(
             plan.units,
             doc,
             prompt=prompt_text,
             context=context,
             schema_json=prepared.wrapper_json,
+            coalesce_sections=coalesce_sections,
         )
         miss_count = _count_new_misses(
             envelopes,
@@ -492,13 +538,14 @@ def rationalize(
     max_output_tokens: int = 8_192,
     expect_non_empty: bool = False,
     strict: bool = False,
+    coalesce_sections: bool = True,
     on_event: EventHook | None = None,
 ) -> RationalizedResult[T]:
     """Extract, ground, reach cross-family consensus on, and fold schema records over v5 PDF documents (plan §4.11).
 
     Args:
-        target: A :class:`~datagrunt.pdf.PDFDocument`, a PDF or bundle path (``str`` or ``PathLike``), or a
-            sequence of 1 to :data:`MAX_TARGETS` targets.
+        target: A :class:`~datagrunt.pdf.PDFDocument`, a :class:`~datagrunt.pdf.CorpusManifest`, a PDF, bundle, or
+            corpus path (``str`` or ``PathLike``), or a sequence of 1 to :data:`MAX_TARGETS` targets.
         schema: The caller's Pydantic ``BaseModel`` subclass describing one entity record.
         prompt: Extraction instructions as a non-blank ``str`` or a regular UTF-8 file :class:`~pathlib.Path`.
         models: Non-empty sequence of model strings, :class:`ModelProvider` objects, or callables.
@@ -519,6 +566,8 @@ def rationalize(
         max_output_tokens: Output token cap sent on each request (1..131,072, default 8,192).
         expect_non_empty: If ``True``, raise :class:`RationalizationError` when ``result.records`` is empty.
         strict: If ``True``, raise :class:`RationalizationError` on any unit request failure.
+        coalesce_sections: If ``True`` (default), pack consecutive text-bearing groups greedily across section
+            boundaries up to ``max_unit_chars``.
         on_event: Optional callback invoked on the caller's thread with each :class:`TelemetryEvent`.
 
     Returns:
@@ -543,6 +592,7 @@ def rationalize(
         schema_version=schema_version,
         expect_non_empty=expect_non_empty,
         strict=strict,
+        coalesce_sections=coalesce_sections,
         on_event=on_event,
         min_families=min_families,
     )
@@ -563,6 +613,7 @@ def rationalize(
     target_work = _build_target_work(
         raw_targets,
         max_unit_chars=max_unit_chars,
+        coalesce_sections=coalesce_sections,
         prompt_text=prompt_text,
         context=context,
         prepared=prepared,

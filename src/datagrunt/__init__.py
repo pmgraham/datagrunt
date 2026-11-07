@@ -61,6 +61,7 @@ from datagrunt.pdf import (
     Table,
 )
 from datagrunt.pdf._extra import LAZY_CLASSES as _LAZY_CLASSES
+from datagrunt.pdf._extra import LAZY_FUNCTIONS as _LAZY_FUNCTIONS
 from datagrunt.pdf._extra import load as _load
 from datagrunt.rationalization import Key  # needs no extra: the package imports neither pydantic nor httpx
 from datagrunt.rationalization._extra import load as _load_rationalize
@@ -92,6 +93,13 @@ __all__ = [
     "DatagruntPDFError",
     "PDFEncryptedError",
     "PDFCorruptError",
+    "CorpusEntry",
+    "CorpusFailure",
+    "CorpusManifest",
+    "load_bundle",
+    "write_bundle",
+    "extract_corpus",
+    "load_corpus",
     "Key",
     "rationalize",
     "RationalizedResult",
@@ -108,6 +116,16 @@ _API_NAMES = _MappingProxyType(
         "ParquetWriter": "datagrunt.parquet_api",
     }
 )
+_PDF_LAZY_NAMES = frozenset({*_LAZY_CLASSES, *_LAZY_FUNCTIONS})
+_PDF_DIRECT_NAMES = _MappingProxyType(
+    {
+        "CorpusEntry": "datagrunt.pdf.corpus",
+        "CorpusFailure": "datagrunt.pdf.corpus",
+        "CorpusManifest": "datagrunt.pdf.corpus",
+        "load_bundle": "datagrunt.pdf._bundle_load",
+        "load_corpus": "datagrunt.pdf.corpus",
+    }
+)
 _RATIONALIZE_NAMES = frozenset({"rationalize", "RationalizedResult"})
 # The subpackages that ``import datagrunt`` bound as its attributes when it imported these APIs eagerly: each is
 # still an attribute, imported at its first access.
@@ -117,7 +135,17 @@ if TYPE_CHECKING:
     from datagrunt.csv_api import CSVReader, CSVWriter
     from datagrunt.excel_api import ExcelReader, ExcelWriter
     from datagrunt.parquet_api import ParquetReader, ParquetWriter
-    from datagrunt.pdf import PDFReader, PDFWriter
+    from datagrunt.pdf import (
+        CorpusEntry,
+        CorpusFailure,
+        CorpusManifest,
+        PDFReader,
+        PDFWriter,
+        extract_corpus,
+        load_bundle,
+        load_corpus,
+        write_bundle,
+    )
     from datagrunt.rationalization import RationalizedResult, rationalize
 
 
@@ -125,18 +153,22 @@ def __getattr__(name: str) -> object:
     """Each API's name, imported at its first access (module notes).
 
     A CSV, Excel or Parquet name is then kept as the package's attribute, so
-    later accesses find it there. ``PDFReader`` and ``PDFWriter`` never need
-    the [pdf] extra to be named: without it, constructing either raises
-    ``ImportError`` with the install hint (see :mod:`datagrunt.pdf`).
-    ``rationalize`` and ``RationalizedResult`` likewise resolve through
-    :mod:`datagrunt.rationalization._extra`.
+    later accesses find it there. ``PDFReader``, ``PDFWriter``, ``write_bundle``
+    and ``extract_corpus`` never need the [pdf] extra to be named: without it,
+    constructing or calling them raises ``ImportError`` with the install hint
+    (see :mod:`datagrunt.pdf`). ``rationalize`` and ``RationalizedResult``
+    likewise resolve through :mod:`datagrunt.rationalization._extra`.
 
     Raises:
         AttributeError: If ``name`` is none of this package's names.
         ImportError: As importing the API that defines ``name`` raises it.
     """
-    if name in _LAZY_CLASSES:
+    if name in _PDF_LAZY_NAMES:
         return _load(name)  # never kept: without the [pdf] extra it is a stand-in, and the extra can arrive later
+    if name in _PDF_DIRECT_NAMES:
+        value = getattr(_import_module(_PDF_DIRECT_NAMES[name]), name)
+        globals()[name] = value
+        return value
     if name in _RATIONALIZE_NAMES:
         return _load_rationalize(name)
     if name in _API_NAMES:
@@ -149,7 +181,7 @@ def __getattr__(name: str) -> object:
 
 
 def __dir__() -> list[str]:
-    return sorted({*globals(), *_LAZY_CLASSES, *_RATIONALIZE_NAMES, *_API_NAMES, *_SUBPACKAGES})
+    return sorted({*globals(), *_PDF_LAZY_NAMES, *_PDF_DIRECT_NAMES, *_RATIONALIZE_NAMES, *_API_NAMES, *_SUBPACKAGES})
 
 
 # Optionally, you can include a logger for your package

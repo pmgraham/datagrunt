@@ -74,7 +74,7 @@ from datagrunt.rationalization.envelope import Envelope
 from datagrunt.rationalization.exceptions import RationalizationError
 from datagrunt.rationalization.grounding import GroundedItem, GroundingReason, GroundingResult
 from datagrunt.rationalization.schema import MAX_DEPTH, FieldSpec, ModelSpec, PreparedSchema
-from datagrunt.rationalization.units import Unit
+from datagrunt.rationalization.units import GroupScope, Unit, group_scopes
 
 RecordStatus: TypeAlias = Literal[
     "consensus",
@@ -295,11 +295,19 @@ def fold_documents(
     """
     _check_arguments(grounding, units, envelopes, documents, schema)
     doc_elements = _index_documents(documents)
+    doc_scopes = {doc_id: group_scopes(document) for doc_id, document in documents.items()}
     unit_citable = _index_citable(units, envelopes)
     unit_rank = {unit_id: index for index, unit_id in enumerate(units)}
     groups = _group_items(grounding.items, units, unit_rank, bool(schema.spec.keys.fields))
     folded = [
-        _fold_group(group, units=units, doc_elements=doc_elements, unit_citable=unit_citable, schema=schema)
+        _fold_group(
+            group,
+            units=units,
+            doc_elements=doc_elements,
+            doc_scopes=doc_scopes,
+            unit_citable=unit_citable,
+            schema=schema,
+        )
         for group in groups
     ]
     return FoldingResult(items=tuple(folded))
@@ -442,11 +450,25 @@ def _group_items(
     return groups
 
 
+def _element_scope(
+    element_id: str,
+    unit: Unit,
+    body_ids: frozenset[str],
+    scopes: Mapping[str, GroupScope],
+) -> tuple[str, ...]:
+    """Resolve the sanitized section ``scope_path`` for a cited element in ``unit``."""
+    if element_id not in body_ids:
+        return unit.scope_path
+    group_scope = scopes.get(element_id)
+    return () if group_scope is None else group_scope.path
+
+
 def _build_sources(
     group: Sequence[GroundedItem],
     *,
     units: Mapping[str, Unit],
     doc_elements: Mapping[str, Mapping[str, DocumentElement]],
+    doc_scopes: Mapping[str, Mapping[str, GroupScope]],
     unit_citable: Mapping[str, Mapping[str, DocumentElement]],
 ) -> tuple[ElementSource, ...]:
     """Resolve cited element ids across ``group`` into deduplicated :class:`ElementSource` instances."""
@@ -457,6 +479,8 @@ def _build_sources(
         unit = units[unit_id]
         citable = unit_citable[unit_id]
         whole_by_id = doc_elements[unit.doc_id]
+        scopes = doc_scopes[unit.doc_id]
+        body_ids = frozenset(element.element_id for element in unit.elements)
         for element_ids in grounded.item.element_ids_by_model.values():
             for element_id in element_ids:
                 pair = (unit_id, element_id)
@@ -471,7 +495,7 @@ def _build_sources(
                         element_id=element_id,
                         page_number=element.page_number,
                         bbox=element.bbox,
-                        scope_path=unit.scope_path,
+                        scope_path=_element_scope(element_id, unit, body_ids, scopes),
                     )
                 )
     return tuple(sources)
@@ -487,13 +511,20 @@ def _fold_group(
     *,
     units: Mapping[str, Unit],
     doc_elements: Mapping[str, Mapping[str, DocumentElement]],
+    doc_scopes: Mapping[str, Mapping[str, GroupScope]],
     unit_citable: Mapping[str, Mapping[str, DocumentElement]],
     schema: PreparedSchema,
 ) -> GroundedRecord[Any]:
     """Fold one group of :class:`GroundedItem` instances into a :class:`GroundedRecord`."""
     first = group[0]
     doc_id = units[first.item.unit_id].doc_id
-    sources = _build_sources(group, units=units, doc_elements=doc_elements, unit_citable=unit_citable)
+    sources = _build_sources(
+        group,
+        units=units,
+        doc_elements=doc_elements,
+        doc_scopes=doc_scopes,
+        unit_citable=unit_citable,
+    )
     quotes = _united(
         quotes_for_model for grounded in group for quotes_for_model in grounded.item.quotes_by_model.values()
     )

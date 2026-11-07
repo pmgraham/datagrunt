@@ -120,7 +120,7 @@ def test_without_the_extra_the_bundle_functions_raise_the_hint_when_called(missi
             from datagrunt.pdf import *
 
             outcome = {"star": sorted(name for name in datagrunt.pdf.__all__ if name not in globals())}
-            for name in ("load_bundle", "write_bundle"):
+            for name in ("write_bundle", "extract_corpus"):
                 function = getattr(datagrunt.pdf, name)
                 try:
                     function("bundle")
@@ -134,7 +134,7 @@ def test_without_the_extra_the_bundle_functions_raise_the_hint_when_called(missi
     )
 
     assert result.pop("star") == []
-    for name in ("load_bundle", "write_bundle"):
+    for name in ("write_bundle", "extract_corpus"):
         assert result[name] is not None, f"{name}(...) raised nothing"
         function_name, message, missing_name, cause = result[name]
         assert function_name == name
@@ -142,6 +142,47 @@ def test_without_the_extra_the_bundle_functions_raise_the_hint_when_called(missi
         assert all(PACKAGES[module] in message for module in missing), message
         assert missing_name.split(".")[0] in missing
         assert cause == "ModuleNotFoundError"
+
+
+def test_without_the_extra_load_bundle_and_load_corpus_succeed(tmp_path, figure_pdf):
+    import datagrunt
+    import datagrunt.pdf
+
+    bundle_dir = tmp_path / "bundle"
+    corpus_dir = tmp_path / "corpus"
+    datagrunt.PDFWriter(figure_pdf, dpi=72, vision_dpi=72).write_bundle(bundle_dir)
+    datagrunt.pdf.extract_corpus(figure_pdf, corpus_dir, dpi=72, vision_dpi=72)
+
+    result = run_python(
+        blocking(EXTRA_MODULES)
+        + textwrap.dedent(
+            f"""
+            import json
+            import datagrunt
+            import datagrunt.pdf
+
+            bundle_dir = {str(bundle_dir)!r}
+            corpus_dir = {str(corpus_dir)!r}
+            doc_pdf = datagrunt.pdf.load_bundle(bundle_dir)
+            doc_top = datagrunt.load_bundle(bundle_dir)
+            manifest_pdf = datagrunt.pdf.load_corpus(corpus_dir)
+            manifest_top = datagrunt.load_corpus(corpus_dir)
+            corpus_docs = manifest_pdf.load_documents()
+            print(
+                json.dumps(
+                    [
+                        doc_pdf == doc_top == corpus_docs[0],
+                        manifest_pdf == manifest_top,
+                        len(corpus_docs),
+                        len(doc_pdf.pages[0].page_image.read_bytes()) > 0,
+                    ]
+                )
+            )
+            """
+        )
+    )
+
+    assert result == [True, True, 1, True]
 
 
 # What a later install adds: a package of the extra that was not installed, or a module of Pillow it lacked.
@@ -166,7 +207,7 @@ def test_the_extra_installed_after_a_stand_in_was_taken_loads_the_real_names(ins
             from datagrunt.pdf._extra import LAZY_CLASSES, LAZY_FUNCTIONS
 
             modules = {**LAZY_CLASSES, **LAZY_FUNCTIONS}
-            paths = [("datagrunt.pdf", name) for name in modules] + [("datagrunt", name) for name in LAZY_CLASSES]
+            paths = [("datagrunt.pdf", name) for name in modules] + [("datagrunt", name) for name in modules]
 
             def refusal(value):
                 try:
@@ -188,8 +229,8 @@ def test_the_extra_installed_after_a_stand_in_was_taken_loads_the_real_names(ins
         )
     )
 
-    expected = [f"datagrunt.pdf.{name}" for name in ("PDFReader", "PDFWriter", "load_bundle", "write_bundle")]
-    expected += ["datagrunt.PDFReader", "datagrunt.PDFWriter"]
+    expected = [f"datagrunt.pdf.{name}" for name in ("PDFReader", "PDFWriter", "write_bundle", "extract_corpus")]
+    expected += [f"datagrunt.{name}" for name in ("PDFReader", "PDFWriter", "write_bundle", "extract_corpus")]
     assert result["before"] == dict.fromkeys(expected, ["ImportError", True])
     assert result["after"] == dict.fromkeys(expected, [True, True])
 

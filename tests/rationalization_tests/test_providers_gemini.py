@@ -57,6 +57,7 @@ from datagrunt.rationalization.providers.base import (
     parse_model_string,
 )
 from datagrunt.rationalization.providers.gemini import (
+    FROM_MODEL_STRING_OPTIONS,
     GEMINI_API_KEY_ENV,
     SCHEMA_MAX_DEPTH,
     SCHEMA_MAX_NODES,
@@ -859,9 +860,21 @@ class TestGoogleCloudAuth:
         for name in ("project", "location", "auth"):
             assert regular[name].kind is inspect.Parameter.KEYWORD_ONLY
             assert regular[name].default is inspect.Parameter.empty
-        assert list(explicit) == ["model", "auth", "temperature", "seed", "max_connections", "transport"]
+        assert list(explicit) == [
+            "model",
+            "auth",
+            "temperature",
+            "seed",
+            "thinking_level",
+            "max_connections",
+            "transport",
+        ]
         assert explicit["auth"].default is inspect.Parameter.empty
-        assert (explicit["temperature"].default, explicit["seed"].default) == (None, 0)
+        assert (
+            explicit["temperature"].default,
+            explicit["seed"].default,
+            explicit["thinking_level"].default,
+        ) == (None, 0, None)
 
     def test_the_docstrings_say_what_express_mode_and_global_give_up(self):
         express_doc = " ".join(GeminiProvider.google_cloud_express.__doc__.split())
@@ -2288,6 +2301,122 @@ class TestLifecycle:
         provider.open()
 
         assert handler.seen == []
+
+
+def from_model_string_gemini(handler=None, **options):
+    handler = Recorder() if handler is None else handler
+    options.setdefault("api_key", KEY)
+    return GeminiProvider.from_model_string(
+        parse_model_string(f"gemini:{MODEL}"), transport=httpx.MockTransport(handler), **options
+    )
+
+
+class TestThinkingLevel:
+    def test_constants_expose_thinking_levels_and_from_model_string_option(self):
+        assert gemini_module.THINKING_LEVELS == frozenset({"LOW", "MEDIUM", "HIGH"})
+        assert type(gemini_module.THINKING_LEVELS) is frozenset
+        assert "thinking_level" in FROM_MODEL_STRING_OPTIONS
+
+    def test_signatures_expose_thinking_level_keyword_defaulting_to_none(self):
+        init_params = inspect.signature(GeminiProvider.__init__).parameters
+        cloud_params = inspect.signature(GeminiProvider.google_cloud).parameters
+        express_params = inspect.signature(GeminiProvider.google_cloud_express).parameters
+
+        assert list(init_params) == [
+            "self",
+            "model",
+            "api_key",
+            "temperature",
+            "seed",
+            "thinking_level",
+            "max_connections",
+            "transport",
+        ]
+        assert list(cloud_params) == [
+            "model",
+            "project",
+            "location",
+            "auth",
+            "temperature",
+            "seed",
+            "thinking_level",
+            "max_connections",
+            "transport",
+        ]
+        assert list(express_params) == [
+            "model",
+            "auth",
+            "temperature",
+            "seed",
+            "thinking_level",
+            "max_connections",
+            "transport",
+        ]
+        for params in (init_params, cloud_params, express_params):
+            assert params["thinking_level"].kind is inspect.Parameter.KEYWORD_ONLY
+            assert params["thinking_level"].default is None
+
+    @pytest.mark.parametrize("make", [gemini, cloud, express, from_model_string_gemini])
+    @pytest.mark.parametrize("given", [{}, {"thinking_level": None}], ids=["default", "none"])
+    def test_none_thinking_level_is_omitted_from_generation_params_and_wire(self, make, given):
+        handler = Recorder()
+        provider = make(handler, **given)
+
+        provider.generate(request_for(provider))
+
+        config = sent_json(handler.seen[0])["generationConfig"]
+        assert "thinking_level" not in provider.generation_params
+        assert "thinkingConfig" not in config
+
+    @pytest.mark.parametrize("make", [gemini, cloud, express, from_model_string_gemini])
+    @pytest.mark.parametrize("level", ["LOW", "MEDIUM", "HIGH"])
+    def test_thinking_level_is_in_generation_params_and_sent_as_thinking_config(self, make, level):
+        handler = Recorder()
+        provider = make(handler, thinking_level=level)
+
+        provider.generate(request_for(provider))
+
+        config = sent_json(handler.seen[0])["generationConfig"]
+        assert provider.generation_params["thinking_level"] == level
+        assert config["thinkingConfig"] == {"thinkingLevel": level}
+
+    def test_each_thinking_level_produces_distinct_generation_params(self):
+        seen = [gemini(thinking_level=level).generation_params for level in (None, "LOW", "MEDIUM", "HIGH")]
+
+        assert len({json.dumps(params, sort_keys=True) for params in seen}) == 4
+
+    @pytest.mark.parametrize("make", [gemini, cloud, express, from_model_string_gemini])
+    @pytest.mark.parametrize("bad", [123, True, False, 1.5, ["LOW"], b"LOW", ("LOW",)])
+    def test_a_non_str_thinking_level_is_refused(self, make, bad):
+        with pytest.raises(RationalizationError, match="thinking_level must be None or a str") as raised:
+            make(thinking_level=bad)
+
+        assert_secret_free(str(raised.value) + traceback_text(raised.value))
+
+    def test_a_str_subclass_thinking_level_is_refused_without_its_value(self):
+        class SneakyLevel(str):
+            pass
+
+        with pytest.raises(RationalizationError, match="thinking_level must be None or a str") as raised:
+            gemini(thinking_level=SneakyLevel(KEY))
+
+        assert_secret_free(str(raised.value) + traceback_text(raised.value))
+
+    @pytest.mark.parametrize("make", [gemini, cloud, express, from_model_string_gemini])
+    @pytest.mark.parametrize(
+        "bad",
+        ["MINIMAL", "low", "medium", "high", "NONE", "", " LOW ", KEY, "canary-secret-hunter2"],
+    )
+    def test_an_invalid_str_thinking_level_is_refused_without_echoing_value(self, make, bad):
+        with pytest.raises(
+            RationalizationError, match='thinking_level must be None, "LOW", "MEDIUM" or "HIGH"'
+        ) as raised:
+            make(thinking_level=bad)
+
+        text = str(raised.value) + repr(raised.value) + traceback_text(raised.value)
+        assert_secret_free(text)
+        if bad:
+            assert bad not in text
 
 
 def test_the_module_imports_nothing_inside_functions_and_nothing_from_core():

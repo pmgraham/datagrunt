@@ -729,25 +729,120 @@ def group_scopes(document: PDFDocument) -> dict[str, GroupScope]:
     return found
 
 
-def _groups(document: PDFDocument) -> list[tuple[DocumentElement, _Group] | int]:
+def _groups(
+    document: PDFDocument, scopes: Mapping[str, GroupScope] | None = None
+) -> list[tuple[DocumentElement, _Group] | int]:
     """First pass: every element with its group, and every error page's number, in document order.
 
     Groups, their members and their scope paths are as module notes 2-4 say.
     """
-    scopes = group_scopes(document)
+    resolved_scopes = group_scopes(document) if scopes is None else scopes
     steps: list[tuple[DocumentElement, _Group] | int] = []
     groups: dict[tuple[str, int], _Group] = {}
     for page in document.pages:
         if page.status == "error":
             steps.append(page.page_number)
         for element in page.elements:
-            scope = scopes.get(element.element_id)
+            scope = resolved_scopes.get(element.element_id)
             key = ("page", page.page_number) if scope is None else ("section", scope.section)
             if key not in groups:
                 groups[key] = _Group((), 0) if scope is None else _Group(scope.path, scope.excluded)
             groups[key].take(element)
             steps.append((element, groups[key]))
     return steps
+
+
+def _common_prefix(left: tuple[Heading, ...], right: tuple[Heading, ...]) -> tuple[Heading, ...]:
+    """The longest shared prefix of two visible opener sequences."""
+    matched = 0
+    for one, two in zip(left, right):
+        if one != two:
+            break
+        matched += 1
+    return left[:matched]
+
+
+def _shared_openers(scopes: Mapping[str, GroupScope], elements: Sequence[DocumentElement]) -> tuple[Heading, ...]:
+    """The longest common visible opener prefix across the groups of ``elements``."""
+    if not elements:
+        return ()
+    first_scope = scopes.get(elements[0].element_id)
+    if first_scope is None:
+        return ()
+    shared = first_scope.openers
+    for element in elements[1:]:
+        if not shared:
+            return ()
+        scope = scopes.get(element.element_id)
+        if scope is None:
+            return ()
+        if scope is not first_scope:
+            shared = _common_prefix(shared, scope.openers)
+    return shared
+
+
+def common_openers(document: PDFDocument, elements: Sequence[DocumentElement]) -> tuple[Heading, ...]:
+    """Return the longest common visible opener prefix across the groups of ``elements``."""
+    if not isinstance(document, PDFDocument):
+        raise TypeError(f"document must be a PDFDocument, got {type(document).__name__}")
+    if not isinstance(elements, Sequence) or isinstance(elements, (str, bytes)):
+        raise TypeError(f"elements must be a Sequence of DocumentElement, got {type(elements).__name__}")
+    return _shared_openers(group_scopes(document), elements)
+
+
+def _draft_scope(scopes: Mapping[str, GroupScope], elements: Sequence[DocumentElement]) -> tuple[tuple[str, ...], int]:
+    """The common scope_path and summed excluded count across the distinct groups of ``elements``."""
+    openers = _shared_openers(scopes, elements)
+    seen_sections: set[int] = set()
+    excluded = 0
+    for element in elements:
+        scope = scopes.get(element.element_id)
+        if scope is not None and scope.section not in seen_sections:
+            seen_sections.add(scope.section)
+            excluded += scope.excluded
+    return tuple(opener.text for opener in openers), excluded
+
+
+class _Coalescer:
+    """Packs elements across consecutive text-bearing groups into coalesced drafts, flushing on error pages."""
+
+    __slots__ = ("drafts", "current", "leading")
+
+    def __init__(self) -> None:
+        self.drafts: list[_Draft] = []
+        self.current: _Draft | None = None
+        self.leading: dict[str, int] = {}
+
+    def flush(self) -> None:
+        """Close the active draft at an error page so later elements start a new unit."""
+        self.current = None
+
+    def pack(self, element: DocumentElement, limit: int, render: Renderer) -> list[_Draft]:
+        """Place ``element`` into the active coalesced draft or open new draft(s); return any opened drafts."""
+        if element.hidden_reasons:
+            target = self.current.hidden if self.current is not None else self.leading
+            _count(target, element.hidden_reasons)
+            return []
+        opened: list[_Draft] = []
+        for part, piece, block in _pieces(element, limit, render):
+            oversize = len(block) > limit
+            if oversize or self.current is None or not self.current.fits(block, limit):
+                draft = _Draft((), 0, oversize=oversize, hidden=dict(self.leading))
+                self.leading.clear()
+                self.drafts.append(draft)
+                self.current = draft
+                opened.append(draft)
+            self.current.add(piece, block, part)
+        return opened
+
+    def finish(self, scopes: Mapping[str, GroupScope]) -> None:
+        """Assign each coalesced draft its common scope path and excluded count, and attach trailing hidden counts."""
+        if self.leading and self.drafts:
+            for reason, count in self.leading.items():
+                self.drafts[-1].hidden[reason] = self.drafts[-1].hidden.get(reason, 0) + count
+            self.leading.clear()
+        for draft in self.drafts:
+            draft.scope_path, draft.scope_excluded = _draft_scope(scopes, draft.elements)
 
 
 def _pack(
@@ -768,6 +863,29 @@ def _pack(
             stream.extend(group.pack(element, limit, render))
         elif element is group.members[0]:
             stream.append(group)
+    return stream
+
+
+def _pack_coalesced(
+    steps: list[tuple[DocumentElement, _Group] | int],
+    scopes: Mapping[str, GroupScope],
+    limit: int,
+    render: Renderer,
+) -> list[_Draft | _Group | int]:
+    """Second pass when ``coalesce_sections=True``: pack across text-bearing groups, flushing on error pages."""
+    stream: list[_Draft | _Group | int] = []
+    coalescer = _Coalescer()
+    for step in steps:
+        if isinstance(step, int):
+            coalescer.flush()
+            stream.append(step)
+            continue
+        element, group = step
+        if group.has_text:
+            stream.extend(coalescer.pack(element, limit, render))
+        elif element is group.members[0]:
+            stream.append(group)
+    coalescer.finish(scopes)
     return stream
 
 
@@ -816,7 +934,7 @@ def _totals(document: PDFDocument) -> tuple[HiddenCounts, int]:
     return _counts(counter), len(hidden)
 
 
-def _check_inputs(document: object, max_unit_chars: object, render: object) -> None:
+def _check_inputs(document: object, max_unit_chars: object, render: object, coalesce_sections: object = False) -> None:
     if not isinstance(document, PDFDocument):
         raise TypeError(f"document must be a PDFDocument, got {type(document).__name__}")
     if not _is_int(max_unit_chars):
@@ -825,9 +943,16 @@ def _check_inputs(document: object, max_unit_chars: object, render: object) -> N
         raise ValueError(f"max_unit_chars must be >= 1, got {max_unit_chars}")
     if not callable(render):
         raise TypeError(f"render must be callable, got {type(render).__name__}")
+    _check_bool("coalesce_sections", coalesce_sections)
 
 
-def build_units(document: PDFDocument, *, max_unit_chars: int, render: Renderer) -> UnitPlan:
+def build_units(
+    document: PDFDocument,
+    *,
+    max_unit_chars: int,
+    render: Renderer,
+    coalesce_sections: bool = False,
+) -> UnitPlan:
     """Group, render and pack a document's visible elements into units (module notes).
 
     Args:
@@ -835,22 +960,31 @@ def build_units(document: PDFDocument, *, max_unit_chars: int, render: Renderer)
         max_unit_chars: The most characters a unit's body holds, unless it is one oversize block (>= 1).
         render: Turns one visible element, or a part of a split one, into its non-empty block; it never sees a
             hidden one. It must be pure: it may be called more than once for the same rows (:data:`Renderer`).
+        coalesce_sections: When ``True``, pack consecutive text-bearing groups greedily across section boundaries
+            up to ``max_unit_chars``, using the longest common visible opener prefix as ``scope_path``.
 
     Returns:
         The units and skipped units in document order, with the hidden counts and the dropped scope entries.
 
     Raises:
         TypeError: If ``document`` is not a ``PDFDocument``, ``max_unit_chars`` not an ``int`` (a ``bool`` is not
-            one), ``render`` not callable, or ``render`` returns something other than a ``str`` (naming the
-            element).
+            one), ``render`` not callable, ``coalesce_sections`` not a ``bool``, or ``render`` returns something
+            other than a ``str`` (naming the element).
         ValueError: If ``max_unit_chars`` is below 1, or ``render`` returns an empty block (naming the element).
     """
-    _check_inputs(document, max_unit_chars, render)
+    _check_inputs(document, max_unit_chars, render, coalesce_sections)
     doc_id = document.metadata.doc_id
     routes = {page.page_number: page.route for page in document.pages}
+    scopes = group_scopes(document)
+    steps = _groups(document, scopes)
+    packed = (
+        _pack_coalesced(steps, scopes, max_unit_chars, render)
+        if coalesce_sections
+        else _pack(steps, max_unit_chars, render)
+    )
     units: list[Unit] = []
     skipped: list[SkippedUnit] = []
-    for item in _pack(_groups(document), max_unit_chars, render):
+    for item in packed:
         if isinstance(item, _Draft) and any(_has_text(element) for element in item.elements):
             units.append(_unit(doc_id, routes, item))
         else:
