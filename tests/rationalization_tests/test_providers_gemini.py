@@ -2380,6 +2380,33 @@ class TestThinkingLevel:
         assert provider.generation_params["thinking_level"] == level
         assert config["thinkingConfig"] == {"thinkingLevel": level}
 
+    @pytest.mark.parametrize("make", [gemini, cloud, express, from_model_string_gemini])
+    @pytest.mark.parametrize(
+        ("given", "expected"),
+        [
+            ("low", "LOW"),
+            ("medium", "MEDIUM"),
+            ("high", "HIGH"),
+            ("Low", "LOW"),
+            ("MeDiUm", "MEDIUM"),
+            ("hIgH", "HIGH"),
+            (" low ", "LOW"),
+            ("  MEDIUM\n", "MEDIUM"),
+            ("\tHigh\t", "HIGH"),
+        ],
+    )
+    def test_lowercase_and_mixed_case_thinking_level_is_normalized_to_uppercase(self, make, given, expected):
+        handler = Recorder()
+        provider = make(handler, thinking_level=given)
+
+        provider.generate(request_for(provider))
+
+        config = sent_json(handler.seen[0])["generationConfig"]
+        assert provider.generation_params["thinking_level"] == expected
+        assert config["thinkingConfig"] == {"thinkingLevel": expected}
+        assert provider.generation_params == make(thinking_level=expected).generation_params
+        assert gemini(thinking_level="low").generation_params == gemini(thinking_level="LOW").generation_params
+
     def test_each_thinking_level_produces_distinct_generation_params(self):
         seen = [gemini(thinking_level=level).generation_params for level in (None, "LOW", "MEDIUM", "HIGH")]
 
@@ -2405,7 +2432,7 @@ class TestThinkingLevel:
     @pytest.mark.parametrize("make", [gemini, cloud, express, from_model_string_gemini])
     @pytest.mark.parametrize(
         "bad",
-        ["MINIMAL", "low", "medium", "high", "NONE", "", " LOW ", KEY, "canary-secret-hunter2"],
+        ["", "   ", "MINIMAL", "NONE", KEY, "canary-secret-hunter2"],
     )
     def test_an_invalid_str_thinking_level_is_refused_without_echoing_value(self, make, bad):
         with pytest.raises(
@@ -2415,7 +2442,7 @@ class TestThinkingLevel:
 
         text = str(raised.value) + repr(raised.value) + traceback_text(raised.value)
         assert_secret_free(text)
-        if bad:
+        if bad.strip():
             assert bad not in text
 
 
