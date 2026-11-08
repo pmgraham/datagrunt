@@ -700,15 +700,18 @@ class TestAtomicWrite:
     def test_a_writer_killed_mid_run_leaves_no_output_dir(self, tmp_path, fast_render):
         pdf = build_pdf(tmp_path / "six.pdf", [PageSpec(items=(TextRun(f"Page {n}", 72.0, 100.0),)) for n in range(6)])
         out = tmp_path / "out"
+        # The pages' own images draw through _loaders.render_page (bundle.render_page draws only a page without one):
+        # the first page's render ends at once, every other one far later, so a page image is staged while the
+        # rest are drawing, whatever the bundle's workers.
         script = (
             "import sys, time\n"
-            "from datagrunt.pdf import bundle\n"
+            "from datagrunt.pdf import _loaders, bundle\n"
             "from datagrunt.pdf.pipeline import extract_document\n"
-            "real = bundle.render_page\n"
-            "def slow(*args, **kwargs):\n"
-            "    time.sleep(0.5)\n"
-            "    return real(*args, **kwargs)\n"
-            "bundle.render_page = slow\n"
+            "real = _loaders.render_page\n"
+            "def slow(source, page_index, **kwargs):\n"
+            "    time.sleep(0.0 if page_index == 0 else 60.0)\n"
+            "    return real(source, page_index, **kwargs)\n"
+            "_loaders.render_page = slow\n"
             "document = extract_document(sys.argv[1])\n"
             "bundle.write_bundle(document, sys.argv[2], source=sys.argv[1], dpi=72, vision_dpi=72)\n"
         )
