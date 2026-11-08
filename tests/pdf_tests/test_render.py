@@ -30,6 +30,7 @@ from pdf_tests.test_pdfium_images import (
     flate_bomb,
     gray,
     image_xobject,
+    images_of,
     j2k,
     jpeg_bytes,
     jpeg_with_components,
@@ -316,6 +317,22 @@ class TestImageGuard:
 
         expected = f"object 1 was not read: the page's {len(FLATE) + len(SAMPLES)}-byte image stream budget is spent"
         assert refusal_of(path) == expected
+
+    def test_many_draws_of_a_stream_that_inflates_spend_the_page_budget_and_refuse_the_render(
+        self, tmp_path, monkeypatch
+    ):
+        # The guard charges each draw's inflated samples to the page budget, as A2 does (a page whose images
+        # decode past it is refused before pdfium decodes one), however much room one draw's own bound leaves.
+        samples = bytes(64 * 64 * 3)
+        raw = zlib.compress(samples)
+        entries = b"/Width 64 /Height 64 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode"
+        content = b"".join(b"q 8 0 0 8 %d 20 cm /Im Do Q " % (10 + 9 * index) for index in range(20))
+        path = xobject_page(tmp_path, raw, entries, content=content)
+        budget = 12 * (len(raw) + len(samples))  # twelve draws: each raw copy and its inflation
+        monkeypatch.setattr(_pdfium_images, "_MAX_PAGE_STREAM_BYTES", budget)
+
+        assert refusal_of(path) == f"object 12 was not read: the page's {budget}-byte image stream budget is spent"
+        assert images_of(path).stats.skipped_over_budget_images == 8  # A2 skips the same draws: they agree
 
     def test_an_image_drawn_under_an_overflowing_cm_refuses_the_render(self, tmp_path):
         # Its decode size is never read (A2 skips it), so it cannot pass the bounds.

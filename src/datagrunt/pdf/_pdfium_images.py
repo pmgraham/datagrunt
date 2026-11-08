@@ -462,12 +462,14 @@ def _guard_page_image(
     unread: RawImage,
     budget: _PageBudget,
 ) -> tuple[RawImage, Refusal | None]:
-    """Check image object ``label`` for render-guard refusals without reading metadata or hashing streams."""
+    """Check image object ``label`` for render-guard refusals without reading metadata or hashing streams.
+
+    The page budget is charged exactly as :func:`pixel_facts` charges it (the raw copy, the codestream header's
+    read and every piece the stream check inflates), so the guard refuses the draws A2 skips as over budget.
+    """
     codec = filters[-1] if filters else ""
     needs_header = codec in _HEADER_READERS
-    checked = _checked_filters(filters)
-    max_stream_charge = len(checked) * (stream_limit(declared[0], declared[1]) + 65536) if checked else 0
-    needs_stream_check = bool(checked) and budget.remaining <= max_stream_charge
+    needs_stream_check = bool(_checked_filters(filters))
     raw = _copied_raw_stream(image, size, label) if (needs_header or needs_stream_check) else b""
     wrapped = partial(wrapped_codestream, image, filters, raw, label, budget.charge)
     try:
