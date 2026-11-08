@@ -1783,12 +1783,13 @@ class TestImageOnlyPagesLeftUnwritten:
 
     @pytest.mark.parametrize("flag", ["render_pages", "include_images"])
     def test_an_opt_out_warns_once_naming_the_pages(self, tmp_path, source, fast_render, flag):
+        document = with_image_only(bound_document(source), IMAGE_ONLY)
         expected = (
-            f"pages [2, 3, 4] hold content only in their page images, which this bundle does not write ({flag}=False); "
-            "the source PDF is their only full copy"
+            f"pages [2, 3, 4] of {document.metadata.source_name} hold content only in their page images, which the "
+            f"bundle at {tmp_path / 'out'} does not write ({flag}=False); the source PDF is their only full copy"
         )
         with pytest.warns(UserWarning, match=re.escape(expected)) as caught:
-            write(with_image_only(bound_document(source), IMAGE_ONLY), tmp_path / "out", source, **{flag: False})
+            write(document, tmp_path / "out", source, **{flag: False})
 
         assert only_copy_warnings(caught) == [expected]
 
@@ -1813,8 +1814,9 @@ class TestImageOnlyPagesLeftUnwritten:
         monkeypatch.setattr(bundle, "render_page", refusing)
         document = with_image_only(bound_document(source, image=b"GIF89a"), IMAGE_ONLY)
         expected = (
-            "pages [2, 3] hold content only in their page images, which this bundle could not write "
-            "(manifest.json's missing entries say why); the source PDF is their only full copy"
+            f"pages [2, 3] of {document.metadata.source_name} hold content only in their page images, which the bundle "
+            f"at {tmp_path / 'out'} could not write (manifest.json's missing entries say why); the source PDF is their "
+            "only full copy"
         )
         with pytest.warns(UserWarning, match=re.escape(expected)) as caught:
             returned = write(document, tmp_path / "out", source)
@@ -1839,8 +1841,9 @@ class TestImageOnlyPagesLeftUnwritten:
         unbound = f"own image renders from {other.resolve()}, not from the source {source.resolve()}"
         assert [str(w.message) for w in caught] == [
             f"page 3's {unbound}: no page image is written for it",
-            "pages [3] hold content only in their page images, which this bundle could not write "
-            "(manifest.json's missing entries say why); the source PDF is their only full copy",
+            f"pages [3] of {document.metadata.source_name} hold content only in their page images, which the bundle "
+            f"at {tmp_path / 'out'} could not write (manifest.json's missing entries say why); the source PDF is "
+            "their only full copy",
         ]
         assert page_image_reasons(tmp_path / "out") == [
             (
@@ -1854,7 +1857,7 @@ class TestImageOnlyPagesLeftUnwritten:
         # Reuse writes nothing and emits none of the write's warnings (an unbound image's neither): the bundle's
         # manifest, written by the first write, still says so.
         out = tmp_path / "out"
-        with pytest.warns(UserWarning, match=r"pages \[2, 3, 4\] hold content only"):
+        with pytest.warns(UserWarning, match=r"pages \[2, 3, 4\] of \S+ hold content only"):
             first = write(with_image_only(bound_document(source), IMAGE_ONLY), out, source, render_pages=False)
         before, manifest = tree_of(out), (out / "manifest.json").read_bytes()
         recwarn.clear()

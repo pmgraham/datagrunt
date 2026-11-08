@@ -19,6 +19,7 @@ checked where tesseract is installed.
 import dataclasses
 import json
 import re
+import warnings
 from pathlib import Path
 
 import pytest
@@ -254,11 +255,12 @@ def only_copy_warnings(caught) -> list[str]:
     return [str(w.message) for w in caught if "hold content only in their page images" in str(w.message)]
 
 
-# The warning a bundle of the mixed document under render_pages=False emits: pages 2, 4 and 5 are marked.
-SKIPPED_MIXED = (
-    "pages [2, 4, 5] hold content only in their page images, which this bundle does not write (render_pages=False); "
-    "the source PDF is their only full copy"
-)
+def skipped_notice(source_name: str, pages: list[int], out: Path, why: str = "render_pages=False") -> str:
+    """The warning a bundle at ``out`` emits when ``why`` skipped its page images, naming the document and bundle."""
+    return (
+        f"pages {pages} of {source_name} hold content only in their page images, which the bundle at {out} does not "
+        f"write ({why}); the source PDF is their only full copy"
+    )
 
 
 class TestABundleThatLeavesAnImageOnlyPageUnwrittenSaysSo:
@@ -266,7 +268,8 @@ class TestABundleThatLeavesAnImageOnlyPageUnwrittenSaysSo:
 
     def test_render_pages_false(self, pdfs, extracted, tmp_path):
         out = tmp_path / "out"
-        with pytest.warns(UserWarning, match=re.escape(SKIPPED_MIXED)) as caught:
+        expected = skipped_notice("mixed.pdf", [2, 4, 5], out)
+        with pytest.warns(UserWarning, match=re.escape(expected)) as caught:
             returned = write_bundle(extracted("mixed", "never"), out, source=pdfs["mixed"], dpi=72, render_pages=False)
 
         skipped = "the page was not rendered: render_pages=False"
@@ -277,15 +280,28 @@ class TestABundleThatLeavesAnImageOnlyPageUnwrittenSaysSo:
             (4, skipped + only_copy("too_little_text")),
             (5, skipped + only_copy("extraction_failed")),
         ]
-        assert only_copy_warnings(caught) == [SKIPPED_MIXED]
+        assert only_copy_warnings(caught) == [expected]
         assert not (out / "page_images").exists() and load_bundle(out) == returned
+
+    def test_two_documents_warn_apart_under_the_default_filter(self, pdfs, extracted, tmp_path):
+        # "short" and "garbled" are marked on page 1 alone: the same page list. Python's default filter shows
+        # one warning a text and a place, so each must name its document and bundle (an extract_corpus run).
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("default")
+            for name in ("short", "garbled"):
+                write_bundle(extracted(name, "never"), tmp_path / name, source=pdfs[name], dpi=72, render_pages=False)
+
+        assert only_copy_warnings(caught) == [
+            skipped_notice(pdfs[name].name, [1], tmp_path / name) for name in ("short", "garbled")
+        ]
 
     def test_pdfwriter_write_bundle_warns_as_write_bundle_does(self, pdfs, tmp_path):
         writer = PDFWriter(pdfs["mixed"], ocr="never", dpi=72)
-        with pytest.warns(UserWarning, match=re.escape(SKIPPED_MIXED)) as caught:
+        expected = skipped_notice("mixed.pdf", [2, 4, 5], tmp_path / "out")
+        with pytest.warns(UserWarning, match=re.escape(expected)) as caught:
             writer.write_bundle(tmp_path / "out", render_pages=False)
 
-        assert only_copy_warnings(caught) == [SKIPPED_MIXED]
+        assert only_copy_warnings(caught) == [expected]
         assert page_image_reasons(tmp_path / "out")[4] == (
             5,
             "the page was not rendered: render_pages=False" + only_copy("extraction_failed"),
@@ -294,8 +310,8 @@ class TestABundleThatLeavesAnImageOnlyPageUnwrittenSaysSo:
     def test_a_failed_render(self, pdfs, extracted, tmp_path):
         # Page 5 is a page pdfium cannot load: its render fails too, so no output holds it but the PDF.
         expected = (
-            "pages [5] hold content only in their page images, which this bundle could not write "
-            "(manifest.json's missing entries say why); the source PDF is their only full copy"
+            f"pages [5] of mixed.pdf hold content only in their page images, which the bundle at {tmp_path / 'out'} "
+            "could not write (manifest.json's missing entries say why); the source PDF is their only full copy"
         )
         with pytest.warns(UserWarning, match=re.escape(expected)) as caught:
             write_bundle(extracted("mixed", "never"), tmp_path / "out", source=pdfs["mixed"], dpi=72)
@@ -318,8 +334,9 @@ class TestPageRendersThatSkipAnImageOnlyPageSaySo:
 
     def test_the_skipped_image_only_page_is_named_once(self, pdfs, tmp_path):
         expected = (
-            "pages [5] hold content only in their page images, which render_pages_as_images could not render "
-            "(the datagrunt.pdf.writer log says why); the source PDF is their only full copy"
+            f"pages [5] of mixed.pdf hold content only in their page images, which render_pages_as_images could not "
+            f"render into {tmp_path / 'pages'} (the datagrunt.pdf.writer log says why); the source PDF is their only "
+            "full copy"
         )
         writer = PDFWriter(pdfs["mixed"], ocr="never")
         with pytest.warns(UserWarning, match=re.escape(expected)) as caught:

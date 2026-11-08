@@ -467,7 +467,8 @@ A bundle written with `render_pages=False` or `include_images=False`, or one
 whose render of a marked page fails, warns (`UserWarning`) that it holds no
 full copy of those pages (a figure on one may still be written); their
 `missing` entries in `manifest.json` say so too. `rationalize()` skips a marked page as a skipped unit of reason
-`image_only` rather than send its text to a model.
+`image_only` rather than send its text to a model (an error page stays
+`page_error`).
 
 A page read by OCR at a mean word confidence under 70 carries a warning that
 it may be turned the wrong way or unreadable, so its text shouldn't be trusted
@@ -522,7 +523,7 @@ Install the `[rationalize]` extra (`pydantic` and `httpx`) alongside `[pdf]`:
 uv pip install "datagrunt[pdf,rationalize]"
 ```
 
-`rationalize()` extracts structured Pydantic records from one or more PDF documents (`PDFDocument`, PDF path, bundle path, or a sequence of them). Hidden elements (`hidden_reasons` non-empty) and image-only pages (`image_only_reasons` non-empty; reported in `result.skipped_units` with reason `"image_only"`) are excluded before any model request is built, bidi/tag/control characters are escaped in the wire envelope, and every model response is validated, compared across model families, grounded against the cited visible elements, and folded across pages by entity key:
+`rationalize()` extracts structured Pydantic records from one or more PDF documents (`PDFDocument`, PDF path, bundle path, or a sequence of them). Hidden elements (`hidden_reasons` non-empty) and image-only pages (`image_only_reasons` non-empty; reported in `result.skipped_units` with reason `"image_only"`, or `"page_error"` for an error page) are excluded before any model request is built, bidi/tag/control characters are escaped in the wire envelope, and every model response is validated, compared across model families, grounded against the cited visible elements, and folded across pages by entity key:
 
 ```python
 from decimal import Decimal

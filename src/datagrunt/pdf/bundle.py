@@ -162,8 +162,9 @@ scan's own picture) is still written as any figure is, unless
 written; instead its ``missing`` page image entry's reason ends
 ``"; its content lives only in its page image (<its reasons, joined by
 ', '>): the source PDF is its only full copy"`` (every other entry is as it
-would be), and one ``UserWarning`` a write names those pages and the cause
-(the option, or the manifest's ``missing`` entries for the failures),
+would be), and one ``UserWarning`` a write names those pages, the
+document (its ``source_name``), the bundle's path and the cause (the
+option, or the manifest's ``missing`` entries for the failures),
 emitted once the bundle is published (:func:`_mark_only_copies`).
 
 The page images are bound to the hashed source. The source's identity
@@ -682,7 +683,7 @@ def _staged(
         renders = _skip_renders(document, ledger, skipped)
     else:
         renders = _write_renders(document, staging, source, options, ledger)
-    _mark_only_copies(document, renders, ledger, skipped)
+    _mark_only_copies(document, renders, ledger, skipped, target)
     _write_texts(document, figures, renders, staging, ledger)
     _write_bytes(staging, MANIFEST, _manifest(document, params, renders, ledger))
     by_path = {artifact.path: artifact for artifact in ledger.artifacts}
@@ -713,14 +714,18 @@ def _skip_renders(document: PDFDocument, ledger: _Ledger, why: str) -> dict[int,
     return {}
 
 
-def _mark_only_copies(document: PDFDocument, renders: Mapping[int, _Written], ledger: _Ledger, skipped: str) -> None:
+def _mark_only_copies(
+    document: PDFDocument, renders: Mapping[int, _Written], ledger: _Ledger, skipped: str, target: Path
+) -> None:
     """Say that the source PDF is the only full copy of each unwritten image-only page: its missing entry, one warning.
 
     An image-only page (#470) holds its content only in its page image: one
     the bundle does not write, whatever the cause, leaves the source PDF its
     only full copy (#471): a figure on the page, if written, is a part of it.
     Every other entry is left as it is. ``skipped`` is the option that
-    skipped every page image, or ``""``.
+    skipped every page image, or ``""``. The warning names the document and
+    the bundle (``target``): Python's default filter shows one warning a
+    text and a place, so a corpus of such documents still warns for each.
     """
     unwritten = {
         page.page_number: page.image_only_reasons
@@ -738,14 +743,14 @@ def _mark_only_copies(document: PDFDocument, renders: Mapping[int, _Written], le
         )
         ledger.missing[index] = entry._replace(reason=entry.reason + clause)
     unsaved = f"does not write ({skipped})" if skipped else "could not write (manifest.json's missing entries say why)"
-    ledger.warnings.append(_only_copy_notice(sorted(unwritten), f"this bundle {unsaved}"))
+    notice = _only_copy_notice(document.metadata.source_name, sorted(unwritten), f"the bundle at {target} {unsaved}")
+    ledger.warnings.append(notice)
 
 
-def _only_copy_notice(pages: list[int], unsaved: str) -> str:
-    """The warning that image-only ``pages``' page images were not written (``unsaved`` says by what, and why)."""
-    return (
-        f"pages {pages} hold content only in their page images, which {unsaved}; the source PDF is their only full copy"
-    )
+def _only_copy_notice(source_name: str, pages: list[int], unsaved: str) -> str:
+    """The warning that image-only ``pages`` of ``source_name`` were not written (``unsaved`` says where, and why)."""
+    held = f"pages {pages} of {source_name} hold content only in their page images"
+    return f"{held}, which {unsaved}; the source PDF is their only full copy"
 
 
 @dataclass

@@ -100,8 +100,8 @@ Each method writes the document in one form. A path returned is absolute
   skipped, never silently: a warning on the module logger names the page
   and why. The image-only pages skipped (``Page.image_only_reasons``,
   #470), whose content lives only in their page images, are also named in
-  one ``UserWarning`` a call: the source PDF is their only full copy (#471, as
-  the bundle warns). Any other error fails the call. The paths returned are
+  one ``UserWarning`` a call, with the document and ``output_dir``: the
+  source PDF is their only full copy (#471, as the bundle warns). Any other error fails the call. The paths returned are
   the files written, in page order. The PDF rendered is the file at the
   source path when the call runs.
 - :meth:`PDFWriter.write_bundle`: A7a's
@@ -375,9 +375,9 @@ class PDFWriter:
         source = self._required_source("render_pages_as_images")
         directory = _directory_target(output_dir)
         target_dpi = self._options.dpi if dpi is None else int_at_least("dpi", dpi, _MIN_TARGET_DPI)
-        pages = self._extracted().pages
+        document = self._extracted()
         directory.mkdir(parents=True, exist_ok=True)
-        return _write_renders(pages, directory, source, target_dpi, self._options)
+        return _write_renders(document, directory, source, target_dpi, self._options)
 
     def write_bundle(
         self,
@@ -584,9 +584,13 @@ def _write_figures(figures: tuple[Figure, ...], directory: Path, *, dedupe: bool
 
 
 def _write_renders(
-    pages: tuple[Page, ...], directory: Path, source: PDFSource, dpi: int, options: PipelineOptions
+    document: PDFDocument, directory: Path, source: PDFSource, dpi: int, options: PipelineOptions
 ) -> list[Path]:
-    """Render and write every page on ``workers`` threads (the bundle's window); the paths written, in page order."""
+    """Render and write every page on ``workers`` threads (the bundle's window); the paths written, in page order.
+
+    The image-only pages skipped are named in one warning, with the document and ``directory`` (#471).
+    """
+    pages = document.pages
 
     def task(page: Page) -> Path | None:
         return _rendered(page, directory, source, dpi, options.max_render_pixels)
@@ -596,8 +600,9 @@ def _write_renders(
         page.page_number for page, path in zip(pages, outcomes, strict=True) if path is None and page.image_only_reasons
     ]
     if unrendered:
-        unsaved = f"render_pages_as_images could not render (the {_LOGGER.name} log says why)"
-        warnings.warn(_only_copy_notice(unrendered, unsaved), UserWarning, stacklevel=3)
+        unsaved = f"render_pages_as_images could not render into {directory} (the {_LOGGER.name} log says why)"
+        notice = _only_copy_notice(document.metadata.source_name, unrendered, unsaved)
+        warnings.warn(notice, UserWarning, stacklevel=3)
     return [path for path in outcomes if path is not None]
 
 
