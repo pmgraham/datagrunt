@@ -66,8 +66,9 @@ Layout (paths relative to the bundle, joined with ``/``):
   every other file's path, size and sha256 (by path), and each artifact
   that is missing and why (by page).
 
-PNGs are encoded with Pillow (the bundle's renders here; figures and own
-page images by their loaders); PDF content is decoded only by A1's loaders
+PNGs of page renders (the bundle's here; own page images by their loaders)
+are encoded by :mod:`datagrunt.pdf._png`, figures by Pillow in their
+loaders; PDF content is decoded only by A1's loaders
 and A5a's guarded render. A figure's or own page image's bytes must start
 with the PNG signature. Each file is created exclusively and streamed
 through a SHA-256 as it is written.
@@ -233,10 +234,9 @@ from dataclasses import dataclass, field
 from itertools import islice
 from pathlib import Path
 from types import MethodType
-from typing import IO, BinaryIO, NamedTuple, TypeVar, cast
+from typing import BinaryIO, NamedTuple, TypeVar
 
 import polars as pl
-from PIL import Image
 
 import datagrunt
 from datagrunt.pdf._bundle_load import (
@@ -268,6 +268,7 @@ from datagrunt.pdf._bundle_load import (
     _read_fd as _read_fd,
 )
 from datagrunt.pdf._loaders import PageDraw, PageRender, figure_pngs
+from datagrunt.pdf._png import write_grey_png
 from datagrunt.pdf._source import SourceIdentity, _opened_source, _stream_sha256
 from datagrunt.pdf._validate import checked_path as _checked_path
 from datagrunt.pdf._validate import strict_bool
@@ -1054,11 +1055,9 @@ def _drawn(source: PDFSource, page: Page, target_dpi: int, max_pixels: int) -> t
 
 
 def _write_png(staging: Path, relative: str, image: RenderedPage) -> _Artifact:
-    """Write 8-bit grey pixels as a PNG, encoded by Pillow straight into the file."""
-    picture = Image.frombytes("L", (image.px_width, image.px_height), image.pixels)
-    # Pillow needs only write() of a file object: a cast, not a conversion.
+    """Write 8-bit grey pixels as a PNG, encoded (:mod:`datagrunt.pdf._png`) straight into the file."""
     return _write_stream(
-        staging, relative, lambda sink: picture.save(cast(IO[bytes], sink), format="PNG", compress_level=1)
+        staging, relative, lambda sink: write_grey_png(sink.write, image.pixels, image.px_width, image.px_height)
     )
 
 

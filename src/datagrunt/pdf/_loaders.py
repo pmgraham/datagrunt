@@ -64,7 +64,6 @@ refused) is that figure's outcome, raised as it was.
 """
 
 import dataclasses
-import io
 import os
 import stat
 import subprocess
@@ -75,11 +74,10 @@ from functools import partial
 from pathlib import Path
 from typing import IO, BinaryIO, Literal, NamedTuple
 
-from PIL import Image
-
 from datagrunt.pdf._image_facts import RawImage
 from datagrunt.pdf._memory_cap import ending
 from datagrunt.pdf._options import _RENDER_TIMEOUT_S, MEMORY_CAP_BYTES
+from datagrunt.pdf._png import grey_png
 from datagrunt.pdf._process import (
     MAX_REQUEST_BYTES,
     REAP_TIMEOUT_S,
@@ -406,9 +404,7 @@ def _removed(source: Path, when: str) -> PDFSourceChangedError:
 
 def _png(image: RenderedPage | Band) -> bytes:
     """8-bit grey pixels as PNG."""
-    buffer = io.BytesIO()
-    Image.frombytes("L", (image.px_width, image.px_height), image.pixels).save(buffer, format="PNG", compress_level=1)
-    return buffer.getvalue()
+    return grey_png(image.pixels, image.px_width, image.px_height)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

@@ -140,10 +140,10 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 import polars as pl
-from PIL import Image
 
 from datagrunt.pdf._loaders import figure_pngs
 from datagrunt.pdf._options import MIN_IMAGE_DIMENSION, OcrMode
+from datagrunt.pdf._png import write_grey_png
 from datagrunt.pdf._source import checked_pdf_file
 from datagrunt.pdf._validate import checked_password as _checked_password
 from datagrunt.pdf._validate import checked_path as _checked_path
@@ -588,6 +588,7 @@ def _rendered(page: Page, directory: Path, source: PDFSource, dpi: int, max_pixe
 
 
 def _write_png(target: Path, image: RenderedPage) -> Path:
-    """Write 8-bit grey pixels as a PNG, encoded by Pillow straight into the file."""
-    picture = Image.frombytes("L", (image.px_width, image.px_height), image.pixels)
-    return _write_atomically(target, lambda handle: picture.save(handle, format="PNG", compress_level=1))
+    """Write 8-bit grey pixels as a PNG, encoded (:mod:`datagrunt.pdf._png`) straight into the file."""
+    return _write_atomically(
+        target, lambda handle: write_grey_png(handle.write, image.pixels, image.px_width, image.px_height)
+    )
