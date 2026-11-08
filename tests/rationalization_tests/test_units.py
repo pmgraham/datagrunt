@@ -4,8 +4,9 @@ A unit is a run of a document's visible elements, each rendered to the block the
 test: hidden elements never reach a unit or the renderer, whatever their reason, and are counted per reason
 (invariant 1); every visible element of every non-error page is in exactly one unit, untruncated (invariant 5),
 grouped by section, else by page; blocks pack greedily up to ``max_unit_chars``; an oversize table or list splits
-by rows or items, every other oversize block goes whole into its own unit; error pages and all-hidden groups are
-skipped units, never silent; ids are deterministic; and the document is never modified (invariant 2).
+by rows or items, every other oversize block goes whole into its own unit; error pages, image-only pages (#472: none
+of their elements sent, their headings opening nothing) and all-hidden groups are skipped units, never silent; ids
+are deterministic; and the document is never modified (invariant 2).
 """
 
 import ast
@@ -23,7 +24,19 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf, solid_png
-from pdf_tests.documents import BOX, DETAILS, FIGURE_A_SHA, INTRO, OFF_PAGE, ids, metadata, page, rich_document
+from pdf_tests.documents import (
+    BOX,
+    DETAILS,
+    FIGURE_A_SHA,
+    INTRO,
+    OFF_PAGE,
+    ids,
+    image_only_document,
+    metadata,
+    page,
+    rich_document,
+    with_image_only,
+)
 
 from datagrunt.pdf import PDFReader
 from datagrunt.pdf.codec import document_to_json
@@ -150,6 +163,15 @@ def bullets(page_number: int, index: int, items, *, ordered=False, markers=(), s
 
 def error(number: int):
     return page(number, (), status="error", quality=None, error="pdfium: bad xref")
+
+
+GARBLED = ("garbled_text",)
+SECRET = "GARBLED-PAGE-TEXT"
+
+
+def marked(number: int, elements: tuple[DocumentElement, ...] = (), reasons=GARBLED, **extra):
+    """A digital page whose content lives only in its page image (``image_only_reasons`` non-empty, #472)."""
+    return page(number, elements, image_only_reasons=reasons, **extra)
 
 
 def document(*pages, sections=()) -> PDFDocument:
@@ -907,7 +929,7 @@ class TestNoText:
         assert unit.elements == elements
         assert plan.skipped == ()
 
-    def test_a_scan_page_without_ocr_is_a_no_text_skipped_unit(self, tmp_path, monkeypatch):
+    def test_a_scan_page_without_ocr_is_image_only_and_no_text_in_an_older_document(self, tmp_path, monkeypatch):
         scan = RasterImage(0.0, 0.0, 612.0, 792.0, solid_png(300, 400, (0.9, 0.9, 0.9)))
         alone = build_pdf(tmp_path / "scan.pdf", [PageSpec(items=(scan,))])
         after_text = build_pdf(
@@ -919,11 +941,24 @@ class TestNoText:
 
         doc = PDFReader(alone).document
         assert [(item.status, item.route) for item in doc.pages] == [("ocr_unavailable", "vision")]
+        assert doc.pages[0].image_only_reasons == ("too_little_text",)  # nothing read its image (#470)
+        plan = build_units(doc, max_unit_chars=BIG, render=never)
+        assert plan.units == ()
+        assert [(item.reason, item.page_numbers) for item in plan.skipped] == [("image_only", (1,))]
+
+        mixed = PDFReader(after_text).document
+        plan = build_units(mixed, max_unit_chars=BIG, render=markdown)
+        assert [(item.reason, item.page_numbers) for item in plan.skipped] == [("image_only", (2,))]
+        assert [unit.page_numbers for unit in plan.units] == [(1,)]
+        assert not any(isinstance(element, Figure) for element in plan.units[0].elements)
+
+        # A document that does not record the marker (5.0-5.2): the scan page has no text, and says so.
+        doc = with_image_only(doc, {1: None})
         plan = build_units(doc, max_unit_chars=BIG, render=never)
         assert plan.units == ()
         assert [(item.reason, item.page_numbers) for item in plan.skipped] == [("no_text", (1,))]
 
-        mixed = PDFReader(after_text).document
+        mixed = with_image_only(mixed, {2: None})
         plan = build_units(mixed, max_unit_chars=BIG, render=markdown)
         assert plan.skipped == ()
         assert [unit.page_numbers for unit in plan.units] == [(1, 2)]
@@ -1490,7 +1525,7 @@ class TestInputs:
 # Properties over generated documents
 # ---------------------------------------------------------------------------------------------------------------
 
-ROUTES = ("digital", "hybrid", "vision", "error")
+ROUTES = ("digital", "hybrid", "vision", "error", "image_only")  # image_only: a digital page marked garbled (#472)
 WORDS = st.text(alphabet="ab <|#*\n", min_size=1, max_size=24).filter(str.strip)
 CELLS = st.text(alphabet="ab <|\n", max_size=10)
 MARKERS = st.sampled_from(["1.", "2)", "a)", "•", "iv.", "(3)"])
@@ -1549,7 +1584,8 @@ def orphan(draw, number: int, index: int, run_index: int, texts: list[str], path
 
 @st.composite
 def documents(draw) -> PDFDocument:
-    """Up to 4 pages (digital, hybrid, vision or error); runs of elements as headed or plain sections, or none.
+    """Up to 4 pages (digital, hybrid, vision, error or image-only); runs of elements as headed or plain sections, or
+    none.
 
     Scope paths nest under :func:`prefixes`. A headed section's heading is listed first among its elements, or not
     listed, standing first or last among its members. Orphan headings may re-record an earlier heading's path.
@@ -1594,10 +1630,19 @@ def documents(draw) -> PDFDocument:
             span = (run[0][0], run[-1][0])
             sections.append(Section(heading=opener, scope_path=scope, page_span=span, elements=listed))
     pages = [
-        error(number) if route == "error" else page(number, tuple(on_page[number]), route=route)
+        error(number)
+        if route == "error"
+        else marked(number, tuple(on_page[number]))
+        if route == "image_only"
+        else page(number, tuple(on_page[number]), route=route)
         for number, route in enumerate(routes, start=1)
     ]
     return document(*pages, sections=sections)
+
+
+def closed_pages(doc: PDFDocument) -> set[int]:
+    """The pages skipped as image-only (the oracle): marked, and not error pages."""
+    return {item.page_number for item in doc.pages if item.image_only_reasons and item.status != "error"}
 
 
 def group_keys(doc: PDFDocument) -> dict[str, tuple[str, int]]:
@@ -1623,9 +1668,12 @@ def expected_order(doc: PDFDocument, keys: dict[str, tuple[str, int]]) -> tuple[
     """The groups with visible text, and the skipped units' ids and reasons, in document order."""
     members: dict[tuple[str, int], list[DocumentElement]] = {}
     events: list[object] = []
+    closed = closed_pages(doc)
     for number, item in enumerate(doc.pages, start=1):
-        if item.status == "error":
-            events.append(f"{DOC}:p{number:04d}")
+        if item.status == "error" or number in closed:
+            reason = "page_error" if item.status == "error" else "image_only"
+            events.append(("skipped", f"{DOC}:p{number:04d}", reason))
+            continue
         for element in item.elements:
             key = keys[element.element_id]
             if key not in members:
@@ -1634,8 +1682,8 @@ def expected_order(doc: PDFDocument, keys: dict[str, tuple[str, int]]) -> tuple[
             members[key].append(element)
     groups, skipped = [], []
     for event in events:
-        if isinstance(event, str):
-            skipped.append((event, "page_error"))
+        if event[0] == "skipped":
+            skipped.append(event[1:])
             continue
         group = members[event]
         visible = [element for element in group if not element.hidden_reasons]
@@ -1752,7 +1800,12 @@ def check_coverage(doc: PDFDocument, plan: UnitPlan, limit: int, render, monoton
     for unit in plan.units:
         for element, part in zip(unit.elements, unit.part_of):
             entries.setdefault(element.element_id, []).append((element, part))
-    visible = [element for element in doc.elements if not element.hidden_reasons and keys[element.element_id] in groups]
+    closed = closed_pages(doc)
+    visible = [
+        element
+        for element in doc.elements
+        if not element.hidden_reasons and keys[element.element_id] in groups and element.page_number not in closed
+    ]
     assert set(entries) <= {element.element_id for element in visible}
     for original in visible:
         found = entries.get(original.element_id, [])
@@ -1766,8 +1819,8 @@ def first_position(unit: Unit) -> tuple[int, int, int]:
 
 
 def skipped_start(doc: PDFDocument, item: SkippedUnit) -> tuple[int, int, int]:
-    """Where a skipped unit starts: a page error before its page, any other at its first element (and part)."""
-    if item.reason == "page_error":
+    """Where a skipped unit starts: a page skipped whole before its page, any other at its first element (and part)."""
+    if item.reason in ("page_error", "image_only"):
         return item.page_numbers[0], -1, 0
     element_id, part = end_of(item.unit_id.split(":", 1)[1].split("-")[0])
     element = next(element for element in doc.elements if element.element_id == element_id)
@@ -1777,12 +1830,14 @@ def skipped_start(doc: PDFDocument, item: SkippedUnit) -> tuple[int, int, int]:
 def opened_scope(doc: PDFDocument, key: tuple[str, int]) -> tuple[tuple[str, ...], int]:
     """A group's kept scope entries and dropped count, by brute force (the oracle for module notes, 2).
 
-    Entry k is kept when its opener is visible: the section's own heading for its last entry, when it has one, else
-    the last heading, at or before the section's first member, whose own path is the section's first k entries.
+    Entry k is kept when its opener is visible and on a page that is sent: the section's own heading for its last
+    entry, when it has one, else the last heading, at or before the section's first member, whose own path is the
+    section's first k entries.
     """
     if key[0] == "page":
         return (), 0
     item = doc.sections[key[1]]
+    closed = closed_pages(doc)
     members = [element for element in (item.heading, *item.elements) if element is not None]
     start = min((element.page_number, element.reading_order) for element in members)
     kept = []
@@ -1791,7 +1846,7 @@ def opened_scope(doc: PDFDocument, key: tuple[str, int]) -> tuple[tuple[str, ...
         found = [h for h in doc.headings if h.scope_path == prefix and (h.page_number, h.reading_order) <= start]
         own = size == len(item.scope_path) and item.heading is not None
         opener = item.heading if own else (found[-1] if found else None)
-        if opener is not None and not opener.hidden_reasons:
+        if opener is not None and not opener.hidden_reasons and opener.page_number not in closed:
             kept.append(prefix[-1])
     return tuple(kept), len(item.scope_path) - len(kept)
 
@@ -2078,3 +2133,157 @@ class TestCoalesceSections:
         assert unit.scope_path == ()
         assert unit.scope_entries_excluded == 3
         assert plan.scope_entries_excluded_total == 3
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Image-only pages (#472): skipped as image_only, none of their elements sent
+# ---------------------------------------------------------------------------------------------------------------
+
+
+class TestImageOnlySkippedUnit:
+    def test_an_image_only_unit_covers_exactly_one_page(self):
+        values = {"unit_id": f"{DOC}:p0001", "reason": "image_only"}
+        with pytest.raises(ValueError, match="one page"):
+            SkippedUnit(**values, page_numbers=(1, 2))
+        assert SkippedUnit(**values, page_numbers=(1,)).reason == "image_only"
+
+    def test_an_image_only_unit_may_count_hidden_elements_or_none(self):
+        values = {"unit_id": f"{DOC}:p0001", "reason": "image_only", "page_numbers": (1,)}
+        assert SkippedUnit(**values).hidden_excluded == ()
+        assert SkippedUnit(**values, hidden_excluded=(("invisible", 1),)).hidden_excluded == (("invisible", 1),)
+
+
+class TestImageOnlyPages:
+    """A page whose content lives only in its page image is one ``image_only`` skipped unit; nothing of it is sent."""
+
+    def test_a_garbled_digital_page_alone_is_one_image_only_skipped_unit_never_rendered(self):
+        doc = document(marked(1, (heading(1, 0, "H"), para(1, 1, SECRET, scope=("H",)))))
+        plan = build_units(doc, max_unit_chars=BIG, render=never)
+
+        assert plan.units == ()
+        assert plan.skipped == (SkippedUnit(unit_id=f"{DOC}:p0001", reason="image_only", page_numbers=(1,)),)
+
+    def test_a_marked_pages_hidden_elements_count_on_its_skipped_unit_only(self):
+        ghosts = (para(1, 1, hidden=("invisible",)), para(1, 2, hidden=("tiny_font", "transparent")))
+        before = para(1, 3, hidden=("invisible",))
+        doc = document(
+            marked(1, (para(1, 0, SECRET), *ghosts, before)),
+            page(2, (para(2, 0, "kept"), para(2, 1, hidden=("off_page",)))),
+        )
+        plan = build_units(doc, max_unit_chars=BIG, render=guarded)
+
+        counted = (("invisible", 2), ("tiny_font", 1), ("transparent", 1))
+        assert plan.skipped == (
+            SkippedUnit(unit_id=f"{DOC}:p0001", reason="image_only", page_numbers=(1,), hidden_excluded=counted),
+        )
+        (unit,) = plan.units
+        assert element_ids(unit) == ["p0002_e000"]
+        assert unit.hidden_excluded == (("off_page", 1),)
+        assert plan.hidden_excluded_total == (("off_page", 1), ("invisible", 2), ("tiny_font", 1), ("transparent", 1))
+        assert plan.hidden_elements_total == 4
+
+    def test_a_section_across_a_marked_page_holds_none_of_its_elements_and_the_skip_sits_in_order(self):
+        opener = heading(1, 0, "H")
+        first, secret = para(1, 1, "one", scope=("H",)), para(2, 0, SECRET, scope=("H",))
+        last = para(3, 0, "three", scope=("H",))
+        doc = document(
+            page(1, (opener, first)),
+            marked(2, (secret,)),
+            page(3, (last,)),
+            error(4),
+            sections=[section((opener, first, secret, last), opener)],
+        )
+        plan = build_units(doc, max_unit_chars=BIG, render=guarded)
+
+        (unit,) = plan.units
+        assert element_ids(unit) == ["p0001_e000", "p0001_e001", "p0003_e000"]
+        assert unit.page_numbers == (1, 3)
+        assert unit.scope_path == ("H",)
+        assert SECRET not in BLOCK_SEPARATOR.join(unit.blocks)
+        assert [(item.unit_id, item.reason) for item in plan.skipped] == [
+            (f"{DOC}:p0002", "image_only"),
+            (f"{DOC}:p0004", "page_error"),
+        ]
+
+    def test_an_error_page_marked_extraction_failed_stays_page_error(self):
+        failed = page(
+            2, (), status="error", quality=None, error="pdfium: bad xref", image_only_reasons=("extraction_failed",)
+        )
+        doc = document(page(1, (para(1, 0),)), failed)
+        plan = build_units(doc, max_unit_chars=BIG, render=markdown)
+
+        assert plan.skipped == (SkippedUnit(unit_id=f"{DOC}:p0002", reason="page_error", page_numbers=(2,)),)
+
+    @pytest.mark.parametrize("reasons", [None, ()])
+    def test_a_page_whose_reasons_are_empty_or_not_recorded_is_unchanged(self, reasons):
+        doc = with_image_only(rich_document(), dict.fromkeys((1, 2, 3, 4), reasons))
+        assert build_units(doc, max_unit_chars=30, render=markdown) == build_units(
+            rich_document(), max_unit_chars=30, render=markdown
+        )
+        assert build_units(doc, max_unit_chars=BIG, render=markdown, coalesce_sections=True) == build_units(
+            rich_document(), max_unit_chars=BIG, render=markdown, coalesce_sections=True
+        )
+
+    def test_every_kind_of_marker_in_one_document(self):
+        plan = build_units(image_only_document(), max_unit_chars=BIG, render=guarded)
+
+        assert unit_ids(plan) == [f"{DOC}:p0001_e000-p0001_e001", f"{DOC}:p0001_e002-p0001_e008"]
+        assert plan.skipped == (
+            SkippedUnit(unit_id=f"{DOC}:p0002", reason="image_only", page_numbers=(2,)),
+            SkippedUnit(unit_id=f"{DOC}:p0003", reason="image_only", page_numbers=(3,)),
+            SkippedUnit(unit_id=f"{DOC}:p0004", reason="page_error", page_numbers=(4,)),
+        )
+        assert (
+            plan.hidden_excluded_total
+            == build_units(rich_document(), max_unit_chars=BIG, render=guarded).hidden_excluded_total
+        )
+
+    def test_a_section_heading_on_a_marked_page_opens_nothing(self):
+        opener = heading(1, 0, SECRET)
+        body = para(2, 0, "kept", scope=(SECRET,))
+        doc = document(marked(1, (opener,)), page(2, (body,)), sections=[section((opener, body), opener)])
+        plan = build_units(doc, max_unit_chars=BIG, render=guarded)
+
+        (unit,) = plan.units
+        assert (unit.scope_path, unit.scope_entries_excluded) == ((), 1)
+        assert plan.scope_entries_excluded_total == 1
+        assert group_scopes(doc)[body.element_id].openers == ()
+
+    def test_an_ancestor_heading_on_a_marked_page_drops_only_its_own_entry(self):
+        ancestor = heading(1, 0, SECRET)
+        child = heading(2, 0, "Child", scope=(SECRET, "Child"))
+        body = para(2, 1, "kept", scope=(SECRET, "Child"))
+        doc = document(
+            marked(1, (ancestor,)),
+            page(2, (child, body)),
+            sections=[section((ancestor,), ancestor), section((child, body), child)],
+        )
+        plan = build_units(doc, max_unit_chars=BIG, render=guarded)
+
+        (unit,) = plan.units
+        assert (unit.scope_path, unit.scope_entries_excluded) == (("Child",), 1)
+        assert [item.reason for item in plan.skipped] == ["image_only"]
+
+    def test_a_marked_page_flushes_the_coalesced_draft_as_an_error_page_does(self):
+        h1, p1 = heading(1, 0, "S1"), para(1, 1, "one", scope=("S1",))
+        h2, p2 = heading(2, 0, SECRET), para(2, 1, SECRET, scope=(SECRET,))
+        p2b = para(2, 2, hidden=("invisible",), scope=(SECRET,))
+        h3, p3 = heading(3, 0, "S3"), para(3, 1, "three", scope=("S3",))
+        doc = document(
+            page(1, (h1, p1)),
+            marked(2, (h2, p2, p2b)),
+            page(3, (h3, p3)),
+            sections=[section((h1, p1), h1), section((h2, p2, p2b), h2), section((h3, p3), h3)],
+        )
+        plan = build_units(doc, max_unit_chars=BIG, render=guarded, coalesce_sections=True)
+
+        assert [element_ids(unit) for unit in plan.units] == [
+            ["p0001_e000", "p0001_e001"],
+            ["p0003_e000", "p0003_e001"],
+        ]
+        assert [unit.scope_path for unit in plan.units] == [("S1",), ("S3",)]
+        assert plan.skipped == (
+            SkippedUnit(
+                unit_id=f"{DOC}:p0002", reason="image_only", page_numbers=(2,), hidden_excluded=(("invisible", 1),)
+            ),
+        )

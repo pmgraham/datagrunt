@@ -22,7 +22,8 @@ instances (or PDF / bundle paths resolved through :class:`~datagrunt.pdf.PDFRead
    - Refuse duplicate ``doc_id`` values across targets with :class:`~datagrunt.rationalization.RationalizationError`.
    - Build each document's units (:func:`~datagrunt.rationalization.units.build_units`) and envelopes
      (:func:`~datagrunt.rationalization.envelope.build_envelopes`), stopping immediately if cumulative distinct cache
-     misses exceed ``max_requests``.
+     misses exceed ``max_requests``. What has nothing to send (an error page, an image-only page, an all-hidden or
+     no-text group) becomes a :class:`~datagrunt.rationalization.units.SkippedUnit` of the result.
 3. **Pipeline execution**:
    - Run requests (:func:`~datagrunt.rationalization.runner.run_requests`), form cross-family consensus
      (:func:`~datagrunt.rationalization.consensus.build_consensus`), ground evidence against cited elements
@@ -600,7 +601,10 @@ def rationalize(
         on_event: Optional callback invoked on the caller's thread with each :class:`TelemetryEvent`.
 
     Returns:
-        A :class:`~datagrunt.rationalization.result.RationalizedResult` parameterized by ``schema``.
+        A :class:`~datagrunt.rationalization.result.RationalizedResult` parameterized by ``schema``. What was not
+        sent is reported, never dropped: ``result.skipped_units`` names each page error, all-hidden or no-text
+        group, and each ``"image_only"`` page (``Page.image_only_reasons``: its content lives only in its page
+        image, so none of its text, visible or hidden, is sent, and no model reads the image yet), with its pages.
 
     Raises:
         TypeError: If any parameter has the wrong type.

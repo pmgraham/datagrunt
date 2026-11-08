@@ -1111,3 +1111,81 @@ class TestTwoStageCorpusAndCoalesceSections:
                 models=(p_google, p_anthropic),
             )
         assert counts == {"google": 0, "anthropic": 0}
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# 7. Image-only pages (#472): skipped as image_only, none of their text sent
+# ---------------------------------------------------------------------------------------------------------------
+
+SECRET = "GARBLEDSECRET"
+BBOX_KV = BBox(x0=10.0, y0=10.0, x1=200.0, y1=25.0)
+
+
+def build_image_only_document() -> PDFDocument:
+    """Page 1 is image-only (garbled text, ``image_only_reasons=("garbled_text",)``): its header-context key-value,
+    heading, prose, table and a hidden line carry :data:`SECRET`. Pages 2 and 3 hold the text that is sent: page 2's
+    prose sits in page 1's heading's section, and page 3's table continues page 1's."""
+    scope = (f"{SECRET} heading",)
+    kv = KeyValue(**ids(1, 0, (), BBOX_KV), key="Drawing", value=f"{SECRET}-DWG")
+    opener = Heading(**ids(1, 1, scope), level=1, text=scope[0])
+    prose = Paragraph(**ids(1, 2, scope), text=f"{SECRET} prose")
+    ghost = Paragraph(**ids(1, 3, scope), text=f"{SECRET} hidden", hidden_reasons=("invisible",))
+    first = Table(
+        **ids(1, 4, scope), headers=(f"{SECRET}-A", f"{SECRET}-B"), rows=(("x", "y"),), extraction_method="lattice"
+    )
+    late = Paragraph(**ids(2, 0, scope), text="Assembly A-300 is sent.")
+    title = Heading(**ids(3, 0, ("Parts",)), level=1, text="Parts")
+    second = Table(
+        **ids(3, 1, ("Parts",)),
+        headers=(),
+        rows=(("A-100", "2"),),
+        extraction_method="stream",
+        continued_from_id=first.element_id,
+    )
+    sections = (
+        Section(heading=None, scope_path=(), page_span=(1, 1), elements=(kv,)),
+        Section(heading=opener, scope_path=scope, page_span=(1, 2), elements=(opener, prose, ghost, first, late)),
+        Section(heading=title, scope_path=("Parts",), page_span=(3, 3), elements=(title, second)),
+    )
+    return PDFDocument(
+        metadata=metadata(3, source_name="garbled.pdf", sha=hashlib.sha256(b"garbled.pdf").hexdigest()),
+        pages=(
+            page(1, (kv, opener, prose, ghost, first), image_only_reasons=("garbled_text",)),
+            page(2, (late,)),
+            page(3, (title, second)),
+        ),
+        sections=sections,
+        header_context=(kv,),
+    )
+
+
+class TestImageOnlyPages:
+    @pytest.mark.parametrize("coalesce_sections", [True, False])
+    def test_no_request_carries_a_marked_pages_text_and_the_result_names_the_page(self, coalesce_sections) -> None:
+        sent: list[str] = []
+
+        def answer(req: ModelRequest) -> ProviderResponse:
+            sent.append(req.system_prompt + req.user_envelope)
+            return ProviderResponse(content={"records": []}, raw_text="{}", finish="complete")
+
+        doc = build_image_only_document()
+        result = real_rationalize(
+            doc,
+            schema=Assembly,
+            prompt="Extract BOM.",
+            models=(
+                CallableProvider("test:google-image-only", answer, family="google"),
+                CallableProvider("test:anthropic-image-only", answer, family="anthropic"),
+            ),
+            coalesce_sections=coalesce_sections,
+        )
+
+        assert sent and any("A-100" in text for text in sent) and any("A-300" in text for text in sent)
+        assert not any(SECRET in text for text in sent)
+        doc_id = doc.metadata.doc_id
+        assert [(item.unit_id, item.reason, item.page_numbers) for item in result.skipped_units] == [
+            (f"{doc_id}:p0001", "image_only", (1,))
+        ]
+        assert result.skipped_units[0].hidden_excluded == (("invisible", 1),)
+        assert result.telemetry.skipped_unit_count == 1
+        assert dict(result.telemetry.hidden_excluded_by_reason)["invisible"] == 1
