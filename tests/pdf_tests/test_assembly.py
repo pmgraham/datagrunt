@@ -1239,12 +1239,12 @@ def two_pages(path: Path, words: str, top: float) -> Path:
     return build_pdf(path, [PageSpec(items=(TextRun(words, 72.0, top, size=24.0),))] * 2)
 
 
-def reader_document(path: Path, **options):
-    return PDFReader(path, **options).document
+def reader_document(path: Path):
+    return PDFReader(path).document
 
 
-def writer_document(path: Path, **options):
-    return PDFWriter(path, **options)._extracted()
+def writer_document(path: Path):
+    return PDFWriter(path)._extracted()
 
 
 class TestDrawnPageImageSource:

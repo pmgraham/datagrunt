@@ -2304,7 +2304,7 @@ def test_a_pipeline_document_sends_every_visible_element_and_no_hidden_text(tmp_
             PageSpec(items=(TextRun("Appendix", 72.0, 60.0, size=18.0), *prose(100.0))),
         ],
     )
-    doc = PDFReader(path, ocr="auto").document
+    doc = PDFReader(path).document
     hidden_text = "\n".join(element.to_markdown() for element in doc.elements if element.hidden_reasons)
     visible = {element.element_id for element in doc.elements if not element.hidden_reasons}
 

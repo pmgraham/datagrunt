@@ -401,7 +401,7 @@ class TestPageImages:
 
         monkeypatch.setattr(_loaders, "render_page", counted)
 
-        page = PDFReader(path, ocr="auto" if route == "hybrid" else "never").pages[0]
+        page = PDFReader(path).pages[0]
 
         image = page.page_image
         assert page.route == route and image is not None and calls == []  # nothing is drawn until it is read
@@ -748,7 +748,7 @@ class TestHiddenText:
     """Markdown omits hidden elements unless include_hidden=True; the frame, the JSON and the elements keep them."""
 
     def test_markdown_omits_the_hidden_vectors_by_default(self, tmp_path):
-        reader = PDFReader(hidden_vectors_pdf(tmp_path), ocr="auto")
+        reader = PDFReader(hidden_vectors_pdf(tmp_path), ocr="never")
 
         markdown = reader.to_markdown()
 
@@ -757,7 +757,7 @@ class TestHiddenText:
         assert markdown == reader.document.to_markdown()
 
     def test_include_hidden_shows_each_behind_its_marker(self, tmp_path):
-        reader = PDFReader(hidden_vectors_pdf(tmp_path), ocr="auto")
+        reader = PDFReader(hidden_vectors_pdf(tmp_path), ocr="never")
 
         blocks = reader.to_markdown(include_hidden=True).split("\n\n")
 
@@ -765,7 +765,7 @@ class TestHiddenText:
             assert f"<!-- hidden: {reason} -->\n{text}" in blocks
 
     def test_the_frame_the_json_and_the_elements_keep_them(self, tmp_path):
-        reader = PDFReader(hidden_vectors_pdf(tmp_path), ocr="auto")
+        reader = PDFReader(hidden_vectors_pdf(tmp_path), ocr="never")
 
         hidden = reader.to_dataframe().filter(pl.col("hidden_reasons").list.len() > 0)
         flagged = {element.text: element.hidden_reasons for element in reader.pages[0].elements if element.is_hidden}
@@ -781,7 +781,7 @@ class TestHiddenText:
 
     @needs_tesseract
     def test_a_vision_page_shows_only_what_ocr_read_by_default(self, tmp_path):
-        reader = PDFReader(garbled_page(tmp_path), ocr="auto")
+        reader = PDFReader(garbled_page(tmp_path))
         (page,) = reader.pages
         superseded = [element for element in page.elements if element.hidden_reasons == ("superseded",)]
         visible = [element for element in page.elements if not element.is_hidden]

@@ -332,7 +332,7 @@ def _assessed(handle: DocumentHandle, index: int, options: PipelineOptions) -> _
 
 def _background_dpi(raw: RawPage, assessment: PageAssessment, options: PipelineOptions) -> int | str | None:
     """The DPI the page's background is drawn at, why it cannot be drawn, or None when the gate does not pass it."""
-    if options.ocr == "never" or not needs_background(raw, assessment):
+    if not needs_background(raw, assessment):
         return None
     bound = min(options.max_render_pixels, pipeline._BACKGROUND_MAX_PIXELS)
     try:

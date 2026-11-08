@@ -352,7 +352,7 @@ def jbig2_scan_pdf(tmp_path_factory) -> Path:
 
 @needs_tesseract
 def test_a_jbig2_scan_is_read_by_ocr_through_extract_document(jbig2_scan_pdf):
-    (page,) = extract_document(jbig2_scan_pdf, ocr="auto").pages
+    (page,) = extract_document(jbig2_scan_pdf).pages
 
     assert (page.status, page.route) == ("ok", "vision")
     read = set(" ".join(element_texts(page)).split())

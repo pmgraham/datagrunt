@@ -164,7 +164,7 @@ def extract_corpus(
     password: str | None = None,
     max_workers: int = 1,
     workers: int = 1,
-    ocr: OcrMode = "never",
+    ocr: OcrMode = "auto",
     dpi: int = DPI,
     vision_dpi: int = 300,
     max_render_pixels: int = MAX_RENDER_PIXELS,

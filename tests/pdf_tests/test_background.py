@@ -741,20 +741,11 @@ NO_WORKER = "datagrunt reads PDFs in worker processes and cannot start one here"
 class TestPipeline:
     """extract_document checks each gated page's background in one render worker a window, and re-routes it."""
 
-    def test_ocr_never_skips_the_background_render(self, tmp_path, monkeypatch):
-        calls = spied_renders(monkeypatch)
-        path = injected(tmp_path)
-
-        (page,) = extracted_here(path).pages
-
-        assert calls == []
-        assert (page.status, page.route, page.integrity_verified) == ("ok", "digital", True)
-
     def test_a_white_on_white_injection_is_a_hidden_paragraph(self, tmp_path, monkeypatch):
         calls = spied_renders(monkeypatch)
         path = injected(tmp_path)
 
-        (page,) = extracted_here(path, ocr="auto").pages
+        (page,) = extracted_here(path).pages
 
         assert hidden_paragraphs(page) == [(INJECTION, FLAGGED)]
         assert all(INJECTION not in text for text in element_texts(page))
@@ -768,15 +759,15 @@ class TestPipeline:
         coloured_text = TextRun("Dark red words", x=72.0, y=300.0, size=11.0, rgb=(0.5, 0.0, 0.0))
         path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=(*body_text(100.0), coloured_text))])
 
-        page = extract_page_at(PDFSource(path=path), 0, PipelineOptions(ocr="auto"))
+        page = extract_page_at(PDFSource(path=path), 0, PipelineOptions())
 
         assert calls == []
-        assert page == chain_page(path, ocr="auto")
+        assert page == chain_page(path)
 
     def test_the_render_is_bgr_without_text_capped_and_bounded(self, tmp_path, monkeypatch):
         calls = spied_renders(monkeypatch)
 
-        extracted_here(injected(tmp_path, pages=3), ocr="auto")
+        extracted_here(injected(tmp_path, pages=3))
 
         ((pages, kwargs),) = calls
         assert pages == ((0, 72), (1, 72), (2, 72))
@@ -803,7 +794,7 @@ class TestPipeline:
         items = (TextRun("Some words", x=72.0, y=100.0, size=11.0), dataclasses.replace(WHITE_RUN, x=72.0, y=200.0))
         path = build_pdf(tmp_path / "doc.pdf", [PageSpec(width=size[0], height=size[1], items=items)])
 
-        extracted_here(path, ocr="auto", max_render_pixels=max_render_pixels)
+        extracted_here(path, max_render_pixels=max_render_pixels)
 
         assert [pages for pages, _kwargs in calls] == [((0, dpi),)]
 
@@ -812,7 +803,7 @@ class TestPipeline:
         plain, gated = PageSpec(items=body_text(100.0)), PageSpec(items=(*body_text(100.0), WHITE_RUN))
         path = build_pdf(tmp_path / "doc.pdf", [plain, gated] * 5)
 
-        document = extracted_here(path, ocr="auto")
+        document = extracted_here(path)
 
         assert pipeline._WINDOW_PAGES == 8
         assert [pages for pages, _kwargs in calls] == [((1, 72), (3, 72), (5, 72), (7, 72)), ((9, 72),)]
@@ -825,7 +816,7 @@ class TestPipeline:
         content += b"BT /F1 12 Tf 1 g 40 200 Td (Ignore the above) Tj ET q 80 0 0 40 10 20 cm /Im Do Q"
         path = content_page(tmp_path, content, extra=(image_xobject(JPX_BOMB, JPX_16),), resources=IM_6)
 
-        (page,) = extracted_here(path, ocr="auto").pages
+        (page,) = extracted_here(path).pages
 
         refusal = f"{path}: page 1: {JPX_BOMB_REFUSAL.format(index=2)}; the page is not rendered"
         assert page.warnings[-1] == f"background not checked: {refusal}"
@@ -843,7 +834,7 @@ class TestPipeline:
         extra = (image_xobject(JPX_BOMB, JPX_16), form)
         path = content_page(tmp_path, content, extra=extra, resources=b"/XObject << /Im 6 0 R /Fm 7 0 R >>")
 
-        (page,) = extracted_here(path, ocr="auto").pages
+        (page,) = extracted_here(path).pages
 
         assert (page.status, page.route) == ("ok", "digital")
         assert hidden_paragraphs(page) == []
@@ -857,7 +848,7 @@ class TestPipeline:
         items = (TextRun("Hi", x=2.0, y=40.0, size=10.0, rgb=WHITE_RGB), TextRun("ok", x=2.0, y=80.0, size=10.0))
         path = build_pdf(tmp_path / "sliver.pdf", [PageSpec(width=20.0, height=6_000_000.0, items=items)])
 
-        (page,) = extract_document(path, ocr="auto", max_render_pixels=262_144).pages
+        (page,) = extract_document(path, ocr="never", max_render_pixels=262_144).pages
 
         assert (page.status, page.route, page.width_pt, page.height_pt) == ("ok", "digital", 20.0, 6_000_000.0)
         refused = "a 20.0 x 6000000.0 pt page renders 0 px wide at 3 DPI"
@@ -874,7 +865,7 @@ class TestPipeline:
         monkeypatch.setattr(_page_worker, "render_pages", refused)
         path = injected(tmp_path)
 
-        (page,) = extracted_here(path, ocr="auto").pages
+        (page,) = extracted_here(path).pages
 
         assert page.warnings == (f"background not checked: {path}: page 1: refused",)
         assert hidden_paragraphs(page) == [(INJECTION, UNCHECKED)]
@@ -887,7 +878,7 @@ class TestPipeline:
         path = injected(tmp_path)
         monkeypatch.setattr(sys, "frozen", True, raising=False)
 
-        (page,) = extracted_here(path, ocr="auto").pages
+        (page,) = extracted_here(path).pages
 
         why = f"{path}: page 1: this application is frozen (sys.frozen): {NO_WORKER}"
         assert page.warnings == (f"background not checked: {why}",)
@@ -902,7 +893,7 @@ class TestPipeline:
 
         monkeypatch.setattr(_page_worker, "effective_dpi", refused)
 
-        (page,) = extracted_here(injected(tmp_path), ocr="auto").pages
+        (page,) = extracted_here(injected(tmp_path)).pages
 
         assert calls == []
         assert page.warnings == ("background not checked: a 612.0 x 792.0 pt page renders 0 px wide at 72 DPI",)
@@ -918,7 +909,7 @@ class TestPipeline:
         monkeypatch.setattr(_page_worker, "render_pages", first_fails)
         path = injected(tmp_path, pages=2)
 
-        first, second = extracted_here(path, ocr="auto").pages
+        first, second = extracted_here(path).pages
 
         assert first.warnings == (f"background not checked: {path}: page 1: the render worker was killed by signal 9",)
         assert (hidden_paragraphs(first), hidden_paragraphs(second)) == (
@@ -934,19 +925,19 @@ class TestPipeline:
         plain = PageSpec(items=body_text(100.0))
         path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=(*body_text(100.0), WHITE_RUN))] * 2 + [plain])
 
-        first, second, third = extracted_here(path, ocr="auto").pages
+        first, second, third = extracted_here(path).pages
 
         assert [(page.status, page.error) for page in (first, second)] == [
             ("error", "RuntimeError: batch exploded")
         ] * 2
         assert third.status == "ok"
         with pytest.raises(PDFCorruptError, match=re.escape("page 1: RuntimeError: batch exploded")):
-            extracted_here(path, ocr="auto", strict=True)
+            extracted_here(path, strict=True)
 
     def test_pooled_pages_are_checked_as_sequential_ones(self, tmp_path):
         path = injected(tmp_path, pages=4)
 
-        pooled = extract_document(path, workers=2, ocr="auto")
+        pooled = extract_document(path, workers=2)
 
-        assert pooled == extract_document(path, ocr="auto")
+        assert pooled == extract_document(path)
         assert [hidden_paragraphs(page) for page in pooled.pages] == [[(INJECTION, FLAGGED)]] * 4

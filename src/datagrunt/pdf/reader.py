@@ -238,7 +238,7 @@ class PDFReader:
         *,
         password: str | None = None,
         workers: int = 1,
-        ocr: OcrMode = "never",
+        ocr: OcrMode = "auto",
         dpi: int = 200,
         vision_dpi: int = 300,
         max_render_pixels: int = 16_000_000,
