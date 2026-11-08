@@ -118,6 +118,15 @@ MAX_STREAM_GRID_UNITS = MAX_GRID_UNITS
 
 # A run joins a line when they overlap across it by this share of the smaller height (spec §3.3 Pass B).
 _LINE_OVERLAP = 0.45
+# Lines are dealt runs while open (#476): a run is dealt among at most this many open lines, and when one more opens,
+# the oldest takes no more runs. The corpus (data/pdfs, 95 pages) keeps at most 5 open at once.
+MAX_OPEN_LINES = 16
+# ... a run is checked against at most this many of an open line's runs it may overlap along the line, those
+# starting last, the rest unchecked (the corpus needs at most 24) ...
+MAX_NEIGHBOUR_CHECKS = 64
+# ... and a line indexes at most this many of its runs for those checks: later runs join it unindexed, so a run
+# inserted into the index moves at most this many entries.
+MAX_INDEXED_RUNS = 1024
 # Runs on a line join with nothing across a gap of at most this many ems, else with a space (spec §3.3 Pass B).
 _JOIN_GAP_EM = 0.22
 # ... and with nothing next to degree and punctuation glyphs, whatever the gap (spec §3.3 Pass B): after
@@ -823,14 +832,17 @@ def _cell_text(runs: list[_Run], default_turn: int) -> str:
     """A cell's text: its runs in lines, read in the direction its text advances.
 
     The direction is the one the cell's runs of two or more chars share,
-    else ``default_turn``. In that frame, runs overlapping a line by at
-    least :data:`_LINE_OVERLAP` of the smaller height are on it; lines read
+    else ``default_turn``. In that frame, runs make lines as :func:`_lines`
+    makes them (a run overlaps the line, and its runs beside the run, by at
+    least :data:`_LINE_OVERLAP` of the smaller height, so, within its
+    bounds, a line never holds one run above another); lines read
     top to bottom and join with one space; runs on a line read left to
     right and join as the stream pass joins them (:func:`_separator`:
     nothing across a gap of at most :data:`_JOIN_GAP_EM` ems of the larger
     font or next to a degree or punctuation glyph, else one space); a
     run keeps its span's char order, with one space at each break pdfium
-    generated inside it. Text is otherwise verbatim. O(r log r) for r runs.
+    generated inside it. Text is otherwise verbatim. O(r log r) for r runs,
+    with :func:`_lines`'s bounded checks.
     """
     if not runs:
         return ""
@@ -879,19 +891,122 @@ def _run_box(run: _Run) -> Box:
     return union_box(run.piece.span.char_boxes[run.start : run.end])
 
 
+class _OpenLine:
+    """A line :func:`_lines` still deals runs to: its runs, its band across the line, and its runs indexed along it.
+
+    The index holds the runs' turned boxes by start and by end, so the runs
+    a run overlaps along the line and its nearest neighbour on each side are
+    found by bisection.
+    """
+
+    __slots__ = ("bottom", "by_end", "by_start", "ends", "items", "starts", "top", "widest")
+
+    def __init__(self, item: tuple[Box, _Run]) -> None:
+        box = item[0]
+        self.items = [item]
+        self.top, self.bottom = box[1], box[3]
+        self.starts, self.by_start = [box[0]], [box]
+        self.ends, self.by_end = [box[2]], [box]
+        self.widest = box[2] - box[0]
+
+    def add(self, item: tuple[Box, _Run]) -> None:
+        """Take a run (with its turned box) onto the line, indexed along it while under :data:`MAX_INDEXED_RUNS`."""
+        box = item[0]
+        self.items.append(item)
+        self.bottom = max(self.bottom, box[3])
+        if len(self.starts) >= MAX_INDEXED_RUNS:
+            return
+        at = bisect_right(self.starts, box[0])
+        self.starts.insert(at, box[0])
+        self.by_start.insert(at, box)
+        at = bisect_right(self.ends, box[2])
+        self.ends.insert(at, box[2])
+        self.by_end.insert(at, box)
+        self.widest = max(self.widest, box[2] - box[0])
+
+    def fit(self, box: Box) -> tuple[float, float] | None:
+        """How well a run's turned ``box`` fits the line, or None if it does not.
+
+        It fits when it overlaps the line's band, and each run beside it
+        (:meth:`beside`), across the line by at least :data:`_LINE_OVERLAP`
+        of the smaller height. The fit is the worst of those runs' shares,
+        and the gap along the line to the nearest of them (0 where they
+        overlap).
+        """
+        if _overlap_share(self.top, self.bottom, box[1], box[3]) < _LINE_OVERLAP:
+            return None
+        beside = self.beside(box)
+        share = min(_overlap_share(other[1], other[3], box[1], box[3]) for other in beside)
+        if share < _LINE_OVERLAP:
+            return None
+        return share, max(0.0, min(_along_gap(other, box) for other in beside))
+
+    def beside(self, box: Box) -> list[Box]:
+        """The boxes of the line's indexed runs a run's turned ``box`` overlaps along the line, else the nearest one.
+
+        The nearest is the nearer of the run ending last before ``box`` and
+        the run starting first after it, so a short run nested in a long
+        one (an accent over a word) hides neither. Runs starting before
+        ``box`` ends and within the widest run's width of its start may
+        overlap it: of those, the :data:`MAX_NEIGHBOUR_CHECKS` starting last
+        are read. O(log r + MAX_NEIGHBOUR_CHECKS) for r runs.
+        """
+        high = bisect_left(self.starts, box[2])
+        low = max(bisect_left(self.starts, box[0] - self.widest), high - MAX_NEIGHBOUR_CHECKS)
+        along = [other for other in self.by_start[low:high] if other[2] > box[0]]
+        if along:
+            return along
+        before = bisect_right(self.ends, box[0])
+        sides = self.by_end[max(before - 1, 0) : before] + self.by_start[high : high + 1]
+        return [min(sides, key=lambda other: _along_gap(other, box))]
+
+
+def _along_gap(first: Box, second: Box) -> float:
+    """The gap between two turned boxes along the line, whichever comes first; negative where they overlap."""
+    return max(second[0] - first[2], first[0] - second[2])
+
+
 def _lines(placed: list[tuple[Box, _Run]]) -> list[list[tuple[Box, _Run]]]:
-    """Runs (with their turned boxes, sorted by top) grouped into lines by their overlap across them."""
-    lines: list[list[tuple[Box, _Run]]] = []
-    top = bottom = 0.0
+    """Runs (with their turned boxes, sorted by top) grouped into lines across them, in the order the lines start.
+
+    A run joins an open line it overlaps across by at least
+    :data:`_LINE_OVERLAP` of the smaller height: the line's band, and each
+    of the line's runs beside it (:meth:`_OpenLine.beside`: those it
+    overlaps along the line, else the nearest). So, within the bounds
+    below, a line never holds one run above another (#476): a run set
+    large (a drop cap, an ordinal) bands two lines, but the runs under the
+    first line's runs start the next. Of the lines it fits, it joins the
+    one whose worst share is the greatest, then whose run beside it is
+    nearest along the line (a full stop's small box lies wholly in two
+    lines' bands), then the oldest; it starts a line if it fits none. A
+    line stays open until a run starts below it, so its last run (a full
+    stop drawn apart) still finds it after another text flow's run has
+    started a line.
+
+    Known limit: a run nearer a large run than the line's other runs (a
+    drop cap's second line starting nearer the cap than the first line's
+    text does) is checked against the large run alone, whose band it lies
+    in, so it joins the first line; checking its other neighbour too would
+    part a raised ordinal suffix ("3rd") from its digit.
+
+    Bounds: at most :data:`MAX_OPEN_LINES` lines are open, the oldest
+    taking no more runs when one more opens; a line indexes at most
+    :data:`MAX_INDEXED_RUNS` runs, of which a run is checked against at
+    most :data:`MAX_NEIGHBOUR_CHECKS`. O(r (L (log r + K) + I)) for r runs
+    and those bounds L, K and I.
+    """
+    lines: list[_OpenLine] = []
+    active: list[_OpenLine] = []
     for item in placed:
-        _, y0, _, y1 = item[0]
-        if lines and _overlap_share(top, bottom, y0, y1) >= _LINE_OVERLAP:
-            lines[-1].append(item)
-            bottom = max(bottom, y1)
+        box = item[0]
+        active = [line for line in active if line.bottom >= box[1]]
+        fits = [(fit, line) for line in active if (fit := line.fit(box)) is not None]
+        if fits:
+            max(fits, key=lambda found: (found[0][0], -found[0][1]))[1].add(item)
             continue
-        lines.append([item])
-        top, bottom = y0, y1
-    return lines
+        lines.append(_OpenLine(item))
+        active = [*active, lines[-1]][-MAX_OPEN_LINES:]
+    return [line.items for line in lines]
 
 
 def _overlap_share(top: float, bottom: float, y0: float, y1: float) -> float:
@@ -1088,8 +1203,11 @@ def text_lines(pieces: tuple[SpanPiece, ...], lattice: LatticeResult) -> tuple[T
        the one most chars advance at (ties: across, down, up). Each turn's
        runs make lines in their own frame, so a label up the margin is a
        line of its own, not glue between the page's lines.
-    3. Lines: runs overlapping a line across it by at least
-       :data:`_LINE_OVERLAP` of the smaller height are on it (A4a's rule).
+    3. Lines: a run joins a line it overlaps across by at least
+       :data:`_LINE_OVERLAP` of the smaller height (A4a's rule), the
+       line's band and each of its runs beside the run alike, so, within
+       :func:`_lines`'s bounds, a line never holds one run above another
+       (#476: a drop cap or a large ordinal bands two lines).
     4. Cells: along a line, runs read in order of their boxes (a run keeps
        its span's char order, so right-to-left text reads as pdfium gives
        it); a gap over :data:`_CELL_GAP_EM` ems of the larger font starts a

@@ -227,6 +227,18 @@ class TestTextLines:
         assert texts(lines) == ["Water boils at 100°C at sea level", "Next line"]
         assert lines[0].font_size_pt == 11.0
 
+    def test_an_ordinal_set_large_beside_two_lines_joins_the_first_and_never_merges_them(self, tmp_path):
+        # Root's Learn to Play p. 4 (#476): a 24 pt "1" set low has a box over both 11 pt lines. Read as one line,
+        # the second line's words landed inside the first ("Choose Factions. board and takes ... Each player ...").
+        items = ordinal_step(
+            ("Choose Factions.", "Each player chooses a faction"), "board and takes all of their pieces."
+        )
+
+        assert texts(read_lines(tmp_path, *items)) == [
+            "1st Choose Factions. Each player chooses a faction",
+            "board and takes all of their pieces.",
+        ]
+
     @pytest.mark.parametrize(
         "gap,cells",
         [
@@ -356,6 +368,136 @@ class TestTextLinesUnits:
 
         assert (texts(on), texts(off)) == (["m2"], ["2", "m"])
 
+    def test_a_run_under_a_run_of_a_line_starts_the_next_line_even_inside_its_band(self):
+        # The 30 pt 'A' bands both rows (#476); 'low' lies under 'top', so a line never holds both.
+        pieces = (chars("A", 10.0, 10.0, height=30.0), chars("top", 20.0, 10.0), chars("x", 60.0, 10.0))
+        pieces += (chars("low", 20.0, 25.0),)
+
+        assert texts(text_lines(pieces, NO_TABLES)) == ["A top x", "low"]
+
+    def test_a_run_past_the_end_of_a_line_is_checked_against_the_nearest_run_on_it(self):
+        # 'tail' overlaps no run of the banded top line along it; the nearest ('top') lies above it, so it reads on.
+        pieces = (chars("A", 10.0, 10.0, height=30.0), chars("top", 20.0, 10.0), chars("low", 20.0, 25.0))
+        pieces += (chars("tail", 50.0, 25.0),)
+
+        assert texts(text_lines(pieces, NO_TABLES)) == ["A top", "low tail"]
+
+    def test_a_run_fitting_two_open_lines_joins_the_one_it_overlaps_most(self):
+        # A title in three sizes: 'through' overlaps the 'Walking' line (and lies partly under 'Walking') by 0.56 of
+        # its height and the 'Root' line wholly, so it reads with 'Root'.
+        pieces = (
+            chars("Walking", 25.0, 17.0, advance=32.0, height=75.0),
+            chars("Root", 106.0, 60.0, advance=40.0, height=92.0),
+            chars("through", 19.0, 75.5, advance=11.0, height=29.5),
+        )
+
+        assert texts(text_lines(pieces, NO_TABLES)) == ["Walking", "through Root"]
+
+    @pytest.mark.parametrize(
+        "same_top,example_top,lines",
+        [
+            pytest.param(100.0, 107.0, ["same.", "Example"], id="nearest-line-older"),
+            pytest.param(107.0, 100.0, ["Example", "same."], id="nearest-line-newer"),
+        ],
+    )
+    def test_a_run_fitting_two_open_lines_alike_joins_the_one_whose_run_is_nearest_along_the_line(
+        self, same_top, example_top, lines
+    ):
+        # The full stop's 2 pt box lies wholly in both lines' bands: it reads with 'same', which it touches, not with
+        # the heading far along the line, whichever line opened first (Learn to Play p. 3).
+        pieces = (chars("same", 10.0, same_top), chars("Example", 200.0, example_top))
+        pieces += (chars(".", 34.0, 108.0, height=2.0),)
+
+        assert texts(text_lines(pieces, NO_TABLES)) == lines
+
+    def test_a_run_fitting_two_open_lines_alike_at_one_distance_joins_the_older(self):
+        # 'm' is 7 pt from 'left' (its line opened first) and from 'right', and lies wholly in both lines' bands.
+        pieces = (chars("left", 16.0, 100.0), chars("right", 60.0, 107.0), chars("m", 47.0, 108.0, height=2.0))
+
+        assert texts(text_lines(pieces, NO_TABLES)) == ["left m", "right"]
+
+    def test_a_run_must_overlap_the_lines_band_as_well_as_the_run_beside_it(self):
+        # 'low' overlaps the full stop beside it by half its height, but the line's band by 5 of its 12 pt.
+        pieces = (chars("pieces", 10.0, 100.0), chars(".", 46.0, 106.0, height=2.0), chars("low", 53.0, 107.0))
+
+        assert texts(text_lines(pieces, NO_TABLES)) == ["pieces.", "low"]
+
+    def test_a_run_must_overlap_every_run_it_overlaps_along_the_line(self):
+        # 'second' lies wholly in the tall 'D' (over most of its width) and under 'first' (over 6 pt of it).
+        pieces = (chars("D", 0.0, 100.0, advance=40.0, height=33.0), chars("first", 35.0, 100.0))
+        pieces += (chars("second", 5.0, 114.0),)
+
+        assert texts(text_lines(pieces, NO_TABLES)) == ["Dfirst", "second"]
+
+    def test_a_run_past_a_short_run_nested_in_a_long_one_is_checked_against_the_long_one(self):
+        # The raised accent starts after 'Cafe' does and ends before it does: 'menu' lies beside 'Cafe', not the accent.
+        pieces = (chars("Cafe", 0.0, 100.0, advance=10.0), chars("'", 30.0, 100.0, height=3.0))
+        pieces += (chars("menu", 45.0, 105.0, height=6.0),)
+
+        assert texts(text_lines(pieces, NO_TABLES)) == ["Cafe' menu"]
+
+    def test_a_lines_last_run_finds_it_past_the_runs_of_another_text_flow(self):
+        # The full stop drawn apart (a 2 pt box low on the line) comes, by top, after a label far along the line
+        # whose second run lies under its first: the label's lower run is a line of its own, and 'pieces' stays open.
+        pieces = (chars("pieces", 10.0, 100.0), chars("Bird", 200.0, 101.0, height=4.0))
+        pieces += (chars("wood", 200.0, 106.0, height=2.0), chars(".", 46.0, 108.0, height=2.0))
+
+        assert texts(text_lines(pieces, NO_TABLES)) == ["pieces. Bird", "wood"]
+
+
+class TestTextLinesBounds:
+    """Each run is dealt among a bounded number of open lines and checked against a bounded number of runs."""
+
+    def test_past_max_open_lines_the_oldest_line_takes_no_more_runs_and_every_char_is_kept(self, monkeypatch):
+        # As test_a_lines_last_run_finds_it_past_the_runs_of_another_text_flow, with one line open at a time.
+        monkeypatch.setattr(layout, "MAX_OPEN_LINES", 1)
+        pieces = (chars("pieces", 10.0, 100.0), chars("Bird", 200.0, 101.0, height=4.0))
+        pieces += (chars("wood", 200.0, 106.0, height=2.0), chars(".", 46.0, 108.0, height=2.0))
+
+        assert texts(text_lines(pieces, NO_TABLES)) == ["pieces Bird", "wood", "."]
+
+    def test_past_max_neighbour_checks_a_run_is_not_checked_against_the_farther_runs(self, monkeypatch):
+        # 'low' overlaps 4 runs of the line along it; it lies under 'top', the farthest by start, and beside the rest.
+        pieces = (
+            chars("top", 10.0, 10.0, advance=20.0),
+            *(chars(c, 13.0 + 5.0 * i, 16.0) for i, c in enumerate("bcd")),
+        )
+        pieces += (chars("low", 10.0, 22.0, advance=8.0),)
+        checked = text_lines(pieces, NO_TABLES)
+        monkeypatch.setattr(layout, "MAX_NEIGHBOUR_CHECKS", 3)
+
+        unchecked = text_lines(pieces, NO_TABLES)
+
+        assert [len(checked), len(unchecked)] == [2, 1]
+        assert sorted(unchecked[0].text.replace(" ", "")) == sorted("topbcdlow")
+
+    def test_past_max_indexed_runs_later_runs_join_unchecked_against(self, monkeypatch):
+        # 'b' joins after the 2 runs indexed: 'low', under it, is checked against the indexed runs beside it, the tall
+        # 'A' (2 pt along), not 'top' (22 pt along, past a cell's gap), and not against 'b'.
+        pieces = (chars("A", 60.0, 9.0, height=31.0), chars("top", 0.0, 10.0), chars("b", 40.0, 10.0))
+        pieces += (chars("low", 40.0, 25.0),)
+        checked = text_lines(pieces, NO_TABLES)
+        monkeypatch.setattr(layout, "MAX_INDEXED_RUNS", 2)
+
+        unchecked = text_lines(pieces, NO_TABLES)
+
+        assert [len(checked), len(unchecked)] == [2, 1]
+        assert sorted(unchecked[0].text.replace(" ", "")) == sorted("Atopblow")
+
+    @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
+    def test_40_000_runs_on_the_line_of_one_wide_run(self):
+        # Every one-char run lies within one 120 000 pt run's width of the 20 000 runs before it: unbounded, each would
+        # be checked against all of them (7 s here).
+        pieces = (chars("w" * 20_000, 0.0, 0.0), *(chars("x", 6.0 * at, 0.0) for at in range(40_000)))
+
+        started = time.perf_counter()
+        lines = text_lines(pieces, NO_TABLES)
+        elapsed = time.perf_counter() - started
+
+        assert sum(line.text.count("x") for line in lines) == 40_000
+        assert sum(line.text.count("w") for line in lines) == 20_000
+        assert elapsed < 2.0, f"{elapsed:.2f} s"
+
 
 class TestTextLinesArguments:
     """The pieces and the lattice result are checked at the boundary."""
@@ -409,6 +551,18 @@ def block_texts(blocks) -> list[str]:
 def column(texts, x: float, top: float, *, pitch: float = 14.0, **overrides) -> tuple[TextRun, ...]:
     """One TextRun per text from ``x``, their baselines ``pitch`` apart from ``top``."""
     return tuple(TextRun(text, x, top + index * pitch, **overrides) for index, text in enumerate(texts))
+
+
+def ordinal_step(first: tuple[str, str], second: str) -> tuple[TextRun, ...]:
+    """A step led by a 24 pt "1" set 8 pt below its 11 pt first line, "st" after it; line one in two runs."""
+    st_x = after("1", 60.0, size=24.0) + 0.5
+    return (
+        TextRun("1", 60.0, 108.0, size=24.0),
+        TextRun("st", st_x, 100.0, size=10.0),
+        TextRun(first[0], 90.0, 100.0),
+        TextRun(first[1], after(first[0], 90.0) + 3.0, 100.0),
+        TextRun(second, 90.0, 114.0),
+    )
 
 
 def block(*lines: TextLine, **overrides) -> TextBlock:
@@ -633,6 +787,16 @@ class TestTextBlocks:
         items = column(("Lines set", "solid read as", "one paragraph."), 72.0, 100.0, pitch=12.0)
 
         assert block_texts(read_blocks(tmp_path, *items)) == ["Lines set solid read as one paragraph."]
+
+    def test_an_ordinal_set_large_beside_a_paragraph_leaves_its_lines_in_order(self, tmp_path):
+        # Root's Learn to Play p. 4 (#476), read as a paragraph.
+        items = ordinal_step(
+            ("Choose Factions.", "Each player chooses a faction"), "board and takes all of their pieces."
+        )
+
+        assert block_texts(read_blocks(tmp_path, *items)) == [
+            "1st Choose Factions. Each player chooses a faction board and takes all of their pieces."
+        ]
 
     @pytest.mark.parametrize(
         "slack,texts",
