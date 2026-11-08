@@ -407,7 +407,7 @@ def _removed(source: Path, when: str) -> PDFSourceChangedError:
 def _png(image: RenderedPage | Band) -> bytes:
     """8-bit grey pixels as PNG."""
     buffer = io.BytesIO()
-    Image.frombytes("L", (image.px_width, image.px_height), image.pixels).save(buffer, format="PNG")
+    Image.frombytes("L", (image.px_width, image.px_height), image.pixels).save(buffer, format="PNG", compress_level=1)
     return buffer.getvalue()
 
 

@@ -22,9 +22,18 @@ from typing import IO, Any
 
 from datagrunt.pdf._image_facts import RawImage
 from datagrunt.pdf._memory_cap import CAP_EXIT, apply_memory_cap
+from datagrunt.pdf._pdfium_common import PdfiumFailure, WalkBoundHit
+from datagrunt.pdf._pdfium_images import decoded_png
 from datagrunt.pdf._process import error_reply, send_message
 from datagrunt.pdf._validate import checked_password, checked_path, choice_str, int_at_least, positive_float
-from datagrunt.pdf.pdfium_engine import ImageLoader
+from datagrunt.pdf.pdfium_engine import (
+    MAX_PAGE_OBJECTS,
+    DocumentHandle,
+    ImageLoader,
+    _load_page,
+    _page_objects,
+    open_document,
+)
 
 __all__: list[str] = []
 
@@ -63,22 +72,71 @@ def _worker_main(message: object, replies: IO[bytes]) -> None:
         for _ in request.figures:
             send_message(replies, _ERROR + error_reply(exc))
         return
-    for page_index, image in request.figures:  # bounded: the batch's figures
-        _send_read(replies, request, page_index, image)
-
-
-def _send_read(replies: IO[bytes], request: _Request, page_index: int, image: RawImage) -> None:
-    """Read one figure and send its bytes, or its error; reaching the cap ends the worker."""
     try:
-        loader = ImageLoader(source=Path(request.source), page_index=page_index, image=image, password=request.password)
-        data = loader.png_bytes() if request.kind == "png" else loader.raw_bytes()
+        handle_cm = open_document(request.source, password=request.password)
+        handle = handle_cm.__enter__()
     except MemoryError:
         os._exit(CAP_EXIT)
-    except Exception as exc:  # this figure's error, sent to the caller, who raises it as it was
-        send_message(replies, _ERROR + error_reply(exc))
+    except Exception as exc:
+        for _ in request.figures:
+            send_message(replies, _ERROR + error_reply(exc))
         return
-    send_message(replies, _BYTES)
-    send_message(replies, data)
+    try:
+        _serve_batch(replies, request, handle)
+    finally:
+        handle_cm.__exit__(None, None, None)
+
+
+def _serve_batch(replies: IO[bytes], request: _Request, handle: DocumentHandle) -> None:
+    """Read each figure in ``request.figures`` sharing ``handle`` and caching the current page load."""
+    source_path = Path(request.source)
+    is_png = request.kind == "png"
+    current_page_index: int | None = None
+    current_page: Any = None
+    current_page_number: int = 0
+    current_objects: list[tuple[Any, int]] | None = None
+    try:
+        for page_index, image in request.figures:  # bounded: the batch's figures
+            try:
+                loader = ImageLoader(source=source_path, page_index=page_index, image=image, password=request.password)
+                if page_index >= handle.page_count:
+                    raise loader._changed(f"it has {handle.page_count} page(s)")
+                if current_page_index != page_index or current_page is None:
+                    if current_page is not None:
+                        current_page.close()
+                        current_page = None
+                        current_page_index = None
+                        current_objects = None
+                    current_page, current_page_number = _load_page(handle, page_index)
+                    current_page_index = page_index
+                    try:
+                        current_objects = _page_objects(current_page.raw, max_objects=MAX_PAGE_OBJECTS)
+                    except (WalkBoundHit, PdfiumFailure):
+                        current_objects = None
+                if is_png:
+                    data = loader._read_from_page(
+                        current_page.raw,
+                        current_page_number,
+                        current_objects,
+                        lambda img, _raw, facts, label: decoded_png(img, facts, label),
+                    )
+                else:
+                    data = loader._read_from_page(
+                        current_page.raw,
+                        current_page_number,
+                        current_objects,
+                        lambda _img, raw, _facts, _label: raw,
+                    )
+            except MemoryError:
+                os._exit(CAP_EXIT)
+            except Exception as exc:  # this figure's error, sent to the caller, who raises it as it was
+                send_message(replies, _ERROR + error_reply(exc))
+                continue
+            send_message(replies, _BYTES)
+            send_message(replies, data)
+    finally:
+        if current_page is not None:
+            current_page.close()
 
 
 def _request_from(message: object) -> _Request:

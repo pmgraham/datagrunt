@@ -221,19 +221,44 @@ def path_segments(
         raise NonFiniteGeometry(f"its matrix to page space is not finite {tuple(matrix)}")
     if not math.isfinite(paint.stroke_width):
         raise NonFiniteGeometry(f"its stroke width is not finite ({paint.stroke_width})")
+    int_at_least("object_index", object_index, 0)
+    strict_bool("dashed", paint.dashed)
+    rgba_tuple("stroke_rgba", paint.stroke_rgba)
+    rgba_tuple("fill_rgba", paint.fill_rgba)
     closed = _explicit_closes(points)
-    placed = [_placed(point, matrix) for point in closed]
-    segments = []
+    placed = _placed_all(closed, matrix)
+    segments: list[RawSegment] = []
     if paint.filled:
         segments.extend(_fill_segments(placed, object_index, paint, to_display))
     if not paint.stroked:
         return segments
+    is_identity = matrix == IDENTITY
+    base_width = max(float(paint.stroke_width), 0.0)
     for local, page in zip(_straight_edges(closed), _straight_edges(placed)):
         line = _axis_line(*page)
         if line is not None:
-            width = _stroke_thickness(paint.stroke_width, matrix, local, page)
+            width = base_width if is_identity else _stroke_thickness(paint.stroke_width, matrix, local, page)
             segments.append(_segment(line, width, "stroke", object_index, paint, to_display))
     return segments
+
+
+def _placed_all(points: list[PathPoint], matrix: Matrix) -> list[PathPoint]:
+    """All ``points`` mapped by ``matrix``, with fast path for IDENTITY."""
+    if matrix == IDENTITY:
+        for point in points:
+            if not (math.isfinite(point.x) and math.isfinite(point.y)):
+                raise NonFiniteGeometry(f"its page-space point {(point.x, point.y)} is not finite")
+        return points
+    a, b, c, d, e, f = matrix
+    out: list[PathPoint] = []
+    for point in points:
+        px, py = point.x, point.y
+        x = a * px + c * py + e
+        y = b * px + d * py + f
+        if not (math.isfinite(x) and math.isfinite(y)):
+            raise NonFiniteGeometry(f"its page-space point {(x, y)} is not finite")
+        out.append(PathPoint(point.kind, x, y, point.closes))
+    return out
 
 
 def _placed(point: PathPoint, matrix: Matrix) -> PathPoint:
@@ -241,7 +266,7 @@ def _placed(point: PathPoint, matrix: Matrix) -> PathPoint:
     x, y = matrix.apply(point.x, point.y)
     if not (math.isfinite(x) and math.isfinite(y)):
         raise NonFiniteGeometry(f"its page-space point {(x, y)} is not finite")
-    return point._replace(x=x, y=y)
+    return PathPoint(point.kind, x, y, point.closes)
 
 
 def _explicit_closes(points: Sequence[PathPoint]) -> list[PathPoint]:
@@ -250,14 +275,14 @@ def _explicit_closes(points: Sequence[PathPoint]) -> list[PathPoint]:
     pdfium's parser already writes that line (the closing point is the start);
     a close flagged away from the start (pdfium's edit API) gets it here.
     """
-    closed = []
+    closed: list[PathPoint] = []
     first: PathPoint | None = None
     for point in points:
         if point.kind == "move" or first is None:
             first = point
-        if point.closes and (point.x, point.y) != (first.x, first.y):
-            closed.append(point._replace(closes=False))
-            closed.append(PathPoint("line", first.x, first.y, closes=True))
+        if point.closes and (point.x != first.x or point.y != first.y):
+            closed.append(PathPoint(point.kind, point.x, point.y, False))
+            closed.append(PathPoint("line", first.x, first.y, True))
         else:
             closed.append(point)
     return closed
@@ -268,7 +293,7 @@ def _straight_edges(points: Sequence[PathPoint]) -> list[tuple[Point, Point]]:
 
     A Bézier's points only move the current point: its curve is not an edge.
     """
-    edges = []
+    edges: list[tuple[Point, Point]] = []
     current: Point | None = None
     for point in points:
         here = (point.x, point.y)
@@ -287,10 +312,10 @@ def _axis_line(start: Point, end: Point) -> Box | None:
         raise NonFiniteGeometry(f"path span is not finite: ({x0!r}, {y0!r}) -> ({x1!r}, {y1!r})")
     if dy < AXIS_TOLERANCE_PT and dx >= MIN_LENGTH_PT:
         y = y0 + (y1 - y0) / 2
-        return min(x0, x1), y, max(x0, x1), y
+        return (x0, y, x1, y) if x0 <= x1 else (x1, y, x0, y)
     if dx < AXIS_TOLERANCE_PT and dy >= MIN_LENGTH_PT:
         x = x0 + (x1 - x0) / 2
-        return x, min(y0, y1), x, max(y0, y1)
+        return (x, y0, x, y1) if y0 <= y1 else (x, y1, x, y0)
     return None
 
 
@@ -411,14 +436,14 @@ def _segment(
         orientation, position, start, end = "v", x0, y0, y1
     if not start < end:
         raise NonFiniteGeometry("path segment collapsed in display space")
-    return RawSegment(
-        orientation=orientation,
-        position=position,
-        start=start,
-        end=end,
-        width=width,
-        kind=kind,
-        object_index=object_index,
-        dashed=paint.dashed and stroke,
-        paint_rgba=paint.stroke_rgba if stroke else paint.fill_rgba,
-    )
+    seg = object.__new__(RawSegment)
+    object.__setattr__(seg, "orientation", orientation)
+    object.__setattr__(seg, "position", float(position))
+    object.__setattr__(seg, "start", float(start))
+    object.__setattr__(seg, "end", float(end))
+    object.__setattr__(seg, "width", float(width))
+    object.__setattr__(seg, "kind", kind)
+    object.__setattr__(seg, "object_index", object_index)
+    object.__setattr__(seg, "dashed", paint.dashed and stroke)
+    object.__setattr__(seg, "paint_rgba", paint.stroke_rgba if stroke else paint.fill_rgba)
+    return seg

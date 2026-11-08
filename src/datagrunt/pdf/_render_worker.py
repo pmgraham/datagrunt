@@ -10,17 +10,21 @@ watchdog) ends it with :data:`~datagrunt.pdf._memory_cap.CAP_EXIT`.
 """
 
 import ctypes
+import json
 import mmap
 import os
+import sys
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from typing import IO, NamedTuple
 
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 
-from datagrunt.pdf._memory_cap import CAP_EXIT, apply_memory_cap
+from datagrunt.pdf._memory_cap import CAP_EXIT, Lifetime, apply_memory_cap
+from datagrunt.pdf._pdfium_common import PdfiumFailure, WalkBoundHit
 from datagrunt.pdf._pdfium_images import read_filters
+from datagrunt.pdf._process import MAX_REQUEST_BYTES, read_message
 from datagrunt.pdf._process import send_message as _send
 from datagrunt.pdf._validate import int_at_least, positive_float, strict_bool
 from datagrunt.pdf.pdfium_engine import (
@@ -54,6 +58,7 @@ from datagrunt.pdf.render import (
 # page: ~250 times the corpus's busiest page (3,977). The walk costs ~0.4 us
 # an object here, so the bound is about half a second of guard.
 _MAX_GUARD_OBJECTS = 1_000_000
+_IDLE_LIFETIME_S = 3600.0
 
 _WHITE = 0xFFFFFFFF
 # Gray output and nothing else: no FPDF_ANNOT (annotations are not drawn), no LCD text, no printing mode.
@@ -110,6 +115,23 @@ def _guarded(handle: DocumentHandle, page_index: int) -> Iterator[tuple[pdfium.P
         yield page, geometry
 
 
+@contextmanager
+def _guarded_with_objects(
+    handle: DocumentHandle, page_index: int
+) -> Iterator[tuple[pdfium.PdfPage, PageGeometry, list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]]]:
+    """Like :func:`_guarded`, also yielding the walked object list so callers walk the page once."""
+    with loaded_page(handle, page_index) as (page, geometry):
+        objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None
+        try:
+            objects = _page_objects(page.raw, max_objects=_MAX_GUARD_OBJECTS)
+        except (WalkBoundHit, PdfiumFailure):
+            objects = None
+        refusal = image_refusal(page, geometry, max_objects=_MAX_GUARD_OBJECTS, objects=objects)
+        if refusal is not None:
+            raise RenderRefused(f"page {geometry.page_number}: {refusal}; the page is not rendered")
+        yield page, geometry, [] if objects is None else objects
+
+
 class _Bitmap(NamedTuple):
     """A page drawn in this process: its size, its pixels (unpadded rows) in anonymous memory, and bytes a pixel."""
 
@@ -134,7 +156,14 @@ def _render_guarded(source: str | os.PathLike[str], page_index: int, dpi: int, p
         return _draw(page, geometry, dpi)
 
 
-def _draw(page: pdfium.PdfPage, geometry: PageGeometry, dpi: int, *, colour: bool = False) -> _Bitmap:
+def _draw(
+    page: pdfium.PdfPage,
+    geometry: PageGeometry,
+    dpi: int,
+    *,
+    colour: bool = False,
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
+) -> _Bitmap:
     """Draw the loaded page at ``dpi`` on white, in 8-bit gray (24-bit BGR if ``colour``), without its annotations."""
     drawn = _BGR if colour else _GRAY
     width, height = render_size(geometry.width_pt, geometry.height_pt, dpi)
@@ -150,7 +179,7 @@ def _draw(page: pdfium.PdfPage, geometry: PageGeometry, dpi: int, *, colour: boo
     try:
         if not pdfium_c.FPDFBitmap_FillRect(bitmap, 0, 0, width, height, _WHITE):
             raise RenderFailed(f"page {geometry.page_number}: pdfium cannot fill a {width} x {height} bitmap")
-        _decode_jbig2_first(page, geometry.page_number)
+        _decode_jbig2_first(page, geometry.page_number, objects=objects)
         # Rotation 0 draws the page as displayed (its /Rotate applied), filling the bitmap.
         pdfium_c.FPDF_RenderPageBitmap(bitmap, page.raw, 0, 0, width, height, 0, drawn.flags)
     finally:
@@ -159,7 +188,12 @@ def _draw(page: pdfium.PdfPage, geometry: PageGeometry, dpi: int, *, colour: boo
     return _Bitmap(width, height, pixels, drawn.channels)
 
 
-def _decode_jbig2_first(page: pdfium.PdfPage, page_number: int) -> int:
+def _decode_jbig2_first(
+    page: pdfium.PdfPage,
+    page_number: int,
+    *,
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
+) -> int:
     """Decode each JBIG2 image the guard's walk reaches on its own, then free it; how many.
 
     Walks :func:`~datagrunt.pdf.pdfium_engine._page_objects` within
@@ -170,9 +204,12 @@ def _decode_jbig2_first(page: pdfium.PdfPage, page_number: int) -> int:
         RenderFailed: If pdfium cannot decode one (named by its walk index).
         PdfiumFailure: If an image's filters cannot be read.
     """
+    walked = _page_objects(page.raw, max_objects=_MAX_GUARD_OBJECTS) if objects is None else objects
     decoded = 0
-    for index, (item, _form) in enumerate(_page_objects(page.raw, max_objects=_MAX_GUARD_OBJECTS)):
-        if pdfium_c.FPDFPageObj_GetType(item) != pdfium_c.FPDF_PAGEOBJ_IMAGE:
+    get_type = pdfium_c.FPDFPageObj_GetType
+    image_kind = pdfium_c.FPDF_PAGEOBJ_IMAGE
+    for index, (item, _form) in enumerate(walked):
+        if get_type(item) != image_kind:
             continue
         if "JBIG2Decode" not in read_filters(item, f"object {index}"):
             continue
@@ -197,13 +234,24 @@ def _render_loaded(handle: DocumentHandle, page_index: int, dpi: int, *, colour:
         RenderFailed: If pdfium cannot remove a text object, or make or fill the bitmap.
         MemoryError: If the bitmap cannot be mapped (a memory cap).
     """
-    with _guarded(handle, page_index) as (page, geometry):
+    with _guarded_with_objects(handle, page_index) as (page, geometry, objects):
+        draw_objects = objects
         if without_text:
-            _remove_text(page, geometry.page_number)
-        return _draw(page, geometry, dpi, colour=colour)
+            get_type = pdfium_c.FPDFPageObj_GetType
+            text_kind = pdfium_c.FPDF_PAGEOBJ_TEXT
+            remaining = [pair for pair in objects if get_type(pair[0]) != text_kind]
+            if len(remaining) != len(objects):
+                _remove_text(page, geometry.page_number, objects=objects)
+                draw_objects = remaining
+        return _draw(page, geometry, dpi, colour=colour, objects=draw_objects)
 
 
-def _remove_text(page: pdfium.PdfPage, page_number: int) -> int:
+def _remove_text(
+    page: pdfium.PdfPage,
+    page_number: int,
+    *,
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
+) -> int:
     """Remove every text object from the loaded page, forms' included; how many. In this load only: nothing is saved.
 
     Walks the guard's walk (:func:`~datagrunt.pdf.pdfium_engine._page_objects`
@@ -213,15 +261,17 @@ def _remove_text(page: pdfium.PdfPage, page_number: int) -> int:
     Raises:
         RenderFailed: If pdfium cannot remove a text object (named by its walk index).
     """
-    objects = _page_objects(page.raw, max_objects=_MAX_GUARD_OBJECTS)
+    walked = _page_objects(page.raw, max_objects=_MAX_GUARD_OBJECTS) if objects is None else objects
     removed = 0
-    for index, (item, form) in enumerate(objects):  # bounded: the walk's objects
-        if pdfium_c.FPDFPageObj_GetType(item) != pdfium_c.FPDF_PAGEOBJ_TEXT:
+    get_type = pdfium_c.FPDFPageObj_GetType
+    text_kind = pdfium_c.FPDF_PAGEOBJ_TEXT
+    for index, (item, form) in enumerate(walked):  # bounded: the walk's objects
+        if get_type(item) != text_kind:
             continue
         if form < 0:
             done = pdfium_c.FPDFPage_RemoveObject(page.raw, item)
         else:
-            done = pdfium_c.FPDFFormObj_RemoveObject(objects[form][0], item)
+            done = pdfium_c.FPDFFormObj_RemoveObject(walked[form][0], item)
         if not done:
             raise RenderFailed(
                 f"page {page_number}: pdfium cannot remove text object {index}; the page is not rendered"
@@ -269,6 +319,105 @@ def _worker_main(message: object, replies: IO[bytes]) -> None:
         return
     _send(replies, _PIXELS + _PIXEL_SIZE.pack(bitmap.width, bitmap.height))
     _send(replies, bitmap.pixels)
+
+
+def _file_id(path: str) -> tuple[int, int, int, int] | None:
+    """The file's ``(st_dev, st_ino, st_size, st_mtime_ns)``, or None if ``os.stat`` fails."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _pool_worker_main(replies: IO[bytes]) -> None:
+    """A persistent render worker for :class:`~datagrunt.pdf.render.RenderWorkerPool`.
+
+    Loops over length-prefixed JSON requests on stdin, caching the open
+    :class:`~datagrunt.pdf.pdfium_engine.DocumentHandle` across consecutive
+    requests while the file on disk has the same ``os.stat`` identity.
+    """
+    lifetime: Lifetime | None = None
+    cached_key: tuple[str, str | None, tuple[int, int, int, int]] | None = None
+    cached_cm: AbstractContextManager[DocumentHandle] | None = None
+    cached_handle: DocumentHandle | None = None
+
+    def get_handle(source: str, password: str | None) -> DocumentHandle:
+        nonlocal cached_key, cached_cm, cached_handle
+        fid = _file_id(source)
+        key = (source, password, fid) if fid is not None else None
+        if cached_handle is not None and key is not None and cached_key == key:
+            return cached_handle
+        if cached_cm is not None:
+            cached_cm.__exit__(None, None, None)
+            cached_cm = None
+            cached_handle = None
+            cached_key = None
+        cm = open_document(source, password=password)
+        handle = cm.__enter__()
+        fid_after = _file_id(source)
+        if fid_after is not None:
+            cached_cm = cm
+            cached_handle = handle
+            cached_key = (source, password, fid_after)
+        return handle
+
+    try:
+        while True:
+            if lifetime is not None:
+                lifetime.extend(_IDLE_LIFETIME_S)
+            raw = read_message(sys.stdin.buffer, MAX_REQUEST_BYTES)
+            if raw is None:
+                return
+            try:
+                message = json.loads(raw)
+            except Exception as exc:
+                _send(replies, _failure(exc))
+                continue
+            if isinstance(message, dict) and "pages" in message:
+                try:
+                    batch_req = _batch_request_from(message)
+                except Exception as exc:
+                    _send(replies, _failure(exc))
+                    continue
+                sent = 0
+                try:
+                    if lifetime is None:
+                        lifetime = apply_memory_cap(batch_req.memory_cap_bytes, batch_req.timeout_s)
+                    else:
+                        lifetime.extend(batch_req.timeout_s)
+                    handle = get_handle(batch_req.source, batch_req.password)
+                    for index, dpi in batch_req.pages:
+                        _send_page(replies, handle, index, dpi, batch_req)
+                        sent += 1
+                except MemoryError:
+                    os._exit(CAP_EXIT)
+                except Exception as exc:
+                    for _ in batch_req.pages[sent:]:
+                        _send(replies, _failure(exc))
+            else:
+                try:
+                    req = _request_from(message)
+                    if lifetime is None:
+                        lifetime = apply_memory_cap(req.memory_cap_bytes, req.timeout_s)
+                    else:
+                        lifetime.extend(req.timeout_s)
+                    handle = get_handle(req.source, req.password)
+                    bitmap = _render_loaded(handle, req.page_index, req.dpi, colour=False, without_text=False)
+                except MemoryError:
+                    os._exit(CAP_EXIT)
+                except RenderRefused as exc:
+                    _send(replies, _REFUSED + str(exc).encode("utf-8", errors="backslashreplace"))
+                    continue
+                except Exception as exc:
+                    _send(replies, _failure(exc))
+                    continue
+                with bitmap.pixels:
+                    _send(replies, _PIXELS + _PIXEL_SIZE.pack(bitmap.width, bitmap.height))
+                    _send(replies, bitmap.pixels)
+    finally:
+        if cached_cm is not None:
+            cached_cm.__exit__(None, None, None)
 
 
 def _batch_main(message: dict[str, object], replies: IO[bytes]) -> None:

@@ -162,7 +162,7 @@ from datagrunt.pdf.codec import document_to_json_bytes
 from datagrunt.pdf.elements import Figure, Page, PDFDocument
 from datagrunt.pdf.frame import _BBOX_FIELDS, element_frame, utf8_text
 from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, extract_document
-from datagrunt.pdf.render import _MIN_TARGET_DPI, RenderedPage, RenderFailed, RenderRefused
+from datagrunt.pdf.render import _MIN_TARGET_DPI, RenderedPage, RenderFailed, RenderRefused, render_worker_pool
 
 __all__ = ["PDFWriter"]
 
@@ -572,7 +572,8 @@ def _write_renders(
     def task(page: Page) -> Path | None:
         return _rendered(page, directory, source, dpi, options.max_render_pixels)
 
-    outcomes = _in_page_order(task, pages, options.workers, "datagrunt-writer")
+    with render_worker_pool():
+        outcomes = _in_page_order(task, pages, options.workers, "datagrunt-writer")
     return [path for path in outcomes if path is not None]
 
 
@@ -589,4 +590,4 @@ def _rendered(page: Page, directory: Path, source: PDFSource, dpi: int, max_pixe
 def _write_png(target: Path, image: RenderedPage) -> Path:
     """Write 8-bit grey pixels as a PNG, encoded by Pillow straight into the file."""
     picture = Image.frombytes("L", (image.px_width, image.px_height), image.pixels)
-    return _write_atomically(target, lambda handle: picture.save(handle, format="PNG"))
+    return _write_atomically(target, lambda handle: picture.save(handle, format="PNG", compress_level=1))

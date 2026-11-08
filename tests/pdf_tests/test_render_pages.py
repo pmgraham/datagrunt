@@ -625,3 +625,75 @@ def test_the_process_allowlist_is_unchanged():
         "render": ("datagrunt.pdf._render_worker", "_worker_main"),
     }
     assert os.path.basename(_render_worker.__file__) == "_render_worker.py"
+
+
+class TestRenderWorkerPool:
+    """render_worker_pool reuses a warm worker and open DocumentHandle across render_page and render_pages calls."""
+
+    def test_pooled_renders_reuse_one_worker_and_reap_on_exit(self, tmp_path, started):
+        path = coloured(tmp_path)
+
+        with render.render_worker_pool() as pool:
+            assert render.active_render_worker_pool() is pool
+            first = render_page(path, 0, dpi=72, memory_cap_bytes=CAP, timeout_s=TIMEOUT_S)
+            second = render_page(path, 0, dpi=36, memory_cap_bytes=CAP, timeout_s=TIMEOUT_S)
+            (third,) = batch(path, ((0, 36),))
+            assert len(started) == 1
+            assert started[0].poll() is None
+
+        assert render.active_render_worker_pool() is None
+        assert started[0].poll() is not None
+        assert (first.px_width, second.px_width, third.px_width) == (400, 200, 200)
+        with pytest.raises(ValueError, match="RenderWorkerPool is closed"):
+            pool.acquire(["python"], "", CAP)
+
+    def test_pool_worker_main_caches_handle_and_handles_errors(self, tmp_path, monkeypatch):
+        import io as _io
+        from dataclasses import asdict
+
+        from datagrunt.pdf._process import send_message
+
+        class FakeLifetime:
+            def extend(self, _s: float) -> None:
+                pass
+
+        monkeypatch.setattr(_render_worker, "apply_memory_cap", lambda *args: FakeLifetime())
+        path = coloured(tmp_path)
+        req1 = render._Request(
+            source=str(path), page_index=0, dpi=36, password=None, memory_cap_bytes=CAP, timeout_s=TIMEOUT_S
+        )
+        req2 = render._Request(
+            source=str(path), page_index=0, dpi=72, password=None, memory_cap_bytes=CAP, timeout_s=TIMEOUT_S
+        )
+        req_bad = {"bad": "request"}
+        batch_req = batch_request(path, ((0, 36),))
+
+        buf = _io.BytesIO()
+        for item in (asdict(req1), asdict(req2), req_bad, asdict(batch_req)):
+            send_message(buf, json.dumps(item).encode("ascii"))
+        buf.seek(0)
+
+        class FakeStdin:
+            buffer = buf
+
+        monkeypatch.setattr(sys, "stdin", FakeStdin())
+        opens = 0
+        real_open = _render_worker.open_document
+
+        def counting_open(*args, **kwargs):
+            nonlocal opens
+            opens += 1
+            return real_open(*args, **kwargs)
+
+        monkeypatch.setattr(_render_worker, "open_document", counting_open)
+        replies = Sink()
+
+        _render_worker._pool_worker_main(replies)
+
+        # req1, req2, and batch_req all share a single open_document call on the unchanged file.
+        assert opens == 1
+        messages = framed(replies.data)
+        assert messages[0] == render._PIXELS + render._PIXEL_SIZE.pack(200, 150)
+        assert messages[2] == render._PIXELS + render._PIXEL_SIZE.pack(400, 300)
+        assert messages[4].startswith(render._FAILED + b"ValueError:")
+        assert messages[5] == render._PIXELS + render._PIXEL_SIZE.pack(200, 150)

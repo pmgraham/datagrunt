@@ -823,18 +823,25 @@ _POINT_KINDS: MappingProxyType[int, Literal["move", "line", "curve"]] = MappingP
 _FILL_MODES = (pdfium_c.FPDF_FILLMODE_NONE, pdfium_c.FPDF_FILLMODE_ALTERNATE, pdfium_c.FPDF_FILLMODE_WINDING)
 
 
-def _read_paint(path: pdfium_c.FPDF_PAGEOBJECT, label: str) -> PathPaint:
+def _read_paint(
+    path: pdfium_c.FPDF_PAGEOBJECT,
+    label: str,
+    bufs: tuple[ctypes.c_int, ctypes.c_int, ctypes.c_float] | None = None,
+) -> PathPaint:
     """Read how a path object is painted: stroke and fill, line width and dashes (if stroked), colours."""
-    fill_mode, stroke = ctypes.c_int(), ctypes.c_int()
+    fill_mode, stroke, width = (ctypes.c_int(), ctypes.c_int(), ctypes.c_float()) if bufs is None else bufs
     if not pdfium_c.FPDFPath_GetDrawMode(path, fill_mode, stroke) or fill_mode.value not in _FILL_MODES:
         raise PdfiumFailure(f"read the draw mode of {label}")
-    width = ctypes.c_float()
-    if stroke.value and not pdfium_c.FPDFPageObj_GetStrokeWidth(path, width):
-        raise PdfiumFailure(f"read the stroke width of {label}")
+    if stroke.value:
+        if not pdfium_c.FPDFPageObj_GetStrokeWidth(path, width):
+            raise PdfiumFailure(f"read the stroke width of {label}")
+        stroke_w = width.value
+    else:
+        stroke_w = 0.0
     return PathPaint(
         stroked=bool(stroke.value),
         filled=fill_mode.value != pdfium_c.FPDF_FILLMODE_NONE,
-        stroke_width=width.value,
+        stroke_width=stroke_w,
         dashed=bool(stroke.value) and _leaves_gaps(_read_dashes(path, label)),
         stroke_rgba=read_rgba(pdfium_c.FPDFPageObj_GetStrokeColor, path, f"stroke colour of {label}"),
         fill_rgba=read_rgba(pdfium_c.FPDFPageObj_GetFillColor, path, f"fill colour of {label}"),
@@ -888,33 +895,49 @@ class _SegmentRoom:
         self.remaining -= count
 
 
-def _read_points(path: pdfium_c.FPDF_PAGEOBJECT, label: str, room: _SegmentRoom) -> list[PathPoint]:
+def _read_points(
+    path: pdfium_c.FPDF_PAGEOBJECT,
+    label: str,
+    room: _SegmentRoom,
+    coords: tuple[ctypes.c_float, ctypes.c_float] | None = None,
+) -> list[PathPoint]:
     """Read a path object's points, in its own space, once ``room`` takes their count (none is read past it)."""
     count = pdfium_c.FPDFPath_CountSegments(path)
     if count < 0:
         raise PdfiumFailure(f"count the path segments of {label}")
     room.take(count, label)
-    points = []
-    x, y = ctypes.c_float(), ctypes.c_float()
+    points: list[PathPoint] = []
+    x, y = (ctypes.c_float(), ctypes.c_float()) if coords is None else coords
+    get_seg = pdfium_c.FPDFPath_GetPathSegment
+    get_type = pdfium_c.FPDFPathSegment_GetType
+    get_pt = pdfium_c.FPDFPathSegment_GetPoint
+    get_close = pdfium_c.FPDFPathSegment_GetClose
+    kinds = _POINT_KINDS
     for index in range(count):
-        segment = pdfium_c.FPDFPath_GetPathSegment(path, index)
-        kind = _POINT_KINDS.get(pdfium_c.FPDFPathSegment_GetType(segment)) if segment else None
-        if kind is None or not pdfium_c.FPDFPathSegment_GetPoint(segment, x, y):
+        segment = get_seg(path, index)
+        kind = kinds.get(get_type(segment)) if segment else None
+        if kind is None or not get_pt(segment, x, y):
             raise PdfiumFailure(f"read path segment {index} of {label}")
-        points.append(PathPoint(kind, x.value, y.value, bool(pdfium_c.FPDFPathSegment_GetClose(segment))))
+        points.append(PathPoint(kind, x.value, y.value, bool(get_close(segment))))
     return points
 
 
-def _read_matrix(obj: pdfium_c.FPDF_PAGEOBJECT, label: str) -> Matrix:
+def _read_matrix(obj: pdfium_c.FPDF_PAGEOBJECT, label: str, raw_buf: pdfium_c.FS_MATRIX | None = None) -> Matrix:
     """Read a page object's matrix (path_segments skips a path whose composed matrix is not finite)."""
-    raw = pdfium_c.FS_MATRIX()
+    raw = pdfium_c.FS_MATRIX() if raw_buf is None else raw_buf
     if not pdfium_c.FPDFPageObj_GetMatrix(obj, raw):
         raise PdfiumFailure(f"read the matrix of {label}")
     return Matrix(raw.a, raw.b, raw.c, raw.d, raw.e, raw.f)
 
 
 def _path_object_segments(
-    path: pdfium_c.FPDF_PAGEOBJECT, index: int, matrix: Matrix, to_display: Callable[[Box], Box], room: _SegmentRoom
+    path: pdfium_c.FPDF_PAGEOBJECT,
+    index: int,
+    matrix: Matrix,
+    to_display: Callable[[Box], Box],
+    room: _SegmentRoom,
+    paint_bufs: tuple[ctypes.c_int, ctypes.c_int, ctypes.c_float] | None = None,
+    pt_coords: tuple[ctypes.c_float, ctypes.c_float] | None = None,
 ) -> list[RawSegment] | None:
     """The segments of path object ``index`` (matrix to page space ``matrix``), or None if its geometry is not finite.
 
@@ -923,8 +946,8 @@ def _path_object_segments(
     renders the rest of it), so only that path is skipped.
     """
     label = f"object {index}"
-    paint = _read_paint(path, label)
-    points = _read_points(path, label, room)
+    paint = _read_paint(path, label, paint_bufs)
+    points = _read_points(path, label, room, pt_coords)
     try:
         return path_segments(points, matrix=matrix, paint=paint, object_index=index, to_display=to_display)
     except NonFiniteGeometry:
@@ -942,12 +965,16 @@ def _objects_in_forms(
     page space (IDENTITY off a form).
     """
     form_matrices: dict[int, Matrix] = {}
+    mat_buf = pdfium_c.FS_MATRIX()
+    get_type = pdfium_c.FPDFPageObj_GetType
+    form_kind = pdfium_c.FPDF_PAGEOBJ_FORM
     for index, (obj, form) in enumerate(objects):
-        obj_kind = pdfium_c.FPDFPageObj_GetType(obj)
-        if obj_kind not in (kind, pdfium_c.FPDF_PAGEOBJ_FORM):
+        obj_kind = get_type(obj)
+        if obj_kind != kind and obj_kind != form_kind:
             continue
-        own, outer = _read_matrix(obj, f"object {index}"), form_matrices[form] if form >= 0 else IDENTITY
-        if obj_kind == pdfium_c.FPDF_PAGEOBJ_FORM:
+        own = _read_matrix(obj, f"object {index}", mat_buf)
+        outer = form_matrices[form] if form >= 0 else IDENTITY
+        if obj_kind == form_kind:
             # A non-finite form matrix is kept: everything inside it is then skipped.
             form_matrices[index] = own.then(outer)
         else:
@@ -967,7 +994,7 @@ def _placed_objects(
     """
     walked = _page_objects(page_raw, max_objects=max_objects) if objects is None else objects
     for index, obj, own, outer in _objects_in_forms(walked, kind):
-        yield index, obj, own.then(outer)
+        yield index, obj, own if outer == IDENTITY else own.then(outer)
 
 
 def _display_mapping(geometry: PageGeometry) -> Callable[[Box], Box]:
@@ -987,9 +1014,11 @@ def _collect_segments(
     segments: list[RawSegment] = []
     skipped = 0
     room = _SegmentRoom()
+    paint_bufs = (ctypes.c_int(), ctypes.c_int(), ctypes.c_float())
+    pt_coords = (ctypes.c_float(), ctypes.c_float())
     placed = _placed_objects(page_raw, pdfium_c.FPDF_PAGEOBJ_PATH, max_objects=MAX_PAGE_OBJECTS, objects=objects)
     for index, path, matrix in placed:
-        found = _path_object_segments(path, index, matrix, to_display, room)
+        found = _path_object_segments(path, index, matrix, to_display, room, paint_bufs, pt_coords)
         if found is None:
             skipped += 1
         else:
@@ -1107,7 +1136,13 @@ def loaded_page(handle: DocumentHandle, index: int) -> Iterator[tuple[pdfium.Pdf
         page.close()
 
 
-def image_refusal(page: pdfium.PdfPage, geometry: PageGeometry, *, max_objects: int) -> str | None:
+def image_refusal(
+    page: pdfium.PdfPage,
+    geometry: PageGeometry,
+    *,
+    max_objects: int,
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
+) -> str | None:
     """Why the loaded ``page`` must not be rendered, naming the object; None when it may be (#369 A5a).
 
     The render guard. It walks the page's objects as :func:`page_images`
@@ -1143,7 +1178,7 @@ def image_refusal(page: pdfium.PdfPage, geometry: PageGeometry, *, max_objects: 
     if not isinstance(geometry, PageGeometry):
         raise TypeError(f"geometry must be a PageGeometry, got {type(geometry).__name__}")
     int_at_least("max_objects", max_objects, 1)
-    placed = _placed_objects(page.raw, pdfium_c.FPDF_PAGEOBJ_IMAGE, max_objects=max_objects)
+    placed = _placed_objects(page.raw, pdfium_c.FPDF_PAGEOBJ_IMAGE, max_objects=max_objects, objects=objects)
     try:
         for outcome in image_outcomes(placed, page.raw, geometry.page_box, _display_mapping(geometry)):
             if outcome.render_refusal is not None:
@@ -1194,21 +1229,28 @@ def _collect_object_boxes(
     boxes: list[Box] = []
     unboxed = 0
     bounds_buf = (ctypes.c_float(), ctypes.c_float(), ctypes.c_float(), ctypes.c_float())
+    mat_buf = pdfium_c.FS_MATRIX()
+    get_type = pdfium_c.FPDFPageObj_GetType
+    form_kind = pdfium_c.FPDF_PAGEOBJ_FORM
+    text_kind = pdfium_c.FPDF_PAGEOBJ_TEXT
     for index, (obj, form) in enumerate(walked):  # bounded: the walk's objects
-        kind = pdfium_c.FPDFPageObj_GetType(obj)
-        outer = form_matrices[form] if form >= 0 else IDENTITY
-        if kind == pdfium_c.FPDF_PAGEOBJ_FORM:
-            # A form paints nothing of its own: the walk visits its contents next, and boxes each.
-            form_matrices[index] = _read_matrix(obj, f"object {index}").then(outer)
+        kind = get_type(obj)
+        if kind == text_kind:
             continue
-        if kind == pdfium_c.FPDF_PAGEOBJ_TEXT:
+        outer = form_matrices[form] if form >= 0 else IDENTITY
+        if kind == form_kind:
+            # A form paints nothing of its own: the walk visits its contents next, and boxes each.
+            form_matrices[index] = _read_matrix(obj, f"object {index}", mat_buf).then(outer)
             continue
         box = _object_box(obj, outer, to_display, bounds_buf)
         if box is None:
             unboxed += 1
         else:
             boxes.append(box)
-    return ObjectBoxes(boxes=tuple(boxes), unboxed=unboxed)
+    out = object.__new__(ObjectBoxes)
+    object.__setattr__(out, "boxes", tuple(boxes))
+    object.__setattr__(out, "unboxed", unboxed)
+    return out
 
 
 def _object_box(
@@ -1223,7 +1265,14 @@ def _object_box(
     )
     if not pdfium_c.FPDFPageObj_GetBounds(obj, left, bottom, right, top):
         return None
-    corners = [outer.apply(x, y) for x in (left.value, right.value) for y in (bottom.value, top.value)]
+    l_val, b_val, r_val, t_val = left.value, bottom.value, right.value, top.value
+    if outer == IDENTITY:
+        if not (math.isfinite(l_val) and math.isfinite(b_val) and math.isfinite(r_val) and math.isfinite(t_val)):
+            return None
+        x0, x1 = (l_val, r_val) if l_val <= r_val else (r_val, l_val)
+        y0, y1 = (b_val, t_val) if b_val <= t_val else (t_val, b_val)
+        return to_display((x0, y0, x1, y1))
+    corners = [outer.apply(x, y) for x in (l_val, r_val) for y in (b_val, t_val)]
     xs, ys = [corner[0] for corner in corners], [corner[1] for corner in corners]
     if not all(math.isfinite(value) for value in (*xs, *ys)):
         return None
@@ -1543,17 +1592,32 @@ class ImageLoader:
                 raise self._changed(f"it has {handle.page_count} page(s)")
             page, page_number = _load_page(handle, self.page_index)
             try:
-                image, raw, facts = self._verified_image(page.raw)
-                return finish(image, raw, facts, f"object {self.object_index}")
-            except PdfiumFailure as exc:
-                message = f"{self.source}: page {page_number}: pdfium cannot {exc}"
-                raise PDFCorruptError(message, page_number=page_number) from exc
-            except (OversizedStream, DecodeRefused) as exc:
-                raise DatagruntPDFError(f"{self.source}: page {page_number}: {exc}") from exc
+                return self._read_from_page(page.raw, page_number, None, finish)
             finally:
                 page.close()
 
-    def _verified_image(self, page_raw: pdfium_c.FPDF_PAGE) -> tuple[pdfium_c.FPDF_PAGEOBJECT, bytes, PixelFacts]:
+    def _read_from_page(
+        self,
+        page_raw: pdfium_c.FPDF_PAGE,
+        page_number: int,
+        objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None,
+        finish: Callable[[pdfium_c.FPDF_PAGEOBJECT, bytes, PixelFacts, str], bytes],
+    ) -> bytes:
+        """Verify the image on ``page_raw`` (using pre-walked ``objects`` if given) and return ``finish(...)``."""
+        try:
+            image, raw, facts = self._verified_image(page_raw, objects)
+            return finish(image, raw, facts, f"object {self.object_index}")
+        except PdfiumFailure as exc:
+            message = f"{self.source}: page {page_number}: pdfium cannot {exc}"
+            raise PDFCorruptError(message, page_number=page_number) from exc
+        except (OversizedStream, DecodeRefused) as exc:
+            raise DatagruntPDFError(f"{self.source}: page {page_number}: {exc}") from exc
+
+    def _verified_image(
+        self,
+        page_raw: pdfium_c.FPDF_PAGE,
+        walked: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
+    ) -> tuple[pdfium_c.FPDF_PAGEOBJECT, bytes, PixelFacts]:
         """The image object this loader names on the loaded page, its verified raw stream and pixel facts.
 
         The stream must hash to ``raw_sha256``, and the facts read from the
@@ -1563,10 +1627,13 @@ class ImageLoader:
         to another picture. Dictionary changes that keep all of these (a
         /Decode array, a palette's colours) are not detected.
         """
-        try:
-            objects = _page_objects(page_raw, max_objects=MAX_PAGE_OBJECTS)
-        except WalkBoundHit as exc:  # its page was within the bound when the image was recorded
-            raise self._changed(str(exc)) from exc
+        if walked is None:
+            try:
+                objects = _page_objects(page_raw, max_objects=MAX_PAGE_OBJECTS)
+            except WalkBoundHit as exc:  # its page was within the bound when the image was recorded
+                raise self._changed(str(exc)) from exc
+        else:
+            objects = walked
         if self.object_index >= len(objects):
             raise self._changed(f"the page has {len(objects)} object(s)")
         image, _form = objects[self.object_index]

@@ -276,7 +276,16 @@ from datagrunt.pdf.elements import Figure, Page, PageImage, PDFDocument
 from datagrunt.pdf.exceptions import BundleCorruptError, DatagruntPDFError, PDFSourceChangedError
 from datagrunt.pdf.frame import element_frame, utf8_text
 from datagrunt.pdf.pipeline import PDFSource, PipelineOptions
-from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page
+from datagrunt.pdf.render import (
+    RenderedPage,
+    RenderFailed,
+    RenderRefused,
+    active_render_worker_pool,
+    effective_dpi,
+    render_page,
+    render_worker_pool,
+    use_render_worker_pool,
+)
 
 __all__ = ["BUNDLE_FORMAT_VERSION", "load_bundle", "write_bundle"]
 
@@ -782,11 +791,17 @@ def _in_page_order(task: Callable[[Page], _T], pages: tuple[Page, ...], workers:
     outcomes: dict[int, _T] = {}
     queued = iter(range(len(pages)))
     running: dict[Future[_T], int] = {}
+    render_pool = active_render_worker_pool()
+
+    def run_task(page: Page) -> _T:
+        with use_render_worker_pool(render_pool):
+            return task(page)
+
     pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix=prefix)
     try:
         for _ in range(len(pages) + 1):  # bounded: each pass collects at least one page, but the last
             for index in islice(queued, workers - len(running)):
-                running[pool.submit(task, pages[index])] = index
+                running[pool.submit(run_task, pages[index])] = index
             if not running:
                 break
             done, _pending = wait(running, return_when=FIRST_COMPLETED)
@@ -806,8 +821,9 @@ def _write_renders(
     def task(page: Page) -> _PageOutcome:
         return _page_outcome(page, staging, source, options)
 
-    for outcome in _in_page_order(task, document.pages, options.workers, "datagrunt-bundle"):
-        _record(outcome, renders, ledger)
+    with render_worker_pool():
+        for outcome in _in_page_order(task, document.pages, options.workers, "datagrunt-bundle"):
+            _record(outcome, renders, ledger)
     return renders
 
 
@@ -1041,7 +1057,9 @@ def _write_png(staging: Path, relative: str, image: RenderedPage) -> _Artifact:
     """Write 8-bit grey pixels as a PNG, encoded by Pillow straight into the file."""
     picture = Image.frombytes("L", (image.px_width, image.px_height), image.pixels)
     # Pillow needs only write() of a file object: a cast, not a conversion.
-    return _write_stream(staging, relative, lambda sink: picture.save(cast(IO[bytes], sink), format="PNG"))
+    return _write_stream(
+        staging, relative, lambda sink: picture.save(cast(IO[bytes], sink), format="PNG", compress_level=1)
+    )
 
 
 def _write_bytes(staging: Path, relative: str, data: bytes) -> _Artifact:

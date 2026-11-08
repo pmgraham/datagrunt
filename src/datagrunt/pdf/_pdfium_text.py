@@ -452,15 +452,25 @@ def _em(
 
 
 def _read_style(
-    textpage: pdfium_c.FPDF_TEXTPAGE, text_object: pdfium_c.FPDF_PAGEOBJECT, char_index: int, object_index: int
+    textpage: pdfium_c.FPDF_TEXTPAGE,
+    text_object: pdfium_c.FPDF_PAGEOBJECT,
+    char_index: int,
+    object_index: int,
+    font_cache: dict[int, tuple[str, bool, bool]] | None = None,
 ) -> _Style:
     """Read the style of text object ``object_index``, which owns textpage char ``char_index``."""
     label = f"object {object_index}"
     font = pdfium_c.FPDFTextObj_GetFont(text_object)
     if not font:
         raise PdfiumFailure(f"read the font of {label}")
-    name = _base_font_name(font, label)
-    is_bold, is_italic = _bold_and_italic(font, name, label)
+    font_key = object_address(font) if font_cache is not None else 0
+    if font_cache is not None and font_key in font_cache:
+        name, is_bold, is_italic = font_cache[font_key]
+    else:
+        name = _base_font_name(font, label)
+        is_bold, is_italic = _bold_and_italic(font, name, label)
+        if font_cache is not None:
+            font_cache[font_key] = (name, is_bold, is_italic)
     render_mode = pdfium_c.FPDFTextObj_GetTextRenderMode(text_object)
     if render_mode not in range(8):  # FPDF_TEXTRENDERMODE_UNKNOWN (-1) on failure
         raise PdfiumFailure(f"read the render mode of {label}")
@@ -620,18 +630,25 @@ class _SpanBuilder:
         if not self._chars:
             return
         boxes = tuple(self._to_display(box) for box in self._boxes)
-        self._spans.append(
-            RawSpan(
-                text="".join(self._chars),
-                bbox=union_box(boxes),
-                char_boxes=boxes,
-                tight_boxes=tuple(self._to_display(box) for box in self._tight),
-                object_index=self._object_indices[self._owner],
-                generated_breaks=tuple(self._breaks),
-                map_errors=tuple(self._errors),
-                **self._styles[self._owner]._asdict(),
-            )
-        )
+        tight_boxes = tuple(self._to_display(box) for box in self._tight)
+        style = self._styles[self._owner]
+        span = object.__new__(RawSpan)
+        object.__setattr__(span, "text", "".join(self._chars))
+        object.__setattr__(span, "bbox", union_box(boxes))
+        object.__setattr__(span, "char_boxes", boxes)
+        object.__setattr__(span, "tight_boxes", tight_boxes)
+        object.__setattr__(span, "font_size_pt", float(style.font_size_pt))
+        object.__setattr__(span, "em_width_pt", float(style.em_width_pt))
+        object.__setattr__(span, "base_font_name", style.base_font_name)
+        object.__setattr__(span, "is_bold", style.is_bold)
+        object.__setattr__(span, "is_italic", style.is_italic)
+        object.__setattr__(span, "render_mode", style.render_mode)
+        object.__setattr__(span, "fill_rgba", style.fill_rgba)
+        object.__setattr__(span, "stroke_rgba", style.stroke_rgba)
+        object.__setattr__(span, "object_index", self._object_indices[self._owner])
+        object.__setattr__(span, "generated_breaks", tuple(self._breaks))
+        object.__setattr__(span, "map_errors", tuple(self._errors))
+        self._spans.append(span)
         self._chars, self._boxes, self._tight, self._breaks, self._errors = [], [], [], [], []
 
 
@@ -662,6 +679,7 @@ def _read_textpage(textpage: pdfium_c.FPDF_TEXTPAGE, object_indices: dict[int, i
         raise WalkBoundHit(f"the text page holds {count} chars, over the walk's {MAX_PAGE_CHARS}-char bound")
     chars: list[_OwnedChar | None] = []
     styles: dict[int, _Style] = {}
+    font_cache: dict[int, tuple[str, bool, bool]] = {}
     skipped: set[int] = set()
     generated = ownerless = 0
     loose_rect = pdfium_c.FS_RECTF()
@@ -686,10 +704,21 @@ def _read_textpage(textpage: pdfium_c.FPDF_TEXTPAGE, object_indices: dict[int, i
         if owner not in styles:
             if owner not in object_indices:
                 raise PdfiumFailure(f"read the text object of char {char_index}: it is not in the page's object tree")
-            styles[owner] = _read_style(textpage, text_object, char_index, object_indices[owner])
+            style = _read_style(textpage, text_object, char_index, object_indices[owner], font_cache)
+            styles[owner] = style
+            if not (math.isfinite(style.font_size_pt) and math.isfinite(style.em_width_pt)):
+                skipped.add(owner)
         box, tight = _loose_box(textpage, char_index, loose_rect), _tight_box(textpage, char_index, tight_coords)
-        style = styles[owner]
-        if not all(math.isfinite(value) for value in (*box, *tight, style.font_size_pt, style.em_width_pt)):
+        if not (
+            math.isfinite(box[0])
+            and math.isfinite(box[1])
+            and math.isfinite(box[2])
+            and math.isfinite(box[3])
+            and math.isfinite(tight[0])
+            and math.isfinite(tight[1])
+            and math.isfinite(tight[2])
+            and math.isfinite(tight[3])
+        ):
             skipped.add(owner)
         chars.append(_OwnedChar(owner, code, map_error, box, tight))
     return _Textpage(chars, generated, ownerless, styles, frozenset(skipped))

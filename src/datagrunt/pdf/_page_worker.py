@@ -62,7 +62,14 @@ from datagrunt.pdf.pipeline import (
     error_page,
 )
 from datagrunt.pdf.quality import Backdrop, PageAssessment, assess_page, needs_background
-from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_pages
+from datagrunt.pdf.render import (
+    RenderedPage,
+    RenderFailed,
+    RenderRefused,
+    effective_dpi,
+    render_pages,
+    render_worker_pool,
+)
 from datagrunt.pdf.vision import fallback_page, vision_page
 
 __all__ = ["extract_page_at"]
@@ -92,7 +99,8 @@ def _worker_main(message: object, replies: IO[bytes]) -> None:
     try:
         request = pipeline._chunk_request(message)
         lifetime = apply_memory_cap(request.memory_cap_bytes, pipeline._facts_bound_s())
-        _extract(request, replies, lifetime)
+        with render_worker_pool():
+            _extract(request, replies, lifetime)
     except MemoryError:
         os._exit(CAP_EXIT)
     except Exception as exc:  # sent, and raised by the caller: never swallowed here
@@ -104,32 +112,33 @@ def _worker_main(message: object, replies: IO[bytes]) -> None:
 def _pool_worker_main(replies: IO[bytes]) -> None:
     """A persistent page worker for :class:`~datagrunt.pdf.pipeline.PageWorkerPool`: loops over chunks on stdin."""
     lifetime: Lifetime | None = None
-    while True:
-        if lifetime is not None:
-            lifetime.extend(_IDLE_LIFETIME_S)
-        raw = read_message(sys.stdin.buffer, MAX_REQUEST_BYTES)
-        if raw is None:
-            return
-        try:
-            message = json.loads(raw)
-            request = pipeline._chunk_request(message)
-            if lifetime is None:
-                lifetime = apply_memory_cap(request.memory_cap_bytes, pipeline._facts_bound_s())
-            else:
-                lifetime.extend(pipeline._facts_bound_s())
-            _extract(request, replies, lifetime)
-        except MemoryError:
-            os._exit(CAP_EXIT)
-        except Exception as exc:  # sent, and raised by the caller: never swallowed here
+    with render_worker_pool():
+        while True:
+            if lifetime is not None:
+                lifetime.extend(_IDLE_LIFETIME_S)
+            raw = read_message(sys.stdin.buffer, MAX_REQUEST_BYTES)
+            if raw is None:
+                return
             try:
-                send_message(replies, _ERROR + error_reply(exc))
+                message = json.loads(raw)
+                request = pipeline._chunk_request(message)
+                if lifetime is None:
+                    lifetime = apply_memory_cap(request.memory_cap_bytes, pipeline._facts_bound_s())
+                else:
+                    lifetime.extend(pipeline._facts_bound_s())
+                _extract(request, replies, lifetime)
+            except MemoryError:
+                os._exit(CAP_EXIT)
+            except Exception as exc:  # sent, and raised by the caller: never swallowed here
+                try:
+                    send_message(replies, _ERROR + error_reply(exc))
+                except OSError:
+                    return
+                continue
+            try:
+                send_message(replies, _DONE)
             except OSError:
                 return
-            continue
-        try:
-            send_message(replies, _DONE)
-        except OSError:
-            return
 
 
 def _extract(request: ChunkRequest, replies: IO[bytes], lifetime: Lifetime) -> None:

@@ -86,17 +86,22 @@ had not answered, each with why. Every page's pixels are held at once: the
 caller bounds the batch (at most :data:`MAX_BATCH_PAGES` pages).
 """
 
+import json
 import math
 import os
 import struct
 import subprocess
+import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, fields
 from functools import partial
 from typing import IO, NamedTuple
 
+from datagrunt.pdf._extra import EXTRA_IMPORTS
 from datagrunt.pdf._memory_cap import ending as _worker_ending
 from datagrunt.pdf._process import ERROR as _PROCESS_ERROR
 from datagrunt.pdf._process import MAX_REQUEST_BYTES as _MAX_REQUEST_BYTES
@@ -108,6 +113,7 @@ from datagrunt.pdf._process import (
     close_pipes,
     reaped,
     request_payload,
+    send_message,
     start_worker,
     worker_command,
 )
@@ -285,6 +291,118 @@ class _Malformed(Exception):
     """A worker's reply the parent refuses (a bad header, a claim past the cap, short pixels): a failure, unread on."""
 
 
+_RENDER_POOL_BOOTSTRAP = (
+    "import importlib, json, os, sys\n"
+    "replies = os.fdopen(os.dup(1), 'wb')\n"
+    "os.dup2(2, 1)\n"
+    "sys.path[:] = json.loads(sys.stdin.buffer.readline())\n"
+    f"extra = {EXTRA_IMPORTS!r}\n"
+    "try:\n"
+    "    from datagrunt.pdf._render_worker import _pool_worker_main\n"
+    "except ImportError as exc:\n"
+    "    if (exc.name or '').partition('.')[0] not in extra:\n"
+    "        raise\n"
+    "    process = importlib.import_module('datagrunt.pdf._process')\n"
+    "    process.send_message(replies, process.missing_extra_reply(exc))\n"
+    "    raise SystemExit(0)\n"
+    "_pool_worker_main(replies)\n"
+)
+
+
+class RenderWorkerPool:
+    """A scoped pool of warm render worker subprocesses that cache open PDF handles across renders."""
+
+    __slots__ = ("_closed", "_idle", "_lock")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._idle: list[tuple[int, subprocess.Popen[bytes], StderrTail]] = []
+        self._closed = False
+
+    def acquire(
+        self, command: list[str], where: str, memory_cap_bytes: int
+    ) -> tuple["subprocess.Popen[bytes]", StderrTail, bool]:
+        """Return a warm idle worker with matching ``memory_cap_bytes``, or start a new pooled worker."""
+        with self._lock:
+            if self._closed:
+                raise ValueError("RenderWorkerPool is closed")
+            for idx in range(len(self._idle) - 1, -1, -1):
+                cap, child, stderr = self._idle[idx]
+                if child.poll() is not None:
+                    self._idle.pop(idx)
+                    close_pipes(child)
+                    reaped(child, REAP_TIMEOUT_S)
+                    stderr.finish(REAP_TIMEOUT_S)
+                    continue
+                if cap == memory_cap_bytes:
+                    self._idle.pop(idx)
+                    return child, stderr, True
+        pool_cmd = [command[0], "-I", "-c", _RENDER_POOL_BOOTSTRAP]
+        child, stderr = _started(pool_cmd, where)
+        stdin = child.stdin
+        if stdin is not None:
+            try:
+                path = [os.path.abspath(entry) if entry else os.getcwd() for entry in sys.path]
+                stdin.write((json.dumps(path) + "\n").encode("utf-8"))
+                stdin.flush()
+            except OSError:
+                pass
+        return child, stderr, False
+
+    def release(self, memory_cap_bytes: int, child: "subprocess.Popen[bytes]", stderr: StderrTail) -> None:
+        """Return a healthy worker to the idle pool, or reap it if the pool is closed or the worker died."""
+        if child.poll() is None:
+            with self._lock:
+                if not self._closed:
+                    self._idle.append((memory_cap_bytes, child, stderr))
+                    return
+        close_pipes(child)
+        reaped(child, REAP_TIMEOUT_S)
+        stderr.finish(REAP_TIMEOUT_S)
+
+    def close(self) -> None:
+        """Close and reap all idle workers in the pool."""
+        with self._lock:
+            self._closed = True
+            idle = list(self._idle)
+            self._idle.clear()
+        for _cap, child, stderr in idle:
+            close_pipes(child)
+            reaped(child, REAP_TIMEOUT_S)
+            stderr.finish(REAP_TIMEOUT_S)
+
+    def __enter__(self) -> "RenderWorkerPool":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+
+_ACTIVE_RENDER_POOL: ContextVar[RenderWorkerPool | None] = ContextVar("_ACTIVE_RENDER_POOL", default=None)
+
+
+def active_render_worker_pool() -> RenderWorkerPool | None:
+    """Return the active :class:`RenderWorkerPool` for the current context, or None."""
+    return _ACTIVE_RENDER_POOL.get()
+
+
+@contextmanager
+def use_render_worker_pool(pool: RenderWorkerPool | None) -> Iterator[None]:
+    """Bind ``pool`` as the active :class:`RenderWorkerPool` in the current context."""
+    token = _ACTIVE_RENDER_POOL.set(pool)
+    try:
+        yield
+    finally:
+        _ACTIVE_RENDER_POOL.reset(token)
+
+
+@contextmanager
+def render_worker_pool() -> Iterator[RenderWorkerPool]:
+    """Open a :class:`RenderWorkerPool` for the block and close all pooled workers on exit."""
+    with RenderWorkerPool() as pool, use_render_worker_pool(pool):
+        yield pool
+
+
 def render_page(
     source: str | os.PathLike[str],
     page_index: int,
@@ -343,6 +461,9 @@ def render_page(
     where = f"{request.source}: page {request.page_index + 1}"
     command = _worker_command(where)
     payload = _request_payload(request)
+    pool = _ACTIVE_RENDER_POOL.get()
+    if pool is not None:
+        return _render_page_pooled(pool, command, request, where)
     deadline = time.monotonic() + request.timeout_s
     worker, stderr = _started(command, where)
     try:
@@ -351,6 +472,24 @@ def render_page(
         close_pipes(worker)
         tail = stderr.finish(REAP_TIMEOUT_S)  # the worker is reaped: its drain ends
     return _outcome(reply, timed_out, exitcode, request, "" if reply is not None else tail)
+
+
+def _render_page_pooled(pool: RenderWorkerPool, command: list[str], request: _Request, where: str) -> RenderedPage:
+    """Run a single-page render on a pooled worker from ``pool``."""
+    message = json.dumps(asdict(request)).encode("ascii")
+    deadline = time.monotonic() + request.timeout_s
+    for _ in range(2):
+        worker, stderr, warm = pool.acquire(command, where, request.memory_cap_bytes)
+        exchange = partial(
+            _exchange_pool, worker.stdin, worker.stdout, message, request.memory_cap_bytes, GRAY_CHANNELS, 1, True
+        )
+        replies, timed_out, exitcode, tail = _watched_pool(
+            pool, worker, stderr, request.memory_cap_bytes, deadline, 1, exchange
+        )
+        if replies or timed_out or not warm:
+            reply = replies[0] if replies else None
+            return _outcome(reply, timed_out, exitcode, request, "" if reply is not None else tail)
+    raise RenderFailed(f"{where}: cannot start a render worker")
 
 
 def _one_page_batch(request: _Request, *, colour: bool, without_text: bool) -> RenderedPage:
@@ -449,6 +588,9 @@ def _run_batch(request: _BatchRequest) -> tuple[list[_Reply], bool, int | None, 
         raise RenderFailed(str(exc)) from exc
     payload = _batch_payload(request)
     count, channels = len(request.pages), BGR_CHANNELS if request.colour else GRAY_CHANNELS
+    pool = _ACTIVE_RENDER_POOL.get()
+    if pool is not None:
+        return _run_batch_pooled(pool, command, request, count, channels)
     deadline = time.monotonic() + request.timeout_s
     worker, stderr = _started(command, "")
     exchange = partial(_exchange_batch, worker.stdin, worker.stdout, payload, request.memory_cap_bytes, channels, count)
@@ -458,6 +600,25 @@ def _run_batch(request: _BatchRequest) -> tuple[list[_Reply], bool, int | None, 
         close_pipes(worker)
         tail = stderr.finish(REAP_TIMEOUT_S)  # the worker is reaped: its drain ends
     return replies, timed_out, exitcode, "" if len(replies) == count else tail
+
+
+def _run_batch_pooled(
+    pool: RenderWorkerPool, command: list[str], request: _BatchRequest, count: int, channels: int
+) -> tuple[list[_Reply], bool, int | None, str]:
+    """Run a batch render on a pooled worker from ``pool``."""
+    message = json.dumps(asdict(request)).encode("ascii")
+    deadline = time.monotonic() + request.timeout_s
+    for _ in range(2):
+        worker, stderr, warm = pool.acquire(command, "", request.memory_cap_bytes)
+        exchange = partial(
+            _exchange_pool, worker.stdin, worker.stdout, message, request.memory_cap_bytes, channels, count, False
+        )
+        replies, timed_out, exitcode, tail = _watched_pool(
+            pool, worker, stderr, request.memory_cap_bytes, deadline, count, exchange
+        )
+        if replies or timed_out or not warm:
+            return replies, timed_out, exitcode, tail
+    return [], False, None, ""
 
 
 def _batch_payload(request: _BatchRequest) -> bytes:
@@ -564,6 +725,78 @@ def _watched(
         timed_out = not complete and time.monotonic() >= deadline
         exitcode = reaped(worker, REAP_TIMEOUT_S if complete else 0.0 if timed_out else _EXIT_GRACE_S)
     return replies, timed_out, exitcode
+
+
+def _watched_pool(
+    pool: RenderWorkerPool,
+    worker: "subprocess.Popen[bytes]",
+    stderr: StderrTail,
+    memory_cap_bytes: int,
+    deadline: float,
+    count: int,
+    exchange: Callable[[], tuple[list[_Reply], bool]],
+) -> tuple[list[_Reply], bool, int | None, str]:
+    """Run ``exchange`` on a pooled worker; return it to ``pool`` if healthy, else reap it and finish its stderr."""
+    killer = threading.Timer(max(0.0, deadline - time.monotonic()), worker.kill)
+    killer.daemon = True
+    killer.start()
+    replies: list[_Reply] = []
+    malformed = False
+    released = False
+    timed_out = False
+    exitcode: int | None = None
+    tail = ""
+    try:
+        try:
+            replies, malformed = exchange()
+        finally:
+            killer.cancel()
+            killer.join(REAP_TIMEOUT_S)
+        complete = len(replies) == count and not malformed
+        if complete and worker.poll() is None:
+            pool.release(memory_cap_bytes, worker, stderr)
+            released = True
+            return replies, False, 0, ""
+    finally:
+        if not released:
+            complete = len(replies) == count and not malformed
+            timed_out = not complete and time.monotonic() >= deadline
+            close_pipes(worker)
+            exitcode = reaped(worker, REAP_TIMEOUT_S if complete else 0.0 if timed_out else _EXIT_GRACE_S)
+            tail = stderr.finish(REAP_TIMEOUT_S)
+    return replies, timed_out, exitcode, "" if len(replies) == count else tail
+
+
+def _exchange_pool(
+    stdin: IO[bytes] | None,
+    stdout: IO[bytes] | None,
+    message: bytes,
+    memory_cap_bytes: int,
+    channels: int,
+    count: int,
+    single: bool,
+) -> tuple[list[_Reply], bool]:
+    """Send length-prefixed ``message`` to a pooled worker without closing stdin; read up to ``count`` replies."""
+    if stdin is None or stdout is None:
+        raise ValueError("the worker's stdin and stdout must be pipes")
+    replies: list[_Reply] = []
+    try:
+        send_message(stdin, message)
+        for _ in range(count):
+            reply = _read_reply(stdout, memory_cap_bytes, channels)
+            if reply is None:
+                return replies, False
+            replies.append(reply)
+    except _Malformed as exc:
+        replies.append(_Reply(_FAILED, str(exc), None))
+        return replies, True
+    except MessageTooLong as exc:
+        if not single:
+            replies.append(_Reply(_FAILED, str(exc), None))
+        return replies, True
+    except OSError:
+        return replies, False
+    return replies, False
 
 
 def _exchange(
