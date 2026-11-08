@@ -18,16 +18,19 @@ checked where tesseract is installed.
 
 import dataclasses
 import json
+import re
 from pathlib import Path
 
 import pytest
 
+from datagrunt.pdf import bundle
 from datagrunt.pdf.bundle import load_bundle, write_bundle
 from datagrunt.pdf.codec import document_from_json_bytes
 from datagrunt.pdf.elements import PDFDocument
 from datagrunt.pdf.frame import element_frame
 from datagrunt.pdf.pipeline import extract_document
 from datagrunt.pdf.reader import PDFReader
+from datagrunt.pdf.render import RenderFailed
 from datagrunt.pdf.writer import PDFWriter
 from pdf_tests.builders import Line, PageSpec, RasterImage, Rect, TextRun, break_page, build_pdf
 from pdf_tests.old_formats import as_bundle_5_0
@@ -233,3 +236,104 @@ class TestTheMarkerIsCarried:
         assert "image_only=" not in (out / "markdown" / "document.md").read_text(encoding="utf-8")
         assert [page.image_only_reasons for page in loaded.pages] == [None] * 5
         assert loaded.image_only_pages == () and PDFReader(out).document == loaded
+
+
+def only_copy(*reasons: str) -> str:
+    """The clause #471 appends to an image-only page's missing page image reason."""
+    return f"; its content lives only in its page image ({', '.join(reasons)}): the source PDF is its only copy"
+
+
+def page_image_reasons(out: Path) -> list[tuple[int, str]]:
+    """Each missing page image's page number and reason, in the manifest's order."""
+    missing = json.loads((out / "manifest.json").read_bytes())["missing"]
+    return [(entry["page_number"], entry["reason"]) for entry in missing if entry["artifact"] == "page_image"]
+
+
+def only_copy_warnings(caught) -> list[str]:
+    """The messages of the warnings #471 emits among ``caught``."""
+    return [str(w.message) for w in caught if "hold content only in their page images" in str(w.message)]
+
+
+# The warning a bundle of the mixed document under render_pages=False emits: pages 2, 4 and 5 are marked.
+SKIPPED_MIXED = (
+    "pages [2, 4, 5] hold content only in their page images, which this bundle does not write (render_pages=False); "
+    "the source PDF is their only copy"
+)
+
+
+class TestABundleThatLeavesAnImageOnlyPageUnwrittenSaysSo:
+    """#471: the opt-out is honoured, nothing more is written; the manifest and one warning say the PDF is the copy."""
+
+    def test_render_pages_false(self, pdfs, extracted, tmp_path):
+        out = tmp_path / "out"
+        with pytest.warns(UserWarning, match=re.escape(SKIPPED_MIXED)) as caught:
+            returned = write_bundle(extracted("mixed", "never"), out, source=pdfs["mixed"], dpi=72, render_pages=False)
+
+        skipped = "the page was not rendered: render_pages=False"
+        assert page_image_reasons(out) == [
+            (1, skipped),
+            (2, skipped + only_copy("too_little_text")),
+            (3, skipped),
+            (4, skipped + only_copy("too_little_text")),
+            (5, skipped + only_copy("extraction_failed")),
+        ]
+        assert only_copy_warnings(caught) == [SKIPPED_MIXED]
+        assert not (out / "page_images").exists() and load_bundle(out) == returned
+
+    def test_pdfwriter_write_bundle_warns_as_write_bundle_does(self, pdfs, tmp_path):
+        writer = PDFWriter(pdfs["mixed"], ocr="never", dpi=72)
+        with pytest.warns(UserWarning, match=re.escape(SKIPPED_MIXED)) as caught:
+            writer.write_bundle(tmp_path / "out", render_pages=False)
+
+        assert only_copy_warnings(caught) == [SKIPPED_MIXED]
+        assert page_image_reasons(tmp_path / "out")[4] == (
+            5,
+            "the page was not rendered: render_pages=False" + only_copy("extraction_failed"),
+        )
+
+    def test_a_failed_render(self, pdfs, extracted, tmp_path):
+        # Page 5 is a page pdfium cannot load: its render fails too, so no output holds it but the PDF.
+        expected = (
+            "pages [5] hold content only in their page images, which this bundle could not write "
+            "(manifest.json's missing entries say why); the source PDF is their only copy"
+        )
+        with pytest.warns(UserWarning, match=re.escape(expected)) as caught:
+            write_bundle(extracted("mixed", "never"), tmp_path / "out", source=pdfs["mixed"], dpi=72)
+
+        assert only_copy_warnings(caught) == [expected]
+        [(number, reason)] = page_image_reasons(tmp_path / "out")
+        assert number == 5 and reason.startswith(f"the page was not rendered: RenderFailed: {pdfs['mixed']}: page 5: ")
+        assert reason.endswith(only_copy("extraction_failed")) and reason.count("; its content lives only") == 1
+
+    @pytest.mark.parametrize("name", ["digital", "hybrid"])
+    def test_a_document_with_no_image_only_page_warns_nothing(self, pdfs, extracted, tmp_path, recwarn, name):
+        write_bundle(extracted(name, "never"), tmp_path / "out", source=pdfs[name], dpi=72, render_pages=False)
+
+        assert page_image_reasons(tmp_path / "out") == [(1, "the page was not rendered: render_pages=False")]
+        assert [str(w.message) for w in recwarn] == []
+
+
+class TestPageRendersThatSkipAnImageOnlyPageSaySo:
+    """#471: ``PDFWriter.render_pages_as_images`` skips a page it cannot render; an image-only one also warns."""
+
+    def test_the_skipped_image_only_page_is_named_once(self, pdfs, tmp_path):
+        expected = (
+            "pages [5] hold content only in their page images, which render_pages_as_images could not render "
+            "(the datagrunt.pdf.writer log says why); the source PDF is their only copy"
+        )
+        writer = PDFWriter(pdfs["mixed"], ocr="never")
+        with pytest.warns(UserWarning, match=re.escape(expected)) as caught:
+            paths = writer.render_pages_as_images(tmp_path / "pages", dpi=72)
+
+        assert only_copy_warnings(caught) == [expected]
+        assert [path.name for path in paths] == [f"page_000{number}.png" for number in (1, 2, 3, 4)]
+
+    def test_a_skipped_page_that_is_not_image_only_is_only_logged(self, pdfs, tmp_path, monkeypatch, recwarn, caplog):
+        def failing(*args, **kwargs):
+            raise RenderFailed("the render worker failed")
+
+        monkeypatch.setattr(bundle, "render_page", failing)  # the page renders, not extraction's workers
+
+        assert PDFWriter(pdfs["digital"], ocr="never").render_pages_as_images(tmp_path / "pages", dpi=72) == []
+        assert [str(w.message) for w in recwarn] == []
+        assert "page 1 was not rendered: RenderFailed: the render worker failed" in caplog.text
