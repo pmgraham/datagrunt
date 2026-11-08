@@ -10,7 +10,14 @@ import pytest
 
 from datagrunt.pdf.elements import PDFDocument
 from datagrunt.pdf.frame import ARROW_SCHEMA, FRAME_SCHEMA, element_arrow, element_frame, element_text
-from pdf_tests.documents import empty_document, metadata, page, rich_document, surrogate_document
+from pdf_tests.documents import (
+    empty_document,
+    image_only_document,
+    metadata,
+    page,
+    rich_document,
+    surrogate_document,
+)
 
 KINDS = ["heading", "paragraph", "key_value", "table", "list", "figure"]
 ROUTES = ["digital", "hybrid", "vision"]
@@ -30,6 +37,7 @@ EXPECTED_SCHEMA = pl.Schema(
         "route": pl.Enum(ROUTES),
         "integrity_verified": pl.Boolean,
         "hidden_reasons": pl.List(pl.String),
+        "image_only_reasons": pl.List(pl.String),
     }
 )
 
@@ -47,6 +55,7 @@ EXPECTED_ARROW = pa.schema(
         ("route", pa.dictionary(pa.int32(), pa.large_string())),
         ("integrity_verified", pa.bool_()),
         ("hidden_reasons", pa.large_list(pa.large_string())),
+        ("image_only_reasons", pa.large_list(pa.large_string())),
     ]
 )
 
@@ -152,6 +161,33 @@ class TestHidden:
         visible = frame.filter(pl.col("hidden_reasons").list.len() == 0)
         assert "p0001_e004" not in visible["element_id"].to_list()
         assert visible.height == len(ROWS) - 2
+
+
+class TestImageOnly:
+    """Each row holds its page's ``image_only_reasons`` (#470): a list, or null when they were not recorded."""
+
+    def test_each_row_holds_its_pages_reasons(self):
+        frame = element_frame(image_only_document())
+        both, one = ["too_little_text", "garbled_text"], ["too_little_text"]
+        assert frame["image_only_reasons"].to_list() == [None] * 9 + [both] * 5 + [one]
+
+    def test_a_page_whose_text_stands_holds_an_empty_list(self, frame):
+        assert frame["image_only_reasons"].to_list() == [[]] * len(ROWS)
+
+    def test_a_page_without_elements_has_no_row_to_name_it(self):
+        document = image_only_document()
+        assert 4 in document.image_only_pages
+        assert 4 not in element_frame(document)["page_number"].to_list()
+
+    def test_image_only_rows_can_be_filtered(self):
+        marked = element_frame(image_only_document()).filter(pl.col("image_only_reasons").list.len() > 0)
+        assert marked["page_number"].unique().sort().to_list() == [2, 3]
+
+    def test_arrow_holds_them_nulls_kept(self):
+        document = image_only_document()
+        column = element_arrow(document).column("image_only_reasons")
+        assert column.to_pylist() == element_frame(document)["image_only_reasons"].to_list()
+        assert column.null_count == 9
 
 
 class TestArrow:

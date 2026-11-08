@@ -195,7 +195,23 @@ class TestPageAssessment:
     def test_fields(self):
         names = [item.name for item in dataclasses.fields(PageAssessment)]
 
-        assert names == ["pieces", "recovered_pieces", "quality", "route", "unmapped_regions", "warnings"]
+        assert names == [
+            "pieces",
+            "recovered_pieces",
+            "quality",
+            "route",
+            "unmapped_regions",
+            "warnings",
+            "image_only_reasons",
+        ]
+
+    def test_image_only_reasons_default_to_none_found(self):
+        # Built without them (as before #470), an assessment records no image-only reason.
+        good = assess(letters(24))
+        fields = {item.name: getattr(good, item.name) for item in dataclasses.fields(PageAssessment)}
+        fields.pop("image_only_reasons", None)
+
+        assert PageAssessment(**fields).image_only_reasons == ()
 
     def test_region_numbers_are_stored_as_floats(self):
         value = assessment(unmapped_regions=((1, 2, 3, 4),))
@@ -254,11 +270,61 @@ class TestPageAssessment:
             ),
             pytest.param({"warnings": ["x"]}, TypeError, "warnings must be a tuple of str, got list", id="warnings"),
             pytest.param({"warnings": (" ",)}, ValueError, "warnings[0] must be a non-blank str", id="warning-blank"),
+            pytest.param(
+                {"image_only_reasons": ["too_little_text"]},
+                TypeError,
+                "image_only_reasons must be a tuple of str, got list",
+                id="image-only-list",
+            ),
+            pytest.param(
+                {"image_only_reasons": None},
+                TypeError,
+                "image_only_reasons must be a tuple of str, got NoneType",
+                id="image-only-none",
+            ),
+            pytest.param(
+                {"image_only_reasons": (1,)},
+                TypeError,
+                "image_only_reasons[0] must be a str, got 1 (int)",
+                id="image-only-item",
+            ),
+            pytest.param(
+                {"image_only_reasons": ("extraction_failed",)},
+                ValueError,
+                "image_only_reasons has unknown reason(s) ['extraction_failed']; "
+                "allowed: ('too_little_text', 'garbled_text')",
+                id="image-only-extraction-failed",
+            ),
+            pytest.param(
+                {"image_only_reasons": ("scan",)},
+                ValueError,
+                "image_only_reasons has unknown reason(s) ['scan']",
+                id="image-only-unknown",
+            ),
+            pytest.param(
+                {"image_only_reasons": ("garbled_text", "garbled_text")},
+                ValueError,
+                "image_only_reasons has duplicate entries: ('garbled_text', 'garbled_text')",
+                id="image-only-duplicate",
+            ),
+            pytest.param(
+                {"image_only_reasons": ("garbled_text", "too_little_text")},
+                ValueError,
+                "image_only_reasons must be in canonical order ('too_little_text', 'garbled_text'), "
+                "got ('garbled_text', 'too_little_text')",
+                id="image-only-order",
+            ),
         ],
     )
     def test_invalid_field_raises(self, overrides, error, message):
         with pytest.raises(error, match=re.escape(message)):
             assessment(**overrides)
+
+    @pytest.mark.parametrize(
+        "reasons", [(), ("too_little_text",), ("garbled_text",), ("too_little_text", "garbled_text")]
+    )
+    def test_the_routing_shortfalls_are_its_image_only_reasons(self, reasons):
+        assert assessment(image_only_reasons=reasons).image_only_reasons == reasons
 
 
 class TestAssessPage:
@@ -885,6 +951,46 @@ class TestOcrModes:
         got = assess(letters(19))
 
         assert (got.route, got.warnings) == ("vision", ())
+
+
+# Each routing shortfall, and the image-only reasons it records (#470).
+SHORTFALLS = [
+    pytest.param((letters(19),), ("too_little_text",), id="too-few"),
+    pytest.param(mixed(20, 20), ("garbled_text",), id="garbled"),
+    pytest.param((letters(5), text_span(garbage(15), y=120.0)), ("too_little_text", "garbled_text"), id="both"),
+]
+
+
+class TestImageOnlyReasons:
+    """A3 records its routing shortfalls as the page's image-only reasons (#470); routes and warnings are as before."""
+
+    @pytest.mark.parametrize("ocr", ["auto", "never"])
+    @pytest.mark.parametrize("spans,reasons", SHORTFALLS)
+    def test_each_shortfall_is_its_reason(self, spans, reasons, ocr):
+        got = assess(*spans, ocr=ocr)
+
+        assert got.image_only_reasons == reasons
+
+    @pytest.mark.parametrize("spans,reasons", SHORTFALLS)
+    def test_always_records_them_too_and_still_routes_vision_without_a_warning(self, spans, reasons):
+        # So a page OCR cannot read under "always" is marked as under "auto" (assemble_page's ocr_unavailable page).
+        got = assess(*spans, ocr="always")
+
+        assert (got.route, got.warnings, got.image_only_reasons) == ("vision", (), reasons)
+
+    @pytest.mark.parametrize("ocr", ["auto", "never", "always"])
+    @pytest.mark.parametrize(
+        "spans,page",
+        [
+            pytest.param((letters(20),), {}, id="enough-text"),
+            pytest.param((letters(24),), {"images": (FULL_BLEED,)}, id="text-over-a-scan"),
+            pytest.param((letters(15),), {"paint": ()}, id="short-clean-text-alone"),
+            pytest.param((), {"paint": ()}, id="blank-page-without-paint"),
+            pytest.param((text_span("abcdefghijklmnopqrstuvwx" + "�" * 40),), {}, id="a-leader-run-aside"),
+        ],
+    )
+    def test_text_that_stands_records_none(self, spans, page, ocr):
+        assert assess(*spans, ocr=ocr, **page).image_only_reasons == ()
 
 
 class TestUnmappedRegions:

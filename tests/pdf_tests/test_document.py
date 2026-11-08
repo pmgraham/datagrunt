@@ -113,6 +113,7 @@ DERIVED = (
     "figures",
     "page_images",
     "degraded_pages",
+    "image_only_pages",
     "integrity_verified",
 )
 
@@ -547,6 +548,23 @@ class TestDocumentDerived:
 
     def test_no_degraded_pages(self):
         assert _two_page_document().degraded_pages == ()
+
+    def test_image_only_pages_are_pages_with_image_only_reasons(self):
+        # #470: () (text stands or OCR read it) and None (not recorded) are not image-only.
+        doc = _document(
+            _page(1, image_only_reasons=("too_little_text",)),
+            _page(2),
+            _page(3, image_only_reasons=None),
+            _page(4, status="error", image_only_reasons=("extraction_failed",)),
+            _page(5, status="error"),
+            _page(6, status="ocr_unavailable", route="vision", image_only_reasons=("too_little_text", "garbled_text")),
+            _page(7, route="vision"),
+        )
+        assert doc.image_only_pages == (1, 4, 6)
+
+    def test_no_image_only_pages(self):
+        assert _two_page_document().image_only_pages == ()
+        assert PDFDocument(metadata=_metadata(0), pages=()).image_only_pages == ()
 
     def test_derived_once_not_per_access(self):
         doc = _document(_page(1, elements=_one_of_each(1)))

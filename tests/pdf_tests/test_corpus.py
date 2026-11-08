@@ -19,6 +19,7 @@ from datagrunt.pdf.corpus import (
 )
 from datagrunt.pdf.exceptions import BundleCorruptError, PDFCorruptError
 from pdf_tests.builders import PageSpec, TextRun, build_pdf
+from pdf_tests.old_formats import as_bundle_5_0
 
 
 def _sha256(path: Path) -> str:
@@ -203,6 +204,24 @@ class TestBatchExtractionAndLoading:
         third = extract_corpus([pdf_a, pdf_b], out, dpi=72, vision_dpi=72, overwrite=True)
         assert all(not e.reused for e in third.entries)
         assert third.load_documents() == first.load_documents()
+
+    def test_a_bundle_of_the_older_format_is_not_reused(self, tmp_path, sample_pdfs):
+        # A format 5.0 bundle (datagrunt 5.0 to 5.2) of this version and parameters records no image-only
+        # reasons: it is written again, never reused (#470 review; bundle._existing's rule).
+        pdf_a, pdf_b = sample_pdfs
+        out = tmp_path / "corpus"
+        first = extract_corpus([pdf_a, pdf_b], out, dpi=72, vision_dpi=72)
+        for entry in first.entries:
+            as_bundle_5_0(out / entry.bundle_relpath)
+
+        second = extract_corpus([pdf_a, pdf_b], out, dpi=72, vision_dpi=72, overwrite=False)
+
+        assert [e.reused for e in second.entries] == [False, False]
+        formats = [
+            json.loads((out / e.bundle_relpath / "manifest.json").read_bytes())["bundle_format_version"]
+            for e in second.entries
+        ]
+        assert formats == ["5.3", "5.3"]
 
     def test_fault_isolation_strict_false_vs_strict_true(self, tmp_path, sample_pdfs):
         pdf_a, _ = sample_pdfs

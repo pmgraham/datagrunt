@@ -37,6 +37,7 @@ from pdf_tests.documents import (
     page,
     rich_document,
     surrogate_document,
+    with_image_only,
 )
 from pydantic import BaseModel, Field
 
@@ -2538,3 +2539,52 @@ class TestCoalesceSectionsEnvelope:
         forged = dataclasses.replace(unit, scope_path=("1. Electrical",))
         with pytest.raises(ValueError, match="scope"):
             build_envelope(forged, doc, prompt="p", context=None, schema_json=SCHEMA_JSON, coalesce_sections=True)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Image-only pages (#472): nothing of a page skipped as image-only reaches another unit's framing
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def page_one_marked() -> PDFDocument:
+    """rich_document whose page 1 (its header context and the table page 2's continues) is image-only."""
+    return with_image_only(rich_document(), {1: ("garbled_text",)})
+
+
+class TestImageOnlyFraming:
+    def test_header_context_on_a_marked_page_is_never_copied(self):
+        doc = page_one_marked()
+        envelopes = build_envelopes(units_of(doc), doc, prompt="p", context=None, schema_json=SCHEMA_JSON)
+
+        assert envelopes and all(env.header_element_ids == () for env in envelopes)
+        assert all(header_copy(env.payload) is None for env in envelopes)
+        assert not any("Invoice" in env.payload for env in envelopes)
+
+    def test_a_link_to_a_table_on_a_marked_page_shows_nothing_of_it(self):
+        doc = page_one_marked()
+        (unit,) = units_of(doc)
+        _, user = build_envelope(unit, doc, prompt="p", context=None, schema_json=SCHEMA_JSON).render(NONCE)
+
+        assert unit.elements[1].continued_from_id == "p0001_e006"  # page 2's table continues page 1's
+        assert continues_lines(user) == []
+        assert "Part" not in user and "Qty" not in user
+
+    def test_a_unit_holding_an_element_of_a_marked_page_is_refused(self):
+        doc = page_one_marked()
+        body = doc.pages[0].elements[3]  # "Body text.", in the Intro section, whose heading is on page 1 too
+        forged = Unit(
+            unit_id=f"{doc.metadata.doc_id}:{body.element_id}-{body.element_id}",
+            doc_id=doc.metadata.doc_id,
+            elements=(body,),
+            blocks=(render_element(body),),
+            part_of=(None,),
+            scope_path=(),
+            scope_entries_excluded=1,
+            page_numbers=(1,),
+            vision=False,
+            oversize=False,
+            hidden_excluded=(),
+        )
+
+        with pytest.raises(ValueError, match="image-only"):
+            build_envelope(forged, doc, prompt="p", context=None, schema_json=SCHEMA_JSON)

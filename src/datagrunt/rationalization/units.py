@@ -23,11 +23,12 @@ parts are copies made by :func:`dataclasses.replace`. The rules, in order:
    alone: a visible heading with the same text on another branch, or later in the document, opens nothing here.
    Every other entry is dropped and counted in the unit's ``scope_entries_excluded``: one a hidden heading opened
    (a hidden section heading, or a hidden heading recording an ancestor's path last), which a hand-built or loaded
-   document can put in a scope path, or one no heading opened (a path no heading records by then). A hidden
-   ancestor drops only its own entry. The pipeline opens sections at visible headings only, so its paths pass
-   whole. :func:`group_scopes` is the rule, read once per section, and T3's envelope reads it too. A heading's own
-   path serves only to find openers: no element's ``scope_path`` reaches a unit, and T3 must render a unit's
-   ``scope_path`` only, never an element's.
+   document can put in a scope path, one a heading on an image-only page opened (rule 4: such a heading is read as
+   a hidden one is, so it opens nothing, its text unsent), or one no heading opened (a path no heading records by
+   then). A hidden or image-only ancestor drops only its own entry. The pipeline opens sections at visible headings
+   only, so its paths pass whole. :func:`group_scopes` is the rule, read once per section, and T3's envelope reads it
+   too. A heading's own path serves only to find openers: no element's ``scope_path`` reaches a unit, and T3 must
+   render a unit's ``scope_path`` only, never an element's.
 3. **Groups** (R5). One group per :class:`~datagrunt.pdf.elements.Section`, whose members are its elements and its
    heading (as the document counts them). An element in no section joins its page's group, whose scope path is
    ``()``. The pipeline leaves only hidden headings in no section (``scope.py``): a page group of them is an
@@ -36,14 +37,21 @@ parts are copies made by :func:`dataclasses.replace`. The rules, in order:
    section's units and a page group's interleave only where the groups do, in a hand-built document.
 4. **Skipped units**, reported rather than dropped (invariant 5), in the document order of their pages and first
    elements. An error page (``status == "error"``, no elements) is a :class:`SkippedUnit` of reason
-   ``"page_error"``, and a group whose members are all hidden one of reason ``"all_hidden"``. Text is what a
-   heading, paragraph, key-value or list always carries, a figure's non-blank caption, or a table's non-blank
-   header or cell. A group whose visible members carry none (only figures without a caption or with a blank one,
-   or tables of blank cells) is one of reason ``"no_text"``, never rendered: an ``ocr_unavailable`` scan page in a
-   section of its own, say. So is a unit packed from a group with text whose own elements carry none (a scan
-   page's figure that packs alone, the blank parts of a split blank table): it is cut from what is sent, named and
-   counted as a unit would be. Each carries its hidden counts (a group's, or the unit's). An empty group yields
-   nothing.
+   ``"page_error"``, and a group whose members are all hidden one of reason ``"all_hidden"``. An image-only page
+   (non-empty ``Page.image_only_reasons``: its text could not stand and nothing read its image, so its content
+   lives only in its page image) that is not an error page is one of reason ``"image_only"``, at its place as an
+   error page's: none of its elements, visible or hidden, joins a group, is rendered or reaches a unit, its hidden
+   ones count on it alone, and with ``coalesce_sections`` it closes the open unit as an error page does. An error
+   page is marked ``"extraction_failed"`` too and stays ``"page_error"``; a page whose reasons are ``()`` (its text
+   stands, or OCR read it) or ``None`` (not recorded, a document of datagrunt 5.0-5.2) is read as before. Reading
+   an image-only page's image is deferred (#473): the skipped unit names the page to read. Text is what a heading,
+   paragraph, key-value or list always carries, a figure's non-blank caption, or a table's non-blank header or
+   cell. A group whose visible members carry none (only figures without a caption or with a blank one, or tables
+   of blank cells) is one of reason ``"no_text"``, never rendered: an ``ocr_unavailable`` scan page of a document
+   that does not record ``image_only_reasons``, in a section of its own, say. So is a unit packed from a group with
+   text whose own elements carry none (such a scan page's figure that packs alone, the blank parts of a split blank
+   table): it is cut from what is sent, named and counted as a unit would be. Each carries its hidden counts (a
+   group's, the unit's, or an image-only page's). An empty group yields nothing.
 5. **Packing.** A group's visible elements are rendered in order, one block each (``render`` must return a
    non-empty ``str``: T3's real blocks carry the ``<el>`` framing), and the blocks are packed greedily: a unit's
    body is its blocks joined by :data:`BLOCK_SEPARATOR`, and a block starts a new unit when adding it would take
@@ -64,9 +72,9 @@ parts are copies made by :func:`dataclasses.replace`. The rules, in order:
    one item) goes whole into its own unit, flagged ``oversize``. Nothing is ever truncated.
 8. **Ids.** ``<doc_id>:<first>-<last>``: the ids of the unit's first and last elements, each followed by
    ``.<part>`` (1-based) when that end is a part of a split element (``doc:p0001_e003.2-p0001_e004``). A page
-   error's is ``<doc_id>:p<page>``, the page number in 4 or more digits as in element ids; an all-hidden or
-   no-text group's names its first and last members. Ids are deterministic and unique within a document, and
-   depend on the renderer only through the sizes of its blocks.
+   error's or an image-only page's is ``<doc_id>:p<page>``, the page number in 4 or more digits as in element ids;
+   an all-hidden or no-text group's names its first and last members. Ids are deterministic and unique within a
+   document, and depend on the renderer only through the sizes of its blocks.
 
 Every loop is linear in the document's elements, rows and items (a split renders O(log n) candidate parts for each
 part it makes) and in its headings' and sections' scope paths (a trie of the headings' paths, never a copy of a
@@ -86,6 +94,7 @@ from datagrunt.pdf.elements import (
     Figure,
     Heading,
     HiddenReason,
+    Page,
     PDFDocument,
     Section,
     Table,
@@ -100,8 +109,9 @@ HiddenCounts: TypeAlias = tuple[tuple[HiddenReason, int], ...]
 PartOf: TypeAlias = tuple[int, int] | None
 """``(part_index, part_count)`` of a split element's part (1-based, at least two parts), or ``None`` if whole."""
 
-SkipReason: TypeAlias = Literal["all_hidden", "no_text", "page_error"]
-"""Why a skipped unit has nothing to send: every member hidden, no visible text, or a page nothing was read from."""
+SkipReason: TypeAlias = Literal["all_hidden", "no_text", "page_error", "image_only"]
+"""Why a skipped unit has nothing to send: every member hidden, no visible text, a page nothing was read from, or a
+page whose content lives only in its page image (``Page.image_only_reasons``), which no model reads yet."""
 
 Renderer: TypeAlias = Callable[[DocumentElement], str]
 """Turns one visible element (or a part of one) into the non-empty block a model reads.
@@ -338,14 +348,16 @@ class SkippedUnit:
     """A group or page with nothing to send, reported rather than dropped (invariant 5).
 
     Args:
-        unit_id: ``<doc_id>:p<page>`` for a page error, ``<doc_id>:<first>-<last>`` for a group (its first and last
-            members) or for a unit cut for having no text (as the unit's id would be).
-        reason: ``"page_error"`` (a page nothing was read from), ``"all_hidden"`` (every member hidden) or
-            ``"no_text"`` (no visible member carries text, module notes, 4).
-        page_numbers: The pages it covers, sorted and distinct: exactly one for a page error; a group's members'
-            pages, hidden ones included; a cut unit's elements' pages, as a unit's.
+        unit_id: ``<doc_id>:p<page>`` for a page error or an image-only page, ``<doc_id>:<first>-<last>`` for a
+            group (its first and last members) or for a unit cut for having no text (as the unit's id would be).
+        reason: ``"page_error"`` (a page nothing was read from), ``"all_hidden"`` (every member hidden),
+            ``"no_text"`` (no visible member carries text) or ``"image_only"`` (a page whose content lives only in
+            its page image, ``Page.image_only_reasons``: none of its text is sent, and no model reads its image
+            yet, so a caller reads ``page_numbers`` to find the page; module notes, 4).
+        page_numbers: The pages it covers, sorted and distinct: exactly one for a page error or an image-only page;
+            a group's members' pages, hidden ones included; a cut unit's elements' pages, as a unit's.
         hidden_excluded: The hidden members counted here, per reason: empty for a page error, non-empty for an
-            all-hidden group, either for a no-text group.
+            all-hidden group, either for a no-text group or an image-only page (that page's hidden elements).
 
     Raises:
         TypeError: If ``unit_id`` is not a ``str``, or ``page_numbers`` or ``hidden_excluded`` is malformed in type.
@@ -366,6 +378,8 @@ class SkippedUnit:
         _check_counts("hidden_excluded", self.hidden_excluded)
         if self.reason == "page_error" and (len(self.page_numbers) != 1 or self.hidden_excluded):
             raise ValueError(f"a page_error unit covers one page and no hidden element, got {self!r}")
+        if self.reason == "image_only" and len(self.page_numbers) != 1:
+            raise ValueError(f"an image_only unit covers one page, got page_numbers={self.page_numbers}")
         if self.reason == "all_hidden" and not self.hidden_excluded:
             raise ValueError(
                 f"an all_hidden unit counts its hidden members, got hidden_excluded={self.hidden_excluded}"
@@ -612,6 +626,18 @@ class _Group:
         return opened
 
 
+def _is_image_only(page: Page) -> bool:
+    """Whether ``page`` is skipped as image-only: marked (non-empty ``image_only_reasons``) and not an error page,
+    which stays a page error (module notes, 4)."""
+    return page.status != "error" and bool(page.image_only_reasons)
+
+
+def _image_only_pages(document: PDFDocument) -> frozenset[int]:
+    """The numbers of the pages :func:`build_units` skips as image-only, whose elements no unit holds (module notes,
+    4): the rule :func:`group_scopes` and :mod:`~datagrunt.rationalization.envelope` read too."""
+    return frozenset(page.page_number for page in document.pages if _is_image_only(page))
+
+
 def _section_owners(sections: tuple[Section, ...]) -> dict[str, int]:
     """Map each section member's element id, its heading included (as the document counts it), to its section."""
     owners: dict[str, int] = {}
@@ -662,14 +688,16 @@ class _Openers:
     """The headings read so far, each the last to record its own scope path (module notes, 2).
 
     The recorded paths form a trie keyed by ``(parent node, entry)`` (the root is node 0), so recording a heading and
-    reading a section's path each take one step per entry, never a copy of a prefix.
+    reading a section's path each take one step per entry, never a copy of a prefix. A heading on one of the
+    ``closed`` pages (the image-only ones, module notes, 4) is recorded like any other but opens nothing.
     """
 
-    __slots__ = ("nodes", "last")
+    __slots__ = ("nodes", "last", "closed")
 
-    def __init__(self) -> None:
+    def __init__(self, closed: frozenset[int]) -> None:
         self.nodes: dict[tuple[int, str], int] = {}
         self.last: dict[int, Heading] = {}
+        self.closed = closed
 
     def record(self, heading: Heading) -> None:
         """Record ``heading``, hidden or not, as the last heading read with its scope path: that entry's opener."""
@@ -679,8 +707,9 @@ class _Openers:
         self.last[node] = heading
 
     def scope(self, index: int, section: Section) -> GroupScope:
-        """The section's path keeping each entry whose opener is visible: the section's own heading for its last
-        entry, when it has one, and for any other entry the last heading read whose own path is the entry's prefix."""
+        """The section's path keeping each entry whose opener is visible and on a page that is sent: the section's
+        own heading for its last entry, when it has one, and for any other entry the last heading read whose own path
+        is the entry's prefix."""
         node = 0
         kept: list[Heading] = []
         path = section.scope_path
@@ -688,7 +717,7 @@ class _Openers:
             node = self.nodes.get((node, entry), _NO_NODE)
             last = position == len(path)
             opener = section.heading if last and section.heading is not None else self.last.get(node)
-            if opener is not None and not opener.hidden_reasons:
+            if opener is not None and not opener.hidden_reasons and opener.page_number not in self.closed:
                 kept.append(opener)
         return GroupScope(section=index, openers=tuple(kept), excluded=len(path) - len(kept))
 
@@ -714,7 +743,7 @@ def group_scopes(document: PDFDocument) -> dict[str, GroupScope]:
     if not isinstance(document, PDFDocument):
         raise TypeError(f"document must be a PDFDocument, got {type(document).__name__}")
     owners = _section_owners(document.sections)
-    openers = _Openers()
+    openers = _Openers(_image_only_pages(document))
     scopes: dict[int, GroupScope] = {}
     found: dict[str, GroupScope] = {}
     for element in document.elements:
@@ -729,19 +758,37 @@ def group_scopes(document: PDFDocument) -> dict[str, GroupScope]:
     return found
 
 
-def _groups(
-    document: PDFDocument, scopes: Mapping[str, GroupScope] | None = None
-) -> list[tuple[DocumentElement, _Group] | int]:
-    """First pass: every element with its group, and every error page's number, in document order.
+@dataclass(slots=True)
+class _SkippedPage:
+    """A page skipped whole, at its place: an error page, or an image-only one with its hidden elements counted
+    per reason (module notes, 1 and 4)."""
+
+    page_number: int
+    reason: SkipReason
+    hidden: dict[str, int] = field(default_factory=dict)
+
+
+_Step: TypeAlias = tuple[DocumentElement, _Group] | _SkippedPage
+"""What the first pass yields, in document order: an element with its group, or a page skipped whole."""
+
+
+def _groups(document: PDFDocument, scopes: Mapping[str, GroupScope] | None = None) -> list[_Step]:
+    """First pass: every element with its group, and every page skipped whole, in document order.
 
     Groups, their members and their scope paths are as module notes 2-4 say.
     """
     resolved_scopes = group_scopes(document) if scopes is None else scopes
-    steps: list[tuple[DocumentElement, _Group] | int] = []
+    steps: list[_Step] = []
     groups: dict[tuple[str, int], _Group] = {}
     for page in document.pages:
         if page.status == "error":
-            steps.append(page.page_number)
+            steps.append(_SkippedPage(page.page_number, "page_error"))
+        elif _is_image_only(page):
+            skipped = _SkippedPage(page.page_number, "image_only")
+            for element in page.elements:
+                _count(skipped.hidden, element.hidden_reasons)
+            steps.append(skipped)
+            continue
         for element in page.elements:
             scope = resolved_scopes.get(element.element_id)
             key = ("page", page.page_number) if scope is None else ("section", scope.section)
@@ -804,7 +851,7 @@ def _draft_scope(scopes: Mapping[str, GroupScope], elements: Sequence[DocumentEl
 
 
 class _Coalescer:
-    """Packs elements across consecutive text-bearing groups into coalesced drafts, flushing on error pages."""
+    """Packs elements across consecutive text-bearing groups into coalesced drafts, flushing at pages skipped whole."""
 
     __slots__ = ("drafts", "current", "leading")
 
@@ -814,7 +861,7 @@ class _Coalescer:
         self.leading: dict[str, int] = {}
 
     def flush(self) -> None:
-        """Close the active draft at an error page so later elements start a new unit."""
+        """Close the active draft at a page skipped whole (error or image-only) so later elements start a new unit."""
         self.current = None
 
     def pack(self, element: DocumentElement, limit: int, render: Renderer) -> list[_Draft]:
@@ -845,17 +892,15 @@ class _Coalescer:
             draft.scope_path, draft.scope_excluded = _draft_scope(scopes, draft.elements)
 
 
-def _pack(
-    steps: list[tuple[DocumentElement, _Group] | int], limit: int, render: Renderer
-) -> list[_Draft | _Group | int]:
+def _pack(steps: list[_Step], limit: int, render: Renderer) -> list[_Draft | _Group | _SkippedPage]:
     """Second pass: everything a unit or skipped unit comes from, in document order of where it starts.
 
     A group with text is packed, its drafts listed as they open (at their first elements); a group without text
-    is listed at its first member, unpacked; an error page at its place.
+    is listed at its first member, unpacked; a page skipped whole at its place.
     """
-    stream: list[_Draft | _Group | int] = []
+    stream: list[_Draft | _Group | _SkippedPage] = []
     for step in steps:
-        if isinstance(step, int):
+        if isinstance(step, _SkippedPage):
             stream.append(step)
             continue
         element, group = step
@@ -867,16 +912,17 @@ def _pack(
 
 
 def _pack_coalesced(
-    steps: list[tuple[DocumentElement, _Group] | int],
+    steps: list[_Step],
     scopes: Mapping[str, GroupScope],
     limit: int,
     render: Renderer,
-) -> list[_Draft | _Group | int]:
-    """Second pass when ``coalesce_sections=True``: pack across text-bearing groups, flushing on error pages."""
-    stream: list[_Draft | _Group | int] = []
+) -> list[_Draft | _Group | _SkippedPage]:
+    """Second pass when ``coalesce_sections=True``: pack across text-bearing groups, flushing at a page skipped
+    whole (an error page or an image-only one)."""
+    stream: list[_Draft | _Group | _SkippedPage] = []
     coalescer = _Coalescer()
     for step in steps:
-        if isinstance(step, int):
+        if isinstance(step, _SkippedPage):
             coalescer.flush()
             stream.append(step)
             continue
@@ -906,10 +952,16 @@ def _unit(doc_id: str, routes: Mapping[int, str], draft: _Draft) -> Unit:
     )
 
 
-def _skipped(doc_id: str, item: _Draft | _Group | int) -> SkippedUnit:
-    """The skipped unit of an error page (its number), a group without text, or a packed unit without text."""
-    if isinstance(item, int):
-        return SkippedUnit(unit_id=f"{doc_id}:p{item:04d}", reason="page_error", page_numbers=(item,))
+def _skipped(doc_id: str, item: _Draft | _Group | _SkippedPage) -> SkippedUnit:
+    """The skipped unit of a page skipped whole, a group without text, or a packed unit without text."""
+    if isinstance(item, _SkippedPage):
+        number = item.page_number
+        return SkippedUnit(
+            unit_id=f"{doc_id}:p{number:04d}",
+            reason=item.reason,
+            page_numbers=(number,),
+            hidden_excluded=_counts(item.hidden),
+        )
     if isinstance(item, _Draft):
         return SkippedUnit(
             unit_id=_unit_id(doc_id, item.elements, item.parts),

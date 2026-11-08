@@ -12,6 +12,13 @@ equal the document's element with its id, so the reference loses nothing.
 The top level names the ``"format"`` (:data:`FORMAT`) and its ``"version"``
 (:data:`VERSION`).
 
+Versions: 2 (#470, datagrunt 5.3) adds each page's ``image_only_reasons``,
+its last key: a JSON array of its reasons (``[]`` for none), or null when
+they were not recorded. Version 1 (datagrunt 5.0 to 5.2) still reads: its
+pages hold exactly their old keys, and each decodes with
+``image_only_reasons=None`` (not recorded). Writing is always version 2, so
+a document read from version 1 writes its pages' reasons as null.
+
 Bytes are not in the JSON. A figure keeps its ``sha256``, its pixel size
 and its ``image_path``; a page image its fields and paths. Paths are written
 with ``/`` (``as_posix``). Loaders are not data: a decoded figure or page
@@ -19,9 +26,12 @@ image reads its bytes from its paths only.
 
 :func:`document_from_json` is strict:
 
-- an unknown format or version is refused;
-- every object must hold exactly its keys: an unknown key or a missing one
-  is refused;
+- an unknown format or version is refused, as is any version but the one
+  ``version=`` requires, when given (a bundle's format names its
+  document's version);
+- every object must hold exactly its keys, its version's: an unknown key or
+  a missing one is refused (a version 1 page holding
+  ``image_only_reasons`` too);
 - containers are checked, never coerced (a string is not split into a tuple);
 - values are checked by A1's own validation, as the types are built.
 
@@ -74,6 +84,7 @@ from datagrunt.pdf.frame import ELEMENT_KINDS, KINDS
 
 __all__ = [
     "FORMAT",
+    "READ_VERSIONS",
     "VERSION",
     "document_from_json",
     "document_from_json_bytes",
@@ -84,8 +95,11 @@ __all__ = [
 ]
 
 FORMAT = "datagrunt.pdf.document"
-# The format is unpublished until 5.0: a heading's tier (P1-A) changed its keys under version 1.
-VERSION = 1
+# The version written. 1: datagrunt 5.0 to 5.2 (a heading's tier, P1-A, changed its keys before 5.0 published it);
+# 2: each page's image_only_reasons (#470).
+VERSION = 2
+# The versions read, oldest first: each with exactly its own page keys (_PAGE_KEYS_BY_VERSION).
+READ_VERSIONS = (1, 2)
 
 # The most JSON bytes read: A1's asset limit.
 _MAX_JSON_BYTES = _MAX_ASSET_BYTES
@@ -99,7 +113,8 @@ _RESERVED_NAMES = frozenset(
 
 _DOCUMENT_KEYS = ("format", "version", "metadata", "pages", "sections", "header_context")
 _METADATA_KEYS = ("doc_id", "source_name", "sha256", "page_count", "title", "author")
-_PAGE_KEYS = (
+# A page's keys under version 1, then under version 2, which adds image_only_reasons last.
+_PAGE_KEYS_V1 = (
     "page_number",
     "width_pt",
     "height_pt",
@@ -112,6 +127,8 @@ _PAGE_KEYS = (
     "error",
     "warnings",
 )
+_PAGE_KEYS = (*_PAGE_KEYS_V1, "image_only_reasons")
+_PAGE_KEYS_BY_VERSION: Mapping[int, tuple[str, ...]] = MappingProxyType({1: _PAGE_KEYS_V1, 2: _PAGE_KEYS})
 _QUALITY_KEYS = (
     "valid_char_ratio",
     "char_count",
@@ -184,6 +201,7 @@ def _page_json(page: Page) -> Json:
         "integrity_verified": page.integrity_verified,
         "error": page.error,
         "warnings": list(page.warnings),
+        "image_only_reasons": None if page.image_only_reasons is None else list(page.image_only_reasons),
     }
 
 
@@ -237,10 +255,14 @@ def _section_json(section: Section) -> Json:
     }
 
 
-def document_from_json_bytes(raw: bytes, *, base_dir: str | os.PathLike[str] | None = None) -> PDFDocument:
+def document_from_json_bytes(
+    raw: bytes, *, base_dir: str | os.PathLike[str] | None = None, version: int | None = None
+) -> PDFDocument:
     """The document in ``raw``, UTF-8 JSON of at most :data:`_MAX_JSON_BYTES` (see the module notes).
 
-    ``base_dir`` is the directory its paths are relative to; without it, a path is refused.
+    ``base_dir`` is the directory its paths are relative to; without it, a
+    path is refused. ``version``, when given, is the one version read (see
+    :func:`document_from_json`).
 
     Raises:
         TypeError: If ``raw`` is not bytes, or as :func:`document_from_json` raises it.
@@ -252,7 +274,7 @@ def document_from_json_bytes(raw: bytes, *, base_dir: str | os.PathLike[str] | N
         raise TypeError(f"raw must be bytes, got {type(raw).__name__}")
     if len(raw) > _MAX_JSON_BYTES:
         raise ValueError(f"document JSON is {len(raw)} bytes, over the {_MAX_JSON_BYTES}-byte bound")
-    return document_from_json(parse_json(raw, "document JSON"), base_dir=base_dir)
+    return document_from_json(parse_json(raw, "document JSON"), base_dir=base_dir, version=version)
 
 
 def parse_json(raw: bytes, what: str) -> object:
@@ -335,20 +357,28 @@ def _part_problem(part: str) -> str:
     return ""
 
 
-def document_from_json(data: object, *, base_dir: str | os.PathLike[str] | None = None) -> PDFDocument:
+def document_from_json(
+    data: object, *, base_dir: str | os.PathLike[str] | None = None, version: int | None = None
+) -> PDFDocument:
     """The document :func:`document_to_json` wrote as ``data`` (see the module notes); ``data`` is not changed.
 
-    ``base_dir`` is the directory its paths are relative to; without it, a path is refused.
+    ``base_dir`` is the directory its paths are relative to; without it, a
+    path is refused. ``version`` None reads any of :data:`READ_VERSIONS`;
+    one of them reads only that version (a bundle's format names its
+    document's version).
 
     Raises:
         TypeError, ValueError: If ``data`` is not such a document, naming where; ValueError for a path
-            without ``base_dir``, or one :func:`contained_path` refuses.
+            without ``base_dir``, or one :func:`contained_path` refuses; either if ``version`` is not
+            None or one of :data:`READ_VERSIONS`.
     """
+    required = _checked_version(version)
     root = _checked_base_dir(base_dir)
     top = _object("document", data, _DOCUMENT_KEYS)
-    _check_format(top)
+    read = _check_format(top, required)
     metadata = _located("metadata", _metadata, top["metadata"])
-    pages = tuple(_located(f"pages[{i}]", _page, value, root) for i, value in enumerate(_array("pages", top["pages"])))
+    raw_pages = enumerate(_array("pages", top["pages"]))
+    pages = tuple(_located(f"pages[{i}]", _page, value, root, read) for i, value in raw_pages)
     by_id = {element.element_id: element for page in pages for element in page.elements}
     raw_sections = enumerate(_array("sections", top["sections"]))
     sections = tuple(_located(f"sections[{i}]", _section, value, by_id) for i, value in raw_sections)
@@ -394,15 +424,30 @@ def _checked_base_dir(base_dir: object) -> Path | None:
     return Path(base_dir)
 
 
-def _check_format(top: Json) -> None:
-    """Refuse a JSON value that is not this format, or of a version this codec does not read."""
+def _checked_version(version: object) -> int | None:
+    """``document_from_json``'s ``version``: None, or one of :data:`READ_VERSIONS`."""
+    if version is None:
+        return None
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise TypeError(f"version must be None or one of {READ_VERSIONS}, got {type(version).__name__}")
+    if version not in READ_VERSIONS:
+        raise ValueError(f"version must be None or one of {READ_VERSIONS}, got {version}")
+    return version
+
+
+def _check_format(top: Json, required: int | None) -> int:
+    """The JSON value's version; refuse one not of this format, of a version not read, or not ``required``."""
     if top["format"] != FORMAT:
         raise ValueError(f"format must be {FORMAT!r}, got {top['format']!r}")
     version = top["version"]
     if isinstance(version, bool) or not isinstance(version, int):
         raise TypeError(f"version must be an int, got {version!r} ({type(version).__name__})")
-    if version != VERSION:
-        raise ValueError(f"version {version} is not supported: this datagrunt reads version {VERSION}")
+    if version not in READ_VERSIONS:
+        versions = ", ".join(str(known) for known in READ_VERSIONS)
+        raise ValueError(f"version {version} is not supported: this datagrunt reads versions {versions}")
+    if required is not None and version != required:
+        raise ValueError(f"version {version} is not supported here: version {required} is required")
+    return version
 
 
 def _object(name: str, value: object, keys: tuple[str, ...]) -> Json:
@@ -462,8 +507,9 @@ def _band_path(name: str, value: object, root: Path | None) -> Path:
     return contained_path(name, value, root)
 
 
-def _page(name: str, value: object, root: Path | None) -> Page:
-    data = _object(name, value, _PAGE_KEYS)
+def _page(name: str, value: object, root: Path | None, version: int) -> Page:
+    """The page in ``value``, which holds exactly ``version``'s page keys."""
+    data = _object(name, value, _PAGE_KEYS_BY_VERSION[version])
     raw_elements = enumerate(_array(f"{name}.elements", data["elements"]))
     elements = tuple(_located(f"{name}.elements[{i}]", _element, item, root) for i, item in raw_elements)
     quality = _optional_object(f"{name}.quality", data["quality"], _QUALITY_KEYS)
@@ -479,7 +525,20 @@ def _page(name: str, value: object, root: Path | None) -> Page:
         integrity_verified=data["integrity_verified"],
         error=data["error"],
         warnings=_tuple(f"{name}.warnings", data["warnings"]),
+        image_only_reasons=_image_only_reasons(f"{name}.image_only_reasons", data, version),
     )
+
+
+def _image_only_reasons(name: str, data: Json, version: int) -> tuple[Any, ...] | None:
+    """A page's ``image_only_reasons``: None under version 1 (not recorded), else its JSON array or null."""
+    if version == 1:
+        return None
+    value = data["image_only_reasons"]
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise TypeError(f"{name} must be a JSON array or null, got {type(value).__name__}")
+    return tuple(value)
 
 
 def _page_image(name: str, value: object, root: Path | None) -> PageImage | None:

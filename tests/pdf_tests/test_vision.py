@@ -646,6 +646,14 @@ class TestVisionPage:
 
         assert low_notes(page) == [], (page.quality, page.warnings)
 
+    @pytest.mark.parametrize("name", ["scan", "captioned"])
+    def test_a_page_ocr_read_is_not_image_only(self, scans, read, name):
+        # A3 found it short of text (#470); OCR read its image, so its content no longer lives only there.
+        _, assessment = inputs(scans[name])
+
+        assert assessment.image_only_reasons == ("too_little_text",)
+        assert (read(name).status, read(name).image_only_reasons) == ("ok", ())
+
 
 def no_tesseract(monkeypatch, tmp_path) -> None:
     """PATH holds no tesseract."""
@@ -743,6 +751,30 @@ class TestOcrUnavailable:
 
         assert page.status == "ocr_unavailable"
         assert page.warnings[-1] == unread_warning("tesseract is unavailable: cannot start tesseract")
+
+    @pytest.mark.parametrize("ocr", ["auto", "always"])
+    @pytest.mark.parametrize("unread", ["no-tesseract", "not-rendered"])
+    def test_it_keeps_a3s_image_only_reasons(self, scans, monkeypatch, tmp_path, unread, ocr):
+        # Nothing read its image (#470): its content lives only there, for the reasons A3 found.
+        if unread == "no-tesseract":
+            no_tesseract(monkeypatch, tmp_path)
+        else:
+            monkeypatch.setattr(vision, "render_page", raising(RenderFailed("page 1: it cannot be drawn")))
+        raw, assessment = inputs(scans["captioned"], ocr)
+
+        page = vision_page(raw, assessment, source=scans["captioned"])
+
+        assert (page.status, page.image_only_reasons) == ("ocr_unavailable", ("too_little_text",))
+        assert page.image_only_reasons == assessment.image_only_reasons
+
+
+def raising(error: Exception):
+    """A stand-in that raises ``error``."""
+
+    def stage(*args, **kwargs):
+        raise error
+
+    return stage
 
 
 UPRIGHT = Orientation(degrees=0, confidence=30.0, status="ok", reason="")
@@ -1442,6 +1474,14 @@ class TestFallbackPage:
         assert (page.quality.vector_line_count, page.quality.hidden_spans_flagged) == (0, 0)
         assert (page.quality.rotation_deg, page.quality.deskew_angle_deg) == (0, None)
 
+    def test_read_by_ocr_it_is_not_image_only(self, scans, monkeypatch):
+        # Its extraction failed, but OCR read its image (#470): its content no longer lives only there.
+        failure = failed_at_text(scans["scan"], monkeypatch)
+
+        page = fell_back(scans["scan"], failure)
+
+        assert (page.status, page.image_only_reasons) == ("ocr_fallback", ())
+
 
 def ok_reading(monkeypatch, words) -> None:
     """OCR stands in: the page upright, ``words`` read."""
@@ -1627,6 +1667,24 @@ class TestFallbackErrors:
         assert (page.status, page.elements, page.page_image) == ("error", (), None)
         assert page.error == f"{FAILED}{failure.message}; ocr='never', so the page is not read by OCR"
         assert (page.width_pt, page.height_pt) == LETTER
+
+    @pytest.mark.parametrize("unread", ["no-geometry", "ocr-never", "not-rendered", "no-tesseract"])
+    def test_every_error_page_is_marked_extraction_failed(self, scans, tmp_path, monkeypatch, unread):
+        # Nothing was read from it (#470): its content lives only in its page (and the source PDF).
+        if unread == "no-geometry":
+            path = break_page(build_pdf(tmp_path / "broken.pdf", [PageSpec(items=LINES)]), 1)
+            with open_document(path) as handle:
+                failure = extract_page(handle, 0)
+        else:
+            path, failure = scans["scan"], failed_at_text(scans["scan"], monkeypatch)
+        if unread == "not-rendered":
+            monkeypatch.setattr(vision, "render_page", raising(RenderFailed("page 1: it cannot be drawn")))
+        if unread == "no-tesseract":
+            no_tesseract(monkeypatch, tmp_path)
+
+        page = fell_back(path, failure, ocr="never" if unread == "ocr-never" else "auto")
+
+        assert (page.status, page.route, page.image_only_reasons) == ("error", "vision", ("extraction_failed",))
 
 
 class TestFallbackArguments:

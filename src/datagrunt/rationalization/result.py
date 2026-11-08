@@ -151,7 +151,7 @@ class RationalizeTelemetry:
     Args:
         document_count: Documents processed.
         unit_count: Units packed and scheduled.
-        skipped_unit_count: Units skipped before model execution.
+        skipped_unit_count: Units skipped before model execution: ``len(RationalizedResult.skipped_units)``.
         empty_unit_count: Units where every complete response returned zero records.
         failed_unit_count: ``(unit, model)`` requests that ended without a response.
         oversize_unit_count: Units flagged ``oversize``.
@@ -296,7 +296,10 @@ class RationalizedResult(Generic[T]):
         quarantined: Quarantined responses and records.
         failed_units: ``(unit, model)`` requests that ended without a response.
         empty_units: Unit ids where every complete response had zero valid and zero quarantined records.
-        skipped_units: Units skipped before model execution.
+        skipped_units: Units skipped before model execution, in document order, each naming its ``reason`` and
+            ``page_numbers`` (:class:`~datagrunt.rationalization.units.SkippedUnit`): a page error, an all-hidden or
+            no-text group, or an ``"image_only"`` page, whose content lives only in its page image: none of its
+            text was sent and no model read its image, so a record it alone holds is not in ``items``.
         telemetry: Run-wide counters and per-model usage.
         schema: Optional schema (:class:`ModelSpec`, :class:`PreparedSchema`, or ``BaseModel`` subclass) used to
             derive the Polars/Arrow schema even when ``items`` has no records.
