@@ -15,13 +15,13 @@ import mmap
 import os
 import sys
 from collections.abc import Iterator, Sequence
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import contextmanager
 from typing import IO, NamedTuple
 
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 
-from datagrunt.pdf._memory_cap import CAP_EXIT, Lifetime, apply_memory_cap
+from datagrunt.pdf._memory_cap import CAP_EXIT, apply_memory_cap
 from datagrunt.pdf._pdfium_common import PdfiumFailure, WalkBoundHit
 from datagrunt.pdf._pdfium_images import read_filters
 from datagrunt.pdf._process import MAX_REQUEST_BYTES, read_message
@@ -58,7 +58,6 @@ from datagrunt.pdf.render import (
 # page: ~250 times the corpus's busiest page (3,977). The walk costs ~0.4 us
 # an object here, so the bound is about half a second of guard.
 _MAX_GUARD_OBJECTS = 1_000_000
-_IDLE_LIFETIME_S = 3600.0
 
 _WHITE = 0xFFFFFFFF
 # Gray output and nothing else: no FPDF_ANNOT (annotations are not drawn), no LCD text, no printing mode.
@@ -320,103 +319,28 @@ def _worker_main(message: object, replies: IO[bytes]) -> None:
     _send(replies, bitmap.pixels)
 
 
-def _file_id(path: str) -> tuple[int, int, int, int] | None:
-    """The file's ``(st_dev, st_ino, st_size, st_mtime_ns)``, or None if ``os.stat`` fails."""
-    try:
-        st = os.stat(path)
-    except OSError:
-        return None
-    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
-
-
 def _pool_worker_main(replies: IO[bytes]) -> None:
-    """A persistent render worker for :class:`~datagrunt.pdf.render.RenderWorkerPool`.
+    """A spare render worker of :class:`~datagrunt.pdf.render.RenderWorkerPool`: one request served, then it returns.
 
-    Loops over length-prefixed JSON requests on stdin, caching the open
-    :class:`~datagrunt.pdf.pdfium_engine.DocumentHandle` across consecutive
-    requests while the file on disk has the same ``os.stat`` identity.
+    Started ahead of its request (its imports done), it waits on stdin for
+    one length-prefixed JSON request; the end of stdin (the pool closed, or
+    its parent gone) ends it unserved. The request is served exactly as a
+    fresh worker serves it (:func:`_worker_main`): its memory cap and
+    deadline are set from that request, from the peak the worker holds
+    after its imports, and the PDF is opened and closed for it alone. A
+    request it cannot read is a failure reply. Then it returns, and the
+    worker exits: it never serves a second request, so nothing of one
+    request's (an open PDF, a cap's baseline, a deadline) reaches another.
     """
-    lifetime: Lifetime | None = None
-    cached_key: tuple[str, str | None, tuple[int, int, int, int]] | None = None
-    cached_cm: AbstractContextManager[DocumentHandle] | None = None
-    cached_handle: DocumentHandle | None = None
-
-    def get_handle(source: str, password: str | None) -> DocumentHandle:
-        nonlocal cached_key, cached_cm, cached_handle
-        fid = _file_id(source)
-        key = (source, password, fid) if fid is not None else None
-        if cached_handle is not None and key is not None and cached_key == key:
-            return cached_handle
-        if cached_cm is not None:
-            cached_cm.__exit__(None, None, None)
-            cached_cm = None
-            cached_handle = None
-            cached_key = None
-        cm = open_document(source, password=password)
-        handle = cm.__enter__()
-        fid_after = _file_id(source)
-        if fid_after is not None:
-            cached_cm = cm
-            cached_handle = handle
-            cached_key = (source, password, fid_after)
-        return handle
-
     try:
-        while True:
-            if lifetime is not None:
-                lifetime.extend(_IDLE_LIFETIME_S)
-            raw = read_message(sys.stdin.buffer, MAX_REQUEST_BYTES)
-            if raw is None:
-                return
-            try:
-                message = json.loads(raw)
-            except Exception as exc:
-                _send(replies, _failure(exc))
-                continue
-            if isinstance(message, dict) and "pages" in message:
-                try:
-                    batch_req = _batch_request_from(message)
-                except Exception as exc:
-                    _send(replies, _failure(exc))
-                    continue
-                sent = 0
-                try:
-                    if lifetime is None:
-                        lifetime = apply_memory_cap(batch_req.memory_cap_bytes, batch_req.timeout_s)
-                    else:
-                        lifetime.extend(batch_req.timeout_s)
-                    handle = get_handle(batch_req.source, batch_req.password)
-                    for index, dpi in batch_req.pages:
-                        _send_page(replies, handle, index, dpi, batch_req)
-                        sent += 1
-                except MemoryError:
-                    os._exit(CAP_EXIT)
-                except Exception as exc:
-                    for _ in batch_req.pages[sent:]:
-                        _send(replies, _failure(exc))
-            else:
-                try:
-                    req = _request_from(message)
-                    if lifetime is None:
-                        lifetime = apply_memory_cap(req.memory_cap_bytes, req.timeout_s)
-                    else:
-                        lifetime.extend(req.timeout_s)
-                    handle = get_handle(req.source, req.password)
-                    bitmap = _render_loaded(handle, req.page_index, req.dpi, colour=False, without_text=False)
-                except MemoryError:
-                    os._exit(CAP_EXIT)
-                except RenderRefused as exc:
-                    _send(replies, _REFUSED + str(exc).encode("utf-8", errors="backslashreplace"))
-                    continue
-                except Exception as exc:
-                    _send(replies, _failure(exc))
-                    continue
-                with bitmap.pixels:
-                    _send(replies, _PIXELS + _PIXEL_SIZE.pack(bitmap.width, bitmap.height))
-                    _send(replies, bitmap.pixels)
-    finally:
-        if cached_cm is not None:
-            cached_cm.__exit__(None, None, None)
+        raw = read_message(sys.stdin.buffer, MAX_REQUEST_BYTES)
+        if raw is None:  # its stdin ended unserved: nothing to answer
+            return
+        message = json.loads(raw)
+    except Exception as exc:  # over its bound, or not JSON: sent, never swallowed
+        _send(replies, _failure(exc))
+        return
+    _worker_main(message, replies)
 
 
 def _batch_main(message: dict[str, object], replies: IO[bytes]) -> None:

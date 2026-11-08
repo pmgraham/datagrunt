@@ -84,9 +84,19 @@ refused or failed is that page's outcome and the batch goes on; a worker
 that ends (its cap, the timeout, an unexpected exit) fails every page it
 had not answered, each with why. Every page's pixels are held at once: the
 caller bounds the batch (at most :data:`MAX_BATCH_PAGES` pages).
+
+Within :func:`render_worker_pool` (a page worker's, a writer's, a
+bundle's), a render takes a pre-started spare instead of starting a
+worker (:class:`RenderWorkerPool`). A spare serves one request exactly as
+a worker started for it would (its own cap, timeout and PDF open), then
+exits. Once the request reaches it, its outcome is final: its replies, or
+why it ended (its cap, its timeout, its exit code and stderr). A spare that
+died while idle never receives the request: a worker started for the
+render draws it instead, with its full ``timeout_s``.
 """
 
 import json
+import logging
 import math
 import os
 import struct
@@ -104,8 +114,8 @@ from typing import IO, NamedTuple
 from datagrunt.pdf._extra import EXTRA_IMPORTS
 from datagrunt.pdf._memory_cap import ending as _worker_ending
 from datagrunt.pdf._process import ERROR as _PROCESS_ERROR
-from datagrunt.pdf._process import MAX_REQUEST_BYTES as _MAX_REQUEST_BYTES
 from datagrunt.pdf._process import (
+    LENGTH,
     REAP_TIMEOUT_S,
     MessageTooLong,
     NoInterpreter,
@@ -113,16 +123,18 @@ from datagrunt.pdf._process import (
     close_pipes,
     reaped,
     request_payload,
-    send_message,
     start_worker,
     worker_command,
 )
+from datagrunt.pdf._process import MAX_REQUEST_BYTES as _MAX_REQUEST_BYTES
 from datagrunt.pdf._process import read_error as _read_error
 from datagrunt.pdf._process import read_message as _read_message
 from datagrunt.pdf._validate import checked_password as _checked_password
 from datagrunt.pdf._validate import checked_path as _checked_path
 from datagrunt.pdf._validate import int_at_least, positive_float, strict_bool
 from datagrunt.pdf.exceptions import DatagruntPDFError
+
+_LOGGER = logging.getLogger(__name__)
 
 # The spec's construction checks (PDFReader / PDFWriter): dpi >= 36, max_render_pixels >= 512 x 512.
 _MIN_TARGET_DPI = 36
@@ -291,6 +303,8 @@ class _Malformed(Exception):
     """A worker's reply the parent refuses (a bad header, a claim past the cap, short pixels): a failure, unread on."""
 
 
+# A spare's program (RenderWorkerPool). Once it has replied (its replies flushed), it flushes its stdio and exits at
+# once: it holds nothing to tear down (its PDF closed, its request answered), and its parent reaps it on its way out.
 _RENDER_POOL_BOOTSTRAP = (
     "import importlib, json, os, sys\n"
     "replies = os.fdopen(os.dup(1), 'wb')\n"
@@ -306,112 +320,212 @@ _RENDER_POOL_BOOTSTRAP = (
     "    process.send_message(replies, process.missing_extra_reply(exc))\n"
     "    raise SystemExit(0)\n"
     "_pool_worker_main(replies)\n"
+    "sys.stdout.flush(); sys.stderr.flush(); os._exit(0)\n"
 )
 
 
-class RenderWorkerPool:
-    """A scoped pool of warm render worker subprocesses that cache open PDF handles across renders."""
+_Worker = tuple["subprocess.Popen[bytes]", StderrTail]
 
-    __slots__ = ("_closed", "_cond", "_idle", "_lock", "_warming")
+# A pool's spares for one memory cap, idle and starting together, at most; and how long acquire waits for one starting.
+_MAX_SPARES = 4
+_SPARE_WAIT_S = REAP_TIMEOUT_S
+# The spares acquire keeps ahead of a caller that renders in turn: the one it hands out is then the older, its imports
+# (~50 ms here) done while the one before it was rendering.
+_SPARES_AHEAD = 2
+_SPARE_THREAD = "datagrunt-render-spare"  # the name of each thread that starts a spare
+
+
+class RenderWorkerPool:
+    """A scoped pool of pre-started, single-use render workers (spares), for :func:`render_worker_pool`.
+
+    A spare is started ahead of its request (``python -I`` running
+    :data:`_RENDER_POOL_BOOTSTRAP`: the caller's ``sys.path``, then the render
+    worker's imports) and waits on its stdin. It serves exactly one request,
+    as a fresh worker serves it (its own memory cap and deadline, from the
+    request; the PDF opened for that request alone), then exits: no worker
+    serves twice, and an idle spare holds no PDF open. :meth:`acquire` hands
+    out the oldest live idle spare (or a worker started then) and starts its
+    replacement in the background, keeping :data:`_SPARES_AHEAD` ahead; at
+    most :data:`_MAX_SPARES` spares of one memory cap are idle or starting at
+    once. A spare that cannot start is logged. :meth:`close` kills and reaps
+    the idle spares (they hold nothing).
+    """
+
+    __slots__ = ("_closed", "_cond", "_idle", "_starting", "_waiting")
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._cond = threading.Condition(self._lock)
+        self._cond = threading.Condition()
         self._idle: list[tuple[int, subprocess.Popen[bytes], StderrTail]] = []
-        self._warming: set[int] = set()
+        self._starting: dict[int, int] = {}  # spares being started, by memory cap
+        self._waiting: dict[int, int] = {}  # acquire calls waiting for one of them, by memory cap
         self._closed = False
 
     def warm(self, memory_cap_bytes: int) -> None:
-        """Start a pooled worker for ``memory_cap_bytes`` in the background if none is idle or warming."""
-        with self._cond:
-            if self._closed or memory_cap_bytes in self._warming:
-                return
-            if any(cap == memory_cap_bytes and child.poll() is None for cap, child, _ in self._idle):
-                return
-            self._warming.add(memory_cap_bytes)
+        """Start a spare for ``memory_cap_bytes`` in the background, unless one is idle or starting already."""
+        self._start_spare_below(memory_cap_bytes, 1)
 
-        def _spawn() -> None:
-            try:
-                command = _worker_command("render warm")
-                pool_cmd = [command[0], "-I", "-c", _RENDER_POOL_BOOTSTRAP]
-                child, stderr = _started(pool_cmd, "render warm")
-                stdin = child.stdin
-                if stdin is not None:
-                    try:
-                        path = [os.path.abspath(entry) if entry else os.getcwd() for entry in sys.path]
-                        stdin.write((json.dumps(path) + "\n").encode("utf-8"))
-                        stdin.flush()
-                    except OSError:
-                        pass
-                self.release(memory_cap_bytes, child, stderr)
-            except Exception:
-                pass
-            finally:
-                with self._cond:
-                    self._warming.discard(memory_cap_bytes)
-                    self._cond.notify_all()
+    def acquire(self, where: str, memory_cap_bytes: int) -> _Worker:
+        """A live idle spare for ``memory_cap_bytes``, or a worker started now; a replacement spare starts too.
 
-        threading.Thread(target=_spawn, daemon=True).start()
+        Waits, within :data:`_SPARE_WAIT_S`, for a spare already starting
+        that no other caller waits for. Spares found dead are reaped and
+        logged. The worker returned serves one request: never return it.
 
-    def acquire(
-        self, command: list[str], where: str, memory_cap_bytes: int
-    ) -> tuple["subprocess.Popen[bytes]", StderrTail, bool]:
-        """Return a warm idle worker with matching ``memory_cap_bytes``, or start a new pooled worker."""
-        with self._cond:
-            while memory_cap_bytes in self._warming and not self._closed:
-                self._cond.wait(timeout=REAP_TIMEOUT_S)
+        Raises:
+            ValueError: If the pool is closed.
+            RenderFailed: If no spare is idle and no worker can start (``where`` heads it).
+        """
+        dead: list[_Worker] = []
+        try:
+            with self._cond:
+                spare = self._taken(memory_cap_bytes, dead)
+        finally:
+            for child, stderr in dead:  # bounded: the idle spares
+                _LOGGER.warning("a spare render worker ended while idle: %s", _retired_ending(child, stderr))
+        worker = spare if spare is not None else _spare_started(where)
+        self._start_spare_below(memory_cap_bytes, _MAX_SPARES)  # its replacement
+        self._start_spare_below(memory_cap_bytes, _SPARES_AHEAD)  # and another, while fewer are ahead
+        return worker
+
+    def _taken(self, memory_cap_bytes: int, dead: list[_Worker]) -> _Worker | None:
+        """An idle spare taken from the pool (the lock held), or None; each dead one found is moved to ``dead``."""
+        give_up = time.monotonic() + _SPARE_WAIT_S
+        while True:  # bounded: by give_up, which every wait ends by
             if self._closed:
                 raise ValueError("RenderWorkerPool is closed")
-            for idx in range(len(self._idle) - 1, -1, -1):
-                cap, child, stderr = self._idle[idx]
+            live = []
+            taken: _Worker | None = None
+            for cap, child, stderr in self._idle:  # bounded: the idle spares, oldest (most likely ready) first
                 if child.poll() is not None:
-                    self._idle.pop(idx)
-                    close_pipes(child)
-                    reaped(child, REAP_TIMEOUT_S)
-                    stderr.finish(REAP_TIMEOUT_S)
-                    continue
-                if cap == memory_cap_bytes:
-                    self._idle.pop(idx)
-                    return child, stderr, True
-        pool_cmd = [command[0], "-I", "-c", _RENDER_POOL_BOOTSTRAP]
-        child, stderr = _started(pool_cmd, where)
-        stdin = child.stdin
-        if stdin is not None:
+                    dead.append((child, stderr))
+                elif taken is None and cap == memory_cap_bytes:
+                    taken = (child, stderr)
+                else:
+                    live.append((cap, child, stderr))
+            self._idle = live
+            if taken is not None:
+                return taken
+            remaining = give_up - time.monotonic()
+            unclaimed = self._starting.get(memory_cap_bytes, 0) - self._waiting.get(memory_cap_bytes, 0)
+            if remaining <= 0 or unclaimed <= 0:
+                return None
+            self._waiting[memory_cap_bytes] = self._waiting.get(memory_cap_bytes, 0) + 1
             try:
-                path = [os.path.abspath(entry) if entry else os.getcwd() for entry in sys.path]
-                stdin.write((json.dumps(path) + "\n").encode("utf-8"))
-                stdin.flush()
-            except OSError:
-                pass
-        return child, stderr, False
+                self._cond.wait(remaining)
+            finally:
+                self._waiting[memory_cap_bytes] -= 1
 
-    def release(self, memory_cap_bytes: int, child: "subprocess.Popen[bytes]", stderr: StderrTail) -> None:
-        """Return a healthy worker to the idle pool, or reap it if the pool is closed or the worker died."""
-        if child.poll() is None:
-            with self._lock:
-                if not self._closed:
-                    self._idle.append((memory_cap_bytes, child, stderr))
-                    return
-        close_pipes(child)
-        reaped(child, REAP_TIMEOUT_S)
-        stderr.finish(REAP_TIMEOUT_S)
+    def _start_spare_below(self, memory_cap_bytes: int, count: int) -> None:
+        """Start a spare for ``memory_cap_bytes`` on a thread of its own if under ``count`` are idle or starting."""
+        with self._cond:
+            idle = sum(1 for cap, child, _ in self._idle if cap == memory_cap_bytes and child.poll() is None)
+            starting = self._starting.get(memory_cap_bytes, 0)
+            if self._closed or idle + starting >= count:
+                return
+            self._starting[memory_cap_bytes] = starting + 1
+        try:
+            threading.Thread(target=self._spawn, args=(memory_cap_bytes,), name=_SPARE_THREAD, daemon=True).start()
+        except RuntimeError as exc:  # no thread to start it: said, and the spare is not counted
+            _LOGGER.warning("a spare render worker could not start: no thread to start it: %s", exc)
+            self._started_one(memory_cap_bytes)
+
+    def _spawn(self, memory_cap_bytes: int) -> None:
+        """A spare's thread: start it, then make it idle, or end it if the pool has closed; a failed start is logged."""
+        try:
+            spare = _spare_started("")
+            if not self._kept(memory_cap_bytes, spare):
+                _retired(*spare)
+        except RenderFailed as exc:  # said, never swallowed: acquire then starts a worker itself, which raises why
+            _LOGGER.warning("a spare render worker could not start: %s", exc)
+        finally:
+            self._started_one(memory_cap_bytes)
+
+    def _kept(self, memory_cap_bytes: int, spare: _Worker) -> bool:
+        """Whether ``spare`` joined the idle spares: not once the pool has closed."""
+        with self._cond:
+            if self._closed:
+                return False
+            self._idle.append((memory_cap_bytes, *spare))
+            return True
+
+    def _started_one(self, memory_cap_bytes: int) -> None:
+        """A spare's start has ended (idle, ended or failed): it is no longer counted as starting."""
+        with self._cond:
+            self._starting[memory_cap_bytes] -= 1
+            self._cond.notify_all()
 
     def close(self) -> None:
-        """Close and reap all idle workers in the pool."""
-        with self._lock:
+        """Close the pool: once the spares starting have started (within a bound), kill and reap the idle ones."""
+        with self._cond:
             self._closed = True
-            idle = list(self._idle)
-            self._idle.clear()
-        for _cap, child, stderr in idle:
-            close_pipes(child)
-            reaped(child, REAP_TIMEOUT_S)
-            stderr.finish(REAP_TIMEOUT_S)
+            self._cond.notify_all()
+            give_up = time.monotonic() + REAP_TIMEOUT_S
+            while any(self._starting.values()):  # bounded: by give_up
+                remaining = give_up - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._cond.wait(remaining)
+            idle, self._idle = self._idle, []
+        for _cap, child, stderr in idle:  # bounded: the idle spares
+            _retired(child, stderr)
 
     def __enter__(self) -> "RenderWorkerPool":
         return self
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
+
+
+def _spare_started(where: str) -> _Worker:
+    """A spare started now: the pool's bootstrap, sent the caller's ``sys.path`` (see :class:`RenderWorkerPool`).
+
+    Raises:
+        RenderFailed: If there is no interpreter, the OS refuses to start
+            it, or it ends before it takes the caller's ``sys.path`` (it is
+            then reaped); ``where`` (if any) heads it.
+    """
+    lead = f"{where}: " if where else ""
+    try:
+        command = [worker_command()[0], "-I", "-c", _RENDER_POOL_BOOTSTRAP]
+    except NoInterpreter as exc:
+        raise RenderFailed(f"{lead}{exc}") from exc
+    child, stderr = _started(command, where)
+    path = [os.path.abspath(entry) if entry else os.getcwd() for entry in sys.path]
+    if child.stdin is not None and _written(child.stdin, (json.dumps(path) + "\n").encode("utf-8")):
+        return child, stderr
+    raise RenderFailed(f"{lead}cannot start a render worker: {_retired_ending(child, stderr)}")
+
+
+def _written(stdin: IO[bytes], data: bytes) -> bool:
+    """Write ``data`` whole to a spare's stdin, unbuffered; False if the pipe has no reader (the spare has ended).
+
+    Unbuffered, so no bytes that cannot be delivered stay in the parent's
+    buffer to fail again when the pipe is closed.
+    """
+    pending = memoryview(data)
+    try:
+        for _ in range(len(data)):  # bounded: each write takes at least one byte (a blocking pipe)
+            if not pending:
+                break
+            pending = pending[os.write(stdin.fileno(), pending) :]
+    except OSError:  # EPIPE (EINVAL on Windows): the spare has ended, and its end of the pipe with it
+        return False
+    return not pending
+
+
+def _retired(child: "subprocess.Popen[bytes]", stderr: StderrTail) -> tuple[int | None, str]:
+    """End a worker that serves no request (it holds no PDF): killed and reaped; its exit code and stderr's tail."""
+    child.kill()  # a no-op once it has exited
+    close_pipes(child)
+    exitcode = reaped(child, REAP_TIMEOUT_S)
+    return exitcode, stderr.finish(REAP_TIMEOUT_S)
+
+
+def _retired_ending(child: "subprocess.Popen[bytes]", stderr: StderrTail) -> str:
+    """Retire a spare that ended on its own (:func:`_retired`): how it ended, in words."""
+    exitcode, tail = _retired(child, stderr)
+    ending = f"it ended with exit code {exitcode}" if exitcode is not None else "it could not be reaped"
+    return f"{ending}; its stderr ends: {tail}" if tail else ending
 
 
 _ACTIVE_RENDER_POOL: ContextVar[RenderWorkerPool | None] = ContextVar("_ACTIVE_RENDER_POOL", default=None)
@@ -499,7 +613,12 @@ def render_page(
     payload = _request_payload(request)
     pool = _ACTIVE_RENDER_POOL.get()
     if pool is not None:
-        return _render_page_pooled(pool, command, request, where)
+        return _render_page_pooled(pool, command, payload, request, where)
+    return _render_page_fresh(command, payload, request, where)
+
+
+def _render_page_fresh(command: list[str], payload: bytes, request: _Request, where: str) -> RenderedPage:
+    """The page drawn by a worker started for it, within ``timeout_s`` from now (see :func:`render_page`)."""
     deadline = time.monotonic() + request.timeout_s
     worker, stderr = _started(command, where)
     try:
@@ -510,22 +629,16 @@ def render_page(
     return _outcome(reply, timed_out, exitcode, request, "" if reply is not None else tail)
 
 
-def _render_page_pooled(pool: RenderWorkerPool, command: list[str], request: _Request, where: str) -> RenderedPage:
-    """Run a single-page render on a pooled worker from ``pool``."""
-    message = json.dumps(asdict(request)).encode("ascii")
-    deadline = time.monotonic() + request.timeout_s
-    for _ in range(2):
-        worker, stderr, warm = pool.acquire(command, where, request.memory_cap_bytes)
-        exchange = partial(
-            _exchange_pool, worker.stdin, worker.stdout, message, request.memory_cap_bytes, GRAY_CHANNELS, 1, True
-        )
-        replies, timed_out, exitcode, tail = _watched_pool(
-            pool, worker, stderr, request.memory_cap_bytes, deadline, 1, exchange
-        )
-        if replies or timed_out or not warm:
-            reply = replies[0] if replies else None
-            return _outcome(reply, timed_out, exitcode, request, "" if reply is not None else tail)
-    raise RenderFailed(f"{where}: cannot start a render worker")
+def _render_page_pooled(
+    pool: RenderWorkerPool, command: list[str], payload: bytes, request: _Request, where: str
+) -> RenderedPage:
+    """The page drawn by a spare from ``pool`` (:func:`_pooled`): final once the spare has the request."""
+    read = partial(_one_reply, memory_cap_bytes=request.memory_cap_bytes)
+    served = _pooled(pool, where, _pool_message(request), request, 1, read)
+    if served is None:  # the spare died while idle: a worker started for the page draws it, with its full timeout
+        return _render_page_fresh(command, payload, request, where)
+    replies, timed_out, exitcode, tail = served
+    return _outcome(replies[0] if replies else None, timed_out, exitcode, request, tail)
 
 
 def _one_page_batch(request: _Request, *, colour: bool, without_text: bool) -> RenderedPage:
@@ -626,7 +739,14 @@ def _run_batch(request: _BatchRequest) -> tuple[list[_Reply], bool, int | None, 
     count, channels = len(request.pages), BGR_CHANNELS if request.colour else GRAY_CHANNELS
     pool = _ACTIVE_RENDER_POOL.get()
     if pool is not None:
-        return _run_batch_pooled(pool, command, request, count, channels)
+        return _run_batch_pooled(pool, command, payload, request, count, channels)
+    return _run_batch_fresh(command, payload, request, count, channels)
+
+
+def _run_batch_fresh(
+    command: list[str], payload: bytes, request: _BatchRequest, count: int, channels: int
+) -> tuple[list[_Reply], bool, int | None, str]:
+    """The batch drawn by a worker started for it, within ``timeout_s`` from now (see :func:`_run_batch`)."""
     deadline = time.monotonic() + request.timeout_s
     worker, stderr = _started(command, "")
     exchange = partial(_exchange_batch, worker.stdin, worker.stdout, payload, request.memory_cap_bytes, channels, count)
@@ -639,22 +759,63 @@ def _run_batch(request: _BatchRequest) -> tuple[list[_Reply], bool, int | None, 
 
 
 def _run_batch_pooled(
-    pool: RenderWorkerPool, command: list[str], request: _BatchRequest, count: int, channels: int
+    pool: RenderWorkerPool, command: list[str], payload: bytes, request: _BatchRequest, count: int, channels: int
 ) -> tuple[list[_Reply], bool, int | None, str]:
-    """Run a batch render on a pooled worker from ``pool``."""
-    message = json.dumps(asdict(request)).encode("ascii")
+    """The batch drawn by a spare from ``pool`` (:func:`_pooled`): final once the spare has the request."""
+    read = partial(_read_replies, memory_cap_bytes=request.memory_cap_bytes, channels=channels, count=count)
+    served = _pooled(pool, "", _pool_message(request), request, count, read)
+    if served is None:  # the spare died while idle: a worker started for the batch draws it, with its full timeout
+        return _run_batch_fresh(command, payload, request, count, channels)
+    return served
+
+
+def _pool_message(request: _Request | _BatchRequest) -> bytes:
+    """The request a spare reads (it has the caller's sys.path already): its JSON alone, within the payload's bound."""
+    return json.dumps(asdict(request)).encode("ascii")
+
+
+def _pooled(
+    pool: RenderWorkerPool,
+    where: str,
+    message: bytes,
+    request: _Request | _BatchRequest,
+    count: int,
+    read: Callable[[IO[bytes]], list[_Reply]],
+) -> tuple[list[_Reply], bool, int | None, str] | None:
+    """Exchange ``message`` with a spare from ``pool`` until its ``count`` replies or ``timeout_s`` from now.
+
+    Returns what the fresh path returns: the replies, whether the deadline
+    passed, the exit code and stderr's tail; final once the spare has the
+    request. The spare serves this request alone: a timer kills it at the
+    deadline, and it is reaped once its replies end (it exits by itself
+    after them), never returned to the pool. None if the request never
+    reached the spare (it died while idle; logged): the caller then starts
+    a worker for it, with a full ``timeout_s`` of its own.
+    """
     deadline = time.monotonic() + request.timeout_s
-    for _ in range(2):
-        worker, stderr, warm = pool.acquire(command, "", request.memory_cap_bytes)
-        exchange = partial(
-            _exchange_pool, worker.stdin, worker.stdout, message, request.memory_cap_bytes, channels, count, False
+    worker, stderr = pool.acquire(where, request.memory_cap_bytes)
+    delivered = False
+
+    def exchange() -> list[_Reply]:
+        nonlocal delivered
+        replies, delivered = _exchange_pool(worker.stdin, worker.stdout, message, read)
+        return replies
+
+    try:
+        replies, timed_out, exitcode = _watched(worker, deadline, count, exchange)
+    finally:
+        close_pipes(worker)
+        tail = stderr.finish(REAP_TIMEOUT_S)  # the spare is reaped: its drain ends
+    if not delivered and not timed_out:
+        said = f"; its stderr ends: {tail}" if tail else ""
+        _LOGGER.warning(
+            "a spare render worker ended while idle (exit code %s)%s; a new worker draws %s",
+            exitcode,
+            said,
+            where or request.source,
         )
-        replies, timed_out, exitcode, tail = _watched_pool(
-            pool, worker, stderr, request.memory_cap_bytes, deadline, count, exchange
-        )
-        if replies or timed_out or not warm:
-            return replies, timed_out, exitcode, tail
-    return [], False, None, ""
+        return None
+    return replies, timed_out, exitcode, "" if len(replies) == count else tail
 
 
 def _batch_payload(request: _BatchRequest) -> bytes:
@@ -763,76 +924,26 @@ def _watched(
     return replies, timed_out, exitcode
 
 
-def _watched_pool(
-    pool: RenderWorkerPool,
-    worker: "subprocess.Popen[bytes]",
-    stderr: StderrTail,
-    memory_cap_bytes: int,
-    deadline: float,
-    count: int,
-    exchange: Callable[[], tuple[list[_Reply], bool]],
-) -> tuple[list[_Reply], bool, int | None, str]:
-    """Run ``exchange`` on a pooled worker; return it to ``pool`` if healthy, else reap it and finish its stderr."""
-    killer = threading.Timer(max(0.0, deadline - time.monotonic()), worker.kill)
-    killer.daemon = True
-    killer.start()
-    replies: list[_Reply] = []
-    malformed = False
-    released = False
-    timed_out = False
-    exitcode: int | None = None
-    tail = ""
-    try:
-        try:
-            replies, malformed = exchange()
-        finally:
-            killer.cancel()
-            killer.join(REAP_TIMEOUT_S)
-        complete = len(replies) == count and not malformed
-        if complete and worker.poll() is None:
-            pool.release(memory_cap_bytes, worker, stderr)
-            released = True
-            return replies, False, 0, ""
-    finally:
-        if not released:
-            complete = len(replies) == count and not malformed
-            timed_out = not complete and time.monotonic() >= deadline
-            close_pipes(worker)
-            exitcode = reaped(worker, REAP_TIMEOUT_S if complete else 0.0 if timed_out else _EXIT_GRACE_S)
-            tail = stderr.finish(REAP_TIMEOUT_S)
-    return replies, timed_out, exitcode, "" if len(replies) == count else tail
-
-
 def _exchange_pool(
-    stdin: IO[bytes] | None,
-    stdout: IO[bytes] | None,
-    message: bytes,
-    memory_cap_bytes: int,
-    channels: int,
-    count: int,
-    single: bool,
+    stdin: IO[bytes] | None, stdout: IO[bytes] | None, message: bytes, read: Callable[[IO[bytes]], list[_Reply]]
 ) -> tuple[list[_Reply], bool]:
-    """Send length-prefixed ``message`` to a pooled worker without closing stdin; read up to ``count`` replies."""
+    """Send ``message`` to a spare, then ``read`` its replies; and whether the request was delivered.
+
+    A spare that died while idle has no reader on its stdin: the request is
+    undelivered, and nothing is read (``[]``, False). Once delivered, the
+    replies are read as a fresh worker's are (:func:`_one_reply`,
+    :func:`_read_replies`); then one byte more is waited for, which is the
+    end of its stdout: a spare exits once it has replied, so it is then
+    reaped at once, not by polling. That wait is within the caller's
+    deadline timer, like every read here.
+    """
     if stdin is None or stdout is None:
         raise ValueError("the worker's stdin and stdout must be pipes")
-    replies: list[_Reply] = []
-    try:
-        send_message(stdin, message)
-        for _ in range(count):
-            reply = _read_reply(stdout, memory_cap_bytes, channels)
-            if reply is None:
-                return replies, False
-            replies.append(reply)
-    except _Malformed as exc:
-        replies.append(_Reply(_FAILED, str(exc), None))
-        return replies, True
-    except MessageTooLong as exc:
-        if not single:
-            replies.append(_Reply(_FAILED, str(exc), None))
-        return replies, True
-    except OSError:
-        return replies, False
-    return replies, False
+    if not _written(stdin, LENGTH.pack(len(message)) + message):
+        return [], False
+    replies = read(stdout)
+    stdout.read(1)  # its end, once it has exited; a byte past its replies changes nothing: it is not read on
+    return replies, True
 
 
 def _exchange(
@@ -850,11 +961,25 @@ def _exchange(
     try:
         stdin.write(payload)
         stdin.close()
+    except OSError:  # the worker stopped reading (it died, or was killed)
+        return None
+    return _read_single(stdout, memory_cap_bytes)
+
+
+def _read_single(stdout: IO[bytes], memory_cap_bytes: int) -> _Reply | None:
+    """A worker's whole reply to one page's request, or None if none came whole (see :func:`_exchange`)."""
+    try:
         return _read_reply(stdout, memory_cap_bytes, GRAY_CHANNELS)
     except _Malformed as exc:
         return _Reply(_FAILED, str(exc), None)
-    except (OSError, MessageTooLong):  # the worker stopped reading (it died, or was killed), or overran a bound
+    except (OSError, MessageTooLong):  # the worker stopped writing (it died, or was killed), or overran a bound
         return None
+
+
+def _one_reply(stdout: IO[bytes], *, memory_cap_bytes: int) -> list[_Reply]:
+    """:func:`_read_single`'s reply, as a list: empty if none came whole."""
+    reply = _read_single(stdout, memory_cap_bytes)
+    return [] if reply is None else [reply]
 
 
 def _exchange_batch(
@@ -875,10 +1000,18 @@ def _exchange_batch(
     """
     if stdin is None or stdout is None:
         raise ValueError("the worker's stdin and stdout must be pipes")
-    replies: list[_Reply] = []
     try:
         stdin.write(payload)
         stdin.close()
+    except OSError:  # it stopped reading (it died, or was killed): each page fails with why it ended
+        return []
+    return _read_replies(stdout, memory_cap_bytes=memory_cap_bytes, channels=channels, count=count)
+
+
+def _read_replies(stdout: IO[bytes], *, memory_cap_bytes: int, channels: int, count: int) -> list[_Reply]:
+    """A batch worker's replies, one a page, in order, up to ``count`` (see :func:`_exchange_batch`)."""
+    replies: list[_Reply] = []
+    try:
         for _ in range(count):  # bounded: one reply a page
             reply = _read_reply(stdout, memory_cap_bytes, channels)
             if reply is None:
@@ -886,7 +1019,7 @@ def _exchange_batch(
             replies.append(reply)
     except (_Malformed, MessageTooLong) as exc:
         replies.append(_Reply(_FAILED, str(exc), None))
-    except OSError:  # it stopped reading (it died, or was killed): each page left fails with why it ended
+    except OSError:  # it stopped writing (it died, or was killed): each page left fails with why it ended
         return replies
     return replies
 

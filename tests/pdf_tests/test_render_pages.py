@@ -7,13 +7,25 @@ Expected pixels come from pdfium itself in this process (the same render
 call, size and flags), never pinned from one platform's fonts.
 """
 
+import contextvars
 import ctypes
+import errno
+import functools
+import io
 import json
+import logging
 import os
 import re
+import shutil
+import signal
+import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
@@ -627,73 +639,357 @@ def test_the_process_allowlist_is_unchanged():
     assert os.path.basename(_render_worker.__file__) == "_render_worker.py"
 
 
+def renders_at_once(path: Path, monkeypatch, count: int) -> None:
+    """``count`` pooled render_page calls at once, each holding its worker until every one of them has one.
+
+    The calls' exchanges wait for each other, so ``count`` workers are out of the pool together. The barrier is
+    removed before this returns: the test's later renders run alone.
+    """
+    barrier = threading.Barrier(count, timeout=60)
+    real = render._exchange_pool
+
+    def held(*args, **kwargs):
+        barrier.wait()
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(render, "_exchange_pool", held)
+    try:
+        with ThreadPoolExecutor(max_workers=count) as threads:
+            calls = [
+                threads.submit(
+                    contextvars.copy_context().run,
+                    render_page,
+                    path,
+                    0,
+                    dpi=36,
+                    memory_cap_bytes=CAP,
+                    timeout_s=TIMEOUT_S,
+                )
+                for _ in range(count)
+            ]
+            assert [call.result().px_width for call in calls] == [200] * count
+    finally:
+        monkeypatch.setattr(render, "_exchange_pool", real)
+
+
+def idle_spares(pool: "render.RenderWorkerPool", count: int, wait_s: float = 10.0) -> list[subprocess.Popen]:
+    """``pool``'s idle spares, oldest first, once ``count`` are there (within ``wait_s``)."""
+    give_up = time.monotonic() + wait_s
+    while time.monotonic() < give_up:  # bounded: by give_up
+        idle = [child for _cap, child, _stderr in list(pool._idle)]
+        if len(idle) >= count:
+            return idle
+        time.sleep(0.01)
+    pytest.fail(f"the pool holds {len(pool._idle)} idle spares after {wait_s} s, not {count}")
+
+
+def idle_spare(pool: "render.RenderWorkerPool") -> subprocess.Popen:
+    """The first of ``pool``'s idle spares, once one is there (within 10 s)."""
+    return idle_spares(pool, 1)[0]
+
+
+def open_files(pid: int) -> set[str]:
+    """The paths process ``pid`` holds open: from /proc on Linux, from lsof elsewhere."""
+    if sys.platform == "linux":
+        names = set()
+        for fd in os.listdir(f"/proc/{pid}/fd"):
+            try:
+                names.add(os.readlink(f"/proc/{pid}/fd/{fd}"))
+            except OSError:  # closed since it was listed
+                continue
+        return names
+    listed = subprocess.run(["lsof", "-n", "-P", "-Fn", "-p", str(pid)], capture_output=True, text=True, timeout=30)
+    return {line[1:] for line in listed.stdout.splitlines() if line.startswith("n")}
+
+
+def spare_stdin(monkeypatch, *messages: bytes) -> None:
+    """A spare's stdin in this process: ``messages``, each after its length, then its end."""
+    stream = io.BytesIO(b"".join(_process.LENGTH.pack(len(message)) + message for message in messages))
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(buffer=stream))
+
+
+def as_json(request) -> bytes:
+    return json.dumps(asdict(request)).encode("ascii")
+
+
 class TestRenderWorkerPool:
-    """render_worker_pool reuses a warm worker and open DocumentHandle across render_page and render_pages calls."""
+    """render_worker_pool keeps pre-started spares; each serves exactly one request, then exits."""
 
-    def test_pooled_renders_reuse_one_worker_and_reap_on_exit(self, tmp_path, started):
-        path = coloured(tmp_path)
-
+    def test_the_pool_is_scoped_and_refuses_once_closed(self):
         with render.render_worker_pool() as pool:
             assert render.active_render_worker_pool() is pool
+
+        assert render.active_render_worker_pool() is None
+        with pytest.raises(ValueError, match="RenderWorkerPool is closed"):
+            pool.acquire("", CAP)
+
+    def test_each_pooled_render_has_a_worker_of_its_own_that_exits_after_its_reply(
+        self, tmp_path, started, monkeypatch
+    ):
+        served = []
+        real = render._exchange_pool
+
+        def recorded(stdin, *args, **kwargs):
+            served.append(stdin)
+            return real(stdin, *args, **kwargs)
+
+        monkeypatch.setattr(render, "_exchange_pool", recorded)
+        path = coloured(tmp_path)
+
+        with render.render_worker_pool():
             first = render_page(path, 0, dpi=72, memory_cap_bytes=CAP, timeout_s=TIMEOUT_S)
             second = render_page(path, 0, dpi=36, memory_cap_bytes=CAP, timeout_s=TIMEOUT_S)
             (third,) = batch(path, ((0, 36),))
-            assert len(started) == 1
-            assert started[0].poll() is None
+            workers = [next(worker for worker in list(started) if worker.stdin is stdin) for stdin in served]
+            codes = [worker.returncode for worker in workers]
 
-        assert render.active_render_worker_pool() is None
-        assert started[0].poll() is not None
         assert (first.px_width, second.px_width, third.px_width) == (400, 200, 200)
-        with pytest.raises(ValueError, match="RenderWorkerPool is closed"):
-            pool.acquire(["python"], "", CAP)
+        assert len({id(worker) for worker in workers}) == len(workers) == 3  # no worker serves twice
+        assert codes == [0, 0, 0]  # each exited by itself after its reply, and was reaped then
+        assert all(worker.poll() is not None for worker in started)  # the spares are reaped on close
 
-    def test_pool_worker_main_caches_handle_and_handles_errors(self, tmp_path, monkeypatch):
-        import io as _io
-        from dataclasses import asdict
-
-        from datagrunt.pdf._process import send_message
-
-        class FakeLifetime:
-            def extend(self, _s: float) -> None:
-                pass
-
-        monkeypatch.setattr(_render_worker, "apply_memory_cap", lambda *args: FakeLifetime())
+    def test_a_pooled_render_past_its_cap_says_so(self, tmp_path, monkeypatch):
         path = coloured(tmp_path)
-        req1 = render._Request(
-            source=str(path), page_index=0, dpi=36, password=None, memory_cap_bytes=CAP, timeout_s=TIMEOUT_S
+        expected = f"{path}: page 1: the render worker reached its {CAP}-byte memory cap and was ended"
+
+        with render.render_worker_pool():
+            renders_at_once(path, monkeypatch, 2)  # two spares, or two warm workers, are then idle
+            with pytest.raises(RenderFailed, match=re.escape(expected)):
+                render_page(path, 0, dpi=10_000_000, memory_cap_bytes=CAP, timeout_s=TIMEOUT_S)
+
+    def test_a_pooled_batch_past_its_cap_says_so(self, tmp_path, monkeypatch):
+        path = coloured(tmp_path)
+        expected = f"{path}: page 1: the render worker reached its {CAP}-byte memory cap and was ended"
+
+        with render.render_worker_pool():
+            renders_at_once(path, monkeypatch, 2)
+            (outcome,) = batch(path, ((0, 10_000_000),))
+
+        assert isinstance(outcome, RenderFailed)
+        assert str(outcome).startswith(expected), outcome
+
+    def test_a_spare_that_died_idle_is_replaced_by_a_new_worker(self, tmp_path, started, monkeypatch):
+        path = coloured(tmp_path)
+
+        with render.render_worker_pool() as pool:
+            pool.warm(CAP)
+            spare = idle_spare(pool)
+            spare.kill()
+            spare.wait(10)
+            monkeypatch.setattr(spare, "poll", lambda: None)  # it dies after acquire finds it alive
+            page = render_page(path, 0, dpi=36, memory_cap_bytes=CAP, timeout_s=TIMEOUT_S)
+
+        assert (page.px_width, page.px_height) == (200, 150)
+        assert spare.returncode == -signal.SIGKILL
+
+    @pytest.mark.skipif(
+        sys.platform != "linux" and shutil.which("lsof") is None, reason="no way to list a process's open files"
+    )
+    def test_no_idle_spare_holds_a_pdf_open(self, tmp_path, started):
+        path = coloured(tmp_path)
+        real = os.path.realpath(path)
+
+        with render.render_worker_pool() as pool:
+            render_page(path, 0, dpi=36, memory_cap_bytes=CAP, timeout_s=TIMEOUT_S)
+            batch(path, ((0, 36),))
+            held = open_files(idle_spare(pool).pid)
+            path.unlink()  # the source can go while the pool holds spares
+
+        assert [name for name in held if name == real or name.endswith(os.sep + path.name)] == []
+
+    def test_a_spare_that_cannot_start_is_logged_and_the_render_fails_saying_why(self, tmp_path, monkeypatch, caplog):
+        refusal = OSError(errno.EAGAIN, "no processes left")
+
+        def refused(command):
+            raise refusal
+
+        monkeypatch.setattr(render, "start_worker", refused)
+        path = coloured(tmp_path)
+        expected = f"{path}: page 1: cannot start a render worker: {refusal}"
+
+        with caplog.at_level(logging.WARNING, logger=render.__name__), render.render_worker_pool() as pool:
+            pool.warm(CAP)
+            with pytest.raises(RenderFailed, match=re.escape(expected)):
+                render_page(path, 0, dpi=36, memory_cap_bytes=CAP, timeout_s=TIMEOUT_S)
+
+        said = [record.getMessage() for record in caplog.records if record.name == render.__name__]
+        assert said and all("a spare render worker could not start" in line and str(refusal) in line for line in said)
+
+    def test_spares_are_bounded_per_memory_cap(self, tmp_path, started, monkeypatch):
+        path = coloured(tmp_path)
+        count = 8
+
+        with render.render_worker_pool() as pool:
+            for _ in range(10):
+                pool.warm(CAP)
+            renders_at_once(path, monkeypatch, count)
+            alive = [worker for worker in list(started) if worker.poll() is None]
+
+        assert len(alive) <= render._MAX_SPARES
+        assert len(started) <= count + render._MAX_SPARES  # one a render, and the spares left at close
+
+    def test_a_pooled_render_keeps_two_spares_ahead(self, tmp_path):
+        path = coloured(tmp_path)
+
+        with render.render_worker_pool() as pool:
+            render_page(path, 0, dpi=36, memory_cap_bytes=CAP, timeout_s=TIMEOUT_S)
+            spares = idle_spares(pool, 2, wait_s=5.0)
+
+        assert len(spares) == render._SPARES_AHEAD == 2
+
+    def test_the_oldest_idle_spare_is_handed_out_first(self, tmp_path):
+        path = coloured(tmp_path)
+
+        with render.render_worker_pool() as pool:
+            render_page(path, 0, dpi=36, memory_cap_bytes=CAP, timeout_s=TIMEOUT_S)
+            oldest = idle_spares(pool, 2)[0]
+            worker, stderr = pool.acquire("", CAP)
+            render._retired(worker, stderr)
+
+        assert worker is oldest  # its imports are the likeliest done
+
+    def test_the_exchange_ends_when_the_spares_stdout_does(self):
+        spare_stdin, stdin = (os.fdopen(fd, mode) for fd, mode in zip(os.pipe(), ("rb", "wb"), strict=True))
+        stdout, spare_stdout = (os.fdopen(fd, mode) for fd, mode in zip(os.pipe(), ("rb", "wb"), strict=True))
+        spare_stdout.write(frame(render._FAILED + b"it failed"))
+        spare_stdout.flush()
+        read = functools.partial(render._one_reply, memory_cap_bytes=CAP)
+        results = []
+        exchange = threading.Thread(
+            target=lambda: results.append(render._exchange_pool(stdin, stdout, b"{}", read)), daemon=True
         )
-        req2 = render._Request(
-            source=str(path), page_index=0, dpi=72, password=None, memory_cap_bytes=CAP, timeout_s=TIMEOUT_S
+
+        exchange.start()
+        exchange.join(0.3)
+        waiting = list(results)  # its reply is in, but the spare has not exited: it would be reaped by polling
+        spare_stdout.close()  # it exits
+        exchange.join(10.0)
+
+        stdin.close()
+        sent = spare_stdin.read()
+        for stream in (spare_stdin, stdout):
+            stream.close()
+        assert waiting == []
+        ((replies, delivered),) = results
+        assert (delivered, [(reply.kind, reply.detail) for reply in replies]) == (True, [(render._FAILED, "it failed")])
+        assert framed(sent) == [b"{}"]
+
+    def test_a_spare_exits_at_once_once_it_has_replied(self, tmp_path):
+        # A stand-in render worker on the spare's sys.path: its reply is a line to stdout, left unflushed, and an
+        # atexit hook that interpreter teardown would run. The spare flushes, then exits without that teardown.
+        package = tmp_path / "datagrunt" / "pdf"
+        package.mkdir(parents=True)
+        (tmp_path / "datagrunt" / "__init__.py").write_text("")
+        (package / "__init__.py").write_text("")
+        (package / "_render_worker.py").write_text(
+            "import atexit, sys\n"
+            "def _pool_worker_main(replies):\n"
+            "    atexit.register(lambda: sys.stderr.write(' torn down'))\n"
+            "    sys.stdout.write('replied')\n"
         )
-        req_bad = {"bad": "request"}
-        batch_req = batch_request(path, ((0, 36),))
 
-        buf = _io.BytesIO()
-        for item in (asdict(req1), asdict(req2), req_bad, asdict(batch_req)):
-            send_message(buf, json.dumps(item).encode("ascii"))
-        buf.seek(0)
+        done = subprocess.run(
+            [sys.executable, "-I", "-c", render._RENDER_POOL_BOOTSTRAP],
+            input=(json.dumps([str(tmp_path)]) + "\n").encode(),
+            capture_output=True,
+            timeout=60,
+        )
 
-        class FakeStdin:
-            buffer = buf
+        assert (done.returncode, done.stdout, done.stderr) == (0, b"", b"replied")
 
-        monkeypatch.setattr(sys, "stdin", FakeStdin())
-        opens = 0
-        real_open = _render_worker.open_document
+    def test_a_spare_that_ends_before_its_sys_path_is_reaped_and_the_render_fails_saying_so(
+        self, tmp_path, started, monkeypatch
+    ):
+        monkeypatch.setattr(render, "_written", lambda stdin, data: False)  # as if it had ended: its pipe unread
+        path = coloured(tmp_path)
+        expected = f"{path}: page 1: cannot start a render worker: it ended with exit code -{signal.SIGKILL}"
 
-        def counting_open(*args, **kwargs):
-            nonlocal opens
-            opens += 1
-            return real_open(*args, **kwargs)
+        with render.render_worker_pool(), pytest.raises(RenderFailed, match=re.escape(expected)):
+            render_page(path, 0, dpi=36, memory_cap_bytes=CAP, timeout_s=TIMEOUT_S)
 
-        monkeypatch.setattr(_render_worker, "open_document", counting_open)
+        assert [worker.returncode for worker in started] == [-signal.SIGKILL]
+
+
+class TestSpareWorker:
+    """A spare (_pool_worker_main) serves its one request as a fresh worker serves it, then returns."""
+
+    @pytest.fixture
+    def capped(self, monkeypatch):
+        """Each cap the spare sets (none reaches this process), and each move of its deadline."""
+        calls = []
+
+        class Lifetime:
+            def extend(self, seconds: float) -> None:
+                calls.append(("extend", seconds))
+
+        def apply(cap: int, timeout_s: float) -> Lifetime:
+            calls.append(("cap", cap, timeout_s))
+            return Lifetime()
+
+        monkeypatch.setattr(_render_worker, "apply_memory_cap", apply)
+        return calls
+
+    def test_a_page_request_is_capped_by_its_own_cap_and_deadline_and_served_alone(self, tmp_path, monkeypatch, capped):
+        path = coloured(tmp_path)
+        request = render._Request(
+            source=str(path), page_index=0, dpi=36, password=None, memory_cap_bytes=CAP, timeout_s=7.5
+        )
+        spare_stdin(monkeypatch, as_json(request), as_json(request))
         replies = Sink()
 
         _render_worker._pool_worker_main(replies)
 
-        # req1, req2, and batch_req all share a single open_document call on the unchanged file.
-        assert opens == 1
+        assert capped == [("cap", CAP, 7.5)]  # its deadline is the request's: never extended
         messages = framed(replies.data)
+        assert len(messages) == 2
         assert messages[0] == render._PIXELS + render._PIXEL_SIZE.pack(200, 150)
-        assert messages[2] == render._PIXELS + render._PIXEL_SIZE.pack(400, 300)
-        assert messages[4].startswith(render._FAILED + b"ValueError:")
-        assert messages[5] == render._PIXELS + render._PIXEL_SIZE.pack(200, 150)
+        assert len(messages[1]) == 200 * 150
+
+    def test_a_batch_request_is_capped_by_its_own_cap_and_deadline_and_served_alone(
+        self, tmp_path, monkeypatch, capped
+    ):
+        path = coloured(tmp_path)
+        request = batch_request(path, ((0, 36), (0, 72)), timeout_s=9.0)
+        spare_stdin(monkeypatch, as_json(request), as_json(request))
+        replies = Sink()
+
+        _render_worker._pool_worker_main(replies)
+
+        assert capped == [("cap", CAP, 9.0)]
+        messages = framed(replies.data)
+        assert [messages[0], messages[2]] == [
+            render._PIXELS + render._PIXEL_SIZE.pack(200, 150),
+            render._PIXELS + render._PIXEL_SIZE.pack(400, 300),
+        ]
+        assert len(messages) == 4
+
+    @pytest.mark.parametrize(
+        "message,expected",
+        [
+            pytest.param(b"{not json", b"JSONDecodeError: ", id="not-json"),
+            pytest.param(b'{"bad": "request"}', b"ValueError: the worker's request must hold exactly", id="page"),
+            pytest.param(b'{"pages": []}', b"ValueError: the batch request must hold exactly", id="batch"),
+        ],
+    )
+    def test_a_request_it_cannot_read_gets_its_failure_then_it_returns(
+        self, tmp_path, monkeypatch, capped, message, expected
+    ):
+        request = render._Request(
+            source=str(coloured(tmp_path)), page_index=0, dpi=36, password=None, memory_cap_bytes=CAP, timeout_s=7.5
+        )
+        spare_stdin(monkeypatch, message, as_json(request))
+        replies = Sink()
+
+        _render_worker._pool_worker_main(replies)
+
+        (reply,) = framed(replies.data)
+        assert reply.startswith(render._FAILED + expected)
+        assert capped == []
+
+    def test_its_stdin_ending_unserved_ends_it_without_a_reply(self, monkeypatch, capped):
+        spare_stdin(monkeypatch)
+        replies = Sink()
+
+        _render_worker._pool_worker_main(replies)
+
+        assert (replies.data, capped) == (b"", [])
