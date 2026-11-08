@@ -17,6 +17,7 @@ import pytest
 from datagrunt.pdf import codec
 from datagrunt.pdf.codec import (
     FORMAT,
+    READ_VERSIONS,
     VERSION,
     contained_path,
     document_from_json,
@@ -38,7 +39,15 @@ from datagrunt.pdf.elements import (
     Section,
     Table,
 )
-from pdf_tests.documents import empty_document, rich_document, surrogate_document
+from pdf_tests.documents import (
+    IMAGE_ONLY,
+    empty_document,
+    image_only_document,
+    rich_document,
+    surrogate_document,
+    with_image_only,
+)
+from pdf_tests.old_formats import as_version_1, version_1_bytes
 
 # Fields that are not data: loaders (bytes come from files or the PDF) and the derived index.
 NOT_DATA = {"_loader", "_raw_loader", "_band_loader", "_index"}
@@ -127,9 +136,10 @@ class TestRoundTrip:
         assert (loaded.pages[1].elements[0].font_size_pt, loaded.pages[1].elements[0].is_bold) == (14.5, True)
         assert (loaded.pages[0].elements[2].font_size_pt, loaded.pages[0].elements[2].is_bold) == (None, None)
 
-    def test_the_format_version_stays_1(self):
-        # Heading's tier is new, but the format is unpublished until 5.0: its keys change and its version does not.
-        assert VERSION == 1 and encoded()["version"] == 1
+    def test_the_format_version_is_2(self):
+        # Version 2 (#470) adds each page's image_only_reasons; version 1 (datagrunt 5.0 to 5.2) still reads.
+        assert VERSION == 2 and encoded()["version"] == 2
+        assert READ_VERSIONS == (1, 2)
 
     def test_column_intervals_are_pairs_in_the_json_and_tuples_back(self):
         data = encoded()
@@ -142,7 +152,7 @@ class TestRoundTrip:
 
     def test_top_level_names_format_and_version(self):
         data = document_to_json(rich_document())
-        assert (data["format"], data["version"]) == ("datagrunt.pdf.document", 1) == (FORMAT, VERSION)
+        assert (data["format"], data["version"]) == ("datagrunt.pdf.document", 2) == (FORMAT, VERSION)
 
     def test_sections_and_header_context_are_element_references(self):
         data = document_to_json(rich_document())
@@ -164,11 +174,7 @@ class TestEveryField:
         [
             (PDFDocument, ()),
             (DocumentMetadata, ("metadata",)),
-            pytest.param(
-                Page,
-                ("pages", 0),
-                marks=pytest.mark.xfail(strict=True, reason="#470 T3: the codec writes image_only_reasons"),
-            ),
+            (Page, ("pages", 0)),
             (PageQuality, ("pages", 0, "quality")),
             (PageImage, ("pages", 2, "page_image")),
             (Section, ("sections", 1)),
@@ -374,9 +380,9 @@ class TestContainedPath:
 
 
 class TestVersion:
-    @pytest.mark.parametrize("version", [0, 2, 99])
+    @pytest.mark.parametrize("version", [0, 3, 99])
     def test_unknown_version_is_refused(self, version):
-        with pytest.raises(ValueError, match=f"version {version} is not supported"):
+        with pytest.raises(ValueError, match=f"version {version} is not supported: this datagrunt reads versions 1, 2"):
             document_from_json(changed(("version",), version))
 
     @pytest.mark.parametrize("version", [True, "1", 1.0, None])
@@ -388,6 +394,111 @@ class TestVersion:
     def test_unknown_format_is_refused(self, name):
         with pytest.raises(ValueError, match="format"):
             document_from_json(changed(("format",), name))
+
+
+class TestImageOnlyReasons:
+    """Version 2 (#470): each page's ``image_only_reasons``, a JSON array, or null when not recorded."""
+
+    def test_it_is_each_pages_last_key(self):
+        data = encoded(image_only_document())
+        assert [list(page)[-1] for page in data["pages"]] == ["image_only_reasons"] * 4
+        assert [page["image_only_reasons"] for page in data["pages"]] == [
+            None,
+            ["too_little_text", "garbled_text"],
+            ["too_little_text"],
+            ["extraction_failed"],
+        ]
+
+    def test_none_is_an_empty_array(self):
+        assert [page["image_only_reasons"] for page in encoded()["pages"]] == [[], [], [], []]
+
+    def test_a_document_with_every_kind_round_trips(self):
+        document = image_only_document()
+        loaded = document_from_json_bytes(document_to_json_bytes(document))
+        assert loaded == document
+        assert [page.image_only_reasons for page in loaded.pages] == [IMAGE_ONLY[n] for n in (1, 2, 3, 4)]
+        assert loaded.image_only_pages == (2, 3, 4)
+
+    def test_the_key_is_required(self):
+        with pytest.raises(ValueError, match=r"pages\[1\] has missing key\(s\) \['image_only_reasons'\]"):
+            document_from_json(changed(("pages", 1, "image_only_reasons"), delete=True))
+
+    @pytest.mark.parametrize("value", ["too_little_text", {"too_little_text": 1}, 1, True])
+    def test_a_value_that_is_not_an_array_or_null_is_refused_not_coerced(self, value):
+        message = rf"pages\[1\]\.image_only_reasons must be a JSON array or null, got {type(value).__name__}"
+        with pytest.raises(TypeError, match=message):
+            document_from_json(changed(("pages", 1, "image_only_reasons"), value))
+
+    @pytest.mark.parametrize(
+        ("page", "value", "error", "message"),
+        [
+            (1, ["blurry"], ValueError, r"pages\[1\]: image_only_reasons has unknown reason\(s\) \['blurry'\]"),
+            (
+                1,
+                ["garbled_text", "too_little_text"],
+                ValueError,
+                r"pages\[1\]: image_only_reasons must be in canonical",
+            ),
+            (1, ["too_little_text", "too_little_text"], ValueError, r"pages\[1\]: image_only_reasons has duplicate"),
+            (1, ["extraction_failed"], ValueError, r"pages\[1\]: image_only_reasons 'extraction_failed' requires"),
+            (3, ["too_little_text"], ValueError, r"pages\[3\]: an error page's image_only_reasons may hold only"),
+            (1, [1], TypeError, r"pages\[1\]: image_only_reasons\[0\] must be a str, got 1 \(int\)"),
+        ],
+    )
+    def test_a_bad_value_is_refused_by_a1_naming_where(self, page, value, error, message):
+        with pytest.raises(error, match=message):
+            document_from_json(changed(("pages", page, "image_only_reasons"), value))
+
+
+class TestVersion1:
+    """Version 1 (datagrunt 5.0 to 5.2) still reads: its pages hold no ``image_only_reasons``, so each reads None."""
+
+    def test_each_page_reads_not_recorded(self):
+        loaded = document_from_json(as_version_1(encoded(image_only_document())))
+        assert [page.image_only_reasons for page in loaded.pages] == [None] * 4
+        assert loaded.image_only_pages == ()
+        assert loaded == with_image_only(image_only_document(), dict.fromkeys((1, 2, 3, 4)))
+
+    def test_its_bytes_read(self):
+        loaded = document_from_json_bytes(version_1_bytes(rich_document()))
+        assert loaded == with_image_only(rich_document(), dict.fromkeys((1, 2, 3, 4)))
+
+    def test_it_must_hold_exactly_its_own_keys(self):
+        data = as_version_1(encoded())
+        data["pages"][0]["image_only_reasons"] = []
+        with pytest.raises(ValueError, match=r"pages\[0\] has unknown key\(s\) \['image_only_reasons'\]"):
+            document_from_json(data)
+
+    def test_it_writes_again_as_version_2_with_null_reasons(self):
+        loaded = document_from_json(as_version_1(encoded()))
+        data = json.loads(document_to_json_bytes(loaded))
+        assert data["version"] == 2
+        assert [page["image_only_reasons"] for page in data["pages"]] == [None] * 4
+        assert document_from_json(data) == loaded
+
+
+class TestRequiredVersion:
+    """``version=`` reads only that version: a bundle's format names the version of its document JSON."""
+
+    def test_each_version_reads_when_it_is_the_one_required(self):
+        assert document_from_json(encoded(), version=2) == rich_document()
+        assert document_from_json_bytes(version_1_bytes(rich_document()), version=1).pages[0].image_only_reasons is None
+
+    @pytest.mark.parametrize(("data", "required"), [(lambda: as_version_1(encoded()), 2), (encoded, 1)])
+    def test_another_version_is_refused(self, data, required):
+        given = 3 - required
+        message = f"version {given} is not supported here: version {required} is required"
+        with pytest.raises(ValueError, match=message):
+            document_from_json(data(), version=required)
+        with pytest.raises(ValueError, match=message):
+            document_from_json_bytes(json.dumps(data()).encode("ascii"), version=required)
+
+    @pytest.mark.parametrize(
+        ("version", "error"), [(0, ValueError), (3, ValueError), ("2", TypeError), (True, TypeError)]
+    )
+    def test_the_required_version_must_be_one_this_codec_reads(self, version, error):
+        with pytest.raises(error, match=r"version must be None or one of \(1, 2\)"):
+            document_from_json(encoded(), version=version)
 
 
 class TestUnknownAndMissingKeys:

@@ -17,14 +17,20 @@ checked where tesseract is installed.
 """
 
 import dataclasses
+import json
 from pathlib import Path
 
 import pytest
 
+from datagrunt.pdf.bundle import load_bundle, write_bundle
+from datagrunt.pdf.codec import document_from_json_bytes
 from datagrunt.pdf.elements import PDFDocument
+from datagrunt.pdf.frame import element_frame
 from datagrunt.pdf.pipeline import extract_document
 from datagrunt.pdf.reader import PDFReader
+from datagrunt.pdf.writer import PDFWriter
 from pdf_tests.builders import Line, PageSpec, RasterImage, Rect, TextRun, break_page, build_pdf
+from pdf_tests.old_formats import as_bundle_5_0
 from pdf_tests.test_isolation import inline_content, pages_pdf, small_cap, text_content
 from pdf_tests.test_ocr import needs_tesseract
 from pdf_tests.test_ocr_scans import LETTER, LINES, png_of, rendered
@@ -183,3 +189,45 @@ class TestAutoUnmarksThePagesOcrReads:
 
     def test_a_garbled_page(self, extracted):
         assert facts(extracted("garbled", "auto")) == [("ok", "vision", ())]
+
+
+class TestTheMarkerIsCarried:
+    """The document JSON, the element frame and the bundle carry what ``ocr="never"`` marks, losslessly (#470)."""
+
+    def test_the_json_round_trips_it(self, extracted, tmp_path):
+        document = extracted("mixed", "never")
+        path = PDFWriter(document).write_json(tmp_path / "doc.json")
+
+        assert document_from_json_bytes(path.read_bytes()) == document
+
+    def test_each_row_holds_its_pages_reasons(self, extracted):
+        document = extracted("mixed", "never")
+        frame = element_frame(document)
+
+        pages = document.pages
+        assert [row["image_only_reasons"] for row in frame.iter_rows(named=True)] == [
+            list(pages[number - 1].image_only_reasons) for number in frame["page_number"].to_list()
+        ]
+        assert 5 not in frame["page_number"].to_list()  # the error page: no elements, so no row names it
+
+    def test_the_bundle_records_and_reloads_it(self, pdfs, extracted, tmp_path):
+        out = tmp_path / "out"
+        returned = write_bundle(extracted("mixed", "never"), out, source=pdfs["mixed"], dpi=72)
+
+        assert json.loads((out / "manifest.json").read_bytes())["image_only_pages"] == [2, 4, 5]
+        assert "<!-- page 2 route=digital status=ok image_only=too_little_text -->" in (
+            (out / "markdown" / "pages" / "page_0002.md").read_text(encoding="utf-8")
+        )
+        assert load_bundle(out) == returned
+        assert PDFReader(out).document.image_only_pages == (2, 4, 5)
+
+    def test_its_bundle_as_datagrunt_5_2_wrote_it_reads_not_recorded(self, pdfs, extracted, tmp_path):
+        out = tmp_path / "out"
+        write_bundle(extracted("mixed", "never"), out, source=pdfs["mixed"], dpi=72)
+        as_bundle_5_0(out)
+
+        loaded = load_bundle(out)
+
+        assert "image_only=" not in (out / "markdown" / "document.md").read_text(encoding="utf-8")
+        assert [page.image_only_reasons for page in loaded.pages] == [None] * 5
+        assert loaded.image_only_pages == () and PDFReader(out).document == loaded

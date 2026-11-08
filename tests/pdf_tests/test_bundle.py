@@ -40,7 +40,17 @@ from datagrunt.pdf.pipeline import extract_document
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page, render_size
 from datagrunt.pdf.writer import PDFWriter
 from pdf_tests.builders import PageSpec, TextRun, build_pdf, hand_written_pdf, solid_png
-from pdf_tests.documents import FIGURE_A_SHA, FIGURE_B_SHA, PAGE_SIZES, metadata, rich_document, surrogate_document
+from pdf_tests.documents import (
+    FIGURE_A_SHA,
+    FIGURE_B_SHA,
+    IMAGE_ONLY,
+    PAGE_SIZES,
+    metadata,
+    rich_document,
+    surrogate_document,
+    with_image_only,
+)
+from pdf_tests.old_formats import as_bundle_5_0
 from pdf_tests.test_layout_stream_tables import body_text
 
 PNG_A = solid_png(64, 32, (0.2, 0.4, 0.6))
@@ -278,6 +288,7 @@ class TestManifest:
             "extraction_params",
             "integrity_verified",
             "degraded_pages",
+            "image_only_pages",
             "page_images",
             "artifacts",
             "missing",
@@ -285,14 +296,27 @@ class TestManifest:
 
     def test_manifest_values(self, written):
         manifest = manifest_of(written.out)
-        assert manifest["bundle_format_version"] == BUNDLE_FORMAT_VERSION == "5.0"
+        assert manifest["bundle_format_version"] == BUNDLE_FORMAT_VERSION == "5.3"
         assert manifest["datagrunt_version"] == datagrunt.__version__
         assert manifest["source_sha256"] == sha_of(written.source) == written.document.metadata.sha256
         params = {"dpi": DPI, "vision_dpi": VISION_DPI, "max_render_pixels": 16_000_000, "workers": 1}
         assert manifest["extraction_params"] == params
         assert manifest["integrity_verified"] is False is written.document.integrity_verified
         assert manifest["degraded_pages"] == [3, 4]
+        assert manifest["image_only_pages"] == [] == list(written.document.image_only_pages)
         assert manifest["missing"] == []
+
+    def test_image_only_pages_are_the_documents_and_their_reasons_load_back(self, tmp_path, source, fast_render):
+        document = with_image_only(bound_document(source), IMAGE_ONLY)
+        returned = write(document, tmp_path / "out", source)
+        assert manifest_of(tmp_path / "out")["image_only_pages"] == [2, 3, 4] == list(document.image_only_pages)
+        data = json.loads((tmp_path / "out" / "json" / "document.json").read_bytes())
+        assert [page["image_only_reasons"] for page in data["pages"]] == [
+            None if IMAGE_ONLY[n] is None else list(IMAGE_ONLY[n]) for n in (1, 2, 3, 4)
+        ]
+        loaded = load_bundle(tmp_path / "out")
+        assert loaded == returned
+        assert [page.image_only_reasons for page in loaded.pages] == [IMAGE_ONLY[n] for n in (1, 2, 3, 4)]
 
     def test_each_page_image_records_its_origin_dpi_and_normalization(self, written):
         render = {"origin": "render", "dpi": float(DPI), "contrast_normalized": False}
@@ -800,9 +824,7 @@ class TestFiguresSharingAStream:
         assert manifest_of(out)["missing"] == []
         assert [figure.read_bytes() for figure in load_bundle(out).figures] == own
 
-    # Its pages are image-only under ocr="never" (a figure, no text: #470); until T3 the codec drops the marker, so
-    # the loaded bundle's pages read () where the written document's read ("too_little_text",).
-    @pytest.mark.xfail(strict=True, reason="#470 T3: the codec writes image_only_reasons")
+    # Its pages are image-only under ocr="never" (a figure, no text: #470): the loaded bundle's pages keep the marker.
     def test_a_figure_is_read_though_an_earlier_one_of_its_stream_failed(self, tmp_path):
         document, returned = self.bundled(tmp_path, UNREADABLE, AS_RGB)
         sha, out = document.figures[0].sha256, tmp_path / "out"
@@ -811,8 +833,8 @@ class TestFiguresSharingAStream:
         [missing] = manifest_of(out)["missing"]
         assert (missing["artifact"], missing["page_number"], missing["element_id"]) == ("figure", 1, "p0001_e000")
         assert load_bundle(out) == returned
+        assert returned.image_only_pages == (1, 2) == tuple(manifest_of(out)["image_only_pages"])
 
-    @pytest.mark.xfail(strict=True, reason="#470 T3: the codec writes image_only_reasons")
     def test_each_figure_not_written_has_its_own_missing_entry(self, tmp_path):
         _, returned = self.bundled(tmp_path, UNREADABLE, UNREADABLE)
         assert [figure.image_path for figure in returned.figures] == [None, None]
@@ -1501,6 +1523,33 @@ class TestReuse:
         changed = with_element(bound_document(source), "p0001_e003", text="Other text.")
         with pytest.raises(FileExistsError, match="its document is not this one"):
             write(changed, tmp_path / "out", source)
+
+    def test_a_bundle_of_the_older_format_is_not_this_writes(self, tmp_path, source, fast_render):
+        # Format 5.0 (datagrunt 5.0 to 5.2), of this datagrunt's version and parameters: its own loaded document
+        # included, which a format check alone tells from this write's (it records no image-only reasons).
+        out = tmp_path / "out"
+        document = bound_document(source)
+        write(document, out, source)
+        as_bundle_5_0(out)
+        old = load_bundle(out)
+        before = tree_of(out)
+        for given in (document, old):
+            with pytest.raises(FileExistsError, match=r"its bundle format is '5\.0', not '5\.3'"):
+                write(given, out, source)
+        assert tree_of(out) == before and leftovers(tmp_path) == []
+
+    def test_overwrite_replaces_a_bundle_of_the_older_format_with_this_one(self, tmp_path, source, fast_render):
+        out = tmp_path / "out"
+        write(bound_document(source), out, source)
+        as_bundle_5_0(out)
+        old = load_bundle(out)
+        replaced = write(old, out, source, overwrite=True)
+        manifest = manifest_of(out)
+        assert (manifest["bundle_format_version"], manifest["image_only_pages"]) == ("5.3", [])
+        data = json.loads((out / "json" / "document.json").read_bytes())
+        assert data["version"] == 2 and [page["image_only_reasons"] for page in data["pages"]] == [None] * 4
+        assert load_bundle(out) == replaced and [page.image_only_reasons for page in replaced.pages] == [None] * 4
+        assert leftovers(tmp_path) == []
 
 
 # A version an editable install's metadata can still hold after the code moved on: installed metadata is stale there.

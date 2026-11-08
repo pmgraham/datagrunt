@@ -5,9 +5,17 @@ Internal: not exported from ``datagrunt`` or ``datagrunt.pdf``. A7b's
 DuckDB) stand on it.
 
 :func:`element_frame` is the spec's unified schema (:data:`FRAME_SCHEMA`),
-in document order (page, then reading order), plus ``hidden_reasons``, a v5
-column the spec's frame lacks: hidden text is flagged, never dropped, so a
-frame consumer filters it out by this column (an empty list is visible).
+in document order (page, then reading order), plus two v5 columns the
+spec's frame lacks. ``hidden_reasons``: hidden text is flagged, never
+dropped, so a frame consumer filters it out by this column (an empty list
+is visible). ``image_only_reasons`` (#470): a non-empty list marks a row of
+a page whose content lives only in its page image (its text could not
+stand, and nothing read the image); an empty list, a page whose text stands
+or OCR read; null, a page whose reasons were not recorded (a document from
+datagrunt 5.0 to 5.2). A page with no elements has no row, so the frame
+cannot name it (an image-only page often has none):
+``PDFDocument.image_only_pages`` and the bundle manifest's
+``image_only_pages`` list every one.
 
 Each column's source:
 
@@ -17,7 +25,8 @@ Each column's source:
 - ``kind``: the element's type (``BulletList`` is ``"list"``).
 - ``text``: :func:`element_text`.
 - ``markdown``: the element's ``to_markdown()``.
-- ``route``, ``integrity_verified``: the element's page's.
+- ``route``, ``integrity_verified``, ``image_only_reasons``: the element's
+  page's (``Page.image_only_reasons``, a list; null when it is None).
 
 A lone surrogate, which PDF text keeps (preserve, not transform), cannot be
 held by a polars or Arrow string (both are UTF-8). Every string the frame
@@ -90,6 +99,7 @@ _COLUMNS: dict[str, pl.DataType] = {
     "route": pl.Enum(list(PAGE_ROUTES)),
     "integrity_verified": pl.Boolean(),
     "hidden_reasons": pl.List(pl.String),
+    "image_only_reasons": pl.List(pl.String),
 }
 FRAME_SCHEMA = pl.Schema(_COLUMNS)
 
@@ -109,6 +119,7 @@ ARROW_SCHEMA = pa.schema(
         ("route", _ENUM),
         ("integrity_verified", pa.bool_()),
         ("hidden_reasons", pa.large_list(pa.large_string())),
+        ("image_only_reasons", pa.large_list(pa.large_string())),
     ]
 )
 
@@ -197,3 +208,5 @@ def _append_row(columns: dict[str, list[object]], element: DocumentElement, page
     columns["route"].append(page.route)
     columns["integrity_verified"].append(page.integrity_verified)
     columns["hidden_reasons"].append(list(element.hidden_reasons))
+    reasons = page.image_only_reasons
+    columns["image_only_reasons"].append(None if reasons is None else list(reasons))

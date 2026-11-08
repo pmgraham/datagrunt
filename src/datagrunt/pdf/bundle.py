@@ -61,10 +61,23 @@ Layout (paths relative to the bundle, joined with ``/``):
   (``datagrunt.__version__``),
   the source's sha256, the extraction parameters (``dpi``, ``vision_dpi``,
   ``max_render_pixels``, ``workers``, then the caller's
-  ``extraction_params``), ``integrity_verified`` and ``degraded_pages``,
-  each page image's origin, DPI and ``contrast_normalized`` (by page),
-  every other file's path, size and sha256 (by path), and each artifact
-  that is missing and why (by page).
+  ``extraction_params``), ``integrity_verified``, ``degraded_pages`` and
+  ``image_only_pages`` (#470: ``PDFDocument.image_only_pages``, the pages
+  whose content lives only in their page image, which the element rows
+  cannot name when a page has no elements), each page image's origin, DPI
+  and ``contrast_normalized`` (by page), every other file's path, size and
+  sha256 (by path), and each artifact that is missing and why (by page).
+
+Formats: :data:`BUNDLE_FORMAT_VERSION`, ``"5.3"`` (#470), is written: its
+manifest holds ``image_only_pages`` and its ``json/document.json`` is codec
+version 2 (each page's ``image_only_reasons``). ``"5.0"``, which datagrunt
+5.0 to 5.2 wrote, still loads: its manifest holds exactly its own keys (no
+``image_only_pages``) and its document JSON must be codec version 1, so
+each page's ``image_only_reasons`` reads None (not recorded); the rest is
+checked as a 5.3 bundle's is. Each format's document JSON must be its own
+codec version. A loaded 5.0 bundle's document writes as format 5.3 (its
+pages' reasons null, ``image_only_pages`` empty). Any other format is
+refused.
 
 PNGs are encoded with Pillow (the bundle's renders here; figures and own
 page images by their loaders); PDF content is decoded only by A1's loaders
@@ -84,9 +97,11 @@ document's sha256).
 
 A bundle already at ``output_dir`` is reused when it is this write's
 (:func:`_existing`): it loads and verifies (:func:`load_bundle`), its
-manifest's datagrunt version is this one's, its source sha256 the
-document's, its extraction parameters this write's, and its document this
-one (the pages the bundle rendered compared without their page image).
+format is :data:`BUNDLE_FORMAT_VERSION` (a 5.0 bundle, which loads, is
+never this write's), its manifest's datagrunt version is this one's, its
+source sha256 the document's, its extraction parameters this write's, and
+its document this one (the pages the bundle rendered compared without their
+page image).
 Its document is then returned as :func:`load_bundle` returns it, and
 nothing is written. Any other bundle there is a FileExistsError naming why,
 unless ``overwrite`` is True (a reusable bundle is reused either way).
@@ -179,8 +194,8 @@ Known limitations, documented:
 and returns the document. Nothing is trusted before it is checked:
 
 1. The manifest (opened as an artifact is, read within the asset limit,
-   strict JSON): its version (:data:`BUNDLE_FORMAT_VERSION`), its keys
-   (exactly, at every level) and values; every artifact path through
+   strict JSON): its version (a format above), its keys (exactly its
+   format's, at every level) and values; every artifact path through
    :func:`~datagrunt.pdf.codec.contained_path` (plain relative parts,
    resolved inside the bundle: no ``..``, absolute path or symlink out),
    listed once, ``json/document.json``, ``json/elements.jsonl`` and
@@ -194,9 +209,10 @@ and returns the document. Nothing is trusted before it is checked:
    are read from the same descriptor, in chunks, at most that size plus one
    byte, and must hash to the manifest's sha256. ``json/document.json`` is
    decoded from the bytes verified, not read again.
-3. The document (the codec, its paths joined to the bundle by the same
-   helper): the manifest's source sha256, ``integrity_verified`` and
-   ``degraded_pages`` must be its; every path it names must be a verified
+3. The document (the codec, of its format's version only; its paths joined
+   to the bundle by the same helper): the manifest's source sha256,
+   ``integrity_verified``, ``degraded_pages`` and (format 5.3)
+   ``image_only_pages`` must be its; every path it names must be a verified
    artifact; the manifest's page images must be its (the same pages, DPI
    and ``contrast_normalized``; a rendered one without bands); the
    manifest must list a ``markdown/pages/page_NNNN.md`` for each of its
@@ -547,6 +563,8 @@ def _existing(target: Path, document: PDFDocument, params: Mapping[str, object])
         manifest, loaded = _loaded(target)
     except (BundleCorruptError, OSError) as exc:
         return None, f"it is not a valid bundle: {exc}"
+    if manifest.bundle_format_version != BUNDLE_FORMAT_VERSION:
+        return None, f"its bundle format is {manifest.bundle_format_version!r}, not {BUNDLE_FORMAT_VERSION!r}"
     version = _datagrunt_version()
     if manifest.datagrunt_version != version:
         return None, f"it was written by datagrunt {manifest.datagrunt_version}, not {version}"
@@ -1124,6 +1142,7 @@ def _manifest(
         "extraction_params": dict(params),
         "integrity_verified": document.integrity_verified,
         "degraded_pages": list(document.degraded_pages),
+        "image_only_pages": list(document.image_only_pages),
         "page_images": images,
         "artifacts": [entry._asdict() for entry in sorted(ledger.artifacts)],
         "missing": [entry._asdict() for entry in sorted(ledger.missing, key=_missing_order)],

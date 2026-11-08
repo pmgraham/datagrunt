@@ -3,14 +3,17 @@
 :func:`rich_document` holds every element type and every field: ``None``
 values, empty tuples, hidden and off-page elements, a continued table,
 duplicate figures, sections, header context, a page image, a vision page and
-an error page. :func:`surrogate_document` holds lone surrogates, which PDF
-text keeps (preserve, not transform) and UTF-8 cannot encode.
+an error page. :func:`image_only_document` is it with every kind of page
+``image_only_reasons`` (#470). :func:`surrogate_document` holds lone
+surrogates, which PDF text keeps (preserve, not transform) and UTF-8 cannot
+encode.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from datagrunt.pdf.elements import (
     BBox,
@@ -216,6 +219,24 @@ def rich_document(
         sections=sections,
         header_context=one[:2],
     )
+
+
+def with_image_only(document: PDFDocument, reasons: Mapping[int, tuple[str, ...] | None]) -> PDFDocument:
+    """``document`` whose pages named in ``reasons`` (by number) have those ``image_only_reasons``."""
+    pages = tuple(
+        dataclasses.replace(item, image_only_reasons=reasons[item.page_number]) if item.page_number in reasons else item
+        for item in document.pages
+    )
+    return dataclasses.replace(document, pages=pages)
+
+
+# image_only_document's pages' reasons: not recorded, both text shortfalls, one, and an error page's.
+IMAGE_ONLY = {1: None, 2: ("too_little_text", "garbled_text"), 3: ("too_little_text",), 4: ("extraction_failed",)}
+
+
+def image_only_document() -> PDFDocument:
+    """rich_document whose pages hold every kind of ``image_only_reasons`` (:data:`IMAGE_ONLY`)."""
+    return with_image_only(rich_document(), IMAGE_ONLY)
 
 
 def surrogate_document() -> PDFDocument:

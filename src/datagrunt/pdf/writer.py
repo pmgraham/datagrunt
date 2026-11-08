@@ -35,11 +35,12 @@ Each method writes the document in one form. A path returned is absolute
   read back by :func:`~datagrunt.pdf.codec.document_from_json_bytes`).
 - :meth:`PDFWriter.write_jsonl`: one JSON object a line, each element's row
   of A7a's frame (:func:`~datagrunt.pdf.frame.element_frame`), in document
-  order: its columns in order, ``bbox`` an object, ``scope_path`` and
-  ``hidden_reasons`` arrays. Compact UTF-8 JSON, each line ending in a
-  newline; a document without elements is an empty file. The frame's
-  strings hold each lone surrogate as its escape (``\\ud800``): the JSON is
-  the lossless form.
+  order: its columns in order, ``bbox`` an object, ``scope_path``,
+  ``hidden_reasons`` and ``image_only_reasons`` arrays (the last null for
+  a page whose reasons were not recorded). Compact UTF-8 JSON, each line
+  ending in a newline; a document without elements is an empty file. The
+  frame's strings hold each lone surrogate as its escape (``\\ud800``): the
+  JSON is the lossless form.
 - :meth:`PDFWriter.write_markdown`: the document's ``to_markdown()``, UTF-8,
   each lone surrogate written as its escape (as the bundle's Markdown).
   Hidden elements are omitted by default; with ``include_hidden=True`` each
@@ -49,9 +50,12 @@ Each method writes the document in one form. A path returned is absolute
 - :meth:`PDFWriter.write_csv`: the frame flattened (:func:`_csv_frame`),
   by polars (its keyword arguments passed on), because CSV cannot hold a
   List or Struct column: ``bbox`` becomes ``bbox_x0``, ``bbox_y0``,
-  ``bbox_x1`` and ``bbox_y1`` in its place, and ``scope_path`` and
-  ``hidden_reasons`` compact JSON-array strings (``["Intro","Details"]``,
-  ``[]`` for none). Every value is written as it is (preserve, not
+  ``bbox_x1`` and ``bbox_y1`` in its place, and ``scope_path``,
+  ``hidden_reasons`` and ``image_only_reasons`` compact JSON-array strings
+  (``["Intro","Details"]``, ``[]`` for none). A null ``image_only_reasons``
+  (not recorded) stays null, which polars writes as its ``null_value``: an
+  empty cell by default, never ``[]`` (none) or a string a reader would
+  take for a list. Every value is written as it is (preserve, not
   transform): a cell that starts with ``=``, ``+``, ``-`` or ``@`` is not
   escaped against spreadsheet formula injection. Guarding a spreadsheet
   that opens the CSV is the application's concern.
@@ -170,8 +174,8 @@ _LOGGER = logging.getLogger(__name__)
 
 # A temporary file's name: this, then a uuid4's hex (the bundle's staging prefix).
 _TEMPORARY_PREFIX = ".tmp_"
-# The frame's List columns, which a CSV holds as JSON-array strings.
-_LIST_COLUMNS = ("scope_path", "hidden_reasons")
+# The frame's List columns, which a CSV holds as JSON-array strings (a null as polars writes one).
+_LIST_COLUMNS = ("scope_path", "hidden_reasons", "image_only_reasons")
 
 
 class PDFWriter:
@@ -510,14 +514,15 @@ def _write_bytes(target: Path, data: bytes) -> Path:
 def _csv_frame(frame: pl.DataFrame) -> pl.DataFrame:
     """A7a's ``frame`` flattened for CSV: ``bbox`` as four columns in its place, the List columns JSON arrays.
 
-    See the module notes. The other columns are as they are.
+    A null list stays null. See the module notes. The other columns are as they are.
     """
     columns: list[pl.Expr | pl.Series] = []
     for name in frame.columns:
         if name == "bbox":
             columns.extend(pl.col(name).struct.field(field).alias(f"bbox_{field}") for field in _BBOX_FIELDS)
         elif name in _LIST_COLUMNS:
-            columns.append(pl.Series(name, [_json_array(items) for items in frame[name].to_list()], dtype=pl.String))
+            cells = [None if items is None else _json_array(items) for items in frame[name].to_list()]
+            columns.append(pl.Series(name, cells, dtype=pl.String))
         else:
             columns.append(pl.col(name))
     return frame.select(columns)
