@@ -771,7 +771,7 @@ class TestScopePath:
                 PageSpec(items=(TextRun("Appendix", 72.0, 60.0, size=18.0), *prose(100.0))),
             ],
         )
-        doc = PDFReader(path).document
+        doc = PDFReader(path, ocr="auto").document
         owner = {element.element_id: item for item in doc.sections for element in item.elements}
 
         assert {item.scope_path for item in doc.sections} >= {("Annual Report",), ("Annual Report", "Details")}
@@ -917,13 +917,13 @@ class TestNoText:
         (tmp_path / "empty-path").mkdir()
         monkeypatch.setenv("PATH", str(tmp_path / "empty-path"))  # no tesseract: OCR cannot run
 
-        doc = PDFReader(alone).document
+        doc = PDFReader(alone, ocr="auto").document
         assert [(item.status, item.route) for item in doc.pages] == [("ocr_unavailable", "vision")]
         plan = build_units(doc, max_unit_chars=BIG, render=never)
         assert plan.units == ()
         assert [(item.reason, item.page_numbers) for item in plan.skipped] == [("no_text", (1,))]
 
-        mixed = PDFReader(after_text).document
+        mixed = PDFReader(after_text, ocr="auto").document
         plan = build_units(mixed, max_unit_chars=BIG, render=markdown)
         assert plan.skipped == ()
         assert [unit.page_numbers for unit in plan.units] == [(1, 2)]

@@ -34,12 +34,7 @@ class WalkBoundHit(Exception):
 
 def object_address(pointer: pdfium_c.FPDF_PAGEOBJECT) -> int:
     """The address a pdfium object pointer holds (0 for NULL), to compare objects."""
-    if not pointer:
-        return 0
-    try:
-        return ctypes.addressof(pointer.contents)
-    except AttributeError:
-        return ctypes.cast(pointer, ctypes.c_void_p).value or 0
+    return ctypes.addressof(pointer.contents) if pointer else 0
 
 
 def read_rgba(
