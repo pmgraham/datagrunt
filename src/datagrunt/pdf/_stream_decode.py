@@ -46,7 +46,6 @@ its end even after the next one stops, as pdfium decodes it in full. Each
 piece decoded is passed to ``charge`` (the page's stream budget).
 """
 
-import base64
 import string
 import zlib
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -76,6 +75,10 @@ _EARLY_CHANGES = (1, 0)
 _LZW_WIDTHS = MappingProxyType({254: 10, 766: 11, 1790: 12})
 
 _ASCII85_DIGITS = bytes(range(ord("!"), ord("u") + 1))
+# Each byte's digit value (``!`` is 0): only digits reach it, so the others' wrapped values are never read.
+_ASCII85_VALUES = bytes((value - ord("!")) % 256 for value in range(256))
+# A group's digits' place values, its first digit the most significant.
+_ASCII85_WEIGHTS = (85**4, 85**3, 85**2, 85, 1)
 _ASCII85_SPACE = b" \t\r\n"
 _HEX_DIGITS = string.hexdigits.encode()
 _NOT_HEX = bytes(value for value in range(256) if value not in _HEX_DIGITS)
@@ -320,11 +323,34 @@ class _Ascii85:
 
 
 def _groups(text: bytes) -> bytes:
-    """Whole 5-character ASCII85 groups (no ``z``) decoded."""
-    try:
-        return base64.a85decode(text)
-    except ValueError as exc:
-        raise Unchecked("ASCII85Decode data holds a group over 2**32 - 1") from exc
+    """Whole 5-character ASCII85 groups (no ``z``) decoded, all at once.
+
+    ``base64.a85decode`` reads a character at a time in Python. Here each
+    group is a 64-bit lane of one big integer: the groups' k-th digits are
+    laid in the low byte of their lanes and summed in, each times its power
+    of 85, so a lane ends holding its group's value (at most ``85**5 - 1``,
+    under 2**33: no lane carries into the next). A group's 4 bytes are the
+    low half of its lane; a group over ``2**32 - 1`` has a bit in the high
+    half.
+    """
+    count, odd = divmod(len(text), 5)
+    if odd or text.translate(None, _ASCII85_DIGITS):
+        raise Unchecked("ASCII85Decode data holds a partial group or a byte outside the groups")
+    if not count:
+        return b""
+    digits = text.translate(_ASCII85_VALUES)
+    lanes = bytearray(8 * count)
+    total = 0
+    for place, weight in enumerate(_ASCII85_WEIGHTS):  # bounded: the 5 digits of a group
+        lanes[7::8] = digits[place::5]
+        total += int.from_bytes(lanes, "big") * weight
+    wide = total.to_bytes(8 * count, "big")
+    if wide[3::8].count(0) != count:
+        raise Unchecked("ASCII85Decode data holds a group over 2**32 - 1")
+    out = bytearray(4 * count)
+    for offset in range(4):  # bounded: the 4 bytes of a group
+        out[offset::4] = wide[4 + offset :: 8]
+    return bytes(out)
 
 
 class _AsciiHex:

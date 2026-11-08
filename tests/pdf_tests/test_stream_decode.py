@@ -291,6 +291,26 @@ class TestAscii85:
     def test_ascii85_decodes_as_pdfium_does(self, tmp_path, raw):
         assert decoded(raw, A85) == pdfium_decoded(tmp_path, raw, b"/ASCII85Decode")
 
+    @pytest.mark.parametrize("size", [0, 4, 8, 400, 4 * 5000 + 4])
+    def test_groups_decode_as_the_standard_library_does(self, size):
+        data = random.Random(size).randbytes(size)
+        text = base64.a85encode(data).replace(b"z", b"!!!!!")
+        assert _stream_decode._groups(text) == base64.a85decode(text) == data
+
+    @pytest.mark.parametrize("text", [b"s8W-!", b"!!!!!s8W-!", b"s8W,u"])
+    def test_groups_up_to_2_32_minus_1_decode(self, text):
+        assert _stream_decode._groups(text) == base64.a85decode(text)
+
+    @pytest.mark.parametrize("text", [b's8W-"', b"!!!!!uuuuu", b"s8W.!!!!!!"])
+    def test_a_group_over_2_32_minus_1_is_unchecked(self, text):
+        with pytest.raises(Unchecked, match=re.escape("a group over 2**32 - 1")):
+            _stream_decode._groups(text)
+
+    def test_a_long_stream_decodes_whole_across_chunks(self):
+        data = random.Random(5).randbytes(3 * CHUNK + 12)
+        raw = base64.a85encode(data, wrapcol=75) + b"~>"
+        assert decoded(raw, A85, limit=len(data)) == data
+
 
 class TestAsciiHex:
     def test_the_length_is_the_decoded_length(self):
