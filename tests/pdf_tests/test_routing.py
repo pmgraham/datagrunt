@@ -992,6 +992,8 @@ class TestImageOnlyReasons:
     def test_text_that_stands_records_none(self, spans, page, ocr):
         assert assess(*spans, ocr=ocr, **page).image_only_reasons == ()
 
+
+class TestUnmappedRegions:
     """Maximal runs of invalid chars in visible pieces keep their geometry for OCR (A5)."""
 
     def test_no_invalid_chars_no_regions(self):

@@ -234,9 +234,11 @@ def check_image_only_reasons(value: object, *, allowed: tuple[ImageOnlyReason, .
     (:mod:`datagrunt.pdf.quality`), which allow only its routing shortfalls.
 
     Raises:
-        TypeError: If ``value`` is not a tuple of str.
-        ValueError: If a reason is not one of ``allowed``, is repeated, or is out of canonical order.
+        TypeError: If ``value`` or ``allowed`` is not a tuple of str.
+        ValueError: If ``allowed`` holds a reason that is not an ``ImageOnlyReason`` or holds one twice, or a
+            reason in ``value`` is not one of ``allowed``, is repeated, or is out of canonical order.
     """
+    _check_canonical_reasons("allowed", str_tuple("allowed", allowed), IMAGE_ONLY_REASONS)
     known = tuple(reason for reason in IMAGE_ONLY_REASONS if reason in allowed)
     _check_canonical_reasons("image_only_reasons", str_tuple("image_only_reasons", value), known)
 

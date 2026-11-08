@@ -169,6 +169,8 @@ class TestNeverMarksEachPageWithItsReasons:
             page.image_only_reasons for page in extracted(name, "never").pages
         ]
         assert reader.document.image_only_pages == extracted(name, "never").image_only_pages
+        # Pinned, so the comparison above cannot pass with both sides unmarked (#470 review).
+        assert reader.document.image_only_pages == {"mixed": (2, 4, 5), "garbled": (1,)}[name]
 
 
 @needs_tesseract
