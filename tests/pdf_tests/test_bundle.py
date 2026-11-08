@@ -1495,6 +1495,17 @@ class TestReuse:
         assert again == first == load_bundle(tmp_path / "out")
         assert [figure.read_bytes() for figure in again.figures] == [PNG_A, PNG_A, PNG_B]
 
+    def test_a_bundle_written_with_another_workers_count_is_reused(self, tmp_path, source, fast_render):
+        # workers sets how many pages run at once, never what is written (its default is the machine's CPU
+        # count): a bundle another machine wrote with another count is this write's bundle, returned unwritten.
+        first = write(bound_document(source), tmp_path / "out", source, workers=3)
+        before = tree_of(tmp_path / "out")
+
+        again = write(bound_document(source), tmp_path / "out", source, workers=1)
+
+        assert tree_of(tmp_path / "out") == before and leftovers(tmp_path) == []
+        assert again == first == load_bundle(tmp_path / "out")
+
     def test_overwrite_reuses_a_matching_bundle_too(self, tmp_path, source, fast_render):
         write(bound_document(source), tmp_path / "out", source)
         before = tree_of(tmp_path / "out")

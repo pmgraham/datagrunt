@@ -418,10 +418,14 @@ visible = reader.to_dataframe().filter(pl.col("hidden_reasons").list.len() == 0)
 
 ### Scanned pages and OCR
 
-Each page is routed `digital`, `hybrid`, or `vision` (`page.route`). A vision
-page (a scan, or a page with too little text or mostly unreadable characters)
-is rendered at `vision_dpi` and read by the **Tesseract** program; there is no
-Python wrapper. The page's own digital text is kept, flagged `superseded`.
+OCR is off by default (`ocr="never"`): a bundle keeps every page's image, so a
+scan's content is never lost, and `page.image_only_reasons` (below) marks the
+pages whose content lives only there. Pass `ocr="auto"` to read those pages
+with OCR. Under `ocr="auto"` each page is routed `digital`, `hybrid`, or
+`vision` (`page.route`). A vision page (a scan, or a page with too little text
+or mostly unreadable characters) is rendered at `vision_dpi` and read by the
+**Tesseract** program; there is no Python wrapper. The page's own digital text
+is kept, flagged `superseded`.
 
 Install Tesseract with its English (`eng`) and orientation (`osd`) data, e.g.
 `brew install tesseract` on macOS or `apt-get install tesseract-ocr` on
@@ -486,8 +490,8 @@ Extraction is always complete: a bad page is recorded, never dropped. Pass
 reader = PDFReader(
     "report.pdf",
     password=None,                  # an encrypted PDF's password
-    workers=1,                      # processes to extract pages with
-    ocr="auto",                     # "auto", "always" (every page to OCR), or "never"
+    workers=os.cpu_count(),         # processes to extract (and threads to render) pages with
+    ocr="never",                    # "never", "auto" (pages without usable text to OCR), or "always"
     dpi=200,                        # page images (render_pages_as_images, bundles)
     vision_dpi=300,                 # pages read by OCR; at least dpi
     max_render_pixels=16_000_000,   # caps every render: a huge page gets a lower DPI
@@ -504,8 +508,10 @@ slivers); it must be at least 1.
 ### Parallel processing
 
 Every PDF is parsed in worker processes, never in your own: pages are
-extracted in `workers` processes (one when `workers=1`) and come back in page
-order, and figure reads and page renders run in workers too. Each worker is a
+extracted in `workers` processes (by default one per CPU; one when
+`workers=1`) and come back in page order, and figure reads and page renders run
+in workers too. `workers` never changes the output, so a bundle or corpus
+written with another count (on a machine with other CPUs, say) is reused. Each worker is a
 fresh, isolated `python` process with a memory cap (2 GiB), and it never imports
 your script, so no `if __name__ == "__main__":` guard is needed. A page that
 passes the cap, or its time bound, becomes an error page with the reason; the

@@ -28,6 +28,7 @@ from datagrunt.pdf._bundle_load import (
     _opened,
     _read_fd,
     _regular,
+    _same_output_params,
     load_bundle,
 )
 from datagrunt.pdf._extra import load as _load_extra
@@ -421,7 +422,8 @@ def _reused_entry(
     """Return a ``reused=True`` entry if ``bundle_dir`` holds a valid matching bundle.
 
     Matching means this datagrunt's version and bundle format (an older format, 5.0, records no image-only
-    reasons: #470), the item's source sha256, doc id and name, and the expected extraction parameters.
+    reasons: #470), the item's source sha256, doc id and name, and the expected extraction parameters but for
+    ``workers``, which changes no output (``_bundle_load._same_output_params``).
     """
     try:
         manifest, doc = _loaded(bundle_dir)
@@ -431,7 +433,7 @@ def _reused_entry(
         return None
     if manifest.bundle_format_version != BUNDLE_FORMAT_VERSION:
         return None
-    if manifest.source_sha256 != item.sha256 or manifest.extraction_params != expected_params:
+    if manifest.source_sha256 != item.sha256 or not _same_output_params(manifest.extraction_params, expected_params):
         return None
     if doc.metadata.doc_id != item.doc_id or doc.metadata.source_name != item.source_name:
         return None

@@ -90,6 +90,9 @@ _MANIFEST_KEYS = (
     "missing",
 )
 _PARAM_KEYS = ("dpi", "vision_dpi", "max_render_pixels", "workers")
+# The extraction_params that set how a write runs, never what it writes: workers (how many pages run at once,
+# by default the machine's CPU count). The manifest records them; whether a bundle is reused ignores them.
+_RUN_PARAM_KEYS = ("workers",)
 _MISSING_ARTIFACTS = ("bands", "figure", "page_image")
 # Where a page image came from: the document's own (its loaders), or the bundle's render at dpi.
 _ORIGINS = ("document", "render")
@@ -310,6 +313,15 @@ def _check_params(value: object) -> None:
     for key, item in value.items():
         if key not in _PARAM_KEYS:
             _json_scalar(f"extraction_params[{key!r}]", item)
+
+
+def _same_output_params(recorded: Mapping[str, object], wanted: Mapping[str, object]) -> bool:
+    """Whether two extraction_params write the same bundle: equal but for the run parameters (_RUN_PARAM_KEYS)."""
+    if not isinstance(recorded, Mapping) or not isinstance(wanted, Mapping):
+        raise TypeError("extraction_params must be Mappings")
+    return {k: v for k, v in recorded.items() if k not in _RUN_PARAM_KEYS} == {
+        k: v for k, v in wanted.items() if k not in _RUN_PARAM_KEYS
+    }
 
 
 def _image_entries(value: object) -> tuple[_ImageEntry, ...]:

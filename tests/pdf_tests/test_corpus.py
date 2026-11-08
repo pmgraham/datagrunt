@@ -205,6 +205,18 @@ class TestBatchExtractionAndLoading:
         assert all(not e.reused for e in third.entries)
         assert third.load_documents() == first.load_documents()
 
+    def test_a_rerun_with_another_workers_count_reuses_the_bundles(self, tmp_path, sample_pdfs):
+        # workers changes no output (its default is the machine's CPU count): a corpus extracted on a machine
+        # with other CPUs is reused, not extracted again.
+        pdf_a, pdf_b = sample_pdfs
+        out = tmp_path / "corpus"
+        first = extract_corpus([pdf_a, pdf_b], out, dpi=72, vision_dpi=72, workers=2)
+
+        second = extract_corpus([pdf_a, pdf_b], out, dpi=72, vision_dpi=72, workers=1)
+
+        assert [e.reused for e in second.entries] == [True, True]
+        assert second.load_documents() == first.load_documents()
+
     def test_a_bundle_of_the_older_format_is_not_reused(self, tmp_path, sample_pdfs):
         # A format 5.0 bundle (datagrunt 5.0 to 5.2) of this version and parameters records no image-only
         # reasons: it is written again, never reused (#470 review; bundle._existing's rule).

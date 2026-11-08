@@ -147,7 +147,7 @@ import uuid
 import warnings
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, NamedTuple
 
 import polars as pl
 
@@ -588,40 +588,51 @@ def _write_renders(
 ) -> list[Path]:
     """Render and write every page on ``workers`` threads (the bundle's window); the paths written, in page order.
 
-    The image-only pages skipped are named in one warning, with the document and ``directory`` (#471).
+    A page not rendered is logged once every page has ended, in page order, whatever order the threads end in
+    (as a bundle records its missing pages). The image-only pages among them are named in one warning, with the
+    document and ``directory`` (#471).
     """
     pages = document.pages
 
-    def task(page: Page) -> Callable[[], Path | None]:
+    def task(page: Page) -> Callable[[], _Render]:
         return _stage_rendered(page, directory, source, dpi, options.max_render_pixels)
 
     with render_worker_pool():
         outcomes = _in_page_order(task, pages, options.workers, "datagrunt-writer", finish=lambda finalize: finalize())
+    for page, outcome in zip(pages, outcomes, strict=True):
+        if outcome.path is None:
+            _LOGGER.warning("page %d was not rendered: %s", page.page_number, outcome.failure)
     unrendered = [
-        page.page_number for page, path in zip(pages, outcomes, strict=True) if path is None and page.image_only_reasons
+        page.page_number
+        for page, outcome in zip(pages, outcomes, strict=True)
+        if outcome.path is None and page.image_only_reasons
     ]
     if unrendered:
         unsaved = f"render_pages_as_images could not render into {directory} (the {_LOGGER.name} log says why)"
         notice = _only_copy_notice(document.metadata.source_name, unrendered, unsaved)
         warnings.warn(notice, UserWarning, stacklevel=3)
-    return [path for path in outcomes if path is not None]
+    return [outcome.path for outcome in outcomes if outcome.path is not None]
 
 
-def _stage_rendered(
-    page: Page, directory: Path, source: PDFSource, dpi: int, max_pixels: int
-) -> Callable[[], Path | None]:
-    """Render ``page`` at the effective DPI of ``dpi`` and return a closure that writes its PNG."""
+class _Render(NamedTuple):
+    """One page's render: the PNG written, or None and why it was not (``"<exception type>: <message>"``)."""
+
+    path: Path | None
+    failure: str = ""
+
+
+def _stage_rendered(page: Page, directory: Path, source: PDFSource, dpi: int, max_pixels: int) -> Callable[[], _Render]:
+    """Render ``page`` at the effective DPI of ``dpi`` and return a closure that writes its PNG.
+
+    A refusal or failure is returned, never logged here: this runs on a worker thread, and the caller logs every
+    page's failure in page order.
+    """
     try:
         _, drawn = _drawn(source, page, dpi, max_pixels)
     except (RenderRefused, RenderFailed) as exc:
-        _LOGGER.warning("page %d was not rendered: %s: %s", page.page_number, type(exc).__name__, exc)
-        return lambda: None
-    return lambda: _write_png(directory / f"page_{page.page_number:04d}.png", drawn)
-
-
-def _rendered(page: Page, directory: Path, source: PDFSource, dpi: int, max_pixels: int) -> Path | None:
-    """Render ``page`` at the effective DPI of ``dpi`` and write its PNG; None, with a warning, if it is not."""
-    return _stage_rendered(page, directory, source, dpi, max_pixels)()
+        unrendered = _Render(None, f"{type(exc).__name__}: {exc}")
+        return lambda: unrendered
+    return lambda: _Render(_write_png(directory / f"page_{page.page_number:04d}.png", drawn))
 
 
 def _write_png(target: Path, image: RenderedPage) -> Path:

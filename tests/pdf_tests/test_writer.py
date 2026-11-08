@@ -1044,6 +1044,31 @@ class TestRenderPagesAsImages:
             "page 3 was not rendered: RenderFailed: page 3: the worker was killed",
         ]
 
+    def test_the_warnings_follow_page_order_whichever_render_fails_first(self, tmp_path, monkeypatch, caplog):
+        # Pages render on `workers` threads, so page 3 can fail before page 2 does: the warnings still name the
+        # pages in page order, as a bundle's missing entries do, whatever order the renders end in.
+        caplog.set_level(logging.WARNING, logger=WRITER_LOGGER)
+        page_3_failed = threading.Event()
+
+        def failing(src, page_index, **kwargs):
+            if page_index == 1:
+                assert page_3_failed.wait(timeout=10)
+                time.sleep(0.3)  # page 3's failure is fully handled before page 2's starts
+                raise RenderRefused("page 2: refused after page 3 failed")
+            if page_index == 2:
+                page_3_failed.set()
+                raise RenderFailed("page 3: the worker was killed")
+            return fake_render(src, page_index, **kwargs)
+
+        monkeypatch.setattr(bundle, "render_page", failing)
+        writer = PDFWriter(source_pdf(tmp_path), ocr="never", dpi=72, workers=4)
+        paths = writer.render_pages_as_images(tmp_path / "pages")
+        assert paths == page_files(tmp_path / "pages", (1, 4))
+        assert warnings_of(caplog) == [
+            "page 2 was not rendered: RenderRefused: page 2: refused after page 3 failed",
+            "page 3 was not rendered: RenderFailed: page 3: the worker was killed",
+        ]
+
     def test_an_effective_dpi_refusal_is_skipped_with_a_warning(self, tmp_path, monkeypatch, caplog):
         caplog.set_level(logging.WARNING, logger=WRITER_LOGGER)
         spied_renders(monkeypatch)
