@@ -240,7 +240,7 @@ class TestTheMarkerIsCarried:
 
 def only_copy(*reasons: str) -> str:
     """The clause #471 appends to an image-only page's missing page image reason."""
-    return f"; its content lives only in its page image ({', '.join(reasons)}): the source PDF is its only copy"
+    return f"; its content lives only in its page image ({', '.join(reasons)}): the source PDF is its only full copy"
 
 
 def page_image_reasons(out: Path) -> list[tuple[int, str]]:
@@ -257,7 +257,7 @@ def only_copy_warnings(caught) -> list[str]:
 # The warning a bundle of the mixed document under render_pages=False emits: pages 2, 4 and 5 are marked.
 SKIPPED_MIXED = (
     "pages [2, 4, 5] hold content only in their page images, which this bundle does not write (render_pages=False); "
-    "the source PDF is their only copy"
+    "the source PDF is their only full copy"
 )
 
 
@@ -295,7 +295,7 @@ class TestABundleThatLeavesAnImageOnlyPageUnwrittenSaysSo:
         # Page 5 is a page pdfium cannot load: its render fails too, so no output holds it but the PDF.
         expected = (
             "pages [5] hold content only in their page images, which this bundle could not write "
-            "(manifest.json's missing entries say why); the source PDF is their only copy"
+            "(manifest.json's missing entries say why); the source PDF is their only full copy"
         )
         with pytest.warns(UserWarning, match=re.escape(expected)) as caught:
             write_bundle(extracted("mixed", "never"), tmp_path / "out", source=pdfs["mixed"], dpi=72)
@@ -319,7 +319,7 @@ class TestPageRendersThatSkipAnImageOnlyPageSaySo:
     def test_the_skipped_image_only_page_is_named_once(self, pdfs, tmp_path):
         expected = (
             "pages [5] hold content only in their page images, which render_pages_as_images could not render "
-            "(the datagrunt.pdf.writer log says why); the source PDF is their only copy"
+            "(the datagrunt.pdf.writer log says why); the source PDF is their only full copy"
         )
         writer = PDFWriter(pdfs["mixed"], ocr="never")
         with pytest.warns(UserWarning, match=re.escape(expected)) as caught:

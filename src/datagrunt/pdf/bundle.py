@@ -156,12 +156,12 @@ An image-only page (``PDFDocument.image_only_pages``, #470: its content
 lives only in its page image) whose page image is not written, whatever
 the cause (``render_pages=False``, ``include_images=False``, a render
 refused or failed, an own image unread or unbound), is in no artifact as
-a page: the source PDF is its only copy (#471). A figure on it (a scan's
-own picture) is still written as any figure is, unless
-``include_images=False``. The opt-out is honoured and nothing more is
+a page: the source PDF is its only full copy (#471). A figure on it (a
+scan's own picture) is still written as any figure is, unless
+``include_images=False``: a part of the page, never the page. The opt-out is honoured and nothing more is
 written; instead its ``missing`` page image entry's reason ends
 ``"; its content lives only in its page image (<its reasons, joined by
-', '>): the source PDF is its only copy"`` (every other entry is as it
+', '>): the source PDF is its only full copy"`` (every other entry is as it
 would be), and one ``UserWarning`` a write names those pages and the cause
 (the option, or the manifest's ``missing`` entries for the failures),
 emitted once the bundle is published (:func:`_mark_only_copies`).
@@ -430,7 +430,7 @@ def write_bundle(
             loaders are not bound to ``source`` (see the module notes); and
             once, naming the image-only pages (``document.image_only_pages``)
             whose page image is not written, whatever the cause: the source
-            PDF is their only copy (#471).
+            PDF is their only full copy (#471).
     """
     options = PipelineOptions(workers=workers, dpi=dpi, vision_dpi=vision_dpi, max_render_pixels=max_render_pixels)
     include_imgs = strict_bool("include_images", include_images)
@@ -714,12 +714,13 @@ def _skip_renders(document: PDFDocument, ledger: _Ledger, why: str) -> dict[int,
 
 
 def _mark_only_copies(document: PDFDocument, renders: Mapping[int, _Written], ledger: _Ledger, skipped: str) -> None:
-    """Say that the source PDF is the only copy of each unwritten image-only page: its missing entry, one warning.
+    """Say that the source PDF is the only full copy of each unwritten image-only page: its missing entry, one warning.
 
     An image-only page (#470) holds its content only in its page image: one
     the bundle does not write, whatever the cause, leaves the source PDF its
-    only copy (#471). Every other entry is left as it is. ``skipped`` is the
-    option that skipped every page image, or ``""``.
+    only full copy (#471): a figure on the page, if written, is a part of it.
+    Every other entry is left as it is. ``skipped`` is the option that
+    skipped every page image, or ``""``.
     """
     unwritten = {
         page.page_number: page.image_only_reasons
@@ -732,7 +733,9 @@ def _mark_only_copies(document: PDFDocument, renders: Mapping[int, _Written], le
         marks = unwritten.get(entry.page_number)
         if entry.artifact != "page_image" or marks is None:
             continue
-        clause = f"; its content lives only in its page image ({', '.join(marks)}): the source PDF is its only copy"
+        clause = (
+            f"; its content lives only in its page image ({', '.join(marks)}): the source PDF is its only full copy"
+        )
         ledger.missing[index] = entry._replace(reason=entry.reason + clause)
     unsaved = f"does not write ({skipped})" if skipped else "could not write (manifest.json's missing entries say why)"
     ledger.warnings.append(_only_copy_notice(sorted(unwritten), f"this bundle {unsaved}"))
@@ -740,7 +743,9 @@ def _mark_only_copies(document: PDFDocument, renders: Mapping[int, _Written], le
 
 def _only_copy_notice(pages: list[int], unsaved: str) -> str:
     """The warning that image-only ``pages``' page images were not written (``unsaved`` says by what, and why)."""
-    return f"pages {pages} hold content only in their page images, which {unsaved}; the source PDF is their only copy"
+    return (
+        f"pages {pages} hold content only in their page images, which {unsaved}; the source PDF is their only full copy"
+    )
 
 
 @dataclass

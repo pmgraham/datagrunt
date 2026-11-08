@@ -100,7 +100,7 @@ Each method writes the document in one form. A path returned is absolute
   skipped, never silently: a warning on the module logger names the page
   and why. The image-only pages skipped (``Page.image_only_reasons``,
   #470), whose content lives only in their page images, are also named in
-  one ``UserWarning`` a call: the source PDF is their only copy (#471, as
+  one ``UserWarning`` a call: the source PDF is their only full copy (#471, as
   the bundle warns). Any other error fails the call. The paths returned are
   the files written, in page order. The PDF rendered is the file at the
   source path when the call runs.
@@ -370,7 +370,7 @@ class PDFWriter:
                 extracts the document.
 
         Warns:
-            UserWarning: Once, naming the image-only pages skipped: the source PDF is their only copy (#471).
+            UserWarning: Once, naming the image-only pages skipped: the source PDF is their only full copy (#471).
         """
         source = self._required_source("render_pages_as_images")
         directory = _directory_target(output_dir)

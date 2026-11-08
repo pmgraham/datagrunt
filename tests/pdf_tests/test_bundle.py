@@ -1721,7 +1721,7 @@ class TestImageAndRenderSkipping:
 
 def only_copy(*reasons: str) -> str:
     """The clause #471 appends to an image-only page's missing page image reason."""
-    return f"; its content lives only in its page image ({', '.join(reasons)}): the source PDF is its only copy"
+    return f"; its content lives only in its page image ({', '.join(reasons)}): the source PDF is its only full copy"
 
 
 def page_image_reasons(out: Path) -> list[tuple[int, str]]:
@@ -1735,7 +1735,7 @@ def only_copy_warnings(caught) -> list[str]:
 
 
 class TestImageOnlyPagesLeftUnwritten:
-    """#471: an image-only page whose page image the bundle does not write: the source PDF is its only copy.
+    """#471: an image-only page whose page image the bundle does not write: the source PDF is its only full copy.
 
     Its ``missing`` page image entry says so; every other entry is as it was. Pages 2, 3 and 4 of
     ``with_image_only(bound_document(source), IMAGE_ONLY)`` are image-only; page 1's reasons are not recorded.
@@ -1785,7 +1785,7 @@ class TestImageOnlyPagesLeftUnwritten:
     def test_an_opt_out_warns_once_naming_the_pages(self, tmp_path, source, fast_render, flag):
         expected = (
             f"pages [2, 3, 4] hold content only in their page images, which this bundle does not write ({flag}=False); "
-            "the source PDF is their only copy"
+            "the source PDF is their only full copy"
         )
         with pytest.warns(UserWarning, match=re.escape(expected)) as caught:
             write(with_image_only(bound_document(source), IMAGE_ONLY), tmp_path / "out", source, **{flag: False})
@@ -1814,7 +1814,7 @@ class TestImageOnlyPagesLeftUnwritten:
         document = with_image_only(bound_document(source, image=b"GIF89a"), IMAGE_ONLY)
         expected = (
             "pages [2, 3] hold content only in their page images, which this bundle could not write "
-            "(manifest.json's missing entries say why); the source PDF is their only copy"
+            "(manifest.json's missing entries say why); the source PDF is their only full copy"
         )
         with pytest.warns(UserWarning, match=re.escape(expected)) as caught:
             returned = write(document, tmp_path / "out", source)
@@ -1840,7 +1840,7 @@ class TestImageOnlyPagesLeftUnwritten:
         assert [str(w.message) for w in caught] == [
             f"page 3's {unbound}: no page image is written for it",
             "pages [3] hold content only in their page images, which this bundle could not write "
-            "(manifest.json's missing entries say why); the source PDF is their only copy",
+            "(manifest.json's missing entries say why); the source PDF is their only full copy",
         ]
         assert page_image_reasons(tmp_path / "out") == [
             (
