@@ -25,6 +25,7 @@ from datagrunt.pdf._extra import LAZY_FUNCTIONS as _LAZY_FUNCTIONS
 from datagrunt.pdf._extra import load as _load
 from datagrunt.pdf.elements import (
     HIDDEN_REASONS,
+    IMAGE_ONLY_REASONS,
     PAGE_ROUTES,
     BBox,
     BulletList,
@@ -34,6 +35,7 @@ from datagrunt.pdf.elements import (
     Figure,
     Heading,
     HiddenReason,
+    ImageOnlyReason,
     KeyValue,
     Page,
     PageImage,
@@ -71,6 +73,8 @@ __all__ = [
     "DocumentElement",
     "HiddenReason",
     "HIDDEN_REASONS",
+    "ImageOnlyReason",
+    "IMAGE_ONLY_REASONS",
     "PageStatus",
     "PageRoute",
     "PAGE_ROUTES",

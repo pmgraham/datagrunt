@@ -409,6 +409,7 @@ class TestPageFields:
         assert page.integrity_verified is False
         assert page.error is None
         assert page.warnings == ()
+        assert page.image_only_reasons == ()
 
     def test_dimensions_coerced_to_float(self):
         page = _page(width_pt=612, height_pt=792)
@@ -600,6 +601,104 @@ class TestPageStatusInvariants:
             _page(status="ocr_unavailable", route=route)
 
 
+class TestPageImageOnlyReasons:
+    """#470: why a page's content lives only in its page image; () when its text stands, None when not recorded."""
+
+    @pytest.mark.parametrize(
+        ("bad", "match"),
+        [
+            (["too_little_text"], r"^image_only_reasons must be a tuple or None, got list$"),
+            ("too_little_text", r"^image_only_reasons must be a tuple or None, got str$"),
+            ((1,), r"^image_only_reasons\[0\] must be a str, got 1 \(int\)$"),
+        ],
+    )
+    def test_wrong_types_rejected_not_coerced(self, bad, match):
+        with pytest.raises(TypeError, match=match):
+            _page(image_only_reasons=bad)
+
+    def test_none_means_not_recorded_and_is_accepted(self):
+        # A document from datagrunt 5.0-5.2 never recorded the marker.
+        assert _page(image_only_reasons=None).image_only_reasons is None
+
+    @pytest.mark.parametrize("reasons", [("too_little_text",), ("garbled_text",), ("too_little_text", "garbled_text")])
+    def test_known_reasons_in_canonical_order_accepted(self, reasons):
+        assert _page(image_only_reasons=reasons).image_only_reasons == reasons
+
+    # A hidden reason is not an image-only reason.
+    @pytest.mark.parametrize("unknown", ["blurry", "superseded", "Too_Little_Text"])
+    def test_unknown_reason_rejected_naming_it_and_the_known_ones(self, unknown):
+        known = re.escape("('too_little_text', 'garbled_text', 'extraction_failed')")
+        with pytest.raises(
+            ValueError, match=rf"^image_only_reasons has unknown reason\(s\) \['{unknown}'\]; allowed: {known}$"
+        ):
+            _page(image_only_reasons=("too_little_text", unknown))
+
+    @pytest.mark.parametrize("reasons", [("garbled_text", "garbled_text"), ("too_little_text",) * 2])
+    def test_each_reason_once(self, reasons):
+        with pytest.raises(ValueError, match=rf"^image_only_reasons has duplicate entries: {re.escape(str(reasons))}$"):
+            _page(image_only_reasons=reasons)
+
+    def test_reasons_in_canonical_order(self):
+        canonical = re.escape("('too_little_text', 'garbled_text')")
+        with pytest.raises(ValueError, match=rf"^image_only_reasons must be in canonical order {canonical}, got "):
+            _page(image_only_reasons=("garbled_text", "too_little_text"))
+
+    @pytest.mark.parametrize("route", ["digital", "hybrid", "vision"])
+    def test_extraction_failed_marks_an_error_page(self, route):
+        page = _page(status="error", route=route, error="pdfium: bad xref", image_only_reasons=("extraction_failed",))
+        assert page.image_only_reasons == ("extraction_failed",)
+
+    @pytest.mark.parametrize(
+        ("status", "route", "reasons"),
+        [
+            ("ok", "digital", ("extraction_failed",)),
+            ("ok", "hybrid", ("too_little_text", "extraction_failed")),
+            ("ocr_unavailable", "vision", ("extraction_failed",)),
+        ],
+    )
+    def test_extraction_failed_only_on_an_error_page(self, status, route, reasons):
+        with pytest.raises(
+            ValueError,
+            match=rf"^image_only_reasons 'extraction_failed' requires status 'error', got status='{status}'$",
+        ):
+            _page(status=status, route=route, image_only_reasons=reasons)
+
+    @pytest.mark.parametrize("reasons", [(), None])
+    def test_an_error_page_may_leave_the_marker_empty_or_unrecorded(self, reasons):
+        # Hand-built and older documents' error pages carry no marker.
+        assert _page(status="error", error="boom", image_only_reasons=reasons).image_only_reasons == reasons
+
+    @pytest.mark.parametrize(
+        "reasons",
+        [("too_little_text",), ("garbled_text",), ("too_little_text", "garbled_text", "extraction_failed")],
+    )
+    def test_text_shortfalls_never_mark_an_error_page(self, reasons):
+        # An error page read no text, so no shortfall of its text was measured.
+        only = "an error page's image_only_reasons may hold only 'extraction_failed'"
+        with pytest.raises(ValueError, match=rf"^{only}, got {re.escape(str(reasons))}$"):
+            _page(status="error", error="boom", image_only_reasons=reasons)
+
+    @pytest.mark.parametrize("reasons", [("too_little_text",), ("garbled_text",), ("too_little_text", "garbled_text")])
+    def test_a_vision_page_ocr_could_not_read_keeps_its_shortfalls(self, reasons):
+        page = _page(status="ocr_unavailable", route="vision", image_only_reasons=reasons)
+        assert page.image_only_reasons == reasons
+
+    @pytest.mark.parametrize("status", ["ok", "ocr_fallback"])
+    @pytest.mark.parametrize("reasons", [(), None])
+    def test_a_page_ocr_read_may_carry_no_reason(self, status, reasons):
+        assert _page(status=status, route="vision", image_only_reasons=reasons).image_only_reasons == reasons
+
+    @pytest.mark.parametrize("status", ["ok", "ocr_fallback"])
+    @pytest.mark.parametrize("reasons", [("too_little_text",), ("garbled_text",), ("too_little_text", "garbled_text")])
+    def test_a_page_ocr_read_is_not_image_only(self, status, reasons):
+        # OCR read its page image, so its content no longer lives only there.
+        with pytest.raises(
+            ValueError,
+            match=rf"^a page OCR read \(route 'vision', status '{status}'\) cannot have image_only_reasons, got ",
+        ):
+            _page(status=status, route="vision", image_only_reasons=reasons)
+
+
 class TestPageElements:
     def test_every_element_type_accepted_in_order(self):
         elements = _one_of_each()
@@ -694,6 +793,35 @@ class TestPageMarkdown:
     def test_ocr_fallback_header(self):
         page = _page(status="ocr_fallback", route="vision", elements=(_paragraph(0),))
         assert page.to_markdown() == "<!-- page 1 route=vision status=ocr_fallback -->\n\nParagraph 0."
+
+    @pytest.mark.parametrize(
+        ("overrides", "header"),
+        [
+            ({"image_only_reasons": ("too_little_text",)}, "route=digital status=ok image_only=too_little_text"),
+            (
+                {
+                    "status": "ocr_unavailable",
+                    "route": "vision",
+                    "image_only_reasons": ("too_little_text", "garbled_text"),
+                },
+                "route=vision status=ocr_unavailable image_only=too_little_text,garbled_text",
+            ),
+            (
+                {"status": "error", "error": "boom", "image_only_reasons": ("extraction_failed",)},
+                "route=digital status=error image_only=extraction_failed",
+            ),
+        ],
+    )
+    def test_image_only_page_header_names_its_reasons(self, overrides, header):
+        # #470: the reasons, comma-joined in canonical order, tell a reader the content is only in the page image.
+        page = _page(elements=() if overrides.get("status") == "error" else (_paragraph(0),), **overrides)
+        body = "" if overrides.get("status") == "error" else "\n\nParagraph 0."
+        assert page.to_markdown() == f"<!-- page 1 {header} -->{body}"
+
+    @pytest.mark.parametrize("reasons", [(), None])
+    def test_header_unchanged_without_reasons(self, reasons):
+        page = _page(elements=(_paragraph(0),), image_only_reasons=reasons)
+        assert page.to_markdown() == "<!-- page 1 route=digital status=ok -->\n\nParagraph 0."
 
     def test_hidden_elements_are_rendered_with_a_marker_not_dropped(self):
         # Hidden spans are flagged, never dropped (spec review D2-b); the marker lets consumers filter them.

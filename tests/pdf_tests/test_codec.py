@@ -164,7 +164,11 @@ class TestEveryField:
         [
             (PDFDocument, ()),
             (DocumentMetadata, ("metadata",)),
-            (Page, ("pages", 0)),
+            pytest.param(
+                Page,
+                ("pages", 0),
+                marks=pytest.mark.xfail(strict=True, reason="#470 T3: the codec writes image_only_reasons"),
+            ),
             (PageQuality, ("pages", 0, "quality")),
             (PageImage, ("pages", 2, "page_image")),
             (Section, ("sections", 1)),

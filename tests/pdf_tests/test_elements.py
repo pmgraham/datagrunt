@@ -28,7 +28,15 @@ from datagrunt.pdf import (
     Paragraph,
     Table,
 )
-from datagrunt.pdf.elements import ExtractionMethod, PageRoute, PageStatus, PDFDocument, make_element_id
+from datagrunt.pdf.elements import (
+    IMAGE_ONLY_REASONS,
+    ExtractionMethod,
+    ImageOnlyReason,
+    PageRoute,
+    PageStatus,
+    PDFDocument,
+    make_element_id,
+)
 from pdf_tests.documents import ids, metadata, page, rich_document
 
 
@@ -91,6 +99,11 @@ class TestTypeAliases:
             "superseded",
             "unchecked_background",
         )
+
+    def test_image_only_reasons_canonical_order(self):
+        # Append-only: a new reason goes last, so the order of these never changes (#470).
+        expected = ("too_little_text", "garbled_text", "extraction_failed")
+        assert IMAGE_ONLY_REASONS == get_args(ImageOnlyReason) == expected
 
     def test_page_status_values(self):
         assert get_args(PageStatus) == ("ok", "ocr_fallback", "ocr_unavailable", "error")
