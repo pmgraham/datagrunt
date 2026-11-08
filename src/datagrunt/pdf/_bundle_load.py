@@ -3,7 +3,8 @@
 Internal: ``datagrunt.pdf.bundle`` re-exports :func:`load_bundle` and the
 shared manifest/artifact structures from this module so that loading a bundle
 never imports ``Pillow`` or ``pypdfium2``. See :mod:`datagrunt.pdf.bundle` for
-the full bundle layout and verification invariants.
+the full bundle layout, its formats (``"5.3"`` written; ``"5.0"`` still
+read: :data:`_FORMATS`) and verification invariants.
 """
 
 import dataclasses
@@ -16,6 +17,7 @@ import sys
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import NamedTuple, TypeVar
 
 from datagrunt.pdf._validate import (
@@ -47,7 +49,10 @@ __all__ = [
     "load_bundle",
 ]
 
-BUNDLE_FORMAT_VERSION = "5.0"
+# The bundle format written: "5.3" (#470) adds the manifest's image_only_pages and holds document JSON version 2.
+BUNDLE_FORMAT_VERSION = "5.3"
+# The format datagrunt 5.0 to 5.2 wrote, which still loads (document JSON version 1).
+_FORMAT_5_0 = "5.0"
 MANIFEST = "manifest.json"
 DOCUMENT_JSON = "json/document.json"
 ELEMENTS_JSONL = "json/elements.jsonl"
@@ -60,7 +65,8 @@ _READ_CHUNK_BYTES = 1 << 20
 # How every bundle file is opened: never through a symlink (O_NOFOLLOW), never blocking on a named pipe
 # (O_NONBLOCK, which a regular file ignores), as bytes (O_BINARY, Windows). Each flag is 0 where it does not exist.
 _OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
-_MANIFEST_KEYS = (
+# A manifest's keys under format 5.0, then under 5.3, which adds image_only_pages after degraded_pages.
+_MANIFEST_KEYS_5_0 = (
     "bundle_format_version",
     "datagrunt_version",
     "source_sha256",
@@ -71,11 +77,35 @@ _MANIFEST_KEYS = (
     "artifacts",
     "missing",
 )
+_MANIFEST_KEYS = (
+    "bundle_format_version",
+    "datagrunt_version",
+    "source_sha256",
+    "extraction_params",
+    "integrity_verified",
+    "degraded_pages",
+    "image_only_pages",
+    "page_images",
+    "artifacts",
+    "missing",
+)
 _PARAM_KEYS = ("dpi", "vision_dpi", "max_render_pixels", "workers")
 _MISSING_ARTIFACTS = ("bands", "figure", "page_image")
 # Where a page image came from: the document's own (its loaders), or the bundle's render at dpi.
 _ORIGINS = ("document", "render")
 _T = TypeVar("_T")
+
+
+class _Format(NamedTuple):
+    """A bundle format this datagrunt reads: its manifest's keys (exactly) and its document JSON's codec version."""
+
+    manifest_keys: tuple[str, ...]
+    codec_version: int
+
+
+_FORMATS: Mapping[str, _Format] = MappingProxyType(
+    {_FORMAT_5_0: _Format(_MANIFEST_KEYS_5_0, 1), BUNDLE_FORMAT_VERSION: _Format(_MANIFEST_KEYS, 2)}
+)
 
 
 class _Artifact(NamedTuple):
@@ -105,13 +135,15 @@ class _ImageEntry(NamedTuple):
 
 
 class _Manifest(NamedTuple):
-    """A manifest's values, checked (see the module notes)."""
+    """A manifest's values, checked (see the module notes); ``image_only_pages`` is None under format 5.0."""
 
+    bundle_format_version: str
     datagrunt_version: str
     source_sha256: str
     extraction_params: dict[str, object]
     integrity_verified: bool
     degraded_pages: tuple[int, ...]
+    image_only_pages: tuple[int, ...] | None
     page_images: tuple[_ImageEntry, ...]
     artifacts: tuple[_Artifact, ...]
     missing: tuple[_Missing, ...]
@@ -178,7 +210,8 @@ def _loaded(root: Path) -> tuple[_Manifest, PDFDocument]:
         else:
             _verified(root, entry, keep=False)
     try:
-        document = document_from_json_bytes(raw, base_dir=root)
+        codec_version = _FORMATS[manifest.bundle_format_version].codec_version
+        document = document_from_json_bytes(raw, base_dir=root, version=codec_version)
     except (TypeError, ValueError) as exc:
         raise BundleCorruptError(f"{DOCUMENT_JSON}: {exc}") from exc
     by_path = {entry.path: entry for entry in manifest.artifacts}
@@ -229,25 +262,41 @@ def _read_manifest(root: Path) -> _Manifest:
 
 def _manifest_of(data: object, root: Path) -> _Manifest:
     """The manifest's values, each checked: TypeError or ValueError naming the first that is wrong."""
-    top = _object("manifest", data, _MANIFEST_KEYS)
-    version = top["bundle_format_version"]
-    if not isinstance(version, str) or version != BUNDLE_FORMAT_VERSION:
-        message = f"bundle_format_version {version!r} is not supported: this datagrunt reads {BUNDLE_FORMAT_VERSION!r}"
-        raise ValueError(message)
+    version = _format_version(data)
+    top = _object("manifest", data, _FORMATS[version].manifest_keys)
     datagrunt_version = non_blank_str("datagrunt_version", top["datagrunt_version"])
     _check_params(top["extraction_params"])
-    pages = enumerate(_array("degraded_pages", top["degraded_pages"]))
     missing = enumerate(_array("missing", top["missing"]))
     return _Manifest(
+        bundle_format_version=version,
         datagrunt_version=datagrunt_version,
         source_sha256=sha256_hex("source_sha256", top["source_sha256"]),
         extraction_params=dict(top["extraction_params"]),
         integrity_verified=strict_bool("integrity_verified", top["integrity_verified"]),
-        degraded_pages=tuple(int_at_least(f"degraded_pages[{i}]", page, 1) for i, page in pages),
+        degraded_pages=_page_numbers("degraded_pages", top["degraded_pages"]),
+        image_only_pages=None if version == _FORMAT_5_0 else _page_numbers("image_only_pages", top["image_only_pages"]),
         page_images=_image_entries(top["page_images"]),
         artifacts=_listed_artifacts(top["artifacts"], root),
         missing=tuple(_missing_entry(f"missing[{i}]", item) for i, item in missing),
     )
+
+
+def _format_version(data: object) -> str:
+    """The manifest's ``bundle_format_version``, if it is a format this datagrunt reads (:data:`_FORMATS`)."""
+    if not isinstance(data, dict):
+        raise TypeError(f"manifest must be a JSON object, got {type(data).__name__}")
+    if "bundle_format_version" not in data:
+        raise ValueError("manifest has missing key(s) ['bundle_format_version']")
+    version = data["bundle_format_version"]
+    if not isinstance(version, str) or version not in _FORMATS:
+        known = ", ".join(repr(name) for name in _FORMATS)
+        raise ValueError(f"bundle_format_version {version!r} is not supported: this datagrunt reads {known}")
+    return version
+
+
+def _page_numbers(name: str, value: object) -> tuple[int, ...]:
+    """A manifest's list of 1-based page numbers (``degraded_pages``, ``image_only_pages``), each checked."""
+    return tuple(int_at_least(f"{name}[{i}]", page, 1) for i, page in enumerate(_array(name, value)))
 
 
 def _check_params(value: object) -> None:
@@ -447,7 +496,7 @@ def _image_with_readers(page: Page, root: Path, entry_of: Callable[[Path], _Arti
 
 
 def _check_facts(document: PDFDocument, manifest: _Manifest) -> None:
-    """The manifest's source sha256, integrity and degraded pages must be the document's."""
+    """The manifest's source sha256, integrity, degraded and (format 5.3) image-only pages must be the document's."""
     if manifest.source_sha256 != document.metadata.sha256:
         sha = document.metadata.sha256
         raise BundleCorruptError(f"{MANIFEST}: source_sha256 {manifest.source_sha256} is not the document's {sha}")
@@ -458,6 +507,9 @@ def _check_facts(document: PDFDocument, manifest: _Manifest) -> None:
     if manifest.degraded_pages != document.degraded_pages:
         mine, theirs = list(manifest.degraded_pages), list(document.degraded_pages)
         raise BundleCorruptError(f"{MANIFEST}: degraded_pages {mine} are not the document's {theirs}")
+    if manifest.image_only_pages is not None and manifest.image_only_pages != document.image_only_pages:
+        mine, theirs = list(manifest.image_only_pages), list(document.image_only_pages)
+        raise BundleCorruptError(f"{MANIFEST}: image_only_pages {mine} are not the document's {theirs}")
 
 
 def _document_paths(document: PDFDocument) -> Iterator[Path]:

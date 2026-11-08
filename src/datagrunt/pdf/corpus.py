@@ -23,6 +23,7 @@ from typing import Final, NamedTuple, cast
 import datagrunt
 from datagrunt.pdf._bundle_load import (
     _MAX_ARTIFACT_BYTES,
+    BUNDLE_FORMAT_VERSION,
     _loaded,
     _opened,
     _read_fd,
@@ -417,12 +418,18 @@ def _reused_entry(
     bundle_relpath: str,
     expected_params: dict[str, object],
 ) -> CorpusEntry | None:
-    """Return a ``reused=True`` entry if ``bundle_dir`` holds a valid matching bundle."""
+    """Return a ``reused=True`` entry if ``bundle_dir`` holds a valid matching bundle.
+
+    Matching means this datagrunt's version and bundle format (an older format, 5.0, records no image-only
+    reasons: #470), the item's source sha256, doc id and name, and the expected extraction parameters.
+    """
     try:
         manifest, doc = _loaded(bundle_dir)
     except (BundleCorruptError, OSError, ValueError, TypeError):
         return None
     if manifest.datagrunt_version != datagrunt.__version__:
+        return None
+    if manifest.bundle_format_version != BUNDLE_FORMAT_VERSION:
         return None
     if manifest.source_sha256 != item.sha256 or manifest.extraction_params != expected_params:
         return None

@@ -35,11 +35,12 @@ Each method writes the document in one form. A path returned is absolute
   read back by :func:`~datagrunt.pdf.codec.document_from_json_bytes`).
 - :meth:`PDFWriter.write_jsonl`: one JSON object a line, each element's row
   of A7a's frame (:func:`~datagrunt.pdf.frame.element_frame`), in document
-  order: its columns in order, ``bbox`` an object, ``scope_path`` and
-  ``hidden_reasons`` arrays. Compact UTF-8 JSON, each line ending in a
-  newline; a document without elements is an empty file. The frame's
-  strings hold each lone surrogate as its escape (``\\ud800``): the JSON is
-  the lossless form.
+  order: its columns in order, ``bbox`` an object, ``scope_path``,
+  ``hidden_reasons`` and ``image_only_reasons`` arrays (the last null for
+  a page whose reasons were not recorded). Compact UTF-8 JSON, each line
+  ending in a newline; a document without elements is an empty file. The
+  frame's strings hold each lone surrogate as its escape (``\\ud800``): the
+  JSON is the lossless form.
 - :meth:`PDFWriter.write_markdown`: the document's ``to_markdown()``, UTF-8,
   each lone surrogate written as its escape (as the bundle's Markdown).
   Hidden elements are omitted by default; with ``include_hidden=True`` each
@@ -49,9 +50,12 @@ Each method writes the document in one form. A path returned is absolute
 - :meth:`PDFWriter.write_csv`: the frame flattened (:func:`_csv_frame`),
   by polars (its keyword arguments passed on), because CSV cannot hold a
   List or Struct column: ``bbox`` becomes ``bbox_x0``, ``bbox_y0``,
-  ``bbox_x1`` and ``bbox_y1`` in its place, and ``scope_path`` and
-  ``hidden_reasons`` compact JSON-array strings (``["Intro","Details"]``,
-  ``[]`` for none). Every value is written as it is (preserve, not
+  ``bbox_x1`` and ``bbox_y1`` in its place, and ``scope_path``,
+  ``hidden_reasons`` and ``image_only_reasons`` compact JSON-array strings
+  (``["Intro","Details"]``, ``[]`` for none). A null ``image_only_reasons``
+  (not recorded) stays null, which polars writes as its ``null_value``: an
+  empty cell by default, never ``[]`` (none) or a string a reader would
+  take for a list. Every value is written as it is (preserve, not
   transform): a cell that starts with ``=``, ``+``, ``-`` or ``@`` is not
   escaped against spreadsheet formula injection. Guarding a spreadsheet
   that opens the CSV is the application's concern.
@@ -94,15 +98,20 @@ Each method writes the document in one form. A path returned is absolute
   its own thread and do not outlive it. A page whose render is refused or fails
   (``RenderRefused``, ``RenderFailed``: its effective DPI's refusal too) is
   skipped, never silently: a warning on the module logger names the page
-  and why. Any other error fails the call. The paths returned are the files
-  written, in page order. The PDF rendered is the file at the source path
-  when the call runs.
+  and why. The image-only pages skipped (``Page.image_only_reasons``,
+  #470), whose content lives only in their page images, are also named in
+  one ``UserWarning`` a call, with the document and ``output_dir``: the
+  source PDF is their only full copy (#471, as the bundle warns). Any other error fails the call. The paths returned are
+  the files written, in page order. The PDF rendered is the file at the
+  source path when the call runs.
 - :meth:`PDFWriter.write_bundle`: A7a's
   :func:`~datagrunt.pdf.bundle.write_bundle` of the document, with the
   writer's source, password and options (``ocr``,
   ``min_image_dimension`` and ``strict`` recorded as its
   ``extraction_params``) and ``overwrite``: a bundle already there that is
   this write's is reused, any other replaced only with ``overwrite=True``.
+  It warns as the bundle's write does, an image-only page whose page image
+  it does not write included (#471).
 
 A writer built from a PDFDocument has no PDF to render:
 :meth:`PDFWriter.render_pages_as_images` and :meth:`PDFWriter.write_bundle`
@@ -135,6 +144,7 @@ import logging
 import os
 import threading
 import uuid
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -153,6 +163,7 @@ from datagrunt.pdf.bundle import (
     _drawn,
     _figure_unbound,
     _in_page_order,
+    _only_copy_notice,
     _Pictures,
     _png,
     _write_rows,
@@ -170,8 +181,8 @@ _LOGGER = logging.getLogger(__name__)
 
 # A temporary file's name: this, then a uuid4's hex (the bundle's staging prefix).
 _TEMPORARY_PREFIX = ".tmp_"
-# The frame's List columns, which a CSV holds as JSON-array strings.
-_LIST_COLUMNS = ("scope_path", "hidden_reasons")
+# The frame's List columns, which a CSV holds as JSON-array strings (a null as polars writes one).
+_LIST_COLUMNS = ("scope_path", "hidden_reasons", "image_only_reasons")
 
 
 class PDFWriter:
@@ -357,13 +368,16 @@ class PDFWriter:
             PDFEncryptedError, PDFCorruptError, PDFSourceChangedError: As extraction
                 (:func:`~datagrunt.pdf.pipeline.extract_document`) raises them, on the call that first
                 extracts the document.
+
+        Warns:
+            UserWarning: Once, naming the image-only pages skipped: the source PDF is their only full copy (#471).
         """
         source = self._required_source("render_pages_as_images")
         directory = _directory_target(output_dir)
         target_dpi = self._options.dpi if dpi is None else int_at_least("dpi", dpi, _MIN_TARGET_DPI)
-        pages = self._extracted().pages
+        document = self._extracted()
         directory.mkdir(parents=True, exist_ok=True)
-        return _write_renders(pages, directory, source, target_dpi, self._options)
+        return _write_renders(document, directory, source, target_dpi, self._options)
 
     def write_bundle(
         self,
@@ -390,6 +404,10 @@ class PDFWriter:
             PDFEncryptedError, PDFCorruptError, PDFSourceChangedError: As extraction
                 (:func:`~datagrunt.pdf.pipeline.extract_document`) raises them, on the call that first
                 extracts the document.
+
+        Warns:
+            UserWarning: As :func:`~datagrunt.pdf.bundle.write_bundle` warns, an image-only page whose page image
+                is not written included (#471).
         """
         source = self._required_source("write_bundle")
         _checked_target(output_dir)
@@ -510,14 +528,15 @@ def _write_bytes(target: Path, data: bytes) -> Path:
 def _csv_frame(frame: pl.DataFrame) -> pl.DataFrame:
     """A7a's ``frame`` flattened for CSV: ``bbox`` as four columns in its place, the List columns JSON arrays.
 
-    See the module notes. The other columns are as they are.
+    A null list stays null. See the module notes. The other columns are as they are.
     """
     columns: list[pl.Expr | pl.Series] = []
     for name in frame.columns:
         if name == "bbox":
             columns.extend(pl.col(name).struct.field(field).alias(f"bbox_{field}") for field in _BBOX_FIELDS)
         elif name in _LIST_COLUMNS:
-            columns.append(pl.Series(name, [_json_array(items) for items in frame[name].to_list()], dtype=pl.String))
+            cells = [None if items is None else _json_array(items) for items in frame[name].to_list()]
+            columns.append(pl.Series(name, cells, dtype=pl.String))
         else:
             columns.append(pl.col(name))
     return frame.select(columns)
@@ -565,15 +584,26 @@ def _write_figures(figures: tuple[Figure, ...], directory: Path, *, dedupe: bool
 
 
 def _write_renders(
-    pages: tuple[Page, ...], directory: Path, source: PDFSource, dpi: int, options: PipelineOptions
+    document: PDFDocument, directory: Path, source: PDFSource, dpi: int, options: PipelineOptions
 ) -> list[Path]:
-    """Render and write every page on ``workers`` threads (the bundle's window); the paths written, in page order."""
+    """Render and write every page on ``workers`` threads (the bundle's window); the paths written, in page order.
+
+    The image-only pages skipped are named in one warning, with the document and ``directory`` (#471).
+    """
+    pages = document.pages
 
     def task(page: Page) -> Callable[[], Path | None]:
         return _stage_rendered(page, directory, source, dpi, options.max_render_pixels)
 
     with render_worker_pool():
         outcomes = _in_page_order(task, pages, options.workers, "datagrunt-writer", finish=lambda finalize: finalize())
+    unrendered = [
+        page.page_number for page, path in zip(pages, outcomes, strict=True) if path is None and page.image_only_reasons
+    ]
+    if unrendered:
+        unsaved = f"render_pages_as_images could not render into {directory} (the {_LOGGER.name} log says why)"
+        notice = _only_copy_notice(document.metadata.source_name, unrendered, unsaved)
+        warnings.warn(notice, UserWarning, stacklevel=3)
     return [path for path in outcomes if path is not None]
 
 

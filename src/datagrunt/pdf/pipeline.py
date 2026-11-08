@@ -199,7 +199,11 @@ bytes are the document's, and stats the path again after the render
 
 An error page (A1: no elements, no quality, never verified) is routed
 ``"vision"``, the spec's route for a page whose extraction fails (render
-and OCR, A5b). A page A2 could not read is ``fallback_page``'s; a page
+and OCR, A5b), and is image-only: its ``image_only_reasons`` are
+``("extraction_failed",)`` (#470), whoever made it. A page whose text A3
+found short or garbled carries A3's reasons unless OCR read it, so
+``ocr="auto"`` routes vision exactly the pages ``ocr="never"`` marks
+image-only. A page A2 could not read is ``fallback_page``'s; a page
 whose step raised (step 5) is its worker's: its size is the page's, read
 with :func:`~datagrunt.pdf.pdfium_engine.page_geometry`; when that cannot
 be read either, it is pdfium's default page size (612 x 792 pt, what
@@ -488,8 +492,9 @@ def _vision(options: PipelineOptions) -> VisionOptions:
 def error_page(index: int, error: str, *, size: tuple[float, float] | None = None, why: str = "") -> Page:
     """The A1 error page of the page at ``index``: no elements, no quality, routed vision (see the module notes).
 
-    Its size is ``size``; with none, pdfium's default page size, and a
-    warning that its own could not be read and ``why``.
+    It is image-only, ``("extraction_failed",)`` (#470): nothing was read
+    from it. Its size is ``size``; with none, pdfium's default page size,
+    and a warning that its own could not be read and ``why``.
     """
     width, height = _DEFAULT_PAGE_SIZE if size is None else size
     warnings = () if size is not None else (_default_size_warning(why),)
@@ -502,6 +507,7 @@ def error_page(index: int, error: str, *, size: tuple[float, float] | None = Non
         quality=None,
         error=error,
         warnings=warnings,
+        image_only_reasons=("extraction_failed",),
     )
 
 

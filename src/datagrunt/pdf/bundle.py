@@ -61,10 +61,23 @@ Layout (paths relative to the bundle, joined with ``/``):
   (``datagrunt.__version__``),
   the source's sha256, the extraction parameters (``dpi``, ``vision_dpi``,
   ``max_render_pixels``, ``workers``, then the caller's
-  ``extraction_params``), ``integrity_verified`` and ``degraded_pages``,
-  each page image's origin, DPI and ``contrast_normalized`` (by page),
-  every other file's path, size and sha256 (by path), and each artifact
-  that is missing and why (by page).
+  ``extraction_params``), ``integrity_verified``, ``degraded_pages`` and
+  ``image_only_pages`` (#470: ``PDFDocument.image_only_pages``, the pages
+  whose content lives only in their page image, which the element rows
+  cannot name when a page has no elements), each page image's origin, DPI
+  and ``contrast_normalized`` (by page), every other file's path, size and
+  sha256 (by path), and each artifact that is missing and why (by page).
+
+Formats: :data:`BUNDLE_FORMAT_VERSION`, ``"5.3"`` (#470), is written: its
+manifest holds ``image_only_pages`` and its ``json/document.json`` is codec
+version 2 (each page's ``image_only_reasons``). ``"5.0"``, which datagrunt
+5.0 to 5.2 wrote, still loads: its manifest holds exactly its own keys (no
+``image_only_pages``) and its document JSON must be codec version 1, so
+each page's ``image_only_reasons`` reads None (not recorded); the rest is
+checked as a 5.3 bundle's is. Each format's document JSON must be its own
+codec version. A loaded 5.0 bundle's document writes as format 5.3 (its
+pages' reasons null, ``image_only_pages`` empty). Any other format is
+refused.
 
 PNGs of page renders (the bundle's here; own page images by their loaders)
 are encoded by :mod:`datagrunt.pdf._png`, figures by Pillow in their
@@ -85,11 +98,15 @@ document's sha256).
 
 A bundle already at ``output_dir`` is reused when it is this write's
 (:func:`_existing`): it loads and verifies (:func:`load_bundle`), its
-manifest's datagrunt version is this one's, its source sha256 the
-document's, its extraction parameters this write's, and its document this
-one (the pages the bundle rendered compared without their page image).
+format is :data:`BUNDLE_FORMAT_VERSION` (a 5.0 bundle, which loads, is
+never this write's), its manifest's datagrunt version is this one's, its
+source sha256 the document's, its extraction parameters this write's, and
+its document this one (the pages the bundle rendered compared without their
+page image).
 Its document is then returned as :func:`load_bundle` returns it, and
-nothing is written. Any other bundle there is a FileExistsError naming why,
+nothing is written, nor any of a write's warnings emitted (its manifest
+still records what the write that made it recorded). Any other bundle
+there is a FileExistsError naming why,
 unless ``overwrite`` is True (a reusable bundle is reused either way).
 
 The bundle is then written into a new staging directory, ``.tmp_<uuid4
@@ -136,6 +153,21 @@ not bound to the source (see below), is not written (it keeps no
 Each is a ``missing`` entry naming the artifact, the page, the figure's
 element id (one entry a figure) and why. Any other error fails the write.
 
+An image-only page (``PDFDocument.image_only_pages``, #470: its content
+lives only in its page image) whose page image is not written, whatever
+the cause (``render_pages=False``, ``include_images=False``, a render
+refused or failed, an own image unread or unbound), is in no artifact as
+a page: the source PDF is its only full copy (#471). A figure on it (a
+scan's own picture) is still written as any figure is, unless
+``include_images=False``: a part of the page, never the page. The opt-out is honoured and nothing more is
+written; instead its ``missing`` page image entry's reason ends
+``"; its content lives only in its page image (<its reasons, joined by
+', '>): the source PDF is its only full copy"`` (every other entry is as it
+would be), and one ``UserWarning`` a write names those pages, the
+document (its ``source_name``), the bundle's path and the cause (the
+option, or the manifest's ``missing`` entries for the failures),
+emitted once the bundle is published (:func:`_mark_only_copies`).
+
 The page images are bound to the hashed source. The source's identity
 (A8a's ``SourceIdentity``: device, inode, size, mtime) is taken with its
 hash, and checked again once every artifact is written, before the rename:
@@ -180,8 +212,8 @@ Known limitations, documented:
 and returns the document. Nothing is trusted before it is checked:
 
 1. The manifest (opened as an artifact is, read within the asset limit,
-   strict JSON): its version (:data:`BUNDLE_FORMAT_VERSION`), its keys
-   (exactly, at every level) and values; every artifact path through
+   strict JSON): its version (a format above), its keys (exactly its
+   format's, at every level) and values; every artifact path through
    :func:`~datagrunt.pdf.codec.contained_path` (plain relative parts,
    resolved inside the bundle: no ``..``, absolute path or symlink out),
    listed once, ``json/document.json``, ``json/elements.jsonl`` and
@@ -195,9 +227,10 @@ and returns the document. Nothing is trusted before it is checked:
    are read from the same descriptor, in chunks, at most that size plus one
    byte, and must hash to the manifest's sha256. ``json/document.json`` is
    decoded from the bytes verified, not read again.
-3. The document (the codec, its paths joined to the bundle by the same
-   helper): the manifest's source sha256, ``integrity_verified`` and
-   ``degraded_pages`` must be its; every path it names must be a verified
+3. The document (the codec, of its format's version only; its paths joined
+   to the bundle by the same helper): the manifest's source sha256,
+   ``integrity_verified``, ``degraded_pages`` and (format 5.3)
+   ``image_only_pages`` must be its; every path it names must be a verified
    artifact; the manifest's page images must be its (the same pages, DPI
    and ``contrast_normalized``; a rendered one without bands); the
    manifest must list a ``markdown/pages/page_NNNN.md`` for each of its
@@ -406,7 +439,10 @@ def write_bundle(
 
     Warns:
         UserWarning: For each page whose own image is not written because its
-            loaders are not bound to ``source`` (see the module notes).
+            loaders are not bound to ``source`` (see the module notes); and
+            once, naming the image-only pages (``document.image_only_pages``)
+            whose page image is not written, whatever the cause: the source
+            PDF is their only full copy (#471).
     """
     options = PipelineOptions(workers=workers, dpi=dpi, vision_dpi=vision_dpi, max_render_pixels=max_render_pixels)
     include_imgs = strict_bool("include_images", include_images)
@@ -558,6 +594,8 @@ def _existing(target: Path, document: PDFDocument, params: Mapping[str, object])
         manifest, loaded = _loaded(target)
     except (BundleCorruptError, OSError) as exc:
         return None, f"it is not a valid bundle: {exc}"
+    if manifest.bundle_format_version != BUNDLE_FORMAT_VERSION:
+        return None, f"its bundle format is {manifest.bundle_format_version!r}, not {BUNDLE_FORMAT_VERSION!r}"
     version = _datagrunt_version()
     if manifest.datagrunt_version != version:
         return None, f"it was written by datagrunt {manifest.datagrunt_version}, not {version}"
@@ -651,11 +689,12 @@ def _staged(
         figures = _write_figures(document, staging, source.path, ledger)
     else:
         figures = _skip_figures(document, ledger)
-    if include_images and render_pages:
-        renders = _write_renders(document, staging, source, options, ledger)
+    skipped = _opted_out(include_images=include_images, render_pages=render_pages)
+    if skipped:
+        renders = _skip_renders(document, ledger, skipped)
     else:
-        why = "include_images=False" if not include_images else "render_pages=False"
-        renders = _skip_renders(document, ledger, why)
+        renders = _write_renders(document, staging, source, options, ledger)
+    _mark_only_copies(document, renders, ledger, skipped, target)
     _write_texts(document, figures, renders, staging, ledger)
     _write_bytes(staging, MANIFEST, _manifest(document, params, renders, ledger))
     by_path = {artifact.path: artifact for artifact in ledger.artifacts}
@@ -672,11 +711,57 @@ def _skip_figures(document: PDFDocument, ledger: _Ledger) -> dict[str, str]:
     return {}
 
 
+def _opted_out(*, include_images: bool, render_pages: bool) -> str:
+    """The option that skips every page image (``include_images=False`` first), or ``""`` if none does."""
+    if not include_images:
+        return "include_images=False"
+    return "" if render_pages else "render_pages=False"
+
+
 def _skip_renders(document: PDFDocument, ledger: _Ledger, why: str) -> dict[int, _Written]:
     """Record each page render as skipped when ``include_images=False`` or ``render_pages=False``."""
     for page in document.pages:
         ledger.missing.append(_Missing("page_image", page.page_number, None, f"the page was not rendered: {why}"))
     return {}
+
+
+def _mark_only_copies(
+    document: PDFDocument, renders: Mapping[int, _Written], ledger: _Ledger, skipped: str, target: Path
+) -> None:
+    """Say that the source PDF is the only full copy of each unwritten image-only page: its missing entry, one warning.
+
+    An image-only page (#470) holds its content only in its page image: one
+    the bundle does not write, whatever the cause, leaves the source PDF its
+    only full copy (#471): a figure on the page, if written, is a part of it.
+    Every other entry is left as it is. ``skipped`` is the option that
+    skipped every page image, or ``""``. The warning names the document and
+    the bundle (``target``): Python's default filter shows one warning a
+    text and a place, so a corpus of such documents still warns for each.
+    """
+    unwritten = {
+        page.page_number: page.image_only_reasons
+        for page in document.pages
+        if page.image_only_reasons and page.page_number not in renders
+    }
+    if not unwritten:
+        return
+    for index, entry in enumerate(ledger.missing):
+        marks = unwritten.get(entry.page_number)
+        if entry.artifact != "page_image" or marks is None:
+            continue
+        clause = (
+            f"; its content lives only in its page image ({', '.join(marks)}): the source PDF is its only full copy"
+        )
+        ledger.missing[index] = entry._replace(reason=entry.reason + clause)
+    unsaved = f"does not write ({skipped})" if skipped else "could not write (manifest.json's missing entries say why)"
+    notice = _only_copy_notice(document.metadata.source_name, sorted(unwritten), f"the bundle at {target} {unsaved}")
+    ledger.warnings.append(notice)
+
+
+def _only_copy_notice(source_name: str, pages: list[int], unsaved: str) -> str:
+    """The warning that image-only ``pages`` of ``source_name`` were not written (``unsaved`` says where, and why)."""
+    held = f"pages {pages} of {source_name} hold content only in their page images"
+    return f"{held}, which {unsaved}; the source PDF is their only full copy"
 
 
 @dataclass
@@ -1218,6 +1303,7 @@ def _manifest(
         "extraction_params": dict(params),
         "integrity_verified": document.integrity_verified,
         "degraded_pages": list(document.degraded_pages),
+        "image_only_pages": list(document.image_only_pages),
         "page_images": images,
         "artifacts": [entry._asdict() for entry in sorted(ledger.artifacts)],
         "missing": [entry._asdict() for entry in sorted(ledger.missing, key=_missing_order)],

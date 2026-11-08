@@ -140,6 +140,19 @@ Pieces the gate does not select stay visible.
   scan-like images, as for ``invisible``) is over 50 % routes hybrid (read
   from its text layer, as a digital page; its unmapped regions are recorded,
   not OCR'd), or digital under ``ocr="never"``; else digital.
+- The image-only marker (#470): ``PageAssessment.image_only_reasons``
+  records which of those two held, in every mode (``"always"`` too):
+  ``too_little_text`` for the count, ``garbled_text`` for the ratio, both
+  when both did (:data:`~datagrunt.pdf.elements.IMAGE_ONLY_REASONS`
+  order); ``()`` when the page's text stands. They are the reasons its
+  content lives only in its page image unless OCR reads it: A4b's
+  :func:`~datagrunt.pdf.assembly.assemble_page` carries them onto the page
+  (a page kept digital under ``ocr="never"``, a vision page OCR could not
+  read), and a page OCR reads has none
+  (:attr:`~datagrunt.pdf.elements.Page.image_only_reasons`). So, of the
+  pages A3 assesses, ``ocr="auto"`` routes vision exactly those
+  ``ocr="never"`` marks. Routes and warnings are as above: the marker
+  changes neither.
 - Unmapped regions: the box of each maximal run of invalid chars in a
   visible piece: recorded, for an OCR pass the pipeline does not run yet.
 
@@ -216,9 +229,11 @@ from datagrunt.pdf.elements import (
     HIDDEN_REASONS,
     PAGE_ROUTES,
     HiddenReason,
+    ImageOnlyReason,
     PageQuality,
     PageRoute,
     check_hidden_reasons,
+    check_image_only_reasons,
 )
 from datagrunt.pdf.pdfium_engine import RawPage
 
@@ -255,6 +270,8 @@ _OCR_LAYER_COVER = 0.5
 _MIN_TEXT_CHARS = 20
 # The valid share of its visible chars a page needs to stay out of vision (spec §3.3 step 2, #417).
 _MIN_VALID_RATIO = 0.70
+# The image-only reasons routing records (#470): the count's shortfall, then the ratio's, in IMAGE_ONLY_REASONS order.
+_SHORTFALL_REASONS: tuple[ImageOnlyReason, ...] = ("too_little_text", "garbled_text")
 # A run of this many identical invalid chars or more is a leader or a rule, not text: the routing ratio leaves it out.
 _MIN_LEADER_RUN = 3
 # What a char code with no Unicode mapping reads as.
@@ -681,6 +698,14 @@ class PageAssessment:
             visible piece, in piece order: where OCR (A5) reads what the
             text layer cannot say. Empty when there is none.
         warnings: Non-fatal notes for the page (``Page.warnings``).
+        image_only_reasons: The routing shortfalls the page's visible text
+            has, whatever the OCR mode (#470, module notes):
+            ``"too_little_text"`` (a count under 20 on a page with paint),
+            ``"garbled_text"`` (a ratio under 0.70), both, or ``()`` when its
+            text stands. Unique, in ``IMAGE_ONLY_REASONS`` order, and never
+            ``"extraction_failed"`` (an assessed page was read). They become
+            ``Page.image_only_reasons`` unless OCR reads the page. ``()`` by
+            default.
     """
 
     pieces: tuple[SpanPiece, ...]
@@ -689,6 +714,7 @@ class PageAssessment:
     route: PageRoute
     unmapped_regions: tuple[Box, ...]
     warnings: tuple[str, ...]
+    image_only_reasons: tuple[ImageOnlyReason, ...] = ()
 
     def __post_init__(self) -> None:
         typed_tuple("pieces", self.pieces, SpanPiece)
@@ -700,6 +726,7 @@ class PageAssessment:
         boxes = tuple(ordered_box(f"unmapped_regions[{index}]", box) for index, box in enumerate(regions))
         object.__setattr__(self, "unmapped_regions", boxes)
         str_tuple("warnings", self.warnings)
+        check_image_only_reasons(self.image_only_reasons, allowed=_SHORTFALL_REASONS)
 
 
 def assess_page(
@@ -763,8 +790,10 @@ def assess_page(
         pieces, own = _flag_unchecked(pieces, page), _flag_unchecked(own, page)
     flagged, unchecked = _duplicates_flagged(own, pieces)
     visible = _visible_text(pieces)
-    painted = _painted(page) if ocr != "always" and visible.counted < _MIN_TEXT_CHARS else False
-    route, warnings = _route(visible, cover, painted, ocr)
+    # Paint matters only to too_little_text (under _MIN_TEXT_CHARS), so it is skipped on a page with enough text,
+    # but checked in every OCR mode: "always" records image-only reasons too (#470).
+    painted = _painted(page) if visible.counted < _MIN_TEXT_CHARS else False
+    route, warnings, reasons = _route(visible, cover, painted, ocr)
     warnings += _recovery_warnings(recovered, page.text.stats.dropped_text_objects)
     return PageAssessment(
         pieces=pieces,
@@ -773,6 +802,7 @@ def assess_page(
         route=route,
         unmapped_regions=_unmapped_regions(pieces),
         warnings=warnings + _duplicate_warnings(unchecked) + _background_warnings(background),
+        image_only_reasons=reasons,
     )
 
 
@@ -1112,35 +1142,61 @@ def _painted(page: RawPage) -> bool:
     return _cover_fraction(objects.boxes, page.geometry.width_pt, page.geometry.height_pt) > 0.0
 
 
-def _route(text: _VisibleText, cover: float, painted: bool, ocr: OcrMode) -> tuple[PageRoute, tuple[str, ...]]:
-    """The page's route and warnings, from its visible text, raster cover and paint (see the module notes)."""
-    if ocr == "always":
-        return "vision", ()
+class _Routing(NamedTuple):
+    """A page's route, its warnings, and its image-only reasons: the shortfalls of its visible text (#470)."""
+
+    route: PageRoute
+    warnings: tuple[str, ...]
+    image_only_reasons: tuple[ImageOnlyReason, ...]
+
+
+class _Shortfall(NamedTuple):
+    """One reason a page's visible text cannot stand, and how its ``ocr='never'`` warning says it."""
+
+    reason: ImageOnlyReason
+    note: str
+
+
+def _route(text: _VisibleText, cover: float, painted: bool, ocr: OcrMode) -> _Routing:
+    """The page's route, warnings and image-only reasons, from its visible text, raster cover and paint (module notes).
+
+    The reasons are the shortfalls of :func:`_shortfalls`, in
+    ``IMAGE_ONLY_REASONS`` order, found in every mode (``"always"`` too: a
+    page OCR then cannot read is marked as under ``"auto"``). A page with
+    any routes vision, or stays digital (with a warning naming each) under
+    ``ocr="never"``; ``"always"`` routes every page vision, with no warning.
+    """
     shortfalls = _shortfalls(text, painted)
+    reasons = tuple(shortfall.reason for shortfall in shortfalls)
+    if ocr == "always":
+        return _Routing("vision", (), reasons)
     if shortfalls:
         if ocr == "never":
-            short = " and ".join(shortfalls)
-            return "digital", (f"ocr='never': the page has {short}; it stays digital instead of going to OCR",)
-        return "vision", ()
+            short = " and ".join(shortfall.note for shortfall in shortfalls)
+            warning = f"ocr='never': the page has {short}; it stays digital instead of going to OCR"
+            return _Routing("digital", (warning,), reasons)
+        return _Routing("vision", (), reasons)
     # hybrid marks a text layer over a scan; under "never" such a page is labelled digital.
-    return ("hybrid" if cover > _OCR_LAYER_COVER and ocr != "never" else "digital"), ()
+    return _Routing("hybrid" if cover > _OCR_LAYER_COVER and ocr != "never" else "digital", (), ())
 
 
-def _shortfalls(text: _VisibleText, painted: bool) -> tuple[str, ...]:
+def _shortfalls(text: _VisibleText, painted: bool) -> tuple[_Shortfall, ...]:
     """Why the page's visible text cannot stand: too few valid chars, too small a valid share, or both; else empty.
 
-    Too few counts only on a ``painted`` page (module notes, P2-C). A page
-    with no visible char outside leader runs has no ratio: its count (0)
-    decides. The ratio is shown cut to 3 places (exact, in integers), so
-    one under 0.70 never reads as 0.700.
+    Too few (``too_little_text``) counts only on a ``painted`` page (module
+    notes, P2-C); too small a share is ``garbled_text``. A page with no
+    visible char outside leader runs has no ratio: its count (0) decides.
+    The ratio is shown cut to 3 places (exact, in integers), so one under
+    0.70 never reads as 0.700.
     """
-    found: list[str] = []
+    found: list[_Shortfall] = []
     if text.counted < _MIN_TEXT_CHARS and painted:
-        found.append(f"{text.counted} valid, visible, non-whitespace chars (under {_MIN_TEXT_CHARS})")
+        few = f"{text.counted} valid, visible, non-whitespace chars (under {_MIN_TEXT_CHARS})"
+        found.append(_Shortfall("too_little_text", few))
     if text.chars and text.valid / text.chars < _MIN_VALID_RATIO:
         ratio = f"0.{text.valid * 1000 // text.chars:03d}"
         share = f"{text.valid} valid chars of its {text.chars} visible ones (leader runs aside)"
-        found.append(f"{share}, a ratio of {ratio} (under {_MIN_VALID_RATIO:.2f})")
+        found.append(_Shortfall("garbled_text", f"{share}, a ratio of {ratio} (under {_MIN_VALID_RATIO:.2f})"))
     return tuple(found)
 
 

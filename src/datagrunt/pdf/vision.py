@@ -106,7 +106,9 @@ against the elements: a mismatch is a warning.
    turned the wrong way or unreadable, so its text should not be trusted
    as is (#456). Its status and its text stay as they are (extraction never
    drops text), and no more OCR is run: the mean is the one the page
-   carries. A page of no words has no mean, and no such warning.
+   carries. A page of no words has no mean, and no such warning. OCR read
+   its image, so it is not image-only: its ``image_only_reasons`` are
+   ``()`` whatever A3 found short in its text (#470).
 
    It is how a page read the wrong way up shows: step 2 makes OSD's turn as
    OSD gives it, and on sparse text OSD can be wrong (see the known
@@ -155,13 +157,17 @@ page of its digital text, the page image when it was rendered, and a
 warning naming why. Words read before a band failed are not used: the page
 is the digital text's, never half of each. assemble_page is given the
 vision DPI and pixel bound the page was rendered within, so its warning
-that the page has no page image agrees with the image (#456).
+that the page has no page image agrees with the image (#456). It keeps
+A3's ``image_only_reasons`` (assemble_page's): nothing read its image, so
+its content lives only there for the reasons its text could not stand
+(#470).
 
 :func:`fallback_page` makes the A1 page of a page A2 could not read (its
 ``PageFailure``; spec §3.3 step 2, per-page fault isolation): only its
 geometry is read (``page_geometry``), then it is rendered and read as a
 vision page is, with no digital text and no figures (none was read). Read,
-it is ``"ocr_fallback"`` (route ``"vision"``, never verified): its quality
+it is ``"ocr_fallback"`` (route ``"vision"``, never verified, not
+image-only: ``image_only_reasons`` ``()``, #470): its quality
 is the OCR's (the words' chars by A3's rule, their mean confidence; no
 vector line, hidden span or skew was measured: 0, 0 and None), its first
 warning says extraction failed and what was not read, and a mean word
@@ -170,7 +176,9 @@ confidence under :data:`LOW_OCR_CONFIDENCE` is flagged as on a vision page
 ``"ocr_unavailable"`` page (its text is the digital text's). When its geometry,
 render or OCR fails too, or ``ocr="never"``, it is an ``"error"`` page (A1:
 no elements, no quality) whose ``error`` names the extraction failure and
-then why it was not read; a page whose geometry cannot be read is pdfium's
+then why it was not read, and whose ``image_only_reasons`` are
+``("extraction_failed",)`` (#470: nothing was read from it; OCR did not
+read a render it keeps); a page whose geometry cannot be read is pdfium's
 default 612 x 792 pt, with a warning.
 
 Known limitations (A5b evidence: 10 corpus pages forced to OCR):
@@ -232,7 +240,17 @@ from datagrunt.pdf.assembly import (
     page_figures,
     raw_page_warnings,
 )
-from datagrunt.pdf.elements import BBox, DocumentElement, Figure, HiddenReason, Page, PageImage, PageQuality, Table
+from datagrunt.pdf.elements import (
+    BBox,
+    DocumentElement,
+    Figure,
+    HiddenReason,
+    ImageOnlyReason,
+    Page,
+    PageImage,
+    PageQuality,
+    Table,
+)
 from datagrunt.pdf.exceptions import PDFCorruptError
 from datagrunt.pdf.layout import LatticeResult, find_lattice_tables, page_layout
 from datagrunt.pdf.ocr import OCRWord, Orientation, bands, normalized, ocr_words, orientation, rotated
@@ -293,6 +311,8 @@ _OCR_MODES: tuple[OcrMode, ...] = ("auto", "always", "never")
 # What pdfium reads for a page with no MediaBox: an error page whose own size cannot be read has this one.
 _DEFAULT_PAGE_SIZE = (612.0, 792.0)
 _NOT_READ = "the page was read by OCR of its render: its text layer, vector rules and images were not read"
+# An error page's image-only reason (#470): nothing was read from it.
+_EXTRACTION_FAILED: tuple[ImageOnlyReason, ...] = ("extraction_failed",)
 
 
 class VisionElements(NamedTuple):
@@ -929,7 +949,10 @@ def _unsized(failed: str, exc: PDFCorruptError) -> _Unread:
 
 
 def _error_page(page_number: int, geometry: PageGeometry | None, unread: _Unread) -> Page:
-    """The A1 error page: no elements, no quality, routed vision; its size the page's, or pdfium's default."""
+    """The A1 error page: no elements, no quality, routed vision, image-only (``extraction_failed``, #470).
+
+    Its size is the page's, or pdfium's default.
+    """
     width, height = (geometry.width_pt, geometry.height_pt) if geometry is not None else _DEFAULT_PAGE_SIZE
     return Page(
         page_number=page_number,
@@ -941,6 +964,7 @@ def _error_page(page_number: int, geometry: PageGeometry | None, unread: _Unread
         page_image=unread.image,
         error=unread.error,
         warnings=unread.warnings,
+        image_only_reasons=_EXTRACTION_FAILED,
     )
 
 

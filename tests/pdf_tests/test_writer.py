@@ -38,6 +38,7 @@ from pdf_tests.documents import (
     empty_document,
     figure,
     ids,
+    image_only_document,
     metadata,
     page,
     rich_document,
@@ -345,10 +346,20 @@ class TestWriteJsonl:
         first = json.loads(path.read_text(encoding="utf-8").split("\n")[0])
         assert list(first) == element_frame(document).columns
         assert first["bbox"] == {"x0": 72.0, "y0": 72.25, "x1": 540.5, "y1": 90.0}
-        assert first["scope_path"] == [] and first["hidden_reasons"] == []
+        assert first["scope_path"] == [] and first["hidden_reasons"] == [] and first["image_only_reasons"] == []
         hidden = json.loads(path.read_text(encoding="utf-8").split("\n")[4])
         assert hidden["hidden_reasons"] == ["tiny_font", "transparent"]
         assert hidden["scope_path"] == ["Intro"]
+
+    def test_image_only_reasons_is_an_array_or_null(self, tmp_path):
+        document = image_only_document()
+        path = PDFWriter(document).write_jsonl(tmp_path / "doc.jsonl")
+        lines = path.read_text(encoding="utf-8").splitlines()
+        rows = [json.loads(line) for line in lines]
+        assert rows == element_frame(document).to_dicts()
+        both, one = ["too_little_text", "garbled_text"], ["too_little_text"]
+        assert [row["image_only_reasons"] for row in rows] == [None] * 9 + [both] * 5 + [one]
+        assert lines[0].endswith(',"image_only_reasons":null}')
 
     def test_lines_are_compact_json(self, tmp_path):
         path = PDFWriter(rich_document()).write_jsonl(tmp_path / "doc.jsonl")
@@ -423,6 +434,7 @@ CSV_COLUMNS = [
     "route",
     "integrity_verified",
     "hidden_reasons",
+    "image_only_reasons",
 ]
 
 
@@ -441,7 +453,7 @@ def flattened(document: PDFDocument) -> pl.DataFrame:
             )
         rows.append(flat)
     schema = {name: frame.schema.get(name, pl.Float64) for name in CSV_COLUMNS}
-    schema.update(scope_path=pl.String, hidden_reasons=pl.String)
+    schema.update(scope_path=pl.String, hidden_reasons=pl.String, image_only_reasons=pl.String)
     return pl.DataFrame(rows, schema=schema, orient="row") if rows else pl.DataFrame(schema=schema)
 
 
@@ -460,6 +472,12 @@ class TestWriteParquet:
         frame = element_frame(document)
         assert back.schema == frame.schema
         assert back.equals(frame)
+
+    def test_image_only_reasons_and_their_nulls_read_back(self, tmp_path):
+        document = image_only_document()
+        back = pl.read_parquet(PDFWriter(document).write_parquet(tmp_path / "doc.parquet"))
+        assert back.equals(element_frame(document))
+        assert back["image_only_reasons"].null_count() == 9
 
     def test_an_empty_document_writes_the_schema_and_no_row(self, tmp_path):
         path = PDFWriter(empty_document()).write_parquet(tmp_path / "doc.parquet")
@@ -502,6 +520,22 @@ class TestWriteCsv:
         assert [json.loads(cell) for cell in back["hidden_reasons"]] == [
             list(e.hidden_reasons) for e in document.elements
         ]
+        assert back["image_only_reasons"].to_list() == ["[]"] * len(document.elements)
+
+    def test_image_only_reasons_is_a_json_array_and_not_recorded_is_an_empty_cell(self, tmp_path):
+        document = image_only_document()
+        path = PDFWriter(document).write_csv(tmp_path / "doc.csv")
+        back = pl.read_csv(path, schema=flattened(document).schema)
+        assert back.equals(flattened(document))
+        both, one = '["too_little_text","garbled_text"]', '["too_little_text"]'
+        assert back["image_only_reasons"].to_list() == [None] * 9 + [both] * 5 + [one]
+        lines = path.read_text(encoding="utf-8").split("\n")
+        assert lines[1].endswith(",[],")  # page 1's: hidden_reasons [], then an empty cell
+        assert lines[-2].endswith(',[],"[""too_little_text""]"')
+
+    def test_a_null_is_written_as_polars_writes_one(self, tmp_path):
+        path = PDFWriter(image_only_document()).write_csv(tmp_path / "doc.csv", null_value="NULL")
+        assert path.read_text(encoding="utf-8").split("\n")[1].endswith(",[],NULL")
 
     def test_bbox_columns_are_the_boxes(self, tmp_path):
         document = rich_document()

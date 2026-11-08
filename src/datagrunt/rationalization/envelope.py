@@ -40,14 +40,15 @@ document is never changed (invariant 2): everything below applies to the copy th
    ``<header_context>``, a copy of the document's ``header_context`` (its visible page-1 key-values, each the
    document's own element) as ordinary :func:`render_element` blocks with their own ids, so their values can be
    cited and grounded, leaving out any block the unit itself holds (every header key-value is a block of exactly
-   one unit, so a record shown only there is extracted once), and left out when nothing is left to show; one
+   one unit, so a record shown only there is extracted once), and left out when nothing is left to show (a
+   key-value on an image-only page, which no unit holds, is never copied: units module notes, 4); one
    ``<continues table="<id>" from="<earlier id>">`` per table of the unit that continues a visible table of the
    document, named by the table's ``continued_from_id`` (never by its headers or any text), holding the earlier
-   table's header row (a link to a hidden or missing table shows nothing of it); and ``<elements>``, holding the
-   unit's blocks joined by :data:`~datagrunt.rationalization.units.BLOCK_SEPARATOR`. Each framing text (the id, a
-   scope entry, a header row) is escaped as element text is (a transient paragraph, as for a caption, a scope
-   entry's built on its opener's id fields), its lines joined by spaces and U+2028 and U+2029 made spaces, then
-   :func:`escape`-d, so it stays on one line. The framing lies outside
+   table's header row (a link to a hidden or missing table, or to one on an image-only page, shows nothing of it);
+   and ``<elements>``, holding the unit's blocks joined by :data:`~datagrunt.rationalization.units.BLOCK_SEPARATOR`.
+   Each framing text (the id, a scope entry, a header row) is escaped as element text is (a transient paragraph, as
+   for a caption, a scope entry's built on its opener's id fields), its lines joined by spaces and U+2028 and U+2029
+   made spaces, then :func:`escape`-d, so it stays on one line. The framing lies outside
    ``max_unit_chars``, which measures the blocks. The header copy is framing, a copy of blocks page 1's own units
    send whole, so it is capped at :data:`HEADER_CONTEXT_MAX_CHARS`: blocks go in whole, in order, until the next
    would pass the cap, then one line says how many more are not shown. A first entry larger than the cap therefore
@@ -56,7 +57,8 @@ document is never changed (invariant 2): everything below applies to the copy th
    a part of a split one equal to it but for its rows (or items and markers). A part's rows are not checked against
    the original's rows: units come from :func:`~datagrunt.rationalization.units.build_units`, which cuts them from
    it, and checking them would cost each part its whole table. A unit's elements must share one group (one
-   section, or one page's elements in no section, units module notes, 3), whose scope is the unit's.
+   section, or one page's elements in no section, units module notes, 3), whose scope is the unit's, and none may
+   stand on an image-only page (units module notes, 4): nothing of such a page is sent, its scope entries included.
 4. **Messages** (:meth:`Envelope.render`). The system message is :data:`SYSTEM_RULES`, then the caller's prompt
    verbatim (it is trusted), then the response schema, then the directive naming this request's tags. The schema is
    a fixed lead-in line, ``The response schema, as JSON:``, and the response wrapper's canonical JSON (the
@@ -114,6 +116,7 @@ from datagrunt.rationalization.units import (
     PartOf,
     Unit,
     _check_bool,
+    _image_only_pages,
     _shared_openers,
     group_scopes,
 )
@@ -409,8 +412,9 @@ def element_escape_counts(element: DocumentElement) -> EscapeCounts:
 @dataclass(frozen=True, slots=True)
 class _Frame:
     """What every unit of one document shares, read once: its id, its header-context blocks (with their ids), its
-    visible tables (by id), its sections' scopes (by member id, :func:`~datagrunt.rationalization.units.group_scopes`)
-    and all its elements by id (to check a unit's)."""
+    visible tables (by id), its sections' scopes (by member id, :func:`~datagrunt.rationalization.units.group_scopes`),
+    all its elements by id (to check a unit's) and its image-only pages (units module notes, 4), whose elements no
+    unit holds."""
 
     doc_id: str
     header: tuple[tuple[str, str], ...]
@@ -418,6 +422,7 @@ class _Frame:
     tables: Mapping[str, Table]
     scopes: Mapping[str, GroupScope]
     elements: Mapping[str, DocumentElement]
+    closed: frozenset[int]
 
 
 def _more_note(count: int) -> str:
@@ -469,15 +474,23 @@ def _header_lines(frame: _Frame, own: frozenset[str]) -> tuple[list[str], tuple[
 
 
 def _frame(document: PDFDocument) -> _Frame:
+    """Read the document once; nothing of a page skipped as image-only (units module notes, 4) is framed."""
+    closed = _image_only_pages(document)
     elements = {element.element_id: element for element in document.elements}
-    header = _header_blocks(document.header_context, elements)
+    entries = tuple(entry for entry in document.header_context if entry.page_number not in closed)
+    header = _header_blocks(entries, elements)
     return _Frame(
         doc_id=document.metadata.doc_id,
         header=header,
         header_ids=frozenset(element_id for element_id, _ in header),
-        tables={table.element_id: table for table in document.tables if not table.hidden_reasons},
+        tables={
+            table.element_id: table
+            for table in document.tables
+            if not table.hidden_reasons and table.page_number not in closed
+        },
         scopes=group_scopes(document),
         elements=elements,
+        closed=closed,
     )
 
 
@@ -813,6 +826,16 @@ def _check_elements(unit: Unit, elements: Mapping[str, DocumentElement]) -> None
             )
 
 
+def _check_pages_sent(unit: Unit, closed: frozenset[int]) -> None:
+    """Require no element of the unit to stand on an image-only page, which no unit holds (units module notes, 4)."""
+    for element in unit.elements:
+        if element.page_number in closed:
+            raise ValueError(
+                f"unit {unit.unit_id}: element {element.element_id} is on page {element.page_number}, which is "
+                "image-only: no unit holds its elements"
+            )
+
+
 def _group_of(element: DocumentElement, frame: _Frame) -> tuple[str, int]:
     """An element's group (units module notes, 3): its section's index, else its page's number."""
     scope = frame.scopes.get(element.element_id)
@@ -834,6 +857,7 @@ def _check_unit(unit: object, frame: _Frame, *, coalesce_sections: bool = False)
     if unit.doc_id != frame.doc_id:
         raise ValueError(f"unit {unit.unit_id} has doc_id {unit.doc_id!r}, not the document's {frame.doc_id!r}")
     _check_elements(unit, frame.elements)
+    _check_pages_sent(unit, frame.closed)
     if not coalesce_sections:
         _check_one_group(unit, frame)
     expected = tuple(opener.text for opener in _openers(unit, frame))
@@ -875,10 +899,10 @@ def build_envelopes(
     Raises:
         TypeError: If ``units`` is not a tuple or list of ``Unit``, ``document`` not a ``PDFDocument``,
             ``prompt`` or ``schema_json`` not a ``str``, or ``coalesce_sections`` / ``include_schema`` not a ``bool``.
-        ValueError: If a unit is of another document, holds an element that is not the document's, has blocks
-            that are not :func:`render_element`'s, elements of more than one group (when ``coalesce_sections`` is
-            ``False``) or a scope path other than its expected visible opener scope, or a header context entry is
-            hidden, off page 1 or not the document's.
+        ValueError: If a unit is of another document, holds an element that is not the document's or one on an
+            image-only page, has blocks that are not :func:`render_element`'s, elements of more than one group (when
+            ``coalesce_sections`` is ``False``) or a scope path other than its expected visible opener scope, or a
+            header context entry is hidden, off page 1 or not the document's.
         RationalizationError: If ``prompt`` is blank or not encodable, ``context`` does not serialize to JSON or
             is past :data:`CONTEXT_MAX_BYTES`, or ``schema_json`` is not a JSON object's canonical JSON, holds an R8
             code point or is past :data:`SCHEMA_MAX_BYTES`.

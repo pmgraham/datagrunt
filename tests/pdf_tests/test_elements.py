@@ -28,7 +28,15 @@ from datagrunt.pdf import (
     Paragraph,
     Table,
 )
-from datagrunt.pdf.elements import ExtractionMethod, PageRoute, PageStatus, PDFDocument, make_element_id
+from datagrunt.pdf.elements import (
+    IMAGE_ONLY_REASONS,
+    ExtractionMethod,
+    ImageOnlyReason,
+    PageRoute,
+    PageStatus,
+    PDFDocument,
+    make_element_id,
+)
 from pdf_tests.documents import ids, metadata, page, rich_document
 
 
@@ -91,6 +99,29 @@ class TestTypeAliases:
             "superseded",
             "unchecked_background",
         )
+
+    def test_image_only_reasons_canonical_order(self):
+        # Append-only: a new reason goes last, so the order of these never changes (#470).
+        expected = ("too_little_text", "garbled_text", "extraction_failed")
+        assert IMAGE_ONLY_REASONS == get_args(ImageOnlyReason) == expected
+
+    @pytest.mark.parametrize(
+        "allowed,error,match",
+        [
+            pytest.param(
+                ("too_little_text", "no_text"),
+                ValueError,
+                r"allowed has unknown reason\(s\) \['no_text'\]",
+                id="unknown",
+            ),
+            pytest.param(("garbled_text", "garbled_text"), ValueError, "allowed has duplicate entries", id="repeated"),
+            pytest.param(["garbled_text"], TypeError, "allowed must be a tuple", id="list"),
+        ],
+    )
+    def test_check_image_only_reasons_refuses_an_allowed_set_it_does_not_know(self, allowed, error, match):
+        # An unknown allowed reason must fail loud, not narrow the rule silently (#470 review).
+        with pytest.raises(error, match=match):
+            elements_module.check_image_only_reasons((), allowed=allowed)
 
     def test_page_status_values(self):
         assert get_args(PageStatus) == ("ok", "ocr_fallback", "ocr_unavailable", "error")

@@ -82,6 +82,23 @@ order of the older ones never changes.
 # Canonical order, derived from the Literal so the two can never drift apart.
 HIDDEN_REASONS: tuple[HiddenReason, ...] = get_args(HiddenReason)
 
+ImageOnlyReason: TypeAlias = Literal["too_little_text", "garbled_text", "extraction_failed"]
+"""Why a page's content lives only in its page image (``Page.image_only_reasons``).
+
+``too_little_text`` means the page has too few valid, visible,
+non-whitespace characters for its text to stand, yet it draws paint OCR
+could read (an image, or vector paint with area on the visible page).
+``garbled_text`` means too small a share of its visible characters is
+valid. These two are the v5 quality stage's routing shortfalls
+(:mod:`datagrunt.pdf.quality`): a page with either goes to OCR unless
+``ocr="never"``. ``extraction_failed`` means the page's digital extraction
+failed, so nothing was read from it (an error page). New reasons are
+appended, so the canonical order never changes.
+"""
+
+# Canonical order, derived from the Literal so the two can never drift apart.
+IMAGE_ONLY_REASONS: tuple[ImageOnlyReason, ...] = get_args(ImageOnlyReason)
+
 PageStatus: TypeAlias = Literal["ok", "ocr_fallback", "ocr_unavailable", "error"]
 PageRoute: TypeAlias = Literal["digital", "hybrid", "vision"]
 ExtractionMethod: TypeAlias = Literal["lattice", "stream"]
@@ -194,15 +211,45 @@ def check_hidden_reasons(value: object) -> None:
         TypeError: If ``value`` is not a tuple of str.
         ValueError: If a reason is unknown, repeated, or out of canonical order.
     """
-    reasons = str_tuple("hidden_reasons", value)
-    unknown = [reason for reason in reasons if reason not in HIDDEN_REASONS]
+    _check_canonical_reasons("hidden_reasons", str_tuple("hidden_reasons", value), HIDDEN_REASONS)
+
+
+def _check_canonical_reasons(name: str, reasons: tuple[str, ...], known: tuple[str, ...]) -> None:
+    """Require every one of ``reasons`` to be one of ``known``, each once, in ``known``'s (canonical) order."""
+    unknown = [reason for reason in reasons if reason not in known]
     if unknown:
-        raise ValueError(f"hidden_reasons has unknown reason(s) {unknown}; allowed: {HIDDEN_REASONS}")
+        raise ValueError(f"{name} has unknown reason(s) {unknown}; allowed: {known}")
     if len(set(reasons)) != len(reasons):
-        raise ValueError(f"hidden_reasons has duplicate entries: {reasons}")
-    canonical = tuple(reason for reason in HIDDEN_REASONS if reason in reasons)
+        raise ValueError(f"{name} has duplicate entries: {reasons}")
+    canonical = tuple(reason for reason in known if reason in reasons)
     if reasons != canonical:
-        raise ValueError(f"hidden_reasons must be in canonical order {canonical}, got {reasons}")
+        raise ValueError(f"{name} must be in canonical order {canonical}, got {reasons}")
+
+
+def check_image_only_reasons(value: object, *, allowed: tuple[ImageOnlyReason, ...] = IMAGE_ONLY_REASONS) -> None:
+    """Require unique image-only reasons, each one of ``allowed``, in ``IMAGE_ONLY_REASONS`` order.
+
+    The one rule for every ``image_only_reasons`` tuple: a page's here
+    (which may also be None), and the v5 quality stage's assessments
+    (:mod:`datagrunt.pdf.quality`), which allow only its routing shortfalls.
+
+    Raises:
+        TypeError: If ``value`` or ``allowed`` is not a tuple of str.
+        ValueError: If ``allowed`` holds a reason that is not an ``ImageOnlyReason`` or holds one twice, or a
+            reason in ``value`` is not one of ``allowed``, is repeated, or is out of canonical order.
+    """
+    _check_canonical_reasons("allowed", str_tuple("allowed", allowed), IMAGE_ONLY_REASONS)
+    known = tuple(reason for reason in IMAGE_ONLY_REASONS if reason in allowed)
+    _check_canonical_reasons("image_only_reasons", str_tuple("image_only_reasons", value), known)
+
+
+def _check_image_only_reasons(value: object) -> None:
+    """Require None or unique, known image-only reasons in ``IMAGE_ONLY_REASONS`` order."""
+    if value is None:
+        return
+    if not isinstance(value, tuple):
+        raise TypeError(f"image_only_reasons must be a tuple or None, got {type(value).__name__}")
+    check_image_only_reasons(value)
 
 
 def _check_choice(name: str, value: object, choices: tuple[str, ...]) -> str:
@@ -1175,6 +1222,8 @@ class PageImage:
 _PAGE_STATUSES: tuple[PageStatus, ...] = get_args(PageStatus)
 # Statuses that only a vision-route page can have.
 _VISION_ONLY_STATUSES: tuple[PageStatus, ...] = ("ocr_fallback", "ocr_unavailable")
+# Statuses of a vision page whose page image OCR read: such a page is never image-only.
+_OCR_READ_STATUSES: tuple[PageStatus, ...] = ("ok", "ocr_fallback")
 # Public (exported from datagrunt.pdf), like HIDDEN_REASONS: the routes a page can take, in PageRoute's order;
 # the v5 quality stage (datagrunt.pdf.quality) checks routes with it.
 PAGE_ROUTES: tuple[PageRoute, ...] = get_args(PageRoute)
@@ -1258,6 +1307,17 @@ class Page:
         integrity_verified: True if the elements passed the integrity check.
         error: Why extraction failed; set exactly when ``status == "error"``.
         warnings: Non-fatal problems met while extracting the page.
+        image_only_reasons: Why the page's content lives only in its page
+            image (:data:`ImageOnlyReason`, unique, in ``IMAGE_ONLY_REASONS``
+            order). Non-empty: the page's text could not stand and nothing
+            read its image. ``()``: its text stands or OCR read it. ``None``:
+            not recorded (a document from an older datagrunt). A tuple or
+            None, never a list. ``"extraction_failed"`` marks only an error
+            page and the text shortfalls only a page that is not one; a page
+            OCR read (route ``"vision"``, status ``"ok"`` or
+            ``"ocr_fallback"``) has none. An error page may also have ``()``
+            or ``None``. ``PDFDocument.image_only_pages`` lists the marked
+            pages.
     """
 
     page_number: int
@@ -1271,10 +1331,12 @@ class Page:
     integrity_verified: bool = False
     error: str | None = None
     warnings: tuple[str, ...] = ()
+    image_only_reasons: tuple[ImageOnlyReason, ...] | None = ()
 
     def __post_init__(self) -> None:
         self._validate_fields()
         self._check_status()
+        self._check_image_only()
         if self.page_image is not None and self.page_image.page_number != self.page_number:
             raise ValueError(
                 f"page_image.page_number {self.page_image.page_number} must equal page_number {self.page_number}"
@@ -1296,6 +1358,7 @@ class Page:
         _check_bool("integrity_verified", self.integrity_verified)
         optional_str("error", self.error)
         str_tuple("warnings", self.warnings)
+        _check_image_only_reasons(self.image_only_reasons)
 
     def _check_status(self) -> None:
         """Enforce the status / route / error / quality / integrity_verified invariants."""
@@ -1322,6 +1385,21 @@ class Page:
             raise ValueError(f"an error page must have quality None, got a {type(self.quality).__name__}")
         if self.integrity_verified:
             raise ValueError("an error page cannot be integrity_verified")
+
+    def _check_image_only(self) -> None:
+        """Enforce which pages each image-only reason may mark (see ``image_only_reasons``)."""
+        reasons = self.image_only_reasons or ()
+        if self.status == "error":
+            if any(reason != "extraction_failed" for reason in reasons):
+                raise ValueError(f"an error page's image_only_reasons may hold only 'extraction_failed', got {reasons}")
+            return
+        if "extraction_failed" in reasons:
+            raise ValueError(
+                f"image_only_reasons 'extraction_failed' requires status 'error', got status={self.status!r}"
+            )
+        if reasons and self.route == "vision" and self.status in _OCR_READ_STATUSES:
+            where = f"route 'vision', status {self.status!r}"
+            raise ValueError(f"a page OCR read ({where}) cannot have image_only_reasons, got {reasons}")
 
     def _check_elements(self) -> None:
         """Enforce page membership, unique ids, strictly increasing reading order, and page bounds."""
@@ -1359,6 +1437,10 @@ class Page:
     def to_markdown(self, *, include_hidden: bool = False) -> str:
         """Render a ``<!-- page N route=R status=S -->`` comment, then each element, blank-line separated.
 
+        An image-only page's comment also names its reasons, comma-joined in
+        canonical order (``<!-- page N route=R status=S image_only=a,b -->``):
+        its content lives only in its page image. A page whose
+        ``image_only_reasons`` is ``()`` or ``None`` gets the plain comment.
         A hidden element is omitted, or rendered behind its marker with
         ``include_hidden=True`` (see the module notes). Consecutive lists get
         a ``<!-- -->`` line between them so they stay separate lists.
@@ -1366,8 +1448,10 @@ class Page:
         Raises:
             TypeError: If ``include_hidden`` is not a bool.
         """
-        header = f"<!-- page {self.page_number} route={self.route} status={self.status} -->"
-        return "\n\n".join([header, *_render_elements(self.elements, include_hidden)])
+        marker = f"page {self.page_number} route={self.route} status={self.status}"
+        if self.image_only_reasons:
+            marker = f"{marker} image_only={','.join(self.image_only_reasons)}"
+        return "\n\n".join([f"<!-- {marker} -->", *_render_elements(self.elements, include_hidden)])
 
 
 def _check_page_span(value: object) -> tuple[int, int]:
@@ -1614,6 +1698,7 @@ class _DocumentIndex:
     figures: tuple[Figure, ...]
     page_images: tuple[PageImage, ...]
     degraded_pages: tuple[int, ...]
+    image_only_pages: tuple[int, ...]
     integrity_verified: bool
 
 
@@ -1632,6 +1717,8 @@ def _build_index(pages: tuple[Page, ...], elements: tuple[DocumentElement, ...])
         figures=tuple(element for element in elements if isinstance(element, Figure)),
         page_images=tuple(page.page_image for page in pages if page.page_image is not None),
         degraded_pages=tuple(page.page_number for page in pages if page.status != "ok"),
+        # None (not recorded) and () alike are falsy: neither marks a page image-only.
+        image_only_pages=tuple(page.page_number for page in pages if page.image_only_reasons),
         integrity_verified=(
             not has_error_page and bool(verifiable) and all(page.integrity_verified for page in verifiable)
         ),
@@ -1765,6 +1852,15 @@ class PDFDocument:
     def degraded_pages(self) -> tuple[int, ...]:
         """1-based numbers of pages whose status is not ``"ok"`` (error, ocr_fallback, ocr_unavailable)."""
         return self._index.degraded_pages
+
+    @property
+    def image_only_pages(self) -> tuple[int, ...]:
+        """1-based numbers of pages whose content lives only in their page image (non-empty ``image_only_reasons``).
+
+        A page whose ``image_only_reasons`` is ``()`` (its text stands, or OCR
+        read it) or ``None`` (not recorded) is not one of them.
+        """
+        return self._index.image_only_pages
 
     @property
     def integrity_verified(self) -> bool:

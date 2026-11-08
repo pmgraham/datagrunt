@@ -34,7 +34,8 @@ from datagrunt.pdf.pipeline import extract_document
 from datagrunt.pdf.reader import PDFReader
 from datagrunt.pdf.render import effective_dpi, render_page, render_size
 from pdf_tests.builders import PageSpec, RasterImage, Rect, TextRun, build_pdf, solid_png
-from pdf_tests.documents import empty_document
+from pdf_tests.documents import empty_document, image_only_document
+from pdf_tests.old_formats import as_version_1
 from pdf_tests.test_ocr import needs_tesseract
 from pdf_tests.test_pipeline import mixed_page
 from pdf_tests.test_routing import garbled_page
@@ -513,6 +514,35 @@ class TestFrame:
         assert reader.to_dataframe().schema == FRAME_SCHEMA
         assert (reader.to_dataframe().height, reader.to_dicts(), reader.get_sample().height) == (0, [], 0)
         assert reader.to_arrow_table().num_rows == 0
+
+
+class TestImageOnly:
+    """Every view carries each row's page's ``image_only_reasons`` (#470); an older document's read null."""
+
+    EXPECTED = [None] * 9 + [["too_little_text", "garbled_text"]] * 5 + [["too_little_text"]]
+
+    def test_every_view_holds_the_column(self):
+        document = image_only_document()
+        reader = PDFReader(document_to_json(document))
+
+        assert reader.document == document and reader.document.image_only_pages == (2, 3, 4)
+        assert reader.to_dataframe()["image_only_reasons"].to_list() == self.EXPECTED
+        assert reader.to_arrow_table().column("image_only_reasons").to_pylist() == self.EXPECTED
+        assert [row["image_only_reasons"] for row in reader.to_dicts()] == self.EXPECTED
+
+    def test_sql_reads_the_column(self):
+        reader = PDFReader(document_to_json(image_only_document()))
+        marked = f"SELECT DISTINCT page_number FROM {reader.db_table} WHERE len(image_only_reasons) > 0 ORDER BY 1"
+        unrecorded = f"SELECT count(*) AS n FROM {reader.db_table} WHERE image_only_reasons IS NULL"
+
+        assert reader.query_data(marked).dicts() == [{"page_number": 2}, {"page_number": 3}]
+        assert reader.query_data(unrecorded).dicts() == [{"n": 9}]
+
+    def test_a_version_1_documents_pages_read_not_recorded(self):
+        reader = PDFReader(as_version_1(document_to_json(image_only_document())))
+
+        assert [page.image_only_reasons for page in reader.pages] == [None] * 4
+        assert reader.to_dataframe()["image_only_reasons"].to_list() == [None] * 15
 
 
 def connections_of(monkeypatch) -> list:

@@ -63,7 +63,8 @@ own (A1's immutable elements). Its views:
 - :meth:`PDFReader.to_dataframe`: A7a's element frame
   (:func:`~datagrunt.pdf.frame.element_frame`, ``hidden_reasons``
   included: hidden text is flagged, never dropped, so filter it out by that
-  column), one row per element in document order. It is built once, on
+  column; ``image_only_reasons`` holds each row's page's, #470), one row per
+  element in document order. It is built once, on
   first use, and each call returns its own clone (cheap: the buffers are
   shared, and a change to one does not reach the reader's).
 - :meth:`PDFReader.to_arrow_table`: that frame as Arrow, of A7a's fixed

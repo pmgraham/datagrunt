@@ -35,6 +35,8 @@ V5_MODEL_NAMES = [
     "DocumentElement",
     "HiddenReason",
     "HIDDEN_REASONS",
+    "ImageOnlyReason",
+    "IMAGE_ONLY_REASONS",
     "PageStatus",
     "PageRoute",
     "PAGE_ROUTES",

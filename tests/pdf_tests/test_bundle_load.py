@@ -21,8 +21,10 @@ import pytest
 from datagrunt.pdf import bundle
 from datagrunt.pdf.bundle import load_bundle
 from datagrunt.pdf.exceptions import BundleCorruptError, DatagruntPDFError
+from datagrunt.pdf.reader import PDFReader
 from pdf_tests.builders import PageSpec, TextRun, build_pdf
-from pdf_tests.documents import FIGURE_A_SHA, FIGURE_B_SHA, metadata, surrogate_document
+from pdf_tests.documents import FIGURE_A_SHA, FIGURE_B_SHA, metadata, surrogate_document, with_image_only
+from pdf_tests.old_formats import as_bundle_5_0, as_version_1
 from pdf_tests.test_bundle import (
     OWN_BANDS,
     OWN_IMAGE,
@@ -337,10 +339,16 @@ class TestContainment:
 
 
 class TestManifest:
-    @pytest.mark.parametrize("version", ["6.0", "4.0", 5.0, None, ""])
+    @pytest.mark.parametrize("version", ["6.0", "4.0", "5.1", "5.2", "5.3.0", "5", 5.0, 5.3, None, "", ["5.3"]])
     def test_an_unknown_bundle_version_is_refused(self, copy, version):
         edit_manifest(copy, lambda data: data.update(bundle_format_version=version))
-        with pytest.raises(BundleCorruptError, match=r"manifest\.json: bundle_format_version .* is not supported"):
+        message = r"manifest\.json: bundle_format_version .* is not supported: this datagrunt reads '5\.0', '5\.3'"
+        with pytest.raises(BundleCorruptError, match=message):
+            load_bundle(copy)
+
+    def test_a_manifest_without_a_version_is_refused(self, copy):
+        edit_manifest(copy, lambda data: data.pop("bundle_format_version"))
+        with pytest.raises(BundleCorruptError, match=r"manifest\.json: .*missing key\(s\) \['bundle_format_version'\]"):
             load_bundle(copy)
 
     @pytest.mark.parametrize(
@@ -369,6 +377,11 @@ class TestManifest:
             (lambda d: d.update(integrity_verified=0), "integrity_verified must be a bool"),
             (lambda d: d.update(degraded_pages="3,4"), "degraded_pages must be a JSON array"),
             (lambda d: d.update(degraded_pages=[0]), r"degraded_pages\[0\] must be >= 1"),
+            (lambda d: d.pop("image_only_pages"), r"missing key\(s\) \['image_only_pages'\]"),
+            (lambda d: d.update(image_only_pages="3"), "image_only_pages must be a JSON array"),
+            (lambda d: d.update(image_only_pages=None), "image_only_pages must be a JSON array"),
+            (lambda d: d.update(image_only_pages=[0]), r"image_only_pages\[0\] must be >= 1"),
+            (lambda d: d.update(image_only_pages=[True]), r"image_only_pages\[0\] must be an int"),
             (lambda d: d.update(artifacts={}), "artifacts must be a JSON array"),
             (lambda d: d["artifacts"][0].update(size=-1), r"artifacts\[0\]\.size must be >= 0"),
             (lambda d: d["artifacts"][0].update(size=True), r"artifacts\[0\]\.size must be an int"),
@@ -434,6 +447,7 @@ class TestDocumentAgainstManifest:
             (lambda d: d.update(source_sha256="0" * 64), "source_sha256 .* is not the document's"),
             (lambda d: d.update(integrity_verified=True), "integrity_verified True is not the document's False"),
             (lambda d: d.update(degraded_pages=[3]), r"degraded_pages \[3\] are not the document's \[3, 4\]"),
+            (lambda d: d.update(image_only_pages=[3]), r"image_only_pages \[3\] are not the document's \[\]"),
         ],
     )
     def test_the_manifests_facts_must_be_the_documents(self, copy, change, message):
@@ -442,8 +456,26 @@ class TestDocumentAgainstManifest:
             load_bundle(copy)
 
     def test_a_document_json_the_codec_refuses_is_refused_naming_it(self, copy):
-        edit_document_json(copy, lambda data: data.update(version=2))
-        with pytest.raises(BundleCorruptError, match=r"json/document\.json: version 2 is not supported"):
+        edit_document_json(copy, lambda data: data.update(version=99))
+        with pytest.raises(BundleCorruptError, match=r"json/document\.json: version 99 is not supported"):
+            load_bundle(copy)
+
+    def test_a_manifests_image_only_pages_must_be_its_documents(self, copy):
+        def marked(data):
+            data["pages"][1]["image_only_reasons"] = ["too_little_text"]
+
+        edit_document_json(copy, marked)
+        with pytest.raises(
+            BundleCorruptError, match=r"manifest\.json: image_only_pages \[\] are not the document's \[2\]"
+        ):
+            load_bundle(copy)
+        edit_manifest(copy, lambda data: data.update(image_only_pages=[2]))
+        assert load_bundle(copy).image_only_pages == (2,)
+
+    def test_a_format_5_3_bundles_document_json_must_be_version_2(self, copy):
+        edit_document_json(copy, lambda data: data.update(as_version_1(data)))
+        message = r"json/document\.json: version 1 is not supported here: version 2 is required"
+        with pytest.raises(BundleCorruptError, match=message):
             load_bundle(copy)
 
     def test_a_page_without_its_image_needs_a_missing_entry(self, copy):
@@ -538,6 +570,76 @@ class TestDocumentAgainstManifest:
         edit_manifest(copy, lambda data: data["missing"].append(stale))
         with pytest.raises(BundleCorruptError, match=r"recorded but present: \[\('page_image', 1, None\)\]"):
             load_bundle(copy)
+
+
+class TestBundleFormat50:
+    """A bundle datagrunt 5.0 to 5.2 wrote (format "5.0", its document JSON version 1) still loads, verified."""
+
+    @pytest.fixture
+    def old(self, copy):
+        """The module's bundle, as datagrunt 5.2.2 wrote it, and its document as this datagrunt loads it."""
+        loaded = load_bundle(copy)
+        as_bundle_5_0(copy)
+        return SimpleNamespace(out=copy, loaded=loaded)
+
+    def test_it_loads_with_each_page_not_recorded(self, old):
+        loaded = load_bundle(old.out)
+        assert manifest(old.out)["bundle_format_version"] == "5.0" and "image_only_pages" not in manifest(old.out)
+        assert [page.image_only_reasons for page in loaded.pages] == [None] * 4
+        assert loaded == with_image_only(old.loaded, dict.fromkeys((1, 2, 3, 4)))
+        assert loaded.image_only_pages == ()
+
+    def test_its_files_read_through_verifying_readers(self, old):
+        loaded = load_bundle(old.out)
+        assert [figure.read_bytes() for figure in loaded.figures] == [PNG_A, PNG_A, PNG_B]
+        assert (loaded.pages[2].page_image.read_bytes(), loaded.pages[2].page_image.read_bands()) == (
+            OWN_IMAGE,
+            OWN_BANDS,
+        )
+        flipped(old.out / A_PNG)
+        with pytest.raises(BundleCorruptError, match=f"{A_PNG}: its sha256"):
+            loaded.figures[0].read_bytes()
+
+    def test_pdfreader_reads_it(self, old):
+        reader = PDFReader(old.out)
+        assert reader.document == load_bundle(old.out)
+        frame = reader.to_dataframe()
+        assert frame["image_only_reasons"].to_list() == [None] * frame.height and frame.height == 15
+        sql = f"SELECT count(*) AS n FROM {reader.db_table} WHERE image_only_reasons IS NULL"
+        assert reader.query_data(sql).dicts() == [{"n": 15}]
+
+    def test_it_must_hold_exactly_its_own_keys(self, old):
+        edit_manifest(old.out, lambda data: data.update(image_only_pages=[]))
+        with pytest.raises(BundleCorruptError, match=r"manifest\.json: .*unknown key\(s\) \['image_only_pages'\]"):
+            load_bundle(old.out)
+
+    def test_its_document_json_must_be_version_1(self, old):
+        def as_version_2(data):
+            data["version"] = 2
+            for page in data["pages"]:
+                page["image_only_reasons"] = []
+
+        edit_document_json(old.out, as_version_2)
+        message = r"json/document\.json: version 2 is not supported here: version 1 is required"
+        with pytest.raises(BundleCorruptError, match=message):
+            load_bundle(old.out)
+
+    def test_its_document_is_checked_against_the_manifest_as_before(self, old):
+        edit_manifest(old.out, lambda data: data.update(degraded_pages=[3]))
+        with pytest.raises(BundleCorruptError, match=r"degraded_pages \[3\] are not the document's \[3, 4\]"):
+            load_bundle(old.out)
+
+    def test_it_writes_again_as_format_5_3(self, old, written, tmp_path, monkeypatch, recwarn):
+        monkeypatch.setattr(bundle, "render_page", fake_render)
+        again = write(load_bundle(old.out), tmp_path / "again", written.source)
+        data = manifest(tmp_path / "again")
+        assert (data["bundle_format_version"], data["image_only_pages"], data["missing"]) == ("5.3", [], [])
+        document = json.loads((tmp_path / "again" / "json" / "document.json").read_bytes())
+        assert document["version"] == 2
+        assert [page["image_only_reasons"] for page in document["pages"]] == [None] * 4
+        rows = [json.loads(line) for line in (tmp_path / "again" / "json" / "elements.jsonl").read_bytes().splitlines()]
+        assert [row["image_only_reasons"] for row in rows] == [None] * 15
+        assert load_bundle(tmp_path / "again") == again and [str(w.message) for w in recwarn] == []
 
 
 class TestArguments:

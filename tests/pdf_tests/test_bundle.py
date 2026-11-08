@@ -40,7 +40,17 @@ from datagrunt.pdf.pipeline import extract_document
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page, render_size
 from datagrunt.pdf.writer import PDFWriter
 from pdf_tests.builders import PageSpec, TextRun, build_pdf, hand_written_pdf, solid_png
-from pdf_tests.documents import FIGURE_A_SHA, FIGURE_B_SHA, PAGE_SIZES, metadata, rich_document, surrogate_document
+from pdf_tests.documents import (
+    FIGURE_A_SHA,
+    FIGURE_B_SHA,
+    IMAGE_ONLY,
+    PAGE_SIZES,
+    metadata,
+    rich_document,
+    surrogate_document,
+    with_image_only,
+)
+from pdf_tests.old_formats import as_bundle_5_0
 from pdf_tests.test_layout_stream_tables import body_text
 
 PNG_A = solid_png(64, 32, (0.2, 0.4, 0.6))
@@ -278,6 +288,7 @@ class TestManifest:
             "extraction_params",
             "integrity_verified",
             "degraded_pages",
+            "image_only_pages",
             "page_images",
             "artifacts",
             "missing",
@@ -285,14 +296,27 @@ class TestManifest:
 
     def test_manifest_values(self, written):
         manifest = manifest_of(written.out)
-        assert manifest["bundle_format_version"] == BUNDLE_FORMAT_VERSION == "5.0"
+        assert manifest["bundle_format_version"] == BUNDLE_FORMAT_VERSION == "5.3"
         assert manifest["datagrunt_version"] == datagrunt.__version__
         assert manifest["source_sha256"] == sha_of(written.source) == written.document.metadata.sha256
         params = {"dpi": DPI, "vision_dpi": VISION_DPI, "max_render_pixels": 16_000_000, "workers": pipeline.WORKERS}
         assert manifest["extraction_params"] == params
         assert manifest["integrity_verified"] is False is written.document.integrity_verified
         assert manifest["degraded_pages"] == [3, 4]
+        assert manifest["image_only_pages"] == [] == list(written.document.image_only_pages)
         assert manifest["missing"] == []
+
+    def test_image_only_pages_are_the_documents_and_their_reasons_load_back(self, tmp_path, source, fast_render):
+        document = with_image_only(bound_document(source), IMAGE_ONLY)
+        returned = write(document, tmp_path / "out", source)
+        assert manifest_of(tmp_path / "out")["image_only_pages"] == [2, 3, 4] == list(document.image_only_pages)
+        data = json.loads((tmp_path / "out" / "json" / "document.json").read_bytes())
+        assert [page["image_only_reasons"] for page in data["pages"]] == [
+            None if IMAGE_ONLY[n] is None else list(IMAGE_ONLY[n]) for n in (1, 2, 3, 4)
+        ]
+        loaded = load_bundle(tmp_path / "out")
+        assert loaded == returned
+        assert [page.image_only_reasons for page in loaded.pages] == [IMAGE_ONLY[n] for n in (1, 2, 3, 4)]
 
     def test_each_page_image_records_its_origin_dpi_and_normalization(self, written):
         render = {"origin": "render", "dpi": float(DPI), "contrast_normalized": False}
@@ -800,6 +824,7 @@ class TestFiguresSharingAStream:
         assert manifest_of(out)["missing"] == []
         assert [figure.read_bytes() for figure in load_bundle(out).figures] == own
 
+    # Its pages are image-only under ocr="never" (a figure, no text: #470): the loaded bundle's pages keep the marker.
     def test_a_figure_is_read_though_an_earlier_one_of_its_stream_failed(self, tmp_path):
         document, returned = self.bundled(tmp_path, UNREADABLE, AS_RGB)
         sha, out = document.figures[0].sha256, tmp_path / "out"
@@ -808,6 +833,7 @@ class TestFiguresSharingAStream:
         [missing] = manifest_of(out)["missing"]
         assert (missing["artifact"], missing["page_number"], missing["element_id"]) == ("figure", 1, "p0001_e000")
         assert load_bundle(out) == returned
+        assert returned.image_only_pages == (1, 2) == tuple(manifest_of(out)["image_only_pages"])
 
     def test_each_figure_not_written_has_its_own_missing_entry(self, tmp_path):
         _, returned = self.bundled(tmp_path, UNREADABLE, UNREADABLE)
@@ -1498,6 +1524,33 @@ class TestReuse:
         with pytest.raises(FileExistsError, match="its document is not this one"):
             write(changed, tmp_path / "out", source)
 
+    def test_a_bundle_of_the_older_format_is_not_this_writes(self, tmp_path, source, fast_render):
+        # Format 5.0 (datagrunt 5.0 to 5.2), of this datagrunt's version and parameters: its own loaded document
+        # included, which a format check alone tells from this write's (it records no image-only reasons).
+        out = tmp_path / "out"
+        document = bound_document(source)
+        write(document, out, source)
+        as_bundle_5_0(out)
+        old = load_bundle(out)
+        before = tree_of(out)
+        for given in (document, old):
+            with pytest.raises(FileExistsError, match=r"its bundle format is '5\.0', not '5\.3'"):
+                write(given, out, source)
+        assert tree_of(out) == before and leftovers(tmp_path) == []
+
+    def test_overwrite_replaces_a_bundle_of_the_older_format_with_this_one(self, tmp_path, source, fast_render):
+        out = tmp_path / "out"
+        write(bound_document(source), out, source)
+        as_bundle_5_0(out)
+        old = load_bundle(out)
+        replaced = write(old, out, source, overwrite=True)
+        manifest = manifest_of(out)
+        assert (manifest["bundle_format_version"], manifest["image_only_pages"]) == ("5.3", [])
+        data = json.loads((out / "json" / "document.json").read_bytes())
+        assert data["version"] == 2 and [page["image_only_reasons"] for page in data["pages"]] == [None] * 4
+        assert load_bundle(out) == replaced and [page.image_only_reasons for page in replaced.pages] == [None] * 4
+        assert leftovers(tmp_path) == []
+
 
 # A version an editable install's metadata can still hold after the code moved on: installed metadata is stale there.
 STALE = "4.6.37"
@@ -1664,3 +1717,156 @@ class TestImageAndRenderSkipping:
         with pytest.raises(TypeError, match=f"{param} must be a bool"):
             write(bound_document(source), tmp_path / "out", source, **{param: value})
         assert not (tmp_path / "out").exists()
+
+
+def only_copy(*reasons: str) -> str:
+    """The clause #471 appends to an image-only page's missing page image reason."""
+    return f"; its content lives only in its page image ({', '.join(reasons)}): the source PDF is its only full copy"
+
+
+def page_image_reasons(out: Path) -> list[tuple[int, str]]:
+    """Each missing page image's page number and reason, in the manifest's order."""
+    return [(m["page_number"], m["reason"]) for m in manifest_of(out)["missing"] if m["artifact"] == "page_image"]
+
+
+def only_copy_warnings(caught) -> list[str]:
+    """The messages of the warnings #471 emits among ``caught``."""
+    return [str(w.message) for w in caught if "hold content only in their page images" in str(w.message)]
+
+
+class TestImageOnlyPagesLeftUnwritten:
+    """#471: an image-only page whose page image the bundle does not write: the source PDF is its only full copy.
+
+    Its ``missing`` page image entry says so; every other entry is as it was. Pages 2, 3 and 4 of
+    ``with_image_only(bound_document(source), IMAGE_ONLY)`` are image-only; page 1's reasons are not recorded.
+    """
+
+    def test_render_pages_false_extends_each_image_only_pages_reason(self, tmp_path, source, fast_render):
+        out = tmp_path / "out"
+        with pytest.warns(UserWarning, match="hold content only in their page images"):
+            returned = write(with_image_only(bound_document(source), IMAGE_ONLY), out, source, render_pages=False)
+
+        skipped = "the page was not rendered: render_pages=False"
+        assert page_image_reasons(out) == [
+            (1, skipped),
+            (2, skipped + only_copy("too_little_text", "garbled_text")),
+            (3, skipped + only_copy("too_little_text")),
+            (4, skipped + only_copy("extraction_failed")),
+        ]
+        assert load_bundle(out) == returned
+
+    def test_include_images_false_extends_them_and_leaves_the_figures_entries(self, tmp_path, source, fast_render):
+        out = tmp_path / "out"
+        with pytest.warns(UserWarning, match="hold content only in their page images"):
+            returned = write(with_image_only(bound_document(source), IMAGE_ONLY), out, source, include_images=False)
+
+        skipped = "the page was not rendered: include_images=False"
+        assert page_image_reasons(out) == [
+            (1, skipped),
+            (2, skipped + only_copy("too_little_text", "garbled_text")),
+            (3, skipped + only_copy("too_little_text")),
+            (4, skipped + only_copy("extraction_failed")),
+        ]
+        assert [m["reason"] for m in manifest_of(out)["missing"] if m["artifact"] == "figure"] == [
+            f"figure {sha} was not written: include_images=False" for sha in (FIGURE_A_SHA, FIGURE_A_SHA, FIGURE_B_SHA)
+        ]
+        assert load_bundle(out) == returned
+
+    @pytest.mark.parametrize("flag", ["render_pages", "include_images"])
+    def test_a_document_with_no_image_only_page_writes_as_before(self, tmp_path, source, fast_render, recwarn, flag):
+        write(bound_document(source), tmp_path / "out", source, **{flag: False})
+
+        assert page_image_reasons(tmp_path / "out") == [
+            (n, f"the page was not rendered: {flag}=False") for n in (1, 2, 3, 4)
+        ]
+        assert [str(w.message) for w in recwarn] == []
+
+    @pytest.mark.parametrize("flag", ["render_pages", "include_images"])
+    def test_an_opt_out_warns_once_naming_the_pages(self, tmp_path, source, fast_render, flag):
+        document = with_image_only(bound_document(source), IMAGE_ONLY)
+        expected = (
+            f"pages [2, 3, 4] of {document.metadata.source_name} hold content only in their page images, which the "
+            f"bundle at {tmp_path / 'out'} does not write ({flag}=False); the source PDF is their only full copy"
+        )
+        with pytest.warns(UserWarning, match=re.escape(expected)) as caught:
+            write(document, tmp_path / "out", source, **{flag: False})
+
+        assert only_copy_warnings(caught) == [expected]
+
+    def test_nothing_warns_when_the_bundle_is_not_published(self, tmp_path, source, monkeypatch, recwarn):
+        def changing(src, page_index, **kwargs):
+            with source.open("ab") as handle:
+                handle.write(b"%% appended")
+            raise RenderFailed("the render worker failed")
+
+        monkeypatch.setattr(bundle, "render_page", changing)
+        with pytest.raises(PDFSourceChangedError):
+            write(with_image_only(bound_document(source), IMAGE_ONLY), tmp_path / "out", source)
+
+        assert [str(w.message) for w in recwarn] == [] and not (tmp_path / "out").exists()
+
+    def test_a_refused_render_and_an_unreadable_own_image_warn_once(self, tmp_path, source, monkeypatch):
+        def refusing(src, page_index, **kwargs):
+            if page_index == 1:
+                raise RenderRefused("page 2: an image over the bound")
+            return fake_render(src, page_index, **kwargs)
+
+        monkeypatch.setattr(bundle, "render_page", refusing)
+        document = with_image_only(bound_document(source, image=b"GIF89a"), IMAGE_ONLY)
+        expected = (
+            f"pages [2, 3] of {document.metadata.source_name} hold content only in their page images, which the bundle "
+            f"at {tmp_path / 'out'} could not write (manifest.json's missing entries say why); the source PDF is their "
+            "only full copy"
+        )
+        with pytest.warns(UserWarning, match=re.escape(expected)) as caught:
+            returned = write(document, tmp_path / "out", source)
+
+        assert only_copy_warnings(caught) == [expected]
+        assert page_image_reasons(tmp_path / "out") == [
+            (
+                2,
+                "the page was not rendered: RenderRefused: page 2: an image over the bound"
+                + only_copy("too_little_text", "garbled_text"),
+            ),
+            (3, "the page's own image was not written: its bytes are not a PNG" + only_copy("too_little_text")),
+        ]
+        assert load_bundle(tmp_path / "out") == returned
+
+    def test_an_unbound_own_image_warns_as_before_and_once_more(self, tmp_path, source, fast_render):
+        other = build_pdf(tmp_path / "other.pdf", [PageSpec()])
+        document = with_image_only(bound_document(source, own_source=other), IMAGE_ONLY)
+        with pytest.warns(UserWarning) as caught:
+            write(document, tmp_path / "out", source)
+
+        unbound = f"own image renders from {other.resolve()}, not from the source {source.resolve()}"
+        assert [str(w.message) for w in caught] == [
+            f"page 3's {unbound}: no page image is written for it",
+            f"pages [3] of {document.metadata.source_name} hold content only in their page images, which the bundle "
+            f"at {tmp_path / 'out'} could not write (manifest.json's missing entries say why); the source PDF is "
+            "their only full copy",
+        ]
+        assert page_image_reasons(tmp_path / "out") == [
+            (
+                3,
+                f"the page's {unbound}: its bytes could not be bound to the hashed source"
+                + only_copy("too_little_text"),
+            )
+        ]
+
+    def test_a_reused_bundle_warns_nothing_as_reuse_never_does(self, tmp_path, source, fast_render, recwarn):
+        # Reuse writes nothing and emits none of the write's warnings (an unbound image's neither): the bundle's
+        # manifest, written by the first write, still says so.
+        out = tmp_path / "out"
+        with pytest.warns(UserWarning, match=r"pages \[2, 3, 4\] of \S+ hold content only"):
+            first = write(with_image_only(bound_document(source), IMAGE_ONLY), out, source, render_pages=False)
+        before, manifest = tree_of(out), (out / "manifest.json").read_bytes()
+        recwarn.clear()
+
+        again = write(with_image_only(bound_document(source), IMAGE_ONLY), out, source, render_pages=False)
+
+        assert again == first and tree_of(out) == before and (out / "manifest.json").read_bytes() == manifest
+        assert [str(w.message) for w in recwarn] == []
+        assert page_image_reasons(out)[1] == (
+            2,
+            "the page was not rendered: render_pages=False" + only_copy("too_little_text", "garbled_text"),
+        )

@@ -1013,6 +1013,10 @@ class TestModuleImports:
         assert quality.check_hidden_reasons is elements.check_hidden_reasons
         assert not hasattr(elements, "_check_hidden_reasons")
 
+    def test_validates_image_only_reasons_with_a1s_public_rule(self):
+        # One rule for every image_only_reasons tuple (#470): A3's assessment allows its routing shortfalls only.
+        assert quality.check_image_only_reasons is elements.check_image_only_reasons
+
     def test_flags_tiny_and_squeezed_text_with_recoverys_one_rule(self):
         # One em rule and one threshold for textpage spans and recovered text alike, in a pure module.
         assert quality.em_reasons is _pdfium_recover.em_reasons is _hidden_rules.em_reasons

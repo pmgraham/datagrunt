@@ -67,6 +67,7 @@ from pdf_tests.test_pdfium_engine import imported_modules
 from pdf_tests.test_pdfium_images import j2k, xobject_page
 from pdf_tests.test_pdfium_spans import content_page
 from pdf_tests.test_quality import SHA, image
+from pdf_tests.test_routing import garbled_page
 from pdf_tests.test_source import promptly
 
 W, H = 400.0, 300.0
@@ -654,6 +655,50 @@ class TestAssemblePage:
         assert page.warnings == (
             "route 'vision': the page was not read by OCR; its digital text is kept as its elements",
         )
+
+
+def short_page(tmp_path) -> Path:
+    """Too little text over a grey box: paint OCR could read, so the page is short of text (P2-C)."""
+    box = Rect(400.0, 600.0, 60.0, 40.0, fill_rgb=(0.5, 0.5, 0.5), stroke=False)
+    return letter(tmp_path, TextRun("Too short", 72.0, 100.0), box)
+
+
+def assembled_under(path, ocr: str) -> Page:
+    """assemble_page of page 1 of ``path``, assessed under ``ocr``."""
+    with open_document(path) as handle:
+        raw = extract_page(handle, 0)
+    assessment = assess_page(raw, ocr=ocr)
+    return assemble_page(raw, assessment, find_lattice_tables(raw.segments.segments, assessment.pieces), source=path)
+
+
+class TestAssemblePageImageOnly:
+    """assemble_page carries A3's image-only reasons (#470): its page's content lives only in its page image."""
+
+    @pytest.mark.parametrize(
+        "ocr,route,status",
+        [
+            pytest.param("never", "digital", "ok", id="kept-digital-under-never"),
+            pytest.param("auto", "vision", "ocr_unavailable", id="vision-not-read-by-ocr"),
+            pytest.param("always", "vision", "ocr_unavailable", id="always-not-read-by-ocr"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "build,reasons",
+        [
+            pytest.param(short_page, ("too_little_text",), id="too-little-text"),
+            pytest.param(garbled_page, ("garbled_text",), id="garbled-text"),
+        ],
+    )
+    def test_a_page_whose_text_cannot_stand_is_marked(self, tmp_path, build, reasons, ocr, route, status):
+        page = assembled_under(build(tmp_path), ocr)
+
+        assert (page.route, page.status, page.image_only_reasons) == (route, status, reasons)
+
+    @pytest.mark.parametrize("ocr", ["auto", "never"])
+    def test_a_page_whose_text_stands_is_not(self, tmp_path, ocr):
+        page = assembled_under(letter(tmp_path, *mixed_items()), ocr)
+
+        assert (page.route, page.status, page.image_only_reasons) == ("digital", "ok", ())
 
 
 # A render worker's memory cap past its start, and its time: what a PageDraw is given by default.
