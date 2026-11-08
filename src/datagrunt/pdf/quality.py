@@ -315,6 +315,8 @@ class SpanPiece:
     @property
     def bbox(self) -> Box:
         """The union of the piece's char boxes."""
+        if self.start == 0 and self.end == len(self.span.char_boxes):
+            return self.span.bbox
         return union_box(self.span.char_boxes[self.start : self.end])
 
 
@@ -760,7 +762,9 @@ def assess_page(
     elif background is not None:
         pieces, own = _flag_unchecked(pieces, page), _flag_unchecked(own, page)
     flagged, unchecked = _duplicates_flagged(own, pieces)
-    route, warnings = _route(_visible_text(pieces), cover, _painted(page), ocr)
+    visible = _visible_text(pieces)
+    painted = _painted(page) if ocr != "always" and visible.counted < _MIN_TEXT_CHARS else False
+    route, warnings = _route(visible, cover, painted, ocr)
     warnings += _recovery_warnings(recovered, page.text.stats.dropped_text_objects)
     return PageAssessment(
         pieces=pieces,
@@ -969,9 +973,10 @@ def _valid(span: RawSpan, offset: int) -> bool:
     O(log map errors): ``map_errors`` is sorted.
     """
     errors = span.map_errors
-    at = bisect_left(errors, offset)
-    if at < len(errors) and errors[at] == offset:
-        return False
+    if errors:
+        at = bisect_left(errors, offset)
+        if at < len(errors) and errors[at] == offset:
+            return False
     return _valid_char(span.text[offset])
 
 
@@ -995,6 +1000,8 @@ def valid_char(char: str) -> bool:
 
 def _valid_char(char: str) -> bool:
     """:func:`valid_char` of a checked char."""
+    if ord(char) < 0x80:
+        return True
     return char != _REPLACEMENT_CHAR and unicodedata.category(char) not in _INVALID_CATEGORIES
 
 
@@ -1008,8 +1015,18 @@ def _quality(page: RawPage, pieces: tuple[SpanPiece, ...], *, _initial: PageAsse
         ratio, count = _initial.quality.valid_char_ratio, _initial.quality.char_count
     else:
         spans = page.text.spans
-        count = sum(len(span.text) for span in spans)
-        valid = sum(1 for span in spans for offset in range(len(span.text)) if _valid(span, offset))
+        count = 0
+        valid = 0
+        for span in spans:
+            text = span.text
+            n = len(text)
+            count += n
+            if text.isascii() and not span.map_errors:
+                valid += n
+            else:
+                for offset in range(n):
+                    if _valid(span, offset):
+                        valid += 1
         ratio = valid / count if count else None
     return PageQuality(
         valid_char_ratio=ratio,
@@ -1063,6 +1080,15 @@ def _visible_text(pieces: tuple[SpanPiece, ...]) -> _VisibleText:
         if piece.hidden_reasons:
             continue
         span = piece.span
+        if span.text.isascii() and not span.map_errors:
+            sub = span.text[piece.start : piece.end]
+            n = len(sub)
+            chars += n
+            valid += n
+            for ch in sub:
+                if not ch.isspace():
+                    counted += 1
+            continue
         runs = groupby(range(piece.start, piece.end), key=lambda offset: (span.text[offset], _valid(span, offset)))
         for (char, is_valid), run in runs:
             length = sum(1 for _ in run)
@@ -1125,7 +1151,10 @@ def _unmapped_regions(pieces: tuple[SpanPiece, ...]) -> tuple[Box, ...]:
 
 def _invalid_runs(piece: SpanPiece) -> Iterator[Box]:
     """Yield the union box of each maximal run of invalid chars in ``piece``."""
-    span, boxes = piece.span, piece.span.char_boxes
+    span = piece.span
+    if span.text.isascii() and not span.map_errors:
+        return
+    boxes = span.char_boxes
     for invalid, run in groupby(range(piece.start, piece.end), key=lambda offset: not _valid(span, offset)):
         if invalid:
             offsets = tuple(run)

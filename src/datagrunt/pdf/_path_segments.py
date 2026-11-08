@@ -194,6 +194,7 @@ def path_segments(
     paint: PathPaint,
     object_index: int,
     to_display: Callable[[Box], Box],
+    _trusted: bool = False,
 ) -> list[RawSegment]:
     """The axis-aligned segments of one path object.
 
@@ -217,14 +218,17 @@ def path_segments(
         within :data:`AXIS_TOLERANCE_PT` in user space, each in path order:
         PDF paints a path's fill before its stroke.
     """
-    if not all(math.isfinite(value) for value in matrix):
+    a, b, c, d, e, f = matrix
+    isfinite = math.isfinite
+    if not (isfinite(a) and isfinite(b) and isfinite(c) and isfinite(d) and isfinite(e) and isfinite(f)):
         raise NonFiniteGeometry(f"its matrix to page space is not finite {tuple(matrix)}")
-    if not math.isfinite(paint.stroke_width):
+    if not isfinite(paint.stroke_width):
         raise NonFiniteGeometry(f"its stroke width is not finite ({paint.stroke_width})")
-    int_at_least("object_index", object_index, 0)
-    strict_bool("dashed", paint.dashed)
-    rgba_tuple("stroke_rgba", paint.stroke_rgba)
-    rgba_tuple("fill_rgba", paint.fill_rgba)
+    if not _trusted:
+        int_at_least("object_index", object_index, 0)
+        strict_bool("dashed", paint.dashed)
+        rgba_tuple("stroke_rgba", paint.stroke_rgba)
+        rgba_tuple("fill_rgba", paint.fill_rgba)
     closed = _explicit_closes(points)
     placed = _placed_all(closed, matrix)
     segments: list[RawSegment] = []
@@ -234,30 +238,37 @@ def path_segments(
         return segments
     is_identity = matrix == IDENTITY
     base_width = max(float(paint.stroke_width), 0.0)
-    for local, page in zip(_straight_edges(closed), _straight_edges(placed)):
-        line = _axis_line(*page)
-        if line is not None:
-            width = base_width if is_identity else _stroke_thickness(paint.stroke_width, matrix, local, page)
-            segments.append(_segment(line, width, "stroke", object_index, paint, to_display))
+    if is_identity:
+        for page in _straight_edges(placed):
+            line = _axis_line(*page)
+            if line is not None:
+                segments.append(_segment(line, base_width, "stroke", object_index, paint, to_display))
+    else:
+        for local, page in zip(_straight_edges(closed), _straight_edges(placed)):
+            line = _axis_line(*page)
+            if line is not None:
+                width = _stroke_thickness(paint.stroke_width, matrix, local, page)
+                segments.append(_segment(line, width, "stroke", object_index, paint, to_display))
     return segments
 
 
-def _placed_all(points: list[PathPoint], matrix: Matrix) -> list[PathPoint]:
+def _placed_all(points: Sequence[PathPoint], matrix: Matrix) -> Sequence[PathPoint]:
     """All ``points`` mapped by ``matrix``, with fast path for IDENTITY."""
+    isfinite = math.isfinite
     if matrix == IDENTITY:
-        for point in points:
-            if not (math.isfinite(point.x) and math.isfinite(point.y)):
-                raise NonFiniteGeometry(f"its page-space point {(point.x, point.y)} is not finite")
+        for _, px, py, _ in points:
+            if not (isfinite(px) and isfinite(py)):
+                raise NonFiniteGeometry(f"its page-space point {(px, py)} is not finite")
         return points
     a, b, c, d, e, f = matrix
     out: list[PathPoint] = []
-    for point in points:
-        px, py = point.x, point.y
+    new_pt = tuple.__new__
+    for kind, px, py, closes in points:
         x = a * px + c * py + e
         y = b * px + d * py + f
-        if not (math.isfinite(x) and math.isfinite(y)):
+        if not (isfinite(x) and isfinite(y)):
             raise NonFiniteGeometry(f"its page-space point {(x, y)} is not finite")
-        out.append(PathPoint(point.kind, x, y, point.closes))
+        out.append(new_pt(PathPoint, (kind, x, y, closes)))
     return out
 
 
@@ -269,20 +280,30 @@ def _placed(point: PathPoint, matrix: Matrix) -> PathPoint:
     return PathPoint(point.kind, x, y, point.closes)
 
 
-def _explicit_closes(points: Sequence[PathPoint]) -> list[PathPoint]:
+def _explicit_closes(points: Sequence[PathPoint]) -> Sequence[PathPoint]:
     """``points`` with every closing edge drawn as a line back to its subpath's start.
 
     pdfium's parser already writes that line (the closing point is the start);
     a close flagged away from the start (pdfium's edit API) gets it here.
     """
-    closed: list[PathPoint] = []
     first: PathPoint | None = None
     for point in points:
-        if point.kind == "move" or first is None:
+        kind, x, y, closes = point
+        if kind == "move" or first is None:
             first = point
-        if point.closes and (point.x != first.x or point.y != first.y):
-            closed.append(PathPoint(point.kind, point.x, point.y, False))
-            closed.append(PathPoint("line", first.x, first.y, True))
+        if closes and (x != first[1] or y != first[2]):
+            break
+    else:
+        return points
+    closed: list[PathPoint] = []
+    first = None
+    for point in points:
+        kind, x, y, closes = point
+        if kind == "move" or first is None:
+            first = point
+        if closes and (x != first[1] or y != first[2]):
+            closed.append(PathPoint(kind, x, y, False))
+            closed.append(PathPoint("line", first[1], first[2], True))
         else:
             closed.append(point)
     return closed
@@ -295,9 +316,9 @@ def _straight_edges(points: Sequence[PathPoint]) -> list[tuple[Point, Point]]:
     """
     edges: list[tuple[Point, Point]] = []
     current: Point | None = None
-    for point in points:
-        here = (point.x, point.y)
-        if point.kind == "line" and current is not None:
+    for kind, x, y, _ in points:
+        here = (x, y)
+        if kind == "line" and current is not None:
             edges.append((current, here))
         current = here
     return edges
@@ -378,7 +399,7 @@ def _subpaths(points: Sequence[PathPoint]) -> list[list[PathPoint]]:
     """``points`` split where each subpath starts (at every move)."""
     subpaths: list[list[PathPoint]] = []
     for point in points:
-        if point.kind == "move" or not subpaths:
+        if point[0] == "move" or not subpaths:
             subpaths.append([])
         subpaths[-1].append(point)
     return subpaths
@@ -393,9 +414,9 @@ def _filled_rectangle(subpath: Sequence[PathPoint]) -> Box | None:
     band around its perimeter). A zero-area rectangle qualifies: pdfium
     paints it as a hairline.
     """
-    if len(subpath) < 2 or any(point.kind == "curve" for point in subpath):
+    if len(subpath) < 2 or any(point[0] == "curve" for point in subpath):
         return None
-    corners = [(point.x, point.y) for point in subpath]
+    corners = [(point[1], point[2]) for point in subpath]
     ring = list(zip(corners, corners[1:] + corners[:1]))
     if not all(abs(x1 - x0) < AXIS_TOLERANCE_PT or abs(y1 - y0) < AXIS_TOLERANCE_PT for (x0, y0), (x1, y1) in ring):
         return None

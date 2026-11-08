@@ -1317,7 +1317,7 @@ class TestRenderedPageImageSource:
         scan = RasterImage(0.0, 0.0, *LETTER, png_of(rendered(scans["scan"])))
         path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=LINES), PageSpec(items=(scan,))])
 
-        document = extracted(path)
+        document = extracted(path, ocr="auto")
 
         assert [page.route for page in document.pages] == ["digital", "vision"]
         found = [entry for page in document.pages for entry in bound_to(page)]
@@ -1327,7 +1327,7 @@ class TestRenderedPageImageSource:
 
     def test_a_vision_page_image_of_the_file_read_draws(self, scans, tmp_path):
         path = copied(scans["scan"], tmp_path / "scan.pdf")
-        page = PDFReader(path).document.pages[0]
+        page = PDFReader(path, ocr="auto").document.pages[0]
         image = page.page_image
 
         assert page.route == "vision"
@@ -1337,7 +1337,7 @@ class TestRenderedPageImageSource:
     @pytest.mark.parametrize("change", [touched, rewritten_with_its_own_bytes], ids=["touched", "own-bytes"])
     def test_a_vision_page_image_of_the_documents_bytes_draws_whatever_the_identity(self, scans, tmp_path, change):
         path = copied(scans["scan"], tmp_path / "scan.pdf")
-        image = PDFReader(path).document.pages[0].page_image
+        image = PDFReader(path, ocr="auto").document.pages[0].page_image
         before = (image.read_bytes(), image.read_bands())
         held = identity_of(path)
 
@@ -1348,7 +1348,7 @@ class TestRenderedPageImageSource:
 
     def test_a_vision_page_image_of_a_file_replaced_since_is_refused(self, scans, tmp_path):
         path = copied(scans["scan"], tmp_path / "scan.pdf")
-        document = PDFReader(path).document
+        document = PDFReader(path, ocr="auto").document
         page = document.pages[0]
         held = identity_of(path)
 
@@ -1368,7 +1368,7 @@ class TestRenderedPageImageSource:
     @pytest.mark.parametrize("load", ["read_bytes", "read_bands"])
     def test_a_vision_page_image_of_other_bytes_of_its_size_is_refused(self, scans, tmp_path, monkeypatch, load):
         path = copied(scans["scan"], tmp_path / "scan.pdf")
-        document = PDFReader(path).document
+        document = PDFReader(path, ocr="auto").document
         held = identity_of(path)
         rewritten_with_other_bytes(path)
         monkeypatch.setattr(_loaders, "render_page", no_draw)

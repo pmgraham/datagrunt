@@ -11,9 +11,18 @@ Box = tuple[float, float, float, float]
 
 def union_box(boxes: tuple[Box, ...]) -> Box:
     """The smallest box holding every one of ``boxes`` (at least one)."""
-    return (
-        min(box[0] for box in boxes),
-        min(box[1] for box in boxes),
-        max(box[2] for box in boxes),
-        max(box[3] for box in boxes),
-    )
+    if len(boxes) == 1:
+        return boxes[0]
+    if not boxes:
+        raise ValueError("union_box() arg is an empty sequence")
+    x0, y0, x1, y1 = boxes[0]
+    for b in boxes[1:]:
+        if b[0] < x0:
+            x0 = b[0]
+        if b[1] < y0:
+            y0 = b[1]
+        if b[2] > x1:
+            x1 = b[2]
+        if b[3] > y1:
+            y1 = b[3]
+    return x0, y0, x1, y1

@@ -591,30 +591,34 @@ class _SpanBuilder:
 
     def add(self, char: _OwnedChar) -> None:
         """Append ``char`` to the current span, or to a new one if another object owns it."""
-        if char.owner != self._owner:
+        owner, code, map_error, box, tight = char
+        if owner != self._owner:
             self._flush()
-            self._owner = char.owner
+            self._owner = owner
         # A char pdfium inserted inside this span becomes a break before this
         # char; one inserted between spans is only counted.
         breaking = self._break_pending and bool(self._chars)
         self._break_pending = False
-        code = char.code
         if breaking:
             self._breaks.append(len(self._chars))
-        elif code in _LOW_SURROGATES and self._chars and ord(self._chars[-1]) in _HIGH_SURROGATES:
+        elif 0xDC00 <= code < 0xE000 and self._chars and 0xD800 <= ord(self._chars[-1]) < 0xDC00:
             # pdfium reports a non-BMP char as a UTF-16 pair of textpage chars.
             high = ord(self._chars[-1])
             self._chars[-1] = chr(0x10000 + ((high - _HIGH_SURROGATES.start) << 10) + (code - _LOW_SURROGATES.start))
-            self._boxes[-1] = union_box((self._boxes[-1], char.box))
-            self._tight[-1] = union_box((self._tight[-1], char.tight))
-            self._mark_unmapped(char, len(self._chars) - 1)
+            self._boxes[-1] = union_box((self._boxes[-1], box))
+            self._tight[-1] = union_box((self._tight[-1], tight))
+            offset = len(self._chars) - 1
+            if (map_error or code > _MAX_CODE_POINT) and (not self._errors or self._errors[-1] != offset):
+                self._errors.append(offset)
             return
-        self._mark_unmapped(char, len(self._chars))
+        offset = len(self._chars)
+        if (map_error or code > _MAX_CODE_POINT) and (not self._errors or self._errors[-1] != offset):
+            self._errors.append(offset)
         # A code beyond Unicode is a raw char code pdfium could not map; U+FFFD
         # keeps its place (and is no surrogate, so it never pairs).
         self._chars.append(chr(code) if code <= _MAX_CODE_POINT else _REPLACEMENT_CHAR)
-        self._boxes.append(char.box)
-        self._tight.append(char.tight)
+        self._boxes.append(box)
+        self._tight.append(tight)
 
     def _mark_unmapped(self, char: _OwnedChar, offset: int) -> None:
         """Record span char ``offset`` as a map error if ``char`` (one of its textpage chars) is one; once each."""
@@ -629,8 +633,9 @@ class _SpanBuilder:
     def _flush(self) -> None:
         if not self._chars:
             return
-        boxes = tuple(self._to_display(box) for box in self._boxes)
-        tight_boxes = tuple(self._to_display(box) for box in self._tight)
+        to_display = self._to_display
+        boxes = tuple(to_display(box) for box in self._boxes)
+        tight_boxes = tuple(to_display(box) for box in self._tight)
         style = self._styles[self._owner]
         span = object.__new__(RawSpan)
         object.__setattr__(span, "text", "".join(self._chars))
@@ -684,43 +689,49 @@ def _read_textpage(textpage: pdfium_c.FPDF_TEXTPAGE, object_indices: dict[int, i
     generated = ownerless = 0
     loose_rect = pdfium_c.FS_RECTF()
     tight_coords = (ctypes.c_double(), ctypes.c_double(), ctypes.c_double(), ctypes.c_double())
+    is_gen = pdfium_c.FPDFText_IsGenerated
+    get_obj = pdfium_c.FPDFText_GetTextObject
+    has_err = pdfium_c.FPDFText_HasUnicodeMapError
+    get_uni = pdfium_c.FPDFText_GetUnicode
+    new_char = tuple.__new__
+    isfinite = math.isfinite
     for char_index in range(count):
-        if _textpage_flag(pdfium_c.FPDFText_IsGenerated(textpage, char_index), char_index, "is generated"):
+        if _textpage_flag(is_gen(textpage, char_index), char_index, "is generated"):
             generated += 1
             chars.append(None)
             continue
-        text_object = pdfium_c.FPDFText_GetTextObject(textpage, char_index)
+        text_object = get_obj(textpage, char_index)
         if not text_object:
             # pdfium inserted it, though not flagged generated: the space
             # between two right-to-left words drawn by separate operators.
             ownerless += 1
             chars.append(None)
             continue
-        map_error = _textpage_flag(
-            pdfium_c.FPDFText_HasUnicodeMapError(textpage, char_index), char_index, "maps to Unicode"
-        )
-        code = pdfium_c.FPDFText_GetUnicode(textpage, char_index)
+        map_error = _textpage_flag(has_err(textpage, char_index), char_index, "maps to Unicode")
+        code = get_uni(textpage, char_index)
         owner = object_address(text_object)
         if owner not in styles:
             if owner not in object_indices:
                 raise PdfiumFailure(f"read the text object of char {char_index}: it is not in the page's object tree")
             style = _read_style(textpage, text_object, char_index, object_indices[owner], font_cache)
             styles[owner] = style
-            if not (math.isfinite(style.font_size_pt) and math.isfinite(style.em_width_pt)):
+            if not (isfinite(style.font_size_pt) and isfinite(style.em_width_pt)):
                 skipped.add(owner)
-        box, tight = _loose_box(textpage, char_index, loose_rect), _tight_box(textpage, char_index, tight_coords)
-        if not (
-            math.isfinite(box[0])
-            and math.isfinite(box[1])
-            and math.isfinite(box[2])
-            and math.isfinite(box[3])
-            and math.isfinite(tight[0])
-            and math.isfinite(tight[1])
-            and math.isfinite(tight[2])
-            and math.isfinite(tight[3])
+        box = _loose_box(textpage, char_index, loose_rect)
+        tight = _tight_box(textpage, char_index, tight_coords)
+        if (
+            box[0] * 0.0
+            + box[1] * 0.0
+            + box[2] * 0.0
+            + box[3] * 0.0
+            + tight[0] * 0.0
+            + tight[1] * 0.0
+            + tight[2] * 0.0
+            + tight[3] * 0.0
+            != 0.0
         ):
             skipped.add(owner)
-        chars.append(_OwnedChar(owner, code, map_error, box, tight))
+        chars.append(new_char(_OwnedChar, (owner, code, map_error, box, tight)))
     return _Textpage(chars, generated, ownerless, styles, frozenset(skipped))
 
 

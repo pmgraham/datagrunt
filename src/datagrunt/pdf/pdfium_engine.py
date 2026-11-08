@@ -720,9 +720,16 @@ def _counted(total: int, count: int, max_objects: int, message: str) -> int:
 
 def _text_walk(objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]) -> ObjectWalk:
     """The walk as the text stage reads it: each object's index, the text objects, and which draw no glyph."""
-    indices = {object_address(obj): index for index, (obj, _form) in enumerate(objects)}
-    texts = (obj for obj, _form in objects if pdfium_c.FPDFPageObj_GetType(obj) == pdfium_c.FPDF_PAGEOBJ_TEXT)
-    return ObjectWalk(indices, frozenset(object_address(obj) for obj in texts), partial(_glyphless, objects, indices))
+    indices: dict[int, int] = {}
+    texts: set[int] = set()
+    get_type = pdfium_c.FPDFPageObj_GetType
+    text_kind = pdfium_c.FPDF_PAGEOBJ_TEXT
+    for index, (obj, _form) in enumerate(objects):
+        addr = object_address(obj)
+        indices[addr] = index
+        if get_type(obj) == text_kind:
+            texts.add(addr)
+    return ObjectWalk(indices, frozenset(texts), partial(_glyphless, objects, indices))
 
 
 def _glyphless(objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]], indices: dict[int, int], address: int) -> bool:
@@ -827,24 +834,29 @@ def _read_paint(
     path: pdfium_c.FPDF_PAGEOBJECT,
     label: str,
     bufs: tuple[ctypes.c_int, ctypes.c_int, ctypes.c_float] | None = None,
+    rgba_bufs: tuple[ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint] | None = None,
 ) -> PathPaint:
     """Read how a path object is painted: stroke and fill, line width and dashes (if stroked), colours."""
     fill_mode, stroke, width = (ctypes.c_int(), ctypes.c_int(), ctypes.c_float()) if bufs is None else bufs
     if not pdfium_c.FPDFPath_GetDrawMode(path, fill_mode, stroke) or fill_mode.value not in _FILL_MODES:
         raise PdfiumFailure(f"read the draw mode of {label}")
-    if stroke.value:
+    stroked = bool(stroke.value)
+    if stroked:
         if not pdfium_c.FPDFPageObj_GetStrokeWidth(path, width):
             raise PdfiumFailure(f"read the stroke width of {label}")
         stroke_w = width.value
     else:
         stroke_w = 0.0
-    return PathPaint(
-        stroked=bool(stroke.value),
-        filled=fill_mode.value != pdfium_c.FPDF_FILLMODE_NONE,
-        stroke_width=stroke_w,
-        dashed=bool(stroke.value) and _leaves_gaps(_read_dashes(path, label)),
-        stroke_rgba=read_rgba(pdfium_c.FPDFPageObj_GetStrokeColor, path, f"stroke colour of {label}"),
-        fill_rgba=read_rgba(pdfium_c.FPDFPageObj_GetFillColor, path, f"fill colour of {label}"),
+    return tuple.__new__(
+        PathPaint,
+        (
+            stroked,
+            fill_mode.value != pdfium_c.FPDF_FILLMODE_NONE,
+            stroke_w,
+            stroked and _leaves_gaps(_read_dashes(path, label)),
+            read_rgba(pdfium_c.FPDFPageObj_GetStrokeColor, path, f"stroke colour of {label}", rgba_bufs),
+            read_rgba(pdfium_c.FPDFPageObj_GetFillColor, path, f"fill colour of {label}", rgba_bufs),
+        ),
     )
 
 
@@ -913,12 +925,13 @@ def _read_points(
     get_pt = pdfium_c.FPDFPathSegment_GetPoint
     get_close = pdfium_c.FPDFPathSegment_GetClose
     kinds = _POINT_KINDS
+    new_pt = tuple.__new__
     for index in range(count):
         segment = get_seg(path, index)
         kind = kinds.get(get_type(segment)) if segment else None
         if kind is None or not get_pt(segment, x, y):
             raise PdfiumFailure(f"read path segment {index} of {label}")
-        points.append(PathPoint(kind, x.value, y.value, bool(get_close(segment))))
+        points.append(new_pt(PathPoint, (kind, x.value, y.value, bool(get_close(segment)))))
     return points
 
 
@@ -927,7 +940,7 @@ def _read_matrix(obj: pdfium_c.FPDF_PAGEOBJECT, label: str, raw_buf: pdfium_c.FS
     raw = pdfium_c.FS_MATRIX() if raw_buf is None else raw_buf
     if not pdfium_c.FPDFPageObj_GetMatrix(obj, raw):
         raise PdfiumFailure(f"read the matrix of {label}")
-    return Matrix(raw.a, raw.b, raw.c, raw.d, raw.e, raw.f)
+    return tuple.__new__(Matrix, (raw.a, raw.b, raw.c, raw.d, raw.e, raw.f))
 
 
 def _path_object_segments(
@@ -938,6 +951,7 @@ def _path_object_segments(
     room: _SegmentRoom,
     paint_bufs: tuple[ctypes.c_int, ctypes.c_int, ctypes.c_float] | None = None,
     pt_coords: tuple[ctypes.c_float, ctypes.c_float] | None = None,
+    rgba_bufs: tuple[ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint] | None = None,
 ) -> list[RawSegment] | None:
     """The segments of path object ``index`` (matrix to page space ``matrix``), or None if its geometry is not finite.
 
@@ -946,10 +960,12 @@ def _path_object_segments(
     renders the rest of it), so only that path is skipped.
     """
     label = f"object {index}"
-    paint = _read_paint(path, label, paint_bufs)
+    paint = _read_paint(path, label, paint_bufs, rgba_bufs)
     points = _read_points(path, label, room, pt_coords)
     try:
-        return path_segments(points, matrix=matrix, paint=paint, object_index=index, to_display=to_display)
+        return path_segments(
+            points, matrix=matrix, paint=paint, object_index=index, to_display=to_display, _trusted=True
+        )
     except NonFiniteGeometry:
         return None
 
@@ -1000,8 +1016,16 @@ def _placed_objects(
 def _display_mapping(geometry: PageGeometry) -> Callable[[Box], Box]:
     """:func:`to_display_box` for the page ``geometry`` describes."""
     rotation = _checked_rotation(geometry.rotation_deg)
-    checked_page = _checked_box("page_box", geometry.page_box, allow_empty=False)
-    return partial(_to_display_checked, rotation=rotation, page_box=checked_page)
+    page_left, page_bottom, page_right, page_top = _checked_box("page_box", geometry.page_box, allow_empty=False)
+    match rotation:
+        case 0:
+            return lambda box: (box[0] - page_left, page_top - box[3], box[2] - page_left, page_top - box[1])
+        case 90:
+            return lambda box: (box[1] - page_bottom, box[0] - page_left, box[3] - page_bottom, box[2] - page_left)
+        case 180:
+            return lambda box: (page_right - box[2], box[1] - page_bottom, page_right - box[0], box[3] - page_bottom)
+        case _:  # 270: the only value left after _checked_rotation
+            return lambda box: (page_top - box[3], page_right - box[2], page_top - box[1], page_right - box[0])
 
 
 def _collect_segments(
@@ -1016,14 +1040,18 @@ def _collect_segments(
     room = _SegmentRoom()
     paint_bufs = (ctypes.c_int(), ctypes.c_int(), ctypes.c_float())
     pt_coords = (ctypes.c_float(), ctypes.c_float())
+    rgba_bufs = (ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint())
     placed = _placed_objects(page_raw, pdfium_c.FPDF_PAGEOBJ_PATH, max_objects=MAX_PAGE_OBJECTS, objects=objects)
     for index, path, matrix in placed:
-        found = _path_object_segments(path, index, matrix, to_display, room, paint_bufs, pt_coords)
+        found = _path_object_segments(path, index, matrix, to_display, room, paint_bufs, pt_coords, rgba_bufs)
         if found is None:
             skipped += 1
         else:
             segments.extend(found)
-    return PageSegments(segments=tuple(segments), stats=SegmentStats(skipped_nonfinite_paths=skipped))
+    out = object.__new__(PageSegments)
+    object.__setattr__(out, "segments", tuple(segments))
+    object.__setattr__(out, "stats", SegmentStats(skipped_nonfinite_paths=skipped))
+    return out
 
 
 def _read_segments(

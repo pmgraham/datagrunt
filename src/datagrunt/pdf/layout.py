@@ -542,22 +542,24 @@ def _crossings(horizontal: list[_Line], vertical: list[_Line]) -> Iterator[tuple
     and each crossing reported once (opening and closing also shift the
     list, a C memmove of at most H references).
     """
+    h_keys = [(line.position, index) for index, line in enumerate(horizontal)]
     events = [(line.start - SNAP_PT, _OPEN, index) for index, line in enumerate(horizontal)]
     events += [(line.end + SNAP_PT, _CLOSE, index) for index, line in enumerate(horizontal)]
     events += [(line.position, _QUERY, index) for index, line in enumerate(vertical)]
     events.sort()
     active: list[tuple[float, int]] = []
+    n_h = len(horizontal)
     for _, kind, index in events:
         if kind == _OPEN:
-            insort(active, (horizontal[index].position, index))
+            insort(active, h_keys[index])
         elif kind == _CLOSE:
-            del active[bisect_left(active, (horizontal[index].position, index))]
+            del active[bisect_left(active, h_keys[index])]
         else:
             line = vertical[index]
             low = bisect_left(active, (line.start - SNAP_PT, -1))
-            high = bisect_right(active, (line.end + SNAP_PT, len(horizontal)))
-            for _, h_index in active[low:high]:
-                yield h_index, index
+            high = bisect_right(active, (line.end + SNAP_PT, n_h))
+            for pos in range(low, high):
+                yield active[pos][1], index
 
 
 class _Grid(NamedTuple):
@@ -738,13 +740,20 @@ class _UnionFind:
 
     def union(self, first: int, second: int) -> None:
         """Join the sets of ``first`` and ``second``."""
-        first, second = self.find(first), self.find(second)
+        parent = self._parent
+        while parent[first] != first:
+            parent[first] = parent[parent[first]]
+            first = parent[first]
+        while parent[second] != second:
+            parent[second] = parent[parent[second]]
+            second = parent[second]
         if first == second:
             return
-        if self._size[first] < self._size[second]:
+        size = self._size
+        if size[first] < size[second]:
             first, second = second, first
-        self._parent[second] = first
-        self._size[first] += self._size[second]
+        parent[second] = first
+        size[first] += size[second]
 
 
 class _Run(NamedTuple):
@@ -876,7 +885,10 @@ def _turned(box: Box, turn: int) -> Box:
 
 def _run_box(run: _Run) -> Box:
     """The union of a run's char boxes."""
-    return union_box(run.piece.span.char_boxes[run.start : run.end])
+    span = run.piece.span
+    if run.start == 0 and run.end == len(span.char_boxes):
+        return span.bbox
+    return union_box(span.char_boxes[run.start : run.end])
 
 
 def _lines(placed: list[tuple[Box, _Run]]) -> list[list[tuple[Box, _Run]]]:
@@ -2431,6 +2443,8 @@ def _without_page_columns(structures: list[_Rows], runs: list[_TurnedRun], turn:
     shares segments only with structures (a title over its first column
     leaves the others alone) stays. O(D r log r) for r runs.
     """
+    if not any(isinstance(found.items[0], StreamTable) for found in structures):
+        return structures
     boxes = [_turned(_ink_box(run), turn) for _, run in runs]
     segment_of: dict[tuple[int, int, int], int] = {}
     for number, segment in enumerate(_xy_cut(boxes, [run.end - run.start for _, run in runs])):

@@ -34,14 +34,24 @@ class WalkBoundHit(Exception):
 
 def object_address(pointer: pdfium_c.FPDF_PAGEOBJECT) -> int:
     """The address a pdfium object pointer holds (0 for NULL), to compare objects."""
-    return ctypes.cast(pointer, ctypes.c_void_p).value or 0
+    if not pointer:
+        return 0
+    try:
+        return ctypes.addressof(pointer.contents)
+    except AttributeError:
+        return ctypes.cast(pointer, ctypes.c_void_p).value or 0
 
 
 def read_rgba(
-    getter: Callable[..., int], page_object: pdfium_c.FPDF_PAGEOBJECT, what: str
+    getter: Callable[..., int],
+    page_object: pdfium_c.FPDF_PAGEOBJECT,
+    what: str,
+    channels: tuple[ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint] | None = None,
 ) -> tuple[int, int, int, int]:
     """Read a page object's fill or stroke colour (``what``) as 0-255 (R, G, B, A)."""
-    red, green, blue, alpha = (ctypes.c_uint() for _ in range(4))
+    red, green, blue, alpha = (
+        (ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()) if channels is None else channels
+    )
     if not getter(page_object, red, green, blue, alpha):
         raise PdfiumFailure(f"read the {what}")
     return red.value, green.value, blue.value, alpha.value
