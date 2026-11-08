@@ -312,18 +312,54 @@ _RENDER_POOL_BOOTSTRAP = (
 class RenderWorkerPool:
     """A scoped pool of warm render worker subprocesses that cache open PDF handles across renders."""
 
-    __slots__ = ("_closed", "_idle", "_lock")
+    __slots__ = ("_closed", "_cond", "_idle", "_lock", "_warming")
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
         self._idle: list[tuple[int, subprocess.Popen[bytes], StderrTail]] = []
+        self._warming: set[int] = set()
         self._closed = False
+
+    def warm(self, memory_cap_bytes: int) -> None:
+        """Start a pooled worker for ``memory_cap_bytes`` in the background if none is idle or warming."""
+        with self._cond:
+            if self._closed or memory_cap_bytes in self._warming:
+                return
+            if any(cap == memory_cap_bytes and child.poll() is None for cap, child, _ in self._idle):
+                return
+            self._warming.add(memory_cap_bytes)
+
+        def _spawn() -> None:
+            try:
+                command = _worker_command("render warm")
+                pool_cmd = [command[0], "-I", "-c", _RENDER_POOL_BOOTSTRAP]
+                child, stderr = _started(pool_cmd, "render warm")
+                stdin = child.stdin
+                if stdin is not None:
+                    try:
+                        path = [os.path.abspath(entry) if entry else os.getcwd() for entry in sys.path]
+                        stdin.write((json.dumps(path) + "\n").encode("utf-8"))
+                        stdin.flush()
+                    except OSError:
+                        pass
+                self.release(memory_cap_bytes, child, stderr)
+            except Exception:
+                pass
+            finally:
+                with self._cond:
+                    self._warming.discard(memory_cap_bytes)
+                    self._cond.notify_all()
+
+        threading.Thread(target=_spawn, daemon=True).start()
 
     def acquire(
         self, command: list[str], where: str, memory_cap_bytes: int
     ) -> tuple["subprocess.Popen[bytes]", StderrTail, bool]:
         """Return a warm idle worker with matching ``memory_cap_bytes``, or start a new pooled worker."""
-        with self._lock:
+        with self._cond:
+            while memory_cap_bytes in self._warming and not self._closed:
+                self._cond.wait(timeout=REAP_TIMEOUT_S)
             if self._closed:
                 raise ValueError("RenderWorkerPool is closed")
             for idx in range(len(self._idle) - 1, -1, -1):

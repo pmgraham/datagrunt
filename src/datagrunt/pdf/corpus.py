@@ -30,7 +30,7 @@ from datagrunt.pdf._bundle_load import (
     load_bundle,
 )
 from datagrunt.pdf._extra import load as _load_extra
-from datagrunt.pdf._options import DPI, MAX_RENDER_PIXELS, MIN_IMAGE_DIMENSION, OcrMode
+from datagrunt.pdf._options import DPI, MAX_RENDER_PIXELS, MIN_IMAGE_DIMENSION, WORKERS, OcrMode
 from datagrunt.pdf._source import _opened_source, _stream_sha256, checked_pdf_file
 from datagrunt.pdf._validate import (
     checked_password,
@@ -163,7 +163,7 @@ def extract_corpus(
     *,
     password: str | None = None,
     max_workers: int = 1,
-    workers: int = 1,
+    workers: int = WORKERS,
     ocr: OcrMode = "auto",
     dpi: int = DPI,
     vision_dpi: int = 300,

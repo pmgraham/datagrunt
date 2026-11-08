@@ -138,7 +138,7 @@ import polars as pl
 import pyarrow as pa
 
 from datagrunt.pdf._database import QueryResult, private_connection, query_result
-from datagrunt.pdf._options import MIN_IMAGE_DIMENSION, OcrMode
+from datagrunt.pdf._options import MIN_IMAGE_DIMENSION, WORKERS, OcrMode
 from datagrunt.pdf._source import checked_pdf_file
 from datagrunt.pdf._validate import checked_password as _checked_password
 from datagrunt.pdf._validate import checked_path as _checked_path
@@ -237,7 +237,7 @@ class PDFReader:
         source: str | os.PathLike[str] | Mapping[str, Any],
         *,
         password: str | None = None,
-        workers: int = 1,
+        workers: int = WORKERS,
         ocr: OcrMode = "auto",
         dpi: int = 200,
         vision_dpi: int = 300,

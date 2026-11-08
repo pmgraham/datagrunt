@@ -10,12 +10,13 @@ image) and :class:`VisionOptions` (A5b's, re-exported by
 :mod:`datagrunt.pdf.vision`).
 """
 
+import os
 from dataclasses import dataclass
 from typing import Literal, TypeAlias
 
 from datagrunt.pdf._validate import int_at_least, non_blank_str, positive_float
 
-__all__ = ["DPI", "MAX_RENDER_PIXELS", "MEMORY_CAP_BYTES", "MIN_IMAGE_DIMENSION", "OcrMode", "VisionOptions"]
+__all__ = ["DPI", "MAX_RENDER_PIXELS", "MEMORY_CAP_BYTES", "MIN_IMAGE_DIMENSION", "OcrMode", "VisionOptions", "WORKERS"]
 
 OcrMode: TypeAlias = Literal["auto", "always", "never"]
 """The reader's OCR option: ``"auto"`` routes by the page's text,
@@ -26,6 +27,7 @@ hybrid stays digital."""
 
 # The default minimum image side in pixels: v4's, kept.
 MIN_IMAGE_DIMENSION = 40
+WORKERS = max(1, os.cpu_count() or 1)
 
 # The spec's construction checks (PDFReader / PDFWriter) and defaults: dpi >= 36, 200; vision_dpi >= 36, 300;
 # max_render_pixels >= 512 x 512, 16,000,000. A page's image (P2-A) is drawn at dpi.

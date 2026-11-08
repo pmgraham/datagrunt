@@ -377,6 +377,8 @@ def image_outcomes(
     page_raw: pdfium_c.FPDF_PAGE,
     page_box: Box,
     to_display: Callable[[Box], Box],
+    *,
+    for_guard: bool = False,
 ) -> Iterator[ImageOutcome]:
     """Each image object in ``placed`` (see :func:`collect_images`) as an :class:`ImageOutcome`, lazily.
 
@@ -387,16 +389,22 @@ def image_outcomes(
     budget = _PageBudget()
     for index, image, matrix in placed:
         try:
-            placement = image_placement(matrix, page_box, to_display)
+            placement = image_placement(matrix, page_box, to_display, for_guard=for_guard)
         except NonFiniteGeometry as exc:
             yield ImageOutcome(None, 0.0, ("nonfinite", f"object {index}: {exc}"))
             continue
-        recorded, refusal = _page_image(image, page_raw, index, placement.bbox, budget)
+        recorded, refusal = _page_image(image, page_raw, index, placement.bbox, budget, for_guard=for_guard)
         yield ImageOutcome(recorded, placement.cover_fraction, refusal)
 
 
 def _page_image(
-    image: pdfium_c.FPDF_PAGEOBJECT, page_raw: pdfium_c.FPDF_PAGE, index: int, bbox: Box, budget: _PageBudget
+    image: pdfium_c.FPDF_PAGEOBJECT,
+    page_raw: pdfium_c.FPDF_PAGE,
+    index: int,
+    bbox: Box,
+    budget: _PageBudget,
+    *,
+    for_guard: bool = False,
 ) -> tuple[RawImage, Refusal | None]:
     """Image object ``index`` as a RawImage, and the ImageStats count it adds to with why (None for none)."""
     label = f"object {index}"
@@ -421,6 +429,8 @@ def _page_image(
         return unread, ("oversized", _oversized_stream(size, label))
     if not fits:
         return unread, _over_budget(label)
+    if for_guard:
+        return _guard_page_image(image, label, filters, declared, size, unread, budget)
     raw = _copied_raw_stream(image, size, label)
     wrapped = partial(wrapped_codestream, image, filters, raw, label, budget.charge)
     try:
@@ -443,12 +453,44 @@ def _page_image(
     return recorded, facts.refusal
 
 
+def _guard_page_image(
+    image: pdfium_c.FPDF_PAGEOBJECT,
+    label: str,
+    filters: tuple[str, ...],
+    declared: tuple[int, int],
+    size: int,
+    unread: RawImage,
+    budget: _PageBudget,
+) -> tuple[RawImage, Refusal | None]:
+    """Check image object ``label`` for render-guard refusals without reading metadata or hashing streams."""
+    codec = filters[-1] if filters else ""
+    needs_header = codec in _HEADER_READERS
+    checked = _checked_filters(filters)
+    max_stream_charge = len(checked) * (stream_limit(declared[0], declared[1]) + 65536) if checked else 0
+    needs_stream_check = bool(checked) and budget.remaining <= max_stream_charge
+    raw = _copied_raw_stream(image, size, label) if (needs_header or needs_stream_check) else b""
+    wrapped = partial(wrapped_codestream, image, filters, raw, label, budget.charge)
+    try:
+        width, height, refusal = _decode_size(filters, declared, raw, wrapped, label)
+        if refusal is None and needs_stream_check:
+            stream_refusal(filters, width, height, raw, label, budget.charge)
+    except BudgetSpent:
+        return unread, _over_budget(label)
+    return unread, refusal
+
+
 def _over_budget(label: str) -> Refusal:
     """The refusal of an image whose stream the page's budget leaves unread."""
     return "over_budget", f"{label} was not read: the page's {_MAX_PAGE_STREAM_BYTES}-byte image stream budget is spent"
 
 
-def image_placement(matrix: Matrix, page_box: Box, to_display: Callable[[Box], Box]) -> Placement:
+def image_placement(
+    matrix: Matrix,
+    page_box: Box,
+    to_display: Callable[[Box], Box],
+    *,
+    for_guard: bool = False,
+) -> Placement:
     """Where the unit square lands under ``matrix`` (image space to user space).
 
     Raises:
@@ -463,6 +505,10 @@ def image_placement(matrix: Matrix, page_box: Box, to_display: Callable[[Box], B
             raise NonFiniteGeometry(f"its corner {corner} is not finite")
     xs, ys = [x for x, _ in corners], [y for _, y in corners]
     bbox = to_display((min(xs), min(ys), max(xs), max(ys)))
+    if for_guard:
+        if not all(math.isfinite(value) for value in bbox):
+            raise NonFiniteGeometry(f"its painted area is not finite (bbox {bbox}, area 0.0)")
+        return Placement(bbox, 0.0)
     left, bottom, right, top = page_box
     covered = _area(_clipped(corners, page_box))
     if not all(math.isfinite(value) for value in (*bbox, covered)):

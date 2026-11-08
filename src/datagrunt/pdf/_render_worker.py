@@ -14,7 +14,7 @@ import json
 import mmap
 import os
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from typing import IO, NamedTuple
 
@@ -162,7 +162,7 @@ def _draw(
     dpi: int,
     *,
     colour: bool = False,
-    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
+    objects: Sequence[tuple[pdfium_c.FPDF_PAGEOBJECT | None, int]] | None = None,
 ) -> _Bitmap:
     """Draw the loaded page at ``dpi`` on white, in 8-bit gray (24-bit BGR if ``colour``), without its annotations."""
     drawn = _BGR if colour else _GRAY
@@ -192,7 +192,7 @@ def _decode_jbig2_first(
     page: pdfium.PdfPage,
     page_number: int,
     *,
-    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
+    objects: Sequence[tuple[pdfium_c.FPDF_PAGEOBJECT | None, int]] | None = None,
 ) -> int:
     """Decode each JBIG2 image the guard's walk reaches on its own, then free it; how many.
 
@@ -209,7 +209,7 @@ def _decode_jbig2_first(
     get_type = pdfium_c.FPDFPageObj_GetType
     image_kind = pdfium_c.FPDF_PAGEOBJ_IMAGE
     for index, (item, _form) in enumerate(walked):
-        if get_type(item) != image_kind:
+        if item is None or get_type(item) != image_kind:
             continue
         if "JBIG2Decode" not in read_filters(item, f"object {index}"):
             continue
@@ -235,22 +235,17 @@ def _render_loaded(handle: DocumentHandle, page_index: int, dpi: int, *, colour:
         MemoryError: If the bitmap cannot be mapped (a memory cap).
     """
     with _guarded_with_objects(handle, page_index) as (page, geometry, objects):
-        draw_objects = objects
+        walked: list[tuple[pdfium_c.FPDF_PAGEOBJECT | None, int]] = list(objects)
         if without_text:
-            get_type = pdfium_c.FPDFPageObj_GetType
-            text_kind = pdfium_c.FPDF_PAGEOBJ_TEXT
-            remaining = [pair for pair in objects if get_type(pair[0]) != text_kind]
-            if len(remaining) != len(objects):
-                _remove_text(page, geometry.page_number, objects=objects)
-                draw_objects = remaining
-        return _draw(page, geometry, dpi, colour=colour, objects=draw_objects)
+            _remove_text(page, geometry.page_number, objects=walked)
+        return _draw(page, geometry, dpi, colour=colour, objects=walked)
 
 
 def _remove_text(
     page: pdfium.PdfPage,
     page_number: int,
     *,
-    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT | None, int]] | None = None,
 ) -> int:
     """Remove every text object from the loaded page, forms' included; how many. In this load only: nothing is saved.
 
@@ -261,22 +256,26 @@ def _remove_text(
     Raises:
         RenderFailed: If pdfium cannot remove a text object (named by its walk index).
     """
-    walked = _page_objects(page.raw, max_objects=_MAX_GUARD_OBJECTS) if objects is None else objects
+    walked: list[tuple[pdfium_c.FPDF_PAGEOBJECT | None, int]] = (
+        list(_page_objects(page.raw, max_objects=_MAX_GUARD_OBJECTS)) if objects is None else objects
+    )
     removed = 0
     get_type = pdfium_c.FPDFPageObj_GetType
     text_kind = pdfium_c.FPDF_PAGEOBJ_TEXT
     for index, (item, form) in enumerate(walked):  # bounded: the walk's objects
-        if get_type(item) != text_kind:
+        if item is None or get_type(item) != text_kind:
             continue
         if form < 0:
             done = pdfium_c.FPDFPage_RemoveObject(page.raw, item)
         else:
-            done = pdfium_c.FPDFFormObj_RemoveObject(walked[form][0], item)
+            parent = walked[form][0]
+            done = bool(parent) and pdfium_c.FPDFFormObj_RemoveObject(parent, item)
         if not done:
             raise RenderFailed(
                 f"page {page_number}: pdfium cannot remove text object {index}; the page is not rendered"
             )
         pdfium_c.FPDFPageObj_Destroy(item)
+        walked[index] = (None, form)
         removed += 1
     return removed
 

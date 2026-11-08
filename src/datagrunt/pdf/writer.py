@@ -142,7 +142,7 @@ from typing import Any, BinaryIO
 import polars as pl
 
 from datagrunt.pdf._loaders import figure_pngs
-from datagrunt.pdf._options import MIN_IMAGE_DIMENSION, OcrMode
+from datagrunt.pdf._options import MIN_IMAGE_DIMENSION, WORKERS, OcrMode
 from datagrunt.pdf._png import write_grey_png
 from datagrunt.pdf._source import checked_pdf_file
 from datagrunt.pdf._validate import checked_password as _checked_password
@@ -200,7 +200,7 @@ class PDFWriter:
         source: str | os.PathLike[str] | PDFDocument,
         *,
         password: str | None = None,
-        workers: int = 1,
+        workers: int = WORKERS,
         ocr: OcrMode = "auto",
         dpi: int = 200,
         vision_dpi: int = 300,
@@ -569,22 +569,29 @@ def _write_renders(
 ) -> list[Path]:
     """Render and write every page on ``workers`` threads (the bundle's window); the paths written, in page order."""
 
-    def task(page: Page) -> Path | None:
-        return _rendered(page, directory, source, dpi, options.max_render_pixels)
+    def task(page: Page) -> Callable[[], Path | None]:
+        return _stage_rendered(page, directory, source, dpi, options.max_render_pixels)
 
     with render_worker_pool():
-        outcomes = _in_page_order(task, pages, options.workers, "datagrunt-writer")
+        outcomes = _in_page_order(task, pages, options.workers, "datagrunt-writer", finish=lambda finalize: finalize())
     return [path for path in outcomes if path is not None]
 
 
-def _rendered(page: Page, directory: Path, source: PDFSource, dpi: int, max_pixels: int) -> Path | None:
-    """Render ``page`` at the effective DPI of ``dpi`` and write its PNG; None, with a warning, if it is not."""
+def _stage_rendered(
+    page: Page, directory: Path, source: PDFSource, dpi: int, max_pixels: int
+) -> Callable[[], Path | None]:
+    """Render ``page`` at the effective DPI of ``dpi`` and return a closure that writes its PNG."""
     try:
         _, drawn = _drawn(source, page, dpi, max_pixels)
     except (RenderRefused, RenderFailed) as exc:
         _LOGGER.warning("page %d was not rendered: %s: %s", page.page_number, type(exc).__name__, exc)
-        return None
-    return _write_png(directory / f"page_{page.page_number:04d}.png", drawn)
+        return lambda: None
+    return lambda: _write_png(directory / f"page_{page.page_number:04d}.png", drawn)
+
+
+def _rendered(page: Page, directory: Path, source: PDFSource, dpi: int, max_pixels: int) -> Path | None:
+    """Render ``page`` at the effective DPI of ``dpi`` and write its PNG; None, with a warning, if it is not."""
+    return _stage_rendered(page, directory, source, dpi, max_pixels)()
 
 
 def _write_png(target: Path, image: RenderedPage) -> Path:

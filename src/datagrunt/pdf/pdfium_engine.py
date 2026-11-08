@@ -184,6 +184,7 @@ import os
 import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -771,6 +772,9 @@ def _opened_textpage(page: pdfium.PdfPage, page_number: int) -> Iterator[pdfium.
         textpage.close()
 
 
+_MIXED_PAGE_HOOK: ContextVar[Callable[[], None] | None] = ContextVar("_MIXED_PAGE_HOOK", default=None)
+
+
 def _read_page_text_and_objects(
     page: pdfium.PdfPage, geometry: PageGeometry
 ) -> tuple[PageText, list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]]:
@@ -779,6 +783,10 @@ def _read_page_text_and_objects(
     with _opened_textpage(page, page_number) as textpage, _pdfium_errors(page_number):
         objects = _page_objects(page.raw, max_objects=MAX_PAGE_OBJECTS)
         walk = _text_walk(objects)
+        if 0 < len(walk.text_objects) < len(objects):
+            hook = _MIXED_PAGE_HOOK.get()
+            if hook is not None:
+                hook()
         return collect_text(textpage.raw, _display_mapping(geometry), walk).page_text, objects
 
 
@@ -1208,7 +1216,7 @@ def image_refusal(
     int_at_least("max_objects", max_objects, 1)
     placed = _placed_objects(page.raw, pdfium_c.FPDF_PAGEOBJ_IMAGE, max_objects=max_objects, objects=objects)
     try:
-        for outcome in image_outcomes(placed, page.raw, geometry.page_box, _display_mapping(geometry)):
+        for outcome in image_outcomes(placed, page.raw, geometry.page_box, _display_mapping(geometry), for_guard=True):
             if outcome.render_refusal is not None:
                 return outcome.render_refusal
     except WalkBoundHit as exc:

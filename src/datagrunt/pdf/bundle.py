@@ -234,7 +234,7 @@ from dataclasses import dataclass, field
 from itertools import islice
 from pathlib import Path
 from types import MethodType
-from typing import BinaryIO, NamedTuple, TypeVar
+from typing import BinaryIO, NamedTuple, TypeVar, cast
 
 import polars as pl
 
@@ -268,6 +268,7 @@ from datagrunt.pdf._bundle_load import (
     _read_fd as _read_fd,
 )
 from datagrunt.pdf._loaders import PageDraw, PageRender, figure_pngs
+from datagrunt.pdf._options import WORKERS
 from datagrunt.pdf._png import write_grey_png
 from datagrunt.pdf._source import SourceIdentity, _opened_source, _stream_sha256
 from datagrunt.pdf._validate import checked_path as _checked_path
@@ -365,7 +366,7 @@ def write_bundle(
     dpi: int = 200,
     vision_dpi: int = 300,
     max_render_pixels: int = 16_000_000,
-    workers: int = 1,
+    workers: int = WORKERS,
     extraction_params: Mapping[str, object] | None = None,
     overwrite: bool = False,
     include_images: bool = True,
@@ -781,20 +782,34 @@ def _png(read: Callable[[], bytes]) -> tuple[bytes | None, str]:
     return data, ""
 
 
-def _in_page_order(task: Callable[[Page], _T], pages: tuple[Page, ...], workers: int, prefix: str) -> list[_T]:
+_U = TypeVar("_U")
+_DEFAULT_PAGEDRAW_PNG = PageDraw.png_bytes
+
+
+def _in_page_order(
+    task: Callable[[Page], _U],
+    pages: tuple[Page, ...],
+    workers: int,
+    prefix: str,
+    *,
+    finish: Callable[[_U], _T] | None = None,
+) -> list[_T]:
     """``task`` of every page on ``workers`` threads, at most ``workers`` in flight; the outcomes, in page order.
 
     A sliding window: the next page is submitted as soon as one ends, so a
     slow page holds one thread, never the others, and no more than
-    ``workers`` pages are ever submitted and unfinished. An error a task
-    raises fails the call, once the pages in flight have ended.
+    ``workers`` pages are ever submitted and unfinished. When ``finish`` is
+    given, replacement ``task`` calls are submitted before ``finish`` runs on
+    completed items so the next page renders while the completed page is
+    encoded and written. An error a task raises fails the call, once the
+    pages in flight have ended.
     """
     outcomes: dict[int, _T] = {}
     queued = iter(range(len(pages)))
-    running: dict[Future[_T], int] = {}
+    running: dict[Future[_U], int] = {}
     render_pool = active_render_worker_pool()
 
-    def run_task(page: Page) -> _T:
+    def run_task(page: Page) -> _U:
         with use_render_worker_pool(render_pool):
             return task(page)
 
@@ -806,8 +821,12 @@ def _in_page_order(task: Callable[[Page], _T], pages: tuple[Page, ...], workers:
             if not running:
                 break
             done, _pending = wait(running, return_when=FIRST_COMPLETED)
-            for future in done:
-                outcomes[running.pop(future)] = future.result()
+            completed = [(running.pop(future), future.result()) for future in done]
+            if finish is not None:
+                for index in islice(queued, workers - len(running)):
+                    running[pool.submit(run_task, pages[index])] = index
+            for index, value in completed:
+                outcomes[index] = finish(value) if finish is not None else cast(_T, value)
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
     return [outcomes[index] for index in range(len(pages))]
@@ -819,11 +838,13 @@ def _write_renders(
     """Write every page's image on ``workers`` threads (:func:`_in_page_order`); each page image written, by number."""
     renders: dict[int, _Written] = {}
 
-    def task(page: Page) -> _PageOutcome:
-        return _page_outcome(page, staging, source, options)
+    def task(page: Page) -> Callable[[], _PageOutcome]:
+        return _stage_page_outcome(page, staging, source, options)
 
     with render_worker_pool():
-        for outcome in _in_page_order(task, document.pages, options.workers, "datagrunt-bundle"):
+        for outcome in _in_page_order(
+            task, document.pages, options.workers, "datagrunt-bundle", finish=lambda finalize: finalize()
+        ):
             _record(outcome, renders, ledger)
     return renders
 
@@ -837,24 +858,37 @@ def _record(outcome: _PageOutcome, renders: dict[int, _Written], ledger: _Ledger
         ledger.warnings.append(outcome.warning)
 
 
+def _stage_page_outcome(
+    page: Page, staging: Path, source: PDFSource, options: PipelineOptions
+) -> Callable[[], _PageOutcome]:
+    """Render the page in the worker thread and return a closure that encodes and writes its PNG."""
+    image = page.page_image
+    if image is None:
+        return _stage_rendered_outcome(page, staging, source, options)
+    image = _draws_bound(image, source)
+    if _page_draw(image) is None:
+        outcome = _own_outcome(image, staging, source)
+        return lambda: outcome
+    try:
+        drawn = _at_write_dpi(image, page, options)
+    except RenderRefused as exc:
+        reason = f"the page was not rendered: {type(exc).__name__}: {exc}"
+        refused = _PageOutcome(None, (), (_Missing("page_image", page.page_number, None, reason),))
+        return lambda: refused
+    draw = _page_draw(drawn)
+    if draw is not None and PageDraw.png_bytes is _DEFAULT_PAGEDRAW_PNG and _own_outcome is _DEFAULT_OWN_OUTCOME:
+        return _stage_draw_outcome(drawn, draw, staging, source)
+    outcome = _own_outcome(drawn, staging, source)
+    return lambda: outcome
+
+
 def _page_outcome(page: Page, staging: Path, source: PDFSource, options: PipelineOptions) -> _PageOutcome:
     """Write the page's own image and bands when it has one, else render it at ``dpi``; a failure is recorded.
 
     A page image drawn on read is written at the effective DPI of ``dpi``
     (:func:`_at_write_dpi`): its own when that is its DPI, else drawn again at it.
     """
-    image = page.page_image
-    if image is None:
-        return _rendered_outcome(page, staging, source, options)
-    image = _draws_bound(image, source)
-    if _page_draw(image) is None:
-        return _own_outcome(image, staging, source)
-    try:
-        drawn = _at_write_dpi(image, page, options)
-    except RenderRefused as exc:
-        reason = f"the page was not rendered: {type(exc).__name__}: {exc}"
-        return _PageOutcome(None, (), (_Missing("page_image", page.page_number, None, reason),))
-    return _own_outcome(drawn, staging, source)
+    return _stage_page_outcome(page, staging, source, options)()
 
 
 def _at_write_dpi(image: PageImage, page: Page, options: PipelineOptions) -> PageImage:
@@ -909,18 +943,58 @@ def _rebound(loader: Callable[[], _T] | None, source: PDFSource) -> Callable[[],
     return method
 
 
-def _rendered_outcome(page: Page, staging: Path, source: PDFSource, options: PipelineOptions) -> _PageOutcome:
-    """Render the page at ``dpi`` and write its PNG (no bands); a refusal or failure is recorded."""
+def _stage_rendered_outcome(
+    page: Page, staging: Path, source: PDFSource, options: PipelineOptions
+) -> Callable[[], _PageOutcome]:
+    """Render ``page`` at ``dpi`` in the worker thread and return a closure that encodes and writes its PNG."""
     number = page.page_number
     try:
         dpi, drawn = _drawn(source, page, options.dpi, options.max_render_pixels)
     except (RenderRefused, RenderFailed) as exc:
         reason = f"the page was not rendered: {type(exc).__name__}: {exc}"
-        return _PageOutcome(None, (), (_Missing("page_image", number, None, reason),))
-    image = f"page_images/page_{number:04d}.png"
-    artifact = _write_png(staging, image, drawn)
-    written = _Written(number, "render", float(dpi), drawn.px_width, drawn.px_height, False, image, ())
-    return _PageOutcome(written, (artifact,), ())
+        outcome = _PageOutcome(None, (), (_Missing("page_image", number, None, reason),))
+        return lambda: outcome
+
+    def finish() -> _PageOutcome:
+        image = f"page_images/page_{number:04d}.png"
+        artifact = _write_png(staging, image, drawn)
+        written = _Written(number, "render", float(dpi), drawn.px_width, drawn.px_height, False, image, ())
+        return _PageOutcome(written, (artifact,), ())
+
+    return finish
+
+
+def _rendered_outcome(page: Page, staging: Path, source: PDFSource, options: PipelineOptions) -> _PageOutcome:
+    """Render the page at ``dpi`` and write its PNG (no bands); a refusal or failure is recorded."""
+    return _stage_rendered_outcome(page, staging, source, options)()
+
+
+def _stage_draw_outcome(
+    image: PageImage, draw: PageDraw, staging: Path, source: PDFSource
+) -> Callable[[], _PageOutcome]:
+    """Render ``draw`` in the worker thread and return a closure that streams its PNG to disk."""
+    number = image.page_number
+    unbound = _unbound(image, source.path)
+    if unbound:
+        reason = f"the page's own image {unbound}: its bytes could not be bound to the hashed source"
+        notice = f"page {number}'s own image {unbound}: no page image is written for it"
+        outcome = _PageOutcome(None, (), (_Missing("page_image", number, None, reason),), notice)
+        return lambda: outcome
+    try:
+        rendered = draw.render_page()
+    except (DatagruntPDFError, OSError) as exc:
+        why = f"{type(exc).__name__}: {exc}"
+        failed = _PageOutcome(None, (), (_Missing("page_image", number, None, f"the page was not rendered: {why}"),))
+        return lambda: failed
+
+    def finish() -> _PageOutcome:
+        path = f"page_images/page_{number:04d}.png"
+        artifact = _write_png(staging, path, rendered)
+        facts = (image.dpi, image.width_px, image.height_px, image.contrast_normalized)
+        written = _Written(number, "render", *facts, path, ())
+        return _PageOutcome(written, (artifact,), ())
+
+    return finish
 
 
 def _own_outcome(image: PageImage, staging: Path, source: PDFSource) -> _PageOutcome:
@@ -948,6 +1022,9 @@ def _own_outcome(image: PageImage, staging: Path, source: PDFSource) -> _PageOut
     facts = (image.dpi, image.width_px, image.height_px, image.contrast_normalized)
     written = _Written(number, origin, *facts, path, bands)
     return _PageOutcome(written, (artifact, *band_artifacts), missing)
+
+
+_DEFAULT_OWN_OUTCOME = _own_outcome
 
 
 def _origin_of(image: PageImage) -> str:

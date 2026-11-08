@@ -22,7 +22,7 @@ import pyarrow.parquet as pq
 import pytest
 from PIL import Image
 
-from datagrunt.pdf import _loaders, bundle, writer
+from datagrunt.pdf import _loaders, bundle, pipeline, writer
 from datagrunt.pdf.bundle import load_bundle
 from datagrunt.pdf.codec import document_from_json_bytes, document_to_json_bytes
 from datagrunt.pdf.elements import Paragraph, PDFDocument
@@ -64,7 +64,7 @@ from pdf_tests.test_layout_stream_tables import body_text
 
 OPTIONS = {
     "password": None,
-    "workers": 1,
+    "workers": pipeline.WORKERS,
     "ocr": "auto",
     "dpi": 200,
     "vision_dpi": 300,
@@ -1124,7 +1124,7 @@ class TestWriteBundle:
             "dpi": 72,
             "vision_dpi": 100,
             "max_render_pixels": 1_000_000,
-            "workers": 1,
+            "workers": pipeline.WORKERS,
             "ocr": "never",
             "min_image_dimension": 40,
             "strict": False,

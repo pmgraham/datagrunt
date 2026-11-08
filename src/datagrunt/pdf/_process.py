@@ -127,8 +127,8 @@ BOOTSTRAP = f"""
 import importlib, json, os, sys
 replies = os.fdopen(os.dup(1), "wb")
 os.dup2(2, 1)
-data = sys.stdin.buffer.read({MAX_REQUEST_BYTES} + 1)
-if len(data) > {MAX_REQUEST_BYTES}:
+data = sys.stdin.buffer.readline({MAX_REQUEST_BYTES} + 2)
+if len(data.rstrip(b"\\n")) > {MAX_REQUEST_BYTES}:
     raise SystemExit("the worker request is over {MAX_REQUEST_BYTES} bytes")
 message = json.loads(data)
 path = message["sys_path"]

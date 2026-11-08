@@ -174,7 +174,7 @@ class TestThePoolWritesNothing:
 
         pooled = extract_document(path, workers=2, ocr="never")
 
-        ended = "the worker process extracting pages 3-4 exited with code 3 without a reply before it began page 3"
+        ended = "the worker process extracting pages 3-3 exited with code 3 without a reply before it began page 3"
         assert [page.error for page in pooled.pages[2:]] == [f"{ended}; its stderr ends: pdfium: a message", None]
 
     def test_a_worker_killed_at_a_strict_failure_ends_its_drain(self, tmp_path, monkeypatch):

@@ -222,7 +222,7 @@ from pathlib import Path
 from typing import IO, NamedTuple, get_args
 
 from datagrunt.pdf._memory_cap import ending
-from datagrunt.pdf._options import DPI, MAX_RENDER_PIXELS, MIN_IMAGE_DIMENSION, OcrMode, VisionOptions
+from datagrunt.pdf._options import DPI, MAX_RENDER_PIXELS, MIN_IMAGE_DIMENSION, WORKERS, OcrMode, VisionOptions
 from datagrunt.pdf._process import (
     MAX_REQUEST_BYTES,
     REAP_TIMEOUT_S,
@@ -319,7 +319,7 @@ class PipelineOptions:
             ``ocr`` is not one of the three modes.
     """
 
-    workers: int = 1
+    workers: int = WORKERS
     ocr: OcrMode = "auto"
     dpi: int = DPI
     vision_dpi: int = 300
@@ -391,7 +391,7 @@ def extract_document(
     source: str | os.PathLike[str],
     *,
     password: str | None = None,
-    workers: int = 1,
+    workers: int = WORKERS,
     ocr: OcrMode = "auto",
     dpi: int = 200,
     vision_dpi: int = 300,
@@ -663,7 +663,7 @@ def _pool_command() -> list[str]:
         raise DatagruntPDFError(str(exc)) from exc
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _Worker:
     """One running page worker: its pages, its process, its stderr's drain (a 4 KiB ring), and when it started."""
 
@@ -671,6 +671,34 @@ class _Worker:
     child: "subprocess.Popen[bytes]"
     stderr: StderrTail
     started: float  # time.monotonic(), just before it was started
+
+
+class _PageDispenser:
+    """Thread-safe dispenser of 0-based page indices across worker threads."""
+
+    __slots__ = ("_count", "_lock", "_next")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._next = 0
+        self._count = 0
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    def initialize(self, start: int, count: int) -> None:
+        with self._lock:
+            self._next = start
+            self._count = count
+
+    def next_page(self) -> int | None:
+        with self._lock:
+            if self._next >= self._count:
+                return None
+            index = self._next
+            self._next += 1
+            return index
 
 
 _POOL_BOOTSTRAP = (
@@ -758,7 +786,7 @@ def _started(command: list[str], pages: tuple[int, ...] | None) -> _Worker:
 
 
 def _send_request(worker: _Worker, payload: bytes) -> None:
-    """Write the worker's request to its stdin and close it.
+    """Write the worker's request line to its stdin, keeping stdin open for dynamic page indices.
 
     A worker that has already died stops reading: its replies then end
     without its pages, and its exit code and stderr say why.
@@ -767,8 +795,8 @@ def _send_request(worker: _Worker, payload: bytes) -> None:
     if stdin is None:
         raise ValueError("the worker's stdin must be a pipe")
     try:
-        stdin.write(payload)
-        stdin.close()
+        stdin.write(payload + b"\n")
+        stdin.flush()
     except OSError:  # it died at once: its replies end, and its exit code and stderr say why
         pass
 
@@ -780,6 +808,19 @@ def _send_pool_request(worker: _Worker, raw_json: bytes) -> None:
         raise ValueError("the worker's stdin must be a pipe")
     try:
         send_message(stdin, raw_json)
+    except OSError:
+        pass
+
+
+def _send_next_page(worker: _Worker, index: int | None, *, close_on_done: bool) -> None:
+    """Send the next 0-based page index (or an empty message when no pages remain) to the worker's stdin."""
+    stdin = worker.child.stdin
+    if stdin is None:
+        return
+    try:
+        send_message(stdin, b"" if index is None else _INDEX.pack(index))
+        if index is None and close_on_done:
+            stdin.close()
     except OSError:
         pass
 
@@ -796,11 +837,12 @@ class _Replies:
     page.
     """
 
-    __slots__ = ("bound_s", "current", "detail", "ending", "error", "facts", "pages")
+    __slots__ = ("bound_s", "completed", "current", "detail", "ending", "error", "facts", "pages")
 
     def __init__(self) -> None:
         self.facts: Facts | None = None
         self.pages: list[Page] = []
+        self.completed = 0
         self.current: int | None = None
         self.ending = ""
         self.detail = ""
@@ -825,9 +867,11 @@ class _Chunk:
         pages: tuple[int, ...] | None,
         workers: int,
         worker_pool: PageWorkerPool | None = None,
+        dispenser: _PageDispenser | None = None,
     ) -> None:
         self.source, self.options, self.command, self.workers = source, options, command, workers
         self.worker_pool = worker_pool
+        self.dispenser = dispenser
         self.pages = pages
         self.facts: Facts | None = None
         self.got: dict[int, Page] = {}
@@ -943,7 +987,11 @@ class _Chunk:
             raise DatagruntPDFError(replies.detail)
         culprit = replies.current if replies.current in unsent else unsent[0]
         self.got[culprit] = error_page(culprit, replies.detail, why="its worker process returned nothing")
-        return tuple(index for index in unsent if index != culprit)
+        left = tuple(index for index in unsent if index != culprit)
+        if not left and self.dispenser is not None:
+            next_index = self.dispenser.next_page()
+            return () if next_index is None else (next_index,)
+        return left
 
 
 # A chunk starts at most this many workers: each settles at least one page, and a PDF has at most 2**31 - 1 pages.
@@ -961,8 +1009,11 @@ def _read_into(worker: _Worker, replies: _Replies, chunk: _Chunk) -> None:
     pages = worker.pages if worker.pages is not None else chunk.pages or ()
     lost = f"the worker process extracting pages {_span(pages)}"
     since = worker.started
-    for _ in range(3 * len(pages) + 2):  # bounded: two progress messages and a page a page, then done
-        bound_s = _reply_bound_s(len(pages), len(replies.pages), chunk.options)
+    max_pages = chunk.dispenser.count if chunk.dispenser is not None else len(pages)
+    for _ in range(3 * max(1, max_pages) + 2):  # bounded: two progress messages and a page a page, then done
+        total_received = replies.completed + len(replies.pages)
+        total_expected = replies.completed + len(pages)
+        bound_s = _reply_bound_s(total_expected, total_received, chunk.options)
         try:
             message, expired = next_reply(
                 worker.child, stdout, since + bound_s - time.monotonic(), _MAX_PAGE_MESSAGE_BYTES, kill=kill_group
@@ -984,8 +1035,21 @@ def _read_into(worker: _Worker, replies: _Replies, chunk: _Chunk) -> None:
             return
         if kind == _ERROR:
             replies.ending = "error_reply"
-        replies.pages.append(_next_page(message, pages, len(replies.pages), lost))
+        page = _next_page(message, pages, len(replies.pages), lost)
+        replies.pages.append(page)
         since = time.monotonic()
+        if len(replies.pages) == len(pages):
+            next_index = chunk.dispenser.next_page() if chunk.dispenser is not None else None
+            if next_index is not None:
+                for done_page in replies.pages:
+                    chunk.got[done_page.page_number - 1] = done_page
+                replies.completed += len(replies.pages)
+                replies.pages.clear()
+                replies.current = None
+                pages = (next_index,)
+                worker.pages = pages
+                lost = f"the worker process extracting pages {_span(pages)}"
+            _send_next_page(worker, next_index, close_on_done=chunk.worker_pool is None)
     raise DatagruntPDFError(f"{lost} sent more replies than its pages")
 
 
@@ -1008,7 +1072,14 @@ def _read_facts(worker: _Worker, stdout: IO[bytes], replies: _Replies, chunk: _C
         raise read_error(message[1:], "the first page worker")
     facts = _facts_of(message)
     chunk.facts = replies.facts = facts
-    chunk.pages = tuple(_chunks(facts.page_count, chunk.workers)[0])
+    if chunk.dispenser is not None:
+        initial = min(chunk.workers, facts.page_count)
+        chunk.dispenser.initialize(initial, facts.page_count)
+        chunk.pages = (0,)
+        worker.pages = (0,)
+    else:
+        chunk.pages = tuple(_chunks(facts.page_count, chunk.workers)[0])
+        worker.pages = chunk.pages
     chunk.ready.set()
     return True
 
@@ -1107,12 +1178,16 @@ def _pooled_pages(
     Every worker is reaped (or returned to ``worker_pool`` if healthy) before this returns or raises.
     """
     workers = _pool_size(options.workers)
-    chunks = [_Chunk(source, options, command, None, workers, worker_pool=worker_pool)]
+    dispenser = _PageDispenser() if workers > 1 else None
+    chunks = [_Chunk(source, options, command, None, workers, worker_pool=worker_pool, dispenser=dispenser)]
     try:
         chunks[0].start()
         facts = _facts_from(chunks[0])
-        for span in _chunks(facts.page_count, workers)[1:]:
-            chunks.append(_Chunk(source, options, command, tuple(span), workers, worker_pool=worker_pool))
+        initial = min(workers, facts.page_count)
+        for index in range(1, initial):
+            chunks.append(
+                _Chunk(source, options, command, (index,), workers, worker_pool=worker_pool, dispenser=dispenser)
+            )
             chunks[-1].start()
         return facts, _gathered(chunks, options)
     finally:
@@ -1132,23 +1207,23 @@ def _facts_from(chunk: _Chunk) -> Facts:
 
 def _gathered(chunks: list[_Chunk], options: PipelineOptions) -> tuple[Page, ...]:
     """Each chunk's pages, in page order, once its thread ends; a chunk's error raised, its later chunks stopped."""
-    pages: list[Page] = []
+    got: dict[int, Page] = {}
     for index, chunk in enumerate(chunks):
         try:
             _joined(chunk, options)
             if chunk.error is not None:
                 raise chunk.error
-            pages.extend(chunk.got[number] for number in sorted(chunk.got))
+            got.update(chunk.got)
         except BaseException:
             for later in chunks[index + 1 :]:
                 later.stop()
             raise
-    return tuple(pages)
+    return tuple(got[number] for number in sorted(got))
 
 
 def _joined(chunk: _Chunk, options: PipelineOptions) -> None:
     """Wait for the chunk's thread: within each of its workers' lifetimes, at most one worker a page and one more."""
-    count = len(chunk.pages or ())
+    count = chunk.dispenser.count if chunk.dispenser is not None else len(chunk.pages or ())
     chunk.thread.join((count + 1) * (_lifetime_s(count, options) + REAP_TIMEOUT_S))
     if chunk.thread.is_alive():
         chunk.stop()

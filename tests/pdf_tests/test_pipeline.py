@@ -251,37 +251,45 @@ DISTRIBUTED_KEYS = ("SPARK_ENV_LOADED", "SPARK_HOME", "BEAM_WORKER_ID", "FLINK_C
 
 # Page workers for tests: module level, so a worker started by the bootstrap imports them from this module by name.
 def pages_of(message) -> tuple[int, ...]:
-    """The page indices the worker for ``message`` extracts: its ranges, or the first chunk (the first worker's)."""
+    """The page indices the worker for ``message`` starts with: its ranges, or page 0 (the first worker's)."""
     if message["pages"] is not None:
         return tuple(index for start, stop in message["pages"] for index in range(start, stop))
-    with open_document(message["source"], password=message["password"]) as handle:
-        return tuple(pipeline._chunks(handle.page_count, message["workers"])[0])
+    return (0,)
 
 
-def holds_page_3(message) -> bool:
-    return 2 in pages_of(message)
+def on_page_3(action) -> None:
+    """Run ``action()`` in this worker process right before page 3 (index 2) is begun."""
+    real = _page_worker._window_pages
+
+    def window_pages(handle, source, window, options, progress):
+        if 2 in window:
+            action()
+        return real(handle, source, window, options, progress)
+
+    _page_worker._window_pages = window_pages
 
 
 def stops_on_page_3(message, replies):
-    """The worker holding page 3 ends at once (``os._exit``: no exception, no reply); the rest are the pipeline's."""
-    if holds_page_3(message):
-        os._exit(7)
+    """The worker given page 3 ends at once (``os._exit``: no exception, no reply); the rest are the pipeline's."""
+    on_page_3(lambda: os._exit(7))
     _page_worker._worker_main(message, replies)
 
 
 def complains_and_stops_on_page_3(message, replies):
-    """The worker holding page 3 writes to its stderr, then ends; the rest are the pipeline's."""
-    if holds_page_3(message):
+    """The worker given page 3 writes to its stderr, then ends; the rest are the pipeline's."""
+
+    def complain_and_stop():
         sys.stderr.write("pdfium: a message\n")
         sys.stderr.flush()
         os._exit(3)
+
+    on_page_3(complain_and_stop)
     _page_worker._worker_main(message, replies)
 
 
 def hang_on_page_3(message, replies):
-    """The worker holding page 3 never replies; the rest are the pipeline's."""
-    if holds_page_3(message):
-        time.sleep(60)
+    """The worker given page 3 never replies; the rest are the pipeline's."""
+    on_page_3(lambda: time.sleep(60))
     _page_worker._worker_main(message, replies)
 
 
@@ -305,9 +313,18 @@ def facts_then_pages(message, replies) -> tuple[Page, ...]:
 
 
 def send_pages_reversed(message, replies):
-    """A worker that replies with its own pages, last first, then done."""
-    for page in reversed(facts_then_pages(message, replies)):
-        _process.send_message(replies, b"P" + pickle.dumps(page))
+    """A worker that replies with page 2 where page 1 is due."""
+    request = pipeline._chunk_request(message)
+    if request.pages is None:
+        with open_document(request.source.path) as handle:
+            info, count = document_metadata(handle), handle.page_count
+            facts = {"page_count": count, "title": info.title, "author": info.author}
+            _process.send_message(replies, b"F" + json.dumps(facts).encode("ascii"))
+            pages = tuple(
+                _page_worker._iter_pages(handle, request.source, (0, 1), request.options, _page_worker._quiet)
+            )
+        for page in reversed(pages):
+            _process.send_message(replies, b"P" + pickle.dumps(page))
     _process.send_message(replies, b"D")
 
 
@@ -338,8 +355,8 @@ def send_done_early(message, replies):
 
 def send_pages_then_stop(message, replies):
     """A worker that sends its pages, then ends before its last check of the file (no done)."""
-    for page in facts_then_pages(message, replies):
-        _process.send_message(replies, b"P" + pickle.dumps(page))
+    request = pipeline._chunk_request(message)
+    _page_worker._extract(request, replies, Lifetime(600.0))
     os._exit(5)
 
 
@@ -550,7 +567,7 @@ def assert_reaped(pids) -> None:
 
 
 GOOD = {
-    "workers": 1,
+    "workers": pipeline.WORKERS,
     "ocr": "auto",
     "dpi": 200,
     "vision_dpi": 300,
@@ -1591,13 +1608,13 @@ class TestWorkers:
 
         pooled = extract_document(path, workers=2)
 
-        reason = "the worker process extracting pages 3-4 exited with code 7 without a reply before it began page 3"
+        reason = "the worker process extracting pages 3-3 exited with code 7 without a reply before it began page 3"
         note = f"the page's size could not be read (its worker process returned nothing){DEFAULT_SIZE_NOTE}"
         assert pooled.pages[2] == error_page(3, reason, warnings=(note,))
         assert pooled.pages[:2] == sequential.pages[:2]
-        assert pooled.pages[3] == sequential.pages[3]  # read by a new worker: the page that ended one ends no other
+        assert pooled.pages[3] == sequential.pages[3]  # read by another worker: the page that ended one ends no other
         assert pooled.degraded_pages == (3,)
-        assert len(started) == 3
+        assert len(started) in (2, 3)
         assert_reaped(started)
 
     def test_strict_raises_when_a_page_ends_its_worker_naming_it(self, tmp_path, monkeypatch):
@@ -1605,7 +1622,7 @@ class TestWorkers:
         started = started_workers(monkeypatch)
         run_page_workers_as(monkeypatch, "stops_on_page_3")
 
-        message = "the worker process extracting pages 3-4 exited with code 7 without a reply before it began page 3"
+        message = "the worker process extracting pages 3-3 exited with code 7 without a reply before it began page 3"
         with pytest.raises(DatagruntPDFError, match=re.escape(message)):
             extract_document(path, workers=2, strict=True)
 
@@ -1651,14 +1668,13 @@ class TestWorkers:
         elapsed = time.monotonic() - began
 
         reason = (
-            "the worker process extracting pages 3-4 did not return page 3 within 10 s of its start: it was killed "
+            "the worker process extracting pages 3-3 did not return page 3 within 2.5 s of its start: it was killed "
             "before it began page 3"
         )
         assert [page.error for page in pooled.pages] == [None, None, reason, None]
-        # Page 3's bound from its worker's start: 4 s to start, its own 2 + 0.5 s (no OCR under ocr="never"), and
-        # its window's lead: page 4's 2 + 0.5 s and the background render's 0.5 + 0.5 s. Pages 1-2 come in ~0.3 s
-        # here, page 2 well within its 2.5 s of page 1; the hung worker sleeps 60 s.
-        assert elapsed >= 10.0
+        # Page 3's bound after its worker already returned a first page: its own 2 + 0.5 s (no OCR under ocr="never").
+        # Pages 1-2 come in ~0.3 s here; the hung worker sleeps 60 s.
+        assert elapsed >= 2.5
         assert_reaped(started)
 
     @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
@@ -1686,14 +1702,12 @@ class TestWorkers:
 
         pooled = extract_document(path, workers=2)
 
-        # Page 2's bound from page 1's reply, however large the page: 0.5 s of work, 0.5 s of background render, its
-        # 2.5 s OCR budget and its reap, 0.5 s: 4 s, where each page after a chunk's first comes in ~0.05 s here. Page
-        # 1's (and page 5's) bound is 10 s from its worker's start (2 s to start, its 4 s, and its window's lead: 3
-        # pages' 1 s and the background render's 1 s), where it comes in ~0.3 s. Page 2's worker hangs 20 s at its
-        # step 4: page 1 is kept, page 2 is an error page, and pages 3-4 are read by a new worker.
+        # Page 2's bound from its worker's start, however large the page: 2 s to start, 0.5 s of work, 0.5 s + 0.5 s
+        # of background render, its 2.5 s OCR budget and its reap, 0.5 s + 0.5 s: 7 s. Page 2's worker hangs 20 s at
+        # its step 4: page 1 is kept, page 2 is an error page, and pages 3-8 are read by the other worker.
         reason = (
-            "the worker process extracting pages 1-4 did not return page 2 within 4 s of page 1: it was killed while "
-            "it extracted page 2"
+            "the worker process extracting pages 2-2 did not return page 2 within 7 s of its start: it was killed "
+            "while it extracted page 2"
         )
         assert [page.error for page in pooled.pages] == [None, reason, None, None, None, None, None, None]
         kept = [0, 2, 3, 4, 5, 6, 7]
@@ -1725,14 +1739,14 @@ class TestWorkers:
         assert pooled == sequential
         assert [(page.status, page.route) for page in pooled.pages] == [("ok", "vision")] * 3 + [("ok", "digital")] * 3
         assert [element_texts(page) for page in pooled.pages[:3]] == [["slow"]] * 3
-        # Pages 1-3's worker made 6 slow tesseract calls (OSD and one band a page at 72 DPI), each 0.3 s of its 3 s
+        # Pages 1-3 made 6 slow tesseract calls in all (OSD and one band a page at 72 DPI), each 0.3 s of its 3 s
         # timeout, a page ~0.9 s of its 18 s budget: none was cut off.
-        assert elapsed >= 6 * SLOW_OCR_SLEEP_S
+        assert elapsed >= 4 * SLOW_OCR_SLEEP_S
         assert_reaped(started)
 
     @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_a_fast_chunk_behind_a_slow_one_is_never_killed(self, tmp_path, monkeypatch):
-        # #426: pages 25-48 (~150 KB pickled, past a pipe's 64 KB) are read as they come, not after pages 1-24's.
+        # #426: pages are handed out one at a time, so fast workers steal remaining pages while a slow page runs.
         path = build_pdf(tmp_path / "doc.pdf", [*[PageSpec(items=LINES)] * 44, *[dense_page()] * 4])
         sequential = extract_document(path, ocr="never")  # at the default bounds: one worker, windows of 8
         allowances(
@@ -1753,10 +1767,7 @@ class TestWorkers:
 
         assert pooled == sequential
         assert [page.status for page in pooled.pages] == ["ok"] * 48
-        # A page's bound (each page its own window): 2.9 + 0.5 s, and 0.3 + 0.3 s for its window's background render,
-        # 4 s; a chunk's first page, 6 s more. Pages 1-24 take 0.5 s each, an eighth of their bound: 12 s in all, past
-        # the 10 s pages 25-48's first page is given from its worker's start. Pages 25-48 take ~0.05 s each here.
-        assert elapsed >= 24 * SLOW_PAGE_S
+        assert elapsed >= SLOW_PAGE_S
         assert_reaped(started)
 
     @pytest.mark.parametrize(
@@ -1806,7 +1817,7 @@ class TestWorkers:
 
         pooled = extract_document(path, workers=2)
 
-        ended = "the worker process extracting pages 3-4 exited with code 3 without a reply before it began page 3"
+        ended = "the worker process extracting pages 3-3 exited with code 3 without a reply before it began page 3"
         assert [page.error for page in pooled.pages[2:]] == [f"{ended}; its stderr ends: pdfium: a message", None]
 
     def test_a_page_worker_is_python_isolated_and_reads_its_request_on_stdin(self, tmp_path, monkeypatch):
@@ -1825,7 +1836,7 @@ class TestWorkers:
         assert seen == [[sys.executable, "-I", "-c", _process.BOOTSTRAP]] * 2
         requests = [json.loads(payload) for payload in written]
         assert [(request["worker"], request["request"]["pages"]) for request in requests] == [
-            ("pages", None),  # the first worker: the document's facts, then the first chunk
+            ("pages", None),  # the first worker: the document's facts, then the first page
             ("pages", [[1, 2]]),
         ]
         assert all(
@@ -1889,7 +1900,7 @@ class TestWorkers:
         started = started_workers(monkeypatch)
         run_page_workers_as(monkeypatch, "send_pages_reversed")
 
-        message = "the worker process extracting pages 1-2 returned page 2 where page 1 was due"
+        message = "the worker process extracting pages 1-1 returned page 2 where page 1 was due"
         with pytest.raises(DatagruntPDFError, match=re.escape(message)):
             extract_document(path, workers=2)
 
@@ -2298,7 +2309,7 @@ class TestSourceIdentity:
         with pytest.raises(PDFSourceChangedError) as caught:
             extract_document(path, workers=2)
 
-        when = "by the time the worker for pages 1-2 finished them"
+        when = "by the time the worker for pages 1-1 finished them"
         assert str(caught.value) == changed(path, when, before, identity_of(path), "inode")
         assert_reaped(started)
 
@@ -2401,7 +2412,7 @@ class TestPageWorker:
 
         assert replies[0] == b"F" + json.dumps({"page_count": 3, "title": "Parts", "author": "Ada"}).encode()
         pages = [pickle.loads(reply[1:]) for reply in replies if reply[:1] == b"P"]
-        assert [page.page_number for page in pages] == [1, 2]  # the first of 2 chunks of 3 pages
+        assert [page.page_number for page in pages] == [1]  # the first worker starts with page 1
         assert replies[-1] == b"D"
 
     def test_each_page_is_sent_as_soon_as_it_is_extracted(self, tmp_path, monkeypatch):

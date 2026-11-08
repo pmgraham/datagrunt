@@ -265,8 +265,8 @@ class PageDraw:
         """The page's ``(width, height)`` in pixels at ``dpi``."""
         return render_size(self.width_pt, self.height_pt, self.dpi)
 
-    def png_bytes(self) -> bytes:
-        """The page as displayed, 8-bit grey as drawn, as PNG.
+    def render_page(self) -> RenderedPage:
+        """The page as displayed, 8-bit grey as drawn, as a :class:`~datagrunt.pdf.render.RenderedPage`.
 
         Raises:
             PDFSourceChangedError: If the file at ``source`` is gone, not a
@@ -283,7 +283,20 @@ class PageDraw:
             raise DatagruntPDFError(
                 f"{self.source}: {drew}, not the {width} x {height} px of its page image: the PDF is not the one read"
             )
-        return _png(page)
+        return page
+
+    def png_bytes(self) -> bytes:
+        """The page as displayed, 8-bit grey as drawn, as PNG.
+
+        Raises:
+            PDFSourceChangedError: If the file at ``source`` is gone, not a
+                regular file or its bytes are not the document's before the
+                render, or it changed during it (module notes).
+            DatagruntPDFError: If the page draws at another size than
+                :attr:`size` (the PDF is not the one read), or as
+                ``render_page`` raises (``RenderRefused``, ``RenderFailed``).
+        """
+        return _png(self.render_page())
 
 
 def _bound_render(loader: PageRender | PageDraw) -> RenderedPage:

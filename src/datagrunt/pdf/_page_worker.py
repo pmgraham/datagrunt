@@ -22,6 +22,7 @@ was on an error page and gives the rest to a new worker.
 import json
 import os
 import pickle
+import stat
 import sys
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -36,6 +37,7 @@ from datagrunt.pdf.elements import Page
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFSourceChangedError
 from datagrunt.pdf.layout import find_lattice_tables
 from datagrunt.pdf.pdfium_engine import (
+    _MIXED_PAGE_HOOK,
     DocumentHandle,
     PageFailure,
     RawPage,
@@ -66,11 +68,14 @@ from datagrunt.pdf.render import (
     RenderedPage,
     RenderFailed,
     RenderRefused,
+    active_render_worker_pool,
     effective_dpi,
     render_pages,
     render_worker_pool,
 )
 from datagrunt.pdf.vision import fallback_page, vision_page
+
+_DEFAULT_RENDER_PAGES = render_pages
 
 __all__ = ["extract_page_at"]
 
@@ -141,6 +146,23 @@ def _pool_worker_main(replies: IO[bytes]) -> None:
                 return
 
 
+def _next_page_index() -> int | None:
+    """Read the next 0-based page index from the caller's pipe on stdin, or None when no more pages remain."""
+    try:
+        stream = sys.stdin.buffer
+        if not stat.S_ISFIFO(os.fstat(stream.fileno()).st_mode):
+            return None
+        raw = read_message(stream, _INDEX.size)
+    except (AttributeError, OSError, ValueError):
+        return None
+    if not raw:
+        return None
+    if len(raw) != _INDEX.size:
+        raise ValueError(f"next page index must be {_INDEX.size} bytes, got {len(raw)}")
+    (index,) = _INDEX.unpack(raw)
+    return index
+
+
 def _extract(request: ChunkRequest, replies: IO[bytes], lifetime: Lifetime) -> None:
     """Open the document, send its facts (the first worker), then each of the chunk's pages; re-check the file."""
     source, pages = request.source, request.pages
@@ -150,11 +172,19 @@ def _extract(request: ChunkRequest, replies: IO[bytes], lifetime: Lifetime) -> N
             info, count = document_metadata(handle), handle.page_count
             facts = {"page_count": count, "title": info.title, "author": info.author}
             send_message(replies, _FACTS + json.dumps(facts).encode("ascii"))
-            pages = tuple(pipeline._chunks(count, request.workers)[0])
-        lifetime.extend(pipeline._lifetime_s(len(pages), request.options))
+            pages = tuple(range(count)) if request.workers == 1 else (0,)
+        pages_list = list(pages)
+        lifetime.extend(pipeline._lifetime_s(len(pages_list), request.options))
         progress = partial(_send_started, replies)
-        for page in _iter_pages(handle, source, pages, request.options, progress):  # bounded: the chunk's pages
+        sent = 0
+        for page in _iter_pages(handle, source, pages_list, request.options, progress):  # bounded: the document's pages
             send_message(replies, _PAGE + pickle.dumps(page))
+            sent += 1
+            if sent == len(pages_list):
+                next_index = _next_page_index()
+                if next_index is not None:
+                    lifetime.extend(pipeline._lifetime_s(1, request.options))
+                    pages_list.append(next_index)
     _check_unchanged(source, os.stat(source.path), f"by the time the worker for pages {_span(pages)} finished them")
 
 
@@ -202,8 +232,11 @@ def _iter_pages(
 ) -> Iterator[Page]:
     """The pages at ``pages`` of the open document, in order, each as it is done; a window of pages at a time."""
     size = pipeline._WINDOW_PAGES
-    for start in range(0, len(pages), size):  # bounded: one window per _WINDOW_PAGES pages
-        yield from _window_pages(handle, source, pages[start : start + size], options, progress)
+    start = 0
+    while start < len(pages):  # bounded: at most the document's pages
+        window = pages[start : start + size]
+        start += len(window)
+        yield from _window_pages(handle, source, window, options, progress)
 
 
 def _window_pages(
@@ -218,9 +251,27 @@ def _window_pages(
     bound gives it (:func:`~datagrunt.pdf.pipeline._reply_bound_s`).
     """
     staged: list[Page | _Assessed | PageFailure] = []
-    for index in window:  # bounded: the window's pages
-        progress(index)
-        staged.append(_isolated(handle, index, options, partial(_assessed, handle, index, options)))
+    pool = active_render_worker_pool()
+    warm_hook = (
+        partial(pool.warm, pipeline._vision(options).memory_cap_bytes)
+        if pool is not None and render_pages is _DEFAULT_RENDER_PAGES
+        else None
+    )
+    token = _MIXED_PAGE_HOOK.set(warm_hook)
+    try:
+        for index in window:  # bounded: the window's pages
+            progress(index)
+            item = _isolated(handle, index, options, partial(_assessed, handle, index, options))
+            if (
+                warm_hook is not None
+                and len(window) > 1
+                and isinstance(item, _Assessed)
+                and isinstance(item.background_dpi, int)
+            ):
+                warm_hook()
+            staged.append(item)
+    finally:
+        _MIXED_PAGE_HOOK.reset(token)
     drawn = _backgrounds(source, staged, options)
     for item in staged:  # bounded: the window's pages
         if isinstance(item, Page):

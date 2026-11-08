@@ -29,7 +29,7 @@ import pytest
 from PIL import Image
 
 import datagrunt
-from datagrunt.pdf import _loaders, bundle
+from datagrunt.pdf import _loaders, bundle, pipeline
 from datagrunt.pdf.bundle import BUNDLE_FORMAT_VERSION, load_bundle, write_bundle
 from datagrunt.pdf.codec import document_from_json_bytes
 from datagrunt.pdf.elements import Figure, PDFDocument
@@ -288,7 +288,7 @@ class TestManifest:
         assert manifest["bundle_format_version"] == BUNDLE_FORMAT_VERSION == "5.0"
         assert manifest["datagrunt_version"] == datagrunt.__version__
         assert manifest["source_sha256"] == sha_of(written.source) == written.document.metadata.sha256
-        params = {"dpi": DPI, "vision_dpi": VISION_DPI, "max_render_pixels": 16_000_000, "workers": 1}
+        params = {"dpi": DPI, "vision_dpi": VISION_DPI, "max_render_pixels": 16_000_000, "workers": pipeline.WORKERS}
         assert manifest["extraction_params"] == params
         assert manifest["integrity_verified"] is False is written.document.integrity_verified
         assert manifest["degraded_pages"] == [3, 4]
@@ -751,7 +751,7 @@ class TestValidation:
 
     def test_defaults_are_recorded(self, tmp_path, source, fast_render):
         write_bundle(bound_document(source), tmp_path / "out", source=source)
-        params = {"dpi": 200, "vision_dpi": 300, "max_render_pixels": 16_000_000, "workers": 1}
+        params = {"dpi": 200, "vision_dpi": 300, "max_render_pixels": 16_000_000, "workers": pipeline.WORKERS}
         assert manifest_of(tmp_path / "out")["extraction_params"] == params
 
     def test_the_render_gets_the_password_cap_and_timeout(self, tmp_path, monkeypatch):
@@ -1247,7 +1247,7 @@ class TestExtractionParams:
             "dpi": DPI,
             "vision_dpi": VISION_DPI,
             "max_render_pixels": 16_000_000,
-            "workers": 1,
+            "workers": pipeline.WORKERS,
             **self.EXTRA,
         }
         assert list(params)[:4] == ["dpi", "vision_dpi", "max_render_pixels", "workers"]

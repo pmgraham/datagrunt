@@ -292,10 +292,10 @@ class TestBatchExtractionAndLoading:
 
         pdf_a, pdf_b = sample_pdfs
         with PageWorkerPool() as pool:
-            doc_a = extract_document(pdf_a, dpi=72, vision_dpi=72, _worker_pool=pool)
+            doc_a = extract_document(pdf_a, workers=1, dpi=72, vision_dpi=72, _worker_pool=pool)
             assert len(pool._idle) == 1
             first_pid = pool._idle[0][0].pid
-            doc_b = extract_document(pdf_b, dpi=72, vision_dpi=72, _worker_pool=pool)
+            doc_b = extract_document(pdf_b, workers=1, dpi=72, vision_dpi=72, _worker_pool=pool)
             assert len(pool._idle) == 1
             assert pool._idle[0][0].pid == first_pid
         assert doc_a.page_count == 1
