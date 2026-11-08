@@ -800,6 +800,9 @@ class TestFiguresSharingAStream:
         assert manifest_of(out)["missing"] == []
         assert [figure.read_bytes() for figure in load_bundle(out).figures] == own
 
+    # Its pages are image-only under ocr="never" (a figure, no text: #470); until T3 the codec drops the marker, so
+    # the loaded bundle's pages read () where the written document's read ("too_little_text",).
+    @pytest.mark.xfail(strict=True, reason="#470 T3: the codec writes image_only_reasons")
     def test_a_figure_is_read_though_an_earlier_one_of_its_stream_failed(self, tmp_path):
         document, returned = self.bundled(tmp_path, UNREADABLE, AS_RGB)
         sha, out = document.figures[0].sha256, tmp_path / "out"
@@ -809,6 +812,7 @@ class TestFiguresSharingAStream:
         assert (missing["artifact"], missing["page_number"], missing["element_id"]) == ("figure", 1, "p0001_e000")
         assert load_bundle(out) == returned
 
+    @pytest.mark.xfail(strict=True, reason="#470 T3: the codec writes image_only_reasons")
     def test_each_figure_not_written_has_its_own_missing_entry(self, tmp_path):
         _, returned = self.bundled(tmp_path, UNREADABLE, UNREADABLE)
         assert [figure.image_path for figure in returned.figures] == [None, None]

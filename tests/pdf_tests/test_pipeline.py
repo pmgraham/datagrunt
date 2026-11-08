@@ -188,6 +188,7 @@ def raising(error: BaseException):
 
 
 def error_page(page_number: int, error: str, *, size=(612.0, 792.0), warnings=()) -> Page:
+    """The error page the pipeline makes: nothing read, so image-only (#470)."""
     return Page(
         page_number=page_number,
         width_pt=size[0],
@@ -197,6 +198,7 @@ def error_page(page_number: int, error: str, *, size=(612.0, 792.0), warnings=()
         quality=None,
         error=error,
         warnings=warnings,
+        image_only_reasons=("extraction_failed",),
     )
 
 
@@ -1107,6 +1109,22 @@ class TestPageIsolation:
 
         with pytest.raises(type(error)):
             page_at(path)
+
+    @pytest.mark.parametrize("size", [None, (400.0, 300.0)], ids=["default-size", "its-size"])
+    def test_the_pipelines_error_page_is_image_only(self, size):
+        # Nothing was read from it (#470): its content lives only in the page (and the source PDF).
+        page = pipeline.error_page(0, "RuntimeError: boom", size=size, why="it could not be read")
+
+        assert (page.status, page.route, page.image_only_reasons) == ("error", "vision", ("extraction_failed",))
+
+    @pytest.mark.parametrize("ocr", ["auto", "never"])
+    def test_a_stage_that_raises_makes_an_image_only_page(self, tmp_path, monkeypatch, ocr):
+        path = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
+        monkeypatch.setattr(_page_worker, "assess_page", raising(RuntimeError("assess_page exploded")))
+
+        page = page_at(path, ocr=ocr)
+
+        assert (page.status, page.route, page.image_only_reasons) == ("error", "vision", ("extraction_failed",))
 
 
 @pytest.fixture(scope="module")

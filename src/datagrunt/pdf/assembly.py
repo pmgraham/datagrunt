@@ -351,7 +351,11 @@ def assemble_page(
        be drawn within the bound (``effective_dpi`` refuses it) has no
        image, and a warning says why.
 
-    The page's ``quality`` and ``route`` are A3's. Its warnings are A2's
+    The page's ``quality``, ``route`` and ``image_only_reasons`` are A3's
+    (#470): a page A3 found short of text or garbled keeps those reasons,
+    since nothing here reads its image (a page kept digital under
+    ``ocr="never"``, a vision page laid out here because OCR could not read
+    it); a page whose text stands has none. Its warnings are A2's
     (skipped text, path and image objects), then the figures', A3's,
     A4a's (grids past its bounds), the layout's, Pass C's and the page
     image's.
@@ -407,6 +411,7 @@ def assemble_page(
         page_image=image,
         integrity_verified=verified and not vision,
         warnings=warnings,
+        image_only_reasons=assessment.image_only_reasons,
     )
 
 

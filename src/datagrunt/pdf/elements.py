@@ -226,13 +226,28 @@ def _check_canonical_reasons(name: str, reasons: tuple[str, ...], known: tuple[s
         raise ValueError(f"{name} must be in canonical order {canonical}, got {reasons}")
 
 
+def check_image_only_reasons(value: object, *, allowed: tuple[ImageOnlyReason, ...] = IMAGE_ONLY_REASONS) -> None:
+    """Require unique image-only reasons, each one of ``allowed``, in ``IMAGE_ONLY_REASONS`` order.
+
+    The one rule for every ``image_only_reasons`` tuple: a page's here
+    (which may also be None), and the v5 quality stage's assessments
+    (:mod:`datagrunt.pdf.quality`), which allow only its routing shortfalls.
+
+    Raises:
+        TypeError: If ``value`` is not a tuple of str.
+        ValueError: If a reason is not one of ``allowed``, is repeated, or is out of canonical order.
+    """
+    known = tuple(reason for reason in IMAGE_ONLY_REASONS if reason in allowed)
+    _check_canonical_reasons("image_only_reasons", str_tuple("image_only_reasons", value), known)
+
+
 def _check_image_only_reasons(value: object) -> None:
     """Require None or unique, known image-only reasons in ``IMAGE_ONLY_REASONS`` order."""
     if value is None:
         return
     if not isinstance(value, tuple):
         raise TypeError(f"image_only_reasons must be a tuple or None, got {type(value).__name__}")
-    _check_canonical_reasons("image_only_reasons", str_tuple("image_only_reasons", value), IMAGE_ONLY_REASONS)
+    check_image_only_reasons(value)
 
 
 def _check_choice(name: str, value: object, choices: tuple[str, ...]) -> str:
