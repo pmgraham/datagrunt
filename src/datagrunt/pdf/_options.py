@@ -27,7 +27,24 @@ hybrid stays digital."""
 
 # The default minimum image side in pixels: v4's, kept.
 MIN_IMAGE_DIMENSION = 40
-WORKERS = max(1, os.cpu_count() or 1)
+
+
+def _usable_cpus() -> int:
+    """The CPUs this process may run on, at least 1: the default ``workers``.
+
+    Its CPU affinity (``os.process_cpu_count``, Python 3.13+; ``os.sched_getaffinity`` before it, where the OS has
+    one), else the machine's count. Neither sees a container's CPU quota: pass ``workers`` there.
+    """
+    process_cpu_count = getattr(os, "process_cpu_count", None)
+    if process_cpu_count is not None:
+        return max(1, process_cpu_count() or 1)
+    sched_getaffinity = getattr(os, "sched_getaffinity", None)
+    if sched_getaffinity is not None:
+        return max(1, len(sched_getaffinity(0)))
+    return max(1, os.cpu_count() or 1)
+
+
+WORKERS = _usable_cpus()
 
 # The spec's construction checks (PDFReader / PDFWriter) and defaults: dpi >= 36, 200; vision_dpi >= 36, 300;
 # max_render_pixels >= 512 x 512, 16,000,000. A page's image (P2-A) is drawn at dpi.

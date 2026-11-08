@@ -490,7 +490,7 @@ Extraction is always complete: a bad page is recorded, never dropped. Pass
 reader = PDFReader(
     "report.pdf",
     password=None,                  # an encrypted PDF's password
-    workers=os.cpu_count(),         # processes to extract (and threads to render) pages with
+    workers=os.process_cpu_count(), # processes to extract (and threads to render) pages with
     ocr="never",                    # "never", "auto" (pages without usable text to OCR), or "always"
     dpi=200,                        # page images (render_pages_as_images, bundles)
     vision_dpi=300,                 # pages read by OCR; at least dpi
@@ -507,19 +507,22 @@ slivers); it must be at least 1.
 
 ### Parallel processing
 
-Every PDF is parsed in worker processes, never in your own: pages are
-extracted in `workers` processes (by default one per CPU; one when
-`workers=1`) and come back in page order, and figure reads and page renders run
-in workers too. `workers` never changes the output, so a bundle or corpus
-written with another count (on a machine with other CPUs, say) is reused. Each worker is a
-fresh, isolated `python` process with a memory cap (2 GiB), and it never imports
-your script, so no `if __name__ == "__main__":` guard is needed. A page that
-passes the cap, or its time bound, becomes an error page with the reason; the
-other pages are read by a new worker. Inside a distributed runtime
-(**Apache Spark**, **Apache Beam**, **Apache Flink**, or **Celery**, detected
-through variables such as `SPARK_ENV_LOADED` and `BEAM_WORKER_ID`) one worker
-extracts the pages. A frozen application (PyInstaller) cannot start workers
-yet, so reading a PDF there raises `DatagruntPDFError` saying so.
+Every PDF is parsed in worker processes, never in your own: pages are extracted
+in `workers` processes (by default one per CPU this process may run on; one
+when `workers=1`; in a container with a CPU quota, pass `workers`) and come
+back in page order, and figure reads and page renders run in workers too.
+`workers` never changes the output, so a bundle or corpus written with another
+count (on a machine with other CPUs, say) is reused. `extract_corpus` gives
+each of the `max_workers` documents it extracts at once its share of the CPUs
+by default. Each worker is a fresh, isolated `python` process with a memory cap
+(2 GiB), and it never imports your script, so no `if __name__ == "__main__":`
+guard is needed. A page that passes the cap, or its time bound, becomes an
+error page with the reason; the other pages are read by a new worker. Inside a
+distributed runtime (**Apache Spark**, **Apache Beam**, **Apache Flink**, or
+**Celery**, detected through variables such as `SPARK_ENV_LOADED` and
+`BEAM_WORKER_ID`) one worker extracts the pages. A frozen application
+(PyInstaller) cannot start workers yet, so reading a PDF there raises
+`DatagruntPDFError` saying so.
 
 ### Schema-driven extraction (`rationalize`)
 

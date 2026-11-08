@@ -165,7 +165,7 @@ def extract_corpus(
     *,
     password: str | None = None,
     max_workers: int = 1,
-    workers: int = WORKERS,
+    workers: int | None = None,
     ocr: OcrMode = "never",
     dpi: int = DPI,
     vision_dpi: int = 300,
@@ -176,10 +176,17 @@ def extract_corpus(
     include_images: bool = True,
     render_pages: bool = True,
 ) -> CorpusManifest:
-    """Extract a batch of PDFs into verified bundles under ``output_dir`` and write ``corpus_manifest.json``."""
+    """Extract a batch of PDFs into verified bundles under ``output_dir`` and write ``corpus_manifest.json``.
+
+    ``max_workers`` documents are extracted at once, each in ``workers`` processes. ``workers`` defaults to
+    each document's share of the CPUs this process may run on (``WORKERS // max_workers``, at least 1), so
+    the corpus runs about one page worker per CPU, never ``max_workers`` times as many.
+    """
     int_at_least("max_workers", max_workers, 1)
     if max_workers > _MAX_CORPUS_WORKERS:
         raise ValueError(f"max_workers must be <= {_MAX_CORPUS_WORKERS}, got {max_workers}")
+    if workers is None:
+        workers = max(1, WORKERS // max_workers)
     replace = strict_bool("overwrite", overwrite)
     checked_include_images = strict_bool("include_images", include_images)
     checked_render_pages = strict_bool("render_pages", render_pages)

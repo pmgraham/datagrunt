@@ -8,6 +8,7 @@ import pytest
 
 import datagrunt
 import datagrunt.pdf
+from datagrunt.pdf import corpus
 from datagrunt.pdf.corpus import (
     CORPUS_FORMAT_VERSION,
     CORPUS_MANIFEST,
@@ -216,6 +217,27 @@ class TestBatchExtractionAndLoading:
 
         assert [e.reused for e in second.entries] == [True, True]
         assert second.load_documents() == first.load_documents()
+
+    def test_the_default_workers_are_shared_by_the_documents_extracted_at_once(
+        self, tmp_path, sample_pdfs, monkeypatch
+    ):
+        # Each of the max_workers documents in flight gets its share of the CPUs, not all of them: otherwise
+        # max_workers x CPUs page workers (each memory-capped) would run at once. An explicit workers is kept.
+        monkeypatch.setattr(corpus, "WORKERS", 8)
+
+        def recorded(manifest):
+            return [
+                json.loads((manifest.output_dir / e.bundle_relpath / "manifest.json").read_bytes())[
+                    "extraction_params"
+                ]["workers"]
+                for e in manifest.entries
+            ]
+
+        shared = extract_corpus(list(sample_pdfs), tmp_path / "shared", max_workers=2, dpi=72, vision_dpi=72)
+        alone = extract_corpus(list(sample_pdfs), tmp_path / "alone", dpi=72, vision_dpi=72)
+        given = extract_corpus(list(sample_pdfs), tmp_path / "given", max_workers=2, workers=3, dpi=72, vision_dpi=72)
+
+        assert (recorded(shared), recorded(alone), recorded(given)) == ([4, 4], [8, 8], [3, 3])
 
     def test_a_bundle_of_the_older_format_is_not_reused(self, tmp_path, sample_pdfs):
         # A format 5.0 bundle (datagrunt 5.0 to 5.2) of this version and parameters records no image-only

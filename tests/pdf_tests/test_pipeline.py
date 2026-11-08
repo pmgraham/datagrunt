@@ -30,6 +30,7 @@ from datagrunt.pdf import (
     DatagruntPDFError,
     PDFCorruptError,
     PDFEncryptedError,
+    _options,
     _page_worker,
     _process,
     _source,
@@ -2504,3 +2505,28 @@ class TestPageWorker:
 
         sent = pickle.loads(reply[1:])
         assert reply[:1] == b"E" and f"{type(sent).__name__}: {sent}".startswith(error)
+
+
+class TestDefaultWorkers:
+    """workers defaults to the CPUs this process may run on (its affinity), not every CPU of the machine."""
+
+    def test_the_cpus_this_process_may_run_on(self, monkeypatch):
+        monkeypatch.setattr(_options.os, "process_cpu_count", lambda: 3, raising=False)
+        monkeypatch.setattr(_options.os, "cpu_count", lambda: 64)
+        assert _options._usable_cpus() == 3
+
+    def test_the_affinity_where_python_has_no_process_cpu_count(self, monkeypatch):
+        monkeypatch.delattr(_options.os, "process_cpu_count", raising=False)
+        monkeypatch.setattr(_options.os, "sched_getaffinity", lambda pid: {0, 5}, raising=False)
+        monkeypatch.setattr(_options.os, "cpu_count", lambda: 64)
+        assert _options._usable_cpus() == 2
+
+    @pytest.mark.parametrize("reported", [None, 0])
+    def test_the_machine_count_without_either_and_never_under_one(self, monkeypatch, reported):
+        monkeypatch.delattr(_options.os, "process_cpu_count", raising=False)
+        monkeypatch.delattr(_options.os, "sched_getaffinity", raising=False)
+        monkeypatch.setattr(_options.os, "cpu_count", lambda: reported)
+        assert _options._usable_cpus() == 1
+
+    def test_it_is_the_default(self):
+        assert pipeline.WORKERS == _options.WORKERS >= 1
