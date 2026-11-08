@@ -212,7 +212,7 @@ def fixtures(tmp_path_factory) -> SimpleNamespace:
     scan = PageSpec(items=(RasterImage(0.0, 0.0, *LETTER, png_of(rendered(text))),))
     scanned = build_pdf(directory / "scanned.pdf", [scan])
     both = build_pdf(directory / "both.pdf", [mixed_page(), scan])
-    document = extract_document(both, **DIGITAL_OPTIONS)
+    document = extract_document(both, ocr="auto", **DIGITAL_OPTIONS)
     bundle = directory / "bundle"
     write_bundle(document, bundle, source=both)
     data = directory / "document.json"
@@ -225,11 +225,11 @@ def seen(fixtures, tmp_path_factory) -> SimpleNamespace:
     """The guard over every source, once for the module."""
     cases = [
         case("digital", fixtures.digital, **DIGITAL_OPTIONS),
-        case("vision", fixtures.scanned),
+        case("vision", fixtures.scanned, ocr="auto"),
         case("bundle", fixtures.bundle),
         case("manifest", fixtures.bundle / "manifest.json"),
         case("dict", fixtures.data, json_source=True),
-        case("workers", fixtures.both, workers=2, **DIGITAL_OPTIONS),
+        case("workers", fixtures.both, workers=2, ocr="auto", **DIGITAL_OPTIONS),
     ]
     return guarded(cases, tmp_path_factory.mktemp("run"), fixtures.directory)
 

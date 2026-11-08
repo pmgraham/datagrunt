@@ -65,7 +65,7 @@ from pdf_tests.test_layout_stream_tables import body_text
 OPTIONS = {
     "password": None,
     "workers": pipeline.WORKERS,
-    "ocr": "auto",
+    "ocr": "never",
     "dpi": 200,
     "vision_dpi": 300,
     "max_render_pixels": 16_000_000,

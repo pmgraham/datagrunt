@@ -91,7 +91,7 @@ def tiny_text_page() -> PageSpec:
     return PageSpec(items=(*body_text(100.0), TextRun("HIDDEN", 72.0, 300.0, size=0.002)))
 
 
-def chain_page(path, index: int = 0, *, ocr="auto", password=None, min_image_dimension=40) -> Page:
+def chain_page(path, index: int = 0, *, ocr="never", password=None, min_image_dimension=40) -> Page:
     """The per-stage chain, run as the stages' own tests run it: A2, recovery, A3, A4a, A4b."""
     with open_document(path, password=password) as handle:
         raw = extract_page(handle, index)
@@ -568,7 +568,7 @@ def assert_reaped(pids) -> None:
 
 GOOD = {
     "workers": pipeline.WORKERS,
-    "ocr": "auto",
+    "ocr": "never",
     "dpi": 200,
     "vision_dpi": 300,
     "max_render_pixels": 16_000_000,
@@ -627,6 +627,7 @@ class TestPipelineOptions:
         [
             pytest.param({"workers": 1, "dpi": 36, "vision_dpi": 36}, id="floors"),
             pytest.param({"max_render_pixels": 262_144, "min_image_dimension": 1}, id="pixel-floors"),
+            pytest.param({"ocr": "auto"}, id="auto"),
             pytest.param({"ocr": "always", "strict": True}, id="always-strict"),
             pytest.param({"ocr": "never"}, id="never"),
         ],
@@ -947,7 +948,7 @@ class TestPageIsolation:
         monkeypatch.setattr(pdfium_c, "FPDFText_CountChars", failing(-1))
         fallbacks = spy(monkeypatch, "fallback_page")
 
-        page = page_at(path)
+        page = page_at(path, ocr="auto")
 
         assert len(fallbacks) == 1
         assert (page.route, page.status, page.integrity_verified) == ("vision", "ocr_fallback", False)
@@ -962,7 +963,7 @@ class TestPageIsolation:
         monkeypatch.setattr(pdfium_c, "FPDFText_CountChars", failing(-1))
         identity, digest = identity_of(path), sha256_of(path)
 
-        page = extract_page_at(PDFSource(path=path, identity=identity, sha256=digest), 0, PipelineOptions())
+        page = extract_page_at(PDFSource(path=path, identity=identity, sha256=digest), 0, PipelineOptions(ocr="auto"))
 
         image = page.page_image
         assert page.route == "vision" and page.status in ("ocr_fallback", "error")  # "error" without tesseract
@@ -975,7 +976,7 @@ class TestPageIsolation:
         monkeypatch.setattr(pdfium_c, "FPDFText_CountChars", failing(-1))
         no_tesseract(monkeypatch, tmp_path)
 
-        page = page_at(path)
+        page = page_at(path, ocr="auto")
 
         why = f"extraction failed at stage 'text': {TEXT_FAILURE}; OCR could not read the page: {UNAVAILABLE}"
         assert dataclasses.replace(page, page_image=None) == error_page(1, why, size=(400.0, 300.0))
@@ -1162,10 +1163,10 @@ class TestVisionEndToEnd:
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page(), scan_page(scan_png), PageSpec(items=LINES)])
         failing_at(monkeypatch, 2)
 
-        document = extracted_here(path, min_image_dimension=32)
+        document = extracted_here(path, ocr="auto", min_image_dimension=32)
 
         digital, scanned, failed = document.pages
-        assert digital == apply_scope((chain_page(path, 0, min_image_dimension=32),)).pages[0]
+        assert digital == apply_scope((chain_page(path, 0, ocr="auto", min_image_dimension=32),)).pages[0]
         assert (scanned.status, scanned.route, scanned.integrity_verified) == ("ok", "vision", False)
         assert len(set(TOKENS) & read_tokens(scanned)) >= 0.9 * len(set(TOKENS))
         assert (failed.status, failed.route, failed.integrity_verified) == ("ocr_fallback", "vision", False)
@@ -1177,7 +1178,7 @@ class TestVisionEndToEnd:
     @needs_tesseract
     def test_a_page_of_mostly_garbled_text_is_read_by_ocr_and_its_digital_text_superseded(self, tmp_path):
         # 20 valid chars, but 27 of its 47 visible chars valid: the ratio routes it vision (#417).
-        document = extract_document(garbled_page(tmp_path))
+        document = extract_document(garbled_page(tmp_path), ocr="auto")
 
         (page,) = document.pages
         assert (page.status, page.route, page.integrity_verified) == ("ok", "vision", False)
@@ -1197,7 +1198,7 @@ class TestVisionEndToEnd:
         failing_at(monkeypatch, 2)
         no_tesseract(monkeypatch, tmp_path)
 
-        document = extracted_here(path, min_image_dimension=32)
+        document = extracted_here(path, ocr="auto", min_image_dimension=32)
 
         digital, scanned, failed = document.pages
         assert digital.status == "ok"
@@ -1571,10 +1572,10 @@ class TestWorkers:
         caption = TextRun("Page 7", 500.0, 760.0, size=10.0)
         specs = [mixed_page(), scan_page(scan_png), scan_page(scan_png, caption), mixed_page(120.0)]
         path = build_pdf(tmp_path / "doc.pdf", specs)
-        sequential = extract_document(path, min_image_dimension=32)
+        sequential = extract_document(path, ocr="auto", min_image_dimension=32)
         started = started_workers(monkeypatch)
 
-        pooled = extract_document(path, workers=2, min_image_dimension=32)
+        pooled = extract_document(path, workers=2, ocr="auto", min_image_dimension=32)
 
         assert len(started) == 2
         assert pooled == sequential
@@ -1687,7 +1688,7 @@ class TestWorkers:
     )
     def test_a_hung_page_is_killed_within_its_bound_and_only_it_is_lost(self, tmp_path, monkeypatch, second):
         path = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=LINES), second, *[PageSpec(items=LINES)] * 6])
-        expected = [element_texts(page) for page in extract_document(path).pages]  # at the default bounds
+        expected = [element_texts(page) for page in extract_document(path, ocr="auto").pages]  # at the default bounds
         allowances(
             monkeypatch,
             _WORKER_START_S=2.0,
@@ -1700,7 +1701,7 @@ class TestWorkers:
         started = started_workers(monkeypatch)
         run_page_workers_as(monkeypatch, "hang_on_page_2")
 
-        pooled = extract_document(path, workers=2)
+        pooled = extract_document(path, workers=2, ocr="auto")
 
         # Page 2's bound from its worker's start, however large the page: 2 s to start, 0.5 s of work, 0.5 s + 0.5 s
         # of background render, its 2.5 s OCR budget and its reap, 0.5 s + 0.5 s: 7 s. Page 2's worker hangs 20 s at
@@ -1719,7 +1720,7 @@ class TestWorkers:
     def test_a_slow_but_bounded_ocr_is_never_cut_off(self, tmp_path, monkeypatch, scan_png):
         path = build_pdf(tmp_path / "doc.pdf", [*[scan_page(scan_png)] * 3, *[PageSpec(items=LINES)] * 3])
         fake_tesseract(tmp_path, monkeypatch, SLOW_TESSERACT, stdout=tsv(row(5, (10, 10, 50, 20), "95", "slow")))
-        sequential = extract_document(path, dpi=72, vision_dpi=72)  # at the default bounds
+        sequential = extract_document(path, ocr="auto", dpi=72, vision_dpi=72)  # at the default bounds
         allowances(
             monkeypatch,
             _WORKER_START_S=6.0,
@@ -1733,7 +1734,7 @@ class TestWorkers:
         run_page_workers_as(monkeypatch, "with_slow_ocr_budget")
 
         began = time.monotonic()
-        pooled = extract_document(path, workers=2, dpi=72, vision_dpi=72)
+        pooled = extract_document(path, workers=2, ocr="auto", dpi=72, vision_dpi=72)
         elapsed = time.monotonic() - began
 
         assert pooled == sequential
@@ -1968,17 +1969,17 @@ class TestPageDeadline:
     """A worker is given each page's bound from its last reply (#418): its own work and budget, never its size."""
 
     def test_a_pages_bound_is_its_work_its_background_share_and_its_ocr_budget(self):
-        assert pipeline._page_bound_s(PipelineOptions()) == PAGE_BOUND_S == 705.0  # about 12 minutes
+        assert pipeline._page_bound_s(PipelineOptions(ocr="auto")) == PAGE_BOUND_S == 705.0  # about 12 minutes
         assert pipeline._page_bound_s(PipelineOptions(ocr="always")) == PAGE_BOUND_S
 
     def test_ocr_never_gives_a_smaller_page_bound(self):
-        assert pipeline._page_bound_s(PipelineOptions(ocr="never")) == NEVER_PAGE_BOUND_S == 90.0
-        assert NEVER_PAGE_BOUND_S < pipeline._page_bound_s(PipelineOptions())
+        assert pipeline._page_bound_s(PipelineOptions()) == NEVER_PAGE_BOUND_S == 90.0
+        assert NEVER_PAGE_BOUND_S < pipeline._page_bound_s(PipelineOptions(ocr="auto"))
 
     def test_the_budget_is_the_one_the_worker_reads_with(self, monkeypatch):
         monkeypatch.setattr(pipeline, "_vision", partial(budgeted, 30.0))
 
-        assert pipeline._page_bound_s(PipelineOptions()) == 60.0 + 30.0 + 30.0 + 15.0
+        assert pipeline._page_bound_s(PipelineOptions(ocr="auto")) == 60.0 + 30.0 + 30.0 + 15.0
 
     @pytest.mark.parametrize(
         "chunk,received,bound",
@@ -1996,7 +1997,7 @@ class TestPageDeadline:
         ],
     )
     def test_each_replys_bound(self, chunk, received, bound):
-        assert pipeline._reply_bound_s(len(chunk), received, PipelineOptions()) == bound
+        assert pipeline._reply_bound_s(len(chunk), received, PipelineOptions(ocr="auto")) == bound
 
     def test_the_first_workers_facts_are_given_its_start_and_its_open(self):
         assert pipeline._facts_bound_s() == 60.0 + 60.0

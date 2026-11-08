@@ -401,7 +401,7 @@ class TestPageImages:
 
         monkeypatch.setattr(_loaders, "render_page", counted)
 
-        page = PDFReader(path).pages[0]
+        page = PDFReader(path, ocr="auto" if route == "hybrid" else "never").pages[0]
 
         image = page.page_image
         assert page.route == route and image is not None and calls == []  # nothing is drawn until it is read
@@ -781,7 +781,7 @@ class TestHiddenText:
 
     @needs_tesseract
     def test_a_vision_page_shows_only_what_ocr_read_by_default(self, tmp_path):
-        reader = PDFReader(garbled_page(tmp_path))
+        reader = PDFReader(garbled_page(tmp_path), ocr="auto")
         (page,) = reader.pages
         superseded = [element for element in page.elements if element.hidden_reasons == ("superseded",)]
         visible = [element for element in page.elements if not element.is_hidden]
