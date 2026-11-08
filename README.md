@@ -320,7 +320,8 @@ result.pl()                         # also .pa() and .dicts()
 Every row has the same columns: `doc_id`, `element_id`, `page_number`,
 `reading_order`, `kind` (`heading`, `paragraph`, `key_value`, `table`, `list`,
 or `figure`), `scope_path`, `text`, `markdown`, `bbox`, `route`,
-`integrity_verified`, and `hidden_reasons`.
+`integrity_verified`, `hidden_reasons`, and `image_only_reasons` (the
+element's page's; see [Scanned pages and OCR](#scanned-pages-and-ocr)).
 
 - `PDFReader` writes nothing to disk, not even temporary files. Figures load
   lazily (`figure.read_bytes()`); write them with `PDFWriter`.
@@ -384,6 +385,8 @@ writer.write_bundle("out/report_bundle")      # all of the above in one checked 
   same options and extractor version, that bundle is returned as it is;
   `overwrite=True` replaces any other valid bundle there. A directory without a
   valid bundle manifest is never overwritten.
+  Bundles and document JSON written by datagrunt 5.0 to 5.2 still load; their
+  pages' `image_only_reasons` read `None` (not recorded).
   `PDFReader("out/report_bundle")` loads it back, verifying every file: an
   invalid `manifest.json` raises `ValueError` at construction, and a file that
   doesn't match its manifest raises `datagrunt.pdf.BundleCorruptError` when the
@@ -439,6 +442,33 @@ Every page reports how extraction went (`page.status`):
 - `error`: nothing could be read; `page.error` says why. The rest of the
   document still extracts.
 
+A page whose text can't stand and that nothing read has its content only in
+its page image. `page.image_only_reasons` says why: `too_little_text` (too few
+readable characters on a page with an image or drawing), `garbled_text` (too
+few of its characters are valid text), or `extraction_failed` (an error page).
+It's empty for a page whose text stands or that OCR read, and
+`document.image_only_pages` lists the marked pages. With `ocr="never"`, a scan
+stays `route=digital`, `status=ok` and is marked; `ocr="auto"` routes exactly
+those pages to OCR (a page that can't be loaded at all is an error page either
+way). The marker is in the JSON, the `image_only_reasons` column,
+each marked page's Markdown header (`<!-- page 2 route=digital status=ok
+image_only=too_little_text -->`) and a bundle's `manifest.json`
+(`image_only_pages`), so a downstream reader can pick the page images it must
+read:
+
+```python
+reader = PDFReader("scans.pdf", ocr="never")
+for page in reader.pages:
+    if page.image_only_reasons and page.page_image is not None:
+        png = page.page_image.read_bytes()   # drawn from the PDF; an error page has none
+```
+
+A bundle written with `render_pages=False` or `include_images=False`, or one
+whose render of a marked page fails, warns (`UserWarning`) that it holds no
+full copy of those pages (a figure on one may still be written); their
+`missing` entries in `manifest.json` say so too. `rationalize()` skips a marked page as a skipped unit of reason
+`image_only` rather than send its text to a model.
+
 A page read by OCR at a mean word confidence under 70 carries a warning that
 it may be turned the wrong way or unreadable, so its text shouldn't be trusted
 as is; the text is kept. Tesseract's orientation detection can turn a page with
@@ -492,7 +522,7 @@ Install the `[rationalize]` extra (`pydantic` and `httpx`) alongside `[pdf]`:
 uv pip install "datagrunt[pdf,rationalize]"
 ```
 
-`rationalize()` extracts structured Pydantic records from one or more PDF documents (`PDFDocument`, PDF path, bundle path, or a sequence of them). Hidden elements (`hidden_reasons` non-empty) are excluded before any model request is built, bidi/tag/control characters are escaped in the wire envelope, and every model response is validated, compared across model families, grounded against the cited visible elements, and folded across pages by entity key:
+`rationalize()` extracts structured Pydantic records from one or more PDF documents (`PDFDocument`, PDF path, bundle path, or a sequence of them). Hidden elements (`hidden_reasons` non-empty) and image-only pages (`image_only_reasons` non-empty; reported in `result.skipped_units` with reason `"image_only"`) are excluded before any model request is built, bidi/tag/control characters are escaped in the wire envelope, and every model response is validated, compared across model families, grounded against the cited visible elements, and folded across pages by entity key:
 
 ```python
 from decimal import Decimal
