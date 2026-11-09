@@ -1215,6 +1215,7 @@ class _Run:
             json_schema=self._schemas[request.provider.model_id],
             max_output_tokens=self.limits.max_output_tokens,
             timeout_s=timeout_s,
+            images=request.envelope.images,
         )
         started = self.clock()
         tally.attempts += 1

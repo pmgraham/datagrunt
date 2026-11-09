@@ -13,6 +13,7 @@ The module imports only the standard library, pydantic, the PDF model and its si
 ``datagrunt.core``, and no import inside a function (invariant 9).
 """
 
+import base64
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -112,9 +113,14 @@ def _vertex_request_body(item: "BatchItem", snapshot: ProviderSnapshot) -> dict[
         config["seed"] = params["seed"]
     if "thinking_level" in params and params["thinking_level"] is not None:
         config["thinkingConfig"] = {"thinkingLevel": params["thinking_level"]}
+    parts: list[dict[str, Any]] = [
+        {"inlineData": {"mimeType": "image/png", "data": base64.b64encode(img).decode("ascii")}}
+        for img in item.request.images
+    ]
+    parts.append({"text": item.request.user_envelope})
     return {
         "systemInstruction": {"parts": [{"text": item.request.system_prompt}]},
-        "contents": [{"role": "user", "parts": [{"text": item.request.user_envelope}]}],
+        "contents": [{"role": "user", "parts": parts}],
         "generationConfig": config,
     }
 
@@ -132,11 +138,29 @@ def _anthropic_model_name(model_id: str) -> str:
 def _anthropic_request_params(item: "BatchItem", snapshot: ProviderSnapshot) -> dict[str, Any]:
     """Construct the Anthropic Message Batches ``params`` dict for ``item``."""
     gen_params = snapshot.generation_params
+    user_content: str | list[dict[str, Any]] = (
+        [
+            *[
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": base64.b64encode(img).decode("ascii"),
+                    },
+                }
+                for img in item.request.images
+            ],
+            {"type": "text", "text": item.request.user_envelope},
+        ]
+        if item.request.images
+        else item.request.user_envelope
+    )
     params: dict[str, Any] = {
         "model": _anthropic_model_name(snapshot.model_id),
         "max_tokens": item.request.max_output_tokens,
         "system": item.request.system_prompt,
-        "messages": [{"role": "user", "content": item.request.user_envelope}],
+        "messages": [{"role": "user", "content": user_content}],
         "output_config": {
             "format": {
                 "type": _ANTHROPIC_MECHANISM,
@@ -292,6 +316,7 @@ def prepare_batch(
     strict: bool = False,
     coalesce_sections: bool = True,
     include_schema_in_prompt: bool = True,
+    multimodal: bool = True,
     timeout_s: float = 60.0,
 ) -> BatchPlan:
     """Prepare all uncached ``(unit, model)`` requests for offline cloud batch execution (#464).
@@ -314,6 +339,7 @@ def prepare_batch(
         strict=strict,
         coalesce_sections=coalesce_sections,
         include_schema_in_prompt=include_schema_in_prompt,
+        multimodal=multimodal,
         on_event=None,
         min_families=min_families,
     )
@@ -335,6 +361,7 @@ def prepare_batch(
         max_unit_chars=max_unit_chars,
         coalesce_sections=coalesce_sections,
         include_schema_in_prompt=include_schema_in_prompt,
+        multimodal=multimodal,
         prompt_text=prompt_text,
         context=context,
         prepared=prepared,
@@ -366,6 +393,7 @@ def prepare_batch(
             json_schema=canonical_copy(schemas_by_model[req.provider.model_id], subject="provider_schema"),
             max_output_tokens=limits.max_output_tokens,
             timeout_s=limits.timeout_s,
+            images=req.envelope.images,
         )
         items.append(
             BatchItem(

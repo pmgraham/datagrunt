@@ -124,6 +124,7 @@ package's own modules (the HTTP stack only through the helper): no pydantic, not
 no import inside a function (invariant 9).
 """
 
+import base64
 import math
 import time
 from collections.abc import Callable, Mapping
@@ -1132,9 +1133,14 @@ class GeminiProvider:
             config["seed"] = self._seed
         if self._thinking_level is not None:
             config["thinkingConfig"] = {"thinkingLevel": self._thinking_level}
+        parts: list[dict[str, Any]] = [
+            {"inlineData": {"mimeType": "image/png", "data": base64.b64encode(img).decode("ascii")}}
+            for img in request.images
+        ]
+        parts.append({"text": request.user_envelope})
         return {
             "systemInstruction": {"parts": [{"text": request.system_prompt}]},
-            "contents": [{"role": "user", "parts": [{"text": request.user_envelope}]}],
+            "contents": [{"role": "user", "parts": parts}],
             "generationConfig": config,
         }
 

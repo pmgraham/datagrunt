@@ -2802,3 +2802,28 @@ class TestRoles:
 
         roles = [message["role"] for message in json.loads(server.only.content)["messages"]]
         assert roles == ["system", "user"]
+
+
+MM_OPENAI_PNG = b"\x89PNG\r\n\x1a\nOPENAI_BAND"
+
+
+class TestMultimodalImages:
+    def test_openai_compatible_provider_sends_data_uri_image_url_parts(self):
+        import base64
+
+        req = make_request(images=(MM_OPENAI_PNG,))
+        messages = module._messages(req, fold=False)
+        expected_b64 = base64.b64encode(MM_OPENAI_PNG).decode("ascii")
+        assert messages == [
+            {"role": "system", "content": SYSTEM},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{expected_b64}"},
+                    },
+                    {"type": "text", "text": ENVELOPE},
+                ],
+            },
+        ]

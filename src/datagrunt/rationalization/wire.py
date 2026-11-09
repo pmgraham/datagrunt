@@ -55,6 +55,15 @@ RAW_TEXT_MAX_BYTES = 8 * 1024 * 1024
 TOKEN_COUNT_MAX = 2**63 - 1
 """The largest token count a response may report: what an ``Int64`` column holds."""
 
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+"""The 8-byte PNG file header required on every attached request image."""
+
+MAX_REQUEST_IMAGES = 64
+"""The most PNG bands a single :class:`ModelRequest` may carry."""
+
+MAX_IMAGES_BYTES = 32 * 1024 * 1024
+"""The largest combined byte size of ``ModelRequest.images`` (32 MiB)."""
+
 _BRIEF_CHARS = 80
 
 
@@ -147,6 +156,7 @@ class ModelRequest:
     json_schema: Mapping[str, Any] = field(repr=False)
     max_output_tokens: int
     timeout_s: float
+    images: tuple[bytes, ...] = field(default=(), repr=False)
 
     def __post_init__(self) -> None:
         for name in ("unit_id", "model_id", "system_prompt", "user_envelope"):
@@ -158,6 +168,24 @@ class ModelRequest:
         if not 1 <= tokens <= MAX_OUTPUT_TOKENS:
             raise ValueError(f"max_output_tokens must be in 1-{MAX_OUTPUT_TOKENS}, got {tokens}")
         object.__setattr__(self, "timeout_s", _check_timeout(self.timeout_s))
+        _check_images(self.images)
+
+
+def _check_images(images: object) -> None:
+    """Require a tuple of at most :data:`MAX_REQUEST_IMAGES` PNG ``bytes`` within :data:`MAX_IMAGES_BYTES`."""
+    if not isinstance(images, tuple):
+        raise TypeError(f"images must be a tuple of PNG bytes, got {type(images).__name__}")
+    if len(images) > MAX_REQUEST_IMAGES:
+        raise ValueError(f"images holds {len(images)} items, past MAX_REQUEST_IMAGES ({MAX_REQUEST_IMAGES})")
+    total = 0
+    for index, item in enumerate(images):
+        if type(item) is not bytes:
+            raise TypeError(f"images[{index}] must be bytes, got {type(item).__name__}")
+        if not item.startswith(PNG_SIGNATURE):
+            raise ValueError(f"images[{index}] must start with the 8-byte PNG signature")
+        total += len(item)
+        if total > MAX_IMAGES_BYTES:
+            raise ValueError(f"images exceed MAX_IMAGES_BYTES ({MAX_IMAGES_BYTES} bytes)")
 
 
 @dataclass(frozen=True, slots=True)

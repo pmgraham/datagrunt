@@ -1189,3 +1189,127 @@ class TestImageOnlyPages:
         assert result.skipped_units[0].hidden_excluded == (("invisible", 1),)
         assert result.telemetry.skipped_unit_count == 1
         assert dict(result.telemetry.hidden_excluded_by_reason)["invisible"] == 1
+
+
+MM_SCAN_BAND = b"\x89PNG\r\n\x1a\nSCAN_BAND_300DPI"
+
+
+class TestMultimodalThreeWitness:
+    def test_ocr_auto_scan_withholds_tesseract_from_prompt_and_grounds_via_3rd_witness(self) -> None:
+        from datagrunt.pdf.elements import PageImage
+
+        scan_img = PageImage(
+            page_number=1,
+            dpi=300.0,
+            width_px=2550,
+            height_px=3300,
+            _band_loader=lambda: (MM_SCAN_BAND,),
+        )
+        ocr_secret = "TESSERACT_ONLY_MARKER"
+        ocr_row = Paragraph(
+            **ids(1, 0, ()),
+            text=f"Assembly A-500 Main Pump ({ocr_secret})",
+        )
+        scan_page = page(1, (ocr_row,), route="vision", page_image=scan_img)
+        doc = PDFDocument(
+            metadata=metadata(1, source_name="scan_auto.pdf", sha=hashlib.sha256(b"scan_auto.pdf").hexdigest()),
+            pages=(scan_page,),
+        )
+        seen_requests: list[ModelRequest] = []
+
+        def vlm_answer(req: ModelRequest) -> ProviderResponse:
+            seen_requests.append(req)
+            return ProviderResponse(
+                content={
+                    "records": [
+                        {
+                            "record": {"assembly_id": "A-500", "title": "Main Pump"},
+                            "grounding_quotes": ["Assembly A-500 Main Pump"],
+                            "source_element_ids": ["p0001_e000"],
+                        }
+                    ]
+                },
+                raw_text="{}",
+                finish="complete",
+            )
+
+        res = real_rationalize(
+            doc,
+            schema=Assembly,
+            prompt="Extract assemblies.",
+            models=(
+                CallableProvider("test:google-vlm", vlm_answer, family="google"),
+                CallableProvider("test:anthropic-vlm", vlm_answer, family="anthropic"),
+            ),
+        )
+
+        assert len(seen_requests) == 2
+        for req in seen_requests:
+            assert req.images == (MM_SCAN_BAND,)
+            assert ocr_secret not in (req.system_prompt + req.user_envelope)
+            assert "Assembly A-500" not in (req.system_prompt + req.user_envelope)
+        assert [r.assembly_id for r in res.records] == ["A-500"]
+        assert res.needs_review == ()
+        assert res.items[0].sources[0].bbox == BBox(x0=0.0, y0=0.0, x1=612.0, y1=792.0)
+
+    def test_degraded_or_image_only_scan_grounds_via_cross_family_vlm_and_blocks_single_model_hallucination(
+        self,
+    ) -> None:
+        from datagrunt.pdf.elements import PageImage
+
+        scan_img = PageImage(
+            page_number=1,
+            dpi=300.0,
+            width_px=2550,
+            height_px=3300,
+            _band_loader=lambda: (MM_SCAN_BAND,),
+        )
+        garbled = Paragraph(**ids(1, 0, ()), text=f"{SECRET} |l1! 060G-112S")
+        garbled_page = page(1, (garbled,), image_only_reasons=("garbled_text",), page_image=scan_img)
+        doc = PDFDocument(
+            metadata=metadata(1, source_name="mojibake_scan.pdf", sha=hashlib.sha256(b"mojibake_scan").hexdigest()),
+            pages=(garbled_page,),
+        )
+        prompts_seen: list[str] = []
+
+        def vlm_ok(req: ModelRequest) -> ProviderResponse:
+            prompts_seen.append(req.system_prompt + req.user_envelope)
+            return ProviderResponse(
+                content={
+                    "records": [
+                        {
+                            "record": {"assembly_id": "A-777", "title": "Booster"},
+                            "grounding_quotes": ["Assembly A-777 Booster"],
+                            "source_element_ids": ["p0001_e000"],
+                        }
+                    ]
+                },
+                raw_text="{}",
+                finish="complete",
+            )
+
+        res_cross = real_rationalize(
+            doc,
+            schema=Assembly,
+            prompt="Extract assemblies.",
+            models=(
+                CallableProvider("test:google-mm", vlm_ok, family="google"),
+                CallableProvider("test:anthropic-mm", vlm_ok, family="anthropic"),
+            ),
+        )
+        assert not any(SECRET in text for text in prompts_seen)
+        assert res_cross.skipped_units == ()
+        assert [r.assembly_id for r in res_cross.records] == ["A-777"]
+        assert res_cross.needs_review == ()
+
+        # Single-family on an image_only page has no OCR witness and no cross-family witness -> fails closed to review!
+        res_single = real_rationalize(
+            doc,
+            schema=Assembly,
+            prompt="Extract assemblies.",
+            models=(CallableProvider("test:google-solo", vlm_ok, family="google"),),
+            min_families=1,
+        )
+        assert res_single.records == ()
+        assert len(res_single.needs_review) == 1
+        assert res_single.needs_review[0].status == "ungrounded_value"

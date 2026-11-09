@@ -118,6 +118,7 @@ def _check_scalar_params(
     strict: bool,
     coalesce_sections: bool,
     include_schema_in_prompt: bool = True,
+    multimodal: bool = True,
     on_event: EventHook | None,
     min_families: int,
 ) -> RunLimits:
@@ -145,6 +146,8 @@ def _check_scalar_params(
         raise TypeError(f"coalesce_sections must be a bool, got {type(coalesce_sections).__name__}")
     if type(include_schema_in_prompt) is not bool:
         raise TypeError(f"include_schema_in_prompt must be a bool, got {type(include_schema_in_prompt).__name__}")
+    if type(multimodal) is not bool:
+        raise TypeError(f"multimodal must be a bool, got {type(multimodal).__name__}")
     if on_event is not None and not callable(on_event):
         raise TypeError(f"on_event must be callable or None, got {type(on_event).__name__}")
     if type(min_families) is not int:
@@ -341,6 +344,7 @@ def _build_target_work(
     max_unit_chars: int,
     coalesce_sections: bool,
     include_schema_in_prompt: bool = True,
+    multimodal: bool = True,
     prompt_text: str,
     context: object,
     prepared: PreparedSchema,
@@ -375,6 +379,7 @@ def _build_target_work(
             max_unit_chars=max_unit_chars,
             render=render_element,
             coalesce_sections=coalesce_sections,
+            multimodal=multimodal,
         )
         envelopes = build_envelopes(
             plan.units,
@@ -384,6 +389,7 @@ def _build_target_work(
             schema_json=prepared.wrapper_json,
             coalesce_sections=coalesce_sections,
             include_schema=include_schema_in_prompt,
+            multimodal=multimodal,
         )
         miss_count = _count_new_misses(
             envelopes,
@@ -567,6 +573,7 @@ def rationalize(
     strict: bool = False,
     coalesce_sections: bool = True,
     include_schema_in_prompt: bool = True,
+    multimodal: bool = True,
     on_event: EventHook | None = None,
 ) -> RationalizedResult[T]:
     """Extract, ground, reach cross-family consensus on, and fold schema records over v5 PDF documents (plan §4.11).
@@ -627,6 +634,7 @@ def rationalize(
         strict=strict,
         coalesce_sections=coalesce_sections,
         include_schema_in_prompt=include_schema_in_prompt,
+        multimodal=multimodal,
         on_event=on_event,
         min_families=min_families,
     )
@@ -649,6 +657,7 @@ def rationalize(
         max_unit_chars=max_unit_chars,
         coalesce_sections=coalesce_sections,
         include_schema_in_prompt=include_schema_in_prompt,
+        multimodal=multimodal,
         prompt_text=prompt_text,
         context=context,
         prepared=prepared,

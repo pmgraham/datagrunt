@@ -109,7 +109,7 @@ from decimal import Decimal
 from fractions import Fraction
 from typing import Literal, TypeAlias, cast, get_args
 
-from datagrunt.pdf.elements import BulletList, DocumentElement, Heading, KeyValue, PDFDocument, Table
+from datagrunt.pdf.elements import BulletList, DocumentElement, Figure, Heading, KeyValue, PDFDocument, Table
 from datagrunt.rationalization.consensus import ConsensusItem, ConsensusResult, normalized_text
 from datagrunt.rationalization.envelope import Envelope, element_text
 from datagrunt.rationalization.runner import RunOutcome
@@ -466,7 +466,7 @@ def ground(
     """
     _check_arguments(consensus, outcome, units, envelopes, schema)
     headers = _header_elements(units, envelopes)
-    vision_pages = _vision_pages(documents, units)
+    vision_pages = _vision_pages(documents, units, envelopes)
     checks = _key_checks(schema.spec)
     model_ids = tuple(model[0] for model in outcome.models)
     texts: dict[str, _UnitTexts] = {}
@@ -476,14 +476,38 @@ def ground(
         unit_texts = texts.get(item.unit_id)
         if unit_texts is None:
             unit = units[item.unit_id]
+            env = envelopes[item.unit_id]
             vision = vision_pages[unit.doc_id]
-            unit_texts = texts[item.unit_id] = _UnitTexts(unit, envelopes[item.unit_id], headers, vision)
+            witness = _multimodal_witness_elements(unit, env, documents[unit.doc_id])
+            unit_texts = texts[item.unit_id] = _UnitTexts(unit, env, headers, vision, witness)
         found = _item_reasons(item, unit_texts, checks)
         items.append(GroundedItem(item=item, status=_status(item.status, bool(found)), reasons=found))
     return GroundingResult(items=tuple(items), empty_units=_empty_units(consensus, outcome, units))
 
 
-def _vision_pages(documents: object, units: Mapping[str, Unit]) -> dict[str, frozenset[int]]:
+def _multimodal_witness_elements(
+    unit: Unit, envelope: Envelope, document: PDFDocument
+) -> Mapping[str, tuple[DocumentElement, ...]]:
+    """Return out-of-prompt OCR witness elements keyed by anchor id for a multimodal unit, or ``{}``."""
+    if not envelope.images or len(unit.page_numbers) != 1 or len(unit.elements) != 1:
+        return {}
+    pno = unit.page_numbers[0]
+    page = next((p for p in document.pages if p.page_number == pno), None)
+    if page is None or page.image_only_reasons:
+        return {unit.elements[0].element_id: ()}
+    witness = tuple(
+        el
+        for el in page.elements
+        if not el.hidden_reasons and not (isinstance(el, Figure) and not (el.caption and el.caption.strip()))
+    )
+    return {unit.elements[0].element_id: witness}
+
+
+def _vision_pages(
+    documents: object,
+    units: Mapping[str, Unit],
+    envelopes: Mapping[str, Envelope] | None = None,
+) -> dict[str, frozenset[int]]:
     """The numbers of each document's pages whose route is ``vision``, by its doc id (module notes, 2).
 
     Raises:
@@ -500,6 +524,13 @@ def _vision_pages(documents: object, units: Mapping[str, Unit]) -> dict[str, fro
         if document.metadata.doc_id != doc_id:
             raise ValueError(f"documents key {doc_id!r} is not its document's id ({document.metadata.doc_id!r})")
         routes[doc_id] = {page.page_number: page.route == "vision" for page in document.pages}
+    if envelopes is not None:
+        for unit_id, unit in units.items():
+            env = envelopes.get(unit_id)
+            if env is not None and env.images and unit.doc_id in routes:
+                for pno in unit.page_numbers:
+                    if pno in routes[unit.doc_id]:
+                        routes[unit.doc_id][pno] = True
     for unit in units.values():
         pages = routes.get(unit.doc_id)
         if pages is None:
@@ -587,7 +618,18 @@ class _UnitTexts:
     The parts of one split element share its id: a unit holds the parts it was given, each a text of its own.
     """
 
-    __slots__ = ("_elements", "_numbers", "_own", "_plain", "_quoted", "_raw", "_tokens", "_vision_pages")
+    __slots__ = (
+        "_elements",
+        "_multimodal",
+        "_numbers",
+        "_own",
+        "_plain",
+        "_quoted",
+        "_raw",
+        "_tokens",
+        "_vision_pages",
+        "_witness",
+    )
 
     def __init__(
         self,
@@ -595,6 +637,7 @@ class _UnitTexts:
         envelope: Envelope,
         headers: Mapping[tuple[str, str], DocumentElement],
         vision_pages: frozenset[int],
+        witness: Mapping[str, tuple[DocumentElement, ...]] | None = None,
     ) -> None:
         elements: dict[str, list[DocumentElement]] = {}
         for element in unit.elements:
@@ -603,12 +646,18 @@ class _UnitTexts:
         for element_id in envelope.header_element_ids:  # never one of the unit's own: the envelope leaves those out
             elements[element_id] = [headers[(unit.doc_id, element_id)]]
         self._elements = elements
+        self._multimodal = bool(envelope.images)
+        self._witness: Mapping[str, tuple[DocumentElement, ...]] = witness or {}
         self._raw: dict[str, tuple[str, ...]] = {}
         self._quoted: dict[str, tuple[str, ...]] = {}
         self._plain: dict[str, tuple[str, ...]] = {}
         self._numbers: dict[str, frozenset[Decimal]] = {}
         self._tokens: dict[str, tuple[Counter[str], ...]] = {}
         self._vision_pages = vision_pages
+
+    @property
+    def multimodal(self) -> bool:
+        return self._multimodal
 
     def citable(self, element_id: str) -> bool:
         """Whether a model may cite ``element_id`` in this unit: one of its elements, or a header block it shows."""
@@ -623,10 +672,16 @@ class _UnitTexts:
         return self._elements[element_id][0].page_number in self._vision_pages
 
     def raw(self, element_id: str) -> tuple[str, ...]:
-        """The :func:`element_text` of each element (or part) ``element_id`` names here: what the model read."""
+        """The :func:`element_text` of each element (or out-of-prompt OCR witness) ``element_id`` names here."""
         found = self._raw.get(element_id)
         if found is None:
-            found = self._raw[element_id] = tuple(element_text(element) for element in self._elements[element_id])
+            if element_id in self._witness:
+                els = self._witness[element_id]
+                parts = tuple(element_text(element) for element in els)
+                found = (*parts, "\n".join(parts)) if len(parts) > 1 else parts
+            else:
+                found = tuple(element_text(element) for element in self._elements[element_id])
+            self._raw[element_id] = found
         return found
 
     def quoted(self, element_id: str) -> tuple[str, ...]:
@@ -641,11 +696,20 @@ class _UnitTexts:
         and comparable: what keys match, each within one field."""
         found = self._plain.get(element_id)
         if found is None:
-            found = self._plain[element_id] = tuple(
-                _comparable(unescape_markdown(each))
-                for element, text in zip(self._elements[element_id], self.raw(element_id), strict=True)
-                for each in _fields(element, text)
-            )
+            if element_id in self._witness:
+                els = self._witness[element_id]
+                found = tuple(
+                    _comparable(unescape_markdown(each))
+                    for element in els
+                    for each in _fields(element, element_text(element))
+                )
+            else:
+                found = tuple(
+                    _comparable(unescape_markdown(each))
+                    for element, text in zip(self._elements[element_id], self.raw(element_id), strict=True)
+                    for each in _fields(element, text)
+                )
+            self._plain[element_id] = found
         return found
 
     def numbers(self, element_id: str) -> frozenset[Decimal]:
@@ -805,25 +869,40 @@ def _key_checks(spec: ModelSpec) -> tuple[tuple[int, str, _KeyKind], ...]:
     return tuple(checks)
 
 
+def _peer_family_quotes(item: ConsensusItem, model_id: str) -> tuple[str, ...]:
+    """Quotes supplied by supporting models from distinct known model families (#473 visual witness)."""
+    own_family = item.families.get(model_id, "unknown")
+    return tuple(
+        quote
+        for peer_id, peer_votes in item.model_votes.items()
+        if peer_votes
+        and item.families.get(peer_id, "unknown") != "unknown"
+        and item.families.get(peer_id, "unknown") != own_family
+        for quote in item.quotes_by_model[peer_id]
+    )
+
+
 def _item_reasons(
     item: ConsensusItem, texts: _UnitTexts, checks: tuple[tuple[int, str, _KeyKind], ...]
 ) -> tuple[GroundingReason, ...]:
     """Every supporting model's reasons, in model order (module notes, 4)."""
     found: list[GroundingReason] = []
-    seen: dict[tuple[tuple[str, ...], tuple[str, ...]], list[GroundingReason]] = {}
+    seen: dict[tuple[tuple[str, ...], tuple[str, ...], str], list[GroundingReason]] = {}
     for model_id, votes in item.model_votes.items():
         if votes:
             element_ids, quotes = item.element_ids_by_model[model_id], item.quotes_by_model[model_id]
-            evidence = (element_ids, quotes)
+            cache_tag = item.families.get(model_id, "") if texts.multimodal else ""
+            evidence = (element_ids, quotes, cache_tag)
             cached = seen.get(evidence)
             if cached is not None:
                 found.extend(replace(reason, model_id=model_id) for reason in cached)
                 continue
             cited = [element_id for element_id in element_ids if texts.citable(element_id)]
+            peer_quotes = _peer_family_quotes(item, model_id) if texts.multimodal and cited else ()
             own: list[GroundingReason] = []
             own.extend(_cited_reasons(model_id, element_ids, texts))
-            own.extend(_quote_reasons(model_id, quotes, cited, texts, keyless=not checks))
-            own.extend(_key_reasons(model_id, item.key, checks, cited, quotes, texts))
+            own.extend(_quote_reasons(model_id, quotes, cited, texts, keyless=not checks, peer_quotes=peer_quotes))
+            own.extend(_key_reasons(model_id, item.key, checks, cited, quotes, texts, peer_quotes=peer_quotes))
             seen[evidence] = own
             found.extend(own)
     return tuple(found)
@@ -845,17 +924,24 @@ def _cited_reasons(model_id: str, element_ids: tuple[str, ...], texts: _UnitText
 
 
 def _quote_reasons(
-    model_id: str, quotes: tuple[str, ...], cited: list[str], texts: _UnitTexts, *, keyless: bool
+    model_id: str,
+    quotes: tuple[str, ...],
+    cited: list[str],
+    texts: _UnitTexts,
+    *,
+    keyless: bool,
+    peer_quotes: tuple[str, ...] = (),
 ) -> list[GroundingReason]:
     """One model's reasons about its quotes (module notes, 2): each must lie within one element it cited; when no
     key is checked (``keyless``), one of them must hold :data:`QUOTE_MIN_TOKENS` tokens."""
     if not quotes:
         return [GroundingReason("no_quotes", model_id)]
     comparable = [_comparable(quote) for quote in quotes]
+    peer_comp = tuple(_comparable(pq) for pq in peer_quotes) if peer_quotes else ()
     found = [
         GroundingReason("quote_not_found", model_id, index=index, text=quote)
         for index, quote in enumerate(quotes)
-        if not _quote_found(comparable[index], cited, texts)
+        if not _quote_found(comparable[index], cited, texts, peer_comp)
     ]
     if keyless and all(_length(quote) < QUOTE_MIN_TOKENS for quote in comparable):
         found.append(GroundingReason("quote_too_short", model_id))
@@ -872,7 +958,7 @@ def _length(quote: str) -> int:
     )
 
 
-def _quote_found(quote: str, cited: list[str], texts: _UnitTexts) -> bool:
+def _quote_found(quote: str, cited: list[str], texts: _UnitTexts, peer_comp: tuple[str, ...] = ()) -> bool:
     """Whether the comparable ``quote`` lies within the text of one of the ``cited`` elements (module notes, 2).
 
     In one of them on a vision page, a token containment of at least :data:`VISION_CONTAINMENT` counts too.
@@ -885,9 +971,13 @@ def _quote_found(quote: str, cited: list[str], texts: _UnitTexts) -> bool:
     if not lenient:
         return False
     wanted = _tokens(quote)
-    return any(
+    if any(
         _containment(wanted, held) >= VISION_CONTAINMENT for element_id in lenient for held in texts.tokens(element_id)
-    )
+    ):
+        return True
+    if not peer_comp:
+        return False
+    return any(quote in pq or _containment(wanted, _tokens(pq)) >= VISION_CONTAINMENT for pq in peer_comp)
 
 
 def _key_reasons(
@@ -897,17 +987,22 @@ def _key_reasons(
     cited: list[str],
     quotes: tuple[str, ...],
     texts: _UnitTexts,
+    *,
+    peer_quotes: tuple[str, ...] = (),
 ) -> list[GroundingReason]:
     """One model's reasons about the item's key values (module notes, 3), key by key: each written in a field of an
     element it cited (else ``key_not_found``), and within one of its own quotes (else ``key_not_quoted``)."""
     if not checks:
         return []
     read = tuple(_comparable(unescape_markdown(quote)) for quote in quotes)
-    numbers = frozenset().union(*map(numeric_values, read)) if any(kind == "number" for *_, kind in checks) else None
+    peer_plain = tuple(_comparable(unescape_markdown(pq)) for pq in peer_quotes) if peer_quotes else ()
+    has_num = any(kind == "number" for *_, kind in checks)
+    numbers = frozenset().union(*map(numeric_values, read)) if has_num else None
+    peer_numbers = frozenset().union(*map(numeric_values, peer_plain)) if has_num and peer_plain else None
     found: list[GroundingReason] = []
     for position, name, kind in checks:
         value = key[position]
-        if not _key_found(value, kind, cited, texts):
+        if not _key_found(value, kind, cited, texts, peer_plain, peer_numbers):
             found.append(GroundingReason("key_not_found", model_id, key_field=name))
         if quotes and not _key_quoted(value, kind, read, numbers):  # a model without a quote is no_quotes
             found.append(GroundingReason("key_not_quoted", model_id, key_field=name))
@@ -923,12 +1018,25 @@ def _key_quoted(value: object, kind: _KeyKind, read: tuple[str, ...], numbers: f
     return bool(wanted) and any(_set_off(wanted, text) for text in read)
 
 
-def _key_found(value: object, kind: _KeyKind, cited: list[str], texts: _UnitTexts) -> bool:
+def _key_found(
+    value: object,
+    kind: _KeyKind,
+    cited: list[str],
+    texts: _UnitTexts,
+    peer_plain: tuple[str, ...] = (),
+    peer_numbers: frozenset[Decimal] | None = None,
+) -> bool:
     """Whether one key value is written in one of the ``cited`` elements: as text, or as one of its numbers."""
     if kind == "number":
-        return any(value in texts.numbers(element_id) for element_id in cited)
+        if any(value in texts.numbers(element_id) for element_id in cited):
+            return True
+        return peer_numbers is not None and value in peer_numbers
     wanted = _comparable(cast(str, value))
-    return bool(wanted) and any(_set_off(wanted, text) for element_id in cited for text in texts.plain(element_id))
+    if not wanted:
+        return False
+    if any(_set_off(wanted, text) for element_id in cited for text in texts.plain(element_id)):
+        return True
+    return bool(peer_plain) and any(_set_off(wanted, pq) for pq in peer_plain)
 
 
 def _set_off(wanted: str, text: str) -> bool:

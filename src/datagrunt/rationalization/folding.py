@@ -295,7 +295,11 @@ def fold_documents(
     """
     _check_arguments(grounding, units, envelopes, documents, schema)
     doc_elements = _index_documents(documents)
-    doc_scopes = {doc_id: group_scopes(document) for doc_id, document in documents.items()}
+    mm_units = frozenset(uid for uid, env in envelopes.items() if env.images)
+    mm_docs = frozenset(units[uid].doc_id for uid in mm_units)
+    doc_scopes = {
+        doc_id: group_scopes(document, multimodal=(doc_id in mm_docs)) for doc_id, document in documents.items()
+    }
     unit_citable = _index_citable(units, envelopes)
     unit_rank = {unit_id: index for index, unit_id in enumerate(units)}
     groups = _group_items(grounding.items, units, unit_rank, bool(schema.spec.keys.fields))
@@ -306,6 +310,7 @@ def fold_documents(
             doc_elements=doc_elements,
             doc_scopes=doc_scopes,
             unit_citable=unit_citable,
+            multimodal_units=mm_units,
             schema=schema,
         )
         for group in groups
@@ -470,6 +475,7 @@ def _build_sources(
     doc_elements: Mapping[str, Mapping[str, DocumentElement]],
     doc_scopes: Mapping[str, Mapping[str, GroupScope]],
     unit_citable: Mapping[str, Mapping[str, DocumentElement]],
+    multimodal_units: frozenset[str] = frozenset(),
 ) -> tuple[ElementSource, ...]:
     """Resolve cited element ids across ``group`` into deduplicated :class:`ElementSource` instances."""
     seen: set[tuple[str, str]] = set()
@@ -487,7 +493,9 @@ def _build_sources(
                 if pair in seen or element_id not in citable:
                     continue
                 seen.add(pair)
-                element = whole_by_id.get(element_id, citable[element_id])
+                is_mm_body = unit_id in multimodal_units and element_id in body_ids
+                element = citable[element_id] if is_mm_body else whole_by_id.get(element_id, citable[element_id])
+                scope_val = unit.scope_path if is_mm_body else _element_scope(element_id, unit, body_ids, scopes)
                 sources.append(
                     ElementSource(
                         doc_id=unit.doc_id,
@@ -495,7 +503,7 @@ def _build_sources(
                         element_id=element_id,
                         page_number=element.page_number,
                         bbox=element.bbox,
-                        scope_path=_element_scope(element_id, unit, body_ids, scopes),
+                        scope_path=scope_val,
                     )
                 )
     return tuple(sources)
@@ -513,6 +521,7 @@ def _fold_group(
     doc_elements: Mapping[str, Mapping[str, DocumentElement]],
     doc_scopes: Mapping[str, Mapping[str, GroupScope]],
     unit_citable: Mapping[str, Mapping[str, DocumentElement]],
+    multimodal_units: frozenset[str] = frozenset(),
     schema: PreparedSchema,
 ) -> GroundedRecord[Any]:
     """Fold one group of :class:`GroundedItem` instances into a :class:`GroundedRecord`."""
@@ -524,6 +533,7 @@ def _fold_group(
         doc_elements=doc_elements,
         doc_scopes=doc_scopes,
         unit_citable=unit_citable,
+        multimodal_units=multimodal_units,
     )
     quotes = _united(
         quotes_for_model for grounded in group for quotes_for_model in grounded.item.quotes_by_model.values()

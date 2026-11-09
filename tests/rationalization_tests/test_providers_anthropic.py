@@ -2109,3 +2109,36 @@ def test_imports_only_the_stdlib_and_the_package_and_nothing_inside_functions():
     assert nested == []
     assert foreign == []
     assert not any(m.startswith("datagrunt.core") for m in modules)
+
+
+MM_ANTHROPIC_PNG = b"\x89PNG\r\n\x1a\nCLAUDE_BAND"
+
+
+class TestMultimodalImages:
+    def test_anthropic_provider_sends_base64_image_blocks_before_text(self):
+        import base64
+        import dataclasses
+
+        handler = reply_with(json_body=MESSAGE)
+        provider = make_provider(handler)
+        req = dataclasses.replace(REQUEST, images=(MM_ANTHROPIC_PNG,))
+
+        provider.generate(req)
+
+        body = json.loads(handler.seen[0].content)
+        assert body["messages"] == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": base64.b64encode(MM_ANTHROPIC_PNG).decode("ascii"),
+                        },
+                    },
+                    {"type": "text", "text": REQUEST.user_envelope},
+                ],
+            }
+        ]

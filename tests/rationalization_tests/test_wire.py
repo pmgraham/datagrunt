@@ -73,7 +73,7 @@ def response(**changes) -> ProviderResponse:
 
 class TestModelRequest:
     def test_fields_in_plan_order(self):
-        assert [field.name for field in dataclasses.fields(ModelRequest)] == list(REQUEST)
+        assert [field.name for field in dataclasses.fields(ModelRequest)] == [*REQUEST, "images"]
 
     def test_frozen_and_slotted(self):
         built = request()
@@ -400,3 +400,34 @@ def test_importing_the_module_loads_neither_pydantic_nor_httpx():
     )
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout.strip().splitlines()[-1]) == []
+
+
+VALID_PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+
+
+class TestModelRequestImages:
+    def test_images_defaults_to_empty_tuple_and_accepts_valid_pngs(self):
+        default_req = request()
+        assert default_req.images == ()
+
+        img_req = request(images=(VALID_PNG, VALID_PNG + b"1"))
+        assert img_req.images == (VALID_PNG, VALID_PNG + b"1")
+        assert "IHDR" not in repr(img_req)
+
+    @pytest.mark.parametrize("bad", [[VALID_PNG], VALID_PNG, None, (123,)])
+    def test_images_rejects_non_tuple_or_non_bytes(self, bad):
+        with pytest.raises(TypeError, match="images"):
+            request(images=bad)
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            (b"",),
+            (b"not-a-png",),
+            (VALID_PNG,) * 65,
+            (VALID_PNG + b"x" * (32 * MIB),),
+        ],
+    )
+    def test_images_rejects_non_png_or_excess_count_or_bytes(self, bad):
+        with pytest.raises(ValueError, match="images"):
+            request(images=bad)

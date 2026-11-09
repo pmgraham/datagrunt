@@ -160,6 +160,7 @@ The module imports the standard library and the package's own modules (the HTTP 
 import inside a function (invariant 9).
 """
 
+import base64
 import math
 import time
 from collections.abc import Mapping
@@ -992,11 +993,29 @@ class AnthropicProvider:
         """
         if not isinstance(request, ModelRequest):
             raise TypeError(f"generate needs a ModelRequest, got {type(request).__name__}")
+        user_content: str | list[dict[str, Any]] = (
+            [
+                *[
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": base64.b64encode(img).decode("ascii"),
+                        },
+                    }
+                    for img in request.images
+                ],
+                {"type": "text", "text": request.user_envelope},
+            ]
+            if request.images
+            else request.user_envelope
+        )
         body: dict[str, Any] = {
             **self._route.body_fields,
             "max_tokens": request.max_output_tokens,
             "system": request.system_prompt,
-            "messages": [{"role": "user", "content": request.user_envelope}],
+            "messages": [{"role": "user", "content": user_content}],
             "output_config": {"format": {"type": MECHANISM, "schema": dict(request.json_schema)}},
         }
         if self._temperature is not None:
