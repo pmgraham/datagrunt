@@ -22,6 +22,12 @@ on:
 permissions:
   contents: read
 
+# Serialize version bumps on main so back-to-back squash merges never race
+# git push / tag creation; manual dispatches get a distinct group per run_id.
+concurrency:
+  group: bump-version-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'main' }}
+  cancel-in-progress: false
+
 jobs:
   bump-version:
     name: Bump version
@@ -62,8 +68,19 @@ jobs:
       - name: Pull latest changes
         run: git pull origin main
 
+      - name: Check whether HEAD already carries a release tag
+        id: tagcheck
+        run: |
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ -n "$(git tag --points-at HEAD)" ]; then
+            echo "HEAD is already tagged ($(git tag --points-at HEAD | tr '\n' ' ')); skipping duplicate bump."
+            echo "already_tagged=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_tagged=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Determine version bump type
         id: version_type
+        if: steps.tagcheck.outputs.already_tagged != 'true'
         run: |
           COMMIT_MSG=$(git log -1 --pretty=%B)
           if echo "$COMMIT_MSG" | grep -qi "\[major\]"; then
@@ -77,4 +94,5 @@ jobs:
           fi
 
       - name: Bump version
+        if: steps.tagcheck.outputs.already_tagged != 'true'
         run: bumpver update --${{ github.event.inputs.part || steps.version_type.outputs.type }}

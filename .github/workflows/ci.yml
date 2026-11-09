@@ -4,9 +4,15 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+# Cancel superseded runs on rapid PR force-pushes or back-to-back merges on main.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -82,7 +88,10 @@ jobs:
     # range (requires-python >= 3.11, classifiers through 3.14). The native
     # extension is abi3-py311, so this mostly exercises the pure-Python paths
     # (the whole PDF subsystem) and the dependency set per version.
+    # Skipped on post-merge push to main: ruleset requires PRs for main, where
+    # this matrix already ran.
     name: python compat
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -116,11 +125,16 @@ jobs:
         run: .venv/bin/pytest tests/ -q
 
   build:
+    # Skipped on post-merge push to main: every PR already builds all wheels +
+    # sdist as required checks, and Publish to PyPI builds release artifacts
+    # after Bump Version completes.
     name: wheel matrix
+    if: github.event_name != 'push'
     uses: ./.github/workflows/build.yml
 
   audit:
     name: dependency audit (advisory)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Advisory, NOT blocking: a newly published advisory in a transitive
     # dependency (duckdb, polars, pyarrow, pypdfium2, …) must not break CI or the
