@@ -751,6 +751,12 @@ class TestCellText:
 
         assert got == [["first second", "", "", ""]]
 
+    def test_a_tall_glyph_in_a_cell_never_merges_the_lines_beside_it(self):
+        # The 30 pt 'A' bands both lines (#476); read as one line, 'second' landed inside the first ("firstsecond").
+        pieces = (chars("A", 10.0, 6.0, height=30.0), chars("first", 20.0, 6.0), chars("line", 60.0, 6.0))
+
+        assert texts(TWO_BY_TWO, *pieces, chars("second", 20.0, 21.0)) == [["A first line second", "", "", ""]]
+
     @pytest.mark.parametrize(
         "gap,joined",
         [
