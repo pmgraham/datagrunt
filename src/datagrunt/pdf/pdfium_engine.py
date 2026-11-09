@@ -216,6 +216,7 @@ from datagrunt.pdf._pdfium_images import (
     collect_images,
     declared_size,
     decoded_png,
+    decoded_png_detached,
     image_outcomes,
     pixel_facts,
     read_filters,
@@ -1621,19 +1622,19 @@ class ImageLoader:
                 page.close()
 
     def _verified_image(self, page_raw: pdfium_c.FPDF_PAGE) -> tuple[pdfium_c.FPDF_PAGEOBJECT, bytes, PixelFacts]:
-        """The image object this loader names on the loaded page, its verified raw stream and pixel facts.
-
-        The stream must hash to ``raw_sha256``, and the facts read from the
-        image dictionary and codestream (filters, decode size, declared size,
-        and the bits per pixel and colour space when pdfium reads them) must
-        be the image's: the same stream under another dictionary would decode
-        to another picture. Dictionary changes that keep all of these (a
-        /Decode array, a palette's colours) are not detected.
-        """
+        """The image object this loader names on the loaded page, its verified raw stream and pixel facts."""
         try:
             objects = _page_objects(page_raw, max_objects=MAX_PAGE_OBJECTS)
         except WalkBoundHit as exc:  # its page was within the bound when the image was recorded
             raise self._changed(str(exc)) from exc
+        return self._verified_on_objects(page_raw, objects)
+
+    def _verified_on_objects(
+        self,
+        page_raw: pdfium_c.FPDF_PAGE,
+        objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]],
+    ) -> tuple[pdfium_c.FPDF_PAGEOBJECT, bytes, PixelFacts]:
+        """Verify this image against pre-walked ``objects`` of ``page_raw`` without re-walking the page."""
         if self.object_index >= len(objects):
             raise self._changed(f"the page has {len(objects)} object(s)")
         image, _form = objects[self.object_index]
@@ -1666,6 +1667,86 @@ class ImageLoader:
         """The error for a source that no longer holds this image (never naming the password)."""
         where = f"{self.source}: page {self.page_index + 1}, object {self.object_index}"
         return DatagruntPDFError(f"{where} is not the image this loader was made for: the file changed ({detail})")
+
+
+class FigureSession:
+    """Reads verified figures from one open ``DocumentHandle``, loading and walking each page once."""
+
+    __slots__ = ("_handle", "_load_error", "_objects", "_page", "_page_index", "_page_number", "_walk_error")
+
+    def __init__(self, handle: DocumentHandle) -> None:
+        if not isinstance(handle, DocumentHandle):
+            raise TypeError(f"handle must be a DocumentHandle, got {type(handle).__name__}")
+        if handle.closed:
+            raise ValueError("document handle is closed")
+        self._handle = handle
+        self._page_index: int | None = None
+        self._page: pdfium.PdfPage | None = None
+        self._page_number: int = 0
+        self._objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None
+        self._walk_error: str | None = None
+        self._load_error: PdfiumFailure | None = None
+
+    def __enter__(self) -> "FigureSession":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Close any cached page under ``_PDFIUM_LOCK``."""
+        with _PDFIUM_LOCK:
+            if self._page is not None:
+                self._page.close()
+                self._page = None
+            self._page_index = None
+            self._objects = None
+            self._walk_error = None
+            self._load_error = None
+
+    def _ensure_page(self, loader: ImageLoader) -> None:
+        if self._page_index == loader.page_index:
+            return
+        self.close()
+        if loader.page_index >= self._handle.page_count:
+            raise loader._changed(f"it has {self._handle.page_count} page(s)")
+        self._page_index = loader.page_index
+        self._page_number = loader.page_index + 1
+        try:
+            self._page, self._page_number = _load_page(self._handle, loader.page_index)
+        except PdfiumFailure as exc:
+            self._load_error = exc
+            return
+        try:
+            self._objects = _page_objects(self._page.raw, max_objects=MAX_PAGE_OBJECTS)
+        except WalkBoundHit as exc:
+            self._walk_error = str(exc)
+
+    def read(self, loader: ImageLoader, kind: Literal["png", "raw"]) -> bytes:
+        """Read ``loader``'s verified ``"png"`` or ``"raw"`` bytes, reusing the loaded page and object walk."""
+        if not isinstance(loader, ImageLoader):
+            raise TypeError(f"loader must be an ImageLoader, got {type(loader).__name__}")
+        choice_str("kind", kind, ("png", "raw"))
+        encoder: Callable[[], bytes] | None = None
+        with _PDFIUM_LOCK:
+            self._ensure_page(loader)
+            page_number = self._page_number
+            try:
+                if self._load_error is not None:
+                    raise self._load_error
+                if self._walk_error is not None:
+                    raise loader._changed(self._walk_error)
+                assert self._page is not None and self._objects is not None
+                image, raw, facts = loader._verified_on_objects(self._page.raw, self._objects)
+                if kind == "raw":
+                    return raw
+                encoder = decoded_png_detached(image, facts, f"object {loader.object_index}")
+            except PdfiumFailure as exc:
+                message = f"{loader.source}: page {page_number}: pdfium cannot {exc}"
+                raise PDFCorruptError(message, page_number=page_number) from exc
+            except (OversizedStream, DecodeRefused) as exc:
+                raise DatagruntPDFError(f"{loader.source}: page {page_number}: {exc}") from exc
+        return encoder()
 
 
 def _uncharged(size: int) -> bool:

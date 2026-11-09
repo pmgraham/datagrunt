@@ -579,10 +579,11 @@ def read_figures(reads: Sequence[FigureRead], kind: Kind) -> Iterator[bytes | Ex
 
 
 def _batches(reads: Sequence[FigureRead]) -> Iterator[list[FigureRead]]:
-    """``reads`` in runs that share a worker: the same PDF, password and cap, at most FIGURE_BATCH long."""
+    """``reads`` in runs sharing a worker (at most FIGURE_BATCH under ``sandbox``; full PDF run in-process)."""
     batch: list[FigureRead] = []
     for read in reads:
-        if batch and (len(batch) == FIGURE_BATCH or _worker_key(batch[0]) != _worker_key(read)):
+        limit_hit = read.sandbox and len(batch) == FIGURE_BATCH
+        if batch and (limit_hit or _worker_key(batch[0]) != _worker_key(read)):
             yield batch
             batch = []
         batch.append(read)
@@ -595,9 +596,9 @@ def _worker_key(read: FigureRead) -> tuple[Path, str | None, int, bool]:
 
 
 def _in_process_figure_outcomes(batch: list[FigureRead], kind: Kind) -> Iterator[bytes | Exception]:
-    """Read a batch of figures in-process from one open DocumentHandle."""
+    """Read a batch of figures in-process from one open DocumentHandle and FigureSession."""
     try:
-        from datagrunt.pdf.pdfium_engine import ImageLoader, open_document
+        from datagrunt.pdf.pdfium_engine import FigureSession, ImageLoader, open_document
     except ImportError as exc:
         from datagrunt.pdf._extra import missing_in_process
 
@@ -613,7 +614,7 @@ def _in_process_figure_outcomes(batch: list[FigureRead], kind: Kind) -> Iterator
         for _ in batch:
             yield exc
         return
-    with handle_ctx as handle:
+    with handle_ctx as handle, FigureSession(handle) as session:
         for read in batch:
             loader = ImageLoader(
                 source=read.source,
@@ -622,7 +623,7 @@ def _in_process_figure_outcomes(batch: list[FigureRead], kind: Kind) -> Iterator
                 password=read.password,
             )
             try:
-                yield loader.read_from_handle(handle, kind)
+                yield session.read(loader, kind)
             except (DatagruntPDFError, OSError) as exc:
                 yield exc
 
