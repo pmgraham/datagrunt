@@ -229,6 +229,12 @@ def page_figures(
     minimum = int_at_least("min_image_dimension", min_image_dimension, 0)
     strict_bool("sandbox", sandbox)
     path = _checked_path(source, "source")
+    sized_candidates = [
+        item
+        for item in images.images
+        if item.raw_sha256 is not None and (sz := _pixel_size(item)) is not None and min(sz) >= minimum
+    ]
+    mosaic_skip = _mosaic_fragment_indices(sized_candidates, geometry) if minimum > 0 else set()
     drafts: list[FigureDraft] = []
     unread: list[int] = []
     unsized: list[int] = []
@@ -240,7 +246,7 @@ def page_figures(
             unread.append(item.object_index)
         elif size is None:
             unsized.append(item.object_index)
-        else:
+        elif item.object_index not in mosaic_skip:
             loader = FigureRead(
                 source=path,
                 page_index=geometry.page_number - 1,
@@ -255,6 +261,110 @@ def page_figures(
         *_not_figures(unsized, "their pixel size is unknown"),
     )
     return PageFigures(drafts=tuple(drafts), warnings=warnings)
+
+
+_MOSAIC_SEAM_PT = 2.0
+_MIN_STRIP_STACK = 3
+_MIN_TILE_COMPONENT = 9
+_MAX_TILE_PX = 512
+
+
+def _abutting_runs(ordered: list[RawImage], *, horizontal: bool) -> set[int]:
+    """Collect ``object_index`` values belonging to edge-abutting strip runs of length ``>= 3``."""
+    found: set[int] = set()
+    run: list[RawImage] = []
+    for im in ordered:
+        b = im.bbox
+        p = run[-1].bbox if run else b
+        abuts = (
+            abs(b[0] - p[0]) <= 3.0 and abs(b[2] - p[2]) <= 3.0 and -3.0 <= (b[1] - p[3]) <= 3.0
+            if horizontal
+            else abs(b[1] - p[1]) <= 3.0 and abs(b[3] - p[3]) <= 3.0 and -3.0 <= (b[0] - p[2]) <= 3.0
+        )
+        if run and abuts:
+            run.append(im)
+            continue
+        if len(run) >= _MIN_STRIP_STACK:
+            found.update(r.object_index for r in run)
+        run = [im]
+    if len(run) >= _MIN_STRIP_STACK:
+        found.update(r.object_index for r in run)
+    return found
+
+
+def _strip_stack_indices(items: list[RawImage], page_w: float, page_h: float) -> set[int]:
+    """Identify ``>= 3`` edge-abutting horizontal or vertical scanline strips slicing one raster image."""
+    h_strips = sorted(
+        (
+            im
+            for im in items
+            if (im.bbox[2] - im.bbox[0]) >= 0.25 * page_w
+            and (
+                (im.bbox[2] - im.bbox[0]) >= 4.0 * max(im.bbox[3] - im.bbox[1], 0.1)
+                or im.px_width >= 4 * max(im.px_height, 1)
+            )
+        ),
+        key=lambda im: (round(im.bbox[0], 0), im.bbox[1]),
+    )
+    v_strips = sorted(
+        (
+            im
+            for im in items
+            if (im.bbox[3] - im.bbox[1]) >= 0.25 * page_h
+            and (
+                (im.bbox[3] - im.bbox[1]) >= 4.0 * max(im.bbox[2] - im.bbox[0], 0.1)
+                or im.px_height >= 4 * max(im.px_width, 1)
+            )
+        ),
+        key=lambda im: (round(im.bbox[1], 0), im.bbox[0]),
+    )
+    return _abutting_runs(h_strips, horizontal=True) | _abutting_runs(v_strips, horizontal=False)
+
+
+def _tile_grid_indices(items: list[RawImage], page_w: float, page_h: float) -> set[int]:
+    """Identify connected components of ``>= 9`` edge-abutting small raster tiles via O(T log T) x-sweep."""
+    tiles = sorted(
+        (
+            im
+            for im in items
+            if (im.bbox[2] - im.bbox[0]) <= 0.30 * page_w
+            and (im.bbox[3] - im.bbox[1]) <= 0.30 * page_h
+            and max(im.px_width, im.px_height) <= _MAX_TILE_PX
+        ),
+        key=lambda im: (im.bbox[0], im.bbox[1]),
+    )
+    n = len(tiles)
+    if n < _MIN_TILE_COMPONENT:
+        return set()
+    parent = list(range(n))
+
+    def find(idx: int) -> int:
+        while parent[idx] != idx:
+            parent[idx] = parent[parent[idx]]
+            idx = parent[idx]
+        return idx
+
+    for i in range(n):
+        ix0, iy0, ix1, iy1 = tiles[i].bbox
+        for j in range(i + 1, n):
+            jx0, jy0, jx1, jy1 = tiles[j].bbox
+            if jx0 > ix1 + _MOSAIC_SEAM_PT:
+                break
+            if ix0 <= jx1 + _MOSAIC_SEAM_PT and jy0 <= iy1 + _MOSAIC_SEAM_PT and iy0 <= jy1 + _MOSAIC_SEAM_PT:
+                parent[find(j)] = find(i)
+
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(tiles[i].object_index)
+    return {obj_idx for members in groups.values() if len(members) >= _MIN_TILE_COMPONENT for obj_idx in members}
+
+
+def _mosaic_fragment_indices(items: list[RawImage], geometry: PageGeometry) -> set[int]:
+    """Object indices of scanline strip stacks and tiled raster mosaics (not standalone figures)."""
+    if len(items) < _MIN_STRIP_STACK:
+        return set()
+    page_w, page_h = geometry.width_pt, geometry.height_pt
+    return _strip_stack_indices(items, page_w, page_h) | _tile_grid_indices(items, page_w, page_h)
 
 
 def _pixel_size(item: RawImage) -> tuple[int, int] | None:

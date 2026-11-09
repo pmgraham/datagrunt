@@ -630,3 +630,148 @@ class TestAuditRegressionFixes:
         m_fail = extract_corpus(in_dir, tmp_path / "out_bound", max_workers=2, strict=False, ocr="never")
         assert len(m_fail.entries) == 0
         assert len(m_fail.failures) == 4
+
+
+class TestNodes5And6CadTr3TablesAndMosaicSuppression:
+    """Node 5 (AutoCAD SHX Tr 3 vector-backed text + BOM tables) & Node 6 (tile/strip mosaic suppression)."""
+
+    def test_autocad_shx_tr3_drawing_restores_markdown_text_and_reconstructs_bom_table(self, tmp_path: Path) -> None:
+        import json
+
+        from datagrunt.pdf.corpus import extract_corpus
+
+        cad_pdf = tmp_path / "54_00655_bom.pdf"
+        c = canvas.Canvas(str(cad_pdf), pagesize=(792, 612))
+
+        # Draw lattice BOM table gridlines (3 rows x 3 cols) in PDF bottom-up coords
+        col_xs = [60.0, 140.0, 320.0, 420.0]
+        row_ys = [520.0, 490.0, 460.0, 430.0]
+        c.setLineWidth(1.0)
+        for x in col_xs:
+            c.line(x, row_ys[-1], x, row_ys[0])
+        for y in row_ys:
+            c.line(col_xs[0], y, col_xs[-1], y)
+
+        rows_data = [
+            ["ITEM", "PART NUMBER", "QTY"],
+            ["1", "VLV 204", "4"],
+            ["2", "PMP 101", "-"],
+        ]
+
+        # Emit AutoCAD-style SHX glyph strokes + overlaid `3 Tr` searchable text for every cell + title
+        def draw_shx_tr3(text_val: str, x_pt: float, y_pt: float, size_pt: float = 10.0) -> None:
+            for idx_ch, ch in enumerate(text_val):
+                if ch.isspace():
+                    continue
+                gx = x_pt + idx_ch * (size_pt * 0.55)
+                if ch == "-":
+                    c.line(gx + 0.5, y_pt + size_pt * 0.35, gx + size_pt * 0.45, y_pt + size_pt * 0.35)
+                else:
+                    c.rect(gx + 0.5, y_pt, size_pt * 0.45, size_pt * 0.75, stroke=1, fill=0)
+            t_obj = c.beginText(x_pt, y_pt)
+            t_obj.setFont("Courier", size_pt)
+            t_obj.setTextRenderMode(3)  # AutoCAD EPDFSHX=1 invisible searchable text over SHX strokes
+            t_obj.textOut(text_val)
+            c.drawText(t_obj)
+
+        draw_shx_tr3("DRAWING 54-00655 PUMP ASSEMBLY", 60.0, 555.0, 14.0)
+        for r_idx, row_cells in enumerate(rows_data):
+            cy = row_ys[r_idx + 1] + 9.0
+            for c_idx, cell_text in enumerate(row_cells):
+                draw_shx_tr3(cell_text, col_xs[c_idx] + 8.0, cy, 10.0)
+
+        # Also place unbacked `3 Tr` prompt-injection text on blank space (MUST stay flagged "invisible"!)
+        inj = c.beginText(500.0, 200.0)
+        inj.setFont("Helvetica", 10.0)
+        inj.setTextRenderMode(3)
+        inj.textOut("SECRET_UNBACKED_PROMPT")
+        c.drawText(inj)
+
+        c.showPage()
+        c.save()
+
+        out_dir = tmp_path / "cad_corpus_out"
+        manifest = extract_corpus(cad_pdf, out_dir, ocr="never")
+        assert len(manifest.entries) == 1
+        bdir = out_dir / manifest.entries[0].bundle_relpath
+        doc_md = (bdir / "markdown" / "document.md").read_text(encoding="utf-8")
+        doc_json = json.loads((bdir / "json" / "document.json").read_text(encoding="utf-8"))
+
+        # 1. CAD Tr 3 text (with internal spaces intact!) is restored to document.md and NOT marked image_only
+        assert "DRAWING 54-00655 PUMP ASSEMBLY" in doc_md
+        assert "VLV 204" in doc_md
+        assert "PMP 101" in doc_md
+        assert doc_json["pages"][0]["image_only_reasons"] == []
+
+        # 2. BOM lattice Table is reconstructed with structured headers + rows in BOTH JSON and Markdown!
+        tables = [el for el in doc_json["pages"][0]["elements"] if el["kind"] == "table"]
+        assert len(tables) == 1
+        assert tables[0]["headers"] == ["ITEM", "PART NUMBER", "QTY"]
+        assert tables[0]["rows"] == [["1", "VLV 204", "4"], ["2", "PMP 101", "-"]]
+        assert "| ITEM | PART NUMBER | QTY |" in doc_md
+
+        # 3. Unbacked `3 Tr` prompt injection remains flagged "invisible" (kept in JSON, omitted from Markdown)
+        assert "SECRET_UNBACKED_PROMPT" not in doc_md
+        hidden_els = [el for el in doc_json["pages"][0]["elements"] if "invisible" in el["hidden_reasons"]]
+        assert any("SECRET_UNBACKED_PROMPT" in el.get("text", "") for el in hidden_els)
+
+    def test_tiled_scan_and_scanline_strips_suppressed_while_real_figures_and_spaced_icons_kept(
+        self, tmp_path: Path
+    ) -> None:
+        import json
+
+        from PIL import Image
+        from reportlab.lib.utils import ImageReader
+
+        from datagrunt.pdf.corpus import extract_corpus
+
+        tile_img = tmp_path / "tile64.png"
+        Image.new("RGB", (64, 64), color=(210, 210, 210)).save(tile_img)
+        strip_img = tmp_path / "strip.png"
+        Image.new("RGB", (1200, 80), color=(220, 220, 220)).save(strip_img)
+        stamp_img = tmp_path / "real_stamp.png"
+        Image.new("RGB", (90, 90), color=(20, 80, 180)).save(stamp_img)
+        diag_img = tmp_path / "real_diagram.png"
+        Image.new("RGB", (600, 400), color=(40, 140, 80)).save(diag_img)
+        icon_img = tmp_path / "spaced_icon.png"
+        Image.new("RGB", (48, 48), color=(160, 60, 60)).save(icon_img)
+
+        pdf_p = tmp_path / "s_GF05CF002_sim.pdf"
+        c = canvas.Canvas(str(pdf_p), pagesize=(612, 792))
+
+        # Page 1: 36 edge-abutting 16x16 pt (64x64 px) raster tiles + 1 standalone 90x90 px stamp
+        for r in range(6):
+            for col in range(6):
+                c.drawImage(ImageReader(str(tile_img)), 40.0 + col * 16.0, 500.0 + r * 16.0, width=16.0, height=16.0)
+        c.drawImage(ImageReader(str(stamp_img)), 360.0, 500.0, width=72.0, height=72.0)
+        c.showPage()
+
+        # Page 2: 6 edge-abutting horizontal scanline strips (480x24 pt, 1200x80 px) + 1 standalone 600x400 diagram
+        for s_idx in range(6):
+            c.drawImage(ImageReader(str(strip_img)), 40.0, 500.0 + s_idx * 24.0, width=480.0, height=24.0)
+        c.drawImage(ImageReader(str(diag_img)), 80.0, 120.0, width=240.0, height=160.0)
+        c.showPage()
+
+        # Page 3: 12 spaced icons in a catalog grid (20 pt gap between icons -> NOT abutting -> ALL 12 KEPT!)
+        for idx in range(12):
+            gx = 60.0 + (idx % 4) * 60.0
+            gy = 500.0 + (idx // 4) * 60.0
+            c.drawImage(ImageReader(str(icon_img)), gx, gy, width=24.0, height=24.0)
+        c.showPage()
+        c.save()
+
+        out_dir = tmp_path / "mosaic_out"
+        manifest = extract_corpus(pdf_p, out_dir, ocr="never")
+        bdir = out_dir / manifest.entries[0].bundle_relpath
+        doc_json = json.loads((bdir / "json" / "document.json").read_text(encoding="utf-8"))
+
+        p1_figs = [el for el in doc_json["pages"][0]["elements"] if el["kind"] == "figure"]
+        p2_figs = [el for el in doc_json["pages"][1]["elements"] if el["kind"] == "figure"]
+        p3_figs = [el for el in doc_json["pages"][2]["elements"] if el["kind"] == "figure"]
+
+        assert len(p1_figs) == 1 and (p1_figs[0]["width_px"], p1_figs[0]["height_px"]) == (90, 90)
+        assert len(p2_figs) == 1 and (p2_figs[0]["width_px"], p2_figs[0]["height_px"]) == (600, 400)
+        assert len(p3_figs) == 12
+        # All 3 pages still have their full-page PNGs captured and saved!
+        for pno in (1, 2, 3):
+            assert (bdir / "page_images" / f"page_{pno:04d}.png").is_file()
