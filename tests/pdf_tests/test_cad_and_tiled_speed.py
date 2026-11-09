@@ -285,3 +285,182 @@ class TestNode3SharedRenderAndFastPng:
         assert all(pg.page_image is not None and pg.page_image.image_path is not None for pg in written.pages)
         assert open_calls == 1, f"Expected 1 open_document across 6 rendered pages, got {open_calls}"
         assert walk_calls == 6, f"Expected 6 _page_objects walks (1/page), got {walk_calls}"
+
+
+class TestNode4CorpusProcessScalingAndReuse:
+    """extract_corpus scales across isolated workers, works from <stdin>, and reuse ignores workers."""
+
+    def test_extract_corpus_max_workers_reuses_across_workers_param_and_bundle_dpi_change_rebuilds(
+        self, tmp_path: Path
+    ) -> None:
+        from datagrunt.pdf.bundle import write_bundle
+        from datagrunt.pdf.corpus import extract_corpus
+        from datagrunt.pdf.pipeline import extract_document
+
+        in_dir = tmp_path / "in_pdfs"
+        in_dir.mkdir()
+        for idx in range(6):
+            p = in_dir / f"sheet_{idx:02d}.pdf"
+            c = canvas.Canvas(str(p), pagesize=(612, 792))
+            c.setFont("Helvetica", 11)
+            c.drawString(72, 700, f"Engineering document {idx}")
+            c.showPage()
+            c.save()
+
+        out_dir = tmp_path / "corpus_out"
+        m1 = extract_corpus(in_dir, out_dir, max_workers=3, workers=1, ocr="never")
+        assert len(m1.entries) == 6
+        assert all(not e.reused for e in m1.entries)
+        # Verify default Pillar 3: every page image is captured and saved in addition to JSON & Markdown
+        for entry in m1.entries:
+            assert (out_dir / entry.bundle_relpath / "page_images" / "page_0001.png").is_file()
+            assert (out_dir / entry.bundle_relpath / "json" / "document.json").is_file()
+            assert (out_dir / entry.bundle_relpath / "markdown" / "document.md").is_file()
+
+        # Reuse with a different `workers` parameter must reuse all 6 bundles without rewriting
+        m2 = extract_corpus(in_dir, out_dir, max_workers=2, workers=4, ocr="never", overwrite=False)
+        assert len(m2.entries) == 6
+        assert all(e.reused for e in m2.entries)
+
+        # Direct write_bundle also reuses across workers changes, but rejects dpi mismatch
+        one_pdf = in_dir / "sheet_00.pdf"
+        doc = extract_document(one_pdf, ocr="never")
+        bdir = tmp_path / "single_bundle"
+        write_bundle(doc, bdir, source=one_pdf, dpi=150, workers=1)
+        reused_doc = write_bundle(doc, bdir, source=one_pdf, dpi=150, workers=4, overwrite=False)
+        assert reused_doc.metadata.doc_id == doc.metadata.doc_id
+        with pytest.raises(FileExistsError):
+            write_bundle(doc, bdir, source=one_pdf, dpi=200, workers=4, overwrite=False)
+
+    def test_three_pillars_text_extracted_images_in_json_and_md_plus_page_images(self, tmp_path: Path) -> None:
+        import json
+
+        from PIL import Image
+        from reportlab.lib.utils import ImageReader
+
+        from datagrunt.pdf.corpus import extract_corpus
+
+        in_dir = tmp_path / "pillar_pdfs"
+        in_dir.mkdir()
+        for idx in range(2):
+            img = Image.new("RGB", (80, 60), color=(20 * idx + 40, 100, 160))
+            img_path = tmp_path / f"stamp_{idx}.png"
+            img.save(img_path)
+            pdf_path = in_dir / f"spec_{idx}.pdf"
+            c = canvas.Canvas(str(pdf_path), pagesize=(612, 792))
+            c.setFont("Helvetica-Bold", 18)
+            c.drawString(72, 720, f"Section {idx + 1} Pump Assembly")
+            c.setFont("Helvetica", 11)
+            c.drawString(72, 690, f"Operating pressure: {150 + idx} PSI nominal.")
+            c.drawImage(ImageReader(str(img_path)), 72, 560, width=80, height=60)
+            c.showPage()
+            c.save()
+
+        out_dir = tmp_path / "pillar_bundles"
+        manifest = extract_corpus(in_dir, out_dir, max_workers=2, ocr="never")
+        assert len(manifest.entries) == 2
+        for idx, entry in enumerate(manifest.entries):
+            bdir = out_dir / entry.bundle_relpath
+            doc_json = json.loads((bdir / "json" / "document.json").read_text(encoding="utf-8"))
+            doc_md = (bdir / "markdown" / "document.md").read_text(encoding="utf-8")
+            # Pillar 1: all text + formatting captured in JSON and Markdown
+            assert f"# Section {idx + 1} Pump Assembly" in doc_md
+            assert f"**Operating pressure:** {150 + idx} PSI nominal." in doc_md
+            # Pillar 2: detected image extracted to disk AND path present in BOTH JSON and Markdown
+            figs = [el for p in doc_json["pages"] for el in p["elements"] if el["kind"] == "figure"]
+            assert len(figs) == 1
+            fig_rel = figs[0]["image_path"]
+            assert isinstance(fig_rel, str) and fig_rel.startswith("images/")
+            assert (bdir / fig_rel).is_file()
+            assert f"../{fig_rel}" in doc_md
+            # Pillar 3: page images captured and saved in addition to extracted images
+            page_rel = doc_json["pages"][0]["page_image"]["image_path"]
+            assert page_rel == "page_images/page_0001.png"
+            assert (bdir / page_rel).is_file()
+
+    def test_corpus_proc_pool_runs_distinct_child_pids_and_succeeds_from_stdin(self, tmp_path: Path) -> None:
+        import os
+        import subprocess
+        import sys
+        from concurrent.futures import ThreadPoolExecutor
+
+        from datagrunt.pdf import corpus
+
+        assert hasattr(corpus, "_CorpusProcPool"), "Expected _CorpusProcPool in corpus.py"
+        in_dir = tmp_path / "stdin_pdfs"
+        in_dir.mkdir()
+        for idx in range(4):
+            p = in_dir / f"doc_{idx}.pdf"
+            c = canvas.Canvas(str(p), pagesize=(612, 792))
+            c.drawString(72, 700, f"Process worker test {idx}")
+            c.showPage()
+            c.save()
+
+        items = corpus._resolve_inputs(in_dir)
+        opts = corpus.PipelineOptions(ocr="never")
+        out_pool = tmp_path / "out_pool"
+        out_pool.mkdir()
+        with corpus._CorpusProcPool() as proc_pool, ThreadPoolExecutor(max_workers=2) as threads:
+            futs = [
+                threads.submit(
+                    corpus._run_in_corpus_worker,
+                    proc_pool,
+                    item,
+                    out_pool,
+                    None,
+                    opts,
+                    True,
+                    include_images=True,
+                    render_pages="vision_only",
+                )
+                for item in items[:2]
+            ]
+            results = [f.result(timeout=60) for f in futs]
+        pids = {pid for pid, _ in results}
+        assert os.getpid() not in pids
+        assert all(isinstance(entry, corpus.CorpusEntry) for _, entry in results)
+
+        # Must succeed when invoked from `python -` (<stdin>) where multiprocessing spawn fails
+        out_stdin = tmp_path / "out_stdin"
+        stdin_code = (
+            "from pathlib import Path\n"
+            "from datagrunt.pdf.corpus import extract_corpus\n"
+            f"m = extract_corpus(Path({str(in_dir)!r}), Path({str(out_stdin)!r}), max_workers=2, ocr='never')\n"
+            "assert len(m.entries) == 4\n"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-"],
+            input=stdin_code,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+        assert completed.returncode == 0, completed.stderr
+
+    def test_corpus_proc_pool_fault_isolation_and_strict_raise(self, tmp_path: Path) -> None:
+        from datagrunt.pdf.corpus import extract_corpus
+        from datagrunt.pdf.exceptions import PDFCorruptError
+
+        in_dir = tmp_path / "mixed_pdfs"
+        in_dir.mkdir()
+        for idx in (0, 2):
+            p = in_dir / f"item_{idx}.pdf"
+            c = canvas.Canvas(str(p), pagesize=(612, 792))
+            c.drawString(72, 700, f"Valid {idx}")
+            c.showPage()
+            c.save()
+        bad = in_dir / "item_1.pdf"
+        bad.write_bytes(b"%PDF-1.7\nnot a valid xref table or trailer\n")
+
+        m = extract_corpus(
+            in_dir, tmp_path / "out_non_strict", max_workers=2, strict=False, ocr="never", render_pages="vision_only"
+        )
+        assert len(m.entries) == 2
+        assert len(m.failures) == 1
+        assert m.failures[0].error_type == "PDFCorruptError"
+
+        with pytest.raises(PDFCorruptError):
+            extract_corpus(
+                in_dir, tmp_path / "out_strict", max_workers=2, strict=True, ocr="never", render_pages="vision_only"
+            )

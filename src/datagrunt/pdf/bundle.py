@@ -290,6 +290,7 @@ from datagrunt.pdf._bundle_load import (
     _Missing,
     _page_markdown,
     _read_manifest,
+    _same_output_params,
     _with_pages,
     _with_readers,
     load_bundle,
@@ -606,7 +607,7 @@ def _existing(target: Path, document: PDFDocument, params: Mapping[str, object])
         return None, f"it was written by datagrunt {manifest.datagrunt_version}, not {version}"
     if manifest.source_sha256 != document.metadata.sha256:
         return None, f"its source_sha256 is {manifest.source_sha256}, not the document's {document.metadata.sha256}"
-    if manifest.extraction_params != dict(params):
+    if not _same_output_params(manifest.extraction_params, params):
         return None, f"its extraction_params {manifest.extraction_params} are not this write's {dict(params)}"
     rendered = {entry.page_number for entry in manifest.page_images if entry.origin == "render"}
     strip_figures = params.get("include_images") is False
