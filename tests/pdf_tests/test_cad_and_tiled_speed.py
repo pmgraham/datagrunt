@@ -129,3 +129,90 @@ class TestNode1FigureSessionBatching:
         assert isinstance(bound_outcomes[1], DatagruntPDFError)
         assert f"object {reads[1].object_index}" in str(bound_outcomes[1])
         assert isinstance(bound_outcomes[2], bytes)
+
+
+class TestNode2CadPathAndFontFastPath:
+    """Short CAD micro-paths cull via outer-mapped GetBounds without losing scaled paths; fonts cache per page."""
+
+    def test_short_micro_paths_skip_segment_ffi_while_scaled_own_and_form_paths_survive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import pypdfium2 as pdfium
+        import pypdfium2.raw as pdfium_c
+
+        pdf_file = tmp_path / "cad_micro.pdf"
+        wrapper = pdfium.PdfDocument.new()
+        raw_doc = wrapper.raw
+        page = pdfium_c.FPDFPage_New(raw_doc, 0, 612.0, 792.0)
+
+        # 1) 400 tiny 3pt CAD hatch/arrowhead strokes -> must be culled before FPDFPath_GetPathSegment
+        for i in range(400):
+            p = pdfium_c.FPDFPageObj_CreateNewPath(float(20 + (i % 40) * 12), float(50 + (i // 40) * 12))
+            pdfium_c.FPDFPath_LineTo(p, float(23 + (i % 40) * 12), float(50 + (i // 40) * 12))
+            pdfium_c.FPDFPath_SetDrawMode(p, pdfium_c.FPDF_FILLMODE_NONE, 1)
+            pdfium_c.FPDFPage_InsertObject(page, p)
+
+        # 2) A 0..2 local path scaled 10x by its OWN object matrix -> 20pt on page (MUST SURVIVE!)
+        scaled_own = pdfium_c.FPDFPageObj_CreateNewPath(0.0, 0.0)
+        pdfium_c.FPDFPath_LineTo(scaled_own, 2.0, 0.0)
+        pdfium_c.FPDFPath_SetDrawMode(scaled_own, pdfium_c.FPDF_FILLMODE_NONE, 1)
+        mat = pdfium_c.FS_MATRIX(10.0, 0.0, 0.0, 10.0, 100.0, 500.0)
+        pdfium_c.FPDFPageObj_SetMatrix(scaled_own, mat)
+        pdfium_c.FPDFPage_InsertObject(page, scaled_own)
+
+        # 3) A normal 100pt horizontal rule -> MUST SURVIVE!
+        long_rule = pdfium_c.FPDFPageObj_CreateNewPath(50.0, 600.0)
+        pdfium_c.FPDFPath_LineTo(long_rule, 150.0, 600.0)
+        pdfium_c.FPDFPath_SetDrawMode(long_rule, pdfium_c.FPDF_FILLMODE_NONE, 1)
+        pdfium_c.FPDFPage_InsertObject(page, long_rule)
+
+        pdfium_c.FPDFPage_GenerateContent(page)
+        pdfium_c.FPDF_ClosePage(page)
+        wrapper.save(str(pdf_file))
+        wrapper.close()
+
+        seg_ffi_calls = 0
+        real_get_seg = pdfium_c.FPDFPath_GetPathSegment
+
+        def counting_get_seg(path_obj, idx):
+            nonlocal seg_ffi_calls
+            seg_ffi_calls += 1
+            return real_get_seg(path_obj, idx)
+
+        monkeypatch.setattr(pdfium_c, "FPDFPath_GetPathSegment", counting_get_seg)
+
+        with pdfium_engine.open_document(pdf_file) as handle:
+            got = pdfium_engine.page_segments(handle, 0)
+
+        # Both the 20pt scaled-own rule and the 100pt rule survive; the 400 3pt micro-paths never call GetPathSegment
+        assert len(got.segments) == 2
+        lengths = sorted(round(seg.end - seg.start, 2) for seg in got.segments)
+        assert lengths == [20.0, 100.0]
+        assert seg_ffi_calls <= 8, f"Expected <=8 GetPathSegment calls, got {seg_ffi_calls}"
+
+    def test_per_page_font_cache_queries_base_font_name_once_per_distinct_font(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from datagrunt.pdf import _pdfium_text
+
+        pdf_file = tmp_path / "cad_callouts.pdf"
+        c = canvas.Canvas(str(pdf_file), pagesize=(612, 792))
+        for i in range(120):
+            c.setFont("Helvetica-Bold" if i % 2 == 0 else "Helvetica", 8)
+            c.drawString(30 + (i % 6) * 90, 750 - (i // 6) * 20, f"DIM-{i:03d}")
+        c.showPage()
+        c.save()
+
+        font_queries = 0
+        real_font_name = _pdfium_text._base_font_name
+
+        def counting_font_name(font, label):
+            nonlocal font_queries
+            font_queries += 1
+            return real_font_name(font, label)
+
+        monkeypatch.setattr(_pdfium_text, "_base_font_name", counting_font_name)
+        doc = extract_document(pdf_file, ocr="never", sandbox=False)
+        md = doc.to_markdown()
+        assert "DIM-000" in md and "DIM-119" in md
+        assert font_queries <= 2, f"Expected <=2 font FFI queries on 120 callouts, got {font_queries}"

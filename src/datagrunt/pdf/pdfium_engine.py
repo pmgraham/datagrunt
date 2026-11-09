@@ -921,14 +921,25 @@ def _read_points(path: pdfium_c.FPDF_PAGEOBJECT, label: str, room: _SegmentRoom)
     if count < 0:
         raise PdfiumFailure(f"count the path segments of {label}")
     room.take(count, label)
-    points = []
+    return _read_counted_points(path, count, label)
+
+
+def _read_counted_points(path: pdfium_c.FPDF_PAGEOBJECT, count: int, label: str) -> list[PathPoint]:
+    """Read ``count`` already-charged path segments from ``path``."""
+    points: list[PathPoint] = []
     x, y = ctypes.c_float(), ctypes.c_float()
+    make_pt = PathPoint
+    get_seg = pdfium_c.FPDFPath_GetPathSegment
+    get_type = pdfium_c.FPDFPathSegment_GetType
+    get_pt = pdfium_c.FPDFPathSegment_GetPoint
+    get_close = pdfium_c.FPDFPathSegment_GetClose
+    kinds = _POINT_KINDS
     for index in range(count):
-        segment = pdfium_c.FPDFPath_GetPathSegment(path, index)
-        kind = _POINT_KINDS.get(pdfium_c.FPDFPathSegment_GetType(segment)) if segment else None
-        if kind is None or not pdfium_c.FPDFPathSegment_GetPoint(segment, x, y):
+        segment = get_seg(path, index)
+        kind = kinds.get(get_type(segment)) if segment else None
+        if kind is None or not get_pt(segment, x, y):
             raise PdfiumFailure(f"read path segment {index} of {label}")
-        points.append(PathPoint(kind, x.value, y.value, bool(pdfium_c.FPDFPathSegment_GetClose(segment))))
+        points.append(make_pt(kind, x.value, y.value, bool(get_close(segment))))
     return points
 
 
@@ -940,8 +951,46 @@ def _read_matrix(obj: pdfium_c.FPDF_PAGEOBJECT, label: str) -> Matrix:
     return Matrix(raw.a, raw.b, raw.c, raw.d, raw.e, raw.f)
 
 
+_FAST_CULL_PT = 11.9
+
+
+def _culled_by_outer_bounds(path: pdfium_c.FPDF_PAGEOBJECT, outer: Matrix) -> bool:
+    """True when ``FPDFPageObj_GetBounds(path)`` mapped by ``outer`` is provably < 11.9 pt in both axes.
+
+    PDFium's ``FPDFPageObj_GetBounds`` already applies ``path``'s own object
+    matrix in binary32 float, returning bounds in the enclosing Form XObject's
+    space; mapping corners strictly by ``outer`` plus an IEEE-754 binary32 ULP
+    margin prevents both ``own`` double-scaling and large-offset cancellation.
+    """
+    left, bottom, right, top = ctypes.c_float(), ctypes.c_float(), ctypes.c_float(), ctypes.c_float()
+    if not pdfium_c.FPDFPageObj_GetBounds(path, left, bottom, right, top):
+        return False
+    l_v, b_v, r_v, t_v = left.value, bottom.value, right.value, top.value
+    isfinite = math.isfinite
+    if not (isfinite(l_v) and isfinite(b_v) and isfinite(r_v) and isfinite(t_v)):
+        return False
+    mag = max(abs(l_v), abs(b_v), abs(r_v), abs(t_v))
+    if outer == IDENTITY:
+        slack = mag * 1e-6
+        return (abs(r_v - l_v) + slack) < _FAST_CULL_PT and (abs(t_v - b_v) + slack) < _FAST_CULL_PT
+    oa, ob, oc, od, oe, of_ = outer
+    scale = max(abs(oa) + abs(oc), abs(ob) + abs(od))
+    slack = mag * scale * 1e-6
+    xs = (oa * l_v + oc * b_v + oe, oa * r_v + oc * b_v + oe, oa * l_v + oc * t_v + oe, oa * r_v + oc * t_v + oe)
+    ys = (ob * l_v + od * b_v + of_, ob * r_v + od * b_v + of_, ob * l_v + od * t_v + of_, ob * r_v + od * t_v + of_)
+    if not (all(isfinite(v) for v in xs) and all(isfinite(v) for v in ys) and isfinite(slack)):
+        return False
+    return (max(xs) - min(xs) + slack) < _FAST_CULL_PT and (max(ys) - min(ys) + slack) < _FAST_CULL_PT
+
+
 def _path_object_segments(
-    path: pdfium_c.FPDF_PAGEOBJECT, index: int, matrix: Matrix, to_display: Callable[[Box], Box], room: _SegmentRoom
+    path: pdfium_c.FPDF_PAGEOBJECT,
+    index: int,
+    matrix: Matrix,
+    to_display: Callable[[Box], Box],
+    room: _SegmentRoom,
+    *,
+    outer: Matrix = IDENTITY,
 ) -> list[RawSegment] | None:
     """The segments of path object ``index`` (matrix to page space ``matrix``), or None if its geometry is not finite.
 
@@ -950,8 +999,29 @@ def _path_object_segments(
     renders the rest of it), so only that path is skipped.
     """
     label = f"object {index}"
-    paint = _read_paint(path, label)
-    points = _read_points(path, label, room)
+    fill_mode, stroke = ctypes.c_int(), ctypes.c_int()
+    if not pdfium_c.FPDFPath_GetDrawMode(path, fill_mode, stroke) or fill_mode.value not in _FILL_MODES:
+        raise PdfiumFailure(f"read the draw mode of {label}")
+    width = ctypes.c_float()
+    if stroke.value and not pdfium_c.FPDFPageObj_GetStrokeWidth(path, width):
+        raise PdfiumFailure(f"read the stroke width of {label}")
+    count = pdfium_c.FPDFPath_CountSegments(path)
+    if count < 0:
+        raise PdfiumFailure(f"count the path segments of {label}")
+    room.take(count, label)
+    if all(math.isfinite(v) for v in matrix) and math.isfinite(width.value):
+        unpainted = not stroke.value and fill_mode.value == pdfium_c.FPDF_FILLMODE_NONE
+        if count > 0 and (unpainted or _culled_by_outer_bounds(path, outer)):
+            return []
+    paint = PathPaint(
+        stroked=bool(stroke.value),
+        filled=fill_mode.value != pdfium_c.FPDF_FILLMODE_NONE,
+        stroke_width=width.value,
+        dashed=bool(stroke.value) and _leaves_gaps(_read_dashes(path, label)),
+        stroke_rgba=read_rgba(pdfium_c.FPDFPageObj_GetStrokeColor, path, f"stroke colour of {label}"),
+        fill_rgba=read_rgba(pdfium_c.FPDFPageObj_GetFillColor, path, f"fill colour of {label}"),
+    )
+    points = _read_counted_points(path, count, label)
     try:
         return path_segments(points, matrix=matrix, paint=paint, object_index=index, to_display=to_display)
     except NonFiniteGeometry:
@@ -1017,10 +1087,9 @@ def _collect_segments(
     segments: list[RawSegment] = []
     skipped = 0
     room = _SegmentRoom()
-    placed = _placed_objects(page_raw, pdfium_c.FPDF_PAGEOBJ_PATH, max_objects=MAX_PAGE_OBJECTS, objects=walked)
     try:
-        for index, path, matrix in placed:
-            found = _path_object_segments(path, index, matrix, to_display, room)
+        for index, path, own, outer in _objects_in_forms(walked, pdfium_c.FPDF_PAGEOBJ_PATH):
+            found = _path_object_segments(path, index, own.then(outer), to_display, room, outer=outer)
             if found is None:
                 skipped += 1
             else:
