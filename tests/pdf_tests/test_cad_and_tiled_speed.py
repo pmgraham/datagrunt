@@ -216,3 +216,72 @@ class TestNode2CadPathAndFontFastPath:
         md = doc.to_markdown()
         assert "DIM-000" in md and "DIM-119" in md
         assert font_queries <= 2, f"Expected <=2 font FFI queries on 120 callouts, got {font_queries}"
+
+
+class TestNode3SharedRenderAndFastPng:
+    """Bundle page rendering reuses one DocumentHandle, walks objects once per page, and encodes lossless PNG fast."""
+
+    def test_grey_png_is_pixel_exact_across_edge_and_16mp_dimensions(self) -> None:
+        import time
+
+        from datagrunt.pdf._png import grey_png_bytes
+
+        for w, h in ((1, 1), (7, 3), (257, 19)):
+            raw = bytes(((i * 73 + 19) & 0xFF) for i in range(w * h))
+            encoded = grey_png_bytes(w, h, raw)
+            decoded = Image.open(io.BytesIO(encoded))
+            assert decoded.mode == "L"
+            assert decoded.size == (w, h)
+            assert decoded.tobytes() == raw
+
+        # 16MP CAD grayscale sheet speed + lossless pixel check
+        w16, h16 = 4964, 3212
+        cad_pixels = (b"\xff" * 4900 + b"\x00" * 64) * h16
+        t0 = time.perf_counter()
+        png16 = grey_png_bytes(w16, h16, cad_pixels)
+        elapsed = time.perf_counter() - t0
+        assert elapsed < 0.35, f"16MP grey_png_bytes took {elapsed:.3f}s"
+        dec16 = Image.open(io.BytesIO(png16))
+        assert dec16.size == (w16, h16)
+        assert dec16.tobytes() == cad_pixels
+
+    def test_write_bundle_reuses_one_document_handle_and_walks_once_per_rendered_page(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from datagrunt.pdf.bundle import write_bundle
+
+        pdf_file = tmp_path / "six_pages.pdf"
+        c = canvas.Canvas(str(pdf_file), pagesize=(612, 792))
+        for p in range(6):
+            c.setFont("Helvetica", 12)
+            c.drawString(72, 700, f"CAD drawing sheet {p + 1}")
+            c.line(72, 680, 540, 680)
+            c.showPage()
+        c.save()
+
+        doc = extract_document(pdf_file, ocr="never", sandbox=False)
+
+        open_calls = 0
+        walk_calls = 0
+        real_open = pdfium_engine.open_document
+        real_walk = pdfium_engine._page_objects
+
+        def counting_open(*args, **kwargs):
+            nonlocal open_calls
+            open_calls += 1
+            return real_open(*args, **kwargs)
+
+        def counting_walk(*args, **kwargs):
+            nonlocal walk_calls
+            walk_calls += 1
+            return real_walk(*args, **kwargs)
+
+        monkeypatch.setattr(pdfium_engine, "open_document", counting_open)
+        monkeypatch.setattr(pdfium_engine, "_page_objects", counting_walk)
+
+        written = write_bundle(doc, tmp_path / "bundle", source=pdf_file, dpi=100, render_pages=True, sandbox=False)
+
+        assert len(written.pages) == 6
+        assert all(pg.page_image is not None and pg.page_image.image_path is not None for pg in written.pages)
+        assert open_calls == 1, f"Expected 1 open_document across 6 rendered pages, got {open_calls}"
+        assert walk_calls == 6, f"Expected 6 _page_objects walks (1/page), got {walk_calls}"

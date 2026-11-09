@@ -1219,7 +1219,13 @@ def loaded_page(handle: DocumentHandle, index: int) -> Iterator[tuple[pdfium.Pdf
             page.close()
 
 
-def image_refusal(page: pdfium.PdfPage, geometry: PageGeometry, *, max_objects: int) -> str | None:
+def image_refusal(
+    page: pdfium.PdfPage,
+    geometry: PageGeometry,
+    *,
+    max_objects: int,
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
+) -> str | None:
     """Why the loaded ``page`` must not be rendered, naming the object; None when it may be (#369 A5a).
 
     The render guard. It walks the page's objects as :func:`page_images`
@@ -1256,7 +1262,7 @@ def image_refusal(page: pdfium.PdfPage, geometry: PageGeometry, *, max_objects: 
         raise TypeError(f"geometry must be a PageGeometry, got {type(geometry).__name__}")
     int_at_least("max_objects", max_objects, 1)
     with _PDFIUM_LOCK:
-        placed = _placed_objects(page.raw, pdfium_c.FPDF_PAGEOBJ_IMAGE, max_objects=max_objects)
+        placed = _placed_objects(page.raw, pdfium_c.FPDF_PAGEOBJ_IMAGE, max_objects=max_objects, objects=objects)
         try:
             for outcome in image_outcomes(placed, page.raw, geometry.page_box, _display_mapping(geometry)):
                 if outcome.render_refusal is not None:
