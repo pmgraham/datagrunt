@@ -1014,11 +1014,11 @@ def _rebound(loader: Callable[[], _T] | None, source: PDFSource, *, sandbox: boo
     if not isinstance(owner, (PageDraw, PageRender)):
         return loader
     rebind_id = owner.sha256 == source.sha256 and owner.identity != source.identity
-    rebind_sandbox = sandbox and not owner.sandbox
+    rebind_sandbox = owner.sandbox != sandbox
     if not rebind_id and not rebind_sandbox:
         return loader
     new_id = source.identity if rebind_id else owner.identity
-    updated = dataclasses.replace(owner, identity=new_id, sandbox=sandbox or owner.sandbox)
+    updated = dataclasses.replace(owner, identity=new_id, sandbox=sandbox)
     method: Callable[[], _T] = MethodType(getattr(loader, "__func__"), updated)
     return method
 
