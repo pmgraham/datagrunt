@@ -3320,3 +3320,42 @@ def test_imports_nothing_inside_functions_and_nothing_from_core():
     assert functions, "vacuous: the module defines no function"
     assert nested == []
     assert [module for module in modules if module.startswith("datagrunt.core")] == []
+
+
+class TestNode4SchemaMarkers:
+    def test_describe_records_informational_and_key_normalizer_and_stays_hashable(self):
+        from datagrunt.rationalization import Informational, Key
+
+        class CatalogRow(BaseModel):
+            sku: Annotated[str, Key(normalizer="alnum_upper")]
+            description: Annotated[str | None, Informational()] = None
+            price: Decimal
+
+        spec = describe(CatalogRow)
+        by_name = {f.name: f for f in spec.fields}
+        assert by_name["sku"].key_normalizer == "alnum_upper"
+        assert by_name["sku"].informational is False
+        assert by_name["description"].informational is True
+        assert hash(spec) == hash(describe(CatalogRow))
+
+    def test_rejects_key_and_informational_on_same_field_or_non_str_alnum_upper(self):
+        from datagrunt.rationalization import Informational, Key
+
+        class BadBoth(BaseModel):
+            sku: Annotated[str, Key, Informational]
+
+        class BadIntKey(BaseModel):
+            line_no: Annotated[int, Key(normalizer="alnum_upper")]
+
+        class SubMeta(BaseModel):
+            author: str
+
+        class BadModelInfo(BaseModel):
+            meta: Annotated[SubMeta | None, Informational] = None
+
+        with pytest.raises(RationalizationError, match="Informational"):
+            describe(BadBoth)
+        with pytest.raises(RationalizationError, match="alnum_upper"):
+            describe(BadIntKey)
+        with pytest.raises(RationalizationError, match="Informational"):
+            describe(BadModelInfo)

@@ -87,6 +87,7 @@ import re
 import typing
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from dataclasses import field as dc_field
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum, Flag
@@ -109,7 +110,7 @@ from pydantic.fields import FieldInfo
 from datagrunt.rationalization._canonical import canonical_json, sha256_hex
 from datagrunt.rationalization._refs import DEFS_POINTER, DEFS_PREFIX, UNREAD_KEYWORDS, def_name, json_pointer
 from datagrunt.rationalization.exceptions import RationalizationError
-from datagrunt.rationalization.markers import _KeyMarker
+from datagrunt.rationalization.markers import KeyNormalizer, _check_normalizer, _InformationalMarker, _KeyMarker
 
 MAX_DEPTH = 32
 """Levels on one path: models and lists for :func:`describe`, objects and arrays for :func:`check_json_schema`."""
@@ -297,6 +298,8 @@ class FieldSpec:
     required: bool
     child: "ModelSpec | None"
     scalar: ScalarSpec | None
+    informational: bool = False
+    key_normalizer: KeyNormalizer | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not isinstance(self.wire_name, str):
@@ -323,6 +326,20 @@ class FieldSpec:
             )
         if self.optional and self.kind in _LIST_KINDS:
             raise ValueError(f"FieldSpec {self.name!r}: a list field cannot be Optional")
+        if not isinstance(self.informational, bool):
+            raise TypeError(f"FieldSpec {self.name!r}: informational must be a bool, got {_brief(self.informational)}")
+        if self.informational and self.kind in _MODEL_KINDS:
+            raise ValueError(
+                f"FieldSpec {self.name!r}: Informational supports scalar and scalar_list fields, not {self.kind}"
+            )
+        _check_normalizer(self.key_normalizer)
+        if self.key_normalizer is not None:
+            if self.informational:
+                raise ValueError(f"FieldSpec {self.name!r}: an Informational field cannot have a key_normalizer")
+            if self.kind != "scalar" or self.optional or self.scalar is None or self.scalar.base is not str:
+                raise ValueError(
+                    f"FieldSpec {self.name!r}: key_normalizer={self.key_normalizer!r} requires a non-Optional str key"
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -344,6 +361,7 @@ class ModelSpec:
     model: type[BaseModel]
     keys: KeySpec
     fields: tuple[FieldSpec, ...]
+    key_normalizers: tuple[KeyNormalizer | None, ...] = dc_field(init=False, compare=False, repr=False, default=())
 
     def __post_init__(self) -> None:
         if not _is_model_class(self.model):
@@ -362,6 +380,12 @@ class ModelSpec:
             field = by_name.get(name)
             if field is None or field.kind != "scalar" or field.optional:
                 raise ValueError(f"ModelSpec {self.model.__name__}: key {name!r} names no non-Optional scalar field")
+            if field.informational:
+                raise ValueError(f"ModelSpec {self.model.__name__}: key {name!r} cannot be Informational")
+        for field in self.fields:
+            if field.key_normalizer is not None and field.name not in self.keys.fields:
+                raise ValueError(f"ModelSpec {self.model.__name__}: non-key {field.name!r} has key_normalizer")
+        object.__setattr__(self, "key_normalizers", tuple(by_name[name].key_normalizer for name in self.keys.fields))
 
 
 @dataclass(frozen=True, slots=True)
@@ -773,6 +797,24 @@ def _describe_model(
     return ModelSpec(model=model, keys=_model_keys(model, path, explicit, fields), fields=fields)
 
 
+def _field_markers(info: FieldInfo, shape: "_Shape", path: str) -> tuple[KeyNormalizer | None, bool]:
+    """Extract ``(key_normalizer, informational)`` from ``info.metadata`` and reject illegal combinations."""
+    key_markers = [item for item in info.metadata if isinstance(item, _KeyMarker)]
+    informational = any(isinstance(item, _InformationalMarker) for item in info.metadata)
+    if key_markers and informational:
+        raise RationalizationError(f"{path}: a field cannot be both Key and Informational")
+    if informational and shape.model is not None:
+        raise RationalizationError(f"{path}: Informational supports scalar and scalar-list fields, not model fields")
+    norm = key_markers[0].normalizer if len(key_markers) == 1 else None
+    if norm is not None:
+        _check_key_field(info, path)
+        if shape.scalar is None or shape.scalar.base is not str:
+            raise RationalizationError(
+                f"{path}: Key(normalizer={norm!r}) requires a str key field, not {_type_name(info.annotation)}"
+            )
+    return norm, informational
+
+
 def _describe_field(
     model: type[BaseModel],
     name: str,
@@ -787,6 +829,7 @@ def _describe_field(
     if info.discriminator is not None or _has_discriminator(info.metadata):
         raise RationalizationError(f"{path}: {_DISCRIMINATED}")
     shape = _shape(info.annotation, path)
+    key_normalizer, informational = _field_markers(info, shape, path)
     if isinstance(info.description, str) and (found := _R8_ESCAPED.search(info.description)) is not None:
         raise RationalizationError(
             f"{path}: its description holds U+{ord(found.group(0)[0]):04X}, a code point R8 escapes: "
@@ -809,6 +852,8 @@ def _describe_field(
         required=info.is_required(),
         child=child,
         scalar=shape.scalar if child is None else None,
+        informational=informational,
+        key_normalizer=key_normalizer,
     )
     _check_static_default(model, info, spec, path)
     return spec
@@ -1025,6 +1070,11 @@ def _strip_annotated(annotation: object, path: str) -> object:
         raise RationalizationError(
             f"{path}: Key must mark the field itself, as Annotated[str, Key], not a type inside it"
         )
+    if any(isinstance(item, _InformationalMarker) for item in metadata):
+        raise RationalizationError(
+            f"{path}: Informational must mark the field itself, as Annotated[str | None, Informational], "
+            "not a type inside it"
+        )
     if _has_discriminator(metadata):
         raise RationalizationError(f"{path}: {_DISCRIMINATED}")
     return inner
@@ -1125,7 +1175,10 @@ def _model_keys(
     marked = _marked_keys(model, path)
     namespace = _namespace(path, marked)
     names = _key_fields(model, path, marked, explicit, fields)
+    by_name = {field.name: field for field in fields}
     for name in names:
+        if by_name[name].informational:
+            raise RationalizationError(f"{path}.{name}: a field cannot be both Key and Informational")
         _check_key_field(model.model_fields[name], f"{path}.{name}")
     return KeySpec(fields=names, namespace=namespace)
 

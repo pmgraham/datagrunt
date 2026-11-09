@@ -103,17 +103,17 @@ import string
 import sys
 import unicodedata
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from fractions import Fraction
-from typing import Literal, TypeAlias, cast, get_args
+from typing import Any, Literal, TypeAlias, cast, get_args
 
 from datagrunt.pdf.elements import BulletList, DocumentElement, Figure, Heading, KeyValue, PDFDocument, Table
-from datagrunt.rationalization.consensus import ConsensusItem, ConsensusResult, normalized_text
-from datagrunt.rationalization.envelope import Envelope, element_text
+from datagrunt.rationalization.consensus import ConsensusItem, ConsensusResult, alnum_upper_text, normalized_text
+from datagrunt.rationalization.envelope import Envelope, element_text, escape
 from datagrunt.rationalization.runner import RunOutcome
-from datagrunt.rationalization.schema import ModelSpec, PreparedSchema
+from datagrunt.rationalization.schema import MAX_DEPTH, ModelSpec, PreparedSchema
 from datagrunt.rationalization.units import Unit
 
 GroundedStatus: TypeAlias = Literal[
@@ -169,6 +169,8 @@ _TABLE_ROW = re.compile(r"\|(?: (?:\\.|[^\\|])*? \|)+")
 _TABLE_RULE = re.compile(r"\| ---(?: \| ---)* \|")
 _KEY_VALUE = re.compile(r"\*\*((?:\\.|[^\\*])+):\*\* (.*)", re.DOTALL)
 _LIST_ENTRY = re.compile(r"(?:-|[0-9]+[.)]) ")
+_ASCII_PUNCT_CHARS = frozenset(string.punctuation + string.whitespace)
+_CODE_BRIDGES = frozenset("-_./ ")
 
 
 _UNSPACED_BLOCKS: tuple[tuple[int, int], ...] = (
@@ -370,7 +372,10 @@ def unescape_markdown(text: str) -> str:
     Raises:
         TypeError: If ``text`` is not a ``str``.
     """
-    return _ESCAPE_OR_BREAK.sub(_unescaped, _check_str("text", text))
+    source = _check_str("text", text)
+    if "\\" not in source and "<br>" not in source:
+        return source
+    return _ESCAPE_OR_BREAK.sub(_unescaped, source)
 
 
 def _unescaped(match: re.Match[str]) -> str:
@@ -468,6 +473,8 @@ def ground(
     headers = _header_elements(units, envelopes)
     vision_pages = _vision_pages(documents, units, envelopes)
     checks = _key_checks(schema.spec)
+    root_norms = _root_key_normalizers(schema.spec)
+    child_specs = _child_key_specs(schema.spec)
     model_ids = tuple(model[0] for model in outcome.models)
     texts: dict[str, _UnitTexts] = {}
     items: list[GroundedItem] = []
@@ -480,7 +487,7 @@ def ground(
             vision = vision_pages[unit.doc_id]
             witness = _multimodal_witness_elements(unit, env, documents[unit.doc_id])
             unit_texts = texts[item.unit_id] = _UnitTexts(unit, env, headers, vision, witness)
-        found = _item_reasons(item, unit_texts, checks)
+        found = _item_reasons(item, unit_texts, checks, root_norms=root_norms, child_specs=child_specs)
         items.append(GroundedItem(item=item, status=_status(item.status, bool(found)), reasons=found))
     return GroundingResult(items=tuple(items), empty_units=_empty_units(consensus, outcome, units))
 
@@ -624,6 +631,7 @@ class _UnitTexts:
         "_numbers",
         "_own",
         "_plain",
+        "_plain_sets",
         "_quoted",
         "_raw",
         "_tokens",
@@ -651,6 +659,7 @@ class _UnitTexts:
         self._raw: dict[str, tuple[str, ...]] = {}
         self._quoted: dict[str, tuple[str, ...]] = {}
         self._plain: dict[str, tuple[str, ...]] = {}
+        self._plain_sets: dict[str, frozenset[str]] = {}
         self._numbers: dict[str, frozenset[Decimal]] = {}
         self._tokens: dict[str, tuple[Counter[str], ...]] = {}
         self._vision_pages = vision_pages
@@ -704,12 +713,29 @@ class _UnitTexts:
                     for each in _fields(element, element_text(element))
                 )
             else:
-                found = tuple(
-                    _comparable(unescape_markdown(each))
-                    for element, text in zip(self._elements[element_id], self.raw(element_id), strict=True)
-                    for each in _fields(element, text)
-                )
+                elem_list = self._elements[element_id]
+                if len(elem_list) == 1 and isinstance(elem_list[0], Table):
+                    tbl = elem_list[0]
+                    hdr = tbl.headers if tbl.headers else ("",) * len(tbl.rows[0])
+                    found = tuple(
+                        _comparable(c if (c.isascii() and c.isprintable()) else escape(c))
+                        for row in (hdr, *tbl.rows)
+                        for c in row
+                    )
+                else:
+                    found = tuple(
+                        _comparable(unescape_markdown(each))
+                        for element, text in zip(elem_list, self.raw(element_id), strict=True)
+                        for each in _fields(element, text)
+                    )
             self._plain[element_id] = found
+        return found
+
+    def plain_set(self, element_id: str) -> frozenset[str]:
+        """Frozenset of :meth:`plain`'s texts for O(1) exact field-equality key checks."""
+        found = self._plain_sets.get(element_id)
+        if found is None:
+            found = self._plain_sets[element_id] = frozenset(self.plain(element_id))
         return found
 
     def numbers(self, element_id: str) -> frozenset[Decimal]:
@@ -766,6 +792,20 @@ def _cut(element: DocumentElement, shown: str) -> tuple[list[str], int]:
     return [shown], 1  # a paragraph's text, or a figure's caption
 
 
+def _table_cells_plain(lines: list[str]) -> list[str]:
+    """Fast path for :func:`_table_cells` when ``shown`` contains no backslash escapes."""
+    cells: list[str] = []
+    for line in (lines[0], *lines[2:]):
+        parts = line.split("|")
+        if len(parts) < 3 or parts[0] or parts[-1]:
+            return []
+        middle = parts[1:-1]
+        if not all(len(p) >= 2 and p[0] == " " and p[-1] == " " for p in middle):
+            return []
+        cells.extend(p[1:-1] for p in middle)
+    return cells
+
+
 def _table_cells(shown: str) -> list[str]:
     """The cells of a table's shown text, row by row: its header row, then its body rows (its rule left out).
 
@@ -775,6 +815,8 @@ def _table_cells(shown: str) -> list[str]:
     lines = shown.split("\n")
     if len(lines) < 2 or _TABLE_RULE.fullmatch(lines[1]) is None:
         return []
+    if "\\" not in shown:
+        return _table_cells_plain(lines)
     cells: list[str] = []
     for line in (lines[0], *lines[2:]):
         if _TABLE_ROW.fullmatch(line) is None:
@@ -872,6 +914,8 @@ def _key_checks(spec: ModelSpec) -> tuple[tuple[int, str, _KeyKind], ...]:
 def _peer_family_quotes(item: ConsensusItem, model_id: str) -> tuple[str, ...]:
     """Quotes supplied by supporting models from distinct known model families (#473 visual witness)."""
     own_family = item.families.get(model_id, "unknown")
+    if own_family == "unknown":
+        return ()
     return tuple(
         quote
         for peer_id, peer_votes in item.model_votes.items()
@@ -882,29 +926,147 @@ def _peer_family_quotes(item: ConsensusItem, model_id: str) -> tuple[str, ...]:
     )
 
 
+_ChildKeySpec: TypeAlias = tuple[tuple[tuple[str, bool], ...], str, _KeyKind, str | None]
+
+
+def _root_key_normalizers(spec: ModelSpec) -> Mapping[str, str | None]:
+    by_name = {f.name: f.key_normalizer for f in spec.fields}
+    return {name: by_name.get(name) for name in spec.keys.fields}
+
+
+def _child_key_specs(
+    spec: ModelSpec, prefix: tuple[tuple[str, bool], ...] = (), depth: int = 1
+) -> tuple[_ChildKeySpec, ...]:
+    """Collect checked scalar keys declared on nested ``model`` and ``model_list`` fields."""
+    if depth > MAX_DEPTH:
+        return ()
+    out: list[_ChildKeySpec] = []
+    for field_spec in spec.fields:
+        child = field_spec.child
+        if child is None:
+            continue
+        step = (*prefix, (field_spec.name, field_spec.kind == "model_list"))
+        if field_spec.kind == "model_list" and child.keys.fields:
+            by_name = {cf.name: cf for cf in child.fields}
+            for _, k_name, k_kind in _key_checks(child):
+                dotted = ".".join([*(n for n, _ in step), k_name])
+                out.append(((*step, (k_name, False)), dotted, k_kind, by_name[k_name].key_normalizer))
+        out.extend(_child_key_specs(child, step, depth + 1))
+    return tuple(out)
+
+
+def _extract_path_values(node: object, steps: tuple[tuple[str, bool], ...]) -> list[object]:
+    """Extract scalar key values along ``steps`` from one JSON-mode vote dict."""
+    current: list[object] = [node]
+    for attr_name, is_list in steps:
+        nxt: list[object] = []
+        for obj in current:
+            if not isinstance(obj, Mapping) or attr_name not in obj or obj[attr_name] is None:
+                continue
+            val = obj[attr_name]
+            if is_list:
+                if isinstance(val, Sequence) and not isinstance(val, (str, bytes)):
+                    nxt.extend(val)
+            else:
+                nxt.append(val)
+        current = nxt
+    return current
+
+
+def _coerce_key_val(raw: object, kind: _KeyKind) -> object:
+    if kind == "number":
+        return raw if type(raw) in (int, Decimal) else Decimal(str(raw))
+    return str(raw)
+
+
+def _extract_two_step_values(
+    votes: Sequence[Mapping[str, Any]], list_attr: str, key_attr: str, kind: _KeyKind
+) -> tuple[object, ...]:
+    """Fast path for depth-1 ``model_list`` child keys (e.g. ``components[].part_number``)."""
+    if len(votes) == 1 and type(votes[0]) is dict and kind == "text":
+        rows_fast = votes[0].get(list_attr)
+        if type(rows_fast) is list:
+            fast = tuple(r[key_attr] for r in rows_fast if type(r) is dict and type(r.get(key_attr)) is str)
+            if len(fast) == len(rows_fast):
+                return fast
+    vals: list[object] = []
+    for vote in votes:
+        rows = vote.get(list_attr) if isinstance(vote, Mapping) else None
+        if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+            continue
+        vals.extend(
+            _coerce_key_val(row[key_attr], kind)
+            for row in rows
+            if isinstance(row, Mapping) and row.get(key_attr) is not None
+        )
+    return tuple(dict.fromkeys(vals))
+
+
+def _extract_spec_values(
+    votes: Sequence[Mapping[str, Any]], steps: tuple[tuple[str, bool], ...], kind: _KeyKind
+) -> tuple[object, ...]:
+    """Extract distinct coerced child key values for ``steps`` across ``votes``."""
+    if len(steps) == 2 and steps[0][1] and not steps[1][1]:
+        return _extract_two_step_values(votes, steps[0][0], steps[1][0], kind)
+    return tuple(dict.fromkeys(_coerce_key_val(x, kind) for v in votes for x in _extract_path_values(v, steps)))
+
+
+def _raw_root_values(votes: Sequence[Mapping[str, Any]], name: str, kind: _KeyKind) -> tuple[object, ...]:
+    """Extract distinct raw root key values across ``votes`` when ``key_normalizer`` is set."""
+    return tuple(dict.fromkeys(_coerce_key_val(v[name], kind) for v in votes if isinstance(v, Mapping) and name in v))
+
+
 def _item_reasons(
-    item: ConsensusItem, texts: _UnitTexts, checks: tuple[tuple[int, str, _KeyKind], ...]
+    item: ConsensusItem,
+    texts: _UnitTexts,
+    checks: tuple[tuple[int, str, _KeyKind], ...],
+    *,
+    root_norms: Mapping[str, str | None] | None = None,
+    child_specs: tuple[_ChildKeySpec, ...] = (),
 ) -> tuple[GroundingReason, ...]:
     """Every supporting model's reasons, in model order (module notes, 4)."""
+    norms = root_norms or {}
+    has_norm = any(norms.values())
     found: list[GroundingReason] = []
-    seen: dict[tuple[tuple[str, ...], tuple[str, ...], str], list[GroundingReason]] = {}
+    seen: dict[tuple[object, ...], list[GroundingReason]] = {}
     for model_id, votes in item.model_votes.items():
-        if votes:
-            element_ids, quotes = item.element_ids_by_model[model_id], item.quotes_by_model[model_id]
-            cache_tag = item.families.get(model_id, "") if texts.multimodal else ""
-            evidence = (element_ids, quotes, cache_tag)
-            cached = seen.get(evidence)
-            if cached is not None:
-                found.extend(replace(reason, model_id=model_id) for reason in cached)
-                continue
-            cited = [element_id for element_id in element_ids if texts.citable(element_id)]
-            peer_quotes = _peer_family_quotes(item, model_id) if texts.multimodal and cited else ()
-            own: list[GroundingReason] = []
-            own.extend(_cited_reasons(model_id, element_ids, texts))
-            own.extend(_quote_reasons(model_id, quotes, cited, texts, keyless=not checks, peer_quotes=peer_quotes))
-            own.extend(_key_reasons(model_id, item.key, checks, cited, quotes, texts, peer_quotes=peer_quotes))
-            seen[evidence] = own
-            found.extend(own)
+        if not votes:
+            continue
+        element_ids, quotes = item.element_ids_by_model[model_id], item.quotes_by_model[model_id]
+        cache_tag = item.families.get(model_id, "") if texts.multimodal else ""
+        root_sig = (
+            tuple(_raw_root_values(votes, name, kind) if norms.get(name) else () for _, name, kind in checks)
+            if has_norm
+            else ()
+        )
+        child_vals = tuple(_extract_spec_values(votes, steps, kind) for steps, _, kind, _ in child_specs)
+        evidence = (element_ids, quotes, cache_tag, root_sig, child_vals)
+        cached = seen.get(evidence)
+        if cached is not None:
+            found.extend(replace(reason, model_id=model_id) for reason in cached)
+            continue
+        cited = [element_id for element_id in element_ids if texts.citable(element_id)]
+        peer_quotes = _peer_family_quotes(item, model_id) if texts.multimodal and cited else ()
+        own: list[GroundingReason] = []
+        own.extend(_cited_reasons(model_id, element_ids, texts))
+        own.extend(_quote_reasons(model_id, quotes, cited, texts, keyless=not checks, peer_quotes=peer_quotes))
+        own.extend(
+            _key_reasons(
+                model_id,
+                item.key,
+                checks,
+                cited,
+                quotes,
+                texts,
+                peer_quotes=peer_quotes,
+                root_raw=root_sig,
+                root_norms=norms,
+                child_specs=child_specs,
+                child_vals=child_vals,
+            )
+        )
+        seen[evidence] = own
+        found.extend(own)
     return tuple(found)
 
 
@@ -980,6 +1142,42 @@ def _quote_found(quote: str, cited: list[str], texts: _UnitTexts, peer_comp: tup
     return any(quote in pq or _containment(wanted, _tokens(pq)) >= VISION_CONTAINMENT for pq in peer_comp)
 
 
+def _valid_code_gap(gap: str) -> bool:
+    """Whether ``gap`` may bridge characters inside one identifier (never across ``,``, ``:``, ``;``, ``()``)."""
+    if not gap:
+        return True
+    return all(ch in _CODE_BRIDGES for ch in gap) and sum(ch != " " for ch in gap) <= 1
+
+
+def _code_edge_glued(text: str, start: int, end: int) -> bool:
+    """Whether ``text[start:end + 1]`` is glued to adjacent ASCII alnum directly or across ``-`` / ``_``."""
+    if start > 0 and text[start - 1] in _ASCII_ALNUM:
+        return True
+    if end + 1 < len(text) and text[end + 1] in _ASCII_ALNUM:
+        return True
+    if start >= 2 and text[start - 1] in "-_" and text[start - 2] in _ASCII_ALNUM:
+        return True
+    return end + 2 < len(text) and text[end + 1] in "-_" and text[end + 2] in _ASCII_ALNUM
+
+
+def _set_off_alnum_upper(wanted: str, text: str) -> bool:
+    """Boundary-safe ``alnum_upper`` match against code tokens in ``text``."""
+    target = alnum_upper_text(wanted)
+    if not target:
+        return False
+    kept = [(idx, uch) for idx, ch in enumerate(text) if ch not in _ASCII_PUNCT_CHARS for uch in ch.upper()]
+    joined = "".join(ch for _, ch in kept)
+    klen = len(target)
+    pos = joined.find(target)
+    while pos >= 0:
+        start_idx, end_idx = kept[pos][0], kept[pos + klen - 1][0]
+        gaps_ok = all(_valid_code_gap(text[kept[k][0] + 1 : kept[k + 1][0]]) for k in range(pos, pos + klen - 1))
+        if gaps_ok and not _code_edge_glued(text, start_idx, end_idx):
+            return True
+        pos = joined.find(target, pos + 1)
+    return False
+
+
 def _key_reasons(
     model_id: str,
     key: tuple[object, ...],
@@ -989,33 +1187,61 @@ def _key_reasons(
     texts: _UnitTexts,
     *,
     peer_quotes: tuple[str, ...] = (),
+    root_raw: tuple[tuple[object, ...], ...] = (),
+    root_norms: Mapping[str, str | None] | None = None,
+    child_specs: tuple[_ChildKeySpec, ...] = (),
+    child_vals: tuple[tuple[object, ...], ...] = (),
 ) -> list[GroundingReason]:
-    """One model's reasons about the item's key values (module notes, 3), key by key: each written in a field of an
-    element it cited (else ``key_not_found``), and within one of its own quotes (else ``key_not_quoted``)."""
-    if not checks:
+    """One model's reasons about the item's root and child-list key values (module notes, 3)."""
+    if not checks and not child_specs:
         return []
+    norms = root_norms or {}
     read = tuple(_comparable(unescape_markdown(quote)) for quote in quotes)
     peer_plain = tuple(_comparable(unescape_markdown(pq)) for pq in peer_quotes) if peer_quotes else ()
-    has_num = any(kind == "number" for *_, kind in checks)
-    numbers = frozenset().union(*map(numeric_values, read)) if has_num else None
+    has_num = any(kind == "number" for *_, kind in checks) or any(kind == "number" for _, _, kind, _ in child_specs)
     peer_numbers = frozenset().union(*map(numeric_values, peer_plain)) if has_num and peer_plain else None
+    quote_num_cache: list[frozenset[Decimal] | None] = [None] * len(read)
     found: list[GroundingReason] = []
-    for position, name, kind in checks:
-        value = key[position]
-        if not _key_found(value, kind, cited, texts, peer_plain, peer_numbers):
+    for idx, (position, name, kind) in enumerate(checks):
+        norm = norms.get(name)
+        raw_vals = root_raw[idx] if idx < len(root_raw) and root_raw[idx] else (key[position],)
+        if not all(_key_found(val, kind, cited, texts, peer_plain, peer_numbers, norm) for val in raw_vals):
             found.append(GroundingReason("key_not_found", model_id, key_field=name))
-        if quotes and not _key_quoted(value, kind, read, numbers):  # a model without a quote is no_quotes
+        if quotes and not all(_key_quoted(val, kind, read, quote_num_cache, norm) for val in raw_vals):
             found.append(GroundingReason("key_not_quoted", model_id, key_field=name))
+    for (_, dotted, kind, norm), c_vals in zip(child_specs, child_vals, strict=True):
+        if c_vals and not all(_key_found(val, kind, cited, texts, peer_plain, peer_numbers, norm) for val in c_vals):
+            found.append(GroundingReason("key_not_found", model_id, key_field=dotted))
     return found
 
 
-def _key_quoted(value: object, kind: _KeyKind, read: tuple[str, ...], numbers: frozenset[Decimal] | None) -> bool:
-    """Whether one key value lies within one of the model's quotes, ``read`` as characters (comparable): as text,
-    set off from ASCII letters and digits, or as one of their ``numbers``."""
+def _quote_has_number(value: object, read: tuple[str, ...], cache: list[frozenset[Decimal] | None]) -> bool:
+    """Lazily evaluate ``numeric_values`` quote-by-quote so an early match skips later quotes."""
+    for idx, quote in enumerate(read):
+        nums = cache[idx]
+        if nums is None:
+            nums = cache[idx] = numeric_values(quote)
+        if value in nums:
+            return True
+    return False
+
+
+def _key_quoted(
+    value: object,
+    kind: _KeyKind,
+    read: tuple[str, ...],
+    quote_num_cache: list[frozenset[Decimal] | None],
+    normalizer: str | None = None,
+) -> bool:
+    """Whether one key value lies within one of the model's quotes, ``read`` as characters (comparable)."""
     if kind == "number":
-        return numbers is not None and value in numbers
+        return _quote_has_number(value, read, quote_num_cache)
     wanted = _comparable(cast(str, value))
-    return bool(wanted) and any(_set_off(wanted, text) for text in read)
+    if not wanted:
+        return False
+    if any(_set_off(wanted, text) for text in read):
+        return True
+    return normalizer == "alnum_upper" and any(_set_off_alnum_upper(wanted, text) for text in read)
 
 
 def _key_found(
@@ -1025,6 +1251,7 @@ def _key_found(
     texts: _UnitTexts,
     peer_plain: tuple[str, ...] = (),
     peer_numbers: frozenset[Decimal] | None = None,
+    normalizer: str | None = None,
 ) -> bool:
     """Whether one key value is written in one of the ``cited`` elements: as text, or as one of its numbers."""
     if kind == "number":
@@ -1034,9 +1261,19 @@ def _key_found(
     wanted = _comparable(cast(str, value))
     if not wanted:
         return False
+    if any(wanted in texts.plain_set(element_id) for element_id in cited):
+        return True
     if any(_set_off(wanted, text) for element_id in cited for text in texts.plain(element_id)):
         return True
-    return bool(peer_plain) and any(_set_off(wanted, pq) for pq in peer_plain)
+    if normalizer == "alnum_upper" and any(
+        _set_off_alnum_upper(wanted, text) for element_id in cited for text in texts.plain(element_id)
+    ):
+        return True
+    if peer_plain and any(_set_off(wanted, pq) for pq in peer_plain):
+        return True
+    return (
+        bool(peer_plain) and normalizer == "alnum_upper" and any(_set_off_alnum_upper(wanted, pq) for pq in peer_plain)
+    )
 
 
 def _set_off(wanted: str, text: str) -> bool:

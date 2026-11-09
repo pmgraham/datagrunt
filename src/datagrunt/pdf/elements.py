@@ -301,6 +301,14 @@ def _markdown_literal(text: str) -> list[str]:
     backslash is doubled), and a block marker left at the line start is
     escaped too. The caller joins the lines as its context requires.
     """
+    if "\n" not in text and "\r" not in text:
+        line = text.strip()
+        if not line:
+            return []
+        escaped = line if line.isalnum() else _MARKDOWN_SYNTAX_CHAR.sub(r"\\\g<0>", line)
+        if escaped[0] in "-+=" or escaped[0].isdigit():
+            escaped = _LINE_START_MARKER.sub(_escape_line_start, escaped, count=1)
+        return [escaped]
     lines = []
     for raw_line in _LINE_BREAK.split(text):
         line = raw_line.strip()

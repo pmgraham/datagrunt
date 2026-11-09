@@ -166,7 +166,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Final, NoReturn, cast
+from typing import Any, Final, Literal, NoReturn, TypeAlias, cast
 from urllib.parse import urlsplit
 
 from datagrunt.rationalization._canonical import canonical_copy, canonical_json
@@ -182,6 +182,7 @@ from datagrunt.rationalization._refs import (
 from datagrunt.rationalization.exceptions import RationalizationError
 from datagrunt.rationalization.providers.base import (
     ModelString,
+    PermanentProviderError,
     _Secret,
     _secret_problem,
     api_key_from_env,
@@ -232,6 +233,25 @@ GOOGLE_CLOUD_METHOD: Final = "rawPredict"
 MECHANISM = "json_schema"
 """How the answer's shape is enforced: ``output_config.format`` of type ``json_schema`` (structured outputs)."""
 
+SchemaMode: TypeAlias = Literal["native", "prompt", "prompt_fallback"]
+SCHEMA_MODES: tuple[SchemaMode, ...] = ("native", "prompt", "prompt_fallback")
+DEFAULT_SCHEMA_MODE: SchemaMode = "native"
+PROMPT_MECHANISM = "prompt"
+FALLBACK_MECHANISM = "prompt_fallback"
+_MECHANISM_BY_MODE: Mapping[SchemaMode, str] = MappingProxyType(
+    {"native": MECHANISM, "prompt": PROMPT_MECHANISM, "prompt_fallback": FALLBACK_MECHANISM}
+)
+_STRUCTURED_OUTPUT_400_TOKENS = (
+    "output_config",
+    "structured_output",
+    "structured output",
+    "allowedpartnermodelfeatures",
+    "json_schema",
+    "schema is too complex",
+    "too many optional",
+    "too many union",
+)
+
 SUPPORTED_FORMATS = frozenset(
     {"date-time", "time", "date", "duration", "email", "hostname", "uri", "ipv4", "ipv6", "uuid"}
 )
@@ -264,7 +284,9 @@ _FINISH_BY_STOP_REASON: Mapping[str, FinishReason] = MappingProxyType(
     }
 )
 _CACHE_TOKEN_FIELDS = ("cache_creation_input_tokens", "cache_read_input_tokens")
-_OPTIONS = frozenset({"base_url", "api_version", "temperature", "allow_insecure_http", "max_connections", "transport"})
+_OPTIONS = frozenset(
+    {"base_url", "api_version", "temperature", "allow_insecure_http", "max_connections", "transport", "schema_mode"}
+)
 _TYPED_KEYWORDS = ("type", "anyOf", "enum", "const")
 _OPTIONS_SHOWN = 10
 _JSON_TYPES = frozenset({"object", "array", "string", "integer", "number", "boolean", "null"})
@@ -358,6 +380,44 @@ def _check_api_version(value: object, temperature: float | None) -> str:
             f'api_version="{SAMPLING_API_VERSION}" for an older model that still takes one'
         )
     return value
+
+
+def _check_schema_mode(value: object) -> SchemaMode:
+    if type(value) is not str or value not in SCHEMA_MODES:
+        _refuse(f"schema_mode must be one of {', '.join(SCHEMA_MODES)}")
+    return value
+
+
+def _exceeds_limits(schema: Mapping[str, Any]) -> bool:
+    optional, union = parameter_counts(schema)
+    return optional > MAX_OPTIONAL_PARAMETERS or union > MAX_UNION_PARAMETERS
+
+
+def _prompt_system(request: ModelRequest) -> str:
+    base = request.system_prompt
+    if "The response schema, as JSON:" not in base:
+        schema_txt = canonical_json(dict(request.json_schema), subject="the response schema")
+        base = f"{base}\n\nThe response schema, as JSON:\n{schema_txt}"
+    return (
+        f"{base}\n\nRespond with a single raw JSON object matching the response schema, without Markdown code fences."
+    )
+
+
+def _strip_json_fence(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return text
+    lines = stripped.splitlines()
+    if len(lines) >= 2 and lines[0].startswith("```") and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1]).strip()
+    return text
+
+
+def _is_structured_output_400(error: PermanentProviderError) -> bool:
+    if error.status_code != 400:
+        return False
+    low = error.detail.lower()
+    return any(tok in low for tok in _STRUCTURED_OUTPUT_400_TOKENS)
 
 
 def _check_max_connections(value: object) -> int:
@@ -628,7 +688,7 @@ def _check_limits(optional: int, union: int) -> None:
     )
 
 
-def transform_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
+def transform_schema(schema: Mapping[str, Any], *, check_limits: bool = True) -> dict[str, Any]:
     """Return the schema structured outputs accept for the neutral ``schema`` (module notes, 3): a fresh object.
 
     Raises:
@@ -654,7 +714,8 @@ def transform_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
         for name, definition in definitions.items():
             walk.stack.append(_Node(definition, result["$defs"][name], json_pointer(DEFS_POINTER, name), 1))
     walk.run()
-    _check_limits(*parameter_counts(result))
+    if check_limits:
+        _check_limits(*parameter_counts(result))
     copy: dict[str, Any] = canonical_copy(result, subject="the transformed response schema")
     return copy
 
@@ -695,7 +756,7 @@ def _answer_text(message: Mapping[str, Any]) -> str | None:
     return "".join(texts) if texts else None
 
 
-def _parse_reply(reply: HttpReply) -> ProviderResponse:
+def _parse_reply(reply: HttpReply, *, allow_fence: bool = False) -> ProviderResponse:
     """The response for a 2xx reply (module notes, 4); never raises for what the model or the server sent."""
     message = reply.json
     if message is None:
@@ -705,7 +766,8 @@ def _parse_reply(reply: HttpReply) -> ProviderResponse:
     stop_reason = message.get("stop_reason")
     finish = _FINISH_BY_STOP_REASON.get(stop_reason) if isinstance(stop_reason, str) else None
     text = _answer_text(message)
-    content = parse_json_object(text) if text is not None and finish is not None else None
+    candidate = _strip_json_fence(text) if (text is not None and allow_fence) else text
+    content = parse_json_object(candidate) if candidate is not None and finish is not None else None
     return response(
         content=content,
         raw_text=reply.text if text is None else text,
@@ -781,7 +843,7 @@ class AnthropicProvider:
             has no explicit key; the message names the option or the variable and never shows a key.
     """
 
-    __slots__ = ("_http", "_max_concurrency", "_max_connections", "_model", "_route", "_temperature")
+    __slots__ = ("_http", "_max_concurrency", "_max_connections", "_model", "_route", "_schema_mode", "_temperature")
 
     def __init__(
         self,
@@ -794,11 +856,13 @@ class AnthropicProvider:
         allow_insecure_http: bool = False,
         max_connections: int = 8,
         transport: object = None,
+        schema_mode: SchemaMode = DEFAULT_SCHEMA_MODE,
     ) -> None:
         secret, problem = _wrap_key(api_key)
         del api_key  # a key given as text never sits in this frame's locals past this line
         if problem is not None:
             _refuse(problem)
+        checked_mode = _check_schema_mode(schema_mode)
         base = check_endpoint(base_url, allow_insecure_http=allow_insecure_http)
         if secret is None:  # no key given: the environment's, for Anthropic's own endpoint only
             secret, missing = _env_key(base)
@@ -816,7 +880,7 @@ class AnthropicProvider:
             plain_headers=MappingProxyType({"anthropic-version": version}),
             credential=secret,
         )
-        self._setup(route, model, checked_temperature, max_connections, allow_insecure_http, transport)
+        self._setup(route, model, checked_temperature, max_connections, allow_insecure_http, transport, checked_mode)
 
     def _setup(
         self,
@@ -826,6 +890,7 @@ class AnthropicProvider:
         max_connections: object,
         allow_insecure_http: bool,
         transport: object,
+        schema_mode: SchemaMode = DEFAULT_SCHEMA_MODE,
     ) -> None:
         """Set the checked state shared by both routes (one code path for the body, the reply and the bounds)."""
         connections = _check_max_connections(max_connections)
@@ -835,6 +900,7 @@ class AnthropicProvider:
         self._route = route
         self._model = model
         self._temperature = temperature
+        self._schema_mode = schema_mode
 
     @classmethod
     def google_cloud(
@@ -847,6 +913,7 @@ class AnthropicProvider:
         temperature: float | None = None,
         max_connections: int = 8,
         transport: object = None,
+        schema_mode: SchemaMode = DEFAULT_SCHEMA_MODE,
     ) -> "AnthropicProvider":
         """Claude on Google Cloud, Google managed (Vertex AI, now Agent Platform), via ``rawPredict`` (module notes, 7).
 
@@ -873,6 +940,7 @@ class AnthropicProvider:
         del auth  # whatever was passed as auth leaves this frame before anything can raise
         if checked is None:
             _refuse(problem)
+        checked_mode = _check_schema_mode(schema_mode)
         target = GoogleCloudTarget(project, location)
         check_access(target, checked, interface=GOOGLE_CLOUD_METHOD)
         model_id = model_id_for(target, GOOGLE_CLOUD_PUBLISHER, model)
@@ -887,7 +955,7 @@ class AnthropicProvider:
             credential=checked,
         )
         provider = cls.__new__(cls)
-        provider._setup(route, model, _check_temperature(temperature), max_connections, False, transport)
+        provider._setup(route, model, _check_temperature(temperature), max_connections, False, transport, checked_mode)
         return provider
 
     @classmethod
@@ -958,10 +1026,16 @@ class AnthropicProvider:
         return self
 
     @property
+    def schema_mode(self) -> SchemaMode:
+        """How structured output is enforced: ``"native"``, ``"prompt"``, or ``"prompt_fallback"``."""
+        return self._schema_mode
+
+    @property
     def generation_params(self) -> dict[str, Any]:
         """A new mapping of what shapes the output: the API version (on Google Cloud, the body's
         ``anthropic_version``), the mechanism, the temperature and the wire."""
-        params: dict[str, Any] = {**self._route.params, "mechanism": MECHANISM, "wire": WIRE}
+        mechanism = _MECHANISM_BY_MODE[self._schema_mode]
+        params: dict[str, Any] = {**self._route.params, "mechanism": mechanism, "wire": WIRE}
         if self._temperature is not None:
             params["temperature"] = self._temperature
         return params
@@ -973,7 +1047,7 @@ class AnthropicProvider:
             TypeError: If ``schema`` is not a ``Mapping``.
             RationalizationError: If the schema cannot be expressed.
         """
-        return transform_schema(schema)
+        return transform_schema(schema, check_limits=(self._schema_mode == "native"))
 
     def open(self) -> None:
         """Build the HTTP clients now, on the caller's thread (optional; the runner calls it at preflight).
@@ -993,6 +1067,20 @@ class AnthropicProvider:
         """
         if not isinstance(request, ModelRequest):
             raise TypeError(f"generate needs a ModelRequest, got {type(request).__name__}")
+        use_native = self._schema_mode == "native" or (
+            self._schema_mode == "prompt_fallback" and not _exceeds_limits(request.json_schema)
+        )
+        deadline = time.monotonic() + request.timeout_s  # set before the token is fetched, which counts against it
+        try:
+            reply = self._send_body(request, use_output_config=use_native, deadline=deadline)
+            return _parse_reply(reply, allow_fence=not use_native)
+        except PermanentProviderError as error:
+            if not (use_native and self._schema_mode == "prompt_fallback" and _is_structured_output_400(error)):
+                raise
+        reply = self._send_body(request, use_output_config=False, deadline=deadline)
+        return _parse_reply(reply, allow_fence=True)
+
+    def _send_body(self, request: ModelRequest, *, use_output_config: bool, deadline: float) -> HttpReply:
         user_content: str | list[dict[str, Any]] = (
             [
                 *[
@@ -1014,21 +1102,20 @@ class AnthropicProvider:
         body: dict[str, Any] = {
             **self._route.body_fields,
             "max_tokens": request.max_output_tokens,
-            "system": request.system_prompt,
+            "system": request.system_prompt if use_output_config else _prompt_system(request),
             "messages": [{"role": "user", "content": user_content}],
-            "output_config": {"format": {"type": MECHANISM, "schema": dict(request.json_schema)}},
         }
+        if use_output_config:
+            body["output_config"] = {"format": {"type": MECHANISM, "schema": dict(request.json_schema)}}
         if self._temperature is not None:
             body["temperature"] = self._temperature
-        deadline = time.monotonic() + request.timeout_s  # set before the token is fetched, which counts against it
-        reply = self._http.post_json(
+        return self._http.post_json(
             self._route.url,
             headers=self._route.headers(),
             body=body,
             timeout_s=request.timeout_s,
             deadline=deadline,
         )
-        return _parse_reply(reply)
 
     def __reduce_ex__(self, protocol: object) -> NoReturn:
         raise TypeError("an AnthropicProvider holds a credential: it never pickles or copies")

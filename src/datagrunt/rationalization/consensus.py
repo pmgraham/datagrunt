@@ -127,6 +127,7 @@ library, pydantic and its sibling modules: nothing from ``datagrunt.core``, and 
 (invariant 9).
 """
 
+import re
 import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -547,6 +548,10 @@ def check_must_agree(spec: ModelSpec, paths: object) -> tuple[str, ...]:
     return tuple(checked)
 
 
+_ASCII_PUNCT_OR_SPACE = re.compile(r"[\s!-/:-@\[-`{-~]+")
+_WORD_TOKENS = re.compile(r"\w+")
+
+
 def normalized_text(value: str) -> str:
     """``value`` in consensus's canonical string form (module notes, 5): NFC, whitespace runs made one space.
 
@@ -555,7 +560,16 @@ def normalized_text(value: str) -> str:
     """
     if not isinstance(value, str):
         raise TypeError(f"value must be a str, got {type(value).__name__}")
-    return " ".join((value if value.isascii() else unicodedata.normalize("NFC", value)).split())
+    if value.isascii():
+        if " " not in value and value.isprintable():
+            return value
+        return " ".join(value.split())
+    return " ".join(unicodedata.normalize("NFC", value).split())
+
+
+def alnum_upper_text(value: str) -> str:
+    """Return ``value`` NFC-normalized with ASCII punctuation/whitespace stripped and uppercased."""
+    return _ASCII_PUNCT_OR_SPACE.sub("", normalized_text(value)).upper()
 
 
 def normalized_key(record: BaseModel, spec: ModelSpec) -> tuple[object, ...]:
@@ -1048,19 +1062,86 @@ def _unit_items(unit_id: str, votes: Sequence[tuple[ValidRecord, ...]], context:
     return [_keyed_item(unit_id, key, per_model, context) for key, per_model in ordered]
 
 
+def _field_similarity(field_spec: FieldSpec, left: Any, right: Any) -> float | None:
+    """Similarity in [0.0, 1.0] between two validated field values, or None when both are unset/empty."""
+    norm_l = _normalized_field(field_spec, left)
+    norm_r = _normalized_field(field_spec, right)
+    if norm_l in (None, ()) and norm_r in (None, ()):
+        return None
+    if norm_l == norm_r:
+        return 1.0
+    if isinstance(norm_l, str) and isinstance(norm_r, str):
+        toks_l = set(_WORD_TOKENS.findall(norm_l.casefold()))
+        toks_r = set(_WORD_TOKENS.findall(norm_r.casefold()))
+        if toks_l and toks_r:
+            return len(toks_l & toks_r) / len(toks_l | toks_r)
+    return 0.0
+
+
+def _record_similarity(first: BaseModel, second: BaseModel, spec: ModelSpec) -> float:
+    """Mean similarity across populated non-informational fields (1.0 when both records are identically empty)."""
+    active = [f for f in spec.fields if not f.informational] or list(spec.fields)
+    scores = [
+        s for f in active if (s := _field_similarity(f, getattr(first, f.name), getattr(second, f.name))) is not None
+    ]
+    return (sum(scores) / len(scores)) if scores else 1.0
+
+
+def _pair_unkeyed_multi(
+    unit_id: str, votes: Sequence[tuple[ValidRecord, ...]], context: _Context
+) -> list[ConsensusItem]:
+    """Greedily pair multi-record unkeyed responses across all models when similarity strictly exceeds 0.5."""
+    spec = context.schema.spec
+    model_count = len(votes)
+    chosen_by_model: list[dict[int, int]] = [{} for _ in range(model_count)]
+    for m_idx in range(1, model_count):
+        candidates: list[tuple[float, int, int]] = []
+        for pos0, rec0 in enumerate(votes[0]):
+            for posm, recm in enumerate(votes[m_idx]):
+                score = _record_similarity(rec0.record, recm.record, spec)
+                if score > 0.5:
+                    candidates.append((score, pos0, posm))
+        candidates.sort(key=lambda entry: (-entry[0], entry[1], entry[2]))
+        used_m: set[int] = set()
+        for _, pos0, posm in candidates:
+            if pos0 not in chosen_by_model[m_idx] and posm not in used_m:
+                chosen_by_model[m_idx][pos0] = posm
+                used_m.add(posm)
+
+    items: list[ConsensusItem] = []
+    consumed: list[set[int]] = [set() for _ in range(model_count)]
+    for pos0, rec0 in enumerate(votes[0]):
+        if all(pos0 in chosen_by_model[m_idx] for m_idx in range(1, model_count)):
+            group: _PerModel = [[rec0]]
+            consumed[0].add(pos0)
+            for m_idx in range(1, model_count):
+                posm = chosen_by_model[m_idx][pos0]
+                consumed[m_idx].add(posm)
+                group.append([votes[m_idx][posm]])
+            items.append(_compared_item(unit_id, (), group, context))
+    for m_idx, records in enumerate(votes):
+        for pos, valid in enumerate(records):
+            if pos not in consumed[m_idx]:
+                single: _PerModel = [[] for _ in votes]
+                single[m_idx].append(valid)
+                items.append(_item(unit_id, "unmatched", (), None, single, context))
+    return items
+
+
 def _unkeyed_items(unit_id: str, votes: Sequence[tuple[ValidRecord, ...]], context: _Context) -> list[ConsensusItem]:
-    """The items of a root without keys: paired when every model returned one record, else one per record."""
-    if len(votes) > 1 and all(len(records) == 1 for records in votes):
+    """The items of a root without keys: paired by position (1 each) or similarity (> 0.5), else unmatched."""
+    if len(votes) == 1:
+        return [_compared_item(unit_id, (), [[valid]], context) for valid in votes[0]]
+    if all(len(records) == 1 for records in votes):
         return [_compared_item(unit_id, (), [list(records) for records in votes], context)]
+    if all(votes):
+        return _pair_unkeyed_multi(unit_id, votes, context)
     items: list[ConsensusItem] = []
     for index, records in enumerate(votes):
         for valid in records:
             per_model: _PerModel = [[] for _ in votes]
             per_model[index].append(valid)
-            if len(votes) == 1:
-                items.append(_compared_item(unit_id, (), per_model, context))
-            else:
-                items.append(_item(unit_id, "unmatched", (), None, per_model, context))
+            items.append(_item(unit_id, "unmatched", (), None, per_model, context))
     return items
 
 
@@ -1386,11 +1467,27 @@ class _Comparison:
                 merged.append(result)
         return _listed(merged, values) if complete else _NO_WINNER
 
+    def _compare_informational(self, field_spec: FieldSpec, values: list[_Entry], *, prefer_wire: bool) -> _Merged:
+        """Select a representative value for a non-disputing ``Informational`` field without recording disputes."""
+        if _same_raw_values(field_spec, values):
+            wire, source = _single_wire(values, prefer_wire=prefer_wire)
+            return _Merged(wire, source)
+        clusters = _clusters(
+            [(index, wire, _normalized_field(field_spec, value)) for index, value, wire in values],
+            prefer_wire=prefer_wire,
+        )
+        winner = next((cluster for cluster in clusters if self.wins(cluster.supporters)), None)
+        if winner is None:
+            winner = next((c for c in clusters if c.normalized is not None and c.normalized != ()), clusters[0])
+        return _Merged(winner.wire, winner.source)
+
     def compare_value(
         self, field_spec: FieldSpec, path: str, spec_path: str, values: list[_Entry]
     ) -> _Merged | _NoWinner:
         """Compare a scalar's values, or a list's as normalized sequences: the winner, or no winner."""
         prefer_wire = not field_spec.required
+        if field_spec.informational and not (self.quorum is not None and self.quorum._must(spec_path)):
+            return self._compare_informational(field_spec, values, prefer_wire=prefer_wire)
         if _same_raw_values(field_spec, values):
             supporters = [index for index, _, _ in values]
             wins = self.wins(supporters)
@@ -1582,23 +1679,37 @@ def _normalized(value: object) -> object:
 
 def _key_of(record: BaseModel, spec: ModelSpec) -> tuple[object, ...]:
     """The normalized key tuple of ``record``, an instance of ``spec``'s model (:func:`normalized_key`)."""
-    return tuple(_normalized(getattr(record, name)) for name in spec.keys.fields)
+    norms = spec.key_normalizers
+    if not any(norms):
+        return tuple(_normalized(getattr(record, name)) for name in spec.keys.fields)
+    return tuple(
+        alnum_upper_text(raw)
+        if norm == "alnum_upper" and type(raw := getattr(record, name)) is str
+        else _normalized(getattr(record, name))
+        for name, norm in zip(spec.keys.fields, norms, strict=True)
+    )
 
 
 def _normalized_field(field_spec: FieldSpec, value: Any) -> object:
-    """A field's value as it is compared: a scalar normalized, a list a tuple of its normalized items.
+    """A field's value as it is compared: a scalar normalized, a model or list as normalized tuple(s).
 
     An ``int`` a ``float`` field holds (a widened default, module notes, 3) is compared as a float, rounded like
     one, so ``0`` and ``0.0`` match; an ``int`` in a ``Decimal`` field compares by value as it is.
     """
+    if value is None:
+        return None
     scalar = field_spec.scalar
     if field_spec.kind == "scalar" and scalar is not None:
+        if field_spec.key_normalizer == "alnum_upper" and type(value) is str:
+            return alnum_upper_text(value)
         return _normalized(_widened(value, scalar.base))
     if field_spec.kind == "scalar_list" and scalar is not None:
         return tuple(_normalized(_widened(item, scalar.base)) for item in value)
     child = field_spec.child
     if child is None:
         return value
+    if field_spec.kind == "model":
+        return _normalized_model(value, child, 1)
     return tuple(_normalized_model(item, child, 1) for item in value)
 
 

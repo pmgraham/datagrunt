@@ -1043,3 +1043,143 @@ class TestCoalesceSectionsFolding:
             (p1.element_id, ("Spec", "1. Electrical")),
             (p2.element_id, ("Spec", "2. Mechanical")),
         ]
+
+
+class TestNode4Folding:
+    def test_fold_across_units_false_preserves_multi_customer_prices_and_informational_folds_cleanly(self):
+        import hashlib
+        from decimal import Decimal
+
+        from datagrunt.rationalization import Informational, rationalize
+        from datagrunt.rationalization.providers.callable import CallableProvider
+
+        class CustomerPrice(BaseModel):
+            sku: Annotated[str, Key]
+            description: Annotated[str | None, Informational] = None
+            price: Decimal
+
+        h1 = Heading(**ids(1, 0, ("Customer A",)), level=1, text="Customer A")
+        p1 = Paragraph(**ids(1, 1, ("Customer A",)), text="SKU-100 Valve 10.00")
+        h2 = Heading(**ids(2, 0, ("Customer B",)), level=1, text="Customer B")
+        p2 = Paragraph(**ids(2, 1, ("Customer B",)), text="SKU-100 Valve 12.50")
+        doc = PDFDocument(
+            metadata=metadata(2, source_name="multi_tier.pdf", sha=hashlib.sha256(b"multi_tier").hexdigest()),
+            pages=(page(1, (h1, p1)), page(2, (h2, p2))),
+            sections=(
+                Section(heading=h1, scope_path=("Customer A",), page_span=(1, 1), elements=(h1, p1)),
+                Section(heading=h2, scope_path=("Customer B",), page_span=(2, 2), elements=(h2, p2)),
+            ),
+        )
+
+        def answer_tier(req):
+            if "p0001_e001" in req.user_envelope:
+                rec = {"sku": "SKU-100", "description": "Standard Valve", "price": "10.00"}
+                item_1 = {
+                    "record": rec,
+                    "grounding_quotes": ["SKU-100 Valve 10.00"],
+                    "source_element_ids": ["p0001_e001"],
+                }
+                return {"records": [item_1]}
+            rec = {"sku": "SKU-100", "description": "Valve - Tier B", "price": "12.50"}
+            item_2 = {"record": rec, "grounding_quotes": ["SKU-100 Valve 12.50"], "source_element_ids": ["p0002_e001"]}
+            return {"records": [item_2]}
+
+        models = (
+            CallableProvider("callable:g-tier", answer_tier, family="google"),
+            CallableProvider("callable:a-tier", answer_tier, family="anthropic"),
+        )
+        unfolded = rationalize(
+            doc,
+            schema=CustomerPrice,
+            prompt="Extract prices.",
+            models=models,
+            coalesce_sections=False,
+            fold_across_units=False,
+        )
+        assert [(r.sku, r.price) for r in unfolded.records] == [
+            ("SKU-100", Decimal("10.00")),
+            ("SKU-100", Decimal("12.50")),
+        ]
+        assert [item.sources[0].scope_path for item in unfolded.items] == [("Customer A",), ("Customer B",)]
+
+        # Matching cross-page prices with differing Informational descriptions fold cleanly!
+        def answer_same_price(req):
+            if "p0001_e001" in req.user_envelope:
+                rec = {"sku": "SKU-100", "description": "Valve Page 1", "price": "10.00"}
+                item_1 = {
+                    "record": rec,
+                    "grounding_quotes": ["SKU-100 Valve 10.00"],
+                    "source_element_ids": ["p0001_e001"],
+                }
+                return {"records": [item_1]}
+            rec = {"sku": "SKU-100", "description": "Valve Page 2 wording", "price": "10.00"}
+            item_2 = {"record": rec, "grounding_quotes": ["SKU-100 Valve 12.50"], "source_element_ids": ["p0002_e001"]}
+            return {"records": [item_2]}
+
+        folded = rationalize(
+            doc,
+            schema=CustomerPrice,
+            prompt="Extract prices.",
+            models=(
+                CallableProvider("callable:g-fold", answer_same_price, family="google"),
+                CallableProvider("callable:a-fold", answer_same_price, family="anthropic"),
+            ),
+            coalesce_sections=False,
+            fold_across_units=True,
+        )
+        assert len(folded.records) == 1
+        assert folded.records[0].price == Decimal("10.00")
+        assert folded.needs_review == ()
+
+    def test_strict_false_isolates_page_render_refusal_on_image_only_page(self):
+        import hashlib
+        from decimal import Decimal
+
+        from datagrunt.pdf.elements import PageImage
+        from datagrunt.pdf.render import RenderRefused
+        from datagrunt.rationalization import rationalize
+        from datagrunt.rationalization.providers.callable import CallableProvider
+
+        class SimpleRow(BaseModel):
+            sku: Annotated[str, Key]
+            price: Decimal
+
+        def refuse_png() -> bytes:
+            raise RenderRefused("synthetic decompression bomb on page 2")
+
+        p1 = page(1, (Paragraph(**ids(1, 0), text="SKU-100 10.00"),))
+        bad_img = PageImage(page_number=2, dpi=150, width_px=100, height_px=100, _loader=refuse_png)
+        p2 = dataclasses.replace(
+            page(2, (), route="vision"),
+            status="ocr_unavailable",
+            image_only_reasons=("too_little_text",),
+            page_image=bad_img,
+        )
+        doc = PDFDocument(
+            metadata=metadata(2, source_name="mixed_refusal.pdf", sha=hashlib.sha256(b"mixed_ref").hexdigest()),
+            pages=(p1, p2),
+        )
+
+        def answer_ok(req):
+            return {
+                "records": [
+                    {
+                        "record": {"sku": "SKU-100", "price": "10.00"},
+                        "grounding_quotes": ["SKU-100 10.00"],
+                        "source_element_ids": ["p0001_e000"],
+                    }
+                ]
+            }
+
+        res = rationalize(
+            doc,
+            schema=SimpleRow,
+            prompt="Extract.",
+            models=(
+                CallableProvider("callable:g-ref", answer_ok, family="google"),
+                CallableProvider("callable:a-ref", answer_ok, family="anthropic"),
+            ),
+            strict=False,
+        )
+        assert [r.sku for r in res.records] == ["SKU-100"]
+        assert any(s.page_numbers == (2,) for s in res.skipped_units)

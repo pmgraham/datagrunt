@@ -423,7 +423,8 @@ class DocumentHandle:
     def __init__(self, pdf: pdfium.PdfDocument) -> None:
         if not isinstance(pdf, pdfium.PdfDocument):
             raise TypeError(f"pdf must be a pypdfium2 PdfDocument, got {type(pdf).__name__}")
-        page_count = len(pdf)
+        with _PDFIUM_LOCK:
+            page_count = len(pdf)
         if page_count < 1:
             raise ValueError("pdf has no pages: a DocumentHandle needs at least one")
         self._pdf = pdf

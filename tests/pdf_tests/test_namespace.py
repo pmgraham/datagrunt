@@ -87,6 +87,7 @@ TOP_LEVEL_PDF_NAMES = [
 # 5.1 (#360) and 5.2 (#464): the schema marker, rationalize(), batch helpers and RationalizedResult.
 TOP_LEVEL_RATIONALIZATION_NAMES = [
     "Key",
+    "Informational",
     "rationalize",
     "RationalizedResult",
     "BatchItem",

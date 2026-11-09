@@ -3161,3 +3161,82 @@ class TestNormalizedText:
     def test_normalized_text_rejects_non_str(self, bad):
         with pytest.raises(TypeError):
             consensus_module.normalized_text(bad)
+
+
+class TestNode4Consensus:
+    def test_alnum_upper_key_and_informational_field_reach_consensus_without_dropping_row(self):
+        from datagrunt.rationalization import Informational
+
+        class PriceRow(BaseModel):
+            part_number: Annotated[str, Key(normalizer="alnum_upper")]
+            description: Annotated[str | None, Informational] = None
+            net_price: Decimal
+
+        prepared_row = prepare(PriceRow)
+        responses = {
+            (U1, GOOGLE): answer(
+                {"part_number": "060G-1125", "description": "Pressure transmitter MBS 3000", "net_price": "145.00"}
+            ),
+            (U1, ANTHROPIC): answer(
+                {"part_number": "060g 1125", "description": "MBS 3000 transmitter, 0-10 bar", "net_price": "145.00"}
+            ),
+        }
+        res = blend(responses, schema=prepared_row)
+        found = only(res)
+        assert found.status == "consensus"
+        assert found.key == ("060G1125",)
+        assert found.disputed_fields == ()
+        assert found.record == PriceRow(
+            part_number="060G-1125",
+            description="Pressure transmitter MBS 3000",
+            net_price=Decimal("145.00"),
+        )
+
+    def test_unkeyed_multi_clause_records_pair_deterministically_across_models(self):
+        from datagrunt.rationalization import Informational
+
+        class WarrantyClause(BaseModel):
+            category: str
+            months: int
+            summary_note: Annotated[str, Informational]
+
+        clause_schema = prepare(WarrantyClause)
+        c1_g = {"category": "Compressor", "months": 24, "summary_note": "24 month compressor warranty coverage"}
+        c2_g = {"category": "Controls", "months": 12, "summary_note": "12 month electronic controls coverage"}
+        c1_a = {"category": "Compressor", "months": 24, "summary_note": "24 month compressor warranty"}
+        c2_a = {"category": "Controls", "months": 12, "summary_note": "12 month electronic controls"}
+        extra_g = {"category": "Paint", "months": 6, "summary_note": "Cabinet finish"}
+
+        responses = {
+            (U1, GOOGLE): answer(c1_g, c2_g, extra_g),
+            (U1, ANTHROPIC): answer(c2_a, c1_a),
+        }
+        res = blend(responses, schema=clause_schema)
+        assert [item.status for item in res.items] == ["consensus", "consensus", "unmatched"]
+        assert [item.record.category for item in res.items if item.record is not None] == ["Compressor", "Controls"]
+
+    def test_unkeyed_multi_clause_handles_nested_models_and_ignores_vacuous_none_fields(self):
+        class SubLimit(BaseModel):
+            currency: str
+            amount: int
+
+        class LiabilityClause(BaseModel):
+            kind: str
+            cap: SubLimit | None = None
+            opt_a: str | None = None
+            opt_b: str | None = None
+            opt_c: str | None = None
+
+        clause_schema = prepare(LiabilityClause)
+        responses = {
+            (U1, GOOGLE): answer(
+                {"kind": "indemnity", "cap": {"currency": "USD", "amount": 100}},
+                {"kind": " confidentiality", "cap": None},
+            ),
+            (U1, ANTHROPIC): answer(
+                {"kind": "termination", "cap": {"currency": "EUR", "amount": 999}},
+                {"kind": "force_majeure", "cap": None},
+            ),
+        }
+        res = blend(responses, schema=clause_schema)
+        assert [item.status for item in res.items] == ["unmatched"] * 4

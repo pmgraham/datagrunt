@@ -2142,3 +2142,57 @@ class TestMultimodalImages:
                 ],
             }
         ]
+
+
+class TestSchemaMode:
+    def test_prompt_mode_bypasses_parameter_limits_omits_output_config_and_parses_fenced_json(self):
+        wide_props = {f"opt_{i}": {"anyOf": [{"type": "string"}, {"type": "null"}]} for i in range(30)}
+        wide_schema = {
+            "type": "object",
+            "properties": {"records": {"type": "array", "items": {"type": "object", "properties": wide_props}}},
+            "required": ["records"],
+        }
+        fenced_reply = message_with(content=[{"type": "text", "text": '```json\n{"records": []}\n```'}])
+        handler = reply_with(json_body=fenced_reply)
+        provider = make_provider(handler, schema_mode="prompt")
+
+        transformed = provider.transform_schema(wide_schema)
+        assert provider.generation_params["mechanism"] == "prompt"
+
+        req = ModelRequest(
+            unit_id="u",
+            model_id=provider.model_id,
+            system_prompt="Extract records.",
+            user_envelope="payload",
+            json_schema=transformed,
+            max_output_tokens=1024,
+            timeout_s=30.0,
+        )
+        resp = provider.generate(req)
+        sent_body = json.loads(handler.seen[0].content)
+        assert "output_config" not in sent_body
+        assert "The response schema, as JSON:" in sent_body["system"]
+        assert resp.content == {"records": []}
+
+    def test_prompt_fallback_retries_without_output_config_on_partner_feature_400(self):
+        calls = []
+
+        def fallback_handler(request):
+            calls.append(json.loads(request.content))
+            if len(calls) == 1:
+                err = {
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "output_config blocked by constraints/vertexai.allowedPartnerModelFeatures",
+                    },
+                }
+                return streamed(400, json_body=err)
+            return streamed(200, json_body=MESSAGE)
+
+        provider = make_provider(fallback_handler, schema_mode="prompt_fallback")
+        resp = provider.generate(REQUEST)
+        assert len(calls) == 2
+        assert "output_config" in calls[0]
+        assert "output_config" not in calls[1]
+        assert resp.finish == "complete" and resp.content is not None
