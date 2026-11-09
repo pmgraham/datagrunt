@@ -179,12 +179,27 @@ class RawSpan:
         if not self.text:
             raise ValueError("text must not be empty")
         boxes = _per_char_boxes("char_boxes", self.char_boxes, len(self.text))
-        bbox = ordered_box("bbox", self.bbox)
-        if bbox != union_box(boxes):
-            raise ValueError(f"bbox must be the union of char_boxes, {union_box(boxes)!r}, got {self.bbox!r}")
+        fast_bbox = _fast_ordered_box(self.bbox)
+        bbox = ordered_box("bbox", self.bbox) if fast_bbox is None else fast_bbox
+        expected = union_box(boxes)
+        if bbox != expected:
+            raise ValueError(f"bbox must be the union of char_boxes, {expected!r}, got {self.bbox!r}")
         object.__setattr__(self, "char_boxes", boxes)
         object.__setattr__(self, "tight_boxes", _per_char_boxes("tight_boxes", self.tight_boxes, len(self.text)))
         object.__setattr__(self, "bbox", bbox)
+
+
+def _fast_ordered_box(box: object) -> Box | None:
+    """Fast-path check for a 4-float/int finite ordered box; None delegates to ``ordered_box``."""
+    if type(box) is not tuple or len(box) != 4:
+        return None
+    x0, y0, x1, y1 = box
+    if not all(type(val) is float or type(val) is int for val in (x0, y0, x1, y1)):
+        return None
+    fx0, fy0, fx1, fy1 = float(x0), float(y0), float(x1), float(y1)
+    if not (math.isfinite(fx0) and math.isfinite(fy0) and math.isfinite(fx1) and math.isfinite(fy1)):
+        return None
+    return (fx0, fy0, fx1, fy1) if fx0 <= fx1 and fy0 <= fy1 else None
 
 
 def _per_char_boxes(name: str, boxes: object, count: int) -> tuple[Box, ...]:
@@ -193,7 +208,11 @@ def _per_char_boxes(name: str, boxes: object, count: int) -> tuple[Box, ...]:
         raise TypeError(f"{name} must be a tuple, got {type(boxes).__name__}")
     if len(boxes) != count:
         raise ValueError(f"{name} must hold one box per char of text: {len(boxes)} boxes for {count} chars")
-    return tuple(ordered_box(f"{name}[{index}]", box) for index, box in enumerate(boxes))
+    checked: list[Box] = []
+    for index, box in enumerate(boxes):
+        fast = _fast_ordered_box(box)
+        checked.append(ordered_box(f"{name}[{index}]", box) if fast is None else fast)
+    return tuple(checked)
 
 
 def _check_offsets(name: str, offsets: object, low: int, high: int) -> None:

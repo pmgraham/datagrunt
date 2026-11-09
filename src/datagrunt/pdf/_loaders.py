@@ -95,11 +95,13 @@ from datagrunt.pdf._process import (
     worker_command,
 )
 from datagrunt.pdf._source import SourceIdentity, _opened_source, _stream_sha256, check_binding
-from datagrunt.pdf._validate import checked_password, checked_path, int_at_least, positive_float
+from datagrunt.pdf._validate import checked_password, checked_path, int_at_least, positive_float, strict_bool
 from datagrunt.pdf.elements import _MAX_ASSET_BYTES, Figure
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFSourceChangedError
 from datagrunt.pdf.ocr import Band, bands, normalized, rotated
 from datagrunt.pdf.render import RenderedPage, render_page, render_size
+
+_default_render_page = render_page
 
 __all__ = ["FIGURE_BATCH", "FigureRead", "PageDraw", "PageRender", "figure_pngs", "read_figures"]
 
@@ -168,6 +170,7 @@ class PageRender:
     timeout_s: float
     identity: SourceIdentity | None = None
     sha256: str | None = None
+    sandbox: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source", checked_path(self.source, "source").absolute())
@@ -178,6 +181,7 @@ class PageRender:
         int_at_least("memory_cap_bytes", self.memory_cap_bytes, 1)
         object.__setattr__(self, "timeout_s", positive_float("timeout_s", self.timeout_s))
         check_binding(self.identity, self.sha256)
+        strict_bool("sandbox", self.sandbox)
 
     def png_bytes(self) -> bytes:
         """The page as displayed (before OCR's turn), normalized, as PNG.
@@ -247,6 +251,7 @@ class PageDraw:
     timeout_s: float = _RENDER_TIMEOUT_S
     identity: SourceIdentity | None = None
     sha256: str | None = None
+    sandbox: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source", checked_path(self.source, "source").absolute())
@@ -261,6 +266,7 @@ class PageDraw:
         int_at_least("memory_cap_bytes", self.memory_cap_bytes, 1)
         object.__setattr__(self, "timeout_s", positive_float("timeout_s", self.timeout_s))
         check_binding(self.identity, self.sha256)
+        strict_bool("sandbox", self.sandbox)
 
     @property
     def size(self) -> tuple[int, int]:
@@ -289,17 +295,37 @@ class PageDraw:
 
 
 def _bound_render(loader: PageRender | PageDraw) -> RenderedPage:
-    """The loader's page, drawn by ``render_page`` only from a file of its document's bytes (module notes)."""
+    """The loader's page, drawn only from a file of its document's bytes (module notes)."""
     image = f"page {loader.page_index + 1}'s image"
     before = _drawable(loader, f"before {image} was drawn")
-    page = render_page(
-        loader.source,
-        loader.page_index,
-        dpi=loader.dpi,
-        password=loader.password,
-        memory_cap_bytes=loader.memory_cap_bytes,
-        timeout_s=loader.timeout_s,
-    )
+    if not loader.sandbox and render_page is _default_render_page:
+        try:
+            from datagrunt.pdf import _render_worker
+        except ImportError as exc:
+            from datagrunt.pdf._extra import missing_in_process
+
+            hint = missing_in_process(type(loader).__name__, exc)
+            if hint is not None:
+                raise hint from exc
+            raise
+
+        page = _render_worker.draw_page_in_process(
+            loader.source,
+            loader.page_index,
+            dpi=loader.dpi,
+            password=loader.password,
+            memory_cap_bytes=loader.memory_cap_bytes,
+            annotations=True,
+        )
+    else:
+        page = render_page(
+            loader.source,
+            loader.page_index,
+            dpi=loader.dpi,
+            password=loader.password,
+            memory_cap_bytes=loader.memory_cap_bytes,
+            timeout_s=loader.timeout_s,
+        )
     _check_unchanged(loader.source, before, f"while {image} was drawn")
     return page
 
@@ -438,6 +464,7 @@ class FigureRead:
     image: RawImage
     password: str | None = field(default=None, repr=False, compare=False)
     memory_cap_bytes: int = MEMORY_CAP_BYTES
+    sandbox: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source", checked_path(self.source, "source").absolute())
@@ -450,6 +477,7 @@ class FigureRead:
             )
         checked_password(self.password)
         int_at_least("memory_cap_bytes", self.memory_cap_bytes, 1)
+        strict_bool("sandbox", self.sandbox)
 
     @property
     def object_index(self) -> int:
@@ -562,12 +590,48 @@ def _batches(reads: Sequence[FigureRead]) -> Iterator[list[FigureRead]]:
         yield batch
 
 
-def _worker_key(read: FigureRead) -> tuple[Path, str | None, int]:
-    return read.source, read.password, read.memory_cap_bytes
+def _worker_key(read: FigureRead) -> tuple[Path, str | None, int, bool]:
+    return read.source, read.password, read.memory_cap_bytes, read.sandbox
+
+
+def _in_process_figure_outcomes(batch: list[FigureRead], kind: Kind) -> Iterator[bytes | Exception]:
+    """Read a batch of figures in-process from one open DocumentHandle."""
+    try:
+        from datagrunt.pdf.pdfium_engine import ImageLoader, open_document
+    except ImportError as exc:
+        from datagrunt.pdf._extra import missing_in_process
+
+        hint = missing_in_process("FigureRead", exc)
+        if hint is not None:
+            raise hint from exc
+        raise
+
+    first = batch[0]
+    try:
+        handle_ctx = open_document(first.source, password=first.password)
+    except (DatagruntPDFError, OSError) as exc:
+        for _ in batch:
+            yield exc
+        return
+    with handle_ctx as handle:
+        for read in batch:
+            loader = ImageLoader(
+                source=read.source,
+                page_index=read.page_index,
+                image=read.image,
+                password=read.password,
+            )
+            try:
+                yield loader.read_from_handle(handle, kind)
+            except (DatagruntPDFError, OSError) as exc:
+                yield exc
 
 
 def _batch_outcomes(batch: list[FigureRead], kind: Kind) -> Iterator[bytes | Exception]:
-    """The batch's outcomes, in order: one worker, then a new one for the reads after any it fails (module notes)."""
+    """The batch's outcomes, in order: in-process by default, or in a worker under ``sandbox``."""
+    if not batch[0].sandbox:
+        yield from _in_process_figure_outcomes(batch, kind)
+        return
     done = 0
     for _ in range(len(batch)):  # bounded: each worker answers or fails at least one read
         if done == len(batch):

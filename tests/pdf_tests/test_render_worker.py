@@ -1202,3 +1202,50 @@ class TestRenderCallsStayInRender:
     )
     def test_the_pattern_finds_each_render_call(self, line):
         assert self.RENDER_CALL.search(line)
+
+
+class TestInProcessAnnotations:
+    """Default sandbox=False renders PDF annotations (FPDF_ANNOT), while sandbox=True suppresses them."""
+
+    def test_in_process_draws_annotations_while_sandbox_suppresses_them(self, tmp_path):
+        import io
+
+        from PIL import Image
+
+        from datagrunt.pdf import _loaders
+        from datagrunt.pdf.vision import PageRender
+
+        appearance = b"0 g 0 0 100 100 re f"
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Contents 4 0 R /Annots [5 0 R] >>",
+            b"<< /Length 0 >>\nstream\n\nendstream",
+            b"<< /Type /Annot /Subtype /Square /Rect [100 100 200 200] /F 4 /AP << /N 6 0 R >> >>",
+            b"<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Length %d >>\nstream\n%s\nendstream"
+            % (len(appearance), appearance),
+        ]
+        pdf_path = hand_written_pdf(tmp_path / "annot.pdf", objects)
+
+        in_proc_draw = _loaders.PageDraw(
+            source=pdf_path, page_index=0, dpi=72, width_pt=400.0, height_pt=300.0, sandbox=False
+        )
+        sandboxed_draw = _loaders.PageDraw(
+            source=pdf_path, page_index=0, dpi=72, width_pt=400.0, height_pt=300.0, sandbox=True
+        )
+        with Image.open(io.BytesIO(in_proc_draw.png_bytes())) as pic:
+            assert pic.getpixel((150, 150)) == 0
+        with Image.open(io.BytesIO(sandboxed_draw.png_bytes())) as pic:
+            assert set(pic.tobytes()) == {255}
+
+        in_proc_render = PageRender(
+            source=pdf_path,
+            page_index=0,
+            dpi=72,
+            rotation=0,
+            memory_cap_bytes=1 << 30,
+            timeout_s=60.0,
+            sandbox=False,
+        )
+        with Image.open(io.BytesIO(in_proc_render.png_bytes())) as pic:
+            assert 0 in set(pic.tobytes())

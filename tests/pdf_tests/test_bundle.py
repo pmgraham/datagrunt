@@ -1711,12 +1711,38 @@ class TestImageAndRenderSkipping:
         # Reuse with identical flags
         assert write(bound_document(source), out, source, include_images=False) == doc
 
-    @pytest.mark.parametrize("param", ["include_images", "render_pages"])
     @pytest.mark.parametrize("value", [1, None, "no"])
-    def test_flags_must_be_bool(self, tmp_path, source, param, value):
-        with pytest.raises(TypeError, match=f"{param} must be a bool"):
-            write(bound_document(source), tmp_path / "out", source, **{param: value})
+    def test_include_images_must_be_bool(self, tmp_path, source, value):
+        with pytest.raises(TypeError, match="include_images must be a bool"):
+            write(bound_document(source), tmp_path / "out", source, include_images=value)
         assert not (tmp_path / "out").exists()
+
+    @pytest.mark.parametrize(("value", "exc_type"), [(1, TypeError), (None, TypeError), ("no", ValueError)])
+    def test_render_pages_validates_type_and_mode(self, tmp_path, source, value, exc_type):
+        with pytest.raises(exc_type, match="render_pages"):
+            write(bound_document(source), tmp_path / "out", source, render_pages=value)
+        assert not (tmp_path / "out").exists()
+
+    def test_render_pages_vision_only_skips_clean_digital_and_keeps_vision_and_image_only(
+        self, tmp_path, source, fast_render, recwarn
+    ):
+        out = tmp_path / "out_vo"
+        # bound_document(source) has pages 1 (digital), 2 (hybrid), 3 (vision), 4 (error).
+        # Mark page 2 as image-only: vision_only must render page 2 (image-only) and page 3 (vision),
+        # while skipping page 1 (clean digital) and page 4 (non-image-only error) with ZERO warnings.
+        document = with_image_only(bound_document(source), {2: ("too_little_text",)})
+        written = write(document, out, source, render_pages="vision_only")
+
+        assert [w for w in recwarn if "hold content only" in str(w.message)] == []
+        assert written.pages[0].page_image is None
+        assert written.pages[1].page_image is not None
+        assert written.pages[2].page_image is not None and len(written.pages[2].page_image.band_paths) > 0
+        assert written.pages[3].page_image is None
+        manifest = manifest_of(out)
+        assert manifest["extraction_params"]["render_pages"] == "vision_only"
+        assert [entry["page_number"] for entry in manifest["page_images"]] == [2, 3]
+        assert load_bundle(out) == written
+        assert write(document, out, source, render_pages="vision_only") == written
 
 
 def only_copy(*reasons: str) -> str:

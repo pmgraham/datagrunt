@@ -15,6 +15,7 @@ import os
 import uuid
 from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import nullcontext
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
@@ -31,7 +32,14 @@ from datagrunt.pdf._bundle_load import (
     load_bundle,
 )
 from datagrunt.pdf._extra import load as _load_extra
-from datagrunt.pdf._options import DPI, MAX_RENDER_PIXELS, MIN_IMAGE_DIMENSION, OcrMode
+from datagrunt.pdf._options import (
+    DPI,
+    MAX_RENDER_PIXELS,
+    MIN_IMAGE_DIMENSION,
+    OcrMode,
+    RenderPagesMode,
+    checked_render_pages,
+)
 from datagrunt.pdf._source import _opened_source, _stream_sha256, checked_pdf_file
 from datagrunt.pdf._validate import (
     checked_password,
@@ -45,7 +53,7 @@ from datagrunt.pdf._validate import (
 from datagrunt.pdf.codec import _array, _object, contained_path, parse_json
 from datagrunt.pdf.elements import DocumentMetadata, PDFDocument
 from datagrunt.pdf.exceptions import BundleCorruptError, DatagruntPDFError
-from datagrunt.pdf.pipeline import PageWorkerPool, PipelineOptions, extract_document
+from datagrunt.pdf.pipeline import PageWorkerPool, PipelineOptions, _pool_size, extract_document
 
 _default_extract_document = extract_document
 
@@ -173,7 +181,8 @@ def extract_corpus(
     strict: bool = False,
     overwrite: bool = False,
     include_images: bool = True,
-    render_pages: bool = True,
+    render_pages: RenderPagesMode = True,
+    sandbox: bool = False,
 ) -> CorpusManifest:
     """Extract a batch of PDFs into verified bundles under ``output_dir`` and write ``corpus_manifest.json``."""
     int_at_least("max_workers", max_workers, 1)
@@ -181,7 +190,7 @@ def extract_corpus(
         raise ValueError(f"max_workers must be <= {_MAX_CORPUS_WORKERS}, got {max_workers}")
     replace = strict_bool("overwrite", overwrite)
     checked_include_images = strict_bool("include_images", include_images)
-    checked_render_pages = strict_bool("render_pages", render_pages)
+    checked_render_pgs = checked_render_pages(render_pages)
     checked_pwd = checked_password(password)
     options = PipelineOptions(
         workers=workers,
@@ -191,12 +200,14 @@ def extract_corpus(
         max_render_pixels=max_render_pixels,
         min_image_dimension=min_image_dimension,
         strict=strict,
+        sandbox=sandbox,
     )
     target = _checked_corpus_dir(output_dir)
     items = _resolve_inputs(inputs)
     write_bundle_fn = _load_extra("write_bundle")
     target.mkdir(parents=True, exist_ok=True)
-    with PageWorkerPool() as worker_pool:
+    use_pool = options.sandbox or _pool_size(options.workers) > 1
+    with PageWorkerPool() if use_pool else nullcontext() as worker_pool:
         outcomes = _run_batch(
             items,
             lambda item: _process_item(
@@ -207,7 +218,7 @@ def extract_corpus(
                 replace,
                 write_bundle_fn,
                 include_images=checked_include_images,
-                render_pages=checked_render_pages,
+                render_pages=checked_render_pgs,
                 worker_pool=worker_pool,
             ),
             min(max_workers, len(items)),
@@ -334,7 +345,7 @@ def _process_item(
     write_bundle_fn: Callable[..., object],
     *,
     include_images: bool = True,
-    render_pages: bool = True,
+    render_pages: RenderPagesMode = True,
     worker_pool: PageWorkerPool | None = None,
 ) -> CorpusEntry | CorpusFailure:
     """Extract or reuse one PDF into ``target / item.doc_id``; isolate errors when ``options.strict`` is False."""
@@ -352,10 +363,14 @@ def _process_item(
         "workers": options.workers,
         **extra_params,
     }
+    if options.sandbox:
+        expected_params["sandbox"] = True
     if not include_images:
         expected_params["include_images"] = False
-    if not render_pages:
+    if render_pages is False:
         expected_params["render_pages"] = False
+    elif render_pages == "vision_only":
+        expected_params["render_pages"] = "vision_only"
     if not overwrite and bundle_dir.is_dir():
         reused = _reused_entry(bundle_dir, item, bundle_relpath, expected_params)
         if reused is not None:
@@ -371,6 +386,7 @@ def _process_item(
             "max_render_pixels": options.max_render_pixels,
             "min_image_dimension": options.min_image_dimension,
             "strict": options.strict,
+            **({"sandbox": True} if options.sandbox else {}),
         }
         if worker_pool is not None and extract_document is _default_extract_document:
             extract_kwargs["_worker_pool"] = worker_pool
@@ -390,6 +406,7 @@ def _process_item(
                 overwrite=True,
                 include_images=include_images,
                 render_pages=render_pages,
+                **({"sandbox": True} if options.sandbox else {}),
             ),
         )
     except (DatagruntPDFError, OSError, ValueError) as exc:

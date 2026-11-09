@@ -65,6 +65,9 @@ from datagrunt.pdf.quality import Backdrop, PageAssessment, assess_page, needs_b
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_pages
 from datagrunt.pdf.vision import fallback_page, vision_page
 
+_default_extract_page = extract_page
+_default_render_pages = render_pages
+
 __all__ = ["extract_page_at"]
 
 _T = TypeVar("_T")
@@ -212,7 +215,7 @@ def _window_pages(
     for index in window:  # bounded: the window's pages
         progress(index)
         staged.append(_isolated(handle, index, options, partial(_assessed, handle, index, options)))
-    drawn = _backgrounds(source, staged, options)
+    drawn = _backgrounds(handle, source, staged, options)
     for item in staged:  # bounded: the window's pages
         if isinstance(item, Page):
             yield item
@@ -310,7 +313,11 @@ def _assessed(handle: DocumentHandle, index: int, options: PipelineOptions) -> _
 
     Under ``strict`` that failure raises here; else the page is read by OCR in its step 4 (:func:`_step_four`).
     """
-    raw = extract_page(handle, index)
+    raw = (
+        extract_page(handle, index, allow_segment_overflow=True)
+        if extract_page is _default_extract_page and not options.strict
+        else extract_page(handle, index)
+    )
     if isinstance(raw, PageFailure):
         if options.strict:
             raise PDFCorruptError(raw.message, page_number=raw.page_number)
@@ -332,14 +339,41 @@ def _background_dpi(raw: RawPage, assessment: PageAssessment, options: PipelineO
         return str(exc)
 
 
-def _backgrounds(
-    source: PDFSource, staged: list[Page | _Assessed | PageFailure], options: PipelineOptions
+def _in_process_backgrounds(
+    handle: DocumentHandle,
+    source: PDFSource,
+    pages: tuple[tuple[int, int], ...],
+    options: PipelineOptions,
 ) -> dict[int, _Drawn]:
-    """Each gated page's background render, by page index: the window's, drawn in one worker (see the module notes).
+    """Draw each gated page's textless BGR background directly on the open ``handle``."""
+    from datagrunt.pdf import _render_worker
 
-    A render call that raises is each of its pages' outcome: each raises it
-    in its own step 4, so the window's other pages are untouched.
-    """
+    cap = pipeline._vision(options).memory_cap_bytes
+    outcomes: dict[int, _Drawn] = {}
+    for page_index, dpi in pages:
+        try:
+            outcomes[page_index] = _render_worker.draw_loaded_in_process(
+                handle,
+                source.path,
+                page_index,
+                dpi=dpi,
+                memory_cap_bytes=cap,
+                colour=True,
+                without_text=True,
+                annotations=False,
+            )
+        except (RenderRefused, RenderFailed) as exc:
+            outcomes[page_index] = exc
+    return outcomes
+
+
+def _backgrounds(
+    handle: DocumentHandle,
+    source: PDFSource,
+    staged: list[Page | _Assessed | PageFailure],
+    options: PipelineOptions,
+) -> dict[int, _Drawn]:
+    """Each gated page's background render, by page index."""
     pages = tuple(
         (item.page_index, item.background_dpi)
         for item in staged
@@ -347,6 +381,8 @@ def _backgrounds(
     )
     if not pages:
         return {}
+    if not options.sandbox and render_pages is _default_render_pages:
+        return _in_process_backgrounds(handle, source, pages, options)
     try:
         drawn = render_pages(
             source.path,
@@ -439,4 +475,5 @@ def _assembled_page(raw: RawPage, assessment: PageAssessment, source: PDFSource,
         min_image_dimension=options.min_image_dimension,
         dpi=options.dpi,
         max_render_pixels=options.max_render_pixels,
+        sandbox=options.sandbox,
     )

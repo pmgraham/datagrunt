@@ -190,13 +190,13 @@ source, out, encrypted, worker_only = Path(sys.argv[1]), Path(sys.argv[2]), sys.
 sha = lambda data: hashlib.sha256(data).hexdigest()
 result = {}
 for workers in (1, 2):
-    reader = PDFReader(source, workers=workers, min_image_dimension=32)
+    reader = PDFReader(source, workers=workers, min_image_dimension=32, sandbox=True)
     frame = reader.to_dataframe()  # hashed by schema and values, as frame_sha hashes it, never by IPC bytes
     values = json.dumps(frame.to_dicts(), sort_keys=True, default=str)
     result[f"frame_{workers}"] = sha((str(frame.schema) + values).encode())
 figure = reader.figures[0]
 result["figure"] = [figure.sha256, sha(figure.read_bytes()), sha(figure.read_raw_bytes())]
-writer = PDFWriter(source, min_image_dimension=32)
+writer = PDFWriter(source, min_image_dimension=32, sandbox=True)
 files = [
     writer.write_json(out / "doc.json"),
     writer.write_jsonl(out / "doc.jsonl"),
@@ -211,7 +211,7 @@ result["images"] = sorted(sha(path.read_bytes()) for path in (out / "images").it
 bundled = writer.write_bundle(out / "bundle")
 result["bundle"] = sorted(path.relative_to(out / "bundle").as_posix() for path in (out / "bundle").rglob("*.png"))
 try:
-    PDFReader(encrypted).pages
+    PDFReader(encrypted, sandbox=True).pages
 except PDFEncryptedError as exc:
     result["encrypted"] = type(exc).__name__
 result["loaded"] = sorted(name for name in sys.modules if name.split(".")[0] == "pypdfium2" or name in worker_only)
@@ -228,7 +228,7 @@ from PIL import Image
 from datagrunt.pdf.reader import PDFReader
 
 source, worker_only = Path(sys.argv[1]), json.loads(sys.argv[2])
-image = PDFReader(source).pages[0].page_image
+image = PDFReader(source, sandbox=True).pages[0].page_image
 data = image.read_bytes()
 with Image.open(io.BytesIO(data)) as picture:
     drawn = [picture.format, picture.mode, list(picture.size), hashlib.sha256(picture.tobytes()).hexdigest()]
@@ -330,7 +330,7 @@ sys.path.insert(0, str(blocked))
 
 from datagrunt.pdf.reader import PDFReader
 
-reader = PDFReader(source, workers=2, min_image_dimension=32)
+reader = PDFReader(source, workers=2, min_image_dimension=32, sandbox=True)
 result = {"pages": [[page.status, page.error] for page in reader.document.pages]}
 result["figure"] = len(reader.figures[0].read_bytes())
 result["page_image"] = len(reader.pages[0].page_image.read_bytes())
@@ -364,7 +364,7 @@ class TestNoWorkerCanStart:
         monkeypatch.setattr(sys, "frozen", True, raising=False)
 
         with pytest.raises(DatagruntPDFError) as raised:
-            extract_document(path, workers=workers)
+            extract_document(path, workers=workers, sandbox=True)
 
         assert str(raised.value) == FROZEN
 
@@ -375,7 +375,7 @@ class TestNoWorkerCanStart:
         monkeypatch.setattr(sys, "frozen", True, raising=False)
 
         with pytest.raises(DatagruntPDFError) as raised:
-            extract_document(path)
+            extract_document(path, sandbox=True)
 
         assert str(raised.value) == FROZEN
 
@@ -384,7 +384,7 @@ class TestNoWorkerCanStart:
         monkeypatch.setattr(sys, "executable", "")
 
         with pytest.raises(DatagruntPDFError) as raised:
-            extract_document(path)
+            extract_document(path, sandbox=True)
 
         assert str(raised.value) == NO_EXECUTABLE
 
@@ -410,7 +410,7 @@ class TestOneWorker:
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * pages)
         commands = started(monkeypatch, pipeline)
 
-        document = extract_document(path, workers=workers)
+        document = extract_document(path, workers=workers, sandbox=True)
 
         assert len(commands) == 1
         assert document == chain_document(path, title="untitled", author="anonymous")
@@ -421,7 +421,7 @@ class TestOneWorker:
         monkeypatch.setenv(key, "1")
         commands = started(monkeypatch, pipeline)
 
-        document = extract_document(path, workers=4)
+        document = extract_document(path, workers=4, sandbox=True)
 
         assert len(commands) == 1
         assert document == chain_document(path, title="untitled", author="anonymous")
@@ -436,7 +436,7 @@ class TestPageWorkerCap:
         path = pages_pdf(tmp_path / "doc.pdf", [*contents, text_content("page four")])
         small_cap(monkeypatch)
 
-        document = extract_document(path, workers=workers, ocr="never")
+        document = extract_document(path, workers=workers, ocr="never", sandbox=True)
 
         assert [page.status for page in document.pages] == ["ok", "error", "ok", "ok"]
         assert [text_of(page) for page in document.pages] == ["page one", "", "page three", "page four"]
@@ -449,14 +449,14 @@ class TestPageWorkerCap:
         small_cap(monkeypatch)
 
         with pytest.raises(DatagruntPDFError, match=f"{CAP_WORDS}.*page 2"):
-            extract_document(path, strict=True, ocr="never")
+            extract_document(path, strict=True, ocr="never", sandbox=True)
 
     def test_a_document_whose_open_passes_the_cap_raises_a_corrupt_error_naming_it(self, tmp_path, monkeypatch):
         path = object_stream_pdf(tmp_path / "doc.pdf", INFLATED)
         small_cap(monkeypatch)
 
         with pytest.raises(PDFCorruptError) as raised:
-            extract_document(path)
+            extract_document(path, sandbox=True)
 
         assert raised.value.page_number is None
         assert CAP_WORDS in str(raised.value) and "the document is not read" in str(raised.value)
@@ -465,7 +465,7 @@ class TestPageWorkerCap:
         path = object_stream_pdf(tmp_path / "doc.pdf", 0)
         small_cap(monkeypatch)
 
-        assert [page.status for page in extract_document(path, ocr="never").pages] == ["ok"]
+        assert [page.status for page in extract_document(path, ocr="never", sandbox=True).pages] == ["ok"]
 
 
 class TestFigureReads:
@@ -484,7 +484,7 @@ class TestFigureReads:
         from datagrunt.pdf._loaders import FigureRead
 
         path = figures_pdf(tmp_path / "doc.pdf", 1)
-        (figure,) = extract_document(path, min_image_dimension=32).figures
+        (figure,) = extract_document(path, min_image_dimension=32, sandbox=True).figures
         read = dataclasses.replace(figure._loader.__self__, memory_cap_bytes=1)
 
         with pytest.raises(DatagruntPDFError, match="reached its 1-byte memory cap"):
@@ -496,7 +496,7 @@ class TestFigureReads:
         from datagrunt.pdf.writer import PDFWriter
 
         path = figures_pdf(tmp_path / "doc.pdf", 5)
-        writer = PDFWriter(path, min_image_dimension=32)
+        writer = PDFWriter(path, min_image_dimension=32, sandbox=True)
         figures = writer._extracted().figures
         monkeypatch.setattr(_loaders, "FIGURE_BATCH", 2)
         commands = started(monkeypatch, _loaders)
@@ -510,7 +510,9 @@ class TestFigureReads:
         from datagrunt.pdf._loaders import read_figures
 
         path = figures_pdf(tmp_path / "doc.pdf", 3)
-        reads = [figure._loader.__self__ for figure in extract_document(path, min_image_dimension=32).figures]
+        reads = [
+            figure._loader.__self__ for figure in extract_document(path, min_image_dimension=32, sandbox=True).figures
+        ]
         capped = [reads[0], dataclasses.replace(reads[1], memory_cap_bytes=1), reads[2]]
 
         outcomes = list(read_figures(capped, "png"))
@@ -560,8 +562,39 @@ def worker_payload(key: str, path: Path) -> bytes:
     if key == "pages":
         return _process.request_payload(
             "pages",
-            pipeline._chunk_payload(pipeline.PDFSource(path=path), None, 1, pipeline.PipelineOptions()),
+            pipeline._chunk_payload(pipeline.PDFSource(path=path), None, 1, pipeline.PipelineOptions(sandbox=True)),
             1 << 20,
         )
-    (figure,) = extract_document(path, min_image_dimension=32).figures
+    (figure,) = extract_document(path, min_image_dimension=32, sandbox=True).figures
     return _loaders._batch_payload([figure._loader.__self__], "png")
+
+
+class TestDefaultInProcessFastPath:
+    """Default sandbox=False runs extraction, background checks, figure reads, and bundle writes in-process."""
+
+    def test_default_reader_writer_and_bundle_spawn_zero_workers(self, tmp_path, monkeypatch):
+        from datagrunt.pdf import _loaders, render
+        from datagrunt.pdf.reader import PDFReader
+        from datagrunt.pdf.writer import PDFWriter
+        from pdf_tests.builders import TextRun
+
+        white = TextRun("Hidden prompt", x=72.0, y=420.0, size=11.0, rgb=(1.0, 1.0, 1.0))
+        img = RasterImage(72.0, 260.0, 64.0, 32.0, solid_png(64, 32, (0.2, 0.4, 0.6)))
+        path = build_pdf(tmp_path / "fast.pdf", [PageSpec(items=(*body_text(72.0), white, img)) for _ in range(3)])
+
+        p_cmds = started(monkeypatch, pipeline)
+        r_cmds = started(monkeypatch, render)
+        f_cmds = started(monkeypatch, _loaders)
+
+        reader = PDFReader(path, min_image_dimension=32)
+        doc = reader.document
+        assert [p.status for p in doc.pages] == ["ok", "ok", "ok"]
+        assert [p.quality.hidden_spans_flagged for p in doc.pages] == [1, 1, 1]
+        assert len(reader.figures[0].read_bytes()) > 0
+        assert len(reader.pages[0].page_image.read_bytes()) > 0
+
+        writer = PDFWriter(path, min_image_dimension=32)
+        bundled = writer.write_bundle(tmp_path / "bundle")
+        assert len(bundled.pages) == 3
+        assert (tmp_path / "bundle" / "page_images" / "page_0001.png").is_file()
+        assert p_cmds == [] and r_cmds == [] and f_cmds == []

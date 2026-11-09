@@ -506,10 +506,19 @@ def _scale(backdrop: Backdrop, width: float, height: float) -> tuple[float, floa
 
 
 def _flag_background(
-    pieces: tuple[SpanPiece, ...], backdrop: Backdrop, scale: tuple[float, float]
+    pieces: tuple[SpanPiece, ...],
+    backdrop: Backdrop,
+    scale: tuple[float, float],
+    *,
+    selected: tuple[bool, ...] | None = None,
 ) -> tuple[SpanPiece, ...]:
-    """:func:`flag_background` of checked input, at the backdrop's ``scale``."""
-    return tuple(_background_flagged(piece, backdrop, scale) for piece in pieces)
+    """:func:`flag_background` of checked input, skipping unselected pieces when ``selected`` is given."""
+    if selected is None:
+        return tuple(_background_flagged(piece, backdrop, scale) for piece in pieces)
+    return tuple(
+        _background_flagged(piece, backdrop, scale) if is_selected else piece
+        for piece, is_selected in zip(pieces, selected, strict=True)
+    )
 
 
 def _background_flagged(piece: SpanPiece, backdrop: Backdrop, scale: tuple[float, float]) -> SpanPiece:
@@ -555,6 +564,13 @@ def _char_bgr(box: Box, backdrop: Backdrop, scale: tuple[float, float]) -> tuple
     rows = _pixel_run(y0 * scale[1], y1 * scale[1], backdrop.px_height)
     row_bytes, step = backdrop.px_width * _BGR_BYTES, columns.step * _BGR_BYTES
     first, last = columns.start * _BGR_BYTES, columns[-1] * _BGR_BYTES
+    if columns.step == 1 and len(columns) > 1:
+        width_bytes = len(columns) * _BGR_BYTES
+        row0 = rows[0] * row_bytes + first
+        pixel0 = backdrop.pixels[row0 : row0 + _BGR_BYTES]
+        solid_row = pixel0 * len(columns)
+        if all(backdrop.pixels[r * row_bytes + first : r * row_bytes + first + width_bytes] == solid_row for r in rows):
+            return pixel0[0], pixel0[1], pixel0[2]
     channels: tuple[list[int], list[int], list[int]] = ([], [], [])
     for row in rows:  # at most MAX_SAMPLES_PER_AXIS
         base = row * row_bytes
@@ -802,7 +818,8 @@ def assess_page(
         own = _recovered_own(recovered, width, height, boxes, cover)
     if isinstance(background, Backdrop):
         scale = _scale(background, width, height)
-        pieces, own = _flag_background(pieces, background, scale), _flag_background(own, background, scale)
+        pieces = _flag_background(pieces, background, scale, selected=_gate_selection(pieces, page))
+        own = _flag_background(own, background, scale, selected=_gate_selection(own, page))
     elif background is not None:
         pieces, own = _flag_unchecked(pieces, page), _flag_unchecked(own, page)
     flagged, unchecked = _duplicates_flagged(own, pieces)

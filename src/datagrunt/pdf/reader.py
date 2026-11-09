@@ -245,6 +245,7 @@ class PDFReader:
         max_render_pixels: int = 16_000_000,
         min_image_dimension: int = MIN_IMAGE_DIMENSION,
         strict: bool = False,
+        sandbox: bool = False,
     ) -> None:
         self._options = PipelineOptions(
             workers=workers,
@@ -254,6 +255,7 @@ class PDFReader:
             max_render_pixels=max_render_pixels,
             min_image_dimension=min_image_dimension,
             strict=strict,
+            sandbox=sandbox,
         )
         self._source = _checked_source(source, password)
         self._document: PDFDocument | None = None
@@ -449,6 +451,19 @@ def _read(source: _Source, options: PipelineOptions) -> PDFDocument:
         return source
     if isinstance(source, _Bundle):
         return load_bundle(source.root)
+    if options.sandbox:
+        return extract_document(
+            source.path,
+            password=source.password,
+            workers=options.workers,
+            ocr=options.ocr,
+            dpi=options.dpi,
+            vision_dpi=options.vision_dpi,
+            max_render_pixels=options.max_render_pixels,
+            min_image_dimension=options.min_image_dimension,
+            strict=options.strict,
+            sandbox=True,
+        )
     return extract_document(
         source.path,
         password=source.password,

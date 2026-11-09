@@ -559,6 +559,7 @@ GOOD = {
     "max_render_pixels": 16_000_000,
     "min_image_dimension": 40,
     "strict": False,
+    "sandbox": False,
 }
 
 
@@ -601,6 +602,7 @@ class TestPipelineOptions:
             ),
             pytest.param({"ocr": None}, "ocr must be a str, got None (NoneType)", id="ocr"),
             pytest.param({"strict": 1}, "strict must be a bool, got 1 (int)", id="strict"),
+            pytest.param({"sandbox": 1}, "sandbox must be a bool, got 1 (int)", id="sandbox"),
         ],
     )
     def test_a_bad_type_raises_type_error(self, change, message):
@@ -614,6 +616,7 @@ class TestPipelineOptions:
             pytest.param({"max_render_pixels": 262_144, "min_image_dimension": 1}, id="pixel-floors"),
             pytest.param({"ocr": "always", "strict": True}, id="always-strict"),
             pytest.param({"ocr": "never"}, id="never"),
+            pytest.param({"sandbox": True}, id="sandbox"),
         ],
     )
     def test_values_at_the_bounds_are_accepted(self, change):
@@ -1897,10 +1900,14 @@ class TestWorkers:
         monkeypatch.setattr(sys, attribute, value, raising=False)
 
         with pytest.raises(DatagruntPDFError) as caught:
-            extract_document(path, workers=workers)
+            extract_document(path, workers=workers, sandbox=True)
 
         assert str(caught.value) == f"{why}: datagrunt reads PDFs in worker processes and cannot start one here"
         assert started == []
+        if workers == 1:
+            in_proc = extract_document(path, workers=1)
+            assert [p.status for p in in_proc.pages] == ["ok", "ok"]
+            assert started == []
 
     def test_a_worker_that_returns_its_pages_out_of_order_fails_loud(self, tmp_path, monkeypatch):
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * 4)
@@ -1954,6 +1961,8 @@ class TestWorkers:
         started = started_workers(monkeypatch)
 
         assert extract_document(path, workers=4) == sequential
+        assert started == []
+        assert extract_document(path, workers=4, sandbox=True) == sequential
         assert len(started) == 1
 
     @pytest.mark.parametrize("pages,workers", [pytest.param(1, 4, id="one-page"), pytest.param(3, 1, id="one-worker")])
@@ -1961,7 +1970,7 @@ class TestWorkers:
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page()] * pages)
         started = started_workers(monkeypatch)
 
-        assert len(extract_document(path, workers=workers).pages) == pages
+        assert len(extract_document(path, workers=workers, sandbox=True).pages) == pages
         assert len(started) == 1
 
 
@@ -2492,3 +2501,32 @@ class TestPageWorker:
 
         sent = pickle.loads(reply[1:])
         assert reply[:1] == b"E" and f"{type(sent).__name__}: {sent}".startswith(error)
+
+
+class TestSegmentOverflowStreamFallback:
+    """When strict=False, exceeding MAX_PAGE_SEGMENTS degrades lattice segments only, preserving digital text."""
+
+    def test_lenient_mode_preserves_digital_text_and_warns_while_strict_raises(self, tmp_path, monkeypatch):
+        from datagrunt.pdf import pdfium_engine
+        from pdf_tests.test_pdfium_extract_page import FOUR_PATHS, content_page
+
+        monkeypatch.setattr(pdfium_engine, "MAX_PAGE_SEGMENTS", 7)
+        path = content_page(tmp_path, b"BT /F1 12 Tf 72 200 Td (Hello CAD) Tj ET " + FOUR_PATHS)
+
+        # Direct low-level extract_page without allow_segment_overflow still returns PageFailure.
+        with pdfium_engine.open_document(path) as handle:
+            assert isinstance(pdfium_engine.extract_page(handle, 0), pdfium_engine.PageFailure)
+
+        # Strict pipeline still raises PDFCorruptError naming the bound.
+        with pytest.raises(PDFCorruptError, match="7-segment bound"):
+            extract_document(path, strict=True, ocr="never")
+
+        # Default lenient pipeline preserves 100% of digital text with stream layout and emits warning.
+        doc = extract_document(path, strict=False, ocr="never")
+        (page,) = doc.pages
+        assert (page.status, page.route, page.integrity_verified) == ("ok", "digital", True)
+        assert element_texts(page) == ["Hello CAD"]
+        assert any(
+            "7-segment bound" in w and "no lattice tables were read; its text reads as stream text" in w
+            for w in page.warnings
+        )

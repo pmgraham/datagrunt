@@ -878,7 +878,11 @@ class TestPipeline:
         path = injected(tmp_path)
         monkeypatch.setattr(sys, "frozen", True, raising=False)
 
-        (page,) = extracted_here(path).pages
+        (in_proc,) = extracted_here(path).pages
+        assert in_proc.warnings == ()
+        assert hidden_paragraphs(in_proc) == [(INJECTION, FLAGGED)]
+
+        (page,) = extracted_here(path, sandbox=True).pages
 
         why = f"{path}: page 1: this application is frozen (sys.frozen): {NO_WORKER}"
         assert page.warnings == (f"background not checked: {why}",)

@@ -13,9 +13,34 @@ image) and :class:`VisionOptions` (A5b's, re-exported by
 from dataclasses import dataclass
 from typing import Literal, TypeAlias
 
-from datagrunt.pdf._validate import int_at_least, non_blank_str, positive_float
+from datagrunt.pdf._validate import int_at_least, non_blank_str, positive_float, strict_bool
 
-__all__ = ["DPI", "MAX_RENDER_PIXELS", "MEMORY_CAP_BYTES", "MIN_IMAGE_DIMENSION", "OcrMode", "VisionOptions"]
+__all__ = [
+    "DPI",
+    "MAX_RENDER_PIXELS",
+    "MEMORY_CAP_BYTES",
+    "MIN_IMAGE_DIMENSION",
+    "OcrMode",
+    "RenderPagesMode",
+    "VisionOptions",
+    "checked_render_pages",
+]
+
+RenderPagesMode: TypeAlias = bool | Literal["vision_only"]
+
+
+def checked_render_pages(render_pages: object) -> RenderPagesMode:
+    """Return ``render_pages`` if it is a bool or ``'vision_only'``."""
+    if isinstance(render_pages, bool):
+        return render_pages
+    if isinstance(render_pages, str):
+        if render_pages == "vision_only":
+            return "vision_only"
+        raise ValueError(f"render_pages must be a bool or 'vision_only', got {render_pages!r}")
+    raise TypeError(
+        f"render_pages must be a bool or 'vision_only', got {render_pages!r} ({type(render_pages).__name__})"
+    )
+
 
 OcrMode: TypeAlias = Literal["auto", "always", "never"]
 """The reader's OCR option: ``"auto"`` routes by the page's text,
@@ -71,6 +96,7 @@ class VisionOptions:
     render_timeout_s: float = _RENDER_TIMEOUT_S
     ocr_timeout_s: float = _OCR_TIMEOUT_S
     page_budget_s: float = _PAGE_BUDGET_S
+    sandbox: bool = False
 
     def __post_init__(self) -> None:
         int_at_least("vision_dpi", self.vision_dpi, _MIN_DPI)
@@ -80,3 +106,4 @@ class VisionOptions:
         object.__setattr__(self, "render_timeout_s", positive_float("render_timeout_s", self.render_timeout_s))
         object.__setattr__(self, "ocr_timeout_s", positive_float("ocr_timeout_s", self.ocr_timeout_s))
         object.__setattr__(self, "page_budget_s", positive_float("page_budget_s", self.page_budget_s))
+        strict_bool("sandbox", self.sandbox)

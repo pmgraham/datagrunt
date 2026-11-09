@@ -289,10 +289,13 @@ def shadowing(tmp_path: Path, module: str) -> Path:
 # Each worker: what runs while the extra is there (the PDF read first where a writer needs its document), then the
 # call that starts that worker after it is gone.
 WORKER_CALLS = {
-    "pages": ("reader = datagrunt.PDFReader(pdf)", "reader.to_dataframe()"),
-    "figures": ("writer = datagrunt.PDFWriter(pdf); writer.write_json(out / 'doc.json')", "writer.extract_images(out)"),
+    "pages": ("reader = datagrunt.PDFReader(pdf, sandbox=True)", "reader.to_dataframe()"),
+    "figures": (
+        "writer = datagrunt.PDFWriter(pdf, sandbox=True); writer.write_json(out / 'doc.json')",
+        "writer.extract_images(out)",
+    ),
     "render": (
-        "writer = datagrunt.PDFWriter(pdf); writer.write_json(out / 'doc.json')",
+        "writer = datagrunt.PDFWriter(pdf, sandbox=True); writer.write_json(out / 'doc.json')",
         "writer.render_pages_as_images(out)",
     ),
 }
@@ -433,3 +436,27 @@ def test_installed_distribution_requires_no_removed_library():
 
     assert [requirement.name for requirement in requirements if canonicalize_name(requirement.name) in REMOVED] == []
     assert pdf_extra == ["pillow>=12.2.0", "pypdfium2>=5.9.0"]
+
+
+@pytest.mark.parametrize("missing", [("pypdfium2",), ("PIL",)], ids=["pypdfium2", "Pillow"])
+def test_extract_document_in_process_without_extra_raises_the_hint(figure_pdf, missing):
+    result = run_python(
+        blocking(missing)
+        + textwrap.dedent(
+            f"""
+            import json
+            from datagrunt.pdf.pipeline import extract_document
+
+            try:
+                extract_document({str(figure_pdf)!r})
+            except ImportError as exc:
+                print(json.dumps([type(exc).__name__, str(exc), exc.name, type(exc.__cause__).__name__]))
+            """
+        )
+    )
+
+    kind, message, missing_name, cause = result
+    assert kind == "ImportError"
+    assert HINT in message and PACKAGES[missing[0]] in message
+    assert missing_name.split(".")[0] == missing[0]
+    assert cause == "ModuleNotFoundError"

@@ -265,6 +265,8 @@ from datagrunt.pdf.pdfium_engine import (
 from datagrunt.pdf.quality import OcrMode, PageAssessment, SpanPiece, valid_char
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page
 
+_default_render_page = render_page
+
 __all__ = [
     "LEAST_SIZE_PT",
     "LOW_OCR_CONFIDENCE",
@@ -641,7 +643,12 @@ def vision_page(
     if reading.failure:
         return _unread(raw_page, assessment, reading.failure, image, where, min_image_dimension, options)
     figures = page_figures(
-        raw_page.images, geometry, source=source, password=password, min_image_dimension=min_image_dimension
+        raw_page.images,
+        geometry,
+        source=source,
+        password=password,
+        min_image_dimension=min_image_dimension,
+        sandbox=options.sandbox,
     )
     laid = vision_elements(
         reading.words,
@@ -697,14 +704,26 @@ def _drawn(
         left = deadline - time.monotonic()
         if left <= 0.0:
             return _Drawn(None, 0, f"the page was not rendered: {_spent(options)}")
-        page = render_page(
-            source,
-            geometry.page_number - 1,
-            dpi=dpi,
-            password=password,
-            memory_cap_bytes=options.memory_cap_bytes,
-            timeout_s=min(options.render_timeout_s, left),
-        )
+        if not options.sandbox and render_page is _default_render_page:
+            from datagrunt.pdf import _render_worker
+
+            page = _render_worker.draw_page_in_process(
+                source,
+                geometry.page_number - 1,
+                dpi=dpi,
+                password=password,
+                memory_cap_bytes=options.memory_cap_bytes,
+                annotations=True,
+            )
+        else:
+            page = render_page(
+                source,
+                geometry.page_number - 1,
+                dpi=dpi,
+                password=password,
+                memory_cap_bytes=options.memory_cap_bytes,
+                timeout_s=min(options.render_timeout_s, left),
+            )
     except (RenderRefused, RenderFailed) as exc:
         return _Drawn(None, 0, f"the page was not rendered: {exc}")
     return _Drawn(page, dpi, "")
@@ -788,6 +807,7 @@ def _page_image(
         timeout_s=options.render_timeout_s,
         identity=where.identity,
         sha256=where.sha256,
+        sandbox=options.sandbox,
     )
     return PageImage(
         page_number=geometry.page_number,
@@ -844,6 +864,7 @@ def _unread(
         min_image_dimension=min_image_dimension,
         dpi=options.vision_dpi,
         max_render_pixels=options.max_render_pixels,
+        sandbox=options.sandbox,
     )
     return dataclasses.replace(
         page, page_image=image, warnings=(*page.warnings, f"OCR could not read the page: {reason}")
