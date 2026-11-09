@@ -985,7 +985,6 @@ class TestModuleImports:
 
     def test_imports_only_the_raw_fact_types_and_a1(self):
         allowed = {
-            "datagrunt.pdf._compute",
             "datagrunt.pdf._hidden_rules",
             "datagrunt.pdf._options",  # OcrMode, which the caller checks without pdfium
             "datagrunt.pdf._pdfium_common",
@@ -1016,6 +1015,25 @@ class TestModuleImports:
     def test_validates_image_only_reasons_with_a1s_public_rule(self):
         # One rule for every image_only_reasons tuple (#470): A3's assessment allows its routing shortfalls only.
         assert quality.check_image_only_reasons is elements.check_image_only_reasons
+
+    def test_painted_checks_bounds_without_union_sweep(self, tmp_path, monkeypatch):
+        raw = extract_page(open_document(content_page(tmp_path, b"")), 0)
+        assert isinstance(raw, RawPage)
+
+        def forbid_union(_boxes):
+            raise AssertionError("_painted must not run O(N log N) _union_area")
+
+        monkeypatch.setattr(quality, "_union_area", forbid_union)
+        off_boxes = tuple((-20.0, -20.0, -5.0, -5.0) for _ in range(100))
+        zero_area = ((10.0, 10.0, 10.0, 50.0),)
+        on_boxes = (*off_boxes, (10.0, 10.0, 20.0, 20.0))
+
+        def boxes_of(boxes):
+            return dataclasses.replace(raw, object_boxes=dataclasses.replace(raw.object_boxes, boxes=boxes))
+
+        assert quality._painted(boxes_of(off_boxes)) is False
+        assert quality._painted(boxes_of(zero_area)) is False
+        assert quality._painted(boxes_of(on_boxes)) is True
 
     def test_flags_tiny_and_squeezed_text_with_recoverys_one_rule(self):
         # One em rule and one threshold for textpage spans and recovered text alike, in a pure module.

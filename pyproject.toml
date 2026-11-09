@@ -181,9 +181,6 @@ module = [
     "datagrunt.core.csv_io._compute",
     "datagrunt.core.csv_io._compute_protocol",
     "datagrunt.core.csv_io._compute_python",
-    "datagrunt.pdf._compute",
-    "datagrunt.pdf._compute_protocol",
-    "datagrunt.pdf._compute_python",
 ]
 disallow_untyped_defs = true
 

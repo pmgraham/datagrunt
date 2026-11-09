@@ -79,7 +79,6 @@ class TestModuleImports:
 
     def test_imports_only_the_raw_fact_types_quality_and_a1(self):
         allowed = {
-            "datagrunt.pdf._compute",
             "datagrunt.pdf._path_segments",
             "datagrunt.pdf._pdfium_common",
             "datagrunt.pdf._validate",
