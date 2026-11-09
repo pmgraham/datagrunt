@@ -464,3 +464,169 @@ class TestNode4CorpusProcessScalingAndReuse:
             extract_corpus(
                 in_dir, tmp_path / "out_strict", max_workers=2, strict=True, ocr="never", render_pages="vision_only"
             )
+
+
+class TestAuditRegressionFixes:
+    """Regression tests for all 4 cross-family gemini-auditor findings."""
+
+    def test_figure_session_state_not_poisoned_on_errors_and_rejects_closed_handle(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from PIL import Image
+        from reportlab.lib.utils import ImageReader
+
+        from datagrunt.pdf import pdfium_engine
+        from datagrunt.pdf.exceptions import PDFCorruptError
+        from datagrunt.pdf.pdfium_engine import FigureSession, ImageLoader, PdfiumFailure, open_document
+
+        img_p = tmp_path / "tile.png"
+        Image.new("RGB", (64, 64), color=(80, 120, 200)).save(img_p)
+        pdf_path = tmp_path / "two_figs.pdf"
+        c = canvas.Canvas(str(pdf_path), pagesize=(612, 792))
+        c.drawImage(ImageReader(str(img_p)), 72, 600, width=64, height=64)
+        c.drawImage(ImageReader(str(img_p)), 200, 600, width=64, height=64)
+        c.showPage()
+        c.save()
+
+        handle = open_document(pdf_path)
+        raw_page = pdfium_engine.extract_page(handle, 0)
+        assert not isinstance(raw_page, pdfium_engine.PageFailure)
+        assert len(raw_page.images.images) == 2
+        loaders = [ImageLoader(source=pdf_path, page_index=0, image=img) for img in raw_page.images.images]
+        assert all(isinstance(ld, ImageLoader) for ld in loaders)
+
+        # (1) _load_page raising PDFCorruptError on fig 0 must NOT poison fig 1 with AssertionError
+        with FigureSession(handle) as session:
+            with monkeypatch.context() as mp:
+
+                def bad_load(_h: object, _idx: int) -> tuple[object, int]:
+                    raise PDFCorruptError("corrupt page", page_number=1)
+
+                mp.setattr(pdfium_engine, "_load_page", bad_load)
+                with pytest.raises(PDFCorruptError):
+                    session.read(loaders[0], "raw")
+                with pytest.raises(PDFCorruptError):
+                    session.read(loaders[1], "raw")
+
+        # (2) _page_objects raising PdfiumFailure translates to PDFCorruptError and does not poison state
+        with FigureSession(handle) as session:
+            with monkeypatch.context() as mp:
+
+                def bad_walk(_raw: object, *, max_objects: int) -> list[tuple[object, int]]:
+                    raise PdfiumFailure("walk failed")
+
+                mp.setattr(pdfium_engine, "_page_objects", bad_walk)
+                with pytest.raises(PDFCorruptError, match="walk failed"):
+                    session.read(loaders[0], "raw")
+                with pytest.raises(PDFCorruptError, match="walk failed"):
+                    session.read(loaders[1], "raw")
+
+        # (3) Closing handle between two same-page reads raises ValueError instead of C-pointer UAF
+        session = FigureSession(handle)
+        assert len(session.read(loaders[0], "raw")) > 0
+        handle.close()
+        with pytest.raises(ValueError, match="document handle is closed"):
+            session.read(loaders[1], "raw")
+        session.close()
+
+    def test_utm_cancellation_path_kept_and_unpainted_nonfinite_counted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import ctypes
+
+        import pypdfium2 as pdfium
+        import pypdfium2.raw as pdfium_c
+
+        from datagrunt.pdf.pdfium_engine import open_document, page_segments
+
+        # (1) Pre-cancellation float32 rounding inside GetBounds under large UTM translation
+        utm_pdf = tmp_path / "utm_cancel.pdf"
+        doc = pdfium.PdfDocument.new()
+        page = pdfium_c.FPDFPage_New(doc.raw, 0, 612.0, 792.0)
+        p_utm = pdfium_c.FPDFPageObj_CreateNewPath(536870912.0, 0.0)
+        pdfium_c.FPDFPath_LineTo(p_utm, 536870976.0, 0.0)
+        pdfium_c.FPDFPath_SetDrawMode(p_utm, pdfium_c.FPDF_FILLMODE_NONE, 1)
+        mat = pdfium_c.FS_MATRIX(0.2499999850988388, 0.0, 0.0, 1.0, -134217720.0, 100.0)
+        assert pdfium_c.FPDFPageObj_SetMatrix(p_utm, ctypes.byref(mat))
+        pdfium_c.FPDFPage_InsertObject(page, p_utm)
+        pdfium_c.FPDFPage_GenerateContent(page)
+        pdfium_c.FPDF_ClosePage(page)
+        doc.save(str(utm_pdf))
+        doc.close()
+
+        with open_document(utm_pdf) as h_utm:
+            segs = page_segments(h_utm, 0)
+        assert len(segs.segments) == 1
+        assert segs.segments[0].end - segs.segments[0].start == pytest.approx(16.0, abs=1e-4)
+
+        # (2) Unpainted path with non-finite point increments skipped_nonfinite_paths
+        def unpainted_mode(_p: object, fill_out: ctypes.c_int, stroke_out: ctypes.c_int) -> int:
+            fill_out.value = pdfium_c.FPDF_FILLMODE_NONE
+            stroke_out.value = 0
+            return 1
+
+        def nan_point(_seg: object, x_out: ctypes.c_float, y_out: ctypes.c_float) -> int:
+            x_out.value = float("nan")
+            y_out.value = 10.0
+            return 1
+
+        with open_document(utm_pdf) as h_unp:
+            monkeypatch.setattr(pdfium_c, "FPDFPath_GetDrawMode", unpainted_mode)
+            monkeypatch.setattr(pdfium_c, "FPDFPathSegment_GetPoint", nan_point)
+            got = page_segments(h_unp, 0)
+        assert got.segments == ()
+        assert got.stats.skipped_nonfinite_paths == 1
+
+    def test_corpus_multi_worker_preserves_user_warnings_from_write_bundle(self, tmp_path: Path) -> None:
+        import warnings
+
+        from PIL import Image
+        from reportlab.lib.utils import ImageReader
+
+        from datagrunt.pdf.corpus import extract_corpus
+
+        in_dir = tmp_path / "scan_pdfs"
+        in_dir.mkdir()
+        for idx in range(2):
+            img_p = tmp_path / f"scan_{idx}.png"
+            Image.new("RGB", (400, 400), color=(200, 200, 200)).save(img_p)
+            pdf_p = in_dir / f"scan_{idx}.pdf"
+            c = canvas.Canvas(str(pdf_p), pagesize=(612, 792))
+            c.drawImage(ImageReader(str(img_p)), 36, 100, width=540, height=600)
+            c.showPage()
+            c.save()
+
+        with warnings.catch_warnings(record=True) as w_single:
+            warnings.simplefilter("always", UserWarning)
+            extract_corpus(in_dir, tmp_path / "out_w1", max_workers=1, ocr="never", render_pages=False)
+        with warnings.catch_warnings(record=True) as w_multi:
+            warnings.simplefilter("always", UserWarning)
+            extract_corpus(in_dir, tmp_path / "out_w2", max_workers=2, ocr="never", render_pages=False)
+
+        assert len(w_single) == 2
+        assert len(w_multi) == 2
+
+    def test_corpus_worker_max_docs_retirement_and_strict_false_message_bounds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from datagrunt.pdf import corpus
+        from datagrunt.pdf.corpus import extract_corpus
+
+        in_dir = tmp_path / "retire_pdfs"
+        in_dir.mkdir()
+        for idx in range(4):
+            pdf_p = in_dir / f"doc_{idx}.pdf"
+            c = canvas.Canvas(str(pdf_p), pagesize=(612, 792))
+            c.drawString(72, 700, f"Doc {idx}")
+            c.showPage()
+            c.save()
+
+        monkeypatch.setattr(corpus, "_MAX_WORKER_DOCS", 1)
+        m_ok = extract_corpus(in_dir, tmp_path / "out_retire", max_workers=2, strict=True, ocr="never")
+        assert len(m_ok.entries) == 4
+
+        monkeypatch.setattr(corpus, "_MAX_WORKER_DOCS", 100_000)
+        monkeypatch.setattr(corpus, "MAX_REQUEST_BYTES", 64)
+        m_fail = extract_corpus(in_dir, tmp_path / "out_bound", max_workers=2, strict=False, ocr="never")
+        assert len(m_fail.entries) == 0
+        assert len(m_fail.failures) == 4

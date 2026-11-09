@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import uuid
+import warnings
 from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
@@ -48,6 +49,7 @@ from datagrunt.pdf._process import (
     ERROR,
     MAX_REQUEST_BYTES,
     REAP_TIMEOUT_S,
+    MessageTooLong,
     StderrTail,
     close_pipes,
     error_reply,
@@ -376,19 +378,20 @@ class _CorpusProcPool:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._idle: list[tuple[subprocess.Popen[bytes], StderrTail]] = []
+        self._idle: list[tuple[subprocess.Popen[bytes], StderrTail, int]] = []
         self._closed = False
 
-    def acquire(self) -> tuple["subprocess.Popen[bytes]", StderrTail]:
-        """Return a healthy idle worker process or start a new isolated worker."""
+    def acquire(self) -> tuple["subprocess.Popen[bytes]", StderrTail, int]:
+        """Return ``(child, stderr, uses_so_far)`` for a healthy worker or start a new isolated worker."""
         with self._lock:
             if self._closed:
                 raise ValueError("_CorpusProcPool is closed")
             while self._idle:
-                child, stderr = self._idle.pop()
-                if child.poll() is None:
-                    return child, stderr
+                child, stderr, uses = self._idle.pop()
+                if uses < _MAX_WORKER_DOCS and child.poll() is None:
+                    return child, stderr, uses
                 close_pipes(child)
+                kill_group(child)
                 reaped(child, REAP_TIMEOUT_S)
                 stderr.finish(REAP_TIMEOUT_S)
         if not sys.executable:
@@ -401,14 +404,16 @@ class _CorpusProcPool:
                 child.stdin.flush()
             except OSError:
                 pass
-        return child, stderr
+        return child, stderr, 0
 
-    def release(self, child: "subprocess.Popen[bytes]", stderr: StderrTail, *, healthy: bool) -> tuple[int | None, str]:
-        """Return ``child`` to idle pool when ``healthy``, else terminate and reap its process group."""
-        if healthy and child.poll() is None:
+    def release(
+        self, child: "subprocess.Popen[bytes]", stderr: StderrTail, uses: int, *, healthy: bool
+    ) -> tuple[int | None, str]:
+        """Return ``child`` to idle pool when ``healthy`` and under retirement cap, else terminate and reap."""
+        if healthy and uses < _MAX_WORKER_DOCS and child.poll() is None:
             with self._lock:
                 if not self._closed:
-                    self._idle.append((child, stderr))
+                    self._idle.append((child, stderr, uses))
                     return None, ""
         close_pipes(child)
         kill_group(child)
@@ -421,7 +426,7 @@ class _CorpusProcPool:
             self._closed = True
             idle = list(self._idle)
             self._idle.clear()
-        for child, stderr in idle:
+        for child, stderr, _uses in idle:
             close_pipes(child)
             kill_group(child)
             reaped(child, REAP_TIMEOUT_S)
@@ -545,27 +550,31 @@ def _run_encoded_corpus_request(raw: bytes) -> bytes:
         sandbox=cast(bool, opts_raw["sandbox"]),
         orientation_fallback=cast(bool, opts_raw["orientation_fallback"]),
     )
-    outcome = _process_item(
-        item,
-        Path(cast(str, req["target"])),
-        cast(str | None, req["password"]),
-        options,
-        cast(bool, req["overwrite"]),
-        _default_load_extra("write_bundle"),
-        include_images=cast(bool, req["include_images"]),
-        render_pages=checked_render_pages(req["render_pages"]),
-        worker_pool=None,
-    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", UserWarning)
+        outcome = _process_item(
+            item,
+            Path(cast(str, req["target"])),
+            cast(str | None, req["password"]),
+            options,
+            cast(bool, req["overwrite"]),
+            _default_load_extra("write_bundle"),
+            include_images=cast(bool, req["include_images"]),
+            render_pages=checked_render_pages(req["render_pages"]),
+            worker_pool=None,
+        )
+    user_notices = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
     if isinstance(outcome, CorpusEntry):
-        body = {"kind": "entry", "pid": os.getpid(), "data": _entry_dict(outcome)}
+        body = {"kind": "entry", "pid": os.getpid(), "data": _entry_dict(outcome), "warnings": user_notices}
     else:
-        body = {"kind": "failure", "pid": os.getpid(), "data": _failure_dict(outcome)}
+        body = {"kind": "failure", "pid": os.getpid(), "data": _failure_dict(outcome), "warnings": user_notices}
     return _OK_TAG + json.dumps(body, allow_nan=False).encode("utf-8")
 
 
 def _corpus_worker_main(replies: IO[bytes]) -> None:
     """Child process loop reading document requests on stdin and sending length-prefixed replies."""
-    for _ in range(_MAX_WORKER_DOCS):
+    # Bound is generous (+1) so parent-driven retirement closes stdin cleanly before child loop ends
+    for _ in range(_MAX_WORKER_DOCS + 1):
         raw = read_message(sys.stdin.buffer, MAX_REQUEST_BYTES)
         if raw is None:
             return
@@ -584,7 +593,7 @@ def _corpus_worker_main(replies: IO[bytes]) -> None:
 
 
 def _decode_corpus_reply(reply: bytes, target: Path) -> tuple[int, CorpusEntry | CorpusFailure]:
-    """Decode one child worker reply frame into ``(child_pid, outcome)`` or raise its error."""
+    """Decode one child worker reply frame into ``(child_pid, outcome)``, re-emitting UserWarnings."""
     if not isinstance(reply, bytes) or len(reply) < 2:
         raise DatagruntPDFError("the corpus worker sent a truncated reply")
     tag, body = reply[:1], reply[1:]
@@ -592,13 +601,27 @@ def _decode_corpus_reply(reply: bytes, target: Path) -> tuple[int, CorpusEntry |
         raise read_error(body, "the corpus worker")
     if tag != _OK_TAG:
         raise DatagruntPDFError("the corpus worker sent an unknown reply tag")
-    msg = _object("corpus_reply", json.loads(body), ("kind", "pid", "data"))
+    msg = _object("corpus_reply", json.loads(body), ("kind", "pid", "data", "warnings"))
+    for idx, item in enumerate(_array("corpus_reply.warnings", msg["warnings"])):
+        if not isinstance(item, str):
+            raise ValueError(f"corpus_reply.warnings[{idx}] must be str")
+        warnings.warn(item, UserWarning, stacklevel=3)
     pid = int_at_least("corpus_reply.pid", msg["pid"], 1)
     if msg["kind"] == "entry":
         return pid, _entry_of("corpus_reply.data", msg["data"], target)
     if msg["kind"] == "failure":
         return pid, _failure_of("corpus_reply.data", msg["data"])
     raise DatagruntPDFError(f"unknown corpus reply kind: {msg['kind']!r}")
+
+
+def _ipc_failure(item: _SourceItem, strict: bool, exc: Exception) -> tuple[int, CorpusEntry | CorpusFailure]:
+    """Raise ``exc`` when ``strict`` is True, else record a :class:`CorpusFailure`."""
+    if strict:
+        if isinstance(exc, MessageTooLong):
+            raise DatagruntPDFError(str(exc)) from exc
+        raise exc
+    err_name = "DatagruntPDFError" if isinstance(exc, MessageTooLong) else type(exc).__name__
+    return 0, CorpusFailure(source_path=str(item.path), error_type=err_name, message=str(exc) or err_name)
 
 
 def _run_in_corpus_worker(
@@ -613,10 +636,13 @@ def _run_in_corpus_worker(
     render_pages: RenderPagesMode,
 ) -> tuple[int, CorpusEntry | CorpusFailure]:
     """Send ``item`` to a warm child process in ``proc_pool`` and decode its reply."""
-    request_bytes = _encode_corpus_request(
-        item, target, password, options, overwrite, include_images=include_images, render_pages=render_pages
-    )
-    child, stderr = proc_pool.acquire()
+    try:
+        request_bytes = _encode_corpus_request(
+            item, target, password, options, overwrite, include_images=include_images, render_pages=render_pages
+        )
+    except (DatagruntPDFError, ValueError) as exc:
+        return _ipc_failure(item, options.strict, exc)
+    child, stderr, uses = proc_pool.acquire()
     healthy = False
     reply: bytes | None = None
     expired = False
@@ -629,15 +655,18 @@ def _run_in_corpus_worker(
             pass
         reply, expired = next_reply(child, child.stdout, _CORPUS_DOC_TIMEOUT_S, MAX_REQUEST_BYTES, kill=kill_group)
         healthy = reply is not None and not expired
+    except (MessageTooLong, DatagruntPDFError) as exc:
+        return _ipc_failure(item, options.strict, exc)
     finally:
-        code, tail = proc_pool.release(child, stderr, healthy=healthy)
+        code, tail = proc_pool.release(child, stderr, uses + 1, healthy=healthy)
     if reply is None:
         reason = "corpus worker timed out" if expired else f"corpus worker exited (code {code})"
         detail = f"{reason}: {tail}" if tail else reason
-        if options.strict:
-            raise DatagruntPDFError(detail)
-        return 0, CorpusFailure(source_path=str(item.path), error_type="DatagruntPDFError", message=detail)
-    return _decode_corpus_reply(reply, target)
+        return _ipc_failure(item, options.strict, DatagruntPDFError(detail))
+    try:
+        return _decode_corpus_reply(reply, target)
+    except (DatagruntPDFError, OSError, ValueError) as exc:
+        return _ipc_failure(item, options.strict, exc)
 
 
 def _run_spawn_batch(
