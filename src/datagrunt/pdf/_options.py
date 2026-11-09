@@ -97,6 +97,7 @@ class VisionOptions:
     ocr_timeout_s: float = _OCR_TIMEOUT_S
     page_budget_s: float = _PAGE_BUDGET_S
     sandbox: bool = False
+    orientation_fallback: bool = False
 
     def __post_init__(self) -> None:
         int_at_least("vision_dpi", self.vision_dpi, _MIN_DPI)
@@ -107,3 +108,4 @@ class VisionOptions:
         object.__setattr__(self, "ocr_timeout_s", positive_float("ocr_timeout_s", self.ocr_timeout_s))
         object.__setattr__(self, "page_budget_s", positive_float("page_budget_s", self.page_budget_s))
         strict_bool("sandbox", self.sandbox)
+        strict_bool("orientation_fallback", self.orientation_fallback)

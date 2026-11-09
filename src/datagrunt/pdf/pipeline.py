@@ -331,6 +331,7 @@ class PipelineOptions:
     min_image_dimension: int = MIN_IMAGE_DIMENSION
     strict: bool = False
     sandbox: bool = False
+    orientation_fallback: bool = False
 
     def __post_init__(self) -> None:
         int_at_least("workers", self.workers, 1)
@@ -343,6 +344,7 @@ class PipelineOptions:
         choice_str("ocr", self.ocr, _OCR_MODES)
         strict_bool("strict", self.strict)
         strict_bool("sandbox", self.sandbox)
+        strict_bool("orientation_fallback", self.orientation_fallback)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -405,6 +407,7 @@ def extract_document(
     min_image_dimension: int = MIN_IMAGE_DIMENSION,
     strict: bool = False,
     sandbox: bool = False,
+    orientation_fallback: bool = False,
     _worker_pool: "PageWorkerPool | None" = None,
 ) -> PDFDocument:
     """Extract the whole PDF at ``source``: steps 1-5 for every page, in workers, then 6-7 (see the module notes).
@@ -442,6 +445,7 @@ def extract_document(
         min_image_dimension=min_image_dimension,
         strict=strict,
         sandbox=sandbox,
+        orientation_fallback=orientation_fallback,
     )
     pdf = PDFSource(path=checked_path(source, "source"), password=password)
     in_process = (
@@ -522,6 +526,7 @@ def _vision(options: PipelineOptions) -> VisionOptions:
         vision_dpi=options.vision_dpi,
         max_render_pixels=options.max_render_pixels,
         sandbox=options.sandbox,
+        orientation_fallback=options.orientation_fallback,
     )
 
 

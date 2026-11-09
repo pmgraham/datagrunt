@@ -909,6 +909,7 @@ class TestVisionOptions:
         assert (options.vision_dpi, options.max_render_pixels, options.language) == (300, 16_000_000, "eng")
         assert (options.memory_cap_bytes, options.render_timeout_s, options.ocr_timeout_s) == (2 << 30, 120.0, 120.0)
         assert options.page_budget_s == 600.0
+        assert options.orientation_fallback is False
         assert pickle.loads(pickle.dumps(options)) == options
 
     @pytest.mark.parametrize(
@@ -924,6 +925,7 @@ class TestVisionOptions:
             ({"page_budget_s": 0.0}, ValueError, "page_budget_s must be > 0"),
             ({"page_budget_s": float("inf")}, ValueError, "page_budget_s must be finite"),
             ({"page_budget_s": "600"}, TypeError, "page_budget_s must be an int or float"),
+            ({"orientation_fallback": 1}, TypeError, "orientation_fallback must be a bool"),
         ],
     )
     def test_rejects_bad_options(self, fields, error, message):
@@ -2117,3 +2119,70 @@ class TestSidewaysListings:
         assert made_by_osd(found) == 90 and righted_notes(page) == made_notes(found), (found, page.warnings)
         read = " ".join(texts(page))
         assert read.startswith(CODE_REPEAT) and read.count(CODE_REPEAT) == 5, read
+
+
+class TestOrientationFallbackVote:
+    """When orientation_fallback=True, undetermined OSD or <70 confidence triggers a 4-way OCR vote."""
+
+    def test_4_way_vote_rights_undetermined_or_low_confidence_rotated_scan_when_enabled(self, scans, monkeypatch):
+        undetermined = Orientation(degrees=0, confidence=None, status="undetermined", reason="too few characters")
+        monkeypatch.setattr(vision, "orientation", lambda *args, **kwargs: undetermined)
+        seen_turns: list[int] = []
+
+        def fake_ocr_words(page_bands, **kwargs):
+            turn = kwargs["rotation"]
+            seen_turns.append(turn)
+            if turn == 90:
+                words = tuple(
+                    OCRWord(
+                        text=f"token{i}",
+                        bbox=BBox(x0=72.0, y0=80.0 + i * 14.0, x1=140.0, y1=90.0 + i * 14.0),
+                        confidence=94.0,
+                        line=i,
+                    )
+                    for i in range(12)
+                )
+                return OCRResult(words=words, status="ok", reason="")
+            bad = (OCRWord(text="x~|", bbox=BBox(x0=72.0, y0=80.0, x1=90.0, y1=90.0), confidence=35.0, line=0),)
+            return OCRResult(words=bad, status="ok", reason="")
+
+        monkeypatch.setattr(vision, "ocr_words", fake_ocr_words)
+
+        default_page = visioned(scans["captioned"], options=VisionOptions(orientation_fallback=False))
+        assert seen_turns == [0]
+        assert default_page.quality.ocr_mean_confidence == pytest.approx(35.0)
+
+        seen_turns.clear()
+        voted_page = visioned(scans["captioned"], options=VisionOptions(orientation_fallback=True))
+        assert set(seen_turns) == {0, 90, 180, 270}
+        assert voted_page.quality.ocr_mean_confidence == pytest.approx(94.0)
+        assert low_notes(voted_page) == []
+        assert any("4-way OCR vote righted it by 90 degrees clockwise" in w for w in voted_page.warnings)
+        assert voted_page.page_image._band_loader.__self__.rotation == 90
+
+    def test_4_way_vote_skips_extra_ocr_when_osd_and_initial_read_are_confident(self, scans, monkeypatch):
+        monkeypatch.setattr(vision, "orientation", lambda *args, **kwargs: UPRIGHT)
+        good_words = tuple(
+            OCRWord(
+                text=f"word{i}",
+                bbox=BBox(x0=72.0, y0=80.0 + i * 14.0, x1=120.0, y1=90.0 + i * 14.0),
+                confidence=92.0,
+                line=i,
+            )
+            for i in range(6)
+        )
+        calls = spy_ocr(monkeypatch, words=good_words)
+
+        page = visioned(scans["captioned"], options=VisionOptions(orientation_fallback=True))
+
+        assert len(calls) == 1
+        assert page.quality.ocr_mean_confidence == pytest.approx(92.0)
+
+    @needs_tesseract
+    def test_end_to_end_upside_down_sparse_capitals_righted_with_orientation_fallback(self, upside_down_capitals):
+        page = PDFReader(upside_down_capitals, ocr="always", orientation_fallback=True).pages[0]
+
+        assert (page.status, page.route) == ("ok", "vision")
+        assert page.quality.ocr_mean_confidence is not None and page.quality.ocr_mean_confidence >= 85.0
+        assert low_notes(page) == []
+        assert "ALPHA DOCUMENT PAGE 1" in " ".join(texts(page))

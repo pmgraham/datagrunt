@@ -183,6 +183,7 @@ def extract_corpus(
     include_images: bool = True,
     render_pages: RenderPagesMode = True,
     sandbox: bool = False,
+    orientation_fallback: bool = False,
 ) -> CorpusManifest:
     """Extract a batch of PDFs into verified bundles under ``output_dir`` and write ``corpus_manifest.json``."""
     int_at_least("max_workers", max_workers, 1)
@@ -201,6 +202,7 @@ def extract_corpus(
         min_image_dimension=min_image_dimension,
         strict=strict,
         sandbox=sandbox,
+        orientation_fallback=orientation_fallback,
     )
     target = _checked_corpus_dir(output_dir)
     items = _resolve_inputs(inputs)
@@ -355,6 +357,7 @@ def _process_item(
         "ocr": options.ocr,
         "min_image_dimension": options.min_image_dimension,
         "strict": options.strict,
+        **({"orientation_fallback": True} if options.orientation_fallback else {}),
     }
     expected_params: dict[str, object] = {
         "dpi": options.dpi,
@@ -387,6 +390,7 @@ def _process_item(
             "min_image_dimension": options.min_image_dimension,
             "strict": options.strict,
             **({"sandbox": True} if options.sandbox else {}),
+            **({"orientation_fallback": True} if options.orientation_fallback else {}),
         }
         if worker_pool is not None and extract_document is _default_extract_document:
             extract_kwargs["_worker_pool"] = worker_pool

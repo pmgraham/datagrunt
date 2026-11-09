@@ -560,6 +560,7 @@ GOOD = {
     "min_image_dimension": 40,
     "strict": False,
     "sandbox": False,
+    "orientation_fallback": False,
 }
 
 
@@ -603,6 +604,11 @@ class TestPipelineOptions:
             pytest.param({"ocr": None}, "ocr must be a str, got None (NoneType)", id="ocr"),
             pytest.param({"strict": 1}, "strict must be a bool, got 1 (int)", id="strict"),
             pytest.param({"sandbox": 1}, "sandbox must be a bool, got 1 (int)", id="sandbox"),
+            pytest.param(
+                {"orientation_fallback": 1},
+                "orientation_fallback must be a bool, got 1 (int)",
+                id="orientation_fallback",
+            ),
         ],
     )
     def test_a_bad_type_raises_type_error(self, change, message):
@@ -617,6 +623,7 @@ class TestPipelineOptions:
             pytest.param({"ocr": "always", "strict": True}, id="always-strict"),
             pytest.param({"ocr": "never"}, id="never"),
             pytest.param({"sandbox": True}, id="sandbox"),
+            pytest.param({"orientation_fallback": True}, id="orientation_fallback"),
         ],
     )
     def test_values_at_the_bounds_are_accepted(self, change):

@@ -177,6 +177,8 @@ from datagrunt.pdf.render import _MIN_TARGET_DPI, RenderedPage, RenderFailed, Re
 
 __all__ = ["PDFWriter"]
 
+_default_extract_document = extract_document
+
 _LOGGER = logging.getLogger(__name__)
 
 # A temporary file's name: this, then a uuid4's hex (the bundle's staging prefix).
@@ -219,6 +221,7 @@ class PDFWriter:
         min_image_dimension: int = MIN_IMAGE_DIMENSION,
         strict: bool = False,
         sandbox: bool = False,
+        orientation_fallback: bool = False,
     ) -> None:
         self._options = PipelineOptions(
             workers=workers,
@@ -229,6 +232,7 @@ class PDFWriter:
             min_image_dimension=min_image_dimension,
             strict=strict,
             sandbox=sandbox,
+            orientation_fallback=orientation_fallback,
         )
         self._source, self._document = _checked_source(source, password)
         self._lock = threading.RLock()
@@ -431,6 +435,7 @@ class PDFWriter:
                 "ocr": options.ocr,
                 "min_image_dimension": options.min_image_dimension,
                 "strict": options.strict,
+                **({"orientation_fallback": True} if options.orientation_fallback else {}),
             },
             overwrite=replace,
             include_images=include_imgs,
@@ -469,7 +474,7 @@ def _checked_source(source: object, password: object) -> tuple[PDFSource | None,
 
 def _extract(source: PDFSource, options: PipelineOptions) -> PDFDocument:
     """The document of ``source``, extracted with ``options``."""
-    if options.sandbox:
+    if extract_document is _default_extract_document and (options.sandbox or options.orientation_fallback):
         return extract_document(
             source.path,
             password=source.password,
@@ -480,7 +485,8 @@ def _extract(source: PDFSource, options: PipelineOptions) -> PDFDocument:
             max_render_pixels=options.max_render_pixels,
             min_image_dimension=options.min_image_dimension,
             strict=options.strict,
-            sandbox=True,
+            sandbox=options.sandbox,
+            orientation_fallback=options.orientation_fallback,
         )
     return extract_document(
         source.path,

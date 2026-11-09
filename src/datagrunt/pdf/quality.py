@@ -269,6 +269,13 @@ _OCR_LAYER_COVER = 0.5
 _MIN_TEXT_CHARS = 20
 # The valid share of its visible chars a page needs to stay out of vision (spec §3.3 step 2, #417).
 _MIN_VALID_RATIO = 0.70
+# On raster-covered scans (> 50 % cover), valid non-leader non-space text must have at least this lexical share.
+_MIN_SCAN_LEXICAL_RATIO = 0.55
+# On raster-covered scans with >= 4 tokens, intraword OCR-noise tokens above this share mark garbled_text.
+_MAX_SCAN_NOISE_TOKEN_RATIO = 0.40
+_MIN_SCAN_TOKENS = 4
+_SCAN_LEADER_CHARS = frozenset("._-…")
+_INTRAWORD_NOISE_CHARS = frozenset("|~^`\\")
 # The image-only reasons routing records (#470): the count's shortfall, then the ratio's, in IMAGE_ONLY_REASONS order.
 _SHORTFALL_REASONS: tuple[ImageOnlyReason, ...] = ("too_little_text", "garbled_text")
 # A run of this many identical invalid chars or more is a leader or a rule, not text: the routing ratio leaves it out.
@@ -823,7 +830,7 @@ def assess_page(
     elif background is not None:
         pieces, own = _flag_unchecked(pieces, page), _flag_unchecked(own, page)
     flagged, unchecked = _duplicates_flagged(own, pieces)
-    route, warnings, reasons = _route(_visible_text(pieces), cover, _painted(page), ocr)
+    route, warnings, reasons = _route(_visible_text(pieces), cover, _painted(page), ocr, pieces=pieces)
     warnings += _recovery_warnings(recovered, page.text.stats.dropped_text_objects)
     return PageAssessment(
         pieces=pieces,
@@ -1166,16 +1173,16 @@ class _Shortfall(NamedTuple):
     note: str
 
 
-def _route(text: _VisibleText, cover: float, painted: bool, ocr: OcrMode) -> _Routing:
-    """The page's route, warnings and image-only reasons, from its visible text, raster cover and paint (module notes).
-
-    The reasons are the shortfalls of :func:`_shortfalls`, in
-    ``IMAGE_ONLY_REASONS`` order, found in every mode (``"always"`` too: a
-    page OCR then cannot read is marked as under ``"auto"``). A page with
-    any routes vision, or stays digital (with a warning naming each) under
-    ``ocr="never"``; ``"always"`` routes every page vision, with no warning.
-    """
-    shortfalls = _shortfalls(text, painted)
+def _route(
+    text: _VisibleText,
+    cover: float,
+    painted: bool,
+    ocr: OcrMode,
+    *,
+    pieces: tuple[SpanPiece, ...] = (),
+) -> _Routing:
+    """The page's route, warnings and image-only reasons, from its visible text, raster cover and paint."""
+    shortfalls = _shortfalls(text, painted, pieces=pieces, cover=cover)
     reasons = tuple(shortfall.reason for shortfall in shortfalls)
     if ocr == "always":
         return _Routing("vision", (), reasons)
@@ -1189,15 +1196,61 @@ def _route(text: _VisibleText, cover: float, painted: bool, ocr: OcrMode) -> _Ro
     return _Routing("hybrid" if cover > _OCR_LAYER_COVER and ocr != "never" else "digital", (), ())
 
 
-def _shortfalls(text: _VisibleText, painted: bool) -> tuple[_Shortfall, ...]:
-    """Why the page's visible text cannot stand: too few valid chars, too small a valid share, or both; else empty.
+def _is_lexical_char(char: str) -> bool:
+    """True if ``char`` is a letter, number, mark, or format joiner in any Unicode script."""
+    cat = unicodedata.category(char)
+    return cat[0] in ("L", "N", "M") or cat == "Cf"
 
-    Too few (``too_little_text``) counts only on a ``painted`` page (module
-    notes, P2-C); too small a share is ``garbled_text``. A page with no
-    visible char outside leader runs has no ratio: its count (0) decides.
-    The ratio is shown cut to 3 places (exact, in integers), so one under
-    0.70 never reads as 0.700.
-    """
+
+def _is_intraword_noise_token(token: str) -> bool:
+    """True when ``token`` mixes alphanumeric characters with intraword OCR-noise symbols."""
+    if len(token) < 2 or not any(ch.isalnum() for ch in token):
+        return False
+    return any(ch in _INTRAWORD_NOISE_CHARS for ch in token) or "!" in token[:-1]
+
+
+def _scan_mojibake_note(pieces: tuple[SpanPiece, ...]) -> str | None:
+    """Return a shortfall note when visible text over a >50 % raster scan is ASCII-Mojibake noise."""
+    lexical = nonspace = 0
+    tokens: list[str] = []
+    for piece in pieces:
+        if piece.hidden_reasons:
+            continue
+        span = piece.span
+        valid_chars: list[str] = []
+        runs = groupby(range(piece.start, piece.end), key=lambda offset: (span.text[offset], _valid(span, offset)))
+        for (char, is_valid), run in runs:
+            if not is_valid:
+                continue
+            length = sum(1 for _ in run)
+            valid_chars.append(char * length)
+            if char.isspace() or (char in _SCAN_LEADER_CHARS and length >= _MIN_LEADER_RUN):
+                continue
+            nonspace += length
+            if _is_lexical_char(char):
+                lexical += length
+        tokens.extend("".join(valid_chars).split())
+    if nonspace >= _MIN_TEXT_CHARS and lexical / nonspace < _MIN_SCAN_LEXICAL_RATIO:
+        ratio = f"0.{lexical * 1000 // nonspace:03d}"
+        return (
+            f"{lexical} lexical chars of {nonspace} non-whitespace scan chars, "
+            f"a lexical ratio of {ratio} (under {_MIN_SCAN_LEXICAL_RATIO:.2f})"
+        )
+    if len(tokens) >= _MIN_SCAN_TOKENS:
+        noisy = sum(1 for tok in tokens if _is_intraword_noise_token(tok))
+        if noisy / len(tokens) > _MAX_SCAN_NOISE_TOKEN_RATIO:
+            return f"{noisy} of {len(tokens)} scan OCR tokens carry intraword symbol noise"
+    return None
+
+
+def _shortfalls(
+    text: _VisibleText,
+    painted: bool,
+    *,
+    pieces: tuple[SpanPiece, ...] = (),
+    cover: float = 0.0,
+) -> tuple[_Shortfall, ...]:
+    """Why the page's visible text cannot stand: too few valid chars, garbled text, or both; else empty."""
     found: list[_Shortfall] = []
     if text.counted < _MIN_TEXT_CHARS and painted:
         few = f"{text.counted} valid, visible, non-whitespace chars (under {_MIN_TEXT_CHARS})"
@@ -1206,6 +1259,10 @@ def _shortfalls(text: _VisibleText, painted: bool) -> tuple[_Shortfall, ...]:
         ratio = f"0.{text.valid * 1000 // text.chars:03d}"
         share = f"{text.valid} valid chars of its {text.chars} visible ones (leader runs aside)"
         found.append(_Shortfall("garbled_text", f"{share}, a ratio of {ratio} (under {_MIN_VALID_RATIO:.2f})"))
+    elif cover > _OCR_LAYER_COVER and text.counted >= _MIN_TEXT_CHARS and pieces:
+        mojibake = _scan_mojibake_note(pieces)
+        if mojibake is not None:
+            found.append(_Shortfall("garbled_text", mojibake))
     return tuple(found)
 
 

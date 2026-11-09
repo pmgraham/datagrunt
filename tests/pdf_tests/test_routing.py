@@ -1761,3 +1761,55 @@ class TestRecoveryIntegration:
         result = assess_page(raw, recovered=recover_dropped_text(handle, 0))
 
         assert (result.route, result.warnings) == ("digital", (UNRECOVERED_WARNING.format(count=1),))
+
+
+class TestScanLexicalShortfall:
+    """Searchable scans (cover > 50 %) with ASCII-Mojibake OCR layers route vision / mark garbled_text."""
+
+    MOJIBAKE_SOUP = "|l1!O0~^ 060G-112S $l4.2O /// === ::: ;;; --- +++ 1lI0O |l1!O0~^"
+    INTRAWORD_NOISE = "|l1!O0~^ l1I|0O! $l4.2O |1I0Ol! ~^|l10O 060G!112S"
+
+    def test_ascii_mojibake_symbol_soup_over_scan_is_garbled_and_routes_vision(self):
+        span = text_span(self.MOJIBAKE_SOUP, render_mode=3)
+
+        auto = assess(span, images=(FULL_BLEED,), ocr="auto")
+        never = assess(span, images=(FULL_BLEED,), ocr="never")
+        digital_no_scan = assess(text_span(self.MOJIBAKE_SOUP), images=(), ocr="auto")
+
+        assert auto.quality.valid_char_ratio == 1.0
+        assert (auto.route, auto.image_only_reasons, auto.warnings) == ("vision", ("garbled_text",), ())
+        assert (never.route, never.image_only_reasons) == ("digital", ("garbled_text",))
+        assert len(never.warnings) == 1 and "ocr='never'" in never.warnings[0]
+        # Without > 50 % scan cover, digital ASCII symbol/code pages stay digital.
+        assert (digital_no_scan.route, digital_no_scan.image_only_reasons) == ("digital", ())
+
+    def test_intraword_ocr_noise_tokens_over_scan_are_garbled(self):
+        span = text_span(self.INTRAWORD_NOISE, render_mode=3)
+
+        auto = assess(span, images=(FULL_BLEED,), ocr="auto")
+        never = assess(span, images=(FULL_BLEED,), ocr="never")
+
+        assert (auto.route, auto.image_only_reasons) == ("vision", ("garbled_text",))
+        assert (never.route, never.image_only_reasons) == ("digital", ("garbled_text",))
+
+    @pytest.mark.parametrize(
+        "clean_layer",
+        [
+            pytest.param(
+                "060G-1125  $42.50  100  $4,250.00  060G-1126  $18.75  250  $4,687.50",
+                id="sku-price-table",
+            ),
+            pytest.param(
+                "| 060G-1125 | Expansion Valve | $42.50 | 060G-1126 | Solenoid Coil | $18.75 |",
+                id="pipe-delimited-table",
+            ),
+            pytest.param(
+                "Introduction .................... 12  Getting started ................. 24",
+                id="toc-dot-leaders",
+            ),
+        ],
+    )
+    def test_clean_numeric_sku_tables_and_toc_leaders_over_scan_stay_hybrid(self, clean_layer):
+        got = assess(text_span(clean_layer, render_mode=3), images=(FULL_BLEED,), ocr="auto")
+
+        assert (got.route, got.image_only_reasons, got.warnings) == ("hybrid", (), ())
