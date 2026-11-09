@@ -209,8 +209,7 @@ from dataclasses import dataclass, field
 from itertools import groupby
 from typing import NamedTuple, get_args
 
-from datagrunt.pdf._compute import backend as compute_backend
-from datagrunt.pdf._hidden_rules import em_reasons, off_page  # noqa: F401
+from datagrunt.pdf._hidden_rules import em_reasons, off_page
 from datagrunt.pdf._options import OcrMode
 from datagrunt.pdf._pdfium_common import Box, union_box
 from datagrunt.pdf._pdfium_images import RawImage
@@ -270,6 +269,13 @@ _OCR_LAYER_COVER = 0.5
 _MIN_TEXT_CHARS = 20
 # The valid share of its visible chars a page needs to stay out of vision (spec §3.3 step 2, #417).
 _MIN_VALID_RATIO = 0.70
+# On raster-covered scans (> 50 % cover), valid non-leader non-space text must have at least this lexical share.
+_MIN_SCAN_LEXICAL_RATIO = 0.55
+# On raster-covered scans with >= 4 tokens, intraword OCR-noise tokens above this share mark garbled_text.
+_MAX_SCAN_NOISE_TOKEN_RATIO = 0.40
+_MIN_SCAN_TOKENS = 4
+_SCAN_LEADER_CHARS = frozenset("._-…")
+_INTRAWORD_NOISE_CHARS = frozenset("|~^`\\")
 # The image-only reasons routing records (#470): the count's shortfall, then the ratio's, in IMAGE_ONLY_REASONS order.
 _SHORTFALL_REASONS: tuple[ImageOnlyReason, ...] = ("too_little_text", "garbled_text")
 # A run of this many identical invalid chars or more is a leader or a rule, not text: the routing ratio leaves it out.
@@ -417,13 +423,16 @@ def _span_pieces(span: RawSpan, width: float, height: float, raster: tuple[Box, 
     under = _overlapping(span.bbox, raster) if no_paint else ()
     flagged = dict.fromkeys(em_reasons(span.em_width_pt, abs(span.font_size_pt)), True)
     flagged["transparent"] = _transparent(span)
-    for start, end, is_off, is_inv in compute_backend().pdf_char_reason_runs(
-        span.char_boxes, width, height, no_paint, under
-    ):
-        flagged["off_page"] = is_off
-        flagged["invisible"] = is_inv
-        reasons = tuple(reason for reason in HIDDEN_REASONS if flagged.get(reason, False))
-        yield SpanPiece(span=span, start=start, end=end, hidden_reasons=reasons)
+    reasons: list[tuple[HiddenReason, ...]] = []
+    for box in span.char_boxes:
+        flagged["off_page"] = off_page(box, width, height)
+        flagged["invisible"] = no_paint and not _over_raster(box, under)
+        reasons.append(tuple(reason for reason in HIDDEN_REASONS if flagged.get(reason, False)))
+    start = 0
+    for end in range(1, len(reasons) + 1):
+        if end == len(reasons) or reasons[end] != reasons[start]:
+            yield SpanPiece(span=span, start=start, end=end, hidden_reasons=reasons[start])
+            start = end
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -504,10 +513,19 @@ def _scale(backdrop: Backdrop, width: float, height: float) -> tuple[float, floa
 
 
 def _flag_background(
-    pieces: tuple[SpanPiece, ...], backdrop: Backdrop, scale: tuple[float, float]
+    pieces: tuple[SpanPiece, ...],
+    backdrop: Backdrop,
+    scale: tuple[float, float],
+    *,
+    selected: tuple[bool, ...] | None = None,
 ) -> tuple[SpanPiece, ...]:
-    """:func:`flag_background` of checked input, at the backdrop's ``scale``."""
-    return tuple(_background_flagged(piece, backdrop, scale) for piece in pieces)
+    """:func:`flag_background` of checked input, skipping unselected pieces when ``selected`` is given."""
+    if selected is None:
+        return tuple(_background_flagged(piece, backdrop, scale) for piece in pieces)
+    return tuple(
+        _background_flagged(piece, backdrop, scale) if is_selected else piece
+        for piece, is_selected in zip(pieces, selected, strict=True)
+    )
 
 
 def _background_flagged(piece: SpanPiece, backdrop: Backdrop, scale: tuple[float, float]) -> SpanPiece:
@@ -537,23 +555,36 @@ def _paint_rgb(span: RawSpan) -> tuple[int, int, int]:
 
 def _background_rgb(piece: SpanPiece, backdrop: Backdrop, scale: tuple[float, float]) -> tuple[int, int, int]:
     """The piece's background: each channel's median over its chars' backgrounds, as red, green, blue."""
-    samples = compute_backend().pdf_char_bgr_medians(
-        backdrop.pixels,
-        backdrop.px_width,
-        backdrop.px_height,
-        scale[0],
-        scale[1],
-        piece.span.char_boxes[piece.start : piece.end],
-    )
+    samples = [_char_bgr(box, backdrop, scale) for box in piece.span.char_boxes[piece.start : piece.end]]
     blue, green, red = (_median([sample[channel] for sample in samples]) for channel in range(_BGR_BYTES))
     return red, green, blue
 
 
 def _char_bgr(box: Box, backdrop: Backdrop, scale: tuple[float, float]) -> tuple[int, int, int]:
-    """A char's background: each channel's median over the backdrop's pixels under its box, as blue, green, red."""
-    return compute_backend().pdf_char_bgr_medians(
-        backdrop.pixels, backdrop.px_width, backdrop.px_height, scale[0], scale[1], (box,)
-    )[0]
+    """A char's background: each channel's median over the backdrop's pixels under its box, as blue, green, red.
+
+    Each row is three strided slices of the backdrop (one a channel): at
+    most MAX_SAMPLES_PER_AXIS rows of at most MAX_SAMPLES_PER_AXIS pixels.
+    """
+    x0, y0, x1, y1 = box
+    columns = _pixel_run(x0 * scale[0], x1 * scale[0], backdrop.px_width)
+    rows = _pixel_run(y0 * scale[1], y1 * scale[1], backdrop.px_height)
+    row_bytes, step = backdrop.px_width * _BGR_BYTES, columns.step * _BGR_BYTES
+    first, last = columns.start * _BGR_BYTES, columns[-1] * _BGR_BYTES
+    if columns.step == 1 and len(columns) > 1:
+        width_bytes = len(columns) * _BGR_BYTES
+        row0 = rows[0] * row_bytes + first
+        pixel0 = backdrop.pixels[row0 : row0 + _BGR_BYTES]
+        solid_row = pixel0 * len(columns)
+        if all(backdrop.pixels[r * row_bytes + first : r * row_bytes + first + width_bytes] == solid_row for r in rows):
+            return pixel0[0], pixel0[1], pixel0[2]
+    channels: tuple[list[int], list[int], list[int]] = ([], [], [])
+    for row in rows:  # at most MAX_SAMPLES_PER_AXIS
+        base = row * row_bytes
+        for channel, values in enumerate(channels):
+            values.extend(backdrop.pixels[base + first + channel : base + last + channel + 1 : step])
+    blue, green, red = (_median(values) for values in channels)
+    return blue, green, red
 
 
 def _pixel_run(low: float, high: float, size: int) -> range:
@@ -609,7 +640,18 @@ def _cover_fraction(boxes: tuple[Box, ...], width: float, height: float) -> floa
 
 def _union_area(boxes: list[Box]) -> float:
     """The exact area of the union of non-empty ``boxes``: sweep over x, cover tree over y."""
-    return compute_backend().pdf_union_area(boxes)
+    edges = sorted({y for box in boxes for y in (box[1], box[3])})
+    rank = {y: index for index, y in enumerate(edges)}
+    opening = [(box[0], 1, rank[box[1]], rank[box[3]]) for box in boxes]
+    closing = [(box[2], -1, rank[box[1]], rank[box[3]]) for box in boxes]
+    events = sorted(opening + closing)
+    tree = _CoverTree(edges)
+    area, previous_x = 0.0, events[0][0]
+    for x, delta, low, high in events:
+        area += tree.covered() * (x - previous_x)
+        tree.add(low, high, delta)
+        previous_x = x
+    return area
 
 
 class _CoverTree:
@@ -783,11 +825,12 @@ def assess_page(
         own = _recovered_own(recovered, width, height, boxes, cover)
     if isinstance(background, Backdrop):
         scale = _scale(background, width, height)
-        pieces, own = _flag_background(pieces, background, scale), _flag_background(own, background, scale)
+        pieces = _flag_background(pieces, background, scale, selected=_gate_selection(pieces, page))
+        own = _flag_background(own, background, scale, selected=_gate_selection(own, page))
     elif background is not None:
         pieces, own = _flag_unchecked(pieces, page), _flag_unchecked(own, page)
     flagged, unchecked = _duplicates_flagged(own, pieces)
-    route, warnings, reasons = _route(_visible_text(pieces), cover, _painted(page), ocr)
+    route, warnings, reasons = _route(_visible_text(pieces), cover, _painted(page), ocr, pieces=pieces)
     warnings += _recovery_warnings(recovered, page.text.stats.dropped_text_objects)
     return PageAssessment(
         pieces=pieces,
@@ -1111,7 +1154,8 @@ def _painted(page: RawPage) -> bool:
     images, objects = page.images.stats, page.object_boxes
     if images.max_cover_fraction > 0.0 or images.skipped_nonfinite_images or objects.unboxed:
         return True
-    return _cover_fraction(objects.boxes, page.geometry.width_pt, page.geometry.height_pt) > 0.0
+    width, height = page.geometry.width_pt, page.geometry.height_pt
+    return any(max(x0, 0.0) < min(x1, width) and max(y0, 0.0) < min(y1, height) for x0, y0, x1, y1 in objects.boxes)
 
 
 class _Routing(NamedTuple):
@@ -1129,16 +1173,16 @@ class _Shortfall(NamedTuple):
     note: str
 
 
-def _route(text: _VisibleText, cover: float, painted: bool, ocr: OcrMode) -> _Routing:
-    """The page's route, warnings and image-only reasons, from its visible text, raster cover and paint (module notes).
-
-    The reasons are the shortfalls of :func:`_shortfalls`, in
-    ``IMAGE_ONLY_REASONS`` order, found in every mode (``"always"`` too: a
-    page OCR then cannot read is marked as under ``"auto"``). A page with
-    any routes vision, or stays digital (with a warning naming each) under
-    ``ocr="never"``; ``"always"`` routes every page vision, with no warning.
-    """
-    shortfalls = _shortfalls(text, painted)
+def _route(
+    text: _VisibleText,
+    cover: float,
+    painted: bool,
+    ocr: OcrMode,
+    *,
+    pieces: tuple[SpanPiece, ...] = (),
+) -> _Routing:
+    """The page's route, warnings and image-only reasons, from its visible text, raster cover and paint."""
+    shortfalls = _shortfalls(text, painted, pieces=pieces, cover=cover)
     reasons = tuple(shortfall.reason for shortfall in shortfalls)
     if ocr == "always":
         return _Routing("vision", (), reasons)
@@ -1152,15 +1196,61 @@ def _route(text: _VisibleText, cover: float, painted: bool, ocr: OcrMode) -> _Ro
     return _Routing("hybrid" if cover > _OCR_LAYER_COVER and ocr != "never" else "digital", (), ())
 
 
-def _shortfalls(text: _VisibleText, painted: bool) -> tuple[_Shortfall, ...]:
-    """Why the page's visible text cannot stand: too few valid chars, too small a valid share, or both; else empty.
+def _is_lexical_char(char: str) -> bool:
+    """True if ``char`` is a letter, number, mark, or format joiner in any Unicode script."""
+    cat = unicodedata.category(char)
+    return cat[0] in ("L", "N", "M") or cat == "Cf"
 
-    Too few (``too_little_text``) counts only on a ``painted`` page (module
-    notes, P2-C); too small a share is ``garbled_text``. A page with no
-    visible char outside leader runs has no ratio: its count (0) decides.
-    The ratio is shown cut to 3 places (exact, in integers), so one under
-    0.70 never reads as 0.700.
-    """
+
+def _is_intraword_noise_token(token: str) -> bool:
+    """True when ``token`` mixes alphanumeric characters with intraword OCR-noise symbols."""
+    if len(token) < 2 or not any(ch.isalnum() for ch in token):
+        return False
+    return any(ch in _INTRAWORD_NOISE_CHARS for ch in token) or "!" in token[:-1]
+
+
+def _scan_mojibake_note(pieces: tuple[SpanPiece, ...]) -> str | None:
+    """Return a shortfall note when visible text over a >50 % raster scan is ASCII-Mojibake noise."""
+    lexical = nonspace = 0
+    tokens: list[str] = []
+    for piece in pieces:
+        if piece.hidden_reasons:
+            continue
+        span = piece.span
+        valid_chars: list[str] = []
+        runs = groupby(range(piece.start, piece.end), key=lambda offset: (span.text[offset], _valid(span, offset)))
+        for (char, is_valid), run in runs:
+            if not is_valid:
+                continue
+            length = sum(1 for _ in run)
+            valid_chars.append(char * length)
+            if char.isspace() or (char in _SCAN_LEADER_CHARS and length >= _MIN_LEADER_RUN):
+                continue
+            nonspace += length
+            if _is_lexical_char(char):
+                lexical += length
+        tokens.extend("".join(valid_chars).split())
+    if nonspace >= _MIN_TEXT_CHARS and lexical / nonspace < _MIN_SCAN_LEXICAL_RATIO:
+        ratio = f"0.{lexical * 1000 // nonspace:03d}"
+        return (
+            f"{lexical} lexical chars of {nonspace} non-whitespace scan chars, "
+            f"a lexical ratio of {ratio} (under {_MIN_SCAN_LEXICAL_RATIO:.2f})"
+        )
+    if len(tokens) >= _MIN_SCAN_TOKENS:
+        noisy = sum(1 for tok in tokens if _is_intraword_noise_token(tok))
+        if noisy / len(tokens) > _MAX_SCAN_NOISE_TOKEN_RATIO:
+            return f"{noisy} of {len(tokens)} scan OCR tokens carry intraword symbol noise"
+    return None
+
+
+def _shortfalls(
+    text: _VisibleText,
+    painted: bool,
+    *,
+    pieces: tuple[SpanPiece, ...] = (),
+    cover: float = 0.0,
+) -> tuple[_Shortfall, ...]:
+    """Why the page's visible text cannot stand: too few valid chars, garbled text, or both; else empty."""
     found: list[_Shortfall] = []
     if text.counted < _MIN_TEXT_CHARS and painted:
         few = f"{text.counted} valid, visible, non-whitespace chars (under {_MIN_TEXT_CHARS})"
@@ -1169,6 +1259,10 @@ def _shortfalls(text: _VisibleText, painted: bool) -> tuple[_Shortfall, ...]:
         ratio = f"0.{text.valid * 1000 // text.chars:03d}"
         share = f"{text.valid} valid chars of its {text.chars} visible ones (leader runs aside)"
         found.append(_Shortfall("garbled_text", f"{share}, a ratio of {ratio} (under {_MIN_VALID_RATIO:.2f})"))
+    elif cover > _OCR_LAYER_COVER and text.counted >= _MIN_TEXT_CHARS and pieces:
+        mojibake = _scan_mojibake_note(pieces)
+        if mojibake is not None:
+            found.append(_Shortfall("garbled_text", mojibake))
     return tuple(found)
 
 

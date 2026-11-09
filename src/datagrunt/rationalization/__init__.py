@@ -24,10 +24,11 @@ from datagrunt.rationalization._extra import LAZY_CLASSES as _LAZY_CLASSES
 from datagrunt.rationalization._extra import LAZY_FUNCTIONS as _LAZY_FUNCTIONS
 from datagrunt.rationalization._extra import load as _load
 from datagrunt.rationalization.exceptions import RationalizationError
-from datagrunt.rationalization.markers import Key
+from datagrunt.rationalization.markers import Informational, Key
 
 __all__ = [
     "Key",
+    "Informational",
     "RationalizationError",
     "rationalize",
     "RationalizedResult",

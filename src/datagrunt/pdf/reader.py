@@ -163,6 +163,8 @@ from datagrunt.pdf.exceptions import BundleCorruptError
 from datagrunt.pdf.frame import ARROW_SCHEMA, element_frame
 from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, extract_document
 
+_default_extract_document = extract_document
+
 __all__ = ["PDFReader"]
 
 _SAMPLE_ROWS = 20  # get_sample's default, the CSV readers' sample size
@@ -245,6 +247,8 @@ class PDFReader:
         max_render_pixels: int = 16_000_000,
         min_image_dimension: int = MIN_IMAGE_DIMENSION,
         strict: bool = False,
+        sandbox: bool = False,
+        orientation_fallback: bool = False,
     ) -> None:
         self._options = PipelineOptions(
             workers=workers,
@@ -254,6 +258,8 @@ class PDFReader:
             max_render_pixels=max_render_pixels,
             min_image_dimension=min_image_dimension,
             strict=strict,
+            sandbox=sandbox,
+            orientation_fallback=orientation_fallback,
         )
         self._source = _checked_source(source, password)
         self._document: PDFDocument | None = None
@@ -449,6 +455,20 @@ def _read(source: _Source, options: PipelineOptions) -> PDFDocument:
         return source
     if isinstance(source, _Bundle):
         return load_bundle(source.root)
+    if extract_document is _default_extract_document and (options.sandbox or options.orientation_fallback):
+        return extract_document(
+            source.path,
+            password=source.password,
+            workers=options.workers,
+            ocr=options.ocr,
+            dpi=options.dpi,
+            vision_dpi=options.vision_dpi,
+            max_render_pixels=options.max_render_pixels,
+            min_image_dimension=options.min_image_dimension,
+            strict=options.strict,
+            sandbox=options.sandbox,
+            orientation_fallback=options.orientation_fallback,
+        )
     return extract_document(
         source.path,
         password=source.password,

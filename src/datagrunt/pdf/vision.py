@@ -253,7 +253,7 @@ from datagrunt.pdf.elements import (
 )
 from datagrunt.pdf.exceptions import PDFCorruptError
 from datagrunt.pdf.layout import LatticeResult, find_lattice_tables, page_layout
-from datagrunt.pdf.ocr import OCRWord, Orientation, bands, normalized, ocr_words, orientation, rotated
+from datagrunt.pdf.ocr import _TURNS, OCRWord, Orientation, bands, normalized, ocr_words, orientation, rotated
 from datagrunt.pdf.pdfium_engine import (
     DocumentHandle,
     PageFailure,
@@ -264,6 +264,8 @@ from datagrunt.pdf.pdfium_engine import (
 )
 from datagrunt.pdf.quality import OcrMode, PageAssessment, SpanPiece, valid_char
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page
+
+_default_render_page = render_page
 
 __all__ = [
     "LEAST_SIZE_PT",
@@ -641,7 +643,12 @@ def vision_page(
     if reading.failure:
         return _unread(raw_page, assessment, reading.failure, image, where, min_image_dimension, options)
     figures = page_figures(
-        raw_page.images, geometry, source=source, password=password, min_image_dimension=min_image_dimension
+        raw_page.images,
+        geometry,
+        source=source,
+        password=password,
+        min_image_dimension=min_image_dimension,
+        sandbox=options.sandbox,
     )
     laid = vision_elements(
         reading.words,
@@ -697,14 +704,26 @@ def _drawn(
         left = deadline - time.monotonic()
         if left <= 0.0:
             return _Drawn(None, 0, f"the page was not rendered: {_spent(options)}")
-        page = render_page(
-            source,
-            geometry.page_number - 1,
-            dpi=dpi,
-            password=password,
-            memory_cap_bytes=options.memory_cap_bytes,
-            timeout_s=min(options.render_timeout_s, left),
-        )
+        if not options.sandbox and render_page is _default_render_page:
+            from datagrunt.pdf import _render_worker
+
+            page = _render_worker.draw_page_in_process(
+                source,
+                geometry.page_number - 1,
+                dpi=dpi,
+                password=password,
+                memory_cap_bytes=options.memory_cap_bytes,
+                annotations=True,
+            )
+        else:
+            page = render_page(
+                source,
+                geometry.page_number - 1,
+                dpi=dpi,
+                password=password,
+                memory_cap_bytes=options.memory_cap_bytes,
+                timeout_s=min(options.render_timeout_s, left),
+            )
     except (RenderRefused, RenderFailed) as exc:
         return _Drawn(None, 0, f"the page was not rendered: {exc}")
     return _Drawn(page, dpi, "")
@@ -742,6 +761,8 @@ def _read(page: RenderedPage, dpi: int, geometry: PageGeometry, options: VisionO
         deadline=deadline,
     )
     if result.status == "ok":
+        if _needs_orientation_vote(found, result.words, options):
+            return _voted_reading(grey, dpi, geometry, options, deadline, turn, notes, result.words)
         return _Reading(result.words, turn, notes, "")
     unused = f"; the {len(result.words)} word(s) it read before that are not used" if result.words else ""
     if result.status == "spent":
@@ -753,6 +774,59 @@ def _read(page: RenderedPage, dpi: int, geometry: PageGeometry, options: VisionO
 def _spent(options: VisionOptions) -> str:
     """Why a page's render or OCR stopped: its budget ran out."""
     return f"the page's {options.page_budget_s:g} s budget is spent"
+
+
+def _vote_score(words: tuple[OCRWord, ...]) -> float:
+    """Confidence-weighted word score ``mean_conf * min(len(words) / 200, 1.0)`` for 4-way orientation voting."""
+    mean = _mean_confidence(words)
+    if mean is None:
+        return 0.0
+    return mean * min(len(words) / 200.0, 1.0)
+
+
+def _needs_orientation_vote(found: Orientation, words: tuple[OCRWord, ...], options: VisionOptions) -> bool:
+    """True when ``orientation_fallback`` is enabled and OSD failed/was weak or mean confidence is < 70."""
+    if not options.orientation_fallback:
+        return False
+    osd_weak = found.status != "ok" or found.confidence is None or found.confidence < ROTATION_CONFIDENCE
+    mean = _mean_confidence(words)
+    return osd_weak or mean is None or mean < LOW_OCR_CONFIDENCE
+
+
+def _voted_reading(
+    grey: RenderedPage,
+    dpi: int,
+    geometry: PageGeometry,
+    options: VisionOptions,
+    deadline: float,
+    initial_turn: int,
+    initial_notes: tuple[str, ...],
+    initial_words: tuple[OCRWord, ...],
+) -> _Reading:
+    """Evaluate the remaining right-angle turns within ``deadline`` and adopt a higher-scoring orientation."""
+    best_turn, best_words, best_score = initial_turn, initial_words, _vote_score(initial_words)
+    size_pt = (geometry.width_pt, geometry.height_pt)
+    for candidate in _TURNS:
+        if candidate == initial_turn or deadline - time.monotonic() <= 0.0:
+            continue
+        cand_res = ocr_words(
+            bands(rotated(grey, candidate)),
+            dpi=dpi,
+            rotation=candidate,
+            page_size_pt=size_pt,
+            timeout_s=options.ocr_timeout_s,
+            language=options.language,
+            deadline=deadline,
+        )
+        if cand_res.status != "ok":
+            break
+        score = _vote_score(cand_res.words)
+        if score > best_score:
+            best_turn, best_words, best_score = candidate, cand_res.words, score
+    if best_turn == initial_turn:
+        return _Reading(initial_words, initial_turn, initial_notes, "")
+    note = f"the page reads turned: 4-way OCR vote righted it by {best_turn} degrees clockwise (score {best_score:.1f})"
+    return _Reading(best_words, best_turn, (note,), "")
 
 
 def _turn(found: Orientation) -> tuple[int, tuple[str, ...]]:
@@ -788,6 +862,7 @@ def _page_image(
         timeout_s=options.render_timeout_s,
         identity=where.identity,
         sha256=where.sha256,
+        sandbox=options.sandbox,
     )
     return PageImage(
         page_number=geometry.page_number,
@@ -844,6 +919,7 @@ def _unread(
         min_image_dimension=min_image_dimension,
         dpi=options.vision_dpi,
         max_render_pixels=options.max_render_pixels,
+        sandbox=options.sandbox,
     )
     return dataclasses.replace(
         page, page_image=image, warnings=(*page.warnings, f"OCR could not read the page: {reason}")

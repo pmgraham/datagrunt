@@ -2287,3 +2287,47 @@ class TestImageOnlyPages:
                 unit_id=f"{DOC}:p0002", reason="image_only", page_numbers=(2,), hidden_excluded=(("invisible", 1),)
             ),
         )
+
+
+PNG_BAND_A = b"\x89PNG\r\n\x1a\nBAND_A"
+PNG_BAND_B = b"\x89PNG\r\n\x1a\nBAND_B"
+
+
+class TestMultimodalUnits:
+    def test_multimodal_packs_vision_and_image_only_pages_with_visuals_without_leaking_text(self):
+        from datagrunt.pdf.elements import PageImage
+
+        p_img_1 = PageImage(
+            page_number=1,
+            dpi=300.0,
+            width_px=2550,
+            height_px=3300,
+            _band_loader=lambda: (PNG_BAND_A, PNG_BAND_B),
+        )
+        p_img_2 = PageImage(
+            page_number=2,
+            dpi=300.0,
+            width_px=2550,
+            height_px=3300,
+            _band_loader=lambda: (PNG_BAND_A,),
+        )
+        ocr_para = para(1, 0, "OCR WITNESS SECRET")
+        garbled_para = para(2, 0, SECRET)
+        hidden_para = para(2, 1, "ghost", hidden=("invisible",))
+        digital_para = para(3, 0, "Clean digital text")
+
+        doc = document(
+            page(1, (ocr_para,), route="vision", page_image=p_img_1),
+            marked(2, (garbled_para, hidden_para), page_image=p_img_2),
+            page(3, (digital_para,), route="digital"),
+            marked(4, (para(4, 0, SECRET),)),  # no page_image -> stays SkippedUnit("image_only")
+        )
+
+        plan = build_units(doc, max_unit_chars=BIG, render=markdown, coalesce_sections=True, multimodal=True)
+
+        assert [u.page_numbers for u in plan.units] == [(1,), (2,), (3,)]
+        assert [u.vision for u in plan.units] == [True, True, False]
+        assert "OCR WITNESS SECRET" not in BLOCK_SEPARATOR.join(plan.units[0].blocks)
+        assert SECRET not in BLOCK_SEPARATOR.join(plan.units[1].blocks)
+        assert plan.units[1].hidden_excluded == (("invisible", 1),)
+        assert [(s.reason, s.page_numbers) for s in plan.skipped] == [("image_only", (4,))]

@@ -20,10 +20,12 @@ import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 
 from datagrunt.pdf._memory_cap import CAP_EXIT, apply_memory_cap
+from datagrunt.pdf._options import MEMORY_CAP_BYTES
 from datagrunt.pdf._pdfium_images import read_filters
 from datagrunt.pdf._process import send_message as _send
 from datagrunt.pdf._validate import int_at_least, positive_float, strict_bool
 from datagrunt.pdf.pdfium_engine import (
+    _PDFIUM_LOCK,
     DocumentHandle,
     PageGeometry,
     _checked_password,
@@ -42,6 +44,7 @@ from datagrunt.pdf.render import (
     _REQUEST_FIELDS,
     BGR_CHANNELS,
     GRAY_CHANNELS,
+    RenderedPage,
     RenderFailed,
     RenderRefused,
     _BatchRequest,
@@ -134,9 +137,17 @@ def _render_guarded(source: str | os.PathLike[str], page_index: int, dpi: int, p
         return _draw(page, geometry, dpi)
 
 
-def _draw(page: pdfium.PdfPage, geometry: PageGeometry, dpi: int, *, colour: bool = False) -> _Bitmap:
-    """Draw the loaded page at ``dpi`` on white, in 8-bit gray (24-bit BGR if ``colour``), without its annotations."""
+def _draw(
+    page: pdfium.PdfPage,
+    geometry: PageGeometry,
+    dpi: int,
+    *,
+    colour: bool = False,
+    annotations: bool = False,
+) -> _Bitmap:
+    """Draw the loaded page at ``dpi`` on white, in 8-bit gray (24-bit BGR if ``colour``)."""
     drawn = _BGR if colour else _GRAY
+    flags = drawn.flags | (pdfium_c.FPDF_ANNOT if annotations else 0)
     width, height = render_size(geometry.width_pt, geometry.height_pt, dpi)
     if width < 1 or height < 1:
         message = f"page {geometry.page_number} renders {width} x {height} px at {dpi} DPI; the page is not rendered"
@@ -152,7 +163,7 @@ def _draw(page: pdfium.PdfPage, geometry: PageGeometry, dpi: int, *, colour: boo
             raise RenderFailed(f"page {geometry.page_number}: pdfium cannot fill a {width} x {height} bitmap")
         _decode_jbig2_first(page, geometry.page_number)
         # Rotation 0 draws the page as displayed (its /Rotate applied), filling the bitmap.
-        pdfium_c.FPDF_RenderPageBitmap(bitmap, page.raw, 0, 0, width, height, 0, drawn.flags)
+        pdfium_c.FPDF_RenderPageBitmap(bitmap, page.raw, 0, 0, width, height, 0, flags)
     finally:
         pdfium_c.FPDFBitmap_Destroy(bitmap)
     del buffer  # releases the mapping's export, so it can be sent and closed
@@ -352,3 +363,80 @@ def _batch_request_from(message: dict[str, object]) -> _BatchRequest:
         colour=strict_bool("colour", message["colour"]),
         without_text=strict_bool("without_text", message["without_text"]),
     )
+
+
+def _check_pixel_cap(geometry: PageGeometry, dpi: int, channels: int, memory_cap_bytes: int) -> None:
+    width, height = render_size(geometry.width_pt, geometry.height_pt, dpi)
+    if width >= 1 and height >= 1 and width * height * channels > memory_cap_bytes:
+        raise MemoryError(f"bitmap needs {width * height * channels} bytes, over {memory_cap_bytes}-byte cap")
+
+
+def draw_page_in_process(
+    source: str | os.PathLike[str],
+    page_index: int,
+    *,
+    dpi: int,
+    password: str | None = None,
+    memory_cap_bytes: int = MEMORY_CAP_BYTES,
+    colour: bool = False,
+    annotations: bool = True,
+) -> RenderedPage:
+    """Guard and draw ``page_index`` of ``source`` in this process under ``_PDFIUM_LOCK``."""
+    checked_source = str(_checked_path(source, "source"))
+    int_at_least("page_index", page_index, 0)
+    int_at_least("dpi", dpi, 1)
+    checked_password = _checked_password(password)
+    int_at_least("memory_cap_bytes", memory_cap_bytes, 1)
+    strict_bool("colour", colour)
+    strict_bool("annotations", annotations)
+    where = f"{checked_source}: page {page_index + 1}"
+    channels = BGR_CHANNELS if colour else GRAY_CHANNELS
+    try:
+        with _PDFIUM_LOCK, _guarded_page(checked_source, page_index, checked_password) as (page, geometry):
+            _check_pixel_cap(geometry, dpi, channels, memory_cap_bytes)
+            bitmap = _draw(page, geometry, dpi, colour=colour, annotations=annotations)
+    except RenderRefused as exc:
+        raise RenderRefused(f"{checked_source}: {exc}") from exc
+    except Exception as exc:
+        raise RenderFailed(f"{where}: the render worker failed: {type(exc).__name__}: {exc}") from exc
+    with bitmap.pixels:
+        raw = bytes(bitmap.pixels)
+    return RenderedPage(pixels=raw, px_width=bitmap.width, px_height=bitmap.height, channels=bitmap.channels)
+
+
+def draw_loaded_in_process(
+    handle: DocumentHandle,
+    source: str | os.PathLike[str],
+    page_index: int,
+    *,
+    dpi: int,
+    memory_cap_bytes: int = MEMORY_CAP_BYTES,
+    colour: bool = False,
+    without_text: bool = False,
+    annotations: bool = False,
+) -> RenderedPage:
+    """Guard and draw ``page_index`` of an already-open ``handle`` in this process under ``_PDFIUM_LOCK``."""
+    if not isinstance(handle, DocumentHandle):
+        raise TypeError(f"handle must be a DocumentHandle, got {type(handle).__name__}")
+    checked_source = str(_checked_path(source, "source"))
+    int_at_least("page_index", page_index, 0)
+    int_at_least("dpi", dpi, 1)
+    int_at_least("memory_cap_bytes", memory_cap_bytes, 1)
+    strict_bool("colour", colour)
+    strict_bool("without_text", without_text)
+    strict_bool("annotations", annotations)
+    where = f"{checked_source}: page {page_index + 1}"
+    channels = BGR_CHANNELS if colour else GRAY_CHANNELS
+    try:
+        with _PDFIUM_LOCK, _guarded(handle, page_index) as (page, geometry):
+            _check_pixel_cap(geometry, dpi, channels, memory_cap_bytes)
+            if without_text:
+                _remove_text(page, geometry.page_number)
+            bitmap = _draw(page, geometry, dpi, colour=colour, annotations=annotations)
+    except RenderRefused as exc:
+        raise RenderRefused(f"{checked_source}: {exc}") from exc
+    except Exception as exc:
+        raise RenderFailed(f"{where}: the render worker failed: {type(exc).__name__}: {exc}") from exc
+    with bitmap.pixels:
+        raw = bytes(bitmap.pixels)
+    return RenderedPage(pixels=raw, px_width=bitmap.width, px_height=bitmap.height, channels=bitmap.channels)

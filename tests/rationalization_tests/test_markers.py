@@ -105,3 +105,27 @@ class TestDirectConstruction:
     def test_rejects_a_namespace_that_is_not_a_str(self, bad):
         with pytest.raises(TypeError, match="namespace must be a str or None"):
             _KeyMarker(namespace=bad)
+
+
+class TestKeyNormalizerAndInformational:
+    def test_key_alnum_upper_normalizer_and_repr(self):
+        from datagrunt.rationalization.markers import Informational, Key
+
+        bare = Key()
+        assert bare == Key
+        k1 = Key(normalizer="alnum_upper")
+        k2 = Key("Part", normalizer="alnum_upper")
+        assert k1.namespace is None and k1.normalizer == "alnum_upper"
+        assert k2.namespace == "part" and k2.normalizer == "alnum_upper"
+        assert repr(k1) == "Key(normalizer='alnum_upper')"
+        assert repr(k2) == "Key('part', normalizer='alnum_upper')"
+        assert Informational() is Informational
+        assert repr(Informational) == "Informational"
+
+    def test_key_normalizer_rejects_bad_types_values_and_rebinding(self):
+        with pytest.raises(TypeError, match="normalizer"):
+            Key(normalizer=123)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="normalizer"):
+            Key(normalizer="bogus")  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="already has a normalizer"):
+            Key(normalizer="alnum_upper")(normalizer="alnum_upper")

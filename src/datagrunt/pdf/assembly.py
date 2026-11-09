@@ -56,7 +56,7 @@ from datagrunt.pdf._loaders import FigureRead, PageDraw
 from datagrunt.pdf._options import _MIN_DPI, _MIN_RENDER_PIXELS, DPI, MAX_RENDER_PIXELS, MIN_IMAGE_DIMENSION
 from datagrunt.pdf._pdfium_common import Box
 from datagrunt.pdf._source import SourceIdentity, check_binding
-from datagrunt.pdf._validate import int_at_least, sha256_hex, str_tuple, typed_tuple
+from datagrunt.pdf._validate import int_at_least, sha256_hex, str_tuple, strict_bool, typed_tuple
 from datagrunt.pdf.elements import (
     BBox,
     BulletList,
@@ -206,6 +206,7 @@ def page_figures(
     source: str | os.PathLike[str],
     password: str | None = None,
     min_image_dimension: int = MIN_IMAGE_DIMENSION,
+    sandbox: bool = False,
 ) -> PageFigures:
     """Draft the page's figures from the images A2 recorded (see the module notes). O(images).
 
@@ -226,6 +227,7 @@ def page_figures(
     if not isinstance(geometry, PageGeometry):
         raise TypeError(f"geometry must be a PageGeometry, got {type(geometry).__name__}")
     minimum = int_at_least("min_image_dimension", min_image_dimension, 0)
+    strict_bool("sandbox", sandbox)
     path = _checked_path(source, "source")
     drafts: list[FigureDraft] = []
     unread: list[int] = []
@@ -239,7 +241,13 @@ def page_figures(
         elif size is None:
             unsized.append(item.object_index)
         else:
-            loader = FigureRead(source=path, page_index=geometry.page_number - 1, image=item, password=password)
+            loader = FigureRead(
+                source=path,
+                page_index=geometry.page_number - 1,
+                image=item,
+                password=password,
+                sandbox=sandbox,
+            )
             drafts.append(_draft(item, size, loader, geometry))
     warnings = (
         *_image_count_warnings(images.stats),
@@ -313,6 +321,7 @@ def assemble_page(
     min_image_dimension: int = MIN_IMAGE_DIMENSION,
     dpi: int = DPI,
     max_render_pixels: int = MAX_RENDER_PIXELS,
+    sandbox: bool = False,
 ) -> Page:
     """The A1 page of a digital or hybrid page: its elements in reading order, its facts, Pass C and its image.
 
@@ -381,9 +390,15 @@ def assemble_page(
     check_binding(identity, sha256)
     int_at_least("dpi", dpi, _MIN_DPI)
     int_at_least("max_render_pixels", max_render_pixels, _MIN_RENDER_PIXELS)
+    strict_bool("sandbox", sandbox)
     geometry = raw_page.geometry
     figures = page_figures(
-        raw_page.images, geometry, source=source, password=password, min_image_dimension=min_image_dimension
+        raw_page.images,
+        geometry,
+        source=source,
+        password=password,
+        min_image_dimension=min_image_dimension,
+        sandbox=sandbox,
     )
     boxes = tuple(draft.bbox for draft in figures.drafts)
     layout = page_layout(
@@ -398,7 +413,9 @@ def assemble_page(
     verified, mismatch = pass_c(assessment, elements)
     vision = assessment.route == "vision"
     warnings = (*raw_page_warnings(raw_page), *figures.warnings, *assessment.warnings, *_lattice_warnings(lattice))
-    image, undrawn = _page_image(geometry, source, password, (identity, sha256), dpi, max_render_pixels)
+    image, undrawn = _page_image(
+        geometry, source, password, (identity, sha256), dpi, max_render_pixels, sandbox=sandbox
+    )
     warnings += (*layout.warnings, *((_VISION_NOTE,) if vision else ()), *mismatch, *undrawn)
     return Page(
         page_number=geometry.page_number,
@@ -422,6 +439,8 @@ def _page_image(
     binding: tuple[SourceIdentity | None, str | None],
     dpi: int,
     max_render_pixels: int,
+    *,
+    sandbox: bool = False,
 ) -> tuple[PageImage | None, tuple[str, ...]]:
     """The page's image, drawn when read (:func:`assemble_page`, step 5); or None and why it cannot be drawn.
 
@@ -440,6 +459,7 @@ def _page_image(
         password=password,
         identity=binding[0],
         sha256=binding[1],
+        sandbox=sandbox,
     )
     width, height = draw.size
     image = PageImage(
@@ -606,6 +626,9 @@ def raw_page_warnings(page: RawPage) -> tuple[str, ...]:
         found.append(
             f"{paths} path object(s) skipped: their geometry is not finite; their rules are missing from this page"
         )
+    bound_hit = page.segments.stats.segment_bound_hit
+    if bound_hit is not None:
+        found.append(f"{bound_hit}: no lattice tables were read; its text reads as stream text")
     return tuple(found)
 
 

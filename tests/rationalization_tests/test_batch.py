@@ -326,3 +326,53 @@ class TestOfflineCloudBatchMode:
         )
         with pytest.raises(RationalizationError, match="strict"):
             ingest_batch(plan_strict, responses)
+
+
+MM_BATCH_PNG = b"\x89PNG\r\n\x1a\nBATCH_SCAN_PNG"
+
+
+class TestMultimodalBatch:
+    def test_prepare_batch_serializes_multimodal_png_bands_for_vertex_and_anthropic(self, tmp_path) -> None:
+        import base64
+        import dataclasses
+
+        from datagrunt.pdf.elements import PageImage, PDFDocument
+
+        scan_img = PageImage(
+            page_number=1,
+            dpi=300.0,
+            width_px=1200,
+            height_px=1600,
+            _band_loader=lambda: (MM_BATCH_PNG,),
+        )
+        scan_page = dataclasses.replace(BOM_DOC.pages[0], route="vision", page_image=scan_img)
+        scan_doc = PDFDocument(
+            metadata=dataclasses.replace(BOM_DOC.metadata, page_count=1),
+            pages=(scan_page,),
+        )
+        gem = GeminiProvider("gemini-2.5-flash", api_key="AIzaSyDummyKeyForOfflineBatch12345")
+        ant = AnthropicProvider("claude-sonnet-4-6", api_key="sk-ant-dummy-key-offline-batch-12345")
+
+        plan = prepare_batch(
+            scan_doc,
+            schema=Assembly,
+            prompt="Extract BOM.",
+            models=(gem, ant),
+            multimodal=True,
+        )
+        assert len(plan.items) == 2
+        assert all(item.request.images == (MM_BATCH_PNG,) for item in plan.items)
+
+        v_path = tmp_path / "mm_vertex.jsonl"
+        a_path = tmp_path / "mm_anthropic.jsonl"
+        assert plan.to_vertex_jsonl(v_path) == 1
+        assert plan.to_anthropic_jsonl(a_path) == 1
+
+        b64 = base64.b64encode(MM_BATCH_PNG).decode("ascii")
+        v_obj = json.loads(v_path.read_text(encoding="utf-8").strip())
+        assert v_obj["request"]["contents"][0]["parts"][0] == {"inlineData": {"mimeType": "image/png", "data": b64}}
+        a_obj = json.loads(a_path.read_text(encoding="utf-8").strip())
+        assert a_obj["params"]["messages"][0]["content"][0] == {
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": b64},
+        }

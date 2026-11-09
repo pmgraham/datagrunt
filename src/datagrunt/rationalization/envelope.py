@@ -99,6 +99,7 @@ standard library, the element model and its sibling modules: no pydantic, no htt
 """
 
 import dataclasses
+import hashlib
 import json
 import re
 import secrets
@@ -107,7 +108,17 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, TypeAlias, get_args
 
-from datagrunt.pdf.elements import BulletList, DocumentElement, Figure, Heading, KeyValue, Paragraph, PDFDocument, Table
+from datagrunt.pdf.elements import (
+    BulletList,
+    DocumentElement,
+    Figure,
+    Heading,
+    KeyValue,
+    PageImage,
+    Paragraph,
+    PDFDocument,
+    Table,
+)
 from datagrunt.rationalization._canonical import canonical_json, strict_loads
 from datagrunt.rationalization.exceptions import RationalizationError
 from datagrunt.rationalization.units import (
@@ -116,9 +127,11 @@ from datagrunt.rationalization.units import (
     PartOf,
     Unit,
     _check_bool,
-    _image_only_pages,
     _shared_openers,
+    _unsent_text_pages,
     group_scopes,
+    is_multimodal_page,
+    vision_page_anchor,
 )
 
 __all__ = [
@@ -164,6 +177,17 @@ PROMPT_MAX_BYTES = 1024 * 1024
 
 SCHEMA_MAX_BYTES = 1024 * 1024
 """The most UTF-8 bytes the response schema's JSON may take in the system message."""
+
+MAX_ENVELOPE_IMAGES = 64
+MAX_ENVELOPE_IMAGE_BYTES = 32 * 1024 * 1024
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+MULTIMODAL_RULES = (
+    "Multimodal page images are attached to the user message in top-to-bottom band order for the page anchor "
+    '<el kind="figure"> block(s) in <elements>. Read the page content directly from the attached image(s), '
+    "copy grounding_quotes verbatim from the text visible in the image(s), and cite the page anchor <el> id "
+    "in source_element_ids.\n\n"
+)
 
 SYSTEM_RULES = (
     f"You extract structured records from one part of a document, for datagrunt ({ENVELOPE_FORMAT}).\n"
@@ -423,6 +447,8 @@ class _Frame:
     scopes: Mapping[str, GroupScope]
     elements: Mapping[str, DocumentElement]
     closed: frozenset[int]
+    multimodal_anchors: Mapping[int, Figure] = field(default_factory=dict)
+    multimodal_images: Mapping[int, PageImage] = field(default_factory=dict)
 
 
 def _more_note(count: int) -> str:
@@ -473,9 +499,19 @@ def _header_lines(frame: _Frame, own: frozenset[str]) -> tuple[list[str], tuple[
     return [_HEADER_OPEN, *lines, _HEADER_CLOSE], tuple(shown)
 
 
-def _frame(document: PDFDocument) -> _Frame:
-    """Read the document once; nothing of a page skipped as image-only (units module notes, 4) is framed."""
-    closed = _image_only_pages(document)
+def _frame(document: PDFDocument, *, multimodal: bool = False) -> _Frame:
+    """Read the document once; nothing of a page skipped as image-only or read multimodally is framed as text."""
+    closed = _unsent_text_pages(document, multimodal=multimodal)
+    mm_anchors = {
+        page.page_number: vision_page_anchor(page)
+        for page in document.pages
+        if is_multimodal_page(page, multimodal=multimodal)
+    }
+    mm_images = {
+        page.page_number: page.page_image
+        for page in document.pages
+        if page.page_number in mm_anchors and page.page_image is not None
+    }
     elements = {element.element_id: element for element in document.elements}
     entries = tuple(entry for entry in document.header_context if entry.page_number not in closed)
     header = _header_blocks(entries, elements)
@@ -488,10 +524,36 @@ def _frame(document: PDFDocument) -> _Frame:
             for table in document.tables
             if not table.hidden_reasons and table.page_number not in closed
         },
-        scopes=group_scopes(document),
+        scopes=group_scopes(document, multimodal=multimodal),
         elements=elements,
         closed=closed,
+        multimodal_anchors=mm_anchors,
+        multimodal_images=mm_images,
     )
+
+
+def _read_page_images(page_image: PageImage) -> tuple[bytes, ...]:
+    """Read normalized PNG bands when present, falling back to full-page PNG bytes."""
+    if page_image._band_loader is not None or page_image.band_paths:
+        return page_image.read_bands()
+    return (page_image.read_bytes(),)
+
+
+def _check_envelope_images(images: object) -> None:
+    """Require a tuple of PNG byte strings within count and byte caps."""
+    if not isinstance(images, tuple):
+        raise TypeError(f"images must be a tuple of bytes, got {type(images).__name__}")
+    if len(images) > MAX_ENVELOPE_IMAGES:
+        raise ValueError(f"images holds {len(images)} items, past {MAX_ENVELOPE_IMAGES}")
+    total = 0
+    for idx, data in enumerate(images):
+        if type(data) is not bytes:
+            raise TypeError(f"images[{idx}] must be bytes, got {type(data).__name__}")
+        if not data.startswith(_PNG_SIGNATURE):
+            raise ValueError(f"images[{idx}] must start with the PNG signature")
+        total += len(data)
+        if total > MAX_ENVELOPE_IMAGE_BYTES:
+            raise ValueError(f"images exceed {MAX_ENVELOPE_IMAGE_BYTES} bytes")
 
 
 def _header_row(table: Table) -> str:
@@ -670,6 +732,7 @@ class Envelope:
     schema_json: str = field(repr=False)
     header_element_ids: tuple[str, ...] = ()
     include_schema: bool = field(default=True, repr=False)
+    images: tuple[bytes, ...] = field(default=(), repr=False)
     envelope_format: str = field(default=ENVELOPE_FORMAT, init=False)
     system_rules: str = field(default=SYSTEM_RULES, init=False, repr=False)
     schema_lead: str = field(default=_SCHEMA_LEAD, init=False, repr=False)
@@ -678,6 +741,9 @@ class Envelope:
 
     def __post_init__(self) -> None:
         _check_bool("include_schema", self.include_schema)
+        _check_envelope_images(self.images)
+        if self.images:
+            object.__setattr__(self, "system_rules", SYSTEM_RULES + MULTIMODAL_RULES)
         _check_component("unit_id", self.unit_id)
         _check_component("prompt", self.prompt)
         if len(self.prompt.encode("utf-8")) > PROMPT_MAX_BYTES:
@@ -725,7 +791,7 @@ class Envelope:
 
     def key_material(self) -> Mapping[str, object]:
         """The components the cache key hashes: canonical-JSON-able, never the nonce (a new dict per call)."""
-        return {
+        material: dict[str, object] = {
             "format": self.envelope_format,
             "unit_id": self.unit_id,
             "system_rules": self.system_rules,
@@ -738,6 +804,9 @@ class Envelope:
             "context": self.context_json,
             "payload": self.payload,
         }
+        if self.images:
+            material["image_sha256s"] = [hashlib.sha256(img).hexdigest() for img in self.images]
+        return material
 
 
 def _check_prompt(prompt: object) -> str:
@@ -850,12 +919,25 @@ def _check_one_group(unit: Unit, frame: _Frame) -> None:
         raise ValueError(f"unit {unit.unit_id}: its elements are of {len(groups)} groups; a unit holds one group's")
 
 
+def _check_multimodal_unit(unit: Unit, anchor: Figure) -> Unit:
+    """Validate that a multimodal page unit holds the exact synthetic page anchor and empty scope."""
+    if unit.elements != (anchor,) or unit.part_of != (None,):
+        raise ValueError(f"unit {unit.unit_id}: multimodal page unit must hold its synthetic page anchor")
+    if unit.blocks != (render_element(anchor),):
+        raise ValueError(f"unit {unit.unit_id}: multimodal anchor block is not render_element's")
+    if unit.scope_path != ():
+        raise ValueError(f"unit {unit.unit_id}: multimodal page unit must have empty scope_path")
+    return unit
+
+
 def _check_unit(unit: object, frame: _Frame, *, coalesce_sections: bool = False) -> Unit:
     """Require a unit of this document: its elements the document's, its blocks rendered, its scope valid."""
     if not isinstance(unit, Unit):
         raise TypeError(f"each unit must be a Unit, got {type(unit).__name__}")
     if unit.doc_id != frame.doc_id:
         raise ValueError(f"unit {unit.unit_id} has doc_id {unit.doc_id!r}, not the document's {frame.doc_id!r}")
+    if len(unit.page_numbers) == 1 and unit.page_numbers[0] in frame.multimodal_anchors:
+        return _check_multimodal_unit(unit, frame.multimodal_anchors[unit.page_numbers[0]])
     _check_elements(unit, frame.elements)
     _check_pages_sent(unit, frame.closed)
     if not coalesce_sections:
@@ -878,6 +960,7 @@ def build_envelopes(
     schema_json: str,
     coalesce_sections: bool = False,
     include_schema: bool = True,
+    multimodal: bool = False,
 ) -> tuple[Envelope, ...]:
     """Build the envelope of each of a document's units, reading the document once.
 
@@ -909,6 +992,7 @@ def build_envelopes(
     """
     _check_bool("coalesce_sections", coalesce_sections)
     _check_bool("include_schema", include_schema)
+    _check_bool("multimodal", multimodal)
     if not isinstance(document, PDFDocument):
         raise TypeError(f"document must be a PDFDocument, got {type(document).__name__}")
     if not isinstance(units, (tuple, list)):
@@ -916,11 +1000,18 @@ def build_envelopes(
     checked_prompt = _check_prompt(prompt)
     context_json = _context_json(context)
     checked_schema = _check_schema(schema_json)
-    frame = _frame(document)
+    frame = _frame(document, multimodal=multimodal)
+    band_cache: dict[int, tuple[bytes, ...]] = {}
     envelopes = []
     for unit in units:
         checked = _check_unit(unit, frame, coalesce_sections=coalesce_sections)
         payload, header_ids = _payload(checked, frame)
+        images: tuple[bytes, ...] = ()
+        if len(checked.page_numbers) == 1 and checked.page_numbers[0] in frame.multimodal_images:
+            pno = checked.page_numbers[0]
+            if pno not in band_cache:
+                band_cache[pno] = _read_page_images(frame.multimodal_images[pno])
+            images = band_cache[pno]
         envelopes.append(
             Envelope(
                 unit_id=checked.unit_id,
@@ -930,6 +1021,7 @@ def build_envelopes(
                 schema_json=checked_schema,
                 header_element_ids=header_ids,
                 include_schema=include_schema,
+                images=images,
             )
         )
     return tuple(envelopes)
@@ -944,6 +1036,7 @@ def build_envelope(
     schema_json: str,
     coalesce_sections: bool = False,
     include_schema: bool = True,
+    multimodal: bool = False,
 ) -> Envelope:
     """Build one unit's envelope (:func:`build_envelopes` for one unit; use that for many).
 
@@ -960,4 +1053,5 @@ def build_envelope(
         schema_json=schema_json,
         coalesce_sections=coalesce_sections,
         include_schema=include_schema,
+        multimodal=multimodal,
     )[0]

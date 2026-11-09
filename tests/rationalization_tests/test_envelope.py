@@ -2588,3 +2588,48 @@ class TestImageOnlyFraming:
 
         with pytest.raises(ValueError, match="image-only"):
             build_envelope(forged, doc, prompt="p", context=None, schema_json=SCHEMA_JSON)
+
+
+MM_PNG_1 = b"\x89PNG\r\n\x1a\nMM_BAND_1"
+MM_PNG_2 = b"\x89PNG\r\n\x1a\nMM_BAND_2"
+
+
+class TestMultimodalEnvelope:
+    def test_multimodal_envelope_attaches_bands_rekeys_cache_and_withholds_ocr_and_garbled_text(self):
+        from datagrunt.pdf.elements import PageImage
+
+        img1 = PageImage(
+            page_number=1,
+            dpi=300.0,
+            width_px=1200,
+            height_px=1600,
+            _band_loader=lambda: (MM_PNG_1, MM_PNG_2),
+        )
+        img1_alt = PageImage(
+            page_number=1,
+            dpi=300.0,
+            width_px=1200,
+            height_px=1600,
+            _band_loader=lambda: (MM_PNG_1,),
+        )
+        ocr_el = para(1, 0, "OUT_OF_PROMPT_TESSERACT_TEXT")
+        doc_a = document(page(1, (ocr_el,), route="vision", page_image=img1))
+        doc_b = document(page(1, (ocr_el,), route="vision", page_image=img1_alt))
+
+        units_a = build_units(doc_a, max_unit_chars=BIG, render=render_element, multimodal=True).units
+        units_b = build_units(doc_b, max_unit_chars=BIG, render=render_element, multimodal=True).units
+
+        (env_a,) = build_envelopes(
+            units_a, doc_a, prompt="Extract parts", context=None, schema_json=SCHEMA_JSON, multimodal=True
+        )
+        (env_b,) = build_envelopes(
+            units_b, doc_b, prompt="Extract parts", context=None, schema_json=SCHEMA_JSON, multimodal=True
+        )
+
+        assert env_a.images == (MM_PNG_1, MM_PNG_2)
+        sys_msg, usr_msg = env_a.render(NONCE)
+        assert "OUT_OF_PROMPT_TESSERACT_TEXT" not in sys_msg
+        assert "OUT_OF_PROMPT_TESSERACT_TEXT" not in usr_msg
+        assert '<el id="p0001_e000" kind="figure" page="1">' in usr_msg
+        assert "image_sha256s" in env_a.key_material()
+        assert env_a.key_material()["image_sha256s"] != env_b.key_material()["image_sha256s"]

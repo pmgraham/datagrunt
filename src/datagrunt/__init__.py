@@ -63,7 +63,7 @@ from datagrunt.pdf import (
 from datagrunt.pdf._extra import LAZY_CLASSES as _LAZY_CLASSES
 from datagrunt.pdf._extra import LAZY_FUNCTIONS as _LAZY_FUNCTIONS
 from datagrunt.pdf._extra import load as _load
-from datagrunt.rationalization import Key  # needs no extra: the package imports neither pydantic nor httpx
+from datagrunt.rationalization import Informational, Key  # needs no extra: imports neither pydantic nor httpx
 from datagrunt.rationalization._extra import load as _load_rationalize
 
 # You can define __all__ to specify what gets imported with "from package
@@ -101,6 +101,7 @@ __all__ = [
     "extract_corpus",
     "load_corpus",
     "Key",
+    "Informational",
     "rationalize",
     "RationalizedResult",
     "BatchItem",

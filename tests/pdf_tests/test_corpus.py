@@ -320,3 +320,26 @@ class TestBatchExtractionAndLoading:
         assert doc_a.page_count == 1
         assert doc_b.page_count == 2
         assert pool._idle == []
+
+    def test_extract_corpus_render_pages_vision_only(self, tmp_path, sample_pdfs, monkeypatch):
+        from datagrunt.pdf import pipeline
+
+        pdf_a, pdf_b = sample_pdfs
+        out = tmp_path / "corpus_vision_only"
+        with pytest.raises(ValueError, match="render_pages"):
+            extract_corpus([pdf_a], out, render_pages="bogus")  # type: ignore[arg-type]
+        assert not out.exists()
+
+        spawned: list = []
+        monkeypatch.setattr(pipeline, "start_worker", lambda *a, **kw: spawned.append(a))
+
+        first = extract_corpus([pdf_a, pdf_b], out, dpi=72, vision_dpi=72, render_pages="vision_only")
+        assert spawned == []
+        assert len(first.entries) == 2
+        assert all(not e.reused for e in first.entries)
+        for bundle_path in first.bundle_paths:
+            assert not (bundle_path / "page_images").exists()
+        second = extract_corpus([pdf_a, pdf_b], out, dpi=72, vision_dpi=72, render_pages="vision_only", overwrite=False)
+        assert all(e.reused for e in second.entries)
+        docs = second.load_documents()
+        assert all(page.page_image is None for doc in docs for page in doc.pages)

@@ -13,6 +13,7 @@ The module imports only the standard library, pydantic, the PDF model and its si
 ``datagrunt.core``, and no import inside a function (invariant 9).
 """
 
+import base64
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -43,13 +44,28 @@ from datagrunt.rationalization.providers.anthropic import (
     _FINISH_BY_STOP_REASON as _ANTHROPIC_FINISH_BY_STOP,
 )
 from datagrunt.rationalization.providers.anthropic import (
+    FALLBACK_MECHANISM as _ANTHROPIC_FALLBACK_MECHANISM,
+)
+from datagrunt.rationalization.providers.anthropic import (
     MECHANISM as _ANTHROPIC_MECHANISM,
+)
+from datagrunt.rationalization.providers.anthropic import (
+    PROMPT_MECHANISM as _ANTHROPIC_PROMPT_MECHANISM,
 )
 from datagrunt.rationalization.providers.anthropic import (
     _answer_text as _anthropic_answer_text,
 )
 from datagrunt.rationalization.providers.anthropic import (
+    _exceeds_limits as _anthropic_exceeds_limits,
+)
+from datagrunt.rationalization.providers.anthropic import (
     _input_tokens as _anthropic_input_tokens,
+)
+from datagrunt.rationalization.providers.anthropic import (
+    _prompt_system as _anthropic_prompt_system,
+)
+from datagrunt.rationalization.providers.anthropic import (
+    _strip_json_fence as _anthropic_strip_fence,
 )
 from datagrunt.rationalization.providers.base import bounded_detail
 from datagrunt.rationalization.providers.gemini import (
@@ -112,9 +128,14 @@ def _vertex_request_body(item: "BatchItem", snapshot: ProviderSnapshot) -> dict[
         config["seed"] = params["seed"]
     if "thinking_level" in params and params["thinking_level"] is not None:
         config["thinkingConfig"] = {"thinkingLevel": params["thinking_level"]}
+    parts: list[dict[str, Any]] = [
+        {"inlineData": {"mimeType": "image/png", "data": base64.b64encode(img).decode("ascii")}}
+        for img in item.request.images
+    ]
+    parts.append({"text": item.request.user_envelope})
     return {
         "systemInstruction": {"parts": [{"text": item.request.system_prompt}]},
-        "contents": [{"role": "user", "parts": [{"text": item.request.user_envelope}]}],
+        "contents": [{"role": "user", "parts": parts}],
         "generationConfig": config,
     }
 
@@ -132,18 +153,41 @@ def _anthropic_model_name(model_id: str) -> str:
 def _anthropic_request_params(item: "BatchItem", snapshot: ProviderSnapshot) -> dict[str, Any]:
     """Construct the Anthropic Message Batches ``params`` dict for ``item``."""
     gen_params = snapshot.generation_params
+    user_content: str | list[dict[str, Any]] = (
+        [
+            *[
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": base64.b64encode(img).decode("ascii"),
+                    },
+                }
+                for img in item.request.images
+            ],
+            {"type": "text", "text": item.request.user_envelope},
+        ]
+        if item.request.images
+        else item.request.user_envelope
+    )
+    mechanism = gen_params.get("mechanism", _ANTHROPIC_MECHANISM)
+    omit_output_config = mechanism == _ANTHROPIC_PROMPT_MECHANISM or (
+        mechanism == _ANTHROPIC_FALLBACK_MECHANISM and _anthropic_exceeds_limits(item.request.json_schema)
+    )
     params: dict[str, Any] = {
         "model": _anthropic_model_name(snapshot.model_id),
         "max_tokens": item.request.max_output_tokens,
-        "system": item.request.system_prompt,
-        "messages": [{"role": "user", "content": item.request.user_envelope}],
-        "output_config": {
+        "system": _anthropic_prompt_system(item.request) if omit_output_config else item.request.system_prompt,
+        "messages": [{"role": "user", "content": user_content}],
+    }
+    if not omit_output_config:
+        params["output_config"] = {
             "format": {
                 "type": _ANTHROPIC_MECHANISM,
                 "schema": dict(item.request.json_schema),
             }
-        },
-    }
+        }
     if "temperature" in gen_params and gen_params["temperature"] is not None:
         params["temperature"] = gen_params["temperature"]
     return params
@@ -191,6 +235,7 @@ class BatchPlan:
     _file_cache: FileCache | None = field(repr=False)
     _slots: Mapping[tuple[str, str], str] = field(repr=False)
     _cache_corrupt: int = field(default=0, repr=False)
+    fold_across_units: bool = True
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "cached_hits", MappingProxyType(dict(self.cached_hits)))
@@ -292,6 +337,8 @@ def prepare_batch(
     strict: bool = False,
     coalesce_sections: bool = True,
     include_schema_in_prompt: bool = True,
+    multimodal: bool = True,
+    fold_across_units: bool = True,
     timeout_s: float = 60.0,
 ) -> BatchPlan:
     """Prepare all uncached ``(unit, model)`` requests for offline cloud batch execution (#464).
@@ -314,6 +361,8 @@ def prepare_batch(
         strict=strict,
         coalesce_sections=coalesce_sections,
         include_schema_in_prompt=include_schema_in_prompt,
+        multimodal=multimodal,
+        fold_across_units=fold_across_units,
         on_event=None,
         min_families=min_families,
     )
@@ -335,6 +384,7 @@ def prepare_batch(
         max_unit_chars=max_unit_chars,
         coalesce_sections=coalesce_sections,
         include_schema_in_prompt=include_schema_in_prompt,
+        multimodal=multimodal,
         prompt_text=prompt_text,
         context=context,
         prepared=prepared,
@@ -366,6 +416,7 @@ def prepare_batch(
             json_schema=canonical_copy(schemas_by_model[req.provider.model_id], subject="provider_schema"),
             max_output_tokens=limits.max_output_tokens,
             timeout_s=limits.timeout_s,
+            images=req.envelope.images,
         )
         items.append(
             BatchItem(
@@ -392,6 +443,7 @@ def prepare_batch(
         _file_cache=file_cache,
         _slots=slots,
         _cache_corrupt=corrupt_count,
+        fold_across_units=fold_across_units,
     )
 
 
@@ -419,7 +471,8 @@ def _parse_anthropic_batch_message(message: Mapping[str, Any]) -> ProviderRespon
     finish = _ANTHROPIC_FINISH_BY_STOP.get(stop_reason) if isinstance(stop_reason, str) else None
     text = _anthropic_answer_text(message)
     raw_text = canonical_json(dict(message), subject="anthropic batch message") if text is None else text
-    content = parse_json_object(text) if text is not None and finish is not None else None
+    cleaned = _anthropic_strip_fence(text) if text is not None else None
+    content = parse_json_object(cleaned) if cleaned is not None and finish is not None else None
     return _build_provider_response(
         content=content,
         raw_text=raw_text,
@@ -651,4 +704,5 @@ def ingest_batch(
         min_families=plan.min_families,
         must_agree=plan.must_agree,
         expect_non_empty=plan.expect_non_empty,
+        fold_across_units=plan.fold_across_units,
     )

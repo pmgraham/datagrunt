@@ -19,7 +19,6 @@ import re
 import subprocess
 import sys
 import threading
-import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -698,36 +697,80 @@ class TestAtomicWrite:
         assert files_in(leftover) == {"partial.png"}
 
     def test_a_writer_killed_mid_run_leaves_no_output_dir(self, tmp_path, fast_render):
+        import selectors
+
         pdf = build_pdf(tmp_path / "six.pdf", [PageSpec(items=(TextRun(f"Page {n}", 72.0, 100.0),)) for n in range(6)])
         out = tmp_path / "out"
         script = (
-            "import sys, time\n"
+            "import sys\n"
             "from datagrunt.pdf import bundle\n"
             "from datagrunt.pdf.pipeline import extract_document\n"
-            "real = bundle.render_page\n"
-            "def slow(*args, **kwargs):\n"
-            "    time.sleep(0.5)\n"
-            "    return real(*args, **kwargs)\n"
-            "bundle.render_page = slow\n"
+            "real_write = bundle._write_stream\n"
+            "signaled = False\n"
+            "def gated_write(staging, relative, fill):\n"
+            "    global signaled\n"
+            "    artifact = real_write(staging, relative, fill)\n"
+            "    if not signaled and relative.startswith('page_images/page_'):\n"
+            "        signaled = True\n"
+            "        sys.stdout.write('STAGED\\n')\n"
+            "        sys.stdout.flush()\n"
+            "        sys.stdin.read(1)\n"
+            "    return artifact\n"
+            "bundle._write_stream = gated_write\n"
             "document = extract_document(sys.argv[1])\n"
             "bundle.write_bundle(document, sys.argv[2], source=sys.argv[1], dpi=72, vision_dpi=72)\n"
         )
-        writer = subprocess.Popen([sys.executable, "-c", script, str(pdf), str(out)], cwd=tmp_path)
+        writer = subprocess.Popen(
+            [sys.executable, "-c", script, str(pdf), str(out)],
+            cwd=tmp_path,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
         try:
-            deadline = time.monotonic() + 60.0
-            while not list(tmp_path.glob(".tmp_*/page_images/page_*.png")):
-                assert writer.poll() is None, "the writer ended before it was killed"
-                assert time.monotonic() < deadline, "no page image was staged within 60 s"
-                time.sleep(0.02)
+            assert writer.stdout is not None
+            with selectors.DefaultSelector() as sel:
+                sel.register(writer.stdout, selectors.EVENT_READ)
+                events = sel.select(timeout=60.0)
+            assert events, "no page image was staged within 60 s"
+            line = writer.stdout.readline()
+            assert line == "STAGED\n", f"writer exited early (rc={writer.poll()}) before staging"
+            assert list(tmp_path.glob(".tmp_*/page_images/page_*.png"))
+            assert writer.poll() is None, "the writer ended before it was killed"
         finally:
             writer.kill()
             writer.wait(timeout=30)
+            if writer.stdin is not None:
+                writer.stdin.close()
+            if writer.stdout is not None:
+                writer.stdout.close()
         assert not out.exists()
         [leftover] = stagings(tmp_path)
         assert not (leftover / "manifest.json").exists()
         # The next write ignores the leftover, the only trace.
         write(extract_document(pdf), out, pdf)
         assert (out / "manifest.json").is_file() and stagings(tmp_path) == [leftover]
+
+    def test_write_bundle_rebinds_sandbox_true_loader_to_in_process_when_sandbox_false(self, tmp_path, monkeypatch):
+        import datagrunt.pdf._process as _proc
+
+        pdf = build_pdf(tmp_path / "one.pdf", [PageSpec(items=(TextRun("Page 1", 72.0, 100.0),))])
+        doc_sbx = extract_document(pdf, sandbox=True)
+        owner = getattr(doc_sbx.pages[0].page_image._loader, "__self__", None)
+        assert owner is not None and owner.sandbox is True
+
+        spawns = 0
+        real_popen = subprocess.Popen
+
+        def count_popen(*args, **kwargs):
+            nonlocal spawns
+            spawns += 1
+            return real_popen(*args, **kwargs)
+
+        monkeypatch.setattr(_proc.subprocess, "Popen", count_popen)
+        written = write_bundle(doc_sbx, tmp_path / "out_fast", source=pdf, sandbox=False, dpi=72, vision_dpi=72)
+        assert spawns == 0
+        assert (written.pages[0].page_image.image_path).is_file()
 
 
 class TestValidation:
@@ -1711,12 +1754,38 @@ class TestImageAndRenderSkipping:
         # Reuse with identical flags
         assert write(bound_document(source), out, source, include_images=False) == doc
 
-    @pytest.mark.parametrize("param", ["include_images", "render_pages"])
     @pytest.mark.parametrize("value", [1, None, "no"])
-    def test_flags_must_be_bool(self, tmp_path, source, param, value):
-        with pytest.raises(TypeError, match=f"{param} must be a bool"):
-            write(bound_document(source), tmp_path / "out", source, **{param: value})
+    def test_include_images_must_be_bool(self, tmp_path, source, value):
+        with pytest.raises(TypeError, match="include_images must be a bool"):
+            write(bound_document(source), tmp_path / "out", source, include_images=value)
         assert not (tmp_path / "out").exists()
+
+    @pytest.mark.parametrize(("value", "exc_type"), [(1, TypeError), (None, TypeError), ("no", ValueError)])
+    def test_render_pages_validates_type_and_mode(self, tmp_path, source, value, exc_type):
+        with pytest.raises(exc_type, match="render_pages"):
+            write(bound_document(source), tmp_path / "out", source, render_pages=value)
+        assert not (tmp_path / "out").exists()
+
+    def test_render_pages_vision_only_skips_clean_digital_and_keeps_vision_and_image_only(
+        self, tmp_path, source, fast_render, recwarn
+    ):
+        out = tmp_path / "out_vo"
+        # bound_document(source) has pages 1 (digital), 2 (hybrid), 3 (vision), 4 (error).
+        # Mark page 2 as image-only: vision_only must render page 2 (image-only) and page 3 (vision),
+        # while skipping page 1 (clean digital) and page 4 (non-image-only error) with ZERO warnings.
+        document = with_image_only(bound_document(source), {2: ("too_little_text",)})
+        written = write(document, out, source, render_pages="vision_only")
+
+        assert [w for w in recwarn if "hold content only" in str(w.message)] == []
+        assert written.pages[0].page_image is None
+        assert written.pages[1].page_image is not None
+        assert written.pages[2].page_image is not None and len(written.pages[2].page_image.band_paths) > 0
+        assert written.pages[3].page_image is None
+        manifest = manifest_of(out)
+        assert manifest["extraction_params"]["render_pages"] == "vision_only"
+        assert [entry["page_number"] for entry in manifest["page_images"]] == [2, 3]
+        assert load_bundle(out) == written
+        assert write(document, out, source, render_pages="vision_only") == written
 
 
 def only_copy(*reasons: str) -> str:

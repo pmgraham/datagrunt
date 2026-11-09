@@ -300,7 +300,8 @@ from datagrunt.pdf._bundle_load import (
 from datagrunt.pdf._bundle_load import (
     _read_fd as _read_fd,
 )
-from datagrunt.pdf._loaders import PageDraw, PageRender, figure_pngs
+from datagrunt.pdf._loaders import FigureRead, PageDraw, PageRender, figure_pngs
+from datagrunt.pdf._options import RenderPagesMode, checked_render_pages
 from datagrunt.pdf._source import SourceIdentity, _opened_source, _stream_sha256
 from datagrunt.pdf._validate import checked_path as _checked_path
 from datagrunt.pdf._validate import strict_bool
@@ -310,6 +311,8 @@ from datagrunt.pdf.exceptions import BundleCorruptError, DatagruntPDFError, PDFS
 from datagrunt.pdf.frame import element_frame, utf8_text
 from datagrunt.pdf.pipeline import PDFSource, PipelineOptions
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page
+
+_default_render_page = render_page
 
 __all__ = ["BUNDLE_FORMAT_VERSION", "load_bundle", "write_bundle"]
 
@@ -392,7 +395,8 @@ def write_bundle(
     extraction_params: Mapping[str, object] | None = None,
     overwrite: bool = False,
     include_images: bool = True,
-    render_pages: bool = True,
+    render_pages: RenderPagesMode = True,
+    sandbox: bool = False,
 ) -> PDFDocument:
     """Write ``document``, extracted from ``source``, as a bundle at ``output_dir``, atomically.
 
@@ -433,9 +437,15 @@ def write_bundle(
             whose page image is not written, whatever the cause: the source
             PDF is their only full copy (#471).
     """
-    options = PipelineOptions(workers=workers, dpi=dpi, vision_dpi=vision_dpi, max_render_pixels=max_render_pixels)
+    options = PipelineOptions(
+        workers=workers,
+        dpi=dpi,
+        vision_dpi=vision_dpi,
+        max_render_pixels=max_render_pixels,
+        sandbox=sandbox,
+    )
     include_imgs = strict_bool("include_images", include_images)
-    render_pgs = strict_bool("render_pages", render_pages)
+    render_pgs = checked_render_pages(render_pages)
     params = _checked_params(options, extraction_params, include_images=include_imgs, render_pages=render_pgs)
     if not isinstance(document, PDFDocument):
         raise TypeError(f"document must be a PDFDocument, got {type(document).__name__}")
@@ -478,7 +488,7 @@ def _checked_params(
     extra: object,
     *,
     include_images: bool = True,
-    render_pages: bool = True,
+    render_pages: RenderPagesMode = True,
 ) -> dict[str, object]:
     """The manifest's ``extraction_params``: the writer's own, then ``extra``'s, each a JSON scalar.
 
@@ -500,10 +510,14 @@ def _checked_params(
             if key in _PARAM_KEYS:
                 raise ValueError(f"extraction_params[{key!r}] is write_bundle's own parameter: pass it as {key}=")
             params[key] = _json_scalar(f"extraction_params[{key!r}]", value)
+    if options.sandbox:
+        params["sandbox"] = True
     if not include_images:
         params["include_images"] = False
-    if not render_pages:
+    if render_pages is False:
         params["render_pages"] = False
+    elif render_pages == "vision_only":
+        params["render_pages"] = "vision_only"
     return params
 
 
@@ -596,6 +610,8 @@ def _existing(target: Path, document: PDFDocument, params: Mapping[str, object])
     strip_figures = params.get("include_images") is False
     if strip_figures or params.get("render_pages") is False:
         rendered |= {page.page_number for page in document.pages}
+    elif params.get("render_pages") == "vision_only":
+        rendered |= {page.page_number for page in document.pages if not _needs_vision_render(page)}
     if _without_renders(loaded, rendered, strip_figures=strip_figures) != _without_renders(
         document, rendered, strip_figures=strip_figures
     ):
@@ -661,6 +677,11 @@ def _check_unchanged(source: PDFSource, identity: SourceIdentity) -> None:
         )
 
 
+def _needs_vision_render(page: Page) -> bool:
+    """True when ``render_pages='vision_only'`` must persist this page's image."""
+    return (page.route == "vision" and page.status != "error") or bool(page.image_only_reasons)
+
+
 def _staged(
     document: PDFDocument,
     staging: Path,
@@ -670,19 +691,19 @@ def _staged(
     params: Mapping[str, object],
     *,
     include_images: bool = True,
-    render_pages: bool = True,
+    render_pages: RenderPagesMode = True,
 ) -> tuple[PDFDocument, tuple[str, ...]]:
     """Write every artifact, then the manifest, into ``staging``: the document (paths in ``target``), and warnings."""
     ledger = _Ledger()
     if include_images:
-        figures = _write_figures(document, staging, source.path, ledger)
+        figures = _write_figures(document, staging, source.path, ledger, sandbox=options.sandbox)
     else:
         figures = _skip_figures(document, ledger)
     skipped = _opted_out(include_images=include_images, render_pages=render_pages)
     if skipped:
         renders = _skip_renders(document, ledger, skipped)
     else:
-        renders = _write_renders(document, staging, source, options, ledger)
+        renders = _write_renders(document, staging, source, options, ledger, render_pages=render_pages)
     _mark_only_copies(document, renders, ledger, skipped, target)
     _write_texts(document, figures, renders, staging, ledger)
     _write_bytes(staging, MANIFEST, _manifest(document, params, renders, ledger))
@@ -700,11 +721,11 @@ def _skip_figures(document: PDFDocument, ledger: _Ledger) -> dict[str, str]:
     return {}
 
 
-def _opted_out(*, include_images: bool, render_pages: bool) -> str:
+def _opted_out(*, include_images: bool, render_pages: RenderPagesMode) -> str:
     """The option that skips every page image (``include_images=False`` first), or ``""`` if none does."""
     if not include_images:
         return "include_images=False"
-    return "" if render_pages else "render_pages=False"
+    return "render_pages=False" if render_pages is False else ""
 
 
 def _skip_renders(document: PDFDocument, ledger: _Ledger, why: str) -> dict[int, _Written]:
@@ -802,14 +823,16 @@ def _write_rows(frame: pl.DataFrame, write: Callable[[bytes], object]) -> None:
         write(line.encode("utf-8") + b"\n")
 
 
-def _write_figures(document: PDFDocument, staging: Path, source: Path, ledger: _Ledger) -> dict[str, str]:
+def _write_figures(
+    document: PDFDocument, staging: Path, source: Path, ledger: _Ledger, *, sandbox: bool = False
+) -> dict[str, str]:
     """Write each bound figure's PNG, each distinct picture once (:class:`_Pictures`); each written one's path, by id.
 
     A figure not bound to ``source`` (:func:`_figure_unbound`) is not read: it gets a missing entry and a warning.
     """
     paths: dict[str, str] = {}
     pictures = _Pictures()
-    figures = _bound_figures(document.figures, source, ledger)
+    figures = _bound_figures(document.figures, source, ledger, sandbox=sandbox)
     for figure, read in zip(figures, figure_pngs(figures), strict=True):  # read in batches, each in its turn
         data, why = _png(read)
         if data is None:
@@ -820,13 +843,29 @@ def _write_figures(document: PDFDocument, staging: Path, source: Path, ledger: _
     return paths
 
 
-def _bound_figures(figures: tuple[Figure, ...], source: Path, ledger: _Ledger) -> tuple[Figure, ...]:
+def _rebound_figure(figure: Figure, *, sandbox: bool) -> Figure:
+    if not sandbox:
+        return figure
+    owner = getattr(figure._loader, "__self__", None)
+    if (
+        isinstance(owner, FigureRead)
+        and not owner.sandbox
+        and getattr(figure._loader, "__func__", None) is FigureRead.png_bytes
+    ):
+        rebound = dataclasses.replace(owner, sandbox=True)
+        return dataclasses.replace(figure, _loader=rebound.png_bytes, _raw_loader=rebound.raw_bytes)
+    return figure
+
+
+def _bound_figures(
+    figures: tuple[Figure, ...], source: Path, ledger: _Ledger, *, sandbox: bool = False
+) -> tuple[Figure, ...]:
     """The figures bound to ``source`` (:func:`_figure_unbound`); each other is unread: a missing entry, a warning."""
     bound: list[Figure] = []
     for figure in figures:
         unbound = _figure_unbound(figure, source)
         if not unbound:
-            bound.append(figure)
+            bound.append(_rebound_figure(figure, sandbox=sandbox))
             continue
         reason = f"figure {figure.sha256} {unbound}: its bytes could not be bound to the hashed source"
         ledger.missing.append(_Missing("figure", figure.page_number, figure.element_id, reason))
@@ -883,12 +922,21 @@ def _in_page_order(task: Callable[[Page], _T], pages: tuple[Page, ...], workers:
 
 
 def _write_renders(
-    document: PDFDocument, staging: Path, source: PDFSource, options: PipelineOptions, ledger: _Ledger
+    document: PDFDocument,
+    staging: Path,
+    source: PDFSource,
+    options: PipelineOptions,
+    ledger: _Ledger,
+    *,
+    render_pages: RenderPagesMode = True,
 ) -> dict[int, _Written]:
-    """Write every page's image on ``workers`` threads (:func:`_in_page_order`); each page image written, by number."""
+    """Write selected page images on ``workers`` threads (:func:`_in_page_order`); each written, by number."""
     renders: dict[int, _Written] = {}
 
     def task(page: Page) -> _PageOutcome:
+        if render_pages == "vision_only" and not _needs_vision_render(page):
+            reason = "the page was not rendered: render_pages='vision_only'"
+            return _PageOutcome(None, (), (_Missing("page_image", page.page_number, None, reason),))
         return _page_outcome(page, staging, source, options)
 
     for outcome in _in_page_order(task, document.pages, options.workers, "datagrunt-bundle"):
@@ -914,7 +962,7 @@ def _page_outcome(page: Page, staging: Path, source: PDFSource, options: Pipelin
     image = page.page_image
     if image is None:
         return _rendered_outcome(page, staging, source, options)
-    image = _draws_bound(image, source)
+    image = _draws_bound(image, source, sandbox=options.sandbox)
     if _page_draw(image) is None:
         return _own_outcome(image, staging, source)
     try:
@@ -943,7 +991,7 @@ def _at_write_dpi(image: PageImage, page: Page, options: PipelineOptions) -> Pag
     return dataclasses.replace(image, dpi=float(dpi), width_px=width, height_px=height, _loader=redrawn.png_bytes)
 
 
-def _draws_bound(image: PageImage, source: PDFSource) -> PageImage:
+def _draws_bound(image: PageImage, source: PDFSource, *, sandbox: bool = False) -> PageImage:
     """``image`` whose PageDraw or PageRender loaders draw through the file this write hashed, by its identity.
 
     The write hashed the file at the source to the document's sha256 and took
@@ -953,27 +1001,25 @@ def _draws_bound(image: PageImage, source: PDFSource) -> PageImage:
     on a copy, so each draw takes the identity's fast path instead of hashing
     the file again. Any other loader, and an image with none, is as it is.
     """
-    loader, bands = _rebound(image._loader, source), _rebound(image._band_loader, source)
+    loader = _rebound(image._loader, source, sandbox=sandbox)
+    bands = _rebound(image._band_loader, source, sandbox=sandbox)
     if loader is image._loader and bands is image._band_loader:
         return image
     return dataclasses.replace(image, _loader=loader, _band_loader=bands)
 
 
-def _rebound(loader: Callable[[], _T] | None, source: PDFSource) -> Callable[[], _T] | None:
-    """``loader`` on a copy of its owner that holds the hashed file's identity, if it needs one; else ``loader``.
-
-    It needs one when it is a PageDraw's or PageRender's method bound to the
-    document's bytes (the source's sha256) under another identity. A loader
-    bound to other bytes, or to none (it checks nothing), is left as it is.
-    """
+def _rebound(loader: Callable[[], _T] | None, source: PDFSource, *, sandbox: bool = False) -> Callable[[], _T] | None:
+    """``loader`` on a copy of its owner holding the hashed file's identity (and ``sandbox``), if needed."""
     owner = getattr(loader, "__self__", None)
-    if not isinstance(owner, (PageDraw, PageRender)) or owner.sha256 != source.sha256:
+    if not isinstance(owner, (PageDraw, PageRender)):
         return loader
-    if owner.identity == source.identity:
+    rebind_id = owner.sha256 == source.sha256 and owner.identity != source.identity
+    rebind_sandbox = owner.sandbox != sandbox
+    if not rebind_id and not rebind_sandbox:
         return loader
-    method: Callable[[], _T] = MethodType(
-        getattr(loader, "__func__"), dataclasses.replace(owner, identity=source.identity)
-    )
+    new_id = source.identity if rebind_id else owner.identity
+    updated = dataclasses.replace(owner, identity=new_id, sandbox=sandbox)
+    method: Callable[[], _T] = MethodType(getattr(loader, "__func__"), updated)
     return method
 
 
@@ -981,7 +1027,7 @@ def _rendered_outcome(page: Page, staging: Path, source: PDFSource, options: Pip
     """Render the page at ``dpi`` and write its PNG (no bands); a refusal or failure is recorded."""
     number = page.page_number
     try:
-        dpi, drawn = _drawn(source, page, options.dpi, options.max_render_pixels)
+        dpi, drawn = _drawn(source, page, options.dpi, options.max_render_pixels, sandbox=options.sandbox)
     except (RenderRefused, RenderFailed) as exc:
         reason = f"the page was not rendered: {type(exc).__name__}: {exc}"
         return _PageOutcome(None, (), (_Missing("page_image", number, None, reason),))
@@ -1108,9 +1154,23 @@ def _own_bands(image: PageImage, staging: Path) -> tuple[tuple[_Artifact, ...], 
     return written, ()
 
 
-def _drawn(source: PDFSource, page: Page, target_dpi: int, max_pixels: int) -> tuple[int, RenderedPage]:
-    """The page drawn at the effective DPI of ``target_dpi`` in A5a's guarded worker, and that DPI."""
+def _drawn(
+    source: PDFSource, page: Page, target_dpi: int, max_pixels: int, *, sandbox: bool = False
+) -> tuple[int, RenderedPage]:
+    """The page drawn at the effective DPI of ``target_dpi``, and that DPI."""
     dpi = effective_dpi(target_dpi, max_pixels, page.width_pt, page.height_pt)
+    if not sandbox and render_page is _default_render_page:
+        from datagrunt.pdf import _render_worker
+
+        drawn = _render_worker.draw_page_in_process(
+            source.path,
+            page.page_number - 1,
+            dpi=dpi,
+            password=source.password,
+            memory_cap_bytes=_MEMORY_CAP_BYTES,
+            annotations=True,
+        )
+        return dpi, drawn
     drawn = render_page(
         source.path,
         page.page_number - 1,

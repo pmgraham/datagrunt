@@ -330,6 +330,8 @@ class PipelineOptions:
     max_render_pixels: int = MAX_RENDER_PIXELS
     min_image_dimension: int = MIN_IMAGE_DIMENSION
     strict: bool = False
+    sandbox: bool = False
+    orientation_fallback: bool = False
 
     def __post_init__(self) -> None:
         int_at_least("workers", self.workers, 1)
@@ -341,6 +343,8 @@ class PipelineOptions:
         int_at_least("min_image_dimension", self.min_image_dimension, 1)
         choice_str("ocr", self.ocr, _OCR_MODES)
         strict_bool("strict", self.strict)
+        strict_bool("sandbox", self.sandbox)
+        strict_bool("orientation_fallback", self.orientation_fallback)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -402,6 +406,8 @@ def extract_document(
     max_render_pixels: int = 16_000_000,
     min_image_dimension: int = MIN_IMAGE_DIMENSION,
     strict: bool = False,
+    sandbox: bool = False,
+    orientation_fallback: bool = False,
     _worker_pool: "PageWorkerPool | None" = None,
 ) -> PDFDocument:
     """Extract the whole PDF at ``source``: steps 1-5 for every page, in workers, then 6-7 (see the module notes).
@@ -438,20 +444,50 @@ def extract_document(
         max_render_pixels=max_render_pixels,
         min_image_dimension=min_image_dimension,
         strict=strict,
+        sandbox=sandbox,
+        orientation_fallback=orientation_fallback,
     )
     pdf = PDFSource(path=checked_path(source, "source"), password=password)
-    command = _pool_command()
+    in_process = (
+        not options.sandbox
+        and _worker_pool is None
+        and _pool_size(options.workers) == 1
+        and _pooled_pages is _default_pooled_pages
+    )
+    command = [] if in_process else _pool_command()
     with _opened_source(pdf.path) as stream:
         identity = SourceIdentity.of(os.fstat(stream.fileno()))
         digest = _stream_sha256(stream, identity.size, pdf.path)
         bound = dataclasses.replace(pdf, identity=identity, sha256=digest)
-        facts, pages = (
-            _pooled_pages(bound, options, command)
-            if _worker_pool is None
-            else _pooled_pages(bound, options, command, worker_pool=_worker_pool)
-        )
+        if in_process:
+            facts, pages = _in_process_pages(bound, options)
+        elif _worker_pool is None:
+            facts, pages = _pooled_pages(bound, options, command)
+        else:
+            facts, pages = _pooled_pages(bound, options, command, worker_pool=_worker_pool)
         _check_unchanged(bound, os.fstat(stream.fileno()), "by the end of its extraction")
     return _document(bound, facts, digest, pages)
+
+
+def _in_process_pages(source: PDFSource, options: PipelineOptions) -> tuple[Facts, tuple[Page, ...]]:
+    """Extract every page of ``source`` directly in this process using one open DocumentHandle."""
+    try:
+        from datagrunt.pdf import _page_worker
+        from datagrunt.pdf.pdfium_engine import document_metadata
+    except ImportError as exc:
+        from datagrunt.pdf._extra import missing_in_process
+
+        hint = missing_in_process("extract_document", exc)
+        if hint is not None:
+            raise hint from exc
+        raise
+
+    with _page_worker._opened_checked(source, "when pdfium opened it") as handle:
+        info = document_metadata(handle)
+        count = handle.page_count
+        pages = tuple(_page_worker._iter_pages(handle, source, range(count), options, _page_worker._quiet))
+    _check_unchanged(source, os.stat(source.path), f"by the time pages 1-{count} finished")
+    return Facts(count, info.title, info.author), pages
 
 
 def _document(source: PDFSource, facts: Facts, digest: str, pages: tuple[Page, ...]) -> PDFDocument:
@@ -486,7 +522,12 @@ def _vision(options: PipelineOptions) -> VisionOptions:
 
     Its ``memory_cap_bytes`` is each page worker's cap too.
     """
-    return VisionOptions(vision_dpi=options.vision_dpi, max_render_pixels=options.max_render_pixels)
+    return VisionOptions(
+        vision_dpi=options.vision_dpi,
+        max_render_pixels=options.max_render_pixels,
+        sandbox=options.sandbox,
+        orientation_fallback=options.orientation_fallback,
+    )
 
 
 def error_page(index: int, error: str, *, size: tuple[float, float] | None = None, why: str = "") -> Page:
@@ -1123,6 +1164,9 @@ def _pooled_pages(
         return facts, _gathered(chunks, options)
     finally:
         _shut_down(chunks)
+
+
+_default_pooled_pages = _pooled_pages
 
 
 def _facts_from(chunk: _Chunk) -> Facts:

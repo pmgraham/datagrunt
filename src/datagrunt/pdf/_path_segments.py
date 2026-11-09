@@ -15,7 +15,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, NamedTuple
 
-from datagrunt.pdf._validate import choice_str, finite_float, int_at_least, rgba_tuple, strict_bool
+from datagrunt.pdf._validate import choice_str, finite_float, int_at_least, non_blank_str, rgba_tuple, strict_bool
 
 Box = tuple[float, float, float, float]
 Point = tuple[float, float]
@@ -106,9 +106,12 @@ class SegmentStats:
     """
 
     skipped_nonfinite_paths: int
+    segment_bound_hit: str | None = None
 
     def __post_init__(self) -> None:
         int_at_least("skipped_nonfinite_paths", self.skipped_nonfinite_paths, 0)
+        if self.segment_bound_hit is not None:
+            non_blank_str("segment_bound_hit", self.segment_bound_hit)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

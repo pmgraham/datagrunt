@@ -153,7 +153,7 @@ import polars as pl
 from PIL import Image
 
 from datagrunt.pdf._loaders import figure_pngs
-from datagrunt.pdf._options import MIN_IMAGE_DIMENSION, OcrMode
+from datagrunt.pdf._options import MIN_IMAGE_DIMENSION, OcrMode, RenderPagesMode, checked_render_pages
 from datagrunt.pdf._source import checked_pdf_file
 from datagrunt.pdf._validate import checked_password as _checked_password
 from datagrunt.pdf._validate import checked_path as _checked_path
@@ -176,6 +176,8 @@ from datagrunt.pdf.pipeline import PDFSource, PipelineOptions, extract_document
 from datagrunt.pdf.render import _MIN_TARGET_DPI, RenderedPage, RenderFailed, RenderRefused
 
 __all__ = ["PDFWriter"]
+
+_default_extract_document = extract_document
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -218,6 +220,8 @@ class PDFWriter:
         max_render_pixels: int = 16_000_000,
         min_image_dimension: int = MIN_IMAGE_DIMENSION,
         strict: bool = False,
+        sandbox: bool = False,
+        orientation_fallback: bool = False,
     ) -> None:
         self._options = PipelineOptions(
             workers=workers,
@@ -227,6 +231,8 @@ class PDFWriter:
             max_render_pixels=max_render_pixels,
             min_image_dimension=min_image_dimension,
             strict=strict,
+            sandbox=sandbox,
+            orientation_fallback=orientation_fallback,
         )
         self._source, self._document = _checked_source(source, password)
         self._lock = threading.RLock()
@@ -385,7 +391,7 @@ class PDFWriter:
         *,
         overwrite: bool = False,
         include_images: bool = True,
-        render_pages: bool = True,
+        render_pages: RenderPagesMode = True,
     ) -> PDFDocument:
         """Write the document's bundle at ``output_dir``, atomically (A7a; see the module notes).
 
@@ -413,8 +419,9 @@ class PDFWriter:
         _checked_target(output_dir)
         replace = strict_bool("overwrite", overwrite)
         include_imgs = strict_bool("include_images", include_images)
-        render_pgs = strict_bool("render_pages", render_pages)
+        render_pgs = checked_render_pages(render_pages)
         options = self._options
+        sandbox_kw = {"sandbox": True} if options.sandbox else {}
         return write_bundle(
             self._extracted(),
             output_dir,
@@ -428,10 +435,12 @@ class PDFWriter:
                 "ocr": options.ocr,
                 "min_image_dimension": options.min_image_dimension,
                 "strict": options.strict,
+                **({"orientation_fallback": True} if options.orientation_fallback else {}),
             },
             overwrite=replace,
             include_images=include_imgs,
             render_pages=render_pgs,
+            **sandbox_kw,
         )
 
     def _extracted(self) -> PDFDocument:
@@ -465,6 +474,20 @@ def _checked_source(source: object, password: object) -> tuple[PDFSource | None,
 
 def _extract(source: PDFSource, options: PipelineOptions) -> PDFDocument:
     """The document of ``source``, extracted with ``options``."""
+    if extract_document is _default_extract_document and (options.sandbox or options.orientation_fallback):
+        return extract_document(
+            source.path,
+            password=source.password,
+            workers=options.workers,
+            ocr=options.ocr,
+            dpi=options.dpi,
+            vision_dpi=options.vision_dpi,
+            max_render_pixels=options.max_render_pixels,
+            min_image_dimension=options.min_image_dimension,
+            strict=options.strict,
+            sandbox=options.sandbox,
+            orientation_fallback=options.orientation_fallback,
+        )
     return extract_document(
         source.path,
         password=source.password,
@@ -593,7 +616,7 @@ def _write_renders(
     pages = document.pages
 
     def task(page: Page) -> Path | None:
-        return _rendered(page, directory, source, dpi, options.max_render_pixels)
+        return _rendered(page, directory, source, dpi, options.max_render_pixels, sandbox=options.sandbox)
 
     outcomes = _in_page_order(task, pages, options.workers, "datagrunt-writer")
     unrendered = [
@@ -606,10 +629,12 @@ def _write_renders(
     return [path for path in outcomes if path is not None]
 
 
-def _rendered(page: Page, directory: Path, source: PDFSource, dpi: int, max_pixels: int) -> Path | None:
+def _rendered(
+    page: Page, directory: Path, source: PDFSource, dpi: int, max_pixels: int, *, sandbox: bool = False
+) -> Path | None:
     """Render ``page`` at the effective DPI of ``dpi`` and write its PNG; None, with a warning, if it is not."""
     try:
-        _, drawn = _drawn(source, page, dpi, max_pixels)
+        _, drawn = _drawn(source, page, dpi, max_pixels, sandbox=sandbox)
     except (RenderRefused, RenderFailed) as exc:
         _LOGGER.warning("page %d was not rendered: %s: %s", page.page_number, type(exc).__name__, exc)
         return None

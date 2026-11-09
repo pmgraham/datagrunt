@@ -2458,3 +2458,29 @@ def test_the_module_imports_nothing_inside_functions_and_nothing_from_core():
     assert inner == []
     assert not [name for name in modules if name.startswith("datagrunt.core")]
     assert "pydantic" not in modules
+
+
+MM_GEMINI_PNG = b"\x89PNG\r\n\x1a\nGEMINI_BAND"
+
+
+class TestMultimodalImages:
+    def test_gemini_provider_sends_inline_data_png_parts_before_user_envelope(self):
+        import base64
+        import dataclasses
+
+        handler = Recorder()
+        provider = gemini(handler)
+        req = dataclasses.replace(request_for(provider), images=(MM_GEMINI_PNG,))
+
+        provider.generate(req)
+
+        parts = sent_json(handler.seen[0])["contents"][0]["parts"]
+        assert parts == [
+            {
+                "inlineData": {
+                    "mimeType": "image/png",
+                    "data": base64.b64encode(MM_GEMINI_PNG).decode("ascii"),
+                }
+            },
+            {"text": req.user_envelope},
+        ]

@@ -1797,7 +1797,8 @@ class TestStatuses:
             entry({"text": "a"}, ("Part PN-104 is",), (PROSE,)),
             entry({"text": "b"}, ("a quote nowhere",), (PROSE,)),
         )
-        responses = {(U1, G): response(*lines), (U1, A): response(lines[0])}
+        other_line = entry({"text": "c"}, ("Part PN-104 is",), (PROSE,))
+        responses = {(U1, G): response(*lines), (U1, A): response(other_line)}
 
         found = grounded(responses, models=PAIR, schema=LINE).items
 
@@ -2217,3 +2218,182 @@ def test_docstrings_match_key_field_reasons_and_vision_page_tokens():
     assert len(key_field_lines) == 1
     assert "key_not_found" in key_field_lines[0] and "key_not_quoted" in key_field_lines[0]
     assert "vision page" in tokens_doc and "vision unit" not in tokens_doc
+
+
+class TestNode4Grounding:
+    def test_alnum_upper_grounds_both_hyphenated_and_stripped_model_votes(self):
+        class CatalogItem(BaseModel):
+            sku: Annotated[str, Key(normalizer="alnum_upper")]
+            qty: int
+
+        cat_schema = prepare(CatalogItem)
+        doc = document(page(1, (para(1, 0, "Order item 060G-1125 qty 5"),)))
+        u_plan = build_units(doc, max_unit_chars=10_000, render=render_element)
+        envs = build_envelopes(u_plan.units, doc, prompt="Extract", context=None, schema_json=cat_schema.wrapper_json)
+        uid = u_plan.units[0].unit_id
+
+        out = RunOutcome(
+            responses={
+                (uid, G): response(
+                    entry({"sku": "060G-1125", "qty": 5}, ("Order item 060G-1125 qty 5",), ("p0001_e000",))
+                ),
+                (uid, A): response(
+                    entry({"sku": "060G1125", "qty": 5}, ("Order item 060G-1125 qty 5",), ("p0001_e000",))
+                ),
+            },
+            failed_units=(),
+            cache_hits=0,
+            cache_misses=2,
+            cache_corrupt=0,
+            cache_write_failures=0,
+            usage={},
+            models=PAIR,
+        )
+        cons = build_consensus(out, cat_schema, (uid,), min_families=2)
+        g_res = ground(
+            cons,
+            outcome=out,
+            units={uid: u_plan.units[0]},
+            envelopes={uid: envs[0]},
+            documents={doc.metadata.doc_id: doc},
+            schema=cat_schema,
+        )
+        assert g_res.items[0].grounded is True
+        assert g_res.items[0].status == "consensus"
+
+    def test_child_list_keys_are_grounded_against_cited_elements(self):
+        class ChildPart(BaseModel):
+            part_no: Annotated[str, Key]
+            qty: int
+
+        class ScheduleSection(BaseModel):
+            customer: Annotated[str, Key]
+            items: list[ChildPart]
+
+        sched_schema = prepare(ScheduleSection)
+        doc = document(page(1, (para(1, 0, "Customer Acme: PN-100 qty 2"),)))
+        u_plan = build_units(doc, max_unit_chars=10_000, render=render_element)
+        envs = build_envelopes(u_plan.units, doc, prompt="Extract", context=None, schema_json=sched_schema.wrapper_json)
+        uid = u_plan.units[0].unit_id
+
+        bad_payload = entry(
+            {"customer": "Acme", "items": [{"part_no": "PN-100", "qty": 2}, {"part_no": "PN-999", "qty": 1}]},
+            ("Customer Acme: PN-100 qty 2",),
+            ("p0001_e000",),
+        )
+        out = RunOutcome(
+            responses={(uid, G): response(bad_payload), (uid, A): response(bad_payload)},
+            failed_units=(),
+            cache_hits=0,
+            cache_misses=2,
+            cache_corrupt=0,
+            cache_write_failures=0,
+            usage={},
+            models=PAIR,
+        )
+        cons = build_consensus(out, sched_schema, (uid,), min_families=2)
+        g_res = ground(
+            cons,
+            outcome=out,
+            units={uid: u_plan.units[0]},
+            envelopes={uid: envs[0]},
+            documents={doc.metadata.doc_id: doc},
+            schema=sched_schema,
+        )
+        assert g_res.items[0].status == "ungrounded_value"
+        assert any(r.reason == "key_not_found" and r.key_field == "items.part_no" for r in g_res.items[0].reasons)
+
+    def test_alnum_upper_boundaries_unknown_family_witness_and_unkeyed_child_quote_floor(self):
+        from datagrunt.rationalization.grounding import _peer_family_quotes, _set_off_alnum_upper
+
+        assert _set_off_alnum_upper("PN10", "PN-10_4") is False
+        assert _set_off_alnum_upper("PN-104", "PN_104") is True
+        assert _set_off_alnum_upper("PN104", "SKU:PN-104") is True
+        assert _set_off_alnum_upper("PN104PN105", "PN-104,PN-105") is False
+        assert _set_off_alnum_upper("PN-104", "Item PN 104 ready") is True
+        assert _set_off_alnum_upper("PN104", "Straße PN-104") is True
+        assert _set_off_alnum_upper("PN104", "Straße PN-104 Stk") is True
+
+        # Verify Table fast-path preserves R8 [U+XXXX] escaping in _UnitTexts.plain
+        class R8Row(BaseModel):
+            sku: Annotated[str, Key]
+
+        r8_schema = prepare(R8Row)
+        r8_tbl = Table(**ids(1, 0), headers=("SKU",), rows=(("PN‮104",),), extraction_method="lattice")
+        r8_doc = document(page(1, (r8_tbl,)))
+        r8_plan = build_units(r8_doc, max_unit_chars=10_000, render=render_element)
+        r8_envs = build_envelopes(
+            r8_plan.units, r8_doc, prompt="Extract", context=None, schema_json=r8_schema.wrapper_json
+        )
+        r8_uid = r8_plan.units[0].unit_id
+        r8_vote = entry({"sku": "PN[U+202E]104"}, ("| PN[U+202E]104 |",), ("p0001_e000",))
+        r8_out = RunOutcome(
+            responses={(r8_uid, G): response(r8_vote), (r8_uid, A): response(r8_vote)},
+            failed_units=(),
+            cache_hits=0,
+            cache_misses=2,
+            cache_corrupt=0,
+            cache_write_failures=0,
+            usage={},
+            models=PAIR,
+        )
+        r8_cons = build_consensus(r8_out, r8_schema, (r8_uid,), min_families=2)
+        r8_ground = ground(
+            r8_cons,
+            outcome=r8_out,
+            units={r8_uid: r8_plan.units[0]},
+            envelopes={r8_uid: r8_envs[0]},
+            documents={r8_doc.metadata.doc_id: r8_doc},
+            schema=r8_schema,
+        )
+        assert r8_ground.items[0].grounded is True
+
+        class ChildLine(BaseModel):
+            sku: Annotated[str, Key]
+            qty: int
+
+        class UnkeyedBasket(BaseModel):
+            items: list[ChildLine]
+
+        basket_schema = prepare(UnkeyedBasket)
+        doc = document(page(1, (para(1, 0, "Item a: PN-100 qty 2"),)))
+        u_plan = build_units(doc, max_unit_chars=10_000, render=render_element)
+        envs = build_envelopes(
+            u_plan.units, doc, prompt="Extract", context=None, schema_json=basket_schema.wrapper_json
+        )
+        uid = u_plan.units[0].unit_id
+        short_quote = entry({"items": [{"sku": "PN-100", "qty": 2}]}, ("a",), ("p0001_e000",))
+        out = RunOutcome(
+            responses={(uid, G): response(short_quote), (uid, A): response(short_quote)},
+            failed_units=(),
+            cache_hits=0,
+            cache_misses=2,
+            cache_corrupt=0,
+            cache_write_failures=0,
+            usage={},
+            models=PAIR,
+        )
+        cons = build_consensus(out, basket_schema, (uid,), min_families=2)
+        g_res = ground(
+            cons,
+            outcome=out,
+            units={uid: u_plan.units[0]},
+            envelopes={uid: envs[0]},
+            documents={doc.metadata.doc_id: doc},
+            schema=basket_schema,
+        )
+        assert any(r.reason == "quote_too_short" for r in g_res.items[0].reasons)
+
+        unknown_pair = (("m_google", "google", "g"), ("m_proxy", "unknown", "p"))
+        out_unk = RunOutcome(
+            responses={(uid, "m_google"): response(short_quote), (uid, "m_proxy"): response(short_quote)},
+            failed_units=(),
+            cache_hits=0,
+            cache_misses=2,
+            cache_corrupt=0,
+            cache_write_failures=0,
+            usage={},
+            models=unknown_pair,
+        )
+        cons_unk = build_consensus(out_unk, basket_schema, (uid,), min_families=1)
+        assert _peer_family_quotes(cons_unk.items[0], "m_proxy") == ()

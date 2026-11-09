@@ -126,6 +126,14 @@ def _installed(module: str) -> bool:
     return importlib.util.find_spec(module) is not None
 
 
+def missing_in_process(caller: str, exc: ImportError) -> ImportError | None:
+    """The install hint, as an ImportError, when an in-process PDF call cannot import the [pdf] extra."""
+    if not _is_missing_extra(exc):
+        return None
+    module = _root(exc)
+    return ImportError(_hint(caller, (module,), exc), name=module)
+
+
 def missing_in_worker(exc: ImportError) -> ImportError | None:
     """The install hint, as an ImportError, for a worker that failed to import the extra (``exc``); else None.
 

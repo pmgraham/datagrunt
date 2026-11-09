@@ -49,6 +49,13 @@ from datagrunt.pdf._bundle_load import MANIFEST, load_bundle
 from datagrunt.pdf._extra import load as _pdf_load
 from datagrunt.pdf.corpus import CORPUS_MANIFEST, CorpusManifest, load_corpus
 from datagrunt.pdf.elements import PDFDocument
+from datagrunt.pdf.exceptions import (
+    BundleCorruptError,
+    DatagruntPDFError,
+    PDFCorruptError,
+    PDFEncryptedError,
+    PDFSourceChangedError,
+)
 from datagrunt.rationalization.cache import FileCache, MemoryCache, request_key
 from datagrunt.rationalization.consensus import ConsensusResult, build_consensus, check_must_agree
 from datagrunt.rationalization.envelope import (
@@ -103,6 +110,11 @@ __all__ = ["MAX_TARGETS", "rationalize"]
 # ---------------------------------------------------------------------------------------------------------------
 
 
+def _require_bool(name: str, value: object) -> None:
+    if type(value) is not bool:
+        raise TypeError(f"{name} must be a bool, got {type(value).__name__}")
+
+
 def _check_scalar_params(
     *,
     max_concurrency: int,
@@ -118,6 +130,8 @@ def _check_scalar_params(
     strict: bool,
     coalesce_sections: bool,
     include_schema_in_prompt: bool = True,
+    multimodal: bool = True,
+    fold_across_units: bool = True,
     on_event: EventHook | None,
     min_families: int,
 ) -> RunLimits:
@@ -139,12 +153,14 @@ def _check_scalar_params(
     version_problem = identity_problem(schema_version)
     if version_problem is not None:
         raise (TypeError if not isinstance(schema_version, str) else ValueError)(f"schema_version {version_problem}")
-    if type(expect_non_empty) is not bool:
-        raise TypeError(f"expect_non_empty must be a bool, got {type(expect_non_empty).__name__}")
-    if type(coalesce_sections) is not bool:
-        raise TypeError(f"coalesce_sections must be a bool, got {type(coalesce_sections).__name__}")
-    if type(include_schema_in_prompt) is not bool:
-        raise TypeError(f"include_schema_in_prompt must be a bool, got {type(include_schema_in_prompt).__name__}")
+    for flag_name, flag_val in (
+        ("expect_non_empty", expect_non_empty),
+        ("coalesce_sections", coalesce_sections),
+        ("include_schema_in_prompt", include_schema_in_prompt),
+        ("multimodal", multimodal),
+        ("fold_across_units", fold_across_units),
+    ):
+        _require_bool(flag_name, flag_val)
     if on_event is not None and not callable(on_event):
         raise TypeError(f"on_event must be callable or None, got {type(on_event).__name__}")
     if type(min_families) is not int:
@@ -341,6 +357,7 @@ def _build_target_work(
     max_unit_chars: int,
     coalesce_sections: bool,
     include_schema_in_prompt: bool = True,
+    multimodal: bool = True,
     prompt_text: str,
     context: object,
     prepared: PreparedSchema,
@@ -375,16 +392,20 @@ def _build_target_work(
             max_unit_chars=max_unit_chars,
             render=render_element,
             coalesce_sections=coalesce_sections,
+            multimodal=multimodal,
         )
-        envelopes = build_envelopes(
+        kept_units, envelopes, render_skipped = _safe_doc_envelopes(
             plan.units,
             doc,
-            prompt=prompt_text,
+            prompt_text=prompt_text,
             context=context,
-            schema_json=prepared.wrapper_json,
+            wrapper_json=prepared.wrapper_json,
             coalesce_sections=coalesce_sections,
             include_schema=include_schema_in_prompt,
+            multimodal=multimodal,
+            strict=limits.strict,
         )
+        skipped.extend(render_skipped)
         miss_count = _count_new_misses(
             envelopes,
             snapshots,
@@ -396,7 +417,7 @@ def _build_target_work(
             miss_count=miss_count,
             max_requests=limits.max_requests,
         )
-        for unit, envelope in zip(plan.units, envelopes, strict=True):
+        for unit, envelope in zip(kept_units, envelopes, strict=True):
             units_by_id[unit.unit_id] = unit
             envelopes_by_id[unit.unit_id] = envelope
             work.append((unit, envelope))
@@ -411,6 +432,95 @@ def _build_target_work(
         work=tuple(work),
         skipped_units=tuple(skipped),
         hidden_excluded_by_reason=hidden_counts,
+    )
+
+
+_FATAL_PDF_ERRORS = (PDFSourceChangedError, BundleCorruptError, PDFCorruptError, PDFEncryptedError)
+
+
+def _isolate_doc_envelopes(
+    units: tuple[Unit, ...],
+    doc: PDFDocument,
+    *,
+    prompt_text: str,
+    context: object,
+    wrapper_json: str,
+    coalesce_sections: bool,
+    include_schema: bool,
+    multimodal: bool,
+) -> tuple[tuple[Unit, ...], tuple[Envelope, ...], list[SkippedUnit]]:
+    """Per-unit fallback isolating single-page render errors into ``SkippedUnit`` under ``strict=False``."""
+    kept_u: list[Unit] = []
+    kept_e: list[Envelope] = []
+    extra_skipped: list[SkippedUnit] = []
+    for unit in units:
+        try:
+            env = build_envelopes(
+                (unit,),
+                doc,
+                prompt=prompt_text,
+                context=context,
+                schema_json=wrapper_json,
+                coalesce_sections=coalesce_sections,
+                include_schema=include_schema,
+                multimodal=multimodal,
+            )[0]
+            kept_u.append(unit)
+            kept_e.append(env)
+        except _FATAL_PDF_ERRORS:
+            raise
+        except DatagruntPDFError:
+            pno = unit.page_numbers[0]
+            extra_skipped.append(
+                SkippedUnit(
+                    unit_id=f"{doc.metadata.doc_id}:p{pno:04d}",
+                    reason="image_only",
+                    page_numbers=unit.page_numbers,
+                    hidden_excluded=unit.hidden_excluded,
+                )
+            )
+    return tuple(kept_u), tuple(kept_e), extra_skipped
+
+
+def _safe_doc_envelopes(
+    units: tuple[Unit, ...],
+    doc: PDFDocument,
+    *,
+    prompt_text: str,
+    context: object,
+    wrapper_json: str,
+    coalesce_sections: bool,
+    include_schema: bool,
+    multimodal: bool,
+    strict: bool,
+) -> tuple[tuple[Unit, ...], tuple[Envelope, ...], list[SkippedUnit]]:
+    """Build envelopes for ``units``; isolate per-page render errors into ``SkippedUnit`` when ``not strict``."""
+    try:
+        envs = build_envelopes(
+            units,
+            doc,
+            prompt=prompt_text,
+            context=context,
+            schema_json=wrapper_json,
+            coalesce_sections=coalesce_sections,
+            include_schema=include_schema,
+            multimodal=multimodal,
+        )
+        return units, envs, []
+    except _FATAL_PDF_ERRORS:
+        raise
+    except DatagruntPDFError as exc:
+        if strict:
+            raise RationalizationError(f"multimodal page render failed on {doc.metadata.doc_id!r}: {exc}") from exc
+    return _isolate_doc_envelopes(
+        units,
+        doc,
+        prompt_text=prompt_text,
+        context=context,
+        wrapper_json=wrapper_json,
+        coalesce_sections=coalesce_sections,
+        include_schema=include_schema,
+        multimodal=multimodal,
     )
 
 
@@ -437,6 +547,7 @@ def _assemble_pipeline_result(
     min_families: int,
     must_agree: Sequence[str],
     expect_non_empty: bool,
+    fold_across_units: bool = True,
 ) -> RationalizedResult[Any]:
     """Execute consensus, grounding and folding over ``outcome`` and assemble :class:`RationalizedResult`."""
     if target_work.units_by_id:
@@ -461,6 +572,7 @@ def _assemble_pipeline_result(
             envelopes=target_work.envelopes_by_id,
             documents=target_work.docs_by_id,
             schema=prepared,
+            fold_across_units=fold_across_units,
         )
     else:
         consensus_res = ConsensusResult(items=(), quarantined=())
@@ -515,6 +627,7 @@ def _run_pipeline(
     min_families: int,
     must_agree: Sequence[str],
     expect_non_empty: bool,
+    fold_across_units: bool = True,
     on_event: EventHook | None,
 ) -> RationalizedResult[Any]:
     """Execute runner, consensus, grounding and folding, then assemble :class:`RationalizedResult`."""
@@ -535,6 +648,7 @@ def _run_pipeline(
         min_families=min_families,
         must_agree=must_agree,
         expect_non_empty=expect_non_empty,
+        fold_across_units=fold_across_units,
     )
 
 
@@ -567,6 +681,8 @@ def rationalize(
     strict: bool = False,
     coalesce_sections: bool = True,
     include_schema_in_prompt: bool = True,
+    multimodal: bool = True,
+    fold_across_units: bool = True,
     on_event: EventHook | None = None,
 ) -> RationalizedResult[T]:
     """Extract, ground, reach cross-family consensus on, and fold schema records over v5 PDF documents (plan §4.11).
@@ -627,6 +743,8 @@ def rationalize(
         strict=strict,
         coalesce_sections=coalesce_sections,
         include_schema_in_prompt=include_schema_in_prompt,
+        multimodal=multimodal,
+        fold_across_units=fold_across_units,
         on_event=on_event,
         min_families=min_families,
     )
@@ -649,6 +767,7 @@ def rationalize(
         max_unit_chars=max_unit_chars,
         coalesce_sections=coalesce_sections,
         include_schema_in_prompt=include_schema_in_prompt,
+        multimodal=multimodal,
         prompt_text=prompt_text,
         context=context,
         prepared=prepared,
@@ -670,6 +789,7 @@ def rationalize(
             min_families=min_families,
             must_agree=checked_must_agree,
             expect_non_empty=expect_non_empty,
+            fold_across_units=fold_across_units,
             on_event=on_event,
         ),
     )

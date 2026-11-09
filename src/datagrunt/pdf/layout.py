@@ -53,7 +53,6 @@ from fractions import Fraction
 from itertools import groupby
 from typing import NamedTuple
 
-from datagrunt.pdf._compute import backend as compute_backend
 from datagrunt.pdf._path_segments import Box, RawSegment
 from datagrunt.pdf._pdfium_common import union_box
 from datagrunt.pdf._validate import (
@@ -468,10 +467,11 @@ def _snapped_lines(segments: Iterable[RawSegment]) -> tuple[list[_Line], list[_L
 
 def _snap_and_merge(segments: list[RawSegment]) -> list[_Line]:
     """One orientation's segments, snapped to their clusters' mean positions and merged along them."""
-    if not segments:
-        return []
-    raw = [(item.position, item.start, item.end) for item in segments]
-    return [_Line(*triple) for triple in compute_backend().pdf_snap_and_merge_segments(raw, SNAP_PT)]
+    lines: list[_Line] = []
+    for cluster in _position_clusters(sorted(segments, key=lambda item: item.position)):
+        position = math.fsum(item.position for item in cluster) / len(cluster)
+        lines.extend(_merged(position, sorted((item.start, item.end) for item in cluster)))
+    return lines
 
 
 def _position_clusters(ordered: list[RawSegment]) -> Iterator[list[RawSegment]]:

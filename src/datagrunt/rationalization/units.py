@@ -89,6 +89,7 @@ from typing import Literal, TypeAlias, TypeGuard, get_args
 
 from datagrunt.pdf.elements import (
     HIDDEN_REASONS,
+    BBox,
     BulletList,
     DocumentElement,
     Figure,
@@ -626,6 +627,46 @@ class _Group:
         return opened
 
 
+def has_page_visual(page: Page) -> bool:
+    """Whether ``page`` carries a readable ``PageImage`` (band loader/paths or full-page loader/path)."""
+    if not isinstance(page, Page):
+        raise TypeError(f"page must be a Page, got {type(page).__name__}")
+    img = page.page_image
+    if img is None:
+        return False
+    return img._band_loader is not None or bool(img.band_paths) or img._loader is not None or img.image_path is not None
+
+
+def is_multimodal_page(page: Page, *, multimodal: bool = False) -> bool:
+    """Whether ``page`` should be sent as multimodal 300-DPI PNG bands rather than text elements (#473)."""
+    _check_bool("multimodal", multimodal)
+    if not isinstance(page, Page):
+        raise TypeError(f"page must be a Page, got {type(page).__name__}")
+    return (
+        multimodal
+        and page.status != "error"
+        and has_page_visual(page)
+        and (page.route == "vision" or bool(page.image_only_reasons))
+    )
+
+
+def vision_page_anchor(page: Page) -> Figure:
+    """Return the synthetic full-page :class:`Figure` anchor placed in ``<elements>`` for a multimodal page."""
+    if not isinstance(page, Page) or page.page_image is None:
+        raise ValueError("vision_page_anchor requires a Page with a non-None page_image")
+    img = page.page_image
+    return Figure(
+        element_id=f"p{page.page_number:04d}_e000",
+        page_number=page.page_number,
+        reading_order=0,
+        bbox=BBox(x0=0.0, y0=0.0, x1=page.width_pt, y1=page.height_pt),
+        sha256="0" * 64,
+        width_px=img.width_px,
+        height_px=img.height_px,
+        caption=f"[page {page.page_number} image attached]",
+    )
+
+
 def _is_image_only(page: Page) -> bool:
     """Whether ``page`` is skipped as image-only: marked (non-empty ``image_only_reasons``) and not an error page,
     which stays a page error (module notes, 4)."""
@@ -636,6 +677,15 @@ def _image_only_pages(document: PDFDocument) -> frozenset[int]:
     """The numbers of the pages :func:`build_units` skips as image-only, whose elements no unit holds (module notes,
     4): the rule :func:`group_scopes` and :mod:`~datagrunt.rationalization.envelope` read too."""
     return frozenset(page.page_number for page in document.pages if _is_image_only(page))
+
+
+def _unsent_text_pages(document: PDFDocument, *, multimodal: bool = False) -> frozenset[int]:
+    """Page numbers whose raw ``page.elements`` are withheld from prompts (image-only skips and multimodal pages)."""
+    return frozenset(
+        page.page_number
+        for page in document.pages
+        if _is_image_only(page) or is_multimodal_page(page, multimodal=multimodal)
+    )
 
 
 def _section_owners(sections: tuple[Section, ...]) -> dict[str, int]:
@@ -722,7 +772,7 @@ class _Openers:
         return GroupScope(section=index, openers=tuple(kept), excluded=len(path) - len(kept))
 
 
-def group_scopes(document: PDFDocument) -> dict[str, GroupScope]:
+def group_scopes(document: PDFDocument, *, multimodal: bool = False) -> dict[str, GroupScope]:
     """Map each section member's element id, its heading included, to its section's scope (module notes, 2).
 
     One pass over the document's elements in document order: each heading is recorded where it stands, and a
@@ -740,10 +790,11 @@ def group_scopes(document: PDFDocument) -> dict[str, GroupScope]:
     Raises:
         TypeError: If ``document`` is not a ``PDFDocument``.
     """
+    _check_bool("multimodal", multimodal)
     if not isinstance(document, PDFDocument):
         raise TypeError(f"document must be a PDFDocument, got {type(document).__name__}")
     owners = _section_owners(document.sections)
-    openers = _Openers(_image_only_pages(document))
+    openers = _Openers(_unsent_text_pages(document, multimodal=multimodal))
     scopes: dict[int, GroupScope] = {}
     found: dict[str, GroupScope] = {}
     for element in document.elements:
@@ -768,22 +819,43 @@ class _SkippedPage:
     hidden: dict[str, int] = field(default_factory=dict)
 
 
-_Step: TypeAlias = tuple[DocumentElement, _Group] | _SkippedPage
-"""What the first pass yields, in document order: an element with its group, or a page skipped whole."""
+@dataclass(slots=True)
+class _MultimodalPage:
+    """A vision or image-only page with a page image, packed as one synthetic anchor unit (#473)."""
+
+    page_number: int
+    anchor: Figure
+    hidden: dict[str, int] = field(default_factory=dict)
 
 
-def _groups(document: PDFDocument, scopes: Mapping[str, GroupScope] | None = None) -> list[_Step]:
-    """First pass: every element with its group, and every page skipped whole, in document order.
+_Step: TypeAlias = tuple[DocumentElement, _Group] | _SkippedPage | _MultimodalPage
+"""What the first pass yields, in document order: an element with its group, a skipped page, or a multimodal page."""
+
+
+def _groups(
+    document: PDFDocument,
+    scopes: Mapping[str, GroupScope] | None = None,
+    *,
+    multimodal: bool = False,
+) -> list[_Step]:
+    """First pass: every element with its group, and every page skipped or multimodal whole, in document order.
 
     Groups, their members and their scope paths are as module notes 2-4 say.
     """
-    resolved_scopes = group_scopes(document) if scopes is None else scopes
+    resolved_scopes = group_scopes(document, multimodal=multimodal) if scopes is None else scopes
     steps: list[_Step] = []
     groups: dict[tuple[str, int], _Group] = {}
     for page in document.pages:
         if page.status == "error":
             steps.append(_SkippedPage(page.page_number, "page_error"))
-        elif _is_image_only(page):
+            continue
+        if is_multimodal_page(page, multimodal=multimodal):
+            mm_page = _MultimodalPage(page.page_number, vision_page_anchor(page))
+            for element in page.elements:
+                _count(mm_page.hidden, element.hidden_reasons)
+            steps.append(mm_page)
+            continue
+        if _is_image_only(page):
             skipped = _SkippedPage(page.page_number, "image_only")
             for element in page.elements:
                 _count(skipped.hidden, element.hidden_reasons)
@@ -892,6 +964,18 @@ class _Coalescer:
             draft.scope_path, draft.scope_excluded = _draft_scope(scopes, draft.elements)
 
 
+def _multimodal_draft(step: _MultimodalPage, limit: int, render: Renderer, extra_hidden: dict[str, int]) -> _Draft:
+    """Build a single-page draft from ``step``, absorbing any pending ``extra_hidden`` counts."""
+    block = _render(render, step.anchor)
+    merged = dict(step.hidden)
+    for reason, count in extra_hidden.items():
+        merged[reason] = merged.get(reason, 0) + count
+    extra_hidden.clear()
+    draft = _Draft((), 0, oversize=len(block) > limit, hidden=merged)
+    draft.add(step.anchor, block, None)
+    return draft
+
+
 def _pack(steps: list[_Step], limit: int, render: Renderer) -> list[_Draft | _Group | _SkippedPage]:
     """Second pass: everything a unit or skipped unit comes from, in document order of where it starts.
 
@@ -899,9 +983,13 @@ def _pack(steps: list[_Step], limit: int, render: Renderer) -> list[_Draft | _Gr
     is listed at its first member, unpacked; a page skipped whole at its place.
     """
     stream: list[_Draft | _Group | _SkippedPage] = []
+    empty_hidden: dict[str, int] = {}
     for step in steps:
         if isinstance(step, _SkippedPage):
             stream.append(step)
+            continue
+        if isinstance(step, _MultimodalPage):
+            stream.append(_multimodal_draft(step, limit, render, empty_hidden))
             continue
         element, group = step
         if group.has_text:
@@ -918,24 +1006,35 @@ def _pack_coalesced(
     render: Renderer,
 ) -> list[_Draft | _Group | _SkippedPage]:
     """Second pass when ``coalesce_sections=True``: pack across text-bearing groups, flushing at a page skipped
-    whole (an error page or an image-only one)."""
+    or sent multimodally whole."""
     stream: list[_Draft | _Group | _SkippedPage] = []
     coalescer = _Coalescer()
+    mm_drafts: list[_Draft] = []
     for step in steps:
         if isinstance(step, _SkippedPage):
             coalescer.flush()
             stream.append(step)
+            continue
+        if isinstance(step, _MultimodalPage):
+            coalescer.flush()
+            mm = _multimodal_draft(step, limit, render, coalescer.leading)
+            mm_drafts.append(mm)
+            stream.append(mm)
             continue
         element, group = step
         if group.has_text:
             stream.extend(coalescer.pack(element, limit, render))
         elif element is group.members[0]:
             stream.append(group)
+    if coalescer.leading and not coalescer.drafts and mm_drafts:
+        for reason, count in coalescer.leading.items():
+            mm_drafts[-1].hidden[reason] = mm_drafts[-1].hidden.get(reason, 0) + count
+        coalescer.leading.clear()
     coalescer.finish(scopes)
     return stream
 
 
-def _unit(doc_id: str, routes: Mapping[int, str], draft: _Draft) -> Unit:
+def _unit(doc_id: str, vision_pages: Mapping[int, bool], draft: _Draft) -> Unit:
     pages = _pages(draft.elements)
     return Unit(
         unit_id=_unit_id(doc_id, draft.elements, draft.parts),
@@ -946,7 +1045,7 @@ def _unit(doc_id: str, routes: Mapping[int, str], draft: _Draft) -> Unit:
         scope_path=draft.scope_path,
         scope_entries_excluded=draft.scope_excluded,
         page_numbers=pages,
-        vision=any(routes[number] == "vision" for number in pages),
+        vision=any(vision_pages[number] for number in pages),
         oversize=draft.oversize,
         hidden_excluded=_counts(draft.hidden),
     )
@@ -986,7 +1085,13 @@ def _totals(document: PDFDocument) -> tuple[HiddenCounts, int]:
     return _counts(counter), len(hidden)
 
 
-def _check_inputs(document: object, max_unit_chars: object, render: object, coalesce_sections: object = False) -> None:
+def _check_inputs(
+    document: object,
+    max_unit_chars: object,
+    render: object,
+    coalesce_sections: object = False,
+    multimodal: object = False,
+) -> None:
     if not isinstance(document, PDFDocument):
         raise TypeError(f"document must be a PDFDocument, got {type(document).__name__}")
     if not _is_int(max_unit_chars):
@@ -996,6 +1101,7 @@ def _check_inputs(document: object, max_unit_chars: object, render: object, coal
     if not callable(render):
         raise TypeError(f"render must be callable, got {type(render).__name__}")
     _check_bool("coalesce_sections", coalesce_sections)
+    _check_bool("multimodal", multimodal)
 
 
 def build_units(
@@ -1004,6 +1110,7 @@ def build_units(
     max_unit_chars: int,
     render: Renderer,
     coalesce_sections: bool = False,
+    multimodal: bool = False,
 ) -> UnitPlan:
     """Group, render and pack a document's visible elements into units (module notes).
 
@@ -1024,11 +1131,14 @@ def build_units(
             other than a ``str`` (naming the element).
         ValueError: If ``max_unit_chars`` is below 1, or ``render`` returns an empty block (naming the element).
     """
-    _check_inputs(document, max_unit_chars, render, coalesce_sections)
+    _check_inputs(document, max_unit_chars, render, coalesce_sections, multimodal)
     doc_id = document.metadata.doc_id
-    routes = {page.page_number: page.route for page in document.pages}
-    scopes = group_scopes(document)
-    steps = _groups(document, scopes)
+    vision_pages = {
+        page.page_number: (page.route == "vision" or is_multimodal_page(page, multimodal=multimodal))
+        for page in document.pages
+    }
+    scopes = group_scopes(document, multimodal=multimodal)
+    steps = _groups(document, scopes, multimodal=multimodal)
     packed = (
         _pack_coalesced(steps, scopes, max_unit_chars, render)
         if coalesce_sections
@@ -1038,7 +1148,7 @@ def build_units(
     skipped: list[SkippedUnit] = []
     for item in packed:
         if isinstance(item, _Draft) and any(_has_text(element) for element in item.elements):
-            units.append(_unit(doc_id, routes, item))
+            units.append(_unit(doc_id, vision_pages, item))
         else:
             skipped.append(_skipped(doc_id, item))
     total, hidden_elements = _totals(document)

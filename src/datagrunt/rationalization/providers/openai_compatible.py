@@ -169,6 +169,7 @@ never the HTTP stack itself (only the HTTP helper imports httpx): nothing from `
 inside a function (invariant 9).
 """
 
+import base64
 import math
 import time
 from collections.abc import Iterable, Mapping
@@ -969,14 +970,30 @@ def _google_family(google: _GoogleRoute, family: object) -> object:
     return family
 
 
-def _messages(request: ModelRequest, *, fold: bool) -> list[dict[str, str]]:
+def _user_content(text: str, images: tuple[bytes, ...]) -> str | list[dict[str, Any]]:
+    if not images:
+        return text
+    return [
+        *[
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{base64.b64encode(img).decode('ascii')}"},
+            }
+            for img in images
+        ],
+        {"type": "text", "text": text},
+    ]
+
+
+def _messages(request: ModelRequest, *, fold: bool) -> list[dict[str, Any]]:
     """A ``system`` turn, then the ``user`` turn (module notes, 1 and 7); ``fold`` (a private hook, never set) puts
     the system prompt first in the one user turn instead."""
     if fold:
-        return [{"role": "user", "content": f"{request.system_prompt}\n\n{request.user_envelope}"}]
+        folded = f"{request.system_prompt}\n\n{request.user_envelope}"
+        return [{"role": "user", "content": _user_content(folded, request.images)}]
     return [
         {"role": "system", "content": request.system_prompt},
-        {"role": "user", "content": request.user_envelope},
+        {"role": "user", "content": _user_content(request.user_envelope, request.images)},
     ]
 
 

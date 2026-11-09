@@ -125,7 +125,10 @@ class TestAutoReadsByOcrExactlyThePagesNeverMarks:
         path = pages_pdf(tmp_path / "doc.pdf", contents)
         small_cap(monkeypatch)
 
-        never, auto = extract_document(path, ocr="never"), extract_document(path, ocr="auto")
+        never, auto = (
+            extract_document(path, ocr="never", sandbox=True),
+            extract_document(path, ocr="auto", sandbox=True),
+        )
 
         assert marked(never) == sent_to_ocr(auto) == {2}
         assert facts(never)[1] == facts(auto)[1] == ("error", "vision", ("extraction_failed",))

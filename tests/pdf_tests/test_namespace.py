@@ -87,6 +87,7 @@ TOP_LEVEL_PDF_NAMES = [
 # 5.1 (#360) and 5.2 (#464): the schema marker, rationalize(), batch helpers and RationalizedResult.
 TOP_LEVEL_RATIONALIZATION_NAMES = [
     "Key",
+    "Informational",
     "rationalize",
     "RationalizedResult",
     "BatchItem",
@@ -316,3 +317,22 @@ def test_core_exports_no_v4_pdf_names():
     import datagrunt.core
 
     assert datagrunt.core.__all__ == CORE_NAMES
+
+
+PDF_COMPUTE_MODULES = (
+    "datagrunt.pdf._compute",
+    "datagrunt.pdf._compute_python",
+    "datagrunt.pdf._compute_protocol",
+)
+
+
+@pytest.mark.parametrize("name", PDF_COMPUTE_MODULES)
+def test_pdf_rust_compute_module_is_gone(name):
+    assert importlib.util.find_spec(name) is None
+
+
+def test_native_exports_no_pdf_kernels():
+    from datagrunt import _native
+
+    pdf_exports = [name for name in dir(_native) if name.startswith("pdf_")]
+    assert pdf_exports == []

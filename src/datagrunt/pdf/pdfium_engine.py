@@ -182,6 +182,7 @@ import hashlib
 import math
 import os
 import sys
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -242,6 +243,7 @@ from datagrunt.pdf._validate import (
     optional_str,
     ordered_box,
     positive_float,
+    strict_bool,
 )
 from datagrunt.pdf.elements import _MAX_ASSET_BYTES
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFEncryptedError
@@ -280,6 +282,9 @@ __all__ = [
     "to_display_box",
 ]
 
+# Process-wide reentrant lock serializing all pypdfium2 / FPDF_* C calls across threads.
+_PDFIUM_LOCK = threading.RLock()
+
 # ``get_rotation()`` normalises /Rotate (-90 reads 270, 450 reads 90, 45 reads 0).
 _ROTATIONS = (0, 90, 180, 270)
 
@@ -303,9 +308,23 @@ def _checked_box(name: str, box: object, *, allow_empty: bool) -> Box:
     return left, bottom, right, top
 
 
+def _fast_user_box(box: object) -> Box | None:
+    """Fast-path check for a 4-float/int finite ordered user-space box."""
+    if type(box) is not tuple or len(box) != 4:
+        return None
+    left, bottom, right, top = box
+    if not all(type(val) is float or type(val) is int for val in (left, bottom, right, top)):
+        return None
+    fl, fb, fr, ft = float(left), float(bottom), float(right), float(top)
+    if not (math.isfinite(fl) and math.isfinite(fb) and math.isfinite(fr) and math.isfinite(ft)):
+        return None
+    return (fl, fb, fr, ft) if fl <= fr and fb <= ft else None
+
+
 def _to_display_checked(box: Box, *, rotation: int, page_box: Box) -> Box:
     """Map ``box`` to display coordinates given pre-checked ``rotation`` and ``page_box``."""
-    left, bottom, right, top = _checked_box("box", box, allow_empty=True)
+    fast = _fast_user_box(box)
+    left, bottom, right, top = _checked_box("box", box, allow_empty=True) if fast is None else fast
     page_left, page_bottom, page_right, page_top = page_box
     match rotation:
         case 0:
@@ -404,7 +423,8 @@ class DocumentHandle:
     def __init__(self, pdf: pdfium.PdfDocument) -> None:
         if not isinstance(pdf, pdfium.PdfDocument):
             raise TypeError(f"pdf must be a pypdfium2 PdfDocument, got {type(pdf).__name__}")
-        page_count = len(pdf)
+        with _PDFIUM_LOCK:
+            page_count = len(pdf)
         if page_count < 1:
             raise ValueError("pdf has no pages: a DocumentHandle needs at least one")
         self._pdf = pdf
@@ -423,7 +443,8 @@ class DocumentHandle:
 
     def close(self) -> None:
         """Close the pdfium document now; closing twice is a no-op."""
-        self._pdf.close()
+        with _PDFIUM_LOCK:
+            self._pdf.close()
 
     def __enter__(self) -> "DocumentHandle":
         return self
@@ -516,8 +537,10 @@ def open_document(path: str | os.PathLike[str], *, password: str | None = None) 
             (``page_number`` is None: the container itself is unreadable).
     """
     source = _checked_path(path)
-    raw = _load_raw_document(source, _checked_password(password))
-    return DocumentHandle(pdfium.PdfDocument(raw))
+    checked_pw = _checked_password(password)
+    with _PDFIUM_LOCK:
+        raw = _load_raw_document(source, checked_pw)
+        return DocumentHandle(pdfium.PdfDocument(raw))
 
 
 # An /Info entry is read whole or not at all: the asset limit (1 GiB) bounds the copy.
@@ -558,8 +581,9 @@ def document_metadata(handle: DocumentHandle) -> DocumentInfo:
     """
     if not isinstance(handle, DocumentHandle):
         raise TypeError(f"handle must be a DocumentHandle, got {type(handle).__name__}")
-    raw = handle._require_open().raw
-    return DocumentInfo(title=_meta_text(raw, "Title"), author=_meta_text(raw, "Author"))
+    with _PDFIUM_LOCK:
+        raw = handle._require_open().raw
+        return DocumentInfo(title=_meta_text(raw, "Title"), author=_meta_text(raw, "Author"))
 
 
 def _meta_text(raw: pdfium_c.FPDF_DOCUMENT, tag: str) -> str | None:
@@ -631,11 +655,12 @@ def page_geometry(handle: DocumentHandle, index: int) -> PageGeometry:
         PDFCorruptError: If pdfium cannot load the page, or its CropBox and
             MediaBox leave no visible area (``page_number`` is set).
     """
-    page, page_number = _load_page(handle, index)
-    try:
-        return _read_geometry(page, page_number)
-    finally:
-        page.close()
+    with _PDFIUM_LOCK:
+        page, page_number = _load_page(handle, index)
+        try:
+            return _read_geometry(page, page_number)
+        finally:
+            page.close()
 
 
 # pdfium parses Form XObjects at most 40 levels deep (observed: 80 nested
@@ -805,11 +830,12 @@ def page_text(handle: DocumentHandle, index: int) -> PageText:
             objects (:data:`MAX_PAGE_OBJECTS`) or its textpage's chars
             (``_pdfium_text.MAX_PAGE_CHARS``) (``page_number`` is set).
     """
-    page, page_number = _load_page(handle, index)
-    try:
-        return _read_page_text(page, _read_geometry(page, page_number))
-    finally:
-        page.close()
+    with _PDFIUM_LOCK:
+        page, page_number = _load_page(handle, index)
+        try:
+            return _read_page_text(page, _read_geometry(page, page_number))
+        finally:
+            page.close()
 
 
 # pdfium's path segment types, as PathPoint kinds (FPDF_SEGMENT_UNKNOWN, -1, is a failure).
@@ -981,19 +1007,30 @@ def _collect_segments(
     page_raw: pdfium_c.FPDF_PAGE,
     geometry: PageGeometry,
     objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
+    *,
+    allow_segment_overflow: bool = False,
 ) -> PageSegments:
     """The segments of every path object on the page, forms' included, in object-walk order, within the bounds."""
     to_display = _display_mapping(geometry)
+    walked = _page_objects(page_raw, max_objects=MAX_PAGE_OBJECTS) if objects is None else objects
     segments: list[RawSegment] = []
     skipped = 0
     room = _SegmentRoom()
-    placed = _placed_objects(page_raw, pdfium_c.FPDF_PAGEOBJ_PATH, max_objects=MAX_PAGE_OBJECTS, objects=objects)
-    for index, path, matrix in placed:
-        found = _path_object_segments(path, index, matrix, to_display, room)
-        if found is None:
-            skipped += 1
-        else:
-            segments.extend(found)
+    placed = _placed_objects(page_raw, pdfium_c.FPDF_PAGEOBJ_PATH, max_objects=MAX_PAGE_OBJECTS, objects=walked)
+    try:
+        for index, path, matrix in placed:
+            found = _path_object_segments(path, index, matrix, to_display, room)
+            if found is None:
+                skipped += 1
+            else:
+                segments.extend(found)
+    except WalkBoundHit as exc:
+        if not allow_segment_overflow:
+            raise
+        return PageSegments(
+            segments=(),
+            stats=SegmentStats(skipped_nonfinite_paths=skipped, segment_bound_hit=str(exc)),
+        )
     return PageSegments(segments=tuple(segments), stats=SegmentStats(skipped_nonfinite_paths=skipped))
 
 
@@ -1001,10 +1038,12 @@ def _read_segments(
     page: pdfium.PdfPage,
     geometry: PageGeometry,
     objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
+    *,
+    allow_segment_overflow: bool = False,
 ) -> PageSegments:
     """Read a loaded page's segments."""
     with _pdfium_errors(geometry.page_number):
-        return _collect_segments(page.raw, geometry, objects=objects)
+        return _collect_segments(page.raw, geometry, objects=objects, allow_segment_overflow=allow_segment_overflow)
 
 
 def page_segments(handle: DocumentHandle, index: int) -> PageSegments:
@@ -1033,11 +1072,12 @@ def page_segments(handle: DocumentHandle, index: int) -> PageSegments:
             (:data:`MAX_PAGE_OBJECTS`) or its path segments
             (:data:`MAX_PAGE_SEGMENTS`) (``page_number`` is set).
     """
-    page, page_number = _load_page(handle, index)
-    try:
-        return _read_segments(page, _read_geometry(page, page_number))
-    finally:
-        page.close()
+    with _PDFIUM_LOCK:
+        page, page_number = _load_page(handle, index)
+        try:
+            return _read_segments(page, _read_geometry(page, page_number))
+        finally:
+            page.close()
 
 
 def _read_images(
@@ -1077,11 +1117,12 @@ def page_images(handle: DocumentHandle, index: int) -> PageImages:
             it fails, or the page holds more than :data:`MAX_PAGE_OBJECTS`
             objects (``page_number`` is set).
     """
-    page, page_number = _load_page(handle, index)
-    try:
-        return _read_images(page, _read_geometry(page, page_number))
-    finally:
-        page.close()
+    with _PDFIUM_LOCK:
+        page, page_number = _load_page(handle, index)
+        try:
+            return _read_images(page, _read_geometry(page, page_number))
+        finally:
+            page.close()
 
 
 @contextmanager
@@ -1100,11 +1141,12 @@ def loaded_page(handle: DocumentHandle, index: int) -> Iterator[tuple[pdfium.Pdf
         PDFCorruptError: If pdfium cannot load the page, or its CropBox and
             MediaBox leave no visible area (``page_number`` is set).
     """
-    page, page_number = _load_page(handle, index)
-    try:
-        yield page, _read_geometry(page, page_number)
-    finally:
-        page.close()
+    with _PDFIUM_LOCK:
+        page, page_number = _load_page(handle, index)
+        try:
+            yield page, _read_geometry(page, page_number)
+        finally:
+            page.close()
 
 
 def image_refusal(page: pdfium.PdfPage, geometry: PageGeometry, *, max_objects: int) -> str | None:
@@ -1143,16 +1185,17 @@ def image_refusal(page: pdfium.PdfPage, geometry: PageGeometry, *, max_objects: 
     if not isinstance(geometry, PageGeometry):
         raise TypeError(f"geometry must be a PageGeometry, got {type(geometry).__name__}")
     int_at_least("max_objects", max_objects, 1)
-    placed = _placed_objects(page.raw, pdfium_c.FPDF_PAGEOBJ_IMAGE, max_objects=max_objects)
-    try:
-        for outcome in image_outcomes(placed, page.raw, geometry.page_box, _display_mapping(geometry)):
-            if outcome.render_refusal is not None:
-                return outcome.render_refusal
-    except WalkBoundHit as exc:
-        return str(exc)
-    except PdfiumFailure as exc:
-        return f"pdfium cannot {exc}"
-    return None
+    with _PDFIUM_LOCK:
+        placed = _placed_objects(page.raw, pdfium_c.FPDF_PAGEOBJ_IMAGE, max_objects=max_objects)
+        try:
+            for outcome in image_outcomes(placed, page.raw, geometry.page_box, _display_mapping(geometry)):
+                if outcome.render_refusal is not None:
+                    return outcome.render_refusal
+        except WalkBoundHit as exc:
+            return str(exc)
+        except PdfiumFailure as exc:
+            return f"pdfium cannot {exc}"
+        return None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1255,11 +1298,12 @@ def page_object_boxes(handle: DocumentHandle, index: int) -> ObjectBoxes:
             matrix, or the page holds more than :data:`MAX_PAGE_OBJECTS`
             objects (``page_number`` is set).
     """
-    page, page_number = _load_page(handle, index)
-    try:
-        return _read_object_boxes(page, _read_geometry(page, page_number))
-    finally:
-        page.close()
+    with _PDFIUM_LOCK:
+        page, page_number = _load_page(handle, index)
+        try:
+            return _read_object_boxes(page, _read_geometry(page, page_number))
+        finally:
+            page.close()
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1338,7 +1382,7 @@ class PageFailure:
         non_blank_str("message", self.message)
 
 
-def extract_page(handle: DocumentHandle, index: int) -> RawPage | PageFailure:
+def extract_page(handle: DocumentHandle, index: int, *, allow_segment_overflow: bool = False) -> RawPage | PageFailure:
     """Return every raw fact of the page at 0-based ``index``, read from one load of it.
 
     The page is loaded once and read in stages: geometry, text, then
@@ -1361,19 +1405,23 @@ def extract_page(handle: DocumentHandle, index: int) -> RawPage | PageFailure:
         ValueError: If ``handle`` is closed.
         IndexError: If ``index`` is outside ``0..page_count - 1``.
     """
-    try:
-        page, page_number = _load_page(handle, index)
-    except PDFCorruptError as exc:
-        if exc.page_number is None:
-            raise
-        return PageFailure(page_number=exc.page_number, stage="page", message=str(exc))
-    try:
-        return _read_stages(page, page_number)
-    finally:
-        page.close()
+    strict_bool("allow_segment_overflow", allow_segment_overflow)
+    with _PDFIUM_LOCK:
+        try:
+            page, page_number = _load_page(handle, index)
+        except PDFCorruptError as exc:
+            if exc.page_number is None:
+                raise
+            return PageFailure(page_number=exc.page_number, stage="page", message=str(exc))
+        try:
+            return _read_stages(page, page_number, allow_segment_overflow=allow_segment_overflow)
+        finally:
+            page.close()
 
 
-def _read_stages(page: pdfium.PdfPage, page_number: int) -> RawPage | PageFailure:
+def _read_stages(
+    page: pdfium.PdfPage, page_number: int, *, allow_segment_overflow: bool = False
+) -> RawPage | PageFailure:
     """Read a loaded page stage by stage; a stage's PDFCorruptError becomes its PageFailure."""
     stage: PageStage = "page"
     try:
@@ -1381,7 +1429,7 @@ def _read_stages(page: pdfium.PdfPage, page_number: int) -> RawPage | PageFailur
         stage = "text"
         text, objects = _read_page_text_and_objects(page, geometry)
         stage = "objects"
-        segments = _read_segments(page, geometry, objects=objects)
+        segments = _read_segments(page, geometry, objects=objects, allow_segment_overflow=allow_segment_overflow)
         images = _read_images(page, geometry, objects=objects)
         object_boxes = _read_object_boxes(page, geometry, objects=objects)
     except PDFCorruptError as exc:
@@ -1416,11 +1464,12 @@ def recover_dropped_text(handle: DocumentHandle, index: int) -> RecoveredText:
             pdfium call on them fails, or the page is past a walk bound
             (objects, textpage chars) (``page_number`` is set).
     """
-    page, page_number = _load_page(handle, index)
-    try:
-        return _recover(page, _read_geometry(page, page_number))
-    finally:
-        page.close()
+    with _PDFIUM_LOCK:
+        page, page_number = _load_page(handle, index)
+        try:
+            return _recover(page, _read_geometry(page, page_number))
+        finally:
+            page.close()
 
 
 def _recover(page: pdfium.PdfPage, geometry: PageGeometry) -> RecoveredText:
@@ -1533,12 +1582,30 @@ class ImageLoader:
         """
         return self._read(lambda image, raw, facts, label: decoded_png(image, facts, label))
 
+    def read_from_handle(self, handle: DocumentHandle, kind: Literal["png", "raw"]) -> bytes:
+        """Read the verified image's ``"png"`` or ``"raw"`` bytes from an already-open ``handle``."""
+        if not isinstance(handle, DocumentHandle):
+            raise TypeError(f"handle must be a DocumentHandle, got {type(handle).__name__}")
+        choice_str("kind", kind, ("png", "raw"))
+        if kind == "raw":
+            return self._read_on_handle(handle, lambda _image, raw, _facts, _label: raw)
+        return self._read_on_handle(handle, lambda image, _raw, facts, label: decoded_png(image, facts, label))
+
     def _read(self, finish: Callable[[pdfium_c.FPDF_PAGEOBJECT, bytes, PixelFacts, str], bytes]) -> bytes:
         """Reopen the PDF, verify the image and return ``finish(image, raw stream, pixel facts, label)``.
 
         The page and the document are closed before returning.
         """
-        with open_document(self.source, password=self.password) as handle:
+        with _PDFIUM_LOCK, open_document(self.source, password=self.password) as handle:
+            return self._read_on_handle(handle, finish)
+
+    def _read_on_handle(
+        self,
+        handle: DocumentHandle,
+        finish: Callable[[pdfium_c.FPDF_PAGEOBJECT, bytes, PixelFacts, str], bytes],
+    ) -> bytes:
+        """Verify the image on ``handle`` and run ``finish``; note PNG encoding runs outside PDFium C calls."""
+        with _PDFIUM_LOCK:
             if self.page_index >= handle.page_count:
                 raise self._changed(f"it has {handle.page_count} page(s)")
             page, page_number = _load_page(handle, self.page_index)

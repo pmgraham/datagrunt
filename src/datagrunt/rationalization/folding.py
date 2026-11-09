@@ -275,6 +275,7 @@ def fold_documents(
     envelopes: Mapping[str, Envelope],
     documents: Mapping[str, PDFDocument],
     schema: PreparedSchema,
+    fold_across_units: bool = True,
 ) -> FoldingResult[Any]:
     """Fold grounded items across units of the same document when they share a non-empty root key (module notes).
 
@@ -293,12 +294,16 @@ def fold_documents(
         ValueError: If ``envelopes`` and ``units`` do not name the same unit ids, a unit's document is missing from
             ``documents``, or an item or empty unit in ``grounding`` names an unknown unit or wrong model/key shape.
     """
-    _check_arguments(grounding, units, envelopes, documents, schema)
+    _check_arguments(grounding, units, envelopes, documents, schema, fold_across_units)
     doc_elements = _index_documents(documents)
-    doc_scopes = {doc_id: group_scopes(document) for doc_id, document in documents.items()}
+    mm_units = frozenset(uid for uid, env in envelopes.items() if env.images)
+    mm_docs = frozenset(units[uid].doc_id for uid in mm_units)
+    doc_scopes = {
+        doc_id: group_scopes(document, multimodal=(doc_id in mm_docs)) for doc_id, document in documents.items()
+    }
     unit_citable = _index_citable(units, envelopes)
     unit_rank = {unit_id: index for index, unit_id in enumerate(units)}
-    groups = _group_items(grounding.items, units, unit_rank, bool(schema.spec.keys.fields))
+    groups = _group_items(grounding.items, units, unit_rank, fold_across_units and bool(schema.spec.keys.fields))
     folded = [
         _fold_group(
             group,
@@ -306,6 +311,7 @@ def fold_documents(
             doc_elements=doc_elements,
             doc_scopes=doc_scopes,
             unit_citable=unit_citable,
+            multimodal_units=mm_units,
             schema=schema,
         )
         for group in groups
@@ -349,8 +355,11 @@ def _check_arguments(
     envelopes: object,
     documents: object,
     schema: object,
+    fold_across_units: object = True,
 ) -> None:
     """Validate all inputs to :func:`fold_documents` before folding."""
+    if type(fold_across_units) is not bool:
+        raise TypeError(f"fold_across_units must be a bool, got {type(fold_across_units).__name__}")
     if not isinstance(grounding, GroundingResult):
         raise TypeError(f"grounding must be a GroundingResult, got {type(grounding).__name__}")
     if not isinstance(schema, PreparedSchema):
@@ -470,6 +479,7 @@ def _build_sources(
     doc_elements: Mapping[str, Mapping[str, DocumentElement]],
     doc_scopes: Mapping[str, Mapping[str, GroupScope]],
     unit_citable: Mapping[str, Mapping[str, DocumentElement]],
+    multimodal_units: frozenset[str] = frozenset(),
 ) -> tuple[ElementSource, ...]:
     """Resolve cited element ids across ``group`` into deduplicated :class:`ElementSource` instances."""
     seen: set[tuple[str, str]] = set()
@@ -487,7 +497,9 @@ def _build_sources(
                 if pair in seen or element_id not in citable:
                     continue
                 seen.add(pair)
-                element = whole_by_id.get(element_id, citable[element_id])
+                is_mm_body = unit_id in multimodal_units and element_id in body_ids
+                element = citable[element_id] if is_mm_body else whole_by_id.get(element_id, citable[element_id])
+                scope_val = unit.scope_path if is_mm_body else _element_scope(element_id, unit, body_ids, scopes)
                 sources.append(
                     ElementSource(
                         doc_id=unit.doc_id,
@@ -495,7 +507,7 @@ def _build_sources(
                         element_id=element_id,
                         page_number=element.page_number,
                         bbox=element.bbox,
-                        scope_path=_element_scope(element_id, unit, body_ids, scopes),
+                        scope_path=scope_val,
                     )
                 )
     return tuple(sources)
@@ -513,6 +525,7 @@ def _fold_group(
     doc_elements: Mapping[str, Mapping[str, DocumentElement]],
     doc_scopes: Mapping[str, Mapping[str, GroupScope]],
     unit_citable: Mapping[str, Mapping[str, DocumentElement]],
+    multimodal_units: frozenset[str] = frozenset(),
     schema: PreparedSchema,
 ) -> GroundedRecord[Any]:
     """Fold one group of :class:`GroundedItem` instances into a :class:`GroundedRecord`."""
@@ -524,6 +537,7 @@ def _fold_group(
         doc_elements=doc_elements,
         doc_scopes=doc_scopes,
         unit_citable=unit_citable,
+        multimodal_units=multimodal_units,
     )
     quotes = _united(
         quotes_for_model for grounded in group for quotes_for_model in grounded.item.quotes_by_model.values()
@@ -718,6 +732,8 @@ class _Folder:
                 return True, False, None
             source = next((inst for inst in instances if field_spec.name in inst.model_fields_set), instances[0])
             return True, True, _dump_leaf(source, field_spec, depth)
+        if field_spec.informational:
+            return True, True, _dump_leaf(explicit[0], field_spec, depth)
         norms = {_normalized_field(field_spec, getattr(inst, field_spec.name)) for inst in explicit}
         if len(norms) > 1:
             self.disputed.append(field_path)
