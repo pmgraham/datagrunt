@@ -18,28 +18,41 @@ jobs:
   test:
     name: cargo + pytest (both backends)
     runs-on: ubuntu-latest
+    env:
+      # PEP 669 low-overhead line monitoring on Python 3.12+.
+      COVERAGE_CORE: sysmon
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: "rust -> target"
+
       - name: Install uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: "3.12"
+          enable-cache: "true"
+          cache-dependency-glob: |
+            pyproject.toml
+            rust/Cargo.toml
+            rust/Cargo.lock
 
       - name: Install tesseract (for PDF OCR tests)
         run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
 
       - name: Create venv, build the extension (editable), install dev/pdf/rationalize extras
         # Explicit venv + editable install (uv handles maturin build isolation
-        # automatically). We then call .venv/bin/<tool> directly rather than
-        # `uv run`, which would re-sync the project env and drop the editable
-        # install + dev extras (that was the earlier "pytest: not found" failure).
+        # automatically). --reinstall-package datagrunt forces maturin to link
+        # fresh Rust changes from rust/target (cached by rust-cache) instead of
+        # ever serving a stale editable wheel from uv's wheel cache.
         run: |
           uv venv --clear   # setup-uv already created .venv; --clear makes this idempotent
-          uv pip install -e ".[dev,pdf,rationalize]"
+          uv pip install --reinstall-package datagrunt -e ".[dev,pdf,rationalize]"
 
       - name: cargo test
         working-directory: rust
@@ -60,12 +73,16 @@ jobs:
         run: cargo fmt --check
 
       - name: pytest (Rust backend)
-        run: .venv/bin/pytest tests/ -q
+        run: |
+          .venv/bin/pytest -n logical --dist=worksteal -m "not corpus and not live and not no_cover" --cov-fail-under=95 tests/ -q
+          .venv/bin/pytest -p no:cov -o addopts="" -m "no_cover and not corpus and not live" tests/ -q
 
       - name: pytest (Python fallback backend)
         env:
           DATAGRUNT_DISABLE_RUST: "1"
-        run: .venv/bin/pytest tests/ -q
+        run: |
+          .venv/bin/pytest -n logical --dist=worksteal -m "not corpus and not live and not no_cover" --cov-fail-under=95 tests/ -q
+          .venv/bin/pytest -p no:cov -o addopts="" -m "no_cover and not corpus and not live" tests/ -q
 
       - name: ruff lint (src + tests — blocking)
         run: .venv/bin/ruff check src tests
@@ -97,16 +114,30 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.13", "3.14"]
+    env:
+      # PEP 669 sys.monitoring is available on 3.12+ (3.13, 3.14); 3.11 uses ctrace.
+      COVERAGE_CORE: ${{ matrix.python-version != '3.11' && 'sysmon' || 'ctrace' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
+      - name: Cache Rust dependencies and build artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: "rust -> target"
+          key: py-${{ matrix.python-version }}
+
       - name: Install uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: ${{ matrix.python-version }}
+          enable-cache: "true"
+          cache-dependency-glob: |
+            pyproject.toml
+            rust/Cargo.toml
+            rust/Cargo.lock
 
       - name: Install tesseract (for PDF OCR tests)
         run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
@@ -114,15 +145,19 @@ jobs:
       - name: Create venv, build the extension (editable), install dev/pdf/rationalize extras
         run: |
           uv venv --clear
-          uv pip install -e ".[dev,pdf,rationalize]"
+          uv pip install --reinstall-package datagrunt -e ".[dev,pdf,rationalize]"
 
       - name: pytest (Rust backend)
-        run: .venv/bin/pytest tests/ -q
+        run: |
+          .venv/bin/pytest -n logical --dist=worksteal -m "not corpus and not live and not no_cover" --cov-fail-under=95 tests/ -q
+          .venv/bin/pytest -p no:cov -o addopts="" -m "no_cover and not corpus and not live" tests/ -q
 
       - name: pytest (Python fallback backend)
         env:
           DATAGRUNT_DISABLE_RUST: "1"
-        run: .venv/bin/pytest tests/ -q
+        run: |
+          .venv/bin/pytest -n logical --dist=worksteal -m "not corpus and not live and not no_cover" --cov-fail-under=95 tests/ -q
+          .venv/bin/pytest -p no:cov -o addopts="" -m "no_cover and not corpus and not live" tests/ -q
 
   build:
     # Skipped on post-merge push to main: every PR already builds all wheels +
@@ -147,19 +182,30 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
+      - name: Install cargo-audit (prebuilt binary)
+        id: install-cargo-audit
+        continue-on-error: true
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-audit
+
       - name: cargo audit
+        if: steps.install-cargo-audit.outcome == 'success'
         continue-on-error: true
         working-directory: rust
         env:
           CARGO_NET_RETRY: "10"
-        run: |
-          cargo install cargo-audit --locked
-          cargo audit
+        run: cargo audit
 
       - name: Install uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: "3.12"
+          enable-cache: "true"
+          cache-dependency-glob: |
+            pyproject.toml
+            rust/Cargo.toml
+            rust/Cargo.lock
 
       - name: pip-audit
         continue-on-error: true
@@ -168,5 +214,5 @@ jobs:
         # enumerates installed dists via pip (uv venvs omit pip by default).
         run: |
           uv venv --clear
-          uv pip install -e . pip-audit pip
+          uv pip install --reinstall-package datagrunt -e . pip-audit pip
           .venv/bin/pip-audit

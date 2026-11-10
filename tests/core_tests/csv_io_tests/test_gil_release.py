@@ -79,6 +79,7 @@ class _BackgroundCounter:
         return (self._count - before) / elapsed, elapsed
 
 
+@pytest.mark.no_cover
 def test_row_count_releases_gil_during_scan(large_csv):
     with _BackgroundCounter() as counter:
         # Free rate: main thread sleeps, so the background loop owns the GIL.

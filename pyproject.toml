@@ -48,6 +48,7 @@ rationalize = [
 dev = [
     "pytest>=9.0.3",
     "pytest-cov>=7.1.0",
+    "pytest-xdist>=3.8.0,<4",
     # Upper-bounded deliberately: ruff's formatter output is a moving target by
     # design (0.16 began formatting Python inside Markdown, #312), and CI gates
     # on `ruff format --check`. Unbounded, a formatter release breaks CI on
@@ -95,6 +96,15 @@ Homepage = "https://www.datagrunt.io/"
 Documentation = "https://www.datagrunt.io/"
 "Source Code" = "https://github.com/pmgraham/datagrunt"
 
+[tool.uv]
+# Invalidate cached editable wheels whenever Rust crates or sources change.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "rust/Cargo.toml" },
+    { file = "rust/Cargo.lock" },
+    { file = "rust/**/*.rs" },
+]
+
 [tool.maturin]
 python-source = "src"
 module-name = "datagrunt._native"
@@ -130,6 +140,7 @@ pythonpath = "."
 # deselected by this addopts AND unselected by the deep job, and would run
 # nowhere. Depth is a profile, not a marker.
 markers = [
+    "no_cover: wall-clock performance tests run serially without coverage overhead",
     "corpus: slow, local-only cross-engine tests over the data/pdfs corpus (deselected by default; run with -m corpus)",
     "live: opt-in smoke tests that call live model provider endpoints when API keys are set (deselected by default; run with -m live)",
 ]
