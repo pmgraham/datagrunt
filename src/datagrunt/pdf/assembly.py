@@ -271,8 +271,35 @@ _MAX_TILE_PT = 40.0
 _MAX_TILE_PX = 160
 
 
+def _build_strip_chain(
+    ordered: list[tuple[int, RawImage]], start: int, used: list[bool], *, horizontal: bool
+) -> list[int]:
+    """Grow one advancing zero-gap strip chain starting at start with bounded lookahead."""
+    chain = [start]
+    misses = 0
+    for j in range(start + 1, len(ordered)):
+        if used[j]:
+            continue
+        prev_b, curr_b = ordered[chain[-1]][1].bbox, ordered[j][1].bbox
+        same_span = (
+            abs(curr_b[0] - prev_b[0]) <= 1.5 and abs(curr_b[2] - prev_b[2]) <= 1.5
+            if horizontal
+            else abs(curr_b[1] - prev_b[1]) <= 1.5 and abs(curr_b[3] - prev_b[3]) <= 1.5
+        )
+        seam = (curr_b[1] - prev_b[3]) if horizontal else (curr_b[0] - prev_b[2])
+        advance = (curr_b[3] - prev_b[3]) if horizontal else (curr_b[2] - prev_b[2])
+        if same_span and -_MOSAIC_SEAM_PT <= seam <= _MOSAIC_SEAM_PT and advance > 0.1:
+            chain.append(j)
+            misses = 0
+        else:
+            misses += 1
+            if misses >= 8:
+                break
+    return chain
+
+
 def _strip_runs_by_span(entries: list[tuple[int, RawImage]], *, horizontal: bool, min_total_area: float) -> set[int]:
-    """Find zero-gap advancing scanline strip stacks of ``>= 8`` strips covering ``>= 30%`` of page in O(S log S)."""
+    """Find zero-gap advancing scanline strip stacks of >= 8 strips covering >= 30% of page in O(S log S)."""
     if len(entries) < _MIN_STRIP_STACK:
         return set()
     ordered = sorted(
@@ -288,40 +315,19 @@ def _strip_runs_by_span(entries: list[tuple[int, RawImage]], *, horizontal: bool
     for i in range(len(ordered)):
         if used[i]:
             continue
-        chain = [i]
-        misses = 0
-        for j in range(i + 1, len(ordered)):
-            if used[j]:
-                continue
-            prev_b = ordered[chain[-1]][1].bbox
-            curr_b = ordered[j][1].bbox
-            same_span = (
-                abs(curr_b[0] - prev_b[0]) <= 1.5 and abs(curr_b[2] - prev_b[2]) <= 1.5
-                if horizontal
-                else abs(curr_b[1] - prev_b[1]) <= 1.5 and abs(curr_b[3] - prev_b[3]) <= 1.5
-            )
-            seam = (curr_b[1] - prev_b[3]) if horizontal else (curr_b[0] - prev_b[2])
-            advance = (curr_b[3] - prev_b[3]) if horizontal else (curr_b[2] - prev_b[2])
-            if same_span and -_MOSAIC_SEAM_PT <= seam <= _MOSAIC_SEAM_PT and advance > 0.1:
-                chain.append(j)
-                misses = 0
-            else:
-                misses += 1
-                if misses >= 8:
-                    break
+        chain = _build_strip_chain(ordered, i, used, horizontal=horizontal)
         for k in chain:
             used[k] = True
-        if len(chain) >= _MIN_STRIP_STACK:
-            first_b = ordered[chain[0]][1].bbox
-            last_b = ordered[chain[-1]][1].bbox
-            union_area = (
-                (first_b[2] - first_b[0]) * max(last_b[3] - first_b[1], 0.0)
-                if horizontal
-                else (first_b[3] - first_b[1]) * max(last_b[2] - first_b[0], 0.0)
-            )
-            if union_area >= min_total_area:
-                for k in chain:
-                    suppressed.add(ordered[k][0])
+        if len(chain) < _MIN_STRIP_STACK:
+            continue
+        first_b, last_b = ordered[chain[0]][1].bbox, ordered[chain[-1]][1].bbox
+        union_area = (
+            (first_b[2] - first_b[0]) * max(last_b[3] - first_b[1], 0.0)
+            if horizontal
+            else (first_b[3] - first_b[1]) * max(last_b[2] - first_b[0], 0.0)
+        )
+        if union_area >= min_total_area:
+            suppressed.update(ordered[k][0] for k in chain)
     return suppressed
 
 
@@ -351,6 +357,36 @@ def _strip_stack_positions(indexed: list[tuple[int, RawImage]], page_w: float, p
     )
 
 
+def _find_root(parent: list[int], node: int) -> int:
+    """Path-compressed disjoint-set root lookup."""
+    while parent[node] != node:
+        parent[node] = parent[parent[node]]
+        node = parent[node]
+    return node
+
+
+def _union_window(merged: list[int], tiles: list[tuple[int, RawImage]], parent: list[int], *, row_mode: bool) -> None:
+    """Union congruent disjointly edge-abutting neighbours within a sorted bucket window."""
+    for m_i, a_idx in enumerate(merged):
+        ab = tiles[a_idx][1].bbox
+        for step in range(1, min(8, len(merged) - m_i)):
+            b_idx = merged[m_i + step]
+            bb = tiles[b_idx][1].bbox
+            seam = (bb[0] - ab[2]) if row_mode else (bb[1] - ab[3])
+            if seam > _MOSAIC_SEAM_PT:
+                break
+            aligned = (
+                abs(ab[1] - bb[1]) <= 1.5 and abs(ab[3] - bb[3]) <= 1.5
+                if row_mode
+                else abs(ab[0] - bb[0]) <= 1.5 and abs(ab[2] - bb[2]) <= 1.5
+            )
+            if aligned and seam >= -_MOSAIC_SEAM_PT:
+                parent[_find_root(parent, b_idx)] = _find_root(parent, a_idx)
+
+
+_NEIGHBOUR_OFFSETS = tuple((d0, d1) for d0 in (-1, 0, 1) for d1 in (-1, 0, 1))
+
+
 def _link_axis_buckets(tiles: list[tuple[int, RawImage]], parent: list[int], *, row_mode: bool) -> None:
     """Union congruent disjointly edge-abutting tiles along rows or columns in strict O(T log T) time."""
     buckets: dict[tuple[int, int], list[int]] = {}
@@ -362,39 +398,10 @@ def _link_axis_buckets(tiles: list[tuple[int, RawImage]], parent: list[int], *, 
             else (int(round(b[0] / 2.0)), int(round(b[2] / 2.0)))
         )
         buckets.setdefault(key, []).append(idx)
-
-    def find(node: int) -> int:
-        while parent[node] != node:
-            parent[node] = parent[parent[node]]
-            node = parent[node]
-        return node
-
-    visited: set[tuple[int, int]] = set()
     for k0, k1 in list(buckets):
-        if (k0, k1) in visited:
-            continue
-        visited.add((k0, k1))
-        merged: list[int] = []
-        for d0 in (-1, 0, 1):
-            for d1 in (-1, 0, 1):
-                merged.extend(buckets.get((k0 + d0, k1 + d1), ()))
+        merged = [idx for d0, d1 in _NEIGHBOUR_OFFSETS for idx in buckets.get((k0 + d0, k1 + d1), ())]
         merged.sort(key=lambda idx: tiles[idx][1].bbox[0] if row_mode else tiles[idx][1].bbox[1])
-        for m_i in range(len(merged)):
-            a_idx = merged[m_i]
-            ab = tiles[a_idx][1].bbox
-            for step in range(1, min(8, len(merged) - m_i)):
-                b_idx = merged[m_i + step]
-                bb = tiles[b_idx][1].bbox
-                seam = (bb[0] - ab[2]) if row_mode else (bb[1] - ab[3])
-                if seam > _MOSAIC_SEAM_PT:
-                    break
-                aligned = (
-                    abs(ab[1] - bb[1]) <= 1.5 and abs(ab[3] - bb[3]) <= 1.5
-                    if row_mode
-                    else abs(ab[0] - bb[0]) <= 1.5 and abs(ab[2] - bb[2]) <= 1.5
-                )
-                if aligned and seam >= -_MOSAIC_SEAM_PT:
-                    parent[find(b_idx)] = find(a_idx)
+        _union_window(merged, tiles, parent, row_mode=row_mode)
 
 
 def _tile_grid_positions(indexed: list[tuple[int, RawImage]]) -> set[int]:
