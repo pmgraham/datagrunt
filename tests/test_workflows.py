@@ -174,9 +174,9 @@ def test_ci_preserves_required_jobs_and_runs_disjoint_xdist_plus_benchmark_passe
         for step in pytest_steps:
             cmd = str(step.get("run", ""))
             assert "-n logical --dist=worksteal" in cmd
-            assert "-m \"not corpus and not live and not no_cover\"" in cmd
+            assert '-m "not corpus and not live and not no_cover"' in cmd
             assert "--cov-fail-under=95" in cmd
-            assert "-p no:cov -o addopts=\"\" -m \"no_cover and not corpus and not live\"" in cmd
+            assert '-p no:cov -o addopts="" -m "no_cover and not corpus and not live"' in cmd
 
 
 def test_ci_uses_sysmon_coverage_core_for_py312_plus() -> None:
