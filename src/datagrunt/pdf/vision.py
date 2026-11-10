@@ -649,6 +649,7 @@ def vision_page(
         password=password,
         min_image_dimension=min_image_dimension,
         sandbox=options.sandbox,
+        image_only=True,
     )
     laid = vision_elements(
         reading.words,

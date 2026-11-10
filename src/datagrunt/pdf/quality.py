@@ -201,6 +201,7 @@ a warning, and so are dropped objects when no recovery is passed (the page's
 ``TextStats.dropped_text_objects`` is over 0 and ``recovered`` is None).
 """
 
+import bisect
 import math
 import unicodedata
 from bisect import bisect_left
@@ -381,57 +382,147 @@ def classify_spans(
     checked_glyphs = tuple(ordered_box(f"glyph_boxes[{idx}]", box) for idx, box in enumerate(glyph_boxes))
     width, height = positive_float("width_pt", width_pt), positive_float("height_pt", height_pt)
     boxes = _scan_boxes(images)
-    v_bands = _banded(checked_glyphs, height) if checked_glyphs else ()
+    v_bands = _glyph_bands(checked_glyphs, height)
     return _classify(spans, width, height, boxes, _cover_fraction(boxes, width, height), v_bands)
 
 
-def _char_has_glyph_stroke(
-    ch: str, cbox: Box, bands: tuple[tuple[Box, ...], ...], height: float, budget: list[int]
-) -> bool:
-    """True when a visible non-white glyph-scale stroke box overlaps ``cbox`` with character-scale dimensions."""
+_MAX_COMPOUND_WORD_PT = 600.0
+_RULE_LIKE_CHARS = frozenset("_-—–=")
+
+
+class _GlyphBand(NamedTuple):
+    """Horizontal page band of glyph stroke boxes sorted by ``x0`` for O(log B) range lookup."""
+
+    boxes: tuple[Box, ...]
+    x0s: tuple[float, ...]
+    max_w: float
+
+
+def _glyph_bands(boxes: tuple[Box, ...], height: float) -> tuple[_GlyphBand, ...]:
+    """Index ``boxes`` into horizontal bands sorted by ``x0`` in O(G log G)."""
+    if not boxes:
+        return ()
+    buckets: list[list[Box]] = [[] for _ in range(_GATE_BANDS)]
+    for box in boxes:
+        for band in _bands_of(box[1], box[3], height):
+            buckets[band].append(box)
+    indexed: list[_GlyphBand] = []
+    for bucket in buckets:
+        bucket.sort(key=lambda b: b[0])
+        max_w = max((b[2] - b[0] for b in bucket), default=0.0)
+        indexed.append(_GlyphBand(tuple(bucket), tuple(b[0] for b in bucket), max_w))
+    return tuple(indexed)
+
+
+def _box_backs_char(ch: str, cw: float, ch_h: float, max_side: float, vw: float, vh: float) -> bool:
+    """True when stroke dimensions ``(vw, vh)`` match a single glyph or > 36 pt compound outlined word path."""
+    if vw > max_side or vh > max_side:
+        minor, major = (vw, vh) if vw <= vh else (vh, vw)
+        min_word_minor = max(3.0, 0.35 * min(max(cw, 4.0), max(ch_h, 4.0)))
+        return (
+            ch not in _RULE_LIKE_CHARS and min_word_minor <= minor <= max_side and 36.0 < major <= _MAX_COMPOUND_WORD_PT
+        )
+    if vh >= max(0.18 * ch_h, 1.2):
+        return True
+    if ch in "-_.=—–~" and vw >= max(0.35 * cw, 1.0) and vh <= max(0.5 * ch_h, 3.0):
+        return True
+    return ch in ".,:;'\"\u00b0\u00b7*" and vw <= max(cw * 2.0, 6.0) and vh <= max(ch_h * 2.0, 6.0)
+
+
+def _x_backs_char(cx0: float, cx1: float, cw: float, vx0: float, vx1: float) -> bool:
+    """True when stroke ``[vx0, vx1]`` centres inside ``[cx0, cx1]`` or covers >= 30% of its width."""
+    vmid = 0.5 * (vx0 + vx1)
+    if cx0 - 0.15 <= vmid <= cx1 + 0.15:
+        return True
+    return min(cx1, vx1) - max(cx0, vx0) >= max(0.30 * cw, 0.5)
+
+
+def _char_has_glyph_stroke(ch: str, cbox: Box, bands: tuple[_GlyphBand, ...], height: float, budget: list[int]) -> bool:
+    """True when a visible non-white glyph/word stroke box backs ``cbox`` without bleeding into neighbours."""
     cx0, cy0, cx1, cy1 = cbox
     cw, ch_h = max(cx1 - cx0, 0.0), max(cy1 - cy0, 0.0)
-    scale = max(cw, ch_h, 4.0)
-    max_side = min(max(2.5 * scale, 18.0), 36.0)
-    horiz_glyph = ch in "-_.=—–~"
-    dot_glyph = ch in ".,:;'\"\u00b0\u00b7"
-    for band in _bands_of(cy0 - _VECTOR_TOL_PT, cy1 + _VECTOR_TOL_PT, height):
-        for vx0, vy0, vx1, vy1 in bands[band]:
+    max_side = min(max(2.5 * max(cw, ch_h, 4.0), 18.0), 36.0)
+    qx0, qx1 = cx0 - 0.15, cx1 + 0.15
+    qy0, qy1 = cy0 - _VECTOR_TOL_PT, cy1 + _VECTOR_TOL_PT
+    for band_idx in _bands_of(qy0, qy1, height):
+        gband = bands[band_idx]
+        lo = bisect.bisect_left(gband.x0s, qx0 - gband.max_w - 1e-6)
+        hi = bisect.bisect_right(gband.x0s, qx1)
+        for idx in range(lo, hi):
             budget[0] -= 1
             if budget[0] < 0:
                 return False
-            if not (
-                vx0 <= cx1 + _VECTOR_TOL_PT
-                and cx0 - _VECTOR_TOL_PT <= vx1
-                and vy0 <= cy1 + _VECTOR_TOL_PT
-                and cy0 - _VECTOR_TOL_PT <= vy1
-            ):
-                continue
-            vw, vh = vx1 - vx0, vy1 - vy0
-            if vw > max_side or vh > max_side:
-                continue
+            vx0, vy0, vx1, vy1 = gband.boxes[idx]
             if (
-                vh >= max(0.35 * ch_h, 1.0)
-                or (horiz_glyph and vw >= max(0.35 * cw, 1.0) and vh <= max(0.5 * ch_h, 3.0))
-                or (dot_glyph and vw <= max(cw * 2.0, 6.0) and vh <= max(ch_h * 2.0, 6.0))
+                vy0 <= qy1
+                and qy0 <= vy1
+                and _x_backs_char(cx0, cx1, cw, vx0, vx1)
+                and _box_backs_char(ch, cw, ch_h, max_side, vx1 - vx0, vy1 - vy0)
             ):
                 return True
     return False
 
 
+_MAX_DRIFT_GAP = 2
+
+
+def _bridge_short_drift_gaps(on_page: list[int], backed: list[bool]) -> None:
+    """Bridge strictly interior <= 2-char kerning-drift gaps bracketed on both sides (never prefixes/suffixes)."""
+    n = len(on_page)
+    pos = 0
+    while pos < n:
+        if backed[on_page[pos]]:
+            pos += 1
+            continue
+        end = pos + 1
+        while end < n and not backed[on_page[end]]:
+            end += 1
+        if pos > 0 and end < n and end - pos <= _MAX_DRIFT_GAP:
+            for k in range(pos, end):
+                backed[on_page[k]] = True
+        pos = end
+
+
+def _mark_word_backing(
+    span: RawSpan,
+    start: int,
+    end: int,
+    width: float,
+    height: float,
+    bands: tuple[_GlyphBand, ...],
+    budget: list[int],
+    backed: list[bool],
+) -> None:
+    """Back on-page characters and bridge strictly interior <= 2-char drift gaps when >= 60% alnum match."""
+    on_page = [i for i in range(start, end) if not off_page(span.char_boxes[i], width, height)]
+    if not on_page:
+        return
+    for idx in on_page:
+        backed[idx] = _char_has_glyph_stroke(span.text[idx], span.char_boxes[idx], bands, height, budget)
+    alnum = [i for i in on_page if span.text[i].isalnum()]
+    alnum_hits = sum(1 for i in alnum if backed[i])
+    if len(alnum) >= 3 and alnum_hits >= 2 and alnum_hits * 5 >= 3 * len(alnum):
+        _bridge_short_drift_gaps(on_page, backed)
+
+
 def _char_vector_flags(
-    span: RawSpan, width: float, height: float, bands: tuple[tuple[Box, ...], ...], budget: list[int]
+    span: RawSpan, width: float, height: float, bands: tuple[_GlyphBand, ...], budget: list[int]
 ) -> tuple[bool, ...]:
-    """Per-character vector-stroke backing flags; internal spaces stay visible only between backed neighbours."""
+    """Word-aware vector-stroke backing flags; internal spaces stay visible only between backed neighbours."""
     n = len(span.text)
     if span.render_mode != _INVISIBLE_TEXT_MODE or not bands or n == 0:
         return (False,) * n
-    backed = [
-        (not ch.isspace())
-        and (not off_page(box, width, height))
-        and _char_has_glyph_stroke(ch, box, bands, height, budget)
-        for ch, box in zip(span.text, span.char_boxes, strict=True)
-    ]
+    backed = [False] * n
+    pos = 0
+    while pos < n:
+        if span.text[pos].isspace():
+            pos += 1
+            continue
+        end = pos + 1
+        while end < n and not span.text[end].isspace():
+            end += 1
+        _mark_word_backing(span, pos, end, width, height, bands, budget, backed)
+        pos = end
     if not any(backed):
         return tuple(backed)
     left_ok = [False] * n
@@ -459,7 +550,7 @@ def _classify(
     height: float,
     boxes: tuple[Box, ...],
     cover: float,
-    v_bands: tuple[tuple[Box, ...], ...] = (),
+    v_bands: tuple[_GlyphBand, ...] = (),
 ) -> tuple[SpanPiece, ...]:
     """:func:`classify_spans` of checked input, given raster ``cover`` and banded vector glyph boxes."""
     raster = boxes if cover > _OCR_LAYER_COVER else ()
@@ -510,7 +601,7 @@ def _span_pieces(
     width: float,
     height: float,
     raster: tuple[Box, ...],
-    v_bands: tuple[tuple[Box, ...], ...] = (),
+    v_bands: tuple[_GlyphBand, ...] = (),
     budget: list[int] | None = None,
 ) -> Iterator[SpanPiece]:
     """Yield ``span``'s pieces: maximal runs of chars with equal hidden reasons."""
@@ -921,7 +1012,7 @@ def assess_page(
         pieces: tuple[SpanPiece, ...] = _initial.pieces
         own: tuple[SpanPiece, ...] = ()
     else:
-        v_bands = _banded(page.object_boxes.glyph_stroke_boxes, height) if page.object_boxes.glyph_stroke_boxes else ()
+        v_bands = _glyph_bands(page.object_boxes.glyph_stroke_boxes, height)
         pieces = _classify(page.text.spans, width, height, boxes, cover, v_bands)
         own = _recovered_own(recovered, width, height, boxes, cover, v_bands)
     if isinstance(background, Backdrop):
@@ -1059,7 +1150,7 @@ def _recovered_own(
     height: float,
     boxes: tuple[Box, ...],
     cover: float,
-    v_bands: tuple[tuple[Box, ...], ...] = (),
+    v_bands: tuple[_GlyphBand, ...] = (),
 ) -> tuple[SpanPiece, ...]:
     """The recovered spans' pieces, in recovery order, each with its recovered reasons and the computed ones.
 

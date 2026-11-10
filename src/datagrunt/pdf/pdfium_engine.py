@@ -1299,29 +1299,59 @@ def image_refusal(
         return None
 
 
+_SINGLE_GLYPH_MAX_PT = 16.0
 _MAX_GLYPH_PATH_PT = 36.0
+_MIN_COMPOUND_MINOR_PT = 2.5
+_MAX_COMPOUND_MAJOR_PT = 600.0
+_MIN_COMPOUND_SEGMENTS = 24
+_MIN_COMPOUND_DENSITY = 0.30
 _MIN_VISIBLE_ALPHA = 13
 _WHITE_DIST_SQ = 16
 
 
+def _is_glyph_or_word_scale(bw: float, bh: float, segs: int, stroked: bool) -> bool:
+    """True for stroked single glyphs (<= 36 pt), small filled glyphs (<= 16 pt), or >= 24-seg word paths."""
+    if (bw <= 0.0 and bh <= 0.0) or segs <= 0:
+        return False
+    minor, major = (bw, bh) if bw <= bh else (bh, bw)
+    if not stroked and segs <= 6 and minor > 4.0:
+        return False
+    single_cap = _MAX_GLYPH_PATH_PT if stroked else _SINGLE_GLYPH_MAX_PT
+    if bw <= single_cap and bh <= single_cap:
+        return True
+    if minor < _MIN_COMPOUND_MINOR_PT or minor > _MAX_GLYPH_PATH_PT or major > _MAX_COMPOUND_MAJOR_PT:
+        return False
+    return segs >= max(_MIN_COMPOUND_SEGMENTS, math.ceil(_MIN_COMPOUND_DENSITY * major))
+
+
+def _visible_rgba(r: int, g: int, b: int, a: int) -> bool:
+    """True when RGBA paint is non-transparent and visibly non-white."""
+    return a >= _MIN_VISIBLE_ALPHA and ((255 - r) ** 2 + (255 - g) ** 2 + (255 - b) ** 2) >= _WHITE_DIST_SQ
+
+
 def _is_visible_glyph_path(obj: pdfium_c.FPDF_PAGEOBJECT, box: Box) -> bool:
-    """True when ``obj`` is a glyph-scale path painting visible non-white ink (SHX/outlined CAD glyphs)."""
+    """True when ``obj`` is a glyph/word-scale path painting visible non-white ink (SHX/outlined CAD glyphs)."""
     bw, bh = box[2] - box[0], box[3] - box[1]
-    if (bw <= 0.0 and bh <= 0.0) or bw > _MAX_GLYPH_PATH_PT or bh > _MAX_GLYPH_PATH_PT:
+    if (bw <= 0.0 and bh <= 0.0) or max(bw, bh) > _MAX_COMPOUND_MAJOR_PT or min(bw, bh) > _MAX_GLYPH_PATH_PT:
         return False
     fill_mode, stroke = ctypes.c_int(), ctypes.c_int()
     if not pdfium_c.FPDFPath_GetDrawMode(obj, fill_mode, stroke):
         return False
     r, g, b, a = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
-    if stroke.value and pdfium_c.FPDFPageObj_GetStrokeColor(obj, r, g, b, a):
-        dist_sq = (255 - r.value) ** 2 + (255 - g.value) ** 2 + (255 - b.value) ** 2
-        if a.value >= _MIN_VISIBLE_ALPHA and dist_sq >= _WHITE_DIST_SQ:
-            return True
-    if fill_mode.value != pdfium_c.FPDF_FILLMODE_NONE and pdfium_c.FPDFPageObj_GetFillColor(obj, r, g, b, a):
-        dist_sq = (255 - r.value) ** 2 + (255 - g.value) ** 2 + (255 - b.value) ** 2
-        if a.value >= _MIN_VISIBLE_ALPHA and dist_sq >= _WHITE_DIST_SQ:
-            return True
-    return False
+    stroke_visible = bool(
+        stroke.value
+        and pdfium_c.FPDFPageObj_GetStrokeColor(obj, r, g, b, a)
+        and _visible_rgba(r.value, g.value, b.value, a.value)
+    )
+    fill_visible = not stroke_visible and bool(
+        fill_mode.value != pdfium_c.FPDF_FILLMODE_NONE
+        and pdfium_c.FPDFPageObj_GetFillColor(obj, r, g, b, a)
+        and _visible_rgba(r.value, g.value, b.value, a.value)
+    )
+    if not (stroke_visible or fill_visible):
+        return False
+    segs = int(pdfium_c.FPDFPath_CountSegments(obj))
+    return _is_glyph_or_word_scale(bw, bh, segs, stroked=stroke_visible)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

@@ -669,6 +669,24 @@ def _run_in_corpus_worker(
         return _ipc_failure(item, options.strict, exc)
 
 
+def _safe_file_size(path: Path) -> int:
+    """Return file byte size for LPT scheduling, or 0 if stat fails."""
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _lpt_todo_indices(items: tuple[_SourceItem, ...], todo_indices: list[int], *, strict: bool) -> list[int]:
+    """Order multi-worker work items largest-file-first (Graham LPT) when ``strict`` is False."""
+    if not isinstance(todo_indices, list):
+        raise TypeError(f"todo_indices must be a list, got {type(todo_indices).__name__}")
+    strict_bool("strict", strict)
+    if strict or len(todo_indices) <= 1:
+        return list(todo_indices)
+    return sorted(todo_indices, key=lambda idx: (-_safe_file_size(items[idx].path), idx))
+
+
 def _run_spawn_batch(
     items: tuple[_SourceItem, ...],
     target: Path,
@@ -706,7 +724,8 @@ def _run_spawn_batch(
             render_pages=render_pages,
         )
         return [outcomes[i] for i in range(len(items))]
-    todo_items = tuple(items[i] for i in todo_indices)
+    ordered_todo = _lpt_todo_indices(items, todo_indices, strict=options.strict)
+    todo_items = tuple(items[i] for i in ordered_todo)
     pool_size = min(workers, len(todo_items))
     with _CorpusProcPool() as proc_pool:
         todo_outcomes = _run_batch(
@@ -723,7 +742,7 @@ def _run_spawn_batch(
             )[1],
             pool_size,
         )
-    for idx, res in zip(todo_indices, todo_outcomes, strict=True):
+    for idx, res in zip(ordered_todo, todo_outcomes, strict=True):
         outcomes[idx] = res
     return [outcomes[i] for i in range(len(items))]
 
