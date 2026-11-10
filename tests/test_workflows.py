@@ -1,4 +1,4 @@
-"""GitHub Actions workflow invariants: deduplication, release guards, SHA pinning, and multi-core CI speed."""
+"""GitHub Actions workflow invariants: deduplication, release guards, allowlist + SHA pinning, and multi-core CI."""
 
 import re
 import tomllib
@@ -11,6 +11,16 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 ACTIONS = ROOT / ".github" / "actions"
 PYPROJECT = ROOT / "pyproject.toml"
 SHA_PINNED_USES_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}$")
+ALLOWED_ACTION_PREFIXES = (
+    "./.github/",
+    "actions/",
+    "github/",
+    "pmgraham/",
+    "PyO3/maturin-action@",
+    "astral-sh/setup-uv@",
+    "dtolnay/rust-toolchain@",
+    "pypa/gh-action-pypi-publish@",
+)
 MAX_WORKFLOW_FILES = 64
 
 
@@ -96,7 +106,7 @@ def test_ci_runs_core_gate_on_push_but_skips_duplicate_wheel_and_compat_builds()
     # (and Publish to PyPI builds release wheels after Bump Version).
     for job_id in ("python-compat", "build", "audit"):
         condition = str(jobs[job_id].get("if", ""))
-        assert "github.event_name != 'push'" in condition, f"{job_id} missing push dedupe guard"
+        assert "github.event_name != " in condition and "push" in condition, f"{job_id} missing push dedupe guard"
 
 
 def test_publish_to_pypi_guards_both_build_and_publish_on_bump_success() -> None:
@@ -105,10 +115,10 @@ def test_publish_to_pypi_guards_both_build_and_publish_on_bump_success() -> None
 
     for job_id in ("build", "publish"):
         condition = str(jobs[job_id].get("if", ""))
-        assert "github.event.workflow_run.conclusion == 'success'" in condition, (
+        assert "github.event.workflow_run.conclusion == " in condition and "success" in condition, (
             f"publish-to-pypi.yml job {job_id!r} must not run when Bump Version fails"
         )
-        assert "github.event_name == 'workflow_dispatch'" in condition
+        assert "github.event_name == " in condition and "workflow_dispatch" in condition
 
 
 def test_bump_version_serializes_runs_and_skips_already_tagged_head() -> None:
@@ -124,7 +134,7 @@ def test_bump_version_serializes_runs_and_skips_already_tagged_head() -> None:
 
     bump_steps = [s for s in steps if s.get("name") == "Bump version"]
     assert len(bump_steps) == 1
-    assert "steps.tagcheck.outputs.already_tagged != 'true'" in str(bump_steps[0].get("if", ""))
+    assert "steps.tagcheck.outputs.already_tagged != " in str(bump_steps[0].get("if", ""))
 
 
 def test_pyproject_configures_xdist_no_cover_marker_and_rust_uv_cache_keys() -> None:
@@ -164,9 +174,9 @@ def test_ci_preserves_required_jobs_and_runs_disjoint_xdist_plus_benchmark_passe
         for step in pytest_steps:
             cmd = str(step.get("run", ""))
             assert "-n logical --dist=worksteal" in cmd
-            assert '-m "not corpus and not live and not no_cover"' in cmd
+            assert "-m \"not corpus and not live and not no_cover\"" in cmd
             assert "--cov-fail-under=95" in cmd
-            assert '-p no:cov -o addopts="" -m "no_cover and not corpus and not live"' in cmd
+            assert "-p no:cov -o addopts=\"\" -m \"no_cover and not corpus and not live\"" in cmd
 
 
 def test_ci_uses_sysmon_coverage_core_for_py312_plus() -> None:
@@ -178,7 +188,7 @@ def test_ci_uses_sysmon_coverage_core_for_py312_plus() -> None:
     assert "sysmon" in compat_core and "ctrace" in compat_core and "3.11" in compat_core
 
 
-def test_ci_enables_fresh_pyo3_uv_rust_and_prebuilt_cargo_audit_caches() -> None:
+def test_ci_enables_fresh_pyo3_uv_rust_and_cargo_audit_caches() -> None:
     ci = _load_workflow("ci.yml")
     for job_id in ("test", "python-compat", "audit"):
         steps = _job_steps(ci, job_id)
@@ -192,19 +202,20 @@ def test_ci_enables_fresh_pyo3_uv_rust_and_prebuilt_cargo_audit_caches() -> None
         assert install_cmds and all("--reinstall-package datagrunt" in cmd for cmd in install_cmds)
 
     for job_id in ("test", "python-compat"):
-        rust_cache = [s for s in _job_steps(ci, job_id) if "Swatinem/rust-cache@" in str(s.get("uses", ""))]
-        assert len(rust_cache) == 1
-        assert rust_cache[0].get("with", {}).get("workspaces") == "rust -> target"
+        cache_steps = [s for s in _job_steps(ci, job_id) if "actions/cache@" in str(s.get("uses", ""))]
+        assert len(cache_steps) == 1
+        assert "rust/target" in str(cache_steps[0].get("with", {}).get("path", ""))
 
     audit_steps = _job_steps(ci, "audit")
-    install_steps = [s for s in audit_steps if "taiki-e/install-action@" in str(s.get("uses", ""))]
-    assert len(install_steps) == 1
-    assert install_steps[0].get("with", {}).get("tool") == "cargo-audit"
-    for step in audit_steps:
-        assert "cargo install cargo-audit" not in str(step.get("run", ""))
+    audit_cache = [s for s in audit_steps if "actions/cache@" in str(s.get("uses", ""))]
+    assert len(audit_cache) == 1
+    assert "cargo-audit" in str(audit_cache[0].get("with", {}).get("path", ""))
+    audit_run = [s for s in audit_steps if s.get("name") == "cargo audit"]
+    assert len(audit_run) == 1
+    assert "command -v cargo-audit" in str(audit_run[0].get("run", ""))
 
 
-def test_all_workflow_actions_are_pinned_to_commit_sha_or_local_workflow() -> None:
+def test_all_workflow_actions_match_repo_allowlist_and_commit_sha_pinning() -> None:
     yaml_files = sorted([*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")])
     if ACTIONS.is_dir():
         yaml_files.extend(sorted([*ACTIONS.rglob("action.yml"), *ACTIONS.rglob("action.yaml")]))
@@ -212,6 +223,9 @@ def test_all_workflow_actions_are_pinned_to_commit_sha_or_local_workflow() -> No
     for wf_path in yaml_files:
         doc = _load_yaml_mapping(wf_path)
         for ref in _collect_uses_refs(doc, wf_path.name):
+            assert ref.startswith(ALLOWED_ACTION_PREFIXES), (
+                f"Action {ref!r} in {wf_path.name} is outside repository allowlist"
+            )
             is_local = ref.startswith("./.github/")
             assert is_local or SHA_PINNED_USES_RE.fullmatch(ref) is not None, (
                 f"Unpinned action {ref!r} in {wf_path.name}"

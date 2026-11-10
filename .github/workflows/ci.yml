@@ -28,9 +28,16 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Cache Rust dependencies and build artifacts
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          workspaces: "rust -> target"
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            rust/target/
+          key: ${{ runner.os }}-cargo-py3.12-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-py3.12-
 
       - name: Install uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
@@ -48,8 +55,8 @@ jobs:
       - name: Create venv, build the extension (editable), install dev/pdf/rationalize extras
         # Explicit venv + editable install (uv handles maturin build isolation
         # automatically). --reinstall-package datagrunt forces maturin to link
-        # fresh Rust changes from rust/target (cached by rust-cache) instead of
-        # ever serving a stale editable wheel from uv's wheel cache.
+        # fresh Rust changes from rust/target (cached by actions/cache) instead
+        # of ever serving a stale editable wheel from uv's wheel cache.
         run: |
           uv venv --clear   # setup-uv already created .venv; --clear makes this idempotent
           uv pip install --reinstall-package datagrunt -e ".[dev,pdf,rationalize]"
@@ -124,10 +131,16 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Cache Rust dependencies and build artifacts
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          workspaces: "rust -> target"
-          key: py-${{ matrix.python-version }}
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            rust/target/
+          key: ${{ runner.os }}-cargo-py${{ matrix.python-version }}-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-py${{ matrix.python-version }}-
 
       - name: Install uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
@@ -182,20 +195,20 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
-      - name: Install cargo-audit (prebuilt binary)
-        id: install-cargo-audit
-        continue-on-error: true
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - name: Cache cargo-audit binary
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          tool: cargo-audit
+          path: ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-cargo-audit-v1
 
       - name: cargo audit
-        if: steps.install-cargo-audit.outcome == 'success'
         continue-on-error: true
         working-directory: rust
         env:
           CARGO_NET_RETRY: "10"
-        run: cargo audit
+        run: |
+          command -v cargo-audit >/dev/null || cargo install cargo-audit --locked
+          cargo audit
 
       - name: Install uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
