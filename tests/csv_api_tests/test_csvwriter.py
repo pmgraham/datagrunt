@@ -1,6 +1,7 @@
 """This module contains tests for the CSVWriter class."""
 
 import json
+import os
 from pathlib import Path
 
 import polars as pl
@@ -185,16 +186,22 @@ class TestCSVWriter:
     def test_file_overwrite(self, sample_csv, tmp_path):
         """Test overwriting existing output files."""
         out_file = str(tmp_path / "test_overwrite.csv")
+        Path(out_file).write_text("stale_col\nstale_val\n", encoding="utf-8")
         writer = CSVWriter(sample_csv)
 
-        # Write file twice to test overwrite behavior
+        # Write file twice to test overwrite behavior; step back 1s between
+        # writes so sub-millisecond cached exports do not tie on Linux coarse
+        # VFS mtime ticks (~4 ms).
         writer.write_csv(out_file)
+        backdated = Path(out_file).stat().st_mtime - 1.0
+        os.utime(out_file, (backdated, backdated))
         original_timestamp = Path(out_file).stat().st_mtime
 
         writer.write_csv(out_file)
         new_timestamp = Path(out_file).stat().st_mtime
 
         assert new_timestamp > original_timestamp
+        assert "stale_col" not in Path(out_file).read_text(encoding="utf-8")
 
     def test_duckdb_writer_imports_once_across_formats(self, sample_csv, tmp_path, monkeypatch):
         """Exporting one DuckDB CSVWriter to several formats imports the source once."""
