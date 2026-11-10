@@ -663,8 +663,10 @@ class TestNodes5And6CadTr3TablesAndMosaicSuppression:
             for idx_ch, ch in enumerate(text_val):
                 if ch.isspace():
                     continue
-                gx = x_pt + idx_ch * (size_pt * 0.55)
-                if ch == "-":
+                gx = x_pt + idx_ch * (size_pt * 0.60)
+                if ch == ".":
+                    c.rect(gx + 1.0, y_pt, 0.4, 0.4, stroke=1, fill=0)
+                elif ch == "-":
                     c.line(gx + 0.5, y_pt + size_pt * 0.35, gx + size_pt * 0.45, y_pt + size_pt * 0.35)
                 else:
                     c.rect(gx + 0.5, y_pt, size_pt * 0.45, size_pt * 0.75, stroke=1, fill=0)
@@ -674,7 +676,7 @@ class TestNodes5And6CadTr3TablesAndMosaicSuppression:
             t_obj.textOut(text_val)
             c.drawText(t_obj)
 
-        draw_shx_tr3("DRAWING 54-00655 PUMP ASSEMBLY", 60.0, 555.0, 14.0)
+        draw_shx_tr3("DRAWING 54-00655 PUMP ASSEMBLY 12.50", 60.0, 555.0, 14.0)
         for r_idx, row_cells in enumerate(rows_data):
             cy = row_ys[r_idx + 1] + 9.0
             for c_idx, cell_text in enumerate(row_cells):
@@ -698,7 +700,7 @@ class TestNodes5And6CadTr3TablesAndMosaicSuppression:
         doc_json = json.loads((bdir / "json" / "document.json").read_text(encoding="utf-8"))
 
         # 1. CAD Tr 3 text (with internal spaces intact!) is restored to document.md and NOT marked image_only
-        assert "DRAWING 54-00655 PUMP ASSEMBLY" in doc_md
+        assert "DRAWING 54-00655 PUMP ASSEMBLY 12.50" in doc_md
         assert "VLV 204" in doc_md
         assert "PMP 101" in doc_md
         assert doc_json["pages"][0]["image_only_reasons"] == []
@@ -728,7 +730,7 @@ class TestNodes5And6CadTr3TablesAndMosaicSuppression:
         tile_img = tmp_path / "tile64.png"
         Image.new("RGB", (64, 64), color=(210, 210, 210)).save(tile_img)
         strip_img = tmp_path / "strip.png"
-        Image.new("RGB", (1200, 80), color=(220, 220, 220)).save(strip_img)
+        Image.new("RGB", (2400, 96), color=(220, 220, 220)).save(strip_img)
         stamp_img = tmp_path / "real_stamp.png"
         Image.new("RGB", (90, 90), color=(20, 80, 180)).save(stamp_img)
         diag_img = tmp_path / "real_diagram.png"
@@ -746,9 +748,9 @@ class TestNodes5And6CadTr3TablesAndMosaicSuppression:
         c.drawImage(ImageReader(str(stamp_img)), 360.0, 500.0, width=72.0, height=72.0)
         c.showPage()
 
-        # Page 2: 6 edge-abutting horizontal scanline strips (480x24 pt, 1200x80 px) + 1 standalone 600x400 diagram
-        for s_idx in range(6):
-            c.drawImage(ImageReader(str(strip_img)), 40.0, 500.0 + s_idx * 24.0, width=480.0, height=24.0)
+        # Page 2: 16 edge-abutting horizontal scanline strips (500x20 pt, 2400x96 px) + 1 standalone 600x400 diagram
+        for s_idx in range(16):
+            c.drawImage(ImageReader(str(strip_img)), 40.0, 380.0 + s_idx * 20.0, width=500.0, height=20.0)
         c.drawImage(ImageReader(str(diag_img)), 80.0, 120.0, width=240.0, height=160.0)
         c.showPage()
 
@@ -775,3 +777,136 @@ class TestNodes5And6CadTr3TablesAndMosaicSuppression:
         # All 3 pages still have their full-page PNGs captured and saved!
         for pno in (1, 2, 3):
             assert (bdir / "page_images" / f"page_{pno:04d}.png").is_file()
+
+
+class TestAuditRound2PromptInjectionAndFigurePreservation:
+    """Adversarial regression tests for 3 Tr prompt-injection resistance, figure preservation, and O(T log T) bounds."""
+
+    def test_adversarial_tr3_prompt_injections_stay_invisible_and_glyph_boxes_validated(self, tmp_path: Path) -> None:
+        from datagrunt.pdf.corpus import extract_corpus
+        from datagrunt.pdf.quality import classify_spans
+
+        # Boundary validation on malformed glyph_boxes
+        with pytest.raises(ValueError):
+            classify_spans(
+                (), width_pt=612.0, height_pt=792.0, images=(), glyph_boxes=((float("nan"), 0.0, 10.0, 10.0),)
+            )
+
+        adv_pdf = tmp_path / "adversarial_tr3.pdf"
+        c = canvas.Canvas(str(adv_pdf), pagesize=(612, 792))
+        c.setFont("Helvetica", 12)
+        c.drawString(60, 720, "Legitimate visible specification text on page 1.")
+
+        # Attack 1: 2.0 pt thick horizontal underline rule under 3 Tr text
+        c.setLineWidth(2.0)
+        c.setStrokeColorRGB(0, 0, 0)
+        c.line(60, 600, 340, 600)
+        t1 = c.beginText(60, 600)
+        t1.setFont("Helvetica", 10)
+        t1.setTextRenderMode(3)
+        t1.textOut("INJECT_OVER_THICK_UNDERLINE")
+        c.drawText(t1)
+
+        # Attack 2: Underscore padding over hairline rule to hit 50% ratio
+        c.setLineWidth(0.5)
+        c.line(60, 520, 480, 520)
+        t2 = c.beginText(60, 520)
+        t2.setFont("Courier", 10)
+        t2.setTextRenderMode(3)
+        t2.textOut("____________________INJECT_PADDED_UNDERSCORES____________________")
+        c.drawText(t2)
+
+        # Attack 3: White-on-white filled glyph boxes & strokes on white page under 3 Tr text
+        c.setFillColorRGB(1.0, 1.0, 1.0)
+        c.setStrokeColorRGB(1.0, 1.0, 1.0)
+        for idx in range(25):
+            c.rect(60 + idx * 6.0, 440, 5.0, 8.0, stroke=1, fill=1)
+        t3 = c.beginText(60, 440)
+        t3.setFont("Courier", 10)
+        t3.setTextRenderMode(3)
+        t3.textOut("INJECT_WHITE_ON_WHITE_BOX")
+        c.drawText(t3)
+
+        c.showPage()
+        c.save()
+
+        out_dir = tmp_path / "adv_out"
+        manifest = extract_corpus(adv_pdf, out_dir, ocr="never")
+        bdir = out_dir / manifest.entries[0].bundle_relpath
+        doc_md = (bdir / "markdown" / "document.md").read_text(encoding="utf-8")
+
+        assert "Legitimate visible specification text on page 1." in doc_md
+        assert "INJECT_OVER_THICK_UNDERLINE" not in doc_md
+        assert "INJECT_PADDED_UNDERSCORES" not in doc_md
+        assert "INJECT_WHITE_ON_WHITE_BOX" not in doc_md
+
+    def test_overlapping_stamp_and_stacked_subplots_preserved_and_tile_sweep_is_ologn(self, tmp_path: Path) -> None:
+        import json
+        import time
+
+        from PIL import Image
+        from reportlab.lib.utils import ImageReader
+
+        from datagrunt.pdf import assembly
+        from datagrunt.pdf.corpus import extract_corpus
+        from datagrunt.pdf.pdfium_engine import RawImage
+
+        tile_img = tmp_path / "t64.png"
+        Image.new("RGB", (64, 64), color=(210, 210, 210)).save(tile_img)
+        stamp_img = tmp_path / "stamp90.png"
+        Image.new("RGB", (90, 90), color=(20, 80, 180)).save(stamp_img)
+        chart_img = tmp_path / "chart.png"
+        Image.new("RGB", (1200, 250), color=(40, 100, 160)).save(chart_img)
+
+        pdf_p = tmp_path / "overlap_and_subplots.pdf"
+        c = canvas.Canvas(str(pdf_p), pagesize=(612, 792))
+
+        # Page 1: 6x6 (36) abutting 16x16 pt tiles WITH a 30x30 pt (90x90 px) stamp drawn ON TOP at (60, 520)!
+        for r in range(6):
+            for col in range(6):
+                c.drawImage(ImageReader(str(tile_img)), 40.0 + col * 16.0, 500.0 + r * 16.0, width=16.0, height=16.0)
+        c.drawImage(ImageReader(str(stamp_img)), 60.0, 520.0, width=30.0, height=30.0)
+        c.showPage()
+
+        # Page 2: Digital page with 3 stacked 1200x250 px subplot charts separated by 2 pt whitespace
+        c.setFont("Helvetica", 11)
+        c.drawString(72, 720, "Performance curves across three operating regimes:")
+        for idx in range(3):
+            c.drawImage(ImageReader(str(chart_img)), 72.0, 100.0 + idx * 102.0, width=468.0, height=100.0)
+        c.showPage()
+        c.save()
+
+        out_dir = tmp_path / "pres_out"
+        manifest = extract_corpus(pdf_p, out_dir, ocr="never")
+        bdir = out_dir / manifest.entries[0].bundle_relpath
+        doc_json = json.loads((bdir / "json" / "document.json").read_text(encoding="utf-8"))
+
+        p1_figs = [el for el in doc_json["pages"][0]["elements"] if el["kind"] == "figure"]
+        p2_figs = [el for el in doc_json["pages"][1]["elements"] if el["kind"] == "figure"]
+        assert len(p1_figs) == 1 and (p1_figs[0]["width_px"], p1_figs[0]["height_px"]) == (90, 90)
+        assert len(p2_figs) == 3
+
+        # Verify O(T log T) scaling on 5,000 single-column stacked micro-tiles (< 0.5s)
+        sha = "a" * 64
+        col_tiles = [
+            (
+                i,
+                RawImage(
+                    object_index=i,
+                    bbox=(40.0, float(i) * 2.0, 60.0, float(i) * 2.0 + 2.0),
+                    px_width=64,
+                    px_height=64,
+                    declared_px=(64, 64),
+                    raw_sha256=sha,
+                    filters=("FlateDecode",),
+                    bits_per_pixel=24,
+                    colorspace="DeviceRGB",
+                ),
+            )
+            for i in range(5000)
+        ]
+        t0 = time.perf_counter()
+        suppressed = assembly._tile_grid_positions(col_tiles)
+        elapsed = time.perf_counter() - t0
+        assert len(suppressed) == 5000
+        assert elapsed < 1.0

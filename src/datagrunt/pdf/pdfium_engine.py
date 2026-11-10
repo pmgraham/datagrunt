@@ -1299,6 +1299,31 @@ def image_refusal(
         return None
 
 
+_MAX_GLYPH_PATH_PT = 36.0
+_MIN_VISIBLE_ALPHA = 13
+_WHITE_DIST_SQ = 16
+
+
+def _is_visible_glyph_path(obj: pdfium_c.FPDF_PAGEOBJECT, box: Box) -> bool:
+    """True when ``obj`` is a glyph-scale path painting visible non-white ink (SHX/outlined CAD glyphs)."""
+    bw, bh = box[2] - box[0], box[3] - box[1]
+    if (bw <= 0.0 and bh <= 0.0) or bw > _MAX_GLYPH_PATH_PT or bh > _MAX_GLYPH_PATH_PT:
+        return False
+    fill_mode, stroke = ctypes.c_int(), ctypes.c_int()
+    if not pdfium_c.FPDFPath_GetDrawMode(obj, fill_mode, stroke):
+        return False
+    r, g, b, a = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
+    if stroke.value and pdfium_c.FPDFPageObj_GetStrokeColor(obj, r, g, b, a):
+        dist_sq = (255 - r.value) ** 2 + (255 - g.value) ** 2 + (255 - b.value) ** 2
+        if a.value >= _MIN_VISIBLE_ALPHA and dist_sq >= _WHITE_DIST_SQ:
+            return True
+    if fill_mode.value != pdfium_c.FPDF_FILLMODE_NONE and pdfium_c.FPDFPageObj_GetFillColor(obj, r, g, b, a):
+        dist_sq = (255 - r.value) ** 2 + (255 - g.value) ** 2 + (255 - b.value) ** 2
+        if a.value >= _MIN_VISIBLE_ALPHA and dist_sq >= _WHITE_DIST_SQ:
+            return True
+    return False
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ObjectBoxes:
     """The displayed box of each of the page's non-text objects: what may paint under its text (#400).
@@ -1313,10 +1338,13 @@ class ObjectBoxes:
         unboxed: How many such objects have no box the walk can give
             (pdfium cannot read their bounds, or the box is not finite). The
             background check counts each as under every piece of text.
+        glyph_stroke_boxes: Subset of ``boxes`` from glyph-scale paths that
+            paint visible non-white ink (for AutoCAD SHX ``3 Tr`` detection).
     """
 
     boxes: tuple[Box, ...]
     unboxed: int
+    glyph_stroke_boxes: tuple[Box, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.boxes, tuple):
@@ -1324,6 +1352,12 @@ class ObjectBoxes:
         checked = tuple(ordered_box(f"boxes[{index}]", box) for index, box in enumerate(self.boxes))
         object.__setattr__(self, "boxes", checked)
         int_at_least("unboxed", self.unboxed, 0)
+        if not isinstance(self.glyph_stroke_boxes, tuple):
+            raise TypeError(f"glyph_stroke_boxes must be a tuple, got {type(self.glyph_stroke_boxes).__name__}")
+        checked_glyphs = tuple(
+            ordered_box(f"glyph_stroke_boxes[{index}]", box) for index, box in enumerate(self.glyph_stroke_boxes)
+        )
+        object.__setattr__(self, "glyph_stroke_boxes", checked_glyphs)
 
 
 def _collect_object_boxes(
@@ -1336,6 +1370,7 @@ def _collect_object_boxes(
     walked = _page_objects(page_raw, max_objects=MAX_PAGE_OBJECTS) if objects is None else objects
     form_matrices: dict[int, Matrix] = {}
     boxes: list[Box] = []
+    glyph_boxes: list[Box] = []
     unboxed = 0
     bounds_buf = (ctypes.c_float(), ctypes.c_float(), ctypes.c_float(), ctypes.c_float())
     for index, (obj, form) in enumerate(walked):  # bounded: the walk's objects
@@ -1352,7 +1387,9 @@ def _collect_object_boxes(
             unboxed += 1
         else:
             boxes.append(box)
-    return ObjectBoxes(boxes=tuple(boxes), unboxed=unboxed)
+            if kind == pdfium_c.FPDF_PAGEOBJ_PATH and _is_visible_glyph_path(obj, box):
+                glyph_boxes.append(box)
+    return ObjectBoxes(boxes=tuple(boxes), unboxed=unboxed, glyph_stroke_boxes=tuple(glyph_boxes))
 
 
 def _object_box(

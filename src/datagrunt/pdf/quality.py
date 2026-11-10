@@ -352,7 +352,7 @@ def classify_spans(
     width_pt: float,
     height_pt: float,
     images: tuple[RawImage, ...],
-    object_boxes: tuple[Box, ...] = (),
+    glyph_boxes: tuple[Box, ...] = (),
 ) -> tuple[SpanPiece, ...]:
     """Cut each span into maximal runs of chars that share their hidden reasons (see the module notes).
 
@@ -376,48 +376,25 @@ def classify_spans(
     """
     typed_tuple("spans", spans, RawSpan)
     typed_tuple("images", images, RawImage)
-    if not isinstance(object_boxes, tuple):
-        raise TypeError(f"object_boxes must be a tuple, got {type(object_boxes).__name__}")
+    if not isinstance(glyph_boxes, tuple):
+        raise TypeError(f"glyph_boxes must be a tuple, got {type(glyph_boxes).__name__}")
+    checked_glyphs = tuple(ordered_box(f"glyph_boxes[{idx}]", box) for idx, box in enumerate(glyph_boxes))
     width, height = positive_float("width_pt", width_pt), positive_float("height_pt", height_pt)
     boxes = _scan_boxes(images)
-    v_bands = _vector_glyph_bands(object_boxes, images, width, height)
+    v_bands = _banded(checked_glyphs, height) if checked_glyphs else ()
     return _classify(spans, width, height, boxes, _cover_fraction(boxes, width, height), v_bands)
 
 
-def _vector_glyph_bands(
-    object_boxes: tuple[Box, ...], images: tuple[RawImage, ...], width: float, height: float
-) -> tuple[tuple[Box, ...], ...]:
-    """Band non-image, non-frame vector object boxes across the page for SHX/outlined ``3 Tr`` glyph checks."""
-    if not object_boxes:
-        return ()
-    img_keys = {
-        (round(im.bbox[0], 1), round(im.bbox[1], 1), round(im.bbox[2], 1), round(im.bbox[3], 1)) for im in images
-    }
-    kept: list[Box] = []
-    for box in object_boxes:
-        bw, bh = box[2] - box[0], box[3] - box[1]
-        if (bw <= 0.0 and bh <= 0.0) or (bw > 0.6 * width and bh > 0.6 * height):
-            continue
-        if img_keys and (round(box[0], 1), round(box[1], 1), round(box[2], 1), round(box[3], 1)) in img_keys:
-            continue
-        kept.append(box)
-    return _banded(tuple(kept), height) if kept else ()
-
-
 def _char_has_glyph_stroke(
-    ch: str,
-    cbox: Box,
-    span_w: float,
-    span_h: float,
-    bands: tuple[tuple[Box, ...], ...],
-    height: float,
-    budget: list[int],
+    ch: str, cbox: Box, bands: tuple[tuple[Box, ...], ...], height: float, budget: list[int]
 ) -> bool:
-    """True when a glyph/word-scale vector stroke box overlaps ``cbox`` with glyph-like extent."""
+    """True when a visible non-white glyph-scale stroke box overlaps ``cbox`` with character-scale dimensions."""
     cx0, cy0, cx1, cy1 = cbox
     cw, ch_h = max(cx1 - cx0, 0.0), max(cy1 - cy0, 0.0)
-    max_vw, max_vh = max(4.0 * span_w, 48.0), max(4.0 * span_h, 48.0)
+    scale = max(cw, ch_h, 4.0)
+    max_side = min(max(2.5 * scale, 18.0), 36.0)
     horiz_glyph = ch in "-_.=—–~"
+    dot_glyph = ch in ".,:;'\"\u00b0\u00b7"
     for band in _bands_of(cy0 - _VECTOR_TOL_PT, cy1 + _VECTOR_TOL_PT, height):
         for vx0, vy0, vx1, vy1 in bands[band]:
             budget[0] -= 1
@@ -431,32 +408,49 @@ def _char_has_glyph_stroke(
             ):
                 continue
             vw, vh = vx1 - vx0, vy1 - vy0
-            if vw > max_vw or vh > max_vh:
+            if vw > max_side or vh > max_side:
                 continue
-            if vh >= min(0.25 * ch_h, 1.5) or (horiz_glyph and vw >= min(0.25 * cw, 1.5)):
+            if (
+                vh >= max(0.35 * ch_h, 1.0)
+                or (horiz_glyph and vw >= max(0.35 * cw, 1.0) and vh <= max(0.5 * ch_h, 3.0))
+                or (dot_glyph and vw <= max(cw * 2.0, 6.0) and vh <= max(ch_h * 2.0, 6.0))
+            ):
                 return True
     return False
 
 
-def _span_is_vector_backed(
+def _char_vector_flags(
     span: RawSpan, width: float, height: float, bands: tuple[tuple[Box, ...], ...], budget: list[int]
-) -> bool:
-    """True when ``span`` is ``3 Tr`` CAD/SHX text with >=50% of on-page non-whitespace chars backed by strokes."""
-    if span.render_mode != _INVISIBLE_TEXT_MODE or not bands:
-        return False
-    on_page_non_ws = [
-        (ch, box)
+) -> tuple[bool, ...]:
+    """Per-character vector-stroke backing flags; internal spaces stay visible only between backed neighbours."""
+    n = len(span.text)
+    if span.render_mode != _INVISIBLE_TEXT_MODE or not bands or n == 0:
+        return (False,) * n
+    backed = [
+        (not ch.isspace())
+        and (not off_page(box, width, height))
+        and _char_has_glyph_stroke(ch, box, bands, height, budget)
         for ch, box in zip(span.text, span.char_boxes, strict=True)
-        if not ch.isspace() and not off_page(box, width, height)
     ]
-    if not on_page_non_ws:
-        return False
-    sx0, sy0, sx1, sy1 = span.bbox
-    span_w, span_h = max(sx1 - sx0, 1.0), max(sy1 - sy0, 1.0)
-    backed = sum(
-        1 for ch, box in on_page_non_ws if _char_has_glyph_stroke(ch, box, span_w, span_h, bands, height, budget)
+    if not any(backed):
+        return tuple(backed)
+    left_ok = [False] * n
+    last = False
+    for idx, ch in enumerate(span.text):
+        if not ch.isspace():
+            last = backed[idx]
+        left_ok[idx] = last
+    right_ok = [False] * n
+    last = False
+    for idx in range(n - 1, -1, -1):
+        if not span.text[idx].isspace():
+            last = backed[idx]
+        right_ok[idx] = last
+    return tuple(
+        backed[i]
+        or (span.text[i].isspace() and not off_page(span.char_boxes[i], width, height) and left_ok[i] and right_ok[i])
+        for i in range(n)
     )
-    return backed * 2 >= len(on_page_non_ws)
 
 
 def _classify(
@@ -522,20 +516,17 @@ def _span_pieces(
     """Yield ``span``'s pieces: maximal runs of chars with equal hidden reasons."""
     no_paint = span.render_mode in _NO_PAINT_MODES
     under = _overlapping(span.bbox, raster) if no_paint else ()
-    vec_backed = (
-        _span_is_vector_backed(
-            span, width, height, v_bands, budget if budget is not None else [_MAX_VECTOR_TEXT_CHECKS]
-        )
-        if no_paint and not under and v_bands
-        else False
+    vec_flags = (
+        _char_vector_flags(span, width, height, v_bands, budget if budget is not None else [_MAX_VECTOR_TEXT_CHECKS])
+        if no_paint and v_bands
+        else (False,) * len(span.char_boxes)
     )
     flagged = dict.fromkeys(em_reasons(span.em_width_pt, abs(span.font_size_pt)), True)
     flagged["transparent"] = _transparent(span)
     reasons: list[tuple[HiddenReason, ...]] = []
-    for box in span.char_boxes:
-        is_off = off_page(box, width, height)
-        flagged["off_page"] = is_off
-        flagged["invisible"] = no_paint and not _over_raster(box, under) and not (vec_backed and not is_off)
+    for box, v_ok in zip(span.char_boxes, vec_flags, strict=True):
+        flagged["off_page"] = off_page(box, width, height)
+        flagged["invisible"] = no_paint and not _over_raster(box, under) and not v_ok
         reasons.append(tuple(reason for reason in HIDDEN_REASONS if flagged.get(reason, False)))
     start = 0
     for end in range(1, len(reasons) + 1):
@@ -930,7 +921,7 @@ def assess_page(
         pieces: tuple[SpanPiece, ...] = _initial.pieces
         own: tuple[SpanPiece, ...] = ()
     else:
-        v_bands = _vector_glyph_bands(page.object_boxes.boxes, page.images.images, width, height)
+        v_bands = _banded(page.object_boxes.glyph_stroke_boxes, height) if page.object_boxes.glyph_stroke_boxes else ()
         pieces = _classify(page.text.spans, width, height, boxes, cover, v_bands)
         own = _recovered_own(recovered, width, height, boxes, cover, v_bands)
     if isinstance(background, Backdrop):
