@@ -12,13 +12,14 @@ watchdog) ends it with :data:`~datagrunt.pdf._memory_cap.CAP_EXIT`.
 import ctypes
 import mmap
 import os
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import IO, NamedTuple
 
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 
+from datagrunt.pdf import pdfium_engine as _eng
 from datagrunt.pdf._memory_cap import CAP_EXIT, apply_memory_cap
 from datagrunt.pdf._options import MEMORY_CAP_BYTES
 from datagrunt.pdf._pdfium_images import read_filters
@@ -28,9 +29,10 @@ from datagrunt.pdf.pdfium_engine import (
     _PDFIUM_LOCK,
     DocumentHandle,
     PageGeometry,
+    PdfiumFailure,
+    WalkBoundHit,
     _checked_password,
     _checked_path,
-    _page_objects,
     image_refusal,
     loaded_page,
     open_document,
@@ -98,18 +100,27 @@ def _guarded_page(
 
 
 @contextmanager
-def _guarded(handle: DocumentHandle, page_index: int) -> Iterator[tuple[pdfium.PdfPage, PageGeometry]]:
-    """The page at ``page_index`` of the open document, loaded, once the image guard passes it; closed on leaving.
-
-    Raises:
-        RenderRefused: If the guard refuses the page; nothing is yielded.
-        IndexError, PDFCorruptError: As
-            :func:`~datagrunt.pdf.pdfium_engine.loaded_page` raises them.
-    """
+def _guarded_with_objects(
+    handle: DocumentHandle, page_index: int
+) -> Iterator[tuple[pdfium.PdfPage, PageGeometry, list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]]]:
+    """Load ``page_index``, walk its objects once for the guard, and yield ``(page, geometry, objects)``."""
     with loaded_page(handle, page_index) as (page, geometry):
-        refusal = image_refusal(page, geometry, max_objects=_MAX_GUARD_OBJECTS)
+        try:
+            objects = _eng._page_objects(page.raw, max_objects=_MAX_GUARD_OBJECTS)
+        except WalkBoundHit as exc:
+            raise RenderRefused(f"page {geometry.page_number}: {exc}; the page is not rendered") from exc
+        except PdfiumFailure as exc:
+            raise RenderRefused(f"page {geometry.page_number}: pdfium cannot {exc}; the page is not rendered") from exc
+        refusal = image_refusal(page, geometry, max_objects=_MAX_GUARD_OBJECTS, objects=objects)
         if refusal is not None:
             raise RenderRefused(f"page {geometry.page_number}: {refusal}; the page is not rendered")
+        yield page, geometry, objects
+
+
+@contextmanager
+def _guarded(handle: DocumentHandle, page_index: int) -> Iterator[tuple[pdfium.PdfPage, PageGeometry]]:
+    """The page at ``page_index`` of the open document, loaded, once the image guard passes it; closed on leaving."""
+    with _guarded_with_objects(handle, page_index) as (page, geometry, _objects):
         yield page, geometry
 
 
@@ -122,19 +133,28 @@ class _Bitmap(NamedTuple):
     channels: int = 1
 
 
+def _image_items_of(
+    objects: Sequence[tuple[pdfium_c.FPDF_PAGEOBJECT, int]],
+) -> list[tuple[int, pdfium_c.FPDF_PAGEOBJECT]]:
+    """Extract ``(walk_index, image_obj)`` before any text removal so destroyed text pointers are never touched."""
+    return [
+        (index, item)
+        for index, (item, _form) in enumerate(objects)
+        if pdfium_c.FPDFPageObj_GetType(item) == pdfium_c.FPDF_PAGEOBJ_IMAGE
+    ]
+
+
 def _render_guarded(source: str | os.PathLike[str], page_index: int, dpi: int, password: str | None) -> _Bitmap:
-    """Guard the page, then draw it at ``dpi`` from the same load, in this process.
-
-    The worker calls this under its memory cap; never call it outside one.
-
-    Raises:
-        RenderRefused: If the guard refuses the page, or it draws under one
-            pixel across at ``dpi``; nothing is drawn.
-        RenderFailed: If pdfium cannot make or fill the bitmap.
-        MemoryError: If the bitmap cannot be mapped (a memory cap).
-    """
-    with _guarded_page(source, page_index, password) as (page, geometry):
-        return _draw(page, geometry, dpi)
+    """Guard the page, then draw it at ``dpi`` from the same load and single object walk, in this process."""
+    with (
+        open_document(source, password=password) as handle,
+        _guarded_with_objects(handle, page_index) as (
+            page,
+            geometry,
+            objects,
+        ),
+    ):
+        return _draw(page, geometry, dpi, image_items=_image_items_of(objects))
 
 
 def _draw(
@@ -144,6 +164,7 @@ def _draw(
     *,
     colour: bool = False,
     annotations: bool = False,
+    image_items: Sequence[tuple[int, pdfium_c.FPDF_PAGEOBJECT]] | None = None,
 ) -> _Bitmap:
     """Draw the loaded page at ``dpi`` on white, in 8-bit gray (24-bit BGR if ``colour``)."""
     drawn = _BGR if colour else _GRAY
@@ -161,7 +182,7 @@ def _draw(
     try:
         if not pdfium_c.FPDFBitmap_FillRect(bitmap, 0, 0, width, height, _WHITE):
             raise RenderFailed(f"page {geometry.page_number}: pdfium cannot fill a {width} x {height} bitmap")
-        _decode_jbig2_first(page, geometry.page_number)
+        _decode_jbig2_first(page, geometry.page_number, image_items=image_items)
         # Rotation 0 draws the page as displayed (its /Rotate applied), filling the bitmap.
         pdfium_c.FPDF_RenderPageBitmap(bitmap, page.raw, 0, 0, width, height, 0, flags)
     finally:
@@ -170,21 +191,20 @@ def _draw(
     return _Bitmap(width, height, pixels, drawn.channels)
 
 
-def _decode_jbig2_first(page: pdfium.PdfPage, page_number: int) -> int:
-    """Decode each JBIG2 image the guard's walk reaches on its own, then free it; how many.
-
-    Walks :func:`~datagrunt.pdf.pdfium_engine._page_objects` within
-    :data:`_MAX_GUARD_OBJECTS` (forms included), as the guard did. The
-    worker calls this under its memory cap, with the page's bitmap mapped.
-
-    Raises:
-        RenderFailed: If pdfium cannot decode one (named by its walk index).
-        PdfiumFailure: If an image's filters cannot be read.
-    """
+def _decode_jbig2_first(
+    page: pdfium.PdfPage,
+    page_number: int,
+    *,
+    image_items: Sequence[tuple[int, pdfium_c.FPDF_PAGEOBJECT]] | None = None,
+) -> int:
+    """Decode each JBIG2 image the guard's walk reaches on its own, then free it; how many."""
+    candidates = (
+        _image_items_of(_eng._page_objects(page.raw, max_objects=_MAX_GUARD_OBJECTS))
+        if image_items is None
+        else image_items
+    )
     decoded = 0
-    for index, (item, _form) in enumerate(_page_objects(page.raw, max_objects=_MAX_GUARD_OBJECTS)):
-        if pdfium_c.FPDFPageObj_GetType(item) != pdfium_c.FPDF_PAGEOBJ_IMAGE:
-            continue
+    for index, item in candidates:
         if "JBIG2Decode" not in read_filters(item, f"object {index}"):
             continue
         bitmap = pdfium_c.FPDFImageObj_GetBitmap(item)
@@ -199,32 +219,22 @@ def _decode_jbig2_first(page: pdfium.PdfPage, page_number: int) -> int:
 
 
 def _render_loaded(handle: DocumentHandle, page_index: int, dpi: int, *, colour: bool, without_text: bool) -> _Bitmap:
-    """Guard the page of the open document, remove its text if asked, then draw it from the same load.
-
-    The batch worker calls this under its memory cap; never call it outside one.
-
-    Raises:
-        RenderRefused: If the guard refuses the page, or it draws under one pixel across at ``dpi``.
-        RenderFailed: If pdfium cannot remove a text object, or make or fill the bitmap.
-        MemoryError: If the bitmap cannot be mapped (a memory cap).
-    """
-    with _guarded(handle, page_index) as (page, geometry):
+    """Guard the page of the open document, remove its text if asked, then draw it from the same single walk."""
+    with _guarded_with_objects(handle, page_index) as (page, geometry, objects):
+        images = _image_items_of(objects)
         if without_text:
-            _remove_text(page, geometry.page_number)
-        return _draw(page, geometry, dpi, colour=colour)
+            _remove_text(page, geometry.page_number, objects=objects)
+        return _draw(page, geometry, dpi, colour=colour, image_items=images)
 
 
-def _remove_text(page: pdfium.PdfPage, page_number: int) -> int:
-    """Remove every text object from the loaded page, forms' included; how many. In this load only: nothing is saved.
-
-    Walks the guard's walk (:func:`~datagrunt.pdf.pdfium_engine._page_objects`
-    within :data:`_MAX_GUARD_OBJECTS`), so it is bounded by the page the guard
-    passed. Each removed object is destroyed (pdfium hands it to the caller).
-
-    Raises:
-        RenderFailed: If pdfium cannot remove a text object (named by its walk index).
-    """
-    objects = _page_objects(page.raw, max_objects=_MAX_GUARD_OBJECTS)
+def _remove_text(
+    page: pdfium.PdfPage,
+    page_number: int,
+    objects: Sequence[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
+) -> int:
+    """Remove every text object from the loaded page, forms' included; how many. In this load only: nothing is saved."""
+    walked = _eng._page_objects(page.raw, max_objects=_MAX_GUARD_OBJECTS) if objects is None else objects
+    objects = walked
     removed = 0
     for index, (item, form) in enumerate(objects):  # bounded: the walk's objects
         if pdfium_c.FPDFPageObj_GetType(item) != pdfium_c.FPDF_PAGEOBJ_TEXT:
@@ -392,9 +402,15 @@ def draw_page_in_process(
     where = f"{checked_source}: page {page_index + 1}"
     channels = BGR_CHANNELS if colour else GRAY_CHANNELS
     try:
-        with _PDFIUM_LOCK, _guarded_page(checked_source, page_index, checked_password) as (page, geometry):
+        with (
+            _PDFIUM_LOCK,
+            open_document(checked_source, password=checked_password) as handle,
+            _guarded_with_objects(handle, page_index) as (page, geometry, objects),
+        ):
             _check_pixel_cap(geometry, dpi, channels, memory_cap_bytes)
-            bitmap = _draw(page, geometry, dpi, colour=colour, annotations=annotations)
+            bitmap = _draw(
+                page, geometry, dpi, colour=colour, annotations=annotations, image_items=_image_items_of(objects)
+            )
     except RenderRefused as exc:
         raise RenderRefused(f"{checked_source}: {exc}") from exc
     except Exception as exc:
@@ -428,11 +444,12 @@ def draw_loaded_in_process(
     where = f"{checked_source}: page {page_index + 1}"
     channels = BGR_CHANNELS if colour else GRAY_CHANNELS
     try:
-        with _PDFIUM_LOCK, _guarded(handle, page_index) as (page, geometry):
+        with _PDFIUM_LOCK, _guarded_with_objects(handle, page_index) as (page, geometry, objects):
             _check_pixel_cap(geometry, dpi, channels, memory_cap_bytes)
+            images = _image_items_of(objects)
             if without_text:
-                _remove_text(page, geometry.page_number)
-            bitmap = _draw(page, geometry, dpi, colour=colour, annotations=annotations)
+                _remove_text(page, geometry.page_number, objects=objects)
+            bitmap = _draw(page, geometry, dpi, colour=colour, annotations=annotations, image_items=images)
     except RenderRefused as exc:
         raise RenderRefused(f"{checked_source}: {exc}") from exc
     except Exception as exc:

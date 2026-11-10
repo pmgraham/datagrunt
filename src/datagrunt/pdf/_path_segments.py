@@ -220,23 +220,46 @@ def path_segments(
         within :data:`AXIS_TOLERANCE_PT` in user space, each in path order:
         PDF paints a path's fill before its stroke.
     """
-    if not all(math.isfinite(value) for value in matrix):
+    a, b, c, d, e, f = matrix
+    isfinite = math.isfinite
+    if not (isfinite(a) and isfinite(b) and isfinite(c) and isfinite(d) and isfinite(e) and isfinite(f)):
         raise NonFiniteGeometry(f"its matrix to page space is not finite {tuple(matrix)}")
-    if not math.isfinite(paint.stroke_width):
+    if not isfinite(paint.stroke_width):
         raise NonFiniteGeometry(f"its stroke width is not finite ({paint.stroke_width})")
     closed = _explicit_closes(points)
-    placed = [_placed(point, matrix) for point in closed]
+    placed = _placed_all(closed, a, b, c, d, e, f)
     segments = []
     if paint.filled:
         segments.extend(_fill_segments(placed, object_index, paint, to_display))
     if not paint.stroked:
         return segments
-    for local, page in zip(_straight_edges(closed), _straight_edges(placed)):
-        line = _axis_line(*page)
+    for idx in range(1, len(placed)):
+        p1 = placed[idx]
+        if p1[0] != "line":
+            continue
+        p0 = placed[idx - 1]
+        page_edge = ((p0[1], p0[2]), (p1[1], p1[2]))
+        line = _axis_line(*page_edge)
         if line is not None:
-            width = _stroke_thickness(paint.stroke_width, matrix, local, page)
+            l0, l1 = closed[idx - 1], closed[idx]
+            local_edge = ((l0[1], l0[2]), (l1[1], l1[2]))
+            width = _stroke_thickness(paint.stroke_width, matrix, local_edge, page_edge)
             segments.append(_segment(line, width, "stroke", object_index, paint, to_display))
     return segments
+
+
+def _placed_all(points: list[PathPoint], a: float, b: float, c: float, d: float, e: float, f: float) -> list[PathPoint]:
+    """Map all ``points`` by ``[a b c d e f]`` without ``NamedTuple._replace`` overhead."""
+    isfinite = math.isfinite
+    make_pt = PathPoint
+    placed: list[PathPoint] = []
+    for kind, px, py, closes in points:
+        x = a * px + c * py + e
+        y = b * px + d * py + f
+        if not (isfinite(x) and isfinite(y)):
+            raise NonFiniteGeometry(f"its page-space point {(x, y)} is not finite")
+        placed.append(make_pt(kind, x, y, closes))
+    return placed
 
 
 def _placed(point: PathPoint, matrix: Matrix) -> PathPoint:
@@ -244,7 +267,7 @@ def _placed(point: PathPoint, matrix: Matrix) -> PathPoint:
     x, y = matrix.apply(point.x, point.y)
     if not (math.isfinite(x) and math.isfinite(y)):
         raise NonFiniteGeometry(f"its page-space point {(x, y)} is not finite")
-    return point._replace(x=x, y=y)
+    return PathPoint(point.kind, x, y, point.closes)
 
 
 def _explicit_closes(points: Sequence[PathPoint]) -> list[PathPoint]:
@@ -253,14 +276,15 @@ def _explicit_closes(points: Sequence[PathPoint]) -> list[PathPoint]:
     pdfium's parser already writes that line (the closing point is the start);
     a close flagged away from the start (pdfium's edit API) gets it here.
     """
-    closed = []
+    make_pt = PathPoint
+    closed: list[PathPoint] = []
     first: PathPoint | None = None
     for point in points:
-        if point.kind == "move" or first is None:
+        if point[0] == "move" or first is None:
             first = point
-        if point.closes and (point.x, point.y) != (first.x, first.y):
-            closed.append(point._replace(closes=False))
-            closed.append(PathPoint("line", first.x, first.y, closes=True))
+        if point[3] and (point[1], point[2]) != (first[1], first[2]):
+            closed.append(make_pt(point[0], point[1], point[2], False))
+            closed.append(make_pt("line", first[1], first[2], True))
         else:
             closed.append(point)
     return closed

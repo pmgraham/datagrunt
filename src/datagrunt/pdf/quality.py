@@ -341,8 +341,18 @@ class SpanPiece:
         return union_box(self.span.char_boxes[self.start : self.end])
 
 
+_INVISIBLE_TEXT_MODE = 3
+_VECTOR_TOL_PT = 0.5
+_MAX_VECTOR_TEXT_CHECKS = 500_000
+
+
 def classify_spans(
-    spans: tuple[RawSpan, ...], *, width_pt: float, height_pt: float, images: tuple[RawImage, ...]
+    spans: tuple[RawSpan, ...],
+    *,
+    width_pt: float,
+    height_pt: float,
+    images: tuple[RawImage, ...],
+    glyph_boxes: tuple[Box, ...] = (),
 ) -> tuple[SpanPiece, ...]:
     """Cut each span into maximal runs of chars that share their hidden reasons (see the module notes).
 
@@ -366,17 +376,95 @@ def classify_spans(
     """
     typed_tuple("spans", spans, RawSpan)
     typed_tuple("images", images, RawImage)
+    if not isinstance(glyph_boxes, tuple):
+        raise TypeError(f"glyph_boxes must be a tuple, got {type(glyph_boxes).__name__}")
+    checked_glyphs = tuple(ordered_box(f"glyph_boxes[{idx}]", box) for idx, box in enumerate(glyph_boxes))
     width, height = positive_float("width_pt", width_pt), positive_float("height_pt", height_pt)
     boxes = _scan_boxes(images)
-    return _classify(spans, width, height, boxes, _cover_fraction(boxes, width, height))
+    v_bands = _banded(checked_glyphs, height) if checked_glyphs else ()
+    return _classify(spans, width, height, boxes, _cover_fraction(boxes, width, height), v_bands)
+
+
+def _char_has_glyph_stroke(
+    ch: str, cbox: Box, bands: tuple[tuple[Box, ...], ...], height: float, budget: list[int]
+) -> bool:
+    """True when a visible non-white glyph-scale stroke box overlaps ``cbox`` with character-scale dimensions."""
+    cx0, cy0, cx1, cy1 = cbox
+    cw, ch_h = max(cx1 - cx0, 0.0), max(cy1 - cy0, 0.0)
+    scale = max(cw, ch_h, 4.0)
+    max_side = min(max(2.5 * scale, 18.0), 36.0)
+    horiz_glyph = ch in "-_.=—–~"
+    dot_glyph = ch in ".,:;'\"\u00b0\u00b7"
+    for band in _bands_of(cy0 - _VECTOR_TOL_PT, cy1 + _VECTOR_TOL_PT, height):
+        for vx0, vy0, vx1, vy1 in bands[band]:
+            budget[0] -= 1
+            if budget[0] < 0:
+                return False
+            if not (
+                vx0 <= cx1 + _VECTOR_TOL_PT
+                and cx0 - _VECTOR_TOL_PT <= vx1
+                and vy0 <= cy1 + _VECTOR_TOL_PT
+                and cy0 - _VECTOR_TOL_PT <= vy1
+            ):
+                continue
+            vw, vh = vx1 - vx0, vy1 - vy0
+            if vw > max_side or vh > max_side:
+                continue
+            if (
+                vh >= max(0.35 * ch_h, 1.0)
+                or (horiz_glyph and vw >= max(0.35 * cw, 1.0) and vh <= max(0.5 * ch_h, 3.0))
+                or (dot_glyph and vw <= max(cw * 2.0, 6.0) and vh <= max(ch_h * 2.0, 6.0))
+            ):
+                return True
+    return False
+
+
+def _char_vector_flags(
+    span: RawSpan, width: float, height: float, bands: tuple[tuple[Box, ...], ...], budget: list[int]
+) -> tuple[bool, ...]:
+    """Per-character vector-stroke backing flags; internal spaces stay visible only between backed neighbours."""
+    n = len(span.text)
+    if span.render_mode != _INVISIBLE_TEXT_MODE or not bands or n == 0:
+        return (False,) * n
+    backed = [
+        (not ch.isspace())
+        and (not off_page(box, width, height))
+        and _char_has_glyph_stroke(ch, box, bands, height, budget)
+        for ch, box in zip(span.text, span.char_boxes, strict=True)
+    ]
+    if not any(backed):
+        return tuple(backed)
+    left_ok = [False] * n
+    last = False
+    for idx, ch in enumerate(span.text):
+        if not ch.isspace():
+            last = backed[idx]
+        left_ok[idx] = last
+    right_ok = [False] * n
+    last = False
+    for idx in range(n - 1, -1, -1):
+        if not span.text[idx].isspace():
+            last = backed[idx]
+        right_ok[idx] = last
+    return tuple(
+        backed[i]
+        or (span.text[i].isspace() and not off_page(span.char_boxes[i], width, height) and left_ok[i] and right_ok[i])
+        for i in range(n)
+    )
 
 
 def _classify(
-    spans: tuple[RawSpan, ...], width: float, height: float, boxes: tuple[Box, ...], cover: float
+    spans: tuple[RawSpan, ...],
+    width: float,
+    height: float,
+    boxes: tuple[Box, ...],
+    cover: float,
+    v_bands: tuple[tuple[Box, ...], ...] = (),
 ) -> tuple[SpanPiece, ...]:
-    """:func:`classify_spans` of checked input, given the raster ``cover`` of the image ``boxes``."""
+    """:func:`classify_spans` of checked input, given raster ``cover`` and banded vector glyph boxes."""
     raster = boxes if cover > _OCR_LAYER_COVER else ()
-    return tuple(piece for span in spans for piece in _span_pieces(span, width, height, raster))
+    budget = [_MAX_VECTOR_TEXT_CHECKS]
+    return tuple(piece for span in spans for piece in _span_pieces(span, width, height, raster, v_bands, budget))
 
 
 def _scan_boxes(images: tuple[RawImage, ...]) -> tuple[Box, ...]:
@@ -417,16 +505,28 @@ def _over_raster(box: Box, raster: tuple[Box, ...]) -> bool:
     return any(image[0] <= x <= image[2] and image[1] <= y <= image[3] for image in raster)
 
 
-def _span_pieces(span: RawSpan, width: float, height: float, raster: tuple[Box, ...]) -> Iterator[SpanPiece]:
+def _span_pieces(
+    span: RawSpan,
+    width: float,
+    height: float,
+    raster: tuple[Box, ...],
+    v_bands: tuple[tuple[Box, ...], ...] = (),
+    budget: list[int] | None = None,
+) -> Iterator[SpanPiece]:
     """Yield ``span``'s pieces: maximal runs of chars with equal hidden reasons."""
     no_paint = span.render_mode in _NO_PAINT_MODES
     under = _overlapping(span.bbox, raster) if no_paint else ()
+    vec_flags = (
+        _char_vector_flags(span, width, height, v_bands, budget if budget is not None else [_MAX_VECTOR_TEXT_CHECKS])
+        if no_paint and v_bands
+        else (False,) * len(span.char_boxes)
+    )
     flagged = dict.fromkeys(em_reasons(span.em_width_pt, abs(span.font_size_pt)), True)
     flagged["transparent"] = _transparent(span)
     reasons: list[tuple[HiddenReason, ...]] = []
-    for box in span.char_boxes:
+    for box, v_ok in zip(span.char_boxes, vec_flags, strict=True):
         flagged["off_page"] = off_page(box, width, height)
-        flagged["invisible"] = no_paint and not _over_raster(box, under)
+        flagged["invisible"] = no_paint and not _over_raster(box, under) and not v_ok
         reasons.append(tuple(reason for reason in HIDDEN_REASONS if flagged.get(reason, False)))
     start = 0
     for end in range(1, len(reasons) + 1):
@@ -821,8 +921,9 @@ def assess_page(
         pieces: tuple[SpanPiece, ...] = _initial.pieces
         own: tuple[SpanPiece, ...] = ()
     else:
-        pieces = _classify(page.text.spans, width, height, boxes, cover)
-        own = _recovered_own(recovered, width, height, boxes, cover)
+        v_bands = _banded(page.object_boxes.glyph_stroke_boxes, height) if page.object_boxes.glyph_stroke_boxes else ()
+        pieces = _classify(page.text.spans, width, height, boxes, cover, v_bands)
+        own = _recovered_own(recovered, width, height, boxes, cover, v_bands)
     if isinstance(background, Backdrop):
         scale = _scale(background, width, height)
         pieces = _flag_background(pieces, background, scale, selected=_gate_selection(pieces, page))
@@ -953,7 +1054,12 @@ def _check_recovered(recovered: object, page_number: int, dropped: int) -> None:
 
 
 def _recovered_own(
-    recovered: RecoveredText | None, width: float, height: float, boxes: tuple[Box, ...], cover: float
+    recovered: RecoveredText | None,
+    width: float,
+    height: float,
+    boxes: tuple[Box, ...],
+    cover: float,
+    v_bands: tuple[tuple[Box, ...], ...] = (),
 ) -> tuple[SpanPiece, ...]:
     """The recovered spans' pieces, in recovery order, each with its recovered reasons and the computed ones.
 
@@ -963,7 +1069,7 @@ def _recovered_own(
         return ()
     found: list[SpanPiece] = []
     for item in recovered.spans:
-        for piece in _classify((item.span,), width, height, boxes, cover):
+        for piece in _classify((item.span,), width, height, boxes, cover, v_bands):
             given = set(piece.hidden_reasons) | set(item.hidden_reasons)
             reasons = tuple(reason for reason in HIDDEN_REASONS if reason in given)
             found.append(SpanPiece(span=piece.span, start=piece.start, end=piece.end, hidden_reasons=reasons))

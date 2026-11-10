@@ -829,6 +829,60 @@ def decoded_png(image: pdfium_c.FPDF_PAGEOBJECT, facts: PixelFacts, label: str) 
         pdfium_c.FPDFBitmap_Destroy(bitmap)
 
 
+_DETACHED_ENCODE_MAX_BYTES = 16 << 20
+
+
+def decoded_png_detached(image: pdfium_c.FPDF_PAGEOBJECT, facts: PixelFacts, label: str) -> Callable[[], bytes]:
+    """Decode ``image`` under PDFium lock; return a lock-free callable that finishes PNG compression."""
+    if facts.refusal is not None:
+        raise DecodeRefused(facts.refusal[1])
+    if not facts.in_process:
+        raise DecodeRefused(
+            f"{label} is a JBIG2 image: it is decoded only when its page is rendered, in the render worker"
+        )
+    if facts.stream_refusal is not None:
+        raise DecodeRefused(facts.stream_refusal)
+    bitmap = pdfium_c.FPDFImageObj_GetBitmap(image)
+    if not bitmap:
+        raise PdfiumFailure(f"decode {label}")
+    try:
+        width, height, stride, mode, raw_mode, buffer = _checked_bitmap(bitmap, label)
+        byte_len = stride * height
+        if byte_len <= _DETACHED_ENCODE_MAX_BYTES:
+            copied = ctypes.string_at(buffer, byte_len)
+            return partial(_encode_raw_png, mode, width, height, copied, raw_mode, stride)
+        encoded = _bitmap_png(bitmap, label)
+        return lambda: encoded
+    finally:
+        pdfium_c.FPDFBitmap_Destroy(bitmap)
+
+
+def _checked_bitmap(bitmap: pdfium_c.FPDF_BITMAP, label: str) -> tuple[int, int, int, str, str, int]:
+    width, height = pdfium_c.FPDFBitmap_GetWidth(bitmap), pdfium_c.FPDFBitmap_GetHeight(bitmap)
+    stride, bitmap_format = pdfium_c.FPDFBitmap_GetStride(bitmap), pdfium_c.FPDFBitmap_GetFormat(bitmap)
+    if bitmap_format not in _BITMAP_FORMATS:
+        raise PdfiumFailure(f"decode {label}: unknown bitmap format {bitmap_format}")
+    mode, raw_mode, pixel_bytes = _BITMAP_FORMATS[bitmap_format]
+    if width < 1 or height < 1:
+        raise PdfiumFailure(f"decode {label}: a {width} x {height} bitmap of stride {stride}")
+    if width * height > _MAX_DECODED_PIXELS:
+        raise TooManyPixels(_too_many_pixels(width, height, label))
+    if stride < width * pixel_bytes:
+        raise PdfiumFailure(f"decode {label}: a {width} x {height} bitmap of stride {stride}")
+    buffer = pdfium_c.FPDFBitmap_GetBuffer(bitmap)
+    if not buffer:
+        raise PdfiumFailure(f"read the decoded pixels of {label}")
+    return width, height, stride, mode, raw_mode, buffer
+
+
+def _encode_raw_png(mode: str, width: int, height: int, data: bytes, raw_mode: str, stride: int) -> bytes:
+    out = io.BytesIO()
+    Image.frombuffer(mode, (width, height), data, "raw", raw_mode, stride, 1).save(
+        out, format="PNG", compress_level=_PNG_COMPRESS_LEVEL, optimize=False
+    )
+    return out.getvalue()
+
+
 def _bitmap_png(bitmap: pdfium_c.FPDF_BITMAP, label: str) -> bytes:
     """A pdfium bitmap's pixels as PNG bytes; the bitmap must outlive this call (Pillow reads it in place)."""
     width, height = pdfium_c.FPDFBitmap_GetWidth(bitmap), pdfium_c.FPDFBitmap_GetHeight(bitmap)

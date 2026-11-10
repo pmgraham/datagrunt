@@ -216,6 +216,7 @@ from datagrunt.pdf._pdfium_images import (
     collect_images,
     declared_size,
     decoded_png,
+    decoded_png_detached,
     image_outcomes,
     pixel_facts,
     read_filters,
@@ -920,14 +921,25 @@ def _read_points(path: pdfium_c.FPDF_PAGEOBJECT, label: str, room: _SegmentRoom)
     if count < 0:
         raise PdfiumFailure(f"count the path segments of {label}")
     room.take(count, label)
-    points = []
+    return _read_counted_points(path, count, label)
+
+
+def _read_counted_points(path: pdfium_c.FPDF_PAGEOBJECT, count: int, label: str) -> list[PathPoint]:
+    """Read ``count`` already-charged path segments from ``path``."""
+    points: list[PathPoint] = []
     x, y = ctypes.c_float(), ctypes.c_float()
+    make_pt = PathPoint
+    get_seg = pdfium_c.FPDFPath_GetPathSegment
+    get_type = pdfium_c.FPDFPathSegment_GetType
+    get_pt = pdfium_c.FPDFPathSegment_GetPoint
+    get_close = pdfium_c.FPDFPathSegment_GetClose
+    kinds = _POINT_KINDS
     for index in range(count):
-        segment = pdfium_c.FPDFPath_GetPathSegment(path, index)
-        kind = _POINT_KINDS.get(pdfium_c.FPDFPathSegment_GetType(segment)) if segment else None
-        if kind is None or not pdfium_c.FPDFPathSegment_GetPoint(segment, x, y):
+        segment = get_seg(path, index)
+        kind = kinds.get(get_type(segment)) if segment else None
+        if kind is None or not get_pt(segment, x, y):
             raise PdfiumFailure(f"read path segment {index} of {label}")
-        points.append(PathPoint(kind, x.value, y.value, bool(pdfium_c.FPDFPathSegment_GetClose(segment))))
+        points.append(make_pt(kind, x.value, y.value, bool(get_close(segment))))
     return points
 
 
@@ -939,8 +951,65 @@ def _read_matrix(obj: pdfium_c.FPDF_PAGEOBJECT, label: str) -> Matrix:
     return Matrix(raw.a, raw.b, raw.c, raw.d, raw.e, raw.f)
 
 
+_FAST_CULL_PT = 11.9
+
+
+def _own_precancel_mag(own: Matrix, l_v: float, b_v: float, r_v: float, t_v: float) -> float | None:
+    """Upper bound on binary32 intermediate magnitudes inside ``FPDFPageObj_GetBounds`` before ``own`` cancellation."""
+    a, b, c, d, e, f = own
+    w_max = max(abs(l_v - e), abs(r_v - e), abs(b_v - f), abs(t_v - f))
+    post_max = max(abs(l_v), abs(b_v), abs(r_v), abs(t_v), abs(e), abs(f), w_max)
+    if b == 0.0 and c == 0.0:
+        if a == 0.0 or d == 0.0:
+            return None
+        return post_max
+    det = a * d - b * c
+    frob2 = a * a + b * b + c * c + d * d
+    if not (math.isfinite(det) and math.isfinite(frob2)) or frob2 == 0.0 or abs(det) <= 1e-6 * frob2:
+        return None
+    bound = max(post_max, (frob2 / abs(det)) * w_max)
+    return bound if math.isfinite(bound) else None
+
+
+def _culled_by_outer_bounds(path: pdfium_c.FPDF_PAGEOBJECT, *, own: Matrix, outer: Matrix) -> bool:
+    """True when ``FPDFPageObj_GetBounds(path)`` mapped by ``outer`` is provably < 11.9 pt in both axes.
+
+    PDFium's ``FPDFPageObj_GetBounds`` already applies ``own`` in binary32 float;
+    ``_own_precancel_mag`` bounds intermediate float32 terms before ``own``
+    translation or shear cancellation so scaled/UTM paths never under-bound ULPs.
+    """
+    left, bottom, right, top = ctypes.c_float(), ctypes.c_float(), ctypes.c_float(), ctypes.c_float()
+    if not pdfium_c.FPDFPageObj_GetBounds(path, left, bottom, right, top):
+        return False
+    l_v, b_v, r_v, t_v = left.value, bottom.value, right.value, top.value
+    isfinite = math.isfinite
+    if not (isfinite(l_v) and isfinite(b_v) and isfinite(r_v) and isfinite(t_v)):
+        return False
+    pre_mag = _own_precancel_mag(own, l_v, b_v, r_v, t_v)
+    if pre_mag is None:
+        return False
+    if outer == IDENTITY:
+        slack = pre_mag * 1e-5
+        return isfinite(slack) and (abs(r_v - l_v) + slack) < _FAST_CULL_PT and (abs(t_v - b_v) + slack) < _FAST_CULL_PT
+    oa, ob, oc, od, oe, of_ = outer
+    scale = max(abs(oa) + abs(oc), abs(ob) + abs(od))
+    slack = pre_mag * scale * 1e-5
+    xs = (oa * l_v + oc * b_v + oe, oa * r_v + oc * b_v + oe, oa * l_v + oc * t_v + oe, oa * r_v + oc * t_v + oe)
+    ys = (ob * l_v + od * b_v + of_, ob * r_v + od * b_v + of_, ob * l_v + od * t_v + of_, ob * r_v + od * t_v + of_)
+    if not (all(isfinite(v) for v in xs) and all(isfinite(v) for v in ys) and isfinite(slack)):
+        return False
+    return (max(xs) - min(xs) + slack) < _FAST_CULL_PT and (max(ys) - min(ys) + slack) < _FAST_CULL_PT
+
+
 def _path_object_segments(
-    path: pdfium_c.FPDF_PAGEOBJECT, index: int, matrix: Matrix, to_display: Callable[[Box], Box], room: _SegmentRoom
+    path: pdfium_c.FPDF_PAGEOBJECT,
+    index: int,
+    matrix: Matrix,
+    to_display: Callable[[Box], Box],
+    room: _SegmentRoom,
+    *,
+    own: Matrix = IDENTITY,
+    outer: Matrix = IDENTITY,
 ) -> list[RawSegment] | None:
     """The segments of path object ``index`` (matrix to page space ``matrix``), or None if its geometry is not finite.
 
@@ -949,8 +1018,35 @@ def _path_object_segments(
     renders the rest of it), so only that path is skipped.
     """
     label = f"object {index}"
-    paint = _read_paint(path, label)
-    points = _read_points(path, label, room)
+    fill_mode, stroke = ctypes.c_int(), ctypes.c_int()
+    if not pdfium_c.FPDFPath_GetDrawMode(path, fill_mode, stroke) or fill_mode.value not in _FILL_MODES:
+        raise PdfiumFailure(f"read the draw mode of {label}")
+    width = ctypes.c_float()
+    if stroke.value and not pdfium_c.FPDFPageObj_GetStrokeWidth(path, width):
+        raise PdfiumFailure(f"read the stroke width of {label}")
+    count = pdfium_c.FPDFPath_CountSegments(path)
+    if count < 0:
+        raise PdfiumFailure(f"count the path segments of {label}")
+    room.take(count, label)
+    painted = bool(stroke.value) or fill_mode.value != pdfium_c.FPDF_FILLMODE_NONE
+    if (
+        count > 0
+        and painted
+        and all(math.isfinite(v) for v in matrix)
+        and all(math.isfinite(v) for v in own)
+        and math.isfinite(width.value)
+        and _culled_by_outer_bounds(path, own=own, outer=outer)
+    ):
+        return []
+    paint = PathPaint(
+        stroked=bool(stroke.value),
+        filled=fill_mode.value != pdfium_c.FPDF_FILLMODE_NONE,
+        stroke_width=width.value,
+        dashed=bool(stroke.value) and _leaves_gaps(_read_dashes(path, label)),
+        stroke_rgba=read_rgba(pdfium_c.FPDFPageObj_GetStrokeColor, path, f"stroke colour of {label}"),
+        fill_rgba=read_rgba(pdfium_c.FPDFPageObj_GetFillColor, path, f"fill colour of {label}"),
+    )
+    points = _read_counted_points(path, count, label)
     try:
         return path_segments(points, matrix=matrix, paint=paint, object_index=index, to_display=to_display)
     except NonFiniteGeometry:
@@ -1016,10 +1112,9 @@ def _collect_segments(
     segments: list[RawSegment] = []
     skipped = 0
     room = _SegmentRoom()
-    placed = _placed_objects(page_raw, pdfium_c.FPDF_PAGEOBJ_PATH, max_objects=MAX_PAGE_OBJECTS, objects=walked)
     try:
-        for index, path, matrix in placed:
-            found = _path_object_segments(path, index, matrix, to_display, room)
+        for index, path, own, outer in _objects_in_forms(walked, pdfium_c.FPDF_PAGEOBJ_PATH):
+            found = _path_object_segments(path, index, own.then(outer), to_display, room, own=own, outer=outer)
             if found is None:
                 skipped += 1
             else:
@@ -1149,7 +1244,13 @@ def loaded_page(handle: DocumentHandle, index: int) -> Iterator[tuple[pdfium.Pdf
             page.close()
 
 
-def image_refusal(page: pdfium.PdfPage, geometry: PageGeometry, *, max_objects: int) -> str | None:
+def image_refusal(
+    page: pdfium.PdfPage,
+    geometry: PageGeometry,
+    *,
+    max_objects: int,
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
+) -> str | None:
     """Why the loaded ``page`` must not be rendered, naming the object; None when it may be (#369 A5a).
 
     The render guard. It walks the page's objects as :func:`page_images`
@@ -1186,7 +1287,7 @@ def image_refusal(page: pdfium.PdfPage, geometry: PageGeometry, *, max_objects: 
         raise TypeError(f"geometry must be a PageGeometry, got {type(geometry).__name__}")
     int_at_least("max_objects", max_objects, 1)
     with _PDFIUM_LOCK:
-        placed = _placed_objects(page.raw, pdfium_c.FPDF_PAGEOBJ_IMAGE, max_objects=max_objects)
+        placed = _placed_objects(page.raw, pdfium_c.FPDF_PAGEOBJ_IMAGE, max_objects=max_objects, objects=objects)
         try:
             for outcome in image_outcomes(placed, page.raw, geometry.page_box, _display_mapping(geometry)):
                 if outcome.render_refusal is not None:
@@ -1196,6 +1297,31 @@ def image_refusal(page: pdfium.PdfPage, geometry: PageGeometry, *, max_objects: 
         except PdfiumFailure as exc:
             return f"pdfium cannot {exc}"
         return None
+
+
+_MAX_GLYPH_PATH_PT = 36.0
+_MIN_VISIBLE_ALPHA = 13
+_WHITE_DIST_SQ = 16
+
+
+def _is_visible_glyph_path(obj: pdfium_c.FPDF_PAGEOBJECT, box: Box) -> bool:
+    """True when ``obj`` is a glyph-scale path painting visible non-white ink (SHX/outlined CAD glyphs)."""
+    bw, bh = box[2] - box[0], box[3] - box[1]
+    if (bw <= 0.0 and bh <= 0.0) or bw > _MAX_GLYPH_PATH_PT or bh > _MAX_GLYPH_PATH_PT:
+        return False
+    fill_mode, stroke = ctypes.c_int(), ctypes.c_int()
+    if not pdfium_c.FPDFPath_GetDrawMode(obj, fill_mode, stroke):
+        return False
+    r, g, b, a = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
+    if stroke.value and pdfium_c.FPDFPageObj_GetStrokeColor(obj, r, g, b, a):
+        dist_sq = (255 - r.value) ** 2 + (255 - g.value) ** 2 + (255 - b.value) ** 2
+        if a.value >= _MIN_VISIBLE_ALPHA and dist_sq >= _WHITE_DIST_SQ:
+            return True
+    if fill_mode.value != pdfium_c.FPDF_FILLMODE_NONE and pdfium_c.FPDFPageObj_GetFillColor(obj, r, g, b, a):
+        dist_sq = (255 - r.value) ** 2 + (255 - g.value) ** 2 + (255 - b.value) ** 2
+        if a.value >= _MIN_VISIBLE_ALPHA and dist_sq >= _WHITE_DIST_SQ:
+            return True
+    return False
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1212,10 +1338,13 @@ class ObjectBoxes:
         unboxed: How many such objects have no box the walk can give
             (pdfium cannot read their bounds, or the box is not finite). The
             background check counts each as under every piece of text.
+        glyph_stroke_boxes: Subset of ``boxes`` from glyph-scale paths that
+            paint visible non-white ink (for AutoCAD SHX ``3 Tr`` detection).
     """
 
     boxes: tuple[Box, ...]
     unboxed: int
+    glyph_stroke_boxes: tuple[Box, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.boxes, tuple):
@@ -1223,6 +1352,12 @@ class ObjectBoxes:
         checked = tuple(ordered_box(f"boxes[{index}]", box) for index, box in enumerate(self.boxes))
         object.__setattr__(self, "boxes", checked)
         int_at_least("unboxed", self.unboxed, 0)
+        if not isinstance(self.glyph_stroke_boxes, tuple):
+            raise TypeError(f"glyph_stroke_boxes must be a tuple, got {type(self.glyph_stroke_boxes).__name__}")
+        checked_glyphs = tuple(
+            ordered_box(f"glyph_stroke_boxes[{index}]", box) for index, box in enumerate(self.glyph_stroke_boxes)
+        )
+        object.__setattr__(self, "glyph_stroke_boxes", checked_glyphs)
 
 
 def _collect_object_boxes(
@@ -1235,6 +1370,7 @@ def _collect_object_boxes(
     walked = _page_objects(page_raw, max_objects=MAX_PAGE_OBJECTS) if objects is None else objects
     form_matrices: dict[int, Matrix] = {}
     boxes: list[Box] = []
+    glyph_boxes: list[Box] = []
     unboxed = 0
     bounds_buf = (ctypes.c_float(), ctypes.c_float(), ctypes.c_float(), ctypes.c_float())
     for index, (obj, form) in enumerate(walked):  # bounded: the walk's objects
@@ -1251,7 +1387,9 @@ def _collect_object_boxes(
             unboxed += 1
         else:
             boxes.append(box)
-    return ObjectBoxes(boxes=tuple(boxes), unboxed=unboxed)
+            if kind == pdfium_c.FPDF_PAGEOBJ_PATH and _is_visible_glyph_path(obj, box):
+                glyph_boxes.append(box)
+    return ObjectBoxes(boxes=tuple(boxes), unboxed=unboxed, glyph_stroke_boxes=tuple(glyph_boxes))
 
 
 def _object_box(
@@ -1621,19 +1759,19 @@ class ImageLoader:
                 page.close()
 
     def _verified_image(self, page_raw: pdfium_c.FPDF_PAGE) -> tuple[pdfium_c.FPDF_PAGEOBJECT, bytes, PixelFacts]:
-        """The image object this loader names on the loaded page, its verified raw stream and pixel facts.
-
-        The stream must hash to ``raw_sha256``, and the facts read from the
-        image dictionary and codestream (filters, decode size, declared size,
-        and the bits per pixel and colour space when pdfium reads them) must
-        be the image's: the same stream under another dictionary would decode
-        to another picture. Dictionary changes that keep all of these (a
-        /Decode array, a palette's colours) are not detected.
-        """
+        """The image object this loader names on the loaded page, its verified raw stream and pixel facts."""
         try:
             objects = _page_objects(page_raw, max_objects=MAX_PAGE_OBJECTS)
         except WalkBoundHit as exc:  # its page was within the bound when the image was recorded
             raise self._changed(str(exc)) from exc
+        return self._verified_on_objects(page_raw, objects)
+
+    def _verified_on_objects(
+        self,
+        page_raw: pdfium_c.FPDF_PAGE,
+        objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]],
+    ) -> tuple[pdfium_c.FPDF_PAGEOBJECT, bytes, PixelFacts]:
+        """Verify this image against pre-walked ``objects`` of ``page_raw`` without re-walking the page."""
         if self.object_index >= len(objects):
             raise self._changed(f"the page has {len(objects)} object(s)")
         image, _form = objects[self.object_index]
@@ -1666,6 +1804,98 @@ class ImageLoader:
         """The error for a source that no longer holds this image (never naming the password)."""
         where = f"{self.source}: page {self.page_index + 1}, object {self.object_index}"
         return DatagruntPDFError(f"{where} is not the image this loader was made for: the file changed ({detail})")
+
+
+class FigureSession:
+    """Reads verified figures from one open ``DocumentHandle``, loading and walking each page once."""
+
+    __slots__ = ("_handle", "_load_error", "_objects", "_page", "_page_index", "_page_number", "_walk_error")
+
+    def __init__(self, handle: DocumentHandle) -> None:
+        if not isinstance(handle, DocumentHandle):
+            raise TypeError(f"handle must be a DocumentHandle, got {type(handle).__name__}")
+        if handle.closed:
+            raise ValueError("document handle is closed")
+        self._handle = handle
+        self._page_index: int | None = None
+        self._page: pdfium.PdfPage | None = None
+        self._page_number: int = 0
+        self._objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None
+        self._walk_error: str | None = None
+        self._load_error: PdfiumFailure | None = None
+
+    def __enter__(self) -> "FigureSession":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Close any cached page under ``_PDFIUM_LOCK``."""
+        with _PDFIUM_LOCK:
+            if self._page is not None:
+                if not self._handle.closed:
+                    self._page.close()
+                self._page = None
+            self._page_index = None
+            self._objects = None
+            self._walk_error = None
+            self._load_error = None
+
+    def _ensure_page(self, loader: ImageLoader) -> tuple[pdfium.PdfPage, list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]]:
+        if self._handle.closed:
+            self._page = None
+            self._page_index = None
+            self._objects = None
+            self._walk_error = None
+            raise ValueError("document handle is closed")
+        if self._page_index == loader.page_index:
+            if self._walk_error is not None:
+                raise loader._changed(self._walk_error)
+            if self._page is not None and self._objects is not None:
+                return self._page, self._objects
+        self.close()
+        if loader.page_index >= self._handle.page_count:
+            raise loader._changed(f"it has {self._handle.page_count} page(s)")
+        page, page_number = _load_page(self._handle, loader.page_index)
+        try:
+            objects = _page_objects(page.raw, max_objects=MAX_PAGE_OBJECTS)
+        except WalkBoundHit as exc:
+            page.close()
+            self._page_index = loader.page_index
+            self._page_number = page_number
+            self._walk_error = str(exc)
+            raise loader._changed(self._walk_error) from exc
+        except BaseException:
+            page.close()
+            raise
+        self._page = page
+        self._page_index = loader.page_index
+        self._page_number = page_number
+        self._objects = objects
+        return page, objects
+
+    def read(self, loader: ImageLoader, kind: Literal["png", "raw"]) -> bytes:
+        """Read ``loader``'s verified ``"png"`` or ``"raw"`` bytes, reusing the loaded page and object walk."""
+        if not isinstance(loader, ImageLoader):
+            raise TypeError(f"loader must be an ImageLoader, got {type(loader).__name__}")
+        choice_str("kind", kind, ("png", "raw"))
+        page_number = loader.page_index + 1
+        encoder: Callable[[], bytes] | None = None
+        with _PDFIUM_LOCK:
+            try:
+                page, objects = self._ensure_page(loader)
+                page_number = self._page_number
+                image, raw, facts = loader._verified_on_objects(page.raw, objects)
+                if kind == "raw":
+                    return raw
+                encoder = decoded_png_detached(image, facts, f"object {loader.object_index}")
+            except PdfiumFailure as exc:
+                message = f"{loader.source}: page {page_number}: pdfium cannot {exc}"
+                raise PDFCorruptError(message, page_number=page_number) from exc
+            except (OversizedStream, DecodeRefused) as exc:
+                raise DatagruntPDFError(f"{loader.source}: page {page_number}: {exc}") from exc
+        return encoder()
 
 
 def _uncharged(size: int) -> bool:

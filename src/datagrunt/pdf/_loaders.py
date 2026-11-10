@@ -64,7 +64,6 @@ refused) is that figure's outcome, raised as it was.
 """
 
 import dataclasses
-import io
 import os
 import stat
 import subprocess
@@ -75,11 +74,10 @@ from functools import partial
 from pathlib import Path
 from typing import IO, BinaryIO, Literal, NamedTuple
 
-from PIL import Image
-
 from datagrunt.pdf._image_facts import RawImage
 from datagrunt.pdf._memory_cap import ending
 from datagrunt.pdf._options import _RENDER_TIMEOUT_S, MEMORY_CAP_BYTES
+from datagrunt.pdf._png import grey_png_bytes
 from datagrunt.pdf._process import (
     MAX_REQUEST_BYTES,
     REAP_TIMEOUT_S,
@@ -273,17 +271,34 @@ class PageDraw:
         """The page's ``(width, height)`` in pixels at ``dpi``."""
         return render_size(self.width_pt, self.height_pt, self.dpi)
 
-    def png_bytes(self) -> bytes:
-        """The page as displayed, 8-bit grey as drawn, as PNG.
+    def draw_from_handle(self, handle: object) -> RenderedPage:
+        """Draw this page on an already-open ``DocumentHandle``, checking source identity before and after."""
+        from datagrunt.pdf import _render_worker
+        from datagrunt.pdf.pdfium_engine import DocumentHandle
 
-        Raises:
-            PDFSourceChangedError: If the file at ``source`` is gone, not a
-                regular file or its bytes are not the document's before the
-                render, or it changed during it (module notes).
-            DatagruntPDFError: If the page draws at another size than
-                :attr:`size` (the PDF is not the one read), or as
-                ``render_page`` raises (``RenderRefused``, ``RenderFailed``).
-        """
+        if not isinstance(handle, DocumentHandle):
+            raise TypeError(f"handle must be a DocumentHandle, got {type(handle).__name__}")
+        image = f"page {self.page_index + 1}'s image"
+        before = _drawable(self, f"before {image} was drawn")
+        page = _render_worker.draw_loaded_in_process(
+            handle,
+            self.source,
+            self.page_index,
+            dpi=self.dpi,
+            memory_cap_bytes=self.memory_cap_bytes,
+            annotations=True,
+        )
+        _check_unchanged(self.source, before, f"while {image} was drawn")
+        if (page.px_width, page.px_height) != self.size:
+            width, height = self.size
+            drew = f"page {self.page_index + 1} draws {page.px_width} x {page.px_height} px"
+            raise DatagruntPDFError(
+                f"{self.source}: {drew}, not the {width} x {height} px of its page image: the PDF is not the one read"
+            )
+        return page
+
+    def png_bytes(self) -> bytes:
+        """The page as displayed, 8-bit grey as drawn, as PNG."""
         page = _bound_render(self)
         if (page.px_width, page.px_height) != self.size:
             width, height = self.size
@@ -432,9 +447,7 @@ def _removed(source: Path, when: str) -> PDFSourceChangedError:
 
 def _png(image: RenderedPage | Band) -> bytes:
     """8-bit grey pixels as PNG."""
-    buffer = io.BytesIO()
-    Image.frombytes("L", (image.px_width, image.px_height), image.pixels).save(buffer, format="PNG")
-    return buffer.getvalue()
+    return grey_png_bytes(image.px_width, image.px_height, image.pixels)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -579,10 +592,11 @@ def read_figures(reads: Sequence[FigureRead], kind: Kind) -> Iterator[bytes | Ex
 
 
 def _batches(reads: Sequence[FigureRead]) -> Iterator[list[FigureRead]]:
-    """``reads`` in runs that share a worker: the same PDF, password and cap, at most FIGURE_BATCH long."""
+    """``reads`` in runs sharing a worker (at most FIGURE_BATCH under ``sandbox``; full PDF run in-process)."""
     batch: list[FigureRead] = []
     for read in reads:
-        if batch and (len(batch) == FIGURE_BATCH or _worker_key(batch[0]) != _worker_key(read)):
+        limit_hit = read.sandbox and len(batch) == FIGURE_BATCH
+        if batch and (limit_hit or _worker_key(batch[0]) != _worker_key(read)):
             yield batch
             batch = []
         batch.append(read)
@@ -595,9 +609,9 @@ def _worker_key(read: FigureRead) -> tuple[Path, str | None, int, bool]:
 
 
 def _in_process_figure_outcomes(batch: list[FigureRead], kind: Kind) -> Iterator[bytes | Exception]:
-    """Read a batch of figures in-process from one open DocumentHandle."""
+    """Read a batch of figures in-process from one open DocumentHandle and FigureSession."""
     try:
-        from datagrunt.pdf.pdfium_engine import ImageLoader, open_document
+        from datagrunt.pdf.pdfium_engine import FigureSession, ImageLoader, open_document
     except ImportError as exc:
         from datagrunt.pdf._extra import missing_in_process
 
@@ -613,7 +627,7 @@ def _in_process_figure_outcomes(batch: list[FigureRead], kind: Kind) -> Iterator
         for _ in batch:
             yield exc
         return
-    with handle_ctx as handle:
+    with handle_ctx as handle, FigureSession(handle) as session:
         for read in batch:
             loader = ImageLoader(
                 source=read.source,
@@ -622,7 +636,7 @@ def _in_process_figure_outcomes(batch: list[FigureRead], kind: Kind) -> Iterator
                 password=read.password,
             )
             try:
-                yield loader.read_from_handle(handle, kind)
+                yield session.read(loader, kind)
             except (DatagruntPDFError, OSError) as exc:
                 yield exc
 

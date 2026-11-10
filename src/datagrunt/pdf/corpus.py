@@ -12,14 +12,18 @@ never require the ``[pdf]`` extra (``pypdfium2`` and ``Pillow``).
 import errno
 import json
 import os
+import subprocess
+import sys
+import threading
 import uuid
+import warnings
 from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
-from typing import Final, NamedTuple, cast
+from typing import IO, Final, NamedTuple, cast
 
 import datagrunt
 from datagrunt.pdf._bundle_load import (
@@ -29,6 +33,7 @@ from datagrunt.pdf._bundle_load import (
     _opened,
     _read_fd,
     _regular,
+    _same_output_params,
     load_bundle,
 )
 from datagrunt.pdf._extra import load as _load_extra
@@ -39,6 +44,22 @@ from datagrunt.pdf._options import (
     OcrMode,
     RenderPagesMode,
     checked_render_pages,
+)
+from datagrunt.pdf._process import (
+    ERROR,
+    MAX_REQUEST_BYTES,
+    REAP_TIMEOUT_S,
+    MessageTooLong,
+    StderrTail,
+    close_pipes,
+    error_reply,
+    kill_group,
+    next_reply,
+    read_error,
+    read_message,
+    reaped,
+    send_message,
+    start_worker,
 )
 from datagrunt.pdf._source import _opened_source, _stream_sha256, checked_pdf_file
 from datagrunt.pdf._validate import (
@@ -56,6 +77,7 @@ from datagrunt.pdf.exceptions import BundleCorruptError, DatagruntPDFError
 from datagrunt.pdf.pipeline import PageWorkerPool, PipelineOptions, _pool_size, extract_document
 
 _default_extract_document = extract_document
+_default_load_extra = _load_extra
 
 __all__ = [
     "CORPUS_FORMAT_VERSION",
@@ -208,23 +230,45 @@ def extract_corpus(
     items = _resolve_inputs(inputs)
     write_bundle_fn = _load_extra("write_bundle")
     target.mkdir(parents=True, exist_ok=True)
-    use_pool = options.sandbox or _pool_size(options.workers) > 1
-    with PageWorkerPool() if use_pool else nullcontext() as worker_pool:
-        outcomes = _run_batch(
+    batch_workers = min(max_workers, len(items))
+    can_spawn_procs = (
+        batch_workers > 1
+        and not options.sandbox
+        and not getattr(sys, "frozen", False)
+        and bool(sys.executable)
+        and extract_document is _default_extract_document
+        and _load_extra is _default_load_extra
+        and getattr(write_bundle_fn, "__module__", "") == "datagrunt.pdf.bundle"
+    )
+    if can_spawn_procs:
+        outcomes = _run_spawn_batch(
             items,
-            lambda item: _process_item(
-                item,
-                target,
-                checked_pwd,
-                options,
-                replace,
-                write_bundle_fn,
-                include_images=checked_include_images,
-                render_pages=checked_render_pgs,
-                worker_pool=worker_pool,
-            ),
-            min(max_workers, len(items)),
+            target,
+            checked_pwd,
+            options,
+            replace,
+            include_images=checked_include_images,
+            render_pages=checked_render_pgs,
+            workers=batch_workers,
         )
+    else:
+        use_pool = options.sandbox or _pool_size(options.workers) > 1
+        with PageWorkerPool() if use_pool else nullcontext() as worker_pool:
+            outcomes = _run_batch(
+                items,
+                lambda item: _process_item(
+                    item,
+                    target,
+                    checked_pwd,
+                    options,
+                    replace,
+                    write_bundle_fn,
+                    include_images=checked_include_images,
+                    render_pages=checked_render_pgs,
+                    worker_pool=worker_pool,
+                ),
+                batch_workers,
+            )
     entries = tuple(res for res in outcomes if isinstance(res, CorpusEntry))
     failures = tuple(res for res in outcomes if isinstance(res, CorpusFailure))
     manifest = CorpusManifest(
@@ -310,6 +354,378 @@ def _file_sha256(path: Path) -> str:
     with _opened_source(path) as stream:
         size = os.fstat(stream.fileno()).st_size
         return _stream_sha256(stream, size, path)
+
+
+_CORPUS_DOC_TIMEOUT_S: Final[float] = 1800.0
+_MAX_WORKER_DOCS: Final[int] = 100_000
+_OK_TAG: Final[bytes] = b"O"
+_CORPUS_POOL_BOOTSTRAP: Final[str] = (
+    "import json, os, sys; "
+    f"raw_path = sys.stdin.buffer.readline({MAX_REQUEST_BYTES}); "
+    "sys.path[:] = json.loads(raw_path); "
+    "out = os.fdopen(os.dup(1), 'wb'); "
+    "os.dup2(2, 1); "
+    "sys.stdout = open(1, 'w', encoding='utf-8', closefd=False); "
+    "from datagrunt.pdf.corpus import _corpus_worker_main; "
+    "_corpus_worker_main(out)"
+)
+
+
+class _CorpusProcPool:
+    """Warm isolated child processes (``python -I -c``) for parallel multi-document corpus extraction."""
+
+    __slots__ = ("_closed", "_idle", "_lock")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._idle: list[tuple[subprocess.Popen[bytes], StderrTail, int]] = []
+        self._closed = False
+
+    def acquire(self) -> tuple["subprocess.Popen[bytes]", StderrTail, int]:
+        """Return ``(child, stderr, uses_so_far)`` for a healthy worker or start a new isolated worker."""
+        with self._lock:
+            if self._closed:
+                raise ValueError("_CorpusProcPool is closed")
+            while self._idle:
+                child, stderr, uses = self._idle.pop()
+                if uses < _MAX_WORKER_DOCS and child.poll() is None:
+                    return child, stderr, uses
+                close_pipes(child)
+                kill_group(child)
+                reaped(child, REAP_TIMEOUT_S)
+                stderr.finish(REAP_TIMEOUT_S)
+        if not sys.executable:
+            raise DatagruntPDFError("sys.executable is empty: cannot start corpus worker")
+        child, stderr = start_worker([sys.executable, "-I", "-c", _CORPUS_POOL_BOOTSTRAP], own_group=True)
+        if child.stdin is not None:
+            try:
+                resolved = [os.path.abspath(entry) if entry else os.getcwd() for entry in sys.path]
+                child.stdin.write((json.dumps(resolved) + "\n").encode("utf-8"))
+                child.stdin.flush()
+            except OSError:
+                pass
+        return child, stderr, 0
+
+    def release(
+        self, child: "subprocess.Popen[bytes]", stderr: StderrTail, uses: int, *, healthy: bool
+    ) -> tuple[int | None, str]:
+        """Return ``child`` to idle pool when ``healthy`` and under retirement cap, else terminate and reap."""
+        if healthy and uses < _MAX_WORKER_DOCS and child.poll() is None:
+            with self._lock:
+                if not self._closed:
+                    self._idle.append((child, stderr, uses))
+                    return None, ""
+        close_pipes(child)
+        kill_group(child)
+        code = reaped(child, REAP_TIMEOUT_S)
+        return code, stderr.finish(REAP_TIMEOUT_S)
+
+    def close(self) -> None:
+        """Close, terminate, and reap all idle corpus workers."""
+        with self._lock:
+            self._closed = True
+            idle = list(self._idle)
+            self._idle.clear()
+        for child, stderr, _uses in idle:
+            close_pipes(child)
+            kill_group(child)
+            reaped(child, REAP_TIMEOUT_S)
+            stderr.finish(REAP_TIMEOUT_S)
+
+    def __enter__(self) -> "_CorpusProcPool":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+
+def _entry_dict(entry: CorpusEntry) -> dict[str, object]:
+    """Serialize ``entry`` to a JSON-compatible dictionary."""
+    return {
+        "doc_id": entry.doc_id,
+        "source_name": entry.source_name,
+        "source_sha256": entry.source_sha256,
+        "bundle_relpath": entry.bundle_relpath,
+        "page_count": entry.page_count,
+        "integrity_verified": entry.integrity_verified,
+        "degraded_pages": list(entry.degraded_pages),
+        "reused": entry.reused,
+    }
+
+
+def _failure_dict(failure: CorpusFailure) -> dict[str, object]:
+    """Serialize ``failure`` to a JSON-compatible dictionary."""
+    return {
+        "source_path": failure.source_path,
+        "error_type": failure.error_type,
+        "message": failure.message,
+    }
+
+
+def _expected_params_for(
+    options: PipelineOptions, *, include_images: bool, render_pages: RenderPagesMode
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Build ``(extra_params, expected_params)`` for bundle manifest matching."""
+    extra_params: dict[str, object] = {
+        "ocr": options.ocr,
+        "min_image_dimension": options.min_image_dimension,
+        "strict": options.strict,
+        **({"orientation_fallback": True} if options.orientation_fallback else {}),
+    }
+    expected_params: dict[str, object] = {
+        "dpi": options.dpi,
+        "vision_dpi": options.vision_dpi,
+        "max_render_pixels": options.max_render_pixels,
+        "workers": options.workers,
+        **extra_params,
+    }
+    if options.sandbox:
+        expected_params["sandbox"] = True
+    if not include_images:
+        expected_params["include_images"] = False
+    if render_pages is False:
+        expected_params["render_pages"] = False
+    elif render_pages == "vision_only":
+        expected_params["render_pages"] = "vision_only"
+    return extra_params, expected_params
+
+
+def _encode_corpus_request(
+    item: _SourceItem,
+    target: Path,
+    password: str | None,
+    options: PipelineOptions,
+    overwrite: bool,
+    *,
+    include_images: bool,
+    render_pages: RenderPagesMode,
+) -> bytes:
+    """Encode one document extraction request as bounded UTF-8 JSON."""
+    payload = {
+        "path": str(item.path),
+        "source_name": item.source_name,
+        "sha256": item.sha256,
+        "doc_id": item.doc_id,
+        "target": str(target),
+        "password": password,
+        "overwrite": overwrite,
+        "include_images": include_images,
+        "render_pages": render_pages,
+        "options": {
+            "workers": options.workers,
+            "ocr": options.ocr,
+            "dpi": options.dpi,
+            "vision_dpi": options.vision_dpi,
+            "max_render_pixels": options.max_render_pixels,
+            "min_image_dimension": options.min_image_dimension,
+            "strict": options.strict,
+            "sandbox": options.sandbox,
+            "orientation_fallback": options.orientation_fallback,
+        },
+    }
+    raw = json.dumps(payload, allow_nan=False).encode("utf-8")
+    if len(raw) > MAX_REQUEST_BYTES:
+        raise DatagruntPDFError(f"corpus request exceeds {MAX_REQUEST_BYTES} bytes")
+    return raw
+
+
+def _run_encoded_corpus_request(raw: bytes) -> bytes:
+    """Execute one encoded corpus document request inside the child worker and return the reply frame."""
+    req = cast(dict[str, object], json.loads(raw))
+    opts_raw = cast(dict[str, object], req["options"])
+    item = _SourceItem(
+        path=Path(cast(str, req["path"])),
+        source_name=cast(str, req["source_name"]),
+        sha256=cast(str, req["sha256"]),
+        doc_id=cast(str, req["doc_id"]),
+    )
+    options = PipelineOptions(
+        workers=cast(int, opts_raw["workers"]),
+        ocr=cast(OcrMode, opts_raw["ocr"]),
+        dpi=cast(int, opts_raw["dpi"]),
+        vision_dpi=cast(int, opts_raw["vision_dpi"]),
+        max_render_pixels=cast(int, opts_raw["max_render_pixels"]),
+        min_image_dimension=cast(int, opts_raw["min_image_dimension"]),
+        strict=cast(bool, opts_raw["strict"]),
+        sandbox=cast(bool, opts_raw["sandbox"]),
+        orientation_fallback=cast(bool, opts_raw["orientation_fallback"]),
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", UserWarning)
+        outcome = _process_item(
+            item,
+            Path(cast(str, req["target"])),
+            cast(str | None, req["password"]),
+            options,
+            cast(bool, req["overwrite"]),
+            _default_load_extra("write_bundle"),
+            include_images=cast(bool, req["include_images"]),
+            render_pages=checked_render_pages(req["render_pages"]),
+            worker_pool=None,
+        )
+    user_notices = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
+    if isinstance(outcome, CorpusEntry):
+        body = {"kind": "entry", "pid": os.getpid(), "data": _entry_dict(outcome), "warnings": user_notices}
+    else:
+        body = {"kind": "failure", "pid": os.getpid(), "data": _failure_dict(outcome), "warnings": user_notices}
+    return _OK_TAG + json.dumps(body, allow_nan=False).encode("utf-8")
+
+
+def _corpus_worker_main(replies: IO[bytes]) -> None:
+    """Child process loop reading document requests on stdin and sending length-prefixed replies."""
+    # Bound is generous (+1) so parent-driven retirement closes stdin cleanly before child loop ends
+    for _ in range(_MAX_WORKER_DOCS + 1):
+        raw = read_message(sys.stdin.buffer, MAX_REQUEST_BYTES)
+        if raw is None:
+            return
+        try:
+            reply = _run_encoded_corpus_request(raw)
+        except Exception as exc:  # sent to parent for strict raise; never swallowed
+            try:
+                send_message(replies, ERROR + error_reply(exc))
+            except OSError:
+                return
+            continue
+        try:
+            send_message(replies, reply)
+        except OSError:
+            return
+
+
+def _decode_corpus_reply(reply: bytes, target: Path) -> tuple[int, CorpusEntry | CorpusFailure]:
+    """Decode one child worker reply frame into ``(child_pid, outcome)``, re-emitting UserWarnings."""
+    if not isinstance(reply, bytes) or len(reply) < 2:
+        raise DatagruntPDFError("the corpus worker sent a truncated reply")
+    tag, body = reply[:1], reply[1:]
+    if tag == ERROR:
+        raise read_error(body, "the corpus worker")
+    if tag != _OK_TAG:
+        raise DatagruntPDFError("the corpus worker sent an unknown reply tag")
+    msg = _object("corpus_reply", json.loads(body), ("kind", "pid", "data", "warnings"))
+    for idx, item in enumerate(_array("corpus_reply.warnings", msg["warnings"])):
+        if not isinstance(item, str):
+            raise ValueError(f"corpus_reply.warnings[{idx}] must be str")
+        warnings.warn(item, UserWarning, stacklevel=3)
+    pid = int_at_least("corpus_reply.pid", msg["pid"], 1)
+    if msg["kind"] == "entry":
+        return pid, _entry_of("corpus_reply.data", msg["data"], target)
+    if msg["kind"] == "failure":
+        return pid, _failure_of("corpus_reply.data", msg["data"])
+    raise DatagruntPDFError(f"unknown corpus reply kind: {msg['kind']!r}")
+
+
+def _ipc_failure(item: _SourceItem, strict: bool, exc: Exception) -> tuple[int, CorpusEntry | CorpusFailure]:
+    """Raise ``exc`` when ``strict`` is True, else record a :class:`CorpusFailure`."""
+    if strict:
+        if isinstance(exc, MessageTooLong):
+            raise DatagruntPDFError(str(exc)) from exc
+        raise exc
+    err_name = "DatagruntPDFError" if isinstance(exc, MessageTooLong) else type(exc).__name__
+    return 0, CorpusFailure(source_path=str(item.path), error_type=err_name, message=str(exc) or err_name)
+
+
+def _run_in_corpus_worker(
+    proc_pool: _CorpusProcPool,
+    item: _SourceItem,
+    target: Path,
+    password: str | None,
+    options: PipelineOptions,
+    overwrite: bool,
+    *,
+    include_images: bool,
+    render_pages: RenderPagesMode,
+) -> tuple[int, CorpusEntry | CorpusFailure]:
+    """Send ``item`` to a warm child process in ``proc_pool`` and decode its reply."""
+    try:
+        request_bytes = _encode_corpus_request(
+            item, target, password, options, overwrite, include_images=include_images, render_pages=render_pages
+        )
+    except (DatagruntPDFError, ValueError) as exc:
+        return _ipc_failure(item, options.strict, exc)
+    child, stderr, uses = proc_pool.acquire()
+    healthy = False
+    reply: bytes | None = None
+    expired = False
+    try:
+        if child.stdin is None or child.stdout is None:
+            raise DatagruntPDFError("corpus worker pipes are missing")
+        try:
+            send_message(child.stdin, request_bytes)
+        except OSError:
+            pass
+        reply, expired = next_reply(child, child.stdout, _CORPUS_DOC_TIMEOUT_S, MAX_REQUEST_BYTES, kill=kill_group)
+        healthy = reply is not None and not expired
+    except (MessageTooLong, DatagruntPDFError) as exc:
+        return _ipc_failure(item, options.strict, exc)
+    finally:
+        code, tail = proc_pool.release(child, stderr, uses + 1, healthy=healthy)
+    if reply is None:
+        reason = "corpus worker timed out" if expired else f"corpus worker exited (code {code})"
+        detail = f"{reason}: {tail}" if tail else reason
+        return _ipc_failure(item, options.strict, DatagruntPDFError(detail))
+    try:
+        return _decode_corpus_reply(reply, target)
+    except (DatagruntPDFError, OSError, ValueError) as exc:
+        return _ipc_failure(item, options.strict, exc)
+
+
+def _run_spawn_batch(
+    items: tuple[_SourceItem, ...],
+    target: Path,
+    password: str | None,
+    options: PipelineOptions,
+    overwrite: bool,
+    *,
+    include_images: bool,
+    render_pages: RenderPagesMode,
+    workers: int,
+) -> list[CorpusEntry | CorpusFailure]:
+    """Verify reusable bundles first, then extract remaining PDFs across isolated worker processes."""
+    outcomes: dict[int, CorpusEntry | CorpusFailure] = {}
+    todo_indices: list[int] = []
+    _, expected_params = _expected_params_for(options, include_images=include_images, render_pages=render_pages)
+    for index, item in enumerate(items):
+        if not overwrite and (target / item.doc_id).is_dir():
+            reused = _reused_entry(target / item.doc_id, item, item.doc_id, expected_params)
+            if reused is not None:
+                outcomes[index] = reused
+                continue
+        todo_indices.append(index)
+    if not todo_indices:
+        return [outcomes[i] for i in range(len(items))]
+    if len(todo_indices) == 1:
+        idx = todo_indices[0]
+        outcomes[idx] = _process_item(
+            items[idx],
+            target,
+            password,
+            options,
+            overwrite,
+            _default_load_extra("write_bundle"),
+            include_images=include_images,
+            render_pages=render_pages,
+        )
+        return [outcomes[i] for i in range(len(items))]
+    todo_items = tuple(items[i] for i in todo_indices)
+    pool_size = min(workers, len(todo_items))
+    with _CorpusProcPool() as proc_pool:
+        todo_outcomes = _run_batch(
+            todo_items,
+            lambda item: _run_in_corpus_worker(
+                proc_pool,
+                item,
+                target,
+                password,
+                options,
+                overwrite,
+                include_images=include_images,
+                render_pages=render_pages,
+            )[1],
+            pool_size,
+        )
+    for idx, res in zip(todo_indices, todo_outcomes, strict=True):
+        outcomes[idx] = res
+    return [outcomes[i] for i in range(len(items))]
 
 
 def _run_batch(
@@ -452,7 +868,7 @@ def _reused_entry(
         return None
     if manifest.bundle_format_version != BUNDLE_FORMAT_VERSION:
         return None
-    if manifest.source_sha256 != item.sha256 or manifest.extraction_params != expected_params:
+    if manifest.source_sha256 != item.sha256 or not _same_output_params(manifest.extraction_params, expected_params):
         return None
     if doc.metadata.doc_id != item.doc_id or doc.metadata.source_name != item.source_name:
         return None
@@ -472,27 +888,8 @@ def _write_corpus_manifest(target: Path, manifest: CorpusManifest) -> None:
     """Atomically write ``corpus_manifest.json`` into ``target``."""
     payload = {
         "corpus_format_version": manifest.corpus_format_version,
-        "entries": [
-            {
-                "doc_id": e.doc_id,
-                "source_name": e.source_name,
-                "source_sha256": e.source_sha256,
-                "bundle_relpath": e.bundle_relpath,
-                "page_count": e.page_count,
-                "integrity_verified": e.integrity_verified,
-                "degraded_pages": list(e.degraded_pages),
-                "reused": e.reused,
-            }
-            for e in manifest.entries
-        ],
-        "failures": [
-            {
-                "source_path": f.source_path,
-                "error_type": f.error_type,
-                "message": f.message,
-            }
-            for f in manifest.failures
-        ],
+        "entries": [_entry_dict(e) for e in manifest.entries],
+        "failures": [_failure_dict(f) for f in manifest.failures],
     }
     raw = json.dumps(payload, ensure_ascii=True, allow_nan=False, indent=2).encode("ascii")
     staging = target / f".tmp_{uuid.uuid4().hex}"

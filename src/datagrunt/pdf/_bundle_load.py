@@ -90,6 +90,7 @@ _MANIFEST_KEYS = (
     "missing",
 )
 _PARAM_KEYS = ("dpi", "vision_dpi", "max_render_pixels", "workers")
+_RUN_PARAM_KEYS = ("workers",)
 _MISSING_ARTIFACTS = ("bands", "figure", "page_image")
 # Where a page image came from: the document's own (its loaders), or the bundle's render at dpi.
 _ORIGINS = ("document", "render")
@@ -297,6 +298,15 @@ def _format_version(data: object) -> str:
 def _page_numbers(name: str, value: object) -> tuple[int, ...]:
     """A manifest's list of 1-based page numbers (``degraded_pages``, ``image_only_pages``), each checked."""
     return tuple(int_at_least(f"{name}[{i}]", page, 1) for i, page in enumerate(_array(name, value)))
+
+
+def _same_output_params(recorded: Mapping[str, object], wanted: Mapping[str, object]) -> bool:
+    """True when ``recorded`` and ``wanted`` agree on every output-affecting parameter (ignoring ``workers``)."""
+    if not isinstance(recorded, Mapping) or not isinstance(wanted, Mapping):
+        raise TypeError("extraction_params must be Mappings")
+    return {k: v for k, v in recorded.items() if k not in _RUN_PARAM_KEYS} == {
+        k: v for k, v in wanted.items() if k not in _RUN_PARAM_KEYS
+    }
 
 
 def _check_params(value: object) -> None:
