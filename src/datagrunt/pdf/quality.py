@@ -483,6 +483,79 @@ def _bridge_short_drift_gaps(on_page: list[int], backed: list[bool]) -> None:
         pos = end
 
 
+def _adjacent_word_bound(
+    edge_box: Box, tr3_bands: tuple[_GlyphBand, ...], height: float, budget: list[int], *, right_side: bool
+) -> float | None:
+    """Nearest adjacent non-space 3 Tr character edge on the same line across all spans, or None."""
+    if not tr3_bands:
+        return None
+    wx0, wy0, wx1, wy1 = edge_box
+    cw, ch_h = max(wx1 - wx0, 0.0), max(wy1 - wy0, 0.0)
+    reach = max(cw * 2.5, 16.0)
+    qy0, qy1 = wy0 + 0.15 * ch_h, wy1 - 0.15 * ch_h
+    if qy0 > qy1:
+        qy0, qy1 = wy0, wy1
+    best: float | None = None
+    for band_idx in _bands_of(qy0, qy1, height):
+        gband = tr3_bands[band_idx]
+        lo = (
+            bisect.bisect_right(gband.x0s, wx1 + 0.05)
+            if right_side
+            else bisect.bisect_left(gband.x0s, wx0 - reach - gband.max_w - 1e-6)
+        )
+        hi = bisect.bisect_right(gband.x0s, wx1 + reach) if right_side else bisect.bisect_left(gband.x0s, wx0 - 0.05)
+        for idx in range(lo, hi):
+            budget[0] -= 1
+            if budget[0] < 0:
+                return best
+            bx0, by0, bx1, by1 = gband.boxes[idx]
+            if by0 <= qy1 and qy0 <= by1 and right_side and bx0 > wx1 + 0.05:
+                best = bx0 if best is None else min(best, bx0)
+            elif by0 <= qy1 and qy0 <= by1 and not right_side and bx1 < wx0 - 0.05:
+                best = bx1 if best is None else max(best, bx1)
+    return best
+
+
+def _word_has_drift_overhang(
+    edge_box: Box,
+    edge_ch: str,
+    bands: tuple[_GlyphBand, ...],
+    tr3_bands: tuple[_GlyphBand, ...],
+    height: float,
+    budget: list[int],
+    *,
+    right_side: bool,
+) -> bool:
+    """True when a glyph stroke overhangs the full token into unclaimed inter-word whitespace."""
+    wx0, wy0, wx1, wy1 = edge_box
+    cw, ch_h = max(wx1 - wx0, 0.0), max(wy1 - wy0, 0.0)
+    bound = _adjacent_word_bound(edge_box, tr3_bands, height, budget, right_side=right_side)
+    gap_lo = wx1 + 0.2 if right_side else ((bound + 0.2) if bound is not None else wx0 - max(cw, 2.0))
+    gap_hi = ((bound - 0.2) if bound is not None else wx1 + max(cw, 2.0)) if right_side else wx0 - 0.2
+    if gap_lo >= gap_hi:
+        return False
+    max_side = min(max(2.5 * max(cw, ch_h, 4.0), 18.0), 36.0)
+    qy0, qy1 = wy0 - _VECTOR_TOL_PT, wy1 + _VECTOR_TOL_PT
+    for band_idx in _bands_of(qy0, qy1, height):
+        gband = bands[band_idx]
+        lo = bisect.bisect_left(gband.x0s, gap_lo - gband.max_w - 1e-6)
+        hi = bisect.bisect_right(gband.x0s, gap_hi + 0.5 * max_side)
+        for idx in range(lo, hi):
+            budget[0] -= 1
+            if budget[0] < 0:
+                return False
+            vx0, vy0, vx1, vy1 = gband.boxes[idx]
+            vw, vh = vx1 - vx0, vy1 - vy0
+            vmid = 0.5 * (vx0 + vx1)
+            overhangs = (vx1 > wx1 + 0.5 if right_side else vx0 < wx0 - 0.5) and gap_lo <= vmid <= gap_hi
+            vh_ok = (max(0.18 * ch_h, 1.2) <= vh <= max_side) or (
+                edge_ch in "*°'\".,:;)]}" and 0.8 <= vh <= max(ch_h * 2.0, 6.0) and vw <= max(cw * 2.0, 6.0)
+            )
+            if vy0 <= qy1 and qy0 <= vy1 and vw <= max_side and vh_ok and overhangs:
+                return True
+    return False
+
+
 def _mark_word_backing(
     span: RawSpan,
     start: int,
@@ -490,10 +563,11 @@ def _mark_word_backing(
     width: float,
     height: float,
     bands: tuple[_GlyphBand, ...],
+    tr3_bands: tuple[_GlyphBand, ...],
     budget: list[int],
     backed: list[bool],
 ) -> None:
-    """Back on-page characters and bridge strictly interior <= 2-char drift gaps when >= 60% alnum match."""
+    """Back on-page characters and bridge interior <= 2-char or overhang-proven 1-letter edge SHX drift."""
     on_page = [i for i in range(start, end) if not off_page(span.char_boxes[i], width, height)]
     if not on_page:
         return
@@ -502,11 +576,51 @@ def _mark_word_backing(
     alnum = [i for i in on_page if span.text[i].isalnum()]
     alnum_hits = sum(1 for i in alnum if backed[i])
     if len(alnum) >= 3 and alnum_hits >= 2 and alnum_hits * 5 >= 3 * len(alnum):
+        alpha_hits = sum(1 for i in alnum if backed[i] and span.text[i].isalpha())
+        lead_ok = (
+            alpha_hits >= 2
+            and not backed[alnum[0]]
+            and backed[alnum[1]]
+            and span.text[alnum[0]].isalpha()
+            and _word_has_drift_overhang(
+                span.char_boxes[on_page[-1]],
+                span.text[on_page[-1]],
+                bands,
+                tr3_bands,
+                height,
+                budget,
+                right_side=True,
+            )
+        )
+        trail_ok = (
+            alpha_hits >= 2
+            and not backed[alnum[-1]]
+            and backed[alnum[-2]]
+            and span.text[alnum[-1]].isalpha()
+            and _word_has_drift_overhang(
+                span.char_boxes[on_page[0]],
+                span.text[on_page[0]],
+                bands,
+                tr3_bands,
+                height,
+                budget,
+                right_side=False,
+            )
+        )
         _bridge_short_drift_gaps(on_page, backed)
+        if lead_ok:
+            backed[alnum[0]] = True
+        if trail_ok:
+            backed[alnum[-1]] = True
 
 
 def _char_vector_flags(
-    span: RawSpan, width: float, height: float, bands: tuple[_GlyphBand, ...], budget: list[int]
+    span: RawSpan,
+    width: float,
+    height: float,
+    bands: tuple[_GlyphBand, ...],
+    budget: list[int],
+    tr3_bands: tuple[_GlyphBand, ...] = (),
 ) -> tuple[bool, ...]:
     """Word-aware vector-stroke backing flags; internal spaces stay visible only between backed neighbours."""
     n = len(span.text)
@@ -521,7 +635,7 @@ def _char_vector_flags(
         end = pos + 1
         while end < n and not span.text[end].isspace():
             end += 1
-        _mark_word_backing(span, pos, end, width, height, bands, budget, backed)
+        _mark_word_backing(span, pos, end, width, height, bands, tr3_bands, budget, backed)
         pos = end
     if not any(backed):
         return tuple(backed)
@@ -555,7 +669,21 @@ def _classify(
     """:func:`classify_spans` of checked input, given raster ``cover`` and banded vector glyph boxes."""
     raster = boxes if cover > _OCR_LAYER_COVER else ()
     budget = [_MAX_VECTOR_TEXT_CHECKS]
-    return tuple(piece for span in spans for piece in _span_pieces(span, width, height, raster, v_bands, budget))
+    tr3_boxes = (
+        tuple(
+            sp.char_boxes[i]
+            for sp in spans
+            if sp.render_mode == _INVISIBLE_TEXT_MODE
+            for i, ch in enumerate(sp.text)
+            if not ch.isspace() and not off_page(sp.char_boxes[i], width, height)
+        )
+        if v_bands
+        else ()
+    )
+    tr3_bands = _glyph_bands(tr3_boxes, height) if tr3_boxes else ()
+    return tuple(
+        piece for span in spans for piece in _span_pieces(span, width, height, raster, v_bands, budget, tr3_bands)
+    )
 
 
 def _scan_boxes(images: tuple[RawImage, ...]) -> tuple[Box, ...]:
@@ -603,12 +731,15 @@ def _span_pieces(
     raster: tuple[Box, ...],
     v_bands: tuple[_GlyphBand, ...] = (),
     budget: list[int] | None = None,
+    tr3_bands: tuple[_GlyphBand, ...] = (),
 ) -> Iterator[SpanPiece]:
     """Yield ``span``'s pieces: maximal runs of chars with equal hidden reasons."""
     no_paint = span.render_mode in _NO_PAINT_MODES
     under = _overlapping(span.bbox, raster) if no_paint else ()
     vec_flags = (
-        _char_vector_flags(span, width, height, v_bands, budget if budget is not None else [_MAX_VECTOR_TEXT_CHECKS])
+        _char_vector_flags(
+            span, width, height, v_bands, budget if budget is not None else [_MAX_VECTOR_TEXT_CHECKS], tr3_bands
+        )
         if no_paint and v_bands
         else (False,) * len(span.char_boxes)
     )

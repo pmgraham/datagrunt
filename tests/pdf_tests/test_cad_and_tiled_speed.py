@@ -22,7 +22,7 @@ def _make_tiled_pdf(path: Path, pages: int, tiles_per_page: int, px: int = 48) -
     c = canvas.Canvas(str(path), pagesize=(612, 792))
     for p in range(pages):
         c.setFont("Helvetica", 10)
-        c.drawString(36, 760, f"Tiled sheet {p + 1}")
+        c.drawString(36, 760, f"Engineering Component Reference Gallery - Sheet {p + 1}")
         for idx in range(tiles_per_page):
             img = Image.frombytes(
                 "L",
@@ -1522,3 +1522,422 @@ class TestArgonPhase2CadWordBackingAndTiledScans:
         assert "FOX" not in adv2_md
         assert "OWL" not in adv2_md
         assert "DWG 54-00655 REV 1I" in adv2_md
+
+    def test_argon_v534_edge_letter_drift_and_sparse_segmented_scans(self, tmp_path: Path) -> None:
+        import json
+
+        from PIL import Image
+        from reportlab.lib.utils import ImageReader
+
+        from datagrunt.pdf.corpus import extract_corpus
+
+        # --- Part 1: CAD 3 Tr leading/trailing 1-letter kerning drift vs numeric/prefix attacks ---
+        cad_pdf = tmp_path / "cad_v535_drift.pdf"
+        c = canvas.Canvas(str(cad_pdf), pagesize=(842, 595))
+        c.setStrokeColorRGB(0.1, 0.1, 0.1)
+        c.setLineWidth(0.7)
+
+        # Rightward +3.6pt SHX drift: char 0 of 'acoustic', 'level*', 'vibration', 'that' misses its char_box!
+        line_r = "acoustic level* vibration that"
+        tr = c.beginText(60.0, 500.0)
+        tr.setFont("Courier", 10)
+        tr.setTextRenderMode(3)
+        tr.textOut(line_r)
+        c.drawText(tr)
+        for idx, ch in enumerate(line_r):
+            if ch.isspace():
+                continue
+            # Shift every SHX stroke +4.8pt right so char 0 of each word lands outside its [cx0, cx1]
+            gx = 60.0 + idx * 6.0 + 5.6
+            c.line(gx, 501.0, gx + 3.2, 508.0)
+
+        # Leftward -4.8pt SHX drift: final letter 'r' of 'Power' and 't' of 'input*' miss!
+        line_l = "Power input*"
+        tl = c.beginText(60.0, 460.0)
+        tl.setFont("Courier", 10)
+        tl.setTextRenderMode(3)
+        tl.textOut(line_l)
+        c.drawText(tl)
+        for idx, ch in enumerate(line_l):
+            if ch.isspace() or ch == "*":
+                continue
+            gx = 60.0 + idx * 6.0 - 4.8
+            c.line(gx, 461.0, gx + 3.2, 468.0)
+
+        # Adversarial guard: "UNAUTHORIZED -100 +250 1000" with strokes ONLY over "AUTHORIZED", "100", "250", "100"
+        adv = "UNAUTHORIZED -100 +250 1000"
+        ta = c.beginText(60.0, 420.0)
+        ta.setFont("Courier", 10)
+        ta.setTextRenderMode(3)
+        ta.textOut(adv)
+        c.drawText(ta)
+        for idx in (*range(2, 12), *range(14, 17), *range(19, 22), *range(23, 26)):
+            gx = 60.0 + idx * 6.0 + 1.0
+            c.line(gx, 421.0, gx + 3.0, 428.0)
+
+        c.showPage()
+        c.save()
+
+        cad_out = tmp_path / "cad_v535_out"
+        cad_man = extract_corpus(cad_pdf, cad_out, ocr="never")
+        cad_md = (cad_out / cad_man.entries[0].bundle_relpath / "markdown" / "document.md").read_text(encoding="utf-8")
+        assert "acoustic level\\* vibration that" in cad_md, f"got: {cad_md!r}"
+        assert "Power input" in cad_md, f"got: {cad_md!r}"
+        assert "UNAUTHORIZED" not in cad_md
+        assert "-100" not in cad_md
+        assert "+250" not in cad_md
+        assert "1000" not in cad_md
+
+        # --- Part 2: Remaining 2,982 raster-scan tile/strip/MRC/full-page variants vs 2-photo appendix ---
+        scan_pdf = tmp_path / "scans_v535.pdf"
+        sc = canvas.Canvas(str(scan_pdf), pagesize=(612, 792))
+
+        t128 = tmp_path / "t128.png"
+        Image.new("L", (128, 128), color=200).save(t128)
+        rem_tile = tmp_path / "t_rem.png"
+        Image.new("L", (56, 128), color=195).save(rem_tile)
+        stamp180 = tmp_path / "stamp180.png"
+        Image.new("RGB", (180, 180), color=(20, 60, 160)).save(stamp180)
+        band4 = tmp_path / "band4.png"
+        Image.new("L", (1200, 400), color=210).save(band4)
+        strip_var = tmp_path / "strip_var.png"
+        Image.new("L", (900, 48), color=205).save(strip_var)
+        full_scan = tmp_path / "full_scan.png"
+        Image.new("L", (1224, 1584), color=235).save(full_scan)
+        zone_patch = tmp_path / "zone_patch.png"
+        Image.new("L", (140, 52), color=180).save(zone_patch)
+        photo = tmp_path / "photo.png"
+        Image.new("RGB", (300, 200), color=(40, 120, 80)).save(photo)
+
+        # Page 1: Sparse white-tile-omitted blueprint scan (6 abutting 96x96pt tiles + 8 isolated 1-tile islands
+        # + 2 edge-remainder tiles + 1 larger 135x135pt RGB approval stamp)
+        for r in range(2):
+            for col in range(3):
+                sc.drawImage(ImageReader(str(t128)), 36.0 + col * 96.0, 60.0 + r * 96.0, width=96.0, height=96.0)
+        for ix, iy in ((36, 320), (228, 320), (420, 320), (132, 460), (324, 460), (36, 600), (228, 600), (420, 600)):
+            sc.drawImage(ImageReader(str(t128)), float(ix), float(iy), width=96.0, height=96.0)
+        sc.drawImage(ImageReader(str(rem_tile)), 516.0, 320.0, width=42.0, height=96.0)
+        sc.drawImage(ImageReader(str(rem_tile)), 516.0, 600.0, width=42.0, height=96.0)
+        sc.drawImage(ImageReader(str(stamp180)), 380.0, 80.0, width=135.0, height=135.0)
+        sc.showPage()
+
+        # Page 2: 4-band full-page scan (< 6 strips, aspect ~ 3:1)
+        for b_idx in range(4):
+            sc.drawImage(ImageReader(str(band4)), 0.0, b_idx * 198.0, width=612.0, height=198.0)
+        sc.showPage()
+
+        # Page 3: Skipped-white-band & ink-trimmed variable-width scanbands (positive 28pt white gaps + varying x0/x1)
+        for s_idx in range(9):
+            x_left = 36.0 + (s_idx % 3) * 28.0
+            w_band = 500.0 - (s_idx % 4) * 35.0
+            y_pos = 80.0 + s_idx * 52.0  # 24pt height + 28pt skipped white gap!
+            sc.drawImage(ImageReader(str(strip_var)), x_left, y_pos, width=w_band, height=24.0)
+        sc.showPage()
+
+        # Page 4: Single full-page scan background + 6 MRC foreground patches
+        sc.drawImage(ImageReader(str(full_scan)), 0.0, 0.0, width=612.0, height=792.0)
+        for m_idx in range(6):
+            sc.drawImage(
+                ImageReader(str(zone_patch)), 60.0 + (m_idx % 2) * 240.0, 120.0 + m_idx * 90.0, width=120.0, height=44.0
+            )
+        sc.showPage()
+
+        # Page 5: Zone-segmented scan (16 non-abutting text-block crops on an image_only page)
+        for z_idx in range(16):
+            zx = 40.0 + (z_idx % 2) * 270.0
+            zy = 60.0 + (z_idx // 2) * 84.0
+            sc.drawImage(ImageReader(str(zone_patch)), zx, zy, width=180.0, height=46.0)
+        sc.showPage()
+
+        # Page 6: Legitimate uncaptioned 2-photo appendix sheet -> BOTH photos MUST survive!
+        sc.drawImage(ImageReader(str(photo)), 106.0, 430.0, width=400.0, height=260.0)
+        sc.drawImage(ImageReader(str(photo)), 106.0, 110.0, width=400.0, height=260.0)
+        sc.showPage()
+        sc.save()
+
+        scan_out = tmp_path / "scans_v535_out"
+        scan_man = extract_corpus(scan_pdf, scan_out, ocr="never", include_images=True, render_pages=True)
+        b_dir = scan_out / scan_man.entries[0].bundle_relpath
+        scan_json = json.loads((b_dir / "json" / "document.json").read_text(encoding="utf-8"))
+
+        assert len(list((b_dir / "page_images").glob("page_*.png"))) == 6
+        p1_f = [el for el in scan_json["pages"][0]["elements"] if el["kind"] == "figure"]
+        p2_f = [el for el in scan_json["pages"][1]["elements"] if el["kind"] == "figure"]
+        p3_f = [el for el in scan_json["pages"][2]["elements"] if el["kind"] == "figure"]
+        p4_f = [el for el in scan_json["pages"][3]["elements"] if el["kind"] == "figure"]
+        p5_f = [el for el in scan_json["pages"][4]["elements"] if el["kind"] == "figure"]
+        p6_f = [el for el in scan_json["pages"][5]["elements"] if el["kind"] == "figure"]
+
+        assert len(p1_f) == 1 and (p1_f[0]["width_px"], p1_f[0]["height_px"]) == (180, 180)
+        assert p2_f == []
+        assert p3_f == []
+        assert p4_f == []
+        assert p5_f == []
+        assert len(p6_f) == 2
+
+    def test_audit_v535_round1_negations_multipliers_cad_diagrams_and_rgb_subplots_preserved(
+        self, tmp_path: Path
+    ) -> None:
+        import json
+
+        from PIL import Image
+        from reportlab.lib.utils import ImageReader
+
+        from datagrunt.pdf.corpus import extract_corpus
+
+        # --- Finding 1: Unshifted "NONE NEVER CANT ASYNCHRONOUS 100k 100M" must NOT hallucinate edge chars ---
+        f1_pdf = tmp_path / "f1_no_drift.pdf"
+        c1 = canvas.Canvas(str(f1_pdf), pagesize=(842, 595))
+        c1.setStrokeColorRGB(0.1, 0.1, 0.1)
+        c1.setLineWidth(0.7)
+        line_f1 = "NONE NEVER CANT ASYNCHRONOUS 100k 100M"
+        t1 = c1.beginText(60.0, 500.0)
+        t1.setFont("Courier", 10)
+        t1.setTextRenderMode(3)
+        t1.textOut(line_f1)
+        c1.drawText(t1)
+        # Strokes only inside ONE (1..3), EVER (6..9), CAN (11..13), SYNCHRONOUS, and 100
+        backed_f1 = (*range(1, 4), *range(6, 10), *range(11, 14), *range(17, 28), *range(29, 32), *range(34, 37))
+        for idx in backed_f1:
+            gx = 60.0 + idx * 6.0 + 1.0
+            c1.line(gx, 501.0, gx + 3.5, 508.0)
+
+        # Round 2 (1A): Same-word punctuation "NONE* (CANT" with strokes only on "ONE*" and "(CAN"
+        line_r2a = "NONE* (CANT"
+        t1a = c1.beginText(60.0, 460.0)
+        t1a.setFont("Courier", 10)
+        t1a.setTextRenderMode(3)
+        t1a.textOut(line_r2a)
+        c1.drawText(t1a)
+        for idx in (*range(1, 5), *range(6, 10)):
+            gx = 60.0 + idx * 6.0 + 1.0
+            c1.line(gx, 461.0, gx + 3.5, 468.0)
+
+        # Round 2 (1B): Proportional Helvetica 10 "NONE MOTOR" (1-span and 2-span) with strokes only on ONE & MOTOR
+        from reportlab.pdfbase.pdfmetrics import stringWidth
+
+        line_r2b = "NONE MOTOR"
+        t1b = c1.beginText(60.0, 420.0)
+        t1b.setFont("Helvetica", 10)
+        t1b.setTextRenderMode(3)
+        t1b.textOut(line_r2b)
+        c1.drawText(t1b)
+        for idx, ch in enumerate(line_r2b):
+            if idx == 0 or ch.isspace():
+                continue
+            x0_ch = 60.0 + stringWidth(line_r2b[:idx], "Helvetica", 10)
+            w_ch = stringWidth(ch, "Helvetica", 10)
+            c1.line(x0_ch + 0.8, 421.0, x0_ch + max(w_ch - 0.8, 1.2), 428.0)
+
+        t1c_a = c1.beginText(60.0, 380.0)
+        t1c_a.setFont("Helvetica", 10)
+        t1c_a.setTextRenderMode(3)
+        t1c_a.textOut("NONE")
+        c1.drawText(t1c_a)
+        x_motor = 60.0 + stringWidth("NONE ", "Helvetica", 10)
+        t1c_b = c1.beginText(x_motor, 380.0)
+        t1c_b.setFont("Helvetica", 10)
+        t1c_b.setTextRenderMode(3)
+        t1c_b.textOut("MOTOR")
+        c1.drawText(t1c_b)
+        for idx, ch in enumerate("NONE"):
+            if idx == 0:
+                continue
+            x0_ch = 60.0 + stringWidth("NONE"[:idx], "Helvetica", 10)
+            w_ch = stringWidth(ch, "Helvetica", 10)
+            c1.line(x0_ch + 0.8, 381.0, x0_ch + max(w_ch - 0.8, 1.2), 388.0)
+        for idx, ch in enumerate("MOTOR"):
+            x0_ch = x_motor + stringWidth("MOTOR"[:idx], "Helvetica", 10)
+            w_ch = stringWidth(ch, "Helvetica", 10)
+            c1.line(x0_ch + 0.8, 381.0, x0_ch + max(w_ch - 0.8, 1.2), 388.0)
+
+        c1.showPage()
+        c1.save()
+
+        f1_out = tmp_path / "f1_out"
+        f1_man = extract_corpus(f1_pdf, f1_out, ocr="never")
+        f1_md = (f1_out / f1_man.entries[0].bundle_relpath / "markdown" / "document.md").read_text(encoding="utf-8")
+        for forbidden in ("NONE", "NEVER", "CANT", "ASYNCHRONOUS", "100k", "100M"):
+            assert forbidden not in f1_md, f"{forbidden} leaked into {f1_md!r}"
+        for expected in ("ONE", "EVER", "CAN", "SYNCHRONOUS", "100", "MOTOR"):
+            assert expected in f1_md, f"{expected} missing from {f1_md!r}"
+
+        # --- Findings 2A-2D & 3A-3D: CAD diagram + 12 icons, 4x4 RGB contact sheet, 1" margin photo,
+        # 2x2 RGB comparison, 5 stacked RGB charts, 6 scattered RGB callouts, and header + 4-band scan ---
+        f2_pdf = tmp_path / "f2_f3_cases.pdf"
+        c2 = canvas.Canvas(str(f2_pdf), pagesize=(612, 792))
+
+        diag800 = tmp_path / "diag800.png"
+        Image.new("RGB", (800, 600), color=(30, 80, 150)).save(diag800)
+        tiny10 = tmp_path / "tiny10.png"
+        Image.new("RGB", (10, 10), color=(100, 100, 100)).save(tiny10)
+        contact120 = tmp_path / "contact120.png"
+        Image.new("RGB", (120, 120), color=(40, 140, 90)).save(contact120)
+        framed1200 = tmp_path / "framed1200.png"
+        Image.new("RGB", (1200, 1600), color=(80, 50, 120)).save(framed1200)
+        panel600 = tmp_path / "panel600.png"
+        Image.new("RGB", (600, 600), color=(140, 70, 50)).save(panel600)
+        chart_rgb = tmp_path / "chart_rgb.png"
+        Image.new("RGB", (1200, 300), color=(50, 90, 160)).save(chart_rgb)
+        callout_rgb = tmp_path / "callout_rgb.png"
+        Image.new("RGB", (450, 120), color=(90, 60, 110)).save(callout_rgb)
+        hdr_banner = tmp_path / "hdr_banner.png"
+        Image.new("RGB", (900, 80), color=(20, 40, 90)).save(hdr_banner)
+        scan_band = tmp_path / "scan_band.png"
+        Image.new("L", (1224, 330), color=210).save(scan_band)
+
+        # Page 1 (2A/2B): Digital CAD 3 Tr drawing with 12 10x10 spacer icons + 1 800x600 diagram
+        c2.setStrokeColorRGB(0.1, 0.1, 0.1)
+        cad_txt = "CAD ASSEMBLY DRAWING 54-00912 REVISION B APPROVED"
+        tc = c2.beginText(60.0, 740.0)
+        tc.setFont("Courier", 10)
+        tc.setTextRenderMode(3)
+        tc.textOut(cad_txt)
+        c2.drawText(tc)
+        for idx, ch in enumerate(cad_txt):
+            if not ch.isspace():
+                c2.line(60.0 + idx * 6.0 + 1.0, 741.0, 60.0 + idx * 6.0 + 4.0, 748.0)
+        for k in range(12):
+            c2.drawImage(ImageReader(str(tiny10)), 40.0 + k * 20.0, 700.0, width=8.0, height=8.0)
+        c2.drawImage(ImageReader(str(diag800)), 60.0, 200.0, width=400.0, height=300.0)
+        c2.showPage()
+
+        # Page 2 (2C): 4x4 (16-photo) spaced RGB photo contact sheet (20 pt gaps) on uncaptioned page
+        for r in range(4):
+            for col in range(4):
+                c2.drawImage(
+                    ImageReader(str(contact120)), 50.0 + col * 120.0, 120.0 + r * 120.0, width=100.0, height=100.0
+                )
+        c2.showPage()
+
+        # Page 3 (2D): Single 1200x1600 px RGB figure inside 1" margins (492x648 pt on 612x792 pt Letter page)
+        c2.drawImage(ImageReader(str(framed1200)), 60.0, 72.0, width=492.0, height=648.0)
+        c2.showPage()
+
+        # Page 4 (3A): 2x2 grid of four 210x210 pt (600x600 px RGB) comparison photos with 1.0 pt gap
+        for r in range(2):
+            for col in range(2):
+                c2.drawImage(
+                    ImageReader(str(panel600)), 80.0 + col * 211.0, 160.0 + r * 211.0, width=210.0, height=210.0
+                )
+        c2.showPage()
+
+        # Page 5 (3B): 5 stacked 400x90 pt (1200x300 px RGB) subplot charts with 50 pt gaps
+        for k in range(5):
+            c2.drawImage(ImageReader(str(chart_rgb)), 80.0, 50.0 + k * 140.0, width=400.0, height=90.0)
+        c2.showPage()
+
+        # Page 6 (3C): 6 scattered 150x40 pt RGB callout figures with 60 pt vertical gaps
+        for k in range(6):
+            c2.drawImage(
+                ImageReader(str(callout_rgb)), 60.0 + (k % 2) * 180.0, 80.0 + k * 100.0, width=150.0, height=40.0
+            )
+        c2.showPage()
+
+        # Page 7 (3D): Header banner at display y=20..60 (PDF y=732..772) above a 4-band scan at PDF y=0..652
+        c2.drawImage(ImageReader(str(hdr_banner)), 50.0, 732.0, width=450.0, height=40.0)
+        for b_idx in range(4):
+            c2.drawImage(ImageReader(str(scan_band)), 0.0, b_idx * 163.0, width=612.0, height=163.0)
+        c2.showPage()
+        c2.save()
+
+        f2_out = tmp_path / "f2_out"
+        f2_man = extract_corpus(f2_pdf, f2_out, ocr="never", include_images=True, render_pages=True)
+        f2_json = json.loads(
+            (f2_out / f2_man.entries[0].bundle_relpath / "json" / "document.json").read_text(encoding="utf-8")
+        )
+        counts = [sum(1 for el in f2_json["pages"][i]["elements"] if el["kind"] == "figure") for i in range(7)]
+        assert counts == [1, 16, 1, 4, 5, 6, 1], f"unexpected figure counts per page: {counts}"
+
+        # Direct 1-bit CCITTFaxDecode unit check + 4 overlaid RGB inspection photos on full-page form preserved
+        from datagrunt.pdf import assembly
+        from datagrunt.pdf.pdfium_engine import PageGeometry, RawImage
+
+        sha = "c" * 64
+        ccitt_patches = [
+            (
+                idx,
+                RawImage(
+                    object_index=idx,
+                    bbox=(40.0, 50.0 + idx * 80.0, 120.0, 110.0 + idx * 80.0),
+                    px_width=160,
+                    px_height=120,
+                    declared_px=(160, 120),
+                    raw_sha256=sha,
+                    filters=("CCITTFaxDecode",),
+                    bits_per_pixel=1,
+                    colorspace="DeviceGray",
+                ),
+            )
+            for idx in range(6)
+        ]
+        assert assembly._mosaic_fragment_positions(
+            ccitt_patches,
+            PageGeometry(page_number=1, width_pt=612.0, height_pt=792.0, rotation_deg=0, crop_offset=(0.0, 0.0)),
+            image_only=True,
+        ) == {0, 1, 2, 3, 4, 5}
+        rgb_form = [
+            (
+                0,
+                RawImage(
+                    object_index=0,
+                    bbox=(0.0, 0.0, 612.0, 792.0),
+                    px_width=1224,
+                    px_height=1584,
+                    declared_px=(1224, 1584),
+                    raw_sha256=sha,
+                    filters=("DCTDecode",),
+                    bits_per_pixel=24,
+                    colorspace="DeviceRGB",
+                ),
+            ),
+            *[
+                (
+                    k,
+                    RawImage(
+                        object_index=k,
+                        bbox=(60.0, 80.0 + k * 120.0, 260.0, 180.0 + k * 120.0),
+                        px_width=400,
+                        px_height=300,
+                        declared_px=(400, 300),
+                        raw_sha256=sha,
+                        filters=("DCTDecode",),
+                        bits_per_pixel=24,
+                        colorspace="DeviceRGB",
+                    ),
+                )
+                for k in range(1, 5)
+            ],
+        ]
+        assert (
+            assembly._mosaic_fragment_positions(
+                rgb_form,
+                PageGeometry(page_number=1, width_pt=612.0, height_pt=792.0, rotation_deg=0, crop_offset=(0.0, 0.0)),
+                image_only=True,
+            )
+            == set()
+        )
+
+        # Round 2 (Finding 2): O(S) bounded runtime on 5,000 non-overlapping DeviceGray micro-bars within 40pt band
+        import time
+
+        micro_bars = [
+            (
+                i,
+                RawImage(
+                    object_index=i,
+                    bbox=(40.0, 100.0 + float(i % 40), 220.0, 105.0 + float(i % 40)),
+                    px_width=256,
+                    px_height=8,
+                    declared_px=(256, 8),
+                    raw_sha256=sha,
+                    filters=("FlateDecode",),
+                    bits_per_pixel=8,
+                    colorspace="DeviceGray",
+                ),
+            )
+            for i in range(5000)
+        ]
+        t0 = time.perf_counter()
+        assembly._ink_trimmed_band_axis(micro_bars, 612.0, 792.0, horizontal=True)
+        assert time.perf_counter() - t0 < 0.25
