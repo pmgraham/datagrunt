@@ -95,7 +95,7 @@ from datagrunt.pdf.pdfium_engine import (
     RawPage,
     _checked_path,
 )
-from datagrunt.pdf.quality import PageAssessment, SpanPiece
+from datagrunt.pdf.quality import PageAssessment, SpanPiece, raster_cover_fraction, valid_char
 from datagrunt.pdf.render import RenderRefused, effective_dpi
 
 __all__ = [
@@ -207,6 +207,7 @@ def page_figures(
     password: str | None = None,
     min_image_dimension: int = MIN_IMAGE_DIMENSION,
     sandbox: bool = False,
+    image_only: bool = False,
 ) -> PageFigures:
     """Draft the page's figures from the images A2 recorded (see the module notes). O(images).
 
@@ -228,13 +229,14 @@ def page_figures(
         raise TypeError(f"geometry must be a PageGeometry, got {type(geometry).__name__}")
     minimum = int_at_least("min_image_dimension", min_image_dimension, 0)
     strict_bool("sandbox", sandbox)
+    strict_bool("image_only", image_only)
     path = _checked_path(source, "source")
-    indexed_sized = [
+    all_sized = [
         (pos, item)
         for pos, item in enumerate(images.images)
-        if item.raw_sha256 is not None and (sz := _pixel_size(item)) is not None and min(sz) >= minimum
+        if item.raw_sha256 is not None and (sz := _pixel_size(item)) is not None and min(sz) >= 1
     ]
-    mosaic_skip = _mosaic_fragment_positions(indexed_sized, geometry) if minimum > 0 else set()
+    mosaic_skip = _mosaic_fragment_positions(all_sized, geometry, image_only=image_only) if minimum > 0 else set()
     drafts: list[FigureDraft] = []
     unread: list[int] = []
     unsized: list[int] = []
@@ -263,62 +265,68 @@ def page_figures(
     return PageFigures(drafts=tuple(drafts), warnings=warnings)
 
 
-_MOSAIC_SEAM_PT = 0.6
-_MIN_STRIP_STACK = 8
-_MIN_STRIP_AREA_SHARE = 0.30
-_MIN_TILE_COMPONENT = 16
-_MAX_TILE_PT = 40.0
-_MAX_TILE_PX = 160
+_MOSAIC_LOWER_SEAM_PT = 1.2
+_MOSAIC_UPPER_SEAM_PT = 0.5
+_STRIP_OVERLAP_PT = 2.5
+_MIN_SCAN_STRIP_STACK = 6
+_MIN_DIGITAL_STRIP_STACK = 8
+_MIN_SCAN_STRIP_AREA = 0.20
+_MIN_DIGITAL_STRIP_AREA = 0.30
+_MIN_MICRO_TILE_COMPONENT = 16
+_MIN_PAGE_TILE_COMPONENT = 9
+_MIN_PAGE_TILE_AREA_SHARE = 0.22
+_MAX_DIGITAL_TILE_PT = 40.0
+_MAX_DIGITAL_TILE_PX = 160
+_MAX_SCAN_MICRO_TILE_PT = 64.0
+_MAX_SUBPAGE_RATIO = 0.55
+_NEIGHBOUR_OFFSETS = tuple((d0, d1) for d0 in (-1, 0, 1) for d1 in (-1, 0, 1))
 
 
 def _build_strip_chain(
-    ordered: list[tuple[int, RawImage]], start: int, used: list[bool], *, horizontal: bool
+    ordered: list[tuple[int, RawImage]], start: int, used: list[bool], *, horizontal: bool, min_seam: float
 ) -> list[int]:
-    """Grow one advancing zero-gap strip chain starting at start with bounded lookahead."""
+    """Grow one advancing strip chain with monotone seam break and bounded lookahead."""
     chain = [start]
     misses = 0
     for j in range(start + 1, len(ordered)):
         if used[j]:
             continue
         prev_b, curr_b = ordered[chain[-1]][1].bbox, ordered[j][1].bbox
-        same_span = (
-            abs(curr_b[0] - prev_b[0]) <= 1.5 and abs(curr_b[2] - prev_b[2]) <= 1.5
-            if horizontal
-            else abs(curr_b[1] - prev_b[1]) <= 1.5 and abs(curr_b[3] - prev_b[3]) <= 1.5
-        )
         seam = (curr_b[1] - prev_b[3]) if horizontal else (curr_b[0] - prev_b[2])
+        if seam > _MOSAIC_UPPER_SEAM_PT:
+            break
+        same_span = (
+            abs(curr_b[0] - prev_b[0]) <= 2.5 and abs(curr_b[2] - prev_b[2]) <= 2.5
+            if horizontal
+            else abs(curr_b[1] - prev_b[1]) <= 2.5 and abs(curr_b[3] - prev_b[3]) <= 2.5
+        )
         advance = (curr_b[3] - prev_b[3]) if horizontal else (curr_b[2] - prev_b[2])
-        if same_span and -_MOSAIC_SEAM_PT <= seam <= _MOSAIC_SEAM_PT and advance > 0.1:
+        if same_span and seam >= min_seam and advance > 0.5:
             chain.append(j)
             misses = 0
         else:
             misses += 1
-            if misses >= 8:
+            if misses >= 16:
                 break
     return chain
 
 
-def _strip_runs_by_span(entries: list[tuple[int, RawImage]], *, horizontal: bool, min_total_area: float) -> set[int]:
-    """Find zero-gap advancing scanline strip stacks of >= 8 strips covering >= 30% of page in O(S log S)."""
-    if len(entries) < _MIN_STRIP_STACK:
+def _strip_chains_in_group(
+    merged: list[tuple[int, RawImage]], *, horizontal: bool, min_stack: int, min_seam: float, min_total_area: float
+) -> set[int]:
+    """Extract qualifying strip chains from one merged span-bucket group."""
+    if len(merged) < min_stack:
         return set()
-    ordered = sorted(
-        entries,
-        key=lambda pair: (
-            (round(pair[1].bbox[0] / 2.0), round(pair[1].bbox[2] / 2.0), pair[1].bbox[1])
-            if horizontal
-            else (round(pair[1].bbox[1] / 2.0), round(pair[1].bbox[3] / 2.0), pair[1].bbox[0])
-        ),
-    )
+    ordered = sorted(merged, key=lambda pair: pair[1].bbox[1] if horizontal else pair[1].bbox[0])
     used = [False] * len(ordered)
-    suppressed: set[int] = set()
+    found: set[int] = set()
     for i in range(len(ordered)):
         if used[i]:
             continue
-        chain = _build_strip_chain(ordered, i, used, horizontal=horizontal)
+        chain = _build_strip_chain(ordered, i, used, horizontal=horizontal, min_seam=min_seam)
         for k in chain:
             used[k] = True
-        if len(chain) < _MIN_STRIP_STACK:
+        if len(chain) < min_stack:
             continue
         first_b, last_b = ordered[chain[0]][1].bbox, ordered[chain[-1]][1].bbox
         union_area = (
@@ -327,34 +335,67 @@ def _strip_runs_by_span(entries: list[tuple[int, RawImage]], *, horizontal: bool
             else (first_b[3] - first_b[1]) * max(last_b[2] - first_b[0], 0.0)
         )
         if union_area >= min_total_area:
-            suppressed.update(ordered[k][0] for k in chain)
+            found.update(ordered[k][0] for k in chain)
+    return found
+
+
+def _strip_runs_by_span(
+    entries: list[tuple[int, RawImage]], *, horizontal: bool, min_stack: int, min_seam: float, min_total_area: float
+) -> set[int]:
+    """Find advancing scanline strip stacks in O(S log S) without bucket-boundary splits."""
+    if len(entries) < min_stack:
+        return set()
+    buckets: dict[tuple[int, int], list[tuple[int, RawImage]]] = {}
+    for pos, im in entries:
+        b = im.bbox
+        key = (
+            (int(round(b[0] / 3.0)), int(round(b[2] / 3.0)))
+            if horizontal
+            else (int(round(b[1] / 3.0)), int(round(b[3] / 3.0)))
+        )
+        buckets.setdefault(key, []).append((pos, im))
+    suppressed: set[int] = set()
+    for k0, k1 in list(buckets):
+        merged = [item for d0, d1 in _NEIGHBOUR_OFFSETS for item in buckets.get((k0 + d0, k1 + d1), ())]
+        suppressed.update(
+            _strip_chains_in_group(
+                merged, horizontal=horizontal, min_stack=min_stack, min_seam=min_seam, min_total_area=min_total_area
+            )
+        )
     return suppressed
 
 
-def _strip_stack_positions(indexed: list[tuple[int, RawImage]], page_w: float, page_h: float) -> set[int]:
-    """Identify full-page/large-region scanline strip stacks (``>= 8`` zero-gap strips, aspect ``>= 8:1``)."""
-    min_area = _MIN_STRIP_AREA_SHARE * page_w * page_h
+def _strip_stack_positions(
+    indexed: list[tuple[int, RawImage]], page_w: float, page_h: float, *, image_only: bool = False
+) -> set[int]:
+    """Identify scanline strip stacks conservatively on digital pages and broadly on image-only scan pages."""
+    min_stack = _MIN_SCAN_STRIP_STACK if image_only else _MIN_DIGITAL_STRIP_STACK
+    min_area = (_MIN_SCAN_STRIP_AREA if image_only else _MIN_DIGITAL_STRIP_AREA) * page_w * page_h
+    min_span = 0.20 if image_only else 0.40
+    min_aspect = 3.0 if image_only else 8.0
+    min_px_aspect = 3 if image_only else 8
+    min_seam = -_STRIP_OVERLAP_PT if image_only else -0.6
     h_cands = [
         (pos, im)
         for pos, im in indexed
-        if (im.bbox[2] - im.bbox[0]) >= 0.40 * page_w
+        if (im.bbox[2] - im.bbox[0]) >= min_span * page_w
         and (
-            (im.bbox[2] - im.bbox[0]) >= 8.0 * max(im.bbox[3] - im.bbox[1], 0.1)
-            or im.px_width >= 8 * max(im.px_height, 1)
+            (im.bbox[2] - im.bbox[0]) >= min_aspect * max(im.bbox[3] - im.bbox[1], 0.1)
+            or im.px_width >= min_px_aspect * max(im.px_height, 1)
         )
     ]
     v_cands = [
         (pos, im)
         for pos, im in indexed
-        if (im.bbox[3] - im.bbox[1]) >= 0.40 * page_h
+        if (im.bbox[3] - im.bbox[1]) >= min_span * page_h
         and (
-            (im.bbox[3] - im.bbox[1]) >= 8.0 * max(im.bbox[2] - im.bbox[0], 0.1)
-            or im.px_height >= 8 * max(im.px_width, 1)
+            (im.bbox[3] - im.bbox[1]) >= min_aspect * max(im.bbox[2] - im.bbox[0], 0.1)
+            or im.px_height >= min_px_aspect * max(im.px_width, 1)
         )
     ]
-    return _strip_runs_by_span(h_cands, horizontal=True, min_total_area=min_area) | _strip_runs_by_span(
-        v_cands, horizontal=False, min_total_area=min_area
-    )
+    return _strip_runs_by_span(
+        h_cands, horizontal=True, min_stack=min_stack, min_seam=min_seam, min_total_area=min_area
+    ) | _strip_runs_by_span(v_cands, horizontal=False, min_stack=min_stack, min_seam=min_seam, min_total_area=min_area)
 
 
 def _find_root(parent: list[int], node: int) -> int:
@@ -365,75 +406,144 @@ def _find_root(parent: list[int], node: int) -> int:
     return node
 
 
-def _union_window(merged: list[int], tiles: list[tuple[int, RawImage]], parent: list[int], *, row_mode: bool) -> None:
+def _union_window(merged: list[int], boxes: list[Box], parent: list[int], *, row_mode: bool) -> None:
     """Union congruent disjointly edge-abutting neighbours within a sorted bucket window."""
     for m_i, a_idx in enumerate(merged):
-        ab = tiles[a_idx][1].bbox
+        ab = boxes[a_idx]
         for step in range(1, min(8, len(merged) - m_i)):
             b_idx = merged[m_i + step]
-            bb = tiles[b_idx][1].bbox
+            bb = boxes[b_idx]
             seam = (bb[0] - ab[2]) if row_mode else (bb[1] - ab[3])
-            if seam > _MOSAIC_SEAM_PT:
+            if seam > _MOSAIC_UPPER_SEAM_PT:
                 break
+            advances = (bb[2] > ab[2] + 0.5) if row_mode else (bb[3] > ab[3] + 0.5)
             aligned = (
-                abs(ab[1] - bb[1]) <= 1.5 and abs(ab[3] - bb[3]) <= 1.5
+                abs(ab[1] - bb[1]) <= 2.0 and abs(ab[3] - bb[3]) <= 2.0
                 if row_mode
-                else abs(ab[0] - bb[0]) <= 1.5 and abs(ab[2] - bb[2]) <= 1.5
+                else abs(ab[0] - bb[0]) <= 2.0 and abs(ab[2] - bb[2]) <= 2.0
             )
-            if aligned and seam >= -_MOSAIC_SEAM_PT:
+            if aligned and advances and seam >= -_MOSAIC_LOWER_SEAM_PT:
                 parent[_find_root(parent, b_idx)] = _find_root(parent, a_idx)
 
 
-_NEIGHBOUR_OFFSETS = tuple((d0, d1) for d0 in (-1, 0, 1) for d1 in (-1, 0, 1))
-
-
-def _link_axis_buckets(tiles: list[tuple[int, RawImage]], parent: list[int], *, row_mode: bool) -> None:
-    """Union congruent disjointly edge-abutting tiles along rows or columns in strict O(T log T) time."""
+def _link_axis_buckets(boxes: list[Box], parent: list[int], *, row_mode: bool) -> None:
+    """Union congruent disjointly edge-abutting boxes along rows or columns in strict O(T log T) time."""
     buckets: dict[tuple[int, int], list[int]] = {}
-    for idx, (_pos, im) in enumerate(tiles):
-        b = im.bbox
+    for idx, b in enumerate(boxes):
         key = (
-            (int(round(b[1] / 2.0)), int(round(b[3] / 2.0)))
+            (int(round(b[1] / 3.0)), int(round(b[3] / 3.0)))
             if row_mode
-            else (int(round(b[0] / 2.0)), int(round(b[2] / 2.0)))
+            else (int(round(b[0] / 3.0)), int(round(b[2] / 3.0)))
         )
         buckets.setdefault(key, []).append(idx)
     for k0, k1 in list(buckets):
         merged = [idx for d0, d1 in _NEIGHBOUR_OFFSETS for idx in buckets.get((k0 + d0, k1 + d1), ())]
-        merged.sort(key=lambda idx: tiles[idx][1].bbox[0] if row_mode else tiles[idx][1].bbox[1])
-        _union_window(merged, tiles, parent, row_mode=row_mode)
+        merged.sort(key=lambda idx: boxes[idx][0] if row_mode else boxes[idx][1])
+        _union_window(merged, boxes, parent, row_mode=row_mode)
 
 
-def _tile_grid_positions(indexed: list[tuple[int, RawImage]]) -> set[int]:
-    """Identify ``>= 16`` congruent disjointly edge-abutting micro-tiles (``<= 40 pt``, ``<= 160 px``) in O(T log T)."""
-    tiles = [
-        (pos, im)
-        for pos, im in indexed
-        if 0.5 <= (im.bbox[2] - im.bbox[0]) <= _MAX_TILE_PT
-        and 0.5 <= (im.bbox[3] - im.bbox[1]) <= _MAX_TILE_PT
-        and max(im.px_width, im.px_height) <= _MAX_TILE_PX
-    ]
+def _collapse_and_link_components(boxes: list[Box], parent: list[int]) -> None:
+    """Collapse multi-tile rows/columns to component bboxes and link congruent staggered bands in O(C log C)."""
+    members_by_root: dict[int, list[int]] = {}
+    for idx in range(len(boxes)):
+        members_by_root.setdefault(_find_root(parent, idx), []).append(idx)
+    comp_roots: list[int] = []
+    comp_boxes: list[Box] = []
+    for root, members in members_by_root.items():
+        if len(members) >= 2:
+            comp_roots.append(root)
+            comp_boxes.append(
+                (
+                    min(boxes[i][0] for i in members),
+                    min(boxes[i][1] for i in members),
+                    max(boxes[i][2] for i in members),
+                    max(boxes[i][3] for i in members),
+                )
+            )
+    if len(comp_boxes) < 2:
+        return
+    comp_parent = list(range(len(comp_boxes)))
+    _link_axis_buckets(comp_boxes, comp_parent, row_mode=True)
+    _link_axis_buckets(comp_boxes, comp_parent, row_mode=False)
+    for c_idx in range(len(comp_boxes)):
+        c_root = _find_root(comp_parent, c_idx)
+        if c_root != c_idx:
+            parent[_find_root(parent, comp_roots[c_idx])] = _find_root(parent, comp_roots[c_root])
+
+
+def _qualifying_tile_group(
+    member_indices: list[int], boxes: list[Box], page_w: float, page_h: float, *, image_only: bool
+) -> bool:
+    """True when a connected component of abutting tiles forms a micro-tile patch or full-page scan grid."""
+    count = len(member_indices)
+    if count < _MIN_PAGE_TILE_COMPONENT:
+        return False
+    max_side = max(max(boxes[i][2] - boxes[i][0], boxes[i][3] - boxes[i][1]) for i in member_indices)
+    micro_cap = _MAX_SCAN_MICRO_TILE_PT if image_only else _MAX_DIGITAL_TILE_PT
+    if count >= _MIN_MICRO_TILE_COMPONENT and max_side <= micro_cap:
+        return True
+    if not image_only or page_w <= 0.0 or page_h <= 0.0:
+        return False
+    gx0 = min(boxes[i][0] for i in member_indices)
+    gy0 = min(boxes[i][1] for i in member_indices)
+    gx1 = max(boxes[i][2] for i in member_indices)
+    gy1 = max(boxes[i][3] for i in member_indices)
+    return (gx1 - gx0) * (gy1 - gy0) >= _MIN_PAGE_TILE_AREA_SHARE * page_w * page_h
+
+
+def _tile_grid_positions(
+    indexed: list[tuple[int, RawImage]], page_w: float = 0.0, page_h: float = 0.0, *, image_only: bool = False
+) -> set[int]:
+    """Identify connected grids of edge-abutting tiles in strict O(T log T) time."""
+    if image_only and page_w > 0.0 and page_h > 0.0:
+        max_w = max(_MAX_SUBPAGE_RATIO * page_w, _MAX_SCAN_MICRO_TILE_PT)
+        max_h = max(_MAX_SUBPAGE_RATIO * page_h, _MAX_SCAN_MICRO_TILE_PT)
+        tiles = [
+            (pos, im)
+            for pos, im in indexed
+            if 0.5 <= (im.bbox[2] - im.bbox[0]) <= max_w and 0.5 <= (im.bbox[3] - im.bbox[1]) <= max_h
+        ]
+        min_needed = _MIN_PAGE_TILE_COMPONENT
+    else:
+        tiles = [
+            (pos, im)
+            for pos, im in indexed
+            if 0.5 <= (im.bbox[2] - im.bbox[0]) <= _MAX_DIGITAL_TILE_PT
+            and 0.5 <= (im.bbox[3] - im.bbox[1]) <= _MAX_DIGITAL_TILE_PT
+            and max(im.px_width, im.px_height) <= _MAX_DIGITAL_TILE_PX
+        ]
+        min_needed = _MIN_MICRO_TILE_COMPONENT
     n = len(tiles)
-    if n < _MIN_TILE_COMPONENT:
+    if n < min_needed:
         return set()
+    boxes = [im.bbox for _pos, im in tiles]
     parent = list(range(n))
-    _link_axis_buckets(tiles, parent, row_mode=True)
-    _link_axis_buckets(tiles, parent, row_mode=False)
+    _link_axis_buckets(boxes, parent, row_mode=True)
+    _link_axis_buckets(boxes, parent, row_mode=False)
+    if image_only:
+        _collapse_and_link_components(boxes, parent)
     groups: dict[int, list[int]] = {}
     for idx in range(n):
-        root = idx
-        while parent[root] != root:
-            parent[root] = parent[parent[root]]
-            root = parent[root]
-        groups.setdefault(root, []).append(tiles[idx][0])
-    return {pos for members in groups.values() if len(members) >= _MIN_TILE_COMPONENT for pos in members}
+        groups.setdefault(_find_root(parent, idx), []).append(idx)
+    return {
+        tiles[i][0]
+        for members in groups.values()
+        if _qualifying_tile_group(members, boxes, page_w, page_h, image_only=image_only)
+        for i in members
+    }
 
 
-def _mosaic_fragment_positions(indexed: list[tuple[int, RawImage]], geometry: PageGeometry) -> set[int]:
+def _mosaic_fragment_positions(
+    indexed: list[tuple[int, RawImage]], geometry: PageGeometry, *, image_only: bool = False
+) -> set[int]:
     """Positions in ``images.images`` belonging to scanline strip stacks or tiled raster mosaics."""
-    if len(indexed) < _MIN_STRIP_STACK:
+    min_count = _MIN_SCAN_STRIP_STACK if image_only else _MIN_DIGITAL_STRIP_STACK
+    if len(indexed) < min_count:
         return set()
-    return _strip_stack_positions(indexed, geometry.width_pt, geometry.height_pt) | _tile_grid_positions(indexed)
+    w, h = geometry.width_pt, geometry.height_pt
+    return _strip_stack_positions(indexed, w, h, image_only=image_only) | _tile_grid_positions(
+        indexed, w, h, image_only=image_only
+    )
 
 
 def _pixel_size(item: RawImage) -> tuple[int, int] | None:
@@ -486,6 +596,33 @@ def _not_figures(objects: list[int], why: str) -> tuple[str, ...]:
     more = len(objects) - _NAMED_OBJECTS
     which = f"objects {named} and {more} more" if more > 0 else f"object{'s' if len(objects) > 1 else ''} {named}"
     return (f"{len(objects)} image(s) not emitted as figures: {why} ({which})",)
+
+
+_SCAN_COVER_THRESHOLD = 0.50
+_MIN_PAINTED_DIGITAL_CHARS = 20
+
+
+def _painted_valid_chars(pieces: tuple[SpanPiece, ...]) -> int:
+    """Count visible valid non-whitespace chars that paint ink (render_mode not in {3, 7})."""
+    return sum(
+        1
+        for piece in pieces
+        if not piece.hidden_reasons and piece.span.render_mode not in (3, 7)
+        for ch in piece.text
+        if not ch.isspace() and valid_char(ch)
+    )
+
+
+def _is_scan_mosaic_page(raw_page: RawPage, assessment: PageAssessment) -> bool:
+    """True on image-only/vision scans and searchable scans (> 50% scan cover without >= 20 painted chars)."""
+    if assessment.image_only_reasons or assessment.route == "vision":
+        return True
+    if _painted_valid_chars(assessment.pieces) >= _MIN_PAINTED_DIGITAL_CHARS:
+        return False
+    return (
+        raster_cover_fraction(raw_page.images.images, raw_page.geometry.width_pt, raw_page.geometry.height_pt)
+        > _SCAN_COVER_THRESHOLD
+    )
 
 
 def assemble_page(
@@ -578,6 +715,7 @@ def assemble_page(
         password=password,
         min_image_dimension=min_image_dimension,
         sandbox=sandbox,
+        image_only=_is_scan_mosaic_page(raw_page, assessment),
     )
     boxes = tuple(draft.bbox for draft in figures.drafts)
     layout = page_layout(
