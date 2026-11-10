@@ -272,7 +272,7 @@ _MAX_TILE_PX = 160
 
 
 def _strip_runs_by_span(entries: list[tuple[int, RawImage]], *, horizontal: bool, min_total_area: float) -> set[int]:
-    """Find zero-gap scanline strip stacks of ``>= 8`` thin strips covering ``>= 30%`` of the page in O(S log S)."""
+    """Find zero-gap advancing scanline strip stacks of ``>= 8`` strips covering ``>= 30%`` of page in O(S log S)."""
     if len(entries) < _MIN_STRIP_STACK:
         return set()
     ordered = sorted(
@@ -301,21 +301,26 @@ def _strip_runs_by_span(entries: list[tuple[int, RawImage]], *, horizontal: bool
                 else abs(curr_b[1] - prev_b[1]) <= 1.5 and abs(curr_b[3] - prev_b[3]) <= 1.5
             )
             seam = (curr_b[1] - prev_b[3]) if horizontal else (curr_b[0] - prev_b[2])
-            if same_span and -_MOSAIC_SEAM_PT <= seam <= _MOSAIC_SEAM_PT:
+            advance = (curr_b[3] - prev_b[3]) if horizontal else (curr_b[2] - prev_b[2])
+            if same_span and -_MOSAIC_SEAM_PT <= seam <= _MOSAIC_SEAM_PT and advance > 0.1:
                 chain.append(j)
                 misses = 0
             else:
                 misses += 1
                 if misses >= 8:
                     break
+        for k in chain:
+            used[k] = True
         if len(chain) >= _MIN_STRIP_STACK:
-            area = sum(
-                (ordered[k][1].bbox[2] - ordered[k][1].bbox[0]) * (ordered[k][1].bbox[3] - ordered[k][1].bbox[1])
-                for k in chain
+            first_b = ordered[chain[0]][1].bbox
+            last_b = ordered[chain[-1]][1].bbox
+            union_area = (
+                (first_b[2] - first_b[0]) * max(last_b[3] - first_b[1], 0.0)
+                if horizontal
+                else (first_b[3] - first_b[1]) * max(last_b[2] - first_b[0], 0.0)
             )
-            if area >= min_total_area:
+            if union_area >= min_total_area:
                 for k in chain:
-                    used[k] = True
                     suppressed.add(ordered[k][0])
     return suppressed
 

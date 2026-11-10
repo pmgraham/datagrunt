@@ -910,3 +910,27 @@ class TestAuditRound2PromptInjectionAndFigurePreservation:
         elapsed = time.perf_counter() - t0
         assert len(suppressed) == 5000
         assert elapsed < 1.0
+
+        # Verify _strip_stack_positions is O(S log S) on unretired sub-area chains & ignores in-place overprints
+        overprints = [
+            (
+                i,
+                RawImage(
+                    object_index=i,
+                    bbox=(150.0, 100.0, 450.0, 100.5),
+                    px_width=400,
+                    px_height=40,
+                    declared_px=(400, 40),
+                    raw_sha256=sha,
+                    filters=("FlateDecode",),
+                    bits_per_pixel=24,
+                    colorspace="DeviceRGB",
+                ),
+            )
+            for i in range(1000)
+        ]
+        t1 = time.perf_counter()
+        got_over = assembly._strip_stack_positions(overprints, 612.0, 792.0)
+        dt_over = time.perf_counter() - t1
+        assert got_over == set()
+        assert dt_over < 0.5
