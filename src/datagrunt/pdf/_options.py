@@ -109,3 +109,58 @@ class VisionOptions:
         object.__setattr__(self, "page_budget_s", positive_float("page_budget_s", self.page_budget_s))
         strict_bool("sandbox", self.sandbox)
         strict_bool("orientation_fallback", self.orientation_fallback)
+
+
+PrerenderEntry: TypeAlias = tuple[int, int, int, bytes]
+_MAX_PRERENDER_CACHE_BYTES = 128 * 1024 * 1024
+
+
+class _PrerenderCache:
+    """Bounded in-memory cache of single-load full-page PNG bytes with pop-on-write eviction."""
+
+    __slots__ = ("_entries", "_exhausted", "_max_bytes", "_used_bytes")
+
+    def __init__(self, max_bytes: int = _MAX_PRERENDER_CACHE_BYTES) -> None:
+        int_at_least("max_bytes", max_bytes, 1)
+        self._max_bytes = max_bytes
+        self._used_bytes = 0
+        self._exhausted = False
+        self._entries: dict[int, PrerenderEntry] = {}
+
+    @property
+    def is_full(self) -> bool:
+        """True once the byte budget has been reached or a MemoryError tripped."""
+        return self._exhausted or self._used_bytes >= self._max_bytes
+
+    def mark_exhausted(self) -> None:
+        """Stop further pre-render allocations for the remainder of the document."""
+        self._exhausted = True
+
+    def put(self, page_index: int, entry: PrerenderEntry) -> bool:
+        """Store ``entry`` if within ``max_bytes``; else mark full and return False."""
+        int_at_least("page_index", page_index, 0)
+        if not isinstance(entry, tuple) or len(entry) != 4 or not isinstance(entry[3], bytes):
+            raise TypeError("entry must be (dpi, px_width, px_height, png_bytes)")
+        size = len(entry[3])
+        if self.is_full or self._used_bytes + size > self._max_bytes:
+            self._exhausted = True
+            return False
+        prev = self._entries.get(page_index)
+        if prev is not None:
+            self._used_bytes -= len(prev[3])
+        self._entries[page_index] = entry
+        self._used_bytes += size
+        return True
+
+    def pop_entry(self, page_index: int) -> PrerenderEntry | None:
+        """Pop and return ``page_index``'s cached PNG tuple, freeing its bytes immediately."""
+        entry = self._entries.pop(page_index, None)
+        if entry is not None:
+            self._used_bytes -= len(entry[3])
+        return entry
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __contains__(self, page_index: object) -> bool:
+        return page_index in self._entries

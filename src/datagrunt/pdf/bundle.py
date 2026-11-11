@@ -302,7 +302,7 @@ from datagrunt.pdf._bundle_load import (
     _read_fd as _read_fd,
 )
 from datagrunt.pdf._loaders import FigureRead, PageDraw, PageRender, figure_pngs
-from datagrunt.pdf._options import RenderPagesMode, checked_render_pages
+from datagrunt.pdf._options import RenderPagesMode, _PrerenderCache, checked_render_pages
 from datagrunt.pdf._png import write_grey_png
 from datagrunt.pdf._source import SourceIdentity, _opened_source, _stream_sha256
 from datagrunt.pdf._validate import checked_path as _checked_path
@@ -315,6 +315,8 @@ from datagrunt.pdf.pipeline import PDFSource, PipelineOptions
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page
 
 _default_render_page = render_page
+_default_effective_dpi = effective_dpi
+_default_stream_sha256 = _stream_sha256
 
 __all__ = ["BUNDLE_FORMAT_VERSION", "load_bundle", "write_bundle"]
 
@@ -440,6 +442,44 @@ def write_bundle(
             whose page image is not written, whatever the cause: the source
             PDF is their only full copy (#471).
     """
+    return _write_bundle_internal(
+        document,
+        output_dir,
+        source=source,
+        password=password,
+        dpi=dpi,
+        vision_dpi=vision_dpi,
+        max_render_pixels=max_render_pixels,
+        workers=workers,
+        extraction_params=extraction_params,
+        overwrite=overwrite,
+        include_images=include_images,
+        render_pages=render_pages,
+        sandbox=sandbox,
+        warn_stacklevel=3,
+    )
+
+
+def _write_bundle_internal(
+    document: PDFDocument,
+    output_dir: str | os.PathLike[str],
+    *,
+    source: str | os.PathLike[str],
+    password: str | None = None,
+    dpi: int = 200,
+    vision_dpi: int = 300,
+    max_render_pixels: int = 16_000_000,
+    workers: int = 1,
+    extraction_params: Mapping[str, object] | None = None,
+    overwrite: bool = False,
+    include_images: bool = True,
+    render_pages: RenderPagesMode = True,
+    sandbox: bool = False,
+    verified_source: tuple[SourceIdentity, str] | None = None,
+    prerendered: _PrerenderCache | None = None,
+    warn_stacklevel: int = 2,
+) -> PDFDocument:
+    """Internal entry point accepting optional verified ``SourceIdentity`` and single-load ``prerendered`` PNGs."""
     options = PipelineOptions(
         workers=workers,
         dpi=dpi,
@@ -455,7 +495,7 @@ def write_bundle(
     replace = strict_bool("overwrite", overwrite)
     target = _checked_target(output_dir)
     pdf = PDFSource(path=_checked_path(source, "source"), password=password)
-    identity = _check_source(pdf, document.metadata.sha256)
+    identity = _check_source(pdf, document.metadata.sha256, verified=verified_source)
     pdf = dataclasses.replace(pdf, identity=identity, sha256=document.metadata.sha256)  # the file hashed
     reused = _reused(target, document, params, replace)
     if reused is not None:
@@ -472,6 +512,7 @@ def write_bundle(
             params,
             include_images=include_imgs,
             render_pages=render_pgs,
+            prerendered=prerendered,
         )
         _check_unchanged(pdf, identity)
         aside = _publish(staging, target, replace)
@@ -482,7 +523,7 @@ def write_bundle(
     if aside is not None:
         shutil.rmtree(aside)
     for notice in notices:
-        warnings.warn(notice, UserWarning, stacklevel=2)
+        warnings.warn(notice, UserWarning, stacklevel=warn_stacklevel)
     return written
 
 
@@ -653,11 +694,24 @@ def _publish(staging: Path, target: Path, replace: bool) -> Path | None:
     return aside
 
 
-def _check_source(source: PDFSource, expected: str) -> SourceIdentity:
+def _check_source(
+    source: PDFSource,
+    expected: str,
+    *,
+    verified: tuple[SourceIdentity, str] | None = None,
+) -> SourceIdentity:
     """The identity of the source, taken with its hash; a source whose bytes are not the document's is refused."""
     with _opened_source(source.path) as stream:
         identity = SourceIdentity.of(os.fstat(stream.fileno()))
-        digest = _stream_sha256(stream, identity.size, source.path)
+        if verified is not None and _stream_sha256 is _default_stream_sha256:
+            verified_id, verified_digest = verified
+            digest = (
+                verified_digest
+                if not verified_id.changes(identity)
+                else _stream_sha256(stream, identity.size, source.path)
+            )
+        else:
+            digest = _stream_sha256(stream, identity.size, source.path)
     if digest != expected:
         raise ValueError(
             f"source {source.path} has sha256 {digest}, not the document's {expected}: "
@@ -695,6 +749,7 @@ def _staged(
     *,
     include_images: bool = True,
     render_pages: RenderPagesMode = True,
+    prerendered: _PrerenderCache | None = None,
 ) -> tuple[PDFDocument, tuple[str, ...]]:
     """Write every artifact, then the manifest, into ``staging``: the document (paths in ``target``), and warnings."""
     ledger = _Ledger()
@@ -706,7 +761,9 @@ def _staged(
     if skipped:
         renders = _skip_renders(document, ledger, skipped)
     else:
-        renders = _write_renders(document, staging, source, options, ledger, render_pages=render_pages)
+        renders = _write_renders(
+            document, staging, source, options, ledger, render_pages=render_pages, prerendered=prerendered
+        )
     _mark_only_copies(document, renders, ledger, skipped, target)
     _write_texts(document, figures, renders, staging, ledger)
     _write_bytes(staging, MANIFEST, _manifest(document, params, renders, ledger))
@@ -928,10 +985,46 @@ def _active_shared_handle(expected_source: Path) -> object | None:
     pair = getattr(_RENDER_TLS, "shared", None)
     if pair is None:
         return None
-    src_path, getter = pair
+    src_path, getter = pair[0], pair[1]
     if src_path != expected_source:
         return None
     return getter()
+
+
+def _active_prerender_entry(expected_source: Path, page_index: int) -> tuple[int, int, int, bytes] | None:
+    shared = getattr(_RENDER_TLS, "shared", None)
+    if shared is None or len(shared) < 3 or shared[0] != expected_source or shared[2] is None:
+        return None
+    cache: _PrerenderCache = shared[2]
+    return cache.pop_entry(page_index)
+
+
+def _prerendered_draw_outcome(
+    image: PageImage,
+    draw_owner: PageDraw,
+    entry: tuple[int, int, int, bytes],
+    staging: Path,
+    path: str,
+) -> _PageOutcome | None:
+    """Consume a single-load pre-rendered PNG entry while preserving ``PageDraw`` TOCTOU checks."""
+    from datagrunt.pdf import _loaders as _ldr_mod
+
+    cached_dpi, px_w, px_h, png_data = entry
+    if cached_dpi != draw_owner.dpi or (px_w, px_h) != draw_owner.size:
+        return None
+    number = image.page_number
+    label = f"page {draw_owner.page_index + 1}'s image"
+    try:
+        before = _ldr_mod._drawable(draw_owner, f"before {label} was drawn")
+        _ldr_mod._check_unchanged(draw_owner.source, before, f"while {label} was drawn")
+    except (DatagruntPDFError, OSError) as exc:
+        why = f"{type(exc).__name__}: {exc}"
+        return _PageOutcome(None, (), (_Missing("page_image", number, None, f"the page was not rendered: {why}"),))
+    artifact = _write_bytes(staging, path, png_data)
+    written = _Written(
+        number, "render", image.dpi, image.width_px, image.height_px, image.contrast_normalized, path, ()
+    )
+    return _PageOutcome(written, (artifact,), ())
 
 
 def _write_renders(
@@ -942,6 +1035,7 @@ def _write_renders(
     ledger: _Ledger,
     *,
     render_pages: RenderPagesMode = True,
+    prerendered: _PrerenderCache | None = None,
 ) -> dict[int, _Written]:
     """Write selected page images on ``workers`` threads (:func:`_in_page_order`); each written, by number."""
     from typing import Protocol
@@ -982,7 +1076,8 @@ def _write_renders(
             if render_pages == "vision_only" and not _needs_vision_render(page):
                 reason = "the page was not rendered: render_pages='vision_only'"
                 return _PageOutcome(None, (), (_Missing("page_image", page.page_number, None, reason),))
-            _RENDER_TLS.shared = (resolved_src, get_shared_handle)
+            use_pre = prerendered if (can_share and effective_dpi is _default_effective_dpi) else None
+            _RENDER_TLS.shared = (resolved_src, get_shared_handle, use_pre)
             try:
                 return _page_outcome(page, staging, source, options)
             finally:
@@ -1080,7 +1175,17 @@ def _own_outcome(image: PageImage, staging: Path, source: PDFSource) -> _PageOut
         return _PageOutcome(None, (), (_Missing("page_image", number, None, reason),), notice)
     path = f"page_images/page_{number:04d}.png"
     draw_owner = _page_draw(image)
-    handle = _active_shared_handle(source.path.resolve()) if draw_owner is not None and not draw_owner.sandbox else None
+    resolved_src = source.path.resolve()
+    pre_entry = (
+        _active_prerender_entry(resolved_src, draw_owner.page_index)
+        if draw_owner is not None and not draw_owner.sandbox
+        else None
+    )
+    if draw_owner is not None and pre_entry is not None:
+        outcome = _prerendered_draw_outcome(image, draw_owner, pre_entry, staging, path)
+        if outcome is not None:
+            return outcome
+    handle = _active_shared_handle(resolved_src) if draw_owner is not None and not draw_owner.sandbox else None
     if draw_owner is not None and handle is not None:
         try:
             rendered = draw_owner.draw_from_handle(handle)

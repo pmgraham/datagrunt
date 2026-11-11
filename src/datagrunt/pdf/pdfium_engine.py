@@ -189,7 +189,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, NoReturn
+from typing import Literal, NamedTuple, NoReturn
 
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
@@ -214,6 +214,7 @@ from datagrunt.pdf._pdfium_images import (
     PixelFacts,
     RawImage,
     collect_images,
+    collect_images_and_refusal,
     declared_size,
     decoded_png,
     decoded_png_detached,
@@ -248,6 +249,8 @@ from datagrunt.pdf._validate import (
 )
 from datagrunt.pdf.elements import _MAX_ASSET_BYTES
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFEncryptedError
+
+collect_images_from_img_mod = collect_images
 
 __all__ = [
     "DocumentHandle",
@@ -314,10 +317,17 @@ def _fast_user_box(box: object) -> Box | None:
     if type(box) is not tuple or len(box) != 4:
         return None
     left, bottom, right, top = box
-    if not all(type(val) is float or type(val) is int for val in (left, bottom, right, top)):
+    t0, t1, t2, t3 = type(left), type(bottom), type(right), type(top)
+    if not (
+        (t0 is float or t0 is int)
+        and (t1 is float or t1 is int)
+        and (t2 is float or t2 is int)
+        and (t3 is float or t3 is int)
+    ):
         return None
     fl, fb, fr, ft = float(left), float(bottom), float(right), float(top)
-    if not (math.isfinite(fl) and math.isfinite(fb) and math.isfinite(fr) and math.isfinite(ft)):
+    isfinite = math.isfinite
+    if not (isfinite(fl) and isfinite(fb) and isfinite(fr) and isfinite(ft)):
         return None
     return (fl, fb, fr, ft) if fl <= fr and fb <= ft else None
 
@@ -691,33 +701,28 @@ def _children(
     return children
 
 
-def _page_objects(page_raw: pdfium_c.FPDF_PAGE, *, max_objects: int) -> list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]:
-    """Every page object in depth-first paint order (a form, then its contents), within ``max_objects``.
-
-    Each comes with the walk index of the form that holds it, -1 for none.
-    Every walk names its bound: extraction's and a loader's
-    :data:`MAX_PAGE_OBJECTS`, the render guard's its own. WalkBoundHit is
-    raised rather than passing either bound: when the page and the forms it
-    opens hold more than ``max_objects`` objects (checked on pdfium's counts,
-    before those objects are read), or when a form nested past
-    ``_MAX_FORM_DEPTH`` holds any object (pdfium parses forms 40 deep, so a
-    form past 64 holds none).
-    """
+def _page_objects_and_types(
+    page_raw: pdfium_c.FPDF_PAGE, *, max_objects: int
+) -> tuple[list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]], list[int]]:
+    """Every page object in depth-first paint order plus its ``FPDFPageObj_GetType`` code."""
     count = pdfium_c.FPDFPage_CountObjects(page_raw)
     total = _counted(0, count, max_objects, "the page holds {count} objects, over the walk's {bound}-object bound")
     top = _children(count, partial(pdfium_c.FPDFPage_GetObject, page_raw), "the page")
     ordered: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] = []
+    kinds: list[int] = []
+    get_type = pdfium_c.FPDFPageObj_GetType
+    form_kind = pdfium_c.FPDF_PAGEOBJ_FORM
     stack = [(iter(top), -1)]
-    # Bounded: one pass per object and one per form, each from a pdfium count,
-    # and the stack never holds more than _MAX_FORM_DEPTH + 1 levels.
     while stack:
         siblings, parent = stack[-1]
         child = next(siblings, None)
         if child is None:
             stack.pop()
             continue
+        kind = get_type(child)
         ordered.append((child, parent))
-        if pdfium_c.FPDFPageObj_GetType(child) != pdfium_c.FPDF_PAGEOBJ_FORM:
+        kinds.append(kind)
+        if kind != form_kind:
             continue
         form_index, count = len(ordered) - 1, pdfium_c.FPDFFormObj_CountObjects(child)
         owner = f"form object {form_index}"
@@ -730,7 +735,12 @@ def _page_objects(page_raw: pdfium_c.FPDF_PAGE, *, max_objects: int) -> list[tup
         over = owner + " holds {count} objects, which take the page over the walk's {bound}-object bound"
         total = _counted(total, count, max_objects, over)
         stack.append((iter(_children(count, partial(pdfium_c.FPDFFormObj_GetObject, child), owner)), form_index))
-    return ordered
+    return ordered, kinds
+
+
+def _page_objects(page_raw: pdfium_c.FPDF_PAGE, *, max_objects: int) -> list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]:
+    """Every page object in depth-first paint order (a form, then its contents), within ``max_objects``."""
+    return _page_objects_and_types(page_raw, max_objects=max_objects)[0]
 
 
 def _counted(total: int, count: int, max_objects: int, message: str) -> int:
@@ -744,11 +754,21 @@ def _counted(total: int, count: int, max_objects: int, message: str) -> int:
     return added
 
 
-def _text_walk(objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]) -> ObjectWalk:
-    """The walk as the text stage reads it: each object's index, the text objects, and which draw no glyph."""
-    indices = {object_address(obj): index for index, (obj, _form) in enumerate(objects)}
-    texts = (obj for obj, _form in objects if pdfium_c.FPDFPageObj_GetType(obj) == pdfium_c.FPDF_PAGEOBJ_TEXT)
-    return ObjectWalk(indices, frozenset(object_address(obj) for obj in texts), partial(_glyphless, objects, indices))
+def _text_walk(objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]], kinds: list[int] | None = None) -> ObjectWalk:
+    """The walk as the text stage reads it: each text object's index and address, and which draw no glyph."""
+    text_kind = pdfium_c.FPDF_PAGEOBJ_TEXT
+    if kinds is None:
+        get_type = pdfium_c.FPDFPageObj_GetType
+        indices = {
+            object_address(obj): index for index, (obj, _form) in enumerate(objects) if get_type(obj) == text_kind
+        }
+    else:
+        indices = {
+            object_address(obj): index
+            for index, ((obj, _form), kind) in enumerate(zip(objects, kinds, strict=True))
+            if kind == text_kind
+        }
+    return ObjectWalk(indices, frozenset(indices), partial(_glyphless, objects, indices))
 
 
 def _glyphless(objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]], indices: dict[int, int], address: int) -> bool:
@@ -790,15 +810,23 @@ def _opened_textpage(page: pdfium.PdfPage, page_number: int) -> Iterator[pdfium.
         textpage.close()
 
 
+def _read_page_text_objects_and_types(
+    page: pdfium.PdfPage, geometry: PageGeometry
+) -> tuple[PageText, list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]], list[int]]:
+    """Read a loaded page's spans, walked object tree, and object types once, closing its textpage."""
+    page_number = geometry.page_number
+    with _opened_textpage(page, page_number) as textpage, _pdfium_errors(page_number):
+        objects, kinds = _page_objects_and_types(page.raw, max_objects=MAX_PAGE_OBJECTS)
+        walk = _text_walk(objects, kinds)
+        return collect_text(textpage.raw, _display_mapping(geometry), walk).page_text, objects, kinds
+
+
 def _read_page_text_and_objects(
     page: pdfium.PdfPage, geometry: PageGeometry
 ) -> tuple[PageText, list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]]:
     """Read a loaded page's spans and walked object tree once, closing its textpage."""
-    page_number = geometry.page_number
-    with _opened_textpage(page, page_number) as textpage, _pdfium_errors(page_number):
-        objects = _page_objects(page.raw, max_objects=MAX_PAGE_OBJECTS)
-        walk = _text_walk(objects)
-        return collect_text(textpage.raw, _display_mapping(geometry), walk).page_text, objects
+    text, objects, _kinds = _read_page_text_objects_and_types(page, geometry)
+    return text, objects
 
 
 def _read_page_text(page: pdfium.PdfPage, geometry: PageGeometry) -> PageText:
@@ -924,10 +952,30 @@ def _read_points(path: pdfium_c.FPDF_PAGEOBJECT, label: str, room: _SegmentRoom)
     return _read_counted_points(path, count, label)
 
 
-def _read_counted_points(path: pdfium_c.FPDF_PAGEOBJECT, count: int, label: str) -> list[PathPoint]:
+class _PathScratch:
+    """Reusable ctypes buffers hoisted once per page walk to avoid per-object allocations."""
+
+    __slots__ = ("bounds", "fill_mode", "fs_matrix", "pt_xy", "rgba", "stroke", "stroke_width")
+
+    def __init__(self) -> None:
+        self.fs_matrix = pdfium_c.FS_MATRIX()
+        self.bounds = (ctypes.c_float(), ctypes.c_float(), ctypes.c_float(), ctypes.c_float())
+        self.fill_mode = ctypes.c_int()
+        self.stroke = ctypes.c_int()
+        self.stroke_width = ctypes.c_float()
+        self.rgba = (ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint())
+        self.pt_xy = (ctypes.c_float(), ctypes.c_float())
+
+
+def _read_counted_points(
+    path: pdfium_c.FPDF_PAGEOBJECT,
+    count: int,
+    label: str,
+    pt_xy: tuple[ctypes.c_float, ctypes.c_float] | None = None,
+) -> list[PathPoint]:
     """Read ``count`` already-charged path segments from ``path``."""
     points: list[PathPoint] = []
-    x, y = ctypes.c_float(), ctypes.c_float()
+    x, y = (ctypes.c_float(), ctypes.c_float()) if pt_xy is None else pt_xy
     make_pt = PathPoint
     get_seg = pdfium_c.FPDFPath_GetPathSegment
     get_type = pdfium_c.FPDFPathSegment_GetType
@@ -943,9 +991,9 @@ def _read_counted_points(path: pdfium_c.FPDF_PAGEOBJECT, count: int, label: str)
     return points
 
 
-def _read_matrix(obj: pdfium_c.FPDF_PAGEOBJECT, label: str) -> Matrix:
+def _read_matrix(obj: pdfium_c.FPDF_PAGEOBJECT, label: str, raw_buf: pdfium_c.FS_MATRIX | None = None) -> Matrix:
     """Read a page object's matrix (path_segments skips a path whose composed matrix is not finite)."""
-    raw = pdfium_c.FS_MATRIX()
+    raw = pdfium_c.FS_MATRIX() if raw_buf is None else raw_buf
     if not pdfium_c.FPDFPageObj_GetMatrix(obj, raw):
         raise PdfiumFailure(f"read the matrix of {label}")
     return Matrix(raw.a, raw.b, raw.c, raw.d, raw.e, raw.f)
@@ -971,34 +1019,56 @@ def _own_precancel_mag(own: Matrix, l_v: float, b_v: float, r_v: float, t_v: flo
     return bound if math.isfinite(bound) else None
 
 
-def _culled_by_outer_bounds(path: pdfium_c.FPDF_PAGEOBJECT, *, own: Matrix, outer: Matrix) -> bool:
-    """True when ``FPDFPageObj_GetBounds(path)`` mapped by ``outer`` is provably < 11.9 pt in both axes.
-
-    PDFium's ``FPDFPageObj_GetBounds`` already applies ``own`` in binary32 float;
-    ``_own_precancel_mag`` bounds intermediate float32 terms before ``own``
-    translation or shear cancellation so scaled/UTM paths never under-bound ULPs.
-    """
-    left, bottom, right, top = ctypes.c_float(), ctypes.c_float(), ctypes.c_float(), ctypes.c_float()
-    if not pdfium_c.FPDFPageObj_GetBounds(path, left, bottom, right, top):
-        return False
-    l_v, b_v, r_v, t_v = left.value, bottom.value, right.value, top.value
+def _culled_from_bounds(l_v: float, b_v: float, r_v: float, t_v: float, *, own: Matrix, outer: Matrix) -> bool:
+    """True when pre-read ``(l_v, b_v, r_v, t_v)`` mapped by ``outer`` is provably < 11.9 pt in both axes."""
     isfinite = math.isfinite
     if not (isfinite(l_v) and isfinite(b_v) and isfinite(r_v) and isfinite(t_v)):
         return False
     pre_mag = _own_precancel_mag(own, l_v, b_v, r_v, t_v)
     if pre_mag is None:
         return False
-    if outer == IDENTITY:
+    if outer is IDENTITY or outer == IDENTITY:
         slack = pre_mag * 1e-5
         return isfinite(slack) and (abs(r_v - l_v) + slack) < _FAST_CULL_PT and (abs(t_v - b_v) + slack) < _FAST_CULL_PT
     oa, ob, oc, od, oe, of_ = outer
     scale = max(abs(oa) + abs(oc), abs(ob) + abs(od))
     slack = pre_mag * scale * 1e-5
-    xs = (oa * l_v + oc * b_v + oe, oa * r_v + oc * b_v + oe, oa * l_v + oc * t_v + oe, oa * r_v + oc * t_v + oe)
-    ys = (ob * l_v + od * b_v + of_, ob * r_v + od * b_v + of_, ob * l_v + od * t_v + of_, ob * r_v + od * t_v + of_)
-    if not (all(isfinite(v) for v in xs) and all(isfinite(v) for v in ys) and isfinite(slack)):
+    x0, x1 = oa * l_v + oc * b_v + oe, oa * r_v + oc * b_v + oe
+    x2, x3 = oa * l_v + oc * t_v + oe, oa * r_v + oc * t_v + oe
+    y0, y1 = ob * l_v + od * b_v + of_, ob * r_v + od * b_v + of_
+    y2, y3 = ob * l_v + od * t_v + of_, ob * r_v + od * t_v + of_
+    all_fin = (
+        isfinite(x0)
+        and isfinite(x1)
+        and isfinite(x2)
+        and isfinite(x3)
+        and isfinite(y0)
+        and isfinite(y1)
+        and isfinite(y2)
+        and isfinite(y3)
+        and isfinite(slack)
+    )
+    if not all_fin:
         return False
-    return (max(xs) - min(xs) + slack) < _FAST_CULL_PT and (max(ys) - min(ys) + slack) < _FAST_CULL_PT
+    return (max(x0, x1, x2, x3) - min(x0, x1, x2, x3) + slack) < _FAST_CULL_PT and (
+        max(y0, y1, y2, y3) - min(y0, y1, y2, y3) + slack
+    ) < _FAST_CULL_PT
+
+
+def _culled_by_outer_bounds(
+    path: pdfium_c.FPDF_PAGEOBJECT,
+    *,
+    own: Matrix,
+    outer: Matrix,
+    bounds_buf: tuple[ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float] | None = None,
+) -> bool:
+    """True when ``FPDFPageObj_GetBounds(path)`` mapped by ``outer`` is provably < 11.9 pt in both axes."""
+    left, bottom, right, top = (
+        (ctypes.c_float(), ctypes.c_float(), ctypes.c_float(), ctypes.c_float()) if bounds_buf is None else bounds_buf
+    )
+    if not pdfium_c.FPDFPageObj_GetBounds(path, left, bottom, right, top):
+        return False
+    return _culled_from_bounds(left.value, bottom.value, right.value, top.value, own=own, outer=outer)
 
 
 def _path_object_segments(
@@ -1010,20 +1080,19 @@ def _path_object_segments(
     *,
     own: Matrix = IDENTITY,
     outer: Matrix = IDENTITY,
+    scratch: _PathScratch | None = None,
 ) -> list[RawSegment] | None:
-    """The segments of path object ``index`` (matrix to page space ``matrix``), or None if its geometry is not finite.
-
-    pdfium call failures raise, and so does a path past the page's segment
-    bound (``room``); non-finite geometry is a fact of the page (pdfium
-    renders the rest of it), so only that path is skipped.
-    """
+    """The segments of path object ``index`` (matrix to page space ``matrix``), or None if non-finite."""
     label = f"object {index}"
-    fill_mode, stroke = ctypes.c_int(), ctypes.c_int()
+    fill_mode, stroke = (ctypes.c_int(), ctypes.c_int()) if scratch is None else (scratch.fill_mode, scratch.stroke)
     if not pdfium_c.FPDFPath_GetDrawMode(path, fill_mode, stroke) or fill_mode.value not in _FILL_MODES:
         raise PdfiumFailure(f"read the draw mode of {label}")
-    width = ctypes.c_float()
-    if stroke.value and not pdfium_c.FPDFPageObj_GetStrokeWidth(path, width):
-        raise PdfiumFailure(f"read the stroke width of {label}")
+    width = ctypes.c_float() if scratch is None else scratch.stroke_width
+    width_val = 0.0
+    if stroke.value:
+        if not pdfium_c.FPDFPageObj_GetStrokeWidth(path, width):
+            raise PdfiumFailure(f"read the stroke width of {label}")
+        width_val = width.value
     count = pdfium_c.FPDFPath_CountSegments(path)
     if count < 0:
         raise PdfiumFailure(f"count the path segments of {label}")
@@ -1032,21 +1101,22 @@ def _path_object_segments(
     if (
         count > 0
         and painted
-        and all(math.isfinite(v) for v in matrix)
-        and all(math.isfinite(v) for v in own)
-        and math.isfinite(width.value)
-        and _culled_by_outer_bounds(path, own=own, outer=outer)
+        and matrix.is_finite()
+        and (matrix is own or own.is_finite())
+        and math.isfinite(width_val)
+        and _culled_by_outer_bounds(path, own=own, outer=outer, bounds_buf=None if scratch is None else scratch.bounds)
     ):
         return []
+    rgba_buf = None if scratch is None else scratch.rgba
     paint = PathPaint(
         stroked=bool(stroke.value),
         filled=fill_mode.value != pdfium_c.FPDF_FILLMODE_NONE,
-        stroke_width=width.value,
+        stroke_width=width_val,
         dashed=bool(stroke.value) and _leaves_gaps(_read_dashes(path, label)),
-        stroke_rgba=read_rgba(pdfium_c.FPDFPageObj_GetStrokeColor, path, f"stroke colour of {label}"),
-        fill_rgba=read_rgba(pdfium_c.FPDFPageObj_GetFillColor, path, f"fill colour of {label}"),
+        stroke_rgba=read_rgba(pdfium_c.FPDFPageObj_GetStrokeColor, path, f"stroke colour of {label}", rgba_buf),
+        fill_rgba=read_rgba(pdfium_c.FPDFPageObj_GetFillColor, path, f"fill colour of {label}", rgba_buf),
     )
-    points = _read_counted_points(path, count, label)
+    points = _read_counted_points(path, count, label, None if scratch is None else scratch.pt_xy)
     try:
         return path_segments(points, matrix=matrix, paint=paint, object_index=index, to_display=to_display)
     except NonFiniteGeometry:
@@ -1099,6 +1169,39 @@ def _display_mapping(geometry: PageGeometry) -> Callable[[Box], Box]:
     return partial(_to_display_checked, rotation=rotation, page_box=checked_page)
 
 
+def _display_coords_fn(geometry: PageGeometry) -> Callable[[float, float, float, float], Box]:
+    """Direct 4-float display mapper for engine-verified finite ordered user-space coordinates."""
+    rotation = _checked_rotation(geometry.rotation_deg)
+    page_left, page_bottom, page_right, page_top = _checked_box("page_box", geometry.page_box, allow_empty=False)
+    if rotation == 0:
+        return lambda left, bottom, right, top: (
+            left - page_left,
+            page_top - top,
+            right - page_left,
+            page_top - bottom,
+        )
+    if rotation == 90:
+        return lambda left, bottom, right, top: (
+            bottom - page_bottom,
+            left - page_left,
+            top - page_bottom,
+            right - page_left,
+        )
+    if rotation == 180:
+        return lambda left, bottom, right, top: (
+            page_right - right,
+            bottom - page_bottom,
+            page_right - left,
+            top - page_bottom,
+        )
+    return lambda left, bottom, right, top: (
+        page_top - top,
+        page_right - right,
+        page_top - bottom,
+        page_right - left,
+    )
+
+
 def _collect_segments(
     page_raw: pdfium_c.FPDF_PAGE,
     geometry: PageGeometry,
@@ -1112,9 +1215,11 @@ def _collect_segments(
     segments: list[RawSegment] = []
     skipped = 0
     room = _SegmentRoom()
+    scratch = _PathScratch()
     try:
         for index, path, own, outer in _objects_in_forms(walked, pdfium_c.FPDF_PAGEOBJ_PATH):
-            found = _path_object_segments(path, index, own.then(outer), to_display, room, own=own, outer=outer)
+            matrix = own if (outer is IDENTITY and own.is_finite()) else own.then(outer)
+            found = _path_object_segments(path, index, matrix, to_display, room, own=own, outer=outer, scratch=scratch)
             if found is None:
                 skipped += 1
             else:
@@ -1122,11 +1227,11 @@ def _collect_segments(
     except WalkBoundHit as exc:
         if not allow_segment_overflow:
             raise
-        return PageSegments(
-            segments=(),
-            stats=SegmentStats(skipped_nonfinite_paths=skipped, segment_bound_hit=str(exc)),
+        return PageSegments._trusted(
+            (),
+            SegmentStats(skipped_nonfinite_paths=skipped, segment_bound_hit=str(exc)),
         )
-    return PageSegments(segments=tuple(segments), stats=SegmentStats(skipped_nonfinite_paths=skipped))
+    return PageSegments._trusted(tuple(segments), SegmentStats(skipped_nonfinite_paths=skipped))
 
 
 def _read_segments(
@@ -1175,15 +1280,46 @@ def page_segments(handle: DocumentHandle, index: int) -> PageSegments:
             page.close()
 
 
+def _placed_from_entries(
+    entries: list[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix]],
+) -> Iterator[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix]]:
+    """Compose each pre-filtered object's own matrix with its enclosing form ``outer`` matrix."""
+    raw_buf = pdfium_c.FS_MATRIX()
+    for index, obj, outer in entries:
+        own = _read_matrix(obj, f"object {index}", raw_buf)
+        yield index, obj, own.then(outer)
+
+
+def _read_images_and_refusal(
+    page: pdfium.PdfPage,
+    geometry: PageGeometry,
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
+    *,
+    image_entries: list[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix]] | None = None,
+) -> tuple[PageImages, str | None]:
+    """Read a loaded page's image objects plus its first render-guard refusal string (if any)."""
+    with _pdfium_errors(geometry.page_number):
+        placed = (
+            _placed_from_entries(image_entries)
+            if image_entries is not None
+            else _placed_objects(page.raw, pdfium_c.FPDF_PAGEOBJ_IMAGE, max_objects=MAX_PAGE_OBJECTS, objects=objects)
+        )
+        to_disp = _display_mapping(geometry)
+        if collect_images is not collect_images_from_img_mod:
+            return collect_images(placed, page.raw, geometry.page_box, to_disp), None
+        return collect_images_and_refusal(placed, page.raw, geometry.page_box, to_disp)
+
+
 def _read_images(
     page: pdfium.PdfPage,
     geometry: PageGeometry,
     objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]] | None = None,
+    *,
+    image_entries: list[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix]] | None = None,
 ) -> PageImages:
     """Read a loaded page's image objects (no pixel is decoded)."""
-    with _pdfium_errors(geometry.page_number):
-        placed = _placed_objects(page.raw, pdfium_c.FPDF_PAGEOBJ_IMAGE, max_objects=MAX_PAGE_OBJECTS, objects=objects)
-        return collect_images(placed, page.raw, geometry.page_box, _display_mapping(geometry))
+    imgs, _refusal = _read_images_and_refusal(page, geometry, objects=objects, image_entries=image_entries)
+    return imgs
 
 
 def page_images(handle: DocumentHandle, index: int) -> PageImages:
@@ -1329,15 +1465,73 @@ def _visible_rgba(r: int, g: int, b: int, a: int) -> bool:
     return a >= _MIN_VISIBLE_ALPHA and ((255 - r) ** 2 + (255 - g) ** 2 + (255 - b) ** 2) >= _WHITE_DIST_SQ
 
 
-def _is_visible_glyph_path(obj: pdfium_c.FPDF_PAGEOBJECT, box: Box) -> bool:
+def _within_glyph_envelope(bw: float, bh: float) -> bool:
+    """Fast reject before FFI colour/segment checks when ``(bw, bh)`` exceeds glyph or word bounds."""
+    if bw <= 0.0 and bh <= 0.0:
+        return False
+    minor, major = (bw, bh) if bw <= bh else (bh, bw)
+    return major <= _MAX_COMPOUND_MAJOR_PT and minor <= _MAX_GLYPH_PATH_PT
+
+
+def _is_glyph_from_paint(
+    box: Box,
+    segs: int,
+    *,
+    stroked: bool,
+    filled: bool,
+    stroke_rgba: tuple[int, int, int, int],
+    fill_rgba: tuple[int, int, int, int],
+) -> bool:
+    """Glyph/word-scale check reusing already-read draw mode, segment count, and RGBA tuples."""
+    bw, bh = box[2] - box[0], box[3] - box[1]
+    if not _within_glyph_envelope(bw, bh):
+        return False
+    stroke_visible = stroked and _visible_rgba(*stroke_rgba)
+    fill_visible = not stroke_visible and filled and _visible_rgba(*fill_rgba)
+    if not (stroke_visible or fill_visible):
+        return False
+    return _is_glyph_or_word_scale(bw, bh, segs, stroked=stroke_visible)
+
+
+def _is_visible_glyph_from_mode(
+    obj: pdfium_c.FPDF_PAGEOBJECT,
+    box: Box,
+    segs: int,
+    *,
+    stroked: bool,
+    filled: bool,
+    rgba_buf: tuple[ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint],
+) -> bool:
+    """Glyph/word-scale check reusing already-read ``stroked``, ``filled``, and ``segs``."""
+    bw, bh = box[2] - box[0], box[3] - box[1]
+    if not _within_glyph_envelope(bw, bh):
+        return False
+    r, g, b, a = rgba_buf
+    stroke_visible = bool(
+        stroked
+        and pdfium_c.FPDFPageObj_GetStrokeColor(obj, r, g, b, a)
+        and _visible_rgba(r.value, g.value, b.value, a.value)
+    )
+    fill_visible = not stroke_visible and bool(
+        filled
+        and pdfium_c.FPDFPageObj_GetFillColor(obj, r, g, b, a)
+        and _visible_rgba(r.value, g.value, b.value, a.value)
+    )
+    if not (stroke_visible or fill_visible):
+        return False
+    return _is_glyph_or_word_scale(bw, bh, segs, stroked=stroke_visible)
+
+
+def _is_visible_glyph_path(obj: pdfium_c.FPDF_PAGEOBJECT, box: Box, scratch: _PathScratch | None = None) -> bool:
     """True when ``obj`` is a glyph/word-scale path painting visible non-white ink (SHX/outlined CAD glyphs)."""
     bw, bh = box[2] - box[0], box[3] - box[1]
-    if (bw <= 0.0 and bh <= 0.0) or max(bw, bh) > _MAX_COMPOUND_MAJOR_PT or min(bw, bh) > _MAX_GLYPH_PATH_PT:
+    if not _within_glyph_envelope(bw, bh):
         return False
-    fill_mode, stroke = ctypes.c_int(), ctypes.c_int()
+    fill_mode, stroke = (ctypes.c_int(), ctypes.c_int()) if scratch is None else (scratch.fill_mode, scratch.stroke)
     if not pdfium_c.FPDFPath_GetDrawMode(obj, fill_mode, stroke):
         return False
-    r, g, b, a = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
+    rgba = (ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()) if scratch is None else scratch.rgba
+    r, g, b, a = rgba
     stroke_visible = bool(
         stroke.value
         and pdfium_c.FPDFPageObj_GetStrokeColor(obj, r, g, b, a)
@@ -1389,6 +1583,66 @@ class ObjectBoxes:
         )
         object.__setattr__(self, "glyph_stroke_boxes", checked_glyphs)
 
+    @classmethod
+    def _trusted(
+        cls,
+        boxes: tuple[Box, ...],
+        unboxed: int,
+        glyph_stroke_boxes: tuple[Box, ...] = (),
+    ) -> "ObjectBoxes":
+        """Construct from engine-validated ordered finite float boxes without O(N) re-validation."""
+        if not isinstance(boxes, tuple) or not isinstance(glyph_stroke_boxes, tuple):
+            raise TypeError("boxes and glyph_stroke_boxes must be tuples")
+        if isinstance(unboxed, bool) or not isinstance(unboxed, int) or unboxed < 0:
+            raise ValueError(f"unboxed must be an int >= 0, got {unboxed!r}")
+        self = object.__new__(cls)
+        object.__setattr__(self, "boxes", boxes)
+        object.__setattr__(self, "unboxed", unboxed)
+        object.__setattr__(self, "glyph_stroke_boxes", glyph_stroke_boxes)
+        return self
+
+
+def _box_from_raw_coords(
+    l_v: float,
+    b_v: float,
+    r_v: float,
+    t_v: float,
+    outer: Matrix,
+    to_coords: Callable[[float, float, float, float], Box],
+) -> Box | None:
+    """Map pre-read ``(l_v, b_v, r_v, t_v)`` through ``outer`` and 4-float ``to_coords``."""
+    isfinite = math.isfinite
+    if outer is IDENTITY or outer == IDENTITY:
+        if not (isfinite(l_v) and isfinite(b_v) and isfinite(r_v) and isfinite(t_v)):
+            return None
+        x0, x1 = (l_v + 0.0, r_v + 0.0) if l_v <= r_v else (r_v + 0.0, l_v + 0.0)
+        y0, y1 = (b_v + 0.0, t_v + 0.0) if b_v <= t_v else (t_v + 0.0, b_v + 0.0)
+        return to_coords(x0, y0, x1, y1)
+    oa, ob, oc, od, oe, of_ = outer
+    x0, x1 = oa * l_v + oc * b_v + oe, oa * r_v + oc * b_v + oe
+    x2, x3 = oa * l_v + oc * t_v + oe, oa * r_v + oc * t_v + oe
+    y0, y1 = ob * l_v + od * b_v + of_, ob * r_v + od * b_v + of_
+    y2, y3 = ob * l_v + od * t_v + of_, ob * r_v + od * t_v + of_
+    if not (
+        isfinite(x0)
+        and isfinite(x1)
+        and isfinite(x2)
+        and isfinite(x3)
+        and isfinite(y0)
+        and isfinite(y1)
+        and isfinite(y2)
+        and isfinite(y3)
+    ):
+        return None
+    return to_coords(min(x0, x1, x2, x3), min(y0, y1, y2, y3), max(x0, x1, x2, x3), max(y0, y1, y2, y3))
+
+
+def _box_from_raw_bounds(
+    l_v: float, b_v: float, r_v: float, t_v: float, outer: Matrix, to_display: Callable[[Box], Box]
+) -> Box | None:
+    """Map pre-read ``(l_v, b_v, r_v, t_v)`` through ``outer`` and ``to_display``."""
+    return _box_from_raw_coords(l_v, b_v, r_v, t_v, outer, lambda x0, y0, x1, y1: to_display((x0, y0, x1, y1)))
+
 
 def _collect_object_boxes(
     page_raw: pdfium_c.FPDF_PAGE,
@@ -1402,24 +1656,23 @@ def _collect_object_boxes(
     boxes: list[Box] = []
     glyph_boxes: list[Box] = []
     unboxed = 0
-    bounds_buf = (ctypes.c_float(), ctypes.c_float(), ctypes.c_float(), ctypes.c_float())
+    scratch = _PathScratch()
     for index, (obj, form) in enumerate(walked):  # bounded: the walk's objects
         kind = pdfium_c.FPDFPageObj_GetType(obj)
         outer = form_matrices[form] if form >= 0 else IDENTITY
         if kind == pdfium_c.FPDF_PAGEOBJ_FORM:
-            # A form paints nothing of its own: the walk visits its contents next, and boxes each.
-            form_matrices[index] = _read_matrix(obj, f"object {index}").then(outer)
+            form_matrices[index] = _read_matrix(obj, f"object {index}", scratch.fs_matrix).then(outer)
             continue
         if kind == pdfium_c.FPDF_PAGEOBJ_TEXT:
             continue
-        box = _object_box(obj, outer, to_display, bounds_buf)
+        box = _object_box(obj, outer, to_display, scratch.bounds)
         if box is None:
             unboxed += 1
         else:
             boxes.append(box)
-            if kind == pdfium_c.FPDF_PAGEOBJ_PATH and _is_visible_glyph_path(obj, box):
+            if kind == pdfium_c.FPDF_PAGEOBJ_PATH and _is_visible_glyph_path(obj, box, scratch):
                 glyph_boxes.append(box)
-    return ObjectBoxes(boxes=tuple(boxes), unboxed=unboxed, glyph_stroke_boxes=tuple(glyph_boxes))
+    return ObjectBoxes._trusted(tuple(boxes), unboxed, tuple(glyph_boxes))
 
 
 def _object_box(
@@ -1434,11 +1687,7 @@ def _object_box(
     )
     if not pdfium_c.FPDFPageObj_GetBounds(obj, left, bottom, right, top):
         return None
-    corners = [outer.apply(x, y) for x in (left.value, right.value) for y in (bottom.value, top.value)]
-    xs, ys = [corner[0] for corner in corners], [corner[1] for corner in corners]
-    if not all(math.isfinite(value) for value in (*xs, *ys)):
-        return None
-    return to_display((min(xs), min(ys), max(xs), max(ys)))
+    return _box_from_raw_bounds(left.value, bottom.value, right.value, top.value, outer, to_display)
 
 
 def _read_object_boxes(
@@ -1587,22 +1836,246 @@ def extract_page(handle: DocumentHandle, index: int, *, allow_segment_overflow: 
             page.close()
 
 
-def _read_stages(
+class _FusedWalkState:
+    """Mutable accumulator for single-pass segments + object_boxes + image placement walk."""
+
+    __slots__ = (
+        "allow_overflow",
+        "boxes",
+        "glyph_boxes",
+        "image_entries",
+        "room",
+        "scratch",
+        "seg_overflow",
+        "segments",
+        "skipped",
+        "to_coords",
+        "to_display",
+        "unboxed",
+    )
+
+    def __init__(
+        self,
+        to_display: Callable[[Box], Box],
+        to_coords: Callable[[float, float, float, float], Box],
+        *,
+        allow_overflow: bool,
+    ) -> None:
+        self.to_display = to_display
+        self.to_coords = to_coords
+        self.allow_overflow = allow_overflow
+        self.scratch = _PathScratch()
+        self.room = _SegmentRoom()
+        self.segments: list[RawSegment] = []
+        self.skipped = 0
+        self.seg_overflow: str | None = None
+        self.boxes: list[Box] = []
+        self.glyph_boxes: list[Box] = []
+        self.unboxed = 0
+        self.image_entries: list[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix]] = []
+
+
+def _step_overflow_path_box(state: _FusedWalkState, obj: pdfium_c.FPDF_PAGEOBJECT, outer: Matrix) -> None:
+    """Collect object and glyph boxes after ``MAX_PAGE_SEGMENTS`` overflow stopped segment collection."""
+    box = _object_box(obj, outer, state.to_display, state.scratch.bounds)
+    if box is None:
+        state.unboxed += 1
+    else:
+        state.boxes.append(box)
+        if _is_visible_glyph_path(obj, box, state.scratch):
+            state.glyph_boxes.append(box)
+
+
+def _step_fused_path(state: _FusedWalkState, obj: pdfium_c.FPDF_PAGEOBJECT, index: int, outer: Matrix) -> None:
+    """Inspect one path object once for both ``PageSegments`` and ``ObjectBoxes``."""
+    if state.seg_overflow is not None:
+        _step_overflow_path_box(state, obj, outer)
+        return
+    s = state.scratch
+    label = f"object {index}"
+    own = _read_matrix(obj, label, s.fs_matrix)
+    matrix = own if (outer is IDENTITY and own.is_finite()) else own.then(outer)
+    if not pdfium_c.FPDFPath_GetDrawMode(obj, s.fill_mode, s.stroke) or s.fill_mode.value not in _FILL_MODES:
+        raise PdfiumFailure(f"read the draw mode of {label}")
+    stroked = bool(s.stroke.value)
+    filled = s.fill_mode.value != pdfium_c.FPDF_FILLMODE_NONE
+    width_val = 0.0
+    if stroked:
+        if not pdfium_c.FPDFPageObj_GetStrokeWidth(obj, s.stroke_width):
+            raise PdfiumFailure(f"read the stroke width of {label}")
+        width_val = s.stroke_width.value
+    count = pdfium_c.FPDFPath_CountSegments(obj)
+    if count < 0:
+        raise PdfiumFailure(f"count the path segments of {label}")
+    try:
+        state.room.take(count, label)
+    except WalkBoundHit as exc:
+        if not state.allow_overflow:
+            raise
+        state.seg_overflow = str(exc)
+        state.segments.clear()
+    b_l, b_b, b_r, b_t = s.bounds
+    has_bounds = bool(pdfium_c.FPDFPageObj_GetBounds(obj, b_l, b_b, b_r, b_t))
+    l_v, b_v, r_v, t_v = b_l.value, b_b.value, b_r.value, b_t.value
+    box = _box_from_raw_coords(l_v, b_v, r_v, t_v, outer, state.to_coords) if has_bounds else None
+    if box is None:
+        state.unboxed += 1
+    else:
+        state.boxes.append(box)
+    if state.seg_overflow is not None:
+        if box is not None and _is_visible_glyph_from_mode(
+            obj, box, count, stroked=stroked, filled=filled, rgba_buf=s.rgba
+        ):
+            state.glyph_boxes.append(box)
+        return
+    culled = (
+        count > 0
+        and (stroked or filled)
+        and matrix.is_finite()
+        and (matrix is own or own.is_finite())
+        and math.isfinite(width_val)
+        and has_bounds
+        and _culled_from_bounds(l_v, b_v, r_v, t_v, own=own, outer=outer)
+    )
+    if culled:
+        if box is not None and _is_visible_glyph_from_mode(
+            obj, box, count, stroked=stroked, filled=filled, rgba_buf=s.rgba
+        ):
+            state.glyph_boxes.append(box)
+        return
+    _emit_nonculled_path(
+        state,
+        obj,
+        index,
+        label,
+        matrix,
+        box,
+        count,
+        stroked=stroked,
+        filled=filled,
+        width_val=width_val,
+    )
+
+
+def _emit_nonculled_path(
+    state: _FusedWalkState,
+    obj: pdfium_c.FPDF_PAGEOBJECT,
+    index: int,
+    label: str,
+    matrix: Matrix,
+    box: Box | None,
+    count: int,
+    *,
+    stroked: bool,
+    filled: bool,
+    width_val: float,
+) -> None:
+    """Read RGBA once for both glyph-box check and ``path_segments`` on a non-culled path."""
+    s = state.scratch
+    stroke_rgba = read_rgba(pdfium_c.FPDFPageObj_GetStrokeColor, obj, f"stroke colour of {label}", s.rgba)
+    fill_rgba = read_rgba(pdfium_c.FPDFPageObj_GetFillColor, obj, f"fill colour of {label}", s.rgba)
+    if box is not None and _is_glyph_from_paint(
+        box, count, stroked=stroked, filled=filled, stroke_rgba=stroke_rgba, fill_rgba=fill_rgba
+    ):
+        state.glyph_boxes.append(box)
+    paint = PathPaint(
+        stroked=stroked,
+        filled=filled,
+        stroke_width=width_val,
+        dashed=stroked and _leaves_gaps(_read_dashes(obj, label)),
+        stroke_rgba=stroke_rgba,
+        fill_rgba=fill_rgba,
+    )
+    points = _read_counted_points(obj, count, label, s.pt_xy)
+    try:
+        found = path_segments(points, matrix=matrix, paint=paint, object_index=index, to_display=state.to_display)
+    except NonFiniteGeometry:
+        state.skipped += 1
+    else:
+        state.segments.extend(found)
+
+
+def _collect_segments_and_boxes(
+    geometry: PageGeometry,
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]],
+    *,
+    kinds: list[int] | None = None,
+    allow_segment_overflow: bool = False,
+) -> tuple[PageSegments, ObjectBoxes, list[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix]]]:
+    """Walk ``objects`` once to collect ``PageSegments``, ``ObjectBoxes``, and placed image entries."""
+    state = _FusedWalkState(
+        _display_mapping(geometry),
+        _display_coords_fn(geometry),
+        allow_overflow=allow_segment_overflow,
+    )
+    form_matrices: dict[int, Matrix] = {}
+    get_type = pdfium_c.FPDFPageObj_GetType
+    resolved_kinds = [get_type(obj) for obj, _f in objects] if kinds is None else kinds
+    for index, ((obj, form), kind) in enumerate(zip(objects, resolved_kinds, strict=True)):
+        if kind == pdfium_c.FPDF_PAGEOBJ_TEXT:
+            continue
+        outer = form_matrices[form] if form >= 0 else IDENTITY
+        if kind == pdfium_c.FPDF_PAGEOBJ_FORM:
+            form_matrices[index] = _read_matrix(obj, f"object {index}", state.scratch.fs_matrix).then(outer)
+        elif kind == pdfium_c.FPDF_PAGEOBJ_PATH:
+            _step_fused_path(state, obj, index, outer)
+        else:
+            if kind == pdfium_c.FPDF_PAGEOBJ_IMAGE:
+                state.image_entries.append((index, obj, outer))
+            box = _object_box(obj, outer, state.to_display, state.scratch.bounds)
+            if box is None:
+                state.unboxed += 1
+            else:
+                state.boxes.append(box)
+    seg_result = (
+        PageSegments._trusted(
+            (),
+            SegmentStats(skipped_nonfinite_paths=state.skipped, segment_bound_hit=state.seg_overflow),
+        )
+        if state.seg_overflow is not None
+        else PageSegments._trusted(tuple(state.segments), SegmentStats(skipped_nonfinite_paths=state.skipped))
+    )
+    box_result = ObjectBoxes._trusted(tuple(state.boxes), state.unboxed, tuple(state.glyph_boxes))
+    return seg_result, box_result, state.image_entries
+
+
+class _PageStageGuardInfo(NamedTuple):
+    """Single-load page extraction result bundled with pre-walked render-guard metadata."""
+
+    raw: RawPage
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]]
+    image_items: list[tuple[int, pdfium_c.FPDF_PAGEOBJECT]]
+    first_render_refusal: str | None
+
+
+def _read_stages_with_guard(
     page: pdfium.PdfPage, page_number: int, *, allow_segment_overflow: bool = False
-) -> RawPage | PageFailure:
-    """Read a loaded page stage by stage; a stage's PDFCorruptError becomes its PageFailure."""
+) -> _PageStageGuardInfo | PageFailure:
+    """Read a loaded page stage by stage and retain ``(objects, image_items, first_render_refusal)``."""
     stage: PageStage = "page"
     try:
         geometry = _read_geometry(page, page_number)
         stage = "text"
-        text, objects = _read_page_text_and_objects(page, geometry)
+        text, objects, kinds = _read_page_text_objects_and_types(page, geometry)
         stage = "objects"
-        segments = _read_segments(page, geometry, objects=objects, allow_segment_overflow=allow_segment_overflow)
-        images = _read_images(page, geometry, objects=objects)
-        object_boxes = _read_object_boxes(page, geometry, objects=objects)
+        with _pdfium_errors(page_number):
+            segments, object_boxes, image_entries = _collect_segments_and_boxes(
+                geometry, objects, kinds=kinds, allow_segment_overflow=allow_segment_overflow
+            )
+        images, first_refusal = _read_images_and_refusal(page, geometry, objects=objects, image_entries=image_entries)
     except PDFCorruptError as exc:
         return PageFailure(page_number=page_number, stage=stage, message=str(exc))
-    return RawPage(geometry=geometry, text=text, segments=segments, images=images, object_boxes=object_boxes)
+    raw = RawPage(geometry=geometry, text=text, segments=segments, images=images, object_boxes=object_boxes)
+    image_items = [(idx, obj) for idx, obj, _outer in image_entries]
+    return _PageStageGuardInfo(raw=raw, objects=objects, image_items=image_items, first_render_refusal=first_refusal)
+
+
+def _read_stages(
+    page: pdfium.PdfPage, page_number: int, *, allow_segment_overflow: bool = False
+) -> RawPage | PageFailure:
+    """Read a loaded page stage by stage; a stage's PDFCorruptError becomes its PageFailure."""
+    res = _read_stages_with_guard(page, page_number, allow_segment_overflow=allow_segment_overflow)
+    return res if isinstance(res, PageFailure) else res.raw
 
 
 def recover_dropped_text(handle: DocumentHandle, index: int) -> RecoveredText:

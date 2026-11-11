@@ -188,16 +188,101 @@ class RawSpan:
         object.__setattr__(self, "tight_boxes", _per_char_boxes("tight_boxes", self.tight_boxes, len(self.text)))
         object.__setattr__(self, "bbox", bbox)
 
+    @classmethod
+    def _trusted(
+        cls,
+        *,
+        text: str,
+        bbox: Box,
+        char_boxes: tuple[Box, ...],
+        tight_boxes: tuple[Box, ...],
+        font_size_pt: float,
+        em_width_pt: float,
+        base_font_name: str,
+        is_bold: bool,
+        is_italic: bool,
+        render_mode: int,
+        fill_rgba: tuple[int, int, int, int],
+        stroke_rgba: tuple[int, int, int, int],
+        object_index: int,
+        generated_breaks: tuple[int, ...],
+        map_errors: tuple[int, ...],
+    ) -> "RawSpan":
+        """Construct from textpage-validated boxes and styles without O(chars) re-validation."""
+        if not isinstance(text, str) or not text:
+            raise ValueError("text must be a non-empty str")
+        n = len(text)
+        if (
+            not isinstance(bbox, tuple)
+            or len(bbox) != 4
+            or not isinstance(char_boxes, tuple)
+            or not isinstance(tight_boxes, tuple)
+            or len(char_boxes) != n
+            or len(tight_boxes) != n
+            or not isinstance(generated_breaks, tuple)
+            or not isinstance(map_errors, tuple)
+        ):
+            raise TypeError("span boxes and offset collections must be tuples of matching length")
+        if (
+            not isinstance(base_font_name, str)
+            or type(is_bold) is not bool
+            or type(is_italic) is not bool
+            or isinstance(render_mode, bool)
+            or not isinstance(render_mode, int)
+            or not (0 <= render_mode <= 7)
+            or isinstance(object_index, bool)
+            or not isinstance(object_index, int)
+            or object_index < 0
+            or not isinstance(fill_rgba, tuple)
+            or len(fill_rgba) != 4
+            or not isinstance(stroke_rgba, tuple)
+            or len(stroke_rgba) != 4
+        ):
+            raise ValueError("invalid span scalar metadata")
+        f_size, f_em = float(font_size_pt), float(em_width_pt)
+        if not (math.isfinite(f_size) and math.isfinite(f_em) and f_em >= 0.0):
+            raise ValueError(f"non-finite or negative span font metrics: {f_size!r}, {f_em!r}")
+        self = object.__new__(cls)
+        object.__setattr__(self, "text", text)
+        object.__setattr__(self, "bbox", bbox)
+        object.__setattr__(self, "char_boxes", char_boxes)
+        object.__setattr__(self, "tight_boxes", tight_boxes)
+        object.__setattr__(self, "font_size_pt", f_size)
+        object.__setattr__(self, "em_width_pt", f_em)
+        object.__setattr__(self, "base_font_name", base_font_name)
+        object.__setattr__(self, "is_bold", is_bold)
+        object.__setattr__(self, "is_italic", is_italic)
+        object.__setattr__(self, "render_mode", render_mode)
+        object.__setattr__(self, "fill_rgba", fill_rgba)
+        object.__setattr__(self, "stroke_rgba", stroke_rgba)
+        object.__setattr__(self, "object_index", object_index)
+        object.__setattr__(self, "generated_breaks", generated_breaks)
+        object.__setattr__(self, "map_errors", map_errors)
+        return self
+
+
+def _box_is_finite(box: Box) -> bool:
+    """True when all four box coordinates are finite."""
+    isfinite = math.isfinite
+    return isfinite(box[0]) and isfinite(box[1]) and isfinite(box[2]) and isfinite(box[3])
+
 
 def _fast_ordered_box(box: object) -> Box | None:
     """Fast-path check for a 4-float/int finite ordered box; None delegates to ``ordered_box``."""
     if type(box) is not tuple or len(box) != 4:
         return None
     x0, y0, x1, y1 = box
-    if not all(type(val) is float or type(val) is int for val in (x0, y0, x1, y1)):
+    t0, t1, t2, t3 = type(x0), type(y0), type(x1), type(y1)
+    if not (
+        (t0 is float or t0 is int)
+        and (t1 is float or t1 is int)
+        and (t2 is float or t2 is int)
+        and (t3 is float or t3 is int)
+    ):
         return None
     fx0, fy0, fx1, fy1 = float(x0), float(y0), float(x1), float(y1)
-    if not (math.isfinite(fx0) and math.isfinite(fy0) and math.isfinite(fx1) and math.isfinite(fy1)):
+    isfinite = math.isfinite
+    if not (isfinite(fx0) and isfinite(fy0) and isfinite(fx1) and isfinite(fy1)):
         return None
     return (fx0, fy0, fx1, fy1) if fx0 <= fx1 and fy0 <= fy1 else None
 
@@ -648,17 +733,26 @@ class _SpanBuilder:
     def _flush(self) -> None:
         if not self._chars:
             return
-        boxes = tuple(self._to_display(box) for box in self._boxes)
+        to_disp = self._to_display
+        boxes = tuple(to_disp(box) for box in self._boxes)
+        style = self._styles[self._owner]
         self._spans.append(
-            RawSpan(
+            RawSpan._trusted(
                 text="".join(self._chars),
                 bbox=union_box(boxes),
                 char_boxes=boxes,
-                tight_boxes=tuple(self._to_display(box) for box in self._tight),
+                tight_boxes=tuple(to_disp(box) for box in self._tight),
+                font_size_pt=style.font_size_pt,
+                em_width_pt=style.em_width_pt,
+                base_font_name=style.base_font_name,
+                is_bold=style.is_bold,
+                is_italic=style.is_italic,
+                render_mode=style.render_mode,
+                fill_rgba=style.fill_rgba,
+                stroke_rgba=style.stroke_rgba,
                 object_index=self._object_indices[self._owner],
                 generated_breaks=tuple(self._breaks),
                 map_errors=tuple(self._errors),
-                **self._styles[self._owner]._asdict(),
             )
         )
         self._chars, self._boxes, self._tight, self._breaks, self._errors = [], [], [], [], []
@@ -691,6 +785,7 @@ def _read_textpage(textpage: pdfium_c.FPDF_TEXTPAGE, object_indices: dict[int, i
         raise WalkBoundHit(f"the text page holds {count} chars, over the walk's {MAX_PAGE_CHARS}-char bound")
     chars: list[_OwnedChar | None] = []
     styles: dict[int, _Style] = {}
+    styles_finite: dict[int, bool] = {}
     font_cache: dict[int, tuple[str, bool, bool]] = {}
     skipped: set[int] = set()
     generated = ownerless = 0
@@ -716,10 +811,11 @@ def _read_textpage(textpage: pdfium_c.FPDF_TEXTPAGE, object_indices: dict[int, i
         if owner not in styles:
             if owner not in object_indices:
                 raise PdfiumFailure(f"read the text object of char {char_index}: it is not in the page's object tree")
-            styles[owner] = _read_style(textpage, text_object, char_index, object_indices[owner], font_cache)
+            st = _read_style(textpage, text_object, char_index, object_indices[owner], font_cache)
+            styles[owner] = st
+            styles_finite[owner] = math.isfinite(st.font_size_pt) and math.isfinite(st.em_width_pt)
         box, tight = _loose_box(textpage, char_index, loose_rect), _tight_box(textpage, char_index, tight_coords)
-        style = styles[owner]
-        if not all(math.isfinite(value) for value in (*box, *tight, style.font_size_pt, style.em_width_pt)):
+        if not (styles_finite[owner] and _box_is_finite(box) and _box_is_finite(tight)):
             skipped.add(owner)
         chars.append(_OwnedChar(owner, code, map_error, box, tight))
     return _Textpage(chars, generated, ownerless, styles, frozenset(skipped))

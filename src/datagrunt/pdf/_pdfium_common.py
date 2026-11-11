@@ -38,10 +38,15 @@ def object_address(pointer: pdfium_c.FPDF_PAGEOBJECT) -> int:
 
 
 def read_rgba(
-    getter: Callable[..., int], page_object: pdfium_c.FPDF_PAGEOBJECT, what: str
+    getter: Callable[..., int],
+    page_object: pdfium_c.FPDF_PAGEOBJECT,
+    what: str,
+    rgba_buf: tuple[ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint] | None = None,
 ) -> tuple[int, int, int, int]:
     """Read a page object's fill or stroke colour (``what``) as 0-255 (R, G, B, A)."""
-    red, green, blue, alpha = (ctypes.c_uint() for _ in range(4))
+    red, green, blue, alpha = (
+        (ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()) if rgba_buf is None else rgba_buf
+    )
     if not getter(page_object, red, green, blue, alpha):
         raise PdfiumFailure(f"read the {what}")
     return red.value, green.value, blue.value, alpha.value
