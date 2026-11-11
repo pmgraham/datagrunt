@@ -38,11 +38,13 @@ from datagrunt.pdf._bundle_load import (
 )
 from datagrunt.pdf._extra import load as _load_extra
 from datagrunt.pdf._options import (
+    _MAX_PRERENDER_CACHE_BYTES,
     DPI,
     MAX_RENDER_PIXELS,
     MIN_IMAGE_DIMENSION,
     OcrMode,
     RenderPagesMode,
+    _PrerenderCache,
     checked_render_pages,
 )
 from datagrunt.pdf._process import (
@@ -61,7 +63,7 @@ from datagrunt.pdf._process import (
     send_message,
     start_worker,
 )
-from datagrunt.pdf._source import _opened_source, _stream_sha256, checked_pdf_file
+from datagrunt.pdf._source import SourceIdentity, _opened_source, _stream_sha256, checked_pdf_file
 from datagrunt.pdf._validate import (
     checked_password,
     checked_path,
@@ -113,6 +115,7 @@ class _SourceItem(NamedTuple):
     source_name: str
     sha256: str
     doc_id: str
+    identity: SourceIdentity | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,12 +318,14 @@ def _resolve_inputs(inputs: object) -> tuple[_SourceItem, ...]:
         if resolved in seen_paths:
             raise ValueError(f"duplicate input path in inputs: {resolved}")
         seen_paths.add(resolved)
-        sha256 = _file_sha256(resolved)
+        sha256, identity = _file_sha256_and_identity(resolved)
         doc_id = DocumentMetadata.make_doc_id(resolved.name, sha256)
         if doc_id in seen_doc_ids:
             raise ValueError(f"duplicate doc_id {doc_id!r} across inputs: {resolved}")
         seen_doc_ids.add(doc_id)
-        items.append(_SourceItem(path=resolved, source_name=resolved.name, sha256=sha256, doc_id=doc_id))
+        items.append(
+            _SourceItem(path=resolved, source_name=resolved.name, sha256=sha256, doc_id=doc_id, identity=identity)
+        )
     return tuple(items)
 
 
@@ -349,11 +354,11 @@ def _discover_paths(inputs: object) -> list[Path]:
     raise TypeError(f"inputs must be a path or Sequence of paths, got {type(inputs).__name__}")
 
 
-def _file_sha256(path: Path) -> str:
-    """Stream the SHA-256 of the regular file at ``path``."""
+def _file_sha256_and_identity(path: Path) -> tuple[str, SourceIdentity]:
+    """Stream the SHA-256 and capture ``SourceIdentity`` from one open fd."""
     with _opened_source(path) as stream:
-        size = os.fstat(stream.fileno()).st_size
-        return _stream_sha256(stream, size, path)
+        identity = SourceIdentity.of(os.fstat(stream.fileno()))
+        return _stream_sha256(stream, identity.size, path), identity
 
 
 _CORPUS_DOC_TIMEOUT_S: Final[float] = 1800.0
@@ -506,6 +511,11 @@ def _encode_corpus_request(
         "source_name": item.source_name,
         "sha256": item.sha256,
         "doc_id": item.doc_id,
+        "identity": (
+            [item.identity.device, item.identity.inode, item.identity.size, item.identity.mtime_ns]
+            if item.identity is not None
+            else None
+        ),
         "target": str(target),
         "password": password,
         "overwrite": overwrite,
@@ -533,11 +543,18 @@ def _run_encoded_corpus_request(raw: bytes) -> bytes:
     """Execute one encoded corpus document request inside the child worker and return the reply frame."""
     req = cast(dict[str, object], json.loads(raw))
     opts_raw = cast(dict[str, object], req["options"])
+    raw_id = cast(list[int] | None, req.get("identity"))
+    item_identity = (
+        SourceIdentity(device=raw_id[0], inode=raw_id[1], size=raw_id[2], mtime_ns=raw_id[3])
+        if raw_id is not None and len(raw_id) == 4
+        else None
+    )
     item = _SourceItem(
         path=Path(cast(str, req["path"])),
         source_name=cast(str, req["source_name"]),
         sha256=cast(str, req["sha256"]),
         doc_id=cast(str, req["doc_id"]),
+        identity=item_identity,
     )
     options = PipelineOptions(
         workers=cast(int, opts_raw["workers"]),
@@ -773,6 +790,95 @@ def _run_batch(
     return [outcomes[index] for index in range(len(items))]
 
 
+def _extract_and_write_bundle(
+    item: _SourceItem,
+    bundle_dir: Path,
+    password: str | None,
+    options: PipelineOptions,
+    extra_params: dict[str, object],
+    write_bundle_fn: Callable[..., object],
+    *,
+    include_images: bool,
+    render_pages: RenderPagesMode,
+    worker_pool: PageWorkerPool | None,
+) -> PDFDocument:
+    """Run ``extract_document`` and ``write_bundle`` sharing single-pass hash and single-load renders."""
+    extract_kwargs: dict[str, object] = {
+        "password": password,
+        "workers": options.workers,
+        "ocr": options.ocr,
+        "dpi": options.dpi,
+        "vision_dpi": options.vision_dpi,
+        "max_render_pixels": options.max_render_pixels,
+        "min_image_dimension": options.min_image_dimension,
+        "strict": options.strict,
+        **({"sandbox": True} if options.sandbox else {}),
+        **({"orientation_fallback": True} if options.orientation_fallback else {}),
+    }
+    default_extract = extract_document is _default_extract_document
+    default_bundle = (
+        getattr(write_bundle_fn, "__module__", "") == "datagrunt.pdf.bundle"
+        and getattr(write_bundle_fn, "__name__", "") == "write_bundle"
+    )
+    verified_pair = (item.identity, item.sha256) if item.identity is not None else None
+    can_prerender = (
+        default_extract
+        and default_bundle
+        and not options.sandbox
+        and worker_pool is None
+        and _pool_size(options.workers) == 1
+        and include_images
+        and render_pages is True
+    )
+    prerender_cache: _PrerenderCache | None = _PrerenderCache(_MAX_PRERENDER_CACHE_BYTES) if can_prerender else None
+    if default_extract:
+        if worker_pool is not None:
+            extract_kwargs["_worker_pool"] = worker_pool
+        if verified_pair is not None:
+            extract_kwargs["_verified_source"] = verified_pair
+        if prerender_cache is not None:
+            extract_kwargs["_prerender_out"] = prerender_cache
+    doc = extract_document(item.path, **extract_kwargs)  # type: ignore[arg-type]
+    if default_bundle:
+        from datagrunt.pdf.bundle import _write_bundle_internal
+
+        return _write_bundle_internal(
+            doc,
+            bundle_dir,
+            source=item.path,
+            password=password,
+            dpi=options.dpi,
+            vision_dpi=options.vision_dpi,
+            max_render_pixels=options.max_render_pixels,
+            workers=options.workers,
+            extraction_params=extra_params,
+            overwrite=True,
+            include_images=include_images,
+            render_pages=render_pages,
+            sandbox=options.sandbox,
+            verified_source=verified_pair,
+            prerendered=prerender_cache,
+        )
+    return cast(
+        PDFDocument,
+        write_bundle_fn(
+            doc,
+            bundle_dir,
+            source=item.path,
+            password=password,
+            dpi=options.dpi,
+            vision_dpi=options.vision_dpi,
+            max_render_pixels=options.max_render_pixels,
+            workers=options.workers,
+            extraction_params=extra_params,
+            overwrite=True,
+            include_images=include_images,
+            render_pages=render_pages,
+            **({"sandbox": True} if options.sandbox else {}),
+        ),
+    )
+
+
 def _process_item(
     item: _SourceItem,
     target: Path,
@@ -815,38 +921,16 @@ def _process_item(
             return reused
     try:
         checked_pdf_file(item.path, "source")
-        extract_kwargs: dict[str, object] = {
-            "password": password,
-            "workers": options.workers,
-            "ocr": options.ocr,
-            "dpi": options.dpi,
-            "vision_dpi": options.vision_dpi,
-            "max_render_pixels": options.max_render_pixels,
-            "min_image_dimension": options.min_image_dimension,
-            "strict": options.strict,
-            **({"sandbox": True} if options.sandbox else {}),
-            **({"orientation_fallback": True} if options.orientation_fallback else {}),
-        }
-        if worker_pool is not None and extract_document is _default_extract_document:
-            extract_kwargs["_worker_pool"] = worker_pool
-        doc = extract_document(item.path, **extract_kwargs)  # type: ignore[arg-type]
-        written = cast(
-            PDFDocument,
-            write_bundle_fn(
-                doc,
-                bundle_dir,
-                source=item.path,
-                password=password,
-                dpi=options.dpi,
-                vision_dpi=options.vision_dpi,
-                max_render_pixels=options.max_render_pixels,
-                workers=options.workers,
-                extraction_params=extra_params,
-                overwrite=True,
-                include_images=include_images,
-                render_pages=render_pages,
-                **({"sandbox": True} if options.sandbox else {}),
-            ),
+        written = _extract_and_write_bundle(
+            item,
+            bundle_dir,
+            password,
+            options,
+            extra_params,
+            write_bundle_fn,
+            include_images=include_images,
+            render_pages=render_pages,
+            worker_pool=worker_pool,
         )
     except (DatagruntPDFError, OSError, ValueError) as exc:
         if options.strict:

@@ -50,7 +50,25 @@ jobs:
             rust/Cargo.lock
 
       - name: Install tesseract (for PDF OCR tests)
-        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
+        # Fall back to GPG-verified mirrors.edge.kernel.org when Azure runners hit *.ubuntu.com DNS outages.
+        run: |
+          use_kernel_mirror() {
+            echo "https://mirrors.edge.kernel.org/ubuntu/" | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+              if [ -f "$f" ]; then
+                sudo sed -i -E 's|https?://[A-Za-z0-9.-]*ubuntu\.com/ubuntu/?|https://mirrors.edge.kernel.org/ubuntu/|g' "$f"
+              fi
+            done
+          }
+          if ! getent ahosts archive.ubuntu.com >/dev/null 2>&1 || ! getent ahosts security.ubuntu.com >/dev/null 2>&1; then
+            use_kernel_mirror
+          fi
+          APT_FAST="-o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+          if ! sudo apt-get update $APT_FAST || ! sudo apt-get install -y $APT_FAST tesseract-ocr; then
+            use_kernel_mirror
+            sudo apt-get update -o Acquire::Retries=3
+            sudo apt-get install -y -o Acquire::Retries=3 tesseract-ocr
+          fi
 
       - name: Create venv, build the extension (editable), install dev/pdf/rationalize extras
         # Explicit venv + editable install (uv handles maturin build isolation
@@ -153,7 +171,25 @@ jobs:
             rust/Cargo.lock
 
       - name: Install tesseract (for PDF OCR tests)
-        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
+        # Fall back to GPG-verified mirrors.edge.kernel.org when Azure runners hit *.ubuntu.com DNS outages.
+        run: |
+          use_kernel_mirror() {
+            echo "https://mirrors.edge.kernel.org/ubuntu/" | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+            for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+              if [ -f "$f" ]; then
+                sudo sed -i -E 's|https?://[A-Za-z0-9.-]*ubuntu\.com/ubuntu/?|https://mirrors.edge.kernel.org/ubuntu/|g' "$f"
+              fi
+            done
+          }
+          if ! getent ahosts archive.ubuntu.com >/dev/null 2>&1 || ! getent ahosts security.ubuntu.com >/dev/null 2>&1; then
+            use_kernel_mirror
+          fi
+          APT_FAST="-o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15"
+          if ! sudo apt-get update $APT_FAST || ! sudo apt-get install -y $APT_FAST tesseract-ocr; then
+            use_kernel_mirror
+            sudo apt-get update -o Acquire::Retries=3
+            sudo apt-get install -y -o Acquire::Retries=3 tesseract-ocr
+          fi
 
       - name: Create venv, build the extension (editable), install dev/pdf/rationalize extras
         run: |

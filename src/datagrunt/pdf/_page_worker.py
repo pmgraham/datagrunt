@@ -30,6 +30,7 @@ from typing import IO, NamedTuple, TypeVar
 
 from datagrunt.pdf import pipeline
 from datagrunt.pdf._memory_cap import CAP_EXIT, Lifetime, apply_memory_cap
+from datagrunt.pdf._options import PrerenderEntry, _PrerenderCache
 from datagrunt.pdf._process import MAX_REQUEST_BYTES, error_reply, read_message, send_message
 from datagrunt.pdf.assembly import assemble_page
 from datagrunt.pdf.elements import Page
@@ -67,6 +68,10 @@ from datagrunt.pdf.vision import fallback_page, vision_page
 
 _default_extract_page = extract_page
 _default_render_pages = render_pages
+_default_effective_dpi = effective_dpi
+
+
+_Drawn = RenderedPage | RenderRefused | RenderFailed | Exception
 
 __all__ = ["extract_page_at"]
 
@@ -191,31 +196,166 @@ def _raise_if_changed(source: PDFSource, when: str, error: Exception) -> None:
         raise changed from error
 
 
+def _can_fuse_page_load(options: PipelineOptions) -> bool:
+    """True when ``extract_page`` and in-process rendering are unmocked and ``sandbox`` is False."""
+    from datagrunt.pdf import pdfium_engine as _eng
+
+    return (
+        not options.sandbox
+        and extract_page is _default_extract_page
+        and render_pages is _default_render_pages
+        and effective_dpi is _default_effective_dpi
+        and _eng.collect_images is _eng.collect_images_from_img_mod
+    )
+
+
+def _capture_page_prerender(
+    page: object,
+    info: object,
+    source: PDFSource,
+    options: PipelineOptions,
+    cache: _PrerenderCache | None = None,
+) -> PrerenderEntry | None:
+    """Render 8-bit grey full-page PNG before text removal; return None on refusal/failure/MemoryError."""
+    import pypdfium2 as pdfium
+
+    from datagrunt.pdf import _render_worker
+    from datagrunt.pdf._options import MEMORY_CAP_BYTES
+    from datagrunt.pdf._png import grey_png_bytes
+    from datagrunt.pdf.pdfium_engine import _PageStageGuardInfo
+
+    if not isinstance(page, pdfium.PdfPage):
+        raise TypeError(f"page must be PdfPage, got {type(page).__name__}")
+    if not isinstance(info, _PageStageGuardInfo):
+        raise TypeError(f"info must be _PageStageGuardInfo, got {type(info).__name__}")
+    if not isinstance(source, PDFSource):
+        raise TypeError(f"source must be PDFSource, got {type(source).__name__}")
+    geom = info.raw.geometry
+    try:
+        draw_dpi = effective_dpi(options.dpi, options.max_render_pixels, geom.width_pt, geom.height_pt)
+        rendered = _render_worker.draw_open_page_in_process(
+            page,
+            geom,
+            info.objects,
+            info.image_items,
+            info.first_render_refusal,
+            source.path,
+            dpi=draw_dpi,
+            memory_cap_bytes=MEMORY_CAP_BYTES,
+            colour=False,
+            without_text=False,
+            annotations=True,
+        )
+        png_data = grey_png_bytes(rendered.px_width, rendered.px_height, rendered.pixels)
+    except MemoryError:
+        if cache is not None:
+            cache.mark_exhausted()
+        return None
+    except (RenderRefused, RenderFailed):
+        return None
+    return (draw_dpi, rendered.px_width, rendered.px_height, png_data)
+
+
+def _assessed_fused_single_load(
+    handle: DocumentHandle,
+    source: PDFSource,
+    index: int,
+    options: PipelineOptions,
+    drawn_out: dict[int, _Drawn],
+    prerender_out: _PrerenderCache | None,
+) -> "_Assessed | PageFailure":
+    """Load ``index`` once: extract stages, optionally pre-render gray PNG, and optionally draw background."""
+    from datagrunt.pdf import _render_worker
+    from datagrunt.pdf import pdfium_engine as _eng
+
+    with _eng._PDFIUM_LOCK:
+        try:
+            page, page_number = _eng._load_page(handle, index)
+        except PDFCorruptError as exc:
+            if exc.page_number is None or options.strict:
+                raise
+            return PageFailure(page_number=exc.page_number, stage="page", message=str(exc))
+        try:
+            info = _eng._read_stages_with_guard(page, page_number, allow_segment_overflow=not options.strict)
+            if isinstance(info, PageFailure):
+                if options.strict:
+                    raise PDFCorruptError(info.message, page_number=info.page_number)
+                return info
+            dropped = info.raw.text.stats.dropped_text_objects
+            recovered = recover_dropped_text(handle, index) if dropped > 0 else None
+            assessment = assess_page(info.raw, ocr=options.ocr, recovered=recovered)
+            bg_dpi = _background_dpi(info.raw, assessment, options)
+            if (
+                prerender_out is not None
+                and not prerender_out.is_full
+                and (options.ocr == "never" or assessment.route != "vision")
+            ):
+                captured = _capture_page_prerender(page, info, source, options, cache=prerender_out)
+                if captured is not None:
+                    prerender_out.put(index, captured)
+            if isinstance(bg_dpi, int):
+                cap = pipeline._vision(options).memory_cap_bytes
+                try:
+                    drawn_out[index] = _render_worker.draw_open_page_in_process(
+                        page,
+                        info.raw.geometry,
+                        info.objects,
+                        info.image_items,
+                        info.first_render_refusal,
+                        source.path,
+                        dpi=bg_dpi,
+                        memory_cap_bytes=cap,
+                        colour=True,
+                        without_text=True,
+                        annotations=False,
+                    )
+                except (RenderRefused, RenderFailed) as exc:
+                    drawn_out[index] = exc
+            return _Assessed(index, info.raw, recovered, assessment, bg_dpi)
+        finally:
+            page.close()
+
+
 def _iter_pages(
-    handle: DocumentHandle, source: PDFSource, pages: Sequence[int], options: PipelineOptions, progress: Progress
+    handle: DocumentHandle,
+    source: PDFSource,
+    pages: Sequence[int],
+    options: PipelineOptions,
+    progress: Progress,
+    *,
+    prerender_out: _PrerenderCache | None = None,
 ) -> Iterator[Page]:
     """The pages at ``pages`` of the open document, in order, each as it is done; a window of pages at a time."""
     size = pipeline._WINDOW_PAGES
     for start in range(0, len(pages), size):  # bounded: one window per _WINDOW_PAGES pages
-        yield from _window_pages(handle, source, pages[start : start + size], options, progress)
+        yield from _window_pages(
+            handle, source, pages[start : start + size], options, progress, prerender_out=prerender_out
+        )
 
 
 def _window_pages(
-    handle: DocumentHandle, source: PDFSource, window: Sequence[int], options: PipelineOptions, progress: Progress
+    handle: DocumentHandle,
+    source: PDFSource,
+    window: Sequence[int],
+    options: PipelineOptions,
+    progress: Progress,
+    *,
+    prerender_out: _PrerenderCache | None = None,
 ) -> Iterator[Page]:
-    """The window's pages, each as it is done: steps 1-3 for each, its gated pages drawn in one worker, then step 4.
-
-    Each step is isolated; ``progress`` hears of each page as its steps 1-3
-    begin, and again as its step 4 does. A page A2 could not read is read
-    by OCR (``fallback_page``) as its step 4, as a vision page is: each page
-    reply carries at most one page's render and OCR budget, the one its
-    bound gives it (:func:`~datagrunt.pdf.pipeline._reply_bound_s`).
-    """
-    staged: list[Page | _Assessed | PageFailure] = []
+    """The window's pages, each as it is done: steps 1-3 for each, its gated pages drawn in one worker, then step 4."""
+    staged: list["Page | _Assessed | PageFailure"] = []
+    fuse = _can_fuse_page_load(options)
+    drawn: dict[int, _Drawn] = {}
     for index in window:  # bounded: the window's pages
         progress(index)
-        staged.append(_isolated(handle, index, options, partial(_assessed, handle, index, options)))
-    drawn = _backgrounds(handle, source, staged, options)
+        step_fn = (
+            partial(_assessed_fused_single_load, handle, source, index, options, drawn, prerender_out)
+            if fuse
+            else partial(_assessed, handle, index, options)
+        )
+        staged.append(_isolated(handle, index, options, step_fn))
+    if not fuse:
+        drawn = _backgrounds(handle, source, staged, options)
     for item in staged:  # bounded: the window's pages
         if isinstance(item, Page):
             yield item
@@ -288,10 +428,6 @@ class _Assessed(NamedTuple):
     recovered: RecoveredText | None
     assessment: PageAssessment
     background_dpi: int | str | None
-
-
-# A page's background render: the page drawn, why not, or the exception its batch raised (each page's step 5).
-_Drawn = RenderedPage | RenderRefused | RenderFailed | Exception
 
 
 def _isolated(handle: DocumentHandle, index: int, options: PipelineOptions, step: Callable[[], _T]) -> _T | Page:

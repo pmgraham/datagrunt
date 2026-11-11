@@ -457,3 +457,48 @@ def draw_loaded_in_process(
     with bitmap.pixels:
         raw = bytes(bitmap.pixels)
     return RenderedPage(pixels=raw, px_width=bitmap.width, px_height=bitmap.height, channels=bitmap.channels)
+
+
+def draw_open_page_in_process(
+    page: pdfium.PdfPage,
+    geometry: PageGeometry,
+    objects: Sequence[tuple[pdfium_c.FPDF_PAGEOBJECT, int]],
+    image_items: Sequence[tuple[int, pdfium_c.FPDF_PAGEOBJECT]],
+    first_render_refusal: str | None,
+    source: str | os.PathLike[str],
+    *,
+    dpi: int,
+    memory_cap_bytes: int = MEMORY_CAP_BYTES,
+    colour: bool = False,
+    without_text: bool = False,
+    annotations: bool = False,
+) -> RenderedPage:
+    """Draw an already-open ``page`` reusing its pre-walked ``objects`` and ``first_render_refusal``."""
+    if not isinstance(page, pdfium.PdfPage) or not isinstance(geometry, PageGeometry):
+        raise TypeError("page must be a PdfPage and geometry a PageGeometry")
+    checked_source = str(_checked_path(source, "source"))
+    int_at_least("dpi", dpi, 1)
+    int_at_least("memory_cap_bytes", memory_cap_bytes, 1)
+    strict_bool("colour", colour)
+    strict_bool("without_text", without_text)
+    strict_bool("annotations", annotations)
+    where = f"{checked_source}: page {geometry.page_number}"
+    channels = BGR_CHANNELS if colour else GRAY_CHANNELS
+    try:
+        with _PDFIUM_LOCK:
+            if len(objects) > _MAX_GUARD_OBJECTS:
+                bound_msg = f"the page holds {len(objects)} objects, over the walk's {_MAX_GUARD_OBJECTS}-object bound"
+                raise RenderRefused(f"page {geometry.page_number}: {bound_msg}; the page is not rendered")
+            if first_render_refusal is not None:
+                raise RenderRefused(f"page {geometry.page_number}: {first_render_refusal}; the page is not rendered")
+            _check_pixel_cap(geometry, dpi, channels, memory_cap_bytes)
+            if without_text:
+                _remove_text(page, geometry.page_number, objects=objects)
+            bitmap = _draw(page, geometry, dpi, colour=colour, annotations=annotations, image_items=image_items)
+    except RenderRefused as exc:
+        raise RenderRefused(f"{checked_source}: {exc}") from exc
+    except Exception as exc:
+        raise RenderFailed(f"{where}: the render worker failed: {type(exc).__name__}: {exc}") from exc
+    with bitmap.pixels:
+        raw = bytes(bitmap.pixels)
+    return RenderedPage(pixels=raw, px_width=bitmap.width, px_height=bitmap.height, channels=bitmap.channels)

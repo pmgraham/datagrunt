@@ -226,7 +226,7 @@ from pathlib import Path
 from typing import IO, NamedTuple, get_args
 
 from datagrunt.pdf._memory_cap import ending
-from datagrunt.pdf._options import DPI, MAX_RENDER_PIXELS, MIN_IMAGE_DIMENSION, OcrMode, VisionOptions
+from datagrunt.pdf._options import DPI, MAX_RENDER_PIXELS, MIN_IMAGE_DIMENSION, OcrMode, VisionOptions, _PrerenderCache
 from datagrunt.pdf._process import (
     MAX_REQUEST_BYTES,
     REAP_TIMEOUT_S,
@@ -249,6 +249,8 @@ from datagrunt.pdf.elements import _MAX_ASSET_BYTES, DocumentMetadata, Page, PDF
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFSourceChangedError
 from datagrunt.pdf.render import _MIN_RENDER_PIXELS, _MIN_TARGET_DPI
 from datagrunt.pdf.scope import apply_scope
+
+_default_stream_sha256 = _stream_sha256
 
 __all__ = ["PDFSource", "PageWorkerPool", "PipelineOptions", "SourceIdentity", "extract_document"]
 
@@ -409,6 +411,8 @@ def extract_document(
     sandbox: bool = False,
     orientation_fallback: bool = False,
     _worker_pool: "PageWorkerPool | None" = None,
+    _verified_source: tuple[SourceIdentity, str] | None = None,
+    _prerender_out: _PrerenderCache | None = None,
 ) -> PDFDocument:
     """Extract the whole PDF at ``source``: steps 1-5 for every page, in workers, then 6-7 (see the module notes).
 
@@ -457,10 +461,20 @@ def extract_document(
     command = [] if in_process else _pool_command()
     with _opened_source(pdf.path) as stream:
         identity = SourceIdentity.of(os.fstat(stream.fileno()))
-        digest = _stream_sha256(stream, identity.size, pdf.path)
+        if _verified_source is not None and _stream_sha256 is _default_stream_sha256:
+            verified_id, verified_digest = _verified_source
+            changes = verified_id.changes(identity)
+            if changes:
+                disagree = "its pages and its sha256 could disagree, so it is not extracted"
+                raise PDFSourceChangedError(
+                    f"{pdf.path} changed before extraction began: {', '.join(changes)}; {disagree}"
+                )
+            digest = verified_digest
+        else:
+            digest = _stream_sha256(stream, identity.size, pdf.path)
         bound = dataclasses.replace(pdf, identity=identity, sha256=digest)
         if in_process:
-            facts, pages = _in_process_pages(bound, options)
+            facts, pages = _in_process_pages(bound, options, prerender_out=_prerender_out)
         elif _worker_pool is None:
             facts, pages = _pooled_pages(bound, options, command)
         else:
@@ -469,7 +483,12 @@ def extract_document(
     return _document(bound, facts, digest, pages)
 
 
-def _in_process_pages(source: PDFSource, options: PipelineOptions) -> tuple[Facts, tuple[Page, ...]]:
+def _in_process_pages(
+    source: PDFSource,
+    options: PipelineOptions,
+    *,
+    prerender_out: _PrerenderCache | None = None,
+) -> tuple[Facts, tuple[Page, ...]]:
     """Extract every page of ``source`` directly in this process using one open DocumentHandle."""
     try:
         from datagrunt.pdf import _page_worker
@@ -485,7 +504,16 @@ def _in_process_pages(source: PDFSource, options: PipelineOptions) -> tuple[Fact
     with _page_worker._opened_checked(source, "when pdfium opened it") as handle:
         info = document_metadata(handle)
         count = handle.page_count
-        pages = tuple(_page_worker._iter_pages(handle, source, range(count), options, _page_worker._quiet))
+        pages = tuple(
+            _page_worker._iter_pages(
+                handle,
+                source,
+                range(count),
+                options,
+                _page_worker._quiet,
+                prerender_out=prerender_out,
+            )
+        )
     _check_unchanged(source, os.stat(source.path), f"by the time pages 1-{count} finished")
     return Facts(count, info.title, info.author), pages
 

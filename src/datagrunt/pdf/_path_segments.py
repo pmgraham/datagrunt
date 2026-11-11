@@ -92,6 +92,44 @@ class RawSegment:
             raise ValueError(f"dashed must be False for a {self.kind}: only a stroke has a dash pattern")
         rgba_tuple("paint_rgba", self.paint_rgba)
 
+    @classmethod
+    def _trusted(
+        cls,
+        orientation: Orientation,
+        position: float,
+        start: float,
+        end: float,
+        width: float,
+        kind: SegmentKind,
+        object_index: int,
+        dashed: bool,
+        paint_rgba: tuple[int, int, int, int],
+    ) -> "RawSegment":
+        """Construct from engine-validated finite geometry without repeating field validators."""
+        if orientation not in _ORIENTATIONS or kind not in _KINDS:
+            raise ValueError(f"invalid orientation {orientation!r} or kind {kind!r}")
+        if isinstance(object_index, bool) or not isinstance(object_index, int) or object_index < 0:
+            raise TypeError(f"object_index must be an int >= 0, got {object_index!r}")
+        if type(dashed) is not bool or not isinstance(paint_rgba, tuple) or len(paint_rgba) != 4:
+            raise TypeError("dashed must be bool and paint_rgba a 4-tuple")
+        f_pos, f_start, f_end, f_width = float(position), float(start), float(end), float(width)
+        isfinite = math.isfinite
+        if not (isfinite(f_pos) and isfinite(f_start) and isfinite(f_end) and isfinite(f_width)):
+            raise ValueError("segment geometry must be finite")
+        if not f_start < f_end or f_width < 0.0 or (dashed and kind != "stroke"):
+            raise ValueError(f"invalid segment bounds: start={start!r}, end={end!r}, width={width!r}")
+        self = object.__new__(cls)
+        object.__setattr__(self, "orientation", orientation)
+        object.__setattr__(self, "position", f_pos)
+        object.__setattr__(self, "start", f_start)
+        object.__setattr__(self, "end", f_end)
+        object.__setattr__(self, "width", f_width)
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "object_index", object_index)
+        object.__setattr__(self, "dashed", dashed)
+        object.__setattr__(self, "paint_rgba", paint_rgba)
+        return self
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SegmentStats:
@@ -130,6 +168,18 @@ class PageSegments:
         if not isinstance(self.stats, SegmentStats):
             raise TypeError(f"stats must be a SegmentStats, got {type(self.stats).__name__}")
 
+    @classmethod
+    def _trusted(cls, segments: tuple[RawSegment, ...], stats: SegmentStats) -> "PageSegments":
+        """Construct from an engine-built RawSegment tuple without O(N) element isinstance scans."""
+        if not isinstance(segments, tuple):
+            raise TypeError(f"segments must be a tuple, got {type(segments).__name__}")
+        if not isinstance(stats, SegmentStats):
+            raise TypeError(f"stats must be a SegmentStats, got {type(stats).__name__}")
+        self = object.__new__(cls)
+        object.__setattr__(self, "segments", segments)
+        object.__setattr__(self, "stats", stats)
+        return self
+
 
 class Matrix(NamedTuple):
     """A PDF transform ``[a b c d e f]``: it maps (x, y) to (a x + c y + e, b x + d y + f)."""
@@ -156,6 +206,12 @@ class Matrix(NamedTuple):
     def apply(self, x: float, y: float) -> Point:
         """The point (x, y) maps to."""
         return self.a * x + self.c * y + self.e, self.b * x + self.d * y + self.f
+
+    def is_finite(self) -> bool:
+        """True when all six transform coefficients are finite."""
+        isfinite = math.isfinite
+        a, b, c, d, e, f = self
+        return isfinite(a) and isfinite(b) and isfinite(c) and isfinite(d) and isfinite(e) and isfinite(f)
 
 
 IDENTITY = Matrix(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
@@ -438,14 +494,14 @@ def _segment(
         orientation, position, start, end = "v", x0, y0, y1
     if not start < end:
         raise NonFiniteGeometry("path segment collapsed in display space")
-    return RawSegment(
-        orientation=orientation,
-        position=position,
-        start=start,
-        end=end,
-        width=width,
-        kind=kind,
-        object_index=object_index,
-        dashed=paint.dashed and stroke,
-        paint_rgba=paint.stroke_rgba if stroke else paint.fill_rgba,
+    return RawSegment._trusted(
+        orientation,
+        position,
+        start,
+        end,
+        width,
+        kind,
+        object_index,
+        paint.dashed and stroke,
+        paint.stroke_rgba if stroke else paint.fill_rgba,
     )

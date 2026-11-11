@@ -332,32 +332,22 @@ class _PageBudget:
         return fits
 
 
-def collect_images(
+def collect_images_and_refusal(
     placed: Iterable[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix]],
     page_raw: pdfium_c.FPDF_PAGE,
     page_box: Box,
     to_display: Callable[[Box], Box],
-) -> PageImages:
-    """The RawImage of every image object in ``placed``, with the page's image stats.
-
-    Args:
-        placed: Each image object with its walk index and its matrix to PDF
-            user space, in object-walk order.
-        page_raw: The loaded page (pdfium needs it for the colour space).
-        page_box: The visible box ``(left, bottom, right, top)`` in user space.
-        to_display: Maps a user-space box to a displayed, top-left box.
-
-    pdfium call failures raise PdfiumFailure. An image whose geometry is not
-    finite is skipped and counted; every other image is recorded, its stream
-    hash and pixel facts left out (and counted) where reading them is
-    refused (see :class:`ImageStats`). No pixel is decoded.
-    """
+) -> tuple[PageImages, str | None]:
+    """Collect ``PageImages`` plus the first ``render_refusal`` string (if any) in one pass."""
     images: list[RawImage] = []
     counts = dict.fromkeys(("nonfinite", "oversized", "unsized", "over_budget", "overlong"), 0)
     cover = 0.0
+    first_refusal: str | None = None
     for outcome in image_outcomes(placed, page_raw, page_box, to_display):
         if outcome.refusal is not None:
             counts[outcome.refusal[0]] += 1
+            if first_refusal is None and outcome.render_refusal is not None:
+                first_refusal = outcome.render_refusal
         if outcome.image is not None:
             images.append(outcome.image)
             cover = max(cover, outcome.cover_fraction)
@@ -369,7 +359,18 @@ def collect_images(
         skipped_overlong_images=counts["overlong"],
         max_cover_fraction=cover,
     )
-    return PageImages(images=tuple(images), stats=stats)
+    return PageImages(images=tuple(images), stats=stats), first_refusal
+
+
+def collect_images(
+    placed: Iterable[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix]],
+    page_raw: pdfium_c.FPDF_PAGE,
+    page_box: Box,
+    to_display: Callable[[Box], Box],
+) -> PageImages:
+    """The RawImage of every image object in ``placed``, with the page's image stats."""
+    page_imgs, _refusal = collect_images_and_refusal(placed, page_raw, page_box, to_display)
+    return page_imgs
 
 
 def image_outcomes(
