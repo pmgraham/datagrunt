@@ -230,3 +230,14 @@ def test_all_workflow_actions_match_repo_allowlist_and_commit_sha_pinning() -> N
             assert is_local or SHA_PINNED_USES_RE.fullmatch(ref) is not None, (
                 f"Unpinned action {ref!r} in {wf_path.name}"
             )
+
+
+def test_ci_tesseract_apt_install_has_non_ubuntu_com_mirror_fallback() -> None:
+    ci = _load_workflow("ci.yml")
+    for job_id in ("test", "python-compat"):
+        steps = [s for s in _job_steps(ci, job_id) if s.get("name") == "Install tesseract (for PDF OCR tests)"]
+        assert len(steps) == 1
+        cmd = str(steps[0].get("run", ""))
+        assert "tesseract-ocr" in cmd
+        assert "https://mirrors.edge.kernel.org/ubuntu/" in cmd
+        assert "/etc/apt/apt-mirrors.txt" in cmd
