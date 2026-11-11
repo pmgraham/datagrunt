@@ -165,6 +165,13 @@ see, and an occlusion follow-up is proposed for the last two):
 - Text a clip path excludes is not flagged: clip paths are not applied.
 - Text under a later opaque image or fill is not flagged: occlusion is
   not checked.
+- On a ``3 Tr`` CAD line, stem strokes plus an extra visible mark placed at
+  the overhanging character pitch have the same bounding boxes as a genuine
+  1-pitch SHX shift (and satisfy multi-word corroboration when peer words on
+  that span also shift in the same direction), and an interior <= 2-letter
+  gap between a backed letter and a backed letter or footnote ``*`` in a
+  >= 60 %-backed digit-free word is bridged as narrow-glyph dropout: this
+  pure stage inspects glyph boxes rather than glyph outline shapes.
 
 Recovered text (#366 task 3,
 :func:`~datagrunt.pdf.pdfium_engine.recover_dropped_text`) is kept apart from
@@ -464,20 +471,119 @@ def _char_has_glyph_stroke(ch: str, cbox: Box, bands: tuple[_GlyphBand, ...], he
 
 
 _MAX_DRIFT_GAP = 2
+_SIGN_CHARS = frozenset("+-\u2212\u2010\u2011\u2012\u2013\u2014\u2015\u00b1\uff0b\uff0d~")
+_SAFE_TWO_CHAR_WORDS = frozenset(
+    {"TO", "IN", "AT", "OF", "ON", "BY", "AS", "IS", "BE", "IT", "AN", "LA", "LE", "DU", "DE", "AU", "EN", "ET"}
+)
+_UNSAFE_BRIDGE_WORDS = frozenset(
+    {
+        "NO",
+        "NOT",
+        "NOR",
+        "NONE",
+        "NEVER",
+        "NEITHER",
+        "NAUGHT",
+        "CANNOT",
+        "CANT",
+        "DONT",
+        "WONT",
+        "SHANT",
+        "ISNT",
+        "ARENT",
+        "WASNT",
+        "WERENT",
+        "HASNT",
+        "HADNT",
+        "DOESNT",
+        "DIDNT",
+        "WOULDNT",
+        "COULDNT",
+        "SHOULDNT",
+        "MUSTNT",
+        "NOK",
+        "IGNORE",
+    }
+)
+_UNSAFE_TWO_CHAR_PREFIXES = frozenset(
+    {"UN", "IN", "IM", "IL", "IR", "NO", "AB", "AN", "BY", "DE", "RE", "EX", "BI", "CO"}
+)
+_UNSAFE_TWO_CHAR_SUFFIXES = frozenset({"NT"})
+_MIN_MULTI_WORD_COUNT = 2
+_MIN_MULTI_SPAN_ALNUM = 8
+_MIN_MULTI_SPAN_HIT_NUM = 7
+_MULTI_SPAN_HIT_DEN = 10
 
 
-def _bridge_short_drift_gaps(on_page: list[int], backed: list[bool]) -> None:
-    """Bridge strictly interior <= 2-char kerning-drift gaps bracketed on both sides (never prefixes/suffixes)."""
+class _SpanDriftCtx(NamedTuple):
+    """Span and banded-stroke context for 3 Tr SHX kerning-drift overhang checks."""
+
+    span: RawSpan
+    bands: tuple[_GlyphBand, ...]
+    tr3_bands: tuple[_GlyphBand, ...]
+    height: float
+    budget: list[int]
+    single_word: bool = True
+    right_corroborated: bool = False
+    left_corroborated: bool = False
+
+
+def _is_ascii_alpha(ch: str) -> bool:
+    """True strictly for ASCII A-Z / a-z letters (rejecting non-ASCII homoglyphs)."""
+    return ch.isascii() and ch.isalpha()
+
+
+def _is_sign_or_dash(ch: str) -> bool:
+    """True for ASCII/Unicode dashes (category Pd) and plus/minus operators or symbols."""
+    if not ch:
+        return False
+    if ch in _SIGN_CHARS:
+        return True
+    if ord(ch) < 128:
+        return False
+    if unicodedata.category(ch) == "Pd":
+        return True
+    name = unicodedata.name(ch, "")
+    return "MINUS" in name or "PLUS" in name
+
+
+def _gap_is_bridgeable(
+    text: str, on_page: Sequence[int], pos: int, end: int, alpha_hits: int, word_upper: str = ""
+) -> bool:
+    """True when interior gap ``pos..end`` is ASCII letters/separators after a backed ASCII letter."""
+    if pos <= 0 or end >= len(on_page) or end - pos > _MAX_DRIFT_GAP or alpha_hits < 2:
+        return False
+    left_ch, right_ch = text[on_page[pos - 1]], text[on_page[end]]
+    right_ok = _is_ascii_alpha(right_ch) or (right_ch == "*" and alpha_hits >= 3 and not word_upper.endswith("NT"))
+    if not (_is_ascii_alpha(left_ch) and right_ok):
+        return False
+    for k in range(pos, end):
+        ch = text[on_page[k]]
+        if not (_is_ascii_alpha(ch) or (alpha_hits >= 4 and ch in "-_")):
+            return False
+    return True
+
+
+def _bridge_short_drift_gaps(text: str, on_page: Sequence[int], backed: list[bool], alpha_hits: int = 0) -> None:
+    """Bridge strictly interior <= 2-char kerning-drift gaps in O(N) on safe digit-free tokens."""
     n = len(on_page)
+    if n < 3 or not text or any(text[i].isdigit() for i in on_page):
+        return
+    word_upper = "".join(text[i] for i in on_page if text[i].isalnum()).upper()
+    if word_upper in _UNSAFE_BRIDGE_WORDS:
+        return
+    non_sign_left = False
     pos = 0
     while pos < n:
-        if backed[on_page[pos]]:
+        idx = on_page[pos]
+        if backed[idx]:
+            non_sign_left = non_sign_left or not _is_sign_or_dash(text[idx])
             pos += 1
             continue
         end = pos + 1
         while end < n and not backed[on_page[end]]:
             end += 1
-        if pos > 0 and end < n and end - pos <= _MAX_DRIFT_GAP:
+        if non_sign_left and _gap_is_bridgeable(text, on_page, pos, end, alpha_hits, word_upper):
             for k in range(pos, end):
                 backed[on_page[k]] = True
         pos = end
@@ -487,7 +593,7 @@ def _adjacent_word_bound(
     edge_box: Box, tr3_bands: tuple[_GlyphBand, ...], height: float, budget: list[int], *, right_side: bool
 ) -> float | None:
     """Nearest adjacent non-space 3 Tr character edge on the same line across all spans, or None."""
-    if not tr3_bands:
+    if not tr3_bands or height <= 0.0:
         return None
     wx0, wy0, wx1, wy1 = edge_box
     cw, ch_h = max(wx1 - wx0, 0.0), max(wy1 - wy0, 0.0)
@@ -516,6 +622,37 @@ def _adjacent_word_bound(
     return best
 
 
+def _stroke_matches_overhang(
+    box: Box,
+    wx0: float,
+    wx1: float,
+    cw: float,
+    ch_h: float,
+    max_side: float,
+    qy0: float,
+    qy1: float,
+    gap_lo: float,
+    gap_hi: float,
+    edge_ch: str,
+    *,
+    right_side: bool,
+) -> bool:
+    """True when ``box`` is a glyph-scale stroke centred inside ``[gap_lo, gap_hi]`` past the word edge."""
+    vx0, vy0, vx1, vy1 = box
+    if vy0 > qy1 or qy0 > vy1:
+        return False
+    vw, vh = vx1 - vx0, vy1 - vy0
+    if vw > max_side:
+        return False
+    vmid = 0.5 * (vx0 + vx1)
+    overhangs = (vx1 > wx1 + 0.5 if right_side else vx0 < wx0 - 0.5) and gap_lo <= vmid <= gap_hi
+    if not overhangs:
+        return False
+    if max(0.18 * ch_h, 1.2) <= vh <= max_side:
+        return True
+    return edge_ch in "*°'\".,:;)]}" and 0.8 <= vh <= max(ch_h * 2.0, 6.0) and vw <= max(cw * 2.0, 6.0)
+
+
 def _word_has_drift_overhang(
     edge_box: Box,
     edge_ch: str,
@@ -525,17 +662,25 @@ def _word_has_drift_overhang(
     budget: list[int],
     *,
     right_side: bool,
+    min_chars: int = 1,
 ) -> bool:
-    """True when a glyph stroke overhangs the full token into unclaimed inter-word whitespace."""
+    """True when glyph stroke(s) overhang the token into unclaimed inter-word whitespace."""
+    if not bands or not edge_ch or min_chars < 1:
+        return False
     wx0, wy0, wx1, wy1 = edge_box
     cw, ch_h = max(wx1 - wx0, 0.0), max(wy1 - wy0, 0.0)
+    free_reach = max(cw, 2.0) if min_chars == 1 else max(cw * 2.5, 5.0)
     bound = _adjacent_word_bound(edge_box, tr3_bands, height, budget, right_side=right_side)
-    gap_lo = wx1 + 0.2 if right_side else ((bound + 0.2) if bound is not None else wx0 - max(cw, 2.0))
-    gap_hi = ((bound - 0.2) if bound is not None else wx1 + max(cw, 2.0)) if right_side else wx0 - 0.2
-    if gap_lo >= gap_hi:
+    gap_lo = wx1 + 0.2 if right_side else ((bound + 0.2) if bound is not None else wx0 - free_reach)
+    gap_hi = ((bound - 0.2) if bound is not None else wx1 + free_reach) if right_side else wx0 - 0.2
+    min_gap = 0.0 if min_chars == 1 else max(1.35 * cw, 4.0)
+    if gap_hi - gap_lo <= min_gap:
         return False
     max_side = min(max(2.5 * max(cw, ch_h, 4.0), 18.0), 36.0)
     qy0, qy1 = wy0 - _VECTOR_TOL_PT, wy1 + _VECTOR_TOL_PT
+    far_step = max(1.05 * cw, 2.0)
+    seen: set[Box] = set()
+    far_ok = min_chars == 1
     for band_idx in _bands_of(qy0, qy1, height):
         gband = bands[band_idx]
         lo = bisect.bisect_left(gband.x0s, gap_lo - gband.max_w - 1e-6)
@@ -544,89 +689,177 @@ def _word_has_drift_overhang(
             budget[0] -= 1
             if budget[0] < 0:
                 return False
-            vx0, vy0, vx1, vy1 = gband.boxes[idx]
-            vw, vh = vx1 - vx0, vy1 - vy0
-            vmid = 0.5 * (vx0 + vx1)
-            overhangs = (vx1 > wx1 + 0.5 if right_side else vx0 < wx0 - 0.5) and gap_lo <= vmid <= gap_hi
-            vh_ok = (max(0.18 * ch_h, 1.2) <= vh <= max_side) or (
-                edge_ch in "*°'\".,:;)]}" and 0.8 <= vh <= max(ch_h * 2.0, 6.0) and vw <= max(cw * 2.0, 6.0)
-            )
-            if vy0 <= qy1 and qy0 <= vy1 and vw <= max_side and vh_ok and overhangs:
+            box = gband.boxes[idx]
+            if not _stroke_matches_overhang(
+                box, wx0, wx1, cw, ch_h, max_side, qy0, qy1, gap_lo, gap_hi, edge_ch, right_side=right_side
+            ):
+                continue
+            seen.add(box)
+            far_ok = far_ok or (box[2] > wx1 + far_step if right_side else box[0] < wx0 - far_step)
+            if len(seen) >= min_chars and far_ok:
                 return True
     return False
 
 
-def _mark_word_backing(
-    span: RawSpan,
-    start: int,
-    end: int,
-    width: float,
-    height: float,
-    bands: tuple[_GlyphBand, ...],
-    tr3_bands: tuple[_GlyphBand, ...],
-    budget: list[int],
+def _overhangs_edge(ctx: _SpanDriftCtx, edge_idx: int, *, right_side: bool, min_chars: int = 1) -> bool:
+    """True when ``ctx.span``'s edge char at ``edge_idx`` has SHX drift overhang on ``right_side``."""
+    if edge_idx < 0 or edge_idx >= len(ctx.span.text):
+        return False
+    return _word_has_drift_overhang(
+        ctx.span.char_boxes[edge_idx],
+        ctx.span.text[edge_idx],
+        ctx.bands,
+        ctx.tr3_bands,
+        ctx.height,
+        ctx.budget,
+        right_side=right_side,
+        min_chars=min_chars,
+    )
+
+
+def _has_sign_prefix(text: str, on_page: Sequence[int], alnum: Sequence[int]) -> bool:
+    """True when any on-page character before ``alnum[0]`` is an ASCII or Unicode sign/dash."""
+    if not text or not on_page or not alnum:
+        return False
+    first_alnum = alnum[0]
+    return any(_is_sign_or_dash(text[i]) for i in on_page if i < first_alnum)
+
+
+def _is_eu_directive_lead_digit(
+    ch: str,
+    text: str,
+    on_page: Sequence[int],
+    alnum: Sequence[int],
+    alpha_hits: int,
+    *,
+    min_alpha_hits: int = 2,
+) -> bool:
+    """True only for an unsigned ASCII YYYY/NN/XX directive with 4-digit year ('1'/'2' lead)."""
+    if ch not in "12" or len(alnum) < 7 or alpha_hits < min_alpha_hits or _has_sign_prefix(text, on_page, alnum):
+        return False
+    if any(not text[i].isascii() or _is_sign_or_dash(text[i]) or text[i] in ".,:_-" for i in on_page):
+        return False
+    slashes = [i for i in on_page if alnum[0] < i < alnum[-1] and text[i] == "/"]
+    if len(slashes) != 2 or not (_is_ascii_alpha(text[alnum[-2]]) and _is_ascii_alpha(text[alnum[-1]])):
+        return False
+    year_digits = [i for i in alnum if i < slashes[0]]
+    return len(year_digits) == 4 and all(text[i].isdigit() for i in year_digits)
+
+
+def _edge_char_ok(
+    ch: str,
+    text: str,
+    on_page: Sequence[int],
+    alnum: Sequence[int],
+    alpha_hits: int,
+    *,
+    leading: bool = True,
+    single_word: bool = True,
+    side_corroborated: bool = False,
+) -> bool:
+    """True when 1-char ASCII edge ``ch`` is a safe corroborated letter or YYYY/NN/XX directive digit."""
+    if len(ch) != 1 or not on_page or not alnum or not all(text[i].isascii() for i in on_page):
+        return False
+    if _has_sign_prefix(text, on_page, alnum):
+        return False
+    if ch.isdigit():
+        return leading and _is_eu_directive_lead_digit(ch, text, on_page, alnum, alpha_hits)
+    if not _is_ascii_alpha(ch):
+        return False
+    word_upper = "".join(text[i] for i in alnum).upper()
+    if word_upper in _UNSAFE_BRIDGE_WORDS:
+        return False
+    if not single_word and not side_corroborated:
+        return False
+    if single_word and leading and ch.upper() in "AN":
+        return False
+    if alpha_hits >= 2:
+        return True
+    return not leading and _is_eu_directive_lead_digit(
+        text[alnum[0]], text, on_page, alnum, alpha_hits, min_alpha_hits=1
+    )
+
+
+def _two_letter_gap_ready(text: str, direct: Sequence[bool], miss0: int, miss1: int, anchor: int) -> bool:
+    """True when ``miss0, miss1`` are contiguous unbacked ASCII letters adjacent to backed ``anchor``."""
+    if not text or not direct or max(miss0, miss1, anchor) - min(miss0, miss1, anchor) != 2:
+        return False
+    if direct[miss0] or direct[miss1] or not direct[anchor]:
+        return False
+    return _is_ascii_alpha(text[miss0]) and _is_ascii_alpha(text[miss1]) and _is_ascii_alpha(text[anchor])
+
+
+def _bridge_two_char_word(
+    ctx: _SpanDriftCtx,
+    on_page: Sequence[int],
+    alnum: Sequence[int],
+    direct: Sequence[bool],
     backed: list[bool],
 ) -> None:
-    """Back on-page characters and bridge interior <= 2-char or overhang-proven 1-letter edge SHX drift."""
-    on_page = [i for i in range(start, end) if not off_page(span.char_boxes[i], width, height)]
-    if not on_page:
+    """Bridge an allowlisted 2-letter ASCII preposition/article in a corroborated multi-word span."""
+    text = ctx.span.text
+    if not on_page or len(alnum) != 2 or len(on_page) > 3 or not all(text[i].isascii() for i in on_page):
         return
-    for idx in on_page:
-        backed[idx] = _char_has_glyph_stroke(span.text[idx], span.char_boxes[idx], bands, height, budget)
-    alnum = [i for i in on_page if span.text[i].isalnum()]
-    alnum_hits = sum(1 for i in alnum if backed[i])
-    if len(alnum) >= 3 and alnum_hits >= 2 and alnum_hits * 5 >= 3 * len(alnum):
-        alpha_hits = sum(1 for i in alnum if backed[i] and span.text[i].isalpha())
-        lead_ok = (
-            alpha_hits >= 2
-            and not backed[alnum[0]]
-            and backed[alnum[1]]
-            and span.text[alnum[0]].isalpha()
-            and _word_has_drift_overhang(
-                span.char_boxes[on_page[-1]],
-                span.text[on_page[-1]],
-                bands,
-                tr3_bands,
-                height,
-                budget,
-                right_side=True,
-            )
-        )
-        trail_ok = (
-            alpha_hits >= 2
-            and not backed[alnum[-1]]
-            and backed[alnum[-2]]
-            and span.text[alnum[-1]].isalpha()
-            and _word_has_drift_overhang(
-                span.char_boxes[on_page[0]],
-                span.text[on_page[0]],
-                bands,
-                tr3_bands,
-                height,
-                budget,
-                right_side=False,
-            )
-        )
-        _bridge_short_drift_gaps(on_page, backed)
-        if lead_ok:
-            backed[alnum[0]] = True
-        if trail_ok:
-            backed[alnum[-1]] = True
+    if _has_sign_prefix(text, on_page, alnum) or alnum[1] - alnum[0] != 1:
+        return
+    if not (_is_ascii_alpha(text[alnum[0]]) and _is_ascii_alpha(text[alnum[1]])):
+        return
+    word_upper = (text[alnum[0]] + text[alnum[1]]).upper()
+    if word_upper not in _SAFE_TWO_CHAR_WORDS or direct[alnum[0]] == direct[alnum[1]]:
+        return
+    right_side = not direct[alnum[0]]
+    corroborated = ctx.right_corroborated if right_side else ctx.left_corroborated
+    edge_idx = on_page[-1] if right_side else on_page[0]
+    if corroborated and _overhangs_edge(ctx, edge_idx, right_side=right_side):
+        backed[alnum[0] if right_side else alnum[1]] = True
 
 
-def _char_vector_flags(
-    span: RawSpan,
-    width: float,
-    height: float,
-    bands: tuple[_GlyphBand, ...],
-    budget: list[int],
-    tr3_bands: tuple[_GlyphBand, ...] = (),
-) -> tuple[bool, ...]:
-    """Word-aware vector-stroke backing flags; internal spaces stay visible only between backed neighbours."""
+def _bridge_two_char_edge_drift(
+    ctx: _SpanDriftCtx,
+    on_page: Sequence[int],
+    alnum: Sequence[int],
+    direct: Sequence[bool],
+    backed: list[bool],
+) -> None:
+    """Bridge a safe 2-letter ASCII word-edge gap in a corroborated multi-word span with 2-glyph overhang."""
+    text = ctx.span.text
+    if not on_page or len(alnum) < 4 or not all(text[i].isascii() for i in on_page):
+        return
+    if _has_sign_prefix(text, on_page, alnum):
+        return
+    word_upper = "".join(text[i] for i in alnum).upper()
+    if word_upper in _UNSAFE_BRIDGE_WORDS:
+        return
+    alnum_hits = sum(1 for i in alnum if direct[i])
+    alpha_hits = sum(1 for i in alnum if direct[i] and _is_ascii_alpha(text[i]))
+    if alpha_hits < 2 or alnum_hits * 2 < len(alnum):
+        return
+    lead_pair = (text[alnum[0]] + text[alnum[1]]).upper()
+    lead_ready = (
+        ctx.right_corroborated
+        and lead_pair not in _UNSAFE_TWO_CHAR_PREFIXES
+        and _two_letter_gap_ready(text, direct, alnum[0], alnum[1], alnum[2])
+    )
+    if lead_ready and _overhangs_edge(ctx, on_page[-1], right_side=True, min_chars=2):
+        backed[alnum[0]] = True
+        backed[alnum[1]] = True
+    trail_pair = (text[alnum[-2]] + text[alnum[-1]]).upper()
+    trail_ready = (
+        ctx.left_corroborated
+        and trail_pair not in _UNSAFE_TWO_CHAR_SUFFIXES
+        and _two_letter_gap_ready(text, direct, alnum[-2], alnum[-1], alnum[-3])
+    )
+    if trail_ready and _overhangs_edge(ctx, on_page[0], right_side=False, min_chars=2):
+        backed[alnum[-2]] = True
+        backed[alnum[-1]] = True
+
+
+def _span_word_slices(span: RawSpan, width: float, height: float) -> tuple[list[int], ...]:
+    """Non-empty on-page index slices for each whitespace-separated token of ``span`` in O(N)."""
     n = len(span.text)
-    if span.render_mode != _INVISIBLE_TEXT_MODE or not bands or n == 0:
-        return (False,) * n
-    backed = [False] * n
+    if n == 0 or width <= 0.0 or height <= 0.0:
+        return ()
+    words: list[list[int]] = []
     pos = 0
     while pos < n:
         if span.text[pos].isspace():
@@ -635,10 +868,140 @@ def _char_vector_flags(
         end = pos + 1
         while end < n and not span.text[end].isspace():
             end += 1
-        _mark_word_backing(span, pos, end, width, height, bands, tr3_bands, budget, backed)
+        on_page = [i for i in range(pos, end) if not off_page(span.char_boxes[i], width, height)]
+        if on_page:
+            words.append(on_page)
         pos = end
-    if not any(backed):
-        return tuple(backed)
+    return tuple(words)
+
+
+def _multi_word_span_qualifies(text: str, words: Sequence[Sequence[int]], direct: Sequence[bool]) -> bool:
+    """True when a multi-word on-page 3 Tr span has >= 8 alnum chars, >= 70% direct hits, and >= 2 hit words."""
+    if len(words) < _MIN_MULTI_WORD_COUNT or not text or not direct:
+        return False
+    alnum_total = 0
+    alnum_hits = 0
+    words_with_hits = 0
+    for word in words:
+        word_alnum = [i for i in word if text[i].isalnum()]
+        hits = sum(1 for i in word_alnum if direct[i])
+        alnum_total += len(word_alnum)
+        alnum_hits += hits
+        if hits > 0:
+            words_with_hits += 1
+    if alnum_total < _MIN_MULTI_SPAN_ALNUM or words_with_hits < _MIN_MULTI_WORD_COUNT:
+        return False
+    return alnum_hits * _MULTI_SPAN_HIT_DEN >= _MIN_MULTI_SPAN_HIT_NUM * alnum_total
+
+
+def _word_drifts_toward(
+    ctx: _SpanDriftCtx, on_page: Sequence[int], direct: Sequence[bool], *, right_side: bool
+) -> bool:
+    """True when ``on_page`` has direct alnum hits, misses its opposite edge, and overhangs ``right_side``."""
+    text = ctx.span.text
+    if not on_page or not direct:
+        return False
+    alnum = [i for i in on_page if text[i].isalnum()]
+    if len(alnum) < 2 or not any(direct[i] for i in alnum):
+        return False
+    missed_edge = not direct[alnum[0]] if right_side else not direct[alnum[-1]]
+    if not missed_edge:
+        return False
+    two_missed = len(alnum) >= 4 and (not direct[alnum[1]] if right_side else not direct[alnum[-2]])
+    edge_idx = on_page[-1] if right_side else on_page[0]
+    return _overhangs_edge(ctx, edge_idx, right_side=right_side, min_chars=2 if two_missed else 1)
+
+
+def _with_span_corroboration(
+    base_ctx: _SpanDriftCtx, words: Sequence[Sequence[int]], direct: Sequence[bool]
+) -> _SpanDriftCtx:
+    """Populate multi-word directional drift corroboration (>= 2 words and unidirectional) onto ``base_ctx``."""
+    if len(words) < _MIN_MULTI_WORD_COUNT or not direct:
+        return base_ctx
+    right_n = sum(1 for w in words if _word_drifts_toward(base_ctx, w, direct, right_side=True))
+    left_n = sum(1 for w in words if _word_drifts_toward(base_ctx, w, direct, right_side=False))
+    right_ok = right_n >= _MIN_MULTI_WORD_COUNT and left_n == 0 and right_n * 2 >= len(words)
+    left_ok = left_n >= _MIN_MULTI_WORD_COUNT and right_n == 0 and left_n * 2 >= len(words)
+    return base_ctx._replace(single_word=False, right_corroborated=right_ok, left_corroborated=left_ok)
+
+
+def _bridge_single_word_edges(
+    ctx: _SpanDriftCtx,
+    on_page: Sequence[int],
+    alnum: Sequence[int],
+    direct: Sequence[bool],
+    backed: list[bool],
+) -> None:
+    """Bridge interior <= 2-char gaps first, then overhang-proven 1-char word edges on >= 60%-backed tokens."""
+    if not on_page or len(alnum) < 3:
+        return
+    text = ctx.span.text
+    alpha_n = sum(1 for i in alnum if direct[i] and _is_ascii_alpha(text[i]))
+    ch0, ch1 = text[alnum[0]], text[alnum[-1]]
+    lead_cand = (
+        not direct[alnum[0]]
+        and direct[alnum[1]]
+        and _edge_char_ok(
+            ch0,
+            text,
+            on_page,
+            alnum,
+            alpha_n,
+            leading=True,
+            single_word=ctx.single_word,
+            side_corroborated=ctx.right_corroborated,
+        )
+    )
+    lead_ok = lead_cand and _overhangs_edge(ctx, on_page[-1], right_side=True)
+    trail_cand = (
+        not direct[alnum[-1]]
+        and direct[alnum[-2]]
+        and _edge_char_ok(
+            ch1,
+            text,
+            on_page,
+            alnum,
+            alpha_n,
+            leading=False,
+            single_word=ctx.single_word,
+            side_corroborated=ctx.left_corroborated,
+        )
+    )
+    trail_ok = trail_cand and _overhangs_edge(ctx, on_page[0], right_side=False)
+    _bridge_short_drift_gaps(text, on_page, backed, alpha_n)
+    if lead_ok:
+        backed[alnum[0]] = True
+    if trail_ok:
+        backed[alnum[-1]] = True
+
+
+def _mark_word_backing(
+    ctx: _SpanDriftCtx,
+    on_page: Sequence[int],
+    direct: Sequence[bool],
+    backed: list[bool],
+    *,
+    multi_word_ok: bool = False,
+) -> None:
+    """Bridge single-word (>= 60%) and vetted multi-word-span SHX drift gaps onto ``backed``."""
+    if not on_page or not direct:
+        return
+    alnum = [i for i in on_page if ctx.span.text[i].isalnum()]
+    alnum_hits = sum(1 for i in alnum if direct[i])
+    if alnum_hits == 0:
+        return
+    if len(alnum) >= 3 and alnum_hits >= 2 and alnum_hits * 5 >= 3 * len(alnum):
+        _bridge_single_word_edges(ctx, on_page, alnum, direct, backed)
+    if multi_word_ok:
+        _bridge_two_char_word(ctx, on_page, alnum, direct, backed)
+        _bridge_two_char_edge_drift(ctx, on_page, alnum, direct, backed)
+
+
+def _propagate_internal_spaces(span: RawSpan, width: float, height: float, backed: Sequence[bool]) -> tuple[bool, ...]:
+    """Mark on-page spaces visible strictly when both immediate non-space neighbours in ``span`` are backed."""
+    n = len(span.text)
+    if n == 0 or not any(backed):
+        return (False,) * n
     left_ok = [False] * n
     last = False
     for idx, ch in enumerate(span.text):
@@ -656,6 +1019,36 @@ def _char_vector_flags(
         or (span.text[i].isspace() and not off_page(span.char_boxes[i], width, height) and left_ok[i] and right_ok[i])
         for i in range(n)
     )
+
+
+def _char_vector_flags(
+    span: RawSpan,
+    width: float,
+    height: float,
+    bands: tuple[_GlyphBand, ...],
+    budget: list[int],
+    tr3_bands: tuple[_GlyphBand, ...] = (),
+) -> tuple[bool, ...]:
+    """Word-aware vector-stroke backing flags; internal spaces stay visible only between backed neighbours."""
+    n = len(span.text)
+    if span.render_mode != _INVISIBLE_TEXT_MODE or not bands or n == 0:
+        return (False,) * n
+    words = _span_word_slices(span, width, height)
+    if not words:
+        return (False,) * n
+    backed = [False] * n
+    for on_page in words:
+        for idx in on_page:
+            backed[idx] = _char_has_glyph_stroke(span.text[idx], span.char_boxes[idx], bands, height, budget)
+    direct = tuple(backed)
+    if not any(direct):
+        return direct
+    base_ctx = _SpanDriftCtx(span=span, bands=bands, tr3_bands=tr3_bands, height=height, budget=budget)
+    ctx = _with_span_corroboration(base_ctx, words, direct)
+    multi_word_ok = _multi_word_span_qualifies(span.text, words, direct)
+    for on_page in words:
+        _mark_word_backing(ctx, on_page, direct, backed, multi_word_ok=multi_word_ok)
+    return _propagate_internal_spaces(span, width, height, backed)
 
 
 def _classify(
