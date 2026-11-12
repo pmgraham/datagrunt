@@ -65,6 +65,8 @@ MAX_IMAGES_BYTES = 32 * 1024 * 1024
 """The largest combined byte size of ``ModelRequest.images`` (32 MiB)."""
 
 _BRIEF_CHARS = 80
+_JSON_SCALARS: tuple[type, ...] = (int, bool)
+_CLONE_MAX_NODES = 1_000_000
 
 
 def _brief(value: object) -> str:
@@ -260,3 +262,173 @@ class ProviderResponse:
         if missing or extra:
             raise ValueError(f"ProviderResponse fields must be exactly {names}: missing {missing}, extra {extra[:5]}")
         return cls(**{name: data[name] for name in names})
+
+
+def _clone_item(
+    item: Any,
+    dicts: list[tuple[Mapping[str, Any], dict[str, Any]]],
+    lists: list[tuple[list[Any], list[Any]]],
+) -> Any:
+    """Return a verified immutable JSON scalar, or queue a fresh ``dict`` / ``list`` container."""
+    kind = type(item)
+    if item is None or kind in _JSON_SCALARS:
+        return item
+    if kind is str:
+        if not item.isascii():
+            _check_encodable("json", item)
+        return item
+    if kind is float:
+        if not math.isfinite(item):
+            raise ValueError("JSON number must be finite")
+        return item
+    if kind is list:
+        child_list: list[Any] = []
+        lists.append((item, child_list))
+        return child_list
+    if kind is dict or isinstance(item, Mapping):
+        child_dict: dict[str, Any] = {}
+        dicts.append((item, child_dict))
+        return child_dict
+    raise ValueError(f"JSON value cannot be {kind.__name__}")
+
+
+def _clone_dict_into(
+    source: Mapping[str, Any],
+    target: dict[str, Any],
+    dicts: list[tuple[Mapping[str, Any], dict[str, Any]]],
+    lists: list[tuple[list[Any], list[Any]]],
+) -> None:
+    """Copy UTF-8 string-keyed entries from ``source`` into ``target`` in sorted key order."""
+    for key in source:
+        if type(key) is not str:
+            raise ValueError(f"JSON object key must be str, got {type(key).__name__}")
+        if not key.isascii():
+            _check_encodable("json", key)
+    for key in sorted(source):
+        target[key] = _clone_item(source[key], dicts, lists)
+
+
+def _clone_json(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Iteratively deep-copy a verified JSON object without serializing or reparsing JSON text."""
+    if not isinstance(value, Mapping):
+        raise TypeError(f"value must be a Mapping, got {type(value).__name__}")
+    root: dict[str, Any] = {}
+    dicts: list[tuple[Mapping[str, Any], dict[str, Any]]] = [(value, root)]
+    lists: list[tuple[list[Any], list[Any]]] = []
+    nodes = 1
+    while dicts or lists:
+        if dicts:
+            src_dict, dst_dict = dicts.pop()
+            nodes += len(src_dict)
+            if nodes > _CLONE_MAX_NODES:
+                raise ValueError(f"JSON object exceeds {_CLONE_MAX_NODES} nodes")
+            _clone_dict_into(src_dict, dst_dict, dicts, lists)
+        else:
+            src_list, dst_list = lists.pop()
+            nodes += len(src_list)
+            if nodes > _CLONE_MAX_NODES:
+                raise ValueError(f"JSON object exceeds {_CLONE_MAX_NODES} nodes")
+            dst_list.extend(_clone_item(item, dicts, lists) for item in src_list)
+    return root
+
+
+def _check_trusted_str(name: str, value: object) -> str:
+    """Require a non-blank valid Unicode ``str``, fast-pathing ASCII strings in ``O(1)``."""
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a str, got {type(value).__name__}")
+    if not value.strip():
+        raise ValueError(f"{name} must be non-blank")
+    if not value.isascii():
+        _check_encodable(name, value)
+    return value
+
+
+def _trusted_model_request(
+    unit_id: str,
+    model_id: str,
+    system_prompt: str,
+    user_envelope: str,
+    json_schema: Mapping[str, Any],
+    max_output_tokens: int,
+    timeout_s: float,
+    images: tuple[bytes, ...] = (),
+) -> ModelRequest:
+    """Construct a :class:`ModelRequest` from pre-validated pipeline inputs without JSON reparsing."""
+    _check_trusted_str("unit_id", unit_id)
+    _check_trusted_str("model_id", model_id)
+    _check_trusted_str("system_prompt", system_prompt)
+    _check_trusted_str("user_envelope", user_envelope)
+    if type(max_output_tokens) is not int:
+        raise TypeError(f"max_output_tokens must be an int, got {type(max_output_tokens).__name__}")
+    if not 1 <= max_output_tokens <= MAX_OUTPUT_TOKENS:
+        raise ValueError(f"max_output_tokens must be in 1-{MAX_OUTPUT_TOKENS}, got {max_output_tokens}")
+    if not isinstance(images, tuple):
+        raise TypeError(f"images must be a tuple of PNG bytes, got {type(images).__name__}")
+    if images:
+        _check_images(images)
+    schema_copy = _clone_json(json_schema)
+    seconds = _check_timeout(timeout_s)
+    req = object.__new__(ModelRequest)
+    object.__setattr__(req, "unit_id", unit_id)
+    object.__setattr__(req, "model_id", model_id)
+    object.__setattr__(req, "system_prompt", system_prompt)
+    object.__setattr__(req, "user_envelope", user_envelope)
+    object.__setattr__(req, "json_schema", schema_copy)
+    object.__setattr__(req, "max_output_tokens", max_output_tokens)
+    object.__setattr__(req, "timeout_s", seconds)
+    object.__setattr__(req, "images", images)
+    return req
+
+
+def _check_trusted_raw_text(raw_text: object) -> str:
+    """Validate ``raw_text`` UTF-8 validity and byte bound, fast-pathing ASCII strings."""
+    if not isinstance(raw_text, str):
+        raise TypeError(f"raw_text must be a str, got {type(raw_text).__name__}")
+    if len(raw_text) > RAW_TEXT_MAX_BYTES:
+        raise ValueError(f"raw_text passes {RAW_TEXT_MAX_BYTES} bytes of UTF-8")
+    if not raw_text.isascii():
+        _check_encodable("raw_text", raw_text)
+        if len(raw_text.encode("utf-8")) > RAW_TEXT_MAX_BYTES:
+            raise ValueError(f"raw_text passes {RAW_TEXT_MAX_BYTES} bytes of UTF-8")
+    return raw_text
+
+
+def _trusted_provider_response(
+    content: Mapping[str, Any] | None,
+    raw_text: str,
+    finish: FinishReason,
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+) -> ProviderResponse:
+    """Construct a :class:`ProviderResponse` from verified JSON without canonical serialize/parse cycles."""
+    checked_raw = _check_trusted_raw_text(raw_text)
+    if type(finish) is not str:
+        raise TypeError(f"finish must be a str, got {type(finish).__name__}")
+    if finish not in FINISH_REASONS:
+        raise ValueError(f"finish must be one of {FINISH_REASONS}, got {_brief(finish)}")
+    _check_count("input_tokens", input_tokens)
+    _check_count("output_tokens", output_tokens)
+    cloned = None if content is None else _clone_json(content)
+    resp = object.__new__(ProviderResponse)
+    object.__setattr__(resp, "content", cloned)
+    object.__setattr__(resp, "raw_text", checked_raw)
+    object.__setattr__(resp, "finish", finish)
+    object.__setattr__(resp, "input_tokens", input_tokens)
+    object.__setattr__(resp, "output_tokens", output_tokens)
+    return resp
+
+
+def _to_trusted_json(response: ProviderResponse) -> dict[str, Any]:
+    """Return ``response`` as a fresh JSON dict using :func:`_clone_json` instead of :func:`canonical_copy`."""
+    if not isinstance(response, ProviderResponse):
+        raise TypeError(f"response must be a ProviderResponse, got {type(response).__name__}")
+    if response.finish not in FINISH_REASONS:
+        raise ValueError(f"finish must be one of {FINISH_REASONS}, got {_brief(response.finish)}")
+    content = None if response.content is None else _clone_json(response.content)
+    return {
+        "content": content,
+        "raw_text": response.raw_text,
+        "finish": response.finish,
+        "input_tokens": response.input_tokens,
+        "output_tokens": response.output_tokens,
+    }

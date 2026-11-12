@@ -697,3 +697,70 @@ def test_to_dicts_and_to_arrow_table() -> None:
     assert isinstance(arrow_tbl, pa.Table)
     expected_tbl = result.to_dataframe(flatten="items", include_disputed=True).to_arrow()
     assert arrow_tbl.equals(expected_tbl)
+
+
+def test_spec_cached_and_flatten_skips_dropped_sibling_lists() -> None:
+    bad_sibling_company = Company(
+        company_id="C-9",
+        company_name="SkipCo",
+        departments=[
+            Department(
+                dept_id="D-9",
+                dept_name="R&D",
+                codes=[INT64_MAX + 1],
+                employees=[Employee(emp_id="E-9", name="Alan", skills=["math"])],
+            ),
+            Department(dept_id="D-10", dept_name="Ops", codes=[], employees=[]),
+        ],
+        line_items=[LineItem(sku="BAD", qty=INT64_MAX + 1, unit_price=Decimal("1.00"))],
+    )
+    item_clean = make_grounded(bad_sibling_company, status="consensus", key=("C-9",))
+    item_disp = make_grounded(
+        Company(company_id="C-10", company_name="EmptyCo"),
+        doc_id="doc_2",
+        status="missing_in_some_models",
+        key=("C-10",),
+    )
+    res = RationalizedResult(
+        items=(item_clean, item_disp),
+        records=(bad_sibling_company,),
+        needs_review=(item_disp,),
+        quarantined=(),
+        failed_units=(),
+        empty_units=(),
+        skipped_units=(),
+        telemetry=make_telemetry(),
+    )
+    assert res._optional_spec() is res._optional_spec()
+    df = res.to_dataframe(flatten="departments.employees", include_disputed=True)
+    assert df["company_id"].to_list() == ["C-9", "C-9", "C-10"]
+    assert df["departments.dept_id"].to_list() == ["D-9", "D-10", None]
+    assert df["departments.employees.emp_id"].to_list() == ["E-9", None, None]
+    assert df["_status"].to_list() == ["consensus", "consensus", "missing_in_some_models"]
+    assert df["_doc_id"].to_list() == ["doc_1", "doc_1", "doc_2"]
+
+
+def test_lazy_error_paths_across_unflattened_and_flattened_levels() -> None:
+    bad_co = Company(
+        company_id="C-9",
+        company_name="SkipCo",
+        departments=[Department(dept_id="D-9", dept_name="R&D", codes=[INT64_MAX + 1], employees=[])],
+        line_items=[LineItem(sku="BAD", qty=INT64_MAX + 1, unit_price=Decimal("1.00"))],
+    )
+    item = make_grounded(bad_co, status="consensus", key=("C-9",))
+    res = RationalizedResult(
+        items=(item,),
+        records=(bad_co,),
+        needs_review=(),
+        quarantined=(),
+        failed_units=(),
+        empty_units=(),
+        skipped_units=(),
+        telemetry=make_telemetry(),
+    )
+    with pytest.raises(RationalizationError, match=r"^departments\[0\]\.codes\[0\]: int value is outside Int64"):
+        res.to_dataframe(flatten="departments.codes")
+    with pytest.raises(RationalizationError, match=r"^line_items\[0\]\.qty: int value is outside Int64"):
+        res.to_dataframe(flatten="line_items")
+    with pytest.raises(RationalizationError, match=r"^departments\[0\]\.codes\[0\]: int value is outside Int64"):
+        res.to_dataframe()

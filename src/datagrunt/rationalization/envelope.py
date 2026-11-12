@@ -110,6 +110,7 @@ from typing import Literal, TypeAlias, get_args
 
 from datagrunt.pdf.elements import (
     BulletList,
+    DatagruntPDFError,
     DocumentElement,
     Figure,
     Heading,
@@ -118,6 +119,8 @@ from datagrunt.pdf.elements import (
     Paragraph,
     PDFDocument,
     Table,
+    _gfm_row,
+    _markdown_literal,
 )
 from datagrunt.rationalization._canonical import canonical_json, strict_loads
 from datagrunt.rationalization.exceptions import RationalizationError
@@ -125,6 +128,7 @@ from datagrunt.rationalization.units import (
     BLOCK_SEPARATOR,
     GroupScope,
     PartOf,
+    SkippedUnit,
     Unit,
     _check_bool,
     _shared_openers,
@@ -147,6 +151,7 @@ __all__ = [
     "EscapeCounts",
     "build_envelope",
     "build_envelopes",
+    "build_envelopes_isolated",
     "element_escape_counts",
     "element_text",
     "escape",
@@ -284,6 +289,12 @@ _KINDS: tuple[tuple[type, str], ...] = (
     (BulletList, "list"),
     (Figure, "figure"),
 )
+_FATAL_PDF_NAMES: frozenset[str] = frozenset(
+    {"PDFEncryptedError", "PDFCorruptError", "PDFSourceChangedError", "BundleCorruptError"}
+)
+_DEFAULT_FATAL_ERRORS: tuple[type[BaseException], ...] = tuple(
+    cls for cls in DatagruntPDFError.__subclasses__() if cls.__name__ in _FATAL_PDF_NAMES
+)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -335,22 +346,13 @@ def escape_counts(text: str) -> EscapeCounts:
     return tuple((category, counter[category]) for category in ESCAPE_CATEGORIES if counter.get(category, 0))
 
 
-def _as_element_text(text: str, anchor: DocumentElement) -> str:
-    """``text`` escaped exactly as the element model escapes a paragraph's text (``text`` must be non-blank).
-
-    A transient :class:`~datagrunt.pdf.elements.Paragraph` with ``anchor``'s id fields renders it, so a caption or a
-    framing text gets the element model's own escaping, never a second escape set.
-    """
-    return Paragraph(
-        element_id=anchor.element_id,
-        page_number=anchor.page_number,
-        reading_order=anchor.reading_order,
-        bbox=anchor.bbox,
-        text=text,
-    ).to_markdown()
+def _as_element_text(text: str, anchor: DocumentElement | None = None) -> str:
+    """``text`` escaped exactly as the element model escapes a paragraph's text (``text`` must be non-blank)."""
+    del anchor
+    return "\n".join(_markdown_literal(text))
 
 
-def _one_line(text: str, anchor: DocumentElement) -> str:
+def _one_line(text: str, anchor: DocumentElement | None = None) -> str:
     """A framing text on one line: escaped as element text is, its lines and separators spaces, then R8-escaped."""
     return escape(_LINE_SEPARATOR.sub(" ", " ".join(_as_element_text(text, anchor).split("\n"))))
 
@@ -413,8 +415,25 @@ def render_element(element: DocumentElement) -> str:
         ValueError: If it is hidden, or its id or page number is not valid.
     """
     kind = _kind(element)
-    body = element_text(element)
+    body = escape(_body_source(element))
     return f'<el id="{element.element_id}" kind="{kind}" page="{element.page_number}">\n{body}\n</el>'
+
+
+def _has_raw_escaped(element: DocumentElement) -> bool:
+    """Return ``True`` if any raw text field of ``element`` holds a code point matched by :data:`_ESCAPED`."""
+    if isinstance(element, (Heading, Paragraph)):
+        return _ESCAPED.search(element.text) is not None
+    if isinstance(element, KeyValue):
+        return _ESCAPED.search(element.key) is not None or _ESCAPED.search(element.value) is not None
+    if isinstance(element, Figure):
+        return element.caption is not None and _ESCAPED.search(element.caption) is not None
+    if isinstance(element, BulletList):
+        return any(_ESCAPED.search(s) is not None for s in element.items) or any(
+            _ESCAPED.search(s) is not None for s in element.markers
+        )
+    return any(_ESCAPED.search(c) is not None for c in element.headers) or any(
+        _ESCAPED.search(c) is not None for row in element.rows for c in row
+    )
 
 
 def element_escape_counts(element: DocumentElement) -> EscapeCounts:
@@ -425,6 +444,8 @@ def element_escape_counts(element: DocumentElement) -> EscapeCounts:
         ValueError: If it is hidden, or its id or page number is not valid.
     """
     _kind(element)
+    if not _has_raw_escaped(element):
+        return ()
     return escape_counts(_body_source(element))
 
 
@@ -441,10 +462,12 @@ class _Frame:
     unit holds."""
 
     doc_id: str
+    doc_line: str
     header: tuple[tuple[str, str], ...]
     header_ids: frozenset[str]
     tables: Mapping[str, Table]
     scopes: Mapping[str, GroupScope]
+    opener_lines: Mapping[str, str]
     elements: Mapping[str, DocumentElement]
     closed: frozenset[int]
     multimodal_anchors: Mapping[int, Figure] = field(default_factory=dict)
@@ -465,12 +488,16 @@ def _header_blocks(
             refuses all three).
     """
     blocks = []
+    seen: set[str] = set()
     for entry in entries:
         block = render_element(entry)
         if entry.page_number != 1:
             raise ValueError(f"header context entry {entry.element_id} is on page {entry.page_number}, not page 1")
         if elements.get(entry.element_id) != entry:
             raise ValueError(f"header context entry {entry.element_id} is not the document's")
+        if entry.element_id in seen:
+            raise ValueError(f"header context entry {entry.element_id} is repeated")
+        seen.add(entry.element_id)
         blocks.append((entry.element_id, block))
     return tuple(blocks)
 
@@ -499,6 +526,20 @@ def _header_lines(frame: _Frame, own: frozenset[str]) -> tuple[list[str], tuple[
     return [_HEADER_OPEN, *lines, _HEADER_CLOSE], tuple(shown)
 
 
+def _opener_lines(scopes: Mapping[str, GroupScope]) -> dict[str, str]:
+    """Precompute single-line escaped text once per unique visible opener heading across ``scopes``."""
+    rendered: dict[str, str] = {}
+    seen_sections: set[int] = set()
+    for scope in scopes.values():
+        if scope.section in seen_sections:
+            continue
+        seen_sections.add(scope.section)
+        for opener in scope.openers:
+            if opener.element_id not in rendered:
+                rendered[opener.element_id] = _one_line(opener.text)
+    return rendered
+
+
 def _frame(document: PDFDocument, *, multimodal: bool = False) -> _Frame:
     """Read the document once; nothing of a page skipped as image-only or read multimodally is framed as text."""
     closed = _unsent_text_pages(document, multimodal=multimodal)
@@ -515,8 +556,11 @@ def _frame(document: PDFDocument, *, multimodal: bool = False) -> _Frame:
     elements = {element.element_id: element for element in document.elements}
     entries = tuple(entry for entry in document.header_context if entry.page_number not in closed)
     header = _header_blocks(entries, elements)
+    scopes = group_scopes(document, multimodal=multimodal)
+    doc_id = document.metadata.doc_id
     return _Frame(
-        doc_id=document.metadata.doc_id,
+        doc_id=doc_id,
+        doc_line=f"<document>{_one_line(doc_id)}</document>",
         header=header,
         header_ids=frozenset(element_id for element_id, _ in header),
         tables={
@@ -524,7 +568,8 @@ def _frame(document: PDFDocument, *, multimodal: bool = False) -> _Frame:
             for table in document.tables
             if not table.hidden_reasons and table.page_number not in closed
         },
-        scopes=group_scopes(document, multimodal=multimodal),
+        scopes=scopes,
+        opener_lines=_opener_lines(scopes),
         elements=elements,
         closed=closed,
         multimodal_anchors=mm_anchors,
@@ -560,7 +605,7 @@ def _header_row(table: Table) -> str:
     """A table's header row as its own Markdown renders it, on one line, escaped; ``(none)`` without headers."""
     if not table.headers:
         return "(none)"
-    return escape(_LINE_SEPARATOR.sub(" ", dataclasses.replace(table, rows=()).to_markdown().partition("\n")[0]))
+    return escape(_LINE_SEPARATOR.sub(" ", _gfm_row(table.headers)))
 
 
 def _continuation_lines(unit: Unit, tables: Mapping[str, Table]) -> list[str]:
@@ -583,13 +628,13 @@ def _openers(unit: Unit, frame: _Frame) -> tuple[Heading, ...]:
     return _shared_openers(frame.scopes, unit.elements)
 
 
-def _payload(unit: Unit, frame: _Frame) -> tuple[str, tuple[str, ...]]:
+def _payload(unit: Unit, frame: _Frame, openers: tuple[Heading, ...] | None = None) -> tuple[str, tuple[str, ...]]:
     """The tagged framing and the unit's blocks (module notes, 3), and the header ids it shows; the unit is checked."""
-    openers = _openers(unit, frame)
-    scope = " > ".join(_one_line(entry, opener) for entry, opener in zip(unit.scope_path, openers, strict=True))
+    resolved = _openers(unit, frame) if openers is None else openers
+    scope = " > ".join(frame.opener_lines[opener.element_id] for opener in resolved)
     header, shown = _header_lines(frame, frozenset(element.element_id for element in unit.elements))
     lines = [
-        f"<document>{_one_line(frame.doc_id, unit.elements[0])}</document>",
+        frame.doc_line,
         f"<scope>{scope}</scope>",
         *header,
         *_continuation_lines(unit, frame.tables),
@@ -738,6 +783,11 @@ class Envelope:
     schema_lead: str = field(default=_SCHEMA_LEAD, init=False, repr=False)
     directive: tuple[str, ...] = field(default=_DIRECTIVE, init=False, repr=False)
     user_layout: tuple[str, ...] = field(default=_USER_LAYOUT, init=False, repr=False)
+    _cached_images: tuple[bytes, ...] | None = field(default=None, init=False, repr=False, compare=False)
+    _image_sha256s: tuple[str, ...] = field(default=(), init=False, repr=False, compare=False)
+    _cached_include_schema: bool | None = field(default=None, init=False, repr=False, compare=False)
+    _cached_key_state: tuple[object, ...] | None = field(default=None, init=False, repr=False, compare=False)
+    _cached_key_json: str | None = field(default=None, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         _check_bool("include_schema", self.include_schema)
@@ -758,6 +808,9 @@ class Envelope:
         if problem is not None:
             raise ValueError(problem)
         _check_header_ids(self.header_element_ids, self.payload)
+        digests = tuple(hashlib.sha256(img).hexdigest() for img in self.images) if self.images else ()
+        object.__setattr__(self, "_cached_images", self.images)
+        object.__setattr__(self, "_image_sha256s", digests)
 
     def render(self, nonce: str) -> tuple[str, str]:
         """Return the ``(system, user)`` messages for ``nonce`` (module notes, 4).
@@ -789,6 +842,14 @@ class Envelope:
         )
         return system, user
 
+    def _get_image_sha256s(self) -> tuple[str, ...]:
+        """Return memoized SHA-256 hex digests for ``self.images``, recomputing if ``images`` changed."""
+        if self._cached_images is not self.images:
+            digests = tuple(hashlib.sha256(img).hexdigest() for img in self.images) if self.images else ()
+            object.__setattr__(self, "_image_sha256s", digests)
+            object.__setattr__(self, "_cached_images", self.images)
+        return self._image_sha256s
+
     def key_material(self) -> Mapping[str, object]:
         """The components the cache key hashes: canonical-JSON-able, never the nonce (a new dict per call)."""
         material: dict[str, object] = {
@@ -804,9 +865,47 @@ class Envelope:
             "context": self.context_json,
             "payload": self.payload,
         }
+        if not self.include_schema:
+            material["include_schema"] = False
         if self.images:
-            material["image_sha256s"] = [hashlib.sha256(img).hexdigest() for img in self.images]
+            material["image_sha256s"] = list(self._get_image_sha256s())
         return material
+
+    def _key_state(self) -> tuple[object, ...]:
+        """Capture exact object references of every component included in :meth:`key_material`."""
+        return (
+            self.envelope_format,
+            self.unit_id,
+            self.system_rules,
+            self.schema_lead,
+            self.directive,
+            self.user_layout,
+            self.header_element_ids,
+            self.prompt,
+            self.schema_json,
+            self.context_json,
+            self.payload,
+            self.include_schema,
+            self.images,
+        )
+
+    def _key_material_json(self) -> str:
+        """Return canonical JSON of :meth:`key_material`, invalidated on any component mutation."""
+        state = self._key_state()
+        cached_state = self._cached_key_state
+        if (
+            self._cached_key_json is not None
+            and cached_state is not None
+            and self._cached_images is self.images
+            and self._cached_include_schema is self.include_schema
+            and all(left is right for left, right in zip(cached_state, state, strict=True))
+        ):
+            return self._cached_key_json
+        rendered = canonical_json(self.key_material(), subject="envelope key_material")
+        object.__setattr__(self, "_cached_include_schema", self.include_schema)
+        object.__setattr__(self, "_cached_key_state", state)
+        object.__setattr__(self, "_cached_key_json", rendered)
+        return rendered
 
 
 def _check_prompt(prompt: object) -> str:
@@ -882,13 +981,57 @@ def _is_documents(element: DocumentElement, part: PartOf, original: DocumentElem
     return False
 
 
-def _check_elements(unit: Unit, elements: Mapping[str, DocumentElement]) -> None:
+def _trusted_envelope(
+    *,
+    unit_id: str,
+    prompt: str,
+    context_json: str,
+    payload: str,
+    schema_json: str,
+    header_element_ids: tuple[str, ...],
+    include_schema: bool,
+    images: tuple[bytes, ...],
+    image_sha256s: tuple[str, ...],
+) -> Envelope:
+    """Construct a pre-validated :class:`Envelope` while enforcing the R8 payload trust boundary."""
+    _check_component("unit_id", unit_id)
+    if not isinstance(payload, str) or not payload:
+        raise ValueError("payload must be a non-empty str")
+    found = _ESCAPED.search(payload)
+    if found is not None:
+        raise ValueError(f"payload holds an unescaped U+{ord(found.group(0)[0]):04X}: escape() it first")
+    if not isinstance(images, tuple) or len(images) != len(image_sha256s):
+        raise ValueError("images and image_sha256s must be matching-length tuples")
+    env = object.__new__(Envelope)
+    rules = SYSTEM_RULES + MULTIMODAL_RULES if images else SYSTEM_RULES
+    object.__setattr__(env, "unit_id", unit_id)
+    object.__setattr__(env, "prompt", prompt)
+    object.__setattr__(env, "context_json", context_json)
+    object.__setattr__(env, "payload", payload)
+    object.__setattr__(env, "schema_json", schema_json)
+    object.__setattr__(env, "header_element_ids", header_element_ids)
+    object.__setattr__(env, "include_schema", include_schema)
+    object.__setattr__(env, "images", images)
+    object.__setattr__(env, "envelope_format", ENVELOPE_FORMAT)
+    object.__setattr__(env, "system_rules", rules)
+    object.__setattr__(env, "schema_lead", _SCHEMA_LEAD)
+    object.__setattr__(env, "directive", _DIRECTIVE)
+    object.__setattr__(env, "user_layout", _USER_LAYOUT)
+    object.__setattr__(env, "_cached_images", images)
+    object.__setattr__(env, "_image_sha256s", image_sha256s)
+    object.__setattr__(env, "_cached_include_schema", None)
+    object.__setattr__(env, "_cached_key_state", None)
+    object.__setattr__(env, "_cached_key_json", None)
+    return env
+
+
+def _check_elements(unit: Unit, elements: Mapping[str, DocumentElement], *, trusted_blocks: bool = False) -> None:
     """Require each element to be the document's own (:func:`_is_documents`) and its block to be rendered."""
     for element, block, part in zip(unit.elements, unit.blocks, unit.part_of, strict=True):
         original = elements.get(element.element_id)
         if original is None or not _is_documents(element, part, original):
             raise ValueError(f"unit {unit.unit_id}: element {element.element_id} is not the document's")
-        if render_element(element) != block:
+        if not trusted_blocks and render_element(element) != block:
             raise ValueError(
                 f"unit {unit.unit_id}: the block of {element.element_id} is not render_element's; "
                 "build units with render=render_element"
@@ -919,36 +1062,129 @@ def _check_one_group(unit: Unit, frame: _Frame) -> None:
         raise ValueError(f"unit {unit.unit_id}: its elements are of {len(groups)} groups; a unit holds one group's")
 
 
-def _check_multimodal_unit(unit: Unit, anchor: Figure) -> Unit:
+def _check_multimodal_unit(
+    unit: Unit,
+    anchor: Figure,
+    *,
+    trusted_blocks: bool = False,
+) -> tuple[Unit, tuple[Heading, ...]]:
     """Validate that a multimodal page unit holds the exact synthetic page anchor and empty scope."""
     if unit.elements != (anchor,) or unit.part_of != (None,):
         raise ValueError(f"unit {unit.unit_id}: multimodal page unit must hold its synthetic page anchor")
-    if unit.blocks != (render_element(anchor),):
+    if not trusted_blocks and unit.blocks != (render_element(anchor),):
         raise ValueError(f"unit {unit.unit_id}: multimodal anchor block is not render_element's")
     if unit.scope_path != ():
         raise ValueError(f"unit {unit.unit_id}: multimodal page unit must have empty scope_path")
-    return unit
+    return unit, ()
 
 
-def _check_unit(unit: object, frame: _Frame, *, coalesce_sections: bool = False) -> Unit:
+def _check_unit(
+    unit: object,
+    frame: _Frame,
+    *,
+    coalesce_sections: bool = False,
+    trusted_blocks: bool = False,
+) -> tuple[Unit, tuple[Heading, ...]]:
     """Require a unit of this document: its elements the document's, its blocks rendered, its scope valid."""
     if not isinstance(unit, Unit):
         raise TypeError(f"each unit must be a Unit, got {type(unit).__name__}")
     if unit.doc_id != frame.doc_id:
         raise ValueError(f"unit {unit.unit_id} has doc_id {unit.doc_id!r}, not the document's {frame.doc_id!r}")
     if len(unit.page_numbers) == 1 and unit.page_numbers[0] in frame.multimodal_anchors:
-        return _check_multimodal_unit(unit, frame.multimodal_anchors[unit.page_numbers[0]])
-    _check_elements(unit, frame.elements)
+        return _check_multimodal_unit(
+            unit,
+            frame.multimodal_anchors[unit.page_numbers[0]],
+            trusted_blocks=trusted_blocks,
+        )
+    _check_elements(unit, frame.elements, trusted_blocks=trusted_blocks)
     _check_pages_sent(unit, frame.closed)
     if not coalesce_sections:
         _check_one_group(unit, frame)
-    expected = tuple(opener.text for opener in _openers(unit, frame))
+    openers = _openers(unit, frame)
+    expected = tuple(opener.text for opener in openers)
     if unit.scope_path != expected:
         raise ValueError(
             f"unit {unit.unit_id}: its scope_path is not its group's scope, the {len(expected)} entries visible "
             "headings opened"
         )
-    return unit
+    return unit, openers
+
+
+_BandCache: TypeAlias = dict[int, tuple[tuple[bytes, ...], tuple[str, ...]]]
+
+
+def _check_fatal_errors(fatal_errors: object) -> tuple[type[BaseException], ...]:
+    """Require a tuple of ``BaseException`` subclasses for fatal PDF error re-raising."""
+    if not isinstance(fatal_errors, tuple):
+        raise TypeError(f"fatal_errors must be a tuple of exception types, got {type(fatal_errors).__name__}")
+    for idx, cls in enumerate(fatal_errors):
+        if not isinstance(cls, type) or not issubclass(cls, BaseException):
+            raise TypeError(f"fatal_errors[{idx}] must be a BaseException subclass, got {cls!r}")
+    return fatal_errors
+
+
+def _prepare_envelope_inputs(
+    units: object,
+    document: object,
+    *,
+    prompt: object,
+    context: object,
+    schema_json: object,
+    coalesce_sections: object,
+    include_schema: object,
+    multimodal: object,
+    trusted_blocks: object,
+) -> tuple[str, str, str, _Frame]:
+    """Validate shared document-level envelope parameters and construct ``_Frame`` once."""
+    _check_bool("coalesce_sections", coalesce_sections)
+    _check_bool("include_schema", include_schema)
+    _check_bool("multimodal", multimodal)
+    _check_bool("_trusted_blocks", trusted_blocks)
+    if not isinstance(document, PDFDocument):
+        raise TypeError(f"document must be a PDFDocument, got {type(document).__name__}")
+    if not isinstance(units, Sequence) or isinstance(units, (str, bytes, bytearray)):
+        raise TypeError(f"units must be a Sequence of Unit, got {type(units).__name__}")
+    checked_prompt = _check_prompt(prompt)
+    context_json = _context_json(context)
+    checked_schema = _check_schema(schema_json)
+    return checked_prompt, context_json, checked_schema, _frame(document, multimodal=bool(multimodal))
+
+
+def _load_unit_images(unit: Unit, frame: _Frame, band_cache: _BandCache) -> tuple[tuple[bytes, ...], tuple[str, ...]]:
+    """Load, validate and hash multimodal PNG bands once per page via ``band_cache``."""
+    if len(unit.page_numbers) != 1 or unit.page_numbers[0] not in frame.multimodal_images:
+        return (), ()
+    pno = unit.page_numbers[0]
+    if pno not in band_cache:
+        bands = _read_page_images(frame.multimodal_images[pno])
+        _check_envelope_images(bands)
+        digests = tuple(hashlib.sha256(img).hexdigest() for img in bands)
+        band_cache[pno] = (bands, digests)
+    return band_cache[pno]
+
+
+def _build_unit_envelope(
+    checked: Unit,
+    openers: tuple[Heading, ...],
+    frame: _Frame,
+    band_cache: _BandCache,
+    shared: tuple[str, str, str, bool],
+) -> Envelope:
+    """Assemble one validated unit's :class:`Envelope` using shared frame and cached bands."""
+    checked_prompt, context_json, checked_schema, include_schema = shared
+    payload, header_ids = _payload(checked, frame, openers)
+    images, digests = _load_unit_images(checked, frame, band_cache)
+    return _trusted_envelope(
+        unit_id=checked.unit_id,
+        prompt=checked_prompt,
+        context_json=context_json,
+        payload=payload,
+        schema_json=checked_schema,
+        header_element_ids=header_ids,
+        include_schema=include_schema,
+        images=images,
+        image_sha256s=digests,
+    )
 
 
 def build_envelopes(
@@ -961,70 +1197,83 @@ def build_envelopes(
     coalesce_sections: bool = False,
     include_schema: bool = True,
     multimodal: bool = False,
+    _trusted_blocks: bool = False,
 ) -> tuple[Envelope, ...]:
-    """Build the envelope of each of a document's units, reading the document once.
-
-    Args:
-        units: Units of ``document`` built with ``render=render_element`` (a tuple or list).
-        document: The document; it is never changed.
-        prompt: The caller's prompt, sent verbatim.
-        context: The caller's context: any value that serializes to JSON, or ``None``.
-        schema_json: The response wrapper's canonical JSON (``PreparedSchema.wrapper_json``), sent in every system
-            message when ``include_schema`` is ``True`` (module notes, 4).
-        coalesce_sections: When ``True``, allow a unit's elements to span multiple groups and require its
-            ``scope_path`` to be their longest common visible opener prefix.
-        include_schema: When ``True`` (default), inline ``schema_json`` in the rendered system prompt; when
-            ``False``, omit the inline schema block when the provider natively enforces ``json_schema``.
-
-    Returns:
-        One envelope per unit, in order.
-
-    Raises:
-        TypeError: If ``units`` is not a tuple or list of ``Unit``, ``document`` not a ``PDFDocument``,
-            ``prompt`` or ``schema_json`` not a ``str``, or ``coalesce_sections`` / ``include_schema`` not a ``bool``.
-        ValueError: If a unit is of another document, holds an element that is not the document's or one on an
-            image-only page, has blocks that are not :func:`render_element`'s, elements of more than one group (when
-            ``coalesce_sections`` is ``False``) or a scope path other than its expected visible opener scope, or a
-            header context entry is hidden, off page 1 or not the document's.
-        RationalizationError: If ``prompt`` is blank or not encodable, ``context`` does not serialize to JSON or
-            is past :data:`CONTEXT_MAX_BYTES`, or ``schema_json`` is not a JSON object's canonical JSON, holds an R8
-            code point or is past :data:`SCHEMA_MAX_BYTES`.
-    """
-    _check_bool("coalesce_sections", coalesce_sections)
-    _check_bool("include_schema", include_schema)
-    _check_bool("multimodal", multimodal)
-    if not isinstance(document, PDFDocument):
-        raise TypeError(f"document must be a PDFDocument, got {type(document).__name__}")
-    if not isinstance(units, (tuple, list)):
-        raise TypeError(f"units must be a tuple or list of Unit, got {type(units).__name__}")
-    checked_prompt = _check_prompt(prompt)
-    context_json = _context_json(context)
-    checked_schema = _check_schema(schema_json)
-    frame = _frame(document, multimodal=multimodal)
-    band_cache: dict[int, tuple[bytes, ...]] = {}
-    envelopes = []
+    """Build the envelope of each of a document's units, reading and framing ``document`` once."""
+    checked_prompt, context_json, checked_schema, frame = _prepare_envelope_inputs(
+        units,
+        document,
+        prompt=prompt,
+        context=context,
+        schema_json=schema_json,
+        coalesce_sections=coalesce_sections,
+        include_schema=include_schema,
+        multimodal=multimodal,
+        trusted_blocks=_trusted_blocks,
+    )
+    shared = (checked_prompt, context_json, checked_schema, include_schema)
+    band_cache: _BandCache = {}
+    envelopes: list[Envelope] = []
     for unit in units:
-        checked = _check_unit(unit, frame, coalesce_sections=coalesce_sections)
-        payload, header_ids = _payload(checked, frame)
-        images: tuple[bytes, ...] = ()
-        if len(checked.page_numbers) == 1 and checked.page_numbers[0] in frame.multimodal_images:
-            pno = checked.page_numbers[0]
-            if pno not in band_cache:
-                band_cache[pno] = _read_page_images(frame.multimodal_images[pno])
-            images = band_cache[pno]
-        envelopes.append(
-            Envelope(
-                unit_id=checked.unit_id,
-                prompt=checked_prompt,
-                context_json=context_json,
-                payload=payload,
-                schema_json=checked_schema,
-                header_element_ids=header_ids,
-                include_schema=include_schema,
-                images=images,
-            )
-        )
+        checked, openers = _check_unit(unit, frame, coalesce_sections=coalesce_sections, trusted_blocks=_trusted_blocks)
+        envelopes.append(_build_unit_envelope(checked, openers, frame, band_cache, shared))
     return tuple(envelopes)
+
+
+def _skipped_image_unit(doc_id: str, unit: Unit) -> SkippedUnit:
+    """Build an ``image_only`` :class:`SkippedUnit` when a multimodal unit's page render fails."""
+    pno = unit.page_numbers[0]
+    return SkippedUnit(
+        unit_id=f"{doc_id}:p{pno:04d}",
+        reason="image_only",
+        page_numbers=unit.page_numbers,
+        hidden_excluded=unit.hidden_excluded,
+    )
+
+
+def build_envelopes_isolated(
+    units: Sequence[Unit],
+    document: PDFDocument,
+    *,
+    prompt: str,
+    context: object,
+    schema_json: str,
+    coalesce_sections: bool = False,
+    include_schema: bool = True,
+    multimodal: bool = False,
+    fatal_errors: tuple[type[BaseException], ...] = _DEFAULT_FATAL_ERRORS,
+    _trusted_blocks: bool = False,
+) -> tuple[tuple[Unit, ...], tuple[Envelope, ...], tuple[SkippedUnit, ...]]:
+    """Build envelopes sharing one ``_Frame`` and ``band_cache``, isolating per-unit PDF render errors."""
+    checked_fatal = _check_fatal_errors(fatal_errors)
+    checked_prompt, context_json, checked_schema, frame = _prepare_envelope_inputs(
+        units,
+        document,
+        prompt=prompt,
+        context=context,
+        schema_json=schema_json,
+        coalesce_sections=coalesce_sections,
+        include_schema=include_schema,
+        multimodal=multimodal,
+        trusted_blocks=_trusted_blocks,
+    )
+    shared = (checked_prompt, context_json, checked_schema, include_schema)
+    band_cache: _BandCache = {}
+    kept_units: list[Unit] = []
+    envelopes: list[Envelope] = []
+    skipped: list[SkippedUnit] = []
+    for unit in units:
+        checked, openers = _check_unit(unit, frame, coalesce_sections=coalesce_sections, trusted_blocks=_trusted_blocks)
+        try:
+            env = _build_unit_envelope(checked, openers, frame, band_cache, shared)
+        except checked_fatal:
+            raise
+        except DatagruntPDFError:
+            skipped.append(_skipped_image_unit(frame.doc_id, checked))
+            continue
+        kept_units.append(checked)
+        envelopes.append(env)
+    return tuple(kept_units), tuple(envelopes), tuple(skipped)
 
 
 def build_envelope(

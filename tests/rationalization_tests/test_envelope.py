@@ -51,13 +51,22 @@ from datagrunt.pdf.elements import (
     Figure,
     Heading,
     KeyValue,
+    PageImage,
     Paragraph,
     PDFDocument,
     Section,
     Table,
 )
+from datagrunt.pdf.exceptions import (
+    BundleCorruptError,
+    DatagruntPDFError,
+    PDFCorruptError,
+    PDFEncryptedError,
+    PDFSourceChangedError,
+)
 from datagrunt.rationalization import RationalizationError
 from datagrunt.rationalization import envelope as envelope_module
+from datagrunt.rationalization.cache import request_key
 from datagrunt.rationalization.envelope import (
     CONTEXT_MAX_BYTES,
     ENVELOPE_FORMAT,
@@ -68,6 +77,7 @@ from datagrunt.rationalization.envelope import (
     Envelope,
     build_envelope,
     build_envelopes,
+    build_envelopes_isolated,
     element_escape_counts,
     element_text,
     escape,
@@ -76,7 +86,7 @@ from datagrunt.rationalization.envelope import (
     render_element,
 )
 from datagrunt.rationalization.schema import prepare
-from datagrunt.rationalization.units import BLOCK_SEPARATOR, Unit, build_units
+from datagrunt.rationalization.units import BLOCK_SEPARATOR, SkippedUnit, Unit, build_units
 
 BIG = 1_000_000
 TIMEOUT_S = 120
@@ -2596,8 +2606,6 @@ MM_PNG_2 = b"\x89PNG\r\n\x1a\nMM_BAND_2"
 
 class TestMultimodalEnvelope:
     def test_multimodal_envelope_attaches_bands_rekeys_cache_and_withholds_ocr_and_garbled_text(self):
-        from datagrunt.pdf.elements import PageImage
-
         img1 = PageImage(
             page_number=1,
             dpi=300.0,
@@ -2633,3 +2641,149 @@ class TestMultimodalEnvelope:
         assert '<el id="p0001_e000" kind="figure" page="1">' in usr_msg
         assert "image_sha256s" in env_a.key_material()
         assert env_a.key_material()["image_sha256s"] != env_b.key_material()["image_sha256s"]
+
+
+class TestWave1BEnvelopeOptimizations:
+    def test_key_material_include_schema_false_non_collision_and_memoization_invalidation(self):
+        doc = document(page(1, (para(1, 0, "Body"),)))
+        unit = one_unit(doc)
+        env_true = build_envelope(unit, doc, prompt="p", context=None, schema_json=SCHEMA_JSON, include_schema=True)
+        env_false = build_envelope(unit, doc, prompt="p", context=None, schema_json=SCHEMA_JSON, include_schema=False)
+        key_args = {
+            "provider_kind": "openai",
+            "model_id": "openai:gpt-4o",
+            "generation_params": {"temperature": 0.0},
+            "provider_schema": WRAPPER,
+            "schema_version": "1",
+        }
+
+        assert "include_schema" not in env_true.key_material()
+        assert env_false.key_material()["include_schema"] is False
+        assert request_key(**key_args, envelope=env_true) != request_key(**key_args, envelope=env_false)
+        assert env_true._key_material_json() == canonical(env_true.key_material())
+        assert env_false._key_material_json() == canonical(env_false.key_material())
+
+        mutated = dataclasses.replace(env_true, images=(MM_PNG_1,))
+        first_json = mutated._key_material_json()
+        object.__setattr__(mutated, "images", (MM_PNG_2,))
+        _ = mutated.key_material()
+        assert mutated._key_material_json() != first_json
+        assert mutated._key_material_json() == canonical(mutated.key_material())
+        object.__setattr__(mutated, "include_schema", False)
+        assert mutated._key_material_json() == canonical(mutated.key_material())
+
+    def test_build_envelopes_isolated_shares_frame_and_band_cache(self, monkeypatch):
+        loads_p1 = 0
+
+        def load_p1() -> tuple[bytes, ...]:
+            nonlocal loads_p1
+            loads_p1 += 1
+            return (MM_PNG_1, MM_PNG_2)
+
+        def fail_p2() -> tuple[bytes, ...]:
+            raise DatagruntPDFError("page 2 band corrupt")
+
+        img1 = PageImage(page_number=1, dpi=300.0, width_px=800, height_px=1000, _band_loader=load_p1)
+        img2 = PageImage(page_number=2, dpi=300.0, width_px=800, height_px=1000, _band_loader=fail_p2)
+        ghost = para(2, 0, "ghost", hidden=("invisible",))
+        doc = document(
+            page(1, (para(1, 0, "ocr"),), route="vision", page_image=img1),
+            page(2, (ghost,), route="vision", page_image=img2),
+            page(3, (para(3, 0, "Clean text"),), route="digital"),
+        )
+        units = build_units(doc, max_unit_chars=BIG, render=render_element, multimodal=True).units
+        scope_calls = 0
+        real_scopes = envelope_module.group_scopes
+
+        def count_scopes(*args, **kwargs):
+            nonlocal scope_calls
+            scope_calls += 1
+            return real_scopes(*args, **kwargs)
+
+        monkeypatch.setattr(envelope_module, "group_scopes", count_scopes)
+        kept, envs, skipped = build_envelopes_isolated(
+            units,
+            doc,
+            prompt="p",
+            context=None,
+            schema_json=SCHEMA_JSON,
+            multimodal=True,
+            _trusted_blocks=True,
+        )
+
+        assert scope_calls == 1
+        assert loads_p1 == 1
+        assert "build_envelopes_isolated" in envelope_module.__all__
+        assert [u.page_numbers for u in kept] == [(1,), (3,)]
+        assert len(envs) == 2 and envs[0].images == (MM_PNG_1, MM_PNG_2)
+        assert skipped == (
+            SkippedUnit(
+                unit_id=f"{doc.metadata.doc_id}:p0002",
+                reason="image_only",
+                page_numbers=(2,),
+                hidden_excluded=(("invisible", 1),),
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            PDFEncryptedError("encrypted"),
+            PDFCorruptError("corrupt", page_number=1),
+            PDFSourceChangedError("changed"),
+            BundleCorruptError("bundle corrupt"),
+        ],
+    )
+    def test_build_envelopes_isolated_reraises_fatal_pdf_errors(self, exc):
+        def raise_fatal() -> tuple[bytes, ...]:
+            raise exc
+
+        img = PageImage(page_number=1, dpi=300.0, width_px=800, height_px=1000, _band_loader=raise_fatal)
+        doc = document(page(1, (para(1, 0, "ocr"),), route="vision", page_image=img))
+        units = build_units(doc, max_unit_chars=BIG, render=render_element, multimodal=True).units
+
+        with pytest.raises(type(exc)):
+            build_envelopes_isolated(units, doc, prompt="p", context=None, schema_json=SCHEMA_JSON, multimodal=True)
+
+    def test_element_escape_counts_fast_path_and_trusted_blocks(self, monkeypatch):
+        section_elements = (
+            heading(1, 0, "Title"),
+            para(1, 1, "Plain <text> & markdown", scope=("Title",)),
+            pair(1, 2, "Key", "Value", scope=("Title",)),
+            grid(1, 3, [("a|b", "c")], scope=("Title",)),
+        )
+        clean_elements = (
+            *section_elements,
+            bullets(1, 4, ["item 1", "item 2"], ordered=True, markers=("a)", "b)")),
+            picture(1, 5, "Clean caption"),
+        )
+        monkeypatch.setattr(
+            envelope_module,
+            "_body_source",
+            lambda _el: (_ for _ in ()).throw(AssertionError("_body_source must not run on clean elements")),
+        )
+        for el in clean_elements:
+            assert element_escape_counts(el) == ()
+
+        monkeypatch.undo()
+        doc = document(page(1, clean_elements), sections=[section(section_elements, section_elements[0])])
+        units = units_of(doc)
+        monkeypatch.setattr(
+            envelope_module,
+            "render_element",
+            lambda _el: (_ for _ in ()).throw(AssertionError("render_element must not run with _trusted_blocks=True")),
+        )
+        envs = build_envelopes(units, doc, prompt="p", context=None, schema_json=SCHEMA_JSON, _trusted_blocks=True)
+        assert len(envs) == 2 and "<scope>Title</scope>" in envs[0].payload
+
+        unescaped_doc = document(page(1, (para(1, 0, "bidi \u202e text"),)))
+        unescaped_units = build_units(unescaped_doc, max_unit_chars=BIG, render=lambda el: el.to_markdown()).units
+        with pytest.raises(ValueError, match="payload holds an unescaped U\\+202E"):
+            build_envelopes(
+                unescaped_units,
+                unescaped_doc,
+                prompt="p",
+                context=None,
+                schema_json=SCHEMA_JSON,
+                _trusted_blocks=True,
+            )

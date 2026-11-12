@@ -30,6 +30,19 @@ def _check_normalizer(normalizer: object) -> KeyNormalizer | None:
     return "alnum_upper"
 
 
+def _check_normalized_namespace(namespace: object) -> None:
+    """Require ``namespace`` to be ``None`` or a non-empty, stripped, lower-case ``str``."""
+    if namespace is None:
+        return
+    if not isinstance(namespace, str):
+        raise TypeError(f"Key namespace must be a str or None, got {namespace!r} ({type(namespace).__name__})")
+    if not namespace or namespace != namespace.strip().lower():
+        raise ValueError(
+            f"Key namespace must be non-empty, stripped and lower-case, got {namespace!r}: "
+            f"Key(namespace) normalizes one"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class _KeyMarker:
     """Marks entity identity fields; call as Key('part') or Key(normalizer='alnum_upper')."""
@@ -39,17 +52,7 @@ class _KeyMarker:
 
     def __post_init__(self) -> None:
         _check_normalizer(self.normalizer)
-        if self.namespace is None:
-            return
-        if not isinstance(self.namespace, str):
-            raise TypeError(
-                f"Key namespace must be a str or None, got {self.namespace!r} ({type(self.namespace).__name__})"
-            )
-        if not self.namespace or self.namespace != self.namespace.strip().lower():
-            raise ValueError(
-                f"Key namespace must be non-empty, stripped and lower-case, got {self.namespace!r}: "
-                f"Key(namespace) normalizes one"
-            )
+        _check_normalized_namespace(self.namespace)
 
     def __call__(
         self,

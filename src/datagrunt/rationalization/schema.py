@@ -110,7 +110,13 @@ from pydantic.fields import FieldInfo
 from datagrunt.rationalization._canonical import canonical_json, sha256_hex
 from datagrunt.rationalization._refs import DEFS_POINTER, DEFS_PREFIX, UNREAD_KEYWORDS, def_name, json_pointer
 from datagrunt.rationalization.exceptions import RationalizationError
-from datagrunt.rationalization.markers import KeyNormalizer, _check_normalizer, _InformationalMarker, _KeyMarker
+from datagrunt.rationalization.markers import (
+    KeyNormalizer,
+    _check_normalized_namespace,
+    _check_normalizer,
+    _InformationalMarker,
+    _KeyMarker,
+)
 
 MAX_DEPTH = 32
 """Levels on one path: models and lists for :func:`describe`, objects and arrays for :func:`check_json_schema`."""
@@ -186,6 +192,11 @@ _R8_ESCAPED = re.compile(
 _JSON_SHOWN = 200
 _FROZEN_ERRORS = frozenset({"frozen_field", "frozen_instance"})
 _MISSING = object()  # what getattr gives for a field an instance lacks (a model_construct() instance)
+_FAST_EXACT_BASES: frozenset[type] = frozenset({str, int, bool, date})
+_FUNCTION_SCHEMA_TYPES: frozenset[str] = frozenset(
+    {"function-before", "function-wrap", "function-plain", "function-after"}
+)
+_VALIDATE_METHODS: tuple[str, ...] = ("model_validate", "model_validate_json", "model_validate_strings")
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,7 +223,7 @@ class KeySpec:
             raise ValueError(f"KeySpec fields must be non-empty and distinct, got {self.fields!r}")
         if self.namespace is not None and not self.fields:
             raise ValueError(f"KeySpec names the namespace {self.namespace!r} for no key field")
-        _KeyMarker(namespace=self.namespace)  # TypeError or ValueError unless None or normalized
+        _check_normalized_namespace(self.namespace)
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +254,7 @@ class ScalarSpec:
     enum: type[Enum] | None = None
     literal: tuple[object, ...] | None = None
     tz: Literal["aware", "naive"] | None = None
+    _literal_set: frozenset[tuple[type, object]] | None = dc_field(init=False, repr=False, compare=False, default=None)
 
     def __post_init__(self) -> None:
         if not isinstance(self.base, type):
@@ -262,6 +274,7 @@ class ScalarSpec:
             _check_enum_values(self.enum, self.base)
         if self.literal is not None:
             _check_literal_values(self.literal, self.base)
+            object.__setattr__(self, "_literal_set", frozenset((type(item), item) for item in self.literal))
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,6 +375,10 @@ class ModelSpec:
     keys: KeySpec
     fields: tuple[FieldSpec, ...]
     key_normalizers: tuple[KeyNormalizer | None, ...] = dc_field(init=False, compare=False, repr=False, default=())
+    fields_by_name: Mapping[str, FieldSpec] = dc_field(init=False, compare=False, repr=False)
+    reads_by_name: bool = dc_field(init=False, compare=False, repr=False, default=False)
+    has_unshown_droppable: bool = dc_field(init=False, compare=False, repr=False, default=False)
+    has_keyed_list: bool = dc_field(init=False, compare=False, repr=False, default=False)
 
     def __post_init__(self) -> None:
         if not _is_model_class(self.model):
@@ -385,7 +402,26 @@ class ModelSpec:
         for field in self.fields:
             if field.key_normalizer is not None and field.name not in self.keys.fields:
                 raise ValueError(f"ModelSpec {self.model.__name__}: non-key {field.name!r} has key_normalizer")
-        object.__setattr__(self, "key_normalizers", tuple(by_name[name].key_normalizer for name in self.keys.fields))
+        _compile_model_spec(self, by_name)
+
+
+def _compile_model_spec(spec: ModelSpec, by_name: dict[str, FieldSpec]) -> None:
+    """Populate derived non-compared dispatch slots on ``spec`` from ``by_name`` and ``spec.fields``."""
+    object.__setattr__(spec, "key_normalizers", tuple(by_name[name].key_normalizer for name in spec.keys.fields))
+    object.__setattr__(spec, "fields_by_name", MappingProxyType(by_name))
+    config = spec.model.model_config
+    object.__setattr__(spec, "reads_by_name", bool(config.get("validate_by_name") or config.get("populate_by_name")))
+    has_unshown = any(
+        (not field.optional and not field.required) or (field.child is not None and field.child.has_unshown_droppable)
+        for field in spec.fields
+    )
+    object.__setattr__(spec, "has_unshown_droppable", has_unshown)
+    has_keyed = any(
+        field.child is not None
+        and ((field.kind == "model_list" and bool(field.child.keys.fields)) or field.child.has_keyed_list)
+        for field in spec.fields
+    )
+    object.__setattr__(spec, "has_keyed_list", has_keyed)
 
 
 @dataclass(frozen=True, slots=True)
@@ -411,6 +447,7 @@ class PreparedSchema:
     spec: ModelSpec
     wrapper_json: str
     sha256: str
+    is_pure_pydantic: bool = dc_field(init=False, compare=False, repr=False, default=False)
 
     def __post_init__(self) -> None:
         if not _is_model_class(self.model) or not isinstance(self.spec, ModelSpec):
@@ -425,12 +462,91 @@ class PreparedSchema:
             raise ValueError("PreparedSchema wrapper_json is not valid Unicode") from error
         if self.sha256 != digest:
             raise ValueError("PreparedSchema sha256 does not match wrapper_json")
+        object.__setattr__(self, "is_pure_pydantic", _spec_is_pure_pydantic(self.spec))
 
     @property
     def wrapper(self) -> dict[str, Any]:
         """The response wrapper, parsed afresh on each access: a caller may transform it freely."""
         parsed: dict[str, Any] = json.loads(self.wrapper_json)
         return parsed
+
+
+def _trusted_prepared_schema(
+    model: type[BaseModel],
+    spec: ModelSpec,
+    wrapper_json: str,
+    sha256: str,
+) -> PreparedSchema:
+    """Build a :class:`PreparedSchema` from verified ``prepare()`` outputs without hashing ``wrapper_json`` twice."""
+    prepared = object.__new__(PreparedSchema)
+    object.__setattr__(prepared, "model", model)
+    object.__setattr__(prepared, "spec", spec)
+    object.__setattr__(prepared, "wrapper_json", wrapper_json)
+    object.__setattr__(prepared, "sha256", sha256)
+    object.__setattr__(prepared, "is_pure_pydantic", _spec_is_pure_pydantic(spec))
+    return prepared
+
+
+def _push_core_children(stack: list[object], node: object) -> None:
+    """Push child schema containers of ``node`` (excluding opaque ``metadata``) onto ``stack``."""
+    if isinstance(node, Mapping):
+        for key, value in node.items():
+            if key != "metadata" and isinstance(value, (Mapping, list, tuple)):
+                stack.append(value)
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            if isinstance(item, (Mapping, list, tuple)):
+                stack.append(item)
+
+
+def _has_default_model_hooks(model: type[BaseModel]) -> bool:
+    """Whether ``model`` leaves ``BaseModel``'s init, post-init, and ``model_validate*`` classmethods untouched."""
+    if model.__init__ is not BaseModel.__init__ or model.model_post_init is not BaseModel.model_post_init:
+        return False
+    for method_name in _VALIDATE_METHODS:
+        own_func = getattr(getattr(model, method_name, None), "__func__", object())
+        base_func = getattr(getattr(BaseModel, method_name, None), "__func__", None)
+        if own_func is not base_func:
+            return False
+    return True
+
+
+def _model_is_pure_pydantic(model: type[BaseModel]) -> bool:
+    """Whether ``model`` keeps default hooks/classmethods and has zero custom function validators."""
+    if not _has_default_model_hooks(model):
+        return False
+    core_schema = getattr(model, "__pydantic_core_schema__", None)
+    if not isinstance(core_schema, Mapping):
+        return False
+    stack: list[object] = [core_schema]
+    for _ in range(MAX_WALK_STEPS):
+        if not stack:
+            return True
+        node = stack.pop()
+        if isinstance(node, Mapping) and node.get("type") in _FUNCTION_SCHEMA_TYPES:
+            return False
+        _push_core_children(stack, node)
+    return False
+
+
+def _spec_is_pure_pydantic(spec: ModelSpec) -> bool:
+    """Whether every reachable model in ``spec`` is pure Pydantic without custom hooks or validators."""
+    checked_models: set[type[BaseModel]] = set()
+    seen_specs: set[int] = {id(spec)}
+    stack: list[ModelSpec] = [spec]
+    for _ in range(MAX_FIELDS + 1):
+        if not stack:
+            return True
+        current = stack.pop()
+        if current.model not in checked_models:
+            if not _model_is_pure_pydantic(current.model):
+                return False
+            checked_models.add(current.model)
+        for field in current.fields:
+            if field.child is not None and id(field.child) not in seen_specs:
+                seen_specs.add(id(field.child))
+                stack.append(field.child)
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -586,6 +702,8 @@ def admits_scalar(scalar: ScalarSpec, value: object) -> bool:
     Returns:
         Whether the field admits it.
     """
+    if not isinstance(scalar, ScalarSpec):
+        raise TypeError(f"scalar must be a ScalarSpec, got {_brief(scalar)}")
     if scalar.enum is not None:
         return type(value) is scalar.enum
     kind = type(value)
@@ -595,8 +713,8 @@ def admits_scalar(scalar: ScalarSpec, value: object) -> bool:
         return True
     if kind is not scalar.base:
         return False
-    if scalar.literal is not None:  # its values all have the exact type ``kind`` (a ScalarSpec rule)
-        return value in scalar.literal
+    if scalar._literal_set is not None:
+        return (kind, value) in scalar._literal_set
     if isinstance(value, datetime):
         return (value.utcoffset() is not None) == (scalar.tz == "aware")
     return True
@@ -637,6 +755,10 @@ def instance_problems(instance: BaseModel, spec: ModelSpec) -> list[str]:
     Returns:
         The problems in field order; ``[]`` when every field holds a value the spec admits.
     """
+    if not isinstance(spec, ModelSpec):
+        raise TypeError(f"spec must be a ModelSpec, got {_brief(spec)}")
+    if _instance_ok(instance, spec):
+        return []
     return _walk_values(list(reversed(_child_visits(spec, instance, "", False))))
 
 
@@ -663,7 +785,7 @@ def prepare(schema: object, key: str | Sequence[str] | None = None) -> PreparedS
     _check_agreement(spec, document)
     _check_document(document, model.__name__)
     text = _canonical_json(_wrap(document))
-    return PreparedSchema(model=model, spec=spec, wrapper_json=text, sha256=sha256_hex(text))
+    return _trusted_prepared_schema(model=model, spec=spec, wrapper_json=text, sha256=sha256_hex(text))
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1751,6 +1873,122 @@ class _Visit:
     value: object
     path: str
     defaulted: bool | None
+
+
+def _scalar_ok(scalar: ScalarSpec, value: object) -> bool:
+    """Whether ``value`` is a finite value admitted by ``scalar`` (fast zero-allocation check)."""
+    if scalar.enum is not None:
+        return type(value) is scalar.enum
+    kind = type(value)
+    base = scalar.base
+    if kind is base:
+        if scalar._literal_set is not None:
+            return (kind, value) in scalar._literal_set
+        if kind in _FAST_EXACT_BASES:
+            return True
+        if isinstance(value, float):
+            return math.isfinite(value)
+        if isinstance(value, Decimal):
+            return value.is_finite()
+        if isinstance(value, datetime):
+            return (value.utcoffset() is not None) == (scalar.tz == "aware")
+        return False
+    if kind is int and isinstance(value, int):
+        if base is float:
+            return abs(value) <= FLOAT_INT_LIMIT
+        return base is Decimal
+    return False
+
+
+def _scalar_list_ok(scalar: ScalarSpec, value: object, steps: int) -> int:
+    """Verify ``value`` is a ``list`` of admitted scalars within ``MAX_WALK_STEPS``; return updated ``steps`` or -1."""
+    if not isinstance(value, list) or type(value) is not list:
+        return -1
+    steps += len(value)
+    if steps > MAX_WALK_STEPS:
+        return -1
+    for item in value:
+        if item is None or not _scalar_ok(scalar, item):
+            return -1
+    return steps
+
+
+def _model_list_ok(
+    child_spec: ModelSpec,
+    value: object,
+    child_depth: int,
+    steps: int,
+    stack: list[tuple[BaseModel, ModelSpec, int]],
+) -> int:
+    """Verify ``value`` is a ``list`` of exact ``child_spec.model`` instances and push them onto ``stack``."""
+    if child_depth > MAX_DEPTH or not isinstance(value, list) or type(value) is not list:
+        return -1
+    steps += len(value)
+    if steps > MAX_WALK_STEPS:
+        return -1
+    expected_model = child_spec.model
+    for item in reversed(value):
+        if not isinstance(item, BaseModel) or type(item) is not expected_model:
+            return -1
+        stack.append((item, child_spec, child_depth))
+    return steps
+
+
+def _field_ok(
+    node: BaseModel,
+    field_spec: FieldSpec,
+    depth: int,
+    steps: int,
+    stack: list[tuple[BaseModel, ModelSpec, int]],
+) -> int:
+    """Check one field of ``node`` without path allocations; return updated ``steps`` or -1 on any problem."""
+    value = getattr(node, field_spec.name, _MISSING)
+    if value is _MISSING:
+        return -1
+    kind = field_spec.kind
+    if kind == "scalar":
+        if value is None:
+            return steps if field_spec.optional else -1
+        return steps if field_spec.scalar is not None and _scalar_ok(field_spec.scalar, value) else -1
+    if kind == "scalar_list":
+        if depth + 1 > MAX_DEPTH or field_spec.scalar is None:
+            return -1
+        return _scalar_list_ok(field_spec.scalar, value, steps)
+    if kind == "model":
+        if value is None:
+            return steps if field_spec.optional else -1
+        child = field_spec.child
+        if depth + 1 > MAX_DEPTH or child is None:
+            return -1
+        if not isinstance(value, BaseModel) or type(value) is not child.model or steps + 1 > MAX_WALK_STEPS:
+            return -1
+        stack.append((value, child, depth + 1))
+        return steps + 1
+    if field_spec.child is None:
+        return -1
+    return _model_list_ok(field_spec.child, value, depth + 2, steps, stack)
+
+
+def _instance_ok(instance: object, spec: ModelSpec) -> bool:
+    """Fast zero-path-allocation check whether ``instance`` satisfies ``spec`` within depth and step bounds."""
+    if not isinstance(spec, ModelSpec) or not isinstance(instance, BaseModel) or type(instance) is not spec.model:
+        return False
+    stack: list[tuple[BaseModel, ModelSpec, int]] = [(instance, spec, 1)]
+    steps = 1
+    for _ in range(MAX_WALK_STEPS + 1):
+        if not stack:
+            return True
+        node, node_spec, depth = stack.pop()
+        if depth > MAX_DEPTH or getattr(node, "__pydantic_extra__", None):
+            return False
+        steps += len(node_spec.fields)
+        if steps > MAX_WALK_STEPS:
+            return False
+        for field_spec in node_spec.fields:
+            steps = _field_ok(node, field_spec, depth, steps, stack)
+            if steps < 0:
+                return False
+    return False
 
 
 def _walk_values(stack: list[_Visit]) -> list[str]:

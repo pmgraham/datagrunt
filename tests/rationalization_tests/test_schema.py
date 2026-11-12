@@ -22,6 +22,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum, Flag, IntEnum, IntFlag, StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated, Any, Literal, NewType
 
 import pytest
@@ -31,15 +32,18 @@ from pydantic import (
     AliasPath,
     AwareDatetime,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Discriminator,
     Field,
     NaiveDatetime,
     NonNegativeInt,
+    PlainValidator,
     PositiveInt,
     RootModel,
     StringConstraints,
     WithJsonSchema,
+    WrapValidator,
     create_model,
     field_validator,
     model_validator,
@@ -49,7 +53,10 @@ from pydantic.json_schema import SkipJsonSchema
 
 from datagrunt.rationalization import Key, RationalizationError
 from datagrunt.rationalization import schema as schema_module
+from datagrunt.rationalization.markers import _check_normalized_namespace
 from datagrunt.rationalization.schema import (
+    DEFAULT_HINT,
+    FLOAT_INT_LIMIT,
     MAX_DEPTH,
     MAX_FIELDS,
     MAX_WALK_STEPS,
@@ -58,6 +65,10 @@ from datagrunt.rationalization.schema import (
     ModelSpec,
     PreparedSchema,
     ScalarSpec,
+    _child_visits,
+    _instance_ok,
+    _walk_values,
+    admits_scalar,
     check_json_schema,
     check_schema,
     describe,
@@ -3359,3 +3370,223 @@ class TestNode4SchemaMarkers:
             describe(BadIntKey)
         with pytest.raises(RationalizationError, match="Informational"):
             describe(BadModelInfo)
+
+
+class OtherColor(Enum):
+    RED = "red"
+
+
+class CustomInitModel(BaseModel):
+    code: str
+
+    def __init__(self, **data: Any) -> None:
+        super().__init__(**data)
+
+
+class CustomPostInitChild(BaseModel):
+    code: str
+
+    def model_post_init(self, _context: Any) -> None:
+        return None
+
+
+class HoldsPostInitChild(BaseModel):
+    child: CustomPostInitChild
+
+
+class CustomModelValidateModel(BaseModel):
+    code: str
+
+    @classmethod
+    def model_validate(cls, obj: Any, *args: Any, **kwargs: Any) -> "CustomModelValidateModel":
+        if isinstance(obj, dict):
+            obj["code"] = str(obj.get("code", "")).strip()
+        return super().model_validate(obj, *args, **kwargs)
+
+
+class TestWave1ACompiledSpecsAndFastPaths:
+    def test_check_normalized_namespace_and_key_spec_parity(self):
+        assert _check_normalized_namespace(None) is None
+        assert _check_normalized_namespace("part") is None
+        with pytest.raises(TypeError, match="str or None"):
+            _check_normalized_namespace(42)
+        for bad in ("", "Part", " part "):
+            with pytest.raises(ValueError, match="non-empty, stripped and lower-case"):
+                _check_normalized_namespace(bad)
+
+    def test_literal_set_distinguishes_bool_from_int_and_preserves_hash(self):
+        int_lit = ScalarSpec(base=int, literal=(1, 0, 2))
+        bool_lit = ScalarSpec(base=bool, literal=(True, False))
+
+        assert admits_scalar(int_lit, 1) is True
+        assert admits_scalar(int_lit, 0) is True
+        assert admits_scalar(int_lit, True) is False
+        assert admits_scalar(int_lit, False) is False
+        assert int_lit._literal_set is not None
+        assert (bool, True) not in int_lit._literal_set
+        assert (bool, False) not in int_lit._literal_set
+
+        assert admits_scalar(bool_lit, True) is True
+        assert admits_scalar(bool_lit, False) is True
+        assert admits_scalar(bool_lit, 1) is False
+        assert admits_scalar(bool_lit, 0) is False
+        assert bool_lit._literal_set is not None
+        assert (int, 1) not in bool_lit._literal_set
+        assert (int, 0) not in bool_lit._literal_set
+        assert hash(int_lit) == hash(ScalarSpec(base=int, literal=(1, 0, 2)))
+
+    def test_model_spec_compiled_slots(self):
+        order_spec = describe(Order)
+        part_spec = describe(Part)
+        line_spec = describe(Line)
+
+        assert isinstance(order_spec.fields_by_name, MappingProxyType)
+        assert set(order_spec.fields_by_name) == {"order_id", "placed", "lines", "tags"}
+        assert order_spec.reads_by_name is False
+        assert describe(Aliases).reads_by_name is True
+        assert describe(ByName).reads_by_name is True
+
+        assert part_spec.has_unshown_droppable is False
+        assert line_spec.has_unshown_droppable is False
+        assert order_spec.has_unshown_droppable is True
+        child_with_default = create_model("DefChild", count=(int, 1))
+        parent_of_default = create_model("DefParent", child=(child_with_default, ...))
+        assert describe(parent_of_default).has_unshown_droppable is True
+
+        assert part_spec.has_keyed_list is False
+        assert describe(create_model("SinglePart", part=(Part, ...), notes=(list[Unkeyed], []))).has_keyed_list is False
+        assert order_spec.has_keyed_list is True
+        assert describe(BillOfMaterials).has_keyed_list is True
+        assert hash(order_spec) == hash(ORDER_SPEC) and order_spec == ORDER_SPEC
+
+    def test_prepared_schema_is_pure_pydantic_true_and_false_cases(self):
+        for pure_model in (Order, EveryForm, Invoice, BillOfMaterials, Contract, LabReport):
+            prepared = prepare(pure_model)
+            assert prepared.is_pure_pydantic is True
+        direct = PreparedSchema(
+            model=Order,
+            spec=ORDER_SPEC,
+            wrapper_json=prepare(Order).wrapper_json,
+            sha256=prepare(Order).sha256,
+        )
+        assert direct.is_pure_pydantic is True
+
+        before_m = create_model("BeforeM", x=(Annotated[int, BeforeValidator(lambda v: v)], ...))
+        after_m = create_model("AfterM", x=(Annotated[int, AfterValidator(lambda v: v)], ...))
+        wrap_m = create_model("WrapM", x=(Annotated[int, WrapValidator(lambda v, h: h(v))], ...))
+        plain_m = create_model(
+            "PlainM",
+            x=(Annotated[int, PlainValidator(lambda v: int(v)), WithJsonSchema({"type": "integer"})], ...),
+        )
+        nested_impure = create_model("NestedImpure", items=(list[after_m], []))
+        for impure_model in (
+            SplitTags,
+            AfterOnHalfBuilt,
+            before_m,
+            after_m,
+            wrap_m,
+            plain_m,
+            nested_impure,
+            CustomInitModel,
+            HoldsPostInitChild,
+            CustomModelValidateModel,
+        ):
+            assert prepare(impure_model).is_pure_pydantic is False
+
+    def test_instance_ok_accepts_every_valid_form_and_matches_walk_values(self):
+        valid_every = EveryForm.model_construct(
+            text="ok",
+            count=5,
+            ratio=FLOAT_INT_LIMIT,
+            flag=True,
+            amount=10,
+            day=date(2026, 1, 2),
+            at=AWARE_AT,
+            color=Color.RED,
+            level=Level.LOW,
+            letter="a",
+            number=1,
+            truth=True,
+            constrained="abc",
+            maybe_text=None,
+            maybe_amount=Decimal("1.25"),
+            maybe_color=Color.BLUE,
+            maybe_letter="a",
+            maybe_part=None,
+            texts=["x"],
+            amounts=[1, Decimal("2.5")],
+            colors=[Color.RED],
+            letters=["x"],
+            parts=[Part(number="PN-1")],
+            part=Part(number="PN-2"),
+            described_part=Part(number="PN-3"),
+        )
+        every_spec = describe(EveryForm)
+        assert _instance_ok(valid_every, every_spec) is True
+        assert instance_problems(valid_every, every_spec) == []
+
+    @pytest.mark.parametrize(
+        ("annotation", "bad_value"),
+        [
+            (float, float("nan")),
+            (float, float("inf")),
+            (float, FLOAT_INT_LIMIT + 1),
+            (Decimal, Decimal("NaN")),
+            (Decimal, Decimal("Infinity")),
+            (Color, OtherColor.RED),
+            (AwareDatetime, NAIVE_AT),
+            (NaiveDatetime, AWARE_AT),
+            (Literal[1, 2], True),
+            (Literal[True], 1),
+            (int, None),
+            (list[str], ("a",)),
+            (Part, SubPart(number="PN-1")),
+            (list[Part], [SubPart(number="PN-1")]),
+        ],
+    )
+    def test_instance_ok_rejects_invalid_values_and_preserves_walk_values_messages(self, annotation, bad_value):
+        model = create_model("CheckHolder", value=(annotation, ...))
+        spec = describe(model)
+        set_inst = model.model_construct(_fields_set={"value"}, value=bad_value)
+        def_inst = model.model_construct(_fields_set=set(), value=bad_value)
+
+        for inst in (set_inst, def_inst):
+            assert _instance_ok(inst, spec) is False
+            expected = _walk_values(list(reversed(_child_visits(spec, inst, "", False))))
+            assert expected and instance_problems(inst, spec) == expected
+        assert DEFAULT_HINT not in instance_problems(set_inst, spec)[0]
+        assert instance_problems(def_inst, spec)[0].endswith(DEFAULT_HINT)
+
+    def test_instance_ok_rejects_missing_extra_wrong_root_max_depth_and_max_steps(self):
+        assert _instance_ok(Part.model_construct(), PART_SPEC) is False
+        assert _instance_ok(Part.__new__(Part), PART_SPEC) is False
+        assert instance_problems(Part.__new__(Part), PART_SPEC) == [
+            "number: is missing (the instance was built without it, as model_construct() can)",
+            "name: is missing (the instance was built without it, as model_construct() can)",
+        ]
+        assert _instance_ok(SubPart(number="PN-1"), PART_SPEC) is False
+
+        with_extra = Part(number="PN-1")
+        object.__setattr__(with_extra, "__pydantic_extra__", {"unexpected": 1})
+        assert _instance_ok(with_extra, PART_SPEC) is False
+
+        leaf_model = create_model("Leaf33", value=(str, ...))
+        deep_spec = ModelSpec(
+            model=leaf_model,
+            keys=KeySpec(fields=(), namespace=None),
+            fields=(FieldSpec("value", "value", "scalar", False, True, None, ScalarSpec(str)),),
+        )
+        deep_inst: BaseModel = leaf_model(value="ok")
+        for level in range(MAX_DEPTH, 0, -1):
+            cls = create_model(f"Manual{level}", next=(type(deep_inst), ...))
+            deep_spec = ModelSpec(
+                model=cls,
+                keys=KeySpec(fields=(), namespace=None),
+                fields=(FieldSpec("next", "next", "model", False, True, deep_spec, None),),
+            )
+            deep_inst = cls(next=deep_inst)
+        assert _instance_ok(deep_inst, deep_spec) is False
+
+        big_list_model = create_model("BigList", items=(list[str], []))
+        big_inst = big_list_model(items=["a"] * (MAX_WALK_STEPS + 1))
+        assert _instance_ok(big_inst, describe(big_list_model)) is False
