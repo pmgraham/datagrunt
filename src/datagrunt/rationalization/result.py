@@ -318,6 +318,7 @@ class RationalizedResult(Generic[T]):
     skipped_units: tuple[SkippedUnit, ...]
     telemetry: RationalizeTelemetry
     schema: type[T] | ModelSpec | PreparedSchema | None = field(default=None, repr=False, compare=False)
+    _spec: ModelSpec | None = field(init=False, repr=False, compare=False, default=None)
 
     def __post_init__(self) -> None:
         _check_tuple_of("items", self.items, GroundedRecord)
@@ -341,7 +342,8 @@ class RationalizedResult(Generic[T]):
         if self.needs_review != expected_review:
             raise ValueError("needs_review must equal the items whose status is not consensus or single_model")
 
-        spec = self._optional_spec()
+        spec = self._resolve_optional_spec()
+        object.__setattr__(self, "_spec", spec)
         if spec is not None:
             for item in self.items:
                 if item.record is not None and not isinstance(item.record, spec.model):
@@ -349,8 +351,8 @@ class RationalizedResult(Generic[T]):
                         f"item record must be an instance of {spec.model.__name__}, got {type(item.record).__name__}"
                     )
 
-    def _optional_spec(self) -> ModelSpec | None:
-        """Return the resolved :class:`ModelSpec` if ``schema`` or a non-None record is present, else ``None``."""
+    def _resolve_optional_spec(self) -> ModelSpec | None:
+        """Resolve the :class:`ModelSpec` once from ``schema`` or the first non-None record."""
         if self.schema is not None:
             return _resolve_model_spec(self.schema)
         for item in self.items:
@@ -358,12 +360,15 @@ class RationalizedResult(Generic[T]):
                 return describe(type(item.record))
         return None
 
+    def _optional_spec(self) -> ModelSpec | None:
+        """Return the cached :class:`ModelSpec` if ``schema`` or a non-None record is present, else ``None``."""
+        return self._spec
+
     def _require_spec(self) -> ModelSpec:
-        """Return the resolved :class:`ModelSpec`, raising :class:`RationalizationError` if unavailable."""
-        spec = self._optional_spec()
-        if spec is None:
+        """Return the cached :class:`ModelSpec`, raising :class:`RationalizationError` if unavailable."""
+        if self._spec is None:
             raise RationalizationError("cannot build a DataFrame from an empty RationalizedResult without schema")
-        return spec
+        return self._spec
 
     def to_dataframe(self, flatten: str | None = None, *, include_disputed: bool = False) -> pl.DataFrame:
         """Convert the result's records to a Polars ``DataFrame`` with deterministic dtypes (plan §4.10).
@@ -390,34 +395,27 @@ class RationalizedResult(Generic[T]):
 
         spec = self._require_spec()
         parts = _validate_flatten_path(spec, flatten) if flatten is not None else ()
-        raw_rows, meta_rows = self._serialize_rows(spec, include_disputed=include_disputed)
+        records, statuses, doc_ids = self._select_records(include_disputed=include_disputed)
 
-        if not parts:
-            schema = polars_schema(spec)
+        try:
+            if not parts:
+                return _unflattened_dataframe(spec, records, statuses, doc_ids, include_disputed=include_disputed)
+            flat_schema = _flat_schema_for_level(spec, parts, "", 1)
             if include_disputed:
-                schema = {**schema, "_status": pl.String(), "_doc_id": pl.String()}
-                rows = [
-                    {**row, "_status": status, "_doc_id": doc_id}
-                    for row, (status, doc_id) in zip(raw_rows, meta_rows, strict=True)
-                ]
-            else:
-                rows = raw_rows
-            return pl.DataFrame(rows, schema=schema)
-
-        flat_schema = _flat_schema_for_level(spec, parts, "", 1)
-        if include_disputed:
-            flat_schema = {**flat_schema, "_status": pl.String(), "_doc_id": pl.String()}
-
-        flat_rows: list[dict[str, Any]] = []
-        for idx, row in enumerate(raw_rows):
-            expanded = _flatten_row_at_level(row, spec, parts, "", 1)
-            if include_disputed:
-                status, doc_id = meta_rows[idx]
-                for sub_row in expanded:
-                    flat_rows.append({**sub_row, "_status": status, "_doc_id": doc_id})
-            else:
-                flat_rows.extend(expanded)
-        return pl.DataFrame(flat_rows, schema=flat_schema)
+                flat_schema["_status"] = pl.String()
+                flat_schema["_doc_id"] = pl.String()
+            flat_columns = _build_flattened_columns(
+                records,
+                statuses,
+                doc_ids,
+                spec,
+                parts,
+                flat_schema,
+                include_disputed=include_disputed,
+            )
+        except _FieldBoundsError as err:
+            raise err.to_error() from None
+        return pl.DataFrame(flat_columns, schema=flat_schema)
 
     def to_dicts(self, *, include_disputed: bool = False) -> list[dict[str, Any]]:
         """Convert the result's records to Python dicts via ``model_dump(mode="python")`` (plan §4.10).
@@ -433,60 +431,88 @@ class RationalizedResult(Generic[T]):
             raise TypeError(f"include_disputed must be a bool, got {type(include_disputed).__name__}")
         if not include_disputed:
             return [record.model_dump(mode="python") for record in self.records]
-        return [
-            {**item.record.model_dump(mode="python"), "_status": item.status, "_doc_id": item.doc_id}
-            for item in self.items
-            if item.record is not None
-        ]
+        out: list[dict[str, Any]] = []
+        for item in self.items:
+            if item.record is not None:
+                row = item.record.model_dump(mode="python")
+                row["_status"] = item.status
+                row["_doc_id"] = item.doc_id
+                out.append(row)
+        return out
 
     def to_arrow_table(self, flatten: str | None = None, *, include_disputed: bool = False) -> pa.Table:
         """Convert the result's records to a PyArrow ``Table`` via :meth:`to_dataframe` (plan §4.10)."""
         return self.to_dataframe(flatten=flatten, include_disputed=include_disputed).to_arrow()
 
-    def _serialize_rows(
-        self, spec: ModelSpec, *, include_disputed: bool
-    ) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
-        """Serialize selected records with Int64/Decimal bounds checks and UTC aware-datetime conversion."""
-        rows: list[dict[str, Any]] = []
-        meta: list[tuple[str, str]] = []
+    def _select_records(self, *, include_disputed: bool) -> tuple[Sequence[T], list[str], list[str]]:
+        """Return selected records plus ``(_status, _doc_id)`` column lists when ``include_disputed=True``."""
         if not include_disputed:
-            for record in self.records:
-                rows.append(_serialize_model(record, spec, "", 1))
-            return rows, meta
+            return self.records, [], []
+        records: list[T] = []
+        statuses: list[str] = []
+        doc_ids: list[str] = []
         for item in self.items:
             if item.record is not None:
-                rows.append(_serialize_model(item.record, spec, "", 1))
-                meta.append((item.status, item.doc_id))
-        return rows, meta
+                records.append(item.record)
+                statuses.append(item.status)
+                doc_ids.append(item.doc_id)
+        return records, statuses, doc_ids
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# Row serialization and bounds checks
+# Columnar serialization and lazy bounds checks
 # ---------------------------------------------------------------------------------------------------------------
 
 
-def _check_decimal_bounds(value: Decimal, path: str) -> Decimal:
+class _FieldBoundsError(Exception):
+    """Internal bounds failure that accumulates field/index segments only while unwinding an error."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.parts: list[str] = []
+
+    def add_index(self, idx: int) -> None:
+        self.parts.append(f"[{idx}]")
+
+    def add_field(self, name: str) -> None:
+        self.parts.append(name)
+
+    def to_error(self) -> RationalizationError:
+        path = ""
+        for part in reversed(self.parts):
+            path = f"{path}{part}" if not path or part.startswith("[") else f"{path}.{part}"
+        return RationalizationError(f"{path}: {self.reason}" if path else self.reason)
+
+
+def _check_decimal_bounds(value: Decimal) -> Decimal:
     """Verify ``value`` fits ``pl.Decimal(38, 9)`` (at most 29 integer digits and 9 fractional digits)."""
     if not value.is_finite():
-        raise RationalizationError(f"{path}: Decimal value is not finite")
+        raise _FieldBoundsError("Decimal value is not finite")
     _, digits, exponent = value.as_tuple()
     if not isinstance(exponent, int):
-        raise RationalizationError(f"{path}: Decimal value is not finite")
+        raise _FieldBoundsError("Decimal value is not finite")
     frac_digits = max(0, -exponent)
     if frac_digits > DECIMAL_SCALE:
-        raise RationalizationError(
-            f"{path}: Decimal value has {frac_digits} fractional digits, exceeding scale {DECIMAL_SCALE}"
-        )
+        raise _FieldBoundsError(f"Decimal value has {frac_digits} fractional digits, exceeding scale {DECIMAL_SCALE}")
     int_digits = max(0, len(digits) + exponent) if value != 0 else 0
     if int_digits > _DECIMAL_MAX_INT_DIGITS:
-        raise RationalizationError(
-            f"{path}: Decimal value has {int_digits} integer digits, exceeding {_DECIMAL_MAX_INT_DIGITS} "
+        raise _FieldBoundsError(
+            f"Decimal value has {int_digits} integer digits, exceeding {_DECIMAL_MAX_INT_DIGITS} "
             f"(Decimal({DECIMAL_PRECISION}, {DECIMAL_SCALE}))"
         )
     return value
 
 
-def _serialize_scalar(value: Any, scalar: ScalarSpec, path: str) -> Any:
+def _is_passthrough_scalar(scalar: ScalarSpec) -> bool:
+    """Whether validated values of ``scalar`` need neither Enum unwrapping, bounds checks, nor UTC conversion."""
+    if scalar.enum is not None:
+        return False
+    base = scalar.base
+    return base is str or base is bool or base is date or (base is datetime and scalar.tz == "naive")
+
+
+def _serialize_scalar(value: Any, scalar: ScalarSpec) -> Any:
     """Convert one scalar value for Polars frame construction without mutating the source record."""
     if value is None:
         return None
@@ -494,11 +520,11 @@ def _serialize_scalar(value: Any, scalar: ScalarSpec, path: str) -> Any:
     base = scalar.base
     if base is int:
         if type(raw) is not int or not INT64_MIN <= raw <= INT64_MAX:
-            raise RationalizationError(f"{path}: int value is outside Int64 range [{INT64_MIN}, {INT64_MAX}]")
+            raise _FieldBoundsError(f"int value is outside Int64 range [{INT64_MIN}, {INT64_MAX}]")
         return raw
     if base is Decimal:
         dec = Decimal(raw) if type(raw) is int else raw
-        return _check_decimal_bounds(dec, path)
+        return _check_decimal_bounds(dec)
     if base is datetime and scalar.tz == "aware":
         return raw.astimezone(timezone.utc)
     if base is float and type(raw) is int:
@@ -506,33 +532,102 @@ def _serialize_scalar(value: Any, scalar: ScalarSpec, path: str) -> Any:
     return raw
 
 
-def _serialize_field(instance: BaseModel, field_spec: FieldSpec, path: str, depth: int) -> Any:
-    """Serialize one field of ``instance`` for Polars frame construction."""
+def _serialize_scalar_list(items: Sequence[Any], scalar: ScalarSpec) -> list[Any]:
+    """Serialize a ``scalar_list`` sequence, recording the failing element index only if bounds fail."""
+    if _is_passthrough_scalar(scalar):
+        return list(items)
+    out: list[Any] = []
+    for idx, item in enumerate(items):
+        try:
+            out.append(_serialize_scalar(item, scalar))
+        except _FieldBoundsError as err:
+            err.add_index(idx)
+            raise
+    return out
+
+
+def _serialize_model_list(items: Sequence[BaseModel], child_spec: ModelSpec, depth: int) -> list[dict[str, Any]]:
+    """Serialize a ``model_list`` sequence into Polars Struct dicts, recording the index only on error."""
+    out: list[dict[str, Any]] = []
+    for idx, item in enumerate(items):
+        try:
+            out.append(_serialize_model(item, child_spec, depth))
+        except _FieldBoundsError as err:
+            err.add_index(idx)
+            raise
+    return out
+
+
+def _serialize_field(instance: BaseModel, field_spec: FieldSpec, depth: int) -> Any:
+    """Serialize one field of ``instance`` for Polars frame construction without eager path formatting."""
     if depth > MAX_DEPTH:
-        raise RationalizationError(f"{path}: nesting is deeper than {MAX_DEPTH} levels")
+        raise RationalizationError(f"{field_spec.name}: nesting is deeper than {MAX_DEPTH} levels")
     value = getattr(instance, field_spec.name)
     if value is None:
         return None
-    if field_spec.kind == "scalar" and field_spec.scalar is not None:
-        return _serialize_scalar(value, field_spec.scalar, path)
-    if field_spec.kind == "scalar_list" and field_spec.scalar is not None:
-        return [_serialize_scalar(item, field_spec.scalar, f"{path}[{idx}]") for idx, item in enumerate(value)]
-    if field_spec.kind == "model" and field_spec.child is not None:
-        return _serialize_model(value, field_spec.child, path, depth + 1)
-    if field_spec.kind == "model_list" and field_spec.child is not None:
-        return [_serialize_model(item, field_spec.child, f"{path}[{idx}]", depth + 1) for idx, item in enumerate(value)]
+    try:
+        if field_spec.kind == "scalar" and field_spec.scalar is not None:
+            return value if _is_passthrough_scalar(field_spec.scalar) else _serialize_scalar(value, field_spec.scalar)
+        if field_spec.kind == "scalar_list" and field_spec.scalar is not None:
+            return _serialize_scalar_list(value, field_spec.scalar)
+        if field_spec.kind == "model" and field_spec.child is not None:
+            return _serialize_model(value, field_spec.child, depth + 1)
+        if field_spec.kind == "model_list" and field_spec.child is not None:
+            return _serialize_model_list(value, field_spec.child, depth + 1)
+    except _FieldBoundsError as err:
+        err.add_field(field_spec.name)
+        raise
     raise RationalizationError(f"invalid FieldSpec {field_spec.name!r}")
 
 
-def _serialize_model(instance: BaseModel, spec: ModelSpec, prefix: str, depth: int) -> dict[str, Any]:
-    """Serialize ``instance`` of ``spec`` into a Python dict matching :func:`polars_schema`."""
+def _serialize_model(instance: BaseModel, spec: ModelSpec, depth: int) -> dict[str, Any]:
+    """Serialize ``instance`` of ``spec`` into a Python Struct dict matching :func:`polars_schema`."""
     if depth > MAX_DEPTH:
-        raise RationalizationError(f"{prefix or spec.model.__name__}: nesting is deeper than {MAX_DEPTH} levels")
-    row: dict[str, Any] = {}
-    for field_spec in spec.fields:
-        path = f"{prefix}.{field_spec.name}" if prefix else field_spec.name
-        row[field_spec.name] = _serialize_field(instance, field_spec, path, depth)
-    return row
+        raise RationalizationError(f"{spec.model.__name__}: nesting is deeper than {MAX_DEPTH} levels")
+    return {field_spec.name: _serialize_field(instance, field_spec, depth) for field_spec in spec.fields}
+
+
+def _serialize_column(records: Sequence[BaseModel], field_spec: FieldSpec) -> list[Any]:
+    """Build one unflattened column list across ``records`` directly."""
+    if not records:
+        return []
+    name = field_spec.name
+    if field_spec.kind == "scalar" and field_spec.scalar is not None:
+        scalar = field_spec.scalar
+        if _is_passthrough_scalar(scalar):
+            return [getattr(rec, name) for rec in records]
+        try:
+            return [_serialize_scalar(getattr(rec, name), scalar) for rec in records]
+        except _FieldBoundsError as err:
+            err.add_field(name)
+            raise
+    if field_spec.kind == "scalar_list" and field_spec.scalar is not None and _is_passthrough_scalar(field_spec.scalar):
+        return [getattr(rec, name) for rec in records]
+    return [_serialize_field(rec, field_spec, 1) for rec in records]
+
+
+def _build_unflattened_columns(records: Sequence[BaseModel], spec: ModelSpec) -> dict[str, list[Any]]:
+    """Build columnar ``dict[str, list[Any]]`` buffers directly for unflattened :meth:`to_dataframe`."""
+    return {field_spec.name: _serialize_column(records, field_spec) for field_spec in spec.fields}
+
+
+def _unflattened_dataframe(
+    spec: ModelSpec,
+    records: Sequence[BaseModel],
+    statuses: list[str],
+    doc_ids: list[str],
+    *,
+    include_disputed: bool,
+) -> pl.DataFrame:
+    """Construct an unflattened Polars ``DataFrame`` directly from columnar field buffers."""
+    schema = polars_schema(spec)
+    columns = _build_unflattened_columns(records, spec)
+    if include_disputed:
+        schema["_status"] = pl.String()
+        schema["_doc_id"] = pl.String()
+        columns["_status"] = statuses
+        columns["_doc_id"] = doc_ids
+    return pl.DataFrame(columns, schema=schema)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -552,8 +647,7 @@ def _validate_flatten_path(spec: ModelSpec, flatten: str) -> tuple[str, ...]:
 
     current = spec
     for idx, part in enumerate(parts):
-        by_name = {field_spec.name: field_spec for field_spec in current.fields}
-        field_spec = by_name.get(part)
+        field_spec = current.fields_by_name.get(part)
         if field_spec is None:
             raise RationalizationError(f"flatten path {flatten!r}: {current.model.__name__} has no field {part!r}")
         is_last = idx == len(parts) - 1
@@ -596,54 +690,155 @@ def _flat_schema_for_level(spec: ModelSpec, parts: tuple[str, ...], prefix: str,
     return out
 
 
-def _flatten_row_at_level(
-    row: Mapping[str, Any] | None,
+def _append_child_model_fields(
+    elem: BaseModel,
+    child_spec: ModelSpec,
+    col_prefix: str,
+    depth: int,
+    columns: dict[str, list[Any]],
+) -> None:
+    """Serialize and append each field of one terminal child model ``elem`` into ``columns``."""
+    for child_field in child_spec.fields:
+        columns[f"{col_prefix}.{child_field.name}"].append(_serialize_field(elem, child_field, depth))
+
+
+def _append_flat_terminal_models(
+    raw_items: Sequence[BaseModel],
+    child_spec: ModelSpec,
+    target_name: str,
+    col_prefix: str,
+    depth: int,
+    columns: dict[str, list[Any]],
+) -> int:
+    """Append terminal exploded ``model_list`` rows (or a single ``None`` row when empty) into ``columns``."""
+    if depth > MAX_DEPTH:
+        raise RationalizationError(f"{col_prefix}: nesting is deeper than {MAX_DEPTH} levels")
+    if not raw_items:
+        for child_field in child_spec.fields:
+            columns[f"{col_prefix}.{child_field.name}"].append(None)
+        return 1
+    for idx, elem in enumerate(raw_items):
+        try:
+            _append_child_model_fields(elem, child_spec, col_prefix, depth, columns)
+        except _FieldBoundsError as err:
+            err.add_index(idx)
+            err.add_field(target_name)
+            raise
+    return len(raw_items)
+
+
+def _append_flat_intermediate(
+    raw_items: Sequence[BaseModel],
+    child_spec: ModelSpec,
+    target_name: str,
+    rest: tuple[str, ...],
+    col_prefix: str,
+    depth: int,
+    columns: dict[str, list[Any]],
+) -> int:
+    """Recurse into an intermediate ``model_list`` along ``rest``, left-outer exploding ``()`` as ``(None,)``."""
+    if not raw_items:
+        return _append_flat_level(None, child_spec, rest, f"{col_prefix}.", depth + 1, columns)
+    total = 0
+    for idx, elem in enumerate(raw_items):
+        try:
+            total += _append_flat_level(elem, child_spec, rest, f"{col_prefix}.", depth + 1, columns)
+        except _FieldBoundsError as err:
+            err.add_index(idx)
+            err.add_field(target_name)
+            raise
+    return total
+
+
+def _append_flat_target(
+    instance: BaseModel | None,
+    target_spec: FieldSpec,
+    rest: tuple[str, ...],
+    col_prefix: str,
+    depth: int,
+    columns: dict[str, list[Any]],
+) -> int:
+    """Explode ``target_spec`` on ``instance`` into ``columns`` and return the number of emitted rows."""
+    raw_items: Sequence[Any] = () if instance is None else (getattr(instance, target_spec.name) or ())
+    if rest:
+        if target_spec.child is None:
+            raise RationalizationError(f"missing child spec on {col_prefix}")
+        return _append_flat_intermediate(
+            raw_items,
+            target_spec.child,
+            target_spec.name,
+            rest,
+            col_prefix,
+            depth,
+            columns,
+        )
+    if target_spec.kind == "scalar_list" and target_spec.scalar is not None:
+        if not raw_items:
+            columns[col_prefix].append(None)
+            return 1
+        try:
+            serialized = _serialize_scalar_list(raw_items, target_spec.scalar)
+        except _FieldBoundsError as err:
+            err.add_field(target_spec.name)
+            raise
+        columns[col_prefix].extend(serialized)
+        return len(serialized)
+    if target_spec.child is None:
+        raise RationalizationError(f"missing child spec on {col_prefix}")
+    return _append_flat_terminal_models(
+        raw_items,
+        target_spec.child,
+        target_spec.name,
+        col_prefix,
+        depth + 1,
+        columns,
+    )
+
+
+def _append_flat_level(
+    instance: BaseModel | None,
     spec: ModelSpec,
     parts: tuple[str, ...],
     prefix: str,
     depth: int,
-) -> list[dict[str, Any]]:
-    """Left-outer explode ``row`` along ``parts``, dropping sibling list fields at each exploded level."""
+    columns: dict[str, list[Any]],
+) -> int:
+    """Left-outer explode ``instance`` along ``parts`` into ``columns``, skipping sibling list fields."""
     if depth > MAX_DEPTH:
         raise RationalizationError(f"{prefix or spec.model.__name__}: nesting is deeper than {MAX_DEPTH} levels")
     target = parts[0]
-    rest = parts[1:]
-    base_cols: dict[str, Any] = {}
-    target_spec: FieldSpec | None = None
-    for field_spec in spec.fields:
-        if field_spec.name == target:
-            target_spec = field_spec
-        elif field_spec.kind not in ("scalar_list", "model_list"):
-            base_cols[f"{prefix}{field_spec.name}"] = None if row is None else row[field_spec.name]
-
+    target_spec = spec.fields_by_name.get(target)
     if target_spec is None:
         raise RationalizationError(f"missing target field {target!r}")
+    kept: list[tuple[str, Any]] = []
+    for field_spec in spec.fields:
+        if field_spec.name != target and field_spec.kind not in ("scalar_list", "model_list"):
+            val = None if instance is None else _serialize_field(instance, field_spec, depth)
+            kept.append((f"{prefix}{field_spec.name}", val))
+    count = _append_flat_target(instance, target_spec, parts[1:], f"{prefix}{target}", depth, columns)
+    for col_name, val in kept:
+        if count == 1:
+            columns[col_name].append(val)
+        else:
+            columns[col_name].extend([val] * count)
+    return count
 
-    items: Sequence[Any] = () if row is None or not row[target] else row[target]
-    col_prefix = f"{prefix}{target}"
 
-    if rest:
-        if target_spec.child is None:
-            raise RationalizationError(f"missing child spec on {col_prefix}")
-        elements: Sequence[Mapping[str, Any] | None] = items if items else (None,)
-        out: list[dict[str, Any]] = []
-        for elem in elements:
-            for sub_row in _flatten_row_at_level(elem, target_spec.child, rest, f"{col_prefix}.", depth + 1):
-                out.append({**base_cols, **sub_row})
-        return out
-
-    if target_spec.kind == "scalar_list":
-        scalar_elems: Sequence[Any] = items if items else (None,)
-        return [{**base_cols, col_prefix: elem} for elem in scalar_elems]
-
-    if target_spec.child is None:
-        raise RationalizationError(f"missing child spec on {col_prefix}")
-    model_elems: Sequence[Mapping[str, Any] | None] = items if items else (None,)
-    rows_out: list[dict[str, Any]] = []
-    for elem in model_elems:
-        child_cols = {
-            f"{col_prefix}.{child_field.name}": (None if elem is None else elem[child_field.name])
-            for child_field in target_spec.child.fields
-        }
-        rows_out.append({**base_cols, **child_cols})
-    return rows_out
+def _build_flattened_columns(
+    records: Sequence[BaseModel],
+    statuses: Sequence[str],
+    doc_ids: Sequence[str],
+    spec: ModelSpec,
+    parts: tuple[str, ...],
+    flat_schema: Mapping[str, pl.DataType],
+    *,
+    include_disputed: bool,
+) -> dict[str, list[Any]]:
+    """Build columnar ``dict[str, list[Any]]`` buffers directly for ``flatten=...`` :meth:`to_dataframe`."""
+    columns: dict[str, list[Any]] = {name: [] for name in flat_schema}
+    for idx, record in enumerate(records):
+        emitted = _append_flat_level(record, spec, parts, "", 1, columns)
+        if include_disputed:
+            columns["_status"].extend([statuses[idx]] * emitted)
+            columns["_doc_id"].extend([doc_ids[idx]] * emitted)
+    return columns

@@ -61,7 +61,8 @@ def canonical_json(value: object, *, subject: str = "the value") -> str:
         raise ValueError("subject must be non-blank")
     try:
         text = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
-        text.encode("utf-8")
+        if not text.isascii():
+            text.encode("utf-8")
     except (TypeError, ValueError, RecursionError) as error:
         raise RationalizationError(f"{subject} is not canonical JSON: {error}") from error
     return text

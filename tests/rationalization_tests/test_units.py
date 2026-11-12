@@ -53,6 +53,7 @@ from datagrunt.pdf.elements import (
     Table,
 )
 from datagrunt.rationalization import units as units_module
+from datagrunt.rationalization.envelope import render_element
 from datagrunt.rationalization.units import (
     BLOCK_SEPARATOR,
     GroupScope,
@@ -2331,3 +2332,66 @@ class TestMultimodalUnits:
         assert SECRET not in BLOCK_SEPARATOR.join(plan.units[1].blocks)
         assert plan.units[1].hidden_excluded == (("invisible", 1),)
         assert [(s.reason, s.page_numbers) for s in plan.skipped] == [("image_only", (4,))]
+
+
+def unflagged_render_element(element: DocumentElement) -> str:
+    """Identical output to ``render_element``, under a distinct identity so ``_largest_part`` runs."""
+    return render_element(element)
+
+
+class TestMonotoneSplittingParity:
+    def test_table_monotone_splitting_matches_binary_search_across_edge_cases(self):
+        edge_rows = [
+            ("a|b", "x\\y\\"),
+            ("line1\nline2\r\nline3", "<el> & \u202e \x07 \U000e0041 \ud800"),
+            ("", "   "),
+            ("OVERSIZE_" + "Z" * 180, "tail"),
+            ("1. start", "- dash"),
+            ("plain", "end\\"),
+        ]
+        for hdrs in (("Col | 1", "Col\u202e2"), ()):
+            doc = document(page(1, (table(1, 0, edge_rows * 3, headers=hdrs),)))
+            for limit in (80, 130, 195, 260, 420):
+                fast = build_units(doc, max_unit_chars=limit, render=render_element)
+                oracle = build_units(doc, max_unit_chars=limit, render=unflagged_render_element)
+                assert fast == oracle
+
+    def test_bullet_list_monotone_splitting_matches_binary_search_across_all_marker_forms(self):
+        items = [
+            "simple item",
+            "pipe | backslash \\ and <tag>",
+            "multi\nline\r\nitem with \u202e and \x07",
+            "OVERSIZE_ITEM_" + "W" * 180,
+            "trailing slash\\",
+            "1. numbered text\n- nested lookalike",
+        ]
+        variants = [
+            bullets(1, 0, items, ordered=False),
+            bullets(1, 0, items, ordered=True),
+            bullets(1, 0, items, ordered=True, markers=("7.", "8.", "9.", "10.", "11.", "12.")),
+            bullets(1, 0, items, ordered=True, markers=("a)", "b)", "c)", "d)", "e)", "f)")),
+            bullets(1, 0, items, ordered=True, markers=("1.", "3.", "4.", "5.", "6.", "8.")),
+        ]
+        for listing in variants:
+            doc = document(page(1, (listing,)))
+            for limit in (75, 120, 180, 280):
+                fast = build_units(doc, max_unit_chars=limit, render=render_element)
+                oracle = build_units(doc, max_unit_chars=limit, render=unflagged_render_element)
+                assert fast == oracle
+
+    def test_monotone_table_splitter_renders_once_per_emitted_part(self, monkeypatch):
+        calls: list[int] = []
+
+        def counting_monotone(element: DocumentElement) -> str:
+            if isinstance(element, Table):
+                calls.append(len(element.rows))
+            return render_element(element)
+
+        monkeypatch.setattr(units_module, "_is_builtin_element_renderer", lambda fn: fn is counting_monotone)
+        rows = [(f"r{idx:04d}", "val") for idx in range(300)]
+        doc = document(page(1, (table(1, 0, rows),)))
+        plan = build_units(doc, max_unit_chars=500, render=counting_monotone)
+
+        assert len(plan.units) > 5
+        part_sizes = [len(u.elements[0].rows) for u in plan.units if isinstance(u.elements[0], Table)]
+        assert calls == [300, *part_sizes]

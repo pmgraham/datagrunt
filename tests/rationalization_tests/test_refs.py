@@ -253,6 +253,27 @@ def test_a_name_written_by_json_pointer_reads_back_by_def_name(name):
     assert def_name(json_pointer("#/$defs", name)) == name
 
 
+def test_json_pointer_rejects_non_str_arguments():
+    with pytest.raises(TypeError, match="str"):
+        json_pointer(None, "Part")
+    with pytest.raises(TypeError, match="str"):
+        json_pointer("#/$defs", 123)
+
+
+def test_edges_direct_push_counts_all_supported_subschema_containers():
+    body = {
+        "type": "object",
+        "properties": {"a": {"type": "string"}, "b": {"type": "integer"}},
+        "items": {"type": "string"},
+        "additionalProperties": {"$ref": "#/$defs/A"},
+        "anyOf": [{"type": "string"}, {"type": "null"}],
+    }
+    # 1 root body + 2 properties + 1 items + 1 additionalProperties + 2 anyOf = 7 nodes
+    assert ref_cycle({"A": body}, max_nodes=7) == ("A", "A")
+    with pytest.raises(NodeBoundError, match="more than 6 schema nodes"):
+        ref_cycle({"A": body}, max_nodes=6)
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # $ref cycles, on every route
 # ---------------------------------------------------------------------------------------------------------------

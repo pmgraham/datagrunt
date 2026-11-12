@@ -93,7 +93,6 @@ UNREAD_KEYWORDS = frozenset(
 (module notes, 3): dropping one would loosen the schema silently, and a ``$ref`` under one would escape the check."""
 
 _BAD_ESCAPE = re.compile("~(?![01])")  # RFC 6901 escapes only "~" (as ~0) and "/" (as ~1)
-_SCHEMA_VALUED = ("items", "additionalProperties")
 
 
 class NodeBoundError(RationalizationError):
@@ -115,7 +114,11 @@ def def_name(ref: object) -> str | None:
     if not isinstance(ref, str) or not ref.startswith(DEFS_PREFIX):
         return None
     token = ref[len(DEFS_PREFIX) :]
-    if "/" in token or "%" in token or _BAD_ESCAPE.search(token):
+    if "/" in token or "%" in token:
+        return None
+    if "~" not in token:
+        return token
+    if _BAD_ESCAPE.search(token):
         return None
     return token.replace("~1", "/").replace("~0", "~")
 
@@ -130,6 +133,10 @@ def json_pointer(base: str, token: str) -> str:
     Returns:
         ``base/token``, ``~`` written as ``~0`` and ``/`` as ``~1``.
     """
+    if not isinstance(base, str) or not isinstance(token, str):
+        raise TypeError("base and token must be str")
+    if "~" not in token and "/" not in token:
+        return f"{base}/{token}"
     return f"{base}/{token.replace('~', '~0').replace('/', '~1')}"
 
 
@@ -157,6 +164,8 @@ def ref_cycle(definitions: Mapping[str, Any], *, max_nodes: int) -> tuple[str, .
         raise TypeError(f"max_nodes must be an int, got {type(max_nodes).__name__}")
     if max_nodes < 1:
         raise ValueError("max_nodes must be at least 1")
+    if not definitions:
+        return None
     edges = _edges(definitions, max_nodes)
     budget = 2 * (len(edges) + sum(len(targets) for targets in edges.values())) + 1
     done: set[str] = set()
@@ -189,18 +198,22 @@ def _shown_name(name: str) -> str:
     return name if len(name) <= NAME_CHARS else f"{name[:NAME_CHARS]}…"
 
 
-def _subschemas(node: Mapping[str, Any]) -> list[object]:
-    """The subschemas under ``node`` that a transform reads: its properties, ``items``, ``anyOf`` members and a
-    schema-valued ``additionalProperties``; a ``$ref``'s siblings included, nested ``$defs`` not."""
-    found: list[object] = []
+def _push_subschemas(stack: list[tuple[str, object]], owner: str, node: Mapping[str, Any]) -> None:
+    """Push the subschemas under ``node`` that a transform reads directly onto ``stack``."""
     properties = node.get("properties")
     if isinstance(properties, Mapping):
-        found.extend(properties.values())
-    found.extend(node[keyword] for keyword in _SCHEMA_VALUED if isinstance(node.get(keyword), Mapping))
+        for child in properties.values():
+            stack.append((owner, child))
+    items = node.get("items")
+    if isinstance(items, Mapping):
+        stack.append((owner, items))
+    additional = node.get("additionalProperties")
+    if isinstance(additional, Mapping):
+        stack.append((owner, additional))
     members = node.get("anyOf")
     if isinstance(members, list):
-        found.extend(members)
-    return found
+        for member in members:
+            stack.append((owner, member))
 
 
 def _edges(definitions: Mapping[str, Any], max_nodes: int) -> dict[str, list[str]]:
@@ -217,10 +230,10 @@ def _edges(definitions: Mapping[str, Any], max_nodes: int) -> dict[str, list[str
         owner, node = stack.pop()
         if not isinstance(node, Mapping):
             continue
-        target = def_name(node.get("$ref"))
+        target = def_name(node["$ref"]) if "$ref" in node else None
         if target is not None and target in found:
             found[owner].add(target)
-        stack.extend((owner, child) for child in _subschemas(node))
+        _push_subschemas(stack, owner, node)
     raise NodeBoundError(
         f"the response schema's $defs hold more than {max_nodes:,} schema node{'' if max_nodes == 1 else 's'}"
     )

@@ -117,6 +117,14 @@ class TestCanonicalJson:
         with pytest.raises(error, match="subject"):
             canonical_json({}, subject=subject)
 
+    def test_ascii_fast_path_and_nested_surrogate_rejection(self):
+        ascii_doc = {"z": [1, 2, 3], "a": {"flag": True, "empty": None, "text": "plain-ascii_123"}}
+        assert canonical_json(ascii_doc) == '{"a":{"empty":null,"flag":true,"text":"plain-ascii_123"},"z":[1,2,3]}'
+
+        with pytest.raises(RationalizationError, match=r"^the value is not canonical JSON: ") as val_err:
+            canonical_json({"ascii_key": ["ok", {"nested": "prefix-\ud83d-suffix"}]})
+        assert isinstance(val_err.value.__cause__, UnicodeEncodeError)
+
 
 class TestCanonicalCopy:
     def test_the_parse_of_the_canonical_json(self):

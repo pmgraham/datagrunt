@@ -83,6 +83,7 @@ pydantic, no httpx, nothing from ``datagrunt.core``, and no import inside a func
 """
 
 import dataclasses
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal, TypeAlias, TypeGuard, get_args
@@ -99,6 +100,8 @@ from datagrunt.pdf.elements import (
     PDFDocument,
     Section,
     Table,
+    _markdown_literal,
+    _shown_as_written,
 )
 
 BLOCK_SEPARATOR = "\n"
@@ -124,6 +127,8 @@ whole element, then candidate parts while it splits), and the plan keeps the blo
 _SKIP_REASONS: tuple[SkipReason, ...] = get_args(SkipReason)
 _ELEMENT_TYPES: tuple[type[DocumentElement], ...] = get_args(DocumentElement)
 _SPLITTABLE: tuple[type, ...] = (Table, BulletList)
+_CM_NUMBER = re.compile(r"[0-9]{1,9}[.)]")
+_ITEM_BREAK = re.compile(r"\r\n|\r|\n")
 
 
 def _check_text(name: str, value: object) -> None:
@@ -568,12 +573,167 @@ def _split(element: Table | BulletList, limit: int, render: Renderer) -> list[tu
     return parts
 
 
+def _pack_spans(entry_lens: Sequence[int], base_len: int, sep_len: int, limit: int) -> list[tuple[int, int]]:
+    """Greedily partition ``0..len(entry_lens)`` into maximal ``(start, stop)`` slices within ``limit``."""
+    if not entry_lens or limit < 1:
+        raise ValueError("entry_lens must be non-empty and limit >= 1")
+    spans: list[tuple[int, int]] = []
+    start = 0
+    current = base_len + entry_lens[0]
+    for idx in range(1, len(entry_lens)):
+        grown = current + sep_len + entry_lens[idx]
+        if current <= limit and grown <= limit:
+            current = grown
+            continue
+        spans.append((start, idx))
+        start = idx
+        current = base_len + entry_lens[idx]
+    spans.append((start, len(entry_lens)))
+    return spans
+
+
+def _split_table_monotone(
+    table: Table,
+    block: str,
+    limit: int,
+    render: Renderer,
+) -> list[tuple[Table | BulletList, str]]:
+    """Split an oversize ``Table`` in ``O(R)`` under a monotone GFM element renderer, verifying each part."""
+    if limit < 1:
+        raise ValueError(f"limit must be >= 1, got {limit}")
+    if len(table.rows) < 2:
+        return []
+    lines = block.split("\n")
+    if len(lines) != len(table.rows) + 4:
+        return _split(table, limit, render)
+    open_tag, header_line, divider_line, close_tag = lines[0], lines[1], lines[2], lines[-1]
+    row_lines = lines[3:-1]
+    base_len = len(open_tag) + len(header_line) + len(divider_line) + len(close_tag) + 4
+    spans = _pack_spans([len(line) for line in row_lines], base_len, 1, limit)
+    if len(spans) < 2:
+        return []
+    parts: list[tuple[Table | BulletList, str]] = []
+    for start, stop in spans:
+        piece = dataclasses.replace(table, rows=table.rows[start:stop])
+        expected = "\n".join((open_tag, header_line, divider_line, *row_lines[start:stop], close_tag))
+        rendered = _render(render, piece)
+        if rendered != expected:
+            raise RuntimeError(f"monotone table split mismatch on {table.element_id}[{start}:{stop}]")
+        parts.append((piece, rendered))
+    return parts
+
+
+def _slice_marker_text_items(listing: BulletList, body_lines: list[str]) -> list[str] | None:
+    """Extract per-item escaped strings from a ``_marker_text_entries`` body (without inter-item ``\\``)."""
+    count = len(listing.items)
+    if len(body_lines) == count:
+        if any(not line.endswith("\\") for line in body_lines[:-1]):
+            return None
+        return [*[line[:-1] for line in body_lines[:-1]], body_lines[-1]]
+    entries: list[str] = []
+    pos = 0
+    for idx, (marker, item) in enumerate(zip(listing.markers, listing.items, strict=True)):
+        span = len(_markdown_literal(f"{marker} {item}"))
+        chunk = body_lines[pos : pos + span]
+        if len(chunk) != span or (idx < count - 1 and not chunk[-1].endswith("\\")):
+            return None
+        if idx < count - 1:
+            chunk = [*chunk[:-1], chunk[-1][:-1]]
+        entries.append("\n".join(chunk))
+        pos += span
+    return entries if pos == len(body_lines) else None
+
+
+def _slice_list_items(listing: BulletList, body_lines: list[str]) -> list[str] | None:
+    """Extract per-item escaped strings from a ``_list_entries`` body."""
+    count = len(listing.items)
+    if len(body_lines) == count:
+        return body_lines
+    if listing.ordered and listing.markers:
+        markers: Sequence[str] = listing.markers
+    elif listing.ordered:
+        markers = [f"{num}." for num in range(1, count + 1)]
+    else:
+        markers = ("-",) * count
+    entries: list[str] = []
+    pos = 0
+    for marker, item in zip(markers, listing.items, strict=True):
+        span = len(_markdown_literal(item)) + len(_ITEM_BREAK.findall(marker))
+        chunk = body_lines[pos : pos + span]
+        if len(chunk) != span:
+            return None
+        entries.append("\n".join(chunk))
+        pos += span
+    return entries if pos == len(body_lines) else None
+
+
+def _list_item_entries(listing: BulletList, body_lines: list[str]) -> tuple[list[str], str] | None:
+    """Return ``(escaped_entries, item_separator)`` when ``listing`` renders uniformly across all slices."""
+    if listing.ordered and listing.markers and not _shown_as_written(listing.markers):
+        if any(_CM_NUMBER.fullmatch(marker) is not None for marker in listing.markers):
+            return None
+        sliced = _slice_marker_text_items(listing, body_lines)
+        return None if sliced is None else (sliced, "\\\n")
+    sliced = _slice_list_items(listing, body_lines)
+    return None if sliced is None else (sliced, "\n")
+
+
+def _split_list_monotone(
+    listing: BulletList,
+    block: str,
+    limit: int,
+    render: Renderer,
+) -> list[tuple[Table | BulletList, str]]:
+    """Split an oversize ``BulletList`` in ``O(R)`` under a monotone GFM element renderer, verifying each part."""
+    if limit < 1:
+        raise ValueError(f"limit must be >= 1, got {limit}")
+    if len(listing.items) < 2:
+        return []
+    lines = block.split("\n")
+    if len(lines) < 3:
+        return _split(listing, limit, render)
+    open_tag, close_tag = lines[0], lines[-1]
+    extracted = _list_item_entries(listing, lines[1:-1])
+    if extracted is None:
+        return _split(listing, limit, render)
+    entries, sep = extracted
+    base_len = len(open_tag) + len(close_tag) + 2
+    spans = _pack_spans([len(entry) for entry in entries], base_len, len(sep), limit)
+    if len(spans) < 2:
+        return []
+    parts: list[tuple[Table | BulletList, str]] = []
+    for start, stop in spans:
+        piece = _part(listing, start, stop)
+        expected = f"{open_tag}\n{sep.join(entries[start:stop])}\n{close_tag}"
+        rendered = _render(render, piece)
+        if rendered != expected:
+            raise RuntimeError(f"monotone list split mismatch on {listing.element_id}[{start}:{stop}]")
+        parts.append((piece, rendered))
+    return parts
+
+
+def _is_builtin_element_renderer(render: Renderer) -> bool:
+    """Return ``True`` when ``render`` is ``datagrunt.rationalization.envelope.render_element``."""
+    return (
+        callable(render)
+        and getattr(render, "__name__", None) == "render_element"
+        and getattr(render, "__module__", None) == "datagrunt.rationalization.envelope"
+    )
+
+
 def _pieces(element: DocumentElement, limit: int, render: Renderer) -> list[tuple[PartOf, DocumentElement, str]]:
     """The element's blocks: the element whole, or its parts when it is a table or list past the limit."""
     block = _render(render, element)
     if len(block) <= limit or not isinstance(element, (Table, BulletList)):
         return [(None, element, block)]
-    parts = _split(element, limit, render)
+    if _is_builtin_element_renderer(render):
+        parts = (
+            _split_table_monotone(element, block, limit, render)
+            if isinstance(element, Table)
+            else _split_list_monotone(element, block, limit, render)
+        )
+    else:
+        parts = _split(element, limit, render)
     if len(parts) < 2:  # one row or item, or a table of headers only: it cannot split
         return [(None, element, block)]
     count = len(parts)

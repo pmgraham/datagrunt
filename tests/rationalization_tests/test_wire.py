@@ -31,6 +31,10 @@ from datagrunt.rationalization.wire import (
     TOKEN_COUNT_MAX,
     ModelRequest,
     ProviderResponse,
+    _clone_json,
+    _to_trusted_json,
+    _trusted_model_request,
+    _trusted_provider_response,
 )
 
 TIMEOUT_S = 120
@@ -431,3 +435,99 @@ class TestModelRequestImages:
     def test_images_rejects_non_png_or_excess_count_or_bytes(self, bad):
         with pytest.raises(ValueError, match="images"):
             request(images=bad)
+
+
+class TestTrustedWireHelpers:
+    def test_clone_json_sorts_keys_deep_copies_nested_mappings_and_validates_types(self):
+        source = {"z": [1, MappingProxyType({"d": "v", "c": [True, None, 2.5]})], "a": {"y": 1, "x": 2}}
+        cloned = _clone_json(source)
+        source["z"].append(99)
+        source["a"]["x"] = 999
+
+        assert cloned == {"a": {"x": 2, "y": 1}, "z": [1, {"c": [True, None, 2.5], "d": "v"}]}
+        assert list(cloned) == ["a", "z"]
+        assert list(cloned["a"]) == ["x", "y"]
+        assert list(cloned["z"][1]) == ["c", "d"]
+        bad_non_mapping: object = [1, 2]
+        with pytest.raises(TypeError, match="Mapping"):
+            _clone_json(bad_non_mapping)
+        for bad in ({1: "x"}, {"a": float("nan")}, {"a": (1, 2)}, {"a": {1}}, {"a": "\ud800"}, {"\ud800": 1}):
+            with pytest.raises(ValueError):
+                _clone_json(bad)
+
+    def test_trusted_model_request_isolates_and_sorts_schema_and_checks_boundaries(self, monkeypatch):
+        def forbid_canonical(*_args, **_kwargs):
+            raise AssertionError("canonical_json must not run on _trusted_model_request")
+
+        source_schema = {"type": "object", "properties": {"records": {"type": "array", "items": {"type": "string"}}}}
+        expected = request(json_schema=source_schema, timeout_s=5, images=(VALID_PNG,))
+        monkeypatch.setattr(canonical_module, "canonical_json", forbid_canonical)
+        built = _trusted_model_request(
+            unit_id=REQUEST["unit_id"],
+            model_id=REQUEST["model_id"],
+            system_prompt=REQUEST["system_prompt"],
+            user_envelope=REQUEST["user_envelope"],
+            json_schema=source_schema,
+            max_output_tokens=8_192,
+            timeout_s=5,
+            images=(VALID_PNG,),
+        )
+        source_schema["properties"]["records"]["type"] = "object"
+
+        assert built == expected
+        assert list(built.json_schema) == ["properties", "type"]
+        assert type(built.timeout_s) is float
+        assert built.json_schema["properties"]["records"]["type"] == "array"
+        with pytest.raises(TypeError, match="max_output_tokens"):
+            _trusted_model_request("u", "m", "s", "e", {}, True, 1.0)
+        with pytest.raises(ValueError, match="unit_id"):
+            _trusted_model_request("  \n ", "m", "s", "e", {}, 10, 1.0)
+        with pytest.raises(ValueError, match="unit_id"):
+            _trusted_model_request("a\ud800", "m", "s", "e", {}, 10, 1.0)
+        bad_images: object = [VALID_PNG]
+        with pytest.raises(TypeError, match="images"):
+            _trusted_model_request("u", "m", "s", "e", {}, 10, 1.0, bad_images)
+        with pytest.raises(ValueError, match="images"):
+            _trusted_model_request("u", "m", "s", "e", {}, 10, 1.0, (b"not-a-png",))
+
+    def test_trusted_provider_response_sorts_keys_isolates_copies_and_checks_bounds(self, monkeypatch):
+        def forbid_canonical(*_args, **_kwargs):
+            raise AssertionError("canonical_json must not run on trusted response helpers")
+
+        source_content = {"z": 1, "a": {"d": 2, "c": [3, {"b": "é", "a": 0}]}}
+        expected = response(content=source_content)
+        expected_json = expected.to_json()
+        monkeypatch.setattr(canonical_module, "canonical_json", forbid_canonical)
+        built = _trusted_provider_response(
+            content=source_content,
+            raw_text=RESPONSE["raw_text"],
+            finish="complete",
+            input_tokens=120,
+            output_tokens=40,
+        )
+        source_content["a"]["d"] = 99
+        dumped = _to_trusted_json(built)
+        dumped["content"]["a"]["c"].clear()
+
+        assert built == expected
+        assert built.content is not None
+        assert list(built.content) == ["a", "z"]
+        assert list(built.content["a"]) == ["c", "d"]
+        assert _to_trusted_json(built) == expected_json
+        assert _trusted_provider_response(None, "", "refused").content is None
+        reason_subclass: object = type("Reason", (str,), {})("complete")
+        for non_str_finish in (1, None, reason_subclass):
+            with pytest.raises(TypeError, match="finish"):
+                _trusted_provider_response(None, "", non_str_finish)
+        bad_finish: object = "invalid"
+        with pytest.raises(ValueError, match="finish"):
+            _trusted_provider_response(None, "", bad_finish)
+        for bad_content in ({"a": "\ud800"}, {"\ud800": 1}):
+            with pytest.raises(ValueError, match="json"):
+                _trusted_provider_response(bad_content, "", "complete")
+        for bad_raw in ("é" * (RAW_TEXT_MAX_BYTES // 2) + "a", "a\ud800b"):
+            with pytest.raises(ValueError, match="raw_text"):
+                _trusted_provider_response(None, bad_raw, "complete")
+        bad_resp: object = {}
+        with pytest.raises(TypeError, match="ProviderResponse"):
+            _to_trusted_json(bad_resp)

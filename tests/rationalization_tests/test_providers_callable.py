@@ -495,8 +495,8 @@ def test_envelope_include_schema_trimming():
     assert schema_json not in sys_without
     assert user_with == user_without
     assert len(sys_without) < len(sys_with)
-    # Cache key material remains identical because provider_schema is hashed separately by request_key().
-    assert env_with.key_material() == env_without.key_material()
+    # Cache key material records include_schema=False so prompt-with-schema and prompt-without-schema never collide.
+    assert env_without.key_material() == {**env_with.key_material(), "include_schema": False}
 
 
 def test_every_rationalization_module_has_no_imports_inside_functions():
