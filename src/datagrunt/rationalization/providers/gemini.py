@@ -124,13 +124,12 @@ package's own modules (the HTTP stack only through the helper): no pydantic, not
 no import inside a function (invariant 9).
 """
 
-import base64
 import math
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Final, Literal, NoReturn, TypeAlias, cast
+from typing import Any, Final, Literal, NoReturn, TypeAlias, TypeGuard, cast
 
 from datagrunt.rationalization._canonical import canonical_copy, canonical_json
 from datagrunt.rationalization._refs import (
@@ -145,11 +144,13 @@ from datagrunt.rationalization._refs import (
 )
 from datagrunt.rationalization.exceptions import RationalizationError
 from datagrunt.rationalization.providers.base import (
+    ImageB64Cache,
     ModelString,
     PermanentProviderError,
     _Secret,
     _secret_problem,
     api_key_from_env,
+    encode_images_b64,
     endpoint_model_id,
 )
 from datagrunt.rationalization.providers.google_cloud import API_VERSION as GOOGLE_CLOUD_API_VERSION
@@ -329,7 +330,7 @@ def _http_client(max_connections: object, transport: object) -> HttpClient:
     count = _check_max_connections(max_connections)
     problem = ""
     try:  # the helper checks the transport's type at run time
-        return HttpClient(max_connections=count, transport=cast(Any, transport))
+        return HttpClient(max_connections=count, keepalive_connections=count, transport=cast(Any, transport))
     except TypeError as error:  # its message names the transport's type, never a value
         problem = str(error)
     raise RationalizationError(problem)
@@ -561,8 +562,8 @@ def _json_node(task: _Task, defs: Mapping[str, Any]) -> list[_Task]:
     return tasks
 
 
-def _is_bound(value: object) -> bool:
-    return type(value) in (int, float) and math.isfinite(value)  # type: ignore[arg-type]  # an int or a float
+def _is_bound(value: object) -> TypeGuard[int | float]:
+    return (type(value) is int or type(value) is float) and math.isfinite(value)
 
 
 def _integer_bounds(target: dict[str, Any], hints: dict[str, Any], integer: str) -> None:
@@ -820,6 +821,7 @@ class GeminiProvider:
         "_auth",
         "_client",
         "_endpoint",
+        "_last_images_b64",
         "_max_concurrency",
         "_max_connections",
         "_seed",
@@ -1022,6 +1024,7 @@ class GeminiProvider:
         self._client = _http_client(max_connections, transport)
         self._max_connections = _check_max_connections(max_connections)
         self._max_concurrency: int | None = None
+        self._last_images_b64: ImageB64Cache | None = None
 
     @property
     def model_id(self) -> str:
@@ -1090,6 +1093,12 @@ class GeminiProvider:
         """
         self._client.open()
 
+    def close(self) -> None:
+        """Close the HTTP clients now (in-flight requests finish first). Idempotent and optional."""
+        client = getattr(self, "_client", None)
+        if client is not None:
+            client.close()
+
     def generate(self, request: ModelRequest) -> ProviderResponse:
         """Send ``request`` and read the answer (module notes, 1-5).
 
@@ -1133,10 +1142,8 @@ class GeminiProvider:
             config["seed"] = self._seed
         if self._thinking_level is not None:
             config["thinkingConfig"] = {"thinkingLevel": self._thinking_level}
-        parts: list[dict[str, Any]] = [
-            {"inlineData": {"mimeType": "image/png", "data": base64.b64encode(img).decode("ascii")}}
-            for img in request.images
-        ]
+        b64s, self._last_images_b64 = encode_images_b64(request.images, self._last_images_b64)
+        parts: list[dict[str, Any]] = [{"inlineData": {"mimeType": "image/png", "data": data}} for data in b64s]
         parts.append({"text": request.user_envelope})
         return {
             "systemInstruction": {"parts": [{"text": request.system_prompt}]},

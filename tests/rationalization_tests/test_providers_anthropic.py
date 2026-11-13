@@ -2196,3 +2196,33 @@ class TestSchemaMode:
         assert "output_config" in calls[0]
         assert "output_config" not in calls[1]
         assert resp.finish == "complete" and resp.content is not None
+
+    def test_anthropic_provider_enables_keepalive_closes_client_and_reuses_image_b64(self, monkeypatch):
+        default_prov = AnthropicProvider("claude-opus-4-7", api_key=KEY, max_connections=5)
+        assert default_prov._http.keepalive_connections == 5
+        default_prov.open()
+        default_prov.close()
+
+        png = b"\x89PNG\r\n\x1a\nANTHROPIC_BAND"
+        provider = make_provider(lambda _req: streamed(200, json_body=MESSAGE))
+        req = ModelRequest(
+            unit_id="u",
+            model_id=provider.model_id,
+            system_prompt="Extract records.",
+            user_envelope="payload",
+            json_schema=SENT_SCHEMA,
+            max_output_tokens=1024,
+            timeout_s=30.0,
+            images=(png,),
+        )
+        calls = []
+        real_encode = anthropic_module.encode_images_b64
+
+        def spy_encode(images, cached=None):
+            calls.append(cached is not None)
+            return real_encode(images, cached)
+
+        monkeypatch.setattr(anthropic_module, "encode_images_b64", spy_encode)
+        provider.generate(req)
+        provider.generate(req)
+        assert calls == [False, True]

@@ -169,7 +169,6 @@ never the HTTP stack itself (only the HTTP helper imports httpx): nothing from `
 inside a function (invariant 9).
 """
 
-import base64
 import math
 import time
 from collections.abc import Iterable, Mapping
@@ -192,11 +191,13 @@ from datagrunt.rationalization.providers.base import (
     OLLAMA_BASE_URL,
     OPENAI_BASE_URL,
     UNKNOWN_FAMILY,
+    ImageB64Cache,
     ModelString,
     _Secret,
     _secret_problem,
     api_key_from_env,
     check_endpoint,
+    encode_images_b64,
     endpoint_model_id,
     family_problem,
     identity_problem,
@@ -827,6 +828,7 @@ def _http_client(settings: _Settings) -> HttpClient:
     try:  # the helper checks the transport's type at run time
         return HttpClient(
             max_connections=settings.max_connections,
+            keepalive_connections=settings.max_connections,
             allow_insecure_http=settings.allow_insecure_http,
             transport=cast(Any, settings.transport),
         )
@@ -970,30 +972,36 @@ def _google_family(google: _GoogleRoute, family: object) -> object:
     return family
 
 
-def _user_content(text: str, images: tuple[bytes, ...]) -> str | list[dict[str, Any]]:
-    if not images:
+def _user_content(text: str, encoded_images: tuple[str, ...]) -> str | list[dict[str, Any]]:
+    if not encoded_images:
         return text
     return [
         *[
             {
                 "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{base64.b64encode(img).decode('ascii')}"},
+                "image_url": {"url": f"data:image/png;base64,{data}"},
             }
-            for img in images
+            for data in encoded_images
         ],
         {"type": "text", "text": text},
     ]
 
 
-def _messages(request: ModelRequest, *, fold: bool) -> list[dict[str, Any]]:
+def _messages(
+    request: ModelRequest,
+    *,
+    fold: bool,
+    encoded_images: tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
     """A ``system`` turn, then the ``user`` turn (module notes, 1 and 7); ``fold`` (a private hook, never set) puts
     the system prompt first in the one user turn instead."""
+    b64s = encode_images_b64(request.images)[0] if encoded_images is None else encoded_images
     if fold:
         folded = f"{request.system_prompt}\n\n{request.user_envelope}"
-        return [{"role": "user", "content": _user_content(folded, request.images)}]
+        return [{"role": "user", "content": _user_content(folded, b64s)}]
     return [
         {"role": "system", "content": request.system_prompt},
-        {"role": "user", "content": _user_content(request.user_envelope, request.images)},
+        {"role": "user", "content": _user_content(request.user_envelope, b64s)},
     ]
 
 
@@ -1034,7 +1042,16 @@ class OpenAICompatibleProvider:
             model id would pass 512 characters.
     """
 
-    __slots__ = ("_auth", "_family", "_generation", "_http", "_max_concurrency", "_max_connections", "_route")
+    __slots__ = (
+        "_auth",
+        "_family",
+        "_generation",
+        "_http",
+        "_last_images_b64",
+        "_max_concurrency",
+        "_max_connections",
+        "_route",
+    )
 
     def __init__(
         self,
@@ -1076,6 +1093,7 @@ class OpenAICompatibleProvider:
         self._generation = settings.generation
         self._max_connections = settings.max_connections
         self._max_concurrency: int | None = None
+        self._last_images_b64: ImageB64Cache | None = None
         self._auth = auth
 
     @classmethod
@@ -1346,6 +1364,12 @@ class OpenAICompatibleProvider:
         """
         self._http.open()
 
+    def close(self) -> None:
+        """Close the HTTP clients now (in-flight requests finish first). Idempotent and optional."""
+        client = getattr(self, "_http", None)
+        if client is not None:
+            client.close()
+
     def generate(self, request: ModelRequest) -> ProviderResponse:
         """Send one request and map the reply (module notes, 1 and 5).
 
@@ -1372,11 +1396,15 @@ class OpenAICompatibleProvider:
             return self._mistral_body(request)
         return self._chat_body(request)
 
+    def _encoded_messages(self, request: ModelRequest) -> list[dict[str, Any]]:
+        b64s, self._last_images_b64 = encode_images_b64(request.images, self._last_images_b64)
+        return _messages(request, fold=self._route.fold_system, encoded_images=b64s)
+
     def _chat_body(self, request: ModelRequest) -> dict[str, Any]:
         """The Chat Completions body (module notes, 1); a dedicated endpoint's names no model."""
         generation = self._generation
         body: dict[str, Any] = {} if self._route.body_model is None else {"model": self._route.body_model}
-        body["messages"] = _messages(request, fold=self._route.fold_system)
+        body["messages"] = self._encoded_messages(request)
         body["response_format"] = _response_format(request, generation.strict)
         body[generation.max_tokens_field] = request.max_output_tokens
         if generation.temperature is not None:
@@ -1390,7 +1418,7 @@ class OpenAICompatibleProvider:
         generation = self._generation
         body: dict[str, Any] = {
             "model": self._route.body_model,
-            "messages": _messages(request, fold=self._route.fold_system),
+            "messages": self._encoded_messages(request),
             "response_format": _response_format(request, generation.strict),
             generation.max_tokens_field: request.max_output_tokens,
             "stream": False,

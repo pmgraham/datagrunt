@@ -76,6 +76,7 @@ pydantic, no httpx, nothing from ``datagrunt.core``, and no import inside a func
 
 import contextlib
 import errno
+import hashlib
 import json
 import math
 import os
@@ -85,11 +86,11 @@ import stat
 import sys
 import tempfile
 import threading
-from collections.abc import Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, fields
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal, TypeAlias, get_args
+from typing import Any, Literal, Protocol, TypeAlias, get_args
 
 from datagrunt.rationalization._canonical import (
     canonical_copy,
@@ -100,7 +101,11 @@ from datagrunt.rationalization._canonical import (
 )
 from datagrunt.rationalization.envelope import Envelope
 from datagrunt.rationalization.exceptions import RationalizationError
-from datagrunt.rationalization.wire import ProviderResponse
+from datagrunt.rationalization.wire import (
+    ProviderResponse,
+    _clone_response_json,
+    _trusted_provider_response,
+)
 
 CACHE_FORMAT = "datagrunt.rationalize.cache/1"
 """The key's and the entry's version: change it with any change to the key's composition or the entry's layout."""
@@ -246,6 +251,71 @@ def request_key(
         "schema_version": _check_text("schema_version", schema_version),
     }
     return sha256_hex(canonical_json(request, subject="the request"))
+
+
+class _DigestPrefix(Protocol):
+    """Copyable SHA-256 prefix state used by :func:`_fast_request_key`."""
+
+    def copy(self) -> "_DigestPrefix": ...
+    def update(self, data: bytes, /) -> None: ...
+    def hexdigest(self) -> str: ...
+
+
+def _provider_key_suffix(
+    *,
+    provider_kind: str,
+    model_id: str,
+    generation_params: Mapping[str, Any],
+    schema_version: str,
+    provider_schema: Mapping[str, Any] | None = None,
+    provider_schema_json: str | None = None,
+) -> bytes:
+    """Pre-serialize the 6 non-envelope request-key fields as UTF-8 bytes in canonical key order."""
+    if (provider_schema is None) == (provider_schema_json is None):
+        raise ValueError("pass exactly one of provider_schema or provider_schema_json")
+    if provider_schema_json is not None:
+        if not isinstance(provider_schema_json, str) or not provider_schema_json.startswith("{"):
+            raise ValueError("provider_schema_json must be a canonical JSON object str")
+        schema_text = provider_schema_json
+    else:
+        schema_text = canonical_json(_check_json_object("provider_schema", provider_schema), subject="the request")
+    head = canonical_json(
+        {
+            "format": CACHE_FORMAT,
+            "generation_params": _check_json_object("generation_params", generation_params),
+            "model_id": _check_text("model_id", model_id),
+            "provider_kind": _check_text("provider_kind", provider_kind),
+        },
+        subject="the request",
+    )
+    ver_text = canonical_json(_check_text("schema_version", schema_version), subject="the request")
+    return f',{head[1:-1]},"provider_schema":{schema_text},"schema_version":{ver_text}}}'.encode("utf-8")
+
+
+def _envelope_key_prefix(envelope: Envelope) -> bytes:
+    """Pre-serialize the opening ``{"envelope":...`` UTF-8 byte prefix for ``envelope``."""
+    if not isinstance(envelope, Envelope):
+        raise TypeError(f"envelope must be an Envelope, got {type(envelope).__name__}")
+    try:
+        return ('{"envelope":' + envelope._key_material_json()).encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise RationalizationError(f"envelope key_material is not valid Unicode: {error}") from error
+
+
+def _fast_request_key(
+    envelope: Envelope,
+    provider_suffix: bytes,
+    *,
+    envelope_hasher: _DigestPrefix | None = None,
+) -> str:
+    """Compute a SHA-256 hex digest bit-identical to :func:`request_key` from pre-serialized parts."""
+    if not isinstance(envelope, Envelope):
+        raise TypeError(f"envelope must be an Envelope, got {type(envelope).__name__}")
+    if type(provider_suffix) is not bytes or not provider_suffix.startswith(b',"format":'):
+        raise ValueError("provider_suffix must be bytes built by _provider_key_suffix")
+    digest = envelope_hasher.copy() if envelope_hasher is not None else hashlib.sha256(_envelope_key_prefix(envelope))
+    digest.update(provider_suffix)
+    return digest.hexdigest()
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -428,7 +498,28 @@ class MemoryCache:
             text = self._entries.get(key)
         if text is None:
             return CacheLookup()
-        return CacheLookup(ProviderResponse.from_json(json.loads(text)))
+        parsed = json.loads(text)
+        return CacheLookup(
+            _trusted_provider_response(
+                content=parsed["content"],
+                raw_text=parsed["raw_text"],
+                finish=parsed["finish"],
+                input_tokens=parsed["input_tokens"],
+                output_tokens=parsed["output_tokens"],
+            )
+        )
+
+    def _put_cloned_json(self, key: str, resp_json: dict[str, Any], meta: CacheMeta) -> bool:
+        """Store pre-cloned ``resp_json`` for ``key`` without repeating :func:`_clone_response_json`."""
+        _check_key(key)
+        if not isinstance(meta, CacheMeta):
+            raise TypeError(f"meta must be a CacheMeta, got {type(meta).__name__}")
+        text = canonical_json(resp_json, subject="the response")
+        with self._lock:
+            if key not in self._entries and len(self._entries) >= self._max_entries:
+                return False
+            self._entries[key] = text
+        return True
 
     def put(self, key: str, response: ProviderResponse, meta: CacheMeta) -> bool:
         """Hold ``response`` for ``key`` (replacing what it held); ``False`` for a new key past ``max_entries``.
@@ -439,12 +530,7 @@ class MemoryCache:
         """
         _check_key(key)
         _check_stored(response, meta)
-        text = canonical_json(response.to_json(), subject="the response")
-        with self._lock:
-            if key not in self._entries and len(self._entries) >= self._max_entries:
-                return False
-            self._entries[key] = text
-        return True
+        return self._put_cloned_json(key, _clone_response_json(response), meta)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -630,8 +716,8 @@ def _fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
-def _write_in(directory_fd: int, name: str, data: bytes) -> None:
-    """Write ``data`` to a new temp file at ``directory_fd``, then replace ``name`` there with it (module notes, 3)."""
+def _write_temp_and_replace(directory_fd: int, name: str, data: bytes) -> None:
+    """Write ``data`` to a hidden temp file at ``directory_fd``, fsync it, and ``os.replace`` ``name``."""
     temporary = f"{_TEMP_PREFIX}{secrets.token_hex(16)}{_TEMP_SUFFIX}"
     descriptor = os.open(temporary, _CREATE_FLAGS, 0o600, dir_fd=directory_fd)
     try:
@@ -641,6 +727,11 @@ def _write_in(directory_fd: int, name: str, data: bytes) -> None:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(temporary, dir_fd=directory_fd)
         raise
+
+
+def _write_in(directory_fd: int, name: str, data: bytes) -> None:
+    """Write ``data`` to a new temp file at ``directory_fd``, then replace ``name`` there with it (module notes, 3)."""
+    _write_temp_and_replace(directory_fd, name, data)
     _fsync_open_directory(directory_fd)
 
 
@@ -653,8 +744,8 @@ def _write_bound(directory: Path, identity: os.stat_result, name: str, data: byt
         os.close(directory_fd)
 
 
-def _write_by_path(directory: Path, identity: os.stat_result, name: str, data: bytes) -> None:
-    """The fallback without ``dir_fd``: by path, the directory's identity checked again once the temp file exists."""
+def _write_temp_by_path(directory: Path, identity: os.stat_result, name: str, data: bytes) -> None:
+    """Write one temp file by path and ``os.replace`` ``directory / name`` without fsyncing ``directory`` yet."""
     descriptor, temporary = tempfile.mkstemp(dir=directory, prefix=_TEMP_PREFIX, suffix=_TEMP_SUFFIX)
     try:
         if not _same_directory(directory, identity):
@@ -666,6 +757,11 @@ def _write_by_path(directory: Path, identity: os.stat_result, name: str, data: b
         with contextlib.suppress(FileNotFoundError):
             os.unlink(temporary)
         raise
+
+
+def _write_by_path(directory: Path, identity: os.stat_result, name: str, data: bytes) -> None:
+    """The fallback without ``dir_fd``: by path, the directory's identity checked again once the temp file exists."""
+    _write_temp_by_path(directory, identity, name, data)
     _fsync_directory(directory)
 
 
@@ -675,6 +771,88 @@ def _write_entry(directory: Path, identity: os.stat_result, name: str, data: byt
         _write_bound(directory, identity, name, data)
     else:
         _write_by_path(directory, identity, name, data)
+    if not _same_directory(directory, identity):
+        raise _tampered(directory)
+
+
+def _serialize_cache_entry(key: str, response: ProviderResponse, meta: CacheMeta) -> bytes | None:
+    """Serialize one validated cache entry to UTF-8 bytes, or ``None`` when past :data:`ENTRY_MAX_BYTES`."""
+    _check_key(key)
+    _check_stored(response, meta)
+    entry = {"format": CACHE_FORMAT, "key": key, "response": _clone_response_json(response), "meta": meta.to_json()}
+    data = canonical_json(entry, subject="the cache entry").encode("utf-8")
+    return None if len(data) > ENTRY_MAX_BYTES else data
+
+
+def _iter_serialized_shard(
+    raw_items: Sequence[tuple[int, str, ProviderResponse, CacheMeta]],
+) -> Iterator[tuple[int, str, bytes]]:
+    """Lazily serialize one shard's entries one item at a time, skipping entries past 8 MiB."""
+    if not isinstance(raw_items, Sequence):
+        raise TypeError("raw_items must be a Sequence")
+    for idx, key, response, meta in raw_items:
+        if type(idx) is not int or idx < 0:
+            raise ValueError("shard entry index must be a non-negative int")
+        data = _serialize_cache_entry(key, response, meta)
+        if data is not None:
+            yield idx, f"{key}.json", data
+
+
+def _write_shard_bound(
+    directory: Path,
+    identity: os.stat_result,
+    items: Iterable[tuple[str, bytes]],
+) -> None:
+    """Write ``(filename, data)`` pairs in one shard via a single ``directory_fd`` and fsync once."""
+    directory_fd = _open_directory(directory, identity)
+    replaced_any = False
+    try:
+        for name, data in items:
+            _write_temp_and_replace(directory_fd, name, data)
+            replaced_any = True
+    except BaseException:
+        if replaced_any:
+            with contextlib.suppress(OSError):
+                _fsync_open_directory(directory_fd)
+        raise
+    else:
+        if replaced_any:
+            _fsync_open_directory(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _write_shard_by_path(
+    directory: Path,
+    identity: os.stat_result,
+    items: Iterable[tuple[str, bytes]],
+) -> None:
+    """Fallback without ``dir_fd``: write each item by path, checking identity, then fsync ``directory`` once."""
+    replaced_any = False
+    try:
+        for name, data in items:
+            _write_temp_by_path(directory, identity, name, data)
+            replaced_any = True
+    except BaseException:
+        if replaced_any:
+            with contextlib.suppress(OSError):
+                _fsync_directory(directory)
+        raise
+    if replaced_any:
+        _fsync_directory(directory)
+
+
+def _write_shard(directory: Path, items: Iterable[tuple[str, bytes]], root: Path) -> None:
+    """Ensure ``directory`` is an untampered shard directory, write ``items``, fsync once, and re-verify."""
+    try:
+        identity = _subdirectory(directory)
+        if _DIR_FD:
+            _write_shard_bound(directory, identity, items)
+        else:
+            _write_shard_by_path(directory, identity, items)
+    except OSError as error:
+        msg = f"cannot write cache shard {directory.name} under cache_dir {root}: {error}"
+        raise RationalizationError(msg) from error
     if not _same_directory(directory, identity):
         raise _tampered(directory)
 
@@ -816,6 +994,23 @@ class FileCache:
             return _corrupt(data)
         return _parse_entry(data, key)
 
+    def _put_cloned_json(self, key: str, resp_json: dict[str, Any], meta: CacheMeta) -> bool:
+        """Write pre-cloned ``resp_json`` atomically without repeating :func:`_clone_response_json`."""
+        _check_key(key)
+        if not isinstance(meta, CacheMeta):
+            raise TypeError(f"meta must be a CacheMeta, got {type(meta).__name__}")
+        entry = {"format": CACHE_FORMAT, "key": key, "response": resp_json, "meta": meta.to_json()}
+        data = canonical_json(entry, subject="the cache entry").encode("utf-8")
+        if len(data) > ENTRY_MAX_BYTES:
+            return False
+        directory = self._root / key[:2]
+        try:
+            _write_entry(directory, _subdirectory(directory), f"{key}.json", data)
+        except OSError as error:
+            msg = f"cannot write cache entry {key} under cache_dir {self._root}: {error}"
+            raise RationalizationError(msg) from error
+        return True
+
     def put(self, key: str, response: ProviderResponse, meta: CacheMeta) -> bool:
         """Write the entry for ``key`` atomically, replacing what is there; ``False`` (nothing written) past 8 MiB.
 
@@ -828,15 +1023,53 @@ class FileCache:
         """
         _check_key(key)
         _check_stored(response, meta)
-        entry = {"format": CACHE_FORMAT, "key": key, "response": response.to_json(), "meta": meta.to_json()}
-        data = canonical_json(entry, subject="the cache entry").encode("utf-8")
-        if len(data) > ENTRY_MAX_BYTES:
-            return False
-        directory = self._root / key[:2]
-        try:
-            _write_entry(directory, _subdirectory(directory), f"{key}.json", data)
-        except OSError as error:
-            raise RationalizationError(
-                f"cannot write cache entry {key} under cache_dir {self._root}: {error}"
-            ) from error
-        return True
+        return self._put_cloned_json(key, _clone_response_json(response), meta)
+
+    def put_many(self, items: Iterable[tuple[str, ProviderResponse, CacheMeta]]) -> tuple[bool, ...]:
+        """Atomically write ``(key, response, meta)`` entries grouped by ``key[:2]``, fsyncing once per shard."""
+        count, shards = _group_batch_entries(items)
+        flags = [False] * count
+        for shard_prefix, raw_items in shards.items():
+            stream = _iter_serialized_shard(raw_items)
+            first = next(stream, None)
+            if first is None:
+                continue
+            _write_shard(self._root / shard_prefix, _mark_written(first, stream, flags), self._root)
+        return tuple(flags)
+
+
+def _mark_written(
+    first: tuple[int, str, bytes],
+    rest: Iterator[tuple[int, str, bytes]],
+    flags: list[bool],
+) -> Iterator[tuple[str, bytes]]:
+    """Yield ``(filename, data)`` pairs and mark each entry ``True`` in ``flags`` once written."""
+    if not isinstance(first, tuple) or len(first) != 3:
+        raise TypeError("first must be an (idx, filename, data) 3-tuple")
+    if not isinstance(flags, list):
+        raise TypeError("flags must be a list of bool")
+    idx0, name0, data0 = first
+    yield name0, data0
+    flags[idx0] = True
+    for idx, name, data in rest:
+        yield name, data
+        flags[idx] = True
+
+
+def _group_batch_entries(
+    items: object,
+) -> tuple[int, dict[str, list[tuple[int, str, ProviderResponse, CacheMeta]]]]:
+    """Validate ``(key, response, meta)`` tuples upfront and group them by ``key[:2]`` without serializing."""
+    if isinstance(items, (str, bytes, bytearray)) or not isinstance(items, Iterable):
+        raise TypeError(f"items must be an Iterable of (key, response, meta) tuples, got {type(items).__name__}")
+    shards: dict[str, list[tuple[int, str, ProviderResponse, CacheMeta]]] = {}
+    count = 0
+    for idx, item in enumerate(items):
+        if not isinstance(item, tuple) or len(item) != 3:
+            raise TypeError("each put_many item must be a (key, response, meta) 3-tuple")
+        key, response, meta = item
+        _check_key(key)
+        _check_stored(response, meta)
+        shards.setdefault(key[:2], []).append((idx, key, response, meta))
+        count = idx + 1
+    return count, shards

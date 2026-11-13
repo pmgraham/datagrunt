@@ -418,7 +418,7 @@ def _trusted_provider_response(
     return resp
 
 
-def _to_trusted_json(response: ProviderResponse) -> dict[str, Any]:
+def _clone_response_json(response: ProviderResponse) -> dict[str, Any]:
     """Return ``response`` as a fresh JSON dict using :func:`_clone_json` instead of :func:`canonical_copy`."""
     if not isinstance(response, ProviderResponse):
         raise TypeError(f"response must be a ProviderResponse, got {type(response).__name__}")
@@ -432,3 +432,8 @@ def _to_trusted_json(response: ProviderResponse) -> dict[str, Any]:
         "input_tokens": response.input_tokens,
         "output_tokens": response.output_tokens,
     }
+
+
+def _to_trusted_json(response: ProviderResponse) -> dict[str, Any]:
+    """Alias of :func:`_clone_response_json` kept for internal callers and tests."""
+    return _clone_response_json(response)

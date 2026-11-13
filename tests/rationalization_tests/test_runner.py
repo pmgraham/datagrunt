@@ -2408,3 +2408,60 @@ def test_model_request_docstring_describes_provider_transformed_wire_schema():
     schema_lines = [line.strip() for line in doc.splitlines() if "json_schema:" in line]
     assert len(schema_lines) == 1
     assert "transform" in doc.lower() and "provider" in doc.lower()
+
+
+def test_three_witness_wave_one_schedules_fairly_across_rate_keys():
+    work = make_work(4)
+    barrier = threading.Barrier(8, timeout=5.0)
+    lock = threading.Lock()
+    wave_one_counts = {"callable:a": 0, "callable:b": 0, "callable:c": 0}
+
+    def handle(request):
+        should_wait = False
+        with lock:
+            if sum(wave_one_counts.values()) < 8:
+                wave_one_counts[request.model_id] += 1
+                should_wait = True
+        if should_wait:
+            barrier.wait()
+        return answer(request)
+
+    providers = [CallableProvider(f"callable:{name}", handle) for name in ("a", "b", "c")]
+    outcome = run(work, providers, limits=RunLimits(max_concurrency=8, max_concurrency_per_provider=4))
+    assert len(outcome.responses) == 12
+    assert wave_one_counts == {"callable:a": 3, "callable:b": 3, "callable:c": 2}
+
+
+def test_preflight_plan_reuses_file_lookups_without_second_disk_get(tmp_path, monkeypatch):
+    work = make_work(2)
+    prov = CallableProvider("callable:a", Recorder())
+    cache = FileCache(tmp_path)
+    run(work[:1], [prov], file_cache=cache)
+    snapshots = snapshot_providers([prov], SCHEMA)
+    limits = RunLimits()
+    slots, reqs = runner_module._plan(work, snapshots, limits, "1.0")
+    probed = {req.key: cache.get(req.key) for req in reqs}
+    preflight = runner_module._PreflightPlan(slots=slots, requests=tuple(reqs), file_lookups=probed)
+
+    monkeypatch.setattr(
+        FileCache,
+        "get",
+        lambda self, key: pytest.fail("FileCache.get must not run twice when _preflight provides file_lookups"),
+    )
+    sent = Events()
+    outcome = run_requests(
+        work,
+        snapshots,
+        SCHEMA,
+        schema_version="1.0",
+        memory_cache=MemoryCache(),
+        file_cache=cache,
+        limits=limits,
+        on_event=sent,
+        _preflight=preflight,
+    )
+    assert (outcome.cache_hits, outcome.cache_misses) == (1, 1)
+    assert [(e.kind, e.unit_id) for e in sent.events] == [
+        ("cache_hit", work[0][0].unit_id),
+        ("request", work[1][0].unit_id),
+    ]

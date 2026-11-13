@@ -806,3 +806,115 @@ def test_a_first_request_on_a_worker_thread_imports_nothing(opened):
     found = json.loads(completed.stdout.strip().splitlines()[-1])
     assert found["statuses"] == [200, 200]
     assert found["new"] == []
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Pooled HTTP/1.1 Keep-Alive Reuse & Warm-Socket Deadline Cut
+# ---------------------------------------------------------------------------------------------------------------
+
+
+class KeepAliveServer:
+    """Persistent HTTP/1.1 server on 127.0.0.1 serving multiple sequential requests per accepted socket."""
+
+    def __init__(self, steps, *, wrap=None):
+        self.steps = list(steps)
+        self.wrap = wrap
+        self.accepted = 0
+        self.requests = []
+        self._lock = threading.Lock()
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(16)
+        self.sock.settimeout(0.2)
+        self.port = self.sock.getsockname()[1]
+        self.stopped = threading.Event()
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while not self.stopped.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                continue
+            with self._lock:
+                self.accepted += 1
+            threading.Thread(target=self._serve_conn, args=(conn,), daemon=True).start()
+
+    def _serve_conn(self, conn):
+        try:
+            conn.settimeout(10)
+            if self.wrap is not None:
+                conn = self.wrap(conn)
+            while not self.stopped.is_set():
+                request = read_request(conn)
+                if request is None:
+                    return
+                with self._lock:
+                    self.requests.append(request)
+                    step = self.steps.pop(0)
+                step(conn, request)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def close(self):
+        self.stopped.set()
+        self.sock.close()
+
+
+def _ka_ok(seq: int):
+    body = json.dumps({"seq": seq}).encode("utf-8")
+    hdrs = [("Content-Type", "application/json"), ("Connection", "keep-alive")]
+    return lambda conn, _req: respond(conn, 200, hdrs, body)
+
+
+def _ka_midstream_stall(conn, _req):
+    conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{"x":"')
+    trickle(conn, b"a" * 80, every_s=0.25)
+
+
+def test_keepalive_reuses_one_tcp_and_tls_connection_across_sequential_requests(serve, monkeypatch, tls_files):
+    ka_http = KeepAliveServer([_ka_ok(1), _ka_ok(2), _ka_ok(3)])
+    ka_tls = KeepAliveServer([_ka_ok(1), _ka_ok(2), _ka_ok(3)], wrap=tls_wrapper(tls_files))
+    monkeypatch.setenv("SSL_CERT_FILE", str(tls_files[0]))
+    monkeypatch.setenv("HTTPS_PROXY", f"http://127.0.0.1:{serve(relay_to(ka_tls.port)).port}")
+    http_client = HttpClient(max_connections=4, keepalive_connections=2, allow_insecure_http=True)
+    tls_client = HttpClient(max_connections=4, keepalive_connections=2)
+    try:
+        http_url = f"http://127.0.0.1:{ka_http.port}/v1"
+        assert [post(http_client, http_url).json["seq"] for _ in range(3)] == [1, 2, 3]
+        assert ka_http.accepted == 1 and len(ka_http.requests) == 3
+
+        assert [post(tls_client, "https://tls.invalid/v1").json["seq"] for _ in range(3)] == [1, 2, 3]
+        assert ka_tls.accepted == 1 and len(ka_tls.requests) == 3
+    finally:
+        http_client.close()
+        tls_client.close()
+        ka_http.close()
+        ka_tls.close()
+
+
+@pytest.mark.parametrize("use_tls", [False, True], ids=["plain-http-warm-cut", "tls-warm-cut"])
+def test_warm_reused_keepalive_socket_is_cut_midstream_within_deadline(use_tls, serve, monkeypatch, tls_files):
+    wrap = tls_wrapper(tls_files) if use_tls else None
+    ka = KeepAliveServer([_ka_ok(1), _ka_midstream_stall, _ka_ok(3)], wrap=wrap)
+    if use_tls:
+        monkeypatch.setenv("SSL_CERT_FILE", str(tls_files[0]))
+        monkeypatch.setenv("HTTPS_PROXY", f"http://127.0.0.1:{serve(relay_to(ka.port)).port}")
+        url = "https://tls.invalid/v1"
+        client = HttpClient(max_connections=4, keepalive_connections=2)
+    else:
+        url = f"http://127.0.0.1:{ka.port}/v1"
+        client = HttpClient(max_connections=4, keepalive_connections=2, allow_insecure_http=True)
+    try:
+        assert post(client, url, budget_s=5.0).json == {"seq": 1}
+        assert ka.accepted == 1
+        cut_within_the_deadline(client, url)
+        assert ka.accepted == 1 and len(ka.requests) == 2
+        assert post(client, url, budget_s=5.0).json == {"seq": 3}
+        assert ka.accepted == 2
+    finally:
+        client.close()
+        ka.close()

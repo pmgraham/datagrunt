@@ -36,6 +36,8 @@ The module imports only the standard library, pydantic, the PDF model and its si
 ``datagrunt.core``, and no import inside a function (invariant 9).
 """
 
+import contextlib
+import hashlib
 import stat
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -56,7 +58,14 @@ from datagrunt.pdf.exceptions import (
     PDFEncryptedError,
     PDFSourceChangedError,
 )
-from datagrunt.rationalization.cache import FileCache, MemoryCache, request_key
+from datagrunt.rationalization.cache import (
+    CacheLookup,
+    FileCache,
+    MemoryCache,
+    _envelope_key_prefix,
+    _fast_request_key,
+    _provider_key_suffix,
+)
 from datagrunt.rationalization.consensus import ConsensusResult, build_consensus, check_must_agree
 from datagrunt.rationalization.envelope import (
     PROMPT_MAX_BYTES,
@@ -65,6 +74,7 @@ from datagrunt.rationalization.envelope import (
     _check_schema,
     _context_json,
     build_envelopes,
+    build_envelopes_isolated,
     element_escape_counts,
     render_element,
 )
@@ -87,6 +97,8 @@ from datagrunt.rationalization.runner import (
     ProviderSnapshot,
     RunLimits,
     RunOutcome,
+    _PreflightPlan,
+    _Request,
     run_requests,
     snapshot_providers,
 )
@@ -113,6 +125,37 @@ __all__ = ["MAX_TARGETS", "rationalize"]
 def _require_bool(name: str, value: object) -> None:
     if type(value) is not bool:
         raise TypeError(f"{name} must be a bool, got {type(value).__name__}")
+
+
+def _check_bool_flags(flags: Sequence[tuple[str, object]]) -> None:
+    """Validate that every ``(name, value)`` pair in ``flags`` is a strict ``bool``."""
+    if not flags:
+        raise ValueError("flags must not be empty")
+    for flag_name, flag_val in flags:
+        _require_bool(flag_name, flag_val)
+
+
+def _check_extra_scalars(
+    max_unit_chars: object,
+    schema_version: object,
+    on_event: object,
+    min_families: object,
+    flags: Sequence[tuple[str, object]],
+) -> None:
+    """Validate non-RunLimits scalar, string, hook, and boolean flags."""
+    if type(max_unit_chars) is not int:
+        raise TypeError(f"max_unit_chars must be an int, got {type(max_unit_chars).__name__}")
+    if max_unit_chars < 1:
+        raise ValueError(f"max_unit_chars must be >= 1, got {max_unit_chars}")
+    if (version_problem := identity_problem(schema_version)) is not None:
+        raise (TypeError if not isinstance(schema_version, str) else ValueError)(f"schema_version {version_problem}")
+    _check_bool_flags(flags)
+    if on_event is not None and not callable(on_event):
+        raise TypeError(f"on_event must be callable or None, got {type(on_event).__name__}")
+    if type(min_families) is not int:
+        raise TypeError(f"min_families must be an int, got {type(min_families).__name__}")
+    if min_families < 1:
+        raise RationalizationError(f"min_families must be >= 1, got {min_families}")
 
 
 def _check_scalar_params(
@@ -146,27 +189,14 @@ def _check_scalar_params(
         max_requests=max_requests,
         strict=strict,
     )
-    if type(max_unit_chars) is not int:
-        raise TypeError(f"max_unit_chars must be an int, got {type(max_unit_chars).__name__}")
-    if max_unit_chars < 1:
-        raise ValueError(f"max_unit_chars must be >= 1, got {max_unit_chars}")
-    version_problem = identity_problem(schema_version)
-    if version_problem is not None:
-        raise (TypeError if not isinstance(schema_version, str) else ValueError)(f"schema_version {version_problem}")
-    for flag_name, flag_val in (
+    flags = (
         ("expect_non_empty", expect_non_empty),
         ("coalesce_sections", coalesce_sections),
         ("include_schema_in_prompt", include_schema_in_prompt),
         ("multimodal", multimodal),
         ("fold_across_units", fold_across_units),
-    ):
-        _require_bool(flag_name, flag_val)
-    if on_event is not None and not callable(on_event):
-        raise TypeError(f"on_event must be callable or None, got {type(on_event).__name__}")
-    if type(min_families) is not int:
-        raise TypeError(f"min_families must be an int, got {type(min_families).__name__}")
-    if min_families < 1:
-        raise RationalizationError(f"min_families must be >= 1, got {min_families}")
+    )
+    _check_extra_scalars(max_unit_chars, schema_version, on_event, min_families, flags)
     return limits
 
 
@@ -209,22 +239,18 @@ def _resolve_provider(entry: object, *, persistent_cache: bool) -> ModelProvider
     return as_provider(entry, persistent_cache=persistent_cache)
 
 
-def _prepare_snapshots(
-    models: object,
-    prepared: PreparedSchema,
-    *,
-    min_families: int,
-    persistent_cache: bool,
-) -> tuple[ProviderSnapshot, ...]:
-    """Resolve ``models``, snapshot each provider, and check ``min_families`` against known model families."""
-    if isinstance(models, (str, bytes, bytearray)) or not isinstance(models, Sequence):
-        raise TypeError(
-            f"models must be a sequence of model strings, providers or callables, got {type(models).__name__}"
-        )
-    if not models:
-        raise RationalizationError("models must not be empty")
-    providers = tuple(_resolve_provider(entry, persistent_cache=persistent_cache) for entry in models)
-    snapshots = snapshot_providers(providers, prepared)
+def _close_ephemeral(closers: Sequence[Callable[[], object]]) -> None:
+    """Close idle ephemeral string-resolved providers without masking active exceptions."""
+    if not isinstance(closers, Sequence):
+        raise TypeError(f"closers must be a Sequence, got {type(closers).__name__}")
+    for closer in closers:
+        if callable(closer):
+            with contextlib.suppress(Exception):
+                closer()
+
+
+def _check_snapshot_families(snapshots: tuple[ProviderSnapshot, ...], min_families: int) -> None:
+    """Verify ``snapshots`` satisfy ``min_families`` across distinct known model families."""
     if min_families > len(snapshots):
         raise RationalizationError(
             f"min_families ({min_families}) cannot exceed the number of models ({len(snapshots)})"
@@ -236,6 +262,52 @@ def _prepare_snapshots(
             f"models span {spanned} distinct known model famil{'y' if spanned == 1 else 'ies'} "
             f"(unknown adds none), fewer than min_families={min_families}"
         )
+
+
+def _prepare_snapshots_with_closers(
+    models: object,
+    prepared: PreparedSchema,
+    *,
+    min_families: int,
+    persistent_cache: bool,
+) -> tuple[tuple[ProviderSnapshot, ...], tuple[Callable[[], object], ...]]:
+    """Resolve ``models``, snapshot each provider, and collect ``close`` hooks for ``str`` entries only."""
+    if isinstance(models, (str, bytes, bytearray)) or not isinstance(models, Sequence):
+        raise TypeError(
+            f"models must be a sequence of model strings, providers or callables, got {type(models).__name__}"
+        )
+    if not models:
+        raise RationalizationError("models must not be empty")
+    providers: list[ModelProvider] = []
+    closers: list[Callable[[], object]] = []
+    try:
+        for entry in models:
+            prov = _resolve_provider(entry, persistent_cache=persistent_cache)
+            providers.append(prov)
+            if isinstance(entry, str) and callable(closer := getattr(prov, "close", None)):
+                closers.append(closer)
+        snapshots = snapshot_providers(providers, prepared)
+        _check_snapshot_families(snapshots, min_families)
+    except BaseException:
+        _close_ephemeral(closers)
+        raise
+    return snapshots, tuple(closers)
+
+
+def _prepare_snapshots(
+    models: object,
+    prepared: PreparedSchema,
+    *,
+    min_families: int,
+    persistent_cache: bool,
+) -> tuple[ProviderSnapshot, ...]:
+    """Resolve ``models``, snapshot each provider, and check ``min_families`` against known model families."""
+    snapshots, _ = _prepare_snapshots_with_closers(
+        models,
+        prepared,
+        min_families=min_families,
+        persistent_cache=persistent_cache,
+    )
     return snapshots
 
 
@@ -246,7 +318,7 @@ def _prepare_snapshots(
 
 @dataclass(frozen=True, slots=True)
 class _TargetWork:
-    """Accumulated documents, units, envelopes, skipped units and hidden counts across all targets."""
+    """Accumulated documents, units, envelopes, skipped units, hidden counts, and preflight plan."""
 
     docs_by_id: Mapping[str, PDFDocument]
     units_by_id: Mapping[str, Unit]
@@ -254,6 +326,7 @@ class _TargetWork:
     work: tuple[tuple[Unit, Envelope], ...]
     skipped_units: tuple[SkippedUnit, ...]
     hidden_excluded_by_reason: Mapping[str, int]
+    preflight: _PreflightPlan
 
 
 def _normalize_targets(target: object) -> tuple[TargetInput, ...]:
@@ -314,41 +387,157 @@ def _resolve_documents(item: TargetInput) -> tuple[PDFDocument, ...]:
     return (cast(PDFDocument, getattr(reader, "document")),)
 
 
-def _count_new_misses(
+@dataclass(slots=True)
+class _WorkAccumulator:
+    """Mutable preflight accumulator building :class:`_TargetWork` in a single pass."""
+
+    docs_by_id: dict[str, PDFDocument]
+    units_by_id: dict[str, Unit]
+    envelopes_by_id: dict[str, Envelope]
+    work: list[tuple[Unit, Envelope]]
+    skipped: list[SkippedUnit]
+    hidden_counts: dict[str, int]
+    slots: dict[tuple[str, str], str]
+    requests: dict[str, _Request]
+    file_lookups: dict[str, CacheLookup]
+    miss_count: int = 0
+
+    @classmethod
+    def empty(cls) -> "_WorkAccumulator":
+        return cls({}, {}, {}, [], [], {}, {}, {}, {}, 0)
+
+    def freeze(self) -> _TargetWork:
+        preflight = _PreflightPlan(
+            slots=self.slots,
+            requests=tuple(self.requests.values()),
+            file_lookups=self.file_lookups,
+        )
+        return _TargetWork(
+            docs_by_id=self.docs_by_id,
+            units_by_id=self.units_by_id,
+            envelopes_by_id=self.envelopes_by_id,
+            work=tuple(self.work),
+            skipped_units=tuple(self.skipped),
+            hidden_excluded_by_reason=self.hidden_counts,
+            preflight=preflight,
+        )
+
+
+def _probe_new_request(
+    req: _Request,
+    file_cache: FileCache | None,
+    acc: _WorkAccumulator,
+    max_requests: int,
+) -> None:
+    """Record distinct ``req``, probe ``file_cache`` at most once, and enforce ``max_requests``."""
+    acc.requests[req.key] = req
+    if file_cache is not None:
+        lookup = file_cache.get(req.key)
+        acc.file_lookups[req.key] = lookup
+        if lookup.hit:
+            return
+    acc.miss_count += 1
+    if acc.miss_count > max_requests:
+        raise RationalizationError(
+            f"this run needs at least {acc.miss_count} requests (distinct cache misses), past max_requests "
+            f"{max_requests}: raise max_requests, or send fewer units or models"
+        )
+
+
+def _record_doc_requests(
+    kept_units: Sequence[Unit],
     envelopes: Sequence[Envelope],
     snapshots: Sequence[ProviderSnapshot],
-    *,
-    params_by_model: Mapping[str, dict[str, Any]],
-    schemas_by_model: Mapping[str, dict[str, Any]],
-    schema_version: str,
+    suffixes: Mapping[str, bytes],
     file_cache: FileCache | None,
-    seen_keys: set[str],
-    miss_count: int,
+    acc: _WorkAccumulator,
     max_requests: int,
-) -> int:
-    """Update ``seen_keys`` and ``miss_count`` for ``envelopes``, raising if distinct misses pass ``max_requests``."""
-    for envelope in envelopes:
+) -> None:
+    """Key and probe ``kept_units`` × ``snapshots`` once, failing fast past ``max_requests``."""
+    if len(kept_units) != len(envelopes):
+        raise ValueError("kept_units and envelopes must have equal length")
+    if max_requests < 1:
+        raise ValueError(f"max_requests must be >= 1, got {max_requests}")
+    for unit, envelope in zip(kept_units, envelopes, strict=True):
+        env_hasher = hashlib.sha256(_envelope_key_prefix(envelope))
         for snapshot in snapshots:
-            key = request_key(
-                provider_kind=snapshot.provider_kind,
-                model_id=snapshot.model_id,
-                generation_params=params_by_model[snapshot.model_id],
-                envelope=envelope,
-                provider_schema=schemas_by_model[snapshot.model_id],
-                schema_version=schema_version,
-            )
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            if file_cache is not None and file_cache.get(key).hit:
-                continue
-            miss_count += 1
-            if miss_count > max_requests:
-                raise RationalizationError(
-                    f"this run needs at least {miss_count} requests (distinct cache misses), past max_requests "
-                    f"{max_requests}: raise max_requests, or send fewer units or models"
-                )
-    return miss_count
+            key = _fast_request_key(envelope, suffixes[snapshot.model_id], envelope_hasher=env_hasher)
+            slot = (unit.unit_id, snapshot.model_id)
+            if acc.slots.setdefault(slot, key) != key:
+                raise ValueError(f"unit {unit.unit_id} appears twice with different envelopes")
+            if key not in acc.requests:
+                _probe_new_request(_Request(key, unit, envelope, snapshot), file_cache, acc, max_requests)
+        acc.units_by_id[unit.unit_id] = unit
+        acc.envelopes_by_id[unit.unit_id] = envelope
+        acc.work.append((unit, envelope))
+
+
+def _suffixes_by_model(
+    snapshots: Sequence[ProviderSnapshot],
+    max_output_tokens: int,
+    schema_version: str,
+) -> dict[str, bytes]:
+    """Precompute canonical non-envelope key suffixes once per provider snapshot."""
+    if not snapshots:
+        raise ValueError("snapshots must not be empty")
+    if max_output_tokens < 1:
+        raise ValueError(f"max_output_tokens must be >= 1, got {max_output_tokens}")
+    return {
+        s.model_id: _provider_key_suffix(
+            provider_kind=s.provider_kind,
+            model_id=s.model_id,
+            generation_params={**s.generation_params, "max_output_tokens": max_output_tokens},
+            provider_schema_json=s.provider_schema_json,
+            schema_version=schema_version,
+        )
+        for s in snapshots
+    }
+
+
+def _add_doc_to_work(
+    doc: PDFDocument,
+    acc: _WorkAccumulator,
+    *,
+    unit_opts: tuple[int, bool, bool, bool],
+    prompt_text: str,
+    context: object,
+    wrapper_json: str,
+    snapshots: Sequence[ProviderSnapshot],
+    suffixes: Mapping[str, bytes],
+    file_cache: FileCache | None,
+    limits: RunLimits,
+) -> None:
+    """Validate ``doc_id``, pack units, build envelopes, and record requests for one document."""
+    max_unit_chars, coalesce_sections, include_schema, multimodal = unit_opts
+    doc_id = doc.metadata.doc_id
+    if doc_id in acc.docs_by_id:
+        raise RationalizationError(f"duplicate doc_id {doc_id!r} across targets: each target must be distinct")
+    if len(acc.docs_by_id) >= MAX_TARGETS:
+        raise RationalizationError(f"resolved targets exceed MAX_TARGETS ({MAX_TARGETS})")
+    acc.docs_by_id[doc_id] = doc
+    plan = build_units(
+        doc,
+        max_unit_chars=max_unit_chars,
+        render=render_element,
+        coalesce_sections=coalesce_sections,
+        multimodal=multimodal,
+    )
+    kept_units, envelopes, render_skipped = _safe_doc_envelopes(
+        plan.units,
+        doc,
+        prompt_text=prompt_text,
+        context=context,
+        wrapper_json=wrapper_json,
+        coalesce_sections=coalesce_sections,
+        include_schema=include_schema,
+        multimodal=multimodal,
+        strict=limits.strict,
+    )
+    acc.skipped.extend(render_skipped)
+    _record_doc_requests(kept_units, envelopes, snapshots, suffixes, file_cache, acc, limits.max_requests)
+    acc.skipped.extend(plan.skipped)
+    for reason, count in plan.hidden_excluded_total:
+        acc.hidden_counts[reason] = acc.hidden_counts.get(reason, 0) + count
 
 
 def _build_target_work(
@@ -367,119 +556,26 @@ def _build_target_work(
     limits: RunLimits,
 ) -> _TargetWork:
     """Resolve targets in order, building units and envelopes while checking ``doc_id`` and ``max_requests``."""
-    docs_by_id: dict[str, PDFDocument] = {}
-    units_by_id: dict[str, Unit] = {}
-    envelopes_by_id: dict[str, Envelope] = {}
-    work: list[tuple[Unit, Envelope]] = []
-    skipped: list[SkippedUnit] = []
-    hidden_counts: dict[str, int] = {}
-    seen_keys: set[str] = set()
-    miss_count = 0
-    params_by_model = {
-        s.model_id: {**s.generation_params, "max_output_tokens": limits.max_output_tokens} for s in snapshots
-    }
-    schemas_by_model = {s.model_id: s.provider_schema for s in snapshots}
-
+    acc = _WorkAccumulator.empty()
+    suffixes = _suffixes_by_model(snapshots, limits.max_output_tokens, schema_version)
+    unit_opts = (max_unit_chars, coalesce_sections, include_schema_in_prompt, multimodal)
     for doc in (doc for item in raw_targets for doc in _resolve_documents(item)):
-        doc_id = doc.metadata.doc_id
-        if doc_id in docs_by_id:
-            raise RationalizationError(f"duplicate doc_id {doc_id!r} across targets: each target must be distinct")
-        if len(docs_by_id) >= MAX_TARGETS:
-            raise RationalizationError(f"resolved targets exceed MAX_TARGETS ({MAX_TARGETS})")
-        docs_by_id[doc_id] = doc
-        plan = build_units(
+        _add_doc_to_work(
             doc,
-            max_unit_chars=max_unit_chars,
-            render=render_element,
-            coalesce_sections=coalesce_sections,
-            multimodal=multimodal,
-        )
-        kept_units, envelopes, render_skipped = _safe_doc_envelopes(
-            plan.units,
-            doc,
+            acc,
+            unit_opts=unit_opts,
             prompt_text=prompt_text,
             context=context,
             wrapper_json=prepared.wrapper_json,
-            coalesce_sections=coalesce_sections,
-            include_schema=include_schema_in_prompt,
-            multimodal=multimodal,
-            strict=limits.strict,
-        )
-        skipped.extend(render_skipped)
-        miss_count = _count_new_misses(
-            envelopes,
-            snapshots,
-            params_by_model=params_by_model,
-            schemas_by_model=schemas_by_model,
-            schema_version=schema_version,
+            snapshots=snapshots,
+            suffixes=suffixes,
             file_cache=file_cache,
-            seen_keys=seen_keys,
-            miss_count=miss_count,
-            max_requests=limits.max_requests,
+            limits=limits,
         )
-        for unit, envelope in zip(kept_units, envelopes, strict=True):
-            units_by_id[unit.unit_id] = unit
-            envelopes_by_id[unit.unit_id] = envelope
-            work.append((unit, envelope))
-        skipped.extend(plan.skipped)
-        for reason, count in plan.hidden_excluded_total:
-            hidden_counts[reason] = hidden_counts.get(reason, 0) + count
-
-    return _TargetWork(
-        docs_by_id=docs_by_id,
-        units_by_id=units_by_id,
-        envelopes_by_id=envelopes_by_id,
-        work=tuple(work),
-        skipped_units=tuple(skipped),
-        hidden_excluded_by_reason=hidden_counts,
-    )
+    return acc.freeze()
 
 
 _FATAL_PDF_ERRORS = (PDFSourceChangedError, BundleCorruptError, PDFCorruptError, PDFEncryptedError)
-
-
-def _isolate_doc_envelopes(
-    units: tuple[Unit, ...],
-    doc: PDFDocument,
-    *,
-    prompt_text: str,
-    context: object,
-    wrapper_json: str,
-    coalesce_sections: bool,
-    include_schema: bool,
-    multimodal: bool,
-) -> tuple[tuple[Unit, ...], tuple[Envelope, ...], list[SkippedUnit]]:
-    """Per-unit fallback isolating single-page render errors into ``SkippedUnit`` under ``strict=False``."""
-    kept_u: list[Unit] = []
-    kept_e: list[Envelope] = []
-    extra_skipped: list[SkippedUnit] = []
-    for unit in units:
-        try:
-            env = build_envelopes(
-                (unit,),
-                doc,
-                prompt=prompt_text,
-                context=context,
-                schema_json=wrapper_json,
-                coalesce_sections=coalesce_sections,
-                include_schema=include_schema,
-                multimodal=multimodal,
-            )[0]
-            kept_u.append(unit)
-            kept_e.append(env)
-        except _FATAL_PDF_ERRORS:
-            raise
-        except DatagruntPDFError:
-            pno = unit.page_numbers[0]
-            extra_skipped.append(
-                SkippedUnit(
-                    unit_id=f"{doc.metadata.doc_id}:p{pno:04d}",
-                    reason="image_only",
-                    page_numbers=unit.page_numbers,
-                    hidden_excluded=unit.hidden_excluded,
-                )
-            )
-    return tuple(kept_u), tuple(kept_e), extra_skipped
 
 
 def _safe_doc_envelopes(
@@ -493,8 +589,21 @@ def _safe_doc_envelopes(
     include_schema: bool,
     multimodal: bool,
     strict: bool,
-) -> tuple[tuple[Unit, ...], tuple[Envelope, ...], list[SkippedUnit]]:
+) -> tuple[tuple[Unit, ...], tuple[Envelope, ...], tuple[SkippedUnit, ...]]:
     """Build envelopes for ``units``; isolate per-page render errors into ``SkippedUnit`` when ``not strict``."""
+    if not strict:
+        return build_envelopes_isolated(
+            units,
+            doc,
+            prompt=prompt_text,
+            context=context,
+            schema_json=wrapper_json,
+            coalesce_sections=coalesce_sections,
+            include_schema=include_schema,
+            multimodal=multimodal,
+            fatal_errors=_FATAL_PDF_ERRORS,
+            _trusted_blocks=True,
+        )
     try:
         envs = build_envelopes(
             units,
@@ -505,23 +614,13 @@ def _safe_doc_envelopes(
             coalesce_sections=coalesce_sections,
             include_schema=include_schema,
             multimodal=multimodal,
+            _trusted_blocks=True,
         )
-        return units, envs, []
     except _FATAL_PDF_ERRORS:
         raise
     except DatagruntPDFError as exc:
-        if strict:
-            raise RationalizationError(f"multimodal page render failed on {doc.metadata.doc_id!r}: {exc}") from exc
-    return _isolate_doc_envelopes(
-        units,
-        doc,
-        prompt_text=prompt_text,
-        context=context,
-        wrapper_json=wrapper_json,
-        coalesce_sections=coalesce_sections,
-        include_schema=include_schema,
-        multimodal=multimodal,
-    )
+        raise RationalizationError(f"multimodal page render failed on {doc.metadata.doc_id!r}: {exc}") from exc
+    return units, envs, ()
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -539,47 +638,62 @@ def _escaped_totals(units: Mapping[str, Unit]) -> dict[str, int]:
     return totals
 
 
-def _assemble_pipeline_result(
+def _run_post_stages(
     target_work: _TargetWork,
     outcome: RunOutcome,
     prepared: PreparedSchema,
     *,
     min_families: int,
     must_agree: Sequence[str],
-    expect_non_empty: bool,
-    fold_across_units: bool = True,
-) -> RationalizedResult[Any]:
-    """Execute consensus, grounding and folding over ``outcome`` and assemble :class:`RationalizedResult`."""
-    if target_work.units_by_id:
-        consensus_res = build_consensus(
-            outcome,
-            prepared,
-            tuple(target_work.units_by_id),
-            min_families=min_families,
-            must_agree=must_agree,
+    fold_across_units: bool,
+    multimodal: bool,
+) -> tuple[ConsensusResult, GroundingResult, FoldingResult[Any]]:
+    """Run consensus, grounding, and document folding over ``outcome`` when units are present."""
+    if not isinstance(target_work, _TargetWork) or not isinstance(outcome, RunOutcome):
+        raise TypeError("target_work and outcome must be validated pipeline structures")
+    if not target_work.units_by_id:
+        return (
+            ConsensusResult(items=(), quarantined=()),
+            GroundingResult(items=(), empty_units=()),
+            FoldingResult(items=()),
         )
-        grounding_res = ground(
-            consensus_res,
-            outcome=outcome,
-            units=target_work.units_by_id,
-            envelopes=target_work.envelopes_by_id,
-            documents=target_work.docs_by_id,
-            schema=prepared,
-        )
-        folding_res: FoldingResult[Any] = fold_documents(
-            grounding_res,
-            units=target_work.units_by_id,
-            envelopes=target_work.envelopes_by_id,
-            documents=target_work.docs_by_id,
-            schema=prepared,
-            fold_across_units=fold_across_units,
-        )
-    else:
-        consensus_res = ConsensusResult(items=(), quarantined=())
-        grounding_res = GroundingResult(items=(), empty_units=())
-        folding_res = FoldingResult(items=())
+    consensus_res = build_consensus(
+        outcome,
+        prepared,
+        tuple(target_work.units_by_id),
+        min_families=min_families,
+        must_agree=must_agree,
+    )
+    grounding_res = ground(
+        consensus_res,
+        outcome=outcome,
+        units=target_work.units_by_id,
+        envelopes=target_work.envelopes_by_id,
+        documents=target_work.docs_by_id,
+        schema=prepared,
+    )
+    folding_res: FoldingResult[Any] = fold_documents(
+        grounding_res,
+        units=target_work.units_by_id,
+        envelopes=target_work.envelopes_by_id,
+        documents=target_work.docs_by_id,
+        schema=prepared,
+        fold_across_units=fold_across_units,
+        multimodal=multimodal,
+    )
+    return consensus_res, grounding_res, folding_res
 
-    telemetry = RationalizeTelemetry(
+
+def _build_telemetry(
+    target_work: _TargetWork,
+    outcome: RunOutcome,
+    consensus_res: ConsensusResult,
+    grounding_res: GroundingResult,
+) -> RationalizeTelemetry:
+    """Assemble :class:`RationalizeTelemetry` from target, runner, consensus, and grounding counts."""
+    if not isinstance(target_work, _TargetWork) or not isinstance(outcome, RunOutcome):
+        raise TypeError("target_work and outcome must be validated pipeline structures")
+    return RationalizeTelemetry(
         document_count=len(target_work.docs_by_id),
         unit_count=len(target_work.units_by_id),
         skipped_unit_count=len(target_work.skipped_units),
@@ -596,6 +710,30 @@ def _assemble_pipeline_result(
         usage_by_model=outcome.usage,
         models=outcome.models,
     )
+
+
+def _assemble_pipeline_result(
+    target_work: _TargetWork,
+    outcome: RunOutcome,
+    prepared: PreparedSchema,
+    *,
+    min_families: int,
+    must_agree: Sequence[str],
+    expect_non_empty: bool,
+    fold_across_units: bool = True,
+    multimodal: bool = True,
+) -> RationalizedResult[Any]:
+    """Execute consensus, grounding and folding over ``outcome`` and assemble :class:`RationalizedResult`."""
+    consensus_res, grounding_res, folding_res = _run_post_stages(
+        target_work,
+        outcome,
+        prepared,
+        min_families=min_families,
+        must_agree=must_agree,
+        fold_across_units=fold_across_units,
+        multimodal=multimodal,
+    )
+    telemetry = _build_telemetry(target_work, outcome, consensus_res, grounding_res)
     items: tuple[GroundedRecord[Any], ...] = folding_res.items
     records = tuple(item.record for item in items if item.status in _CLEAN_STATUSES and item.record is not None)
     needs_review = tuple(item for item in items if item.status not in _CLEAN_STATUSES)
@@ -628,6 +766,7 @@ def _run_pipeline(
     must_agree: Sequence[str],
     expect_non_empty: bool,
     fold_across_units: bool = True,
+    multimodal: bool = True,
     on_event: EventHook | None,
 ) -> RationalizedResult[Any]:
     """Execute runner, consensus, grounding and folding, then assemble :class:`RationalizedResult`."""
@@ -640,6 +779,7 @@ def _run_pipeline(
         file_cache=file_cache,
         limits=limits,
         on_event=on_event,
+        _preflight=target_work.preflight,
     )
     return _assemble_pipeline_result(
         target_work,
@@ -649,12 +789,84 @@ def _run_pipeline(
         must_agree=must_agree,
         expect_non_empty=expect_non_empty,
         fold_across_units=fold_across_units,
+        multimodal=multimodal,
     )
 
 
 # ---------------------------------------------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------------------------------------------
+
+
+def _preflight_schema_and_snapshots(
+    pre: tuple[type[Any], str | Sequence[str] | None, Sequence[str], str | Path, object, Sequence[ModelInput], Any],
+    min_families: int,
+) -> tuple[PreparedSchema, tuple[str, ...], str, tuple[ProviderSnapshot, ...], tuple[Callable[[], object], ...]]:
+    """Prepare ``schema``, validate ``prompt`` and ``context``, and snapshot ``models``."""
+    if len(pre) != 7 or min_families < 1:
+        raise ValueError("pre must be a 7-tuple and min_families >= 1")
+    schema, key, must_agree, prompt, context, models, cache_dir = pre
+    prepared = prepare(schema, key=key)
+    checked_must_agree = check_must_agree(prepared.spec, must_agree)
+    prompt_text = _read_prompt(prompt)
+    _context_json(context)
+    _check_schema(prepared.wrapper_json)
+    snapshots, closers = _prepare_snapshots_with_closers(
+        models,
+        prepared,
+        min_families=min_families,
+        persistent_cache=cache_dir is not None,
+    )
+    return prepared, checked_must_agree, prompt_text, snapshots, closers
+
+
+def _execute_with_snapshots(
+    target: TargetInput | Sequence[TargetInput],
+    pre: tuple[type[Any], str | Sequence[str] | None, Sequence[str], str | Path, object, Sequence[ModelInput], Any],
+    limits: RunLimits,
+    u_opts: tuple[int, bool, bool, bool],
+    r_opts: tuple[bool, bool, int, str, EventHook | None],
+) -> RationalizedResult[Any]:
+    """Snapshot ``models``, resolve targets, run the pipeline, and close ephemeral ``str`` models."""
+    if not isinstance(limits, RunLimits) or len(pre) != 7:
+        raise TypeError("limits and pre must be validated preflight inputs")
+    max_unit_chars, coalesce_sections, include_schema_in_prompt, multimodal = u_opts
+    fold_across_units, expect_non_empty, min_families, schema_version, on_event = r_opts
+    _, _, _, _, context, _, cache_dir = pre
+    prepared, checked_must_agree, prompt_text, snapshots, closers = _preflight_schema_and_snapshots(pre, min_families)
+    try:
+        file_cache = FileCache(cache_dir) if cache_dir is not None else None
+        target_work = _build_target_work(
+            _normalize_targets(target),
+            max_unit_chars=max_unit_chars,
+            coalesce_sections=coalesce_sections,
+            include_schema_in_prompt=include_schema_in_prompt,
+            multimodal=multimodal,
+            prompt_text=prompt_text,
+            context=context,
+            prepared=prepared,
+            snapshots=snapshots,
+            schema_version=schema_version,
+            file_cache=file_cache,
+            limits=limits,
+        )
+        return _run_pipeline(
+            target_work,
+            snapshots,
+            prepared,
+            schema_version=schema_version,
+            memory_cache=MemoryCache(),
+            file_cache=file_cache,
+            limits=limits,
+            min_families=min_families,
+            must_agree=checked_must_agree,
+            expect_non_empty=expect_non_empty,
+            fold_across_units=fold_across_units,
+            multimodal=multimodal,
+            on_event=on_event,
+        )
+    finally:
+        _close_ephemeral(closers)
 
 
 def rationalize(
@@ -729,67 +941,21 @@ def rationalize(
             ``cache_dir``, target ``doc_id`` uniqueness, ``max_requests`` preflight, a permanent/strict provider
             error, or ``expect_non_empty`` check fails.
     """
-    limits = _check_scalar_params(
+    limits = RunLimits(
         max_concurrency=max_concurrency,
         max_concurrency_per_provider=max_concurrency_per_provider,
         rpm_limit=rpm_limit,
         timeout_s=timeout_s,
         max_retries=max_retries,
-        max_unit_chars=max_unit_chars,
-        max_requests=max_requests,
         max_output_tokens=max_output_tokens,
-        schema_version=schema_version,
-        expect_non_empty=expect_non_empty,
+        max_requests=max_requests,
         strict=strict,
-        coalesce_sections=coalesce_sections,
-        include_schema_in_prompt=include_schema_in_prompt,
-        multimodal=multimodal,
-        fold_across_units=fold_across_units,
-        on_event=on_event,
-        min_families=min_families,
     )
-    prepared = prepare(schema, key=key)
-    checked_must_agree = check_must_agree(prepared.spec, must_agree)
-    prompt_text = _read_prompt(prompt)
-    _context_json(context)
-    _check_schema(prepared.wrapper_json)
-    snapshots = _prepare_snapshots(
-        models,
-        prepared,
-        min_families=min_families,
-        persistent_cache=cache_dir is not None,
-    )
-    file_cache = FileCache(cache_dir) if cache_dir is not None else None
-    memory_cache = MemoryCache()
-    raw_targets = _normalize_targets(target)
-    target_work = _build_target_work(
-        raw_targets,
-        max_unit_chars=max_unit_chars,
-        coalesce_sections=coalesce_sections,
-        include_schema_in_prompt=include_schema_in_prompt,
-        multimodal=multimodal,
-        prompt_text=prompt_text,
-        context=context,
-        prepared=prepared,
-        snapshots=snapshots,
-        schema_version=schema_version,
-        file_cache=file_cache,
-        limits=limits,
-    )
-    return cast(
-        RationalizedResult[T],
-        _run_pipeline(
-            target_work,
-            snapshots,
-            prepared,
-            schema_version=schema_version,
-            memory_cache=memory_cache,
-            file_cache=file_cache,
-            limits=limits,
-            min_families=min_families,
-            must_agree=checked_must_agree,
-            expect_non_empty=expect_non_empty,
-            fold_across_units=fold_across_units,
-            on_event=on_event,
-        ),
-    )
+    f1 = (("expect_non_empty", expect_non_empty), ("coalesce_sections", coalesce_sections))
+    f2 = (("include_schema_in_prompt", include_schema_in_prompt), ("multimodal", multimodal))
+    f3 = (*f1, *f2, ("fold_across_units", fold_across_units))
+    _check_extra_scalars(max_unit_chars, schema_version, on_event, min_families, f3)
+    u_opts = (max_unit_chars, coalesce_sections, include_schema_in_prompt, multimodal)
+    r_opts = (fold_across_units, expect_non_empty, min_families, schema_version, on_event)
+    pre = (schema, key, must_agree, prompt, context, models, cache_dir)
+    return cast(RationalizedResult[T], _execute_with_snapshots(target, pre, limits, u_opts, r_opts))

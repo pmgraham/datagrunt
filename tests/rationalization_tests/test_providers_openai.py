@@ -2809,11 +2809,9 @@ MM_OPENAI_PNG = b"\x89PNG\r\n\x1a\nOPENAI_BAND"
 
 class TestMultimodalImages:
     def test_openai_compatible_provider_sends_data_uri_image_url_parts(self):
-        import base64
-
         req = make_request(images=(MM_OPENAI_PNG,))
         messages = module._messages(req, fold=False)
-        expected_b64 = base64.b64encode(MM_OPENAI_PNG).decode("ascii")
+        expected_b64 = module.encode_images_b64((MM_OPENAI_PNG,))[0][0]
         assert messages == [
             {"role": "system", "content": SYSTEM},
             {
@@ -2827,3 +2825,24 @@ class TestMultimodalImages:
                 ],
             },
         ]
+
+    def test_openai_compatible_provider_enables_keepalive_closes_client_and_reuses_image_b64(self, monkeypatch):
+        default_prov = OpenAICompatibleProvider("llama3", base_url="http://127.0.0.1:8000/v1", max_connections=7)
+        assert default_prov._http.keepalive_connections == 7
+        default_prov.open()
+        default_prov.close()
+
+        server = Server()
+        provider = gateway(server)
+        req = make_request(images=(MM_OPENAI_PNG,))
+        calls = []
+        real_encode = module.encode_images_b64
+
+        def spy_encode(images, cached=None):
+            calls.append(cached is not None)
+            return real_encode(images, cached)
+
+        monkeypatch.setattr(module, "encode_images_b64", spy_encode)
+        provider.generate(req)
+        provider.generate(req)
+        assert calls == [False, True]

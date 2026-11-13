@@ -30,6 +30,7 @@ import zlib
 from pathlib import Path
 
 import h11
+import httpcore
 import httpx
 import pytest
 from hypothesis import HealthCheck, given, settings
@@ -1468,3 +1469,156 @@ def test_importing_http_loads_the_http_stack():
 
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout.strip().splitlines()[-1]) == sorted(HTTP_STACK)
+
+
+def test_keepalive_connections_defaults_to_zero_and_validates_bounds(monkeypatch):
+    captured = []
+    real_client = httpx.Client
+
+    def spy_client(**kwargs):
+        captured.append(kwargs)
+        return real_client(**kwargs)
+
+    monkeypatch.setattr(http_module.httpx, "Client", spy_client)
+    bare = HttpClient()
+    bare.open()
+    bare.close()
+    assert bare.keepalive_connections == 0
+    assert captured[-1]["transport"] is None
+    assert captured[-1]["limits"].max_keepalive_connections == 0
+
+    pooled = HttpClient(max_connections=8, keepalive_connections=4)
+    pooled.open()
+    pooled.close()
+    assert pooled.keepalive_connections == 4
+    assert captured[-1]["limits"].max_keepalive_connections == 4
+    assert captured[-1]["limits"].keepalive_expiry == 15.0
+
+    for bad in (-1, 1025):
+        with pytest.raises(ValueError, match="keepalive_connections"):
+            HttpClient(keepalive_connections=bad)
+    for wrong_type in (True, "2"):
+        with pytest.raises(TypeError, match="keepalive_connections"):
+            HttpClient(keepalive_connections=wrong_type)
+
+
+def test_checked_target_is_cached_per_instance_without_revalidating(monkeypatch):
+    calls = []
+    real_check = http_module.check_endpoint
+
+    def spy_check(url, *, allow_insecure_http=False):
+        calls.append((url, allow_insecure_http))
+        return real_check(url, allow_insecure_http=allow_insecure_http)
+
+    monkeypatch.setattr(http_module, "check_endpoint", spy_check)
+    client = make_client(reply_with(200, json_body={"ok": True}))
+    assert post(client).status == 200
+    assert post(client).status == 200
+    assert len(calls) == 1
+    assert post(client, url="https://api.example/v2").status == 200
+    assert len(calls) == 2
+
+
+class _FakeNetStream:
+    def __init__(self, sock: socket.socket) -> None:
+        self._sock = sock
+
+    def get_extra_info(self, info: str) -> object:
+        return self._sock if info == "socket" else None
+
+
+class _FakeInnerConnection(httpcore.ConnectionInterface):
+    def __init__(self, sock: socket.socket | None, *, raise_exc: BaseException | None = None) -> None:
+        self.sock = sock
+        self.raise_exc = raise_exc
+        self.closed_flag = False
+        self.available = True
+
+    def handle_request(self, request: httpcore.Request) -> httpcore.Response:
+        trace = request.extensions.get("trace")
+        if self.sock is not None and callable(trace):
+            trace("connection.connect_tcp.complete", {"return_value": _FakeNetStream(self.sock)})
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return httpcore.Response(200)
+
+    def can_handle_request(self, origin: httpcore.Origin) -> bool:
+        return True
+
+    def close(self) -> None:
+        self.closed_flag = True
+
+    def info(self) -> str:
+        return "fake"
+
+    def is_available(self) -> bool:
+        return self.available
+
+    def has_expired(self) -> bool:
+        return False
+
+    def is_idle(self) -> bool:
+        return True
+
+    def is_closed(self) -> bool:
+        return self.closed_flag
+
+
+def test_bound_connection_closes_raw_socket_when_inner_raises_or_marks_closed_without_close():
+    left1, right1 = socket.socketpair()
+    left2, right2 = socket.socketpair()
+    try:
+        failing_inner = _FakeInnerConnection(left1, raise_exc=RuntimeError("boom"))
+        bound_fail = http_module._BoundConnection(failing_inner)
+        req1 = httpcore.Request("POST", "https://api.example/v1")
+        with pytest.raises(RuntimeError, match="boom"):
+            bound_fail.handle_request(req1)
+        assert bound_fail._raw_socket is None
+
+        closing_inner = _FakeInnerConnection(left2)
+        bound_eof = http_module._BoundConnection(closing_inner)
+        bound_eof.handle_request(httpcore.Request("POST", "https://api.example/v1"))
+        dup_sock = bound_eof._raw_socket
+        assert dup_sock is not None and dup_sock.fileno() >= 0
+        closing_inner.closed_flag = True
+        assert bound_eof.is_closed() is True
+        assert bound_eof._raw_socket is None
+        assert dup_sock.fileno() == -1
+    finally:
+        for sock in (left1, right1, left2, right2):
+            sock.close()
+
+
+def test_bound_connection_restores_trace_extension_across_connection_not_available():
+    left_b, right_b = socket.socketpair()
+    try:
+        inner_a = _FakeInnerConnection(None, raise_exc=httpcore.ConnectionNotAvailable())
+        inner_b = _FakeInnerConnection(left_b)
+        bound_a = http_module._BoundConnection(inner_a)
+        bound_b = http_module._BoundConnection(inner_b)
+        seen_events: list[str] = []
+
+        def orig_trace(event_name: str, _info: object) -> None:
+            seen_events.append(event_name)
+
+        req = httpcore.Request("POST", "https://api.example/v1", extensions={"trace": orig_trace})
+        with pytest.raises(httpcore.ConnectionNotAvailable):
+            bound_a.handle_request(req)
+        assert req.extensions == {"trace": orig_trace}
+
+        bound_b.handle_request(req)
+        assert bound_a._raw_socket is None
+        assert bound_b._raw_socket is not None
+        assert req.extensions == {"trace": orig_trace}
+        assert seen_events == ["connection.connect_tcp.complete"]
+        bound_b.close()
+    finally:
+        left_b.close()
+        right_b.close()
+
+
+def test_bind_transport_pool_fails_loud_without_bindable_pool():
+    with pytest.raises(RationalizationError, match="transport is None"):
+        http_module._bind_transport_pool(None)
+    with pytest.raises(RationalizationError, match="no bindable connection pool"):
+        http_module._bind_transport_pool(httpx.MockTransport(reply_with(200, json_body={})))
