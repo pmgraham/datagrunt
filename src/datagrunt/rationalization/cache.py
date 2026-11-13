@@ -103,7 +103,7 @@ from datagrunt.rationalization.envelope import Envelope
 from datagrunt.rationalization.exceptions import RationalizationError
 from datagrunt.rationalization.wire import (
     ProviderResponse,
-    _to_trusted_json,
+    _clone_response_json,
     _trusted_provider_response,
 )
 
@@ -509,8 +509,8 @@ class MemoryCache:
             )
         )
 
-    def _put_trusted_json(self, key: str, resp_json: dict[str, Any], meta: CacheMeta) -> bool:
-        """Store pre-cloned ``resp_json`` for ``key`` without repeating :func:`_to_trusted_json`."""
+    def _put_cloned_json(self, key: str, resp_json: dict[str, Any], meta: CacheMeta) -> bool:
+        """Store pre-cloned ``resp_json`` for ``key`` without repeating :func:`_clone_response_json`."""
         _check_key(key)
         if not isinstance(meta, CacheMeta):
             raise TypeError(f"meta must be a CacheMeta, got {type(meta).__name__}")
@@ -530,7 +530,7 @@ class MemoryCache:
         """
         _check_key(key)
         _check_stored(response, meta)
-        return self._put_trusted_json(key, _to_trusted_json(response), meta)
+        return self._put_cloned_json(key, _clone_response_json(response), meta)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -779,7 +779,7 @@ def _serialize_cache_entry(key: str, response: ProviderResponse, meta: CacheMeta
     """Serialize one validated cache entry to UTF-8 bytes, or ``None`` when past :data:`ENTRY_MAX_BYTES`."""
     _check_key(key)
     _check_stored(response, meta)
-    entry = {"format": CACHE_FORMAT, "key": key, "response": _to_trusted_json(response), "meta": meta.to_json()}
+    entry = {"format": CACHE_FORMAT, "key": key, "response": _clone_response_json(response), "meta": meta.to_json()}
     data = canonical_json(entry, subject="the cache entry").encode("utf-8")
     return None if len(data) > ENTRY_MAX_BYTES else data
 
@@ -994,8 +994,8 @@ class FileCache:
             return _corrupt(data)
         return _parse_entry(data, key)
 
-    def _put_trusted_json(self, key: str, resp_json: dict[str, Any], meta: CacheMeta) -> bool:
-        """Write pre-cloned ``resp_json`` atomically without repeating :func:`_to_trusted_json`."""
+    def _put_cloned_json(self, key: str, resp_json: dict[str, Any], meta: CacheMeta) -> bool:
+        """Write pre-cloned ``resp_json`` atomically without repeating :func:`_clone_response_json`."""
         _check_key(key)
         if not isinstance(meta, CacheMeta):
             raise TypeError(f"meta must be a CacheMeta, got {type(meta).__name__}")
@@ -1023,7 +1023,7 @@ class FileCache:
         """
         _check_key(key)
         _check_stored(response, meta)
-        return self._put_trusted_json(key, _to_trusted_json(response), meta)
+        return self._put_cloned_json(key, _clone_response_json(response), meta)
 
     def put_many(self, items: Iterable[tuple[str, ProviderResponse, CacheMeta]]) -> tuple[bool, ...]:
         """Atomically write ``(key, response, meta)`` entries grouped by ``key[:2]``, fsyncing once per shard."""

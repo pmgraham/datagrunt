@@ -145,7 +145,7 @@ from datagrunt.rationalization.wire import (
     MAX_OUTPUT_TOKENS,
     ModelRequest,
     ProviderResponse,
-    _to_trusted_json,
+    _clone_response_json,
     _trusted_model_request,
 )
 
@@ -1053,7 +1053,7 @@ def _file_put(
     """Write one entry; what went wrong (an entry past 8 MiB, a write that failed), as event details."""
     try:
         written = (
-            file_cache._put_trusted_json(key, resp_json, meta)
+            file_cache._put_cloned_json(key, resp_json, meta)
             if resp_json is not None and type(file_cache) is FileCache
             else file_cache.put(key, response, meta)
         )
@@ -1224,9 +1224,9 @@ class _Run:
             latency_ms=latency_ms,
             created_at=datetime.now(timezone.utc).isoformat(),
         )
-        resp_json = _to_trusted_json(response)
+        resp_json = _clone_response_json(response)
         mem_ok = (
-            stores.memory._put_trusted_json(request.key, resp_json, meta)
+            stores.memory._put_cloned_json(request.key, resp_json, meta)
             if type(stores.memory) is MemoryCache
             else stores.memory.put(request.key, response, meta)
         )
