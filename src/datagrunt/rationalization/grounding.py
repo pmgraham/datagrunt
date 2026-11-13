@@ -102,6 +102,7 @@ import re
 import string
 import sys
 import unicodedata
+from array import array
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -109,9 +110,18 @@ from decimal import Decimal
 from fractions import Fraction
 from typing import Any, Literal, TypeAlias, cast, get_args
 
-from datagrunt.pdf.elements import BulletList, DocumentElement, Figure, Heading, KeyValue, PDFDocument, Table
+from datagrunt.pdf.elements import (
+    BulletList,
+    DocumentElement,
+    Figure,
+    Heading,
+    KeyValue,
+    Paragraph,
+    PDFDocument,
+    Table,
+)
 from datagrunt.rationalization.consensus import ConsensusItem, ConsensusResult, alnum_upper_text, normalized_text
-from datagrunt.rationalization.envelope import Envelope, element_text, escape
+from datagrunt.rationalization.envelope import Envelope, element_text
 from datagrunt.rationalization.runner import RunOutcome
 from datagrunt.rationalization.schema import MAX_DEPTH, ModelSpec, PreparedSchema
 from datagrunt.rationalization.units import Unit
@@ -171,7 +181,8 @@ _KEY_VALUE = re.compile(r"\*\*((?:\\.|[^\\*])+):\*\* (.*)", re.DOTALL)
 _LIST_ENTRY = re.compile(r"(?:-|[0-9]+[.)]) ")
 _ASCII_PUNCT_CHARS = frozenset(string.punctuation + string.whitespace)
 _CODE_BRIDGES = frozenset("-_./ ")
-
+_SMALL_DECIMALS: tuple[Decimal, ...] = tuple(Decimal(i) for i in range(10_000))
+_ELEMENT_CLASSES = (Heading, Paragraph, KeyValue, Table, BulletList, Figure)
 
 _UNSPACED_BLOCKS: tuple[tuple[int, int], ...] = (
     (0x0E00, 0x0E7F),  # Thai
@@ -292,6 +303,27 @@ class GroundingReason:
         _check_text("model_id", self.model_id)
         _check_reason_shape(self.reason, self.index, self.key_field, self.text)
 
+    @classmethod
+    def _trusted(
+        cls,
+        reason: GroundingReasonCode,
+        model_id: str,
+        *,
+        index: int | None = None,
+        key_field: str | None = None,
+        text: str | None = None,
+    ) -> "GroundingReason":
+        """Construct an internal :class:`GroundingReason` from verified ``ground()`` checks."""
+        if not model_id or reason not in GROUNDING_REASONS:
+            raise ValueError("GroundingReason._trusted requires valid reason and model_id")
+        self = object.__new__(cls)
+        object.__setattr__(self, "reason", reason)
+        object.__setattr__(self, "model_id", model_id)
+        object.__setattr__(self, "index", index)
+        object.__setattr__(self, "key_field", key_field)
+        object.__setattr__(self, "text", text)
+        return self
+
 
 @dataclass(frozen=True, slots=True)
 class GroundedItem:
@@ -332,6 +364,23 @@ class GroundedItem:
             raise ValueError(f"a {self.item.status} item with {len(self.reasons)} reason(s) is {expected}")
         object.__setattr__(self, "grounded", not self.reasons)
 
+    @classmethod
+    def _trusted(
+        cls,
+        item: ConsensusItem,
+        status: GroundedStatus,
+        reasons: tuple["GroundingReason", ...],
+    ) -> "GroundedItem":
+        """Construct an internal :class:`GroundedItem` from verified ``ground()`` outputs."""
+        if not isinstance(item, ConsensusItem) or not isinstance(reasons, tuple):
+            raise TypeError("GroundedItem._trusted requires ConsensusItem and tuple reasons")
+        self = object.__new__(cls)
+        object.__setattr__(self, "item", item)
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "reasons", reasons)
+        object.__setattr__(self, "grounded", not reasons)
+        return self
+
 
 @dataclass(frozen=True, slots=True)
 class GroundingResult:
@@ -353,6 +402,16 @@ class GroundingResult:
             _check_text("empty_units entry", unit_id)
         if len(set(self.empty_units)) != len(self.empty_units):
             raise ValueError("empty_units must not repeat a unit id")
+
+    @classmethod
+    def _trusted(cls, items: tuple[GroundedItem, ...], empty_units: tuple[str, ...]) -> "GroundingResult":
+        """Construct an internal :class:`GroundingResult` from verified tuples."""
+        if not isinstance(items, tuple) or not isinstance(empty_units, tuple):
+            raise TypeError("GroundingResult._trusted requires items and empty_units tuples")
+        self = object.__new__(cls)
+        object.__setattr__(self, "items", items)
+        object.__setattr__(self, "empty_units", empty_units)
+        return self
 
 
 def _status(status: str, has_reasons: bool) -> GroundedStatus:
@@ -384,6 +443,23 @@ def _unescaped(match: re.Match[str]) -> str:
     return "\n" if escaped is None else escaped
 
 
+def _add_numbers(values: set[Decimal], source: str) -> None:
+    """Add every recognized numeric value in ``source`` into ``values``."""
+    if not isinstance(values, set) or not isinstance(source, str):
+        raise TypeError("_add_numbers requires a set and str")
+    for match in _NUMBER_RUN.finditer(source):
+        raw = match.group(0)
+        if "," not in raw and "." not in raw:
+            value = _SMALL_DECIMALS[int(raw)] if len(raw) <= 4 else Decimal(raw)
+        elif _NUMBER.fullmatch(raw) is not None:
+            value = Decimal(raw.replace(",", ""))
+        else:
+            continue
+        values.add(value)
+        if match.start() and source[match.start() - 1] in _MINUS:
+            values.add(value.copy_negate())  # exact, unlike unary minus
+
+
 def numeric_values(text: str) -> frozenset[Decimal]:
     """The numbers ``text`` writes, by value (module notes, what is not recognized as a number).
 
@@ -394,13 +470,7 @@ def numeric_values(text: str) -> frozenset[Decimal]:
     """
     source = _check_str("text", text)
     values: set[Decimal] = set()
-    for match in _NUMBER_RUN.finditer(source):
-        if _NUMBER.fullmatch(match.group(0)) is None:
-            continue
-        value = Decimal(match.group(0).replace(",", ""))  # exact: no context rounding
-        values.add(value)
-        if match.start() and source[match.start() - 1] in _MINUS:
-            values.add(value.copy_negate())  # exact, unlike unary minus
+    _add_numbers(values, source)
     return frozenset(values)
 
 
@@ -480,34 +550,74 @@ def ground(
     items: list[GroundedItem] = []
     for item in consensus.items:
         _check_item(item, model_ids, schema, checks)
-        unit_texts = texts.get(item.unit_id)
-        if unit_texts is None:
-            unit = units[item.unit_id]
-            env = envelopes[item.unit_id]
-            vision = vision_pages[unit.doc_id]
-            witness = _multimodal_witness_elements(unit, env, documents[unit.doc_id])
-            unit_texts = texts[item.unit_id] = _UnitTexts(unit, env, headers, vision, witness)
+        unit_texts = _unit_texts_for(item.unit_id, texts, units, envelopes, headers, vision_pages, documents)
         found = _item_reasons(item, unit_texts, checks, root_norms=root_norms, child_specs=child_specs)
-        items.append(GroundedItem(item=item, status=_status(item.status, bool(found)), reasons=found))
-    return GroundingResult(items=tuple(items), empty_units=_empty_units(consensus, outcome, units))
+        items.append(GroundedItem._trusted(item=item, status=_status(item.status, bool(found)), reasons=found))
+    return GroundingResult._trusted(items=tuple(items), empty_units=_empty_units(consensus, outcome, units))
+
+
+def _unit_texts_for(
+    unit_id: str,
+    texts: dict[str, "_UnitTexts"],
+    units: Mapping[str, Unit],
+    envelopes: Mapping[str, Envelope],
+    headers: Mapping[tuple[str, str], tuple[DocumentElement, str]],
+    vision_pages: Mapping[str, frozenset[int]],
+    documents: Mapping[str, PDFDocument],
+) -> "_UnitTexts":
+    """Return cached or newly constructed :class:`_UnitTexts` for ``unit_id``."""
+    if not unit_id or unit_id not in units:
+        raise KeyError(f"unknown unit_id {unit_id!r}")
+    unit_texts = texts.get(unit_id)
+    if unit_texts is None:
+        unit = units[unit_id]
+        env = envelopes[unit_id]
+        witness = _multimodal_witness_elements(unit, env, documents[unit.doc_id])
+        unit_texts = texts[unit_id] = _UnitTexts(unit, env, headers, vision_pages[unit.doc_id], witness)
+    return unit_texts
 
 
 def _multimodal_witness_elements(
     unit: Unit, envelope: Envelope, document: PDFDocument
 ) -> Mapping[str, tuple[DocumentElement, ...]]:
     """Return out-of-prompt OCR witness elements keyed by anchor id for a multimodal unit, or ``{}``."""
-    if not envelope.images or len(unit.page_numbers) != 1 or len(unit.elements) != 1:
+    if not isinstance(unit, Unit) or not isinstance(envelope, Envelope) or not isinstance(document, PDFDocument):
+        raise TypeError("_multimodal_witness_elements requires Unit, Envelope, and PDFDocument")
+    if not envelope.images or len(unit.page_numbers) != len(unit.elements):
         return {}
-    pno = unit.page_numbers[0]
-    page = next((p for p in document.pages if p.page_number == pno), None)
-    if page is None or page.image_only_reasons:
-        return {unit.elements[0].element_id: ()}
-    witness = tuple(
-        el
-        for el in page.elements
-        if not el.hidden_reasons and not (isinstance(el, Figure) and not (el.caption and el.caption.strip()))
-    )
-    return {unit.elements[0].element_id: witness}
+    by_page = {p.page_number: p for p in document.pages}
+    out: dict[str, tuple[DocumentElement, ...]] = {}
+    for anchor in unit.elements:
+        page = by_page.get(anchor.page_number)
+        if page is None or page.image_only_reasons:
+            out[anchor.element_id] = ()
+            continue
+        out[anchor.element_id] = tuple(
+            el
+            for el in page.elements
+            if not el.hidden_reasons and not (isinstance(el, Figure) and not (el.caption and el.caption.strip()))
+        )
+    return out
+
+
+def _mark_multimodal_pages(
+    routes: dict[str, dict[int, bool]],
+    units: Mapping[str, Unit],
+    envelopes: Mapping[str, Envelope] | None,
+) -> None:
+    """Mark pages of image-bearing multimodal envelopes as vision-routed in ``routes``."""
+    if not isinstance(routes, dict) or not isinstance(units, Mapping):
+        raise TypeError("routes must be a dict and units must be a Mapping")
+    if envelopes is None:
+        return
+    for unit_id, unit in units.items():
+        env = envelopes.get(unit_id)
+        doc_routes = routes.get(unit.doc_id)
+        if env is None or not env.images or doc_routes is None:
+            continue
+        for pno in unit.page_numbers:
+            if pno in doc_routes:
+                doc_routes[pno] = True
 
 
 def _vision_pages(
@@ -531,13 +641,7 @@ def _vision_pages(
         if document.metadata.doc_id != doc_id:
             raise ValueError(f"documents key {doc_id!r} is not its document's id ({document.metadata.doc_id!r})")
         routes[doc_id] = {page.page_number: page.route == "vision" for page in document.pages}
-    if envelopes is not None:
-        for unit_id, unit in units.items():
-            env = envelopes.get(unit_id)
-            if env is not None and env.images and unit.doc_id in routes:
-                for pno in unit.page_numbers:
-                    if pno in routes[unit.doc_id]:
-                        routes[unit.doc_id][pno] = True
+    _mark_multimodal_pages(routes, units, envelopes)
     for unit in units.values():
         pages = routes.get(unit.doc_id)
         if pages is None:
@@ -575,14 +679,15 @@ def _check_arguments(consensus: object, outcome: object, units: object, envelope
     known = set(cast(Mapping[str, Unit], units))
     if set(cast(Mapping[str, Envelope], envelopes)) != known:
         raise ValueError("envelopes must name the same unit ids as units")
-    named = (
-        *(("an item", item.unit_id) for item in consensus.items),
-        *(("a quarantined item", item.unit_id) for item in consensus.quarantined),
-        *(("a response", unit_id) for unit_id, _ in outcome.responses),
-    )
-    for what, unit_id in named:
+    for item in consensus.items:
+        if item.unit_id not in known:
+            raise ValueError(f"an item names the unit {item.unit_id!r}, which units does not")
+    for q_item in consensus.quarantined:
+        if q_item.unit_id not in known:
+            raise ValueError(f"a quarantined item names the unit {q_item.unit_id!r}, which units does not")
+    for unit_id, _ in outcome.responses:
         if unit_id not in known:
-            raise ValueError(f"{what} names the unit {unit_id!r}, which units does not")
+            raise ValueError(f"a response names the unit {unit_id!r}, which units does not")
 
 
 def _check_item(
@@ -619,6 +724,23 @@ def _empty_units(consensus: ConsensusResult, outcome: RunOutcome, units: Mapping
 # ---------------------------------------------------------------------------------------------------------------
 
 
+def _slice_rendered_block(element: DocumentElement, block: str | None) -> str | None:
+    """Slice ``element_text`` directly from a standard ``render_element`` block, else return ``None``."""
+    if not isinstance(element, _ELEMENT_CLASSES) or (block is not None and not isinstance(block, str)):
+        raise TypeError("_slice_rendered_block requires DocumentElement and str | None")
+    if element.hidden_reasons or block is None or not block.endswith("\n</el>"):
+        return None
+    prefix = f'<el id="{element.element_id}" kind="'
+    if not block.startswith(prefix):
+        return None
+    nl = block.find("\n", len(prefix))
+    end = len(block) - 6
+    tag_suffix = f'" page="{element.page_number}">'
+    if nl < 0 or nl + 1 > end or not block.endswith(tag_suffix, len(prefix) + 1, nl):
+        return None
+    return block[nl + 1 : -6]
+
+
 class _UnitTexts:
     """One unit's citable elements (module notes, 1) and their texts, each text computed once, on first use.
 
@@ -626,6 +748,9 @@ class _UnitTexts:
     """
 
     __slots__ = (
+        "_alnum_entries",
+        "_alnum_sets",
+        "_blocks",
         "_elements",
         "_multimodal",
         "_numbers",
@@ -643,23 +768,30 @@ class _UnitTexts:
         self,
         unit: Unit,
         envelope: Envelope,
-        headers: Mapping[tuple[str, str], DocumentElement],
+        headers: Mapping[tuple[str, str], tuple[DocumentElement, str]],
         vision_pages: frozenset[int],
         witness: Mapping[str, tuple[DocumentElement, ...]] | None = None,
     ) -> None:
         elements: dict[str, list[DocumentElement]] = {}
-        for element in unit.elements:
+        blocks: dict[str, list[str | None]] = {}
+        for element, block in zip(unit.elements, unit.blocks, strict=True):
             elements.setdefault(element.element_id, []).append(element)
+            blocks.setdefault(element.element_id, []).append(block)
         self._own = frozenset(elements)
         for element_id in envelope.header_element_ids:  # never one of the unit's own: the envelope leaves those out
-            elements[element_id] = [headers[(unit.doc_id, element_id)]]
+            header_el, header_block = headers[(unit.doc_id, element_id)]
+            elements[element_id] = [header_el]
+            blocks[element_id] = [header_block]
         self._elements = elements
+        self._blocks = blocks
         self._multimodal = bool(envelope.images)
         self._witness: Mapping[str, tuple[DocumentElement, ...]] = witness or {}
         self._raw: dict[str, tuple[str, ...]] = {}
         self._quoted: dict[str, tuple[str, ...]] = {}
         self._plain: dict[str, tuple[str, ...]] = {}
         self._plain_sets: dict[str, frozenset[str]] = {}
+        self._alnum_entries: dict[str, tuple[tuple[str, str, "array[int]"], ...]] = {}
+        self._alnum_sets: dict[str, frozenset[str]] = {}
         self._numbers: dict[str, frozenset[Decimal]] = {}
         self._tokens: dict[str, tuple[Counter[str], ...]] = {}
         self._vision_pages = vision_pages
@@ -689,7 +821,10 @@ class _UnitTexts:
                 parts = tuple(element_text(element) for element in els)
                 found = (*parts, "\n".join(parts)) if len(parts) > 1 else parts
             else:
-                found = tuple(element_text(element) for element in self._elements[element_id])
+                found = tuple(
+                    sliced if (sliced := _slice_rendered_block(el, blk)) is not None else element_text(el)
+                    for el, blk in zip(self._elements[element_id], self._blocks[element_id], strict=True)
+                )
             self._raw[element_id] = found
         return found
 
@@ -707,27 +842,10 @@ class _UnitTexts:
         if found is None:
             if element_id in self._witness:
                 els = self._witness[element_id]
-                found = tuple(
-                    _comparable(unescape_markdown(each))
-                    for element in els
-                    for each in _fields(element, element_text(element))
-                )
+                found = tuple(item for el in els for item in _plain_fields_of(el, element_text(el)))
             else:
-                elem_list = self._elements[element_id]
-                if len(elem_list) == 1 and isinstance(elem_list[0], Table):
-                    tbl = elem_list[0]
-                    hdr = tbl.headers if tbl.headers else ("",) * len(tbl.rows[0])
-                    found = tuple(
-                        _comparable(c if (c.isascii() and c.isprintable()) else escape(c))
-                        for row in (hdr, *tbl.rows)
-                        for c in row
-                    )
-                else:
-                    found = tuple(
-                        _comparable(unescape_markdown(each))
-                        for element, text in zip(elem_list, self.raw(element_id), strict=True)
-                        for each in _fields(element, text)
-                    )
+                pairs = zip(self._elements[element_id], self.raw(element_id), strict=True)
+                found = tuple(item for el, text in pairs for item in _plain_fields_of(el, text))
             self._plain[element_id] = found
         return found
 
@@ -738,11 +856,31 @@ class _UnitTexts:
             found = self._plain_sets[element_id] = frozenset(self.plain(element_id))
         return found
 
+    def alnum_upper_entries(self, element_id: str) -> tuple[tuple[str, str, "array[int]"], ...]:
+        """Pre-indexed ``(text, joined_upper, source_indices)`` triples for :meth:`plain` fields."""
+        found = self._alnum_entries.get(element_id)
+        if found is None:
+            found = self._alnum_entries[element_id] = tuple(_index_alnum_field(text) for text in self.plain(element_id))
+        return found
+
+    def alnum_upper_set(self, element_id: str) -> frozenset[str]:
+        """Frozenset of valid whole-field ``alnum_upper`` tokens for O(1) exact SKU/code cell checks."""
+        found = self._alnum_sets.get(element_id)
+        if found is None:
+            found = self._alnum_sets[element_id] = frozenset(
+                tok for entry in self.alnum_upper_entries(element_id) if (tok := _whole_alnum_token(entry)) is not None
+            )
+        return found
+
     def numbers(self, element_id: str) -> frozenset[Decimal]:
         """The numbers of :meth:`plain`'s texts (:func:`numeric_values`): what an int or Decimal key matches."""
         found = self._numbers.get(element_id)
         if found is None:
-            found = self._numbers[element_id] = frozenset().union(*map(numeric_values, self.plain(element_id)))
+            acc: set[Decimal] = set()
+            fields = self.plain(element_id)
+            if fields:
+                _add_numbers(acc, "\n".join(fields))
+            found = self._numbers[element_id] = frozenset(acc)
         return found
 
     def tokens(self, element_id: str) -> tuple[Counter[str], ...]:
@@ -756,6 +894,23 @@ class _UnitTexts:
 # ---------------------------------------------------------------------------------------------------------------
 # An element's fields, read from the text it showed
 # ---------------------------------------------------------------------------------------------------------------
+
+
+def _plain_fields_of(element: DocumentElement, text: str) -> list[str]:
+    """Extract comparable unescaped field strings from ``element``'s rendered ``text``."""
+    if not isinstance(element, _ELEMENT_CLASSES) or not isinstance(text, str):
+        raise TypeError("_plain_fields_of requires DocumentElement and str")
+    no_field_newlines = isinstance(element, Table) or "\n" not in text
+    if (
+        no_field_newlines
+        and "\\" not in text
+        and "<br>" not in text
+        and text.isascii()
+        and "  " not in text
+        and text.replace("\n", "").isprintable()
+    ):
+        return [cell.strip() for cell in _fields(element, text)]
+    return [_comparable(unescape_markdown(each)) for each in _fields(element, text)]
 
 
 def _fields(element: DocumentElement, shown: str) -> tuple[str, ...]:
@@ -865,8 +1020,8 @@ def _literal_entries(lines: list[str]) -> list[str]:
 
 def _header_elements(
     units: Mapping[str, Unit], envelopes: Mapping[str, Envelope]
-) -> dict[tuple[str, str], DocumentElement]:
-    """The header-context element each envelope shows, by ``(doc_id, element_id)``: a unit of its document holds it.
+) -> dict[tuple[str, str], tuple[DocumentElement, str]]:
+    """The header-context element and rendered block each envelope shows, by ``(doc_id, element_id)``.
 
     Raises:
         ValueError: If no unit of its document holds one of them.
@@ -876,11 +1031,11 @@ def _header_elements(
         for unit_id, envelope in envelopes.items()
         for element_id in envelope.header_element_ids
     }
-    found: dict[tuple[str, str], DocumentElement] = {}
+    found: dict[tuple[str, str], tuple[DocumentElement, str]] = {}
     for unit in units.values():
-        for element in unit.elements:
+        for element, block in zip(unit.elements, unit.blocks, strict=True):
             if (unit.doc_id, element.element_id) in wanted:
-                found[(unit.doc_id, element.element_id)] = element
+                found[(unit.doc_id, element.element_id)] = (element, block)
     missing = sorted(wanted - found.keys())
     if missing:
         raise ValueError(f"header-context blocks an envelope shows are the elements of no unit given: {missing}")
@@ -911,6 +1066,18 @@ def _key_checks(spec: ModelSpec) -> tuple[tuple[int, str, _KeyKind], ...]:
     return tuple(checks)
 
 
+@dataclass(frozen=True, slots=True)
+class _PeerWitness:
+    """Pre-tokenized cross-family peer quotes and per-peer-model combined token counters on multimodal units."""
+
+    comparable: tuple[str, ...] = ()
+    plain: tuple[str, ...] = ()
+    model_counters: tuple[Counter[str], ...] = ()
+
+
+_EMPTY_WITNESS = _PeerWitness()
+
+
 def _peer_family_quotes(item: ConsensusItem, model_id: str) -> tuple[str, ...]:
     """Quotes supplied by supporting models from distinct known model families (#473 visual witness)."""
     own_family = item.families.get(model_id, "unknown")
@@ -923,6 +1090,56 @@ def _peer_family_quotes(item: ConsensusItem, model_id: str) -> tuple[str, ...]:
         and item.families.get(peer_id, "unknown") != "unknown"
         and item.families.get(peer_id, "unknown") != own_family
         for quote in item.quotes_by_model[peer_id]
+    )
+
+
+def _build_multimodal_peer_map(
+    item: ConsensusItem,
+) -> dict[str, tuple[tuple[str, ...], tuple[str, ...], Counter[str]]]:
+    """Precompute comparable quotes, plain quotes, and combined token ``Counter`` per known-family supporting model."""
+    if not isinstance(item, ConsensusItem) or not item.model_votes:
+        raise ValueError("_build_multimodal_peer_map requires a ConsensusItem with model_votes")
+    precomputed: dict[str, tuple[tuple[str, ...], tuple[str, ...], Counter[str]]] = {}
+    for peer_id, peer_votes in item.model_votes.items():
+        if not peer_votes or item.families.get(peer_id, "unknown") == "unknown":
+            continue
+        raw_quotes = item.quotes_by_model[peer_id]
+        comp_quotes = tuple(_comparable(pq) for pq in raw_quotes)
+        plain_quotes = tuple(_comparable(unescape_markdown(pq)) for pq in raw_quotes)
+        combined: Counter[str] = Counter()
+        for cq in comp_quotes:
+            combined.update(_tokens(cq))
+        precomputed[peer_id] = (comp_quotes, plain_quotes, combined)
+    return precomputed
+
+
+def _peer_witness_for(
+    item: ConsensusItem,
+    model_id: str,
+    precomputed: Mapping[str, tuple[tuple[str, ...], tuple[str, ...], Counter[str]]],
+) -> _PeerWitness:
+    """Assemble cross-family peer witness quotes and separate per-peer-model token counters for ``model_id``."""
+    if not isinstance(item, ConsensusItem) or not model_id or not isinstance(precomputed, Mapping):
+        raise ValueError("_peer_witness_for requires ConsensusItem, non-empty model_id, and Mapping")
+    own_family = item.families.get(model_id, "unknown")
+    if own_family == "unknown":
+        return _EMPTY_WITNESS
+    comp_list: list[str] = []
+    plain_list: list[str] = []
+    counters: list[Counter[str]] = []
+    for peer_id, (comp_quotes, plain_quotes, combined) in precomputed.items():
+        if item.families.get(peer_id, "unknown") == own_family:
+            continue
+        comp_list.extend(comp_quotes)
+        plain_list.extend(plain_quotes)
+        if combined:
+            counters.append(combined)
+    if not comp_list:
+        return _EMPTY_WITNESS
+    return _PeerWitness(
+        comparable=tuple(comp_list),
+        plain=tuple(plain_list),
+        model_counters=tuple(counters),
     )
 
 
@@ -955,21 +1172,28 @@ def _child_key_specs(
     return tuple(out)
 
 
+def _step_path_values(current: Sequence[object], attr_name: str, is_list: bool) -> list[object]:
+    """Advance one ``(attr_name, is_list)`` step across ``current`` JSON-mode nodes."""
+    if not attr_name or not isinstance(is_list, bool):
+        raise ValueError("_step_path_values requires non-empty attr_name and bool is_list")
+    nxt: list[object] = []
+    for obj in current:
+        if not isinstance(obj, Mapping) or attr_name not in obj or obj[attr_name] is None:
+            continue
+        val = obj[attr_name]
+        if not is_list:
+            nxt.append(val)
+            continue
+        if isinstance(val, Sequence) and not isinstance(val, (str, bytes)):
+            nxt.extend(val)
+    return nxt
+
+
 def _extract_path_values(node: object, steps: tuple[tuple[str, bool], ...]) -> list[object]:
     """Extract scalar key values along ``steps`` from one JSON-mode vote dict."""
     current: list[object] = [node]
     for attr_name, is_list in steps:
-        nxt: list[object] = []
-        for obj in current:
-            if not isinstance(obj, Mapping) or attr_name not in obj or obj[attr_name] is None:
-                continue
-            val = obj[attr_name]
-            if is_list:
-                if isinstance(val, Sequence) and not isinstance(val, (str, bytes)):
-                    nxt.extend(val)
-            else:
-                nxt.append(val)
-        current = nxt
+        current = _step_path_values(current, attr_name, is_list)
     return current
 
 
@@ -986,9 +1210,9 @@ def _extract_two_step_values(
     if len(votes) == 1 and type(votes[0]) is dict and kind == "text":
         rows_fast = votes[0].get(list_attr)
         if type(rows_fast) is list:
-            fast = tuple(r[key_attr] for r in rows_fast if type(r) is dict and type(r.get(key_attr)) is str)
+            fast = [val for r in rows_fast if type(r) is dict and type(val := r.get(key_attr)) is str]
             if len(fast) == len(rows_fast):
-                return fast
+                return tuple(dict.fromkeys(fast))
     vals: list[object] = []
     for vote in votes:
         rows = vote.get(list_attr) if isinstance(vote, Mapping) else None
@@ -1027,6 +1251,7 @@ def _item_reasons(
     """Every supporting model's reasons, in model order (module notes, 4)."""
     norms = root_norms or {}
     has_norm = any(norms.values())
+    peer_map = _build_multimodal_peer_map(item) if texts.multimodal else {}
     found: list[GroundingReason] = []
     seen: dict[tuple[object, ...], list[GroundingReason]] = {}
     for model_id, votes in item.model_votes.items():
@@ -1045,43 +1270,64 @@ def _item_reasons(
         if cached is not None:
             found.extend(replace(reason, model_id=model_id) for reason in cached)
             continue
-        cited = [element_id for element_id in element_ids if texts.citable(element_id)]
-        peer_quotes = _peer_family_quotes(item, model_id) if texts.multimodal and cited else ()
-        own: list[GroundingReason] = []
-        own.extend(_cited_reasons(model_id, element_ids, texts))
-        own.extend(_quote_reasons(model_id, quotes, cited, texts, keyless=not checks, peer_quotes=peer_quotes))
-        own.extend(
-            _key_reasons(
-                model_id,
-                item.key,
-                checks,
-                cited,
-                quotes,
-                texts,
-                peer_quotes=peer_quotes,
-                root_raw=root_sig,
-                root_norms=norms,
-                child_specs=child_specs,
-                child_vals=child_vals,
-            )
+        own = _model_reasons(
+            item, model_id, element_ids, quotes, texts, checks, peer_map, norms, root_sig, child_specs, child_vals
         )
         seen[evidence] = own
         found.extend(own)
     return tuple(found)
 
 
+def _model_reasons(
+    item: ConsensusItem,
+    model_id: str,
+    element_ids: tuple[str, ...],
+    quotes: tuple[str, ...],
+    texts: _UnitTexts,
+    checks: tuple[tuple[int, str, _KeyKind], ...],
+    peer_map: Mapping[str, tuple[tuple[str, ...], tuple[str, ...], Counter[str]]],
+    norms: Mapping[str, str | None],
+    root_sig: tuple[tuple[object, ...], ...],
+    child_specs: tuple[_ChildKeySpec, ...],
+    child_vals: tuple[tuple[object, ...], ...],
+) -> list[GroundingReason]:
+    """Compute cited-element, quote, and key grounding reasons for one supporting ``model_id``."""
+    if not model_id or not isinstance(texts, _UnitTexts):
+        raise ValueError("_model_reasons requires non-empty model_id and _UnitTexts")
+    cited = [element_id for element_id in element_ids if texts.citable(element_id)]
+    witness = _peer_witness_for(item, model_id, peer_map) if texts.multimodal and cited else _EMPTY_WITNESS
+    own = _cited_reasons(model_id, element_ids, texts)
+    own.extend(_quote_reasons(model_id, quotes, cited, texts, keyless=not checks, witness=witness))
+    own.extend(
+        _key_reasons(
+            model_id,
+            item.key,
+            checks,
+            cited,
+            quotes,
+            texts,
+            peer_plain=witness.plain,
+            root_raw=root_sig,
+            root_norms=norms,
+            child_specs=child_specs,
+            child_vals=child_vals,
+        )
+    )
+    return own
+
+
 def _cited_reasons(model_id: str, element_ids: tuple[str, ...], texts: _UnitTexts) -> list[GroundingReason]:
     """One model's reasons about the ids it cites (module notes, 1): each unknown id, then ``header_only``."""
     if not element_ids:
-        return [GroundingReason("no_element_ids", model_id)]
+        return [GroundingReason._trusted("no_element_ids", model_id)]
     found = [
-        GroundingReason("unknown_element", model_id, index=index, text=element_id)
+        GroundingReason._trusted("unknown_element", model_id, index=index, text=element_id)
         for index, element_id in enumerate(element_ids)
         if not texts.citable(element_id)
     ]
     citable = [element_id for element_id in element_ids if texts.citable(element_id)]
     if citable and not any(texts.own(element_id) for element_id in citable):
-        found.append(GroundingReason("header_only", model_id))
+        found.append(GroundingReason._trusted("header_only", model_id))
     return found
 
 
@@ -1092,21 +1338,20 @@ def _quote_reasons(
     texts: _UnitTexts,
     *,
     keyless: bool,
-    peer_quotes: tuple[str, ...] = (),
+    witness: _PeerWitness = _EMPTY_WITNESS,
 ) -> list[GroundingReason]:
     """One model's reasons about its quotes (module notes, 2): each must lie within one element it cited; when no
     key is checked (``keyless``), one of them must hold :data:`QUOTE_MIN_TOKENS` tokens."""
     if not quotes:
-        return [GroundingReason("no_quotes", model_id)]
+        return [GroundingReason._trusted("no_quotes", model_id)]
     comparable = [_comparable(quote) for quote in quotes]
-    peer_comp = tuple(_comparable(pq) for pq in peer_quotes) if peer_quotes else ()
     found = [
-        GroundingReason("quote_not_found", model_id, index=index, text=quote)
+        GroundingReason._trusted("quote_not_found", model_id, index=index, text=quote)
         for index, quote in enumerate(quotes)
-        if not _quote_found(comparable[index], cited, texts, peer_comp)
+        if not _quote_found(comparable[index], cited, texts, witness)
     ]
     if keyless and all(_length(quote) < QUOTE_MIN_TOKENS for quote in comparable):
-        found.append(GroundingReason("quote_too_short", model_id))
+        found.append(GroundingReason._trusted("quote_too_short", model_id))
     return found
 
 
@@ -1120,7 +1365,12 @@ def _length(quote: str) -> int:
     )
 
 
-def _quote_found(quote: str, cited: list[str], texts: _UnitTexts, peer_comp: tuple[str, ...] = ()) -> bool:
+def _quote_found(
+    quote: str,
+    cited: list[str],
+    texts: _UnitTexts,
+    witness: _PeerWitness = _EMPTY_WITNESS,
+) -> bool:
     """Whether the comparable ``quote`` lies within the text of one of the ``cited`` elements (module notes, 2).
 
     In one of them on a vision page, a token containment of at least :data:`VISION_CONTAINMENT` counts too.
@@ -1137,9 +1387,11 @@ def _quote_found(quote: str, cited: list[str], texts: _UnitTexts, peer_comp: tup
         _containment(wanted, held) >= VISION_CONTAINMENT for element_id in lenient for held in texts.tokens(element_id)
     ):
         return True
-    if not peer_comp:
+    if not witness.comparable:
         return False
-    return any(quote in pq or _containment(wanted, _tokens(pq)) >= VISION_CONTAINMENT for pq in peer_comp)
+    if any(quote in pq for pq in witness.comparable):
+        return True
+    return any(_containment(wanted, counter) >= VISION_CONTAINMENT for counter in witness.model_counters)
 
 
 def _valid_code_gap(gap: str) -> bool:
@@ -1160,22 +1412,65 @@ def _code_edge_glued(text: str, start: int, end: int) -> bool:
     return end + 2 < len(text) and text[end + 1] in "-_" and text[end + 2] in _ASCII_ALNUM
 
 
+def _index_alnum_field(text: str) -> tuple[str, str, "array[int]"]:
+    """Build ``(text, upper_non_punct, source_indices)`` for boundary-safe ``alnum_upper`` lookup."""
+    if not isinstance(text, str):
+        raise TypeError(f"text must be a str, got {type(text).__name__}")
+    if not text:
+        return "", "", array("I")
+    indices = array("I")
+    chars: list[str] = []
+    if text.isascii():
+        for idx, ch in enumerate(text.upper()):
+            if ch not in _ASCII_PUNCT_CHARS:
+                indices.append(idx)
+                chars.append(ch)
+        return text, "".join(chars), indices
+    for idx, ch in enumerate(text):
+        if ch in _ASCII_PUNCT_CHARS:
+            continue
+        for uch in ch.upper():
+            indices.append(idx)
+            chars.append(uch)
+    return text, "".join(chars), indices
+
+
+def _whole_alnum_token(entry: tuple[str, str, "array[int]"]) -> str | None:
+    """Return ``joined`` when the entire field ``entry`` forms one valid unglued code token, else ``None``."""
+    if not isinstance(entry, tuple) or len(entry) != 3:
+        raise TypeError("entry must be a (text, joined, indices) 3-tuple")
+    text, joined, indices = entry
+    if not joined or _code_edge_glued(text, indices[0], indices[-1]):
+        return None
+    if not all(_valid_code_gap(text[indices[k] + 1 : indices[k + 1]]) for k in range(len(indices) - 1)):
+        return None
+    return joined
+
+
+def _match_alnum_entry(target: str, entry: tuple[str, str, "array[int]"]) -> bool:
+    """Whether non-empty ``target`` (already ``alnum_upper_text``) matches pre-indexed ``entry``."""
+    if not isinstance(target, str) or not isinstance(entry, tuple) or len(entry) != 3:
+        raise TypeError("_match_alnum_entry requires str target and 3-tuple entry")
+    if not target:
+        return False
+    text, joined, indices = entry
+    klen = len(target)
+    pos = joined.find(target)
+    while pos >= 0:
+        start_idx, end_idx = indices[pos], indices[pos + klen - 1]
+        gaps_ok = all(_valid_code_gap(text[indices[k] + 1 : indices[k + 1]]) for k in range(pos, pos + klen - 1))
+        if gaps_ok and not _code_edge_glued(text, start_idx, end_idx):
+            return True
+        pos = joined.find(target, pos + 1)
+    return False
+
+
 def _set_off_alnum_upper(wanted: str, text: str) -> bool:
     """Boundary-safe ``alnum_upper`` match against code tokens in ``text``."""
     target = alnum_upper_text(wanted)
     if not target:
         return False
-    kept = [(idx, uch) for idx, ch in enumerate(text) if ch not in _ASCII_PUNCT_CHARS for uch in ch.upper()]
-    joined = "".join(ch for _, ch in kept)
-    klen = len(target)
-    pos = joined.find(target)
-    while pos >= 0:
-        start_idx, end_idx = kept[pos][0], kept[pos + klen - 1][0]
-        gaps_ok = all(_valid_code_gap(text[kept[k][0] + 1 : kept[k + 1][0]]) for k in range(pos, pos + klen - 1))
-        if gaps_ok and not _code_edge_glued(text, start_idx, end_idx):
-            return True
-        pos = joined.find(target, pos + 1)
-    return False
+    return _match_alnum_entry(target, _index_alnum_field(_comparable(text)))
 
 
 def _key_reasons(
@@ -1186,7 +1481,7 @@ def _key_reasons(
     quotes: tuple[str, ...],
     texts: _UnitTexts,
     *,
-    peer_quotes: tuple[str, ...] = (),
+    peer_plain: tuple[str, ...] = (),
     root_raw: tuple[tuple[object, ...], ...] = (),
     root_norms: Mapping[str, str | None] | None = None,
     child_specs: tuple[_ChildKeySpec, ...] = (),
@@ -1197,21 +1492,25 @@ def _key_reasons(
         return []
     norms = root_norms or {}
     read = tuple(_comparable(unescape_markdown(quote)) for quote in quotes)
-    peer_plain = tuple(_comparable(unescape_markdown(pq)) for pq in peer_quotes) if peer_quotes else ()
     has_num = any(kind == "number" for *_, kind in checks) or any(kind == "number" for _, _, kind, _ in child_specs)
-    peer_numbers = frozenset().union(*map(numeric_values, peer_plain)) if has_num and peer_plain else None
+    peer_numbers: frozenset[Decimal] | None = None
+    if has_num and peer_plain:
+        acc: set[Decimal] = set()
+        for pq in peer_plain:
+            _add_numbers(acc, pq)
+        peer_numbers = frozenset(acc)
     quote_num_cache: list[frozenset[Decimal] | None] = [None] * len(read)
     found: list[GroundingReason] = []
     for idx, (position, name, kind) in enumerate(checks):
         norm = norms.get(name)
         raw_vals = root_raw[idx] if idx < len(root_raw) and root_raw[idx] else (key[position],)
         if not all(_key_found(val, kind, cited, texts, peer_plain, peer_numbers, norm) for val in raw_vals):
-            found.append(GroundingReason("key_not_found", model_id, key_field=name))
+            found.append(GroundingReason._trusted("key_not_found", model_id, key_field=name))
         if quotes and not all(_key_quoted(val, kind, read, quote_num_cache, norm) for val in raw_vals):
-            found.append(GroundingReason("key_not_quoted", model_id, key_field=name))
+            found.append(GroundingReason._trusted("key_not_quoted", model_id, key_field=name))
     for (_, dotted, kind, norm), c_vals in zip(child_specs, child_vals, strict=True):
         if c_vals and not all(_key_found(val, kind, cited, texts, peer_plain, peer_numbers, norm) for val in c_vals):
-            found.append(GroundingReason("key_not_found", model_id, key_field=dotted))
+            found.append(GroundingReason._trusted("key_not_found", model_id, key_field=dotted))
     return found
 
 
@@ -1241,7 +1540,28 @@ def _key_quoted(
         return False
     if any(_set_off(wanted, text) for text in read):
         return True
-    return normalizer == "alnum_upper" and any(_set_off_alnum_upper(wanted, text) for text in read)
+    if normalizer != "alnum_upper":
+        return False
+    target = alnum_upper_text(wanted)
+    return bool(target) and any(_match_alnum_entry(target, _index_alnum_field(text)) for text in read)
+
+
+def _text_key_in_element(wanted: str, element_id: str, texts: _UnitTexts) -> bool:
+    """Whether ``wanted`` matches ``element_id`` by O(1) whole-field set lookup or ``_set_off``."""
+    if not wanted or not element_id:
+        raise ValueError("_text_key_in_element requires non-empty wanted and element_id")
+    if wanted in texts.plain_set(element_id):
+        return True
+    return any(_set_off(wanted, text) for text in texts.plain(element_id))
+
+
+def _alnum_key_in_element(target: str, element_id: str, texts: _UnitTexts) -> bool:
+    """Whether ``alnum_upper`` ``target`` matches ``element_id`` via whole-cell set or indexed scan."""
+    if not target or not element_id:
+        raise ValueError("_alnum_key_in_element requires non-empty target and element_id")
+    if target in texts.alnum_upper_set(element_id):
+        return True
+    return any(_match_alnum_entry(target, entry) for entry in texts.alnum_upper_entries(element_id))
 
 
 def _key_found(
@@ -1261,19 +1581,14 @@ def _key_found(
     wanted = _comparable(cast(str, value))
     if not wanted:
         return False
-    if any(wanted in texts.plain_set(element_id) for element_id in cited):
+    if any(_text_key_in_element(wanted, element_id, texts) for element_id in cited):
         return True
-    if any(_set_off(wanted, text) for element_id in cited for text in texts.plain(element_id)):
-        return True
-    if normalizer == "alnum_upper" and any(
-        _set_off_alnum_upper(wanted, text) for element_id in cited for text in texts.plain(element_id)
-    ):
+    target = alnum_upper_text(wanted) if normalizer == "alnum_upper" else ""
+    if target and any(_alnum_key_in_element(target, element_id, texts) for element_id in cited):
         return True
     if peer_plain and any(_set_off(wanted, pq) for pq in peer_plain):
         return True
-    return (
-        bool(peer_plain) and normalizer == "alnum_upper" and any(_set_off_alnum_upper(wanted, pq) for pq in peer_plain)
-    )
+    return bool(peer_plain and target) and any(_match_alnum_entry(target, _index_alnum_field(pq)) for pq in peer_plain)
 
 
 def _set_off(wanted: str, text: str) -> bool:

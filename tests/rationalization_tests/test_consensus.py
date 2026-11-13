@@ -31,7 +31,7 @@ from pydantic import (
 from pydantic.alias_generators import to_camel
 
 from datagrunt.pdf.elements import Paragraph, PDFDocument, Table, make_element_id
-from datagrunt.rationalization import Key, RationalizationError
+from datagrunt.rationalization import Informational, Key, RationalizationError
 from datagrunt.rationalization import consensus as consensus_module
 from datagrunt.rationalization.consensus import (
     CONSENSUS_STATUSES,
@@ -2725,7 +2725,7 @@ MEDIAN_LATENCY_S = 2.0
 """A realistic median latency of one structured-output request."""
 CONCURRENCY = 8
 """rationalize()'s default max_concurrency."""
-BLEND_SHARE = 0.01
+BLEND_SHARE = 0.007
 """The share of a run's wall time validation, consensus and grounding may take."""
 RECORDS_PER_UNIT = 10
 CHILDREN_PER_RECORD = 5
@@ -2926,11 +2926,11 @@ class TestBenchmarkGate:
     def test_blending_takes_at_most_one_percent_of_the_runs_wall_time(self):
         run = realistic_run(1_000)
         requests = len(run.outcome.responses)
-        budget_s = requests * MEDIAN_LATENCY_S / CONCURRENCY * BLEND_SHARE  # 2,000 x 2.0 s / 8 x 1% = 5 s
+        budget_s = requests * MEDIAN_LATENCY_S / CONCURRENCY * BLEND_SHARE  # 2,000 x 2.0 s / 8 x 0.7% = 3.5 s
 
         elapsed, consensus, grounded = best_blend_time(run)
 
-        assert requests == 2_000 and budget_s == pytest.approx(5.0)
+        assert requests == 2_000 and budget_s == pytest.approx(3.5)
         statuses = [found.status for found in consensus.items]
         assert len(statuses) == 10_000
         assert statuses.count("field_disagreement") == 1_000
@@ -3165,8 +3165,6 @@ class TestNormalizedText:
 
 class TestNode4Consensus:
     def test_alnum_upper_key_and_informational_field_reach_consensus_without_dropping_row(self):
-        from datagrunt.rationalization import Informational
-
         class PriceRow(BaseModel):
             part_number: Annotated[str, Key(normalizer="alnum_upper")]
             description: Annotated[str | None, Informational] = None
@@ -3193,8 +3191,6 @@ class TestNode4Consensus:
         )
 
     def test_unkeyed_multi_clause_records_pair_deterministically_across_models(self):
-        from datagrunt.rationalization import Informational
-
         class WarrantyClause(BaseModel):
             category: str
             months: int
@@ -3240,3 +3236,180 @@ class TestNode4Consensus:
         }
         res = blend(responses, schema=clause_schema)
         assert [item.status for item in res.items] == ["unmatched"] * 4
+
+
+class SerializeAliasChild(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, validate_by_name=True, serialize_by_alias=True)
+    part_number: Annotated[str, Key]
+    unit_count: int = 1
+
+
+class SerializeAliasOrder(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, validate_by_name=True, serialize_by_alias=True)
+    order_id: Annotated[str, Key(normalizer="alnum_upper")]
+    line_items: list[SerializeAliasChild] = []
+
+
+class InfoStep(BaseModel):
+    action: str
+    minutes: int
+    note: Annotated[str, Informational] = ""
+
+
+class InfoRecipe(BaseModel):
+    recipe_id: Annotated[str, Key]
+    steps: list[InfoStep] = []
+
+
+class InfoSubRecipe(BaseModel):
+    steps: list[InfoStep] = []
+
+
+class OptionalRecipeHolder(BaseModel):
+    holder_id: Annotated[str, Key]
+    sub: InfoSubRecipe | None = None
+
+
+class TestWave2AConsensusRegressions:
+    def test_serialize_by_alias_model_votes_keep_attribute_names_and_ground_child_keys(self):
+        schema = prepare(SerializeAliasOrder)
+        doc = PDFDocument(
+            metadata=metadata(1),
+            pages=(page(1, (Paragraph(**ids(1, 0), text="Order ORD-100: PN-10 qty 2"),)),),
+        )
+        plan = build_units(doc, max_unit_chars=10_000, render=render_element)
+        envs = build_envelopes(plan.units, doc, prompt="Extract.", context=None, schema_json=schema.wrapper_json)
+        uid = plan.units[0].unit_id
+        bad = {
+            "orderId": "ORD-100",
+            "lineItems": [{"partNumber": "PN-10", "unitCount": 2}, {"partNumber": "PN-999", "unitCount": 1}],
+        }
+        payload = entry(bad, ("Order ORD-100: PN-10 qty 2",), ("p0001_e000",))
+        run_out = outcome(
+            {(uid, GOOGLE[0]): raw({"records": [payload]}), (uid, ANTHROPIC[0]): raw({"records": [payload]})},
+            PAIR,
+        )
+        cons = build_consensus(run_out, schema, (uid,), min_families=2)
+        vote_dict = cons.items[0].model_votes[GOOGLE[0]][0]
+        assert "order_id" in vote_dict and "line_items" in vote_dict
+        assert "part_number" in vote_dict["line_items"][0]
+        grounded_res = ground(
+            cons,
+            outcome=run_out,
+            units={uid: plan.units[0]},
+            envelopes={uid: envs[0]},
+            documents={doc.metadata.doc_id: doc},
+            schema=schema,
+        )
+        assert grounded_res.items[0].status == "ungrounded_value"
+        assert any(
+            r.reason == "key_not_found" and r.key_field == "line_items.part_number"
+            for r in grounded_res.items[0].reasons
+        )
+
+    def test_normalized_text_multi_word_ascii_fast_path_and_control_whitespace(self):
+        clean = "Assembly A-100: Main Pump, lot 1,000"
+        assert consensus_module.normalized_text(clean) is clean
+        assert consensus_module.normalized_text("") == ""
+        assert consensus_module.normalized_text("   ") == ""
+        assert consensus_module.normalized_text("  hello   world  ") == "hello world"
+        assert consensus_module.normalized_text("hello\tworld\nfoo\rbar") == "hello world foo bar"
+
+    def test_public_validate_response_isolates_wire_from_response_content(self):
+        class RequiredRoot(BaseModel):
+            code: Annotated[str, Key]
+            tags: list[str]
+            items: list[Component]
+
+        req_schema = prepare(RequiredRoot)
+        assert not req_schema.spec.has_unshown_droppable
+        assert req_schema.is_pure_pydantic
+        resp = answer({"code": "R-1", "tags": ["a"], "items": [{"part_number": "PN-1", "quantity": 2}]})
+        (valid,) = validate(resp, req_schema).records
+        valid.wire["code"] = "MUTATED"
+        valid.wire["tags"].append("MUTATED")
+        valid.wire["items"][0]["part_number"] = "MUTATED"
+        assert resp.content == {
+            "records": [
+                {
+                    "record": {"code": "R-1", "tags": ["a"], "items": [{"part_number": "PN-1", "quantity": 2}]},
+                    "grounding_quotes": ["a quote"],
+                    "source_element_ids": ["p0001_e001"],
+                }
+            ]
+        }
+
+    def test_informational_in_unkeyed_child_model_agrees_unless_covered_by_must_agree(self):
+        schema = prepare(InfoRecipe)
+        r_g = {"recipe_id": "R-1", "steps": [{"action": "Boil", "minutes": 5, "note": "uncovered pot"}]}
+        r_a = {"recipe_id": "R-1", "steps": [{"action": "Boil", "minutes": 5, "note": "uncovered"}]}
+        r_o = {"recipe_id": "R-1", "steps": [{"action": "Boil", "minutes": 5, "note": "covered lid"}]}
+        agreed = only(blend({(U1, GOOGLE): answer(r_g), (U1, ANTHROPIC): answer(r_a)}, schema=schema))
+        assert (agreed.status, agreed.disputed_fields) == ("consensus", ())
+        assert agreed.record == InfoRecipe(
+            recipe_id="R-1",
+            steps=[InfoStep(action="Boil", minutes=5, note="uncovered pot")],
+        )
+
+        three_note = {(U1, GOOGLE): answer(r_g), (U1, ANTHROPIC): answer(r_g), (U1, OPENAI): answer(r_o)}
+        disputed_note = only(blend(three_note, THREE, schema=schema, must_agree=("steps.note",)))
+        assert (disputed_note.status, disputed_note.disputed_fields) == ("field_disagreement", ("steps[0]",))
+
+        r_simmer = {"recipe_id": "R-1", "steps": [{"action": "Simmer", "minutes": 5, "note": "covered"}]}
+        simmer_votes = {(U1, GOOGLE): answer(r_g), (U1, ANTHROPIC): answer(r_a), (U1, OPENAI): answer(r_simmer)}
+        ok_min = only(blend(simmer_votes, THREE, schema=schema, must_agree=("steps.minutes",)))
+        assert (ok_min.status, ok_min.disputed_fields) == ("consensus", ())
+
+        r_bad_min = {"recipe_id": "R-1", "steps": [{"action": "Boil", "minutes": 6, "note": "uncovered pot"}]}
+        bad_min_votes = {(U1, GOOGLE): answer(r_g), (U1, ANTHROPIC): answer(r_a), (U1, OPENAI): answer(r_bad_min)}
+        bad_min = only(blend(bad_min_votes, THREE, schema=schema, must_agree=("steps.minutes",)))
+        assert (bad_min.status, bad_min.disputed_fields) == ("field_disagreement", ("steps[0]",))
+
+    def test_unkeyed_multi_inverted_index_preserves_tie_breaking_and_empty_records(self):
+        class OptRow(BaseModel):
+            tag: str | None = None
+            detail: str | None = None
+
+        opt_schema = prepare(OptRow)
+        empty_res = blend(
+            {(U1, GOOGLE): answer({}, {"tag": "only_g"}), (U1, ANTHROPIC): answer({"tag": "only_a"}, {})},
+            schema=opt_schema,
+        )
+        assert [it.status for it in empty_res.items] == ["consensus", "unmatched", "unmatched"]
+        assert empty_res.items[0].record == OptRow()
+
+        tie_res = blend(
+            {
+                (U1, GOOGLE): answer({"tag": "alpha", "detail": "one two"}, {"tag": "alpha", "detail": "one three"}),
+                (U1, ANTHROPIC): answer({"tag": "alpha", "detail": "one four"}, {"tag": "beta", "detail": "nine"}),
+            },
+            schema=opt_schema,
+        )
+        assert [it.status for it in tie_res.items] == ["field_disagreement", "unmatched", "unmatched"]
+        assert tie_res.items[0].model_votes[GOOGLE[0]][0]["detail"] == "one two"
+
+    def test_optional_submodel_unkeyed_list_must_agree_and_deep_max_depth_path(self, monkeypatch):
+        holder_schema = prepare(OptionalRecipeHolder)
+        with_sub = {"holder_id": "H-1", "sub": {"steps": [{"action": "Boil", "minutes": 5}]}}
+        without_sub = {"holder_id": "H-1", "sub": None}
+        votes = {(U1, GOOGLE): answer(with_sub), (U1, ANTHROPIC): answer(with_sub), (U1, OPENAI): answer(without_sub)}
+        found = only(blend(votes, THREE, schema=holder_schema, must_agree=("sub.steps.minutes",)))
+        assert found.status == "field_disagreement"
+        assert found.disputed_fields == ("sub.steps",)
+
+        class LeafModel(BaseModel):
+            val: int = 1
+
+        class MidModel(BaseModel):
+            leaf: LeafModel = LeafModel()
+
+        class RootDeep(BaseModel):
+            code: Annotated[str, Key]
+            mid: MidModel = MidModel()
+
+        deep_schema = prepare(RootDeep)
+        inst = RootDeep(code="D-1")
+        monkeypatch.setattr(consensus_module, "MAX_DEPTH", 2)
+        comp = consensus_module._Comparison(voters=2, quorum=None)
+        with pytest.raises(RationalizationError, match=r"^mid\.leaf: nesting is deeper than 2 levels$"):
+            comp.compare_model(deep_schema.spec, "", "", [(0, inst, {}), (1, inst, {})], 1)

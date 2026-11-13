@@ -217,8 +217,11 @@ _REBUILT = -1  # the entry index of a rebuilt record, compared with the records 
 _LIST_KINDS = frozenset({"scalar_list", "model_list"})
 _CLEAN_STATUSES = ("consensus", "single_model")
 _WRAPPER_SHAPE = '{"records": [...]}'
+_WRAPPER_KEYS_SET = frozenset({"records"})
 _ENTRY_KEYS = ("grounding_quotes", "record", "source_element_ids")
+_ENTRY_KEYS_SET = frozenset(_ENTRY_KEYS)
 _ENTRY_SHAPE = '{"record": {...}, "grounding_quotes": [str, ...], "source_element_ids": [str, ...]}'
+_FLOAT_FMT = f".{FLOAT_SIGNIFICANT_DIGITS}g"
 _V = TypeVar("_V")
 
 
@@ -394,6 +397,27 @@ class ValidRecord:
         if self.position < 0:
             raise ValueError(f"position must be >= 0, got {self.position}")
 
+    @classmethod
+    def _trusted(
+        cls,
+        *,
+        record: BaseModel,
+        grounding_quotes: tuple[str, ...],
+        source_element_ids: tuple[str, ...],
+        position: int,
+        wire: dict[str, Any],
+    ) -> "ValidRecord":
+        """Construct an internal :class:`ValidRecord` from pre-checked wrapper parts."""
+        if not isinstance(record, BaseModel) or not isinstance(wire, dict):
+            raise TypeError("ValidRecord._trusted requires a BaseModel record and dict wire")
+        self = object.__new__(cls)
+        object.__setattr__(self, "record", record)
+        object.__setattr__(self, "grounding_quotes", grounding_quotes)
+        object.__setattr__(self, "source_element_ids", source_element_ids)
+        object.__setattr__(self, "position", position)
+        object.__setattr__(self, "wire", wire)
+        return self
+
 
 @dataclass(frozen=True, slots=True)
 class ValidatedResponse:
@@ -492,6 +516,37 @@ class ConsensusItem:
         if self.status == "unmatched" and counts != [0] * (len(counts) - 1) + [1]:
             raise ValueError("an unmatched item holds exactly one record")
 
+    @classmethod
+    def _trusted(
+        cls,
+        *,
+        unit_id: str,
+        status: ConsensusStatus,
+        key: tuple[object, ...],
+        record: BaseModel | None,
+        disputed_fields: tuple[str, ...],
+        notes: tuple[str, ...],
+        model_votes: Mapping[str, tuple[Mapping[str, Any], ...]],
+        quotes_by_model: Mapping[str, tuple[str, ...]],
+        element_ids_by_model: Mapping[str, tuple[str, ...]],
+        families: Mapping[str, str],
+    ) -> "ConsensusItem":
+        """Construct an internal :class:`ConsensusItem` from read-only per-model mappings."""
+        if not unit_id or not isinstance(key, tuple):
+            raise ValueError("ConsensusItem._trusted requires non-empty unit_id and tuple key")
+        self = object.__new__(cls)
+        object.__setattr__(self, "unit_id", unit_id)
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "key", key)
+        object.__setattr__(self, "record", record)
+        object.__setattr__(self, "disputed_fields", disputed_fields)
+        object.__setattr__(self, "notes", notes)
+        object.__setattr__(self, "model_votes", model_votes)
+        object.__setattr__(self, "quotes_by_model", quotes_by_model)
+        object.__setattr__(self, "element_ids_by_model", element_ids_by_model)
+        object.__setattr__(self, "families", families)
+        return self
+
 
 @dataclass(frozen=True, slots=True)
 class ConsensusResult:
@@ -507,6 +562,16 @@ class ConsensusResult:
     def __post_init__(self) -> None:
         _check_tuple_of("items", self.items, ConsensusItem)
         _check_tuple_of("quarantined", self.quarantined, QuarantinedItem)
+
+    @classmethod
+    def _trusted(cls, items: tuple[ConsensusItem, ...], quarantined: tuple[QuarantinedItem, ...]) -> "ConsensusResult":
+        """Construct an internal :class:`ConsensusResult` from verified item and quarantine tuples."""
+        if not isinstance(items, tuple) or not isinstance(quarantined, tuple):
+            raise TypeError("ConsensusResult._trusted requires item and quarantine tuples")
+        self = object.__new__(cls)
+        object.__setattr__(self, "items", items)
+        object.__setattr__(self, "quarantined", quarantined)
+        return self
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -561,8 +626,10 @@ def normalized_text(value: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"value must be a str, got {type(value).__name__}")
     if value.isascii():
-        if " " not in value and value.isprintable():
+        if value.isprintable() and (not value or (value[0] != " " and value[-1] != " " and "  " not in value)):
             return value
+        return " ".join(value.split())
+    if unicodedata.is_normalized("NFC", value):
         return " ".join(value.split())
     return " ".join(unicodedata.normalize("NFC", value).split())
 
@@ -630,14 +697,30 @@ def validate_response(
     if not isinstance(schema, PreparedSchema):
         raise TypeError(f"schema must be a PreparedSchema, got {type(schema).__name__}")
     origin = _Origin(model_id=_check_text("model_id", model_id), unit_id=_check_text("unit_id", unit_id))
+    quarantine: list[QuarantinedItem] = []
+    records = _validate_response_records(response, schema, origin, quarantine, isolate_wire=True)
+    return ValidatedResponse(records=records, quarantined=tuple(quarantine))
+
+
+def _validate_response_records(
+    response: ProviderResponse,
+    schema: PreparedSchema,
+    origin: "_Origin",
+    quarantine: list[QuarantinedItem],
+    *,
+    isolate_wire: bool,
+) -> tuple[ValidRecord, ...]:
+    """Validate ``response`` into valid records and append quarantined items to ``quarantine``."""
+    if not isinstance(response, ProviderResponse) or not isinstance(schema, PreparedSchema):
+        raise TypeError("response and schema must be ProviderResponse and PreparedSchema")
     if response.finish != "complete":
-        return ValidatedResponse(records=(), quarantined=(_finish_item(origin, response),))
+        quarantine.append(_finish_item(origin, response))
+        return ()
     entries = _wrapper_entries(response)
     if isinstance(entries, str):
-        item = origin.item("unparseable", _response_text(response), entries)
-        return ValidatedResponse(records=(), quarantined=(item,))
+        quarantine.append(origin.item("unparseable", _response_text(response), entries))
+        return ()
     records: list[ValidRecord] = []
-    quarantine: list[QuarantinedItem] = []
     for position, entry in enumerate(entries):
         parts = _entry_parts(entry)
         if isinstance(parts, str):
@@ -645,17 +728,17 @@ def validate_response(
             quarantine.append(origin.item("unparseable", _json_text(entry), message, _cited_ids(entry)))
             continue
         record, quotes, ids = parts
-        checked = _validate_record(record, schema)
+        checked = _validate_record(record, schema, isolate_wire=isolate_wire)
         if isinstance(checked, str):
-            message = f"records[{position}]: {checked}"
-            quarantine.append(origin.item("validation", _json_text(record), message, ids))
+            quarantine.append(origin.item("validation", _json_text(record), f"records[{position}]: {checked}", ids))
             continue
         instance, wire = checked
-        valid = ValidRecord(
-            record=instance, grounding_quotes=quotes, source_element_ids=ids, position=position, wire=wire
+        records.append(
+            ValidRecord._trusted(
+                record=instance, grounding_quotes=quotes, source_element_ids=ids, position=position, wire=wire
+            )
         )
-        records.append(valid)
-    return ValidatedResponse(records=tuple(records), quarantined=tuple(quarantine))
+    return tuple(records)
 
 
 def build_consensus(
@@ -695,7 +778,7 @@ def build_consensus(
     for unit_id in units:
         votes = _unit_votes(outcome, context, unit_id, quarantine)
         items.extend(_unit_items(unit_id, votes, context))
-    return ConsensusResult(items=tuple(items), quarantined=tuple(quarantine))
+    return ConsensusResult._trusted(items=tuple(items), quarantined=tuple(quarantine))
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -754,9 +837,8 @@ def _wrapper_entries(response: ProviderResponse) -> list[object] | str:
     content = response.content
     if content is None:
         return "the response holds no JSON object (it did not parse)"
-    keys = sorted(content)
-    if keys != ["records"]:
-        return f"the response is not the wrapper {_WRAPPER_SHAPE}: its keys are {_brief(keys)}"
+    if content.keys() != _WRAPPER_KEYS_SET:
+        return f"the response is not the wrapper {_WRAPPER_SHAPE}: its keys are {_brief(sorted(content))}"
     entries = content["records"]
     if not isinstance(entries, list):
         return f'the response is not the wrapper {_WRAPPER_SHAPE}: "records" is a {_json_kind(entries)}'
@@ -767,9 +849,8 @@ def _entry_parts(entry: object) -> tuple[dict[str, Any], tuple[str, ...], tuple[
     """A wrapper entry's record, quotes and element ids, or why it is not an entry."""
     if not isinstance(entry, dict):
         return f"it is a {_json_kind(entry)}"
-    keys = sorted(entry)
-    if keys != list(_ENTRY_KEYS):
-        return f"its keys are {_brief(keys)}"
+    if entry.keys() != _ENTRY_KEYS_SET:
+        return f"its keys are {_brief(sorted(entry))}"
     record = entry["record"]
     if not isinstance(record, dict):
         return f'"record" is a {_json_kind(record)}'
@@ -812,21 +893,26 @@ def _json_kind(value: object) -> str:
     return "array" if isinstance(value, list) else "object"
 
 
-def _validate_record(record: dict[str, Any], schema: PreparedSchema) -> tuple[BaseModel, dict[str, Any]] | str:
+def _validate_record(
+    record: dict[str, Any],
+    schema: PreparedSchema,
+    *,
+    isolate_wire: bool = True,
+) -> tuple[BaseModel, dict[str, Any]] | str:
     """The validated instance of ``record`` and what it was validated from, or why it is not one (module notes, 2-3)."""
-    wire = _drop_unshown(record, schema.spec)
+    wire = _drop_unshown(record, schema.spec) if isolate_wire else _drop_unshown_cow(record, schema.spec)
     checked = _validated(wire, schema)
     return checked if isinstance(checked, str) else (checked, wire)
 
 
 def _validated(wire: object, schema: PreparedSchema) -> BaseModel | str:
-    """``model_validate`` of a copy of ``wire``, checked like any record (module notes, 1 and 3), or why it is not one.
+    """``model_validate`` of ``wire``, checked like any record (module notes, 1 and 3), or why it is not one.
 
     Every record goes through it once: each model's as it sent it, and a merged one rebuilt (module notes, 8). A
     validator may change what it is given in place (pydantic hands a ``mode="before"`` validator the very dict),
-    so it is given a copy, and ``wire`` stays what the models sent.
+    so non-pure schemas get a deep copy and ``wire`` stays what the models sent.
     """
-    given = _json_copy(wire)
+    given = wire if schema.is_pure_pydantic else _json_copy(wire)
     try:
         instance = schema.model.model_validate(given)
     except ValidationError as error:
@@ -869,55 +955,72 @@ def _loc_text(loc: tuple[int | str, ...]) -> str:
 
 
 def _drop_unshown(record: dict[str, Any], spec: ModelSpec) -> dict[str, Any]:
-    """A copy of ``record`` without the nulls that mean "not shown" (module notes, 2), its child records likewise.
-
-    Only the objects on the way to a child record are copied, so the input is never changed. The walk follows the
-    spec, so it goes no deeper than the spec, and visits each child record of the input once.
-    """
-    root = dict(record)
-    stack: list[tuple[dict[str, Any], ModelSpec]] = [(root, spec)]
-    while stack:
-        node, node_spec = stack.pop()
-        stack.extend(_drop_in_node(node, node_spec))
-    return root
+    """An isolated copy of ``record`` without the nulls that mean "not shown" (module notes, 2)."""
+    cleaned = _drop_unshown_cow(record, spec)
+    copied: dict[str, Any] = _json_copy(cleaned)
+    return copied
 
 
-def _drop_in_node(node: dict[str, Any], spec: ModelSpec) -> list[tuple[dict[str, Any], ModelSpec]]:
-    """Drop one record object's unshown nulls, under each name its model reads; return its child records."""
-    by_name = _reads_by_name(spec.model)
-    children: list[tuple[dict[str, Any], ModelSpec]] = []
+def _drop_unshown_cow(record: dict[str, Any], spec: ModelSpec, depth: int = 1) -> dict[str, Any]:
+    """Return ``record`` without unshown nulls, copying containers only along mutated paths."""
+    if not isinstance(record, dict):
+        raise TypeError(f"record must be a dict, got {type(record).__name__}")
+    if depth > MAX_DEPTH:
+        raise RationalizationError(f"{spec.model.__name__}: nesting is deeper than {MAX_DEPTH} levels")
+    if not spec.has_unshown_droppable:
+        return record
+    copied: dict[str, Any] | None = None
+    by_name = spec.reads_by_name
     for field_spec in spec.fields:
-        if not by_name or field_spec.wire_name == field_spec.name:
-            names: tuple[str, ...] = (field_spec.wire_name,)
-        elif field_spec.wire_name < field_spec.name:
-            names = (field_spec.wire_name, field_spec.name)
-        else:
-            names = (field_spec.name, field_spec.wire_name)
-        for name in names:
-            value = node.get(name, _ABSENT)
-            if value is None and not field_spec.optional and not field_spec.required:
-                del node[name]
-            elif field_spec.child is not None:
-                children.extend(_copied_children(node, name, field_spec, value))
-    return children
+        copied = _drop_key_cow(record, copied, field_spec, field_spec.wire_name, depth)
+        if by_name and field_spec.name != field_spec.wire_name:
+            copied = _drop_key_cow(record, copied, field_spec, field_spec.name, depth)
+    return record if copied is None else copied
 
 
-def _copied_children(
-    node: dict[str, Any], name: str, field_spec: FieldSpec, value: object
-) -> list[tuple[dict[str, Any], ModelSpec]]:
-    """Copy the child records ``value`` (under ``name``) holds into ``node``; return them."""
+def _drop_key_cow(
+    record: dict[str, Any],
+    copied: dict[str, Any] | None,
+    field_spec: FieldSpec,
+    name: str,
+    depth: int,
+) -> dict[str, Any] | None:
+    """Apply null-not-shown CoW rule for ``name`` on ``record``, returning ``copied`` when mutated."""
+    if not name or depth < 1:
+        raise ValueError("_drop_key_cow requires non-empty name and depth >= 1")
+    value = record.get(name, _ABSENT)
+    if value is _ABSENT:
+        return copied
+    if value is None and not field_spec.optional and not field_spec.required:
+        target = dict(record) if copied is None else copied
+        del target[name]
+        return target
+    updated = _drop_unshown_child(field_spec, value, depth)
+    if updated is not value:
+        target = dict(record) if copied is None else copied
+        target[name] = updated
+        return target
+    return copied
+
+
+def _drop_unshown_child(field_spec: FieldSpec, value: object, depth: int) -> object:
+    """Return ``value`` with unshown nulls dropped in child records (copy-on-write)."""
+    if depth < 1 or not isinstance(field_spec, FieldSpec):
+        raise ValueError("_drop_unshown_child requires FieldSpec and depth >= 1")
     child = field_spec.child
-    if child is None:
-        return []
-    if field_spec.kind == "model" and isinstance(value, dict):
-        copy = dict(value)
-        node[name] = copy
-        return [(copy, child)]
-    if field_spec.kind == "model_list" and isinstance(value, list):
-        items = [dict(item) if isinstance(item, dict) else item for item in value]
-        node[name] = items
-        return [(item, child) for item in items if isinstance(item, dict)]
-    return []
+    if child is None or not child.has_unshown_droppable:
+        return value
+    if field_spec.kind == "model":
+        return _drop_unshown_cow(value, child, depth + 1) if isinstance(value, dict) else value
+    if field_spec.kind != "model_list" or not isinstance(value, list):
+        return value
+    copied_list: list[Any] | None = None
+    for idx, item in enumerate(value):
+        updated = _drop_unshown_cow(item, child, depth + 1) if isinstance(item, dict) else item
+        if updated is not item:
+            copied_list = list(value) if copied_list is None else copied_list
+            copied_list[idx] = updated
+    return value if copied_list is None else copied_list
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -932,6 +1035,7 @@ class _Context:
     schema: PreparedSchema
     model_ids: tuple[str, ...]
     families: tuple[str, ...]
+    families_map: Mapping[str, str]
     min_families: int
     must_agree: frozenset[str]
 
@@ -946,7 +1050,7 @@ def _check_path(spec: ModelSpec, path: str) -> None:
     for part in parts:
         if node is None:
             raise RationalizationError(f"must_agree path {path!r}: {previous!r} holds no model, so nothing is under it")
-        found = next((field_spec for field_spec in node.fields if field_spec.name == part), None)
+        found = node.fields_by_name.get(part)
         if found is None:
             names = ", ".join(field_spec.name for field_spec in node.fields)
             raise RationalizationError(
@@ -983,7 +1087,15 @@ def _check_run(outcome: object, schema: object, min_families: object, must_agree
             f"adds none) but min_families is {min_families}: no value could be agreed"
         )
     paths = frozenset(check_must_agree(schema.spec, must_agree))
-    return _Context(schema=schema, model_ids=model_ids, families=families, min_families=min_families, must_agree=paths)
+    families_map = MappingProxyType(dict(zip(model_ids, families, strict=True)))
+    return _Context(
+        schema=schema,
+        model_ids=model_ids,
+        families=families,
+        families_map=families_map,
+        min_families=min_families,
+        must_agree=paths,
+    )
 
 
 def _check_units(unit_ids: object, outcome: RunOutcome, context: _Context) -> tuple[str, ...]:
@@ -1019,9 +1131,8 @@ def _unit_votes(
         if response is None:
             votes.append(())
             continue
-        validated = validate_response(response, context.schema, unit_id=unit_id, model_id=model_id)
-        votes.append(validated.records)
-        quarantine.extend(validated.quarantined)
+        origin = _Origin(model_id=model_id, unit_id=unit_id)
+        votes.append(_validate_response_records(response, context.schema, origin, quarantine, isolate_wire=False))
     return votes
 
 
@@ -1062,51 +1173,110 @@ def _unit_items(unit_id: str, votes: Sequence[tuple[ValidRecord, ...]], context:
     return [_keyed_item(unit_id, key, per_model, context) for key, per_model in ordered]
 
 
-def _field_similarity(field_spec: FieldSpec, left: Any, right: Any) -> float | None:
-    """Similarity in [0.0, 1.0] between two validated field values, or None when both are unset/empty."""
-    norm_l = _normalized_field(field_spec, left)
-    norm_r = _normalized_field(field_spec, right)
-    if norm_l in (None, ()) and norm_r in (None, ()):
-        return None
-    if norm_l == norm_r:
-        return 1.0
-    if isinstance(norm_l, str) and isinstance(norm_r, str):
-        toks_l = set(_WORD_TOKENS.findall(norm_l.casefold()))
-        toks_r = set(_WORD_TOKENS.findall(norm_r.casefold()))
+@dataclass(frozen=True, slots=True)
+class _UnkeyedFeatures:
+    """Pre-normalized active field values, word-token sets, and posting keys for one unkeyed record."""
+
+    norms: tuple[object, ...]
+    empty: tuple[bool, ...]
+    tokens: tuple[frozenset[str] | None, ...]
+    keys: tuple[tuple[object, ...], ...]
+
+
+def _extract_unkeyed_features(instance: BaseModel, active: Sequence[FieldSpec]) -> _UnkeyedFeatures:
+    """Precompute normalized field values, word tokens, and inverted-index keys for ``instance``."""
+    if not isinstance(instance, BaseModel) or not active:
+        raise ValueError("_extract_unkeyed_features requires a BaseModel instance and non-empty active fields")
+    norms: list[object] = []
+    empty: list[bool] = []
+    tokens: list[frozenset[str] | None] = []
+    keys: list[tuple[object, ...]] = []
+    for f_idx, field_spec in enumerate(active):
+        norm = _normalized_field(field_spec, getattr(instance, field_spec.name))
+        is_empty = norm is None or norm == ()
+        norms.append(norm)
+        empty.append(is_empty)
+        if not is_empty:
+            keys.append((f_idx, "eq", norm))
+        if isinstance(norm, str):
+            word_set = frozenset(_WORD_TOKENS.findall(norm.casefold()))
+            tokens.append(word_set)
+            keys.extend((f_idx, "tok", tok) for tok in word_set)
+        else:
+            tokens.append(None)
+    if all(empty):
+        keys.append(("__empty__",))
+    return _UnkeyedFeatures(
+        norms=tuple(norms),
+        empty=tuple(empty),
+        tokens=tuple(tokens),
+        keys=tuple(dict.fromkeys(keys)),
+    )
+
+
+def _features_similarity(left: _UnkeyedFeatures, right: _UnkeyedFeatures) -> float:
+    """Mean similarity across populated active fields from precomputed :class:`_UnkeyedFeatures`."""
+    if not isinstance(left, _UnkeyedFeatures) or not isinstance(right, _UnkeyedFeatures):
+        raise TypeError("left and right must be _UnkeyedFeatures")
+    if len(left.norms) != len(right.norms):
+        raise ValueError("feature vectors must share the same field count")
+    total = 0.0
+    count = 0
+    for f_idx in range(len(left.norms)):
+        if left.empty[f_idx] and right.empty[f_idx]:
+            continue
+        count += 1
+        norm_l, norm_r = left.norms[f_idx], right.norms[f_idx]
+        if norm_l == norm_r:
+            total += 1.0
+            continue
+        toks_l, toks_r = left.tokens[f_idx], right.tokens[f_idx]
         if toks_l and toks_r:
-            return len(toks_l & toks_r) / len(toks_l | toks_r)
-    return 0.0
+            total += len(toks_l & toks_r) / len(toks_l | toks_r)
+    return (total / count) if count else 1.0
 
 
-def _record_similarity(first: BaseModel, second: BaseModel, spec: ModelSpec) -> float:
-    """Mean similarity across populated non-informational fields (1.0 when both records are identically empty)."""
-    active = [f for f in spec.fields if not f.informational] or list(spec.fields)
-    scores = [
-        s for f in active if (s := _field_similarity(f, getattr(first, f.name), getattr(second, f.name))) is not None
-    ]
-    return (sum(scores) / len(scores)) if scores else 1.0
+def _match_model_unkeyed(
+    feats0: Sequence[_UnkeyedFeatures],
+    featsm: Sequence[_UnkeyedFeatures],
+) -> dict[int, int]:
+    """Greedily pair ``feats0`` to ``featsm`` via an inverted index over positive-similarity features."""
+    if not isinstance(feats0, Sequence) or not isinstance(featsm, Sequence):
+        raise TypeError("feats0 and featsm must be Sequences of _UnkeyedFeatures")
+    postings: dict[tuple[object, ...], list[int]] = {}
+    for posm, recm in enumerate(featsm):
+        for key in recm.keys:
+            postings.setdefault(key, []).append(posm)
+    candidates: list[tuple[float, int, int]] = []
+    for pos0, rec0 in enumerate(feats0):
+        seen_m = {posm for key in rec0.keys for posm in postings.get(key, ())}
+        for posm in seen_m:
+            score = _features_similarity(rec0, featsm[posm])
+            if score > 0.5:
+                candidates.append((score, pos0, posm))
+    candidates.sort(key=lambda entry: (-entry[0], entry[1], entry[2]))
+    chosen: dict[int, int] = {}
+    used_m: set[int] = set()
+    for _, pos0, posm in candidates:
+        if pos0 not in chosen and posm not in used_m:
+            chosen[pos0] = posm
+            used_m.add(posm)
+    return chosen
 
 
 def _pair_unkeyed_multi(
     unit_id: str, votes: Sequence[tuple[ValidRecord, ...]], context: _Context
 ) -> list[ConsensusItem]:
     """Greedily pair multi-record unkeyed responses across all models when similarity strictly exceeds 0.5."""
+    if not unit_id or len(votes) < 2:
+        raise ValueError("_pair_unkeyed_multi requires non-empty unit_id and at least two models")
     spec = context.schema.spec
+    active = [f for f in spec.fields if not f.informational] or list(spec.fields)
     model_count = len(votes)
-    chosen_by_model: list[dict[int, int]] = [{} for _ in range(model_count)]
+    feats_by_model = [[_extract_unkeyed_features(rec.record, active) for rec in records] for records in votes]
+    chosen_by_model: list[dict[int, int]] = [{}]
     for m_idx in range(1, model_count):
-        candidates: list[tuple[float, int, int]] = []
-        for pos0, rec0 in enumerate(votes[0]):
-            for posm, recm in enumerate(votes[m_idx]):
-                score = _record_similarity(rec0.record, recm.record, spec)
-                if score > 0.5:
-                    candidates.append((score, pos0, posm))
-        candidates.sort(key=lambda entry: (-entry[0], entry[1], entry[2]))
-        used_m: set[int] = set()
-        for _, pos0, posm in candidates:
-            if pos0 not in chosen_by_model[m_idx] and posm not in used_m:
-                chosen_by_model[m_idx][pos0] = posm
-                used_m.add(posm)
+        chosen_by_model.append(_match_model_unkeyed(feats_by_model[0], feats_by_model[m_idx]))
 
     items: list[ConsensusItem] = []
     consumed: list[set[int]] = [set() for _ in range(model_count)]
@@ -1258,28 +1428,28 @@ def _item(
         votes[model_id] = tuple(_dumped(valid.record) for valid in shown)
         quotes[model_id] = _united(valid.grounding_quotes for valid in copies)
         element_ids[model_id] = _united(valid.source_element_ids for valid in copies)
-    return ConsensusItem(
+    return ConsensusItem._trusted(
         unit_id=unit_id,
         status=status,
         key=key,
         record=record,
         disputed_fields=tuple(dict.fromkeys(disputed)),
         notes=tuple(notes),
-        model_votes=votes,
-        quotes_by_model=quotes,
-        element_ids_by_model=element_ids,
-        families=dict(zip(context.model_ids, context.families, strict=True)),
+        model_votes=MappingProxyType(votes),
+        quotes_by_model=MappingProxyType(quotes),
+        element_ids_by_model=MappingProxyType(element_ids),
+        families=context.families_map,
     )
 
 
 def _dumped(record: BaseModel) -> dict[str, Any]:
-    """A validated record as a JSON-mode dict.
+    """A validated record as a JSON-mode dict keyed by Python attribute names.
 
     Pydantic's serializer warns about an ``int`` in a ``Decimal`` field (and writes it as a number); the default
     check admitted every value a record holds, widened ints included (module notes, 3), so the warning carries
-    nothing and is left out.
+    nothing and is left out. ``by_alias=False`` prevents ``serialize_by_alias=True`` from rewriting attribute keys.
     """
-    return record.model_dump(mode="json", warnings=False)
+    return record.model_dump(mode="json", by_alias=False, warnings=False)
 
 
 def _united(groups: Iterable[tuple[str, ...]]) -> tuple[str, ...]:
@@ -1388,12 +1558,15 @@ class _Comparison:
         """Compare instances of one model field by field: the merged object (JSON, by wire name), or no winner."""
         if depth > MAX_DEPTH:
             raise RationalizationError(f"{path or 'the record'}: nesting is deeper than {MAX_DEPTH} levels")
-        by_name = _reads_by_name(spec.model)
+        if len(entries) == 1 and self.voters == 1 and self.quorum is None and not spec.has_keyed_list:
+            return _Merged(entries[0][2], entries[0][0])
+        by_name = spec.reads_by_name
+        has_must = self.quorum is not None and bool(self.quorum.must_agree)
         parts: list[tuple[FieldSpec, _Merged]] = []
         complete = True
         for field_spec in spec.fields:
-            field_path = f"{path}.{field_spec.name}" if path else field_spec.name
-            field_spec_path = f"{spec_path}.{field_spec.name}" if spec_path else field_spec.name
+            field_path = _join_path(path, field_spec.name)
+            field_spec_path = _join_path(spec_path, field_spec.name) if has_must else ""
             values = [
                 (index, getattr(instance, field_spec.name), _wire_value(wire, field_spec, by_name))
                 for index, instance, wire in entries
@@ -1416,6 +1589,33 @@ class _Comparison:
             return self.compare_keyed_list(child, path, spec_path, values, depth)
         return self.compare_value(field_spec, path, spec_path, values)
 
+    def _compare_submodel(
+        self,
+        child: ModelSpec,
+        parent_path: str,
+        key_instance: BaseModel | None,
+        spec_path: str,
+        entries: list[_Entry],
+        next_depth: int,
+        cached_path: str | None = None,
+    ) -> _Merged | _NoWinner:
+        """Compare ``child`` with lazy dispute-path formatting and prefixing."""
+        if not entries:
+            raise ValueError("_compare_submodel requires non-empty entries")
+        if next_depth > MAX_DEPTH:
+            resolved = _submodel_path(child, parent_path, key_instance, cached_path)
+            raise RationalizationError(f"{resolved or 'the record'}: nesting is deeper than {MAX_DEPTH} levels")
+        mark = len(self.disputed)
+        try:
+            result = self.compare_model(child, "", spec_path, entries, next_depth)
+        except RationalizationError as exc:
+            resolved = _submodel_path(child, parent_path, key_instance, cached_path)
+            raise RationalizationError(_prefixed_depth_error(resolved, str(exc))) from exc
+        if len(self.disputed) > mark:
+            resolved = _submodel_path(child, parent_path, key_instance, cached_path)
+            _prefix_disputed(self.disputed, mark, resolved)
+        return result
+
     def compare_child(
         self, child: ModelSpec, path: str, spec_path: str, values: list[_Entry], depth: int
     ) -> _Merged | _NoWinner:
@@ -1432,7 +1632,7 @@ class _Comparison:
                 return _NO_WINNER
             if winner is absent:
                 return _Merged(_wire_of(values, absent[0]), absent[0])
-        return self.compare_model(child, path, spec_path, present, depth + 1)
+        return self._compare_submodel(child, path, None, spec_path, present, depth + 1)
 
     def compare_keyed_list(
         self, child: ModelSpec, path: str, spec_path: str, values: list[_Entry], depth: int
@@ -1450,17 +1650,18 @@ class _Comparison:
         merged: list[_Merged] = []
         complete = True
         for key, found in members.items():
-            child_path = f"{path}[{_key_text(found[0][1], child)}]"
             clashing = conflicts.get(key, ())
             self.repeated.update(clashing)
             self.split = self.split or len(found) < len(values) or 0 < len(clashing) < len(found)
+            child_path: str | None = None
             if clashing or len(found) < len(values):
+                child_path = f"{path}[{_key_text(found[0][1], child)}]"
                 self.disputed.append(child_path)
-            if clashing or not self.wins([index for index, _, _ in found]):
+            if clashing or len(found) * 2 <= self.voters:
                 left_out = (len(values) - len(found)) * 2 > self.voters
                 complete = complete and not clashing and left_out
                 continue
-            result = self.compare_model(child, child_path, spec_path, found, depth + 1)
+            result = self._compare_submodel(child, path, found[0][1], spec_path, found, depth + 1, child_path)
             if isinstance(result, _NoWinner):
                 complete = False
             else:
@@ -1481,63 +1682,134 @@ class _Comparison:
             winner = next((c for c in clusters if c.normalized is not None and c.normalized != ()), clusters[0])
         return _Merged(winner.wire, winner.source)
 
+    def _same_raw_merged(
+        self, path: str, spec_path: str, values: list[_Entry], *, prefer_wire: bool
+    ) -> _Merged | _NoWinner:
+        """Merge ``values`` when all entries already hold the same raw scalar or scalar list."""
+        if not values or self.voters < 1:
+            raise ValueError("_same_raw_merged requires non-empty values and voters >= 1")
+        if len(values) == self.voters:
+            if self.quorum is not None and not self.quorum.all_families_ok:
+                self.disputed.append(path)
+            wire, source = _single_wire(values, prefer_wire=prefer_wire)
+            return _Merged(wire, source)
+        supporters = [index for index, _, _ in values]
+        wins = self.wins(supporters)
+        if not wins or not self.agreed(supporters, len(values), spec_path):
+            self.disputed.append(path)
+        if not wins:
+            return _NO_WINNER
+        wire, source = _single_wire(values, prefer_wire=prefer_wire)
+        return _Merged(wire, source)
+
     def compare_value(
         self, field_spec: FieldSpec, path: str, spec_path: str, values: list[_Entry]
     ) -> _Merged | _NoWinner:
         """Compare a scalar's values, or a list's as normalized sequences: the winner, or no winner."""
         prefer_wire = not field_spec.required
-        if field_spec.informational and not (self.quorum is not None and self.quorum._must(spec_path)):
+        quorum = self.quorum
+        if field_spec.informational and not (quorum is not None and quorum._must(spec_path)):
             return self._compare_informational(field_spec, values, prefer_wire=prefer_wire)
         if _same_raw_values(field_spec, values):
-            supporters = [index for index, _, _ in values]
-            wins = self.wins(supporters)
-            if not wins or not self.agreed(supporters, len(values), spec_path):
-                self.disputed.append(path)
-            if not wins:
-                return _NO_WINNER
-            wire, source = _single_wire(values, prefer_wire=prefer_wire)
-            return _Merged(wire, source)
-        clusters = _clusters(
-            [(index, wire, _normalized_field(field_spec, value)) for index, value, wire in values],
-            prefer_wire=prefer_wire,
-        )
+            return self._same_raw_merged(path, spec_path, values, prefer_wire=prefer_wire)
+        use_quorum_norm = field_spec.child is not None and quorum is not None and bool(quorum.must_agree)
+        triples = [
+            (
+                index,
+                wire,
+                _normalized_field_quorum(field_spec, value, spec_path, quorum)
+                if use_quorum_norm
+                else _normalized_field(field_spec, value),
+            )
+            for index, value, wire in values
+        ]
+        clusters = _clusters(triples, prefer_wire=prefer_wire)
         self.split = self.split or len(clusters) > 1
         winner = next((cluster for cluster in clusters if self.wins(cluster.supporters)), None)
-        if winner is None or not self.agreed(winner.supporters, len(values), spec_path):
+        disagreed = (
+            winner is None
+            or not self.agreed(winner.supporters, len(values), spec_path)
+            or (
+                quorum is not None
+                and len(winner.supporters) < quorum.requested
+                and _unkeyed_list_must_disagrees(field_spec, spec_path, values, quorum)
+            )
+        )
+        if disagreed:
             self.disputed.extend(_value_paths(field_spec, path, clusters))
         return _NO_WINNER if winner is None else _Merged(winner.wire, winner.source)
+
+
+def _join_path(prefix: str, name: str) -> str:
+    """Return ``name`` when ``prefix`` is empty, else ``f'{prefix}.{name}'``."""
+    if not isinstance(prefix, str) or not isinstance(name, str) or not name:
+        raise ValueError("_join_path requires str prefix and non-empty str name")
+    return f"{prefix}.{name}" if prefix else name
+
+
+def _submodel_path(
+    child: ModelSpec,
+    parent_path: str,
+    key_instance: BaseModel | None,
+    cached_path: str | None,
+) -> str:
+    """Format the attribute/key path of a nested model or keyed-list child on demand."""
+    if not isinstance(child, ModelSpec) or not isinstance(parent_path, str):
+        raise TypeError("_submodel_path requires ModelSpec and str parent_path")
+    if cached_path is not None:
+        return cached_path
+    return parent_path if key_instance is None else f"{parent_path}[{_key_text(key_instance, child)}]"
+
+
+def _prefixed_depth_error(prefix: str, message: str) -> str:
+    """Prepend ancestor ``prefix`` to a nested ``MAX_DEPTH`` :class:`RationalizationError` message."""
+    if not isinstance(prefix, str) or not isinstance(message, str) or not message:
+        raise ValueError("_prefixed_depth_error requires str prefix and non-empty message")
+    if not prefix:
+        return message
+    if message.startswith("the record:"):
+        return f"{prefix}{message[len('the record') :]}"
+    return f"{prefix}.{message}"
+
+
+def _prefix_disputed(disputed: list[str], start: int, prefix: str) -> None:
+    """Prepend ``prefix`` to every disputed field path recorded since ``start``."""
+    if start < 0 or start > len(disputed):
+        raise ValueError(f"start index {start} out of bounds for disputed length {len(disputed)}")
+    if not isinstance(prefix, str) or not prefix:
+        raise ValueError("prefix must be a non-empty str")
+    for idx in range(start, len(disputed)):
+        disputed[idx] = f"{prefix}.{disputed[idx]}"
 
 
 def _assembled(parts: Sequence[tuple[FieldSpec, _Merged]], entries: Sequence[_Entry]) -> _Merged:
     """A model's merged object: one entry's own JSON when every field is that entry's own, else its fields' JSON by
     wire name (a default left out, so it applies again)."""
-    sources = {merged.source for _, merged in parts}
-    source = sources.pop() if len(sources) == 1 else None
-    if source is not None:
-        return _Merged(_wire_of(entries, source), source)
+    first_source = parts[0][1].source if parts else None
+    if first_source is not None and all(merged.source == first_source for _, merged in parts[1:]):
+        return _Merged(_wire_of(entries, first_source), first_source)
     wire = {field_spec.wire_name: merged.wire for field_spec, merged in parts if merged.wire is not _ABSENT}
     return _Merged(wire, None)
 
 
 def _listed(children: Sequence[_Merged], values: Sequence[_Entry]) -> _Merged:
     """A keyed list's merged children: one entry's own list when they are all of it, each its own, else their JSON."""
-    sources = {merged.source for merged in children}
-    source = sources.pop() if len(sources) == 1 else None
-    if source is not None:
-        _, own, wire = next(entry for entry in values if entry[0] == source)
+    first_source = children[0].source if children else None
+    if first_source is not None and all(merged.source == first_source for merged in children[1:]):
+        _, own, wire = next(entry for entry in values if entry[0] == first_source)
         if len(own) == len(children):
-            return _Merged(wire, source)
+            return _Merged(wire, first_source)
     return _Merged([merged.wire for merged in children if merged.wire is not _ABSENT], None)
-
-
-def _reads_by_name(model: type[BaseModel]) -> bool:
-    """Whether ``model`` validates a field by its attribute name too (``validate_by_name`` or ``populate_by_name``)."""
-    return bool(model.model_config.get("validate_by_name") or model.model_config.get("populate_by_name"))
 
 
 def _wire_value(node: object, field_spec: FieldSpec, by_name: bool) -> object:
     """A field's JSON in a record object as its model sent it: under its wire name, else (``by_name``) its attribute
     name; ``_ABSENT`` when the object holds neither (the field took its default) or is no object."""
+    if type(node) is dict:
+        found = node.get(field_spec.wire_name, _ABSENT)
+        if found is not _ABSENT or not by_name:
+            return found
+        return node.get(field_spec.name, _ABSENT)
     if not isinstance(node, dict):
         return _ABSENT
     if field_spec.wire_name in node:
@@ -1549,7 +1821,10 @@ def _wire_value(node: object, field_spec: FieldSpec, by_name: bool) -> object:
 
 def _wire_of(entries: Sequence[_Entry], index: int) -> object:
     """The JSON of the entry ``index`` among ``entries``."""
-    return next(wire for at, _, wire in entries if at == index)
+    for at, _, wire in entries:
+        if at == index:
+            return wire
+    raise LookupError(f"entry index {index} not found")
 
 
 def _children_by_key(
@@ -1570,7 +1845,8 @@ def _children_by_key(
             if key not in own:
                 own[key] = instance
                 members.setdefault(key, []).append((index, instance, _ABSENT if items is None else items[position]))
-            elif _differ(own[key], instance, child):
+                continue
+            if _differ(own[key], instance, child):
                 conflicts.setdefault(key, set()).add(index)
     return members, conflicts
 
@@ -1595,8 +1871,11 @@ def _same_raw_values(field_spec: FieldSpec, values: list[_Entry]) -> bool:
     """Whether every entry in ``values`` already holds the same raw scalar or scalar list value."""
     if field_spec.child is not None:
         return False
-    if len(values) <= 1:
+    n_vals = len(values)
+    if n_vals <= 1:
         return True
+    if n_vals == 2 and field_spec.kind == "scalar":
+        return _same_scalar(values[0][1], values[1][1])
     first = values[0][1]
     if field_spec.kind == "scalar":
         return all(_same_scalar(first, value) for _, value, _ in values[1:])
@@ -1669,7 +1948,7 @@ def _normalized(value: object) -> object:
     if isinstance(value, Enum):
         return value.value
     if type(value) is float:
-        return float(format(value, f".{FLOAT_SIGNIFICANT_DIGITS}g"))
+        return float(format(value, _FLOAT_FMT))
     if type(value) is str:
         return normalized_text(value)
     if type(value) is datetime and value.utcoffset() is not None:
@@ -1679,14 +1958,20 @@ def _normalized(value: object) -> object:
 
 def _key_of(record: BaseModel, spec: ModelSpec) -> tuple[object, ...]:
     """The normalized key tuple of ``record``, an instance of ``spec``'s model (:func:`normalized_key`)."""
+    fields = spec.keys.fields
     norms = spec.key_normalizers
+    if len(fields) == 1:
+        raw = getattr(record, fields[0])
+        if norms[0] == "alnum_upper" and type(raw) is str:
+            return (alnum_upper_text(raw),)
+        return (_normalized(raw),)
     if not any(norms):
-        return tuple(_normalized(getattr(record, name)) for name in spec.keys.fields)
+        return tuple(_normalized(getattr(record, name)) for name in fields)
     return tuple(
         alnum_upper_text(raw)
         if norm == "alnum_upper" and type(raw := getattr(record, name)) is str
         else _normalized(getattr(record, name))
-        for name, norm in zip(spec.keys.fields, norms, strict=True)
+        for name, norm in zip(fields, norms, strict=True)
     )
 
 
@@ -1713,6 +1998,23 @@ def _normalized_field(field_spec: FieldSpec, value: Any) -> object:
     return tuple(_normalized_model(item, child, 1) for item in value)
 
 
+def _normalized_field_quorum(
+    field_spec: FieldSpec,
+    value: Any,
+    spec_path: str,
+    quorum: _Quorum | None,
+) -> object:
+    """Normalize ``value`` for ``field_spec`` while honoring ``quorum`` ``must_agree`` on ``Informational`` fields."""
+    if not isinstance(field_spec, FieldSpec) or not isinstance(spec_path, str):
+        raise TypeError("_normalized_field_quorum requires FieldSpec and str spec_path")
+    if value is None or field_spec.child is None:
+        return _normalized_field(field_spec, value)
+    child = field_spec.child
+    if field_spec.kind == "model":
+        return _normalized_model(value, child, 1, spec_path, quorum)
+    return tuple(_normalized_model(item, child, 1, spec_path, quorum) for item in value)
+
+
 def _widened(value: object, base: type) -> object:
     """``value`` as a ``float`` when it is an ``int`` (never a ``bool``) of a ``float`` field, so it rounds as one.
 
@@ -1723,23 +2025,118 @@ def _widened(value: object, base: type) -> object:
     return value
 
 
-def _normalized_model(instance: BaseModel | None, spec: ModelSpec, depth: int) -> object:
+def _normalized_model(
+    instance: BaseModel | None,
+    spec: ModelSpec,
+    depth: int,
+    spec_path: str = "",
+    quorum: _Quorum | None = None,
+) -> object:
     """An instance as the tuple of its fields' normalized values, its nested models and lists in order."""
     if instance is None:
         return None
     if depth > MAX_DEPTH:
         raise RationalizationError(f"{spec.model.__name__}: nesting is deeper than {MAX_DEPTH} levels")
+    has_must = quorum is not None and bool(quorum.must_agree)
     parts: list[object] = []
     for field_spec in spec.fields:
+        f_path = _join_path(spec_path, field_spec.name) if has_must else ""
+        if field_spec.informational and not (has_must and quorum is not None and quorum._must(f_path)):
+            continue
         value = getattr(instance, field_spec.name)
         child = field_spec.child
         if child is None:
             parts.append(_normalized_field(field_spec, value))
         elif field_spec.kind == "model":
-            parts.append(_normalized_model(value, child, depth + 1))
+            parts.append(_normalized_model(value, child, depth + 1, f_path, quorum))
         else:
-            parts.append(tuple(_normalized_model(item, child, depth + 1) for item in value))
+            parts.append(tuple(_normalized_model(item, child, depth + 1, f_path, quorum) for item in value))
     return tuple(parts)
+
+
+def _models_differ_on_must(
+    instances: Sequence[BaseModel],
+    spec: ModelSpec,
+    spec_path: str,
+    quorum: _Quorum,
+    depth: int = 1,
+) -> bool:
+    """Whether ``instances`` disagree on any ``must_agree`` field at or below ``spec_path``."""
+    if depth > MAX_DEPTH:
+        raise RationalizationError(f"{spec.model.__name__}: nesting is deeper than {MAX_DEPTH} levels")
+    if not isinstance(spec_path, str):
+        raise TypeError("spec_path must be a str")
+    if len(instances) <= 1:
+        return False
+    for cf in spec.fields:
+        cf_path = _join_path(spec_path, cf.name)
+        if quorum._must(cf_path):
+            norms = {_normalized_field_quorum(cf, getattr(inst, cf.name), cf_path, quorum) for inst in instances}
+            if len(norms) > 1:
+                return True
+            continue
+        has_descendant = cf.child is not None and any(p.startswith(f"{cf_path}.") for p in quorum.must_agree)
+        if has_descendant and cf.child is not None:
+            if _child_must_differs(instances, cf, cf.child, cf_path, quorum, depth + 1):
+                return True
+    return False
+
+
+def _child_must_differs(
+    instances: Sequence[BaseModel],
+    field_spec: FieldSpec,
+    child: ModelSpec,
+    spec_path: str,
+    quorum: _Quorum,
+    depth: int,
+) -> bool:
+    """Whether nested ``model`` or ``model_list`` field ``field_spec`` differs on a descendant ``must_agree`` path."""
+    if depth > MAX_DEPTH:
+        raise RationalizationError(f"{child.model.__name__}: nesting is deeper than {MAX_DEPTH} levels")
+    if not spec_path:
+        raise ValueError("spec_path must be non-empty")
+    if field_spec.kind == "model":
+        present = [sub for inst in instances if (sub := getattr(inst, field_spec.name)) is not None]
+        if 0 < len(present) < len(instances):
+            return True
+        return _models_differ_on_must(present, child, spec_path, quorum, depth)
+    lists = [getattr(inst, field_spec.name) for inst in instances]
+    if len({len(items) for items in lists}) > 1:
+        return True
+    if not lists or not lists[0]:
+        return False
+    return any(
+        _models_differ_on_must([items[idx] for items in lists], child, spec_path, quorum, depth)
+        for idx in range(len(lists[0]))
+    )
+
+
+def _unkeyed_list_must_disagrees(
+    field_spec: FieldSpec,
+    spec_path: str,
+    values: Sequence[_Entry],
+    quorum: _Quorum | None,
+) -> bool:
+    """Whether an unkeyed ``model_list`` violates a descendant ``must_agree`` path across ``values``."""
+    if not isinstance(field_spec, FieldSpec) or not isinstance(spec_path, str):
+        raise TypeError("_unkeyed_list_must_disagrees requires FieldSpec and str spec_path")
+    child = field_spec.child
+    if child is None or field_spec.kind != "model_list" or quorum is None or not quorum.must_agree:
+        return False
+    prefix = f"{spec_path}."
+    if not any(path.startswith(prefix) for path in quorum.must_agree):
+        return False
+    if len(values) < quorum.requested:
+        return True
+    lists = [entry[1] for entry in values]
+    if len({len(items) for items in lists}) > 1:
+        return True
+    if not lists or not lists[0]:
+        return False
+    return any(
+        _models_differ_on_must([items[idx] for items in lists], child, spec_path, quorum, 1)
+        for idx in range(len(lists[0]))
+    )
 
 
 def _order_part(value: object) -> tuple[int, Any]:

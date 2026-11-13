@@ -47,8 +47,13 @@ records, child items and cited element ids. The module imports only the standard
 model and its sibling modules: nothing from ``datagrunt.core``, and no import inside a function (invariant 9).
 """
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import date, datetime
+from decimal import Decimal
+from enum import Enum
+from types import MappingProxyType
 from typing import Any, Generic, Literal, TypeAlias, TypeVar, cast, get_args
 
 from pydantic import BaseModel
@@ -61,7 +66,6 @@ from datagrunt.rationalization.consensus import (
     _check_text,
     _check_tuple_of,
     _check_votes,
-    _dumped,
     _key_of,
     _key_text,
     _normalized_field,
@@ -101,7 +105,8 @@ __all__ = [
 ]
 
 _CLEAN_STATUSES: frozenset[str] = frozenset({"consensus", "single_model"})
-_STATUS_RANK: Mapping[str, int] = {status: index for index, status in enumerate(RECORD_STATUSES)}
+_STATUS_RANK: Mapping[str, int] = MappingProxyType({status: index for index, status in enumerate(RECORD_STATUSES)})
+_PLAIN_WIRE_SCALARS: tuple[type, ...] = (str, int, float, bool)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -248,6 +253,45 @@ class GroundedRecord(Generic[T]):
         if self.status == "ungrounded_value" and not self.grounding_reasons:
             raise ValueError("an ungrounded_value record must have at least one GroundingReason")
 
+    @classmethod
+    def _trusted(
+        cls,
+        *,
+        doc_id: str,
+        unit_ids: tuple[str, ...],
+        status: RecordStatus,
+        key: tuple[object, ...],
+        record: T | None,
+        disputed_fields: tuple[str, ...],
+        notes: tuple[str, ...],
+        grounding_reasons: tuple[GroundingReason, ...],
+        sources: tuple[ElementSource, ...],
+        grounding_quotes: tuple[str, ...],
+        model_votes: Mapping[str, tuple[Mapping[str, Any], ...]],
+        quotes_by_model: Mapping[str, tuple[str, ...]],
+        element_ids_by_model: Mapping[str, tuple[str, ...]],
+        families: Mapping[str, str],
+    ) -> "GroundedRecord[T]":
+        """Construct an internal :class:`GroundedRecord` from read-only mappings without re-copying."""
+        if not doc_id or not unit_ids:
+            raise ValueError("GroundedRecord._trusted requires non-empty doc_id and unit_ids")
+        self = object.__new__(cls)
+        object.__setattr__(self, "doc_id", doc_id)
+        object.__setattr__(self, "unit_ids", unit_ids)
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "key", key)
+        object.__setattr__(self, "record", record)
+        object.__setattr__(self, "disputed_fields", disputed_fields)
+        object.__setattr__(self, "notes", notes)
+        object.__setattr__(self, "grounding_reasons", grounding_reasons)
+        object.__setattr__(self, "sources", sources)
+        object.__setattr__(self, "grounding_quotes", grounding_quotes)
+        object.__setattr__(self, "model_votes", model_votes)
+        object.__setattr__(self, "quotes_by_model", quotes_by_model)
+        object.__setattr__(self, "element_ids_by_model", element_ids_by_model)
+        object.__setattr__(self, "families", families)
+        return self
+
 
 @dataclass(frozen=True, slots=True)
 class FoldingResult(Generic[T]):
@@ -261,6 +305,15 @@ class FoldingResult(Generic[T]):
 
     def __post_init__(self) -> None:
         _check_tuple_of("items", self.items, GroundedRecord)
+
+    @classmethod
+    def _trusted(cls, items: tuple[GroundedRecord[T], ...]) -> "FoldingResult[T]":
+        """Construct an internal :class:`FoldingResult` from verified records."""
+        if not isinstance(items, tuple) or (bool(items) and not isinstance(items[0], GroundedRecord)):
+            raise TypeError("FoldingResult._trusted requires a tuple of GroundedRecord")
+        self = object.__new__(cls)
+        object.__setattr__(self, "items", items)
+        return self
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -276,6 +329,7 @@ def fold_documents(
     documents: Mapping[str, PDFDocument],
     schema: PreparedSchema,
     fold_across_units: bool = True,
+    multimodal: bool | None = None,
 ) -> FoldingResult[Any]:
     """Fold grounded items across units of the same document when they share a non-empty root key (module notes).
 
@@ -285,6 +339,8 @@ def fold_documents(
         envelopes: Every unit's envelope by its ``unit_id`` (same keys as ``units``).
         documents: Every document of the run by its ``doc_id``.
         schema: The prepared schema the run used.
+        fold_across_units: Whether to fold items sharing ``(doc_id, key)`` across units.
+        multimodal: Explicit multimodal mode flag; ``None`` infers per document from ``envelopes``.
 
     Returns:
         The :class:`FoldingResult`.
@@ -294,29 +350,14 @@ def fold_documents(
         ValueError: If ``envelopes`` and ``units`` do not name the same unit ids, a unit's document is missing from
             ``documents``, or an item or empty unit in ``grounding`` names an unknown unit or wrong model/key shape.
     """
-    _check_arguments(grounding, units, envelopes, documents, schema, fold_across_units)
-    doc_elements = _index_documents(documents)
-    mm_units = frozenset(uid for uid, env in envelopes.items() if env.images)
-    mm_docs = frozenset(units[uid].doc_id for uid in mm_units)
-    doc_scopes = {
-        doc_id: group_scopes(document, multimodal=(doc_id in mm_docs)) for doc_id, document in documents.items()
-    }
-    unit_citable = _index_citable(units, envelopes)
+    _check_arguments(grounding, units, envelopes, documents, schema, fold_across_units, multimodal)
+    if not grounding.items:
+        return FoldingResult._trusted(items=())
+    provenance = _ProvenanceIndex(units=units, envelopes=envelopes, documents=documents, multimodal=multimodal)
     unit_rank = {unit_id: index for index, unit_id in enumerate(units)}
     groups = _group_items(grounding.items, units, unit_rank, fold_across_units and bool(schema.spec.keys.fields))
-    folded = [
-        _fold_group(
-            group,
-            units=units,
-            doc_elements=doc_elements,
-            doc_scopes=doc_scopes,
-            unit_citable=unit_citable,
-            multimodal_units=mm_units,
-            schema=schema,
-        )
-        for group in groups
-    ]
-    return FoldingResult(items=tuple(folded))
+    folded = [_fold_group(group, units=units, provenance=provenance, schema=schema) for group in groups]
+    return FoldingResult._trusted(items=tuple(folded))
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -356,10 +397,13 @@ def _check_arguments(
     documents: object,
     schema: object,
     fold_across_units: object = True,
+    multimodal: object = None,
 ) -> None:
     """Validate all inputs to :func:`fold_documents` before folding."""
     if type(fold_across_units) is not bool:
         raise TypeError(f"fold_across_units must be a bool, got {type(fold_across_units).__name__}")
+    if multimodal is not None and not isinstance(multimodal, bool):
+        raise TypeError(f"multimodal must be a bool or None, got {type(multimodal).__name__}")
     if not isinstance(grounding, GroundingResult):
         raise TypeError(f"grounding must be a GroundingResult, got {type(grounding).__name__}")
     if not isinstance(schema, PreparedSchema):
@@ -459,58 +503,104 @@ def _group_items(
     return groups
 
 
-def _element_scope(
-    element_id: str,
-    unit: Unit,
-    body_ids: frozenset[str],
-    scopes: Mapping[str, GroupScope],
-) -> tuple[str, ...]:
-    """Resolve the sanitized section ``scope_path`` for a cited element in ``unit``."""
-    if element_id not in body_ids:
-        return unit.scope_path
-    group_scope = scopes.get(element_id)
-    return () if group_scope is None else group_scope.path
+class _ProvenanceIndex:
+    """Lazily resolves section scopes and caches :class:`ElementSource` per ``(unit_id, element_id)``."""
 
+    __slots__ = (
+        "_body_ids",
+        "_citable",
+        "_doc_elements",
+        "_doc_scopes",
+        "_documents",
+        "_mm_docs",
+        "_mm_units",
+        "_multimodal",
+        "_sources",
+        "_units",
+    )
 
-def _build_sources(
-    group: Sequence[GroundedItem],
-    *,
-    units: Mapping[str, Unit],
-    doc_elements: Mapping[str, Mapping[str, DocumentElement]],
-    doc_scopes: Mapping[str, Mapping[str, GroupScope]],
-    unit_citable: Mapping[str, Mapping[str, DocumentElement]],
-    multimodal_units: frozenset[str] = frozenset(),
-) -> tuple[ElementSource, ...]:
-    """Resolve cited element ids across ``group`` into deduplicated :class:`ElementSource` instances."""
-    seen: set[tuple[str, str]] = set()
-    sources: list[ElementSource] = []
-    for grounded in group:
-        unit_id = grounded.item.unit_id
-        unit = units[unit_id]
-        citable = unit_citable[unit_id]
-        whole_by_id = doc_elements[unit.doc_id]
-        scopes = doc_scopes[unit.doc_id]
-        body_ids = frozenset(element.element_id for element in unit.elements)
-        for element_ids in grounded.item.element_ids_by_model.values():
-            for element_id in element_ids:
-                pair = (unit_id, element_id)
-                if pair in seen or element_id not in citable:
-                    continue
-                seen.add(pair)
-                is_mm_body = unit_id in multimodal_units and element_id in body_ids
-                element = citable[element_id] if is_mm_body else whole_by_id.get(element_id, citable[element_id])
-                scope_val = unit.scope_path if is_mm_body else _element_scope(element_id, unit, body_ids, scopes)
-                sources.append(
-                    ElementSource(
-                        doc_id=unit.doc_id,
-                        unit_id=unit_id,
-                        element_id=element_id,
-                        page_number=element.page_number,
-                        bbox=element.bbox,
-                        scope_path=scope_val,
-                    )
-                )
-    return tuple(sources)
+    def __init__(
+        self,
+        *,
+        units: Mapping[str, Unit],
+        envelopes: Mapping[str, Envelope],
+        documents: Mapping[str, PDFDocument],
+        multimodal: bool | None,
+    ) -> None:
+        mm_units = frozenset(uid for uid, env in envelopes.items() if env.images)
+        self._units = units
+        self._documents = documents
+        self._multimodal = multimodal
+        self._mm_units = mm_units
+        self._mm_docs = frozenset(units[uid].doc_id for uid in mm_units)
+        self._doc_elements = _index_documents(documents)
+        self._citable = _index_citable(units, envelopes)
+        self._doc_scopes: dict[str, Mapping[str, GroupScope]] = {}
+        self._body_ids: dict[str, frozenset[str]] = {}
+        self._sources: dict[tuple[str, str], ElementSource | None] = {}
+
+    def _scopes_for(self, doc_id: str) -> Mapping[str, GroupScope]:
+        """Lazily compute :func:`group_scopes` for ``doc_id`` only when a section-scoped body element is cited."""
+        if not doc_id or doc_id not in self._documents:
+            raise KeyError(f"unknown doc_id {doc_id!r}")
+        scopes = self._doc_scopes.get(doc_id)
+        if scopes is None:
+            doc = self._documents[doc_id]
+            doc_mm = (doc_id in self._mm_docs) if self._multimodal is None else self._multimodal
+            scopes = {} if not doc.sections else group_scopes(doc, multimodal=doc_mm)
+            self._doc_scopes[doc_id] = scopes
+        return scopes
+
+    def resolve(self, unit_id: str, element_id: str) -> ElementSource | None:
+        """Resolve ``(unit_id, element_id)`` to its cached :class:`ElementSource`, or ``None`` if uncitable."""
+        if not unit_id or not element_id:
+            raise ValueError("unit_id and element_id must be non-empty")
+        pair = (unit_id, element_id)
+        if pair in self._sources:
+            return self._sources[pair]
+        citable = self._citable[unit_id]
+        if element_id not in citable:
+            self._sources[pair] = None
+            return None
+        unit = self._units[unit_id]
+        body_ids = self._body_ids.get(unit_id)
+        if body_ids is None:
+            body_ids = self._body_ids[unit_id] = frozenset(el.element_id for el in unit.elements)
+        is_mm_body = unit_id in self._mm_units and element_id in body_ids
+        default_el = citable[element_id]
+        element = default_el if is_mm_body else self._doc_elements[unit.doc_id].get(element_id, default_el)
+        if is_mm_body or element_id not in body_ids:
+            scope_val = unit.scope_path
+        else:
+            group_scope = self._scopes_for(unit.doc_id).get(element_id)
+            scope_val = () if group_scope is None else group_scope.path
+        source = ElementSource(
+            doc_id=unit.doc_id,
+            unit_id=unit_id,
+            element_id=element_id,
+            page_number=element.page_number,
+            bbox=element.bbox,
+            scope_path=scope_val,
+        )
+        self._sources[pair] = source
+        return source
+
+    def build_sources(self, group: Sequence[GroundedItem]) -> tuple[ElementSource, ...]:
+        """Resolve cited element ids across ``group`` into deduplicated :class:`ElementSource` instances."""
+        if not isinstance(group, Sequence) or not group:
+            raise ValueError("group must be a non-empty Sequence of GroundedItem")
+        pairs = (
+            (grounded.item.unit_id, element_id)
+            for grounded in group
+            for element_ids in grounded.item.element_ids_by_model.values()
+            for element_id in element_ids
+        )
+        sources: list[ElementSource] = []
+        for unit_id, element_id in dict.fromkeys(pairs):
+            resolved = self.resolve(unit_id, element_id)
+            if resolved is not None:
+                sources.append(resolved)
+        return tuple(sources)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -522,29 +612,19 @@ def _fold_group(
     group: Sequence[GroundedItem],
     *,
     units: Mapping[str, Unit],
-    doc_elements: Mapping[str, Mapping[str, DocumentElement]],
-    doc_scopes: Mapping[str, Mapping[str, GroupScope]],
-    unit_citable: Mapping[str, Mapping[str, DocumentElement]],
-    multimodal_units: frozenset[str] = frozenset(),
+    provenance: _ProvenanceIndex,
     schema: PreparedSchema,
 ) -> GroundedRecord[Any]:
     """Fold one group of :class:`GroundedItem` instances into a :class:`GroundedRecord`."""
     first = group[0]
     doc_id = units[first.item.unit_id].doc_id
-    sources = _build_sources(
-        group,
-        units=units,
-        doc_elements=doc_elements,
-        doc_scopes=doc_scopes,
-        unit_citable=unit_citable,
-        multimodal_units=multimodal_units,
-    )
+    sources = provenance.build_sources(group)
     quotes = _united(
         quotes_for_model for grounded in group for quotes_for_model in grounded.item.quotes_by_model.values()
     )
     if len(group) == 1:
         item = first.item
-        return GroundedRecord(
+        return GroundedRecord._trusted(
             doc_id=doc_id,
             unit_ids=(item.unit_id,),
             status=first.status,
@@ -560,44 +640,71 @@ def _fold_group(
             element_ids_by_model=item.element_ids_by_model,
             families=item.families,
         )
+    return _fold_multi_unit_group(group, doc_id=doc_id, sources=sources, quotes=quotes, schema=schema)
 
+
+def _aggregate_group_mappings(
+    group: Sequence[GroundedItem],
+) -> tuple[
+    tuple[str, ...],
+    Mapping[str, tuple[Mapping[str, Any], ...]],
+    Mapping[str, tuple[str, ...]],
+    Mapping[str, tuple[str, ...]],
+]:
+    """Unite ``unit_ids``, ``model_votes``, ``quotes_by_model``, and ``element_ids_by_model`` across ``group``."""
+    if not isinstance(group, Sequence) or len(group) < 2:
+        raise ValueError("_aggregate_group_mappings requires at least two GroundedItem entries")
     unit_ids = tuple(dict.fromkeys(grounded.item.unit_id for grounded in group))
-    model_ids = tuple(first.item.model_votes)
-    model_votes = {
-        model_id: tuple(vote for grounded in group for vote in grounded.item.model_votes[model_id])
-        for model_id in model_ids
-    }
-    quotes_by_model = {
-        model_id: _united(grounded.item.quotes_by_model[model_id] for grounded in group) for model_id in model_ids
-    }
-    element_ids_by_model = {
-        model_id: _united(grounded.item.element_ids_by_model[model_id] for grounded in group) for model_id in model_ids
-    }
+    model_ids = tuple(group[0].item.model_votes)
+    model_votes = MappingProxyType(
+        {
+            model_id: tuple(vote for grounded in group for vote in grounded.item.model_votes[model_id])
+            for model_id in model_ids
+        }
+    )
+    quotes_by_model = MappingProxyType(
+        {model_id: _united(grounded.item.quotes_by_model[model_id] for grounded in group) for model_id in model_ids}
+    )
+    element_ids_by_model = MappingProxyType(
+        {
+            model_id: _united(grounded.item.element_ids_by_model[model_id] for grounded in group)
+            for model_id in model_ids
+        }
+    )
+    return unit_ids, model_votes, quotes_by_model, element_ids_by_model
+
+
+def _fold_multi_unit_group(
+    group: Sequence[GroundedItem],
+    *,
+    doc_id: str,
+    sources: tuple[ElementSource, ...],
+    quotes: tuple[str, ...],
+    schema: PreparedSchema,
+) -> GroundedRecord[Any]:
+    """Fold two or more :class:`GroundedItem` instances sharing ``(doc_id, key)`` across units."""
+    first = group[0]
+    unit_ids, model_votes, quotes_by_model, element_ids_by_model = _aggregate_group_mappings(group)
     reasons = tuple(dict.fromkeys(reason for grounded in group for reason in grounded.reasons))
     disputed: list[str] = [path for grounded in group for path in grounded.item.disputed_fields]
     notes: list[str] = [note for grounded in group for note in grounded.item.notes]
-
     records = [grounded.item.record for grounded in group if grounded.item.record is not None]
-    all_have_records = len(records) == len(group)
     folder = _Folder()
-    wire = folder.fold_model(schema.spec, "", records, 1) if len(records) >= 2 else None
+    wire, valid_sources = folder.fold_model(schema.spec, "", records, 1) if len(records) >= 2 else (None, frozenset())
     disputed.extend(folder.disputed)
-    has_conflict = bool(folder.disputed)
-
-    folded_record: BaseModel | None = None
-    if all_have_records and not has_conflict and wire is not None:
-        built = _validated(wire, schema)
-        if isinstance(built, str):
-            has_conflict = True
-            notes.append(f"the folded record failed validation: {built}")
-        else:
-            folded_record = built
-
+    folded_record, has_conflict = _resolve_folded_record(
+        records,
+        wire,
+        valid_sources,
+        schema,
+        all_have_records=len(records) == len(group),
+        has_conflict=bool(folder.disputed),
+        notes=notes,
+    )
     status = _folded_status(group, has_conflict=has_conflict, has_reasons=bool(reasons))
     if status in ("field_disagreement", "unmatched", "cross_page_conflict"):
         folded_record = None
-
-    return GroundedRecord(
+    return GroundedRecord._trusted(
         doc_id=doc_id,
         unit_ids=unit_ids,
         status=status,
@@ -615,6 +722,30 @@ def _fold_group(
     )
 
 
+def _resolve_folded_record(
+    records: Sequence[BaseModel],
+    wire: dict[str, Any] | None,
+    valid_sources: frozenset[int],
+    schema: PreparedSchema,
+    *,
+    all_have_records: bool,
+    has_conflict: bool,
+    notes: list[str],
+) -> tuple[BaseModel | None, bool]:
+    """Return ``(folded_record, has_conflict)``, reusing ``records[source]`` when an instance matches unchanged."""
+    if not isinstance(records, Sequence) or not isinstance(notes, list) or not isinstance(schema, PreparedSchema):
+        raise TypeError("_resolve_folded_record requires Sequence records, list notes, and PreparedSchema")
+    if not all_have_records or has_conflict or wire is None:
+        return None, has_conflict
+    if valid_sources:
+        return records[min(valid_sources)], False
+    built = _validated(wire, schema)
+    if isinstance(built, str):
+        notes.append(f"the folded record failed validation: {built}")
+        return None, True
+    return built, False
+
+
 def _folded_status(group: Sequence[GroundedItem], *, has_conflict: bool, has_reasons: bool) -> RecordStatus:
     """Rank the status of a multi-unit group by worst-status precedence (module notes, 4)."""
     if has_conflict:
@@ -626,7 +757,7 @@ def _folded_status(group: Sequence[GroundedItem], *, has_conflict: bool, has_rea
 
 
 class _Folder:
-    """Cross-unit recursive model folder (module notes, 3)."""
+    """Cross-unit recursive model folder with source-instance tracking (module notes, 3)."""
 
     __slots__ = ("disputed",)
 
@@ -639,20 +770,27 @@ class _Folder:
         path: str,
         instances: Sequence[BaseModel],
         depth: int,
-    ) -> dict[str, Any] | None:
-        """Fold ``instances`` of ``spec`` across units into a wire dict, or ``None`` on conflict."""
+    ) -> tuple[dict[str, Any] | None, frozenset[int]]:
+        """Fold ``instances`` of ``spec`` across units into ``(wire_or_none, matching_instance_indices)``."""
         if depth > MAX_DEPTH:
             raise RationalizationError(f"{path or spec.model.__name__}: nesting is deeper than {MAX_DEPTH} levels")
         wire: dict[str, Any] = {}
+        candidates: set[int] = set(range(len(instances)))
         complete = True
         for field_spec in spec.fields:
             field_path = f"{path}.{field_spec.name}" if path else field_spec.name
-            ok, has_value, value = self._fold_field(field_spec, field_path, instances, depth)
+            ok, has_value, value, field_matches = self._fold_field(field_spec, field_path, instances, depth)
             if not ok:
                 complete = False
-            elif has_value:
+                candidates.clear()
+                continue
+            if has_value:
                 wire[field_spec.wire_name] = value
-        return wire if complete else None
+            if candidates:
+                candidates &= field_matches
+        if not complete:
+            return None, frozenset()
+        return wire, frozenset(candidates)
 
     def _fold_field(
         self,
@@ -660,8 +798,8 @@ class _Folder:
         field_path: str,
         instances: Sequence[BaseModel],
         depth: int,
-    ) -> tuple[bool, bool, Any]:
-        """Fold one field across ``instances``: returns ``(ok, include_in_wire, wire_value)``."""
+    ) -> tuple[bool, bool, Any, frozenset[int]]:
+        """Fold one field across ``instances``: returns ``(ok, include_in_wire, wire_value, matching_indices)``."""
         child = field_spec.child
         if field_spec.kind == "model" and child is not None:
             return self._fold_nested_model(field_spec, child, field_path, instances, depth)
@@ -676,16 +814,27 @@ class _Folder:
         field_path: str,
         instances: Sequence[BaseModel],
         depth: int,
-    ) -> tuple[bool, bool, Any]:
+    ) -> tuple[bool, bool, Any, frozenset[int]]:
         """Fold an Optional or required nested ``BaseModel`` field across units."""
-        present = [getattr(inst, field_spec.name) for inst in instances if getattr(inst, field_spec.name) is not None]
+        present = [
+            (idx, sub) for idx, inst in enumerate(instances) if (sub := getattr(inst, field_spec.name)) is not None
+        ]
         if not present:
             include = field_spec.required or any(field_spec.name in inst.model_fields_set for inst in instances)
-            return True, include, None
+            matches = frozenset(
+                idx for idx, inst in enumerate(instances) if (field_spec.name in inst.model_fields_set) == include
+            )
+            return True, include, None, matches
         if len(present) == 1:
-            return True, True, _instance_wire(present[0], child, depth + 1)
-        folded = self.fold_model(child, field_path, present, depth + 1)
-        return (folded is not None), (folded is not None), folded
+            only_idx, only_sub = present[0]
+            matches = frozenset({only_idx}) if field_spec.name in instances[only_idx].model_fields_set else frozenset()
+            return True, True, _instance_wire(only_sub, child, depth + 1), matches
+        folded, child_matches = self.fold_model(child, field_path, [sub for _, sub in present], depth + 1)
+        if folded is None:
+            return False, False, None, frozenset()
+        selected = [present[pos][0] for pos in child_matches]
+        matches = frozenset(idx for idx in selected if field_spec.name in instances[idx].model_fields_set)
+        return True, True, folded, matches
 
     def _fold_keyed_list(
         self,
@@ -694,7 +843,7 @@ class _Folder:
         field_path: str,
         instances: Sequence[BaseModel],
         depth: int,
-    ) -> tuple[bool, bool, Any]:
+    ) -> tuple[bool, bool, Any, frozenset[int]]:
         """Union and fold a keyed ``list[ChildModel]`` across units in first-seen child key order."""
         groups: dict[tuple[object, ...], list[BaseModel]] = {}
         for inst in instances:
@@ -702,20 +851,29 @@ class _Folder:
                 groups.setdefault(_key_of(child_inst, child), []).append(child_inst)
         if not groups:
             include = field_spec.required or any(field_spec.name in inst.model_fields_set for inst in instances)
-            return True, include, []
+            matches = frozenset(
+                idx for idx, inst in enumerate(instances) if (field_spec.name in inst.model_fields_set) == include
+            )
+            return True, include, [], matches
         merged_list: list[dict[str, Any]] = []
+        accepted_ids: list[frozenset[int]] = []
         list_ok = True
         for child_instances in groups.values():
-            child_path = f"{field_path}[{_key_text(child_instances[0], child)}]"
             if len(child_instances) == 1:
                 merged_list.append(_instance_wire(child_instances[0], child, depth + 1))
+                accepted_ids.append(frozenset({id(child_instances[0])}))
+                continue
+            child_path = f"{field_path}[{_key_text(child_instances[0], child)}]"
+            folded_child, child_matches = self.fold_model(child, child_path, child_instances, depth + 1)
+            if folded_child is None:
+                list_ok = False
             else:
-                folded_child = self.fold_model(child, child_path, child_instances, depth + 1)
-                if folded_child is None:
-                    list_ok = False
-                else:
-                    merged_list.append(folded_child)
-        return list_ok, list_ok, merged_list
+                merged_list.append(folded_child)
+                accepted_ids.append(frozenset(id(child_instances[pos]) for pos in child_matches))
+        if not list_ok:
+            return False, False, None, frozenset()
+        matches = _matching_keyed_list_parents(instances, field_spec.name, accepted_ids)
+        return True, True, merged_list, matches
 
     def _fold_leaf(
         self,
@@ -723,22 +881,38 @@ class _Folder:
         field_path: str,
         instances: Sequence[BaseModel],
         depth: int,
-    ) -> tuple[bool, bool, Any]:
+    ) -> tuple[bool, bool, Any, frozenset[int]]:
         """Fold a scalar, ``scalar_list`` or unkeyed ``model_list`` field across units."""
         explicit = [inst for inst in instances if _is_explicit(inst, field_spec)]
         if not explicit:
             include = field_spec.required or any(field_spec.name in inst.model_fields_set for inst in instances)
             if not include:
-                return True, False, None
+                matches = frozenset(
+                    idx
+                    for idx, inst in enumerate(instances)
+                    if field_spec.name not in inst.model_fields_set
+                    and _same_raw_leaf(field_spec, instances[0], inst, depth)
+                )
+                return True, False, None, matches
             source = next((inst for inst in instances if field_spec.name in inst.model_fields_set), instances[0])
-            return True, True, _dump_leaf(source, field_spec, depth)
-        if field_spec.informational:
-            return True, True, _dump_leaf(explicit[0], field_spec, depth)
-        norms = {_normalized_field(field_spec, getattr(inst, field_spec.name)) for inst in explicit}
-        if len(norms) > 1:
-            self.disputed.append(field_path)
-            return False, False, None
-        return True, True, _dump_leaf(explicit[0], field_spec, depth)
+            matches = frozenset(
+                idx
+                for idx, inst in enumerate(instances)
+                if field_spec.name in inst.model_fields_set and _same_raw_leaf(field_spec, source, inst, depth)
+            )
+            return True, True, _dump_leaf(source, field_spec, depth), matches
+        if not field_spec.informational:
+            norms = {_normalized_field(field_spec, getattr(inst, field_spec.name)) for inst in explicit}
+            if len(norms) > 1:
+                self.disputed.append(field_path)
+                return False, False, None, frozenset()
+        winner = explicit[0]
+        matches = frozenset(
+            idx
+            for idx, inst in enumerate(instances)
+            if field_spec.name in inst.model_fields_set and _same_raw_leaf(field_spec, winner, inst, depth)
+        )
+        return True, True, _dump_leaf(winner, field_spec, depth), matches
 
 
 def _is_explicit(instance: BaseModel, field_spec: FieldSpec) -> bool:
@@ -753,28 +927,120 @@ def _is_explicit(instance: BaseModel, field_spec: FieldSpec) -> bool:
     return field_spec.required or field_spec.name in instance.model_fields_set
 
 
-def _instance_wire(instance: BaseModel, spec: ModelSpec, depth: int) -> dict[str, Any]:
-    """Serialize ``instance`` to a wire dict for ``model_validate``, omitting unset defaulted fields."""
+def _matching_keyed_list_parents(
+    instances: Sequence[BaseModel],
+    field_name: str,
+    accepted_ids: Sequence[frozenset[int]],
+) -> frozenset[int]:
+    """Return indices of ``instances`` whose list ``field_name`` matches ``accepted_ids`` 1:1 in order."""
+    if not field_name or not accepted_ids:
+        raise ValueError("_matching_keyed_list_parents requires non-empty field_name and accepted_ids")
+    target_len = len(accepted_ids)
+    matched: list[int] = []
+    for idx, inst in enumerate(instances):
+        if field_name not in inst.model_fields_set:
+            continue
+        own_list = getattr(inst, field_name)
+        if len(own_list) == target_len and all(id(own_list[pos]) in accepted_ids[pos] for pos in range(target_len)):
+            matched.append(idx)
+    return frozenset(matched)
+
+
+def _scalar_to_wire(value: object) -> Any:
+    """Serialize one validated scalar value to its JSON-mode wire primitive in O(1)."""
+    if type(value) is float and not math.isfinite(value):
+        raise ValueError("non-finite float cannot be serialized to wire")
+    if value is None or type(value) in _PLAIN_WIRE_SCALARS:
+        return value
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    raise TypeError(f"unsupported scalar wire value of type {type(value).__name__}")
+
+
+def _same_raw_scalar(left: object, right: object) -> bool:
+    """Whether two validated scalars share exact Python type, value, Decimal scale, float sign, and tzinfo."""
+    if isinstance(left, (dict, list, BaseModel)) or isinstance(right, (dict, list, BaseModel)):
+        raise TypeError("_same_raw_scalar requires scalar values, not containers or models")
+    if left is right:
+        return True
+    if type(left) is not type(right) or left != right:
+        return False
+    if isinstance(left, Decimal):
+        return left.as_tuple() == cast(Decimal, right).as_tuple()
+    if isinstance(left, datetime):
+        return left.tzinfo == cast(datetime, right).tzinfo
+    if isinstance(left, float):
+        return math.copysign(1.0, left) == math.copysign(1.0, cast(float, right))
+    return True
+
+
+def _same_raw_model(left: BaseModel, right: BaseModel, spec: ModelSpec, depth: int) -> bool:
+    """Whether two validated model instances have identical ``model_fields_set`` and raw field values."""
+    if left is right:
+        return True
     if depth > MAX_DEPTH:
         raise RationalizationError(f"{spec.model.__name__}: nesting is deeper than {MAX_DEPTH} levels")
-    dumped = _dumped(instance)
-    wire: dict[str, Any] = {}
+    if type(left) is not type(right) or left.model_fields_set != right.model_fields_set:
+        return False
     for field_spec in spec.fields:
-        if not field_spec.required and field_spec.name not in instance.model_fields_set:
+        if field_spec.kind == "model" and field_spec.child is not None:
+            sub_l, sub_r = getattr(left, field_spec.name), getattr(right, field_spec.name)
+            if (sub_l is None) != (sub_r is None):
+                return False
+            if sub_l is not None and not _same_raw_model(sub_l, sub_r, field_spec.child, depth + 1):
+                return False
+        elif not _same_raw_leaf(field_spec, left, right, depth):
+            return False
+    return True
+
+
+def _same_raw_leaf(field_spec: FieldSpec, target: BaseModel, candidate: BaseModel, depth: int) -> bool:
+    """Whether ``candidate`` holds the exact same raw leaf value for ``field_spec`` as ``target``."""
+    if not isinstance(target, BaseModel) or not isinstance(candidate, BaseModel):
+        raise TypeError("target and candidate must be BaseModel instances")
+    if target is candidate:
+        return True
+    left, right = getattr(target, field_spec.name), getattr(candidate, field_spec.name)
+    if field_spec.kind == "scalar":
+        return _same_raw_scalar(left, right)
+    if field_spec.kind == "scalar_list":
+        return len(left) == len(right) and all(_same_raw_scalar(a, b) for a, b in zip(left, right))
+    if field_spec.kind == "model_list" and field_spec.child is not None:
+        child = field_spec.child
+        return len(left) == len(right) and all(_same_raw_model(a, b, child, depth + 1) for a, b in zip(left, right))
+    return False
+
+
+def _instance_wire(instance: BaseModel, spec: ModelSpec, depth: int) -> dict[str, Any]:
+    """Serialize ``instance`` to a wire dict for ``model_validate``, omitting unset defaulted fields."""
+    if not isinstance(instance, BaseModel):
+        raise TypeError(f"instance must be a BaseModel, got {type(instance).__name__}")
+    if depth > MAX_DEPTH:
+        raise RationalizationError(f"{spec.model.__name__}: nesting is deeper than {MAX_DEPTH} levels")
+    wire: dict[str, Any] = {}
+    fields_set = instance.model_fields_set
+    for field_spec in spec.fields:
+        if not field_spec.required and field_spec.name not in fields_set:
             continue
         if field_spec.kind == "model" and field_spec.child is not None:
             sub = getattr(instance, field_spec.name)
             wire[field_spec.wire_name] = None if sub is None else _instance_wire(sub, field_spec.child, depth + 1)
-        elif field_spec.kind == "model_list" and field_spec.child is not None:
-            items = getattr(instance, field_spec.name)
-            wire[field_spec.wire_name] = [_instance_wire(item, field_spec.child, depth + 1) for item in items]
         else:
-            wire[field_spec.wire_name] = dumped[field_spec.name]
+            wire[field_spec.wire_name] = _dump_leaf(instance, field_spec, depth)
     return wire
 
 
 def _dump_leaf(instance: BaseModel, field_spec: FieldSpec, depth: int) -> Any:
-    """Serialize a scalar, ``scalar_list``, or unkeyed ``model_list`` field of ``instance`` for ``model_validate``."""
+    """Serialize a scalar, ``scalar_list``, or ``model_list`` field of ``instance`` for ``model_validate``."""
+    if not isinstance(instance, BaseModel) or depth < 1:
+        raise ValueError("_dump_leaf requires BaseModel instance and depth >= 1")
+    value = getattr(instance, field_spec.name)
     if field_spec.kind == "model_list" and field_spec.child is not None:
-        return [_instance_wire(item, field_spec.child, depth + 1) for item in getattr(instance, field_spec.name)]
-    return _dumped(instance)[field_spec.name]
+        return [_instance_wire(item, field_spec.child, depth + 1) for item in value]
+    if field_spec.kind == "scalar_list":
+        return [_scalar_to_wire(item) for item in value]
+    return _scalar_to_wire(value)
