@@ -67,6 +67,7 @@ the standard library and the package's own modules: no pydantic, no httpx, nothi
 import inside a function (invariant 9).
 """
 
+import base64
 import encodings.idna  # noqa: F401  # the "idna" codec check_endpoint uses, loaded here rather than on a worker thread
 import inspect
 import ipaddress
@@ -82,7 +83,7 @@ from urllib.parse import SplitResult, urlsplit
 
 from datagrunt.rationalization._canonical import canonical_copy
 from datagrunt.rationalization.exceptions import RationalizationError
-from datagrunt.rationalization.wire import ModelRequest, ProviderResponse
+from datagrunt.rationalization.wire import PNG_SIGNATURE, ModelRequest, ProviderResponse
 
 ProviderKind: TypeAlias = Literal["openai", "anthropic", "gemini", "ollama", "openai-compatible"]
 """The prefix of a model string: the provider that receives the documents."""
@@ -910,3 +911,35 @@ def api_key_from_env(var: str) -> _Secret | None:
             "trailing whitespace (a newline included)"
         )
     return key
+
+
+ImageB64Cache: TypeAlias = tuple[tuple[bytes, ...], tuple[str, ...]]
+"""Single-entry per-instance memo tuple ``(raw_png_tuple, base64_ascii_tuple)``."""
+
+
+def encode_png_b64(img: bytes) -> str:
+    """Encode raw PNG ``bytes`` to an ASCII base64 string."""
+    if type(img) is not bytes:
+        raise TypeError(f"img must be bytes, got {type(img).__name__}")
+    if not img.startswith(PNG_SIGNATURE):
+        raise ValueError("img must start with the PNG signature")
+    return base64.b64encode(img).decode("ascii")
+
+
+def encode_images_b64(
+    images: tuple[bytes, ...],
+    cached: ImageB64Cache | None = None,
+) -> tuple[tuple[str, ...], ImageB64Cache | None]:
+    """Encode ``images`` to ASCII base64 strings, reusing ``cached`` on tuple hit."""
+    if not isinstance(images, tuple):
+        raise TypeError(f"images must be a tuple of bytes, got {type(images).__name__}")
+    if not images:
+        return (), cached
+    if (
+        cached is not None
+        and len(cached[0]) == len(images)
+        and (cached[0] is images or all(a is b or a == b for a, b in zip(cached[0], images, strict=True)))
+    ):
+        return cached[1], cached
+    encoded = tuple(encode_png_b64(img) for img in images)
+    return encoded, (images, encoded)

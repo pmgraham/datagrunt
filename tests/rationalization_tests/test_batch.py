@@ -1,13 +1,19 @@
 """Tests for per-provider concurrency caps, prompt schema trimming, and offline cloud batch mode (#464)."""
 
+import base64
+import dataclasses
+import hashlib
 import json
 import threading
 import time
+import tracemalloc
 from pathlib import Path
 from typing import Any
 
 import pytest
+from pdf_tests.documents import ids, metadata, page
 
+from datagrunt.pdf.elements import PageImage, Paragraph, PDFDocument
 from datagrunt.rationalization import (
     AnthropicProvider,
     BatchItem,
@@ -22,6 +28,9 @@ from datagrunt.rationalization import (
     prepare_batch,
     rationalize,
 )
+from datagrunt.rationalization import batch as batch_module
+from datagrunt.rationalization.cache import FileCache
+from datagrunt.rationalization.providers import base as base_module
 from datagrunt.rationalization.runner import RunLimits, _slot_counts, snapshot_providers
 from datagrunt.rationalization.schema import prepare
 from datagrunt.rationalization.wire import ModelRequest
@@ -52,7 +61,7 @@ class TestPerProviderConcurrencyCap:
 
             for bad in (0, -1, 65, True, "2"):
                 with pytest.raises(RationalizationError, match="max_concurrency"):
-                    provider.with_max_concurrency(bad)  # type: ignore[arg-type]
+                    getattr(provider, "with_max_concurrency")(bad)
 
     def test_slot_counts_respects_per_provider_max_concurrency(self) -> None:
         prepared = prepare(Assembly)
@@ -333,11 +342,6 @@ MM_BATCH_PNG = b"\x89PNG\r\n\x1a\nBATCH_SCAN_PNG"
 
 class TestMultimodalBatch:
     def test_prepare_batch_serializes_multimodal_png_bands_for_vertex_and_anthropic(self, tmp_path) -> None:
-        import base64
-        import dataclasses
-
-        from datagrunt.pdf.elements import PageImage, PDFDocument
-
         scan_img = PageImage(
             page_number=1,
             dpi=300.0,
@@ -376,3 +380,163 @@ class TestMultimodalBatch:
             "type": "image",
             "source": {"type": "base64", "media_type": "image/png", "data": b64},
         }
+
+    def test_multimodal_jsonl_export_shares_base64_across_witnesses(self, tmp_path: Path, monkeypatch) -> None:
+        scan_img = PageImage(
+            page_number=1,
+            dpi=300.0,
+            width_px=1200,
+            height_px=1600,
+            _band_loader=lambda: (MM_BATCH_PNG,),
+        )
+        scan_page = dataclasses.replace(BOM_DOC.pages[0], route="vision", page_image=scan_img)
+        scan_doc = PDFDocument(metadata=dataclasses.replace(BOM_DOC.metadata, page_count=1), pages=(scan_page,))
+        gem1 = GeminiProvider("gemini-2.5-flash", api_key="AIzaSyDummyKeyForOfflineBatch11111")
+        gem2 = GeminiProvider("gemini-2.5-pro", api_key="AIzaSyDummyKeyForOfflineBatch22222")
+        ant = AnthropicProvider("claude-sonnet-4-6", api_key="sk-ant-dummy-key-offline-batch-33333")
+        plan = prepare_batch(scan_doc, schema=Assembly, prompt="Extract BOM.", models=(gem1, gem2, ant))
+
+        encode_calls: list[bytes] = []
+        real_encode = base_module.encode_png_b64
+
+        def spy_encode(img: bytes) -> str:
+            encode_calls.append(img)
+            return real_encode(img)
+
+        monkeypatch.setattr(base_module, "encode_png_b64", spy_encode)
+        assert plan.to_vertex_jsonl(tmp_path / "two_vertex.jsonl") == 2
+        assert len(encode_calls) == 1
+
+
+class TestStreamingBatchIOAndPutMany:
+    def test_streaming_jsonl_export_and_load_bound_peak_memory(self, tmp_path: Path) -> None:
+        pages = tuple(
+            page(idx, (Paragraph(**ids(idx, 0, ()), text=f"Assembly A-{idx:03d} " + ("pad " * 2500)),))
+            for idx in range(1, 33)
+        )
+        big_doc = PDFDocument(
+            metadata=metadata(len(pages), source_name="many.pdf", sha=hashlib.sha256(b"many.pdf").hexdigest()),
+            pages=pages,
+        )
+        gem = GeminiProvider("gemini-2.5-flash", api_key="AIzaSyDummyKeyForOfflineBatch44444")
+        ant = AnthropicProvider("claude-sonnet-4-6", api_key="sk-ant-dummy-key-offline-batch-55555")
+        models = (gem, ant)
+        plan = prepare_batch(big_doc, schema=Assembly, prompt="Extract BOM.", models=models, coalesce_sections=False)
+        assert len(plan.items) == 64
+
+        v_path = tmp_path / "stream_vertex.jsonl"
+        tracemalloc.start()
+        try:
+            written = plan.to_vertex_jsonl(v_path)
+            _, export_peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert written == 32
+        assert v_path.stat().st_size > 400_000
+        assert export_peak < 350_000
+
+        out_jsonl = tmp_path / "stream_out.jsonl"
+        with out_jsonl.open("w", encoding="utf-8") as handle:
+            for idx in range(60):
+                cid = plan.items[0].custom_id if idx == 0 else f"extra_{idx:04d}"
+                handle.write(json.dumps({"custom_id": cid, "pad": "z" * 40_000}) + "\n")
+
+        loaded: dict[Any, object] = {}
+        tracemalloc.start()
+        try:
+            batch_module._load_jsonl_file(
+                out_jsonl,
+                loaded,
+                seen_ids=set(),
+                wanted_ids=frozenset({plan.items[0].custom_id}),
+            )
+            _, load_peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert list(loaded) == [plan.items[0].custom_id]
+        assert out_jsonl.stat().st_size > 2_000_000
+        assert load_peak < 500_000
+
+    def test_jsonl_loader_rejects_duplicate_ids_invalid_utf8_and_oversize_lines(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        dup_path = tmp_path / "dup.jsonl"
+        dup_path.write_text('{"custom_id":"k1","records":[]}\n{"custom_id":"k1","records":[]}\n', encoding="utf-8")
+        with pytest.raises(RationalizationError, match="duplicate custom_id"):
+            batch_module._load_jsonl_file(dup_path, {})
+
+        bad_utf8 = tmp_path / "bad_utf8.jsonl"
+        bad_utf8.write_bytes(b'{"custom_id":"k1","x":"\xff"}\n')
+        with pytest.raises(RationalizationError, match="invalid UTF-8"):
+            batch_module._load_jsonl_file(bad_utf8, {})
+
+        monkeypatch.setattr(batch_module, "BATCH_LINE_MAX_BYTES", 64)
+        exact_k1 = '{"custom_id":"k1","p":"' + ("a" * 39) + '"}'
+        exact_k2 = '{"custom_id":"k2","p":"' + ("b" * 39) + '"}'
+        assert len(exact_k1.encode("utf-8")) == 64
+        exact_path = tmp_path / "exact_64.jsonl"
+        exact_path.write_bytes(exact_k1.encode("utf-8") + b"\n" + exact_k2.encode("utf-8") + b"\r\n")
+        exact_out: dict[Any, object] = {}
+        batch_module._load_jsonl_file(exact_path, exact_out)
+        assert set(exact_out) == {"k1", "k2"}
+
+        long_line = tmp_path / "long.jsonl"
+        long_line.write_bytes(('{"custom_id":"k1","p":"' + ("x" * 40) + '"}').encode("utf-8") + b"\n")
+        with pytest.raises(RationalizationError, match="exceeds 64 bytes"):
+            batch_module._load_jsonl_file(long_line, {})
+
+    def test_ingest_batch_persists_via_put_many_once(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        cache_dir = tmp_path / "pm_cache"
+        p_google, p_anthropic, _ = make_bom_providers()
+        plan = prepare_batch(
+            BOM_DOC,
+            schema=Assembly,
+            prompt="Extract BOM.",
+            models=(p_google, p_anthropic),
+            cache_dir=cache_dir,
+            coalesce_sections=False,
+        )
+        put_many_batches: list[int] = []
+        real_put_many = FileCache.put_many
+
+        def spy_put_many(self, items):
+            materialized = list(items)
+            put_many_batches.append(len(materialized))
+            return real_put_many(self, materialized)
+
+        monkeypatch.setattr(FileCache, "put_many", spy_put_many)
+        responses = {item.custom_id: _bom_response_for(item.request) for item in plan.items}
+        result = ingest_batch(plan, responses)
+        assert len(result.records) == 2
+        assert put_many_batches == [len(plan.items)]
+
+    def test_ingest_batch_falls_back_to_per_entry_put_when_put_many_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cache_dir = tmp_path / "fallback_cache"
+        p_google, p_anthropic, _ = make_bom_providers()
+        plan = prepare_batch(
+            BOM_DOC,
+            schema=Assembly,
+            prompt="Extract BOM.",
+            models=(p_google, p_anthropic),
+            cache_dir=cache_dir,
+            coalesce_sections=False,
+        )
+        put_keys: list[str] = []
+        real_put = FileCache.put
+
+        def fail_put_many(self, items):
+            raise RationalizationError("simulated shard write failure")
+
+        def spy_put(self, key, response, meta):
+            put_keys.append(key)
+            return real_put(self, key, response, meta)
+
+        monkeypatch.setattr(FileCache, "put_many", fail_put_many)
+        monkeypatch.setattr(FileCache, "put", spy_put)
+        responses = {item.custom_id: _bom_response_for(item.request) for item in plan.items}
+        result = ingest_batch(plan, responses)
+        assert len(result.records) == 2
+        assert result.telemetry.cache_write_failures == 0
+        assert put_keys == [item.key for item in plan.items]

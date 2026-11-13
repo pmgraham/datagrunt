@@ -160,7 +160,6 @@ The module imports the standard library and the package's own modules (the HTTP 
 import inside a function (invariant 9).
 """
 
-import base64
 import math
 import time
 from collections.abc import Mapping
@@ -181,12 +180,14 @@ from datagrunt.rationalization._refs import (
 )
 from datagrunt.rationalization.exceptions import RationalizationError
 from datagrunt.rationalization.providers.base import (
+    ImageB64Cache,
     ModelString,
     PermanentProviderError,
     _Secret,
     _secret_problem,
     api_key_from_env,
     check_endpoint,
+    encode_images_b64,
     endpoint_model_id,
 )
 from datagrunt.rationalization.providers.google_cloud import (
@@ -431,7 +432,10 @@ def _http_client(max_connections: int, allow_insecure_http: bool, transport: obj
     problem = ""
     try:  # the helper checks the transport's type at run time
         return HttpClient(
-            max_connections=max_connections, allow_insecure_http=allow_insecure_http, transport=cast(Any, transport)
+            max_connections=max_connections,
+            keepalive_connections=max_connections,
+            allow_insecure_http=allow_insecure_http,
+            transport=cast(Any, transport),
         )
     except TypeError as error:  # its message names the transport's type, never a key
         problem = str(error)
@@ -505,6 +509,9 @@ class _Walk:
         self.copy_children(node, source)
         self.copy_limits(node, source, hints)
         _add_hints(node.target, hints)
+        ordered = {key: node.target[key] for key in sorted(node.target)}
+        node.target.clear()
+        node.target.update(ordered)
 
     def convert_ref(self, node: _Node, ref: object) -> None:
         """A ``$ref`` is kept alone (its siblings dropped), and must name a root ``$defs`` entry."""
@@ -716,8 +723,7 @@ def transform_schema(schema: Mapping[str, Any], *, check_limits: bool = True) ->
     walk.run()
     if check_limits:
         _check_limits(*parameter_counts(result))
-    copy: dict[str, Any] = canonical_copy(result, subject="the transformed response schema")
-    return copy
+    return result
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -843,7 +849,16 @@ class AnthropicProvider:
             has no explicit key; the message names the option or the variable and never shows a key.
     """
 
-    __slots__ = ("_http", "_max_concurrency", "_max_connections", "_model", "_route", "_schema_mode", "_temperature")
+    __slots__ = (
+        "_http",
+        "_last_images_b64",
+        "_max_concurrency",
+        "_max_connections",
+        "_model",
+        "_route",
+        "_schema_mode",
+        "_temperature",
+    )
 
     def __init__(
         self,
@@ -897,6 +912,7 @@ class AnthropicProvider:
         self._http = _http_client(connections, allow_insecure_http, transport)
         self._max_connections = connections
         self._max_concurrency: int | None = None
+        self._last_images_b64: ImageB64Cache | None = None
         self._route = route
         self._model = model
         self._temperature = temperature
@@ -1057,6 +1073,12 @@ class AnthropicProvider:
         """
         self._http.open()
 
+    def close(self) -> None:
+        """Close the HTTP clients now (in-flight requests finish first). Idempotent and optional."""
+        client = getattr(self, "_http", None)
+        if client is not None:
+            client.close()
+
     def generate(self, request: ModelRequest) -> ProviderResponse:
         """Send one request and read its reply (module notes, 5-6).
 
@@ -1081,6 +1103,7 @@ class AnthropicProvider:
         return _parse_reply(reply, allow_fence=True)
 
     def _send_body(self, request: ModelRequest, *, use_output_config: bool, deadline: float) -> HttpReply:
+        b64s, self._last_images_b64 = encode_images_b64(request.images, self._last_images_b64)
         user_content: str | list[dict[str, Any]] = (
             [
                 *[
@@ -1089,14 +1112,14 @@ class AnthropicProvider:
                         "source": {
                             "type": "base64",
                             "media_type": "image/png",
-                            "data": base64.b64encode(img).decode("ascii"),
+                            "data": data,
                         },
                     }
-                    for img in request.images
+                    for data in b64s
                 ],
                 {"type": "text", "text": request.user_envelope},
             ]
-            if request.images
+            if b64s
             else request.user_envelope
         )
         body: dict[str, Any] = {

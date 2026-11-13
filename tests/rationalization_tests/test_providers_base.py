@@ -1748,3 +1748,26 @@ def test_importing_the_rationalization_package_does_not_import_the_providers():
 
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout.strip().splitlines()[-1]) == []
+
+
+def test_encode_png_b64_and_encode_images_b64_validate_and_reuse_cache():
+    png_a = b"\x89PNG\r\n\x1a\nAAAA"
+    png_b = b"\x89PNG\r\n\x1a\nBBBB"
+    encoded_a = base_module.encode_png_b64(png_a)
+    assert encoded_a.isascii() and encoded_a
+
+    images = (png_a, png_b)
+    first_b64s, cache1 = base_module.encode_images_b64(images, None)
+    second_b64s, cache2 = base_module.encode_images_b64(images, cache1)
+    assert first_b64s == (encoded_a, base_module.encode_png_b64(png_b))
+    assert second_b64s is first_b64s and cache2 is cache1
+
+    empty_b64s, empty_cache = base_module.encode_images_b64((), cache1)
+    assert empty_b64s == () and empty_cache is cache1
+
+    with pytest.raises(TypeError, match="bytes"):
+        base_module.encode_png_b64("not-bytes")
+    with pytest.raises(ValueError, match="PNG"):
+        base_module.encode_png_b64(b"JFIF")
+    with pytest.raises(TypeError, match="tuple"):
+        base_module.encode_images_b64([png_a], None)

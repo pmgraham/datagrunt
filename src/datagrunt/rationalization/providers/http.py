@@ -4,14 +4,14 @@
 share one), or at once by :meth:`HttpClient.open` on the caller's thread (the runner calls it at preflight, so no
 module is first imported on a worker thread, #458). Both are closed by a ``weakref.finalize`` when the helper is
 garbage-collected: ``close()`` (or ``with``) only releases them early, a request in flight finishes first, and the
-helper stays usable after it. Neither follows a redirect; neither keeps a connection alive (every request opens its
-own, so its socket can be cut at the deadline); both send ``User-Agent: datagrunt/<version>`` and
-``Accept-Encoding: identity`` and hold at most ``max_connections`` connections. After a transport failure (a network
-error, a cut at the deadline, a TLS failure) the client that failed is retired: the next request gets a fresh one,
-and the old one closes when its last request ends. This works around a defect of httpcore 1.0.9: when the TLS
-handshake of a tunnelled (``CONNECT``) connection fails or is cut, the connection stays ACTIVE in the pool, so
-``max_connections`` such failures would hang every later request until ``close()``. Keep-alive is off, so a fresh
-client loses nothing.
+helper stays usable after it. Neither follows a redirect; both send ``User-Agent: datagrunt/<version>`` and
+``Accept-Encoding: identity`` and hold at most ``max_connections`` connections. By default ``keepalive_connections=0``
+opens a fresh connection per request; when ``keepalive_connections > 0``, :class:`_BoundConnection` retains a pre-TLS
+plain ``socket.socket`` duplicate across pooled HTTP/1.1 reuse so reused sockets can still be cut at the deadline.
+After a transport failure (a network error, a cut at the deadline, a TLS failure) the client that failed is retired:
+the next request gets a fresh one, and the old one closes when its last request ends. This works around a defect of
+httpcore 1.0.9: when the TLS handshake of a tunnelled (``CONNECT``) connection fails or is cut, the connection stays
+ACTIVE in the pool, so ``max_connections`` such failures would hang every later request until ``close()``.
 
 - **Loopback** (``localhost``, ``127.0.0.0/8``, ``::1``: Ollama, vLLM on this machine) uses a client with
   ``trust_env=False``: it never goes through a proxy and ignores the environment's certificate settings
@@ -130,6 +130,7 @@ TRANSIENT_STATUSES = frozenset({408, 429, 500, 502, 503, 504, 520, 521, 522, 523
 CONNECT_TIMEOUT_S = 10.0
 WRITE_TIMEOUT_S = 15.0
 POOL_TIMEOUT_S = 10.0
+KEEPALIVE_EXPIRY_S = 15.0
 
 MAX_CONNECTIONS_LIMIT = 1_024
 """The largest pool a helper may ask for."""
@@ -352,14 +353,25 @@ def _encode_body(body: object) -> bytes:
 # ---------------------------------------------------------------------------------------------------------------
 
 
-def _json_object(data: bytes) -> dict[str, Any] | None:
-    """The body as a strict JSON object (rule 6), or ``None``: parsed by
-    :func:`~datagrunt.rationalization._canonical.strict_loads`, as a model's JSON text is."""
+def _decode_body(data: bytes) -> tuple[dict[str, Any] | None, str]:
+    """Decode ``data`` once on valid UTF-8 and parse a strict JSON object when present (rule 6)."""
+    if not isinstance(data, bytes):
+        raise TypeError(f"data must be bytes, got {type(data).__name__}")
     try:
-        value = strict_loads(data.decode("utf-8"))
-    except (ValueError, RecursionError):  # a UnicodeDecodeError or a JSONDecodeError is a ValueError
-        return None
-    return value if isinstance(value, dict) else None
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, data.decode("utf-8", errors="replace")
+    try:
+        value = strict_loads(text)
+    except (ValueError, RecursionError):
+        return None, text
+    return (value if isinstance(value, dict) else None), text
+
+
+def _json_object(data: bytes) -> dict[str, Any] | None:
+    """Parse ``data`` as a strict UTF-8 JSON object, or return ``None``."""
+    parsed, _ = _decode_body(data)
+    return parsed
 
 
 def _error_text(parsed: Mapping[str, Any] | None, text: str) -> str:
@@ -379,8 +391,8 @@ def _error_text(parsed: Mapping[str, Any] | None, text: str) -> str:
 def _error_detail(data: bytes, secrets: tuple[_Secret, ...]) -> str:
     """An error reply's detail (rule 8), every key of the request redacted; it returns, so no raw text is left
     in the locals of the frame that raises."""
-    text = data.decode("utf-8", errors="replace")
-    detail = _error_text(_json_object(data), text)
+    parsed, text = _decode_body(data)
+    detail = _error_text(parsed, text)
     for secret in secrets:
         detail = secret.redact(detail)
     return detail
@@ -495,7 +507,8 @@ def _reply(exchange: _Exchange, secrets: tuple[_Secret, ...], now: float) -> Htt
             raise TransientProviderError(status, wait, exchange.problem)
         raise PermanentProviderError(status, exchange.problem)
     if 200 <= status < 300:
-        return HttpReply(status, _json_object(exchange.data), exchange.data.decode("utf-8", errors="replace"), wait)
+        parsed, text = _decode_body(exchange.data)
+        return HttpReply(status, parsed, text, wait)
     detail = _error_detail(exchange.data, secrets)
     if status in TRANSIENT_STATUSES:
         raise TransientProviderError(status, wait, detail)
@@ -567,11 +580,14 @@ class _Cutter:
         return True
 
     def trace(self, event: str, info: Mapping[str, Any]) -> None:
-        """httpcore's trace callback: capture the socket when a connection is made."""
-        if not event.endswith(".connect_tcp.complete"):
+        """httpcore's trace callback: capture the socket when a connection is made or reused."""
+        if event == "datagrunt.reuse_tcp.complete":
+            original = info.get("socket")
+        elif event.endswith(".connect_tcp.complete"):
+            stream = info.get("return_value")
+            original = None if stream is None else stream.get_extra_info("socket")
+        else:
             return
-        stream = info.get("return_value")
-        original = None if stream is None else stream.get_extra_info("socket")
         if not isinstance(original, socket.socket):
             raise _CutUnavailable("no socket")
         try:
@@ -785,11 +801,162 @@ def _environment_problem() -> str | None:
 # ---------------------------------------------------------------------------------------------------------------
 
 
-def _check_options(max_connections: object, allow_insecure_http: object, transport: object) -> None:
+_NO_TRACE = object()
+
+
+def _restore_trace_extension(request: httpcore.Request, prior_trace: object) -> None:
+    """Restore ``request.extensions['trace']`` to its pre-call state after ``handle_request``."""
+    if not isinstance(request, httpcore.Request):
+        raise TypeError(f"request must be an httpcore.Request, got {type(request).__name__}")
+    if not isinstance(request.extensions, dict):
+        request.extensions = dict(request.extensions)
+    if prior_trace is _NO_TRACE:
+        request.extensions = {k: v for k, v in request.extensions.items() if k != "trace"}
+    else:
+        request.extensions = {**request.extensions, "trace": prior_trace}
+
+
+class _BoundConnection(httpcore.ConnectionInterface):
+    """Retains a pre-TLS plain ``socket.socket`` duplicate across pooled HTTP/1.1 keep-alive reuse."""
+
+    def __init__(self, inner: httpcore.ConnectionInterface) -> None:
+        if not isinstance(inner, httpcore.ConnectionInterface):
+            raise TypeError(f"inner must be an httpcore.ConnectionInterface, got {type(inner).__name__}")
+        self._inner = inner
+        self._lock = threading.Lock()
+        self._raw_socket: socket.socket | None = None
+
+    def _close_raw_socket(self) -> None:
+        with self._lock:
+            raw, self._raw_socket = self._raw_socket, None
+        if raw is not None:
+            raw.close()
+
+    def _capture_tcp(self, info: Mapping[str, Any]) -> None:
+        if not isinstance(info, Mapping):
+            raise TypeError(f"info must be a Mapping, got {type(info).__name__}")
+        stream = info.get("return_value")
+        original = None if stream is None else stream.get_extra_info("socket")
+        if not isinstance(original, socket.socket):
+            return
+        try:
+            duplicate = original.dup()
+        except OSError as error:
+            raise _CutUnavailable("no file descriptor to spare") from error
+        with self._lock:
+            previous, self._raw_socket = self._raw_socket, duplicate
+        if previous is not None:
+            previous.close()
+
+    def handle_request(self, request: httpcore.Request) -> httpcore.Response:
+        if not isinstance(request, httpcore.Request):
+            raise TypeError(f"request must be an httpcore.Request, got {type(request).__name__}")
+        prior_trace = request.extensions.get("trace", _NO_TRACE)
+        with self._lock:
+            reused = self._raw_socket
+        if reused is not None and callable(prior_trace) and self._inner.is_available():
+            prior_trace("datagrunt.reuse_tcp.complete", {"socket": reused})
+
+        def trace_hook(event_name: str, info: Mapping[str, Any]) -> None:
+            if event_name.endswith(".connect_tcp.complete"):
+                self._capture_tcp(info)
+            if callable(prior_trace):
+                prior_trace(event_name, info)
+
+        request.extensions = {**request.extensions, "trace": trace_hook}
+        drop_socket = False
+        try:
+            return self._inner.handle_request(request)
+        except BaseException as exc:
+            drop_socket = not isinstance(exc, httpcore.ConnectionNotAvailable)
+            raise
+        finally:
+            _restore_trace_extension(request, prior_trace)
+            if drop_socket or self._inner.is_closed():
+                self._close_raw_socket()
+
+    def can_handle_request(self, origin: httpcore.Origin) -> bool:
+        return self._inner.can_handle_request(origin)
+
+    def close(self) -> None:
+        try:
+            self._inner.close()
+        finally:
+            self._close_raw_socket()
+
+    def info(self) -> str:
+        return self._inner.info()
+
+    def is_available(self) -> bool:
+        return self._inner.is_available()
+
+    def has_expired(self) -> bool:
+        return self._inner.has_expired()
+
+    def is_idle(self) -> bool:
+        return self._inner.is_idle()
+
+    def is_closed(self) -> bool:
+        closed = self._inner.is_closed()
+        if closed:
+            self._close_raw_socket()
+        return closed
+
+
+class _PoolBinder:
+    """Callable wrapper around an httpcore pool's ``create_connection`` method."""
+
+    __slots__ = ("_create",)
+
+    def __init__(self, create: Callable[[httpcore.Origin], httpcore.ConnectionInterface]) -> None:
+        if not callable(create):
+            raise TypeError("create must be callable")
+        self._create = create
+
+    def __call__(self, origin: httpcore.Origin) -> httpcore.ConnectionInterface:
+        if origin is None:
+            raise TypeError("origin must not be None")
+        return _BoundConnection(self._create(origin))
+
+
+def _bind_transport_pool(transport: object) -> None:
+    """Wrap an httpcore connection pool's ``create_connection`` with :class:`_PoolBinder`."""
+    if transport is None:
+        raise RationalizationError("cannot bind keep-alive sockets: HTTP transport is None")
+    pool = getattr(transport, "_pool", None)
+    create = getattr(pool, "create_connection", None)
+    if pool is None or not callable(create):
+        raise RationalizationError("cannot bind keep-alive sockets: transport exposes no bindable connection pool")
+    if not isinstance(create, _PoolBinder):
+        pool.create_connection = _PoolBinder(create)
+
+
+def _bind_client_pools(client: httpx.Client) -> None:
+    """Attach pre-TLS socket binding to ``client``'s default and mounted proxy connection pools."""
+    if client is None or not callable(getattr(client, "close", None)):
+        raise TypeError(f"client must be an httpx.Client, got {type(client).__name__}")
+    _bind_transport_pool(getattr(client, "_transport", None))
+    mounts = getattr(client, "_mounts", None)
+    if isinstance(mounts, Mapping):
+        for mounted in mounts.values():
+            if mounted is not None:
+                _bind_transport_pool(mounted)
+
+
+def _check_options(
+    max_connections: object,
+    keepalive_connections: object,
+    allow_insecure_http: object,
+    transport: object,
+) -> None:
     if type(max_connections) is not int:
         raise TypeError(f"max_connections must be an int, got {type(max_connections).__name__}")
     if not 1 <= max_connections <= MAX_CONNECTIONS_LIMIT:
         raise ValueError(f"max_connections must be in 1-{MAX_CONNECTIONS_LIMIT}, got {max_connections}")
+    if type(keepalive_connections) is not int:
+        raise TypeError(f"keepalive_connections must be an int, got {type(keepalive_connections).__name__}")
+    if not 0 <= keepalive_connections <= MAX_CONNECTIONS_LIMIT:
+        raise ValueError(f"keepalive_connections must be in 0-{MAX_CONNECTIONS_LIMIT}, got {keepalive_connections}")
     if not isinstance(allow_insecure_http, bool):
         raise TypeError(f"allow_insecure_http must be a bool, got {type(allow_insecure_http).__name__}")
     if transport is not None and not isinstance(transport, httpx.BaseTransport):
@@ -829,21 +996,24 @@ class HttpClient:
         self,
         *,
         max_connections: int = 4,
+        keepalive_connections: int = 0,
         allow_insecure_http: bool = False,
         transport: httpx.BaseTransport | None = None,
         wall_clock: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
-        _check_options(max_connections, allow_insecure_http, transport)
+        _check_options(max_connections, keepalive_connections, allow_insecure_http, transport)
         if not callable(wall_clock) or not callable(monotonic):
             raise TypeError("wall_clock and monotonic must be callable")
         self._max_connections = max_connections
+        self._keepalive_connections = keepalive_connections
         self._allow_insecure_http = allow_insecure_http
         self._transport = transport
         self._wall_clock = wall_clock
         self._monotonic = monotonic
         self._lock = threading.Lock()
         self._slots: dict[bool, _Slot] = {}
+        self._last_checked_target: tuple[str, bool, tuple[str, bool]] | None = None
 
     def _build(self, loopback: bool) -> httpx.Client | str:
         """A new client, or the configuration problem that prevents it (named, never its value)."""
@@ -851,17 +1021,34 @@ class HttpClient:
             problem = _environment_problem()
             if problem is not None:
                 return problem
+        limits = (
+            httpx.Limits(
+                max_connections=self._max_connections,
+                max_keepalive_connections=self._keepalive_connections,
+                keepalive_expiry=KEEPALIVE_EXPIRY_S,
+            )
+            if self._keepalive_connections > 0
+            else httpx.Limits(max_connections=self._max_connections, max_keepalive_connections=0)
+        )
         failure = ""
         try:
-            return httpx.Client(
+            client = httpx.Client(
                 follow_redirects=False,
                 trust_env=not loopback,
-                limits=httpx.Limits(max_connections=self._max_connections, max_keepalive_connections=0),
+                limits=limits,
                 headers=dict(_CLIENT_HEADERS),
                 transport=self._transport,
             )
         except _BUILD_ERRORS as error:
             failure = type(error).__name__
+        else:
+            if self._keepalive_connections > 0 and self._transport is None:
+                try:
+                    _bind_client_pools(client)
+                except BaseException:
+                    client.close()
+                    raise
+            return client
         return (
             f"the HTTP client could not be built from the environment ({failure}): check HTTP_PROXY, HTTPS_PROXY, "
             "ALL_PROXY, SSL_CERT_FILE and SSL_CERT_DIR"
@@ -930,6 +1117,23 @@ class HttpClient:
     def __repr__(self) -> str:
         return f"HttpClient(max_connections={self._max_connections}, allow_insecure_http={self._allow_insecure_http})"
 
+    @property
+    def keepalive_connections(self) -> int:
+        """Maximum idle keep-alive connections retained per pool."""
+        return self._keepalive_connections
+
+    def _checked_target(self, url: str) -> tuple[str, bool]:
+        """Return ``(normalized_url, is_loopback)``, reusing the per-instance single-entry cache on hit."""
+        if type(url) is str:
+            cached = self._last_checked_target
+            if cached is not None and cached[0] == url and cached[1] is self._allow_insecure_http:
+                return cached[2]
+        target = _target(url, self._allow_insecure_http)
+        result = (target, is_loopback_endpoint(target))
+        if type(url) is str:
+            self._last_checked_target = (url, self._allow_insecure_http, result)
+        return result
+
     def post_json(
         self,
         url: str,
@@ -939,30 +1143,20 @@ class HttpClient:
         timeout_s: float,
         deadline: float,
     ) -> HttpReply:
-        """POST ``body`` as JSON to ``url`` and return the 2xx reply (module notes, 1-8).
-
-        Args:
-            url: The endpoint, checked as :func:`~datagrunt.rationalization.providers.base.check_endpoint` checks
-                it and sent normalized.
-            headers: Extra headers; a key as a ``_Secret``.
-            body: The JSON object to send.
-            timeout_s: The read timeout, finite and > 0.
-            deadline: The absolute ``monotonic()`` instant the whole request must end by.
+        """POST ``body`` as JSON to ``url`` within ``timeout_s`` and absolute ``deadline`` (module notes, 1-8).
 
         Raises:
-            TransientProviderError: On a retryable status, a timeout, a transport failure or the deadline.
-            PermanentProviderError: On a refused URL or environment, any other status, a redirect, a body past
-                8 MiB or one that does not decode, or a header that could inject another or frame the request.
+            TransientProviderError: On a retryable status, timeout, transport failure, or deadline cut.
+            PermanentProviderError: On a refused URL/environment, non-retryable status, redirect, or >8 MiB body.
             TypeError: If an argument has the wrong type, or a key header is a plain ``str``.
-            ValueError: If ``timeout_s`` or ``deadline`` is out of range, ``body`` is not JSON or a header is given
-                twice.
+            ValueError: If ``timeout_s`` or ``deadline`` is out of range, ``body`` is not JSON, or a header repeats.
         """
-        target = _target(url, self._allow_insecure_http)
+        target, loopback = self._checked_target(url)
         seconds = _check_timeout(timeout_s)
         finish = _check_deadline(deadline, self._monotonic())
         sent = _request_headers(headers)
         content = _encode_body(body)
-        slot = self._acquire(is_loopback_endpoint(target))
+        slot = self._acquire(loopback)
         if isinstance(slot, str):
             raise PermanentProviderError(None, slot)
         outcome: _Exchange | _Failure | None = None

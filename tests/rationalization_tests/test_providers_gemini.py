@@ -31,7 +31,9 @@ Every request goes to an ``httpx.MockTransport``; no test reaches a network host
 """
 
 import ast
+import base64
 import copy
+import dataclasses
 import inspect
 import json
 import logging
@@ -2465,9 +2467,6 @@ MM_GEMINI_PNG = b"\x89PNG\r\n\x1a\nGEMINI_BAND"
 
 class TestMultimodalImages:
     def test_gemini_provider_sends_inline_data_png_parts_before_user_envelope(self):
-        import base64
-        import dataclasses
-
         handler = Recorder()
         provider = gemini(handler)
         req = dataclasses.replace(request_for(provider), images=(MM_GEMINI_PNG,))
@@ -2484,3 +2483,24 @@ class TestMultimodalImages:
             },
             {"text": req.user_envelope},
         ]
+
+    def test_gemini_provider_enables_keepalive_closes_client_and_reuses_image_b64(self, monkeypatch):
+        default_prov = GeminiProvider("gemini-2.5-flash", api_key=KEY, max_connections=6)
+        assert default_prov._client.keepalive_connections == 6
+        default_prov.open()
+        default_prov.close()
+
+        handler = Recorder()
+        provider = gemini(handler)
+        req = dataclasses.replace(request_for(provider), images=(MM_GEMINI_PNG,))
+        calls = []
+        real_encode = gemini_module.encode_images_b64
+
+        def spy_encode(images, cached=None):
+            calls.append(cached is not None)
+            return real_encode(images, cached)
+
+        monkeypatch.setattr(gemini_module, "encode_images_b64", spy_encode)
+        provider.generate(req)
+        provider.generate(req)
+        assert calls == [False, True]

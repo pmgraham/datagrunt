@@ -102,6 +102,8 @@ providers own, nothing from ``datagrunt.core``, and no import inside a function,
 (invariant 9).
 """
 
+import hashlib
+import heapq
 import math
 import queue
 import random
@@ -116,7 +118,15 @@ from types import MappingProxyType
 from typing import Any, Literal, NoReturn, Protocol, TypeAlias, cast, get_args
 
 from datagrunt.rationalization._canonical import canonical_copy, canonical_json, sha256_hex, strict_loads
-from datagrunt.rationalization.cache import CacheLookup, CacheMeta, FileCache, MemoryCache, request_key
+from datagrunt.rationalization.cache import (
+    CacheLookup,
+    CacheMeta,
+    FileCache,
+    MemoryCache,
+    _envelope_key_prefix,
+    _fast_request_key,
+    _provider_key_suffix,
+)
 from datagrunt.rationalization.envelope import Envelope, new_nonce
 from datagrunt.rationalization.exceptions import RationalizationError
 from datagrunt.rationalization.providers.base import (
@@ -131,7 +141,13 @@ from datagrunt.rationalization.providers.base import (
 )
 from datagrunt.rationalization.schema import PreparedSchema
 from datagrunt.rationalization.units import Unit
-from datagrunt.rationalization.wire import MAX_OUTPUT_TOKENS, ModelRequest, ProviderResponse
+from datagrunt.rationalization.wire import (
+    MAX_OUTPUT_TOKENS,
+    ModelRequest,
+    ProviderResponse,
+    _to_trusted_json,
+    _trusted_model_request,
+)
 
 EventKind: TypeAlias = Literal["cache_hit", "cache_corrupt", "request", "retry", "unit_failed", "cache_write_failed"]
 """What a :class:`TelemetryEvent` reports."""
@@ -833,6 +849,15 @@ def _check_snapshots(value: object, schema: PreparedSchema) -> tuple[ProviderSna
     return checked
 
 
+@dataclass(frozen=True, slots=True)
+class _PreflightPlan:
+    """Precomputed request slots, distinct requests, and FileCache lookups from single-pass preflight."""
+
+    slots: Mapping[tuple[str, str], str]
+    requests: tuple[_Request, ...]
+    file_lookups: Mapping[str, CacheLookup]
+
+
 def _plan(
     work: Sequence[tuple[Unit, Envelope]], providers: Sequence[ProviderSnapshot], limits: RunLimits, schema_version: str
 ) -> tuple[dict[tuple[str, str], str], list[_Request]]:
@@ -842,21 +867,20 @@ def _plan(
     """
     slots: dict[tuple[str, str], str] = {}
     requests: dict[str, _Request] = {}
-    params = {
-        provider.model_id: {**provider.generation_params, "max_output_tokens": limits.max_output_tokens}
+    suffixes = {
+        provider.model_id: _provider_key_suffix(
+            provider_kind=provider.provider_kind,
+            model_id=provider.model_id,
+            generation_params={**provider.generation_params, "max_output_tokens": limits.max_output_tokens},
+            provider_schema_json=provider.provider_schema_json,
+            schema_version=schema_version,
+        )
         for provider in providers
     }
-    schemas = {provider.model_id: provider.provider_schema for provider in providers}  # parsed once per provider
     for unit, envelope in work:
+        env_hasher = hashlib.sha256(_envelope_key_prefix(envelope))
         for provider in providers:
-            key = request_key(
-                provider_kind=provider.provider_kind,
-                model_id=provider.model_id,
-                generation_params=params[provider.model_id],
-                envelope=envelope,
-                provider_schema=schemas[provider.model_id],
-                schema_version=schema_version,
-            )
+            key = _fast_request_key(envelope, suffixes[provider.model_id], envelope_hasher=env_hasher)
             slot = (unit.unit_id, provider.model_id)
             if slots.setdefault(slot, key) != key:
                 raise ValueError(f"unit {unit.unit_id} appears twice with different envelopes")
@@ -888,11 +912,18 @@ def _event(
     )
 
 
-def _lookup(key: str, memory: MemoryCache, file_cache: FileCache | None) -> tuple[CacheLookup, str]:
+def _lookup(
+    key: str,
+    memory: MemoryCache,
+    file_cache: FileCache | None,
+    file_lookups: Mapping[str, CacheLookup] | None = None,
+) -> tuple[CacheLookup, str]:
     """The memory cache's answer, else the file cache's when there is one, and which store gave it."""
     lookup = memory.get(key)
     if lookup.hit or file_cache is None:
         return lookup, "memory"
+    if file_lookups is not None and key in file_lookups:
+        return file_lookups[key], "file"
     return file_cache.get(key), "file"
 
 
@@ -901,13 +932,14 @@ def _probe(
     memory: MemoryCache,
     file_cache: FileCache | None,
     deliver: Callable[[TelemetryEvent], None],
+    file_lookups: Mapping[str, CacheLookup] | None = None,
 ) -> _Probe:
     """Look each distinct request up, the memory cache first; each hit and corrupt entry is an event, delivered here."""
     hits: dict[str, ProviderResponse] = {}
     misses: list[_Request] = []
     corrupt = 0
     for request in requests:
-        lookup, store = _lookup(request.key, memory, file_cache)
+        lookup, store = _lookup(request.key, memory, file_cache, file_lookups)
         if lookup.response is not None:
             hits[request.key] = lookup.response
             deliver(_event(request, "cache_hit", 0, None, None, store))
@@ -933,6 +965,7 @@ class _Stores:
     schema_name: str
     schema_version: str
     schema_sha256: str
+    prompt_hashes: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1009,10 +1042,21 @@ def _slot_counts(providers: Sequence[ProviderSnapshot], limits: RunLimits) -> di
     return counts
 
 
-def _file_put(file_cache: FileCache, key: str, response: ProviderResponse, meta: CacheMeta) -> list[str]:
+def _file_put(
+    file_cache: FileCache,
+    key: str,
+    response: ProviderResponse,
+    meta: CacheMeta,
+    *,
+    resp_json: dict[str, Any] | None = None,
+) -> list[str]:
     """Write one entry; what went wrong (an entry past 8 MiB, a write that failed), as event details."""
     try:
-        written = file_cache.put(key, response, meta)
+        written = (
+            file_cache._put_trusted_json(key, resp_json, meta)
+            if resp_json is not None and type(file_cache) is FileCache
+            else file_cache.put(key, response, meta)
+        )
     except RationalizationError as error:  # the run keeps the response it has (module notes)
         return [f"file cache write failed: {error}"]
     return [] if written else ["file cache entry past 8 MiB: not written"]
@@ -1168,6 +1212,7 @@ class _Run:
         """Put a fresh response into the memory cache and the file cache; each store that keeps nothing is an
         event, and counts. Returns how many did not."""
         request, stores = job.request, self._stores
+        prompt_hash = stores.prompt_hashes.get(request.envelope.prompt) or sha256_hex(request.envelope.prompt)
         meta = CacheMeta(
             model_id=request.provider.model_id,
             unit_id=request.unit.unit_id,
@@ -1175,13 +1220,19 @@ class _Run:
             schema_name=stores.schema_name,
             schema_version=stores.schema_version,
             schema_sha256=stores.schema_sha256,
-            prompt_sha256=sha256_hex(request.envelope.prompt),
+            prompt_sha256=prompt_hash,
             latency_ms=latency_ms,
             created_at=datetime.now(timezone.utc).isoformat(),
         )
-        problems = [] if stores.memory.put(request.key, response, meta) else ["memory cache full"]
+        resp_json = _to_trusted_json(response)
+        mem_ok = (
+            stores.memory._put_trusted_json(request.key, resp_json, meta)
+            if type(stores.memory) is MemoryCache
+            else stores.memory.put(request.key, response, meta)
+        )
+        problems = [] if mem_ok else ["memory cache full"]
         if stores.file is not None:
-            problems.extend(_file_put(stores.file, request.key, response, meta))
+            problems.extend(_file_put(stores.file, request.key, response, meta, resp_json=resp_json))
         for problem in problems:
             self._emit(job, "cache_write_failed", attempt, None, None, problem)
         return len(problems)
@@ -1194,11 +1245,13 @@ class _Run:
             RationalizationError: If every draw is already in the content (the nonce source is not random).
         """
         envelope = request.envelope
-        texts = (envelope.prompt, envelope.schema_json, envelope.context_json, envelope.payload)
         for _ in range(NONCE_DRAWS):
-            nonce = self._nonce()
-            if not any(nonce in text for text in texts):
-                return envelope.render(nonce)
+            try:
+                return envelope.render(self._nonce())
+            except ValueError as error:
+                if "already holds this nonce" in str(error):
+                    continue
+                raise
         raise RationalizationError(
             f"no nonce absent from unit {request.unit.unit_id}'s content in {NONCE_DRAWS} draws: the nonce source is "
             "not random"
@@ -1207,7 +1260,7 @@ class _Run:
     def _send(self, job: _Job, tally: _Tally, timeout_s: float) -> ProviderResponse:
         request = job.request
         system, user = self._render(request)
-        model_request = ModelRequest(
+        model_request = _trusted_model_request(
             unit_id=request.unit.unit_id,
             model_id=request.provider.model_id,
             system_prompt=system,
@@ -1266,10 +1319,17 @@ class _Scheduler:
         """
         taken: list[tuple[int, _Request]] = []
         self.due_in = None
-        lines = sorted((line for line in self._queues.values() if line), key=lambda line: line[0][0])
-        for line in lines:
-            while line and len(taken) < room and self._release(line):
+        if room <= 0:
+            return taken
+        heap = [(line[0][0], rate_key) for rate_key, line in self._queues.items() if line]
+        heapq.heapify(heap)
+        while heap and len(taken) < room:
+            _, rate_key = heapq.heappop(heap)
+            line = self._queues[rate_key]
+            if self._release(line):
                 taken.append(line.popleft())
+                if line:
+                    heapq.heappush(heap, (line[0][0], rate_key))
         return taken
 
     def _release(self, line: deque[tuple[int, _Request]]) -> bool:
@@ -1578,6 +1638,22 @@ def _deliverer(on_event: EventHook | None) -> Callable[[TelemetryEvent], None]:
     return deliver
 
 
+def _resolve_plan(
+    pairs: tuple[tuple[Unit, Envelope], ...],
+    snapshots: tuple[ProviderSnapshot, ...],
+    limits: RunLimits,
+    schema_version: str,
+    preflight: _PreflightPlan | None,
+) -> tuple[Mapping[tuple[str, str], str], Sequence[_Request], Mapping[str, CacheLookup] | None]:
+    """Return ``(slots, requests, file_lookups)`` from ``preflight`` or compute them via :func:`_plan`."""
+    if preflight is None:
+        slots, requests = _plan(pairs, snapshots, limits, schema_version)
+        return slots, requests, None
+    if not isinstance(preflight, _PreflightPlan):
+        raise TypeError(f"_preflight must be a _PreflightPlan or None, got {type(preflight).__name__}")
+    return preflight.slots, preflight.requests, preflight.file_lookups
+
+
 def run_requests(
     work: Sequence[tuple[Unit, Envelope]],
     providers: Sequence[ProviderSnapshot],
@@ -1592,6 +1668,7 @@ def run_requests(
     sleep: Callable[[float], object] | None = None,
     rng: JitterSource | None = None,
     nonce: Callable[[], str] = new_nonce,
+    _preflight: _PreflightPlan | None = None,
 ) -> RunOutcome:
     """Send every (unit, provider) request the caches do not answer, and return the outcome (module notes).
 
@@ -1639,9 +1716,9 @@ def run_requests(
     snapshots = _check_snapshots(providers, schema)
     checked = _check_limits(limits)
     hooks = _check_hooks(on_event, clock, sleep, rng, nonce)
-    slots, requests = _plan(pairs, snapshots, checked, schema_version)
+    slots, requests, file_lookups = _resolve_plan(pairs, snapshots, checked, schema_version, _preflight)
     deliver = _deliverer(hooks.on_event)
-    probe = _probe(requests, memory_cache, file_cache, deliver)
+    probe = _probe(requests, memory_cache, file_cache, deliver, file_lookups)
     if len(probe.misses) > checked.max_requests:
         raise RationalizationError(
             f"this run needs {len(probe.misses)} requests (distinct cache misses), past max_requests "
@@ -1651,6 +1728,7 @@ def run_requests(
     for snapshot in snapshots:
         if snapshot.open is not None and snapshot.model_id in used:
             snapshot.open()
-    stores = _Stores(memory_cache, file_cache, schema.model.__name__, schema_version, schema.sha256)
+    prompt_hashes = {envelope.prompt: sha256_hex(envelope.prompt) for _, envelope in pairs}
+    stores = _Stores(memory_cache, file_cache, schema.model.__name__, schema_version, schema.sha256, prompt_hashes)
     results = _execute(_Run(checked, snapshots, hooks, stores), probe.misses, deliver)
     return _assemble(slots, probe, results, snapshots)

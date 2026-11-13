@@ -61,14 +61,14 @@ import math
 import re
 from typing import Any, TypeAlias
 
-from datagrunt.rationalization._canonical import canonical_copy, strict_loads
-from datagrunt.rationalization.exceptions import RationalizationError
+from datagrunt.rationalization._canonical import strict_loads
 from datagrunt.rationalization.wire import (
     FINISH_REASONS,
     RAW_TEXT_MAX_BYTES,
     TOKEN_COUNT_MAX,
     FinishReason,
     ProviderResponse,
+    _trusted_provider_response,
 )
 
 JSON_MAX_DEPTH = 64
@@ -162,14 +162,13 @@ def safe_json(value: object) -> dict[str, object] | None:
     if type(value) is not dict:
         return None
     try:
-        copy: dict[str, object] = canonical_copy(_escaped_copy(value), subject="the model's JSON object")
-    except (_NotJsonError, RationalizationError):  # canonical JSON refuses an int past the digit limit
+        return _escaped_copy(value)
+    except _NotJsonError:
         return None
-    return copy
 
 
 def _escaped_copy(root: dict[Any, Any]) -> dict[str, object]:
-    """Copy ``root`` iteratively, every string and key escaped, under both bounds.
+    """Copy ``root`` iteratively, every string and key escaped and sorted, under all bounds.
 
     Raises:
         _NotJsonError: At the first value, key or bound that refuses it.
@@ -190,13 +189,18 @@ def _escaped_copy(root: dict[Any, Any]) -> dict[str, object]:
 
 
 def _copy_members(source: dict[Any, Any], target: dict[str, object], depth: int, stack: list[_Frame]) -> None:
-    """Copy an object's members into ``target``, refusing a key that is not a ``str`` or collides once escaped."""
+    """Copy an object's members into ``target`` in sorted key order, refusing non-``str`` or colliding keys."""
+    pairs: list[tuple[str, Any]] = []
     for key, item in source.items():
         if type(key) is not str:
             raise _NotJsonError(f"a key is a {type(key).__name__}, not a str")
-        name = safe_text(key)
-        if name in target:
+        pairs.append((safe_text(key), item))
+    pairs.sort(key=lambda entry: entry[0])
+    previous: str | None = None
+    for name, item in pairs:
+        if name == previous:
             raise _NotJsonError("two keys of one object are equal once escaped")
+        previous = name
         target[name] = _copy_value(item, depth, stack)
 
 
@@ -205,7 +209,14 @@ def _copy_value(item: object, depth: int, stack: list[_Frame]) -> object:
 
     ``depth`` is the depth of ``item``'s container.
     """
-    if item is None or type(item) is bool or type(item) is int:
+    if item is None or type(item) is bool:
+        return item
+    if type(item) is int:
+        if item < -999_999_999 or item > 999_999_999:
+            try:
+                str(item)
+            except ValueError as error:
+                raise _NotJsonError("an int exceeds the string digit limit") from error
         return item
     if type(item) is str:
         return safe_text(item)
@@ -282,7 +293,7 @@ def response(
     """
     if type(finish) is not str or finish not in FINISH_REASONS:
         raise ValueError(f"finish must be one of {FINISH_REASONS}: the adapter maps the provider's reason to one")
-    return ProviderResponse(
+    return _trusted_provider_response(
         content=None if content is None else safe_json(content),
         raw_text=bounded_raw_text(raw_text) if isinstance(raw_text, str) else "",
         finish=finish,

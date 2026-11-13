@@ -14,6 +14,7 @@ import copy
 import dataclasses
 import errno
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -1952,3 +1953,98 @@ def test_importing_the_module_loads_neither_pydantic_nor_httpx():
     )
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout.strip().splitlines()[-1]) == []
+
+
+def test_fast_request_key_matches_request_key_across_schemas_images_and_flags():
+    pngs = (b"\x89PNG\r\n\x1a\nBAND_ONE", b"\x89PNG\r\n\x1a\nBAND_TWO")
+    envelopes = (
+        ENVELOPE,
+        dataclasses.replace(ENVELOPE, include_schema=False),
+        dataclasses.replace(ENVELOPE, images=pngs),
+        dataclasses.replace(ENVELOPE, prompt="Extrait résumé — Δ", include_schema=False, images=pngs),
+    )
+    params = {"temperature": 0.0, "seed": 42, "max_output_tokens": 4096}
+    schema = {"type": "object", "properties": {"records": {"type": "array"}}, "required": ["records"]}
+    schema_json = canonical_json(schema)
+    suffix_dict = cache_module._provider_key_suffix(
+        provider_kind="gemini",
+        model_id="gemini:gemini-2.5-pro",
+        generation_params=params,
+        provider_schema=schema,
+        schema_version="2.1",
+    )
+    suffix_json = cache_module._provider_key_suffix(
+        provider_kind="gemini",
+        model_id="gemini:gemini-2.5-pro",
+        generation_params=params,
+        provider_schema_json=schema_json,
+        schema_version="2.1",
+    )
+    assert suffix_dict == suffix_json
+    for env in envelopes:
+        expected = request_key(
+            provider_kind="gemini",
+            model_id="gemini:gemini-2.5-pro",
+            generation_params=params,
+            envelope=env,
+            provider_schema=schema,
+            schema_version="2.1",
+        )
+        hasher = hashlib.sha256(cache_module._envelope_key_prefix(env))
+        assert cache_module._fast_request_key(env, suffix_dict) == expected
+        assert cache_module._fast_request_key(env, suffix_json, envelope_hasher=hasher) == expected
+
+
+def test_put_many_batches_fsync_once_per_shard_and_skips_oversize_entries(cache, monkeypatch):
+    meta = make_meta()
+    keys_aa = [f"aa{idx:062x}" for idx in range(4)]
+    keys_bb = [f"bb{idx:062x}" for idx in range(2)]
+    huge_key = f"cc{0:062x}"
+    huge_resp = ProviderResponse(content={"pad": "x" * ENTRY_MAX_BYTES}, raw_text="{}", finish="complete")
+    batch = [
+        *((k, make_response(k), meta) for k in keys_aa),
+        *((k, make_response(k), meta) for k in keys_bb),
+        (huge_key, huge_resp, meta),
+    ]
+    synced_modes: list[int] = []
+    real_fsync = os.fsync
+
+    def tracking_fsync(fd: int) -> None:
+        synced_modes.append(os.fstat(fd).st_mode)
+        real_fsync(fd)
+
+    monkeypatch.setattr(cache_module.os, "fsync", tracking_fsync)
+    flags = cache.put_many(batch)
+    monkeypatch.undo()
+
+    assert flags == (True, True, True, True, True, True, False)
+    assert sum(1 for m in synced_modes if stat.S_ISREG(m)) == 6
+    if POSIX:
+        assert sum(1 for m in synced_modes if stat.S_ISDIR(m)) == 2
+    assert all(cache.get(k).response == make_response(k) for k in (*keys_aa, *keys_bb))
+    assert cache.get(huge_key) == CacheLookup(None)
+
+
+@needs_posix
+def test_put_many_rejects_symlink_and_swapped_shard_directories(cache, root, tmp_path, monkeypatch):
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    key_sym = f"dd{1:062x}"
+    (root / "dd").symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(RationalizationError, match="symlink"):
+        cache.put_many([(key_sym, make_response("sym"), make_meta())])
+    assert list(elsewhere.iterdir()) == []
+
+    key_swap = f"ee{1:062x}"
+    helper_name = "_write_shard_bound" if cache_module._DIR_FD else "_write_shard_by_path"
+    real_write = getattr(cache_module, helper_name)
+
+    def swap_after_write(directory, identity, items):
+        real_write(directory, identity, items)
+        moved = tmp_path / "moved_ee"
+        directory.rename(moved)
+        directory.symlink_to(elsewhere, target_is_directory=True)
+
+    monkeypatch.setattr(cache_module, helper_name, swap_after_write)
+    with pytest.raises(RationalizationError, match="tampered"):
+        cache.put_many([(key_swap, make_response("swap"), make_meta())])

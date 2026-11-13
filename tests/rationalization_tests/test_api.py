@@ -23,16 +23,20 @@ from datagrunt.pdf.elements import (
     BBox,
     Heading,
     KeyValue,
+    PageImage,
     Paragraph,
     PDFDocument,
     Section,
     Table,
 )
+from datagrunt.pdf.exceptions import DatagruntPDFError
 from datagrunt.pdf.render import RenderedPage
 from datagrunt.rationalization import Key, RationalizationError, _extra
+from datagrunt.rationalization import api as api_module
 from datagrunt.rationalization.api import rationalize as real_rationalize
+from datagrunt.rationalization.cache import FileCache
 from datagrunt.rationalization.envelope import CONTEXT_MAX_BYTES, PROMPT_MAX_BYTES
-from datagrunt.rationalization.providers.base import TransientProviderError
+from datagrunt.rationalization.providers.base import ModelProvider, TransientProviderError
 from datagrunt.rationalization.providers.callable import CallableProvider
 from datagrunt.rationalization.result import RationalizedResult as real_result_cls
 from datagrunt.rationalization.wire import ModelRequest, ProviderResponse
@@ -1314,3 +1318,163 @@ class TestMultimodalThreeWitness:
         assert res_single.records == ()
         assert len(res_single.needs_review) == 1
         assert res_single.needs_review[0].status == "ungrounded_value"
+
+    def test_multimodal_skipped_vision_page_isolates_ocr_heading_scope_from_later_pages(self) -> None:
+        def broken_bands() -> tuple[bytes, ...]:
+            raise DatagruntPDFError("band decode failed on page 1")
+
+        bad_img = PageImage(page_number=1, dpi=300.0, width_px=2550, height_px=3300, _band_loader=broken_bands)
+        leaked_scope = ("SECRET_OCR_HEADING_P1",)
+        p1_h = Heading(**ids(1, 0, leaked_scope), level=1, text=leaked_scope[0])
+        p2_p = Paragraph(**ids(2, 0, leaked_scope), text="Assembly A-900 Valve")
+        sections = (Section(heading=p1_h, scope_path=leaked_scope, page_span=(1, 2), elements=(p1_h, p2_p)),)
+        doc = PDFDocument(
+            metadata=metadata(2, source_name="skip_mm.pdf", sha=hashlib.sha256(b"skip_mm.pdf").hexdigest()),
+            pages=(page(1, (p1_h,), route="vision", page_image=bad_img), page(2, (p2_p,))),
+            sections=sections,
+        )
+
+        def answer_p2(req: ModelRequest) -> ProviderResponse:
+            assert "SECRET_OCR_HEADING_P1" not in (req.system_prompt + req.user_envelope)
+            return ProviderResponse(
+                content={
+                    "records": [
+                        {
+                            "record": {"assembly_id": "A-900", "title": "Valve"},
+                            "grounding_quotes": ["Assembly A-900 Valve"],
+                            "source_element_ids": ["p0002_e000"],
+                        }
+                    ]
+                },
+                raw_text="{}",
+                finish="complete",
+            )
+
+        res = real_rationalize(
+            doc,
+            schema=Assembly,
+            prompt="Extract assemblies.",
+            models=(
+                CallableProvider("test:google-iso", answer_p2, family="google"),
+                CallableProvider("test:anthropic-iso", answer_p2, family="anthropic"),
+            ),
+            multimodal=True,
+            strict=False,
+        )
+        assert [(s.unit_id, s.reason, s.page_numbers) for s in res.skipped_units] == [
+            (f"{doc.metadata.doc_id}:p0001", "image_only", (1,))
+        ]
+        assert [r.assembly_id for r in res.records] == ["A-900"]
+        assert res.items[0].sources[0].scope_path == ()
+
+
+class _ClosableFakeProvider(ModelProvider):
+    """Minimal ModelProvider tracking ``close()`` invocations."""
+
+    def __init__(self, model_id: str, family: str) -> None:
+        self._model_id = model_id
+        self._family = family
+        self.closed = 0
+
+    @property
+    def model_id(self) -> str:
+        return self._model_id
+
+    @property
+    def provider_kind(self) -> str:
+        return "callable"
+
+    @property
+    def rate_key(self) -> str:
+        return self._model_id
+
+    @property
+    def model_family(self) -> str:
+        return self._family
+
+    @property
+    def generation_params(self) -> dict[str, Any]:
+        return {}
+
+    def transform_schema(self, schema: Any) -> dict[str, Any]:
+        return dict(schema)
+
+    def generate(self, request: ModelRequest) -> ProviderResponse:
+        return _bom_response_for(request)
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+class TestEphemeralProviderCleanupAndSinglePassPreflight:
+    def test_ephemeral_str_providers_close_on_exit_and_error_while_caller_owned_stay_open(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ephemeral = _ClosableFakeProvider("gemini:gemini-2.5-flash", "google")
+        caller_owned = _ClosableFakeProvider("anthropic:caller-owned", "anthropic")
+        real_resolve = api_module._resolve_provider
+
+        def fake_resolve(entry: object, *, persistent_cache: bool) -> ModelProvider:
+            if entry == "gemini:gemini-2.5-flash":
+                return ephemeral
+            return real_resolve(entry, persistent_cache=persistent_cache)
+
+        monkeypatch.setattr(api_module, "_resolve_provider", fake_resolve)
+        res = real_rationalize(
+            BOM_DOC,
+            schema=Assembly,
+            prompt="Extract BOM.",
+            models=("gemini:gemini-2.5-flash", caller_owned),
+        )
+        assert len(res.records) == 2
+        assert ephemeral.closed == 1
+        assert caller_owned.closed == 0
+
+        # Error during _prepare_snapshots_with_closers (min_families=3 > 2 models) still closes ephemeral provider!
+        with pytest.raises(RationalizationError, match="min_families"):
+            real_rationalize(
+                NEVER_OPENED,
+                schema=Assembly,
+                prompt="Extract BOM.",
+                models=("gemini:gemini-2.5-flash", caller_owned),
+                min_families=3,
+            )
+        assert ephemeral.closed == 2
+        assert caller_owned.closed == 0
+
+    def test_single_pass_preflight_calls_file_cache_get_once_per_distinct_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cache_dir = tmp_path / "single_pass_cache"
+        get_counts: dict[str, int] = {}
+        real_get = FileCache.get
+
+        def spy_get(self: FileCache, key: str):
+            get_counts[key] = get_counts.get(key, 0) + 1
+            return real_get(self, key)
+
+        monkeypatch.setattr(FileCache, "get", spy_get)
+        p_g1, p_a1, _ = make_bom_providers()
+        real_rationalize(
+            BOM_DOC,
+            schema=Assembly,
+            prompt="Extract BOM.",
+            models=(p_g1, p_a1),
+            cache_dir=cache_dir,
+            coalesce_sections=False,
+        )
+        assert set(get_counts.values()) == {1}
+
+        get_counts.clear()
+        p_g2, p_a2, counts2 = make_bom_providers()
+        res_hit = real_rationalize(
+            BOM_DOC,
+            schema=Assembly,
+            prompt="Extract BOM.",
+            models=(p_g2, p_a2),
+            cache_dir=cache_dir,
+            coalesce_sections=False,
+        )
+        assert counts2 == {"google": 0, "anthropic": 0}
+        assert res_hit.telemetry.cache_hits == 6
+        assert set(get_counts.values()) == {1}
