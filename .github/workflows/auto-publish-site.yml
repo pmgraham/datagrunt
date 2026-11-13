@@ -71,6 +71,7 @@ jobs:
           repository: pmgraham/datagrunt-site
           token: ${{ steps.site-token.outputs.token }}
           path: datagrunt-site
+          fetch-depth: 0
 
       # A re-trigger for an already-documented version (a late-approved stale
       # publish, or the loser of a race) has nothing real to do — the AI
@@ -140,3 +141,16 @@ jobs:
           # push (#328): one rebase-retry. A conflicting rebase still fails,
           # which is the correct outcome for a genuine content collision.
           git push origin main || { git pull --rebase origin main && git push origin main; }
+
+      # Cloudflare Pages triggers only on push webhooks (not check_suite
+      # rerequests), so a dropped webhook during a GitHub/Cloudflare API hiccup
+      # leaves the commit undeployed while this job exits green. Always verify
+      # the live URL on datagrunt.io — including when postcheck skipped
+      # regeneration on a manual recovery dispatch — and push at most one empty
+      # commit to re-emit the webhook before failing loud.
+      - name: Verify and heal live site deployment
+        run: |
+          python3 datagrunt/scripts/verify_site_deploy.py \
+            --site-dir datagrunt-site \
+            --pyproject datagrunt/pyproject.toml
+

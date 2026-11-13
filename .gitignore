@@ -168,6 +168,7 @@ outputs/
 scripts/*
 !scripts/smoke_wheel.py
 !scripts/antigravity_workflow.py
+!scripts/verify_site_deploy.py
 
 # Antigravity session & brain directories
 .antigravity_sessions/
