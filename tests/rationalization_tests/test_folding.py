@@ -5,26 +5,33 @@ and grounded items come from ``build_consensus`` + ``ground`` over hand-built re
 """
 
 import dataclasses
+import hashlib
+from datetime import date, datetime, timezone
+from decimal import Decimal
+from enum import Enum
 from types import MappingProxyType
 from typing import Annotated, Any
 
 import pytest
-from pdf_tests.documents import BOX, ids, metadata, page
-from pydantic import BaseModel, model_validator
+from pdf_tests.documents import BOX, VISION_QUALITY, ids, metadata, page
+from pydantic import AwareDatetime, BaseModel, ConfigDict, field_validator, model_validator
+from pydantic.alias_generators import to_camel
 
 import datagrunt.rationalization.folding as folding_module
 from datagrunt.pdf.elements import (
     BBox,
     Heading,
     KeyValue,
+    PageImage,
     Paragraph,
     PDFDocument,
     Section,
     Table,
 )
-from datagrunt.rationalization import Key
+from datagrunt.pdf.render import RenderRefused
+from datagrunt.rationalization import Informational, Key, rationalize
 from datagrunt.rationalization.consensus import build_consensus
-from datagrunt.rationalization.envelope import Envelope, build_envelopes, render_element
+from datagrunt.rationalization.envelope import Envelope, build_envelopes, build_envelopes_isolated, render_element
 from datagrunt.rationalization.folding import (
     RECORD_STATUSES,
     ElementSource,
@@ -34,6 +41,7 @@ from datagrunt.rationalization.folding import (
     fold_documents,
 )
 from datagrunt.rationalization.grounding import GroundingReason, GroundingResult, ground
+from datagrunt.rationalization.providers.callable import CallableProvider
 from datagrunt.rationalization.runner import FailedUnit, RunOutcome
 from datagrunt.rationalization.schema import PreparedSchema, prepare
 from datagrunt.rationalization.units import Unit, build_units
@@ -1047,12 +1055,6 @@ class TestCoalesceSectionsFolding:
 
 class TestNode4Folding:
     def test_fold_across_units_false_preserves_multi_customer_prices_and_informational_folds_cleanly(self):
-        import hashlib
-        from decimal import Decimal
-
-        from datagrunt.rationalization import Informational, rationalize
-        from datagrunt.rationalization.providers.callable import CallableProvider
-
         class CustomerPrice(BaseModel):
             sku: Annotated[str, Key]
             description: Annotated[str | None, Informational] = None
@@ -1132,14 +1134,6 @@ class TestNode4Folding:
         assert folded.needs_review == ()
 
     def test_strict_false_isolates_page_render_refusal_on_image_only_page(self):
-        import hashlib
-        from decimal import Decimal
-
-        from datagrunt.pdf.elements import PageImage
-        from datagrunt.pdf.render import RenderRefused
-        from datagrunt.rationalization import rationalize
-        from datagrunt.rationalization.providers.callable import CallableProvider
-
         class SimpleRow(BaseModel):
             sku: Annotated[str, Key]
             price: Decimal
@@ -1183,3 +1177,215 @@ class TestNode4Folding:
         )
         assert [r.sku for r in res.records] == ["SKU-100"]
         assert any(s.page_numbers == (2,) for s in res.skipped_units)
+
+
+class FinishKind(Enum):
+    PLAIN = "plain"
+    COATED = "coated"
+
+
+class AliasedFoldLine(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, validate_by_name=True, serialize_by_alias=True)
+    part_no: Annotated[str, Key]
+    unit_cost: Decimal | None = None
+
+
+class AliasedFoldOrder(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, validate_by_name=True, serialize_by_alias=True)
+    assembly_id: Annotated[str, Key]
+    finish_kind: FinishKind | None = None
+    ship_date: date | None = None
+    verified_at: AwareDatetime | None = None
+    amounts: list[Decimal] = []
+    lines: list[AliasedFoldLine] = []
+
+
+class PrefixedFold(BaseModel):
+    assembly_id: Annotated[str, Key]
+    code: str
+    label: str | None = None
+
+    @field_validator("code")
+    @classmethod
+    def _prefix(cls, value: str) -> str:
+        return f"PFX_{value}"
+
+
+class TextualFold(BaseModel):
+    assembly_id: Annotated[str, Key]
+    amount: int
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def _parse_text(cls, value: object) -> int:
+        if not isinstance(value, str):
+            raise ValueError("amount must arrive as str")
+        return int(value.replace(",", ""))
+
+
+class UnkeyedFoldStep(BaseModel):
+    step_no: int
+    note: Annotated[str, Informational] = ""
+
+
+class UnkeyedStepsAssembly(BaseModel):
+    assembly_id: Annotated[str, Key]
+    steps: list[UnkeyedFoldStep] = []
+
+
+def _skipped_vision_heading_doc() -> tuple[PDFDocument, Paragraph]:
+    def refuse_png() -> bytes:
+        raise RenderRefused("page 1 render refused")
+
+    bad_img = PageImage(page_number=1, dpi=150, width_px=80, height_px=80, _loader=refuse_png)
+    h_vis = Heading(**ids(1, 0, ("UNSENT_VISION_HEADING",)), level=1, text="UNSENT_VISION_HEADING")
+    p_dig = para(2, 0, "Assembly A-100 Main Pump.", scope_path=("UNSENT_VISION_HEADING",), bbox=BBOX_P2)
+    sec = Section(heading=h_vis, scope_path=("UNSENT_VISION_HEADING",), page_span=(1, 2), elements=(h_vis, p_dig))
+    p1 = dataclasses.replace(page(1, (h_vis,), route="vision", quality=VISION_QUALITY), page_image=bad_img)
+    return make_doc(p1, page(2, (p_dig,)), sections=(sec,)), p_dig
+
+
+class TestWave2AFoldingRegressions:
+    def test_serialize_by_alias_and_scalar_to_wire_fold_cleanly_across_units(self) -> None:
+        schema = prepare(AliasedFoldOrder)
+        run = prepare_doc(BOM_DOC, schema=schema)
+        r1 = {
+            "assemblyId": "A-100",
+            "finishKind": "coated",
+            "amounts": ["12.50"],
+            "lines": [{"partNo": "PN-1", "unitCost": "4.25"}],
+        }
+        r2 = {
+            "assemblyId": "A-100",
+            "shipDate": "2026-11-05",
+            "verifiedAt": "2026-11-05T10:30:00Z",
+            "lines": [{"partNo": "PN-2", "unitCost": "8.00"}],
+        }
+        responses = {
+            (U1, G): response(entry(r1, ("Assembly A-100 Main Pump", "Part PN-1 qty 2 steel"), (E_P1,))),
+            (U1, A): response(entry(r1, ("Assembly A-100 Main Pump", "Part PN-1 qty 2 steel"), (E_P1,))),
+            (U2, G): response(entry(r2, ("Assembly A-100 Spare", "Part PN-2 qty 4 brass"), (E_P2,))),
+            (U2, A): response(entry(r2, ("Assembly A-100 Spare", "Part PN-2 qty 4 brass"), (E_P2,))),
+        }
+        (item,) = run_and_fold(responses, run, schema=schema).items
+        assert item.status == "consensus"
+        assert item.record is not None
+        assert item.record.finish_kind is FinishKind.COATED
+        assert item.record.ship_date == date(2026, 11, 5)
+        assert item.record.verified_at == datetime(2026, 11, 5, 10, 30, tzinfo=timezone.utc)
+        assert [amt.as_tuple() for amt in item.record.amounts] == [Decimal("12.50").as_tuple()]
+        assert [(ln.part_no, ln.unit_cost) for ln in item.record.lines] == [
+            ("PN-1", Decimal("4.25")),
+            ("PN-2", Decimal("8.00")),
+        ]
+
+    def test_source_skip_rebuild_prevents_double_running_validators_and_preserves_fields_set(self) -> None:
+        pfx_schema = prepare(PrefixedFold)
+        pfx_run = prepare_doc(BOM_DOC, schema=pfx_schema)
+        p1 = {"assembly_id": "A-100", "code": "123"}
+        p2 = {"assembly_id": "A-100", "code": "123", "label": "Spare"}
+        responses = {
+            (U1, G): response(entry(p1, ("Assembly A-100 Main Pump",), (E_P1,))),
+            (U1, A): response(entry(p1, ("Assembly A-100 Main Pump",), (E_P1,))),
+            (U2, G): response(entry(p2, ("Assembly A-100 Spare",), (E_P2,))),
+            (U2, A): response(entry(p2, ("Assembly A-100 Spare",), (E_P2,))),
+        }
+        (item,) = run_and_fold(responses, pfx_run, schema=pfx_schema).items
+        assert item.record is not None
+        assert (item.status, item.record.code, item.record.label) == ("consensus", "PFX_123", "Spare")
+
+        txt_schema = prepare(TextualFold)
+        txt_run = prepare_doc(BOM_DOC, schema=txt_schema)
+        t_rec = {"assembly_id": "A-100", "amount": "1,234"}
+        t_resp = {
+            (U1, G): response(entry(t_rec, ("Assembly A-100 Main Pump",), (E_P1,))),
+            (U1, A): response(entry(t_rec, ("Assembly A-100 Main Pump",), (E_P1,))),
+            (U2, G): response(entry(t_rec, ("Assembly A-100 Spare",), (E_P2,))),
+            (U2, A): response(entry(t_rec, ("Assembly A-100 Spare",), (E_P2,))),
+        }
+        (txt_item,) = run_and_fold(t_resp, txt_run, schema=txt_schema).items
+        assert txt_item.record is not None
+        assert (txt_item.status, txt_item.record.amount) == ("consensus", 1234)
+
+        f1 = {"assembly_id": "A-100", "title": "Main Pump"}
+        f2 = {"assembly_id": "A-100", "notes": None}
+        f_resp = {
+            (U1, G): response(entry(f1, ("Assembly A-100 Main Pump",), (E_P1,))),
+            (U1, A): response(entry(f1, ("Assembly A-100 Main Pump",), (E_P1,))),
+            (U2, G): response(entry(f2, ("Assembly A-100 Spare",), (E_P2,))),
+            (U2, A): response(entry(f2, ("Assembly A-100 Spare",), (E_P2,))),
+        }
+        (f_item,) = run_and_fold(f_resp, BOM_RUN).items
+        assert f_item.record is not None
+        assert {"assembly_id", "title", "notes"} <= f_item.record.model_fields_set
+
+    def test_multimodal_flag_prevents_unsent_vision_heading_scope_leak_when_vision_unit_skipped(self) -> None:
+        doc, p_dig = _skipped_vision_heading_doc()
+        plan = build_units(doc, max_unit_chars=BIG, render=render_element, multimodal=True)
+        kept_units, envs, skipped = build_envelopes_isolated(
+            plan.units,
+            doc,
+            prompt="Extract.",
+            context=None,
+            schema_json=ASSEMBLY.wrapper_json,
+            multimodal=True,
+        )
+        assert len(skipped) == 1 and len(kept_units) == 1
+        assert all(not env.images for env in envs)
+        u_dig = kept_units[0].unit_id
+        units_map = {u.unit_id: u for u in kept_units}
+        envs_map = {e.unit_id: e for e in envs}
+        docs_map = {doc.metadata.doc_id: doc}
+        ans = response(entry({"assembly_id": "A-100"}, ("Assembly A-100 Main Pump.",), (p_dig.element_id,)))
+        out = RunOutcome(
+            responses={(u_dig, G): ans, (u_dig, A): ans},
+            failed_units=(),
+            cache_hits=0,
+            cache_misses=2,
+            cache_corrupt=0,
+            cache_write_failures=0,
+            usage={},
+            models=PAIR,
+        )
+        cons = build_consensus(out, ASSEMBLY, (u_dig,), min_families=2)
+        g_res = ground(cons, outcome=out, units=units_map, envelopes=envs_map, documents=docs_map, schema=ASSEMBLY)
+        folded = fold_documents(
+            g_res,
+            units=units_map,
+            envelopes=envs_map,
+            documents=docs_map,
+            schema=ASSEMBLY,
+            multimodal=True,
+        )
+        assert folded.items[0].sources[0].scope_path == ()
+
+    def test_fold_documents_rejects_non_bool_multimodal_flag(self) -> None:
+        g_res = GroundingResult(items=(), empty_units=())
+        bad_mm: Any = "yes"
+        with pytest.raises(TypeError, match="multimodal"):
+            fold_documents(
+                g_res,
+                units=BOM_RUN.units,
+                envelopes=BOM_RUN.envelopes,
+                documents={BOM_RUN.document.metadata.doc_id: BOM_RUN.document},
+                schema=ASSEMBLY,
+                multimodal=bad_mm,
+            )
+
+    def test_informational_field_in_unkeyed_child_model_folds_across_units_without_conflict(self) -> None:
+        schema = prepare(UnkeyedStepsAssembly)
+        run = prepare_doc(BOM_DOC, schema=schema)
+        r1 = {"assembly_id": "A-100", "steps": [{"step_no": 1, "note": "Page 1 wording"}]}
+        r2 = {"assembly_id": "A-100", "steps": [{"step_no": 1, "note": "Page 2 wording"}]}
+        responses = {
+            (U1, G): response(entry(r1, ("Assembly A-100 Main Pump",), (E_P1,))),
+            (U1, A): response(entry(r1, ("Assembly A-100 Main Pump",), (E_P1,))),
+            (U2, G): response(entry(r2, ("Assembly A-100 Spare",), (E_P2,))),
+            (U2, A): response(entry(r2, ("Assembly A-100 Spare",), (E_P2,))),
+        }
+        (item,) = run_and_fold(responses, run, schema=schema).items
+        assert item.status == "consensus"
+        assert item.record == UnkeyedStepsAssembly(
+            assembly_id="A-100",
+            steps=[UnkeyedFoldStep(step_no=1, note="Page 1 wording")],
+        )

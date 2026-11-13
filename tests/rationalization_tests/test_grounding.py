@@ -33,6 +33,7 @@ from datagrunt.pdf.elements import (
     Figure,
     Heading,
     KeyValue,
+    PageImage,
     Paragraph,
     PDFDocument,
     Section,
@@ -2397,3 +2398,160 @@ class TestNode4Grounding:
         )
         cons_unk = build_consensus(out_unk, basket_schema, (uid,), min_families=1)
         assert _peer_family_quotes(cons_unk.items[0], "m_proxy") == ()
+
+
+TINY_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+OPENAI = ("openai:gpt-5", "openai", "openai-compatible")
+O_ID = OPENAI[0]
+
+
+def _make_multimodal_image_only_run(schema: PreparedSchema) -> Prepared:
+    img = PageImage(page_number=1, dpi=150, width_px=8, height_px=8, _loader=lambda: TINY_PNG)
+    scan_page = dataclasses.replace(
+        page(1, (), route="vision", quality=VISION_QUALITY),
+        status="ocr_unavailable",
+        image_only_reasons=("too_little_text",),
+        page_image=img,
+    )
+    doc = document(scan_page)
+    plan = build_units(doc, max_unit_chars=BIG, render=render_element, multimodal=True)
+    envs = build_envelopes(
+        plan.units,
+        doc,
+        prompt="Extract.",
+        context=None,
+        schema_json=schema.wrapper_json,
+        multimodal=True,
+    )
+    return Prepared(
+        document=doc,
+        units={u.unit_id: u for u in plan.units},
+        envelopes={e.unit_id: e for e in envs},
+    )
+
+
+class TestWave2AGroundingRegressions:
+    def test_multimodal_split_vs_combined_cross_family_peer_quotes_ground_both_models(self):
+        mm_run = _make_multimodal_image_only_run(PART)
+        (uid,) = mm_run.unit_ids
+        anchor_id = mm_run.units[uid].elements[0].element_id
+        vote_g = entry(
+            {"number": "PN-700", "title": "Titanium Valve"},
+            ("Part: PN-700", "Name: Titanium Valve", "Qty: 5"),
+            (anchor_id,),
+        )
+        vote_a = entry(
+            {"number": "PN-700", "title": "Titanium Valve"},
+            ("Part: PN-700 | Name: Titanium Valve | Qty: 5",),
+            (anchor_id,),
+        )
+        res = grounded({(uid, G): response(vote_g), (uid, A): response(vote_a)}, models=PAIR, run=mm_run)
+        assert len(res.items) == 1
+        assert res.items[0].grounded is True
+        assert res.items[0].status == "consensus"
+
+    def test_multimodal_peer_counters_never_sum_across_multiple_peers_or_same_or_unknown_family(self):
+        mm_run = _make_multimodal_image_only_run(LINE)
+        (uid,) = mm_run.unit_ids
+        anchor_id = mm_run.units[uid].elements[0].element_id
+        padded = entry({"text": "row"}, ("bolt bolt bolt bolt bolt bolt nut",), (anchor_id,))
+        half_peer = entry({"text": "row"}, ("bolt bolt bolt nut",), (anchor_id,))
+        three_models = (GOOGLE, ANTHROPIC, OPENAI)
+        res = grounded(
+            {(uid, G): response(padded), (uid, A): response(half_peer), (uid, O_ID): response(half_peer)},
+            models=three_models,
+            schema=LINE,
+            run=mm_run,
+        )
+        assert ("quote_not_found", G, 0, None) in reasons(res.items[0])
+
+        same_fam = (GOOGLE, ("gemini:gemini-flash", "google", "gemini"))
+        out_same = outcome_of(
+            {(uid, G): response(padded), (uid, same_fam[1][0]): response(padded)},
+            same_fam,
+        )
+        cons_same = build_consensus(out_same, LINE, (uid,), min_families=1)
+        g_same = ground(
+            cons_same,
+            outcome=out_same,
+            units=mm_run.units,
+            envelopes=mm_run.envelopes,
+            documents=documents_of(mm_run),
+            schema=LINE,
+        )
+        assert [r.reason for r in g_same.items[0].reasons] == ["quote_not_found", "quote_not_found"]
+
+    def test_unit_texts_slices_standard_blocks_without_calling_element_text_and_falls_back_safely(self, monkeypatch):
+        def forbid_element_text(_el: DocumentElement) -> str:
+            raise AssertionError("element_text should not be called when Unit.blocks match render_element")
+
+        monkeypatch.setattr(grounding_module, "element_text", forbid_element_text)
+        found = single(part(), ("PN-104",), (PROSE,))
+        assert found.grounded is True
+
+        monkeypatch.undo()
+        p_el = para(1, 0, "Part PN-104 custom block.")
+        u_id = f"{DOC_ID}:p0001_e000-p0001_e000"
+        custom_unit = Unit(
+            unit_id=u_id,
+            doc_id=DOC_ID,
+            elements=(p_el,),
+            blocks=("CUSTOM_WRAPPER: Part PN-104 custom block.",),
+            part_of=(None,),
+            scope_path=(),
+            scope_entries_excluded=0,
+            page_numbers=(1,),
+            vision=False,
+            oversize=False,
+            hidden_excluded=(),
+        )
+        custom_doc = document(page(1, (p_el,)))
+        escaped_doc_id = DOC_ID.replace("_", chr(92) + "_")
+        payload = (
+            f"<document>{escaped_doc_id}</document>\n<scope></scope>\n<elements>\n{render_element(p_el)}\n</elements>"
+        )
+        env = Envelope(
+            unit_id=u_id,
+            prompt="Extract.",
+            context_json="null",
+            payload=payload,
+            schema_json=PART.wrapper_json,
+        )
+        custom_run = Prepared(document=custom_doc, units={u_id: custom_unit}, envelopes={u_id: env})
+        fallback = single(part(), ("Part PN-104 custom block.",), ("p0001_e000",), unit_id=u_id, run=custom_run)
+        assert fallback.grounded is True
+
+    def test_small_decimals_boundaries_and_lazy_per_element_key_lookup(self):
+        assert numeric_values("0 0012 9999 10000 -9999") == frozenset(
+            {Decimal(0), Decimal(12), Decimal(9999), Decimal(10000), Decimal(-9999)}
+        )
+        p_el = para(1, 0, "Assembly PN-104 ready.")
+        t_el = grid(1, 1, ("ColA", "ColB"), ("X-1", "Y-1"), ("X-2", "Y-2"))
+        lazy_doc = document(page(1, (p_el, t_el)))
+        lazy_run = prepared(lazy_doc)
+        (uid,) = lazy_run.unit_ids
+        u_texts = grounding_module._UnitTexts(
+            lazy_run.units[uid],
+            lazy_run.envelopes[uid],
+            {},
+            frozenset(),
+        )
+        assert grounding_module._key_found("PN-104", "text", ["p0001_e000", "p0001_e001"], u_texts) is True
+        assert "p0001_e001" not in u_texts._plain
+
+    def test_slice_rendered_block_guards_hidden_or_missing_page_attr_and_nfd_alnum_upper(self):
+        p_el = para(1, 0, "Part PN-104")
+        no_page_blk = '<el id="p0001_e000" kind="paragraph">\nPart PN-104\n</el>'
+        assert grounding_module._slice_rendered_block(p_el, no_page_blk) is None
+        hidden_el = dataclasses.replace(p_el, hidden_reasons=("invisible",))
+        std_blk = '<el id="p0001_e000" kind="paragraph" page="1">\nPart PN-104\n</el>'
+        assert grounding_module._slice_rendered_block(hidden_el, std_blk) is None
+        nfd_text = "Code\u00a0cafe\u0301-104\u00a0ok"
+        assert grounding_module._set_off_alnum_upper("CAF\u00c9-104", nfd_text) is True
+
+        ctrl_tbl = grid(1, 0, ("ColA", "ColB"), ("PN-104\x0c", "X\x85"))
+        ctrl_run = prepared(document(page(1, (ctrl_tbl,))))
+        (c_uid,) = ctrl_run.unit_ids
+        c_texts = grounding_module._UnitTexts(ctrl_run.units[c_uid], ctrl_run.envelopes[c_uid], {}, frozenset())
+        assert c_texts.plain("p0001_e000") == ("ColA", "ColB", "PN-104", "X")
+        assert c_texts.numbers("p0001_e000") == frozenset({Decimal("104"), Decimal("-104")})
