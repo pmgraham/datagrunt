@@ -433,6 +433,8 @@ def _box_backs_char(ch: str, cw: float, ch_h: float, max_side: float, vw: float,
         return True
     if ch in "-_.=—–~" and vw >= max(0.35 * cw, 1.0) and vh <= max(0.5 * ch_h, 3.0):
         return True
+    if ch in "T7FEZJLt+" and max(0.45 * cw, 2.0) <= vw <= max(1.6 * cw, 6.0) and vh <= max(0.5 * ch_h, 3.0):
+        return True
     return ch in ".,:;'\"\u00b0\u00b7*" and vw <= max(cw * 2.0, 6.0) and vh <= max(ch_h * 2.0, 6.0)
 
 
@@ -526,11 +528,24 @@ class _SpanDriftCtx(NamedTuple):
     single_word: bool = True
     right_corroborated: bool = False
     left_corroborated: bool = False
+    multi_word_ok: bool = False
+    span_drifted: bool = False
 
 
 def _is_ascii_alpha(ch: str) -> bool:
     """True strictly for ASCII A-Z / a-z letters (rejecting non-ASCII homoglyphs)."""
     return ch.isascii() and ch.isalpha()
+
+
+def _is_cjk_ideograph(ch: str) -> bool:
+    """True for CJK Unified/Compatibility Ideographs (distinct from Latin homoglyph scripts)."""
+    cp = ord(ch)
+    return 0x3400 <= cp <= 0x9FFF or 0xF900 <= cp <= 0xFAFF
+
+
+def _is_safe_letter(ch: str) -> bool:
+    """True for ASCII A-Z / a-z letters or CJK ideographs (rejecting Latin homoglyphs)."""
+    return _is_ascii_alpha(ch) or _is_cjk_ideograph(ch)
 
 
 def _is_sign_or_dash(ch: str) -> bool:
@@ -547,31 +562,171 @@ def _is_sign_or_dash(ch: str) -> bool:
     return "MINUS" in name or "PLUS" in name
 
 
-def _gap_is_bridgeable(
-    text: str, on_page: Sequence[int], pos: int, end: int, alpha_hits: int, word_upper: str = ""
+def _merge_x_intervals(raw: list[tuple[float, float]], merge_tol: float) -> list[tuple[float, float]]:
+    """Sort and merge horizontal stroke intervals separated by at most ``merge_tol``."""
+    if not raw:
+        return []
+    raw.sort()
+    merged: list[list[float]] = [[raw[0][0], raw[0][1]]]
+    for x0, x1 in raw[1:]:
+        if x0 <= merged[-1][1] + merge_tol:
+            merged[-1][1] = max(merged[-1][1], x1)
+        else:
+            merged.append([x0, x1])
+    return [(m[0], m[1]) for m in merged]
+
+
+def _token_glyph_intervals(
+    ctx: _SpanDriftCtx, indices: Sequence[int], *, bound_neighbors: bool = True
+) -> tuple[list[tuple[float, float]], float]:
+    """Merged glyph-scale stroke x-intervals across ``indices`` (excluding wide table rules)."""
+    if not indices or not ctx.bands:
+        return [], 1.0
+    boxes = [ctx.span.char_boxes[i] for i in indices]
+    wx0, wy0 = min(b[0] for b in boxes), min(b[1] for b in boxes)
+    wx1, wy1 = max(b[2] for b in boxes), max(b[3] for b in boxes)
+    ascii_w = [b[2] - b[0] for i, b in zip(indices, boxes, strict=True) if ctx.span.text[i].isascii() and b[2] > b[0]]
+    cw = max(min(ascii_w) if ascii_w else (wx1 - wx0) / len(indices), 1.0)
+    ch_h = max(wy1 - wy0, 1.0)
+    max_side = min(max(2.5 * max(cw, ch_h, 4.0), 18.0), 36.0)
+    reach = max(1.65 * cw, 4.0) if bound_neighbors else max(0.32 * (wx1 - wx0), 2.5 * cw)
+    lbound = (
+        _adjacent_word_bound(boxes[0], ctx.tr3_bands, ctx.height, ctx.budget, right_side=False)
+        if bound_neighbors
+        else None
+    )
+    rbound = (
+        _adjacent_word_bound(boxes[-1], ctx.tr3_bands, ctx.height, ctx.budget, right_side=True)
+        if bound_neighbors
+        else None
+    )
+    qx0 = max(wx0 - reach, (lbound + 0.2) if lbound is not None else wx0 - reach)
+    qx1 = min(wx1 + reach, (rbound - 0.2) if rbound is not None else wx1 + reach)
+    qy0, qy1 = wy0 - _VECTOR_TOL_PT, wy1 + _VECTOR_TOL_PT
+    raw: list[tuple[float, float]] = []
+    seen: set[Box] = set()
+    for band_idx in _bands_of(qy0, qy1, ctx.height):
+        gband = ctx.bands[band_idx]
+        lo = bisect.bisect_left(gband.x0s, qx0 - gband.max_w - 1e-6)
+        hi = bisect.bisect_right(gband.x0s, qx1)
+        for idx in range(lo, hi):
+            ctx.budget[0] -= 1
+            if ctx.budget[0] < 0:
+                return [], cw
+            b = gband.boxes[idx]
+            if b in seen:
+                continue
+            seen.add(b)
+            vx0, vy0, vx1, vy1 = b
+            vw, vh = vx1 - vx0, vy1 - vy0
+            vmid = 0.5 * (vx0 + vx1)
+            if vy0 > qy1 or qy0 > vy1 or not (qx0 <= vmid <= qx1) or vw > max_side:
+                continue
+            if vh >= max(0.18 * ch_h, 1.2) or (vw <= max(1.6 * cw, 6.0) and 0.5 <= vh <= max(0.5 * ch_h, 4.0)):
+                raw.append((vx0, vx1))
+    return _merge_x_intervals(raw, max(0.12 * cw, 0.4)), cw
+
+
+def _gap_has_no_unstroked_void(
+    ctx: _SpanDriftCtx,
+    on_page: Sequence[int],
+    pos: int,
+    end: int,
+    intervals: Sequence[tuple[float, float]],
+    cw: float,
 ) -> bool:
-    """True when interior gap ``pos..end`` is ASCII letters/separators after a backed ASCII letter."""
-    if pos <= 0 or end >= len(on_page) or end - pos > _MAX_DRIFT_GAP or alpha_hits < 2:
+    """True when glyph strokes across ``pos..end`` prove proportional SHX pitch rather than an omitted character."""
+    if ctx.span_drifted and len(on_page) >= 6:
+        return True
+    if not intervals:
+        return False
+    gx0 = ctx.span.char_boxes[on_page[pos]][0]
+    gx1 = ctx.span.char_boxes[on_page[end - 1]][2]
+    local = [iv for iv in intervals if iv[1] >= gx0 - 1.1 * cw and iv[0] <= gx1 + 1.1 * cw]
+    if not local or (len(local) < (end - pos) + 1 and len(intervals) < len(on_page)):
+        return False
+    if local[0][0] > gx0 + 0.45 * cw or local[-1][1] < gx1 - 0.45 * cw:
+        return False
+    max_gap = max((local[i + 1][0] - local[i][1] for i in range(len(local) - 1)), default=0.0)
+    return max_gap <= 1.15 * cw
+
+
+def _alpha_gap_bridgeable(
+    text: str, on_page: Sequence[int], pos: int, end: int, alpha_hits: int, word_upper: str
+) -> bool:
+    """True when digit-free interior gap ``pos..end`` is safe kerning/bracket drift."""
+    if alpha_hits < 2:
         return False
     left_ch, right_ch = text[on_page[pos - 1]], text[on_page[end]]
-    right_ok = _is_ascii_alpha(right_ch) or (right_ch == "*" and alpha_hits >= 3 and not word_upper.endswith("NT"))
-    if not (_is_ascii_alpha(left_ch) and right_ok):
+    if left_ch in "([#":
+        if end - pos != 1 or text[on_page[pos]].upper() in "AN":
+            return False
+    elif not _is_safe_letter(left_ch):
+        return False
+    right_ok = (
+        _is_safe_letter(right_ch)
+        or (right_ch in ")].,:;" and end - pos == 1)
+        or (right_ch == "*" and alpha_hits >= 3 and not word_upper.endswith("NT"))
+    )
+    if not right_ok:
+        return False
+    return all(
+        _is_safe_letter(text[on_page[k]]) or (alpha_hits >= 4 and text[on_page[k]] in "-_") for k in range(pos, end)
+    )
+
+
+def _gap_is_bridgeable(
+    text: str,
+    on_page: Sequence[int],
+    pos: int,
+    end: int,
+    alpha_hits: int,
+    word_upper: str = "",
+    *,
+    ctx: _SpanDriftCtx | None = None,
+    has_digit: bool = False,
+    intervals: Sequence[tuple[float, float]] = (),
+    cw: float = 1.0,
+) -> bool:
+    """True when interior gap ``pos..end`` is safe kerning/Vernier drift with no unstroked character void."""
+    if not text or pos <= 0 or end >= len(on_page) or end - pos > _MAX_DRIFT_GAP:
+        return False
+    if not has_digit:
+        return _alpha_gap_bridgeable(text, on_page, pos, end, alpha_hits, word_upper)
+    if ctx is None:
+        return False
+    left_ch = text[on_page[pos - 1]]
+    if _is_sign_or_dash(left_ch) and pos == 1 and not any(text[on_page[k]].isalnum() for k in range(pos)):
         return False
     for k in range(pos, end):
         ch = text[on_page[k]]
-        if not (_is_ascii_alpha(ch) or (alpha_hits >= 4 and ch in "-_")):
+        if _is_sign_or_dash(ch) or ch in ".+=":
+            if not (ch in "-_" and alpha_hits >= 1):
+                return False
+        elif not ((ch.isascii() and ch.isalnum()) or _is_cjk_ideograph(ch) or ch in "/*"):
             return False
-    return True
+    return _gap_has_no_unstroked_void(ctx, on_page, pos, end, intervals, cw)
 
 
-def _bridge_short_drift_gaps(text: str, on_page: Sequence[int], backed: list[bool], alpha_hits: int = 0) -> None:
-    """Bridge strictly interior <= 2-char kerning-drift gaps in O(N) on safe digit-free tokens."""
+def _bridge_short_drift_gaps(
+    text: str,
+    on_page: Sequence[int],
+    backed: list[bool],
+    alpha_hits: int = 0,
+    *,
+    ctx: _SpanDriftCtx | None = None,
+) -> None:
+    """Bridge strictly interior <= 2-char kerning/Vernier drift gaps in O(N) when physically stroke-continuous."""
     n = len(on_page)
-    if n < 3 or not text or any(text[i].isdigit() for i in on_page):
+    if n < 3 or not text:
         return
     word_upper = "".join(text[i] for i in on_page if text[i].isalnum()).upper()
     if word_upper in _UNSAFE_BRIDGE_WORDS:
         return
+    has_digit = any(text[i].isdigit() for i in on_page)
+    if has_digit and ctx is None:
+        return
+    intervals, cw = _token_glyph_intervals(ctx, on_page) if has_digit and ctx is not None else ([], 1.0)
     non_sign_left = False
     pos = 0
     while pos < n:
@@ -583,7 +738,9 @@ def _bridge_short_drift_gaps(text: str, on_page: Sequence[int], backed: list[boo
         end = pos + 1
         while end < n and not backed[on_page[end]]:
             end += 1
-        if non_sign_left and _gap_is_bridgeable(text, on_page, pos, end, alpha_hits, word_upper):
+        if non_sign_left and _gap_is_bridgeable(
+            text, on_page, pos, end, alpha_hits, word_upper, ctx=ctx, has_digit=has_digit, intervals=intervals, cw=cw
+        ):
             for k in range(pos, end):
                 backed[on_page[k]] = True
         pos = end
@@ -746,6 +903,29 @@ def _is_eu_directive_lead_digit(
     return len(year_digits) == 4 and all(text[i].isdigit() for i in year_digits)
 
 
+def _expanded_part_edge_digit_ok(
+    ctx: _SpanDriftCtx | None, on_page: Sequence[int], alnum: Sequence[int], alpha_hits: int
+) -> bool:
+    """True when proportional SHX expansion (> 1.0 * cw pitch) continuously backs all ``on_page`` glyphs."""
+    if ctx is None or len(alnum) < 6 or alpha_hits < 1:
+        return False
+    intervals, cw = _token_glyph_intervals(ctx, on_page)
+    if len(intervals) < len(on_page):
+        return False
+    wx0, wx1 = ctx.span.char_boxes[on_page[0]][0], ctx.span.char_boxes[on_page[-1]][2]
+    max_gap = max((intervals[i + 1][0] - intervals[i][1] for i in range(len(intervals) - 1)), default=999.0)
+    return max_gap <= 1.15 * cw and (intervals[-1][1] - intervals[0][0]) >= (wx1 - wx0) + 0.4 * cw
+
+
+def _n_lead_continuous(ctx: _SpanDriftCtx | None, on_page: Sequence[int], alnum: Sequence[int]) -> bool:
+    """True when uncorroborated leading ``N`` has full stroke-cluster count and <= 1.15 * cw spacing."""
+    if ctx is None:
+        return False
+    intervals, cw = _token_glyph_intervals(ctx, on_page)
+    max_gap = max((intervals[i + 1][0] - intervals[i][1] for i in range(len(intervals) - 1)), default=999.0)
+    return len(intervals) >= len(alnum) and max_gap <= 1.15 * cw
+
+
 def _edge_char_ok(
     ch: str,
     text: str,
@@ -756,22 +936,30 @@ def _edge_char_ok(
     leading: bool = True,
     single_word: bool = True,
     side_corroborated: bool = False,
+    ctx: _SpanDriftCtx | None = None,
 ) -> bool:
-    """True when 1-char ASCII edge ``ch`` is a safe corroborated letter or YYYY/NN/XX directive digit."""
-    if len(ch) != 1 or not on_page or not alnum or not all(text[i].isascii() for i in on_page):
+    """True when 1-char edge ``ch`` is a safe corroborated letter, CJK ideograph, or continuous part/directive digit."""
+    if len(ch) != 1 or not text or not on_page or not alnum:
+        return False
+    if not all(text[i].isascii() or _is_cjk_ideograph(text[i]) or text[i] in "。，、；：（）" for i in on_page):
         return False
     if _has_sign_prefix(text, on_page, alnum):
         return False
     if ch.isdigit():
-        return leading and _is_eu_directive_lead_digit(ch, text, on_page, alnum, alpha_hits)
-    if not _is_ascii_alpha(ch):
+        if leading and _is_eu_directive_lead_digit(ch, text, on_page, alnum, alpha_hits):
+            return True
+        return _expanded_part_edge_digit_ok(ctx, on_page, alnum, alpha_hits)
+    if not _is_safe_letter(ch):
         return False
     word_upper = "".join(text[i] for i in alnum).upper()
     if word_upper in _UNSAFE_BRIDGE_WORDS:
         return False
-    if not single_word and not side_corroborated:
+    multi_ok = ctx.multi_word_ok if ctx is not None else False
+    if not single_word and not (side_corroborated or multi_ok):
         return False
-    if single_word and leading and ch.upper() in "AN":
+    if leading and ch.upper() == "A" and not side_corroborated:
+        return False
+    if leading and ch.upper() == "N" and not side_corroborated and not _n_lead_continuous(ctx, on_page, alnum):
         return False
     if alpha_hits >= 2:
         return True
@@ -912,17 +1100,41 @@ def _word_drifts_toward(
     return _overhangs_edge(ctx, edge_idx, right_side=right_side, min_chars=2 if two_missed else 1)
 
 
+def _span_has_continuous_overhang(base_ctx: _SpanDriftCtx, words: Sequence[Sequence[int]]) -> bool:
+    """True when a multi-word span's glyph clusters match or exceed its non-space chars and overhang its edge."""
+    all_idx = [i for w in words for i in w]
+    if len(all_idx) < _MIN_MULTI_SPAN_ALNUM:
+        return False
+    intervals, cw = _token_glyph_intervals(base_ctx, all_idx, bound_neighbors=False)
+    if len(intervals) < len(all_idx):
+        return False
+    sx0 = base_ctx.span.char_boxes[all_idx[0]][0]
+    sx1 = base_ctx.span.char_boxes[all_idx[-1]][2]
+    span_ivs = [iv for iv in intervals if iv[1] >= sx0 - 1.5 * cw]
+    if len(span_ivs) < len(all_idx):
+        return False
+    max_gap = max((span_ivs[i + 1][0] - span_ivs[i][1] for i in range(len(span_ivs) - 1)), default=999.0)
+    return max_gap <= 2.8 * cw and (span_ivs[-1][1] >= sx1 + 1.5 * cw or span_ivs[0][0] <= sx0 - 1.5 * cw)
+
+
 def _with_span_corroboration(
-    base_ctx: _SpanDriftCtx, words: Sequence[Sequence[int]], direct: Sequence[bool]
+    base_ctx: _SpanDriftCtx, words: Sequence[Sequence[int]], direct: Sequence[bool], *, multi_word_ok: bool = False
 ) -> _SpanDriftCtx:
-    """Populate multi-word directional drift corroboration (>= 2 words and unidirectional) onto ``base_ctx``."""
+    """Populate multi-word directional drift corroboration and span-level SHX continuity onto ``base_ctx``."""
     if len(words) < _MIN_MULTI_WORD_COUNT or not direct:
         return base_ctx
     right_n = sum(1 for w in words if _word_drifts_toward(base_ctx, w, direct, right_side=True))
     left_n = sum(1 for w in words if _word_drifts_toward(base_ctx, w, direct, right_side=False))
     right_ok = right_n >= _MIN_MULTI_WORD_COUNT and left_n == 0 and right_n * 2 >= len(words)
     left_ok = left_n >= _MIN_MULTI_WORD_COUNT and right_n == 0 and left_n * 2 >= len(words)
-    return base_ctx._replace(single_word=False, right_corroborated=right_ok, left_corroborated=left_ok)
+    span_drifted = multi_word_ok and not (right_ok or left_ok) and _span_has_continuous_overhang(base_ctx, words)
+    return base_ctx._replace(
+        single_word=False,
+        right_corroborated=right_ok,
+        left_corroborated=left_ok,
+        multi_word_ok=multi_word_ok,
+        span_drifted=span_drifted,
+    )
 
 
 def _bridge_single_word_edges(
@@ -936,7 +1148,7 @@ def _bridge_single_word_edges(
     if not on_page or len(alnum) < 3:
         return
     text = ctx.span.text
-    alpha_n = sum(1 for i in alnum if direct[i] and _is_ascii_alpha(text[i]))
+    alpha_n = sum(1 for i in alnum if direct[i] and _is_safe_letter(text[i]))
     ch0, ch1 = text[alnum[0]], text[alnum[-1]]
     lead_cand = (
         not direct[alnum[0]]
@@ -950,6 +1162,7 @@ def _bridge_single_word_edges(
             leading=True,
             single_word=ctx.single_word,
             side_corroborated=ctx.right_corroborated,
+            ctx=ctx,
         )
     )
     lead_ok = lead_cand and _overhangs_edge(ctx, on_page[-1], right_side=True)
@@ -965,10 +1178,11 @@ def _bridge_single_word_edges(
             leading=False,
             single_word=ctx.single_word,
             side_corroborated=ctx.left_corroborated,
+            ctx=ctx,
         )
     )
     trail_ok = trail_cand and _overhangs_edge(ctx, on_page[0], right_side=False)
-    _bridge_short_drift_gaps(text, on_page, backed, alpha_n)
+    _bridge_short_drift_gaps(text, on_page, backed, alpha_n, ctx=ctx)
     if lead_ok:
         backed[alnum[0]] = True
     if trail_ok:
@@ -1044,8 +1258,8 @@ def _char_vector_flags(
     if not any(direct):
         return direct
     base_ctx = _SpanDriftCtx(span=span, bands=bands, tr3_bands=tr3_bands, height=height, budget=budget)
-    ctx = _with_span_corroboration(base_ctx, words, direct)
     multi_word_ok = _multi_word_span_qualifies(span.text, words, direct)
+    ctx = _with_span_corroboration(base_ctx, words, direct, multi_word_ok=multi_word_ok)
     for on_page in words:
         _mark_word_backing(ctx, on_page, direct, backed, multi_word_ok=multi_word_ok)
     return _propagate_internal_spaces(span, width, height, backed)

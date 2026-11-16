@@ -2747,16 +2747,17 @@ class TestMultimodalTextlessPeerQuoteGrounding:
             ("quote_not_found", A, 1, None),
         ]
 
-        # 7. Punctuation-only quote ("-" in "04-60008-27") has zero tokens and never waives padded hallucinations
-        punct_g = entry(bearing, ("-", "04-60008-27 COMPLETELY HALLUCINATED EXTRA"), (anchor_part,))
-        punct_a = entry(bearing, ("04-60008-27",), (anchor_part,))
+        # 7. Punctuation-only quote ("-" in "04-60008-27") has zero tokens and never waives disjoint hallucinations
+        punct_g = entry({"text": "row"}, ("-", "COMPLETELY HALLUCINATED EXTRA"), (anchor_line,))
+        punct_a = entry({"text": "row"}, ("04-60008-27",), (anchor_line,))
         punct_res = grounded(
-            {(uid_part, G): response(punct_g), (uid_part, A): response(punct_a)},
+            {(uid_line, G): response(punct_g), (uid_line, A): response(punct_a)},
             models=PAIR,
-            run=mm_part,
+            schema=LINE,
+            run=mm_line,
         )
         assert (punct_res.items[0].status, punct_res.items[0].grounded) == ("ungrounded_value", False)
-        assert reasons(punct_res.items[0]) == [("quote_not_found", G, 1, None)]
+        assert ("quote_not_found", G, 1, None) in reasons(punct_res.items[0])
 
         # 8. Trivial short words ("e", "row") on keyless schema never waive 3-word hallucinations
         for trivial in ("e", "row"):
@@ -2776,15 +2777,121 @@ class TestMultimodalTextlessPeerQuoteGrounding:
             ]
 
         # 9. Root key present only inside an uncorroborated padded quote is never waived
-        pad_key_g = entry(bearing, ("BALL BEARINGS", "04-60008-27 COMPLETELY HALLUCINATED EXTRA"), (anchor_part,))
-        pad_key_a = entry(bearing, ("04-60008-27", "BALL BEARINGS"), (anchor_part,))
+        class NormPart(BaseModel):
+            number: Annotated[str, Key(normalizer="alnum_upper")]
+            title: str
+
+        norm_schema = prepare(NormPart)
+        mm_norm = _make_multimodal_image_only_run(norm_schema)
+        (uid_norm,) = mm_norm.unit_ids
+        anchor_norm = mm_norm.units[uid_norm].elements[0].element_id
+        norm_rec = {"number": "AB-12-CD", "title": "Bearing"}
+        pad_key_g = entry(norm_rec, ("BALL BEARINGS", "AB12CD COMPLETELY HALLUCINATED EXTRA"), (anchor_norm,))
+        pad_key_a = entry(norm_rec, ("AB-12-CD", "BALL BEARINGS"), (anchor_norm,))
         pad_key_res = grounded(
-            {(uid_part, G): response(pad_key_g), (uid_part, A): response(pad_key_a)},
+            {(uid_norm, G): response(pad_key_g), (uid_norm, A): response(pad_key_a)},
+            models=PAIR,
+            schema=norm_schema,
+            run=mm_norm,
+        )
+        assert (pad_key_res.items[0].status, pad_key_res.items[0].grounded) == ("ungrounded_value", False)
+        assert reasons(pad_key_res.items[0]) == [
+            ("quote_not_found", G, 1, None),
+            ("quote_not_found", A, 0, None),
+        ]
+
+    def test_textless_multimodal_single_quote_superset_and_hyphenated_numeric_codes_ground_consensus(self):
+        mm_prof = _make_multimodal_image_only_run(DOC_PROFILE)
+        (uid_prof,) = mm_prof.unit_ids
+        anchor_prof = mm_prof.units[uid_prof].elements[0].element_id
+        mm_part = _make_multimodal_image_only_run(PART)
+        (uid_part,) = mm_part.unit_ids
+        anchor_part = mm_part.units[uid_part].elements[0].element_id
+
+        # 1. Single-quote bilingual superset ("MOTEUR ELECTRIQUE AC" vs "MOTEUR ELECTRIQUE AC [MOTOR AC]")
+        prof_rec = {
+            "drawing_number": "54-60000",
+            "manufacturer": "Carrier",
+            "specs": [{"label": "Type", "value": "AC Motor"}],
+        }
+        bilingual_res = grounded(
+            {
+                (uid_prof, G): response(entry(prof_rec, ("MOTEUR ELECTRIQUE AC [MOTOR AC]",), (anchor_prof,))),
+                (uid_prof, A): response(entry(prof_rec, ("MOTEUR ELECTRIQUE AC",), (anchor_prof,))),
+            },
+            models=PAIR,
+            schema=DOC_PROFILE,
+            run=mm_prof,
+        )
+        assert (bilingual_res.items[0].status, bilingual_res.items[0].grounded, bilingual_res.items[0].reasons) == (
+            "consensus",
+            True,
+            (),
+        )
+
+        # 2. Single-quote part-code superset on keyed Part ("54-60000" vs "P/N 54-60000 CAPACITOR ASSY")
+        cap_rec = {"number": "54-60000", "title": "Capacitor Assembly"}
+        code_sup_res = grounded(
+            {
+                (uid_part, G): response(entry(cap_rec, ("P/N 54-60000 CAPACITOR ASSY",), (anchor_part,))),
+                (uid_part, A): response(entry(cap_rec, ("54-60000",), (anchor_part,))),
+            },
             models=PAIR,
             run=mm_part,
         )
-        assert (pad_key_res.items[0].status, pad_key_res.items[0].grounded) == ("ungrounded_value", False)
-        assert reasons(pad_key_res.items[0]) == [("quote_not_found", G, 1, None)]
+        assert (code_sup_res.items[0].status, code_sup_res.items[0].grounded, code_sup_res.items[0].reasons) == (
+            "consensus",
+            True,
+            (),
+        )
+
+        # 3. Hyphenated numeric part codes ("54-60000", "630372-006", "77009-651") on keyless DOC_PROFILE
+        for num_code in ("54-60000", "630372-006", "77009-651"):
+            rec = {"drawing_number": num_code, "manufacturer": "Carrier", "specs": []}
+            num_res = grounded(
+                {
+                    (uid_prof, G): response(entry(rec, (num_code, "CENTRIFUGAL COMPRESSOR DRAWING"), (anchor_prof,))),
+                    (uid_prof, A): response(entry(rec, (num_code, "CARRIER TITLE BLOCK SHEET 1"), (anchor_prof,))),
+                },
+                models=PAIR,
+                schema=DOC_PROFILE,
+                run=mm_prof,
+            )
+            assert (num_res.items[0].status, num_res.items[0].grounded) == ("consensus", True), num_code
+
+        # 4. Short/decimal/spaced numbers and mid-token glued substrings still fail
+        for bad_num in ("12-34", "100.00", "10 000"):
+            bad_rec = {"drawing_number": bad_num, "manufacturer": "Carrier", "specs": []}
+            bad_res = grounded(
+                {
+                    (uid_prof, G): response(entry(bad_rec, (bad_num, "ALPHA BETA GAMMA"), (anchor_prof,))),
+                    (uid_prof, A): response(entry(bad_rec, (bad_num, "DELTA EPSILON ZETA"), (anchor_prof,))),
+                },
+                models=PAIR,
+                schema=DOC_PROFILE,
+                run=mm_prof,
+            )
+            assert (bad_res.items[0].status, bad_res.items[0].grounded) == ("ungrounded_value", False), bad_num
+
+        mm_line = _make_multimodal_image_only_run(LINE)
+        (uid_line,) = mm_line.unit_ids
+        anchor_line = mm_line.units[uid_line].elements[0].element_id
+        for peer_q, glued_q in (
+            ("A10", "ULTRA1000 BOLT NUT"),
+            ("54-60000", "9954-6000099 BOLT NUT"),
+            ("PIN A B", "SPIN A BOLT"),
+        ):
+            peer_entry = entry({"text": "row"}, (peer_q, "VALID THREE WORD ANCHOR"), (anchor_line,))
+            glued_res = grounded(
+                {
+                    (uid_line, G): response(entry({"text": "row"}, (glued_q,), (anchor_line,))),
+                    (uid_line, A): response(peer_entry),
+                },
+                models=PAIR,
+                schema=LINE,
+                run=mm_line,
+            )
+            assert ("quote_not_found", G, 0, None) in reasons(glued_res.items[0])
 
     def test_ocr_backed_multimodal_unit_still_rejects_ungrounded_secondary_quote(self):
         img = PageImage(page_number=1, dpi=150, width_px=8, height_px=8, _loader=lambda: TINY_PNG)
@@ -2824,6 +2931,25 @@ class TestMultimodalTextlessPeerQuoteGrounding:
 
         assert res.items[0].status == "ungrounded_value"
         assert reasons(res.items[0]) == [("quote_not_found", G, 1, None)]
+
+        single_padded = grounded(
+            {
+                (uid, G): response(
+                    entry(
+                        {"number": "04-60008-27", "title": "Bearing"},
+                        ("04-60008-27 UNPRINTED HALLUCINATED NOTE",),
+                        (anchor_id,),
+                    )
+                ),
+                (uid, A): response(
+                    entry({"number": "04-60008-27", "title": "Bearing"}, ("04-60008-27",), (anchor_id,))
+                ),
+            },
+            models=PAIR,
+            run=ocr_run,
+        )
+        assert single_padded.items[0].status == "ungrounded_value"
+        assert reasons(single_padded.items[0]) == [("quote_not_found", G, 0, None)]
 
     def test_multimodal_unit_with_digital_header_context_enforces_exact_header_check_and_header_isolation(self):
         hdr_vendor = pair(1, 0, "Vendor", "Carrier Corp")

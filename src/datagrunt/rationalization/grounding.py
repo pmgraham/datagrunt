@@ -1439,7 +1439,53 @@ def _quote_in_texts(quote: str, cited: Sequence[str], texts: _UnitTexts) -> bool
     )
 
 
-def _quote_in_witness(quote: str, witness: _PeerWitness) -> bool:
+def _counter_in_texts(counter: Counter[str], cited: Sequence[str], texts: _UnitTexts) -> bool:
+    """Whether ``counter`` already has >=0.85 containment in any ``cited`` element's tokens."""
+    if not isinstance(counter, Counter) or not isinstance(texts, _UnitTexts):
+        raise TypeError("_counter_in_texts requires Counter and _UnitTexts")
+    return any(_containment(counter, held) >= VISION_CONTAINMENT for eid in cited for held in texts.tokens(eid))
+
+
+def _peer_superset_matches(
+    quote: str,
+    wanted: Counter[str],
+    witness: _PeerWitness,
+    non_textless: Sequence[str] = (),
+    strict: Sequence[str] = (),
+    texts: _UnitTexts | None = None,
+) -> bool:
+    """Whether ``quote`` cleanly contains a non-trivial peer scan witness not already explained by text blocks."""
+    if not isinstance(quote, str) or not isinstance(witness, _PeerWitness):
+        raise TypeError("_peer_superset_matches requires str quote and _PeerWitness")
+    if not wanted or (strict and texts is not None and _near_strict_element(quote, strict, texts)):
+        return False
+    for pq in witness.comparable:
+        pq_tokens = _tokens(pq)
+        if not (len(pq_tokens) >= QUOTE_MIN_TOKENS or _is_code_identifier(pq)):
+            continue
+        if (
+            pq in quote
+            and _containment(pq_tokens, wanted) == 1
+            and not (non_textless and texts is not None and _quote_in_texts(pq, non_textless, texts))
+        ):
+            return True
+    for counter in witness.model_counters:
+        if (
+            len(counter) >= QUOTE_MIN_TOKENS
+            and _containment(counter, wanted) >= VISION_CONTAINMENT
+            and not (non_textless and texts is not None and _counter_in_texts(counter, non_textless, texts))
+        ):
+            return True
+    return False
+
+
+def _quote_in_witness(
+    quote: str,
+    witness: _PeerWitness,
+    non_textless: Sequence[str] = (),
+    strict: Sequence[str] = (),
+    texts: _UnitTexts | None = None,
+) -> bool:
     """Whether comparable ``quote`` matches cross-family ``witness`` quotes (substring or >=0.85 containment)."""
     if not isinstance(quote, str) or not isinstance(witness, _PeerWitness):
         raise TypeError("_quote_in_witness requires str quote and _PeerWitness")
@@ -1448,7 +1494,9 @@ def _quote_in_witness(quote: str, witness: _PeerWitness) -> bool:
     if any(quote in pq for pq in witness.comparable):
         return True
     wanted = _tokens(quote)
-    return any(_containment(wanted, counter) >= VISION_CONTAINMENT for counter in witness.model_counters)
+    if any(_containment(wanted, counter) >= VISION_CONTAINMENT for counter in witness.model_counters):
+        return True
+    return _peer_superset_matches(quote, wanted, witness, non_textless, strict, texts)
 
 
 def _near_strict_element(quote: str, strict: Sequence[str], texts: _UnitTexts) -> bool:
@@ -1476,14 +1524,29 @@ def _waivable_scan_quote(
 
 
 def _is_code_identifier(quote: str) -> bool:
-    """Whether ``quote`` is a multi-char alphanumeric identifier with both letters and digits."""
+    """Whether ``quote`` is a multi-char alphanumeric or bridged numeric identifier."""
+    if not isinstance(quote, str):
+        raise TypeError("_is_code_identifier requires str quote")
     if not quote or not all(ch.isalnum() or ch in _CODE_BRIDGES for ch in quote):
         return False
     alnum = [ch for ch in quote if ch.isalnum()]
-    return len(alnum) >= 3 and any(ch.isdigit() for ch in alnum) and any(ch.isalpha() for ch in alnum)
+    has_bridge = any(ch in "-_/" for ch in quote) or quote.count(".") >= 2
+    return (
+        len(alnum) >= 3
+        and any(ch.isdigit() for ch in alnum)
+        and (any(ch.isalpha() for ch in alnum) or (has_bridge and len(alnum) >= 5))
+    )
 
 
-def _witness_token_corroborated(quote: str, witness: _PeerWitness, *, keyless: bool) -> bool:
+def _witness_token_corroborated(
+    quote: str,
+    witness: _PeerWitness,
+    *,
+    keyless: bool,
+    non_textless: Sequence[str] = (),
+    strict: Sequence[str] = (),
+    texts: _UnitTexts | None = None,
+) -> bool:
     """Whether ``quote`` matches a cross-family peer counter (>=0.85) and is non-trivial when ``keyless``."""
     if not isinstance(quote, str) or not isinstance(witness, _PeerWitness):
         raise TypeError("_witness_token_corroborated requires str quote and _PeerWitness")
@@ -1492,7 +1555,9 @@ def _witness_token_corroborated(quote: str, witness: _PeerWitness, *, keyless: b
     wanted = _tokens(quote)
     if not wanted:
         return False
-    return any(_containment(wanted, counter) >= VISION_CONTAINMENT for counter in witness.model_counters)
+    if any(_containment(wanted, counter) >= VISION_CONTAINMENT for counter in witness.model_counters):
+        return True
+    return _peer_superset_matches(quote, wanted, witness, non_textless, strict, texts)
 
 
 def _matched_quotes_hold_keys(
@@ -1533,8 +1598,11 @@ def _has_corroborated_scan_quote(
     if not witness.model_counters or not any(texts.textless_anchor(eid) for eid in cited):
         return False
     text_ids = tuple(eid for eid in cited if not texts.textless_anchor(eid))
+    strict_ids = tuple(eid for eid in cited if not texts.lenient(eid))
     for quote in comparable:
-        if not _witness_token_corroborated(quote, witness, keyless=keyless):
+        if not _witness_token_corroborated(
+            quote, witness, keyless=keyless, non_textless=text_ids, strict=strict_ids, texts=texts
+        ):
             continue
         if not (text_ids and _quote_in_texts(quote, text_ids, texts)):
             return True
@@ -1553,7 +1621,11 @@ def _quote_found(
     """
     if _quote_in_texts(quote, cited, texts):
         return True
-    return any(texts.lenient(eid) for eid in cited) and _quote_in_witness(quote, witness)
+    if not any(texts.lenient(eid) for eid in cited):
+        return False
+    non_textless = tuple(eid for eid in cited if not texts.textless_anchor(eid))
+    strict = tuple(eid for eid in cited if not texts.lenient(eid))
+    return _quote_in_witness(quote, witness, non_textless, strict, texts)
 
 
 def _valid_code_gap(gap: str) -> bool:
