@@ -3413,3 +3413,86 @@ class TestWave2AConsensusRegressions:
         comp = consensus_module._Comparison(voters=2, quorum=None)
         with pytest.raises(RationalizationError, match=r"^mid\.leaf: nesting is deeper than 2 levels$"):
             comp.compare_model(deep_schema.spec, "", "", [(0, inst, {}), (1, inst, {})], 1)
+
+
+class DocProfile(BaseModel):
+    doc_key: Annotated[str, Key]
+    parent_part_number: Annotated[str | None, Informational] = None
+    l1_category: str = "Unclassified"
+    l2_category: Annotated[str | None, Informational] = None
+    specs: Annotated[list[str], Informational] = []
+
+
+class PrefixedInfoTags(BaseModel):
+    doc_key: Annotated[str, Key]
+    tags: Annotated[list[str], Informational] = []
+
+    @field_validator("tags")
+    @classmethod
+    def _prefix_each(cls, values: list[str]) -> list[str]:
+        return [f"PFX_{item}" for item in values]
+
+
+class TestInformationalListAndOptionalConsensus:
+    def test_informational_scalar_list_unites_distinct_normalized_items_across_models(self):
+        schema = prepare(DocProfile)
+        gemini_specs = [f"Spec {i}: {i * 10}V" for i in range(1, 9)]
+        claude_specs = [
+            "Spec 1:  10V ",  # whitespace-equivalent to Spec 1 -> deduplicated to Gemini's spelling
+            *[f"Spec {i}: {i * 10}V" for i in range(2, 21)],
+        ]
+        responses = {
+            (U1, GOOGLE): answer(
+                {
+                    "doc_key": "DOC-1",
+                    "parent_part_number": "30RA402080",
+                    "l1_category": "Steel Fabrication",
+                    "l2_category": "STEEL FABRICATION",
+                    "specs": gemini_specs,
+                }
+            ),
+            (U1, ANTHROPIC): answer(
+                {
+                    "doc_key": "DOC-1",
+                    "parent_part_number": None,
+                    "l1_category": "Steel Fabrication",
+                    "l2_category": None,
+                    "specs": claude_specs,
+                }
+            ),
+        }
+        found = only(blend(responses, schema=schema))
+        assert found.status == "consensus"
+        assert found.disputed_fields == ()
+        assert found.record is not None
+        assert found.record.parent_part_number == "30RA402080"
+        assert found.record.l2_category == "STEEL FABRICATION"
+        assert len(found.record.specs) == 20
+        assert found.record.specs[0] == "Spec 1: 10V"
+        assert found.record.specs[-1] == "Spec 20: 200V"
+
+    def test_informational_optional_scalar_and_list_prefer_populated_over_majority_none_or_empty(self):
+        schema = prepare(DocProfile)
+        responses = {
+            (U1, GOOGLE): answer({"doc_key": "DOC-2", "l2_category": None, "specs": []}),
+            (U1, ANTHROPIC): answer({"doc_key": "DOC-2", "l2_category": None, "specs": []}),
+            (U1, OPENAI): answer({"doc_key": "DOC-2", "l2_category": "CHILLER FRAME", "specs": ["Weight: 500 kg"]}),
+        }
+        found = only(blend(responses, THREE, schema=schema))
+        assert found.status == "consensus"
+        assert found.record is not None
+        assert found.record.l2_category == "CHILLER FRAME"
+        assert found.record.specs == ["Weight: 500 kg"]
+
+    def test_informational_scalar_list_runs_non_idempotent_validator_once_and_passes_holds_agreed(self):
+        schema = prepare(PrefixedInfoTags)
+        responses = {
+            (U1, GOOGLE): answer({"doc_key": "DOC-3", "tags": ["alpha", "beta"]}),
+            (U1, ANTHROPIC): answer({"doc_key": "DOC-3", "tags": ["beta", "gamma"]}),
+        }
+        found = only(blend(responses, schema=schema))
+        assert found.status == "consensus"
+        assert found.notes == ()
+        assert found.record == PrefixedInfoTags.model_validate({"doc_key": "DOC-3", "tags": ["alpha", "beta", "gamma"]})
+        assert found.record is not None
+        assert found.record.tags == ["PFX_alpha", "PFX_beta", "PFX_gamma"]

@@ -50,9 +50,8 @@ model and its sibling modules: nothing from ``datagrunt.core``, and no import in
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import datetime
 from decimal import Decimal
-from enum import Enum
 from types import MappingProxyType
 from typing import Any, Generic, Literal, TypeAlias, TypeVar, cast, get_args
 
@@ -68,10 +67,13 @@ from datagrunt.rationalization.consensus import (
     _check_votes,
     _key_of,
     _key_text,
+    _normalized,
     _normalized_field,
     _read_only,
+    _scalar_to_wire,
     _united,
     _validated,
+    _widened,
     key_order,
 )
 from datagrunt.rationalization.envelope import Envelope
@@ -93,9 +95,17 @@ RecordStatus: TypeAlias = Literal[
 
 RECORD_STATUSES: tuple[RecordStatus, ...] = get_args(RecordStatus)
 
+GROUNDED_UNION_STATUSES: tuple[RecordStatus, ...] = (
+    "consensus",
+    "single_model",
+    "missing_in_some_models",
+)
+"""Statuses eligible for the grounded-union tier when ``record`` is present and grounded without disputes."""
+
 T = TypeVar("T", bound=BaseModel)
 
 __all__ = [
+    "GROUNDED_UNION_STATUSES",
     "RECORD_STATUSES",
     "ElementSource",
     "FoldingResult",
@@ -105,8 +115,8 @@ __all__ = [
 ]
 
 _CLEAN_STATUSES: frozenset[str] = frozenset({"consensus", "single_model"})
+_GROUNDED_UNION_SET: frozenset[str] = frozenset(GROUNDED_UNION_STATUSES)
 _STATUS_RANK: Mapping[str, int] = MappingProxyType({status: index for index, status in enumerate(RECORD_STATUSES)})
-_PLAIN_WIRE_SCALARS: tuple[type, ...] = (str, int, float, bool)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -253,6 +263,22 @@ class GroundedRecord(Generic[T]):
         if self.status == "ungrounded_value" and not self.grounding_reasons:
             raise ValueError("an ungrounded_value record must have at least one GroundingReason")
 
+    @property
+    def is_grounded(self) -> bool:
+        """Whether supporting models' evidence grounded the record without grounding failures."""
+        return not self.grounding_reasons
+
+    @property
+    def is_grounded_union(self) -> bool:
+        """Whether the record belongs to the grounded-union tier (clean or grounded single-family catch)."""
+        return (
+            self.status in _GROUNDED_UNION_SET
+            and self.record is not None
+            and not self.grounding_reasons
+            and not self.disputed_fields
+            and not self.notes
+        )
+
     @classmethod
     def _trusted(
         cls,
@@ -305,6 +331,21 @@ class FoldingResult(Generic[T]):
 
     def __post_init__(self) -> None:
         _check_tuple_of("items", self.items, GroundedRecord)
+
+    @property
+    def records(self) -> tuple[T, ...]:
+        """Clean validated records (``status in ("consensus", "single_model")``), in document order."""
+        return tuple(item.record for item in self.items if item.status in _CLEAN_STATUSES and item.record is not None)
+
+    @property
+    def grounded_items(self) -> tuple[GroundedRecord[T], ...]:
+        """Items in the grounded-union tier (:attr:`GroundedRecord.is_grounded_union`), in document order."""
+        return tuple(item for item in self.items if item.is_grounded_union)
+
+    @property
+    def grounded_records(self) -> tuple[T, ...]:
+        """Validated records in the grounded-union tier, in document order."""
+        return tuple(item.record for item in self.items if item.is_grounded_union and item.record is not None)
 
     @classmethod
     def _trusted(cls, items: tuple[GroundedRecord[T], ...]) -> "FoldingResult[T]":
@@ -697,12 +738,11 @@ def _fold_multi_unit_group(
         wire,
         valid_sources,
         schema,
-        all_have_records=len(records) == len(group),
         has_conflict=bool(folder.disputed),
         notes=notes,
     )
     status = _folded_status(group, has_conflict=has_conflict, has_reasons=bool(reasons))
-    if status in ("field_disagreement", "unmatched", "cross_page_conflict"):
+    if status in ("unmatched", "cross_page_conflict"):
         folded_record = None
     return GroundedRecord._trusted(
         doc_id=doc_id,
@@ -728,14 +768,19 @@ def _resolve_folded_record(
     valid_sources: frozenset[int],
     schema: PreparedSchema,
     *,
-    all_have_records: bool,
+    all_have_records: bool = True,
     has_conflict: bool,
     notes: list[str],
 ) -> tuple[BaseModel | None, bool]:
     """Return ``(folded_record, has_conflict)``, reusing ``records[source]`` when an instance matches unchanged."""
     if not isinstance(records, Sequence) or not isinstance(notes, list) or not isinstance(schema, PreparedSchema):
         raise TypeError("_resolve_folded_record requires Sequence records, list notes, and PreparedSchema")
-    if not all_have_records or has_conflict or wire is None:
+    del all_have_records
+    if not records or has_conflict:
+        return None, has_conflict
+    if len(records) == 1:
+        return records[0], False
+    if wire is None:
         return None, has_conflict
     if valid_sources:
         return records[min(valid_sources)], False
@@ -906,6 +951,8 @@ class _Folder:
             if len(norms) > 1:
                 self.disputed.append(field_path)
                 return False, False, None, frozenset()
+        elif field_spec.kind == "scalar_list" and field_spec.scalar is not None:
+            return _fold_informational_scalar_list(field_spec, instances, explicit)
         winner = explicit[0]
         matches = frozenset(
             idx
@@ -915,15 +962,42 @@ class _Folder:
         return True, True, _dump_leaf(winner, field_spec, depth), matches
 
 
+def _fold_informational_scalar_list(
+    field_spec: FieldSpec,
+    instances: Sequence[BaseModel],
+    explicit: Sequence[BaseModel],
+) -> tuple[bool, bool, list[Any], frozenset[int]]:
+    """Unite an ``Informational`` ``scalar_list`` field across ``explicit`` units in first-seen normalized order."""
+    if not explicit or field_spec.scalar is None:
+        raise ValueError("_fold_informational_scalar_list requires non-empty explicit instances and ScalarSpec")
+    scalar_base = field_spec.scalar.base
+    seen_norms: set[object] = set()
+    united_items: list[Any] = []
+    for inst in explicit:
+        for item in getattr(inst, field_spec.name):
+            norm = _normalized(_widened(item, scalar_base))
+            if norm not in seen_norms:
+                seen_norms.add(norm)
+                united_items.append(item)
+    wire_items = [_scalar_to_wire(item) for item in united_items]
+    target_len = len(united_items)
+    matches = frozenset(
+        idx
+        for idx, inst in enumerate(instances)
+        if field_spec.name in inst.model_fields_set
+        and len(own := getattr(inst, field_spec.name)) == target_len
+        and all(_same_raw_scalar(a, b) for a, b in zip(united_items, own))
+    )
+    return True, True, wire_items, matches
+
+
 def _is_explicit(instance: BaseModel, field_spec: FieldSpec) -> bool:
     """Whether ``instance`` provides a non-vacuous explicit value for ``field_spec``."""
     value = getattr(instance, field_spec.name)
     if field_spec.optional:
         return value is not None
     if field_spec.kind in ("scalar_list", "model_list"):
-        return (field_spec.required or field_spec.name in instance.model_fields_set) and (
-            bool(value) or field_spec.required
-        )
+        return (field_spec.required or field_spec.name in instance.model_fields_set) and bool(value)
     return field_spec.required or field_spec.name in instance.model_fields_set
 
 
@@ -944,21 +1018,6 @@ def _matching_keyed_list_parents(
         if len(own_list) == target_len and all(id(own_list[pos]) in accepted_ids[pos] for pos in range(target_len)):
             matched.append(idx)
     return frozenset(matched)
-
-
-def _scalar_to_wire(value: object) -> Any:
-    """Serialize one validated scalar value to its JSON-mode wire primitive in O(1)."""
-    if type(value) is float and not math.isfinite(value):
-        raise ValueError("non-finite float cannot be serialized to wire")
-    if value is None or type(value) in _PLAIN_WIRE_SCALARS:
-        return value
-    if isinstance(value, Enum):
-        return value.value
-    if isinstance(value, Decimal):
-        return str(value)
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-    raise TypeError(f"unsupported scalar wire value of type {type(value).__name__}")
 
 
 def _same_raw_scalar(left: object, right: object) -> bool:

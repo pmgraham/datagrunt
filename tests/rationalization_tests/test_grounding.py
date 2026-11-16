@@ -58,7 +58,7 @@ from datagrunt.rationalization.grounding import (
 )
 from datagrunt.rationalization.runner import FailedUnit, RunOutcome
 from datagrunt.rationalization.schema import PreparedSchema, prepare
-from datagrunt.rationalization.units import Unit, build_units
+from datagrunt.rationalization.units import Unit, build_units, vision_page_anchor
 from datagrunt.rationalization.wire import ProviderResponse
 
 BIG = 1_000_000
@@ -2555,3 +2555,501 @@ class TestWave2AGroundingRegressions:
         c_texts = grounding_module._UnitTexts(ctrl_run.units[c_uid], ctrl_run.envelopes[c_uid], {}, frozenset())
         assert c_texts.plain("p0001_e000") == ("ColA", "ColB", "PN-104", "X")
         assert c_texts.numbers("p0001_e000") == frozenset({Decimal("104"), Decimal("-104")})
+
+
+class SpecEntry(BaseModel):
+    label: str
+    value: str
+
+
+class DocProfile(BaseModel):
+    drawing_number: str
+    manufacturer: str
+    specs: list[SpecEntry]
+
+
+DOC_PROFILE = prepare(DocProfile)
+
+
+class TestMultimodalTextlessPeerQuoteGrounding:
+    def test_textless_multimodal_corroborated_part_with_secondary_context_quote_grounds_consensus(self):
+        mm_run = _make_multimodal_image_only_run(PART)
+        (uid,) = mm_run.unit_ids
+        anchor_id = mm_run.units[uid].elements[0].element_id
+        vote_g = entry(
+            {"number": "04-60008-27", "title": "Ball Bearing"},
+            ("04-60008-27", "BALL BEARINGS WITH DDUC3 SEALS"),
+            (anchor_id,),
+        )
+        vote_a = entry(
+            {"number": "04-60008-27", "title": "Ball Bearing"},
+            ("04-60008-27",),
+            (anchor_id,),
+        )
+        sym_g = entry(
+            {"number": "ZR42K3-TFD", "title": "Scroll Compressor"},
+            ("ZR42K3-TFD", "SCROLL COMPRESSOR"),
+            (anchor_id,),
+        )
+        sym_a = entry(
+            {"number": "ZR42K3-TFD", "title": "Scroll Compressor"},
+            ("ZR42K3-TFD", "R22 REFRIGERANT"),
+            (anchor_id,),
+        )
+
+        res = grounded(
+            {(uid, G): response(vote_g, sym_g), (uid, A): response(vote_a, sym_a)},
+            models=PAIR,
+            run=mm_run,
+        )
+
+        assert [(item.item.key, item.status, item.grounded, item.reasons) for item in res.items] == [
+            (("04-60008-27",), "consensus", True, ()),
+            (("ZR42K3-TFD",), "consensus", True, ()),
+        ]
+
+    def test_textless_multimodal_corroborated_profile_with_specs_and_secondary_quotes_grounds_consensus(self):
+        mm_run = _make_multimodal_image_only_run(DOC_PROFILE)
+        (uid,) = mm_run.unit_ids
+        anchor_id = mm_run.units[uid].elements[0].element_id
+        profile_rec = {
+            "drawing_number": "GB15LF004",
+            "manufacturer": "Carrier",
+            "specs": [{"label": "Material", "value": "ASTM A36"}],
+        }
+        vote_g = entry(
+            profile_rec,
+            ("GB15LF004", "CENTRIFUGAL COMPRESSOR ASSEMBLY", "MATERIAL: ASTM A36"),
+            (anchor_id,),
+        )
+        vote_a = entry(
+            profile_rec,
+            ("GB15LF004", "CARRIER ENGINEERING DRAWING"),
+            (anchor_id,),
+        )
+
+        res = grounded(
+            {(uid, G): response(vote_g), (uid, A): response(vote_a)},
+            models=PAIR,
+            schema=DOC_PROFILE,
+            run=mm_run,
+        )
+
+        assert len(res.items) == 1
+        assert (res.items[0].status, res.items[0].grounded, res.items[0].reasons) == ("consensus", True, ())
+
+    def test_textless_multimodal_true_hallucinations_still_fail_grounding(self):
+        # 1. Zero peer-quote overlap on keyless/enum vision-only unit
+        mm_line = _make_multimodal_image_only_run(LINE)
+        (uid_line,) = mm_line.unit_ids
+        anchor_line = mm_line.units[uid_line].elements[0].element_id
+        disjoint_res = grounded(
+            {
+                (uid_line, G): response(entry({"text": "row"}, ("ALPHA BETA GAMMA",), (anchor_line,))),
+                (uid_line, A): response(entry({"text": "row"}, ("DELTA EPSILON ZETA",), (anchor_line,))),
+            },
+            models=PAIR,
+            schema=LINE,
+            run=mm_line,
+        )
+        assert disjoint_res.items[0].status == "ungrounded_value"
+        assert reasons(disjoint_res.items[0]) == [
+            ("quote_not_found", G, 0, None),
+            ("quote_not_found", A, 0, None),
+        ]
+
+        # 2. Single-family / missing_in_some_models on vision-only unit has no peer witness
+        mm_part = _make_multimodal_image_only_run(PART)
+        (uid_part,) = mm_part.unit_ids
+        anchor_part = mm_part.units[uid_part].elements[0].element_id
+        bearing = {"number": "04-60008-27", "title": "Bearing"}
+        solo_res = grounded(
+            {
+                (uid_part, G): response(entry(bearing, ("04-60008-27",), (anchor_part,))),
+                (uid_part, A): response(),
+            },
+            models=PAIR,
+            run=mm_part,
+        )
+        assert (solo_res.items[0].status, solo_res.items[0].grounded) == ("missing_in_some_models", False)
+        assert reasons(solo_res.items[0]) == [
+            ("quote_not_found", G, 0, None),
+            ("key_not_found", G, None, "number"),
+        ]
+
+        # 3. Blank secondary quote still fails with quote_not_found
+        blank_res = grounded(
+            {
+                (uid_part, G): response(entry(bearing, ("04-60008-27", "   "), (anchor_part,))),
+                (uid_part, A): response(entry(bearing, ("04-60008-27",), (anchor_part,))),
+            },
+            models=PAIR,
+            run=mm_part,
+        )
+        assert blank_res.items[0].status == "ungrounded_value"
+        assert reasons(blank_res.items[0]) == [("quote_not_found", G, 1, None)]
+
+        # 4. Unquoted root key + uncorroborated peer key still fails
+        unquoted_res = grounded(
+            {
+                (uid_part, G): response(entry(bearing, ("BALL BEARINGS",), (anchor_part,))),
+                (uid_part, A): response(entry(bearing, ("04-60008-27", "BALL BEARINGS"), (anchor_part,))),
+            },
+            models=PAIR,
+            run=mm_part,
+        )
+        assert unquoted_res.items[0].status == "ungrounded_value"
+        assert reasons(unquoted_res.items[0]) == [
+            ("key_not_quoted", G, None, "number"),
+            ("quote_not_found", A, 0, None),
+            ("key_not_found", A, None, "number"),
+        ]
+
+        # 5. Child-list key hallucination still caught on vision-only unit
+        class ChildItem(BaseModel):
+            part_no: Annotated[str, Key]
+            qty: int
+
+        class Assembly(BaseModel):
+            asm_no: Annotated[str, Key]
+            items: list[ChildItem]
+
+        asm_schema = prepare(Assembly)
+        mm_asm = _make_multimodal_image_only_run(asm_schema)
+        (uid_asm,) = mm_asm.unit_ids
+        anchor_asm = mm_asm.units[uid_asm].elements[0].element_id
+        asm_rec = {"asm_no": "ASM-100", "items": [{"part_no": "PN-10", "qty": 1}, {"part_no": "PN-999", "qty": 1}]}
+        asm_res = grounded(
+            {
+                (uid_asm, G): response(entry(asm_rec, ("ASM-100", "PN-10", "PN-999"), (anchor_asm,))),
+                (uid_asm, A): response(entry(asm_rec, ("ASM-100", "PN-10"), (anchor_asm,))),
+            },
+            models=PAIR,
+            schema=asm_schema,
+            run=mm_asm,
+        )
+        assert asm_res.items[0].status == "ungrounded_value"
+        assert ("key_not_found", G, None, "items.part_no") in reasons(asm_res.items[0])
+
+        # 6. Mid-word 1-char substring ("A" in "DELTA...", "E" in "ALPHA...") never unlocks scan quote waiver
+        midword_res = grounded(
+            {
+                (uid_line, G): response(entry({"text": "row"}, ("A", "ALPHA BETA GAMMA"), (anchor_line,))),
+                (uid_line, A): response(entry({"text": "row"}, ("E", "DELTA EPSILON ZETA"), (anchor_line,))),
+            },
+            models=PAIR,
+            schema=LINE,
+            run=mm_line,
+        )
+        assert (midword_res.items[0].status, midword_res.items[0].grounded) == ("ungrounded_value", False)
+        assert reasons(midword_res.items[0]) == [
+            ("quote_not_found", G, 1, None),
+            ("quote_not_found", A, 1, None),
+        ]
+
+        # 7. Punctuation-only quote ("-" in "04-60008-27") has zero tokens and never waives padded hallucinations
+        punct_g = entry(bearing, ("-", "04-60008-27 COMPLETELY HALLUCINATED EXTRA"), (anchor_part,))
+        punct_a = entry(bearing, ("04-60008-27",), (anchor_part,))
+        punct_res = grounded(
+            {(uid_part, G): response(punct_g), (uid_part, A): response(punct_a)},
+            models=PAIR,
+            run=mm_part,
+        )
+        assert (punct_res.items[0].status, punct_res.items[0].grounded) == ("ungrounded_value", False)
+        assert reasons(punct_res.items[0]) == [("quote_not_found", G, 1, None)]
+
+        # 8. Trivial short words ("e", "row") on keyless schema never waive 3-word hallucinations
+        for trivial in ("e", "row"):
+            triv_res = grounded(
+                {
+                    (uid_line, G): response(entry({"text": "row"}, (trivial, "ALPHA BETA GAMMA"), (anchor_line,))),
+                    (uid_line, A): response(entry({"text": "row"}, (trivial, "DELTA EPSILON ZETA"), (anchor_line,))),
+                },
+                models=PAIR,
+                schema=LINE,
+                run=mm_line,
+            )
+            assert (triv_res.items[0].status, triv_res.items[0].grounded) == ("ungrounded_value", False)
+            assert reasons(triv_res.items[0]) == [
+                ("quote_not_found", G, 1, None),
+                ("quote_not_found", A, 1, None),
+            ]
+
+        # 9. Root key present only inside an uncorroborated padded quote is never waived
+        pad_key_g = entry(bearing, ("BALL BEARINGS", "04-60008-27 COMPLETELY HALLUCINATED EXTRA"), (anchor_part,))
+        pad_key_a = entry(bearing, ("04-60008-27", "BALL BEARINGS"), (anchor_part,))
+        pad_key_res = grounded(
+            {(uid_part, G): response(pad_key_g), (uid_part, A): response(pad_key_a)},
+            models=PAIR,
+            run=mm_part,
+        )
+        assert (pad_key_res.items[0].status, pad_key_res.items[0].grounded) == ("ungrounded_value", False)
+        assert reasons(pad_key_res.items[0]) == [("quote_not_found", G, 1, None)]
+
+    def test_ocr_backed_multimodal_unit_still_rejects_ungrounded_secondary_quote(self):
+        img = PageImage(page_number=1, dpi=150, width_px=8, height_px=8, _loader=lambda: TINY_PNG)
+        ocr_page = dataclasses.replace(
+            page(1, (para(1, 0, "Part 04-60008-27 is shown."),), route="vision", quality=VISION_QUALITY),
+            page_image=img,
+        )
+        doc = document(ocr_page)
+        plan = build_units(doc, max_unit_chars=BIG, render=render_element, multimodal=True)
+        envs = build_envelopes(
+            plan.units, doc, prompt="Extract.", context=None, schema_json=PART.wrapper_json, multimodal=True
+        )
+        ocr_run = Prepared(
+            document=doc,
+            units={u.unit_id: u for u in plan.units},
+            envelopes={e.unit_id: e for e in envs},
+        )
+        (uid,) = ocr_run.unit_ids
+        anchor_id = ocr_run.units[uid].elements[0].element_id
+
+        res = grounded(
+            {
+                (uid, G): response(
+                    entry(
+                        {"number": "04-60008-27", "title": "Bearing"},
+                        ("04-60008-27", "UNPRINTED HALLUCINATED NOTE"),
+                        (anchor_id,),
+                    )
+                ),
+                (uid, A): response(
+                    entry({"number": "04-60008-27", "title": "Bearing"}, ("04-60008-27",), (anchor_id,))
+                ),
+            },
+            models=PAIR,
+            run=ocr_run,
+        )
+
+        assert res.items[0].status == "ungrounded_value"
+        assert reasons(res.items[0]) == [("quote_not_found", G, 1, None)]
+
+    def test_multimodal_unit_with_digital_header_context_enforces_exact_header_check_and_header_isolation(self):
+        hdr_vendor = pair(1, 0, "Vendor", "Carrier Corp")
+        hdr_invoice = pair(1, 1, "Invoice", words(20))
+        p1_body = para(1, 2, "Cover sheet text.")
+        img = PageImage(page_number=2, dpi=150, width_px=8, height_px=8, _loader=lambda: TINY_PNG)
+        scan_p2 = dataclasses.replace(
+            page(2, (), route="vision", quality=VISION_QUALITY),
+            status="ocr_unavailable",
+            image_only_reasons=("too_little_text",),
+            page_image=img,
+        )
+        doc = document(
+            page(1, (hdr_vendor, hdr_invoice, p1_body)),
+            scan_p2,
+            header_context=(hdr_vendor, hdr_invoice),
+        )
+        plan = build_units(doc, max_unit_chars=BIG, render=render_element, multimodal=True)
+        envs = build_envelopes(
+            plan.units, doc, prompt="Extract.", context=None, schema_json=PART.wrapper_json, multimodal=True
+        )
+        mm_hdr_run = Prepared(
+            document=doc,
+            units={u.unit_id: u for u in plan.units},
+            envelopes={e.unit_id: e for e in envs},
+        )
+        _, scan_uid = mm_hdr_run.unit_ids
+        scan_anchor = mm_hdr_run.units[scan_uid].elements[0].element_id
+
+        # 5a. Legitimate scan + digital header citation with secondary scan quote grounds cleanly
+        ok_res = grounded(
+            {
+                (scan_uid, G): response(
+                    entry(
+                        {"number": "04-60008-27", "title": "Carrier Bearing"},
+                        ("04-60008-27", "Carrier Corp", "BALL BEARINGS WITH DDUC3 SEALS"),
+                        (scan_anchor, "p0001_e000"),
+                    )
+                ),
+                (scan_uid, A): response(
+                    entry({"number": "04-60008-27", "title": "Carrier Bearing"}, ("04-60008-27",), (scan_anchor,))
+                ),
+            },
+            models=PAIR,
+            run=mm_hdr_run,
+        )
+        assert (ok_res.items[0].status, ok_res.items[0].grounded) == ("consensus", True)
+
+        # 5b. Near-miss corruption of a cited digital header block is still rejected as quote_not_found
+        bad_hdr_quote = f"Invoice {words(19)} zz"
+        bad_hdr_res = grounded(
+            {
+                (scan_uid, G): response(
+                    entry(
+                        {"number": "04-60008-27", "title": "Carrier Bearing"},
+                        ("04-60008-27", bad_hdr_quote),
+                        (scan_anchor, "p0001_e001"),
+                    )
+                ),
+                (scan_uid, A): response(
+                    entry({"number": "04-60008-27", "title": "Carrier Bearing"}, ("04-60008-27",), (scan_anchor,))
+                ),
+            },
+            models=PAIR,
+            run=mm_hdr_run,
+        )
+        assert bad_hdr_res.items[0].status == "ungrounded_value"
+        assert reasons(bad_hdr_res.items[0]) == [("quote_not_found", G, 1, None)]
+
+        # 5c. Citing only digital header block never borrows peer quotes for key_not_found or quote_not_found
+        hdr_only_vote = entry({"number": "PN-999", "title": "Fake"}, ("PN-999",), ("p0001_e000",))
+        hdr_only_res = grounded(
+            {(scan_uid, G): response(hdr_only_vote), (scan_uid, A): response(hdr_only_vote)},
+            models=PAIR,
+            run=mm_hdr_run,
+        )
+        assert reasons(hdr_only_res.items[0]) == [
+            ("header_only", G, None, None),
+            ("quote_not_found", G, 0, None),
+            ("key_not_found", G, None, "number"),
+            ("header_only", A, None, None),
+            ("quote_not_found", A, 0, None),
+            ("key_not_found", A, None, "number"),
+        ]
+
+        # 5d. Smuggling a shared <header_context> quote alongside scan_anchor never waives disjoint fake scan quotes
+        hdr_smuggle_g = entry(
+            {"number": "Carrier", "title": "Fake"},
+            ("**Vendor:** Carrier Corp", "TOTALLY FAKE SCAN ALPHA"),
+            (scan_anchor, "p0001_e000"),
+        )
+        hdr_smuggle_a = entry(
+            {"number": "Carrier", "title": "Fake"},
+            ("**Vendor:** Carrier Corp", "COMPLETELY FAKE SCAN BETA"),
+            (scan_anchor, "p0001_e000"),
+        )
+        hdr_smuggle_res = grounded(
+            {(scan_uid, G): response(hdr_smuggle_g), (scan_uid, A): response(hdr_smuggle_a)},
+            models=PAIR,
+            run=mm_hdr_run,
+        )
+        assert (hdr_smuggle_res.items[0].status, hdr_smuggle_res.items[0].grounded) == ("ungrounded_value", False)
+        assert reasons(hdr_smuggle_res.items[0]) == [
+            ("quote_not_found", G, 1, None),
+            ("quote_not_found", A, 1, None),
+        ]
+
+    def test_hybrid_digital_and_multimodal_vision_unit_isolates_digital_and_vision_elements(self):
+        dig_one = para(1, 0, f"Part PN-104 {words(60)}")
+        dig_two = para(1, 1, "Secondary digital note.")
+        img = PageImage(page_number=2, dpi=150, width_px=8, height_px=8, _loader=lambda: TINY_PNG)
+        scan_p2 = dataclasses.replace(
+            page(2, (), route="vision", quality=VISION_QUALITY),
+            status="ocr_unavailable",
+            image_only_reasons=("too_little_text",),
+            page_image=img,
+        )
+        anchor_p2 = vision_page_anchor(scan_p2)
+        hybrid_doc = document(page(1, (dig_one, dig_two)), scan_p2)
+        h_uid = f"{hybrid_doc.metadata.doc_id}:p0001_e000-p0002_e000"
+        hybrid_els = (dig_one, dig_two, anchor_p2)
+        hybrid_blocks = tuple(render_element(el) for el in hybrid_els)
+        hybrid_unit = Unit(
+            unit_id=h_uid,
+            doc_id=hybrid_doc.metadata.doc_id,
+            elements=hybrid_els,
+            blocks=hybrid_blocks,
+            part_of=(None, None, None),
+            scope_path=(),
+            scope_entries_excluded=0,
+            page_numbers=(1, 2),
+            vision=True,
+            oversize=False,
+            hidden_excluded=(),
+        )
+        escaped_doc_id = hybrid_doc.metadata.doc_id.replace("_", chr(92) + "_")
+        joined_blocks = "\n\n".join(hybrid_blocks)
+        payload = f"<document>{escaped_doc_id}</document>\n<scope></scope>\n<elements>\n{joined_blocks}\n</elements>"
+        hybrid_env = Envelope(
+            unit_id=h_uid,
+            prompt="Extract.",
+            context_json="null",
+            payload=payload,
+            schema_json=PART.wrapper_json,
+            images=(TINY_PNG,),
+        )
+        hybrid_run = Prepared(document=hybrid_doc, units={h_uid: hybrid_unit}, envelopes={h_uid: hybrid_env})
+
+        # 6a. Digital element in hybrid multimodal unit still requires exact substring (not 0.85 vision containment)
+        near_dig = entry({"number": "PN-104", "title": "Part"}, ("PN-104", near("w")), ("p0001_e000",))
+        res_near = grounded(
+            {(h_uid, G): response(near_dig), (h_uid, A): response(near_dig)}, models=PAIR, run=hybrid_run
+        )
+        assert reasons(res_near.items[0]) == [
+            ("quote_not_found", G, 1, None),
+            ("quote_not_found", A, 1, None),
+        ]
+
+        # 6b. Digital-only citation never borrows peer witness for ungrounded key or quote
+        fake_dig = entry({"number": "PN-999", "title": "Fake"}, ("PN-999",), ("p0001_e000",))
+        res_fake_dig = grounded(
+            {(h_uid, G): response(fake_dig), (h_uid, A): response(fake_dig)}, models=PAIR, run=hybrid_run
+        )
+        assert reasons(res_fake_dig.items[0]) == [
+            ("quote_not_found", G, 0, None),
+            ("key_not_found", G, None, "number"),
+            ("quote_not_found", A, 0, None),
+            ("key_not_found", A, None, "number"),
+        ]
+
+        # 6c. Cross-page mismatch: G cites digital page 1, A cites vision page 2 -> A gets no peer witness
+        res_cross = grounded(
+            {
+                (h_uid, G): response(entry({"number": "PN-104", "title": "Part"}, ("PN-104",), ("p0001_e000",))),
+                (h_uid, A): response(entry({"number": "PN-104", "title": "Part"}, ("PN-104",), ("p0002_e000",))),
+            },
+            models=PAIR,
+            run=hybrid_run,
+        )
+        assert reasons(res_cross.items[0]) == [
+            ("quote_not_found", A, 0, None),
+            ("key_not_found", A, None, "number"),
+        ]
+
+        # 6d. Smuggling scan anchor alongside digital own element never waives fabricated quote
+        res_smuggle = grounded(
+            {
+                (h_uid, G): response(
+                    entry(
+                        {"number": "PN-104", "title": "Part"},
+                        ("PN-104", "FABRICATED EXTRA QUOTE"),
+                        ("p0001_e000", "p0002_e000"),
+                    )
+                ),
+                (h_uid, A): response(
+                    entry({"number": "PN-104", "title": "Part"}, ("PN-104",), ("p0001_e000", "p0002_e000"))
+                ),
+            },
+            models=PAIR,
+            run=hybrid_run,
+        )
+        assert reasons(res_smuggle.items[0]) == [("quote_not_found", G, 1, None)]
+
+        # 6e. Vision-anchor citation on 3-element hybrid unit grounds corroborated scan record with extra context,
+        # and never grounds against the synthetic "[page 2 image attached]" marker caption
+        res_scan_ok = grounded(
+            {
+                (h_uid, G): response(
+                    entry(
+                        {"number": "04-60008-27", "title": "Bearing"},
+                        ("04-60008-27", "BALL BEARINGS WITH DDUC3 SEALS"),
+                        ("p0002_e000",),
+                    )
+                ),
+                (h_uid, A): response(
+                    entry({"number": "04-60008-27", "title": "Bearing"}, ("04-60008-27",), ("p0002_e000",))
+                ),
+            },
+            models=PAIR,
+            run=hybrid_run,
+        )
+        assert (res_scan_ok.items[0].status, res_scan_ok.items[0].grounded) == ("consensus", True)
+
+        marker_vote = entry({"number": "2", "title": "Fake"}, ("[page 2 image attached]",), ("p0002_e000",))
+        res_caption_exploit = grounded({(h_uid, G): response(marker_vote)}, models=(GOOGLE,), run=hybrid_run)
+        assert reasons(res_caption_exploit.items[0]) == [
+            ("quote_not_found", G, 0, None),
+            ("key_not_found", G, None, "number"),
+        ]
