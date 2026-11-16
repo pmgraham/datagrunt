@@ -24,8 +24,8 @@ Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow
 - **Excel Reading & Writing:** Read `.xlsx`/`.xls` workbooks sheet by sheet into DataFrames, dicts, Arrow, or SQL, and export any sheet (or all of them) to CSV, JSON, JSONL, Parquet, or Excel.
 - **Parquet Reading & Writing:** Read `.parquet` files into DataFrames, dicts, Arrow tables, or SQL, and export to CSV, JSON, JSONL, Parquet, or Excel. Backed by a single Polars engine with full `read_options`/`write_options` passthrough.
 - **Robust by Default:** Fail-fast validation with clear errors (invalid engine names, missing paths, directories, encrypted PDFs), graceful handling of empty files, no `UnicodeDecodeError` when constructing a reader over a non-UTF-8 file, and sane comment semantics — only leading `#` lines are treated as comments, so `#`-prefixed data rows such as hex colors are preserved on all engines.
-- **PDF Parsing & OCR:** Read PDFs into a typed document of headings, paragraphs, key-value pairs, tables, lists, and figures, as DataFrames, Arrow tables, dicts, Markdown, or SQL, and write JSON, JSONL, Markdown, Parquet, CSV, images, or a checksummed bundle. Hidden text is flagged, never dropped, and scanned pages are read with optional [Tesseract](https://github.com/tesseract-ocr/tesseract) OCR. Powered by the permissively-licensed **PDFium** engine.
-- **Schema-Driven PDF Rationalization (v5.1+):** Extract Pydantic records from v5 PDF documents (`rationalize()`) with cross-family model consensus (`min_families=2`), verbatim quote and key grounding against visible elements, cross-page entity folding, and deterministic Polars/Arrow export (`to_dataframe(flatten=...)`).
+- **PDF Parsing, OCR & Corpus Bundles:** Read PDFs into a typed document of headings, paragraphs, key-value pairs, tables, lists, and figures — as DataFrames, Arrow tables, dicts, Markdown, or SQL — and write JSON, JSONL, Markdown, Parquet, CSV, images, checksummed single-document bundles (`write_bundle`, `render_pages="vision_only"`), or parallel multi-document corpora (`extract_corpus`, `load_corpus`). Hidden text is flagged, never dropped, and scanned pages are read with optional [Tesseract](https://github.com/tesseract-ocr/tesseract) OCR. Powered by the permissively-licensed **PDFium** engine with an in-process zero-subprocess fast path (`sandbox=False`) and optional process-isolated sandboxing (`sandbox=True`).
+- **Schema-Driven PDF Rationalization (v5.1+):** Extract Pydantic records across PDF documents, bundles, or corpora (`rationalize()`) with adaptive section coalescing, multimodal VLM routing on scanned/image-only pages (`multimodal=True`), normalized identity keys (`Key(normalizer="alnum_upper")`), non-disputing `Informational` fields, cross-family consensus (`min_families=2`), 3-witness quote & key grounding, cross-unit entity folding (`fold_across_units=True`), grounded-union result tiers (`grounded_records`, `include_grounded_union=True`), and offline cloud batch execution (`prepare_batch`, `ingest_batch`).
 - **Pythonic API:** Enjoy a clean and intuitive API that integrates seamlessly into your existing Python workflows.
 
 ### Powertools Under The Hood
@@ -376,22 +376,26 @@ writer.write_bundle("out/report_bundle")      # all of the above in one checked 
 - `render_pages_as_images(output_dir, dpi=None)` writes 8-bit grayscale PNGs at
   the writer's `dpi` (or the one you pass), through a memory-capped renderer. A
   page that can't be rendered is logged and skipped; the others are written.
-- `write_bundle(output_dir)` writes `json/document.json`,
-  `markdown/document.md`, `images/<sha256>.png`, `page_images/page_NNNN.png`
-  (plus the OCR bands of scanned pages), and a `manifest.json` that records
-  every file's size and SHA-256, plus `json/elements.jsonl` and one Markdown
-  file per page (`markdown/pages/page_NNNN.md`). `output_dir` must not exist or
-  must be empty. If it already holds a bundle of the same PDF, written with the
-  same options and extractor version, that bundle is returned as it is;
-  `overwrite=True` replaces any other valid bundle there. A directory without a
-  valid bundle manifest is never overwritten.
-  Bundles and document JSON written by datagrunt 5.0 to 5.2 still load; their
-  pages' `image_only_reasons` read `None` (not recorded).
-  `PDFReader("out/report_bundle")` loads it back, verifying every file: an
-  invalid `manifest.json` raises `ValueError` at construction, and a file that
-  doesn't match its manifest raises `datagrunt.pdf.BundleCorruptError` when the
-  bundle is first loaded. A source PDF that changes while it's read or bundled
-  raises `datagrunt.pdf.PDFSourceChangedError`.
+- `write_bundle(output_dir, *, overwrite=False, include_images=True, render_pages=True)`
+  writes `json/document.json`, `json/elements.jsonl`, `markdown/document.md`,
+  `markdown/pages/page_NNNN.md`, `images/<sha256>.png`, `page_images/page_NNNN.png`
+  (plus OCR bands on scanned pages), and a `manifest.json` recording every file's
+  size and SHA-256. Pass `render_pages="vision_only"` to render page PNGs only for
+  `vision` and `image_only` pages while skipping renders on clean digital pages.
+  `output_dir` must not exist or must be empty; if it already holds an identical
+  bundle of the same PDF and options, that bundle is reused (`overwrite=True`
+  replaces any other valid bundle there; a directory without a valid bundle
+  manifest is never overwritten).
+  Bundles and document JSON written by datagrunt 5.0+ load cleanly through
+  `PDFReader("out/report_bundle")` or `load_bundle("out/report_bundle")`,
+  verifying every file against `manifest.json` (`BundleCorruptError` on mismatch;
+  `PDFSourceChangedError` if a source PDF mutates during extraction).
+- `extract_corpus(inputs, output_dir, *, max_workers=1, render_pages="vision_only", ocr="auto", ...)`
+  extracts a directory or sequence of PDFs across warm worker processes (scheduled
+  largest-file-first via Graham LPT), reuses unchanged bundles incrementally by
+  SHA-256 and options, isolates per-document errors into `manifest.failures` when
+  `strict=False`, and writes an atomic `corpus_manifest.json` reloadable via
+  `load_corpus("out/corpus")` (or passed directly to `rationalize()`).
 - `write_csv` writes every value as extracted: a cell that starts with `=`,
   `+`, `-`, or `@` is not escaped, so guarding a spreadsheet against formula
   injection is your application's concern.
@@ -466,14 +470,18 @@ for page in reader.pages:
 A bundle written with `render_pages=False` or `include_images=False`, or one
 whose render of a marked page fails, warns (`UserWarning`) that it holds no
 full copy of those pages (a figure on one may still be written); their
-`missing` entries in `manifest.json` say so too. `rationalize()` skips a marked page as a skipped unit of reason
-`image_only` rather than send its text to a model (an error page stays
-`page_error`).
+`missing` entries in `manifest.json` say so too. During `rationalize()`,
+`multimodal=True` (the default) attaches rendered page/band PNGs for `vision`
+and `image_only` pages directly to vision-capable model requests rather than
+trusting empty or garbled text; pass `multimodal=False` (or omit page renders)
+to skip `image_only` pages in `result.skipped_units` (`reason="image_only"`, or
+`"page_error"` for an error page).
 
 A page read by OCR at a mean word confidence under 70 carries a warning that
 it may be turned the wrong way or unreadable, so its text shouldn't be trusted
-as is; the text is kept. Tesseract's orientation detection can turn a page with
-little text the wrong way; such a page reads at low confidence and is flagged.
+as is; the text is kept. Pass `orientation_fallback=True` to run a 4-way
+(`0°`, `90°`, `180°`, `270°`) OCR word-confidence vote whenever OSD is
+unavailable or initial confidence falls below 70.
 
 Extraction is always complete: a bad page is recorded, never dropped. Pass
 `strict=True` to raise `PDFCorruptError` on a bad page instead.
@@ -486,13 +494,15 @@ Extraction is always complete: a bad page is recorded, never dropped. Pass
 reader = PDFReader(
     "report.pdf",
     password=None,                  # an encrypted PDF's password
-    workers=1,                      # processes to extract pages with
+    workers=1,                      # page-extraction workers (processes when > 1 or sandbox=True)
     ocr="auto",                     # "auto", "always" (every page to OCR), or "never"
     dpi=200,                        # page images (render_pages_as_images, bundles)
     vision_dpi=300,                 # pages read by OCR; at least dpi
     max_render_pixels=16_000_000,   # caps every render: a huge page gets a lower DPI
     min_image_dimension=40,         # smaller embedded images aren't figures
     strict=False,                   # raise on a bad page instead of recording it
+    sandbox=False,                  # True isolates every page/render in a 2 GiB python -I worker
+    orientation_fallback=False,     # True votes 0/90/180/270° when OSD fails or OCR conf < 70
 )
 ```
 
@@ -501,19 +511,23 @@ and a wrong type raises `TypeError`. `min_image_dimension` drops embedded
 images narrower or shorter than that many pixels (rule lines, separators, icon
 slivers); it must be at least 1.
 
-### Parallel processing
+### Execution and worker isolation
 
-Every PDF is parsed in worker processes, never in your own: pages are
-extracted in `workers` processes (one when `workers=1`) and come back in page
-order, and figure reads and page renders run in workers too. Each worker is a
-fresh, isolated `python` process with a memory cap (2 GiB), and it never imports
-your script, so no `if __name__ == "__main__":` guard is needed. A page that
-passes the cap, or its time bound, becomes an error page with the reason; the
-other pages are read by a new worker. Inside a distributed runtime
-(**Apache Spark**, **Apache Beam**, **Apache Flink**, or **Celery**, detected
-through variables such as `SPARK_ENV_LOADED` and `BEAM_WORKER_ID`) one worker
-extracts the pages. A frozen application (PyInstaller) cannot start workers
-yet, so reading a PDF there raises `DatagruntPDFError` saying so.
+By default (`sandbox=False`, `workers=1`), `PDFReader` and `PDFWriter` run on
+an in-process fast path with zero cold Python subprocess spawns on digital
+PDFs, serializing native PDFium calls under a re-entrant lock. Multi-page and
+multi-document parallelism scale out cleanly:
+
+- **Across documents (`extract_corpus`):** `extract_corpus(inputs, out_dir, max_workers=8)`
+  maintains a pool of warm child processes with per-document timeouts, LPT
+  scheduling, and incremental bundle reuse.
+- **Within a document (`workers > 1`) or strict process sandboxing (`sandbox=True`):**
+  pages and renders execute in isolated `python -I` worker processes capped at
+  2 GiB (`RLIMIT_AS`) that never import your script (no `if __name__ == "__main__":`
+  guard required). A page exceeding its memory or time bound becomes an error
+  page while remaining pages continue in a fresh worker. Inside distributed
+  runtimes (**Apache Spark**, **Apache Beam**, **Apache Flink**, or **Celery**),
+  per-document worker pools automatically clamp to 1 process.
 
 ### Schema-driven extraction (`rationalize`)
 
@@ -523,44 +537,66 @@ Install the `[rationalize]` extra (`pydantic` and `httpx`) alongside `[pdf]`:
 uv pip install "datagrunt[pdf,rationalize]"
 ```
 
-`rationalize()` extracts structured Pydantic records from one or more PDF documents (`PDFDocument`, PDF path, bundle path, or a sequence of them). Hidden elements (`hidden_reasons` non-empty) and image-only pages (`image_only_reasons` non-empty; reported in `result.skipped_units` with reason `"image_only"`, or `"page_error"` for an error page) are excluded before any model request is built, bidi/tag/control characters are escaped in the wire envelope, and every model response is validated, compared across model families, grounded against the cited visible elements, and folded across pages by entity key:
+`rationalize()` extracts structured Pydantic records from one or more PDF
+targets (`PDFDocument`, `CorpusManifest`, PDF path, bundle directory, corpus
+directory, or a sequence of up to `10,000` targets). Hidden elements
+(`hidden_reasons` non-empty) are excluded before prompting, bidi/tag/control
+characters are escaped in the wire envelope, consecutive digital sections
+coalesce adaptively up to `max_unit_chars`, `vision` and `image_only` pages
+route as multimodal PNGs (`multimodal=True`), and model responses are validated,
+compared across model families, grounded against cited elements, and folded
+across units by entity key (`fold_across_units=True`):
 
 ```python
 from decimal import Decimal
 from typing import Annotated
 from pydantic import BaseModel
-from datagrunt import Key, PDFReader, rationalize
+from datagrunt import Informational, Key, extract_corpus, rationalize
+from datagrunt.rationalization import AnthropicProvider, GeminiProvider, GoogleCloudAuth
 
 
-class LineItem(BaseModel):
-    part_no: Annotated[str, Key]
-    qty: int
-    unit_price: Decimal
+class PartMention(BaseModel):
+    # alnum_upper folds "04-60008-27" and "046000827" as one entity while still
+    # verifying each model's raw printed identifier against cited elements:
+    part_number: Annotated[str, Key("part", normalizer="alnum_upper")]
+    category: str
+    notes: Annotated[str | None, Informational] = None   # non-disputing free text
+    specs: Annotated[list[str], Informational] = []      # united across models & units
+    unit_price: Decimal | None = None
 
 
-class Invoice(BaseModel):
-    invoice_id: Annotated[str, Key("Invoice #")]
-    vendor: str
-    items: list[LineItem] = []
+corpus = extract_corpus("pdfs/", "bundles/", max_workers=4, render_pages="vision_only")
+auth = GoogleCloudAuth()
 
-
-doc = PDFReader("invoice.pdf").document
 result = rationalize(
-    doc,
-    schema=Invoice,
-    prompt="Extract each invoice and its line items.",
-    models=("openai:gpt-5.4", "anthropic:claude-sonnet-4-6"),
+    corpus,
+    schema=PartMention,
+    prompt="Extract every referenced engineering part and its specifications.",
+    models=(
+        GeminiProvider.google_cloud("gemini-2.5-pro", project="my-gcp-proj", auth=auth),
+        AnthropicProvider.google_cloud(
+            "claude-opus-4-6",
+            project="my-gcp-proj",
+            auth=auth,
+            schema_mode="prompt_fallback",  # auto-latches prompt mode on org-policy/grammar 400s
+        ),
+    ),
     min_families=2,          # require agreement across >= 2 distinct model families
-    cache_dir=".dg-cache",   # optional atomic on-disk response cache
+    cache_dir=".dg-cache",   # atomic sharded on-disk response cache
 )
 
-df = result.to_dataframe(flatten="items")   # deterministic Polars schema + left-outer explode
-review = result.needs_review                # disputed, ungrounded, or cross-page-conflict items
+strict_df = result.to_dataframe()                            # strict consensus records
+union_df = result.to_dataframe(include_grounded_union=True)  # consensus + grounded single-family (_status, _doc_id)
+review = result.needs_review                                 # disputed, ungrounded, or cross-page-conflict items
 ```
 
-- **Cross-family consensus (`min_families=2`):** by default, a record reaches `"consensus"` only when a strict majority of requested models from at least two distinct model families agree on every field (`must_agree=("vendor",)` requires unanimity on named paths).
-- **Quote and key grounding:** every supporting model must cite non-header unit elements (`source_element_ids`) and supply `grounding_quotes` that appear in those cited elements (exact substring on digital/hybrid pages; token containment ≥ 0.85 on vision/OCR pages) and contain the record's root `Key` values. Grounding checks root keys and verbatim quotes against cited elements; non-key field values are verified by cross-family consensus.
-- **Explicit provider endpoints:** model strings require an explicit prefix (`openai:`, `anthropic:`, `gemini:`, `ollama:`, or `openai-compatible:<model>@<url>`). Google Cloud (Vertex AI / Agent Platform) endpoints are configured through `GeminiProvider.google_cloud(...)`, `GeminiProvider.google_cloud_express(...)`, `AnthropicProvider.google_cloud(...)`, and `OpenAICompatibleProvider.google_cloud(...)` with `GoogleCloudAuth`.
+- **Schema markers (`Key` & `Informational`):** `Key` marks identity fields (`Annotated[str, Key]`, `Key("part")`, or `Key("part", normalizer="alnum_upper")`), including nested `model_list` child keys. `Informational` marks non-disputing fields whose wording variance never discards an agreed record — optional scalars prefer populated values over `None`, and `Informational` `list[scalar]` fields unite distinct normalized items in first-seen order across models and units.
+- **Cross-family consensus & result tiers (`min_families=2`):**
+  - `result.records`: strict clean tier (`status in ("consensus", "single_model")`, with `must_agree=(...)` enforcing unanimity on critical paths).
+  - `result.grounded_records` / `result.grounded_items` (or `to_dataframe(..., include_grounded_union=True)`, `to_dicts`, `to_arrow_table`): grounded-union tier (`"consensus"`, `"single_model"`, and element-grounded `"missing_in_some_models"` items with zero `grounding_reasons`, `disputed_fields`, or `notes`), preserving single-family catches alongside `_status` and `_doc_id` attribution.
+  - `result.needs_review`: `"field_disagreement"` (retaining non-conflicting multi-unit folded records), `"ungrounded_value"`, or `"cross_page_conflict"` items, each carrying `GroundedRecord.sources` (`doc_id`, `page_number`, `element_id`, `bbox`).
+- **3-witness quote and key grounding:** supporting models must cite non-header elements (`source_element_ids`) and provide `grounding_quotes` verified against cited elements (exact substring on digital elements; token containment ≥ 0.85 on vision/OCR elements, out-of-prompt OCR witnesses on multimodal scans, and cross-family peer-quote corroboration on textless `ocr="never"` scans) containing all root and child `Key` values.
+- **Providers & offline cloud batches:** model strings require an explicit prefix (`openai:`, `anthropic:`, `gemini:`, `ollama:`, or `openai-compatible:<model>@<url>`), or pass `GeminiProvider`, `AnthropicProvider` (`schema_mode="native" | "prompt" | "prompt_fallback"`), or `OpenAICompatibleProvider` (with pooled HTTP keep-alive and `GoogleCloudAuth` for Vertex AI). For asynchronous cloud batch APIs, build uncached requests with `plan = prepare_batch(...)`, export via `plan.to_vertex_jsonl(...)` / `plan.to_anthropic_jsonl(...)`, and assemble the full `RationalizedResult` with `ingest_batch(plan, responses)`.
 
 ## Engine Comparison
 
@@ -587,10 +623,15 @@ _The engines above apply to CSV processing. Whichever you pick, results are cons
 - **`ParquetWriter`**: Export Parquet files to multiple formats (CSV, Excel, JSON, JSONL, Parquet)
 - **`PDFWriter`**: Write a PDF's document to JSON, JSONL, Markdown, Parquet, or CSV, extract its figures, render whole pages to PNG files, or write a checksummed bundle
 
+### Bundles & Corpora
+- **`write_bundle` / `load_bundle`**: Write and verify checksummed single-PDF bundles (`render_pages=True | False | "vision_only"`)
+- **`extract_corpus` / `load_corpus`**: Parallel multi-PDF corpus extraction with LPT scheduling, SHA-256 incremental reuse, and `CorpusManifest` verification
+
 ### Rationalization
-- **`rationalize`**: Extract, ground, reach cross-family consensus on, and fold Pydantic schema records over `PDFDocument`s
-- **`Key`**: `Annotated` schema marker identifying entity key fields (and optional document label aliases)
-- **`RationalizedResult`**: Consensus records (`records`), review queue (`needs_review`), quarantine log (`quarantined`), telemetry (`telemetry`), and deterministic Polars/Arrow/dict exports (`to_dataframe`, `to_arrow_table`, `to_dicts`)
+- **`rationalize`**: Adaptive multimodal extraction, 3-witness quote/key grounding, cross-family consensus, and cross-unit folding over PDFs, bundles, or `CorpusManifest`s
+- **`Key` & `Informational`**: `Annotated` schema markers for entity identity (`Key("part", normalizer="alnum_upper")`) and non-disputing descriptive/list fields (`Informational`)
+- **`prepare_batch` & `ingest_batch`**: Offline Vertex AI and Anthropic Message Batches JSONL generation (`BatchPlan`) and response ingestion
+- **`RationalizedResult` & `GroundedRecord`**: Strict (`records`), grounded-union (`grounded_records`, `grounded_items`, `include_grounded_union=True`), and review (`needs_review`) tiers with `ElementSource` bounding-box provenance, telemetry, and Polars/Arrow/dict exports
 
 ## Full Documentation
 
