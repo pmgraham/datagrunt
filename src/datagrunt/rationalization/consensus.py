@@ -127,6 +127,7 @@ library, pydantic and its sibling modules: nothing from ``datagrunt.core``, and 
 (invariant 9).
 """
 
+import math
 import re
 import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -222,6 +223,7 @@ _ENTRY_KEYS = ("grounding_quotes", "record", "source_element_ids")
 _ENTRY_KEYS_SET = frozenset(_ENTRY_KEYS)
 _ENTRY_SHAPE = '{"record": {...}, "grounding_quotes": [str, ...], "source_element_ids": [str, ...]}'
 _FLOAT_FMT = f".{FLOAT_SIGNIFICANT_DIGITS}g"
+_PLAIN_WIRE_SCALARS: tuple[type, ...] = (str, int, float, bool)
 _V = TypeVar("_V")
 
 
@@ -1673,13 +1675,17 @@ class _Comparison:
         if _same_raw_values(field_spec, values):
             wire, source = _single_wire(values, prefer_wire=prefer_wire)
             return _Merged(wire, source)
+        if field_spec.kind == "scalar_list":
+            return _merge_informational_scalar_list(field_spec, values, prefer_wire=prefer_wire)
         clusters = _clusters(
             [(index, wire, _normalized_field(field_spec, value)) for index, value, wire in values],
             prefer_wire=prefer_wire,
         )
-        winner = next((cluster for cluster in clusters if self.wins(cluster.supporters)), None)
-        if winner is None:
-            winner = next((c for c in clusters if c.normalized is not None and c.normalized != ()), clusters[0])
+        populated = [c for c in clusters if c.normalized is not None and c.normalized != ()]
+        if not populated:
+            return _Merged(clusters[0].wire, clusters[0].source)
+        pop_total = sum(len(c.supporters) for c in populated)
+        winner = next((c for c in populated if len(c.supporters) * 2 > pop_total), populated[0])
         return _Merged(winner.wire, winner.source)
 
     def _same_raw_merged(
@@ -1896,6 +1902,60 @@ def _single_wire(values: list[_Entry], *, prefer_wire: bool) -> tuple[object, in
             if entry_wire is not _ABSENT:
                 return entry_wire, index
     return wire, source
+
+
+def _scalar_to_wire(value: object) -> Any:
+    """Serialize one validated scalar value to its JSON-mode wire primitive in O(1)."""
+    if type(value) is float and not math.isfinite(value):
+        raise ValueError("non-finite float cannot be serialized to wire")
+    if value is None or type(value) in _PLAIN_WIRE_SCALARS:
+        return value
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    raise TypeError(f"unsupported scalar wire value of type {type(value).__name__}")
+
+
+def _merge_informational_scalar_list(
+    field_spec: FieldSpec,
+    values: list[_Entry],
+    *,
+    prefer_wire: bool,
+) -> _Merged:
+    """Unite an ``Informational`` ``scalar_list`` across ``values`` in first-seen normalized order."""
+    if not values or field_spec.scalar is None:
+        raise ValueError("_merge_informational_scalar_list requires non-empty values and a ScalarSpec")
+    scalar_base = field_spec.scalar.base
+    seen_norms: set[object] = set()
+    united_raw: list[Any] = []
+    united_wire: list[Any] = []
+    for _, items, wire in values:
+        wire_items = wire if isinstance(wire, list) and len(wire) == len(items) else None
+        for pos, item in enumerate(items):
+            norm = _normalized(_widened(item, scalar_base))
+            if norm not in seen_norms:
+                seen_norms.add(norm)
+                united_raw.append(item)
+                united_wire.append(_scalar_to_wire(item) if wire_items is None else wire_items[pos])
+    if not united_raw:
+        wire_val, source = _single_wire(values, prefer_wire=prefer_wire)
+        return _Merged(wire_val, source)
+    target_len = len(united_raw)
+    matched = [
+        (index, wire)
+        for index, items, wire in values
+        if len(items) == target_len and all(_same_scalar(a, b) for a, b in zip(united_raw, items))
+    ]
+    if matched:
+        if prefer_wire:
+            for index, entry_wire in matched:
+                if entry_wire is not _ABSENT:
+                    return _Merged(entry_wire, index)
+        return _Merged(matched[0][1], matched[0][0])
+    return _Merged(united_wire, None)
 
 
 def _clusters(values: Iterable[tuple[int, object, object]], *, prefer_wire: bool = True) -> list[_Cluster]:

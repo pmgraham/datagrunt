@@ -116,6 +116,7 @@ from datagrunt.pdf.elements import (
     Figure,
     Heading,
     KeyValue,
+    Page,
     Paragraph,
     PDFDocument,
     Table,
@@ -124,7 +125,7 @@ from datagrunt.rationalization.consensus import ConsensusItem, ConsensusResult, 
 from datagrunt.rationalization.envelope import Envelope, element_text
 from datagrunt.rationalization.runner import RunOutcome
 from datagrunt.rationalization.schema import MAX_DEPTH, ModelSpec, PreparedSchema
-from datagrunt.rationalization.units import Unit
+from datagrunt.rationalization.units import Unit, is_multimodal_page, vision_page_anchor
 
 GroundedStatus: TypeAlias = Literal[
     "consensus", "single_model", "missing_in_some_models", "field_disagreement", "unmatched", "ungrounded_value"
@@ -577,18 +578,29 @@ def _unit_texts_for(
     return unit_texts
 
 
+def _is_multimodal_anchor(element: DocumentElement, page: Page | None) -> bool:
+    """Whether ``element`` is the synthetic full-page multimodal vision anchor for ``page``."""
+    if not isinstance(element, _ELEMENT_CLASSES) or (page is not None and not isinstance(page, Page)):
+        raise TypeError("_is_multimodal_anchor requires DocumentElement and Page | None")
+    if not isinstance(element, Figure) or page is None or not is_multimodal_page(page, multimodal=True):
+        return False
+    return element == vision_page_anchor(page)
+
+
 def _multimodal_witness_elements(
     unit: Unit, envelope: Envelope, document: PDFDocument
 ) -> Mapping[str, tuple[DocumentElement, ...]]:
     """Return out-of-prompt OCR witness elements keyed by anchor id for a multimodal unit, or ``{}``."""
     if not isinstance(unit, Unit) or not isinstance(envelope, Envelope) or not isinstance(document, PDFDocument):
         raise TypeError("_multimodal_witness_elements requires Unit, Envelope, and PDFDocument")
-    if not envelope.images or len(unit.page_numbers) != len(unit.elements):
+    if not envelope.images:
         return {}
     by_page = {p.page_number: p for p in document.pages}
     out: dict[str, tuple[DocumentElement, ...]] = {}
     for anchor in unit.elements:
         page = by_page.get(anchor.page_number)
+        if not _is_multimodal_anchor(anchor, page):
+            continue
         if page is None or page.image_only_reasons:
             out[anchor.element_id] = ()
             continue
@@ -604,20 +616,26 @@ def _mark_multimodal_pages(
     routes: dict[str, dict[int, bool]],
     units: Mapping[str, Unit],
     envelopes: Mapping[str, Envelope] | None,
+    documents: Mapping[str, PDFDocument],
 ) -> None:
-    """Mark pages of image-bearing multimodal envelopes as vision-routed in ``routes``."""
+    """Mark multimodal anchor pages of image-bearing envelopes as vision-routed in ``routes``."""
     if not isinstance(routes, dict) or not isinstance(units, Mapping):
         raise TypeError("routes must be a dict and units must be a Mapping")
     if envelopes is None:
         return
+    pages_by_doc: dict[str, dict[int, Page]] = {}
     for unit_id, unit in units.items():
         env = envelopes.get(unit_id)
         doc_routes = routes.get(unit.doc_id)
-        if env is None or not env.images or doc_routes is None:
+        doc = documents.get(unit.doc_id)
+        if env is None or not env.images or doc_routes is None or doc is None:
             continue
-        for pno in unit.page_numbers:
-            if pno in doc_routes:
-                doc_routes[pno] = True
+        by_page = pages_by_doc.get(unit.doc_id)
+        if by_page is None:
+            by_page = pages_by_doc[unit.doc_id] = {p.page_number: p for p in doc.pages}
+        for el in unit.elements:
+            if el.page_number in doc_routes and _is_multimodal_anchor(el, by_page.get(el.page_number)):
+                doc_routes[el.page_number] = True
 
 
 def _vision_pages(
@@ -641,7 +659,7 @@ def _vision_pages(
         if document.metadata.doc_id != doc_id:
             raise ValueError(f"documents key {doc_id!r} is not its document's id ({document.metadata.doc_id!r})")
         routes[doc_id] = {page.page_number: page.route == "vision" for page in document.pages}
-    _mark_multimodal_pages(routes, units, envelopes)
+    _mark_multimodal_pages(routes, units, envelopes, cast(Mapping[str, PDFDocument], documents))
     for unit in units.values():
         pages = routes.get(unit.doc_id)
         if pages is None:
@@ -811,6 +829,15 @@ class _UnitTexts:
     def lenient(self, element_id: str) -> bool:
         """Whether the cited ``element_id`` lies on a vision page of its document: its quotes take containment."""
         return self._elements[element_id][0].page_number in self._vision_pages
+
+    def multimodal_anchor(self, element_id: str) -> bool:
+        """Whether ``element_id`` is a synthetic multimodal page anchor of this unit."""
+        return element_id in self._witness
+
+    def textless_anchor(self, element_id: str) -> bool:
+        """Whether ``element_id`` is a multimodal page anchor with zero out-of-prompt text witness elements."""
+        witness = self._witness.get(element_id)
+        return witness is not None and not witness
 
     def raw(self, element_id: str) -> tuple[str, ...]:
         """The :func:`element_text` of each element (or out-of-prompt OCR witness) ``element_id`` names here."""
@@ -1093,15 +1120,19 @@ def _peer_family_quotes(item: ConsensusItem, model_id: str) -> tuple[str, ...]:
     )
 
 
-def _build_multimodal_peer_map(
-    item: ConsensusItem,
-) -> dict[str, tuple[tuple[str, ...], tuple[str, ...], Counter[str]]]:
-    """Precompute comparable quotes, plain quotes, and combined token ``Counter`` per known-family supporting model."""
-    if not isinstance(item, ConsensusItem) or not item.model_votes:
-        raise ValueError("_build_multimodal_peer_map requires a ConsensusItem with model_votes")
-    precomputed: dict[str, tuple[tuple[str, ...], tuple[str, ...], Counter[str]]] = {}
+_PeerEntry: TypeAlias = tuple[tuple[str, ...], tuple[str, ...], Counter[str], frozenset[str]]
+
+
+def _build_multimodal_peer_map(item: ConsensusItem, texts: _UnitTexts) -> dict[str, _PeerEntry]:
+    """Precompute comparable quotes, plain quotes, token ``Counter``, and cited anchors per known-family model."""
+    if not isinstance(item, ConsensusItem) or not item.model_votes or not isinstance(texts, _UnitTexts):
+        raise ValueError("_build_multimodal_peer_map requires a ConsensusItem with model_votes and _UnitTexts")
+    precomputed: dict[str, _PeerEntry] = {}
     for peer_id, peer_votes in item.model_votes.items():
         if not peer_votes or item.families.get(peer_id, "unknown") == "unknown":
+            continue
+        anchors = frozenset(eid for eid in item.element_ids_by_model[peer_id] if texts.multimodal_anchor(eid))
+        if not anchors:
             continue
         raw_quotes = item.quotes_by_model[peer_id]
         comp_quotes = tuple(_comparable(pq) for pq in raw_quotes)
@@ -1109,26 +1140,27 @@ def _build_multimodal_peer_map(
         combined: Counter[str] = Counter()
         for cq in comp_quotes:
             combined.update(_tokens(cq))
-        precomputed[peer_id] = (comp_quotes, plain_quotes, combined)
+        precomputed[peer_id] = (comp_quotes, plain_quotes, combined, anchors)
     return precomputed
 
 
 def _peer_witness_for(
     item: ConsensusItem,
     model_id: str,
-    precomputed: Mapping[str, tuple[tuple[str, ...], tuple[str, ...], Counter[str]]],
+    cited_anchors: frozenset[str],
+    precomputed: Mapping[str, _PeerEntry],
 ) -> _PeerWitness:
-    """Assemble cross-family peer witness quotes and separate per-peer-model token counters for ``model_id``."""
+    """Assemble cross-family peer witness quotes sharing a cited multimodal anchor with ``model_id``."""
     if not isinstance(item, ConsensusItem) or not model_id or not isinstance(precomputed, Mapping):
         raise ValueError("_peer_witness_for requires ConsensusItem, non-empty model_id, and Mapping")
     own_family = item.families.get(model_id, "unknown")
-    if own_family == "unknown":
+    if not cited_anchors or own_family == "unknown":
         return _EMPTY_WITNESS
     comp_list: list[str] = []
     plain_list: list[str] = []
     counters: list[Counter[str]] = []
-    for peer_id, (comp_quotes, plain_quotes, combined) in precomputed.items():
-        if item.families.get(peer_id, "unknown") == own_family:
+    for peer_id, (comp_quotes, plain_quotes, combined, peer_anchors) in precomputed.items():
+        if item.families.get(peer_id, "unknown") == own_family or cited_anchors.isdisjoint(peer_anchors):
             continue
         comp_list.extend(comp_quotes)
         plain_list.extend(plain_quotes)
@@ -1251,7 +1283,7 @@ def _item_reasons(
     """Every supporting model's reasons, in model order (module notes, 4)."""
     norms = root_norms or {}
     has_norm = any(norms.values())
-    peer_map = _build_multimodal_peer_map(item) if texts.multimodal else {}
+    peer_map = _build_multimodal_peer_map(item, texts) if texts.multimodal else {}
     found: list[GroundingReason] = []
     seen: dict[tuple[object, ...], list[GroundingReason]] = {}
     for model_id, votes in item.model_votes.items():
@@ -1285,7 +1317,7 @@ def _model_reasons(
     quotes: tuple[str, ...],
     texts: _UnitTexts,
     checks: tuple[tuple[int, str, _KeyKind], ...],
-    peer_map: Mapping[str, tuple[tuple[str, ...], tuple[str, ...], Counter[str]]],
+    peer_map: Mapping[str, _PeerEntry],
     norms: Mapping[str, str | None],
     root_sig: tuple[tuple[object, ...], ...],
     child_specs: tuple[_ChildKeySpec, ...],
@@ -1295,9 +1327,23 @@ def _model_reasons(
     if not model_id or not isinstance(texts, _UnitTexts):
         raise ValueError("_model_reasons requires non-empty model_id and _UnitTexts")
     cited = [element_id for element_id in element_ids if texts.citable(element_id)]
-    witness = _peer_witness_for(item, model_id, peer_map) if texts.multimodal and cited else _EMPTY_WITNESS
+    anchors = frozenset(eid for eid in cited if texts.multimodal_anchor(eid)) if texts.multimodal else frozenset()
+    witness = _peer_witness_for(item, model_id, anchors, peer_map) if anchors else _EMPTY_WITNESS
     own = _cited_reasons(model_id, element_ids, texts)
-    own.extend(_quote_reasons(model_id, quotes, cited, texts, keyless=not checks, witness=witness))
+    own.extend(
+        _quote_reasons(
+            model_id,
+            quotes,
+            cited,
+            texts,
+            keyless=not checks,
+            witness=witness,
+            key=item.key,
+            checks=checks,
+            norms=norms,
+            root_raw=root_sig,
+        )
+    )
     own.extend(
         _key_reasons(
             model_id,
@@ -1339,16 +1385,27 @@ def _quote_reasons(
     *,
     keyless: bool,
     witness: _PeerWitness = _EMPTY_WITNESS,
+    key: tuple[object, ...] = (),
+    checks: tuple[tuple[int, str, _KeyKind], ...] = (),
+    norms: Mapping[str, str | None] | None = None,
+    root_raw: tuple[tuple[object, ...], ...] = (),
 ) -> list[GroundingReason]:
     """One model's reasons about its quotes (module notes, 2): each must lie within one element it cited; when no
     key is checked (``keyless``), one of them must hold :data:`QUOTE_MIN_TOKENS` tokens."""
     if not quotes:
         return [GroundingReason._trusted("no_quotes", model_id)]
     comparable = [_comparable(quote) for quote in quotes]
+    matched = [_quote_found(comp, cited, texts, witness) for comp in comparable]
+    allow_extra = (
+        not all(matched)
+        and _has_corroborated_scan_quote(comparable, cited, texts, witness, keyless=keyless)
+        and _matched_quotes_hold_keys(quotes, matched, key, checks, norms or {}, root_raw)
+    )
+    strict = tuple(eid for eid in cited if not texts.lenient(eid)) if allow_extra else ()
     found = [
         GroundingReason._trusted("quote_not_found", model_id, index=index, text=quote)
         for index, quote in enumerate(quotes)
-        if not _quote_found(comparable[index], cited, texts, witness)
+        if not matched[index] and not _waivable_scan_quote(comparable[index], allow_extra, strict, texts)
     ]
     if keyless and all(_length(quote) < QUOTE_MIN_TOKENS for quote in comparable):
         found.append(GroundingReason._trusted("quote_too_short", model_id))
@@ -1365,6 +1422,125 @@ def _length(quote: str) -> int:
     )
 
 
+def _quote_in_texts(quote: str, cited: Sequence[str], texts: _UnitTexts) -> bool:
+    """Whether comparable ``quote`` matches ``texts`` of ``cited`` (exact substring, or vision containment)."""
+    if not isinstance(quote, str) or not isinstance(texts, _UnitTexts):
+        raise TypeError("_quote_in_texts requires str quote and _UnitTexts")
+    if not quote:
+        return False
+    if any(quote in text for element_id in cited for text in texts.quoted(element_id)):
+        return True
+    lenient = [element_id for element_id in cited if texts.lenient(element_id)]
+    if not lenient:
+        return False
+    wanted = _tokens(quote)
+    return any(
+        _containment(wanted, held) >= VISION_CONTAINMENT for element_id in lenient for held in texts.tokens(element_id)
+    )
+
+
+def _quote_in_witness(quote: str, witness: _PeerWitness) -> bool:
+    """Whether comparable ``quote`` matches cross-family ``witness`` quotes (substring or >=0.85 containment)."""
+    if not isinstance(quote, str) or not isinstance(witness, _PeerWitness):
+        raise TypeError("_quote_in_witness requires str quote and _PeerWitness")
+    if not quote or not witness.comparable:
+        return False
+    if any(quote in pq for pq in witness.comparable):
+        return True
+    wanted = _tokens(quote)
+    return any(_containment(wanted, counter) >= VISION_CONTAINMENT for counter in witness.model_counters)
+
+
+def _near_strict_element(quote: str, strict: Sequence[str], texts: _UnitTexts) -> bool:
+    """Whether non-empty comparable ``quote`` has >=0.85 token containment in a non-lenient cited element."""
+    if not isinstance(quote, str) or not isinstance(texts, _UnitTexts):
+        raise TypeError("_near_strict_element requires str quote and _UnitTexts")
+    if not quote or not strict:
+        return False
+    wanted = _tokens(quote)
+    if not wanted:
+        return False
+    return any(
+        _containment(wanted, held) >= VISION_CONTAINMENT for element_id in strict for held in texts.tokens(element_id)
+    )
+
+
+def _waivable_scan_quote(
+    quote: str,
+    allow_extra: bool,
+    strict: Sequence[str],
+    texts: _UnitTexts,
+) -> bool:
+    """Whether an unmatched ``quote`` is a benign secondary scan context quote."""
+    return allow_extra and bool(quote) and not _near_strict_element(quote, strict, texts)
+
+
+def _is_code_identifier(quote: str) -> bool:
+    """Whether ``quote`` is a multi-char alphanumeric identifier with both letters and digits."""
+    if not quote or not all(ch.isalnum() or ch in _CODE_BRIDGES for ch in quote):
+        return False
+    alnum = [ch for ch in quote if ch.isalnum()]
+    return len(alnum) >= 3 and any(ch.isdigit() for ch in alnum) and any(ch.isalpha() for ch in alnum)
+
+
+def _witness_token_corroborated(quote: str, witness: _PeerWitness, *, keyless: bool) -> bool:
+    """Whether ``quote`` matches a cross-family peer counter (>=0.85) and is non-trivial when ``keyless``."""
+    if not isinstance(quote, str) or not isinstance(witness, _PeerWitness):
+        raise TypeError("_witness_token_corroborated requires str quote and _PeerWitness")
+    if keyless and _length(quote) < QUOTE_MIN_TOKENS and not _is_code_identifier(quote):
+        return False
+    wanted = _tokens(quote)
+    if not wanted:
+        return False
+    return any(_containment(wanted, counter) >= VISION_CONTAINMENT for counter in witness.model_counters)
+
+
+def _matched_quotes_hold_keys(
+    quotes: tuple[str, ...],
+    matched: Sequence[bool],
+    key: tuple[object, ...],
+    checks: tuple[tuple[int, str, _KeyKind], ...],
+    norms: Mapping[str, str | None],
+    root_raw: tuple[tuple[object, ...], ...],
+) -> bool:
+    """Whether every checked root key is already quoted within ``quotes`` whose ``matched`` entry is True."""
+    if not isinstance(quotes, tuple) or not isinstance(norms, Mapping):
+        raise TypeError("_matched_quotes_hold_keys requires quotes tuple and norms Mapping")
+    if not checks:
+        return True
+    matched_read = tuple(_comparable(unescape_markdown(q)) for idx, q in enumerate(quotes) if matched[idx])
+    if not matched_read:
+        return False
+    num_cache: list[frozenset[Decimal] | None] = [None] * len(matched_read)
+    for idx, (position, name, kind) in enumerate(checks):
+        raw_vals = root_raw[idx] if idx < len(root_raw) and root_raw[idx] else (key[position],)
+        if not all(_key_quoted(val, kind, matched_read, num_cache, norms.get(name)) for val in raw_vals):
+            return False
+    return True
+
+
+def _has_corroborated_scan_quote(
+    comparable: Sequence[str],
+    cited: Sequence[str],
+    texts: _UnitTexts,
+    witness: _PeerWitness,
+    *,
+    keyless: bool,
+) -> bool:
+    """Whether ``comparable`` holds a token-corroborated scan quote not explained by any cited text-backed block."""
+    if not isinstance(texts, _UnitTexts) or not isinstance(witness, _PeerWitness):
+        raise TypeError("_has_corroborated_scan_quote requires _UnitTexts and _PeerWitness")
+    if not witness.model_counters or not any(texts.textless_anchor(eid) for eid in cited):
+        return False
+    text_ids = tuple(eid for eid in cited if not texts.textless_anchor(eid))
+    for quote in comparable:
+        if not _witness_token_corroborated(quote, witness, keyless=keyless):
+            continue
+        if not (text_ids and _quote_in_texts(quote, text_ids, texts)):
+            return True
+    return False
+
+
 def _quote_found(
     quote: str,
     cited: list[str],
@@ -1375,23 +1551,9 @@ def _quote_found(
 
     In one of them on a vision page, a token containment of at least :data:`VISION_CONTAINMENT` counts too.
     """
-    if not quote:
-        return False
-    if any(quote in text for element_id in cited for text in texts.quoted(element_id)):
+    if _quote_in_texts(quote, cited, texts):
         return True
-    lenient = [element_id for element_id in cited if texts.lenient(element_id)]
-    if not lenient:
-        return False
-    wanted = _tokens(quote)
-    if any(
-        _containment(wanted, held) >= VISION_CONTAINMENT for element_id in lenient for held in texts.tokens(element_id)
-    ):
-        return True
-    if not witness.comparable:
-        return False
-    if any(quote in pq for pq in witness.comparable):
-        return True
-    return any(_containment(wanted, counter) >= VISION_CONTAINMENT for counter in witness.model_counters)
+    return any(texts.lenient(eid) for eid in cited) and _quote_in_witness(quote, witness)
 
 
 def _valid_code_gap(gap: str) -> bool:

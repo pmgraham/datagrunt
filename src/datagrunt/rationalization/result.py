@@ -370,38 +370,63 @@ class RationalizedResult(Generic[T]):
             raise RationalizationError("cannot build a DataFrame from an empty RationalizedResult without schema")
         return self._spec
 
-    def to_dataframe(self, flatten: str | None = None, *, include_disputed: bool = False) -> pl.DataFrame:
+    @property
+    def grounded_items(self) -> tuple[GroundedRecord[T], ...]:
+        """Items in the grounded-union tier (:attr:`GroundedRecord.is_grounded_union`), in document order."""
+        return tuple(item for item in self.items if item.is_grounded_union)
+
+    @property
+    def grounded_records(self) -> tuple[T, ...]:
+        """Validated records in the grounded-union tier, in document order."""
+        return tuple(item.record for item in self.items if item.is_grounded_union and item.record is not None)
+
+    def to_dataframe(
+        self,
+        flatten: str | None = None,
+        *,
+        include_disputed: bool = False,
+        include_grounded_union: bool = False,
+    ) -> pl.DataFrame:
         """Convert the result's records to a Polars ``DataFrame`` with deterministic dtypes (plan §4.10).
 
         Args:
             flatten: Optional dotted path of ``model_list`` or ``scalar_list`` fields to left-outer explode.
                 Sibling list fields at each exploded level are dropped to prevent Cartesian fan-out.
-            include_disputed: When ``False`` (default), includes ``self.records``. When ``True``, includes every
-                item in ``self.items`` with ``item.record is not None`` and appends ``_status`` and ``_doc_id``
-                string columns.
+            include_disputed: When ``False`` (default), includes ``self.records`` (unless ``include_grounded_union``
+                is ``True``). When ``True``, includes every item in ``self.items`` with ``item.record is not None``
+                and appends ``_status`` and ``_doc_id`` string columns.
+            include_grounded_union: When ``True`` (and ``include_disputed`` is ``False``), includes
+                :attr:`grounded_items` and appends ``_status`` and ``_doc_id`` string columns.
 
         Returns:
             A :class:`polars.DataFrame`.
 
         Raises:
-            TypeError: If ``flatten`` is neither ``str`` nor ``None``, or ``include_disputed`` is not a ``bool``.
+            TypeError: If ``flatten`` is neither ``str`` nor ``None``, or ``include_disputed`` /
+                ``include_grounded_union`` is not a ``bool``.
             RationalizationError: If ``flatten`` is not a valid list path, or any ``int`` or ``Decimal`` value
                 exceeds ``pl.Int64`` / ``pl.Decimal(38, 9)`` bounds.
         """
         if not isinstance(include_disputed, bool):
             raise TypeError(f"include_disputed must be a bool, got {type(include_disputed).__name__}")
+        if not isinstance(include_grounded_union, bool):
+            raise TypeError(f"include_grounded_union must be a bool, got {type(include_grounded_union).__name__}")
         if flatten is not None and not isinstance(flatten, str):
             raise TypeError(f"flatten must be a str or None, got {type(flatten).__name__}")
 
         spec = self._require_spec()
         parts = _validate_flatten_path(spec, flatten) if flatten is not None else ()
-        records, statuses, doc_ids = self._select_records(include_disputed=include_disputed)
+        with_meta = include_disputed or include_grounded_union
+        records, statuses, doc_ids = self._select_records(
+            include_disputed=include_disputed,
+            include_grounded_union=include_grounded_union,
+        )
 
         try:
             if not parts:
-                return _unflattened_dataframe(spec, records, statuses, doc_ids, include_disputed=include_disputed)
+                return _unflattened_dataframe(spec, records, statuses, doc_ids, include_disputed=with_meta)
             flat_schema = _flat_schema_for_level(spec, parts, "", 1)
-            if include_disputed:
+            if with_meta:
                 flat_schema["_status"] = pl.String()
                 flat_schema["_doc_id"] = pl.String()
             flat_columns = _build_flattened_columns(
@@ -411,28 +436,39 @@ class RationalizedResult(Generic[T]):
                 spec,
                 parts,
                 flat_schema,
-                include_disputed=include_disputed,
+                include_disputed=with_meta,
             )
         except _FieldBoundsError as err:
             raise err.to_error() from None
         return pl.DataFrame(flat_columns, schema=flat_schema)
 
-    def to_dicts(self, *, include_disputed: bool = False) -> list[dict[str, Any]]:
+    def to_dicts(
+        self,
+        *,
+        include_disputed: bool = False,
+        include_grounded_union: bool = False,
+    ) -> list[dict[str, Any]]:
         """Convert the result's records to Python dicts via ``model_dump(mode="python")`` (plan §4.10).
 
         Args:
-            include_disputed: When ``False`` (default), dumps ``self.records``. When ``True``, dumps every item in
-                ``self.items`` with ``item.record is not None`` and appends ``_status`` and ``_doc_id``.
+            include_disputed: When ``False`` (default), dumps ``self.records`` (unless ``include_grounded_union``
+                is ``True``). When ``True``, dumps every item in ``self.items`` with ``item.record is not None``
+                and appends ``_status`` and ``_doc_id``.
+            include_grounded_union: When ``True`` (and ``include_disputed`` is ``False``), dumps
+                :attr:`grounded_items` and appends ``_status`` and ``_doc_id``.
 
         Returns:
             List of record dicts.
         """
         if not isinstance(include_disputed, bool):
             raise TypeError(f"include_disputed must be a bool, got {type(include_disputed).__name__}")
-        if not include_disputed:
+        if not isinstance(include_grounded_union, bool):
+            raise TypeError(f"include_grounded_union must be a bool, got {type(include_grounded_union).__name__}")
+        if not include_disputed and not include_grounded_union:
             return [record.model_dump(mode="python") for record in self.records]
+        source_items = self.items if include_disputed else self.grounded_items
         out: list[dict[str, Any]] = []
-        for item in self.items:
+        for item in source_items:
             if item.record is not None:
                 row = item.record.model_dump(mode="python")
                 row["_status"] = item.status
@@ -440,18 +476,34 @@ class RationalizedResult(Generic[T]):
                 out.append(row)
         return out
 
-    def to_arrow_table(self, flatten: str | None = None, *, include_disputed: bool = False) -> pa.Table:
+    def to_arrow_table(
+        self,
+        flatten: str | None = None,
+        *,
+        include_disputed: bool = False,
+        include_grounded_union: bool = False,
+    ) -> pa.Table:
         """Convert the result's records to a PyArrow ``Table`` via :meth:`to_dataframe` (plan §4.10)."""
-        return self.to_dataframe(flatten=flatten, include_disputed=include_disputed).to_arrow()
+        return self.to_dataframe(
+            flatten=flatten,
+            include_disputed=include_disputed,
+            include_grounded_union=include_grounded_union,
+        ).to_arrow()
 
-    def _select_records(self, *, include_disputed: bool) -> tuple[Sequence[T], list[str], list[str]]:
-        """Return selected records plus ``(_status, _doc_id)`` column lists when ``include_disputed=True``."""
-        if not include_disputed:
+    def _select_records(
+        self,
+        *,
+        include_disputed: bool,
+        include_grounded_union: bool = False,
+    ) -> tuple[Sequence[T], list[str], list[str]]:
+        """Return selected records plus ``(_status, _doc_id)`` column lists when metadata is requested."""
+        if not include_disputed and not include_grounded_union:
             return self.records, [], []
+        source_items = self.items if include_disputed else self.grounded_items
         records: list[T] = []
         statuses: list[str] = []
         doc_ids: list[str] = []
-        for item in self.items:
+        for item in source_items:
             if item.record is not None:
                 records.append(item.record)
                 statuses.append(item.status)

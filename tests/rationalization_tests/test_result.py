@@ -764,3 +764,117 @@ def test_lazy_error_paths_across_unflattened_and_flattened_levels() -> None:
         res.to_dataframe(flatten="line_items")
     with pytest.raises(RationalizationError, match=r"^departments\[0\]\.codes\[0\]: int value is outside Int64"):
         res.to_dataframe()
+
+
+def test_grounded_union_properties_and_exports_exclude_ungrounded_and_disputed() -> None:
+    c_consensus = Company(
+        company_id="C-1",
+        company_name="ConsensusCo",
+        departments=[
+            Department(
+                dept_id="D-1",
+                dept_name="Core",
+                employees=[Employee(emp_id="E-1", name="Ada")],
+            )
+        ],
+    )
+    c_grounded_partial = Company(
+        company_id="SMBJ18A",
+        company_name="SingleModelGrounded",
+        departments=[
+            Department(
+                dept_id="D-2",
+                dept_name="Analog",
+                employees=[Employee(emp_id="E-2", name="Grace")],
+            )
+        ],
+    )
+    c_ungrounded_partial = Company(company_id="FAKE-1", company_name="HallucinatedKey")
+    c_ungrounded_val = Company(company_id="C-4", company_name="BadQuote")
+    c_disputed = Company(company_id="C-5", company_name="Disputed")
+
+    it_consensus = make_grounded(c_consensus, status="consensus", key=("C-1",))
+    it_grounded_partial = make_grounded(
+        c_grounded_partial,
+        doc_id="doc_2",
+        unit_id="doc_2:p0001_e001-p0001_e001",
+        status="missing_in_some_models",
+        key=("SMBJ18A",),
+    )
+    it_ungrounded_partial = make_grounded(
+        c_ungrounded_partial,
+        status="missing_in_some_models",
+        key=("FAKE-1",),
+        grounding_reasons=(GroundingReason(reason="key_not_found", model_id=G, key_field="company_id"),),
+    )
+    it_ungrounded_val = make_grounded(
+        c_ungrounded_val,
+        status="ungrounded_value",
+        key=("C-4",),
+        grounding_reasons=(GroundingReason(reason="no_quotes", model_id=G),),
+    )
+    it_disputed = make_grounded(
+        c_disputed,
+        status="field_disagreement",
+        key=("C-5",),
+        disputed_fields=("company_name",),
+    )
+
+    result = RationalizedResult(
+        items=(it_consensus, it_grounded_partial, it_ungrounded_partial, it_ungrounded_val, it_disputed),
+        records=(c_consensus,),
+        needs_review=(it_grounded_partial, it_ungrounded_partial, it_ungrounded_val, it_disputed),
+        quarantined=(),
+        failed_units=(),
+        empty_units=(),
+        skipped_units=(),
+        telemetry=make_telemetry(),
+        schema=COMPANY_SCHEMA,
+    )
+
+    assert result.grounded_items == (it_consensus, it_grounded_partial)
+    assert [item.status for item in result.grounded_items] == ["consensus", "missing_in_some_models"]
+    assert [item.sources[0].element_id for item in result.grounded_items] == ["p0001_e001", "p0001_e001"]
+    assert result.grounded_records == (c_consensus, c_grounded_partial)
+
+    df_gu = result.to_dataframe(include_grounded_union=True)
+    assert df_gu["company_id"].to_list() == ["C-1", "SMBJ18A"]
+    assert df_gu["_status"].to_list() == ["consensus", "missing_in_some_models"]
+    assert df_gu["_doc_id"].to_list() == ["doc_1", "doc_2"]
+
+    df_gu_flat = result.to_dataframe(flatten="departments.employees", include_grounded_union=True)
+    assert df_gu_flat["company_id"].to_list() == ["C-1", "SMBJ18A"]
+    assert df_gu_flat["departments.employees.emp_id"].to_list() == ["E-1", "E-2"]
+    assert df_gu_flat["_status"].to_list() == ["consensus", "missing_in_some_models"]
+    assert df_gu_flat["_doc_id"].to_list() == ["doc_1", "doc_2"]
+
+    dicts_gu = result.to_dicts(include_grounded_union=True)
+    assert [row["company_id"] for row in dicts_gu] == ["C-1", "SMBJ18A"]
+    assert [row["_status"] for row in dicts_gu] == ["consensus", "missing_in_some_models"]
+    assert [row["_doc_id"] for row in dicts_gu] == ["doc_1", "doc_2"]
+
+    arrow_gu = result.to_arrow_table(include_grounded_union=True)
+    assert arrow_gu.equals(df_gu.to_arrow())
+
+    empty_res: RationalizedResult[Company] = RationalizedResult(
+        items=(),
+        records=(),
+        needs_review=(),
+        quarantined=(),
+        failed_units=(),
+        empty_units=(),
+        skipped_units=(),
+        telemetry=make_telemetry(),
+        schema=COMPANY_SCHEMA,
+    )
+    empty_gu = empty_res.to_dataframe(include_grounded_union=True)
+    assert empty_gu.height == 0
+    assert "_status" in empty_gu.schema and "_doc_id" in empty_gu.schema
+
+    for bad_flag in (1, "yes", None):
+        with pytest.raises(TypeError, match="include_grounded_union"):
+            result.to_dataframe(include_grounded_union=bad_flag)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="include_grounded_union"):
+            result.to_dicts(include_grounded_union=bad_flag)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="include_grounded_union"):
+            result.to_arrow_table(include_grounded_union=bad_flag)  # type: ignore[arg-type]

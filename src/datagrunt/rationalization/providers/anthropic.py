@@ -161,6 +161,7 @@ import inside a function (invariant 9).
 """
 
 import math
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -168,7 +169,7 @@ from types import MappingProxyType
 from typing import Any, Final, Literal, NoReturn, TypeAlias, cast
 from urllib.parse import urlsplit
 
-from datagrunt.rationalization._canonical import canonical_copy, canonical_json
+from datagrunt.rationalization._canonical import canonical_copy, canonical_json, sha256_hex
 from datagrunt.rationalization._refs import (
     DEFS_POINTER,
     UNREAD_KEYWORDS,
@@ -252,6 +253,12 @@ _STRUCTURED_OUTPUT_400_TOKENS = (
     "too many optional",
     "too many union",
 )
+_SCHEMA_COMPLEXITY_400_TOKENS = (
+    "schema is too complex",
+    "too many optional",
+    "too many union",
+)
+_FALLBACK_SCHEMA_CACHE_MAX = 64
 
 SUPPORTED_FORMATS = frozenset(
     {"date-time", "time", "date", "duration", "email", "hostname", "uri", "ipv4", "ipv6", "uuid"}
@@ -419,6 +426,19 @@ def _is_structured_output_400(error: PermanentProviderError) -> bool:
         return False
     low = error.detail.lower()
     return any(tok in low for tok in _STRUCTURED_OUTPUT_400_TOKENS)
+
+
+def _is_schema_complexity_400(error: PermanentProviderError) -> bool:
+    if error.status_code != 400:
+        return False
+    low = error.detail.lower()
+    return any(tok in low for tok in _SCHEMA_COMPLEXITY_400_TOKENS)
+
+
+def _schema_digest(schema: Mapping[str, Any]) -> str:
+    if not isinstance(schema, Mapping):
+        raise TypeError(f"schema must be a Mapping, got {type(schema).__name__}")
+    return sha256_hex(canonical_json(dict(schema), subject="the response schema"))
 
 
 def _check_max_connections(value: object) -> int:
@@ -850,11 +870,14 @@ class AnthropicProvider:
     """
 
     __slots__ = (
+        "_fallback_lock",
+        "_fallback_schemas",
         "_http",
         "_last_images_b64",
         "_max_concurrency",
         "_max_connections",
         "_model",
+        "_native_disabled",
         "_route",
         "_schema_mode",
         "_temperature",
@@ -917,6 +940,9 @@ class AnthropicProvider:
         self._model = model
         self._temperature = temperature
         self._schema_mode = schema_mode
+        self._fallback_lock = threading.Lock()
+        self._native_disabled = False
+        self._fallback_schemas: dict[str, None] = {}
 
     @classmethod
     def google_cloud(
@@ -1079,6 +1105,37 @@ class AnthropicProvider:
         if client is not None:
             client.close()
 
+    def _should_use_native(self, schema: Mapping[str, Any]) -> bool:
+        """Whether this request should attempt native ``output_config.format`` structured outputs."""
+        if self._schema_mode == "native":
+            return True
+        if self._schema_mode != "prompt_fallback":
+            return False
+        with self._fallback_lock:
+            if self._native_disabled:
+                return False
+            has_schema_latches = bool(self._fallback_schemas)
+        if _exceeds_limits(schema):
+            return False
+        if not has_schema_latches:
+            return True
+        digest = _schema_digest(schema)
+        with self._fallback_lock:
+            return not self._native_disabled and digest not in self._fallback_schemas
+
+    def _latch_prompt_fallback(self, schema: Mapping[str, Any], error: PermanentProviderError) -> None:
+        """Record a capability or schema-complexity 400 so later ``prompt_fallback`` calls skip doomed retries."""
+        if _is_schema_complexity_400(error):
+            digest = _schema_digest(schema)
+            with self._fallback_lock:
+                if digest not in self._fallback_schemas and len(self._fallback_schemas) >= _FALLBACK_SCHEMA_CACHE_MAX:
+                    oldest = next(iter(self._fallback_schemas))
+                    del self._fallback_schemas[oldest]
+                self._fallback_schemas[digest] = None
+            return
+        with self._fallback_lock:
+            self._native_disabled = True
+
     def generate(self, request: ModelRequest) -> ProviderResponse:
         """Send one request and read its reply (module notes, 5-6).
 
@@ -1089,9 +1146,7 @@ class AnthropicProvider:
         """
         if not isinstance(request, ModelRequest):
             raise TypeError(f"generate needs a ModelRequest, got {type(request).__name__}")
-        use_native = self._schema_mode == "native" or (
-            self._schema_mode == "prompt_fallback" and not _exceeds_limits(request.json_schema)
-        )
+        use_native = self._should_use_native(request.json_schema)
         deadline = time.monotonic() + request.timeout_s  # set before the token is fetched, which counts against it
         try:
             reply = self._send_body(request, use_output_config=use_native, deadline=deadline)
@@ -1099,6 +1154,7 @@ class AnthropicProvider:
         except PermanentProviderError as error:
             if not (use_native and self._schema_mode == "prompt_fallback" and _is_structured_output_400(error)):
                 raise
+            self._latch_prompt_fallback(request.json_schema, error)
         reply = self._send_body(request, use_output_config=False, deadline=deadline)
         return _parse_reply(reply, allow_fence=True)
 

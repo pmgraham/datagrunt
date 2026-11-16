@@ -21,13 +21,16 @@ Re-checked on 2026-11-05 by the T7 review (the wire shape matches the current do
 
 import ast
 import copy
+import dataclasses
 import json
 import math
 import pickle
 import re
 import sys
+import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -1718,7 +1721,7 @@ def test_a_schema_that_is_not_exactly_json_is_refused():
 # https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/structured-outputs
 # https://docs.cloud.google.com/vertex-ai/generative-ai/docs/partner-models/claude/use-claude
 
-TOKEN = "ya29.hunter2-TOKEN"
+TOKEN = "ya29-hunter2-TOKEN"
 GC_MODEL = "claude-opus-4-7"
 REGIONAL_MODEL = "claude-sonnet-4-6"
 PROJECT = "my-project"
@@ -2196,6 +2199,140 @@ class TestSchemaMode:
         assert "output_config" in calls[0]
         assert "output_config" not in calls[1]
         assert resp.finish == "complete" and resp.content is not None
+
+    @ROUTES
+    def test_prompt_fallback_latches_org_policy_400_across_subsequent_units_and_schemas(self, build):
+        calls: list[dict] = []
+
+        def org_policy_handler(request):
+            body = json.loads(request.content)
+            calls.append(body)
+            if "output_config" in body:
+                err = {
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "output_config blocked by constraints/vertexai.allowedPartnerModelFeatures",
+                    },
+                }
+                return streamed(400, json_body=err)
+            return streamed(200, json_body=MESSAGE)
+
+        provider = build(org_policy_handler, schema_mode="prompt_fallback")
+        other_schema = {
+            "type": "object",
+            "properties": {
+                "records": {
+                    "type": "array",
+                    "items": {"type": "object", "properties": {"id": {"type": "string"}}},
+                }
+            },
+            "required": ["records"],
+        }
+        other_req = dataclasses.replace(REQUEST, unit_id="u_other", json_schema=other_schema)
+
+        for idx in range(5):
+            resp = provider.generate(dataclasses.replace(REQUEST, unit_id=f"u_{idx}"))
+            assert resp.finish == "complete" and resp.content is not None
+        resp_other = provider.generate(other_req)
+        assert resp_other.finish == "complete" and resp_other.content is not None
+
+        # Only unit 0 attempted native output_config (1 HTTP 400 + 1 prompt 200); rest sent 1 prompt call each.
+        assert len(calls) == 7
+        assert ["output_config" in body for body in calls] == [True, False, False, False, False, False, False]
+        assert provider.schema_mode == "prompt_fallback"
+        assert provider.generation_params["mechanism"] == "prompt_fallback"
+
+    def test_prompt_fallback_latches_schema_complexity_400_per_schema_while_allowing_simple_schema(self):
+        calls: list[dict] = []
+        complex_schema = {
+            "type": "object",
+            "properties": {
+                "records": {
+                    "type": "array",
+                    "items": {"type": "object", "properties": {"complex_f": {"type": "string"}}},
+                }
+            },
+            "required": ["records"],
+        }
+        simple_schema = SENT_SCHEMA
+
+        def grammar_handler(request):
+            body = json.loads(request.content)
+            calls.append(body)
+            if "output_config" in body and body["output_config"]["format"]["schema"] == complex_schema:
+                err = {
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "output_config.format.schema: Schema is too complex for compilation",
+                    },
+                }
+                return streamed(400, json_body=err)
+            return streamed(200, json_body=MESSAGE)
+
+        provider = make_provider(grammar_handler, schema_mode="prompt_fallback")
+        complex_req = dataclasses.replace(REQUEST, json_schema=complex_schema)
+        simple_req = dataclasses.replace(REQUEST, json_schema=simple_schema)
+
+        for idx in range(3):
+            resp = provider.generate(dataclasses.replace(complex_req, unit_id=f"c_{idx}"))
+            assert resp.finish == "complete" and resp.content is not None
+        resp_simple = provider.generate(dataclasses.replace(simple_req, unit_id="s_0"))
+        assert resp_simple.finish == "complete" and resp_simple.content is not None
+
+        # Complex schema tried output_config once (400 -> prompt 200), then latched prompt; simple_schema kept native.
+        assert ["output_config" in body for body in calls] == [True, False, False, False, True]
+
+    def test_prompt_fallback_propagates_unrelated_400_without_latching(self):
+        calls: list[dict] = []
+
+        def bad_request_handler(request):
+            calls.append(json.loads(request.content))
+            err = {"type": "error", "error": {"type": "invalid_request_error", "message": "max_tokens is invalid"}}
+            return streamed(400, json_body=err)
+
+        provider = make_provider(bad_request_handler, schema_mode="prompt_fallback")
+        with pytest.raises(PermanentProviderError) as caught:
+            provider.generate(REQUEST)
+        assert caught.value.status_code == 400
+        assert len(calls) == 1 and "output_config" in calls[0]
+
+    def test_prompt_fallback_latching_is_thread_safe_across_concurrent_workers(self):
+        lock = threading.Lock()
+        native_attempts = 0
+        prompt_attempts = 0
+
+        def concurrent_handler(request):
+            nonlocal native_attempts, prompt_attempts
+            body = json.loads(request.content)
+            if "output_config" in body:
+                with lock:
+                    native_attempts += 1
+                msg = "Feature structured_outputs is not allowed by constraints/vertexai.allowedPartnerModelFeatures"
+                err = {
+                    "type": "error",
+                    "error": {"type": "invalid_request_error", "message": msg},
+                }
+                return streamed(400, json_body=err)
+            with lock:
+                prompt_attempts += 1
+            return streamed(200, json_body=MESSAGE)
+
+        provider = gc_provider(concurrent_handler, schema_mode="prompt_fallback", max_connections=8)
+        # Warm unit 0 latches capability refusal; 24 concurrent worker requests thereafter must do 0 native attempts.
+        first = provider.generate(dataclasses.replace(REQUEST, unit_id="warm"))
+        assert first.finish == "complete"
+        assert (native_attempts, prompt_attempts) == (1, 1)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [
+                pool.submit(provider.generate, dataclasses.replace(REQUEST, unit_id=f"u_{i}")) for i in range(24)
+            ]
+            results = [fut.result(timeout=10.0) for fut in futures]
+        assert len(results) == 24 and all(r.finish == "complete" and r.content is not None for r in results)
+        assert native_attempts == 1
+        assert prompt_attempts == 25
 
     def test_anthropic_provider_enables_keepalive_closes_client_and_reuses_image_b64(self, monkeypatch):
         default_prov = AnthropicProvider("claude-opus-4-7", api_key=KEY, max_connections=5)

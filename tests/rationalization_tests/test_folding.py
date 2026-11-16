@@ -1389,3 +1389,193 @@ class TestWave2AFoldingRegressions:
             assembly_id="A-100",
             steps=[UnkeyedFoldStep(step_no=1, note="Page 1 wording")],
         )
+
+
+class ProfileFoldSchema(BaseModel):
+    doc_key: Annotated[str, Key]
+    parent_part_number: Annotated[str | None, Informational] = None
+    l1_category: str
+    l2_category: Annotated[str | None, Informational] = None
+    specs: Annotated[list[str], Informational] = []
+
+
+class RequiredSpecsSchema(BaseModel):
+    assembly_id: Annotated[str, Key]
+    specs: list[str]
+
+
+class TestMultiUnitDisagreementAndListFolding:
+    def test_multi_unit_field_disagreement_on_one_unit_preserves_agreed_record_and_specs_from_other_units(
+        self,
+    ) -> None:
+        """30RA402080_2.0 pattern: Unit 1 agrees on Steel Fabrication + specs; Unit 2 disputes l1_category.
+        Folded GroundedRecord must stay status='field_disagreement' (never leaking into clean records) while
+        preserving the folded valid record and its specifications instead of wiping record=None.
+        """
+        schema = prepare(ProfileFoldSchema)
+        run = prepare_doc(BOM_DOC, schema=schema)
+        u1_rec_g = {
+            "doc_key": "A-100",
+            "parent_part_number": "A-100",
+            "l1_category": "Steel Fabrication",
+            "l2_category": "STEEL FABRICATION",
+            "specs": [f"Spec {i}" for i in range(1, 9)],
+        }
+        u1_rec_a = {
+            "doc_key": "A-100",
+            "parent_part_number": None,
+            "l1_category": "Steel Fabrication",
+            "l2_category": None,
+            "specs": [f"Spec {i}" for i in range(1, 21)],
+        }
+        # Unit 2: Gemini says Steel Fabrication, Claude says Unclassified -> unit-level field_disagreement (record=None)
+        u2_rec_g = {"doc_key": "A-100", "l1_category": "Steel Fabrication", "specs": ["Extra G"]}
+        u2_rec_a = {"doc_key": "A-100", "l1_category": "Unclassified", "specs": ["Extra A"]}
+        # Unit 3: Agreed additional specs on page 3
+        u3_rec = {"doc_key": "A-100", "l1_category": "Steel Fabrication", "specs": ["Spec 21"]}
+        responses = {
+            (U1, G): response(entry(u1_rec_g, ("Assembly A-100 Main Pump",), (E_P1,))),
+            (U1, A): response(entry(u1_rec_a, ("Assembly A-100 Main Pump",), (E_P1,))),
+            (U2, G): response(entry(u2_rec_g, ("Assembly A-100 Spare",), (E_P2,))),
+            (U2, A): response(entry(u2_rec_a, ("Assembly A-100 Spare",), (E_P2,))),
+            (U3, G): response(entry(u3_rec, ("Assembly A-100 continued",), (E_P3,))),
+            (U3, A): response(entry(u3_rec, ("Assembly A-100 continued",), (E_P3,))),
+        }
+        folded = run_and_fold(responses, run, schema=schema)
+        (item,) = folded.items
+        assert item.status == "field_disagreement"
+        assert item.disputed_fields == ("l1_category",)
+        assert item.record is not None
+        assert item.record.parent_part_number == "A-100"
+        assert item.record.l1_category == "Steel Fabrication"
+        assert item.record.l2_category == "STEEL FABRICATION"
+        assert len(item.record.specs) == 21
+        assert item.record.specs[-1] == "Spec 21"
+
+    def test_single_valid_unit_plus_disputed_unit_preserves_single_valid_record(self) -> None:
+        schema = prepare(ProfileFoldSchema)
+        run = prepare_doc(BOM_DOC, schema=schema)
+        u1_rec = {"doc_key": "A-100", "l1_category": "Steel Fabrication", "specs": ["Spec 1", "Spec 2"]}
+        u2_g = {"doc_key": "A-100", "l1_category": "Steel Fabrication"}
+        u2_a = {"doc_key": "A-100", "l1_category": "Unclassified"}
+        responses = {
+            (U1, G): response(entry(u1_rec, ("Assembly A-100 Main Pump",), (E_P1,))),
+            (U1, A): response(entry(u1_rec, ("Assembly A-100 Main Pump",), (E_P1,))),
+            (U2, G): response(entry(u2_g, ("Assembly A-100 Spare",), (E_P2,))),
+            (U2, A): response(entry(u2_a, ("Assembly A-100 Spare",), (E_P2,))),
+        }
+        (item,) = run_and_fold(responses, run, schema=schema).items
+        assert item.status == "field_disagreement"
+        assert item.disputed_fields == ("l1_category",)
+        assert item.record is not None
+        assert item.record.specs == ["Spec 1", "Spec 2"]
+
+    def test_three_model_disagreement_with_majority_record_folds_across_units_unless_pages_conflict(self) -> None:
+        google_2 = ("gemini:gemini-2.5", "google", "gemini")
+        one_fam_three = (GOOGLE, google_2, ANTHROPIC)
+        g2_id = google_2[0]
+        r1 = {"assembly_id": "A-100", "title": "Main Pump"}
+        r2_maj = {"assembly_id": "A-100", "title": "Main Pump", "notes": "Spare"}
+        r2_min = {"assembly_id": "A-100", "title": "Main Pump", "notes": "Other"}
+        responses = {
+            (U1, G): response(entry(r1, ("Assembly A-100 Main Pump",), (E_P1,))),
+            (U1, g2_id): response(entry(r1, ("Assembly A-100 Main Pump",), (E_P1,))),
+            (U1, A): response(entry(r1, ("Assembly A-100 Main Pump",), (E_P1,))),
+            (U2, G): response(entry(r2_maj, ("Assembly A-100 Spare",), (E_P2,))),
+            (U2, g2_id): response(entry(r2_maj, ("Assembly A-100 Spare",), (E_P2,))),
+            (U2, A): response(entry(r2_min, ("Assembly A-100 Spare",), (E_P2,))),
+        }
+        (item,) = run_and_fold(responses, BOM_RUN, models=one_fam_three).items
+        assert item.status == "field_disagreement"
+        assert item.disputed_fields == ("notes",)
+        assert item.record == Assembly(assembly_id="A-100", title="Main Pump", notes="Spare")
+
+    def test_required_list_field_empty_on_second_unit_folds_without_false_cross_page_conflict(self) -> None:
+        schema = prepare(RequiredSpecsSchema)
+        run = prepare_doc(BOM_DOC, schema=schema)
+        r1 = {"assembly_id": "A-100", "specs": ["Pressure 10 bar", "Main Pump"]}
+        r2 = {"assembly_id": "A-100", "specs": []}
+        responses = {
+            (U1, G): response(entry(r1, ("Assembly A-100 Main Pump",), (E_P1,))),
+            (U1, A): response(entry(r1, ("Assembly A-100 Main Pump",), (E_P1,))),
+            (U2, G): response(entry(r2, ("Assembly A-100 Spare",), (E_P2,))),
+            (U2, A): response(entry(r2, ("Assembly A-100 Spare",), (E_P2,))),
+        }
+        (item,) = run_and_fold(responses, run, schema=schema).items
+        assert item.status == "consensus"
+        assert item.disputed_fields == ()
+        assert item.record == RequiredSpecsSchema(assembly_id="A-100", specs=["Pressure 10 bar", "Main Pump"])
+
+
+class TestGroundedUnionTierHelpers:
+    def test_grounded_record_flags_and_folding_result_tiers(self) -> None:
+        assert folding_module.GROUNDED_UNION_STATUSES == (
+            "consensus",
+            "single_model",
+            "missing_in_some_models",
+        )
+        assert "GROUNDED_UNION_STATUSES" in folding_module.__all__
+
+        clean_rec = Assembly(assembly_id="A-1", title="Pump")
+        single_family_grounded_rec = Assembly(assembly_id="SMBJ18A", title="Diode")
+        single_family_hallucinated_rec = Assembly(assembly_id="FAKE-99", title="Ghost")
+        disputed_rec = Assembly(assembly_id="A-3", title="Majority")
+        ungrounded_rec = Assembly(assembly_id="A-4", title="BadQuote")
+
+        it_consensus = make_grounded_record(status="consensus", key=("A-1",), record=clean_rec)
+        it_grounded_partial = make_grounded_record(
+            status="missing_in_some_models",
+            key=("SMBJ18A",),
+            record=single_family_grounded_rec,
+            model_votes={G: (single_family_grounded_rec.model_dump(mode="json"),), A: ()},
+            quotes_by_model={G: ("SMBJ18A",), A: ()},
+            element_ids_by_model={G: (E_P1,), A: ()},
+        )
+        it_ungrounded_partial = make_grounded_record(
+            status="missing_in_some_models",
+            key=("FAKE-99",),
+            record=single_family_hallucinated_rec,
+            grounding_reasons=(GroundingReason("key_not_found", G, key_field="assembly_id"),),
+            model_votes={G: (single_family_hallucinated_rec.model_dump(mode="json"),), A: ()},
+            quotes_by_model={G: ("SMBJ18A",), A: ()},
+            element_ids_by_model={G: (E_P1,), A: ()},
+        )
+        it_disputed = make_grounded_record(
+            status="field_disagreement",
+            key=("A-3",),
+            record=disputed_rec,
+            disputed_fields=("title",),
+        )
+        it_ungrounded = make_grounded_record(
+            status="ungrounded_value",
+            key=("A-4",),
+            record=ungrounded_rec,
+            grounding_reasons=(GroundingReason("no_quotes", G),),
+        )
+        it_conflict = make_grounded_record(
+            status="cross_page_conflict",
+            key=("A-5",),
+            record=None,
+            disputed_fields=("title",),
+        )
+
+        assert it_consensus.is_grounded is True and it_consensus.is_grounded_union is True
+        assert it_grounded_partial.is_grounded is True and it_grounded_partial.is_grounded_union is True
+        assert it_ungrounded_partial.is_grounded is False and it_ungrounded_partial.is_grounded_union is False
+        assert it_disputed.is_grounded is True and it_disputed.is_grounded_union is False
+        assert it_ungrounded.is_grounded is False and it_ungrounded.is_grounded_union is False
+        assert it_conflict.is_grounded is True and it_conflict.is_grounded_union is False
+
+        folded = FoldingResult(
+            items=(
+                it_consensus,
+                it_grounded_partial,
+                it_ungrounded_partial,
+                it_disputed,
+                it_ungrounded,
+                it_conflict,
+            )
+        )
+        assert folded.records == (clean_rec,)
+        assert folded.grounded_items == (it_consensus, it_grounded_partial)
+        assert folded.grounded_records == (clean_rec, single_family_grounded_rec)
